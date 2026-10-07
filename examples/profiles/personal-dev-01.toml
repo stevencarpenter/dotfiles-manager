@@ -1,0 +1,8 @@
+# One synthetic machine, not a selectable mode for another machine.
+schema = 1
+id = "personal-dev-01"
+bundle = "../base/bundle.toml"
+platform = "macos"
+architecture = "arm64"
+modules = ["personal-dev"]
+overrides = []

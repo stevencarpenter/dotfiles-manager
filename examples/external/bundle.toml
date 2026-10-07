@@ -1,0 +1,7 @@
+# Synthetic external source. The public bundle never references this bundle.
+schema = 1
+id = "example-external"
+extends = "../base/bundle.toml"
+
+[modules]
+work = "modules/work/module.toml"

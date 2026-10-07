@@ -1,0 +1,7 @@
+schema = 1
+id = "homelab-01"
+bundle = "../base/bundle.toml"
+platform = "linux"
+architecture = "x86_64"
+modules = ["homelab"]
+overrides = []

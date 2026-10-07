@@ -1,0 +1,7 @@
+schema = 1
+id = "server-01"
+bundle = "../base/bundle.toml"
+platform = "linux"
+architecture = "arm64"
+modules = ["server"]
+overrides = []

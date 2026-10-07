@@ -1,0 +1,2 @@
+# Synthetic external variant. Illustrates source ownership, not a real policy.
+start-at-login = false

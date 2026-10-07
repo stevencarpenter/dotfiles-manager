@@ -1,0 +1,59 @@
+# Synthetic work configuration, not a copy of a private wrapper.
+schema = 1
+id = "work"
+platforms = ["macos"]
+requires = ["agents", "desktop"]
+
+[[overrides]]
+resource = "core.git-defaults"
+path = "/core/editor"
+value = "vim"
+reason = "This example machine uses its existing Vim installation."
+
+[[overrides]]
+resource = "agents.skills"
+path = "/entries/sample-audit/enabled"
+value = false
+reason = "The optional example skill is not selected for this machine."
+
+# The path is resolved relative to this module, not the desktop module.
+[[overrides]]
+resource = "desktop.aerospace"
+path = "/source"
+value = "files/aerospace.toml"
+reason = "Supply a complete variant through the exposed source slot."
+
+[[contributions]]
+resource = "agents.claude-settings"
+path = "/handlers"
+key = "work.session"
+reason = "Add one owned handler without replacing other SessionStart hooks."
+[contributions.value]
+event = "SessionStart"
+type = "command"
+argv = ["${HOME}/.local/bin/example-work-session"]
+
+[[resources]]
+id = "git-identity"
+kind = "render"
+adapter = "git-config/v1"
+target = ".config/external-overlays/git/work.inc"
+[resources.value.user]
+name = "Example Developer"
+email = "developer@example.invalid"
+
+[[resources]]
+id = "instructions"
+kind = "link"
+adapter = "fs-link/v1"
+target = ".codex/AGENTS.d/40-work.md"
+[resources.value]
+source = "files/AGENTS.md"
+
+[[resources]]
+id = "session-hook"
+kind = "link"
+adapter = "fs-link/v1"
+target = ".local/bin/example-work-session"
+[resources.value]
+source = "files/session-hook.sh"

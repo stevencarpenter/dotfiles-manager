@@ -1,0 +1,12 @@
+schema = 1
+id = "homelab"
+platforms = ["linux"]
+requires = ["server"]
+
+[[resources]]
+id = "ssh-fragment"
+kind = "link"
+adapter = "fs-link/v1"
+target = ".ssh/config.d/30-homelab.conf"
+[resources.value]
+source = "files/ssh.conf"

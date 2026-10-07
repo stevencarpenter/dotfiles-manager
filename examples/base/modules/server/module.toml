@@ -1,0 +1,20 @@
+schema = 1
+id = "server"
+platforms = ["linux"]
+requires = []
+
+[[overrides]]
+resource = "core.git-defaults"
+path = "/core/editor"
+value = "vi"
+reason = "This synthetic server uses its existing base-system editor."
+
+[[resources]]
+id = "git-package"
+kind = "package"
+adapter = "apt/v1"
+[resources.value]
+name = "git"
+# Refresh through update; sync only applies the declared configuration.
+update_policy = "rolling"
+downgrade = "forbid"

@@ -1,0 +1,42 @@
+schema = 1
+id = "agents"
+platforms = ["macos", "linux"]
+requires = []
+
+[[resources]]
+id = "claude-settings"
+kind = "merge"
+adapter = "claude-settings/v1"
+target = ".claude/settings.json"
+[resources.value.managed]
+outputStyle = "STE"
+[resources.value.seed]
+model = "example-model"
+[resources.value.handlers]
+[resources.policy]
+defaults = ["/managed/outputStyle"]
+extensions = ["/handlers"]
+
+[[resources]]
+id = "codex-instructions"
+kind = "assemble"
+adapter = "text-fragments/v1"
+target = ".codex/AGENTS.md"
+[resources.value]
+body = "files/AGENTS.md"
+fragments_dir = ".codex/AGENTS.d"
+pattern = "*.md"
+separator = "\n"
+
+[[resources]]
+id = "skills"
+kind = "distribution"
+adapter = "skills/v1"
+[resources.value]
+target_roots = [".claude/skills", ".pi/agent/skills"]
+[resources.value.entries.sample-audit]
+source = "files/sample-audit"
+enabled = true
+[resources.policy]
+defaults = ["/entries/sample-audit/enabled"]
+extensions = []
