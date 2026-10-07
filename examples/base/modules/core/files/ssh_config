@@ -1,0 +1,6 @@
+# Fragments precede every Host block. SSH uses the first value for a key.
+Include ~/.ssh/config.d/*.conf
+
+Host *
+    ServerAliveInterval 30
+    ServerAliveCountMax 3

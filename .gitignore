@@ -1,0 +1,8 @@
+.lavish/
+.pi/
+.venv/
+__pycache__/
+.ruff_cache/
+
+.idea/
+*.iml

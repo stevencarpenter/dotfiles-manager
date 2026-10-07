@@ -1,0 +1,2 @@
+# Synthetic base variant, not the current deployed window-manager config.
+start-at-login = true

@@ -1,0 +1,168 @@
+# These are future resolver expectations, not executed by check_examples.py.
+# Changes are RFC 6902 patches to parsed documents in isolated fixture memory.
+schema = 1
+
+[[cases]]
+id = "personal-composition"
+profile = "profiles/personal-dev-01.toml"
+[cases.expect]
+modules = ["core", "agents", "desktop", "personal-dev"]
+[[cases.expect.values]]
+resource = "core.git-defaults"
+path = "/core/editor"
+value = "nvim"
+
+[[cases]]
+id = "external-composition"
+profile = "profiles/work-01.toml"
+[cases.expect]
+modules = ["core", "agents", "desktop", "work"]
+[[cases.expect.values]]
+resource = "core.git-defaults"
+path = "/core/editor"
+value = "vim"
+[[cases.expect.values]]
+resource = "agents.skills"
+path = "/entries/sample-audit/enabled"
+value = false
+[[cases.expect.origins]]
+resource = "desktop.aerospace"
+path = "/source"
+module = "work"
+source = "external/modules/work/files/aerospace.toml"
+
+[[cases]]
+id = "homelab-composition"
+profile = "profiles/homelab-01.toml"
+[cases.expect]
+modules = ["core", "server", "homelab"]
+[[cases.expect.values]]
+resource = "core.git-defaults"
+path = "/core/editor"
+value = "vi"
+
+[[cases]]
+id = "server-composition"
+profile = "profiles/server-01.toml"
+[cases.expect]
+modules = ["core", "server"]
+
+[[cases]]
+id = "protected-core-source"
+profile = "profiles/work-01.toml"
+expected_error = "E_OVERRIDE_FORBIDDEN"
+[[cases.changes]]
+file = "profiles/work-01.toml"
+op = "add"
+path = "/overrides/-"
+value = { resource = "core.git", path = "/source", value = "files/replacement", reason = "Attempt to replace protected include topology." }
+
+[[cases]]
+id = "competing-default-overrides"
+profile = "profiles/work-01.toml"
+expected_error = "E_OVERRIDE_CONFLICT"
+[[cases.changes]]
+file = "profiles/work-01.toml"
+op = "add"
+path = "/overrides/-"
+value = { resource = "core.git-defaults", path = "/core/editor", value = "vi", reason = "Competes with the work module's declared override." }
+
+[[cases]]
+id = "external-core-replacement"
+profile = "profiles/work-01.toml"
+expected_error = "E_CORE_REPLACEMENT"
+[[cases.changes]]
+file = "external/bundle.toml"
+op = "add"
+path = "/core"
+value = "modules/work/module.toml"
+
+[[cases]]
+id = "unknown-module"
+profile = "profiles/work-01.toml"
+expected_error = "E_MODULE_UNKNOWN"
+[[cases.changes]]
+file = "profiles/work-01.toml"
+op = "add"
+path = "/modules/-"
+value = "missing-module"
+
+[[cases]]
+id = "duplicate-module-selection"
+profile = "profiles/work-01.toml"
+expected_error = "E_MODULE_DUPLICATE"
+[[cases.changes]]
+file = "profiles/work-01.toml"
+op = "add"
+path = "/modules/-"
+value = "work"
+
+[[cases]]
+id = "module-dependency-cycle"
+profile = "profiles/work-01.toml"
+expected_error = "E_DEPENDENCY_CYCLE"
+[[cases.changes]]
+file = "external/modules/work/module.toml"
+op = "add"
+path = "/requires/-"
+value = "work"
+
+[[cases]]
+id = "contribution-namespace"
+profile = "profiles/work-01.toml"
+expected_error = "E_EXTENSION_NAMESPACE"
+[[cases.changes]]
+file = "external/modules/work/module.toml"
+op = "replace"
+path = "/contributions/0/key"
+value = "agents.session"
+
+[[cases]]
+id = "missing-external-source"
+profile = "profiles/work-01.toml"
+expected_error = "E_SOURCE_MISSING"
+[[cases.changes]]
+file = "profiles/work-01.toml"
+op = "replace"
+path = "/bundle"
+value = "../absent/bundle.toml"
+
+[[cases]]
+id = "output-owner-collision"
+profile = "profiles/work-01.toml"
+expected_error = "E_TARGET_COLLISION"
+[[cases.changes]]
+file = "external/modules/work/module.toml"
+op = "replace"
+path = "/resources/0/target"
+value = ".config/git/config"
+
+[[cases]]
+id = "source-containment"
+profile = "profiles/server-01.toml"
+expected_error = "E_SOURCE_ESCAPE"
+[[cases.changes]]
+file = "base/modules/core/module.toml"
+op = "replace"
+path = "/resources/1/value/source"
+value = "../../../profiles/server-01.toml"
+
+[[cases]]
+id = "home-target-containment"
+profile = "profiles/server-01.toml"
+expected_error = "E_TARGET_INVALID"
+[[cases.changes]]
+file = "base/modules/core/module.toml"
+op = "replace"
+path = "/resources/1/target"
+value = "../outside-home"
+
+[[cases]]
+id = "unsupported-module-platform"
+profile = "profiles/work-01.toml"
+expected_error = "E_PLATFORM_UNSUPPORTED"
+[[cases.changes]]
+file = "profiles/work-01.toml"
+op = "replace"
+path = "/platform"
+value = "linux"

@@ -1,0 +1,15 @@
+schema = 1
+id = "desktop"
+platforms = ["macos"]
+requires = []
+
+[[resources]]
+id = "aerospace"
+kind = "link"
+adapter = "fs-link/v1"
+target = ".config/aerospace/aerospace.toml"
+[resources.value]
+source = "files/aerospace.toml"
+[resources.policy]
+defaults = ["/source"]
+extensions = []

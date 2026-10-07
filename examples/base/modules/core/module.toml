@@ -1,0 +1,40 @@
+schema = 1
+id = "core"
+platforms = ["macos", "linux"]
+requires = []
+
+# Ordinary authored files stay ordinary files. No override of this topology.
+[[resources]]
+id = "git"
+kind = "link"
+adapter = "fs-link/v1"
+target = ".config/git/config"
+[resources.value]
+source = "files/gitconfig"
+
+[[resources]]
+id = "ssh"
+kind = "link"
+adapter = "fs-link/v1"
+target = ".ssh/config"
+[resources.value]
+source = "files/ssh_config"
+[resources.policy]
+defaults = ["/source"]
+extensions = []
+
+# Native rendering demonstrates exposed defaults without a template language.
+[[resources]]
+id = "git-defaults"
+kind = "render"
+adapter = "git-config/v1"
+target = ".config/external-overlays/git/base.inc"
+[resources.value.core]
+editor = "nvim"
+[resources.value.init]
+defaultBranch = "main"
+[resources.value.fetch]
+prune = true
+[resources.policy]
+defaults = ["/core/editor", "/init/defaultBranch", "/fetch/prune"]
+extensions = []
