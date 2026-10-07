@@ -30,11 +30,11 @@ just check
 uv run scripts/check_examples.py
 ```
 
-The checker uses Python 3.14 and the standard library. It checks TOML syntax, basic document shapes, local references, source containment, resource IDs, policy pointers, and acceptance-fixture structure. It also proves that five malformed example variants are rejected.
+The checker uses Python 3.14 and the standard library. It checks TOML syntax, basic document shapes, local references, source containment, resource IDs, policy pointers, and acceptance-fixture structure. It also checks rejection of nine malformed example variants, including wrong document-kind references, and acceptance of a profile without optional overrides.
 
 It does **not** implement composition, evaluate the acceptance expectations, contact package managers or vaults, or inspect/write a live HOME. Python is a documentation-check dependency, not a decision about the manager's implementation or target-machine requirements.
 
-Recorded draft verification: 14 manifests and seven modules checked; 16 acceptance-case definitions inspected; all five malformed variants rejected. Ruff lint/format, hook shell syntax, and authored-source Gitleaks scans passed. The draft 0.2 review HTML passed layout checks at 1280 and 390 CSS pixels in both themes; those checks predate the doctor table added in draft 0.3. These checks do not establish implementation of the required workflows.
+The checker reports 14 manifests, seven modules, 16 unexecuted acceptance-case definitions, nine malformed-variant rejections, and one accepted profile without overrides. Earlier draft verification rejected the original five malformed variants. Ruff lint/format, hook shell syntax, and authored-source Gitleaks scans passed. The draft 0.2 review HTML passed layout checks at 1280 and 390 CSS pixels in both themes; those checks predate the doctor table added in draft 0.3. These checks do not establish implementation of the required workflows.
 
 [Contract CI](.github/workflows/contract-check.yml) runs the fixture checker, pinned Ruff lint/format checks, and inert-hook syntax checks on pushes and pull requests. It does not run the proposed manager workflows.
 
