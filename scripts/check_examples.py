@@ -212,6 +212,7 @@ def check(root: Path) -> tuple[int, int, int]:
                     f"{name}: extension must be a map",
                 )
 
+    bundles = {path for path in docs if path.name == "bundle.toml"}
     profiles = {
         path: doc for path, doc in docs.items() if path.parent.name == "profiles"
     }
@@ -224,7 +225,14 @@ def check(root: Path) -> tuple[int, int, int]:
             )
             for key in ("core", "extends"):
                 if key in doc:
-                    local_path(root, path.parent / doc[key])
+                    target = local_path(root, path.parent / doc[key])
+                    require(
+                        target in modules and modules[target]["id"] == "core"
+                        if key == "core"
+                        else target in bundles,
+                        f"{path}: {key} must reference a parsed "
+                        + ("core module" if key == "core" else "bundle"),
+                    )
             for name, reference in doc["modules"].items():
                 target = local_path(root, path.parent / reference)
                 require(
@@ -241,12 +249,14 @@ def check(root: Path) -> tuple[int, int, int]:
                     "platform",
                     "architecture",
                     "modules",
-                    "overrides",
                 },
-                set(),
+                {"overrides"},
                 str(path),
             )
-            local_path(root, path.parent / doc["bundle"])
+            require(
+                local_path(root, path.parent / doc["bundle"]) in bundles,
+                f"{path}: bundle must reference a parsed bundle",
+            )
             require(set(doc["modules"]) <= set(ids), f"{path}: unknown selected module")
         if path in modules or path in profiles:
             for override in doc.get("overrides", []):
@@ -321,7 +331,7 @@ def check(root: Path) -> tuple[int, int, int]:
 
 
 def main() -> None:
-    """Check the examples and reject five malformed copies in temporary storage.
+    """Check examples, nine malformed copies, and one valid optional-field omission.
 
     Returns:
         None: Prints validation evidence or raises on failure.
@@ -354,6 +364,31 @@ def main() -> None:
             '"/core/missing",',
             "unknown policy path",
         ),
+        (
+            "base/bundle.toml",
+            'core = "modules/core/module.toml"',
+            'core = "../external/bundle.toml"',
+            "core must reference a parsed core module",
+        ),
+        (
+            "base/bundle.toml",
+            'core = "modules/core/module.toml"',
+            'core = "modules/server/module.toml"',
+            "core must reference a parsed core module",
+        ),
+        (
+            "external/bundle.toml",
+            'extends = "../base/bundle.toml"',
+            'extends = "../base/modules/core/module.toml"',
+            "extends must reference a parsed bundle",
+        ),
+        (
+            "profiles/server-01.toml",
+            'bundle = "../base/bundle.toml"',
+            'bundle = "../base/modules/server/module.toml"',
+            "bundle must reference a parsed bundle",
+        ),
+        ("profiles/server-01.toml", "overrides = []\n", "", None),
     ]
     for relative, old, new, diagnostic in mutations:
         with tempfile.TemporaryDirectory(prefix="dotfiles-contract-") as directory:
@@ -367,16 +402,24 @@ def main() -> None:
             )
             target.write_text(original.replace(old, new))
             try:
-                check(fixture)
+                result = check(fixture)
             except ValueError as error:
-                require(diagnostic in str(error), f"wrong rejection: {error}")
+                require(
+                    diagnostic is not None and diagnostic in str(error),
+                    f"wrong rejection: {error}",
+                )
             else:
-                raise AssertionError(f"checker accepted malformed fixture: {relative}")
+                require(
+                    diagnostic is None,
+                    f"checker accepted malformed fixture: {relative}",
+                )
+                require(result == counts, "valid fixture changed document counts")
     print(
         f"Checked {counts[0]} manifests, {counts[1]} modules, {counts[2]} acceptance-case definitions."
     )
     print(
-        "Rejected all five malformed fixture variants. Resolver expectations were not executed."
+        "Rejected nine malformed fixture variants; accepted one profile without overrides. "
+        "Resolver expectations were not executed."
     )
 
 
