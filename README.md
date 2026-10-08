@@ -4,6 +4,7 @@ A proposed manager for one profile per machine, an authoritative shared core, an
 
 **Status:** design and example fixtures only. There is no manager executable, configuration resolver, provider implementation, or deployment engine. `dotfiles-manager` is a working name. No implementation language or license has been selected.
 
+- [Reviewed delivery roadmap](docs/roadmap.json) and [review record](docs/roadmap-review.md): M5/M3 task contracts and evidence gates. Kaneo DFM is the authoritative backlog.
 - [Design contract](DESIGN.md): agreed requirements, proposed manifest semantics, lifecycle, and migration boundaries.
 - [Initial inventory classification](INVENTORY.md): actual source areas proposed as invariants, defaults, modules, or unmanaged state.
 - [Example profiles](examples/profiles/): personal development, synthetic work, homelab, and server compositions.
