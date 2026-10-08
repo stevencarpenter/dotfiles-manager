@@ -18,31 +18,76 @@
       "key": "evidence",
       "title": "feat(readiness): establish scope and migration evidence",
       "priority": "high",
-      "goal": "Current two-machine scope, ownership baseline, implementation contract and honest publication gate are established. Historical audits and synthetic fixtures are not live compatibility proof."
+      "goal": "Current two-machine scope, ownership baseline, implementation contract and honest publication gate are established. Historical audits and synthetic fixtures are not live compatibility proof.",
+      "kaneo": {
+        "id": "bfaccwjmr7jiyb1vki06zw9j",
+        "ticket": "DFM-1",
+        "status": "to-do",
+        "priority": "high",
+        "labels": [
+          "epic"
+        ]
+      }
     },
     {
       "key": "engine",
       "title": "feat(engine): build a safe owned-configuration engine",
       "priority": "high",
-      "goal": "An installable engine resolves one explicit profile and safely plans, applies, verifies and recovers owned operations. This internal milestone is not the first delivered product."
+      "goal": "An installable engine resolves one explicit profile and safely plans, applies, verifies and recovers owned operations. This internal milestone is not the first delivered product.",
+      "kaneo": {
+        "id": "v51z47oi6qrt0v5sj0i3vtmz",
+        "ticket": "DFM-2",
+        "status": "to-do",
+        "priority": "high",
+        "labels": [
+          "epic"
+        ]
+      }
     },
     {
       "key": "providers",
       "title": "feat(providers): cover both development-machine profiles",
       "priority": "high",
-      "goal": "Every selected configuration, version source, package, service and privileged resource has one explicit owner and a tested supported path. Public/private boundaries and foreign application state survive."
+      "goal": "Every selected configuration, version source, package, service and privileged resource has one explicit owner and a tested supported path. Public/private boundaries and foreign application state survive.",
+      "kaneo": {
+        "id": "tm41x7jq3rsm86fu84zeb9gh",
+        "ticket": "DFM-3",
+        "status": "to-do",
+        "priority": "high",
+        "labels": [
+          "epic"
+        ]
+      }
     },
     {
       "key": "workflows",
       "title": "feat(workflows): deliver all four required workflows",
       "priority": "high",
-      "goal": "Complete-graph update, one-command GitHub sync, trial/adopt/purge and read-only doctor work together with interruption and non-mutation evidence. A resolver-only release does not satisfy this epic."
+      "goal": "Complete-graph update, one-command GitHub sync, trial/adopt/purge and read-only doctor work together with interruption and non-mutation evidence. A resolver-only release does not satisfy this epic.",
+      "kaneo": {
+        "id": "f5v9iy4rfmtitefqtoid3i5v",
+        "ticket": "DFM-4",
+        "status": "to-do",
+        "priority": "high",
+        "labels": [
+          "epic"
+        ]
+      }
     },
     {
       "key": "cutover",
       "title": "feat(cutover): replace ownership on both development Macs",
       "priority": "high",
-      "goal": "Personal M5 and work M3 each pass native evidence, rehearsal, recovery and owner-approved cutover. Old writers are retired only after their replacement is proven. i9 and future machines are excluded."
+      "goal": "Personal M5 and work M3 each pass native evidence, rehearsal, recovery and owner-approved cutover. Old writers are retired only after their replacement is proven. i9 and future machines are excluded.",
+      "kaneo": {
+        "id": "uxd94udv9sur9bdg9al5uupj",
+        "ticket": "DFM-5",
+        "status": "to-do",
+        "priority": "high",
+        "labels": [
+          "epic"
+        ]
+      }
     }
   ],
   "tasks": [
@@ -60,7 +105,16 @@
         "Future Linux and Mac Studio/Mac Mini consideration is limited to avoiding OS-bound core semantics, mandatory GUI assumptions and hard-coded model/prefix paths. Do not add platform implementations, a new portability framework or future delivery gates.",
         "Use a configured Worktrunk sibling based on the current published design head, preserving the active validation branch and original checkpoints. Keep employer names and actual work-machine posture out of public artifacts.",
         "Run just check, git diff --check and relevant documentation checks; record a focused Conventional Commit. Do not claim fixture success verifies a machine."
-      ]
+      ],
+      "kaneo": {
+        "id": "n3hmmk651i5u60nrq7tvkgms",
+        "ticket": "DFM-6",
+        "status": "to-do",
+        "priority": "high",
+        "labels": [
+          "ready-for-agent"
+        ]
+      }
     },
     {
       "key": "m5-inventory",
@@ -76,7 +130,16 @@
         "Identify every writer and trigger: Nix/Home Manager activation, just recipes, hooks, installers, launch jobs, application updaters and manual entry points. Identify source-linked outputs that change when Git checkouts move.",
         "Record recoverable configuration/state boundaries and an independent usable shell/access path. Inventory is not permission to render secrets, repair drift, install, reload or retire owners.",
         "Owner confirms the scoped, redacted evidence and its storage location. Keep raw machine data local; attach an approved summary or reference, not secret content."
-      ]
+      ],
+      "kaneo": {
+        "id": "jyvgvzw3pr22920qfy6x1hiq",
+        "ticket": "DFM-7",
+        "status": "to-do",
+        "priority": "high",
+        "labels": [
+          "needs-human"
+        ]
+      }
     },
     {
       "key": "m3-inputs",
@@ -92,7 +155,16 @@
         "Keep employer configuration and security posture in the authorized private location. Do not upload raw inputs to this personal board/repository or add network agents, tunnels, credentials or trust exceptions to obtain access.",
         "Record approved manager installation/source access, operator evidence-transfer path and independent recovery access. The work machine need not reach Kaneo or the personal control environment.",
         "Owner approves a minimal evidence handoff. Missing required inputs remain blockers. Relate DOT-6 for context without duplicating or requiring completion of its old work-flake implementation."
-      ]
+      ],
+      "kaneo": {
+        "id": "wx8ukzkafdil2j83thqnxw39",
+        "ticket": "DFM-8",
+        "status": "to-do",
+        "priority": "high",
+        "labels": [
+          "needs-human"
+        ]
+      }
     },
     {
       "key": "ownership",
@@ -110,7 +182,14 @@
         "Classify actual content as invariant, exposed default, selected module or application-owned state. Preserve bounded replacement/subtraction and native include semantics, not an additions-only model.",
         "Every retained resource has a replacement path. Split any newly discovered provider into a bounded task and add real blocks relations before this task closes; a generic script that invokes old orchestration is not coverage.",
         "Review the ledger against both evidence packets and the current source tree, with approved private attestations where needed. Store only synthetic/generalized work examples in shared/public documents."
-      ]
+      ],
+      "kaneo": {
+        "id": "wsz2tv8cjtvxona3ysqmio56",
+        "ticket": "DFM-9",
+        "status": "to-do",
+        "priority": "high",
+        "labels": []
+      }
     },
     {
       "key": "architecture",
@@ -129,7 +208,14 @@
         "Validate against existing cases and one concrete file/package/co-owned/secret/native lifecycle operation. Document actual device/bootstrap compatibility as a later evidence gate, not an assumption. Independent review and just check pass.",
         "Define bounded noninteractive behavior and consistent terminal outcomes for CLI automation. Without a TTY or required credentials/approval, fail before mutation rather than prompt indefinitely; explicit approval is bound to the exact reviewed plan and does not waive stale-state, privilege, secret or disruptive-action gates. No scheduler or daemon is implied.",
         "Define the shared installation/discovery, inspection, generation/reload and update-completion contracts used by workflow tests, including realistic fake implementations. Earlier workflow leaves verify orchestration against these contracts; completed real provider adapters are joined and verified at integration, not invented again inside workflows."
-      ]
+      ],
+      "kaneo": {
+        "id": "sga4he1czkae97jtuwfyi5p0",
+        "ticket": "DFM-10",
+        "status": "to-do",
+        "priority": "high",
+        "labels": []
+      }
     },
     {
       "key": "native-discovery",
@@ -148,7 +234,16 @@
         "Before closing an affected adapter/bootstrap acceptance, attach the relevant discovery evidence or create a scoped blocks relation for its concrete unresolved finding. Generic engine and fake workflow development remain independent; do not globally block every provider or require hosted CI merely to gather approved evidence.",
         "Probe effects must be disposable and approved, or remain an explicit owner/access blocker. No inferred package churn, vault export, production migration, blind restart, trust exception or live ownership handoff is authorized.",
         "Reconcile each finding with shared adapter contracts and realistic mocks. Add newly discovered provider work as bounded leaves with ownership/integration/native-proof dependencies before claiming coverage. Final provider-proof remains required after integration for the exact packaged candidate."
-      ]
+      ],
+      "kaneo": {
+        "id": "aoktjvcc1totjjv1axrjm61m",
+        "ticket": "DFM-11",
+        "status": "to-do",
+        "priority": "high",
+        "labels": [
+          "needs-human"
+        ]
+      }
     },
     {
       "key": "ci-account",
@@ -163,7 +258,16 @@
         "An actual workflow job for this private repository starts; attach the run/job URL and observed outcome without account/payment details. This proves runner eligibility, not a green manager or final PR.",
         "Keep the existing publication validation run intact; do not create a duplicate run or dismiss its awaiting CI finding as passed.",
         "Owner explicitly promotes this device/account task after the operational evidence is present."
-      ]
+      ],
+      "kaneo": {
+        "id": "s3v0nlq2567zsx8vksiny0la",
+        "ticket": "DFM-12",
+        "status": "to-do",
+        "priority": "urgent",
+        "labels": [
+          "needs-human"
+        ]
+      }
     },
     {
       "key": "publication",
@@ -179,9 +283,16 @@
         "Resume run 01M4AQBBVXZP1R06N185E4NTCR, preserving its fixes and branch docs/initial-contract at the actual current SHA. Never abort/reset/rewrite merely to bypass the finding.",
         "Verify real hosted checks for the exact pushed SHA and confirm PR #1 remains private-repository, open and unmerged until separately authorized. Report jobs that cannot start as infrastructure blockers.",
         "Correct the PR's product-validation wording to documentation-checker validation. Record the off-contract generated commit subject and obtain an approved correction/disposition without silently rewriting preserved history.",
-        "Record the checker\u2019s actual structural/self-test coverage separately from unexecuted resolver and workflow requirements. Re-run the relevant local gate and reconcile the remote head.",
+        "Record the checker’s actual structural/self-test coverage separately from unexecuted resolver and workflow requirements. Re-run the relevant local gate and reconcile the remote head.",
         "This evidence leaf closes when the preserved validation run, accurate PR metadata and reviewed exact-SHA hosted checks are complete. PR #1 remains open and unmerged until separately authorized; merge is not this leaf's closure condition or a prerequisite for native proof. Attach the run/check URLs and exact SHA; no billing or merge authority is granted."
-      ]
+      ],
+      "kaneo": {
+        "id": "obshvas56hpmbwsg10kiymjw",
+        "ticket": "DFM-13",
+        "status": "in-review",
+        "priority": "high",
+        "labels": []
+      }
     },
     {
       "key": "bootstrap",
@@ -200,7 +311,14 @@
         "Document source/build identity and safe upgrade sequencing. Do not add a service, network listener, automatic updater, release publication or new runtime framework.",
         "Expose explicit binding commands and refuse unsupported deliberate rebinding. Durable binding identity enforcement, storage validation, receipt/trial preservation and concurrent binding tests are implemented in state and exercised through the installed CLI; no force flag or implicit profile inference is introduced.",
         "Device-dependent installation/source-access choices remain provisional. When approved M5/M3 evidence is available, reconcile the chosen path and perform authorized isolated invocation probes before promoting that path for native proof. Generic bootstrap work can proceed independently of both inventory tasks."
-      ]
+      ],
+      "kaneo": {
+        "id": "czt93q1kcipulat2cuoepi7p",
+        "ticket": "DFM-14",
+        "status": "to-do",
+        "priority": "high",
+        "labels": []
+      }
     },
     {
       "key": "resolver",
@@ -219,7 +337,14 @@
         "Resolve deterministically with no network, vault, target writes, package access or manifest code execution. Tests verify both outcomes and non-mutation; just check and independent review pass.",
         "Use two synthetic target profiles referencing the same core and reusable module source. Change the shared source once and prove both resolutions change without copied declarations; preserve allowed private overrides and public resolution without private reads. Reject invariant overrides and competing owners.",
         "Errors identify the declaring source, resource/field, rejected value category, conflicting owner where applicable and corrective action. Keep secret-bearing values redacted. Test one unknown field and one conflicting override."
-      ]
+      ],
+      "kaneo": {
+        "id": "hr0jobkbht9srl3ej9vol8k5",
+        "ticket": "DFM-15",
+        "status": "to-do",
+        "priority": "high",
+        "labels": []
+      }
     },
     {
       "key": "planner",
@@ -237,7 +362,14 @@
         "Changed source content, targets, ownership or topology invalidates approval before mutation. Unsupported privileged paths and unknown ownership fail closed.",
         "Test collisions, directory/file transitions, aliasing, input races and source edits after planning; assert plan/inspect perform no network, vault or mutating provider calls.",
         "A rejected plan identifies source/resource/field, conflicting claim or failed precondition, and one actionable correction without secret values. Test a representative source/ownership conflict through the CLI."
-      ]
+      ],
+      "kaneo": {
+        "id": "vx52tccsv2o7xd2wl1iact3l",
+        "ticket": "DFM-16",
+        "status": "to-do",
+        "priority": "high",
+        "labels": []
+      }
     },
     {
       "key": "state",
@@ -257,7 +389,14 @@
         "Inject persistence failure, concurrent commands and abrupt exit around receipt writes; verify last-good recovery, lock release and no inferred deletion.",
         "Verify binding identity against loaded receipts and trial records through the installed CLI. Concurrent initial binding or a changed profile/machine identity cannot create two owners or replace an existing binding; refuse before writes and preserve last-good receipts, claims and trial baselines.",
         "Before initializing or writing binding/state/snapshots, validate topology and trusted ownership/permissions within canonical HOME and manager storage boundaries. Refuse redirected manager roots/binding files or conflicting path types without repair. Test zero writes to redirected foreign destinations; recognize legitimate macOS canonical path aliases rather than banning all ancestor symlinks."
-      ]
+      ],
+      "kaneo": {
+        "id": "qey0v78406la9lb6ixsgvvh7",
+        "ticket": "DFM-17",
+        "status": "to-do",
+        "priority": "high",
+        "labels": []
+      }
     },
     {
       "key": "files",
@@ -276,7 +415,14 @@
         "Record file publication separately from consumer reload. Required failure stops mutation by default, blocks dependents and reports applied/failed/blocked/not-started work.",
         "Regression checks cover recursive ~/.dotfiles-style links, stale/dangling parents, directory transitions, replaced links, target races, permissions and safe no-op reruns.",
         "For an explicitly approved legacy file handoff, verify the exact released writer and unchanged output, journal its recoverable baseline and record the new claim before publication. Refuse changed/unattributed outputs. Test a legacy symlink and co-owned output, interruption between release/acquisition, concurrent replacement and scoped recovery. Use synthetic approved claims here; integration/rehearsal reconciles actual claims with the ledger."
-      ]
+      ],
+      "kaneo": {
+        "id": "h2ayd9upohg1wscf0aal1so9",
+        "ticket": "DFM-18",
+        "status": "to-do",
+        "priority": "high",
+        "labels": []
+      }
     },
     {
       "key": "recovery",
@@ -293,7 +439,14 @@
         "Report irreversible native updates and application/database migrations with explicit compatible recovery or forward-fix steps; package downgrade is not database rollback.",
         "Keep the coordinator/recovery executable available through source/runtime/self updates. Source publication and provider cancellation boundaries are explicit.",
         "Fault-inject before/after external success and receipt persistence, partial publication and recovery failure; prove no duplicate irreversible action and honest partial results."
-      ]
+      ],
+      "kaneo": {
+        "id": "xavp4wgp1qc1f8fxxujk2ux2",
+        "ticket": "DFM-19",
+        "status": "to-do",
+        "priority": "high",
+        "labels": []
+      }
     },
     {
       "key": "native-config",
@@ -311,7 +464,14 @@
         "Validate effective native settings for claimed invariants with bounded approved probes; report unenforceable invariants rather than equating a protected manifest field with native enforcement.",
         "Preserve unrelated native fragments and app runtime state. Generation or syntax failure leaves last-good output and blocks dependent reloads.",
         "Test order-sensitive Git/SSH examples, disappearing/foreign fragments, file substitutions and malformed input through plan/apply/verify, then run just check."
-      ]
+      ],
+      "kaneo": {
+        "id": "u9r58zj69s36yphovuzt5dc8",
+        "ticket": "DFM-20",
+        "status": "to-do",
+        "priority": "high",
+        "labels": []
+      }
     },
     {
       "key": "agent-config",
@@ -329,7 +489,14 @@
         "Re-read/merge safely or require quiescence for concurrent application writers. A manager lock is not a lock on the application; changed foreign inputs invalidate unsafe publication.",
         "Keep discovery/fetch outside read-only resolution and keep sessions, credentials, approval/trust state and databases outside configuration capture. Respect intentional tracked app-written declarative exceptions.",
         "Tests preserve foreign hooks/preferences, retire only owned handlers and retain last-good files after missing overlays, malformed settings or concurrent writes. Every inventoried destination is accounted for."
-      ]
+      ],
+      "kaneo": {
+        "id": "uv7flk29inalkxnfgayybwp6",
+        "ticket": "DFM-21",
+        "status": "to-do",
+        "priority": "high",
+        "labels": []
+      }
     },
     {
       "key": "secrets",
@@ -347,7 +514,14 @@
         "Keep secret bytes, public hashes, environment dumps and raw provider errors out of plans, Git, general receipts and adoption. Any permitted secret recovery material remains locally restricted.",
         "Read-only commands never contact a vault or prompt for authentication. Ordinary sync/update requires explicit scope to render; missing required secrets cannot become warnings with success.",
         "Run fake-vault success/failure/expired-auth tests with realistic overwrite semantics, and leak-scan outputs. Actual vault/device acceptance is separately owner-approved."
-      ]
+      ],
+      "kaneo": {
+        "id": "j1pulunnbtfcpltlr2chpdxi",
+        "ticket": "DFM-22",
+        "status": "to-do",
+        "priority": "high",
+        "labels": []
+      }
     },
     {
       "key": "brew",
@@ -365,7 +539,14 @@
         "Separate side-effect-free metadata inspection from candidate refresh and installation. Missing metadata/provider or credentials is explicit, not silently omitted coverage.",
         "Capture dependency/install attribution needed for trials and approved ownership transfer; preserve pre-existing/shared dependencies and expose indirect upgrade effects before approval.",
         "Contract tests cover no-op, failure, pending casks, shared dependencies and upgrade side effects. Native provider behavior must later pass the isolated macOS proof gate."
-      ]
+      ],
+      "kaneo": {
+        "id": "h1y4zvbwiccadha8hmf743th",
+        "ticket": "DFM-23",
+        "status": "to-do",
+        "priority": "high",
+        "labels": []
+      }
     },
     {
       "key": "toolchains",
@@ -383,7 +564,14 @@
         "Report declared/installed/selected identities and compatibility. Respect existing installer/source ownership and prevent duplicate package owners.",
         "Keep the running coordinator/interpreter and recovery path usable during upgrade; self/runtime replacement happens only after durable result recording or a proven safe handoff.",
         "Tests cover missing runtimes, shim ambiguity, held/forked tools, unsupported sources and interrupted upgrade; assert read-only probes cannot auto-install or access the network."
-      ]
+      ],
+      "kaneo": {
+        "id": "w38x24s276l5b01eby9jr7oi",
+        "ticket": "DFM-24",
+        "status": "to-do",
+        "priority": "high",
+        "labels": []
+      }
     },
     {
       "key": "plugins",
@@ -402,7 +590,14 @@
         "Enforce approved source identities and explicit trust for new origins; fetching metadata is not authorization to execute repository code or arbitrary installer scripts.",
         "Place eligible pin/lock edits in their actual owning repository with provenance; missing credentials, read-only sources or unsupported managed versions block preparation instead of shrinking the update set.",
         "Tests exercise disable/substitution, dependency overlap, malicious/escaped source paths, foreign skills, local forks and lock updates without hard-coding model names or cosmetic preferences."
-      ]
+      ],
+      "kaneo": {
+        "id": "xs074zuete91uezwms13fdou",
+        "ticket": "DFM-25",
+        "status": "to-do",
+        "priority": "high",
+        "labels": []
+      }
     },
     {
       "key": "lifecycle",
@@ -420,7 +615,14 @@
         "Distinguish installed, selected, running and consumer-loaded state; record fresh verification or explicit pending/unknown. A queued request cannot produce full-update success.",
         "Avoid competing launchers/installers and preserve application databases/sessions. Check version/data compatibility before destructive or irreversible transitions.",
         "Use realistic fake processes for timeout, queued completion, failure and interruption tests, then require native lifecycle/reload evidence before cutover."
-      ]
+      ],
+      "kaneo": {
+        "id": "tfhk2uitxkvgwnl350x29vs7",
+        "ticket": "DFM-26",
+        "status": "to-do",
+        "priority": "high",
+        "labels": []
+      }
     },
     {
       "key": "system",
@@ -440,7 +642,14 @@
         "Coordinate package/service ownership handoff without destructive blanket uninstall or a wrapper that still delegates authority to nix-darwin/Home Manager.",
         "Keep OS-specific defaults/launch semantics in their provider boundary, not core composition. No Linux implementation, hostname branching or universal desktop assumptions.",
         "Tests cover denied privilege, partially applied defaults, missing prerequisites, pending installers and retained unrelated settings. Native proof and owner approval are separate gates."
-      ]
+      ],
+      "kaneo": {
+        "id": "gz0jmqgz86oulv4gac9epbb9",
+        "ticket": "DFM-27",
+        "status": "to-do",
+        "priority": "high",
+        "labels": []
+      }
     },
     {
       "key": "public-profile",
@@ -459,7 +668,14 @@
         "Keep the existing public Nix API functioning during coexistence; new declarations do not activate a second writer. Do not repurpose homelab or Linux fixtures as deployment profiles.",
         "Run resolver coverage against the ledger, source secret scans and fixture/implementation gates. No live apply, source checkout movement or old-writer disablement in this conversion task.",
         "Provide an executable synthetic authoring walkthrough: create one small reusable module, select it in two profiles, expose one bounded preference/contribution, validate and inspect declared resource ownership and supplying-source provenance through resolve/explain. Reuse shared sources instead of copying configuration or adding a new expression language; live path inspection remains planner scope."
-      ]
+      ],
+      "kaneo": {
+        "id": "evw1rfdbe6wmdv1tqido8bd5",
+        "ticket": "DFM-28",
+        "status": "to-do",
+        "priority": "high",
+        "labels": []
+      }
     },
     {
       "key": "work-profile",
@@ -477,7 +693,14 @@
         "Demonstrate that public-only composition neither fetches nor names private sources and work composition selects only its declared modules/resources. Keep personal-only sources/actions absent unless actually declared and authorized.",
         "Reconcile the complete M3 ledger using permitted private test execution; return owner-approved evidence references without copying employer data into personal/public fixtures.",
         "Keep old ownership unchanged until cutover, with passing private composition/contract tests and independent review. Missing access is a blocker, not a synthetic-fixture substitute."
-      ]
+      ],
+      "kaneo": {
+        "id": "h90m6i4hj734n0k565kf0niw",
+        "ticket": "DFM-29",
+        "status": "to-do",
+        "priority": "high",
+        "labels": []
+      }
     },
     {
       "key": "sync",
@@ -496,7 +719,14 @@
         "Apply fetched declared versions and required missing prerequisites/generation/reloads without independently upgrading all floating dependencies. Explicit secret/disruption approval remains inside the workflow.",
         "CLI tests with temporary Git remotes cover already-linked sources, invalid nested modules, missing credentials/new trust, declined approval, concurrent changes and repeat no-op sync. No stale/core-only success fallback.",
         "Distinguish declared tracking refs from exact nested-module pins: tracking refs advance as declared, exact revisions remain exact, and sync never rewrites their owning pin/lock to a newer upstream identity. Temporary-remote tests cover an advanced upstream branch and missing exact source content without tracking-head substitution or publication."
-      ]
+      ],
+      "kaneo": {
+        "id": "k5pmgnepgdx1w9g55t2fn7pm",
+        "ticket": "DFM-30",
+        "status": "to-do",
+        "priority": "high",
+        "labels": []
+      }
     },
     {
       "key": "update",
@@ -514,7 +744,14 @@
         "Write pin/lock changes only to owning sources, preserve unrelated edits/private boundaries and never auto-commit/push. Read-only source update paths are explicit or block.",
         "Verify/account every participant as updated/current/held/pending/failed/blocked and resume safely. Tests prove partial failure, missing provider, pending native updates and self-update sequencing cannot report full success.",
         "Exclude trial-only upgrades. During preparation, block candidate operations whose known indirect provider effects would change an active trial installation or its attributed dependencies. Preserve the trial baseline/attribution and give the action needed to resolve the blocked trial; add no new approval mode that silently bypasses trial protection."
-      ]
+      ],
+      "kaneo": {
+        "id": "t1md1gh1aeyhnfibos5tbeuo",
+        "ticket": "DFM-31",
+        "status": "to-do",
+        "priority": "high",
+        "labels": []
+      }
     },
     {
       "key": "try",
@@ -532,7 +769,14 @@
         "Attach durable trial state to the bound profile without bypassing protected core rules. Baselines survive shell/process exit.",
         "Declare unsupported/uninstrumented effects as unknown candidates, not owned cleanup scope. Newly observed paths never acquire a retroactive baseline.",
         "Tests cover new/pre-existing installations, baseline failure, decline and interrupted install using a fake provider. Later workflow integration must prove sync/update preserve active trials."
-      ]
+      ],
+      "kaneo": {
+        "id": "rphld14v0tedsfgvibw2s1n7",
+        "ticket": "DFM-32",
+        "status": "to-do",
+        "priority": "high",
+        "labels": []
+      }
     },
     {
       "key": "adopt",
@@ -551,7 +795,14 @@
         "A subsequent sync reproduces the adopted configuration without a duplicate owner or loss of unrelated source edits.",
         "Tests cover secrets, forbidden core overrides, missing source access, malformed configuration, concurrent edits and failure at each handoff boundary.",
         "Refuse a destination absent from the prospective bound profile before writing source or transferring trial ownership. Test a valid but unselected catalogue module with unchanged sources and intact recoverable trial/baseline; suggest selecting an appropriate module through a separately validated profile edit rather than changing selection implicitly."
-      ]
+      ],
+      "kaneo": {
+        "id": "q77e8m00tycbv0rh13rgmtl6",
+        "ticket": "DFM-33",
+        "status": "to-do",
+        "priority": "high",
+        "labels": []
+      }
     },
     {
       "key": "purge",
@@ -568,7 +819,14 @@
         "Restore baseline files only if current content/topology still matches the trial-owned result. Concurrent edits, unsafe parents and missing/corrupt receipts block the affected cleanup.",
         "Report retained/unattributed effects and reasons. Never run broad autoremove, recursive HOME deletion or infer that the machine is pristine.",
         "CLI regression cases cover trial-only versus pre-existing installations, multiple trials, external edits, lost state, interrupted purge and approval refusal."
-      ]
+      ],
+      "kaneo": {
+        "id": "n6lqwcbbz5mb31hkiev5stn9",
+        "ticket": "DFM-34",
+        "status": "to-do",
+        "priority": "high",
+        "labels": []
+      }
     },
     {
       "key": "doctor",
@@ -586,7 +844,14 @@
         "Use only bounded approved local probes with timeouts. Never execute arbitrary binaries/shims, fetch, auto-install, write, authenticate to vaults, reload or repair; remote eligibility is dated cached evidence or unknown.",
         "Keep independent rows when manifests/modules/providers/probes fail; label stale receipt-derived inventory partial. Table and versioned JSON agree on OK/WARN/ERROR/UNKNOWN/not-applicable, no secrets/ANSI leakage and exit 0/1/2 contract.",
         "Test narrow-terminal/full-path output and malformed/missing/unsafe/timeout cases with explicit filesystem/network/vault/process non-mutation assertions. Errors or incomplete required checks cannot return healthy success."
-      ]
+      ],
+      "kaneo": {
+        "id": "ka07977ghue5i1rai8tqkg6d",
+        "ticket": "DFM-35",
+        "status": "to-do",
+        "priority": "high",
+        "labels": []
+      }
     },
     {
       "key": "integration",
@@ -619,7 +884,14 @@
         "Exercise cross-profile shared-source propagation, bounded private overrides and binding/refusal preservation end to end. Test noninteractive missing-approval/credential paths for prompt termination, non-mutation and truthful partial/pending exit results.",
         "Exercise trial-only and shared-dependency upgrade cases and assert no implicit trial version change. Test adoption into an unselected catalogue module with unchanged sources and a recoverable baseline. Exact source-pin tests must retain a declared nested-module revision when its upstream branch advances or block when exact content is unavailable.",
         "Verify every inventoried real provider adapter through the packaged CLI using isolated targets and realistic fakes at external-process boundaries. Earlier workflow contracts are orchestration tests, not claims of complete real-provider or native support; final provider-proof verifies actual native behavior."
-      ]
+      ],
+      "kaneo": {
+        "id": "a7m6aq93qwpjfc8juzkmk2y6",
+        "ticket": "DFM-36",
+        "status": "to-do",
+        "priority": "high",
+        "labels": []
+      }
     },
     {
       "key": "provider-proof",
@@ -639,7 +911,16 @@
         "Probes that cannot be safely isolated are explicitly authorized and scoped or remain blockers. No production database migration, package churn, secret export or blind service restart as a test.",
         "Verify the manager installs/runs through approved distribution paths on both M5 and M3 without requiring the retiring managed runtime. Native inability is a release blocker, not an optional skip.",
         "Reconcile results with mocks and resource coverage; fix any contradiction and rerun affected review/CI. Owner approves the evidence; passing this task does not authorize ownership handoff."
-      ]
+      ],
+      "kaneo": {
+        "id": "fn02jzc2hb9wwgeefeylv9if",
+        "ticket": "DFM-37",
+        "status": "to-do",
+        "priority": "high",
+        "labels": [
+          "needs-human"
+        ]
+      }
     },
     {
       "key": "m5-rehearsal",
@@ -659,7 +940,16 @@
         "Rehearse the dependency-ordered release-old/acquire-new sequence with failure and resume, mapping every legacy writer/trigger to an explicit disable/restore action. Never run two writers for the same output.",
         "Prepare and verify independent shell/access recovery, critical development and native menu/SketchyBar acceptance, stop/rollback thresholds and a named observation window before retirement. Irreversible transitions have a compatible forward-recovery path.",
         "Owner reviews the exact plan, rollback runbook and native/CI evidence. Rehearsal approval does not authorize live cutover; retain existing Nix generations/tools and do not garbage-collect."
-      ]
+      ],
+      "kaneo": {
+        "id": "c6whb4dd4ovpobmb51dwyd9u",
+        "ticket": "DFM-38",
+        "status": "to-do",
+        "priority": "high",
+        "labels": [
+          "needs-human"
+        ]
+      }
     },
     {
       "key": "m5-cutover",
@@ -677,7 +967,16 @@
         "Verify fresh login/restart as approved, shell/PATH/toolchains, selected developer/agent tools, secrets without disclosure, native services and the accepted menu/SketchyBar interactions.",
         "Demonstrate all four top-level workflows safely on approved representative resources, including nested sources, trial adopt/purge, non-mutating doctor and truthful native pending/completed results. Preserve unrelated work and runtime state.",
         "Observe the predeclared normal-use window and required service cycles. Owner confirms operational acceptance with exact revisions/receipts; legacy binaries/generations and recovery materials remain retained for later retirement."
-      ]
+      ],
+      "kaneo": {
+        "id": "sdj7jxduqo5cakcyolzuj9u5",
+        "ticket": "DFM-39",
+        "status": "to-do",
+        "priority": "high",
+        "labels": [
+          "needs-human"
+        ]
+      }
     },
     {
       "key": "m3-rehearsal",
@@ -697,7 +996,16 @@
         "Rehearse release-old/acquire-new for every work writer, including private generators, packages, system settings and native lifecycle prerequisites. Missing inputs/providers or incompatible application data block.",
         "Record work identity/native include checks, fresh-login and required development workflows, source/trust boundaries, stop/rollback conditions and a predeclared observation window.",
         "Owner reviews the exact plan and scoped recovery proof. This can proceed independently of M5 cutover, but does not authorize M3 cutover or legacy removal."
-      ]
+      ],
+      "kaneo": {
+        "id": "pm31ceqg48p9x04qfz9gjsp8",
+        "ticket": "DFM-40",
+        "status": "to-do",
+        "priority": "high",
+        "labels": [
+          "needs-human"
+        ]
+      }
     },
     {
       "key": "m3-cutover",
@@ -716,7 +1024,16 @@
         "Verify fresh login/restart as approved, selected work development workflows, identities, PATH/runtimes, private generated settings, secrets and native/system services with actual consumer evidence.",
         "Safely demonstrate update, GitHub sync, trial/adopt/purge and read-only doctor across the actual work graph using approved targets, without moving private configuration/evidence to unauthorized locations.",
         "Observe the declared normal-use window and required cycles; owner confirms operational acceptance. Keep rollback materials and old generations until the separate retirement gate."
-      ]
+      ],
+      "kaneo": {
+        "id": "azd50kz4612ryw4enrpmxlu9",
+        "ticket": "DFM-41",
+        "status": "to-do",
+        "priority": "high",
+        "labels": [
+          "needs-human"
+        ]
+      }
     },
     {
       "key": "retirement",
@@ -735,7 +1052,16 @@
         "Obtain separate destructive-cleanup approval and backup retention/end-of-recovery decision before removal. No blanket Nix uninstall, store GC, package autoremove, credential rotation or repository deletion by inference.",
         "Verify fresh-login/critical behavior and all relevant doctor/ownership checks after scoped retirement; preserve recovery artifacts according to the explicitly approved retention policy.",
         "Owner promotes only with per-machine evidence. i9/Stow and unrelated DOT/HOME work remain unchanged; public compatibility is retired only after known consumers are accounted for."
-      ]
+      ],
+      "kaneo": {
+        "id": "yvsv4cuk5k5wthhkf5r83dhp",
+        "ticket": "DFM-42",
+        "status": "to-do",
+        "priority": "high",
+        "labels": [
+          "needs-human"
+        ]
+      }
     },
     {
       "key": "acceptance",
@@ -754,7 +1080,16 @@
         "Publish accurate usage/recovery documentation in the appropriate authorized repositories and identify evidence limitations without presenting skipped tests or future Linux examples as supported platforms.",
         "Owner explicitly accepts delivery. This gate grants no release publication, visibility change or future-platform work; no i9 dependency is reintroduced.",
         "Verify the documented reusable-module authoring journey and actionable errors against the packaged CLI. Record supported noninteractive behavior without claiming scheduled or unattended upgrades beyond its explicit approval contract."
-      ]
+      ],
+      "kaneo": {
+        "id": "ponxl7k2ueobz88pztaxaeyt",
+        "ticket": "DFM-43",
+        "status": "to-do",
+        "priority": "high",
+        "labels": [
+          "needs-human"
+        ]
+      }
     }
   ],
   "review_revision": "2026-10-08-final",
@@ -762,7 +1097,36 @@
     "id": "ldzsz08c771hgwkfwwzqjdd5",
     "key": "DFM",
     "workspace_id": "7tMuvznyx3ZOUb2boKJQbakZi44sT0eU",
-    "publication_state": "prepared"
+    "publication_state": "verified",
+    "publication_date": "2026-10-08",
+    "verification": {
+      "date": "2026-10-08",
+      "tasksVerified": 43,
+      "epics": 5,
+      "leaves": 38,
+      "fullDescriptionChecks": 43,
+      "subtasks": 38,
+      "blocks": 76,
+      "related": 2,
+      "prioritiesStatusesLabelsAssigneesDatesVerified": true,
+      "taskPagesVerified": 1,
+      "relatedPagesVerified": 1,
+      "onlyReady": "DFM-6",
+      "inReview": "DFM-13",
+      "errors": []
+    },
+    "context_relations": [
+      {
+        "source": "m3-inputs",
+        "target": "DOT-6",
+        "relation_id": "gashw3pj5hhawgmg7nbqskin"
+      },
+      {
+        "source": "provider-proof",
+        "target": "DOT-2",
+        "relation_id": "qqk8jqi4tuwtz4dv4vsill1i"
+      }
+    ]
   },
   "review": {
     "date": "2026-10-08",

@@ -34,7 +34,9 @@ The local structural checker verifies unique task keys, valid parent/prerequisit
 
 `just check` validates documentation fixtures only. Resolver, packaged-workflow and native-device acceptance remain future task evidence. Hosted-CI status in the preserved draft is historical; this review did not recheck GitHub.
 
-After filing, fetch every task and native relation. Compare descriptions, status, priority, labels, parents and prerequisite edges with the exact prepared payload. Check all task and related-data pages. Record IDs and any mismatches in the snapshot before calling publication complete.
+Publication completed on 2026-10-08. Full read-back matched all 43 descriptions, statuses, priorities, labels and absent assignees/dates against prepared payloads. Native relation read-back matched all 38 parents, 76 prerequisite edges and two contextual related links (DOT-6 and DOT-2), without duplicates or unexpected edges. All task and related-data pages were checked. The snapshot records exact IDs, ticket numbers and the verification result: zero mismatches.
+
+DFM-1 through DFM-5 are epic scope containers. DFM-6 is the only initial ready-for-agent leaf. DFM-13 remains in-review for the existing publication evidence. Eleven leaves carry needs-human; no implementation or operational task was started. DFM-11 is early native discovery; DFM-37 is final native proof; DFM-43 owns final delivery acceptance.
 
 ## Remaining uncertainty
 
