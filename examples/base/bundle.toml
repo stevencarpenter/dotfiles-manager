@@ -1,0 +1,10 @@
+schema = 1
+id = "example-base"
+core = "modules/core/module.toml"
+
+[modules]
+agents = "modules/agents/module.toml"
+desktop = "modules/desktop/module.toml"
+personal-dev = "modules/personal-dev/module.toml"
+server = "modules/server/module.toml"
+homelab = "modules/homelab/module.toml"

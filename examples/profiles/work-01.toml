@@ -1,0 +1,8 @@
+# Synthetic external consumer. No private inputs or actual account values.
+schema = 1
+id = "work-01"
+bundle = "../external/bundle.toml"
+platform = "macos"
+architecture = "arm64"
+modules = ["work"]
+overrides = []

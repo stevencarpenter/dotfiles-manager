@@ -1,0 +1,7 @@
+# Synthetic core topology. Missing optional includes are allowed by Git.
+[include]
+    path = ~/.config/external-overlays/git/base.inc
+[include]
+    path = ~/.config/external-overlays/git/extra.inc
+[includeIf "gitdir:~/work/"]
+    path = ~/.config/external-overlays/git/work.inc
