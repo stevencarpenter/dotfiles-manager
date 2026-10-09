@@ -330,6 +330,8 @@ The current private wrapper has not been inspected in this workspace. Synthetic 
 
 ## 11. Decisions still proposed
 
+The [minimum implementation contract](docs/architecture.md) proposes answers for the language, source lock, receipt format, adapter packaging and CLI exit semantics below. Its status is proposed, with owner review pending. Until the owner accepts it, the items below stay open.
+
 - TOML schema and the exact catalogue/override syntax.
 - The CLI and state-directory working name.
 - Which real configurations are universal core, exposed defaults, or optional modules.
