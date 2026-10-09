@@ -23,7 +23,9 @@ An epic is complete exactly when its native child relations match its expected c
 
 Before dispatch, read the current prerequisite relations and the canonical checklists of all blocking predecessors. Every prerequisite requirement must be checked. Readiness labels, current evidence and explicit action authorization remain dispatch controls. They are not completion state. Filing tickets does not authorize implementation, merge, live configuration, secrets, retirement, publication or billing changes.
 
-For source work, record exact source identity, relevant checks, documentation and a verified commit. Changed-source implementation also requires successful exact-SHA hosted checks and an authorized merge before the leaf is complete. Its separate merge criterion records that outcome. DFM-13 instead requires its preserved validation run, accurate PR metadata and reviewed exact-SHA checks. It does not require merging PR #1.
+For source work, record exact source identity, successful full local checks, documentation and a verified commit. Changed-source implementation also requires an authorized merge before the leaf is complete. Its separate merge criterion records that outcome. DFM-13 instead requires its preserved validation evidence, accurate PR metadata and reviewed exact-SHA local checks. It does not require merging PR #1.
+
+The owner changed the validation gate on 2026-10-09. Passing local validation is required for GitHub publication and merge. Hosted CI is informational. This policy supersedes hosted-check and account-eligibility requirements in the dated roadmap snapshot and earlier task wording. Preserve criterion IDs and unrelated requirements; do not claim that failed or unstarted hosted checks passed. Local validation does not replace native-device proof, independent review or explicit action approval.
 
 ## Revise requirements without losing state
 

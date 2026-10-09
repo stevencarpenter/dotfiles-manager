@@ -20,6 +20,9 @@ jobs:
         with:
           python-version: "3.14"
 
+      - name: Run the shared local gate
+        run: bash scripts/check_staged.sh
+
       - name: Check design fixtures
         run: uv run scripts/check_examples.py
 
