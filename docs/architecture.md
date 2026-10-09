@@ -1,20 +1,22 @@
 # Minimum implementation contract
 
-Status: **Proposed; owner review pending.** Task: DFM-10. This document selects the implementation language and fixes the minimum formats and boundaries. It implements nothing. [DESIGN.md](../DESIGN.md) remains the requirements source. This document takes precedence over DESIGN.md section 11 only after the owner accepts it.
+Status: **Proposed; owner review pending.** Task: DFM-10. This document selects the implementation language and fixes the minimum formats and boundaries. It implements nothing. [DESIGN.md](../DESIGN.md) remains the requirements source. This document takes precedence over DESIGN.md section 11 only after the owner accepts the whole document.
 
-Criteria covered: C01 to C06 and C08 to C10. C07 (independent review) and C11 (delivery evidence) remain open.
+Criteria covered: C01 to C06 and C08 to C10. C06 is **prose-validated only**: no resolver, code or device ran. C07 (independent review) and C11 (delivery evidence) remain open.
+
+The owner answered the questions in section 14 on 2026-10-09. Those answers are recorded as decisions. They are inputs to this proposal, not acceptance of the document.
 
 ## 1. Decision summary
 
-1. Language: Rust (stable, edition 2024), one binary, no runtime interpreter.
-2. Dependencies: the Rust standard library plus four vendored crates (`serde`, `toml`, `serde_json`, `sha2`). Hand-written argument parsing. No async runtime, no plugin loader, no expression language.
-3. Adapters: compiled into the binary, behind typed Rust traits. There is no marketplace and no dynamic loading.
-4. Formats: TOML for authored documents and source locks. JSON for machine-written state and receipts. Every document carries an integer `schema`.
-5. Distribution: the binary installs into a manager-owned versioned directory. A symlink selects the active version. The coordinator updates itself last.
+1. Language: Rust (stable, edition 2024), one binary, no runtime interpreter. The choice is conditional on bootstrap cost (section 2).
+2. Dependencies: the Rust standard library plus four direct crates (`serde`, `toml`, `serde_json`, `sha2`) with exact version pins and transitive dependencies locked by `Cargo.lock`. A `cargo-deny` gate and `cargo-audit` or `cargo-vet` run in the local gate. Hand-written argument parsing. No async runtime, plugin loader or expression language.
+3. Adapters: compiled into the binary behind typed Rust traits. No marketplace and no dynamic loading.
+4. Formats: TOML for authored documents and the source lock. JSON for machine-written state, ledger, receipts and journal. Every document carries an integer `schema`.
+5. Distribution: build from source on each machine. No release artifact, signing or notarization in the first delivery. The binary installs into a manager-owned versioned directory selected by a symlink. The coordinator updates itself last.
 
 ## 2. Prior-art check and rationale record
 
-Hippo query (`mcp__hippo__ask` and `search_hybrid`, 2026-10-09): no prior record selects an implementation language for this manager. Related history exists: the owner evaluated chezmoi, Nix, Stow, YADM and Dotbot for the current dotfiles (chezmoi needed repeated re-adds for live edits, Nix was heavy for frequent small edits, Stow had no generation), and a chezmoi to nix-darwin port was already tried on a branch. Those results motivate a replacement manager. They say nothing about its language. The `ask` call itself was degraded (inference backend unreachable). The conclusion rests on `search_hybrid` results only.
+Hippo query (`mcp__hippo__ask` and `search_hybrid`, 2026-10-09): no prior record selects an implementation language for this manager. Related history exists: the owner evaluated chezmoi, Nix, Stow, YADM and Dotbot for the current dotfiles (chezmoi needed repeated re-adds for live edits, Nix was heavy for frequent small edits, Stow had no generation), and a chezmoi to nix-darwin port was tried on a branch. Those results motivate a replacement manager. They say nothing about its language. The `ask` call was degraded (inference backend unreachable), so the conclusion rests on `search_hybrid` only.
 
 ### Language trade-offs
 
@@ -22,98 +24,168 @@ Verified on the authoring machine (Apple Silicon): `/usr/bin/python3` is 3.9.6 a
 
 | Option | For | Against |
 | --- | --- | --- |
-| Python 3.14, standard library | Zero third-party code. `tomllib`, `json`, `hashlib`, `os.replace` exist. The repo already uses it for `scripts/check_examples.py`. Fastest to write. | Needs a managed interpreter at run time. `update` can retire that interpreter mid-operation. A fresh machine has no suitable Python (system Python lacks `tomllib`), so bootstrap needs uv first. Weak static typing at the adapter boundary. |
-| Swift | OS-owned toolchain via Command Line Tools. Native Foundation, CryptoKit. | No TOML in the standard library or Foundation. Foundation differs on Linux. Smaller ecosystem for TOML and JSON Pointer. Ties core code to Apple tooling (conflicts with C04 intent). |
-| Go | Static binary. Rich standard library. | No TOML in the standard library. Weaker enum modelling for typed operations and outcomes. Toolchain arrives through mise. |
-| Rust | Static binary: nothing the manager can retire is needed at run time. Enums and traits express operations, outcomes and adapter ports with exhaustive matching. Fixed supply chain through `Cargo.lock` and vendoring. | No TOML in the standard library, so four vetted crates. Slower to write. Build needs a Rust toolchain and the Apple linker. |
+| Python 3.14, standard library, run through uv | Zero third-party code. `tomllib`, `json`, `hashlib`, `os.replace` exist. The repo already uses it for `scripts/check_examples.py`. No compile step. Fastest to write. | Needs a managed interpreter at run time. `update` can retire that interpreter mid-operation. A fresh machine needs uv before anything runs. Weaker static typing at the adapter boundary. |
+| Swift | OS-owned toolchain via Command Line Tools. Foundation and CryptoKit. | No TOML in the standard library or Foundation. Foundation differs on Linux. Ties core code to Apple tooling (against C04 intent). |
+| Go | Static binary. Rich standard library. | No TOML in the standard library. Weaker enum modelling for typed operations and outcomes. |
+| Rust | Static binary: nothing the manager can retire is needed at run time. Enums and traits express operations, outcomes and ports with exhaustive matching. Fixed supply chain through `Cargo.lock`. | No TOML in the standard library, so four direct crates. Slower to write. Every device needs a pinned toolchain and the Apple linker at build time. |
 
-Decision: Rust. The deciding facts are bootstrap (C01, C05) and self-update. A compiled binary does not depend on an interpreter that `update` may replace, and the type system enforces the adapter contract. The cost is four crates and a build step. Python is the fallback if the owner rejects the build requirement (open question 1).
+### Condition on the Rust choice
+
+Rust's advantage over Python 3.14 plus uv holds only when one of these is true:
+
+1. A prebuilt artifact is distributed (rejected for first delivery, decision 2), or
+2. A pinned Rust toolchain is confirmed present on each target device at bootstrap and at every self-update.
+
+The owner accepted condition 2 for first delivery (decision 1). It is **unverified** on the personal M5 and the work M3 until the device gate in section 13. If the gate fails, the documented alternative is Python 3.14 standard library run through uv, with the interpreter-retirement risk handled by the self-update ordering rule in section 8.
+
+Self-update by build adds a prerequisite: the exact pinned toolchain version must already be installed when `update` builds. If a lock change bumps the toolchain pin, installing the new toolchain is a separate earlier operation that needs network access and is shown in the plan. The build itself then runs with network off (section 8).
 
 ## 3. Toolchain and repository layout (C01)
 
-- `rust-toolchain.toml` pins the channel. `Cargo.lock` is committed. `cargo vendor` output is not committed. CI and the local gate use `--locked --offline` after a fetch step.
-- Workspace layout, with this dependency direction only (arrows point at what is depended on):
+- `rust-toolchain.toml` pins an exact version (for example `1.98.1`), not a channel. `Cargo.lock` is committed. Direct crates are pinned with `=x.y.z`. The vendor directory is not committed.
+- Gate additions, once the workspace exists, in `scripts/check_all.sh`: `cargo fmt --check`, `cargo clippy -- -D warnings`, `cargo test --locked`, `cargo deny check`, and `cargo audit` or `cargo vet`. The shared hook and CI script rule in AGENTS.md is unchanged.
+- Workspace crates and permitted dependencies (an arrow means "depends on"):
 
 ```
-cli  ->  engine  ->  model
-cli  ->  platform_macos  ->  engine ports
-engine defines ports (traits); platform_macos and test fakes implement them
+ports            (leaf: traits Fs, Clock, Runner, Vault, Platform and shared value types)
+model         -> (nothing)      pure: documents, schema checks, resolver, provenance
+adapters      -> ports, model   generic adapters: fs-link, git-config, claude-settings,
+                                text-fragments, skills
+engine        -> ports, model   planner, applier, ledger, receipts, journal, registry trait
+platform_macos-> ports, model   macOS provider adapters and port implementations
+cli           -> engine, adapters, platform_macos   parsing, rendering, exit mapping
 ```
 
-- `model`: documents, schema validation, resolver, provenance. Pure functions. No process, network or filesystem calls except through the `Fs` port.
-- `engine`: planner, applier, receipts, state, journal. Defines the ports in section 11.
-- `platform_macos`: Homebrew, mise, launchd, application, `op` and filesystem-alias behavior. The only crate that names macOS paths, tools or APIs.
-- `cli`: parsing, rendering, exit mapping.
-- Existing checks stay. `scripts/check_all.sh` gains `cargo fmt --check`, `cargo clippy -D warnings` and `cargo test --locked` only when the workspace exists. The shared hook and CI script rule in AGENTS.md is unchanged.
+- `model` takes already-read bytes and returns typed values. It performs no filesystem, process or network call and has no port dependency. `engine` reads sources through the `Fs` port and passes bytes to `model`.
+- `adapters` is the generic adapter crate. It contains no OS-bound path or tool.
+- `platform_macos` is the only crate that names macOS prefixes, macOS-provided tools or APIs, and the provider tools that are OS-bound (Homebrew, launchd, application bundles, `op`, mise). A test fails the gate if those names or prefix literals appear in `model`, `ports`, `engine` or `adapters`.
+- The registry maps adapter identifiers to implementations. `cli` builds it. `engine` knows only the trait.
 
 ## 4. Versioned schema and compatibility (C01, C03)
 
-Every authored and machine-written document has an integer top-level `schema`. Document kinds: `bundle`, `module`, `profile`, `lock`, `binding`, `state`, `receipt`, `journal-entry`.
+Every authored and machine-written document has an integer top-level `schema`. Document kinds: `bundle`, `module`, `profile`, `lock`, `binding`, `state`, `ledger`, `receipt`, `journal-entry`.
 
-Rules:
+### Compatibility table
 
-1. The binary has a compiled list of supported schema versions per document kind. Initially `[1]` for each.
-2. An unlisted version, higher or lower, is refused before any other field is read. The error is `E_SCHEMA_UNSUPPORTED`. It names the file, found version and supported list. Exit code 3.
-3. Schema 1 accepts known keys only (DESIGN.md section 3). Any added key is a new schema version. The manager never ignores an unknown key.
-4. Each kind has a compatibility statement in its owning release notes: readable versions and written version. The binary writes only its newest version for each kind.
-5. Authored documents are never rewritten by an automatic upgrade. A schema migration of authored files is an explicit, reviewed edit.
+Each kind has three compiled-in lists. Initial values:
+
+| Kind | Writes | Reads | Upgrades from |
+| --- | --- | --- | --- |
+| `bundle`, `module`, `profile`, `lock`, `binding` (authored or reviewed) | 1 | 1 | none (never auto-upgraded) |
+| `state`, `ledger` (machine owned) | 1 | 1 | none yet |
+| `receipt`, `journal-entry` | 1 | 1 | none yet (read-only readers per old version) |
+
+### Rules
+
+1. **Refusal applies to versions outside (Reads union Upgrades from).** A version outside that set is refused with `E_SCHEMA_UNSUPPORTED` before any other field is read. The error names the file, found version and supported lists.
+2. A version in "Upgrades from" but not in "Reads" is converted by the upgrade procedure below. Authored kinds have an empty upgrade list: a schema migration of authored files is an explicit, reviewed edit.
+3. Schema 1 accepts known keys only (DESIGN.md section 3). Any added key requires a new schema version. The manager never ignores an unknown key.
+4. The binary writes only the newest version of each kind. Release notes state the new "Writes", "Reads" and "Upgrades from" lists for each kind.
+
+### Where state lives and who owns the ledger (F1)
+
+State root: `~/.local/state/dotfiles-manager/` (directories 0700, files 0600).
+
+| Path | Content | Mutability |
+| --- | --- | --- |
+| `state/ledger.json` | The ownership ledger: for each resource, the exact `owned_outputs` the manager may later remove, with fingerprints and the `op_id` that last wrote them. | Rewritten atomically after each operation reaches a terminal journal entry. |
+| `state/receipts/` | One receipt per run (history and evidence). | Immutable. Never rewritten or converted. |
+| `state/journal.jsonl` | Append-only intent and outcome entries. | Append only. |
+| `state/snapshots/` | Restorable copies for adapters that support restore (section 8). | Written per operation, pruned by retention. |
+| `state/trials/` | Active trial records and baselines. | Rewritten atomically. |
+
+The **ledger is the only source of delete authority.** A receipt never grants it. Consequences:
+
+1. The ledger is part of `state` and is converted by the state upgrade. Because it is self-contained, an unreadable or unsupported old receipt cannot change delete authority in either direction.
+2. Receipts stay in their original schema. One read-only reader per supported old receipt version converts to the current in-memory type for display and `doctor`. A receipt outside Reads union Upgrades from is shown as `unreadable` and affects nothing else.
+3. A ledger entry whose fingerprint no longer matches the live output is a conflict. It authorizes no deletion.
+4. Loss or corruption of the ledger makes all outputs unowned (state-loss rule in DESIGN.md section 7). Recovery is inspect-and-adopt or restore from a snapshot, never forced apply.
 
 ### State upgrade and recovery
 
-State lives under `~/.local/state/dotfiles-manager/` (mode 0700; files 0600).
+1. The upgrade holds the lock (section 10) taken on the parent directory, so the lock is not inside the renamed directory.
+2. It reads `state/`, writes the new format into `state.next/`, validates it, writes `state.next/COMPLETE`, then renames `state` to `state.prev-<old schema>` and `state.next` to `state`. The order of the two renames is fixed.
+3. Recovery by directory shape: `state.next/` without `COMPLETE` is discarded and the upgrade restarts from the untouched `state/`. `state.next/COMPLETE` with no `state/` completes the rename. `state/` with `state.prev-*` is the normal post-upgrade shape.
+4. State newer than the binary supports, or outside Reads union Upgrades from, is refused with `E_STATE_NEWER` or `E_SCHEMA_UNSUPPORTED`. There is no downgrade. Recovery is `state.prev-*` plus an older binary version kept by the rule in section 12.
 
-1. Upgrade is forward only and copy based. The manager reads the old state, writes the new format into `state.next/`, validates it, writes `state.next/COMPLETE`, then renames `state` to `state.prev-<old schema>` and `state.next` to `state` (two renames; the order is fixed).
-2. Recovery by directory shape: `state.next/` without `COMPLETE` is discarded and the upgrade restarts from untouched `state/`. `state.next/COMPLETE` with no `state/` completes the rename. `state/` and `state.prev-*` both present is normal until the next successful run, which removes `state.prev-*`.
-3. State newer than the binary supports is refused (`E_STATE_NEWER`), exit 3. There is no downgrade. The recovery is `state.prev-*` plus an older binary version, which stay on disk by the distribution rule in section 12.
-4. Receipts are immutable. An old receipt with an unsupported schema is treated as unreadable. Its outputs have unknown ownership, so no deletion is authorized from it. This matches the existing rule that state loss cannot make unknown files owned.
-5. Unreadable or missing state never triggers forced apply. The only exits are `doctor` (read-only), inspect-and-adopt, or restoration from a receipt snapshot.
+### Rollback window (F3)
+
+1. After an upgrade, `state.prev-*` and the previous binary version directory are kept.
+2. The first `doctor` run on the upgraded state that completes its state, ledger and journal checks without a state finding writes `state/VERIFIED`. (`doctor` writes only this marker inside the manager's own state. That is the one exception to its read-only rule, and the marker never changes configuration or ownership.)
+3. The first successful mutating run after `VERIFIED` exists removes `state.prev-*` and the previous version directory, then records the removal in its receipt.
+4. If `VERIFIED` never appears, `state.prev-*` stays. It is never removed by a run that failed, was interrupted, or was read-only.
 
 ## 5. Document formats (C01)
 
-Authored formats are the existing fixtures: `bundle.toml`, `module.toml`, `profile`. Nothing in this section changes them.
+Authored formats are the existing fixtures: `bundle.toml`, `module.toml`, `profile`. Nothing here changes them.
+
+### Parser and read limits (S10)
+
+1. Authored TOML and the lock: at most 1 MiB per file, nesting depth at most 32, at most 10,000 resources in the resolved composition, string values at most 64 KiB.
+2. JSON state files: at most 16 MiB per file, depth at most 32. Journal lines at most 64 KiB. A line over the limit is a journal error, not a skipped line.
+3. All reads of authored, state or source files are bounded to the limit of their kind. A file over the limit is refused with `E_LIMIT_EXCEEDED` without being fully read. Source files for adapters have a per-adapter limit.
 
 ### Source lock
 
-`dotfiles-manager.lock` is TOML. It lives in the source that owns the pin (DESIGN.md section 7: never private module details in the public core). The manager writes it only during `update` or `sync` after approval, as a reviewable local edit with no automatic commit.
+`dotfiles-manager.lock` is TOML, kept in the source that owns the pin (never private module details in the public core). The manager writes it only during `update` or `sync` after approval, as a reviewable local edit with no automatic commit.
 
 ```toml
 schema = 1
 
 [[sources]]
-id = "example-external"           # bundle or module source id
+id = "example-external"
 kind = "git"                      # "git" or "path"
-origin = "https://example.invalid/org/repo.git"  # canonical form, see section 8
-ref = "refs/heads/main"           # tracking ref, informational for exact pins
-commit = "<40 hex>"               # resolved revision
-tree = "sha256:<64 hex>"          # content identity of the checked-out tree (section below)
+origin = "https://example.invalid/org/repo.git"  # canonical form, section 8
+ref = "refs/heads/main"
+commit = "<40 hex>"               # must be reachable from ref
+tree = "sha256:<64 hex>"          # recomputed digest, section 8
 
 [[adapters]]
 id = "homebrew/v1"
 required_by = ["personal-dev.atuin"]
+
+[manager]                         # present only when the manager is a managed component
+version = "<semver>"
+binary_sha256 = "<64 hex>"        # SHA-256 of the built binary (section 8)
+toolchain = "1.98.1"
 ```
 
-Content identity: SHA-256 over a sorted list of `path NUL mode NUL file-sha256` entries for tracked files. For `kind = "path"` (local editable source) the lock stores no commit. Any change to such a source invalidates an existing plan, as DESIGN.md requires. Adapter entries record the adapter identifier and version the lock was produced with. The lock holds no secret values and no hash of secret material.
+For `kind = "path"` (local editable source) the lock stores no commit. Any change to such a source invalidates an existing plan. The lock holds no secret values and no hash of secret material.
 
 ### Receipt
 
-JSON, one file per operation run: `receipts/<utc-timestamp>-<op-id>.json`, canonical form (UTF-8, sorted keys, no insignificant whitespace). Fields:
+JSON, one file per run: `receipts/<utc-timestamp>-<op-id>.json`, canonical form (UTF-8, sorted keys, no insignificant whitespace).
 
 ```
-schema, op_id, command, started_at, finished_at, binary{version, commit},
-profile{id, binding_digest}, plan_digest, approval{kind, plan_digest, at},
+schema, op_id, command, started_at, finished_at,
+binary{version, commit, sha256},
+profile{id, binding_digest}, machine_id,
+plan_digest, approval{kind, plan_digest, at},      # kind: "interactive" | "yes_plan" (S11)
 sources[{id, commit, tree}],
-operations[{id, resource, adapter, kind, status, started_at, finished_at,
+operations[{id, resource, adapter, class, status, started_at, finished_at,
             before{fingerprint}, after{fingerprint}, owned_outputs[], error?}],
-result{outcome, counts{updated, current, held, pending, failed, blocked, not_started}}
+result{outcome, exit_code, counts}
 ```
 
-- `status` is one of `done`, `failed`, `blocked`, `not_started`, `not_in_scope`, `pending`, `skipped_hold`.
-- `fingerprint` is a SHA-256 of file content or a stable native identity (for example a package name and version). For secret outputs, the receipt stores the destination, mode and the label `secret`. It stores no content and no hash (DESIGN.md section 8).
-- `owned_outputs` is the exact set the manager may later remove. It is the only source of delete authority.
+Read-only commands write no receipt. `approval.kind` is `interactive` or `yes_plan` for every receipt (S11).
+
+**One status vocabulary (F6).** Operation `status` and `counts` keys are the same set. `counts` has one key per status, and the sum of all counts equals the number of participants (every resource or component the plan covers, whether or not it changed).
+
+| Status | Meaning | Journal phase |
+| --- | --- | --- |
+| `updated` | Operation ran and its postcondition passed. | `done` |
+| `current` | `already_done` was true or desired equals observed. | `done` |
+| `held` | A declared hold applies, with its reason. | `done` |
+| `pending` | Request accepted, completion not yet observed (for example a queued native update). | `pending` (carries the completion token) |
+| `failed` | Operation or postcondition failed. | `failed` |
+| `blocked` | A prerequisite failed or a dependency failed or was `pending` without allowing dependents. | `blocked` |
+| `not_started` | Run stopped before this operation. | none |
+| `not_in_scope` | The command's scope excludes it (for example secrets during `sync`). | none |
+| `unknown` | A required observation is `UNKNOWN`, so the engine cannot decide. | `unknown` |
 
 ### Journal and interruption records
 
-`journal.jsonl` is append-only, one JSON object per line, `fsync` after each append. Before each mutating operation the engine appends `{"op_id","operation","phase":"intent", "preconditions_digest"}`. After the operation and its postcondition check it appends `phase:"done"` or `phase:"failed"`. An `intent` without a terminal entry is an interruption record. The next invocation reports it, runs the operation's idempotence probe (section 9), and either marks it `done`, marks it `failed`, or reports `unknown` and refuses dependent work. Interruption never authorizes deletion.
+`journal.jsonl` is append-only, one JSON object per line, `fsync` after each append. Before a mutating operation the engine appends phase `intent` with a digest of its preconditions. After it, the engine appends exactly one of `done`, `failed`, `blocked`, `pending` or `unknown`. An `intent` without a following terminal entry is an interruption record. The next invocation reports it, runs the operation's `already_done` probe, and then writes `done` or `failed`, or writes `unknown` and blocks dependent work. Interruption never authorizes deletion.
 
 ### Binding
 
@@ -123,113 +195,155 @@ result{outcome, counts{updated, current, held, pending, failed, blocked, not_sta
 
 DESIGN.md sections 2, 3 and 5 define the rules. This section records how the implementation holds them.
 
-1. **One bound profile.** `BoundProfile` is constructed only from the binding file. The CLI has no `--profile` flag on mutating commands. Tests use `DFM_BINDING` to point at an isolated binding.
-2. **Protected core.** The resolver marks every core path not listed in `policy.defaults` or `policy.extensions` as protected. A change request to a protected path returns `E_OVERRIDE_FORBIDDEN`. Core cannot name a non-core module in `requires`.
-3. **Explicit defaults and contributions.** Only the two policy lists admit change. An override or contribution is a typed `Change { resource, path, value, reason, origin }`. There is no generic merge function in `model`.
+1. **One bound profile.** `BoundProfile` is constructed only from the binding file. Mutating commands have no `--profile` flag.
+2. **Protected core.** The resolver marks every core path not listed in `policy.defaults` or `policy.extensions` as protected. A change to a protected path returns `E_OVERRIDE_FORBIDDEN`. Core cannot name a non-core module in `requires`.
+3. **Explicit defaults and contributions.** Only the two policy lists admit change. An override or contribution is a typed `Change { resource, path, value, reason, origin }`. `model` has no generic merge function.
 4. **Provenance.** Every effective value carries `Provenance { owner, original, change?, changer, reason, source_file, content_id }`. `explain` prints it. Secret-bearing values hold references only.
-5. **Private-to-public direction.** A bundle can `extends` exactly one ancestor and cannot be referenced by it. The resolver rejects a public source whose closure reaches an external source. Module paths resolve against the declaring manifest and must stay inside its trusted root.
-6. **Order independence.** The resolver sorts only for display (core first, then lexical). Conflict detection runs on sets, not sequences.
+5. **Private-to-public direction.** A bundle can `extends` exactly one ancestor and cannot be referenced by it. The resolver rejects a public source whose closure reaches an external source. Module paths resolve against the declaring manifest and stay inside its trusted root.
+6. **Order independence.** The resolver sorts only for display (core first, then lexical). Conflict detection runs on sets.
 
 ## 7. OS separation (C04)
 
-1. `model` and `engine` contain no path literal for a prefix (`/opt/homebrew`, `/usr/local`), no machine model name and no tool name. A grep-style check in the gate enforces this for those crates (a test, not a convention).
-2. HOME is derived once, at startup, by `platform_macos::home()`: the password-database home of the effective user, which must equal `$HOME` unless `DFM_HOME` is set. `DFM_HOME` is for isolated tests only and the binary prints it in every report header when set. A mismatch without `DFM_HOME` is `E_HOME_MISMATCH` and fails before mutation.
-3. Provider locations are observations, not constants. Each provider adapter declares an ordered candidate search (for example, locations conventional for the platform and architecture) and verifies the result (file exists, executable, owned by an expected user). The verified location is recorded in the report and receipt. `doctor` shows when a candidate fails verification.
-4. The OS-bound surface is the `platform_macos` crate: filesystem case and alias behavior, launchd, application bundles, Homebrew, mise, `op`. The `Platform` port exposes `home()`, `case_fold(path)`, `locate(provider)` and `runner()`. Composition, planning and state use only the port.
-5. Optional GUI or service resources (desktop, launchd agents) exist only in modules a profile selects. The engine has no GUI assumption. Without a selected desktop module, no GUI probe runs.
-6. Not built: Linux providers, Intel-specific paths, portability layers. The only commitment is that nothing in `model` or `engine` would need to change to add them.
+1. `model`, `ports`, `engine` and `adapters` contain no prefix literal, no model name and no OS-bound tool name. A gate test enforces this (section 3).
+2. HOME is derived once by `platform_macos`: the password-database home of the effective user, which must equal `$HOME`. A mismatch is `E_HOME_MISMATCH` and fails before mutation.
+3. **Isolation overrides (F8).** `DFM_HOME`, `DFM_BINDING` and `--home` replace HOME and the binding for tests. Rules: every report header and the JSON output show `isolated: true` and the override values. Read-only commands (including `self-check`) accept them in every build. Mutating commands accept them only in a build with the cargo feature `test-isolation`, which release builds never enable. A release build given an override on a mutating command exits 2 with `E_OVERRIDE_REFUSED`.
+4. Provider locations are observations, not constants. Each provider adapter declares an ordered candidate search and verifies the result (exists, executable, trusted owner and mode per section 8). The verified location is recorded in the report and receipt.
+5. The `Platform` port exposes `home()`, `case_fold(path)`, `locate(provider)` and `runner()`. Composition, planning and state use only the port.
+6. Optional GUI or service resources exist only in modules a profile selects. The engine has no GUI assumption.
+7. Not built: Linux providers, Intel-specific paths, portability layers. The only commitment is that nothing in `model` or `engine` would change to add them.
 
-## 8. Trust, probes, privilege, snapshots (C05)
+## 8. Trust, probes, privilege, snapshots, secrets (C05)
 
-### Trusted source identities
+### Source identity and fetch
 
 A source identity is `(canonical origin, resolved commit, tree digest)`.
 
-1. Canonical origin: lowercase host, no credentials, no trailing `.git`, `https` or `ssh` scheme only (`path` sources are local and unlocked).
-2. The binding holds the trusted origin set. A new origin needs explicit approval during an interactive `sync` or `update`. A fetched manifest never grants trust, and fetching never runs repository code.
-3. A fetched commit is accepted only when its tree digest matches the lock, or the approved plan includes the lock change. Commit signature verification is not required in this contract (open question 4).
-4. Unknown origin, redirect to a different origin, or a changed tree under an unchanged pin: `E_SOURCE_UNTRUSTED`, exit 3, no mutation.
+**Canonical origin (S2).** Exactly one form: scheme `https` or `ssh`; host lowercase ASCII (IDNA converted); no userinfo except the fixed `git` user for `ssh`; no port unless non-default; path without trailing `/` and without a `.git` suffix; no query or fragment. Anything that does not canonicalize to this form is `E_SOURCE_UNTRUSTED`. Comparison is exact string equality of the canonical form.
+
+**Fetch environment (S2).** The manager runs Git with `GIT_CONFIG_GLOBAL=/dev/null`, `GIT_CONFIG_SYSTEM=/dev/null`, `GIT_CONFIG_NOSYSTEM=1`, `GIT_TERMINAL_PROMPT=0`, `GIT_ALLOW_PROTOCOL=https:ssh`, `protocol.allow=never` with `https` and `ssh` enabled by `-c`, no `url.*.insteadOf` rewriting, no `core.fsmonitor`, hooks disabled by `core.hooksPath=/dev/null`, and no credential helper except the one declared in the binding. Redirects to a different canonical origin fail. Fetch runs into a staging directory. It never changes a linked checkout.
+
+**Tree digest (S1).** The manager recomputes the digest from the checked-out staging tree. It never trusts a digest supplied by the source.
+
+1. The digest is SHA-256 over sorted entries `<relative path> NUL <mode class> NUL <content sha256 or symlink target>`. Mode class is `file` or `exec` (executable bit), or `symlink`.
+2. Entries allowed: regular files and symlinks. Submodules, gitlinks, devices, sockets, FIFOs and any non-regular entry are rejected with `E_SOURCE_UNTRUSTED`.
+3. A symlink target must stay inside the source root; otherwise `E_SOURCE_ESCAPE`.
+4. The pinned commit must be reachable from the declared `ref` in the fetched history.
+5. Any lock change is shown with the old and new commit, the old and new digest, and a diff stat (`git diff --stat old..new`) in the plan. A lock change without that display is not approvable.
+
+**Trust grant.**
+
+1. The binding holds the trusted origin set. A new origin needs an interactive approval during `sync` or `update`. **`--yes-plan` can never grant a new origin (S3, F9).** A noninteractive run that meets a new origin exits 3.
+2. Fetching and resolving never run repository code.
+3. **Known exception (F9).** The self-update build runs the fetched workspace's `build.rs` files, procedural macros and the vendored dependencies' build scripts. Trust for that code is the origin plus the recomputed tree digest, and nothing more. This is a recorded risk: a compromised trusted origin can run code as the user at build time. Mitigations are in the self-update section.
+4. Commit signatures are not required now (decision 4). Signed commits can be added later by a schema change.
 
 ### Read-only probe allowlist
 
-A probe is data owned by an adapter: `{ argv (exact), env (scrubbed, plus fixed vars), cwd, timeout, max_output, expects }`. The runner executes only entries whose argv equals a declared entry after placeholder substitution of validated identifiers. Rules:
+A probe is data owned by an adapter: `{ argv0, argv template, env, timeout, max_output, expects }`.
 
-1. Allowed without any entry: `lstat`, `readlink`, directory listing and bounded reads of declared paths.
+1. Allowed without an entry: `lstat`, `readlink`, directory listing and bounded reads of declared paths, all through the `Fs` port.
 2. Never allowed: running a discovered or shimmed binary for `--version`, any network call, vault call, install, update or repair.
-3. Environment is rebuilt from an allowlist (for example `PATH`, `HOME`, `LANG`) plus adapter variables that disable automatic update and analytics. Stderr is captured, truncated and redacted before display.
-4. Each entry is added only with a fixture-backed test that shows no write and no network. Candidate entries to verify in the implementation phase (not verified here): a Homebrew installed-version listing, a mise installed-tool listing, a launchd service listing, reading an application bundle's metadata file. Unverified candidates stay disabled, and the probe result is `UNKNOWN`.
-5. A timeout, a non-allowlisted request or an unsupported platform fact yields `UNKNOWN` with a reason. Unknown support fails closed: no apply operation proceeds on an unknown prerequisite.
+3. **Parameters (S6).** Each substituted parameter must match an adapter-declared regular expression (for example `^[a-z0-9][a-z0-9._+@-]{0,63}$`). A value starting with `-` is rejected. The template places `--` before positional parameters when the tool supports it.
+4. **argv[0] (S6).** An absolute path, verified by the `Fs` port: owned by root or the current user, not group- or world-writable, not inside a HOME-writable directory used for shims, and not a symlink chain leaving a trusted prefix. The verification result is part of the observation.
+5. **Process context (S6).** The runner starts the process in a fixed manager-owned empty directory as cwd, with a rebuilt environment (`PATH` fixed by the provider, `HOME`, `LANG=C`) plus adapter variables. Homebrew probes disable auto-update and analytics. mise probes disable config discovery and auto-install. Each of those settings is part of the test for that probe.
+6. **Re-verification (S6).** A probe's recorded behavior is tied to the tool version it was tested with. When the observed tool version changes, the probe result is `UNKNOWN` until its fixture test is rerun against that version.
+7. **The control is the fixture-backed tests.** Runtime enforcement is the exact argv match and the checks above. The evidence that a probe has no write and no network effect is its test, run against a process-level fake and, at integration, the real tool. An untested probe stays disabled and returns `UNKNOWN`.
+8. Candidate entries to verify in the implementation phase (not verified here): a package installed-version listing, a runtime-tool installed listing, a service listing, reading an application bundle's metadata file.
+9. A timeout, a non-allowlisted request or an unsupported fact yields `UNKNOWN` with a reason. Unknown support fails closed.
 
 ### Prerequisites and postconditions
 
-Every typed operation declares both, as data checked by the engine:
+Every typed operation declares both as data the engine checks:
 
 - Prerequisites: observation fingerprints that must still hold at apply time, source identities, privilege class, credential availability, quiescence requirement.
-- Postcondition: a probe or file check that proves the effect (file content matches, package version observed, consumer reloaded). A file that is correct, an executable that is installed and a consumer that has reloaded are three separate postconditions.
-- A failed prerequisite yields `blocked` with a code. A failed postcondition yields `failed`. Neither is ever reported as success.
+- Postcondition: a probe or file check that proves the effect. A correct file, an installed executable and a reloaded consumer are three separate postconditions.
+- A failed prerequisite yields `blocked`. A failed postcondition yields `failed`. An `UNKNOWN` required observation yields `unknown`. None is ever reported as success.
+- **The engine re-verifies each operation's prerequisites immediately before that operation applies (S3), even when the plan digest matched.**
 
 ### Privilege boundaries
 
-- Operation privilege classes: `user` (default), `privileged` (explicit scope, separate adapter), `native-ui` (requires the application's own prompt).
-- HOME adapters never escalate. A privileged operation appears in the plan with its exact command class and scope. Execution uses a non-interactive privilege check first. If the privilege is not already available and no TTY exists, the plan fails before any mutation (section 10).
-- The manager never stores a privilege credential.
+1. Privilege classes: `user` (default), `privileged` (explicit scope, separate adapter), `native-ui` (needs the application's own prompt).
+2. HOME adapters never escalate.
+3. **Privileged operations (S9).** Each is an exact argv vector, validated against an adapter-declared template, executed directly without a shell. The argv is part of the plan digest and is shown in the plan. The manager never persists sudo timestamps or credentials, never changes the sudo timestamp policy, and strips secret-bearing environment variables (all variables added for vault or credential use) from the child's environment.
+4. A noninteractive run checks privilege availability without a prompt before mutation. If unavailable, the run exits 3.
 
-### Snapshot privacy
+### Filesystem writes (S8)
 
-- Snapshots exist only for adapters that declare restore support (ordinary files). Location: `state/snapshots/<op-id>/`, directories 0700, files 0600.
-- Secret outputs are never snapshotted. Their last-good file stays at the destination and the new content is written to a same-directory 0600 temporary file, then renamed on success.
-- Receipts reference snapshots by path and fingerprint, never by content. Snapshots are removed with their receipt retention policy; deleting a snapshot is never an implicit side effect of purge.
+Writes that publish into a target directory use descriptor-relative operations: open the verified parent with `O_DIRECTORY | O_NOFOLLOW` and then `openat`, `renameat`, `symlinkat`, `unlinkat` and `fstatat` with `AT_SYMLINK_NOFOLLOW` against that descriptor. The parent chain is validated component by component with the same flags. The rule closes the window between "check parents" and "write". A platform without these calls is unsupported for that adapter and the adapter fails closed. Atomic publication is: same-directory temporary file created with `O_EXCL`, validated, then `renameat`.
+
+### Secrets and sensitive paths (S7)
+
+1. Resources have a sensitivity class: `normal` or `sensitive`. Secret outputs are always `sensitive`. A co-owned file may be declared `sensitive` by its adapter when it can hold credentials.
+2. For `sensitive` paths the manager stores no snapshot content, no content hash and no diff in the ledger, receipts, journal, snapshots or `--json`. It stores the destination, mode and an owner label.
+3. **Redaction rule for every persisted or printed field** (receipt `error`, journal entries, `--json`, table, provider stderr): a value is replaced by `[redacted]` if it came from a `sensitive` path, a secret provider, an environment variable declared secret, or matches a credential pattern list. Provider stderr is captured, truncated to 4 KiB, redacted, then stored.
+4. **Test (required).** A fake provider writes a planted secret string into stderr, stdout, an error message and a file name. The test asserts the string is absent from every persisted file and every output format.
+5. Snapshots are `normal` class only. They live in `state/snapshots/<op-id>/` (0700 and 0600). Retention: snapshots are kept while the owning receipt's operation is the latest for that resource, and removed on the next successful run after a newer snapshot exists for the same resource, or 30 days after the resource leaves the ledger, whichever is later. Deleting a snapshot is never a side effect of purge. `state.prev-*` retention is in section 4.
+6. Secret destinations: the new content goes to a same-directory 0600 temporary file and replaces the destination only after a complete, non-empty render. A failed or empty render leaves the previous file untouched.
 
 ### Coordinator self-update last
 
-1. The manager package is a managed component like any other, with one extra ordering rule: it is always the final operation of the plan, with edges from every other operation.
-2. Before it runs, the receipt for all prior operations is written and synced.
-3. The new version builds or installs into a new versioned directory, runs `dotfiles-manager self-check` from that directory (loads the binding, state and lock, no mutation), and only then flips the active symlink in one atomic rename.
-4. The running process keeps its old inode and exits after writing its result. The previous version directory stays until the next successful run of the new version. Rollback is a symlink flip back.
-5. A failed self-check leaves the previous version active and reports `failed` for that operation only.
+1. The manager package is a managed component with one extra ordering rule: it is the final operation, with edges from every other operation.
+2. Before it runs, every prior operation has a terminal journal entry and the ledger and receipt for them are written and synced.
+3. **Build (S5).** The build runs from the staged tree whose digest matched the lock. Network is off after `cargo fetch --locked` (crates.io only, no git dependencies, no alternate registries). The build environment is scrubbed (`PATH`, `HOME` for the build directory, `CARGO_HOME` for the vendored cache, no secrets). The pinned toolchain must already be installed (section 2).
+4. The built binary's SHA-256 is recorded in the receipt and in the lock `[manager]` table.
+5. **Self-check (S5).** The new binary runs `self-check` with a scrubbed environment and `DFM_HOME` and `DFM_BINDING` pointing at a temporary copy of the binding and state. `self-check` is read-only and makes no network call. On success the active symlink flips in one atomic rename.
+6. The running process keeps its old inode and exits after writing its result. A failed self-check leaves the previous version active and records `failed` for that operation only.
+7. The previous version directory follows the rollback window in section 4.
 
 ## 9. Operation lifecycle and idempotence
 
 The stages are DESIGN.md section 6 (resolve, inspect, plan, apply, verify). Additions:
 
-1. A plan has a digest over: resolved model, source identities, observation fingerprints and the ordered operation list. Approval binds to this digest (section 10).
+1. **Plan digest (S3).** SHA-256 over the canonical JSON of the typed plan. The plan includes: manager binary identity (version and SHA-256), binding digest, machine identity, resolved model digest, source identities, observation fingerprints, the ordered operation list with each operation's prerequisites, privilege class and exact privilege argv, and content hashes of generated outputs for `normal` class outputs. For `sensitive` outputs it includes destination and mode only.
 2. Each operation implements `already_done(observation) -> bool`. After an interruption the engine uses it to avoid repeating a completed side effect.
-3. On the first failure, dependents become `blocked` and independent operations that have not started become `not_started`. The default is to stop. A later `--continue` is not in the minimum contract.
-4. The receipt is written even on failure and on interruption by signal. SIGINT and SIGTERM stop after the current operation, write the receipt, and exit 130.
+3. On the first failure, dependents become `blocked` and operations that have not started become `not_started`. The default is to stop. A `--continue` option is not in the minimum contract.
+4. The receipt is written even on failure and on interruption by signal.
 
-## 10. CLI and exit semantics (C01, C08)
+## 10. CLI, exit semantics, noninteractive behavior (C01, C08)
 
-### Exit codes
+### Exit codes (F5)
 
 | Code | Name | Meaning |
 | --- | --- | --- |
-| 0 | `ok` | Completed. No work needed counts as completed. |
-| 1 | `failed` | Operation failed, diagnosed errors, incomplete required checks, or partial application. Compatible with the `doctor` contract. |
-| 2 | `usage` | Invalid invocation, or inability to produce the requested report. Compatible with the `doctor` contract. |
-| 3 | `blocked` | A precondition failed before any mutation: stale plan, missing credential, no TTY for a required prompt, privilege unavailable, untrusted source, unsupported schema or state version, unknown support. |
-| 4 | `declined` | Approval was refused or not given. No mutation. |
-| 5 | `pending` | All operations that could finish did, and at least one is pending (for example a queued native update). Not success. |
-| 130 | `interrupted` | Stopped by signal after the receipt was written. |
+| 0 | `ok` | Completed, including no work needed. |
+| 1 | `failed` | Any operation `failed`, `blocked` or `unknown` after some mutation began; diagnosed errors or incomplete required checks (also `doctor`). |
+| 2 | `usage` | Invalid invocation, refused override, or inability to produce the requested report. |
+| 3 | `blocked` | A gate failed **before any mutation**: stale plan, missing credential, no TTY for a required prompt, privilege unavailable, untrusted or new origin in a noninteractive run, unsupported version, `UNKNOWN` required prerequisite, lock held. |
+| 4 | `declined` | Approval refused or prompt timeout. No mutation. |
+| 5 | `pending` | Everything that could finish did, and at least one participant is `pending`. Not success. |
+| 130 | `interrupted` | Stopped by SIGINT after the receipt was written. |
+| 143 | `terminated` | Stopped by SIGTERM after the receipt was written. |
 
-Every non-zero result prints one stable code (`E_...` or a `doctor` finding code) and the first failing location. `--json` output repeats the code and exit name, and uses the same semantics as the table. Resolver error codes are the `expected_error` values already in `examples/cases.toml`.
+**Mixed results.** A run returns the highest-precedence code that applies:
 
-### Command surface
+`143 or 130 (signal, first received)  >  2  >  1  >  5  >  3  >  4  >  0`
 
-DESIGN.md section 7 defines the commands. Global flags: `--json`, `--no-input`, `--yes-plan <digest>`, `--timeout <duration>`, `--home <dir>` (tests only; same as `DFM_HOME`). No flag selects a profile on a mutating command.
+Codes 3 and 4 mean no mutation happened, so they cannot occur together with 1 or 5 in one run. A prerequisite that blocks **after** some mutation is status `blocked` and exit **1**, not 3. Unknown and failed operations both give 1. Pending with no failure gives 5.
+
+**`doctor` and exit-3 inputs.** `doctor` never exits 3 or 4. For malformed manifests, unsupported schema or state version, missing modules or an untrusted source, it reports each as a finding with its `E_...` code, inspects whatever is still safe to inspect, and exits 1. It exits 2 only if it cannot produce any report. This keeps DESIGN.md's rule that independent rows stay visible.
+
+Every non-zero result prints one stable code and the first failing location. `--json` repeats the code, exit name, and per-status counts, with the same semantics as the table. Resolver codes are the `expected_error` values in `examples/cases.toml`.
+
+### Commands and flags
+
+DESIGN.md section 7 defines the commands. Global flags: `--json`, `--no-input`, `--preview`, `--yes-plan <digest>`, `--allow-disruptive <operation-id>`, `--timeout <duration>`, and the isolation overrides in section 7. No flag selects a profile on a mutating command.
 
 ### Bounded noninteractive behavior
 
-1. Interactive means both stdin and stderr are TTYs and `--no-input` is absent. Otherwise the run is noninteractive.
-2. Before any mutation, the engine computes every prompt the plan could need (approval, new-origin trust, credential, privilege, disruptive action). In a noninteractive run, any such prompt that is not already satisfied ends the run with exit 3 and the list of unsatisfied gates. It does not wait.
-3. Prompts in an interactive run have a bounded wait (default 300 s, `--timeout`). Expiry ends the run with exit 4. There is no indefinite prompt.
-4. Approval for noninteractive use is `--yes-plan <digest>`. The digest binds the exact reviewed plan (section 9). A changed source, observation, privilege or operation list changes the digest, and the run exits 3 as stale.
-5. `--yes-plan` does not waive: stale-state checks, secret authentication (a secret scope needs a credential that is already available non-interactively, else exit 3), privilege availability, or a disruptive action (needs a separate `--allow-disruptive <operation-id>` bound to the same digest).
-6. No scheduler, daemon, background process or login item is part of this contract. Each invocation is one process that exits.
-7. Locking: one manager lock per state directory (`state/lock`, advisory, with holder pid and start time). A second mutating invocation exits 3 with `E_LOCKED`. Read-only commands do not take the mutating lock.
+1. Interactive means stdin and stderr are TTYs and `--no-input` is absent. Otherwise the run is noninteractive.
+2. Before any mutation the engine computes every gate the plan needs (approval, new-origin trust, credential, privilege, disruptive action). An unsatisfied gate in a noninteractive run ends the run with exit 3 and the list of gates. It never waits.
+3. Interactive prompts wait at most 300 s. Expiry exits 4.
+4. **Preview.** `sync --preview` and `update --preview` (and the same for `adopt` and `purge`) resolve, inspect and plan, print the plan and its `--yes-plan` digest, write nothing and exit 0. The digest is computed fresh on every run. The manager never stores it and never reads one from a cache. A reviewer must read the preview before passing the digest back. The engine cannot verify that a person read it. That limit is recorded.
+5. `--yes-plan <digest>` recomputes the plan digest and compares. A mismatch exits 3 as stale. Approval kind in the receipt is `yes_plan`. It does not waive: per-operation prerequisite checks, secret credential availability (unavailable gives exit 3), privilege availability, disruptive actions (a separate `--allow-disruptive <operation-id>` bound to the same digest), or new-origin trust (interactive only).
+6. **Operation bounds.** `--timeout` also bounds each provider operation and external process; the default is 600 s per operation, and an adapter may lower it but not exceed an overall run limit of 4 h. Expiry marks the operation `failed` (or `pending` if the provider returned a completion token) and sends SIGTERM to the process group.
+7. **Two-signal escalation.** First SIGINT or SIGTERM: stop starting new operations, let the current operation finish for up to 30 s, then send SIGTERM to its process group, write the receipt and exit 130 or 143. Second signal: send SIGKILL to the process group immediately, leave the `intent` journal entry as the interruption record, write what receipt state can be written, and exit 130 or 143.
+8. Disruptive set (decision 8). Disruptive: restart or unload of a user launch agent or Homebrew service (for example the window manager, status bar and border helpers), any configuration change that reloads a window manager, and deletion of an owned file. Not disruptive: writing a configuration file that is not yet loaded. Each disruptive operation needs `--allow-disruptive` or interactive confirmation.
+9. No scheduler, daemon, background process or login item is part of this contract.
+10. **Lock (F4).** One manager lock: an advisory `flock` on `~/.local/state/dotfiles-manager.lock`, a file in the parent directory, holding the pid and start time. It is outside `state/`, so state upgrade renames do not move it. A second mutating invocation, or a read-only command that needs a stable view during upgrade, gets exit 3 `E_LOCKED`. Ordinary read-only commands take no lock and read a snapshot-consistent view.
 
 ## 11. Typed adapter boundary and shared contracts (C01, C09, C10)
 
-Adapters are Rust types compiled into the binary and selected by the versioned identifier in the manifest (`fs-link/v1`). An unknown identifier is `E_ADAPTER_UNKNOWN` at resolve time. There is no marketplace, no dynamic loading and no manifest-supplied code.
+Adapters are Rust types compiled into the binary and selected by the versioned identifier in the manifest (`fs-link/v1`). An unknown identifier is `E_ADAPTER_UNKNOWN` at resolve time.
 
 ### Adapter trait (shape, not final code)
 
@@ -237,7 +351,7 @@ Adapters are Rust types compiled into the binary and selected by the versioned i
 trait Adapter {
     fn id(&self) -> AdapterId;                              // "fs-link/v1"
     fn validate(&self, value: &Value) -> Result<Typed, SchemaError>;
-    fn claims(&self, t: &Typed) -> Claims;                  // outputs, inputs, owners
+    fn claims(&self, t: &Typed) -> Claims;                  // outputs, inputs, owners, sensitivity
     fn probes(&self, t: &Typed) -> Vec<ProbeRequest>;       // from the allowlist only
     fn plan(&self, t: &Typed, obs: &Observation) -> Result<Vec<Operation>, PlanError>;
     fn apply(&self, op: &Operation, cx: &mut ApplyCx) -> Outcome;
@@ -246,93 +360,106 @@ trait Adapter {
 }
 ```
 
-`validate` and `claims` are pure. Only `apply` touches the world, and only through `ApplyCx` ports. `Outcome` is `Done | Failed(code) | Blocked(code) | Pending(token)`. No adapter returns a bare string or boolean.
+`validate` and `claims` are pure. Only `apply` touches the world, through `ApplyCx` ports. `Outcome` is `Done | Failed(code) | Blocked(code) | Pending(token) | Unknown(reason)`.
 
 ### Shared ports (the contracts workflow tests use)
 
 | Port | Methods (summary) | Result types |
 | --- | --- | --- |
 | `Installer` (installation and discovery) | `discover(tool) -> Vec<Candidate{owner, versions, paths, config_hints}>`; `owner_of(component)`; `install(component, version)`; `uninstall(component)` | `Outcome`; discovery never mutates |
-| `Inspector` | `inspect(ProbeRequest) -> Observation{value or UNKNOWN(reason), observed_at, freshness}` | Allowlist enforced by the runner, not by each caller |
-| `Generator` and `Reloader` | `generate(inputs) -> Output`; `reload(scope) -> ReloadResult` | `Reloaded`, `Requested`, `Unsupported`, `Failed`. A generated file is not a reload. |
-| `UpdateProvider` | `candidates(policy) -> Vec<Candidate>`; `request(candidate) -> Token`; `completion(token) -> Queued | Completed | Failed | Unknown` | Queued is `pending`. Only `Completed` is done. |
-| `Fs`, `Clock`, `Runner`, `Vault` | Filesystem, time, process spawning with allowlist, secret access | Replaceable per test |
+| `Inspector` | `inspect(ProbeRequest) -> Observation{value or UNKNOWN(reason), observed_at, freshness}` | Allowlist enforced by the runner |
+| `Generator` and `Reloader` | `generate(inputs) -> Output`; `reload(scope) -> Reloaded | Requested | Unsupported | Failed` | A generated file is not a reload |
+| `UpdateProvider` | `candidates(policy)`; `request(candidate) -> Token`; `completion(token) -> Queued | Completed | Failed | Unknown` | Queued is `pending`. Only `Completed` is `updated`. |
+| `Fs`, `Clock`, `Runner`, `Vault` | Filesystem (descriptor-relative), time, allowlisted process spawn, secret access | Replaceable per test |
 
 ### Fake implementations
 
-1. In-process fakes implement the same traits and run against an isolated temporary HOME. They model failures: probe timeout, malformed output, queued-then-completed updates, queued-then-never-completed updates, partial install, empty secret, vault unavailable, concurrent foreign edit between plan and apply.
-2. Process-level fakes are small executables placed on an isolated `PATH` for adapters that must spawn a tool. They record argv and environment so tests can assert allowlist compliance and the absence of network or write calls.
+1. In-process fakes implement the same traits against an isolated temporary HOME. They model: probe timeout, malformed output, queued-then-completed updates, queued-then-never-completed updates, partial install, empty secret, vault unavailable, a concurrent foreign edit between plan and apply, and a symlink swapped into a parent between check and write.
+2. Process-level fakes are small executables on an isolated `PATH`. They record argv, cwd and environment so tests can assert allowlist compliance and the absence of network or write calls.
 3. A conformance suite runs against every implementation of a port: the fake and, at integration, the real adapter. A fake that fails the suite is a bug in the fake.
 
 ### Verification layering (C10)
 
 1. Workflow leaves (update, sync, try/adopt/purge, doctor) test orchestration only: ordering, blocking, approval binding, receipts, accounting, exit codes. They use the fakes and the conformance suite.
-2. A workflow leaf does not implement a real provider adapter and does not invent a new port. A needed port change is a contract change to this document.
-3. Real provider adapters are built and conformance-tested in their own leaves. They are joined to the workflows at integration, where the integration tests replace fakes with real adapters in an isolated HOME.
+2. A workflow leaf does not implement a real provider adapter and does not invent a port. A needed port change is a change to this document.
+3. Real provider adapters are built and conformance-tested in their own leaves. They are joined to the workflows at integration, in an isolated HOME.
 4. Native-device behavior on the personal M5 and work M3 is the later evidence gate (section 13).
 
 ## 12. Distribution and bootstrap (C01, C06)
 
-1. Layout: `~/.local/share/dotfiles-manager/versions/<semver>-<short-commit>/dotfiles-manager`. The active version is a symlink `~/.local/share/dotfiles-manager/current`. The command on PATH is a symlink to `current/dotfiles-manager`. (Locations are defaults for the macOS provider; the engine reads them from the `Platform` port.)
-2. Build: `cargo build --release --locked --offline` from a verified commit, with vendored sources fetched against `Cargo.lock`. The linker's ad-hoc signature is sufficient for a locally built binary. No release artifact, signing identity or notarization is part of this contract (open question 2).
-3. Bootstrap on a clean machine: a short POSIX `sh` script in this repository that (a) checks for Git and a Rust toolchain at the pinned channel, (b) clones the repository at a pinned commit, (c) builds, (d) installs into the layout above, (e) runs `self-check`. It prints each missing prerequisite and stops. It installs nothing silently.
-4. The bootstrap prerequisites (Command Line Tools, a Rust toolchain provider) are not assumed available on the M5 or M3. That is checked on the real devices later (section 13).
-5. Old version directories are kept until the next successful run of the new version, which is the rollback window for section 4.
+1. Layout: `~/.local/share/dotfiles-manager/versions/<semver>-<short-commit>/dotfiles-manager`. The active version is the symlink `~/.local/share/dotfiles-manager/current`. The command on PATH is a symlink to `current/dotfiles-manager`. Locations come from the `Platform` port.
+2. Build: `cargo build --release --locked --offline` from the staged tree after `cargo fetch --locked`. Whether the linker's ad-hoc signature is accepted under each device's security policy is **unverified** (device policy unknown). It is a device-gate item.
+3. **Bootstrap provenance (S4).**
+   1. The owner supplies, out of band, the bootstrap script's pinned commit and its SHA-256. The script is obtained by cloning that commit over `https` from the canonical origin and verifying the checksum before it runs. No `curl | sh`.
+   2. The script requires Git and Command Line Tools. If Command Line Tools are missing it runs `xcode-select --install`, then **polls** `xcode-select -p` and a compiler probe until they succeed or a 30-minute limit expires (the install command returns early). On expiry it stops with a clear message.
+   3. It requires the exact pinned Rust toolchain version, not a channel. It does not install a toolchain silently. If absent, it prints the exact pinned version and the toolchain source and stops.
+   4. It runs `cargo fetch --locked` with crates.io as the only registry, then builds offline, then runs `self-check`, then installs into the layout.
+   5. `cargo deny` and `cargo audit` or `cargo vet` run in the gate for the commit being built. The first self-built binary is trusted because it was built locally from the verified commit. Its SHA-256 is recorded as the first lock `[manager]` entry.
+4. Old version directories follow the rollback window in section 4.
 
 ## 13. Validation against fixtures and one concrete operation (C06)
 
-### Existing cases
+**Status: prose-validated only.** Nothing in this section was executed. Tables show **expected** behavior under this contract. They are not results.
 
-`examples/cases.toml` has four composition cases and 12 negative cases. The contract maps them as follows. All fixtures stay unexecuted by `just check`; the resolver must execute them in a later leaf.
+### Expected mapping of existing cases
 
-| Cases | Contract stage | Result |
+`examples/cases.toml` has four composition cases and 12 negative cases. A later resolver leaf must execute them. `just check` does not.
+
+| Cases | Contract stage | Expected result |
 | --- | --- | --- |
-| `personal-composition`, `external-composition`, `homelab-composition`, `server-composition` | Resolve (section 6) | Module list and effective values match. The `origins` entry for `desktop.aerospace` shows provenance carrying the supplying module and source. |
-| `unknown-module`, `duplicate-module-selection`, `module-dependency-cycle`, `unsupported-module-platform`, `external-core-replacement` | Resolve: selection, dependency, platform | Exit 3, code from the case. No state touched. |
+| `personal-composition`, `external-composition`, `homelab-composition`, `server-composition` | Resolve (section 6) | Module list and effective values match. The `origins` entry for `desktop.aerospace` expects provenance with the supplying module and source. |
+| `unknown-module`, `duplicate-module-selection`, `module-dependency-cycle`, `unsupported-module-platform`, `external-core-replacement` | Resolve: selection, dependency, platform | Exit 3 with the case's code. No state touched. |
 | `protected-core-source`, `competing-default-overrides`, `contribution-namespace`, `output-owner-collision` | Resolve: authority and claims | Exit 3. Section 6 items 2 and 3 produce the codes. |
-| `missing-external-source`, `source-containment`, `home-target-containment` | Resolve: source and target containment | Exit 3. Items 5 of section 6 and section 8 apply. |
+| `missing-external-source`, `source-containment`, `home-target-containment` | Resolve: source and target containment | Exit 3. Section 6 item 5 and section 8 apply. |
 
-The first error follows the validation order in DESIGN.md section 9. `E_SCHEMA_UNSUPPORTED`, `E_SOURCE_UNTRUSTED`, `E_ADAPTER_UNKNOWN` and `E_HOME_MISMATCH` are added by this contract and have no fixture yet. Each needs a case before the resolver is accepted (listed as follow-up in the PR).
+The first error follows the validation order in DESIGN.md section 9. This contract adds `E_SCHEMA_UNSUPPORTED`, `E_STATE_NEWER`, `E_SOURCE_UNTRUSTED`, `E_ADAPTER_UNKNOWN`, `E_HOME_MISMATCH`, `E_OVERRIDE_REFUSED`, `E_LIMIT_EXCEEDED` and `E_LOCKED`. None has a fixture yet.
 
-Gap found: the fixtures contain no case for the schema-version refusal, a state-version refusal or an interrupted operation. This contract defines them (sections 4, 5), but nothing validates them yet.
+Gap: the fixtures contain no case for schema refusal, state-version refusal, an oversized document, a new-origin gate or an interrupted operation. Each needs a case before the resolver or engine leaf is accepted.
 
-### Walkthrough: `sync` on `personal-dev-01`
+### Expected walkthrough: `sync` on `personal-dev-01`
 
-Scenario: `sync` pulls a core revision that changes five things. The profile composes `core`, `agents`, `desktop`, `personal-dev`. Paths and names are the synthetic fixture names.
+Scenario: `sync` pulls a core revision that changes several resources. The profile composes `core`, `agents`, `desktop`, `personal-dev`. Names are the synthetic fixture names.
 
-1. **Resolve.** The binary loads the binding and the profile. Every `schema` is 1, accepted. Sources are fetched into staging (not the linked checkout). The staged tree digests are compared with the lock, and the changed lock is part of the plan. The resolver closes `requires`, applies overrides, and produces the effective model with provenance.
-2. **Inspect.** Allowlisted probes only. `lstat` and `readlink` on `~/.config/git/config` and `~/.ssh/config`. Read of `~/.claude/settings.json`. A Homebrew installed-version listing for `atuin` (candidate probe, disabled and reported `UNKNOWN` until verified). Application bundle metadata for `firstmate`. Existence of the secret destination file and its mode. No `--version` run, no network.
-3. **Plan.** Operations and digest:
-   - File: `core.ssh`, `fs-link/v1`. The link target is absent. Operation `create-link` with prerequisite "leaf absent, parents are real directories". Postcondition: `readlink` equals the source path.
-   - Co-owned: `agents.claude-settings`, `claude-settings/v1`. Operation `merge-fields` with the managed fields and handlers only. The observation fingerprint covers the whole live file so foreign hooks are captured. Postcondition: managed fields equal desired, foreign handlers unchanged.
-   - Package: `personal-dev.atuin`, `homebrew/v1`. The locked pin is the declared version. It is a changed pin, so `sync` applies it. It does not float to a newer release. If the observed owner is not Homebrew, the operation is `blocked` (owner conflict).
-   - Secret: `personal-dev.example-secret`, `op-template/v1`. `sync` does not include secret scope by default, so this operation is listed `not_in_scope`. The plan shows the destination and mode 0600, not any content.
-   - Native: `personal-dev.firstmate`, `firstmate-native/v1`. `sync` applies declarations only. It does not request a native update (that is `update`).
-   - The manager's own package, if the lock changes its version, is the last operation (section 8).
-4. **Approve.** Interactive: the table is shown, the user approves, the digest is recorded in the receipt. Noninteractive: `--yes-plan <digest>` is required, or exit 3 with the unsatisfied gate.
-5. **Apply.** Journal `intent` for each operation. Before writing `settings.json`, the adapter re-reads the live file. If its fingerprint differs from the plan, the operation is `blocked` (stale) and later dependents are blocked. Otherwise the adapter writes a same-directory temporary file, validates it, and renames it atomically. The link operation re-checks parents immediately before `symlink`.
-6. **Verify.** Each postcondition is tested. The link and merged settings pass. `atuin` is verified by the allowlisted installed-version probe. The reload of any consumer is a separate result: `Requested` or `Unsupported` for a running application, never silently `Reloaded`.
-7. **Result.** Receipt written with `owned_outputs`. Counts: `done` 3, `not_in_scope` 1, `pending` 0. Exit 0. A re-run produces an empty plan and exit 0.
-8. **Failure variant.** If the Homebrew install fails, the self-update and any operation that depends on it are `blocked`. Independent file operations that already completed stay done and are listed in the receipt. Exit 1. The next run reads the receipt and the journal, runs `already_done` for each operation, and resumes. No rollback is attempted across providers.
-9. **Secret and native variants.** With `update`, the `firstmate` request returns a token. `completion(token)` is `Queued`, so the operation is `pending` and the run exits 5. The secret operation, when explicitly in scope, authenticates only if the credential is available; a failed or empty render leaves the previous file untouched.
-
-This walkthrough is prose validation of the contract. No code ran. Only the resolver cases are candidates for early executable checks.
+1. **Resolve.** Every `schema` is 1, accepted. Sources are fetched into staging with the isolated Git environment. The manager recomputes each tree digest and checks reachability from the ref. The lock change, old and new commit, digests and diff stat are part of the plan. The resolver closes `requires`, applies overrides, and produces the effective model with provenance.
+2. **Inspect.** Allowlisted probes only. `lstat` and `readlink` on `~/.config/git/config` and `~/.ssh/config`. A bounded read of `~/.claude/settings.json`. An installed-version probe for `atuin` (a candidate probe, `UNKNOWN` until its fixture test exists). Application bundle metadata for `firstmate`. Existence and mode of the secret destination. No `--version` run, no network.
+3. **Plan** (participants and expected status):
+   - File `core.ssh` (`fs-link/v1`): link absent, so `create-link`; prerequisite "leaf absent, parents are real directories"; postcondition "`readlink` equals source". Expected `updated`.
+   - Co-owned `agents.claude-settings` (`claude-settings/v1`): `merge-fields` for managed fields and handlers only. The prerequisite fingerprint covers the whole live file so foreign hooks are captured. Class `normal`. Expected `updated`.
+   - Package `personal-dev.atuin` (`homebrew/v1`): the locked pin differs, so `sync` applies it and does not float to a newer release. If the observed owner is not the declared owner, expected `blocked`.
+   - Secret `personal-dev.example-secret` (`op-template/v1`): secrets are not in `sync` scope by default. Expected `not_in_scope`. The plan shows destination and mode 0600, no content, no hash.
+   - Native `personal-dev.firstmate` (`firstmate-native/v1`): `sync` applies declarations only and requests no native update. Expected `current`.
+   - Manager component, only if the lock changes its version: last, per section 8.
+4. **Approve.** Interactive: the plan is shown and the digest recorded with `approval.kind = interactive`. Noninteractive: `--yes-plan <digest>` from a prior `--preview`, or exit 3 with the unsatisfied gate. A new origin is never approvable this way.
+5. **Apply.** Journal `intent` per operation. Before writing `settings.json`, the adapter re-reads the live file through the descriptor-relative `Fs` port. A fingerprint mismatch makes the operation `blocked` (stale) and blocks dependents. Otherwise it writes an `O_EXCL` temporary file in the same directory, validates it, and `renameat`s it.
+6. **Verify.** Each postcondition is tested. The reload of any running consumer is a separate result (`Requested` or `Unsupported`), never silently `Reloaded`.
+7. **Result.** Expected counts: `updated` 3, `current` 1, `not_in_scope` 1, others 0 (sum 5 participants). Ledger and receipt written. Exit 0. A repeat run expects an empty plan and exit 0.
+8. **Failure variant.** If the package install fails, mid-run: the operation is `failed`, dependents `blocked`, unstarted operations `not_started`. Completed file operations stay `updated` in the receipt and ledger. Exit 1. The next run reads the journal, runs `already_done` for each operation, and resumes. No cross-provider rollback.
+9. **Pending variant.** Under `update`, the `firstmate` request returns a token and `completion(token)` is `Queued`. The status is `pending`, the journal phase is `pending`, and with no failure the exit code is 5.
+10. **Secret variant.** With the secret scope explicitly selected, the manager authenticates only if the credential is already available. A failed or empty render leaves the previous file untouched. A noninteractive run without the credential exits 3 before mutation.
 
 ### Later evidence gate: device and bootstrap compatibility
 
-Not assumed here. The following need evidence on the real personal M5 and work M3 in a later leaf: Command Line Tools and Rust toolchain availability at the pinned channel, linker behavior and ad-hoc code signing under the machine's security policy, Homebrew and mise probe behavior without side effects, secret-vault noninteractive availability, and the home-directory and filesystem alias behavior. Until then these are unknown.
+Not assumed. The following need evidence on the real personal M5 and work M3 in a later leaf, and are unknown until then: Command Line Tools and the exact pinned Rust toolchain on each device, linker behavior and ad-hoc signing under each machine's security policy, Homebrew and mise probe behavior without side effects, noninteractive vault availability, filesystem alias behavior, availability of the Git protocols and credential helper for the declared origins, and whether the work M3's policy permits building and running a locally built binary.
 
-## 14. Open questions for the owner
+## 14. Decisions and open questions
 
-1. **Build requirement.** Is it acceptable that bootstrap requires Git, Command Line Tools and a Rust toolchain on each target? The alternative is Python 3.14 standard library (no build, but a managed interpreter that `update` can retire).
-2. **Release artifacts.** Build from source on each machine (this contract), or publish a prebuilt `aarch64-apple-darwin` binary with a pinned checksum? The second needs a release process and a signing decision.
-3. **Third-party crates.** Are `serde`, `toml`, `serde_json` and `sha2` acceptable as the only runtime crates?
-4. **Commit signature policy.** Require signed commits for trusted origins, or rely on origin trust plus tree digests?
-5. **Exit-code table.** Are exit codes 3, 4, 5 and 130 acceptable in addition to the `doctor` codes 0, 1, 2?
-6. **State directory and command names.** Keep `dotfiles-manager` and `~/.local/state/dotfiles-manager/` (still working names)?
-7. **Prompt timeout.** Is a 300 s default for interactive prompts acceptable?
-8. **Disruptive actions.** Which actions count as disruptive in the first delivery (for example restarting a window manager)? The list is needed before the apply leaf.
+### Decided (owner, 2026-10-09)
+
+1. **Build requirement.** Git, Command Line Tools and a pinned Rust toolchain are accepted at bootstrap only. Bootstrap polls for Command Line Tools completion before building. Rationale: the static binary removes the interpreter-retirement risk (section 2). Python 3.14 standard library through uv stays documented as the fallback.
+2. **Release artifacts.** Build from source for first delivery. No signing or release process. Rationale: avoids a release and signing decision before the device gate.
+3. **Crates.** `serde`, `toml`, `serde_json` and `sha2` are accepted as the four direct crates, with exact version pins, locked transitives and a `cargo-deny` gate. Rationale: the standard library has no TOML parser or SHA-256.
+4. **Commit signatures.** Not required now. Trust is origin plus the recomputed tree digest. Signed commits can come later. Rationale: no signing infrastructure exists, and the digest binds content.
+5. **Exit codes.** 3, 4, 5 and 130 accepted, with 143 for SIGTERM.
+6. **Names.** Keep `dotfiles-manager` and `~/.local/state/dotfiles-manager/`.
+7. **Prompt timeout.** 300 s accepted.
+8. **Disruptive set.** The set in section 10 is proposed and accepted as the working definition.
+
+### Open questions for the owner
+
+1. **Employer identity.** The public documents use "work M3" and a synthetic "work" module, and name no employer. Confirm that no document, fixture, lock origin or receipt field in this public repository may identify the employer or work-machine details, and that private module repositories carry them.
+2. **Device gate.** Which device runs the section 13 gate first, and who runs it? Until it runs, the Rust choice and the bootstrap sequence are unverified on both devices.
+3. **Toolchain pin source.** Where does the exact toolchain come from on a device (an existing version manager or a direct download)? Section 2 requires it to be present before a self-update build.
 
 ## 15. Not in this contract
 
-No marketplace, no expression language, no daemon or scheduler, no Linux or Intel provider, no dynamic adapter loading, no cross-provider transaction.
+No marketplace, expression language, daemon or scheduler, Linux or Intel provider, dynamic adapter loading, or cross-provider transaction. Renaming existing tool or device names is out of scope here.
