@@ -4,6 +4,8 @@
 
 Source baseline: `~/.dotfiles` at `1dbd12d3a563120a77aa3e27f68ad903a6d47d9e`. The generated-dotfiles audit provides evaluated counts: 126 Home Manager path entries, including 115 source links; 11 MCP destinations; four activation-written settings/instruction outputs; two secret-render targets. These scopes overlap and must not be added together. The counts are prior verified audit results, not a new evaluation performed for this draft.
 
+First delivery targets only the personal M5 and work M3 (native Apple Silicon macOS). The Intel i9 remains independently owned by homelab and GNU Stow. Linux and homelab entries below are illustrative schema fixtures, not supported-target or migration promises. Future platforms constrain only the avoidance of OS-bound core semantics, mandatory GUI assumptions, and hard-coded model or prefix paths.
+
 “Linked on every current machine” is evidence about the current configuration, not proof that a setting belongs on every future server. The public repository declares one host. The current private consumer has not been inspected; no actual work-machine configuration is inferred below.
 
 ## Core invariants
@@ -42,7 +44,7 @@ AeroSpace, mise infrastructure fragments, MCP machine overlays, and skill machin
 | Personal and homelab | Personal shell functions, Hippo, journal configuration, personal registry, optional sports tooling, Tailscale integration, declared 1Password templates | Device-specific journal data remains device-specific. Homelab reachability and account values do not become universal defaults. |
 | Platform/system | Package owners, macOS preferences, login shell, launchd/systemd resources, fonts/certificates and privileged paths | Separate privileged adapters and explicit ownership handoffs. Existing Nix-generated state is not deleted by removing user links. |
 
-A server composition can select only the core and its platform/server requirements. The Linux examples demonstrate that desired composition; they do not establish that the current macOS source files or service implementations already support Linux.
+A server composition can select only the core and its platform/server requirements. The Linux examples show the schema can express that composition; they are illustrative, not a supported-target or migration promise, and do not establish that the current macOS source files or service implementations support Linux.
 
 The synthetic external work module demonstrates replacement, subtraction, hook contributions, and scoped Git identity. It is not a template copied from the real private repository, and it contains no claims about that machine's applications or security posture.
 
