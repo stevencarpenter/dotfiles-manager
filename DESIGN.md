@@ -11,6 +11,9 @@ Status: proposed replacement specification, not an implemented manager. The owne
 3. Role-specific configuration belongs in modules. Work, personal-development, homelab, and server modules can carry their own application plugins, extensions, packages, and settings.
 4. Installation accounts for the machine's platform, existing files, package owners, application state, and service lifecycle. Existing state informs a safe transition; it does not silently become desired configuration.
 5. A full replacement manager is in scope. Incremental implementation and migration do not restrict the eventual product to a task-runner wrapper.
+6. First delivery requires only two machines: the personal M5 and the work M3, both native Apple Silicon macOS. The earlier three-machine requirement is superseded. All four mandatory workflows and full replacement still apply to these two machines.
+7. The Intel i9 remains independently owned by the homelab repository and GNU Stow. It is not a first-delivery target, and this design makes no migration promise for it.
+8. Linux and desktop Macs (Mac Studio, Mac Mini) are not targets. Design only to avoid OS-bound core semantics, mandatory GUI assumptions, and hard-coded model or prefix paths. This adds no platform implementation, portability framework, or delivery gate.
 
 ### Mandatory first-implementation workflows
 

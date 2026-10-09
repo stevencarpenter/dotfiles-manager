@@ -13,6 +13,12 @@ A proposed manager for one profile per machine, an authoritative shared core, an
 - [Synthetic external bundle](examples/external/bundle.toml): adds a module without making the public bundle reference it.
 - [Resolver acceptance fixtures](examples/cases.toml): expected results and errors for the future resolver. These expectations are not executed yet.
 
+## First delivery scope
+
+First delivery requires only the personal M5 and the work M3, both native Apple Silicon macOS. This supersedes the earlier three-machine requirement. All four workflows below and full replacement remain mandatory for these two machines.
+
+The Intel i9 remains independently owned by the homelab repository and GNU Stow. The Linux and homelab examples are illustrative schema fixtures, not supported-target or migration promises. Future Linux and desktop Mac (Mac Studio, Mac Mini) use is limited to avoiding OS-bound core semantics, mandatory GUI assumptions, and hard-coded model or prefix paths. It adds no platform implementation, portability framework, or delivery gate.
+
 ## Required in the very first implementation
 
 These workflows are user requirements, not features deferred until after a read-only implementation. The command names are proposals, not installed commands.
