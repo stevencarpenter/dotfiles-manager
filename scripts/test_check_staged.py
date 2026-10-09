@@ -78,15 +78,28 @@ class StagedGateTest(unittest.TestCase):
             shutil.copyfile(
                 Path(__file__).with_name("check_staged.sh"), scripts / "check_staged.sh"
             )
-            # The gate must hand check_all.sh an environment free of local git variables.
+            # The default index holds a failing gate; only the alternate index passes.
+            (scripts / "check_all.sh").write_text(
+                'echo "validated the default index" >&2\nexit 1\n'
+            )
+            subprocess.run(["git", "add", "."], cwd=decoy, check=True, env=env)
+            before = subprocess.check_output(["git", "write-tree"], cwd=decoy, env=env)
+            # The alternate index (as a hook's GIT_INDEX_FILE) must be the one validated,
+            # and check_all.sh must see no local git variables.
+            alternate = decoy / ".git" / "alternate-index"
+            shutil.copyfile(decoy / ".git" / "index", alternate)
             (scripts / "check_all.sh").write_text(
                 "for v in $(git rev-parse --local-env-vars); do\n"
                 '  [ -z "${!v+x}" ] || { echo "leaked $v" >&2; exit 1; }\n'
                 "done\n"
             )
-            subprocess.run(["git", "add", "."], cwd=decoy, check=True, env=env)
-            before = subprocess.check_output(["git", "write-tree"], cwd=decoy, env=env)
-            poisoned = poisoned_env(decoy)
+            subprocess.run(
+                ["git", "add", "scripts/check_all.sh"],
+                cwd=decoy,
+                check=True,
+                env=env | {"GIT_INDEX_FILE": str(alternate)},
+            )
+            poisoned = poisoned_env(decoy) | {"GIT_INDEX_FILE": str(alternate)}
             result = subprocess.run(
                 ["bash", "scripts/check_staged.sh"],
                 cwd=decoy,

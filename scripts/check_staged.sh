@@ -9,5 +9,6 @@ trap 'rm -rf "$gate_tree"' EXIT
 git checkout-index --all --prefix="$gate_tree/"
 cd "$gate_tree"
 # Hooks export GIT_DIR/GIT_INDEX_FILE; drop them so nested git commands cannot touch this repo.
-unset $(git rev-parse --local-env-vars)
+local_env_vars=$(git rev-parse --local-env-vars)
+unset $local_env_vars
 bash scripts/check_all.sh
