@@ -40,7 +40,7 @@ Rust's advantage over Python 3.14 plus uv holds only when one of these is true:
 
 The owner accepted condition 2 for first delivery (decision 1). It is **unverified** on the personal M5 and the work M3 until the device gate in section 13. If the gate fails, the documented alternative is Python 3.14 standard library run through uv, with the interpreter-retirement risk handled by the self-update ordering rule in section 8.
 
-Self-update by build adds a prerequisite: the exact pinned toolchain version must already be installed when `update` builds. If a lock change bumps the toolchain pin, installing the new toolchain is a separate earlier operation that needs network access and is shown in the plan. The build itself then runs with network off (section 8).
+Self-update by build adds a prerequisite: the exact pinned toolchain version must already be installed when `update` builds, from the source and checksum defined in section 8. If a lock change bumps the toolchain pin, installing the new toolchain is a separate earlier operation that needs network access and is shown in the plan, with the artifact digest. The build step has no network guarantee beyond Cargo's own offline mode (section 8, build containment).
 
 ## 3. Toolchain and repository layout (C01)
 
@@ -49,19 +49,25 @@ Self-update by build adds a prerequisite: the exact pinned toolchain version mus
 - Workspace crates and permitted dependencies (an arrow means "depends on"):
 
 ```
-ports            (leaf: traits Fs, Clock, Runner, Vault, Platform and shared value types)
-model         -> (nothing)      pure: documents, schema checks, resolver, provenance
-adapters      -> ports, model   generic adapters: fs-link, git-config, claude-settings,
-                                text-fragments, skills
-engine        -> ports, model   planner, applier, ledger, receipts, journal, registry trait
-platform_macos-> ports, model   macOS provider adapters and port implementations
-cli           -> engine, adapters, platform_macos   parsing, rendering, exit mapping
+model          -> (nothing)       data and pure logic: documents, schema checks, resolver,
+                                  provenance, and the shared data types Typed, Claims,
+                                  Operation, Observation, ProbeRequest, Check, Outcome
+ports          -> model           traits only: Adapter, Fs, Clock, Runner, Vault, Platform,
+                                  Installer, Inspector, Generator, Reloader, UpdateProvider
+adapters       -> ports, model    generic adapters: fs-link, git-config, claude-settings,
+                                  text-fragments, skills
+engine         -> ports, model    planner, applier, ledger, receipts, journal, registry
+platform_macos -> ports, model    macOS provider adapters and port implementations
+cli            -> engine, adapters, platform_macos   parsing, rendering, exit mapping
 ```
 
-- `model` takes already-read bytes and returns typed values. It performs no filesystem, process or network call and has no port dependency. `engine` reads sources through the `Fs` port and passes bytes to `model`.
+
+- `model` takes already-read bytes and returns typed values. It performs no filesystem, process or network call and depends on no other crate. `engine` reads sources through the `Fs` port and passes bytes to `model`.
+- Type placement: data types (`Typed`, `Claims`, `Operation`, `Observation`, `Outcome`) live in `model`. Traits (`Adapter` and the section 11 ports) live in `ports`. `adapters` and `platform_macos` implement `Adapter` and the ports. Neither depends on `engine`. `engine` calls adapters only through the `Adapter` trait in `ports`.
 - `adapters` is the generic adapter crate. It contains no OS-bound path or tool.
 - `platform_macos` is the only crate that names macOS prefixes, macOS-provided tools or APIs, and the provider tools that are OS-bound (Homebrew, launchd, application bundles, `op`, mise). A test fails the gate if those names or prefix literals appear in `model`, `ports`, `engine` or `adapters`.
 - The registry maps adapter identifiers to implementations. `cli` builds it. `engine` knows only the trait.
+- Release profile and features: `test-isolation` (section 7) is never in `default` features. A gate test fails if a release build graph enables it.
 
 ## 4. Versioned schema and compatibility (C01, C03)
 
@@ -106,16 +112,17 @@ The **ledger is the only source of delete authority.** A receipt never grants it
 ### State upgrade and recovery
 
 1. The upgrade holds the lock (section 10) taken on the parent directory, so the lock is not inside the renamed directory.
-2. It reads `state/`, writes the new format into `state.next/`, validates it, writes `state.next/COMPLETE`, then renames `state` to `state.prev-<old schema>` and `state.next` to `state`. The order of the two renames is fixed.
+2. It reads `state/`, writes the new format into `state.next/`, validates it, writes `state.next/COMPLETE`, then renames `state` to `state.prev-<n>` and `state.next` to `state`. `<n>` is the upgrade id, an integer one greater than the highest existing `state.prev-*`, so names never collide. The new `state` gets a record `state/UPGRADE` with `upgrade_id` and the digest of the converted state. The order of the two renames is fixed.
 3. Recovery by directory shape: `state.next/` without `COMPLETE` is discarded and the upgrade restarts from the untouched `state/`. `state.next/COMPLETE` with no `state/` completes the rename. `state/` with `state.prev-*` is the normal post-upgrade shape.
-4. State newer than the binary supports, or outside Reads union Upgrades from, is refused with `E_STATE_NEWER` or `E_SCHEMA_UNSUPPORTED`. There is no downgrade. Recovery is `state.prev-*` plus an older binary version kept by the rule in section 12.
+4. State newer than the binary supports, or outside Reads union Upgrades from, is refused with `E_STATE_NEWER` or `E_SCHEMA_UNSUPPORTED`. There is no downgrade. Recovery is `state.prev-<n>` plus an older binary version kept by the rule in section 12.
 
-### Rollback window (F3)
+### Rollback window (F3, N2, N3)
 
-1. After an upgrade, `state.prev-*` and the previous binary version directory are kept.
-2. The first `doctor` run on the upgraded state that completes its state, ledger and journal checks without a state finding writes `state/VERIFIED`. (`doctor` writes only this marker inside the manager's own state. That is the one exception to its read-only rule, and the marker never changes configuration or ownership.)
-3. The first successful mutating run after `VERIFIED` exists removes `state.prev-*` and the previous version directory, then records the removal in its receipt.
-4. If `VERIFIED` never appears, `state.prev-*` stays. It is never removed by a run that failed, was interrupted, or was read-only.
+1. After an upgrade, `state.prev-<n>` and the previous binary version directory are kept.
+2. `doctor` stays read-only. It writes no marker. It reports whether the upgraded state is verified.
+3. The explicit command `verify --mark` takes the lock, checks the state, ledger and journal, and writes `state/VERIFIED` with `O_EXCL`. The marker holds the `upgrade_id` and a digest of `ledger.json` and `UPGRADE` at marking time. The command refuses if the marker exists, if any check fails, or if no upgrade is pending verification. An upgrade never copies a marker forward: `state.next/` is created without one.
+4. Removing `state.prev-<n>` and the previous binary directory is a planned, journaled operation (`retire-previous`). It appears as a preview line, is part of the plan digest and has its own journal entries. The first successful mutating run plans it only when the marker's `upgrade_id` equals the current `UPGRADE` record and its digest equals the digest computed at plan time. A mutating run that changes the ledger in between makes the marker stale, and `verify --mark` must run again.
+5. If the marker never appears or is stale, `state.prev-<n>` stays. A failed, interrupted or read-only run never removes it.
 
 ## 5. Document formats (C01)
 
@@ -148,8 +155,9 @@ required_by = ["personal-dev.atuin"]
 
 [manager]                         # present only when the manager is a managed component
 version = "<semver>"
-binary_sha256 = "<64 hex>"        # SHA-256 of the built binary (section 8)
+binary_sha256 = "<64 hex>"        # record only; never compared across machines
 toolchain = "1.98.1"
+toolchain_artifact_sha256 = "<64 hex>"   # digest of the toolchain artifact (section 8)
 ```
 
 For `kind = "path"` (local editable source) the lock stores no commit. Any change to such a source invalidates an existing plan. The lock holds no secret values and no hash of secret material.
@@ -169,7 +177,9 @@ operations[{id, resource, adapter, class, status, started_at, finished_at,
 result{outcome, exit_code, counts}
 ```
 
-Read-only commands write no receipt. `approval.kind` is `interactive` or `yes_plan` for every receipt (S11).
+Read-only commands (`plan`, `explain`, `doctor`, `status`, `self-check`, and any `--preview`) write no receipt. `verify --mark` writes only its marker and a journal entry. Every receipt records `approval.kind` as `interactive` or `yes_plan` (S11). It also records `approvals[]` entries for each disruptive operation approved (`{operation_id, how: "interactive" | "allow_disruptive", at}`) and `origin_grants[]` for each origin-trust grant (`{origin, how: "interactive", binding_digest_before, binding_digest_after, written_by: "manager", binary_sha256}`). A binding that contains an origin with no matching grant record is treated as untrusted (`E_SOURCE_UNTRUSTED`), and `doctor` reports `BINDING_CHANGED_EXTERNALLY`.
+
+`binary.sha256` is recorded for audit only. It is never compared across machines.
 
 **One status vocabulary (F6).** Operation `status` and `counts` keys are the same set. `counts` has one key per status, and the sum of all counts equals the number of participants (every resource or component the plan covers, whether or not it changed).
 
@@ -180,10 +190,11 @@ Read-only commands write no receipt. `approval.kind` is `interactive` or `yes_pl
 | `held` | A declared hold applies, with its reason. | `done` |
 | `pending` | Request accepted, completion not yet observed (for example a queued native update). | `pending` (carries the completion token) |
 | `failed` | Operation or postcondition failed. | `failed` |
-| `blocked` | A prerequisite failed or a dependency failed or was `pending` without allowing dependents. | `blocked` |
+| `blocked` | A prerequisite failed, or a dependency `failed` or `blocked`. | `blocked` |
+| `blocked_pending` | A dependency is `pending`, so this operation did not start. Reported separately from `blocked`. | `blocked` (with reason `pending_dependency`) |
 | `not_started` | Run stopped before this operation. | none |
 | `not_in_scope` | The command's scope excludes it (for example secrets during `sync`). | none |
-| `unknown` | A required observation is `UNKNOWN`, so the engine cannot decide. | `unknown` |
+| `unknown` | A required observation is `UNKNOWN`, so the engine cannot decide. Before any mutation it gives exit 3. After a mutation began it gives exit 1. | `unknown` |
 
 ### Journal and interruption records
 
@@ -208,7 +219,7 @@ DESIGN.md sections 2, 3 and 5 define the rules. This section records how the imp
 
 1. `model`, `ports`, `engine` and `adapters` contain no prefix literal, no model name and no OS-bound tool name. A gate test enforces this (section 3).
 2. HOME is derived once by `platform_macos`: the password-database home of the effective user, which must equal `$HOME`. A mismatch is `E_HOME_MISMATCH` and fails before mutation.
-3. **Isolation overrides (F8).** `DFM_HOME`, `DFM_BINDING` and `--home` replace HOME and the binding for tests. Rules: every report header and the JSON output show `isolated: true` and the override values. Read-only commands (including `self-check`) accept them in every build. Mutating commands accept them only in a build with the cargo feature `test-isolation`, which release builds never enable. A release build given an override on a mutating command exits 2 with `E_OVERRIDE_REFUSED`.
+3. **Isolation overrides (F8, N9).** `DFM_HOME`, `DFM_BINDING` and `--home` exist only in a build with the cargo feature `test-isolation`. Release builds do not compile them: the environment variables are ignored and `--home` is an unknown flag (exit 2). A gate test checks that a release build never enables `test-isolation`. In a `test-isolation` build, every report header and JSON output show `isolated: true` and the override values. `self-check` takes an explicit `--fixture-dir <path>` argument in every build, reads only that directory, and makes no network call.
 4. Provider locations are observations, not constants. Each provider adapter declares an ordered candidate search and verifies the result (exists, executable, trusted owner and mode per section 8). The verified location is recorded in the report and receipt.
 5. The `Platform` port exposes `home()`, `case_fold(path)`, `locate(provider)` and `runner()`. Composition, planning and state use only the port.
 6. Optional GUI or service resources exist only in modules a profile selects. The engine has no GUI assumption.
@@ -222,7 +233,7 @@ A source identity is `(canonical origin, resolved commit, tree digest)`.
 
 **Canonical origin (S2).** Exactly one form: scheme `https` or `ssh`; host lowercase ASCII (IDNA converted); no userinfo except the fixed `git` user for `ssh`; no port unless non-default; path without trailing `/` and without a `.git` suffix; no query or fragment. Anything that does not canonicalize to this form is `E_SOURCE_UNTRUSTED`. Comparison is exact string equality of the canonical form.
 
-**Fetch environment (S2).** The manager runs Git with `GIT_CONFIG_GLOBAL=/dev/null`, `GIT_CONFIG_SYSTEM=/dev/null`, `GIT_CONFIG_NOSYSTEM=1`, `GIT_TERMINAL_PROMPT=0`, `GIT_ALLOW_PROTOCOL=https:ssh`, `protocol.allow=never` with `https` and `ssh` enabled by `-c`, no `url.*.insteadOf` rewriting, no `core.fsmonitor`, hooks disabled by `core.hooksPath=/dev/null`, and no credential helper except the one declared in the binding. Redirects to a different canonical origin fail. Fetch runs into a staging directory. It never changes a linked checkout.
+**Fetch environment (S2, N4).** The manager builds the Git environment from scratch, as for probes: it starts empty and adds only `PATH` (fixed), `HOME` (a manager-owned empty directory), `LANG=C`, `GIT_CONFIG_GLOBAL=/dev/null`, `GIT_CONFIG_SYSTEM=/dev/null`, `GIT_CONFIG_NOSYSTEM=1`, `GIT_TERMINAL_PROMPT=0`, `GIT_ALLOW_PROTOCOL=https:ssh`, and the one credential helper declared in the binding. It never inherits `GIT_CONFIG_COUNT`, `GIT_CONFIG_KEY_*`, `GIT_CONFIG_PARAMETERS`, `GIT_SSH_COMMAND`, `GIT_PROXY_COMMAND`, `GIT_ASKPASS`, `HTTPS_PROXY` or any other variable from the caller. The git binary path is pinned and verified by the argv[0] rule in the probe section. Command-line settings: `protocol.allow=never` with `https` and `ssh` enabled, `core.hooksPath=/dev/null`, `core.fsmonitor=false`, `transfer.fsckObjects=true`, no `url.*.insteadOf`. Redirects to a different canonical origin fail. Fetch runs into a staging directory and never changes a linked checkout.
 
 **Tree digest (S1).** The manager recomputes the digest from the checked-out staging tree. It never trusts a digest supplied by the source.
 
@@ -236,7 +247,7 @@ A source identity is `(canonical origin, resolved commit, tree digest)`.
 
 1. The binding holds the trusted origin set. A new origin needs an interactive approval during `sync` or `update`. **`--yes-plan` can never grant a new origin (S3, F9).** A noninteractive run that meets a new origin exits 3.
 2. Fetching and resolving never run repository code.
-3. **Known exception (F9).** The self-update build runs the fetched workspace's `build.rs` files, procedural macros and the vendored dependencies' build scripts. Trust for that code is the origin plus the recomputed tree digest, and nothing more. This is a recorded risk: a compromised trusted origin can run code as the user at build time. Mitigations are in the self-update section.
+3. **Known exception (F9).** The self-update and bootstrap builds run the fetched workspace's `build.rs` files, procedural macros and the dependencies' build scripts. Trust for that code is the origin plus the recomputed tree digest, and nothing more. This is a documented, accepted risk with no sandbox: a compromised trusted origin can run code as the user at build time. Containment claims are in the self-update section.
 4. Commit signatures are not required now (decision 4). Signed commits can be added later by a schema change.
 
 ### Read-only probe allowlist
@@ -279,16 +290,19 @@ Writes that publish into a target directory use descriptor-relative operations: 
 2. For `sensitive` paths the manager stores no snapshot content, no content hash and no diff in the ledger, receipts, journal, snapshots or `--json`. It stores the destination, mode and an owner label.
 3. **Redaction rule for every persisted or printed field** (receipt `error`, journal entries, `--json`, table, provider stderr): a value is replaced by `[redacted]` if it came from a `sensitive` path, a secret provider, an environment variable declared secret, or matches a credential pattern list. Provider stderr is captured, truncated to 4 KiB, redacted, then stored.
 4. **Test (required).** A fake provider writes a planted secret string into stderr, stdout, an error message and a file name. The test asserts the string is absent from every persisted file and every output format.
-5. Snapshots are `normal` class only. They live in `state/snapshots/<op-id>/` (0700 and 0600). Retention: snapshots are kept while the owning receipt's operation is the latest for that resource, and removed on the next successful run after a newer snapshot exists for the same resource, or 30 days after the resource leaves the ledger, whichever is later. Deleting a snapshot is never a side effect of purge. `state.prev-*` retention is in section 4.
+5. Snapshots are `normal` class only. For a co-owned document such as `claude-settings/v1`, the class is `normal` and the snapshot holds the **managed fields only**, never the whole file, so foreign fields that might hold credentials are not copied. They live in `state/snapshots/<op-id>/` (0700 and 0600). Retention: snapshots are kept while the owning receipt's operation is the latest for that resource, and removed on the next successful run after a newer snapshot exists for the same resource, or 30 days after the resource leaves the ledger, whichever is later. Deleting a snapshot is never a side effect of purge. `state.prev-<n>` retention is in section 4.
+7. **Conflict detection for sensitive paths (N7).** The manager must not overwrite a user edit silently, without storing secret content or its hash. For a `sensitive` co-owned file, the ledger stores a per-machine salted hash of the **managed fields only** (the salt is a random 32-byte value in `state`, mode 0600; the hash is never exported, and it never covers secret values). For a secret output, the ledger stores file identity and metadata only (device, inode, size, mode, mtime), not content. At apply time a mismatch with the ledger entry, or a missing ledger entry for an existing destination, makes the operation `blocked` with `E_CONFLICT`. Overwriting needs an interactive confirmation that names the destination.
 6. Secret destinations: the new content goes to a same-directory 0600 temporary file and replaces the destination only after a complete, non-empty render. A failed or empty render leaves the previous file untouched.
 
 ### Coordinator self-update last
 
 1. The manager package is a managed component with one extra ordering rule: it is the final operation, with edges from every other operation.
 2. Before it runs, every prior operation has a terminal journal entry and the ledger and receipt for them are written and synced.
-3. **Build (S5).** The build runs from the staged tree whose digest matched the lock. Network is off after `cargo fetch --locked` (crates.io only, no git dependencies, no alternate registries). The build environment is scrubbed (`PATH`, `HOME` for the build directory, `CARGO_HOME` for the vendored cache, no secrets). The pinned toolchain must already be installed (section 2).
-4. The built binary's SHA-256 is recorded in the receipt and in the lock `[manager]` table.
-5. **Self-check (S5).** The new binary runs `self-check` with a scrubbed environment and `DFM_HOME` and `DFM_BINDING` pointing at a temporary copy of the binding and state. `self-check` is read-only and makes no network call. On success the active symlink flips in one atomic rename.
+3. **Build (S5, N4, N5).** The build runs from the staged tree whose digest matched the lock. The staged tree is rejected with `E_SOURCE_UNTRUSTED` if it contains a `.cargo/` directory at any level or a `rust-toolchain.toml` that differs from the lock's `[manager].toolchain` pin. `cargo fetch --locked` uses crates.io only (no git dependencies, no alternate registries), then `cargo build --release --locked --offline` runs. The environment is scrubbed in the same way as for probes (fixed `PATH`, a manager-owned `HOME` for the build, `CARGO_HOME` pointing at the Cargo registry cache, no secrets). **Containment limits:** `--offline` and Cargo's offline mode only stop Cargo's own fetches. They do not stop a build script or procedural macro from using the network, and they do not hide the real HOME or the rest of the filesystem. The manager does not claim network isolation or HOME isolation for the build. Bootstrap builds and `cargo fetch` use the same scrubbed environment.
+4. The built binary's SHA-256 is recorded in the receipt and in the lock `[manager]` table as a record only. It is never compared across machines (builds need not be reproducible).
+4a. **Toolchain provenance (N1).** The toolchain source is the official Rust release distribution (`static.rust-lang.org`). The lock pins the exact version and the SHA-256 of the toolchain artifact, taken from the official release manifest and reviewed in the lock diff. The plan includes the artifact digest. The install verifies the checksum before use. `rustup` auto-install is disabled in every manager-run process (set `RUSTUP_AUTO_INSTALL=0`; confirm the variable against the pinned rustup at implementation). The staged `rust-toolchain.toml` must equal the lock pin (item 3).
+4b. **Audit gates (N5).** `cargo deny` and `cargo audit` or `cargo vet` run at development time and in the CI gate for the commit that is locked. They do not run on the device. The lock pins a commit that passed the gate, and the tree digest binds the content.
+5. **Self-check (S5, N9).** The new binary runs `self-check --fixture-dir <temporary copy of binding and state>` with a scrubbed environment. `self-check` is read-only and makes no network call. On success the active symlink flips in one atomic rename.
 6. The running process keeps its old inode and exits after writing its result. A failed self-check leaves the previous version active and records `failed` for that operation only.
 7. The previous version directory follows the rollback window in section 4.
 
@@ -296,10 +310,11 @@ Writes that publish into a target directory use descriptor-relative operations: 
 
 The stages are DESIGN.md section 6 (resolve, inspect, plan, apply, verify). Additions:
 
-1. **Plan digest (S3).** SHA-256 over the canonical JSON of the typed plan. The plan includes: manager binary identity (version and SHA-256), binding digest, machine identity, resolved model digest, source identities, observation fingerprints, the ordered operation list with each operation's prerequisites, privilege class and exact privilege argv, and content hashes of generated outputs for `normal` class outputs. For `sensitive` outputs it includes destination and mode only.
+1. **Plan digest (S3, N8).** SHA-256 over the canonical JSON of the typed plan. The plan includes: the command and its scope, the manager binary identity (version and SHA-256), binding digest, machine identity, resolved model digest, source identities, the toolchain artifact digest when a build is planned, observation fingerprints, the ordered operation list with each operation's prerequisites, privilege class and exact privilege argv, the set of operations marked for `--allow-disruptive`, and content hashes of generated outputs for `normal` class outputs. For `sensitive` outputs it includes destination and mode only. **Path-source identity:** for a `kind = "path"` source, the identity is the canonical absolute real path plus the tree digest computed with the same rules as a Git tree (regular files and symlinks only, symlink targets inside the root), recomputed at plan time and again before apply.
 2. Each operation implements `already_done(observation) -> bool`. After an interruption the engine uses it to avoid repeating a completed side effect.
 3. On the first failure, dependents become `blocked` and operations that have not started become `not_started`. The default is to stop. A `--continue` option is not in the minimum contract.
 4. The receipt is written even on failure and on interruption by signal.
+5. **Display integrity (N3).** Every untrusted string rendered to a terminal (file names, commit messages, provider output, module text) has control characters and escape sequences replaced by visible escapes. The plan shows every field that changes an effect: target, mode, owner, argv, source, version, privilege class, disruptive flag. Git diffs and diff stats run with `--no-ext-diff --no-textconv` and with the isolated environment.
 
 ## 10. CLI, exit semantics, noninteractive behavior (C01, C08)
 
@@ -308,11 +323,11 @@ The stages are DESIGN.md section 6 (resolve, inspect, plan, apply, verify). Addi
 | Code | Name | Meaning |
 | --- | --- | --- |
 | 0 | `ok` | Completed, including no work needed. |
-| 1 | `failed` | Any operation `failed`, `blocked` or `unknown` after some mutation began; diagnosed errors or incomplete required checks (also `doctor`). |
+| 1 | `failed` | Any operation `failed`, `blocked` or `unknown` **after** some mutation began; the run limit expired (`E_RUN_LIMIT`); diagnosed errors or incomplete required checks (also `doctor`). |
 | 2 | `usage` | Invalid invocation, refused override, or inability to produce the requested report. |
-| 3 | `blocked` | A gate failed **before any mutation**: stale plan, missing credential, no TTY for a required prompt, privilege unavailable, untrusted or new origin in a noninteractive run, unsupported version, `UNKNOWN` required prerequisite, lock held. |
+| 3 | `blocked` | A gate failed **before any mutation**: stale plan, missing credential, no TTY for a required prompt, privilege unavailable, untrusted or new origin in a noninteractive run, unsupported version, a required prerequisite that is `UNKNOWN`, lock held. |
 | 4 | `declined` | Approval refused or prompt timeout. No mutation. |
-| 5 | `pending` | Everything that could finish did, and at least one participant is `pending`. Not success. |
+| 5 | `pending` | No operation `failed`, `blocked` or `unknown`, and at least one participant is `pending` (including a `pending` operation that left a dependent `blocked_pending`). Not success. |
 | 130 | `interrupted` | Stopped by SIGINT after the receipt was written. |
 | 143 | `terminated` | Stopped by SIGTERM after the receipt was written. |
 
@@ -320,7 +335,7 @@ The stages are DESIGN.md section 6 (resolve, inspect, plan, apply, verify). Addi
 
 `143 or 130 (signal, first received)  >  2  >  1  >  5  >  3  >  4  >  0`
 
-Codes 3 and 4 mean no mutation happened, so they cannot occur together with 1 or 5 in one run. A prerequisite that blocks **after** some mutation is status `blocked` and exit **1**, not 3. Unknown and failed operations both give 1. Pending with no failure gives 5.
+Codes 3 and 4 mean no mutation happened, so they cannot occur together with 1 or 5 in one run. **Unknown:** a required `UNKNOWN` prerequisite found before any mutation gives 3. One found after a mutation began makes that operation `unknown` and the run exit 1. **Blocked:** an operation that blocks after some mutation is status `blocked` and the run exits 1, not 3. **Pending:** with no failure, a `pending` operation gives 5, even if it left dependents as `blocked_pending`. The receipt counts `pending` and `blocked_pending` separately from `blocked`. Any `failed`, `blocked` or `unknown` outranks `pending`, so the run exits 1.
 
 **`doctor` and exit-3 inputs.** `doctor` never exits 3 or 4. For malformed manifests, unsupported schema or state version, missing modules or an untrusted source, it reports each as a finding with its `E_...` code, inspects whatever is still safe to inspect, and exits 1. It exits 2 only if it cannot produce any report. This keeps DESIGN.md's rule that independent rows stay visible.
 
@@ -328,20 +343,20 @@ Every non-zero result prints one stable code and the first failing location. `--
 
 ### Commands and flags
 
-DESIGN.md section 7 defines the commands. Global flags: `--json`, `--no-input`, `--preview`, `--yes-plan <digest>`, `--allow-disruptive <operation-id>`, `--timeout <duration>`, and the isolation overrides in section 7. No flag selects a profile on a mutating command.
+DESIGN.md section 7 defines the commands, including `try`, `adopt` and `purge` (all mutating, so they use the plan, preview, approval and receipt rules here). This contract adds `verify --mark` (section 4) and `self-check --fixture-dir <path>` (section 8). Global flags: `--json`, `--no-input`, `--preview`, `--yes-plan <digest>`, `--allow-disruptive <operation-id>`, `--timeout <duration>`. The isolation overrides in section 7 exist only in `test-isolation` builds. No flag selects a profile on a mutating command.
 
 ### Bounded noninteractive behavior
 
 1. Interactive means stdin and stderr are TTYs and `--no-input` is absent. Otherwise the run is noninteractive.
 2. Before any mutation the engine computes every gate the plan needs (approval, new-origin trust, credential, privilege, disruptive action). An unsatisfied gate in a noninteractive run ends the run with exit 3 and the list of gates. It never waits.
 3. Interactive prompts wait at most 300 s. Expiry exits 4.
-4. **Preview.** `sync --preview` and `update --preview` (and the same for `adopt` and `purge`) resolve, inspect and plan, print the plan and its `--yes-plan` digest, write nothing and exit 0. The digest is computed fresh on every run. The manager never stores it and never reads one from a cache. A reviewer must read the preview before passing the digest back. The engine cannot verify that a person read it. That limit is recorded.
+4. **Preview.** `sync --preview`, `update --preview`, `try --preview`, `adopt --preview` and `purge --preview` resolve, inspect and plan, print the plan and its `--yes-plan` digest, and exit 0. Precisely: `--preview` writes nothing outside a per-run staging directory under the manager state root, which holds fetched objects and temporary trees and is removed at exit. It writes no ledger, receipt, journal entry, snapshot, lock edit or live configuration. Preview of `sync` and `update` does use the network for the fetch into staging. `--preview` together with `--yes-plan` is refused with exit 2. The digest is computed fresh on every run. The manager never stores it and never reads one from a cache. A reviewer must read the preview before passing the digest back. The engine cannot verify that a person read it. That limit is recorded.
 5. `--yes-plan <digest>` recomputes the plan digest and compares. A mismatch exits 3 as stale. Approval kind in the receipt is `yes_plan`. It does not waive: per-operation prerequisite checks, secret credential availability (unavailable gives exit 3), privilege availability, disruptive actions (a separate `--allow-disruptive <operation-id>` bound to the same digest), or new-origin trust (interactive only).
-6. **Operation bounds.** `--timeout` also bounds each provider operation and external process; the default is 600 s per operation, and an adapter may lower it but not exceed an overall run limit of 4 h. Expiry marks the operation `failed` (or `pending` if the provider returned a completion token) and sends SIGTERM to the process group.
+6. **Operation bounds.** `--timeout` also bounds each provider operation and external process; the default is 600 s per operation. An adapter may lower the bound. It may raise it for a named operation only (for example a native completion wait) up to the run limit, and the raised bound appears in the plan and the digest. The run limit is 4 h. When the run limit expires, the manager stops starting operations, treats the current operation as timed out, marks unstarted operations `not_started`, and exits 1 with `E_RUN_LIMIT`. On any timeout the manager sends SIGTERM to the process group, waits a 10 s grace period, then sends SIGKILL to the group. The operation is `failed`, or `pending` if the provider already returned a completion token.
 7. **Two-signal escalation.** First SIGINT or SIGTERM: stop starting new operations, let the current operation finish for up to 30 s, then send SIGTERM to its process group, write the receipt and exit 130 or 143. Second signal: send SIGKILL to the process group immediately, leave the `intent` journal entry as the interruption record, write what receipt state can be written, and exit 130 or 143.
 8. Disruptive set (decision 8). Disruptive: restart or unload of a user launch agent or Homebrew service (for example the window manager, status bar and border helpers), any configuration change that reloads a window manager, and deletion of an owned file. Not disruptive: writing a configuration file that is not yet loaded. Each disruptive operation needs `--allow-disruptive` or interactive confirmation.
 9. No scheduler, daemon, background process or login item is part of this contract.
-10. **Lock (F4).** One manager lock: an advisory `flock` on `~/.local/state/dotfiles-manager.lock`, a file in the parent directory, holding the pid and start time. It is outside `state/`, so state upgrade renames do not move it. A second mutating invocation, or a read-only command that needs a stable view during upgrade, gets exit 3 `E_LOCKED`. Ordinary read-only commands take no lock and read a snapshot-consistent view.
+10. **Lock (F4, N3, N7).** One manager lock: an advisory `flock` on `~/.local/state/dotfiles-manager.lock`, a file in the parent directory, holding the pid and start time. It is outside `state/`, so state upgrade renames do not move it. Mutating commands and `verify --mark` take it exclusively. A second one gets exit 3 `E_LOCKED`. Read-only commands take no lock. They open the `state` directory by descriptor once at start and read relative to that descriptor, so they see the old or the new directory consistently during an upgrade rename. If no `state/` directory exists at that moment, they retry once after 1 s and then refuse: exit 3, or for `doctor` a finding and exit 1.
 
 ## 11. Typed adapter boundary and shared contracts (C01, C09, C10)
 
@@ -390,12 +405,12 @@ trait Adapter {
 ## 12. Distribution and bootstrap (C01, C06)
 
 1. Layout: `~/.local/share/dotfiles-manager/versions/<semver>-<short-commit>/dotfiles-manager`. The active version is the symlink `~/.local/share/dotfiles-manager/current`. The command on PATH is a symlink to `current/dotfiles-manager`. Locations come from the `Platform` port.
-2. Build: `cargo build --release --locked --offline` from the staged tree after `cargo fetch --locked`. Whether the linker's ad-hoc signature is accepted under each device's security policy is **unverified** (device policy unknown). It is a device-gate item.
+2. Build: `cargo build --release --locked --offline` from the staged tree after `cargo fetch --locked`, under the build containment rules and limits in section 8. Whether the linker's ad-hoc signature is accepted under each device's security policy is **unverified** (device policy unknown). It is a device-gate item.
 3. **Bootstrap provenance (S4).**
    1. The owner supplies, out of band, the bootstrap script's pinned commit and its SHA-256. The script is obtained by cloning that commit over `https` from the canonical origin and verifying the checksum before it runs. No `curl | sh`.
    2. The script requires Git and Command Line Tools. If Command Line Tools are missing it runs `xcode-select --install`, then **polls** `xcode-select -p` and a compiler probe until they succeed or a 30-minute limit expires (the install command returns early). On expiry it stops with a clear message.
    3. It requires the exact pinned Rust toolchain version, not a channel. It does not install a toolchain silently. If absent, it prints the exact pinned version and the toolchain source and stops.
-   4. It runs `cargo fetch --locked` with crates.io as the only registry, then builds offline, then runs `self-check`, then installs into the layout.
+   4. It checks the toolchain artifact digest from the lock (section 8, item 4a) and runs `cargo fetch --locked` with crates.io as the only registry, then builds offline, then runs `self-check --fixture-dir`, then installs into the layout. Fetch and build use the scrubbed environment from section 8. The containment limits in section 8 apply here too.
    5. `cargo deny` and `cargo audit` or `cargo vet` run in the gate for the commit being built. The first self-built binary is trusted because it was built locally from the verified commit. Its SHA-256 is recorded as the first lock `[manager]` entry.
 4. Old version directories follow the rollback window in section 4.
 
@@ -416,7 +431,7 @@ trait Adapter {
 
 The first error follows the validation order in DESIGN.md section 9. This contract adds `E_SCHEMA_UNSUPPORTED`, `E_STATE_NEWER`, `E_SOURCE_UNTRUSTED`, `E_ADAPTER_UNKNOWN`, `E_HOME_MISMATCH`, `E_OVERRIDE_REFUSED`, `E_LIMIT_EXCEEDED` and `E_LOCKED`. None has a fixture yet.
 
-Gap: the fixtures contain no case for schema refusal, state-version refusal, an oversized document, a new-origin gate or an interrupted operation. Each needs a case before the resolver or engine leaf is accepted.
+Gap: the fixtures contain no case for schema refusal, state-version refusal, an oversized document, a new-origin gate or an interrupted operation. Fixtures for these codes and scenarios are deferred to the implementation task that owns each (resolver, state upgrade, trust, limits, interruption). This contract does not add unexecuted fixtures.
 
 ### Expected walkthrough: `sync` on `personal-dev-01`
 
@@ -455,12 +470,13 @@ Not assumed. The following need evidence on the real personal M5 and work M3 in 
 6. **Names.** Keep `dotfiles-manager` and `~/.local/state/dotfiles-manager/`.
 7. **Prompt timeout.** 300 s accepted.
 8. **Disruptive set.** The set in section 10 is proposed and accepted as the working definition.
+9. **Firstmate scope.** `firstmate` applies to the personal M5 only. The work M3 profile does not include it. M3 is deferred and not a first-delivery requirement.
+10. **Final-round decisions.** `doctor` stays read-only (marker moved to `verify --mark`). Build-script risk is accepted and documented with no sandbox. Missing error-code fixtures are deferred to the owning implementation tasks. `blocked` stays exit 1, and a run with no failure but a pending operation exits 5.
 
 ### Open questions for the owner
 
 1. **Employer identity.** The public documents use "work M3" and a synthetic "work" module, and name no employer. Confirm that no document, fixture, lock origin or receipt field in this public repository may identify the employer or work-machine details, and that private module repositories carry them.
 2. **Device gate.** Which device runs the section 13 gate first, and who runs it? Until it runs, the Rust choice and the bootstrap sequence are unverified on both devices.
-3. **Toolchain pin source.** Where does the exact toolchain come from on a device (an existing version manager or a direct download)? Section 2 requires it to be present before a self-update build.
 
 ## 15. Not in this contract
 
