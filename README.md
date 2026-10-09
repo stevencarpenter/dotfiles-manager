@@ -26,6 +26,12 @@ Read-only resolution can be built first internally, but does not satisfy this fi
 
 ## Check the draft
 
+Install Git hooks once per clone with `lefthook install`. Git, Bash, Lefthook and uv must be available on PATH.
+
+The pre-commit hook runs the full local gate against a temporary copy of the staged files. It checks fixtures, pinned Ruff lint/format, shell syntax and the staged-gate regression test. It does not modify or restage files. Run `just check-all` to check the working tree manually.
+
+Passing local validation is the gate for GitHub publication and merge. Hosted CI is informational; account billing and unavailable runners do not block delivery. Keep evidence for the exact source revision. Merge and publication still require authorization.
+
 ```sh
 just check
 # Or, without just:

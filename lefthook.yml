@@ -1,0 +1,4 @@
+pre-commit:
+  jobs:
+    - name: local-validation
+      run: bash scripts/check_staged.sh
