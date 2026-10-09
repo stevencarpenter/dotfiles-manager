@@ -14,6 +14,8 @@ The owner answered the questions in section 14 on 2026-10-09. Those answers are 
 4. Formats: TOML for authored documents and the source lock. JSON for machine-written state, ledger, receipts and journal. Every document carries an integer `schema`.
 5. Distribution: build from source on each machine. No release artifact, signing or notarization in the first delivery. The binary installs into a manager-owned versioned directory selected by a symlink. The coordinator updates itself last.
 
+Scope: `firstmate` applies to the personal M5 only. The work M3 profile does not include it. Adding it to the M3 is deferred and is not a first-delivery requirement.
+
 ## 2. Prior-art check and rationale record
 
 Hippo query (`mcp__hippo__ask` and `search_hybrid`, 2026-10-09): no prior record selects an implementation language for this manager. Related history exists: the owner evaluated chezmoi, Nix, Stow, YADM and Dotbot for the current dotfiles (chezmoi needed repeated re-adds for live edits, Nix was heavy for frequent small edits, Stow had no generation), and a chezmoi to nix-darwin port was tried on a branch. Those results motivate a replacement manager. They say nothing about its language. The `ask` call was degraded (inference backend unreachable), so the conclusion rests on `search_hybrid` only.
