@@ -4,6 +4,8 @@ A proposed manager for one profile per machine, an authoritative shared core, an
 
 **Status:** design and example fixtures only. There is no manager executable, configuration resolver, provider implementation, or deployment engine. `dotfiles-manager` is a working name. No implementation language or license has been selected.
 
+- [Reviewed delivery roadmap](docs/roadmap.json) and [review record](docs/roadmap-review.md): M5/M3 task contracts and evidence gates. Kaneo DFM is the authoritative backlog.
+- [Checklist completion contract](docs/checklist-state.md): live Kaneo acceptance checkboxes are the sole completion state. Tasks and epics derive completion from their canonical requirements.
 - [Design contract](DESIGN.md): agreed requirements, proposed manifest semantics, lifecycle, and migration boundaries.
 - [Initial inventory classification](INVENTORY.md): actual source areas proposed as invariants, defaults, modules, or unmanaged state.
 - [Example profiles](examples/profiles/): personal development, synthetic work, homelab, and server compositions.
@@ -23,6 +25,12 @@ These workflows are user requirements, not features deferred until after a read-
 Read-only resolution can be built first internally, but does not satisfy this first-implementation scope. [Workflow acceptance requirements](DESIGN.md#first-implementation-workflow-acceptance) cover the required end-to-end behavior; the existing 16 resolver definitions are not substitutes.
 
 ## Check the draft
+
+Install Git hooks once per clone with `lefthook install`. Git, Bash, Lefthook and uv must be available on PATH.
+
+The pre-commit hook runs the full local gate against a temporary copy of the staged files. It checks fixtures, pinned Ruff lint/format, shell syntax and the staged-gate regression test. It does not modify or restage files. Run `just check-all` to check the working tree manually.
+
+Passing local validation is the gate for GitHub publication and merge. Hosted CI is informational; account billing and unavailable runners do not block delivery. Keep evidence for the exact source revision. Merge and publication still require authorization.
 
 ```sh
 just check
