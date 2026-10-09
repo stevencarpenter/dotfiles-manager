@@ -44,7 +44,7 @@ AeroSpace, mise infrastructure fragments, MCP machine overlays, and skill machin
 | Personal and homelab | Personal shell functions, Hippo, journal configuration, personal registry, optional sports tooling, Tailscale integration, declared 1Password templates | Device-specific journal data remains device-specific. Homelab reachability and account values do not become universal defaults. |
 | Platform/system | Package owners, macOS preferences, login shell, launchd/systemd resources, fonts/certificates and privileged paths | Separate privileged adapters and explicit ownership handoffs. Existing Nix-generated state is not deleted by removing user links. |
 
-A server composition can select only the core and its platform/server requirements. The Linux examples demonstrate that desired composition; they are illustrative, not a supported-target or migration promise, and do not establish that the current macOS source files or service implementations support Linux.
+A server composition can select only the core and its platform/server requirements. The Linux examples show the schema can express that composition; they are illustrative, not a supported-target or migration promise, and do not establish that the current macOS source files or service implementations support Linux.
 
 The synthetic external work module demonstrates replacement, subtraction, hook contributions, and scoped Git identity. It is not a template copied from the real private repository, and it contains no claims about that machine's applications or security posture.
 

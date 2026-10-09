@@ -8,7 +8,7 @@ A proposed manager for one profile per machine, an authoritative shared core, an
 - [Checklist completion contract](docs/checklist-state.md): live Kaneo acceptance checkboxes are the sole completion state. Tasks and epics derive completion from their canonical requirements.
 - [Design contract](DESIGN.md): agreed requirements, proposed manifest semantics, lifecycle, and migration boundaries.
 - [Initial inventory classification](INVENTORY.md): actual source areas proposed as invariants, defaults, modules, or unmanaged state.
-- [Example profiles](examples/profiles/): personal development, synthetic work, homelab, and server compositions.
+- [Example profiles](examples/profiles/): personal development, synthetic work, homelab (illustrative), and server (illustrative) compositions.
 - [Public example bundle](examples/base/bundle.toml): the mandatory core and reusable modules.
 - [Synthetic external bundle](examples/external/bundle.toml): adds a module without making the public bundle reference it.
 - [Resolver acceptance fixtures](examples/cases.toml): expected results and errors for the future resolver. These expectations are not executed yet.

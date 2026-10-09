@@ -13,7 +13,7 @@ Status: proposed replacement specification, not an implemented manager. The owne
 5. A full replacement manager is in scope. Incremental implementation and migration do not restrict the eventual product to a task-runner wrapper.
 6. First delivery requires only two machines: the personal M5 and the work M3, both native Apple Silicon macOS. The earlier three-machine requirement is superseded. All four mandatory workflows and full replacement still apply to these two machines.
 7. The Intel i9 remains independently owned by the homelab repository and GNU Stow. It is not a first-delivery target, and this design makes no migration promise for it.
-8. Linux and desktop Macs (Mac Studio, Mac Mini) are not targets. Design only to avoid OS-bound core semantics, mandatory GUI assumptions, and hard-coded model or prefix paths. This adds no platform implementation, portability framework, or delivery gate.
+8. Linux and desktop Macs (Mac Studio, Mac Mini) are not targets. The design only avoids OS-bound core semantics, mandatory GUI assumptions, and hard-coded model or prefix paths. This adds no platform implementation, portability framework, or delivery gate.
 
 ### Mandatory first-implementation workflows
 
@@ -280,6 +280,8 @@ Raw edits through a supported link remain ordinary Git changes. A replaced link 
 | `work-01` | Synthetic external module | Core, agents, desktop, work; permitted Git editor and complete-file overrides, optional skill disabling, handler and native-fragment contributions. |
 | `homelab-01` | Homelab | Core, server, homelab; server dependency does not install the personal development stack. |
 | `server-01` | Server | Core and server; explicit alternate editor default, no agent or desktop modules. |
+
+The homelab and server profiles are illustrative schema fixtures, not supported targets or migration promises.
 
 Fixture values illustrate mechanisms, not final decisions about which real settings belong in core. The source files are intentionally small. The examples do not reproduce the complete current dotfiles inventory, provider dependencies, or private wrapper.
 
