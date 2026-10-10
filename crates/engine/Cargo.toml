@@ -11,6 +11,7 @@ failpoints = []
 
 [dependencies]
 dfm-model = { workspace = true }
+rustix = { workspace = true }
 
 [lints]
 workspace = true

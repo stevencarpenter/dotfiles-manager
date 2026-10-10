@@ -146,6 +146,7 @@ fn only_the_contract_crates_are_direct_dependencies() {
         "dfm-platform-macos",
         "serde",
         "serde_json",
+        "rustix",
         "toml",
         "sha2",
     ];
@@ -153,19 +154,28 @@ fn only_the_contract_crates_are_direct_dependencies() {
     let pins: Vec<&str> = manifest
         .lines()
         .filter(|l| {
-            ["serde =", "serde_json =", "toml =", "sha2 ="]
+            ["serde =", "serde_json =", "rustix =", "toml =", "sha2 ="]
                 .iter()
                 .any(|k| l.starts_with(k))
         })
         .collect();
     assert_eq!(
         pins.len(),
-        4,
-        "expected exactly serde, serde_json, toml and sha2: {pins:?}"
+        5,
+        "expected exactly serde, serde_json, rustix, toml and sha2: {pins:?}"
     );
     assert!(
         pins.iter().all(|l| l.contains("\"=")),
         "direct crates need exact =x.y.z pins"
+    );
+    // rustix is the one crate allowed to touch the OS, and only through its safe fs API.
+    let rustix = pins.iter().find(|l| l.starts_with("rustix =")).unwrap();
+    assert!(
+        rustix.contains("default-features = false")
+            && rustix.contains("\"std\", \"fs\"")
+            && !rustix.contains("process")
+            && !rustix.contains("net"),
+        "rustix needs only std and fs: {rustix}"
     );
 }
 
