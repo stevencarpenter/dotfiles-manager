@@ -2,7 +2,7 @@
 
 A proposed manager for one profile per machine, an authoritative shared core, and explicitly selected modules.
 
-**Status:** design and example fixtures, plus a Rust CLI that can be built, installed in isolation and bound to one profile ([bootstrap and binding](docs/bootstrap.md)) and a durable [state store](docs/state.md) (ownership ledger, receipts, journal, trial records). A pure configuration resolver ([resolver notes](docs/resolver.md)) and a read-only `explain` command exist. There is no provider implementation or deployment engine. `dotfiles-manager` is a working name. No license has been selected.
+**Status:** design and example fixtures, plus a Rust CLI that can be built, installed in isolation and bound to one profile ([bootstrap and binding](docs/bootstrap.md)) and a durable [state store](docs/state.md) (ownership ledger, receipts, journal, trial records). A pure configuration resolver ([resolver notes](docs/resolver.md)) and a read-only `explain` command exist. A read-only `plan` command ([planner notes](docs/planner.md)) validates claims, topology and ownership and detects stale plans. There is no provider implementation or deployment engine. `dotfiles-manager` is a working name. No license has been selected.
 
 - [Reviewed delivery roadmap](docs/roadmap.json) and [review record](docs/roadmap-review.md): M5/M3 task contracts and evidence gates. Kaneo DFM is the authoritative backlog.
 - [Checklist completion contract](docs/checklist-state.md): live Kaneo acceptance checkboxes are the sole completion state. Tasks and epics derive completion from their canonical requirements.

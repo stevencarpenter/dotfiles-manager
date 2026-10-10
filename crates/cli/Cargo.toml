@@ -44,5 +44,9 @@ required-features = ["test-isolation"]
 name = "explain"
 required-features = ["test-isolation"]
 
+[[test]]
+name = "planner"
+required-features = ["test-isolation"]
+
 [lints]
 workspace = true

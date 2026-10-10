@@ -1,0 +1,1076 @@
+//! `plan` in an isolated HOME against copies of the fixtures: claims, collisions, topology,
+//! ownership, edges, determinism, stale-plan detection and non-mutation (DFM-16).
+
+mod common;
+
+use common::{TempDir, copy_tree, repo_root};
+use dfm_model::plan::{Action, Ownership, Saved, Status};
+use sha2::{Digest, Sha256};
+use std::fs;
+use std::os::unix::fs::{PermissionsExt, symlink};
+use std::path::{Path, PathBuf};
+use std::process::{Command, Output};
+
+const BIN: &str = env!("CARGO_BIN_EXE_dotfiles-manager");
+
+struct Env {
+    home: TempDir,
+    _src: TempDir,
+    root: PathBuf,
+}
+
+impl Env {
+    fn new(profile: &str) -> Env {
+        let home = TempDir::new("plan-home");
+        let src = TempDir::new("plan-src");
+        let root = src.path().join("examples");
+        copy_tree(&repo_root().join("examples"), &root);
+        let e = Env {
+            home,
+            _src: src,
+            root,
+        };
+        let p = e.root.join("profiles").join(profile);
+        let o = e.run(&[
+            "bind",
+            "--profile",
+            p.to_str().unwrap(),
+            "--machine-id",
+            "m5-personal",
+        ]);
+        assert_eq!(o.status.code(), Some(0), "{}", text(&o.stderr));
+        e
+    }
+
+    fn personal() -> Env {
+        Env::new("personal-dev-01.toml")
+    }
+
+    fn run(&self, args: &[&str]) -> Output {
+        Command::new(BIN)
+            .env_clear()
+            .arg("--home")
+            .arg(self.home.path())
+            .args(args)
+            .output()
+            .unwrap()
+    }
+
+    fn plan(&self, extra: &[&str]) -> Output {
+        let mut a = vec!["plan", "--root", self.root.to_str().unwrap()];
+        a.extend_from_slice(extra);
+        self.run(&a)
+    }
+
+    fn saved(&self) -> (Output, Saved) {
+        let o = self.plan(&["--json"]);
+        let s = Saved::parse(&o.stdout).unwrap_or_else(|e| panic!("{e}\n{}", text(&o.stdout)));
+        (o, s)
+    }
+
+    fn h(&self, rel: &str) -> PathBuf {
+        self.home.path().join(rel)
+    }
+
+    fn src(&self, rel: &str) -> PathBuf {
+        self.root.join(rel)
+    }
+
+    fn mkdirs(&self, rel: &str) {
+        fs::create_dir_all(self.h(rel)).unwrap();
+    }
+}
+
+fn text(b: &[u8]) -> String {
+    String::from_utf8_lossy(b).into_owned()
+}
+
+fn code(o: &Output) -> i32 {
+    o.status.code().unwrap()
+}
+
+fn op<'a>(s: &'a Saved, id: &str) -> &'a dfm_model::plan::Operation {
+    s.plan
+        .operations
+        .iter()
+        .find(|o| o.id == id)
+        .unwrap_or_else(|| panic!("no operation {id}"))
+}
+
+/// Names, kinds, modes, modification times and bytes of everything below `root`, links unread.
+fn fingerprint(root: &Path) -> String {
+    fn go(dir: &Path, h: &mut Sha256) {
+        let mut v: Vec<_> = fs::read_dir(dir).unwrap().map(|e| e.unwrap()).collect();
+        v.sort_by_key(|e| e.file_name());
+        for e in v {
+            let m = fs::symlink_metadata(e.path()).unwrap();
+            h.update(e.path().to_str().unwrap().as_bytes());
+            h.update(
+                format!("{:?} {:o}", m.modified().unwrap(), m.permissions().mode()).as_bytes(),
+            );
+            if m.is_dir() {
+                go(&e.path(), h);
+            } else if m.is_file() {
+                h.update(fs::read(e.path()).unwrap());
+            } else if m.file_type().is_symlink() {
+                h.update(
+                    fs::read_link(e.path())
+                        .unwrap()
+                        .to_str()
+                        .unwrap()
+                        .as_bytes(),
+                );
+            }
+        }
+    }
+    let mut h = Sha256::new();
+    go(root, &mut h);
+    format!("{:x}", h.finalize())
+}
+
+fn case_insensitive(dir: &Path) -> bool {
+    let probe = dir.join("CaseProbe");
+    fs::write(&probe, b"x").unwrap();
+    let folded = dir.join("caseprobe").exists();
+    fs::remove_file(&probe).unwrap();
+    folded
+}
+
+// ---- C01: claims ------------------------------------------------------------------------
+
+#[test]
+fn claims_are_enumerated_for_files_directories_and_distribution_leaves() {
+    let e = Env::personal();
+    e.mkdirs(".codex/AGENTS.d");
+    fs::write(e.h(".codex/AGENTS.d/10-local.md"), "local\n").unwrap();
+    fs::write(e.h(".codex/AGENTS.d/notes.txt"), "not a fragment\n").unwrap();
+    let (o, s) = e.saved();
+    assert_eq!(code(&o), 0, "{}", text(&o.stderr));
+    // An exact path claim.
+    let git = op(&s, "core.git@.config/git/config");
+    assert_eq!(git.action, Action::CreateLink);
+    assert!(git.effect.contains("-> ") && git.effect.contains("core/files/gitconfig"));
+    // Distribution leaves: one per enabled entry under each root.
+    for root in [".claude/skills", ".pi/agent/skills"] {
+        let leaf = op(&s, &format!("agents.skills@{root}/sample-audit"));
+        assert_eq!(leaf.action, Action::CreateLink);
+        assert!(leaf.effect.contains("sample-audit"));
+    }
+    // A directory claim: only matching entries are fragments, and the foreign one is recorded.
+    let asm = op(&s, "agents.codex-instructions@.codex/AGENTS.md");
+    let names: Vec<_> = asm
+        .fragments
+        .iter()
+        .map(|f| (&f.name[..], &f.origin[..]))
+        .collect();
+    assert_eq!(names, [("10-local.md", "foreign")]);
+    assert!(s.plan.observations.listings.contains_key(".codex/AGENTS.d"));
+    // Out of scope work is listed, never planned.
+    let secret = op(&s, "personal-dev.example-secret@scope");
+    assert_eq!(secret.status, Status::NotInScope);
+    assert!(secret.mode.is_some() && secret.path.is_some());
+    assert_eq!(
+        op(&s, "personal-dev.atuin@scope").status,
+        Status::NotInScope
+    );
+}
+
+#[test]
+fn a_case_alias_of_an_existing_entry_is_a_collision() {
+    let e = Env::personal();
+    if !case_insensitive(e.home.path()) {
+        eprintln!("SKIPPED: this volume is case sensitive, so no case alias can exist");
+        return;
+    }
+    e.mkdirs(".config/GIT");
+    let o = e.plan(&[]);
+    assert_eq!(code(&o), 3, "{}", text(&o.stderr));
+    let err = text(&o.stderr);
+    assert!(
+        err.contains("E_TARGET_COLLISION") && err.contains("`GIT`"),
+        "{err}"
+    );
+}
+
+// ---- C01/C07: parent links, directory and file transitions -------------------------------
+
+fn expect_blocked(o: &Output, code_name: &str, words: &[&str]) {
+    assert_eq!(code(o), 3, "{}{}", text(&o.stdout), text(&o.stderr));
+    let err = text(&o.stderr);
+    assert!(err.contains(code_name), "{err}");
+    for w in words {
+        assert!(err.contains(w), "missing {w:?} in {err}");
+    }
+    assert!(err.contains("Fix:"), "{err}");
+}
+
+#[test]
+fn dangling_recursive_and_redirecting_parent_links_are_rejected() {
+    // Dangling.
+    let e = Env::personal();
+    e.mkdirs(".config");
+    symlink("/nonexistent/target", e.h(".config/git")).unwrap();
+    expect_blocked(
+        &e.plan(&[]),
+        "E_PARENT_UNSAFE",
+        &["dangling", ".config/git"],
+    );
+
+    // Recursive.
+    let e = Env::personal();
+    e.mkdirs(".config");
+    symlink("git2", e.h(".config/git")).unwrap();
+    symlink("git", e.h(".config/git2")).unwrap();
+    expect_blocked(&e.plan(&[]), "E_PARENT_UNSAFE", &["recursive"]);
+
+    // A stale link that still resolves: it redirects the write out of the claim.
+    let e = Env::personal();
+    e.mkdirs(".config");
+    e.mkdirs("elsewhere");
+    symlink(e.h("elsewhere"), e.h(".config/git")).unwrap();
+    let before = fingerprint(&e.h("elsewhere"));
+    expect_blocked(&e.plan(&[]), "E_PARENT_UNSAFE", &["link to a directory"]);
+    assert_eq!(fingerprint(&e.h("elsewhere")), before);
+
+    // A link to a file where a directory is needed.
+    let e = Env::personal();
+    fs::write(e.h("a-file"), "x").unwrap();
+    symlink("a-file", e.h(".ssh")).unwrap();
+    expect_blocked(
+        &e.plan(&[]),
+        "E_PARENT_UNSAFE",
+        &["where a directory is needed"],
+    );
+}
+
+#[test]
+fn directory_and_file_transitions_are_conflicts_and_nothing_is_replaced() {
+    // A directory where the link goes.
+    let e = Env::personal();
+    e.mkdirs(".ssh/config");
+    expect_blocked(
+        &e.plan(&[]),
+        "E_CONFLICT",
+        &["is a directory where a link is needed"],
+    );
+    assert!(e.h(".ssh/config").is_dir());
+
+    // A file where a parent directory goes.
+    let e = Env::personal();
+    fs::write(e.h(".ssh"), "x").unwrap();
+    expect_blocked(
+        &e.plan(&[]),
+        "E_CONFLICT",
+        &["is a file where a directory is needed"],
+    );
+    assert!(e.h(".ssh").is_file());
+
+    // A file where a fragment directory goes.
+    let e = Env::personal();
+    e.mkdirs(".codex");
+    fs::write(e.h(".codex/AGENTS.d"), "x").unwrap();
+    expect_blocked(&e.plan(&[]), "E_CONFLICT", &["is not a directory"]);
+
+    // A foreign link at the leaf, and a foreign file at the leaf.
+    let e = Env::personal();
+    e.mkdirs(".ssh");
+    symlink("/somewhere/else", e.h(".ssh/config")).unwrap();
+    expect_blocked(&e.plan(&[]), "E_CONFLICT", &["no ledger entry"]);
+    assert_eq!(
+        fs::read_link(e.h(".ssh/config")).unwrap(),
+        Path::new("/somewhere/else")
+    );
+}
+
+#[test]
+fn a_directory_that_does_not_exist_yet_is_planned_in_dependency_order() {
+    let e = Env::personal();
+    let (_, s) = e.saved();
+    let ssh = op(&s, "core.ssh@.ssh/config");
+    assert_eq!(ssh.after, ["mkdir@.ssh"]);
+    let deep = op(&s, "agents.skills@.pi/agent/skills/sample-audit");
+    assert_eq!(deep.after, ["mkdir@.pi/agent/skills"]);
+    assert_eq!(op(&s, "mkdir@.pi/agent/skills").after, ["mkdir@.pi/agent"]);
+    let pos = |id: &str| s.plan.operations.iter().position(|o| o.id == id).unwrap();
+    assert!(
+        pos("mkdir@.pi") < pos("mkdir@.pi/agent")
+            && pos("mkdir@.pi/agent") < pos("mkdir@.pi/agent/skills")
+    );
+}
+
+// ---- C06: ownership fails closed --------------------------------------------------------
+
+fn record(e: &Env, resource: &str, output: &Path, content: &str) {
+    let o = e.run(&[
+        "__record-op",
+        "--resource",
+        resource,
+        "--output",
+        output.to_str().unwrap(),
+        "--content",
+        content,
+    ]);
+    assert_eq!(code(&o), 0, "{}", text(&o.stderr));
+}
+
+#[test]
+fn ownership_comes_from_the_ledger_only() {
+    let base = ".config/external-overlays/git/base.inc";
+    // Unowned content is never overwritten (C09: a representative source and ownership conflict).
+    let e = Env::personal();
+    e.mkdirs(".config/external-overlays/git");
+    fs::write(e.h(base), "user content\n").unwrap();
+    let o = e.plan(&[]);
+    expect_blocked(
+        &o,
+        "E_CONFLICT",
+        &["core.git-defaults", base, "core/module.toml", "ledger"],
+    );
+    assert_eq!(fs::read_to_string(e.h(base)).unwrap(), "user content\n");
+
+    // An output the ledger records, still unchanged, may be updated.
+    let e = Env::personal();
+    e.mkdirs(".config/external-overlays/git");
+    record(&e, "core.git-defaults", &e.h(base), "managed\n");
+    let (o, s) = e.saved();
+    assert_eq!(code(&o), 0, "{}", text(&o.stderr));
+    let git = op(&s, &format!("core.git-defaults@{base}"));
+    assert_eq!(
+        (git.action, git.ownership),
+        (Action::UpdateFile, Ownership::Owned)
+    );
+
+    // After a user edit the fingerprint no longer matches: a conflict, not a replacement.
+    fs::write(e.h(base), "edited by the user\n").unwrap();
+    expect_blocked(
+        &e.plan(&[]),
+        "E_CONFLICT",
+        &["changed after the manager wrote it"],
+    );
+
+    // An output another resource owns is foreign.
+    let e = Env::personal();
+    e.mkdirs(".config/external-overlays/git");
+    record(&e, "core.git", &e.h(base), "managed\n");
+    expect_blocked(
+        &e.plan(&[]),
+        "E_CONFLICT",
+        &["no ledger entry says this resource owns it"],
+    );
+}
+
+#[test]
+fn a_sensitive_destination_that_exists_fails_closed_and_leaks_nothing() {
+    let secret = "sk-PLANTED-0123456789";
+    let content = format!("{{\"token\":\"{secret}\"}}");
+    let digest = format!("{:x}", Sha256::digest(content.as_bytes()));
+    // Two ways to fail closed: no ledger entry, and a ledger entry that has no comparable
+    // fingerprint (docs/state.md: the salted hash is not built).
+    for (recorded, words) in [
+        (false, "no ledger entry"),
+        (true, "ownership cannot be verified"),
+    ] {
+        let e = Env::personal();
+        e.mkdirs(".claude");
+        let out = e.h(".claude/settings.json");
+        if recorded {
+            let o = e.run(&[
+                "__record-op",
+                "--resource",
+                "agents.claude-settings",
+                "--output",
+                out.to_str().unwrap(),
+                "--content",
+                &content,
+                "--sensitive",
+                "yes",
+            ]);
+            assert_eq!(code(&o), 0, "{}", text(&o.stderr));
+        } else {
+            fs::write(&out, &content).unwrap();
+        }
+        for o in [e.plan(&[]), e.plan(&["--json"])] {
+            assert_eq!(code(&o), 3);
+            let all = format!("{}{}", text(&o.stdout), text(&o.stderr));
+            assert!(all.contains("E_CONFLICT") && all.contains(words), "{all}");
+            assert!(
+                !all.contains(secret) && !all.contains(&digest),
+                "secret leaked: {all}"
+            );
+        }
+        assert_eq!(fs::read_to_string(&out).unwrap(), content);
+    }
+}
+
+#[test]
+fn state_is_required_because_ownership_would_be_unknown() {
+    let e = Env::personal();
+    fs::remove_dir_all(e.h(".local/state/dotfiles-manager/state")).unwrap();
+    let o = e.plan(&[]);
+    assert_eq!(code(&o), 3);
+    assert!(
+        text(&o.stderr).contains("E_STATE_INVALID"),
+        "{}",
+        text(&o.stderr)
+    );
+    // An unbound machine is refused before anything is read.
+    let fresh = TempDir::new("plan-unbound");
+    let o = Command::new(BIN)
+        .env_clear()
+        .arg("--home")
+        .arg(fresh.path())
+        .args(["plan", "--root", e.root.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert_eq!(code(&o), 3);
+    assert!(text(&o.stderr).contains("E_BINDING_INVALID"));
+}
+
+#[test]
+fn a_directory_the_user_cannot_write_is_a_privilege_failure() {
+    let e = Env::personal();
+    e.mkdirs(".ssh");
+    fs::set_permissions(e.h(".ssh"), fs::Permissions::from_mode(0o500)).unwrap();
+    let o = e.plan(&[]);
+    fs::set_permissions(e.h(".ssh"), fs::Permissions::from_mode(0o700)).unwrap();
+    expect_blocked(
+        &o,
+        "E_PRIVILEGE_UNSUPPORTED",
+        &["not writable", "never escalates"],
+    );
+}
+
+// ---- C02/C03: edges, cycles, no module barrier ------------------------------------------
+
+#[test]
+fn a_fragment_producer_precedes_its_consumer_and_modules_are_not_barriers() {
+    let e = Env::new("work-01.toml");
+    let (o, s) = e.saved();
+    assert_eq!(code(&o), 0, "{}", text(&o.stderr));
+    let consumer = op(&s, "agents.codex-instructions@.codex/AGENTS.md");
+    assert!(
+        consumer
+            .after
+            .contains(&"work.instructions@.codex/AGENTS.d/40-work.md".to_string()),
+        "{:?}",
+        consumer.after
+    );
+    assert!(
+        consumer
+            .fragments
+            .iter()
+            .any(|f| f.name == "40-work.md" && f.origin == "selected:work.instructions")
+    );
+    let pos = |id: &str| s.plan.operations.iter().position(|o| o.id == id).unwrap();
+    assert!(pos("work.instructions@.codex/AGENTS.d/40-work.md") < pos(&consumer.id));
+    // One edge crosses from module work to module agents. No other operation waits for a module.
+    for o in &s.plan.operations {
+        for a in &o.after {
+            let dep = op(&s, a);
+            let same = dep.module == o.module;
+            let allowed =
+                a.starts_with("mkdir@") || a == "work.instructions@.codex/AGENTS.d/40-work.md";
+            assert!(same || allowed, "{} waits for {a}", o.id);
+        }
+    }
+    let ssh = op(&s, "core.ssh@.ssh/config");
+    assert_eq!(ssh.after, ["mkdir@.ssh"]);
+}
+
+const LOOP: &str = r#"
+[[resources]]
+id = "loop-a"
+kind = "assemble"
+adapter = "text-fragments/v1"
+target = "loopb/a.md"
+[resources.value]
+body = "files/AGENTS.md"
+fragments_dir = "loopa"
+pattern = "*.md"
+separator = "\n"
+
+[[resources]]
+id = "loop-b"
+kind = "assemble"
+adapter = "text-fragments/v1"
+target = "loopa/b.md"
+[resources.value]
+body = "files/AGENTS.md"
+fragments_dir = "loopb"
+pattern = "*.md"
+separator = "\n"
+"#;
+
+#[test]
+fn two_assemblers_that_feed_each_other_are_a_cycle() {
+    let e = Env::personal();
+    let m = e.src("base/modules/agents/module.toml");
+    let mut t = fs::read_to_string(&m).unwrap();
+    t.push_str(LOOP);
+    fs::write(&m, t).unwrap();
+    // The resolver accepts the pair (docs/resolver.md, "Fragment injection"); the planner must not.
+    let o = e.plan(&[]);
+    expect_blocked(
+        &o,
+        "E_PLAN_CYCLE",
+        &["agents.loop-a", "agents.loop-b", "->"],
+    );
+    let out = text(&o.stdout);
+    assert!(
+        out.contains("blocked agents.loop-a@") && out.contains("blocked agents.loop-b@"),
+        "{out}"
+    );
+}
+
+// ---- C05: determinism --------------------------------------------------------------------
+
+#[test]
+fn identical_inputs_and_observations_give_the_same_plan() {
+    let e = Env::personal();
+    e.mkdirs(".codex/AGENTS.d");
+    for n in ["30-c.md", "10-a.md", "20-b.md"] {
+        fs::write(e.h(&format!(".codex/AGENTS.d/{n}")), n).unwrap();
+    }
+    let a = e.plan(&["--json"]);
+    let b = e.plan(&["--json"]);
+    assert_eq!(a.stdout, b.stdout);
+    let (sa, sb) = (
+        Saved::parse(&a.stdout).unwrap(),
+        Saved::parse(&b.stdout).unwrap(),
+    );
+    assert_eq!(sa.plan_digest, sb.plan_digest);
+    let t1 = e.plan(&[]);
+    let t2 = e.plan(&[]);
+    assert_eq!(t1.stdout, t2.stdout);
+    assert!(text(&t1.stdout).contains(&format!("plan digest: {}", sa.plan_digest)));
+}
+
+#[test]
+fn the_plan_records_identities_ownership_privilege_and_conditions() {
+    let e = Env::personal();
+    let (_, s) = e.saved();
+    let p = &s.plan;
+    assert_eq!(p.binary.sha256.len(), 64);
+    assert_eq!(p.sources[0].kind, "path");
+    assert!(p.sources[0].tree.starts_with("sha256:"));
+    assert_eq!(p.model_digest.len(), 64);
+    assert!(!p.observations.seen.is_empty());
+    let git = op(&s, "core.git@.config/git/config");
+    assert_eq!(git.privilege, "user");
+    assert_eq!(git.ownership, Ownership::Absent);
+    assert!(
+        git.preconditions
+            .iter()
+            .any(|c| c.subject == "path:.config/git/config" && c.state == "missing")
+    );
+    assert!(
+        git.preconditions
+            .iter()
+            .any(|c| c.subject.starts_with("source:"))
+    );
+    assert!(!git.postcondition.is_empty() && !git.effect.is_empty());
+    // A sensitive output shows destination and mode only, and no content hash.
+    let settings = op(&s, "agents.claude-settings@.claude/settings.json");
+    assert!(
+        settings
+            .effect
+            .contains("sensitive: destination and mode only")
+    );
+}
+
+// ---- C06/C07: stale plans ----------------------------------------------------------------
+
+fn save(e: &Env) -> (PathBuf, Saved) {
+    let (_, s) = e.saved();
+    let f = e.h("saved-plan.json");
+    fs::write(&f, serde_json::to_vec(&s).unwrap()).unwrap();
+    (f, s)
+}
+
+fn against(e: &Env, f: &Path) -> Output {
+    e.plan(&["--against", f.to_str().unwrap()])
+}
+
+fn expect_stale(o: &Output, what: &str, subject: &str) {
+    assert_eq!(code(o), 3, "{}{}", text(&o.stdout), text(&o.stderr));
+    let err = text(&o.stderr);
+    assert!(err.contains("E_PLAN_STALE") && err.contains(what), "{err}");
+    let all = text(&o.stdout);
+    assert!(all.contains(subject), "{all}");
+}
+
+#[test]
+fn an_unchanged_world_matches_the_saved_plan() {
+    let e = Env::personal();
+    let (f, s) = save(&e);
+    let o = against(&e, &f);
+    assert_eq!(code(&o), 0, "{}{}", text(&o.stdout), text(&o.stderr));
+    assert!(text(&o.stdout).contains("plan current"));
+    assert!(text(&o.stdout).contains(&s.plan_digest));
+}
+
+#[test]
+fn a_source_edit_after_planning_invalidates_the_plan() {
+    let e = Env::personal();
+    let (f, _) = save(&e);
+    fs::write(
+        e.src("base/modules/core/files/gitconfig"),
+        "[user]\n name = changed\n",
+    )
+    .unwrap();
+    let o = against(&e, &f);
+    expect_stale(&o, "source input changed", "core.git@.config/git/config");
+    assert!(text(&o.stdout).contains("stale source: "));
+}
+
+#[test]
+fn a_new_foreign_fragment_or_a_removed_one_changes_the_input_set() {
+    let e = Env::personal();
+    e.mkdirs(".codex/AGENTS.d");
+    fs::write(e.h(".codex/AGENTS.d/10-a.md"), "a").unwrap();
+    let (f, _) = save(&e);
+    fs::write(e.h(".codex/AGENTS.d/20-b.md"), "b").unwrap();
+    expect_stale(
+        &against(&e, &f),
+        "observation changed",
+        "fragments:.codex/AGENTS.d",
+    );
+    fs::remove_file(e.h(".codex/AGENTS.d/20-b.md")).unwrap();
+    assert_eq!(code(&against(&e, &f)), 0);
+    fs::remove_file(e.h(".codex/AGENTS.d/10-a.md")).unwrap();
+    expect_stale(
+        &against(&e, &f),
+        "observation changed",
+        "fragments:.codex/AGENTS.d",
+    );
+    // A changed fragment is a changed input too.
+    fs::write(e.h(".codex/AGENTS.d/10-a.md"), "changed").unwrap();
+    expect_stale(
+        &against(&e, &f),
+        "observation changed",
+        "fragments:.codex/AGENTS.d",
+    );
+}
+
+#[test]
+fn a_target_that_appears_or_changes_type_invalidates_the_plan() {
+    let e = Env::personal();
+    let (f, _) = save(&e);
+    e.mkdirs(".ssh");
+    expect_stale(&against(&e, &f), "observation changed", ".ssh");
+    let o = against(&e, &f);
+    assert!(text(&o.stdout).contains("path:.ssh"));
+
+    // Topology: a directory replaced by a link after planning.
+    let e = Env::personal();
+    e.mkdirs(".ssh");
+    let (f, _) = save(&e);
+    fs::remove_dir(e.h(".ssh")).unwrap();
+    symlink("/elsewhere", e.h(".ssh")).unwrap();
+    let o = against(&e, &f);
+    assert_eq!(code(&o), 3);
+    assert!(
+        text(&o.stderr).contains("E_PLAN_STALE"),
+        "{}",
+        text(&o.stderr)
+    );
+}
+
+#[test]
+fn changed_ownership_invalidates_the_plan() {
+    let base = ".config/external-overlays/git/base.inc";
+    let e = Env::personal();
+    e.mkdirs(".config/external-overlays/git");
+    record(&e, "core.git-defaults", &e.h(base), "managed\n");
+    let (f, _) = save(&e);
+    // The user edits the owned file after the plan was made.
+    fs::write(e.h(base), "edited\n").unwrap();
+    let o = against(&e, &f);
+    assert_eq!(code(&o), 3);
+    let err = text(&o.stderr);
+    assert!(err.contains("E_PLAN_STALE"), "{err}");
+    assert!(
+        text(&o.stdout).contains("stale ownership: core.git-defaults@"),
+        "{}",
+        text(&o.stdout)
+    );
+}
+
+#[test]
+fn a_saved_plan_that_was_edited_or_is_unreadable_is_refused() {
+    let e = Env::personal();
+    let (f, s) = save(&e);
+
+    let mut v: serde_json::Value = serde_json::from_slice(&fs::read(&f).unwrap()).unwrap();
+    v["plan"]["operations"][0]["effect"] = "something else".into();
+    fs::write(&f, serde_json::to_vec(&v).unwrap()).unwrap();
+    let o = against(&e, &f);
+    assert_eq!(code(&o), 3);
+    assert!(
+        text(&o.stderr).contains("E_PLAN_INVALID"),
+        "{}",
+        text(&o.stderr)
+    );
+
+    let mut v = serde_json::to_value(&s).unwrap();
+    v["plan"]["schema"] = 2.into();
+    fs::write(&f, serde_json::to_vec(&v).unwrap()).unwrap();
+    let o = against(&e, &f);
+    assert_eq!(code(&o), 3);
+    assert!(text(&o.stderr).contains("E_SCHEMA_UNSUPPORTED"));
+
+    fs::write(&f, "not json").unwrap();
+    assert!(text(&against(&e, &f).stderr).contains("E_PLAN_INVALID"));
+
+    let missing = e.h("none.json");
+    let o = against(&e, &missing);
+    assert_eq!(code(&o), 2);
+    assert!(text(&o.stderr).contains("E_REPORT_UNAVAILABLE"));
+}
+
+// ---- C07: no writes, no processes, no network --------------------------------------------
+
+#[test]
+fn plan_changes_nothing_and_starts_no_provider() {
+    let e = Env::personal();
+    e.mkdirs(".codex/AGENTS.d");
+    fs::write(e.h(".codex/AGENTS.d/10-a.md"), "a").unwrap();
+    // Provider look-alikes on PATH record any start.
+    let bin = TempDir::new("plan-path");
+    let marker = bin.path().join("started");
+    for tool in [
+        "op",
+        "brew",
+        "git",
+        "mise",
+        "curl",
+        "ssh",
+        "security",
+        "launchctl",
+        "sudo",
+    ] {
+        let p = bin.path().join(tool);
+        fs::write(
+            &p,
+            format!("#!/bin/sh\necho {tool} >> '{}'\n", marker.display()),
+        )
+        .unwrap();
+        fs::set_permissions(&p, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let (home_before, src_before) = (fingerprint(e.home.path()), fingerprint(&e.root));
+    for extra in [&[][..], &["--json"][..]] {
+        let mut a = vec!["--home", e.home.path().to_str().unwrap(), "plan", "--root"];
+        a.push(e.root.to_str().unwrap());
+        a.extend_from_slice(extra);
+        let o = Command::new(BIN)
+            .env_clear()
+            .env("PATH", bin.path())
+            .env("HTTPS_PROXY", "http://127.0.0.1:9")
+            .args(a)
+            .output()
+            .unwrap();
+        assert_eq!(code(&o), 0, "{}", text(&o.stderr));
+    }
+    assert!(
+        !marker.exists(),
+        "a provider was started: {:?}",
+        fs::read_to_string(&marker)
+    );
+    assert_eq!(fingerprint(e.home.path()), home_before, "HOME changed");
+    assert_eq!(fingerprint(&e.root), src_before, "the sources changed");
+}
+
+#[test]
+fn the_planner_code_has_no_process_network_or_write_calls() {
+    let root = repo_root();
+    let files = [
+        "crates/model/src/plan/mod.rs",
+        "crates/model/src/plan/build.rs",
+        "crates/model/src/plan/graph.rs",
+        "crates/model/src/plan/stale.rs",
+        "crates/engine/src/observe.rs",
+        "crates/cli/src/plan_cmd.rs",
+    ];
+    let banned = [
+        "std::net",
+        "TcpStream",
+        "UdpSocket",
+        "process::Command",
+        "Command::new",
+        "std::fs::write",
+        "fs::write",
+        "create_dir",
+        "remove_file",
+        "remove_dir",
+        "rename(",
+        "symlink(",
+        "OpenOptions::new().write",
+        ".create(true)",
+        "mkdirat",
+        "unlinkat",
+        "renameat",
+        "symlinkat",
+    ];
+    for f in files {
+        let src = fs::read_to_string(root.join(f)).unwrap();
+        // Skip the test module and doc text; only code lines count.
+        let code: String = src
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        for b in banned {
+            assert!(!code.contains(b), "{f} contains {b}");
+        }
+    }
+}
+
+// ---- exit mapping (section 10) ----------------------------------------------------------
+
+#[test]
+fn plan_follows_the_exit_table_for_resolver_and_report_failures() {
+    // A malformed manifest is a gate failure before mutation: exit 3 (doctor maps it to 1).
+    let e = Env::personal();
+    fs::write(
+        e.src("base/modules/core/module.toml"),
+        "schema = 1\nnot valid toml [\n",
+    )
+    .unwrap();
+    let o = e.plan(&[]);
+    assert_eq!(code(&o), 3, "{}", text(&o.stderr));
+    assert!(text(&o.stderr).contains("E_"), "{}", text(&o.stderr));
+
+    // A source that cannot be read means no report can be produced: exit 2.
+    let o = e.run(&["plan", "--root", "/nonexistent-dfm-root"]);
+    assert_eq!(code(&o), 2);
+    assert!(text(&o.stderr).contains("E_REPORT_UNAVAILABLE"));
+
+    // Usage errors.
+    for args in [
+        &["plan"][..],
+        &["plan", "--root"][..],
+        &["plan", "--root", "x", "--root", "y"][..],
+        &["plan", "--root", "x", "--bogus"][..],
+        &["plan", "--root", "x", "--json", "--json"][..],
+    ] {
+        assert_eq!(code(&e.run(args)), 2, "{args:?}");
+    }
+}
+
+// ---- C08: a rejected plan explains itself -------------------------------------------------
+
+#[test]
+fn a_blocker_names_source_resource_field_claim_and_one_fix() {
+    let e = Env::personal();
+    e.mkdirs(".ssh");
+    fs::write(e.h(".ssh/config"), "Host *\n").unwrap();
+    let (o, s) = e.saved();
+    assert_eq!(code(&o), 3);
+    let b = &s.plan.blockers[0];
+    assert_eq!(b.code.as_str(), "E_CONFLICT");
+    assert_eq!(b.resource, "core.ssh");
+    assert!(
+        b.source.ends_with("modules/core/module.toml"),
+        "{}",
+        b.source
+    );
+    assert_eq!(b.field.as_deref(), Some("target"));
+    assert_eq!(b.path.as_deref(), Some(".ssh/config"));
+    assert!(b.detail.contains(".ssh/config") && !b.correction.is_empty());
+    assert_eq!(op(&s, "core.ssh@.ssh/config").status, Status::Blocked);
+    // The first blocker is what the error line and the exit code report.
+    let err = text(&o.stderr);
+    assert!(
+        err.starts_with("error: E_CONFLICT core.ssh (.ssh/config, target)"),
+        "{err}"
+    );
+}
+
+#[test]
+fn untrusted_text_in_a_blocker_is_escaped() {
+    let e = Env::personal();
+    e.mkdirs(".config");
+    symlink("/x\u{202e}y", e.h(".config/git")).unwrap();
+    let o = e.plan(&[]);
+    assert_eq!(code(&o), 3);
+    let all = format!("{}{}", text(&o.stdout), text(&o.stderr));
+    assert!(
+        !all.contains('\u{202e}') && all.contains("\\u{202e}"),
+        "{all}"
+    );
+}
+
+// ---- the library with synthetic observations (facts a test cannot create as this user) -----
+
+mod synthetic {
+    use super::*;
+    use dfm_cli::builtin_catalog;
+    use dfm_model::Code;
+    use dfm_model::plan::{
+        Binary, Context, Node, Observations, Plan, Seen, Source, build, followups, requests,
+    };
+    use dfm_model::resolve::{SourceSet, resolve};
+
+    fn load(dir: &Path, rel: &str, out: &mut SourceSet) {
+        let mut v: Vec<_> = fs::read_dir(dir).unwrap().map(|e| e.unwrap()).collect();
+        v.sort_by_key(|e| e.file_name());
+        for e in v {
+            let name = e.file_name().into_string().unwrap();
+            let path = if rel.is_empty() {
+                name
+            } else {
+                format!("{rel}/{name}")
+            };
+            let ty = e.file_type().unwrap();
+            if ty.is_symlink() {
+                out.insert_link(path, fs::read_link(e.path()).unwrap().to_str().unwrap());
+            } else if ty.is_dir() {
+                load(&e.path(), &path, out);
+            } else {
+                out.insert_file(path, fs::read(e.path()).unwrap());
+            }
+        }
+    }
+
+    fn observed() -> (dfm_model::resolve::Resolved, Observations) {
+        let mut set = SourceSet::new();
+        load(&repo_root().join("examples"), "", &mut set);
+        let resolved = resolve(&set, "profiles/personal-dev-01.toml", &builtin_catalog()).unwrap();
+        let home = TempDir::new("synthetic-home");
+        fs::set_permissions(home.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let sys = dfm_engine::Sys {
+            uid: dfm_platform_macos::current_uid().unwrap(),
+        };
+        let dir = dfm_engine::Dir::open_home(&sys, home.path()).unwrap();
+        let mut obs = dfm_engine::observe(&sys, &dir, &requests(&resolved)).unwrap();
+        let more = dfm_engine::observe(&sys, &dir, &followups(&resolved, &obs)).unwrap();
+        dfm_engine::merge(&mut obs, more);
+        (resolved, obs)
+    }
+
+    fn plan(resolved: &dfm_model::resolve::Resolved, obs: &Observations) -> Plan {
+        let cx = Context {
+            binary: Binary {
+                version: "0".into(),
+                sha256: "0".repeat(64),
+            },
+            profile: "p",
+            machine_id: "m",
+            sources: vec![Source {
+                kind: "path".into(),
+                root: "/r".into(),
+                tree: "sha256:0".into(),
+            }],
+            root: "/r",
+            ledger: vec![],
+        };
+        build(resolved, &cx, obs)
+    }
+
+    fn first(p: &Plan, id: &str) -> Code {
+        p.blockers
+            .iter()
+            .find(|b| b.resource == id)
+            .unwrap_or_else(|| panic!("no blocker for {id}: {:?}", p.blockers))
+            .code
+    }
+
+    fn put(obs: &mut Observations, path: &str, node: Node, alias: Option<&str>) {
+        obs.seen.insert(
+            path.into(),
+            Seen {
+                node,
+                alias: alias.map(String::from),
+            },
+        );
+    }
+
+    #[test]
+    fn the_same_inputs_build_equal_plans() {
+        let (r, obs) = observed();
+        let (a, b) = (plan(&r, &obs), plan(&r, &obs));
+        assert_eq!(a, b);
+        assert_eq!(a.digest(), b.digest());
+        assert!(a.blockers.is_empty());
+        // The digest depends on the observations.
+        let mut other = obs.clone();
+        put(
+            &mut other,
+            ".ssh",
+            Node::Dir {
+                mode: 0o700,
+                own: true,
+            },
+            None,
+        );
+        assert_ne!(plan(&r, &other).digest(), a.digest());
+    }
+
+    #[test]
+    fn a_parent_owned_by_another_user_needs_privilege_that_a_home_adapter_never_has() {
+        let (r, mut obs) = observed();
+        put(
+            &mut obs,
+            ".ssh",
+            Node::Dir {
+                mode: 0o755,
+                own: false,
+            },
+            None,
+        );
+        let p = plan(&r, &obs);
+        assert_eq!(first(&p, "core.ssh"), Code::PrivilegeUnsupported);
+        let leaf = Node::File {
+            mode: 0o644,
+            own: false,
+            size: 1,
+            sha256: None,
+        };
+        put(
+            &mut obs,
+            ".ssh",
+            Node::Dir {
+                mode: 0o755,
+                own: true,
+            },
+            None,
+        );
+        put(&mut obs, ".ssh/config", leaf, None);
+        assert_eq!(
+            first(&plan(&r, &obs), "core.ssh"),
+            Code::PrivilegeUnsupported
+        );
+    }
+
+    #[test]
+    fn a_case_alias_and_an_unknown_fact_fail_closed() {
+        let (r, mut obs) = observed();
+        put(
+            &mut obs,
+            ".config",
+            Node::Dir {
+                mode: 0o755,
+                own: true,
+            },
+            Some("Config"),
+        );
+        let p = plan(&r, &obs);
+        assert_eq!(first(&p, "core.git"), Code::TargetCollision);
+        assert!(p.blockers.iter().any(|b| b.detail.contains("`Config`")));
+
+        let (r, mut obs) = observed();
+        put(
+            &mut obs,
+            ".ssh",
+            Node::Unknown {
+                reason: "EIO".into(),
+            },
+            None,
+        );
+        assert_eq!(first(&plan(&r, &obs), "core.ssh"), Code::ObservationUnknown);
+
+        let (r, mut obs) = observed();
+        obs.seen.remove(".ssh");
+        assert_eq!(first(&plan(&r, &obs), "core.ssh"), Code::ObservationUnknown);
+    }
+}
