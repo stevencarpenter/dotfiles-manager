@@ -213,3 +213,34 @@ fn swapping_state_for_a_symlink_mid_write_cannot_redirect_the_write() {
         );
     }
 }
+
+#[test]
+fn init_stops_if_the_staging_directory_is_replaced_before_the_rename() {
+    use std::os::unix::fs::symlink;
+    let h = Home::new();
+    let release = h.0.join("release");
+    let mut s = Store::open_write(
+        sys(&h),
+        &h.layout(),
+        Fail::at("init-before-rename", Action::Wait(release.clone())),
+    )
+    .unwrap();
+    let foreign = Home::new();
+    let root = h.0.join(".local/state/dotfiles-manager");
+    let stamp = Stamp::of(&binding("/p/profile.toml", "m5"));
+    std::thread::scope(|sc| {
+        let init = sc.spawn(|| s.init(&stamp));
+        wait_until("the failpoint", || {
+            release.with_extension("reached").exists()
+        });
+        fs::rename(root.join("state.next"), root.join("elsewhere")).unwrap();
+        symlink(&foreign.0, root.join("state.next")).unwrap();
+        fs::write(&release, "go").unwrap();
+        assert_eq!(code(init.join().unwrap()), Code::StorageInvalid);
+    });
+    assert!(
+        !root.join("state").exists(),
+        "the swapped directory was not published"
+    );
+    assert!(fs::read_dir(&foreign.0).unwrap().next().is_none());
+}

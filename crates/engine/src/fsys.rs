@@ -18,6 +18,7 @@ use rustix::io::Errno;
 use std::fs::{self, File, TryLockError};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::fd::OwnedFd;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -44,7 +45,8 @@ pub fn storage(detail: impl Into<String>) -> Refusal {
 }
 
 pub fn io(what: &str, e: &std::io::Error) -> Refusal {
-    Refusal::new(Code::IoFailed, format!("{what}: {}", e.kind()))
+    // The OS message (for example "Operation not permitted (os error 1)") says more than the kind.
+    Refusal::new(Code::IoFailed, format!("{what}: {e}"))
 }
 
 fn sys_err(what: &str, e: Errno) -> Refusal {
@@ -98,6 +100,32 @@ fn mode_bits(st: &Stat) -> u32 {
 
 fn kind(st: &Stat) -> FileType {
     FileType::from_raw_mode(st.st_mode)
+}
+
+/// The identity of whatever `path` names, by device and inode. `follow` resolves a symlink at
+/// the end. `None` when nothing is there (or the path runs through a file). Used to compare
+/// claims with the manager's own paths by identity instead of by spelling.
+pub fn path_ident(path: &Path, follow: bool) -> Result<Option<Ident>, Refusal> {
+    let m = if follow {
+        fs::metadata(path)
+    } else {
+        fs::symlink_metadata(path)
+    };
+    match m {
+        Ok(m) => Ok(Some(Ident {
+            dev: m.dev(),
+            ino: m.ino(),
+        })),
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+            ) || e.raw_os_error() == Some(Errno::LOOP.raw_os_error()) =>
+        {
+            Ok(None)
+        }
+        Err(e) => Err(io("stat claim", &e)),
+    }
 }
 
 /// A listing: names, and a count of entries whose name is not UTF-8.
@@ -300,8 +328,24 @@ impl Dir {
         }
     }
 
+    /// Flushes this directory's entries to stable storage. `File::sync_all` is `F_FULLFSYNC` on
+    /// macOS (plain `fsync` does not flush the drive cache there), and an interrupted call is
+    /// retried. Tests that abort the process cannot prove power-loss ordering: an abort leaves
+    /// the page cache intact.
     pub fn sync(&self) -> Result<(), Refusal> {
-        rfs::fsync(&self.fd).map_err(|e| sys_err("sync directory", e))
+        let f = File::from(
+            self.fd
+                .try_clone()
+                .map_err(|e| io("duplicate directory", &e))?,
+        );
+        let mut tries = 0;
+        loop {
+            match f.sync_all() {
+                Ok(()) => return Ok(()),
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted && tries < 5 => tries += 1,
+                Err(e) => return Err(io("sync directory", &e)),
+            }
+        }
     }
 
     /// Reads a manager-owned file: no symlink, regular, owned by the current user, mode 0600,
@@ -337,7 +381,7 @@ impl Dir {
         }
         let mut buf = Vec::new();
         File::from(fd)
-            .take(limit as u64 + 1)
+            .take(u64::try_from(limit).unwrap_or(u64::MAX).saturating_add(1))
             .read_to_end(&mut buf)
             .map_err(|e| bad(e.kind().to_string()))?;
         if buf.len() > limit {
@@ -383,8 +427,23 @@ impl Dir {
         }
     }
 
+    /// Removes a temporary name. Used where a failure leaves nothing that matters.
     fn drop_temp(&self, tmp: &str) {
         let _ = rfs::unlinkat(&self.fd, tmp, AtFlags::empty());
+    }
+
+    /// Removes the temporary name after a successful `linkat`. A failure leaves the published
+    /// file with two links, which the append check would later refuse, so it is reported.
+    fn drop_linked_temp(&self, tmp: &str) -> Result<(), Refusal> {
+        rfs::unlinkat(&self.fd, tmp, AtFlags::empty()).map_err(|e| {
+            Refusal::new(
+                Code::IoUnconfirmed,
+                format!(
+                    "published, but the temporary name {tmp} could not be removed: {}",
+                    std::io::Error::from(e)
+                ),
+            )
+        })
     }
 
     fn require_plain(&self, name: &str) -> Result<(), Refusal> {
@@ -450,12 +509,14 @@ impl Dir {
             }
         };
         let r = step();
-        self.drop_temp(&tmp);
         if r.as_ref().is_ok_and(|created| *created) {
+            self.drop_linked_temp(&tmp)?;
             unconfirmed(
                 fail.hit(&format!("{label}-after-rename"))
                     .and_then(|()| self.sync()),
             )?;
+        } else {
+            self.drop_temp(&tmp);
         }
         r
     }
@@ -468,6 +529,7 @@ impl Dir {
         sys: &Sys,
         name: &str,
         line: &[u8],
+        max_total: u64,
         fail: &Fail,
         label: &str,
     ) -> Result<(), Refusal> {
@@ -476,7 +538,8 @@ impl Dir {
         let fd = rfs::openat(
             &self.fd,
             name,
-            OFlags::RDWR | OFlags::APPEND | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            // O_NONBLOCK so a FIFO planted at this name cannot hang the open.
+            OFlags::RDWR | OFlags::APPEND | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
             Mode::empty(),
         )
         .map_err(|e| match e {
@@ -493,8 +556,18 @@ impl Dir {
                 "must be a private regular file with one link owned by the current user".into(),
             ));
         }
+        let size = u64::try_from(st.st_size).map_err(|_| bad("has a negative size".into()))?;
+        if size.saturating_add(u64::try_from(line.len()).unwrap_or(u64::MAX)) > max_total {
+            return Err(Refusal::new(
+                Code::LimitExceeded,
+                format!(
+                    "{} would pass {max_total} bytes; it is not appended",
+                    self.at(name).display()
+                ),
+            ));
+        }
         let mut f = File::from(fd);
-        if st.st_size > 0 {
+        if size > 0 {
             let mut last = [0u8; 1];
             f.seek(SeekFrom::End(-1))
                 .and_then(|_| f.read_exact(&mut last))
@@ -510,10 +583,13 @@ impl Dir {
             }
         }
         fail.hit(&format!("{label}-before-write"))?;
-        f.write_all(line)
-            .and_then(|()| f.sync_all())
-            .map_err(|e| io("append", &e))?;
-        fail.hit(&format!("{label}-after-write"))
+        f.write_all(line).map_err(|e| io("append", &e))?;
+        // The line is written. A failure from here on means its durability is unconfirmed.
+        unconfirmed(
+            f.sync_all()
+                .map_err(|e| io("sync journal", &e))
+                .and_then(|()| fail.hit(&format!("{label}-after-write"))),
+        )
     }
 
     /// Lists this directory. Entry names that are not UTF-8 are counted, not dropped silently.
@@ -610,30 +686,28 @@ impl Lock {
     pub fn acquire(sys: &Sys, parent: &Dir, name: &str) -> Result<Lock, Refusal> {
         check_name(name)?;
         let bad = |d: String| storage(format!("{}: {d}", parent.at(name).display()));
-        // O_NONBLOCK so a FIFO planted at this name cannot hang the open. Several processes may
-        // create the file at the same moment, and macOS can then report ENOENT for a create
-        // that lost the race, so a few immediate retries are allowed.
-        let open = || {
-            rfs::openat(
+        // O_NONBLOCK so a FIFO planted at this name cannot hang the open. Open the existing file
+        // first. If it is absent, create it exclusively, and if another process created it in
+        // between (EEXIST), open it again. The loop is bounded.
+        let flags = OFlags::RDWR | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC;
+        let mode = Mode::from_raw_mode(0o600);
+        let mut attempts = 0;
+        let fd = loop {
+            attempts += 1;
+            match rfs::openat(&parent.fd, name, flags, Mode::empty()) {
+                Ok(fd) => break fd,
+                Err(Errno::LOOP) => return Err(bad("is a symlink".into())),
+                Err(Errno::NOENT) => {}
+                Err(e) => return Err(bad(io_kind(e))),
+            }
+            match rfs::openat(
                 &parent.fd,
                 name,
-                OFlags::RDWR
-                    | OFlags::CREATE
-                    | OFlags::NOFOLLOW
-                    | OFlags::NONBLOCK
-                    | OFlags::CLOEXEC,
-                Mode::from_raw_mode(0o600),
-            )
-        };
-        let mut tries = 0;
-        let fd = loop {
-            match open() {
+                flags | OFlags::CREATE | OFlags::EXCL,
+                mode,
+            ) {
                 Ok(fd) => break fd,
-                Err(Errno::NOENT) if tries < 20 => {
-                    tries += 1;
-                    std::thread::sleep(std::time::Duration::from_millis(2));
-                }
-                Err(Errno::LOOP) => return Err(bad("is a symlink".into())),
+                Err(Errno::EXIST) if attempts < 8 => {}
                 Err(e) => return Err(bad(io_kind(e))),
             }
         };

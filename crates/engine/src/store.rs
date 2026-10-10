@@ -6,7 +6,7 @@
 //! ones the paths name and that the lock is still held on the lock file.
 
 use crate::fail::Fail;
-use crate::fsys::{Dir, Layout, Lock, Sys, below, storage, unconfirmed};
+use crate::fsys::{Dir, Layout, Lock, Sys, below, path_ident, storage, unconfirmed};
 use dfm_model::binding::Binding;
 use dfm_model::state::{
     self, Class, JournalEntry, Ledger, Phase, Receipt, Scope, Stamp, StateDoc, TrialRecord,
@@ -14,7 +14,8 @@ use dfm_model::state::{
 };
 use dfm_model::{Code, Refusal};
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Seconds since the epoch. A clock before 1970 is an error, never a silent zero.
 pub fn now_unix() -> Result<u64, Refusal> {
@@ -42,11 +43,16 @@ pub enum Probe {
 pub struct Store {
     sys: Sys,
     /// Canonical HOME as a path, for claim checks (claims live outside the manager's storage).
+    home: PathBuf,
     root_parent: Dir,
     root_name: String,
     root: Dir,
     state: Option<Dir>,
     scope: Scope,
+    /// Manager paths (state root, config, lock, data, cache) as canonical paths, for identity checks.
+    reserved: Vec<PathBuf>,
+    /// Set after the first write that took effect. Later refusals are stamped with it.
+    mutated: AtomicBool,
     secrets: Vec<String>,
     fail: Fail,
     lock: Option<Lock>,
@@ -78,9 +84,9 @@ impl Store {
     fn locate(
         sys: &Sys,
         layout: &Layout,
+        home: &Dir,
         create: bool,
-    ) -> Result<Option<(Dir, Dir, String, Dir)>, Refusal> {
-        let home = Dir::open_home(sys, &layout.home)?;
+    ) -> Result<Option<(Dir, String, Dir)>, Refusal> {
         let mut rel = rel_of(layout, &layout.state_root)?;
         let Some(name) = rel.pop() else {
             return Err(storage("the state root is HOME itself"));
@@ -92,7 +98,7 @@ impl Store {
         let Some(root) = parent.child(sys, &name, true, create)? else {
             return Ok(None);
         };
-        Ok(Some((home, parent, name, root)))
+        Ok(Some((parent, name, root)))
     }
 
     fn build(
@@ -104,23 +110,28 @@ impl Store {
     ) -> Result<Store, Refusal> {
         let (root_parent, root_name, root) = located;
         let canon = home.shown().to_path_buf();
-        let join = |p: &Path| -> Result<String, Refusal> {
+        let join = |p: &Path| -> Result<PathBuf, Refusal> {
             Ok(rel_of(layout, p)?
                 .iter()
-                .fold(canon.clone(), |a, c| a.join(c))
-                .to_string_lossy()
-                .into_owned())
+                .fold(canon.clone(), |a, c| a.join(c)))
         };
-        let reserved = [
+        let reserved_paths = vec![
             join(&layout.state_root)?,
             join(&layout.config_dir)?,
             join(&layout.lock_file)?,
             join(&layout.data_dir)?,
             join(&layout.cache_dir)?,
         ];
+        let reserved_text: Vec<String> = reserved_paths
+            .iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect();
         Ok(Store {
             sys,
-            scope: Scope::new(&canon.to_string_lossy(), &reserved),
+            scope: Scope::new(&canon.to_string_lossy(), &reserved_text),
+            home: canon,
+            reserved: reserved_paths,
+            mutated: AtomicBool::new(false),
             root_parent,
             root_name,
             root,
@@ -159,28 +170,47 @@ impl Store {
     /// Opens for reading without taking the lock and without creating anything. `None` when no
     /// state directory exists. A redirected, mistyped or badly owned path is a refusal.
     pub fn open_read(sys: Sys, layout: &Layout, fail: Fail) -> Result<Option<Store>, Refusal> {
-        let Some((home, parent, name, root)) = Self::locate(&sys, layout, false)? else {
+        let home = Dir::open_home(&sys, &layout.home)?;
+        let Some(located) = Self::locate(&sys, layout, &home, false)? else {
             return Ok(None);
         };
-        let mut s = Store::build(sys, layout, &home, (parent, name, root), fail)?;
+        let mut s = Store::build(sys, layout, &home, located, fail)?;
         Ok(s.attach_state()?.then_some(s))
     }
 
-    /// Opens for writing: creates the shared parent of the lock file, takes the exclusive lock
-    /// (`E_LOCKED` if held, never waiting), then validates or creates the manager root.
+    /// Opens for writing and may create the state root: see [`Store::open_write_with`].
     pub fn open_write(sys: Sys, layout: &Layout, fail: Fail) -> Result<Store, Refusal> {
+        Self::open_write_with(sys, layout, fail, true)
+    }
+
+    /// Opens for writing: takes the exclusive lock (`E_LOCKED` if held, never waiting), then
+    /// validates the manager root. With `create_root` the missing parents of the lock file and
+    /// the state root are created, which only the first `bind` should do. Without it a missing
+    /// directory is state loss and a refusal (`E_STATE_INVALID`) that creates nothing. The lock
+    /// file itself is created if absent: it holds no state.
+    pub fn open_write_with(
+        sys: Sys,
+        layout: &Layout,
+        fail: Fail,
+        create_root: bool,
+    ) -> Result<Store, Refusal> {
+        let lost = || {
+            Refusal::new(
+                Code::StateInvalid,
+                "the state directory is missing; state is not recreated (state loss)",
+            )
+        };
         let home = Dir::open_home(&sys, &layout.home)?;
         let mut lock_rel = rel_of(layout, &layout.lock_file)?;
         let Some(lock_name) = lock_rel.pop() else {
             return Err(storage("the lock file is HOME itself"));
         };
         let lock_dir = home
-            .walk(&sys, &lock_rel, lock_rel.len(), true)?
-            .ok_or_else(|| storage("the lock directory vanished"))?;
+            .walk(&sys, &lock_rel, lock_rel.len(), create_root)?
+            .ok_or_else(lost)?;
         let lock = Lock::acquire(&sys, &lock_dir, &lock_name)?;
-        let (_, parent, name, root) =
-            Self::locate(&sys, layout, true)?.ok_or_else(|| storage("the state root vanished"))?;
-        let mut s = Store::build(sys, layout, &home, (parent, name, root), fail)?;
+        let located = Self::locate(&sys, layout, &home, create_root)?.ok_or_else(lost)?;
+        let mut s = Store::build(sys, layout, &home, located, fail)?;
         s.lock = Some(lock);
         // A writer must not act on a state directory whose layout it would refuse to read.
         s.attach_state()?;
@@ -240,6 +270,11 @@ impl Store {
     /// so a crash leaves either no `state` or a complete one. An existing `state` that is not an
     /// empty directory is refused and left alone: lost or damaged state is never recreated.
     pub fn init(&mut self, stamp: &Stamp) -> Result<(), Refusal> {
+        let r = self.init_inner(stamp);
+        self.wrote(r)
+    }
+
+    fn init_inner(&mut self, stamp: &Stamp) -> Result<(), Refusal> {
         // The state directory may not exist yet, so only the lock and the root are checked.
         self.lock_ok()?;
         if self.root_parent.entry_ident(&self.root_name)? != Some(self.root.ident()?) {
@@ -278,6 +313,12 @@ impl Store {
         )?;
         staging.publish_new("journal.jsonl", b"", &self.fail, "init-journal")?;
         self.fail.hit("init-before-rename")?;
+        // Just before the rename: the lock is still ours and the staging name still names the
+        // directory this call built.
+        self.lock_ok()?;
+        if self.root.entry_ident(STAGING)? != Some(staging.ident()?) {
+            return Err(storage("the staging directory was replaced; init stops"));
+        }
         self.root.rename(STAGING, STATE)?;
         let synced = unconfirmed(self.root.sync());
         self.attach_state()?;
@@ -322,6 +363,9 @@ impl Store {
     fn ledger_raw(&self) -> Result<Ledger, Refusal> {
         let l = Ledger::parse(&self.read_doc("ledger.json")?)?;
         l.validate_within(&self.scope)?;
+        for o in l.resources.iter().flat_map(|r| &r.owned_outputs) {
+            self.check_claim(&o.path)?;
+        }
         Ok(l)
     }
 
@@ -336,8 +380,105 @@ impl Store {
         let entries = state::parse_journal(&self.read_doc("journal.jsonl")?)?;
         for e in &entries {
             e.validate_within(&self.scope)?;
+            for o in e.recovery.iter().flat_map(|r| &r.outputs) {
+                self.check_claim(&o.path)?;
+            }
         }
         Ok(entries)
+    }
+
+    /// The manager's reserved directories and files, and their ancestors, by filesystem identity
+    /// (device and inode), not by spelling. A case or Unicode alias, a hard path through a
+    /// symlink, or any other name for the same directory has the same identity.
+    fn reserved_idents(
+        &self,
+    ) -> Result<(Vec<crate::fsys::Ident>, Vec<crate::fsys::Ident>), Refusal> {
+        let mut inside = Vec::new();
+        let mut exact = Vec::new();
+        for (i, r) in self.reserved.iter().enumerate() {
+            // Index 2 is the lock file: it may be claimed neither exactly nor from inside.
+            let is_dir = i != 2;
+            if let Some(id) = path_ident(r, true)? {
+                exact.push(id);
+                if is_dir {
+                    inside.push(id);
+                }
+            }
+            for a in r
+                .ancestors()
+                .skip(1)
+                .take_while(|a| a.starts_with(&self.home))
+            {
+                if let Some(id) = path_ident(a, true)? {
+                    exact.push(id);
+                }
+            }
+        }
+        Ok((inside, exact))
+    }
+
+    /// Refuses a claim that is, lies inside, or contains a reserved path, judged by identity: a
+    /// directory above the leaf (symlinks followed) that is a reserved directory, or a leaf that
+    /// is a reserved path or an ancestor of one. A symlink as the leaf is allowed: the link
+    /// itself is the claim.
+    fn identity_check(&self, path: &str) -> Result<(), Refusal> {
+        let outside = || {
+            Refusal::new(
+                Code::StateInvalid,
+                format!("{path} is, contains or lies inside a path the manager owns"),
+            )
+        };
+        let (inside, exact) = self.reserved_idents()?;
+        let p = Path::new(path);
+        for a in p
+            .ancestors()
+            .skip(1)
+            .take_while(|a| a.starts_with(&self.home))
+        {
+            if path_ident(a, true)?.is_some_and(|id| inside.contains(&id)) {
+                return Err(outside());
+            }
+        }
+        if path_ident(p, false)?.is_some_and(|id| exact.contains(&id)) {
+            return Err(outside());
+        }
+        Ok(())
+    }
+
+    /// Delete authority for one exact output, decided now: the ledger is read again (valid,
+    /// inside the scope, written for this identity), the path is checked against the manager's
+    /// reserved paths by identity, and the live fingerprint must equal the recorded one.
+    pub fn authorizes_delete(
+        &self,
+        resource: &str,
+        path: &str,
+        live_sha256: &str,
+    ) -> Result<bool, Refusal> {
+        let ledger = self.read_ledger()?;
+        self.check_claim(path)?;
+        Ok(ledger.authorizes_delete(resource, path, live_sha256))
+    }
+
+    /// Whether this store has changed anything on disk yet.
+    pub fn mutated(&self) -> bool {
+        self.mutated.load(Ordering::SeqCst)
+    }
+
+    /// Wraps a write. The first write that took effect (or whose outcome is unconfirmed) sets the
+    /// flag, and every refusal after that is stamped as happening after a mutation (exit 1).
+    fn wrote<T>(&self, r: Result<T, Refusal>) -> Result<T, Refusal> {
+        match &r {
+            Ok(_) => self.mutated.store(true, Ordering::SeqCst),
+            Err(e) if e.code == Code::IoUnconfirmed => self.mutated.store(true, Ordering::SeqCst),
+            Err(_) => {}
+        }
+        r.map_err(|e| {
+            if self.mutated() {
+                e.after_mutation()
+            } else {
+                e
+            }
+        })
     }
 
     /// A claim must lie inside HOME and outside the manager's own paths, as written and after the
@@ -353,6 +494,7 @@ impl Store {
         if !self.scope.admits(path) {
             return Err(outside());
         }
+        self.identity_check(path)?;
         let p = Path::new(path);
         let (Some(parent), Some(leaf)) = (p.parent(), p.file_name()) else {
             return Err(outside());
@@ -386,6 +528,10 @@ impl Store {
 
     /// Appends one journal entry and syncs it. Intent entries are written before a side effect.
     pub fn append_journal(&self, e: &JournalEntry) -> Result<(), Refusal> {
+        self.wrote(self.append_journal_inner(e))
+    }
+
+    fn append_journal_inner(&self, e: &JournalEntry) -> Result<(), Refusal> {
         self.guard(None)?;
         let mut e = e.clone();
         e.scrub(&self.secret_refs())?;
@@ -396,15 +542,35 @@ impl Store {
             &self.sys,
             "journal.jsonl",
             &e.to_line()?,
+            state::MAX_JOURNAL_BYTES,
             &self.fail,
             "journal",
         )
+    }
+
+    /// Refuses a document over the write cap, before anything is written.
+    fn cap(bytes: Vec<u8>) -> Result<Vec<u8>, Refusal> {
+        if bytes.len() > state::MAX_WRITE_BYTES {
+            return Err(Refusal::new(
+                Code::LimitExceeded,
+                format!(
+                    "the document would be {} bytes; the write cap is {}",
+                    bytes.len(),
+                    state::MAX_WRITE_BYTES
+                ),
+            ));
+        }
+        Ok(bytes)
     }
 
     /// Replaces the ledger atomically. A failure before the rename leaves the previous ledger. A
     /// failure after it is `E_IO_UNCONFIRMED`: the new ledger is in place, durability unknown.
     /// The ledger must carry the identity in `state.json`.
     pub fn write_ledger(&self, l: &Ledger) -> Result<(), Refusal> {
+        self.wrote(self.write_ledger_inner(l))
+    }
+
+    fn write_ledger_inner(&self, l: &Ledger) -> Result<(), Refusal> {
         self.guard(None)?;
         self.check_owner(&l.binding)?;
         l.validate()?;
@@ -412,13 +578,18 @@ impl Store {
         for o in l.resources.iter().flat_map(|r| &r.owned_outputs) {
             self.check_claim(&o.path)?;
         }
+        let bytes = Self::cap(canonical(l)?)?;
         self.state()?
-            .replace_file("ledger.json", &canonical(l)?, &self.fail, "ledger")
+            .replace_file("ledger.json", &bytes, &self.fail, "ledger")
     }
 
     /// Publishes a receipt. Receipts are immutable: an existing name is a refusal, never an
     /// overwrite. Returns the file name.
     pub fn write_receipt(&self, r: &Receipt) -> Result<String, Refusal> {
+        self.wrote(self.write_receipt_inner(r))
+    }
+
+    fn write_receipt_inner(&self, r: &Receipt) -> Result<String, Refusal> {
         let dir = self
             .guard(Some("receipts"))?
             .ok_or_else(|| storage("no receipts directory"))?;
@@ -432,7 +603,7 @@ impl Store {
         let name = r
             .file_name()
             .ok_or_else(|| Refusal::new(Code::StateInvalid, "receipt has no usable time"))?;
-        if dir.publish_new(&name, &canonical(&r)?, &self.fail, "receipt")? {
+        if dir.publish_new(&name, &Self::cap(canonical(&r)?)?, &self.fail, "receipt")? {
             Ok(name)
         } else {
             Err(storage(format!(
@@ -443,6 +614,10 @@ impl Store {
 
     /// Replaces an active trial record atomically.
     pub fn write_trial(&self, t: &TrialRecord) -> Result<(), Refusal> {
+        self.wrote(self.write_trial_inner(t))
+    }
+
+    fn write_trial_inner(&self, t: &TrialRecord) -> Result<(), Refusal> {
         let dir = self
             .guard(Some("trials"))?
             .ok_or_else(|| storage("no trials directory"))?;
@@ -458,7 +633,7 @@ impl Store {
         }
         dir.replace_file(
             &format!("{}.json", t.trial_id),
-            &canonical(t)?,
+            &Self::cap(canonical(t)?)?,
             &self.fail,
             "trial",
         )
@@ -473,6 +648,16 @@ impl Store {
         bytes: &[u8],
         class: Class,
     ) -> Result<(), Refusal> {
+        self.wrote(self.write_snapshot_inner(op_id, name, bytes, class))
+    }
+
+    fn write_snapshot_inner(
+        &self,
+        op_id: &str,
+        name: &str,
+        bytes: &[u8],
+        class: Class,
+    ) -> Result<(), Refusal> {
         let snaps = self
             .guard(Some("snapshots"))?
             .ok_or_else(|| storage("no snapshots directory"))?;
@@ -481,6 +666,12 @@ impl Store {
         }
         if !state::valid_id(op_id) || !state::valid_id(name) {
             return Err(storage("snapshot names must be plain ids"));
+        }
+        if bytes.len() > state::MAX_WRITE_BYTES {
+            return Err(Refusal::new(
+                Code::LimitExceeded,
+                "the snapshot is over the write cap",
+            ));
         }
         let dir = snaps
             .child(&self.sys, op_id, true, true)?
@@ -593,6 +784,9 @@ impl Store {
                 }
                 let r = read(&d, &n).and_then(|b| Receipt::parse(&b)).and_then(|r| {
                     r.validate_within(&self.scope)?;
+                    for p in r.operations.iter().flat_map(|o| &o.owned_outputs) {
+                        self.check_claim(p)?;
+                    }
                     if r.file_name().as_deref() == Some(&n) {
                         Ok(r)
                     } else {

@@ -1296,3 +1296,45 @@ fn an_unreadable_receipts_directory_is_a_finding_not_an_empty_list() {
     );
     assert!(!text(&c.stdout).contains("state ok"));
 }
+
+// ---- final round: state loss -------------------------------------------------------------------
+
+#[test]
+fn a_binding_without_its_state_is_state_loss_and_is_never_recreated() {
+    for lose in ["root", "state-dir"] {
+        let h = seeded("loss");
+        let gone = if lose == "root" {
+            root(h.path())
+        } else {
+            state(h.path())
+        };
+        fs::remove_dir_all(&gone).unwrap();
+        let before = snapshot(h.path());
+        let o = bind(h.path());
+        assert_eq!(o.status.code(), Some(3), "{lose}: {}", text(&o.stderr));
+        assert!(
+            text(&o.stderr).contains("E_STATE_INVALID"),
+            "{lose}: {}",
+            text(&o.stderr)
+        );
+        assert!(
+            text(&o.stderr).contains("state loss"),
+            "{lose}: {}",
+            text(&o.stderr)
+        );
+        assert_eq!(snapshot(h.path()), before, "{lose}: nothing was written");
+        let c = check(h.path());
+        assert_eq!(c.status.code(), Some(1), "{lose}: {}", text(&c.stdout));
+        assert!(
+            text(&c.stdout).contains("E_STATE_INVALID"),
+            "{lose}: {}",
+            text(&c.stdout)
+        );
+        assert!(text(&c.stdout).contains("state loss"), "{lose}");
+        // Writers refuse too, before any effect.
+        let o = record(h.path(), "core.y", "y", "y");
+        assert_eq!(o.status.code(), Some(3), "{lose}");
+        assert!(!h.path().join("y").exists());
+        assert_eq!(snapshot(h.path()), before, "{lose}");
+    }
+}

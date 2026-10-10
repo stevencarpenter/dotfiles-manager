@@ -588,3 +588,182 @@ fn reconcile_refuses_a_torn_journal_and_leaves_it_alone() {
     assert_eq!(code(s.reconcile(&|_| Probe::Done)), Code::StateInvalid);
     assert_eq!(fs::read(&j).unwrap(), bytes);
 }
+
+#[test]
+fn claims_are_judged_by_identity_so_aliases_and_links_cannot_reach_manager_paths() {
+    let h = Home::new();
+    let (s, stamp) = init(&h);
+    let home = h.0.to_str().unwrap().to_string();
+    // A directory link into the state root, and a link chain through it.
+    symlink(
+        h.0.join(".local/state/dotfiles-manager"),
+        h.0.join("sneaky"),
+    )
+    .unwrap();
+    symlink(h.0.join("sneaky"), h.0.join("sneakier")).unwrap();
+    let mut paths = vec![
+        format!("{home}/sneaky/state/ledger.json"),
+        format!("{home}/sneakier/state/state.json"),
+    ];
+    // APFS folds case and many Unicode characters, so another spelling can be the same
+    // directory. Use whichever aliases this volume really resolves to the state root.
+    for alias in [
+        ".LOCAL/STATE/DOTFILES-MANAGER",
+        ".local/state/dotfile\u{17f}-manager",
+    ] {
+        let probe = h.0.join(alias);
+        if fs::metadata(&probe).is_ok_and(|m| {
+            m.ino()
+                == fs::metadata(h.0.join(".local/state/dotfiles-manager"))
+                    .unwrap()
+                    .ino()
+        }) {
+            paths.push(format!("{home}/{alias}/state/ledger.json"));
+        }
+    }
+    for bad in paths {
+        let mut l = ledger_with(&stamp, &h, "core.x", "a", 'a');
+        l.resources[0].owned_outputs[0].path = bad.clone();
+        assert_eq!(code(s.write_ledger(&l)), Code::StateInvalid, "{bad}");
+        // The same hand-written ledger is refused on read, and gives no delete authority.
+        let on_disk = h.0.join(".local/state/dotfiles-manager/state/ledger.json");
+        fs::write(&on_disk, dfm_model::state::canonical(&l).unwrap()).unwrap();
+        fs::set_permissions(&on_disk, fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(code(s.read_ledger()), Code::StateInvalid, "{bad}");
+        assert!(
+            s.authorizes_delete("core.x", &bad, &"a".repeat(64))
+                .is_err(),
+            "{bad}"
+        );
+        fs::write(
+            &on_disk,
+            dfm_model::state::canonical(&Ledger::empty(stamp.clone())).unwrap(),
+        )
+        .unwrap();
+    }
+}
+
+#[test]
+fn delete_authority_is_decided_again_at_use_time() {
+    let h = Home::new();
+    let (s, stamp) = init(&h);
+    fs::create_dir_all(h.0.join("real")).unwrap();
+    let file = h.0.join("real/owned").to_str().unwrap().to_string();
+    let mut l = Ledger::empty(stamp.clone());
+    l.record(LedgerResource {
+        resource: "core.x".into(),
+        adapter: "fs-link/v1".into(),
+        class: Class::Normal,
+        op_id: "op1".into(),
+        owned_outputs: vec![OwnedOutput {
+            path: file.clone(),
+            mode: 0o600,
+            fingerprint: Some("a".repeat(64)),
+        }],
+    })
+    .unwrap();
+    s.write_ledger(&l).unwrap();
+    assert!(
+        s.authorizes_delete("core.x", &file, &"a".repeat(64))
+            .unwrap()
+    );
+    assert!(
+        !s.authorizes_delete("core.x", &file, &"b".repeat(64))
+            .unwrap(),
+        "conflict"
+    );
+    // The owned directory is replaced by a link into the manager's storage after the ledger was
+    // written. The ledger still lists the path, but the authority is refused now.
+    fs::remove_dir_all(h.0.join("real")).unwrap();
+    symlink(h.0.join(".local/state/dotfiles-manager"), h.0.join("real")).unwrap();
+    assert!(
+        s.authorizes_delete("core.x", &file, &"a".repeat(64))
+            .is_err()
+    );
+}
+
+#[test]
+fn refusals_after_the_first_write_are_stamped_as_after_a_mutation() {
+    let h = Home::new();
+    let (s, stamp) = init(&h);
+    assert!(s.mutated(), "init changed the disk");
+    let other = Stamp::of(&binding("/p/other.toml", "m5"));
+    let e = s
+        .write_ledger(&ledger_with(&other, &h, "core.x", "a", 'a'))
+        .unwrap_err();
+    assert!(e.mutated, "a refusal after init is after a mutation");
+    drop(s);
+    let s = open(&h);
+    assert!(!s.mutated());
+    let e = s
+        .write_ledger(&ledger_with(&other, &h, "core.x", "a", 'a'))
+        .unwrap_err();
+    assert!(!e.mutated, "nothing was written yet");
+    s.write_ledger(&ledger_with(&stamp, &h, "core.x", "a", 'a'))
+        .unwrap();
+    let e = s
+        .write_ledger(&ledger_with(&other, &h, "core.x", "a", 'a'))
+        .unwrap_err();
+    assert!(e.mutated);
+    assert_eq!(e.exit(), dfm_model::Exit::Failed);
+}
+
+#[test]
+fn writes_over_the_size_caps_are_refused_before_anything_is_written() {
+    use dfm_engine::{Dir, Fail as F, Sys as S};
+    let h = Home::new();
+    let (s, stamp) = init(&h);
+    // A receipt with enough operations to pass the write cap.
+    let mut r = receipt(&stamp, "run-big", vec![]);
+    let one = r.operations[0].clone();
+    r.operations = (0..20_000)
+        .map(|i| {
+            let mut o = one.clone();
+            o.id = format!("op{i}");
+            o.resource = "r".repeat(250);
+            o.adapter = "a".repeat(250);
+            o
+        })
+        .collect();
+    r.result.counts = dfm_model::state::count_statuses(&r.operations);
+    assert_eq!(code(s.write_receipt(&r)), Code::LimitExceeded);
+    assert!(
+        fs::read_dir(h.0.join(".local/state/dotfiles-manager/state/receipts"))
+            .unwrap()
+            .next()
+            .is_none()
+    );
+    // The journal cap, exercised on the file primitive with a small limit.
+    let dir = Home::new();
+    let f = dir.0.join("journal.jsonl");
+    fs::write(&f, "").unwrap();
+    fs::set_permissions(&f, fs::Permissions::from_mode(0o600)).unwrap();
+    let d = Dir::open_plain(&dir.0).unwrap();
+    let sys = S {
+        uid: fs::metadata(&dir.0).unwrap().uid(),
+    };
+    d.append_line(&sys, "journal.jsonl", b"0123456789\n", 20, &F::none(), "t")
+        .unwrap();
+    let err = d
+        .append_line(&sys, "journal.jsonl", b"0123456789\n", 20, &F::none(), "t")
+        .unwrap_err();
+    assert_eq!(err.code, Code::LimitExceeded);
+    assert_eq!(fs::read(&f).unwrap(), b"0123456789\n");
+}
+
+#[test]
+fn many_processes_creating_the_lock_at_once_only_ever_see_locked() {
+    let h = Home::new();
+    let results: Vec<_> = std::thread::scope(|sc| {
+        let tasks: Vec<_> = (0..16)
+            .map(|_| sc.spawn(|| Store::open_write(sys(&h), &h.layout(), Fail::none()).map(|_| ())))
+            .collect();
+        tasks.into_iter().map(|t| t.join().unwrap()).collect()
+    });
+    assert!(results.iter().any(Result::is_ok));
+    for r in results {
+        if let Err(e) = r {
+            assert_eq!(e.code, Code::Locked, "{e}");
+        }
+    }
+}

@@ -316,6 +316,16 @@ fn read_existing_binding(ctx: &Ctx) -> Result<Option<Binding>, Refusal> {
     }
 }
 
+/// A binding with no state directory is state loss, not a fresh start. Only a bind that finds no
+/// binding may create state (docs/state.md).
+fn state_lost_refusal() -> Refusal {
+    Refusal::new(
+        Code::StateInvalid,
+        "the binding exists but its state directory is missing; state is not recreated (state loss). \
+         Restore ~/.local/state/dotfiles-manager/, or move the binding aside to start new state",
+    )
+}
+
 fn state_owner_refusal(owner: &Stamp) -> Refusal {
     Refusal::new(
         Code::RebindUnsupported,
@@ -364,19 +374,27 @@ fn bind(ctx: &Ctx, profile: String, machine_id: String) -> Result<String, Refusa
         }
         None => false,
     };
-    if have.is_some() && owned {
-        return Ok("already bound".into());
+    if have.is_some() {
+        return if owned {
+            Ok("already bound".into())
+        } else {
+            Err(state_lost_refusal())
+        };
     }
 
     // Phase 2 writes under the manager lock and decides again, because another command may have
     // bound in between. The state records the identity first, so a crash between the two writes
     // can only be retried by the same identity.
-    let mut store = Store::open_write(sys, &layout, state_cmd::fail_from_env()?)?;
+    let mut store =
+        Store::open_write_with(sys, &layout, state_cmd::fail_from_env()?, have.is_none())?;
     let have = read_existing_binding(ctx)?;
     if let Some(h) = &have
         && !h.same_identity(&want)
     {
         return Err(rebind_refusal(h));
+    }
+    if have.is_some() && !store.is_initialized() {
+        return Err(state_lost_refusal());
     }
     let inited = !store.is_initialized();
     if inited {

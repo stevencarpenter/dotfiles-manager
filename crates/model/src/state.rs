@@ -16,6 +16,11 @@ pub const MAX_JOURNAL_LINE: usize = 64 << 10;
 const MAX_DEPTH: usize = 32;
 /// Provider text kept in a receipt or journal entry (section 8, secrets item 3).
 pub const MAX_ERROR_BYTES: usize = 4096;
+/// Largest ledger, receipt or trial document the manager writes. The read cap is larger, so a
+/// document the manager wrote is always readable and a hand-made huge one is still refused.
+pub const MAX_WRITE_BYTES: usize = 4 << 20;
+/// Largest total size of the journal. An append that would pass it is refused before writing.
+pub const MAX_JOURNAL_BYTES: u64 = 8 << 20;
 
 fn bad(d: impl Into<String>) -> Refusal {
     Refusal::new(Code::StateInvalid, d)
@@ -422,6 +427,7 @@ impl Receipt {
         if self.result.counts != count_statuses(&self.operations) {
             return Err(bad("receipt counts do not match its operations"));
         }
+        self.validate_fields()?;
         for o in &self.operations {
             if o.class == Class::Sensitive && (o.before.is_some() || o.after.is_some()) {
                 return Err(bad(format!(
@@ -439,6 +445,68 @@ impl Receipt {
             }
             if o.error.as_ref().is_some_and(|e| e.len() > MAX_ERROR_BYTES) {
                 return Err(bad(format!("operation {} error is not bounded", o.id)));
+            }
+        }
+        Ok(())
+    }
+
+    /// The fields that carry no free text: each must have its exact shape, so nothing can be
+    /// hidden in them.
+    fn validate_fields(&self) -> Result<(), Refusal> {
+        let plain =
+            |t: &str| !t.is_empty() && t.len() <= 64 && t.chars().all(|c| c.is_ascii_graphic());
+        let hex_id =
+            |t: &str| matches!(t.len(), 40 | 64) && t.bytes().all(|c| c.is_ascii_hexdigit());
+        if !plain(&self.binary.version) || !plain(&self.binary.commit) {
+            return Err(bad("receipt binary version or commit is malformed"));
+        }
+        if !valid_sha256(&self.binary.sha256) {
+            return Err(bad("receipt binary sha256 is malformed"));
+        }
+        if self
+            .plan_digest
+            .as_deref()
+            .is_some_and(|d| !valid_sha256(d))
+        {
+            return Err(bad("receipt plan_digest is malformed"));
+        }
+        if let Some(a) = &self.approval
+            && (!matches!(a.kind.as_str(), "interactive" | "yes_plan")
+                || !valid_sha256(&a.plan_digest)
+                || parse_rfc3339(&a.at).is_none())
+        {
+            return Err(bad("receipt approval is malformed"));
+        }
+        for src in &self.sources {
+            let tree_ok = src.tree.strip_prefix("sha256:").is_some_and(valid_sha256);
+            if !valid_id(&src.id) || !hex_id(&src.commit) || !tree_ok {
+                return Err(bad("receipt source identity is malformed"));
+            }
+        }
+        let exit_name = match self.result.exit_code {
+            0 => "ok",
+            1 => "failed",
+            2 => "usage",
+            3 => "blocked",
+            4 => "declined",
+            5 => "pending",
+            130 => "interrupted",
+            143 => "terminated",
+            _ => return Err(bad("receipt exit_code is not a contract code")),
+        };
+        if self.result.outcome != exit_name {
+            return Err(bad("receipt outcome does not match its exit_code"));
+        }
+        for o in &self.operations {
+            let named =
+                |t: &str| !t.is_empty() && t.len() <= 256 && !t.chars().any(char::is_control);
+            if !valid_id(&o.id) || !named(&o.resource) || !named(&o.adapter) {
+                return Err(bad(format!("operation {} has a malformed name", o.id)));
+            }
+            for t in [&o.started_at, &o.finished_at] {
+                if parse_rfc3339(t).is_none() {
+                    return Err(bad(format!("operation {} time is malformed", o.id)));
+                }
             }
         }
         Ok(())
@@ -669,7 +737,12 @@ pub fn redact(text: &str, secrets: &[&str]) -> String {
     let mut ranges: Vec<(usize, usize)> = secrets
         .iter()
         .filter(|s| !s.is_empty())
-        .flat_map(|s| text.match_indices(s).map(|(i, m)| (i, i + m.len())))
+        // Every start position, so a match that overlaps itself ("aaaa" in "xaaaaaax") is found.
+        .flat_map(|s| {
+            text.char_indices()
+                .filter(move |(i, _)| text[*i..].starts_with(s))
+                .map(move |(i, _)| (i, i + s.len()))
+        })
         .collect();
     ranges.sort_unstable();
     let mut merged: Vec<(usize, usize)> = Vec::new();
@@ -711,6 +784,9 @@ impl Receipt {
     /// Redacts descriptive text with `secrets` in one pass. A path or identifier that contains
     /// a secret cannot be redacted without breaking its use, so it is refused.
     pub fn scrub(&mut self, secrets: &[&str]) -> Result<(), Refusal> {
+        if leaks(&self.op_id, secrets) {
+            return Err(secret_in_path());
+        }
         for o in &self.operations {
             let ids = [&o.id, &o.resource, &o.adapter];
             if ids.iter().any(|t| leaks(t, secrets))
@@ -1170,6 +1246,9 @@ mod tests {
         assert_eq!(redact("abcdefgh", &["abcd", "efgh"]), "[redacted]");
         // Bidirectional and zero-width characters become visible.
         assert_eq!(redact("a\u{202E}b\u{200B}c", &[]), "a\\u{202e}b\\u{200b}c");
+        // A match that overlaps itself is found at every start.
+        assert_eq!(redact("ababab", &["abab"]), "[redacted]");
+        assert_eq!(redact("xaaaaaax", &["aaaa"]), "x[redacted]x");
         // A secret that contains another secret is redacted whole, whatever the list order.
         for list in [["abc", "abcdef"], ["abcdef", "abc"]] {
             assert_eq!(redact("x abcdef y", &list), "x [redacted] y");
@@ -1240,5 +1319,44 @@ mod tests {
         r.operations[0].owned_outputs = vec!["/h/tok-hunter2".into()];
         let e = r.scrub(&["hunter2"]).unwrap_err();
         assert!(!e.detail.contains("hunter2"));
+    }
+
+    #[test]
+    fn receipt_fields_without_free_text_must_have_their_exact_shape() {
+        let good = receipt(vec![op(Status::Updated, Class::Normal)]);
+        assert!(good.validate().is_ok());
+        let mut cases: Vec<(&str, Receipt)> = Vec::new();
+        let mut r = good.clone();
+        r.result.outcome = "all fine, token=abc".into();
+        cases.push(("outcome", r));
+        let mut r = good.clone();
+        r.binary.sha256 = "not a hash".into();
+        cases.push(("sha", r));
+        let mut r = good.clone();
+        r.plan_digest = Some("secret".into());
+        cases.push(("plan", r));
+        let mut r = good.clone();
+        r.approval = Some(Approval {
+            kind: "hunter2".into(),
+            plan_digest: "a".repeat(64),
+            at: "2026-10-10T00:00:00Z".into(),
+        });
+        cases.push(("approval", r));
+        let mut r = good.clone();
+        r.sources = vec![SourceId {
+            id: "s".into(),
+            commit: "zz".into(),
+            tree: "x".into(),
+        }];
+        cases.push(("source", r));
+        let mut r = good.clone();
+        r.operations[0].started_at = "yesterday".into();
+        cases.push(("time", r));
+        let mut r = good.clone();
+        r.operations[0].resource = "line\nbreak".into();
+        cases.push(("name", r));
+        for (what, r) in cases {
+            assert!(r.validate().is_err(), "{what}");
+        }
     }
 }

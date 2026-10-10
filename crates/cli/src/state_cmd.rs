@@ -66,7 +66,14 @@ pub fn check(ctx: &Ctx, out: &mut dyn Write) -> Result<(), Refusal> {
     let (binding, store) = match (binding, store) {
         (Some(b), Some(s)) => (b, s),
         (None, None) => return writeln!(out, "unbound; no state").map_err(w),
-        (Some(_), None) => return writeln!(out, "bound; state is not initialized").map_err(w),
+        (Some(_), None) => {
+            writeln!(
+                out,
+                "E_STATE_INVALID the binding exists but its state directory is missing (state loss)"
+            )
+            .map_err(w)?;
+            return Err(Refusal::new(Code::Diagnosed, "1 finding"));
+        }
         (None, Some(_)) => {
             writeln!(out, "E_STATE_INVALID state exists but there is no binding").map_err(w)?;
             return Err(Refusal::new(Code::Diagnosed, "1 finding"));
