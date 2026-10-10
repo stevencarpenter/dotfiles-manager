@@ -427,7 +427,7 @@ trait Adapter {
 
 ### Expected mapping of existing cases
 
-`examples/cases.toml` has four composition cases and 12 negative cases. A later resolver leaf must execute them. `just check` does not.
+`examples/cases.toml` has four composition cases and 12 negative cases. DFM-15 executes them in `cargo test -p dfm-cli --test resolver`, which `just check` runs through the `rust-tests` step. The Python fixture checker still checks shape only.
 
 | Cases | Contract stage | Expected result |
 | --- | --- | --- |

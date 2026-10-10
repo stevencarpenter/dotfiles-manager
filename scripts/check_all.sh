@@ -3,7 +3,7 @@
 # Usage: check_all.sh [step ...]   steps: fixtures scripts rust-style rust-tests (default: all)
 set -euo pipefail
 
-# Documentation fixtures only. Resolver expectations are not executed here.
+# Documentation fixtures only: shape and references. The resolver cases run in step rust-tests.
 step_fixtures() {
     uv run scripts/check_examples.py
 }
