@@ -41,7 +41,8 @@ fn finish(dir: &Path, digest: &str) {
             let text = fs::read(&p).unwrap();
             let text = String::from_utf8_lossy(&text)
                 .replace("@TOOLCHAIN_TREE@", digest)
-                .replace("@CR@", "\r");
+                .replace("@CR@", "\r")
+                .replace("@NUL@", "\0");
             fs::write(p.with_extension(""), text.as_bytes()).unwrap();
             fs::remove_file(&p).unwrap();
         }
@@ -196,5 +197,28 @@ fn shell_checker_and_manager_agree_on_every_fixture() {
         failures.len(),
         cases.len(),
         failures.join("\n")
+    );
+}
+
+#[test]
+fn unreadable_directory_in_the_staged_tree_is_refused_by_both_checkers() {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = TempDir::new("unreadable");
+    let (home, stage) = materialize(&fixtures().join("cases/ok-base"), tmp.path());
+    let hidden = stage.join("crates/b");
+    fs::set_permissions(&hidden, fs::Permissions::from_mode(0o000)).unwrap();
+    let (m, s) = (run_manager(&home, &stage), run_script(&home, &stage));
+    fs::set_permissions(&hidden, fs::Permissions::from_mode(0o755)).unwrap();
+    assert_eq!(
+        (m.code, m.verdict()),
+        (3, "E_SOURCE_UNTRUSTED".into()),
+        "manager: {}",
+        m.stderr
+    );
+    assert_eq!(
+        (s.code, s.verdict()),
+        (3, "E_SOURCE_UNTRUSTED".into()),
+        "script: {}",
+        s.stderr
     );
 }

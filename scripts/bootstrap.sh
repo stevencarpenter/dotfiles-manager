@@ -93,12 +93,14 @@ function array(   c) {
   VK = "a"
 }
 function inline(key,   sk, c) {
-  P++; ws()
+  P++; ws(); delete SUBS
   if (substr(S, P, 1) == "}") { P++; VK = "t"; return }
   while (1) {
     ws()
     if (!match(substr(S, P), /^[A-Za-z0-9_-]+/)) bad("inline table key")
     sk = substr(S, P, RLENGTH); P += RLENGTH; ws()
+    if (sk in SUBS) bad("duplicate inline table key")
+    SUBS[sk] = 1
     if (substr(S, P, 1) != "=") bad("inline table syntax")
     P++; ws()
     if (substr(S, P, 1) == "[") array(); else scalar()
@@ -119,11 +121,15 @@ function header(   arr, name, cl) {
   if (substr(S, P, length(cl)) != cl) bad("table header")
   P += length(cl); ws()
   if (P <= length(S) && substr(S, P, 1) != "#") bad("text after header")
+  if (!arr) { if (name in TABLES) bad("duplicate table"); TABLES[name] = 1 }
+  delete KEYS
   on_header(name, arr)
 }
 function pair(   key, c) {
   if (!match(S, /^[A-Za-z0-9_-]+/)) bad("key")
   key = substr(S, 1, RLENGTH); P = RLENGTH + 1; ws()
+  if (key in KEYS) bad("duplicate key")
+  KEYS[key] = 1
   if (substr(S, P, 1) != "=") bad("expected =")
   P++; ws(); c = substr(S, P, 1)
   if (c == "[") array(); else if (c == "{") inline(key); else scalar()
@@ -178,7 +184,8 @@ function on_pair(key,   i) {
     if (VK == "t") bad("inline table in dependency table")
   } else {
     if (VK == "t" && (key in DENY)) bad("table-valued key " key)
-    if (TABLE == "workspace" && (key == "members" || key == "exclude")) {
+    if (VK == "s" && (key == "build" || key == "workspace") && !pathok(VS, DEPTH)) bad(key " escapes the staged tree")
+    if (TABLE == "workspace" && (key == "members" || key == "exclude" || key == "default-members")) {
       if (VK != "a") bad(key " is not an array")
       for (i = 1; i <= ARRN; i++) if (ARR[i] == "\001" || !pathok(ARR[i], DEPTH)) bad(key " entry escapes the staged tree")
     }
@@ -254,13 +261,14 @@ run_awk() {
   _stage=$1 _rel=$2 _prog=$3; shift 3
   _file=$_stage/$_rel
   [ "$(wc -c < "$_file" | tr -d ' ')" -le 1048576 ] || refuse E_SOURCE_UNTRUSTED "$_rel exceeds 1 MiB"
-  ! grep -q "[^ -~$TAB]" "$_file" || refuse E_SOURCE_UNTRUSTED "$_rel: non-ASCII or control character"
+  [ "$(tr -d ' -~\t\n' < "$_file" | wc -c | tr -d ' ')" -eq 0 ] || refuse E_SOURCE_UNTRUSTED "$_rel: non-ASCII or control character"
   awk -v "FN=$_rel" "$@" "$_prog" "$_file" || return 1
 }
 
 controls_staged() { # $1 stage; sets PIN and TREE
   stage=$1
   [ -d "$stage" ] && [ ! -L "$stage" ] || refuse E_SOURCE_UNTRUSTED "staged tree is not a directory"
+  [ -z "$(cd "$stage" && find . 2>&1 >/dev/null)" ] || refuse E_SOURCE_UNTRUSTED "unreadable entry in staged tree"
   odd=$(cd "$stage" && find . ! -name . ! -type f ! -type d -print | head -n 1)
   [ -z "$odd" ] || refuse E_SOURCE_UNTRUSTED "symlink or special file in staged tree: $odd"
   bad=$(cd "$stage" && { find . -name "*$NL*" -print; find . -print | grep '[^ -~]' || true; } | head -n 1)
@@ -271,17 +279,23 @@ controls_staged() { # $1 stage; sets PIN and TREE
   [ -f "$stage/Cargo.lock" ] || refuse E_SOURCE_UNTRUSTED "Cargo.lock missing"
   out=$(run_awk "$stage" Cargo.lock "$CARGO_LOCK_AWK") || refuse_out "$out"
   list=$(cd "$stage" && find . -type f | sort)
+  # Names are matched case-insensitively because the file system is.
+  clash=$(printf '%s\n' "$list" | awk '{ sub(/^\.\//, ""); n = split($0, c, "/"); p = ""
+    for (i = 1; i <= n; i++) { p = (i > 1 ? p "/" : "") c[i]; k = tolower(p)
+      if (!(k in S)) S[k] = p; else if (S[k] != p) { print p; exit } } }')
+  [ -z "$clash" ] || refuse E_SOURCE_UNTRUSTED "$clash: differs from another path only in case"
   while IFS= read -r f; do
     f=${f#./}
-    case $f in
+    lf=$(printf '%s' "$f" | tr 'A-Z' 'a-z')
+    case $lf in
       .cargo/config.toml|.cargo/config|*/.cargo/config.toml|*/.cargo/config)
         refuse E_SOURCE_UNTRUSTED "$f: cargo configuration in staged tree" ;;
     esac
-    case ${f##*/} in
+    case ${lf##*/} in
       rust-toolchain) refuse E_SOURCE_UNTRUSTED "$f: legacy rust-toolchain file" ;;
       rust-toolchain.toml)
         out=$(run_awk "$stage" "$f" "$SCAN$TOOLCHAIN_RULES" -v "PINV=$PIN") || refuse_out "$out" ;;
-      Cargo.toml)
+      cargo.toml)
         depth=$(printf '%s' "$f" | tr -cd / | wc -c | tr -d ' ')
         out=$(run_awk "$stage" "$f" "$SCAN$MANIFEST_RULES" -v "DEPTH=$depth") || refuse_out "$out" ;;
     esac
@@ -291,26 +305,32 @@ EOF
 }
 
 # Prints the toolchain tree digest of $1 (docs/architecture.md section 8, item 4a).
+# Fails closed: any unreadable entry, failed hash, bad symlink or empty tree is an error,
+# never a digest of the entries that happened to be readable.
 toolchain_digest() (
   cd "$1" || exit 1
+  [ -z "$(find . 2>&1 >/dev/null)" ] || exit 1
   [ -z "$(find . ! -name . ! -type f ! -type d ! -type l -print | head -n 1)" ] || exit 1
   [ -z "$(find . -name "*$NL*" -print | head -n 1)" ] || exit 1
   ! find . -print | grep -q '[^ -~]' || exit 1
-  {
-    find . -type f ! -perm -u+x -print0 | xargs -0 -r /usr/bin/shasum -a 256 |
-      awk '{ h = $1; sub(/^[0-9a-f]+  \.\//, ""); printf "%s\tfile\t%s\n", $0, h }'
-    find . -type f -perm -u+x -print0 | xargs -0 -r /usr/bin/shasum -a 256 |
-      awk '{ h = $1; sub(/^[0-9a-f]+  \.\//, ""); printf "%s\texec\t%s\n", $0, h }'
-    find . -type l | while IFS= read -r l; do printf '%s\t%s\n' "${l#./}" "$(readlink "$l")"; done |
-      awk -F'\t' '
-        NF != 2 || $2 ~ /[^ -~]/ || $2 == "" || substr($2, 1, 1) == "/" || substr($2, 1, 1) == "~" || index($2, "\\") > 0 { exit 1 }
-        { d = gsub(/\//, "/", $1); n = split($2, c, "/"); seen = 0
-          for (i = 1; i <= n; i++) {
-            if (c[i] == "" || c[i] == ".") continue
-            if (c[i] == "..") { if (seen) exit 1; d--; if (d < 0) exit 1 } else seen = 1
-          }
-          printf "%s\tsymlink\t%s\n", $1, $2 }'
-  } | sort | while IFS=$TAB read -r p c v; do printf '%s\0%s\0%s\n' "$p" "$c" "$v"; done |
+  nf=$(find . -type f | wc -l); nl=$(find . -type l | wc -l)
+  [ "$nf" -gt 0 ] || exit 1
+  plain=$(find . -type f ! -perm -u+x -print0 | xargs -0 -r /usr/bin/shasum -a 256 |
+    awk '{ h = $1; sub(/^[0-9a-f]+  \.\//, ""); printf "%s\tfile\t%s\n", $0, h }')
+  execs=$(find . -type f -perm -u+x -print0 | xargs -0 -r /usr/bin/shasum -a 256 |
+    awk '{ h = $1; sub(/^[0-9a-f]+  \.\//, ""); printf "%s\texec\t%s\n", $0, h }')
+  links=$(find . -type l | while IFS= read -r l; do printf '%s\t%s\n' "${l#./}" "$(readlink "$l")"; done |
+    awk -F'\t' '
+      NF != 2 || $2 ~ /[^ -~]/ || $2 == "" || substr($2, 1, 1) == "/" || substr($2, 1, 1) == "~" || index($2, "\\") > 0 { exit 1 }
+      { d = gsub(/\//, "/", $1); n = split($2, c, "/"); seen = 0
+        for (i = 1; i <= n; i++) {
+          if (c[i] == "" || c[i] == ".") continue
+          if (c[i] == "..") { if (seen) exit 1; d--; if (d < 0) exit 1 } else seen = 1
+        }
+        printf "%s\tsymlink\t%s\n", $1, $2 }')
+  entries=$(printf '%s\n%s\n%s\n' "$plain" "$execs" "$links" | grep .) || exit 1
+  [ "$(printf '%s\n' "$entries" | wc -l | tr -d ' ')" -eq $((nf + nl)) ] || exit 1
+  printf '%s\n' "$entries" | sort | while IFS=$TAB read -r p c v; do printf '%s\0%s\0%s\n' "$p" "$c" "$v"; done |
     /usr/bin/shasum -a 256 | cut -d' ' -f1
 )
 
@@ -319,7 +339,7 @@ controls_toolchain() { # uses PIN, TREE, DATA
   [ -d "$TC" ] && [ ! -L "$TC" ] ||
     refuse E_TOOLCHAIN_MISMATCH "toolchain $PIN is absent at $TC; install exactly that version there (official Rust release distribution)"
   got=$(toolchain_digest "$TC") || got=
-  [ "$got" = "$TREE" ] || refuse E_TOOLCHAIN_MISMATCH "toolchain $PIN tree digest differs from the lock"
+  [ -n "$PIN" ] && [ -n "$TREE" ] && [ -n "$got" ] && [ "$got" = "$TREE" ] || refuse E_TOOLCHAIN_MISMATCH "toolchain $PIN tree digest differs from the lock"
 }
 
 controls_ancestors() { # uses CACHE
@@ -365,8 +385,6 @@ cmd_install() {
   # Read-only prerequisite and identity checks come first.
   head=$(git_clean -C "$src" rev-parse HEAD 2>/dev/null) || refuse E_SOURCE_UNTRUSTED "source is not a git checkout"
   [ "$head" = "$commit" ] || refuse E_SOURCE_UNTRUSTED "source is at $head, expected $commit"
-  [ -z "$(git_clean -C "$src" status --porcelain --untracked-files=all)" ] ||
-    refuse E_SOURCE_UNTRUSTED "source checkout has uncommitted or untracked files"
   # Early, read-only hint of the pin so a missing toolchain is refused before any mutation.
   # The real parse and every other check run later on the staged copy.
   hint=$(git_clean -C "$src" cat-file blob HEAD:dotfiles-manager.lock 2>/dev/null |
@@ -390,7 +408,10 @@ cmd_install() {
   bin=$build/target/release/dotfiles-manager
   mkdir -p "$build/fixture"
   tcrun "$bin" self-check --fixture-dir "$build/fixture" >/dev/null || { echo "error: self-check failed" >&2; exit 1; }
-  set -- $(tcrun "$bin" --version); semver=$2
+  ver=$(tcrun "$bin" --version) || { echo "error: the built binary did not run" >&2; exit 1; }
+  case $ver in "dotfiles-manager "*" (commit $commit)") ;; *) echo "error: the built binary reports a different identity: $ver" >&2; exit 1 ;; esac
+  semver=${ver#dotfiles-manager }; semver=${semver%% *}
+  case $semver in ""|*[!0-9.]*) echo "error: unexpected version $semver" >&2; exit 1 ;; esac
   name=$semver-$(printf '%s' "$commit" | cut -c1-12)
   mkdir -p "$DATA/versions/$name" "$HOME_DIR/.local/bin"
   cp "$bin" "$DATA/versions/$name/dotfiles-manager.new"; chmod 755 "$DATA/versions/$name/dotfiles-manager.new"
@@ -428,7 +449,8 @@ case $cmd in
   uninstall) cmd_uninstall ;;
   toolchain-digest) # prints the value for [manager].toolchain_tree_sha256 in dotfiles-manager.lock
     [ -d "${dir:-}" ] || usage "toolchain-digest needs --dir <installed toolchain>"
-    toolchain_digest "$dir" || refuse E_TOOLCHAIN_MISMATCH "cannot digest $dir" ;;
+    d=$(toolchain_digest "$dir") && [ -n "$d" ] || refuse E_TOOLCHAIN_MISMATCH "cannot digest $dir"
+    printf '%s\n' "$d" ;;
   check-controls)
     [ -n "$src" ] || usage "check-controls needs --source"
     resolve_home; controls "$src"; echo "build controls ok" ;;

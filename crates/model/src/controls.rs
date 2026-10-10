@@ -5,6 +5,8 @@
 //! `scripts/bootstrap.sh` implements the same grammar and rules in awk. The two
 //! must agree on every fixture in `tests/fixtures/build-controls` (docs/bootstrap.md).
 
+use std::collections::{BTreeMap, HashSet};
+
 pub const MAX_FILE_BYTES: u64 = 1 << 20;
 
 const DEP_TABLES: [&str; 3] = ["dependencies", "dev-dependencies", "build-dependencies"];
@@ -173,9 +175,13 @@ impl Cur<'_> {
             self.p += 1;
             return Ok(Val::Tbl);
         }
+        let mut subs = HashSet::new();
         loop {
             self.ws();
             let sk = self.bare().ok_or("inline table key")?;
+            if !subs.insert(sk.clone()) {
+                return Err("duplicate inline table key".into());
+            }
             self.ws();
             if self.peek() != Some(b'=') {
                 return Err("inline table syntax".into());
@@ -214,17 +220,27 @@ fn valid_table_name(n: &str) -> bool {
             .all(|s| !s.is_empty() && s.bytes().all(is_bare))
 }
 
+/// Names already seen: duplicate tables and keys are refused, because a TOML reader
+/// that rejects them and one that keeps the last value would disagree about the file.
+#[derive(Default)]
+struct Seen {
+    tables: HashSet<String>,
+    keys: HashSet<String>,
+}
+
 fn scan(text: &str, h: &mut dyn Hooks) -> Res {
     if !ascii_only(text.as_bytes()) {
         return Err("non-ASCII or control character".into());
     }
+    let mut seen = Seen::default();
     for (i, raw) in text.split('\n').enumerate() {
-        scan_line(raw.trim_matches([' ', '\t']), h).map_err(|e| format!("line {}: {e}", i + 1))?;
+        scan_line(raw.trim_matches([' ', '\t']), h, &mut seen)
+            .map_err(|e| format!("line {}: {e}", i + 1))?;
     }
     Ok(())
 }
 
-fn scan_line(line: &str, h: &mut dyn Hooks) -> Res {
+fn scan_line(line: &str, h: &mut dyn Hooks, seen: &mut Seen) -> Res {
     if line.is_empty() || line.starts_with('#') {
         return Ok(());
     }
@@ -253,9 +269,16 @@ fn scan_line(line: &str, h: &mut dyn Hooks) -> Res {
         }
         c.p += close.len();
         trailing(&mut c, "header")?;
+        if !array && !seen.tables.insert(name.to_string()) {
+            return Err("duplicate table".into());
+        }
+        seen.keys.clear();
         return h.header(name, array);
     }
     let key = c.bare().ok_or("key")?;
+    if !seen.keys.insert(key.clone()) {
+        return Err("duplicate key".into());
+    }
     c.ws();
     if c.peek() != Some(b'=') {
         return Err("expected =".into());
@@ -365,7 +388,15 @@ impl Hooks for ManifestRules {
                 if *v == Val::Tbl && DENY_TABLE_VALUES.contains(&key) {
                     return Err(format!("table-valued key {key}"));
                 }
-                if self.table == "workspace" && (key == "members" || key == "exclude") {
+                if let Val::Str(s) = v
+                    && (key == "build" || key == "workspace")
+                    && !path_ok(s, self.depth)
+                {
+                    return Err(format!("{key} escapes the staged tree"));
+                }
+                if self.table == "workspace"
+                    && (key == "members" || key == "exclude" || key == "default-members")
+                {
                     let Val::Arr(items) = v else {
                         return Err(format!("{key} is not an array"));
                     };
@@ -574,6 +605,30 @@ pub fn check_cargo_lock(text: &str) -> Res {
     Ok(())
 }
 
+/// Cargo, rustup and the file system treat names case-insensitively on macOS. A name
+/// that differs only in case from another path would let a config file hide, so
+/// two paths (or directory prefixes) that fold to the same name are refused.
+pub fn case_collision<'a>(files: impl IntoIterator<Item = &'a str>) -> Option<String> {
+    let mut seen: BTreeMap<String, String> = BTreeMap::new();
+    for f in files {
+        let mut prefix = String::new();
+        for part in f.split('/') {
+            if !prefix.is_empty() {
+                prefix.push('/');
+            }
+            prefix.push_str(part);
+            match seen.get(&prefix.to_ascii_lowercase()) {
+                Some(prev) if *prev != prefix => return Some(prefix),
+                Some(_) => {}
+                None => {
+                    seen.insert(prefix.to_ascii_lowercase(), prefix.clone());
+                }
+            }
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -626,6 +681,11 @@ mod tests {
         );
         assert_eq!(parse_source_lock(&lock).unwrap(), ("1.2.3".into(), sha));
         assert!(parse_source_lock("schema = 1\n").is_err());
+        assert_eq!(
+            case_collision(["crates/a/x", "crates/A/y"]),
+            Some("crates/A".into())
+        );
+        assert_eq!(case_collision(["a/x", "a/y", "b"]), None);
         assert!(check_toolchain_file("[toolchain]\nchannel = \"1.2.3\"\n", "1.2.3").is_ok());
         assert!(check_toolchain_file("[toolchain]\nchannel = \"1.2.4\"\n", "1.2.3").is_err());
         assert!(

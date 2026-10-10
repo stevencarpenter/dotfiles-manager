@@ -8,7 +8,7 @@ Task: DFM-14. This document records what the first implementation does and where
 | --- | --- |
 | Workspace crates `dfm-model` (pure data and rules), `dfm-platform-macos` (HOME, paths, platform check), `dfm-cli` (binary `dotfiles-manager`) | `crates/` |
 | POSIX sh bootstrap and build-controls checker | `scripts/bootstrap.sh` |
-| Shared checker fixtures (69 cases) | `tests/fixtures/build-controls/` |
+| Shared checker fixtures (85 cases) | `tests/fixtures/build-controls/` |
 
 `ports`, `adapters` and `engine` are not created yet. No task needs them.
 
@@ -30,7 +30,7 @@ dotfiles-manager self-check --build-controls <staged tree> | --fixture-dir <dir>
 
 ## Source and build identity
 
-- A source identity is the git commit plus the recomputed tree digest. `bootstrap.sh install` requires `--commit <40 hex>`. It refuses unless `HEAD` equals that commit and the checkout has no uncommitted or untracked files. Git runs with the scrubbed environment from the contract.
+- A source identity is the git commit plus the recomputed tree digest. `bootstrap.sh install` requires `--commit <40 hex>` and refuses unless `HEAD` equals it. Git runs with the scrubbed environment from the contract. The script runs no `git status`, because that would run filters configured in the repository (tested). Uncommitted files are ignored: only `HEAD` is built.
 - The build input is `git archive HEAD` extracted into the build directory, not the working tree.
 - The script sets `DFM_BUILD_COMMIT` for the build. `--version` prints `dotfiles-manager <semver> (commit <sha>)`. The installed directory is `versions/<semver>-<first 12 of commit>`.
 - The binary SHA-256 is printed after install as a record only. Builds are not claimed to be reproducible.
@@ -52,7 +52,9 @@ The running manager is never replaced in place, so an upgrade does not depend on
 
 The checker reads only: comments; `[a.b]` and `[[a.b]]` headers with bare names; `key = value` with a bare key and a single-line string without escapes, boolean, integer, array or inline table of those. It refuses everything else, including multi-line values, dotted or quoted keys, floats and dates, non-ASCII bytes, CR, and files over 1 MiB.
 
-Rules: no `.cargo/config.toml` or `.cargo/config` at any level; no `rust-toolchain` file; every `rust-toolchain.toml` must contain only `channel` equal to the lock pin; every `path`, `members` and `exclude` value must stay inside the root (a `..` after a normal component is refused); `git`, `registry` and unlisted dependency keys are refused; `[replace]` is refused; `[patch]` is allowed only for `crates-io`; `Cargo.lock` lines must be recognised and any `source` must be crates.io; symlinks and special files in the tree are refused.
+Rules: names are matched case-insensitively, and two paths that differ only in case are refused (the macOS file system folds case); duplicate tables, keys and inline keys are refused; no `.cargo/config.toml` or `.cargo/config` at any level; no `rust-toolchain` file; every `rust-toolchain.toml` must contain only `channel` equal to the lock pin; every `path`, `members`, `exclude`, `default-members`, `build` and `workspace` string must stay inside the root (a `..` after a normal component is refused); `git`, `registry` and unlisted dependency keys are refused; `[replace]` is refused; `[patch]` is allowed only for `crates-io`; `Cargo.lock` lines must be recognised and any `source` must be crates.io; symlinks and special files in the tree are refused.
+
+The checker and `toolchain-digest` fail closed: an unreadable entry, a failed hash, a bad symlink or an empty toolchain is a refusal, never a digest of the readable part. After the build the script requires the binary to report exactly `dotfiles-manager <digits.dots> (commit <the verified commit>)` before it names the install directory.
 
 ## Differences from the contract
 
@@ -61,7 +63,7 @@ Rules: no `.cargo/config.toml` or `.cargo/config` at any level; no `rust-toolcha
 3. **Binding location.** The binding is at `~/.config/dotfiles-manager/machine.toml` as contract section 5 says, not in the state directory. Durable binding storage in state belongs to DFM-17 (C07 is not claimed).
 4. **New error codes** beyond the contract list: `E_PLATFORM_UNSUPPORTED`, `E_REBIND_UNSUPPORTED`, `E_BINDING_INVALID`, `E_PROFILE_INVALID`, `E_USAGE`, `E_PREREQ_MISSING` (script only).
 5. **Tree digest framing.** Each entry is `path NUL class NUL value LF`; the contract does not fix the terminator. The class `exec` means the owner execute bit is set.
-6. **Test hooks in the script.** With `DFM_BOOTSTRAP_TEST=1` the script reads `DFM_TEST_HOME`, `DFM_TEST_OS` and `DFM_TEST_ARCH` in place of `dscl` and `uname`. They exist so tests can use a temporary HOME. Without the variable the script uses the password database, and a temporary HOME gives `E_HOME_MISMATCH` (tested).
+6. **Test hooks in the script.** With `DFM_BOOTSTRAP_TEST=1` the script reads `DFM_TEST_HOME`, `DFM_TEST_OS` and `DFM_TEST_ARCH` in place of `dscl` and `uname`. They exist so tests can use a temporary HOME. A caller who can set them already controls the user's environment; they are not an integrity boundary. Without the variable the script uses the password database, and a temporary HOME gives `E_HOME_MISMATCH` (tested).
 7. **Cache location.** `cache_dir()` is `~/.cache/dotfiles-manager`; the contract leaves it open. The script and `dfm-platform-macos` hard-code the same literal and a test compares them.
 8. **Signals.** The CLI does not catch SIGINT or SIGTERM; no command yet runs long enough to need a receipt.
 9. **Fetch.** `cargo fetch --locked` runs with crates.io as the only registry in an empty `CARGO_HOME`. The install test therefore needs network access.
@@ -69,3 +71,5 @@ Rules: no `.cargo/config.toml` or `.cargo/config` at any level; no `rust-toolcha
 ## Not verified
 
 Device behavior on the personal M5 and work M3 (DG-1, C09): Cargo configuration discovery with the pinned Cargo, whether the empty build environment suffices on each device's Command Line Tools, ad-hoc signing under device policy, the Command Line Tools install poll, and the real toolchain digest. The install test used a minimal copy of the authoring machine's toolchain, not an official release distribution install. The channel manifest digest is carried in the lock format but not checked by this script (toolchain install is a later typed operation).
+
+The differential test cannot place two paths that differ only in case on this file system, so the case-collision rule is covered by a unit test in `dfm-model` and by manual reasoning for the awk version only.

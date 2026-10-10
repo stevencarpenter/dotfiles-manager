@@ -124,7 +124,7 @@ fn home_must_match_the_password_database() {
 }
 
 #[test]
-fn missing_toolchain_wrong_commit_and_dirty_source_are_refused_before_mutation() {
+fn missing_toolchain_wrong_commit_and_hostile_repo_config_are_refused_before_mutation() {
     let tmp = TempDir::new("script-prereq");
     let home = tmp.path().join("home");
     fs::create_dir(&home).unwrap();
@@ -147,10 +147,27 @@ fn missing_toolchain_wrong_commit_and_dirty_source_are_refused_before_mutation()
     assert_eq!(o.status.code(), Some(3));
     assert!(err(&o).contains("E_SOURCE_UNTRUSTED"), "{}", err(&o));
 
-    fs::write(src.join("extra"), "x").unwrap();
+    // Repository-local configuration must never run code: a clean filter would run on `git status`.
+    let marker = tmp.path().join("filter-ran");
+    fs::write(src.join(".gitattributes"), "* filter=evil\n").unwrap();
+    fs::write(
+        src.join("dotfiles-manager.lock"),
+        "changed so git must re-hash it\n",
+    )
+    .unwrap();
+    let mut cfg = fs::OpenOptions::new()
+        .append(true)
+        .open(src.join(".git/config"))
+        .unwrap();
+    std::io::Write::write_all(
+        &mut cfg,
+        format!("[filter \"evil\"]\n\tclean = touch {}\n", marker.display()).as_bytes(),
+    )
+    .unwrap();
     let o = script_test_mode(&home, &["install", "--source", s, "--commit", &sha], &[]);
+    assert!(!marker.exists(), "repository configuration executed code");
     assert_eq!(o.status.code(), Some(3));
-    assert!(err(&o).contains("uncommitted or untracked"), "{}", err(&o));
+    assert!(err(&o).contains("E_TOOLCHAIN_MISMATCH"), "{}", err(&o));
 
     for bad in [
         vec!["install"],
@@ -167,6 +184,48 @@ fn missing_toolchain_wrong_commit_and_dirty_source_are_refused_before_mutation()
     assert!(
         entries_below(&home).is_empty(),
         "refusals must precede any write"
+    );
+}
+
+#[test]
+fn toolchain_digest_fails_closed_instead_of_dropping_unreadable_entries() {
+    let tmp = TempDir::new("digest-closed");
+    let home = tmp.path().join("home");
+    let tc = tmp.path().join("tc");
+    fs::create_dir_all(&home).unwrap();
+    fs::create_dir_all(tc.join("bin")).unwrap();
+    fs::write(tc.join("bin/a"), "a").unwrap();
+    fs::write(tc.join("bin/b"), "b").unwrap();
+    let ok = script_test_mode(
+        &home,
+        &["toolchain-digest", "--dir", tc.to_str().unwrap()],
+        &[],
+    );
+    assert_eq!(ok.status.code(), Some(0));
+    fs::set_permissions(tc.join("bin/b"), fs::Permissions::from_mode(0o000)).unwrap();
+    let o = script_test_mode(
+        &home,
+        &["toolchain-digest", "--dir", tc.to_str().unwrap()],
+        &[],
+    );
+    assert_eq!(
+        o.status.code(),
+        Some(3),
+        "a partial digest was printed: {}",
+        String::from_utf8_lossy(&o.stdout)
+    );
+    assert!(o.stdout.is_empty());
+    let empty = tmp.path().join("empty");
+    fs::create_dir(&empty).unwrap();
+    let o = script_test_mode(
+        &home,
+        &["toolchain-digest", "--dir", empty.to_str().unwrap()],
+        &[],
+    );
+    assert_eq!(
+        o.status.code(),
+        Some(3),
+        "an empty toolchain must not produce a digest"
     );
 }
 

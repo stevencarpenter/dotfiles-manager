@@ -101,9 +101,16 @@ fn staged_tree(stage: &Path) -> Result<(String, String), Refusal> {
     }
     controls::check_cargo_lock(&read_bounded(&stage.join("Cargo.lock"), "Cargo.lock")?)
         .map_err(|e| untrusted(format!("Cargo.lock: {e}")))?;
+    if let Some(p) = controls::case_collision(nodes.iter().map(|(p, _)| p.as_str())) {
+        return Err(untrusted(format!(
+            "{p}: differs from another path only in case"
+        )));
+    }
     for (rel, _) in &nodes {
-        let base = rel.rsplit('/').next().unwrap_or(rel);
-        let in_cargo_dir = rel.rsplit('/').nth(1) == Some(".cargo");
+        // Names are matched case-insensitively because the file system is.
+        let lower = rel.to_ascii_lowercase();
+        let base = lower.rsplit('/').next().unwrap_or(&lower);
+        let in_cargo_dir = lower.rsplit('/').nth(1) == Some(".cargo");
         if in_cargo_dir && (base == "config.toml" || base == "config") {
             return Err(untrusted(format!(
                 "{rel}: cargo configuration in staged tree"
@@ -117,7 +124,7 @@ fn staged_tree(stage: &Path) -> Result<(String, String), Refusal> {
                 controls::check_toolchain_file(&read_bounded(&stage.join(rel), rel)?, &pin)
                     .map_err(|e| untrusted(format!("{rel}: {e}")))?
             }
-            "Cargo.toml" => {
+            "cargo.toml" => {
                 let depth = rel.matches('/').count();
                 controls::check_manifest(&read_bounded(&stage.join(rel), rel)?, depth)
                     .map_err(|e| untrusted(format!("{rel}: {e}")))?;
