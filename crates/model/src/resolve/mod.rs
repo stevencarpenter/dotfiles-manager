@@ -3,11 +3,13 @@
 
 mod docs;
 mod error;
+mod explain;
 mod pointer;
 mod schema;
 mod source;
 
 pub use error::ResolveError;
+pub use explain::explain;
 pub use schema::{AdapterCatalog, AdapterSpec, Claims, Field, Schema, TargetRule};
 pub use source::{Entry, SourceSet};
 mod compose;

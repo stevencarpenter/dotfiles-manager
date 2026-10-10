@@ -20,6 +20,7 @@ dfm-platform-macos = { workspace = true }
 sha2 = { workspace = true }
 
 [dev-dependencies]
+serde_json = { workspace = true }
 # Resolver tests parse and patch fixture documents in memory. Already an accepted direct crate.
 toml = { workspace = true }
 
@@ -39,8 +40,9 @@ required-features = ["test-isolation"]
 name = "build_controls"
 required-features = ["test-isolation"]
 
-[dev-dependencies]
-serde_json = { workspace = true }
+[[test]]
+name = "explain"
+required-features = ["test-isolation"]
 
 [lints]
 workspace = true
