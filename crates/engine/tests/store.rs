@@ -726,7 +726,13 @@ fn writes_over_the_size_caps_are_refused_before_anything_is_written() {
         })
         .collect();
     r.result.counts = dfm_model::state::count_statuses(&r.operations);
-    assert_eq!(code(s.write_receipt(&r)), Code::LimitExceeded);
+    let err = s.write_receipt(&r).unwrap_err();
+    assert_eq!(err.code, Code::LimitExceeded);
+    assert!(
+        err.detail.contains("the write cap is 4194304"),
+        "{}",
+        err.detail
+    );
     assert!(
         fs::read_dir(h.0.join(".local/state/dotfiles-manager/state/receipts"))
             .unwrap()
@@ -752,7 +758,7 @@ fn writes_over_the_size_caps_are_refused_before_anything_is_written() {
 }
 
 #[test]
-fn many_processes_creating_the_lock_at_once_only_ever_see_locked() {
+fn many_concurrent_open_writers_only_ever_see_locked_or_success() {
     let h = Home::new();
     let results: Vec<_> = std::thread::scope(|sc| {
         let tasks: Vec<_> = (0..16)
@@ -766,4 +772,155 @@ fn many_processes_creating_the_lock_at_once_only_ever_see_locked() {
             assert_eq!(e.code, Code::Locked, "{e}");
         }
     }
+}
+
+#[test]
+fn a_receipt_with_an_operation_that_never_ran_is_written_and_read_back() {
+    let h = Home::new();
+    let (s, stamp) = init(&h);
+    let mut r = receipt(&stamp, "run-2", vec![]);
+    let mut never = r.operations[0].clone();
+    never.id = "op2".into();
+    never.status = dfm_model::state::Status::NotStarted;
+    never.started_at = None;
+    never.finished_at = None;
+    r.operations.push(never);
+    r.result.counts = dfm_model::state::count_statuses(&r.operations);
+    s.write_receipt(&r).unwrap();
+    let loaded = s.load();
+    assert_eq!(loaded.receipts.len(), 1);
+    assert_eq!(loaded.receipts[0].1.as_ref().unwrap(), &r);
+}
+
+#[test]
+fn claims_under_a_missing_reserved_parent_are_refused_even_by_unicode_alias() {
+    let h = Home::new();
+    let (s, stamp) = init(&h);
+    let home = h.0.to_str().unwrap().to_string();
+    // Fresh HOME: .local/share and the data directory do not exist at all.
+    assert!(!h.0.join(".local/share").exists());
+    for bad in [
+        format!("{home}/.local/\u{17f}hare/dotfiles-manager/new"),
+        format!("{home}/.local/share/dotfiles-manager/new"),
+        format!("{home}/.CACHE/DOTFILE\u{17f}-MANAGER/build"),
+    ] {
+        let mut l = ledger_with(&stamp, &h, "core.x", "a", 'a');
+        l.resources[0].owned_outputs[0].path = bad.clone();
+        assert_eq!(code(s.write_ledger(&l)), Code::StateInvalid, "{bad}");
+    }
+    // The same when only the parent exists.
+    fs::create_dir_all(h.0.join(".local/share")).unwrap();
+    let bad = format!("{home}/.local/\u{17f}hare/dotfiles-manager/new");
+    let mut l = ledger_with(&stamp, &h, "core.x", "a", 'a');
+    l.resources[0].owned_outputs[0].path = bad.clone();
+    assert_eq!(code(s.write_ledger(&l)), Code::StateInvalid, "{bad}");
+}
+
+#[test]
+fn a_hand_written_trial_with_foreign_paths_is_a_finding_not_a_trial() {
+    let h = Home::new();
+    let (s, stamp) = init(&h);
+    let dir = h.0.join(".local/state/dotfiles-manager/state/trials");
+    for (n, bad) in [
+        ("t1", "/etc/hosts".to_string()),
+        (
+            "t2",
+            h.0.join(".local/state/dotfiles-manager/state/state.json")
+                .to_str()
+                .unwrap()
+                .to_string(),
+        ),
+    ] {
+        let t = dfm_model::state::TrialRecord {
+            schema: 1,
+            binding: stamp.clone(),
+            trial_id: n.into(),
+            tool: "atuin".into(),
+            created_unix: 1,
+            baseline: dfm_model::state::Baseline {
+                tool_preexisting: false,
+                paths: vec![dfm_model::state::BaselinePath {
+                    path: bad,
+                    existed: false,
+                    sha256: None,
+                }],
+            },
+            owned_outputs: vec![],
+        };
+        let f = dir.join(format!("{n}.json"));
+        fs::write(&f, dfm_model::state::canonical(&t).unwrap()).unwrap();
+        fs::set_permissions(&f, fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    let loaded = s.load();
+    assert_eq!(loaded.trials.len(), 2);
+    assert!(
+        loaded
+            .trials
+            .iter()
+            .all(|(_, t)| t.as_ref().is_err_and(|e| e.code == Code::StateInvalid))
+    );
+}
+
+#[test]
+fn every_write_cap_is_enforced_before_anything_is_written() {
+    let h = Home::new();
+    let (s, stamp) = init(&h);
+    let state = h.0.join(".local/state/dotfiles-manager/state");
+    let home = h.0.to_str().unwrap();
+    // Ledger: many resources, each with a path.
+    let mut l = Ledger::empty(stamp.clone());
+    l.resources = (0..30_000)
+        .map(|i| LedgerResource {
+            resource: format!("core.{i}"),
+            adapter: "fs-link/v1".into(),
+            class: Class::Normal,
+            op_id: "op1".into(),
+            owned_outputs: vec![OwnedOutput {
+                path: format!("{home}/f{i}-{}", "x".repeat(150)),
+                mode: 0o600,
+                fingerprint: Some("a".repeat(64)),
+            }],
+        })
+        .collect();
+    let before = fs::read(state.join("ledger.json")).unwrap();
+    let e = s.write_ledger(&l).unwrap_err();
+    assert_eq!(e.code, Code::LimitExceeded, "{e}");
+    assert_eq!(fs::read(state.join("ledger.json")).unwrap(), before);
+    // Trial: a baseline with many long paths.
+    let t = dfm_model::state::TrialRecord {
+        schema: 1,
+        binding: stamp.clone(),
+        trial_id: "big".into(),
+        tool: "atuin".into(),
+        created_unix: 1,
+        baseline: dfm_model::state::Baseline {
+            tool_preexisting: false,
+            paths: (0..2_000)
+                .map(|i| dfm_model::state::BaselinePath {
+                    path: format!("{home}/{i}-{}", "y".repeat(2_100)),
+                    existed: false,
+                    sha256: None,
+                })
+                .collect(),
+        },
+        owned_outputs: vec![],
+    };
+    assert_eq!(code(s.write_trial(&t)), Code::LimitExceeded);
+    assert!(!state.join("trials/big.json").exists());
+    // Snapshot.
+    let big = vec![0u8; dfm_model::state::MAX_WRITE_BYTES + 1];
+    assert_eq!(
+        code(s.write_snapshot("run-1", "big", &big, Class::Normal)),
+        Code::LimitExceeded
+    );
+    assert!(!state.join("snapshots/run-1").exists());
+    // Journal: fill the file to the cap, then append through the real entry point.
+    let j = state.join("journal.jsonl");
+    let fill = vec![b'\n'; usize::try_from(dfm_model::state::MAX_JOURNAL_BYTES).unwrap() - 10];
+    fs::write(&j, &fill).unwrap();
+    fs::set_permissions(&j, fs::Permissions::from_mode(0o600)).unwrap();
+    let out = h.0.join("o").to_str().unwrap().to_string();
+    let e = s.append_journal(&intent("op1", &out)).unwrap_err();
+    assert_eq!(e.code, Code::LimitExceeded, "{e}");
+    assert_eq!(fs::read(&j).unwrap(), fill, "a full journal is left alone");
 }

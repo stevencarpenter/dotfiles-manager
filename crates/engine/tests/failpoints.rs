@@ -236,11 +236,33 @@ fn init_stops_if_the_staging_directory_is_replaced_before_the_rename() {
         fs::rename(root.join("state.next"), root.join("elsewhere")).unwrap();
         symlink(&foreign.0, root.join("state.next")).unwrap();
         fs::write(&release, "go").unwrap();
-        assert_eq!(code(init.join().unwrap()), Code::StorageInvalid);
+        let e = init.join().unwrap().unwrap_err();
+        assert_eq!(e.code, Code::StorageInvalid);
+        // The staging directory existed, so this refusal came after a mutation: exit 1, not 3.
+        assert!(e.mutated);
+        assert_eq!(e.exit(), dfm_model::Exit::Failed);
     });
+    assert!(s.mutated());
     assert!(
         !root.join("state").exists(),
         "the swapped directory was not published"
     );
     assert!(fs::read_dir(&foreign.0).unwrap().next().is_none());
+}
+
+#[test]
+fn a_refusal_before_anything_was_created_still_exits_3() {
+    let h = Home::new();
+    // Nothing exists and the caller may not create the root: state loss, a gate, no mutation.
+    let e = Store::open_write_with(sys(&h), &h.layout(), Fail::none(), false).unwrap_err();
+    assert_eq!(e.code, Code::StateInvalid);
+    assert!(!e.mutated);
+    assert_eq!(e.exit(), dfm_model::Exit::Blocked);
+    assert!(!h.0.join(".local").exists(), "nothing was created");
+    // A second writer meets the lock: also before any creation of its own.
+    let (first, _) = init(&h);
+    let e = Store::open_write(sys(&h), &h.layout(), Fail::none()).unwrap_err();
+    assert_eq!(e.exit(), dfm_model::Exit::Blocked);
+    assert!(!e.mutated);
+    drop(first);
 }

@@ -385,28 +385,36 @@ fn bind(ctx: &Ctx, profile: String, machine_id: String) -> Result<String, Refusa
     // Phase 2 writes under the manager lock and decides again, because another command may have
     // bound in between. The state records the identity first, so a crash between the two writes
     // can only be retried by the same identity.
-    let mut store =
-        Store::open_write_with(sys, &layout, state_cmd::fail_from_env()?, have.is_none())?;
-    let have = read_existing_binding(ctx)?;
+    // Phase 1 returned for an existing binding, so only an unbound machine gets here and may
+    // create the state root.
+    let mut store = Store::open_write_with(sys, &layout, state_cmd::fail_from_env()?, true)?;
+    // Whatever this call created (directories, the lock file, the staging directory) makes a
+    // later refusal a post-mutation one (exit 1). The store tracks that.
+    let stamped = |store: &Store, r: Refusal| {
+        if store.mutated() {
+            r.after_mutation()
+        } else {
+            r
+        }
+    };
+    let have = read_existing_binding(ctx).map_err(|r| stamped(&store, r))?;
     if let Some(h) = &have
         && !h.same_identity(&want)
     {
-        return Err(rebind_refusal(h));
+        return Err(stamped(&store, rebind_refusal(h)));
     }
     if have.is_some() && !store.is_initialized() {
-        return Err(state_lost_refusal());
+        return Err(stamped(&store, state_lost_refusal()));
     }
-    let inited = !store.is_initialized();
-    if inited {
-        store.init(&stamp)?;
-    } else {
-        let doc = store.read_state()?;
+    if store.is_initialized() {
+        let doc = store.read_state().map_err(|r| stamped(&store, r))?;
         if !doc.binding.same_identity(&stamp) {
-            return Err(state_owner_refusal(&doc.binding));
+            return Err(stamped(&store, state_owner_refusal(&doc.binding)));
         }
+    } else {
+        store.init(&stamp)?;
     }
-    // A refusal after this call created the state directory happened after a mutation (exit 1).
-    let after = |r: Refusal| if inited { r.after_mutation() } else { r };
+    let after = |r: Refusal| stamped(&store, r);
     if have.is_some() {
         return Ok("already bound".into());
     }

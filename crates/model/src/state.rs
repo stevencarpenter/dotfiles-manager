@@ -322,8 +322,9 @@ pub struct OperationRecord {
     /// Sensitivity class. A sensitive operation carries no `before` or `after`.
     pub class: Class,
     pub status: Status,
-    pub started_at: String,
-    pub finished_at: String,
+    /// Absent only for an operation that never ran (`not_started`, `not_in_scope`).
+    pub started_at: Option<String>,
+    pub finished_at: Option<String>,
     pub before: Option<Fingerprint>,
     pub after: Option<Fingerprint>,
     pub owned_outputs: Vec<String>,
@@ -503,9 +504,17 @@ impl Receipt {
             if !valid_id(&o.id) || !named(&o.resource) || !named(&o.adapter) {
                 return Err(bad(format!("operation {} has a malformed name", o.id)));
             }
+            let never_ran = matches!(o.status, Status::NotStarted | Status::NotInScope);
             for t in [&o.started_at, &o.finished_at] {
-                if parse_rfc3339(t).is_none() {
-                    return Err(bad(format!("operation {} time is malformed", o.id)));
+                let ok = match t {
+                    Some(t) => parse_rfc3339(t).is_some(),
+                    None => never_ran,
+                };
+                if !ok {
+                    return Err(bad(format!(
+                        "operation {} time is missing or malformed",
+                        o.id
+                    )));
                 }
             }
         }
@@ -868,19 +877,25 @@ impl TrialRecord {
 
 /// Where a claim may point: strictly inside HOME, and neither inside, equal to, nor an ancestor
 /// of a reserved manager path (state, config, lock, data, cache). Comparison is case-folded,
-/// because APFS is case-insensitive by default. Unicode normalization differences are not
-/// folded (a known limit).
+/// because APFS is case-insensitive by default, so it also holds when the reserved directory
+/// does not exist yet. Unicode normalization differences are not folded (a known limit).
 #[derive(Debug, Clone)]
 pub struct Scope {
     home: String,
     reserved: Vec<String>,
 }
 
+/// Case folding close to what APFS applies: upper then lower case maps the long s (U+017F) to
+/// `s`, the Kelvin sign to `k` and the sharp s to `ss`, which a plain lowercase does not.
+fn fold(s: &str) -> String {
+    s.to_uppercase().to_lowercase()
+}
+
 impl Scope {
     pub fn new(home: &str, reserved: &[String]) -> Scope {
         Scope {
-            home: home.to_lowercase(),
-            reserved: reserved.iter().map(|r| r.to_lowercase()).collect(),
+            home: fold(home),
+            reserved: reserved.iter().map(|r| fold(r)).collect(),
         }
     }
 
@@ -888,7 +903,7 @@ impl Scope {
         if !valid_path(path) {
             return false;
         }
-        let p = path.to_lowercase();
+        let p = fold(path);
         let inside = p
             .strip_prefix(&self.home)
             .is_some_and(|rest| rest.starts_with('/') && rest.len() > 1);
@@ -1029,8 +1044,8 @@ mod tests {
             adapter: "fs-link/v1".into(),
             class,
             status,
-            started_at: "2026-10-10T00:00:00Z".into(),
-            finished_at: "2026-10-10T00:00:01Z".into(),
+            started_at: Some("2026-10-10T00:00:00Z".into()),
+            finished_at: Some("2026-10-10T00:00:01Z".into()),
             before: None,
             after: None,
             owned_outputs: vec!["/h/.gitconfig".into()],
@@ -1322,6 +1337,33 @@ mod tests {
     }
 
     #[test]
+    fn an_operation_that_never_ran_has_no_times_and_one_that_ran_must() {
+        let mut o = op(Status::NotStarted, Class::Normal);
+        o.started_at = None;
+        o.finished_at = None;
+        assert!(receipt(vec![o.clone()]).validate().is_ok());
+        o.status = Status::NotInScope;
+        assert!(receipt(vec![o.clone()]).validate().is_ok());
+        for ran in [
+            Status::Updated,
+            Status::Failed,
+            Status::Pending,
+            Status::Unknown,
+        ] {
+            o.status = ran;
+            assert!(receipt(vec![o.clone()]).validate().is_err(), "{ran:?}");
+        }
+    }
+
+    #[test]
+    fn the_fold_catches_unicode_aliases_even_when_nothing_exists() {
+        let sc = Scope::new("/H", &["/H/.local/share/dotfiles-manager".to_string()]);
+        assert!(!sc.admits("/H/.local/\u{17f}hare/dotfiles-manager/new"));
+        assert!(!sc.admits("/H/.local/share/DOTFILE\u{17f}-manager/x"));
+        assert!(sc.admits("/H/.local/share/other"));
+    }
+
+    #[test]
     fn receipt_fields_without_free_text_must_have_their_exact_shape() {
         let good = receipt(vec![op(Status::Updated, Class::Normal)]);
         assert!(good.validate().is_ok());
@@ -1350,7 +1392,7 @@ mod tests {
         }];
         cases.push(("source", r));
         let mut r = good.clone();
-        r.operations[0].started_at = "yesterday".into();
+        r.operations[0].started_at = Some("yesterday".into());
         cases.push(("time", r));
         let mut r = good.clone();
         r.operations[0].resource = "line\nbreak".into();

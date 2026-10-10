@@ -15,12 +15,33 @@ use crate::fail::Fail;
 use dfm_model::{Code, Refusal};
 use rustix::fs::{self as rfs, AtFlags, CWD, FileType, Mode, OFlags, Stat};
 use rustix::io::Errno;
+use std::cell::Cell;
 use std::fs::{self, File, TryLockError};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::fd::OwnedFd;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
+
+thread_local! {
+    /// Set when this thread created a directory or the lock file. A refusal after that happened
+    /// after a mutation (exit 1, not 3).
+    static CREATED: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Clears the creation flag. Called at the start of an operation that may create things.
+pub fn reset_created() {
+    CREATED.with(|c| c.set(false));
+}
+
+/// Whether this thread created a directory or the lock file since [`reset_created`].
+pub fn created() -> bool {
+    CREATED.with(Cell::get)
+}
+
+fn note_created() {
+    CREATED.with(|c| c.set(true));
+}
 
 /// The effective user. The engine names no other OS fact.
 #[derive(Clone, Copy, Debug)]
@@ -234,7 +255,10 @@ impl Dir {
             Ok(fd) => fd,
             Err(Errno::NOENT) if create => {
                 let made = match rfs::mkdirat(&self.fd, name, Mode::from_raw_mode(0o700)) {
-                    Ok(()) => true,
+                    Ok(()) => {
+                        note_created();
+                        true
+                    }
                     // A concurrent creator is fine; what exists is validated below.
                     Err(Errno::EXIST) => false,
                     Err(e) => {
@@ -328,23 +352,27 @@ impl Dir {
         }
     }
 
-    /// Flushes this directory's entries to stable storage. `File::sync_all` is `F_FULLFSYNC` on
-    /// macOS (plain `fsync` does not flush the drive cache there), and an interrupted call is
-    /// retried. Tests that abort the process cannot prove power-loss ordering: an abort leaves
-    /// the page cache intact.
+    /// Flushes this directory's entries to stable storage. `File::sync_all` asks for
+    /// `F_FULLFSYNC` on macOS (plain `fsync` does not flush the drive cache there). A volume or
+    /// directory that rejects that request gets a plain `fsync` instead. Whether the data
+    /// reaches the medium cannot be observed from a test, and tests that abort the process
+    /// leave the page cache intact, so none of them shows power-loss ordering.
     pub fn sync(&self) -> Result<(), Refusal> {
         let f = File::from(
             self.fd
                 .try_clone()
                 .map_err(|e| io("duplicate directory", &e))?,
         );
-        let mut tries = 0;
-        loop {
-            match f.sync_all() {
-                Ok(()) => return Ok(()),
-                Err(e) if e.kind() == std::io::ErrorKind::Interrupted && tries < 5 => tries += 1,
-                Err(e) => return Err(io("sync directory", &e)),
+        match f.sync_all() {
+            Ok(()) => Ok(()),
+            Err(e)
+                if [Errno::NOTSUP, Errno::NOTTY, Errno::INVAL]
+                    .iter()
+                    .any(|x| e.raw_os_error() == Some(x.raw_os_error())) =>
+            {
+                rfs::fsync(&self.fd).map_err(|e| sys_err("sync directory", e))
             }
+            Err(e) => Err(io("sync directory", &e)),
         }
     }
 

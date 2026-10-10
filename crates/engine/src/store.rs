@@ -6,7 +6,9 @@
 //! ones the paths name and that the lock is still held on the lock file.
 
 use crate::fail::Fail;
-use crate::fsys::{Dir, Layout, Lock, Sys, below, path_ident, storage, unconfirmed};
+use crate::fsys::{
+    Dir, Layout, Lock, Sys, below, created, path_ident, reset_created, storage, unconfirmed,
+};
 use dfm_model::binding::Binding;
 use dfm_model::state::{
     self, Class, JournalEntry, Ledger, Phase, Receipt, Scope, Stamp, StateDoc, TrialRecord,
@@ -50,12 +52,20 @@ pub struct Store {
     state: Option<Dir>,
     scope: Scope,
     /// Manager paths (state root, config, lock, data, cache) as canonical paths, for identity checks.
-    reserved: Vec<PathBuf>,
+    reserved: Vec<Reserved>,
     /// Set after the first write that took effect. Later refusals are stamped with it.
     mutated: AtomicBool,
     secrets: Vec<String>,
     fail: Fail,
     lock: Option<Lock>,
+}
+
+/// A path the manager owns. A claim may not be, lie inside, or contain it.
+#[derive(Debug)]
+struct Reserved {
+    path: PathBuf,
+    /// A directory (claims inside it are refused) or the lock file (a plain file).
+    is_dir: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -116,15 +126,30 @@ impl Store {
                 .fold(canon.clone(), |a, c| a.join(c)))
         };
         let reserved_paths = vec![
-            join(&layout.state_root)?,
-            join(&layout.config_dir)?,
-            join(&layout.lock_file)?,
-            join(&layout.data_dir)?,
-            join(&layout.cache_dir)?,
+            Reserved {
+                path: join(&layout.state_root)?,
+                is_dir: true,
+            },
+            Reserved {
+                path: join(&layout.config_dir)?,
+                is_dir: true,
+            },
+            Reserved {
+                path: join(&layout.lock_file)?,
+                is_dir: false,
+            },
+            Reserved {
+                path: join(&layout.data_dir)?,
+                is_dir: true,
+            },
+            Reserved {
+                path: join(&layout.cache_dir)?,
+                is_dir: true,
+            },
         ];
         let reserved_text: Vec<String> = reserved_paths
             .iter()
-            .map(|p| p.to_string_lossy().into_owned())
+            .map(|r| r.path.to_string_lossy().into_owned())
             .collect();
         Ok(Store {
             sys,
@@ -189,6 +214,24 @@ impl Store {
     /// directory is state loss and a refusal (`E_STATE_INVALID`) that creates nothing. The lock
     /// file itself is created if absent: it holds no state.
     pub fn open_write_with(
+        sys: Sys,
+        layout: &Layout,
+        fail: Fail,
+        create_root: bool,
+    ) -> Result<Store, Refusal> {
+        reset_created();
+        match Self::open_write_inner(sys, layout, fail, create_root) {
+            Ok(s) => {
+                // A directory or the lock file made by this call counts as a mutation.
+                s.mutated.store(created(), Ordering::SeqCst);
+                Ok(s)
+            }
+            Err(e) if created() => Err(e.after_mutation()),
+            Err(e) => Err(e),
+        }
+    }
+
+    fn open_write_inner(
         sys: Sys,
         layout: &Layout,
         fail: Fail,
@@ -300,6 +343,8 @@ impl Store {
             .root
             .child(&self.sys, STAGING, true, true)?
             .ok_or_else(|| storage("cannot create the staging directory"))?;
+        // The staging directory exists from here: a failure now still changed the disk.
+        self.mutated.store(true, Ordering::SeqCst);
         for d in SUBDIRS {
             staging.child(&self.sys, d, true, true)?;
         }
@@ -395,16 +440,19 @@ impl Store {
     ) -> Result<(Vec<crate::fsys::Ident>, Vec<crate::fsys::Ident>), Refusal> {
         let mut inside = Vec::new();
         let mut exact = Vec::new();
-        for (i, r) in self.reserved.iter().enumerate() {
-            // Index 2 is the lock file: it may be claimed neither exactly nor from inside.
-            let is_dir = i != 2;
-            if let Some(id) = path_ident(r, true)? {
+        for r in &self.reserved {
+            if let Some(id) = path_ident(&r.path, true)? {
                 exact.push(id);
-                if is_dir {
+                // A claim may not lie inside a reserved directory. The lock file has no inside.
+                if r.is_dir {
                     inside.push(id);
                 }
             }
+            // The ancestors that exist today. For a reserved path that is missing this is its
+            // deepest existing ancestor. The text scope (folded for case and Unicode) covers the
+            // part that does not exist yet.
             for a in r
+                .path
                 .ancestors()
                 .skip(1)
                 .take_while(|a| a.starts_with(&self.home))
@@ -575,10 +623,10 @@ impl Store {
         self.check_owner(&l.binding)?;
         l.validate()?;
         l.check_secrets(&self.secret_refs())?;
+        let bytes = Self::cap(canonical(l)?)?;
         for o in l.resources.iter().flat_map(|r| &r.owned_outputs) {
             self.check_claim(&o.path)?;
         }
-        let bytes = Self::cap(canonical(l)?)?;
         self.state()?
             .replace_file("ledger.json", &bytes, &self.fail, "ledger")
     }
@@ -624,6 +672,7 @@ impl Store {
         self.check_owner(&t.binding)?;
         t.validate()?;
         t.check_secrets(&self.secret_refs())?;
+        let bytes = Self::cap(canonical(t)?)?;
         for p in t
             .owned_outputs
             .iter()
@@ -631,12 +680,7 @@ impl Store {
         {
             self.check_claim(p)?;
         }
-        dir.replace_file(
-            &format!("{}.json", t.trial_id),
-            &Self::cap(canonical(t)?)?,
-            &self.fail,
-            "trial",
-        )
+        dir.replace_file(&format!("{}.json", t.trial_id), &bytes, &self.fail, "trial")
     }
 
     /// Stores restorable content for an operation. Only the normal class is allowed: a sensitive

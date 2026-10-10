@@ -712,7 +712,7 @@ fn concurrent_initial_binds_create_one_owner_in_the_binding_and_in_the_state() {
             let err = text(&o.stderr);
             assert!(
                 matches!(o.status.code(), Some(0))
-                    || (o.status.code() == Some(3)
+                    || (matches!(o.status.code(), Some(3 | 1))
                         && (err.contains("E_REBIND_UNSUPPORTED") || err.contains("E_LOCKED"))),
                 "round {round}: {:?} {err}",
                 o.status
