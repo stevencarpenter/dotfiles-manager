@@ -2,7 +2,8 @@ use crate::Exit;
 use std::fmt;
 
 /// Stable error codes. The first group is defined by docs/architecture.md; the
-/// second group is added by the bootstrap task and listed in docs/bootstrap.md.
+/// second group is added by the bootstrap task (docs/bootstrap.md) and the third by the
+/// state task (docs/state.md).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Code {
     HomeMismatch,
@@ -17,6 +18,11 @@ pub enum Code {
     ProfileInvalid,
     IoFailed,
     Usage,
+    StateInvalid,
+    StateNewer,
+    StorageInvalid,
+    IdentityMismatch,
+    Locked,
 }
 
 impl Code {
@@ -34,6 +40,11 @@ impl Code {
             Code::ProfileInvalid => "E_PROFILE_INVALID",
             Code::IoFailed => "E_IO_FAILED",
             Code::Usage => "E_USAGE",
+            Code::StateInvalid => "E_STATE_INVALID",
+            Code::StateNewer => "E_STATE_NEWER",
+            Code::StorageInvalid => "E_STORAGE_INVALID",
+            Code::IdentityMismatch => "E_IDENTITY_MISMATCH",
+            Code::Locked => "E_LOCKED",
         }
     }
 

@@ -135,16 +135,27 @@ fn only_the_contract_crates_are_direct_dependencies() {
         .filter(|l| l.contains('='))
         .map(|l| l.split('=').next().unwrap().trim())
         .collect();
-    let allowed = ["dfm-model", "dfm-platform-macos", "serde", "toml", "sha2"];
+    let allowed = [
+        "dfm-model",
+        "dfm-platform-macos",
+        "serde",
+        "serde_json",
+        "toml",
+        "sha2",
+    ];
     assert!(deps.iter().all(|d| allowed.contains(d)), "{deps:?}");
     let pins: Vec<&str> = manifest
         .lines()
-        .filter(|l| l.starts_with("serde =") || l.starts_with("toml =") || l.starts_with("sha2 ="))
+        .filter(|l| {
+            ["serde =", "serde_json =", "toml =", "sha2 ="]
+                .iter()
+                .any(|k| l.starts_with(k))
+        })
         .collect();
     assert_eq!(
         pins.len(),
-        3,
-        "expected exactly serde, toml and sha2: {pins:?}"
+        4,
+        "expected exactly serde, serde_json, toml and sha2: {pins:?}"
     );
     assert!(
         pins.iter().all(|l| l.contains("\"=")),
