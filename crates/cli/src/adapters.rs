@@ -46,9 +46,10 @@ fn git_includes(text: &str) -> Vec<Include> {
             let name = header.0.trim();
             current = if name.eq_ignore_ascii_case("include") {
                 Some(None)
-            } else if name.len() > 9 && name[..9].eq_ignore_ascii_case("includeif") {
-                let cond = name[9..].trim().trim_matches('"').to_string();
-                Some(Some(cond))
+            } else if let (Some(head), Some(rest)) = (name.get(..9), name.get(9..))
+                && head.eq_ignore_ascii_case("includeif")
+            {
+                Some(Some(rest.trim().trim_matches('"').to_string()))
             } else {
                 None
             };
@@ -198,6 +199,26 @@ pub fn builtin_catalog() -> AdapterCatalog {
 #[cfg(test)]
 mod tests {
     use super::git_includes;
+
+    #[test]
+    fn untrusted_section_names_never_panic_on_a_character_boundary() {
+        // Byte 9 falls inside the euro sign; slicing there would panic.
+        for text in [
+            "[abcdefgh\u{20ac}]\npath = x\n",
+            "[\u{20ac}\u{20ac}\u{20ac}\u{20ac}]\n",
+            "[\u{1f600}includeif]\n",
+            "[includeif\u{20ac}\"c\"]\npath = ~/p\n",
+            "[",
+            "[]",
+            "path",
+        ] {
+            let _ = git_includes(text);
+        }
+        // A real section with a multibyte condition still parses.
+        let got = git_includes("[includeIf \"gitdir:~/\u{e9}/\"]\npath = ~/a\n");
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].condition.as_deref(), Some("gitdir:~/\u{e9}/"));
+    }
 
     #[test]
     fn git_include_directives_keep_file_order_and_conditions() {
