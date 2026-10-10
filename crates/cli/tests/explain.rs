@@ -389,3 +389,66 @@ fn help_lists_explain() {
         .unwrap();
     assert!(text(&o.stdout).contains("explain <resource-or-target> --root <dir>"));
 }
+
+#[test]
+fn a_path_with_a_bidirectional_control_is_shown_escaped_in_the_refusal() {
+    let (home, _t, root) = bound("work-01.toml");
+    let r = root.to_str().unwrap();
+    // A FIFO whose name tries to reorder the terminal line that names it.
+    let fifo = root.join("base/modules/core/files/evil\u{202e}gpj.txt");
+    let mut mkfifo = Command::new("/usr/bin/mkfifo");
+    mkfifo.arg(&fifo);
+    assert!(finish_within(mkfifo, 10).status.success());
+    let mut explain = Command::new(BIN);
+    explain
+        .env_clear()
+        .arg("--home")
+        .arg(home.path())
+        .args(["explain", "core.git", "--root", r]);
+    let o = finish_within(explain, 20);
+    assert_eq!(o.status.code(), Some(3));
+    let err = text(&o.stderr);
+    assert!(err.contains("E_SOURCE_UNTRUSTED"), "{err}");
+    assert!(err.contains("evil\\u{202e}gpj.txt"), "{err}");
+    assert!(
+        !err.contains('\u{202e}'),
+        "the raw character reached the terminal: {err:?}"
+    );
+}
+
+#[test]
+fn argument_text_is_escaped_before_it_is_printed() {
+    let home = TempDir::new("args");
+    for arg in [
+        "bad\u{202e}cmd",
+        "bad\u{200b}cmd",
+        "bad\u{2028}cmd",
+        "bad\u{e0041}cmd",
+    ] {
+        let o = run(home.path(), &[arg]);
+        assert_eq!(o.status.code(), Some(2), "{arg:?}");
+        let err = text(&o.stderr);
+        assert!(err.starts_with("error: E_USAGE"), "{err}");
+        assert!(err.contains("\\u{"), "{err}");
+        assert!(err.chars().all(|c| !c.is_control() || c == '\n'), "{err:?}");
+        assert!(!err.contains(arg), "{err:?}");
+    }
+}
+
+#[test]
+fn a_non_utf8_argument_is_a_usage_error_not_a_panic() {
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
+    let bad = OsString::from_vec(vec![b'x', 0xff, 0xfe]);
+    for args in [
+        vec![bad.clone()],
+        vec![OsString::from("explain"), bad.clone()],
+    ] {
+        let o = Command::new(BIN).env_clear().args(&args).output().unwrap();
+        assert_eq!(o.status.code(), Some(2), "{args:?}");
+        let err = text(&o.stderr);
+        assert!(err.starts_with("error: E_USAGE argument "), "{err}");
+        assert!(err.contains("is not valid UTF-8"), "{err}");
+        assert!(!err.contains("panicked"), "{err}");
+    }
+}

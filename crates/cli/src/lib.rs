@@ -46,17 +46,10 @@ exit codes: 0 ok, 1 failed, 2 usage, 3 blocked before mutation, 4 declined,
 
 const MAX_ERROR_CHARS: usize = 512;
 
-/// Control characters and escapes become visible, and the length is bounded.
+/// Control, invisible and bidirectional characters become visible escapes, and the length is
+/// bounded.
 fn bounded(s: &str) -> String {
-    let mut out = String::new();
-    for c in s.chars().take(MAX_ERROR_CHARS) {
-        if c.is_control() {
-            out.extend(c.escape_default())
-        } else {
-            out.push(c)
-        }
-    }
-    out
+    dfm_model::display::visible(&s.chars().take(MAX_ERROR_CHARS).collect::<String>())
 }
 
 struct Ctx {
@@ -321,7 +314,7 @@ fn explain(ctx: &Ctx, query: &str, root: &Path) -> Result<String, Refusal> {
     let root = fs::canonicalize(root).map_err(|e| {
         Refusal::new(
             Code::ReportUnavailable,
-            format!("{}: {}", root.display(), e.kind()),
+            dfm_model::display::visible(&format!("{}: {}", root.display(), e.kind())),
         )
     })?;
     let rel = Path::new(binding.profile())

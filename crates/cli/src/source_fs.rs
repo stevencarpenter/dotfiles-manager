@@ -27,7 +27,7 @@ const MAX_TOTAL_BYTES: u64 = 64 << 20;
 /// changed type after the directory listing is refused instead of read.
 fn read_regular(path: &Path, shown: &str) -> Result<Vec<u8>, Refusal> {
     let io = |e: std::io::Error| {
-        Refusal::new(
+        refusal(
             Code::ReportUnavailable,
             format!("cannot read source {shown}: {}", e.kind()),
         )
@@ -38,7 +38,7 @@ fn read_regular(path: &Path, shown: &str) -> Result<Vec<u8>, Refusal> {
         .open(path)
         .map_err(io)?;
     if !file.metadata().map_err(io)?.is_file() {
-        return Err(Refusal::new(
+        return Err(refusal(
             Code::SourceUntrusted,
             format!("{shown} changed type while reading"),
         ));
@@ -50,6 +50,12 @@ fn read_regular(path: &Path, shown: &str) -> Result<Vec<u8>, Refusal> {
     Ok(buf)
 }
 
+/// A refusal whose detail is safe to print: paths come from the tree being read and may hold
+/// control, bidirectional or zero-width characters.
+fn refusal(code: Code, detail: String) -> Refusal {
+    Refusal::new(code, dfm_model::display::visible(&detail))
+}
+
 pub fn load_source_set(root: &Path) -> Result<SourceSet, Refusal> {
     struct State {
         set: SourceSet,
@@ -57,7 +63,7 @@ pub fn load_source_set(root: &Path) -> Result<SourceSet, Refusal> {
         bytes: u64,
     }
     fn refuse(code: Code, what: String) -> Refusal {
-        Refusal::new(code, what)
+        refusal(code, what)
     }
     fn go(dir: &Path, rel: &str, st: &mut State) -> Result<(), Refusal> {
         let io = |e: std::io::Error, p: &str| {
