@@ -1044,6 +1044,40 @@ fn the_binding_is_checked_again_just_before_the_swap() {
 
 #[test]
 #[ignore = "needs crates.io"]
+fn the_binding_is_checked_again_immediately_before_the_copy() {
+    let p = prepare("copy-binding");
+    let cfg = p.home.join(".config/dotfiles-manager");
+    let hook = p.tmp.path().join("hook.sh");
+    // A valid binding with mode 0644 appears after the first check. Only the check right before
+    // the copy refuses it with exit 3; without it the new binary's self-check fails with exit 1.
+    let valid = "schema = 1\nprofile = \"/p\"\nmachine_id = \"m5\"\nplatform = \"macos\"\narch = \"aarch64\"\norigins = []\n";
+    fs::write(
+        &hook,
+        format!("mkdir -p '{0}' && printf '%s' '{1}' > '{0}/machine.toml' && chmod 644 '{0}/machine.toml'\n", cfg.display(), valid),
+    )
+    .unwrap();
+    let o = install(
+        &p,
+        &p.sha,
+        &[("DFM_TEST_BEFORE_COPY", hook.to_str().unwrap())],
+    );
+    assert_eq!(
+        o.status.code(),
+        Some(3),
+        "{}\n{}",
+        String::from_utf8_lossy(&o.stdout),
+        err(&o)
+    );
+    assert!(
+        err(&o).contains("E_BINDING_INVALID") && err(&o).contains("0600"),
+        "{}",
+        err(&o)
+    );
+    assert!(!p.data.join("current").exists(), "current must not flip");
+}
+
+#[test]
+#[ignore = "needs crates.io"]
 fn a_swap_that_did_not_take_effect_is_not_reported_as_done() {
     let p = prepare("swap-readback");
     let hook = p.tmp.path().join("hook.sh");

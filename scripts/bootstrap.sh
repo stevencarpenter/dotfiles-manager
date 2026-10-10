@@ -18,6 +18,8 @@
 # cannot export it to skip the re-execution. A caller can still pass the argument itself,
 # so the child checks that its environment holds only the allowed names and refuses
 # otherwise. The DFM_TEST_* hooks are forwarded only when DFM_BOOTSTRAP_TEST=1.
+# Run with /bin/sh (or /usr/bin/env -i /bin/sh), never with bash: in non-POSIX mode an
+# exported function can override the exec builtin before the scrub.
 # Run it as `/usr/bin/env -i /bin/sh scripts/bootstrap.sh ...`. SHELLOPTS and PS4 (xtrace
 # with command substitution, noexec) take effect before the first line of this file and are
 # outside its control; a run that did not print its final line did not finish.
@@ -31,6 +33,7 @@ case ${1:-} in
           ${DFM_TEST_ARCH:+"DFM_TEST_ARCH=$DFM_TEST_ARCH"} ${DFM_TEST_CLT:+"DFM_TEST_CLT=$DFM_TEST_CLT"} \
           ${DFM_TEST_BEFORE_SWAP:+"DFM_TEST_BEFORE_SWAP=$DFM_TEST_BEFORE_SWAP"} \
           ${DFM_TEST_AFTER_SWAP:+"DFM_TEST_AFTER_SWAP=$DFM_TEST_AFTER_SWAP"} \
+          ${DFM_TEST_BEFORE_COPY:+"DFM_TEST_BEFORE_COPY=$DFM_TEST_BEFORE_COPY"} \
           /bin/sh "$0" --dfm-scrubbed "$@" ;;
     esac
     exec /usr/bin/env -i PATH=/usr/bin:/bin:/usr/sbin:/sbin HOME="${HOME:-}" /bin/sh "$0" --dfm-scrubbed "$@" ;;
@@ -38,7 +41,7 @@ esac
 shift
 env_check=$(/usr/bin/env | /usr/bin/awk -F= -v test="${DFM_BOOTSTRAP_TEST:-}" '
   BEGIN { split("PATH HOME PWD OLDPWD SHLVL _", a, " "); for (i in a) ok[a[i]] = 1
-    if (test == "1") { split("DFM_BOOTSTRAP_TEST DFM_TEST_HOME DFM_TEST_OS DFM_TEST_ARCH DFM_TEST_CLT DFM_TEST_BEFORE_SWAP DFM_TEST_AFTER_SWAP", t, " "); for (i in t) ok[t[i]] = 1 } }
+    if (test == "1") { split("DFM_BOOTSTRAP_TEST DFM_TEST_HOME DFM_TEST_OS DFM_TEST_ARCH DFM_TEST_CLT DFM_TEST_BEFORE_SWAP DFM_TEST_AFTER_SWAP DFM_TEST_BEFORE_COPY", t, " "); for (i in t) ok[t[i]] = 1 } }
   /^[^=]+=/ { if (!($1 in ok)) { print "unexpected " $1; bad = 1; exit } }
   END { if (!bad) print "clean" }') || env_check=
 case $env_check:$PATH in
@@ -504,6 +507,7 @@ cmd_install() {
   bin=$build/target/release/dotfiles-manager
   # The new binary must be able to read the binding that already exists, so it checks a copy.
   mkdir -p "$build/fixture"
+  if test_mode && [ -n "${DFM_TEST_BEFORE_COPY:-}" ]; then /bin/sh "$DFM_TEST_BEFORE_COPY"; fi
   check_binding
   if [ -e "$HOME_DIR/.config/dotfiles-manager/machine.toml" ]; then
     cp -p "$HOME_DIR/.config/dotfiles-manager/machine.toml" "$build/fixture/machine.toml"
@@ -527,9 +531,13 @@ cmd_install() {
   mv -fh "$HOME_DIR/.local/bin/dotfiles-manager.new" "$HOME_DIR/.local/bin/dotfiles-manager"
   if test_mode && [ -n "${DFM_TEST_AFTER_SWAP:-}" ]; then /bin/sh "$DFM_TEST_AFTER_SWAP"; fi
   # Read both links back: a swap that did not take effect must not be reported as done.
-  if [ "$(readlink "$DATA/current")" != "versions/$name" ] ||
-    [ "$(readlink "$HOME_DIR/.local/bin/dotfiles-manager")" != "$DATA/current/dotfiles-manager" ]; then
-    echo "error: swap did not take effect" >&2; exit 1
+  got_current=$(readlink "$DATA/current") || got_current=
+  got_link=$(readlink "$HOME_DIR/.local/bin/dotfiles-manager") || got_link=
+  if [ "$got_current" != "versions/$name" ]; then
+    echo "error: swap did not take effect: $DATA/current is '$got_current', expected 'versions/$name'" >&2; exit 1
+  fi
+  if [ "$got_link" != "$DATA/current/dotfiles-manager" ]; then
+    echo "error: swap did not take effect: the command path is '$got_link', expected '$DATA/current/dotfiles-manager'" >&2; exit 1
   fi
   rm_build; rm -rf "$DATA/cargo-home" "$DATA/rustup-home" "$DATA/build-home"
   sha=$(/usr/bin/shasum -a 256 "$DATA/versions/$name/dotfiles-manager" | cut -d' ' -f1)

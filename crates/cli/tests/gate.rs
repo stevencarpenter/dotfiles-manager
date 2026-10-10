@@ -39,6 +39,7 @@ fn the_documented_fixture_count_is_the_real_one() {
         .expect("docs/bootstrap.md states the fixture count");
     let real = fs::read_dir(repo_root().join("tests/fixtures/build-controls/cases"))
         .unwrap()
+        .filter(|e| e.as_ref().unwrap().path().is_dir())
         .count();
     assert_eq!(said, real, "update the count in docs/bootstrap.md");
 }
