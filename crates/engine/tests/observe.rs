@@ -104,7 +104,7 @@ fn a_directory_is_listed_on_request() {
     }
     let o = seen(&h, &[req("d", false, true)]);
     assert_eq!(o.listings["d"].names, ["a", "b", "c"]);
-    assert!(!o.listings["d"].truncated);
+    assert_eq!(o.listings["d"].incomplete, None);
     let o = seen(&h, &[req("d", false, false)]);
     assert!(o.listings.is_empty());
 }
@@ -168,4 +168,54 @@ fn tree(root: &std::path::Path) -> Vec<(String, u32, u64)> {
     go(root, &mut v);
     v.sort();
     v
+}
+
+#[test]
+fn unreadable_entries_are_unknown_facts_and_never_abort_the_walk() {
+    let h = Home::new();
+    fs::create_dir_all(h.0.join("closed/inner")).unwrap();
+    fs::write(h.0.join("secret"), "x").unwrap();
+    fs::create_dir_all(h.0.join("listed")).unwrap();
+    for p in ["closed", "secret", "listed"] {
+        fs::set_permissions(h.0.join(p), fs::Permissions::from_mode(0o000)).unwrap();
+    }
+    let o = seen(
+        &h,
+        &[
+            req("closed/inner/f", false, false),
+            req("secret", true, false),
+            req("listed", false, true),
+        ],
+    );
+    for p in ["closed", "secret", "listed"] {
+        fs::set_permissions(h.0.join(p), fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    assert!(
+        matches!(o.seen["closed"].node, Node::Unknown { .. }),
+        "{:?}",
+        o.seen["closed"]
+    );
+    assert!(!o.seen.contains_key("closed/inner"));
+    assert!(matches!(o.seen["secret"].node, Node::Unknown { .. }));
+    assert!(matches!(o.seen["listed"].node, Node::Dir { .. }));
+    assert_eq!(
+        o.listings["listed"].incomplete,
+        Some(dfm_model::plan::Incomplete::Failed)
+    );
+}
+
+#[test]
+fn a_directory_is_listed_once_for_many_requests() {
+    let h = Home::new();
+    fs::create_dir_all(h.0.join("d")).unwrap();
+    for n in ["a", "b", "c"] {
+        fs::write(h.0.join("d").join(n), n).unwrap();
+    }
+    let reqs: Vec<_> = ["d/a", "d/b", "d/c"]
+        .iter()
+        .map(|p| req(p, true, false))
+        .collect();
+    let o = seen(&h, &reqs);
+    assert_eq!(o.seen.len(), 4);
+    assert!(o.seen.values().all(|s| s.alias.is_none()));
 }

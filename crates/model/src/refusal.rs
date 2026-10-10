@@ -58,6 +58,7 @@ pub enum Code {
     PlanInvalid,
     PrivilegeUnsupported,
     ObservationUnknown,
+    TargetReserved,
 }
 
 impl Code {
@@ -109,6 +110,7 @@ impl Code {
         Code::PlanInvalid,
         Code::PrivilegeUnsupported,
         Code::ObservationUnknown,
+        Code::TargetReserved,
     ];
 
     pub fn parse(s: &str) -> Option<Code> {
@@ -163,6 +165,7 @@ impl Code {
             Code::PlanInvalid => "E_PLAN_INVALID",
             Code::PrivilegeUnsupported => "E_PRIVILEGE_UNSUPPORTED",
             Code::ObservationUnknown => "E_OBSERVATION_UNKNOWN",
+            Code::TargetReserved => "E_TARGET_RESERVED",
         }
     }
 
@@ -219,3 +222,18 @@ impl fmt::Display for Refusal {
 }
 
 impl std::error::Error for Refusal {}
+
+#[cfg(test)]
+mod tests {
+    use super::Code;
+
+    #[test]
+    fn every_code_round_trips_through_its_name() {
+        for c in Code::ALL {
+            assert_eq!(Code::parse(c.as_str()), Some(*c));
+        }
+        assert_eq!(Code::parse("E_NOPE"), None);
+        let names: std::collections::BTreeSet<_> = Code::ALL.iter().map(|c| c.as_str()).collect();
+        assert_eq!(names.len(), Code::ALL.len(), "two codes share a name");
+    }
+}

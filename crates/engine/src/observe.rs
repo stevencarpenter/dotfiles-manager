@@ -4,13 +4,16 @@
 //!
 //! The walk starts at the opened HOME and goes one component at a time with `O_NOFOLLOW`, so a
 //! link in a parent is reported, never followed. Nothing is created, written, repaired or run.
+//! A path that cannot be read is reported as `Unknown`, never as a failure of the walk.
 
 use crate::fsys::{Dir, Peek, PeekTo, Sys};
 use dfm_model::Refusal;
 use dfm_model::digest::sha256_hex;
+use dfm_model::fold;
 use dfm_model::plan::{
-    LinkTo, Listing, MAX_HASHED_BYTES, MAX_LISTING, Node, Observations, Request, Seen,
+    Incomplete, LinkTo, Listing, MAX_HASHED_BYTES, MAX_LISTING, Node, Observations, Request, Seen,
 };
+use std::collections::BTreeMap;
 
 fn lower(to: PeekTo) -> LinkTo {
     match to {
@@ -22,56 +25,51 @@ fn lower(to: PeekTo) -> LinkTo {
     }
 }
 
-/// Entry names of one directory, with the directory kept open for the next step.
-struct Level {
-    dir: Dir,
-    names: Option<Vec<String>>,
-}
-
 fn list(dir: &Dir) -> Listing {
     match dir.list() {
-        Ok(l) if l.odd == 0 && l.names.len() <= MAX_LISTING => Listing {
+        Ok(l) if l.odd > 0 => Listing {
             names: l.names,
-            truncated: false,
+            incomplete: Some(Incomplete::NonUtf8),
         },
-        Ok(mut l) => {
+        Ok(mut l) if l.names.len() > MAX_LISTING => {
             l.names.truncate(MAX_LISTING);
             Listing {
                 names: l.names,
-                truncated: true,
+                incomplete: Some(Incomplete::TooMany),
             }
         }
+        Ok(l) => Listing {
+            names: l.names,
+            incomplete: None,
+        },
         Err(_) => Listing {
             names: Vec::new(),
-            truncated: true,
+            incomplete: Some(Incomplete::Failed),
         },
     }
 }
 
-/// The spelling on disk when it differs from `name` only by case.
-fn alias(names: &Option<Vec<String>>, name: &str) -> Option<String> {
-    let names = names.as_ref()?;
-    if names.iter().any(|n| n == name) {
-        return None;
+fn unknown(reason: &str) -> Node {
+    Node::Unknown {
+        reason: reason.into(),
     }
-    let f = name.to_lowercase();
-    names.iter().find(|n| n.to_lowercase() == f).cloned()
 }
 
-fn node(peek: Peek, dir: &Dir, name: &str, hash: bool) -> Result<Node, Refusal> {
-    Ok(match peek {
+fn node(peek: Peek, dir: &Dir, name: &str, hash: bool) -> Node {
+    match peek {
         Peek::Missing => Node::Missing,
         Peek::Dir { mode, own } => Node::Dir { mode, own },
         Peek::File { mode, own, size } => {
             let sha256 = if !hash {
                 None
             } else if size > MAX_HASHED_BYTES {
-                return Ok(Node::Unknown {
-                    reason: "file is larger than the 16 MiB hash bound".into(),
-                });
+                return unknown("file is larger than the 16 MiB hash bound");
             } else {
-                dir.read_plain(name, MAX_HASHED_BYTES)?
-                    .map(|b| sha256_hex(&b))
+                match dir.read_plain(name, MAX_HASHED_BYTES) {
+                    Ok(Some(b)) => Some(sha256_hex(&b)),
+                    Ok(None) => return unknown("file changed while it was read"),
+                    Err(_) => return unknown("file cannot be read; check its permissions"),
+                }
             };
             Node::File {
                 mode,
@@ -86,20 +84,23 @@ fn node(peek: Peek, dir: &Dir, name: &str, hash: bool) -> Result<Node, Refusal> 
             own,
         },
         Peek::Other { mode, own } => Node::Other { mode, own },
-        Peek::Unknown(reason) => Node::Unknown { reason },
-    })
+        Peek::Unknown(kind) => Node::Unknown {
+            reason: format!("cannot be examined ({kind})"),
+        },
+    }
 }
 
 /// Observes every request and every proper prefix of its path, below `home`. A prefix that is
-/// not a directory ends the walk for that request.
+/// not a directory ends the walk for that request. A directory is listed once, however many
+/// requests pass through it.
 pub fn observe(sys: &Sys, home: &Dir, requests: &[Request]) -> Result<Observations, Refusal> {
     let mut out = Observations::default();
+    // Entry names of each directory, by its HOME-relative path, for the case check.
+    let mut names: BTreeMap<String, Listing> = BTreeMap::new();
     for req in requests {
         let comps: Vec<&str> = req.path.split('/').collect();
-        let mut level = Level {
-            dir: home.try_clone()?,
-            names: None,
-        };
+        let mut dir = home.try_clone()?;
+        let mut parent = String::new();
         for (i, name) in comps.iter().enumerate() {
             let path = comps[..=i].join("/");
             let last = i + 1 == comps.len();
@@ -109,52 +110,69 @@ pub fn observe(sys: &Sys, home: &Dir, requests: &[Request]) -> Result<Observatio
                 .seen
                 .get(&path)
                 .is_some_and(|s| !(want_hash && matches!(s.node, Node::File { sha256: None, .. })));
-            // The listing of the parent is needed for the case check of every existing entry.
-            if level.names.is_none() {
-                let l = list(&level.dir);
-                level.names = (!l.truncated).then_some(l.names);
-            }
-            let peek = level.dir.peek(sys, name)?;
+            let peek = dir.peek(sys, name)?;
             let exists = !matches!(peek, Peek::Missing);
             let is_dir = matches!(peek, Peek::Dir { .. });
             if !known {
-                let al = if exists {
-                    alias(&level.names, name)
+                // On a case-folding filesystem a lookup of the wrong case succeeds, so the
+                // listing of the parent is what tells the two spellings apart.
+                let siblings = names
+                    .entry(parent.clone())
+                    .or_insert_with(|| list(&dir))
+                    .clone();
+                let al = if exists && !siblings.names.iter().any(|n| n == name) {
+                    let f = fold(name);
+                    siblings.names.iter().find(|n| fold(n) == f).cloned()
                 } else {
                     None
                 };
-                let n = node(peek, &level.dir, name, want_hash)?;
-                // On a case-folding filesystem a lookup of the wrong case succeeds, so the
-                // listing is what tells the two spellings apart. If the parent was too large
-                // to list, the case question stays open and the entry is unknown.
-                let n = if exists && level.names.is_none() && !matches!(n, Node::Unknown { .. }) {
-                    Node::Unknown {
-                        reason: "parent directory is too large to check for case aliases".into(),
-                    }
-                } else {
-                    n
-                };
+                let mut n = node(peek, &dir, name, want_hash);
+                if exists && siblings.incomplete.is_some() && !matches!(n, Node::Unknown { .. }) {
+                    n = unknown(
+                        "parent directory cannot be fully listed to check for case aliases",
+                    );
+                }
                 out.seen.insert(path.clone(), Seen { node: n, alias: al });
             }
             if !is_dir {
                 break;
             }
-            let Some(next) = level.dir.peek_dir(name)? else {
-                break;
+            let next = match dir.peek_dir(name) {
+                Ok(Some(d)) => d,
+                // A directory that cannot be opened (no read permission) ends the walk. Below
+                // it nothing can be seen, so the directory itself is the unknown fact, unless
+                // it is the requested path and only its listing was wanted.
+                Ok(None) | Err(_) => {
+                    if last && req.list {
+                        out.listings.entry(path.clone()).or_insert(Listing {
+                            names: Vec::new(),
+                            incomplete: Some(Incomplete::Failed),
+                        });
+                    } else if !last {
+                        out.seen.insert(
+                            path.clone(),
+                            Seen {
+                                node: unknown("directory cannot be opened; check its permissions"),
+                                alias: None,
+                            },
+                        );
+                    }
+                    break;
+                }
             };
             if last && req.list && !out.listings.contains_key(&path) {
-                out.listings.insert(path.clone(), list(&next));
+                let l = names.entry(path.clone()).or_insert_with(|| list(&next));
+                out.listings.insert(path.clone(), l.clone());
             }
-            level = Level {
-                dir: next,
-                names: None,
-            };
+            dir = next;
+            parent = path;
         }
     }
     Ok(out)
 }
 
-/// Adds the facts of `more` to `into`. A fact observed twice keeps the first one.
+/// Adds the facts of `more` to `into`. A fact observed twice keeps the first one, so a later
+/// pass can never add a hash to a path the first pass chose not to hash.
 pub fn merge(into: &mut Observations, more: Observations) {
     for (k, v) in more.seen {
         into.seen.entry(k).or_insert(v);

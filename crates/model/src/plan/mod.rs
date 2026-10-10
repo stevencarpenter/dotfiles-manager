@@ -11,7 +11,7 @@ mod graph;
 mod stale;
 
 pub use build::{Context, Owned, build, followups, requests};
-pub use stale::{Stale, stale};
+pub use stale::{Stale, StaleKind, stale};
 
 use crate::digest::sha256_hex;
 use crate::refusal::{Code, Refusal};
@@ -71,6 +71,7 @@ pub enum LinkTo {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Seen {
     pub node: Node,
     /// The spelling on disk when it differs from the requested one only by case. The target
@@ -78,15 +79,29 @@ pub struct Seen {
     pub alias: Option<String>,
 }
 
-/// The names in one directory. `truncated` means the bound was reached.
+/// Why a listing is not the full set of names.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Incomplete {
+    /// More entries than [`MAX_LISTING`].
+    TooMany,
+    /// The directory could not be opened or read.
+    Failed,
+    /// An entry name is not UTF-8.
+    NonUtf8,
+}
+
+/// The names in one directory.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Listing {
     pub names: Vec<String>,
-    pub truncated: bool,
+    pub incomplete: Option<Incomplete>,
 }
 
 /// Every local fact the plan rests on, keyed by HOME-relative path.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Observations {
     pub seen: BTreeMap<String, Seen>,
     pub listings: BTreeMap<String, Listing>,
@@ -97,13 +112,14 @@ pub struct Observations {
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Request {
     pub path: String,
-    /// Record the content hash of a regular file at `path`.
+    /// Record the content hash of a regular file at `path`. Never set for a sensitive path.
     pub hash: bool,
     /// List the entries when `path` is a directory.
     pub list: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Binary {
     pub version: String,
     pub sha256: String,
@@ -112,6 +128,7 @@ pub struct Binary {
 /// A source tree the plan was made from: `kind = "path"` identity (section 9): the canonical
 /// absolute root plus the tree digest.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Source {
     pub kind: String,
     pub root: String,
@@ -126,6 +143,9 @@ pub enum Action {
     ReplaceLink,
     CreateFile,
     UpdateFile,
+    /// Remove an output the ledger proves this manager wrote and nothing selects any more.
+    /// Apply (DFM-18) executes it after re-checking the fingerprint precondition.
+    Remove,
     /// Nothing to do, or out of scope.
     None,
 }
@@ -158,6 +178,7 @@ pub enum Ownership {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Input {
     /// Path of the source file in the source tree.
     pub path: String,
@@ -165,22 +186,32 @@ pub struct Input {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Fragment {
     pub name: String,
     /// `selected:<resource>` or `foreign`.
     pub origin: String,
 }
 
-/// A fact that must still hold at apply time: `subject` names it, `state` is its fingerprint.
+/// A fact that must still hold at apply time: `subject` names it, `state` is its fingerprint
+/// as [`node_state`] builds it. Apply observes again and compares the strings.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Precondition {
     pub subject: String,
     pub state: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Operation {
+    /// Stable within one plan: `<resource>@<path>`, `mkdir@<path>`, `<resource>@scope` or
+    /// `remove@<resource>@<path>`.
     pub id: String,
+    /// The journal operation id for this operation (docs/state.md: lowercase letters, digits,
+    /// `.`, `_`, `-`). It is derived from the model digest, the sources and `id`, not from the
+    /// plan digest, which covers this field.
+    pub journal_id: String,
     pub resource: String,
     pub module: String,
     pub adapter: String,
@@ -188,7 +219,11 @@ pub struct Operation {
     pub action: Action,
     pub status: Status,
     pub path: Option<String>,
+    /// The file mode the resource declares for its output, if it declares one.
     pub mode: Option<u32>,
+    /// The absolute link target for a link or distribution leaf. Apply reads this field and
+    /// never parses `effect` or `postcondition`, which are prose for people.
+    pub link: Option<String>,
     /// Always `user`: a HOME adapter never escalates (section 8).
     pub privilege: String,
     /// What the operation does, without content or secret values.
@@ -205,6 +240,7 @@ pub struct Operation {
 /// Why a plan cannot be approved: the source, resource and field, the conflicting claim or
 /// failed precondition, and one correction. It never carries a secret value.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Blocker {
     #[serde(with = "code_str")]
     pub code: Code,
@@ -249,6 +285,7 @@ impl Blocker {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Plan {
     pub schema: i64,
     pub command: String,
@@ -266,19 +303,26 @@ pub struct Plan {
     pub blockers: Vec<Blocker>,
 }
 
+fn serialization(e: &Refusal) -> Refusal {
+    Refusal::new(
+        Code::IoFailed,
+        format!("cannot serialize the plan: {}", e.detail),
+    )
+}
+
 impl Plan {
     /// SHA-256 of the canonical JSON of the plan (sorted keys, no insignificant whitespace).
-    pub fn digest(&self) -> String {
-        // Serializing owned data to a JSON value cannot fail for these types.
-        sha256_hex(&canonical(self).expect("a plan serializes"))
+    pub fn digest(&self) -> Result<String, Refusal> {
+        Ok(sha256_hex(&canonical(self).map_err(|e| serialization(&e))?))
     }
 
-    pub fn saved(&self) -> Saved {
-        Saved {
-            plan_digest: self.digest(),
+    pub fn saved(&self) -> Result<Saved, Refusal> {
+        Ok(Saved {
+            plan_digest: self.digest()?,
             plan: self.clone(),
             isolated: None,
-        }
+            stale: Vec::new(),
+        })
     }
 }
 
@@ -292,6 +336,10 @@ pub struct Saved {
     /// outside the plan, so it is not part of the digest.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub isolated: Option<String>,
+    /// Set by `plan --json --against`: how this plan differs from the saved one. Outside the
+    /// plan, so not part of the digest.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub stale: Vec<Stale>,
 }
 
 impl Saved {
@@ -326,13 +374,44 @@ impl Saved {
         }
         let saved: Saved =
             serde_json::from_value(v).map_err(|e| bad(format!("not a saved plan: {e}")))?;
-        if saved.plan.digest() != saved.plan_digest {
+        if saved.plan.digest()? != saved.plan_digest {
             return Err(bad(
                 "plan_digest does not match the plan content; the file was edited".into(),
             ));
         }
         Ok(saved)
     }
+}
+
+/// The precondition string for what was seen at one path. Apply observes the path again with
+/// the same request and compares this string, so both sides must build it here. A sensitive
+/// path carries no hash and no size.
+pub fn node_state(seen: &Seen, sensitive: bool) -> String {
+    let base = match &seen.node {
+        Node::Missing => "missing".to_string(),
+        Node::Dir { mode, .. } => format!("dir:{mode:o}"),
+        Node::File {
+            mode, size, sha256, ..
+        } => match (sha256, sensitive) {
+            (Some(h), false) => format!("file:{mode:o}:sha256:{h}"),
+            (None, false) => format!("file:{mode:o}:size:{size}"),
+            (_, true) => format!("file:{mode:o}"),
+        },
+        Node::Link { target, to, .. } => format!("link:{target}:{to:?}").to_lowercase(),
+        Node::Other { mode, .. } => format!("other:{mode:o}"),
+        Node::Unknown { reason } => format!("unknown:{reason}"),
+    };
+    match &seen.alias {
+        Some(a) => format!("{base} alias={a}"),
+        None => base,
+    }
+}
+
+/// The ledger fingerprint of a link: SHA-256 of the link target text. DFM-17 left link
+/// fingerprints open; the planner and apply both use this function. A file's fingerprint is the
+/// SHA-256 of its content.
+pub fn link_fingerprint(target: &str) -> String {
+    sha256_hex(target.as_bytes())
 }
 
 /// The identity of a source tree read from `root` (section 9, "Path-source identity"): the
@@ -388,20 +467,12 @@ mod tests {
     }
 
     #[test]
-    fn every_code_round_trips_through_its_name() {
-        for c in Code::ALL {
-            assert_eq!(Code::parse(c.as_str()), Some(*c));
-        }
-        assert_eq!(Code::parse("E_NOPE"), None);
-    }
-
-    #[test]
     fn a_saved_plan_round_trips_and_detects_an_edit() {
         let p = empty();
-        let bytes = p.saved().to_json().unwrap();
+        let bytes = p.saved().unwrap().to_json().unwrap();
         let back = Saved::parse(&bytes).unwrap();
         assert_eq!(back.plan, p);
-        assert_eq!(back.plan_digest, p.digest());
+        assert_eq!(back.plan_digest, p.digest().unwrap());
         let edited = String::from_utf8(bytes)
             .unwrap()
             .replace("\"/p\"", "\"/q\"");
@@ -413,11 +484,21 @@ mod tests {
     }
 
     #[test]
+    fn unknown_keys_are_refused_inside_the_plan() {
+        let p = empty();
+        let mut v = serde_json::to_value(p.saved().unwrap()).unwrap();
+        v["plan"]["extra"] = 1.into();
+        let e = Saved::parse(&serde_json::to_vec(&v).unwrap()).unwrap_err();
+        assert_eq!(e.code, Code::PlanInvalid);
+        assert!(e.detail.contains("extra"), "{}", e.detail);
+    }
+
+    #[test]
     fn the_digest_changes_with_any_field() {
         let a = empty();
         let mut b = a.clone();
         b.machine_id = "n".into();
-        assert_ne!(a.digest(), b.digest());
+        assert_ne!(a.digest().unwrap(), b.digest().unwrap());
         let mut c = a.clone();
         c.observations.seen.insert(
             "x".into(),
@@ -426,6 +507,22 @@ mod tests {
                 alias: None,
             },
         );
-        assert_ne!(a.digest(), c.digest());
+        assert_ne!(a.digest().unwrap(), c.digest().unwrap());
+    }
+
+    #[test]
+    fn node_state_hides_what_a_sensitive_path_must_not_show() {
+        let file = |sha: Option<&str>| Seen {
+            node: Node::File {
+                mode: 0o600,
+                own: true,
+                size: 9,
+                sha256: sha.map(String::from),
+            },
+            alias: None,
+        };
+        assert_eq!(node_state(&file(Some("ab")), false), "file:600:sha256:ab");
+        assert_eq!(node_state(&file(None), false), "file:600:size:9");
+        assert_eq!(node_state(&file(Some("ab")), true), "file:600");
     }
 }

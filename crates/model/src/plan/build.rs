@@ -2,11 +2,12 @@
 
 use super::graph;
 use super::{
-    Action, Binary, Blocker, Fragment, Input, LinkTo, Node, Observations, Operation, Ownership,
-    Plan, Precondition, Request, Seen, Source, Status,
+    Action, Binary, Blocker, Fragment, Incomplete, Input, LinkTo, Node, Observations, Operation,
+    Ownership, Plan, Precondition, Request, Seen, Source, Status, link_fingerprint, node_state,
 };
 use crate::digest::sha256_hex;
-use crate::refusal::Code;
+use crate::fold::fold;
+use crate::refusal::{Code, Refusal};
 use crate::resolve::{Resolved, ResolvedResource, glob};
 use crate::state::Class;
 use std::collections::{BTreeMap, BTreeSet};
@@ -22,10 +23,6 @@ fn in_scope(r: &ResolvedResource) -> bool {
     )
 }
 
-fn fold(s: &str) -> String {
-    s.to_lowercase()
-}
-
 fn parts(path: &str) -> Vec<&str> {
     path.split('/').collect()
 }
@@ -34,6 +31,7 @@ fn parts(path: &str) -> Vec<&str> {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Owned {
     pub resource: String,
+    pub adapter: String,
     pub class: Class,
     pub path: String,
     pub fingerprint: Option<String>,
@@ -47,11 +45,29 @@ pub struct Context<'a> {
     /// The canonical absolute root the sources were read from. A link points into it.
     pub root: &'a str,
     pub ledger: Vec<Owned>,
+    /// HOME-relative claimed paths that overlap the manager's own paths, with the reason. The
+    /// caller decides this with the store's rules (text scope and filesystem identity).
+    pub reserved: BTreeMap<String, String>,
+}
+
+/// Ledger outputs that no selected resource claims any more: candidates for removal.
+fn removals<'a>(resolved: &Resolved, ledger: &'a [Owned]) -> Vec<&'a Owned> {
+    ledger
+        .iter()
+        .filter(|o| {
+            let f = fold(&o.path);
+            !resolved
+                .resources
+                .get(&o.resource)
+                .is_some_and(|r| r.claims.iter().any(|c| fold(c) == f))
+        })
+        .collect()
 }
 
 /// The local facts the first observation pass must collect: every claimed path with its
-/// parents, and every fragment directory with its listing.
-pub fn requests(resolved: &Resolved) -> Vec<Request> {
+/// parents, every fragment directory with its listing, and every ledger output that is no
+/// longer claimed. A sensitive path is never hashed.
+pub fn requests(resolved: &Resolved, ledger: &[Owned]) -> Vec<Request> {
     let mut want: BTreeMap<String, (bool, bool)> = BTreeMap::new();
     for r in resolved.resources.values().filter(|r| in_scope(r)) {
         for c in &r.claims {
@@ -61,14 +77,23 @@ pub fn requests(resolved: &Resolved) -> Vec<Request> {
             want.entry(d.dir.clone()).or_default().1 = true;
         }
     }
+    for o in removals(resolved, ledger) {
+        want.entry(o.path.clone()).or_default().0 |= o.class == Class::Normal;
+    }
     want.into_iter()
         .map(|(path, (hash, list))| Request { path, hash, list })
         .collect()
 }
 
-/// The second pass: fragments already in a fragment directory, which are inputs the manager
-/// does not produce.
+/// The second pass: fragments already in a fragment directory that no resource claims. They are
+/// inputs the manager does not produce, so they are hashed. A claimed path is never requested
+/// here: whether it is hashed depends on its sensitivity and was decided in the first pass.
 pub fn followups(resolved: &Resolved, obs: &Observations) -> Vec<Request> {
+    let claimed: BTreeSet<String> = resolved
+        .resources
+        .values()
+        .flat_map(|r| r.claims.iter().map(|c| fold(c)))
+        .collect();
     let mut out = BTreeSet::new();
     for r in resolved.resources.values().filter(|r| in_scope(r)) {
         for d in &r.dir_claims {
@@ -76,11 +101,14 @@ pub fn followups(resolved: &Resolved, obs: &Observations) -> Vec<Request> {
                 continue;
             };
             for n in l.names.iter().filter(|n| matches_pattern(&d.pattern, n)) {
-                out.insert(Request {
-                    path: format!("{}/{n}", d.dir),
-                    hash: true,
-                    list: false,
-                });
+                let path = format!("{}/{n}", d.dir);
+                if !claimed.contains(&fold(&path)) {
+                    out.insert(Request {
+                        path,
+                        hash: true,
+                        list: false,
+                    });
+                }
             }
         }
     }
@@ -119,22 +147,32 @@ struct Parents {
 struct Planner<'a> {
     cx: &'a Context<'a>,
     obs: &'a Observations,
+    /// Ledger index by folded path.
+    ledger: BTreeMap<String, &'a Owned>,
     ops: BTreeMap<String, Operation>,
     blockers: Vec<Blocker>,
 }
 
-pub fn build(resolved: &Resolved, cx: &Context<'_>, obs: &Observations) -> Plan {
+pub fn build(resolved: &Resolved, cx: &Context<'_>, obs: &Observations) -> Result<Plan, Refusal> {
+    let mut ledger = BTreeMap::new();
+    for o in &cx.ledger {
+        ledger.entry(fold(&o.path)).or_insert(o);
+    }
     let mut p = Planner {
         cx,
         obs,
+        ledger,
         ops: BTreeMap::new(),
         blockers: Vec::new(),
     };
     for r in resolved.resources.values() {
         p.resource(r);
     }
+    for o in removals(resolved, &cx.ledger) {
+        p.remove(o);
+    }
     p.edges(resolved);
-    let (operations, cycle) = p.finish();
+    let (mut operations, cycle) = p.finish();
     let mut blockers = p.blockers;
     if let Some(cycle) = cycle {
         let first = operations
@@ -159,30 +197,46 @@ pub fn build(resolved: &Resolved, cx: &Context<'_>, obs: &Observations) -> Plan 
             correction: "move one output out of the other's fragment directory, or change a fragment pattern so the output no longer matches".into(),
         });
     }
-    Plan {
+    let model_digest = model_digest(resolved)?;
+    let trees: Vec<&str> = cx.sources.iter().map(|s| s.tree.as_str()).collect();
+    for o in &mut operations {
+        o.journal_id = journal_id(&model_digest, &trees, &o.id);
+    }
+    Ok(Plan {
         schema: super::SCHEMA,
         command: "plan".into(),
         scope: "config".into(),
         binary: cx.binary.clone(),
         profile: cx.profile.into(),
         machine_id: cx.machine_id.into(),
-        model_digest: model_digest(resolved),
+        model_digest,
         sources: cx.sources.clone(),
         observations: obs.clone(),
         operations,
         blockers,
-    }
+    })
+}
+
+/// A journal operation id (lowercase letters, digits; at most 64 characters) that is the same
+/// for the same model, sources and operation, and does not depend on the plan digest, which
+/// covers the id itself.
+fn journal_id(model_digest: &str, trees: &[&str], op_id: &str) -> String {
+    let h = sha256_hex(format!("{model_digest}\n{}\n{op_id}", trees.join(",")).as_bytes());
+    format!("p{}", &h[..32])
 }
 
 /// Digest of the resolved model. Values of secret-bearing resources are left out: they are
 /// references, and no hash of secret material belongs in a plan (DESIGN.md section 8).
-fn model_digest(resolved: &Resolved) -> String {
+fn model_digest(resolved: &Resolved) -> Result<String, Refusal> {
+    let ser = |e: serde_json::Error| {
+        Refusal::new(Code::IoFailed, format!("cannot serialize the model: {e}"))
+    };
     let mut doc = serde_json::Map::new();
     for (id, r) in &resolved.resources {
         let value = if r.secret_values {
             serde_json::Value::Null
         } else {
-            serde_json::to_value(&r.value).unwrap_or(serde_json::Value::Null)
+            serde_json::to_value(&r.value).map_err(ser)?
         };
         doc.insert(
             id.clone(),
@@ -196,45 +250,35 @@ fn model_digest(resolved: &Resolved) -> String {
     let all = serde_json::json!({
         "profile": resolved.profile, "modules": resolved.modules, "resources": doc,
     });
-    sha256_hex(&serde_json::to_vec(&all).expect("a json value serializes"))
-}
-
-fn node_state(seen: &Seen, sensitive: bool) -> String {
-    let base = match &seen.node {
-        Node::Missing => "missing".to_string(),
-        Node::Dir { mode, .. } => format!("dir:{mode:o}"),
-        Node::File {
-            mode, size, sha256, ..
-        } => match (sha256, sensitive) {
-            (Some(h), false) => format!("file:{mode:o}:sha256:{h}"),
-            (None, false) => format!("file:{mode:o}:size:{size}"),
-            (_, true) => format!("file:{mode:o}"),
-        },
-        Node::Link { target, to, .. } => format!("link:{target}:{to:?}").to_lowercase(),
-        Node::Other { mode, .. } => format!("other:{mode:o}"),
-        Node::Unknown { reason } => format!("unknown:{reason}"),
-    };
-    match &seen.alias {
-        Some(a) => format!("{base} alias={a}"),
-        None => base,
-    }
+    Ok(sha256_hex(&serde_json::to_vec(&all).map_err(ser)?))
 }
 
 fn pointer_escape(s: &str) -> String {
     s.replace('~', "~0").replace('/', "~1")
 }
 
+fn declared_mode(r: &ResolvedResource) -> Option<u32> {
+    match r.value.get("mode") {
+        Some(Value::Integer(m)) => u32::try_from(*m).ok(),
+        _ => None,
+    }
+}
+
 impl Planner<'_> {
-    fn blocker(&mut self, r: &ResolvedResource, path: Option<&str>, f: Fail) {
+    fn push(&mut self, resource: &str, source: &str, path: Option<&str>, f: Fail) {
         self.blockers.push(Blocker {
             code: f.code,
-            resource: r.id.clone(),
-            source: r.declared_in.clone(),
+            resource: resource.into(),
+            source: source.into(),
             field: Some(f.field.into()),
             path: path.map(String::from),
             detail: f.detail,
             correction: f.correction.into(),
         });
+    }
+
+    fn blocker(&mut self, r: &ResolvedResource, path: Option<&str>, f: Fail) {
+        self.push(&r.id, &r.declared_in, path, f);
     }
 
     fn seen(&self, path: &str) -> Result<&Seen, Fail> {
@@ -246,6 +290,31 @@ impl Planner<'_> {
                 "run plan again; if it repeats, report the path",
             )
         })
+    }
+
+    /// What a claimed path may not be: outside the ASCII names the planner can compare safely
+    /// (Unicode normalization is not folded, so two spellings could be one entry), or a path the
+    /// manager owns.
+    fn claim_checks(&self, path: &str, field: &'static str) -> Result<(), Fail> {
+        if let Some(why) = self.cx.reserved.get(path) {
+            return Err(fail(
+                Code::TargetReserved,
+                field,
+                format!("{path} overlaps a path the manager owns: {why}"),
+                "claim a path outside the manager's state, config, lock, data and cache locations",
+            ));
+        }
+        if !path.is_ascii() {
+            return Err(fail(
+                Code::TargetInvalid,
+                field,
+                format!(
+                    "{path} contains non-ASCII characters; Unicode normalization is not supported yet, so two spellings could be one entry"
+                ),
+                "use an ASCII name for the target",
+            ));
+        }
+        Ok(())
     }
 
     /// Walks the parents of `path` (every proper prefix). `write` means entries will be created
@@ -320,53 +389,53 @@ impl Planner<'_> {
         }
     }
 
+    fn skeleton(&self, r: &ResolvedResource, id: String, path: Option<String>) -> Operation {
+        Operation {
+            id,
+            journal_id: String::new(),
+            resource: r.id.clone(),
+            module: r.module.clone(),
+            adapter: r.adapter.clone(),
+            class: if r.sensitive {
+                Class::Sensitive
+            } else {
+                Class::Normal
+            },
+            action: Action::None,
+            status: Status::Blocked,
+            path,
+            mode: declared_mode(r),
+            link: None,
+            privilege: "user".into(),
+            effect: String::new(),
+            ownership: Ownership::Absent,
+            inputs: Vec::new(),
+            fragments: Vec::new(),
+            after: Vec::new(),
+            preconditions: Vec::new(),
+            postcondition: "none".into(),
+        }
+    }
+
     fn out_of_scope(&mut self, r: &ResolvedResource) {
         let secret = r.kind == "secret";
-        let (path, mode, effect) = if secret {
-            let mode = match r.value.get("mode") {
-                Some(Value::Integer(m)) => u32::try_from(*m).ok(),
-                _ => None,
-            };
+        let (path, effect) = if secret {
             (
                 r.target.clone(),
-                mode,
                 "secret output: destination and mode only; rendering needs an explicit secrets scope"
                     .to_string(),
             )
         } else {
             (
                 None,
-                None,
                 format!("{} is provisioning, outside a configuration plan", r.kind),
             )
         };
         let id = format!("{}@scope", r.id);
-        self.ops.insert(
-            id.clone(),
-            Operation {
-                id,
-                resource: r.id.clone(),
-                module: r.module.clone(),
-                adapter: r.adapter.clone(),
-                class: if r.sensitive {
-                    Class::Sensitive
-                } else {
-                    Class::Normal
-                },
-                action: Action::None,
-                status: Status::NotInScope,
-                path,
-                mode,
-                privilege: "user".into(),
-                effect,
-                ownership: Ownership::Absent,
-                inputs: Vec::new(),
-                fragments: Vec::new(),
-                after: Vec::new(),
-                preconditions: Vec::new(),
-                postcondition: "none".into(),
-            },
-        );
+        let mut op = self.skeleton(r, id.clone(), path);
+        op.status = Status::NotInScope;
+        op.effect = effect;
+        self.ops.insert(id, op);
     }
 
     /// The source files that feed one claim, and the absolute link target when the claim is a
@@ -399,27 +468,26 @@ impl Planner<'_> {
     }
 
     fn ledger_entry(&self, path: &str) -> Option<&Owned> {
-        let f = fold(path);
-        self.cx.ledger.iter().find(|o| fold(&o.path) == f)
+        self.ledger.get(&fold(path)).copied()
     }
 
-    fn ownership(&self, r: &ResolvedResource, path: &str, seen: &Seen) -> Ownership {
+    fn ownership(&self, resource: &str, sensitive: bool, path: &str, seen: &Seen) -> Ownership {
         if matches!(seen.node, Node::Missing) {
             return Ownership::Absent;
         }
         let Some(e) = self.ledger_entry(path) else {
             return Ownership::Foreign;
         };
-        if e.resource != r.id {
+        if e.resource != resource {
             return Ownership::Foreign;
         }
         let live = match &seen.node {
             Node::File { sha256, .. } => sha256.clone(),
-            Node::Link { target, .. } => Some(sha256_hex(target.as_bytes())),
+            Node::Link { target, .. } => Some(link_fingerprint(target)),
             _ => None,
         };
         match (&e.fingerprint, e.class, live) {
-            (Some(want), Class::Normal, Some(have)) if !r.sensitive => {
+            (Some(want), Class::Normal, Some(have)) if !sensitive => {
                 if *want == have {
                     Ownership::Owned
                 } else {
@@ -430,6 +498,19 @@ impl Planner<'_> {
         }
     }
 
+    fn ledger_state(&self, path: &str) -> String {
+        self.ledger_entry(path).map_or_else(
+            || "none".into(),
+            |e| {
+                format!(
+                    "{}:{}",
+                    e.resource,
+                    e.fingerprint.clone().unwrap_or_else(|| "sensitive".into())
+                )
+            },
+        )
+    }
+
     fn leaf(&mut self, r: &ResolvedResource, claim: &str) {
         let field = if r.kind == "distribution" {
             "/entries"
@@ -438,45 +519,32 @@ impl Planner<'_> {
         };
         let id = format!("{}@{claim}", r.id);
         let (inputs, link) = self.inputs(r, claim);
-        let class = if r.sensitive {
-            Class::Sensitive
-        } else {
-            Class::Normal
-        };
-        let mut op = Operation {
-            id: id.clone(),
-            resource: r.id.clone(),
-            module: r.module.clone(),
-            adapter: r.adapter.clone(),
-            class,
-            action: Action::None,
-            status: Status::Blocked,
-            path: Some(claim.into()),
-            mode: None,
-            privilege: "user".into(),
-            effect: String::new(),
-            ownership: Ownership::Absent,
-            inputs,
-            fragments: Vec::new(),
-            after: Vec::new(),
-            preconditions: Vec::new(),
-            postcondition: String::new(),
-        };
+        let mut op = self.skeleton(r, id.clone(), Some(claim.into()));
+        op.inputs = inputs;
         for i in &op.inputs {
             op.preconditions.push(Precondition {
                 subject: format!("source:{}", i.path),
                 state: i.content_id.clone().unwrap_or_else(|| "unhashed".into()),
             });
         }
-        let parents = match self.parents(claim, field, true) {
-            Ok(p) => p,
-            Err(f) => {
-                op.effect = format!("blocked: {}", f.detail);
-                self.blocker(r, Some(claim), f);
-                self.ops.insert(id, op);
-                return;
-            }
-        };
+        if let Err(f) = self.leaf_checks(r, claim, field, link.as_deref(), &mut op) {
+            op.effect = format!("blocked: {}", f.detail);
+            op.status = Status::Blocked;
+            self.blocker(r, Some(claim), f);
+        }
+        self.ops.insert(id, op);
+    }
+
+    fn leaf_checks(
+        &mut self,
+        r: &ResolvedResource,
+        claim: &str,
+        field: &'static str,
+        link: Option<&str>,
+        op: &mut Operation,
+    ) -> Result<(), Fail> {
+        self.claim_checks(claim, field)?;
+        let parents = self.parents(claim, field, true)?;
         op.preconditions.extend(parents.states.clone());
         let comps = parts(claim);
         let mut prev: Option<String> = None;
@@ -486,129 +554,263 @@ impl Planner<'_> {
             }
             op.after.extend(prev);
         }
-        let missing = Seen {
-            node: Node::Missing,
-            alias: None,
-        };
         let seen = if parents.missing_from.is_some() {
-            Ok(&missing)
-        } else {
-            self.seen(claim)
-        };
-        let seen = match seen {
-            Ok(s) => s.clone(),
-            Err(f) => {
-                op.effect = format!("blocked: {}", f.detail);
-                self.blocker(r, Some(claim), f);
-                self.ops.insert(id, op);
-                return;
+            Seen {
+                node: Node::Missing,
+                alias: None,
             }
+        } else {
+            self.seen(claim)?.clone()
         };
+        // An alias is the same entry under another spelling. Nothing is planned through it,
+        // even when the ledger owns the entry.
+        if let Some(actual) = &seen.alias {
+            return Err(alias_fail(field, claim, actual));
+        }
         op.preconditions.push(Precondition {
             subject: format!("path:{claim}"),
             state: node_state(&seen, r.sensitive),
         });
-        op.ownership = self.ownership(r, claim, &seen);
+        op.ownership = self.ownership(&r.id, r.sensitive, claim, &seen);
         op.preconditions.push(Precondition {
             subject: format!("ledger:{claim}"),
-            state: self.ledger_entry(claim).map_or_else(
-                || "none".into(),
-                |e| {
-                    format!(
-                        "{}:{}",
-                        e.resource,
-                        e.fingerprint.clone().unwrap_or_else(|| "sensitive".into())
-                    )
-                },
-            ),
+            state: self.ledger_state(claim),
         });
-        let decision = decide(r, claim, &seen, link.as_deref(), op.ownership);
-        match decision {
-            Ok((action, status, ownership, effect, post)) => {
-                op.action = action;
-                op.status = status;
-                op.ownership = ownership;
-                op.effect = effect;
-                op.postcondition = post;
-            }
-            Err(f) => {
-                op.effect = format!("blocked: {}", f.detail);
-                op.postcondition = "none".into();
-                self.blocker(r, Some(claim), f);
-            }
+        let (action, status, ownership, effect, post) =
+            decide(r, claim, &seen, link, op.ownership)?;
+        op.action = action;
+        op.status = status;
+        op.ownership = ownership;
+        op.effect = effect;
+        op.postcondition = post;
+        op.link = link.map(String::from);
+        Ok(())
+    }
+
+    /// A ledger output that nothing selects any more. It is removed only when the ledger proves
+    /// the live output is the one the manager wrote. Anything else is a conflict.
+    fn remove(&mut self, o: &Owned) {
+        let id = format!("remove@{}@{}", o.resource, o.path);
+        let mut op = Operation {
+            id: id.clone(),
+            journal_id: String::new(),
+            resource: o.resource.clone(),
+            module: String::new(),
+            adapter: o.adapter.clone(),
+            class: o.class,
+            action: Action::None,
+            status: Status::Blocked,
+            path: Some(o.path.clone()),
+            mode: None,
+            link: None,
+            privilege: "user".into(),
+            effect: String::new(),
+            ownership: Ownership::Absent,
+            inputs: Vec::new(),
+            fragments: Vec::new(),
+            after: Vec::new(),
+            preconditions: Vec::new(),
+            postcondition: "none".into(),
+        };
+        if let Err(f) = self.remove_checks(o, &mut op) {
+            op.effect = format!("blocked: {}", f.detail);
+            op.status = Status::Blocked;
+            self.push(&o.resource, "state/ledger.json", Some(&o.path), f);
         }
         self.ops.insert(id, op);
+    }
+
+    fn remove_checks(&self, o: &Owned, op: &mut Operation) -> Result<(), Fail> {
+        let field = "owned_outputs";
+        let path = o.path.as_str();
+        let parents = self.parents(path, field, true)?;
+        op.preconditions.extend(parents.states.clone());
+        let seen = if parents.missing_from.is_some() {
+            Seen {
+                node: Node::Missing,
+                alias: None,
+            }
+        } else {
+            self.seen(path)?.clone()
+        };
+        if let Some(actual) = &seen.alias {
+            return Err(alias_fail(field, path, actual));
+        }
+        op.preconditions.push(Precondition {
+            subject: format!("path:{path}"),
+            state: node_state(&seen, o.class == Class::Sensitive),
+        });
+        op.preconditions.push(Precondition {
+            subject: format!("ledger:{path}"),
+            state: self.ledger_state(path),
+        });
+        match &seen.node {
+            Node::Missing => {
+                op.status = Status::Current;
+                op.effect = format!("{path} is already absent; no longer selected");
+                return Ok(());
+            }
+            Node::Unknown { reason } => return Err(unknown_fail(field, path, reason)),
+            Node::Dir { .. } => {
+                return Err(fail(
+                    Code::Conflict,
+                    field,
+                    format!("{path} is a directory; the manager never removes a directory"),
+                    "remove it yourself if it is no longer wanted",
+                ));
+            }
+            _ => {}
+        }
+        op.ownership = self.ownership(&o.resource, o.class == Class::Sensitive, path, &seen);
+        let why = match op.ownership {
+            Ownership::Owned => None,
+            Ownership::Modified => Some("was changed after the manager wrote it"),
+            Ownership::Unverifiable => Some("has an owner the manager cannot verify"),
+            _ => Some("is not owned by this resource according to the ledger"),
+        };
+        if let Some(why) = why {
+            return Err(fail(
+                Code::Conflict,
+                field,
+                format!("{path} is no longer selected but {why}"),
+                "review the file and remove it yourself; the manager removes only what it can prove it wrote",
+            ));
+        }
+        op.action = Action::Remove;
+        op.status = Status::Planned;
+        op.effect = format!("remove {path}; no longer selected");
+        op.postcondition = format!("{path} is absent");
+        Ok(())
     }
 
     /// A directory the plan must create. One operation per directory, shared by every claim
     /// below it, chained so a child follows its parent.
     fn mkdir(&mut self, r: &ResolvedResource, path: &str, parent: Option<String>) -> String {
         let id = format!("mkdir@{path}");
-        self.ops.entry(id.clone()).or_insert_with(|| Operation {
-            id: id.clone(),
-            resource: r.id.clone(),
-            module: r.module.clone(),
-            adapter: r.adapter.clone(),
-            class: Class::Normal,
-            action: Action::CreateDir,
-            status: Status::Planned,
-            path: Some(path.into()),
-            mode: None,
-            privilege: "user".into(),
-            effect: format!("create directory {path}"),
-            ownership: Ownership::Absent,
-            inputs: Vec::new(),
-            fragments: Vec::new(),
-            after: parent.into_iter().collect(),
-            preconditions: vec![Precondition {
+        if !self.ops.contains_key(&id) {
+            let mut op = self.skeleton(r, id.clone(), Some(path.into()));
+            op.class = Class::Normal;
+            op.mode = None;
+            op.action = Action::CreateDir;
+            op.status = Status::Planned;
+            op.effect = format!("create directory {path}");
+            op.after = parent.into_iter().collect();
+            op.preconditions = vec![Precondition {
                 subject: format!("path:{path}"),
                 state: "missing".into(),
-            }],
-            postcondition: format!("{path} is a real directory"),
-        });
+            }];
+            op.postcondition = format!("{path} is a real directory");
+            self.ops.insert(id.clone(), op);
+        }
         id
     }
 
     /// A fragment directory is read, not written: it must be absent or a real directory.
     fn fragment_dir(&mut self, r: &ResolvedResource, dir: &str) {
-        let check = self.parents(dir, "/fragments_dir", false).and_then(|p| {
-            if p.missing_from.is_some() {
-                return Ok(());
-            }
-            let seen = self.seen(dir)?;
-            if let Some(a) = &seen.alias {
-                return Err(alias_fail("/fragments_dir", dir, a));
-            }
-            match &seen.node {
-                Node::Missing => Ok(()),
-                Node::Dir { own: true, .. } => Ok(()),
-                Node::Dir { .. } => {
-                    Err(privilege("/fragments_dir", dir, "is owned by another user"))
+        let check = self
+            .claim_checks(dir, "/fragments_dir")
+            .and_then(|()| self.parents(dir, "/fragments_dir", false))
+            .and_then(|p| {
+                if p.missing_from.is_some() {
+                    return Ok(());
                 }
-                Node::Link { target, to, .. } => Err(link_fail("/fragments_dir", dir, target, *to)),
-                Node::Unknown { reason } => Err(unknown_fail("/fragments_dir", dir, reason)),
-                _ => Err(fail(
-                    Code::Conflict,
-                    "/fragments_dir",
-                    format!("{dir} is not a directory"),
-                    "move the file aside or point fragments_dir at a directory",
-                )),
-            }
-        });
+                let seen = self.seen(dir)?;
+                if let Some(a) = &seen.alias {
+                    return Err(alias_fail("/fragments_dir", dir, a));
+                }
+                match &seen.node {
+                    Node::Missing => Ok(()),
+                    Node::Dir { own: true, .. } => Ok(()),
+                    Node::Dir { .. } => {
+                        Err(privilege("/fragments_dir", dir, "is owned by another user"))
+                    }
+                    Node::Link { target, to, .. } => {
+                        Err(link_fail("/fragments_dir", dir, target, *to))
+                    }
+                    Node::Unknown { reason } => Err(unknown_fail("/fragments_dir", dir, reason)),
+                    _ => Err(fail(
+                        Code::Conflict,
+                        "/fragments_dir",
+                        format!("{dir} is not a directory"),
+                        "move the file aside or point fragments_dir at a directory",
+                    )),
+                }
+            });
         if let Err(f) = check {
             self.blocker(r, Some(dir), f);
+            return;
         }
-        if self.obs.listings.get(dir).is_some_and(|l| l.truncated) {
-            self.blocker(
-                r,
-                Some(dir),
-                fail(
-                    Code::ObservationUnknown,
-                    "/fragments_dir",
+        if let Some(why) = self.obs.listings.get(dir).and_then(|l| l.incomplete) {
+            let (detail, fix) = match why {
+                Incomplete::TooMany => (
                     format!("{dir} has too many entries to list"),
                     "remove entries that are not fragments",
                 ),
+                Incomplete::Failed => (
+                    format!("{dir} could not be listed"),
+                    "make the directory readable and run plan again",
+                ),
+                Incomplete::NonUtf8 => (
+                    format!("{dir} holds an entry whose name is not UTF-8"),
+                    "rename or remove that entry",
+                ),
+            };
+            self.blocker(
+                r,
+                Some(dir),
+                fail(Code::ObservationUnknown, "/fragments_dir", detail, fix),
             );
+        }
+    }
+
+    /// Why a foreign fragment cannot be used as an input, if it cannot.
+    fn fragment_problem(&self, dir: &str, name: &str) -> Option<Fail> {
+        let path = format!("{dir}/{name}");
+        let field = "/fragments_dir";
+        if !name.is_ascii() {
+            return Some(fail(
+                Code::TargetInvalid,
+                field,
+                format!(
+                    "fragment {path} has non-ASCII characters; Unicode normalization is not supported yet"
+                ),
+                "rename the fragment with an ASCII name",
+            ));
+        }
+        let fix = "remove or replace it with a regular file you own";
+        match self.obs.seen.get(&path).map(|s| (&s.node, &s.alias)) {
+            Some((
+                Node::File {
+                    own: true,
+                    sha256: Some(_),
+                    ..
+                },
+                None,
+            )) => None,
+            Some((Node::File { sha256: None, .. } | Node::Unknown { .. }, _)) | None => Some(fail(
+                Code::ObservationUnknown,
+                field,
+                format!("fragment {path} could not be read or is too large to hash"),
+                "make it readable and within 16 MiB, or remove it",
+            )),
+            Some((Node::File { own: false, .. }, _)) => Some(fail(
+                Code::PrivilegeUnsupported,
+                field,
+                format!("fragment {path} is owned by another user"),
+                fix,
+            )),
+            Some((Node::Link { .. }, _)) => Some(fail(
+                Code::Conflict,
+                field,
+                format!("fragment {path} is a link; its content is not what the plan observed"),
+                fix,
+            )),
+            Some((_, _)) => Some(fail(
+                Code::Conflict,
+                field,
+                format!("fragment {path} is not a regular file"),
+                fix,
+            )),
         }
     }
 
@@ -626,7 +828,9 @@ impl Planner<'_> {
                 let mut selected: Vec<(String, String, String)> = Vec::new();
                 for (id, o) in &self.ops {
                     let Some(p) = &o.path else { continue };
-                    if o.action == Action::CreateDir || o.status == Status::NotInScope {
+                    if matches!(o.action, Action::CreateDir | Action::Remove)
+                        || o.status == Status::NotInScope
+                    {
                         continue;
                     }
                     let Some((parent, name)) = p.rsplit_once('/') else {
@@ -646,6 +850,7 @@ impl Planner<'_> {
                     })
                     .collect();
                 let mut foreign_state = Vec::new();
+                let mut problems = Vec::new();
                 if let Some(l) = self.obs.listings.get(&d.dir) {
                     for n in l.names.iter().filter(|n| matches_pattern(&d.pattern, n)) {
                         if selected_names.contains(&fold(n)) {
@@ -661,11 +866,18 @@ impl Planner<'_> {
                             .get(&format!("{}/{n}", d.dir))
                             .map_or_else(|| "unobserved".into(), |s| node_state(s, false));
                         foreign_state.push(format!("{n}={st}"));
+                        if let Some(f) = self.fragment_problem(&d.dir, n) {
+                            problems.push((format!("{}/{n}", d.dir), f));
+                        }
                     }
                 }
                 fragments.sort_by(|a, b| (&a.name, &a.origin).cmp(&(&b.name, &b.origin)));
                 let mut names: Vec<String> = selected.iter().map(|(_, _, n)| n.clone()).collect();
                 names.sort();
+                let blocked = !problems.is_empty();
+                for (path, f) in problems {
+                    self.blocker(r, Some(&path), f);
+                }
                 for cid in consumers {
                     if let Some(op) = self.ops.get_mut(&cid) {
                         for (pid, _, _) in &selected {
@@ -683,6 +895,10 @@ impl Planner<'_> {
                                 foreign_state.join(",")
                             ),
                         });
+                        if blocked {
+                            op.status = Status::Blocked;
+                            op.effect = format!("blocked: a fragment in {} cannot be used", d.dir);
+                        }
                     }
                 }
             }
@@ -719,14 +935,15 @@ impl Planner<'_> {
     }
 }
 
-#[allow(clippy::type_complexity)]
+type Decision = (Action, Status, Ownership, String, String);
+
 fn decide(
     r: &ResolvedResource,
     path: &str,
     seen: &Seen,
     link: Option<&str>,
     ownership: Ownership,
-) -> Result<(Action, Status, Ownership, String, String), Fail> {
+) -> Result<Decision, Fail> {
     let shown = if r.sensitive {
         format!("{path} (sensitive: destination and mode only)")
     } else {

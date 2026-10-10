@@ -12,6 +12,7 @@ use dfm_model::plan::{
 };
 use dfm_model::{Code, Refusal};
 use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
 use std::fs;
 use std::io::{Read, Write};
 use std::os::unix::fs::OpenOptionsExt;
@@ -119,6 +120,7 @@ fn owned(store: &Store, home: &Path) -> Result<Vec<Owned>, Refusal> {
                 })?;
             out.push(Owned {
                 resource: r.resource.clone(),
+                adapter: r.adapter.clone(),
                 class: r.class,
                 path: rel.into(),
                 fingerprint: o.fingerprint.clone(),
@@ -141,15 +143,31 @@ pub fn make_plan(ctx: &Ctx, root: &Path) -> Result<Plan, Refusal> {
     let ledger = owned(&store, &layout.home)?;
 
     let home = Dir::open_home(&sys, &layout.home)?;
-    let reqs = plan::requests(&loaded.resolved);
+    let reqs = plan::requests(&loaded.resolved, &ledger);
     let mut obs = observe(&sys, &home, &reqs)?;
     let more = observe(&sys, &home, &plan::followups(&loaded.resolved, &obs))?;
     merge(&mut obs, more);
 
-    let root_str = loaded
-        .root
-        .to_str()
-        .ok_or_else(|| Refusal::new(Code::ReportUnavailable, "--root is not UTF-8"))?;
+    // Claims that overlap the manager's own paths, by the store's rules: the text scope (case
+    // folded, so it holds for directories that do not exist yet) and filesystem identity.
+    let mut reserved = BTreeMap::new();
+    for r in loaded.resolved.resources.values() {
+        let dirs = r.dir_claims.iter().map(|d| &d.dir);
+        for rel in r.claims.iter().chain(dirs) {
+            let abs = home.shown().join(rel);
+            // Only an overlap is a reserved path. A path that cannot be resolved (a link loop,
+            // an unreadable parent) is the topology check's to report, with its own code.
+            if let Err(e) = store.check_claim(&abs.to_string_lossy())
+                && e.code == Code::StateInvalid
+            {
+                reserved.insert(rel.clone(), visible(&e.detail));
+            }
+        }
+    }
+
+    let root_str = loaded.root.to_str().ok_or_else(|| {
+        usage("--root resolves to a path that is not UTF-8; point --root at a UTF-8 path")
+    })?;
     let cx = Context {
         binary: binary_identity()?,
         profile: loaded.binding.profile(),
@@ -157,8 +175,9 @@ pub fn make_plan(ctx: &Ctx, root: &Path) -> Result<Plan, Refusal> {
         sources: vec![source_identity(root_str, &loaded.sources)],
         root: root_str,
         ledger,
+        reserved,
     };
-    Ok(plan::build(&loaded.resolved, &cx, &obs))
+    plan::build(&loaded.resolved, &cx, &obs)
 }
 
 fn render(p: &Plan, digest: &str, out: &mut dyn Write) -> std::io::Result<()> {
@@ -197,19 +216,26 @@ fn render(p: &Plan, digest: &str, out: &mut dyn Write) -> std::io::Result<()> {
     writeln!(out, "plan digest: {digest}")
 }
 
+const STALE_SHOWN: usize = 20;
+
 fn print_stale(list: &[Stale], out: &mut dyn Write) -> std::io::Result<()> {
-    for s in list.iter().take(20) {
+    for s in list.iter().take(STALE_SHOWN) {
         writeln!(
             out,
             "stale {}: {} was {} now {}",
-            s.what,
+            s.what.as_str(),
             visible(&s.subject),
             visible(&s.was),
             visible(&s.now)
         )?;
     }
-    if list.len() > 20 {
-        writeln!(out, "stale: {} more differences", list.len() - 20)?;
+    if list.len() > STALE_SHOWN {
+        writeln!(
+            out,
+            "stale: {} more differences not shown ({} in total)",
+            list.len() - STALE_SHOWN,
+            list.len()
+        )?;
     }
     Ok(())
 }
@@ -224,10 +250,16 @@ pub fn run(ctx: &Ctx, args: &Args, out: &mut dyn Write) -> Result<(), Refusal> {
         None => None,
     };
     let fresh = make_plan(ctx, Path::new(&args.root))?;
-    let digest = fresh.digest();
+    let digest = fresh.digest()?;
+    let diffs = match &old {
+        Some(old) => plan::stale(&old.plan, &fresh)?,
+        None => Vec::new(),
+    };
     if args.json {
-        let mut saved = fresh.saved();
+        // One JSON document on stdout, whatever the result. The differences travel inside it.
+        let mut saved = fresh.saved()?;
         saved.isolated = ctx.isolated.clone();
+        saved.stale = diffs.clone();
         out.write_all(&saved.to_json()?).map_err(w)?;
         writeln!(out).map_err(w)?;
     } else {
@@ -235,22 +267,22 @@ pub fn run(ctx: &Ctx, args: &Args, out: &mut dyn Write) -> Result<(), Refusal> {
             writeln!(out, "isolated: true {i}").map_err(w)?;
         }
         render(&fresh, &digest, out).map_err(w)?;
+        print_stale(&diffs, out).map_err(w)?;
     }
-    if let Some(old) = old {
-        let diffs = plan::stale(&old.plan, &fresh);
-        if let Some(first) = diffs.first() {
-            print_stale(&diffs, out).map_err(w)?;
-            return Err(Refusal::new(
-                Code::PlanStale,
-                visible(&format!(
-                    "{} changed: {} was {} now {}. Fix: review the new plan and approve it again; a plan whose inputs changed cannot be applied",
-                    first.what, first.subject, first.was, first.now
-                )),
-            ));
-        }
-        if !args.json {
-            writeln!(out, "plan current: the saved plan matches").map_err(w)?;
-        }
+    if let Some(first) = diffs.first() {
+        return Err(Refusal::new(
+            Code::PlanStale,
+            visible(&format!(
+                "{} changed: {} was {} now {}. Fix: review the new plan and approve it again; a plan whose inputs changed cannot be applied",
+                first.what.as_str(),
+                first.subject,
+                first.was,
+                first.now
+            )),
+        ));
+    }
+    if old.is_some() && !args.json {
+        writeln!(out, "plan current: the saved plan matches").map_err(w)?;
     }
     match fresh.blockers.first() {
         Some(b) => Err(b.refusal()),
