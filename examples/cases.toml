@@ -1,4 +1,5 @@
-# These are future resolver expectations, not executed by check_examples.py.
+# Resolver expectations. check_examples.py checks only their shape; the resolver tests in
+# crates/cli/tests/resolver execute them.
 # Changes are RFC 6902 patches to parsed documents in isolated fixture memory.
 schema = 1
 

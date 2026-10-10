@@ -2,7 +2,7 @@
 
 A proposed manager for one profile per machine, an authoritative shared core, and explicitly selected modules.
 
-**Status:** design and example fixtures, plus a Rust CLI that can be built, installed in isolation and bound to one profile ([bootstrap and binding](docs/bootstrap.md)) and a durable [state store](docs/state.md) (ownership ledger, receipts, journal, trial records). There is no configuration resolver, provider implementation, or deployment engine. `dotfiles-manager` is a working name. No license has been selected.
+**Status:** design and example fixtures, plus a Rust CLI that can be built, installed in isolation and bound to one profile ([bootstrap and binding](docs/bootstrap.md)) and a durable [state store](docs/state.md) (ownership ledger, receipts, journal, trial records). A pure configuration resolver ([resolver notes](docs/resolver.md)) and a read-only `explain` command exist. There is no provider implementation or deployment engine. `dotfiles-manager` is a working name. No license has been selected.
 
 - [Reviewed delivery roadmap](docs/roadmap.json) and [review record](docs/roadmap-review.md): M5/M3 task contracts and evidence gates. Kaneo DFM is the authoritative backlog.
 - [Checklist completion contract](docs/checklist-state.md): live Kaneo acceptance checkboxes are the sole completion state. Tasks and epics derive completion from their canonical requirements.
@@ -12,7 +12,7 @@ A proposed manager for one profile per machine, an authoritative shared core, an
 - [Example profiles](examples/profiles/): personal development, synthetic work, homelab (illustrative), and server (illustrative) compositions.
 - [Public example bundle](examples/base/bundle.toml): the mandatory core and reusable modules.
 - [Synthetic external bundle](examples/external/bundle.toml): adds a module without making the public bundle reference it.
-- [Resolver acceptance fixtures](examples/cases.toml): expected results and errors for the future resolver. These expectations are not executed yet.
+- [Resolver acceptance fixtures](examples/cases.toml): expected results and errors. `cargo test -p dfm-cli --test resolver` executes all 16 against in-memory copies. `scripts/check_examples.py` still checks only their shape.
 
 ## First delivery scope
 
