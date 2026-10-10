@@ -184,6 +184,8 @@ Read-only commands (`plan`, `explain`, `doctor`, `status`, `self-check`, and any
 
 `binary.sha256` is recorded for audit only. It is never compared across machines.
 
+**Outcome vocabulary and operation times (resolved reading, DFM-17).** `result.outcome` is the exit name of `result.exit_code` from the section 10 table: `ok` 0, `failed` 1, `usage` 2, `blocked` 3, `declined` 4, `pending` 5, `interrupted` 130, `terminated` 143. The contract lists `started_at` and `finished_at` for every operation. An operation that never ran (`not_started`, `not_in_scope`) has no times, so those two fields are absent for exactly those statuses and required for every other status.
+
 **One status vocabulary (F6).** Operation `status` and `counts` keys are the same set. `counts` has one key per status, and the sum of all counts equals the number of participants (every resource or component the plan covers, whether or not it changed).
 
 | Status | Meaning | Journal phase |
