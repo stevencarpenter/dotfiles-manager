@@ -1,0 +1,6 @@
+[package]
+name = "a"
+version = "0.1.0"
+
+[patch.other]
+b = { path = "../b" }

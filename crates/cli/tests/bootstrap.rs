@@ -1,0 +1,428 @@
+//! `scripts/bootstrap.sh`: refusals before mutation, and a full isolated install,
+//! invocation and clean removal with a real build.
+
+mod common;
+
+use common::{TempDir, repo_root};
+use std::fs;
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Output};
+
+fn script(home: &Path, args: &[&str], env: &[(&str, &str)]) -> Output {
+    let mut c = Command::new("/bin/sh");
+    c.arg(repo_root().join("scripts/bootstrap.sh"))
+        .args(args)
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("HOME", home);
+    for (k, v) in env {
+        c.env(k, v);
+    }
+    c.output().unwrap()
+}
+
+/// Test mode makes the script take the home from DFM_TEST_HOME instead of dscl.
+fn script_test_mode(home: &Path, args: &[&str], env: &[(&str, &str)]) -> Output {
+    let mut e = vec![
+        ("DFM_BOOTSTRAP_TEST", "1"),
+        ("DFM_TEST_HOME", home.to_str().unwrap()),
+    ];
+    e.extend_from_slice(env);
+    script(home, args, &e)
+}
+
+fn err(o: &Output) -> String {
+    String::from_utf8_lossy(&o.stderr).into_owned()
+}
+
+fn git(dir: &Path, args: &[&str]) -> String {
+    let o = Command::new("/usr/bin/git")
+        .current_dir(dir)
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("HOME", "/var/empty")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .args(["-c", "user.name=t", "-c", "user.email=t@example.invalid"])
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(o.status.success(), "git {args:?}: {}", err(&o));
+    String::from_utf8_lossy(&o.stdout).trim().to_string()
+}
+
+fn entries_below(dir: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    for e in fs::read_dir(dir).into_iter().flatten() {
+        let p = e.unwrap().path();
+        out.push(p.clone());
+        if p.is_dir() && !p.is_symlink() {
+            out.extend(entries_below(&p));
+        }
+    }
+    out
+}
+
+/// A tiny committed source with only a lock file. Enough for the refusals before any build.
+fn tiny_source(tmp: &Path, pin: &str) -> (PathBuf, String) {
+    let src = tmp.join("src");
+    fs::create_dir_all(&src).unwrap();
+    fs::write(
+        src.join("dotfiles-manager.lock"),
+        format!(
+            "schema = 1\n\n[manager]\ntoolchain = \"{pin}\"\ntoolchain_tree_sha256 = \"{}\"\n",
+            "0".repeat(64)
+        ),
+    )
+    .unwrap();
+    git(&src, &["init", "-q", "-b", "main"]);
+    git(&src, &["add", "-A"]);
+    git(&src, &["commit", "-q", "-m", "lock"]);
+    let sha = git(&src, &["rev-parse", "HEAD"]);
+    (src, sha)
+}
+
+#[test]
+fn unsupported_os_or_architecture_is_refused_before_mutation() {
+    let tmp = TempDir::new("script-platform");
+    let home = tmp.path().join("home");
+    fs::create_dir(&home).unwrap();
+    let (src, sha) = tiny_source(tmp.path(), "9.9.9");
+    for (os, arch) in [
+        ("Linux", "arm64"),
+        ("Darwin", "x86_64"),
+        ("Linux", "x86_64"),
+    ] {
+        let o = script_test_mode(
+            &home,
+            &[
+                "install",
+                "--source",
+                src.to_str().unwrap(),
+                "--commit",
+                &sha,
+            ],
+            &[("DFM_TEST_OS", os), ("DFM_TEST_ARCH", arch)],
+        );
+        assert_eq!(o.status.code(), Some(3), "{os}/{arch}");
+        assert!(err(&o).contains("E_PLATFORM_UNSUPPORTED"), "{}", err(&o));
+    }
+    assert!(
+        entries_below(&home).is_empty(),
+        "refusal must precede any write"
+    );
+}
+
+#[test]
+fn home_must_match_the_password_database() {
+    let tmp = TempDir::new("script-home");
+    let o = script(tmp.path(), &["uninstall"], &[]);
+    assert_eq!(o.status.code(), Some(3));
+    assert!(err(&o).contains("E_HOME_MISMATCH"), "{}", err(&o));
+    assert!(entries_below(tmp.path()).is_empty());
+}
+
+#[test]
+fn missing_toolchain_wrong_commit_and_dirty_source_are_refused_before_mutation() {
+    let tmp = TempDir::new("script-prereq");
+    let home = tmp.path().join("home");
+    fs::create_dir(&home).unwrap();
+    let (src, sha) = tiny_source(tmp.path(), "9.9.9");
+    let s = src.to_str().unwrap();
+
+    let o = script_test_mode(&home, &["install", "--source", s, "--commit", &sha], &[]);
+    assert_eq!(o.status.code(), Some(3));
+    assert!(
+        err(&o).contains("E_TOOLCHAIN_MISMATCH") && err(&o).contains("9.9.9"),
+        "{}",
+        err(&o)
+    );
+
+    let o = script_test_mode(
+        &home,
+        &["install", "--source", s, "--commit", &"a".repeat(40)],
+        &[],
+    );
+    assert_eq!(o.status.code(), Some(3));
+    assert!(err(&o).contains("E_SOURCE_UNTRUSTED"), "{}", err(&o));
+
+    fs::write(src.join("extra"), "x").unwrap();
+    let o = script_test_mode(&home, &["install", "--source", s, "--commit", &sha], &[]);
+    assert_eq!(o.status.code(), Some(3));
+    assert!(err(&o).contains("uncommitted or untracked"), "{}", err(&o));
+
+    for bad in [
+        vec!["install"],
+        vec!["install", "--source", s, "--commit", "abc"],
+        vec!["bogus"],
+        vec!["install", "--nope"],
+    ] {
+        assert_eq!(
+            script_test_mode(&home, &bad, &[]).status.code(),
+            Some(2),
+            "{bad:?}"
+        );
+    }
+    assert!(
+        entries_below(&home).is_empty(),
+        "refusals must precede any write"
+    );
+}
+
+fn clone_path(from: &Path, to: &Path) {
+    fs::create_dir_all(to.parent().unwrap()).unwrap();
+    let fast = Command::new("/bin/cp")
+        .arg("-cR")
+        .arg(from)
+        .arg(to)
+        .status()
+        .unwrap()
+        .success();
+    if !fast {
+        assert!(
+            Command::new("/bin/cp")
+                .arg("-R")
+                .arg(from)
+                .arg(to)
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
+}
+
+/// The smallest part of the host toolchain that can build this workspace.
+fn minimal_toolchain(dest: &Path) -> String {
+    let rustc = |arg: &str| {
+        let o = Command::new("rustc")
+            .current_dir(repo_root())
+            .arg(arg)
+            .output()
+            .unwrap();
+        assert!(o.status.success(), "rustc {arg} failed");
+        String::from_utf8_lossy(&o.stdout).trim().to_string()
+    };
+    let version = rustc("-V").split_whitespace().nth(1).unwrap().to_string();
+    let sysroot = PathBuf::from(rustc("--print=sysroot"));
+    for rel in [
+        "bin/cargo",
+        "bin/rustc",
+        "lib/libLLVM.dylib",
+        "lib/rustlib/aarch64-apple-darwin/lib",
+        "lib/rustlib/aarch64-apple-darwin/bin",
+    ] {
+        clone_path(&sysroot.join(rel), &dest.join(rel));
+    }
+    for e in fs::read_dir(sysroot.join("lib")).unwrap() {
+        let e = e.unwrap();
+        if e.file_name()
+            .to_string_lossy()
+            .starts_with("librustc_driver")
+        {
+            clone_path(&e.path(), &dest.join("lib").join(e.file_name()));
+        }
+    }
+    version
+}
+
+/// Copies the repository working tree, skipping build output and tool caches.
+fn copy_repo(from: &Path, to: &Path) {
+    const SKIP: [&str; 8] = [
+        ".git",
+        "target",
+        ".venv",
+        ".ruff_cache",
+        "__pycache__",
+        ".lavish",
+        ".idea",
+        ".pi",
+    ];
+    fs::create_dir_all(to).unwrap();
+    for e in fs::read_dir(from).unwrap() {
+        let e = e.unwrap();
+        let name = e.file_name();
+        let ty = e.file_type().unwrap();
+        if SKIP.iter().any(|s| name == *s) || ty.is_symlink() {
+            continue;
+        }
+        if ty.is_dir() {
+            copy_repo(&e.path(), &to.join(&name));
+        } else {
+            fs::copy(e.path(), to.join(&name)).unwrap();
+        }
+    }
+}
+
+/// Working-tree copy of this repository, committed, plus the lock a reviewer would write.
+fn full_source(tmp: &Path, pin: &str, digest: &str) -> (PathBuf, String) {
+    let src = tmp.join("src");
+    copy_repo(&repo_root(), &src);
+    fs::write(
+        src.join("rust-toolchain.toml"),
+        format!("[toolchain]\nchannel = \"{pin}\"\n"),
+    )
+    .unwrap();
+    fs::write(
+        src.join("dotfiles-manager.lock"),
+        format!("schema = 1\n\n[manager]\nversion = \"0.1.0\"\ntoolchain = \"{pin}\"\ntoolchain_tree_sha256 = \"{digest}\"\n"),
+    )
+    .unwrap();
+    git(&src, &["init", "-q", "-b", "main"]);
+    git(&src, &["add", "-A"]);
+    git(&src, &["commit", "-q", "-m", "source"]);
+    let sha = git(&src, &["rev-parse", "HEAD"]);
+    (src, sha)
+}
+
+#[test]
+fn isolated_install_invocation_and_clean_removal() {
+    if std::env::var_os("DFM_SKIP_NETWORK_TESTS").is_some() {
+        eprintln!(
+            "SKIPPED: DFM_SKIP_NETWORK_TESTS is set; the install needs crates.io for `cargo fetch`"
+        );
+        return;
+    }
+    let tmp = TempDir::new("install");
+    let home = tmp.path().join("home");
+    let data = home.join(".local/share/dotfiles-manager");
+    fs::create_dir_all(&home).unwrap();
+
+    // Owner step: place the exact pinned toolchain and record its tree digest in the lock.
+    let tc_tmp = tmp.path().join("tc");
+    let pin = minimal_toolchain(&tc_tmp);
+    let tc = data.join("toolchains").join(&pin);
+    fs::create_dir_all(tc.parent().unwrap()).unwrap();
+    fs::rename(&tc_tmp, &tc).unwrap();
+    let digest = dfm_cli::toolchain_tree_digest(&tc).unwrap();
+    let shell_digest = script_test_mode(
+        &home,
+        &["toolchain-digest", "--dir", tc.to_str().unwrap()],
+        &[],
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&shell_digest.stdout).trim(),
+        digest,
+        "shell and Rust toolchain digests differ"
+    );
+    let (src, sha) = full_source(tmp.path(), &pin, &digest);
+
+    // A caller environment that tries to redirect the build: none of it may be used.
+    let planted = tmp.path().join("planted");
+    let marker = tmp.path().join("planted-was-invoked");
+    fs::create_dir(&planted).unwrap();
+    for tool in ["cargo", "rustc", "rustup", "cc"] {
+        let p = planted.join(tool);
+        fs::write(
+            &p,
+            format!("#!/bin/sh\necho {tool} >> {}\nexit 1\n", marker.display()),
+        )
+        .unwrap();
+        fs::set_permissions(&p, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let path = format!("{}:/usr/bin:/bin", planted.display());
+    let o = script_test_mode(
+        &home,
+        &[
+            "install",
+            "--source",
+            src.to_str().unwrap(),
+            "--commit",
+            &sha,
+        ],
+        &[
+            ("PATH", &path),
+            ("RUSTUP_TOOLCHAIN", "planted"),
+            ("RUSTC", planted.join("rustc").to_str().unwrap()),
+            ("CARGO_HOME", "/nonexistent-cargo-home"),
+            ("RUSTFLAGS", "--cfg planted"),
+        ],
+    );
+    assert_eq!(
+        o.status.code(),
+        Some(0),
+        "install failed:\n{}\n{}",
+        String::from_utf8_lossy(&o.stdout),
+        err(&o)
+    );
+    assert!(
+        !marker.exists(),
+        "a planted proxy was invoked: {}",
+        fs::read_to_string(&marker).unwrap_or_default()
+    );
+
+    // Layout and identity.
+    let name = format!("0.1.0-{}", &sha[..12]);
+    assert_eq!(
+        fs::read_link(data.join("current")).unwrap(),
+        Path::new(&format!("versions/{name}"))
+    );
+    assert!(
+        data.join("versions")
+            .join(&name)
+            .join("dotfiles-manager")
+            .is_file()
+    );
+    assert_eq!(
+        fs::read_link(home.join(".local/bin/dotfiles-manager")).unwrap(),
+        data.join("current/dotfiles-manager")
+    );
+    for gone in ["cargo-home", "rustup-home", "build-home"] {
+        assert!(
+            !data.join(gone).exists(),
+            "{gone} should be removed after the build"
+        );
+    }
+    assert!(!home.join(".cache/dotfiles-manager/build").exists());
+
+    // Invocation of the installed release binary, which has no test-isolation overrides.
+    let bin = home.join(".local/bin/dotfiles-manager");
+    let run = |args: &[&str], env: &[(&str, &str)]| {
+        let mut c = Command::new(&bin);
+        c.env_clear().args(args);
+        for (k, v) in env {
+            c.env(k, v);
+        }
+        c.output().unwrap()
+    };
+    let v = run(&["--version"], &[]);
+    let v = String::from_utf8_lossy(&v.stdout).into_owned();
+    assert_eq!(v.trim(), format!("dotfiles-manager 0.1.0 (commit {sha})"));
+    assert_eq!(
+        run(&["--home", home.to_str().unwrap(), "binding"], &[])
+            .status
+            .code(),
+        Some(2),
+        "--home must not exist in a release build"
+    );
+    let o = run(
+        &["binding"],
+        &[
+            ("HOME", home.to_str().unwrap()),
+            ("DFM_HOME", home.to_str().unwrap()),
+        ],
+    );
+    assert_eq!(
+        o.status.code(),
+        Some(3),
+        "DFM_HOME must be ignored in a release build"
+    );
+    assert!(err(&o).contains("E_HOME_MISMATCH"));
+    assert!(
+        !home.join(".config").exists(),
+        "installation must not bind or apply anything"
+    );
+
+    // Clean removal leaves only the owner-placed toolchain.
+    let o = script_test_mode(&home, &["uninstall"], &[]);
+    assert_eq!(o.status.code(), Some(0), "{}", err(&o));
+    let left: Vec<_> = entries_below(&home)
+        .into_iter()
+        .filter(|p| !p.starts_with(data.join("toolchains")) && !p.is_dir())
+        .collect();
+    assert!(left.is_empty(), "files left after uninstall: {left:?}");
+    assert!(
+        tc.join("bin/cargo").exists(),
+        "uninstall must not remove the toolchain"
+    );
+}
