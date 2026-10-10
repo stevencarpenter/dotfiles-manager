@@ -156,6 +156,42 @@ pub struct Listing {
     pub odd: usize,
 }
 
+/// What `fstatat` found at one entry, without following it.
+#[derive(Debug)]
+pub enum Peek {
+    Missing,
+    Dir {
+        mode: u32,
+        own: bool,
+    },
+    File {
+        mode: u32,
+        own: bool,
+        size: u64,
+    },
+    Link {
+        target: String,
+        to: PeekTo,
+        own: bool,
+    },
+    Other {
+        mode: u32,
+        own: bool,
+    },
+    /// The entry could not be examined; the text is the error kind.
+    Unknown(String),
+}
+
+/// What a link resolves to when followed once.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PeekTo {
+    Dir,
+    File,
+    Other,
+    Dangling,
+    Loop,
+}
+
 /// An open directory. Operations take a plain entry name and act on this directory only.
 #[derive(Debug)]
 pub struct Dir {
@@ -618,6 +654,86 @@ impl Dir {
                 .map_err(|e| io("sync journal", &e))
                 .and_then(|()| fail.hit(&format!("{label}-after-write"))),
         )
+    }
+
+    /// Opens the subdirectory `name` for reading without following a link and without any
+    /// owner or mode check. `None` when `name` is absent or is not a directory (a link, a file).
+    /// For observation only: nothing is created and nothing is judged here.
+    pub fn peek_dir(&self, name: &str) -> Result<Option<Dir>, Refusal> {
+        check_name(name)?;
+        let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+        match rfs::openat(&self.fd, name, flags, Mode::empty()) {
+            Ok(fd) => Ok(Some(Dir {
+                fd,
+                shown: self.at(name),
+            })),
+            Err(Errno::NOENT | Errno::NOTDIR | Errno::LOOP) => Ok(None),
+            Err(e) => Err(sys_err(&format!("open {}", self.at(name).display()), e)),
+        }
+    }
+
+    /// Looks at the entry `name` without following it (`fstatat` with `AT_SYMLINK_NOFOLLOW`).
+    /// A link is read, and followed once from this directory to say what it resolves to.
+    pub fn peek(&self, sys: &Sys, name: &str) -> Result<Peek, Refusal> {
+        check_name(name)?;
+        let st = match rfs::statat(&self.fd, name, AtFlags::SYMLINK_NOFOLLOW) {
+            Ok(st) => st,
+            Err(Errno::NOENT) => return Ok(Peek::Missing),
+            Err(e) => return Ok(Peek::Unknown(io_kind(e))),
+        };
+        let (mode, own) = (mode_bits(&st), st.st_uid == sys.uid);
+        Ok(match kind(&st) {
+            FileType::Directory => Peek::Dir { mode, own },
+            FileType::RegularFile => Peek::File {
+                mode,
+                own,
+                size: u64::try_from(st.st_size).unwrap_or(u64::MAX),
+            },
+            FileType::Symlink => {
+                let target = match rfs::readlinkat(&self.fd, name, Vec::new()) {
+                    Ok(t) => t.to_string_lossy().into_owned(),
+                    Err(e) => return Ok(Peek::Unknown(io_kind(e))),
+                };
+                let to = match rfs::statat(&self.fd, name, AtFlags::empty()) {
+                    Ok(f) => match kind(&f) {
+                        FileType::Directory => PeekTo::Dir,
+                        FileType::RegularFile => PeekTo::File,
+                        _ => PeekTo::Other,
+                    },
+                    Err(Errno::NOENT | Errno::NOTDIR) => PeekTo::Dangling,
+                    Err(Errno::LOOP) => PeekTo::Loop,
+                    Err(e) => return Ok(Peek::Unknown(io_kind(e))),
+                };
+                Peek::Link { target, to, own }
+            }
+            _ => Peek::Other { mode, own },
+        })
+    }
+
+    /// Reads at most `limit` bytes of the regular file `name` without following a link.
+    /// `None` when it is absent, not a regular file, or larger than `limit`.
+    pub fn read_plain(&self, name: &str, limit: u64) -> Result<Option<Vec<u8>>, Refusal> {
+        check_name(name)?;
+        let fd = match rfs::openat(
+            &self.fd,
+            name,
+            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+            Mode::empty(),
+        ) {
+            Ok(fd) => fd,
+            Err(Errno::NOENT | Errno::LOOP | Errno::NOTDIR) => return Ok(None),
+            Err(e) => return Err(sys_err(&format!("open {}", self.at(name).display()), e)),
+        };
+        let st = rfs::fstat(&fd).map_err(|e| sys_err("stat file", e))?;
+        if kind(&st) != FileType::RegularFile {
+            return Ok(None);
+        }
+        let mut buf = Vec::new();
+        File::from(fd)
+            .take(limit.saturating_add(1))
+            .read_to_end(&mut buf)
+            .map_err(|e| io("read file", &e))?;
+        Ok((u64::try_from(buf.len()).unwrap_or(u64::MAX) <= limit).then_some(buf))
     }
 
     /// Lists this directory. Entry names that are not UTF-8 are counted, not dropped silently.
