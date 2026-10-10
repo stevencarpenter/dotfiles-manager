@@ -26,6 +26,27 @@ pub enum Code {
     OpInterrupted,
     Diagnosed,
     IoUnconfirmed,
+    // Resolver codes. The `expected_error` values in examples/cases.toml and E_ADAPTER_UNKNOWN
+    // (docs/architecture.md section 11) are fixed by the docs. The others are added by DFM-15
+    // and listed in docs/resolver.md.
+    OverrideForbidden,
+    OverrideConflict,
+    CoreReplacement,
+    ModuleUnknown,
+    ModuleDuplicate,
+    DependencyCycle,
+    BundleCycle,
+    ExtensionNamespace,
+    ExtensionConflict,
+    SourceMissing,
+    SourceEscape,
+    TargetCollision,
+    TargetInvalid,
+    AdapterUnknown,
+    FieldUnknown,
+    ManifestInvalid,
+    ReferenceInvalid,
+    TypeMismatch,
 }
 
 impl Code {
@@ -51,6 +72,24 @@ impl Code {
             Code::OpInterrupted => "E_OP_INTERRUPTED",
             Code::Diagnosed => "E_DIAGNOSED",
             Code::IoUnconfirmed => "E_IO_UNCONFIRMED",
+            Code::OverrideForbidden => "E_OVERRIDE_FORBIDDEN",
+            Code::OverrideConflict => "E_OVERRIDE_CONFLICT",
+            Code::CoreReplacement => "E_CORE_REPLACEMENT",
+            Code::ModuleUnknown => "E_MODULE_UNKNOWN",
+            Code::ModuleDuplicate => "E_MODULE_DUPLICATE",
+            Code::DependencyCycle => "E_DEPENDENCY_CYCLE",
+            Code::BundleCycle => "E_BUNDLE_CYCLE",
+            Code::ExtensionNamespace => "E_EXTENSION_NAMESPACE",
+            Code::ExtensionConflict => "E_EXTENSION_CONFLICT",
+            Code::SourceMissing => "E_SOURCE_MISSING",
+            Code::SourceEscape => "E_SOURCE_ESCAPE",
+            Code::TargetCollision => "E_TARGET_COLLISION",
+            Code::TargetInvalid => "E_TARGET_INVALID",
+            Code::AdapterUnknown => "E_ADAPTER_UNKNOWN",
+            Code::FieldUnknown => "E_FIELD_UNKNOWN",
+            Code::ManifestInvalid => "E_MANIFEST_INVALID",
+            Code::ReferenceInvalid => "E_REFERENCE_INVALID",
+            Code::TypeMismatch => "E_TYPE_MISMATCH",
         }
     }
 
