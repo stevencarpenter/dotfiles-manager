@@ -15,6 +15,7 @@ test-isolation = []
 
 [dependencies]
 dfm-model = { workspace = true }
+dfm-engine = { workspace = true }
 dfm-platform-macos = { workspace = true }
 sha2 = { workspace = true }
 
@@ -24,6 +25,10 @@ sha2 = { workspace = true }
 # for every build of the package.
 [[test]]
 name = "cli"
+required-features = ["test-isolation"]
+
+[[test]]
+name = "state"
 required-features = ["test-isolation"]
 
 [[test]]

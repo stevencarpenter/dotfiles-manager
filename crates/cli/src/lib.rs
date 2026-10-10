@@ -1,15 +1,19 @@
 //! `dotfiles-manager` command line: version, help, explicit profile binding and self-check.
 
 mod controls_fs;
+mod state_cmd;
 
 pub use controls_fs::{check_build_controls, toolchain_tree_digest};
 
+use dfm_engine::fsys::{canonical_home, check_dir_chain};
+use dfm_engine::{Fail, Found, Layout, Store, Sys};
 use dfm_model::binding::{Binding, MAX_BYTES, check_profile};
+use dfm_model::state::Stamp;
 use dfm_model::{Code, Exit, Refusal};
 use dfm_platform_macos::{Platform, check_supported, current_platform};
 use std::fs;
 use std::io::{ErrorKind, Read, Write};
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 const HELP: &str = "\
@@ -20,6 +24,7 @@ usage:
   dotfiles-manager --help | help
   dotfiles-manager bind --profile <file> --machine-id <id>
   dotfiles-manager binding
+  dotfiles-manager state check
   dotfiles-manager self-check --build-controls <staged tree>
   dotfiles-manager self-check --fixture-dir <dir>
 
@@ -52,6 +57,31 @@ struct Ctx {
     os: String,
     arch: String,
     isolated: Option<String>,
+}
+
+impl Ctx {
+    fn layout(&self) -> Layout {
+        Layout {
+            home: self.platform.home().to_path_buf(),
+            config_dir: self
+                .binding_path
+                .parent()
+                .map_or_else(|| self.platform.config_dir(), Path::to_path_buf),
+            state_root: self.platform.state_dir(),
+            lock_file: self.platform.lock_path(),
+        }
+    }
+
+    fn sys(&self) -> Result<Sys, Refusal> {
+        let uid = dfm_platform_macos::current_uid()
+            .ok_or_else(|| Refusal::new(Code::StorageInvalid, "cannot read the user id"))?;
+        Ok(Sys {
+            uid,
+            o_nofollow: dfm_platform_macos::O_NOFOLLOW,
+            o_nonblock: dfm_platform_macos::O_NONBLOCK,
+            eloop: dfm_platform_macos::ELOOP,
+        })
+    }
 }
 
 #[cfg(feature = "test-isolation")]
@@ -194,7 +224,7 @@ fn dispatch(args: &[String], out: &mut dyn Write) -> Result<(), Refusal> {
         "binding" if rest.is_empty() => {
             let ctx = context(home)?;
             header(out, &ctx).map_err(w)?;
-            match read_binding(&ctx.binding_path)? {
+            match read_existing_binding(&ctx)? {
                 None => writeln!(out, "unbound"),
                 Some(b) => writeln!(
                     out,
@@ -205,6 +235,13 @@ fn dispatch(args: &[String], out: &mut dyn Write) -> Result<(), Refusal> {
             }
             .map_err(w)
         }
+        "state" => state_cmd::dispatch_state(&context(home)?, rest, out),
+        #[cfg(feature = "test-isolation")]
+        "__record-op" => state_cmd::record_op(&context(home)?, rest, out),
+        #[cfg(feature = "test-isolation")]
+        "__record-trial" => state_cmd::record_trial(&context(home)?, rest, out),
+        #[cfg(feature = "test-isolation")]
+        "__reconcile" if rest.is_empty() => state_cmd::reconcile(&context(home)?, out),
         "self-check" => {
             let [controls, fixture] = flags(rest, ["--build-controls", "--fixture-dir"])?;
             match (controls, fixture) {
@@ -293,6 +330,35 @@ fn rebind_refusal(have: &Binding) -> Refusal {
     )
 }
 
+/// Validates the topology of the binding's directory, then reads the binding. A redirected,
+/// mistyped or badly owned directory is `E_STORAGE_INVALID`. Nothing is created.
+fn read_existing_binding(ctx: &Ctx) -> Result<Option<Binding>, Refusal> {
+    match config_chain(ctx, false)? {
+        Found::Absent => Ok(None),
+        Found::Present => read_binding(&ctx.binding_path),
+    }
+}
+
+/// The config directory is shared with other tools, so an existing one only has to be closed
+/// to group and others. A directory this call creates is 0700.
+fn config_chain(ctx: &Ctx, create: bool) -> Result<Found, Refusal> {
+    let layout = ctx.layout();
+    let sys = ctx.sys()?;
+    let home = canonical_home(&sys, &layout.home)?;
+    let rel = dfm_engine::fsys::below(&layout.home, &layout.config_dir)?;
+    check_dir_chain(&sys, &home, &rel, rel.len(), create)
+}
+
+fn state_owner_refusal(owner: &Stamp) -> Refusal {
+    Refusal::new(
+        Code::RebindUnsupported,
+        format!(
+            "the state directory belongs to {} as {}; rebinding is an ownership migration and is not supported",
+            owner.profile, owner.machine_id
+        ),
+    )
+}
+
 fn bind(ctx: &Ctx, profile: String, machine_id: String) -> Result<String, Refusal> {
     check_supported(&ctx.os, &ctx.arch)?;
     let invalid = |d: String| Refusal::new(Code::ProfileInvalid, d);
@@ -310,17 +376,56 @@ fn bind(ctx: &Ctx, profile: String, machine_id: String) -> Result<String, Refusa
         .map_err(|e| invalid(format!("{real}: {}", e.kind())))?;
     check_profile(&content)?;
     let want = Binding::new(real, &machine_id)?;
-    if let Some(have) = read_binding(&ctx.binding_path)? {
-        return if have.same_identity(&want) {
-            Ok("already bound".into())
-        } else {
-            Err(rebind_refusal(&have))
-        };
+    let stamp = Stamp::of(&want);
+    let (layout, sys) = (ctx.layout(), ctx.sys()?);
+
+    // Phase 1 decides from a read-only look and refuses before any write. A different identity,
+    // in the binding or in the state directory, is never replaced.
+    let have = read_existing_binding(ctx)?;
+    if let Some(h) = &have
+        && !h.same_identity(&want)
+    {
+        return Err(rebind_refusal(h));
     }
+    let owned = match Store::open_read(sys, &layout, Fail::none())? {
+        Some(s) => {
+            let doc = s.read_state()?;
+            if !doc.binding.same_identity(&stamp) {
+                return Err(state_owner_refusal(&doc.binding));
+            }
+            true
+        }
+        None => false,
+    };
+    if have.is_some() && owned {
+        return Ok("already bound".into());
+    }
+
+    // Phase 2 writes under the manager lock and decides again, because another command may have
+    // bound in between. The state records the identity first, so a crash between the two writes
+    // can only be retried by the same identity.
+    let store = Store::open_write(sys, &layout, state_cmd::fail_from_env()?)?;
+    let have = read_existing_binding(ctx)?;
+    if let Some(h) = &have
+        && !h.same_identity(&want)
+    {
+        return Err(rebind_refusal(h));
+    }
+    if store.is_initialized()? {
+        let doc = store.read_state()?;
+        if !doc.binding.same_identity(&stamp) {
+            return Err(state_owner_refusal(&doc.binding));
+        }
+    } else {
+        store.init(&stamp)?;
+    }
+    if have.is_some() {
+        return Ok("already bound".into());
+    }
+    config_chain(ctx, true)?;
     if publish(&ctx.binding_path, &want)? {
         return Ok(format!("bound {real} as {machine_id}"));
     }
-    // Another process bound first: same identity is success, anything else is a rebind.
     match read_binding(&ctx.binding_path)? {
         Some(have) if have.same_identity(&want) => Ok("already bound".into()),
         Some(have) => Err(rebind_refusal(&have)),
@@ -333,7 +438,7 @@ fn bind(ctx: &Ctx, profile: String, machine_id: String) -> Result<String, Refusa
 
 /// Writes the binding with create-new semantics. `Ok(false)` means the file already existed.
 /// The content is complete before it becomes visible: temp file, fsync, then `hard_link`
-/// (which never replaces an existing file).
+/// (which never replaces an existing file). The directory was validated by the caller.
 fn publish(path: &Path, b: &Binding) -> Result<bool, Refusal> {
     let io = |what: &str, e: std::io::Error| {
         Refusal::new(Code::IoFailed, format!("{what}: {}", e.kind()))
@@ -341,11 +446,6 @@ fn publish(path: &Path, b: &Binding) -> Result<bool, Refusal> {
     let parent = path
         .parent()
         .ok_or_else(|| Refusal::new(Code::BindingInvalid, "binding path has no parent"))?;
-    fs::DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
-        .create(parent)
-        .map_err(|e| io("create config dir", e))?;
     // pid, a counter and the clock make the name unpredictable enough that create_new fails
     // rather than writing through a name an attacker prepared.
     static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);

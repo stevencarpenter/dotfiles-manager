@@ -166,7 +166,7 @@ fn only_the_contract_crates_are_direct_dependencies() {
 
 #[test]
 fn crate_dependency_direction_follows_the_contract() {
-    // model -> nothing; platform_macos -> model; cli -> model, platform_macos. Cargo rejects
+    // model -> nothing; engine -> model; platform_macos -> model; cli -> model, engine, platform_macos. Cargo rejects
     // cycles, so checking the allowed edges is enough to keep the layering.
     let deps = |krate: &str| -> Vec<String> {
         let text =
@@ -184,7 +184,10 @@ fn crate_dependency_direction_follows_the_contract() {
     assert!(deps("model").is_empty());
     assert_eq!(deps("engine"), ["dfm-model"]);
     assert_eq!(deps("platform_macos"), ["dfm-model"]);
-    assert_eq!(deps("cli"), ["dfm-model", "dfm-platform-macos"]);
+    assert_eq!(
+        deps("cli"),
+        ["dfm-model", "dfm-engine", "dfm-platform-macos"]
+    );
 }
 
 #[test]

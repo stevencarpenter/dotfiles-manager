@@ -24,6 +24,7 @@ pub enum Code {
     IdentityMismatch,
     Locked,
     OpInterrupted,
+    Diagnosed,
 }
 
 impl Code {
@@ -47,14 +48,15 @@ impl Code {
             Code::IdentityMismatch => "E_IDENTITY_MISMATCH",
             Code::Locked => "E_LOCKED",
             Code::OpInterrupted => "E_OP_INTERRUPTED",
+            Code::Diagnosed => "E_DIAGNOSED",
         }
     }
 
     pub const fn exit(self) -> Exit {
         match self {
             Code::Usage => Exit::Usage,
-            // A failure while writing is not a refusal before mutation.
-            Code::IoFailed => Exit::Failed,
+            // A failure while writing, or findings from a read-only check, are not refusals.
+            Code::IoFailed | Code::Diagnosed => Exit::Failed,
             _ => Exit::Blocked,
         }
     }

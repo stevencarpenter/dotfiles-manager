@@ -85,13 +85,18 @@ impl Store {
             return Ok(None);
         }
         let s = Store::new(sys, layout, home, fail)?;
-        if check_dir_chain(&sys, &s.root, &[STATE.into()], 0, false)? == Found::Absent {
-            return Ok(None);
+        Ok(s.check_layout()?.then_some(s))
+    }
+
+    /// Validates `state` and its subdirectories if they exist. `false` when `state` is absent.
+    fn check_layout(&self) -> Result<bool, Refusal> {
+        if check_dir_chain(&self.sys, &self.root, &[STATE.into()], 0, false)? == Found::Absent {
+            return Ok(false);
         }
         for d in SUBDIRS {
-            check_dir_chain(&sys, &s.dir, &[d.into()], 0, false)?;
+            check_dir_chain(&self.sys, &self.dir, &[d.into()], 0, false)?;
         }
-        Ok(Some(s))
+        Ok(true)
     }
 
     /// Opens for writing: creates the shared parent of the lock file, takes the exclusive lock
@@ -107,6 +112,8 @@ impl Store {
         check_dir_chain(&sys, &home, &rel, rel.len() - 1, true)?;
         let mut s = Store::new(sys, layout, home, fail)?;
         s.lock = Some(lock);
+        // A writer must not act on a state directory whose layout it would refuse to read.
+        s.check_layout()?;
         Ok(s)
     }
 

@@ -9,5 +9,5 @@ pub mod fsys;
 pub mod store;
 
 pub use fail::{Action, Fail};
-pub use fsys::{Layout, Lock, Sys};
+pub use fsys::{Found, Layout, Lock, Sys};
 pub use store::{Finding, Loaded, Probe, Store, now_unix, verify_identity};

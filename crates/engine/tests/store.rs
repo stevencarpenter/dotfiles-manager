@@ -462,10 +462,11 @@ fn redirected_roots_and_conflicting_types_are_refused_with_zero_foreign_writes()
     fs::create_dir_all(&root).unwrap();
     fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
     fs::write(root.join("state"), "file").unwrap();
-    let stamp = Stamp::of(&binding("/p/profile.toml", "m5"));
-    let s = open(&h);
-    assert_eq!(code(s.init(&stamp)), Code::StorageInvalid);
-    drop(s);
+    // A writer refuses a mistyped state path when it opens, before any init or effect.
+    assert_eq!(
+        code(Store::open_write(sys(&h), &h.layout(), Fail::none())),
+        Code::StorageInvalid
+    );
     fs::remove_file(root.join("state")).unwrap();
     let (s, _) = init(&h);
     drop(s);
@@ -476,9 +477,11 @@ fn redirected_roots_and_conflicting_types_are_refused_with_zero_foreign_writes()
         code(Store::open_read(sys(&h), &h.layout(), Fail::none())),
         Code::StorageInvalid
     );
-    let s = open(&h);
-    let r = receipt(&stamp, "run-1", vec![]);
-    assert_eq!(code(s.write_receipt(&r)), Code::StorageInvalid);
+    // The writer refuses on open, so no receipt is ever written through the link.
+    assert_eq!(
+        code(Store::open_write(sys(&h), &h.layout(), Fail::none())),
+        Code::StorageInvalid
+    );
     assert!(files_below(&foreign.0).is_empty());
 }
 
