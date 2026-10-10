@@ -24,8 +24,23 @@ fn the_isolated_build_is_enabled_for_this_run() {
     let enabled = std::hint::black_box(cfg!(feature = "test-isolation"));
     assert!(
         enabled,
-        "run scripts/check_all.sh rust-tests; a plain cargo test skips the cli and build_controls targets"
+        "run scripts/check_all.sh rust-tests; a plain cargo test skips the cli and build_controls targets (use --no-fail-fast to see every other failure)"
     );
+}
+
+#[test]
+fn the_documented_fixture_count_is_the_real_one() {
+    let doc = fs::read_to_string(repo_root().join("docs/bootstrap.md")).unwrap();
+    let said: usize = doc
+        .split("Shared checker fixtures (")
+        .nth(1)
+        .and_then(|r| r.split_whitespace().next())
+        .and_then(|n| n.parse().ok())
+        .expect("docs/bootstrap.md states the fixture count");
+    let real = fs::read_dir(repo_root().join("tests/fixtures/build-controls/cases"))
+        .unwrap()
+        .count();
+    assert_eq!(said, real, "update the count in docs/bootstrap.md");
 }
 
 #[test]

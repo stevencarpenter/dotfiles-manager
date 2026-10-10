@@ -389,7 +389,8 @@ fn caller_environment_cannot_influence_the_script() {
                 tc.to_str().unwrap(),
             ])
             .env_clear()
-            .env("PATH", "/usr/bin:/bin")
+            // The exact PATH the script requires, so only the allowlist can refuse.
+            .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
             .env("HOME", &home)
             .env("DFM_BOOTSTRAP_TEST", "1")
             .env("DFM_TEST_HOME", &home);
@@ -398,13 +399,33 @@ fn caller_environment_cannot_influence_the_script() {
         }
         c.output().unwrap()
     };
+    // Control: the marker with a clean environment is accepted and gives the real digest.
+    let ok = with_marker(&[]);
+    assert_eq!(ok.status.code(), Some(0), "{}", err(&ok));
+    assert_eq!(String::from_utf8_lossy(&ok.stdout).trim(), clean);
+    let evil_ran = tmp.path().join("evil-ran");
+    fs::write(
+        forge.join("Evil.pm"),
+        format!(
+            "package Evil; BEGIN {{ open my $f, '>', '{}'; print $f 'x'; }} 1;\n",
+            evil_ran.display()
+        ),
+    )
+    .unwrap();
     for hostile_var in [
         ("PERL5OPT", "-MForge"),
         ("BASH_FUNC_cut%%", "() { echo forged; }"),
+        // Functions named like the shell's own test commands must not defeat the guard.
+        ("BASH_FUNC_[%%", "() { return 0; }"),
+        ("BASH_FUNC_test%%", "() { return 0; }"),
         ("DFM_BS_CLEAN", "1"),
         ("CDPATH", "/tmp"),
     ] {
-        let o = with_marker(&[("PERL5LIB", forge.to_str().unwrap()), hostile_var]);
+        let o = with_marker(&[
+            ("PERL5LIB", forge.to_str().unwrap()),
+            ("PERL5OPT", "-MEvil"),
+            hostile_var,
+        ]);
         assert_eq!(
             o.status.code(),
             Some(3),
@@ -413,8 +434,12 @@ fn caller_environment_cannot_influence_the_script() {
         );
         assert!(
             o.stdout.is_empty() && err(&o).contains("E_ENV_UNEXPECTED"),
-            "{}",
+            "{hostile_var:?}: {}",
             err(&o)
+        );
+        assert!(
+            !evil_ran.exists(),
+            "{hostile_var:?}: the hostile perl module ran"
         );
     }
     // A relative --dir with CDPATH pointing at a decoy must still resolve against the cwd.
@@ -918,6 +943,8 @@ fn a_new_binary_that_cannot_read_the_existing_binding_does_not_become_current() 
     let cfg = p.home.join(".config/dotfiles-manager");
     fs::create_dir_all(&cfg).unwrap();
     fs::write(cfg.join("machine.toml"), "schema = 2\n").unwrap();
+    // Private and owned by us, so only the new binary's parser can object.
+    fs::set_permissions(cfg.join("machine.toml"), fs::Permissions::from_mode(0o600)).unwrap();
     let o = install(&p, &p.sha, &[]);
     assert_eq!(
         o.status.code(),
@@ -985,6 +1012,64 @@ fn the_command_path_and_current_are_checked_again_just_before_the_swap() {
     );
     assert_eq!(o.status.code(), Some(3), "{}", err(&o));
     assert!(err(&o).contains("current"), "{}", err(&o));
+}
+
+#[test]
+#[ignore = "needs crates.io"]
+fn the_binding_is_checked_again_just_before_the_swap() {
+    let p = prepare("swap-binding");
+    let cfg = p.home.join(".config/dotfiles-manager");
+    let hook = p.tmp.path().join("hook.sh");
+    // After the pre-flip self-check, a binding appears that the new binary would not accept.
+    fs::write(
+        &hook,
+        format!("mkdir -p '{0}' && echo 'schema = 1' > '{0}/machine.toml' && chmod 644 '{0}/machine.toml'\n", cfg.display()),
+    )
+    .unwrap();
+    let o = install(
+        &p,
+        &p.sha,
+        &[("DFM_TEST_BEFORE_SWAP", hook.to_str().unwrap())],
+    );
+    assert_eq!(
+        o.status.code(),
+        Some(3),
+        "{}\n{}",
+        String::from_utf8_lossy(&o.stdout),
+        err(&o)
+    );
+    assert!(err(&o).contains("E_BINDING_INVALID"), "{}", err(&o));
+    assert!(!p.data.join("current").exists(), "current must not flip");
+}
+
+#[test]
+#[ignore = "needs crates.io"]
+fn a_swap_that_did_not_take_effect_is_not_reported_as_done() {
+    let p = prepare("swap-readback");
+    let hook = p.tmp.path().join("hook.sh");
+    // After the swap, `current` is replaced by a directory.
+    fs::write(
+        &hook,
+        format!(
+            "rm -f '{0}/current' && mkdir '{0}/current'\n",
+            p.data.display()
+        ),
+    )
+    .unwrap();
+    let o = install(
+        &p,
+        &p.sha,
+        &[("DFM_TEST_AFTER_SWAP", hook.to_str().unwrap())],
+    );
+    assert_eq!(
+        o.status.code(),
+        Some(1),
+        "{}\n{}",
+        String::from_utf8_lossy(&o.stdout),
+        err(&o)
+    );
+    assert!(err(&o).contains("swap did not take effect"), "{}", err(&o));
+    assert!(!String::from_utf8_lossy(&o.stdout).contains("bootstrap: done"));
 }
 
 #[test]
@@ -1080,7 +1165,7 @@ fn an_unusable_binding_stops_the_install_before_any_mutation() {
     fs::write(&binding, valid).unwrap();
     fs::set_permissions(&binding, fs::Permissions::from_mode(0o644)).unwrap();
     let o = install_tiny(&home, &src, &sha);
-    assert_eq!(o.status.code(), Some(1), "{}", err(&o));
+    assert_eq!(o.status.code(), Some(3), "{}", err(&o));
     assert!(
         err(&o).contains("E_BINDING_INVALID") && err(&o).contains("0600"),
         "{}",
@@ -1093,7 +1178,7 @@ fn an_unusable_binding_stops_the_install_before_any_mutation() {
     fs::set_permissions(&real, fs::Permissions::from_mode(0o600)).unwrap();
     symlink(&real, &binding).unwrap();
     let o = install_tiny(&home, &src, &sha);
-    assert_eq!(o.status.code(), Some(1), "{}", err(&o));
+    assert_eq!(o.status.code(), Some(3), "{}", err(&o));
     assert!(
         err(&o).contains("E_BINDING_INVALID") && err(&o).contains("symlink"),
         "{}",
@@ -1122,7 +1207,7 @@ fn a_fifo_at_the_binding_path_does_not_hang_the_script_or_the_manager() {
     );
     let started = std::time::Instant::now();
     let o = install_tiny(&home, &src, &sha);
-    assert_eq!(o.status.code(), Some(1), "{}", err(&o));
+    assert_eq!(o.status.code(), Some(3), "{}", err(&o));
     assert!(
         err(&o).contains("E_BINDING_INVALID") && err(&o).contains("regular file"),
         "{}",
