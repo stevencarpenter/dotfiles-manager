@@ -9,7 +9,7 @@ The owner answered the questions in section 14 on 2026-10-09. Those answers are 
 ## 1. Decision summary
 
 1. Language: Rust (stable, edition 2024), one binary, no runtime interpreter. The choice is conditional on bootstrap cost (section 2).
-2. Dependencies: the Rust standard library plus four direct crates (`serde`, `toml`, `serde_json` (not yet used), `sha2`) with exact version pins and transitive dependencies locked by `Cargo.lock`. A `cargo-deny` gate (planned, not yet wired in) and `cargo-audit` or `cargo-vet` run in the local gate. Hand-written argument parsing. No async runtime, plugin loader or expression language.
+2. Dependencies: the Rust standard library plus five direct crates (`serde`, `toml`, `serde_json`, `sha2`, and `rustix` with features `std` and `fs`) with exact version pins and transitive dependencies locked by `Cargo.lock`. A gate test checks every workspace member's direct dependencies and `rustix`'s resolved features against an allow-list. `cargo-deny` and `cargo-audit` or `cargo-vet` are planned and are not yet part of the local gate. Hand-written argument parsing. No async runtime, plugin loader or expression language.
 3. Adapters: compiled into the binary behind typed Rust traits. No marketplace and no dynamic loading.
 4. Formats: TOML for authored documents and the source lock. JSON for machine-written state, ledger, receipts and journal. Every document carries an integer `schema`.
 5. Distribution: build from source on each machine. No release artifact, signing or notarization in the first delivery. The binary installs into a manager-owned versioned directory selected by a symlink. The coordinator updates itself last.
@@ -29,7 +29,7 @@ Verified on the authoring machine (Apple Silicon): `/usr/bin/python3` is 3.9.6 a
 | Python 3.14, standard library, run through uv | Zero third-party code. `tomllib`, `json`, `hashlib`, `os.replace` exist. The repo already uses it for `scripts/check_examples.py`. No compile step. Fastest to write. | Needs a managed interpreter at run time. `update` can retire that interpreter mid-operation. A fresh machine needs uv before anything runs. Weaker static typing at the adapter boundary. |
 | Swift | OS-owned toolchain via Command Line Tools. Foundation and CryptoKit. | No TOML in the standard library or Foundation. Foundation differs on Linux. Ties core code to Apple tooling (against C04 intent). |
 | Go | Static binary. Rich standard library. | No TOML in the standard library. Weaker enum modelling for typed operations and outcomes. |
-| Rust | Static binary: nothing the manager can retire is needed at run time. Enums and traits express operations, outcomes and ports with exhaustive matching. Fixed supply chain through `Cargo.lock`. | No TOML in the standard library, so four direct crates. Slower to write. Every device needs a pinned toolchain and the Apple linker at build time. |
+| Rust | Static binary: nothing the manager can retire is needed at run time. Enums and traits express operations, outcomes and ports with exhaustive matching. Fixed supply chain through `Cargo.lock`. | No TOML in the standard library, so five direct crates (section 14, decision 3). Slower to write. Every device needs a pinned toolchain and the Apple linker at build time. |
 
 ### Condition on the Rust choice
 
@@ -473,7 +473,7 @@ Other unknowns: Command Line Tools and the exact pinned Rust toolchain on each d
 
 1. **Build requirement.** Git, Command Line Tools and a pinned Rust toolchain are accepted at bootstrap only. Bootstrap refuses with `E_PREREQ_MISSING` when Command Line Tools are missing; it does not start the installer or poll (owner-delegated decision during DFM-14 implementation, 2026-10-10). Rationale: the static binary removes the interpreter-retirement risk (section 2). Python 3.14 standard library through uv stays documented as the fallback.
 2. **Release artifacts.** Build from source for first delivery. No signing or release process. Rationale: avoids a release and signing decision before the device gate.
-3. **Crates.** `serde`, `toml`, `serde_json` (not yet used) and `sha2` are accepted as the four direct crates, with exact version pins, locked transitives and a `cargo-deny` gate (planned, not yet wired in). Rationale: the standard library has no TOML parser or SHA-256.
+3. **Crates.** `serde`, `toml`, `serde_json` and `sha2` are accepted as direct crates, with exact version pins and locked transitives. `rustix` is the fifth (owner-delegated decision during DFM-17, 2026-10-10): pinned `=1.1.5`, default features off, only `std` and `fs`, used by `dfm-engine` for descriptor-relative file operations through its safe API, so `unsafe_code` stays forbidden. A `cargo-deny` gate is planned and not yet wired in. Rationale: the standard library has no TOML parser, SHA-256 or `openat`.
 4. **Commit signatures.** Not required now. Trust is origin plus the recomputed tree digest. Signed commits can come later. Rationale: no signing infrastructure exists, and the digest binds content.
 5. **Exit codes.** 3, 4, 5 and 130 accepted, with 143 for SIGTERM.
 6. **Names.** Keep `dotfiles-manager` and `~/.local/state/dotfiles-manager/`.
