@@ -1,8 +1,8 @@
 # Minimum implementation contract
 
-Status: **Proposed; owner review pending.** Task: DFM-10. This document selects the implementation language and fixes the minimum formats and boundaries. It implements nothing. [DESIGN.md](../DESIGN.md) remains the requirements source. This document takes precedence over DESIGN.md section 11 only after the owner accepts the whole document.
+Status: **Accepted into the review branch `going-to-sleep` on 2026-10-09 via PR #6. Owner review of `going-to-sleep` against `main` is pending.** Task: DFM-10. This document selects the implementation language and fixes the minimum formats and boundaries. It implements nothing. [DESIGN.md](../DESIGN.md) remains the requirements source. This document takes precedence over DESIGN.md section 11 only after the owner accepts the whole document.
 
-Criteria covered: C01 to C06 and C08 to C10. C06 is **prose-validated only**: no resolver, code or device ran. C07 (independent review) and C11 (delivery evidence) remain open.
+DFM-10 criteria C01 to C11 are checked. C06 is **prose-validated only**: no resolver, code or device ran.
 
 The owner answered the questions in section 14 on 2026-10-09. Those answers are recorded as decisions. They are inputs to this proposal, not acceptance of the document.
 
