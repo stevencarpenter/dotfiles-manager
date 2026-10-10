@@ -1,0 +1,8 @@
+# Synthetic target 1. Public bundle only.
+schema = 1
+id = "machine-a"
+bundle = "../shared/bundle.toml"
+platform = "macos"
+architecture = "arm64"
+modules = ["reusable"]
+overrides = []

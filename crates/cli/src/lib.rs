@@ -1,8 +1,10 @@
 //! `dotfiles-manager` command line: version, help, explicit profile binding and self-check.
 
+mod adapters;
 mod controls_fs;
 mod state_cmd;
 
+pub use adapters::builtin_catalog;
 pub use controls_fs::{check_build_controls, toolchain_tree_digest};
 
 use dfm_engine::{Dir, Fail, Layout, Store, Sys, open_config};

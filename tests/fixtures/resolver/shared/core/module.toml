@@ -1,0 +1,24 @@
+schema = 1
+id = "core"
+platforms = ["macos", "linux"]
+requires = []
+
+[[resources]]
+id = "editor-defaults"
+kind = "render"
+adapter = "git-config/v1"
+target = ".config/synthetic/editor.inc"
+[resources.value.core]
+editor = "nvim"
+[resources.policy]
+defaults = ["/core/editor"]
+extensions = []
+
+# An invariant: no policy, so nothing may change it.
+[[resources]]
+id = "launcher"
+kind = "link"
+adapter = "fs-link/v1"
+target = ".local/bin/synthetic-launcher"
+[resources.value]
+source = "files/launcher"
