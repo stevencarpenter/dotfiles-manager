@@ -29,7 +29,10 @@ fn walk(root: &Path) -> Result<Vec<(String, Node)>, String> {
                 .file_name()
                 .into_string()
                 .map_err(|_| format!("non-UTF-8 name in {rel}"))?;
-            if !name.bytes().all(|b| (0x20..=0x7e).contains(&b)) {
+            if !name
+                .bytes()
+                .all(|b| (0x20..=0x7e).contains(&b) && b != b'\\')
+            {
                 return Err(format!("unsupported file name in {rel}"));
             }
             let path = if rel.is_empty() {

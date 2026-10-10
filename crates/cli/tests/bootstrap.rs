@@ -115,6 +115,42 @@ fn unsupported_os_or_architecture_is_refused_before_mutation() {
 }
 
 #[test]
+fn a_home_with_whitespace_is_refused_by_the_script() {
+    let tmp = TempDir::new("script-space");
+    let home = tmp.path().join("a b");
+    fs::create_dir(&home).unwrap();
+    let o = script_test_mode(&home, &["uninstall"], &[]);
+    assert_eq!(o.status.code(), Some(3));
+    assert!(
+        err(&o).contains("E_HOME_MISMATCH") && err(&o).contains("whitespace"),
+        "{}",
+        err(&o)
+    );
+    assert!(entries_below(&home).is_empty());
+}
+
+#[test]
+fn toolchain_digest_refuses_file_names_with_backslashes() {
+    let tmp = TempDir::new("backslash");
+    let home = tmp.path().join("home");
+    let tc = tmp.path().join("tc");
+    fs::create_dir_all(&home).unwrap();
+    fs::create_dir_all(&tc).unwrap();
+    fs::write(tc.join("ok"), "a").unwrap();
+    let args = ["toolchain-digest", "--dir", tc.to_str().unwrap()];
+    assert_eq!(script_test_mode(&home, &args, &[]).status.code(), Some(0));
+    fs::write(tc.join("a\\b"), "b").unwrap();
+    let o = script_test_mode(&home, &args, &[]);
+    assert_eq!(
+        o.status.code(),
+        Some(3),
+        "{}",
+        String::from_utf8_lossy(&o.stdout)
+    );
+    assert!(o.stdout.is_empty());
+}
+
+#[test]
 fn home_must_match_the_password_database() {
     let tmp = TempDir::new("script-home");
     let o = script(tmp.path(), &["uninstall"], &[]);

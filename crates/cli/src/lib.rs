@@ -59,6 +59,12 @@ fn context(home: Option<String>) -> Result<Ctx, Refusal> {
     let env = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
     let home = home.or_else(|| env("DFM_HOME"));
     let platform = match &home {
+        Some(h) if !dfm_platform_macos::valid_home(h) => {
+            return Err(Refusal::new(
+                Code::HomeMismatch,
+                "the home directory contains whitespace or control characters; this is not supported",
+            ));
+        }
         Some(h) => Platform::with_home(PathBuf::from(h)),
         None => Platform::detect()?,
     };

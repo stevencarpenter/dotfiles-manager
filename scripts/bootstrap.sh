@@ -50,6 +50,7 @@ resolve_home() {
     pw_home=$(/usr/bin/dscl . -read "/Users/$user" NFSHomeDirectory 2>/dev/null | /usr/bin/sed -n 's/^NFSHomeDirectory: //p') || pw_home=
   fi
   [ -n "$pw_home" ] || refuse E_HOME_MISMATCH "cannot read the home directory from the password database"
+  case $pw_home in *[[:space:][:cntrl:]]*) refuse E_HOME_MISMATCH "the home directory contains whitespace or control characters; this is not supported" ;; esac
   [ "$pw_home" = "${HOME:-}" ] || refuse E_HOME_MISMATCH "password database home $pw_home differs from HOME"
   HOME_DIR=$pw_home
   DATA=$HOME_DIR/$DATA_REL
@@ -176,7 +177,7 @@ function classify(t,   n, s, i, k, rest) {
     rest = n - 2
   } else {
     k = 0
-    for (i = 1; i <= n; i++) if (s[i] == "dependencies" || s[i] == "dev-dependencies" || s[i] == "build-dependencies") { k = i; break }
+    for (i = 1; i <= n; i++) if (s[i] == "dependencies" || s[i] == "dev-dependencies" || s[i] == "build-dependencies" || s[i] == "dev_dependencies" || s[i] == "build_dependencies") { k = i; break }
     if (k == 0) return "ord"
     rest = n - k
   }
@@ -212,7 +213,7 @@ BEGIN {
   CTX = "ord"; TABLE = ""
   split("version features optional default-features default_features package workspace path artifact lib target", a, " ")
   for (i in a) ALLOW[a[i]] = 1
-  split("patch replace dependencies dev-dependencies build-dependencies target workspace", a, " ")
+  split("patch replace dependencies dev-dependencies build-dependencies dev_dependencies build_dependencies target workspace", a, " ")
   for (i in a) DENY[a[i]] = 1
 }
 END { if (failed) exit 3 }
@@ -288,7 +289,7 @@ controls_staged() { # $1 stage; sets PIN and TREE
   [ -z "$(cd "$stage" && find . 2>&1 >/dev/null)" ] || refuse E_SOURCE_UNTRUSTED "unreadable entry in staged tree"
   odd=$(cd "$stage" && find . ! -name . ! -type f ! -type d -print | head -n 1)
   [ -z "$odd" ] || refuse E_SOURCE_UNTRUSTED "symlink or special file in staged tree: $odd"
-  bad=$(cd "$stage" && { find . -name "*$NL*" -print; find . -print | grep '[^ -~]' || true; } | head -n 1)
+  bad=$(cd "$stage" && { find . -name "*$NL*" -print; find . -print | grep '[^ -~]\|\\' || true; } | head -n 1)
   [ -z "$bad" ] || refuse E_SOURCE_UNTRUSTED "unsupported file name in staged tree"
   [ -f "$stage/dotfiles-manager.lock" ] || refuse E_SOURCE_UNTRUSTED "dotfiles-manager.lock missing"
   out=$(run_awk "$stage" dotfiles-manager.lock "$SCAN$LOCK_RULES") || refuse_out "$out"
@@ -332,7 +333,7 @@ toolchain_digest() (
   [ -z "$(find . 2>&1 >/dev/null)" ] || exit 1
   [ -z "$(find . ! -name . ! -type f ! -type d ! -type l -print | head -n 1)" ] || exit 1
   [ -z "$(find . -name "*$NL*" -print | head -n 1)" ] || exit 1
-  ! find . -print | grep -q '[^ -~]' || exit 1
+  ! find . -print | grep -q '[^ -~]\|\\' || exit 1
   nf=$(find . -type f | wc -l); nl=$(find . -type l | wc -l)
   [ "$nf" -gt 0 ] || exit 1
   plain=$(find . -type f ! -perm -u+x -print0 | xargs -0 -r /usr/bin/shasum -a 256 |

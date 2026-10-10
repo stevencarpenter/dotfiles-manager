@@ -385,3 +385,18 @@ fn self_check_fixture_dir_reads_only_that_directory() {
     );
     assert!(files_below(home.path()).is_empty());
 }
+
+#[test]
+fn a_home_with_whitespace_is_refused() {
+    let tmp = TempDir::new("space");
+    let home = tmp.path().join("a b");
+    fs::create_dir(&home).unwrap();
+    let o = run(&home, &["binding"]);
+    assert_eq!(o.status.code(), Some(3));
+    assert!(
+        text(&o.stderr).contains("E_HOME_MISMATCH"),
+        "{}",
+        text(&o.stderr)
+    );
+    assert!(files_below(&home).is_empty());
+}

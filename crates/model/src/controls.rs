@@ -9,7 +9,14 @@ use std::collections::{BTreeMap, HashSet};
 
 pub const MAX_FILE_BYTES: u64 = 1 << 20;
 
-const DEP_TABLES: [&str; 3] = ["dependencies", "dev-dependencies", "build-dependencies"];
+// Cargo also accepts the underscore spellings of the dev and build tables.
+const DEP_TABLES: [&str; 5] = [
+    "dependencies",
+    "dev-dependencies",
+    "build-dependencies",
+    "dev_dependencies",
+    "build_dependencies",
+];
 const DEP_KEYS: [&str; 11] = [
     "version",
     "features",
@@ -23,12 +30,14 @@ const DEP_KEYS: [&str; 11] = [
     "lib",
     "target",
 ];
-const DENY_TABLE_VALUES: [&str; 7] = [
+const DENY_TABLE_VALUES: [&str; 9] = [
     "patch",
     "replace",
     "dependencies",
     "dev-dependencies",
     "build-dependencies",
+    "dev_dependencies",
+    "build_dependencies",
     "target",
     "workspace",
 ];

@@ -29,6 +29,12 @@ pub fn current_platform() -> (&'static str, &'static str) {
     (std::env::consts::OS, std::env::consts::ARCH)
 }
 
+/// A HOME with whitespace or control characters is refused. Paths from it reach shell scripts
+/// and tool arguments, and `scripts/bootstrap.sh` applies the same rule.
+pub fn valid_home(home: &str) -> bool {
+    home.starts_with('/') && !home.chars().any(|c| c.is_whitespace() || c.is_control())
+}
+
 /// Paths derived from one HOME.
 #[derive(Clone, Debug)]
 pub struct Platform {
@@ -54,6 +60,11 @@ impl Platform {
             .map(str::trim)
             .filter(|h| h.starts_with('/'))
             .ok_or_else(|| mismatch("unreadable password database home".into()))?;
+        if !valid_home(pw_home) {
+            return Err(mismatch(format!(
+                "the home directory {pw_home:?} contains whitespace or control characters; this is not supported"
+            )));
+        }
         match std::env::var_os("HOME") {
             Some(h) if h == pw_home => Ok(Platform {
                 home: PathBuf::from(pw_home),
@@ -125,6 +136,14 @@ mod tests {
                 check_supported(o, a).unwrap_err().code,
                 Code::PlatformUnsupported
             );
+        }
+    }
+
+    #[test]
+    fn homes_with_whitespace_or_control_characters_are_refused() {
+        assert!(valid_home("/Users/a"));
+        for bad in ["/Users/a b", "/Users/a\tb", "/Users/a\nb", "relative", ""] {
+            assert!(!valid_home(bad), "{bad:?}");
         }
     }
 
