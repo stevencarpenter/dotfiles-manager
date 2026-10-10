@@ -128,11 +128,33 @@ fn test_isolation_is_never_in_default_or_the_release_graph() {
     );
 }
 
+/// The host triple, from `rustc -vV`. `cargo metadata --filter-platform` with it needs only the
+/// packages a build for this machine downloads, so the test also runs offline with a fresh
+/// CARGO_HOME after a plain build (without the filter it wants every target's packages).
+fn host_triple() -> String {
+    let rustc = std::env::var("RUSTC").unwrap_or_else(|_| "rustc".into());
+    let o = Command::new(rustc).arg("-vV").output().unwrap();
+    String::from_utf8_lossy(&o.stdout)
+        .lines()
+        .find_map(|l| l.strip_prefix("host: "))
+        .expect("rustc -vV prints a host line")
+        .trim()
+        .to_string()
+}
+
 fn metadata() -> serde_json::Value {
     let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
     let o = Command::new(cargo)
         .current_dir(repo_root())
-        .args(["metadata", "--locked", "--offline", "--format-version", "1"])
+        .args([
+            "metadata",
+            "--locked",
+            "--offline",
+            "--format-version",
+            "1",
+            "--filter-platform",
+        ])
+        .arg(host_triple())
         .output()
         .unwrap();
     assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
