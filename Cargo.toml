@@ -21,5 +21,6 @@ unsafe_code = "forbid"
 [workspace.lints.clippy]
 all = "warn"
 
+# Tests hash a ~400 MB toolchain tree; unoptimized sha2 is too slow for that.
 [profile.dev.package.sha2]
 opt-level = 3

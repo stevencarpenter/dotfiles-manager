@@ -25,9 +25,6 @@ jobs:
           pin=$(sed -n 's/^channel = "\(.*\)"$/\1/p' rust-toolchain.toml)
           rustup toolchain install "$pin" --profile minimal --component rustfmt --component clippy
 
-      - name: Run the shared local gate
-        run: bash scripts/check_staged.sh
-
       - name: Check design fixtures
         run: bash scripts/check_all.sh fixtures
 

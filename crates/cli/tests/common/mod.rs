@@ -1,4 +1,7 @@
-#![allow(dead_code)]
+#![allow(
+    dead_code,
+    reason = "each test binary uses a different subset of these helpers"
+)]
 use std::fs;
 use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};

@@ -111,9 +111,69 @@ fn only_the_contract_crates_are_direct_dependencies() {
         .collect();
     let allowed = ["dfm-model", "dfm-platform-macos", "serde", "toml", "sha2"];
     assert!(deps.iter().all(|d| allowed.contains(d)), "{deps:?}");
-    let pinned = manifest
+    let pins: Vec<&str> = manifest
         .lines()
         .filter(|l| l.starts_with("serde =") || l.starts_with("toml =") || l.starts_with("sha2 ="))
-        .all(|l| l.contains("\"="));
-    assert!(pinned, "direct crates need exact =x.y.z pins");
+        .collect();
+    assert_eq!(
+        pins.len(),
+        3,
+        "expected exactly serde, toml and sha2: {pins:?}"
+    );
+    assert!(
+        pins.iter().all(|l| l.contains("\"=")),
+        "direct crates need exact =x.y.z pins"
+    );
+}
+
+#[test]
+fn crate_dependency_direction_follows_the_contract() {
+    // model -> nothing; platform_macos -> model; cli -> model, platform_macos. Cargo rejects
+    // cycles, so checking the allowed edges is enough to keep the layering.
+    let deps = |krate: &str| -> Vec<String> {
+        let text =
+            fs::read_to_string(repo_root().join("crates").join(krate).join("Cargo.toml")).unwrap();
+        text.split("[dependencies]")
+            .nth(1)
+            .unwrap_or("")
+            .lines()
+            .take_while(|l| !l.starts_with('['))
+            .filter_map(|l| l.split('=').next())
+            .map(|d| d.trim().to_string())
+            .filter(|d| d.starts_with("dfm-"))
+            .collect()
+    };
+    assert!(deps("model").is_empty());
+    assert_eq!(deps("platform_macos"), ["dfm-model"]);
+    assert_eq!(deps("cli"), ["dfm-model", "dfm-platform-macos"]);
+}
+
+#[test]
+fn a_plain_release_build_of_every_target_has_no_test_isolation() {
+    let target = common::TempDir::new("release-graph");
+    let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
+    let o = Command::new(cargo)
+        .current_dir(repo_root())
+        .args([
+            "build",
+            "--release",
+            "--workspace",
+            "--all-targets",
+            "--locked",
+            "--offline",
+            "--target-dir",
+        ])
+        .arg(target.path())
+        .output()
+        .unwrap();
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let v = Command::new(target.path().join("release/dotfiles-manager"))
+        .arg("--version")
+        .output()
+        .unwrap();
+    let v = String::from_utf8_lossy(&v.stdout);
+    assert!(
+        v.starts_with("dotfiles-manager ") && !v.contains("test-isolation"),
+        "{v}"
+    );
 }

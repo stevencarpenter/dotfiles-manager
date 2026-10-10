@@ -247,7 +247,11 @@ function on_header(name, arr) {
   TABLE = name
 }
 function on_inline(k, sk) { bad("inline table") }
-function on_pair(key) {
+function on_pair(key,   i) {
+  if (TABLE == "toolchain" && key == "components" && VK == "a") {
+    for (i = 1; i <= ARRN; i++) if (ARR[i] != "rustfmt" && ARR[i] != "clippy") bad("rust-toolchain.toml differs from the lock pin")
+    return
+  }
   if (TABLE != "toolchain" || key != "channel" || VK != "s" || VS != PINV || CSEEN) bad("rust-toolchain.toml differs from the lock pin")
   CSEEN = 1
 }

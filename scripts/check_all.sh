@@ -21,12 +21,21 @@ step_scripts() {
 step_rust_style() {
     cargo fmt --all -- --check
     cargo clippy --workspace --all-targets --locked -- -D warnings
+    # The second run lints the code and tests that only exist in the isolated build.
+    cargo clippy --workspace --all-targets --locked --features dfm-cli/test-isolation -- -D warnings
 }
 
 # Implementation tests: unit, CLI, bootstrap script and build-controls differential tests.
-# The install test fetches crates from crates.io; set DFM_SKIP_NETWORK_TESTS=1 to skip it.
+# The isolated build (feature test-isolation) is needed by the CLI and differential tests.
+# The install test needs crates.io, so it is #[ignore]d and run explicitly here.
+# Set DFM_SKIP_NETWORK_TESTS=1 to skip it; the skip is printed.
 step_rust_tests() {
-    cargo test --workspace --locked
+    cargo test --workspace --locked --features dfm-cli/test-isolation
+    if [ -n "${DFM_SKIP_NETWORK_TESTS:-}" ]; then
+        echo "SKIPPED: network install test (DFM_SKIP_NETWORK_TESTS is set)"
+    else
+        cargo test --workspace --locked --features dfm-cli/test-isolation -- --ignored
+    fi
 }
 
 steps=("$@")

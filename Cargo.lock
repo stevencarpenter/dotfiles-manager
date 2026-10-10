@@ -40,7 +40,6 @@ dependencies = [
 name = "dfm-cli"
 version = "0.1.0"
 dependencies = [
- "dfm-cli",
  "dfm-model",
  "dfm-platform-macos",
  "sha2",

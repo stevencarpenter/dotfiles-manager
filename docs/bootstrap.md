@@ -26,7 +26,7 @@ dotfiles-manager self-check --build-controls <staged tree> | --fixture-dir <dir>
 - The binding file is published with a temporary file, `fsync` and `hard_link`, which never replaces an existing file. Concurrent binds leave one identity.
 - Nothing applies configuration. Installation and `bind` only write the files named here.
 - Errors are one line, at most 512 characters, with control characters escaped. Exit codes follow the contract (0, 1, 2, 3, 4, 5, 130, 143). Codes 4, 5, 130 and 143 are defined and tested for precedence but no command produces them yet. The CLI installs no signal handler.
-- Isolation overrides (`--home`, `DFM_HOME`, `DFM_BINDING`, `DFM_PLATFORM`) compile only with the cargo feature `test-isolation`. Those builds print `isolated: true` and append `test-isolation` to `--version`. The installed release binary ignores them (tested).
+- Isolation overrides (`--home`, `DFM_HOME`, `DFM_BINDING`, `DFM_PLATFORM`) compile only with the cargo feature `test-isolation`. Those builds print `isolated: true` and append `test-isolation` to `--version`. The installed release binary ignores them (tested). The feature is switched on only by `--features dfm-cli/test-isolation` (the gate does this); no self dev-dependency enables it, and a gate test builds every release target without the flag and checks `--version`. `rust-toolchain.toml` in the repository lists `rustfmt` and `clippy`; the checker allows exactly those two components besides the pinned channel.
 
 ## Source and build identity
 

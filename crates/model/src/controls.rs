@@ -532,6 +532,16 @@ impl Hooks for ToolchainFile<'_> {
                 self.seen = true;
                 Ok(())
             }
+            // The formatter and linter components are what a developer checkout asks for.
+            Val::Arr(items)
+                if self.table == "toolchain"
+                    && key == "components"
+                    && items
+                        .iter()
+                        .all(|i| matches!(i.as_deref(), Some("rustfmt" | "clippy"))) =>
+            {
+                Ok(())
+            }
             _ => Err("rust-toolchain.toml differs from the lock pin".into()),
         }
     }
@@ -541,7 +551,8 @@ impl Hooks for ToolchainFile<'_> {
     }
 }
 
-/// A staged `rust-toolchain.toml` must name exactly the lock pin and nothing else.
+/// A staged `rust-toolchain.toml` must name exactly the lock pin. Only the `rustfmt` and
+/// `clippy` components are allowed besides it.
 pub fn check_toolchain_file(text: &str, pin: &str) -> Res {
     let mut r = ToolchainFile {
         pin,

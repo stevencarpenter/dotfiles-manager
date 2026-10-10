@@ -18,8 +18,17 @@ dfm-model = { workspace = true }
 dfm-platform-macos = { workspace = true }
 sha2 = { workspace = true }
 
-[dev-dependencies]
-dfm-cli = { path = ".", features = ["test-isolation"] }
+# These tests drive the isolated build through --home, so they need the feature. Run them with
+# `cargo test --features test-isolation` (scripts/check_all.sh does). A plain `cargo test`
+# skips them; there is deliberately no self dev-dependency that would switch the feature on
+# for every build of the package.
+[[test]]
+name = "cli"
+required-features = ["test-isolation"]
+
+[[test]]
+name = "build_controls"
+required-features = ["test-isolation"]
 
 [lints]
 workspace = true

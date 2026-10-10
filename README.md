@@ -49,7 +49,7 @@ just check-tests      # cargo test: implementation, CLI, bootstrap and build-con
 uv run scripts/check_examples.py
 ```
 
-`scripts/check_all.sh` is the single shared gate and accepts the step names `fixtures`, `scripts`, `rust-style` and `rust-tests`. `just check-tests` includes an install test that fetches crates from crates.io; set `DFM_SKIP_NETWORK_TESTS=1` to skip that one test (the skip is printed).
+`scripts/check_all.sh` is the single shared gate and accepts the step names `fixtures`, `scripts`, `rust-style` and `rust-tests`. The CLI and differential tests need the isolated build, so the gate runs `cargo test --workspace --locked --features dfm-cli/test-isolation`; a plain `cargo test` skips those test targets. The install test needs crates.io, so it is `#[ignore]`d and the gate runs it explicitly with `-- --ignored`. Set `DFM_SKIP_NETWORK_TESTS=1` to skip it; the gate then prints `SKIPPED: network install test`.
 
 The fixture checker below is unchanged and still checks documentation fixtures only.
 
