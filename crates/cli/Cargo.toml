@@ -19,6 +19,10 @@ dfm-engine = { workspace = true }
 dfm-platform-macos = { workspace = true }
 sha2 = { workspace = true }
 
+[dev-dependencies]
+# Resolver tests parse and patch fixture documents in memory. Already an accepted direct crate.
+toml = { workspace = true }
+
 # These tests drive the isolated build through --home, so they need the feature. Run them with
 # `cargo test --features test-isolation` (scripts/check_all.sh does). A plain `cargo test`
 # skips them; there is deliberately no self dev-dependency that would switch the feature on
