@@ -135,18 +135,149 @@ fn explain_redacts_secret_references_and_shows_no_hash_of_them() {
     assert!(!out.contains("content sha256"), "{out}");
 }
 
-#[test]
-fn explain_writes_nothing() {
-    let (home, _t, root) = bound("work-01.toml");
-    let (h0, r0) = (snapshot(home.path()), snapshot(&root));
-    for q in ["desktop.aerospace", "core.git", "nonexistent.thing"] {
-        run(
-            home.path(),
-            &["explain", q, "--root", root.to_str().unwrap()],
-        );
+/// Every `<module>.<resource>` ID declared by the example modules.
+fn resource_ids(root: &Path) -> Vec<String> {
+    let mut ids = Vec::new();
+    fn go(dir: &Path, ids: &mut Vec<String>) {
+        for e in fs::read_dir(dir).unwrap() {
+            let p = e.unwrap().path();
+            if p.is_dir() {
+                go(&p, ids);
+            } else if p.file_name().is_some_and(|n| n == "module.toml") {
+                let doc: toml::Table = fs::read_to_string(&p).unwrap().parse().unwrap();
+                let module = doc["id"].as_str().unwrap().to_string();
+                for r in doc
+                    .get("resources")
+                    .and_then(|r| r.as_array())
+                    .into_iter()
+                    .flatten()
+                {
+                    ids.push(format!("{module}.{}", r["id"].as_str().unwrap()));
+                }
+            }
+        }
     }
-    assert_eq!(snapshot(home.path()), h0, "HOME changed");
-    assert_eq!(snapshot(&root), r0, "sources changed");
+    go(root, &mut ids);
+    ids.sort();
+    ids
+}
+
+#[test]
+fn explain_writes_nothing_for_any_profile_or_resource() {
+    let ids = resource_ids(&repo_root().join("examples"));
+    assert!(ids.len() >= 14, "{ids:?}");
+    let checked_in = snapshot(&repo_root().join("examples"));
+    // personal-dev-01 and work-01 are macOS profiles that resolve; the Linux ones are refused
+    // at bind on this build, so they are covered by the resolver tests instead.
+    for profile in ["personal-dev-01.toml", "work-01.toml"] {
+        let (home, _t, root) = bound(profile);
+        let (h0, r0) = (snapshot(home.path()), snapshot(&root));
+        let mut explained = 0;
+        for id in &ids {
+            let o = run(
+                home.path(),
+                &["explain", id, "--root", root.to_str().unwrap()],
+            );
+            // A resource of a module the profile does not select is a usage error, not a write.
+            assert!(
+                matches!(o.status.code(), Some(0 | 2)),
+                "{profile} {id}: {}",
+                text(&o.stderr)
+            );
+            explained += usize::from(o.status.code() == Some(0));
+        }
+        assert!(explained >= 8, "{profile}: only {explained} explained");
+        assert_eq!(snapshot(home.path()), h0, "{profile}: HOME changed");
+        assert_eq!(snapshot(&root), r0, "{profile}: sources changed");
+    }
+    assert_eq!(
+        snapshot(&repo_root().join("examples")),
+        checked_in,
+        "the checked-in examples changed"
+    );
+}
+
+#[test]
+fn explain_prints_the_include_order_of_a_native_document() {
+    let (home, _t, root) = bound("work-01.toml");
+    let o = run(
+        home.path(),
+        &[
+            "explain",
+            "work.git-identity",
+            "--root",
+            root.to_str().unwrap(),
+        ],
+    );
+    let out = text(&o.stdout);
+    assert!(
+        out.contains(
+            "included by core.git (.config/git/config) at position 3 of 3, only when gitdir:~/work/"
+        ),
+        "{out}"
+    );
+    assert!(
+        out.contains(
+            "1. ~/.config/external-overlays/git/base.inc -> core.git-defaults (module core)"
+        ),
+        "{out}"
+    );
+    assert!(
+        out.contains("Rule: later include entries override earlier ones"),
+        "{out}"
+    );
+}
+
+#[test]
+fn source_loading_skips_a_top_level_git_directory_and_refuses_the_rest() {
+    let (home, _t, root) = bound("work-01.toml");
+    let r = root.to_str().unwrap();
+    fs::create_dir_all(root.join(".git")).unwrap();
+    fs::write(root.join(".git/config"), "[core]\n").unwrap();
+    let o = run(home.path(), &["explain", "core.git", "--root", r]);
+    assert_eq!(o.status.code(), Some(0), "{}", text(&o.stderr));
+
+    // A nested .git is a submodule or gitlink: refused.
+    let nested = root.join("base/modules/core/.git");
+    fs::write(&nested, "gitdir: elsewhere\n").unwrap();
+    let o = run(home.path(), &["explain", "core.git", "--root", r]);
+    assert_eq!(o.status.code(), Some(3));
+    assert!(
+        text(&o.stderr).contains("E_SOURCE_UNTRUSTED"),
+        "{}",
+        text(&o.stderr)
+    );
+    fs::remove_file(&nested).unwrap();
+
+    // A FIFO is a special file: refused without opening it, so the command cannot hang.
+    let fifo = root.join("base/modules/core/files/pipe");
+    assert!(
+        Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let o = run(home.path(), &["explain", "core.git", "--root", r]);
+    assert_eq!(o.status.code(), Some(3));
+    assert!(
+        text(&o.stderr).contains("E_SOURCE_UNTRUSTED"),
+        "{}",
+        text(&o.stderr)
+    );
+    fs::remove_file(&fifo).unwrap();
+
+    // A symlink is recorded, not followed: one that leaves the module is a containment error.
+    fs::remove_file(root.join("base/modules/core/files/gitconfig")).unwrap();
+    std::os::unix::fs::symlink("/etc/hosts", root.join("base/modules/core/files/gitconfig"))
+        .unwrap();
+    let o = run(home.path(), &["explain", "core.git", "--root", r]);
+    assert_eq!(o.status.code(), Some(3));
+    assert!(
+        text(&o.stderr).contains("E_SOURCE_ESCAPE"),
+        "{}",
+        text(&o.stderr)
+    );
 }
 
 #[test]

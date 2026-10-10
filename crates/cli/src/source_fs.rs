@@ -1,11 +1,16 @@
 //! Reads a materialized source directory into an in-memory `SourceSet` for the resolver.
 //! Read-only. Symlinks are recorded, never followed, so the resolver decides containment.
-//! A `.git` directory is repository metadata, not source content, and is skipped.
+//! A top-level `.git` is repository metadata, not source content, and is skipped. A `.git`
+//! anywhere deeper is a submodule or gitlink, which the tree rules refuse (E_SOURCE_UNTRUSTED,
+//! docs/architecture.md section 8). Files are opened without following symlinks and without
+//! blocking, then checked with fstat, so an entry swapped for a link or a FIFO after listing
+//! cannot be read through.
 
 use dfm_model::resolve::SourceSet;
 use dfm_model::{Code, Refusal};
 use std::fs;
 use std::io::Read;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 
 const MAX_FILE_BYTES: u64 = 1 << 20;
@@ -44,8 +49,14 @@ pub fn load_source_set(root: &Path) -> Result<SourceSet, Refusal> {
                     format!("control character in a name under {rel}"),
                 ));
             }
-            if rel.is_empty() && name == ".git" {
-                continue;
+            if name == ".git" {
+                if rel.is_empty() {
+                    continue;
+                }
+                return Err(refuse(
+                    Code::SourceUntrusted,
+                    format!("nested .git under {rel}: submodules and gitlinks are refused"),
+                ));
             }
             let path = if rel.is_empty() {
                 name
@@ -73,8 +84,19 @@ pub fn load_source_set(root: &Path) -> Result<SourceSet, Refusal> {
                 go(&e.path(), &path, st)?;
             } else if ty.is_file() {
                 let mut buf = Vec::new();
-                fs::File::open(e.path())
-                    .and_then(|f| f.take(MAX_FILE_BYTES + 1).read_to_end(&mut buf))
+                let file = fs::OpenOptions::new()
+                    .read(true)
+                    .custom_flags(dfm_platform_macos::O_NOFOLLOW | dfm_platform_macos::O_NONBLOCK)
+                    .open(e.path())
+                    .map_err(|e| io(e, &path))?;
+                if !file.metadata().map_err(|e| io(e, &path))?.is_file() {
+                    return Err(refuse(
+                        Code::SourceUntrusted,
+                        format!("{path} changed type while reading"),
+                    ));
+                }
+                file.take(MAX_FILE_BYTES + 1)
+                    .read_to_end(&mut buf)
                     .map_err(|e| io(e, &path))?;
                 st.bytes += buf.len() as u64;
                 if buf.len() as u64 > MAX_FILE_BYTES || st.bytes > MAX_TOTAL_BYTES {
