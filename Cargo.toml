@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/model", "crates/platform_macos", "crates/cli"]
+members = ["crates/model", "crates/engine", "crates/platform_macos", "crates/cli"]
 
 [workspace.package]
 version = "0.1.0"
@@ -11,9 +11,14 @@ publish = false
 [workspace.dependencies]
 dfm-model = { path = "crates/model" }
 dfm-platform-macos = { path = "crates/platform_macos" }
+dfm-engine = { path = "crates/engine" }
 serde = { version = "=1.0.229", features = ["derive"] }
 toml = { version = "=1.1.6", default-features = false, features = ["std", "serde", "parse", "display"] }
 sha2 = "=0.10.9"
+serde_json = "=1.0.149"
+# Safe descriptor-relative file operations (openat, mkdirat, renameat, linkat, fstatat). Only the
+# fs and std features: no process, net or unsafe-bearing extras. Released 2026-09-16.
+rustix = { version = "=1.1.5", default-features = false, features = ["std", "fs"] }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

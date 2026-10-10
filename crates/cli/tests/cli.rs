@@ -321,8 +321,13 @@ fn concurrent_binds_leave_exactly_one_identity() {
                     bound.contains(&format!("profile={p} ")),
                     "round {round}: success for a different identity"
                 ),
-                Some(3) => assert!(
-                    text(&o.stderr).contains("E_REBIND_UNSUPPORTED"),
+                // The loser either met the winner's binding (another identity) or the manager
+                // lock (docs/architecture.md section 10: a second writer exits 3 E_LOCKED).
+                // Exit 1 is the same refusal from a loser that had already created a shared
+                // directory (such as .local/state) before it met the lock: a mutation began.
+                Some(3 | 1) => assert!(
+                    text(&o.stderr).contains("E_REBIND_UNSUPPORTED")
+                        || text(&o.stderr).contains("E_LOCKED"),
                     "{}",
                     text(&o.stderr)
                 ),

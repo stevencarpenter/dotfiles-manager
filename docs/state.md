@@ -1,0 +1,101 @@
+# Durable state
+
+Task: DFM-17. This document records what the first state implementation does and where it resolves or differs from [docs/architecture.md](architecture.md) (the contract). The contract wins where this document is silent.
+
+## What exists
+
+| Part | Location |
+| --- | --- |
+| Pure document types, strict parsing, redaction, time formatting | `crates/model/src/state.rs` |
+| Storage validation, writer lock, atomic writes, journal, ledger, receipts, trials, snapshots, reconciliation | `crates/engine/` (`dfm-engine`, depends on `dfm-model` only) |
+| `bind` initializes state. `state check` verifies identity. | `crates/cli/` |
+| Recording commands for tests (`__record-op`, `__record-trial`, `__reconcile`) | `crates/cli/src/state_cmd/harness.rs`, compiled only with `test-isolation` |
+| Failure injection (error, abort, wait for a file) | `crates/engine/src/fail.rs`, behind the engine feature `failpoints`, which only `dfm-cli/test-isolation` enables. A gate test rejects it in a release dependency graph. |
+
+The `ports` and `adapters` crates are not created. `platform_macos` exists (HOME, paths, platform check) and the engine does not depend on it. The engine takes the one OS fact it needs (the user id) from the caller in `Sys`. File operations go through `rustix` (see Dependencies), so the engine names no OS constant.
+
+No workflow (`sync`, `update`, `try`, `adopt`, `purge`) exists. Nothing in the release binary writes a ledger entry, receipt or trial record yet. The engine API does, and the isolated test binary drives it.
+
+## Layout
+
+```
+~/.config/dotfiles-manager/machine.toml            binding (DFM-14)
+~/.local/state/dotfiles-manager.lock               writer lock (flock), outside the state root
+~/.local/state/dotfiles-manager/state/             0700
+    state.json   ledger.json   journal.jsonl       0600
+    receipts/ snapshots/ trials/                   0700
+~/.local/state/dotfiles-manager/state.next/        only during init
+```
+
+The architecture table lists `state/ledger.json` relative to the state root `~/.local/state/dotfiles-manager/`. This implementation reads that literally: the files sit in a `state/` directory inside the root. That is also the only reading under which `state.prev-<n>` and `state.next` are siblings of `state` and the lock "in the parent directory" is outside it.
+
+`grants.json` and the `state upgrade` machinery are not created. Trust grants belong to a later task.
+
+## Documents
+
+All are JSON in canonical form (UTF-8, sorted keys, no extra whitespace), at most 16 MiB (journal lines 64 KiB), nesting depth at most 32, unknown keys refused. The schema is read first: `1` is accepted, a higher integer is `E_STATE_NEWER`, any other integer is `E_SCHEMA_UNSUPPORTED`, a missing one is `E_STATE_INVALID`.
+
+- `state.json`, `ledger.json` and each trial carry `binding{profile, machine_id, binding_digest}`. The receipt carries `profile{id, binding_digest}` and `machine_id` as the contract lists them.
+- **Identity is profile plus machine id.** `binding_digest` is audit evidence and is never compared, because an authored binding edit changes it without changing the owner.
+- Every document written for another identity than `state.json` is refused on write (ledger, receipt, trial) and reported on read.
+- Ledger: one entry per resource with its exact `owned_outputs`. Two resources cannot own one path. Paths are normalized absolute paths inside HOME, checked on read as well as on write. They may not be inside, equal to, or an ancestor of the state root, the config directory, the lock file, the data directory (toolchains) or the cache directory (build). Comparison is case-folded text and also by filesystem identity (device and inode, symlinks followed above the leaf): a directory above the claim that is a reserved directory, or a leaf that is a reserved path or an ancestor of one, is refused, so a case or Unicode alias (APFS folds `U+017F` to `s`) or a link into the manager's storage cannot pass. A symlink as the leaf is allowed, because the link itself is the claim. The same check runs on every path read from the ledger, receipts, trials and journal, and again in `authorizes_delete` at the moment of use. On write, symlinks in the parent directories are resolved first. A hand-written ledger that violates this is a finding and grants nothing. A normal resource has a SHA-256 fingerprint. A sensitive resource has none (see limits). `authorizes_delete` needs a normal entry for that resource and path whose fingerprint equals the live one. A mismatch, a missing entry or a sensitive resource authorizes nothing.
+- Receipt: the contract fields. `result.outcome` is the exit name and must match `exit_code`: `ok` 0, `failed` 1, `usage` 2, `blocked` 3, `declined` 4, `pending` 5, `interrupted` 130, `terminated` 143 (a resolved reading of the contract, see Decisions). An operation has `started_at` and `finished_at` unless its status is `not_started` or `not_in_scope`, where both are absent. `counts` has one key per status and must equal the tally of `operations`. A sensitive operation carries no `before` or `after`. `error` is bounded to 4 KiB.
+- Journal: `intent` (with `recovery{outputs[{path, existed_before, expected_sha256?}], snapshot?}`), then one of `done`, `failed`, `blocked`, `pending`, `unknown`. An `intent` without a later outcome for the same `(op_id, op)` is an interruption record.
+- Trial: `trial_id`, `tool`, `baseline{tool_preexisting, paths[{path, existed, sha256?}]}`, `owned_outputs`.
+
+## Rules that the code enforces
+
+1. **Topology (C08).** HOME is resolved once through every alias (`/var` to `/private/var`, a link above HOME) and opened. Everything below it is reached with `openat` relative to a descriptor, with `O_NOFOLLOW` (`O_DIRECTORY` for directories), and checked on the opened descriptor (`fstat`), never by path. Every component of the config directory, the lock directory and the state root must be a real directory (never a symlink, never another file type) owned by the current user. State root and below must be exactly 0700. Existing shared parents and the config directory must not be group or world writable. Files must be regular, owned by the current user and 0600. A violation is `E_STORAGE_INVALID` (exit 3). Nothing is repaired or replaced.
+2. **Writer lock (C01, C05).** Mutating paths take an exclusive `flock` on the lock file without waiting. A second holder gets `E_LOCKED` (exit 3). The kernel releases the lock when the process ends, so an abrupt exit cannot leave it held. Read-only commands take no lock. The lock file opens relative to a held directory descriptor, non-blocking, and must be a regular file owned by the user with mode 0600 (a mode the umask tightened is set to 0600). The holder compares the locked file with the entry in the held directory before every write. If the file was removed or replaced, the holder refuses to write (`E_LOCKED`). A second command can still lock the new file, so removing the lock file lets a second writer start, but the first writer is fenced and writes nothing more.
+3. **Atomic persistence (C01, C05).** Replacement is a same-directory 0600 temporary file, `fsync`, `rename`, directory `fsync`. A failure before the rename leaves the previous file. A failure after it is `E_IO_UNCONFIRMED` (exit 1): the new file is in place and only its durability is unknown. New directories and the journal are `fsync`ed, with their parents. Receipts and snapshots use create-only publication (`hard_link`) and are never overwritten. The journal is append-only with `fsync` and refuses to extend a file whose last line is torn.
+4. **Intent before effect (C02).** The harness order is: intent with recovery metadata (`fsync`), effect, independent read-back, outcome entry, ledger update, receipt. Ownership is recorded only after the outcome entry.
+5. **Reconciliation (C02, C03, C05).** `reconcile` asks a probe (the operation's `already_done` check) and journals `done`, `failed` or `unknown`. It never runs the operation again, never edits the ledger and never creates ownership. An interrupted operation becomes owned only when a later normal run records it.
+6. **Init (C01).** `state.next/` is built and renamed to `state/`. A crash leaves no `state/` or a complete one. An existing `state/` that is not an empty directory is never recreated: lost or damaged state needs inspect-and-adopt.
+7. **Bind order (C07, C11).** Phase 1 is read-only and refuses a different identity (in the binding or in `state.json`) with `E_REBIND_UNSUPPORTED` before any write, including the lock file. Phase 2 takes the lock, decides again, writes `state/` first and the binding second. A crash between them can only be completed by the same identity. There is no force flag and no command infers a profile. A binding with no state directory is state loss: `bind` refuses with `E_STATE_INVALID` (exit 3) and writes nothing, `state check` reports it as a finding (exit 1), and writers refuse without creating the state root. Only a bind that finds no binding may create state. A binding from before DFM-17 has no state: move it aside and bind again, or restore the state directory.
+8. **State check (C06).** `dotfiles-manager state check` is read-only. Topology and directory-level refusals are findings with exit 1, like a diagnostic command, not an abort. It loads every document and reports each problem by file: `E_IDENTITY_MISMATCH` for a readable document written for another identity, the document's own code for an unreadable one (it hides nothing else), `E_OP_INTERRUPTED` for an intent without an outcome. Listing errors, unreadable directories and stray temporary files (including in `snapshots/`) are reported too. Exit 1 with `E_DIAGNOSED` when there are findings, 0 otherwise.
+9. **Exit after a mutation.** A refusal that happens after a mutation began exits 1, not 3 (section 10). `Refusal::after_mutation` marks it. `bind` marks refusals after it created the state directory, and the harness marks everything after the intent entry.
+10. **Held descriptors and re-check (S1, C08).** A `Store` holds open descriptors for the state root and for `state/` for its whole life, and every read and write is relative to them. A path component swapped for a symlink or another directory after the store was opened cannot redirect a write: the descriptor still names the directory that was verified. Before each ledger, journal, receipt, trial or snapshot write the store also checks that the lock is still the locked file, that the held root and `state/` are still the entries their paths name (a swap is refused, `E_STORAGE_INVALID`, and nothing more is written), and that their owner and mode are unchanged. Subdirectories are opened without following a link at the moment of each write. Test: `state/` is swapped for a link to a foreign directory while a ledger or journal write is parked at a failpoint. The write completes inside the original directory, the foreign directory stays empty, and the next write is refused.
+11. **Redaction.** One pass over every persisted free-text field (receipt command and operation error; journal reason and token). Fields with a fixed shape are validated instead (item 13). Overlapping matches merge, including a match that overlaps itself. Control, bidirectional and zero-width characters become visible escapes. Each such text is bounded to 4 KiB. A resource, adapter, id or path that contains a known secret is refused, not redacted, because redaction would break its use. The refusal text does not repeat the value.
+12. **Durability.** File and directory syncs use `File::sync_all`, which asks for `F_FULLFSYNC` on macOS. A directory that rejects that request gets a plain `fsync` instead. Whether data reaches the medium cannot be observed by any test here, and tests that abort the process leave the page cache intact, so they show recovery from a crash of the manager and say nothing about power loss.
+13. **Write caps.** A ledger, receipt, trial or snapshot over 4 MiB is refused before anything is written, and an append that would take the journal past 8 MiB is refused. The read cap stays 16 MiB, so a document the manager wrote is always readable. Rotation is not built, so a journal at its cap refuses every append, which stops every operation that must journal its intent first. Reads and `state check` still work. Receipt fields that carry no free text (outcome, hashes, source identities, approval, operation times and names) must have their exact shape.
+14. **Mutation tracking.** A `Store` records its first write that took effect (or whose result is unconfirmed) and stamps every later refusal as after a mutation, so the exit is 1 whatever the caller does.
+
+## Decisions and ambiguities resolved
+
+| Contract text | Reading used |
+| --- | --- |
+| Section 4: `state/ledger.json` under "State root: `~/.local/state/dotfiles-manager/`" | Files live in `<root>/state/`. See Layout. |
+| Section 5 receipt: `result{outcome, ...}` | `outcome` is the exit name of `exit_code` (the section 10 table). Operation times are optional only for `not_started` and `not_in_scope`. |
+| Section 5 receipt: `profile{id, ...}` and `class` per operation | `profile.id` is the canonical profile path, the binding's identity. `class` is the sensitivity class (`normal` or `sensitive`), because the receipt rule for sensitive operations keys on it. |
+| Section 10: a second mutating command gets exit 3 `E_LOCKED` | `bind` follows it. The DFM-14 concurrent-bind test now accepts `E_LOCKED` as a loser's outcome. At least one bind still wins. |
+| Section 8, "Filesystem writes": descriptor-relative `openat`/`renameat`/`fstatat` | Met for the manager's own storage, with `rustix` (below). `symlinkat` is not used. Residual limits are listed under Known limits. |
+| Section 14 decision 3 accepts `serde_json` | Added, pinned `=1.0.149`, used by `dfm-model` only. |
+| Section 14 decision 3 lists four direct crates | `rustix` is a fifth, added by owner-delegated decision for descriptor-relative operations: pinned `=1.1.5` (released 2026-09-16), default features off, only `std` and `fs`, safe API only (`unsafe_code` stays forbidden), used by `dfm-engine` only. Transitive: `bitflags`, `errno`, `libc`, `linux-raw-sys`. A gate test checks every member's direct dependencies against an allow-list built from `cargo metadata`, and that `rustix` resolves with exactly the features `alloc`, `fs` and `std`. |
+
+## Known limits
+
+The first item is closed except for its residual list. Owner decisions are pending on state upgrade, sensitive conflict detection, trial baseline class, bind placement and parser strictness. They are not worked around here.
+
+- **Residual after descriptor-relative writes (C08).** The redirection class is closed for the manager's storage: a swapped path cannot send a write elsewhere. These remain:
+  1. HOME is resolved with `canonicalize` and then opened. A swap of a system-owned ancestor of HOME between those two calls is not covered.
+  2. A held descriptor does not stop another process of the same user from changing, unlinking or chmod-ing files inside the verified directory. It stops redirection only. The re-check refuses a writer after a swap or a mode change, but a change made after the check and before the write is not detected.
+  3. Claims point at files in HOME that applications and adapters own. The engine resolves a claim's parent directories by path when it accepts the claim. The effect on the claimed file is the adapter's, and it must use its own descriptor-relative operations.
+  4. Removing the lock file lets a second command lock the new file. The first writer is fenced (it refuses further writes) but a second writer can start.
+  5. Path scope compares case-folded text, not normalized Unicode.
+- **State upgrade (C03).** Not built. Every kind has "Upgrades from: none yet", so there is nothing to convert, and the `state.next` / `state.prev-<n>` upgrade procedure, `verify --mark`, `retire-previous` and `state/UPGRADE` do not exist. A newer or unsupported state is refused with its code and nothing is rewritten.
+- **Conflict detection for sensitive paths (C04).** Absent. The per-machine salted hash of section 8 item 7 needs a salt and a producer adapter. Neither exists, so the ledger stores no hash for a sensitive resource, `authorizes_delete` refuses such a resource, and an edit to a sensitive output is not detected.
+- **Trial baseline class (S6).** A trial baseline has no sensitivity class. A baseline path hash is stored for any path.
+- **Bind orchestration (R8).** `bind` sequencing lives in the CLI crate, not the engine.
+- **Strict-parser gaps (R12).** Known gaps remain in how strictly the parsers reject unusual but valid JSON (for example duplicate keys, which `serde_json` accepts, last one wins).
+- **Application-owned data.** The engine accepts only exact paths inside HOME and outside its own paths. Deciding that a path inside HOME belongs to an application is the adapter's evidence.
+- **Redaction** removes known secret values only. It does not detect unknown credential patterns. Unicode normalization differences are not folded in the path scope.
+- Snapshot retention and pruning, `grants.json`, journal rotation and the `Fs`/`Clock` ports are not built.
+- A non-UTF-8 entry name is reported as a finding by code, but it has no test, because APFS rejects such names.
+- **Delete code (DFM-18).** Nothing here deletes. The delete code must not follow a symlink at the leaf, and must decide authorization again with descriptor-relative operations at the moment of removal (`Store::authorizes_delete` decides by path and identity at the time of the call, so a swap after it is the caller's to close).
+- **Evidence scope.** The "installed CLI" evidence is the `test-isolation` build driven through `--home`, the same binary used by the other CLI tests. It is not the installed release binary, and no device was used. The recording commands exist only in that build.
+
+## Recovery by hand
+
+- `E_STATE_INVALID`, `E_STATE_NEWER`, `E_SCHEMA_UNSUPPORTED` on a document: keep the file. Use the binary version that wrote it, or restore from a copy. No command rewrites it.
+- `E_REBIND_UNSUPPORTED` against existing state: the state directory belongs to another identity. Move `~/.local/state/dotfiles-manager/` aside yourself if that machine identity really is retired.
+- `E_OP_INTERRUPTED`: a later run decides with the operation's `already_done` check. The isolated test binary has `__reconcile` for this.

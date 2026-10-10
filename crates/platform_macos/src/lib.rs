@@ -12,6 +12,8 @@ pub const DATA_DIR: &str = ".local/share/dotfiles-manager";
 pub const CACHE_DIR: &str = ".cache/dotfiles-manager";
 pub const STATE_DIR: &str = ".local/state/dotfiles-manager";
 pub const CONFIG_DIR: &str = ".config/dotfiles-manager";
+/// The writer lock file, a sibling of the state root so a state upgrade rename never moves it.
+pub const STATE_LOCK: &str = ".local/state/dotfiles-manager.lock";
 
 /// Rejects every platform except native Apple Silicon macOS, before any mutation.
 pub fn check_supported(os: &str, arch: &str) -> Result<(), Refusal> {
@@ -28,15 +30,6 @@ pub fn check_supported(os: &str, arch: &str) -> Result<(), Refusal> {
 pub fn current_platform() -> (&'static str, &'static str) {
     (std::env::consts::OS, std::env::consts::ARCH)
 }
-
-/// `O_NOFOLLOW` on Darwin. Opening a symlink with it fails instead of following the link.
-pub const O_NOFOLLOW: i32 = 0x0100;
-
-/// `O_NONBLOCK` on Darwin. Opening a FIFO with it does not wait for a writer.
-pub const O_NONBLOCK: i32 = 0x0004;
-
-/// `ELOOP` on Darwin: what `O_NOFOLLOW` reports when the path is a symlink.
-pub const ELOOP: i32 = 62;
 
 /// The effective user id, read with `id -u`.
 pub fn current_uid() -> Option<u32> {
@@ -118,6 +111,14 @@ impl Platform {
         self.home.join(STATE_DIR)
     }
 
+    pub fn config_dir(&self) -> PathBuf {
+        self.home.join(CONFIG_DIR)
+    }
+
+    pub fn lock_path(&self) -> PathBuf {
+        self.home.join(STATE_LOCK)
+    }
+
     pub fn binding_path(&self) -> PathBuf {
         self.home.join(CONFIG_DIR).join("machine.toml")
     }
@@ -172,6 +173,11 @@ mod tests {
         assert_eq!(
             p.binding_path(),
             Path::new("/h/.config/dotfiles-manager/machine.toml")
+        );
+        assert_eq!(p.state_dir(), Path::new("/h/.local/state/dotfiles-manager"));
+        assert_eq!(
+            p.lock_path(),
+            Path::new("/h/.local/state/dotfiles-manager.lock")
         );
     }
 }

@@ -84,6 +84,11 @@ impl Binding {
         self.profile == other.profile && self.machine_id == other.machine_id
     }
 
+    /// SHA-256 of the canonical TOML form. Audit evidence only; identity is profile plus machine.
+    pub fn digest(&self) -> String {
+        crate::digest::sha256_hex(self.to_toml().as_bytes())
+    }
+
     pub fn to_toml(&self) -> String {
         toml::to_string(self).expect("a flat struct of strings always serializes")
     }

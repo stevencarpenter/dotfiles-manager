@@ -121,57 +121,176 @@ fn test_isolation_is_never_in_default_or_the_release_graph() {
         !tree.contains("test-isolation"),
         "release graph enables test-isolation:\n{tree}"
     );
-}
-
-#[test]
-fn only_the_contract_crates_are_direct_dependencies() {
-    let manifest = fs::read_to_string(repo_root().join("Cargo.toml")).unwrap();
-    let deps: Vec<&str> = manifest
-        .split("[workspace.dependencies]")
-        .nth(1)
-        .unwrap()
-        .lines()
-        .take_while(|l| !l.starts_with('['))
-        .filter(|l| l.contains('='))
-        .map(|l| l.split('=').next().unwrap().trim())
-        .collect();
-    let allowed = ["dfm-model", "dfm-platform-macos", "serde", "toml", "sha2"];
-    assert!(deps.iter().all(|d| allowed.contains(d)), "{deps:?}");
-    let pins: Vec<&str> = manifest
-        .lines()
-        .filter(|l| l.starts_with("serde =") || l.starts_with("toml =") || l.starts_with("sha2 ="))
-        .collect();
-    assert_eq!(
-        pins.len(),
-        3,
-        "expected exactly serde, toml and sha2: {pins:?}"
-    );
+    // The engine's abort and wait code exists only with this feature.
     assert!(
-        pins.iter().all(|l| l.contains("\"=")),
-        "direct crates need exact =x.y.z pins"
+        tree.contains("dfm-engine") && !tree.contains("failpoints"),
+        "release graph enables failpoints:\n{tree}"
     );
 }
 
+/// The host triple, from `rustc -vV`. `cargo metadata --filter-platform` with it needs only the
+/// packages a build for this machine downloads, so the test also runs offline with a fresh
+/// CARGO_HOME after a plain build (without the filter it wants every target's packages).
+fn host_triple() -> String {
+    let rustc = std::env::var("RUSTC").unwrap_or_else(|_| "rustc".into());
+    let o = Command::new(rustc).arg("-vV").output().unwrap();
+    String::from_utf8_lossy(&o.stdout)
+        .lines()
+        .find_map(|l| l.strip_prefix("host: "))
+        .expect("rustc -vV prints a host line")
+        .trim()
+        .to_string()
+}
+
+fn metadata() -> serde_json::Value {
+    let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
+    let o = Command::new(cargo)
+        .current_dir(repo_root())
+        .args([
+            "metadata",
+            "--locked",
+            "--offline",
+            "--format-version",
+            "1",
+            "--filter-platform",
+        ])
+        .arg(host_triple())
+        .output()
+        .unwrap();
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    serde_json::from_slice(&o.stdout).unwrap()
+}
+
+/// Every direct dependency of every workspace member, of every kind (normal, dev, build) and
+/// every target, must be in this table, with its exact requirement. Adding a crate, a dev
+/// dependency or a target-specific dependency fails this test until the table is edited.
 #[test]
-fn crate_dependency_direction_follows_the_contract() {
-    // model -> nothing; platform_macos -> model; cli -> model, platform_macos. Cargo rejects
-    // cycles, so checking the allowed edges is enough to keep the layering.
-    let deps = |krate: &str| -> Vec<String> {
-        let text =
-            fs::read_to_string(repo_root().join("crates").join(krate).join("Cargo.toml")).unwrap();
-        text.split("[dependencies]")
-            .nth(1)
-            .unwrap_or("")
-            .lines()
-            .take_while(|l| !l.starts_with('['))
-            .filter_map(|l| l.split('=').next())
-            .map(|d| d.trim().to_string())
-            .filter(|d| d.starts_with("dfm-"))
-            .collect()
-    };
-    assert!(deps("model").is_empty());
-    assert_eq!(deps("platform_macos"), ["dfm-model"]);
-    assert_eq!(deps("cli"), ["dfm-model", "dfm-platform-macos"]);
+fn the_direct_dependencies_of_every_member_match_the_allow_list_exactly() {
+    use std::collections::{BTreeMap, BTreeSet};
+    let m = metadata();
+    let packages = m["packages"].as_array().unwrap();
+    let members: BTreeSet<&str> = m["workspace_members"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|id| {
+            let p = packages.iter().find(|p| p["id"] == *id).unwrap();
+            p["name"].as_str().unwrap()
+        })
+        .collect();
+    let expected: BTreeMap<&str, Vec<&str>> = BTreeMap::from([
+        (
+            "dfm-model",
+            vec![
+                "normal:serde:=1.0.229",
+                "normal:serde_json:=1.0.149",
+                "normal:sha2:=0.10.9",
+                "normal:toml:=1.1.6",
+            ],
+        ),
+        (
+            "dfm-engine",
+            vec!["normal:dfm-model:*", "normal:rustix:=1.1.5"],
+        ),
+        ("dfm-platform-macos", vec!["normal:dfm-model:*"]),
+        (
+            "dfm-cli",
+            vec![
+                "dev:serde_json:=1.0.149",
+                "normal:dfm-engine:*",
+                "normal:dfm-model:*",
+                "normal:dfm-platform-macos:*",
+                "normal:sha2:=0.10.9",
+            ],
+        ),
+    ]);
+    assert_eq!(
+        members,
+        expected.keys().copied().collect::<BTreeSet<_>>(),
+        "a workspace member was added or removed: update the allow-list"
+    );
+    for p in packages
+        .iter()
+        .filter(|p| members.contains(p["name"].as_str().unwrap()))
+    {
+        let name = p["name"].as_str().unwrap();
+        let mut got: Vec<String> = p["dependencies"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|d| {
+                assert!(
+                    d["target"].is_null(),
+                    "{name}: target-specific dependency {}",
+                    d["name"]
+                );
+                format!(
+                    "{}:{}:{}",
+                    d["kind"].as_str().unwrap_or("normal"),
+                    d["name"].as_str().unwrap(),
+                    d["req"].as_str().unwrap()
+                )
+            })
+            .collect();
+        got.sort();
+        assert_eq!(got, expected[name], "{name}: direct dependencies changed");
+        // Nothing but the binary crate may depend on the binary crate, even for tests.
+        assert!(
+            name == "dfm-cli" || !got.iter().any(|g| g.contains(":dfm-cli:")),
+            "{name} depends on dfm-cli"
+        );
+    }
+}
+
+/// rustix is the one crate allowed to reach the OS, through its safe fs API only. Its resolved
+/// features must be exactly these. A deny-list would miss a new feature.
+#[test]
+fn rustix_is_resolved_with_exactly_the_alloc_fs_and_std_features() {
+    let m = metadata();
+    let ids: Vec<&serde_json::Value> = m["packages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|p| p["name"] == "rustix")
+        .map(|p| &p["id"])
+        .collect();
+    assert_eq!(ids.len(), 1, "exactly one rustix version: {ids:?}");
+    let node = m["resolve"]["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|n| n["id"] == *ids[0])
+        .unwrap();
+    let mut features: Vec<&str> = node["features"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f.as_str().unwrap())
+        .collect();
+    features.sort_unstable();
+    assert_eq!(features, ["alloc", "fs", "std"]);
+    // And the requested features and default-features flag of the one edge that names it.
+    let engine = m["packages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["name"] == "dfm-engine")
+        .unwrap();
+    let dep = engine["dependencies"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|d| d["name"] == "rustix")
+        .unwrap();
+    assert_eq!(dep["uses_default_features"], false);
+    let mut asked: Vec<&str> = dep["features"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f.as_str().unwrap())
+        .collect();
+    asked.sort_unstable();
+    assert_eq!(asked, ["fs", "std"]);
 }
 
 #[test]
