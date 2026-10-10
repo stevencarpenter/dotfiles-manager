@@ -10,7 +10,7 @@ Task: DFM-14. This document records what the first implementation does and where
 | POSIX sh bootstrap and build-controls checker | `scripts/bootstrap.sh` |
 | Shared checker fixtures (114 cases) | `tests/fixtures/build-controls/` |
 
-`ports`, `adapters` and `engine` are not created yet. No task needs them.
+`ports` and `adapters` are not created yet. `engine` holds state persistence ([docs/state.md](state.md)).
 
 ## CLI
 
@@ -18,11 +18,12 @@ Task: DFM-14. This document records what the first implementation does and where
 dotfiles-manager --version | --help
 dotfiles-manager bind --profile <file> --machine-id <id>
 dotfiles-manager binding
+dotfiles-manager state check
 dotfiles-manager self-check --build-controls <staged tree> | --fixture-dir <dir>
 ```
 
 - `bind` records the canonical profile path and a machine identity in `~/.config/dotfiles-manager/machine.toml` (schema 1, mode 0600, directory 0700). Nothing is inferred: both flags are required.
-- A second `bind` with the same identity succeeds without a write. A different profile or machine id exits 3 with `E_REBIND_UNSUPPORTED`. There is no force flag. Rebinding is an ownership migration and is not implemented.
+- `bind` also creates the state directory (see [docs/state.md](state.md)) before it writes the binding, and takes the manager lock. A concurrent second `bind` can therefore exit 3 with `E_LOCKED` instead of `already bound`. A second `bind` with the same identity succeeds without a write. A different profile or machine id exits 3 with `E_REBIND_UNSUPPORTED`. There is no force flag. Rebinding is an ownership migration and is not implemented.
 - `bind` refuses a profile that is not a regular file of at most 1 MiB that parses as TOML with a top-level `schema` key (`E_PROFILE_INVALID`, exit 3). The resolver checks the rest in a later task. A binding that cannot be read or is wrong is never overwritten. Manual recovery: inspect `~/.config/dotfiles-manager/machine.toml`, and if the machine really should be rebound or the file is damaged, remove that file yourself; no command does it.
 - The binding is opened without following symlinks and must be a regular file owned by the current user with mode 0600; anything else is `E_BINDING_INVALID`. The config directory is synced after the file is linked.
 - The binding file is published with a temporary file, `fsync` and `hard_link`, which never replaces an existing file. Concurrent binds leave one identity.
