@@ -605,6 +605,20 @@ pub fn check_cargo_lock(text: &str) -> Res {
     Ok(())
 }
 
+/// True when the manifest has a `[workspace]` table. A staged root without one could be
+/// adopted as a member of a `Cargo.toml` planted in an ancestor directory, which would
+/// bring that file's `[patch]` and `[replace]` tables into the build.
+pub fn declares_workspace(text: &str) -> bool {
+    text.lines().any(|l| {
+        l.trim_matches([' ', '\t'])
+            .strip_prefix("[workspace]")
+            .is_some_and(|rest| {
+                let rest = rest.trim_matches([' ', '\t']);
+                rest.is_empty() || rest.starts_with('#')
+            })
+    })
+}
+
 /// Cargo, rustup and the file system treat names case-insensitively on macOS. A name
 /// that differs only in case from another path would let a config file hide, so
 /// two paths (or directory prefixes) that fold to the same name are refused.
@@ -671,6 +685,14 @@ mod tests {
         ] {
             assert!(check_manifest(bad, 1).is_err(), "{bad:?}");
         }
+    }
+
+    #[test]
+    fn workspace_header_detection() {
+        assert!(declares_workspace("[package]\n  [workspace]  # c\n"));
+        assert!(!declares_workspace(
+            "[workspace.dependencies]\n# [workspace]\nx = \"[workspace]\"\n"
+        ));
     }
 
     #[test]

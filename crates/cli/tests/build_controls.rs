@@ -67,10 +67,10 @@ impl Run {
         if self.code == 0 {
             return "ok".into();
         }
-        let at = self
-            .stderr
-            .find("E_")
-            .unwrap_or_else(|| panic!("no error code in {:?}", self.stderr));
+        // A failure without a stable code is itself a difference worth reporting.
+        let Some(at) = self.stderr.find("E_") else {
+            return format!("NO_CODE(exit {})", self.code);
+        };
         self.stderr[at..]
             .chars()
             .take_while(|c| c.is_ascii_uppercase() || *c == '_')
@@ -142,7 +142,17 @@ fn materialize(case: &Path, tmp: &Path) -> (PathBuf, PathBuf) {
     let digest = toolchain_digest();
     finish(&stage, &digest);
     finish(&home, &digest);
+    if extra.lines().any(|l| l == "unsearchable-ancestor") {
+        // The build directory's parent cannot be searched, so nothing below it can be checked.
+        set_mode(&home.join(".cache/dotfiles-manager"), 0o600);
+    }
     (home, stage)
+}
+
+fn set_mode(p: &Path, mode: u32) {
+    use std::os::unix::fs::PermissionsExt;
+    fs::create_dir_all(p).ok();
+    fs::set_permissions(p, fs::Permissions::from_mode(mode)).unwrap();
 }
 
 #[test]
@@ -174,6 +184,7 @@ fn shell_checker_and_manager_agree_on_every_fixture() {
         let tmp = TempDir::new("controls");
         let (home, stage) = materialize(case, tmp.path());
         let (m, s) = (run_manager(&home, &stage), run_script(&home, &stage));
+        set_mode(&home.join(".cache/dotfiles-manager"), 0o755);
         let expected_exit = if want == "ok" { 0 } else { 3 };
         if m.verdict() != want
             || s.verdict() != want

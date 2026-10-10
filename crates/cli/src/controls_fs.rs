@@ -8,7 +8,7 @@ use dfm_model::{Code, Refusal};
 use dfm_platform_macos::Platform;
 use sha2::{Digest, Sha256};
 use std::fs;
-use std::io::Read;
+use std::io::{ErrorKind, Read};
 use std::path::{Path, PathBuf};
 
 const LOCK_FILE: &str = "dotfiles-manager.lock";
@@ -106,6 +106,7 @@ fn staged_tree(stage: &Path) -> Result<(String, String), Refusal> {
             "{p}: differs from another path only in case"
         )));
     }
+    let mut root_workspace = false;
     for (rel, _) in &nodes {
         // Names are matched case-insensitively because the file system is.
         let lower = rel.to_ascii_lowercase();
@@ -126,11 +127,18 @@ fn staged_tree(stage: &Path) -> Result<(String, String), Refusal> {
             }
             "cargo.toml" => {
                 let depth = rel.matches('/').count();
-                controls::check_manifest(&read_bounded(&stage.join(rel), rel)?, depth)
+                let text = read_bounded(&stage.join(rel), rel)?;
+                controls::check_manifest(&text, depth)
                     .map_err(|e| untrusted(format!("{rel}: {e}")))?;
+                root_workspace |= depth == 0 && controls::declares_workspace(&text);
             }
             _ => {}
         }
+    }
+    if !root_workspace {
+        return Err(untrusted(
+            "the root Cargo.toml must declare [workspace]".into(),
+        ));
     }
     Ok((pin, tree))
 }
@@ -203,15 +211,25 @@ fn ancestors(platform: &Platform) -> Result<(), Refusal> {
             "rust-toolchain",
             "rust-toolchain.toml",
         ] {
-            if fs::symlink_metadata(dir.join(f)).is_ok() {
-                return Err(Refusal::new(
-                    Code::BuildConfig,
-                    format!(
-                        "{} would be read by Cargo or rustup for the build directory {}",
-                        dir.join(f).display(),
-                        build.display()
-                    ),
-                ));
+            match fs::symlink_metadata(dir.join(f)) {
+                Ok(_) => {
+                    return Err(Refusal::new(
+                        Code::BuildConfig,
+                        format!(
+                            "{} would be read by Cargo or rustup for the build directory {}",
+                            dir.join(f).display(),
+                            build.display()
+                        ),
+                    ));
+                }
+                Err(e) if matches!(e.kind(), ErrorKind::NotFound | ErrorKind::NotADirectory) => {}
+                // An ancestor that cannot be searched cannot be shown to be free of config.
+                Err(e) => {
+                    return Err(Refusal::new(
+                        Code::BuildConfig,
+                        format!("cannot check {}: {}", dir.join(f).display(), e.kind()),
+                    ));
+                }
             }
         }
     }

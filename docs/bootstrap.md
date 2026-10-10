@@ -8,7 +8,7 @@ Task: DFM-14. This document records what the first implementation does and where
 | --- | --- |
 | Workspace crates `dfm-model` (pure data and rules), `dfm-platform-macos` (HOME, paths, platform check), `dfm-cli` (binary `dotfiles-manager`) | `crates/` |
 | POSIX sh bootstrap and build-controls checker | `scripts/bootstrap.sh` |
-| Shared checker fixtures (85 cases) | `tests/fixtures/build-controls/` |
+| Shared checker fixtures (102 cases) | `tests/fixtures/build-controls/` |
 
 `ports`, `adapters` and `engine` are not created yet. No task needs them.
 
@@ -52,7 +52,7 @@ The running manager is never replaced in place, so an upgrade does not depend on
 
 The checker reads only: comments; `[a.b]` and `[[a.b]]` headers with bare names; `key = value` with a bare key and a single-line string without escapes, boolean, integer, array or inline table of those. It refuses everything else, including multi-line values, dotted or quoted keys, floats and dates, non-ASCII bytes, CR, and files over 1 MiB.
 
-Rules: names are matched case-insensitively, and two paths that differ only in case are refused (the macOS file system folds case); duplicate tables, keys and inline keys are refused; no `.cargo/config.toml` or `.cargo/config` at any level; no `rust-toolchain` file; every `rust-toolchain.toml` must contain only `channel` equal to the lock pin; every `path`, `members`, `exclude`, `default-members`, `build` and `workspace` string must stay inside the root (a `..` after a normal component is refused); `git`, `registry` and unlisted dependency keys are refused; `[replace]` is refused; `[patch]` is allowed only for `crates-io`; `Cargo.lock` lines must be recognised and any `source` must be crates.io; symlinks and special files in the tree are refused.
+Rules: names are matched case-insensitively, and two paths that differ only in case are refused (the macOS file system folds case); duplicate tables, keys and inline keys are refused; no `.cargo/config.toml` or `.cargo/config` at any level; no `rust-toolchain` file; every `rust-toolchain.toml` must contain only `channel` equal to the lock pin; every `path`, `members`, `exclude`, `default-members`, `build` and `workspace` string must stay inside the root (a `..` after a normal component is refused); `git`, `registry` and unlisted dependency keys are refused; `[replace]` is refused; `[patch]` is allowed only for `crates-io`; `Cargo.lock` lines must be recognised and any `source` must be crates.io; symlinks and special files in the tree are refused; the root `Cargo.toml` must declare `[workspace]` (otherwise a `Cargo.toml` planted in an ancestor could adopt it and add `[patch]` tables); an ancestor of the build directory that cannot be searched is refused with `E_BUILD_CONFIG` instead of being treated as free of config.
 
 The checker and `toolchain-digest` fail closed: an unreadable entry, a failed hash, a bad symlink or an empty toolchain is a refusal, never a digest of the readable part. After the build the script requires the binary to report exactly `dotfiles-manager <digits.dots> (commit <the verified commit>)` before it names the install directory.
 

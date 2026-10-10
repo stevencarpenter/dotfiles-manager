@@ -284,6 +284,7 @@ controls_staged() { # $1 stage; sets PIN and TREE
     for (i = 1; i <= n; i++) { p = (i > 1 ? p "/" : "") c[i]; k = tolower(p)
       if (!(k in S)) S[k] = p; else if (S[k] != p) { print p; exit } } }')
   [ -z "$clash" ] || refuse E_SOURCE_UNTRUSTED "$clash: differs from another path only in case"
+  root_ws=0
   while IFS= read -r f; do
     f=${f#./}
     lf=$(printf '%s' "$f" | tr 'A-Z' 'a-z')
@@ -297,11 +298,13 @@ controls_staged() { # $1 stage; sets PIN and TREE
         out=$(run_awk "$stage" "$f" "$SCAN$TOOLCHAIN_RULES" -v "PINV=$PIN") || refuse_out "$out" ;;
       cargo.toml)
         depth=$(printf '%s' "$f" | tr -cd / | wc -c | tr -d ' ')
-        out=$(run_awk "$stage" "$f" "$SCAN$MANIFEST_RULES" -v "DEPTH=$depth") || refuse_out "$out" ;;
+        out=$(run_awk "$stage" "$f" "$SCAN$MANIFEST_RULES" -v "DEPTH=$depth") || refuse_out "$out"
+        if [ "$depth" -eq 0 ] && grep -Eq "^[ $TAB]*\\[workspace\\][ $TAB]*(#.*)?\$" "$stage/$f"; then root_ws=1; fi ;;
     esac
   done <<EOF
 $list
 EOF
+  [ "$root_ws" -eq 1 ] || refuse E_SOURCE_UNTRUSTED "the root Cargo.toml must declare [workspace]"
 }
 
 # Prints the toolchain tree digest of $1 (docs/architecture.md section 8, item 4a).
@@ -345,9 +348,12 @@ controls_toolchain() { # uses PIN, TREE, DATA
 controls_ancestors() { # uses CACHE
   d=$CACHE/build; tail=
   while [ ! -d "$d" ]; do tail=/${d##*/}$tail; d=$(dirname "$d"); done
-  base=$(cd "$d" && pwd -P); [ "$base" = / ] && base=
+  base=$(cd "$d" 2>/dev/null && pwd -P) || refuse E_BUILD_CONFIG "cannot resolve the build directory $d"
+  [ "$base" = / ] && base=
   d=$base$tail; [ -n "$d" ] || d=/
   while :; do
+    # An ancestor that cannot be searched cannot be shown to be free of config.
+    { [ ! -d "$d" ] || [ -x "$d" ]; } || refuse E_BUILD_CONFIG "cannot search $d to check for Cargo or rustup configuration"
     for f in .cargo/config.toml .cargo/config rust-toolchain rust-toolchain.toml; do
       if [ -e "${d%/}/$f" ] || [ -L "${d%/}/$f" ]; then
         refuse E_BUILD_CONFIG "${d%/}/$f would be read by Cargo or rustup for the build directory"

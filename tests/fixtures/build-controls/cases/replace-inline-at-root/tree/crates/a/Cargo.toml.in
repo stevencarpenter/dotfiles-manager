@@ -1,0 +1,4 @@
+replace = { x = "1" }
+[package]
+name = "a"
+version = "0.1.0"
