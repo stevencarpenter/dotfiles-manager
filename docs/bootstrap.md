@@ -44,10 +44,10 @@ Run it as `/usr/bin/env -i /bin/sh scripts/bootstrap.sh <command> ...`. The scri
 ## Install, upgrade, rollback, removal
 
 1. Place the exact pinned toolchain at `~/.local/share/dotfiles-manager/toolchains/<version>/`. Compute its digest with `sh scripts/bootstrap.sh toolchain-digest --dir <that dir>`. Review it, then write `[manager] toolchain` and `toolchain_tree_sha256` into `dotfiles-manager.lock` in the commit to build. The repository does not carry a lock yet, because the digest of the toolchain on each device is not known.
-2. `sh scripts/bootstrap.sh install --source <checkout> --commit <sha>`. Order: platform, HOME, source identity, toolchain presence, Command Line Tools (polled up to 30 minutes), stage, build controls, then `cargo fetch --locked`, `cargo build --release --locked --offline` with an empty constructed environment, `self-check --fixture-dir`, and install. No cargo, rustc or rustup process starts before the controls pass.
+2. `sh scripts/bootstrap.sh install --source <checkout> --commit <sha>`. Order: platform, HOME, source identity, toolchain presence, Command Line Tools (a missing install is refused with `E_PREREQ_MISSING` and the instruction to run `xcode-select --install`; the script never starts the installer or polls) and the command path (an existing file or foreign symlink at `~/.local/bin/dotfiles-manager` is refused, never replaced), stage, build controls, then `cargo fetch --locked`, `cargo build --release --locked --offline` with an empty constructed environment, `self-check --fixture-dir` against a copy of the existing `machine.toml` (a new binary that cannot read the current binding never becomes current), and install. No cargo, rustc or rustup process starts before the controls pass.
 3. Upgrade is the same command with a newer commit. The new version directory is written first. `current` flips by one atomic rename of a symlink, after the new binary passed `self-check`. A failed build or check leaves the previous version active. Old version directories stay. State is not migrated here (state upgrade belongs to a later task).
 4. Rollback: point `current` at the previous `versions/<name>` (`ln -s versions/<name> current.new && mv -fh current.new current`).
-5. `sh scripts/bootstrap.sh uninstall` removes the PATH link, `versions/`, `current`, the build directories and the cache. It leaves toolchains, state and the binding.
+5. `sh scripts/bootstrap.sh uninstall` removes the PATH link (only if it points at this manager), `versions/`, `current`, the build directories and `~/.cache/dotfiles-manager/build`. It leaves toolchains, state, the binding and anything else in the cache root.
 
 The running manager is never replaced in place, so an upgrade does not depend on the executable it replaces. The install needs only POSIX sh, system tools in `/usr/bin:/bin:/usr/sbin:/sbin`, Git, Command Line Tools and the placed toolchain.
 
@@ -71,10 +71,15 @@ The checker and `toolchain-digest` fail closed: an unreadable entry, a failed ha
 6. **Test hooks in the script.** With `DFM_BOOTSTRAP_TEST=1` the script reads `DFM_TEST_HOME`, `DFM_TEST_OS` and `DFM_TEST_ARCH` in place of `dscl` and `uname`. They exist so tests can use a temporary HOME. A caller who can set them already controls the user's environment; they are not an integrity boundary. Without the variable the script uses the password database, and a temporary HOME gives `E_HOME_MISMATCH` (tested).
 7. **Cache location.** `cache_dir()` is `~/.cache/dotfiles-manager`; the contract leaves it open. The script and `dfm-platform-macos` hard-code the same literal and a test compares them.
 8. **Signals.** The CLI does not catch SIGINT or SIGTERM; no command yet runs long enough to need a receipt.
-9. **Fetch.** `cargo fetch --locked` runs with crates.io as the only registry in an empty `CARGO_HOME`. The install test therefore needs network access.
+9. **Command Line Tools.** Contract section 12 item 3.2 has the script run `xcode-select --install` and poll for 30 minutes. This implementation refuses instead (owner decision), because starting a long interactive installer from a script is a machine change the owner should start.
+10. **Fetch.** `cargo fetch --locked` runs with crates.io as the only registry in an empty `CARGO_HOME`. The install test therefore needs network access.
+
+## Accepted risks
+
+- After the controls pass, the staged tree is made read-only (`chmod -R a-w`) and the toolchain digest is checked again immediately before `cargo fetch`. A process running as the same user can still change permissions or files between those steps and the build. The contract's trust boundary is the user account, so this is accepted and not closable without a sandbox. Build scripts and procedural macros already run as the user (contract section 8, known exception).
 
 ## Not verified
 
-Device behavior on the personal M5 and work M3 (DG-1, C09): Cargo configuration discovery with the pinned Cargo, whether the empty build environment suffices on each device's Command Line Tools, ad-hoc signing under device policy, the Command Line Tools install poll, and the real toolchain digest. The install test used a minimal copy of the authoring machine's toolchain, not an official release distribution install. The channel manifest digest is carried in the lock format but not checked by this script (toolchain install is a later typed operation).
+Device behavior on the personal M5 and work M3 (DG-1, C09): Cargo configuration discovery with the pinned Cargo, whether the empty build environment suffices on each device's Command Line Tools, ad-hoc signing under device policy, and the real toolchain digest. The install test used a minimal copy of the authoring machine's toolchain, not an official release distribution install. The channel manifest digest is carried in the lock format but not checked by this script (toolchain install is a later typed operation).
 
 The differential test cannot place two paths that differ only in case on this file system, so the case-collision rule is covered by a unit test in `dfm-model` and by manual reasoning for the awk version only.

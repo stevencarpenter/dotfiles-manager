@@ -576,19 +576,21 @@ fn full_source(tmp: &Path, pin: &str, digest: &str) -> (PathBuf, String) {
     (src, sha)
 }
 
-#[test]
-fn isolated_install_invocation_and_clean_removal() {
-    if std::env::var_os("DFM_SKIP_NETWORK_TESTS").is_some() {
-        eprintln!(
-            "SKIPPED: DFM_SKIP_NETWORK_TESTS is set; the install needs crates.io for `cargo fetch`"
-        );
-        return;
-    }
-    let tmp = TempDir::new("install");
+/// A temporary HOME with the pinned toolchain placed and a committed copy of this repository.
+struct Prepared {
+    tmp: TempDir,
+    home: PathBuf,
+    data: PathBuf,
+    src: PathBuf,
+    sha: String,
+    tc: PathBuf,
+}
+
+fn prepare(label: &str) -> Prepared {
+    let tmp = TempDir::new(label);
     let home = tmp.path().join("home");
     let data = home.join(".local/share/dotfiles-manager");
     fs::create_dir_all(&home).unwrap();
-
     // Owner step: place the exact pinned toolchain and record its tree digest in the lock.
     let tc_tmp = tmp.path().join("tc");
     let pin = minimal_toolchain(&tc_tmp);
@@ -607,30 +609,66 @@ fn isolated_install_invocation_and_clean_removal() {
         "shell and Rust toolchain digests differ"
     );
     let (src, sha) = full_source(tmp.path(), &pin, &digest);
-
-    // A caller environment that tries to redirect the build: none of it may be used.
-    let planted = tmp.path().join("planted");
-    let marker = tmp.path().join("planted-was-invoked");
-    fs::create_dir(&planted).unwrap();
-    for tool in ["cargo", "rustc", "rustup", "cc"] {
-        let p = planted.join(tool);
-        fs::write(
-            &p,
-            format!("#!/bin/sh\necho {tool} >> {}\nexit 1\n", marker.display()),
-        )
-        .unwrap();
-        fs::set_permissions(&p, fs::Permissions::from_mode(0o755)).unwrap();
+    Prepared {
+        tmp,
+        home,
+        data,
+        src,
+        sha,
+        tc,
     }
-    let path = format!("{}:/usr/bin:/bin", planted.display());
-    let o = script_test_mode(
-        &home,
+}
+
+fn install(p: &Prepared, sha: &str, env: &[(&str, &str)]) -> Output {
+    script_test_mode(
+        &p.home,
         &[
             "install",
             "--source",
-            src.to_str().unwrap(),
+            p.src.to_str().unwrap(),
             "--commit",
-            &sha,
+            sha,
         ],
+        env,
+    )
+}
+
+/// Commits a trivial change so the next install has a different commit (and version directory).
+fn next_commit(p: &Prepared, note: &str) -> String {
+    fs::write(p.src.join("NOTE"), note).unwrap();
+    git(&p.src, &["add", "-A"]);
+    git(&p.src, &["commit", "-q", "-m", note]);
+    git(&p.src, &["rev-parse", "HEAD"])
+}
+
+#[test]
+#[ignore = "needs crates.io"]
+fn isolated_install_invocation_and_clean_removal() {
+    let p = prepare("install");
+    let (home, data, sha, tc) = (&p.home, &p.data, &p.sha, &p.tc);
+
+    // A caller environment that tries to redirect the build: none of it may be used.
+    let planted = p.tmp.path().join("planted");
+    let marker = p.tmp.path().join("planted-was-invoked");
+    fs::create_dir(&planted).unwrap();
+    for tool in ["cargo", "rustc", "rustup", "cc"] {
+        let f = planted.join(tool);
+        fs::write(
+            &f,
+            format!("#!/bin/sh\necho {tool} >> {}\nexit 1\n", marker.display()),
+        )
+        .unwrap();
+        fs::set_permissions(&f, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    // A read-only build directory left by an earlier run must not block the next one.
+    let stale = home.join(".cache/dotfiles-manager/build/stage/sub");
+    fs::create_dir_all(&stale).unwrap();
+    fs::write(stale.join("x"), "x").unwrap();
+    fs::set_permissions(&stale, fs::Permissions::from_mode(0o500)).unwrap();
+    let path = format!("{}:/usr/bin:/bin", planted.display());
+    let o = install(
+        &p,
+        sha,
         &[
             ("PATH", &path),
             ("RUSTUP_TOOLCHAIN", "planted"),
@@ -646,6 +684,7 @@ fn isolated_install_invocation_and_clean_removal() {
         String::from_utf8_lossy(&o.stdout),
         err(&o)
     );
+    assert!(String::from_utf8_lossy(&o.stdout).contains("bootstrap: done"));
     assert!(
         !marker.exists(),
         "a planted proxy was invoked: {}",
@@ -686,8 +725,7 @@ fn isolated_install_invocation_and_clean_removal() {
         }
         c.output().unwrap()
     };
-    let v = run(&["--version"], &[]);
-    let v = String::from_utf8_lossy(&v.stdout).into_owned();
+    let v = String::from_utf8_lossy(&run(&["--version"], &[]).stdout).into_owned();
     assert_eq!(v.trim(), format!("dotfiles-manager 0.1.0 (commit {sha})"));
     assert_eq!(
         run(&["--home", home.to_str().unwrap(), "binding"], &[])
@@ -715,15 +753,181 @@ fn isolated_install_invocation_and_clean_removal() {
     );
 
     // Clean removal leaves only the owner-placed toolchain.
-    let o = script_test_mode(&home, &["uninstall"], &[]);
+    let o = script_test_mode(home, &["uninstall"], &[]);
     assert_eq!(o.status.code(), Some(0), "{}", err(&o));
-    let left: Vec<_> = entries_below(&home)
+    let left: Vec<_> = entries_below(home)
         .into_iter()
-        .filter(|p| !p.starts_with(data.join("toolchains")) && !p.is_dir())
+        .filter(|e| !e.starts_with(data.join("toolchains")) && !e.is_dir())
         .collect();
     assert!(left.is_empty(), "files left after uninstall: {left:?}");
     assert!(
         tc.join("bin/cargo").exists(),
         "uninstall must not remove the toolchain"
+    );
+}
+
+#[test]
+#[ignore = "needs crates.io"]
+fn upgrade_retries_after_a_stale_current_new_and_rolls_back() {
+    let p = prepare("upgrade");
+    let (data, first) = (&p.data, p.sha.clone());
+    assert_eq!(install(&p, &first, &[]).status.code(), Some(0));
+    let second = next_commit(&p, "second");
+    // A leftover from an interrupted earlier run: a directory named current.new.
+    fs::create_dir_all(data.join("current.new/inner")).unwrap();
+    let o = install(&p, &second, &[]);
+    assert_eq!(
+        o.status.code(),
+        Some(0),
+        "{}\n{}",
+        String::from_utf8_lossy(&o.stdout),
+        err(&o)
+    );
+    let (n1, n2) = (
+        format!("0.1.0-{}", &first[..12]),
+        format!("0.1.0-{}", &second[..12]),
+    );
+    assert_eq!(
+        fs::read_link(data.join("current")).unwrap(),
+        Path::new(&format!("versions/{n2}"))
+    );
+    assert!(
+        data.join("versions")
+            .join(&n1)
+            .join("dotfiles-manager")
+            .is_file(),
+        "the previous version must be kept"
+    );
+    assert!(!data.join("current.new").exists());
+    assert!(
+        !data.join("versions").join(&n1).join("current.new").exists(),
+        "a link was created inside an old directory"
+    );
+    // Rollback exactly as documented.
+    let rollback = format!(
+        "cd '{}' && ln -s versions/{n1} current.new && mv -fh current.new current",
+        data.display()
+    );
+    assert!(
+        Command::new("/bin/sh")
+            .args(["-c", &rollback])
+            .status()
+            .unwrap()
+            .success()
+    );
+    let v = Command::new(p.home.join(".local/bin/dotfiles-manager"))
+        .env_clear()
+        .arg("--version")
+        .output()
+        .unwrap();
+    assert!(String::from_utf8_lossy(&v.stdout).contains(&first));
+}
+
+#[test]
+#[ignore = "needs crates.io"]
+fn a_new_binary_that_cannot_read_the_existing_binding_does_not_become_current() {
+    let p = prepare("binding-gate");
+    let cfg = p.home.join(".config/dotfiles-manager");
+    fs::create_dir_all(&cfg).unwrap();
+    fs::write(cfg.join("machine.toml"), "schema = 2\n").unwrap();
+    let o = install(&p, &p.sha, &[]);
+    assert_eq!(
+        o.status.code(),
+        Some(1),
+        "{}\n{}",
+        String::from_utf8_lossy(&o.stdout),
+        err(&o)
+    );
+    assert!(
+        !p.data.join("current").exists() && !p.home.join(".local/bin/dotfiles-manager").exists()
+    );
+    assert_eq!(
+        fs::read_to_string(cfg.join("machine.toml")).unwrap(),
+        "schema = 2\n",
+        "the binding must be untouched"
+    );
+}
+
+#[test]
+fn missing_command_line_tools_are_refused_before_mutation() {
+    let tmp = TempDir::new("clt");
+    let home = tmp.path().join("home");
+    let toolchain = home.join(".local/share/dotfiles-manager/toolchains/9.9.9");
+    fs::create_dir_all(&toolchain).unwrap();
+    let (src, sha) = tiny_source(tmp.path(), "9.9.9");
+    let before = entries_below(&home);
+    let o = script_test_mode(
+        &home,
+        &[
+            "install",
+            "--source",
+            src.to_str().unwrap(),
+            "--commit",
+            &sha,
+        ],
+        &[("DFM_TEST_CLT", "missing")],
+    );
+    assert_eq!(o.status.code(), Some(3));
+    assert!(
+        err(&o).contains("E_PREREQ_MISSING") && err(&o).contains("xcode-select --install"),
+        "{}",
+        err(&o)
+    );
+    assert_eq!(
+        entries_below(&home),
+        before,
+        "nothing may be created, and no installer may start"
+    );
+}
+
+#[test]
+fn a_foreign_file_at_the_command_path_is_never_replaced() {
+    let tmp = TempDir::new("foreign");
+    let home = tmp.path().join("home");
+    fs::create_dir_all(home.join(".local/share/dotfiles-manager/toolchains/9.9.9")).unwrap();
+    fs::create_dir_all(home.join(".local/bin")).unwrap();
+    let target = home.join(".local/bin/dotfiles-manager");
+    fs::write(&target, "mine").unwrap();
+    let (src, sha) = tiny_source(tmp.path(), "9.9.9");
+    let o = script_test_mode(
+        &home,
+        &[
+            "install",
+            "--source",
+            src.to_str().unwrap(),
+            "--commit",
+            &sha,
+        ],
+        &[],
+    );
+    assert_eq!(o.status.code(), Some(3));
+    assert!(
+        err(&o).contains("E_PREREQ_MISSING") && err(&o).contains("not a symlink"),
+        "{}",
+        err(&o)
+    );
+    assert_eq!(fs::read_to_string(&target).unwrap(), "mine");
+    assert!(!home.join(".cache").exists());
+}
+
+#[test]
+fn uninstall_removes_only_what_the_manager_created() {
+    let tmp = TempDir::new("uninstall");
+    let home = tmp.path().join("home");
+    let cache = home.join(".cache/dotfiles-manager");
+    fs::create_dir_all(cache.join("build")).unwrap();
+    fs::write(cache.join("build/x"), "x").unwrap();
+    fs::write(cache.join("keep.txt"), "mine").unwrap();
+    fs::create_dir_all(home.join(".local/bin")).unwrap();
+    let foreign = home.join(".local/bin/dotfiles-manager");
+    std::os::unix::fs::symlink("/usr/bin/true", &foreign).unwrap();
+    let o = script_test_mode(&home, &["uninstall"], &[]);
+    assert_eq!(o.status.code(), Some(0), "{}", err(&o));
+    assert!(!cache.join("build").exists());
+    assert_eq!(fs::read_to_string(cache.join("keep.txt")).unwrap(), "mine");
+    assert_eq!(
+        fs::read_link(&foreign).unwrap(),
+        Path::new("/usr/bin/true"),
+        "a link that is not ours must stay"
     );
 }

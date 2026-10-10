@@ -385,17 +385,27 @@ controls_ancestors() { # uses CACHE
 controls() { controls_staged "$1"; controls_toolchain; controls_ancestors; }
 
 # ---- install and uninstall -----------------------------------------------------------------
+# The script never starts the Command Line Tools installer: that is a long, interactive
+# change to the machine. It refuses before any mutation and tells the owner what to do.
 ensure_clt() {
-  /usr/bin/xcode-select -p >/dev/null 2>&1 && /usr/bin/xcrun --find clang >/dev/null 2>&1 && return 0
-  printf 'Command Line Tools are missing; starting the installer\n'
-  /usr/bin/xcode-select --install >/dev/null 2>&1 || true
-  waited=0
-  while [ "$waited" -lt 1800 ]; do
-    /usr/bin/xcode-select -p >/dev/null 2>&1 && /usr/bin/xcrun --find clang >/dev/null 2>&1 && return 0
-    sleep 10; waited=$((waited + 10))
-  done
-  refuse E_PREREQ_MISSING "Command Line Tools did not become available within 30 minutes"
+  if { test_mode && [ "${DFM_TEST_CLT:-}" = missing ]; } ||
+    ! { /usr/bin/xcode-select -p >/dev/null 2>&1 && /usr/bin/xcrun --find clang >/dev/null 2>&1; }; then
+    refuse E_PREREQ_MISSING "Command Line Tools are missing. Run 'xcode-select --install', wait for it to finish, then run this script again"
+  fi
 }
+
+# The command path may only be replaced when it is absent or already ours.
+check_command_path() {
+  link=$HOME_DIR/.local/bin/dotfiles-manager
+  if [ -L "$link" ]; then
+    [ "$(readlink "$link")" = "$DATA/current/dotfiles-manager" ] ||
+      refuse E_PREREQ_MISSING "$link is a symlink that points elsewhere; move it away first"
+  elif [ -e "$link" ]; then
+    refuse E_PREREQ_MISSING "$link exists and is not a symlink; move it away first"
+  fi
+}
+
+rm_build() { [ ! -e "$build" ] || chmod -R u+w "$build"; rm -rf "$build"; }
 
 # Replacement refs (refs/replace) would let a ref swap the content of the verified commit.
 git_clean() { /usr/bin/env -i PATH="$SYSPATH" HOME=/var/empty LANG=C GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null \
@@ -423,24 +433,33 @@ cmd_install() {
   [ -d "$DATA/toolchains/$hint" ] ||
     refuse E_TOOLCHAIN_MISMATCH "toolchain $hint is absent at $DATA/toolchains/$hint; install exactly that version there (official Rust release distribution)"
   ensure_clt
+  check_command_path
   build=$CACHE/build
-  rm -rf "$build"; mkdir -p "$build/stage"
+  rm_build; mkdir -p "$build/stage"
   # Build the verified commit itself, not whatever HEAD is. Both steps are checked: a pipe would hide
   # the status of git archive.
   git_clean -C "$src" archive --format=tar --end-of-options "$commit" >"$build/source.tar" || { echo "error: git archive failed" >&2; exit 1; }
   tar -xf "$build/source.tar" -C "$build/stage" || { echo "error: cannot extract the source" >&2; exit 1; }
   rm -f "$build/source.tar"
   controls "$build/stage"
+  chmod -R a-w "$build/stage" # same-uid writers can still undo this; see docs/bootstrap.md
   # Controls passed. From here the pinned toolchain runs under a constructed environment.
   for d in cargo-home rustup-home build-home; do rm -rf "${DATA:?}/$d"; mkdir -p "$DATA/$d"; done
   cd "$build"
   tcrun() { /usr/bin/env -i PATH="$TC/bin:$SYSPATH" HOME="$DATA/build-home" CARGO_HOME="$DATA/cargo-home" \
     RUSTUP_HOME="$DATA/rustup-home" RUSTC="$TC/bin/rustc" LANG=C DFM_BUILD_COMMIT="$commit" "$@"; }
+  # Check the toolchain again immediately before it first runs.
+  got=$(toolchain_digest "$TC") || got=
+  [ -n "$got" ] && [ "$got" = "$TREE" ] || refuse E_TOOLCHAIN_MISMATCH "toolchain $PIN changed after the check"
   tcrun "$TC/bin/cargo" fetch --locked --manifest-path "$build/stage/Cargo.toml" || { echo "error: cargo fetch failed" >&2; exit 1; }
   tcrun "$TC/bin/cargo" build --release --locked --offline --manifest-path "$build/stage/Cargo.toml" \
     --target-dir "$build/target" -p dfm-cli || { echo "error: cargo build failed" >&2; exit 1; }
   bin=$build/target/release/dotfiles-manager
+  # The new binary must be able to read the binding that already exists, so it checks a copy.
   mkdir -p "$build/fixture"
+  if [ -e "$HOME_DIR/.config/dotfiles-manager/machine.toml" ]; then
+    cp "$HOME_DIR/.config/dotfiles-manager/machine.toml" "$build/fixture/machine.toml"
+  fi
   tcrun "$bin" self-check --fixture-dir "$build/fixture" >/dev/null || { echo "error: self-check failed" >&2; exit 1; }
   ver=$(tcrun "$bin" --version) || { echo "error: the built binary did not run" >&2; exit 1; }
   case $ver in "dotfiles-manager "*" (commit $commit)") ;; *) echo "error: the built binary reports a different identity: $ver" >&2; exit 1 ;; esac
@@ -450,21 +469,25 @@ cmd_install() {
   mkdir -p "$DATA/versions/$name" "$HOME_DIR/.local/bin"
   cp "$bin" "$DATA/versions/$name/dotfiles-manager.new"; chmod 755 "$DATA/versions/$name/dotfiles-manager.new"
   mv -f "$DATA/versions/$name/dotfiles-manager.new" "$DATA/versions/$name/dotfiles-manager"
-  ln -s "versions/$name" "$DATA/current.new"; mv -fh "$DATA/current.new" "$DATA/current"
-  ln -s "$DATA/current/dotfiles-manager" "$HOME_DIR/.local/bin/dotfiles-manager.new"
+  # A stale current.new (even a directory) is removed first, so ln cannot create the link inside it.
+  rm -rf "$DATA/current.new"; ln -sfn "versions/$name" "$DATA/current.new"; mv -fh "$DATA/current.new" "$DATA/current"
+  rm -f "$HOME_DIR/.local/bin/dotfiles-manager.new"
+  ln -sfn "$DATA/current/dotfiles-manager" "$HOME_DIR/.local/bin/dotfiles-manager.new"
   mv -fh "$HOME_DIR/.local/bin/dotfiles-manager.new" "$HOME_DIR/.local/bin/dotfiles-manager"
-  rm -rf "$build" "$DATA/cargo-home" "$DATA/rustup-home" "$DATA/build-home"
+  rm_build; rm -rf "$DATA/cargo-home" "$DATA/rustup-home" "$DATA/build-home"
   sha=$(/usr/bin/shasum -a 256 "$DATA/versions/$name/dotfiles-manager" | cut -d' ' -f1)
   printf 'installed %s\nsource commit %s\nbinary sha256 %s (record only)\nbootstrap: done\n' "$DATA/versions/$name" "$commit" "$sha"
 }
 
-# Removes what install created. The toolchain, state and binding are never touched.
+# Removes what install created. The toolchain, state, binding and anything else in the cache
+# root are never touched.
 cmd_uninstall() {
   resolve_home
   link=$HOME_DIR/.local/bin/dotfiles-manager
-  if [ -L "$link" ]; then rm -f "$link"; fi
-  rm -rf "${DATA:?}/versions" "$DATA/current" "$DATA/current.new" "$DATA/cargo-home" "$DATA/rustup-home" "$DATA/build-home" "${CACHE:?}"
-  rmdir "$DATA" "$HOME_DIR/.local/bin" 2>/dev/null || true
+  if [ -L "$link" ] && [ "$(readlink "$link")" = "$DATA/current/dotfiles-manager" ]; then rm -f "$link"; fi
+  build=$CACHE/build; rm_build
+  rm -rf "${DATA:?}/versions" "$DATA/current" "$DATA/current.new" "$DATA/cargo-home" "$DATA/rustup-home" "$DATA/build-home"
+  rmdir "$CACHE" "$DATA" "$HOME_DIR/.local/bin" 2>/dev/null || true
   printf 'removed the installed manager; toolchains, state and binding were left in place\n'
 }
 
