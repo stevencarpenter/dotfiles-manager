@@ -73,6 +73,9 @@ pub struct AdapterSpec {
     pub target: TargetRule,
     /// Values hold references to secrets. They are shown as `[redacted]` and never hashed.
     pub secret_values: bool,
+    /// The output can hold credentials (architecture section 8, "Secrets and sensitive paths"):
+    /// the planner stores no content hash for it. Implied by `secret_values`.
+    pub sensitive: bool,
     /// The adapter writes into a native document with its own precedence rules.
     pub native_document: bool,
     pub claims: Claims,

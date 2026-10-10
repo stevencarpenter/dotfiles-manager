@@ -13,6 +13,7 @@ pub use explain::explain;
 pub use schema::{AdapterCatalog, AdapterSpec, Claims, Field, Include, Schema, TargetRule};
 pub use source::{Entry, SourceSet};
 mod compose;
+pub(crate) use compose::glob;
 
 use std::collections::BTreeMap;
 use toml::Value;
@@ -52,6 +53,8 @@ pub struct ResolvedResource {
     pub defaults: Vec<String>,
     pub extensions: Vec<String>,
     pub secret_values: bool,
+    /// The output can hold credentials, so no content hash is recorded for it.
+    pub sensitive: bool,
     pub native_document: bool,
     /// One entry per leaf of `value`, keyed by RFC 6901 pointer.
     pub provenance: BTreeMap<String, Provenance>,

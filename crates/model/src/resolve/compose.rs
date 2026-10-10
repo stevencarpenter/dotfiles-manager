@@ -1008,6 +1008,7 @@ fn finish(
                 defaults: r.defaults.clone(),
                 extensions: r.extensions.clone(),
                 secret_values: spec.secret_values,
+                sensitive: spec.sensitive || spec.secret_values,
                 native_document: spec.native_document,
                 provenance: prov,
                 claims,

@@ -5,6 +5,7 @@ pub mod controls;
 pub mod digest;
 pub mod display;
 pub mod exit;
+pub mod plan;
 pub mod refusal;
 pub mod resolve;
 pub mod state;

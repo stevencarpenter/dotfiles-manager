@@ -25,6 +25,7 @@ fn spec(
         kind,
         target,
         secret_values: false,
+        sensitive: false,
         native_document: false,
         claims,
         value,
@@ -118,25 +119,29 @@ pub fn builtin_catalog() -> AdapterCatalog {
                 Schema::Native,
             )
         }),
-        native(spec(
-            "claude-settings/v1",
-            "merge",
-            TargetRule::Required,
-            Claims::Target,
-            Schema::Table(vec![
-                field("managed", Schema::Native, true),
-                field("seed", Schema::Native, false),
-                field(
-                    "handlers",
-                    Schema::Map(Box::new(Schema::Table(vec![
-                        field("event", Schema::Str, true),
-                        field("type", Schema::Str, true),
-                        field("argv", Schema::Array(Box::new(Schema::Str)), true),
-                    ]))),
-                    true,
-                ),
-            ]),
-        )),
+        // The live file can hold credentials in fields the manager does not own.
+        native(AdapterSpec {
+            sensitive: true,
+            ..spec(
+                "claude-settings/v1",
+                "merge",
+                TargetRule::Required,
+                Claims::Target,
+                Schema::Table(vec![
+                    field("managed", Schema::Native, true),
+                    field("seed", Schema::Native, false),
+                    field(
+                        "handlers",
+                        Schema::Map(Box::new(Schema::Table(vec![
+                            field("event", Schema::Str, true),
+                            field("type", Schema::Str, true),
+                            field("argv", Schema::Array(Box::new(Schema::Str)), true),
+                        ]))),
+                        true,
+                    ),
+                ]),
+            )
+        }),
         native(spec(
             "text-fragments/v1",
             "assemble",
