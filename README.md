@@ -2,7 +2,7 @@
 
 A proposed manager for one profile per machine, an authoritative shared core, and explicitly selected modules.
 
-**Status:** design and example fixtures only. There is no manager executable, configuration resolver, provider implementation, or deployment engine. `dotfiles-manager` is a working name. No implementation language or license has been selected.
+**Status:** design and example fixtures, plus a Rust CLI that can be built, installed in isolation and bound to one profile ([bootstrap and binding](docs/bootstrap.md)). There is no configuration resolver, provider implementation, or deployment engine. `dotfiles-manager` is a working name. No license has been selected.
 
 - [Reviewed delivery roadmap](docs/roadmap.json) and [review record](docs/roadmap-review.md): M5/M3 task contracts and evidence gates. Kaneo DFM is the authoritative backlog.
 - [Checklist completion contract](docs/checklist-state.md): live Kaneo acceptance checkboxes are the sole completion state. Tasks and epics derive completion from their canonical requirements.
@@ -35,15 +35,23 @@ Read-only resolution can be built first internally, but does not satisfy this fi
 
 Install Git hooks once per clone with `lefthook install`. Git, Bash, Lefthook and uv must be available on PATH.
 
-The pre-commit hook runs the full local gate against a temporary copy of the staged files. It checks fixtures, pinned Ruff lint/format, shell syntax and the staged-gate regression test. It does not modify or restage files. Run `just check-all` to check the working tree manually.
+The pre-commit hook runs the full local gate against a temporary copy of the staged files. It checks fixtures, pinned Ruff lint/format, shell syntax, the staged-gate regression test, `cargo fmt --check`, `cargo clippy -D warnings` and `cargo test`. It does not modify or restage files. Run `just check-all` to check the working tree manually.
 
 Passing local validation is the gate for GitHub publication and merge. Hosted CI is informational; account billing and unavailable runners do not block delivery. Keep evidence for the exact source revision. Merge and publication still require authorization.
 
 ```sh
-just check
-# Or, without just:
+just check            # runs the four named checks below, in order
+just check-fixtures   # documentation fixtures only
+just check-scripts    # Ruff, shell syntax, staged-gate regression test
+just check-style      # cargo fmt --check, cargo clippy -D warnings
+just check-tests      # cargo test: implementation, CLI, bootstrap and build-controls tests
+# Or, without just, the fixture checker alone:
 uv run scripts/check_examples.py
 ```
+
+`scripts/check_all.sh` is the single shared gate and accepts the step names `fixtures`, `scripts`, `rust-style` and `rust-tests`. `just check-tests` includes an install test that fetches crates from crates.io; set `DFM_SKIP_NETWORK_TESTS=1` to skip that one test (the skip is printed).
+
+The fixture checker below is unchanged and still checks documentation fixtures only.
 
 The checker uses Python 3.14 and the standard library. It checks TOML syntax, basic document shapes, local references, source containment, resource IDs, policy pointers, and acceptance-fixture structure. It also checks rejection of nine malformed example variants, including wrong document-kind references, and acceptance of a profile without optional overrides.
 
@@ -51,6 +59,6 @@ It does **not** implement composition, evaluate the acceptance expectations, con
 
 The checker reports 14 manifests, seven modules, 16 unexecuted acceptance-case definitions, nine malformed-variant rejections, and one accepted profile without overrides. Earlier draft verification rejected the original five malformed variants. Ruff lint/format, hook shell syntax, and authored-source Gitleaks scans passed. The draft 0.2 review HTML passed layout checks at 1280 and 390 CSS pixels in both themes; those checks predate the doctor table added in draft 0.3. These checks do not establish implementation of the required workflows.
 
-[Contract CI](.github/workflows/contract-check.yml) runs the fixture checker, pinned Ruff lint/format checks, and inert-hook syntax checks on pushes and pull requests. It does not run the proposed manager workflows.
+[Contract CI](.github/workflows/contract-check.yml) mirrors the local gate on pushes and pull requests: fixtures, Ruff, hook and bootstrap script syntax, Rust style and Rust tests. Hosted Actions are disabled for this repository, so the local gate is the authority. The checks run no manager workflow (sync, update, try, adopt, purge) and no native-device proof.
 
 All names, account references, and external configuration in the fixtures are synthetic. The examples demonstrate the proposed format; they are not a complete migration of the existing dotfiles inventory and must not be deployed.
