@@ -1,10 +1,12 @@
 //! The state directory: initialization, journal, ledger, receipts, trials and snapshots.
+//!
+//! A [`Store`] holds open descriptors for the state root and for `state/`. Every read and write
+//! goes through them, so a path swapped after the store was opened cannot redirect an
+//! operation. Before each write the store also checks that the held directories are still the
+//! ones the paths name and that the lock is still held on the lock file.
 
 use crate::fail::Fail;
-use crate::fsys::{
-    self, Found, Layout, Lock, Sys, append_line, below, canonical_home, check_dir_chain,
-    publish_new, read_private, replace_file, storage, unconfirmed,
-};
+use crate::fsys::{Dir, Layout, Lock, Sys, below, storage, unconfirmed};
 use dfm_model::binding::Binding;
 use dfm_model::state::{
     self, Class, JournalEntry, Ledger, Phase, Receipt, Scope, Stamp, StateDoc, TrialRecord,
@@ -12,7 +14,7 @@ use dfm_model::state::{
 };
 use dfm_model::{Code, Refusal};
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 /// Seconds since the epoch. A clock before 1970 is an error, never a silent zero.
 pub fn now_unix() -> Result<u64, Refusal> {
@@ -39,10 +41,11 @@ pub enum Probe {
 #[derive(Debug)]
 pub struct Store {
     sys: Sys,
-    home: PathBuf,
-    root: PathBuf,
-    root_rel: Vec<String>,
-    dir: PathBuf,
+    /// Canonical HOME as a path, for claim checks (claims live outside the manager's storage).
+    root_parent: Dir,
+    root_name: String,
+    root: Dir,
+    state: Option<Dir>,
     scope: Scope,
     secrets: Vec<String>,
     fail: Fail,
@@ -66,40 +69,80 @@ impl Finding {
     }
 }
 
+fn rel_of(layout: &Layout, p: &Path) -> Result<Vec<String>, Refusal> {
+    below(&layout.home, p)
+}
+
 impl Store {
-    fn new(sys: Sys, layout: &Layout, home: PathBuf, fail: Fail) -> Result<Store, Refusal> {
-        let join = |p: &Path| -> Result<PathBuf, Refusal> {
-            Ok(below(&layout.home, p)?
-                .iter()
-                .fold(home.clone(), |a, c| a.join(c)))
-        };
-        let root_rel = below(&layout.home, &layout.state_root)?;
-        if root_rel.is_empty() {
+    /// Opens HOME and walks to the state root, creating directories when `create` is set.
+    fn locate(
+        sys: &Sys,
+        layout: &Layout,
+        create: bool,
+    ) -> Result<Option<(Dir, Dir, String, Dir)>, Refusal> {
+        let home = Dir::open_home(sys, &layout.home)?;
+        let mut rel = rel_of(layout, &layout.state_root)?;
+        let Some(name) = rel.pop() else {
             return Err(storage("the state root is HOME itself"));
-        }
-        let root = join(&layout.state_root)?;
-        let reserved: Vec<String> = [
-            root.clone(),
+        };
+        // Shared parents (such as .local/state) only have to be closed to group and others.
+        let Some(parent) = home.walk(sys, &rel, rel.len(), create)? else {
+            return Ok(None);
+        };
+        let Some(root) = parent.child(sys, &name, true, create)? else {
+            return Ok(None);
+        };
+        Ok(Some((home, parent, name, root)))
+    }
+
+    fn build(
+        sys: Sys,
+        layout: &Layout,
+        home: &Dir,
+        located: (Dir, String, Dir),
+        fail: Fail,
+    ) -> Result<Store, Refusal> {
+        let (root_parent, root_name, root) = located;
+        let canon = home.shown().to_path_buf();
+        let join = |p: &Path| -> Result<String, Refusal> {
+            Ok(rel_of(layout, p)?
+                .iter()
+                .fold(canon.clone(), |a, c| a.join(c))
+                .to_string_lossy()
+                .into_owned())
+        };
+        let reserved = [
+            join(&layout.state_root)?,
             join(&layout.config_dir)?,
             join(&layout.lock_file)?,
             join(&layout.data_dir)?,
             join(&layout.cache_dir)?,
-        ]
-        .iter()
-        .map(|p| p.to_string_lossy().into_owned())
-        .collect();
-        let home_str = home.to_string_lossy().into_owned();
+        ];
         Ok(Store {
             sys,
-            dir: root.join(STATE),
-            scope: Scope::new(&home_str, &reserved),
-            secrets: Vec::new(),
-            root_rel,
+            scope: Scope::new(&canon.to_string_lossy(), &reserved),
+            root_parent,
+            root_name,
             root,
-            home,
+            state: None,
+            secrets: Vec::new(),
             fail,
             lock: None,
         })
+    }
+
+    /// Opens `state/` and its subdirectories if they exist and validates them on their
+    /// descriptors. `false` when `state` is absent.
+    fn attach_state(&mut self) -> Result<bool, Refusal> {
+        let Some(state) = self.root.child(&self.sys, STATE, true, false)? else {
+            self.state = None;
+            return Ok(false);
+        };
+        for d in SUBDIRS {
+            state.child(&self.sys, d, true, false)?;
+        }
+        self.state = Some(state);
+        Ok(true)
     }
 
     /// Known secret values. Descriptive text that contains one is redacted before it is
@@ -116,128 +159,32 @@ impl Store {
     /// Opens for reading without taking the lock and without creating anything. `None` when no
     /// state directory exists. A redirected, mistyped or badly owned path is a refusal.
     pub fn open_read(sys: Sys, layout: &Layout, fail: Fail) -> Result<Option<Store>, Refusal> {
-        let home = canonical_home(&sys, &layout.home)?;
-        let s = Store::new(sys, layout, home.clone(), fail)?;
-        let private_from = s.root_rel.len() - 1;
-        if check_dir_chain(&sys, &home, &s.root_rel, private_from, false)? == Found::Absent {
+        let Some((home, parent, name, root)) = Self::locate(&sys, layout, false)? else {
             return Ok(None);
-        }
-        Ok(s.check_layout()?.then_some(s))
-    }
-
-    /// Validates `state` and its subdirectories if they exist. `false` when `state` is absent.
-    fn check_layout(&self) -> Result<bool, Refusal> {
-        if check_dir_chain(&self.sys, &self.root, &[STATE.into()], 0, false)? == Found::Absent {
-            return Ok(false);
-        }
-        for d in SUBDIRS {
-            check_dir_chain(&self.sys, &self.dir, &[d.into()], 0, false)?;
-        }
-        Ok(true)
+        };
+        let mut s = Store::build(sys, layout, &home, (parent, name, root), fail)?;
+        Ok(s.attach_state()?.then_some(s))
     }
 
     /// Opens for writing: creates the shared parent of the lock file, takes the exclusive lock
     /// (`E_LOCKED` if held, never waiting), then validates or creates the manager root.
     pub fn open_write(sys: Sys, layout: &Layout, fail: Fail) -> Result<Store, Refusal> {
-        let home = canonical_home(&sys, &layout.home)?;
-        let lock_rel = below(&layout.home, &layout.lock_file)?;
-        let parent = &lock_rel[..lock_rel.len().saturating_sub(1)];
-        check_dir_chain(&sys, &home, parent, parent.len(), true)?;
-        let lock_path = lock_rel.iter().fold(home.clone(), |a, c| a.join(c));
-        let lock = Lock::acquire(&sys, &lock_path)?;
-        let mut s = Store::new(sys, layout, home.clone(), fail)?;
-        check_dir_chain(&sys, &home, &s.root_rel, s.root_rel.len() - 1, true)?;
+        let home = Dir::open_home(&sys, &layout.home)?;
+        let mut lock_rel = rel_of(layout, &layout.lock_file)?;
+        let Some(lock_name) = lock_rel.pop() else {
+            return Err(storage("the lock file is HOME itself"));
+        };
+        let lock_dir = home
+            .walk(&sys, &lock_rel, lock_rel.len(), true)?
+            .ok_or_else(|| storage("the lock directory vanished"))?;
+        let lock = Lock::acquire(&sys, &lock_dir, &lock_name)?;
+        let (_, parent, name, root) =
+            Self::locate(&sys, layout, true)?.ok_or_else(|| storage("the state root vanished"))?;
+        let mut s = Store::build(sys, layout, &home, (parent, name, root), fail)?;
         s.lock = Some(lock);
         // A writer must not act on a state directory whose layout it would refuse to read.
-        s.check_layout()?;
+        s.attach_state()?;
         Ok(s)
-    }
-
-    /// Run immediately before every write: the lock file is still the locked one, and the
-    /// whole directory chain down to `sub` (a subdirectory of `state`, or none) still passes.
-    /// This narrows the window between validation and use. It does not close it: see the
-    /// module note in `fsys.rs`.
-    fn guard(&self, sub: Option<&str>) -> Result<(), Refusal> {
-        self.lock
-            .as_ref()
-            .ok_or_else(|| storage("a write needs the manager lock"))?
-            .verify()?;
-        let gone = |what: &str| storage(format!("{what} vanished before the write"));
-        let private_from = self.root_rel.len() - 1;
-        if check_dir_chain(&self.sys, &self.home, &self.root_rel, private_from, false)?
-            == Found::Absent
-        {
-            return Err(gone("the state root"));
-        }
-        let mut below_root = vec![STATE.to_string()];
-        below_root.extend(sub.map(str::to_string));
-        if check_dir_chain(&self.sys, &self.root, &below_root, 0, false)? == Found::Absent {
-            return Err(gone("the state directory"));
-        }
-        Ok(())
-    }
-
-    /// The state directory exists (and passed topology validation).
-    pub fn is_initialized(&self) -> Result<bool, Refusal> {
-        Ok(check_dir_chain(&self.sys, &self.root, &[STATE.into()], 0, false)? == Found::Present)
-    }
-
-    /// Creates the state directory for `stamp`. It builds `state.next` and renames it into place,
-    /// so a crash leaves either no `state` or a complete one. An existing `state` that is not an
-    /// empty directory is refused and left alone: lost or damaged state is never recreated.
-    pub fn init(&self, stamp: &Stamp) -> Result<(), Refusal> {
-        // The state directory does not exist yet, so only the lock and the root are checked.
-        self.lock_ok()?;
-        let private_from = self.root_rel.len() - 1;
-        if check_dir_chain(&self.sys, &self.home, &self.root_rel, private_from, false)?
-            == Found::Absent
-        {
-            return Err(storage("the state root vanished before init"));
-        }
-        let (sys, dir) = (&self.sys, &self.dir);
-        if self.is_initialized()? {
-            let empty = fs::read_dir(dir)
-                .map_err(|e| fsys::io("list state", &e))?
-                .next()
-                .is_none();
-            if !empty {
-                return Err(Refusal::new(
-                    Code::StateInvalid,
-                    format!(
-                        "{} exists and is not empty; it is not recreated",
-                        dir.display()
-                    ),
-                ));
-            }
-        }
-        let staging = self.root.join(STAGING);
-        if check_dir_chain(sys, &self.root, &[STAGING.into()], 0, false)? == Found::Present {
-            // Our own half-built directory from a crashed init. It never held authority.
-            fs::remove_dir_all(&staging).map_err(|e| fsys::io("discard staging", &e))?;
-        }
-        check_dir_chain(sys, &self.root, &[STAGING.into()], 0, true)?;
-        for d in SUBDIRS {
-            check_dir_chain(sys, &staging, &[d.into()], 0, true)?;
-        }
-        let doc = StateDoc::new(stamp.clone(), now_unix()?);
-        publish_new(
-            &staging,
-            "state.json",
-            &canonical(&doc)?,
-            &self.fail,
-            "init-state",
-        )?;
-        publish_new(
-            &staging,
-            "ledger.json",
-            &canonical(&Ledger::empty(stamp.clone()))?,
-            &self.fail,
-            "init-ledger",
-        )?;
-        publish_new(&staging, "journal.jsonl", b"", &self.fail, "init-journal")?;
-        self.fail.hit("init-before-rename")?;
-        fs::rename(&staging, dir).map_err(|e| fsys::io("publish state", &e))?;
-        unconfirmed(fsys::sync_dir(&self.root))
     }
 
     fn lock_ok(&self) -> Result<(), Refusal> {
@@ -247,13 +194,105 @@ impl Store {
             .verify()
     }
 
-    fn read_doc(&self, name: &str) -> Result<Vec<u8>, Refusal> {
-        read_private(&self.sys, &self.dir.join(name), state::MAX_BYTES)?.ok_or_else(|| {
-            Refusal::new(
+    /// The held directory still has the owner and mode it was opened with.
+    fn held_ok(&self, d: &Dir, private: bool) -> Result<(), Refusal> {
+        d.recheck(&self.sys, private)
+    }
+
+    /// Run immediately before every write. The lock file is still the locked one. The state root
+    /// and `state/` that this store holds are still the entries their paths name (a swap is
+    /// refused) and still have the right owner and mode. Returns the subdirectory `sub`, opened
+    /// without following a link, when one is asked for.
+    fn guard(&self, sub: Option<&str>) -> Result<Option<Dir>, Refusal> {
+        self.lock_ok()?;
+        let replaced =
+            |what: &str| storage(format!("{what} was replaced or removed; this writer stops"));
+        if self.root_parent.entry_ident(&self.root_name)? != Some(self.root.ident()?) {
+            return Err(replaced("the state root"));
+        }
+        self.held_ok(&self.root, true)?;
+        let state = self.state()?;
+        if self.root.entry_ident(STATE)? != Some(state.ident()?) {
+            return Err(replaced("the state directory"));
+        }
+        self.held_ok(state, true)?;
+        match sub {
+            None => Ok(None),
+            Some(s) => state
+                .child(&self.sys, s, true, false)?
+                .map(Some)
+                .ok_or_else(|| storage(format!("{s} is missing; it is not recreated"))),
+        }
+    }
+
+    fn state(&self) -> Result<&Dir, Refusal> {
+        self.state
+            .as_ref()
+            .ok_or_else(|| storage("the state directory does not exist"))
+    }
+
+    /// The state directory exists (and passed topology validation).
+    pub fn is_initialized(&self) -> bool {
+        self.state.is_some()
+    }
+
+    /// Creates the state directory for `stamp`. It builds `state.next` and renames it into place,
+    /// so a crash leaves either no `state` or a complete one. An existing `state` that is not an
+    /// empty directory is refused and left alone: lost or damaged state is never recreated.
+    pub fn init(&mut self, stamp: &Stamp) -> Result<(), Refusal> {
+        // The state directory may not exist yet, so only the lock and the root are checked.
+        self.lock_ok()?;
+        if self.root_parent.entry_ident(&self.root_name)? != Some(self.root.ident()?) {
+            return Err(storage(
+                "the state root was replaced or removed; init stops",
+            ));
+        }
+        self.held_ok(&self.root, true)?;
+        if let Some(state) = &self.state
+            && !state.list()?.names.is_empty()
+        {
+            return Err(Refusal::new(
                 Code::StateInvalid,
-                format!("{name} is missing; it is not reconstructed"),
-            )
-        })
+                format!(
+                    "{} exists and is not empty; it is not recreated",
+                    state.shown().display()
+                ),
+            ));
+        }
+        // A half-built directory from a crashed init never held authority; discard it.
+        self.root.remove_tree(&self.sys, STAGING)?;
+        let staging = self
+            .root
+            .child(&self.sys, STAGING, true, true)?
+            .ok_or_else(|| storage("cannot create the staging directory"))?;
+        for d in SUBDIRS {
+            staging.child(&self.sys, d, true, true)?;
+        }
+        let doc = StateDoc::new(stamp.clone(), now_unix()?);
+        staging.publish_new("state.json", &canonical(&doc)?, &self.fail, "init-state")?;
+        staging.publish_new(
+            "ledger.json",
+            &canonical(&Ledger::empty(stamp.clone()))?,
+            &self.fail,
+            "init-ledger",
+        )?;
+        staging.publish_new("journal.jsonl", b"", &self.fail, "init-journal")?;
+        self.fail.hit("init-before-rename")?;
+        self.root.rename(STAGING, STATE)?;
+        let synced = unconfirmed(self.root.sync());
+        self.attach_state()?;
+        synced
+    }
+
+    fn read_doc(&self, name: &str) -> Result<Vec<u8>, Refusal> {
+        self.state()?
+            .read_private(&self.sys, name, state::MAX_BYTES)?
+            .ok_or_else(|| {
+                Refusal::new(
+                    Code::StateInvalid,
+                    format!("{name} is missing; it is not reconstructed"),
+                )
+            })
     }
 
     pub fn read_state(&self) -> Result<StateDoc, Refusal> {
@@ -333,7 +372,7 @@ impl Store {
                         return Err(outside());
                     }
                 }
-                Err(e) => return Err(fsys::io("resolve claim parent", &e)),
+                Err(e) => return Err(crate::fsys::io("resolve claim parent", &e)),
             }
         };
         let mut full = real;
@@ -353,9 +392,9 @@ impl Store {
         for o in e.recovery.iter().flat_map(|r| &r.outputs) {
             self.check_claim(&o.path)?;
         }
-        append_line(
+        self.state()?.append_line(
             &self.sys,
-            &self.dir.join("journal.jsonl"),
+            "journal.jsonl",
             &e.to_line()?,
             &self.fail,
             "journal",
@@ -373,19 +412,16 @@ impl Store {
         for o in l.resources.iter().flat_map(|r| &r.owned_outputs) {
             self.check_claim(&o.path)?;
         }
-        replace_file(
-            &self.dir,
-            "ledger.json",
-            &canonical(l)?,
-            &self.fail,
-            "ledger",
-        )
+        self.state()?
+            .replace_file("ledger.json", &canonical(l)?, &self.fail, "ledger")
     }
 
     /// Publishes a receipt. Receipts are immutable: an existing name is a refusal, never an
     /// overwrite. Returns the file name.
     pub fn write_receipt(&self, r: &Receipt) -> Result<String, Refusal> {
-        self.guard(Some("receipts"))?;
+        let dir = self
+            .guard(Some("receipts"))?
+            .ok_or_else(|| storage("no receipts directory"))?;
         self.check_owner(&r.stamp())?;
         let mut r = r.clone();
         r.scrub(&self.secret_refs())?;
@@ -396,13 +432,7 @@ impl Store {
         let name = r
             .file_name()
             .ok_or_else(|| Refusal::new(Code::StateInvalid, "receipt has no usable time"))?;
-        if publish_new(
-            &self.dir.join("receipts"),
-            &name,
-            &canonical(&r)?,
-            &self.fail,
-            "receipt",
-        )? {
+        if dir.publish_new(&name, &canonical(&r)?, &self.fail, "receipt")? {
             Ok(name)
         } else {
             Err(storage(format!(
@@ -413,7 +443,9 @@ impl Store {
 
     /// Replaces an active trial record atomically.
     pub fn write_trial(&self, t: &TrialRecord) -> Result<(), Refusal> {
-        self.guard(Some("trials"))?;
+        let dir = self
+            .guard(Some("trials"))?
+            .ok_or_else(|| storage("no trials directory"))?;
         self.check_owner(&t.binding)?;
         t.validate()?;
         t.check_secrets(&self.secret_refs())?;
@@ -424,8 +456,7 @@ impl Store {
         {
             self.check_claim(p)?;
         }
-        replace_file(
-            &self.dir.join("trials"),
+        dir.replace_file(
             &format!("{}.json", t.trial_id),
             &canonical(t)?,
             &self.fail,
@@ -442,22 +473,19 @@ impl Store {
         bytes: &[u8],
         class: Class,
     ) -> Result<(), Refusal> {
-        self.guard(Some("snapshots"))?;
+        let snaps = self
+            .guard(Some("snapshots"))?
+            .ok_or_else(|| storage("no snapshots directory"))?;
         if class == Class::Sensitive {
             return Err(storage("a sensitive resource has no snapshot content"));
         }
         if !state::valid_id(op_id) || !state::valid_id(name) {
             return Err(storage("snapshot names must be plain ids"));
         }
-        check_dir_chain(
-            &self.sys,
-            &self.dir.join("snapshots"),
-            &[op_id.to_string()],
-            0,
-            true,
-        )?;
-        let dir = self.dir.join("snapshots").join(op_id);
-        if publish_new(&dir, name, bytes, &self.fail, "snapshot")? {
+        let dir = snaps
+            .child(&self.sys, op_id, true, true)?
+            .ok_or_else(|| storage("cannot create the snapshot directory"))?;
+        if dir.publish_new(name, bytes, &self.fail, "snapshot")? {
             Ok(())
         } else {
             Err(storage(format!("snapshot {op_id}/{name} already exists")))
@@ -495,39 +523,55 @@ impl Store {
         Ok(out)
     }
 
-    /// Lists a directory below `state`. A listing error, a missing directory and a name that is
-    /// not UTF-8 are findings, not silently skipped.
-    fn list(&self, rel: &str, problems: &mut Vec<Finding>) -> Vec<String> {
-        let shown = if rel.is_empty() { STATE } else { rel };
-        let rd = match fs::read_dir(self.dir.join(rel)) {
-            Ok(rd) => rd,
+    /// Lists a directory. A listing error and a name that is not UTF-8 are findings, not
+    /// silently skipped.
+    fn list_dir(d: &Dir, shown: &str, problems: &mut Vec<Finding>) -> Vec<String> {
+        match d.list() {
+            Ok(l) => {
+                if l.odd > 0 {
+                    problems.push(Finding::new(
+                        Code::StateInvalid,
+                        shown,
+                        "an entry name is not UTF-8",
+                    ));
+                }
+                l.names
+            }
             Err(e) => {
                 problems.push(Finding::new(
                     Code::StateInvalid,
                     shown,
-                    format!("cannot list this directory: {}", e.kind()),
+                    format!("cannot list this directory: {}", e.detail),
                 ));
-                return Vec::new();
-            }
-        };
-        let mut names = Vec::new();
-        for entry in rd {
-            match entry.map(|e| e.file_name().into_string()) {
-                Ok(Ok(n)) => names.push(n),
-                Ok(Err(_)) => problems.push(Finding::new(
-                    Code::StateInvalid,
-                    shown,
-                    "an entry name is not UTF-8",
-                )),
-                Err(e) => problems.push(Finding::new(
-                    Code::StateInvalid,
-                    shown,
-                    format!("cannot read an entry: {}", e.kind()),
-                )),
+                Vec::new()
             }
         }
-        names.sort();
-        names
+    }
+
+    /// Opens a subdirectory of `state/` for reading, reporting a failure as a finding.
+    fn sub_dir(&self, sub: &str, problems: &mut Vec<Finding>) -> Option<Dir> {
+        let opened = self
+            .state()
+            .and_then(|s| s.child(&self.sys, sub, true, false));
+        match opened {
+            Ok(Some(d)) => Some(d),
+            Ok(None) => {
+                problems.push(Finding::new(
+                    Code::StateInvalid,
+                    sub,
+                    "this directory is missing",
+                ));
+                None
+            }
+            Err(e) => {
+                problems.push(Finding::new(
+                    Code::StateInvalid,
+                    sub,
+                    format!("cannot list this directory: {}", e.detail),
+                ));
+                None
+            }
+        }
     }
 
     /// Reads every document. Each file's result is kept separately so one unreadable document
@@ -536,92 +580,81 @@ impl Store {
         let mut problems = Vec::new();
         let mut strays = Vec::new();
         let tmp = |n: &str| n.starts_with('.') && n.ends_with(".tmp");
+        let read = |d: &Dir, n: &str| -> Result<Vec<u8>, Refusal> {
+            d.read_private(&self.sys, n, state::MAX_BYTES)?
+                .ok_or_else(|| storage("vanished"))
+        };
         let mut receipts = Vec::new();
-        for n in self.list("receipts", &mut problems) {
-            if tmp(&n) {
-                strays.push(format!("receipts/{n} (interrupted write)"));
-                continue;
-            }
-            let r = read_private(
-                &self.sys,
-                &self.dir.join("receipts").join(&n),
-                state::MAX_BYTES,
-            )
-            .and_then(|b| b.ok_or_else(|| storage("vanished")))
-            .and_then(|b| Receipt::parse(&b))
-            .and_then(|r| {
-                r.validate_within(&self.scope)?;
-                if r.file_name().as_deref() == Some(&n) {
-                    Ok(r)
-                } else {
-                    Err(Refusal::new(
-                        Code::StateInvalid,
-                        "name does not match content",
-                    ))
+        if let Some(d) = self.sub_dir("receipts", &mut problems) {
+            for n in Self::list_dir(&d, "receipts", &mut problems) {
+                if tmp(&n) {
+                    strays.push(format!("receipts/{n} (interrupted write)"));
+                    continue;
                 }
-            });
-            receipts.push((n, r));
+                let r = read(&d, &n).and_then(|b| Receipt::parse(&b)).and_then(|r| {
+                    r.validate_within(&self.scope)?;
+                    if r.file_name().as_deref() == Some(&n) {
+                        Ok(r)
+                    } else {
+                        Err(Refusal::new(
+                            Code::StateInvalid,
+                            "name does not match content",
+                        ))
+                    }
+                });
+                receipts.push((n, r));
+            }
         }
         let mut trials = Vec::new();
-        for n in self.list("trials", &mut problems) {
-            if tmp(&n) {
-                strays.push(format!("trials/{n} (interrupted write)"));
-                continue;
-            }
-            let t = read_private(
-                &self.sys,
-                &self.dir.join("trials").join(&n),
-                state::MAX_BYTES,
-            )
-            .and_then(|b| b.ok_or_else(|| storage("vanished")))
-            .and_then(|b| TrialRecord::parse(&b))
-            .and_then(|t| {
-                t.validate_within(&self.scope)?;
-                if format!("{}.json", t.trial_id) == n {
-                    Ok(t)
-                } else {
-                    Err(Refusal::new(
-                        Code::StateInvalid,
-                        "name does not match content",
-                    ))
-                }
-            });
-            trials.push((n, t));
-        }
-        for op in self.list("snapshots", &mut problems) {
-            let op_dir = format!("snapshots/{op}");
-            let is_dir = fs::symlink_metadata(self.dir.join(&op_dir)).is_ok_and(|m| m.is_dir());
-            if !is_dir {
-                strays.push(format!("{op_dir} (unexpected)"));
-                continue;
-            }
-            for n in self.list(&op_dir, &mut problems) {
+        if let Some(d) = self.sub_dir("trials", &mut problems) {
+            for n in Self::list_dir(&d, "trials", &mut problems) {
                 if tmp(&n) {
-                    strays.push(format!("{op_dir}/{n} (interrupted write)"));
+                    strays.push(format!("trials/{n} (interrupted write)"));
+                    continue;
                 }
+                let t = read(&d, &n)
+                    .and_then(|b| TrialRecord::parse(&b))
+                    .and_then(|t| {
+                        t.validate_within(&self.scope)?;
+                        if format!("{}.json", t.trial_id) == n {
+                            Ok(t)
+                        } else {
+                            Err(Refusal::new(
+                                Code::StateInvalid,
+                                "name does not match content",
+                            ))
+                        }
+                    });
+                trials.push((n, t));
             }
         }
-        for n in self.list("", &mut problems) {
-            let known = ["state.json", "ledger.json", "journal.jsonl"];
-            if !known.contains(&n.as_str()) && !SUBDIRS.contains(&n.as_str()) {
-                strays.push(format!("{n} (unexpected)"));
-            }
-        }
-        match fs::read_dir(&self.root) {
-            Ok(rd) => {
-                for e in rd.flatten() {
-                    if let Ok(n) = e.file_name().into_string()
-                        && n != STATE
-                    {
-                        strays.push(format!("../{n} (staging or previous state)"));
+        if let Some(d) = self.sub_dir("snapshots", &mut problems) {
+            for op in Self::list_dir(&d, "snapshots", &mut problems) {
+                let op_dir = format!("snapshots/{op}");
+                match d.child(&self.sys, &op, true, false) {
+                    Ok(Some(sd)) => {
+                        for n in Self::list_dir(&sd, &op_dir, &mut problems) {
+                            if tmp(&n) {
+                                strays.push(format!("{op_dir}/{n} (interrupted write)"));
+                            }
+                        }
                     }
+                    _ => strays.push(format!("{op_dir} (unexpected)")),
                 }
             }
-            Err(e) => problems.push(Finding::new(
-                Code::StateInvalid,
-                "..",
-                format!("cannot list the state root: {}", e.kind()),
-            )),
+        }
+        if let Ok(state) = self.state() {
+            for n in Self::list_dir(state, STATE, &mut problems) {
+                let known = ["state.json", "ledger.json", "journal.jsonl"];
+                if !known.contains(&n.as_str()) && !SUBDIRS.contains(&n.as_str()) {
+                    strays.push(format!("{n} (unexpected)"));
+                }
+            }
+        }
+        for n in Self::list_dir(&self.root, "..", &mut problems) {
+            if n != STATE {
+                strays.push(format!("../{n} (staging or previous state)"));
+            }
         }
         strays.sort();
         Loaded {

@@ -13,7 +13,7 @@ use std::path::Path;
 #[test]
 fn init_builds_a_private_layout_once() {
     let h = Home::new();
-    let (s, stamp) = init(&h);
+    let (mut s, stamp) = init(&h);
     let state = h.0.join(".local/state/dotfiles-manager/state");
     for (p, mode) in [
         (state.clone(), 0o700),
@@ -34,7 +34,7 @@ fn init_builds_a_private_layout_once() {
 #[test]
 fn damaged_or_lost_state_is_never_recreated() {
     let h = Home::new();
-    let (s, stamp) = init(&h);
+    let (mut s, stamp) = init(&h);
     let state = h.0.join(".local/state/dotfiles-manager/state");
     fs::remove_file(state.join("state.json")).unwrap();
     assert_eq!(s.init(&stamp).unwrap_err().code, Code::StateInvalid);
@@ -319,7 +319,7 @@ fn a_macos_style_alias_of_home_is_recognized() {
     let alias = alias_dir.0.join("home-alias");
     symlink(&h.0, &alias).unwrap();
     let l = layout(&alias);
-    let s = Store::open_write(sys(&h), &l, Fail::none()).unwrap();
+    let mut s = Store::open_write(sys(&h), &l, Fail::none()).unwrap();
     s.init(&Stamp::of(&binding("/p/profile.toml", "m5")))
         .unwrap();
     assert!(

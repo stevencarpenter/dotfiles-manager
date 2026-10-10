@@ -22,7 +22,7 @@ fn open_bound(ctx: &Ctx, fail: Fail, secrets: Vec<String>) -> Result<(Store, Bin
     let binding = read_existing_binding(ctx)?
         .ok_or_else(|| Refusal::new(Code::BindingInvalid, "this machine is not bound"))?;
     let store = Store::open_write(ctx.sys()?, &ctx.layout(), fail)?.with_secrets(secrets);
-    if !store.is_initialized()? {
+    if !store.is_initialized() {
         return Err(Refusal::new(
             Code::StateInvalid,
             "state is not initialized; run bind",

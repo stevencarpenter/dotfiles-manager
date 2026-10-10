@@ -11,5 +11,5 @@ pub mod store;
 #[cfg(feature = "failpoints")]
 pub use fail::Action;
 pub use fail::Fail;
-pub use fsys::{Found, Layout, Lock, Sys};
+pub use fsys::{Dir, Layout, Lock, Sys, open_config};
 pub use store::{Finding, Loaded, Probe, Store, now_unix, verify_identity};

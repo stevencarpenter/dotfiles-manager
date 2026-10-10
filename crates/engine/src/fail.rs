@@ -16,8 +16,9 @@ pub enum Action {
     Error,
     /// End the process at once with no cleanup, as a crash or SIGKILL would.
     Abort,
-    /// Block, holding whatever the caller holds, until this file exists (or 30 s pass). The test
-    /// creates the file, so there is no timing guess.
+    /// Block, holding whatever the caller holds, until this file exists (or 30 s pass). The
+    /// point first creates `<file>.reached` (extension replaced), then the test creates the file.
+    /// So the test waits on a file and never guesses a delay.
     Wait(PathBuf),
 }
 
@@ -51,6 +52,8 @@ impl Fail {
                 )),
                 Action::Abort => std::process::abort(),
                 Action::Wait(file) => {
+                    // Tell the test the point was reached, so it never has to guess a delay.
+                    let _ = std::fs::write(file.with_extension("reached"), "");
                     let end = std::time::Instant::now() + std::time::Duration::from_secs(30);
                     while !file.exists() {
                         if std::time::Instant::now() > end {

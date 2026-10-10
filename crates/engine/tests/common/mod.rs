@@ -53,9 +53,6 @@ pub fn layout(home: &Path) -> Layout {
 pub fn sys(home: &Home) -> Sys {
     Sys {
         uid: fs::metadata(&home.0).unwrap().uid(),
-        o_nofollow: 0x0100,
-        o_nonblock: 0x0004,
-        eloop: 62,
     }
 }
 
@@ -68,7 +65,7 @@ pub fn open(h: &Home) -> Store {
 }
 
 pub fn init(h: &Home) -> (Store, Stamp) {
-    let s = open(h);
+    let mut s = open(h);
     let stamp = Stamp::of(&binding("/p/profile.toml", "m5"));
     s.init(&stamp).unwrap();
     (s, stamp)
