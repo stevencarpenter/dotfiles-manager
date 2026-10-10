@@ -1,0 +1,2 @@
+[source.crates-io]
+replace-with = "x"

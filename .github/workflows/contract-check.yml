@@ -9,7 +9,7 @@ permissions:
 
 jobs:
   check:
-    runs-on: ubuntu-latest
+    runs-on: macos-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -20,16 +20,19 @@ jobs:
         with:
           python-version: "3.14"
 
-      - name: Run the shared local gate
-        run: bash scripts/check_staged.sh
+      - name: Install the pinned Rust toolchain
+        run: |
+          pin=$(sed -n 's/^channel = "\(.*\)"$/\1/p' rust-toolchain.toml)
+          rustup toolchain install "$pin" --profile minimal --component rustfmt --component clippy
 
       - name: Check design fixtures
-        run: uv run scripts/check_examples.py
+        run: bash scripts/check_all.sh fixtures
 
-      - name: Check Python style
-        run: |
-          uvx ruff@0.14.14 check scripts/check_examples.py
-          uvx ruff@0.14.14 format --check scripts/check_examples.py
+      - name: Check script style and syntax
+        run: bash scripts/check_all.sh scripts
 
-      - name: Check inert hook syntax
-        run: bash -n examples/external/modules/work/files/session-hook.sh
+      - name: Check Rust style (fmt, clippy)
+        run: bash scripts/check_all.sh rust-style
+
+      - name: Run implementation tests
+        run: bash scripts/check_all.sh rust-tests

@@ -1,0 +1,8 @@
+[package]
+name = "a"
+version = "0.1.0"
+build = false
+workspace = "../.."
+
+[dependencies]
+b = { path = "../b" }

@@ -1,0 +1,6 @@
+[package]
+name = "a"
+version = "0.1.0"
+
+[target.'cfg(unix)'.dependencies]
+x = { path = "../../../x" }

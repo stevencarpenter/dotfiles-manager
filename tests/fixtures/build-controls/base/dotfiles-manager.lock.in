@@ -1,0 +1,11 @@
+schema = 1
+
+[[sources]]
+id = "example"
+kind = "path"
+
+[manager]
+version = "0.1.0"
+toolchain = "9.9.9"
+toolchain_manifest_sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
+toolchain_tree_sha256 = "@TOOLCHAIN_TREE@"
