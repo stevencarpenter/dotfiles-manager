@@ -7,6 +7,7 @@ A proposed manager for one profile per machine, an authoritative shared core, an
 - [Reviewed delivery roadmap](docs/roadmap.json) and [review record](docs/roadmap-review.md): M5/M3 task contracts and evidence gates. Kaneo DFM is the authoritative backlog.
 - [Checklist completion contract](docs/checklist-state.md): live Kaneo acceptance checkboxes are the sole completion state. Tasks and epics derive completion from their canonical requirements.
 - [Design contract](DESIGN.md): agreed requirements, proposed manifest semantics, lifecycle, and migration boundaries.
+- [Minimum implementation contract (proposed, owner review pending)](docs/architecture.md): language and toolchain, formats, CLI exit semantics, adapter boundary, trust and bootstrap.
 - [Initial inventory classification](INVENTORY.md): actual source areas proposed as invariants, defaults, modules, or unmanaged state.
 - [Example profiles](examples/profiles/): personal development, synthetic work, homelab (illustrative), and server (illustrative) compositions.
 - [Public example bundle](examples/base/bundle.toml): the mandatory core and reusable modules.
