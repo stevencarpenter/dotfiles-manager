@@ -403,13 +403,17 @@ git_clean() { /usr/bin/env -i PATH="$SYSPATH" HOME=/var/empty LANG=C GIT_CONFIG_
 
 cmd_install() {
   [ -n "${src:-}" ] && [ -n "${commit:-}" ] || usage "install needs --source and --commit"
-  case $commit in *[!0-9a-f]*|"") usage "--commit must be 40 lowercase hex digits" ;; esac
-  [ ${#commit} -eq 40 ] || usage "--commit must be 40 lowercase hex digits"
+  # The pin is a full-length lowercase object id and nothing else: no abbreviation, ref, tag,
+  # revision syntax (^, ~, @{}), option-like value or whitespace ever reaches git.
+  case $commit in ""|*[!0-9a-f]*) refuse E_SOURCE_UNTRUSTED "--commit must be a full lowercase hex object id (40 or 64 digits)" ;; esac
+  case ${#commit} in 40) fmt=sha1 ;; 64) fmt=sha256 ;; *) refuse E_SOURCE_UNTRUSTED "--commit must be a full lowercase hex object id (40 or 64 digits)" ;; esac
   resolve_home; check_platform
   [ -d "$src" ] || refuse E_SOURCE_UNTRUSTED "source $src is not a directory"
   # Read-only prerequisite and identity checks come first.
-  [ "$(git_clean -C "$src" cat-file -t "$commit" 2>/dev/null)" = commit ] ||
-    refuse E_SOURCE_UNTRUSTED "$commit is not a commit in the source checkout"
+  [ "$(git_clean -C "$src" rev-parse --show-object-format 2>/dev/null)" = "$fmt" ] ||
+    refuse E_SOURCE_UNTRUSTED "the source checkout does not use the $fmt object format of the pin"
+  resolved=$(git_clean -C "$src" rev-parse --verify --end-of-options "$commit^{commit}" 2>/dev/null) || resolved=
+  [ "$resolved" = "$commit" ] || refuse E_SOURCE_UNTRUSTED "$commit is not a commit in the source checkout"
   # Early, read-only hint of the pin so a missing toolchain is refused before any mutation.
   # The real parse and every other check run later on the staged copy.
   hint=$(git_clean -C "$src" cat-file blob "$commit:dotfiles-manager.lock" 2>/dev/null |
@@ -422,7 +426,7 @@ cmd_install() {
   rm -rf "$build"; mkdir -p "$build/stage"
   # Build the verified commit itself, not whatever HEAD is. Both steps are checked: a pipe would hide
   # the status of git archive.
-  git_clean -C "$src" archive --format=tar "$commit" >"$build/source.tar" || { echo "error: git archive failed" >&2; exit 1; }
+  git_clean -C "$src" archive --format=tar --end-of-options "$commit" >"$build/source.tar" || { echo "error: git archive failed" >&2; exit 1; }
   tar -xf "$build/source.tar" -C "$build/stage" || { echo "error: cannot extract the source" >&2; exit 1; }
   rm -f "$build/source.tar"
   controls "$build/stage"

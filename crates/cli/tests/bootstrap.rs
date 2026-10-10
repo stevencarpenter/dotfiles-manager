@@ -169,12 +169,7 @@ fn missing_toolchain_wrong_commit_and_hostile_repo_config_are_refused_before_mut
     assert_eq!(o.status.code(), Some(3));
     assert!(err(&o).contains("E_TOOLCHAIN_MISMATCH"), "{}", err(&o));
 
-    for bad in [
-        vec!["install"],
-        vec!["install", "--source", s, "--commit", "abc"],
-        vec!["bogus"],
-        vec!["install", "--nope"],
-    ] {
+    for bad in [vec!["install"], vec!["bogus"], vec!["install", "--nope"]] {
         assert_eq!(
             script_test_mode(&home, &bad, &[]).status.code(),
             Some(2),
@@ -333,6 +328,111 @@ fn noexec_run_is_detectable_by_the_missing_final_line() {
     fs::create_dir(&home).unwrap();
     let o = script_test_mode(&home, &["uninstall"], &[("SHELLOPTS", "noexec")]);
     assert!(!String::from_utf8_lossy(&o.stdout).contains("removed the installed manager"));
+}
+
+#[test]
+fn only_a_full_lowercase_object_id_is_accepted_as_the_pin() {
+    let tmp = TempDir::new("pin");
+    let home = tmp.path().join("home");
+    fs::create_dir(&home).unwrap();
+    let (src, good) = tiny_source(tmp.path(), "9.9.9");
+    let s = src.to_str().unwrap();
+    let marker = tmp.path().join("upload-pack-ran");
+    let bad = [
+        good[..12].to_string(),
+        good.to_uppercase(),
+        "main".into(),
+        "HEAD".into(),
+        "HEAD~0".into(),
+        format!("{good}^{{}}"),
+        format!("{good}~0"),
+        "@{0}".into(),
+        "@".into(),
+        format!("--upload-pack=touch {}", marker.display()),
+        "-h".into(),
+        format!(" {good}"),
+        format!("{good} "),
+        format!("{good}\n"),
+        good[..39].to_string(),
+        format!("{good}0"),
+        "g".repeat(40),
+        "0".repeat(64),
+        format!("{good}{}", &good[..24]),
+    ];
+    for commit in &bad {
+        let o = script_test_mode(&home, &["install", "--source", s, "--commit", commit], &[]);
+        assert_eq!(o.status.code(), Some(3), "{commit:?}: {}", err(&o));
+        assert!(
+            err(&o).contains("E_SOURCE_UNTRUSTED"),
+            "{commit:?}: {}",
+            err(&o)
+        );
+    }
+    assert!(!marker.exists());
+    assert!(
+        entries_below(&home).is_empty(),
+        "refusals must precede any write"
+    );
+}
+
+#[test]
+fn a_ref_named_like_the_pin_cannot_redirect_the_build() {
+    let tmp = TempDir::new("pin-ref");
+    let home = tmp.path().join("home");
+    fs::create_dir(&home).unwrap();
+    let (src, good) = tiny_source(tmp.path(), "9.9.9");
+    git(&src, &["checkout", "-q", "-b", "other"]);
+    fs::write(
+        src.join("dotfiles-manager.lock"),
+        "schema = 1\n\n[manager]\ntoolchain = \"8.8.8\"\n",
+    )
+    .unwrap();
+    git(&src, &["commit", "-q", "-a", "-m", "other"]);
+    let other = git(&src, &["rev-parse", "HEAD"]);
+    // A branch whose name is the other commit's id but which points at the good commit.
+    git(&src, &["branch", "-f", &other, &good]);
+    let o = script_test_mode(
+        &home,
+        &[
+            "install",
+            "--source",
+            src.to_str().unwrap(),
+            "--commit",
+            &other,
+        ],
+        &[],
+    );
+    assert_eq!(o.status.code(), Some(3));
+    assert!(
+        err(&o).contains("8.8.8") && !err(&o).contains("9.9.9"),
+        "the ref redirected the pin: {}",
+        err(&o)
+    );
+}
+
+#[test]
+fn a_64_digit_pin_needs_a_sha256_repository() {
+    let tmp = TempDir::new("pin-sha256");
+    let home = tmp.path().join("home");
+    fs::create_dir(&home).unwrap();
+    let (src, _) = tiny_source(tmp.path(), "9.9.9");
+    let o = script_test_mode(
+        &home,
+        &[
+            "install",
+            "--source",
+            src.to_str().unwrap(),
+            "--commit",
+            &"a".repeat(64),
+        ],
+        &[],
+    );
+    assert_eq!(o.status.code(), Some(3));
+    assert!(
+        err(&o).contains("E_SOURCE_UNTRUSTED") && err(&o).contains("object format"),
+        "{}",
+        err(&o)
+    );
 }
 
 fn clone_path(from: &Path, to: &Path) {
