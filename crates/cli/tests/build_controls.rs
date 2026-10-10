@@ -136,6 +136,12 @@ fn materialize(case: &Path, tmp: &Path) -> (PathBuf, PathBuf) {
     if tc.exists() {
         finish(&tc, "");
     }
+    if extra.lines().any(|l| l == "toolchain=group-writable-file") {
+        set_mode(&tc.join("lib/libstd.rlib"), 0o664);
+    }
+    if extra.lines().any(|l| l == "toolchain=world-writable-dir") {
+        set_mode(&tc.join("lib"), 0o757);
+    }
     if extra.lines().any(|l| l == "toolchain=tampered") {
         fs::write(tc.join("lib/libstd.rlib"), "tampered\n").unwrap();
     }
@@ -151,8 +157,23 @@ fn materialize(case: &Path, tmp: &Path) -> (PathBuf, PathBuf) {
 
 fn set_mode(p: &Path, mode: u32) {
     use std::os::unix::fs::PermissionsExt;
-    fs::create_dir_all(p).ok();
+    if !p.exists() {
+        fs::create_dir_all(p).unwrap();
+    }
     fs::set_permissions(p, fs::Permissions::from_mode(mode)).unwrap();
+}
+
+/// Restores a directory mode on drop, so a panic cannot leave an unsearchable directory
+/// behind that the temporary directory cannot remove.
+struct RestoreMode(PathBuf);
+
+impl Drop for RestoreMode {
+    fn drop(&mut self) {
+        use std::os::unix::fs::PermissionsExt;
+        if self.0.exists() {
+            let _ = fs::set_permissions(&self.0, fs::Permissions::from_mode(0o755));
+        }
+    }
 }
 
 #[test]
@@ -183,8 +204,8 @@ fn shell_checker_and_manager_agree_on_every_fixture() {
             .to_string();
         let tmp = TempDir::new("controls");
         let (home, stage) = materialize(case, tmp.path());
+        let _restore = RestoreMode(home.join(".cache/dotfiles-manager"));
         let (m, s) = (run_manager(&home, &stage), run_script(&home, &stage));
-        set_mode(&home.join(".cache/dotfiles-manager"), 0o755);
         let expected_exit = if want == "ok" { 0 } else { 3 };
         if m.verdict() != want
             || s.verdict() != want
@@ -217,6 +238,7 @@ fn unreadable_directory_in_the_staged_tree_is_refused_by_both_checkers() {
     let tmp = TempDir::new("unreadable");
     let (home, stage) = materialize(&fixtures().join("cases/ok-base"), tmp.path());
     let hidden = stage.join("crates/b");
+    let _restore = RestoreMode(hidden.clone());
     fs::set_permissions(&hidden, fs::Permissions::from_mode(0o000)).unwrap();
     let (m, s) = (run_manager(&home, &stage), run_script(&home, &stage));
     fs::set_permissions(&hidden, fs::Permissions::from_mode(0o755)).unwrap();

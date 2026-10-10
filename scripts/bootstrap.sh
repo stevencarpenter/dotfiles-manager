@@ -351,6 +351,8 @@ toolchain_digest() (
   [ -z "$(find . ! -name . ! -type f ! -type d ! -type l -print | head -n 1)" ] || exit 1
   [ -z "$(find . -name "*$NL*" -print | head -n 1)" ] || exit 1
   ! find . -print | grep -q '[^ -~]\|\\' || exit 1
+  # The digest records only the owner-execute bit, so group- or world-writable entries are refused.
+  [ -z "$(find . ! -type l \( -perm -020 -o -perm -002 \) -print | head -n 1)" ] || exit 1
   nf=$(find . -type f | wc -l); nl=$(find . -type l | wc -l)
   [ "$nf" -gt 0 ] || exit 1
   plain=$(find . -type f ! -perm -u+x -print0 | xargs -0 -r /usr/bin/shasum -a 256 |

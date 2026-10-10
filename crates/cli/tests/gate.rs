@@ -19,6 +19,16 @@ fn rs_files(dir: &Path, out: &mut Vec<std::path::PathBuf>) {
 }
 
 #[test]
+fn the_isolated_build_is_enabled_for_this_run() {
+    // Through a variable: the value is a build-time constant, which is the point of the test.
+    let enabled = std::hint::black_box(cfg!(feature = "test-isolation"));
+    assert!(
+        enabled,
+        "run scripts/check_all.sh rust-tests; a plain cargo test skips the cli and build_controls targets"
+    );
+}
+
+#[test]
 fn os_bound_names_stay_in_platform_macos() {
     let forbidden = [
         "/usr/bin",

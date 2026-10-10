@@ -9,7 +9,7 @@ use dfm_model::{Code, Exit, Refusal};
 use dfm_platform_macos::{Platform, check_supported, current_platform};
 use std::fs;
 use std::io::{ErrorKind, Read, Write};
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 const HELP: &str = "\
@@ -259,15 +259,8 @@ fn read_binding(path: &Path) -> Result<Option<Binding>, Refusal> {
     if !meta.is_file() {
         return Err(invalid("not a regular file".into()));
     }
-    if dfm_platform_macos::current_uid() != Some(meta.uid()) {
-        return Err(invalid("not owned by the current user".into()));
-    }
-    if meta.mode() & 0o777 != 0o600 {
-        return Err(invalid(format!(
-            "mode is {:o}, expected 0600",
-            meta.mode() & 0o777
-        )));
-    }
+    binding_meta_problem(meta.uid(), meta.mode(), dfm_platform_macos::current_uid())
+        .map_or(Ok(()), |p| Err(invalid(p)))?;
     let mut buf = Vec::new();
     file.take(MAX_BYTES as u64 + 1)
         .read_to_end(&mut buf)
@@ -275,6 +268,18 @@ fn read_binding(path: &Path) -> Result<Option<Binding>, Refusal> {
     Binding::parse(&buf)
         .map(Some)
         .map_err(|r| Refusal::new(r.code, format!("{}: {}", path.display(), r.detail)))
+}
+
+/// Why a binding file's owner or mode is unacceptable, if it is. Separate so the owner rule can
+/// be tested without a file owned by another user.
+fn binding_meta_problem(file_uid: u32, mode: u32, current_uid: Option<u32>) -> Option<String> {
+    if current_uid != Some(file_uid) {
+        return Some("not owned by the current user".into());
+    }
+    if mode & 0o777 != 0o600 {
+        return Some(format!("mode is {:o}, expected 0600", mode & 0o777));
+    }
+    None
 }
 
 fn rebind_refusal(have: &Binding) -> Refusal {
@@ -358,6 +363,8 @@ fn publish(path: &Path, b: &Binding) -> Result<bool, Refusal> {
         .mode(0o600)
         .open(&tmp)
         .and_then(|mut f| {
+            // The umask can clear bits of the creation mode; the binding must be exactly 0600.
+            f.set_permissions(fs::Permissions::from_mode(0o600))?;
             f.write_all(b.to_toml().as_bytes())
                 .and_then(|()| f.sync_all())
         });
@@ -385,4 +392,32 @@ fn fixture_check(dir: &Path) -> Result<(), Refusal> {
         ));
     }
     read_binding(&dir.join("machine.toml")).map(|_| ())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::binding_meta_problem;
+
+    #[test]
+    fn owner_and_mode_rules() {
+        assert_eq!(binding_meta_problem(501, 0o100600, Some(501)), None);
+        assert!(
+            binding_meta_problem(0, 0o100600, Some(501))
+                .unwrap()
+                .contains("owned")
+        );
+        assert!(
+            binding_meta_problem(501, 0o100600, None)
+                .unwrap()
+                .contains("owned")
+        );
+        for mode in [0o100644, 0o100660, 0o100400, 0o100700] {
+            assert!(
+                binding_meta_problem(501, mode, Some(501))
+                    .unwrap()
+                    .contains("0600"),
+                "{mode:o}"
+            );
+        }
+    }
 }

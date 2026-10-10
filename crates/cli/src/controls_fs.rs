@@ -161,6 +161,35 @@ fn file_sha256(path: &Path) -> std::io::Result<String> {
 /// Digest of an installed toolchain tree (docs/architecture.md section 8, item 4a).
 pub fn toolchain_tree_digest(dir: &Path) -> Result<String, String> {
     use std::os::unix::fs::PermissionsExt;
+    // The digest records only the owner-execute bit, so a tree that others can modify is
+    // refused instead of being described.
+    fn others_can_write(dir: &Path, rel: &str) -> Result<(), String> {
+        use std::os::unix::fs::PermissionsExt;
+        let ioerr = |e: std::io::Error| format!("{rel}: {}", e.kind());
+        if fs::symlink_metadata(dir)
+            .map_err(ioerr)?
+            .permissions()
+            .mode()
+            & 0o022
+            != 0
+        {
+            return Err(format!("{rel} is writable by group or others"));
+        }
+        for e in fs::read_dir(dir).map_err(ioerr)? {
+            let e = e.map_err(ioerr)?;
+            let ty = e.file_type().map_err(ioerr)?;
+            let name = format!("{rel}/{}", e.file_name().to_string_lossy());
+            if ty.is_dir() {
+                others_can_write(&e.path(), &name)?;
+            } else if !ty.is_symlink()
+                && e.metadata().map_err(ioerr)?.permissions().mode() & 0o022 != 0
+            {
+                return Err(format!("{name} is writable by group or others"));
+            }
+        }
+        Ok(())
+    }
+    others_can_write(dir, ".")?;
     let mut entries = Vec::new();
     for (rel, node) in walk(dir)? {
         let kind = match node {

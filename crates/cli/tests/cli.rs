@@ -544,3 +544,27 @@ fn a_fifo_at_the_binding_path_is_refused_without_blocking() {
         assert_eq!(status.code(), Some(3), "{args:?}");
     }
 }
+
+#[test]
+fn a_restrictive_umask_still_produces_a_binding_the_reader_accepts() {
+    let home = TempDir::new("umask");
+    let cfg = home.path().join(".config/dotfiles-manager");
+    fs::create_dir_all(&cfg).unwrap();
+    fs::set_permissions(&cfg, fs::Permissions::from_mode(0o700)).unwrap();
+    let p = profile("work-01.toml");
+    // umask 277 would turn the creation mode 0600 into 0400.
+    let o = Command::new("/bin/sh")
+        .args(["-c", "umask 277; exec \"$0\" \"$@\"", BIN, "--home"])
+        .arg(home.path())
+        .args(["bind", "--profile", &p, "--machine-id", "m3"])
+        .env_clear()
+        .output()
+        .unwrap();
+    assert_eq!(o.status.code(), Some(0), "{}", text(&o.stderr));
+    let file = cfg.join("machine.toml");
+    assert_eq!(
+        fs::metadata(&file).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    assert_eq!(run(home.path(), &["binding"]).status.code(), Some(0));
+}

@@ -130,6 +130,32 @@ fn a_home_with_whitespace_is_refused_by_the_script() {
 }
 
 #[test]
+fn toolchain_digest_refuses_entries_writable_by_group_or_others() {
+    let tmp = TempDir::new("writable");
+    let home = tmp.path().join("home");
+    let tc = tmp.path().join("tc");
+    fs::create_dir_all(&home).unwrap();
+    fs::create_dir_all(tc.join("bin")).unwrap();
+    fs::write(tc.join("bin/a"), "a").unwrap();
+    let args = ["toolchain-digest", "--dir", tc.to_str().unwrap()];
+    assert_eq!(script_test_mode(&home, &args, &[]).status.code(), Some(0));
+    for (path, mode) in [
+        ("bin/a", 0o664),
+        ("bin/a", 0o646),
+        ("bin", 0o775),
+        ("bin", 0o757),
+    ] {
+        let p = tc.join(path);
+        let old = fs::metadata(&p).unwrap().permissions().mode() & 0o7777;
+        fs::set_permissions(&p, fs::Permissions::from_mode(mode)).unwrap();
+        let o = script_test_mode(&home, &args, &[]);
+        assert_eq!(o.status.code(), Some(3), "{path} at {mode:o}");
+        assert!(o.stdout.is_empty());
+        fs::set_permissions(&p, fs::Permissions::from_mode(old)).unwrap();
+    }
+}
+
+#[test]
 fn toolchain_digest_refuses_file_names_with_backslashes() {
     let tmp = TempDir::new("backslash");
     let home = tmp.path().join("home");
