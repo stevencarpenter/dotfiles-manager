@@ -41,7 +41,9 @@ dotfiles-manager self-check --build-controls <staged tree> | --fixture-dir <dir>
 
 ## Running the script
 
-Run it as `/usr/bin/env -i /bin/sh scripts/bootstrap.sh <command> ...`. The script also re-executes itself under `env -i` with a fixed `PATH`, so exported shell functions (`BASH_FUNC_*`), `PERL5LIB`/`PERL5OPT` (`shasum` is perl), `CDPATH` and `ENV` do not change what is checked (tested). Relative `--source` and `--dir` values are made absolute first. A caller's `SHELLOPTS=noexec` makes `/bin/sh` skip the whole file and exit 0; no script can prevent that, so a successful run is one that prints its final line (`bootstrap: done` for install).
+Start it as `/usr/bin/env -i /bin/sh scripts/bootstrap.sh <command> ...`. The script also re-executes itself under `env -i` with a fixed `PATH`, so exported shell functions (`BASH_FUNC_*`, for example a forged `cut` or `awk`), `PERL5LIB`/`PERL5OPT` (`shasum` is perl), `CDPATH` and `ENV` do not change what is checked (tested). The marker that says "already scrubbed" is the first argument `--dfm-scrubbed`, not an environment variable. A caller can pass that argument itself, so the child checks that its environment holds only `PATH`, `HOME`, the shell's own `PWD`/`OLDPWD`/`SHLVL`/`_` and, in test mode, the `DFM_TEST_*` hooks. Anything else is refused with `E_ENV_UNEXPECTED` (exit 3). The `DFM_TEST_*` values are forwarded only when `DFM_BOOTSTRAP_TEST=1`. Relative `--source` and `--dir` values are made absolute first.
+
+An inherited `SHELLOPTS` or `PS4` (xtrace with command substitution, or `noexec`) takes effect before the first line of the script and is outside its control. `noexec` makes `/bin/sh` skip the whole file and exit 0. A run that did not print its final line did not finish: `bootstrap: done` for install, `removed the installed manager` for uninstall, `build controls ok` for `check-controls`.
 
 ## Install, upgrade, rollback, removal
 

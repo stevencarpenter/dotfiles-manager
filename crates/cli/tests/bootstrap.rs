@@ -337,14 +337,60 @@ fn caller_environment_cannot_influence_the_script() {
         ("PERL5LIB", forge.to_str().unwrap()),
         ("PERL5OPT", "-MForge"),
         ("BASH_FUNC_awk%%", "() { echo forged; }"),
+        (
+            "BASH_FUNC_cut%%",
+            "() { echo ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff; }",
+        ),
         ("BASH_ENV", "/nonexistent"),
         ("ENV", "/nonexistent"),
+        // The old sentinel: exporting it must not skip the scrub.
+        ("DFM_BS_CLEAN", "1"),
     ];
     assert_eq!(
         digest(&hostile, tc.to_str().unwrap(), tmp.path()),
         clean,
         "caller environment changed the digest"
     );
+    // A caller-supplied marker must not skip the scrub either: the child refuses a dirty
+    // environment instead of trusting the marker.
+    let with_marker = |env: &[(&str, &str)]| {
+        let mut c = Command::new("/bin/sh");
+        c.arg(repo_root().join("scripts/bootstrap.sh"))
+            .args([
+                "--dfm-scrubbed",
+                "toolchain-digest",
+                "--dir",
+                tc.to_str().unwrap(),
+            ])
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("HOME", &home)
+            .env("DFM_BOOTSTRAP_TEST", "1")
+            .env("DFM_TEST_HOME", &home);
+        for (k, v) in env {
+            c.env(k, v);
+        }
+        c.output().unwrap()
+    };
+    for hostile_var in [
+        ("PERL5OPT", "-MForge"),
+        ("BASH_FUNC_cut%%", "() { echo forged; }"),
+        ("DFM_BS_CLEAN", "1"),
+        ("CDPATH", "/tmp"),
+    ] {
+        let o = with_marker(&[("PERL5LIB", forge.to_str().unwrap()), hostile_var]);
+        assert_eq!(
+            o.status.code(),
+            Some(3),
+            "{hostile_var:?}: {}",
+            String::from_utf8_lossy(&o.stdout)
+        );
+        assert!(
+            o.stdout.is_empty() && err(&o).contains("E_ENV_UNEXPECTED"),
+            "{}",
+            err(&o)
+        );
+    }
     // A relative --dir with CDPATH pointing at a decoy must still resolve against the cwd.
     let decoy = tmp.path().join("decoy");
     fs::create_dir_all(decoy.join("tc/bin")).unwrap();
@@ -353,6 +399,22 @@ fn caller_environment_cannot_influence_the_script() {
         digest(&[("CDPATH", decoy.to_str().unwrap())], "tc", tmp.path()),
         clean
     );
+}
+
+#[test]
+fn test_variables_are_forwarded_only_in_test_mode() {
+    let tmp = TempDir::new("fwd");
+    let home = tmp.path().join("home");
+    fs::create_dir(&home).unwrap();
+    // Without DFM_BOOTSTRAP_TEST the DFM_TEST_* values must be dropped, so the real
+    // password-database home is used and a temporary HOME is a mismatch.
+    let o = script(
+        &home,
+        &["uninstall"],
+        &[("DFM_TEST_HOME", home.to_str().unwrap())],
+    );
+    assert_eq!(o.status.code(), Some(3));
+    assert!(err(&o).contains("E_HOME_MISMATCH"), "{}", err(&o));
 }
 
 #[test]

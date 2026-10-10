@@ -12,15 +12,31 @@
 # Exit: 0 ok, 1 build failed, 2 usage, 3 refused before the build.
 # Scrub the caller's environment before anything else runs: exported shell functions
 # (BASH_FUNC_*), PERL5LIB or PERL5OPT (shasum is perl), CDPATH, ENV and the like must not
-# influence the checks. Only the test hooks below survive, and only when set.
-# Run as `/usr/bin/env -i /bin/sh scripts/bootstrap.sh ...`: a SHELLOPTS=noexec in the
-# caller's environment makes /bin/sh read this file without running it, so treat a run
-# that did not print its final line as a failure.
-if [ -z "${DFM_BS_CLEAN:-}" ]; then
-  exec /usr/bin/env -i PATH=/usr/bin:/bin:/usr/sbin:/sbin HOME="${HOME:-}" DFM_BS_CLEAN=1 \
-    ${DFM_BOOTSTRAP_TEST:+"DFM_BOOTSTRAP_TEST=$DFM_BOOTSTRAP_TEST"} ${DFM_TEST_HOME:+"DFM_TEST_HOME=$DFM_TEST_HOME"} \
-    ${DFM_TEST_OS:+"DFM_TEST_OS=$DFM_TEST_OS"} ${DFM_TEST_ARCH:+"DFM_TEST_ARCH=$DFM_TEST_ARCH"} \
-    ${DFM_TEST_CLT:+"DFM_TEST_CLT=$DFM_TEST_CLT"} /bin/sh "$0" "$@"
+# influence the checks. The marker is an argument, not an environment variable, so a
+# caller cannot export it to skip the re-execution. A caller can still pass the argument
+# itself, so the child checks that its environment holds nothing unexpected and refuses
+# otherwise. The DFM_TEST_* hooks are forwarded only when DFM_BOOTSTRAP_TEST=1.
+# Run it as `/usr/bin/env -i /bin/sh scripts/bootstrap.sh ...`. SHELLOPTS and PS4 (xtrace
+# with command substitution, noexec) take effect before the first line of this file and are
+# outside its control; a run that did not print its final line did not finish.
+if [ "${1:-}" != --dfm-scrubbed ]; then
+  if [ "${DFM_BOOTSTRAP_TEST:-}" = 1 ]; then
+    exec /usr/bin/env -i PATH=/usr/bin:/bin:/usr/sbin:/sbin HOME="${HOME:-}" DFM_BOOTSTRAP_TEST=1 \
+      ${DFM_TEST_HOME:+"DFM_TEST_HOME=$DFM_TEST_HOME"} ${DFM_TEST_OS:+"DFM_TEST_OS=$DFM_TEST_OS"} \
+      ${DFM_TEST_ARCH:+"DFM_TEST_ARCH=$DFM_TEST_ARCH"} ${DFM_TEST_CLT:+"DFM_TEST_CLT=$DFM_TEST_CLT"} \
+      /bin/sh "$0" --dfm-scrubbed "$@"
+  fi
+  exec /usr/bin/env -i PATH=/usr/bin:/bin:/usr/sbin:/sbin HOME="${HOME:-}" /bin/sh "$0" --dfm-scrubbed "$@"
+fi
+shift
+env_check=$(/usr/bin/env | /usr/bin/awk -F= -v test="${DFM_BOOTSTRAP_TEST:-}" '
+  BEGIN { split("PATH HOME PWD OLDPWD SHLVL _", a, " "); for (i in a) ok[a[i]] = 1
+    if (test == "1") { split("DFM_BOOTSTRAP_TEST DFM_TEST_HOME DFM_TEST_OS DFM_TEST_ARCH DFM_TEST_CLT", t, " "); for (i in t) ok[t[i]] = 1 } }
+  /^[A-Za-z_][A-Za-z0-9_%]*=/ { if (!($1 in ok)) { print "unexpected " $1; bad = 1; exit } }
+  END { if (!bad) print "clean" }') || env_check=
+if [ "$env_check" != clean ] || [ "$PATH" != /usr/bin:/bin:/usr/sbin:/sbin ]; then
+  /usr/bin/printf 'error: E_ENV_UNEXPECTED the environment holds more than the script allows (%s); start it as /usr/bin/env -i /bin/sh scripts/bootstrap.sh\n' "${env_check:-unreadable}" >&2
+  exit 3
 fi
 set -eu
 umask 077
