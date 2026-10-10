@@ -46,6 +46,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "dfm-engine"
+version = "0.1.0"
+dependencies = [
+ "dfm-model",
+]
+
+[[package]]
 name = "dfm-model"
 version = "0.1.0"
 dependencies = [

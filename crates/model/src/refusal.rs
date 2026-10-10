@@ -23,6 +23,7 @@ pub enum Code {
     StorageInvalid,
     IdentityMismatch,
     Locked,
+    OpInterrupted,
 }
 
 impl Code {
@@ -45,6 +46,7 @@ impl Code {
             Code::StorageInvalid => "E_STORAGE_INVALID",
             Code::IdentityMismatch => "E_IDENTITY_MISMATCH",
             Code::Locked => "E_LOCKED",
+            Code::OpInterrupted => "E_OP_INTERRUPTED",
         }
     }
 

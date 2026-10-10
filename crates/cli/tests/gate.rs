@@ -137,6 +137,7 @@ fn only_the_contract_crates_are_direct_dependencies() {
         .collect();
     let allowed = [
         "dfm-model",
+        "dfm-engine",
         "dfm-platform-macos",
         "serde",
         "serde_json",
@@ -181,6 +182,7 @@ fn crate_dependency_direction_follows_the_contract() {
             .collect()
     };
     assert!(deps("model").is_empty());
+    assert_eq!(deps("engine"), ["dfm-model"]);
     assert_eq!(deps("platform_macos"), ["dfm-model"]);
     assert_eq!(deps("cli"), ["dfm-model", "dfm-platform-macos"]);
 }

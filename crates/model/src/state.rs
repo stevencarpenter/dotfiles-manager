@@ -652,8 +652,11 @@ impl TrialRecord {
 /// characters become visible escapes, and the length is bounded.
 pub fn redact(text: &str, secrets: &[&str]) -> String {
     let mut t = text.to_string();
-    for s in secrets.iter().filter(|s| !s.is_empty()) {
-        t = t.replace(s, "[redacted]");
+    // Longest first: replacing a short secret first could leave the rest of a longer one visible.
+    let mut ordered: Vec<&&str> = secrets.iter().filter(|s| !s.is_empty()).collect();
+    ordered.sort_by_key(|s| std::cmp::Reverse(s.len()));
+    for s in ordered {
+        t = t.replace(*s, "[redacted]");
     }
     let mut out = String::new();
     for c in t.chars() {
@@ -960,6 +963,10 @@ mod tests {
         assert_eq!(out, "token=[redacted]\\u{1b}[31m ok");
         assert!(!out.contains("hunter2"));
         assert!(redact(&"x".repeat(10_000), &[]).len() <= MAX_ERROR_BYTES);
+        // A secret that contains another secret is redacted whole, whatever the list order.
+        for list in [["abc", "abcdef"], ["abcdef", "abc"]] {
+            assert_eq!(redact("x abcdef y", &list), "x [redacted] y");
+        }
     }
 
     #[test]
