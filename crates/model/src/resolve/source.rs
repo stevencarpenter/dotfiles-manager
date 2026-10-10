@@ -132,30 +132,22 @@ impl SourceSet {
     }
 }
 
-/// Joins `rel` onto `base_dir` lexically. The result must stay under `root`.
-pub(crate) fn join(base_dir: &str, rel: &str, root: &str) -> Result<String, PathFault> {
+/// Joins `rel` onto `base_dir` without interpreting `.` or `..`. A real filesystem resolves
+/// `..` after it follows symlinks, so only [`SourceSet::locate`] may decide where such a path
+/// ends up. Collapsing `..` here would let `files/link/../x` pass as `files/x`.
+/// `root` is the directory the final path must stay under; `locate` enforces it.
+pub(crate) fn join(base_dir: &str, rel: &str, _root: &str) -> Result<String, PathFault> {
     if rel.starts_with('/') {
         return Err(PathFault::Escape);
     }
-    if rel.is_empty() || rel.chars().any(char::is_control) {
+    if rel.is_empty() || rel.chars().any(char::is_control) || rel.split('/').any(str::is_empty) {
         return Err(PathFault::Invalid);
     }
-    let root_len = root.split('/').filter(|c| !c.is_empty()).count();
-    let mut parts: Vec<&str> = base_dir.split('/').filter(|c| !c.is_empty()).collect();
-    for c in rel.split('/') {
-        match c {
-            "" => return Err(PathFault::Invalid),
-            "." => {}
-            ".." => {
-                if parts.len() <= root_len {
-                    return Err(PathFault::Escape);
-                }
-                parts.pop();
-            }
-            _ => parts.push(c),
-        }
-    }
-    Ok(parts.join("/"))
+    Ok(if base_dir.is_empty() {
+        rel.to_string()
+    } else {
+        format!("{base_dir}/{rel}")
+    })
 }
 
 pub(crate) fn parent(path: &str) -> &str {
@@ -167,14 +159,31 @@ mod tests {
     use super::*;
 
     #[test]
-    fn join_stays_under_the_root() {
-        assert_eq!(join("a/b", "../c", "a").unwrap(), "a/c");
-        assert_eq!(join("a/b", "../../c", "a"), Err(PathFault::Escape));
+    fn join_refuses_absolute_and_malformed_paths_and_keeps_dots_for_locate() {
+        assert_eq!(join("a/b", "../c", "a").unwrap(), "a/b/../c");
         assert_eq!(join("a", "/etc", "a"), Err(PathFault::Escape));
         assert_eq!(join("a", "x//y", "a"), Err(PathFault::Invalid));
         assert_eq!(join("a", "x\0y", "a"), Err(PathFault::Invalid));
         assert_eq!(join("", "x", ""), Ok("x".into()));
-        assert_eq!(join("", "../x", ""), Err(PathFault::Escape));
+    }
+
+    #[test]
+    fn dotdot_after_a_symlink_is_resolved_against_the_link_target() {
+        let mut s = SourceSet::new();
+        s.insert_file("m/real/secret", "S");
+        s.insert_file("m/files/x", "X");
+        s.insert_link("m/files/link", "../real");
+        // Lexically `files/link/../x` is `files/x`; on a real filesystem it is `real/../x`
+        // after following the link, which is `m/x`. The resolver must not call that `files/x`.
+        assert_eq!(
+            s.locate("m/files/link/../x", "m"),
+            Err(LocateFault::Missing)
+        );
+        s.insert_file("m/x", "Y");
+        assert!(
+            matches!(s.locate("m/files/link/../x", "m"), Ok(Located::File { path, .. }) if path == "m/x")
+        );
+        assert_eq!(s.locate("m/../outside", "m"), Err(LocateFault::Escape));
     }
 
     fn set() -> SourceSet {
