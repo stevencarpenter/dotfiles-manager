@@ -68,35 +68,7 @@ impl ResolveError {
     }
 }
 
-/// Characters that change how text is laid out or hide in it: zero-width characters, the byte
-/// order mark, and the bidirectional embedding, override and isolate controls.
-pub(crate) fn is_invisible(c: char) -> bool {
-    matches!(
-        c,
-        '\u{00ad}'
-            | '\u{200b}'..='\u{200f}'
-            | '\u{202a}'..='\u{202e}'
-            | '\u{2060}'..='\u{2064}'
-            | '\u{2066}'..='\u{206f}'
-            | '\u{feff}'
-    )
-}
-
-/// Replaces control and invisible characters with visible escapes so untrusted text cannot
-/// rewrite a terminal or disguise itself.
-pub(crate) fn visible(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for c in s.chars() {
-        if c.is_control() {
-            out.extend(c.escape_default());
-        } else if is_invisible(c) {
-            out.extend(c.escape_unicode());
-        } else {
-            out.push(c);
-        }
-    }
-    out
-}
+pub(crate) use crate::display::{is_invisible, visible};
 
 impl fmt::Display for ResolveError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -140,17 +112,5 @@ pub(crate) fn category(v: &toml::Value) -> &'static str {
         toml::Value::Datetime(_) => "datetime",
         toml::Value::Array(_) => "array",
         toml::Value::Table(_) => "table",
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn controls_and_invisible_characters_become_visible_escapes() {
-        let shown = visible("a\nb\u{202e}c\u{200b}d\u{feff}e\u{2066}f\u{7}");
-        assert_eq!(shown, "a\\nb\\u{202e}c\\u{200b}d\\u{feff}e\\u{2066}f\\u{7}");
-        assert_eq!(visible("plain ünï text"), "plain ünï text");
     }
 }

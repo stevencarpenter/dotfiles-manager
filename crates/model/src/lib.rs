@@ -3,6 +3,7 @@
 pub mod binding;
 pub mod controls;
 pub mod digest;
+pub mod display;
 pub mod exit;
 pub mod refusal;
 pub mod resolve;

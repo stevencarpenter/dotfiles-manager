@@ -1766,7 +1766,21 @@ fn l4_a_case_alias_cannot_hide_a_link() {
 
 #[test]
 fn l5_bidi_and_zero_width_characters_are_refused_in_targets_and_escaped_in_messages() {
-    for target in ["a\\u202eb", "a\\u200bb", "\\ufeffa", "a\\u2066b"] {
+    for target in [
+        "a\\u202eb",
+        "a\\u200bb",
+        "\\ufeffa",
+        "a\\u2066b",
+        "a\\u061cb",
+        "a\\u2028b",
+        "a\\u2029b",
+        "a\\u034fb",
+        "a\\u180eb",
+        "a\\U000e0041b",
+        "a\\ufe0fb",
+        "a\\u3164b",
+        "a\\u115fb",
+    ] {
         let mut set = synthetic();
         edit(
             &mut set,

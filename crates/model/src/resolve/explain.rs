@@ -3,6 +3,7 @@
 //! [`Resolved`] value. Values of resources that hold secret references print as `[redacted]`.
 //! Output is bounded: long strings are clipped and an oversized report is refused.
 
+use super::compose::glob;
 use super::error::visible;
 use super::pointer;
 use super::{ChangeKind, IncludeEntry, IncludeGroup, Resolved, ResolvedResource};
@@ -15,6 +16,7 @@ const MAX_VALUE_CHARS: usize = 200;
 const MAX_OUTPUT_BYTES: usize = 1 << 20;
 const MAX_RESOURCES: usize = 100;
 const MAX_OVERLAP_LINES: usize = 20;
+const MAX_SUPPLIER_LINES: usize = 200;
 
 /// Writes one line and refuses as soon as the report is over the size limit, so no list can
 /// grow past it between checks.
@@ -185,6 +187,41 @@ fn describe(resolved: &Resolved, r: &ResolvedResource, out: &mut String) -> Resu
             clip(&d.pattern),
             clip(&d.dir)
         );
+        // Any selected module may place a matching file here, and its name sets its position.
+        // The owner does not opt in, so every supplier is listed.
+        let dir = d.dir.to_lowercase();
+        let pattern = d.pattern.to_lowercase();
+        let mut suppliers: Vec<(&str, &ResolvedResource)> = Vec::new();
+        for o in resolved.resources.values().filter(|o| o.id != r.id) {
+            for claim in &o.claims {
+                if let Some((parent, name)) = claim.rsplit_once('/')
+                    && parent.to_lowercase() == dir
+                    && glob(&pattern, &name.to_lowercase())
+                {
+                    suppliers.push((name, o));
+                }
+            }
+        }
+        suppliers.sort_by(|a, b| (a.0, &a.1.id).cmp(&(b.0, &b.1.id)));
+        put!(
+            out,
+            "  fragment suppliers, in the order the assembler reads them (by file name):{}",
+            if suppliers.is_empty() { " none" } else { "" }
+        );
+        for (i, (name, o)) in suppliers.iter().enumerate().take(MAX_SUPPLIER_LINES) {
+            put!(
+                out,
+                "    {}. {} <- {} (module {}, declared in {})",
+                i + 1,
+                clip(name),
+                clip(&o.id),
+                clip(&o.module),
+                clip(&o.declared_in)
+            );
+        }
+        if suppliers.len() > MAX_SUPPLIER_LINES {
+            put!(out, "    and {} more", suppliers.len() - MAX_SUPPLIER_LINES);
+        }
     }
     put!(out, "  permitted overrides: {}", clip(&list(&r.defaults)));
     put!(

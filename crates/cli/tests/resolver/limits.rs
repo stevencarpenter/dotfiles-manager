@@ -418,3 +418,203 @@ fn l3_the_module_cap_counts_the_core_and_pins_its_boundary() {
     assert_eq!(e.code, Code::LimitExceeded);
     assert!(e.message.contains("more than 10000 modules"), "{e}");
 }
+
+// Claims, supplier lookup and source hashing scale with their inputs, not their products.
+
+/// A `skills/v1` resource named `id` with `roots` target roots and `entries` entries, each
+/// entry pointing at `source`.
+fn skills(id: &str, roots: usize, entries: usize, source: &str) -> String {
+    let mut s = format!(
+        "[[resources]]\nid = \"{id}\"\nkind = \"distribution\"\nadapter = \"skills/v1\"\n[resources.value]\ntarget_roots = ["
+    );
+    for r in 0..roots {
+        let _ = write!(s, "\"d{id}/r{r:05}\", ");
+    }
+    s.push_str("]\n");
+    for e in 0..entries {
+        let _ = write!(
+            s,
+            "[resources.value.entries.e{e:05}]\nsource = \"{source}\"\nenabled = true\n"
+        );
+    }
+    s
+}
+
+#[test]
+fn s1_the_claim_product_is_refused_before_any_claim_is_built() {
+    // 6000 roots x 3000 entries is 1.8e7 claims. It is refused from the two lengths alone.
+    let m = module("many", &[], &skills("sk", 6000, 3000, "files/f"));
+    let set = build(&[m], &["many".into()]);
+    let t = Instant::now();
+    let e = run(&set).unwrap_err();
+    assert!(t.elapsed() < Duration::from_secs(5), "{:?}", t.elapsed());
+    assert_eq!(e.code, Code::LimitExceeded);
+    assert_eq!(e.resource.as_deref(), Some("many.sk"));
+    assert!(e.message.contains("too many output paths"), "{e}");
+}
+
+#[test]
+fn s1_the_claim_caps_are_pinned_per_resource_and_in_total() {
+    let with_file = |modules: &[(String, String)], selected: &[String]| {
+        let mut set = build(modules, selected);
+        set.insert_file("b/m/files/f", "x");
+        set
+    };
+    // Exactly 100000 claims in one resource resolves. One more root is refused.
+    let m = module("one", &[], &skills("a", 100, 1000, "files/f"));
+    let r = run(&with_file(&[m], &["one".into()])).unwrap();
+    assert_eq!(r.resources["one.a"].claims.len(), 100_000);
+    let m = module("one", &[], &skills("a", 101, 1000, "files/f"));
+    let e = run(&with_file(&[m], &["one".into()])).unwrap_err();
+    assert_eq!(
+        (e.code, e.resource.as_deref()),
+        (Code::LimitExceeded, Some("one.a"))
+    );
+    // Two resources at the cap total 200000 and resolve. A third pushes the total over.
+    let two = format!(
+        "{}{}",
+        skills("a", 100, 1000, "files/f"),
+        skills("b", 100, 1000, "files/f")
+    );
+    let r = run(&with_file(&[module("two", &[], &two)], &["two".into()])).unwrap();
+    assert_eq!(
+        r.resources.values().map(|r| r.claims.len()).sum::<usize>(),
+        200_000
+    );
+    let three = format!("{two}{}", skills("c", 1, 1, "files/f"));
+    let e = run(&with_file(&[module("two", &[], &three)], &["two".into()])).unwrap_err();
+    assert_eq!(
+        (e.code, e.resource.as_deref()),
+        (Code::LimitExceeded, Some("two.c"))
+    );
+}
+
+#[test]
+fn s2_supplier_lookup_scales_with_thirty_thousand_values_and_twelve_thousand_overrides() {
+    let mut owner = String::from(
+        "[[resources]]\nid = \"big\"\nkind = \"render\"\nadapter = \"git-config/v1\"\ntarget = \"t/big\"\n[resources.value.k]\n",
+    );
+    for i in 0..30_000 {
+        let _ = writeln!(owner, "k{i:05} = 1");
+    }
+    let defaults: Vec<String> = (0..12_000).map(|i| format!("\"/k/k{i:05}\"")).collect();
+    let _ = write!(
+        owner,
+        "[resources.policy]\ndefaults = [{}]\n",
+        defaults.join(", ")
+    );
+    let mut modules = vec![module("own", &[], &owner)];
+    for part in 0..3 {
+        let mut body = String::new();
+        for i in (part * 4000)..((part + 1) * 4000) {
+            let _ = write!(
+                body,
+                "[[overrides]]\nresource = \"own.big\"\npath = \"/k/k{i:05}\"\nvalue = 2\nreason = \"r\"\n"
+            );
+        }
+        modules.push(module(&format!("ovr{part}"), &[], &body));
+    }
+    let ids: Vec<String> = modules.iter().map(|m| m.0.clone()).collect();
+    let t = Instant::now();
+    let r = run(&build(&modules, &ids)).unwrap();
+    assert!(t.elapsed() < Duration::from_secs(10), "{:?}", t.elapsed());
+    let big = &r.resources["own.big"];
+    assert_eq!(big.provenance.len(), 30_000);
+    assert_eq!(big.value["k"]["k11999"].as_integer(), Some(2));
+    assert_eq!(big.value["k"]["k12000"].as_integer(), Some(1));
+    assert_eq!(big.provenance["/k/k11999"].changer.as_deref(), Some("ovr2"));
+    assert_eq!(big.provenance["/k/k12000"].changer, None);
+}
+
+#[test]
+fn s3_a_directory_reached_by_three_thousand_references_is_hashed_once() {
+    let m = module("dirs", &[], &skills("sk", 1, 3000, "files/dir"));
+    let mut set = build(&[m], &["dirs".into()]);
+    for i in 0..3000 {
+        set.insert_file(format!("b/m/files/dir/f{i:04}"), format!("file {i}"));
+    }
+    let t = Instant::now();
+    let r = run(&set).unwrap();
+    assert!(t.elapsed() < Duration::from_secs(20), "{:?}", t.elapsed());
+    let ids: std::collections::BTreeSet<_> = r.resources["dirs.sk"]
+        .provenance
+        .iter()
+        .filter(|(p, _)| p.ends_with("/source"))
+        .map(|(_, p)| p.content_id.clone().unwrap())
+        .collect();
+    assert_eq!(ids.len(), 1, "every reference sees the same digest");
+}
+
+#[test]
+fn s3_a_large_file_reached_by_many_references_is_hashed_once() {
+    // 9000 links in three modules (a document is limited to 1 MiB), all naming one 1 MiB file.
+    let body = |m: usize| {
+        let mut s = String::new();
+        for i in 0..3000 {
+            let _ = write!(
+                s,
+                "[[resources]]\nid = \"l{i:05}\"\nkind = \"link\"\nadapter = \"fs-link/v1\"\ntarget = \"t{m}/l{i:05}\"\n[resources.value]\nsource = \"files/big\"\n"
+            );
+        }
+        s
+    };
+    let ids: Vec<String> = (0..3).map(|m| format!("lnk{m}")).collect();
+    let modules: Vec<_> = ids
+        .iter()
+        .enumerate()
+        .map(|(m, id)| module(id, &[], &body(m)))
+        .collect();
+    let mut set = build(&modules, &ids);
+    set.insert_file("b/m/files/big", vec![b'x'; 1 << 20]);
+    let t = Instant::now();
+    let r = run(&set).unwrap();
+    assert!(t.elapsed() < Duration::from_secs(6), "{:?}", t.elapsed());
+    assert_eq!(r.resources.len(), 9000);
+}
+
+#[test]
+fn s3_the_digest_cache_does_not_let_a_narrower_root_skip_the_containment_check() {
+    // owner.thing reaches the directory from the owner's root, where the link inside it is
+    // fine. owner.thing2 is overridden by the `sub` module, whose root is narrower, and the
+    // same link leaves that root. The first reference must not vouch for the second.
+    let file = |id: &str, requires: &str, body: &str| {
+        format!(
+            "schema = 1\nid = \"{id}\"\nplatforms = [\"macos\"]\nrequires = [{requires}]\n{body}"
+        )
+    };
+    let thing = |id: &str| {
+        format!(
+            "[[resources]]\nid = \"{id}\"\nkind = \"link\"\nadapter = \"fs-link/v1\"\ntarget = \"t/{id}\"\n[resources.value]\nsource = \"sub/files/d\"\n[resources.policy]\ndefaults = [\"/source\"]\n"
+        )
+    };
+    let mut set = SourceSet::new();
+    set.insert_file("b/bundle.toml", "schema = 1\nid = \"gen\"\ncore = \"m/core.toml\"\n[modules]\nowner = \"m/owner/module.toml\"\nsub = \"m/owner/sub/module.toml\"\n");
+    set.insert_file("b/m/core.toml", file("core", "", ""));
+    set.insert_file(
+        "b/m/owner/module.toml",
+        file(
+            "owner",
+            "",
+            &format!("{}{}", thing("thing"), thing("thing2")),
+        ),
+    );
+    set.insert_file(
+        "b/m/owner/sub/module.toml",
+        file("sub", "\"owner\"", "[[overrides]]\nresource = \"owner.thing2\"\npath = \"/source\"\nvalue = \"files/d\"\nreason = \"r\"\n"),
+    );
+    set.insert_file("b/m/owner/sub/files/d/ok", "ok");
+    set.insert_link("b/m/owner/sub/files/d/link", "../../../sibling");
+    set.insert_file("b/m/owner/sibling", "inside the owner root, outside sub");
+    set.insert_file(
+        "p/profile.toml",
+        "schema = 1\nid = \"gen-01\"\nbundle = \"../b/bundle.toml\"\nplatform = \"macos\"\narchitecture = \"arm64\"\nmodules = [\"sub\"]\n",
+    );
+    let e = run(&set).unwrap_err();
+    assert_eq!(e.code, Code::SourceEscape, "{e}");
+    assert_eq!(e.source, "b/m/owner/sub/module.toml");
+    assert_eq!(e.resource.as_deref(), Some("owner.thing2"));
+    // Without the narrower reference the same tree resolves, so the cache is what was tested.
+    let mut ok = set.clone();
+    ok.insert_file("b/m/owner/sub/module.toml", file("sub", "\"owner\"", ""));
+    assert!(run(&ok).is_ok());
+}

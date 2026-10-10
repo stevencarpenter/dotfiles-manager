@@ -149,3 +149,66 @@ fn a_fragment_included_twice_shows_every_position() {
         "{out}"
     );
 }
+
+// Every supplier of a fragment is visible, because the owner does not opt in.
+
+#[test]
+fn explain_lists_every_fragment_supplier_in_reading_order() {
+    let mut set = examples();
+    let first = "{ id = \"early\", kind = \"link\", adapter = \"fs-link/v1\", target = \".codex/AGENTS.d/10-first.md\", value = { source = \"files/AGENTS.md\" } }";
+    crate::harness::edit(
+        &mut set,
+        "external/modules/work/module.toml",
+        "add",
+        "/resources/-",
+        Some(first),
+    );
+    let out = text(&set, "profiles/work-01.toml", "agents.codex-instructions");
+    let lines: Vec<&str> = out.lines().collect();
+    let at = lines
+        .iter()
+        .position(|l| l.contains("fragment suppliers, in the order the assembler reads them"))
+        .unwrap();
+    assert_eq!(
+        lines[at + 1].trim(),
+        "1. 10-first.md <- work.early (module work, declared in external/modules/work/module.toml)"
+    );
+    assert_eq!(
+        lines[at + 2].trim(),
+        "2. 40-work.md <- work.instructions (module work, declared in external/modules/work/module.toml)"
+    );
+    assert!(!lines[at + 3].trim_start().starts_with("3."), "{out}");
+    // With no supplier the list says so.
+    let none = text(
+        &examples(),
+        "profiles/personal-dev-01.toml",
+        "agents.codex-instructions",
+    );
+    assert!(none.contains("(by file name): none"), "{none}");
+}
+
+#[test]
+fn assemblers_whose_outputs_land_in_each_others_directories_still_resolve() {
+    // Each output matches the other's pattern, so both are accepted as fragments. The resolver
+    // does not model that loop; the planner (DFM-16) must reject it.
+    let mut set = examples();
+    let asm = |id: &str, target: &str, dir: &str| {
+        format!(
+            "{{ id = \"{id}\", kind = \"assemble\", adapter = \"text-fragments/v1\", target = \"{target}\", value = {{ body = \"files/personal.env.tpl\", fragments_dir = \"{dir}\", pattern = \"*.md\", separator = \"\\n\" }} }}"
+        )
+    };
+    for r in [
+        asm("one", ".d1/out.md", ".d2"),
+        asm("two", ".d2/out.md", ".d1"),
+    ] {
+        crate::harness::edit(
+            &mut set,
+            "base/modules/personal-dev/module.toml",
+            "add",
+            "/resources/-",
+            Some(&r),
+        );
+    }
+    let out = text(&set, "profiles/personal-dev-01.toml", "personal-dev.one");
+    assert!(out.contains("1. out.md <- personal-dev.two"), "{out}");
+}

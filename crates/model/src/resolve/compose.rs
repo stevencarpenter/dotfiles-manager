@@ -28,6 +28,10 @@ const MAX_LEAVES: usize = 200_000;
 /// Include directives in one authored native document, and in all of them together (counted
 /// once per resource that links the document).
 const MAX_INCLUDES_PER_DOC: usize = 1_000;
+/// Output claims one resource may enumerate, and all resources together. A distribution adapter
+/// claims roots x entries paths, so the product is checked before any claim is built.
+const MAX_CLAIMS_PER_RESOURCE: usize = 100_000;
+const MAX_CLAIMS_TOTAL: usize = 200_000;
 const MAX_INCLUDES_TOTAL: usize = 10_000;
 
 fn limit(file: &str, what: &str) -> ResolveError {
@@ -763,19 +767,24 @@ fn authorize(
 
 /// The declaring source for the value at `ptr`: the change that covers it, or the owner.
 fn supplier_for(owner: &Owned, roots: Option<&BTreeMap<String, Supplier>>, ptr: &str) -> Supplier {
-    roots
-        .and_then(|r| {
-            r.iter()
-                .find(|(root, _)| ptr == root.as_str() || ptr.starts_with(&format!("{root}/")))
-                .map(|(_, s)| s.clone())
-        })
-        .unwrap_or_else(|| Supplier {
-            file: owner.file.clone(),
-            dir: owner.dir.clone(),
-            changer: owner.module.clone(),
-            change: None,
-            reason: None,
-        })
+    // The change that covers `ptr` is at `ptr` itself or at one of its ancestors, so look each
+    // up directly instead of scanning every change root.
+    let covering = roots.and_then(|r| {
+        let mut at = ptr;
+        loop {
+            if let Some(s) = r.get(at) {
+                return Some(s);
+            }
+            at = &at[..at.rfind('/')?];
+        }
+    });
+    covering.cloned().unwrap_or_else(|| Supplier {
+        file: owner.file.clone(),
+        dir: owner.dir.clone(),
+        changer: owner.module.clone(),
+        change: None,
+        reason: None,
+    })
 }
 
 fn leaves<'v>(v: &'v Value, ptr: &str, out: &mut Vec<(String, &'v Value)>) {
@@ -801,6 +810,9 @@ fn finish(
     let mut include_cache: BTreeMap<String, Vec<Include>> = BTreeMap::new();
     let mut include_total = 0usize;
     let mut leaf_budget = 0usize;
+    let mut claim_budget = 0usize;
+    // One digest per located source path, however many references name it.
+    let mut digests: BTreeMap<String, String> = BTreeMap::new();
     for (gid, owner) in resources {
         let r = &owner.doc;
         let spec = catalog.get(&r.adapter).ok_or_else(|| {
@@ -909,12 +921,14 @@ fn finish(
             }
             _ => {}
         }
+        // Claims are counted before anything expensive is done for this resource.
+        let (claims, dir_claims) = claims_of(spec, owner, gid, value, &mut claim_budget)?;
         // Source containment, through symlinks, relative to the file that supplied the value.
         let mut prov: BTreeMap<String, Provenance> = BTreeMap::new();
         let mut srcs: BTreeMap<String, (String, Option<String>)> = BTreeMap::new();
         for s in &found.sources {
             let sup = supplier_for(owner, roots, &s.pointer);
-            let (path, id) = contain(sources, &sup, gid, &s.pointer, &s.rel, spec)?;
+            let (path, id) = contain(sources, &sup, gid, &s.pointer, &s.rel, spec, &mut digests)?;
             srcs.insert(s.pointer.clone(), (path, id));
         }
         let base_tokens = |p: &str| {
@@ -951,7 +965,6 @@ fn finish(
                 },
             );
         }
-        let (claims, dir_claims) = claims_of(spec, owner, gid, value)?;
         if let (Some(parse), Some((path, _))) = (spec.source_includes, srcs.get("/source")) {
             // The source is the authored native document; its include lines fix the order.
             let key = format!("{}\0{path}", spec.id);
@@ -1067,6 +1080,7 @@ fn contain(
     ptr: &str,
     rel: &str,
     spec: &AdapterSpec,
+    digests: &mut BTreeMap<String, String>,
 ) -> Result<(String, Option<String>), ResolveError> {
     let wrap = |e: ResolveError| e.resource(gid).field(ptr);
     let path =
@@ -1076,10 +1090,23 @@ fn contain(
         .map_err(|f| wrap(locate_error(&sup.file, ptr, f)))?
     {
         Located::File { path, bytes } => {
-            let id = (!spec.secret_values).then(|| format!("sha256:{}", sha256_hex(bytes)));
+            let id = (!spec.secret_values).then(|| {
+                digests
+                    .entry(path.clone())
+                    .or_insert_with(|| format!("sha256:{}", sha256_hex(bytes)))
+                    .clone()
+            });
             Ok((path, id))
         }
         Located::Dir { path } => {
+            // A directory reached again was already checked entry by entry, and its digest is
+            // the same, so do not walk and hash it again for every reference.
+            // The key includes the root: the same directory can be reached from two roots, and
+            // entry links must stay inside each of them.
+            let key = format!("{}\0{path}", sup.dir);
+            if let Some(id) = digests.get(&key) {
+                return Ok((path.clone(), (!spec.secret_values).then(|| id.clone())));
+            }
             let mut entries = Vec::new();
             for (name, e) in sources.below(&path) {
                 let full = format!("{path}/{name}");
@@ -1111,8 +1138,9 @@ fn contain(
                     Err(f) => return Err(wrap(locate_error(&sup.file, ptr, f))),
                 }
             }
-            let id = (!spec.secret_values).then(|| format!("sha256:{}", tree_digest(entries)));
-            Ok((path, id))
+            let id = format!("sha256:{}", tree_digest(entries));
+            digests.insert(key, id.clone());
+            Ok((path, (!spec.secret_values).then_some(id)))
         }
     }
 }
@@ -1122,6 +1150,7 @@ fn claims_of(
     owner: &Owned,
     gid: &str,
     value: &Value,
+    budget: &mut usize,
 ) -> Result<(Vec<String>, Vec<DirClaim>), ResolveError> {
     let get = |p: &str| pointer::get(value, &pointer::parse(p).expect("static pointer"));
     Ok(match spec.claims {
@@ -1160,7 +1189,17 @@ fn claims_of(
             else {
                 return Ok((Vec::new(), Vec::new()));
             };
-            let mut out = Vec::new();
+            // Refuse before building the list: roots x entries can be enormous.
+            let count = roots.len().saturating_mul(entries.len());
+            *budget = budget.saturating_add(count);
+            if count > MAX_CLAIMS_PER_RESOURCE || *budget > MAX_CLAIMS_TOTAL {
+                return Err(
+                    limit(&owner.file, "the composition claims too many output paths")
+                        .resource(gid)
+                        .field("/entries"),
+                );
+            }
+            let mut out = Vec::with_capacity(count);
             for root in roots.iter().filter_map(Value::as_str) {
                 for (name, e) in entries {
                     if schema::home_path_fault(name).is_some() || name.contains('/') {
@@ -1182,7 +1221,7 @@ fn claims_of(
 }
 
 /// `*` matches any run of characters and `?` any one, within a single path component.
-fn glob(pattern: &str, name: &str) -> bool {
+pub(crate) fn glob(pattern: &str, name: &str) -> bool {
     let (p, n): (Vec<char>, Vec<char>) = (pattern.chars().collect(), name.chars().collect());
     let (mut pi, mut ni, mut star, mut mark) = (0, 0, None, 0);
     while ni < n.len() {
