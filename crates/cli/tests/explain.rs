@@ -19,6 +19,26 @@ fn run(home: &Path, args: &[&str]) -> Output {
         .unwrap()
 }
 
+/// Runs a command and kills it if it has not finished in `secs`, so a command that blocks on a
+/// FIFO fails the test instead of hanging the gate.
+fn finish_within(mut cmd: Command, secs: u64) -> Output {
+    use std::process::Stdio;
+    let mut child = cmd
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let start = std::time::Instant::now();
+    while child.try_wait().unwrap().is_none() {
+        if start.elapsed().as_secs() >= secs {
+            let _ = child.kill();
+            panic!("command did not finish within {secs} s: {cmd:?}");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    child.wait_with_output().unwrap()
+}
+
 fn text(b: &[u8]) -> String {
     String::from_utf8_lossy(b).into_owned()
 }
@@ -251,14 +271,16 @@ fn source_loading_skips_a_top_level_git_directory_and_refuses_the_rest() {
 
     // A FIFO is a special file: refused without opening it, so the command cannot hang.
     let fifo = root.join("base/modules/core/files/pipe");
-    assert!(
-        Command::new("mkfifo")
-            .arg(&fifo)
-            .status()
-            .unwrap()
-            .success()
-    );
-    let o = run(home.path(), &["explain", "core.git", "--root", r]);
+    let mut mkfifo = Command::new("/usr/bin/mkfifo");
+    mkfifo.arg(&fifo);
+    assert!(finish_within(mkfifo, 10).status.success());
+    let mut explain = Command::new(BIN);
+    explain
+        .env_clear()
+        .arg("--home")
+        .arg(home.path())
+        .args(["explain", "core.git", "--root", r]);
+    let o = finish_within(explain, 20);
     assert_eq!(o.status.code(), Some(3));
     assert!(
         text(&o.stderr).contains("E_SOURCE_UNTRUSTED"),
@@ -329,6 +351,17 @@ fn explain_needs_a_binding_and_a_profile_inside_the_root() {
     assert!(snapshot(home.path()).is_empty());
 
     let (home, _t, _root) = bound("work-01.toml");
+    // A root that cannot be read means no report can be produced: exit 2, not a gate (exit 3).
+    let o = run(
+        home.path(),
+        &["explain", "core.git", "--root", "/nonexistent-dfm-root"],
+    );
+    assert_eq!(o.status.code(), Some(2));
+    assert!(
+        text(&o.stderr).starts_with("error: E_REPORT_UNAVAILABLE"),
+        "{}",
+        text(&o.stderr)
+    );
     let other = TempDir::new("elsewhere");
     let o = run(
         home.path(),

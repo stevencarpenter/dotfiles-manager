@@ -318,8 +318,12 @@ fn explain(ctx: &Ctx, query: &str, root: &Path) -> Result<String, Refusal> {
             "this machine is not bound; run bind first",
         )
     })?;
-    let root = fs::canonicalize(root)
-        .map_err(|e| Refusal::new(Code::IoFailed, format!("{}: {}", root.display(), e.kind())))?;
+    let root = fs::canonicalize(root).map_err(|e| {
+        Refusal::new(
+            Code::ReportUnavailable,
+            format!("{}: {}", root.display(), e.kind()),
+        )
+    })?;
     let rel = Path::new(binding.profile())
         .strip_prefix(&root)
         .ok()
