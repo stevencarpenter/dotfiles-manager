@@ -1,10 +1,15 @@
 //! Cost bounds: linear dependency ordering, sorted policy checks, and hard caps on modules,
 //! resources, values, bundle depth and explain output.
 
+use crate::harness::synthetic;
 use dfm_cli::builtin_catalog;
 use dfm_model::Code;
-use dfm_model::resolve::{ResolveError, Resolved, SourceSet, explain, resolve};
+use dfm_model::resolve::{
+    AdapterCatalog, AdapterSpec, Claims, Field, Include, ResolveError, Resolved, Schema, SourceSet,
+    TargetRule, explain, resolve,
+};
 use std::fmt::Write;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 /// A generous bound. The checks below fail by orders of magnitude, not by a few seconds, when
@@ -226,4 +231,190 @@ fn l3_explain_clips_long_text_and_refuses_oversized_reports() {
     let r = run(&build(&[m], &["wide".into()])).unwrap();
     let e = explain(&r, "wide.big").unwrap_err();
     assert_eq!(e.code, Code::LimitExceeded);
+}
+
+// Include directives: capped per document and in total, parsed once per document.
+
+fn include_lines(n: usize) -> String {
+    (0..n)
+        .map(|i| format!("[include]\n    path = ~/.config/inc/f{i:04}\n"))
+        .collect()
+}
+
+fn set_with_gitconfig(text: &str, extra_links: usize) -> SourceSet {
+    let mut set = synthetic();
+    set.insert_file("shared/core/files/gitconfig", text);
+    for i in 0..extra_links {
+        let r = format!(
+            "{{ id = \"git{i}\", kind = \"link\", adapter = \"fs-link/v1\", target = \".config/synthetic/gitconfig{i}\", value = {{ source = \"files/gitconfig\" }} }}"
+        );
+        crate::harness::edit(
+            &mut set,
+            "shared/core/module.toml",
+            "add",
+            "/resources/-",
+            Some(&r),
+        );
+    }
+    set
+}
+
+#[test]
+fn i1_one_document_may_hold_a_thousand_includes_and_not_one_more() {
+    let a = "profiles/machine-a.toml";
+    let r = resolve(
+        &set_with_gitconfig(&include_lines(1000), 0),
+        a,
+        &builtin_catalog(),
+    )
+    .unwrap();
+    assert_eq!(r.includes[0].entries.len(), 1000);
+    let e = resolve(
+        &set_with_gitconfig(&include_lines(1001), 0),
+        a,
+        &builtin_catalog(),
+    )
+    .unwrap_err();
+    assert_eq!(e.code, Code::LimitExceeded);
+    assert_eq!(e.source, "shared/core/module.toml");
+    assert!(
+        e.message.contains("more than 1000 include directives"),
+        "{e}"
+    );
+}
+
+#[test]
+fn i1_the_total_over_all_links_is_capped_at_ten_thousand() {
+    let a = "profiles/machine-a.toml";
+    // core.git plus nine more links to the same 1000-line document: exactly 10000.
+    let r = resolve(
+        &set_with_gitconfig(&include_lines(1000), 9),
+        a,
+        &builtin_catalog(),
+    )
+    .unwrap();
+    assert_eq!(
+        r.includes.iter().map(|g| g.entries.len()).sum::<usize>(),
+        10_000
+    );
+    let e = resolve(
+        &set_with_gitconfig(&include_lines(1000), 10),
+        a,
+        &builtin_catalog(),
+    )
+    .unwrap_err();
+    assert_eq!(e.code, Code::LimitExceeded);
+    assert!(
+        e.message.contains("more than 10000 include directives"),
+        "{e}"
+    );
+}
+
+static PARSES: AtomicUsize = AtomicUsize::new(0);
+
+fn counting_parser(text: &str) -> Vec<Include> {
+    PARSES.fetch_add(1, Ordering::SeqCst);
+    text.lines()
+        .map(|l| Include {
+            path: l.to_string(),
+            condition: None,
+        })
+        .collect()
+}
+
+#[test]
+fn i1_each_document_is_parsed_once_however_many_resources_link_it() {
+    let link = AdapterSpec {
+        id: "fs-link/v1".into(),
+        kind: "link",
+        target: TargetRule::Required,
+        secret_values: false,
+        native_document: false,
+        claims: Claims::Target,
+        value: Schema::Table(vec![Field {
+            name: "source",
+            schema: Schema::Source,
+            required: true,
+        }]),
+        source_includes: Some(counting_parser),
+        precedence: None,
+    };
+    let cat = AdapterCatalog::new([link]);
+    let res = |i: usize, file: &str| {
+        format!(
+            "[[resources]]\nid = \"l{i}\"\nkind = \"link\"\nadapter = \"fs-link/v1\"\ntarget = \"t/l{i}\"\n[resources.value]\nsource = \"files/{file}\"\n"
+        )
+    };
+    let body: String = (0..6)
+        .map(|i| res(i, if i < 4 { "one" } else { "two" }))
+        .collect();
+    let mut set = build(&[module("lnk", &[], &body)], &["lnk".into()]);
+    set.insert_file("b/m/files/one", "x\ny\n");
+    set.insert_file("b/m/files/two", "z\n");
+    PARSES.store(0, Ordering::SeqCst);
+    let r = resolve(&set, "p/profile.toml", &cat).unwrap();
+    assert_eq!(PARSES.load(Ordering::SeqCst), 2, "six links, two documents");
+    assert_eq!(r.includes.len(), 6, "every link still gets its own group");
+}
+
+#[test]
+fn i1_explain_output_stays_bounded_when_a_fragment_is_included_a_thousand_times() {
+    // Every clipped field is at its 200 character limit and the IDs are 60 characters long, so a
+    // 1000-position report is over 1 MiB. The writer must stop at the limit, not after it.
+    let long = |c: char, n: usize| c.to_string().repeat(n);
+    let (base_id, frag_id, frag_mod) = (long('g', 60), long('f', 60), long('m', 60));
+    let frag_target = format!(".config/{}", long('t', 250));
+    let mut gitconfig = String::new();
+    for i in 0..1000 {
+        gitconfig.push_str(&format!(
+            "[includeIf \"gitdir:{}{i:04}\"]\n    path = ~/{frag_target}\n",
+            long('c', 250)
+        ));
+    }
+    let core = format!(
+        "schema = 1\nid = \"core\"\nplatforms = [\"macos\"]\nrequires = []\n[[resources]]\nid = \"{base_id}\"\nkind = \"link\"\nadapter = \"fs-link/v1\"\ntarget = \".config/{}\"\n[resources.value]\nsource = \"files/gitconfig\"\n",
+        long('g', 250)
+    );
+    let frag = format!(
+        "[[resources]]\nid = \"{frag_id}\"\nkind = \"render\"\nadapter = \"git-config/v1\"\ntarget = \"{frag_target}\"\n[resources.value.a]\nk = 1\n"
+    );
+    let mut set = build(
+        &[module(&frag_mod, &[], &frag)],
+        std::slice::from_ref(&frag_mod),
+    );
+    set.insert_file("b/m/core.toml", core);
+    set.insert_file("b/m/files/gitconfig", gitconfig);
+    let r = run(&set).unwrap();
+    assert_eq!(r.includes[0].entries.len(), 1000);
+    let id = format!("{frag_mod}.{frag_id}");
+    let e = explain(&r, &id).unwrap_err();
+    assert_eq!(
+        e.code,
+        Code::LimitExceeded,
+        "a 1000-position report is over 1 MiB and is refused"
+    );
+    // The base lists its includes once and fits.
+    let text = explain(&r, &format!("core.{base_id}")).unwrap();
+    assert!(text.len() < (1 << 20) + 4096, "{}", text.len());
+    // A short fragment list is fine.
+    let mut few = set.clone();
+    few.insert_file(
+        "b/m/files/gitconfig",
+        format!("[include]\n    path = ~/{frag_target}\n"),
+    );
+    assert!(explain(&run(&few).unwrap(), &id).is_ok());
+}
+
+#[test]
+fn l3_the_module_cap_counts_the_core_and_pins_its_boundary() {
+    // At most 10000 modules including the core: 9999 others resolve, 10000 others are refused.
+    let ids: Vec<String> = (0..9_999).map(|i| format!("m{i:05}")).collect();
+    let modules: Vec<_> = ids.iter().map(|id| module(id, &[], "")).collect();
+    let r = run(&build(&modules, &ids)).unwrap();
+    assert_eq!(r.modules.len(), 10_000);
+    let ids: Vec<String> = (0..10_000).map(|i| format!("m{i:05}")).collect();
+    let modules: Vec<_> = ids.iter().map(|id| module(id, &[], "")).collect();
+    let e = run(&build(&modules, &ids)).unwrap_err();
+    assert_eq!(e.code, Code::LimitExceeded);
+    assert!(e.message.contains("more than 10000 modules"), "{e}");
 }

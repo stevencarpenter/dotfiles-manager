@@ -25,6 +25,10 @@ const MAX_MODULES: usize = 10_000;
 const MAX_TOTAL_DOC_BYTES: usize = 64 << 20;
 /// Leaves across the whole composition. Each leaf gets a provenance record.
 const MAX_LEAVES: usize = 200_000;
+/// Include directives in one authored native document, and in all of them together (counted
+/// once per resource that links the document).
+const MAX_INCLUDES_PER_DOC: usize = 1_000;
+const MAX_INCLUDES_TOTAL: usize = 10_000;
 
 fn limit(file: &str, what: &str) -> ResolveError {
     ResolveError::new(
@@ -105,8 +109,8 @@ fn locate_error(from: &str, field: &str, f: LocateFault) -> ResolveError {
         LocateFault::Escape => ResolveError::new(
             Code::SourceEscape,
             from,
-            "a symlink in the path leaves the trusted root",
-            "replace the link with a file inside the source, or remove it",
+            "the path or a symlink in it leaves the trusted root",
+            "use a path that stays inside the declaring source, and replace or remove any link that leaves it",
         ),
         LocateFault::Loop => ResolveError::new(
             Code::SourceEscape,
@@ -624,7 +628,7 @@ fn authorize(
                 return Err(ResolveError::new(
                     Code::TypeMismatch,
                     &ch.file,
-                    format!("the override must be a {}", category(base)),
+                    format!("the override must be of type {}", category(base)),
                     "supply a value of the owner's type; boolean and integer are different types",
                 )
                 .resource(&o.resource)
@@ -792,7 +796,10 @@ fn finish(
     eff: &Effective,
 ) -> Result<(BTreeMap<String, ResolvedResource>, Vec<IncludeGroup>), ResolveError> {
     let mut out = BTreeMap::new();
-    let mut raw_includes: Vec<(String, Vec<Include>, Option<&'static str>)> = Vec::new();
+    let mut raw_includes: Vec<(String, Vec<Include>)> = Vec::new();
+    // Each authored document is parsed once, however many resources link it.
+    let mut include_cache: BTreeMap<String, Vec<Include>> = BTreeMap::new();
+    let mut include_total = 0usize;
     let mut leaf_budget = 0usize;
     for (gid, owner) in resources {
         let r = &owner.doc;
@@ -843,7 +850,7 @@ fn finish(
                 .rejected(found),
                 Fault::Type { expected, found } => at(
                     Code::TypeMismatch,
-                    format!("expected a {expected}"),
+                    format!("expected type {expected}"),
                     "supply a value of the declared type; boolean and integer are different types",
                 )
                 .rejected(found),
@@ -947,13 +954,32 @@ fn finish(
         let (claims, dir_claims) = claims_of(spec, owner, gid, value)?;
         if let (Some(parse), Some((path, _))) = (spec.source_includes, srcs.get("/source")) {
             // The source is the authored native document; its include lines fix the order.
-            if let Ok(Located::File { bytes, .. }) = sources.locate(path, "")
-                && let Ok(text) = std::str::from_utf8(bytes)
-            {
-                let found = parse(text);
-                if !found.is_empty() {
-                    raw_includes.push((gid.clone(), found, spec.precedence));
+            let key = format!("{}\0{path}", spec.id);
+            if !include_cache.contains_key(&key) {
+                let parsed = match sources.locate(path, "") {
+                    Ok(Located::File { bytes, .. }) => {
+                        std::str::from_utf8(bytes).map(parse).unwrap_or_default()
+                    }
+                    _ => Vec::new(),
+                };
+                if parsed.len() > MAX_INCLUDES_PER_DOC {
+                    return Err(limit(
+                        &owner.file,
+                        "a native document has more than 1000 include directives",
+                    ));
                 }
+                include_cache.insert(key.clone(), parsed);
+            }
+            let found = &include_cache[&key];
+            include_total += found.len();
+            if include_total > MAX_INCLUDES_TOTAL {
+                return Err(limit(
+                    &owner.file,
+                    "the composition has more than 10000 include directives",
+                ));
+            }
+            if !found.is_empty() {
+                raw_includes.push((gid.clone(), found.clone()));
             }
         }
         out.insert(
@@ -985,14 +1011,14 @@ fn finish(
 /// declares the included file. Matching is by output path, without regard to case.
 fn include_groups(
     resolved: &BTreeMap<String, ResolvedResource>,
-    raw: Vec<(String, Vec<Include>, Option<&'static str>)>,
+    raw: Vec<(String, Vec<Include>)>,
 ) -> Vec<IncludeGroup> {
     let by_target: BTreeMap<String, &ResolvedResource> = resolved
         .values()
         .filter_map(|r| r.target.as_ref().map(|t| (t.to_lowercase(), r)))
         .collect();
     raw.into_iter()
-        .map(|(base, includes, _)| {
+        .map(|(base, includes)| {
             let entries: Vec<IncludeEntry> = includes
                 .into_iter()
                 .enumerate()
@@ -1011,14 +1037,8 @@ fn include_groups(
                     }
                 })
                 .collect();
-            // The ordering rule belongs to the adapters that write the included fragments.
-            let rule = entries
-                .iter()
-                .filter_map(|e| e.resource.as_ref())
-                .find_map(|id| resolved[id].precedence.clone());
             IncludeGroup {
                 base_target: resolved[&base].target.clone(),
-                rule,
                 entries,
                 base,
             }
@@ -1201,7 +1221,14 @@ fn check_claims(resolved: &BTreeMap<String, ResolvedResource>) -> Result<(), Res
             if let Some((other, other_claim)) =
                 owners.insert(fold(claim), (gid.as_str(), claim.as_str()))
             {
-                return Err(collision(r, gid, claim, other, other_claim));
+                return Err(collision(
+                    r,
+                    gid,
+                    claim,
+                    other,
+                    other_claim,
+                    "the same output path, compared without case",
+                ));
             }
         }
     }
@@ -1223,7 +1250,23 @@ fn check_claims(resolved: &BTreeMap<String, ResolvedResource>) -> Result<(), Res
                 &pair[1].2.dir,
                 pair[0].1,
                 &pair[0].2.dir,
+                "fragment directories may not be equal or nested",
             ));
+        }
+    }
+    // A fragment directory may not sit below a path that another resource claims as a file.
+    for (tokens, gid, d) in &dirs {
+        for end in 1..tokens.len() {
+            if let Some((other, other_claim)) = owners.get(&tokens[..end].join("/")) {
+                return Err(collision(
+                    &resolved[*gid],
+                    gid,
+                    &d.dir,
+                    other,
+                    other_claim,
+                    "a file cannot also be the parent of a fragment directory",
+                ));
+            }
         }
     }
     let dir_by_path: BTreeMap<String, (&str, &DirClaim)> = dirs
@@ -1243,13 +1286,34 @@ fn check_claims(resolved: &BTreeMap<String, ResolvedResource>) -> Result<(), Res
                         && rest.len() == 1
                         && glob(&d.pattern.to_lowercase(), rest[0]);
                     if !as_fragment {
-                        return Err(collision(r, gid, claim, owner, &d.dir));
+                        return Err(collision(
+                            r,
+                            gid,
+                            claim,
+                            owner,
+                            &d.dir,
+                            &if owner == gid.as_str() {
+                                "an assembled file cannot be placed in the directory it reads fragments from".to_string()
+                            } else {
+                                format!(
+                                    "that directory is read as fragments, so another resource may place only a file matching `{}` directly in it",
+                                    d.pattern
+                                )
+                            },
+                        ));
                     }
                 }
                 if end < parts.len() {
                     // Ancestors that are files, not directories.
                     if let Some((other, other_claim)) = owners.get(&prefix) {
-                        return Err(collision(r, gid, claim, other, other_claim));
+                        return Err(collision(
+                            r,
+                            gid,
+                            claim,
+                            other,
+                            other_claim,
+                            "a file cannot also be a directory",
+                        ));
                     }
                 }
             }
@@ -1264,11 +1328,12 @@ fn collision(
     claim: &str,
     other: &str,
     other_claim: &str,
+    why: &str,
 ) -> ResolveError {
     ResolveError::new(
         Code::TargetCollision,
         &r.declared_in,
-        format!("output `{claim}` collides with `{other_claim}` (compared without case, and a file cannot also be a directory)"),
+        format!("output `{claim}` collides with `{other_claim}`: {why}"),
         "give each resource its own output path",
     )
     .resource(gid)

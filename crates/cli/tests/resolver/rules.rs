@@ -1,5 +1,6 @@
 //! Authority, containment and error-content rules (DFM-15 C02, C03, C04, C09, C10, C11),
-//! each exercised on an isolated in-memory copy of the synthetic fixtures.
+//! each exercised on an isolated in-memory copy of the synthetic fixtures. Every refusal is
+//! checked for its code, declaring source, resource and a fragment of its message.
 
 use crate::harness::{edit, examples, synthetic, val};
 use dfm_cli::builtin_catalog;
@@ -11,6 +12,13 @@ const A: &str = "profiles/machine-a.toml";
 const B: &str = "profiles/machine-b.toml";
 const PRIVATE: &str = "private/private-mod/module.toml";
 const REUSABLE: &str = "shared/reusable/module.toml";
+const SHARED_BUNDLE: &str = "shared/bundle.toml";
+const PRIVATE_BUNDLE: &str = "private/bundle.toml";
+const SETTINGS: &str = "reusable.tool-settings";
+const TOKEN: &str = "private-mod.api-token";
+const PERSONAL: &str = "profiles/personal-dev-01.toml";
+const PERSONAL_MOD: &str = "base/modules/personal-dev/module.toml";
+const AGENTS_MOD: &str = "base/modules/agents/module.toml";
 
 fn run(set: &SourceSet, profile: &str) -> Result<Resolved, ResolveError> {
     resolve(set, profile, &builtin_catalog())
@@ -25,6 +33,24 @@ fn err(set: &SourceSet, profile: &str) -> ResolveError {
         Err(e) => e,
         Ok(_) => panic!("{profile} resolved but should have been refused"),
     }
+}
+
+/// Resolves, expects a refusal, and checks its code, declaring source, resource and a message
+/// fragment. Returns the error for any further checks.
+fn refused(
+    set: &SourceSet,
+    profile: &str,
+    code: Code,
+    source: &str,
+    resource: Option<&str>,
+    message: &str,
+) -> ResolveError {
+    let e = err(set, profile);
+    assert_eq!(e.code, code, "code: {e}");
+    assert_eq!(e.source, source, "declaring source: {e}");
+    assert_eq!(e.resource.as_deref(), resource, "resource: {e}");
+    assert!(e.message.contains(message), "{message:?} not in: {e}");
+    e
 }
 
 fn sha(bytes: &[u8]) -> String {
@@ -50,8 +76,15 @@ fn baseline_fixtures_resolve() {
 #[test]
 fn c02_the_core_is_mandatory_and_named_core() {
     let mut set = synthetic();
-    edit(&mut set, "shared/bundle.toml", "remove", "/core", None);
-    assert_eq!(err(&set, A).code, Code::ManifestInvalid);
+    edit(&mut set, SHARED_BUNDLE, "remove", "/core", None);
+    refused(
+        &set,
+        A,
+        Code::ManifestInvalid,
+        SHARED_BUNDLE,
+        None,
+        "needs `core` or `extends`",
+    );
 
     let mut set = synthetic();
     edit(
@@ -61,17 +94,31 @@ fn c02_the_core_is_mandatory_and_named_core() {
         "/id",
         Some("\"core-two\""),
     );
-    assert_eq!(err(&set, A).code, Code::ReferenceInvalid);
+    refused(
+        &set,
+        A,
+        Code::ReferenceInvalid,
+        SHARED_BUNDLE,
+        None,
+        "`core` must reference the core module",
+    );
 
     let mut set = synthetic();
     edit(
         &mut set,
-        "private/bundle.toml",
+        PRIVATE_BUNDLE,
         "add",
         "/modules/core",
         Some("\"private-mod/module.toml\""),
     );
-    assert_eq!(err(&set, B).code, Code::CoreReplacement);
+    refused(
+        &set,
+        B,
+        Code::CoreReplacement,
+        PRIVATE_BUNDLE,
+        None,
+        "cannot define a module named core",
+    );
 
     let mut set = synthetic();
     edit(
@@ -81,7 +128,14 @@ fn c02_the_core_is_mandatory_and_named_core() {
         "/requires",
         Some("[\"reusable\"]"),
     );
-    assert_eq!(err(&set, A).code, Code::ManifestInvalid);
+    refused(
+        &set,
+        A,
+        Code::ManifestInvalid,
+        "shared/core/module.toml",
+        None,
+        "core cannot depend on other modules",
+    );
 }
 
 #[test]
@@ -89,35 +143,56 @@ fn c02_bundle_ancestry_is_one_acyclic_chain_without_redefinition() {
     let mut set = synthetic();
     edit(
         &mut set,
-        "private/bundle.toml",
+        PRIVATE_BUNDLE,
         "add",
         "/modules/reusable",
         Some("\"private-mod/module.toml\""),
     );
-    let e = err(&set, B);
-    assert_eq!(e.code, Code::ModuleDuplicate);
-    assert_eq!(e.conflicts_with.as_deref(), Some("shared/bundle.toml"));
+    let e = refused(
+        &set,
+        B,
+        Code::ModuleDuplicate,
+        PRIVATE_BUNDLE,
+        None,
+        "already defined by an inherited bundle",
+    );
+    assert_eq!(e.conflicts_with.as_deref(), Some(SHARED_BUNDLE));
 
     let mut set = synthetic();
-    edit(&mut set, "shared/bundle.toml", "remove", "/core", None);
+    edit(&mut set, SHARED_BUNDLE, "remove", "/core", None);
     edit(
         &mut set,
-        "shared/bundle.toml",
+        SHARED_BUNDLE,
         "add",
         "/extends",
         Some("\"../private/bundle.toml\""),
     );
-    assert_eq!(err(&set, B).code, Code::BundleCycle);
+    refused(
+        &set,
+        B,
+        Code::BundleCycle,
+        SHARED_BUNDLE,
+        None,
+        "extend each other in a cycle",
+    );
 
     let mut set = synthetic();
     edit(
         &mut set,
-        "private/bundle.toml",
+        PRIVATE_BUNDLE,
         "replace",
         "/id",
         Some("\"synthetic-shared\""),
     );
-    assert_eq!(err(&set, B).code, Code::ManifestInvalid);
+    let e = refused(
+        &set,
+        B,
+        Code::ManifestInvalid,
+        SHARED_BUNDLE,
+        None,
+        "share an ID",
+    );
+    assert_eq!(e.conflicts_with.as_deref(), Some(PRIVATE_BUNDLE));
 }
 
 #[test]
@@ -125,21 +200,42 @@ fn c02_ids_are_unique_and_match_their_catalogue_key() {
     let mut set = synthetic();
     let dup = "{ id = \"tool-config\", kind = \"link\", adapter = \"fs-link/v1\", target = \"x\", value = { source = \"files/tool.conf\" } }";
     edit(&mut set, REUSABLE, "add", "/resources/-", Some(dup));
-    assert_eq!(err(&set, A).code, Code::ManifestInvalid);
+    refused(
+        &set,
+        A,
+        Code::ManifestInvalid,
+        REUSABLE,
+        Some("reusable.tool-config"),
+        "duplicate resource ID",
+    );
 
     let mut set = synthetic();
     edit(
         &mut set,
-        "shared/bundle.toml",
+        SHARED_BUNDLE,
         "replace",
         "/modules/reusable",
         Some("\"core/module.toml\""),
     );
-    assert_eq!(err(&set, A).code, Code::ReferenceInvalid);
+    refused(
+        &set,
+        A,
+        Code::ReferenceInvalid,
+        SHARED_BUNDLE,
+        None,
+        "references a module with a different ID",
+    );
 
     let mut set = synthetic();
     edit(&mut set, REUSABLE, "replace", "/id", Some("\"Reusable\""));
-    assert_eq!(err(&set, A).code, Code::ManifestInvalid);
+    refused(
+        &set,
+        A,
+        Code::ManifestInvalid,
+        REUSABLE,
+        None,
+        "module id is invalid",
+    );
 }
 
 #[test]
@@ -158,14 +254,24 @@ fn c02_dependencies_close_over_requires_and_selection_has_no_duplicates() {
 
     let mut set = synthetic();
     edit(&mut set, B, "add", "/modules/-", Some("\"private-mod\""));
-    assert_eq!(err(&set, B).code, Code::ModuleDuplicate);
+    refused(
+        &set,
+        B,
+        Code::ModuleDuplicate,
+        B,
+        None,
+        "module `private-mod` is selected more than once",
+    );
 
     let mut set = synthetic();
     edit(&mut set, B, "add", "/modules/-", Some("\"core\""));
-    assert_eq!(
-        err(&set, B).code,
+    refused(
+        &set,
+        B,
         Code::ModuleDuplicate,
-        "core is always selected"
+        B,
+        None,
+        "module `core` is selected more than once; core is always selected",
     );
 
     let mut set = synthetic();
@@ -176,7 +282,14 @@ fn c02_dependencies_close_over_requires_and_selection_has_no_duplicates() {
         "/requires",
         Some("[\"reusable\", \"reusable\"]"),
     );
-    assert_eq!(err(&set, B).code, Code::ModuleDuplicate);
+    refused(
+        &set,
+        B,
+        Code::ModuleDuplicate,
+        PRIVATE,
+        None,
+        "`reusable` is required more than once",
+    );
 
     let mut set = synthetic();
     edit(
@@ -186,18 +299,40 @@ fn c02_dependencies_close_over_requires_and_selection_has_no_duplicates() {
         "/requires",
         Some("[\"ghost\"]"),
     );
-    assert_eq!(err(&set, B).code, Code::ModuleUnknown);
+    refused(
+        &set,
+        B,
+        Code::ModuleUnknown,
+        PRIVATE,
+        None,
+        "module `ghost` is not in the bundle catalogue",
+    );
 }
 
 #[test]
 fn c02_platforms_and_cycles_are_rejected() {
     let mut set = synthetic();
     edit(&mut set, B, "replace", "/platform", Some("\"linux\""));
-    assert_eq!(err(&set, B).code, Code::PlatformUnsupported);
+    let e = refused(
+        &set,
+        B,
+        Code::PlatformUnsupported,
+        PRIVATE,
+        None,
+        "does not support the profile platform",
+    );
+    assert_eq!(e.conflicts_with.as_deref(), Some(B));
 
     let mut set = synthetic();
     edit(&mut set, B, "replace", "/platform", Some("\"windows\""));
-    assert_eq!(err(&set, B).code, Code::ManifestInvalid);
+    refused(
+        &set,
+        B,
+        Code::ManifestInvalid,
+        B,
+        None,
+        "platform must be `macos` or `linux`",
+    );
 
     let mut set = synthetic();
     edit(
@@ -207,62 +342,125 @@ fn c02_platforms_and_cycles_are_rejected() {
         "/requires",
         Some("[\"private-mod\"]"),
     );
-    let e = err(&set, B);
-    assert_eq!(e.code, Code::DependencyCycle);
-    assert!(e.message.contains("private-mod") && e.message.contains("reusable"));
+    refused(
+        &set,
+        B,
+        Code::DependencyCycle,
+        PRIVATE,
+        None,
+        "cycle: private-mod, reusable",
+    );
 }
 
 #[test]
 fn c02_overrides_follow_exact_bounded_path_and_type_rules() {
-    let rows: &[(&str, &str, Code, Option<&str>)] = &[
+    let rows: &[(&str, &str, Code, Option<&str>, &str)] = &[
         (
             "/tool/retries/x",
             "1",
             Code::OverrideForbidden,
             Some("integer"),
+            "the path is protected",
         ),
         (
             "/tool",
             "{ retries = 1 }",
             Code::OverrideForbidden,
             Some("table"),
+            "the path is protected",
         ),
         (
             "/tool/missing",
             "1",
             Code::OverrideForbidden,
             Some("integer"),
+            "the path is protected",
         ),
         (
             "/tool/paths/0",
             "\"x\"",
             Code::OverrideForbidden,
             Some("string"),
+            "the path is protected",
         ),
-        ("/tool/retries", "\"5\"", Code::TypeMismatch, Some("string")),
-        ("/tool/retries", "true", Code::TypeMismatch, Some("boolean")),
-        ("/tool/retries", "1.5", Code::TypeMismatch, Some("float")),
-        ("/tool/verbose", "1", Code::TypeMismatch, Some("integer")),
-        ("/tool/paths", "\"a\"", Code::TypeMismatch, Some("string")),
-        ("", "1", Code::ReferenceInvalid, None),
-        ("tool/retries", "1", Code::ReferenceInvalid, None),
-        ("/tool/*", "1", Code::ReferenceInvalid, None),
-        ("/tool//retries", "1", Code::ReferenceInvalid, None),
+        (
+            "/tool/retries",
+            "\"5\"",
+            Code::TypeMismatch,
+            Some("string"),
+            "must be of type integer",
+        ),
+        (
+            "/tool/retries",
+            "true",
+            Code::TypeMismatch,
+            Some("boolean"),
+            "must be of type integer",
+        ),
+        (
+            "/tool/retries",
+            "1.5",
+            Code::TypeMismatch,
+            Some("float"),
+            "must be of type integer",
+        ),
+        (
+            "/tool/verbose",
+            "1",
+            Code::TypeMismatch,
+            Some("integer"),
+            "must be of type boolean",
+        ),
+        (
+            "/tool/paths",
+            "\"a\"",
+            Code::TypeMismatch,
+            Some("string"),
+            "must be of type array",
+        ),
+        (
+            "",
+            "1",
+            Code::ReferenceInvalid,
+            None,
+            "the root pointer is not allowed",
+        ),
+        (
+            "tool/retries",
+            "1",
+            Code::ReferenceInvalid,
+            None,
+            "a pointer starts with /",
+        ),
+        (
+            "/tool/*",
+            "1",
+            Code::ReferenceInvalid,
+            None,
+            "wildcards are not allowed",
+        ),
+        (
+            "/tool//retries",
+            "1",
+            Code::ReferenceInvalid,
+            None,
+            "empty path segments are not allowed",
+        ),
     ];
-    for (path, lit, code, category) in rows {
+    for (path, lit, code, category, message) in rows {
         let mut set = synthetic();
-        add_override(&mut set, A, "reusable.tool-settings", path, lit);
-        let e = err(&set, A);
-        assert_eq!(e.code, *code, "{path} {lit}: {e}");
+        add_override(&mut set, A, SETTINGS, path, lit);
+        let e = refused(&set, A, *code, A, Some(SETTINGS), message);
+        assert_eq!(e.field.as_deref(), Some(*path), "{path} {lit}");
         if let Some(c) = category {
             assert_eq!(e.rejected, Some(*c), "{path} {lit}");
         }
     }
     // A valid replacement works and changes only that value.
     let mut set = synthetic();
-    add_override(&mut set, A, "reusable.tool-settings", "/tool/retries", "9");
+    add_override(&mut set, A, SETTINGS, "/tool/retries", "9");
     let r = ok(&set, A);
-    let v = &r.resources["reusable.tool-settings"].value;
+    let v = &r.resources[SETTINGS].value;
     assert_eq!(v["tool"]["retries"], val("9"));
     assert_eq!(v["tool"]["timeout"], val("30"));
 }
@@ -270,31 +468,38 @@ fn c02_overrides_follow_exact_bounded_path_and_type_rules() {
 #[test]
 fn c02_arrays_are_atomic() {
     let mut set = synthetic();
-    add_override(
-        &mut set,
-        A,
-        "reusable.tool-settings",
-        "/tool/paths",
-        "[\"z\"]",
-    );
+    add_override(&mut set, A, SETTINGS, "/tool/paths", "[\"z\"]");
     let r = ok(&set, A);
-    assert_eq!(
-        r.resources["reusable.tool-settings"].value["tool"]["paths"],
-        val("[\"z\"]")
-    );
+    assert_eq!(r.resources[SETTINGS].value["tool"]["paths"], val("[\"z\"]"));
 }
 
 #[test]
 fn c02_overrides_name_resources_in_the_selected_composition_and_give_a_reason() {
-    for resource in ["private-mod.api-token", "ghost.thing", "nodot"] {
+    for resource in [TOKEN, "ghost.thing", "nodot"] {
         let mut set = synthetic();
         add_override(&mut set, A, resource, "/x", "1");
-        assert_eq!(err(&set, A).code, Code::ReferenceInvalid, "{resource}");
+        let e = refused(
+            &set,
+            A,
+            Code::ReferenceInvalid,
+            A,
+            Some(resource),
+            "is not in the selected composition",
+        );
+        assert_eq!(e.field.as_deref(), Some("resource"));
     }
     let mut set = synthetic();
     let o = "{ resource = \"core.editor-defaults\", path = \"/core/editor\", value = \"vi\", reason = \"  \" }";
     edit(&mut set, A, "add", "/overrides/-", Some(o));
-    assert_eq!(err(&set, A).code, Code::ManifestInvalid);
+    let e = refused(
+        &set,
+        A,
+        Code::ManifestInvalid,
+        A,
+        None,
+        "needs a nonempty reason",
+    );
+    assert_eq!(e.field.as_deref(), Some("/overrides/0/reason"));
 }
 
 #[test]
@@ -304,13 +509,43 @@ fn c02_contributions_need_an_exposed_map_a_namespaced_key_and_a_free_slot() {
             "{{ resource = \"reusable.agent-settings\", path = \"{path}\", key = \"{key}\", reason = \"t\", value = {{ event = \"E\", type = \"command\", argv = [\"x\"] }} }}"
         )
     };
-    for (key, path, code) in [
-        ("other.audit", "/handlers", Code::ExtensionNamespace),
-        ("private-mod.", "/handlers", Code::ExtensionNamespace),
-        ("private-mod.UPPER", "/handlers", Code::ExtensionNamespace),
-        ("audit", "/handlers", Code::ExtensionNamespace),
-        ("private-mod.x", "/managed", Code::OverrideForbidden),
-        ("private-mod.audit", "/handlers", Code::ExtensionConflict),
+    for (key, path, code, message) in [
+        (
+            "other.audit",
+            "/handlers",
+            Code::ExtensionNamespace,
+            "a contribution key must be `private-mod.`",
+        ),
+        (
+            "private-mod.",
+            "/handlers",
+            Code::ExtensionNamespace,
+            "a contribution key must be `private-mod.`",
+        ),
+        (
+            "private-mod.UPPER",
+            "/handlers",
+            Code::ExtensionNamespace,
+            "a contribution key must be `private-mod.`",
+        ),
+        (
+            "audit",
+            "/handlers",
+            Code::ExtensionNamespace,
+            "a contribution key must be `private-mod.`",
+        ),
+        (
+            "private-mod.x",
+            "/managed",
+            Code::OverrideForbidden,
+            "not an exposed extension map",
+        ),
+        (
+            "private-mod.audit",
+            "/handlers",
+            Code::ExtensionConflict,
+            "two contributors claim one key",
+        ),
     ] {
         let mut set = synthetic();
         edit(
@@ -320,8 +555,18 @@ fn c02_contributions_need_an_exposed_map_a_namespaced_key_and_a_free_slot() {
             "/contributions/-",
             Some(&contrib(key, path)),
         );
-        let e = err(&set, B);
-        assert_eq!(e.code, code, "{key} {path}: {e}");
+        let e = refused(
+            &set,
+            B,
+            code,
+            PRIVATE,
+            Some("reusable.agent-settings"),
+            message,
+        );
+        assert!(
+            e.field.as_deref().is_some_and(|f| f.starts_with(path)),
+            "{key} {path}: {e}"
+        );
     }
     // A key that the owner already declares cannot be replaced by a contribution.
     let mut set = synthetic();
@@ -332,8 +577,14 @@ fn c02_contributions_need_an_exposed_map_a_namespaced_key_and_a_free_slot() {
         "/resources/3/value/handlers/private-mod.audit",
         Some("{ event = \"E\", type = \"command\", argv = [\"x\"] }"),
     );
-    let e = err(&set, B);
-    assert_eq!(e.code, Code::ExtensionConflict);
+    let e = refused(
+        &set,
+        B,
+        Code::ExtensionConflict,
+        PRIVATE,
+        Some("reusable.agent-settings"),
+        "already exists in the owner's map",
+    );
     assert_eq!(e.conflicts_with.as_deref(), Some("reusable"));
 }
 
@@ -370,8 +621,18 @@ fn c02_ordering_never_grants_override_authority() {
     for value in ["\"emacs\"", "\"vim\""] {
         let mut set = synthetic();
         add_override(&mut set, B, "core.editor-defaults", "/core/editor", value);
-        let e = err(&set, B);
-        assert_eq!(e.code, Code::OverrideConflict);
+        let e = refused(
+            &set,
+            B,
+            Code::OverrideConflict,
+            PRIVATE,
+            Some("core.editor-defaults"),
+            "two overrides address the same resource and path",
+        );
+        assert_eq!(
+            e.conflicts_with.as_deref(),
+            Some("machine-b (profiles/machine-b.toml)")
+        );
         by_value.push(e);
     }
     assert_eq!(by_value[0], by_value[1]);
@@ -406,7 +667,15 @@ fn c02_a_dependency_confers_no_authority_over_its_parent() {
             "{ resource = \"reusable.tool-settings\", path = \"/tool\", value = { retries = 1 }, reason = \"t\" }",
         ),
     );
-    assert_eq!(err(&set, B).code, Code::OverrideForbidden);
+    let e = refused(
+        &set,
+        B,
+        Code::OverrideForbidden,
+        PRIVATE,
+        Some(SETTINGS),
+        "the path is protected",
+    );
+    assert_eq!(e.conflicts_with.as_deref(), Some("reusable"));
 }
 
 // C03: provenance survives replacement and disabling.
@@ -451,7 +720,7 @@ fn c03_contributions_and_profile_overrides_have_their_own_origin() {
     assert_eq!(h.change, Some(dfm_model::resolve::ChangeKind::Contribution));
     assert_eq!(h.changer.as_deref(), Some("private-mod"));
     assert_eq!(h.original, None);
-    let p = &r.resources["reusable.tool-settings"].provenance["/tool/retries"];
+    let p = &r.resources[SETTINGS].provenance["/tool/retries"];
     assert_eq!(p.changer.as_deref(), Some("machine-b"));
     assert_eq!(p.source_file, B);
     assert_eq!(p.original, Some(val("3")));
@@ -472,14 +741,14 @@ fn c03_disabling_an_optional_entry_keeps_reason_origin_and_drops_its_claim() {
         Some("The optional example skill is not selected for this machine.")
     );
     assert!(skills.claims.is_empty(), "{:?}", skills.claims);
-    let personal = ok(&set, "profiles/personal-dev-01.toml");
+    let personal = ok(&set, PERSONAL);
     assert_eq!(personal.resources["agents.skills"].claims.len(), 2);
 }
 
 #[test]
 fn c03_native_documents_are_marked_so_precedence_is_reported() {
     let r = ok(&synthetic(), A);
-    assert!(r.resources["reusable.tool-settings"].native_document);
+    assert!(r.resources[SETTINGS].native_document);
     assert!(r.resources["reusable.agent-settings"].native_document);
     assert!(!r.resources["reusable.tool-config"].native_document);
 }
@@ -488,33 +757,51 @@ fn c03_native_documents_are_marked_so_precedence_is_reported() {
 
 #[test]
 fn c04_unknown_keys_are_refused_everywhere() {
-    let rows: &[(&str, &str, &str, &str)] = &[
-        (A, "profile", "/bogus", A),
+    let rows: &[(&str, &str, &str, &str, Option<&str>)] = &[
+        (A, "profile", "/bogus", A, None),
+        (SHARED_BUNDLE, "bundle", "/bogus", SHARED_BUNDLE, None),
+        (REUSABLE, "module", "/bogus", REUSABLE, None),
+        (REUSABLE, "resource", "/resources/0/bogus", REUSABLE, None),
         (
-            "shared/bundle.toml",
-            "bundle",
-            "/bogus",
-            "shared/bundle.toml",
+            REUSABLE,
+            "policy",
+            "/resources/0/policy/bogus",
+            REUSABLE,
+            None,
         ),
-        (REUSABLE, "module", "/bogus", REUSABLE),
-        (REUSABLE, "resource", "/resources/0/bogus", REUSABLE),
-        (REUSABLE, "policy", "/resources/0/policy/bogus", REUSABLE),
         (
             REUSABLE,
             "adapter value",
             "/resources/0/value/bogus",
             REUSABLE,
+            Some("reusable.tool-config"),
         ),
-        (B, "override", "/overrides/0/bogus", B),
-        (PRIVATE, "contribution", "/contributions/0/bogus", PRIVATE),
+        (B, "override", "/overrides/0/bogus", B, None),
+        (
+            PRIVATE,
+            "contribution",
+            "/contributions/0/bogus",
+            PRIVATE,
+            None,
+        ),
     ];
-    for (file, what, path, source) in rows {
+    for (file, what, path, source, resource) in rows {
         let mut set = synthetic();
         edit(&mut set, file, "add", path, Some("\"v\""));
         let profile = if *file == A { A } else { B };
-        let e = err(&set, profile);
-        assert_eq!(e.code, Code::FieldUnknown, "{what}: {e}");
-        assert_eq!(e.source, *source, "{what}");
+        let message = if *what == "adapter value" {
+            "accepts known keys only"
+        } else {
+            "unknown key `bogus`"
+        };
+        let e = refused(
+            &set,
+            profile,
+            Code::FieldUnknown,
+            source,
+            *resource,
+            message,
+        );
         assert!(
             e.field.as_deref().is_some_and(|f| f.ends_with("/bogus")),
             "{what}: {e}"
@@ -528,21 +815,35 @@ fn c04_references_to_the_wrong_kind_of_document_are_refused() {
     let mut set = synthetic();
     edit(
         &mut set,
-        "shared/bundle.toml",
+        SHARED_BUNDLE,
         "replace",
         "/core",
         Some("\"bundle.toml\""),
     );
-    assert_eq!(err(&set, A).code, Code::ReferenceInvalid);
+    refused(
+        &set,
+        A,
+        Code::ReferenceInvalid,
+        SHARED_BUNDLE,
+        None,
+        "expected a module document, found a bundle document",
+    );
     let mut set = synthetic();
     edit(
         &mut set,
-        "private/bundle.toml",
+        PRIVATE_BUNDLE,
         "replace",
         "/extends",
         Some("\"../shared/reusable/module.toml\""),
     );
-    assert_eq!(err(&set, B).code, Code::ReferenceInvalid);
+    refused(
+        &set,
+        B,
+        Code::ReferenceInvalid,
+        REUSABLE,
+        None,
+        "expected a bundle document, found a module document",
+    );
     let mut set = synthetic();
     edit(
         &mut set,
@@ -551,30 +852,44 @@ fn c04_references_to_the_wrong_kind_of_document_are_refused() {
         "/bundle",
         Some("\"../shared/reusable/module.toml\""),
     );
-    assert_eq!(err(&set, A).code, Code::ReferenceInvalid);
+    refused(
+        &set,
+        A,
+        Code::ReferenceInvalid,
+        REUSABLE,
+        None,
+        "expected a bundle document, found a module document",
+    );
     let mut set = synthetic();
     edit(
         &mut set,
-        "shared/bundle.toml",
+        SHARED_BUNDLE,
         "replace",
         "/modules/reusable",
         Some("\"bundle.toml\""),
     );
-    assert_eq!(err(&set, A).code, Code::ReferenceInvalid);
+    refused(
+        &set,
+        A,
+        Code::ReferenceInvalid,
+        SHARED_BUNDLE,
+        None,
+        "expected a module document, found a bundle document",
+    );
 }
 
 #[test]
 fn c04_unsafe_targets_are_refused() {
-    for target in [
-        "/etc/x",
-        "../x",
-        "a/../b",
-        "a//b",
-        "a/./b",
-        "~/x",
-        "a\\u0000b",
-        "a\\nb",
-        "",
+    for (target, why) in [
+        ("/etc/x", "absolute path"),
+        ("../x", "dot component"),
+        ("a/../b", "dot component"),
+        ("a//b", "empty component"),
+        ("a/./b", "dot component"),
+        ("~/x", "tilde component"),
+        ("a\\u0000b", "control character"),
+        ("a\\nb", "control character"),
+        ("", "empty path"),
     ] {
         let mut set = synthetic();
         edit(
@@ -584,22 +899,33 @@ fn c04_unsafe_targets_are_refused() {
             "/resources/0/target",
             Some(&format!("\"{target}\"")),
         );
-        let e = err(&set, A);
-        assert_eq!(e.code, Code::TargetInvalid, "{target:?}: {e}");
-        assert_eq!(e.resource.as_deref(), Some("reusable.tool-config"));
+        let e = refused(
+            &set,
+            A,
+            Code::TargetInvalid,
+            REUSABLE,
+            Some("reusable.tool-config"),
+            &format!("unsafe output path: {why}"),
+        );
+        assert_eq!(e.field.as_deref(), Some("/target"), "{target:?}");
     }
     let mut set = examples();
     edit(
         &mut set,
-        "base/modules/agents/module.toml",
+        AGENTS_MOD,
         "replace",
         "/resources/2/value/target_roots/0",
         Some("\"../x\""),
     );
-    assert_eq!(
-        err(&set, "profiles/personal-dev-01.toml").code,
-        Code::TargetInvalid
+    let e = refused(
+        &set,
+        PERSONAL,
+        Code::TargetInvalid,
+        AGENTS_MOD,
+        Some("agents.skills"),
+        "unsafe output path: dot component",
     );
+    assert_eq!(e.field.as_deref(), Some("/target_roots/0"));
 }
 
 #[test]
@@ -608,26 +934,47 @@ fn c04_source_links_may_not_leave_their_root() {
     let cases = [
         (
             "../../../private/private-mod/files/banner",
-            Some(Code::SourceEscape),
+            Some((Code::SourceEscape, "leaves the trusted root")),
         ),
-        ("/etc/hosts", Some(Code::SourceEscape)),
-        ("../../../profiles/machine-a.toml", Some(Code::SourceEscape)),
-        ("nowhere", Some(Code::SourceMissing)),
-        ("tool.conf", Some(Code::SourceEscape)),
+        (
+            "/etc/hosts",
+            Some((Code::SourceEscape, "leaves the trusted root")),
+        ),
+        (
+            "../../../profiles/machine-a.toml",
+            Some((Code::SourceEscape, "leaves the trusted root")),
+        ),
+        (
+            "nowhere",
+            Some((
+                Code::SourceMissing,
+                "not in the materialized, trusted sources",
+            )),
+        ),
+        ("tool.conf", Some((Code::SourceEscape, "form a loop"))),
         ("banner", None),
     ];
     for (target, want) in cases {
         let mut set = synthetic();
         set.insert_link(tool, target);
-        match (want, run(&set, A)) {
-            (Some(code), Err(e)) => assert_eq!(e.code, code, "{target}: {e}"),
-            (None, Ok(r)) => assert_eq!(
-                r.resources["reusable.tool-config"].provenance["/source"]
+        match want {
+            Some((code, message)) => {
+                let e = refused(
+                    &set,
+                    A,
+                    code,
+                    REUSABLE,
+                    Some("reusable.tool-config"),
+                    message,
+                );
+                assert_eq!(e.field.as_deref(), Some("/source"), "{target}");
+            }
+            None => assert_eq!(
+                ok(&set, A).resources["reusable.tool-config"].provenance["/source"]
                     .source_path
                     .as_deref(),
                 Some("shared/reusable/files/banner")
             ),
-            (w, g) => panic!("{target}: wanted {w:?}, got {g:?}"),
         }
     }
     // A link inside a directory source is checked too.
@@ -636,21 +983,46 @@ fn c04_source_links_may_not_leave_their_root() {
         "base/modules/agents/files/sample-audit/escape",
         "../../../core/files/gitconfig",
     );
-    let e = err(&set, "profiles/personal-dev-01.toml");
-    assert_eq!(e.code, Code::SourceEscape);
-    assert_eq!(e.resource.as_deref(), Some("agents.skills"));
+    let e = refused(
+        &set,
+        PERSONAL,
+        Code::SourceEscape,
+        AGENTS_MOD,
+        Some("agents.skills"),
+        "leaves the trusted root",
+    );
+    assert_eq!(e.field.as_deref(), Some("/entries/sample-audit/source"));
 }
 
 #[test]
 fn c04_unsupported_adapters_are_refused() {
-    for (path, lit) in [
-        ("/resources/0/adapter", "\"fs-link/v2\""),
-        ("/resources/0/adapter", "\"nope/v1\""),
-        ("/resources/0/kind", "\"render\""),
+    for (path, lit, message) in [
+        (
+            "/resources/0/adapter",
+            "\"fs-link/v2\"",
+            "adapter `fs-link/v2` is not built into this manager",
+        ),
+        (
+            "/resources/0/adapter",
+            "\"nope/v1\"",
+            "adapter `nope/v1` is not built into this manager",
+        ),
+        (
+            "/resources/0/kind",
+            "\"render\"",
+            "adapter `fs-link/v1` does not implement kind `render`",
+        ),
     ] {
         let mut set = synthetic();
         edit(&mut set, REUSABLE, "replace", path, Some(lit));
-        assert_eq!(err(&set, A).code, Code::AdapterUnknown, "{path} {lit}");
+        refused(
+            &set,
+            A,
+            Code::AdapterUnknown,
+            REUSABLE,
+            Some("reusable.tool-config"),
+            message,
+        );
     }
 }
 
@@ -664,9 +1036,18 @@ fn c04_boolean_and_integer_are_distinct_in_adapter_values() {
         "/resources/0/value/mode",
         Some("true"),
     );
-    let e = err(&set, B);
-    assert_eq!(e.code, Code::TypeMismatch);
-    assert_eq!(e.rejected, Some("boolean"));
+    let e = refused(
+        &set,
+        B,
+        Code::TypeMismatch,
+        PRIVATE,
+        Some(TOKEN),
+        "expected type integer",
+    );
+    assert_eq!(
+        (e.rejected, e.field.as_deref()),
+        (Some("boolean"), Some("/mode"))
+    );
 }
 
 #[test]
@@ -687,7 +1068,14 @@ fn c04_profile_sources_stay_inside_the_profile_directory() {
         "/source",
         "\"../private/private-mod/files/banner\"",
     );
-    assert_eq!(err(&set, A).code, Code::SourceEscape);
+    refused(
+        &set,
+        A,
+        Code::SourceEscape,
+        A,
+        Some("reusable.tool-banner"),
+        "leaves the trusted root",
+    );
     let mut set = synthetic();
     set.insert_file("profiles/files/banner", "profile banner\n");
     add_override(
@@ -716,15 +1104,28 @@ fn c09_invariants_cannot_be_overridden() {
             "{ resource = \"core.launcher\", path = \"/source\", value = \"files/x\", reason = \"t\" }",
         ),
     );
-    let e = err(&set, B);
-    assert_eq!(e.code, Code::OverrideForbidden);
-    assert_eq!(e.resource.as_deref(), Some("core.launcher"));
+    let e = refused(
+        &set,
+        B,
+        Code::OverrideForbidden,
+        PRIVATE,
+        Some("core.launcher"),
+        "the path is protected",
+    );
     assert_eq!(e.conflicts_with.as_deref(), Some("core"));
     // Identity fields are not part of `value`, so no pointer can reach them.
     for path in ["/target", "/adapter", "/kind", "/id", "/policy/defaults"] {
         let mut set = synthetic();
         add_override(&mut set, A, "core.editor-defaults", path, "\"x\"");
-        assert_eq!(err(&set, A).code, Code::OverrideForbidden, "{path}");
+        let e = refused(
+            &set,
+            A,
+            Code::OverrideForbidden,
+            A,
+            Some("core.editor-defaults"),
+            "the path is protected",
+        );
+        assert_eq!(e.field.as_deref(), Some(path));
     }
 }
 
@@ -739,59 +1140,81 @@ fn c09_competing_owners_are_refused() {
         "/core/editor",
         "\"vim\"",
     );
-    let e = err(&set, B);
-    assert_eq!(e.code, Code::OverrideConflict);
-    // The error names the declaring source of the later change and the other owner.
-    assert_eq!(e.source, PRIVATE);
+    let e = refused(
+        &set,
+        B,
+        Code::OverrideConflict,
+        PRIVATE,
+        Some("core.editor-defaults"),
+        "two overrides address the same resource and path",
+    );
     assert_eq!(
         e.conflicts_with.as_deref(),
         Some("machine-b (profiles/machine-b.toml)")
     );
-    // Outputs: case-insensitive equal, and file against directory.
-    for target in [
-        ".config/synthetic/TOOL.conf",
-        ".config/synthetic/tool.conf/child",
-        ".config",
+    // Outputs: case-insensitive equal, file against directory, and a file above a claimed file.
+    for (target, source, resource, other, why) in [
+        (
+            ".config/synthetic/TOOL.conf",
+            REUSABLE,
+            "reusable.tool-config",
+            "private-mod.extra",
+            "the same output path, compared without case",
+        ),
+        (
+            ".config/synthetic/tool.conf/child",
+            PRIVATE,
+            "private-mod.extra",
+            "reusable.tool-config",
+            "a file cannot also be a directory",
+        ),
+        (
+            ".config",
+            "shared/core/module.toml",
+            "core.editor-defaults",
+            "private-mod.extra",
+            "a file cannot also be a directory",
+        ),
     ] {
         let mut set = synthetic();
         let r = format!(
             "{{ id = \"extra\", kind = \"link\", adapter = \"fs-link/v1\", target = \"{target}\", value = {{ source = \"files/banner\" }} }}"
         );
         edit(&mut set, PRIVATE, "add", "/resources/-", Some(&r));
-        let e = err(&set, B);
-        assert_eq!(e.code, Code::TargetCollision, "{target}: {e}");
-        assert!(e.conflicts_with.is_some());
+        let e = refused(&set, B, Code::TargetCollision, source, Some(resource), why);
+        assert_eq!(e.conflicts_with.as_deref(), Some(other), "{target}");
     }
     // A distribution leaf against a link.
     let mut set = examples();
     let r = "{ id = \"clash\", kind = \"link\", adapter = \"fs-link/v1\", target = \".claude/skills/sample-audit\", value = { source = \"files/personal.env.tpl\" } }";
-    edit(
-        &mut set,
-        "base/modules/personal-dev/module.toml",
-        "add",
-        "/resources/-",
-        Some(r),
+    edit(&mut set, PERSONAL_MOD, "add", "/resources/-", Some(r));
+    let e = refused(
+        &set,
+        PERSONAL,
+        Code::TargetCollision,
+        PERSONAL_MOD,
+        Some("personal-dev.clash"),
+        "the same output path",
     );
-    let e = err(&set, "profiles/personal-dev-01.toml");
-    assert_eq!(e.code, Code::TargetCollision);
-    assert!(
-        e.conflicts_with
-            .as_deref()
-            .is_some_and(|o| o == "agents.skills" || o == "personal-dev.clash")
-    );
+    assert_eq!(e.conflicts_with.as_deref(), Some("agents.skills"));
     // Two skill entries that differ only by case.
     let mut set = examples();
     edit(
         &mut set,
-        "base/modules/agents/module.toml",
+        AGENTS_MOD,
         "add",
         "/resources/2/value/entries/Sample-Audit",
         Some("{ source = \"files/sample-audit\", enabled = true }"),
     );
-    assert_eq!(
-        err(&set, "profiles/personal-dev-01.toml").code,
-        Code::TargetCollision
+    let e = refused(
+        &set,
+        PERSONAL,
+        Code::TargetCollision,
+        AGENTS_MOD,
+        Some("agents.skills"),
+        "the same output path, compared without case",
     );
+    assert_eq!(e.conflicts_with.as_deref(), Some("agents.skills"));
 }
 
 // C10 and C11: what an error says.
@@ -800,10 +1223,14 @@ fn c09_competing_owners_are_refused() {
 fn c10_a_forbidden_override_names_source_resource_field_category_owner_and_fix() {
     let mut set = synthetic();
     add_override(&mut set, B, "core.launcher", "/source", "\"files/x\"");
-    let e = err(&set, B);
-    assert_eq!(e.code, Code::OverrideForbidden);
-    assert_eq!(e.source, B);
-    assert_eq!(e.resource.as_deref(), Some("core.launcher"));
+    let e = refused(
+        &set,
+        B,
+        Code::OverrideForbidden,
+        B,
+        Some("core.launcher"),
+        "the path is protected",
+    );
     assert_eq!(e.field.as_deref(), Some("/source"));
     assert_eq!(e.rejected, Some("string"));
     assert_eq!(e.conflicts_with.as_deref(), Some("core"));
@@ -828,13 +1255,7 @@ fn c10_a_forbidden_override_names_source_resource_field_category_owner_and_fix()
 #[test]
 fn c10_secret_bearing_values_never_appear_in_errors() {
     const PLANTED: &str = "PLANTED-SECRET-VALUE-9f3a";
-    let token = "private-mod.api-token";
-    // Protected path, wrong type, unknown key and a bad target all carry the planted value.
-    let attempts: Vec<(&str, &str, String)> = vec![
-        ("override", "/account", format!("\"{PLANTED}\"")),
-        ("override", "/mode", format!("\"{PLANTED}\"")),
-    ];
-    for (_, path, lit) in attempts {
+    for path in ["/account", "/mode"] {
         let mut set = synthetic();
         edit(
             &mut set,
@@ -842,10 +1263,17 @@ fn c10_secret_bearing_values_never_appear_in_errors() {
             "add",
             "/overrides/-",
             Some(&format!(
-                "{{ resource = \"{token}\", path = \"{path}\", value = {lit}, reason = \"t\" }}"
+                "{{ resource = \"{TOKEN}\", path = \"{path}\", value = \"{PLANTED}\", reason = \"t\" }}"
             )),
         );
-        let e = err(&set, B);
+        let e = refused(
+            &set,
+            B,
+            Code::OverrideForbidden,
+            PRIVATE,
+            Some(TOKEN),
+            "the path is protected",
+        );
         let shown = format!("{e} {e:?} {}", dfm_model::Refusal::from(e.clone()));
         assert!(!shown.contains(PLANTED), "{shown}");
     }
@@ -864,8 +1292,14 @@ fn c10_secret_bearing_values_never_appear_in_errors() {
         "/resources/0/value/extra",
         Some(&format!("\"{PLANTED}\"")),
     );
-    let e = err(&set, B);
-    assert_eq!(e.code, Code::FieldUnknown);
+    let e = refused(
+        &set,
+        B,
+        Code::FieldUnknown,
+        PRIVATE,
+        Some(TOKEN),
+        "accepts known keys only",
+    );
     assert!(!format!("{e} {e:?}").contains(PLANTED));
     let mut set = synthetic();
     edit(
@@ -875,12 +1309,18 @@ fn c10_secret_bearing_values_never_appear_in_errors() {
         "/resources/0/target",
         Some(&format!("\"../{PLANTED}\"")),
     );
-    let e = err(&set, B);
-    assert_eq!(e.code, Code::TargetInvalid);
+    let e = refused(
+        &set,
+        B,
+        Code::TargetInvalid,
+        PRIVATE,
+        Some(TOKEN),
+        "unsafe output path: dot component",
+    );
     assert!(!format!("{e} {e:?}").contains(PLANTED));
     // Secret resources carry no content identity: not even a hash of the template.
     let r = ok(&synthetic(), B);
-    let t = &r.resources[token];
+    let t = &r.resources[TOKEN];
     assert!(t.secret_values);
     assert!(t.provenance.values().all(|p| p.content_id.is_none()));
 }
@@ -895,11 +1335,15 @@ fn c11_one_unknown_field() {
         "/resources/1/value/colour",
         Some("\"blue\""),
     );
-    let e = err(&set, A);
-    assert_eq!(e.code, Code::FieldUnknown);
+    let e = refused(
+        &set,
+        A,
+        Code::FieldUnknown,
+        REUSABLE,
+        Some("reusable.tool-banner"),
+        "unknown key; adapter `fs-link/v1` accepts known keys only",
+    );
     assert_eq!(e.code.as_str(), "E_FIELD_UNKNOWN");
-    assert_eq!(e.source, REUSABLE);
-    assert_eq!(e.resource.as_deref(), Some("reusable.tool-banner"));
     assert_eq!(e.field.as_deref(), Some("/colour"));
     assert_eq!(e.rejected, Some("string"));
     assert!(!e.action.is_empty());
@@ -915,9 +1359,15 @@ fn c11_one_conflicting_override() {
         "/core/editor",
         "\"emacs\"",
     );
-    let e = err(&set, B);
+    let e = refused(
+        &set,
+        B,
+        Code::OverrideConflict,
+        PRIVATE,
+        Some("core.editor-defaults"),
+        "two overrides address the same resource and path",
+    );
     assert_eq!(e.code.as_str(), "E_OVERRIDE_CONFLICT");
-    assert_eq!(e.resource.as_deref(), Some("core.editor-defaults"));
     assert_eq!(e.field.as_deref(), Some("/core/editor"));
     assert_eq!(e.rejected, Some("string"));
     assert!(e.conflicts_with.is_some());
@@ -931,9 +1381,6 @@ fn hashing_helper_matches_the_digest_module() {
 
 // Fragment directories are claimed as prefixes.
 
-const PERSONAL: &str = "profiles/personal-dev-01.toml";
-const PERSONAL_MOD: &str = "base/modules/personal-dev/module.toml";
-
 fn link_at(set: &mut SourceSet, id: &str, target: &str) {
     let r = format!(
         "{{ id = \"{id}\", kind = \"link\", adapter = \"fs-link/v1\", target = \"{target}\", value = {{ source = \"files/personal.env.tpl\" }} }}"
@@ -941,11 +1388,16 @@ fn link_at(set: &mut SourceSet, id: &str, target: &str) {
     edit(set, PERSONAL_MOD, "add", "/resources/-", Some(&r));
 }
 
+fn assemble(id: &str, target: &str, dir: &str) -> String {
+    format!(
+        "{{ id = \"{id}\", kind = \"assemble\", adapter = \"text-fragments/v1\", target = \"{target}\", value = {{ body = \"files/personal.env.tpl\", fragments_dir = \"{dir}\", pattern = \"*.md\", separator = \"\\n\" }} }}"
+    )
+}
+
 #[test]
 fn m1_a_fragment_directory_accepts_only_matching_files_from_other_resources() {
     // work-01 places `40-work.md` in the assembler's directory, which is how a module supplies a fragment.
     ok(&examples(), "profiles/work-01.toml");
-    let fragment_dir = ".codex/AGENTS.d";
     for (target, why) in [
         (".codex/AGENTS.d/notes.txt", "name does not match *.md"),
         (".codex/AGENTS.d/sub/x.md", "not a direct child"),
@@ -955,14 +1407,18 @@ fn m1_a_fragment_directory_accepts_only_matching_files_from_other_resources() {
     ] {
         let mut set = examples();
         link_at(&mut set, "extra", target);
-        let e = err(&set, PERSONAL);
-        assert_eq!(e.code, Code::TargetCollision, "{target}: {why}: {e}");
+        let e = refused(
+            &set,
+            PERSONAL,
+            Code::TargetCollision,
+            PERSONAL_MOD,
+            Some("personal-dev.extra"),
+            "may place only a file matching `*.md` directly in it",
+        );
         assert_eq!(
-            e.conflicts_with
-                .as_deref()
-                .map(|o| o == fragment_dir || o == "agents.codex-instructions"),
-            Some(true),
-            "{target}"
+            e.conflicts_with.as_deref(),
+            Some("agents.codex-instructions"),
+            "{target}: {why}"
         );
     }
     // A matching direct child is a fragment, not a collision.
@@ -973,16 +1429,32 @@ fn m1_a_fragment_directory_accepts_only_matching_files_from_other_resources() {
 
 #[test]
 fn m1_fragment_directories_may_not_alias_or_nest() {
-    let assemble = |id: &str, target: &str, dir: &str| {
-        format!(
-            "{{ id = \"{id}\", kind = \"assemble\", adapter = \"text-fragments/v1\", target = \"{target}\", value = {{ body = \"files/personal.env.tpl\", fragments_dir = \"{dir}\", pattern = \"*.md\", separator = \"\\n\" }} }}"
-        )
-    };
-    for dir in [
-        ".codex/AGENTS.d",
-        ".Codex/agents.D",
-        ".codex/AGENTS.d/inner",
-        ".codex",
+    // (dir, resource reported, source, other). The reported side is the later one in sorted order.
+    for (dir, resource, source, other) in [
+        (
+            ".codex/AGENTS.d",
+            "personal-dev.twin",
+            PERSONAL_MOD,
+            "agents.codex-instructions",
+        ),
+        (
+            ".Codex/agents.D",
+            "personal-dev.twin",
+            PERSONAL_MOD,
+            "agents.codex-instructions",
+        ),
+        (
+            ".codex/AGENTS.d/inner",
+            "personal-dev.twin",
+            PERSONAL_MOD,
+            "agents.codex-instructions",
+        ),
+        (
+            ".codex",
+            "agents.codex-instructions",
+            AGENTS_MOD,
+            "personal-dev.twin",
+        ),
     ] {
         let mut set = examples();
         edit(
@@ -992,8 +1464,15 @@ fn m1_fragment_directories_may_not_alias_or_nest() {
             "/resources/-",
             Some(&assemble("twin", ".codex/OTHER.md", dir)),
         );
-        let e = err(&set, PERSONAL);
-        assert_eq!(e.code, Code::TargetCollision, "{dir}: {e}");
+        let e = refused(
+            &set,
+            PERSONAL,
+            Code::TargetCollision,
+            source,
+            Some(resource),
+            "fragment directories may not be equal or nested",
+        );
+        assert_eq!(e.conflicts_with.as_deref(), Some(other), "{dir}");
     }
     // The assembled file may not sit inside its own fragment directory.
     let mut set = examples();
@@ -1004,7 +1483,15 @@ fn m1_fragment_directories_may_not_alias_or_nest() {
         "/resources/-",
         Some(&assemble("self", ".config/fr/self.md", ".config/fr")),
     );
-    assert_eq!(err(&set, PERSONAL).code, Code::TargetCollision);
+    let e = refused(
+        &set,
+        PERSONAL,
+        Code::TargetCollision,
+        PERSONAL_MOD,
+        Some("personal-dev.self"),
+        "an assembled file cannot be placed in the directory it reads fragments from",
+    );
+    assert_eq!(e.conflicts_with.as_deref(), Some("personal-dev.self"));
     // A distinct directory is fine, and the pattern may not escape one component.
     let mut set = examples();
     edit(
@@ -1019,8 +1506,57 @@ fn m1_fragment_directories_may_not_alias_or_nest() {
         let mut set = examples();
         let r = assemble("badpat", ".config/p.md", ".config/p.d").replace("*.md", bad);
         edit(&mut set, PERSONAL_MOD, "add", "/resources/-", Some(&r));
-        assert_eq!(err(&set, PERSONAL).code, Code::ManifestInvalid, "{bad:?}");
+        let e = refused(
+            &set,
+            PERSONAL,
+            Code::ManifestInvalid,
+            PERSONAL_MOD,
+            Some("personal-dev.badpat"),
+            "the fragment pattern may use only `*` and `?`",
+        );
+        assert_eq!(e.field.as_deref(), Some("/pattern"), "{bad:?}");
     }
+}
+
+#[test]
+fn m1_a_file_above_a_fragment_directory_is_refused() {
+    // Resource X claims `.codex` as a file; the assembler reads `.codex/AGENTS.d`.
+    for (target, why) in [(".codex", "the grandparent"), (".CODEX", "a case alias")] {
+        let mut set = examples();
+        link_at(&mut set, "above", target);
+        let e = refused(
+            &set,
+            PERSONAL,
+            Code::TargetCollision,
+            AGENTS_MOD,
+            Some("agents.codex-instructions"),
+            "a file cannot also be the parent of a fragment directory",
+        );
+        assert_eq!(
+            e.conflicts_with.as_deref(),
+            Some("personal-dev.above"),
+            "{why}"
+        );
+    }
+    // The same goes for a file that is the direct parent of a nested directory.
+    let mut set = examples();
+    edit(
+        &mut set,
+        PERSONAL_MOD,
+        "add",
+        "/resources/-",
+        Some(&assemble("deep", ".config/deep.md", ".config/a/b/c")),
+    );
+    link_at(&mut set, "mid", ".config/a/b");
+    let e = refused(
+        &set,
+        PERSONAL,
+        Code::TargetCollision,
+        PERSONAL_MOD,
+        Some("personal-dev.deep"),
+        "a file cannot also be the parent of a fragment directory",
+    );
+    assert_eq!(e.conflicts_with.as_deref(), Some("personal-dev.mid"));
 }
 
 // Native precedence is per value, from the authored include order.
@@ -1032,10 +1568,12 @@ fn m2_includes_follow_the_order_written_in_the_authored_document() {
     let g = &r.includes[0];
     assert_eq!(g.base, "core.git");
     assert_eq!(g.base_target.as_deref(), Some(".config/git/config"));
+    // The ordering rule belongs to the fragment's adapter, in one place.
     assert_eq!(
-        g.rule.as_deref(),
+        r.resources["core.git-defaults"].precedence.as_deref(),
         Some("later include entries override earlier ones for single-valued keys")
     );
+    assert_eq!(r.resources["core.git"].precedence, None);
     let rows: Vec<_> = g
         .entries
         .iter()
@@ -1138,7 +1676,7 @@ fn m2_include_order_comes_from_the_document_not_from_declaration_order() {
 // Looking up sources: `..` and case.
 
 #[test]
-fn l4_dotdot_needs_a_real_directory_and_case_aliases_do_not_hide_links() {
+fn l4_dotdot_needs_a_real_directory() {
     for rel in [
         "files/nonexistent/../tool.conf",
         "files/tool.conf/../banner",
@@ -1151,7 +1689,14 @@ fn l4_dotdot_needs_a_real_directory_and_case_aliases_do_not_hide_links() {
             "/resources/0/value/source",
             Some(&format!("\"{rel}\"")),
         );
-        assert_eq!(err(&set, A).code, Code::SourceMissing, "{rel}");
+        refused(
+            &set,
+            A,
+            Code::SourceMissing,
+            REUSABLE,
+            Some("reusable.tool-config"),
+            "not in the materialized, trusted sources",
+        );
     }
     // A real directory works.
     let mut set = synthetic();
@@ -1163,24 +1708,60 @@ fn l4_dotdot_needs_a_real_directory_and_case_aliases_do_not_hide_links() {
         Some("\"files/../files/tool.conf\""),
     );
     ok(&set, A);
-    // A link spelled `Link` is the same entry as `link` on a case-insensitive filesystem.
-    let mut set = synthetic();
-    set.insert_link(
-        "shared/reusable/files/Link",
-        "../../../private/private-mod/files/banner",
-    );
+}
+
+#[test]
+fn l4_a_case_alias_cannot_hide_a_link() {
+    // A link spelled `Link` is the same entry as `link` on a case-insensitive filesystem. Without
+    // the alias the name is simply missing, so SourceEscape proves the case-folded lookup ran.
+    let mut control = synthetic();
     edit(
-        &mut set,
+        &mut control,
         REUSABLE,
         "replace",
         "/resources/0/value/source",
         Some("\"files/link\""),
     );
-    assert_eq!(err(&set, A).code, Code::SourceEscape);
-    // Two spellings of one name cannot be told apart there.
+    refused(
+        &control,
+        A,
+        Code::SourceMissing,
+        REUSABLE,
+        Some("reusable.tool-config"),
+        "not in the materialized, trusted sources",
+    );
+    let mut set = control.clone();
+    set.insert_link(
+        "shared/reusable/files/Link",
+        "../../../private/private-mod/files/banner",
+    );
+    refused(
+        &set,
+        A,
+        Code::SourceEscape,
+        REUSABLE,
+        Some("reusable.tool-config"),
+        "the path or a symlink in it leaves the trusted root",
+    );
+    // A link that stays inside the root is followed through the alias to its target.
+    let mut inside = control.clone();
+    inside.insert_link("shared/reusable/files/Link", "banner");
+    let p = &ok(&inside, A).resources["reusable.tool-config"].provenance["/source"];
+    assert_eq!(
+        p.source_path.as_deref(),
+        Some("shared/reusable/files/banner")
+    );
+    // Two spellings of one name cannot be told apart there. This is the CaseAlias branch.
     let mut set = synthetic();
     set.insert_file("shared/reusable/files/Tool.conf", "other");
-    assert_eq!(err(&set, A).code, Code::SourceEscape);
+    refused(
+        &set,
+        A,
+        Code::SourceEscape,
+        REUSABLE,
+        Some("reusable.tool-config"),
+        "two source entries differ only by case",
+    );
 }
 
 #[test]
@@ -1194,12 +1775,25 @@ fn l5_bidi_and_zero_width_characters_are_refused_in_targets_and_escaped_in_messa
             "/resources/0/target",
             Some(&format!("\"{target}\"")),
         );
-        let e = err(&set, A);
-        assert_eq!(e.code, Code::TargetInvalid, "{target}");
+        refused(
+            &set,
+            A,
+            Code::TargetInvalid,
+            REUSABLE,
+            Some("reusable.tool-config"),
+            "invisible or bidirectional-control character",
+        );
     }
     let mut set = synthetic();
     edit(&mut set, REUSABLE, "add", "/bogus\u{202e}x", Some("1"));
-    let e = err(&set, A);
+    let e = refused(
+        &set,
+        A,
+        Code::FieldUnknown,
+        REUSABLE,
+        None,
+        "unknown key `bogus",
+    );
     let shown = e.to_string();
     assert!(
         shown.contains("\\u{202e}") && !shown.contains('\u{202e}'),
@@ -1209,15 +1803,22 @@ fn l5_bidi_and_zero_width_characters_are_refused_in_targets_and_escaped_in_messa
 
 #[test]
 fn l6_secret_file_modes_are_bounded_and_private() {
-    for (lit, ok_) in [
-        ("384", true),
-        ("256", true),
-        ("0", true),
-        ("-1", false),
-        ("438", false),
-        ("416", false),
-        ("512", true),
-        ("4096", false),
+    // 0o600 and 0o400 are private. -1 and 0o1000 are out of range. 0o666, 0o640 are not private.
+    for (lit, want) in [
+        ("384", None),
+        ("256", None),
+        ("0", None),
+        ("-1", Some("a file mode is an integer from 0 to 0o777")),
+        ("512", Some("a file mode is an integer from 0 to 0o777")),
+        ("4096", Some("a file mode is an integer from 0 to 0o777")),
+        (
+            "438",
+            Some("a private file mode must clear group and other bits"),
+        ),
+        (
+            "416",
+            Some("a private file mode must clear group and other bits"),
+        ),
     ] {
         let mut set = synthetic();
         edit(
@@ -1227,14 +1828,25 @@ fn l6_secret_file_modes_are_bounded_and_private() {
             "/resources/0/value/mode",
             Some(lit),
         );
-        let got = run(&set, B);
-        // 512 is 0o1000: out of range. 416 is 0o640 and 438 is 0o666: group or other bits.
-        let want_ok = ok_ && lit != "512";
-        assert_eq!(got.is_ok(), want_ok, "{lit}: {got:?}");
-        if let Err(e) = got {
-            assert_eq!(e.code, Code::ManifestInvalid, "{lit}");
-            assert_eq!(e.rejected, Some("integer"));
-            assert_eq!(e.resource.as_deref(), Some("private-mod.api-token"));
+        match want {
+            None => {
+                ok(&set, B);
+            }
+            Some(message) => {
+                let e = refused(
+                    &set,
+                    B,
+                    Code::ManifestInvalid,
+                    PRIVATE,
+                    Some(TOKEN),
+                    message,
+                );
+                assert_eq!(
+                    (e.rejected, e.field.as_deref()),
+                    (Some("integer"), Some("/mode")),
+                    "{lit}"
+                );
+            }
         }
     }
 }

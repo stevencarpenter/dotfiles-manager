@@ -87,7 +87,6 @@ pub struct IncludeEntry {
 pub struct IncludeGroup {
     pub base: String,
     pub base_target: Option<String>,
-    pub rule: Option<String>,
     pub entries: Vec<IncludeEntry>,
 }
 

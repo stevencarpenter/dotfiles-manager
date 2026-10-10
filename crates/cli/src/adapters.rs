@@ -34,26 +34,38 @@ fn spec(
 }
 
 /// Include directives of a Git config, in file order: `[include]` and `[includeIf "<cond>"]`
-/// sections with a `path` key. Nothing else in the file matters for precedence.
+/// sections with a `path` key. Nothing else in the file matters for precedence. A key may follow
+/// the header on the same line (`[include] path = x`), which Git accepts. A section name that
+/// only starts with `includeif` (such as `includeiffy`) is not an include.
 fn git_includes(text: &str) -> Vec<Include> {
+    fn section(name: &str) -> Option<Option<String>> {
+        if name.eq_ignore_ascii_case("include") {
+            return Some(None);
+        }
+        let (head, rest) = (name.get(..9)?, name.get(9..)?);
+        if !head.eq_ignore_ascii_case("includeif") || !rest.starts_with(char::is_whitespace) {
+            return None;
+        }
+        let cond = rest.trim().strip_prefix('"')?.strip_suffix('"')?;
+        Some(Some(cond.to_string()))
+    }
     let mut current: Option<Option<String>> = None;
     let mut out = Vec::new();
     for line in text.lines().map(str::trim) {
         if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
             continue;
         }
-        if let Some(header) = line.strip_prefix('[').and_then(|l| l.split_once(']')) {
-            let name = header.0.trim();
-            current = if name.eq_ignore_ascii_case("include") {
-                Some(None)
-            } else if let (Some(head), Some(rest)) = (name.get(..9), name.get(9..))
-                && head.eq_ignore_ascii_case("includeif")
-            {
-                Some(Some(rest.trim().trim_matches('"').to_string()))
-            } else {
-                None
-            };
-        } else if let (Some(cond), Some((key, value))) = (&current, line.split_once('='))
+        let key_line = match line.strip_prefix('[').and_then(|l| l.split_once(']')) {
+            Some((name, tail)) => {
+                current = section(name.trim());
+                tail.trim()
+            }
+            None => line,
+        };
+        if key_line.is_empty() || key_line.starts_with('#') || key_line.starts_with(';') {
+            continue;
+        }
+        if let (Some(cond), Some((key, value))) = (&current, key_line.split_once('='))
             && key.trim().eq_ignore_ascii_case("path")
         {
             out.push(Include {
@@ -218,6 +230,32 @@ mod tests {
         let got = git_includes("[includeIf \"gitdir:~/\u{e9}/\"]\npath = ~/a\n");
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].condition.as_deref(), Some("gitdir:~/\u{e9}/"));
+    }
+
+    #[test]
+    fn only_real_include_sections_count() {
+        let got = |t: &str| {
+            git_includes(t)
+                .into_iter()
+                .map(|i| i.path)
+                .collect::<Vec<_>>()
+        };
+        // Lookalike section names are not includes.
+        assert!(got("[includeiffy]\npath = ~/a\n").is_empty());
+        assert!(got("[includeIfx \"c\"]\npath = ~/a\n").is_empty());
+        assert!(got("[includeIf]\npath = ~/a\n").is_empty());
+        assert!(got("[includeIf c]\npath = ~/a\n").is_empty());
+        assert!(got("[include \"x\"]\npath = ~/a\n").is_empty());
+        assert!(got("[includes]\npath = ~/a\n").is_empty());
+        // A key on the header line counts, in file order with the others.
+        assert_eq!(
+            got(
+                "[include] path = ~/one\n[includeIf \"g:~/\"] path = ~/two\n[include]\npath = ~/three\n[user] path = ~/no\n"
+            ),
+            ["~/one", "~/two", "~/three"]
+        );
+        // A comment after the header is not a key.
+        assert!(got("[include] # path = ~/a\n").is_empty());
     }
 
     #[test]

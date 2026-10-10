@@ -26,6 +26,8 @@ pub enum Code {
     OpInterrupted,
     Diagnosed,
     IoUnconfirmed,
+    /// The requested report cannot be produced because a source cannot be read.
+    ReportUnavailable,
     // Resolver codes. The `expected_error` values in examples/cases.toml and E_ADAPTER_UNKNOWN
     // (docs/architecture.md section 11) are fixed by the docs. The others are added by DFM-15
     // and listed in docs/resolver.md.
@@ -72,6 +74,7 @@ impl Code {
             Code::OpInterrupted => "E_OP_INTERRUPTED",
             Code::Diagnosed => "E_DIAGNOSED",
             Code::IoUnconfirmed => "E_IO_UNCONFIRMED",
+            Code::ReportUnavailable => "E_REPORT_UNAVAILABLE",
             Code::OverrideForbidden => "E_OVERRIDE_FORBIDDEN",
             Code::OverrideConflict => "E_OVERRIDE_CONFLICT",
             Code::CoreReplacement => "E_CORE_REPLACEMENT",
@@ -96,6 +99,8 @@ impl Code {
     pub const fn exit(self) -> Exit {
         match self {
             Code::Usage => Exit::Usage,
+            // docs/architecture.md section 10, exit 2: "inability to produce the requested report".
+            Code::ReportUnavailable => Exit::Usage,
             // A failure while writing, or findings from a read-only check, are not refusals.
             Code::IoFailed | Code::Diagnosed | Code::IoUnconfirmed => Exit::Failed,
             _ => Exit::Blocked,

@@ -7,12 +7,25 @@ use super::error::visible;
 use super::pointer;
 use super::{ChangeKind, IncludeEntry, IncludeGroup, Resolved, ResolvedResource};
 use crate::{Code, Refusal};
+use std::collections::BTreeMap;
 use std::fmt::Write;
 
 const REDACTED: &str = "[redacted]";
 const MAX_VALUE_CHARS: usize = 200;
 const MAX_OUTPUT_BYTES: usize = 1 << 20;
 const MAX_RESOURCES: usize = 100;
+const MAX_OVERLAP_LINES: usize = 20;
+
+/// Writes one line and refuses as soon as the report is over the size limit, so no list can
+/// grow past it between checks.
+macro_rules! put {
+    ($out:expr, $($arg:tt)*) => {{
+        let _ = writeln!($out, $($arg)*);
+        if $out.len() > MAX_OUTPUT_BYTES {
+            return Err(too_big());
+        }
+    }};
+}
 
 /// Escapes untrusted text and clips it to `MAX_VALUE_CHARS`.
 fn clip(s: &str) -> String {
@@ -53,25 +66,41 @@ fn entry_text(e: &IncludeEntry) -> String {
     }
 }
 
-fn native_header(r: &ResolvedResource, groups: &[IncludeGroup], out: &mut String) {
+fn too_big() -> Refusal {
+    Refusal::new(
+        Code::LimitExceeded,
+        "the explanation is too large; ask for one resource",
+    )
+}
+
+fn native_header(
+    r: &ResolvedResource,
+    groups: &[IncludeGroup],
+    out: &mut String,
+) -> Result<(), Refusal> {
     let rule = r
         .precedence
         .as_deref()
         .unwrap_or("the application decides which value wins");
-    let _ = writeln!(
+    put!(
         out,
         "  native precedence: this adapter writes into a native document. Rule: {}. The manager \
          does not validate the resulting native configuration, so it cannot enforce a protected \
-         setting there.",
+         setting there. Keys that the authored document sets itself are not modelled.",
         clip(rule)
     );
     for g in groups {
-        if let Some(me) = g
+        // A file can be included more than once. Each position is shown.
+        let mine: Vec<&IncludeEntry> = g
             .entries
             .iter()
-            .find(|e| e.resource.as_deref() == Some(&r.id))
-        {
-            let _ = writeln!(
+            .filter(|e| e.resource.as_deref() == Some(&r.id))
+            .collect();
+        if mine.is_empty() {
+            continue;
+        }
+        for me in mine {
+            put!(
                 out,
                 "  included by {} ({}) at position {} of {}{}",
                 clip(&g.base),
@@ -82,23 +111,23 @@ fn native_header(r: &ResolvedResource, groups: &[IncludeGroup], out: &mut String
                     .as_ref()
                     .map_or(String::new(), |c| format!(", only when {}", clip(c)))
             );
-            let _ = writeln!(out, "  sibling fragments in read order:");
-            for e in &g.entries {
-                let _ = writeln!(out, "    {}", entry_text(e));
-            }
+        }
+        put!(out, "  sibling fragments in read order:");
+        for e in &g.entries {
+            put!(out, "    {}", entry_text(e));
         }
     }
+    Ok(())
 }
 
-/// Other fragments in the same include group that also set `ptr`, with their position.
-fn also_set<'a>(
+/// For each value pointer of `r`, the other fragments in its include groups that also set it,
+/// as `(position, resource)`. Built from the other fragments' values once, not per value.
+fn overlaps<'a>(
     r: &ResolvedResource,
-    ptr: &str,
-    groups: &'a [IncludeGroup],
-    resolved: &Resolved,
-) -> Vec<(&'a IncludeEntry, String)> {
-    let mut out = Vec::new();
-    for g in groups {
+    resolved: &'a Resolved,
+) -> BTreeMap<&'a str, Vec<(usize, &'a str)>> {
+    let mut map: BTreeMap<&str, Vec<(usize, &str)>> = BTreeMap::new();
+    for g in &resolved.includes {
         if !g
             .entries
             .iter()
@@ -107,21 +136,19 @@ fn also_set<'a>(
             continue;
         }
         for e in &g.entries {
-            if let Some(other) = e.resource.as_deref().filter(|o| *o != r.id)
-                && resolved.resources[other].provenance.contains_key(ptr)
-            {
-                out.push((e, other.to_string()));
+            let Some(other) = e.resource.as_deref().filter(|o| *o != r.id) else {
+                continue;
+            };
+            for ptr in resolved.resources[other].provenance.keys() {
+                if r.provenance.contains_key(ptr) {
+                    map.entry(ptr.as_str())
+                        .or_default()
+                        .push((e.position, other));
+                }
             }
         }
     }
-    out
-}
-
-fn too_big() -> Refusal {
-    Refusal::new(
-        Code::LimitExceeded,
-        "the explanation is too large; ask for one resource",
-    )
+    map
 }
 
 fn describe(resolved: &Resolved, r: &ResolvedResource, out: &mut String) -> Result<(), Refusal> {
@@ -132,97 +159,105 @@ fn describe(resolved: &Resolved, r: &ResolvedResource, out: &mut String) -> Resu
             v.join(", ")
         }
     };
-    let _ = writeln!(out, "resource {}", clip(&r.id));
-    let _ = writeln!(
+    put!(out, "resource {}", clip(&r.id));
+    put!(
         out,
         "  declared by module {} in {}",
         clip(&r.module),
         clip(&r.declared_in)
     );
-    let _ = writeln!(
+    put!(
         out,
         "  kind {}, adapter {}",
         clip(&r.kind),
         clip(&r.adapter)
     );
     if let Some(t) = &r.target {
-        let _ = writeln!(out, "  target {}", clip(t));
+        put!(out, "  target {}", clip(t));
     }
     for c in r.claims.iter().filter(|c| Some(*c) != r.target.as_ref()) {
-        let _ = writeln!(out, "  claims {}", clip(c));
+        put!(out, "  claims {}", clip(c));
     }
     for d in &r.dir_claims {
-        let _ = writeln!(
+        put!(
             out,
             "  reads fragments {} from {}",
             clip(&d.pattern),
             clip(&d.dir)
         );
     }
-    let _ = writeln!(out, "  permitted overrides: {}", clip(&list(&r.defaults)));
-    let _ = writeln!(
+    put!(out, "  permitted overrides: {}", clip(&list(&r.defaults)));
+    put!(
         out,
         "  permitted extensions: {}",
         clip(&list(&r.extensions))
     );
     if let Some(g) = resolved.includes.iter().find(|g| g.base == r.id) {
-        let _ = writeln!(out, "  includes, in the order the application reads them:");
+        put!(out, "  includes, in the order the application reads them:");
         for e in &g.entries {
-            let _ = writeln!(out, "    {}", entry_text(e));
+            put!(out, "    {}", entry_text(e));
         }
     }
     if r.native_document {
-        native_header(r, &resolved.includes, out);
+        native_header(r, &resolved.includes, out)?;
     }
-    let _ = writeln!(
+    put!(
         out,
         "  runtime verification: not verified. The resolver reads declarations only and inspects no machine state."
     );
-    let _ = writeln!(out, "  values:");
+    put!(out, "  values:");
+    let shared = if r.native_document {
+        overlaps(r, resolved)
+    } else {
+        BTreeMap::new()
+    };
     for (ptr, p) in &r.provenance {
         let value = pointer::parse(ptr)
             .ok()
             .and_then(|t| pointer::get(&r.value, &t));
         let shown = value.map_or_else(|| "[unavailable]".to_string(), |v| show(r, v));
-        let _ = writeln!(out, "    {} = {}", clip(ptr), shown);
-        let _ = writeln!(out, "      owner {}", clip(&p.owner));
+        put!(out, "    {} = {}", clip(ptr), shown);
+        put!(out, "      owner {}", clip(&p.owner));
         match (p.change, &p.changer) {
             (Some(kind), Some(by)) => {
                 let how = match kind {
                     ChangeKind::Override => "override",
                     ChangeKind::Contribution => "contribution",
                 };
-                let _ = writeln!(out, "      changed by {} ({how})", clip(by));
+                put!(out, "      changed by {} ({how})", clip(by));
                 if let Some(reason) = &p.reason {
-                    let _ = writeln!(out, "      reason: {}", clip(reason));
+                    put!(out, "      reason: {}", clip(reason));
                 }
                 if let Some(o) = &p.original {
-                    let _ = writeln!(out, "      declared value: {}", show(r, o));
+                    put!(out, "      declared value: {}", show(r, o));
                 }
             }
             _ => {
-                let _ = writeln!(out, "      declared value, not changed");
+                put!(out, "      declared value, not changed");
             }
         }
-        let _ = writeln!(out, "      supplied by {}", clip(&p.source_file));
+        put!(out, "      supplied by {}", clip(&p.source_file));
         if let Some(path) = &p.source_path {
-            let _ = writeln!(out, "      source file {}", clip(path));
+            put!(out, "      source file {}", clip(path));
         }
         if let Some(id) = &p.content_id {
-            let _ = writeln!(out, "      content {id}");
+            put!(out, "      content {id}");
         }
-        if r.native_document {
-            for (e, other) in also_set(r, ptr, &resolved.includes, resolved) {
-                let _ = writeln!(
+        if let Some(others) = shared.get(ptr.as_str()) {
+            for (position, other) in others.iter().take(MAX_OVERLAP_LINES) {
+                put!(
                     out,
-                    "      also set by {} (include position {}); the final value depends on the application's include order",
-                    clip(&other),
-                    e.position
+                    "      also set by {} (include position {position}); the final value depends on the application's include order",
+                    clip(other)
                 );
             }
-        }
-        if out.len() > MAX_OUTPUT_BYTES {
-            return Err(too_big());
+            if others.len() > MAX_OVERLAP_LINES {
+                put!(
+                    out,
+                    "      and {} more fragments set it",
+                    others.len() - MAX_OVERLAP_LINES
+                );
+            }
         }
     }
     Ok(())
@@ -258,7 +293,7 @@ pub fn explain(resolved: &Resolved, query: &str) -> Result<String, Refusal> {
         return Err(too_big());
     }
     let mut out = String::new();
-    let _ = writeln!(
+    put!(
         out,
         "profile {} ({}/{}), modules: {}",
         clip(&resolved.profile),

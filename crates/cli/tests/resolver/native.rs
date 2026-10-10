@@ -120,3 +120,32 @@ fn a_document_with_an_includer_shows_it_and_one_without_invents_no_order() {
     );
     assert!(!agents.contains("included by"), "{agents}");
 }
+
+#[test]
+fn a_fragment_included_twice_shows_every_position() {
+    let mut set = synthetic();
+    let twice = "[include]\n    path = ~/.config/synthetic/editor.inc\n[includeIf \"gitdir:~/projects/\"]\n    path = ~/.config/synthetic/local.inc\n[includeIf \"gitdir:~/other/\"]\n    path = ~/.config/synthetic/editor.inc\n";
+    set.insert_file("shared/core/files/gitconfig", twice);
+    let out = text(&set, "profiles/machine-b.toml", "core.editor-defaults");
+    for line in [
+        "included by core.git (.config/synthetic/gitconfig) at position 1 of 3\n",
+        "included by core.git (.config/synthetic/gitconfig) at position 3 of 3, only when gitdir:~/other/",
+    ] {
+        assert!(out.contains(line), "missing {line:?} in:\n{out}");
+    }
+    // Both positions are siblings in the read-order list, and the overlap names the other fragment.
+    assert!(
+        out.contains("1. ~/.config/synthetic/editor.inc -> core.editor-defaults"),
+        "{out}"
+    );
+    assert!(
+        out.contains(
+            "3. ~/.config/synthetic/editor.inc only when gitdir:~/other/ -> core.editor-defaults"
+        ),
+        "{out}"
+    );
+    assert!(
+        out.contains("also set by private-mod.local-overrides (include position 2)"),
+        "{out}"
+    );
+}
