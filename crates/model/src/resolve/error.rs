@@ -15,12 +15,6 @@ impl std::ops::Deref for ResolveError {
     }
 }
 
-impl std::ops::DerefMut for ResolveError {
-    fn deref_mut(&mut self) -> &mut Detail {
-        &mut self.0
-    }
-}
-
 /// The fields of a [`ResolveError`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Detail {
@@ -74,17 +68,34 @@ impl ResolveError {
     }
 }
 
-/// Replaces control characters so untrusted text cannot rewrite a terminal.
+/// Characters that change how text is laid out or hide in it: zero-width characters, the byte
+/// order mark, and the bidirectional embedding, override and isolate controls.
+pub(crate) fn is_invisible(c: char) -> bool {
+    matches!(
+        c,
+        '\u{00ad}'
+            | '\u{200b}'..='\u{200f}'
+            | '\u{202a}'..='\u{202e}'
+            | '\u{2060}'..='\u{2064}'
+            | '\u{2066}'..='\u{206f}'
+            | '\u{feff}'
+    )
+}
+
+/// Replaces control and invisible characters with visible escapes so untrusted text cannot
+/// rewrite a terminal or disguise itself.
 pub(crate) fn visible(s: &str) -> String {
-    s.chars()
-        .flat_map(|c| {
-            if c.is_control() {
-                c.escape_default().collect::<Vec<_>>()
-            } else {
-                vec![c]
-            }
-        })
-        .collect()
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        if c.is_control() {
+            out.extend(c.escape_default());
+        } else if is_invisible(c) {
+            out.extend(c.escape_unicode());
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 impl fmt::Display for ResolveError {
@@ -129,5 +140,17 @@ pub(crate) fn category(v: &toml::Value) -> &'static str {
         toml::Value::Datetime(_) => "datetime",
         toml::Value::Array(_) => "array",
         toml::Value::Table(_) => "table",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn controls_and_invisible_characters_become_visible_escapes() {
+        let shown = visible("a\nb\u{202e}c\u{200b}d\u{feff}e\u{2066}f\u{7}");
+        assert_eq!(shown, "a\\nb\\u{202e}c\\u{200b}d\\u{feff}e\\u{2066}f\\u{7}");
+        assert_eq!(visible("plain ünï text"), "plain ünï text");
     }
 }

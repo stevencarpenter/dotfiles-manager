@@ -22,3 +22,12 @@ adapter = "fs-link/v1"
 target = ".local/bin/synthetic-launcher"
 [resources.value]
 source = "files/launcher"
+
+# An authored native document. Its include lines fix the order in which Git reads fragments.
+[[resources]]
+id = "git"
+kind = "link"
+adapter = "fs-link/v1"
+target = ".config/synthetic/gitconfig"
+[resources.value]
+source = "files/gitconfig"

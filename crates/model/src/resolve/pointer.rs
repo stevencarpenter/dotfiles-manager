@@ -106,11 +106,6 @@ pub(crate) fn get_mut<'a>(value: &'a mut Value, tokens: &[String]) -> Option<&'a
     Some(cur)
 }
 
-/// True if one pointer equals the other or is a path-prefix of it.
-pub(crate) fn overlaps(a: &str, b: &str) -> bool {
-    a == b || b.starts_with(&format!("{a}/")) || a.starts_with(&format!("{b}/"))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -130,12 +125,5 @@ mod tests {
         let v: Value = toml::from_str("a = [1, 2]\n[t]\nx = 1").unwrap();
         assert!(get(&v, &parse("/t/x").unwrap()).is_some());
         assert!(get(&v, &parse("/a/0").unwrap()).is_none());
-    }
-
-    #[test]
-    fn overlap_respects_segment_boundaries() {
-        assert!(overlaps("/a", "/a/b"));
-        assert!(overlaps("/a/b", "/a"));
-        assert!(!overlaps("/a", "/ab"));
     }
 }

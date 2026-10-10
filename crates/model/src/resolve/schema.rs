@@ -21,6 +21,11 @@ pub enum Schema {
     Array(Box<Schema>),
     /// A closed set of keys. Any other key is refused.
     Table(Vec<Field>),
+    /// A POSIX file mode: an integer in `0..=0o777`. With `private`, group and other bits must
+    /// be clear.
+    FileMode {
+        private: bool,
+    },
     /// Open keys with one value schema (a named collection).
     Map(Box<Schema>),
     /// A native application document. Types are preserved, keys are the application's.
@@ -46,6 +51,13 @@ pub enum Claims {
     None,
     /// The resource `target`.
     Target,
+    /// The resource `target`, plus a directory of fragment files read into it. The directory is
+    /// claimed as a prefix. Another resource may place a file there only if its name matches
+    /// the pattern, because that is how a selected module supplies a fragment.
+    TargetAndFragments {
+        dir: &'static str,
+        pattern: &'static str,
+    },
     /// One leaf per enabled entry under each root: `<root>/<entry name>`.
     Leaves {
         roots: &'static str,
@@ -65,6 +77,20 @@ pub struct AdapterSpec {
     pub native_document: bool,
     pub claims: Claims,
     pub value: Schema,
+    /// For adapters whose source file is a native document that includes other files (for
+    /// example a Git config): lists those includes in the order the application reads them.
+    pub source_includes: Option<fn(&str) -> Vec<Include>>,
+    /// How the application orders competing values in a native document, for `explain`.
+    pub precedence: Option<&'static str>,
+}
+
+/// One include directive found in an authored native document.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Include {
+    /// The path as written, for example `~/.config/x/base.inc`.
+    pub path: String,
+    /// The condition guarding it, for example `gitdir:~/work/`.
+    pub condition: Option<String>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -94,6 +120,7 @@ pub(crate) enum Fault {
         found: &'static str,
     },
     MissingKey,
+    OutOfRange(&'static str),
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -125,7 +152,7 @@ pub(crate) struct Found {
 fn expected_name(s: &Schema) -> &'static str {
     match s {
         Schema::Str | Schema::Source | Schema::HomePath => "string",
-        Schema::Int => "integer",
+        Schema::Int | Schema::FileMode { .. } => "integer",
         Schema::Bool => "boolean",
         Schema::Array(_) => "array",
         Schema::Table(_) | Schema::Map(_) | Schema::Native => "table",
@@ -150,6 +177,19 @@ pub(crate) fn validate(
         | (Schema::Int, Value::Integer(_))
         | (Schema::Bool, Value::Boolean(_))
         | (Schema::Native, _) => Ok(()),
+        (Schema::FileMode { private }, Value::Integer(n)) => {
+            let fault = |why| SchemaFault {
+                pointer: ptr.into(),
+                fault: Fault::OutOfRange(why),
+            };
+            if !(0..=0o777).contains(n) {
+                Err(fault("a file mode is an integer from 0 to 0o777"))
+            } else if *private && n & 0o077 != 0 {
+                Err(fault("a private file mode must clear group and other bits"))
+            } else {
+                Ok(())
+            }
+        }
         (Schema::Source, Value::String(s)) => {
             found.sources.push(SourceRef {
                 pointer: ptr.into(),
@@ -215,6 +255,9 @@ pub(crate) fn home_path_fault(path: &str) -> Option<&'static str> {
     }
     if path.chars().any(char::is_control) {
         return Some("control character");
+    }
+    if path.chars().any(super::error::is_invisible) {
+        return Some("invisible or bidirectional-control character");
     }
     for c in path.split('/') {
         match c {
@@ -285,9 +328,43 @@ mod tests {
     }
 
     #[test]
+    fn file_modes_are_bounded_and_private_ones_clear_group_and_other() {
+        let m = |private| Schema::FileMode { private };
+        let ok = |n: i64, private| {
+            validate(&Value::Integer(n), &m(private), "/m", &mut Found::default())
+        };
+        assert!(ok(0o600, true).is_ok() && ok(0o400, true).is_ok() && ok(0o644, false).is_ok());
+        for (n, private) in [
+            (-1, false),
+            (0o1000, false),
+            (0o666, true),
+            (0o640, true),
+            (0o601, true),
+        ] {
+            assert!(
+                matches!(ok(n, private).unwrap_err().fault, Fault::OutOfRange(_)),
+                "{n:o}"
+            );
+        }
+        assert!(validate(&Value::Boolean(true), &m(true), "/m", &mut Found::default()).is_err());
+    }
+
+    #[test]
     fn home_paths() {
         assert_eq!(home_path_fault(".config/x"), None);
-        for bad in ["", "/x", "a/../b", "a//b", "./a", "a\0b", "~/x", "a/~b"] {
+        for bad in [
+            "",
+            "/x",
+            "a/../b",
+            "a//b",
+            "./a",
+            "a\0b",
+            "~/x",
+            "a/~b",
+            "a\u{202e}b",
+            "a\u{200b}b",
+            "\u{feff}a",
+        ] {
             assert!(home_path_fault(bad).is_some(), "{bad:?}");
         }
     }

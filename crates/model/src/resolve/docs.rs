@@ -5,7 +5,7 @@
 use super::error::{ResolveError, category};
 use super::pointer;
 use crate::Code;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use toml::{Table, Value};
 
 /// Limits from docs/architecture.md section 5 (S10).
@@ -607,7 +607,9 @@ fn resource(file: &str, item: &Value, i: usize) -> Result<ResourceDoc, ResolveEr
 }
 
 /// Policy paths are RFC 6901 pointers that exist in `value`, never overlap, and never address
-/// an array element. Extension paths must be maps.
+/// an array element. Extension paths must be maps. Pointers are compared as token lists in
+/// sorted order, where every descendant follows its ancestor directly, so one pass over
+/// neighbours finds every duplicate or overlap.
 fn check_policy(file: &str, r: &ResourceDoc) -> Result<(), ResolveError> {
     let bad = |path: &str, why: &str| {
         invalid(
@@ -618,17 +620,26 @@ fn check_policy(file: &str, r: &ResourceDoc) -> Result<(), ResolveError> {
         .resource(r.id.clone())
         .field(path)
     };
-    let all: Vec<&String> = r.defaults.iter().chain(&r.extensions).collect();
-    for (n, path) in all.iter().enumerate() {
+    let extensions: BTreeSet<&String> = r.extensions.iter().collect();
+    let mut parsed: Vec<(Vec<String>, &String)> =
+        Vec::with_capacity(r.defaults.len() + r.extensions.len());
+    for path in r.defaults.iter().chain(&r.extensions) {
         let tokens = pointer::parse(path).map_err(|f| bad(path, f.describe()))?;
         let Some(found) = pointer::get(&r.value, &tokens) else {
             return Err(bad(path, "it does not exist in the value"));
         };
-        if all[..n].iter().any(|other| pointer::overlaps(other, path)) {
-            return Err(bad(path, "it overlaps another policy path"));
-        }
-        if r.extensions.contains(path) && !matches!(found, Value::Table(_)) {
+        if extensions.contains(path) && !matches!(found, Value::Table(_)) {
             return Err(bad(path, "an extension path must be a map"));
+        }
+        parsed.push((tokens, path));
+    }
+    parsed.sort();
+    for pair in parsed.windows(2) {
+        if pair[1].0.starts_with(&pair[0].0) {
+            return Err(bad(
+                pair[1].1,
+                "it duplicates or overlaps another policy path",
+            ));
         }
     }
     Ok(())

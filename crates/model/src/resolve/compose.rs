@@ -9,16 +9,31 @@ use super::docs::{
 };
 use super::error::{ResolveError, category};
 use super::pointer;
-use super::schema::{self, AdapterCatalog, AdapterSpec, Claims, Fault, Found, TargetRule};
+use super::schema::{self, AdapterCatalog, AdapterSpec, Claims, Fault, Found, Include, TargetRule};
 use super::source::{self, LocateFault, Located, PathFault, SourceSet};
-use super::{ChangeKind, Provenance, Resolved, ResolvedResource};
+use super::{
+    ChangeKind, DirClaim, IncludeEntry, IncludeGroup, Provenance, Resolved, ResolvedResource,
+};
 use crate::Code;
 use crate::digest::{EntryKind, TreeEntry, sha256_hex, tree_digest};
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet};
 use toml::Value;
 
 const MAX_BUNDLE_DEPTH: usize = 16;
 const MAX_RESOURCES: usize = 10_000;
+const MAX_MODULES: usize = 10_000;
+const MAX_TOTAL_DOC_BYTES: usize = 64 << 20;
+/// Leaves across the whole composition. Each leaf gets a provenance record.
+const MAX_LEAVES: usize = 200_000;
+
+fn limit(file: &str, what: &str) -> ResolveError {
+    ResolveError::new(
+        Code::LimitExceeded,
+        file,
+        what.to_string(),
+        "split the composition or remove unused modules",
+    )
+}
 
 struct Loaded<'a> {
     sources: &'a SourceSet,
@@ -99,6 +114,12 @@ fn locate_error(from: &str, field: &str, f: LocateFault) -> ResolveError {
             "symlinks in the path form a loop or are nested too deeply",
             "remove the link loop",
         ),
+        LocateFault::CaseAlias => ResolveError::new(
+            Code::SourceEscape,
+            from,
+            "two source entries differ only by case, so a case-insensitive filesystem cannot tell them apart",
+            "rename one of them",
+        ),
     }
     .field(field)
     .rejected("string")
@@ -127,6 +148,8 @@ struct Owned {
     file: String,
     dir: String,
     doc: ResourceDoc,
+    defaults: BTreeSet<String>,
+    extensions: BTreeSet<String>,
 }
 
 pub(crate) fn resolve(
@@ -156,6 +179,8 @@ pub(crate) fn resolve(
                     module: m.id.clone(),
                     file: m.file.clone(),
                     dir: source::parent(&m.file).to_string(),
+                    defaults: r.defaults.iter().cloned().collect(),
+                    extensions: r.extensions.iter().cloned().collect(),
                     doc: r.clone(),
                 },
             );
@@ -173,7 +198,7 @@ pub(crate) fn resolve(
     let effective = authorize(&resources, &changes)?;
 
     // Phase 4: resolved adapter schema and source containment.
-    let resolved = finish(sources, catalog, &resources, &effective)?;
+    let (resolved, includes) = finish(sources, catalog, &resources, &effective)?;
 
     // Phase 5: output claims.
     check_claims(&resolved)?;
@@ -184,6 +209,7 @@ pub(crate) fn resolve(
         architecture: profile.architecture,
         modules: order,
         resources: resolved,
+        includes,
     })
 }
 
@@ -304,19 +330,35 @@ fn load_modules(
         )
         .field("/core"));
     }
-    let mut queue: VecDeque<String> = profile.modules.iter().cloned().collect();
-    queue.extend(core.requires.iter().cloned());
+    // A sorted frontier: modules load in ID order, so which malformed document is reported
+    // first does not depend on how the profile or `requires` lists are ordered.
+    let mut frontier: BTreeSet<String> = profile.modules.iter().cloned().collect();
+    frontier.extend(core.requires.iter().cloned());
     let mut modules: BTreeMap<String, ModuleDoc> = BTreeMap::new();
     modules.insert("core".into(), core);
-    while let Some(id) = queue.pop_front() {
+    let mut total_bytes = 0usize;
+    while let Some(id) = frontier.pop_first() {
         if modules.contains_key(&id) {
             continue;
         }
         let Some(entry) = catalogue.get(&id) else {
             continue;
         };
+        if modules.len() >= MAX_MODULES {
+            return Err(limit(
+                &entry.bundle,
+                "more than 10000 modules are reachable",
+            ));
+        }
         let field = pointer::join("/modules", &id);
         let (path, bytes) = l.read_path(&entry.bundle, &field, &entry.path, &entry.bundle_dir)?;
+        total_bytes += bytes.len();
+        if total_bytes > MAX_TOTAL_DOC_BYTES {
+            return Err(limit(
+                &entry.bundle,
+                "module documents exceed 64 MiB in total",
+            ));
+        }
         let m = docs::module(&path, bytes)?;
         if m.id != id {
             return Err(ResolveError::new(
@@ -327,7 +369,12 @@ fn load_modules(
             )
             .field(field));
         }
-        queue.extend(m.requires.iter().cloned());
+        frontier.extend(
+            m.requires
+                .iter()
+                .filter(|r| !modules.contains_key(*r))
+                .cloned(),
+        );
         modules.insert(id, m);
     }
     Ok(modules)
@@ -397,39 +444,49 @@ fn select(
             .conflicts_with(profile.file.clone()));
         }
     }
-    // Kahn's algorithm: core first, then the lexically smallest module whose prerequisites
-    // have all been placed. The order is for presentation only.
+    // Kahn's algorithm with in-degree counts and an ordered ready set: core first, then the
+    // lexically smallest module whose prerequisites are all placed. For presentation only.
+    let mut waiting: BTreeMap<&str, usize> = BTreeMap::new();
+    let mut dependents: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+    for m in modules.values().filter(|m| m.id != "core") {
+        waiting.insert(m.id.as_str(), m.requires.len());
+        for r in &m.requires {
+            dependents
+                .entry(r.as_str())
+                .or_default()
+                .push(m.id.as_str());
+        }
+    }
     let mut order = vec!["core".to_string()];
-    let mut left: BTreeSet<&String> = modules.keys().filter(|k| *k != "core").collect();
-    while !left.is_empty() {
-        let next = left
-            .iter()
-            .find(|id| {
-                modules[**id]
-                    .requires
-                    .iter()
-                    .all(|r| r == "core" || order.contains(r))
-            })
-            .map(|id| (*id).clone());
-        match next {
-            Some(id) => {
-                left.remove(&id);
-                order.push(id);
-            }
-            None => {
-                let names: Vec<&str> = left.iter().map(|s| s.as_str()).collect();
-                return Err(ResolveError::new(
-                    Code::DependencyCycle,
-                    &modules[*left.iter().next().expect("nonempty")].file,
-                    format!(
-                        "modules depend on each other in a cycle: {}",
-                        names.join(", ")
-                    ),
-                    "remove one `requires` entry to break the cycle",
-                )
-                .field("/requires"));
+    let mut ready: BTreeSet<&str> = waiting
+        .iter()
+        .filter(|(_, n)| **n == 0)
+        .map(|(id, _)| *id)
+        .collect();
+    while let Some(id) = ready.pop_first() {
+        order.push(id.to_string());
+        waiting.remove(id);
+        for d in dependents.get(id).into_iter().flatten() {
+            if let Some(n) = waiting.get_mut(d) {
+                *n -= 1;
+                if *n == 0 {
+                    ready.insert(d);
+                }
             }
         }
+    }
+    if let Some((first, _)) = waiting.iter().next() {
+        let names: Vec<&str> = waiting.keys().copied().collect();
+        return Err(ResolveError::new(
+            Code::DependencyCycle,
+            &modules[*first].file,
+            format!(
+                "modules depend on each other in a cycle: {}",
+                names.join(", ")
+            ),
+            "remove one `requires` entry to break the cycle",
+        )
+        .field("/requires"));
     }
     Ok(order)
 }
@@ -550,7 +607,7 @@ fn authorize(
                 .resource(&o.resource)
                 .field(&o.path)
             })?;
-            if !owner.doc.defaults.contains(&o.path) {
+            if !owner.defaults.contains(&o.path) {
                 return Err(ResolveError::new(
                     Code::OverrideForbidden,
                     &ch.file,
@@ -600,7 +657,7 @@ fn authorize(
                 .resource(&c.resource)
                 .field(&c.path)
             })?;
-            if !owner.doc.extensions.contains(&c.path) {
+            if !owner.extensions.contains(&c.path) {
                 return Err(ResolveError::new(
                     Code::OverrideForbidden,
                     &ch.file,
@@ -733,8 +790,10 @@ fn finish(
     catalog: &AdapterCatalog,
     resources: &BTreeMap<String, Owned>,
     eff: &Effective,
-) -> Result<BTreeMap<String, ResolvedResource>, ResolveError> {
+) -> Result<(BTreeMap<String, ResolvedResource>, Vec<IncludeGroup>), ResolveError> {
     let mut out = BTreeMap::new();
+    let mut raw_includes: Vec<(String, Vec<Include>, Option<&'static str>)> = Vec::new();
+    let mut leaf_budget = 0usize;
     for (gid, owner) in resources {
         let r = &owner.doc;
         let spec = catalog.get(&r.adapter).ok_or_else(|| {
@@ -793,6 +852,12 @@ fn finish(
                     "a required key is missing".into(),
                     "add the key",
                 ),
+                Fault::OutOfRange(why) => at(
+                    Code::ManifestInvalid,
+                    why.into(),
+                    "use a mode such as 0o600 (private) or 0o644",
+                )
+                .rejected("integer"),
             });
         }
         for h in &found.homes {
@@ -852,6 +917,13 @@ fn finish(
         };
         let mut ls = Vec::new();
         leaves(value, "", &mut ls);
+        leaf_budget += ls.len();
+        if leaf_budget > MAX_LEAVES {
+            return Err(limit(
+                &owner.file,
+                "the composition has more than 200000 values",
+            ));
+        }
         for (ptr, _) in ls {
             let sup = supplier_for(owner, roots, &ptr);
             let (source_path, content_id) = match srcs.get(&ptr) {
@@ -872,6 +944,18 @@ fn finish(
                 },
             );
         }
+        let (claims, dir_claims) = claims_of(spec, owner, gid, value)?;
+        if let (Some(parse), Some((path, _))) = (spec.source_includes, srcs.get("/source")) {
+            // The source is the authored native document; its include lines fix the order.
+            if let Ok(Located::File { bytes, .. }) = sources.locate(path, "")
+                && let Ok(text) = std::str::from_utf8(bytes)
+            {
+                let found = parse(text);
+                if !found.is_empty() {
+                    raw_includes.push((gid.clone(), found, spec.precedence));
+                }
+            }
+        }
         out.insert(
             gid.clone(),
             ResolvedResource {
@@ -887,11 +971,59 @@ fn finish(
                 secret_values: spec.secret_values,
                 native_document: spec.native_document,
                 provenance: prov,
-                claims: claims_of(spec, owner, gid, value)?,
+                claims,
+                dir_claims,
+                precedence: spec.precedence.map(String::from),
             },
         );
     }
-    Ok(out)
+    let groups = include_groups(&out, raw_includes);
+    Ok((out, groups))
+}
+
+/// Orders each authored native document's includes and ties each to the resource that
+/// declares the included file. Matching is by output path, without regard to case.
+fn include_groups(
+    resolved: &BTreeMap<String, ResolvedResource>,
+    raw: Vec<(String, Vec<Include>, Option<&'static str>)>,
+) -> Vec<IncludeGroup> {
+    let by_target: BTreeMap<String, &ResolvedResource> = resolved
+        .values()
+        .filter_map(|r| r.target.as_ref().map(|t| (t.to_lowercase(), r)))
+        .collect();
+    raw.into_iter()
+        .map(|(base, includes, _)| {
+            let entries: Vec<IncludeEntry> = includes
+                .into_iter()
+                .enumerate()
+                .map(|(i, inc)| {
+                    let hit = inc
+                        .path
+                        .strip_prefix("~/")
+                        .and_then(|rel| by_target.get(&rel.to_lowercase()))
+                        .filter(|r| r.id != base);
+                    IncludeEntry {
+                        position: i + 1,
+                        path: inc.path,
+                        condition: inc.condition,
+                        resource: hit.map(|r| r.id.clone()),
+                        module: hit.map(|r| r.module.clone()),
+                    }
+                })
+                .collect();
+            // The ordering rule belongs to the adapters that write the included fragments.
+            let rule = entries
+                .iter()
+                .filter_map(|e| e.resource.as_ref())
+                .find_map(|id| resolved[id].precedence.clone());
+            IncludeGroup {
+                base_target: resolved[&base].target.clone(),
+                rule,
+                entries,
+                base,
+            }
+        })
+        .collect()
 }
 
 fn target_error(file: &str, gid: &str, field: &str, why: &str) -> ResolveError {
@@ -970,20 +1102,43 @@ fn claims_of(
     owner: &Owned,
     gid: &str,
     value: &Value,
-) -> Result<Vec<String>, ResolveError> {
+) -> Result<(Vec<String>, Vec<DirClaim>), ResolveError> {
+    let get = |p: &str| pointer::get(value, &pointer::parse(p).expect("static pointer"));
     Ok(match spec.claims {
-        Claims::None => Vec::new(),
-        Claims::Target => owner.doc.target.iter().cloned().collect(),
+        Claims::None => (Vec::new(), Vec::new()),
+        Claims::Target => (owner.doc.target.iter().cloned().collect(), Vec::new()),
+        Claims::TargetAndFragments { dir, pattern } => {
+            let (Some(Value::String(d)), Some(Value::String(p))) = (get(dir), get(pattern)) else {
+                return Ok((owner.doc.target.iter().cloned().collect(), Vec::new()));
+            };
+            if p.is_empty() || p.chars().any(|c| "/[]{}\\".contains(c)) {
+                return Err(ResolveError::new(
+                    Code::ManifestInvalid,
+                    &owner.file,
+                    "the fragment pattern may use only `*` and `?` and must name one path component",
+                    "use a pattern such as `*.md`",
+                )
+                .resource(gid)
+                .field(pattern)
+                .rejected("string"));
+            }
+            (
+                owner.doc.target.iter().cloned().collect(),
+                vec![DirClaim {
+                    dir: d.clone(),
+                    pattern: p.clone(),
+                }],
+            )
+        }
         Claims::Leaves {
             roots,
             entries,
             enabled,
         } => {
-            let get = |p: &str| pointer::get(value, &pointer::parse(p).expect("static pointer"));
             let (Some(Value::Array(roots)), Some(Value::Table(entries))) =
                 (get(roots), get(entries))
             else {
-                return Ok(Vec::new());
+                return Ok((Vec::new(), Vec::new()));
             };
             let mut out = Vec::new();
             for root in roots.iter().filter_map(Value::as_str) {
@@ -1001,13 +1156,38 @@ fn claims_of(
                     }
                 }
             }
-            out
+            (out, Vec::new())
         }
     })
 }
 
+/// `*` matches any run of characters and `?` any one, within a single path component.
+fn glob(pattern: &str, name: &str) -> bool {
+    let (p, n): (Vec<char>, Vec<char>) = (pattern.chars().collect(), name.chars().collect());
+    let (mut pi, mut ni, mut star, mut mark) = (0, 0, None, 0);
+    while ni < n.len() {
+        if pi < p.len() && (p[pi] == '?' || p[pi] == n[ni]) {
+            pi += 1;
+            ni += 1;
+        } else if pi < p.len() && p[pi] == '*' {
+            star = Some(pi);
+            mark = ni;
+            pi += 1;
+        } else if let Some(s) = star {
+            pi = s + 1;
+            mark += 1;
+            ni = mark;
+        } else {
+            return false;
+        }
+    }
+    p[pi..].iter().all(|c| *c == '*')
+}
+
 /// Phase 5: two resources may not claim one output, compared case-insensitively because the
-/// target filesystem may fold case, and a claimed file may not also be a parent of another claim.
+/// target filesystem may fold case, and a claimed file may not also be the parent of another
+/// claim. A fragment directory is claimed as a prefix: only files whose name matches the
+/// owner's pattern may be placed directly in it, and only by another resource.
 fn check_claims(resolved: &BTreeMap<String, ResolvedResource>) -> Result<(), ResolveError> {
     let fold = |p: &str| {
         p.split('/')
@@ -1025,17 +1205,52 @@ fn check_claims(resolved: &BTreeMap<String, ResolvedResource>) -> Result<(), Res
             }
         }
     }
+    // Directory claims may not equal or nest inside each other. Sorted token lists put every
+    // descendant right after its ancestor, so neighbours are enough.
+    let mut dirs: Vec<(Vec<String>, &str, &DirClaim)> = Vec::new();
+    for (gid, r) in resolved {
+        for d in &r.dir_claims {
+            let tokens = fold(&d.dir).split('/').map(String::from).collect();
+            dirs.push((tokens, gid.as_str(), d));
+        }
+    }
+    dirs.sort_by(|a, b| (&a.0, a.1).cmp(&(&b.0, b.1)));
+    for pair in dirs.windows(2) {
+        if pair[1].0.starts_with(&pair[0].0) {
+            return Err(collision(
+                &resolved[pair[1].1],
+                pair[1].1,
+                &pair[1].2.dir,
+                pair[0].1,
+                &pair[0].2.dir,
+            ));
+        }
+    }
+    let dir_by_path: BTreeMap<String, (&str, &DirClaim)> = dirs
+        .iter()
+        .map(|(t, gid, d)| (t.join("/"), (*gid, *d)))
+        .collect();
     for (gid, r) in resolved {
         for claim in &r.claims {
             let folded = fold(claim);
-            let mut prefix = String::new();
-            for part in folded.split('/').take(folded.split('/').count() - 1) {
-                if !prefix.is_empty() {
-                    prefix.push('/');
+            let parts: Vec<&str> = folded.split('/').collect();
+            // The claim itself, then each proper prefix.
+            for end in (1..=parts.len()).rev() {
+                let prefix = parts[..end].join("/");
+                if let Some(&(owner, d)) = dir_by_path.get(&prefix) {
+                    let rest = &parts[end..];
+                    let as_fragment = owner != gid.as_str()
+                        && rest.len() == 1
+                        && glob(&d.pattern.to_lowercase(), rest[0]);
+                    if !as_fragment {
+                        return Err(collision(r, gid, claim, owner, &d.dir));
+                    }
                 }
-                prefix.push_str(part);
-                if let Some((other, other_claim)) = owners.get(&prefix) {
-                    return Err(collision(r, gid, claim, other, other_claim));
+                if end < parts.len() {
+                    // Ancestors that are files, not directories.
+                    if let Some((other, other_claim)) = owners.get(&prefix) {
+                        return Err(collision(r, gid, claim, other, other_claim));
+                    }
                 }
             }
         }

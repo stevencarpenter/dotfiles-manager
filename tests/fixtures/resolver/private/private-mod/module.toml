@@ -36,3 +36,12 @@ target = ".config/synthetic/token.env"
 template = "files/token.tpl"
 account = "synthetic-account"
 mode = 0o600
+
+# A second fragment that sets a value the core fragment also sets.
+[[resources]]
+id = "local-overrides"
+kind = "render"
+adapter = "git-config/v1"
+target = ".config/synthetic/local.inc"
+[resources.value.core]
+editor = "ed"

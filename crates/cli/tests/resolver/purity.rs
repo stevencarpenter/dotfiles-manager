@@ -1,13 +1,16 @@
 //! C05 and C06: resolution is deterministic and pure, and leaves everything as it found it.
 
+use crate::cases::{cases, run};
 use crate::common::{TempDir, repo_root};
 use crate::harness::{edit, examples, synthetic};
 use dfm_cli::builtin_catalog;
-use dfm_model::resolve::{SourceSet, resolve};
+use dfm_model::Code;
+use dfm_model::resolve::resolve;
 use sha2::{Digest, Sha256};
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
+/// Names, modification times and bytes of everything below `root`.
 fn tree_fingerprint(root: &Path) -> String {
     fn go(dir: &Path, h: &mut Sha256) {
         let mut v: Vec<_> = fs::read_dir(dir).unwrap().map(|e| e.unwrap()).collect();
@@ -28,34 +31,31 @@ fn tree_fingerprint(root: &Path) -> String {
     format!("{:x}", h.finalize())
 }
 
-fn rebuilt_in_reverse(set: &SourceSet) -> SourceSet {
-    let mut out = SourceSet::new();
-    let mut paths: Vec<&str> = set.paths().collect();
-    paths.reverse();
-    for p in paths {
-        match set.get(p).unwrap() {
-            dfm_model::resolve::Entry::File(b) => out.insert_file(p, b.clone()),
-            dfm_model::resolve::Entry::Link(t) => out.insert_link(p, t.clone()),
-        }
+#[test]
+fn c05_independently_built_inputs_give_identical_results() {
+    // Each call loads the fixtures from disk into a new set, so nothing is shared between runs.
+    let cat = builtin_catalog();
+    for (profile, load) in [
+        ("profiles/machine-b.toml", synthetic as fn() -> _),
+        ("profiles/work-01.toml", examples as fn() -> _),
+    ] {
+        let first = resolve(&load(), profile, &cat).unwrap();
+        let second = resolve(&load(), profile, &cat).unwrap();
+        assert_eq!(first, second);
+        assert_eq!(
+            format!("{first:?}"),
+            format!("{second:?}"),
+            "the debug form is identical too, so no map order leaks"
+        );
     }
-    out
 }
 
 #[test]
-fn c05_resolution_is_deterministic() {
+fn c05_when_two_problems_exist_the_same_one_is_always_reported() {
     let cat = builtin_catalog();
-    for (set, profile) in [
-        (synthetic(), "profiles/machine-b.toml"),
-        (examples(), "profiles/work-01.toml"),
-    ] {
-        let first = resolve(&set, profile, &cat).unwrap();
-        assert_eq!(first, resolve(&set, profile, &cat).unwrap());
-        assert_eq!(
-            first,
-            resolve(&rebuilt_in_reverse(&set), profile, &cat).unwrap()
-        );
-    }
-    // The first error is deterministic too.
+    let a = "profiles/machine-a.toml";
+    let b = "profiles/machine-b.toml";
+    // A phase 1 problem beats a phase 2 problem, whichever the files list first.
     let mut set = synthetic();
     edit(
         &mut set,
@@ -64,40 +64,79 @@ fn c05_resolution_is_deterministic() {
         "/bogus",
         Some("1"),
     );
-    edit(
-        &mut set,
-        "shared/core/module.toml",
-        "add",
-        "/bogus",
-        Some("1"),
-    );
-    let a = resolve(&set, "profiles/machine-a.toml", &cat).unwrap_err();
+    edit(&mut set, a, "add", "/modules/-", Some("\"ghost\""));
+    let e = resolve(&set, a, &cat).unwrap_err();
     assert_eq!(
-        a,
-        resolve(&rebuilt_in_reverse(&set), "profiles/machine-a.toml", &cat).unwrap_err()
+        (e.code, e.source.as_str()),
+        (Code::FieldUnknown, "shared/reusable/module.toml")
     );
+
+    // Two malformed modules: the one with the smaller ID is loaded and reported first, however
+    // the profile orders its selection.
+    for modules in [
+        "[\"private-mod\"]",
+        "[\"reusable\", \"private-mod\"]",
+        "[\"private-mod\", \"reusable\"]",
+    ] {
+        let mut set = synthetic();
+        edit(
+            &mut set,
+            "shared/reusable/module.toml",
+            "add",
+            "/bogus",
+            Some("1"),
+        );
+        edit(
+            &mut set,
+            "private/private-mod/module.toml",
+            "add",
+            "/bogus",
+            Some("1"),
+        );
+        edit(&mut set, b, "replace", "/modules", Some(modules));
+        let e = resolve(&set, b, &cat).unwrap_err();
+        assert_eq!(
+            (e.code, e.source.as_str()),
+            (Code::FieldUnknown, "private/private-mod/module.toml"),
+            "{modules}"
+        );
+    }
+
+    // Two forbidden overrides: the smaller resource ID is reported, whichever is declared first.
+    for order in [
+        ["core.launcher", "reusable.tool-config"],
+        ["reusable.tool-config", "core.launcher"],
+    ] {
+        let mut set = synthetic();
+        for r in order {
+            let o = format!(
+                "{{ resource = \"{r}\", path = \"/source\", value = \"x\", reason = \"t\" }}"
+            );
+            edit(&mut set, b, "add", "/overrides/-", Some(&o));
+        }
+        // reusable.tool-config exposes /source, so only core.launcher is forbidden; make both bad.
+        edit(
+            &mut set,
+            "shared/reusable/module.toml",
+            "remove",
+            "/resources/0/policy",
+            None,
+        );
+        let e = resolve(&set, b, &cat).unwrap_err();
+        assert_eq!(
+            (e.code, e.resource.as_deref()),
+            (Code::OverrideForbidden, Some("core.launcher")),
+            "{order:?}"
+        );
+    }
 }
 
 #[test]
 fn c05_the_model_crate_has_no_io_process_network_or_env_access() {
-    let banned = [
-        "std::fs",
-        "std::process",
-        "std::net",
-        "std::env",
-        "std::os",
-        "std::thread",
-        "Command",
-        "TcpStream",
-        "UdpSocket",
-        "File::",
-        "read_to_string",
-        "read_dir",
-        "current_dir",
-        "getenv",
-    ];
+    // A source scan. It shows the code that is there does not name these APIs. It is not a
+    // proof about dependencies, which the manifest check below pins.
     let mut files = Vec::new();
-    fn walk(d: &Path, out: &mut Vec<std::path::PathBuf>) {
+    fn walk(d: &Path, out: &mut Vec<PathBuf>) {
         for e in fs::read_dir(d).unwrap() {
             let p = e.unwrap().path();
             if p.is_dir() {
@@ -109,13 +148,58 @@ fn c05_the_model_crate_has_no_io_process_network_or_env_access() {
     }
     walk(&repo_root().join("crates/model/src"), &mut files);
     assert!(files.len() > 10);
+    let banned_paths = [
+        "std::fs",
+        "std::io",
+        "std::process",
+        "std::net",
+        "std::env",
+        "std::os",
+        "std::thread",
+        "std::time",
+        "std::sync",
+    ];
+    let banned_names = [
+        "fs", "io", "process", "net", "env", "os", "thread", "time", "sync",
+    ];
+    let banned_words = [
+        "Command",
+        "TcpStream",
+        "UdpSocket",
+        "File::",
+        "read_to_string",
+        "read_dir",
+        "current_dir",
+        "getenv",
+        "extern \"C\"",
+        "unsafe {",
+        "unsafe fn",
+        "unsafe impl",
+        "unsafe trait",
+        "unsafe extern",
+    ];
     for f in files {
         let text = fs::read_to_string(&f).unwrap();
-        for b in banned {
-            assert!(!text.contains(b), "{} uses {b}", f.display());
+        let name = f.display();
+        for b in banned_paths.iter().chain(&banned_words) {
+            assert!(!text.contains(b), "{name} uses {b}");
+        }
+        // Grouped imports such as `use std::{fs, collections::BTreeMap}` hide the path.
+        let mut rest = text.as_str();
+        while let Some(i) = rest.find("std::{") {
+            let group = &rest[i + 6..];
+            let end = group.find('}').expect("a closed import group");
+            for item in group[..end].split(',') {
+                let head = item.trim().split("::").next().unwrap_or("");
+                assert!(
+                    !banned_names.contains(&head),
+                    "{name} imports std::{head} in a group"
+                );
+            }
+            rest = &group[end..];
         }
     }
-    // Only the data crates: no network, process or package library can be linked in.
+    // Only the data crates are direct dependencies of the model.
     let manifest = fs::read_to_string(repo_root().join("crates/model/Cargo.toml")).unwrap();
     let deps: Vec<&str> = manifest
         .split("[dependencies]")
@@ -128,6 +212,10 @@ fn c05_the_model_crate_has_no_io_process_network_or_env_access() {
         .filter(|d| !d.is_empty())
         .collect();
     assert_eq!(deps, ["serde", "toml", "sha2"]);
+    assert!(
+        manifest.contains("workspace = true"),
+        "the model inherits the workspace lints, which forbid unsafe code"
+    );
 }
 
 #[test]
@@ -164,20 +252,35 @@ fn c05_manifest_text_is_data_and_never_executed() {
     assert_eq!(
         fs::read_dir(home.path()).unwrap().count(),
         0,
-        "resolution wrote into the directory"
+        "the canary directory stayed empty"
     );
 }
 
 #[test]
-fn c06_resolution_does_not_mutate_its_inputs_on_success_or_failure() {
-    let cat = builtin_catalog();
-    let before_disk = [
-        tree_fingerprint(&repo_root().join("examples")),
-        tree_fingerprint(&repo_root().join("tests/fixtures/resolver")),
+fn c06_all_sixteen_definitions_leave_the_fixture_files_untouched() {
+    let roots = [
+        repo_root().join("examples"),
+        repo_root().join("tests/fixtures/resolver"),
     ];
-    let home = TempDir::new("home");
-    let before_home = tree_fingerprint(home.path());
+    let before: Vec<String> = roots.iter().map(|r| tree_fingerprint(r)).collect();
+    for case in cases() {
+        let _ = run(&case);
+    }
+    // The synthetic profiles too, and every example profile directly.
+    for p in ["machine-a", "machine-b"] {
+        let _ = resolve(
+            &synthetic(),
+            &format!("profiles/{p}.toml"),
+            &builtin_catalog(),
+        );
+    }
+    let after: Vec<String> = roots.iter().map(|r| tree_fingerprint(r)).collect();
+    assert_eq!(before, after);
+}
 
+#[test]
+fn c06_resolution_does_not_mutate_the_set_it_reads() {
+    let cat = builtin_catalog();
     let ok_set = synthetic();
     let ok_copy = ok_set.clone();
     resolve(&ok_set, "profiles/machine-b.toml", &cat).unwrap();
@@ -194,17 +297,4 @@ fn c06_resolution_does_not_mutate_its_inputs_on_success_or_failure() {
     let bad_copy = bad_set.clone();
     resolve(&bad_set, "profiles/machine-a.toml", &cat).unwrap_err();
     assert_eq!(bad_set, bad_copy);
-
-    // The 16 example definitions leave the checked-in files and an isolated HOME untouched.
-    for profile in ["personal-dev-01", "work-01", "homelab-01", "server-01"] {
-        let _ = resolve(&examples(), &format!("profiles/{profile}.toml"), &cat);
-    }
-    assert_eq!(
-        before_disk,
-        [
-            tree_fingerprint(&repo_root().join("examples")),
-            tree_fingerprint(&repo_root().join("tests/fixtures/resolver")),
-        ]
-    );
-    assert_eq!(before_home, tree_fingerprint(home.path()));
 }

@@ -928,3 +928,313 @@ fn c11_one_conflicting_override() {
 fn hashing_helper_matches_the_digest_module() {
     assert_eq!(sha(b"x"), format!("sha256:{:x}", Sha256::digest(b"x")));
 }
+
+// Fragment directories are claimed as prefixes.
+
+const PERSONAL: &str = "profiles/personal-dev-01.toml";
+const PERSONAL_MOD: &str = "base/modules/personal-dev/module.toml";
+
+fn link_at(set: &mut SourceSet, id: &str, target: &str) {
+    let r = format!(
+        "{{ id = \"{id}\", kind = \"link\", adapter = \"fs-link/v1\", target = \"{target}\", value = {{ source = \"files/personal.env.tpl\" }} }}"
+    );
+    edit(set, PERSONAL_MOD, "add", "/resources/-", Some(&r));
+}
+
+#[test]
+fn m1_a_fragment_directory_accepts_only_matching_files_from_other_resources() {
+    // work-01 places `40-work.md` in the assembler's directory, which is how a module supplies a fragment.
+    ok(&examples(), "profiles/work-01.toml");
+    let fragment_dir = ".codex/AGENTS.d";
+    for (target, why) in [
+        (".codex/AGENTS.d/notes.txt", "name does not match *.md"),
+        (".codex/AGENTS.d/sub/x.md", "not a direct child"),
+        (".codex/AGENTS.d", "the directory itself"),
+        (".CODEX/agents.D/X.TXT", "case alias of a non-matching name"),
+        (".codex/AGENTS.d/sub/deeper/x.md", "nested"),
+    ] {
+        let mut set = examples();
+        link_at(&mut set, "extra", target);
+        let e = err(&set, PERSONAL);
+        assert_eq!(e.code, Code::TargetCollision, "{target}: {why}: {e}");
+        assert_eq!(
+            e.conflicts_with
+                .as_deref()
+                .map(|o| o == fragment_dir || o == "agents.codex-instructions"),
+            Some(true),
+            "{target}"
+        );
+    }
+    // A matching direct child is a fragment, not a collision.
+    let mut set = examples();
+    link_at(&mut set, "extra", ".codex/AGENTS.d/50-extra.MD");
+    ok(&set, PERSONAL);
+}
+
+#[test]
+fn m1_fragment_directories_may_not_alias_or_nest() {
+    let assemble = |id: &str, target: &str, dir: &str| {
+        format!(
+            "{{ id = \"{id}\", kind = \"assemble\", adapter = \"text-fragments/v1\", target = \"{target}\", value = {{ body = \"files/personal.env.tpl\", fragments_dir = \"{dir}\", pattern = \"*.md\", separator = \"\\n\" }} }}"
+        )
+    };
+    for dir in [
+        ".codex/AGENTS.d",
+        ".Codex/agents.D",
+        ".codex/AGENTS.d/inner",
+        ".codex",
+    ] {
+        let mut set = examples();
+        edit(
+            &mut set,
+            PERSONAL_MOD,
+            "add",
+            "/resources/-",
+            Some(&assemble("twin", ".codex/OTHER.md", dir)),
+        );
+        let e = err(&set, PERSONAL);
+        assert_eq!(e.code, Code::TargetCollision, "{dir}: {e}");
+    }
+    // The assembled file may not sit inside its own fragment directory.
+    let mut set = examples();
+    edit(
+        &mut set,
+        PERSONAL_MOD,
+        "add",
+        "/resources/-",
+        Some(&assemble("self", ".config/fr/self.md", ".config/fr")),
+    );
+    assert_eq!(err(&set, PERSONAL).code, Code::TargetCollision);
+    // A distinct directory is fine, and the pattern may not escape one component.
+    let mut set = examples();
+    edit(
+        &mut set,
+        PERSONAL_MOD,
+        "add",
+        "/resources/-",
+        Some(&assemble("ok", ".config/ok.md", ".config/ok.d")),
+    );
+    ok(&set, PERSONAL);
+    for bad in ["../*.md", "a/*.md", "[ab].md", "{a,b}.md", ""] {
+        let mut set = examples();
+        let r = assemble("badpat", ".config/p.md", ".config/p.d").replace("*.md", bad);
+        edit(&mut set, PERSONAL_MOD, "add", "/resources/-", Some(&r));
+        assert_eq!(err(&set, PERSONAL).code, Code::ManifestInvalid, "{bad:?}");
+    }
+}
+
+// Native precedence is per value, from the authored include order.
+
+#[test]
+fn m2_includes_follow_the_order_written_in_the_authored_document() {
+    let r = ok(&examples(), "profiles/work-01.toml");
+    assert_eq!(r.includes.len(), 1);
+    let g = &r.includes[0];
+    assert_eq!(g.base, "core.git");
+    assert_eq!(g.base_target.as_deref(), Some(".config/git/config"));
+    assert_eq!(
+        g.rule.as_deref(),
+        Some("later include entries override earlier ones for single-valued keys")
+    );
+    let rows: Vec<_> = g
+        .entries
+        .iter()
+        .map(|e| {
+            (
+                e.position,
+                e.path.as_str(),
+                e.condition.as_deref(),
+                e.resource.as_deref(),
+                e.module.as_deref(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        rows,
+        [
+            (
+                1,
+                "~/.config/external-overlays/git/base.inc",
+                None,
+                Some("core.git-defaults"),
+                Some("core")
+            ),
+            (
+                2,
+                "~/.config/external-overlays/git/extra.inc",
+                None,
+                None,
+                None
+            ),
+            (
+                3,
+                "~/.config/external-overlays/git/work.inc",
+                Some("gitdir:~/work/"),
+                Some("work.git-identity"),
+                Some("work")
+            ),
+        ]
+    );
+    // A profile without the work module has no resource at position 3.
+    let p = ok(&examples(), PERSONAL);
+    assert_eq!(p.includes[0].entries[2].resource, None);
+}
+
+#[test]
+fn m2_overlapping_fragments_are_listed_in_include_order() {
+    let r = ok(&synthetic(), B);
+    let g = &r.includes[0];
+    let order: Vec<_> = g
+        .entries
+        .iter()
+        .map(|e| (e.position, e.resource.as_deref()))
+        .collect();
+    assert_eq!(
+        order,
+        [
+            (1, Some("core.editor-defaults")),
+            (2, Some("private-mod.local-overrides")),
+            (3, None)
+        ]
+    );
+    assert_eq!(
+        g.entries[1].condition.as_deref(),
+        Some("gitdir:~/projects/")
+    );
+    // Both fragments set /core/editor, so the order decides. Only that pair overlaps.
+    let a = &r.resources["core.editor-defaults"].provenance;
+    let b = &r.resources["private-mod.local-overrides"].provenance;
+    let shared: Vec<_> = a.keys().filter(|k| b.contains_key(*k)).collect();
+    assert_eq!(shared, ["/core/editor"]);
+    // The public machine has only the first fragment declared.
+    let pa = ok(&synthetic(), A);
+    assert_eq!(
+        pa.includes[0]
+            .entries
+            .iter()
+            .filter(|e| e.resource.is_some())
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn m2_include_order_comes_from_the_document_not_from_declaration_order() {
+    let mut set = synthetic();
+    let swapped = "[include]\n    path = ~/.config/synthetic/local.inc\n[include]\n    path = ~/.config/synthetic/editor.inc\n";
+    set.insert_file("shared/core/files/gitconfig", swapped);
+    let r = ok(&set, B);
+    let order: Vec<_> = r.includes[0]
+        .entries
+        .iter()
+        .filter_map(|e| e.resource.as_deref())
+        .collect();
+    assert_eq!(
+        order,
+        ["private-mod.local-overrides", "core.editor-defaults"]
+    );
+}
+
+// Looking up sources: `..` and case.
+
+#[test]
+fn l4_dotdot_needs_a_real_directory_and_case_aliases_do_not_hide_links() {
+    for rel in [
+        "files/nonexistent/../tool.conf",
+        "files/tool.conf/../banner",
+    ] {
+        let mut set = synthetic();
+        edit(
+            &mut set,
+            REUSABLE,
+            "replace",
+            "/resources/0/value/source",
+            Some(&format!("\"{rel}\"")),
+        );
+        assert_eq!(err(&set, A).code, Code::SourceMissing, "{rel}");
+    }
+    // A real directory works.
+    let mut set = synthetic();
+    edit(
+        &mut set,
+        REUSABLE,
+        "replace",
+        "/resources/0/value/source",
+        Some("\"files/../files/tool.conf\""),
+    );
+    ok(&set, A);
+    // A link spelled `Link` is the same entry as `link` on a case-insensitive filesystem.
+    let mut set = synthetic();
+    set.insert_link(
+        "shared/reusable/files/Link",
+        "../../../private/private-mod/files/banner",
+    );
+    edit(
+        &mut set,
+        REUSABLE,
+        "replace",
+        "/resources/0/value/source",
+        Some("\"files/link\""),
+    );
+    assert_eq!(err(&set, A).code, Code::SourceEscape);
+    // Two spellings of one name cannot be told apart there.
+    let mut set = synthetic();
+    set.insert_file("shared/reusable/files/Tool.conf", "other");
+    assert_eq!(err(&set, A).code, Code::SourceEscape);
+}
+
+#[test]
+fn l5_bidi_and_zero_width_characters_are_refused_in_targets_and_escaped_in_messages() {
+    for target in ["a\\u202eb", "a\\u200bb", "\\ufeffa", "a\\u2066b"] {
+        let mut set = synthetic();
+        edit(
+            &mut set,
+            REUSABLE,
+            "replace",
+            "/resources/0/target",
+            Some(&format!("\"{target}\"")),
+        );
+        let e = err(&set, A);
+        assert_eq!(e.code, Code::TargetInvalid, "{target}");
+    }
+    let mut set = synthetic();
+    edit(&mut set, REUSABLE, "add", "/bogus\u{202e}x", Some("1"));
+    let e = err(&set, A);
+    let shown = e.to_string();
+    assert!(
+        shown.contains("\\u{202e}") && !shown.contains('\u{202e}'),
+        "{shown}"
+    );
+}
+
+#[test]
+fn l6_secret_file_modes_are_bounded_and_private() {
+    for (lit, ok_) in [
+        ("384", true),
+        ("256", true),
+        ("0", true),
+        ("-1", false),
+        ("438", false),
+        ("416", false),
+        ("512", true),
+        ("4096", false),
+    ] {
+        let mut set = synthetic();
+        edit(
+            &mut set,
+            PRIVATE,
+            "replace",
+            "/resources/0/value/mode",
+            Some(lit),
+        );
+        let got = run(&set, B);
+        // 512 is 0o1000: out of range. 416 is 0o640 and 438 is 0o666: group or other bits.
+        let want_ok = ok_ && lit != "512";
+        assert_eq!(got.is_ok(), want_ok, "{lit}: {got:?}");
+        if let Err(e) = got {
+            assert_eq!(e.code, Code::ManifestInvalid, "{lit}");
+            assert_eq!(e.rejected, Some("integer"));
+            assert_eq!(e.resource.as_deref(), Some("private-mod.api-token"));
+        }
+    }
+}

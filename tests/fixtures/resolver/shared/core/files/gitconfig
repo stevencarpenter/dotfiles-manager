@@ -1,0 +1,7 @@
+# Synthetic core topology. Git reads the includes in this order.
+[include]
+    path = ~/.config/synthetic/editor.inc
+[includeIf "gitdir:~/projects/"]
+    path = ~/.config/synthetic/local.inc
+[include]
+    path = ~/.config/synthetic/absent.inc

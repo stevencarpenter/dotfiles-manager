@@ -13,13 +13,16 @@ pub enum Entry {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SourceSet {
     entries: BTreeMap<String, Entry>,
+    /// Lowercased path to the spellings that fold to it. A case-insensitive filesystem resolves
+    /// `Files/Link` and `files/link` to one entry, so lookups go through this index.
+    folded: BTreeMap<String, Vec<String>>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum PathFault {
     /// Absolute, or climbs above the allowed root.
     Escape,
-    /// Empty component, control character or NUL.
+    /// Empty component, control or invisible character, or NUL.
     Invalid,
 }
 
@@ -28,6 +31,8 @@ pub(crate) enum LocateFault {
     Escape,
     Missing,
     Loop,
+    /// Two entries differ only by case, so a case-insensitive filesystem cannot tell them apart.
+    CaseAlias,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -38,17 +43,29 @@ pub(crate) enum Located<'a> {
 
 const MAX_HOPS: usize = 40;
 
+fn fold(path: &str) -> String {
+    path.to_lowercase()
+}
+
 impl SourceSet {
     pub fn new() -> Self {
         Self::default()
     }
 
+    fn insert(&mut self, path: String, entry: Entry) {
+        let spellings = self.folded.entry(fold(&path)).or_default();
+        if !spellings.contains(&path) {
+            spellings.push(path.clone());
+        }
+        self.entries.insert(path, entry);
+    }
+
     pub fn insert_file(&mut self, path: impl Into<String>, bytes: impl Into<Vec<u8>>) {
-        self.entries.insert(path.into(), Entry::File(bytes.into()));
+        self.insert(path.into(), Entry::File(bytes.into()));
     }
 
     pub fn insert_link(&mut self, path: impl Into<String>, target: impl Into<String>) {
-        self.entries.insert(path.into(), Entry::Link(target.into()));
+        self.insert(path.into(), Entry::Link(target.into()));
     }
 
     pub fn get(&self, path: &str) -> Option<&Entry> {
@@ -67,25 +84,41 @@ impl SourceSet {
         self.entries.is_empty()
     }
 
+    /// The entry at `path`, matched without regard to case.
+    fn entry_at(&self, path: &str) -> Result<Option<(&String, &Entry)>, LocateFault> {
+        match self.folded.get(&fold(path)).map(Vec::as_slice) {
+            None | Some([]) => Ok(None),
+            Some([one]) => Ok(self.entries.get_key_value(one)),
+            Some(_) => Err(LocateFault::CaseAlias),
+        }
+    }
+
     fn is_dir(&self, path: &str) -> bool {
-        let prefix = format!("{path}/");
-        self.entries
+        let prefix = format!("{}/", fold(path));
+        self.folded
             .range(prefix.clone()..)
             .next()
             .is_some_and(|(k, _)| k.starts_with(&prefix))
     }
 
-    /// Entries below `dir`, as paths relative to `dir`.
+    /// Entries below `dir`, matched without regard to case, as paths relative to `dir`.
     pub(crate) fn below<'a>(&'a self, dir: &str) -> impl Iterator<Item = (&'a str, &'a Entry)> {
-        let prefix = format!("{dir}/");
-        self.entries
+        let prefix = format!("{}/", fold(dir));
+        let depth = dir.split('/').filter(|c| !c.is_empty()).count();
+        self.folded
             .range(prefix.clone()..)
             .take_while(move |(k, _)| k.starts_with(&prefix))
-            .map(move |(k, e)| (&k[dir.len() + 1..], e))
+            .flat_map(|(_, spellings)| spellings)
+            .filter_map(move |key| {
+                let rel = key.splitn(depth + 1, '/').nth(depth)?;
+                Some((rel, self.entries.get(key)?))
+            })
     }
 
-    /// Resolves symlinks inside the snapshot. Every hop must stay under `root`; a link that
-    /// leaves it, an absolute link target, or a loop is a fault. `path` is already normalized.
+    /// Resolves symlinks inside the snapshot the way a filesystem would. Every hop must stay
+    /// under `root`. A link that leaves it, an absolute link target, a loop, or two spellings
+    /// that differ only by case is a fault. `..` is applied to the real directory reached so
+    /// far, and only if that directory exists. `path` has been checked by [`join`].
     pub(crate) fn locate(&self, path: &str, root: &str) -> Result<Located<'_>, LocateFault> {
         let root_parts: Vec<&str> = root.split('/').filter(|c| !c.is_empty()).collect();
         let mut parts = path.split('/').filter(|c| !c.is_empty());
@@ -102,30 +135,46 @@ impl SourceSet {
                     if resolved.len() <= root_parts.len() {
                         return Err(LocateFault::Escape);
                     }
+                    if !self.is_dir(&resolved.join("/")) {
+                        return Err(LocateFault::Missing);
+                    }
                     resolved.pop();
                     continue;
                 }
                 _ => resolved.push(c),
             }
-            let cur = resolved.join("/");
-            if let Some(Entry::Link(target)) = self.entries.get(&cur) {
-                hops += 1;
-                if hops > MAX_HOPS {
-                    return Err(LocateFault::Loop);
+            match self.entry_at(&resolved.join("/"))? {
+                Some((_, Entry::Link(target))) => {
+                    hops += 1;
+                    if hops > MAX_HOPS {
+                        return Err(LocateFault::Loop);
+                    }
+                    if target.starts_with('/') {
+                        return Err(LocateFault::Escape);
+                    }
+                    resolved.pop();
+                    for part in target.split('/').rev().filter(|p| !p.is_empty()) {
+                        pending.push_front(part.to_string());
+                    }
                 }
-                if target.starts_with('/') {
-                    return Err(LocateFault::Escape);
+                Some((key, Entry::File(_))) => {
+                    // Keep the stored spelling so later steps and the result agree with it.
+                    if let (Some(last), Some(actual)) =
+                        (resolved.last_mut(), key.rsplit('/').next())
+                    {
+                        *last = actual.to_string();
+                    }
                 }
-                resolved.pop();
-                for part in target.split('/').rev().filter(|p| !p.is_empty()) {
-                    pending.push_front(part.to_string());
-                }
+                None => {}
             }
         }
         let cur = resolved.join("/");
-        match self.entries.get(&cur) {
-            Some(Entry::File(bytes)) => Ok(Located::File { path: cur, bytes }),
-            Some(Entry::Link(_)) => Err(LocateFault::Missing),
+        match self.entry_at(&cur)? {
+            Some((key, Entry::File(bytes))) => Ok(Located::File {
+                path: key.clone(),
+                bytes,
+            }),
+            Some((_, Entry::Link(_))) => Err(LocateFault::Missing),
             None if self.is_dir(&cur) => Ok(Located::Dir { path: cur }),
             None => Err(LocateFault::Missing),
         }
@@ -140,7 +189,12 @@ pub(crate) fn join(base_dir: &str, rel: &str, _root: &str) -> Result<String, Pat
     if rel.starts_with('/') {
         return Err(PathFault::Escape);
     }
-    if rel.is_empty() || rel.chars().any(char::is_control) || rel.split('/').any(str::is_empty) {
+    if rel.is_empty()
+        || rel
+            .chars()
+            .any(|c| c.is_control() || super::error::is_invisible(c))
+        || rel.split('/').any(str::is_empty)
+    {
         return Err(PathFault::Invalid);
     }
     Ok(if base_dir.is_empty() {
@@ -165,6 +219,34 @@ mod tests {
         assert_eq!(join("a", "x//y", "a"), Err(PathFault::Invalid));
         assert_eq!(join("a", "x\0y", "a"), Err(PathFault::Invalid));
         assert_eq!(join("", "x", ""), Ok("x".into()));
+    }
+
+    #[test]
+    fn dotdot_needs_an_existing_directory_and_lookups_ignore_case() {
+        let mut s = SourceSet::new();
+        s.insert_file("m/files/banner", "B");
+        s.insert_link("m/files/Link", "../../outside");
+        assert_eq!(
+            s.locate("m/files/nonexistent/../banner", "m"),
+            Err(LocateFault::Missing)
+        );
+        assert_eq!(
+            s.locate("m/files/banner/../banner", "m"),
+            Err(LocateFault::Missing)
+        );
+        assert!(matches!(
+            s.locate("m/files/../files/banner", "m"),
+            Ok(Located::File { .. })
+        ));
+        assert!(
+            matches!(s.locate("m/FILES/BANNER", "m"), Ok(Located::File { path, .. }) if path == "m/files/banner")
+        );
+        // `link` and `Link` are one name to a case-insensitive filesystem, so the link is followed.
+        assert_eq!(s.locate("m/files/link", "m"), Err(LocateFault::Escape));
+        s.insert_file("m/files/BANNER", "other");
+        assert_eq!(s.locate("m/files/banner", "m"), Err(LocateFault::CaseAlias));
+        let below: Vec<&str> = s.below("M/Files").map(|(n, _)| n).collect();
+        assert_eq!(below.len(), 3, "{below:?}");
     }
 
     #[test]

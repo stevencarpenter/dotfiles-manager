@@ -3,7 +3,7 @@
 //! kind, whether it owns a target, how its `value` is typed, and which outputs it claims. No
 //! adapter is run here.
 
-use dfm_model::resolve::{AdapterCatalog, AdapterSpec, Claims, Field, Schema, TargetRule};
+use dfm_model::resolve::{AdapterCatalog, AdapterSpec, Claims, Field, Include, Schema, TargetRule};
 
 fn field(name: &'static str, schema: Schema, required: bool) -> Field {
     Field {
@@ -28,7 +28,40 @@ fn spec(
         native_document: false,
         claims,
         value,
+        source_includes: None,
+        precedence: None,
     }
+}
+
+/// Include directives of a Git config, in file order: `[include]` and `[includeIf "<cond>"]`
+/// sections with a `path` key. Nothing else in the file matters for precedence.
+fn git_includes(text: &str) -> Vec<Include> {
+    let mut current: Option<Option<String>> = None;
+    let mut out = Vec::new();
+    for line in text.lines().map(str::trim) {
+        if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
+            continue;
+        }
+        if let Some(header) = line.strip_prefix('[').and_then(|l| l.split_once(']')) {
+            let name = header.0.trim();
+            current = if name.eq_ignore_ascii_case("include") {
+                Some(None)
+            } else if name.len() > 9 && name[..9].eq_ignore_ascii_case("includeif") {
+                let cond = name[9..].trim().trim_matches('"').to_string();
+                Some(Some(cond))
+            } else {
+                None
+            };
+        } else if let (Some(cond), Some((key, value))) = (&current, line.split_once('='))
+            && key.trim().eq_ignore_ascii_case("path")
+        {
+            out.push(Include {
+                path: value.trim().trim_matches('"').to_string(),
+                condition: cond.clone(),
+            });
+        }
+    }
+    out
 }
 
 fn package(id: &str) -> AdapterSpec {
@@ -45,26 +78,33 @@ fn package(id: &str) -> AdapterSpec {
     )
 }
 
+#[doc(hidden)]
 pub fn builtin_catalog() -> AdapterCatalog {
     let native = |mut s: AdapterSpec| {
         s.native_document = true;
         s
     };
     AdapterCatalog::new([
-        spec(
-            "fs-link/v1",
-            "link",
-            TargetRule::Required,
-            Claims::Target,
-            Schema::Table(vec![field("source", Schema::Source, true)]),
-        ),
-        native(spec(
-            "git-config/v1",
-            "render",
-            TargetRule::Required,
-            Claims::Target,
-            Schema::Native,
-        )),
+        AdapterSpec {
+            source_includes: Some(git_includes),
+            ..spec(
+                "fs-link/v1",
+                "link",
+                TargetRule::Required,
+                Claims::Target,
+                Schema::Table(vec![field("source", Schema::Source, true)]),
+            )
+        },
+        native(AdapterSpec {
+            precedence: Some("later include entries override earlier ones for single-valued keys"),
+            ..spec(
+                "git-config/v1",
+                "render",
+                TargetRule::Required,
+                Claims::Target,
+                Schema::Native,
+            )
+        }),
         native(spec(
             "claude-settings/v1",
             "merge",
@@ -88,7 +128,10 @@ pub fn builtin_catalog() -> AdapterCatalog {
             "text-fragments/v1",
             "assemble",
             TargetRule::Required,
-            Claims::Target,
+            Claims::TargetAndFragments {
+                dir: "/fragments_dir",
+                pattern: "/pattern",
+            },
             Schema::Table(vec![
                 field("body", Schema::Source, true),
                 field("fragments_dir", Schema::HomePath, true),
@@ -131,7 +174,7 @@ pub fn builtin_catalog() -> AdapterCatalog {
                 Schema::Table(vec![
                     field("template", Schema::Source, true),
                     field("account", Schema::Str, true),
-                    field("mode", Schema::Int, true),
+                    field("mode", Schema::FileMode { private: true }, true),
                 ]),
             )
         },
@@ -150,4 +193,26 @@ pub fn builtin_catalog() -> AdapterCatalog {
             ]),
         ),
     ])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::git_includes;
+
+    #[test]
+    fn git_include_directives_keep_file_order_and_conditions() {
+        let text = "# c\n[user]\n  path = ignored\n[include]\n  path = ~/a.inc\n[includeIf \"gitdir:~/w/\"]\n  path = ~/b.inc\n[include]\n  PATH = ~/c.inc\n";
+        let got: Vec<(String, Option<String>)> = git_includes(text)
+            .into_iter()
+            .map(|i| (i.path, i.condition))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                ("~/a.inc".to_string(), None),
+                ("~/b.inc".to_string(), Some("gitdir:~/w/".to_string())),
+                ("~/c.inc".to_string(), None),
+            ]
+        );
+    }
 }

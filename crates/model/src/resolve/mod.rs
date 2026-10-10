@@ -10,7 +10,7 @@ mod source;
 
 pub use error::ResolveError;
 pub use explain::explain;
-pub use schema::{AdapterCatalog, AdapterSpec, Claims, Field, Schema, TargetRule};
+pub use schema::{AdapterCatalog, AdapterSpec, Claims, Field, Include, Schema, TargetRule};
 pub use source::{Entry, SourceSet};
 mod compose;
 
@@ -57,6 +57,38 @@ pub struct ResolvedResource {
     pub provenance: BTreeMap<String, Provenance>,
     /// Output paths this resource claims.
     pub claims: Vec<String>,
+    /// Directories this resource reads fragments from, claimed as a prefix.
+    pub dir_claims: Vec<DirClaim>,
+    /// How the application orders competing values in this native document, when known.
+    pub precedence: Option<String>,
+}
+
+/// A fragment directory: only files matching `pattern` may be placed in it by another resource.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DirClaim {
+    pub dir: String,
+    pub pattern: String,
+}
+
+/// One include directive of an authored native document, with the resource that declares the
+/// included file (if any resource does).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IncludeEntry {
+    /// 1-based position in the order the application reads the document.
+    pub position: usize,
+    pub path: String,
+    pub condition: Option<String>,
+    pub resource: Option<String>,
+    pub module: Option<String>,
+}
+
+/// The ordered includes of one authored native document (for example a Git config).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IncludeGroup {
+    pub base: String,
+    pub base_target: Option<String>,
+    pub rule: Option<String>,
+    pub entries: Vec<IncludeEntry>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -67,6 +99,8 @@ pub struct Resolved {
     /// Core first, then each module after its prerequisites, lexically among the ready ones.
     pub modules: Vec<String>,
     pub resources: BTreeMap<String, ResolvedResource>,
+    /// Native documents whose include order is declared by an authored source file.
+    pub includes: Vec<IncludeGroup>,
 }
 
 /// Resolves the profile at `profile_path` (a path inside `sources`) against the adapters in
