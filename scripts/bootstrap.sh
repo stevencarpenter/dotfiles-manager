@@ -10,8 +10,21 @@
 # POSIX sh plus system tools from a fixed PATH. No cargo, rustc or rustup process
 # starts before the toolchain tree digest and the build controls pass.
 # Exit: 0 ok, 1 build failed, 2 usage, 3 refused before the build.
+# Scrub the caller's environment before anything else runs: exported shell functions
+# (BASH_FUNC_*), PERL5LIB or PERL5OPT (shasum is perl), CDPATH, ENV and the like must not
+# influence the checks. Only the test hooks below survive, and only when set.
+# Run as `/usr/bin/env -i /bin/sh scripts/bootstrap.sh ...`: a SHELLOPTS=noexec in the
+# caller's environment makes /bin/sh read this file without running it, so treat a run
+# that did not print its final line as a failure.
+if [ -z "${DFM_BS_CLEAN:-}" ]; then
+  exec /usr/bin/env -i PATH=/usr/bin:/bin:/usr/sbin:/sbin HOME="${HOME:-}" DFM_BS_CLEAN=1 \
+    ${DFM_BOOTSTRAP_TEST:+"DFM_BOOTSTRAP_TEST=$DFM_BOOTSTRAP_TEST"} ${DFM_TEST_HOME:+"DFM_TEST_HOME=$DFM_TEST_HOME"} \
+    ${DFM_TEST_OS:+"DFM_TEST_OS=$DFM_TEST_OS"} ${DFM_TEST_ARCH:+"DFM_TEST_ARCH=$DFM_TEST_ARCH"} \
+    ${DFM_TEST_CLT:+"DFM_TEST_CLT=$DFM_TEST_CLT"} /bin/sh "$0" "$@"
+fi
 set -eu
 umask 077
+unset CDPATH
 SYSPATH=/usr/bin:/bin:/usr/sbin:/sbin # same list as dfm_platform_macos::SYSTEM_PATH
 PATH=$SYSPATH
 export PATH LC_ALL=C
@@ -379,8 +392,10 @@ ensure_clt() {
   refuse E_PREREQ_MISSING "Command Line Tools did not become available within 30 minutes"
 }
 
+# Replacement refs (refs/replace) would let a ref swap the content of the verified commit.
 git_clean() { /usr/bin/env -i PATH="$SYSPATH" HOME=/var/empty LANG=C GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null \
-  GIT_CONFIG_NOSYSTEM=1 GIT_TERMINAL_PROMPT=0 /usr/bin/git -c core.fsmonitor=false -c core.hooksPath=/dev/null "$@"; }
+  GIT_CONFIG_NOSYSTEM=1 GIT_TERMINAL_PROMPT=0 GIT_NO_REPLACE_OBJECTS=1 /usr/bin/git -c core.fsmonitor=false \
+  -c core.hooksPath=/dev/null -c core.useReplaceRefs=false "$@"; }
 
 cmd_install() {
   [ -n "${src:-}" ] && [ -n "${commit:-}" ] || usage "install needs --source and --commit"
@@ -389,11 +404,11 @@ cmd_install() {
   resolve_home; check_platform
   [ -d "$src" ] || refuse E_SOURCE_UNTRUSTED "source $src is not a directory"
   # Read-only prerequisite and identity checks come first.
-  head=$(git_clean -C "$src" rev-parse HEAD 2>/dev/null) || refuse E_SOURCE_UNTRUSTED "source is not a git checkout"
-  [ "$head" = "$commit" ] || refuse E_SOURCE_UNTRUSTED "source is at $head, expected $commit"
+  [ "$(git_clean -C "$src" cat-file -t "$commit" 2>/dev/null)" = commit ] ||
+    refuse E_SOURCE_UNTRUSTED "$commit is not a commit in the source checkout"
   # Early, read-only hint of the pin so a missing toolchain is refused before any mutation.
   # The real parse and every other check run later on the staged copy.
-  hint=$(git_clean -C "$src" cat-file blob HEAD:dotfiles-manager.lock 2>/dev/null |
+  hint=$(git_clean -C "$src" cat-file blob "$commit:dotfiles-manager.lock" 2>/dev/null |
     sed -n 's/^toolchain = "\([0-9][0-9.]*\)"[ \t]*$/\1/p' | head -n 1)
   [ -n "$hint" ] || refuse E_SOURCE_UNTRUSTED "dotfiles-manager.lock has no toolchain pin"
   [ -d "$DATA/toolchains/$hint" ] ||
@@ -401,7 +416,11 @@ cmd_install() {
   ensure_clt
   build=$CACHE/build
   rm -rf "$build"; mkdir -p "$build/stage"
-  git_clean -C "$src" archive --format=tar HEAD | tar -xf - -C "$build/stage"
+  # Build the verified commit itself, not whatever HEAD is. Both steps are checked: a pipe would hide
+  # the status of git archive.
+  git_clean -C "$src" archive --format=tar "$commit" >"$build/source.tar" || { echo "error: git archive failed" >&2; exit 1; }
+  tar -xf "$build/source.tar" -C "$build/stage" || { echo "error: cannot extract the source" >&2; exit 1; }
+  rm -f "$build/source.tar"
   controls "$build/stage"
   # Controls passed. From here the pinned toolchain runs under a constructed environment.
   for d in cargo-home rustup-home build-home; do rm -rf "${DATA:?}/$d"; mkdir -p "$DATA/$d"; done
@@ -427,7 +446,7 @@ cmd_install() {
   mv -fh "$HOME_DIR/.local/bin/dotfiles-manager.new" "$HOME_DIR/.local/bin/dotfiles-manager"
   rm -rf "$build" "$DATA/cargo-home" "$DATA/rustup-home" "$DATA/build-home"
   sha=$(/usr/bin/shasum -a 256 "$DATA/versions/$name/dotfiles-manager" | cut -d' ' -f1)
-  printf 'installed %s\nsource commit %s\nbinary sha256 %s (record only)\n' "$DATA/versions/$name" "$commit" "$sha"
+  printf 'installed %s\nsource commit %s\nbinary sha256 %s (record only)\nbootstrap: done\n' "$DATA/versions/$name" "$commit" "$sha"
 }
 
 # Removes what install created. The toolchain, state and binding are never touched.
@@ -450,6 +469,9 @@ while [ $# -gt 0 ]; do
     *) usage "unknown argument $1" ;;
   esac
 done
+# Relative arguments become absolute so a later cd cannot be redirected.
+case $src in ""|/*) ;; *) src=$PWD/$src ;; esac
+case $dir in ""|/*) ;; *) dir=$PWD/$dir ;; esac
 case $cmd in
   install) cmd_install ;;
   uninstall) cmd_uninstall ;;

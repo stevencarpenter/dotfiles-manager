@@ -229,6 +229,112 @@ fn toolchain_digest_fails_closed_instead_of_dropping_unreadable_entries() {
     );
 }
 
+#[test]
+fn replace_refs_cannot_swap_the_built_commit() {
+    let tmp = TempDir::new("replace");
+    let home = tmp.path().join("home");
+    fs::create_dir(&home).unwrap();
+    let (src, good) = tiny_source(tmp.path(), "9.9.9");
+    git(&src, &["checkout", "-q", "-b", "evil"]);
+    fs::write(
+        src.join("dotfiles-manager.lock"),
+        "schema = 1\n\n[manager]\ntoolchain = \"8.8.8\"\n",
+    )
+    .unwrap();
+    git(&src, &["commit", "-q", "-a", "-m", "evil"]);
+    let evil = git(&src, &["rev-parse", "HEAD"]);
+    git(&src, &["checkout", "-q", "main"]);
+    git(&src, &["replace", &good, &evil]);
+    let o = script_test_mode(
+        &home,
+        &[
+            "install",
+            "--source",
+            src.to_str().unwrap(),
+            "--commit",
+            &good,
+        ],
+        &[],
+    );
+    assert_eq!(o.status.code(), Some(3));
+    assert!(
+        err(&o).contains("9.9.9") && !err(&o).contains("8.8.8"),
+        "replacement ref was honoured: {}",
+        err(&o)
+    );
+}
+
+#[test]
+fn caller_environment_cannot_influence_the_script() {
+    let tmp = TempDir::new("env");
+    let home = tmp.path().join("home");
+    let tc = tmp.path().join("tc");
+    fs::create_dir_all(&home).unwrap();
+    fs::create_dir_all(tc.join("bin")).unwrap();
+    fs::write(tc.join("bin/a"), "a").unwrap();
+    let digest = |env: &[(&str, &str)], dir: &str, cwd: &Path| {
+        let mut c = Command::new("/bin/sh");
+        c.arg(repo_root().join("scripts/bootstrap.sh"))
+            .args(["toolchain-digest", "--dir", dir])
+            .current_dir(cwd)
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("HOME", &home)
+            .env("DFM_BOOTSTRAP_TEST", "1")
+            .env("DFM_TEST_HOME", &home);
+        for (k, v) in env {
+            c.env(k, v);
+        }
+        String::from_utf8_lossy(&c.output().unwrap().stdout)
+            .trim()
+            .to_string()
+    };
+    let clean = digest(&[], tc.to_str().unwrap(), tmp.path());
+    assert_eq!(clean.len(), 64);
+    // shasum is perl: a forged module must not run. An exported function must not shadow awk.
+    let forge = tmp.path().join("forge");
+    fs::create_dir(&forge).unwrap();
+    fs::write(
+        forge.join("Forge.pm"),
+        format!(
+            "package Forge; BEGIN {{ print \"{}  forged\\n\"; exit 0 }} 1;\n",
+            "f".repeat(64)
+        ),
+    )
+    .unwrap();
+    let hostile = [
+        ("PERL5LIB", forge.to_str().unwrap()),
+        ("PERL5OPT", "-MForge"),
+        ("BASH_FUNC_awk%%", "() { echo forged; }"),
+        ("BASH_ENV", "/nonexistent"),
+        ("ENV", "/nonexistent"),
+    ];
+    assert_eq!(
+        digest(&hostile, tc.to_str().unwrap(), tmp.path()),
+        clean,
+        "caller environment changed the digest"
+    );
+    // A relative --dir with CDPATH pointing at a decoy must still resolve against the cwd.
+    let decoy = tmp.path().join("decoy");
+    fs::create_dir_all(decoy.join("tc/bin")).unwrap();
+    fs::write(decoy.join("tc/bin/a"), "different").unwrap();
+    assert_eq!(
+        digest(&[("CDPATH", decoy.to_str().unwrap())], "tc", tmp.path()),
+        clean
+    );
+}
+
+#[test]
+fn noexec_run_is_detectable_by_the_missing_final_line() {
+    // SHELLOPTS=noexec makes /bin/sh skip the file; no script can prevent that. Callers must
+    // look for the success line, which a skipped run never prints.
+    let tmp = TempDir::new("noexec");
+    let home = tmp.path().join("home");
+    fs::create_dir(&home).unwrap();
+    let o = script_test_mode(&home, &["uninstall"], &[("SHELLOPTS", "noexec")]);
+    assert!(!String::from_utf8_lossy(&o.stdout).contains("removed the installed manager"));
+}
+
 fn clone_path(from: &Path, to: &Path) {
     fs::create_dir_all(to.parent().unwrap()).unwrap();
     let fast = Command::new("/bin/cp")

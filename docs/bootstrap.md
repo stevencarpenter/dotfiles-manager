@@ -31,10 +31,15 @@ dotfiles-manager self-check --build-controls <staged tree> | --fixture-dir <dir>
 ## Source and build identity
 
 - A source identity is the git commit plus the recomputed tree digest. `bootstrap.sh install` requires `--commit <40 hex>` and refuses unless `HEAD` equals it. Git runs with the scrubbed environment from the contract. The script runs no `git status`, because that would run filters configured in the repository (tested). Uncommitted files are ignored: only `HEAD` is built.
-- The build input is `git archive HEAD` extracted into the build directory, not the working tree.
+- The build input is `git archive <commit>` of the verified `--commit` (not whatever `HEAD` is). Git runs with `GIT_NO_REPLACE_OBJECTS=1` and `core.useReplaceRefs=false`, so a `refs/replace` entry cannot swap the content (tested). The commit must exist and be of type `commit`. The script reads an existing checkout; it does not fetch into a staging directory with `transfer.fsckObjects`, which the contract describes for fetches.
+
 - The script sets `DFM_BUILD_COMMIT` for the build. `--version` prints `dotfiles-manager <semver> (commit <sha>)`. The installed directory is `versions/<semver>-<first 12 of commit>`.
 - The binary SHA-256 is printed after install as a record only. Builds are not claimed to be reproducible.
 - The owner obtains the script and commit out of band, as in contract section 12 item 3.1. This implementation does **not** clone or verify the script checksum itself: the owner clones the pinned commit with a scrubbed Git environment, checks `git rev-parse HEAD` and the script SHA-256, then runs the script from that checkout.
+
+## Running the script
+
+Run it as `/usr/bin/env -i /bin/sh scripts/bootstrap.sh <command> ...`. The script also re-executes itself under `env -i` with a fixed `PATH`, so exported shell functions (`BASH_FUNC_*`), `PERL5LIB`/`PERL5OPT` (`shasum` is perl), `CDPATH` and `ENV` do not change what is checked (tested). Relative `--source` and `--dir` values are made absolute first. A caller's `SHELLOPTS=noexec` makes `/bin/sh` skip the whole file and exit 0; no script can prevent that, so a successful run is one that prints its final line (`bootstrap: done` for install).
 
 ## Install, upgrade, rollback, removal
 
