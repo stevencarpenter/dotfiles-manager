@@ -244,13 +244,15 @@ fn read_binding(path: &Path) -> Result<Option<Binding>, Refusal> {
         |d: String| Refusal::new(Code::BindingInvalid, format!("{}: {d}", path.display()));
     let file = match fs::OpenOptions::new()
         .read(true)
-        .custom_flags(dfm_platform_macos::O_NOFOLLOW)
+        .custom_flags(dfm_platform_macos::O_NOFOLLOW | dfm_platform_macos::O_NONBLOCK)
         .open(path)
     {
         Ok(f) => f,
         Err(e) if e.kind() == ErrorKind::NotFound => return Ok(None),
         // ELOOP is what O_NOFOLLOW reports for a symlink.
-        Err(e) if e.raw_os_error() == Some(62) => return Err(invalid("is a symlink".into())),
+        Err(e) if e.raw_os_error() == Some(dfm_platform_macos::ELOOP) => {
+            return Err(invalid("is a symlink".into()));
+        }
         Err(e) => return Err(invalid(e.kind().to_string())),
     };
     let meta = file.metadata().map_err(|e| invalid(e.kind().to_string()))?;

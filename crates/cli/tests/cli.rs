@@ -502,3 +502,45 @@ fn an_io_failure_while_writing_the_binding_exits_1() {
     );
     assert!(!cfg.join("machine.toml").exists());
 }
+
+#[test]
+fn a_fifo_at_the_binding_path_is_refused_without_blocking() {
+    let home = TempDir::new("fifo");
+    let cfg = home.path().join(".config/dotfiles-manager");
+    fs::create_dir_all(&cfg).unwrap();
+    assert!(
+        Command::new("/usr/bin/mkfifo")
+            .arg(cfg.join("machine.toml"))
+            .status()
+            .unwrap()
+            .success()
+    );
+    for args in [
+        vec!["binding"],
+        vec![
+            "bind",
+            "--profile",
+            &profile("work-01.toml"),
+            "--machine-id",
+            "m3",
+        ],
+    ] {
+        let mut child = cmd(home.path(), &args)
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let status = loop {
+            if let Some(s) = child.try_wait().unwrap() {
+                break s;
+            }
+            if std::time::Instant::now() > deadline {
+                child.kill().unwrap();
+                panic!("{args:?} blocked on a FIFO");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        };
+        assert_eq!(status.code(), Some(3), "{args:?}");
+    }
+}

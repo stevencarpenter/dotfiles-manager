@@ -32,6 +32,12 @@ pub fn current_platform() -> (&'static str, &'static str) {
 /// `O_NOFOLLOW` on Darwin. Opening a symlink with it fails instead of following the link.
 pub const O_NOFOLLOW: i32 = 0x0100;
 
+/// `O_NONBLOCK` on Darwin. Opening a FIFO with it does not wait for a writer.
+pub const O_NONBLOCK: i32 = 0x0004;
+
+/// `ELOOP` on Darwin: what `O_NOFOLLOW` reports when the path is a symlink.
+pub const ELOOP: i32 = 62;
+
 /// The effective user id, read with `id -u`.
 pub fn current_uid() -> Option<u32> {
     run(&["/usr/bin/id", "-u"])?.parse().ok()

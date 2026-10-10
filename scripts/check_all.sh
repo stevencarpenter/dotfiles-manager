@@ -28,11 +28,11 @@ step_rust_style() {
 # Implementation tests: unit, CLI, bootstrap script and build-controls differential tests.
 # The isolated build (feature test-isolation) is needed by the CLI and differential tests.
 # The install test needs crates.io, so it is #[ignore]d and run explicitly here.
-# Set DFM_SKIP_NETWORK_TESTS=1 to skip it; the skip is printed.
+# Set DFM_SKIP_NETWORK_TESTS=1 (exactly 1) to skip it; the skip is printed.
 step_rust_tests() {
     cargo test --workspace --locked --features dfm-cli/test-isolation
-    if [ -n "${DFM_SKIP_NETWORK_TESTS:-}" ]; then
-        echo "SKIPPED: network install test (DFM_SKIP_NETWORK_TESTS is set)"
+    if [ "${DFM_SKIP_NETWORK_TESTS:-}" = 1 ]; then
+        echo "SKIPPED: network install test (DFM_SKIP_NETWORK_TESTS=1)"
     else
         cargo test --workspace --locked --features dfm-cli/test-isolation -- --ignored
     fi

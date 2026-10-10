@@ -24,6 +24,7 @@ if [ "${1:-}" != --dfm-scrubbed ]; then
     exec /usr/bin/env -i PATH=/usr/bin:/bin:/usr/sbin:/sbin HOME="${HOME:-}" DFM_BOOTSTRAP_TEST=1 \
       ${DFM_TEST_HOME:+"DFM_TEST_HOME=$DFM_TEST_HOME"} ${DFM_TEST_OS:+"DFM_TEST_OS=$DFM_TEST_OS"} \
       ${DFM_TEST_ARCH:+"DFM_TEST_ARCH=$DFM_TEST_ARCH"} ${DFM_TEST_CLT:+"DFM_TEST_CLT=$DFM_TEST_CLT"} \
+      ${DFM_TEST_BEFORE_SWAP:+"DFM_TEST_BEFORE_SWAP=$DFM_TEST_BEFORE_SWAP"} \
       /bin/sh "$0" --dfm-scrubbed "$@"
   fi
   exec /usr/bin/env -i PATH=/usr/bin:/bin:/usr/sbin:/sbin HOME="${HOME:-}" /bin/sh "$0" --dfm-scrubbed "$@"
@@ -31,7 +32,7 @@ fi
 shift
 env_check=$(/usr/bin/env | /usr/bin/awk -F= -v test="${DFM_BOOTSTRAP_TEST:-}" '
   BEGIN { split("PATH HOME PWD OLDPWD SHLVL _", a, " "); for (i in a) ok[a[i]] = 1
-    if (test == "1") { split("DFM_BOOTSTRAP_TEST DFM_TEST_HOME DFM_TEST_OS DFM_TEST_ARCH DFM_TEST_CLT", t, " "); for (i in t) ok[t[i]] = 1 } }
+    if (test == "1") { split("DFM_BOOTSTRAP_TEST DFM_TEST_HOME DFM_TEST_OS DFM_TEST_ARCH DFM_TEST_CLT DFM_TEST_BEFORE_SWAP", t, " "); for (i in t) ok[t[i]] = 1 } }
   /^[A-Za-z_][A-Za-z0-9_%]*=/ { if (!($1 in ok)) { print "unexpected " $1; bad = 1; exit } }
   END { if (!bad) print "clean" }') || env_check=
 if [ "$env_check" != clean ] || [ "$PATH" != /usr/bin:/bin:/usr/sbin:/sbin ]; then
@@ -386,8 +387,7 @@ controls_ancestors() { # uses CACHE
   [ "$base" = / ] && base=
   d=$base$tail; [ -n "$d" ] || d=/
   while :; do
-    # An ancestor that cannot be searched cannot be shown to be free of config.
-    { [ ! -d "$d" ] || [ -x "$d" ]; } || refuse E_BUILD_CONFIG "cannot search $d to check for Cargo or rustup configuration"
+    # An ancestor that cannot be searched already failed the cd above, so every d here is searchable.
     for f in .cargo/config.toml .cargo/config rust-toolchain rust-toolchain.toml; do
       if [ -e "${d%/}/$f" ] || [ -L "${d%/}/$f" ]; then
         refuse E_BUILD_CONFIG "${d%/}/$f would be read by Cargo or rustup for the build directory"
@@ -403,15 +403,22 @@ controls() { controls_staged "$1"; controls_toolchain; controls_ancestors; }
 # ---- install and uninstall -----------------------------------------------------------------
 # The script never starts the Command Line Tools installer: that is a long, interactive
 # change to the machine. It refuses before any mutation and tells the owner what to do.
+# Command Line Tools keep clang at usr/bin; a full Xcode keeps it in its default toolchain.
 ensure_clt() {
-  if { test_mode && [ "${DFM_TEST_CLT:-}" = missing ]; } ||
-    ! { /usr/bin/xcode-select -p >/dev/null 2>&1 && /usr/bin/xcrun --find clang >/dev/null 2>&1; }; then
+  clt=$(/usr/bin/xcode-select -p 2>/dev/null) || clt=
+  if { test_mode && [ "${DFM_TEST_CLT:-}" = missing ]; } || [ -z "$clt" ] ||
+    { [ ! -x "$clt/usr/bin/clang" ] && [ ! -x "$clt/Toolchains/XcodeDefault.xctoolchain/usr/bin/clang" ]; }; then
     refuse E_PREREQ_MISSING "Command Line Tools are missing. Run 'xcode-select --install', wait for it to finish, then run this script again"
   fi
 }
 
-# The command path may only be replaced when it is absent or already ours.
+# The command path may only be replaced when it is absent or already ours, and `current`
+# may only be replaced when it is absent or a symlink. Checked early and again before the swap.
 check_command_path() {
+  cur=$DATA/current
+  if { [ -e "$cur" ] || [ -L "$cur" ]; } && [ ! -L "$cur" ]; then
+    refuse E_PREREQ_MISSING "$cur exists and is not a symlink; move it away first"
+  fi
   link=$HOME_DIR/.local/bin/dotfiles-manager
   if [ -L "$link" ]; then
     [ "$(readlink "$link")" = "$DATA/current/dotfiles-manager" ] ||
@@ -420,6 +427,18 @@ check_command_path() {
     refuse E_PREREQ_MISSING "$link exists and is not a symlink; move it away first"
   fi
 }
+
+# An existing binding must be usable by the new binary exactly as it is: a regular file, not a
+# symlink or FIFO, mode 0600, owned by the current user (the rules of read_binding in the CLI).
+check_binding() {
+  b=$HOME_DIR/.config/dotfiles-manager/machine.toml
+  { [ -e "$b" ] || [ -L "$b" ]; } || return 0
+  [ ! -L "$b" ] || binding_bad "$b" "is a symlink"
+  [ -f "$b" ] || binding_bad "$b" "is not a regular file"
+  [ "$(/usr/bin/stat -f %Lp "$b")" = 600 ] || binding_bad "$b" "mode is not 0600"
+  [ "$(/usr/bin/stat -f %u "$b")" = "$(/usr/bin/id -u)" ] || binding_bad "$b" "is not owned by the current user"
+}
+binding_bad() { printf 'error: E_BINDING_INVALID %s %s\n' "$1" "$2" >&2; exit 1; }
 
 rm_build() { [ ! -e "$build" ] || chmod -R u+w "$build"; rm -rf "$build"; }
 
@@ -435,6 +454,8 @@ cmd_install() {
   case $commit in ""|*[!0-9a-f]*) refuse E_SOURCE_UNTRUSTED "--commit must be a full lowercase hex object id (40 or 64 digits)" ;; esac
   case ${#commit} in 40) fmt=sha1 ;; 64) fmt=sha256 ;; *) refuse E_SOURCE_UNTRUSTED "--commit must be a full lowercase hex object id (40 or 64 digits)" ;; esac
   resolve_home; check_platform
+  # /usr/bin/git is the Command Line Tools shim, so the tools are probed before any git call.
+  ensure_clt
   [ -d "$src" ] || refuse E_SOURCE_UNTRUSTED "source $src is not a directory"
   # Read-only prerequisite and identity checks come first.
   [ "$(git_clean -C "$src" rev-parse --show-object-format 2>/dev/null)" = "$fmt" ] ||
@@ -448,8 +469,8 @@ cmd_install() {
   [ -n "$hint" ] || refuse E_SOURCE_UNTRUSTED "dotfiles-manager.lock has no toolchain pin"
   [ -d "$DATA/toolchains/$hint" ] ||
     refuse E_TOOLCHAIN_MISMATCH "toolchain $hint is absent at $DATA/toolchains/$hint; install exactly that version there (official Rust release distribution)"
-  ensure_clt
   check_command_path
+  check_binding
   build=$CACHE/build
   rm_build; mkdir -p "$build/stage"
   # Build the verified commit itself, not whatever HEAD is. Both steps are checked: a pipe would hide
@@ -474,7 +495,7 @@ cmd_install() {
   # The new binary must be able to read the binding that already exists, so it checks a copy.
   mkdir -p "$build/fixture"
   if [ -e "$HOME_DIR/.config/dotfiles-manager/machine.toml" ]; then
-    cp "$HOME_DIR/.config/dotfiles-manager/machine.toml" "$build/fixture/machine.toml"
+    cp -p "$HOME_DIR/.config/dotfiles-manager/machine.toml" "$build/fixture/machine.toml"
   fi
   tcrun "$bin" self-check --fixture-dir "$build/fixture" >/dev/null || { echo "error: self-check failed" >&2; exit 1; }
   ver=$(tcrun "$bin" --version) || { echo "error: the built binary did not run" >&2; exit 1; }
@@ -485,9 +506,11 @@ cmd_install() {
   mkdir -p "$DATA/versions/$name" "$HOME_DIR/.local/bin"
   cp "$bin" "$DATA/versions/$name/dotfiles-manager.new"; chmod 755 "$DATA/versions/$name/dotfiles-manager.new"
   mv -f "$DATA/versions/$name/dotfiles-manager.new" "$DATA/versions/$name/dotfiles-manager"
+  if test_mode && [ -n "${DFM_TEST_BEFORE_SWAP:-}" ]; then /bin/sh "$DFM_TEST_BEFORE_SWAP"; fi
+  check_command_path
   # A stale current.new (even a directory) is removed first, so ln cannot create the link inside it.
   rm -rf "$DATA/current.new"; ln -sfn "versions/$name" "$DATA/current.new"; mv -fh "$DATA/current.new" "$DATA/current"
-  rm -f "$HOME_DIR/.local/bin/dotfiles-manager.new"
+  rm -rf "$HOME_DIR/.local/bin/dotfiles-manager.new"
   ln -sfn "$DATA/current/dotfiles-manager" "$HOME_DIR/.local/bin/dotfiles-manager.new"
   mv -fh "$HOME_DIR/.local/bin/dotfiles-manager.new" "$HOME_DIR/.local/bin/dotfiles-manager"
   rm_build; rm -rf "$DATA/cargo-home" "$DATA/rustup-home" "$DATA/build-home"

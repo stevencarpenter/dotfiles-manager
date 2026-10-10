@@ -911,6 +911,57 @@ fn a_new_binary_that_cannot_read_the_existing_binding_does_not_become_current() 
 }
 
 #[test]
+#[ignore = "needs crates.io"]
+fn the_command_path_and_current_are_checked_again_just_before_the_swap() {
+    let p = prepare("swap-recheck");
+    // Runs after the build and before the swap; the real race is another process doing this.
+    let hook = p.tmp.path().join("hook.sh");
+    let link = p.home.join(".local/bin/dotfiles-manager");
+    fs::write(
+        &hook,
+        format!(
+            "mkdir -p '{0}' && echo mine > '{1}'\n",
+            link.parent().unwrap().display(),
+            link.display()
+        ),
+    )
+    .unwrap();
+    let o = install(
+        &p,
+        &p.sha,
+        &[("DFM_TEST_BEFORE_SWAP", hook.to_str().unwrap())],
+    );
+    assert_eq!(
+        o.status.code(),
+        Some(3),
+        "{}\n{}",
+        String::from_utf8_lossy(&o.stdout),
+        err(&o)
+    );
+    assert!(err(&o).contains("E_PREREQ_MISSING"), "{}", err(&o));
+    assert_eq!(fs::read_to_string(&link).unwrap(), "mine\n");
+    assert!(
+        !p.data.join("current").exists(),
+        "current must not flip when the command path became foreign"
+    );
+    // Same for `current` itself becoming a directory.
+    fs::remove_file(&link).unwrap();
+    let hook2 = p.tmp.path().join("hook2.sh");
+    fs::write(
+        &hook2,
+        format!("mkdir -p '{0}'\n", p.data.join("current").display()),
+    )
+    .unwrap();
+    let o = install(
+        &p,
+        &p.sha,
+        &[("DFM_TEST_BEFORE_SWAP", hook2.to_str().unwrap())],
+    );
+    assert_eq!(o.status.code(), Some(3), "{}", err(&o));
+    assert!(err(&o).contains("current"), "{}", err(&o));
+}
+
+#[test]
 fn missing_command_line_tools_are_refused_before_mutation() {
     let tmp = TempDir::new("clt");
     let home = tmp.path().join("home");
@@ -940,6 +991,135 @@ fn missing_command_line_tools_are_refused_before_mutation() {
         before,
         "nothing may be created, and no installer may start"
     );
+}
+
+#[test]
+fn missing_tools_are_detected_before_any_git_call() {
+    // /usr/bin/git is the xcode-select shim, so the probe must come first. A directory that is
+    // not a git repository would otherwise be refused as an untrusted source.
+    let tmp = TempDir::new("clt-order");
+    let home = tmp.path().join("home");
+    fs::create_dir(&home).unwrap();
+    let not_git = tmp.path().join("plain");
+    fs::create_dir(&not_git).unwrap();
+    let o = script_test_mode(
+        &home,
+        &[
+            "install",
+            "--source",
+            not_git.to_str().unwrap(),
+            "--commit",
+            &"a".repeat(40),
+        ],
+        &[("DFM_TEST_CLT", "missing")],
+    );
+    assert_eq!(o.status.code(), Some(3));
+    assert!(err(&o).contains("E_PREREQ_MISSING"), "{}", err(&o));
+    assert!(entries_below(&home).is_empty());
+}
+
+/// A home with the toolchain placed, a tiny committed source, and a binding-like path to abuse.
+fn refusal_setup(label: &str) -> (TempDir, PathBuf, PathBuf, String) {
+    let tmp = TempDir::new(label);
+    let home = tmp.path().join("home");
+    fs::create_dir_all(home.join(".local/share/dotfiles-manager/toolchains/9.9.9")).unwrap();
+    let (src, sha) = tiny_source(tmp.path(), "9.9.9");
+    (tmp, home, src, sha)
+}
+
+fn install_tiny(home: &Path, src: &Path, sha: &str) -> Output {
+    script_test_mode(
+        home,
+        &[
+            "install",
+            "--source",
+            src.to_str().unwrap(),
+            "--commit",
+            sha,
+        ],
+        &[],
+    )
+}
+
+#[test]
+fn an_unusable_binding_stops_the_install_before_any_mutation() {
+    use std::os::unix::fs::symlink;
+    let (_tmp, home, src, sha) = refusal_setup("binding-pre");
+    let cfg = home.join(".config/dotfiles-manager");
+    fs::create_dir_all(&cfg).unwrap();
+    let binding = cfg.join("machine.toml");
+    let valid = "schema = 1\nprofile = \"/p\"\nmachine_id = \"m5\"\nplatform = \"macos\"\narch = \"aarch64\"\norigins = []\n";
+    let before = entries_below(&home);
+    // Mode 0644: a copy would normalise it to 0600 and hide the problem.
+    fs::write(&binding, valid).unwrap();
+    fs::set_permissions(&binding, fs::Permissions::from_mode(0o644)).unwrap();
+    let o = install_tiny(&home, &src, &sha);
+    assert_eq!(o.status.code(), Some(1), "{}", err(&o));
+    assert!(
+        err(&o).contains("E_BINDING_INVALID") && err(&o).contains("0600"),
+        "{}",
+        err(&o)
+    );
+    // A symlink to a valid, private file.
+    fs::remove_file(&binding).unwrap();
+    let real = home.join("real.toml");
+    fs::write(&real, valid).unwrap();
+    fs::set_permissions(&real, fs::Permissions::from_mode(0o600)).unwrap();
+    symlink(&real, &binding).unwrap();
+    let o = install_tiny(&home, &src, &sha);
+    assert_eq!(o.status.code(), Some(1), "{}", err(&o));
+    assert!(
+        err(&o).contains("E_BINDING_INVALID") && err(&o).contains("symlink"),
+        "{}",
+        err(&o)
+    );
+    fs::remove_file(&binding).unwrap();
+    fs::remove_file(&real).unwrap();
+    assert_eq!(
+        entries_below(&home),
+        before,
+        "nothing may be created, and `current` must stay absent"
+    );
+}
+
+#[test]
+fn a_fifo_at_the_binding_path_does_not_hang_the_script_or_the_manager() {
+    let (_tmp, home, src, sha) = refusal_setup("binding-fifo");
+    let cfg = home.join(".config/dotfiles-manager");
+    fs::create_dir_all(&cfg).unwrap();
+    assert!(
+        Command::new("/usr/bin/mkfifo")
+            .arg(cfg.join("machine.toml"))
+            .status()
+            .unwrap()
+            .success()
+    );
+    let started = std::time::Instant::now();
+    let o = install_tiny(&home, &src, &sha);
+    assert_eq!(o.status.code(), Some(1), "{}", err(&o));
+    assert!(
+        err(&o).contains("E_BINDING_INVALID") && err(&o).contains("regular file"),
+        "{}",
+        err(&o)
+    );
+    assert!(started.elapsed() < std::time::Duration::from_secs(20));
+}
+
+#[test]
+fn an_existing_current_that_is_not_a_symlink_is_refused() {
+    let (_tmp, home, src, sha) = refusal_setup("current-dir");
+    let current = home.join(".local/share/dotfiles-manager/current");
+    fs::create_dir_all(&current).unwrap();
+    fs::write(current.join("mine"), "x").unwrap();
+    let o = install_tiny(&home, &src, &sha);
+    assert_eq!(o.status.code(), Some(3), "{}", err(&o));
+    assert!(
+        err(&o).contains("E_PREREQ_MISSING") && err(&o).contains("current"),
+        "{}",
+        err(&o)
+    );
+    assert_eq!(fs::read_to_string(current.join("mine")).unwrap(), "x");
+    assert!(!home.join(".cache").exists());
 }
 
 #[test]
