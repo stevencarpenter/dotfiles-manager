@@ -5,8 +5,8 @@ pub mod controls;
 pub mod digest;
 pub mod exit;
 pub mod refusal;
-pub mod state;
 pub mod resolve;
+pub mod state;
 
 pub use exit::Exit;
 pub use refusal::{Code, Refusal};

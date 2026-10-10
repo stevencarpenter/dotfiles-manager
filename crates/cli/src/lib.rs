@@ -2,16 +2,16 @@
 
 mod adapters;
 mod controls_fs;
-mod state_cmd;
 mod source_fs;
+mod state_cmd;
 
 pub use adapters::builtin_catalog;
 pub use controls_fs::{check_build_controls, toolchain_tree_digest};
 
 use dfm_engine::{Dir, Fail, Layout, Store, Sys, open_config};
 use dfm_model::binding::{Binding, MAX_BYTES, check_profile};
-use dfm_model::state::Stamp;
 use dfm_model::resolve::resolve;
+use dfm_model::state::Stamp;
 use dfm_model::{Code, Exit, Refusal};
 use dfm_platform_macos::{Platform, check_supported, current_platform};
 use source_fs::load_source_set;

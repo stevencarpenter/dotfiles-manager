@@ -199,7 +199,7 @@ fn c05_the_model_crate_has_no_io_process_network_or_env_access() {
             rest = &group[end..];
         }
     }
-    // Only the data crates are direct dependencies of the model.
+    // Only data crates (serialization and hashing) are direct dependencies of the model.
     let manifest = fs::read_to_string(repo_root().join("crates/model/Cargo.toml")).unwrap();
     let deps: Vec<&str> = manifest
         .split("[dependencies]")
@@ -211,7 +211,9 @@ fn c05_the_model_crate_has_no_io_process_network_or_env_access() {
         .map(str::trim)
         .filter(|d| !d.is_empty())
         .collect();
-    assert_eq!(deps, ["serde", "toml", "sha2"]);
+    let mut sorted = deps.clone();
+    sorted.sort_unstable();
+    assert_eq!(sorted, ["serde", "serde_json", "sha2", "toml"]);
     assert!(
         manifest.contains("workspace = true"),
         "the model inherits the workspace lints, which forbid unsafe code"
