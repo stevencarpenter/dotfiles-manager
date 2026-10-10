@@ -15,6 +15,7 @@ pub enum Code {
     RebindUnsupported,
     BindingInvalid,
     ProfileInvalid,
+    IoFailed,
     Usage,
 }
 
@@ -31,6 +32,7 @@ impl Code {
             Code::RebindUnsupported => "E_REBIND_UNSUPPORTED",
             Code::BindingInvalid => "E_BINDING_INVALID",
             Code::ProfileInvalid => "E_PROFILE_INVALID",
+            Code::IoFailed => "E_IO_FAILED",
             Code::Usage => "E_USAGE",
         }
     }
@@ -38,6 +40,8 @@ impl Code {
     pub const fn exit(self) -> Exit {
         match self {
             Code::Usage => Exit::Usage,
+            // A failure while writing is not a refusal before mutation.
+            Code::IoFailed => Exit::Failed,
             _ => Exit::Blocked,
         }
     }

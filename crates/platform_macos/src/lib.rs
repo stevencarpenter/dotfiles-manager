@@ -29,6 +29,14 @@ pub fn current_platform() -> (&'static str, &'static str) {
     (std::env::consts::OS, std::env::consts::ARCH)
 }
 
+/// `O_NOFOLLOW` on Darwin. Opening a symlink with it fails instead of following the link.
+pub const O_NOFOLLOW: i32 = 0x0100;
+
+/// The effective user id, read with `id -u`.
+pub fn current_uid() -> Option<u32> {
+    run(&["/usr/bin/id", "-u"])?.parse().ok()
+}
+
 /// A HOME with whitespace or control characters is refused. Paths from it reach shell scripts
 /// and tool arguments, and `scripts/bootstrap.sh` applies the same rule.
 pub fn valid_home(home: &str) -> bool {

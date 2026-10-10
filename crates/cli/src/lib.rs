@@ -4,7 +4,7 @@ mod controls_fs;
 
 pub use controls_fs::{check_build_controls, toolchain_tree_digest};
 
-use dfm_model::binding::{Binding, MAX_BYTES};
+use dfm_model::binding::{Binding, MAX_BYTES, check_profile};
 use dfm_model::{Code, Exit, Refusal};
 use dfm_platform_macos::{Platform, check_supported, current_platform};
 use std::fs;
@@ -159,9 +159,8 @@ pub fn run(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> Exit {
 
 fn dispatch(args: &[String], out: &mut dyn Write) -> Result<(), Refusal> {
     let (home, args) = split_home(args)?;
-    let w = |e: std::io::Error| {
-        Refusal::new(Code::BindingInvalid, format!("output failed: {}", e.kind()))
-    };
+    let w =
+        |e: std::io::Error| Refusal::new(Code::IoFailed, format!("output failed: {}", e.kind()));
     let Some((cmd, rest)) = args.split_first() else {
         return write!(out, "{HELP}").map_err(w);
     };
@@ -237,19 +236,39 @@ fn header(out: &mut dyn Write, ctx: &Ctx) -> std::io::Result<()> {
     }
 }
 
-/// Reads the whole bounded file. `None` when it does not exist.
+/// Reads the whole bounded file. `None` when it does not exist. The file is opened without
+/// following symlinks and must be a regular file owned by the current user with mode 0600.
 fn read_binding(path: &Path) -> Result<Option<Binding>, Refusal> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
     let invalid =
         |d: String| Refusal::new(Code::BindingInvalid, format!("{}: {d}", path.display()));
-    match fs::symlink_metadata(path) {
+    let file = match fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(dfm_platform_macos::O_NOFOLLOW)
+        .open(path)
+    {
+        Ok(f) => f,
         Err(e) if e.kind() == ErrorKind::NotFound => return Ok(None),
+        // ELOOP is what O_NOFOLLOW reports for a symlink.
+        Err(e) if e.raw_os_error() == Some(62) => return Err(invalid("is a symlink".into())),
         Err(e) => return Err(invalid(e.kind().to_string())),
-        Ok(m) if !m.is_file() => return Err(invalid("not a regular file".into())),
-        Ok(_) => {}
+    };
+    let meta = file.metadata().map_err(|e| invalid(e.kind().to_string()))?;
+    if !meta.is_file() {
+        return Err(invalid("not a regular file".into()));
+    }
+    if dfm_platform_macos::current_uid() != Some(meta.uid()) {
+        return Err(invalid("not owned by the current user".into()));
+    }
+    if meta.mode() & 0o777 != 0o600 {
+        return Err(invalid(format!(
+            "mode is {:o}, expected 0600",
+            meta.mode() & 0o777
+        )));
     }
     let mut buf = Vec::new();
-    fs::File::open(path)
-        .and_then(|f| f.take(MAX_BYTES as u64 + 1).read_to_end(&mut buf))
+    file.take(MAX_BYTES as u64 + 1)
+        .read_to_end(&mut buf)
         .map_err(|e| invalid(e.kind().to_string()))?;
     Binding::parse(&buf)
         .map(Some)
@@ -278,6 +297,11 @@ fn bind(ctx: &Ctx, profile: String, machine_id: String) -> Result<String, Refusa
     let real = real
         .to_str()
         .ok_or_else(|| invalid("profile path is not UTF-8".into()))?;
+    let mut content = Vec::new();
+    fs::File::open(real)
+        .and_then(|f| f.take(MAX_BYTES as u64 + 1).read_to_end(&mut content))
+        .map_err(|e| invalid(format!("{real}: {}", e.kind())))?;
+    check_profile(&content)?;
     let want = Binding::new(real, &machine_id)?;
     if let Some(have) = read_binding(&ctx.binding_path)? {
         return if have.same_identity(&want) {
@@ -305,7 +329,7 @@ fn bind(ctx: &Ctx, profile: String, machine_id: String) -> Result<String, Refusa
 /// (which never replaces an existing file).
 fn publish(path: &Path, b: &Binding) -> Result<bool, Refusal> {
     let io = |what: &str, e: std::io::Error| {
-        Refusal::new(Code::BindingInvalid, format!("{what}: {}", e.kind()))
+        Refusal::new(Code::IoFailed, format!("{what}: {}", e.kind()))
     };
     let parent = path
         .parent()
@@ -315,7 +339,17 @@ fn publish(path: &Path, b: &Binding) -> Result<bool, Refusal> {
         .mode(0o700)
         .create(parent)
         .map_err(|e| io("create config dir", e))?;
-    let tmp = parent.join(format!(".machine.toml.{}.tmp", std::process::id()));
+    // pid, a counter and the clock make the name unpredictable enough that create_new fails
+    // rather than writing through a name an attacker prepared.
+    static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.subsec_nanos());
+    let tmp = parent.join(format!(
+        ".machine.toml.{}.{}.{nanos}.tmp",
+        std::process::id(),
+        N.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
     let written = fs::OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -328,7 +362,13 @@ fn publish(path: &Path, b: &Binding) -> Result<bool, Refusal> {
     let linked = written.and_then(|()| fs::hard_link(&tmp, path));
     let _ = fs::remove_file(&tmp);
     match linked {
-        Ok(()) => Ok(true),
+        Ok(()) => {
+            // Make the new directory entry durable.
+            fs::File::open(parent)
+                .and_then(|d| d.sync_all())
+                .map_err(|e| io("sync config dir", e))?;
+            Ok(true)
+        }
         Err(e) if e.kind() == ErrorKind::AlreadyExists => Ok(false),
         Err(e) => Err(io("write binding", e)),
     }

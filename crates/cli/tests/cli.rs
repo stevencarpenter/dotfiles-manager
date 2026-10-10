@@ -276,6 +276,7 @@ fn damaged_or_newer_binding_is_never_overwritten() {
         ("schema = 1\nextra = 1\n", "E_BINDING_INVALID"),
     ] {
         fs::write(&file, content).unwrap();
+        fs::set_permissions(&file, fs::Permissions::from_mode(0o600)).unwrap();
         for args in [
             vec!["bind", "--profile", &p, "--machine-id", "m3"],
             vec!["binding"],
@@ -399,4 +400,105 @@ fn a_home_with_whitespace_is_refused() {
         text(&o.stderr)
     );
     assert!(files_below(&home).is_empty());
+}
+
+#[test]
+fn a_profile_must_be_a_toml_file_with_a_schema_key() {
+    let home = TempDir::new("profile-content");
+    let dir = TempDir::new("profile-files");
+    for (name, content) in [
+        ("empty.toml", ""),
+        ("not-toml.toml", "this is [not toml"),
+        ("no-schema.toml", "id = \"x\"\n"),
+        ("nested-schema.toml", "[t]\nschema = 1\n"),
+    ] {
+        let f = dir.path().join(name);
+        fs::write(&f, content).unwrap();
+        let o = run(
+            home.path(),
+            &[
+                "bind",
+                "--profile",
+                f.to_str().unwrap(),
+                "--machine-id",
+                "m5",
+            ],
+        );
+        assert_eq!(o.status.code(), Some(3), "{name}");
+        assert!(
+            text(&o.stderr).contains("E_PROFILE_INVALID"),
+            "{name}: {}",
+            text(&o.stderr)
+        );
+    }
+    assert!(files_below(home.path()).is_empty());
+}
+
+#[test]
+fn a_binding_that_is_a_symlink_or_not_private_is_refused() {
+    let home = TempDir::new("binding-kind");
+    let p = profile("work-01.toml");
+    assert_eq!(
+        run(
+            home.path(),
+            &["bind", "--profile", &p, "--machine-id", "m3"]
+        )
+        .status
+        .code(),
+        Some(0)
+    );
+    let file = home.path().join(".config/dotfiles-manager/machine.toml");
+    let good = fs::read(&file).unwrap();
+    fs::set_permissions(&file, fs::Permissions::from_mode(0o644)).unwrap();
+    for args in [
+        vec!["binding"],
+        vec!["bind", "--profile", &p, "--machine-id", "m3"],
+    ] {
+        let o = run(home.path(), &args);
+        assert_eq!(o.status.code(), Some(3), "{args:?}");
+        assert!(
+            text(&o.stderr).contains("E_BINDING_INVALID") && text(&o.stderr).contains("0600"),
+            "{}",
+            text(&o.stderr)
+        );
+    }
+    fs::set_permissions(&file, fs::Permissions::from_mode(0o600)).unwrap();
+    let elsewhere = home.path().join("elsewhere.toml");
+    fs::write(&elsewhere, &good).unwrap();
+    fs::set_permissions(&elsewhere, fs::Permissions::from_mode(0o600)).unwrap();
+    fs::remove_file(&file).unwrap();
+    std::os::unix::fs::symlink(&elsewhere, &file).unwrap();
+    let o = run(home.path(), &["binding"]);
+    assert_eq!(o.status.code(), Some(3));
+    assert!(
+        text(&o.stderr).contains("E_BINDING_INVALID"),
+        "{}",
+        text(&o.stderr)
+    );
+}
+
+#[test]
+fn an_io_failure_while_writing_the_binding_exits_1() {
+    let home = TempDir::new("io-failure");
+    let cfg = home.path().join(".config/dotfiles-manager");
+    fs::create_dir_all(&cfg).unwrap();
+    fs::set_permissions(&cfg, fs::Permissions::from_mode(0o500)).unwrap();
+    let o = run(
+        home.path(),
+        &[
+            "bind",
+            "--profile",
+            &profile("work-01.toml"),
+            "--machine-id",
+            "m3",
+        ],
+    );
+    fs::set_permissions(&cfg, fs::Permissions::from_mode(0o700)).unwrap();
+    assert_eq!(o.status.code(), Some(1), "{}", text(&o.stderr));
+    assert!(
+        text(&o.stderr).contains("E_IO_FAILED"),
+        "{}",
+        text(&o.stderr)
+    );
+    assert!(!cfg.join("machine.toml").exists());
 }

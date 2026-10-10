@@ -28,6 +28,24 @@ pub fn valid_machine_id(id: &str) -> bool {
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || b"._-".contains(c))
 }
 
+/// A profile must be a bounded TOML document with a top-level `schema` key. The resolver
+/// (a later task) validates the rest; this only keeps `bind` from recording an arbitrary file.
+pub fn check_profile(bytes: &[u8]) -> Result<(), Refusal> {
+    let bad = |d: &str| Refusal::new(Code::ProfileInvalid, d.to_string());
+    if bytes.len() > MAX_BYTES {
+        return Err(bad("profile exceeds 1 MiB"));
+    }
+    let text = std::str::from_utf8(bytes).map_err(|_| bad("profile is not UTF-8"))?;
+    let table: toml::Table = text.parse().map_err(|e: toml::de::Error| {
+        bad(&format!("profile is not valid TOML: {}", e.message()))
+    })?;
+    if table.contains_key("schema") {
+        Ok(())
+    } else {
+        Err(bad("profile has no top-level schema key"))
+    }
+}
+
 impl Binding {
     /// Builds a binding for this platform. The profile must be a canonical absolute path.
     pub fn new(profile: &str, machine_id: &str) -> Result<Binding, Refusal> {
@@ -118,6 +136,14 @@ mod tests {
     fn round_trip() {
         let b = Binding::new("/p/profile.toml", "m5-personal").unwrap();
         assert_eq!(Binding::parse(b.to_toml().as_bytes()).unwrap(), b);
+    }
+
+    #[test]
+    fn profile_needs_a_top_level_schema_key() {
+        assert!(check_profile(b"schema = 1\nid = \"x\"\n").is_ok());
+        for bad in [&b""[..], b"[t]\nschema = 1\n", b"[oops", b"\xff"] {
+            assert_eq!(check_profile(bad).unwrap_err().code, Code::ProfileInvalid);
+        }
     }
 
     #[test]
