@@ -1,174 +1,14 @@
 //! Storage behavior in an isolated HOME: topology, lock, atomic writes, journal, reconciliation.
 
-use dfm_engine::{Action, Fail, Layout, Probe, Store, Sys, verify_identity};
-use dfm_model::binding::Binding;
-use dfm_model::state::{
-    BinaryId, Class, JournalEntry, Ledger, LedgerResource, OperationRecord, OwnedOutput, Phase,
-    ProfileRef, Receipt, Recovery, RecoveryOutput, RunResult, Stamp, Status, count_statuses,
-};
-use dfm_model::{Code, Refusal};
+mod common;
+
+use common::*;
+use dfm_engine::{Fail, Probe, Store, verify_identity};
+use dfm_model::Code;
+use dfm_model::state::{Class, Ledger, LedgerResource, OwnedOutput, Phase, Stamp};
 use std::fs;
 use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU32, Ordering};
-use std::time::Duration;
-
-struct Home(PathBuf);
-
-impl Home {
-    fn new() -> Home {
-        static N: AtomicU32 = AtomicU32::new(0);
-        let p = std::env::temp_dir().canonicalize().unwrap().join(format!(
-            "dfm-engine-{}-{}",
-            std::process::id(),
-            N.fetch_add(1, Ordering::Relaxed)
-        ));
-        fs::create_dir_all(&p).unwrap();
-        fs::set_permissions(&p, fs::Permissions::from_mode(0o700)).unwrap();
-        Home(p)
-    }
-
-    fn layout(&self) -> Layout {
-        layout(&self.0)
-    }
-}
-
-impl Drop for Home {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
-    }
-}
-
-fn layout(home: &Path) -> Layout {
-    Layout {
-        home: home.into(),
-        config_dir: home.join(".config/dotfiles-manager"),
-        state_root: home.join(".local/state/dotfiles-manager"),
-        lock_file: home.join(".local/state/dotfiles-manager.lock"),
-    }
-}
-
-fn sys(home: &Home) -> Sys {
-    Sys {
-        uid: fs::metadata(&home.0).unwrap().uid(),
-        o_nofollow: 0x0100,
-        o_nonblock: 0x0004,
-        eloop: 62,
-    }
-}
-
-fn binding(profile: &str, id: &str) -> Binding {
-    Binding::new(profile, id).unwrap()
-}
-
-fn open(h: &Home) -> Store {
-    Store::open_write(sys(h), &h.layout(), Fail::none()).unwrap()
-}
-
-fn init(h: &Home) -> (Store, Stamp) {
-    let s = open(h);
-    let stamp = Stamp::of(&binding("/p/profile.toml", "m5"));
-    s.init(&stamp).unwrap();
-    (s, stamp)
-}
-
-fn code<T>(r: Result<T, Refusal>) -> Code {
-    r.err().expect("expected a refusal").code
-}
-
-fn files_below(dir: &Path) -> Vec<PathBuf> {
-    let mut out = Vec::new();
-    for e in fs::read_dir(dir).into_iter().flatten().flatten() {
-        let p = e.path();
-        out.push(p.clone());
-        if e.file_type().unwrap().is_dir() {
-            out.extend(files_below(&p));
-        }
-    }
-    out
-}
-
-fn ledger_with(stamp: &Stamp, home: &Home, resource: &str, file: &str, fp: char) -> Ledger {
-    let mut l = Ledger::empty(stamp.clone());
-    l.record(LedgerResource {
-        resource: resource.into(),
-        adapter: "fs-link/v1".into(),
-        class: Class::Normal,
-        op_id: "op1".into(),
-        owned_outputs: vec![OwnedOutput {
-            path: home.0.join(file).to_str().unwrap().into(),
-            mode: 0o600,
-            fingerprint: Some(fp.to_string().repeat(64)),
-        }],
-    })
-    .unwrap();
-    l
-}
-
-fn intent(op: &str, path: &str) -> JournalEntry {
-    JournalEntry {
-        schema: 1,
-        op_id: "run-1".into(),
-        op: op.into(),
-        phase: Phase::Intent,
-        at: "2026-10-10T00:00:00Z".into(),
-        resource: "core.x".into(),
-        adapter: "fs-link/v1".into(),
-        class: Class::Normal,
-        recovery: Some(Recovery {
-            outputs: vec![RecoveryOutput {
-                path: path.into(),
-                existed_before: false,
-                expected_sha256: Some("a".repeat(64)),
-            }],
-            snapshot: None,
-        }),
-        token: None,
-        reason: None,
-    }
-}
-
-fn receipt(stamp: &Stamp, op_id: &str, outputs: Vec<String>) -> Receipt {
-    let ops = vec![OperationRecord {
-        id: "op1".into(),
-        resource: "core.x".into(),
-        adapter: "fs-link/v1".into(),
-        class: Class::Normal,
-        status: Status::Updated,
-        started_at: "2026-10-10T00:00:00Z".into(),
-        finished_at: "2026-10-10T00:00:01Z".into(),
-        before: None,
-        after: None,
-        owned_outputs: outputs,
-        error: None,
-    }];
-    Receipt {
-        schema: 1,
-        op_id: op_id.into(),
-        command: "sync".into(),
-        started_at: "2026-10-10T00:00:00Z".into(),
-        finished_at: "2026-10-10T00:00:02Z".into(),
-        binary: BinaryId {
-            version: "0.1.0".into(),
-            commit: "unknown".into(),
-            sha256: "0".repeat(64),
-        },
-        profile: ProfileRef {
-            id: stamp.profile.clone(),
-            binding_digest: stamp.binding_digest.clone(),
-        },
-        machine_id: stamp.machine_id.clone(),
-        plan_digest: None,
-        approval: None,
-        sources: vec![],
-        result: RunResult {
-            outcome: "ok".into(),
-            exit_code: 0,
-            counts: count_statuses(&ops),
-        },
-        operations: ops,
-    }
-}
+use std::path::Path;
 
 #[test]
 fn init_builds_a_private_layout_once() {
@@ -189,33 +29,6 @@ fn init_builds_a_private_layout_once() {
     assert_eq!(s.read_state().unwrap().binding, stamp);
     assert!(s.read_ledger().unwrap().resources.is_empty());
     assert_eq!(s.init(&stamp).unwrap_err().code, Code::StateInvalid);
-}
-
-#[test]
-fn a_crashed_init_staging_directory_is_discarded_and_state_is_not_half_built() {
-    let h = Home::new();
-    let s = open(&h);
-    // Leftover from an init that died before the rename.
-    let staging = h.0.join(".local/state/dotfiles-manager/state.next");
-    fs::create_dir_all(staging.join("receipts")).unwrap();
-    fs::set_permissions(&staging, fs::Permissions::from_mode(0o700)).unwrap();
-    fs::set_permissions(staging.join("receipts"), fs::Permissions::from_mode(0o700)).unwrap();
-    fs::write(staging.join("state.json"), "partial").unwrap();
-    let stamp = Stamp::of(&binding("/p/profile.toml", "m5"));
-    s.init(&stamp).unwrap();
-    assert!(!staging.exists());
-    assert_eq!(s.read_state().unwrap().binding, stamp);
-
-    // A failure before the rename leaves no `state` directory at all.
-    let h2 = Home::new();
-    let s2 = Store::open_write(
-        sys(&h2),
-        &h2.layout(),
-        Fail::at("init-before-rename", Action::Error),
-    )
-    .unwrap();
-    assert_eq!(s2.init(&stamp).unwrap_err().code, Code::IoFailed);
-    assert!(!h2.0.join(".local/state/dotfiles-manager/state").exists());
 }
 
 #[test]
@@ -241,27 +54,6 @@ fn the_writer_lock_is_exclusive_and_released_on_drop() {
     assert!(Store::open_read(sys(&h), &h.layout(), Fail::none()).is_ok());
     drop(first);
     open(&h);
-}
-
-#[test]
-fn a_failed_ledger_write_keeps_the_last_good_ledger_and_leaves_no_temporary_file() {
-    let h = Home::new();
-    let (s, stamp) = init(&h);
-    let good = ledger_with(&stamp, &h, "core.x", "a", 'a');
-    s.write_ledger(&good).unwrap();
-    drop(s);
-    for point in ["ledger-before-write", "ledger-after-tmp"] {
-        let s = Store::open_write(sys(&h), &h.layout(), Fail::at(point, Action::Error)).unwrap();
-        let newer = ledger_with(&stamp, &h, "core.x", "a", 'b');
-        assert_eq!(code(s.write_ledger(&newer)), Code::IoFailed, "{point}");
-        assert_eq!(s.read_ledger().unwrap(), good, "{point}");
-        let state = h.0.join(".local/state/dotfiles-manager/state");
-        let temps: Vec<_> = files_below(&state)
-            .into_iter()
-            .filter(|p| p.extension().is_some_and(|e| e == "tmp"))
-            .collect();
-        assert!(temps.is_empty(), "{point}: {temps:?}");
-    }
 }
 
 #[test]
@@ -428,8 +220,11 @@ fn identity_mismatches_and_unreadable_documents_are_findings() {
     let other = Stamp::of(&binding("/p/other.toml", "m5"));
     let mut foreign = receipt(&other, "run-2", vec![]);
     foreign.started_at = "2026-10-11T00:00:00Z".into();
-    s.write_receipt(&foreign).unwrap();
+    // The store refuses to write a foreign receipt, so put one there by hand.
     let dir = h.0.join(".local/state/dotfiles-manager/state/receipts");
+    let fpath = dir.join(foreign.file_name().unwrap());
+    fs::write(&fpath, dfm_model::state::canonical(&foreign).unwrap()).unwrap();
+    fs::set_permissions(&fpath, fs::Permissions::from_mode(0o600)).unwrap();
     fs::write(dir.join("bad.json"), "{").unwrap();
     fs::set_permissions(dir.join("bad.json"), fs::Permissions::from_mode(0o600)).unwrap();
     let findings = verify_identity(&s.load(), &binding("/p/profile.toml", "m5"));
@@ -534,26 +329,262 @@ fn a_macos_style_alias_of_home_is_recognized() {
 }
 
 #[test]
-fn a_stalled_writer_blocks_a_second_one_without_touching_state() {
+fn a_ledger_for_another_identity_is_refused_on_read_and_write_and_stays_unchanged() {
     let h = Home::new();
     let (s, _) = init(&h);
-    drop(s);
-    let slow = Store::open_write(
-        sys(&h),
-        &h.layout(),
-        Fail::at(
-            "journal-before-write",
-            Action::Sleep(Duration::from_millis(300)),
-        ),
+    let other = Stamp::of(&binding("/p/other.toml", "m5"));
+    let before = fs::read(h.0.join(".local/state/dotfiles-manager/state/ledger.json")).unwrap();
+    let foreign = ledger_with(&other, &h, "core.x", "a", 'a');
+    assert_eq!(code(s.write_ledger(&foreign)), Code::IdentityMismatch);
+    let on_disk = h.0.join(".local/state/dotfiles-manager/state/ledger.json");
+    assert_eq!(fs::read(&on_disk).unwrap(), before);
+    // A foreign-stamped ledger put there by hand is refused on read, and gives no authority.
+    fs::write(&on_disk, dfm_model::state::canonical(&foreign).unwrap()).unwrap();
+    assert_eq!(code(s.read_ledger()), Code::IdentityMismatch);
+    let findings = verify_identity(&s.load(), &binding("/p/profile.toml", "m5"));
+    assert!(
+        findings
+            .iter()
+            .any(|f| f.code == Code::IdentityMismatch && f.file == "ledger.json")
+    );
+    // Receipts and trials are held to the same rule.
+    let r = receipt(&other, "run-9", vec![]);
+    assert_eq!(code(s.write_receipt(&r)), Code::IdentityMismatch);
+    assert!(
+        fs::read_dir(h.0.join(".local/state/dotfiles-manager/state/receipts"))
+            .unwrap()
+            .next()
+            .is_none()
+    );
+}
+
+#[test]
+fn a_hand_written_ledger_cannot_own_paths_outside_home_or_manager_storage() {
+    let h = Home::new();
+    let (s, stamp) = init(&h);
+    let on_disk = h.0.join(".local/state/dotfiles-manager/state/ledger.json");
+    let home = h.0.to_str().unwrap().to_string();
+    for bad in [
+        "/etc/hosts".to_string(),
+        format!("{home}/.local/state/dotfiles-manager/state/state.json"),
+        format!("{home}/.LOCAL/state/Dotfiles-Manager/state/state.json"),
+        format!("{home}/.local/share/dotfiles-manager/toolchains/1.98.1/bin/cargo"),
+        format!("{home}/.cache/dotfiles-manager/build"),
+        format!("{home}/.local/state"),
+        format!("{home}/.config"),
+    ] {
+        let mut l = ledger_with(&stamp, &h, "core.x", "a", 'a');
+        l.resources[0].owned_outputs[0].path = bad.clone();
+        fs::write(&on_disk, dfm_model::state::canonical(&l).unwrap()).unwrap();
+        fs::set_permissions(&on_disk, fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(code(s.read_ledger()), Code::StateInvalid, "{bad}");
+        let loaded = s.load();
+        assert!(
+            loaded.ledger.is_err(),
+            "{bad}: no authority is read from it"
+        );
+        let findings = verify_identity(&loaded, &binding("/p/profile.toml", "m5"));
+        assert!(findings.iter().any(|f| f.file == "ledger.json"), "{bad}");
+    }
+}
+
+#[test]
+fn claims_cover_data_cache_ancestors_case_and_symlinked_parents() {
+    let h = Home::new();
+    let (s, stamp) = init(&h);
+    let home = h.0.to_str().unwrap().to_string();
+    // A symlink inside HOME that points at the manager's own storage.
+    symlink(
+        h.0.join(".local/state/dotfiles-manager"),
+        h.0.join("sneaky"),
     )
     .unwrap();
-    let out = h.0.join("out").to_str().unwrap().to_string();
-    std::thread::scope(|sc| {
-        sc.spawn(|| slow.append_journal(&intent("op1", &out)).unwrap());
-        std::thread::sleep(Duration::from_millis(100));
+    let outside = Home::new();
+    symlink(&outside.0, h.0.join("away")).unwrap();
+    for bad in [
+        format!("{home}/.local/share/dotfiles-manager/toolchains/x"),
+        format!("{home}/.cache/dotfiles-manager"),
+        format!("{home}/.CONFIG/dotfiles-manager/machine.toml"),
+        format!("{home}/.local/state"),
+        format!("{home}/sneaky/state/ledger.json"),
+        format!("{home}/away/file"),
+    ] {
+        let mut l = ledger_with(&stamp, &h, "core.x", "a", 'a');
+        l.resources[0].owned_outputs[0].path = bad.clone();
+        assert_eq!(code(s.write_ledger(&l)), Code::StateInvalid, "{bad}");
         assert_eq!(
-            code(Store::open_write(sys(&h), &h.layout(), Fail::none())),
-            Code::Locked
+            code(s.append_journal(&intent("op1", &bad))),
+            Code::StateInvalid,
+            "{bad}"
         );
-    });
+    }
+    // The leaf itself may be a symlink: a link is a legitimate claim.
+    symlink("/etc/hosts", h.0.join("link")).unwrap();
+    let mut l = ledger_with(&stamp, &h, "core.x", "link", 'a');
+    s.write_ledger(&l).unwrap();
+    l.resources.clear();
+    s.write_ledger(&l).unwrap();
+    assert!(fs::read_dir(&outside.0).unwrap().next().is_none());
+}
+
+#[test]
+fn the_holder_stops_when_its_lock_file_is_removed_or_replaced() {
+    let h = Home::new();
+    let (s, stamp) = init(&h);
+    let lock = h.0.join(".local/state/dotfiles-manager.lock");
+    fs::remove_file(&lock).unwrap();
+    // The old holder is fenced: it refuses every further write.
+    assert_eq!(
+        code(s.write_ledger(&ledger_with(&stamp, &h, "core.x", "a", 'a'))),
+        Code::Locked
+    );
+    assert_eq!(
+        code(s.append_journal(&intent("op1", h.0.join("o").to_str().unwrap()))),
+        Code::Locked
+    );
+    drop(s);
+    // A replaced file is caught the same way.
+    let s = open(&h);
+    fs::remove_file(&lock).unwrap();
+    fs::write(&lock, "x").unwrap();
+    fs::set_permissions(&lock, fs::Permissions::from_mode(0o600)).unwrap();
+    assert_eq!(
+        code(s.write_ledger(&ledger_with(&stamp, &h, "core.x", "a", 'a'))),
+        Code::Locked
+    );
+}
+
+#[test]
+fn a_planted_fifo_or_loose_lock_file_cannot_hang_or_be_trusted() {
+    let h = Home::new();
+    let parent = h.0.join(".local/state");
+    fs::create_dir_all(&parent).unwrap();
+    fs::set_permissions(&parent, fs::Permissions::from_mode(0o700)).unwrap();
+    let lock = parent.join("dotfiles-manager.lock");
+    assert!(
+        std::process::Command::new("/usr/bin/mkfifo")
+            .arg(&lock)
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert_eq!(
+        code(Store::open_write(sys(&h), &h.layout(), Fail::none())),
+        Code::StorageInvalid
+    );
+    fs::remove_file(&lock).unwrap();
+    fs::write(&lock, "").unwrap();
+    fs::set_permissions(&lock, fs::Permissions::from_mode(0o666)).unwrap();
+    assert_eq!(
+        code(Store::open_write(sys(&h), &h.layout(), Fail::none())),
+        Code::StorageInvalid
+    );
+}
+
+#[test]
+fn the_directory_chain_is_checked_again_just_before_each_write() {
+    let h = Home::new();
+    let (s, stamp) = init(&h);
+    let foreign = Home::new();
+    let state = h.0.join(".local/state/dotfiles-manager/state");
+    // Swap `receipts` for a link after the store was opened and validated.
+    fs::remove_dir(state.join("receipts")).unwrap();
+    symlink(&foreign.0, state.join("receipts")).unwrap();
+    assert_eq!(
+        code(s.write_receipt(&receipt(&stamp, "run-1", vec![]))),
+        Code::StorageInvalid
+    );
+    assert!(fs::read_dir(&foreign.0).unwrap().next().is_none());
+    // The same for the state root itself.
+    let root = h.0.join(".local/state/dotfiles-manager");
+    fs::set_permissions(&root, fs::Permissions::from_mode(0o755)).unwrap();
+    assert_eq!(
+        code(s.write_ledger(&ledger_with(&stamp, &h, "core.x", "a", 'a'))),
+        Code::StorageInvalid
+    );
+    assert_eq!(
+        code(s.append_journal(&intent("op1", h.0.join("o").to_str().unwrap()))),
+        Code::StorageInvalid
+    );
+}
+
+#[test]
+fn load_reports_listing_errors_odd_names_and_stray_snapshot_files() {
+    let h = Home::new();
+    let (s, _) = init(&h);
+    let state = h.0.join(".local/state/dotfiles-manager/state");
+    s.write_snapshot("run-1", "core-x", b"old", Class::Normal)
+        .unwrap();
+    fs::write(state.join("snapshots/run-1/.core-y.1.2.3.tmp"), "half").unwrap();
+    let l = s.load();
+    assert!(
+        l.strays
+            .iter()
+            .any(|x| x.contains("snapshots/run-1/.core-y")),
+        "{:?}",
+        l.strays
+    );
+    // An unreadable directory is a finding, not an empty listing.
+    fs::set_permissions(state.join("trials"), fs::Permissions::from_mode(0o000)).unwrap();
+    let l = s.load();
+    assert!(
+        l.problems
+            .iter()
+            .any(|p| p.file == "trials" && p.detail.contains("cannot list")),
+        "{:?}",
+        l.problems
+    );
+    fs::set_permissions(state.join("trials"), fs::Permissions::from_mode(0o700)).unwrap();
+}
+
+#[test]
+fn secrets_are_redacted_in_text_and_refused_in_names() {
+    let h = Home::new();
+    let (s, stamp) = init(&h);
+    let s = s.with_secrets(vec!["hunter2".into()]);
+    let state = h.0.join(".local/state/dotfiles-manager/state");
+    let out = h.0.join("out").to_str().unwrap().to_string();
+    let mut e = intent("op1", &out);
+    e.reason = Some("auth failed for hunter2".into());
+    e.token = Some("tok-hunter2".into());
+    s.append_journal(&e).unwrap();
+    let mut r = receipt(&stamp, "run-1", vec![out.clone()]);
+    r.command = "sync hunter2".into();
+    r.operations[0].error = Some("bad hunter2".into());
+    s.write_receipt(&r).unwrap();
+    // Names cannot be redacted without breaking them, so they are refused, and not echoed.
+    let named = h.0.join("tok-hunter2").to_str().unwrap().to_string();
+    let bad = s.append_journal(&intent("op2", &named)).unwrap_err();
+    assert_eq!(bad.code, Code::StateInvalid);
+    assert!(!bad.detail.contains("hunter2"));
+    let mut l = ledger_with(&stamp, &h, "core.x", "tok-hunter2", 'a');
+    assert_eq!(code(s.write_ledger(&l)), Code::StateInvalid);
+    l.resources.clear();
+    s.write_ledger(&l).unwrap();
+    let mut files = vec![state.join("journal.jsonl"), state.join("ledger.json")];
+    files.extend(
+        fs::read_dir(state.join("receipts"))
+            .unwrap()
+            .map(|e| e.unwrap().path()),
+    );
+    for f in files {
+        let body = fs::read_to_string(&f).unwrap();
+        assert!(!body.contains("hunter2"), "{f:?}");
+    }
+}
+
+#[test]
+fn reconcile_refuses_a_torn_journal_and_leaves_it_alone() {
+    let h = Home::new();
+    let (s, _) = init(&h);
+    let out = h.0.join("out").to_str().unwrap().to_string();
+    s.append_journal(&intent("op1", &out)).unwrap();
+    s.append_journal(&intent("op2", &out)).unwrap();
+    let j =
+        h.0.join(".local/state/dotfiles-manager/state/journal.jsonl");
+    let mut bytes = fs::read(&j).unwrap();
+    bytes.truncate(bytes.len() - 7);
+    fs::write(&j, &bytes).unwrap();
+    assert_eq!(code(s.reconcile(&|_| Probe::Done)), Code::StateInvalid);
+    assert_eq!(fs::read(&j).unwrap(), bytes);
 }

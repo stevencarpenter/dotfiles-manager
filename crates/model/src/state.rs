@@ -84,10 +84,11 @@ pub fn parse<T: DeserializeOwned>(kind: &str, bytes: &[u8]) -> Result<T, Refusal
 }
 
 /// Canonical form: UTF-8, sorted keys, no insignificant whitespace.
-pub fn canonical<T: Serialize>(doc: &T) -> Vec<u8> {
+pub fn canonical<T: Serialize>(doc: &T) -> Result<Vec<u8>, Refusal> {
     // `Value` keeps objects in a sorted map (serde_json without `preserve_order`).
-    let v = serde_json::to_value(doc).expect("plain data always serializes");
-    serde_json::to_vec(&v).expect("a JSON value always serializes")
+    serde_json::to_value(doc)
+        .and_then(|v| serde_json::to_vec(&v))
+        .map_err(|e| bad(format!("cannot serialize: {e}")))
 }
 
 // ---- identity ---------------------------------------------------------------------------------
@@ -532,7 +533,7 @@ impl JournalEntry {
     /// One line of `journal.jsonl`, with the trailing newline.
     pub fn to_line(&self) -> Result<Vec<u8>, Refusal> {
         self.validate()?;
-        let mut l = canonical(self);
+        let mut l = canonical(self)?;
         l.push(b'\n');
         if l.len() > MAX_JOURNAL_LINE {
             return Err(Refusal::new(
@@ -648,19 +649,47 @@ impl TrialRecord {
 
 // ---- redaction and time -----------------------------------------------------------------------
 
-/// Text for a receipt, journal or log: known secret values become `[redacted]`, control
-/// characters become visible escapes, and the length is bounded.
+fn hidden(c: char) -> bool {
+    // Bidirectional overrides and isolates, zero-width characters and the byte order mark can
+    // hide or reorder text on a terminal.
+    matches!(c, '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2060}'..='\u{2064}'
+        | '\u{2066}'..='\u{2069}' | '\u{FEFF}')
+}
+
+/// True when any known secret value occurs in `text`.
+pub fn leaks(text: &str, secrets: &[&str]) -> bool {
+    secrets.iter().any(|s| !s.is_empty() && text.contains(s))
+}
+
+/// Text for a receipt, journal or log: every occurrence of a known secret value becomes
+/// `[redacted]` (overlapping and adjacent occurrences are merged, so no part of a longer match
+/// survives), control, bidirectional and zero-width characters become visible escapes, and the
+/// length is bounded.
 pub fn redact(text: &str, secrets: &[&str]) -> String {
-    let mut t = text.to_string();
-    // Longest first: replacing a short secret first could leave the rest of a longer one visible.
-    let mut ordered: Vec<&&str> = secrets.iter().filter(|s| !s.is_empty()).collect();
-    ordered.sort_by_key(|s| std::cmp::Reverse(s.len()));
-    for s in ordered {
-        t = t.replace(*s, "[redacted]");
+    let mut ranges: Vec<(usize, usize)> = secrets
+        .iter()
+        .filter(|s| !s.is_empty())
+        .flat_map(|s| text.match_indices(s).map(|(i, m)| (i, i + m.len())))
+        .collect();
+    ranges.sort_unstable();
+    let mut merged: Vec<(usize, usize)> = Vec::new();
+    for (start, end) in ranges {
+        match merged.last_mut() {
+            Some(last) if start <= last.1 => last.1 = last.1.max(end),
+            _ => merged.push((start, end)),
+        }
     }
+    let mut t = String::with_capacity(text.len());
+    let mut at = 0;
+    for (start, end) in merged {
+        t.push_str(&text[at..start]);
+        t.push_str("[redacted]");
+        at = end;
+    }
+    t.push_str(&text[at..]);
     let mut out = String::new();
     for c in t.chars() {
-        let piece: String = if c.is_control() {
+        let piece: String = if c.is_control() || hidden(c) {
             c.escape_default().collect()
         } else {
             c.to_string()
@@ -672,6 +701,179 @@ pub fn redact(text: &str, secrets: &[&str]) -> String {
     }
     out
 }
+
+fn secret_in_path() -> Refusal {
+    // The value is not repeated: this text is printed.
+    bad("a path or identifier contains a known secret; it is refused, not redacted")
+}
+
+impl Receipt {
+    /// Redacts descriptive text with `secrets` in one pass. A path or identifier that contains
+    /// a secret cannot be redacted without breaking its use, so it is refused.
+    pub fn scrub(&mut self, secrets: &[&str]) -> Result<(), Refusal> {
+        for o in &self.operations {
+            let ids = [&o.id, &o.resource, &o.adapter];
+            if ids.iter().any(|t| leaks(t, secrets))
+                || o.owned_outputs.iter().any(|p| leaks(p, secrets))
+            {
+                return Err(secret_in_path());
+            }
+        }
+        let red = |t: &mut String| *t = redact(t, secrets);
+        red(&mut self.command);
+        red(&mut self.binary.version);
+        red(&mut self.binary.commit);
+        if let Some(a) = &mut self.approval {
+            red(&mut a.kind);
+        }
+        for o in &mut self.operations {
+            if let Some(e) = &mut o.error {
+                red(e);
+            }
+        }
+        Ok(())
+    }
+}
+
+impl JournalEntry {
+    /// Redacts descriptive text with `secrets`. Identifiers and recovery paths that contain a
+    /// secret are refused.
+    pub fn scrub(&mut self, secrets: &[&str]) -> Result<(), Refusal> {
+        let paths = self
+            .recovery
+            .iter()
+            .flat_map(|r| &r.outputs)
+            .map(|o| &o.path);
+        let ids = [&self.op_id, &self.op, &self.resource, &self.adapter];
+        if ids.iter().any(|t| leaks(t, secrets)) || paths.into_iter().any(|p| leaks(p, secrets)) {
+            return Err(secret_in_path());
+        }
+        for t in [&mut self.token, &mut self.reason].into_iter().flatten() {
+            *t = redact(t, secrets);
+        }
+        Ok(())
+    }
+}
+
+impl Ledger {
+    /// A ledger key or path that contains a known secret is refused.
+    pub fn check_secrets(&self, secrets: &[&str]) -> Result<(), Refusal> {
+        let bad_text = self.resources.iter().any(|r| {
+            leaks(&r.resource, secrets)
+                || leaks(&r.adapter, secrets)
+                || r.owned_outputs.iter().any(|o| leaks(&o.path, secrets))
+        });
+        if bad_text {
+            Err(secret_in_path())
+        } else {
+            Ok(())
+        }
+    }
+}
+
+impl TrialRecord {
+    /// A trial id, tool or path that contains a known secret is refused.
+    pub fn check_secrets(&self, secrets: &[&str]) -> Result<(), Refusal> {
+        let paths = self
+            .baseline
+            .paths
+            .iter()
+            .map(|p| &p.path)
+            .chain(&self.owned_outputs);
+        let hit = [&self.trial_id, &self.tool]
+            .iter()
+            .any(|t| leaks(t, secrets))
+            || paths.into_iter().any(|p| leaks(p, secrets));
+        if hit { Err(secret_in_path()) } else { Ok(()) }
+    }
+}
+
+// ---- scope ------------------------------------------------------------------------------------
+
+/// Where a claim may point: strictly inside HOME, and neither inside, equal to, nor an ancestor
+/// of a reserved manager path (state, config, lock, data, cache). Comparison is case-folded,
+/// because APFS is case-insensitive by default. Unicode normalization differences are not
+/// folded (a known limit).
+#[derive(Debug, Clone)]
+pub struct Scope {
+    home: String,
+    reserved: Vec<String>,
+}
+
+impl Scope {
+    pub fn new(home: &str, reserved: &[String]) -> Scope {
+        Scope {
+            home: home.to_lowercase(),
+            reserved: reserved.iter().map(|r| r.to_lowercase()).collect(),
+        }
+    }
+
+    pub fn admits(&self, path: &str) -> bool {
+        if !valid_path(path) {
+            return false;
+        }
+        let p = path.to_lowercase();
+        let inside = p
+            .strip_prefix(&self.home)
+            .is_some_and(|rest| rest.starts_with('/') && rest.len() > 1);
+        inside
+            && !self.reserved.iter().any(|r| {
+                p == *r || p.starts_with(&format!("{r}/")) || r.starts_with(&format!("{p}/"))
+            })
+    }
+
+    fn check<'a>(&self, paths: impl IntoIterator<Item = &'a String>) -> Result<(), Refusal> {
+        match paths.into_iter().find(|p| !self.admits(p)) {
+            None => Ok(()),
+            Some(p) => Err(bad(format!(
+                "{p} is outside HOME or overlaps the manager's own paths"
+            ))),
+        }
+    }
+}
+
+impl Ledger {
+    /// Containment of every owned output. Applied on read as well as on write.
+    pub fn validate_within(&self, scope: &Scope) -> Result<(), Refusal> {
+        scope.check(
+            self.resources
+                .iter()
+                .flat_map(|r| &r.owned_outputs)
+                .map(|o| &o.path),
+        )
+    }
+}
+
+impl Receipt {
+    pub fn validate_within(&self, scope: &Scope) -> Result<(), Refusal> {
+        scope.check(self.operations.iter().flat_map(|o| &o.owned_outputs))
+    }
+}
+
+impl TrialRecord {
+    pub fn validate_within(&self, scope: &Scope) -> Result<(), Refusal> {
+        scope.check(
+            self.baseline
+                .paths
+                .iter()
+                .map(|p| &p.path)
+                .chain(&self.owned_outputs),
+        )
+    }
+}
+
+impl JournalEntry {
+    pub fn validate_within(&self, scope: &Scope) -> Result<(), Refusal> {
+        scope.check(
+            self.recovery
+                .iter()
+                .flat_map(|r| &r.outputs)
+                .map(|o| &o.path),
+        )
+    }
+}
+
+// ---- time -------------------------------------------------------------------------------------
 
 /// Days since 1970-01-01 to a civil date (proleptic Gregorian).
 fn civil(days: i64) -> (i64, u32, u32) {
@@ -821,7 +1023,7 @@ mod tests {
     #[test]
     fn documents_round_trip_in_canonical_form() {
         let doc = StateDoc::new(stamp(), 7);
-        let bytes = canonical(&doc);
+        let bytes = canonical(&doc).unwrap();
         assert_eq!(StateDoc::parse(&bytes).unwrap(), doc);
         let text = String::from_utf8(bytes).unwrap();
         assert!(!text.contains(' ') && !text.contains('\n'));
@@ -893,14 +1095,14 @@ mod tests {
             op(Status::Updated, Class::Normal),
             op(Status::Current, Class::Normal),
         ]);
-        let back = Receipt::parse(&canonical(&ok)).unwrap();
+        let back = Receipt::parse(&canonical(&ok).unwrap()).unwrap();
         assert_eq!(back, ok);
         assert_eq!(back.result.counts.values().sum::<u32>(), 2);
         assert_eq!(back.file_name().unwrap(), "20261010T000000Z-run-1.json");
 
         let mut skew = ok.clone();
         skew.result.counts.insert(Status::Failed, 1);
-        assert!(Receipt::parse(&canonical(&skew)).is_err());
+        assert!(Receipt::parse(&canonical(&skew).unwrap()).is_err());
 
         let mut s = op(Status::Updated, Class::Sensitive);
         s.after = Some(Fingerprint {
@@ -963,6 +1165,11 @@ mod tests {
         assert_eq!(out, "token=[redacted]\\u{1b}[31m ok");
         assert!(!out.contains("hunter2"));
         assert!(redact(&"x".repeat(10_000), &[]).len() <= MAX_ERROR_BYTES);
+        // Overlapping matches merge, so no tail of the longer one survives.
+        assert_eq!(redact("abcdef", &["abcd", "cdef"]), "[redacted]");
+        assert_eq!(redact("abcdefgh", &["abcd", "efgh"]), "[redacted]");
+        // Bidirectional and zero-width characters become visible.
+        assert_eq!(redact("a\u{202E}b\u{200B}c", &[]), "a\\u{202e}b\\u{200b}c");
         // A secret that contains another secret is redacted whole, whatever the list order.
         for list in [["abc", "abcdef"], ["abcdef", "abc"]] {
             assert_eq!(redact("x abcdef y", &list), "x [redacted] y");
@@ -987,9 +1194,51 @@ mod tests {
             },
             owned_outputs: vec![],
         };
-        assert_eq!(TrialRecord::parse(&canonical(&t)).unwrap(), t);
+        assert_eq!(TrialRecord::parse(&canonical(&t).unwrap()).unwrap(), t);
         let mut bad = t;
         bad.trial_id = "Bad Id".into();
         assert!(bad.validate().is_err());
+    }
+
+    #[test]
+    fn scope_is_case_folded_strict_and_refuses_ancestors() {
+        let reserved = [
+            "/H/.local/state/dotfiles-manager".to_string(),
+            "/H/.config/dotfiles-manager".to_string(),
+        ];
+        let sc = Scope::new("/H", &reserved);
+        for ok in [
+            "/H/.gitconfig",
+            "/h/.config/git/config",
+            "/H/.local/share/x",
+        ] {
+            assert!(sc.admits(ok), "{ok}");
+        }
+        for no in [
+            "/H",
+            "/etc/hosts",
+            "/Hx/y",
+            "/H/.local/state/dotfiles-manager/state/state.json",
+            "/h/.LOCAL/STATE/Dotfiles-Manager/state/ledger.json",
+            "/H/.local/state",
+            "/H/.config",
+            "/H/.local",
+            "/H/.config/dotfiles-manager/machine.toml",
+        ] {
+            assert!(!sc.admits(no), "{no}");
+        }
+    }
+
+    #[test]
+    fn scrub_redacts_text_and_refuses_secret_paths_without_echoing_them() {
+        let mut r = receipt(vec![op(Status::Updated, Class::Normal)]);
+        r.command = "sync hunter2".into();
+        r.operations[0].error = Some("bad hunter2".into());
+        r.scrub(&["hunter2"]).unwrap();
+        assert_eq!(r.command, "sync [redacted]");
+        assert_eq!(r.operations[0].error.as_deref(), Some("bad [redacted]"));
+        r.operations[0].owned_outputs = vec!["/h/tok-hunter2".into()];
+        let e = r.scrub(&["hunter2"]).unwrap_err();
+        assert!(!e.detail.contains("hunter2"));
     }
 }

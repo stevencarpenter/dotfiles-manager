@@ -134,14 +134,15 @@ fn names_below(dir: &Path) -> Vec<String> {
         .collect()
 }
 
+fn json(bytes: &[u8]) -> serde_json::Value {
+    serde_json::from_slice(bytes).unwrap()
+}
+
 fn journal_phases(h: &Path) -> Vec<String> {
     fs::read_to_string(state(h).join("journal.jsonl"))
         .unwrap()
         .lines()
-        .map(|l| {
-            let at = l.find("\"phase\":\"").unwrap() + 9;
-            l[at..].split('"').next().unwrap().to_string()
-        })
+        .map(|l| json(l.as_bytes())["phase"].as_str().unwrap().to_string())
         .collect()
 }
 
@@ -227,18 +228,24 @@ fn an_operation_journals_intent_then_done_then_records_ownership_and_a_receipt()
     let first = intent.lines().next().unwrap();
     assert!(first.contains("\"existed_before\":false") && first.contains(&sha_hex("[user]\n")));
 
-    let ledger = fs::read_to_string(state(h.path()).join("ledger.json")).unwrap();
-    assert!(ledger.contains("core.git") && ledger.contains(&out_file(h.path(), "gitconfig")));
-    assert!(ledger.contains(&sha_hex("[user]\n")));
+    let ledger = json(&fs::read(state(h.path()).join("ledger.json")).unwrap());
+    let owned = &ledger["resources"][0];
+    assert_eq!(owned["resource"], "core.git");
+    assert_eq!(
+        owned["owned_outputs"][0]["path"],
+        out_file(h.path(), "gitconfig")
+    );
+    assert_eq!(
+        owned["owned_outputs"][0]["fingerprint"],
+        sha_hex("[user]\n")
+    );
     let receipts = names_below(&state(h.path()).join("receipts"));
     assert_eq!(receipts.len(), 1, "{receipts:?}");
     let rp = state(h.path()).join("receipts").join(&receipts[0]);
     assert_eq!(fs::metadata(&rp).unwrap().mode() & 0o777, 0o600);
-    let r = fs::read_to_string(&rp).unwrap();
-    assert!(
-        r.contains("\"updated\":1") && r.contains("\"exit_code\":0"),
-        "{r}"
-    );
+    let r = json(&fs::read(&rp).unwrap());
+    assert_eq!(r["result"]["counts"]["updated"], 1);
+    assert_eq!(r["result"]["exit_code"], 0);
     let c = check(h.path());
     assert_eq!(c.status.code(), Some(0), "{}", text(&c.stdout));
     assert!(text(&c.stdout).contains("1 resources, 1 owned outputs"));
@@ -306,10 +313,15 @@ fn abrupt_exit_at_every_point_leaves_recoverable_state_and_a_free_lock() {
         if point.starts_with("ledger-after-tmp") || interrupted || point == "after-done" {
             assert_eq!(now, good_ledger, "{point}: last good ledger preserved");
         }
-        assert!(
-            !text(&now).contains("core.victim")
-                || point.starts_with("ledger-after-rename")
-                || point.starts_with("receipt")
+        let owns = json(&now)["resources"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r["resource"] == "core.victim");
+        let ledger_replaced = point == "ledger-after-rename" || point.starts_with("receipt");
+        assert_eq!(
+            owns, ledger_replaced,
+            "{point}: ledger holds the victim only once replaced"
         );
 
         // Nothing grants ownership of the victim by inference.
@@ -424,6 +436,8 @@ fn a_persistence_failure_keeps_the_last_good_files_and_leaves_no_temporary_file(
 fn a_second_writer_gets_exit_3_and_writes_nothing() {
     let h = bound_home("lock");
     let out = out_file(h.path(), "slow");
+    // The holder waits at the failpoint until this file exists. No timing is involved.
+    let release = h.path().join("release-holder");
     let mut slow = cmd(
         h.path(),
         &[
@@ -436,7 +450,10 @@ fn a_second_writer_gets_exit_3_and_writes_nothing() {
             "s",
         ],
     )
-    .env("DFM_FAILPOINT", "after-intent:sleep-1500")
+    .env(
+        "DFM_FAILPOINT",
+        format!("after-intent:wait-{}", release.display()),
+    )
     .stdout(Stdio::null())
     .stderr(Stdio::null())
     .spawn()
@@ -471,6 +488,7 @@ fn a_second_writer_gets_exit_3_and_writes_nothing() {
     // Read-only commands still run while the lock is held.
     assert!(matches!(check(h.path()).status.code(), Some(0 | 1)));
 
+    fs::write(&release, "go").unwrap();
     assert_eq!(slow.wait().unwrap().code(), Some(0));
     assert_eq!(journal_phases(h.path()), ["intent", "done"]);
     assert_eq!(check(h.path()).status.code(), Some(0));
@@ -768,14 +786,13 @@ fn redirected_manager_paths_are_refused_with_zero_writes_to_the_destination() {
         };
         let o = run(h.path(), &args);
         let err = text(&o.stderr);
+        // bind refuses before any write (3). The read-only check reports a finding (1).
+        let want = if then == ["bind"] { 3 } else { 1 };
+        assert_eq!(o.status.code(), Some(want), "{victim}: {err}");
+        let said = format!("{err}{}", text(&o.stdout));
         assert!(
-            matches!(o.status.code(), Some(3)),
-            "{victim}: {:?} {err}",
-            o.status
-        );
-        assert!(
-            err.contains("E_STORAGE_INVALID") || err.contains("E_BINDING_INVALID"),
-            "{victim}: {err}"
+            said.contains("E_STORAGE_INVALID") || said.contains("E_BINDING_INVALID"),
+            "{victim}: {said}"
         );
         assert!(
             names_below(foreign.path()).is_empty(),
@@ -833,8 +850,8 @@ fn conflicting_path_types_and_loose_permissions_are_refused_not_repaired() {
         let p = h.path().join(path);
         fs::set_permissions(&p, fs::Permissions::from_mode(mode)).unwrap();
         let o = check(h.path());
-        assert_eq!(o.status.code(), Some(3), "{label}: {}", text(&o.stderr));
-        assert!(text(&o.stderr).contains("E_STORAGE_INVALID"), "{label}");
+        assert_eq!(o.status.code(), Some(1), "{label}: {}", text(&o.stderr));
+        assert!(text(&o.stdout).contains("E_STORAGE_INVALID"), "{label}");
         let o = record(h.path(), "core.x", "x", "x");
         assert_eq!(o.status.code(), Some(3), "{label}");
         assert!(
@@ -1072,4 +1089,210 @@ fn claims_are_limited_to_exact_paths_inside_home() {
         assert_eq!(snapshot(h.path()), before, "{path}");
     }
     assert!(!Path::new("/etc/dotfiles-manager-test").exists());
+}
+
+// ---- review round: exit codes, names, tampering ---------------------------------------------------
+
+#[test]
+fn a_refusal_after_the_effect_exits_1_not_3() {
+    let h = bound_home("mutated");
+    let run_with = |name: &str| {
+        let out = out_file(h.path(), name);
+        run(
+            h.path(),
+            &[
+                "__record-op",
+                "--resource",
+                "core.dup",
+                "--output",
+                &out,
+                "--content",
+                "x",
+                "--op-id",
+                "dup",
+                "--at",
+                "1791590400",
+            ],
+        )
+    };
+    assert_eq!(run_with("first").status.code(), Some(0));
+    // Same run id and start time: the receipt name collides after the effect already happened.
+    let o = run_with("second");
+    assert_eq!(o.status.code(), Some(1), "{}", text(&o.stderr));
+    assert!(
+        text(&o.stderr).contains("E_STORAGE_INVALID"),
+        "{}",
+        text(&o.stderr)
+    );
+    assert!(h.path().join("second").exists(), "the effect did happen");
+    // A refusal before the intent is still a gate: exit 3.
+    let o = record(h.path(), "core.dup", "first", "x");
+    assert_eq!(o.status.code(), Some(3));
+}
+
+#[test]
+fn a_secret_in_a_file_name_is_refused_before_anything_is_written() {
+    let h = bound_home("secret-name");
+    let before = snapshot(h.path());
+    let named = out_file(h.path(), "tok-hunter2");
+    let o = run(
+        h.path(),
+        &[
+            "__record-op",
+            "--resource",
+            "personal.token",
+            "--output",
+            &named,
+            "--content",
+            "c",
+            "--secret",
+            "hunter2",
+        ],
+    );
+    assert_eq!(o.status.code(), Some(3), "{}", text(&o.stderr));
+    let said = format!("{}{}", text(&o.stdout), text(&o.stderr));
+    assert!(!said.contains("hunter2"), "{said}");
+    assert!(!Path::new(&named).exists());
+    assert_eq!(snapshot(h.path()), before);
+}
+
+#[test]
+fn a_hand_written_ledger_cannot_grant_authority_over_foreign_paths() {
+    let h = seeded("handwritten");
+    let path = state(h.path()).join("ledger.json");
+    for target in [
+        "/etc/hosts".to_string(),
+        state(h.path())
+            .join("state.json")
+            .to_str()
+            .unwrap()
+            .to_string(),
+    ] {
+        let mut l = json(&fs::read(&path).unwrap());
+        l["resources"][0]["owned_outputs"][0]["path"] = target.clone().into();
+        fs::write(&path, serde_json::to_vec(&l).unwrap()).unwrap();
+        let c = check(h.path());
+        let report = text(&c.stdout);
+        assert_eq!(c.status.code(), Some(1), "{target}: {report}");
+        assert!(
+            report.contains("E_STATE_INVALID ledger.json"),
+            "{target}: {report}"
+        );
+        assert!(!report.contains("owned outputs"), "{target}: {report}");
+        let o = record(h.path(), "core.z", "z", "z");
+        assert_eq!(o.status.code(), Some(3), "{target}");
+        assert!(!h.path().join("z").exists());
+    }
+}
+
+#[test]
+fn a_ledger_for_another_machine_stops_the_writer_before_any_effect() {
+    let h = seeded("foreign-ledger");
+    let path = state(h.path()).join("ledger.json");
+    let good = fs::read(&path).unwrap();
+    let swapped = text(&good).replace(
+        &format!("\"machine_id\":\"{M5}\""),
+        "\"machine_id\":\"m3-work\"",
+    );
+    fs::write(&path, &swapped).unwrap();
+    let o = record(h.path(), "core.z", "z", "z");
+    assert_eq!(o.status.code(), Some(3), "{}", text(&o.stderr));
+    assert!(
+        text(&o.stderr).contains("E_IDENTITY_MISMATCH"),
+        "{}",
+        text(&o.stderr)
+    );
+    assert!(!h.path().join("z").exists());
+    assert_eq!(fs::read_to_string(&path).unwrap(), swapped, "left alone");
+}
+
+#[test]
+fn a_holder_whose_lock_file_was_removed_stops_writing() {
+    let h = bound_home("lock-removed");
+    let out = out_file(h.path(), "held");
+    let release = h.path().join("release-holder");
+    let holder = cmd(
+        h.path(),
+        &[
+            "__record-op",
+            "--resource",
+            "core.held",
+            "--output",
+            &out,
+            "--content",
+            "h",
+        ],
+    )
+    .env(
+        "DFM_FAILPOINT",
+        format!("after-effect:wait-{}", release.display()),
+    )
+    .stdout(Stdio::null())
+    .stderr(Stdio::piped())
+    .spawn()
+    .unwrap();
+    wait_for("the effect", || Path::new(&out).exists());
+    fs::remove_file(h.path().join(".local/state/dotfiles-manager.lock")).unwrap();
+    fs::write(&release, "go").unwrap();
+    let o = holder.wait_with_output().unwrap();
+    // The effect happened, then the next write was refused: after a mutation, so exit 1.
+    assert_eq!(o.status.code(), Some(1), "{}", text(&o.stderr));
+    assert!(text(&o.stderr).contains("E_LOCKED"), "{}", text(&o.stderr));
+    assert_eq!(
+        journal_phases(h.path()),
+        ["intent"],
+        "no outcome was written without the lock"
+    );
+    let ledger = json(&fs::read(state(h.path()).join("ledger.json")).unwrap());
+    assert!(ledger["resources"].as_array().unwrap().is_empty());
+}
+
+#[test]
+fn a_torn_journal_is_reported_and_reconcile_leaves_it_alone() {
+    let h = bound_home("torn");
+    let out = out_file(h.path(), "victim");
+    let o = with_fail(
+        h.path(),
+        "after-effect:abort",
+        &[
+            "__record-op",
+            "--resource",
+            "core.victim",
+            "--output",
+            &out,
+            "--content",
+            "v",
+        ],
+    );
+    assert_eq!(o.status.signal(), Some(6));
+    let j = state(h.path()).join("journal.jsonl");
+    let mut bytes = fs::read(&j).unwrap();
+    bytes.truncate(bytes.len() - 5);
+    fs::write(&j, &bytes).unwrap();
+    let c = check(h.path());
+    assert_eq!(c.status.code(), Some(1));
+    assert!(
+        text(&c.stdout).contains("E_STATE_INVALID journal.jsonl"),
+        "{}",
+        text(&c.stdout)
+    );
+    let r = run(h.path(), &["__reconcile"]);
+    assert_eq!(r.status.code(), Some(3), "{}", text(&r.stderr));
+    assert_eq!(fs::read(&j).unwrap(), bytes);
+}
+
+#[test]
+fn an_unreadable_receipts_directory_is_a_finding_not_an_empty_list() {
+    let h = seeded("unreadable");
+    let dir = state(h.path()).join("receipts");
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o000)).unwrap();
+    let c = check(h.path());
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+    assert_eq!(c.status.code(), Some(1), "{}", text(&c.stderr));
+    assert!(
+        text(&c.stdout).contains("E_STORAGE_INVALID"),
+        "{}",
+        text(&c.stdout)
+    );
+    assert!(!text(&c.stdout).contains("state ok"));
 }

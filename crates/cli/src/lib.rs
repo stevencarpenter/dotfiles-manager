@@ -69,6 +69,8 @@ impl Ctx {
                 .map_or_else(|| self.platform.config_dir(), Path::to_path_buf),
             state_root: self.platform.state_dir(),
             lock_file: self.platform.lock_path(),
+            data_dir: self.platform.data_dir(),
+            cache_dir: self.platform.cache_dir(),
         }
     }
 
@@ -182,7 +184,7 @@ pub fn run(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> Exit {
         Ok(()) => Exit::Ok,
         Err(r) => {
             let _ = writeln!(err, "error: {}", bounded(&r.to_string()));
-            r.code.exit()
+            r.exit()
         }
     }
 }
@@ -411,28 +413,31 @@ fn bind(ctx: &Ctx, profile: String, machine_id: String) -> Result<String, Refusa
     {
         return Err(rebind_refusal(h));
     }
-    if store.is_initialized()? {
+    let inited = !store.is_initialized()?;
+    if inited {
+        store.init(&stamp)?;
+    } else {
         let doc = store.read_state()?;
         if !doc.binding.same_identity(&stamp) {
             return Err(state_owner_refusal(&doc.binding));
         }
-    } else {
-        store.init(&stamp)?;
     }
+    // A refusal after this call created the state directory happened after a mutation (exit 1).
+    let after = |r: Refusal| if inited { r.after_mutation() } else { r };
     if have.is_some() {
         return Ok("already bound".into());
     }
-    config_chain(ctx, true)?;
-    if publish(&ctx.binding_path, &want)? {
+    config_chain(ctx, true).map_err(after)?;
+    if publish(&ctx.binding_path, &want).map_err(after)? {
         return Ok(format!("bound {real} as {machine_id}"));
     }
-    match read_binding(&ctx.binding_path)? {
+    match read_binding(&ctx.binding_path).map_err(after)? {
         Some(have) if have.same_identity(&want) => Ok("already bound".into()),
-        Some(have) => Err(rebind_refusal(&have)),
-        None => Err(Refusal::new(
+        Some(have) => Err(after(rebind_refusal(&have))),
+        None => Err(after(Refusal::new(
             Code::BindingInvalid,
             "binding vanished during bind",
-        )),
+        ))),
     }
 }
 

@@ -30,6 +30,9 @@ pub struct Layout {
     pub config_dir: PathBuf,
     pub state_root: PathBuf,
     pub lock_file: PathBuf,
+    /// Manager-owned data (toolchains) and cache (build) roots. Claims may not touch them.
+    pub data_dir: PathBuf,
+    pub cache_dir: PathBuf,
 }
 
 pub fn storage(detail: impl Into<String>) -> Refusal {
@@ -104,6 +107,10 @@ pub fn check_dir_chain(
                 }
                 fs::set_permissions(&p, fs::Permissions::from_mode(0o700))
                     .map_err(|e| io(&format!("chmod {}", p.display()), &e))?;
+                // The new directory entry must be durable before anything is written inside.
+                if let Some(parent) = p.parent() {
+                    sync_dir(parent)?;
+                }
                 fs::symlink_metadata(&p).map_err(|e| io("stat", &e))?
             }
             Err(e) if e.kind() == ErrorKind::NotFound => return Ok(Found::Absent),
@@ -183,7 +190,7 @@ pub fn read_private(sys: &Sys, path: &Path, limit: usize) -> Result<Option<Vec<u
     Ok(Some(buf))
 }
 
-fn sync_dir(dir: &Path) -> Result<(), Refusal> {
+pub fn sync_dir(dir: &Path) -> Result<(), Refusal> {
     File::open(dir)
         .and_then(|d| d.sync_all())
         .map_err(|e| io("sync directory", &e))
@@ -233,7 +240,8 @@ fn require_plain(target: &Path) -> Result<(), Refusal> {
 }
 
 /// Atomic replacement: temporary file, fsync, `rename`, directory fsync. Any failure before the
-/// rename leaves the previous file untouched, which is the last good state. Failure points are
+/// rename leaves the previous file untouched, which is the last good state. A failure after it
+/// is `E_IO_UNCONFIRMED`: the new file is in place and only its durability is unknown. Failure points are
 /// `<label>-before-write`, `<label>-after-tmp` and `<label>-after-rename`.
 pub fn replace_file(
     dir: &Path,
@@ -254,8 +262,25 @@ pub fn replace_file(
         let _ = fs::remove_file(&tmp);
         return Err(e);
     }
-    fail.hit(&format!("{label}-after-rename"))?;
-    sync_dir(dir)
+    // The rename happened. From here a failure means the new file is in place but its durability
+    // is unconfirmed, which is a different outcome from a failure that left the old file.
+    unconfirmed(
+        fail.hit(&format!("{label}-after-rename"))
+            .and_then(|()| sync_dir(dir)),
+    )
+}
+
+/// A failure after the commit point: the new content is visible, durability is not confirmed.
+pub fn unconfirmed(r: Result<(), Refusal>) -> Result<(), Refusal> {
+    r.map_err(|e| {
+        Refusal::new(
+            Code::IoUnconfirmed,
+            format!(
+                "the new file is in place but its durability is unconfirmed: {}",
+                e.detail
+            ),
+        )
+    })
 }
 
 /// Create-only publication (`hard_link` never replaces). `Ok(false)` means the name existed and
@@ -282,8 +307,10 @@ pub fn publish_new(
     let r = step();
     let _ = fs::remove_file(&tmp);
     if r.as_ref().is_ok_and(|created| *created) {
-        fail.hit(&format!("{label}-after-rename"))?;
-        sync_dir(dir)?;
+        unconfirmed(
+            fail.hit(&format!("{label}-after-rename"))
+                .and_then(|()| sync_dir(dir)),
+        )?;
     }
     r
 }
@@ -340,30 +367,17 @@ pub fn append_line(
     fail.hit(&format!("{label}-after-write"))
 }
 
-/// Creates a new private file that must not exist. `Ok(false)` if it exists.
-pub fn create_empty(path: &Path) -> Result<bool, Refusal> {
-    match OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(path)
-    {
-        Ok(f) => {
-            f.set_permissions(fs::Permissions::from_mode(0o600))
-                .and_then(|()| f.sync_all())
-                .map_err(|e| io("create", &e))?;
-            Ok(true)
-        }
-        Err(e) if e.kind() == ErrorKind::AlreadyExists => Ok(false),
-        Err(e) => Err(io("create", &e)),
-    }
-}
-
 /// The advisory writer lock (`flock`). The kernel releases it when the process ends, so an
 /// abrupt exit cannot leave it held. Dropping the value releases it too.
+///
+/// A lock on a deleted or replaced file protects nothing, so the holder compares the file it
+/// locked with the path before each write ([`Lock::verify`]).
 #[derive(Debug)]
 pub struct Lock {
     _file: File,
+    path: PathBuf,
+    dev: u64,
+    ino: u64,
 }
 
 impl Lock {
@@ -376,7 +390,8 @@ impl Lock {
             .create(true)
             .truncate(false)
             .mode(0o600)
-            .custom_flags(sys.o_nofollow)
+            // O_NONBLOCK so a FIFO planted at this path cannot hang the open.
+            .custom_flags(sys.o_nofollow | sys.o_nonblock)
             .open(path)
             .map_err(|e| {
                 if e.raw_os_error() == Some(sys.eloop) {
@@ -391,6 +406,16 @@ impl Lock {
                 "must be a regular file owned by the current user".into()
             ));
         }
+        let mode = m.mode() & 0o777;
+        if mode != 0o600 {
+            // A umask can clear bits of the creation mode. Tightening to 0600 is allowed, a
+            // looser mode is refused.
+            if mode & !0o600 != 0 {
+                return Err(bad(format!("mode is {mode:o}, expected 0600")));
+            }
+            f.set_permissions(fs::Permissions::from_mode(0o600))
+                .map_err(|e| io("chmod lock", &e))?;
+        }
         match f.try_lock() {
             Ok(()) => {}
             Err(TryLockError::WouldBlock) => {
@@ -403,15 +428,35 @@ impl Lock {
             }
             Err(TryLockError::Error(e)) => return Err(io("lock", &e)),
         }
+        let lock = Lock {
+            _file: f,
+            path: path.to_path_buf(),
+            dev: m.dev(),
+            ino: m.ino(),
+        };
+        lock.verify()?;
         // Informational only: the lock is the flock, not these bytes.
-        let note = format!(
-            "pid {} since {}\n",
-            std::process::id(),
-            crate::store::now_unix()
-        );
+        let since = crate::store::now_unix().map_or_else(|_| "unknown".into(), |t| t.to_string());
+        let note = format!("pid {} since {since}\n", std::process::id());
+        let mut f = &lock._file;
         f.set_len(0)
             .and_then(|()| f.write_all(note.as_bytes()))
             .map_err(|e| io("write lock note", &e))?;
-        Ok(Lock { _file: f })
+        Ok(lock)
+    }
+
+    /// Fails unless the path still names the file this lock holds. Called before every write.
+    pub fn verify(&self) -> Result<(), Refusal> {
+        let lost = |d: &str| {
+            Refusal::new(
+                Code::Locked,
+                format!("{}: {d}; this writer must stop", self.path.display()),
+            )
+        };
+        match fs::symlink_metadata(&self.path) {
+            Ok(m) if m.is_file() && m.dev() == self.dev && m.ino() == self.ino => Ok(()),
+            Ok(_) => Err(lost("the lock file was replaced")),
+            Err(_) => Err(lost("the lock file was removed")),
+        }
     }
 }

@@ -23,15 +23,14 @@ pub fn fail_from_env() -> Result<Fail, Refusal> {
     };
     let (point, action) = spec
         .rsplit_once(':')
-        .ok_or_else(|| usage("DFM_FAILPOINT is <point>:<error|abort|sleep-ms>"))?;
+        .ok_or_else(|| usage("DFM_FAILPOINT is <point>:<error|abort|wait-file>"))?;
     let action = match action {
         "error" => Action::Error,
         "abort" => Action::Abort,
         a => a
-            .strip_prefix("sleep-")
-            .and_then(|ms| ms.parse().ok())
-            .map(|ms| Action::Sleep(std::time::Duration::from_millis(ms)))
-            .ok_or_else(|| usage("DFM_FAILPOINT action is error, abort or sleep-<ms>"))?,
+            .strip_prefix("wait-")
+            .map(|f| Action::Wait(std::path::PathBuf::from(f)))
+            .ok_or_else(|| usage("DFM_FAILPOINT action is error, abort or wait-<file>"))?,
     };
     Ok(Fail::at(point, action))
 }
@@ -47,8 +46,23 @@ pub fn check(ctx: &Ctx, out: &mut dyn Write) -> Result<(), Refusal> {
     let w =
         |e: std::io::Error| Refusal::new(Code::IoFailed, format!("output failed: {}", e.kind()));
     header(out, ctx).map_err(w)?;
-    let binding = super::read_existing_binding(ctx)?;
-    let store = Store::open_read(ctx.sys()?, &ctx.layout(), Fail::none())?;
+    // Topology and directory-level refusals are findings here (exit 1), as for a diagnostic
+    // command, not an abort: the report still says what was found.
+    let finding = |r: Refusal, out: &mut dyn Write| -> Result<(), Refusal> {
+        writeln!(out, "{} {}", r.code.as_str(), bounded(&r.detail)).map_err(w)?;
+        Err(Refusal::new(Code::Diagnosed, "1 finding"))
+    };
+    let binding = match super::read_existing_binding(ctx) {
+        Ok(b) => b,
+        Err(r) => return finding(r, out),
+    };
+    let store = match ctx
+        .sys()
+        .and_then(|sys| Store::open_read(sys, &ctx.layout(), Fail::none()))
+    {
+        Ok(s) => s,
+        Err(r) => return finding(r, out),
+    };
     let (binding, store) = match (binding, store) {
         (Some(b), Some(s)) => (b, s),
         (None, None) => return writeln!(out, "unbound; no state").map_err(w),

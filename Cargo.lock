@@ -43,6 +43,7 @@ dependencies = [
  "dfm-engine",
  "dfm-model",
  "dfm-platform-macos",
+ "serde_json",
  "sha2",
 ]
 

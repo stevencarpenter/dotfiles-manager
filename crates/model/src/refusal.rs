@@ -25,6 +25,7 @@ pub enum Code {
     Locked,
     OpInterrupted,
     Diagnosed,
+    IoUnconfirmed,
 }
 
 impl Code {
@@ -49,6 +50,7 @@ impl Code {
             Code::Locked => "E_LOCKED",
             Code::OpInterrupted => "E_OP_INTERRUPTED",
             Code::Diagnosed => "E_DIAGNOSED",
+            Code::IoUnconfirmed => "E_IO_UNCONFIRMED",
         }
     }
 
@@ -56,7 +58,7 @@ impl Code {
         match self {
             Code::Usage => Exit::Usage,
             // A failure while writing, or findings from a read-only check, are not refusals.
-            Code::IoFailed | Code::Diagnosed => Exit::Failed,
+            Code::IoFailed | Code::Diagnosed | Code::IoUnconfirmed => Exit::Failed,
             _ => Exit::Blocked,
         }
     }
@@ -67,6 +69,9 @@ impl Code {
 pub struct Refusal {
     pub code: Code,
     pub detail: String,
+    /// True when state was already changed before this refusal. Section 10: a gate that fails
+    /// after a mutation began exits 1, not 3.
+    pub mutated: bool,
 }
 
 impl Refusal {
@@ -74,6 +79,21 @@ impl Refusal {
         Refusal {
             code,
             detail: detail.into(),
+            mutated: false,
+        }
+    }
+
+    /// Marks that a mutation had begun when this refusal happened.
+    pub fn after_mutation(mut self) -> Self {
+        self.mutated = true;
+        self
+    }
+
+    /// The process exit for this refusal.
+    pub fn exit(&self) -> Exit {
+        match self.code.exit() {
+            Exit::Blocked if self.mutated => Exit::Failed,
+            e => e,
         }
     }
 }

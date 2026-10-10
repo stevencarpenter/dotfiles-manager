@@ -121,6 +121,11 @@ fn test_isolation_is_never_in_default_or_the_release_graph() {
         !tree.contains("test-isolation"),
         "release graph enables test-isolation:\n{tree}"
     );
+    // The engine's abort and wait code exists only with this feature.
+    assert!(
+        tree.contains("dfm-engine") && !tree.contains("failpoints"),
+        "release graph enables failpoints:\n{tree}"
+    );
 }
 
 #[test]

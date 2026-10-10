@@ -11,7 +11,7 @@ path = "src/main.rs"
 
 [features]
 # Never in default. Compiles DFM_HOME, DFM_BINDING, DFM_PLATFORM and --home.
-test-isolation = []
+test-isolation = ["dfm-engine/failpoints"]
 
 [dependencies]
 dfm-model = { workspace = true }
@@ -34,6 +34,9 @@ required-features = ["test-isolation"]
 [[test]]
 name = "build_controls"
 required-features = ["test-isolation"]
+
+[dev-dependencies]
+serde_json = { workspace = true }
 
 [lints]
 workspace = true

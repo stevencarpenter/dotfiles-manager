@@ -5,8 +5,16 @@ edition = { workspace = true }
 rust-version = { workspace = true }
 publish = { workspace = true }
 
+[features]
+# Test-only failure injection. Never in default; a gate test rejects it in a release graph.
+failpoints = []
+
 [dependencies]
 dfm-model = { workspace = true }
 
 [lints]
 workspace = true
+
+[[test]]
+name = "failpoints"
+required-features = ["failpoints"]

@@ -8,6 +8,8 @@ pub mod fail;
 pub mod fsys;
 pub mod store;
 
-pub use fail::{Action, Fail};
+#[cfg(feature = "failpoints")]
+pub use fail::Action;
+pub use fail::Fail;
 pub use fsys::{Found, Layout, Lock, Sys};
 pub use store::{Finding, Loaded, Probe, Store, now_unix, verify_identity};
