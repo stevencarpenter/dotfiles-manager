@@ -51,6 +51,7 @@ dependencies = [
  "dfm-platform-macos",
  "serde_json",
  "sha2",
+ "toml",
 ]
 
 [[package]]

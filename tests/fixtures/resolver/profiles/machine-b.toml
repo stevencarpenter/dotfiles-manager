@@ -1,0 +1,13 @@
+# Synthetic target 2. Same core and reusable module as machine-a, plus a private module.
+schema = 1
+id = "machine-b"
+bundle = "../private/bundle.toml"
+platform = "macos"
+architecture = "arm64"
+modules = ["private-mod"]
+
+[[overrides]]
+resource = "reusable.tool-settings"
+path = "/tool/retries"
+value = 5
+reason = "This machine has a slower link."

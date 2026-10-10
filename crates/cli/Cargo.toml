@@ -19,6 +19,11 @@ dfm-engine = { workspace = true }
 dfm-platform-macos = { workspace = true }
 sha2 = { workspace = true }
 
+[dev-dependencies]
+serde_json = { workspace = true }
+# Resolver tests parse and patch fixture documents in memory. Already an accepted direct crate.
+toml = { workspace = true }
+
 # These tests drive the isolated build through --home, so they need the feature. Run them with
 # `cargo test --features test-isolation` (scripts/check_all.sh does). A plain `cargo test`
 # skips them; there is deliberately no self dev-dependency that would switch the feature on
@@ -35,8 +40,9 @@ required-features = ["test-isolation"]
 name = "build_controls"
 required-features = ["test-isolation"]
 
-[dev-dependencies]
-serde_json = { workspace = true }
+[[test]]
+name = "explain"
+required-features = ["test-isolation"]
 
 [lints]
 workspace = true

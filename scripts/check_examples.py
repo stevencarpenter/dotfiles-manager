@@ -419,7 +419,8 @@ def main() -> None:
     )
     print(
         "Rejected nine malformed fixture variants; accepted one profile without overrides. "
-        "Resolver expectations were not executed."
+        "This script checks shape only; the resolver cases run in "
+        "crates/cli/tests/resolver (cargo test, step rust-tests)."
     )
 
 

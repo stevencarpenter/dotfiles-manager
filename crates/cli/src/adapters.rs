@@ -1,0 +1,277 @@
+//! The adapter registry the resolver validates against (docs/architecture.md section 3: the CLI
+//! builds the registry). Each entry states what the resolver needs to know about an adapter: its
+//! kind, whether it owns a target, how its `value` is typed, and which outputs it claims. No
+//! adapter is run here.
+
+use dfm_model::resolve::{AdapterCatalog, AdapterSpec, Claims, Field, Include, Schema, TargetRule};
+
+fn field(name: &'static str, schema: Schema, required: bool) -> Field {
+    Field {
+        name,
+        schema,
+        required,
+    }
+}
+
+fn spec(
+    id: &str,
+    kind: &'static str,
+    target: TargetRule,
+    claims: Claims,
+    value: Schema,
+) -> AdapterSpec {
+    AdapterSpec {
+        id: id.into(),
+        kind,
+        target,
+        secret_values: false,
+        native_document: false,
+        claims,
+        value,
+        source_includes: None,
+        precedence: None,
+    }
+}
+
+/// Include directives of a Git config, in file order: `[include]` and `[includeIf "<cond>"]`
+/// sections with a `path` key. Nothing else in the file matters for precedence. A key may follow
+/// the header on the same line (`[include] path = x`), which Git accepts. A section name that
+/// only starts with `includeif` (such as `includeiffy`) is not an include.
+fn git_includes(text: &str) -> Vec<Include> {
+    fn section(name: &str) -> Option<Option<String>> {
+        if name.eq_ignore_ascii_case("include") {
+            return Some(None);
+        }
+        let (head, rest) = (name.get(..9)?, name.get(9..)?);
+        if !head.eq_ignore_ascii_case("includeif") || !rest.starts_with(char::is_whitespace) {
+            return None;
+        }
+        let cond = rest.trim().strip_prefix('"')?.strip_suffix('"')?;
+        Some(Some(cond.to_string()))
+    }
+    let mut current: Option<Option<String>> = None;
+    let mut out = Vec::new();
+    for line in text.lines().map(str::trim) {
+        if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
+            continue;
+        }
+        let key_line = match line.strip_prefix('[').and_then(|l| l.split_once(']')) {
+            Some((name, tail)) => {
+                current = section(name.trim());
+                tail.trim()
+            }
+            None => line,
+        };
+        if key_line.is_empty() || key_line.starts_with('#') || key_line.starts_with(';') {
+            continue;
+        }
+        if let (Some(cond), Some((key, value))) = (&current, key_line.split_once('='))
+            && key.trim().eq_ignore_ascii_case("path")
+        {
+            out.push(Include {
+                path: value.trim().trim_matches('"').to_string(),
+                condition: cond.clone(),
+            });
+        }
+    }
+    out
+}
+
+fn package(id: &str) -> AdapterSpec {
+    spec(
+        id,
+        "package",
+        TargetRule::Forbidden,
+        Claims::None,
+        Schema::Table(vec![
+            field("name", Schema::Str, true),
+            field("update_policy", Schema::Str, true),
+            field("downgrade", Schema::Str, false),
+        ]),
+    )
+}
+
+#[doc(hidden)]
+pub fn builtin_catalog() -> AdapterCatalog {
+    let native = |mut s: AdapterSpec| {
+        s.native_document = true;
+        s
+    };
+    AdapterCatalog::new([
+        AdapterSpec {
+            source_includes: Some(git_includes),
+            ..spec(
+                "fs-link/v1",
+                "link",
+                TargetRule::Required,
+                Claims::Target,
+                Schema::Table(vec![field("source", Schema::Source, true)]),
+            )
+        },
+        native(AdapterSpec {
+            precedence: Some("later include entries override earlier ones for single-valued keys"),
+            ..spec(
+                "git-config/v1",
+                "render",
+                TargetRule::Required,
+                Claims::Target,
+                Schema::Native,
+            )
+        }),
+        native(spec(
+            "claude-settings/v1",
+            "merge",
+            TargetRule::Required,
+            Claims::Target,
+            Schema::Table(vec![
+                field("managed", Schema::Native, true),
+                field("seed", Schema::Native, false),
+                field(
+                    "handlers",
+                    Schema::Map(Box::new(Schema::Table(vec![
+                        field("event", Schema::Str, true),
+                        field("type", Schema::Str, true),
+                        field("argv", Schema::Array(Box::new(Schema::Str)), true),
+                    ]))),
+                    true,
+                ),
+            ]),
+        )),
+        native(spec(
+            "text-fragments/v1",
+            "assemble",
+            TargetRule::Required,
+            Claims::TargetAndFragments {
+                dir: "/fragments_dir",
+                pattern: "/pattern",
+            },
+            Schema::Table(vec![
+                field("body", Schema::Source, true),
+                field("fragments_dir", Schema::HomePath, true),
+                field("pattern", Schema::Str, true),
+                field("separator", Schema::Str, true),
+            ]),
+        )),
+        spec(
+            "skills/v1",
+            "distribution",
+            TargetRule::Forbidden,
+            Claims::Leaves {
+                roots: "/target_roots",
+                entries: "/entries",
+                enabled: "enabled",
+            },
+            Schema::Table(vec![
+                field(
+                    "target_roots",
+                    Schema::Array(Box::new(Schema::HomePath)),
+                    true,
+                ),
+                field(
+                    "entries",
+                    Schema::Map(Box::new(Schema::Table(vec![
+                        field("source", Schema::Source, true),
+                        field("enabled", Schema::Bool, true),
+                    ]))),
+                    true,
+                ),
+            ]),
+        ),
+        AdapterSpec {
+            secret_values: true,
+            ..spec(
+                "op-template/v1",
+                "secret",
+                TargetRule::Required,
+                Claims::Target,
+                Schema::Table(vec![
+                    field("template", Schema::Source, true),
+                    field("account", Schema::Str, true),
+                    field("mode", Schema::FileMode { private: true }, true),
+                ]),
+            )
+        },
+        package("homebrew/v1"),
+        package("mise/v1"),
+        package("apt/v1"),
+        spec(
+            "firstmate-native/v1",
+            "application",
+            TargetRule::Forbidden,
+            Claims::None,
+            Schema::Table(vec![
+                field("name", Schema::Str, true),
+                field("update_policy", Schema::Str, true),
+                field("completion", Schema::Str, true),
+            ]),
+        ),
+    ])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::git_includes;
+
+    #[test]
+    fn untrusted_section_names_never_panic_on_a_character_boundary() {
+        // Byte 9 falls inside the euro sign; slicing there would panic.
+        for text in [
+            "[abcdefgh\u{20ac}]\npath = x\n",
+            "[\u{20ac}\u{20ac}\u{20ac}\u{20ac}]\n",
+            "[\u{1f600}includeif]\n",
+            "[includeif\u{20ac}\"c\"]\npath = ~/p\n",
+            "[",
+            "[]",
+            "path",
+        ] {
+            let _ = git_includes(text);
+        }
+        // A real section with a multibyte condition still parses.
+        let got = git_includes("[includeIf \"gitdir:~/\u{e9}/\"]\npath = ~/a\n");
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].condition.as_deref(), Some("gitdir:~/\u{e9}/"));
+    }
+
+    #[test]
+    fn only_real_include_sections_count() {
+        let got = |t: &str| {
+            git_includes(t)
+                .into_iter()
+                .map(|i| i.path)
+                .collect::<Vec<_>>()
+        };
+        // Lookalike section names are not includes.
+        assert!(got("[includeiffy]\npath = ~/a\n").is_empty());
+        assert!(got("[includeIfx \"c\"]\npath = ~/a\n").is_empty());
+        assert!(got("[includeIf]\npath = ~/a\n").is_empty());
+        assert!(got("[includeIf c]\npath = ~/a\n").is_empty());
+        assert!(got("[include \"x\"]\npath = ~/a\n").is_empty());
+        assert!(got("[includes]\npath = ~/a\n").is_empty());
+        // A key on the header line counts, in file order with the others.
+        assert_eq!(
+            got(
+                "[include] path = ~/one\n[includeIf \"g:~/\"] path = ~/two\n[include]\npath = ~/three\n[user] path = ~/no\n"
+            ),
+            ["~/one", "~/two", "~/three"]
+        );
+        // A comment after the header is not a key.
+        assert!(got("[include] # path = ~/a\n").is_empty());
+    }
+
+    #[test]
+    fn git_include_directives_keep_file_order_and_conditions() {
+        let text = "# c\n[user]\n  path = ignored\n[include]\n  path = ~/a.inc\n[includeIf \"gitdir:~/w/\"]\n  path = ~/b.inc\n[include]\n  PATH = ~/c.inc\n";
+        let got: Vec<(String, Option<String>)> = git_includes(text)
+            .into_iter()
+            .map(|i| (i.path, i.condition))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                ("~/a.inc".to_string(), None),
+                ("~/b.inc".to_string(), Some("gitdir:~/w/".to_string())),
+                ("~/c.inc".to_string(), None),
+            ]
+        );
+    }
+}

@@ -1,0 +1,47 @@
+schema = 1
+id = "private-mod"
+platforms = ["macos"]
+requires = ["reusable"]
+
+[[overrides]]
+resource = "core.editor-defaults"
+path = "/core/editor"
+value = "vim"
+reason = "This synthetic machine uses its existing Vim."
+
+# Whole-file replacement through an exposed slot. The path is relative to this module.
+[[overrides]]
+resource = "reusable.tool-banner"
+path = "/source"
+value = "files/banner"
+reason = "Supply a private banner through the exposed source slot."
+
+[[contributions]]
+resource = "reusable.agent-settings"
+path = "/handlers"
+key = "private-mod.audit"
+reason = "Add one owned handler."
+[contributions.value]
+event = "SessionStart"
+type = "command"
+argv = ["synthetic-audit"]
+
+# The template and account are references. No secret value appears in any manifest.
+[[resources]]
+id = "api-token"
+kind = "secret"
+adapter = "op-template/v1"
+target = ".config/synthetic/token.env"
+[resources.value]
+template = "files/token.tpl"
+account = "synthetic-account"
+mode = 0o600
+
+# A second fragment that sets a value the core fragment also sets.
+[[resources]]
+id = "local-overrides"
+kind = "render"
+adapter = "git-config/v1"
+target = ".config/synthetic/local.inc"
+[resources.value.core]
+editor = "ed"

@@ -1,15 +1,20 @@
 //! `dotfiles-manager` command line: version, help, explicit profile binding and self-check.
 
+mod adapters;
 mod controls_fs;
+mod source_fs;
 mod state_cmd;
 
+pub use adapters::builtin_catalog;
 pub use controls_fs::{check_build_controls, toolchain_tree_digest};
 
 use dfm_engine::{Dir, Fail, Layout, Store, Sys, open_config};
 use dfm_model::binding::{Binding, MAX_BYTES, check_profile};
+use dfm_model::resolve::resolve;
 use dfm_model::state::Stamp;
 use dfm_model::{Code, Exit, Refusal};
 use dfm_platform_macos::{Platform, check_supported, current_platform};
+use source_fs::load_source_set;
 use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -23,6 +28,7 @@ usage:
   dotfiles-manager bind --profile <file> --machine-id <id>
   dotfiles-manager binding
   dotfiles-manager state check
+  dotfiles-manager explain <resource-or-target> --root <dir>
   dotfiles-manager self-check --build-controls <staged tree>
   dotfiles-manager self-check --fixture-dir <dir>
 
@@ -30,23 +36,20 @@ bind records the profile and machine identity once. A second bind with a
 different profile or machine is refused (E_REBIND_UNSUPPORTED). No command
 infers a profile, and nothing applies configuration.
 
+explain resolves the bound profile against the trusted sources in --root and prints
+ownership, permitted changes, provenance and native precedence for one resource or
+output path. It reads only --root and the binding, and writes nothing.
+
 exit codes: 0 ok, 1 failed, 2 usage, 3 blocked before mutation, 4 declined,
 5 pending, 130 interrupted, 143 terminated.
 ";
 
 const MAX_ERROR_CHARS: usize = 512;
 
-/// Control characters and escapes become visible, and the length is bounded.
+/// Control, invisible and bidirectional characters become visible escapes, and the length is
+/// bounded.
 fn bounded(s: &str) -> String {
-    let mut out = String::new();
-    for c in s.chars().take(MAX_ERROR_CHARS) {
-        if c.is_control() {
-            out.extend(c.escape_default())
-        } else {
-            out.push(c)
-        }
-    }
-    out
+    dfm_model::display::visible(&s.chars().take(MAX_ERROR_CHARS).collect::<String>())
 }
 
 struct Ctx {
@@ -246,6 +249,13 @@ fn dispatch(args: &[String], out: &mut dyn Write) -> Result<(), Refusal> {
         "__record-trial" => state_cmd::record_trial(&context(home)?, rest, out),
         #[cfg(feature = "test-isolation")]
         "__reconcile" if rest.is_empty() => state_cmd::reconcile(&context(home)?, out),
+        "explain" => {
+            let (query, root) = explain_args(rest)?;
+            let ctx = context(home)?;
+            header(out, &ctx).map_err(w)?;
+            let text = explain(&ctx, &query, Path::new(&root))?;
+            write!(out, "{text}").map_err(w)
+        }
         "self-check" => {
             let [controls, fixture] = flags(rest, ["--build-controls", "--fixture-dir"])?;
             match (controls, fixture) {
@@ -268,6 +278,58 @@ fn dispatch(args: &[String], out: &mut dyn Write) -> Result<(), Refusal> {
             "unknown command or argument {other}; try --help"
         ))),
     }
+}
+
+/// `explain <query> --root <dir>`, in either order.
+fn explain_args(args: &[String]) -> Result<(String, String), Refusal> {
+    let mut query = None;
+    let mut root = None;
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        if a == "--root" {
+            let v = it.next().ok_or_else(|| usage("--root needs a value"))?;
+            if root.replace(v.clone()).is_some() {
+                return Err(usage("--root given twice"));
+            }
+        } else if a.starts_with("--") {
+            return Err(usage(format!("unknown argument {a}")));
+        } else if query.replace(a.clone()).is_some() {
+            return Err(usage("explain takes one resource or output path"));
+        }
+    }
+    Ok((
+        query.ok_or_else(|| usage("explain needs a resource or output path"))?,
+        root.ok_or_else(|| usage("--root is required"))?,
+    ))
+}
+
+/// Resolves the bound profile against `root` and explains one resource. Read-only.
+fn explain(ctx: &Ctx, query: &str, root: &Path) -> Result<String, Refusal> {
+    let binding = read_existing_binding(ctx)?.ok_or_else(|| {
+        Refusal::new(
+            Code::BindingInvalid,
+            "this machine is not bound; run bind first",
+        )
+    })?;
+    let root = fs::canonicalize(root).map_err(|e| {
+        Refusal::new(
+            Code::ReportUnavailable,
+            dfm_model::display::visible(&format!("{}: {}", root.display(), e.kind())),
+        )
+    })?;
+    let rel = Path::new(binding.profile())
+        .strip_prefix(&root)
+        .ok()
+        .and_then(Path::to_str)
+        .ok_or_else(|| {
+            Refusal::new(
+                Code::ProfileInvalid,
+                "the bound profile is not inside --root; point --root at the trusted source tree that contains it",
+            )
+        })?;
+    let sources = load_source_set(&root)?;
+    let resolved = resolve(&sources, rel, &builtin_catalog())?;
+    dfm_model::resolve::explain(&resolved, query)
 }
 
 fn header(out: &mut dyn Write, ctx: &Ctx) -> std::io::Result<()> {

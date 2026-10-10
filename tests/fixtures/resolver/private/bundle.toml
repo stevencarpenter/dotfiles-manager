@@ -1,0 +1,7 @@
+# Synthetic private bundle. It extends the shared bundle; the shared bundle never names it.
+schema = 1
+id = "synthetic-private"
+extends = "../shared/bundle.toml"
+
+[modules]
+private-mod = "private-mod/module.toml"
