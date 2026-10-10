@@ -573,3 +573,25 @@ fn a_restrictive_umask_still_produces_a_binding_the_reader_accepts() {
     );
     assert_eq!(run(home.path(), &["binding"]).status.code(), Some(0));
 }
+
+#[test]
+fn bind_binding_and_state_escape_an_invisible_profile_path() {
+    let home = TempDir::new("escape-home");
+    let src = TempDir::new("escape-src");
+    let dir = src.path().join("p\u{202e}q");
+    fs::create_dir_all(&dir).unwrap();
+    let p = dir.join("profile.toml");
+    fs::write(&p, "schema = 1\n").unwrap();
+    let p = p.to_str().unwrap();
+    let outputs = [
+        run(home.path(), &["bind", "--profile", p, "--machine-id", "m5"]),
+        run(home.path(), &["binding"]),
+        run(home.path(), &["state", "check"]),
+    ];
+    for o in outputs {
+        let out = text(&o.stdout);
+        assert_eq!(o.status.code(), Some(0), "{out}{}", text(&o.stderr));
+        assert!(!out.contains('\u{202e}'), "raw bidi control in: {out}");
+    }
+    assert!(text(&run(home.path(), &["binding"]).stdout).contains("p\\u{202e}q"));
+}

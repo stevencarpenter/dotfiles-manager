@@ -236,7 +236,7 @@ fn dispatch(args: &[String], out: &mut dyn Write) -> Result<(), Refusal> {
                 Some(b) => writeln!(
                     out,
                     "bound profile={} machine_id={}",
-                    b.profile(),
+                    dfm_model::display::visible(b.profile()),
                     b.machine_id()
                 ),
             }
@@ -490,7 +490,10 @@ fn bind(ctx: &Ctx, profile: String, machine_id: String) -> Result<String, Refusa
         })?;
     let name = ctx.binding_name().map_err(after)?;
     if publish(&dir, &name, &want).map_err(after)? {
-        return Ok(format!("bound {real} as {machine_id}"));
+        return Ok(format!(
+            "bound {} as {machine_id}",
+            dfm_model::display::visible(real)
+        ));
     }
     match read_binding(&sys, &dir, &name).map_err(after)? {
         Some(have) if have.same_identity(&want) => Ok("already bound".into()),
