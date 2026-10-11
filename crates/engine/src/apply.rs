@@ -20,7 +20,7 @@ use crate::recover;
 use crate::store::{Store, now_unix};
 use dfm_model::digest::sha256_hex;
 use dfm_model::fold;
-use dfm_model::merge::{Merged, check_foreign, salted};
+use dfm_model::merge::{Merged, check_foreign, leaf_hashes, salted};
 use dfm_model::plan::{
     Action, Operation, Owned, Plan, Request, Status as PlanStatus, ledger_state, link_fingerprint,
     node_state,
@@ -127,7 +127,10 @@ pub fn owned_outputs(ledger: &Ledger, home: &Path) -> Result<Vec<Owned>, Refusal
                 class: r.class,
                 path: rel.into(),
                 fingerprint: o.fingerprint.clone(),
-                coowned_entries: o.coowned.as_ref().map(|c| c.entries.len()),
+                coowned_entries: o
+                    .coowned
+                    .as_ref()
+                    .map(|c| (c.entries.len(), c.appended.len())),
             });
         }
     }
@@ -529,6 +532,8 @@ struct MergeRead {
 /// What a merge will write and the salted hash to record (`None` for a retire).
 struct MergeDecision {
     merged: Merged,
+    /// Salted hash of each managed leaf, to record (empty for a retire).
+    leaves: std::collections::BTreeMap<String, String>,
     new_hash: Option<String>,
 }
 
@@ -659,11 +664,14 @@ impl Exec<'_, '_> {
         })
     }
 
-    /// The bytes of a generated file. The inputs are read and compared with the plan first, the
-    /// generator runs on those bytes only, and the result must equal the planned output hash.
-    /// A stale input or output blocks the operation. Nothing is journaled and nothing is
-    /// written, so the previous output stays the last good one.
-    fn generated(&self, op: &Operation, rel: &str) -> Result<Vec<u8>, Ended> {
+    /// Opens the fragment directory of `op` (if it has one) and reads the sources and fragments
+    /// the plan recorded, each compared with the plan. A stale input blocks the operation.
+    fn fragment_inputs(
+        &self,
+        op: &Operation,
+        rel: &str,
+        salt: Option<&[u8]>,
+    ) -> Result<GeneratorInputs, Ended> {
         let dir = match op.fragment_dir.as_deref() {
             Some(d) => {
                 let comps = components(d).map_err(failed)?;
@@ -675,12 +683,20 @@ impl Exec<'_, '_> {
             }
             None => None,
         };
-        let inputs = gather(self.plan, op, &self.run.sys, dir.as_ref()).map_err(|g| match g {
+        gather(self.plan, op, &self.run.sys, dir.as_ref(), salt).map_err(|g| match g {
             Gather::Stale(d) => {
                 blocked(Code::PlanStale, format!("{rel}: {d}; nothing was changed"))
             }
             Gather::Failed(r) => failed(r),
-        })?;
+        })
+    }
+
+    /// The bytes of a generated file. The inputs are read and compared with the plan first, the
+    /// generator runs on those bytes only, and the result must equal the planned output hash.
+    /// A stale input or output blocks the operation. Nothing is journaled and nothing is
+    /// written, so the previous output stays the last good one.
+    fn generated(&self, op: &Operation, rel: &str) -> Result<Vec<u8>, Ended> {
+        let inputs = self.fragment_inputs(op, rel, None)?;
         let bytes = match self.run.generator.generate(op, &inputs) {
             Ok(b) => b,
             Err(r) if r.code == Code::PlanStale => return Err(Ended::Blocked(r)),
@@ -983,13 +999,29 @@ impl Exec<'_, '_> {
             .flat_map(|r| &r.owned_outputs)
             .find(|o| o.path == abs)
             .and_then(|o| o.coowned.clone());
+        // The fragments of a merge are read like those of an assembly: the plan lists them, each
+        // is read again below the opened directory and compared with the plan. A retire reads
+        // none, because it removes only what the ledger records.
+        let fragments = if op.action == Action::Retire {
+            GeneratorInputs::default()
+        } else {
+            let salt = self.run.store.salt().ok().flatten();
+            self.fragment_inputs(op, rel, salt.as_deref())?
+        };
         let inputs = GeneratorInputs {
             live: read.live.clone(),
             owned_entries: recorded
                 .as_ref()
                 .map(|c| c.entries.clone())
                 .unwrap_or_default(),
+            owned_appended: recorded
+                .as_ref()
+                .map(|c| c.appended.clone())
+                .unwrap_or_default(),
             takeover: op.takeover,
+            home: self.run.home.shown().to_str().map(String::from),
+            listing: fragments.listing,
+            fragments: fragments.fragments,
             ..GeneratorInputs::default()
         };
         let merged = match self.run.generator.merge(op, &inputs) {
@@ -1023,16 +1055,23 @@ impl Exec<'_, '_> {
                 Ended::Blocked(e)
             })?;
         }
-        let new_hash = if retire {
-            None
+        let (new_hash, leaves) = if retire {
+            (None, Default::default())
         } else {
             let salt = match salt {
                 Some(s) => s,
                 None => self.run.store.salt_or_create().map_err(failed)?,
             };
-            Some(salted(&salt, &merged.rendered_view))
+            (
+                Some(salted(&salt, &merged.rendered_view)),
+                leaf_hashes(&salt, &merged),
+            )
         };
-        Ok(MergeDecision { merged, new_hash })
+        Ok(MergeDecision {
+            merged,
+            leaves,
+            new_hash,
+        })
     }
 
     /// Step 3, settle: intent, publish, read-back, outcome, ledger.
@@ -1050,7 +1089,11 @@ impl Exec<'_, '_> {
         read: &MergeRead,
         decided: MergeDecision,
     ) -> Result<Ended, Ended> {
-        let MergeDecision { merged, new_hash } = decided;
+        let MergeDecision {
+            merged,
+            leaves,
+            new_hash,
+        } = decided;
         let retire = op.action == Action::Retire;
         let id = self.attempt_id(op);
         let recovery = Recovery {
@@ -1091,7 +1134,17 @@ impl Exec<'_, '_> {
             .and_then(|()| self.run.fail.hit("apply-after-done"))
             .and_then(|()| match &new_hash {
                 None => self.forget_output(op, &id, abs),
-                Some(h) => self.record_coowned(op, &id, abs, h, merged.entries.clone()),
+                Some(h) => self.record_coowned(
+                    op,
+                    &id,
+                    abs,
+                    CoOwned {
+                        managed_hash: h.clone(),
+                        entries: merged.entries.clone(),
+                        appended: merged.appended.clone(),
+                        leaves,
+                    },
+                ),
             });
         if let Err(e) = settled {
             return Err(self.after_intent(e, &id, abs));
@@ -1156,8 +1209,7 @@ impl Exec<'_, '_> {
         op: &Operation,
         id: &str,
         abs: &str,
-        managed_hash: &str,
-        entries: Vec<dfm_model::state::OwnedEntry>,
+        coowned: CoOwned,
     ) -> Result<(), Refusal> {
         let mut ledger = self.run.store.read_ledger_lenient()?;
         let mut outs = ledger
@@ -1171,10 +1223,7 @@ impl Exec<'_, '_> {
             path: abs.into(),
             mode: dfm_model::merge::MODE,
             fingerprint: None,
-            coowned: Some(CoOwned {
-                managed_hash: managed_hash.into(),
-                entries,
-            }),
+            coowned: Some(coowned),
         });
         outs.sort_by(|a, b| a.path.cmp(&b.path));
         ledger.record(LedgerResource {

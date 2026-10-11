@@ -1,0 +1,99 @@
+schema = 1
+id = "claude-base"
+platforms = ["macos", "linux"]
+requires = []
+
+# Mirrors the shape of a full Claude Code base settings file with placeholder values. No
+# secret is declared. A profile selects this module instead of `agents`: both claim
+# `.claude/settings.json`, and only one resource may.
+[[resources]]
+id = "claude-settings"
+kind = "merge"
+adapter = "claude-settings/v1"
+target = ".claude/settings.json"
+[resources.value]
+# Arrays listed here are appended, not replaced. The manager removes only the items it added.
+append = ["/sandbox/filesystem/allowWrite"]
+# Files in this directory merge over the declared managed values, in byte order of the name.
+fragments_dir = ".claude/settings.d"
+pattern = "*.json"
+
+[resources.value.managed]
+outputStyle = "STE"
+verbose = false
+autoDreamEnabled = true
+teammateMode = "tmux"
+cleanupPeriodDays = 14
+
+[resources.value.managed.env]
+EXAMPLE_FEATURE_FLAG = "1"
+EXAMPLE_MAX_WORKERS = "64"
+
+[resources.value.managed.permissions]
+defaultMode = "auto"
+
+[resources.value.managed.statusLine]
+type = "command"
+command = "bash ~/.claude/statusline-command.sh"
+
+[resources.value.managed.enabledPlugins]
+"example-tools@example-marketplace" = true
+"example-lsp@example-marketplace" = true
+"example-experiment@example-marketplace" = false
+
+[resources.value.managed.skillOverrides]
+example-skill = "off"
+
+[resources.value.managed.extraKnownMarketplaces.example-marketplace.source]
+source = "github"
+repo = "example-org/example-marketplace"
+
+[resources.value.managed.sandbox.filesystem]
+allowWrite = ["~/.cache/example-tool", "~/projects/example", "~/.local/share/example/tools"]
+
+# Set only when the live file has no value, so a choice made inside the tool survives.
+[resources.value.seed]
+model = "example-model"
+effortLevel = "high"
+
+[resources.value.handlers.em-dash-check]
+event = "PreToolUse"
+matcher = "Bash"
+type = "command"
+argv = ["${HOME}/.claude/hooks/no-em-dash-commit.sh"]
+
+[resources.value.handlers.worktree-create]
+event = "WorktreeCreate"
+type = "command"
+argv = ["${HOME}/.claude/hooks/wt-create.sh"]
+
+[resources.value.handlers.worktree-remove]
+event = "WorktreeRemove"
+type = "command"
+argv = ["${HOME}/.claude/hooks/wt-remove.sh"]
+
+[resources.value.handlers.journal-stop]
+event = "Stop"
+type = "command"
+argv = ["${HOME}/.claude/hooks/agent-journal-stop.sh"]
+
+[resources.value.handlers.journal-subagent-stop]
+event = "SubagentStop"
+type = "command"
+argv = ["${HOME}/.claude/hooks/agent-journal-stop.sh"]
+
+[resources.value.handlers.reap-subagent-stop]
+event = "SubagentStop"
+type = "command"
+argv = ["${HOME}/.claude/hooks/agent-reap-subagent-stop.sh"]
+timeout = 20
+
+[resources.value.handlers.reap-session-end]
+event = "SessionEnd"
+type = "command"
+argv = ["${HOME}/.claude/hooks/agent-reap-session-end.sh"]
+timeout = 20
+
+[resources.policy]
+defaults = ["/managed/outputStyle", "/managed/enabledPlugins/example-experiment@example-marketplace"]
+extensions = ["/handlers"]

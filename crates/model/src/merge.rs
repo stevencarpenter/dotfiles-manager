@@ -5,17 +5,21 @@
 //! This code lives in `dfm-model` because `serde_json` is allowed there only (docs/architecture.md
 //! section 1). The adapter glue (registry entry, `Generator` impl) is in the CLI crate.
 //!
-//! The live document is the base. The declared `managed` keys are set, the declared `seed` keys
-//! are set only when absent, and the declared handlers are added to `hooks.<event>` as owned
-//! entries. Every other key and every foreign hook entry is carried over by value. The output is
-//! re-serialized with sorted keys and a 2-space indent, so formatting is normalized.
+//! The live document is the base. The declared `managed` values merge into it: an object merges
+//! recursively (managed leaves win, foreign leaves survive), an array replaces, except at a
+//! pointer listed in `append`, where the unique declared items are appended and the manager
+//! records them as its own. Fragments (`settings.d`) merge over the declared values first. The
+//! declared `seed` values are set only where the live file has nothing, at any depth, and the
+//! declared handlers are added to `hooks.<event>` as owned entries. Every other key and every
+//! foreign hook entry is carried over by value. The output is re-serialized with sorted keys and
+//! a 2-space indent, so formatting is normalized.
 //!
 //! Nothing in an error message repeats a byte of the live file: a parse error names a category,
 //! a line and a column only.
 
 use crate::digest::sha256_hex;
 use crate::refusal::{Code, Refusal};
-use crate::state::{CoOwned, OwnedEntry};
+use crate::state::{AppendedItem, CoOwned, OwnedEntry};
 use serde_json::{Map, Value as Json};
 use std::collections::{BTreeMap, BTreeSet};
 use toml::Value as Toml;
@@ -24,6 +28,13 @@ use toml::Value as Toml;
 pub const ADAPTER: &str = "claude-settings/v1";
 /// The mode of the published file. A live file open to group or others is refused.
 pub const MODE: u32 = 0o600;
+
+/// The most managed leaves, hook entries and appended items one merge output may record. The
+/// ledger holds a salted hash for each, so the bound keeps the ledger inside its size limit.
+pub const MAX_RECORDED: usize = 10_000;
+
+/// The longest hook timeout the manager declares, in seconds.
+const MAX_TIMEOUT: i64 = 3600;
 
 /// One declared handler: a hook command the manager adds and may later retire.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -39,9 +50,20 @@ struct Handler {
 /// The declared value of a `claude-settings/v1` resource, converted to JSON.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Desired {
+    /// The declared values. `managed_sha256` covers these only.
     managed: Map<String, Json>,
+    /// The declared values with the fragments merged over them. The merge and the salted
+    /// managed-fields hash use this view.
+    effective: Map<String, Json>,
     seed: Map<String, Json>,
     handlers: Vec<Handler>,
+    /// JSON pointers (escaped) of the arrays whose unique items are appended, not replaced.
+    append: BTreeSet<String>,
+    /// The fragment directory (a HOME path) and the file name pattern, when declared.
+    fragments: Option<(String, String)>,
+    /// HOME as the machine spells it. Only used to recognize an existing hook that spells the
+    /// same command with the absolute home path.
+    home: Option<String>,
 }
 
 /// The result of a merge. `Debug` prints lengths only: the bytes can hold credentials.
@@ -54,8 +76,15 @@ pub struct Merged {
     pub live_view: Vec<u8>,
     /// Canonical JSON of the managed keys as declared.
     pub rendered_view: Vec<u8>,
+    /// The leaves of `live_view` and `rendered_view` by JSON pointer, as canonical JSON. A leaf
+    /// is a value that is not an object. The conflict check compares leaf by leaf, so a changed
+    /// key set (a dropped key or fragment) is not an edit.
+    pub live_leaves: BTreeMap<String, Vec<u8>>,
+    pub rendered_leaves: BTreeMap<String, Vec<u8>>,
     /// The handler entries the manager owns after this merge. The ledger records them.
     pub entries: Vec<OwnedEntry>,
+    /// The array items the manager owns after this merge (`append`). The ledger records them.
+    pub appended: Vec<AppendedItem>,
     /// Whether `bytes` differ from the live bytes.
     pub changed: bool,
 }
@@ -70,6 +99,7 @@ impl std::fmt::Debug for Merged {
                 &format_args!("{} bytes", self.rendered_view.len()),
             )
             .field("entries", &self.entries)
+            .field("appended", &self.appended)
             .field("changed", &self.changed)
             .finish()
     }
@@ -159,6 +189,13 @@ fn shell_word(a: &str) -> String {
 }
 
 fn handler(id: &str, v: &Toml) -> Result<Handler, Refusal> {
+    // The id becomes `OwnedEntry.id` in the ledger, which refuses an empty id or a control
+    // character. Refuse it here, before any write.
+    if id.is_empty() || id.chars().any(char::is_control) {
+        return Err(invalid(
+            "a handler id must be a non-empty name without control characters",
+        ));
+    }
     let at = format!("handlers.{id}");
     let t = v
         .as_table()
@@ -186,7 +223,30 @@ fn handler(id: &str, v: &Toml) -> Result<Handler, Refusal> {
         .map(|a| shell_word(a))
         .collect::<Vec<_>>()
         .join(" ");
-    let entry = serde_json::json!({ "hooks": [ { "command": command, "type": "command" } ] });
+    let mut hook = serde_json::json!({ "command": command, "type": "command" });
+    if let Some(v) = t.get("timeout") {
+        let secs = v
+            .as_integer()
+            .filter(|n| (1..=MAX_TIMEOUT).contains(n))
+            .ok_or_else(|| {
+                invalid(format!(
+                    "{at}.timeout must be an integer from 1 to {MAX_TIMEOUT} (seconds)"
+                ))
+            })?;
+        hook["timeout"] = Json::from(secs);
+    }
+    let mut entry = serde_json::json!({ "hooks": [hook] });
+    if let Some(v) = t.get("matcher") {
+        let m = v
+            .as_str()
+            .filter(|s| !s.chars().any(char::is_control))
+            .ok_or_else(|| {
+                invalid(format!(
+                    "{at}.matcher must be a string without control characters (an empty string matches everything)"
+                ))
+            })?;
+        entry["matcher"] = Json::String(m.into());
+    }
     let sha256 = sha256_hex(&canonical(&entry));
     Ok(Handler {
         id: id.into(),
@@ -228,15 +288,107 @@ impl Desired {
                 handlers.push(handler(id, v)?);
             }
         }
+        let mut append = BTreeSet::new();
+        if let Some(a) = root.get("append") {
+            let list = a
+                .as_array()
+                .ok_or_else(|| invalid("append must be an array of JSON pointers"))?;
+            for p in list {
+                let p = p.as_str().and_then(normal_pointer).ok_or_else(|| {
+                    invalid("append must hold JSON pointers such as /sandbox/filesystem/allowWrite")
+                })?;
+                if p == "/hooks" || p.starts_with("/hooks/") {
+                    return Err(invalid(
+                        "append cannot name hooks: hooks are declared as handlers",
+                    ));
+                }
+                if !matches!(pointer_get(&managed, &p), Some(Json::Array(_))) {
+                    return Err(invalid(format!(
+                        "append pointer {p} does not name an array in managed (a pointer is case-sensitive, and a mistyped one would turn append into replace). Fix: declare the array under managed or correct the pointer"
+                    )));
+                }
+                append.insert(p);
+            }
+        }
+        let text = |k: &str| match root.get(k) {
+            None => Ok(None),
+            Some(Toml::String(s)) if !s.is_empty() => Ok(Some(s.clone())),
+            Some(_) => Err(invalid(format!("{k} must be a non-empty string"))),
+        };
+        let fragments = match (text("fragments_dir")?, text("pattern")?) {
+            (Some(d), Some(p)) => Some((d, p)),
+            (None, None) => None,
+            _ => {
+                return Err(invalid(
+                    "fragments_dir and pattern go together: declare both or neither",
+                ));
+            }
+        };
         Ok(Desired {
+            effective: managed.clone(),
             managed,
             seed,
             handlers,
+            append,
+            fragments,
+            home: None,
         })
     }
 
+    /// Sets HOME, so an existing hook that spells the home directory as an absolute path is
+    /// recognized as the declared hook.
+    pub fn with_home(mut self, home: &str) -> Desired {
+        self.home = Some(home.trim_end_matches('/').to_string()).filter(|h| !h.is_empty());
+        self
+    }
+
+    /// The fragment directory and the file name pattern, when the resource declares them.
+    pub fn fragment_spec(&self) -> Option<(&str, &str)> {
+        self.fragments
+            .as_ref()
+            .map(|(d, p)| (d.as_str(), p.as_str()))
+    }
+
+    /// The declared values with `fragments` merged over them, in the order given (the caller
+    /// passes byte order of the names). Objects merge recursively and a later fragment wins; an
+    /// array or a scalar replaces. A fragment that is not a JSON object, or that sets `hooks`,
+    /// is `E_CONFLICT`. The message names the fragment and the error category, line and column,
+    /// and repeats no content.
+    pub fn with_fragments<'a>(
+        &self,
+        fragments: impl IntoIterator<Item = (&'a str, &'a [u8])>,
+    ) -> Result<Desired, Refusal> {
+        let mut out = self.clone();
+        for (name, bytes) in fragments {
+            let fix = "Fix: repair or remove the fragment; the manager writes nothing until every fragment is a JSON object";
+            let obj = match serde_json::from_slice::<Json>(bytes) {
+                Ok(Json::Object(m)) => m,
+                Ok(_) => {
+                    return Err(conflict(format!(
+                        "fragment {name} is JSON but not an object. {fix}"
+                    )));
+                }
+                Err(e) => {
+                    return Err(conflict(format!(
+                        "fragment {name} is not valid JSON ({:?} at line {}, column {}). {fix}",
+                        e.classify(),
+                        e.line(),
+                        e.column()
+                    )));
+                }
+            };
+            if obj.contains_key("hooks") {
+                return Err(conflict(format!(
+                    "fragment {name} sets hooks. Fix: declare hooks as handlers in the module so the manager can retire only its own entries"
+                )));
+            }
+            overlay(&mut out.effective, &obj, "", &out.append.clone());
+        }
+        Ok(out)
+    }
+
     /// SHA-256 of the canonical JSON of the declared managed values. The module declares them,
-    /// so the digest is not secret and may appear in the plan.
+    /// so the digest is not secret and may appear in the plan. Fragments are not part of it.
     pub fn managed_sha256(&self) -> String {
         sha256_hex(&canonical(&Json::Object(self.managed.clone())))
     }
@@ -246,16 +398,112 @@ impl Desired {
         self.handlers.len()
     }
 
-    /// The top-level setting names the manager sets or seeds, sorted, never values.
+    /// The setting paths the manager sets or seeds, sorted, never values. A path is the keys
+    /// from the top of the file to a leaf (a value that is not an object), joined with dots.
+    /// Fragments are included: their keys are module or user data, not live content.
     pub fn setting_names(&self) -> Vec<String> {
-        let mut names: BTreeSet<String> = self.managed.keys().cloned().collect();
-        names.extend(self.seed.keys().cloned());
+        let mut names = BTreeSet::new();
+        leaf_paths(&self.effective, "", &mut names);
+        leaf_paths(&self.seed, "", &mut names);
         names.into_iter().collect()
     }
 
-    fn rendered_view(&self) -> Vec<u8> {
-        canonical(&Json::Object(self.managed.clone()))
+    fn rendered_map(&self) -> Map<String, Json> {
+        view_of(&self.effective, &self.effective, "", &self.append)
     }
+
+    fn rendered_view(&self) -> Vec<u8> {
+        canonical(&Json::Object(self.rendered_map()))
+    }
+}
+
+fn leaf_paths(m: &Map<String, Json>, prefix: &str, out: &mut BTreeSet<String>) {
+    for (k, v) in m {
+        let path = if prefix.is_empty() {
+            k.clone()
+        } else {
+            format!("{prefix}.{k}")
+        };
+        match v {
+            Json::Object(o) if !o.is_empty() => leaf_paths(o, &path, out),
+            _ => {
+                out.insert(path);
+            }
+        }
+    }
+}
+
+/// Deep merge of fragment objects: objects merge and everything else replaces. At an `append`
+/// pointer two arrays concatenate with unique items, so a fragment adds to a declared list.
+fn overlay(
+    dst: &mut Map<String, Json>,
+    src: &Map<String, Json>,
+    at: &str,
+    append: &BTreeSet<String>,
+) {
+    for (k, v) in src {
+        let here = format!("{at}/{}", escape_token(k));
+        match (dst.get_mut(k), v) {
+            (Some(Json::Object(d)), Json::Object(s)) => overlay(d, s, &here, append),
+            (Some(Json::Array(d)), Json::Array(s)) if append.contains(&here) => {
+                for item in s {
+                    let sha = sha_of(item);
+                    if !d.iter().any(|e| sha_of(e) == sha) {
+                        d.push(item.clone());
+                    }
+                }
+            }
+            _ => {
+                dst.insert(k.clone(), v.clone());
+            }
+        }
+    }
+}
+
+fn escape_token(t: &str) -> String {
+    t.replace('~', "~0").replace('/', "~1")
+}
+
+/// A JSON pointer that names at least one key, in its canonical spelling. `None` when the text
+/// is not a pointer (RFC 6901) or names the whole document.
+pub(crate) fn normal_pointer(p: &str) -> Option<String> {
+    let rest = p.strip_prefix('/')?;
+    let tokens: Vec<String> = rest.split('/').map(unescape_token).collect::<Option<_>>()?;
+    if tokens
+        .iter()
+        .any(|t| t.is_empty() || t.chars().any(char::is_control))
+    {
+        return None;
+    }
+    Some(
+        tokens
+            .iter()
+            .map(|t| format!("/{}", escape_token(t)))
+            .collect(),
+    )
+}
+
+fn unescape_token(t: &str) -> Option<String> {
+    let mut out = String::new();
+    let mut it = t.chars();
+    while let Some(c) = it.next() {
+        if c == '~' {
+            match it.next()? {
+                '0' => out.push('~'),
+                '1' => out.push('/'),
+                _ => return None,
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    Some(out)
+}
+
+fn pointer_tokens(p: &str) -> Vec<String> {
+    p.strip_prefix('/')
+        .map(|r| r.split('/').filter_map(unescape_token).collect())
+        .unwrap_or_default()
 }
 
 /// Parses the live document. Absent is `{}`. Anything that is not a JSON object is refused with
@@ -279,12 +527,83 @@ fn parse_live(live: Option<&[u8]>) -> Result<Map<String, Json>, Refusal> {
     }
 }
 
-fn view_of(doc: &Map<String, Json>, keys: &Map<String, Json>) -> Vec<u8> {
-    let picked: Map<String, Json> = keys
-        .keys()
-        .filter_map(|k| doc.get(k).map(|v| (k.clone(), v.clone())))
-        .collect();
-    canonical(&Json::Object(picked))
+/// The managed view of `doc`: the leaves of `managed` as `doc` holds them, at the same paths.
+/// A foreign leaf beside a managed one is not part of it. The items of an `append` array are
+/// left out, like hook entries: the manager restores a deleted item and does not call it an
+/// edit. An object that holds nothing of ours is left out.
+fn view_of(
+    doc: &Map<String, Json>,
+    managed: &Map<String, Json>,
+    at: &str,
+    append: &BTreeSet<String>,
+) -> Map<String, Json> {
+    let mut out = Map::new();
+    for (k, mv) in managed {
+        let here = format!("{at}/{}", escape_token(k));
+        if append.contains(&here) {
+            continue;
+        }
+        let Some(lv) = doc.get(k) else { continue };
+        match (mv, lv) {
+            (Json::Object(mo), Json::Object(lo)) => {
+                let sub = view_of(lo, mo, &here, append);
+                if !sub.is_empty() {
+                    out.insert(k.clone(), Json::Object(sub));
+                }
+            }
+            (Json::Object(_), _) => {}
+            _ => {
+                out.insert(k.clone(), lv.clone());
+            }
+        }
+    }
+    out
+}
+
+/// The leaves of a managed view by JSON pointer.
+fn leaves_of(view: &Map<String, Json>) -> BTreeMap<String, Vec<u8>> {
+    fn walk(m: &Map<String, Json>, at: &str, out: &mut BTreeMap<String, Vec<u8>>) {
+        for (k, v) in m {
+            // A key the ledger cannot spell as a JSON pointer is not compared leaf by leaf.
+            if k.is_empty() || k.chars().any(char::is_control) {
+                continue;
+            }
+            let here = format!("{at}/{}", escape_token(k));
+            match v {
+                Json::Object(o) => walk(o, &here, out),
+                leaf => {
+                    out.insert(here, canonical(leaf));
+                }
+            }
+        }
+    }
+    let mut out = BTreeMap::new();
+    walk(view, "", &mut out);
+    out
+}
+
+/// The salted content token of one fragment (`fragments:` precondition of a sensitive merge).
+pub fn fragment_token(salt: &[u8], name: &str, content: &[u8]) -> String {
+    let mut buf = name.as_bytes().to_vec();
+    buf.push(0);
+    buf.extend_from_slice(content);
+    salted(salt, &buf)
+}
+
+/// The salted hash of one managed leaf, as the ledger records it (`coowned.leaves`).
+pub fn leaf_hash(salt: &[u8], pointer: &str, value: &[u8]) -> String {
+    let mut buf = pointer.as_bytes().to_vec();
+    buf.push(0);
+    buf.extend_from_slice(value);
+    salted(salt, &buf)
+}
+
+/// The salted hashes of every managed leaf this merge declares, by JSON pointer.
+pub fn leaf_hashes(salt: &[u8], m: &Merged) -> BTreeMap<String, String> {
+    m.rendered_leaves
+        .iter()
+        .map(|(p, v)| (p.clone(), leaf_hash(salt, p, v)))
+        .collect()
 }
 
 fn serialize(doc: Map<String, Json>) -> Vec<u8> {
@@ -337,9 +656,10 @@ fn remove_owned(
     let Some(arr) = event_array(hooks, event)? else {
         return Ok(());
     };
-    let before = arr.len();
-    arr.retain(|e| sha_of(e) != sha256);
-    if arr.len() != before {
+    // One ownership record authorizes the removal of one element. An identical copy that the
+    // user added is foreign configuration and stays.
+    if let Some(i) = arr.iter().position(|e| sha_of(e) == sha256) {
+        arr.remove(i);
         touched.insert(event.into());
     }
     Ok(())
@@ -360,6 +680,157 @@ fn tidy(doc: &mut Map<String, Json>, touched: &BTreeSet<String>) {
     }
 }
 
+/// Removes the item whose canonical hash is `sha256` from the array at `tokens`. Returns true
+/// when `map` became empty because of this removal, so the caller can drop the key it emptied.
+/// A path of another shape is left alone.
+fn remove_item(map: &mut Map<String, Json>, tokens: &[String], sha256: &str) -> bool {
+    let Some((first, rest)) = tokens.split_first() else {
+        return false;
+    };
+    let emptied = if rest.is_empty() {
+        match map.get_mut(first) {
+            // One record removes one item: an identical copy of the user's stays.
+            Some(Json::Array(a)) => match a.iter().position(|e| sha_of(e) == sha256) {
+                Some(i) => {
+                    a.remove(i);
+                    a.is_empty()
+                }
+                None => false,
+            },
+            _ => false,
+        }
+    } else {
+        match map.get_mut(first) {
+            Some(Json::Object(m)) => remove_item(m, rest, sha256),
+            _ => false,
+        }
+    };
+    if emptied {
+        map.remove(first);
+        return map.is_empty();
+    }
+    false
+}
+
+/// What one merge walk needs besides the documents.
+struct Walk<'a> {
+    desired: &'a Desired,
+    prior: &'a [AppendedItem],
+    takeover: bool,
+    appended: Vec<AppendedItem>,
+}
+
+fn not_an_object(pointer: &str) -> Refusal {
+    conflict(format!(
+        "{pointer} in the live file is not an object, but the module sets keys below it. Fix: correct it by hand; the manager does not rewrite a foreign shape"
+    ))
+}
+
+/// Merges the declared managed object into `live`. An object merges into an object, a leaf or an
+/// array replaces, and an `append` array adds its unique items.
+fn apply_managed(
+    live: &mut Map<String, Json>,
+    managed: &Map<String, Json>,
+    path: &mut Vec<String>,
+    w: &mut Walk<'_>,
+) -> Result<(), Refusal> {
+    for (k, mv) in managed {
+        path.push(k.clone());
+        let ptr: String = path
+            .iter()
+            .map(|t| format!("/{}", escape_token(t)))
+            .collect();
+        if w.desired.append.contains(&ptr) {
+            append_items(live, k, mv, &ptr, w)?;
+        } else if let Json::Object(mo) = mv {
+            match live.get_mut(k) {
+                Some(Json::Object(lo)) => apply_managed(lo, mo, path, w)?,
+                None | Some(Json::Null) => {
+                    let mut fresh = Map::new();
+                    apply_managed(&mut fresh, mo, path, w)?;
+                    live.insert(k.clone(), Json::Object(fresh));
+                }
+                Some(_) => return Err(not_an_object(&ptr)),
+            }
+        } else {
+            if matches!(live.get(k), Some(Json::Object(_))) {
+                return Err(conflict(format!(
+                    "{ptr} in the live file is a table, but the module sets a value there. Fix: correct it by hand; the manager does not discard a foreign table"
+                )));
+            }
+            live.insert(k.clone(), mv.clone());
+        }
+        path.pop();
+    }
+    Ok(())
+}
+
+fn append_items(
+    live: &mut Map<String, Json>,
+    key: &str,
+    declared: &Json,
+    ptr: &str,
+    w: &mut Walk<'_>,
+) -> Result<(), Refusal> {
+    let Json::Array(items) = declared else {
+        return Err(invalid(format!(
+            "{ptr} is listed in append, but its declared value is not an array"
+        )));
+    };
+    let mut seen = BTreeSet::new();
+    let unique: Vec<(&Json, String)> = items
+        .iter()
+        .map(|i| (i, sha_of(i)))
+        .filter(|(_, h)| seen.insert(h.clone()))
+        .collect();
+    if unique.is_empty() {
+        return Ok(());
+    }
+    let slot = live
+        .entry(key.to_string())
+        .or_insert_with(|| Json::Array(Vec::new()));
+    if slot.is_null() {
+        *slot = Json::Array(Vec::new());
+    }
+    let Json::Array(arr) = slot else {
+        return Err(conflict(format!(
+            "{ptr} in the live file is not an array. Fix: correct it by hand; the manager does not rewrite a foreign shape"
+        )));
+    };
+    for (item, sha256) in unique {
+        let present = arr.iter().any(|e| sha_of(e) == sha256);
+        if !present {
+            arr.push(item.clone());
+        }
+        // The manager owns an item it added now or recorded before and, at an approved
+        // take-over, an identical item already there. Any other identical item is the user's.
+        let was_owned = w
+            .prior
+            .iter()
+            .any(|a| a.pointer == ptr && a.sha256 == sha256);
+        if !present || was_owned || w.takeover {
+            w.appended.push(AppendedItem {
+                pointer: ptr.to_string(),
+                sha256,
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Sets the seed values where the live document has nothing, at any depth.
+fn apply_seed(live: &mut Map<String, Json>, seed: &Map<String, Json>) {
+    for (k, sv) in seed {
+        match (live.get_mut(k), sv) {
+            (None | Some(Json::Null), _) => {
+                live.insert(k.clone(), sv.clone());
+            }
+            (Some(Json::Object(lo)), Json::Object(so)) => apply_seed(lo, so),
+            _ => {}
+        }
+    }
+}
+
 /// Merges the declared value into the live document.
 ///
 /// `owned` is what the ledger recorded after the last merge. An owned entry whose handler is
@@ -370,27 +841,43 @@ pub fn merge(
     desired: &Desired,
     owned: &[OwnedEntry],
 ) -> Result<Merged, Refusal> {
-    merge_with(live, desired, owned, false)
+    merge_with(live, desired, owned, &[], false)
 }
 
-/// As [`merge`]. With `takeover` (the first write into an existing file with no ledger entry,
-/// approved with `--allow-adopt`), an identical entry already in place is recorded as owned. The
-/// approval covers it: after an interrupted first merge the file already holds the manager's own
-/// entries, and nothing tells them from the user's copy.
+/// As [`merge`]. `appended` is what the ledger recorded as appended array items. With `takeover`
+/// (the first write into an existing file with no ledger entry, approved with `--allow-adopt`),
+/// an identical entry or item already in place is recorded as owned. The approval covers it:
+/// after an interrupted first merge the file already holds the manager's own entries, and
+/// nothing tells them from the user's copy.
 pub fn merge_with(
     live: Option<&[u8]>,
     desired: &Desired,
     owned: &[OwnedEntry],
+    appended: &[AppendedItem],
     takeover: bool,
 ) -> Result<Merged, Refusal> {
     let mut doc = parse_live(live)?;
-    let live_view = view_of(&doc, &desired.managed);
-    for (k, v) in &desired.managed {
-        doc.insert(k.clone(), v.clone());
+    let live_map = view_of(&doc, &desired.effective, "", &desired.append);
+    let live_view = canonical(&Json::Object(live_map.clone()));
+    // An appended item the module no longer declares goes first, matched by hash.
+    for a in appended {
+        let declared = desired.append.contains(&a.pointer)
+            && matches!(
+                pointer_get(&desired.effective, &a.pointer),
+                Some(Json::Array(items)) if items.iter().any(|i| sha_of(i) == a.sha256)
+            );
+        if !declared {
+            remove_item(&mut doc, &pointer_tokens(&a.pointer), &a.sha256);
+        }
     }
-    for (k, v) in &desired.seed {
-        doc.entry(k.clone()).or_insert_with(|| v.clone());
-    }
+    let mut walk = Walk {
+        desired,
+        prior: appended,
+        takeover,
+        appended: Vec::new(),
+    };
+    apply_managed(&mut doc, &desired.effective, &mut Vec::new(), &mut walk)?;
+    apply_seed(&mut doc, &desired.seed);
     let declared: BTreeMap<&str, &Handler> = desired
         .handlers
         .iter()
@@ -419,17 +906,21 @@ pub fn merge_with(
                 ));
             }
         };
-        let present = match event_array(hooks, &h.event)? {
+        let (added, exact) = match event_array(hooks, &h.event)? {
             Some(arr) => {
-                let found = arr.iter().any(|e| sha_of(e) == h.sha256);
-                if !found {
+                // An exact copy is the manager's to own. An equivalent hook (another spelling of
+                // the same command) is the user's: it is not duplicated and not recorded, so a
+                // retire can never remove a group that holds foreign hooks too.
+                let exact = arr.iter().any(|e| sha_of(e) == h.sha256);
+                let added = !exact && !hook_present(arr, &h.entry, desired.home.as_deref());
+                if added {
                     arr.push(h.entry.clone());
                 }
-                found
+                (added, exact)
             }
             None => {
                 hooks.insert(h.event.clone(), Json::Array(vec![h.entry.clone()]));
-                false
+                (true, false)
             }
         };
         // The manager owns an entry it added now or recorded as its own before, and, at an
@@ -438,7 +929,7 @@ pub fn merge_with(
         let was_owned = owned
             .iter()
             .any(|o| o.id == h.id && o.key == h.event && o.sha256 == h.sha256);
-        if !present || was_owned || takeover {
+        if added || exact && (was_owned || takeover) {
             entries.push(OwnedEntry {
                 id: h.id.clone(),
                 key: h.event.clone(),
@@ -446,26 +937,211 @@ pub fn merge_with(
             });
         }
     }
+    let rendered_leaves = leaves_of(&desired.rendered_map());
+    if rendered_leaves.len() + entries.len() + walk.appended.len() > MAX_RECORDED {
+        return Err(Refusal::new(
+            Code::LimitExceeded,
+            format!(
+                "the merge would record more than {MAX_RECORDED} managed leaves, hooks and appended items in the ledger. Fix: declare fewer keys, or shrink the fragments"
+            ),
+        ));
+    }
     let bytes = serialize(doc);
     let changed = live != Some(bytes.as_slice());
     Ok(Merged {
         bytes,
         live_view,
         rendered_view: desired.rendered_view(),
+        live_leaves: leaves_of(&live_map),
+        rendered_leaves,
         entries,
+        appended: walk.appended,
         changed,
     })
 }
 
-/// Removes only the handler entries the ledger recorded as owned. Managed values, seeded values
-/// and every foreign key and hook stay. Returns the new bytes and whether they differ.
-pub fn retire(live: &[u8], owned: &[OwnedEntry]) -> Result<(Vec<u8>, bool), Refusal> {
+/// How a character of a shell word was written. Only text the shell would expand can be a home
+/// spelling: `~` when bare, `$HOME` and `${HOME}` when bare or in double quotes. A character in
+/// single quotes, or escaped with a backslash, is literal text.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Lead {
+    Bare,
+    Double,
+    Literal,
+}
+
+/// One character with how it was written and the quote span it sits in. A span changes at every
+/// quote that opens or closes, so `"$"HOME` and `$HO"ME"` are not one token.
+type Ch = (char, Lead, u32);
+
+/// Splits a shell command into words the way a POSIX shell reads quotes (single, double and
+/// backslash), without any expansion. `None` when a quote is not closed.
+fn shell_words(s: &str) -> Option<Vec<Vec<Ch>>> {
+    let (mut words, mut cur, mut open, mut span) = (Vec::new(), Vec::<Ch>::new(), false, 0u32);
+    let mut it = s.chars();
+    while let Some(c) = it.next() {
+        match c {
+            '\'' => {
+                open = true;
+                span += 1;
+                loop {
+                    match it.next()? {
+                        '\'' => break,
+                        x => cur.push((x, Lead::Literal, span)),
+                    }
+                }
+                span += 1;
+            }
+            '"' => {
+                open = true;
+                span += 1;
+                loop {
+                    match it.next()? {
+                        '"' => break,
+                        '\\' => {
+                            let n = it.next()?;
+                            if matches!(n, '\\' | '"' | '$' | '`') {
+                                cur.push((n, Lead::Literal, span));
+                            } else {
+                                cur.push(('\\', Lead::Literal, span));
+                                cur.push((n, Lead::Double, span));
+                            }
+                        }
+                        x => cur.push((x, Lead::Double, span)),
+                    }
+                }
+                span += 1;
+            }
+            '\\' => {
+                open = true;
+                span += 1;
+                cur.push((it.next()?, Lead::Literal, span));
+                span += 1;
+            }
+            c if c.is_whitespace() => {
+                if open {
+                    words.push(std::mem::take(&mut cur));
+                    open = false;
+                }
+            }
+            c => {
+                open = true;
+                cur.push((c, Lead::Bare, span));
+            }
+        }
+    }
+    if open {
+        words.push(cur);
+    }
+    Some(words)
+}
+
+/// One word with its home spelling made canonical. The leading `~`, `$HOME` or `${HOME}` becomes
+/// the home marker only when the shell would expand it: the whole token is written as one unit,
+/// bare (or double-quoted for the variables), and a `~` is followed by a bare `/` or the end. A
+/// partly quoted token (`"$"HOME`, `$HO"ME"`, `~"/x"`) is literal text. The absolute home path is
+/// literal text in any quoting, so it always matches.
+fn canon_word(w: &[Ch], home: Option<&str>) -> String {
+    let text: String = w.iter().map(|c| c.0).collect();
+    let unit = |n: usize, lead: Lead| {
+        w.len() >= n
+            && w[..n]
+                .iter()
+                .all(|c| c.1 == lead && c.2 == w.first().map_or(0, |f| f.2))
+    };
+    let at_end = |n: usize, bare_slash: bool| match w.get(n) {
+        None => true,
+        Some(c) => c.0 == '/' && (!bare_slash || c.1 == Lead::Bare),
+    };
+    let marker = |n: usize| {
+        let rest: String = w[n..].iter().map(|c| c.0).collect();
+        format!("\u{1}HOME{rest}")
+    };
+    if unit(1, Lead::Bare) && w[0].0 == '~' && at_end(1, true) {
+        return marker(1);
+    }
+    for (name, n) in [("$HOME", 5), ("${HOME}", 7)] {
+        for lead in [Lead::Bare, Lead::Double] {
+            if text.starts_with(name) && unit(n, lead) && at_end(n, false) {
+                return marker(n);
+            }
+        }
+    }
+    if let Some(h) = home
+        && let Some(rest) = text.strip_prefix(h)
+        && (rest.is_empty() || rest.starts_with('/'))
+    {
+        return format!("\u{1}HOME{rest}");
+    }
+    text
+}
+
+/// The identity of a hook command: its words, read as a shell reads them, with an expandable home
+/// spelling made canonical. Quoting that does not change the words, and `~/`, `$HOME/`,
+/// `${HOME}/` and the absolute home path at the start of a word, do not change it. A `~` or
+/// `$HOME` that is single-quoted, escaped or only partly quoted is literal text and does. A
+/// command with an unclosed quote is its own identity.
+fn command_identity(cmd: &str, home: Option<&str>) -> String {
+    match shell_words(cmd) {
+        Some(w) => w
+            .iter()
+            .map(|x| canon_word(x, home))
+            .collect::<Vec<_>>()
+            .join("\0"),
+        None => format!("raw\0{cmd}"),
+    }
+}
+
+/// Whether `arr` (the groups of one event) already runs the declared hook: a group with the same
+/// matcher that holds a `command` hook of the same identity. The timeout does not matter, and
+/// neither does what else the group holds, so a group the nix merge wrote with two hooks counts.
+fn hook_present(arr: &[Json], entry: &Json, home: Option<&str>) -> bool {
+    let Some(want) = entry["hooks"][0]["command"]
+        .as_str()
+        .map(|c| command_identity(c, home))
+    else {
+        return false;
+    };
+    arr.iter().any(|g| {
+        g.get("matcher") == entry.get("matcher")
+            && g["hooks"].as_array().is_some_and(|hs| {
+                hs.iter().any(|h| {
+                    h["type"] == "command"
+                        && h["command"]
+                            .as_str()
+                            .is_some_and(|c| command_identity(c, home) == want)
+                })
+            })
+    })
+}
+
+fn pointer_get<'a>(m: &'a Map<String, Json>, pointer: &str) -> Option<&'a Json> {
+    let tokens = pointer_tokens(pointer);
+    let (last, parents) = tokens.split_last()?;
+    let mut cur = m;
+    for t in parents {
+        cur = cur.get(t)?.as_object()?;
+    }
+    cur.get(last)
+}
+
+/// Removes only the handler entries and appended items the ledger recorded as owned. Managed
+/// values, seeded values and every foreign key, hook and array item stay. Returns the new bytes
+/// and whether they differ.
+pub fn retire(
+    live: &[u8],
+    owned: &[OwnedEntry],
+    appended: &[AppendedItem],
+) -> Result<(Vec<u8>, bool), Refusal> {
     let mut doc = parse_live(Some(live))?;
     let mut touched = BTreeSet::new();
     for o in owned {
         remove_owned(&mut doc, &o.key, &o.sha256, &mut touched)?;
     }
     tidy(&mut doc, &touched);
+    for a in appended {
+        remove_item(&mut doc, &pointer_tokens(&a.pointer), &a.sha256);
+    }
     let bytes = serialize(doc);
     let changed = live != bytes.as_slice();
     Ok((bytes, changed))
@@ -473,7 +1149,12 @@ pub fn retire(live: &[u8], owned: &[OwnedEntry]) -> Result<(Vec<u8>, bool), Refu
 
 /// Checks that the live document parses, and returns its managed view, without building a merge.
 pub fn live_view(live: Option<&[u8]>, desired: &Desired) -> Result<Vec<u8>, Refusal> {
-    Ok(view_of(&parse_live(live)?, &desired.managed))
+    Ok(canonical(&Json::Object(view_of(
+        &parse_live(live)?,
+        &desired.effective,
+        "",
+        &desired.append,
+    ))))
 }
 
 /// The text for a lost or unusable salt while the ledger records a salted hash. It is a hard
@@ -484,7 +1165,19 @@ pub const SALT_LOST: &str = "state/salt is missing or unusable, but the ledger r
 /// managed view must differ from the salted hash the ledger holds, and must not already equal
 /// the declared values (then nothing is overwritten). Plan and apply both decide through this.
 pub fn foreign_edit(salt: &[u8], recorded: &CoOwned, m: &Merged) -> bool {
-    salted(salt, &m.live_view) != recorded.managed_hash && m.live_view != m.rendered_view
+    // Leaf by leaf, over the leaves both the ledger and the module name now. A leaf the module
+    // dropped, renamed or added is not an edit: the declared key set changed, not the file. The
+    // whole-view hash is not consulted here, because it covers the old key set. A ledger written
+    // before DFM-48 has no leaf hashes, so its first write has nothing to compare and records them.
+    recorded.leaves.iter().any(|(path, hash)| {
+        let Some(declared) = m.rendered_leaves.get(path) else {
+            return false;
+        };
+        match m.live_leaves.get(path) {
+            None => true,
+            Some(live) => live != declared && leaf_hash(salt, path, live) != *hash,
+        }
+    })
 }
 
 /// The shared conflict check for plan and apply. `live_present` is false when the file is
@@ -528,12 +1221,16 @@ pub fn classify(
     salt: Option<&[u8]>,
 ) -> Result<(Merged, Outcome), Refusal> {
     let owned = recorded.map(|c| c.entries.as_slice()).unwrap_or_default();
-    let merged = merge(live, desired, owned)?;
+    let appended = recorded.map(|c| c.appended.as_slice()).unwrap_or_default();
+    let merged = merge_with(live, desired, owned, appended, false)?;
     check_foreign(live.is_some(), recorded, salt, &merged)?;
     let current = live.is_some()
         && !merged.changed
         && recorded.zip(salt).is_some_and(|(c, salt)| {
-            salted(salt, &merged.rendered_view) == c.managed_hash && c.entries == merged.entries
+            salted(salt, &merged.rendered_view) == c.managed_hash
+                && c.leaves == leaf_hashes(salt, &merged)
+                && c.entries == merged.entries
+                && c.appended == merged.appended
         });
     Ok((
         merged,
@@ -630,7 +1327,7 @@ argv = ["audit", "--quiet", "two words"]
         let live =
             br#"{"hooks":{"PreToolUse":[{"hooks":[{"type":"command","command":"foreign"}]}]}}"#;
         let m = merge(Some(live), &desired(BASE), &[]).unwrap();
-        let (bytes, changed) = retire(&m.bytes, &m.entries).unwrap();
+        let (bytes, changed) = retire(&m.bytes, &m.entries, &m.appended).unwrap();
         assert!(changed);
         let out = json(&bytes);
         assert_eq!(out["outputStyle"], "STE", "managed values stay");
@@ -643,7 +1340,7 @@ argv = ["audit", "--quiet", "two words"]
     #[test]
     fn retire_drops_the_event_and_hooks_it_emptied() {
         let m = merge(None, &desired(BASE), &[]).unwrap();
-        let (bytes, _) = retire(&m.bytes, &m.entries).unwrap();
+        let (bytes, _) = retire(&m.bytes, &m.entries, &m.appended).unwrap();
         assert!(json(&bytes).get("hooks").is_none());
     }
 
@@ -652,7 +1349,7 @@ argv = ["audit", "--quiet", "two words"]
         let first = merge(None, &desired(BASE), &[]).unwrap();
         let plain = merge(Some(&first.bytes), &desired(BASE), &[]).unwrap();
         assert!(plain.entries.is_empty(), "the user's copy stays the user's");
-        let taken = merge_with(Some(&first.bytes), &desired(BASE), &[], true).unwrap();
+        let taken = merge_with(Some(&first.bytes), &desired(BASE), &[], &[], true).unwrap();
         assert_eq!(taken.entries, first.entries);
     }
 
@@ -766,7 +1463,7 @@ argv = ["audit", "--quiet", "two words"]
         let live = br#"{"hooks":{"PreToolUse":[{"hooks":[{"command":"audit --quiet 'two words'","type":"command"}]}]}}"#;
         let first = merge(Some(live), &desired(BASE), &[]).unwrap();
         assert!(first.entries.is_empty(), "{:?}", first.entries);
-        let (bytes, _) = retire(&first.bytes, &first.entries).unwrap();
+        let (bytes, _) = retire(&first.bytes, &first.entries, &first.appended).unwrap();
         assert_eq!(
             json(&bytes)["hooks"]["PreToolUse"]
                 .as_array()
@@ -789,6 +1486,8 @@ argv = ["audit", "--quiet", "two words"]
         let rec = CoOwned {
             managed_hash: salted(&salt, &first.rendered_view),
             entries: first.entries.clone(),
+            appended: first.appended.clone(),
+            leaves: leaf_hashes(&salt, &first),
         };
         // Unchanged live file: current.
         let (_, o) = classify(Some(&first.bytes), &d, Some(&rec), Some(&salt)).unwrap();
@@ -828,5 +1527,525 @@ argv = ["audit", "--quiet", "two words"]
     fn the_salted_hash_depends_on_the_salt() {
         assert_ne!(salted(b"a", b"{}"), salted(b"b", b"{}"));
         assert_eq!(salted(b"a", b"{}"), salted(b"a", b"{}"));
+    }
+
+    const NESTED: &str = r#"
+append = ["/sandbox/filesystem/allowWrite"]
+[managed.env]
+MANAGED = "1"
+[managed.enabledPlugins]
+"a@m" = true
+[managed.sandbox.filesystem]
+allowWrite = ["/m/one", "/m/two", "/m/one"]
+[seed]
+model = "opusplan"
+[seed.permissions]
+defaultMode = "auto"
+"#;
+
+    #[test]
+    fn objects_merge_recursively_and_foreign_leaves_survive_at_any_depth() {
+        let live = br#"{"env":{"MINE":"x","MANAGED":"0"},"enabledPlugins":{"user@m":true,"a@m":false},"permissions":{"allow":["Bash"]}}"#;
+        let m = merge(Some(live), &desired(NESTED), &[]).unwrap();
+        let out = json(&m.bytes);
+        assert_eq!(out["env"], serde_json::json!({"MINE":"x","MANAGED":"1"}));
+        assert_eq!(
+            out["enabledPlugins"],
+            serde_json::json!({"user@m":true,"a@m":true}),
+            "a plugin the user enabled survives, a managed leaf wins"
+        );
+        assert_eq!(out["permissions"]["allow"], serde_json::json!(["Bash"]));
+        assert_eq!(out["permissions"]["defaultMode"], "auto", "seed at depth");
+        assert_eq!(out["model"], "opusplan");
+    }
+
+    #[test]
+    fn seeds_never_overwrite_a_live_value_at_any_depth() {
+        let live = br#"{"model":"haiku","permissions":{"defaultMode":"plan"}}"#;
+        let out = json(&merge(Some(live), &desired(NESTED), &[]).unwrap().bytes);
+        assert_eq!(out["model"], "haiku");
+        assert_eq!(out["permissions"]["defaultMode"], "plan");
+    }
+
+    #[test]
+    fn an_append_array_adds_unique_items_once_and_keeps_the_users() {
+        let live = br#"{"sandbox":{"filesystem":{"allowWrite":["/user","/m/two"]}}}"#;
+        let d = desired(NESTED);
+        let m = merge(Some(live), &d, &[]).unwrap();
+        let aw = json(&m.bytes)["sandbox"]["filesystem"]["allowWrite"].clone();
+        assert_eq!(aw, serde_json::json!(["/user", "/m/two", "/m/one"]));
+        // Only the item the manager added is recorded. `/m/two` was the user's.
+        assert_eq!(m.appended.len(), 1);
+        let again = merge_with(Some(&m.bytes), &d, &[], &m.appended, false).unwrap();
+        assert!(!again.changed, "a second merge changes nothing");
+        assert_eq!(again.appended, m.appended);
+    }
+
+    #[test]
+    fn an_append_array_replaces_nothing_and_creates_the_path_when_absent() {
+        let m = merge(None, &desired(NESTED), &[]).unwrap();
+        assert_eq!(
+            json(&m.bytes)["sandbox"]["filesystem"]["allowWrite"],
+            serde_json::json!(["/m/one", "/m/two"])
+        );
+        assert_eq!(m.appended.len(), 2);
+    }
+
+    #[test]
+    fn a_dropped_appended_item_is_removed_and_a_user_item_is_not() {
+        let d1 = desired(NESTED);
+        let live = br#"{"sandbox":{"filesystem":{"allowWrite":["/user"]}}}"#;
+        let m1 = merge(Some(live), &d1, &[]).unwrap();
+        let d2 = desired(&NESTED.replace(r#""/m/one", "/m/two", "/m/one""#, r#""/m/two""#));
+        let m2 = merge_with(Some(&m1.bytes), &d2, &[], &m1.appended, false).unwrap();
+        assert_eq!(
+            json(&m2.bytes)["sandbox"]["filesystem"]["allowWrite"],
+            serde_json::json!(["/user", "/m/two"])
+        );
+        assert_eq!(m2.appended.len(), 1);
+    }
+
+    #[test]
+    fn deselecting_removes_appended_items_and_the_paths_they_emptied() {
+        let m = merge(None, &desired(NESTED), &[]).unwrap();
+        let (bytes, changed) = retire(&m.bytes, &m.entries, &m.appended).unwrap();
+        assert!(changed);
+        let out = json(&bytes);
+        assert!(out.get("sandbox").is_none(), "the emptied path is dropped");
+        assert_eq!(out["env"]["MANAGED"], "1", "managed values stay");
+        // A user item in the same array stays, and so does the array.
+        let live = br#"{"sandbox":{"filesystem":{"allowWrite":["/user"]}}}"#;
+        let m = merge(Some(live), &desired(NESTED), &[]).unwrap();
+        let (bytes, _) = retire(&m.bytes, &m.entries, &m.appended).unwrap();
+        assert_eq!(
+            json(&bytes)["sandbox"]["filesystem"]["allowWrite"],
+            serde_json::json!(["/user"])
+        );
+    }
+
+    #[test]
+    fn the_managed_view_ignores_foreign_leaves_and_append_items() {
+        let d = desired(NESTED);
+        let m = merge(None, &d, &[]).unwrap();
+        let salt = [3u8; 32];
+        let rec = CoOwned {
+            managed_hash: salted(&salt, &m.rendered_view),
+            entries: m.entries.clone(),
+            appended: m.appended.clone(),
+            leaves: leaf_hashes(&salt, &m),
+        };
+        // A plugin the user adds, a user sandbox path and a deleted appended item are no edit.
+        let live = br#"{"env":{"MANAGED":"1","MINE":"x"},"enabledPlugins":{"a@m":true,"user@m":true},"sandbox":{"filesystem":{"allowWrite":["/user"]}}}"#;
+        let (merged, _) = classify(Some(live), &d, Some(&rec), Some(&salt)).unwrap();
+        // The view holds the managed leaves and nothing the user added.
+        assert_eq!(
+            merged.live_view,
+            br#"{"enabledPlugins":{"a@m":true},"env":{"MANAGED":"1"}}"#
+        );
+        assert_eq!(
+            merged.appended.len(),
+            2,
+            "a deleted appended item comes back"
+        );
+        // A change of a managed leaf is an edit.
+        let edited = br#"{"env":{"MANAGED":"2"},"enabledPlugins":{"a@m":true}}"#;
+        let e = classify(Some(edited), &d, Some(&rec), Some(&salt)).unwrap_err();
+        assert_eq!(e.code, Code::Conflict);
+        assert!(!e.detail.contains('2'));
+    }
+
+    #[test]
+    fn a_managed_object_over_a_live_scalar_is_refused_without_content() {
+        let live = br#"{"env":"secret-text"}"#;
+        let e = merge(Some(live), &desired(NESTED), &[]).unwrap_err();
+        assert_eq!(e.code, Code::Conflict);
+        assert!(!e.detail.contains("secret-text"));
+        let live = br#"{"sandbox":{"filesystem":{"allowWrite":"secret-text"}}}"#;
+        let e = merge(Some(live), &desired(NESTED), &[]).unwrap_err();
+        assert_eq!(e.code, Code::Conflict);
+        assert!(!e.detail.contains("secret-text"));
+    }
+
+    #[test]
+    fn append_pointers_are_validated_and_fragments_need_both_fields() {
+        for bad in [
+            "append = [\"sandbox\"]\n[managed]\n",
+            "append = [\"/a//b\"]\n[managed]\n",
+            "append = [\"/a/~2\"]\n[managed]\n",
+            "append = \"/a\"\n[managed]\n",
+            "fragments_dir = \".claude/settings.d\"\n[managed]\n",
+        ] {
+            let v = toml::from_str::<Toml>(bad).unwrap();
+            assert_eq!(
+                Desired::from_value(&v).unwrap_err().code,
+                Code::ManifestInvalid,
+                "{bad}"
+            );
+        }
+        // An append pointer must name an array under managed. A mistyped one is refused, because
+        // it would turn append into replace and lose the user's items.
+        for bad in [
+            "append = [\"/a/b\"]\n[managed.a]\nb = 1\n",
+            "append = [\"/sandbox/filesystem/allowwrite\"]\n[managed.sandbox.filesystem]\nallowWrite = [\"x\"]\n",
+            "append = [\"/a/missing\"]\n[managed.a]\nb = [1]\n",
+            "append = [\"/hooks/Stop\"]\n[managed.a]\nb = [1]\n",
+        ] {
+            let v = toml::from_str::<Toml>(bad).unwrap();
+            let e = Desired::from_value(&v).unwrap_err();
+            assert_eq!(e.code, Code::ManifestInvalid, "{bad}");
+        }
+        desired("append = [\"/a/b\"]\n[managed.a]\nb = [1]\n");
+    }
+
+    #[test]
+    fn fragments_layer_in_name_order_over_the_declared_values() {
+        let d = desired(&format!(
+            "fragments_dir = \".claude/settings.d\"\npattern = \"*.json\"\n{NESTED}"
+        ));
+        assert_eq!(d.fragment_spec(), Some((".claude/settings.d", "*.json")));
+        let layered = d
+            .with_fragments([
+                (
+                    "10-a.json",
+                    br#"{"env":{"MANAGED":"frag","NEW":"n"},"outputStyle":"X"}"#.as_slice(),
+                ),
+                ("20-b.json", br#"{"env":{"NEW":"later"}}"#.as_slice()),
+            ])
+            .unwrap();
+        let out = json(&merge(None, &layered, &[]).unwrap().bytes);
+        assert_eq!(
+            out["env"],
+            serde_json::json!({"MANAGED":"frag","NEW":"later"})
+        );
+        assert_eq!(out["outputStyle"], "X");
+        // The declared digest ignores fragments. The names cover the layered view.
+        assert_eq!(layered.managed_sha256(), d.managed_sha256());
+        assert!(layered.setting_names().contains(&"outputStyle".to_string()));
+        assert!(!d.setting_names().contains(&"outputStyle".to_string()));
+        // The salted view covers the fragments.
+        assert_ne!(layered.rendered_view(), d.rendered_view());
+    }
+
+    #[test]
+    fn a_bad_fragment_is_refused_by_name_without_content() {
+        let d = desired(NESTED);
+        for (bytes, why) in [
+            (b"{not json planted-token".as_slice(), "not valid JSON"),
+            (b"[1]".as_slice(), "not an object"),
+            (br#"{"hooks":{}}"#.as_slice(), "sets hooks"),
+        ] {
+            let e = d.with_fragments([("02-bad.json", bytes)]).unwrap_err();
+            assert_eq!(e.code, Code::Conflict);
+            assert!(
+                e.detail.contains("02-bad.json") && e.detail.contains(why),
+                "{}",
+                e.detail
+            );
+            assert!(!e.detail.contains("planted-token"));
+        }
+    }
+
+    #[test]
+    fn a_handler_may_carry_a_matcher_and_a_timeout() {
+        let d = desired(
+            "[managed]\n[handlers.guard]\nevent = \"PreToolUse\"\ntype = \"command\"\nargv = [\"g\"]\nmatcher = \"Bash\"\ntimeout = 20\n",
+        );
+        let out = json(&merge(None, &d, &[]).unwrap().bytes);
+        let g = &out["hooks"]["PreToolUse"][0];
+        assert_eq!(g["matcher"], "Bash");
+        assert_eq!(g["hooks"][0]["timeout"], 20);
+        for bad in ["matcher = 3", "timeout = 0", "timeout = \"x\""] {
+            let v = toml::from_str::<Toml>(&format!(
+                "[managed]\n[handlers.g]\nevent = \"E\"\ntype = \"command\"\nargv = [\"g\"]\n{bad}\n"
+            ))
+            .unwrap();
+            assert!(Desired::from_value(&v).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn command_identity_ignores_home_spelling_and_quoting() {
+        let home = Some("/home/me");
+        let id = |c: &str| command_identity(c, home);
+        let want = id("~/.claude/hooks/x.sh");
+        for same in [
+            "$HOME/.claude/hooks/x.sh",
+            "${HOME}/.claude/hooks/x.sh",
+            "\"${HOME}/.claude/hooks/x.sh\"",
+            "\"$HOME/.claude/hooks/x.sh\"",
+            "/home/me/.claude/hooks/x.sh",
+            "'/home/me/.claude/hooks/x.sh'",
+            "  ~/.claude/hooks/x.sh  ",
+        ] {
+            assert_eq!(id(same), want, "{same}");
+        }
+        // A single-quoted or escaped `~` or `$HOME` is literal text, not the home directory.
+        for literal in [
+            "'~/.claude/hooks/x.sh'",
+            "'${HOME}/.claude/hooks/x.sh'",
+            "\\$HOME/.claude/hooks/x.sh",
+            "\"\\${HOME}/.claude/hooks/x.sh\"",
+            "\"~/.claude/hooks/x.sh\"",
+            "\\~/.claude/hooks/x.sh",
+            // A token that is only partly quoted is not one expandable unit.
+            "\"$\"HOME/.claude/hooks/x.sh",
+            "~\"/.claude/hooks/x.sh\"",
+            "$HO\"ME\"/.claude/hooks/x.sh",
+            "$H\"\"OME/.claude/hooks/x.sh",
+            "\"$\"\"HOME\"/.claude/hooks/x.sh",
+        ] {
+            assert_ne!(id(literal), want, "{literal}");
+        }
+        for other in [
+            "~/.claude/hooks/y.sh",
+            "/home/mex/.claude/hooks/x.sh",
+            "bash ~/.claude/hooks/x.sh",
+            "/opt/x/.claude/hooks/x.sh",
+        ] {
+            assert_ne!(id(other), want, "{other}");
+        }
+        assert_ne!(id("a 'b c'"), id("a b c"), "word boundaries count");
+        assert_eq!(
+            id("a 'b c"),
+            "raw\0a 'b c",
+            "an unclosed quote is its own identity"
+        );
+    }
+
+    #[test]
+    fn an_equivalent_hook_is_not_duplicated_and_not_owned_even_at_take_over() {
+        let d = desired(
+            "[managed]\n[handlers.g]\nevent = \"E\"\ntype = \"command\"\nargv = [\"${HOME}/h/x.sh\"]\n",
+        )
+        .with_home("/home/me");
+        let live = br#"{"hooks":{"E":[{"hooks":[{"type":"command","command":"/home/me/h/x.sh"},{"type":"command","command":"foreign"}]}]}}"#;
+        for takeover in [false, true] {
+            let m = merge_with(Some(live), &d, &[], &[], takeover).unwrap();
+            assert_eq!(json(&m.bytes)["hooks"]["E"].as_array().unwrap().len(), 1);
+            assert!(m.entries.is_empty(), "takeover={takeover}");
+        }
+    }
+
+    #[test]
+    fn dropping_a_managed_key_is_no_edit_but_a_hand_edit_of_a_kept_key_still_is() {
+        let salt = [5u8; 32];
+        let wide = desired("[managed]\na = 1\nb = 2\n");
+        let first = merge(None, &wide, &[]).unwrap();
+        let rec = CoOwned {
+            managed_hash: salted(&salt, &first.rendered_view),
+            entries: vec![],
+            appended: vec![],
+            leaves: leaf_hashes(&salt, &first),
+        };
+        let narrow = desired("[managed]\na = 1\n");
+        // The module dropped `b`: the live file is as written, so the write is allowed.
+        assert!(classify(Some(&first.bytes), &narrow, Some(&rec), Some(&salt)).is_ok());
+        // A hand edit of the kept key is still a conflict, with or without the dropped key.
+        let edited = br#"{"a":9,"b":2}"#;
+        let e = classify(Some(edited), &narrow, Some(&rec), Some(&salt)).unwrap_err();
+        assert_eq!(e.code, Code::Conflict);
+        assert!(!e.detail.contains('9'));
+        // A key the module added is not compared: there is nothing recorded for it.
+        let wider = desired("[managed]\na = 1\nb = 2\nc = 3\n");
+        assert!(classify(Some(&first.bytes), &wider, Some(&rec), Some(&salt)).is_ok());
+        // A removed kept key is an edit.
+        let e = classify(Some(br#"{"b":2}"#), &narrow, Some(&rec), Some(&salt)).unwrap_err();
+        assert_eq!(e.code, Code::Conflict);
+    }
+
+    #[test]
+    fn a_declared_value_over_a_foreign_table_is_refused_without_content() {
+        let live = br#"{"a":{"secret":"planted-token"}}"#;
+        let e = merge(Some(live), &desired("[managed]\na = 1\n"), &[]).unwrap_err();
+        assert_eq!(e.code, Code::Conflict);
+        assert!(!e.detail.contains("planted-token"));
+        let e = merge(Some(live), &desired("[managed]\na = [1]\n"), &[]).unwrap_err();
+        assert_eq!(e.code, Code::Conflict);
+    }
+
+    #[test]
+    fn a_seed_fills_a_live_null() {
+        let d = desired("[managed]\n[seed]\nmodel = \"m\"\n[seed.p]\nq = 1\n");
+        let out = json(
+            &merge(Some(br#"{"model":null,"p":{"q":null}}"#), &d, &[])
+                .unwrap()
+                .bytes,
+        );
+        assert_eq!(
+            (out["model"].clone(), out["p"]["q"].clone()),
+            ("m".into(), 1.into())
+        );
+    }
+
+    #[test]
+    fn a_fragment_array_at_an_append_pointer_adds_unique_items() {
+        let d = desired(NESTED);
+        let layered = d
+            .with_fragments([(
+                "10.json",
+                br#"{"sandbox":{"filesystem":{"allowWrite":["/m/two","/frag/new"]}}}"#.as_slice(),
+            )])
+            .unwrap();
+        let m = merge(None, &layered, &[]).unwrap();
+        assert_eq!(
+            json(&m.bytes)["sandbox"]["filesystem"]["allowWrite"],
+            serde_json::json!(["/m/one", "/m/two", "/frag/new"])
+        );
+        // Another array in a fragment still replaces.
+        let layered = d
+            .with_fragments([
+                ("10.json", br#"{"extra":[1]}"#.as_slice()),
+                ("20.json", br#"{"extra":[2]}"#.as_slice()),
+            ])
+            .unwrap();
+        assert_eq!(
+            json(&merge(None, &layered, &[]).unwrap().bytes)["extra"],
+            serde_json::json!([2])
+        );
+    }
+
+    #[test]
+    fn handler_matcher_and_timeout_are_validated() {
+        let with = |extra: &str| {
+            toml::from_str::<Toml>(&format!(
+                "[managed]\n[handlers.g]\nevent = \"E\"\ntype = \"command\"\nargv = [\"g\"]\n{extra}\n"
+            ))
+            .unwrap()
+        };
+        for ok in [
+            "matcher = \"\"",
+            "timeout = 3600",
+            "timeout = 1",
+            "matcher = \"Bash|Write\"",
+        ] {
+            assert!(Desired::from_value(&with(ok)).is_ok(), "{ok}");
+        }
+        for bad in [
+            "timeout = 3601",
+            "timeout = -5",
+            "matcher = \"a\\nb\"",
+            "matcher = true",
+        ] {
+            let e = Desired::from_value(&with(bad)).unwrap_err();
+            assert_eq!(e.code, Code::ManifestInvalid, "{bad}");
+        }
+        let out = json(
+            &merge(
+                None,
+                &Desired::from_value(&with("matcher = \"\"")).unwrap(),
+                &[],
+            )
+            .unwrap()
+            .bytes,
+        );
+        assert_eq!(out["hooks"]["E"][0]["matcher"], "");
+    }
+
+    #[test]
+    fn a_merge_that_would_record_too_many_leaves_is_refused() {
+        let d = desired(NESTED);
+        let mut big = String::from("{");
+        for i in 0..=MAX_RECORDED {
+            big.push_str(&format!("\"k{i}\":{i},"));
+        }
+        big.push_str("\"z\":0}");
+        let layered = d.with_fragments([("big.json", big.as_bytes())]).unwrap();
+        let e = merge(None, &layered, &[]).unwrap_err();
+        assert_eq!(e.code, Code::LimitExceeded);
+        assert!(merge(None, &d, &[]).is_ok());
+    }
+
+    #[test]
+    fn an_owned_record_removes_one_element_and_an_identical_user_copy_stays() {
+        let d = desired(BASE);
+        let first = merge(None, &d, &[]).unwrap();
+        // The user adds an identical copy of the manager's hook.
+        let mut doc = json(&first.bytes);
+        let copy = doc["hooks"]["PreToolUse"][0].clone();
+        doc["hooks"]["PreToolUse"]
+            .as_array_mut()
+            .unwrap()
+            .push(copy);
+        let live = serde_json::to_vec(&doc).unwrap();
+        // The handler leaves the module: one element goes.
+        let gone = desired("[managed]\noutputStyle = \"STE\"\n");
+        let m = merge(Some(&live), &gone, &first.entries).unwrap();
+        assert_eq!(
+            json(&m.bytes)["hooks"]["PreToolUse"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        // A retire removes one element too.
+        let (bytes, _) = retire(&live, &first.entries, &[]).unwrap();
+        assert_eq!(
+            json(&bytes)["hooks"]["PreToolUse"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        // The same holds for an appended array item.
+        let n = desired(NESTED);
+        let a = merge(
+            Some(br#"{"sandbox":{"filesystem":{"allowWrite":["/m/one","/m/one"]}}}"#),
+            &n,
+            &[],
+        )
+        .unwrap();
+        let rec = vec![AppendedItem {
+            pointer: "/sandbox/filesystem/allowWrite".into(),
+            sha256: sha_of(&Json::from("/m/one")),
+        }];
+        let (bytes, _) = retire(&serde_json::to_vec(&json(&a.bytes)).unwrap(), &[], &rec).unwrap();
+        assert_eq!(
+            json(&bytes)["sandbox"]["filesystem"]["allowWrite"],
+            serde_json::json!(["/m/one", "/m/two"]),
+            "one copy of /m/one is removed and the other stays"
+        );
+    }
+
+    #[test]
+    fn a_handler_id_that_the_ledger_would_refuse_is_refused_when_desired_is_built() {
+        for id in ["\"\"", "\"a\\nb\"", "\"a\\u0001\""] {
+            let v = toml::from_str::<Toml>(&format!(
+                "[managed]\n[handlers.{id}]\nevent = \"E\"\ntype = \"command\"\nargv = [\"g\"]\n"
+            ))
+            .unwrap();
+            let e = Desired::from_value(&v).unwrap_err();
+            assert_eq!(e.code, Code::ManifestInvalid, "{id}");
+        }
+    }
+
+    #[test]
+    fn renaming_a_managed_key_in_one_update_is_no_conflict() {
+        let salt = [8u8; 32];
+        let old = desired("[managed]\nkeep = 1\nold = 2\n");
+        let first = merge(None, &old, &[]).unwrap();
+        let rec = CoOwned {
+            managed_hash: salted(&salt, &first.rendered_view),
+            entries: vec![],
+            appended: vec![],
+            leaves: leaf_hashes(&salt, &first),
+        };
+        // `old` is removed and `new` is added in one source update. The live file is untouched.
+        let renamed = desired("[managed]\nkeep = 1\nnew = 2\n");
+        let (m, o) = classify(Some(&first.bytes), &renamed, Some(&rec), Some(&salt)).unwrap();
+        assert_eq!(o, Outcome::Write);
+        let out = json(&m.bytes);
+        assert_eq!(
+            (out["new"].clone(), out["old"].clone()),
+            (2.into(), 2.into())
+        );
+        // A hand edit of the kept key in the same state is still a conflict.
+        let e = classify(
+            Some(br#"{"keep":9,"old":2}"#),
+            &renamed,
+            Some(&rec),
+            Some(&salt),
+        )
+        .unwrap_err();
+        assert_eq!(e.code, Code::Conflict);
     }
 }

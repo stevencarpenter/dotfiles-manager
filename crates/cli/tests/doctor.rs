@@ -589,8 +589,8 @@ fn doctor_status_and_json_change_nothing_and_never_create_the_lock_file() {
     };
     assert_eq!(
         names(&fx.state()).len(),
-        6,
-        "no new state file: ledger, journal, state.json, 3 dirs"
+        7,
+        "no new state file: ledger, journal, state.json, salt, 3 dirs"
     );
 }
 

@@ -5,9 +5,11 @@
 //! names of the settings, and whether the merge may write. No live content, no hash of the live
 //! file and no salted hash leaves this function.
 
-use dfm_engine::{Dir, Live, Store, Sys};
+use dfm_engine::{Dir, Got, Live, Store, Sys};
 use dfm_model::merge::{self, Desired};
-use dfm_model::plan::{MAX_HASHED_BYTES, MergeFact, MergeVerdict, Owned, in_scope};
+use dfm_model::plan::{
+    MAX_HASHED_BYTES, MAX_LISTING, MergeFact, MergeVerdict, Owned, in_scope, matches_pattern,
+};
 use dfm_model::resolve::Resolved;
 use dfm_model::state::CoOwned;
 use dfm_model::{Code, Refusal};
@@ -30,16 +32,168 @@ fn refused(r: &Refusal) -> MergeVerdict {
     blocked(r.code, &r.detail)
 }
 
+/// What the plan-time reads share.
+#[derive(Clone, Copy)]
+struct Cx<'a> {
+    resolved: &'a Resolved,
+    sys: &'a Sys,
+    home: &'a Dir,
+    /// The opened source root, or why it could not be opened.
+    source: &'a Result<Dir, Refusal>,
+    ledger: &'a [Owned],
+}
+
+/// A salted token for the content of each fragment, by name. Empty while `state/salt` does not
+/// exist or is unusable (the first apply creates it; an unusable one is refused elsewhere).
+fn tokens(store: &Store, frags: &BTreeMap<String, Vec<u8>>) -> Vec<(String, String)> {
+    let salt = store.salt().ok().flatten();
+    frags
+        .iter()
+        .map(|(n, b)| {
+            let t = salt
+                .as_deref()
+                .map_or_else(String::new, |s| merge::fragment_token(s, n, b));
+            (n.clone(), t)
+        })
+        .collect()
+}
+
+/// The fragments the merge of `r` layers over its declared values, by name (byte order), read
+/// as apply reads them: below HOME without following a link, regular, owned by the user, one
+/// hard link, within the shared 16 MiB bound. The set is the planner's: the files in the
+/// directory that match the pattern and that nobody removes, plus the files a selected link
+/// resource puts there (their source files, read from the source root). A fragment made by any
+/// other kind of resource has no content before apply, so it is refused.
+fn read_fragments(
+    cx: &Cx<'_>,
+    dir: &str,
+    pattern: &str,
+) -> Result<BTreeMap<String, Vec<u8>>, Refusal> {
+    let Cx {
+        resolved,
+        sys,
+        home,
+        source,
+        ledger,
+    } = *cx;
+    let too_much = || Refusal::new(Code::LimitExceeded, "the fragments together exceed 16 MiB");
+    let left = std::cell::Cell::new(MAX_HASHED_BYTES);
+    let mut out = BTreeMap::new();
+    let mut take = |name: String, bytes: Vec<u8>| -> Result<(), Refusal> {
+        left.set(
+            left.get()
+                .checked_sub(u64::try_from(bytes.len()).unwrap_or(u64::MAX))
+                .ok_or_else(too_much)?,
+        );
+        out.insert(name, bytes);
+        Ok(())
+    };
+    let dir_f = dfm_model::fold(dir);
+    let mut selected = Vec::new();
+    for other in resolved.resources.values().filter(|o| in_scope(o)) {
+        for claim in &other.claims {
+            let Some((parent, name)) = claim.rsplit_once('/') else {
+                continue;
+            };
+            if dfm_model::fold(parent) == dir_f && matches_pattern(pattern, name) {
+                selected.push((other, name.to_string()));
+            }
+        }
+    }
+    for (other, name) in &selected {
+        let path = format!("{dir}/{name}");
+        let src = (other.kind == "link")
+            .then(|| {
+                other
+                    .provenance
+                    .values()
+                    .find_map(|p| p.source_path.clone())
+            })
+            .flatten();
+        let bytes = match (src, source) {
+            (Some(src), Ok(root)) => match root.read_input_below(sys, &src, MAX_HASHED_BYTES)? {
+                Got::Bytes(b) => b,
+                Got::TooBig => return Err(too_much()),
+                Got::Absent => {
+                    return Err(Refusal::new(
+                        Code::SourceUntrusted,
+                        format!(
+                            "the source of fragment {path} is not a regular file owned by you with one hard link"
+                        ),
+                    ));
+                }
+            },
+            // The source root could not be opened: that is the cause, not the fragment.
+            (Some(_), Err(e)) => return Err(e.clone()),
+            _ => {
+                return Err(Refusal::new(
+                    Code::GeneratorUnavailable,
+                    format!(
+                        "fragment {path} comes from {} ({}), which has no content before apply. Fix: make the fragment a file of yours or a link resource",
+                        other.id, other.kind
+                    ),
+                ));
+            }
+        };
+        take(name.clone(), bytes)?;
+    }
+    let comps: Vec<&str> = dir.split('/').collect();
+    let Some(live_dir) = home.open_below_opt(sys, &comps)? else {
+        return Ok(out);
+    };
+    let listing = live_dir.list_upto(MAX_LISTING)?;
+    if listing.odd > 0 || listing.names.len() > MAX_LISTING {
+        return Err(Refusal::new(
+            Code::Conflict,
+            format!("{dir} holds a name that is not UTF-8 or too many entries"),
+        ));
+    }
+    for name in listing.names.iter().filter(|n| matches_pattern(pattern, n)) {
+        let path = format!("{dir}/{name}");
+        let folded = dfm_model::fold(&path);
+        // The planner reports a non-ASCII name itself. A name another resource's output removes
+        // is not an input (a deselected producer), and a selected one was read above.
+        if !name.is_ascii()
+            || selected
+                .iter()
+                .any(|(_, n)| dfm_model::fold(n) == dfm_model::fold(name))
+            || ledger.iter().any(|o| dfm_model::fold(&o.path) == folded)
+        {
+            continue;
+        }
+        match live_dir.read_input(sys, name, left.get())? {
+            Got::Bytes(b) => take(name.clone(), b)?,
+            Got::TooBig => return Err(too_much()),
+            Got::Absent => {
+                return Err(Refusal::new(
+                    Code::Conflict,
+                    format!("fragment {path} is not a plain file of yours with one link"),
+                ));
+            }
+        }
+    }
+    Ok(out)
+}
+
 /// The merge facts for every selected merge resource, by resource id. `home_path` is HOME as the
-/// layout spells it, which is how the ledger spells its paths.
+/// layout spells it, which is how the ledger spells its paths. `source` is the opened source
+/// root, for the fragments a selected link resource puts in the fragment directory.
 pub fn merge_facts(
     resolved: &Resolved,
     store: &Store,
     sys: &Sys,
     home: &Dir,
     home_path: &Path,
+    source: &Result<Dir, Refusal>,
     ledger: &[Owned],
 ) -> BTreeMap<String, MergeFact> {
+    let cx = Cx {
+        resolved,
+        sys,
+        home,
+        source,
+        ledger,
+    };
     let mut out = BTreeMap::new();
     for r in resolved
         .resources
@@ -49,7 +203,7 @@ pub fn merge_facts(
         let [claim] = r.claims.as_slice() else {
             continue;
         };
-        let desired = match Desired::from_value(&r.value) {
+        let declared = match Desired::from_value(&r.value) {
             Ok(d) => d,
             Err(e) => {
                 out.insert(
@@ -58,6 +212,7 @@ pub fn merge_facts(
                         managed_sha256: String::new(),
                         sets: Vec::new(),
                         handlers: 0,
+                        fragments: Vec::new(),
                         verdict: blocked(
                             e.code,
                             &format!(
@@ -70,26 +225,63 @@ pub fn merge_facts(
                 continue;
             }
         };
+        // The declared values with the fragments merged over them. A fragment that cannot be
+        // read or parsed blocks the operation with its name and no content.
+        let read = match declared.fragment_spec() {
+            None => Ok(BTreeMap::new()),
+            Some((dir, pattern)) => read_fragments(&cx, dir, pattern),
+        };
+        let layered = match (&read, declared.fragment_spec()) {
+            (Err(e), _) => Err(e.clone()),
+            (Ok(_), None) => Ok(declared.clone()),
+            (Ok(f), Some(_)) => {
+                declared.with_fragments(f.iter().map(|(n, b)| (n.as_str(), b.as_slice())))
+            }
+        };
         // Another resource's ledger entry on this path decides before anything is read.
         let other = ledger
             .iter()
             .find(|o| dfm_model::fold(&o.path) == dfm_model::fold(claim) && o.resource != r.id);
-        let verdict = match other {
-            Some(o) => blocked(
+        let verdict = match (&layered, other) {
+            (_, Some(o)) => blocked(
                 Code::Conflict,
                 &format!(
                     "{claim} is recorded in the ledger as an output of {}. Fix: remove that resource's claim on the path first; the manager does not merge into another resource's output",
                     o.resource
                 ),
             ),
-            None => verdict_for(&r.id, claim, &desired, store, sys, home, home_path),
+            (Err(e), None) => refused(e),
+            (Ok(desired), None) => {
+                let desired = match home_path.to_str() {
+                    Some(h) => desired.clone().with_home(h),
+                    None => desired.clone(),
+                };
+                verdict_for(&r.id, claim, &desired, store, sys, home, home_path)
+            }
         };
+        // Fragments are tracked by a salted content token, so the salt must exist. `bind` creates
+        // it (and creates a missing one for a store made by an older build).
+        let verdict = match (&read, store.salt()) {
+            (Ok(f), Ok(None))
+                if !f.is_empty() && !matches!(verdict, MergeVerdict::Blocked { .. }) =>
+            {
+                blocked(
+                    Code::StateInvalid,
+                    "state/salt does not exist, so the content of the fragments cannot be tracked. Fix: run bind again with the same profile and machine id; it creates the missing salt and changes nothing else",
+                )
+            }
+            _ => verdict,
+        };
+        let shown = layered.as_ref().unwrap_or(&declared);
         out.insert(
             r.id.clone(),
             MergeFact {
-                managed_sha256: desired.managed_sha256(),
-                sets: desired.setting_names(),
-                handlers: desired.handler_count(),
+                managed_sha256: declared.managed_sha256(),
+                sets: shown.setting_names(),
+                handlers: declared.handler_count(),
+                fragments: read
+                    .as_ref()
+                    .map_or_else(|_| Vec::new(), |f| tokens(store, f)),
                 verdict,
             },
         );

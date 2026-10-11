@@ -360,6 +360,9 @@ impl Store {
             "init-ledger",
         )?;
         staging.publish_new("journal.jsonl", b"", &self.fail, "init-journal")?;
+        // The salt exists from the start, so a plan can salt a content token before any merge.
+        // A store made by an older build gets it from `bind` or from the first merge.
+        staging.publish_new(SALT, &random_salt()?, &self.fail, "init-salt")?;
         self.fail.hit("init-before-rename")?;
         // Just before the rename: the lock is still ours and the staging name still names the
         // directory this call built.
@@ -496,14 +499,9 @@ impl Store {
     }
 
     fn create_salt(&self) -> Result<(), Refusal> {
-        use std::io::Read;
         let dir = self.state()?;
         self.guard(None)?;
-        let mut buf = [0u8; SALT_BYTES];
-        fs::File::open("/dev/urandom")
-            .and_then(|mut f| f.read_exact(&mut buf))
-            .map_err(|e| crate::fsys::io("read /dev/urandom", &e))?;
-        dir.publish_new(SALT, &buf, &self.fail, "salt")?;
+        dir.publish_new(SALT, &random_salt()?, &self.fail, "salt")?;
         Ok(())
     }
 
@@ -1132,4 +1130,14 @@ pub fn verify_identity(l: &Loaded, b: &Binding) -> Vec<Finding> {
         }
     }
     out
+}
+
+/// 32 random bytes from the operating system.
+fn random_salt() -> Result<[u8; SALT_BYTES], Refusal> {
+    use std::io::Read;
+    let mut buf = [0u8; SALT_BYTES];
+    fs::File::open("/dev/urandom")
+        .and_then(|mut f| f.read_exact(&mut buf))
+        .map_err(|e| crate::fsys::io("read /dev/urandom", &e))?;
+    Ok(buf)
 }

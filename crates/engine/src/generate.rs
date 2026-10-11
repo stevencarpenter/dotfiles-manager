@@ -9,9 +9,9 @@
 use crate::fsys::{Dir, Got, Peek, Sys};
 use dfm_model::digest::sha256_hex;
 use dfm_model::fold;
-use dfm_model::merge::Merged;
+use dfm_model::merge::{Merged, fragment_token};
 use dfm_model::plan::{MAX_HASHED_BYTES, MAX_LISTING, Operation, Plan};
-use dfm_model::state::OwnedEntry;
+use dfm_model::state::{AppendedItem, Class, OwnedEntry};
 use dfm_model::{Code, Refusal};
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -34,9 +34,14 @@ pub struct GeneratorInputs {
     pub live: Option<Vec<u8>>,
     /// The handler entries the ledger records as added by the manager (merge and retire).
     pub owned_entries: Vec<OwnedEntry>,
+    /// The array items the ledger records as appended by the manager (merge and retire).
+    pub owned_appended: Vec<AppendedItem>,
     /// The operation is the approved first write into an existing co-owned file with no ledger
     /// entry. A merge then records an identical entry already in place as owned.
     pub takeover: bool,
+    /// HOME as the machine spells it, for the merge to recognize an existing hook that spells the
+    /// same command with the absolute home path.
+    pub home: Option<String>,
 }
 
 /// `Debug` prints the size of the live file and never its bytes: it can hold credentials.
@@ -51,6 +56,7 @@ impl std::fmt::Debug for GeneratorInputs {
                 &self.live.as_ref().map(|b| format!("{} bytes", b.len())),
             )
             .field("owned_entries", &self.owned_entries)
+            .field("owned_appended", &self.owned_appended)
             .finish()
     }
 }
@@ -194,6 +200,7 @@ pub(crate) fn gather(
     op: &Operation,
     sys: &Sys,
     fragment_dir: Option<&Dir>,
+    salt: Option<&[u8]>,
 ) -> Result<GeneratorInputs, Gather> {
     let mut out = GeneratorInputs::default();
     // A render has no file input. Nothing is read, so the source root is not opened either.
@@ -253,17 +260,42 @@ pub(crate) fn gather(
                 selected(sys, &root, dir, producer, &mut budget, &f.name, &path)?
             }
             None => {
-                let want = f.sha256.as_deref().ok_or_else(|| {
-                    invalid(format!("foreign fragment {path} has no recorded hash"))
-                })?;
                 let bytes = budget.read(sys, dir, &f.name, &path)?;
-                if sha256_hex(&bytes) != want {
-                    return Err(stale(format!("fragment {path} changed since the plan")));
+                // A fragment of a sensitive merge has no plain hash in the plan: it can hold
+                // credentials. Its salted content token is part of the approved plan, which
+                // apply plans again under the lock and compares before it writes.
+                if op.class != Class::Sensitive {
+                    let want = f.sha256.as_deref().ok_or_else(|| {
+                        invalid(format!("foreign fragment {path} has no recorded hash"))
+                    })?;
+                    if sha256_hex(&bytes) != want {
+                        return Err(stale(format!("fragment {path} changed since the plan")));
+                    }
                 }
                 bytes
             }
         };
         out.fragments.insert(f.name.clone(), bytes);
+    }
+    // The fragments of a sensitive merge are tracked by a salted content token in the plan. The
+    // re-plan under the lock compared it once; compare again with the bytes read now, so a
+    // fragment swapped between that read and this one is stale too.
+    let tokens = op
+        .preconditions
+        .iter()
+        .find(|p| p.subject == format!("fragments:{dir_rel}"))
+        .and_then(|p| p.state.split_once(" content=[").map(|(_, t)| t.to_string()));
+    if let (Some(salt), Some(want), true) = (salt, tokens, op.class == Class::Sensitive) {
+        let got: Vec<String> = out
+            .fragments
+            .iter()
+            .map(|(n, b)| format!("{n}:{}", fragment_token(salt, n, b)))
+            .collect();
+        if got.join(",") != want.strip_suffix(']').unwrap_or(&want) {
+            return Err(stale(format!(
+                "fragment content in {dir_rel} changed since the plan"
+            )));
+        }
     }
     Ok(out)
 }
