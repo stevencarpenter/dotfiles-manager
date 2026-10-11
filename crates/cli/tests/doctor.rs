@@ -1,161 +1,42 @@
 //! `doctor` and `status` through the isolated binary: row statuses and codes, independent rows,
 //! table and JSON agreement, narrow output, the exit rule and non-mutation (DFM-35).
 //!
-//! The fixture mirrors tests/apply.rs (a synthetic link-only source tree). No test touches the
-//! real HOME. Every run passes `--home <temp dir>` and an empty environment.
+//! The fixture (tests/common) is a synthetic link-only source tree. No test touches the real
+//! HOME. Every run passes `--home <temp dir>` and an empty environment.
 
 mod common;
 
-use common::TempDir;
+use common::{BIN, Fx, PROFILE, code, fingerprint, is_root, text};
+use dfm_model::doctor::DoctorCode;
 use serde_json::Value;
-use sha2::{Digest, Sha256};
 use std::fs;
 use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::Command;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-const BIN: &str = env!("CARGO_BIN_EXE_dotfiles-manager");
-
-struct Fx {
-    home: TempDir,
-    _src: TempDir,
-    root: PathBuf,
+/// Applies the plan, so every link is owned.
+fn applied() -> Fx {
+    let fx = Fx::new();
+    let o = fx.run(&["plan", "--root", fx.root_arg(), "--json"]);
+    let digest = dfm_model::plan::Saved::parse(&o.stdout)
+        .unwrap()
+        .plan_digest;
+    let o = fx.run(&["apply", "--root", fx.root_arg(), "--yes-plan", &digest]);
+    assert_eq!(code(&o), 0, "{}\n{}", text(&o.stderr), text(&o.stdout));
+    fx
 }
 
-const CORE: &str = r#"schema = 1
-id = "core"
-platforms = ["macos", "linux"]
-requires = []
-
-[[resources]]
-id = "git"
-kind = "link"
-adapter = "fs-link/v1"
-target = ".config/git/config"
-[resources.value]
-source = "files/gitconfig"
-
-[[resources]]
-id = "ssh"
-kind = "link"
-adapter = "fs-link/v1"
-target = ".ssh/config"
-[resources.value]
-source = "files/ssh_config"
-"#;
-
-const EXTRA: &str = r#"schema = 1
-id = "extra"
-platforms = ["macos", "linux"]
-requires = []
-
-[[resources]]
-id = "tmux"
-kind = "link"
-adapter = "fs-link/v1"
-target = ".config/tmux/tmux.conf"
-[resources.value]
-source = "files/tmux.conf"
-
-[[resources]]
-id = "zsh"
-kind = "link"
-adapter = "fs-link/v1"
-target = ".zshrc"
-[resources.value]
-source = "files/zshrc"
-"#;
-
-const BUNDLE: &str = r#"schema = 1
-id = "t-base"
-core = "modules/core/module.toml"
-
-[modules]
-extra = "modules/extra/module.toml"
-"#;
-
-const PROFILE: &str = "schema = 1\nid = \"t-01\"\nbundle = \"../base/bundle.toml\"\nplatform = \"macos\"\narchitecture = \"arm64\"\nmodules = [\"extra\"]\noverrides = []\n";
+fn skipped(why: &str) {
+    println!("SKIPPED: {why}");
+}
 
 impl Fx {
-    /// A bound machine whose profile selects the `extra` module. Nothing is applied yet.
-    fn new() -> Fx {
-        let fx = Fx {
-            home: TempDir::new("doctor-home"),
-            _src: TempDir::new("doctor-src"),
-            root: PathBuf::new(),
-        };
-        let root = fx._src.path().join("root");
-        let fx = Fx { root, ..fx };
-        fx.put("base/bundle.toml", BUNDLE);
-        fx.put("base/modules/core/module.toml", CORE);
-        fx.put("base/modules/extra/module.toml", EXTRA);
-        for (m, f, c) in [
-            ("core", "gitconfig", "[user]\n"),
-            ("core", "ssh_config", "Host *\n"),
-            ("extra", "tmux.conf", "set -g mouse on\n"),
-            ("extra", "zshrc", "export A=1\n"),
-        ] {
-            fx.put(&format!("base/modules/{m}/files/{f}"), c);
-        }
-        fx.put("profiles/t-01.toml", PROFILE);
-        let p = fx.root.join("profiles/t-01.toml");
-        let o = fx.run(&[
-            "bind",
-            "--profile",
-            p.to_str().unwrap(),
-            "--machine-id",
-            "m5-test",
-        ]);
-        assert_eq!(code(&o), 0, "{}", text(&o.stderr));
-        fx
-    }
-
-    /// As [`Fx::new`], and every link applied.
-    fn applied() -> Fx {
-        let fx = Fx::new();
-        let o = fx.run(&["plan", "--root", fx.root_arg(), "--json"]);
-        let digest = dfm_model::plan::Saved::parse(&o.stdout)
-            .unwrap()
-            .plan_digest;
-        let o = fx.run(&["apply", "--root", fx.root_arg(), "--yes-plan", &digest]);
-        assert_eq!(code(&o), 0, "{}\n{}", text(&o.stderr), text(&o.stdout));
-        fx
-    }
-
-    fn put(&self, rel: &str, content: &str) {
-        let p = self.root.join(rel);
-        fs::create_dir_all(p.parent().unwrap()).unwrap();
-        fs::write(p, content).unwrap();
-    }
-
-    fn run_env(&self, env: &[(&str, &str)], args: &[&str]) -> Output {
-        Command::new(BIN)
-            .env_clear()
-            .envs(env.iter().copied())
-            .arg("--home")
-            .arg(self.home.path())
-            .args(args)
-            .output()
-            .unwrap()
-    }
-
-    fn run(&self, args: &[&str]) -> Output {
-        self.run_env(&[], args)
-    }
-
-    fn root_arg(&self) -> &str {
-        self.root.to_str().unwrap()
-    }
-
-    fn h(&self, rel: &str) -> PathBuf {
-        self.home.path().join(rel)
-    }
-
     fn state(&self) -> PathBuf {
         self.h(".local/state/dotfiles-manager/state")
     }
 
-    fn doctor(&self, extra: &[&str]) -> Output {
+    fn doctor(&self, extra: &[&str]) -> std::process::Output {
         let mut a = vec!["doctor", "--root", self.root_arg()];
         a.extend_from_slice(extra);
         self.run(&a)
@@ -171,15 +52,6 @@ impl Fx {
     }
 }
 
-fn text(b: &[u8]) -> String {
-    String::from_utf8_lossy(b).into_owned()
-}
-
-fn code(o: &Output) -> i32 {
-    o.status.code().unwrap()
-}
-
-/// The row whose subject ends with `subject`.
 fn at<'a>(rows: &'a [Value], subject: &str) -> &'a Value {
     rows.iter()
         .find(|r| r["subject"].as_str().unwrap().ends_with(subject))
@@ -191,50 +63,11 @@ fn status<'a>(rows: &'a [Value], subject: &str) -> (&'a str, &'a str) {
     (r["status"].as_str().unwrap(), r["code"].as_str().unwrap())
 }
 
-/// Names, kinds, modes, modification times and bytes of everything below `root`, links unread.
-/// The lock file is included: doctor must not create or touch it.
-fn fingerprint(root: &Path) -> String {
-    fn go(dir: &Path, h: &mut Sha256) {
-        let mut v: Vec<_> = fs::read_dir(dir).unwrap().map(|e| e.unwrap()).collect();
-        v.sort_by_key(|e| e.file_name());
-        for e in v {
-            let m = fs::symlink_metadata(e.path()).unwrap();
-            h.update(e.path().to_str().unwrap().as_bytes());
-            h.update(
-                format!("{:?} {:o}", m.modified().unwrap(), m.permissions().mode()).as_bytes(),
-            );
-            if m.is_dir() {
-                go(&e.path(), h);
-            } else if m.is_file() {
-                h.update(fs::read(e.path()).unwrap());
-            } else if m.file_type().is_symlink() {
-                h.update(
-                    fs::read_link(e.path())
-                        .unwrap()
-                        .to_str()
-                        .unwrap()
-                        .as_bytes(),
-                );
-            }
-        }
-    }
-    let mut h = Sha256::new();
-    go(root, &mut h);
-    format!("{:x}", h.finalize())
-}
-
-fn is_root() -> bool {
-    Command::new("id")
-        .arg("-u")
-        .output()
-        .is_ok_and(|o| text(&o.stdout).trim() == "0")
-}
-
 // ---- healthy state ------------------------------------------------------------------------
 
 #[test]
 fn an_applied_machine_is_healthy_and_every_owned_output_is_ok() {
-    let fx = Fx::applied();
+    let fx = applied();
     let (c, rows) = fx.rows();
     assert_eq!(c, 0, "{rows:#?}");
     for p in [
@@ -261,7 +94,7 @@ fn an_applied_machine_is_healthy_and_every_owned_output_is_ok() {
 
 #[test]
 fn a_foreign_file_that_the_plan_does_not_claim_is_not_a_finding() {
-    let fx = Fx::applied();
+    let fx = applied();
     fs::write(fx.h(".config/git/local-override"), "[user]\nname = x\n").unwrap();
     fs::write(fx.h(".zshrc.local"), "export B=2\n").unwrap();
     let (c, rows) = fx.rows();
@@ -287,7 +120,7 @@ fn a_fresh_bind_lists_the_planned_outputs_as_pending_warnings_and_exits_0() {
 
 #[test]
 fn a_replaced_link_is_a_conflict_and_exits_1() {
-    let fx = Fx::applied();
+    let fx = applied();
     fs::remove_file(fx.h(".zshrc")).unwrap();
     fs::write(fx.h(".zshrc"), "export EDITED=1\n").unwrap();
     let (c, rows) = fx.rows();
@@ -303,7 +136,7 @@ fn a_replaced_link_is_a_conflict_and_exits_1() {
 
 #[test]
 fn a_retargeted_link_is_a_conflict() {
-    let fx = Fx::applied();
+    let fx = applied();
     fs::remove_file(fx.h(".zshrc")).unwrap();
     symlink("/etc/hosts", fx.h(".zshrc")).unwrap();
     let (c, rows) = fx.rows();
@@ -313,7 +146,7 @@ fn a_retargeted_link_is_a_conflict() {
 
 #[test]
 fn a_missing_output_is_a_warning_with_its_fix() {
-    let fx = Fx::applied();
+    let fx = applied();
     fs::remove_file(fx.h(".zshrc")).unwrap();
     let (c, rows) = fx.rows();
     assert_eq!(c, 0, "WARN alone exits 0");
@@ -328,7 +161,7 @@ fn a_missing_output_is_a_warning_with_its_fix() {
 
 #[test]
 fn a_changed_source_makes_the_owned_link_pending() {
-    let fx = Fx::applied();
+    let fx = applied();
     let m = fs::read_to_string(fx.root.join("base/modules/extra/module.toml")).unwrap();
     fx.put(
         "base/modules/extra/module.toml",
@@ -342,7 +175,7 @@ fn a_changed_source_makes_the_owned_link_pending() {
 
 #[test]
 fn deselecting_a_module_shows_its_owned_outputs_as_removals() {
-    let fx = Fx::applied();
+    let fx = applied();
     fx.put("profiles/t-01.toml", &PROFILE.replace("\"extra\"", ""));
     let (c, rows) = fx.rows();
     assert_eq!(c, 0, "{rows:#?}");
@@ -352,7 +185,7 @@ fn deselecting_a_module_shows_its_owned_outputs_as_removals() {
 
 #[test]
 fn a_linked_parent_of_an_owned_output_is_unsafe() {
-    let fx = Fx::applied();
+    let fx = applied();
     let elsewhere = fx._src.path().join("moved-tmux");
     fs::rename(fx.h(".config/tmux"), &elsewhere).unwrap();
     symlink(&elsewhere, fx.h(".config/tmux")).unwrap();
@@ -367,7 +200,7 @@ fn a_linked_parent_of_an_owned_output_is_unsafe() {
 
 #[test]
 fn without_a_plan_a_linked_parent_of_an_owned_output_is_still_found() {
-    let fx = Fx::applied();
+    let fx = applied();
     fs::remove_file(fx.root.join("profiles/t-01.toml")).unwrap();
     let real = fx.h(".config/tmux-real");
     fs::rename(fx.h(".config/tmux"), &real).unwrap();
@@ -385,20 +218,19 @@ fn without_a_plan_a_linked_parent_of_an_owned_output_is_still_found() {
 #[test]
 fn an_unreadable_parent_is_an_unknown_required_row_and_exits_1() {
     if is_root() {
+        skipped("running as root: directory modes do not apply");
         return;
     }
-    let fx = Fx::applied();
+    let fx = applied();
     let dir = fx.h(".config/git");
     fs::set_permissions(&dir, fs::Permissions::from_mode(0o000)).unwrap();
     let (c, rows) = fx.rows();
     fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
     assert_eq!(c, 1, "{rows:#?}");
     let r = at(&rows, ".config/git/config");
-    assert!(
-        matches!(r["status"].as_str(), Some("UNKNOWN" | "ERROR")),
-        "{r:#?}"
-    );
-    assert_ne!(r["status"], "OK");
+    assert_eq!(r["status"], "UNKNOWN", "{r:#?}");
+    assert_eq!(r["code"], "E_OBSERVATION_UNKNOWN");
+    assert_eq!(r["required"], true);
 }
 
 // ---- interrupted work ---------------------------------------------------------------------
@@ -438,7 +270,7 @@ fn an_interrupted_intent_is_an_error_row_with_a_recovery_hint() {
 
 #[test]
 fn a_ledger_parse_failure_keeps_the_other_rows() {
-    let fx = Fx::applied();
+    let fx = applied();
     fs::write(fx.state().join("ledger.json"), "{ not json").unwrap();
     let (c, rows) = fx.rows();
     assert_eq!(c, 1);
@@ -461,7 +293,7 @@ fn a_ledger_parse_failure_keeps_the_other_rows() {
 
 #[test]
 fn an_unreadable_journal_keeps_the_ledger_and_output_rows() {
-    let fx = Fx::applied();
+    let fx = applied();
     fs::write(fx.state().join("journal.jsonl"), "garbage\n").unwrap();
     let (c, rows) = fx.rows();
     assert_eq!(c, 1);
@@ -472,7 +304,7 @@ fn an_unreadable_journal_keeps_the_ledger_and_output_rows() {
 
 #[test]
 fn a_missing_profile_keeps_the_state_and_owned_rows_and_labels_them_partial() {
-    let fx = Fx::applied();
+    let fx = applied();
     fs::remove_file(fx.root.join("profiles/t-01.toml")).unwrap();
     let (c, rows) = fx.rows();
     assert_eq!(c, 1, "{rows:#?}");
@@ -490,7 +322,7 @@ fn a_missing_profile_keeps_the_state_and_owned_rows_and_labels_them_partial() {
 
 #[test]
 fn a_broken_module_manifest_is_one_error_row() {
-    let fx = Fx::applied();
+    let fx = applied();
     fx.put("base/modules/extra/module.toml", "schema = 1\nid = ");
     let (c, rows) = fx.rows();
     assert_eq!(c, 1);
@@ -503,7 +335,7 @@ fn a_broken_module_manifest_is_one_error_row() {
 
 #[test]
 fn an_unreadable_receipt_is_a_partial_warning_not_an_error() {
-    let fx = Fx::applied();
+    let fx = applied();
     let dir = fx.state().join("receipts");
     let name = fs::read_dir(&dir)
         .unwrap()
@@ -523,22 +355,22 @@ fn an_unreadable_receipt_is_a_partial_warning_not_an_error() {
 
 #[test]
 fn an_unbound_machine_reports_the_binding_and_exits_1() {
-    let fx = Fx {
-        home: TempDir::new("doctor-unbound"),
-        _src: TempDir::new("doctor-unbound-src"),
-        root: PathBuf::new(),
-    };
-    let root = fx._src.path().to_path_buf();
-    let fx = Fx { root, ..fx };
+    let fx = Fx::unbound();
     let (c, rows) = fx.rows();
     assert_eq!(c, 1);
     assert_eq!(
         rows.iter().find(|r| r["kind"] == "binding").unwrap()["code"],
         "E_BINDING_INVALID"
     );
-    assert!(
-        rows.iter()
-            .any(|r| r["kind"] == "state" && r["status"] == "N/A")
+    let state = rows.iter().find(|r| r["kind"] == "state").unwrap();
+    assert_eq!(
+        (state["status"].as_str(), state["code"].as_str()),
+        (Some("N/A"), Some("D_STATE_ABSENT"))
+    );
+    let profile = rows.iter().find(|r| r["kind"] == "profile").unwrap();
+    assert_eq!(
+        (profile["status"].as_str(), profile["code"].as_str()),
+        (Some("UNKNOWN"), Some("D_DEPENDS_UNKNOWN"))
     );
 }
 
@@ -546,24 +378,7 @@ fn an_unbound_machine_reports_the_binding_and_exits_1() {
 
 #[test]
 fn sensitive_and_generated_resources_are_not_applicable_and_read_no_content() {
-    let home = TempDir::new("doctor-ex-home");
-    let src = TempDir::new("doctor-ex-src");
-    let root = src.path().join("examples");
-    common::copy_tree(&common::repo_root().join("examples"), &root);
-    let fx = Fx {
-        home,
-        _src: src,
-        root,
-    };
-    let p = fx.root.join("profiles/personal-dev-01.toml");
-    let o = fx.run(&[
-        "bind",
-        "--profile",
-        p.to_str().unwrap(),
-        "--machine-id",
-        "m5",
-    ]);
-    assert_eq!(code(&o), 0, "{}", text(&o.stderr));
+    let fx = personal();
     let (_, rows) = fx.rows();
     let na = |c: &str| rows.iter().filter(|r| r["code"] == c).collect::<Vec<_>>();
     assert!(!na("D_NA_SENSITIVE").is_empty(), "{rows:#?}");
@@ -604,7 +419,7 @@ fn table_rows(table: &str) -> Vec<(String, String, String)> {
 
 #[test]
 fn table_status_and_json_agree_on_every_row_for_doctor_and_status() {
-    let fx = Fx::applied();
+    let fx = applied();
     fs::remove_file(fx.h(".zshrc")).unwrap();
     fs::remove_file(fx.h(".ssh/config")).unwrap();
     fs::write(fx.h(".ssh/config"), "x").unwrap();
@@ -637,7 +452,7 @@ fn table_status_and_json_agree_on_every_row_for_doctor_and_status() {
 
 #[test]
 fn json_is_one_document_without_ansi_and_exit_follows_the_rows() {
-    let fx = Fx::applied();
+    let fx = applied();
     let o = fx.doctor(&["--json"]);
     let out = text(&o.stdout);
     assert_eq!(out.lines().count(), 1);
@@ -656,7 +471,7 @@ fn json_is_one_document_without_ansi_and_exit_follows_the_rows() {
 
 #[test]
 fn narrow_output_wraps_every_line_and_json_keeps_the_full_path() {
-    let fx = Fx::applied();
+    let fx = applied();
     let deep = ".config/some/very/long/directory/name/for/narrow/terminals/tool.conf";
     fx.put("base/modules/extra/files/deep", "x\n");
     let m = fs::read_to_string(fx.root.join("base/modules/extra/module.toml")).unwrap();
@@ -678,23 +493,29 @@ fn narrow_output_wraps_every_line_and_json_keeps_the_full_path() {
 }
 
 #[test]
-fn untrusted_text_is_escaped_in_both_formats() {
-    let fx = Fx::applied();
-    fs::remove_file(fx.h(".zshrc")).unwrap();
-    fs::write(fx.h(".zshrc"), "x").unwrap();
-    // A resource whose id carries a terminal escape is refused by the resolver, and the refusal
-    // text reaches a row. Neither format may carry the raw escape.
-    let m = fs::read_to_string(fx.root.join("base/modules/extra/module.toml")).unwrap();
-    fx.put(
-        "base/modules/extra/module.toml",
-        &m.replace("id = \"tmux\"", "id = \"tm\\u001b[31mux\""),
-    );
+fn untrusted_text_from_a_file_name_is_escaped_in_both_formats() {
+    let fx = applied();
+    // A receipt file name is untrusted data. It reaches the subject of a WARN row.
+    let name = "bad\u{1b}[31mname\u{202e}.json";
+    fs::write(fx.state().join("receipts").join(name), "{}").unwrap();
     for extra in [&[][..], &["--json"][..]] {
         let o = fx.doctor(extra);
         let out = text(&o.stdout);
-        assert!(!out.contains('\u{1b}'), "{out:?}");
-        assert_eq!(code(&o), 1);
+        assert!(
+            !out.contains('\u{1b}') && !out.contains('\u{202e}'),
+            "{out:?}"
+        );
+        assert!(
+            out.contains("bad\\u{1b}[31mname\\u{202e}.json") || out.contains("bad\\\\u{1b}"),
+            "{out}"
+        );
     }
+    let (_, rows) = fx.rows();
+    assert!(
+        rows.iter()
+            .any(|r| r["subject"].as_str().unwrap().contains("\\u{1b}")),
+        "{rows:#?}"
+    );
 }
 
 // ---- usage --------------------------------------------------------------------------------
@@ -721,7 +542,7 @@ fn bad_arguments_are_usage_errors() {
 
 #[test]
 fn doctor_status_and_json_change_nothing_and_never_create_the_lock_file() {
-    let fx = Fx::applied();
+    let fx = applied();
     // Break several things so every row kind is exercised, then remove the lock file bind left.
     fs::remove_file(fx.h(".zshrc")).unwrap();
     fs::remove_file(fx.h(".ssh/config")).unwrap();
@@ -810,12 +631,400 @@ fn doctor_answers_while_another_command_holds_the_lock_and_leaves_it_alone() {
     assert_eq!(before, after, "doctor changed HOME while the lock was held");
 }
 
-// ---- docs ---------------------------------------------------------------------------------
+// ---- sensitive paths are never read ---------------------------------------------------------
+
+fn old_atime(p: &Path) -> SystemTime {
+    let old = UNIX_EPOCH + Duration::from_secs(946_684_800);
+    let f = fs::OpenOptions::new().write(true).open(p).unwrap();
+    f.set_times(fs::FileTimes::new().set_accessed(old)).unwrap();
+    old
+}
+
+fn atime(p: &Path) -> SystemTime {
+    fs::metadata(p).unwrap().accessed().unwrap()
+}
+
+/// The personal example profile, bound in an isolated HOME. Its `.claude/settings.json` is a
+/// sensitive resource.
+fn personal() -> Fx {
+    let src = common::TempDir::new("doctor-ex-src");
+    let root = src.path().join("examples");
+    common::copy_tree(&common::repo_root().join("examples"), &root);
+    let fx = Fx {
+        home: common::TempDir::new("doctor-ex-home"),
+        _src: src,
+        root,
+    };
+    let p = fx.root.join("profiles/personal-dev-01.toml");
+    let o = fx.run(&[
+        "bind",
+        "--profile",
+        p.to_str().unwrap(),
+        "--machine-id",
+        "m5",
+    ]);
+    assert_eq!(code(&o), 0, "{}", text(&o.stderr));
+    fx
+}
+
+/// Adds a ledger entry with the given class, by editing `ledger.json` as the store wrote it.
+fn own(fx: &Fx, resource: &str, class: &str, rel: &str) {
+    let f = fx.state().join("ledger.json");
+    let mut l: Value = serde_json::from_slice(&fs::read(&f).unwrap()).unwrap();
+    let fingerprint = if class == "normal" {
+        Value::String("ab".repeat(32))
+    } else {
+        Value::Null
+    };
+    l["resources"]
+        .as_array_mut()
+        .unwrap()
+        .push(serde_json::json!({
+            "resource": resource, "adapter": "fs-link/v1", "class": class, "op_id": "x-1",
+            "owned_outputs": [{"path": fx.h(rel), "mode": 420, "fingerprint": fingerprint}],
+        }));
+    fs::write(&f, serde_json::to_vec(&l).unwrap()).unwrap();
+}
 
 #[test]
-fn every_doctor_code_is_documented() {
+fn a_path_a_sensitive_resource_now_claims_is_not_read_even_if_the_ledger_has_a_normal_entry() {
+    let fx = personal();
+    let target = fx.h(".claude/settings.json");
+    fs::create_dir_all(target.parent().unwrap()).unwrap();
+    fs::write(&target, "{\"token\":\"hunter2-secret\"}").unwrap();
+    own(&fx, "old-owner", "normal", ".claude/settings.json");
+    let before = fingerprint(fx.home.path());
+    let old = old_atime(&target);
+    for extra in [&["--json"][..], &[][..]] {
+        let o = fx.doctor(extra);
+        assert!(!text(&o.stdout).contains("hunter2"), "a content leaked");
+    }
+    assert_eq!(atime(&target), old, "doctor read the sensitive file");
+    assert_eq!(fingerprint(fx.home.path()), before);
+    let (_, rows) = fx.rows();
+    let r = at(&rows, ".claude/settings.json");
+    // The planner's blocker (it fails closed on a sensitive destination without a ledger entry
+    // of this resource) decides the row. It is never OK, and nothing was hashed.
+    assert_eq!(
+        (r["status"].as_str(), r["code"].as_str()),
+        (Some("ERROR"), Some("E_CONFLICT")),
+        "{r:#?}"
+    );
+}
+
+#[test]
+fn a_case_variant_of_a_sensitive_ledger_entry_is_not_read() {
+    let fx = personal();
+    // The ledger records the sensitive class for `.CLAUDE/settings.json`. The file on disk is the
+    // normal-class entry of another resource at the lower-case spelling of the same path.
+    let target = fx.h(".claude/settings.json");
+    fs::create_dir_all(target.parent().unwrap()).unwrap();
+    fs::write(&target, "secret-bytes").unwrap();
+    own(&fx, "vault-owner", "sensitive", ".CLAUDE/settings.json");
+    own(&fx, "other", "normal", ".claude/settings.json");
+    let old = old_atime(&target);
+    // Without a profile there is no plan, so only the ledger decides what is sensitive.
+    fs::remove_file(fx.root.join("profiles/personal-dev-01.toml")).unwrap();
+    let (_, rows) = fx.rows();
+    assert_eq!(
+        atime(&target),
+        old,
+        "doctor read a case alias of a sensitive entry"
+    );
+    assert_eq!(at(&rows, ".claude/settings.json")["status"], "N/A");
+}
+
+#[test]
+fn a_sensitive_destination_with_no_read_permission_is_not_applicable_not_an_error() {
+    if is_root() {
+        skipped("running as root: file modes do not apply");
+        return;
+    }
+    let fx = personal();
+    let target = fx.h(".claude/settings.json");
+    fs::create_dir_all(target.parent().unwrap()).unwrap();
+    fs::write(&target, "x").unwrap();
+    let old = old_atime(&target);
+    fs::set_permissions(&target, fs::Permissions::from_mode(0o000)).unwrap();
+    let (_, rows) = fx.rows();
+    fs::set_permissions(&target, fs::Permissions::from_mode(0o600)).unwrap();
+    assert_eq!(atime(&target), old);
+    assert!(
+        rows.iter()
+            .all(|r| r["status"] != "OK"
+                || !r["subject"].as_str().unwrap().contains("settings.json"))
+    );
+}
+
+// ---- documented codes -----------------------------------------------------------------------
+
+fn code_of(rows: &[Value], kind: &str) -> (String, String) {
+    let r = rows
+        .iter()
+        .find(|r| r["kind"] == kind)
+        .unwrap_or_else(|| panic!("no {kind} row"));
+    (
+        r["status"].as_str().unwrap().into(),
+        r["code"].as_str().unwrap().into(),
+    )
+}
+
+fn row_code<'a>(rows: &'a [Value], subject: &str) -> &'a str {
+    at(rows, subject)["code"].as_str().unwrap()
+}
+
+#[test]
+fn an_output_that_is_already_the_wanted_result_but_unrecorded_is_a_warning() {
+    let fx = Fx::new();
+    let link = fx.root.join("base/modules/extra/files/zshrc");
+    symlink(&link, fx.h(".zshrc")).unwrap();
+    let (c, rows) = fx.rows();
+    assert_eq!(c, 0, "{rows:#?}");
+    assert_eq!(status(&rows, ".zshrc"), ("WARN", "D_UNRECORDED"));
+}
+
+#[test]
+fn a_stray_state_entry_is_a_partial_warning() {
+    let fx = applied();
+    fs::write(fx.state().join("receipts").join(".half.tmp"), "x").unwrap();
+    let (c, rows) = fx.rows();
+    assert_eq!(c, 0, "{rows:#?}");
+    let r = rows
+        .iter()
+        .find(|r| r["code"] == "D_STATE_PARTIAL")
+        .unwrap();
+    assert_eq!(
+        (r["status"].as_str(), r["partial"].as_bool()),
+        (Some("WARN"), Some(true))
+    );
+}
+
+#[test]
+fn no_receipt_is_not_applicable_and_a_failed_last_run_is_a_warning() {
+    let fx = Fx::new();
+    let (_, rows) = fx.rows();
+    assert_eq!(
+        code_of(&rows, "receipt"),
+        ("N/A".into(), "D_NO_RECEIPT".into())
+    );
+    let fx = applied();
+    let dir = fx.state().join("receipts");
+    let f = fs::read_dir(&dir).unwrap().next().unwrap().unwrap().path();
+    let mut r: Value = serde_json::from_slice(&fs::read(&f).unwrap()).unwrap();
+    r["result"]["outcome"] = "failed".into();
+    r["result"]["exit_code"] = 1.into();
+    fs::write(&f, serde_json::to_vec(&r).unwrap()).unwrap();
+    let (c, rows) = fx.rows();
+    assert_eq!(c, 0, "WARN alone exits 0: {rows:#?}");
+    assert_eq!(
+        code_of(&rows, "receipt"),
+        ("WARN".into(), "D_LAST_RUN".into())
+    );
+}
+
+#[test]
+fn a_missing_profile_makes_the_plan_row_unknown_and_dependent() {
+    let fx = applied();
+    fs::remove_file(fx.root.join("profiles/t-01.toml")).unwrap();
+    let (_, rows) = fx.rows();
+    assert_eq!(
+        code_of(&rows, "plan"),
+        ("UNKNOWN".into(), "D_DEPENDS_UNKNOWN".into())
+    );
+}
+
+#[test]
+fn state_loss_and_state_without_a_binding_are_state_invalid() {
+    let fx = applied();
+    fs::remove_dir_all(fx.h(".local/state/dotfiles-manager")).unwrap();
+    let (c, rows) = fx.rows();
+    assert_eq!(c, 1);
+    assert_eq!(
+        code_of(&rows, "state"),
+        ("ERROR".into(), "E_STATE_INVALID".into())
+    );
+    assert!(
+        at(&rows, "state directory")["detail"]
+            .as_str()
+            .unwrap()
+            .contains("state loss")
+    );
+
+    let fx = applied();
+    fs::remove_file(fx.h(".config/dotfiles-manager/machine.toml")).unwrap();
+    let (c, rows) = fx.rows();
+    assert_eq!(c, 1);
+    assert_eq!(code_of(&rows, "binding").1, "E_BINDING_INVALID");
+    assert_eq!(
+        code_of(&rows, "state"),
+        ("ERROR".into(), "E_STATE_INVALID".into())
+    );
+    assert!(
+        at(&rows, "state directory")["detail"]
+            .as_str()
+            .unwrap()
+            .contains("no readable binding")
+    );
+}
+
+#[test]
+fn a_redirected_state_directory_is_storage_invalid() {
+    let fx = applied();
+    let dir = fx.h(".local/state/dotfiles-manager");
+    let moved = fx.h(".local/state/moved");
+    fs::rename(&dir, &moved).unwrap();
+    symlink(&moved, &dir).unwrap();
+    let (c, rows) = fx.rows();
+    assert_eq!(c, 1);
+    assert_eq!(
+        code_of(&rows, "state"),
+        ("ERROR".into(), "E_STORAGE_INVALID".into())
+    );
+}
+
+#[test]
+fn state_written_for_another_identity_is_an_identity_mismatch() {
+    let fx = applied();
+    let f = fx.state().join("state.json");
+    let mut v: Value = serde_json::from_slice(&fs::read(&f).unwrap()).unwrap();
+    v["binding"]["machine_id"] = "another-machine".into();
+    fs::write(&f, serde_json::to_vec(&v).unwrap()).unwrap();
+    let (c, rows) = fx.rows();
+    assert_eq!(c, 1);
+    assert_eq!(row_code(&rows, "state.json"), "E_IDENTITY_MISMATCH");
+    assert_eq!(status(&rows, "state.json").0, "ERROR");
+}
+
+#[test]
+fn a_ledger_path_outside_home_is_refused_and_the_other_rows_stay() {
+    let fx = applied();
+    let f = fx.state().join("ledger.json");
+    let l = fs::read_to_string(&f).unwrap();
+    // The scope check refuses a path outside HOME when the ledger is read, so the whole ledger
+    // is one ERROR row here. Every other source still has its rows.
+    fs::write(
+        &f,
+        l.replace(fx.home.path().to_str().unwrap(), "/elsewhere"),
+    )
+    .unwrap();
+    let (c, rows) = fx.rows();
+    assert_eq!(c, 1);
+    assert_eq!(status(&rows, "ledger.json").0, "ERROR");
+    assert_eq!(status(&rows, "journal.jsonl").0, "OK");
+    assert_eq!(code_of(&rows, "profile").0, "OK");
+}
+
+// ---- the lock row ---------------------------------------------------------------------------
+
+fn lock_of(fx: &Fx) -> Value {
+    let (_, rows) = fx.rows();
+    rows.into_iter().find(|r| r["kind"] == "lock").unwrap()
+}
+
+#[test]
+fn the_lock_row_handles_every_kind_of_lock_file() {
+    let fx = applied();
+    let lock = fx.h(".local/state/dotfiles-manager.lock");
+    // A note left by the last holder.
+    let r = lock_of(&fx);
+    assert_eq!(
+        (r["status"].as_str(), r["code"].as_str()),
+        (Some("OK"), Some("D_LOCK_NOTE")),
+        "{r:#?}"
+    );
+    // No file.
+    fs::remove_file(&lock).unwrap();
+    let r = lock_of(&fx);
+    assert_eq!(
+        (r["status"].as_str(), r["code"].as_str()),
+        (Some("OK"), Some("D_OK"))
+    );
+    assert!(!lock.exists());
+    // An empty file has no note.
+    fs::write(&lock, "").unwrap();
+    let r = lock_of(&fx);
+    assert_eq!(r["status"], "OK");
+    assert!(r["detail"].as_str().unwrap().contains("no holder note"));
+    fs::remove_file(&lock).unwrap();
+    // A symlink is refused, not followed.
+    symlink("/etc/hosts", &lock).unwrap();
+    let r = lock_of(&fx);
+    assert_eq!(
+        (r["status"].as_str(), r["code"].as_str()),
+        (Some("WARN"), Some("E_STORAGE_INVALID")),
+        "{r:#?}"
+    );
+    fs::remove_file(&lock).unwrap();
+    // A directory.
+    fs::create_dir(&lock).unwrap();
+    let r = lock_of(&fx);
+    assert_eq!(
+        (r["status"].as_str(), r["code"].as_str()),
+        (Some("WARN"), Some("E_STORAGE_INVALID")),
+        "{r:#?}"
+    );
+    fs::remove_dir(&lock).unwrap();
+    // A FIFO must neither block doctor nor be read.
+    let made = Command::new("mkfifo")
+        .arg(&lock)
+        .status()
+        .is_ok_and(|s| s.success());
+    assert!(made, "mkfifo failed");
+    let r = lock_of(&fx);
+    assert_eq!(
+        (r["status"].as_str(), r["code"].as_str()),
+        (Some("WARN"), Some("E_STORAGE_INVALID")),
+        "{r:#?}"
+    );
+    fs::remove_file(&lock).unwrap();
+    // A file the user cannot read.
+    if is_root() {
+        skipped("running as root: the unreadable lock file case");
+        return;
+    }
+    fs::write(&lock, "pid 1 since x\n").unwrap();
+    fs::set_permissions(&lock, fs::Permissions::from_mode(0o000)).unwrap();
+    let r = lock_of(&fx);
+    fs::set_permissions(&lock, fs::Permissions::from_mode(0o600)).unwrap();
+    assert_eq!(
+        (r["status"].as_str(), r["code"].as_str()),
+        (Some("WARN"), Some("E_STORAGE_INVALID")),
+        "{r:#?}"
+    );
+}
+
+// ---- docs -----------------------------------------------------------------------------------
+
+/// The `D_*` codes in the first column of the code table in docs/doctor.md.
+fn documented_codes() -> Vec<String> {
     let doc = fs::read_to_string(common::repo_root().join("docs/doctor.md")).unwrap();
-    for (c, _) in dfm_model::doctor::CODES {
-        assert!(doc.contains(c), "docs/doctor.md does not mention {c}");
+    let table = doc.split("\n## Codes\n").nth(1).expect("a Codes section");
+    let table = table.split("\n## ").next().unwrap();
+    table
+        .lines()
+        .filter_map(|l| l.strip_prefix("| `"))
+        .filter_map(|l| l.split_once('`'))
+        .map(|(c, _)| c.to_string())
+        .filter(|c| c.starts_with("D_"))
+        .collect()
+}
+
+#[test]
+fn the_documented_codes_are_exactly_the_registered_codes() {
+    let mut docs = documented_codes();
+    let mut registered: Vec<String> = DoctorCode::ALL
+        .iter()
+        .map(|c| c.as_str().to_string())
+        .collect();
+    docs.sort();
+    registered.sort();
+    assert_eq!(docs, registered);
+    let doc = fs::read_to_string(common::repo_root().join("docs/doctor.md")).unwrap();
+    for c in DoctorCode::ALL {
+        assert!(
+            doc.contains(c.description()),
+            "the description of {} is not in the docs",
+            c.as_str()
+        );
     }
 }

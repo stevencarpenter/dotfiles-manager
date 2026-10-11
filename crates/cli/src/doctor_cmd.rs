@@ -5,17 +5,21 @@
 //! lock and writes nothing. A failing source gives its own row and the other rows still appear.
 
 use crate::{Ctx, Loaded, bounded, header, load_resolved, plan_cmd, read_existing_binding, usage};
-use dfm_engine::{Dir, Fail, Layout, Store, Sys, observe, owned_outputs, verify_identity};
-use dfm_model::binding::Binding;
-use dfm_model::doctor::{Level, Report, Row};
-use dfm_model::plan::{
-    Action, Node, Observations, Operation, Owned, Plan, Request, Status, in_scope, link_fingerprint,
+use dfm_engine::{
+    Dir, Fail, Layout, Loaded as StateLoaded, Store, Sys, merge, observe, verify_identity,
 };
-use dfm_model::state::{Class, unfinished};
+use dfm_model::binding::Binding;
+use dfm_model::doctor::{DoctorCode as D, Level, Report, Row};
+use dfm_model::fold;
+use dfm_model::plan::{
+    Action, Node, Observations, Operation, Owned, Ownership, Plan, Request, Status, in_scope,
+    link_fingerprint, sensitive_paths,
+};
+use dfm_model::state::{Class, Ledger, unfinished};
 use dfm_model::{Code, Refusal};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Write};
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::Path;
 
 const DEFAULT_WIDTH: usize = 80;
@@ -80,9 +84,16 @@ fn inspect(ctx: &Ctx, command: &'static str, root: &Path) -> Result<Report, Refu
     let mut rows = Vec::new();
     let binding = binding_row(ctx, &mut rows);
     let owned = state_rows(sys, &layout, binding.as_ref(), &mut rows);
-    lock_row(ctx, &mut rows);
-    let plan = profile_rows(ctx, binding.as_ref(), root, &mut rows);
-    output_rows(sys, &layout, owned.as_deref(), plan.as_ref(), &mut rows);
+    lock_row(ctx, sys.uid, &mut rows);
+    let (loaded, plan) = profile_rows(ctx, binding.as_ref(), root, &mut rows);
+    output_rows(
+        sys,
+        &layout,
+        owned.as_deref(),
+        loaded.as_ref(),
+        plan.as_ref(),
+        &mut rows,
+    );
     Ok(Report::new(command, ctx.isolated.clone(), rows))
 }
 
@@ -101,7 +112,7 @@ fn fix_for(code: Code) -> &'static str {
         Code::Conflict => "Review the file. Move it aside or restore it, then run plan.",
         Code::ReportUnavailable => "Pass an existing --root directory.",
         Code::ObservationUnknown => "Fix the permissions or the path named here, then run doctor.",
-        _ => "Fix the file named here, then run doctor. See docs/doctor.md for the code.",
+        _ => "Fix the file named here, then run doctor.",
     }
 }
 
@@ -114,7 +125,7 @@ fn refusal_row(kind: &'static str, subject: &str, r: &Refusal) -> Row {
     };
     Row::new(
         kind,
-        r.code.as_str(),
+        r.code,
         status,
         subject,
         &bounded(&r.detail),
@@ -123,7 +134,7 @@ fn refusal_row(kind: &'static str, subject: &str, r: &Refusal) -> Row {
 }
 
 fn ok_row(kind: &'static str, subject: &str, detail: &str) -> Row {
-    Row::new(kind, "D_OK", Level::Ok, subject, detail, "None.")
+    Row::new(kind, D::Ok, Level::Ok, subject, detail, "")
 }
 
 fn binding_row(ctx: &Ctx, rows: &mut Vec<Row>) -> Option<Binding> {
@@ -148,6 +159,8 @@ fn binding_row(ctx: &Ctx, rows: &mut Vec<Row>) -> Option<Binding> {
     }
 }
 
+// ---- state --------------------------------------------------------------------------------
+
 /// State store rows. Returns the owned outputs when the ledger could be read.
 fn state_rows(
     sys: Sys,
@@ -167,7 +180,7 @@ fn state_rows(
         (None, None) => {
             rows.push(Row::new(
                 "state",
-                "D_STATE_ABSENT",
+                D::StateAbsent,
                 Level::NotApplicable,
                 "state directory",
                 "no state exists",
@@ -206,57 +219,94 @@ fn state_rows(
             "belongs to the bound identity",
         )),
     }
-
     // The lenient reads: one output with an unsafe parent must not hide the rest of the ledger.
-    let mut owned = None;
-    match store.read_ledger_lenient() {
-        Ok(led) => {
-            let outputs: usize = led.resources.iter().map(|r| r.owned_outputs.len()).sum();
-            rows.push(ok_row(
-                "state",
-                "ledger.json",
-                &format!("{} resources, {outputs} owned outputs", led.resources.len()),
-            ));
-            match owned_outputs(&led, &layout.home) {
-                Ok(o) => owned = Some(o),
-                Err(r) => rows.push(refusal_row("state", "ledger.json", &r)),
-            }
-        }
-        Err(r) => rows.push(refusal_row("state", "ledger.json", &r)),
-    }
-    match store.read_journal_lenient() {
-        Ok(entries) => {
-            rows.push(ok_row(
-                "state",
-                "journal.jsonl",
-                &format!("{} entries", entries.len()),
-            ));
-            for e in unfinished(&entries) {
-                let subject = e
-                    .recovery
-                    .iter()
-                    .flat_map(|r| &r.outputs)
-                    .map(|o| o.path.as_str())
-                    .next()
-                    .unwrap_or(&e.op);
-                rows.push(Row::new(
-                    "intent",
-                    Code::OpInterrupted.as_str(),
-                    Level::Error,
-                    subject,
-                    &format!(
-                        "operation {} of run {} (resource {}, began {}) has an intent and no outcome",
-                        e.op, e.op_id, e.resource, e.at
-                    ),
-                    "Run apply. It settles each interrupted operation before new work. Doctor never settles or replays.",
-                ));
-            }
-        }
-        Err(r) => rows.push(refusal_row("state", "journal.jsonl", &r)),
-    }
+    let owned = ledger_rows(&store, layout, rows);
+    journal_rows(&store, rows);
+    let bad = evidence_rows(&l, &findings, rows);
+    receipt_row(&l, bad, rows);
+    owned
+}
 
-    // Receipts, trials and stray files are audit evidence. Their failures are WARN rows, and the
-    // inventory they leave is partial.
+/// The ledger row and the owned outputs. One path outside HOME gets its own ERROR row and does
+/// not hide the others.
+fn ledger_rows(store: &Store, layout: &Layout, rows: &mut Vec<Row>) -> Option<Vec<Owned>> {
+    let led: Ledger = match store.read_ledger_lenient() {
+        Ok(l) => l,
+        Err(r) => {
+            rows.push(refusal_row("state", "ledger.json", &r));
+            return None;
+        }
+    };
+    let total: usize = led.resources.iter().map(|r| r.owned_outputs.len()).sum();
+    rows.push(ok_row(
+        "state",
+        "ledger.json",
+        &format!("{} resources, {total} owned outputs", led.resources.len()),
+    ));
+    let mut owned = Vec::new();
+    for r in &led.resources {
+        for o in &r.owned_outputs {
+            match Path::new(&o.path)
+                .strip_prefix(&layout.home)
+                .ok()
+                .and_then(Path::to_str)
+            {
+                Some(rel) => owned.push(Owned {
+                    resource: r.resource.clone(),
+                    adapter: r.adapter.clone(),
+                    class: r.class,
+                    path: rel.into(),
+                    fingerprint: o.fingerprint.clone(),
+                }),
+                None => rows.push(refusal_row(
+                    "output",
+                    &o.path,
+                    &Refusal::new(Code::StateInvalid, "the ledger path is outside HOME"),
+                )),
+            }
+        }
+    }
+    Some(owned)
+}
+
+fn journal_rows(store: &Store, rows: &mut Vec<Row>) {
+    let entries = match store.read_journal_lenient() {
+        Ok(e) => e,
+        Err(r) => {
+            rows.push(refusal_row("state", "journal.jsonl", &r));
+            return;
+        }
+    };
+    rows.push(ok_row(
+        "state",
+        "journal.jsonl",
+        &format!("{} entries", entries.len()),
+    ));
+    for e in unfinished(&entries) {
+        let subject = e
+            .recovery
+            .iter()
+            .flat_map(|r| &r.outputs)
+            .map(|o| o.path.as_str())
+            .next()
+            .unwrap_or(&e.op);
+        rows.push(Row::new(
+            "intent",
+            Code::OpInterrupted,
+            Level::Error,
+            subject,
+            &format!(
+                "operation {} of run {} (resource {}, began {}) has an intent and no outcome",
+                e.op, e.op_id, e.resource, e.at
+            ),
+            "Wait for a running apply to finish, then run apply. An apply that holds the lock reports E_LOCKED. Doctor never settles or replays.",
+        ));
+    }
+}
+
+/// Receipts, trials and stray files are audit evidence. Their failures are WARN rows and leave
+/// the inventory partial. Returns how many rows it added.
+fn evidence_rows(l: &StateLoaded, findings: &[dfm_engine::Finding], rows: &mut Vec<Row>) -> usize {
     let mut bad = 0;
     for f in findings
         .iter()
@@ -266,7 +316,7 @@ fn state_rows(
         rows.push(
             Row::new(
                 "state",
-                f.code.as_str(),
+                f.code,
                 Level::Warn,
                 &f.file,
                 &bounded(&f.detail),
@@ -282,10 +332,11 @@ fn state_rows(
             .take(SHOWN_STRAYS)
             .map(String::as_str)
             .collect();
+        bad += 1;
         rows.push(
             Row::new(
                 "state",
-                "D_STATE_PARTIAL",
+                D::StatePartial,
                 Level::Warn,
                 "state directory",
                 &format!("{} stray entries: {}", l.strays.len(), shown.join(", ")),
@@ -294,55 +345,68 @@ fn state_rows(
             .partial(),
         );
     }
+    bad
+}
+
+fn receipt_row(l: &StateLoaded, bad: usize, rows: &mut Vec<Row>) {
     let latest = l
         .receipts
         .iter()
         .filter_map(|(n, r)| r.as_ref().ok().map(|r| (n, r)))
         .max_by(|a, b| a.0.cmp(b.0));
     let unreadable = l.receipts.iter().filter(|r| r.1.is_err()).count();
-    rows.push(match latest {
-        None => {
-            let r = Row::new(
-                "receipt",
-                "D_NO_RECEIPT",
-                Level::NotApplicable,
-                "receipts",
-                "no readable receipt",
-                "Run apply to record the first run.",
-            );
-            if unreadable > 0 { r.partial() } else { r }
-        }
+    let row = match latest {
+        None => Row::new(
+            "receipt",
+            D::NoReceipt,
+            Level::NotApplicable,
+            "receipts",
+            "no readable receipt",
+            "Run apply to record the first run.",
+        ),
         Some((name, r)) => {
             let detail = format!(
                 "{} {} (exit {}) finished {}",
                 r.command, r.result.outcome, r.result.exit_code, r.finished_at
             );
-            let row = if r.result.outcome == "ok" {
+            if r.result.outcome == "ok" {
                 ok_row("receipt", name, &detail)
             } else {
                 Row::new(
                     "receipt",
-                    "D_LAST_RUN",
+                    D::LastRun,
                     Level::Warn,
                     name,
                     &detail,
                     "Run plan to see what is still pending.",
                 )
-            };
-            if unreadable > 0 || bad > 0 {
-                row.partial()
-            } else {
-                row
             }
         }
+    };
+    rows.push(if unreadable > 0 || bad > 0 {
+        row.partial()
+    } else {
+        row
     });
-    owned
 }
 
-/// The lock file note. Doctor never takes the lock, so a note only says who held it last.
-fn lock_row(ctx: &Ctx, rows: &mut Vec<Row>) {
+// ---- lock ---------------------------------------------------------------------------------
+
+/// The lock file note. Doctor never takes the lock, so a note only says who held it last. The
+/// file must be a regular file owned by the user, or the row is a WARN.
+fn lock_row(ctx: &Ctx, uid: u32, rows: &mut Vec<Row>) {
     let path = ctx.platform.lock_path();
     let shown = path.display().to_string();
+    let warn = |why: &str| {
+        Row::new(
+            "lock",
+            Code::StorageInvalid,
+            Level::Warn,
+            &shown,
+            why,
+            "Check that the lock file is a regular file owned by you.",
+        )
+    };
     let opened = std::fs::OpenOptions::new()
         .read(true)
         .custom_flags(dfm_platform_macos::O_NOFOLLOW | dfm_platform_macos::O_NONBLOCK)
@@ -354,43 +418,56 @@ fn lock_row(ctx: &Ctx, rows: &mut Vec<Row>) {
             return;
         }
         Err(e) => {
-            rows.push(Row::new(
-                "lock",
-                Code::StorageInvalid.as_str(),
-                Level::Warn,
-                &shown,
-                &format!("cannot read the lock file: {}", e.kind()),
-                "Check that the lock file is a regular file owned by you.",
-            ));
+            rows.push(warn(&format!("cannot open the lock file: {}", e.kind())));
             return;
         }
     };
+    match f.metadata() {
+        Ok(m) if m.is_file() && m.uid() == uid => {}
+        Ok(_) => {
+            rows.push(warn("the lock file is not a regular file owned by you"));
+            return;
+        }
+        Err(e) => {
+            rows.push(warn(&format!("cannot inspect the lock file: {}", e.kind())));
+            return;
+        }
+    }
     let mut buf = Vec::new();
-    let note = match f.take(LOCK_NOTE_BYTES).read_to_end(&mut buf) {
-        Ok(_) => String::from_utf8_lossy(&buf).trim().to_string(),
-        Err(e) => format!("unreadable ({})", e.kind()),
-    };
-    rows.push(Row::new(
-        "lock",
-        "D_LOCK_NOTE",
-        Level::Ok,
-        &shown,
-        &format!("last holder note: {note}. Doctor does not take the lock, so it cannot tell whether a holder runs now"),
-        "None.",
-    ));
+    if let Err(e) = f.take(LOCK_NOTE_BYTES).read_to_end(&mut buf) {
+        rows.push(warn(&format!("cannot read the lock file: {}", e.kind())));
+        return;
+    }
+    let note = String::from_utf8_lossy(&buf).trim().to_string();
+    rows.push(if note.is_empty() {
+        ok_row("lock", &shown, "the lock file has no holder note")
+    } else {
+        Row::new(
+            "lock",
+            D::LockNote,
+            Level::Ok,
+            &shown,
+            &format!(
+                "last holder note: {note}. Doctor does not take the lock, so it cannot tell whether a holder runs now"
+            ),
+            "",
+        )
+    });
 }
 
-/// Profile, module, resource and plan rows. Returns the plan when it could be made.
+// ---- profile and plan ---------------------------------------------------------------------
+
+/// Profile, module, resource and plan rows. Returns what could be resolved and planned.
 fn profile_rows(
     ctx: &Ctx,
     binding: Option<&Binding>,
     root: &Path,
     rows: &mut Vec<Row>,
-) -> Option<Plan> {
+) -> (Option<Loaded>, Option<Plan>) {
     let depends = |kind: &'static str, subject: &str, why: &str| {
         Row::new(
             kind,
-            "D_DEPENDS_UNKNOWN",
+            D::DependsUnknown,
             Level::Unknown,
             subject,
             why,
@@ -403,9 +480,9 @@ fn profile_rows(
             "bound profile",
             "needs a readable binding",
         ));
-        return None;
+        return (None, None);
     }
-    let loaded: Loaded = match load_resolved(ctx, root) {
+    let loaded = match load_resolved(ctx, root) {
         Ok(l) => l,
         Err(r) => {
             rows.push(refusal_row("profile", "bound profile", &r));
@@ -414,7 +491,7 @@ fn profile_rows(
                 "plan",
                 "drift cannot be assessed without a resolved profile",
             ));
-            return None;
+            return (None, None);
         }
     };
     let res = &loaded.resolved;
@@ -436,16 +513,16 @@ fn profile_rows(
         rows.push(if r.sensitive {
             Row::new(
                 "resource",
-                "D_NA_SENSITIVE",
+                D::NaSensitive,
                 Level::NotApplicable,
                 &r.id,
                 "sensitive resource: nothing is read",
-                "None.",
+                "",
             )
         } else {
             Row::new(
                 "resource",
-                "D_PROBING_NOT_BUILT",
+                D::ProbingNotBuilt,
                 Level::Unknown,
                 &r.id,
                 &format!(
@@ -457,14 +534,17 @@ fn profile_rows(
             .optional()
         });
     }
-    match plan_cmd::plan_for(ctx, &loaded) {
+    let plan = match plan_cmd::plan_for(ctx, &loaded) {
         Ok(p) => Some(p),
         Err(r) => {
             rows.push(refusal_row("plan", "plan", &r));
             None
         }
-    }
+    };
+    (Some(loaded), plan)
 }
+
+// ---- outputs ------------------------------------------------------------------------------
 
 /// What the live entry at an owned path says about the ledger entry.
 enum Live {
@@ -516,16 +596,54 @@ fn live_state(o: &Owned, obs: &Observations) -> Live {
     Live::Unknown("empty path".into())
 }
 
+/// The facts for the owned outputs: the plan's observations where they serve, and one more
+/// read-only pass for the paths they lack or did not hash. A sensitive path is never requested.
+fn observe_owned(
+    sys: Sys,
+    layout: &Layout,
+    owned: &[Owned],
+    sensitive: &BTreeSet<String>,
+    plan: Option<&Plan>,
+) -> Result<Observations, Refusal> {
+    let served = |p: &str| {
+        plan.is_some_and(|pl| {
+            pl.observations
+                .seen
+                .get(p)
+                .is_some_and(|s| !matches!(s.node, Node::File { sha256: None, .. }))
+        })
+    };
+    let reqs: Vec<Request> = owned
+        .iter()
+        .filter(|o| o.class == Class::Normal && !sensitive.contains(&fold(&o.path)))
+        .filter(|o| !served(&o.path))
+        .map(|o| Request {
+            path: o.path.clone(),
+            hash: true,
+            list: false,
+        })
+        .collect();
+    let mut obs = Observations::default();
+    if !reqs.is_empty() {
+        obs = observe(&sys, &Dir::open_home(&sys, &layout.home)?, &reqs)?;
+    }
+    if let Some(p) = plan {
+        merge(&mut obs, p.observations.clone());
+    }
+    Ok(obs)
+}
+
 /// One row per owned output and per output the plan claims. A foreign file that the plan does
 /// not claim has no row: a project-local override is not a conflict.
 fn output_rows(
     sys: Sys,
     layout: &Layout,
     owned: Option<&[Owned]>,
+    loaded: Option<&Loaded>,
     plan: Option<&Plan>,
     rows: &mut Vec<Row>,
 ) {
-    let partial = plan.is_none();
+    let owned = owned.unwrap_or_default();
     let mut blocked = BTreeSet::new();
     for b in plan.iter().flat_map(|p| &p.blockers) {
         let status = if b.code == Code::ObservationUnknown {
@@ -537,16 +655,15 @@ fn output_rows(
         blocked.insert(subject.to_string());
         rows.push(Row::new(
             "output",
-            b.code.as_str(),
+            b.code,
             status,
             subject,
             &bounded(&format!("{} in {}: {}", b.resource, b.source, b.detail)),
             &bounded(&b.correction),
         ));
     }
-
     let mut by_path: BTreeMap<&str, (Option<&Owned>, Option<&Operation>)> = BTreeMap::new();
-    for o in owned.unwrap_or_default() {
+    for o in owned {
         by_path.entry(&o.path).or_default().0 = Some(o);
     }
     for op in plan.iter().flat_map(|p| &p.operations) {
@@ -558,147 +675,134 @@ fn output_rows(
             by_path.entry(path).or_default().1 = Some(op);
         }
     }
-
-    // Content is hashed only for normal outputs. A sensitive path is not even looked at.
-    let reqs: Vec<Request> = owned
-        .unwrap_or_default()
-        .iter()
-        .filter(|o| o.class == Class::Normal)
-        .map(|o| Request {
-            path: o.path.clone(),
-            hash: true,
-            list: false,
-        })
-        .collect();
-    let obs = Dir::open_home(&sys, &layout.home).and_then(|home| observe(&sys, &home, &reqs));
-
+    let sensitive = sensitive_paths(loaded.map(|l| &l.resolved), owned);
+    let obs = observe_owned(sys, layout, owned, &sensitive, plan);
     for (path, (o, op)) in by_path {
         if blocked.contains(path) {
             continue;
         }
-        let sensitive = o.is_some_and(|o| o.class == Class::Sensitive)
-            || op.is_some_and(|op| op.class == Class::Sensitive);
-        let generated =
-            op.is_some_and(|op| matches!(op.action, Action::CreateFile | Action::UpdateFile));
-        let who = o
-            .map(|o| o.resource.as_str())
-            .or(op.map(|op| op.resource.as_str()));
-        let who = who.unwrap_or("unknown");
-        let mut row = if sensitive {
-            Row::new(
-                "output",
-                "D_NA_SENSITIVE",
-                Level::NotApplicable,
-                path,
-                &format!("resource {who}: sensitive output, content is not read"),
-                "None.",
-            )
-        } else if generated {
-            Row::new(
-                "output",
-                "D_NA_GENERATED",
-                Level::NotApplicable,
-                path,
-                &format!("resource {who}: not applicable in this build (no generator)"),
-                "None.",
-            )
-        } else if let Some(o) = o {
-            match &obs {
-                Err(r) => Row::new(
-                    "output",
-                    Code::ObservationUnknown.as_str(),
-                    Level::Unknown,
-                    path,
-                    &format!(
-                        "resource {who}: HOME cannot be observed: {}",
-                        bounded(&r.detail)
-                    ),
-                    fix_for(Code::ObservationUnknown),
-                ),
-                Ok(obs) => owned_row(path, who, op, live_state(o, obs)),
-            }
-        } else if let Some(op) = op {
-            match op.status {
-                Status::Planned => Row::new(
-                    "output",
-                    "D_PLAN_PENDING",
-                    Level::Warn,
-                    path,
-                    &format!(
-                        "resource {who} claims it and does not own it yet: {}",
-                        op.effect
-                    ),
-                    "Review plan, then run apply.",
-                ),
-                Status::Current
-                    if op.ownership == dfm_model::plan::Ownership::UnrecordedCurrent =>
-                {
-                    Row::new(
-                        "output",
-                        "D_UNRECORDED",
-                        Level::Warn,
-                        path,
-                        &format!(
-                            "resource {who}: the output is the wanted result, but the ledger has no entry"
-                        ),
-                        "None: the manager leaves it alone and never removes it.",
-                    )
-                }
-                Status::Current => ok_row(
-                    "output",
-                    path,
-                    &format!("resource {who}: already the wanted result"),
-                ),
-                Status::NotInScope | Status::Blocked => continue,
-            }
-        } else {
-            continue;
-        };
-        if partial {
-            row = row.partial();
+        if let Some(row) = classify(path, o, op, &sensitive, &obs) {
+            rows.push(if plan.is_none() { row.partial() } else { row });
         }
-        rows.push(row);
+    }
+}
+
+/// The row for one path, or none when the plan has nothing to say about it.
+fn classify(
+    path: &str,
+    o: Option<&Owned>,
+    op: Option<&Operation>,
+    sensitive: &BTreeSet<String>,
+    obs: &Result<Observations, Refusal>,
+) -> Option<Row> {
+    let who = o
+        .map(|o| o.resource.as_str())
+        .or(op.map(|op| op.resource.as_str()))
+        .unwrap_or("unknown");
+    // Checked before anything else: a sensitive path is never looked at, whoever owns it.
+    let is_sensitive = sensitive.contains(&fold(path))
+        || o.is_some_and(|o| o.class == Class::Sensitive)
+        || op.is_some_and(|op| op.class == Class::Sensitive);
+    if is_sensitive {
+        return Some(Row::new(
+            "output",
+            D::NaSensitive,
+            Level::NotApplicable,
+            path,
+            &format!("resource {who}: sensitive output, content is not read"),
+            "",
+        ));
+    }
+    if op.is_some_and(|op| matches!(op.action, Action::CreateFile | Action::UpdateFile)) {
+        return Some(Row::new(
+            "output",
+            D::NaGenerated,
+            Level::NotApplicable,
+            path,
+            &format!("resource {who}: not applicable in this build (no generator)"),
+            "",
+        ));
+    }
+    if let Some(o) = o {
+        return Some(match obs {
+            Err(r) => Row::new(
+                "output",
+                Code::ObservationUnknown,
+                Level::Unknown,
+                path,
+                &format!(
+                    "resource {who}: HOME cannot be observed: {}",
+                    bounded(&r.detail)
+                ),
+                fix_for(Code::ObservationUnknown),
+            ),
+            Ok(obs) => owned_row(path, who, op, live_state(o, obs)),
+        });
+    }
+    let op = op?;
+    match op.status {
+        Status::Planned => Some(Row::new(
+            "output",
+            D::PlanPending,
+            Level::Warn,
+            path,
+            &format!(
+                "resource {who} claims it and does not own it yet: {}",
+                op.effect
+            ),
+            "Review plan, then run apply.",
+        )),
+        Status::Current if op.ownership == Ownership::UnrecordedCurrent => Some(Row::new(
+            "output",
+            D::Unrecorded,
+            Level::Warn,
+            path,
+            &format!(
+                "resource {who}: the output is the wanted result, but the ledger has no entry"
+            ),
+            "None needed: the manager leaves it alone and never removes it.",
+        )),
+        Status::Current => Some(ok_row(
+            "output",
+            path,
+            &format!("resource {who}: already the wanted result"),
+        )),
+        Status::NotInScope | Status::Blocked => None,
     }
 }
 
 fn owned_row(path: &str, who: &str, op: Option<&Operation>, live: Live) -> Row {
+    let row = |code: Code, level: Level, detail: &str| {
+        Row::new("output", code, level, path, detail, fix_for(code))
+    };
     match live {
-        Live::Unknown(why) => Row::new(
-            "output",
-            Code::ObservationUnknown.as_str(),
+        Live::Unknown(why) => row(
+            Code::ObservationUnknown,
             Level::Unknown,
-            path,
             &format!("resource {who}: {}", bounded(&why)),
-            fix_for(Code::ObservationUnknown),
         ),
-        Live::Parent(why) => Row::new(
-            "output",
-            Code::ParentUnsafe.as_str(),
+        Live::Parent(why) => row(
+            Code::ParentUnsafe,
             Level::Error,
-            path,
             &format!("resource {who}: {}", bounded(&why)),
-            fix_for(Code::ParentUnsafe),
         ),
         Live::Missing => Row::new(
             "output",
-            "D_OUTPUT_MISSING",
+            D::OutputMissing,
             Level::Warn,
             path,
             &format!("owned by {who}; the output is gone"),
             "Run apply to publish it again.",
         ),
-        Live::Differs(why) => Row::new(
-            "output",
-            Code::Conflict.as_str(),
+        Live::Differs(why) => row(
+            Code::Conflict,
             Level::Error,
-            path,
             &format!("owned by {who}; {why}. The manager will not overwrite or remove it"),
-            fix_for(Code::Conflict),
         ),
         Live::Match => match op.filter(|op| op.status == Status::Planned) {
             Some(op) if op.action == Action::Remove => Row::new(
                 "output",
-                "D_PLAN_REMOVAL",
+                D::PlanRemoval,
                 Level::Warn,
                 path,
                 &format!("owned by {who}; nothing selects it any more: {}", op.effect),
@@ -706,7 +810,7 @@ fn owned_row(path: &str, who: &str, op: Option<&Operation>, live: Live) -> Row {
             ),
             Some(op) => Row::new(
                 "output",
-                "D_PLAN_PENDING",
+                D::PlanPending,
                 Level::Warn,
                 path,
                 &format!("owned by {who}; the wanted result changed: {}", op.effect),

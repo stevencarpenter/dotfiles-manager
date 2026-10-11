@@ -40,7 +40,7 @@ Both commands are read-only. They run no program, probe no tool, version or PATH
 | `kind` | `binding`, `state`, `lock`, `profile`, `module`, `resource`, `output`, `intent`, `receipt` or `plan`. |
 | `code` | A stable code. Either an `E_*` code that already exists, or a `D_*` code from the table below. |
 | `status` | `OK`, `WARN`, `ERROR`, `UNKNOWN` or `N/A`. |
-| `subject` | The path, file or resource. Paths below HOME are relative to HOME. |
+| `subject` | The path, file or resource. Output paths and the stray state entries are relative to HOME or to the state directory. The subjects of the `binding`, `profile` and `lock` rows are absolute paths. A subject is cut at 4096 characters. |
 | `detail` | What was found. It never holds a file content or a secret value. |
 | `fix` | One line of fix text. |
 | `required` | `true` unless the row is a check this build cannot run. An UNKNOWN required row is exit 1. |
@@ -57,9 +57,9 @@ All text passes through `dfm_model::display::visible`. Neither format has an ANS
 | `state` | The state directory | ERROR `E_STATE_INVALID` for state loss (binding without state) or state without a binding. ERROR `E_STORAGE_INVALID` for a redirected or badly owned directory. N/A `D_STATE_ABSENT` when neither exists. |
 | `state` | A receipt or trial that cannot be read, or belongs to another identity | WARN with the file's code, labeled partial. Receipts are audit evidence and never authority. |
 | `state` | Stray entries (interrupted writes, staging directories) | WARN `D_STATE_PARTIAL`, labeled partial. |
-| `intent` | A journal intent with no outcome | ERROR `E_OP_INTERRUPTED`. The fix is to run `apply`, which settles it. |
+| `intent` | A journal intent with no outcome | ERROR `E_OP_INTERRUPTED`. A running apply also leaves an intent until it ends, and doctor cannot tell the two apart. The fix is to wait for a running apply, then run `apply`, which settles it. |
 | `receipt` | The newest readable receipt | OK `D_OK`, WARN `D_LAST_RUN` when its outcome is not `ok`, N/A `D_NO_RECEIPT`. |
-| `lock` | The lock file | OK `D_OK` (no file) or OK `D_LOCK_NOTE`. WARN `E_STORAGE_INVALID` when the file cannot be read. |
+| `lock` | The lock file | OK `D_OK` (no file, or an empty file with no note) or OK `D_LOCK_NOTE`. WARN `E_STORAGE_INVALID` when the file is a link, a directory, a FIFO, owned by another user, or cannot be opened or read. The file is opened without following a link and checked on the descriptor. |
 | `profile` | The resolved profile | OK `D_OK`. ERROR with the resolver's code (`E_MANIFEST_INVALID`, `E_SOURCE_MISSING`, `E_PROFILE_INVALID`, and so on). UNKNOWN `D_DEPENDS_UNKNOWN` without a readable binding. |
 | `module` | Each selected module | OK `D_OK`. |
 | `resource` | A resource that is not a file output (package, application and similar) | UNKNOWN `D_PROBING_NOT_BUILT`, not required. N/A `D_NA_SENSITIVE` when it is sensitive. |
@@ -82,7 +82,7 @@ An output row joins three facts: the ledger entry (who owns it), the live entry 
 | Owned, live entry cannot be read | UNKNOWN `E_OBSERVATION_UNKNOWN` |
 | Claimed by the plan, not owned, plan would create it | WARN `D_PLAN_PENDING` |
 | Claimed, not owned, already the wanted result | WARN `D_UNRECORDED` |
-| Sensitive output (ledger class or plan class) | N/A `D_NA_SENSITIVE`. No content is read or hashed. |
+| Sensitive output: a ledger entry of the sensitive class (compared with case folded), a path a selected sensitive resource claims, or a sensitive plan operation | N/A `D_NA_SENSITIVE`. No content is read or hashed, whoever owns the path. A planner blocker for the path (for example `E_CONFLICT` for a sensitive destination without a ledger entry) is shown instead, because it needs no content. |
 | Operation that needs generated content | N/A `D_NA_GENERATED`: not applicable in this build (no generator). |
 
 An owned output is compared by fingerprint: SHA-256 of the file content, or of the link target text for a link (`link_fingerprint`). The comparison reads the file (a read, never a write).
@@ -117,6 +117,8 @@ Each source is read on its own. A parse failure in the ledger, the journal, a mo
 - The ledger, journal and state document are read with the lenient reads. One output with an unsafe parent does not hide the rest of the ledger.
 - When the profile or the plan fails, owned outputs still get rows from the ledger and the live entry. They are labeled `partial`, because drift against the plan was not assessed.
 - When the ledger fails, the plan cannot know ownership, so the plan row fails and output rows for the plan are absent.
+- A ledger path outside HOME is refused when the ledger is read, so it fails the ledger row. The per-path ERROR row for such a path is a second line of defense.
+- The plan's observations serve the output rows. A second read-only pass covers only owned paths the plan did not observe or hash.
 
 ## Table format
 
@@ -138,4 +140,5 @@ These are deferred. A row for them is UNKNOWN with the reason "probing not built
 - A parent of an owned output that is a link is reported as an error even when the link stays inside HOME, because apply refuses to write through it.
 - The planner reports a link that leaves HOME as `E_TARGET_RESERVED`. Doctor shows the planner's code.
 - A receipt that fails the claim check (for example its output now sits below a link) is shown as an unreadable receipt, a WARN row.
-- Doctor reads file content to compare fingerprints. It reads nothing for a sensitive output.
+- Doctor reads file content to compare fingerprints. It reads nothing for a sensitive output. The rule is the planner's (`dfm_model::plan::sensitive_paths`), with the claims of selected sensitive resources compared case-folded. Without a resolved profile only the ledger classes protect a path, so a normal ledger entry that a sensitive resource now claims is hashed in that case.
+- `plan_for` still opens the store and reads the ledger on its own, so doctor reads the ledger twice.
