@@ -375,14 +375,14 @@ pub struct SourceId {
     pub tree: String,
 }
 
-/// One approved disruptive operation (architecture section 5, `approvals[]`).
+/// One approved disruptive operation or adoption (architecture section 5, `approvals[]`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DisruptiveApproval {
     /// The `id` of the receipt operation that ran with this approval.
     pub operation_id: String,
-    /// `allow_disruptive`. The contract also names `interactive`, which needs a prompt that
-    /// does not exist yet.
+    /// `allow_disruptive` or `allow_adopt` (DFM-45). The contract also names `interactive`,
+    /// which needs a prompt that does not exist yet.
     pub how: String,
     pub at: String,
 }
@@ -410,7 +410,7 @@ pub struct Receipt {
     pub plan_digest: Option<String>,
     pub approval: Option<Approval>,
     pub sources: Vec<SourceId>,
-    /// One entry per disruptive operation that ran with an approval.
+    /// One entry per disruptive operation or adoption that ran with an approval.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub approvals: Vec<DisruptiveApproval>,
     pub operations: Vec<OperationRecord>,
@@ -518,7 +518,10 @@ impl Receipt {
         }
         for a in &self.approvals {
             let known = self.operations.iter().any(|o| o.id == a.operation_id);
-            if a.how != "allow_disruptive" || !known || parse_rfc3339(&a.at).is_none() {
+            if !matches!(a.how.as_str(), "allow_disruptive" | "allow_adopt")
+                || !known
+                || parse_rfc3339(&a.at).is_none()
+            {
                 return Err(bad("receipt approvals[] entry is malformed"));
             }
         }
@@ -1431,6 +1434,8 @@ mod tests {
             how: "allow_disruptive".into(),
             at: "2026-10-10T00:00:00Z".into(),
         }];
+        r.validate().unwrap();
+        r.approvals[0].how = "allow_adopt".into();
         r.validate().unwrap();
         let again = Receipt::parse(&canonical(&r).unwrap()).unwrap();
         assert_eq!(again, r);

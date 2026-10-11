@@ -671,8 +671,10 @@ impl Planner<'_> {
             subject: format!("ledger:{claim}"),
             state: self.ledger_state(claim, r.sensitive),
         });
+        // Only a normal-class output that no ledger entry mentions can be adopted.
+        let unowned = !r.sensitive && self.ledger_entry(claim).is_none();
         let (action, status, ownership, effect, post) =
-            decide(r, claim, &seen, link, op.ownership)?;
+            decide(r, claim, &seen, link, op.ownership, unowned)?;
         op.action = action;
         op.status = status;
         op.ownership = ownership;
@@ -1095,6 +1097,7 @@ fn decide(
     seen: &Seen,
     link: Option<&str>,
     ownership: Ownership,
+    unowned: bool,
 ) -> Result<Decision, Fail> {
     let shown = if r.sensitive {
         format!("{path} (sensitive: destination and mode only)")
@@ -1140,6 +1143,22 @@ fn decide(
                     format!("link {shown} -> {want}"),
                     post,
                 )),
+                // An exact link to a file that no ledger entry mentions: ownership is recorded
+                // and nothing is written. A link to a directory is never adopted.
+                (
+                    Node::Link {
+                        target,
+                        to: LinkTo::File,
+                        ..
+                    },
+                    _,
+                ) if target == want && unowned => Ok((
+                    Action::Adopt,
+                    Status::Planned,
+                    Ownership::UnrecordedCurrent,
+                    format!("adopt {shown}: record the existing link -> {want}, write nothing"),
+                    post,
+                )),
                 (Node::Link { target, .. }, o) if target == want => Ok((
                     Action::None,
                     Status::Current,
@@ -1162,6 +1181,14 @@ fn decide(
                 (_, Ownership::Unverifiable) => {
                     Err(conflict("has an owner the manager cannot verify"))
                 }
+                (Node::File { .. }, _) => Err(fail(
+                    Code::Conflict,
+                    "target",
+                    format!(
+                        "{path} is a regular file, not the link -> {want} this resource would create; the manager adopts only an exact existing link"
+                    ),
+                    "move the file aside, or replace it with that link by hand",
+                )),
                 _ => Err(conflict(
                     "exists and no ledger entry says this resource owns it",
                 )),

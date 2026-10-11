@@ -78,6 +78,9 @@ pub struct Run<'a> {
     /// Operation ids the caller approved as disruptive (`--allow-disruptive`). The set must
     /// equal the set of planned removals: the plan determines it.
     pub allow: &'a BTreeSet<String>,
+    /// Operation ids the caller approved as adoptions (`--allow-adopt`). The set must equal the
+    /// set of planned adoptions.
+    pub allow_adopt: &'a BTreeSet<String>,
     pub fail: &'a Fail,
 }
 
@@ -95,6 +98,8 @@ pub struct Report {
 pub struct Gates {
     /// Ids of the planned removals, in plan order. Each needs `--allow-disruptive <id>`.
     pub removals: Vec<String>,
+    /// Ids of the planned adoptions, in plan order. Each needs `--allow-adopt <id>`.
+    pub adoptions: Vec<String>,
     /// The first gate that refuses the plan (a blocker, a malformed plan, a file with no
     /// generator, a sensitive output), if any.
     pub refusal: Option<Refusal>,
@@ -153,12 +158,21 @@ fn is_file_action(a: Action) -> bool {
     matches!(a, Action::CreateFile | Action::UpdateFile)
 }
 
-/// `--allow-disruptive '<id>'`, quoted so a user can paste it into a shell.
-pub fn allow_flag(id: &str) -> String {
+fn quoted_flag(flag: &str, id: &str) -> String {
     format!(
-        "--allow-disruptive '{}'",
+        "{flag} '{}'",
         dfm_model::display::visible(id).replace('\'', "'\\''")
     )
+}
+
+/// `--allow-disruptive '<id>'`, quoted so a user can paste it into a shell.
+pub fn allow_flag(id: &str) -> String {
+    quoted_flag("--allow-disruptive", id)
+}
+
+/// `--allow-adopt '<id>'`, quoted so a user can paste it into a shell.
+pub fn adopt_flag(id: &str) -> String {
+    quoted_flag("--allow-adopt", id)
 }
 
 /// A link target must lie inside the root of the operation's own source: the root whose
@@ -189,8 +203,15 @@ pub fn gates(plan: &Plan, generator: &dyn Generator) -> Gates {
         .filter(|o| o.status == PlanStatus::Planned && o.action == Action::Remove)
         .map(|o| o.id.clone())
         .collect();
+    let adoptions = plan
+        .operations
+        .iter()
+        .filter(|o| o.status == PlanStatus::Planned && o.action == Action::Adopt)
+        .map(|o| o.id.clone())
+        .collect();
     Gates {
         removals,
+        adoptions,
         refusal: first_refusal(plan, generator).err(),
     }
 }
@@ -239,7 +260,7 @@ fn first_refusal(plan: &Plan, generator: &dyn Generator) -> Result<(), Refusal> 
             ));
         }
         match op.action {
-            Action::CreateLink | Action::ReplaceLink => {
+            Action::CreateLink | Action::ReplaceLink | Action::Adopt => {
                 let link = op
                     .link
                     .as_deref()
@@ -274,24 +295,54 @@ fn first_refusal(plan: &Plan, generator: &dyn Generator) -> Result<(), Refusal> 
 /// The allowances must equal the planned removals: an id that names no removal is a usage
 /// error, and every removal needs its own id. The message lists every missing id as a flag.
 pub fn check_allow(removals: &[String], allow: &BTreeSet<String>) -> Result<(), Refusal> {
-    if let Some(bad) = allow.iter().find(|a| !removals.contains(a)) {
+    check_set(
+        removals,
+        allow,
+        "--allow-disruptive",
+        "removal",
+        Code::DisruptiveUnapproved,
+        allow_flag,
+    )
+}
+
+/// The same rule for adoptions: the allowances must equal the planned adoptions.
+pub fn check_allow_adopt(adoptions: &[String], allow: &BTreeSet<String>) -> Result<(), Refusal> {
+    check_set(
+        adoptions,
+        allow,
+        "--allow-adopt",
+        "adoption",
+        Code::AdoptUnapproved,
+        adopt_flag,
+    )
+}
+
+fn check_set(
+    planned: &[String],
+    allow: &BTreeSet<String>,
+    flag: &str,
+    noun: &str,
+    unapproved: Code,
+    spell: fn(&str) -> String,
+) -> Result<(), Refusal> {
+    if let Some(bad) = allow.iter().find(|a| !planned.contains(a)) {
         return Err(Refusal::new(
             Code::Usage,
-            format!("--allow-disruptive {bad} names no removal in this plan"),
+            format!("{flag} {bad} names no {noun} in this plan"),
         ));
     }
-    let missing: Vec<String> = removals
+    let missing: Vec<String> = planned
         .iter()
         .filter(|id| !allow.contains(*id))
-        .map(|id| allow_flag(id))
+        .map(|id| spell(id))
         .collect();
     if missing.is_empty() {
         return Ok(());
     }
     Err(Refusal::new(
-        Code::DisruptiveUnapproved,
+        unapproved,
         format!(
-            "{} removal(s) need approval. Add: {}",
+            "{} {noun}(s) need approval. Add: {}",
             missing.len(),
             missing.join(" ")
         ),
@@ -369,6 +420,7 @@ fn step_name(op: &Operation) -> &'static str {
         Action::CreateFile => "create-file",
         Action::UpdateFile => "update-file",
         Action::Remove => "remove",
+        Action::Adopt => "adopt",
         Action::None => "none",
     }
 }
@@ -553,7 +605,9 @@ impl Exec<'_, '_> {
                 }
             }
             (Action::Remove, Peek::File { .. } | Peek::Link { .. }) => {}
-            (Action::ReplaceLink | Action::UpdateFile | Action::Remove, _) => {
+            (Action::Adopt, Peek::Link { target, .. })
+                if Some(target.as_str()) == op.link.as_deref() => {}
+            (Action::ReplaceLink | Action::UpdateFile | Action::Remove | Action::Adopt, _) => {
                 return Err(appeared(
                     "is no longer the entry the plan found; it is left alone",
                 ));
@@ -576,7 +630,12 @@ impl Exec<'_, '_> {
         };
         let new_fp = match (&bytes, op.link.as_deref()) {
             (Some(b), _) => Some(sha256_hex(b)),
-            (None, Some(l)) if matches!(op.action, Action::CreateLink | Action::ReplaceLink) => {
+            (None, Some(l))
+                if matches!(
+                    op.action,
+                    Action::CreateLink | Action::ReplaceLink | Action::Adopt
+                ) =>
+            {
                 Some(link_fingerprint(l))
             }
             _ => None,
@@ -637,8 +696,11 @@ impl Exec<'_, '_> {
             op.action,
             Action::CreateLink | Action::ReplaceLink | Action::CreateFile | Action::UpdateFile
         );
+        // An adoption records ownership of an output that was already there. Nothing was
+        // published, so no consumer reload state is recorded for it.
+        let records = published || op.action == Action::Adopt;
         if let Err(e) =
-            self.settle_outcome(op, &id, &abs, published, bytes.is_some(), new_fp.as_deref())
+            self.settle_outcome(op, &id, &abs, records, bytes.is_some(), new_fp.as_deref())
         {
             return Err(self.after_intent(e, &id, &abs));
         }
@@ -649,7 +711,7 @@ impl Exec<'_, '_> {
                 _ => facts.ledger_fp.clone(),
             },
             after: new_fp,
-            owned: if published { vec![abs] } else { Vec::new() },
+            owned: if records { vec![abs] } else { Vec::new() },
             reload: published.then(|| RELOAD_NOT_ATTEMPTED.to_string()),
         })
     }
@@ -660,7 +722,7 @@ impl Exec<'_, '_> {
         op: &Operation,
         id: &str,
         abs: &str,
-        published: bool,
+        records: bool,
         generated: bool,
         new_fp: Option<&str>,
     ) -> Result<(), Refusal> {
@@ -668,7 +730,7 @@ impl Exec<'_, '_> {
         self.run.fail.hit("apply-after-done")?;
         match op.action {
             Action::Remove => self.forget_output(op, id, abs),
-            _ if published => {
+            _ if records => {
                 let mode = if generated {
                     op.mode.unwrap_or(0o600)
                 } else {
@@ -732,6 +794,8 @@ impl Exec<'_, '_> {
                 )?;
             }
             Action::Remove => removed = Some(self.remove(op, abs, parent, name, live)?),
+            // Nothing is written: the leaf must still be the exact link the plan found.
+            Action::Adopt => self.still_exact_link(op, abs, parent, name)?,
             Action::None => return Err(plan_invalid("no action")),
         }
         fail.hit("apply-after-effect")?;
@@ -742,6 +806,7 @@ impl Exec<'_, '_> {
             )
         };
         match (op.action, parent.peek(sys, name)?) {
+            (Action::Adopt, _) => self.still_exact_link(op, abs, parent, name)?,
             (Action::CreateDir, Peek::Dir { .. }) | (Action::Remove, Peek::Missing) => {}
             (Action::CreateLink | Action::ReplaceLink, Peek::Link { target, .. })
                 if Some(target.as_str()) == op.link.as_deref() => {}
@@ -759,6 +824,27 @@ impl Exec<'_, '_> {
             _ => return Err(bad("the entry is not what was published")),
         }
         Ok(removed)
+    }
+
+    /// The adoption check, made before the effect step and again after it, immediately before
+    /// the outcome entry and the ledger write: the leaf is still a link with the planned text.
+    /// A change is a conflict. The entry is left alone and no ledger entry is written.
+    fn still_exact_link(
+        &self,
+        op: &Operation,
+        abs: &str,
+        parent: &Dir,
+        name: &str,
+    ) -> Result<(), Refusal> {
+        match parent.peek(&self.run.sys, name)? {
+            Peek::Link { target, .. } if Some(target.as_str()) == op.link.as_deref() => Ok(()),
+            _ => Err(Refusal::new(
+                Code::Conflict,
+                format!(
+                    "{abs} is no longer the link the plan found; it is left alone and not adopted"
+                ),
+            )),
+        }
     }
 
     /// Deletes one owned output. Authorization is decided again here, with the ledger read now
@@ -956,7 +1042,7 @@ impl Exec<'_, '_> {
             ("remove", _) if fp.is_some() && fp == out.expected_sha256 => Probe::NotDone,
             ("create-dir", Peek::Dir { .. }) => Probe::Done,
             (_, Peek::Missing) => Probe::NotDone,
-            ("create-link" | "replace-link" | "create-file" | "update-file", _)
+            ("create-link" | "replace-link" | "create-file" | "update-file" | "adopt", _)
                 if fp.is_some() && fp == out.expected_sha256 =>
             {
                 Probe::Done
@@ -1058,6 +1144,7 @@ pub fn apply(run: &Run<'_>, plan: &Plan) -> Result<Report, Refusal> {
         return Err(r);
     }
     check_allow(&g.removals, run.allow)?;
+    check_allow_adopt(&g.adoptions, run.allow_adopt)?;
     check_journal_capacity(run.store.journal_len()?, plan)?;
     Ok(execute(run, plan))
 }

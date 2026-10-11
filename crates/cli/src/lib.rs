@@ -36,6 +36,7 @@ usage:
   dotfiles-manager doctor --root <dir> [--json]
   dotfiles-manager status --root <dir> [--json]
   dotfiles-manager apply --root <dir> [--preview] [--yes-plan <digest>] [--allow-disruptive <operation-id>]...
+                               [--allow-adopt <operation-id>]...
   dotfiles-manager self-check --build-controls <staged tree>
   dotfiles-manager self-check --fixture-dir <dir>
 
@@ -63,6 +64,8 @@ See docs/doctor.md.
 apply plans again, prints the plan and exits 3 (E_APPROVAL_REQUIRED) unless --yes-plan carries the
 digest of that exact plan. Then it publishes file links and removes previously owned outputs,
 journals each step and writes a receipt. A removal also needs --allow-disruptive <operation-id>.
+An existing link that is exactly the planned link is adopted (ownership is recorded, nothing is
+written) only with --allow-adopt <operation-id>.
 --preview prints the plan and its digest and changes nothing.
 
 exit codes: 0 ok, 1 failed, 2 usage, 3 blocked before mutation, 4 declined,

@@ -160,6 +160,9 @@ pub enum Action {
     /// Remove an output the ledger proves this manager wrote and nothing selects any more.
     /// Apply (DFM-18) executes it after re-checking the fingerprint precondition.
     Remove,
+    /// Record ownership of an existing link that is exactly the link the resource would create.
+    /// Apply writes nothing to HOME for it and needs `--allow-adopt <operation-id>`.
+    Adopt,
     /// Nothing to do, or out of scope.
     None,
 }

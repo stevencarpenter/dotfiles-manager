@@ -642,6 +642,93 @@ fn the_plan_records_identities_ownership_privilege_and_conditions() {
     );
 }
 
+// ---- DFM-45: adoption of an exact existing link --------------------------------------------
+
+/// The link text `core.ssh` would publish, taken from a plan made before the leaf exists.
+fn ssh_link(e: &Env) -> String {
+    let (_, s) = e.saved();
+    op(&s, "core.ssh@.ssh/config").link.clone().unwrap()
+}
+
+#[test]
+fn an_exact_unowned_link_is_planned_as_an_adoption_with_a_leaf_and_ledger_precondition() {
+    let e = Env::personal();
+    let (_, before) = e.saved();
+    let link = ssh_link(&e);
+    e.mkdirs(".ssh");
+    symlink(&link, e.h(".ssh/config")).unwrap();
+    let (o, s) = e.saved();
+    assert_eq!(code(&o), 0, "{}", text(&o.stdout));
+    let a = op(&s, "core.ssh@.ssh/config");
+    assert_eq!((a.action, a.status), (Action::Adopt, Status::Planned));
+    assert_eq!(a.ownership, Ownership::UnrecordedCurrent);
+    assert_eq!(a.link.as_deref(), Some(link.as_str()));
+    assert!(a.after.is_empty(), "{:?}", a.after);
+    let pre = |subject: &str| {
+        a.preconditions
+            .iter()
+            .find(|p| p.subject == subject)
+            .map(|p| p.state.clone())
+    };
+    assert_eq!(pre("path:.ssh/config"), Some(format!("link:{link}:file")));
+    assert_eq!(pre("ledger:.ssh/config").as_deref(), Some("none"));
+    // The new action is part of the plan digest and the saved form accepts it.
+    assert_ne!(s.plan_digest, before.plan_digest);
+    let bytes = s.to_json().unwrap();
+    let back = Saved::parse(&bytes).unwrap();
+    assert_eq!(back.plan, s.plan);
+    assert!(text(&bytes).contains("\"action\":\"adopt\""));
+    // The human form says what happens.
+    let t = text(&e.plan(&[]).stdout);
+    assert!(
+        t.contains("adopt .ssh/config: record the existing link"),
+        "{t}"
+    );
+}
+
+#[test]
+fn a_change_of_an_adoption_leaf_makes_the_saved_plan_stale() {
+    let e = Env::personal();
+    let link = ssh_link(&e);
+    e.mkdirs(".ssh");
+    symlink(&link, e.h(".ssh/config")).unwrap();
+    let (f, _) = save(&e);
+    fs::remove_file(e.h(".ssh/config")).unwrap();
+    symlink("/somewhere/else", e.h(".ssh/config")).unwrap();
+    let o = against(&e, &f);
+    assert_eq!(code(&o), 3, "{}{}", text(&o.stdout), text(&o.stderr));
+    assert!(
+        text(&o.stderr).contains("E_PLAN_STALE"),
+        "{}",
+        text(&o.stderr)
+    );
+}
+
+#[test]
+fn a_regular_file_at_a_link_target_is_a_conflict_that_names_the_file_and_the_fix() {
+    let e = Env::personal();
+    let link = ssh_link(&e);
+    e.mkdirs(".ssh");
+    // The content does not matter: a file is not the link the resource creates.
+    let source = fs::read(e.src("base/modules/core/files/ssh_config")).unwrap();
+    fs::write(e.h(".ssh/config"), source).unwrap();
+    let s = expect_blocked(
+        &e,
+        "E_CONFLICT",
+        "core.ssh",
+        ".ssh/config",
+        &format!(
+            ".ssh/config is a regular file, not the link -> {} this resource would create; the manager adopts only an exact existing link",
+            link
+        ),
+    );
+    assert_eq!(
+        s.plan.blockers[0].correction,
+        "move the file aside, or replace it with that link by hand"
+    );
+    assert!(op(&s, "core.ssh@.ssh/config").action != Action::Adopt);
+}
+
 // ---- C06/C07: stale plans ----------------------------------------------------------------
 
 fn save(e: &Env) -> (PathBuf, Saved) {
