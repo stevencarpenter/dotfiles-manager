@@ -2,7 +2,7 @@
 //! it never touches the filesystem. Paths are `/`-separated and relative to the snapshot root.
 //! Symlinks are kept as entries so containment can be decided without following the real ones.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Entry {
@@ -16,6 +16,11 @@ pub struct SourceSet {
     /// Lowercased path to the spellings that fold to it. A case-insensitive filesystem resolves
     /// `Files/Link` and `files/link` to one entry, so lookups go through this index.
     folded: BTreeMap<String, Vec<String>>,
+    /// The bundle's `[sources]` declaration when the loader read only part of the root.
+    scope: Option<SourceScope>,
+    /// Folded paths of excluded entries that exist on disk and were not read. A directory source
+    /// that holds some is not fully hashed.
+    pruned: BTreeSet<String>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -33,6 +38,8 @@ pub(crate) enum LocateFault {
     Loop,
     /// Two entries differ only by case, so a case-insensitive filesystem cannot tell them apart.
     CaseAlias,
+    /// The loader did not read this path because the bundle's `[sources]` leaves it out.
+    Scope(ScopeFault),
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -43,11 +50,39 @@ pub(crate) enum Located<'a> {
 
 const MAX_HOPS: usize = 40;
 
+use super::scope::{ScopeFault, SourceScope};
 use crate::fold::fold;
 
 impl SourceSet {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Records that only the parts of the root named by `scope` were loaded. Path lookups then
+    /// refuse a path outside them as an escape instead of reporting it missing.
+    pub fn set_scope(&mut self, scope: Option<SourceScope>) {
+        self.scope = scope;
+    }
+
+    pub(crate) fn scope(&self) -> Option<&SourceScope> {
+        self.scope.as_ref()
+    }
+
+    /// Records an excluded entry that exists but was left unread.
+    pub fn record_pruned(&mut self, path: &str) {
+        self.pruned.insert(fold(path));
+    }
+
+    /// Excluded entries at or below `dir` that were left unread.
+    pub fn pruned_under(&self, dir: &str) -> usize {
+        let dir = fold(dir);
+        let prefix = format!("{dir}/");
+        usize::from(self.pruned.contains(&dir))
+            + self
+                .pruned
+                .range(prefix.clone()..)
+                .take_while(|k| k.starts_with(&prefix))
+                .count()
     }
 
     fn insert(&mut self, path: String, entry: Entry) {
@@ -141,6 +176,13 @@ impl SourceSet {
                 }
                 _ => resolved.push(c),
             }
+            if let Some(f) = self
+                .scope
+                .as_ref()
+                .and_then(|s| s.fault(&resolved.join("/")))
+            {
+                return Err(LocateFault::Scope(f));
+            }
             match self.entry_at(&resolved.join("/"))? {
                 Some((_, Entry::Link(target))) => {
                     hops += 1;
@@ -173,7 +215,13 @@ impl SourceSet {
                 bytes,
             }),
             Some((_, Entry::Link(_))) => Err(LocateFault::Missing),
-            None if self.is_dir(&cur) => Ok(Located::Dir { path: cur }),
+            None if self.is_dir(&cur) => match &self.scope {
+                // Only a root and its subtree were loaded whole. A directory above a root, the
+                // bundle directory or a subdirectory beside the bundle holds loaded files in
+                // part, so a source that names it would publish unchecked content.
+                Some(sc) if !sc.holds_dir(&cur) => Err(LocateFault::Scope(sc.outside(&cur))),
+                _ => Ok(Located::Dir { path: cur }),
+            },
             None => Err(LocateFault::Missing),
         }
     }
@@ -291,5 +339,48 @@ mod tests {
         assert_eq!(s.locate("m/files/loop1", "m"), Err(LocateFault::Loop));
         assert_eq!(s.locate("m/files/dangling", "m"), Err(LocateFault::Missing));
         assert_eq!(s.locate("m/files/none", "m"), Err(LocateFault::Missing));
+    }
+
+    #[test]
+    fn a_directory_link_to_an_ancestor_of_a_root_is_an_escape() {
+        let t: toml::Table = "roots = [\"m/files/sub\"]".parse().unwrap();
+        let scope = SourceScope::parse("m/bundle.toml", &toml::Value::Table(t)).unwrap();
+        let mut s = SourceSet::new();
+        s.insert_file("m/files/sub/a", "A");
+        s.insert_file("m/files/other", "O");
+        s.set_scope(Some(scope));
+        assert!(matches!(
+            s.locate("m/files/sub", "m"),
+            Ok(Located::Dir { .. })
+        ));
+        assert!(matches!(
+            s.locate("m/files/sub/a", "m"),
+            Ok(Located::File { .. })
+        ));
+        for dir in ["m/files", "m"] {
+            assert!(
+                matches!(
+                    s.locate(dir, "m"),
+                    Err(LocateFault::Scope(ScopeFault::Outside { .. }))
+                ),
+                "{dir}"
+            );
+        }
+        // A file that no root holds and that is not beside the bundle is outside too.
+        assert!(matches!(
+            s.locate("m/files/other", "m"),
+            Err(LocateFault::Scope(ScopeFault::Outside { .. }))
+        ));
+    }
+
+    #[test]
+    fn pruned_entries_are_counted_below_a_directory_without_regard_to_case() {
+        let mut s = SourceSet::new();
+        s.record_pruned("d/.venv");
+        s.record_pruned("D/node_modules");
+        s.record_pruned("d2/x");
+        assert_eq!(s.pruned_under("d"), 2);
+        assert_eq!(s.pruned_under("d/.VENV"), 1);
+        assert_eq!(s.pruned_under("d3"), 0);
     }
 }

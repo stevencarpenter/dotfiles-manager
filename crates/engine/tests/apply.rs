@@ -122,6 +122,7 @@ fn op(h: &Home, store: &Store, id: &str, n: u32, action: Action, rel: &str) -> O
         managed_sha256: None,
         takeover: false,
         output_bytes: None,
+        excluded: None,
         sets: vec![],
         after: vec![],
         preconditions: pre,

@@ -10,6 +10,7 @@ use super::docs::{
 use super::error::{ResolveError, category};
 use super::pointer;
 use super::schema::{self, AdapterCatalog, AdapterSpec, Claims, Fault, Found, Include, TargetRule};
+use super::scope::ScopeFault;
 use super::source::{self, LocateFault, Located, PathFault, SourceSet};
 use super::{
     ChangeKind, DirClaim, IncludeEntry, IncludeGroup, Provenance, Resolved, ResolvedResource,
@@ -122,6 +123,18 @@ fn locate_error(from: &str, field: &str, f: LocateFault) -> ResolveError {
             "symlinks in the path form a loop or are nested too deeply",
             "remove the link loop",
         ),
+        LocateFault::Scope(ScopeFault::Excluded { pattern, path }) => ResolveError::new(
+            Code::SourceEscape,
+            from,
+            format!("`{path}` is excluded from the loaded sources by `{pattern}`"),
+            format!("point the source outside `{pattern}`, or narrow `[sources].exclude` in the bundle"),
+        ),
+        LocateFault::Scope(ScopeFault::Outside { roots, path }) => ResolveError::new(
+            Code::SourceEscape,
+            from,
+            format!("`{path}` is outside the declared source roots ({roots})"),
+            format!("point the source into a declared root ({roots}), or add a root that holds it to `[sources].roots` in the bundle"),
+        ),
         LocateFault::CaseAlias => ResolveError::new(
             Code::SourceEscape,
             from,
@@ -171,6 +184,7 @@ pub(crate) fn resolve(
     let (pfile, pbytes) = l.read_path(profile_path, "profile", profile_path, "")?;
     let profile = docs::profile(&pfile, pbytes)?;
     let chain = bundle_chain(&l, &profile)?;
+    check_scope(sources, &chain[0])?;
     let catalogue = catalogue(&chain)?;
     let modules = load_modules(&l, &chain, &catalogue, &profile)?;
 
@@ -221,6 +235,32 @@ pub(crate) fn resolve(
     })
 }
 
+/// The loader decides what to read from the bundle it found before resolution. The resolver
+/// must have reached the same bundle, or the scope would not describe what was loaded.
+fn check_scope(sources: &SourceSet, leaf: &BundleDoc) -> Result<(), ResolveError> {
+    let loaded = sources.scope();
+    if loaded == leaf.sources.as_ref() {
+        return Ok(());
+    }
+    let named = |s: Option<&super::scope::SourceScope>| {
+        s.map_or("no bundle with [sources]".to_string(), |s| {
+            format!("`{}`", s.file())
+        })
+    };
+    Err(ResolveError::new(
+        Code::ManifestInvalid,
+        &leaf.file,
+        format!(
+            "the loader read {} but the profile resolves to `{}` with {}",
+            named(loaded),
+            leaf.file,
+            named(leaf.sources.as_ref())
+        ),
+        "name the bundle without `..` after a link, so the loader and the resolver reach the same file",
+    )
+    .field("/bundle"))
+}
+
 fn bundle_chain(l: &Loaded, profile: &ProfileDoc) -> Result<Vec<BundleDoc>, ResolveError> {
     let mut chain: Vec<BundleDoc> = Vec::new();
     let mut seen: BTreeSet<String> = BTreeSet::new();
@@ -257,6 +297,15 @@ fn bundle_chain(l: &Loaded, profile: &ProfileDoc) -> Result<Vec<BundleDoc>, Reso
             )
             .field("/id")
             .conflicts_with(prev.file.clone()));
+        }
+        if !chain.is_empty() && b.sources.is_some() {
+            return Err(ResolveError::new(
+                Code::ManifestInvalid,
+                &path,
+                "an extended bundle declares `[sources]`; only the bundle the profile names may",
+                "move `[sources]` to the bundle the profile names",
+            )
+            .field("/sources"));
         }
         let next = b.extends.clone();
         chain.push(b);

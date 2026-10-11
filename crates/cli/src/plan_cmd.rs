@@ -177,7 +177,17 @@ pub fn plan_for(ctx: &Ctx, loaded: &Loaded) -> Result<Plan, Refusal> {
     let mut plan = plan::build(&loaded.resolved, &cx, &obs)?;
     // Generated output hashes (architecture section 9 item 1), from the same adapters apply runs.
     crate::adapters::plan_outputs(&mut plan, &loaded.resolved, &sys, &home);
+    mark_excluded(&mut plan, &loaded.sources);
     Ok(plan)
+}
+
+/// Marks each operation whose directory source holds entries that `[sources].exclude` left
+/// unread. Such a directory is published whole on apply, but the plan hashed only what was read.
+fn mark_excluded(plan: &mut Plan, sources: &dfm_model::resolve::SourceSet) {
+    for o in &mut plan.operations {
+        let n: usize = o.inputs.iter().map(|i| sources.pruned_under(&i.path)).sum();
+        o.excluded = u64::try_from(n).ok().filter(|n| *n > 0);
+    }
 }
 
 pub(crate) fn render(p: &Plan, digest: &str, out: &mut dyn Write) -> std::io::Result<()> {
@@ -221,6 +231,9 @@ pub(crate) fn render(p: &Plan, digest: &str, out: &mut dyn Write) -> std::io::Re
         }
         if !o.sets.is_empty() {
             writeln!(out, "    sets: {}", visible(&o.sets.join(", ")))?;
+        }
+        if let Some(n) = o.excluded {
+            writeln!(out, "    note: contains {n} excluded entries, not hashed")?;
         }
     }
     for b in &p.blockers {
