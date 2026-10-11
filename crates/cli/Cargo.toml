@@ -52,5 +52,9 @@ required-features = ["test-isolation"]
 name = "apply"
 required-features = ["test-isolation"]
 
+[[test]]
+name = "doctor"
+required-features = ["test-isolation"]
+
 [lints]
 workspace = true
