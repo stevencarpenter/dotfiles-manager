@@ -6,8 +6,10 @@ mod common;
 use common::{BUNDLE, Fx, code, is_root, text};
 use dfm_model::plan::Saved;
 use std::fs;
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 const JUNK_IGNORED: &str = "**/.venv";
 const PLUGINS: &str = "base/modules/core/files/plugins";
@@ -203,12 +205,6 @@ fn the_digest_follows_loaded_files_and_ignores_excluded_ones() {
     // A file outside every root is not loaded either.
     fx.put("outside/readme", "x");
     assert_eq!(tree(&fx), t1);
-    // Changing the declaration changes the digest.
-    fx.put(
-        "base/bundle.toml",
-        &format!("{BUNDLE}\n[sources]\nroots = [\"base\", \"profiles\"]\n"),
-    );
-    assert_ne!(tree(&fx), t1);
 }
 
 struct Restore(PathBuf, u32);
@@ -220,7 +216,7 @@ impl Drop for Restore {
 }
 
 #[test]
-fn an_excluded_path_is_never_opened_or_listed() {
+fn an_excluded_path_is_never_opened_or_listed_by_a_non_root_user() {
     if is_root() {
         return;
     }
@@ -247,6 +243,13 @@ fn an_excluded_path_is_never_opened_or_listed() {
     let _c = Restore(f.clone(), 0o644);
     fs::set_permissions(&f, fs::Permissions::from_mode(0o000)).unwrap();
     assert_eq!(code(&plan(&bare)), 2);
+    // The same for a directory: listing it fails for a non-root user.
+    let dir_fx = scoped(r#""base", "profiles""#, "");
+    dir_fx.put("base/modules/core/files/vault/inside", "x");
+    let d = dir_fx.root.join("base/modules/core/files/vault");
+    let _d = Restore(d.clone(), 0o755);
+    fs::set_permissions(&d, fs::Permissions::from_mode(0o000)).unwrap();
+    assert_eq!(code(&plan(&dir_fx)), 2);
 }
 
 #[test]
@@ -290,7 +293,7 @@ fn only_the_bundle_the_profile_names_may_declare_sources() {
 }
 
 #[test]
-fn an_invalid_declaration_is_refused_before_any_load() {
+fn an_invalid_declaration_is_manifest_invalid_with_exit_3() {
     for body in [
         "roots = []",
         "roots = [\"../x\"]",
@@ -306,4 +309,233 @@ fn an_invalid_declaration_is_refused_before_any_load() {
         assert_eq!(code(&o), 3, "{body}: {}", text(&o.stderr));
         assert!(text(&o.stderr).contains("E_MANIFEST_INVALID"), "{body}");
     }
+}
+
+fn mkfifo(path: &Path) {
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    assert!(
+        Command::new("/usr/bin/mkfifo")
+            .arg(path)
+            .status()
+            .unwrap()
+            .success()
+    );
+}
+
+#[test]
+fn an_excluded_special_file_is_skipped_and_an_unexcluded_one_is_refused() {
+    // Works for root too: no permission bit is involved.
+    let fx = scoped(r#""base", "profiles""#, r#""**/pipe""#);
+    mkfifo(&fx.root.join("base/modules/core/files/pipe"));
+    assert_eq!(code(&plan(&fx)), 0);
+    let bare = scoped(r#""base", "profiles""#, "");
+    mkfifo(&bare.root.join("base/modules/core/files/pipe"));
+    let o = plan(&bare);
+    assert_eq!(code(&o), 3);
+    assert!(
+        text(&o.stderr).contains("E_SOURCE_UNTRUSTED"),
+        "{}",
+        text(&o.stderr)
+    );
+}
+
+#[test]
+fn an_excluded_entry_with_a_control_or_non_utf8_name_does_not_abort_the_load() {
+    let fx = scoped(r#""base", "profiles""#, r#""**/bad*""#);
+    fx.put("base/modules/core/files/bad\u{1}name", "x");
+    // APFS refuses a non-UTF-8 name; where the filesystem allows one, it must be skipped too.
+    let raw = fx
+        .root
+        .join("base/modules/core/files")
+        .join(std::ffi::OsStr::from_bytes(b"bad\xff"));
+    let _ = fs::write(raw, "x");
+    assert_eq!(code(&plan(&fx)), 0, "{}", text(&plan(&fx).stderr));
+    let bare = scoped(r#""base", "profiles""#, "");
+    bare.put("base/modules/core/files/bad\u{1}name", "x");
+    let o = plan(&bare);
+    assert_eq!(code(&o), 3);
+    assert!(
+        text(&o.stderr).contains("E_SOURCE_UNTRUSTED"),
+        "{}",
+        text(&o.stderr)
+    );
+}
+
+#[test]
+fn editing_only_the_sources_table_changes_the_digest() {
+    let fx = scoped(r#""base", "profiles""#, r#""**/never-matches""#);
+    let t0 = tree(&fx);
+    fx.put(
+        "base/bundle.toml",
+        &format!(
+            "{BUNDLE}\n[sources]\nroots = [\"base\", \"profiles\"]\nexclude = [\"**/also-never-matches\"]\n"
+        ),
+    );
+    assert_ne!(tree(&fx), t0);
+}
+
+const PLUGS: &str = r#"
+[[resources]]
+id = "plugs"
+kind = "link"
+adapter = "fs-link/v1"
+target = ".config/plugs"
+[resources.value]
+source = "files/plugdir"
+"#;
+
+fn with_plugs(fx: &Fx) {
+    let m = fs::read_to_string(fx.root.join("base/modules/extra/module.toml")).unwrap();
+    fx.put("base/modules/extra/module.toml", &format!("{m}{PLUGS}"));
+    fx.put("base/modules/extra/files/plugdir/keep", "k");
+    fx.put("base/modules/extra/files/plugdir/.venv/lib", "x");
+    fx.put("base/modules/extra/files/plugdir/node_modules/m", "x");
+}
+
+#[test]
+fn a_directory_link_with_excluded_content_is_noted_and_counted() {
+    let fx = scoped(r#""base", "profiles""#, r#""**/.venv", "**/node_modules""#);
+    with_plugs(&fx);
+    let o = plan(&fx);
+    assert_eq!(code(&o), 0, "{}", text(&o.stderr));
+    let out = text(&o.stdout);
+    assert_eq!(
+        out.matches("note: contains 2 excluded entries, not hashed")
+            .count(),
+        1,
+        "{out}"
+    );
+    let o = fx.run(&["plan", "--root", fx.root_arg(), "--json"]);
+    let s = Saved::parse(&o.stdout).unwrap();
+    let ops: Vec<_> = s
+        .plan
+        .operations
+        .iter()
+        .filter(|o| o.excluded.is_some())
+        .collect();
+    assert_eq!(ops.len(), 1);
+    assert_eq!(ops[0].resource, "extra.plugs");
+    assert_eq!(ops[0].excluded, Some(2));
+    // A plan with nothing pruned has no note and no field.
+    let plain = scoped(r#""base", "profiles""#, "");
+    let o = plan(&plain);
+    assert!(!text(&o.stdout).contains("note:"));
+}
+
+#[test]
+fn a_link_hop_into_an_excluded_path_is_refused() {
+    let fx = scoped(r#""base", "profiles""#, &format!(r#""{JUNK_IGNORED}""#));
+    fx.put(
+        "base/modules/extra/files/.venv/tmux.conf",
+        "set -g mouse on\n",
+    );
+    symlink(
+        ".venv/tmux.conf",
+        fx.root.join("base/modules/extra/files/hop"),
+    )
+    .unwrap();
+    let m = fs::read_to_string(fx.root.join("base/modules/extra/module.toml")).unwrap();
+    fx.put(
+        "base/modules/extra/module.toml",
+        &m.replace("files/tmux.conf", "files/hop"),
+    );
+    let o = plan(&fx);
+    let err = text(&o.stderr);
+    assert_eq!(code(&o), 3, "{err}");
+    assert!(
+        err.contains("E_SOURCE_ESCAPE") && err.contains(JUNK_IGNORED),
+        "{err}"
+    );
+}
+
+#[test]
+fn similar_root_names_a_link_loop_and_siblings_load_independently() {
+    let fx = scoped(r#""base", "profiles", "home", "home2""#, "");
+    fx.put("home/a", "1");
+    fx.put("home2/b", "1");
+    symlink("loop2", fx.root.join("home/loop1")).unwrap();
+    symlink("loop1", fx.root.join("home/loop2")).unwrap();
+    let t0 = tree(&fx);
+    fx.put("home2/b", "2");
+    assert_ne!(tree(&fx), t0, "home2 was not loaded");
+    let t1 = tree(&fx);
+    fx.put("home3/c", "x");
+    assert_eq!(tree(&fx), t1, "home3 must not load next to home and home2");
+}
+
+#[test]
+fn a_root_below_an_unreadable_directory_reports_the_real_error() {
+    if is_root() {
+        return;
+    }
+    let fx = scoped(r#""base", "profiles", "locked/inner""#, "");
+    fx.put("locked/inner/x", "1");
+    let dir = fx.root.join("locked");
+    let _r = Restore(dir.clone(), 0o755);
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o000)).unwrap();
+    let o = plan(&fx);
+    let err = text(&o.stderr);
+    assert_eq!(code(&o), 2, "{err}");
+    assert!(
+        err.contains("E_REPORT_UNAVAILABLE") && err.contains("permission denied"),
+        "{err}"
+    );
+}
+
+#[test]
+fn the_loader_and_the_resolver_must_reach_the_same_bundle() {
+    // The loader collapses `..` lexically and reads base/bundle.toml. The resolver follows the
+    // link and reads real/bundle.toml. A scope that describes the other file must be refused.
+    let decoy = BUNDLE;
+    let fx = Fx::unbound();
+    fx.put(
+        "base/bundle.toml",
+        &format!("{BUNDLE}\n[sources]\nroots = [\"base\", \"profiles\", \"real\"]\n"),
+    );
+    fx.put("real/deep/keep", "k");
+    symlink("../real/deep", fx.root.join("base/lnk")).unwrap();
+    fx.put("real/bundle.toml", decoy);
+    let p = fs::read_to_string(fx.root.join("profiles/t-01.toml")).unwrap();
+    fx.put(
+        "profiles/t-01.toml",
+        &p.replace("../base/bundle.toml", "../base/lnk/../bundle.toml"),
+    );
+    bind(&fx);
+    let o = plan(&fx);
+    let err = text(&o.stderr);
+    assert_eq!(code(&o), 3, "{err}");
+    assert!(err.contains("E_MANIFEST_INVALID"), "{err}");
+    assert!(
+        err.contains("base/bundle.toml") && err.contains("real/bundle.toml"),
+        "{err}"
+    );
+    // The other way round: the loader found no scope, the resolved bundle declares one.
+    fx.put("base/bundle.toml", BUNDLE);
+    fx.put(
+        "real/bundle.toml",
+        &format!("{BUNDLE}\n[sources]\nroots = [\"base\", \"profiles\", \"real\"]\n"),
+    );
+    let o = plan(&fx);
+    let err = text(&o.stderr);
+    assert_eq!(code(&o), 3, "{err}");
+    assert!(
+        err.contains("E_MANIFEST_INVALID") && err.contains("real/bundle.toml"),
+        "{err}"
+    );
+}
+
+#[test]
+fn git_metadata_beside_the_bundle_is_skipped_but_below_a_root_is_refused() {
+    let fx = scoped(r#""base/modules", "profiles""#, "");
+    fx.put("base/.git/config", "[core]\n");
+    assert_eq!(code(&plan(&fx)), 0, "{}", text(&plan(&fx).stderr));
+    let held = scoped(r#""base", "profiles""#, "");
+    held.put("base/.git/config", "[core]\n");
+    let o = plan(&held);
+    assert_eq!(code(&o), 3);
+    assert!(
+        text(&o.stderr).contains("E_SOURCE_UNTRUSTED"),
+        "{}",
+        text(&o.stderr)
+    );
 }

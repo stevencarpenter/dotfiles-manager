@@ -184,6 +184,7 @@ pub(crate) fn resolve(
     let (pfile, pbytes) = l.read_path(profile_path, "profile", profile_path, "")?;
     let profile = docs::profile(&pfile, pbytes)?;
     let chain = bundle_chain(&l, &profile)?;
+    check_scope(sources, &chain[0])?;
     let catalogue = catalogue(&chain)?;
     let modules = load_modules(&l, &chain, &catalogue, &profile)?;
 
@@ -232,6 +233,32 @@ pub(crate) fn resolve(
         resources: resolved,
         includes,
     })
+}
+
+/// The loader decides what to read from the bundle it found before resolution. The resolver
+/// must have reached the same bundle, or the scope would not describe what was loaded.
+fn check_scope(sources: &SourceSet, leaf: &BundleDoc) -> Result<(), ResolveError> {
+    let loaded = sources.scope();
+    if loaded == leaf.sources.as_ref() {
+        return Ok(());
+    }
+    let named = |s: Option<&super::scope::SourceScope>| {
+        s.map_or("no bundle with [sources]".to_string(), |s| {
+            format!("`{}`", s.file())
+        })
+    };
+    Err(ResolveError::new(
+        Code::ManifestInvalid,
+        &leaf.file,
+        format!(
+            "the loader read {} but the profile resolves to `{}` with {}",
+            named(loaded),
+            leaf.file,
+            named(leaf.sources.as_ref())
+        ),
+        "name the bundle without `..` after a link, so the loader and the resolver reach the same file",
+    )
+    .field("/bundle"))
 }
 
 fn bundle_chain(l: &Loaded, profile: &ProfileDoc) -> Result<Vec<BundleDoc>, ResolveError> {

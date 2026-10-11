@@ -95,9 +95,11 @@ exclude = [
 ```
 
 - Roots and patterns are relative to `--root`. A pattern is anchored there, so `**/.venv` is the way to match a `.venv` at any depth.
-- The profile, the bundle and every module must lie inside a root, or directly beside the bundle file. Otherwise `plan` fails with `E_SOURCE_ESCAPE` and names the file.
+- The profile, the bundle and every module must lie inside a root, or be a file or link directly beside the bundle file. A subdirectory beside the bundle is read only when a root holds it. Otherwise `plan` fails with `E_SOURCE_ESCAPE` and names the file.
 - A resource source inside an excluded path fails with `E_SOURCE_ESCAPE` and names the pattern.
 - A change to `[sources]` changes the source digest, so a saved plan goes stale.
+- A link to a directory that holds excluded entries (for example a plugin directory with `.venv`) is published whole on apply. The plan shows `note: contains N excluded entries, not hashed` under that operation. Read it before you approve.
+- A root may not be excluded, may not lie below an excluded path and may not name `.git`.
 - If `plan` reports `E_LIMIT_EXCEEDED` for the entry count, the message names the three largest directories. Exclude them or narrow the roots.
 - `plan --against` for a bundle without `[sources]` behaves as before.
 

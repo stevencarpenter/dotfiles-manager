@@ -60,12 +60,6 @@ fn refusal(code: Code, detail: String) -> Refusal {
     Refusal::new(code, dfm_model::display::visible(&detail))
 }
 
-/// Reads the whole `root`, as a bundle without `[sources]` expects.
-#[cfg(test)]
-fn load_source_set(root: &Path) -> Result<SourceSet, Refusal> {
-    load(root, None)
-}
-
 /// Reads the parts of `root` that the profile's bundle declares in `[sources]`, or the whole
 /// root when it declares none. `profile` is the root-relative profile path. A profile or bundle
 /// that cannot be found here is not an error yet: the whole root is read and the resolver
@@ -73,12 +67,13 @@ fn load_source_set(root: &Path) -> Result<SourceSet, Refusal> {
 pub fn load_scoped(root: &Path, profile: &str) -> Result<SourceSet, Refusal> {
     match find_scope(root, profile)? {
         None => load(root, None),
-        Some((scope, bundle)) => load(root, Some((&scope, &bundle))),
+        Some(scope) => load(root, Some(&scope)),
     }
 }
 
-/// The `[sources]` declaration of the bundle that `profile` names, with that bundle's path.
-fn find_scope(root: &Path, profile: &str) -> Result<Option<(SourceScope, String)>, Refusal> {
+/// The `[sources]` declaration of the bundle that `profile` names. The resolver later checks
+/// that it reached the same bundle (`E_MANIFEST_INVALID` otherwise).
+fn find_scope(root: &Path, profile: &str) -> Result<Option<SourceScope>, Refusal> {
     let Ok(profile_bytes) = read_regular(&root.join(profile), profile) else {
         return Ok(None);
     };
@@ -95,12 +90,13 @@ fn find_scope(root: &Path, profile: &str) -> Result<Option<(SourceScope, String)
     let Ok(bytes) = read_regular(&real, bundle) else {
         return Ok(None);
     };
-    Ok(bundle_scope(bundle, &bytes)?.map(|s| (s, bundle.to_string())))
+    Ok(bundle_scope(bundle, &bytes)?)
 }
 
 /// Each declared root must be a real directory: no link in any component, nothing missing.
 /// Roots nested inside another root are dropped so no entry is read twice.
-fn walkable_roots(root: &Path, scope: &SourceScope, bundle: &str) -> Result<Vec<String>, Refusal> {
+fn walkable_roots(root: &Path, scope: &SourceScope) -> Result<Vec<String>, Refusal> {
+    let bundle = scope.file();
     let fault = |code, r: &str, why: &str, fix: &str| {
         refusal(
             code,
@@ -114,13 +110,22 @@ fn walkable_roots(root: &Path, scope: &SourceScope, bundle: &str) -> Result<Vec<
         let mut at = root.to_path_buf();
         for c in r.split('/') {
             at.push(c);
-            let meta = fs::symlink_metadata(&at).map_err(|_| {
-                fault(
-                    Code::ManifestInvalid,
-                    r,
-                    "does not exist",
-                    "create the directory or remove it from `roots`",
-                )
+            let meta = fs::symlink_metadata(&at).map_err(|e| {
+                if e.kind() == std::io::ErrorKind::NotFound {
+                    fault(
+                        Code::ManifestInvalid,
+                        r,
+                        "does not exist",
+                        "create the directory or remove it from `roots`",
+                    )
+                } else {
+                    fault(
+                        Code::ReportUnavailable,
+                        r,
+                        &format!("cannot be read: {}", e.kind()),
+                        "fix the permissions of the directory",
+                    )
+                }
             })?;
             if meta.file_type().is_symlink() {
                 return Err(fault(
@@ -159,60 +164,92 @@ struct State<'a> {
     scope: Option<&'a SourceScope>,
     entries: usize,
     bytes: u64,
+    pruned: usize,
     /// Where the walk starts: directory, its root-relative name, and whether it is shallow.
     starts: Vec<(PathBuf, String, bool)>,
 }
 
-/// Directories counted before the size report stops. The report lists names only and opens no
+/// Entries counted before the size report stops. The report lists names only and opens no
 /// file, but a tree can be arbitrarily large.
 const COUNT_CEILING: usize = 1_000_000;
+
+/// Excluded entries recorded for the plan note, over all loaded directories.
+const MAX_PRUNED: usize = 100_000;
+
+/// What the size report learned: direct entries per directory, how many entries it saw
+/// (stopping at the ceiling), and how many directories it could not list.
+struct Counts {
+    per_dir: BTreeMap<String, usize>,
+    seen: usize,
+    unreadable: usize,
+}
+
+/// Lists directories under the walk starts and counts direct entries. It opens no file and
+/// skips what the loader skips. It stops at `ceiling` entries.
+fn count_entries(
+    starts: &[(PathBuf, String, bool)],
+    scope: Option<&SourceScope>,
+    ceiling: usize,
+) -> Counts {
+    fn go(
+        dir: &Path,
+        rel: &str,
+        shallow: bool,
+        scope: Option<&SourceScope>,
+        ceiling: usize,
+        c: &mut Counts,
+    ) {
+        let Ok(rd) = fs::read_dir(dir) else {
+            c.unreadable += 1;
+            return;
+        };
+        for e in rd {
+            let Ok(e) = e else {
+                c.unreadable += 1;
+                continue;
+            };
+            if c.seen >= ceiling {
+                return;
+            }
+            let name = e.file_name().to_string_lossy().into_owned();
+            let path = if rel.is_empty() {
+                name.clone()
+            } else {
+                format!("{rel}/{name}")
+            };
+            if name.to_lowercase() == ".git"
+                || scope.is_some_and(|s| s.excluded_by(&path).is_some())
+            {
+                continue;
+            }
+            let is_dir = e.file_type().is_ok_and(|t| t.is_dir());
+            if shallow && is_dir {
+                continue;
+            }
+            c.seen += 1;
+            *c.per_dir.entry(rel.to_string()).or_default() += 1;
+            if is_dir {
+                go(&e.path(), &path, false, scope, ceiling, c);
+            }
+        }
+    }
+    let mut c = Counts {
+        per_dir: BTreeMap::new(),
+        seen: 0,
+        unreadable: 0,
+    };
+    for (dir, rel, shallow) in starts {
+        go(dir, rel, *shallow, scope, ceiling, &mut c);
+    }
+    c
+}
 
 impl State<'_> {
     /// The refusal for a tree over the cap. A second pass that lists directories but opens no
     /// file counts the entries per directory, so the message names the real largest ones.
     fn too_many_entries(&self) -> Refusal {
-        fn count(
-            dir: &Path,
-            rel: &str,
-            shallow: bool,
-            scope: Option<&SourceScope>,
-            seen: &mut usize,
-            per_dir: &mut BTreeMap<String, usize>,
-        ) {
-            let Ok(rd) = fs::read_dir(dir) else { return };
-            for e in rd.flatten() {
-                if *seen >= COUNT_CEILING {
-                    return;
-                }
-                let Ok(name) = e.file_name().into_string() else {
-                    continue;
-                };
-                let path = if rel.is_empty() {
-                    name.clone()
-                } else {
-                    format!("{rel}/{name}")
-                };
-                if name.to_lowercase() == ".git"
-                    || scope.is_some_and(|s| s.excluded_by(&path).is_some())
-                {
-                    continue;
-                }
-                let is_dir = e.file_type().is_ok_and(|t| t.is_dir());
-                if shallow && is_dir {
-                    continue;
-                }
-                *seen += 1;
-                *per_dir.entry(rel.to_string()).or_default() += 1;
-                if is_dir {
-                    count(&e.path(), &path, false, scope, seen, per_dir);
-                }
-            }
-        }
-        let (mut seen, mut per_dir) = (0, BTreeMap::new());
-        for (dir, rel, shallow) in &self.starts {
-            count(dir, rel, *shallow, self.scope, &mut seen, &mut per_dir);
-        }
-        let mut dirs: Vec<_> = per_dir.iter().collect();
+        let c = count_entries(&self.starts, self.scope, COUNT_CEILING);
+        let mut dirs: Vec<_> = c.per_dir.iter().collect();
         dirs.sort_by(|a, b| b.1.cmp(a.1).then(a.0.cmp(b.0)));
         let top: Vec<String> = dirs
             .iter()
@@ -222,22 +259,30 @@ impl State<'_> {
                 format!("{d} ({n} entries)")
             })
             .collect();
-        let at_least = if seen >= COUNT_CEILING {
+        let at_least = if c.seen >= COUNT_CEILING {
             "at least "
         } else {
             ""
         };
+        let unreadable = if c.unreadable > 0 {
+            format!(
+                " ({} directories could not be listed and are not counted)",
+                c.unreadable
+            )
+        } else {
+            String::new()
+        };
         refusal(
             Code::LimitExceeded,
             format!(
-                "source tree has more than {MAX_ENTRIES} entries. Largest directories ({at_least}direct entries): {}. Fix: list the trees you need in `[sources].roots`, or skip these with `[sources].exclude` in the bundle",
+                "source tree has more than {MAX_ENTRIES} entries. Largest directories ({at_least}direct entries): {}{unreadable}. Fix: list the trees you need in `[sources].roots`, or skip these with `[sources].exclude` in the bundle",
                 top.join(", ")
             ),
         )
     }
 }
 
-fn load(root: &Path, declared: Option<(&SourceScope, &str)>) -> Result<SourceSet, Refusal> {
+fn load(root: &Path, declared: Option<&SourceScope>) -> Result<SourceSet, Refusal> {
     fn io(e: std::io::Error, p: &str) -> Refusal {
         refusal(
             Code::ReportUnavailable,
@@ -252,6 +297,29 @@ fn load(root: &Path, declared: Option<(&SourceScope, &str)>) -> Result<SourceSet
             .map_err(|e| io(e, rel))?;
         names.sort_by_key(|e| e.file_name());
         for e in names {
+            // An excluded entry is skipped before its name is validated and before it is listed,
+            // opened or counted, so a name that would be refused elsewhere does not abort the load.
+            if let Some(sc) = st.scope {
+                let lossy = e.file_name().to_string_lossy().into_owned();
+                let shown = if rel.is_empty() {
+                    lossy
+                } else {
+                    format!("{rel}/{lossy}")
+                };
+                if sc.excluded_by(&shown).is_some() {
+                    st.pruned += 1;
+                    if st.pruned > MAX_PRUNED {
+                        return Err(refusal(
+                            Code::LimitExceeded,
+                            format!(
+                                "more than {MAX_PRUNED} excluded entries. Fix: exclude their parent directory instead"
+                            ),
+                        ));
+                    }
+                    st.set.record_pruned(&shown);
+                    continue;
+                }
+            }
             let name = e
                 .file_name()
                 .into_string()
@@ -267,12 +335,9 @@ fn load(root: &Path, declared: Option<(&SourceScope, &str)>) -> Result<SourceSet
             } else {
                 format!("{rel}/{name}")
             };
-            // An excluded entry is skipped before anything is opened, listed or counted.
-            if st.scope.is_some_and(|s| s.excluded_by(&path).is_some()) {
-                continue;
-            }
             if name.to_lowercase() == ".git" {
-                if rel.is_empty() {
+                // Repository metadata beside the bundle or at the top is not source content.
+                if rel.is_empty() || shallow {
                     continue;
                 }
                 return Err(refusal(
@@ -320,9 +385,10 @@ fn load(root: &Path, declared: Option<(&SourceScope, &str)>) -> Result<SourceSet
     }
     let mut st = State {
         set: SourceSet::new(),
-        scope: declared.map(|(s, _)| s),
+        scope: declared,
         entries: 0,
         bytes: 0,
+        pruned: 0,
         starts: Vec::new(),
     };
     match declared {
@@ -330,8 +396,8 @@ fn load(root: &Path, declared: Option<(&SourceScope, &str)>) -> Result<SourceSet
             st.starts.push((root.to_path_buf(), String::new(), false));
             go(root, "", &mut st, false)?;
         }
-        Some((scope, bundle)) => {
-            let roots = walkable_roots(root, scope, bundle)?;
+        Some(scope) => {
+            let roots = walkable_roots(root, scope)?;
             for r in &roots {
                 st.starts.push((root.join(r), r.clone(), false));
             }
@@ -348,7 +414,7 @@ fn load(root: &Path, declared: Option<(&SourceScope, &str)>) -> Result<SourceSet
             }
         }
     }
-    st.set.set_scope(declared.map(|(s, _)| s.clone()));
+    st.set.set_scope(declared.cloned());
     Ok(st.set)
 }
 
@@ -407,17 +473,40 @@ mod tests {
         fs::create_dir_all(d.join(".Git")).unwrap();
         fs::write(d.join(".Git/config"), "x").unwrap();
         fs::write(d.join("a"), "a").unwrap();
-        let set = load_source_set(&d).unwrap();
+        let set = load(&d, None).unwrap();
         assert_eq!(set.paths().collect::<Vec<_>>(), ["a"]);
         fs::create_dir_all(d.join("m/.GIT")).unwrap();
-        assert_eq!(load_source_set(&d).unwrap_err().code, Code::SourceUntrusted);
+        assert_eq!(load(&d, None).unwrap_err().code, Code::SourceUntrusted);
         let _ = fs::remove_dir_all(&d);
     }
 
     #[test]
     fn unreadable_roots_are_report_unavailable_with_exit_2() {
-        let e = load_source_set(Path::new("/nonexistent-dfm-root")).unwrap_err();
+        let e = load(Path::new("/nonexistent-dfm-root"), None).unwrap_err();
         assert_eq!(e.code, Code::ReportUnavailable);
         assert_eq!(e.code.exit().code(), 2);
+    }
+
+    #[test]
+    fn the_size_report_stops_at_its_ceiling_and_counts_unreadable_directories() {
+        let d = scratch();
+        for i in 0..10 {
+            fs::write(d.join(format!("f{i}")), "").unwrap();
+        }
+        fs::create_dir(d.join("sub")).unwrap();
+        fs::write(d.join("sub/x"), "").unwrap();
+        let start = [(d.clone(), String::new(), false)];
+        let all = count_entries(&start, None, 1_000);
+        assert_eq!((all.seen, all.per_dir[""], all.per_dir["sub"]), (12, 11, 1));
+        let few = count_entries(&start, None, 3);
+        assert_eq!(few.seen, 3);
+        // A directory that cannot be listed is counted, not skipped silently.
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(d.join("sub"), fs::Permissions::from_mode(0o000)).unwrap();
+        let unreadable = count_entries(&start, None, 1_000);
+        fs::set_permissions(d.join("sub"), fs::Permissions::from_mode(0o755)).unwrap();
+        let root = Command::new("id").arg("-u").output().unwrap().stdout == b"0\n";
+        assert_eq!(unreadable.unreadable, usize::from(!root));
+        let _ = fs::remove_dir_all(&d);
     }
 }

@@ -21,16 +21,20 @@ pub(crate) enum ScopeFault {
     Outside { roots: String, path: String },
 }
 
-/// A bundle's `[sources]` table plus the directory of the bundle that declares it.
+/// A bundle's `[sources]` table plus the bundle that declares it.
 ///
 /// Loaded: every entry under a root, and the files and links that sit directly in the bundle
 /// directory. Subdirectories of the bundle directory are loaded only through a root. Patterns
 /// are anchored at the source root and compared without regard to case, as source lookup is.
+/// Patterns, roots and the bundle directory are folded and split once, when the table is read.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SourceScope {
     roots: Vec<String>,
     exclude: Vec<String>,
-    bundle_dir: String,
+    file: String,
+    roots_c: Vec<Vec<String>>,
+    exclude_c: Vec<Vec<String>>,
+    bundle_c: Vec<String>,
 }
 
 impl SourceScope {
@@ -39,55 +43,73 @@ impl SourceScope {
         &self.roots
     }
 
-    /// Declared exclude patterns, in the order written.
-    pub fn exclude(&self) -> &[String] {
-        &self.exclude
+    /// The declaring bundle file.
+    pub fn file(&self) -> &str {
+        &self.file
     }
 
     /// The directory that holds the declaring bundle.
     pub fn bundle_dir(&self) -> &str {
-        &self.bundle_dir
+        parent(&self.file)
     }
 
     /// The first exclude pattern that matches `path` itself. A pattern that names a directory
     /// excludes its subtree because the loader never descends into a matched directory.
     pub fn excluded_by(&self, path: &str) -> Option<&str> {
         let comps = components(&fold(path));
-        self.exclude
+        self.excluded_comps(&comps)
+    }
+
+    fn excluded_comps(&self, comps: &[String]) -> Option<&str> {
+        self.exclude_c
             .iter()
-            .find(|p| matches_path(&components(&fold(p)), &comps))
-            .map(String::as_str)
+            .position(|p| matches_path(p, comps))
+            .map(|i| self.exclude[i].as_str())
     }
 
     /// True when `path` can hold loaded entries: it is under a root, above a root (a directory
-    /// that leads to one), above or at the bundle directory, or a direct child of it.
-    pub fn reaches(&self, path: &str) -> bool {
+    /// that leads to one), above or at the bundle directory, or a direct child of it. Use it
+    /// for the steps of a path. The end of a path that names a directory needs [`Self::holds_dir`].
+    pub(crate) fn reaches(&self, path: &str) -> bool {
         let p = components(&fold(path));
-        let bundle = components(&fold(&self.bundle_dir));
+        let bundle = &self.bundle_c;
         if p.len() <= bundle.len() && bundle[..p.len()] == p[..] {
             return true;
         }
         if p.len() == bundle.len() + 1 && p[..bundle.len()] == bundle[..] {
             return true;
         }
-        self.roots.iter().any(|r| {
-            let r = components(&fold(r));
+        self.roots_c.iter().any(|r| {
             let n = p.len().min(r.len());
             p[..n] == r[..n]
         })
     }
 
+    /// True when a directory at `path` was loaded as a whole: it is a root or under one. An
+    /// ancestor of a root, the bundle directory and a subdirectory beside the bundle are not.
+    pub(crate) fn holds_dir(&self, path: &str) -> bool {
+        let p = components(&fold(path));
+        self.roots_c
+            .iter()
+            .any(|r| p.len() >= r.len() && p[..r.len()] == r[..])
+    }
+
     pub(crate) fn fault(&self, path: &str) -> Option<ScopeFault> {
-        if let Some(p) = self.excluded_by(path) {
+        let comps = components(&fold(path));
+        if let Some(p) = self.excluded_comps(&comps) {
             return Some(ScopeFault::Excluded {
                 pattern: p.to_string(),
                 path: path.to_string(),
             });
         }
-        (!self.reaches(path)).then(|| ScopeFault::Outside {
+        (!self.reaches(path)).then(|| self.outside(path))
+    }
+
+    pub(crate) fn outside(&self, path: &str) -> ScopeFault {
+        ScopeFault::Outside {
             roots: self.roots.join(", "),
             path: path.to_string(),
-        })
+        }
     }
 
     /// Reads `[sources]`. `file` is the declaring bundle.
@@ -182,11 +204,35 @@ impl SourceScope {
                 .rejected("string"));
             }
         }
-        Ok(SourceScope {
+        let scope = SourceScope {
+            roots_c: roots.iter().map(|r| components(&fold(r))).collect(),
+            exclude_c: exclude.iter().map(|p| components(&fold(p))).collect(),
+            bundle_c: components(&fold(parent(file))),
             roots,
             exclude,
-            bundle_dir: parent(file).to_string(),
-        })
+            file: file.to_string(),
+        };
+        // A root at or below an excluded path would be read although the bundle says to skip it.
+        for r in &scope.roots {
+            let mut prefix = String::new();
+            for c in r.split('/') {
+                if !prefix.is_empty() {
+                    prefix.push('/');
+                }
+                prefix.push_str(c);
+                if let Some(p) = scope.excluded_by(&prefix) {
+                    return Err(invalid(
+                        "/sources/roots",
+                        format!(
+                            "a root is at or below a path that the exclude pattern `{p}` skips"
+                        ),
+                        "narrow the pattern or drop the root",
+                    )
+                    .rejected("string"));
+                }
+            }
+        }
+        Ok(scope)
     }
 }
 
@@ -207,6 +253,9 @@ fn path_fault(s: &str, pattern: bool) -> Option<&'static str> {
         match c {
             "" => return Some("has an empty component"),
             "." | ".." => return Some("has a `.` or `..` component"),
+            _ if !pattern && c.eq_ignore_ascii_case(".git") => {
+                return Some("has a `.git` component");
+            }
             _ if !pattern && c.contains(['*', '?']) => return Some("has a wildcard"),
             _ if c.contains("**") && c != "**" => {
                 return Some("uses `**` inside a component");
@@ -364,5 +413,62 @@ other = 1"#),
         );
         assert_eq!(profile_bundle_path("p.toml", p), None);
         assert_eq!(profile_bundle_path("p.toml", b"not toml ["), None);
+    }
+
+    #[test]
+    fn wildcards_stay_inside_a_component_and_double_star_spans_components() {
+        let s = scope(
+            r#"roots = ["z"]
+exclude = ["home/*", "a/?b", "p/**", "**/**/**/x", "m/**/k/*.o"]"#,
+        )
+        .unwrap();
+        assert!(s.excluded_by("home/x").is_some());
+        assert!(s.excluded_by("home").is_none());
+        assert!(s.excluded_by("home/x/y").is_none());
+        assert!(s.excluded_by("a/xb").is_some());
+        assert!(s.excluded_by("a/b").is_none());
+        assert!(s.excluded_by("p").is_some());
+        assert!(s.excluded_by("p/q/r").is_some());
+        assert!(s.excluded_by("x").is_some());
+        assert!(s.excluded_by("p/q/r/x").is_some());
+        assert!(s.excluded_by("q/xx").is_none());
+        assert!(s.excluded_by("m/k/a.o").is_some());
+        assert!(s.excluded_by("m/1/2/k/a.o").is_some());
+        assert!(s.excluded_by("m/1/2/k/a.c").is_none());
+    }
+
+    #[test]
+    fn a_root_at_or_below_an_excluded_path_is_refused() {
+        for (roots, exclude) in [
+            ("\"profiles\"", "\"profiles\""),
+            ("\"a/b/c\"", "\"a/b\""),
+            ("\"a/.venv/x\"", "\"**/.venv\""),
+            ("\"home\"", "\"**\""),
+        ] {
+            let e = scope(&format!("roots = [{roots}]\nexclude = [{exclude}]")).unwrap_err();
+            assert_eq!(e.code, Code::ManifestInvalid, "{roots} {exclude}");
+        }
+        assert!(scope("roots = [\"home\"]\nexclude = [\"home/.venv\"]").is_ok());
+    }
+
+    #[test]
+    fn a_root_may_not_hold_a_git_component() {
+        for r in ["a/.git", "a/.GIT/b", ".Git"] {
+            let e = scope(&format!("roots = [\"{r}\"]")).unwrap_err();
+            assert_eq!(e.code, Code::ManifestInvalid, "{r}");
+        }
+    }
+
+    #[test]
+    fn only_a_root_and_its_subtree_count_as_a_loaded_directory() {
+        let s = scope("roots = [\"home/sub\", \"dfm\"]").unwrap();
+        assert!(s.holds_dir("home/sub"));
+        assert!(s.holds_dir("home/sub/x/y"));
+        assert!(s.holds_dir("DFM/x"));
+        for p in ["home", "", "other", "home/subx"] {
+            assert!(!s.holds_dir(p), "{p}");
+        }
+        // The steps toward a root are still walkable.
+        assert!(s.reaches("home"));
     }
 }

@@ -304,6 +304,11 @@ pub struct Operation {
     /// new SSH-program setting before approving.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub sets: Vec<String>,
+    /// Excluded entries inside a directory source of this operation (`[sources].exclude`). They
+    /// exist on disk, were not read and are not in the source hash, so a reviewer should know the
+    /// directory holds more than the plan shows. Absent when there are none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub excluded: Option<u64>,
     /// Operation ids that must finish first.
     pub after: Vec<String>,
     pub preconditions: Vec<Precondition>,
@@ -608,6 +613,7 @@ mod tests {
             managed_sha256: None,
             takeover: false,
             output_bytes: None,
+            excluded: None,
             sets: vec![],
             after: vec![],
             preconditions: vec![],
