@@ -69,6 +69,9 @@ pub enum Code {
     // Added by DFM-47 (docs/apply.md, signals). The stop was requested by SIGINT or SIGTERM.
     Interrupted,
     Terminated,
+    // Added by DFM-55 (docs/architecture.md section 10, docs/resolver.md). The bound profile
+    // targets another platform or architecture than this machine.
+    PlatformMismatch,
 }
 
 impl Code {
@@ -128,6 +131,7 @@ impl Code {
         Code::AdoptUnapproved,
         Code::Interrupted,
         Code::Terminated,
+        Code::PlatformMismatch,
     ];
 
     pub fn parse(s: &str) -> Option<Code> {
@@ -190,6 +194,7 @@ impl Code {
             Code::AdoptUnapproved => "E_ADOPT_UNAPPROVED",
             Code::Interrupted => "E_INTERRUPTED",
             Code::Terminated => "E_TERMINATED",
+            Code::PlatformMismatch => "E_PLATFORM_MISMATCH",
         }
     }
 

@@ -336,7 +336,7 @@ The stages are DESIGN.md section 6 (resolve, inspect, plan, apply, verify). Addi
 | 0 | `ok` | Completed, including no work needed. |
 | 1 | `failed` | Any operation `failed`, `blocked` or `unknown` **after** some mutation began; the run limit expired (`E_RUN_LIMIT`); diagnosed errors or incomplete required checks (also `doctor`). |
 | 2 | `usage` | Invalid invocation, or inability to produce the requested report. |
-| 3 | `blocked` | A gate failed **before any mutation**: stale plan, missing credential, no TTY for a required prompt, privilege unavailable, untrusted or new origin, or a toolchain change, in a noninteractive run or in `--preview` (before any fetch or install), unsupported version, a required prerequisite that is `UNKNOWN`, lock held. |
+| 3 | `blocked` | A gate failed **before any mutation**: stale plan, missing credential, no TTY for a required prompt, privilege unavailable, untrusted or new origin, or a toolchain change, in a noninteractive run or in `--preview` (before any fetch or install), unsupported version, a profile for another platform or architecture than this machine (`E_PLATFORM_MISMATCH`), a required prerequisite that is `UNKNOWN`, lock held. |
 | 4 | `declined` | Approval refused or prompt timeout. No mutation. |
 | 5 | `pending` | No operation `failed`, `blocked` or `unknown`, and at least one participant is `pending` (including a `pending` operation that left a dependent `blocked_pending`). Not success. |
 | 130 | `interrupted` | Stopped by SIGINT after the receipt was written. |

@@ -2507,3 +2507,34 @@ fn claims_under_missing_share_config_and_cache_directories_apply_with_private_pa
         text(&again.stdout)
     );
 }
+
+#[test]
+fn apply_through_a_symlinked_home_spelling_uses_the_canonical_home() {
+    let fx = Fx::new();
+    let alias = TempDir::new("apply-alias");
+    let spelled = alias.path().join("home");
+    symlink(fx.home.path(), &spelled).unwrap();
+    let run = |args: &[&str]| {
+        Command::new(BIN)
+            .env_clear()
+            .arg("--home")
+            .arg(&spelled)
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    let o = run(&["plan", "--root", fx.root_arg(), "--json"]);
+    let digest = Saved::parse(&o.stdout)
+        .unwrap_or_else(|e| panic!("{e}\n{}", text(&o.stdout)))
+        .plan_digest;
+    let o = run(&["apply", "--root", fx.root_arg(), "--yes-plan", &digest]);
+    assert_eq!(code(&o), 0, "{}{}", text(&o.stdout), stderr(&o));
+    assert!(fx.h(".config/git/config").is_symlink());
+    let canonical = fs::canonicalize(fx.home.path()).unwrap();
+    assert!(
+        fx.ledger()
+            .to_string()
+            .contains(canonical.to_str().unwrap()),
+        "the ledger records the canonical HOME"
+    );
+}

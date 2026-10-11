@@ -229,7 +229,7 @@ fn run_inner(
         store: &store,
         sys,
         home: &home,
-        home_path: &layout.home,
+        home_path: home.shown(),
         generator: &Generators::new(&second.resolved),
         allow: &args.allow,
         allow_adopt: &args.allow_adopt,
