@@ -13,7 +13,7 @@
 
 use crate::fail::Fail;
 use crate::fsys::{Dir, Live, Peek, Sys};
-use crate::generate::{Gather, Generator, GeneratorInputs, gather};
+use crate::generate::{Gather, Generator, GeneratorInputs, gather, link_source};
 use crate::observe::observe;
 use crate::publish::Publish;
 use crate::recover;
@@ -509,6 +509,14 @@ fn blocked(code: Code, detail: impl Into<String>) -> Ended {
     Ended::Blocked(Refusal::new(code, detail))
 }
 
+/// A source that no longer matches the plan blocks the operation. Anything else fails it.
+fn ended(g: Gather, rel: &str) -> Ended {
+    match g {
+        Gather::Stale(d) => blocked(Code::PlanStale, format!("{rel}: {d}; nothing was changed")),
+        Gather::Failed(r) => failed(r),
+    }
+}
+
 fn failed(r: Refusal) -> Ended {
     Ended::Failed(r, None)
 }
@@ -531,6 +539,8 @@ fn step_name(op: &Operation) -> &'static str {
 struct MergeRead {
     live: Option<Vec<u8>>,
     stamp: Option<crate::fsys::Stamp>,
+    /// The permission bits of the live file when it was read.
+    mode: Option<u32>,
 }
 
 /// What a merge will write and the salted hash to record (`None` for a retire).
@@ -687,12 +697,7 @@ impl Exec<'_, '_> {
             }
             None => None,
         };
-        gather(self.plan, op, &self.run.sys, dir.as_ref(), salt).map_err(|g| match g {
-            Gather::Stale(d) => {
-                blocked(Code::PlanStale, format!("{rel}: {d}; nothing was changed"))
-            }
-            Gather::Failed(r) => failed(r),
-        })
+        gather(self.plan, op, &self.run.sys, dir.as_ref(), salt).map_err(|g| ended(g, rel))
     }
 
     /// The bytes of a generated file. The inputs are read and compared with the plan first, the
@@ -820,6 +825,11 @@ impl Exec<'_, '_> {
             (Action::None | Action::Retire, _) => {
                 return Err(failed(plan_invalid("no action")));
             }
+        }
+        // A link publishes a target the plan hashed. The source is read again now, so a checkout
+        // that changed since the locked re-plan is never published or recorded as owned.
+        if op.action.carries_link() {
+            link_source(&self.run.sys, self.plan, op).map_err(|g| ended(g, rel))?;
         }
         // Content and fingerprints are decided before the intent is written, so a generator
         // failure leaves no interruption record.
@@ -951,6 +961,7 @@ impl Exec<'_, '_> {
             (Ok(Live::Missing), Action::CreateFile) => Ok(MergeRead {
                 live: None,
                 stamp: None,
+                mode: None,
             }),
             (Ok(Live::Missing), _) => Err(blocked(
                 Code::Conflict,
@@ -972,6 +983,7 @@ impl Exec<'_, '_> {
                 Ok(MergeRead {
                     live: Some(bytes),
                     stamp: Some(stamp),
+                    mode: Some(mode),
                 })
             }
             (Ok(Live::Unusable(why)), _) => Err(blocked(
@@ -1001,7 +1013,7 @@ impl Exec<'_, '_> {
             .iter()
             .filter(|r| r.resource == op.resource)
             .flat_map(|r| &r.owned_outputs)
-            .find(|o| o.path == abs)
+            .find(|o| fold(&o.path) == fold(abs))
             .and_then(|o| o.coowned.clone());
         // The fragments of a merge are read like those of an assembly: the plan lists them, each
         // is read again below the opened directory and compared with the plan. A retire reads
@@ -1110,8 +1122,7 @@ impl Exec<'_, '_> {
         };
         self.journal(op, &id, Phase::Intent, Some(recovery), None)
             .map_err(|e| Ended::Failed(e, Some(id.clone())))?;
-        let effect =
-            self.merge_effect(rel, parent, name, read.stamp, &merged.bytes, merged.changed);
+        let effect = self.merge_effect(rel, parent, name, read, &merged.bytes, merged.changed);
         if let Err(e) = effect {
             let unconfirmed = e.code == Code::IoUnconfirmed;
             let why: String = dfm_model::display::visible(&e.detail)
@@ -1168,20 +1179,23 @@ impl Exec<'_, '_> {
 
     /// Publishes the merged bytes when they differ from the live file, then reads the result
     /// back. The replace is guarded by the identity captured at the re-read, not by a hash of
-    /// the whole file. The read-back compares in memory and records nothing.
+    /// the whole file. The read-back always runs, also when nothing was written: the bytes must
+    /// be the merged bytes, and the mode must be the mode this operation left (the merge mode
+    /// after a write, the mode read before for an unchanged file). It compares in memory and
+    /// records nothing.
     fn merge_effect(
         &self,
         rel: &str,
         parent: &Dir,
         name: &str,
-        stamp: Option<crate::fsys::Stamp>,
+        read: &MergeRead,
         bytes: &[u8],
         changed: bool,
     ) -> Result<(), Refusal> {
         let fail = self.run.fail;
         fail.hit("apply-before-effect")?;
         if changed {
-            let how = match stamp {
+            let how = match read.stamp {
                 Some(s) => Publish::ReplaceStamp(s),
                 None => Publish::Create,
             };
@@ -1197,10 +1211,15 @@ impl Exec<'_, '_> {
         let (h, _) = parent
             .hash_file(name, MAX_FILE)?
             .ok_or_else(|| bad("the file cannot be read back"))?;
-        if changed && h != sha256_hex(bytes) {
+        if h != sha256_hex(bytes) {
             return Err(bad("the content read back differs"));
         }
-        if changed && parent.entry_mode(name)? != Some(dfm_model::merge::MODE) {
+        let want_mode = if changed {
+            Some(dfm_model::merge::MODE)
+        } else {
+            read.mode
+        };
+        if parent.entry_mode(name)? != want_mode {
             return Err(bad("the mode differs"));
         }
         Ok(())
@@ -1222,7 +1241,7 @@ impl Exec<'_, '_> {
             .find(|r| r.resource == op.resource)
             .map(|r| r.owned_outputs.clone())
             .unwrap_or_default();
-        outs.retain(|o| o.path != abs);
+        outs.retain(|o| fold(&o.path) != fold(abs));
         outs.push(OwnedOutput {
             path: abs.into(),
             mode: dfm_model::merge::MODE,
@@ -1462,9 +1481,10 @@ impl Exec<'_, '_> {
             return Ended::Current;
         }
         let listed = self.run.store.read_ledger_lenient().map(|l| {
-            l.resources
-                .iter()
-                .any(|r| r.resource == op.resource && r.owned_outputs.iter().any(|o| o.path == abs))
+            l.resources.iter().any(|r| {
+                r.resource == op.resource
+                    && r.owned_outputs.iter().any(|o| fold(&o.path) == fold(&abs))
+            })
         });
         match listed {
             Ok(true) if self.path_unknown(&abs).is_none() && self.absent_now(rel) => {}

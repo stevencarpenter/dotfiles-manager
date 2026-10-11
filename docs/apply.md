@@ -63,6 +63,17 @@ All of these exit 3 and change nothing:
 
 A stale input or output hash blocks the operation with `E_PLAN_STALE`. A generator failure fails it. Both happen before the intent entry, so nothing is journaled and nothing is written. The previous output stays in place (the last good output), the ledger still names its hash, and dependents are `blocked`, as for any other failure.
 
+## Link source
+
+A link publishes a target that the plan hashed (`source:<path>` precondition). The checkout can change after the locked re-plan, so apply reads the source again immediately before the intent entry:
+
+1. The plan's source root (the source whose root holds the link target) is opened. Each component of `Operation.inputs[0].path` is opened below it with `O_NOFOLLOW`. A missing parent, or a parent that is a link, is stale.
+2. The last component must be a regular file or a directory. Anything else, or a missing source, is stale.
+3. A file must hash to the `source:` precondition. A directory is walked without following links, and its tree digest (files with their hashes, links with their target text, directories including empty ones) must equal the precondition. The walk stops at the loader's limits (20,000 entries, 1 MiB per file, 64 MiB in total) and a tree over them is stale.
+4. A mismatch is `E_PLAN_STALE`: the operation is blocked, nothing is journaled, nothing is written, no ownership is recorded, and the message names the path without a hash.
+
+A source with no recorded identity (a secret value) is checked for presence and type only. A directory source that holds entries left out by `[sources].exclude` is also checked for presence and type only, because the plan records the number of excluded entries and not the patterns (docs/resolver.md, "Excluded entries"). Unlike a generated file's input, a link source is not required to be owned by the current user or to have one hard link, because the loader that hashed it did not require that either.
+
 ## Order
 
 Operations run in the planner's order. It is a deterministic topological sort of the `after` edges: directories first, then links and files, with removals ordered by the planner's edges. Apply never reorders.
@@ -72,7 +83,7 @@ For one operation, apply does these steps in this order:
 1. **Prerequisites.** Apply observes the path and its parents again, through the opened HOME, with the planner's own request and string builders (`observe`, `dfm_model::plan::node_state`, `ledger_state`). Every `path:` and `ledger:` precondition must equal the fresh string. A mismatch makes the operation `blocked` before anything is written. No journal entry exists for it.
 2. **Topology.** Apply opens the parent chain from HOME one component at a time with `O_NOFOLLOW | O_DIRECTORY`. Each directory must be owned by the current user. A link, a file, a missing directory or another owner is `E_PARENT_UNSAFE`. All later steps use the opened parent descriptor, never the path.
 3. **Leaf.** Apply looks at the leaf through that descriptor (`fstatat` without following). It must be what the operation expects: absent for a create, the same link for a replace, a regular file for an update, a file or link for a remove.
-4. **Content.** For a file, apply reads the operation's inputs and calls the generator (see Generator). A stale input, a generator failure or a hash that differs from the plan leaves no journal entry and no write.
+4. **Content.** For a file, apply reads the operation's inputs and calls the generator (see Generator). A stale input, a generator failure or a hash that differs from the plan leaves no journal entry and no write. For a link (`create_link`, `replace_link`, `adopt`), apply reads the source again (see Link source). A source that changed is `E_PLAN_STALE`, with no journal entry and no write.
 5. **Intent.** The journal gets an `intent` entry (durable) with the path, whether it existed, and the expected SHA-256.
 6. **Effect.** See the next section.
 7. **Read-back.** Apply reads the result through the same descriptor: link target, content hash and mode, or absence.
@@ -149,7 +160,7 @@ The code is three functions: `merge_read`, `merge_decide` and `merge_settle`.
 6. **Salt**: `state/salt` is created now if it does not exist (docs/state.md).
 7. **Intent**: the journal gets an `intent` entry with `existed_before` and no expected hash.
 8. **Effect**: if the bytes differ from the live file, publish them. A new file uses `linkat`, which never replaces. An existing file uses `renameat` after a last identity check (`Publish::ReplaceStamp`). If the bytes are equal nothing is written, and the ledger is still updated. The failpoints are `apply-before-effect`, `file-after-tmp` and `apply-after-effect`.
-9. **Read-back**: the file is read and compared with the bytes in memory, and the mode must be 0600. Nothing of this is recorded.
+9. **Read-back**: the file is always read and compared with the bytes in memory, also when nothing was written (an unchanged merge or a takeover). The mode must be 0600 after a write, and the mode read at step 3 when nothing was written. A file rewritten or changed with `chmod` between the read and this step fails the postcondition (`E_IO_FAILED`, journal `failed`), and the ledger is not written. Nothing of this is recorded.
 10. **Outcome and ledger**: the journal gets `done`. The ledger records the output with no fingerprint, the salted hash of the managed fields as written (fragments included), the owned handler entries and the appended array items. A `retire` drops the output from the ledger.
 
 The receipt operation has class `sensitive`, no `before` and no `after`, the output path as owned (not for `retire`), and `reload = not_attempted` when a file was published. The report prints the same line as for any operation.
@@ -265,7 +276,7 @@ SIGKILL cannot be caught. It leaves the `intent` entry, and the next run settles
 - **Merge crash recovery.** A crash after the rename and before the outcome entry leaves an `intent` for a sensitive file. `reconcile` has no expected hash for it, so the answer is `unknown`, which blocks that path for one run. The next run plans from the live file and merges again. The ledger may then lack the salted hash for a file the manager did write: the next merge treats the file as one with no ledger entry and takes over the managed fields.
 - **Salted hash on a restored state.** If `state/salt` is lost while the ledger holds a salted hash, the foreign-edit check cannot run and the plan is blocked (`E_STATE_INVALID`) until the file is restored.
 - **Replace and remove check, then act.** `replace_link`, `update_file` and `remove` verify the leaf and then call `renameat` or `unlinkat`. These are two system calls. A process of the same user that swaps the leaf between them wins. Create operations have no such window (`EEXIST`). A swap of a parent directory cannot redirect any step, because every step uses the opened descriptor. A parent swapped after it was opened is not detected for the operations that already hold it. The effect lands in the directory that was verified, and the next operation sees the changed topology and is blocked.
-- **Source content during the run.** The `source:` preconditions are checked when the plan is made and again under the lock. A link does not read its source. A generated file reads its sources again immediately before it is generated and compares them (see Generator). A source read after that point is not compared again.
+- **Source content during the run.** The `source:` preconditions are checked when the plan is made and again under the lock. A link reads its source again immediately before its intent entry (see Link source), and a generated file reads its sources again immediately before it is generated and compares them (see Generator). A source changed after that point is not compared again: a link publishes a path, so a later change shows only in the next plan.
 - **Crash between the effect and the ledger.** The output exists, the journal says `done` (or `intent` only), and the ledger has no entry. The next plan sees an exact link as an `adopt` operation, and `--allow-adopt` records it (DFM-45). Until then the output stays and is not owned, so it is never removed. This is the safe direction. Recovering ownership from the journal alone is not built, and a regular file with the right content is not recovered at all.
 - **Signals.** Only SIGKILL (and a crash or power loss) leaves an `intent` entry without an outcome. The next run settles it. See Signals.
 - **Not implemented flags and modes.** `--json`, `--no-input`, `--timeout`, an interactive approval and a run limit do not exist. Every run is noninteractive, so exit 4 does not occur.

@@ -9,7 +9,8 @@ use dfm_engine::{
     Action as Inject, Dir, Fail, Generator, GeneratorInputs, NoGenerator, Run, Store, apply, gates,
     observe, owned_outputs,
 };
-use dfm_model::digest::sha256_hex;
+use dfm_model::digest::{EntryKind, TreeEntry, sha256_hex, tree_digest};
+use dfm_model::merge::Merged;
 use dfm_model::plan::{
     Action, Binary, Fragment, Input, Observations, Operation, Ownership, Plan, Precondition,
     Request, Source, Status as PlanStatus, ledger_state, link_fingerprint, node_state,
@@ -994,8 +995,13 @@ fn a_journal_id_is_never_reused_across_runs() {
 #[test]
 fn a_link_is_checked_against_the_root_of_its_own_source() {
     let s = setup();
+    // The second source exists, because a link reads its source before it is published.
+    let second = s.h.0.join(".second");
+    fs::create_dir_all(second.join("files")).unwrap();
+    fs::write(second.join("files/x"), "x").unwrap();
+    let second = second.to_str().unwrap().to_string();
     let mut o = op(&s.h, &s.store, "x@l", 1, Action::CreateLink, "l");
-    o.link = Some("/second/files/x".into());
+    o.link = Some(format!("{second}/files/x"));
     o.inputs = vec![dfm_model::plan::Input {
         path: "files/x".into(),
         content_id: None,
@@ -1003,7 +1009,7 @@ fn a_link_is_checked_against_the_root_of_its_own_source() {
     let mut p = plan(vec![o]);
     p.sources.push(Source {
         kind: "path".into(),
-        root: "/second".into(),
+        root: second,
         tree: "sha256:1".into(),
     });
     // The link lies in the second source, not the first.
@@ -2309,4 +2315,283 @@ fn an_intent_with_no_recorded_path_blocks_its_whole_resource() {
         r.detail
     );
     assert!(!recover_now(&s).open[0].has_paths);
+}
+
+// ---- a link source is read again before the link is published (PR #8, DFM-55b) --------------
+
+/// A link `l` to a file (`files/x`) or a directory (`files/d`) of a fresh source root, with the
+/// `source:` precondition the planner records for it.
+fn link_plan(s: &Setup, tag: &str, dir: bool) -> (Plan, std::path::PathBuf) {
+    let root = s.h.0.join(format!(".lsrc-{tag}"));
+    fs::create_dir_all(root.join("files/d/sub")).unwrap();
+    fs::write(root.join("files/x"), "data\n").unwrap();
+    fs::write(root.join("files/d/a"), "A").unwrap();
+    let (path, id) = if dir {
+        let entry = |path: &str, kind| TreeEntry {
+            path: path.into(),
+            kind,
+        };
+        let id = tree_digest(vec![
+            entry(
+                "a",
+                EntryKind::File {
+                    exec: false,
+                    sha256: sha256_hex(b"A"),
+                },
+            ),
+            entry("sub", EntryKind::Dir),
+        ]);
+        ("files/d", id)
+    } else {
+        ("files/x", sha256_hex(b"data\n"))
+    };
+    let mut o = op(&s.h, &s.store, "x@l", 1, Action::CreateLink, "l");
+    o.link = Some(format!("{}/{path}", root.display()));
+    o.inputs = vec![Input {
+        path: path.into(),
+        content_id: Some(format!("sha256:{id}")),
+    }];
+    o.preconditions.push(Precondition {
+        subject: format!("source:{path}"),
+        state: format!("sha256:{id}"),
+    });
+    let p = plan_in(root.to_str().unwrap(), vec![o]);
+    (p, root)
+}
+
+fn nothing_published(s: &Setup) {
+    assert!(
+        fs::symlink_metadata(s.h.0.join("l")).is_err(),
+        "no link was written"
+    );
+    assert!(
+        s.store.read_journal().unwrap().is_empty(),
+        "no intent entry"
+    );
+    assert!(
+        s.store.read_ledger().unwrap().resources.is_empty(),
+        "no ownership was recorded"
+    );
+}
+
+#[test]
+fn an_unchanged_link_source_is_published_and_owned() {
+    for dir in [false, true] {
+        let s = setup();
+        let (p, _) = link_plan(&s, "ok", dir);
+        let r = go(&s, &p, &NoGenerator, &none());
+        assert_eq!(r.operations[0].status, Status::Updated, "{:?}", r.stopped);
+        assert_eq!(s.store.read_ledger().unwrap().resources.len(), 1);
+    }
+}
+
+#[test]
+fn a_link_source_that_changed_after_the_plan_is_stale_and_writes_nothing() {
+    type Mutate = fn(&Path);
+    let cases: [(&str, bool, Mutate); 8] = [
+        ("file-edit", false, |r| {
+            fs::write(r.join("files/x"), "other\n").unwrap()
+        }),
+        ("file-gone", false, |r| {
+            fs::remove_file(r.join("files/x")).unwrap()
+        }),
+        ("file-is-dir", false, |r| {
+            fs::remove_file(r.join("files/x")).unwrap();
+            fs::create_dir(r.join("files/x")).unwrap();
+        }),
+        ("file-ancestor-link", false, |r| {
+            let out = r.with_extension("out");
+            fs::rename(r.join("files"), &out).unwrap();
+            symlink(&out, r.join("files")).unwrap();
+        }),
+        ("dir-entry-added", true, |r| {
+            fs::write(r.join("files/d/new"), "N").unwrap()
+        }),
+        ("dir-empty-subdir-added", true, |r| {
+            fs::create_dir(r.join("files/d/sub2")).unwrap()
+        }),
+        ("dir-gone", true, |r| {
+            fs::remove_dir_all(r.join("files/d")).unwrap()
+        }),
+        ("dir-ancestor-link", true, |r| {
+            let out = r.with_extension("out");
+            fs::rename(r.join("files"), &out).unwrap();
+            symlink(&out, r.join("files")).unwrap();
+        }),
+    ];
+    for (tag, dir, mutate) in cases {
+        let s = setup();
+        let (p, root) = link_plan(&s, tag, dir);
+        mutate(&root);
+        let r = go(&s, &p, &NoGenerator, &none());
+        assert_eq!(
+            r.operations[0].status,
+            Status::Blocked,
+            "{tag}: {:?}",
+            r.stopped
+        );
+        assert_eq!(r.stopped.as_ref().unwrap().code, Code::PlanStale, "{tag}");
+        assert!(!prints_a_hash(&r.stopped.as_ref().unwrap().detail), "{tag}");
+        nothing_published(&s);
+    }
+}
+
+#[test]
+fn a_link_source_with_no_recorded_identity_is_still_checked_for_presence() {
+    let s = setup();
+    let (mut p, root) = link_plan(&s, "unhashed", false);
+    p.operations[0].inputs[0].content_id = None;
+    p.operations[0]
+        .preconditions
+        .retain(|c| !c.subject.starts_with("source:"));
+    fs::write(root.join("files/x"), "any content\n").unwrap();
+    let r = go(&s, &p, &NoGenerator, &none());
+    assert_eq!(r.operations[0].status, Status::Updated, "{:?}", r.stopped);
+    let s = setup();
+    let (mut p, root) = link_plan(&s, "unhashed-gone", false);
+    p.operations[0].inputs[0].content_id = None;
+    fs::remove_file(root.join("files/x")).unwrap();
+    let r = go(&s, &p, &NoGenerator, &none());
+    assert_eq!(r.operations[0].status, Status::Blocked);
+    nothing_published(&s);
+}
+
+// ---- an unchanged merge is read back too (PR #8, DFM-55b) -----------------------------------
+
+/// A merge that leaves the live file as it is: the bytes equal the live ones and `changed` is
+/// false, as for a takeover or a metadata-only change.
+struct Unchanged;
+
+impl Generator for Unchanged {
+    fn supports(&self, _: &Operation) -> bool {
+        false
+    }
+    fn generate(&self, _: &Operation, _: &GeneratorInputs) -> Result<Vec<u8>, Refusal> {
+        Err(Refusal::new(Code::GeneratorUnavailable, "none"))
+    }
+    fn merges(&self, _: &Operation) -> bool {
+        true
+    }
+    fn merge(&self, _: &Operation, i: &GeneratorInputs) -> Result<Merged, Refusal> {
+        Ok(Merged {
+            bytes: i.live.clone().unwrap_or_default(),
+            live_view: b"{}".to_vec(),
+            rendered_view: b"{}".to_vec(),
+            live_leaves: BTreeMap::new(),
+            rendered_leaves: BTreeMap::new(),
+            entries: vec![],
+            appended: vec![],
+            changed: false,
+        })
+    }
+}
+
+/// An `update_file` merge of `settings.json`, planned from the live machine.
+fn merge_plan(s: &Setup) -> Plan {
+    let live = s.h.0.join("settings.json");
+    fs::write(&live, "{\"a\":1}\n").unwrap();
+    fs::set_permissions(&live, fs::Permissions::from_mode(0o600)).unwrap();
+    let mut o = op(
+        &s.h,
+        &s.store,
+        "x@s",
+        1,
+        Action::UpdateFile,
+        "settings.json",
+    );
+    o.class = Class::Sensitive;
+    o.managed_sha256 = Some("a".repeat(64));
+    let sys = sys(&s.h);
+    let home = Dir::open_home(&sys, &s.h.0).unwrap();
+    let obs = observe(
+        &sys,
+        &home,
+        &[Request {
+            path: "settings.json".into(),
+            hash: false,
+            list: false,
+        }],
+    )
+    .unwrap();
+    for c in &mut o.preconditions {
+        if c.subject == "path:settings.json" {
+            c.state = node_state(&obs.seen["settings.json"], true);
+        } else if c.subject == "ledger:settings.json" {
+            c.state = ledger_state(None, true);
+        }
+    }
+    plan(vec![o])
+}
+
+#[test]
+fn an_unchanged_merge_that_is_left_alone_is_recorded() {
+    let s = setup();
+    let r = go(&s, &merge_plan(&s), &Unchanged, &none());
+    assert_eq!(r.operations[0].status, Status::Updated, "{:?}", r.stopped);
+    assert_eq!(s.store.read_ledger().unwrap().resources.len(), 1);
+}
+
+#[test]
+fn an_unchanged_merge_rewritten_or_chmoded_before_the_read_back_is_not_recorded() {
+    type Mutate = fn(&Path);
+    let cases: [(&str, Mutate); 2] = [
+        ("rewrite", |f| fs::write(f, "{\"a\":2}\n").unwrap()),
+        ("chmod", |f| {
+            fs::set_permissions(f, fs::Permissions::from_mode(0o640)).unwrap()
+        }),
+    ];
+    for (tag, mutate) in cases {
+        let s = setup();
+        let p = merge_plan(&s);
+        let live = s.h.0.join("settings.json");
+        let r = parked(
+            &s,
+            &p,
+            &Unchanged,
+            &none(),
+            "apply-after-effect",
+            move || mutate(&live),
+        );
+        assert_eq!(
+            r.operations[0].status,
+            Status::Failed,
+            "{tag}: {:?}",
+            r.stopped
+        );
+        let last = s.store.read_journal().unwrap().pop().unwrap();
+        assert_eq!(last.phase, Phase::Failed, "{tag}");
+        assert!(
+            s.store.read_ledger().unwrap().resources.is_empty(),
+            "{tag}: no ownership from stale bytes"
+        );
+    }
+}
+
+// ---- case-folded ledger paths (PR #8, DFM-55b) ----------------------------------------------
+
+#[test]
+fn an_output_planned_with_another_casing_replaces_its_ledger_entry_in_place() {
+    let s = setup();
+    fs::write(s.h.0.join("Foo"), "old\n").unwrap();
+    // The volume must fold case for `foo` to name the file `Foo`.
+    if !s.h.0.join("foo").exists() {
+        return;
+    }
+    own(&s, "Foo", "old\n");
+    let mut o = op(&s.h, &s.store, "x@foo", 1, Action::UpdateFile, "foo");
+    let owned = owned_outputs(&s.store.read_ledger().unwrap(), &s.h.0).unwrap();
+    for c in &mut o.preconditions {
+        if c.subject == "ledger:foo" {
+            c.state = ledger_state(owned.first(), false);
+        }
+    }
+    let r = go(&s, &plan(vec![o]), &gen_for("x@foo", "new\n"), &none());
+    assert_eq!(r.operations[0].status, Status::Updated, "{:?}", r.stopped);
+    let l = s.store.read_ledger().unwrap();
+    let paths: Vec<&str> = l
+        .resources
+        .iter()
+        .flat_map(|r| r.owned_outputs.iter().map(|o| o.path.as_str()))
+        .collect();
+    assert_eq!(paths, [s.h.0.join("foo").to_str().unwrap()]);
 }

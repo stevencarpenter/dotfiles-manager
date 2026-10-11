@@ -260,7 +260,8 @@ impl Ledger {
     }
 
     /// Exact ownership: unique resources, unique output paths across all resources (two owners
-    /// for one path is a conflict), normalized absolute paths, and no content hash for a
+    /// for one path is a conflict; paths that differ only by case name one output on a
+    /// case-insensitive volume, so they count as one path), normalized absolute paths, and no content hash for a
     /// sensitive resource.
     pub fn validate(&self) -> Result<(), Refusal> {
         self.binding.validate()?;
@@ -280,8 +281,11 @@ impl Ledger {
                 if !valid_path(&o.path) {
                     return Err(bad(format!("ledger path {:?} is not normalized", o.path)));
                 }
-                if !paths.insert(&o.path) {
-                    return Err(bad(format!("ledger gives {} two owners", o.path)));
+                if !paths.insert(fold(&o.path)) {
+                    return Err(bad(format!(
+                        "ledger gives {} two owners or two spellings",
+                        o.path
+                    )));
                 }
                 match (r.class, &o.fingerprint) {
                     (Class::Normal, Some(f)) if valid_sha256(f) => {}
@@ -1333,6 +1337,48 @@ mod tests {
         assert!(!text.contains(' ') && !text.contains('\n'));
         assert!(text.find("\"binding\"").unwrap() < text.find("\"created_unix\"").unwrap());
         assert!(text.find("\"created_unix\"").unwrap() < text.find("\"schema\"").unwrap());
+    }
+
+    #[test]
+    fn ledger_paths_that_differ_only_by_case_are_one_path() {
+        let out = |path: &str| OwnedOutput {
+            path: path.into(),
+            mode: 0o600,
+            fingerprint: Some("a".repeat(64)),
+            coowned: None,
+        };
+        let entry = |res: &str, paths: &[&str]| LedgerResource {
+            resource: res.into(),
+            adapter: "fs-link/v1".into(),
+            class: Class::Normal,
+            op_id: "op1".into(),
+            owned_outputs: paths.iter().map(|p| out(p)).collect(),
+        };
+        // Both spellings in one resource, and in two, are refused.
+        for res in [
+            vec![entry("a", &["/h/.config/foo", "/h/.config/Foo"])],
+            vec![
+                entry("a", &["/h/.config/foo"]),
+                entry("b", &["/h/.config/Foo"]),
+            ],
+        ] {
+            let mut l = Ledger::empty(stamp());
+            l.resources = res;
+            assert_eq!(l.validate().unwrap_err().code, Code::StateInvalid);
+            let bytes = serde_json::to_vec(&l).unwrap();
+            assert_eq!(Ledger::parse(&bytes).unwrap_err().code, Code::StateInvalid);
+        }
+        // Re-recording a resource with the other spelling replaces its entry.
+        let mut l = Ledger::empty(stamp());
+        l.record(entry("a", &["/h/.config/foo"])).unwrap();
+        l.record(entry("a", &["/h/.config/Foo"])).unwrap();
+        assert_eq!(l.resources[0].owned_outputs.len(), 1);
+        assert_eq!(l.resources[0].owned_outputs[0].path, "/h/.config/Foo");
+        // Another resource may not take the other spelling.
+        assert_eq!(
+            l.record(entry("b", &["/h/.config/FOO"])).unwrap_err().code,
+            Code::StateInvalid
+        );
     }
 
     #[test]
