@@ -50,7 +50,9 @@ Operation ids are `<resource>@<path>`, `mkdir@<path>`, `<resource>@scope` and `r
 
 For apply (DFM-18) each operation also carries: `journal_id` (a valid journal id, derived from the model digest, the source trees and the operation id, not from the plan digest, which covers it), `link` (the absolute link target), and `mode` (the mode the resource declares). Apply must read these fields and never parse `effect` or `postcondition`, which are prose. Precondition strings come from `dfm_model::plan::node_state`, and a link's ledger fingerprint is `dfm_model::plan::link_fingerprint` (SHA-256 of the target text). Apply must re-observe with the same requests and use these two functions, so both sides build identical strings. Re-checking them immediately before each write is apply's duty (architecture section 8).
 
-**Removal.** A ledger output that no selected resource claims is planned as `remove` only when the live output matches the ledger fingerprint (`owned`). A changed, foreign, sensitive or directory output is `E_CONFLICT`. An output that is already gone is `current`. Removal is only planned here. Nothing deletes in this task.
+**Removal.** A ledger output is a removal candidate when its resource is no longer selected and no selected resource claims its path. (A resource that is still selected keeps its outputs even if it claims nothing now.) It is planned as `remove` only when the live output matches the ledger fingerprint (`owned`). A changed, foreign, sensitive, directory, non-ASCII or other-user output is a blocker (`E_CONFLICT`, `E_TARGET_INVALID` or `E_PRIVILEGE_UNSUPPORTED`). An output that is already gone is `current`. A path claimed by a selected sensitive resource is never hashed, and its ledger fingerprint is never printed, whoever owns the entry. Removal is only planned here. Nothing deletes in this task.
+
+A planned removal of a file in a fragment directory is listed in the consumer's `fragments` as `removing:<resource>`. The removal runs after the consumer (`after`), so the consumer reads the file first. A blocked or absent removal adds no edge and is not a producer.
 
 ## Rules the planner enforces
 
@@ -97,6 +99,7 @@ An unsupported saved-plan schema is `E_SCHEMA_UNSUPPORTED`. A missing state dire
 ## Known limits
 
 - **No adapter output.** `render`, `merge` and `assemble` operations are planned as `create_file` or `update_file` without comparing desired content, so a file that already equals the desired content is still planned when the ledger owns it. `already_done` needs the adapters. A `skills/v1` leaf is planned as a link to its source, which is an assumption about that adapter.
+- **Hidden or unverified decisions.** A mode a resource declares outside `0..=0o777` is `E_MANIFEST_INVALID`, not dropped. A claim that cannot be checked against the manager's own paths (an I/O error, not an overlap) is `E_OBSERVATION_UNKNOWN`, exit 3 (architecture section 10, an unknown required fact). The topology walk reports a link loop or unreadable parent first.
 - **Generated-output hashes.** Section 9 asks for content hashes of generated normal outputs. They need the adapters (DFM-20). Until then the plan records input identities and the model digest.
 - **Prose fields.** `effect` and `postcondition` are free text for people. Apply uses `action`, `path`, `link`, `mode` and `preconditions`.
 - **Field claims.** The resolver models path claims only. Claims on fields inside a co-owned document (for example one key of `settings.json`) are not modelled, so two resources writing different fields of one file collide as a path.
@@ -105,9 +108,30 @@ An unsupported saved-plan schema is `E_SCHEMA_UNSUPPORTED`. A missing state dire
 - **Non-ASCII names** are refused (above), not normalized.
 - **Source mode.** The source loader records no executable bit, so a mode-only edit of a source file does not change the tree digest.
 - **Sensitive conflicts.** The salted hash is not built (docs/state.md), so any existing sensitive destination blocks the plan, owned or not.
-- **No removal.** A ledger entry for a resource that is no longer selected is not planned for release or deletion.
+- **Removal scope.** Removal is planned only for a resource that is no longer selected, at a path nobody claims. There is no mass-removal guard: deselecting everything plans the removal of every fingerprint-verified owned output. That is by design. The ledger is the only authority and a changed output is never removed.
 - **No source lock.** The source identity is the loaded tree under `--root`. Lock and origin checks belong to DFM-30.
 - **Races.** Observation and the resolver's source read are separate reads. A change between them shows up as a stale plan at the next comparison, not during the run. `apply` must observe again (section 6, step 4).
 - **Reserved manager directories** that do not exist yet, and the NFC and NFD collision gap, are unchanged known limits (docs/resolver.md, docs/state.md). The planner does not widen them: it compares case-folded names and the on-disk listing, and it refuses non-ASCII names instead of normalizing them. Reserved manager directories that do not exist yet are covered by the text scope of the store check.
 - **Non-UTF-8 names** in a listing, a listing that fails, and a listing over 50,000 entries are three separate reasons (`non_utf8`, `failed`, `too_many`), and each makes the plan fail closed for that directory.
 - **Evidence scope.** Tests use the `test-isolation` build and a temporary HOME. No device was used.
+
+## The `stale` array in `--json`
+
+With `--against`, the JSON document has `stale`, a list sorted most specific first, one entry per kind and subject. It is empty or absent when the plan matches. It sits outside the plan, so it is not in the digest.
+
+```json
+{"what": "source_input", "subject": "core.git@.config/git/config (core.git)", "was": "<old>", "now": "<new>"}
+```
+
+`what` is one of `source_input`, `ownership`, `observation`, `operation`, `source`, `model`, `binary`, `plan`. `plan` with subject `digest` means the digests differ and no other entry explains it. The text mode prints the same entries as `stale <what with spaces>: <subject> was <old> now <new>`, at most 20, then a line that says how many were omitted.
+
+## Serialization failures
+
+Serializing a plan or the model cannot fail for these types. If it ever does, the error is `E_STATE_INVALID` (the class `state::canonical` already uses for the same impossible case), not `E_IO_FAILED`. Exit 3.
+
+## Notes for apply (DFM-18)
+
+- Apply must compare both `node_state` (the precondition strings) and `link_fingerprint` (ledger fingerprint of a link: SHA-256 of the target text; a file's is the SHA-256 of its content). `node_state` compares link targets exactly, so a case-only retarget is a change.
+- `journal_id` is derived from the model digest, the source trees and the operation id. It ignores observations and HOME. After a partial apply, replanning gives the same ids for the same operations, so apply must not reuse an id whose journal entries already exist.
+- The ledger is not authenticated. Apply must decide deletion again with `Store::authorizes_delete` at the moment of removal and must not follow a link at the leaf.
+- Deselecting everything plans the removal of every fingerprint-verified owned output. There is no mass-removal guard. That is by design.
