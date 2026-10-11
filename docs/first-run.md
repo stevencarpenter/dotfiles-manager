@@ -75,7 +75,7 @@ Rules that matter on the first run:
 - `target` is relative to HOME and must be ASCII. The source file must exist inside the checkout.
 - Use only `kind = "link"` resources. Any `render`, `merge` or `assemble` resource makes `apply` refuse the whole plan with `E_GENERATOR_UNAVAILABLE` (exit 3, nothing written).
 - Do not list `.claude/settings.json`, files under `.ssh` other than `config`, or any file that holds a secret.
-- Do not link a directory. Only file-level links are supported.
+- A `link` resource may point at a file or a directory. A directory link is one operation; the manager never writes through it and never deletes it recursively.
 
 ## 3. Bind, then look without writing
 
