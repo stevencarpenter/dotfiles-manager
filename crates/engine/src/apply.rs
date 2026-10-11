@@ -659,11 +659,9 @@ impl Exec<'_, '_> {
         })
     }
 
-    /// The bytes of a generated file. The inputs are read and compared with the plan first, the
-    /// generator runs on those bytes only, and the result must equal the planned output hash.
-    /// A stale input or output blocks the operation. Nothing is journaled and nothing is
-    /// written, so the previous output stays the last good one.
-    fn generated(&self, op: &Operation, rel: &str) -> Result<Vec<u8>, Ended> {
+    /// Opens the fragment directory of `op` (if it has one) and reads the sources and fragments
+    /// the plan recorded, each compared with the plan. A stale input blocks the operation.
+    fn fragment_inputs(&self, op: &Operation, rel: &str) -> Result<GeneratorInputs, Ended> {
         let dir = match op.fragment_dir.as_deref() {
             Some(d) => {
                 let comps = components(d).map_err(failed)?;
@@ -675,12 +673,20 @@ impl Exec<'_, '_> {
             }
             None => None,
         };
-        let inputs = gather(self.plan, op, &self.run.sys, dir.as_ref()).map_err(|g| match g {
+        gather(self.plan, op, &self.run.sys, dir.as_ref()).map_err(|g| match g {
             Gather::Stale(d) => {
                 blocked(Code::PlanStale, format!("{rel}: {d}; nothing was changed"))
             }
             Gather::Failed(r) => failed(r),
-        })?;
+        })
+    }
+
+    /// The bytes of a generated file. The inputs are read and compared with the plan first, the
+    /// generator runs on those bytes only, and the result must equal the planned output hash.
+    /// A stale input or output blocks the operation. Nothing is journaled and nothing is
+    /// written, so the previous output stays the last good one.
+    fn generated(&self, op: &Operation, rel: &str) -> Result<Vec<u8>, Ended> {
+        let inputs = self.fragment_inputs(op, rel)?;
         let bytes = match self.run.generator.generate(op, &inputs) {
             Ok(b) => b,
             Err(r) if r.code == Code::PlanStale => return Err(Ended::Blocked(r)),
@@ -983,13 +989,27 @@ impl Exec<'_, '_> {
             .flat_map(|r| &r.owned_outputs)
             .find(|o| o.path == abs)
             .and_then(|o| o.coowned.clone());
+        // The fragments of a merge are read like those of an assembly: the plan lists them, each
+        // is read again below the opened directory and compared with the plan. A retire reads
+        // none, because it removes only what the ledger records.
+        let fragments = if op.action == Action::Retire {
+            GeneratorInputs::default()
+        } else {
+            self.fragment_inputs(op, rel)?
+        };
         let inputs = GeneratorInputs {
             live: read.live.clone(),
             owned_entries: recorded
                 .as_ref()
                 .map(|c| c.entries.clone())
                 .unwrap_or_default(),
+            owned_appended: recorded
+                .as_ref()
+                .map(|c| c.appended.clone())
+                .unwrap_or_default(),
             takeover: op.takeover,
+            listing: fragments.listing,
+            fragments: fragments.fragments,
             ..GeneratorInputs::default()
         };
         let merged = match self.run.generator.merge(op, &inputs) {
@@ -1091,7 +1111,14 @@ impl Exec<'_, '_> {
             .and_then(|()| self.run.fail.hit("apply-after-done"))
             .and_then(|()| match &new_hash {
                 None => self.forget_output(op, &id, abs),
-                Some(h) => self.record_coowned(op, &id, abs, h, merged.entries.clone()),
+                Some(h) => self.record_coowned(
+                    op,
+                    &id,
+                    abs,
+                    h,
+                    merged.entries.clone(),
+                    merged.appended.clone(),
+                ),
             });
         if let Err(e) = settled {
             return Err(self.after_intent(e, &id, abs));
@@ -1158,6 +1185,7 @@ impl Exec<'_, '_> {
         abs: &str,
         managed_hash: &str,
         entries: Vec<dfm_model::state::OwnedEntry>,
+        appended: Vec<dfm_model::state::AppendedItem>,
     ) -> Result<(), Refusal> {
         let mut ledger = self.run.store.read_ledger_lenient()?;
         let mut outs = ledger
@@ -1174,6 +1202,7 @@ impl Exec<'_, '_> {
             coowned: Some(CoOwned {
                 managed_hash: managed_hash.into(),
                 entries,
+                appended,
             }),
         });
         outs.sort_by(|a, b| a.path.cmp(&b.path));

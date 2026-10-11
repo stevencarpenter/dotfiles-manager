@@ -157,16 +157,24 @@ pub fn registry() -> Vec<Adapter> {
                     "claude-settings/v1",
                     "merge",
                     TargetRule::Fixed(".claude/settings.json"),
-                    Claims::Target,
+                    Claims::TargetAndFragments {
+                        dir: "/fragments_dir",
+                        pattern: "/pattern",
+                    },
                     Schema::Table(vec![
                         field("managed", Schema::Native, true),
                         field("seed", Schema::Native, false),
+                        field("append", Schema::Array(Box::new(Schema::Str)), false),
+                        field("fragments_dir", Schema::HomePath, false),
+                        field("pattern", Schema::Str, false),
                         field(
                             "handlers",
                             Schema::Map(Box::new(Schema::Table(vec![
                                 field("event", Schema::Str, true),
                                 field("type", Schema::Str, true),
                                 field("argv", Schema::Array(Box::new(Schema::Str)), true),
+                                field("matcher", Schema::Str, false),
+                                field("timeout", Schema::Int, false),
                             ]))),
                             true,
                         ),

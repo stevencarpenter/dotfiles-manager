@@ -161,8 +161,16 @@ pub fn plan_for(ctx: &Ctx, loaded: &Loaded) -> Result<Plan, Refusal> {
     let root_str = loaded.root.to_str().ok_or_else(|| {
         usage("--root resolves to a path that is not UTF-8; point --root at a UTF-8 path")
     })?;
-    let merge =
-        crate::adapters::merge_facts(&loaded.resolved, &store, &sys, &home, &layout.home, &ledger);
+    let source_root = Dir::open_plain(&loaded.root).ok();
+    let merge = crate::adapters::merge_facts(
+        &loaded.resolved,
+        &store,
+        &sys,
+        &home,
+        &layout.home,
+        source_root.as_ref(),
+        &ledger,
+    );
     let cx = Context {
         binary: binary_identity()?,
         profile: loaded.binding.profile(),
@@ -234,6 +242,12 @@ pub(crate) fn render(p: &Plan, digest: &str, out: &mut dyn Write) -> std::io::Re
         }
         if let Some(n) = o.excluded {
             writeln!(out, "    note: contains {n} excluded entries, not hashed")?;
+        }
+        // The fragments a merge layers over its declared values, by name, in merge order. The
+        // names are module data or the user's own files; no content and no hash is shown.
+        if o.managed_sha256.is_some() && !o.fragments.is_empty() {
+            let names: Vec<&str> = o.fragments.iter().map(|f| f.name.as_str()).collect();
+            writeln!(out, "    fragments: {}", visible(&names.join(", ")))?;
         }
     }
     for b in &p.blockers {

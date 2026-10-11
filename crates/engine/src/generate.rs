@@ -11,7 +11,7 @@ use dfm_model::digest::sha256_hex;
 use dfm_model::fold;
 use dfm_model::merge::Merged;
 use dfm_model::plan::{MAX_HASHED_BYTES, MAX_LISTING, Operation, Plan};
-use dfm_model::state::OwnedEntry;
+use dfm_model::state::{AppendedItem, OwnedEntry};
 use dfm_model::{Code, Refusal};
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -34,6 +34,8 @@ pub struct GeneratorInputs {
     pub live: Option<Vec<u8>>,
     /// The handler entries the ledger records as added by the manager (merge and retire).
     pub owned_entries: Vec<OwnedEntry>,
+    /// The array items the ledger records as appended by the manager (merge and retire).
+    pub owned_appended: Vec<AppendedItem>,
     /// The operation is the approved first write into an existing co-owned file with no ledger
     /// entry. A merge then records an identical entry already in place as owned.
     pub takeover: bool,
@@ -51,6 +53,7 @@ impl std::fmt::Debug for GeneratorInputs {
                 &self.live.as_ref().map(|b| format!("{} bytes", b.len())),
             )
             .field("owned_entries", &self.owned_entries)
+            .field("owned_appended", &self.owned_appended)
             .finish()
     }
 }

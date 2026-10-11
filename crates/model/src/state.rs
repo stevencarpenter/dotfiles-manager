@@ -192,6 +192,20 @@ pub struct CoOwned {
     pub managed_hash: String,
     /// The handler entries the manager added, so it retires only those.
     pub entries: Vec<OwnedEntry>,
+    /// The array items the manager appended under an `append` policy (DFM-48), so it removes
+    /// only those. Absent in a ledger written before DFM-48, which reads as empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub appended: Vec<AppendedItem>,
+}
+
+/// One item the manager appended to a foreign array of a co-owned file. `sha256` is the hash of
+/// the item the module declared (the manager's own content), never of live content.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AppendedItem {
+    /// JSON pointer of the array in the settings document, such as `/sandbox/filesystem/allowWrite`.
+    pub pointer: String,
+    pub sha256: String,
 }
 
 /// One list entry the manager added to a co-owned file. `sha256` is the hash of the entry the
@@ -281,7 +295,15 @@ impl Ledger {
                             && !e.id.chars().chain(e.key.chars()).any(char::is_control)
                             && valid_sha256(&e.sha256)
                     });
-                    if r.class != Class::Sensitive || !valid_sha256(&c.managed_hash) || !entries_ok
+                    let appended_ok = c.appended.iter().all(|a| {
+                        a.pointer.starts_with('/')
+                            && !a.pointer.chars().any(char::is_control)
+                            && valid_sha256(&a.sha256)
+                    });
+                    if r.class != Class::Sensitive
+                        || !valid_sha256(&c.managed_hash)
+                        || !entries_ok
+                        || !appended_ok
                     {
                         return Err(bad(format!(
                             "ledger co-owned record for {} is malformed or not sensitive",
@@ -1345,6 +1367,10 @@ mod tests {
                 key: "PreToolUse".into(),
                 sha256: "c".repeat(64),
             }],
+            appended: vec![AppendedItem {
+                pointer: "/sandbox/filesystem/allowWrite".into(),
+                sha256: "d".repeat(64),
+            }],
         };
         let mut l = Ledger::empty(stamp());
         l.record(entry(Class::Sensitive, None, Some(good.clone())))
@@ -1379,6 +1405,20 @@ mod tests {
                 entries: vec![OwnedEntry {
                     key: "a\nb".into(),
                     ..good.entries[0].clone()
+                }],
+                ..good.clone()
+            },
+            CoOwned {
+                appended: vec![AppendedItem {
+                    pointer: "no-slash".into(),
+                    ..good.appended[0].clone()
+                }],
+                ..good.clone()
+            },
+            CoOwned {
+                appended: vec![AppendedItem {
+                    sha256: "short".into(),
+                    ..good.appended[0].clone()
                 }],
                 ..good.clone()
             },

@@ -97,20 +97,46 @@ impl Generator for Generators<'_> {
             let live = inputs.live.as_deref().ok_or_else(|| {
                 Refusal::new(Code::Conflict, "the file to retire entries from is gone")
             })?;
-            let (bytes, changed) = retire(live, &inputs.owned_entries)?;
+            let (bytes, changed) = retire(live, &inputs.owned_entries, &inputs.owned_appended)?;
             return Ok(Merged {
                 bytes,
                 live_view: Vec::new(),
                 rendered_view: Vec::new(),
                 entries: Vec::new(),
+                appended: Vec::new(),
                 changed,
             });
         }
         let desired = Desired::from_value(self.value(op)?)?;
+        let desired = match desired.fragment_spec() {
+            Some((_, pattern)) => {
+                // As an assembly: a matching name in the directory that the plan did not list
+                // means the directory changed since the plan.
+                if let Some(extra) = inputs.listing.iter().flatten().find(|n| {
+                    matches_pattern(pattern, n)
+                        && !inputs.fragments.keys().any(|k| fold(k) == fold(n))
+                }) {
+                    return Err(Refusal::new(
+                        Code::PlanStale,
+                        format!(
+                            "fragment {extra} is in the directory and the plan does not list it"
+                        ),
+                    ));
+                }
+                desired.with_fragments(
+                    inputs
+                        .fragments
+                        .iter()
+                        .map(|(n, b)| (n.as_str(), b.as_slice())),
+                )?
+            }
+            None => desired,
+        };
         merge_with(
             inputs.live.as_deref(),
             &desired,
             &inputs.owned_entries,
+            &inputs.owned_appended,
             inputs.takeover,
         )
     }
