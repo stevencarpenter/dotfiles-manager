@@ -11,7 +11,7 @@ Task: DFM-16. This document records what the first planner does and where it res
 | `plan` command | `crates/cli/src/plan_cmd.rs` |
 | Sensitivity flag on adapters and resolved resources | `AdapterSpec::sensitive`, `ResolvedResource::sensitive` |
 
-Layering follows architecture section 3. `model` takes already-observed facts and returns a plan. `engine` observes. `cli` joins them. No `ports` or `adapters` crate exists yet, so the planner decides from catalog data and observations and runs no adapter. There is no `apply` (DFM-18).
+Layering follows architecture section 3. `model` takes already-observed facts and returns a plan. `engine` observes. `cli` joins them. No `ports` or `adapters` crate exists yet, so the planner decides from catalog data and observations and runs no adapter. `apply` is described in [docs/apply.md](apply.md).
 
 ## The command
 
@@ -50,7 +50,7 @@ Operation ids are `<resource>@<path>`, `mkdir@<path>`, `<resource>@scope` and `r
 
 For apply (DFM-18) each operation also carries: `journal_id` (a valid journal id, derived from the model digest, the source trees and the operation id, not from the plan digest, which covers it), `link` (the absolute link target), and `mode` (the mode the resource declares). Apply must read these fields and never parse `effect` or `postcondition`, which are prose. Precondition strings come from `dfm_model::plan::node_state`, and a link's ledger fingerprint is `dfm_model::plan::link_fingerprint` (SHA-256 of the target text). Apply must re-observe with the same requests and use these two functions, so both sides build identical strings. Re-checking them immediately before each write is apply's duty (architecture section 8).
 
-**Removal.** A ledger output is a removal candidate when its resource is no longer selected and no selected resource claims its path. (A resource that is still selected keeps its outputs even if it claims nothing now.) It is planned as `remove` only when the live output matches the ledger fingerprint (`owned`). A changed, foreign, sensitive, directory, non-ASCII or other-user output is a blocker (`E_CONFLICT`, `E_TARGET_INVALID` or `E_PRIVILEGE_UNSUPPORTED`). An output that is already gone is `current`. A path claimed by a selected sensitive resource is never hashed, and its ledger fingerprint is never printed, whoever owns the entry. Removal is only planned here. Nothing deletes in this task.
+**Removal.** A ledger output is a removal candidate when its resource is no longer selected and no selected resource claims its path. (A resource that is still selected keeps its outputs even if it claims nothing now.) It is planned as `remove` only when the live output matches the ledger fingerprint (`owned`). A changed, foreign, sensitive, directory, non-ASCII or other-user output is a blocker (`E_CONFLICT`, `E_TARGET_INVALID` or `E_PRIVILEGE_UNSUPPORTED`). An output that is already gone is `current` with `action = remove`, so apply can drop its stale ledger entry (docs/apply.md). An output whose parent directory is a link is `E_PARENT_UNSAFE` for that entry only, and every other operation stays plannable. A path claimed by a selected sensitive resource is never hashed, and its ledger fingerprint is never printed, whoever owns the entry. `apply` executes removals (docs/apply.md).
 
 A fragment that a planned removal deletes is not an input. It is left out of the consumer's `fragments`, the consumer's `fragments:` precondition lists it as `removing=[...]`, and the consumer runs after the removal (`after`). Deselected content never reaches the assembled file, and one apply converges. A blocked or absent removal adds no edge and is not a producer.
 
@@ -92,7 +92,7 @@ An unsupported saved-plan schema is `E_SCHEMA_UNSUPPORTED`. A missing state dire
 | --- | --- |
 | Section 10, exit 3: "a required prerequisite that is `UNKNOWN`", and section 8 "An untested probe stays disabled and returns `UNKNOWN`" | A configuration plan has no probe, so no prerequisite is `UNKNOWN` for it. Package and application resources are out of scope (above). A path that cannot be observed is `E_OBSERVATION_UNKNOWN`, exit 3. |
 | Section 9, item 1: "content hashes of generated outputs for `normal` class outputs" | No adapter runs yet, so no output is generated. The plan records the identities of the inputs (`inputs`, `source:` preconditions) and the model digest. Output hashes need the adapters (DFM-20). |
-| Section 10: `--yes-plan <digest>` "recomputes the plan digest and compares" | `plan --against <saved plan>` is the read-only form. `--yes-plan` belongs to the mutating commands (DFM-18). |
+| Section 10: `--yes-plan <digest>` "recomputes the plan digest and compares" | `plan --against <saved plan>` is the read-only form. `--yes-plan` belongs to the mutating commands: `apply` (docs/apply.md). |
 | Section 5, ledger: "exact `owned_outputs` ... with fingerprints" | A link output's fingerprint is the SHA-256 of its target text. DFM-17 left link fingerprints unspecified. |
 | DESIGN.md section 4: "A directory link conflicts with every independently claimed descendant" | The resolver checks claims against each other. The planner adds the machine side: a link parent on disk is `E_PARENT_UNSAFE`. |
 

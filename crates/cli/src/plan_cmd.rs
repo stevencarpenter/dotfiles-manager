@@ -104,30 +104,7 @@ fn read_saved(path: &Path) -> Result<Vec<u8>, Refusal> {
 
 /// Ledger outputs as paths relative to HOME.
 fn owned(store: &Store, home: &Path) -> Result<Vec<Owned>, Refusal> {
-    let ledger = store.read_ledger()?;
-    let mut out = Vec::new();
-    for r in &ledger.resources {
-        for o in &r.owned_outputs {
-            let rel = Path::new(&o.path)
-                .strip_prefix(home)
-                .ok()
-                .and_then(Path::to_str)
-                .ok_or_else(|| {
-                    Refusal::new(
-                        Code::StateInvalid,
-                        format!("ledger path {} is outside HOME", visible(&o.path)),
-                    )
-                })?;
-            out.push(Owned {
-                resource: r.resource.clone(),
-                adapter: r.adapter.clone(),
-                class: r.class,
-                path: rel.into(),
-                fingerprint: o.fingerprint.clone(),
-            });
-        }
-    }
-    Ok(out)
+    dfm_engine::owned_outputs(&store.read_ledger_lenient()?, home)
 }
 
 /// Builds the plan for the bound profile. Read-only.
@@ -193,7 +170,7 @@ pub fn make_plan(ctx: &Ctx, root: &Path) -> Result<Plan, Refusal> {
     plan::build(&loaded.resolved, &cx, &obs)
 }
 
-fn render(p: &Plan, digest: &str, out: &mut dyn Write) -> std::io::Result<()> {
+pub(crate) fn render(p: &Plan, digest: &str, out: &mut dyn Write) -> std::io::Result<()> {
     writeln!(
         out,
         "plan: profile={} machine={} scope={}",

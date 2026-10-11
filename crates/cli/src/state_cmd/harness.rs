@@ -182,6 +182,7 @@ pub fn record_op(ctx: &Ctx, args: &[String], out: &mut dyn Write) -> Result<(), 
             after: (class == Class::Normal).then(|| fp(&digest)),
             owned_outputs: vec![output],
             error: note,
+            reload: None,
         }];
         let receipt = Receipt {
             schema: 1,
@@ -202,6 +203,7 @@ pub fn record_op(ctx: &Ctx, args: &[String], out: &mut dyn Write) -> Result<(), 
             plan_digest: None,
             approval: None,
             sources: vec![],
+            approvals: vec![],
             result: RunResult {
                 outcome: "ok".into(),
                 exit_code: 0,

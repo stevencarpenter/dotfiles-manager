@@ -37,6 +37,19 @@ pub struct Owned {
     pub fingerprint: Option<String>,
 }
 
+/// The ledger entry for a path as a precondition string. For a sensitive path the fingerprint
+/// is left out, whoever owns the entry: it can be a hash of credentials. Apply builds the same
+/// string from a fresh ledger read, so both sides must use this function.
+pub fn ledger_state(entry: Option<&Owned>, sensitive: bool) -> String {
+    entry.map_or_else(
+        || "none".into(),
+        |e| match (&e.fingerprint, sensitive) {
+            (Some(f), false) => format!("{}:{f}", e.resource),
+            _ => format!("{}:sensitive", e.resource),
+        },
+    )
+}
+
 pub struct Context<'a> {
     pub binary: Binary,
     pub profile: &'a str,
@@ -563,13 +576,7 @@ impl Planner<'_> {
     /// The ledger entry for a path as a precondition string. For a sensitive path the
     /// fingerprint is left out, whoever owns the entry: it can be a hash of credentials.
     fn ledger_state(&self, path: &str, sensitive: bool) -> String {
-        self.ledger_entry(path).map_or_else(
-            || "none".into(),
-            |e| match (&e.fingerprint, sensitive) {
-                (Some(f), false) => format!("{}:{f}", e.resource),
-                _ => format!("{}:sensitive", e.resource),
-            },
-        )
+        ledger_state(self.ledger_entry(path), sensitive)
     }
 
     fn leaf(&mut self, r: &ResolvedResource, claim: &str) {
@@ -688,6 +695,19 @@ impl Planner<'_> {
     fn remove_checks(&self, o: &Owned, op: &mut Operation) -> Result<(), Fail> {
         let field = "owned_outputs";
         let path = o.path.as_str();
+        // A link in a parent is reported first and for this entry only. Such an entry (a
+        // stow-style linked config directory, for example) must not block any other operation.
+        let comps = parts(path);
+        for i in 0..comps.len().saturating_sub(1) {
+            let p = comps[..=i].join("/");
+            if let Some(Seen {
+                node: Node::Link { target, to, .. },
+                ..
+            }) = self.obs.seen.get(&p)
+            {
+                return Err(link_fail(field, &p, target, *to));
+            }
+        }
         self.claim_checks(path, field)?;
         let parents = self.parents(path, field, true)?;
         self.unchecked(path, field)?;
@@ -713,6 +733,8 @@ impl Planner<'_> {
         });
         match &seen.node {
             Node::Missing {} => {
+                // Apply drops the ledger's stale entry for it (docs/apply.md).
+                op.action = Action::Remove;
                 op.status = Status::Current;
                 op.effect = format!("{path} is already absent; no longer selected");
                 return Ok(());

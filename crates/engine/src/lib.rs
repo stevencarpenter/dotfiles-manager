@@ -4,11 +4,17 @@
 //! The crate names no OS constant: the caller supplies them in [`Sys`] and the paths in
 //! [`Layout`].
 
+pub mod apply;
 pub mod fail;
 pub mod fsys;
 pub mod observe;
+pub mod publish;
 pub mod store;
 
+pub use apply::{
+    Gates, Generator, NoGenerator, RELOAD_NOT_ATTEMPTED, Report, Run, allow_flag, apply,
+    check_allow, check_journal_capacity, gates, owned_outputs,
+};
 #[cfg(feature = "failpoints")]
 pub use fail::Action;
 pub use fail::Fail;

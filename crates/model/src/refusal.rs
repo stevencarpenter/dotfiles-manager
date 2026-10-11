@@ -59,6 +59,11 @@ pub enum Code {
     PrivilegeUnsupported,
     ObservationUnknown,
     TargetReserved,
+    // Apply codes added by DFM-18 (docs/apply.md).
+    GeneratorUnavailable,
+    DisruptiveUnapproved,
+    SensitiveUnsupported,
+    ApprovalRequired,
 }
 
 impl Code {
@@ -111,6 +116,10 @@ impl Code {
         Code::PrivilegeUnsupported,
         Code::ObservationUnknown,
         Code::TargetReserved,
+        Code::GeneratorUnavailable,
+        Code::DisruptiveUnapproved,
+        Code::SensitiveUnsupported,
+        Code::ApprovalRequired,
     ];
 
     pub fn parse(s: &str) -> Option<Code> {
@@ -166,6 +175,10 @@ impl Code {
             Code::PrivilegeUnsupported => "E_PRIVILEGE_UNSUPPORTED",
             Code::ObservationUnknown => "E_OBSERVATION_UNKNOWN",
             Code::TargetReserved => "E_TARGET_RESERVED",
+            Code::GeneratorUnavailable => "E_GENERATOR_UNAVAILABLE",
+            Code::DisruptiveUnapproved => "E_DISRUPTIVE_UNAPPROVED",
+            Code::SensitiveUnsupported => "E_SENSITIVE_UNSUPPORTED",
+            Code::ApprovalRequired => "E_APPROVAL_REQUIRED",
         }
     }
 

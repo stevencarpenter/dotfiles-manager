@@ -19,3 +19,7 @@ workspace = true
 [[test]]
 name = "failpoints"
 required-features = ["failpoints"]
+
+[[test]]
+name = "apply"
+required-features = ["failpoints"]

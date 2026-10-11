@@ -87,7 +87,7 @@ pub fn io(what: &str, e: &std::io::Error) -> Refusal {
     Refusal::new(Code::IoFailed, format!("{what}: {e}"))
 }
 
-fn sys_err(what: &str, e: Errno) -> Refusal {
+pub(crate) fn sys_err(what: &str, e: Errno) -> Refusal {
     io(what, &std::io::Error::from(e))
 }
 
@@ -111,7 +111,20 @@ pub fn below(home: &Path, path: &Path) -> Result<Vec<String>, Refusal> {
         .collect()
 }
 
-fn check_name(name: &str) -> Result<(), Refusal> {
+/// A hidden same-directory name for a staged file or link: unique per process and call.
+pub(crate) fn temp_name(name: &str, suffix: &str) -> String {
+    static N: AtomicU32 = AtomicU32::new(0);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.subsec_nanos());
+    format!(
+        ".{name}.{}.{}.{nanos}.{suffix}",
+        std::process::id(),
+        N.fetch_add(1, Ordering::Relaxed)
+    )
+}
+
+pub(crate) fn check_name(name: &str) -> Result<(), Refusal> {
     if name.is_empty() || name == "." || name == ".." || name.contains('/') || name.contains('\0') {
         return Err(storage(format!("{name:?} is not a plain file name")));
     }
@@ -125,18 +138,18 @@ pub struct Ident {
     ino: u64,
 }
 
-fn ident_of(st: &Stat) -> Result<Ident, Refusal> {
+pub(crate) fn ident_of(st: &Stat) -> Result<Ident, Refusal> {
     Ok(Ident {
         dev: u64::try_from(st.st_dev).map_err(|_| storage("a device number is out of range"))?,
         ino: st.st_ino,
     })
 }
 
-fn mode_bits(st: &Stat) -> u32 {
+pub(crate) fn mode_bits(st: &Stat) -> u32 {
     u32::from(st.st_mode) & 0o777
 }
 
-fn kind(st: &Stat) -> FileType {
+pub(crate) fn kind(st: &Stat) -> FileType {
     FileType::from_raw_mode(st.st_mode)
 }
 
@@ -212,7 +225,7 @@ pub enum PeekTo {
 /// An open directory. Operations take a plain entry name and act on this directory only.
 #[derive(Debug)]
 pub struct Dir {
-    fd: OwnedFd,
+    pub(crate) fd: OwnedFd,
     /// Where this directory was reached, for messages only. Never used to act.
     shown: PathBuf,
 }
@@ -273,7 +286,7 @@ impl Dir {
         ident_of(&rfs::fstat(&self.fd).map_err(|e| sys_err("stat directory", e))?)
     }
 
-    fn at(&self, name: &str) -> PathBuf {
+    pub(crate) fn at(&self, name: &str) -> PathBuf {
         self.shown.join(name)
     }
 
@@ -295,7 +308,7 @@ impl Dir {
     /// checks it on the descriptor: owned by the current user, and `private` means exactly
     /// 0700 while otherwise it only has to be closed to group and others. `None` when absent
     /// and `create` is not set. Nothing is repaired or replaced.
-    pub fn child(
+    pub(crate) fn child(
         &self,
         sys: &Sys,
         name: &str,
@@ -357,7 +370,7 @@ impl Dir {
     /// Walks `rel` below this directory with [`Dir::child`]. Components from index
     /// `private_from` on must be exactly 0700. `None` when a component is absent and `create`
     /// is not set.
-    pub fn walk(
+    pub(crate) fn walk(
         &self,
         sys: &Sys,
         rel: &[String],
@@ -476,15 +489,20 @@ impl Dir {
 
     /// A same-directory temporary file, fully written and synced, named so that readers ignore it.
     fn write_temp(&self, name: &str, bytes: &[u8]) -> Result<String, Refusal> {
-        static N: AtomicU32 = AtomicU32::new(0);
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| d.subsec_nanos());
-        let tmp = format!(
-            ".{name}.{}.{}.{nanos}.tmp",
-            std::process::id(),
-            N.fetch_add(1, Ordering::Relaxed)
-        );
+        self.write_temp_mode(name, bytes, 0o600)
+    }
+
+    /// As [`Dir::write_temp`], with the mode the published file will have. The mode is set
+    /// before any content is written, so the file is never wider than `mode`.
+    pub(crate) fn write_temp_mode(
+        &self,
+        name: &str,
+        bytes: &[u8],
+        mode: u32,
+    ) -> Result<String, Refusal> {
+        let tmp = temp_name(name, "tmp");
+        let raw = rfs::RawMode::try_from(mode)
+            .map_err(|_| storage(format!("file mode {mode:o} is out of range")))?;
         let fd = rfs::openat(
             &self.fd,
             &tmp,
@@ -492,7 +510,7 @@ impl Dir {
             Mode::from_raw_mode(0o600),
         )
         .map_err(|e| sys_err("create temporary file", e))?;
-        let written = rfs::fchmod(&fd, Mode::from_raw_mode(0o600))
+        let written = rfs::fchmod(&fd, Mode::from_raw_mode(raw))
             .map_err(std::io::Error::from)
             .and_then(|()| {
                 let mut f = File::from(fd);
@@ -509,7 +527,7 @@ impl Dir {
     }
 
     /// Removes a temporary name. Used where a failure leaves nothing that matters.
-    fn drop_temp(&self, tmp: &str) {
+    pub(crate) fn drop_temp(&self, tmp: &str) {
         let _ = rfs::unlinkat(&self.fd, tmp, AtFlags::empty());
     }
 
@@ -543,7 +561,7 @@ impl Dir {
     /// the rename leaves the previous file, which is the last good state. A failure after it is
     /// `E_IO_UNCONFIRMED`: the new file is in place and only its durability is unknown.
     /// Failure points are `<label>-before-write`, `-after-tmp` and `-after-rename`.
-    pub fn replace_file(
+    pub(crate) fn replace_file(
         &self,
         name: &str,
         bytes: &[u8],
@@ -605,6 +623,7 @@ impl Dir {
     /// Appends one complete line. The file must exist, be private, have one link and end with a
     /// newline (or be empty), so a torn earlier line is never extended. Failure points:
     /// `<label>-before-write` and `<label>-after-write`.
+    #[doc(hidden)]
     pub fn append_line(
         &self,
         sys: &Sys,
@@ -775,14 +794,14 @@ impl Dir {
     }
 
     /// Renames an entry of this directory. The target must not be a non-empty directory.
-    pub fn rename(&self, from: &str, to: &str) -> Result<(), Refusal> {
+    pub(crate) fn rename(&self, from: &str, to: &str) -> Result<(), Refusal> {
         check_name(from)?;
         check_name(to)?;
         rfs::renameat(&self.fd, from, &self.fd, to).map_err(|e| sys_err("rename", e))
     }
 
     /// Removes the directory `name` and everything below it without following any link.
-    pub fn remove_tree(&self, sys: &Sys, name: &str) -> Result<(), Refusal> {
+    pub(crate) fn remove_tree(&self, sys: &Sys, name: &str) -> Result<(), Refusal> {
         let Some(d) = self.child(sys, name, false, false)? else {
             return Ok(());
         };

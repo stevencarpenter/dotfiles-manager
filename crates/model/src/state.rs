@@ -330,7 +330,17 @@ pub struct OperationRecord {
     pub after: Option<Fingerprint>,
     pub owned_outputs: Vec<String>,
     pub error: Option<String>,
+    /// What happened to the consumer of a published file, recorded apart from the publication
+    /// (architecture section 8: a correct file and a reloaded consumer are separate
+    /// postconditions). One of [`RELOADS`]. Absent when the operation published nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reload: Option<String>,
 }
+
+/// The consumer reload states the manager can record. Only `not_attempted` exists until a
+/// `Reloader` does (architecture section 11 names `requested`, `reloaded`, `unsupported` and
+/// `failed` for it). A state nothing can write is refused, so a receipt cannot claim one.
+pub const RELOADS: [&str; 1] = ["not_attempted"];
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -359,8 +369,22 @@ pub struct Approval {
 #[serde(deny_unknown_fields)]
 pub struct SourceId {
     pub id: String,
-    pub commit: String,
+    /// Absent for a local path source, which has no commit. The `tree` digest identifies it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commit: Option<String>,
     pub tree: String,
+}
+
+/// One approved disruptive operation (architecture section 5, `approvals[]`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DisruptiveApproval {
+    /// The `id` of the receipt operation that ran with this approval.
+    pub operation_id: String,
+    /// `allow_disruptive`. The contract also names `interactive`, which needs a prompt that
+    /// does not exist yet.
+    pub how: String,
+    pub at: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -386,6 +410,9 @@ pub struct Receipt {
     pub plan_digest: Option<String>,
     pub approval: Option<Approval>,
     pub sources: Vec<SourceId>,
+    /// One entry per disruptive operation that ran with an approval.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub approvals: Vec<DisruptiveApproval>,
     pub operations: Vec<OperationRecord>,
     pub result: RunResult,
 }
@@ -448,6 +475,9 @@ impl Receipt {
             if o.error.as_ref().is_some_and(|e| e.len() > MAX_ERROR_BYTES) {
                 return Err(bad(format!("operation {} error is not bounded", o.id)));
             }
+            if o.reload.as_deref().is_some_and(|r| !RELOADS.contains(&r)) {
+                return Err(bad(format!("operation {} reload state is unknown", o.id)));
+            }
         }
         Ok(())
     }
@@ -481,8 +511,15 @@ impl Receipt {
         }
         for src in &self.sources {
             let tree_ok = src.tree.strip_prefix("sha256:").is_some_and(valid_sha256);
-            if !valid_id(&src.id) || !hex_id(&src.commit) || !tree_ok {
+            let commit_ok = src.commit.as_deref().is_none_or(hex_id);
+            if !valid_id(&src.id) || !commit_ok || !tree_ok {
                 return Err(bad("receipt source identity is malformed"));
+            }
+        }
+        for a in &self.approvals {
+            let known = self.operations.iter().any(|o| o.id == a.operation_id);
+            if a.how != "allow_disruptive" || !known || parse_rfc3339(&a.at).is_none() {
+                return Err(bad("receipt approvals[] entry is malformed"));
             }
         }
         let exit_name = match self.result.exit_code {
@@ -1045,6 +1082,7 @@ mod tests {
             after: None,
             owned_outputs: vec!["/h/.gitconfig".into()],
             error: None,
+            reload: None,
         }
     }
 
@@ -1069,6 +1107,7 @@ mod tests {
             plan_digest: None,
             approval: None,
             sources: vec![],
+            approvals: vec![],
             result: RunResult {
                 outcome: "ok".into(),
                 exit_code: 0,
@@ -1359,6 +1398,45 @@ mod tests {
     }
 
     #[test]
+    fn a_reload_state_must_come_from_the_fixed_list_and_round_trips() {
+        for name in RELOADS {
+            let mut o = op(Status::Updated, Class::Normal);
+            o.reload = Some(name.into());
+            let r = receipt(vec![o]);
+            r.validate().unwrap();
+            let again = Receipt::parse(&canonical(&r).unwrap()).unwrap();
+            assert_eq!(again.operations[0].reload.as_deref(), Some(name));
+        }
+        let mut o = op(Status::Updated, Class::Normal);
+        o.reload = Some("done".into());
+        assert_eq!(
+            receipt(vec![o]).validate().unwrap_err().code,
+            Code::StateInvalid
+        );
+        // An absent field is not written, so receipts without it keep their bytes.
+        let plain = canonical(&receipt(vec![op(Status::Updated, Class::Normal)])).unwrap();
+        assert!(!String::from_utf8(plain).unwrap().contains("reload"));
+    }
+
+    #[test]
+    fn a_path_source_and_a_disruptive_approval_validate_and_round_trip() {
+        let mut r = receipt(vec![op(Status::Updated, Class::Normal)]);
+        r.sources = vec![SourceId {
+            id: "path-0123456789ab".into(),
+            commit: None,
+            tree: format!("sha256:{}", "b".repeat(64)),
+        }];
+        r.approvals = vec![DisruptiveApproval {
+            operation_id: "op1".into(),
+            how: "allow_disruptive".into(),
+            at: "2026-10-10T00:00:00Z".into(),
+        }];
+        r.validate().unwrap();
+        let again = Receipt::parse(&canonical(&r).unwrap()).unwrap();
+        assert_eq!(again, r);
+    }
+
+    #[test]
     fn receipt_fields_without_free_text_must_have_their_exact_shape() {
         let good = receipt(vec![op(Status::Updated, Class::Normal)]);
         assert!(good.validate().is_ok());
@@ -1382,10 +1460,24 @@ mod tests {
         let mut r = good.clone();
         r.sources = vec![SourceId {
             id: "s".into(),
-            commit: "zz".into(),
+            commit: Some("zz".into()),
             tree: "x".into(),
         }];
         cases.push(("source", r));
+        let mut r = good.clone();
+        r.approvals = vec![DisruptiveApproval {
+            operation_id: "no-such-op".into(),
+            how: "allow_disruptive".into(),
+            at: "2026-10-10T00:00:00Z".into(),
+        }];
+        cases.push(("approval for an unknown operation", r));
+        let mut r = good.clone();
+        r.approvals = vec![DisruptiveApproval {
+            operation_id: "op1".into(),
+            how: "interactive".into(),
+            at: "2026-10-10T00:00:00Z".into(),
+        }];
+        cases.push(("approval kind with no prompt behind it", r));
         let mut r = good.clone();
         r.operations[0].started_at = Some("yesterday".into());
         cases.push(("time", r));
