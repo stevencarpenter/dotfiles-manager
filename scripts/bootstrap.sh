@@ -485,6 +485,26 @@ ensure_command_link() {
   [ "$(readlink "$link")" = "$want" ] || { echo "error: the command link is '$(readlink "$link" || true)', expected '$want'" >&2; exit 1; }
 }
 
+# The CLI opens the binding through open_config: HOME, then .config and .config/dotfiles-manager,
+# each opened without following a link, owned by the current user and closed to group and others
+# (mode & 022 == 0). Mirror those rules on every component that exists. A missing component is fine:
+# the CLI creates it. HOME itself may be reached through an alias, as in open_home.
+check_config_tree() {
+  _uid=$(/usr/bin/id -u)
+  for _p in "$HOME_DIR" "$HOME_DIR/.config" "$HOME_DIR/.config/dotfiles-manager"; do
+    if [ "$_p" != "$HOME_DIR" ]; then
+      { [ -e "$_p" ] || [ -L "$_p" ]; } || return 0
+      [ ! -L "$_p" ] || refuse E_PREREQ_MISSING "$_p is a symlink; the CLI refuses a binding reached through it. Move it away first"
+      [ -d "$_p" ] || refuse E_PREREQ_MISSING "$_p exists and is not a directory; move it away first"
+    fi
+    [ "$(/usr/bin/stat -f %u "$_p")" = "$_uid" ] ||
+      refuse E_PREREQ_MISSING "$_p is not owned by the current user; the CLI refuses a binding below it"
+    _m=$(/usr/bin/stat -f %Lp "$_p")
+    [ $(( 0$_m & 022 )) -eq 0 ] ||
+      refuse E_PREREQ_MISSING "$_p has mode $_m, writable by group or others; the CLI refuses a binding below it"
+  done
+}
+
 # An existing binding must be usable by the new binary exactly as it is: a regular file, not a
 # symlink or FIFO, mode 0600, owned by the current user (the rules of read_binding in the CLI).
 check_binding() {
@@ -554,7 +574,7 @@ cmd_install() {
   [ -d "$DATA/toolchains/$hint" ] ||
     refuse E_TOOLCHAIN_MISMATCH "toolchain $hint is absent at $DATA/toolchains/$hint; install exactly that version there (official Rust release distribution)"
   check_command_path
-  check_binding
+  check_config_tree; check_binding
   check_cache_tree; check_data_tree; check_bin_dir
   build=$CACHE/build
   rm_build; mkdir -p "$build/stage"
@@ -581,7 +601,7 @@ cmd_install() {
   # The new binary must be able to read the binding that already exists, so it checks a copy.
   mkdir -p "$build/fixture"
   if test_mode && [ -n "${DFM_TEST_BEFORE_COPY:-}" ]; then /bin/sh "$DFM_TEST_BEFORE_COPY"; fi
-  check_binding
+  check_config_tree; check_binding
   if [ -e "$HOME_DIR/.config/dotfiles-manager/machine.toml" ]; then
     cp -p "$HOME_DIR/.config/dotfiles-manager/machine.toml" "$build/fixture/machine.toml"
   fi
@@ -603,7 +623,7 @@ cmd_install() {
     { rm -f "$staged_bin"; echo "error: cannot stage the binary" >&2; exit 1; }
   if test_mode && [ -n "${DFM_TEST_BEFORE_SWAP:-}" ]; then /bin/sh "$DFM_TEST_BEFORE_SWAP"; fi
   check_command_path
-  check_binding
+  check_config_tree; check_binding
   # The command link is the only step in a directory the manager does not own, so it comes before
   # the flip. After the flip only the read-back and the cleanup remain.
   ensure_command_link
