@@ -33,6 +33,7 @@ usage:
   dotfiles-manager bind --profile <file> --machine-id <id>
   dotfiles-manager binding
   dotfiles-manager state check
+  dotfiles-manager state recover
   dotfiles-manager state resolve <journal-id> --as done|failed
   dotfiles-manager explain <resource-or-target> --root <dir>
   dotfiles-manager plan --root <dir> [--json] [--against <saved plan>]
@@ -72,10 +73,12 @@ written) only with --allow-adopt <operation-id>.
 --preview prints the plan and its digest and changes nothing.
 
 An operation that ended unknown (E_OP_INTERRUPTED) blocks its path in every later run. Each apply
-checks the path again and settles the entry when the result is clear. Doctor and status list the
-entries that are still open with their journal id. state resolve <journal-id> --as done|failed
-settles one by hand: done needs the path to hold the result the operation expected (else
-E_CONFLICT); failed needs nothing. It takes the writer lock and journals the reason: resolved by operator.
+checks the path again and settles the entry when the result is clear. state recover does only that:
+it needs no plan and no approval flag, takes the writer lock, journals what it settles, writes no
+receipt, and exits 3 while an entry stays open. Doctor and status list open entries with their
+journal id. state resolve <journal-id> --as done|failed settles one by hand: done needs the path
+to hold the result the operation expected (else E_CONFLICT); failed needs nothing and is the only
+way to clear an entry that has no intent record. Both journal the reason: resolved by operator.
 
 exit codes: 0 ok, 1 failed, 2 usage, 3 blocked before mutation, 4 declined,
 5 pending, 130 interrupted, 143 terminated.

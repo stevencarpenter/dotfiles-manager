@@ -2,7 +2,8 @@
 //! binary (isolated builds only).
 
 use super::{Ctx, bounded, header, usage};
-use dfm_engine::{Dir, Fail, Store, resolve, verify_identity};
+use dfm_engine::{Dir, Fail, Store, Sys, recover, resolve, verify_identity};
+use dfm_model::state::Phase;
 use dfm_model::{Code, Refusal};
 use std::io::Write;
 
@@ -130,14 +131,24 @@ pub fn check(ctx: &Ctx, out: &mut dyn Write) -> Result<(), Refusal> {
     }
 }
 
-/// `state resolve <journal-id> --as done|failed`: settles an `unknown` outcome that no probe
-/// can decide. It takes the writer lock and appends one journal entry with the reason
-/// "resolved by operator". `done` needs the live path to match what the operation expected,
-/// and then records ownership as the operation would have. No receipt is written: the journal
-/// entry is the record.
-pub fn resolve_cmd(ctx: &Ctx, id: &str, as_done: bool, out: &mut dyn Write) -> Result<(), Refusal> {
-    let w =
-        |e: std::io::Error| Refusal::new(Code::IoFailed, format!("output failed: {}", e.kind()));
+/// A store opened for writing under the writer lock, with the opened HOME.
+struct Locked {
+    store: Store,
+    home: Dir,
+    sys: Sys,
+    home_path: std::path::PathBuf,
+}
+
+/// A refusal after the store wrote anything exits 1, not 3 (architecture section 10).
+fn stamped(store: &Store, r: Refusal) -> Refusal {
+    if store.mutated() {
+        r.after_mutation()
+    } else {
+        r
+    }
+}
+
+fn open_locked(ctx: &Ctx) -> Result<Locked, Refusal> {
     let binding = super::read_existing_binding(ctx)?.ok_or_else(|| {
         Refusal::new(
             Code::BindingInvalid,
@@ -146,13 +157,6 @@ pub fn resolve_cmd(ctx: &Ctx, id: &str, as_done: bool, out: &mut dyn Write) -> R
     })?;
     let (layout, sys) = (ctx.layout(), ctx.sys()?);
     let store = Store::open_write_with(sys, &layout, fail_from_env()?, false)?;
-    let stamped = |store: &Store, r: Refusal| {
-        if store.mutated() {
-            r.after_mutation()
-        } else {
-            r
-        }
-    };
     if !store.is_initialized() {
         return Err(stamped(&store, super::state_lost_refusal()));
     }
@@ -160,21 +164,97 @@ pub fn resolve_cmd(ctx: &Ctx, id: &str, as_done: bool, out: &mut dyn Write) -> R
         .require_identity(&binding)
         .map_err(|r| stamped(&store, r))?;
     let home = Dir::open_home(&sys, &layout.home).map_err(|r| stamped(&store, r))?;
-    resolve(&store, (&sys, &home, &layout.home), id, as_done).map_err(|r| stamped(&store, r))?;
-    header(out, ctx).map_err(w)?;
+    Ok(Locked {
+        store,
+        home,
+        sys,
+        home_path: layout.home,
+    })
+}
+
+fn out_err(e: std::io::Error) -> Refusal {
+    Refusal::new(Code::IoFailed, format!("output failed: {}", e.kind()))
+}
+
+/// `state resolve <journal-id> --as done|failed`: settles an `unknown` outcome that no probe
+/// can decide. It takes the writer lock and appends one journal entry with the reason
+/// "resolved by operator". `done` needs the live path to match what the operation expected,
+/// and then records ownership under the same shape rules as apply. No receipt is written: the
+/// journal entry is the record.
+pub fn resolve_cmd(ctx: &Ctx, id: &str, as_done: bool, out: &mut dyn Write) -> Result<(), Refusal> {
+    let l = open_locked(ctx)?;
+    resolve(&l.store, (&l.sys, &l.home, &l.home_path), id, as_done)
+        .map_err(|r| stamped(&l.store, r))?;
+    header(out, ctx).map_err(out_err)?;
     writeln!(
         out,
         "resolved {} as {}",
         bounded(id),
         if as_done { "done" } else { "failed" }
     )
-    .map_err(w)
+    .map_err(out_err)
+}
+
+/// `state recover`: settles what the machine shows clearly, with no plan and no allowance
+/// flags. It takes the writer lock and writes journal entries (and ledger entries for a `done`
+/// that apply would own). It writes no receipt. Exit 0 when nothing stays open, else 3 with
+/// `E_OP_INTERRUPTED` naming each journal id.
+pub fn recover_cmd(ctx: &Ctx, out: &mut dyn Write) -> Result<(), Refusal> {
+    let l = open_locked(ctx)?;
+    let s = recover(&l.store, (&l.sys, &l.home, &l.home_path)).map_err(|r| stamped(&l.store, r))?;
+    header(out, ctx).map_err(out_err)?;
+    for (id, phase) in &s.closed {
+        let what = if *phase == Phase::Done {
+            "done"
+        } else {
+            "failed"
+        };
+        writeln!(out, "settled {} as {what}", bounded(id)).map_err(out_err)?;
+    }
+    for o in &s.open {
+        writeln!(
+            out,
+            "open {} ({} of {}) {}",
+            bounded(&o.id),
+            o.op,
+            bounded(&o.resource),
+            o.paths
+                .iter()
+                .map(|p| bounded(p))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+        .map_err(out_err)?;
+    }
+    if s.closed.is_empty() && s.open.is_empty() {
+        return writeln!(out, "nothing to recover").map_err(out_err);
+    }
+    // An open entry is a result to report, not a failure of this command: exit 3 even when
+    // other entries were settled.
+    match s.open.first() {
+        None => Ok(()),
+        Some(first) => Err(Refusal::new(
+            Code::OpInterrupted,
+            format!(
+                "{} operation(s) stay open: {}. Nothing the machine shows clearly is left unsettled. Check the path, then run `dotfiles-manager state resolve '{}' --as done|failed`",
+                s.open.len(),
+                s.open
+                    .iter()
+                    .map(|o| bounded(&o.id))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                bounded(&first.id)
+            ),
+        )),
+    }
 }
 
 pub fn dispatch_state(ctx: &Ctx, rest: &[String], out: &mut dyn Write) -> Result<(), Refusal> {
-    const USAGE: &str = "usage: state check | state resolve <journal-id> --as done|failed";
+    const USAGE: &str =
+        "usage: state check | state recover | state resolve <journal-id> --as done|failed";
     match rest {
         [sub] if sub == "check" => check(ctx, out),
+        [sub] if sub == "recover" => recover_cmd(ctx, out),
         [sub, id, flag, kind] if sub == "resolve" && flag == "--as" => match kind.as_str() {
             "done" | "failed" => resolve_cmd(ctx, id, kind == "done", out),
             _ => Err(usage("state resolve: --as is done or failed")),

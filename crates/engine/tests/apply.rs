@@ -130,6 +130,10 @@ fn op(h: &Home, store: &Store, id: &str, n: u32, action: Action, rel: &str) -> O
 }
 
 fn plan(ops: Vec<Operation>) -> Plan {
+    plan_in("/src", ops)
+}
+
+fn plan_in(root: &str, ops: Vec<Operation>) -> Plan {
     Plan {
         schema: 1,
         command: "plan".into(),
@@ -143,7 +147,7 @@ fn plan(ops: Vec<Operation>) -> Plan {
         model_digest: "0".repeat(64),
         sources: vec![Source {
             kind: "path".into(),
-            root: "/src".into(),
+            root: root.into(),
             tree: "sha256:0".into(),
         }],
         observations: Observations::default(),
@@ -1671,13 +1675,29 @@ fn a_fragment_directory_with_too_many_entries_is_stale() {
 
 // ---- recovery across runs (DFM-19) -----------------------------------------------------------
 
-/// Run 1 ends `unknown` for a link `l` (the failpoint fires after the link exists).
+/// A real source file, so a link to it resolves to a regular file. Returns the source root.
+fn real_src(s: &Setup) -> String {
+    let root = s.h.0.with_extension("src");
+    fs::create_dir_all(&root).unwrap();
+    fs::write(root.join("x"), "x\n").unwrap();
+    root.to_str().unwrap().to_string()
+}
+
+/// A link operation to the real source file `x`.
+fn link_op(s: &Setup, n: u32, rel: &str) -> Operation {
+    let mut l = op(&s.h, &s.store, "x@link", n, Action::CreateLink, rel);
+    l.link = Some(format!("{}/x", real_src(s)));
+    l
+}
+
+/// Run 1 ends `unknown` for a link `l` (the failpoint fires after the link exists). The
+/// resource already has a ledger entry, as automatic ownership requires.
 fn unknown_link(s: &Setup) {
-    let mut l = op(&s.h, &s.store, "x@link", 1, Action::CreateLink, "l");
-    l.link = Some("/src/x".into());
+    own(s, "seed", "seed\n");
+    let l = link_op(s, 1, "l");
     let rep = go_with(
         s,
-        &plan(vec![l]),
+        &plan_in(&real_src(s), vec![l]),
         &gens(),
         &none(),
         &Fail::at("link-after-create", Inject::Error),
@@ -1706,6 +1726,7 @@ fn owned_paths(s: &Setup) -> Vec<(String, Option<String>)> {
         .resources
         .iter()
         .flat_map(|r| r.owned_outputs.iter())
+        .filter(|o| !o.path.ends_with("/seed"))
         .map(|o| (o.path.clone(), o.fingerprint.clone()))
         .collect()
 }
@@ -1721,8 +1742,13 @@ fn an_unknown_link_that_is_now_present_settles_done_in_the_next_run_with_ownersh
     assert_eq!(e.phase, Phase::Done);
     assert_eq!(e.reason.as_deref(), Some("recovered: done"));
     let abs = s.h.0.join("l").to_str().unwrap().to_string();
-    assert!(owned_paths(&s).contains(&(abs, Some(link_fingerprint("/src/x")))));
-    assert_eq!(fs::read_link(s.h.0.join("l")).unwrap(), Path::new("/src/x"));
+    assert!(
+        owned_paths(&s).contains(&(abs, Some(link_fingerprint(&format!("{}/x", real_src(&s))))))
+    );
+    assert_eq!(
+        fs::read_link(s.h.0.join("l")).unwrap(),
+        Path::new(&format!("{}/x", real_src(&s)))
+    );
 }
 
 #[test]
@@ -1736,9 +1762,8 @@ fn an_unknown_link_removed_between_runs_settles_failed_and_the_path_is_free() {
     assert_eq!(e.reason.as_deref(), Some("recovered: not done"));
     assert!(owned_paths(&s).iter().all(|(p, _)| !p.ends_with("/l")));
     // The path is free: a new link there is created.
-    let mut l = op(&s.h, &s.store, "x@link", 2, Action::CreateLink, "l");
-    l.link = Some("/src/x".into());
-    let rep = go(&s, &plan(vec![l]), &gens(), &none());
+    let l = link_op(&s, 2, "l");
+    let rep = go(&s, &plan_in(&real_src(&s), vec![l]), &gens(), &none());
     assert_eq!(rep.operations[0].status, Status::Updated);
 }
 
@@ -1760,9 +1785,8 @@ fn an_unknown_that_the_probe_cannot_decide_blocks_its_path_in_every_run() {
             Action::CreateFile,
             &format!("g{n}"),
         );
-        let mut l = op(&s.h, &s.store, "x@link", 2, Action::CreateLink, "l");
-        l.link = Some("/src/x".into());
-        let rep = go(&s, &plan(vec![g, l]), &gens(), &none());
+        let l = link_op(&s, 2, "l");
+        let rep = go(&s, &plan_in(&real_src(&s), vec![g, l]), &gens(), &none());
         assert_eq!(rep.operations[1].status, Status::Blocked);
         let r = rep.stopped.unwrap();
         assert_eq!(r.code, Code::OpInterrupted);
@@ -1799,7 +1823,7 @@ fn an_interrupted_intent_the_probe_cannot_decide_stays_blocked_across_runs() {
                 outputs: vec![RecoveryOutput {
                     path: abs,
                     existed_before: false,
-                    expected_sha256: Some(link_fingerprint("/src/x")),
+                    expected_sha256: Some(link_fingerprint(&format!("{}/x", real_src(&s)))),
                 }],
                 snapshot: None,
             }),
@@ -1808,9 +1832,8 @@ fn an_interrupted_intent_the_probe_cannot_decide_stays_blocked_across_runs() {
         })
         .unwrap();
     for _ in 0..2 {
-        let mut l = op(&s.h, &s.store, "x@link", 2, Action::CreateLink, "l");
-        l.link = Some("/src/x".into());
-        let rep = go(&s, &plan(vec![l]), &gens(), &none());
+        let l = link_op(&s, 2, "l");
+        let rep = go(&s, &plan_in(&real_src(&s), vec![l]), &gens(), &none());
         assert_eq!(rep.operations[0].status, Status::Blocked);
         assert_eq!(rep.stopped.unwrap().code, Code::OpInterrupted);
     }
@@ -1905,7 +1928,7 @@ fn resolve_done_records_ownership_only_for_a_matching_path_and_failed_needs_noth
     assert_eq!(e.code, Code::Usage);
     // Match: restore the link.
     fs::remove_file(s.h.0.join("l")).unwrap();
-    symlink("/src/x", s.h.0.join("l")).unwrap();
+    symlink(format!("{}/x", real_src(&s)), s.h.0.join("l")).unwrap();
     dfm_engine::resolve(&s.store, r, &id, true).unwrap();
     let last = last_of(&s, &jid(1));
     assert_eq!(last.phase, Phase::Done);
@@ -1930,4 +1953,299 @@ fn resolve_done_records_ownership_only_for_a_matching_path_and_failed_needs_noth
     dfm_engine::resolve(&s.store, r, &id, false).unwrap();
     assert_eq!(last_of(&s, &jid(1)).phase, Phase::Failed);
     assert!(owned_paths(&s).is_empty());
+}
+
+// ---- recovery hardening (DFM-19 fix round) ---------------------------------------------------
+
+/// Writes an intent and an `unknown` entry by hand, as a forged or foreign journal would.
+fn forge(
+    s: &Setup,
+    (id, op, resource): (&str, &str, &str),
+    (path, existed_before, expected): (&str, bool, Option<String>),
+    reason: &str,
+    with_intent: bool,
+) {
+    use dfm_model::state::{Recovery, RecoveryOutput};
+    let entry = |phase, recovery| JournalEntry {
+        schema: 1,
+        op_id: id.into(),
+        op: op.into(),
+        phase,
+        at: "2026-10-10T00:00:00Z".into(),
+        resource: resource.into(),
+        adapter: "git-config/v1".into(),
+        class: Class::Normal,
+        recovery,
+        token: None,
+        reason: (phase == Phase::Unknown).then(|| reason.to_string()),
+    };
+    if with_intent {
+        let rec = Recovery {
+            outputs: vec![RecoveryOutput {
+                path: s.h.0.join(path).to_str().unwrap().into(),
+                existed_before,
+                expected_sha256: expected,
+            }],
+            snapshot: None,
+        };
+        s.store
+            .append_journal(&entry(Phase::Intent, Some(rec)))
+            .unwrap();
+    }
+    s.store
+        .append_journal(&entry(Phase::Unknown, None))
+        .unwrap();
+}
+
+fn real_link(s: &Setup, rel: &str) -> String {
+    let t = format!("{}/x", real_src(s));
+    symlink(&t, s.h.0.join(rel)).unwrap();
+    link_fingerprint(&t)
+}
+
+fn recover_now(s: &Setup) -> dfm_engine::Settled {
+    let home = Dir::open_home(&sys(&s.h), &s.h.0).unwrap();
+    dfm_engine::recover(&s.store, (&sys(&s.h), &home, s.h.0.as_path())).unwrap()
+}
+
+#[test]
+fn a_case_only_spelling_of_a_blocked_path_is_still_blocked() {
+    let s = setup();
+    unknown_link(&s);
+    fs::remove_file(s.h.0.join("l")).unwrap();
+    fs::create_dir(s.h.0.join("l")).unwrap();
+    for rel in ["L", "l/CHILD"] {
+        let mut o = op(&s.h, &s.store, "x@file", 8, Action::CreateFile, "g9");
+        o.path = Some(rel.into());
+        let rep = go(&s, &plan(vec![o]), &gens(), &none());
+        assert_eq!(rep.operations[0].status, Status::Blocked, "{rel}");
+        assert_eq!(rep.stopped.unwrap().code, Code::OpInterrupted, "{rel}");
+    }
+}
+
+#[test]
+fn an_unknown_with_no_intent_blocks_its_whole_resource_until_resolved_failed() {
+    let s = setup();
+    forge(
+        &s,
+        ("orphan-1", "create-link", "core.x"),
+        ("l", false, None),
+        "unconfirmed: x",
+        false,
+    );
+    let g = op(&s.h, &s.store, "x@file", 7, Action::CreateFile, "g");
+    let rep = go(&s, &plan(vec![g]), &gens(), &none());
+    assert_eq!(rep.operations[0].status, Status::Blocked);
+    let r = rep.stopped.unwrap();
+    assert_eq!(r.code, Code::OpInterrupted);
+    assert!(
+        r.detail.contains("orphan-1") && r.detail.contains("--as failed"),
+        "{}",
+        r.detail
+    );
+    assert!(!s.h.0.join("g").exists());
+    // Settling cannot decide it, and `done` is refused.
+    let st = recover_now(&s);
+    assert_eq!(st.open.len(), 1);
+    assert!(!st.open[0].has_intent);
+    let home = Dir::open_home(&sys(&s.h), &s.h.0).unwrap();
+    let sy = sys(&s.h);
+    let w = (&sy, &home, s.h.0.as_path());
+    let e = dfm_engine::resolve(&s.store, w, "orphan-1", true).unwrap_err();
+    assert_eq!(e.code, Code::Conflict);
+    dfm_engine::resolve(&s.store, w, "orphan-1", false).unwrap();
+    let g = op(&s.h, &s.store, "x@file", 7, Action::CreateFile, "g");
+    let rep = go(&s, &plan(vec![g]), &gens(), &none());
+    assert_eq!(rep.operations[0].status, Status::Updated);
+}
+
+#[test]
+fn a_forged_or_late_matching_unknown_never_creates_ownership() {
+    // Forged: a real link and an intent plus unknown for it, on a resource the ledger and the
+    // plan do not know.
+    let s = setup();
+    let fp = real_link(&s, "l");
+    forge(
+        &s,
+        ("forged-1", "create-link", "other.res"),
+        ("l", false, Some(fp.clone())),
+        "unconfirmed: x",
+        true,
+    );
+    let st = recover_now(&s);
+    assert_eq!(st.closed, [("forged-1".to_string(), Phase::Done)]);
+    assert!(owned_paths(&s).is_empty(), "unknown resource");
+
+    // The same on a resource the ledger knows, but the entry was not seen to match when it was
+    // written (no `unconfirmed:` mark): the match appeared later.
+    let s = setup();
+    own(&s, "seed", "seed\n");
+    let fp = real_link(&s, "l");
+    forge(
+        &s,
+        ("late-1", "create-link", "core.x"),
+        ("l", false, Some(fp.clone())),
+        "reconciled: the effect cannot be observed",
+        true,
+    );
+    recover_now(&s);
+    assert!(owned_paths(&s).is_empty(), "late match");
+
+    // A create that found the path present before is not owned either.
+    let s = setup();
+    own(&s, "seed", "seed\n");
+    let fp = real_link(&s, "l");
+    forge(
+        &s,
+        ("pre-1", "create-link", "core.x"),
+        ("l", true, Some(fp)),
+        "unconfirmed: x",
+        true,
+    );
+    recover_now(&s);
+    assert!(owned_paths(&s).is_empty(), "existed before");
+
+    // A link to something that is not a regular file is not owned.
+    let s = setup();
+    own(&s, "seed", "seed\n");
+    symlink("/nowhere", s.h.0.join("l")).unwrap();
+    forge(
+        &s,
+        ("dang-1", "create-link", "core.x"),
+        ("l", false, Some(link_fingerprint("/nowhere"))),
+        "unconfirmed: x",
+        true,
+    );
+    let st = recover_now(&s);
+    assert_eq!(st.closed.len(), 1);
+    assert!(owned_paths(&s).is_empty(), "dangling link");
+
+    // The legitimate case still records ownership.
+    let s = setup();
+    unknown_link(&s);
+    recover_now(&s);
+    assert_eq!(owned_paths(&s).len(), 1);
+}
+
+#[test]
+fn a_plan_that_names_the_output_lets_settling_own_a_new_resource() {
+    let s = setup();
+    let root = real_src(&s);
+    let l = link_op(&s, 1, "l");
+    let rep = go_with(
+        &s,
+        &plan_in(&root, vec![l]),
+        &gens(),
+        &none(),
+        &Fail::at("link-after-create", Inject::Error),
+    );
+    assert_eq!(rep.operations[0].status, Status::Unknown);
+    // The resource has no ledger entry. The plan names the output (an adoption), so the entry
+    // is settled and owned first, and the adoption is current.
+    let mut a = link_op(&s, 2, "l");
+    a.action = Action::Adopt;
+    let id = a.id.clone();
+    let adopt = BTreeSet::from([id]);
+    let home = Dir::open_home(&sys(&s.h), &s.h.0).unwrap();
+    let (g, fail, nobody) = (gens(), Fail::none(), none());
+    let r = Run {
+        allow_adopt: &adopt,
+        ..run(&s, &g, &nobody, &fail, &home)
+    };
+    let rep = apply(&r, &plan_in(&root, vec![a])).unwrap();
+    assert_eq!(
+        rep.operations[0].status,
+        Status::Current,
+        "{:?}",
+        rep.stopped
+    );
+    assert_eq!(owned_paths(&s).len(), 1);
+}
+
+#[test]
+fn settle_only_recovery_clears_an_unknown_replace_link_and_reports_what_stays_open() {
+    // The replace-link deadlock: the owned link now has the new target, the ledger the old one.
+    let s = setup();
+    let root = real_src(&s);
+    let (old, new) = (format!("{root}/old"), format!("{root}/x"));
+    fs::write(format!("{root}/old"), "old\n").unwrap();
+    symlink(&old, s.h.0.join("l")).unwrap();
+    own_fp(&s, "l", &link_fingerprint(&old));
+    let mut l = op(&s.h, &s.store, "x@link", 1, Action::ReplaceLink, "l");
+    l.link = Some(new.clone());
+    let rep = go_with(
+        &s,
+        &plan_in(&root, vec![l]),
+        &gens(),
+        &none(),
+        &Fail::at("link-after-rename", Inject::Error),
+    );
+    assert_eq!(rep.operations[0].status, Status::Unknown);
+    let st = recover_now(&s);
+    assert!(st.open.is_empty());
+    assert_eq!(st.closed.len(), 1);
+    let abs = s.h.0.join("l").to_str().unwrap().to_string();
+    assert_eq!(owned_paths(&s), [(abs, Some(link_fingerprint(&new)))]);
+    // Nothing left: a second call settles nothing.
+    let st = recover_now(&s);
+    assert!(st.open.is_empty() && st.closed.is_empty());
+
+    // One that stays open is reported with its journal id.
+    let s = setup();
+    unknown_link(&s);
+    fs::remove_file(s.h.0.join("l")).unwrap();
+    fs::create_dir(s.h.0.join("l")).unwrap();
+    let id = last_of(&s, &jid(1)).op_id;
+    let st = recover_now(&s);
+    assert_eq!(st.open.len(), 1);
+    assert_eq!(st.open[0].id, id);
+    assert_eq!(st.open[0].paths.len(), 1);
+    assert!(st.closed.is_empty());
+}
+
+#[test]
+fn an_adoption_goes_stale_when_the_ledger_changed_to_another_fingerprint_or_resource() {
+    for (resource, target) in [("core.x", "/other"), ("other.res", "")] {
+        let s = setup();
+        let root = real_src(&s);
+        let t = format!("{root}/x");
+        symlink(&t, s.h.0.join("l")).unwrap();
+        let mut a = link_op(&s, 1, "l");
+        a.action = Action::Adopt;
+        // The ledger changes after planning.
+        let fp = if target.is_empty() {
+            link_fingerprint(&t)
+        } else {
+            link_fingerprint(target)
+        };
+        let mut led = s.store.read_ledger().unwrap();
+        led.record(LedgerResource {
+            resource: resource.into(),
+            adapter: "git-config/v1".into(),
+            class: Class::Normal,
+            op_id: "seed-1".into(),
+            owned_outputs: vec![OwnedOutput {
+                path: s.h.0.join("l").to_str().unwrap().into(),
+                mode: 0o777,
+                fingerprint: Some(fp),
+                coowned: None,
+            }],
+        })
+        .unwrap();
+        s.store.write_ledger(&led).unwrap();
+        let adopt = BTreeSet::from([a.id.clone()]);
+        let home = Dir::open_home(&sys(&s.h), &s.h.0).unwrap();
+        let (g, fail, nobody) = (gens(), Fail::none(), none());
+        let r = Run {
+            allow_adopt: &adopt,
+            ..run(&s, &g, &nobody, &fail, &home)
+        };
+        let rep = apply(&r, &plan_in(&root, vec![a])).unwrap();
+        assert_eq!(
+            rep.operations[0].status,
+            Status::Blocked,
+            "{resource} {target}"
+        );
+        assert_eq!(rep.stopped.unwrap().code, Code::PlanStale);
+    }
 }

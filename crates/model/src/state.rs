@@ -1432,6 +1432,99 @@ mod tests {
         assert!(receipt(vec![s]).validate().is_err());
     }
 
+    fn je(id: &str, op: &str, phase: Phase) -> JournalEntry {
+        JournalEntry {
+            schema: SCHEMA,
+            op_id: id.into(),
+            op: op.into(),
+            phase,
+            at: "2026-10-10T00:00:00Z".into(),
+            resource: "r".into(),
+            adapter: "a".into(),
+            class: Class::Normal,
+            recovery: (phase == Phase::Intent).then(|| Recovery {
+                outputs: vec![RecoveryOutput {
+                    path: format!("/h/{id}"),
+                    existed_before: false,
+                    expected_sha256: None,
+                }],
+                snapshot: None,
+            }),
+            token: None,
+            reason: None,
+        }
+    }
+
+    #[test]
+    fn unresolved_pairs_an_unknown_with_its_intent_by_id_and_op() {
+        let j = [
+            je("a-1", "create-link", Phase::Intent),
+            je("a-1", "create-file", Phase::Intent),
+            je("a-1", "create-link", Phase::Unknown),
+        ];
+        let open = unresolved(&j);
+        assert_eq!(open.len(), 1);
+        assert_eq!(open[0].unknown.op, "create-link");
+        assert_eq!(open[0].intent.unwrap().op, "create-link");
+        assert_eq!(open[0].paths().collect::<Vec<_>>(), ["/h/a-1"]);
+        // Another id never pairs.
+        let j = [
+            je("b-1", "create-link", Phase::Intent),
+            je("a-1", "create-link", Phase::Unknown),
+        ];
+        assert!(unresolved(&j)[0].intent.is_none());
+    }
+
+    #[test]
+    fn unresolved_a_later_done_or_failed_closes_and_a_later_unknown_supersedes() {
+        for closing in [Phase::Done, Phase::Failed] {
+            let j = [
+                je("a-1", "x", Phase::Intent),
+                je("a-1", "x", Phase::Unknown),
+                je("a-1", "x", closing),
+            ];
+            assert!(unresolved(&j).is_empty(), "{closing:?}");
+        }
+        // Two unknown entries for one operation are one open operation, not two.
+        let j = [
+            je("a-1", "x", Phase::Intent),
+            je("a-1", "x", Phase::Unknown),
+            je("a-1", "x", Phase::Unknown),
+        ];
+        let open = unresolved(&j);
+        assert_eq!(open.len(), 1);
+        assert!(
+            std::ptr::eq(open[0].unknown, &j[2]),
+            "the later entry stands"
+        );
+        // An unknown after a closing entry (a new outcome) is open again.
+        let j = [
+            je("a-1", "x", Phase::Intent),
+            je("a-1", "x", Phase::Failed),
+            je("a-1", "x", Phase::Unknown),
+        ];
+        assert_eq!(unresolved(&j).len(), 1);
+    }
+
+    #[test]
+    fn unresolved_an_intent_after_the_unknown_is_not_its_recovery_record() {
+        let j = [
+            je("a-1", "x", Phase::Unknown),
+            je("a-1", "x", Phase::Intent),
+        ];
+        let open = unresolved(&j);
+        assert_eq!(open.len(), 1);
+        assert!(open[0].intent.is_none());
+        assert_eq!(open[0].paths().count(), 0);
+        // And an unknown with no intent at all.
+        assert!(
+            unresolved(&[je("z-1", "x", Phase::Unknown)])[0]
+                .intent
+                .is_none()
+        );
+        assert!(unresolved(&[je("z-1", "x", Phase::Done)]).is_empty());
+    }
+
     #[test]
     fn journal_torn_oversize_and_unfinished_entries() {
         let intent = |op: &str| JournalEntry {

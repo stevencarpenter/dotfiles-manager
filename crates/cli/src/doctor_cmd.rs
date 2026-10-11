@@ -306,17 +306,23 @@ fn journal_rows(store: &Store, rows: &mut Vec<Row>) {
     for u in unresolved(&entries) {
         let id = &u.unknown.op_id;
         let subject = u.paths().next().unwrap_or(&u.unknown.op);
+        let blocks = if u.intent.is_some() {
+            "blocks this path in every run"
+        } else {
+            "has no intent record, so it blocks every operation of its resource (only `--as failed` clears it)"
+        };
         rows.push(Row::new(
             "intent",
             Code::OpInterrupted,
             Level::Error,
             subject,
             &format!(
-                "operation {} (journal id {id}, resource {}, since {}) ended unknown and blocks this path in every run",
+                "operation {} (journal id {id}, resource {}, since {}) ended unknown and {blocks}",
                 u.unknown.op, u.unknown.resource, u.unknown.at
             ),
             &format!(
-                "Check the path. Run apply: it settles the entry when the path shows a clear result. Otherwise run `dotfiles-manager state resolve {id} --as done` or `--as failed`. Doctor never settles."
+                "Run `dotfiles-manager state recover` or apply: they settle the entry when the path shows a clear result. Otherwise check the path, then run `dotfiles-manager state resolve '{}' --as done` or `--as failed`. Doctor never settles.",
+                id.replace('\'', "'\\''")
             ),
         ));
     }

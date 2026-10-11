@@ -2283,3 +2283,115 @@ fn state_resolve_usage_errors_exit_2_and_write_nothing() {
     }
     assert_eq!(fingerprint(fx.home.path()), before);
 }
+
+#[test]
+fn state_recover_settles_a_new_resource_done_without_ownership_and_the_plan_offers_adopt() {
+    let (fx, id, _) = after_unknown_link();
+    let o = fx.run(&["state", "recover"]);
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+    assert!(
+        text(&o.stdout).contains(&format!("settled {id} as done")),
+        "{}",
+        text(&o.stdout)
+    );
+    let settled = fx.journal();
+    let last = settled.last().unwrap();
+    assert_eq!(
+        (last["phase"].as_str(), last["reason"].as_str()),
+        (Some("done"), Some("recovered: done"))
+    );
+    // The resource has no ledger entry and no plan was given, so nothing is owned. The next
+    // plan offers the adoption.
+    assert!(fx.owned_paths().is_empty());
+    assert_eq!(fx.adopt_ids().len(), 1);
+    // No receipt for a settle-only command.
+    assert_eq!(fx.receipts().len(), 1);
+    // Nothing is open any more.
+    let o = fx.run(&["state", "recover"]);
+    assert_eq!(code(&o), 0);
+    assert!(
+        text(&o.stdout).contains("nothing to recover"),
+        "{}",
+        text(&o.stdout)
+    );
+}
+
+#[test]
+fn state_recover_fixes_the_ledger_after_an_unknown_replace_link() {
+    let fx = Fx::new();
+    assert_eq!(code(&fx.apply(&[])), 0);
+    fx.put("base/modules/extra/files/zshrc2", "export B=2\n");
+    let m = fs::read_to_string(fx.root.join("base/modules/extra/module.toml")).unwrap();
+    fs::write(
+        fx.root.join("base/modules/extra/module.toml"),
+        m.replace("files/zshrc\"", "files/zshrc2\""),
+    )
+    .unwrap();
+    let o = fx.apply_failing("link-after-rename:error", &[]);
+    assert_eq!(code(&o), 1, "{}\n{}", stderr(&o), text(&o.stdout));
+    let (id, _) = fx.unknown_entry();
+    // The link already shows the planned target, so a plan calls it current ("already holds;
+    // not adopted: the ledger already has an entry") and nothing fixes the stale ledger
+    // fingerprint. Without recovery the ledger keeps the old target.
+    let old = fx.root.join("base/modules/extra/files/zshrc");
+    let fp_of = |fx: &Fx| {
+        fx.ledger()["resources"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|r| r["owned_outputs"].as_array().unwrap().iter())
+            .find(|o| o["path"].as_str().unwrap().ends_with("/.zshrc"))
+            .unwrap()["fingerprint"]
+            .clone()
+    };
+    assert_eq!(
+        fp_of(&fx),
+        dfm_model::plan::link_fingerprint(old.to_str().unwrap()).as_str()
+    );
+    // No flag and no plan are needed to clear it.
+    let o = fx.run(&["state", "recover"]);
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+    assert!(text(&o.stdout).contains(&format!("settled {id} as done")));
+    let new = fx.root.join("base/modules/extra/files/zshrc2");
+    let want = dfm_model::plan::link_fingerprint(new.to_str().unwrap());
+    let fp = fp_of(&fx);
+    assert_eq!(fp, want.as_str());
+    let o = fx.apply(&[]);
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+}
+
+#[test]
+fn state_recover_exits_3_naming_the_id_while_an_entry_stays_open() {
+    let (fx, id, path) = after_unknown_link();
+    fs::remove_file(&path).unwrap();
+    fs::create_dir(&path).unwrap();
+    let before = fingerprint(fx.home.path());
+    let o = fx.run(&["state", "recover"]);
+    assert_eq!(code(&o), 3, "{}\n{}", stderr(&o), text(&o.stdout));
+    assert!(
+        stderr(&o).contains("E_OP_INTERRUPTED") && stderr(&o).contains(&id),
+        "{}",
+        stderr(&o)
+    );
+    assert!(
+        text(&o.stdout).contains(&format!("open {id}")),
+        "{}",
+        text(&o.stdout)
+    );
+    assert_eq!(fingerprint(fx.home.path()), before, "nothing was written");
+    for args in [
+        vec!["state", "recover", "extra"],
+        vec!["state", "recover", "--as", "done"],
+    ] {
+        assert_eq!(code(&fx.run(&args)), 2, "{args:?}");
+    }
+}
+
+#[test]
+fn state_recover_on_a_clean_machine_settles_nothing_and_exits_0() {
+    let fx = Fx::new();
+    assert_eq!(code(&fx.apply(&[])), 0);
+    let o = fx.run(&["state", "recover"]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    assert!(text(&o.stdout).contains("nothing to recover"));
+}
