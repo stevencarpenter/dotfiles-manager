@@ -895,7 +895,7 @@ fn record(
 /// it (through `after`) are `blocked`, every other operation that has not started is
 /// `not_started`. Operations that need nothing (`current`, `not_in_scope`) are still reported
 /// as they are. There is no rollback.
-pub fn apply(run: &Run<'_>, plan: &Plan) -> Result<Report, Refusal> {
+pub fn execute(run: &Run<'_>, plan: &Plan) -> Result<Report, Refusal> {
     let mut ex = Exec {
         run,
         attempts: BTreeMap::new(),

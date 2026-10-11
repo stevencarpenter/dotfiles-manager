@@ -7,7 +7,7 @@
 
 use crate::plan_cmd::{make_plan, render};
 use crate::{Ctx, bounded, read_existing_binding, state_cmd, usage};
-use dfm_engine::{Dir, NoGenerator, Run, Store, apply, now_unix, preflight};
+use dfm_engine::{Dir, NoGenerator, Run, Store, execute, now_unix, preflight};
 use dfm_model::display::visible;
 use dfm_model::state::{
     Approval, BinaryId, ProfileRef, Receipt, RunResult, Stamp, Status, count_statuses, rfc3339,
@@ -176,7 +176,7 @@ pub fn run(ctx: &Ctx, args: &Args, out: &mut dyn Write) -> Result<(), Refusal> {
     preflight(&run, &locked).map_err(|r| stamped(&store, r))?;
 
     let started = now_unix().map_err(|r| stamped(&store, r))?;
-    let report = apply(&run, &locked).map_err(|r| stamped(&store, r))?;
+    let report = execute(&run, &locked).map_err(|r| stamped(&store, r))?;
     let finished = now_unix().map_err(Refusal::after_mutation)?;
 
     let counts = count_statuses(&report.operations);

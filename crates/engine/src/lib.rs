@@ -12,7 +12,7 @@ pub mod publish;
 pub mod store;
 
 pub use apply::{
-    Generator, NoGenerator, RELOAD_NOT_ATTEMPTED, Report, Run, apply, owned_outputs, preflight,
+    Generator, NoGenerator, RELOAD_NOT_ATTEMPTED, Report, Run, execute, owned_outputs, preflight,
 };
 #[cfg(feature = "failpoints")]
 pub use fail::Action;

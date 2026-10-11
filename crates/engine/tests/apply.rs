@@ -6,8 +6,8 @@ mod common;
 
 use common::*;
 use dfm_engine::{
-    Action as Inject, Dir, Fail, Generator, NoGenerator, Run, Store, apply, observe, owned_outputs,
-    preflight,
+    Action as Inject, Dir, Fail, Generator, NoGenerator, Run, Store, execute, observe,
+    owned_outputs, preflight,
 };
 use dfm_model::digest::sha256_hex;
 use dfm_model::plan::{
@@ -163,7 +163,7 @@ fn go(s: &Setup, p: &Plan, g: &dyn Generator, allow: &BTreeSet<String>) -> dfm_e
     let home = Dir::open_home(&sys(&s.h), &s.h.0).unwrap();
     let r = run(s, g, allow, &fail, &home);
     preflight(&r, p).unwrap();
-    apply(&r, p).unwrap()
+    execute(&r, p).unwrap()
 }
 
 fn none() -> BTreeSet<String> {
@@ -309,7 +309,7 @@ fn a_file_that_appears_between_the_last_check_and_the_publish_is_never_replaced(
     let allow = none();
     let r = run(&s, &g, &allow, &fail, &home);
     preflight(&r, &plan(vec![o.clone()])).unwrap();
-    let rep = apply(&r, &plan(vec![o])).unwrap();
+    let rep = execute(&r, &plan(vec![o])).unwrap();
     t.join().unwrap();
     let _ = fs::remove_file(&reached);
     assert_eq!(rep.operations[0].status, Status::Failed);
@@ -339,7 +339,7 @@ fn a_failure_before_the_commit_leaves_no_file_and_no_staged_name() {
         let r = run(&s, &g, &allow, &fail, &home);
         let p = plan(vec![o]);
         preflight(&r, &p).unwrap();
-        let rep = apply(&r, &p).unwrap();
+        let rep = execute(&r, &p).unwrap();
         assert_eq!(rep.operations[0].status, Status::Failed, "{point}");
         assert!(!s.h.0.join("a").exists(), "{point}");
         assert!(leftovers(&s.h.0).is_empty(), "{point}");
@@ -442,7 +442,7 @@ fn removal_never_follows_a_leaf_link_swapped_in_before_or_during_the_delete() {
     let r = run(&s, &NoGenerator, &allow, &fail, &home);
     let p = plan(vec![o]);
     preflight(&r, &p).unwrap();
-    let rep = apply(&r, &p).unwrap();
+    let rep = execute(&r, &p).unwrap();
     t.join().unwrap();
     let _ = fs::remove_file(&reached);
     assert_eq!(
@@ -565,7 +565,7 @@ fn dependents_of_a_failed_operation_are_blocked_and_the_rest_are_not_started() {
     let r = run(&s, &g, &allow, &fail, &home);
     let p = plan(vec![a, b, c]);
     preflight(&r, &p).unwrap();
-    let rep = apply(&r, &p).unwrap();
+    let rep = execute(&r, &p).unwrap();
     let st: Vec<_> = rep.operations.iter().map(|o| o.status).collect();
     assert_eq!(st, [Status::Failed, Status::Blocked, Status::NotStarted]);
     assert!(rep.operations[2].started_at.is_none());
