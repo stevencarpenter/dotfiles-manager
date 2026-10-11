@@ -203,6 +203,7 @@ pub fn record_op(ctx: &Ctx, args: &[String], out: &mut dyn Write) -> Result<(), 
             plan_digest: None,
             approval: None,
             sources: vec![],
+            approvals: vec![],
             result: RunResult {
                 outcome: "ok".into(),
                 exit_code: 0,

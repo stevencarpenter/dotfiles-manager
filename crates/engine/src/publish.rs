@@ -9,6 +9,7 @@
 use crate::fail::Fail;
 use crate::fsys::{Dir, Sys, check_name, kind, mode_bits, sys_err, unconfirmed};
 use dfm_model::digest::sha256_hex;
+use dfm_model::plan::link_fingerprint;
 use dfm_model::{Code, Refusal};
 use rustix::fs::{self as rfs, AtFlags, FileType, Mode, OFlags};
 use rustix::io::Errno;
@@ -18,7 +19,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 /// How a file is published.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Publish<'a> {
+pub(crate) enum Publish<'a> {
     /// The name must be absent. `linkat` never replaces, so a file that appeared since the
     /// check is a conflict.
     Create,
@@ -28,6 +29,21 @@ pub enum Publish<'a> {
 
 fn conflict(detail: impl Into<String>) -> Refusal {
     Refusal::new(Code::Conflict, detail)
+}
+
+/// Gives a link the mode 0755 a link normally has. `symlinkat` applies the umask on macOS, and a
+/// link made under a restrictive umask (0500, say) cannot be read by its own owner. Linux links
+/// have no mode, and its `fchmodat` refuses `AT_SYMLINK_NOFOLLOW`, which is accepted here.
+fn normalize_link_mode(dir: &Dir, name: &str) -> Result<(), Refusal> {
+    match rfs::chmodat(
+        &dir.fd,
+        name,
+        Mode::from_raw_mode(0o755),
+        AtFlags::SYMLINK_NOFOLLOW,
+    ) {
+        Ok(()) | Err(Errno::NOTSUP) => Ok(()),
+        Err(e) => Err(sys_err("set link mode", e)),
+    }
 }
 
 /// A hidden same-directory name for a staged link or file.
@@ -49,7 +65,7 @@ impl Dir {
     /// file, a missing component or another owner is `E_PARENT_UNSAFE`: nothing is followed,
     /// created or repaired. The result names the directory that was verified, whatever happens
     /// to its path afterwards.
-    pub fn open_below(&self, sys: &Sys, rel: &[&str]) -> Result<Dir, Refusal> {
+    pub(crate) fn open_below(&self, sys: &Sys, rel: &[&str]) -> Result<Dir, Refusal> {
         let mut cur = self.try_clone()?;
         for name in rel {
             let unsafe_parent = |why: &str| {
@@ -71,8 +87,10 @@ impl Dir {
     }
 
     /// Creates the directory `name` with mode 0700 (the XDG default for a directory created on
-    /// the user's behalf). An existing entry is a conflict and is left alone.
-    pub fn make_dir(&self, name: &str) -> Result<(), Refusal> {
+    /// the user's behalf). An existing entry is a conflict and is left alone. The mode is set by
+    /// name, without following a link, before the directory is opened, so a restrictive umask
+    /// cannot leave a directory the process itself cannot open.
+    pub(crate) fn make_dir(&self, name: &str, fail: &Fail) -> Result<(), Refusal> {
         check_name(name)?;
         match rfs::mkdirat(&self.fd, name, Mode::from_raw_mode(0o700)) {
             Ok(()) => {}
@@ -84,24 +102,31 @@ impl Dir {
             }
             Err(e) => return Err(sys_err(&format!("create {}", self.at(name).display()), e)),
         }
-        // `mkdirat` applies the umask. The mode is stated, not inherited.
-        let fd = rfs::openat(
-            &self.fd,
-            name,
-            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-            Mode::empty(),
+        // Committed. A failure from here on leaves the directory in place, so it is reported as
+        // unconfirmed, not as a failure to create.
+        unconfirmed(
+            rfs::chmodat(
+                &self.fd,
+                name,
+                Mode::from_raw_mode(0o700),
+                AtFlags::SYMLINK_NOFOLLOW,
+            )
+            .map_err(|e| sys_err("chmod new directory", e))
+            .and_then(|()| fail.hit("dir-after-create"))
+            .and_then(|()| self.sync()),
         )
-        .map_err(|e| sys_err("open new directory", e))?;
-        rfs::fchmod(&fd, Mode::from_raw_mode(0o700)).map_err(|e| sys_err("chmod directory", e))?;
-        self.sync()
     }
 
     /// Creates the link `name -> target`. `symlinkat` never replaces, so an entry that appeared
     /// since the check is a conflict.
-    pub fn make_link(&self, name: &str, target: &str) -> Result<(), Refusal> {
+    pub(crate) fn make_link(&self, name: &str, target: &str, fail: &Fail) -> Result<(), Refusal> {
         check_name(name)?;
         match rfs::symlinkat(target, &self.fd, name) {
-            Ok(()) => self.sync(),
+            Ok(()) => unconfirmed(
+                normalize_link_mode(self, name)
+                    .and_then(|()| fail.hit("link-after-create"))
+                    .and_then(|()| self.sync()),
+            ),
             Err(Errno::EXIST) => Err(conflict(format!(
                 "{} appeared while applying; it is left alone",
                 self.at(name).display()
@@ -110,23 +135,24 @@ impl Dir {
         }
     }
 
-    /// Replaces the link `name` with a link to `target`, only while it still points at
-    /// `expected_target`. The new link is made under a hidden name and moved over with
-    /// `renameat`, so a reader sees the old or the new link, never neither. The check and the
-    /// rename are two calls: a change between them is not detected (docs/apply.md, limits).
-    pub fn replace_link(
+    /// Replaces the link `name` with a link to `target`, only while the live link still has
+    /// the fingerprint the ledger records (`link_fingerprint` of its target text). The new link
+    /// is made under a hidden name and moved over with `renameat`, so a reader sees the old or
+    /// the new link, never neither. The check and the rename are two calls: a change between
+    /// them is not detected (docs/apply.md, limits).
+    pub(crate) fn replace_link(
         &self,
         name: &str,
         target: &str,
-        expected_target: &str,
+        ledger_fingerprint: &str,
         fail: &Fail,
     ) -> Result<(), Refusal> {
         check_name(name)?;
         match rfs::readlinkat(&self.fd, name, Vec::new()) {
-            Ok(t) if t.to_string_lossy() == expected_target => {}
+            Ok(t) if link_fingerprint(&t.to_string_lossy()) == ledger_fingerprint => {}
             Ok(_) => {
                 return Err(conflict(format!(
-                    "{} changed while applying",
+                    "{} no longer matches the fingerprint the ledger records; it is left alone",
                     self.at(name).display()
                 )));
             }
@@ -140,22 +166,24 @@ impl Dir {
         }
         let tmp = temp_name(name);
         rfs::symlinkat(target, &self.fd, &tmp).map_err(|e| sys_err("stage link", e))?;
-        let moved = fail.hit("link-after-tmp").and_then(|()| {
-            rfs::renameat(&self.fd, &tmp, &self.fd, name).map_err(|e| sys_err("rename", e))
-        });
+        let moved = normalize_link_mode(self, &tmp)
+            .and_then(|()| fail.hit("link-after-tmp"))
+            .and_then(|()| {
+                rfs::renameat(&self.fd, &tmp, &self.fd, name).map_err(|e| sys_err("rename", e))
+            });
         if let Err(e) = moved {
             self.drop_temp(&tmp);
             return Err(e);
         }
-        unconfirmed(self.sync())
+        unconfirmed(fail.hit("link-after-rename").and_then(|()| self.sync()))
     }
 
     /// Removes the non-directory entry `name`. A link is removed, not followed. A directory is
     /// never removed: `unlinkat` without `AT_REMOVEDIR` refuses it.
-    pub fn remove_entry(&self, name: &str) -> Result<(), Refusal> {
+    pub(crate) fn remove_entry(&self, name: &str, fail: &Fail) -> Result<(), Refusal> {
         check_name(name)?;
         match rfs::unlinkat(&self.fd, name, AtFlags::empty()) {
-            Ok(()) => unconfirmed(self.sync()),
+            Ok(()) => unconfirmed(fail.hit("remove-after-unlink").and_then(|()| self.sync())),
             Err(Errno::NOENT) => Err(conflict(format!(
                 "{} vanished while applying",
                 self.at(name).display()
@@ -171,7 +199,7 @@ impl Dir {
     /// Hashes the regular file `name` from one descriptor opened without following a link, and
     /// returns the hash with the descriptor's identity so a caller can check that the name still
     /// refers to the same file. `None` when the name is absent or is not a regular file.
-    pub fn hash_file(
+    pub(crate) fn hash_file(
         &self,
         name: &str,
         limit: u64,
@@ -208,7 +236,7 @@ impl Dir {
     /// before the commit point leaves the previous state and removes the staged file. A failure
     /// after it is `E_IO_UNCONFIRMED`. Failure points: `file-before-write`, `file-after-tmp`,
     /// `file-after-rename`.
-    pub fn publish_file(
+    pub(crate) fn publish_file(
         &self,
         name: &str,
         bytes: &[u8],
@@ -265,7 +293,7 @@ impl Dir {
     }
 
     /// The mode bits of the entry `name`, without following a link. `None` when absent.
-    pub fn entry_mode(&self, name: &str) -> Result<Option<u32>, Refusal> {
+    pub(crate) fn entry_mode(&self, name: &str) -> Result<Option<u32>, Refusal> {
         check_name(name)?;
         match rfs::statat(&self.fd, name, AtFlags::SYMLINK_NOFOLLOW) {
             Ok(st) => Ok(Some(mode_bits(&st))),

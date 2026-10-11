@@ -374,8 +374,24 @@ pub struct Approval {
 #[serde(deny_unknown_fields)]
 pub struct SourceId {
     pub id: String,
-    pub commit: String,
+    /// `path` for a local source tree, which has no commit. Absent for a Git source.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    /// Absent exactly when `kind` is `path`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commit: Option<String>,
     pub tree: String,
+}
+
+/// One approved disruptive operation (architecture section 5, `approvals[]`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DisruptiveApproval {
+    /// The `id` of the receipt operation that ran with this approval.
+    pub operation_id: String,
+    /// `interactive` or `allow_disruptive`.
+    pub how: String,
+    pub at: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -401,6 +417,9 @@ pub struct Receipt {
     pub plan_digest: Option<String>,
     pub approval: Option<Approval>,
     pub sources: Vec<SourceId>,
+    /// One entry per disruptive operation that ran with an approval.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub approvals: Vec<DisruptiveApproval>,
     pub operations: Vec<OperationRecord>,
     pub result: RunResult,
 }
@@ -499,8 +518,22 @@ impl Receipt {
         }
         for src in &self.sources {
             let tree_ok = src.tree.strip_prefix("sha256:").is_some_and(valid_sha256);
-            if !valid_id(&src.id) || !hex_id(&src.commit) || !tree_ok {
+            let kind_ok = match (src.kind.as_deref(), src.commit.as_deref()) {
+                (Some("path"), None) => true,
+                (None, Some(c)) => hex_id(c),
+                _ => false,
+            };
+            if !valid_id(&src.id) || !kind_ok || !tree_ok {
                 return Err(bad("receipt source identity is malformed"));
+            }
+        }
+        for a in &self.approvals {
+            let known = self.operations.iter().any(|o| o.id == a.operation_id);
+            if !matches!(a.how.as_str(), "interactive" | "allow_disruptive")
+                || !known
+                || parse_rfc3339(&a.at).is_none()
+            {
+                return Err(bad("receipt approvals[] entry is malformed"));
             }
         }
         let exit_name = match self.result.exit_code {
@@ -1088,6 +1121,7 @@ mod tests {
             plan_digest: None,
             approval: None,
             sources: vec![],
+            approvals: vec![],
             result: RunResult {
                 outcome: "ok".into(),
                 exit_code: 0,
@@ -1399,6 +1433,25 @@ mod tests {
     }
 
     #[test]
+    fn a_path_source_and_a_disruptive_approval_validate_and_round_trip() {
+        let mut r = receipt(vec![op(Status::Updated, Class::Normal)]);
+        r.sources = vec![SourceId {
+            id: "path-0123456789ab".into(),
+            kind: Some("path".into()),
+            commit: None,
+            tree: format!("sha256:{}", "b".repeat(64)),
+        }];
+        r.approvals = vec![DisruptiveApproval {
+            operation_id: "op1".into(),
+            how: "allow_disruptive".into(),
+            at: "2026-10-10T00:00:00Z".into(),
+        }];
+        r.validate().unwrap();
+        let again = Receipt::parse(&canonical(&r).unwrap()).unwrap();
+        assert_eq!(again, r);
+    }
+
+    #[test]
     fn receipt_fields_without_free_text_must_have_their_exact_shape() {
         let good = receipt(vec![op(Status::Updated, Class::Normal)]);
         assert!(good.validate().is_ok());
@@ -1422,10 +1475,26 @@ mod tests {
         let mut r = good.clone();
         r.sources = vec![SourceId {
             id: "s".into(),
-            commit: "zz".into(),
+            kind: None,
+            commit: Some("zz".into()),
             tree: "x".into(),
         }];
         cases.push(("source", r));
+        let mut r = good.clone();
+        r.sources = vec![SourceId {
+            id: "s".into(),
+            kind: Some("path".into()),
+            commit: Some("a".repeat(40)),
+            tree: format!("sha256:{}", "a".repeat(64)),
+        }];
+        cases.push(("path source with a commit", r));
+        let mut r = good.clone();
+        r.approvals = vec![DisruptiveApproval {
+            operation_id: "no-such-op".into(),
+            how: "allow_disruptive".into(),
+            at: "2026-10-10T00:00:00Z".into(),
+        }];
+        cases.push(("approval for an unknown operation", r));
         let mut r = good.clone();
         r.operations[0].started_at = Some("yesterday".into());
         cases.push(("time", r));

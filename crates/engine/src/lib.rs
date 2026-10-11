@@ -11,13 +11,16 @@ pub mod observe;
 pub mod publish;
 pub mod store;
 
+#[cfg(feature = "failpoints")]
+#[doc(hidden)]
+pub use apply::test_support;
 pub use apply::{
-    Generator, NoGenerator, RELOAD_NOT_ATTEMPTED, Report, Run, execute, owned_outputs, preflight,
+    Gates, Generator, NoGenerator, RELOAD_NOT_ATTEMPTED, Report, Run, allow_flag, apply,
+    check_allow, gates, owned_outputs,
 };
 #[cfg(feature = "failpoints")]
 pub use fail::Action;
 pub use fail::Fail;
 pub use fsys::{Dir, Layout, Lock, Peek, PeekTo, Sys, listed, open_config, reset_listed};
 pub use observe::{merge, observe};
-pub use publish::Publish;
 pub use store::{Finding, Loaded, Probe, Store, now_unix, verify_identity};

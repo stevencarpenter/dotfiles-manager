@@ -62,7 +62,7 @@ pub enum Code {
     // Apply codes added by DFM-18 (docs/apply.md).
     GeneratorUnavailable,
     DisruptiveUnapproved,
-    ApplyFailed,
+    SensitiveUnsupported,
     ApprovalRequired,
 }
 
@@ -118,7 +118,7 @@ impl Code {
         Code::TargetReserved,
         Code::GeneratorUnavailable,
         Code::DisruptiveUnapproved,
-        Code::ApplyFailed,
+        Code::SensitiveUnsupported,
         Code::ApprovalRequired,
     ];
 
@@ -177,7 +177,7 @@ impl Code {
             Code::TargetReserved => "E_TARGET_RESERVED",
             Code::GeneratorUnavailable => "E_GENERATOR_UNAVAILABLE",
             Code::DisruptiveUnapproved => "E_DISRUPTIVE_UNAPPROVED",
-            Code::ApplyFailed => "E_APPLY_FAILED",
+            Code::SensitiveUnsupported => "E_SENSITIVE_UNSUPPORTED",
             Code::ApprovalRequired => "E_APPROVAL_REQUIRED",
         }
     }
@@ -188,9 +188,7 @@ impl Code {
             // docs/architecture.md section 10, exit 2: "inability to produce the requested report".
             Code::ReportUnavailable => Exit::Usage,
             // A failure while writing, or findings from a read-only check, are not refusals.
-            Code::IoFailed | Code::Diagnosed | Code::IoUnconfirmed | Code::ApplyFailed => {
-                Exit::Failed
-            }
+            Code::IoFailed | Code::Diagnosed | Code::IoUnconfirmed => Exit::Failed,
             _ => Exit::Blocked,
         }
     }

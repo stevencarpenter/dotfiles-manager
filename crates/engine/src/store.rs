@@ -415,19 +415,53 @@ impl Store {
     }
 
     /// The ledger, valid and inside the scope, and written for the identity in `state.json`.
+    /// One entry that fails the claim check (for example a parent directory that is a link
+    /// leaving HOME) refuses the whole read. Writers use this form.
     pub fn read_ledger(&self) -> Result<Ledger, Refusal> {
         let l = self.ledger_raw()?;
         self.check_owner(&l.binding)?;
         Ok(l)
     }
 
+    /// As [`Store::read_ledger`], but an output that fails the claim check does not refuse the
+    /// read: its path and the reason are returned with the ledger. The caller must treat such
+    /// an output as unusable (no read, write or delete through it). The planner and apply use
+    /// this form, so one unsafe entry blocks only the operations on that entry.
+    pub fn read_ledger_lenient(&self) -> Result<(Ledger, Vec<(String, String)>), Refusal> {
+        let l = Ledger::parse(&self.read_doc("ledger.json")?)?;
+        l.validate_within(&self.scope)?;
+        self.check_owner(&l.binding)?;
+        let mut unsafe_paths = Vec::new();
+        for o in l.resources.iter().flat_map(|r| &r.owned_outputs) {
+            match self.check_claim(&o.path) {
+                Ok(()) => {}
+                Err(e) if e.code == Code::StateInvalid => {
+                    unsafe_paths.push((o.path.clone(), e.detail));
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Ok((l, unsafe_paths))
+    }
+
     pub fn read_journal(&self) -> Result<Vec<JournalEntry>, Refusal> {
-        let entries = state::parse_journal(&self.read_doc("journal.jsonl")?)?;
+        let entries = self.read_journal_lenient()?;
         for e in &entries {
-            e.validate_within(&self.scope)?;
             for o in e.recovery.iter().flat_map(|r| &r.outputs) {
                 self.check_claim(&o.path)?;
             }
+        }
+        Ok(entries)
+    }
+
+    /// As [`Store::read_journal`], without the claim check of each recovery path. A path in an
+    /// old entry can become unsafe later (a parent turned into a link that leaves HOME), and
+    /// that must not stop every later run. Nothing is read, written or deleted through a path
+    /// from these entries without a fresh check. Apply uses this form.
+    pub fn read_journal_lenient(&self) -> Result<Vec<JournalEntry>, Refusal> {
+        let entries = state::parse_journal(&self.read_doc("journal.jsonl")?)?;
+        for e in &entries {
+            e.validate_within(&self.scope)?;
         }
         Ok(entries)
     }
@@ -502,7 +536,8 @@ impl Store {
         path: &str,
         live_sha256: &str,
     ) -> Result<bool, Refusal> {
-        let ledger = self.read_ledger()?;
+        // Other entries may be unsafe; only this exact path has to pass the claim check.
+        let (ledger, _) = self.read_ledger_lenient()?;
         self.check_claim(path)?;
         Ok(ledger.authorizes_delete(resource, path, live_sha256))
     }
@@ -624,8 +659,33 @@ impl Store {
         l.validate()?;
         l.check_secrets(&self.secret_refs())?;
         let bytes = Self::cap(canonical(l)?)?;
-        for o in l.resources.iter().flat_map(|r| &r.owned_outputs) {
-            self.check_claim(&o.path)?;
+        // An output the stored ledger already holds, unchanged, is not checked again: one
+        // unsafe old entry must not stop every later write. New or changed outputs are checked.
+        let (old, _) = self.read_ledger_lenient()?;
+        let known: std::collections::BTreeSet<(&str, &str, Option<&str>)> = old
+            .resources
+            .iter()
+            .flat_map(|r| {
+                r.owned_outputs.iter().map(|o| {
+                    (
+                        r.resource.as_str(),
+                        o.path.as_str(),
+                        o.fingerprint.as_deref(),
+                    )
+                })
+            })
+            .collect();
+        for r in &l.resources {
+            for o in &r.owned_outputs {
+                let key = (
+                    r.resource.as_str(),
+                    o.path.as_str(),
+                    o.fingerprint.as_deref(),
+                );
+                if !known.contains(&key) {
+                    self.check_claim(&o.path)?;
+                }
+            }
         }
         self.state()?
             .replace_file("ledger.json", &bytes, &self.fail, "ledger")
@@ -736,7 +796,7 @@ impl Store {
         probe: &dyn Fn(&JournalEntry) -> Probe,
     ) -> Result<Vec<(String, String, Phase)>, Refusal> {
         self.guard(None)?;
-        let entries = self.read_journal()?;
+        let entries = self.read_journal_lenient()?;
         let mut out = Vec::new();
         for i in state::unfinished(&entries) {
             let (phase, why) = match probe(i) {

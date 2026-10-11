@@ -1,11 +1,12 @@
 //! Apply: executes a plan's operations against HOME (docs/apply.md).
 //!
-//! The caller re-plans under the manager lock and compares the approved digest before it gets
-//! here. This module then re-checks, for each operation and immediately before its effect, every
-//! fact the plan recorded (`path:` and `ledger:` preconditions) and the topology of the parent
-//! chain, walked from the opened HOME one component at a time without following a link. The
-//! effect itself uses a primitive that cannot replace or follow what it did not verify
-//! ([`crate::publish`]).
+//! [`apply`] is the one entry point. It checks the gates that need no write ([`gates`]), settles
+//! interrupted work and then runs the operations in the plan's order. The caller re-plans under
+//! the manager lock and compares the approved digest before it gets here. For each operation and
+//! immediately before its effect, this module re-checks every fact the plan recorded (`path:`
+//! and `ledger:` preconditions) and the topology of the parent chain, walked from the opened HOME
+//! one component at a time without following a link. The effect itself uses a primitive that
+//! cannot replace or follow what it did not verify (`crate::publish`).
 //!
 //! Order of one operation: prerequisites, intent entry, effect, read-back, outcome entry, ledger
 //! update. The receipt is written by the caller after the last operation.
@@ -32,13 +33,18 @@ use std::path::Path;
 /// A published file is at most this large (the same bound the planner hashes).
 const MAX_FILE: u64 = dfm_model::plan::MAX_HASHED_BYTES;
 
+/// A conservative size for the two journal entries (intent and outcome) of one operation. An
+/// entry is bounded to 64 KiB, and apply writes reasons of at most 1024 characters.
+const JOURNAL_BYTES_PER_OPERATION: u64 = 4096;
+
 /// The consumer reload state recorded for every published output. No reloader exists yet, so a
 /// published file never implies a reloaded consumer.
 pub const RELOAD_NOT_ATTEMPTED: &str = "not_attempted";
 
 /// Produces the bytes of a generated file. Adapters (DFM-20) implement it. Apply calls it only
 /// for an operation it supports, and the content must follow from the operation's recorded
-/// inputs: `generate` must itself re-verify the `source:` preconditions.
+/// inputs: `generate` must itself re-verify the `source:` preconditions. The trait lives here
+/// until the `ports` crate exists (docs/architecture.md section 3).
 pub trait Generator {
     fn supports(&self, op: &Operation) -> bool;
     fn generate(&self, op: &Operation) -> Result<Vec<u8>, Refusal>;
@@ -68,7 +74,8 @@ pub struct Run<'a> {
     /// HOME as the layout spells it. Ledger and journal paths use this spelling.
     pub home_path: &'a Path,
     pub generator: &'a dyn Generator,
-    /// Operation ids the caller approved as disruptive (`--allow-disruptive`).
+    /// Operation ids the caller approved as disruptive (`--allow-disruptive`). The set must
+    /// equal the set of planned removals: the plan determines it.
     pub allow: &'a BTreeSet<String>,
     pub fail: &'a Fail,
 }
@@ -77,8 +84,19 @@ pub struct Run<'a> {
 #[derive(Debug)]
 pub struct Report {
     pub operations: Vec<OperationRecord>,
-    /// The first operation failure or block, if any. Later operations are blocked or not started.
+    /// The first operation failure or block, with its own code. Later operations are blocked or
+    /// not started. The caller marks it with `after_mutation` when the store wrote anything.
     pub stopped: Option<Refusal>,
+}
+
+/// The result of the gates that need no write.
+#[derive(Debug)]
+pub struct Gates {
+    /// Ids of the planned removals, in plan order. Each needs `--allow-disruptive <id>`.
+    pub removals: Vec<String>,
+    /// The first gate that refuses the plan (a blocker, a malformed plan, a file with no
+    /// generator, a sensitive output), if any.
+    pub refusal: Option<Refusal>,
 }
 
 /// Converts the ledger into the planner's view: paths relative to HOME.
@@ -134,13 +152,53 @@ fn is_file_action(a: Action) -> bool {
     matches!(a, Action::CreateFile | Action::UpdateFile)
 }
 
-/// Gates that need no write. A refusal here means nothing was changed (exit 3).
-pub fn preflight(run: &Run<'_>, plan: &Plan) -> Result<(), Refusal> {
+/// `--allow-disruptive '<id>'`, quoted so a user can paste it into a shell.
+pub fn allow_flag(id: &str) -> String {
+    format!(
+        "--allow-disruptive '{}'",
+        dfm_model::display::visible(id).replace('\'', "'\\''")
+    )
+}
+
+/// A link target must lie inside the root of the operation's own source: the root whose
+/// `<root>/<first input path>` is the target. A target outside every source root, or one that
+/// names a different file than the operation's input, is refused.
+fn link_inside_its_source(plan: &Plan, op: &Operation, link: &str) -> bool {
+    if link.contains('\0') || link.split('/').any(|c| c == "..") {
+        return false;
+    }
+    plan.sources.iter().any(|s| {
+        let inside = link
+            .strip_prefix(s.root.as_str())
+            .is_some_and(|rest| rest.starts_with('/'));
+        inside
+            && op
+                .inputs
+                .first()
+                .is_none_or(|i| link == format!("{}/{}", s.root, i.path))
+    })
+}
+
+/// The gates that need no write. They are pure, so a preview can run them. A refusal means
+/// nothing was changed (exit 3).
+pub fn gates(plan: &Plan, generator: &dyn Generator) -> Gates {
+    let removals = plan
+        .operations
+        .iter()
+        .filter(|o| o.status == PlanStatus::Planned && o.action == Action::Remove)
+        .map(|o| o.id.clone())
+        .collect();
+    Gates {
+        removals,
+        refusal: first_refusal(plan, generator).err(),
+    }
+}
+
+fn first_refusal(plan: &Plan, generator: &dyn Generator) -> Result<(), Refusal> {
     if let Some(b) = plan.blockers.first() {
         return Err(b.refusal());
     }
     let mut seen: BTreeSet<&str> = BTreeSet::new();
-    let mut removals = Vec::new();
     for op in &plan.operations {
         if !seen.insert(&op.id) {
             return Err(plan_invalid(format!("operation {} appears twice", op.id)));
@@ -168,35 +226,32 @@ pub fn preflight(run: &Run<'_>, plan: &Plan) -> Result<(), Refusal> {
             .as_deref()
             .ok_or_else(|| plan_invalid(format!("{} has no path", op.id)))?;
         components(path)?;
+        // A sensitive output has no comparable fingerprint and no conflict detection yet
+        // (docs/state.md), so apply writes, links and removes none of them.
+        if op.class == Class::Sensitive && op.action != Action::CreateDir {
+            return Err(Refusal::new(
+                Code::SensitiveUnsupported,
+                format!(
+                    "{}: sensitive outputs are not published or removed yet (no conflict detection)",
+                    op.id
+                ),
+            ));
+        }
         match op.action {
             Action::CreateLink | Action::ReplaceLink => {
                 let link = op
                     .link
                     .as_deref()
                     .ok_or_else(|| plan_invalid(format!("{} has no link target", op.id)))?;
-                let root = plan.sources.first().map(|s| s.root.as_str());
-                let inside = root.is_some_and(|r| {
-                    link.strip_prefix(r)
-                        .is_some_and(|rest| rest.starts_with('/'))
-                });
-                if !inside || link.contains('\0') || link.split('/').any(|c| c == "..") {
+                if !link_inside_its_source(plan, op, link) {
                     return Err(plan_invalid(format!(
-                        "{} links to {link:?}, which is not inside the source root",
+                        "{} links to {link:?}, which is not inside the root of its own source",
                         op.id
                     )));
                 }
             }
             Action::CreateFile | Action::UpdateFile => {
-                if op.class == Class::Sensitive {
-                    return Err(Refusal::new(
-                        Code::GeneratorUnavailable,
-                        format!(
-                            "{}: sensitive outputs are not published yet (no conflict detection)",
-                            op.id
-                        ),
-                    ));
-                }
-                if !run.generator.supports(op) {
+                if !generator.supports(op) {
                     return Err(Refusal::new(
                         Code::GeneratorUnavailable,
                         format!(
@@ -206,41 +261,71 @@ pub fn preflight(run: &Run<'_>, plan: &Plan) -> Result<(), Refusal> {
                     ));
                 }
             }
-            Action::Remove => removals.push(op.id.as_str()),
-            Action::CreateDir => {}
+            Action::Remove | Action::CreateDir => {}
             Action::None => {
                 return Err(plan_invalid(format!("{} is planned with no action", op.id)));
             }
         }
     }
-    if let Some(bad) = run.allow.iter().find(|a| !removals.contains(&a.as_str())) {
+    Ok(())
+}
+
+/// The allowances must equal the planned removals: an id that names no removal is a usage
+/// error, and every removal needs its own id. The message lists every missing id as a flag.
+pub fn check_allow(removals: &[String], allow: &BTreeSet<String>) -> Result<(), Refusal> {
+    if let Some(bad) = allow.iter().find(|a| !removals.contains(a)) {
         return Err(Refusal::new(
             Code::Usage,
             format!("--allow-disruptive {bad} names no removal in this plan"),
         ));
     }
-    let missing: Vec<&str> = removals
+    let missing: Vec<String> = removals
         .iter()
-        .copied()
-        .filter(|id| !run.allow.contains(*id))
+        .filter(|id| !allow.contains(*id))
+        .map(|id| allow_flag(id))
         .collect();
-    if !missing.is_empty() {
-        let shown: Vec<String> = missing
-            .iter()
-            .take(10)
-            .map(|m| dfm_model::display::visible(m))
-            .collect();
+    if missing.is_empty() {
+        return Ok(());
+    }
+    Err(Refusal::new(
+        Code::DisruptiveUnapproved,
+        format!(
+            "{} removal(s) need approval. Add: {}",
+            missing.len(),
+            missing.join(" ")
+        ),
+    ))
+}
+
+/// Refuses before any write when the journal could not take this run's entries. Journal
+/// rotation is not built (DFM-19), so a full journal stops every mutating run.
+fn journal_capacity(run: &Run<'_>, plan: &Plan) -> Result<(), Refusal> {
+    let used: u64 = run
+        .store
+        .read_journal_lenient()?
+        .iter()
+        .map(|e| {
+            e.to_line()
+                .map_or(0, |l| u64::try_from(l.len()).unwrap_or(u64::MAX))
+        })
+        .sum();
+    let journaled = plan
+        .operations
+        .iter()
+        .filter(|o| {
+            o.status == PlanStatus::Planned
+                || (o.status == PlanStatus::Current && o.action == Action::Remove)
+        })
+        .count();
+    let need = u64::try_from(journaled)
+        .unwrap_or(u64::MAX)
+        .saturating_mul(JOURNAL_BYTES_PER_OPERATION);
+    if used.saturating_add(need) > dfm_model::state::MAX_JOURNAL_BYTES {
         return Err(Refusal::new(
-            Code::DisruptiveUnapproved,
+            Code::LimitExceeded,
             format!(
-                "{} removal(s) need --allow-disruptive <operation-id>: {}{}",
-                missing.len(),
-                shown.join(", "),
-                if missing.len() > shown.len() {
-                    ", ..."
-                } else {
-                    ""
-                }
+                "the journal ({used} bytes) cannot take the entries of {journaled} operations without passing {} bytes. Nothing was changed. Journal rotation is not built (DFM-19)",
+                dfm_model::state::MAX_JOURNAL_BYTES
             ),
         ));
     }
@@ -251,11 +336,13 @@ struct Exec<'a, 'r> {
     run: &'a Run<'r>,
     /// Journal intents per planner journal id, so an id is never reused after a partial apply.
     attempts: BTreeMap<String, u32>,
-    /// Paths an interrupted operation left in an unknown state. Nothing is done to them.
+    /// Paths whose state is unknown (an interrupted or unconfirmed operation). Nothing more is
+    /// done to them in this run.
     unknown_paths: BTreeSet<String>,
 }
 
-/// How one operation ended.
+/// How one operation ended. `Option<String>` is the journal attempt id, present once the
+/// intent entry was written.
 enum Ended {
     Updated {
         id: String,
@@ -265,8 +352,9 @@ enum Ended {
         reload: Option<String>,
     },
     Current,
-    Failed(Refusal),
+    Failed(Refusal, Option<String>),
     Blocked(Refusal),
+    Unknown(Refusal, Option<String>),
 }
 
 fn blocked(code: Code, detail: impl Into<String>) -> Ended {
@@ -274,11 +362,13 @@ fn blocked(code: Code, detail: impl Into<String>) -> Ended {
 }
 
 fn failed(r: Refusal) -> Ended {
-    Ended::Failed(r)
+    Ended::Failed(r, None)
 }
 
-fn now() -> Result<String, Refusal> {
-    Ok(rfc3339(now_unix()?))
+fn now() -> String {
+    // A clock before 1970 is reported by the store when it needs one. A time stamp in a report
+    // is best effort, so the report is still written.
+    rfc3339(now_unix().unwrap_or(0))
 }
 
 fn step_name(op: &Operation) -> &'static str {
@@ -315,20 +405,20 @@ impl Exec<'_, '_> {
         format!("{}-{n}", op.journal_id)
     }
 
-    fn entry(
+    fn journal(
         &self,
         op: &Operation,
         id: &str,
         phase: Phase,
         recovery: Option<Recovery>,
         reason: Option<String>,
-    ) -> Result<JournalEntry, Refusal> {
-        Ok(JournalEntry {
+    ) -> Result<(), Refusal> {
+        self.run.store.append_journal(&JournalEntry {
             schema: 1,
             op_id: id.into(),
             op: step_name(op).into(),
             phase,
-            at: now()?,
+            at: now(),
             resource: op.resource.clone(),
             adapter: op.adapter.clone(),
             class: op.class,
@@ -338,17 +428,10 @@ impl Exec<'_, '_> {
         })
     }
 
-    fn journal(
-        &self,
-        op: &Operation,
-        id: &str,
-        phase: Phase,
-        recovery: Option<Recovery>,
-        reason: Option<String>,
-    ) -> Result<(), Refusal> {
-        self.run
-            .store
-            .append_journal(&self.entry(op, id, phase, recovery, reason)?)
+    /// The ledger as the planner sees it, with a path-unsafe entry left out of the view.
+    fn owned(&self) -> Result<Vec<Owned>, Refusal> {
+        let (ledger, _) = self.run.store.read_ledger_lenient()?;
+        owned_outputs(&ledger, self.run.home_path)
     }
 
     /// Re-observes the path and its parents through the opened HOME and compares every recorded
@@ -370,8 +453,7 @@ impl Exec<'_, '_> {
             }],
         )
         .map_err(failed)?;
-        let ledger = self.run.store.read_ledger().map_err(failed)?;
-        let owned = owned_outputs(&ledger, self.run.home_path).map_err(failed)?;
+        let owned = self.owned().map_err(failed)?;
         let entry = owned.iter().find(|o| fold(&o.path) == fold(rel));
         for p in &op.preconditions {
             let actual = if let Some(path) = p.subject.strip_prefix("path:") {
@@ -406,7 +488,28 @@ impl Exec<'_, '_> {
         }
     }
 
+    /// Classifies an error that happened after the intent entry. An unconfirmed durability
+    /// result means the effect is in place and only its durability is unknown: the operation
+    /// is `unknown`, its path is blocked for the rest of the run, and it is not a plain failure.
+    fn after_intent(&mut self, e: Refusal, id: &str, abs: &str) -> Ended {
+        if e.code == Code::IoUnconfirmed {
+            self.unknown_paths.insert(abs.into());
+            Ended::Unknown(e, Some(id.into()))
+        } else {
+            Ended::Failed(e, Some(id.into()))
+        }
+    }
+
     fn try_op(&mut self, op: &Operation) -> Result<Ended, Ended> {
+        // The gates refuse a sensitive operation before the run starts. Nothing below hashes,
+        // fingerprints or journals the content of a sensitive path.
+        if op.class == Class::Sensitive {
+            debug_assert!(false, "a sensitive operation reached apply");
+            return Err(failed(Refusal::new(
+                Code::SensitiveUnsupported,
+                format!("{}: sensitive outputs are not supported", op.id),
+            )));
+        }
         let rel = op
             .path
             .as_deref()
@@ -419,7 +522,9 @@ impl Exec<'_, '_> {
         }) {
             return Err(blocked(
                 Code::OpInterrupted,
-                format!("{rel}: an interrupted operation left it in an unknown state"),
+                format!(
+                    "{rel}: an interrupted or unconfirmed operation left it in an unknown state"
+                ),
             ));
         }
         let facts = self.prerequisites(op, rel)?;
@@ -435,32 +540,26 @@ impl Exec<'_, '_> {
             .map_err(Ended::Blocked)?;
         let live = parent.peek(&self.run.sys, name).map_err(failed)?;
         let appeared = |what: &str| blocked(Code::Conflict, format!("{rel} {what}"));
-        let (old_target, old_file_fp) = match (op.action, &live) {
-            (Action::CreateDir | Action::CreateLink | Action::CreateFile, Peek::Missing) => {
-                (None, None)
-            }
+        match (op.action, &live) {
+            (Action::CreateDir | Action::CreateLink | Action::CreateFile, Peek::Missing) => {}
             (Action::CreateDir | Action::CreateLink | Action::CreateFile, _) => {
                 return Err(appeared(
                     "appeared before it could be created; it is left alone",
                 ));
             }
-            (Action::ReplaceLink, Peek::Link { target, .. }) => (Some(target.clone()), None),
-            (Action::UpdateFile, Peek::File { .. }) => (None, facts.ledger_fp.clone()),
-            (Action::Remove, Peek::File { .. } | Peek::Link { .. }) => {
-                if op.class == Class::Sensitive {
-                    return Err(appeared(
-                        "is sensitive; the manager cannot verify it, so it is kept",
-                    ));
+            (Action::ReplaceLink, Peek::Link { .. }) | (Action::UpdateFile, Peek::File { .. }) => {
+                if facts.ledger_fp.is_none() {
+                    return Err(appeared("has no ledger fingerprint; it is left alone"));
                 }
-                (None, None)
             }
+            (Action::Remove, Peek::File { .. } | Peek::Link { .. }) => {}
             (Action::ReplaceLink | Action::UpdateFile | Action::Remove, _) => {
                 return Err(appeared(
                     "is no longer the entry the plan found; it is left alone",
                 ));
             }
             (Action::None, _) => return Err(failed(plan_invalid("no action"))),
-        };
+        }
         // Content and fingerprints are decided before the intent is written, so a generator
         // failure leaves no interruption record.
         let bytes = if is_file_action(op.action) {
@@ -496,7 +595,7 @@ impl Exec<'_, '_> {
             snapshot: None,
         };
         self.journal(op, &id, Phase::Intent, Some(recovery), None)
-            .map_err(failed)?;
+            .map_err(|e| Ended::Failed(e, Some(id.clone())))?;
         // From here on the effect may have happened.
         let effect = self.effect(
             op,
@@ -505,55 +604,68 @@ impl Exec<'_, '_> {
             &parent,
             name,
             &live,
-            old_target.as_deref(),
-            old_file_fp.as_deref(),
+            facts.ledger_fp.as_deref(),
             bytes.as_deref(),
             new_fp.as_deref(),
         );
         let removed_fp = match effect {
             Ok(fp) => fp,
             Err(e) => {
+                let unconfirmed = e.code == Code::IoUnconfirmed;
                 let why: String = dfm_model::display::visible(&e.detail)
                     .chars()
                     .take(1024)
                     .collect();
-                let note = self.journal(op, &id, Phase::Failed, None, Some(why.clone()));
-                return Err(failed(match note {
+                let phase = if unconfirmed {
+                    Phase::Unknown
+                } else {
+                    Phase::Failed
+                };
+                let note = self.journal(op, &id, phase, None, Some(why.clone()));
+                let e = match note {
                     Ok(()) => e,
                     Err(n) => Refusal::new(
                         e.code,
-                        format!("{why}; the failure could not be journaled: {}", n.detail),
+                        format!("{why}; the outcome could not be journaled: {}", n.detail),
                     ),
-                }));
+                };
+                return Err(self.after_intent(e, &id, &abs));
             }
         };
         // The effect is read back. Now the outcome entry, then ownership.
-        self.journal(op, &id, Phase::Done, None, None)
-            .map_err(failed)?;
-        self.run.fail.hit("apply-after-done").map_err(failed)?;
+        let rest = (|| -> Result<(), Refusal> {
+            self.journal(op, &id, Phase::Done, None, None)?;
+            self.run.fail.hit("apply-after-done")?;
+            let published = matches!(
+                op.action,
+                Action::CreateLink | Action::ReplaceLink | Action::CreateFile | Action::UpdateFile
+            );
+            match op.action {
+                Action::Remove => self.forget_output(op, &id, &abs),
+                _ if published => {
+                    let fp = new_fp.clone().unwrap_or_default();
+                    let mode = if bytes.is_some() {
+                        op.mode.unwrap_or(0o600)
+                    } else {
+                        0o777
+                    };
+                    self.record_output(op, &id, &abs, &fp, mode)
+                }
+                _ => Ok(()),
+            }
+        })();
+        if let Err(e) = rest {
+            return Err(self.after_intent(e, &id, &abs));
+        }
         let published = matches!(
             op.action,
             Action::CreateLink | Action::ReplaceLink | Action::CreateFile | Action::UpdateFile
         );
-        match op.action {
-            Action::Remove => self.forget_output(op, &id, &abs).map_err(failed)?,
-            _ if published => {
-                let fp = new_fp.clone().unwrap_or_default();
-                let mode = if bytes.is_some() {
-                    op.mode.unwrap_or(0o600)
-                } else {
-                    0o777
-                };
-                self.record_output(op, &id, &abs, &fp, mode)
-                    .map_err(failed)?;
-            }
-            _ => {}
-        }
         Ok(Ended::Updated {
             id,
             before: match op.action {
                 Action::Remove => removed_fp,
-                _ => old_file_fp.or_else(|| old_target.as_deref().map(link_fingerprint)),
+                _ => facts.ledger_fp.clone(),
             },
             after: new_fp,
             owned: if published { vec![abs] } else { Vec::new() },
@@ -563,7 +675,8 @@ impl Exec<'_, '_> {
 
     /// The effect, then its read-back. For a removal it returns the fingerprint of what was
     /// removed. The primitives re-verify the leaf themselves (create never replaces, replace
-    /// and update compare the live link target or content hash, remove checks identity).
+    /// and update compare the live link or content against the ledger fingerprint, remove
+    /// checks identity).
     #[expect(
         clippy::too_many_arguments,
         reason = "one effect needs the facts verified before it"
@@ -576,8 +689,7 @@ impl Exec<'_, '_> {
         parent: &Dir,
         name: &str,
         live: &Peek,
-        old_target: Option<&str>,
-        old_file_fp: Option<&str>,
+        ledger_fp: Option<&str>,
         bytes: Option<&[u8]>,
         new_fp: Option<&str>,
     ) -> Result<Option<String>, Refusal> {
@@ -586,16 +698,18 @@ impl Exec<'_, '_> {
         fail.hit("apply-before-effect")?;
         let mut removed = None;
         match op.action {
-            Action::CreateDir => parent.make_dir(name)?,
-            Action::CreateLink => parent.make_link(name, op.link.as_deref().unwrap_or_default())?,
+            Action::CreateDir => parent.make_dir(name, fail)?,
+            Action::CreateLink => {
+                parent.make_link(name, op.link.as_deref().unwrap_or_default(), fail)?;
+            }
             Action::ReplaceLink => parent.replace_link(
                 name,
                 op.link.as_deref().unwrap_or_default(),
-                old_target.unwrap_or_default(),
+                ledger_fp.unwrap_or_default(),
                 fail,
             )?,
             Action::CreateFile | Action::UpdateFile => {
-                let how = match old_file_fp {
+                let how = match ledger_fp {
                     Some(h) if op.action == Action::UpdateFile => {
                         Publish::Replace { expected_sha256: h }
                     }
@@ -667,6 +781,7 @@ impl Exec<'_, '_> {
                 "no longer matches the fingerprint the ledger records",
             ));
         }
+        self.run.fail.hit("apply-before-unlink")?;
         // The name must still be the entry that was hashed.
         match (ident, target) {
             (Some(i), _) if parent.entry_ident(name)? != Some(i) => {
@@ -678,7 +793,7 @@ impl Exec<'_, '_> {
             },
             _ => {}
         }
-        parent.remove_entry(name)?;
+        parent.remove_entry(name, self.run.fail)?;
         Ok(fp)
     }
 
@@ -690,7 +805,7 @@ impl Exec<'_, '_> {
         fp: &str,
         mode: u32,
     ) -> Result<(), Refusal> {
-        let mut ledger = self.run.store.read_ledger()?;
+        let (mut ledger, _) = self.run.store.read_ledger_lenient()?;
         let mut outs = ledger
             .resources
             .iter()
@@ -716,7 +831,7 @@ impl Exec<'_, '_> {
 
     /// Drops one output from the ledger, and the resource when it owns nothing else.
     fn forget_output(&self, op: &Operation, id: &str, abs: &str) -> Result<(), Refusal> {
-        let mut ledger = self.run.store.read_ledger()?;
+        let (mut ledger, _) = self.run.store.read_ledger_lenient()?;
         for r in &mut ledger.resources {
             if r.resource == op.resource {
                 r.owned_outputs.retain(|o| o.path != abs);
@@ -735,7 +850,7 @@ impl Exec<'_, '_> {
         };
         let go = || -> Result<Option<String>, Refusal> {
             let abs = self.abs(rel)?;
-            let ledger = self.run.store.read_ledger()?;
+            let (ledger, _) = self.run.store.read_ledger_lenient()?;
             let has = ledger.resources.iter().any(|r| {
                 r.resource == op.resource && r.owned_outputs.iter().any(|o| o.path == abs)
             });
@@ -761,7 +876,7 @@ impl Exec<'_, '_> {
             .and_then(|()| self.journal(op, &id, Phase::Done, None, None));
         match r {
             Ok(()) => Ended::Current,
-            Err(e) => failed(e),
+            Err(e) => Ended::Failed(e, Some(id)),
         }
     }
 
@@ -818,10 +933,10 @@ impl Exec<'_, '_> {
 
 /// Journal entries of earlier runs that never reached a terminal entry are settled first
 /// (architecture section 5): the operation's `already_done` check decides `done` or `failed`,
-/// or `unknown`, which blocks work on that path. Nothing is run again and no ownership is
-/// created.
+/// or `unknown`, which blocks work on that path for this run. Nothing is run again and no
+/// ownership is created.
 fn settle(ex: &mut Exec<'_, '_>) -> Result<(), Refusal> {
-    let entries = ex.run.store.read_journal()?;
+    let entries = ex.run.store.read_journal_lenient()?;
     let pending: Vec<(String, String, Vec<String>)> = unfinished(&entries)
         .into_iter()
         .map(|e| {
@@ -833,15 +948,20 @@ fn settle(ex: &mut Exec<'_, '_>) -> Result<(), Refusal> {
             (e.op_id.clone(), e.op.clone(), paths)
         })
         .collect();
-    if pending.is_empty() {
-        return Ok(());
+    if !pending.is_empty() {
+        let settled = ex.run.store.reconcile(&|e| ex.probe(e))?;
+        for (id, op, phase) in settled {
+            if phase == Phase::Unknown
+                && let Some((_, _, paths)) = pending.iter().find(|(i, o, _)| *i == id && *o == op)
+            {
+                ex.unknown_paths.extend(paths.iter().cloned());
+            }
+        }
     }
-    let settled = ex.run.store.reconcile(&|e| ex.probe(e))?;
-    for (id, op, phase) in settled {
-        if phase == Phase::Unknown
-            && let Some((_, _, paths)) = pending.iter().find(|(i, o, _)| *i == id && *o == op)
-        {
-            ex.unknown_paths.extend(paths.iter().cloned());
+    let entries = ex.run.store.read_journal_lenient()?;
+    for entry in entries.iter().filter(|e| e.phase == Phase::Intent) {
+        if let Some((jid, _)) = entry.op_id.rsplit_once('-') {
+            *ex.attempts.entry(jid.to_string()).or_insert(0) += 1;
         }
     }
     Ok(())
@@ -889,34 +1009,34 @@ fn record(
     }
 }
 
-/// Executes the plan in its order. Call [`preflight`] first and re-plan under the lock.
+/// Checks the gates and then runs the plan. This is the engine's one entry point. A refusal
+/// here means nothing was changed. Once the run starts it always returns a [`Report`], also
+/// when the journal cannot be read or a step fails, so the caller can still write a receipt.
 ///
-/// The first failed or blocked operation stops all further mutation: operations that depend on
-/// it (through `after`) are `blocked`, every other operation that has not started is
-/// `not_started`. Operations that need nothing (`current`, `not_in_scope`) are still reported
-/// as they are. There is no rollback.
-pub fn execute(run: &Run<'_>, plan: &Plan) -> Result<Report, Refusal> {
+/// The first failed, blocked or unknown operation stops all further mutation: operations that
+/// depend on it (through `after`, transitively through results) are `blocked`, every other
+/// operation that has not started is `not_started`. Operations that need nothing (`current`,
+/// `not_in_scope`) are still reported as they are. There is no rollback.
+pub fn apply(run: &Run<'_>, plan: &Plan) -> Result<Report, Refusal> {
+    let g = gates(plan, run.generator);
+    if let Some(r) = g.refusal {
+        return Err(r);
+    }
+    check_allow(&g.removals, run.allow)?;
+    journal_capacity(run, plan)?;
+    Ok(execute(run, plan))
+}
+
+fn execute(run: &Run<'_>, plan: &Plan) -> Report {
     let mut ex = Exec {
         run,
         attempts: BTreeMap::new(),
         unknown_paths: BTreeSet::new(),
     };
-    settle(&mut ex)?;
-    let entries = run.store.read_journal()?;
-    for op in &plan.operations {
-        let prefix = format!("{}-", op.journal_id);
-        let used = entries
-            .iter()
-            .filter(|e| e.phase == Phase::Intent && e.op_id.starts_with(&prefix))
-            .count();
-        ex.attempts.insert(
-            op.journal_id.clone(),
-            u32::try_from(used).unwrap_or(u32::MAX),
-        );
-    }
+    // A failure to settle earlier work stops the run before its first operation.
+    let mut stopped: Option<Refusal> = settle(&mut ex).err();
     let mut results: BTreeMap<&str, Status> = BTreeMap::new();
     let mut records = Vec::new();
-    let mut stopped: Option<Refusal> = None;
     for op in &plan.operations {
         let (status, rec) = match op.status {
             PlanStatus::NotInScope => (
@@ -939,16 +1059,14 @@ pub fn execute(run: &Run<'_>, plan: &Plan) -> Result<Report, Refusal> {
                 };
                 let why = dependent
                     .then(|| Refusal::new(Code::PlanStale, "a dependency did not complete"));
-                let times = dependent
-                    .then(|| now().map(|t| (t.clone(), t)))
-                    .transpose()?;
+                let times = dependent.then(|| (now(), now()));
                 (s, record(op, &op.journal_id, s, times, why.as_ref(), None))
             }
             _ => {
-                let started = now()?;
+                let started = now();
                 let ended = if op.status == PlanStatus::Current {
                     // A stale ledger entry is dropped only while the run is still going.
-                    if stopped.is_none() && op.id.starts_with("remove@") {
+                    if stopped.is_none() && op.action == Action::Remove {
                         ex.prune(op)
                     } else {
                         Ended::Current
@@ -956,7 +1074,7 @@ pub fn execute(run: &Run<'_>, plan: &Plan) -> Result<Report, Refusal> {
                 } else {
                     ex.run_op(op)
                 };
-                let times = Some((started, now()?));
+                let times = Some((started, now()));
                 match &ended {
                     Ended::Current => (
                         Status::Current,
@@ -966,11 +1084,12 @@ pub fn execute(run: &Run<'_>, plan: &Plan) -> Result<Report, Refusal> {
                         Status::Updated,
                         record(op, id, Status::Updated, times, None, Some(&ended)),
                     ),
-                    Ended::Failed(r) => {
+                    Ended::Failed(r, id) => {
                         stopped.get_or_insert_with(|| r.clone());
+                        let id = id.as_deref().unwrap_or(&op.journal_id);
                         (
                             Status::Failed,
-                            record(op, &op.journal_id, Status::Failed, times, Some(r), None),
+                            record(op, id, Status::Failed, times, Some(r), None),
                         )
                     }
                     Ended::Blocked(r) => {
@@ -980,14 +1099,68 @@ pub fn execute(run: &Run<'_>, plan: &Plan) -> Result<Report, Refusal> {
                             record(op, &op.journal_id, Status::Blocked, times, Some(r), None),
                         )
                     }
+                    Ended::Unknown(r, id) => {
+                        stopped.get_or_insert_with(|| r.clone());
+                        let id = id.as_deref().unwrap_or(&op.journal_id);
+                        (
+                            Status::Unknown,
+                            record(op, id, Status::Unknown, times, Some(r), None),
+                        )
+                    }
                 }
             }
         };
         results.insert(&op.id, status);
         records.push(rec);
     }
-    Ok(Report {
+    Report {
         operations: records,
         stopped,
-    })
+    }
+}
+
+/// Thin wrappers over the file primitives for the engine's own integration tests. Not part of
+/// the API: the CLI never calls them.
+#[cfg(feature = "failpoints")]
+#[doc(hidden)]
+pub mod test_support {
+    use super::{Dir, Fail, Publish, Refusal, Sys};
+
+    pub fn open_below(home: &Dir, sys: &Sys, rel: &[&str]) -> Result<Dir, Refusal> {
+        home.open_below(sys, rel)
+    }
+    pub fn remove_entry(dir: &Dir, name: &str, fail: &Fail) -> Result<(), Refusal> {
+        dir.remove_entry(name, fail)
+    }
+    pub fn make_dir(dir: &Dir, name: &str, fail: &Fail) -> Result<(), Refusal> {
+        dir.make_dir(name, fail)
+    }
+    pub fn make_link(dir: &Dir, name: &str, target: &str, fail: &Fail) -> Result<(), Refusal> {
+        dir.make_link(name, target, fail)
+    }
+    pub fn replace_link(
+        dir: &Dir,
+        name: &str,
+        target: &str,
+        ledger_fp: &str,
+        fail: &Fail,
+    ) -> Result<(), Refusal> {
+        dir.replace_link(name, target, ledger_fp, fail)
+    }
+    pub fn replace_file(
+        dir: &Dir,
+        name: &str,
+        bytes: &[u8],
+        expected_sha256: &str,
+        fail: &Fail,
+    ) -> Result<(), Refusal> {
+        dir.publish_file(
+            name,
+            bytes,
+            0o600,
+            Publish::Replace { expected_sha256 },
+            super::MAX_FILE,
+            fail,
+        )
+    }
 }

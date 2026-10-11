@@ -6,11 +6,13 @@
 //! changes nothing.
 
 use crate::plan_cmd::{make_plan, render};
-use crate::{Ctx, bounded, read_existing_binding, state_cmd, usage};
-use dfm_engine::{Dir, NoGenerator, Run, Store, execute, now_unix, preflight};
+use crate::{Ctx, read_existing_binding, state_cmd, usage};
+use dfm_engine::{Dir, NoGenerator, Run, Store, allow_flag, apply, check_allow, gates, now_unix};
 use dfm_model::display::visible;
+use dfm_model::plan::Action;
 use dfm_model::state::{
-    Approval, BinaryId, ProfileRef, Receipt, RunResult, Stamp, Status, count_statuses, rfc3339,
+    Approval, BinaryId, DisruptiveApproval, ProfileRef, Receipt, RunResult, SourceId, Stamp,
+    Status, count_statuses, rfc3339,
 };
 use dfm_model::{Code, Exit, Refusal};
 use std::collections::BTreeSet;
@@ -88,7 +90,7 @@ fn stale(approved: &str, now: &str) -> Refusal {
 
 fn label(s: Status) -> &'static str {
     match s {
-        Status::Updated => "applied",
+        Status::Updated => "updated",
         Status::Current => "current",
         Status::Failed => "failed",
         Status::Blocked => "blocked",
@@ -101,7 +103,32 @@ fn label(s: Status) -> &'static str {
     }
 }
 
+/// What was printed so far, so a refusal prints its `result:` line exactly once.
+#[derive(Default)]
+struct Progress {
+    plan_printed: bool,
+    result_printed: bool,
+}
+
 pub fn run(ctx: &Ctx, args: &Args, out: &mut dyn Write) -> Result<(), Refusal> {
+    let mut progress = Progress::default();
+    let r = run_inner(ctx, args, out, &mut progress);
+    if let Err(e) = &r
+        && progress.plan_printed
+        && !progress.result_printed
+    {
+        // The printed result is the exit the process returns, from the same refusal.
+        let _ = writeln!(out, "result: {}", e.exit().name());
+    }
+    r
+}
+
+fn run_inner(
+    ctx: &Ctx,
+    args: &Args,
+    out: &mut dyn Write,
+    progress: &mut Progress,
+) -> Result<(), Refusal> {
     let w =
         |e: std::io::Error| Refusal::new(Code::IoFailed, format!("output failed: {}", e.kind()));
     let binding = read_existing_binding(ctx)?.ok_or_else(|| {
@@ -118,6 +145,7 @@ pub fn run(ctx: &Ctx, args: &Args, out: &mut dyn Write) -> Result<(), Refusal> {
         writeln!(out, "isolated: true {i}").map_err(w)?;
     }
     render(&plan, &digest, out).map_err(w)?;
+    progress.plan_printed = true;
     // A digest that no longer matches is the first thing to report: the reviewer approved a
     // different plan. A blocked plan cannot be approved at all.
     if let Some(approved) = &args.yes_plan
@@ -127,6 +155,28 @@ pub fn run(ctx: &Ctx, args: &Args, out: &mut dyn Write) -> Result<(), Refusal> {
     }
     if let Some(b) = plan.blockers.first() {
         return Err(b.refusal());
+    }
+    // The gates that need no write run before the lock and in a preview, so a plan that apply
+    // would refuse is refused here with the same code.
+    let g = gates(&plan, &NoGenerator);
+    if let Some(bad) = args.allow.iter().find(|a| !g.removals.contains(a)) {
+        return Err(usage(format!(
+            "--allow-disruptive {bad} names no removal in this plan"
+        )));
+    }
+    let needed: Vec<&String> = g
+        .removals
+        .iter()
+        .filter(|id| !args.allow.contains(*id))
+        .collect();
+    if !needed.is_empty() {
+        writeln!(out, "removals need approval, one flag each:").map_err(w)?;
+        for id in &needed {
+            writeln!(out, "  {}", allow_flag(id)).map_err(w)?;
+        }
+    }
+    if let Some(r) = g.refusal {
+        return Err(r);
     }
     if args.preview {
         return Ok(());
@@ -139,6 +189,7 @@ pub fn run(ctx: &Ctx, args: &Args, out: &mut dyn Write) -> Result<(), Refusal> {
             ),
         ));
     };
+    check_allow(&g.removals, &args.allow)?;
 
     // Take the lock, then decide again: another command may have changed the machine or the
     // sources since the first look.
@@ -173,27 +224,58 @@ pub fn run(ctx: &Ctx, args: &Args, out: &mut dyn Write) -> Result<(), Refusal> {
         allow: &args.allow,
         fail: &fail,
     };
-    preflight(&run, &locked).map_err(|r| stamped(&store, r))?;
-
     let started = now_unix().map_err(|r| stamped(&store, r))?;
-    let report = execute(&run, &locked).map_err(|r| stamped(&store, r))?;
-    let finished = now_unix().map_err(Refusal::after_mutation)?;
+    let report = apply(&run, &locked).map_err(|r| stamped(&store, r))?;
+    let finished = now_unix().unwrap_or(started);
 
     let counts = count_statuses(&report.operations);
     let n = |s: Status| counts.get(&s).copied().unwrap_or(0);
-    let bad = n(Status::Failed) + n(Status::Blocked) + n(Status::Unknown) > 0;
     let mutated = store.mutated();
-    let exit = match (bad, mutated) {
-        (false, _) => Exit::Ok,
-        (true, true) => Exit::Failed,
-        (true, false) => Exit::Blocked,
-    };
+    // One exit, derived from the first problem, is both printed and returned.
+    let stopped = report
+        .stopped
+        .map(|r| if mutated { r.after_mutation() } else { r });
+    let mut exit = stopped.as_ref().map_or(Exit::Ok, Refusal::exit);
 
     // The receipt is written whenever anything changed, also after a failure. A run that
     // changed nothing (a safe rerun, or a stop before the first effect) writes none.
     let mut receipt_name = None;
+    let mut receipt_error = None;
     if mutated {
         let stamp = Stamp::of(&binding);
+        let approvals = locked
+            .operations
+            .iter()
+            .zip(&report.operations)
+            .filter(|(op, rec)| {
+                op.action == Action::Remove
+                    && args.allow.contains(&op.id)
+                    // The attempt id replaces the planner id once the operation reached its intent.
+                    && rec.id != op.journal_id
+            })
+            .map(|(_, rec)| DisruptiveApproval {
+                operation_id: rec.id.clone(),
+                how: "allow_disruptive".into(),
+                at: rec.started_at.clone().unwrap_or_else(|| rfc3339(started)),
+            })
+            .collect();
+        let sources = locked
+            .sources
+            .iter()
+            .filter(|s| s.kind == "path")
+            .map(|s| SourceId {
+                id: format!(
+                    "path-{}",
+                    s.tree
+                        .trim_start_matches("sha256:")
+                        .get(..12)
+                        .unwrap_or("0")
+                ),
+                kind: Some("path".into()),
+                commit: None,
+                tree: s.tree.clone(),
+            })
+            .collect();
         let receipt = Receipt {
             schema: 1,
             op_id: format!("apply-{}-{}", &digest[..16], std::process::id()),
@@ -216,8 +298,8 @@ pub fn run(ctx: &Ctx, args: &Args, out: &mut dyn Write) -> Result<(), Refusal> {
                 plan_digest: digest.clone(),
                 at: rfc3339(started),
             }),
-            // A path source has no commit. The plan digest covers the source tree digest.
-            sources: Vec::new(),
+            sources,
+            approvals,
             operations: report.operations.clone(),
             result: RunResult {
                 outcome: exit.name().into(),
@@ -225,11 +307,14 @@ pub fn run(ctx: &Ctx, args: &Args, out: &mut dyn Write) -> Result<(), Refusal> {
                 counts: counts.clone(),
             },
         };
-        receipt_name = Some(
-            store
-                .write_receipt(&receipt)
-                .map_err(Refusal::after_mutation)?,
-        );
+        match store.write_receipt(&receipt) {
+            Ok(name) => receipt_name = Some(name),
+            Err(e) => {
+                // The journal and the ledger stay the record. The run is a failure.
+                exit = Exit::Failed;
+                receipt_error = Some(e.after_mutation());
+            }
+        }
     }
 
     for (op, rec) in locked.operations.iter().zip(&report.operations) {
@@ -251,11 +336,12 @@ pub fn run(ctx: &Ctx, args: &Args, out: &mut dyn Write) -> Result<(), Refusal> {
     }
     writeln!(
         out,
-        "counts: applied={} current={} failed={} blocked={} not_started={} not_in_scope={}",
+        "counts: updated={} current={} failed={} blocked={} unknown={} not_started={} not_in_scope={}",
         n(Status::Updated),
         n(Status::Current),
         n(Status::Failed),
         n(Status::Blocked),
+        n(Status::Unknown),
         n(Status::NotStarted),
         n(Status::NotInScope)
     )
@@ -270,20 +356,14 @@ pub fn run(ctx: &Ctx, args: &Args, out: &mut dyn Write) -> Result<(), Refusal> {
     if let Some(r) = &receipt_name {
         writeln!(out, "receipt: {}", visible(r)).map_err(w)?;
     }
+    if let Some(e) = &receipt_error {
+        writeln!(out, "receipt: not written ({})", visible(&e.to_string())).map_err(w)?;
+    }
     writeln!(out, "result: {}", exit.name()).map_err(w)?;
-    match (exit, report.stopped) {
-        (Exit::Ok, _) => Ok(()),
-        // Nothing changed: the first failure keeps its own code, which exits 3.
-        (Exit::Blocked, Some(r)) => Err(r),
-        (_, stopped) => Err(Refusal::new(
-            Code::ApplyFailed,
-            bounded(&format!(
-                "{} failed, {} blocked, {} not started after some files changed. First failure: {}. The ledger lists exactly what was published; run plan to see what remains",
-                n(Status::Failed),
-                n(Status::Blocked),
-                n(Status::NotStarted),
-                stopped.map_or_else(|| "unknown".into(), |r| r.to_string())
-            )),
-        )),
+    progress.result_printed = true;
+    match (receipt_error, stopped) {
+        (Some(e), _) => Err(e),
+        (None, Some(r)) => Err(r),
+        (None, None) => Ok(()),
     }
 }

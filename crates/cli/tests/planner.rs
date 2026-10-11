@@ -1774,7 +1774,8 @@ fn an_owned_output_that_nothing_selects_any_more_is_planned_for_removal() {
     let (o, s) = e.saved();
     assert_eq!(code(&o), 0);
     let r = op(&s, "remove@gone.res@gone.txt");
-    assert_eq!((r.action, r.status), (Action::None, Status::Current));
+    // The action is Remove so apply can drop the stale ledger entry (docs/apply.md).
+    assert_eq!((r.action, r.status), (Action::Remove, Status::Current));
 
     // A directory is never removed.
     fs::create_dir(&gone).unwrap();

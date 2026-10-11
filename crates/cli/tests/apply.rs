@@ -193,9 +193,27 @@ impl Fx {
             .map(|e| e.unwrap().path())
             .collect();
         v.sort();
-        v.iter()
+        let mut all: Vec<serde_json::Value> = v
+            .iter()
             .map(|p| serde_json::from_slice(&fs::read(p).unwrap()).unwrap())
-            .collect()
+            .collect();
+        // Oldest first. Two runs in the same second sort by file name, which has no meaning, so
+        // the run that published more comes first (the earlier run of these tests).
+        let updated = |r: &serde_json::Value| {
+            r["operations"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|o| o["status"] == "updated")
+                .count()
+        };
+        all.sort_by(|a, b| {
+            a["started_at"]
+                .as_str()
+                .cmp(&b["started_at"].as_str())
+                .then(updated(b).cmp(&updated(a)))
+        });
+        all
     }
 
     fn owned_paths(&self) -> Vec<String> {
@@ -215,6 +233,30 @@ impl Fx {
             .collect();
         v.sort();
         v
+    }
+
+    /// Drops the zsh link, so the first operation is a directory with a dependent link.
+    fn without_zsh(&self) {
+        let m = fs::read_to_string(self.root.join("base/modules/extra/module.toml")).unwrap();
+        self.put(
+            "base/modules/extra/module.toml",
+            &m[..m.find("[[resources]]\nid = \"zsh\"").unwrap()],
+        );
+    }
+
+    /// Adds a rendered file. No generator exists, so a plan with it must be refused up front.
+    fn with_render(&self) {
+        let m = fs::read_to_string(self.root.join("base/modules/extra/module.toml")).unwrap();
+        self.put(
+            "base/modules/extra/module.toml",
+            &format!(
+                "{m}\n[[resources]]\nid = \"gitdefaults\"\nkind = \"render\"\nadapter = \"git-config/v1\"\ntarget = \".config/git/defaults.inc\"\n[resources.value.core]\neditor = \"nvim\"\n[resources.policy]\ndefaults = [\"/core/editor\"]\nextensions = []\n"
+            ),
+        );
+    }
+
+    fn lock_note(&self) -> Vec<u8> {
+        fs::read(self.h(".local/state/dotfiles-manager.lock")).unwrap()
     }
 
     fn set_profile(&self, modules: &str) {
@@ -327,9 +369,19 @@ fn bad_flags_are_usage_errors() {
         let o = fx.run(&args);
         assert_eq!(code(&o), 2, "{args:?}: {}", stderr(&o));
     }
-    // An allowance for an operation the plan does not contain is refused as well.
+    // An allowance for an operation the plan does not contain is refused as well, before the
+    // lock is taken and before the state store is opened for writing.
+    let note = fx.lock_note();
+    let before = fingerprint(fx.home.path());
     let o = fx.apply_with(&d, &["--allow-disruptive", "remove@nothing@here"]);
     assert_eq!(code(&o), 2, "{}", stderr(&o));
+    assert!(
+        text(&o.stdout).contains("result: usage"),
+        "{}",
+        text(&o.stdout)
+    );
+    assert_eq!(fx.lock_note(), note, "the lock was not taken");
+    assert_eq!(fingerprint(fx.home.path()), before);
 }
 
 #[test]
@@ -373,7 +425,7 @@ fn apply_publishes_links_creates_parents_and_records_ownership_and_a_receipt() {
     assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
     let out = text(&o.stdout);
     assert!(
-        out.contains("counts: applied=") && out.contains("failed=0"),
+        out.contains("counts: updated=") && out.contains("failed=0"),
         "{out}"
     );
     for (rel, src) in [
@@ -450,7 +502,7 @@ fn a_second_apply_of_an_applied_plan_changes_nothing_and_exits_0() {
     let before = fingerprint(fx.home.path());
     let o = fx.apply(&[]);
     assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
-    assert!(text(&o.stdout).contains("applied=0"), "{}", text(&o.stdout));
+    assert!(text(&o.stdout).contains("updated=0"), "{}", text(&o.stdout));
     assert_eq!(
         fingerprint(fx.home.path()),
         before,
@@ -635,9 +687,9 @@ fn configuration_changes_never_require_rebuilding_the_manager() {
 }
 
 #[test]
-fn a_plan_with_generated_files_is_refused_before_any_write_while_no_adapter_exists() {
-    // The example personal profile renders files. No generator exists in this build, so apply
-    // must say so up front and change nothing, not publish half of the plan.
+fn a_plan_with_a_sensitive_output_is_refused_before_any_write() {
+    // The example personal profile merges a sensitive settings file. Apply cannot detect an
+    // edit to it yet, so it refuses the whole plan with its own code and changes nothing.
     let home = TempDir::new("apply-gen-home");
     let src = TempDir::new("apply-gen-src");
     let root = src.path().join("examples");
@@ -662,9 +714,44 @@ fn a_plan_with_generated_files_is_refused_before_any_write_while_no_adapter_exis
     let o = fx.apply(&[]);
     assert_eq!(code(&o), 3, "{}", stderr(&o));
     assert!(
+        stderr(&o).contains("E_SENSITIVE_UNSUPPORTED"),
+        "{}",
+        stderr(&o)
+    );
+    assert_eq!(fingerprint(fx.home.path()), before);
+    assert!(fx.receipts().is_empty());
+}
+
+#[test]
+fn a_plan_with_a_generated_file_is_refused_up_front_by_apply_and_by_preview() {
+    // No generator exists in this build. Both the preview and the real run say so, with the
+    // same code and the same blocked result, and neither changes anything.
+    let fx = Fx::new();
+    fx.with_render();
+    let before = fingerprint(fx.home.path());
+    let preview = fx.run(&["apply", "--root", fx.root_arg(), "--preview"]);
+    assert_eq!(code(&preview), 3, "{}", stderr(&preview));
+    assert!(
+        stderr(&preview).contains("E_GENERATOR_UNAVAILABLE"),
+        "{}",
+        stderr(&preview)
+    );
+    assert!(
+        text(&preview.stdout).contains("result: blocked"),
+        "{}",
+        text(&preview.stdout)
+    );
+    let o = fx.apply(&[]);
+    assert_eq!(code(&o), 3, "{}", stderr(&o));
+    assert!(
         stderr(&o).contains("E_GENERATOR_UNAVAILABLE"),
         "{}",
         stderr(&o)
+    );
+    assert!(
+        text(&o.stdout).contains("result: blocked"),
+        "{}",
+        text(&o.stdout)
     );
     assert_eq!(fingerprint(fx.home.path()), before);
     assert!(fx.receipts().is_empty());
@@ -896,27 +983,33 @@ fn parked_apply(fx: &Fx, point: &str, during: impl FnOnce(&Fx)) -> Output {
 #[test]
 fn a_target_swapped_for_a_foreign_file_after_the_last_check_is_never_overwritten() {
     let fx = Fx::new();
-    // Every parent exists, so the first effect is a link creation.
+    fx.without_zsh();
+    // Every parent exists, so the first operation is the creation of the git link.
     fs::create_dir_all(fx.h(".config/git")).unwrap();
     fs::create_dir_all(fx.h(".config/tmux")).unwrap();
     fs::create_dir_all(fx.h(".ssh")).unwrap();
     let o = parked_apply(&fx, "apply-before-effect", |fx| {
-        // Whichever link is first, make every target foreign.
         for t in [
             ".config/git/config",
             ".config/tmux/tmux.conf",
             ".ssh/config",
-            ".zshrc",
         ] {
             fs::write(fx.h(t), "foreign\n").unwrap();
         }
     });
     assert_eq!(code(&o), 1, "{}\n{}", stderr(&o), text(&o.stdout));
+    let out = text(&o.stdout);
+    // The parked operation is the git link, and it is the one that failed.
+    assert!(out.contains("failed core.git@.config/git/config"), "{out}");
+    assert!(
+        out.contains("counts: updated=0 current=0 failed=1 blocked=0 unknown=0 not_started=2"),
+        "{out}"
+    );
+    assert!(out.contains("result: failed"), "{out}");
     for t in [
         ".config/git/config",
         ".config/tmux/tmux.conf",
         ".ssh/config",
-        ".zshrc",
     ] {
         assert_eq!(fs::read_to_string(fx.h(t)).unwrap(), "foreign\n", "{t}");
     }
@@ -928,19 +1021,24 @@ fn a_target_swapped_for_a_foreign_file_after_the_last_check_is_never_overwritten
     assert_eq!(rs.len(), 1);
     assert_eq!(rs[0]["result"]["outcome"], "failed");
     let counts = &rs[0]["result"]["counts"];
-    assert_eq!(counts["failed"], 1);
-    assert_eq!(counts["updated"], 0);
-    assert!(counts["not_started"].as_u64().unwrap() >= 1);
+    assert_eq!(
+        (
+            counts["failed"].as_u64(),
+            counts["updated"].as_u64(),
+            counts["not_started"].as_u64()
+        ),
+        (Some(1), Some(0), Some(2))
+    );
 }
 
 #[test]
 fn a_parent_swapped_for_a_link_after_the_check_receives_no_write() {
     let fx = Fx::new();
-    fs::create_dir_all(fx.h(".config")).unwrap();
+    fx.without_zsh();
     fs::create_dir_all(fx.h("victim")).unwrap();
+    // The first operation creates ~/.config/git. While it waits (the parent ~/.config is
+    // already open), ~/.config is swapped for a link to a directory outside the plan.
     let o = parked_apply(&fx, "apply-before-effect", |fx| {
-        // The first operation creates a directory inside ~/.config (or elsewhere). Swap ~/.config
-        // for a link to a directory outside the plan while it waits.
         fs::rename(fx.h(".config"), fx.h(".config-moved")).unwrap();
         symlink(fx.h("victim"), fx.h(".config")).unwrap();
     });
@@ -949,21 +1047,23 @@ fn a_parent_swapped_for_a_link_after_the_check_receives_no_write() {
         0,
         "nothing was written through the link"
     );
+    // The effect landed in the directory that was verified, which now has another name.
+    assert!(fx.h(".config-moved/git").is_dir());
     assert_eq!(code(&o), 1, "{}\n{}", stderr(&o), text(&o.stdout));
-    // The later operations saw the changed topology and did not run.
-    let counts = &fx.receipts()[0]["result"]["counts"];
-    assert!(counts["blocked"].as_u64().unwrap() + counts["failed"].as_u64().unwrap() >= 1);
+    let out = text(&o.stdout);
+    assert!(out.contains("updated mkdir@.config/git"), "{out}");
+    // The next operation saw the changed topology and was blocked, the rest did not start.
+    assert!(out.contains("blocked core.git@.config/git/config"), "{out}");
+    assert!(
+        out.contains("counts: updated=1 current=0 failed=0 blocked=1 unknown=0 not_started=4"),
+        "{out}"
+    );
 }
 
 #[test]
 fn a_required_failure_stops_mutation_blocks_dependents_and_counts_the_rest() {
     let fx = Fx::new();
-    // Without the zsh link, the first operation is a directory that a link depends on.
-    let m = fs::read_to_string(fx.root.join("base/modules/extra/module.toml")).unwrap();
-    fx.put(
-        "base/modules/extra/module.toml",
-        &m[..m.find("[[resources]]\nid = \"zsh\"").unwrap()],
-    );
+    fx.without_zsh();
     let digest = fx.digest();
     let o = Command::new(BIN)
         .env_clear()
@@ -975,21 +1075,60 @@ fn a_required_failure_stops_mutation_blocks_dependents_and_counts_the_rest() {
         .unwrap();
     assert_eq!(code(&o), 1, "{}\n{}", stderr(&o), text(&o.stdout));
     let out = text(&o.stdout);
-    // Exactly one failure, its dependents are blocked, independent work did not start.
-    assert!(out.contains("failed=1"), "{out}");
-    assert!(!out.contains("blocked=0"), "{out}");
-    assert!(!out.contains("not_started=0"), "{out}");
-    assert!(out.contains("applied=0"), "{out}");
-    assert!(stderr(&o).contains("E_APPLY_FAILED"), "{}", stderr(&o));
+    // Exactly one failure (the first directory), exactly one dependent, four not started.
+    assert!(out.contains("failed mkdir@.config/git"), "{out}");
+    assert!(
+        out.contains("counts: updated=0 current=0 failed=1 blocked=1 unknown=0 not_started=4"),
+        "{out}"
+    );
+    assert!(out.contains("result: failed"), "{out}");
+    // The original code is kept. There is no umbrella code.
+    assert!(stderr(&o).contains("E_IO_FAILED"), "{}", stderr(&o));
+    assert!(!stderr(&o).contains("E_APPLY_FAILED"));
     let r = &fx.receipts()[0];
     assert_eq!(r["result"]["outcome"], "failed");
     assert_eq!(r["result"]["exit_code"], 1);
-    // The journal shows the intent and its failure. Nothing was recorded as owned.
+    // The journal shows the intent and its failure. The receipt id of the failed operation is
+    // the journal attempt id. Nothing was recorded as owned.
     let j = fx.journal();
     assert_eq!(j.iter().filter(|e| e["phase"] == "intent").count(), 1);
     assert_eq!(j.iter().filter(|e| e["phase"] == "failed").count(), 1);
+    let failed_op = r["operations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|o| o["status"] == "failed")
+        .unwrap();
+    assert_eq!(failed_op["id"], j[0]["op_id"]);
     assert!(fx.owned_paths().is_empty());
-    assert!(fs::symlink_metadata(fx.h(".zshrc")).is_err());
+}
+
+#[test]
+fn a_failure_before_any_write_prints_failed_and_exits_1() {
+    // The journal cannot take the first intent entry: the run fails before it writes anything.
+    // That is a failure, not a block, so the printed result and the exit say so.
+    let fx = Fx::new();
+    let digest = fx.digest();
+    let o = Command::new(BIN)
+        .env_clear()
+        .env("DFM_FAILPOINT", "journal-before-write:error")
+        .arg("--home")
+        .arg(fx.home.path())
+        .args(["apply", "--root", fx.root_arg(), "--yes-plan", &digest])
+        .output()
+        .unwrap();
+    assert_eq!(code(&o), 1, "{}\n{}", stderr(&o), text(&o.stdout));
+    assert!(
+        text(&o.stdout).contains("result: failed"),
+        "{}",
+        text(&o.stdout)
+    );
+    assert!(stderr(&o).contains("E_IO_FAILED"), "{}", stderr(&o));
+    assert!(
+        fx.receipts().is_empty(),
+        "nothing was written, so there is no receipt"
+    );
+    assert!(fx.owned_paths().is_empty());
 }
 
 #[test]
@@ -998,22 +1137,26 @@ fn an_unwritable_directory_is_a_failure_and_never_data_loss() {
         return;
     }
     let fx = Fx::new();
+    fx.without_zsh();
     fs::create_dir_all(fx.h(".config/git")).unwrap();
     fs::create_dir_all(fx.h(".config/tmux")).unwrap();
     fs::create_dir_all(fx.h(".ssh")).unwrap();
     fs::write(fx.h("keep.txt"), "keep\n").unwrap();
+    // The first operation is the git link. Its directory loses write permission while it waits.
     let o = parked_apply(&fx, "apply-before-effect", |fx| {
-        for d in [".config/git", ".config/tmux", ".ssh"] {
-            fs::set_permissions(fx.h(d), fs::Permissions::from_mode(0o500)).unwrap();
-        }
+        fs::set_permissions(fx.h(".config/git"), fs::Permissions::from_mode(0o500)).unwrap();
     });
-    for d in [".config/git", ".config/tmux", ".ssh"] {
-        fs::set_permissions(fx.h(d), fs::Permissions::from_mode(0o700)).unwrap();
-    }
+    fs::set_permissions(fx.h(".config/git"), fs::Permissions::from_mode(0o700)).unwrap();
     assert_eq!(code(&o), 1, "{}\n{}", stderr(&o), text(&o.stdout));
-    assert!(text(&o.stdout).contains("failed=1") || text(&o.stdout).contains("blocked="));
+    let out = text(&o.stdout);
+    assert!(out.contains("failed core.git@.config/git/config"), "{out}");
+    assert!(
+        out.contains("counts: updated=0 current=0 failed=1 blocked=0 unknown=0 not_started=2"),
+        "{out}"
+    );
     assert_eq!(fs::read_to_string(fx.h("keep.txt")).unwrap(), "keep\n");
     assert!(fx.owned_paths().is_empty());
+    assert!(fs::symlink_metadata(fx.h(".config/git/config")).is_err());
 }
 
 #[test]
@@ -1034,6 +1177,11 @@ fn an_unwritable_directory_known_at_plan_time_blocks_before_any_write() {
         "{}",
         stderr(&o)
     );
+    assert!(
+        text(&o.stdout).contains("result: blocked"),
+        "{}",
+        text(&o.stdout)
+    );
     assert_eq!(after, before);
 }
 
@@ -1043,6 +1191,88 @@ fn running_as_root() -> bool {
         .arg("-u")
         .output()
         .is_ok_and(|o| text(&o.stdout).trim() == "0")
+}
+
+#[test]
+fn a_restrictive_umask_does_not_wedge_the_directories_apply_creates() {
+    // With umask 0500, mkdir(0700) would give mode 0200: the process could not open the
+    // directory it just made. Apply states the mode, so the run completes with 0700.
+    let fx = Fx::new();
+    let digest = fx.digest();
+    let o = Command::new("/bin/sh")
+        .env_clear()
+        .args(["-c", "umask 0500 && exec \"$0\" \"$@\""])
+        .arg(BIN)
+        .arg("--home")
+        .arg(fx.home.path())
+        .args(["apply", "--root", fx.root_arg(), "--yes-plan", &digest])
+        .output()
+        .unwrap();
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+    for d in [".config/git", ".config/tmux", ".ssh"] {
+        let m = fs::metadata(fx.h(d)).unwrap().permissions().mode() & 0o777;
+        assert_eq!(m, 0o700, "{d}");
+    }
+    assert!(fx.h(".config/git/config").is_symlink());
+}
+
+#[test]
+fn a_crash_after_a_link_effect_leaves_an_unowned_link_that_a_removal_run_keeps() {
+    // The first operation is the zsh link. The process dies right after the link exists and
+    // before the journal says done, so the ledger has no entry for it.
+    let fx = Fx::new();
+    let digest = fx.digest();
+    let o = Command::new(BIN)
+        .env_clear()
+        .env("DFM_FAILPOINT", "apply-after-effect:abort")
+        .arg("--home")
+        .arg(fx.home.path())
+        .args(["apply", "--root", fx.root_arg(), "--yes-plan", &digest])
+        .output()
+        .unwrap();
+    assert!(!o.status.success());
+    assert!(is_link_to(
+        &fx.h(".zshrc"),
+        &fx.root.join("base/modules/extra/files/zshrc")
+    ));
+    assert!(
+        fx.owned_paths().is_empty(),
+        "the ledger has no entry for it"
+    );
+    let j = fx.journal();
+    assert_eq!((j.len(), j[0]["phase"].as_str()), (1, Some("intent")));
+    // The rerun settles the interruption as done and finishes the plan.
+    let o = fx.apply(&[]);
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+    assert!(
+        !fx.owned_paths().contains(&".zshrc".to_string()),
+        "it stays unowned"
+    );
+    assert_eq!(fx.owned_paths().len(), 3);
+    // Deselect the module and approve every removal: only the owned tmux link goes.
+    fx.set_profile("");
+    let plan = fx.saved();
+    let removals: Vec<String> = plan
+        .plan
+        .operations
+        .iter()
+        .filter(|o| o.id.starts_with("remove@"))
+        .map(|o| o.id.clone())
+        .collect();
+    assert_eq!(removals.len(), 1, "{removals:?}");
+    assert!(!removals[0].contains("zsh"));
+    let mut args = Vec::new();
+    for r in &removals {
+        args.push("--allow-disruptive");
+        args.push(r.as_str());
+    }
+    let o = fx.apply_with(&plan.plan_digest, &args);
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+    assert!(is_link_to(
+        &fx.h(".zshrc"),
+        &fx.root.join("base/modules/extra/files/zshrc")
+    ));
+    assert!(fs::symlink_metadata(fx.h(".config/tmux/tmux.conf")).is_err());
 }
 
 #[test]
@@ -1088,22 +1318,182 @@ fn a_crash_between_intent_and_effect_is_settled_and_its_journal_id_is_not_reused
     assert_eq!(fx.owned_paths().len(), 4);
 }
 
+// ---- hardening ----------------------------------------------------------------------------
+
+/// Moves `~/.config/tmux` outside HOME and leaves a link to it, as a stow-style setup does.
+fn stow_style_tmux(fx: &Fx) -> PathBuf {
+    let outside = fx
+        .home
+        .path()
+        .parent()
+        .unwrap()
+        .join(format!("stow-{}", std::process::id()));
+    fs::create_dir_all(&outside).unwrap();
+    fs::rename(fx.h(".config/tmux"), outside.join("tmux")).unwrap();
+    symlink(outside.join("tmux"), fx.h(".config/tmux")).unwrap();
+    outside
+}
+
 #[test]
-fn a_crash_after_the_effect_leaves_an_unowned_output_that_is_never_removed() {
-    // The effect happened, the ledger was not updated. The link stays, it is not owned, and a
-    // later deselection cannot delete it. The safe direction (docs/apply.md, limits).
+fn a_linked_parent_of_one_owned_output_blocks_only_that_entry() {
     let fx = Fx::new();
-    let digest = fx.digest();
-    let o = Command::new(BIN)
-        .env_clear()
-        .env("DFM_FAILPOINT", "apply-after-done:abort")
-        .arg("--home")
-        .arg(fx.home.path())
-        .args(["apply", "--root", fx.root_arg(), "--yes-plan", &digest])
-        .output()
+    assert_eq!(code(&fx.apply(&[])), 0);
+    let outside = stow_style_tmux(&fx);
+    let before = fingerprint(fx.home.path());
+
+    // Still selected: plan and apply do not fail with E_STATE_INVALID. The one operation on
+    // the unsafe entry is blocked, and every other operation stays current.
+    let o = fx.run(&["plan", "--root", fx.root_arg(), "--json"]);
+    let s = Saved::parse(&o.stdout).unwrap_or_else(|e| panic!("{e}\n{}", text(&o.stdout)));
+    assert!(!stderr(&o).contains("E_STATE_INVALID"), "{}", stderr(&o));
+    assert_eq!(s.plan.blockers.len(), 1, "{:?}", s.plan.blockers);
+    assert_eq!(s.plan.blockers[0].resource, "extra.tmux");
+    for op in &s.plan.operations {
+        if op.resource != "extra.tmux" {
+            assert_eq!(op.status, dfm_model::plan::Status::Current, "{}", op.id);
+        }
+    }
+    let o = fx.apply(&[]);
+    assert_eq!(code(&o), 3, "{}", stderr(&o));
+    assert!(!stderr(&o).contains("E_STATE_INVALID"), "{}", stderr(&o));
+
+    // Deselected: the removal on the unsafe entry is blocked as an unsafe parent. The other
+    // removal (zsh) is still planned, and nothing is read or deleted through the link.
+    fx.set_profile("");
+    let s = fx.saved();
+    assert_eq!(s.plan.blockers.len(), 1, "{:?}", s.plan.blockers);
+    assert_eq!(s.plan.blockers[0].code.as_str(), "E_PARENT_UNSAFE");
+    assert_eq!(s.plan.blockers[0].resource, "extra.tmux");
+    let zsh = s
+        .plan
+        .operations
+        .iter()
+        .find(|o| o.id.starts_with("remove@extra.zsh"))
         .unwrap();
-    assert!(!o.status.success());
-    assert!(fx.owned_paths().is_empty());
+    assert_eq!(zsh.status, dfm_model::plan::Status::Planned);
+    let o = fx.apply(&[]);
+    assert_eq!(code(&o), 3, "{}", stderr(&o));
+    assert!(stderr(&o).contains("E_PARENT_UNSAFE"), "{}", stderr(&o));
+    assert!(
+        outside.join("tmux/tmux.conf").is_symlink(),
+        "the link target was not touched"
+    );
+    assert!(
+        fs::symlink_metadata(fx.h(".zshrc")).is_ok(),
+        "nothing was removed"
+    );
+    let _ = before;
+    let _ = fs::remove_dir_all(&outside);
+}
+
+#[test]
+fn ledger_writes_still_work_when_another_entry_has_a_linked_parent() {
+    // The tmux resource now claims another path, so its old entry is no longer claimed and not a
+    // removal candidate (the resource is still selected). The old entry sits behind a link that
+    // leaves HOME. A new link is published and the ledger is rewritten around the old entry.
+    let fx = Fx::new();
+    assert_eq!(code(&fx.apply(&[])), 0);
+    let outside = stow_style_tmux(&fx);
+    let m = fs::read_to_string(fx.root.join("base/modules/extra/module.toml")).unwrap();
+    fx.put(
+        "base/modules/extra/module.toml",
+        &m.replace(
+            "target = \".config/tmux/tmux.conf\"",
+            "target = \".tmux.conf\"",
+        ),
+    );
     let o = fx.apply(&[]);
     assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+    assert!(is_link_to(
+        &fx.h(".tmux.conf"),
+        &fx.root.join("base/modules/extra/files/tmux.conf")
+    ));
+    let owned = fx.owned_paths();
+    assert!(owned.contains(&".tmux.conf".to_string()), "{owned:?}");
+    assert!(
+        owned.contains(&".config/tmux/tmux.conf".to_string()),
+        "the old entry is kept: {owned:?}"
+    );
+    assert!(
+        outside.join("tmux/tmux.conf").is_symlink(),
+        "nothing was touched behind the link"
+    );
+    let _ = fs::remove_dir_all(&outside);
+}
+
+#[test]
+fn preview_lists_every_removal_as_a_pasteable_flag_and_exits_0() {
+    let fx = Fx::new();
+    assert_eq!(code(&fx.apply(&[])), 0);
+    fx.set_profile("");
+    let o = fx.run(&["apply", "--root", fx.root_arg(), "--preview"]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let out = text(&o.stdout);
+    for id in [
+        "remove@extra.tmux@.config/tmux/tmux.conf",
+        "remove@extra.zsh@.zshrc",
+    ] {
+        assert!(out.contains(&format!("--allow-disruptive '{id}'")), "{out}");
+    }
+    // The same text, pasted back, approves exactly those removals.
+    let d = fx.digest();
+    let o = fx.apply_with(
+        &d,
+        &[
+            "--allow-disruptive",
+            "remove@extra.tmux@.config/tmux/tmux.conf",
+            "--allow-disruptive",
+            "remove@extra.zsh@.zshrc",
+        ],
+    );
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+    // The refusal without the flags lists every id too.
+    let fx = Fx::new();
+    assert_eq!(code(&fx.apply(&[])), 0);
+    fx.set_profile("");
+    let o = fx.apply(&[]);
+    assert_eq!(code(&o), 3);
+    assert!(
+        text(&o.stdout).contains("--allow-disruptive 'remove@extra.zsh@.zshrc'"),
+        "{}",
+        text(&o.stdout)
+    );
+    assert!(text(&o.stdout).contains("result: blocked"));
+}
+
+#[test]
+fn the_receipt_records_each_disruptive_approval_and_the_path_source() {
+    let fx = Fx::new();
+    assert_eq!(code(&fx.apply(&[])), 0);
+    fx.set_profile("");
+    let d = fx.digest();
+    let o = fx.apply_with(
+        &d,
+        &[
+            "--allow-disruptive",
+            "remove@extra.tmux@.config/tmux/tmux.conf",
+            "--allow-disruptive",
+            "remove@extra.zsh@.zshrc",
+        ],
+    );
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+    let r = &fx.receipts()[1];
+    let approvals = r["approvals"].as_array().unwrap();
+    assert_eq!(approvals.len(), 2);
+    let op_ids: Vec<_> = r["operations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|o| o["id"].clone())
+        .collect();
+    for a in approvals {
+        assert_eq!(a["how"], "allow_disruptive");
+        assert!(op_ids.contains(&a["operation_id"]), "{a}");
+    }
+    let src = &r["sources"][0];
+    assert_eq!(src["kind"], "path");
+    assert!(src.get("commit").is_none());
+    assert!(src["tree"].as_str().unwrap().starts_with("sha256:"));
+    // The receipt a first apply writes has no approvals.
+    assert!(fx.receipts()[0].get("approvals").is_none());
 }
