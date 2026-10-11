@@ -189,14 +189,14 @@ fn describe(resolved: &Resolved, r: &ResolvedResource, out: &mut String) -> Resu
         );
         // Any selected module may place a matching file here, and its name sets its position.
         // The owner does not opt in, so every supplier is listed.
-        let dir = d.dir.to_lowercase();
-        let pattern = d.pattern.to_lowercase();
+        let dir = crate::fold::fold(&d.dir);
+        let pattern = crate::fold::fold(&d.pattern);
         let mut suppliers: Vec<(&str, &ResolvedResource)> = Vec::new();
         for o in resolved.resources.values().filter(|o| o.id != r.id) {
             for claim in &o.claims {
                 if let Some((parent, name)) = claim.rsplit_once('/')
-                    && parent.to_lowercase() == dir
-                    && glob(&pattern, &name.to_lowercase())
+                    && crate::fold::fold(parent) == dir
+                    && glob(&pattern, &crate::fold::fold(name))
                 {
                     suppliers.push((name, o));
                 }
@@ -308,12 +308,12 @@ pub fn explain(resolved: &Resolved, query: &str) -> Result<String, Refusal> {
     if let Some(r) = resolved.resources.get(query) {
         hits.push(r);
     } else {
-        let q = query.trim_end_matches('/').to_lowercase();
+        let q = crate::fold::fold(query.trim_end_matches('/'));
         hits.extend(resolved.resources.values().filter(|r| {
             r.target
                 .iter()
                 .chain(&r.claims)
-                .any(|t| t.to_lowercase() == q)
+                .any(|t| crate::fold::fold(t) == q)
         }));
     }
     if hits.is_empty() {

@@ -532,7 +532,7 @@ impl Store {
     /// A claim must lie inside HOME and outside the manager's own paths, as written and after the
     /// symlinks in its parent directories are resolved. Whether a path in HOME belongs to the
     /// manager is the adapter's evidence, not a guess.
-    fn check_claim(&self, path: &str) -> Result<(), Refusal> {
+    pub fn check_claim(&self, path: &str) -> Result<(), Refusal> {
         let outside = || {
             Refusal::new(
                 Code::StateInvalid,

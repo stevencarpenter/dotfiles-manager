@@ -43,9 +43,7 @@ pub(crate) enum Located<'a> {
 
 const MAX_HOPS: usize = 40;
 
-fn fold(path: &str) -> String {
-    path.to_lowercase()
-}
+use crate::fold::fold;
 
 impl SourceSet {
     pub fn new() -> Self {

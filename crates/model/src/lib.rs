@@ -5,9 +5,12 @@ pub mod controls;
 pub mod digest;
 pub mod display;
 pub mod exit;
+pub mod fold;
+pub mod plan;
 pub mod refusal;
 pub mod resolve;
 pub mod state;
 
 pub use exit::Exit;
+pub use fold::fold;
 pub use refusal::{Code, Refusal};

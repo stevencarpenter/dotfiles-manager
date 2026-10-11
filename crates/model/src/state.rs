@@ -4,6 +4,7 @@
 //! checked before any other field, and unknown keys are refused.
 
 use crate::binding::Binding;
+use crate::fold::fold;
 use crate::{Code, Refusal};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::collections::{BTreeMap, BTreeSet};
@@ -883,12 +884,6 @@ impl TrialRecord {
 pub struct Scope {
     home: String,
     reserved: Vec<String>,
-}
-
-/// Case folding close to what APFS applies: upper then lower case maps the long s (U+017F) to
-/// `s`, the Kelvin sign to `k` and the sharp s to `ss`, which a plain lowercase does not.
-fn fold(s: &str) -> String {
-    s.to_uppercase().to_lowercase()
 }
 
 impl Scope {

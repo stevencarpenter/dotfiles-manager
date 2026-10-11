@@ -329,6 +329,7 @@ fn i1_each_document_is_parsed_once_however_many_resources_link_it() {
         kind: "link",
         target: TargetRule::Required,
         secret_values: false,
+        sensitive: false,
         native_document: false,
         claims: Claims::Target,
         value: Schema::Table(vec![Field {

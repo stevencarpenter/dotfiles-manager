@@ -2,6 +2,7 @@
 
 mod adapters;
 mod controls_fs;
+mod plan_cmd;
 mod source_fs;
 mod state_cmd;
 
@@ -29,6 +30,7 @@ usage:
   dotfiles-manager binding
   dotfiles-manager state check
   dotfiles-manager explain <resource-or-target> --root <dir>
+  dotfiles-manager plan --root <dir> [--json] [--against <saved plan>]
   dotfiles-manager self-check --build-controls <staged tree>
   dotfiles-manager self-check --fixture-dir <dir>
 
@@ -39,6 +41,11 @@ infers a profile, and nothing applies configuration.
 explain resolves the bound profile against the trusted sources in --root and prints
 ownership, permitted changes, provenance and native precedence for one resource or
 output path. It reads only --root and the binding, and writes nothing.
+
+plan resolves the bound profile against --root, observes the claimed paths under HOME
+read-only, and prints the typed plan with its digest. It writes nothing, fetches nothing and
+authenticates nothing. --json prints the plan for review. --against compares a saved --json
+plan with a fresh one and exits 3 (E_PLAN_STALE) when any input changed.
 
 exit codes: 0 ok, 1 failed, 2 usage, 3 blocked before mutation, 4 declined,
 5 pending, 130 interrupted, 143 terminated.
@@ -236,7 +243,7 @@ fn dispatch(args: &[String], out: &mut dyn Write) -> Result<(), Refusal> {
                 Some(b) => writeln!(
                     out,
                     "bound profile={} machine_id={}",
-                    b.profile(),
+                    dfm_model::display::visible(b.profile()),
                     b.machine_id()
                 ),
             }
@@ -255,6 +262,10 @@ fn dispatch(args: &[String], out: &mut dyn Write) -> Result<(), Refusal> {
             header(out, &ctx).map_err(w)?;
             let text = explain(&ctx, &query, Path::new(&root))?;
             write!(out, "{text}").map_err(w)
+        }
+        "plan" => {
+            let args = plan_cmd::parse_args(rest)?;
+            plan_cmd::run(&context(home)?, &args, out)
         }
         "self-check" => {
             let [controls, fixture] = flags(rest, ["--build-controls", "--fixture-dir"])?;
@@ -303,8 +314,17 @@ fn explain_args(args: &[String]) -> Result<(String, String), Refusal> {
     ))
 }
 
-/// Resolves the bound profile against `root` and explains one resource. Read-only.
-fn explain(ctx: &Ctx, query: &str, root: &Path) -> Result<String, Refusal> {
+/// The bound profile resolved against the trusted sources in `root`.
+struct Loaded {
+    binding: Binding,
+    /// The canonical `--root`.
+    root: PathBuf,
+    sources: dfm_model::resolve::SourceSet,
+    resolved: dfm_model::resolve::Resolved,
+}
+
+/// Resolves the bound profile against `root`. Read-only.
+fn load_resolved(ctx: &Ctx, root: &Path) -> Result<Loaded, Refusal> {
     let binding = read_existing_binding(ctx)?.ok_or_else(|| {
         Refusal::new(
             Code::BindingInvalid,
@@ -329,7 +349,18 @@ fn explain(ctx: &Ctx, query: &str, root: &Path) -> Result<String, Refusal> {
         })?;
     let sources = load_source_set(&root)?;
     let resolved = resolve(&sources, rel, &builtin_catalog())?;
-    dfm_model::resolve::explain(&resolved, query)
+    Ok(Loaded {
+        binding,
+        root,
+        sources,
+        resolved,
+    })
+}
+
+/// Resolves the bound profile against `root` and explains one resource. Read-only.
+fn explain(ctx: &Ctx, query: &str, root: &Path) -> Result<String, Refusal> {
+    let loaded = load_resolved(ctx, root)?;
+    dfm_model::resolve::explain(&loaded.resolved, query)
 }
 
 fn header(out: &mut dyn Write, ctx: &Ctx) -> std::io::Result<()> {
@@ -490,7 +521,10 @@ fn bind(ctx: &Ctx, profile: String, machine_id: String) -> Result<String, Refusa
         })?;
     let name = ctx.binding_name().map_err(after)?;
     if publish(&dir, &name, &want).map_err(after)? {
-        return Ok(format!("bound {real} as {machine_id}"));
+        return Ok(format!(
+            "bound {} as {machine_id}",
+            dfm_model::display::visible(real)
+        ));
     }
     match read_binding(&sys, &dir, &name).map_err(after)? {
         Some(have) if have.same_identity(&want) => Ok("already bound".into()),

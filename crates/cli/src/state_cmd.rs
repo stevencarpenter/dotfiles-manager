@@ -89,7 +89,7 @@ pub fn check(ctx: &Ctx, out: &mut dyn Write) -> Result<(), Refusal> {
     writeln!(
         out,
         "binding: {} as {}",
-        binding.profile(),
+        dfm_model::display::visible(binding.profile()),
         binding.machine_id()
     )
     .map_err(w)?;

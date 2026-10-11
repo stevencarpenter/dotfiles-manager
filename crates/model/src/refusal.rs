@@ -49,9 +49,74 @@ pub enum Code {
     ManifestInvalid,
     ReferenceInvalid,
     TypeMismatch,
+    // Planner codes added by DFM-16 (docs/planner.md). E_CONFLICT is named by docs/architecture.md
+    // section 8; the others are new.
+    Conflict,
+    ParentUnsafe,
+    PlanCycle,
+    PlanStale,
+    PlanInvalid,
+    PrivilegeUnsupported,
+    ObservationUnknown,
+    TargetReserved,
 }
 
 impl Code {
+    /// Every code, for parsing a stored plan.
+    pub const ALL: &'static [Code] = &[
+        Code::HomeMismatch,
+        Code::SchemaUnsupported,
+        Code::LimitExceeded,
+        Code::SourceUntrusted,
+        Code::ToolchainMismatch,
+        Code::BuildConfig,
+        Code::PlatformUnsupported,
+        Code::RebindUnsupported,
+        Code::BindingInvalid,
+        Code::ProfileInvalid,
+        Code::IoFailed,
+        Code::Usage,
+        Code::StateInvalid,
+        Code::StateNewer,
+        Code::StorageInvalid,
+        Code::IdentityMismatch,
+        Code::Locked,
+        Code::OpInterrupted,
+        Code::Diagnosed,
+        Code::IoUnconfirmed,
+        Code::ReportUnavailable,
+        Code::OverrideForbidden,
+        Code::OverrideConflict,
+        Code::CoreReplacement,
+        Code::ModuleUnknown,
+        Code::ModuleDuplicate,
+        Code::DependencyCycle,
+        Code::BundleCycle,
+        Code::ExtensionNamespace,
+        Code::ExtensionConflict,
+        Code::SourceMissing,
+        Code::SourceEscape,
+        Code::TargetCollision,
+        Code::TargetInvalid,
+        Code::AdapterUnknown,
+        Code::FieldUnknown,
+        Code::ManifestInvalid,
+        Code::ReferenceInvalid,
+        Code::TypeMismatch,
+        Code::Conflict,
+        Code::ParentUnsafe,
+        Code::PlanCycle,
+        Code::PlanStale,
+        Code::PlanInvalid,
+        Code::PrivilegeUnsupported,
+        Code::ObservationUnknown,
+        Code::TargetReserved,
+    ];
+
+    pub fn parse(s: &str) -> Option<Code> {
+        Code::ALL.iter().copied().find(|c| c.as_str() == s)
+    }
+
     pub const fn as_str(self) -> &'static str {
         match self {
             Code::HomeMismatch => "E_HOME_MISMATCH",
@@ -93,6 +158,14 @@ impl Code {
             Code::ManifestInvalid => "E_MANIFEST_INVALID",
             Code::ReferenceInvalid => "E_REFERENCE_INVALID",
             Code::TypeMismatch => "E_TYPE_MISMATCH",
+            Code::Conflict => "E_CONFLICT",
+            Code::ParentUnsafe => "E_PARENT_UNSAFE",
+            Code::PlanCycle => "E_PLAN_CYCLE",
+            Code::PlanStale => "E_PLAN_STALE",
+            Code::PlanInvalid => "E_PLAN_INVALID",
+            Code::PrivilegeUnsupported => "E_PRIVILEGE_UNSUPPORTED",
+            Code::ObservationUnknown => "E_OBSERVATION_UNKNOWN",
+            Code::TargetReserved => "E_TARGET_RESERVED",
         }
     }
 
@@ -149,3 +222,18 @@ impl fmt::Display for Refusal {
 }
 
 impl std::error::Error for Refusal {}
+
+#[cfg(test)]
+mod tests {
+    use super::Code;
+
+    #[test]
+    fn every_code_round_trips_through_its_name() {
+        for c in Code::ALL {
+            assert_eq!(Code::parse(c.as_str()), Some(*c));
+        }
+        assert_eq!(Code::parse("E_NOPE"), None);
+        let names: std::collections::BTreeSet<_> = Code::ALL.iter().map(|c| c.as_str()).collect();
+        assert_eq!(names.len(), Code::ALL.len(), "two codes share a name");
+    }
+}
