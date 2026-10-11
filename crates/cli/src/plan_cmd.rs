@@ -171,7 +171,10 @@ pub fn plan_for(ctx: &Ctx, loaded: &Loaded) -> Result<Plan, Refusal> {
         reserved,
         unchecked,
     };
-    plan::build(&loaded.resolved, &cx, &obs)
+    let mut plan = plan::build(&loaded.resolved, &cx, &obs)?;
+    // Generated output hashes (architecture section 9 item 1), from the same adapters apply runs.
+    crate::adapters::plan_outputs(&mut plan, &loaded.resolved, &loaded.sources, &home)?;
+    Ok(plan)
 }
 
 pub(crate) fn render(p: &Plan, digest: &str, out: &mut dyn Write) -> std::io::Result<()> {

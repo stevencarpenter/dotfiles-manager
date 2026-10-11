@@ -3,6 +3,9 @@
 //! kind, whether it owns a target, how its `value` is typed, and which outputs it claims. No
 //! adapter is run here.
 
+mod generate;
+pub use generate::{Generators, plan_outputs};
+
 use dfm_model::resolve::{AdapterCatalog, AdapterSpec, Claims, Field, Include, Schema, TargetRule};
 
 fn field(name: &'static str, schema: Schema, required: bool) -> Field {

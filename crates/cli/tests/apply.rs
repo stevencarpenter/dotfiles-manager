@@ -244,17 +244,6 @@ impl Fx {
         );
     }
 
-    /// Adds a rendered file. No generator exists, so a plan with it must be refused up front.
-    fn with_render(&self) {
-        let m = fs::read_to_string(self.root.join("base/modules/extra/module.toml")).unwrap();
-        self.put(
-            "base/modules/extra/module.toml",
-            &format!(
-                "{m}\n[[resources]]\nid = \"gitdefaults\"\nkind = \"render\"\nadapter = \"git-config/v1\"\ntarget = \".config/git/defaults.inc\"\n[resources.value.core]\neditor = \"nvim\"\n[resources.policy]\ndefaults = [\"/core/editor\"]\nextensions = []\n"
-            ),
-        );
-    }
-
     fn lock_note(&self) -> Vec<u8> {
         fs::read(self.h(".local/state/dotfiles-manager.lock")).unwrap()
     }
@@ -722,41 +711,6 @@ fn a_plan_with_a_sensitive_output_is_refused_before_any_write() {
         stderr(&o).contains("E_SENSITIVE_UNSUPPORTED"),
         "{}",
         stderr(&o)
-    );
-    assert_eq!(fingerprint(fx.home.path()), before);
-    assert!(fx.receipts().is_empty());
-}
-
-#[test]
-fn a_plan_with_a_generated_file_is_refused_up_front_by_apply_and_by_preview() {
-    // No generator exists in this build. Both the preview and the real run say so, with the
-    // same code and the same blocked result, and neither changes anything.
-    let fx = Fx::new();
-    fx.with_render();
-    let before = fingerprint(fx.home.path());
-    let preview = fx.run(&["apply", "--root", fx.root_arg(), "--preview"]);
-    assert_eq!(code(&preview), 3, "{}", stderr(&preview));
-    assert!(
-        stderr(&preview).contains("E_GENERATOR_UNAVAILABLE"),
-        "{}",
-        stderr(&preview)
-    );
-    assert!(
-        text(&preview.stdout).contains("result: blocked"),
-        "{}",
-        text(&preview.stdout)
-    );
-    let o = fx.apply(&[]);
-    assert_eq!(code(&o), 3, "{}", stderr(&o));
-    assert!(
-        stderr(&o).contains("E_GENERATOR_UNAVAILABLE"),
-        "{}",
-        stderr(&o)
-    );
-    assert!(
-        text(&o.stdout).contains("result: blocked"),
-        "{}",
-        text(&o.stdout)
     );
     assert_eq!(fingerprint(fx.home.path()), before);
     assert!(fx.receipts().is_empty());

@@ -201,9 +201,23 @@ fn op_diff(out: &mut Vec<Stale>, a: &Operation, b: &Operation) {
             .collect()
     };
     keyed(out, StaleKind::Observation, &pre(a), &pre(b));
-    if (a.action, a.status, &a.after, &a.fragments, &a.link, &a.mode)
-        != (b.action, b.status, &b.after, &b.fragments, &b.link, &b.mode)
-    {
+    if (
+        a.action,
+        a.status,
+        &a.after,
+        &a.fragments,
+        &a.link,
+        &a.mode,
+        &a.output_sha256,
+    ) != (
+        b.action,
+        b.status,
+        &b.after,
+        &b.fragments,
+        &b.link,
+        &b.mode,
+        &b.output_sha256,
+    ) {
         let show = |o: &Operation| {
             format!(
                 "{:?} {:?} after={:?} link={:?} mode={:?} fragments={}",

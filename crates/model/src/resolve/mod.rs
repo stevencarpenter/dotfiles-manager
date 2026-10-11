@@ -16,7 +16,7 @@ mod compose;
 pub(crate) use compose::glob;
 
 use std::collections::BTreeMap;
-use toml::Value;
+pub use toml::{Table, Value};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ChangeKind {

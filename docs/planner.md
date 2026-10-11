@@ -11,7 +11,7 @@ Task: DFM-16. This document records what the first planner does and where it res
 | `plan` command | `crates/cli/src/plan_cmd.rs` |
 | Sensitivity flag on adapters and resolved resources | `AdapterSpec::sensitive`, `ResolvedResource::sensitive` |
 
-Layering follows architecture section 3. `model` takes already-observed facts and returns a plan. `engine` observes. `cli` joins them. No `ports` or `adapters` crate exists yet, so the planner decides from catalog data and observations and runs no adapter. `apply` is described in [docs/apply.md](apply.md).
+Layering follows architecture section 3. `model` takes already-observed facts and returns a plan. `engine` observes. `cli` joins them. No `ports` or `adapters` crate exists yet. The model decides from catalog data and observations. The CLI then runs the `render` and `assemble` adapters to fill the output hashes (docs/adapters.md). `apply` is described in [docs/apply.md](apply.md).
 
 ## The command
 
@@ -91,18 +91,20 @@ An unsupported saved-plan schema is `E_SCHEMA_UNSUPPORTED`. A missing state dire
 | Contract text | Reading used |
 | --- | --- |
 | Section 10, exit 3: "a required prerequisite that is `UNKNOWN`", and section 8 "An untested probe stays disabled and returns `UNKNOWN`" | A configuration plan has no probe, so no prerequisite is `UNKNOWN` for it. Package and application resources are out of scope (above). A path that cannot be observed is `E_OBSERVATION_UNKNOWN`, exit 3. |
-| Section 9, item 1: "content hashes of generated outputs for `normal` class outputs" | No adapter runs yet, so no output is generated. The plan records the identities of the inputs (`inputs`, `source:` preconditions) and the model digest. Output hashes need the adapters (DFM-20). |
+| Section 9, item 1: "content hashes of generated outputs for `normal` class outputs" | The CLI runs the `git-config/v1` and `text-fragments/v1` generators at plan time and records `output_sha256` on each planned `create_file` or `update_file` of those adapters. `dfm-model` stays pure: the model builds the plan, then the CLI fills the hash (`plan_outputs`). The hash is inside the plan digest, so the digest changes for any plan that has a generated file. A plan with no generated file has the same digest as before. |
 | Section 10: `--yes-plan <digest>` "recomputes the plan digest and compares" | `plan --against <saved plan>` is the read-only form. `--yes-plan` belongs to the mutating commands: `apply` (docs/apply.md). |
 | Section 5, ledger: "exact `owned_outputs` ... with fingerprints" | A link output's fingerprint is the SHA-256 of `link\0` and its target text. DFM-17 left link fingerprints unspecified. |
 | DESIGN.md section 4: "A directory link conflicts with every independently claimed descendant" | The resolver checks claims against each other. The planner adds the machine side: a link parent on disk is `E_PARENT_UNSAFE`. |
 
 ## Known limits
 
-- **No adapter output.** `render`, `merge` and `assemble` operations are planned as `create_file` or `update_file` without comparing desired content, so a file that already equals the desired content is still planned when the ledger owns it. `already_done` needs the adapters. A `skills/v1` leaf is planned as a link to its source, which is an assumption about that adapter.
+- **Merge output.** `merge` operations (`claude-settings/v1`) have no adapter (DFM-21). They are planned as `create_file` or `update_file` with no output hash. A `skills/v1` leaf is planned as a link to its source, which is an assumption about that adapter.
+- **Generated files already current.** After the CLI computes `output_sha256`, an owned `update_file` whose live content and mode already equal it becomes `current` with action `none`. A rerun then plans nothing. An unowned file with the same content stays a conflict.
 - **Mode on out-of-scope resources.** A bad `mode` on an out-of-scope resource (for example a secret) still raises a blocker.
 - **Sensitive ledger entries.** A path the ledger records as sensitive is never hashed and its ledger text is never printed, whoever claims it now, and a fragment-directory name that matches it in another case is not hashed.
 - **Hidden or unverified decisions.** A mode a resource declares outside `0..=0o777` is `E_MANIFEST_INVALID`, not dropped. A claim that cannot be checked against the manager's own paths (an I/O error, not an overlap) is `E_OBSERVATION_UNKNOWN`, exit 3 (architecture section 10, an unknown required fact). The topology walk reports a link loop or unreadable parent first. The reserved-path and unchecked maps are computed for ledger outputs too, so removal candidates get the same checks.
-- **Generated-output hashes.** Section 9 asks for content hashes of generated normal outputs. They need the adapters (DFM-20). Until then the plan records input identities and the model digest.
+- **Generated-output hashes.** Present for `render` and `assemble` (above). A generation failure at plan time (for example a fragment that is not UTF-8 text) is a blocker on the operation with the generator's code. It names the field and the path and carries no content. A fragment produced by a `merge` resource has no hash and is a blocker (`E_GENERATOR_UNAVAILABLE`).
+- **New plan fields.** `Operation.output_sha256`, `Operation.fragment_dir` and `Fragment.sha256` are omitted from the JSON when empty.
 - **Prose fields.** `effect` and `postcondition` are free text for people. Apply uses `action`, `path`, `link`, `mode` and `preconditions`.
 - **Field claims.** The resolver models path claims only. Claims on fields inside a co-owned document (for example one key of `settings.json`) are not modelled, so two resources writing different fields of one file collide as a path.
 - **Apply-time check.** The plan records preconditions. Re-observing and refusing a changed fact immediately before each write belongs to apply (DFM-18, architecture section 8).

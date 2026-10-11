@@ -183,7 +183,7 @@ pub fn followups(resolved: &Resolved, obs: &Observations, ledger: &[Owned]) -> V
     out.into_iter().collect()
 }
 
-fn matches_pattern(pattern: &str, name: &str) -> bool {
+pub fn matches_pattern(pattern: &str, name: &str) -> bool {
     glob(&fold(pattern), &fold(name))
 }
 
@@ -506,6 +506,8 @@ impl Planner<'_> {
             ownership: Ownership::Absent,
             inputs: Vec::new(),
             fragments: Vec::new(),
+            fragment_dir: None,
+            output_sha256: None,
             after: Vec::new(),
             preconditions: Vec::new(),
             postcondition: "none".into(),
@@ -705,6 +707,8 @@ impl Planner<'_> {
             ownership: Ownership::Absent,
             inputs: Vec::new(),
             fragments: Vec::new(),
+            fragment_dir: None,
+            output_sha256: None,
             after: Vec::new(),
             preconditions: Vec::new(),
             postcondition: "none".into(),
@@ -984,6 +988,7 @@ impl Planner<'_> {
             .map(|(_, res, n)| Fragment {
                 name: n.clone(),
                 origin: format!("selected:{res}"),
+                sha256: None,
             })
             .collect();
         let removals = self.planned_removals();
@@ -1001,9 +1006,14 @@ impl Planner<'_> {
                     removing.push((n.clone(), rid.clone()));
                     continue;
                 }
+                let sha256 = match self.obs.seen.get(&path).map(|s| &s.node) {
+                    Some(Node::File { sha256, .. }) => sha256.clone(),
+                    _ => None,
+                };
                 fragments.push(Fragment {
                     name: n.clone(),
                     origin: "foreign".into(),
+                    sha256,
                 });
                 let st = self
                     .obs
@@ -1046,6 +1056,7 @@ impl Planner<'_> {
                 }
                 op.after.sort();
                 op.fragments = fragments.clone();
+                op.fragment_dir = Some(d.dir.clone());
                 op.preconditions.push(Precondition {
                     subject: format!("fragments:{}", d.dir),
                     state: state.clone(),

@@ -5,11 +5,12 @@
 //! and only then hands the plan to the engine. Without an approval it prints the plan and
 //! changes nothing.
 
-use crate::plan_cmd::{make_plan, render};
-use crate::{Ctx, read_existing_binding, state_cmd, usage};
+use crate::adapters::Generators;
+use crate::plan_cmd::{plan_for, render};
+use crate::{Ctx, load_resolved, read_existing_binding, state_cmd, usage};
 use dfm_engine::{
-    Approval as Allowance, Dir, NoGenerator, Run, Store, apply, check_allowances,
-    check_journal_capacity, gates, now_unix,
+    Approval as Allowance, Dir, Run, Store, apply, check_allowances, check_journal_capacity, gates,
+    now_unix,
 };
 use dfm_model::display::visible;
 use dfm_model::state::{
@@ -147,7 +148,8 @@ fn run_inner(
     })?;
     let root = Path::new(&args.root);
     // Read-only look first. A refusal here changes nothing, not even the lock file.
-    let plan = make_plan(ctx, root)?;
+    let first = load_resolved(ctx, root)?;
+    let plan = plan_for(ctx, &first)?;
     let digest = plan.digest()?;
     if let Some(i) = &ctx.isolated {
         writeln!(out, "isolated: true {i}").map_err(w)?;
@@ -167,7 +169,12 @@ fn run_inner(
     // The gates that need no write run before the lock and in a preview, so a plan that apply
     // would refuse is refused here with the same code.
     let (layout, sys) = (ctx.layout(), ctx.sys()?);
-    let g = gates(&plan, &NoGenerator);
+    let g = gates(
+        &plan,
+        &Generators {
+            resolved: &first.resolved,
+        },
+    );
     if let Some(r) = g.refusal {
         return Err(r);
     }
@@ -216,7 +223,8 @@ fn run_inner(
     store
         .require_identity(&binding)
         .map_err(|r| stamped(&store, r))?;
-    let locked = make_plan(ctx, root).map_err(|r| stamped(&store, r))?;
+    let second = load_resolved(ctx, root).map_err(|r| stamped(&store, r))?;
+    let locked = plan_for(ctx, &second).map_err(|r| stamped(&store, r))?;
     let locked_digest = locked.digest().map_err(|r| stamped(&store, r))?;
     if locked_digest != digest {
         return Err(stamped(&store, stale(approved, &locked_digest)));
@@ -227,7 +235,9 @@ fn run_inner(
         sys,
         home: &home,
         home_path: &layout.home,
-        generator: &NoGenerator,
+        generator: &Generators {
+            resolved: &second.resolved,
+        },
         allow: &args.allow,
         allow_adopt: &args.allow_adopt,
         fail: &fail,

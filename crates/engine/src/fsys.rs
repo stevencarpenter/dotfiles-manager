@@ -772,6 +772,24 @@ impl Dir {
         Ok((u64::try_from(buf.len()).unwrap_or(u64::MAX) <= limit).then_some(buf))
     }
 
+    /// Reads at most `limit` bytes of the regular file at the `/`-separated relative path `rel`.
+    /// Every parent is opened without following a link, and so is the file. `None` when any
+    /// part is absent, a link or not the expected type, or when the file is larger than `limit`.
+    pub fn read_below(&self, rel: &str, limit: u64) -> Result<Option<Vec<u8>>, Refusal> {
+        let mut parts: Vec<&str> = rel.split('/').collect();
+        let Some(name) = parts.pop() else {
+            return Ok(None);
+        };
+        let mut cur = self.try_clone()?;
+        for p in parts {
+            cur = match cur.peek_dir(p)? {
+                Some(next) => next,
+                None => return Ok(None),
+            };
+        }
+        cur.read_plain(name, limit)
+    }
+
     /// Lists this directory. Entry names that are not UTF-8 are counted, not dropped silently.
     pub fn list(&self) -> Result<Listing, Refusal> {
         LISTED.with(|c| c.set(c.get() + 1));

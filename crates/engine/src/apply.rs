@@ -13,6 +13,7 @@
 
 use crate::fail::Fail;
 use crate::fsys::{Dir, Peek, Sys};
+use crate::generate::{Gather, Generator, gather};
 use crate::observe::observe;
 use crate::publish::Publish;
 use crate::store::{Probe, Store, now_unix};
@@ -32,7 +33,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 /// A published file is at most this large (the same bound the planner hashes).
-const MAX_FILE: u64 = dfm_model::plan::MAX_HASHED_BYTES;
+pub(crate) const MAX_FILE: u64 = dfm_model::plan::MAX_HASHED_BYTES;
 
 /// A conservative size for the two journal entries (intent and outcome) of one operation. An
 /// entry is bounded to 64 KiB, and apply writes reasons of at most 1024 characters.
@@ -41,31 +42,6 @@ const JOURNAL_BYTES_PER_OPERATION: u64 = 4096;
 /// The consumer reload state recorded for every published output. No reloader exists yet, so a
 /// published file never implies a reloaded consumer.
 pub const RELOAD_NOT_ATTEMPTED: &str = "not_attempted";
-
-/// Produces the bytes of a generated file. Adapters (DFM-20) implement it. Apply calls it only
-/// for an operation it supports, and the content must follow from the operation's recorded
-/// inputs: `generate` must itself re-verify the `source:` preconditions. The trait lives here
-/// until the `ports` crate exists (docs/architecture.md section 3).
-pub trait Generator {
-    fn supports(&self, op: &Operation) -> bool;
-    fn generate(&self, op: &Operation) -> Result<Vec<u8>, Refusal>;
-}
-
-/// The generator of a build with no adapters: every file operation is unsupported.
-#[derive(Debug, Default)]
-pub struct NoGenerator;
-
-impl Generator for NoGenerator {
-    fn supports(&self, _op: &Operation) -> bool {
-        false
-    }
-    fn generate(&self, op: &Operation) -> Result<Vec<u8>, Refusal> {
-        Err(Refusal::new(
-            Code::GeneratorUnavailable,
-            format!("no generator for {}", op.adapter),
-        ))
-    }
-}
 
 pub struct Run<'a> {
     pub store: &'a Store,
@@ -349,6 +325,12 @@ fn first_refusal(plan: &Plan, generator: &dyn Generator) -> Result<(), Refusal> 
                         ),
                     ));
                 }
+                if op.output_sha256.is_none() {
+                    return Err(plan_invalid(format!(
+                        "{} is generated but the plan records no output hash",
+                        op.id
+                    )));
+                }
             }
             Action::Remove | Action::CreateDir => {}
             Action::None => {
@@ -456,6 +438,7 @@ pub fn check_journal_capacity(journal_len: u64, plan: &Plan) -> Result<(), Refus
 
 struct Exec<'a, 'r> {
     run: &'a Run<'r>,
+    plan: &'a Plan,
     /// Journal intents per planner journal id, so an id is never reused after a partial apply.
     attempts: BTreeMap<String, u32>,
     /// Paths whose state is unknown (an interrupted or unconfirmed operation). Nothing more is
@@ -617,6 +600,71 @@ impl Exec<'_, '_> {
         })
     }
 
+    /// The bytes of a generated file. The inputs are read and compared with the plan first, the
+    /// generator runs on those bytes only, and the result must equal the planned output hash.
+    /// A stale input or output blocks the operation. Nothing is journaled and nothing is
+    /// written, so the previous output stays the last good one.
+    fn generated(&self, op: &Operation, rel: &str) -> Result<Vec<u8>, Ended> {
+        let dir = match op.fragment_dir.as_deref() {
+            Some(d) => {
+                let comps = components(d).map_err(failed)?;
+                match self.run.home.open_below(&self.run.sys, &comps) {
+                    Ok(dir) => Some(dir),
+                    // A fragment directory that does not exist yet holds no fragments.
+                    Err(_) if self.absent(&comps) => None,
+                    Err(e) => return Err(Ended::Blocked(e)),
+                }
+            }
+            None => None,
+        };
+        let inputs = gather(self.plan, op, &self.run.sys, dir.as_ref()).map_err(|g| match g {
+            Gather::Stale(d) => {
+                blocked(Code::PlanStale, format!("{rel}: {d}; nothing was changed"))
+            }
+            Gather::Failed(r) => failed(r),
+        })?;
+        let bytes = match self.run.generator.generate(op, &inputs) {
+            Ok(b) => b,
+            Err(r) if r.code == Code::PlanStale => return Err(Ended::Blocked(r)),
+            Err(r) => return Err(failed(r)),
+        };
+        if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > MAX_FILE {
+            return Err(failed(Refusal::new(
+                Code::LimitExceeded,
+                format!("{rel}: generated content exceeds 16 MiB"),
+            )));
+        }
+        let have = sha256_hex(&bytes);
+        if op.output_sha256.as_deref() != Some(have.as_str()) {
+            return Err(blocked(
+                Code::PlanStale,
+                format!(
+                    "{rel}: generated content is sha256:{have}, not the planned output; nothing was changed"
+                ),
+            ));
+        }
+        Ok(bytes)
+    }
+
+    /// Whether the path is missing: the walk from HOME reaches an absent entry before anything
+    /// that is not a plain directory. A link or a file on the way is not "missing".
+    fn absent(&self, comps: &[&str]) -> bool {
+        let Ok(mut cur) = self.run.home.try_clone() else {
+            return false;
+        };
+        for c in comps {
+            match cur.peek(&self.run.sys, c) {
+                Ok(Peek::Missing) => return true,
+                Ok(Peek::Dir { .. }) => match cur.peek_dir(c) {
+                    Ok(Some(next)) => cur = next,
+                    _ => return false,
+                },
+                _ => return false,
+            }
+        }
+        false
+    }
+
     fn run_op(&mut self, op: &Operation) -> Ended {
         self.try_op(op).unwrap_or_else(|e| e)
     }
@@ -695,14 +743,7 @@ impl Exec<'_, '_> {
         // Content and fingerprints are decided before the intent is written, so a generator
         // failure leaves no interruption record.
         let bytes = if is_file_action(op.action) {
-            let b = self.run.generator.generate(op).map_err(failed)?;
-            if u64::try_from(b.len()).unwrap_or(u64::MAX) > MAX_FILE {
-                return Err(failed(Refusal::new(
-                    Code::LimitExceeded,
-                    format!("{rel}: generated content exceeds 16 MiB"),
-                )));
-            }
-            Some(b)
+            Some(self.generated(op, rel)?)
         } else {
             None
         };
@@ -1221,6 +1262,7 @@ fn execute(run: &Run<'_>, plan: &Plan) -> Report {
     let clock = now_unix();
     let mut ex = Exec {
         run,
+        plan,
         attempts: BTreeMap::new(),
         unknown_paths: BTreeSet::new(),
         clock: Cell::new(*clock.as_ref().unwrap_or(&0)),
