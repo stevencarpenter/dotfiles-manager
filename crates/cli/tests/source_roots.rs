@@ -539,3 +539,16 @@ fn git_metadata_beside_the_bundle_is_skipped_but_below_a_root_is_refused() {
         text(&o.stderr)
     );
 }
+
+#[test]
+fn an_exclude_that_names_the_bundle_directory_is_refused() {
+    let fx = scoped(r#""profiles""#, r#""base""#);
+    fx.put("base/big", &"x".repeat(2 << 20));
+    let o = plan(&fx);
+    let err = text(&o.stderr);
+    assert_eq!(code(&o), 3, "{err}");
+    assert!(
+        err.contains("E_MANIFEST_INVALID") && err.contains("bundle directory"),
+        "{err}"
+    );
+}

@@ -232,6 +232,22 @@ impl SourceScope {
                 }
             }
         }
+        // Files beside the bundle are read from its directory, so the directory may not be skipped.
+        let mut prefix = String::new();
+        for c in scope.bundle_dir().split('/').filter(|c| !c.is_empty()) {
+            if !prefix.is_empty() {
+                prefix.push('/');
+            }
+            prefix.push_str(c);
+            if let Some(p) = scope.excluded_by(&prefix) {
+                return Err(invalid(
+                    "/sources/exclude",
+                    format!("the bundle directory is at or below a path that the exclude pattern `{p}` skips"),
+                    "narrow the pattern: the bundle directory may not be excluded",
+                )
+                .rejected("string"));
+            }
+        }
         Ok(scope)
     }
 }
@@ -449,6 +465,16 @@ exclude = ["home/*", "a/?b", "p/**", "**/**/**/x", "m/**/k/*.o"]"#,
             assert_eq!(e.code, Code::ManifestInvalid, "{roots} {exclude}");
         }
         assert!(scope("roots = [\"home\"]\nexclude = [\"home/.venv\"]").is_ok());
+    }
+
+    #[test]
+    fn the_bundle_directory_may_not_be_excluded() {
+        // `scope` declares the bundle in `dfm/`.
+        for ex in ["dfm", "**/dfm", "d*"] {
+            let e = scope(&format!("roots = [\"mods\"]\nexclude = [\"{ex}\"]")).unwrap_err();
+            assert_eq!(e.code, Code::ManifestInvalid, "{ex}");
+        }
+        assert!(scope("roots = [\"mods\"]\nexclude = [\"dfm/sub\"]").is_ok());
     }
 
     #[test]
