@@ -1223,6 +1223,10 @@ fn contain(
                     Err(f) => return Err(wrap(locate_error(&sup.file, ptr, f))),
                 }
             }
+            entries.extend(sources.dirs_below(&path).map(|d| TreeEntry {
+                path: d.to_string(),
+                kind: EntryKind::Dir,
+            }));
             let id = format!("sha256:{}", tree_digest(entries));
             digests.insert(key, id.clone());
             Ok((path, (!spec.secret_values).then_some(id)))

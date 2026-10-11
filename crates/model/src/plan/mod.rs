@@ -514,6 +514,10 @@ pub fn source_identity(root: &str, set: &crate::resolve::SourceSet) -> Source {
                 kind,
             })
         })
+        .chain(set.dirs().map(|d| TreeEntry {
+            path: d.to_string(),
+            kind: EntryKind::Dir,
+        }))
         .collect();
     Source {
         kind: "path".into(),

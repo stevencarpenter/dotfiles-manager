@@ -363,6 +363,7 @@ fn load(root: &Path, declared: Option<&SourceScope>) -> Result<SourceSet, Refusa
                 })?;
                 st.set.insert_link(path, target);
             } else if ty.is_dir() {
+                st.set.insert_dir(path.clone());
                 go(&e.path(), &path, st, false)?;
             } else if ty.is_file() {
                 let buf = read_regular(&e.path(), &path)?;
@@ -400,6 +401,8 @@ fn load(root: &Path, declared: Option<&SourceScope>) -> Result<SourceSet, Refusa
             let roots = walkable_roots(root, scope)?;
             for r in &roots {
                 st.starts.push((root.join(r), r.clone(), false));
+                // A root with nothing loaded below it is still a directory.
+                st.set.insert_dir(r.clone());
             }
             // The bundle directory contributes its own files and links, unless a root holds it.
             let dir = scope.bundle_dir();

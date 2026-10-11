@@ -2,13 +2,21 @@
 //!
 //! SHA-256 over entries sorted by path bytes. Each entry is
 //! `<path> NUL <class> NUL <value> LF`, where class is `file`, `exec` or
-//! `symlink` and value is the content SHA-256 (hex) or the symlink target.
+//! `symlink` or `dir` and value is the content SHA-256 (hex), the symlink target, or empty for
+//! a directory. A directory entry makes an empty directory part of the identity.
 
 use sha2::{Digest, Sha256};
 
 pub enum EntryKind {
-    File { exec: bool, sha256: String },
-    Symlink { target: String },
+    File {
+        exec: bool,
+        sha256: String,
+    },
+    Symlink {
+        target: String,
+    },
+    /// A real directory, recorded so an empty one is part of the identity.
+    Dir,
 }
 
 pub struct TreeEntry {
@@ -38,9 +46,10 @@ pub fn tree_digest(mut entries: Vec<TreeEntry>) -> String {
             EntryKind::File {
                 exec: false,
                 sha256,
-            } => ("file", sha256),
-            EntryKind::File { exec: true, sha256 } => ("exec", sha256),
-            EntryKind::Symlink { target } => ("symlink", target),
+            } => ("file", sha256.as_str()),
+            EntryKind::File { exec: true, sha256 } => ("exec", sha256.as_str()),
+            EntryKind::Symlink { target } => ("symlink", target.as_str()),
+            EntryKind::Dir => ("dir", ""),
         };
         h.update(e.path.as_bytes());
         h.update([0]);

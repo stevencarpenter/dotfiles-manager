@@ -423,6 +423,57 @@ fn a_directory_link_with_excluded_content_is_noted_and_counted() {
     assert!(!text(&o.stdout).contains("note:"));
 }
 
+/// The operation that links `extra.plugs`, from a JSON plan.
+fn plugs_op(fx: &Fx) -> dfm_model::plan::Operation {
+    let o = fx.run(&["plan", "--root", fx.root_arg(), "--json"]);
+    assert_eq!(code(&o), 0, "{}", text(&o.stderr));
+    Saved::parse(&o.stdout)
+        .unwrap()
+        .plan
+        .operations
+        .into_iter()
+        .find(|o| o.resource == "extra.plugs")
+        .expect("the plugs operation")
+}
+
+fn add_plugs_module(fx: &Fx) {
+    let m = fs::read_to_string(fx.root.join("base/modules/extra/module.toml")).unwrap();
+    fx.put("base/modules/extra/module.toml", &format!("{m}{PLUGS}"));
+}
+
+#[test]
+fn an_empty_directory_source_plans_as_a_directory_link() {
+    // No entry at all below the directory.
+    let fx = scoped(r#""base", "profiles""#, "");
+    add_plugs_module(&fx);
+    fs::create_dir_all(fx.root.join("base/modules/extra/files/plugdir")).unwrap();
+    let op = plugs_op(&fx);
+    assert_eq!(op.action, dfm_model::plan::Action::CreateLink);
+    assert!(op.inputs[0].path.ends_with("files/plugdir"), "{op:?}");
+    assert!(op.inputs[0].content_id.is_some());
+    // Every child excluded: the directory is still a directory, and the plan counts the entry.
+    let fx = scoped(r#""base", "profiles""#, r#""**/.venv""#);
+    add_plugs_module(&fx);
+    fx.put("base/modules/extra/files/plugdir/.venv/lib", "x");
+    let op = plugs_op(&fx);
+    assert_eq!(op.action, dfm_model::plan::Action::CreateLink);
+    assert_eq!(op.excluded, Some(1));
+}
+
+#[test]
+fn an_empty_subdirectory_is_part_of_the_directory_identity_and_the_tree_digest() {
+    let fx = scoped(r#""base", "profiles""#, "");
+    with_plugs(&fx);
+    let (id0, t0) = (plugs_op(&fx).inputs[0].content_id.clone(), tree(&fx));
+    fs::create_dir(fx.root.join("base/modules/extra/files/plugdir/empty")).unwrap();
+    let (id1, t1) = (plugs_op(&fx).inputs[0].content_id.clone(), tree(&fx));
+    assert_ne!(id0, id1, "directory identity");
+    assert_ne!(t0, t1, "source tree digest");
+    // A nested empty directory changes it again.
+    fs::create_dir(fx.root.join("base/modules/extra/files/plugdir/empty/inner")).unwrap();
+    assert_ne!(plugs_op(&fx).inputs[0].content_id, id1);
+}
+
 #[test]
 fn a_link_hop_into_an_excluded_path_is_refused() {
     let fx = scoped(r#""base", "profiles""#, &format!(r#""{JUNK_IGNORED}""#));
