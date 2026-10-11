@@ -11,7 +11,7 @@ Task: DFM-18, and DFM-21 for the co-owned merge. This document records what the 
 | Command, approval, second plan under the lock, receipt, report | `crates/cli/src/apply_cmd.rs` |
 | Receipt field `reload` | `crates/model/src/state.rs` |
 
-`model` stays pure. `engine` does all file input and output through the safe `rustix` API. `unsafe_code` stays forbidden. No dependency was added.
+`model` stays pure. `engine` does all file input and output through the safe `rustix` API. `unsafe_code` stays forbidden everywhere except `crates/engine/src/signal.rs`, the signal handler (see Signals). DFM-47 added `libc` as a direct dependency of `engine`.
 
 ## The command
 
@@ -231,6 +231,20 @@ Publishing a file does not reload the program that reads it (architecture sectio
 - `Fs` and `Clock` traits, adopting a regular file or a directory link, and rename-aside hardening for the check-then-act windows below.
 - Splitting long functions and removing small duplicated helpers in the executor.
 
+## Signals
+
+`apply` (not `--preview`) handles SIGINT and SIGTERM. It installs the handlers after it takes the writer lock and before it settles earlier work, so before the first mutation. The handler stores the number of the first signal in an atomic and does nothing else. The signal is not an error of the operation. The executor looks at the record before it writes each `intent` entry:
+
+- The operation in flight finishes: its effect, read-back, outcome entry and ledger write. A staged file is never left half written.
+- No new `intent` entry is written. Every operation that has not started is `not_started`. An operation that needs nothing (`current`, `not_in_scope`) is reported as it is.
+- The receipt has outcome `interrupted` (SIGINT, exit 130) or `terminated` (SIGTERM, exit 143), as for any other run that changed something. A run that changed nothing writes no receipt.
+- The report prints, then the last line is `result: interrupted` or `result: terminated`. The process returns the code. The handler never exits the process.
+- A signal has precedence over a failure in the exit code. The operations still show what failed.
+- A second signal, of either kind, changes nothing. The first signal keeps its code and the receipt is still written. A signal that arrives after the last operation also decides the exit.
+- `plan`, `doctor`, `explain`, `state` and `apply --preview` install no handler, so a signal ends them as before: the kernel kills the process and no receipt exists.
+
+The handlers are installed without `SA_RESTART`, so a blocking call of the main thread returns `EINTR` and the executor sees the record at the next check. SIGKILL cannot be caught. It leaves the `intent` entry, and the next run settles it ("Interrupted runs").
+
 ## Known limits
 
 - **Clock.** The run reads the clock at its start. If the clock fails then, the run does not start. If it fails later, the last good reading is reused. No 1970 stamp is written.
@@ -240,7 +254,7 @@ Publishing a file does not reload the program that reads it (architecture sectio
 - **Replace and remove check, then act.** `replace_link`, `update_file` and `remove` verify the leaf and then call `renameat` or `unlinkat`. These are two system calls. A process of the same user that swaps the leaf between them wins. Create operations have no such window (`EEXIST`). A swap of a parent directory cannot redirect any step, because every step uses the opened descriptor. A parent swapped after it was opened is not detected for the operations that already hold it. The effect lands in the directory that was verified, and the next operation sees the changed topology and is blocked.
 - **Source content during the run.** The `source:` preconditions are checked when the plan is made and again under the lock. A link does not read its source. A generated file reads its sources again immediately before it is generated and compares them (see Generator). A source read after that point is not compared again.
 - **Crash between the effect and the ledger.** The output exists, the journal says `done` (or `intent` only), and the ledger has no entry. The next plan sees an exact link as an `adopt` operation, and `--allow-adopt` records it (DFM-45). Until then the output stays and is not owned, so it is never removed. This is the safe direction. Recovering ownership from the journal alone is not built, and a regular file with the right content is not recovered at all.
-- **Signals.** SIGINT and SIGTERM are not handled (no signal API without `unsafe` or a sixth crate; the owner decision is pending). A signal ends the process. The `intent` entry is the interruption record and the next run settles it. Exit 130 and 143 are not produced.
+- **Signals.** Only SIGKILL (and a crash or power loss) leaves an `intent` entry without an outcome. The next run settles it. See Signals.
 - **Not implemented flags and modes.** `--json`, `--no-input`, `--timeout`, an interactive approval and a run limit do not exist. Every run is noninteractive, so exit 4 does not occur.
 - **Forged ledger.** The ledger is not authenticated. A ledger edited by hand, with correct hashes for a user's own regular files, can make apply delete those files when the matching `--allow-disruptive` ids are given. The per-id flag and a review of the plan (which lists every removal) limit this. A stronger fix is a per-machine MAC over the ledger, or a device and inode record per output. Neither is built.
 - **Receipt write after the work.** If the receipt cannot be written, the run exits 1 and the journal and ledger are the record.

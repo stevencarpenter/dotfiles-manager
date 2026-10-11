@@ -143,6 +143,6 @@ Deselect the module in the profile (`modules = []`), run `plan`, then `apply --p
 ## Known limits on the first run
 
 - Only links. No generated files, no secrets, no packages, no reloads of running programs.
-- `Ctrl-C` during `apply` is not handled. The next run settles the interrupted operation from the journal before it does anything else.
+- `Ctrl-C` during `apply` stops cleanly. The operation in flight finishes, the receipt has outcome `interrupted`, and the exit code is 130. SIGTERM gives `terminated` and 143. After SIGKILL or a crash, the next run settles the interrupted operation from the journal before it does anything else.
 - A removal or link replacement checks the leaf and then acts in a second step. A concurrent same-user process could change the leaf in between.
 - Config edits in the checkout never require rebuilding the manager. Only a new manager commit does, through `bootstrap.sh install`.
