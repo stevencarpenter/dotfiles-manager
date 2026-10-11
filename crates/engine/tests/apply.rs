@@ -120,6 +120,7 @@ fn op(h: &Home, store: &Store, id: &str, n: u32, action: Action, rel: &str) -> O
         fragment_dir: None,
         output_sha256: None,
         managed_sha256: None,
+        takeover: false,
         output_bytes: None,
         sets: vec![],
         after: vec![],

@@ -17,7 +17,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 /// The verified live input of one generated file.
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
+#[derive(Default, Clone, PartialEq, Eq)]
 pub struct GeneratorInputs {
     /// Source files by their path in the source tree, one per entry of `Operation::inputs`.
     /// Each hash equals the plan's `source:` precondition.
@@ -34,6 +34,22 @@ pub struct GeneratorInputs {
     pub live: Option<Vec<u8>>,
     /// The handler entries the ledger records as added by the manager (merge and retire).
     pub owned_entries: Vec<OwnedEntry>,
+}
+
+/// `Debug` prints the size of the live file and never its bytes: it can hold credentials.
+impl std::fmt::Debug for GeneratorInputs {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GeneratorInputs")
+            .field("sources", &self.sources.keys().collect::<Vec<_>>())
+            .field("listing", &self.listing)
+            .field("fragments", &self.fragments.keys().collect::<Vec<_>>())
+            .field(
+                "live",
+                &self.live.as_ref().map(|b| format!("{} bytes", b.len())),
+            )
+            .field("owned_entries", &self.owned_entries)
+            .finish()
+    }
 }
 
 /// Produces the bytes of a generated file. Adapters implement it (docs/adapters.md). The trait

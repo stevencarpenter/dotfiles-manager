@@ -447,16 +447,30 @@ impl Store {
     /// section 8 item 7), or `None` when `state/salt` does not exist yet. It must be exactly 32
     /// bytes in a private regular file. The salt never leaves `state` and is never printed.
     pub fn salt(&self) -> Result<Option<Vec<u8>>, Refusal> {
+        // A symlink, a wrong owner or mode, or a wrong size is an error that is never repaired.
+        let bad = |e: Refusal| {
+            Refusal::new(
+                Code::StorageInvalid,
+                format!(
+                    "state/salt is unusable ({}). It is not replaced. {}",
+                    e.detail,
+                    dfm_model::merge::SALT_LOST
+                        .split_once(". ")
+                        .map_or("", |(_, r)| r)
+                ),
+            )
+        };
         match self
             .state()?
-            .read_private(&self.sys, SALT, SALT_BYTES + 1)?
+            .read_private(&self.sys, SALT, SALT_BYTES + 1)
+            .map_err(bad)?
         {
             None => Ok(None),
             Some(b) if b.len() == SALT_BYTES => Ok(Some(b)),
-            Some(_) => Err(Refusal::new(
-                Code::StateInvalid,
-                "state/salt is not 32 bytes; it is not replaced. Fix: restore the file from a copy. If none exists, move it aside and run apply again; every co-owned file is then merged without a foreign-edit check once",
-            )),
+            Some(b) => Err(bad(storage(format!(
+                "{} bytes, expected {SALT_BYTES}",
+                b.len()
+            )))),
         }
     }
 
@@ -974,6 +988,24 @@ impl Store {
                     }
                     _ => strays.push(format!("{op_dir} (unexpected)")),
                 }
+            }
+        }
+        if self.state().is_ok() {
+            let salt = self.salt();
+            let recorded = self.ledger_raw().is_ok_and(|l| {
+                l.resources
+                    .iter()
+                    .flat_map(|r| &r.owned_outputs)
+                    .any(|o| o.coowned.is_some())
+            });
+            match salt {
+                Err(e) => problems.push(Finding::new(Code::StorageInvalid, "salt", e.detail)),
+                Ok(None) if recorded => problems.push(Finding::new(
+                    Code::StateInvalid,
+                    "salt",
+                    dfm_model::merge::SALT_LOST,
+                )),
+                Ok(_) => {}
             }
         }
         if let Ok(state) = self.state() {

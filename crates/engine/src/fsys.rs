@@ -167,8 +167,8 @@ fn stamp_of(st: &Stat) -> Result<Stamp, Refusal> {
     })
 }
 
-/// The live file of a co-owned destination, read for one merge ([`Dir::read_live`]).
-#[derive(Debug)]
+/// The live file of a co-owned destination, read for one merge ([`Dir::read_live`]). `Debug`
+/// prints the size of the bytes and never the bytes: they can hold credentials.
 pub enum Live {
     Missing,
     /// Not a regular file, owned by another user, or hard-linked. The text says which.
@@ -180,6 +180,19 @@ pub enum Live {
         /// The state the bytes were read from. Publication compares it again before the rename.
         stamp: Stamp,
     },
+}
+
+impl std::fmt::Debug for Live {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Live::Missing => f.write_str("Missing"),
+            Live::Unusable(why) => write!(f, "Unusable({why})"),
+            Live::TooBig => f.write_str("TooBig"),
+            Live::File { bytes, mode, .. } => {
+                write!(f, "File {{ {} bytes, mode {mode:o} }}", bytes.len())
+            }
+        }
+    }
 }
 
 pub(crate) fn mode_bits(st: &Stat) -> u32 {

@@ -156,7 +156,7 @@ pub fn registry() -> Vec<Adapter> {
                 ..spec(
                     "claude-settings/v1",
                     "merge",
-                    TargetRule::Required,
+                    TargetRule::Fixed(".claude/settings.json"),
                     Claims::Target,
                     Schema::Table(vec![
                         field("managed", Schema::Native, true),

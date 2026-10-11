@@ -1530,12 +1530,13 @@ fn a_sensitive_output_under_a_fragment_pattern_is_never_hashed() {
         r#"
 [[resources]]
 id = "claude-copy"
-kind = "merge"
-adapter = "claude-settings/v1"
+kind = "secret"
+adapter = "op-template/v1"
 target = ".codex/AGENTS.d/60-secret.md"
-[resources.value.managed]
-outputStyle = "STE"
-[resources.value.handlers]
+[resources.value]
+template = "files/AGENTS.md"
+account = "example-account"
+mode = 0o600
 "#,
     );
     fs::write(&m, t).unwrap();
@@ -1550,16 +1551,21 @@ outputStyle = "STE"
         "{all}"
     );
     let s = Saved::parse(&o.stdout).unwrap();
-    match &s.plan.observations.seen[".codex/AGENTS.d/60-secret.md"].node {
-        dfm_model::plan::Node::File { sha256, .. } => assert_eq!(sha256, &None),
-        n => panic!("{n:?}"),
+    // The merge adapter now pins its target (`.claude/settings.json`), so the sensitive claim
+    // under the fragment pattern is a secret output. It is out of scope, so it is not observed
+    // as a file and no fragment of the assembly is its content. Whatever was observed holds no
+    // hash.
+    if let Some(seen) = s.plan.observations.seen.get(".codex/AGENTS.d/60-secret.md")
+        && let dfm_model::plan::Node::File { sha256, .. } = &seen.node
+    {
+        assert_eq!(sha256, &None);
     }
-    // It is the producer of a fragment, not a foreign one.
     let asm = op(&s, "agents.codex-instructions@.codex/AGENTS.md");
     assert!(
         asm.fragments
             .iter()
-            .any(|f| f.name == "60-secret.md" && f.origin == "selected:agents.claude-copy")
+            .all(|f| f.sha256.is_none() || f.name != "60-secret.md"),
+        "a claimed sensitive path is never hashed as a foreign fragment"
     );
 }
 

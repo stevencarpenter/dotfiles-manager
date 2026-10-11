@@ -43,7 +43,7 @@ extensions = []
 id = "agent-settings"
 kind = "merge"
 adapter = "claude-settings/v1"
-target = ".config/synthetic/settings.json"
+target = ".claude/settings.json"
 [resources.value.managed]
 mode = "strict"
 [resources.value.seed]

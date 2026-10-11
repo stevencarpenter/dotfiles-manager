@@ -170,7 +170,34 @@ impl Fx {
         self.run(&["plan", "--root", self.root_arg()])
     }
 
+    /// Applies the current plan. A take-over of an existing file is approved by id, as a person
+    /// would paste the flag the refusal prints.
     fn apply(&self) -> Output {
+        let saved = self.saved();
+        let ids: Vec<String> = saved
+            .plan
+            .operations
+            .iter()
+            .filter(|o| o.takeover)
+            .map(|o| o.id.clone())
+            .collect();
+        let mut a = vec![
+            "apply".to_string(),
+            "--root".into(),
+            self.root_arg().into(),
+            "--yes-plan".into(),
+            saved.plan_digest,
+        ];
+        for id in ids {
+            a.push("--allow-adopt".into());
+            a.push(id);
+        }
+        let a: Vec<&str> = a.iter().map(String::as_str).collect();
+        self.run(&a)
+    }
+
+    /// Applies with the digest and no allowance.
+    fn apply_bare(&self) -> Output {
         let d = self.saved().plan_digest;
         self.apply_with(&d)
     }
@@ -653,7 +680,8 @@ fn nothing_but_the_ledger_holds_the_salted_hash_and_no_output_shows_content() {
     collect(&fx.run(&["plan", "--root", fx.root_arg(), "--json"]));
     let d = fx.saved().plan_digest;
     collect(&fx.run(&["apply", "--root", fx.root_arg(), "--preview"]));
-    let o = fx.apply_with(&d);
+    collect(&fx.apply_with(&d));
+    let o = fx.apply();
     assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
     collect(&o);
     for args in [
@@ -676,6 +704,24 @@ fn nothing_but_the_ledger_holds_the_salted_hash_and_no_output_shows_content() {
         .to_string();
     let salt = fs::read(fx.state().join("salt")).unwrap();
     assert_eq!(salt.len(), 32);
+    // The raw salt bytes must be absent from every output and every state file but the salt.
+    let salt_hex_lower: String = salt.iter().map(|b| format!("{b:02x}")).collect();
+    assert!(!seen_text.contains(&salt_hex_lower), "salt hex in output");
+    for f in files_below(&fx.state()) {
+        if f.file_name().unwrap() != "salt" {
+            let b = fs::read(&f).unwrap();
+            assert!(
+                !b.windows(salt.len()).any(|w| w == salt.as_slice()),
+                "{} holds the raw salt",
+                f.display()
+            );
+            assert!(
+                !String::from_utf8_lossy(&b).contains(&salt_hex_lower),
+                "{} holds the salt in hex",
+                f.display()
+            );
+        }
+    }
     for (what, needle) in [
         ("planted token", TOKEN.to_string()),
         ("salted hash", hash.clone()),
@@ -828,4 +874,172 @@ fn doctor_reports_the_merge_output_from_the_comparison_and_never_shows_content()
         !all.contains("edited-by-hand") && !all.contains(TOKEN),
         "{all}"
     );
+}
+
+// ---- fix round: delete and recreate, take-over approval, salt, target, ownership ----------
+
+#[test]
+fn a_deleted_settings_file_is_created_again_and_the_hash_is_recorded_anew() {
+    let fx = Fx::new();
+    fx.live(LIVE);
+    assert_eq!(code(&fx.apply()), 0);
+    let old = fx.coowned().unwrap()["coowned"]["managed_hash"].clone();
+    fs::remove_file(fx.settings()).unwrap();
+    let o = fx.plan();
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+    assert!(
+        text(&o.stdout).contains("create .claude/settings.json"),
+        "{}",
+        text(&o.stdout)
+    );
+    let o = fx.apply_bare();
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+    let j = fx.live_json();
+    assert_eq!(j["outputStyle"], "STE");
+    assert_eq!(j["model"], "example-model", "the file is rebuilt from {{}}");
+    assert_eq!(fx.mode(), 0o600);
+    let c = fx.coowned().unwrap();
+    assert_eq!(
+        c["coowned"]["managed_hash"], old,
+        "same salt and values give the same hash"
+    );
+    let o = fx.apply_bare();
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    assert!(text(&o.stdout).contains("updated=0"), "{}", text(&o.stdout));
+}
+
+#[test]
+fn an_existing_file_with_no_ledger_entry_needs_allow_adopt_and_an_absent_one_does_not() {
+    let fx = Fx::new();
+    fx.live(LIVE);
+    let before = fs::read(fx.settings()).unwrap();
+    let o = fx.apply_bare();
+    assert_eq!(code(&o), 3, "{}\n{}", stderr(&o), text(&o.stdout));
+    assert!(stderr(&o).contains("E_ADOPT_UNAPPROVED"), "{}", stderr(&o));
+    assert!(stderr(&o).contains("--allow-adopt"), "{}", stderr(&o));
+    assert_eq!(fs::read(fx.settings()).unwrap(), before);
+    assert_eq!(fx.receipts(), 0);
+    assert!(fx.coowned().is_none());
+    let t = text(&fx.plan().stdout);
+    assert!(
+        t.contains("take over managed fields of an existing file"),
+        "{t}"
+    );
+    assert!(
+        t.contains("hand edits of managed fields are overwritten"),
+        "{t}"
+    );
+    // With the flag it writes, and the receipt records how the approval was given.
+    let o = fx.apply();
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+    assert_eq!(fx.live_json()["outputStyle"], "STE");
+    let r = fs::read_dir(fx.state().join("receipts"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap();
+    let r: serde_json::Value = serde_json::from_slice(&fs::read(r.path()).unwrap()).unwrap();
+    assert_eq!(r["approvals"][0]["how"], "allow_adopt");
+    // The next run needs no flag: the ledger records the file now.
+    fx.module(|m| m.replace("\"STE\"", "\"next\""));
+    let o = fx.apply_bare();
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+    // An absent file needs no flag.
+    let fresh = Fx::new();
+    let o = fresh.apply_bare();
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+}
+
+#[test]
+fn a_module_that_names_another_target_is_refused_at_resolution() {
+    let fx = Fx::new();
+    fx.module(|m| {
+        m.replace(
+            "target = \".claude/settings.json\"",
+            "target = \".claude/other.json\"",
+        )
+    });
+    let o = fx.plan();
+    assert_ne!(code(&o), 0);
+    let e = stderr(&o);
+    assert!(
+        e.contains("E_MANIFEST_INVALID") && e.contains(".claude/settings.json"),
+        "{e}"
+    );
+}
+
+#[test]
+fn an_identical_hook_that_was_already_there_is_not_owned_and_retire_leaves_it() {
+    let fx = Fx::new();
+    let same =
+        r#"{"hooks":{"PreToolUse":[{"hooks":[{"command":"audit --quiet","type":"command"}]}]}}"#;
+    fx.live(same);
+    assert_eq!(code(&fx.apply()), 0);
+    let c = fx.coowned().unwrap();
+    assert_eq!(c["coowned"]["entries"], serde_json::json!([]), "{c}");
+    assert_eq!(
+        fx.live_json()["hooks"]["PreToolUse"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    fx.set_profile("");
+    let o = fx.apply_bare();
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+    assert_eq!(
+        fx.live_json()["hooks"]["PreToolUse"][0]["hooks"][0]["command"],
+        "audit --quiet",
+        "the user's copy stays"
+    );
+}
+
+// The salt: missing, short, open to others, or a link. Each is a hard state error for plan and
+// apply, with the recovery text, and `state check` reports it.
+fn bad_salt(change: impl FnOnce(&Path)) {
+    let fx = Fx::new();
+    assert_eq!(code(&fx.apply()), 0);
+    let salt = fx.state().join("salt");
+    change(&salt);
+    let o = fx.plan();
+    assert_eq!(code(&o), 3, "{}\n{}", stderr(&o), text(&o.stdout));
+    let e = stderr(&o);
+    assert!(e.contains("restore state/salt from a copy"), "{e}");
+    assert!(e.contains("coowned"), "names the ledger key: {e}");
+    let a = fx.run(&[
+        "apply",
+        "--root",
+        fx.root_arg(),
+        "--yes-plan",
+        &"0".repeat(64),
+    ]);
+    assert_eq!(code(&a), 3, "{}", stderr(&a));
+    let c = fx.run(&["state", "check"]);
+    assert_eq!(code(&c), 1, "{}\n{}", stderr(&c), text(&c.stdout));
+    let all = format!("{}{}", stderr(&c), text(&c.stdout));
+    assert!(all.contains("salt"), "{all}");
+}
+
+#[test]
+fn a_missing_salt_with_coowned_entries_is_a_hard_state_error() {
+    bad_salt(|p| fs::remove_file(p).unwrap());
+}
+
+#[test]
+fn a_16_byte_salt_is_refused() {
+    bad_salt(|p| fs::write(p, [7u8; 16]).unwrap());
+}
+
+#[test]
+fn a_salt_open_to_others_is_refused() {
+    bad_salt(|p| fs::set_permissions(p, fs::Permissions::from_mode(0o644)).unwrap());
+}
+
+#[test]
+fn a_symlinked_salt_is_refused() {
+    bad_salt(|p| {
+        let real = p.with_file_name("salt-real");
+        fs::rename(p, &real).unwrap();
+        std::os::unix::fs::symlink(&real, p).unwrap();
+    });
 }

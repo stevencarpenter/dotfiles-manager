@@ -42,6 +42,8 @@ pub struct Field {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TargetRule {
     Required,
+    /// The adapter writes one destination only. A resource naming another is refused.
+    Fixed(&'static str),
     Forbidden,
 }
 

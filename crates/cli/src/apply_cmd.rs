@@ -259,7 +259,7 @@ fn run_inner(
             .iter()
             .zip(&report.operations)
             .filter_map(|(op, rec)| {
-                let kind = Allowance::of(op.action)?;
+                let kind = Allowance::of(op)?;
                 let approved = match kind {
                     Allowance::Disruptive => &args.allow,
                     Allowance::Adopt => &args.allow_adopt,

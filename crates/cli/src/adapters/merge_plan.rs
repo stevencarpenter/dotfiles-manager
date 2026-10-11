@@ -151,43 +151,18 @@ fn verdict_for(
             .and_then(|o| o.coowned.clone()),
         Err(e) => return refused(&e),
     };
-    let owned = recorded
-        .as_ref()
-        .map(|c| c.entries.clone())
-        .unwrap_or_default();
-    let merged = match merge::merge(bytes.as_deref(), desired, &owned) {
-        Ok(m) => m,
-        Err(e) => return refused(&e),
-    };
-    let Some(c) = recorded else {
-        // No ledger entry: the manager may write. It takes over the managed fields.
-        return MergeVerdict::Write;
-    };
     let salt = match store.salt() {
-        Ok(Some(s)) => s,
-        Ok(None) => {
-            return blocked(
-                Code::StateInvalid,
-                "state/salt is missing but the ledger records a salted hash, so a foreign edit cannot be detected. Fix: restore state/salt from a copy",
-            );
-        }
+        Ok(s) => s,
         Err(e) => return refused(&e),
     };
-    if merge::salted(&salt, &merged.live_view) != c.managed_hash
-        && merged.live_view != merged.rendered_view
-    {
-        return blocked(
-            Code::Conflict,
-            &format!(
-                "a managed field of {claim} was changed outside the manager since the last apply. Fix: restore the declared value in the file, or set the same value in the module so the manager adopts your edit"
-            ),
-        );
-    }
-    let recorded_now = merge::salted(&salt, &merged.rendered_view) == c.managed_hash
-        && c.entries == merged.entries;
-    if !merged.changed && recorded_now {
-        MergeVerdict::Current
-    } else {
-        MergeVerdict::Write
+    match merge::classify(
+        bytes.as_deref(),
+        desired,
+        recorded.as_ref(),
+        salt.as_deref(),
+    ) {
+        Ok((_, merge::Outcome::Current)) => MergeVerdict::Current,
+        Ok((_, merge::Outcome::Write)) => MergeVerdict::Write,
+        Err(e) => refused(&e),
     }
 }

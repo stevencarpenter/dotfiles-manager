@@ -257,7 +257,7 @@ fn ledger_rows(store: &Store, layout: &Layout, rows: &mut Vec<Row>) -> Option<Ve
                     class: r.class,
                     path: rel.into(),
                     fingerprint: o.fingerprint.clone(),
-                    coowned_entries: None,
+                    coowned_entries: o.coowned.as_ref().map(|c| c.entries.len()),
                 }),
                 None => rows.push(refusal_row(
                     "output",

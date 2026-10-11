@@ -15,7 +15,7 @@
 
 use crate::digest::sha256_hex;
 use crate::refusal::{Code, Refusal};
-use crate::state::OwnedEntry;
+use crate::state::{CoOwned, OwnedEntry};
 use serde_json::{Map, Value as Json};
 use std::collections::{BTreeMap, BTreeSet};
 use toml::Value as Toml;
@@ -44,8 +44,8 @@ pub struct Desired {
     handlers: Vec<Handler>,
 }
 
-/// The result of a merge.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// The result of a merge. `Debug` prints lengths only: the bytes can hold credentials.
+#[derive(Clone, PartialEq, Eq)]
 pub struct Merged {
     /// The new file content.
     pub bytes: Vec<u8>,
@@ -60,6 +60,21 @@ pub struct Merged {
     pub changed: bool,
 }
 
+impl std::fmt::Debug for Merged {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Merged")
+            .field("bytes", &format_args!("{} bytes", self.bytes.len()))
+            .field("live_view", &format_args!("{} bytes", self.live_view.len()))
+            .field(
+                "rendered_view",
+                &format_args!("{} bytes", self.rendered_view.len()),
+            )
+            .field("entries", &self.entries)
+            .field("changed", &self.changed)
+            .finish()
+    }
+}
+
 fn invalid(detail: impl Into<String>) -> Refusal {
     Refusal::new(Code::ManifestInvalid, detail)
 }
@@ -69,9 +84,8 @@ fn conflict(detail: impl Into<String>) -> Refusal {
 }
 
 fn canonical(v: &Json) -> Vec<u8> {
-    // `serde_json::Map` is a sorted map here (no `preserve_order`), so this is canonical. A
-    // `Json` value always serializes.
-    serde_json::to_vec(v).unwrap_or_default()
+    // `serde_json::Map` is a sorted map here (no `preserve_order`), so this is canonical.
+    serde_json::to_vec(v).expect("a serde_json::Value always serializes: its keys are strings")
 }
 
 fn to_json(v: &Toml, at: &str) -> Result<Json, Refusal> {
@@ -124,7 +138,9 @@ fn shell_word(a: &str) -> String {
         out.push('"');
         return out;
     }
+    // A leading `=` is expanded by zsh (`=cmd` is the path of cmd), so such a word is quoted.
     let plain = !a.is_empty()
+        && !a.starts_with('=')
         && a.bytes()
             .all(|b| b.is_ascii_alphanumeric() || b"_@%+=:,./-".contains(&b));
     if plain {
@@ -264,7 +280,8 @@ fn view_of(doc: &Map<String, Json>, keys: &Map<String, Json>) -> Vec<u8> {
 }
 
 fn serialize(doc: Map<String, Json>) -> Vec<u8> {
-    let mut out = serde_json::to_vec_pretty(&Json::Object(doc)).unwrap_or_default();
+    let mut out = serde_json::to_vec_pretty(&Json::Object(doc))
+        .expect("a serde_json::Value always serializes: its keys are strings");
     out.push(b'\n');
     out
 }
@@ -362,12 +379,13 @@ pub fn merge(
     for o in owned {
         let kept = declared
             .get(o.id.as_str())
-            .is_some_and(|h| h.event == o.event && h.sha256 == o.sha256);
+            .is_some_and(|h| h.event == o.key && h.sha256 == o.sha256);
         if !kept {
-            remove_owned(&mut doc, &o.event, &o.sha256, &mut touched)?;
+            remove_owned(&mut doc, &o.key, &o.sha256, &mut touched)?;
         }
     }
     tidy(&mut doc, &touched);
+    let mut entries = Vec::new();
     for h in &desired.handlers {
         let hooks = match doc
             .entry("hooks")
@@ -380,28 +398,35 @@ pub fn merge(
                 ));
             }
         };
-        match event_array(hooks, &h.event)? {
+        let present = match event_array(hooks, &h.event)? {
             Some(arr) => {
-                if !arr.iter().any(|e| sha_of(e) == h.sha256) {
+                let found = arr.iter().any(|e| sha_of(e) == h.sha256);
+                if !found {
                     arr.push(h.entry.clone());
                 }
+                found
             }
             None => {
                 hooks.insert(h.event.clone(), Json::Array(vec![h.entry.clone()]));
+                false
             }
+        };
+        // The manager owns an entry it added now or recorded as its own before. An identical
+        // entry that was already there and is not recorded belongs to the user: a later retire
+        // must never delete it.
+        let was_owned = owned
+            .iter()
+            .any(|o| o.id == h.id && o.key == h.event && o.sha256 == h.sha256);
+        if !present || was_owned {
+            entries.push(OwnedEntry {
+                id: h.id.clone(),
+                key: h.event.clone(),
+                sha256: h.sha256.clone(),
+            });
         }
     }
     let bytes = serialize(doc);
     let changed = live != Some(bytes.as_slice());
-    let entries = desired
-        .handlers
-        .iter()
-        .map(|h| OwnedEntry {
-            id: h.id.clone(),
-            event: h.event.clone(),
-            sha256: h.sha256.clone(),
-        })
-        .collect();
     Ok(Merged {
         bytes,
         live_view,
@@ -417,7 +442,7 @@ pub fn retire(live: &[u8], owned: &[OwnedEntry]) -> Result<(Vec<u8>, bool), Refu
     let mut doc = parse_live(Some(live))?;
     let mut touched = BTreeSet::new();
     for o in owned {
-        remove_owned(&mut doc, &o.event, &o.sha256, &mut touched)?;
+        remove_owned(&mut doc, &o.key, &o.sha256, &mut touched)?;
     }
     tidy(&mut doc, &touched);
     let bytes = serialize(doc);
@@ -428,6 +453,75 @@ pub fn retire(live: &[u8], owned: &[OwnedEntry]) -> Result<(Vec<u8>, bool), Refu
 /// Checks that the live document parses, and returns its managed view, without building a merge.
 pub fn live_view(live: Option<&[u8]>, desired: &Desired) -> Result<Vec<u8>, Refusal> {
     Ok(view_of(&parse_live(live)?, &desired.managed))
+}
+
+/// The text for a lost or unusable salt while the ledger records a salted hash. It is a hard
+/// state error: no command recovers it.
+pub const SALT_LOST: &str = "state/salt is missing or unusable, but the ledger records a salted hash of managed fields. This is a hard state error, so the foreign-edit check cannot run. Fix: restore state/salt from a copy (32 bytes, mode 0600). If no copy exists, edit state/ledger.json by hand and delete the `coowned` object (the key under resources[].owned_outputs[]) of each co-owned output; the next apply then needs --allow-adopt for that file";
+
+/// Whether a managed field was changed outside the manager since the last write. The live
+/// managed view must differ from the salted hash the ledger holds, and must not already equal
+/// the declared values (then nothing is overwritten). Plan and apply both decide through this.
+pub fn foreign_edit(salt: &[u8], recorded: &CoOwned, m: &Merged) -> bool {
+    salted(salt, &m.live_view) != recorded.managed_hash && m.live_view != m.rendered_view
+}
+
+/// The shared conflict check for plan and apply. `live_present` is false when the file is
+/// absent: there is nothing to compare, and the merge creates the file and records a new salted
+/// hash. A recorded hash needs a usable salt. Messages carry no live content.
+pub fn check_foreign(
+    live_present: bool,
+    recorded: Option<&CoOwned>,
+    salt: Option<&[u8]>,
+    m: &Merged,
+) -> Result<(), Refusal> {
+    let Some(c) = recorded else {
+        return Ok(());
+    };
+    let Some(salt) = salt else {
+        return Err(Refusal::new(Code::StateInvalid, SALT_LOST));
+    };
+    if live_present && foreign_edit(salt, c, m) {
+        return Err(conflict(
+            "a managed field of the live settings file was changed outside the manager since the last apply; nothing was changed. Fix: restore the declared value in the file, or set the same value in the module so the manager adopts your edit",
+        ));
+    }
+    Ok(())
+}
+
+/// What a merge would do to the live file.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Outcome {
+    /// Write the file, or record ownership of one that is already correct.
+    Write,
+    /// The result equals the live bytes and the ledger records the same hash and entries.
+    Current,
+}
+
+/// Merges and checks in one step: the one function plan-time facts use. Apply calls [`merge`]
+/// through its generator and then [`check_foreign`], the same check.
+pub fn classify(
+    live: Option<&[u8]>,
+    desired: &Desired,
+    recorded: Option<&CoOwned>,
+    salt: Option<&[u8]>,
+) -> Result<(Merged, Outcome), Refusal> {
+    let owned = recorded.map(|c| c.entries.as_slice()).unwrap_or_default();
+    let merged = merge(live, desired, owned)?;
+    check_foreign(live.is_some(), recorded, salt, &merged)?;
+    let current = live.is_some()
+        && !merged.changed
+        && recorded.zip(salt).is_some_and(|(c, salt)| {
+            salted(salt, &merged.rendered_view) == c.managed_hash && c.entries == merged.entries
+        });
+    Ok((
+        merged,
+        if current {
+            Outcome::Current
+        } else {
+            Outcome::Write
+        },
+    ))
 }
 
 /// The salted hash of a managed view. The salt is a per-machine secret in `state/salt`. The
@@ -605,6 +699,82 @@ argv = ["audit", "--quiet", "two words"]
         assert_eq!(shell_word("$HOME/a"), "'$HOME/a'");
         assert_eq!(shell_word("it's"), "'it'\\''s'");
         assert_eq!(shell_word(""), "''");
+    }
+
+    #[test]
+    fn output_keys_are_sorted_whatever_the_order_in_the_live_file() {
+        let live =
+            br#"{"zeta":1,"alpha":{"y":1,"b":2},"model":"m","hooks":{"Stop":[],"PreToolUse":[]}}"#;
+        let m = merge(Some(live), &desired(BASE), &[]).unwrap();
+        let t = String::from_utf8(m.bytes).unwrap();
+        let at = |k: &str| t.find(&format!("\n  \"{k}\"")).unwrap();
+        assert!(
+            at("alpha") < at("hooks")
+                && at("hooks") < at("model")
+                && at("model") < at("outputStyle")
+        );
+        assert!(at("outputStyle") < at("zeta"));
+        assert!(
+            t.find("\"b\"").unwrap() < t.find("\"y\"").unwrap(),
+            "nested keys too"
+        );
+        assert!(t.find("\"PreToolUse\"").unwrap() < t.find("\"Stop\"").unwrap());
+    }
+
+    #[test]
+    fn a_word_that_starts_with_equals_is_quoted() {
+        assert_eq!(shell_word("=cmd"), "'=cmd'");
+        assert_eq!(shell_word("a=b"), "a=b");
+    }
+
+    #[test]
+    fn an_identical_hook_that_was_already_there_is_not_recorded_as_owned() {
+        let live = br#"{"hooks":{"PreToolUse":[{"hooks":[{"command":"audit --quiet 'two words'","type":"command"}]}]}}"#;
+        let first = merge(Some(live), &desired(BASE), &[]).unwrap();
+        assert!(first.entries.is_empty(), "{:?}", first.entries);
+        let (bytes, _) = retire(&first.bytes, &first.entries).unwrap();
+        assert_eq!(
+            json(&bytes)["hooks"]["PreToolUse"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        // Once the manager added an entry, it stays owned on later merges.
+        let added = merge(None, &desired(BASE), &[]).unwrap();
+        assert_eq!(added.entries.len(), 1);
+        let again = merge(Some(&added.bytes), &desired(BASE), &added.entries).unwrap();
+        assert_eq!(again.entries, added.entries);
+    }
+
+    #[test]
+    fn the_conflict_check_is_shared_and_skips_an_absent_file() {
+        let d = desired(BASE);
+        let salt = [9u8; 32];
+        let first = merge(None, &d, &[]).unwrap();
+        let rec = CoOwned {
+            managed_hash: salted(&salt, &first.rendered_view),
+            entries: first.entries.clone(),
+        };
+        // Unchanged live file: current.
+        let (_, o) = classify(Some(&first.bytes), &d, Some(&rec), Some(&salt)).unwrap();
+        assert_eq!(o, Outcome::Current);
+        // A hand edit of a managed field is a conflict, and a salt-less check is a hard error.
+        let edited = br#"{"outputStyle":"mine"}"#;
+        let e = classify(Some(edited), &d, Some(&rec), Some(&salt)).unwrap_err();
+        assert_eq!(e.code, Code::Conflict);
+        assert!(!e.detail.contains("mine"));
+        let e = classify(Some(&first.bytes), &d, Some(&rec), None).unwrap_err();
+        assert_eq!(e.code, Code::StateInvalid);
+        // An absent file has nothing to compare: it is created again.
+        let (m, o) = classify(None, &d, Some(&rec), Some(&salt)).unwrap();
+        assert_eq!((o, m.changed), (Outcome::Write, true));
+        // A live value already equal to the declared one is no conflict.
+        let stale = CoOwned {
+            managed_hash: "0".repeat(64),
+            ..rec
+        };
+        assert!(classify(Some(&first.bytes), &d, Some(&stale), Some(&salt)).is_ok());
     }
 
     #[test]

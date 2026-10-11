@@ -143,6 +143,10 @@ extensions = ["/handlers"]
 
 The resolver applies `policy.defaults` and `policy.extensions` (an overlay can change a default or add a handler). The adapter reads the resolved value. A config edit needs no rebuild.
 
+**Mapping rule.** `managed` and `seed` act on the top-level keys of the settings file, and a policy pointer addresses the same resolved value: `/managed/outputStyle` is the field `outputStyle` of `managed`, which sets the top-level key `outputStyle`. A nested table under a key is replaced as one value. The adapter writes no nested path.
+
+**Fixed destination.** The adapter writes `.claude/settings.json` only. A resource of this adapter with any other `target` is `E_MANIFEST_INVALID` at resolution (`TargetRule::Fixed`), with the fix text `set the target to .claude/settings.json`. The destination is pinned so a module cannot point the sensitive merge at another file.
+
 ### Merge rules
 
 The base is the live document. The merge changes only what the module declares.
@@ -150,7 +154,7 @@ The base is the live document. The merge changes only what the module declares.
 1. **Managed.** Each key of `managed` is set to the declared value. The whole value of that top-level key is replaced. A declared `false` is an explicit disable and is written as `false`. TOML has no null, so a JSON `null` cannot be declared.
 2. **Seed.** Each key of `seed` is set only when the live file has no such key. A live value, including `false`, is never overwritten. A key in both `managed` and `seed` is managed.
 3. **Handlers.** Each handler is one hook entry `{"hooks":[{"type":"command","command":"<argv>"}]}` added to the array `hooks.<event>`. `argv` is joined into one shell command. A word is single-quoted unless it only holds `A-Za-z0-9_@%+=:,./-`. A word that starts with `${HOME}` keeps that reference live in double quotes, so a hook finds the home directory on each machine. Only the type `command` is built. Any other type is `E_MANIFEST_INVALID` with fix text, because the manager cannot reverse it safely.
-4. **Owned list.** The ledger records, for each handler the manager added, its id, its event and the SHA-256 of the entry it declared (declared content, not live content). The next merge removes an owned entry whose handler is gone or changed, matching by that hash, so a foreign entry is never touched. It adds each declared entry unless an identical one is already in the array. A user who deleted an owned entry gets it back, because the manager owns it. A foreign entry that is byte-equal to a declared one counts as the manager's after the next write.
+4. **Owned list.** The ledger records, for each handler the manager added, its id, its event and the SHA-256 of the entry it declared (declared content, not live content). The next merge removes an owned entry whose handler is gone or changed, matching by that hash, so a foreign entry is never touched. It adds each declared entry unless an identical one is already in the array. A user who deleted an owned entry gets it back, because the manager owns it. The ledger records ownership only for an entry the manager added, or one it already recorded. An identical entry that was in the file before the manager first wrote stays the user's, so a later `retire` never removes it.
 5. **Retire.** When the resource is no longer selected, the manager removes only the owned entries (the plan action `retire`). Managed and seeded values stay, every foreign key and hook stays, and the file is never deleted. An event array or the `hooks` object that the removal emptied is removed. One that was already empty is left alone.
 6. **Foreign shapes.** If `hooks` is not an object, or `hooks.<event>` is not an array, the merge stops with `E_CONFLICT` and fix text. `managed.hooks` and `seed.hooks` are refused: hooks are declared as handlers.
 7. **Normalized formatting.** The output is the document re-serialized with sorted keys, a 2-space indent and a final newline. Comments are not part of JSON. Key order, spacing and number spelling are not preserved. Integers that fit 64 bits and finite floats are kept by value. A number outside those ranges is stored as the nearest `f64`. A duplicate key in the live file keeps the last value (the `serde_json` rule).
@@ -170,12 +174,20 @@ At plan time and again at apply time the manager reads the live file and compare
 
 1. The live managed view is the canonical JSON of the declared managed keys as the live file holds them. A key that is absent is left out.
 2. Its salted hash is compared with `coowned.managed_hash` in the ledger.
-3. If the ledger has no entry for this resource and path, the manager may write. It takes over the managed fields of an existing file. The contract (section 8 item 7) blocks a missing ledger entry for an existing secret output. A co-owned file differs: the manager keeps every foreign key, so the live file is the base and not an object to protect from replacement.
+3. If the ledger has no entry for this resource and path and the file exists, the first write is a take-over. It is a planned operation that needs `--allow-adopt '<id>'` (next section). An absent file needs no flag.
 4. If the hashes are equal, the manager may write.
 5. If they differ and the live managed view is not already equal to the declared values, a managed field was changed outside the manager. The operation is `E_CONFLICT`, nothing is written, and the fix text says: restore the declared value in the file, or declare the edited value in the module so the manager adopts it. No value is printed. If the live managed view already equals the declared values, nothing is overwritten and the write is allowed.
 6. A managed key that the user removed counts as an edit.
+7. If the file is absent while the ledger has an entry (the user deleted it), there is nothing to compare. The plan is a create: the merged document is built from `{}` and the salted hash is recorded again.
+8. The ledger holds a salted hash only with a usable `state/salt`. A salt that is missing, not 32 bytes, not mode 0600, a link or not owned by the user is a hard state error (docs/state.md). Plan and apply refuse with the recovery text and write nothing.
+
+Plan and apply use one pure function for the comparison, `dfm_model::merge::check_foreign` (built on `foreign_edit`). `classify` adds the merge and the `current` test for the plan.
 
 An entry of another resource in the ledger for the same path blocks before the file is read. A symlink, a file of another owner, a hard-linked file or a file over 16 MiB is refused. A file open to group or others (a mode that has any bit in `0077`) is refused with `E_CONFLICT` and the fix `chmod 600`. The manager does not change a mode it did not set. The published file always has mode 0600.
+
+### Take over an existing file
+
+Owner-delegated decision (2026-10-11), recorded in docs/architecture.md section 8 item 7. The first write into an existing settings file that has no `coowned` ledger entry for this resource is the operation `update_file` with `takeover = true`. Its effect text reads `take over managed fields of an existing file <path> (sensitive: destination and mode only); foreign keys are kept; hand edits of managed fields are overwritten`. Apply refuses it without `--allow-adopt '<operation-id>'` (`E_ADOPT_UNAPPROVED`, exit 3, nothing written). The approval is recorded in the receipt as `how = allow_adopt`. An absent file is a create and needs no flag. After the first write the ledger has the entry, and later runs need no flag. A deleted file with a ledger entry is a create too.
 
 ### What the plan shows
 
@@ -254,13 +266,18 @@ The unmodified example profile now plans and applies in an isolated HOME. The te
 | Output of the merge for a handler | One entry `{"hooks":[{"type":"command","command":...}]}` with no `matcher`. The settings format is not in the contract; this is the minimal valid hook element. |
 | Where the merge algorithm lives | `dfm-model`, because the dependency allow-list admits `serde_json` there only. |
 | Approval for `retire` | None beyond `--yes-plan`. It deletes no file and removes only entries the ledger proves the manager added. |
+| First write into an existing file | `--allow-adopt` (owner-delegated). The contract asks for an interactive confirmation naming the destination. No prompt exists, so the per-operation flag stands in, as for link adoption. |
+| Ledger key for an owned entry | `coowned.entries[{id, key, sha256}]`. `key` is the list the entry sits in (the hook event). The name is generic so another co-owned list can use it. |
+| Deleted file with a ledger entry | Planned as a create from `{}`. The foreign-edit comparison is skipped because no file exists. |
 | Doctor for a merge output | Row `N/A` (`D_NA_SENSITIVE`) while healthy. A foreign edit or a malformed file is the plan's `E_CONFLICT`, shown as `ERROR` (docs/doctor.md). |
 
 ## Not built
 
 - **Other co-owned destinations** (DFM-21.C01, C02, C05): Codex configuration, MCP server configuration files and any reverse transformation of them. The owner's inventory (DFM-9) names them. No existing activation code was invoked or ported. An unsupported reverse transformation stays an explicit blocker with fix text, as for a handler of another type.
 - **A JSON `null` disable.** TOML cannot express it. Only `false` and other TOML values are declarable.
-- **Lossless numbers.** An integer beyond 64 bits in a foreign key becomes an `f64`.
+- **Lossless numbers.** An integer beyond 64 bits in a foreign key becomes an `f64`. Recorded, not fixed.
+- **Forged ledger.** The ledger is not authenticated. A same-user edit of `coowned.entries` can make `retire` remove a hook entry whose hash it names. This is the same limit as for removals (docs/apply.md, "Forged ledger").
+- **Hand edit on the first merge.** A hand edit of a managed field is overwritten by the first write into an existing file. The `--allow-adopt` flag and the plan text say so before it happens.
 - **Capture** (adopting a live file into the sources). The merge never writes the sources.
 - **Native-setting probes** (DFM-20.C03). Nothing runs `git config --list` or similar. The manager does not report whether a protected setting survives every fragment. That stays the open item that docs/resolver.md names.
 - **SSH and shell assemblies.** Only the two fixtures' adapters exist. A tmux, SSH or shell assembly with its own ordering rule needs its own adapter (code), or can use `text-fragments/v1` when "body plus sorted fragments" is the rule.

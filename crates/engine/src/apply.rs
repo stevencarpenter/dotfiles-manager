@@ -19,7 +19,7 @@ use crate::publish::Publish;
 use crate::store::{Probe, Store, now_unix};
 use dfm_model::digest::sha256_hex;
 use dfm_model::fold;
-use dfm_model::merge::salted;
+use dfm_model::merge::{Merged, check_foreign, salted};
 use dfm_model::plan::{
     Action, Operation, Owned, Plan, Request, Status as PlanStatus, ledger_state, link_fingerprint,
     node_state,
@@ -172,9 +172,13 @@ impl Approval {
         Approval::ALL.into_iter().find(|a| a.flag() == flag)
     }
 
-    /// The operation the approval covers.
-    pub fn of(action: Action) -> Option<Approval> {
-        Approval::ALL.into_iter().find(|a| a.action() == action)
+    /// The approval an operation needs: a removal and an adoption by their action, and the
+    /// first write into an existing co-owned file (`takeover`) as an adoption.
+    pub fn of(op: &Operation) -> Option<Approval> {
+        if op.takeover {
+            return Some(Approval::Adopt);
+        }
+        Approval::ALL.into_iter().find(|a| a.action() == op.action)
     }
 
     pub fn flag(self) -> &'static str {
@@ -250,7 +254,7 @@ pub fn gates(plan: &Plan, generator: &dyn Generator) -> Gates {
     let planned = |kind: Approval| {
         plan.operations
             .iter()
-            .filter(|o| o.status == PlanStatus::Planned && o.action == kind.action())
+            .filter(|o| o.status == PlanStatus::Planned && Approval::of(o) == Some(kind))
             .map(|o| o.id.clone())
             .collect()
     };
@@ -510,6 +514,18 @@ fn step_name(op: &Operation) -> &'static str {
         Action::Retire => "retire",
         Action::None => "none",
     }
+}
+
+/// The live file of a merge, as read under the lock.
+struct MergeRead {
+    live: Option<Vec<u8>>,
+    stamp: Option<crate::fsys::Stamp>,
+}
+
+/// What a merge will write and the salted hash to record (`None` for a retire).
+struct MergeDecision {
+    merged: Merged,
+    new_hash: Option<String>,
 }
 
 /// Facts read again immediately before the effect.
@@ -838,8 +854,7 @@ impl Exec<'_, '_> {
     /// A co-owned merge (`claude-settings/v1`, docs/apply.md "Merge"). The live file is read now,
     /// under the writer lock, and the result is made from THAT content. Only a salted hash of the
     /// managed fields is compared and recorded; no hash of the whole file exists anywhere.
-    /// Order: prerequisites, topology, re-read, merge, conflict check, salt, intent, publish
-    /// (identity guarded), read-back, outcome, ledger.
+    /// Three steps: [`Exec::merge_read`], [`Exec::merge_decide`], [`Exec::merge_settle`].
     fn try_merge(&mut self, op: &Operation) -> Result<Ended, Ended> {
         let rel = op
             .path
@@ -864,23 +879,34 @@ impl Exec<'_, '_> {
             .home
             .open_below(&self.run.sys, parents)
             .map_err(Ended::Blocked)?;
-        let retire = op.action == Action::Retire;
+        let read = self.merge_read(op, rel, &parent, name)?;
+        let decided = self.merge_decide(op, rel, &abs, &read)?;
+        self.merge_settle(op, rel, &abs, &parent, name, &read, decided)
+    }
+
+    /// Step 1, read: the live file under the lock. Nothing is decided here.
+    fn merge_read(
+        &self,
+        op: &Operation,
+        rel: &str,
+        parent: &Dir,
+        name: &str,
+    ) -> Result<MergeRead, Ended> {
         self.run.fail.hit("merge-before-read").map_err(failed)?;
-        let (live, stamp) = match (parent.read_live(&self.run.sys, name, MAX_FILE), op.action) {
-            (Err(e), _) => return Err(Ended::Blocked(e)),
-            (Ok(Live::Missing), Action::CreateFile) => (None, None),
-            (Ok(Live::Missing), _) => {
-                return Err(blocked(
-                    Code::Conflict,
-                    format!("{rel} is gone since the plan; it is not recreated by this operation"),
-                ));
-            }
-            (Ok(Live::File { .. }), Action::CreateFile) => {
-                return Err(blocked(
-                    Code::Conflict,
-                    format!("{rel} appeared before it could be created; it is left alone"),
-                ));
-            }
+        match (parent.read_live(&self.run.sys, name, MAX_FILE), op.action) {
+            (Err(e), _) => Err(Ended::Blocked(e)),
+            (Ok(Live::Missing), Action::CreateFile) => Ok(MergeRead {
+                live: None,
+                stamp: None,
+            }),
+            (Ok(Live::Missing), _) => Err(blocked(
+                Code::Conflict,
+                format!("{rel} is gone since the plan; it is not recreated by this operation"),
+            )),
+            (Ok(Live::File { .. }), Action::CreateFile) => Err(blocked(
+                Code::Conflict,
+                format!("{rel} appeared before it could be created; it is left alone"),
+            )),
             (Ok(Live::File { bytes, mode, stamp }), _) => {
                 if mode & 0o077 != 0 {
                     return Err(blocked(
@@ -890,32 +916,46 @@ impl Exec<'_, '_> {
                         ),
                     ));
                 }
-                (Some(bytes), Some(stamp))
+                Ok(MergeRead {
+                    live: Some(bytes),
+                    stamp: Some(stamp),
+                })
             }
-            (Ok(Live::Unusable(why)), _) => {
-                return Err(blocked(
-                    Code::Conflict,
-                    format!("{rel} {why}; it is left alone"),
-                ));
-            }
-            (Ok(Live::TooBig), _) => {
-                return Err(failed(Refusal::new(
-                    Code::LimitExceeded,
-                    format!("{rel} exceeds 16 MiB"),
-                )));
-            }
-        };
+            (Ok(Live::Unusable(why)), _) => Err(blocked(
+                Code::Conflict,
+                format!("{rel} {why}; it is left alone"),
+            )),
+            (Ok(Live::TooBig), _) => Err(failed(Refusal::new(
+                Code::LimitExceeded,
+                format!("{rel} exceeds 16 MiB"),
+            ))),
+        }
+    }
+
+    /// Step 2, decide: merge from the bytes just read, then the conflict check that plan time
+    /// uses too (`dfm_model::merge::check_foreign`). `retire` touches no managed field and skips
+    /// it. A conflict or a lost salt blocks and writes nothing.
+    fn merge_decide(
+        &self,
+        op: &Operation,
+        rel: &str,
+        abs: &str,
+        read: &MergeRead,
+    ) -> Result<MergeDecision, Ended> {
         let ledger = self.run.store.read_ledger_lenient().map_err(failed)?;
-        let recorded: Option<&CoOwned> = ledger
+        let recorded: Option<CoOwned> = ledger
             .resources
             .iter()
             .filter(|r| r.resource == op.resource)
             .flat_map(|r| &r.owned_outputs)
             .find(|o| o.path == abs)
-            .and_then(|o| o.coowned.as_ref());
+            .and_then(|o| o.coowned.clone());
         let inputs = GeneratorInputs {
-            live: live.clone(),
-            owned_entries: recorded.map(|c| c.entries.clone()).unwrap_or_default(),
+            live: read.live.clone(),
+            owned_entries: recorded
+                .as_ref()
+                .map(|c| c.entries.clone())
+                .unwrap_or_default(),
             ..GeneratorInputs::default()
         };
         let merged = match self.run.generator.merge(op, &inputs) {
@@ -925,49 +965,66 @@ impl Exec<'_, '_> {
             }
             Err(r) => return Err(failed(r)),
         };
-        // Conflict detection: a managed field changed outside the manager. Both sides are
-        // salted hashes of the managed fields only. A live value already equal to the declared
-        // one needs no overwrite, so it is accepted.
-        let salt_now = self.run.store.salt().map_err(failed)?;
-        if !retire && let Some(c) = recorded {
-            let salt = salt_now.as_deref().ok_or_else(|| {
-                failed(Refusal::new(
-                    Code::StateInvalid,
-                    "state/salt is missing but the ledger records a salted hash; the foreign-edit check cannot run. Fix: restore state/salt from a copy",
-                ))
+        let retire = op.action == Action::Retire;
+        let salt = match self.run.store.salt() {
+            Ok(s) => s,
+            Err(e) if recorded.is_some() => return Err(Ended::Blocked(e)),
+            Err(e) => return Err(failed(e)),
+        };
+        if !retire {
+            check_foreign(
+                read.live.is_some(),
+                recorded.as_ref(),
+                salt.as_deref(),
+                &merged,
+            )
+            .map_err(|e| {
+                let e = Refusal::new(e.code, format!("{rel}: {}", e.detail));
+                Ended::Blocked(e)
             })?;
-            if salted(salt, &merged.live_view) != c.managed_hash
-                && merged.live_view != merged.rendered_view
-            {
-                return Err(blocked(
-                    Code::Conflict,
-                    format!(
-                        "a managed field of {rel} was changed outside the manager since the last apply; nothing was changed. Fix: restore the declared value in the file, or set the same value in the module so the manager adopts your edit"
-                    ),
-                ));
-            }
         }
         let new_hash = if retire {
             None
         } else {
-            let salt = match salt_now {
+            let salt = match salt {
                 Some(s) => s,
                 None => self.run.store.salt_or_create().map_err(failed)?,
             };
             Some(salted(&salt, &merged.rendered_view))
         };
+        Ok(MergeDecision { merged, new_hash })
+    }
+
+    /// Step 3, settle: intent, publish, read-back, outcome, ledger.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "one settle needs the facts of the two steps before it"
+    )]
+    fn merge_settle(
+        &mut self,
+        op: &Operation,
+        rel: &str,
+        abs: &str,
+        parent: &Dir,
+        name: &str,
+        read: &MergeRead,
+        decided: MergeDecision,
+    ) -> Result<Ended, Ended> {
+        let MergeDecision { merged, new_hash } = decided;
+        let retire = op.action == Action::Retire;
         let id = self.attempt_id(op);
         let recovery = Recovery {
             outputs: vec![RecoveryOutput {
-                path: abs.clone(),
-                existed_before: live.is_some(),
+                path: abs.to_string(),
+                existed_before: read.live.is_some(),
                 expected_sha256: None,
             }],
             snapshot: None,
         };
         self.journal(op, &id, Phase::Intent, Some(recovery), None)
             .map_err(|e| Ended::Failed(e, Some(id.clone())))?;
-        let effect = self.merge_effect(rel, &parent, name, stamp, &merged.bytes, merged.changed);
+        let effect =
+            self.merge_effect(rel, parent, name, read.stamp, &merged.bytes, merged.changed);
         if let Err(e) = effect {
             let unconfirmed = e.code == Code::IoUnconfirmed;
             let why: String = dfm_model::display::visible(&e.detail)
@@ -987,23 +1044,27 @@ impl Exec<'_, '_> {
                     format!("{why}; the outcome could not be journaled: {}", n.detail),
                 ),
             };
-            return Err(self.after_intent(e, &id, &abs));
+            return Err(self.after_intent(e, &id, abs));
         }
         let settled = self
             .journal(op, &id, Phase::Done, None, None)
             .and_then(|()| self.run.fail.hit("apply-after-done"))
             .and_then(|()| match &new_hash {
-                None => self.forget_output(op, &id, &abs),
-                Some(h) => self.record_coowned(op, &id, &abs, h, merged.entries.clone()),
+                None => self.forget_output(op, &id, abs),
+                Some(h) => self.record_coowned(op, &id, abs, h, merged.entries.clone()),
             });
         if let Err(e) = settled {
-            return Err(self.after_intent(e, &id, &abs));
+            return Err(self.after_intent(e, &id, abs));
         }
         Ok(Ended::Updated {
             id,
             before: None,
             after: None,
-            owned: if retire { Vec::new() } else { vec![abs] },
+            owned: if retire {
+                Vec::new()
+            } else {
+                vec![abs.to_string()]
+            },
             reload: merged.changed.then(|| RELOAD_NOT_ATTEMPTED.to_string()),
         })
     }

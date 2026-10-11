@@ -138,11 +138,14 @@ The window between the last read and the ledger write stays open. A process of t
 
 A sensitive co-owned file (`claude-settings/v1`, docs/adapters.md) runs through `try_merge`, not the normal path. There is no output hash, no `path:` content hash and no ledger fingerprint. For one operation, in this order:
 
+0. **Approval.** An operation with `takeover = true` (the first write into an existing co-owned file with no ledger entry) needs `--allow-adopt '<id>'` like an adoption. It is part of the gates: without it apply exits 3 with `E_ADOPT_UNAPPROVED` before any write. The receipt records `how = allow_adopt`. For a sensitive operation the receipt validator accepts a published file (a `reload` state) and no `after`.
 1. **Prerequisites** as for any operation. The `path:` precondition of a sensitive file holds its mode and no hash or size.
 2. **Topology**: the parent chain is opened without following a link.
 3. **Re-read under the lock** (`Dir::read_live`): one descriptor opened without following a link. The file must be regular, owned by the user, with one hard link, at most 16 MiB, and the stamp before and after the read must agree (device, inode, size, modification time, change time). A mode open to group or others is `E_CONFLICT` (blocked, exit 3). The failpoint `merge-before-read` sits before this read.
 4. **Merge** (`Generator::merge`) with `GeneratorInputs.live` (the bytes just read, or `None`) and `owned_entries` (from the ledger). A malformed or foreign-shaped file is `E_CONFLICT` and blocks. The result is made from the bytes just read, not from the plan-time file.
-5. **Conflict check**: the salted hash of the live managed fields against the ledger (docs/adapters.md, "Conflict detection"). A foreign edit is `E_CONFLICT`, blocked, nothing written. `retire` skips this check: it touches no managed field.
+5. **Conflict check**: `dfm_model::merge::check_foreign`, the same function plan time uses (docs/adapters.md, "Conflict detection"). A foreign edit is `E_CONFLICT`, blocked, nothing written. A lost salt with a recorded hash is `E_STATE_INVALID`, blocked. An absent live file skips the comparison. `retire` skips the check: it touches no managed field.
+
+The code is three functions: `merge_read`, `merge_decide` and `merge_settle`.
 6. **Salt**: `state/salt` is created now if it does not exist (docs/state.md).
 7. **Intent**: the journal gets an `intent` entry with `existed_before` and no expected hash.
 8. **Effect**: if the bytes differ from the live file, publish them. A new file uses `linkat`, which never replaces. An existing file uses `renameat` after a last identity check (`Publish::ReplaceStamp`). If the bytes are equal nothing is written, and the ledger is still updated. The failpoints are `apply-before-effect`, `file-after-tmp` and `apply-after-effect`.

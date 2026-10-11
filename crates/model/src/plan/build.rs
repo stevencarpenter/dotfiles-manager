@@ -548,6 +548,7 @@ impl Planner<'_> {
             fragment_dir: None,
             output_sha256: None,
             managed_sha256: None,
+            takeover: false,
             output_bytes: None,
             sets: Vec::new(),
             after: Vec::new(),
@@ -817,14 +818,24 @@ impl Planner<'_> {
                 format!("{shown} already holds the merge result{what}"),
                 post,
             )),
+            Some(MergeVerdict::Write) if !owned => {
+                // The first write into an existing file the ledger does not record. The owner
+                // approves it by id (`--allow-adopt`): hand edits of managed fields are lost.
+                op.takeover = true;
+                Ok((
+                    Action::UpdateFile,
+                    Status::Planned,
+                    Ownership::Foreign,
+                    format!(
+                        "take over managed fields of an existing file {shown}; foreign keys are kept; hand edits of managed fields are overwritten{what}"
+                    ),
+                    post,
+                ))
+            }
             Some(MergeVerdict::Write) => Ok((
                 Action::UpdateFile,
                 Status::Planned,
-                if owned {
-                    Ownership::Owned
-                } else {
-                    Ownership::Foreign
-                },
+                Ownership::Owned,
                 format!(
                     "merge into {shown}: managed values set, seeds only if absent, owned handlers added; foreign keys and hooks stay{what}"
                 ),
@@ -863,6 +874,7 @@ impl Planner<'_> {
             fragment_dir: None,
             output_sha256: None,
             managed_sha256: None,
+            takeover: false,
             output_bytes: None,
             sets: Vec::new(),
             after: Vec::new(),
