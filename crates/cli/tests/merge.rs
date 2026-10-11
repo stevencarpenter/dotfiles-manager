@@ -1197,3 +1197,590 @@ fn a_merge_that_ends_unknown_stays_open_is_never_auto_owned_and_clears_only_by_h
     assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
     assert!(fx.live_json().get("hooks").is_none(), "{}", fx.live_json());
 }
+
+// ---- parity with the nix merge (DFM-48) --------------------------------------------------
+//
+// The fixture is `examples/base/modules/claude-base`: the shape of the base settings file the
+// nix merge starts from, with placeholder values. These tests port the cases of
+// `test-claude-settings-order.sh` and `test-claude-hooks-preservation.sh` that the manager's
+// rules share. Two cases do not carry over: nix sweeps unrecorded hooks by command marker, and
+// the manager removes only entries its ledger records (docs/adapters.md, rule 4); nix keeps the
+// first-seen key order, and the manager writes sorted keys (rule 7).
+
+const BASE_MODULE: &str = include_str!("../../../examples/base/modules/claude-base/module.toml");
+const BASE_ID: &str = "claude-base.claude-settings";
+
+impl Fx {
+    /// Selects the `claude-base` fixture instead of `agents`.
+    fn base() -> Fx {
+        let fx = Fx::new();
+        fx.put("base/modules/claude-base/module.toml", BASE_MODULE);
+        fx.put(
+            "base/bundle.toml",
+            &BUNDLE.replace(
+                "agents = \"modules/agents/module.toml\"",
+                "agents = \"modules/agents/module.toml\"\nclaude-base = \"modules/claude-base/module.toml\"",
+            ),
+        );
+        fx.set_profile("\"claude-base\"");
+        fx
+    }
+
+    fn base_module(&self, f: impl FnOnce(String) -> String) {
+        let p = self.root.join("base/modules/claude-base/module.toml");
+        fs::write(&p, f(fs::read_to_string(&p).unwrap())).unwrap();
+    }
+
+    fn fragment(&self, name: &str, content: &str) {
+        let d = self.h(".claude/settings.d");
+        fs::create_dir_all(&d).unwrap();
+        fs::write(d.join(name), content).unwrap();
+    }
+
+    fn coowned_of(&self, id: &str) -> serde_json::Value {
+        self.ledger()["resources"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["resource"] == id)
+            .map(|r| r["owned_outputs"][0].clone())
+            .unwrap_or_else(|| panic!("no ledger entry for {id}"))
+    }
+}
+
+fn commands(j: &serde_json::Value, event: &str) -> Vec<String> {
+    j["hooks"][event]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .flat_map(|g| g["hooks"].as_array().cloned().unwrap_or_default())
+                .filter_map(|h| h["command"].as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn allow_write(j: &serde_json::Value) -> Vec<String> {
+    serde_json::from_value(j["sandbox"]["filesystem"]["allowWrite"].clone()).unwrap_or_default()
+}
+
+#[test]
+fn the_fixture_creates_every_shape_of_the_base_settings_file() {
+    let fx = Fx::base();
+    let o = fx.apply();
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+    let j = fx.live_json();
+    assert_eq!(j["env"]["EXAMPLE_FEATURE_FLAG"], "1");
+    assert_eq!(j["permissions"]["defaultMode"], "auto");
+    assert_eq!(j["statusLine"]["type"], "command");
+    assert_eq!(
+        j["enabledPlugins"]["example-experiment@example-marketplace"],
+        false
+    );
+    assert_eq!(j["skillOverrides"]["example-skill"], "off");
+    assert_eq!(
+        j["extraKnownMarketplaces"]["example-marketplace"]["source"]["repo"],
+        "example-org/example-marketplace"
+    );
+    assert_eq!(j["outputStyle"], "STE");
+    assert_eq!(j["verbose"], false);
+    assert_eq!(j["model"], "example-model");
+    assert_eq!(j["effortLevel"], "high");
+    assert_eq!(allow_write(&j).len(), 3);
+    let pre = &j["hooks"]["PreToolUse"][0];
+    assert_eq!(pre["matcher"], "Bash");
+    assert_eq!(
+        pre["hooks"][0]["command"],
+        "\"${HOME}/.claude/hooks/no-em-dash-commit.sh\""
+    );
+    assert_eq!(j["hooks"]["SubagentStop"].as_array().unwrap().len(), 2);
+    assert_eq!(j["hooks"]["SessionEnd"][0]["hooks"][0]["timeout"], 20);
+    assert_eq!(fx.mode(), 0o600);
+    // A rerun changes nothing and writes no receipt.
+    let receipts = fx.receipts();
+    let o = fx.apply();
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    assert_eq!(fx.receipts(), receipts);
+    assert!(text(&o.stdout).contains("updated=0"), "{}", text(&o.stdout));
+}
+
+#[test]
+fn a_plugin_the_user_enabled_in_claude_code_survives_apply() {
+    let fx = Fx::base();
+    fx.live(
+        r#"{"enabledPlugins":{"foo@elsewhere":true,"example-tools@example-marketplace":false},"env":{"MY_VAR":"1"}}"#,
+    );
+    let o = fx.apply();
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+    let j = fx.live_json();
+    assert_eq!(
+        j["enabledPlugins"]["foo@elsewhere"], true,
+        "foreign leaf survives"
+    );
+    assert_eq!(
+        j["enabledPlugins"]["example-tools@example-marketplace"], true,
+        "a managed leaf wins"
+    );
+    assert_eq!(j["env"]["MY_VAR"], "1");
+    assert_eq!(j["env"]["EXAMPLE_MAX_WORKERS"], "64");
+    // The user enables another plugin later. That is no foreign edit of a managed field.
+    let mut j = fx.live_json();
+    j["enabledPlugins"]["later@elsewhere"] = serde_json::json!(true);
+    fx.live(&serde_json::to_string(&j).unwrap());
+    let o = fx.plan();
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+    let o = fx.apply();
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+    assert_eq!(fx.live_json()["enabledPlugins"]["later@elsewhere"], true);
+}
+
+#[test]
+fn a_user_sandbox_path_survives_and_the_declared_ones_are_appended_once() {
+    let fx = Fx::base();
+    fx.live(
+        r#"{"sandbox":{"filesystem":{"allowWrite":["/user/path","~/projects/example"],"denyRead":["/x"]},"enabled":true}}"#,
+    );
+    assert_eq!(code(&fx.apply()), 0);
+    let aw = allow_write(&fx.live_json());
+    assert_eq!(
+        aw,
+        [
+            "/user/path",
+            "~/projects/example",
+            "~/.cache/example-tool",
+            "~/.local/share/example/tools"
+        ],
+        "user paths stay, an identical path is not duplicated, the rest are appended in order"
+    );
+    assert_eq!(fx.live_json()["sandbox"]["filesystem"]["denyRead"][0], "/x");
+    assert_eq!(fx.live_json()["sandbox"]["enabled"], true);
+    assert_eq!(code(&fx.apply()), 0);
+    assert_eq!(allow_write(&fx.live_json()), aw, "a rerun appends nothing");
+    // The file existed, so this was the approved take-over: every declared item already in place
+    // is recorded as owned with the two the manager added (docs/adapters.md, rule 4).
+    let c = fx.coowned_of(BASE_ID);
+    assert_eq!(c["coowned"]["appended"].as_array().unwrap().len(), 3);
+    assert_eq!(
+        c["coowned"]["appended"][0]["pointer"],
+        "/sandbox/filesystem/allowWrite"
+    );
+}
+
+#[test]
+fn a_dropped_declared_path_is_removed_and_a_user_path_is_not() {
+    let fx = Fx::base();
+    fx.live(r#"{"sandbox":{"filesystem":{"allowWrite":["/user/path"]}}}"#);
+    assert_eq!(code(&fx.apply()), 0);
+    fx.base_module(|m| m.replace(r#""~/projects/example", "#, ""));
+    assert_eq!(code(&fx.apply()), 0);
+    let aw = allow_write(&fx.live_json());
+    assert_eq!(
+        aw,
+        [
+            "/user/path",
+            "~/.cache/example-tool",
+            "~/.local/share/example/tools"
+        ]
+    );
+    // The user adds a path of their own, then deselects the module: only ours go.
+    let mut j = fx.live_json();
+    j["sandbox"]["filesystem"]["allowWrite"]
+        .as_array_mut()
+        .unwrap()
+        .push(serde_json::json!("/user/second"));
+    fx.live(&serde_json::to_string(&j).unwrap());
+    fx.set_profile("");
+    let o = fx.apply();
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+    assert_eq!(
+        allow_write(&fx.live_json()),
+        ["/user/path", "/user/second"],
+        "retire removes the appended items and keeps the user's"
+    );
+}
+
+#[test]
+fn a_retired_managed_hook_is_removed_and_a_foreign_hook_stays() {
+    let fx = Fx::base();
+    fx.live(
+        r#"{"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"/opt/other/agent-state.sh"}]}],
+        "Stop":[{"hooks":[{"type":"command","command":"/opt/other/stop.sh"}]}]}}"#,
+    );
+    assert_eq!(code(&fx.apply()), 0);
+    assert_eq!(commands(&fx.live_json(), "Stop").len(), 2);
+    // The module drops the Stop handler: the manager removes its entry and nothing else.
+    fx.base_module(|m| {
+        let i = m.find("[resources.value.handlers.journal-stop]").unwrap();
+        let j = m[i..]
+            .find("[resources.value.handlers.journal-subagent-stop]")
+            .unwrap();
+        format!("{}{}", &m[..i], &m[i + j..])
+    });
+    let o = fx.apply();
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+    let j = fx.live_json();
+    assert_eq!(commands(&j, "Stop"), ["/opt/other/stop.sh"]);
+    assert_eq!(commands(&j, "SessionStart"), ["/opt/other/agent-state.sh"]);
+    assert_eq!(commands(&j, "WorktreeCreate").len(), 1, "the others stay");
+}
+
+#[test]
+fn foreign_hooks_of_any_type_and_their_group_metadata_survive() {
+    let fx = Fx::base();
+    fx.live(
+        r#"{"hooks":{"PreToolUse":[{"matcher":"Write","hooks":[
+          {"type":"command","command":"/opt/herdr/pre.sh"},
+          {"type":"prompt","prompt":"Review this write"},
+          {"type":"agent","prompt":"Validate this write"},
+          {"type":"http","url":"https://localhost/hook"},
+          {"type":"mcp_tool","server":"guard","tool":"check","input":{"path":"x"}}]}]}}"#,
+    );
+    assert_eq!(code(&fx.apply()), 0);
+    let j = fx.live_json();
+    let groups = j["hooks"]["PreToolUse"].as_array().unwrap();
+    assert_eq!(
+        groups.len(),
+        2,
+        "the managed group is added beside the foreign one"
+    );
+    assert_eq!(groups[0]["matcher"], "Write");
+    let mut types: Vec<&str> = groups[0]["hooks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|h| h["type"].as_str().unwrap())
+        .collect();
+    types.sort_unstable();
+    assert_eq!(types, ["agent", "command", "http", "mcp_tool", "prompt"]);
+    let managed: Vec<_> = groups.iter().filter(|g| g["matcher"] == "Bash").collect();
+    assert_eq!(managed.len(), 1, "the managed hook is present exactly once");
+    assert_eq!(code(&fx.apply()), 0);
+    assert_eq!(
+        fx.live_json()["hooks"]["PreToolUse"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+}
+
+#[test]
+fn a_changed_handler_replaces_the_old_entry_and_no_stale_one_remains() {
+    let fx = Fx::base();
+    assert_eq!(code(&fx.apply()), 0);
+    fx.base_module(|m| m.replace("wt-create.sh", "wt-create-v2.sh"));
+    assert_eq!(code(&fx.apply()), 0);
+    let cmds = commands(&fx.live_json(), "WorktreeCreate");
+    assert_eq!(cmds, ["\"${HOME}/.claude/hooks/wt-create-v2.sh\""]);
+}
+
+#[test]
+fn keys_the_managed_block_never_sets_keep_their_values() {
+    let fx = Fx::base();
+    fx.live(
+        r#"{"$schema":"https://json.schemastore.org/claude-code-settings.json","model":"haiku","theme":"dark","editorMode":"vim","effortLevel":"medium","permissions":{"defaultMode":"acceptEdits"},"teammateMode":"tmux","voiceEnabled":true,"sandbox":{"filesystem":{"allowWrite":["/fixture/user-write"]}}}"#,
+    );
+    assert_eq!(code(&fx.apply()), 0);
+    let j = fx.live_json();
+    for (k, v) in [
+        ("theme", "dark"),
+        ("editorMode", "vim"),
+        ("model", "haiku"),
+        ("effortLevel", "medium"),
+    ] {
+        assert_eq!(j[k], v, "in-tool key {k} was changed");
+    }
+    assert_eq!(j["voiceEnabled"], true);
+    assert_eq!(j["teammateMode"], "tmux");
+    assert!(allow_write(&j).contains(&"/fixture/user-write".to_string()));
+    // `permissions.defaultMode` is managed: the declared value wins over the live one.
+    assert_eq!(j["permissions"]["defaultMode"], "auto");
+}
+
+#[test]
+fn seeds_apply_only_when_absent_and_a_later_in_tool_choice_stays() {
+    let fx = Fx::base();
+    fx.live(r#"{"model":"mine"}"#);
+    assert_eq!(code(&fx.apply()), 0);
+    let j = fx.live_json();
+    assert_eq!(j["model"], "mine");
+    assert_eq!(j["effortLevel"], "high");
+    let mut j = fx.live_json();
+    j["effortLevel"] = serde_json::json!("low");
+    fx.live(&serde_json::to_string(&j).unwrap());
+    assert_eq!(code(&fx.apply()), 0);
+    assert_eq!(fx.live_json()["effortLevel"], "low");
+}
+
+#[test]
+fn a_fragment_overrides_a_base_value_and_adds_keys() {
+    let fx = Fx::base();
+    fx.fragment(
+        "10-local.json",
+        r#"{"outputStyle":"plain","env":{"EXAMPLE_MAX_WORKERS":"8","FROM_FRAGMENT":"1"},"fragmentKey":true}"#,
+    );
+    fx.fragment("20-later.json", r#"{"env":{"FROM_FRAGMENT":"2"}}"#);
+    let plan = fx.plan();
+    let out = text(&plan.stdout);
+    assert_eq!(code(&plan), 0, "{}\n{out}", stderr(&plan));
+    assert!(
+        out.contains("fragments: 10-local.json, 20-later.json"),
+        "{out}"
+    );
+    assert!(
+        out.contains("env.FROM_FRAGMENT") && out.contains("fragmentKey"),
+        "{out}"
+    );
+    assert!(!out.contains("plain"), "no value is shown");
+    assert_eq!(code(&fx.apply()), 0);
+    let j = fx.live_json();
+    assert_eq!(j["outputStyle"], "plain");
+    assert_eq!(j["env"]["EXAMPLE_MAX_WORKERS"], "8");
+    assert_eq!(j["env"]["FROM_FRAGMENT"], "2", "the later name wins");
+    assert_eq!(j["env"]["EXAMPLE_FEATURE_FLAG"], "1", "base leaves stay");
+    assert_eq!(j["fragmentKey"], true);
+    // The plan JSON lists each fragment with its hash. The hash is of the fragment file.
+    let saved = fx.saved();
+    let op = saved
+        .plan
+        .operations
+        .iter()
+        .find(|o| o.managed_sha256.is_some())
+        .unwrap();
+    let names: Vec<&str> = op.fragments.iter().map(|f| f.name.as_str()).collect();
+    assert_eq!(names, ["10-local.json", "20-later.json"]);
+    assert!(
+        op.fragments
+            .iter()
+            .all(|f| f.origin == "foreign" && f.sha256.is_some())
+    );
+    // The managed fields include the fragments: editing a fragment value is not a conflict,
+    // and editing the live value of a fragment key is one.
+    assert_eq!(code(&fx.plan()), 0);
+    let mut j = fx.live_json();
+    j["fragmentKey"] = serde_json::json!(false);
+    fx.live(&serde_json::to_string(&j).unwrap());
+    let o = fx.plan();
+    assert_eq!(code(&o), 3, "{}\n{}", stderr(&o), text(&o.stdout));
+}
+
+#[test]
+fn removing_a_fragment_restores_the_base_value_on_the_next_apply() {
+    let fx = Fx::base();
+    fx.fragment("10-local.json", r#"{"outputStyle":"plain"}"#);
+    assert_eq!(code(&fx.apply()), 0);
+    assert_eq!(fx.live_json()["outputStyle"], "plain");
+    fs::remove_file(fx.h(".claude/settings.d/10-local.json")).unwrap();
+    // The live value still equals what the manager wrote, so it is no foreign edit: the next
+    // apply writes the base value again.
+    let o = fx.plan();
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+    assert_eq!(code(&fx.apply()), 0);
+    assert_eq!(fx.live_json()["outputStyle"], "STE");
+}
+
+#[test]
+fn a_malformed_fragment_blocks_with_nothing_written_and_no_content_shown() {
+    let fx = Fx::base();
+    assert_eq!(code(&fx.apply()), 0);
+    let before = fs::read(fx.settings()).unwrap();
+    let receipts = fx.receipts();
+    fx.fragment("01-good.json", r#"{"goodKey":true}"#);
+    fx.fragment("02-bad.json", &format!("{{\"k\": \"{TOKEN}\" oops"));
+    let o = fx.plan();
+    let all = format!("{}{}", text(&o.stdout), stderr(&o));
+    assert_eq!(code(&o), 3, "{all}");
+    assert!(
+        all.contains("E_CONFLICT") && all.contains("02-bad.json"),
+        "{all}"
+    );
+    assert!(!all.contains(TOKEN), "no fragment content is shown");
+    let d = fx.saved().plan_digest;
+    let o = fx.apply_with(&d);
+    let all = format!("{}{}", text(&o.stdout), stderr(&o));
+    assert_ne!(code(&o), 0, "{all}");
+    assert!(!all.contains(TOKEN));
+    assert_eq!(
+        fs::read(fx.settings()).unwrap(),
+        before,
+        "the last good file stays"
+    );
+    assert_eq!(fx.receipts(), receipts);
+    // Fixing the fragment unblocks the next run.
+    fx.fragment("02-bad.json", r#"{"fixed":true}"#);
+    assert_eq!(code(&fx.apply()), 0);
+    let j = fx.live_json();
+    assert_eq!(
+        (j["goodKey"].clone(), j["fixed"].clone()),
+        (true.into(), true.into())
+    );
+}
+
+#[test]
+fn a_fragment_that_is_not_an_object_or_sets_hooks_blocks() {
+    for (content, why) in [
+        ("[1,2]", "not an object"),
+        (r#"{"hooks":{}}"#, "sets hooks"),
+    ] {
+        let fx = Fx::base();
+        fx.fragment("01-x.json", content);
+        let o = fx.plan();
+        let all = format!("{}{}", text(&o.stdout), stderr(&o));
+        assert_eq!(code(&o), 3, "{all}");
+        assert!(all.contains("01-x.json") && all.contains(why), "{all}");
+        assert!(!fx.settings().exists());
+    }
+}
+
+#[test]
+fn a_fragment_that_changes_between_plan_and_apply_is_stale() {
+    let fx = Fx::base();
+    fx.fragment("10-a.json", r#"{"fragmentKey":1}"#);
+    let d = fx.saved().plan_digest;
+    fx.fragment("10-a.json", r#"{"fragmentKey":2}"#);
+    let o = fx.apply_with(&d);
+    assert_ne!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+    assert!(stderr(&o).contains("E_PLAN_STALE"), "{}", stderr(&o));
+    assert!(!fx.settings().exists(), "nothing was written");
+    // A fragment that appears after the plan is stale too.
+    let d = fx.saved().plan_digest;
+    fx.fragment("11-new.json", r#"{"added":true}"#);
+    let o = fx.apply_with(&d);
+    assert_ne!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+    assert!(stderr(&o).contains("E_PLAN_STALE"), "{}", stderr(&o));
+    assert!(!fx.settings().exists());
+}
+
+#[test]
+fn a_fragment_made_by_a_link_resource_is_layered_like_a_user_fragment() {
+    let fx = Fx::base();
+    fx.put(
+        "base/modules/claude-base/files/20-module.json",
+        r#"{"fromModule":"yes","env":{"EXAMPLE_MAX_WORKERS":"2"}}"#,
+    );
+    fx.base_module(|m| {
+        format!(
+            "{m}\n[[resources]]\nid = \"fragment\"\nkind = \"link\"\nadapter = \"fs-link/v1\"\ntarget = \".claude/settings.d/20-module.json\"\n[resources.value]\nsource = \"files/20-module.json\"\n"
+        )
+    });
+    let o = fx.plan();
+    let out = text(&o.stdout);
+    assert_eq!(code(&o), 0, "{}\n{out}", stderr(&o));
+    assert!(out.contains("fragments: 20-module.json"), "{out}");
+    let o = fx.apply();
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+    let j = fx.live_json();
+    assert_eq!(j["fromModule"], "yes");
+    assert_eq!(j["env"]["EXAMPLE_MAX_WORKERS"], "2");
+    let receipts = fx.receipts();
+    let o = fx.apply();
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    assert_eq!(fx.receipts(), receipts, "a rerun changes nothing");
+}
+
+#[test]
+fn a_managed_object_over_a_foreign_scalar_blocks_and_the_file_is_unchanged() {
+    // The nix normalization keeps the existing file when `sandbox.filesystem` has the wrong type.
+    for live in [
+        r#"{"sandbox":{"filesystem":"invalid"}}"#,
+        r#"{"sandbox":{"filesystem":{"allowWrite":"PLANTED-TOKEN-7f3a9c"}}}"#,
+        r#"{"env":"PLANTED-TOKEN-7f3a9c"}"#,
+    ] {
+        let fx = Fx::base();
+        fx.live(live);
+        let o = fx.plan();
+        let all = format!("{}{}", text(&o.stdout), stderr(&o));
+        assert_eq!(code(&o), 3, "{live}: {all}");
+        assert!(all.contains("E_CONFLICT") && !all.contains(TOKEN), "{all}");
+        let d = fx.saved().plan_digest;
+        let o = fx.run(&["apply", "--root", fx.root_arg(), "--yes-plan", &d]);
+        assert_ne!(code(&o), 0);
+        assert_eq!(fs::read_to_string(fx.settings()).unwrap(), live);
+    }
+}
+
+#[test]
+fn a_hand_edit_of_a_nested_managed_leaf_is_a_conflict_and_a_new_sibling_is_not() {
+    let fx = Fx::base();
+    assert_eq!(code(&fx.apply()), 0);
+    let mut j = fx.live_json();
+    j["env"]["MY_NEW_VAR"] = serde_json::json!("1");
+    fx.live(&serde_json::to_string(&j).unwrap());
+    assert_eq!(code(&fx.plan()), 0, "a sibling the user added is no edit");
+    j["env"]["EXAMPLE_FEATURE_FLAG"] = serde_json::json!("0");
+    fx.live(&serde_json::to_string(&j).unwrap());
+    let o = fx.plan();
+    assert_eq!(code(&o), 3, "{}", stderr(&o));
+    assert!(stderr(&o).contains("E_CONFLICT"));
+}
+
+#[test]
+fn a_take_over_of_an_existing_file_records_only_the_items_it_added() {
+    let fx = Fx::base();
+    fx.live(r#"{"sandbox":{"filesystem":{"allowWrite":["~/.cache/example-tool"]}},"foo":1}"#);
+    let saved = fx.saved();
+    assert!(saved.plan.operations.iter().any(|o| o.takeover));
+    // Without the flag the apply is refused.
+    let o = fx.apply_bare();
+    assert_eq!(code(&o), 3, "{}", stderr(&o));
+    // With the flag every identical item already in place is recorded as owned (rule 4).
+    assert_eq!(code(&fx.apply()), 0);
+    let c = fx.coowned_of(BASE_ID);
+    assert_eq!(c["coowned"]["appended"].as_array().unwrap().len(), 3);
+}
+
+#[test]
+fn no_foreign_nested_content_reaches_any_output_or_state_file() {
+    let fx = Fx::base();
+    fx.live(&format!(
+        r#"{{"env":{{"SECRET":"{TOKEN}"}},"enabledPlugins":{{"x@y":true}},"mcpServers":{{"s":{{"headers":{{"Authorization":"Bearer {TOKEN}"}}}}}},"sandbox":{{"filesystem":{{"allowWrite":["/{TOKEN}"]}}}}}}"#
+    ));
+    fx.fragment("10-a.json", r#"{"fragmentKey":true}"#);
+    let mut seen = String::new();
+    for args in [
+        vec!["plan", "--root", fx.root_arg()],
+        vec!["plan", "--root", fx.root_arg(), "--json"],
+    ] {
+        let o = fx.run(&args);
+        seen.push_str(&text(&o.stdout));
+        seen.push_str(&stderr(&o));
+    }
+    let o = fx.apply();
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+    seen.push_str(&text(&o.stdout));
+    seen.push_str(&stderr(&o));
+    for args in [
+        vec!["doctor", "--root", fx.root_arg()],
+        vec!["status", "--root", fx.root_arg()],
+        vec!["plan", "--root", fx.root_arg()],
+    ] {
+        let o = fx.run(&args);
+        seen.push_str(&text(&o.stdout));
+        seen.push_str(&stderr(&o));
+    }
+    assert!(
+        !seen.contains(TOKEN),
+        "a foreign value appeared in command output"
+    );
+    let hash = fx.coowned_of(BASE_ID)["coowned"]["managed_hash"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        !seen.contains(&hash),
+        "the salted hash appeared in command output"
+    );
+    for f in files_below(&fx.state()) {
+        let name = f.file_name().unwrap().to_string_lossy().into_owned();
+        let t = String::from_utf8_lossy(&fs::read(&f).unwrap()).into_owned();
+        assert!(!t.contains(TOKEN), "{name} holds foreign content");
+        if name != "ledger.json" {
+            assert!(!t.contains(&hash), "{name} holds the salted hash");
+        }
+    }
+    assert!(
+        fs::read_to_string(fx.state().join("ledger.json"))
+            .unwrap()
+            .contains(&hash)
+    );
+}
