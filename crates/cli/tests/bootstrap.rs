@@ -1627,3 +1627,46 @@ fn the_command_link_is_staged_before_current_flips() {
         Path::new(&format!("versions/0.1.0-{}", &second[..12]))
     );
 }
+
+#[test]
+fn a_symlinked_bin_directory_is_refused_before_the_command_link_is_staged() {
+    let (tmp, home, src, sha) = refusal_setup("bin-link");
+    let outside = victim(tmp.path(), &["bin"]);
+    std::os::unix::fs::symlink(outside.join("bin"), home.join(".local/bin")).unwrap();
+    let o = install_tiny(&home, &src, &sha);
+    assert_eq!(o.status.code(), Some(3), "{}", err(&o));
+    assert!(
+        err(&o).contains("E_PREREQ_MISSING") && err(&o).contains("symlink"),
+        "{}",
+        err(&o)
+    );
+    assert_victim_intact(&outside, &["bin"]);
+    assert_eq!(fs::read_dir(outside.join("bin")).unwrap().count(), 1);
+    assert!(!home.join(".cache").exists());
+}
+
+#[test]
+#[ignore = "needs crates.io"]
+fn the_data_directories_are_checked_again_before_the_late_removals() {
+    let p = prepare("late-recheck");
+    let outside = victim(p.tmp.path(), &["cargo-home"]);
+    // After the swap, the directory about to be removed becomes a link to real data.
+    let hook = p.tmp.path().join("hook.sh");
+    fs::write(
+        &hook,
+        format!(
+            "rm -rf '{0}/cargo-home' && ln -s '{1}' '{0}/cargo-home'\n",
+            p.data.display(),
+            outside.join("cargo-home").display()
+        ),
+    )
+    .unwrap();
+    let o = install(
+        &p,
+        &p.sha,
+        &[("DFM_TEST_AFTER_SWAP", hook.to_str().unwrap())],
+    );
+    assert_eq!(o.status.code(), Some(3), "{}", err(&o));
+    assert!(err(&o).contains("E_PREREQ_MISSING"), "{}", err(&o));
+    assert_victim_intact(&outside, &["cargo-home"]);
+}

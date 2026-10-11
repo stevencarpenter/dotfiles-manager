@@ -467,14 +467,22 @@ check_command_path() {
 # link inside a directory that mktemp -d just made, so no name that existed before is touched,
 # and is renamed into place. A link that exists before `current` does is harmless: it dangles.
 ensure_command_link() {
-  link=$HOME_DIR/.local/bin/dotfiles-manager
+  link=$HOME_DIR/.local/bin/dotfiles-manager; want=$DATA/current/dotfiles-manager
   [ ! -L "$link" ] || return 0
+  check_bin_dir
   link_dir=$(mktemp -d "$HOME_DIR/.local/bin/.dotfiles-manager-link.XXXXXX") || { echo "error: cannot stage the command link" >&2; exit 1; }
-  if ln -s "$DATA/current/dotfiles-manager" "$link_dir/link" && mv -fh "$link_dir/link" "$link"; then
-    rmdir "$link_dir"
+  ln -s "$want" "$link_dir/link" || { rm -rf "$link_dir"; echo "error: cannot stage the command link" >&2; exit 1; }
+  # Test the destination again right before the rename: mv would move the link into a directory
+  # that appeared since the first check, or replace a link that is not ours.
+  if [ -L "$link" ]; then
+    [ "$(readlink "$link")" = "$want" ] || { rm -rf "$link_dir"; refuse E_PREREQ_MISSING "$link appeared and points elsewhere; move it away first"; }
+  elif [ -e "$link" ]; then
+    rm -rf "$link_dir"; refuse E_PREREQ_MISSING "$link appeared and is not a symlink; move it away first"
   else
-    rm -rf "$link_dir"; echo "error: cannot create the command link" >&2; exit 1
+    mv -fh "$link_dir/link" "$link" || { rm -rf "$link_dir"; echo "error: cannot create the command link" >&2; exit 1; }
   fi
+  rm -rf "$link_dir"
+  [ "$(readlink "$link")" = "$want" ] || { echo "error: the command link is '$(readlink "$link" || true)', expected '$want'" >&2; exit 1; }
 }
 
 # An existing binding must be usable by the new binary exactly as it is: a regular file, not a
@@ -506,6 +514,12 @@ check_private_path() {
   done
 }
 check_cache_tree() { check_private_path "$CACHE_REL/build"; }
+# The bin directory receives the command link: a real directory the current user owns.
+check_bin_dir() {
+  check_private_path .local/bin
+  [ ! -d "$HOME_DIR/.local/bin" ] || [ "$(/usr/bin/stat -f %u "$HOME_DIR/.local/bin")" = "$(/usr/bin/id -u)" ] ||
+    refuse E_PREREQ_MISSING "$HOME_DIR/.local/bin is not owned by the current user; move it away first"
+}
 check_data_tree() {
   for _d in versions cargo-home rustup-home build-home; do check_private_path "$DATA_REL/$_d"; done
 }
@@ -541,7 +555,7 @@ cmd_install() {
     refuse E_TOOLCHAIN_MISMATCH "toolchain $hint is absent at $DATA/toolchains/$hint; install exactly that version there (official Rust release distribution)"
   check_command_path
   check_binding
-  check_cache_tree; check_data_tree
+  check_cache_tree; check_data_tree; check_bin_dir
   build=$CACHE/build
   rm_build; mkdir -p "$build/stage"
   # Build the verified commit itself, not whatever HEAD is. Both steps are checked: a pipe would hide
@@ -552,6 +566,7 @@ cmd_install() {
   controls "$build/stage"
   chmod -R a-w "$build/stage" # same-uid writers can still undo this; see docs/bootstrap.md
   # Controls passed. From here the pinned toolchain runs under a constructed environment.
+  check_cache_tree; check_data_tree # again: the window since the first check was the staging and the controls
   for d in cargo-home rustup-home build-home; do rm -rf "${DATA:?}/$d"; mkdir -p "$DATA/$d"; done
   cd "$build"
   tcrun() { /usr/bin/env -i PATH="$TC/bin:$SYSPATH" HOME="$DATA/build-home" CARGO_HOME="$DATA/cargo-home" \
@@ -604,6 +619,7 @@ cmd_install() {
   if [ "$got_link" != "$DATA/current/dotfiles-manager" ]; then
     echo "error: swap did not take effect: the command path is '$got_link', expected '$DATA/current/dotfiles-manager'" >&2; exit 1
   fi
+  check_cache_tree; check_data_tree # again: the window since the last check was the whole build
   rm_build; rm -rf "$DATA/cargo-home" "$DATA/rustup-home" "$DATA/build-home"
   sha=$(/usr/bin/shasum -a 256 "$DATA/versions/$name/dotfiles-manager" | cut -d' ' -f1)
   printf 'installed %s\nsource commit %s\nbinary sha256 %s (record only)\nbootstrap: done\n' "$DATA/versions/$name" "$commit" "$sha"
