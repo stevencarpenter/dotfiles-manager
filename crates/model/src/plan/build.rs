@@ -16,7 +16,7 @@ use toml::Value;
 /// The kinds a configuration plan covers. Packages and applications are provisioning, and a
 /// secret is rendered only on explicit request (DESIGN.md section 7: "Only configuration work
 /// belongs in a normal config plan").
-fn in_scope(r: &ResolvedResource) -> bool {
+pub fn in_scope(r: &ResolvedResource) -> bool {
     matches!(
         r.kind.as_str(),
         "link" | "render" | "merge" | "assemble" | "distribution"
