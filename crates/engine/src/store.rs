@@ -405,9 +405,15 @@ impl Store {
         }
     }
 
-    fn ledger_raw(&self) -> Result<Ledger, Refusal> {
+    /// The ledger parsed and inside the scope, with no claim check of its paths.
+    fn ledger_parsed(&self) -> Result<Ledger, Refusal> {
         let l = Ledger::parse(&self.read_doc("ledger.json")?)?;
         l.validate_within(&self.scope)?;
+        Ok(l)
+    }
+
+    fn ledger_raw(&self) -> Result<Ledger, Refusal> {
+        let l = self.ledger_parsed()?;
         for o in l.resources.iter().flat_map(|r| &r.owned_outputs) {
             self.check_claim(&o.path)?;
         }
@@ -423,25 +429,20 @@ impl Store {
         Ok(l)
     }
 
-    /// As [`Store::read_ledger`], but an output that fails the claim check does not refuse the
-    /// read: its path and the reason are returned with the ledger. The caller must treat such
-    /// an output as unusable (no read, write or delete through it). The planner and apply use
-    /// this form, so one unsafe entry blocks only the operations on that entry.
-    pub fn read_ledger_lenient(&self) -> Result<(Ledger, Vec<(String, String)>), Refusal> {
-        let l = Ledger::parse(&self.read_doc("ledger.json")?)?;
-        l.validate_within(&self.scope)?;
+    /// As [`Store::read_ledger`], without the claim check of each output. A path in an old
+    /// entry can become unusable later (a parent that became a link leaving HOME, or a loop),
+    /// and that must not stop every later run. The caller must not read, write or delete
+    /// through an output without checking its own path first: the planner does that per entry
+    /// and apply does it per operation. The planner and apply use this form.
+    pub fn read_ledger_lenient(&self) -> Result<Ledger, Refusal> {
+        let l = self.ledger_parsed()?;
         self.check_owner(&l.binding)?;
-        let mut unsafe_paths = Vec::new();
-        for o in l.resources.iter().flat_map(|r| &r.owned_outputs) {
-            match self.check_claim(&o.path) {
-                Ok(()) => {}
-                Err(e) if e.code == Code::StateInvalid => {
-                    unsafe_paths.push((o.path.clone(), e.detail));
-                }
-                Err(e) => return Err(e),
-            }
-        }
-        Ok((l, unsafe_paths))
+        Ok(l)
+    }
+
+    /// The size of `journal.jsonl` in bytes, as stored.
+    pub fn journal_len(&self) -> Result<u64, Refusal> {
+        Ok(u64::try_from(self.read_doc("journal.jsonl")?.len()).unwrap_or(u64::MAX))
     }
 
     pub fn read_journal(&self) -> Result<Vec<JournalEntry>, Refusal> {
@@ -537,7 +538,7 @@ impl Store {
         live_sha256: &str,
     ) -> Result<bool, Refusal> {
         // Other entries may be unsafe; only this exact path has to pass the claim check.
-        let (ledger, _) = self.read_ledger_lenient()?;
+        let ledger = self.read_ledger_lenient()?;
         self.check_claim(path)?;
         Ok(ledger.authorizes_delete(resource, path, live_sha256))
     }
@@ -646,6 +647,18 @@ impl Store {
         Ok(bytes)
     }
 
+    /// `(resource, path, fingerprint)` of every owned output.
+    fn ledger_keys(l: &Ledger) -> std::collections::BTreeSet<(String, String, Option<String>)> {
+        l.resources
+            .iter()
+            .flat_map(|r| {
+                r.owned_outputs
+                    .iter()
+                    .map(|o| (r.resource.clone(), o.path.clone(), o.fingerprint.clone()))
+            })
+            .collect()
+    }
+
     /// Replaces the ledger atomically. A failure before the rename leaves the previous ledger. A
     /// failure after it is `E_IO_UNCONFIRMED`: the new ledger is in place, durability unknown.
     /// The ledger must carry the identity in `state.json`.
@@ -661,31 +674,9 @@ impl Store {
         let bytes = Self::cap(canonical(l)?)?;
         // An output the stored ledger already holds, unchanged, is not checked again: one
         // unsafe old entry must not stop every later write. New or changed outputs are checked.
-        let (old, _) = self.read_ledger_lenient()?;
-        let known: std::collections::BTreeSet<(&str, &str, Option<&str>)> = old
-            .resources
-            .iter()
-            .flat_map(|r| {
-                r.owned_outputs.iter().map(|o| {
-                    (
-                        r.resource.as_str(),
-                        o.path.as_str(),
-                        o.fingerprint.as_deref(),
-                    )
-                })
-            })
-            .collect();
-        for r in &l.resources {
-            for o in &r.owned_outputs {
-                let key = (
-                    r.resource.as_str(),
-                    o.path.as_str(),
-                    o.fingerprint.as_deref(),
-                );
-                if !known.contains(&key) {
-                    self.check_claim(&o.path)?;
-                }
-            }
+        let old = Self::ledger_keys(&self.read_ledger_lenient()?);
+        for (_, path, _) in Self::ledger_keys(l).difference(&old) {
+            self.check_claim(path)?;
         }
         self.state()?
             .replace_file("ledger.json", &bytes, &self.fail, "ledger")

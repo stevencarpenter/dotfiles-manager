@@ -174,10 +174,10 @@ schema, op_id, command, started_at, finished_at,
 binary{version, commit, sha256},
 profile{id, binding_digest}, machine_id,
 plan_digest, approval{kind, plan_digest, at},      # kind: "interactive" | "yes_plan" (S11)
-sources[{id, commit, tree} | {id, kind: "path", tree}],   # a path source has no commit (DFM-18)
+sources[{id, commit, tree} | {id, tree}],   # a source with no commit is a path source (DFM-18)
 operations[{id, resource, adapter, class, status, started_at, finished_at,
             before{fingerprint}, after{fingerprint},   # omitted for sensitive operations
-            owned_outputs[], error?, reload?}],        # reload: not_attempted | requested | reloaded | unsupported | failed (DFM-18)
+            owned_outputs[], error?, reload?}],        # reload: only not_attempted is accepted until a Reloader exists (DFM-18)
 result{outcome, exit_code, counts}
 approvals[{operation_id, how, at}]                    # optional, DFM-18: one per disruptive operation that ran
 ```
@@ -348,7 +348,7 @@ Codes 3 and 4 mean no mutation happened, so they cannot occur together with 1 or
 
 **`doctor` and exit-3 inputs.** `doctor` never exits 3 or 4. For malformed manifests, unsupported schema or state version, missing modules or an untrusted source, it reports each as a finding with its `E_...` code, inspects whatever is still safe to inspect, and exits 1. It exits 2 only if it cannot produce any report. This keeps DESIGN.md's rule that independent rows stay visible.
 
-Every non-zero result prints one stable code and the first failing location. `--json` repeats the code, exit name, and per-status counts, with the same semantics as the table. Resolver codes are the `expected_error` values in `examples/cases.toml`.
+An I/O failure before the first write exits 1 (`E_IO_FAILED`, `E_IO_UNCONFIRMED`), while a block or a gate before the first write exits 3. Every non-zero result prints one stable code and the first failing location. `--json` repeats the code, exit name, and per-status counts, with the same semantics as the table. Resolver codes are the `expected_error` values in `examples/cases.toml`.
 
 ### Commands and flags
 

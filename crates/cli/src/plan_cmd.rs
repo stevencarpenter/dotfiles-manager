@@ -104,7 +104,7 @@ fn read_saved(path: &Path) -> Result<Vec<u8>, Refusal> {
 
 /// Ledger outputs as paths relative to HOME.
 fn owned(store: &Store, home: &Path) -> Result<Vec<Owned>, Refusal> {
-    dfm_engine::owned_outputs(&store.read_ledger_lenient()?.0, home)
+    dfm_engine::owned_outputs(&store.read_ledger_lenient()?, home)
 }
 
 /// Builds the plan for the bound profile. Read-only.

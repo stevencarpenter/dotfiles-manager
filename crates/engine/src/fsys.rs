@@ -111,6 +111,19 @@ pub fn below(home: &Path, path: &Path) -> Result<Vec<String>, Refusal> {
         .collect()
 }
 
+/// A hidden same-directory name for a staged file or link: unique per process and call.
+pub(crate) fn temp_name(name: &str, suffix: &str) -> String {
+    static N: AtomicU32 = AtomicU32::new(0);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.subsec_nanos());
+    format!(
+        ".{name}.{}.{}.{nanos}.{suffix}",
+        std::process::id(),
+        N.fetch_add(1, Ordering::Relaxed)
+    )
+}
+
 pub(crate) fn check_name(name: &str) -> Result<(), Refusal> {
     if name.is_empty() || name == "." || name == ".." || name.contains('/') || name.contains('\0') {
         return Err(storage(format!("{name:?} is not a plain file name")));
@@ -295,7 +308,7 @@ impl Dir {
     /// checks it on the descriptor: owned by the current user, and `private` means exactly
     /// 0700 while otherwise it only has to be closed to group and others. `None` when absent
     /// and `create` is not set. Nothing is repaired or replaced.
-    pub fn child(
+    pub(crate) fn child(
         &self,
         sys: &Sys,
         name: &str,
@@ -357,7 +370,7 @@ impl Dir {
     /// Walks `rel` below this directory with [`Dir::child`]. Components from index
     /// `private_from` on must be exactly 0700. `None` when a component is absent and `create`
     /// is not set.
-    pub fn walk(
+    pub(crate) fn walk(
         &self,
         sys: &Sys,
         rel: &[String],
@@ -487,15 +500,7 @@ impl Dir {
         bytes: &[u8],
         mode: u32,
     ) -> Result<String, Refusal> {
-        static N: AtomicU32 = AtomicU32::new(0);
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| d.subsec_nanos());
-        let tmp = format!(
-            ".{name}.{}.{}.{nanos}.tmp",
-            std::process::id(),
-            N.fetch_add(1, Ordering::Relaxed)
-        );
+        let tmp = temp_name(name, "tmp");
         let raw = rfs::RawMode::try_from(mode)
             .map_err(|_| storage(format!("file mode {mode:o} is out of range")))?;
         let fd = rfs::openat(
@@ -556,7 +561,7 @@ impl Dir {
     /// the rename leaves the previous file, which is the last good state. A failure after it is
     /// `E_IO_UNCONFIRMED`: the new file is in place and only its durability is unknown.
     /// Failure points are `<label>-before-write`, `-after-tmp` and `-after-rename`.
-    pub fn replace_file(
+    pub(crate) fn replace_file(
         &self,
         name: &str,
         bytes: &[u8],
@@ -618,6 +623,7 @@ impl Dir {
     /// Appends one complete line. The file must exist, be private, have one link and end with a
     /// newline (or be empty), so a torn earlier line is never extended. Failure points:
     /// `<label>-before-write` and `<label>-after-write`.
+    #[doc(hidden)]
     pub fn append_line(
         &self,
         sys: &Sys,
@@ -788,14 +794,14 @@ impl Dir {
     }
 
     /// Renames an entry of this directory. The target must not be a non-empty directory.
-    pub fn rename(&self, from: &str, to: &str) -> Result<(), Refusal> {
+    pub(crate) fn rename(&self, from: &str, to: &str) -> Result<(), Refusal> {
         check_name(from)?;
         check_name(to)?;
         rfs::renameat(&self.fd, from, &self.fd, to).map_err(|e| sys_err("rename", e))
     }
 
     /// Removes the directory `name` and everything below it without following any link.
-    pub fn remove_tree(&self, sys: &Sys, name: &str) -> Result<(), Refusal> {
+    pub(crate) fn remove_tree(&self, sys: &Sys, name: &str) -> Result<(), Refusal> {
         let Some(d) = self.child(sys, name, false, false)? else {
             return Ok(());
         };

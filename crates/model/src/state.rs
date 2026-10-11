@@ -337,15 +337,10 @@ pub struct OperationRecord {
     pub reload: Option<String>,
 }
 
-/// The consumer reload states: the `Reloader` results of architecture section 11 plus
-/// `not_attempted`, the only one the manager can record until a reloader exists.
-pub const RELOADS: [&str; 5] = [
-    "not_attempted",
-    "requested",
-    "reloaded",
-    "unsupported",
-    "failed",
-];
+/// The consumer reload states the manager can record. Only `not_attempted` exists until a
+/// `Reloader` does (architecture section 11 names `requested`, `reloaded`, `unsupported` and
+/// `failed` for it). A state nothing can write is refused, so a receipt cannot claim one.
+pub const RELOADS: [&str; 1] = ["not_attempted"];
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -374,10 +369,7 @@ pub struct Approval {
 #[serde(deny_unknown_fields)]
 pub struct SourceId {
     pub id: String,
-    /// `path` for a local source tree, which has no commit. Absent for a Git source.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub kind: Option<String>,
-    /// Absent exactly when `kind` is `path`.
+    /// Absent for a local path source, which has no commit. The `tree` digest identifies it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub commit: Option<String>,
     pub tree: String,
@@ -389,7 +381,8 @@ pub struct SourceId {
 pub struct DisruptiveApproval {
     /// The `id` of the receipt operation that ran with this approval.
     pub operation_id: String,
-    /// `interactive` or `allow_disruptive`.
+    /// `allow_disruptive`. The contract also names `interactive`, which needs a prompt that
+    /// does not exist yet.
     pub how: String,
     pub at: String,
 }
@@ -518,21 +511,14 @@ impl Receipt {
         }
         for src in &self.sources {
             let tree_ok = src.tree.strip_prefix("sha256:").is_some_and(valid_sha256);
-            let kind_ok = match (src.kind.as_deref(), src.commit.as_deref()) {
-                (Some("path"), None) => true,
-                (None, Some(c)) => hex_id(c),
-                _ => false,
-            };
-            if !valid_id(&src.id) || !kind_ok || !tree_ok {
+            let commit_ok = src.commit.as_deref().is_none_or(hex_id);
+            if !valid_id(&src.id) || !commit_ok || !tree_ok {
                 return Err(bad("receipt source identity is malformed"));
             }
         }
         for a in &self.approvals {
             let known = self.operations.iter().any(|o| o.id == a.operation_id);
-            if !matches!(a.how.as_str(), "interactive" | "allow_disruptive")
-                || !known
-                || parse_rfc3339(&a.at).is_none()
-            {
+            if a.how != "allow_disruptive" || !known || parse_rfc3339(&a.at).is_none() {
                 return Err(bad("receipt approvals[] entry is malformed"));
             }
         }
@@ -1437,7 +1423,6 @@ mod tests {
         let mut r = receipt(vec![op(Status::Updated, Class::Normal)]);
         r.sources = vec![SourceId {
             id: "path-0123456789ab".into(),
-            kind: Some("path".into()),
             commit: None,
             tree: format!("sha256:{}", "b".repeat(64)),
         }];
@@ -1475,19 +1460,10 @@ mod tests {
         let mut r = good.clone();
         r.sources = vec![SourceId {
             id: "s".into(),
-            kind: None,
             commit: Some("zz".into()),
             tree: "x".into(),
         }];
         cases.push(("source", r));
-        let mut r = good.clone();
-        r.sources = vec![SourceId {
-            id: "s".into(),
-            kind: Some("path".into()),
-            commit: Some("a".repeat(40)),
-            tree: format!("sha256:{}", "a".repeat(64)),
-        }];
-        cases.push(("path source with a commit", r));
         let mut r = good.clone();
         r.approvals = vec![DisruptiveApproval {
             operation_id: "no-such-op".into(),
@@ -1495,6 +1471,13 @@ mod tests {
             at: "2026-10-10T00:00:00Z".into(),
         }];
         cases.push(("approval for an unknown operation", r));
+        let mut r = good.clone();
+        r.approvals = vec![DisruptiveApproval {
+            operation_id: "op1".into(),
+            how: "interactive".into(),
+            at: "2026-10-10T00:00:00Z".into(),
+        }];
+        cases.push(("approval kind with no prompt behind it", r));
         let mut r = good.clone();
         r.operations[0].started_at = Some("yesterday".into());
         cases.push(("time", r));

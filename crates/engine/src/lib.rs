@@ -11,12 +11,9 @@ pub mod observe;
 pub mod publish;
 pub mod store;
 
-#[cfg(feature = "failpoints")]
-#[doc(hidden)]
-pub use apply::test_support;
 pub use apply::{
     Gates, Generator, NoGenerator, RELOAD_NOT_ATTEMPTED, Report, Run, allow_flag, apply,
-    check_allow, gates, owned_outputs,
+    check_allow, check_journal_capacity, gates, owned_outputs,
 };
 #[cfg(feature = "failpoints")]
 pub use fail::Action;

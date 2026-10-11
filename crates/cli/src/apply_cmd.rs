@@ -7,7 +7,9 @@
 
 use crate::plan_cmd::{make_plan, render};
 use crate::{Ctx, read_existing_binding, state_cmd, usage};
-use dfm_engine::{Dir, NoGenerator, Run, Store, allow_flag, apply, check_allow, gates, now_unix};
+use dfm_engine::{
+    Dir, NoGenerator, Run, Store, apply, check_allow, check_journal_capacity, gates, now_unix,
+};
 use dfm_model::display::visible;
 use dfm_model::plan::Action;
 use dfm_model::state::{
@@ -158,26 +160,24 @@ fn run_inner(
     }
     // The gates that need no write run before the lock and in a preview, so a plan that apply
     // would refuse is refused here with the same code.
+    let (layout, sys) = (ctx.layout(), ctx.sys()?);
     let g = gates(&plan, &NoGenerator);
-    if let Some(bad) = args.allow.iter().find(|a| !g.removals.contains(a)) {
-        return Err(usage(format!(
-            "--allow-disruptive {bad} names no removal in this plan"
-        )));
-    }
-    let needed: Vec<&String> = g
-        .removals
-        .iter()
-        .filter(|id| !args.allow.contains(*id))
-        .collect();
-    if !needed.is_empty() {
-        writeln!(out, "removals need approval, one flag each:").map_err(w)?;
-        for id in &needed {
-            writeln!(out, "  {}", allow_flag(id)).map_err(w)?;
-        }
-    }
     if let Some(r) = g.refusal {
         return Err(r);
     }
+    // An id that names no removal is a usage error. A removal without its id is refused, and
+    // every missing id is printed as a flag to paste.
+    if let Err(e) = check_allow(&g.removals, &args.allow) {
+        if e.code == Code::DisruptiveUnapproved {
+            writeln!(out, "{}", visible(&e.detail)).map_err(w)?;
+        }
+        return Err(e);
+    }
+    // The journal size is read without the lock. The lock is taken only for a real run.
+    let readable = Store::open_read(sys, &layout, state_cmd::fail_from_env()?)?
+        .ok_or_else(crate::state_lost_refusal)?;
+    check_journal_capacity(readable.journal_len()?, &plan)?;
+    drop(readable);
     if args.preview {
         return Ok(());
     }
@@ -189,11 +189,9 @@ fn run_inner(
             ),
         ));
     };
-    check_allow(&g.removals, &args.allow)?;
 
     // Take the lock, then decide again: another command may have changed the machine or the
     // sources since the first look.
-    let (layout, sys) = (ctx.layout(), ctx.sys()?);
     let fail = state_cmd::fail_from_env()?;
     let store = Store::open_write_with(sys, &layout, fail.clone(), false)?;
     let stamped = |store: &Store, r: Refusal| {
@@ -271,7 +269,6 @@ fn run_inner(
                         .get(..12)
                         .unwrap_or("0")
                 ),
-                kind: Some("path".into()),
                 commit: None,
                 tree: s.tree.clone(),
             })

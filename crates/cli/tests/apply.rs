@@ -1382,7 +1382,7 @@ fn a_linked_parent_of_one_owned_output_blocks_only_that_entry() {
         fs::symlink_metadata(fx.h(".zshrc")).is_ok(),
         "nothing was removed"
     );
-    let _ = before;
+    assert_eq!(fingerprint(fx.home.path()), before, "nothing was written");
     let _ = fs::remove_dir_all(&outside);
 }
 
@@ -1422,32 +1422,44 @@ fn ledger_writes_still_work_when_another_entry_has_a_linked_parent() {
 }
 
 #[test]
-fn preview_lists_every_removal_as_a_pasteable_flag_and_exits_0() {
+fn preview_refuses_unapproved_removals_with_pasteable_flags_and_accepts_them_when_given() {
     let fx = Fx::new();
     assert_eq!(code(&fx.apply(&[])), 0);
     fx.set_profile("");
-    let o = fx.run(&["apply", "--root", fx.root_arg(), "--preview"]);
-    assert_eq!(code(&o), 0, "{}", stderr(&o));
-    let out = text(&o.stdout);
-    for id in [
+    let ids = [
         "remove@extra.tmux@.config/tmux/tmux.conf",
         "remove@extra.zsh@.zshrc",
-    ] {
+    ];
+    let before = fingerprint(fx.home.path());
+    // Without the flags the preview refuses exactly as apply would, and writes nothing.
+    let o = fx.run(&["apply", "--root", fx.root_arg(), "--preview"]);
+    assert_eq!(code(&o), 3, "{}", stderr(&o));
+    assert!(
+        stderr(&o).contains("E_DISRUPTIVE_UNAPPROVED"),
+        "{}",
+        stderr(&o)
+    );
+    let out = text(&o.stdout);
+    for id in ids {
         assert!(out.contains(&format!("--allow-disruptive '{id}'")), "{out}");
     }
-    // The same text, pasted back, approves exactly those removals.
-    let d = fx.digest();
+    assert!(out.contains("result: blocked"), "{out}");
+    assert_eq!(fingerprint(fx.home.path()), before);
+    // The flags, pasted back, make the preview exit 0 and the run apply exactly those removals.
+    let mut flags = vec!["apply", "--root", fx.root_arg(), "--preview"];
+    for id in ids {
+        flags.push("--allow-disruptive");
+        flags.push(id);
+    }
+    let o = fx.run(&flags);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    assert_eq!(fingerprint(fx.home.path()), before);
     let o = fx.apply_with(
-        &d,
-        &[
-            "--allow-disruptive",
-            "remove@extra.tmux@.config/tmux/tmux.conf",
-            "--allow-disruptive",
-            "remove@extra.zsh@.zshrc",
-        ],
+        &fx.digest(),
+        &["--allow-disruptive", ids[0], "--allow-disruptive", ids[1]],
     );
     assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
-    // The refusal without the flags lists every id too.
+    // The refusal of a real run lists every id too.
     let fx = Fx::new();
     assert_eq!(code(&fx.apply(&[])), 0);
     fx.set_profile("");
@@ -1459,6 +1471,76 @@ fn preview_lists_every_removal_as_a_pasteable_flag_and_exits_0() {
         text(&o.stdout)
     );
     assert!(text(&o.stdout).contains("result: blocked"));
+}
+
+#[test]
+fn a_full_journal_refuses_a_preview_and_a_run_before_any_write() {
+    let fx = Fx::new();
+    let e = dfm_model::state::JournalEntry {
+        schema: 1,
+        op_id: "p1-1".into(),
+        op: "remove".into(),
+        phase: dfm_model::state::Phase::Done,
+        at: "2026-10-10T00:00:00Z".into(),
+        resource: "r".into(),
+        adapter: "fs-link/v1".into(),
+        class: dfm_model::state::Class::Normal,
+        recovery: None,
+        token: None,
+        reason: None,
+    };
+    let line = e.to_line().unwrap();
+    let count = (dfm_model::state::MAX_JOURNAL_BYTES as usize - 2048) / line.len();
+    let path = fx.state().join("journal.jsonl");
+    fs::write(&path, line.repeat(count)).unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+    let before = fingerprint(fx.home.path());
+    for extra in [vec!["--preview"], vec![]] {
+        let mut a = vec!["apply", "--root", fx.root_arg()];
+        let d = fx.digest();
+        if extra.is_empty() {
+            a.extend(["--yes-plan", d.as_str()]);
+        } else {
+            a.extend(extra.iter().copied());
+        }
+        let o = fx.run(&a);
+        assert_eq!(code(&o), 3, "{}", stderr(&o));
+        assert!(stderr(&o).contains("E_LIMIT_EXCEEDED"), "{}", stderr(&o));
+        assert!(stderr(&o).contains("DFM-19"), "{}", stderr(&o));
+    }
+    assert_eq!(fingerprint(fx.home.path()), before);
+    assert!(!fx.h(".zshrc").exists());
+}
+
+#[test]
+fn a_self_looping_parent_of_one_owned_output_blocks_only_that_entry() {
+    let fx = Fx::new();
+    assert_eq!(code(&fx.apply(&[])), 0);
+    // ~/.config/tmux becomes a link to itself: resolving its children fails with a loop error.
+    fs::remove_file(fx.h(".config/tmux/tmux.conf")).unwrap();
+    fs::remove_dir(fx.h(".config/tmux")).unwrap();
+    symlink(fx.h(".config/tmux"), fx.h(".config/tmux")).unwrap();
+    let before = fingerprint(fx.home.path());
+    let o = fx.run(&["plan", "--root", fx.root_arg(), "--json"]);
+    let s = Saved::parse(&o.stdout).unwrap_or_else(|e| panic!("{e}\n{}", text(&o.stdout)));
+    assert!(
+        !stderr(&o).contains("E_STATE_INVALID") && !stderr(&o).contains("E_IO_FAILED"),
+        "{}",
+        stderr(&o)
+    );
+    assert_eq!(s.plan.blockers.len(), 1, "{:?}", s.plan.blockers);
+    assert_eq!(s.plan.blockers[0].resource, "extra.tmux");
+    for op in &s.plan.operations {
+        if op.resource != "extra.tmux" {
+            assert_eq!(op.status, dfm_model::plan::Status::Current, "{}", op.id);
+        }
+    }
+    let o = fx.run(&["apply", "--root", fx.root_arg(), "--preview"]);
+    assert_eq!(code(&o), 3, "{}", stderr(&o));
+    assert!(stderr(&o).contains("E_PARENT_UNSAFE"), "{}", stderr(&o));
+    let o = fx.apply(&[]);
+    assert_eq!(code(&o), 3, "{}", stderr(&o));
+    assert_eq!(fingerprint(fx.home.path()), before, "nothing was written");
 }
 
 #[test]
@@ -1491,7 +1573,7 @@ fn the_receipt_records_each_disruptive_approval_and_the_path_source() {
         assert!(op_ids.contains(&a["operation_id"]), "{a}");
     }
     let src = &r["sources"][0];
-    assert_eq!(src["kind"], "path");
+    assert!(src.get("kind").is_none());
     assert!(src.get("commit").is_none());
     assert!(src["tree"].as_str().unwrap().starts_with("sha256:"));
     // The receipt a first apply writes has no approvals.

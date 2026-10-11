@@ -7,7 +7,6 @@ mod common;
 use common::*;
 use dfm_engine::{
     Action as Inject, Dir, Fail, Generator, NoGenerator, Run, Store, apply, observe, owned_outputs,
-    test_support,
 };
 use dfm_model::digest::sha256_hex;
 use dfm_model::plan::{
@@ -731,14 +730,14 @@ fn a_replaced_link_is_compared_with_the_ledger_fingerprint_not_the_earlier_peek(
     let s = setup();
     symlink("/src/other", s.h.0.join("l")).unwrap();
     let home = Dir::open_home(&sys(&s.h), &s.h.0).unwrap();
-    let e = test_support::replace_link(
-        &home,
-        "l",
-        "/src/new",
-        &link_fingerprint("/src/old"),
-        &Fail::none(),
-    )
-    .unwrap_err();
+    let e = home
+        .replace_link(
+            "l",
+            "/src/new",
+            &link_fingerprint("/src/old"),
+            &Fail::none(),
+        )
+        .unwrap_err();
     assert_eq!(e.code, Code::Conflict);
     assert_eq!(
         fs::read_link(s.h.0.join("l")).unwrap(),
@@ -746,8 +745,7 @@ fn a_replaced_link_is_compared_with_the_ledger_fingerprint_not_the_earlier_peek(
     );
     assert!(leftovers(&s.h.0).is_empty());
     // And the matching fingerprint replaces it.
-    test_support::replace_link(
-        &home,
+    home.replace_link(
         "l",
         "/src/new",
         &link_fingerprint("/src/other"),
@@ -766,7 +764,7 @@ fn a_directory_is_never_removed_and_nothing_is_deleted_recursively() {
     fs::create_dir_all(s.h.0.join("d/inner")).unwrap();
     fs::write(s.h.0.join("d/inner/x"), "x").unwrap();
     let home = Dir::open_home(&sys(&s.h), &s.h.0).unwrap();
-    let e = test_support::remove_entry(&home, "d", &Fail::none()).unwrap_err();
+    let e = home.remove_entry("d", &Fail::none()).unwrap_err();
     assert_eq!(e.code, Code::Conflict);
     assert!(s.h.0.join("d/inner/x").is_file());
 }
@@ -784,10 +782,10 @@ fn a_parent_that_is_a_link_or_a_file_is_not_opened() {
         vec!["missing"],
         vec!["real", "nope"],
     ] {
-        let e = test_support::open_below(&home, &sys(&s.h), &rel).unwrap_err();
+        let e = home.open_below(&sys(&s.h), &rel).unwrap_err();
         assert_eq!(e.code, Code::ParentUnsafe, "{rel:?}");
     }
-    assert!(test_support::open_below(&home, &sys(&s.h), &["real"]).is_ok());
+    assert!(home.open_below(&sys(&s.h), &["real"]).is_ok());
 }
 
 #[test]
@@ -1025,4 +1023,112 @@ fn a_failure_while_settling_earlier_work_still_returns_a_report() {
     assert_eq!(rep.stopped.as_ref().unwrap().code, Code::IoFailed);
     assert_eq!(rep.operations[0].status, Status::NotStarted);
     assert!(!s.h.0.join("a").exists());
+}
+
+#[test]
+fn the_journal_size_is_the_stored_size_not_a_reserialized_sum() {
+    // Each line is padded with spaces after its closing brace. The parser accepts it, a
+    // re-serialized sum would not see the padding, and the stored size is over the cap.
+    let s = setup();
+    let e = JournalEntry {
+        phase: Phase::Done,
+        recovery: None,
+        ..intent("create-link", &s.h.0.join("z").to_string_lossy())
+    };
+    let mut line = e.to_line().unwrap();
+    line.pop();
+    line.extend_from_slice(&[b' '; 600]);
+    line.push(b'\n');
+    let count = (dfm_model::state::MAX_JOURNAL_BYTES as usize - 2048) / line.len();
+    let path =
+        s.h.0
+            .join(".local/state/dotfiles-manager/state/journal.jsonl");
+    fs::write(&path, line.repeat(count)).unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+    assert!(s.store.journal_len().unwrap() > dfm_model::state::MAX_JOURNAL_BYTES - 4096);
+    let o = op(&s.h, &s.store, "x@a", 1, Action::CreateFile, "a");
+    let err = refused(&s, &plan(vec![o]), &gen_for("x@a", "x"), &none());
+    assert_eq!(err.code, Code::LimitExceeded);
+    assert!(!s.h.0.join("a").exists());
+}
+
+/// A store whose own failpoint is armed, after `prepare` ran on a normal one.
+fn rearmed(prepare: impl FnOnce(&Setup), fail: Fail) -> Setup {
+    let h = Home::new();
+    let (store, _) = init(&h);
+    let s = Setup { h, store };
+    prepare(&s);
+    let Setup { h, store } = s;
+    drop(store);
+    let store = Store::open_write(sys(&h), &h.layout(), fail).unwrap();
+    Setup { h, store }
+}
+
+fn absent_candidate(s: &Setup) -> Plan {
+    let mut o = op(
+        &s.h,
+        &s.store,
+        "remove@core.x@gone",
+        1,
+        Action::Remove,
+        "gone",
+    );
+    o.status = PlanStatus::Current;
+    plan(vec![o])
+}
+
+#[test]
+fn a_file_that_appears_while_a_stale_entry_is_pruned_keeps_its_ledger_entry() {
+    let gate = std::env::temp_dir()
+        .canonicalize()
+        .unwrap()
+        .join(format!("prune-gate-{}", std::process::id()));
+    let _ = fs::remove_file(&gate);
+    let reached = gate.with_extension("reached");
+    let _ = fs::remove_file(&reached);
+    let s = rearmed(
+        |s| own(s, "gone", "x"),
+        Fail::at("journal-before-write", Inject::Wait(gate.clone())),
+    );
+    let p = absent_candidate(&s);
+    let leaf = s.h.0.join("gone");
+    let t = std::thread::spawn({
+        let (gate, reached) = (gate.clone(), reached.clone());
+        move || {
+            let end = std::time::Instant::now() + std::time::Duration::from_secs(20);
+            while !reached.exists() && std::time::Instant::now() < end {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            fs::write(&leaf, "x").unwrap();
+            fs::write(&gate, "").unwrap();
+        }
+    });
+    let rep = go(&s, &p, &NoGenerator, &none());
+    t.join().unwrap();
+    let _ = fs::remove_file(&reached);
+    let _ = fs::remove_file(&gate);
+    assert_eq!(
+        rep.operations[0].status,
+        Status::Current,
+        "{:?}",
+        rep.stopped
+    );
+    assert_eq!(
+        s.store.read_ledger().unwrap().resources.len(),
+        1,
+        "the entry survives"
+    );
+    assert!(s.h.0.join("gone").is_file());
+}
+
+#[test]
+fn a_stale_entry_whose_ledger_write_is_unconfirmed_is_unknown() {
+    let s = rearmed(
+        |s| own(s, "gone", "x"),
+        Fail::at("ledger-after-rename", Inject::Error),
+    );
+    let p = absent_candidate(&s);
+    let rep = go(&s, &p, &NoGenerator, &none());
+    assert_eq!(rep.operations[0].status, Status::Unknown);
+    assert_eq!(rep.stopped.as_ref().unwrap().code, Code::IoUnconfirmed);
 }

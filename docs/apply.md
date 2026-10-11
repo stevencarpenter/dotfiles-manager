@@ -22,7 +22,7 @@ dotfiles-manager apply --root <dir> [--preview] [--yes-plan <digest>] [--allow-d
 There is no `--plan <file>` flag. The manager stores no plan (architecture section 10), so apply plans again from the current machine and compares the digest the reviewer approved.
 
 1. Apply resolves, observes and plans exactly as `plan` does. It prints the plan and its digest.
-2. `--preview` runs the gates that need no write (below), lists every removal as a pasteable `--allow-disruptive '<id>'` flag, and exits 0 only when apply would not refuse on those gates. A refusal exits 3 with the same code that apply gives. A preview never writes. It cannot be combined with `--yes-plan` (exit 2).
+2. `--preview` runs the gates that need no write (below), including the journal size, lists every removal that lacks its flag as a pasteable `--allow-disruptive '<id>'` flag, and exits 0 only when apply would not refuse on those gates. A removal without its flag exits 3 with `E_DISRUPTIVE_UNAPPROVED`, as apply does. A refusal exits 3 with the same code that apply gives. A preview never writes. It cannot be combined with `--yes-plan` (exit 2).
 3. A blocked plan (any blocker) exits 3 with the first blocker. A blocked plan cannot be approved.
 4. Without `--yes-plan`, apply exits 3 with `E_APPROVAL_REQUIRED` and changes nothing. No prompt exists, so every run is noninteractive (architecture section 10, "Bounded noninteractive behavior").
 5. A `--yes-plan` digest that differs from the current digest exits 3 with `E_PLAN_STALE`. This check is read-only. It does not take the lock and does not create the lock file.
@@ -94,7 +94,7 @@ A removal needs all of the following at the moment of deletion:
 
 Then `unlinkat` removes the name. A link is removed, never followed. Anything modified or foreign is kept and reported. Deselecting a module removes only the outputs the ledger proves the manager wrote. It does not uninstall a package, erase runtime state, remove a directory, or touch a sibling.
 
-A removal candidate that is already gone has a stale ledger entry. Apply drops that entry (journaled), so a later file with the same content at the same path does not look owned.
+A removal candidate that is already gone has a stale ledger entry. Apply drops that entry (journaled), so a later file with the same content at the same path does not look owned. Apply checks absence through the opened HOME before the intent entry and again right before the ledger write. A path that exists again, a parent that cannot be opened, or a path in an unknown state keeps its entry. An unconfirmed ledger write there is `unknown`, like any other.
 
 ## Journal ids
 
@@ -132,25 +132,25 @@ A receipt is written whenever the run wrote anything, also after a failure. If s
 
 - `operations[].reload`: see below.
 - `approvals[{operation_id, how, at}]`: one entry per `--allow-disruptive` removal that ran. `operation_id` is the id of the receipt operation (the journal attempt id). `how` is `allow_disruptive`. Absent when there is none.
-- `sources[{id, kind, tree}]`: a path source as `kind = "path"` with no `commit`. `id` is `path-` and the first 12 hex characters of the tree digest. The tree digest is the one the planner computes.
+- `sources[{id, tree}]`: a path source has no `commit`, and a source with no commit is a path source. `id` is `path-` and the first 12 hex characters of the tree digest. The tree digest is the one the planner computes.
 - Every operation that ran has the journal attempt id as its receipt `id`, also when it failed, was unknown or was blocked after its intent. An operation that did not reach its intent has the planner's journal id.
 
 ## Publication and reload
 
-Publishing a file does not reload the program that reads it (architecture section 8, "A correct file, an installed executable and a reloaded consumer are three separate postconditions"). Each published link or file has `reload` in its receipt operation. The only value apply writes is `not_attempted`, because no `Reloader` exists. The validator accepts the contract names (`requested`, `reloaded`, `unsupported`, `failed`) for later tasks. The report prints a line that says no reload happened. A test asserts that no `updated` operation claims a reload.
+Publishing a file does not reload the program that reads it (architecture section 8, "A correct file, an installed executable and a reloaded consumer are three separate postconditions"). Each published link or file has `reload` in its receipt operation. The only value apply writes is `not_attempted`, because no `Reloader` exists. The validator accepts only `not_attempted`, so a receipt cannot claim a reload that nothing can perform. A later task that adds a `Reloader` adds the other contract names (`requested`, `reloaded`, `unsupported`, `failed`). The report prints a line that says no reload happened. A test asserts that no `updated` operation claims a reload.
 
 ## Decisions where the documents were silent
 
 | Question | Choice |
 | --- | --- |
-| Preview | Runs the read-only gates and lists the removal flags. Exit 0 only when apply would not refuse on those gates. |
+| Preview | Runs every read-only gate that apply runs before the lock: blockers, generator and sensitive refusals, link containment, the allow set and the journal size. A removal without its `--allow-disruptive` id exits 3 with `E_DISRUPTIVE_UNAPPROVED` and prints every missing flag. Exit 0 only when apply would not refuse on those gates. Pass the flags to the preview to get exit 0. |
 | Flag shape | `--root`, `--yes-plan`, `--allow-disruptive` (repeatable), `--preview`. No `--plan <file>`: the digest is the contract. |
 | Is a removal approved by `--yes-plan` alone? | No. Architecture section 10 item 8 calls deletion of an owned file disruptive, so each removal needs `--allow-disruptive <operation-id>`. This also bounds mass deletion: N removals need N explicit ids. The planner still has no mass-removal guard (docs/planner.md). |
 | Mode of a directory apply creates | 0700, the XDG default. The planner has no mode for `mkdir`. |
 | File mode | The declared mode, else 0600. |
 | An output that already is correct but unrecorded (`unrecorded_current`) | Left as it is and not claimed. Adopting an existing output is a separate workflow. |
 | Directories | Never recorded as owned, never removed. |
-| Receipt `sources` | A path source as `{id, kind: "path", tree}` with no commit. The plan digest covers the same tree digest. |
+| Receipt `sources` | A path source as `{id, tree}` with no commit. The plan digest covers the same tree digest. |
 | Receipt `approval.kind` | `yes_plan`. |
 | New codes | `E_APPROVAL_REQUIRED` (3), `E_GENERATOR_UNAVAILABLE` (3), `E_SENSITIVE_UNSUPPORTED` (3), `E_DISRUPTIVE_UNAPPROVED` (3). |
 | Stale ledger entry of a removal candidate that is already gone | Dropped (journaled). The planner now gives that case `action = remove` with status `current`. |
@@ -167,6 +167,7 @@ Publishing a file does not reload the program that reads it (architecture sectio
 
 ## Known limits
 
+- **Clock.** The run reads the clock at its start. If the clock fails then, the run does not start. If it fails later, the last good reading is reused. No 1970 stamp is written.
 - **No generated files from the command.** `render`, `merge` and `assemble` resources need adapters (DFM-20). The engine publishes and removes files and the tests prove it with a test generator, but the release binary has none, so `apply` refuses any plan that contains a generated file. The example personal profile is such a plan. Generated-file publication is therefore not proven through the CLI.
 - **Replace and remove check, then act.** `replace_link`, `update_file` and `remove` verify the leaf and then call `renameat` or `unlinkat`. These are two system calls. A process of the same user that swaps the leaf between them wins. Create operations have no such window (`EEXIST`). A swap of a parent directory cannot redirect any step, because every step uses the opened descriptor. A parent swapped after it was opened is not detected for the operations that already hold it. The effect lands in the directory that was verified, and the next operation sees the changed topology and is blocked.
 - **Source content during the run.** The `source:` preconditions are checked when the plan is made and again under the lock. They are not read again per operation. A link does not read its source. A generator must re-verify the sources it reads.

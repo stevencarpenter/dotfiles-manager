@@ -7,7 +7,7 @@
 //! `AT_REMOVEDIR`, so a directory is never removed and a link is removed, not followed.
 
 use crate::fail::Fail;
-use crate::fsys::{Dir, Sys, check_name, kind, mode_bits, sys_err, unconfirmed};
+use crate::fsys::{Dir, Sys, check_name, kind, mode_bits, sys_err, temp_name, unconfirmed};
 use dfm_model::digest::sha256_hex;
 use dfm_model::plan::link_fingerprint;
 use dfm_model::{Code, Refusal};
@@ -15,7 +15,6 @@ use rustix::fs::{self as rfs, AtFlags, FileType, Mode, OFlags};
 use rustix::io::Errno;
 use std::fs::File;
 use std::io::Read;
-use std::sync::atomic::{AtomicU32, Ordering};
 
 /// How a file is published.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -46,26 +45,14 @@ fn normalize_link_mode(dir: &Dir, name: &str) -> Result<(), Refusal> {
     }
 }
 
-/// A hidden same-directory name for a staged link or file.
-fn temp_name(name: &str) -> String {
-    static N: AtomicU32 = AtomicU32::new(0);
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.subsec_nanos());
-    format!(
-        ".{name}.{}.{}.{nanos}.stage",
-        std::process::id(),
-        N.fetch_add(1, Ordering::Relaxed)
-    )
-}
-
 impl Dir {
     /// Opens `rel` below this directory one component at a time, each with `O_NOFOLLOW |
     /// O_DIRECTORY`, and requires every component to be owned by the current user. A link, a
     /// file, a missing component or another owner is `E_PARENT_UNSAFE`: nothing is followed,
     /// created or repaired. The result names the directory that was verified, whatever happens
     /// to its path afterwards.
-    pub(crate) fn open_below(&self, sys: &Sys, rel: &[&str]) -> Result<Dir, Refusal> {
+    #[doc(hidden)]
+    pub fn open_below(&self, sys: &Sys, rel: &[&str]) -> Result<Dir, Refusal> {
         let mut cur = self.try_clone()?;
         for name in rel {
             let unsafe_parent = |why: &str| {
@@ -90,7 +77,8 @@ impl Dir {
     /// the user's behalf). An existing entry is a conflict and is left alone. The mode is set by
     /// name, without following a link, before the directory is opened, so a restrictive umask
     /// cannot leave a directory the process itself cannot open.
-    pub(crate) fn make_dir(&self, name: &str, fail: &Fail) -> Result<(), Refusal> {
+    #[doc(hidden)]
+    pub fn make_dir(&self, name: &str, fail: &Fail) -> Result<(), Refusal> {
         check_name(name)?;
         match rfs::mkdirat(&self.fd, name, Mode::from_raw_mode(0o700)) {
             Ok(()) => {}
@@ -119,7 +107,8 @@ impl Dir {
 
     /// Creates the link `name -> target`. `symlinkat` never replaces, so an entry that appeared
     /// since the check is a conflict.
-    pub(crate) fn make_link(&self, name: &str, target: &str, fail: &Fail) -> Result<(), Refusal> {
+    #[doc(hidden)]
+    pub fn make_link(&self, name: &str, target: &str, fail: &Fail) -> Result<(), Refusal> {
         check_name(name)?;
         match rfs::symlinkat(target, &self.fd, name) {
             Ok(()) => unconfirmed(
@@ -140,7 +129,8 @@ impl Dir {
     /// is made under a hidden name and moved over with `renameat`, so a reader sees the old or
     /// the new link, never neither. The check and the rename are two calls: a change between
     /// them is not detected (docs/apply.md, limits).
-    pub(crate) fn replace_link(
+    #[doc(hidden)]
+    pub fn replace_link(
         &self,
         name: &str,
         target: &str,
@@ -164,7 +154,7 @@ impl Dir {
             }
             Err(e) => return Err(sys_err("read link", e)),
         }
-        let tmp = temp_name(name);
+        let tmp = temp_name(name, "stage");
         rfs::symlinkat(target, &self.fd, &tmp).map_err(|e| sys_err("stage link", e))?;
         let moved = normalize_link_mode(self, &tmp)
             .and_then(|()| fail.hit("link-after-tmp"))
@@ -180,7 +170,8 @@ impl Dir {
 
     /// Removes the non-directory entry `name`. A link is removed, not followed. A directory is
     /// never removed: `unlinkat` without `AT_REMOVEDIR` refuses it.
-    pub(crate) fn remove_entry(&self, name: &str, fail: &Fail) -> Result<(), Refusal> {
+    #[doc(hidden)]
+    pub fn remove_entry(&self, name: &str, fail: &Fail) -> Result<(), Refusal> {
         check_name(name)?;
         match rfs::unlinkat(&self.fd, name, AtFlags::empty()) {
             Ok(()) => unconfirmed(fail.hit("remove-after-unlink").and_then(|()| self.sync())),
