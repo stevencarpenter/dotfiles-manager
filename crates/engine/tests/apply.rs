@@ -324,6 +324,17 @@ fn a_generated_file_is_staged_in_its_directory_published_with_its_mode_and_owned
 }
 
 #[test]
+fn a_created_directory_is_journaled_under_the_create_dir_name_the_claim_check_knows() {
+    let s = setup();
+    let d = op(&s.h, &s.store, "x@d", 1, Action::CreateDir, "d");
+    let r = go(&s, &plan(vec![d]), &gens(), &none());
+    assert_eq!(r.operations[0].status, Status::Updated, "{:?}", r.stopped);
+    let j = s.store.read_journal().unwrap();
+    assert!(!j.is_empty());
+    assert!(j.iter().all(JournalEntry::creates_dir), "{j:?}");
+}
+
+#[test]
 fn the_default_file_mode_is_0600() {
     let s = setup();
     let o = op(&s.h, &s.store, "x@a", 1, Action::CreateFile, "a");
