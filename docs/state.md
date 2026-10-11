@@ -97,6 +97,8 @@ The planner does not read the journal. A plan with a blocker cannot be approved,
 
 ## Known limits
 
+- The torn-line repair cuts any final line without a newline, also a complete line that only lacks the newline; this is by design, and the cut entry's operation is settled by the probe. A journal that is a symlink is refused (not repaired) like any other journal access.
+
 - `DFM_BINDING` (isolated builds only) is not canonicalized like HOME. Its parent is opened relative to the resolved HOME, so a binding path with an alias spelling can be refused.
 - `state check` reads each snapshot payload fully (up to the 16 MiB read cap) to run the private-file checks. A store with many large snapshots makes the check slow and memory-heavy.
 

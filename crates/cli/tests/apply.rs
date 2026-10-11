@@ -2552,6 +2552,11 @@ fn apply_repairs_a_torn_final_journal_line_before_it_settles() {
     let o = fx.apply(&[]);
     assert_eq!(code(&o), 0, "{}{}", text(&o.stdout), stderr(&o));
     assert!(fx.h(".zshrc").is_symlink());
+    assert!(
+        text(&o.stdout).contains("repaired a torn final journal line (16 bytes removed)"),
+        "{}",
+        text(&o.stdout)
+    );
     let journal = fs::read_to_string(&j).unwrap();
     let repair = journal
         .find("torn line repaired")

@@ -720,11 +720,18 @@ impl Dir {
 
     /// Cuts `name` back to `len` bytes and syncs it. Used only to remove a torn final journal
     /// line. A failure of the cut is an unconfirmed outcome: the file may or may not be shorter.
-    pub fn truncate_to(&self, sys: &Sys, name: &str, len: u64) -> Result<(), Refusal> {
+    /// `read_size` is the size the caller judged; a file of another size was changed since.
+    pub fn truncate_to(
+        &self,
+        sys: &Sys,
+        name: &str,
+        read_size: u64,
+        len: u64,
+    ) -> Result<(), Refusal> {
         let (fd, size) = self.open_append(sys, name, false)?;
-        if len > size {
+        if size != read_size || len > size {
             return Err(storage(format!(
-                "{}: cannot cut to {len} bytes, the file has {size}",
+                "{}: the file changed while it was read ({read_size} bytes read, {size} now)",
                 self.at(name).display()
             )));
         }

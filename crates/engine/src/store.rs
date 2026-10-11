@@ -746,7 +746,8 @@ impl Store {
         if bytes.last().is_none_or(|b| *b == b'\n') {
             return Ok(0);
         }
-        self.wrote(self.repair_torn_journal_inner(&bytes))
+        // The cut is a write: from here the store counts as mutated even if the next step fails.
+        self.repair_torn_journal_inner(&bytes)
     }
 
     fn repair_torn_journal_inner(&self, bytes: &[u8]) -> Result<usize, Refusal> {
@@ -754,8 +755,12 @@ impl Store {
         // Everything before the torn line must be a sound journal.
         state::parse_journal(&bytes[..keep])?;
         let removed = bytes.len() - keep;
-        self.state()?
-            .truncate_to(&self.sys, "journal.jsonl", u64::try_from(keep).unwrap_or(0))?;
+        self.wrote(self.state()?.truncate_to(
+            &self.sys,
+            "journal.jsonl",
+            u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+            u64::try_from(keep).unwrap_or(0),
+        ))?;
         let at = now_unix()?;
         self.append_journal(&JournalEntry {
             schema: state::SCHEMA,

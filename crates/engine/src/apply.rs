@@ -79,6 +79,8 @@ pub struct Report {
     /// The first operation failure or block, with its own code. Later operations are blocked or
     /// not started. The caller marks it with `after_mutation` when the store wrote anything.
     pub stopped: Option<Refusal>,
+    /// Bytes of a torn final journal line that were cut off before settling (0 when none).
+    pub repaired: usize,
 }
 
 /// The result of the gates that need no write.
@@ -472,6 +474,8 @@ pub fn check_journal_capacity(journal_len: u64, plan: &Plan) -> Result<(), Refus
 struct Exec<'a, 'r> {
     run: &'a Run<'r>,
     plan: &'a Plan,
+    /// Bytes cut off a torn final journal line by this run's repair.
+    repaired: usize,
     /// Journal intents per planner journal id, so an id is never reused after a partial apply.
     attempts: BTreeMap<String, u32>,
     /// Paths whose state is unknown (an interrupted or unconfirmed operation). Nothing more is
@@ -1508,7 +1512,7 @@ impl Exec<'_, '_> {
 ///    recorded it) or `failed`. An unclear one blocks its path in this run.
 fn settle(ex: &mut Exec<'_, '_>) -> Result<(), Refusal> {
     // A torn final journal line is cut and journaled before anything reads the entries.
-    ex.run.store.repair_torn_journal()?;
+    ex.repaired = ex.run.store.repair_torn_journal()?;
     let entries = ex.run.store.read_journal_lenient()?;
     let settled = {
         let planned = |resource: &str, abs: &str| {
@@ -1607,6 +1611,7 @@ fn execute(run: &Run<'_>, plan: &Plan) -> Report {
     let mut ex = Exec {
         run,
         plan,
+        repaired: 0,
         attempts: BTreeMap::new(),
         unknown_paths: BTreeMap::new(),
         unknown_resources: BTreeMap::new(),
@@ -1702,5 +1707,6 @@ fn execute(run: &Run<'_>, plan: &Plan) -> Report {
     Report {
         operations: records,
         stopped: crate::signal::requested().or(stopped),
+        repaired: ex.repaired,
     }
 }

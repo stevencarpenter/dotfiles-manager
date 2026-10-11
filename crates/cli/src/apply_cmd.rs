@@ -246,6 +246,14 @@ fn run_inner(
         .map_err(|r| stamped(&store, dfm_engine::signal::requested().unwrap_or(r)))?;
     let finished = now_unix().unwrap_or(started);
 
+    if report.repaired > 0 {
+        writeln!(
+            out,
+            "repaired a torn final journal line ({} bytes removed)",
+            report.repaired
+        )
+        .map_err(w)?;
+    }
     let counts = count_statuses(&report.operations);
     let n = |s: Status| counts.get(&s).copied().unwrap_or(0);
     let mutated = store.mutated();

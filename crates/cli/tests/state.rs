@@ -1344,6 +1344,27 @@ fn recover_repairs_one_torn_final_journal_line_and_refuses_a_torn_middle_line() 
 }
 
 #[test]
+fn a_failed_repair_after_the_cut_exits_1_because_the_journal_changed() {
+    let h = bound_home("torn-cut");
+    assert_eq!(
+        record(h.path(), "core.victim", "victim", "v").status.code(),
+        Some(0)
+    );
+    let j = state(h.path()).join("journal.jsonl");
+    let mut torn = fs::read(&j).unwrap();
+    let sound = torn.len();
+    torn.extend_from_slice(b"{\"schema\":1,\"op_");
+    fs::write(&j, &torn).unwrap();
+    let r = with_fail(
+        h.path(),
+        "journal-before-write:error",
+        &["state", "recover"],
+    );
+    assert_eq!(r.status.code(), Some(1), "{}", text(&r.stderr));
+    assert_eq!(fs::read(&j).unwrap().len(), sound, "the torn line was cut");
+}
+
+#[test]
 fn an_unreadable_receipts_directory_is_a_finding_not_an_empty_list() {
     let h = seeded("unreadable");
     let dir = state(h.path()).join("receipts");
