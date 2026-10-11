@@ -151,16 +151,22 @@ pub fn make_plan(ctx: &Ctx, root: &Path) -> Result<Plan, Refusal> {
     // Claims that overlap the manager's own paths, by the store's rules: the text scope (case
     // folded, so it holds for directories that do not exist yet) and filesystem identity.
     let mut reserved = BTreeMap::new();
+    let mut unchecked = BTreeMap::new();
     for r in loaded.resolved.resources.values() {
         let dirs = r.dir_claims.iter().map(|d| &d.dir);
         for rel in r.claims.iter().chain(dirs) {
             let abs = home.shown().join(rel);
-            // Only an overlap is a reserved path. A path that cannot be resolved (a link loop,
-            // an unreadable parent) is the topology check's to report, with its own code.
-            if let Err(e) = store.check_claim(&abs.to_string_lossy())
-                && e.code == Code::StateInvalid
-            {
-                reserved.insert(rel.clone(), visible(&e.detail));
+            // An overlap is a reserved path (E_STATE_INVALID from the store). Any other failure
+            // means the path could not be checked, so the plan reports an unknown fact
+            // (E_OBSERVATION_UNKNOWN, exit 3: "a required prerequisite that is UNKNOWN",
+            // architecture section 10). The planner reports a link loop or an unreadable parent
+            // first, with its own code.
+            if let Err(e) = store.check_claim(&abs.to_string_lossy()) {
+                if e.code == Code::StateInvalid {
+                    reserved.insert(rel.clone(), visible(&e.detail));
+                } else {
+                    unchecked.insert(rel.clone(), visible(&e.detail));
+                }
             }
         }
     }
@@ -176,6 +182,7 @@ pub fn make_plan(ctx: &Ctx, root: &Path) -> Result<Plan, Refusal> {
         root: root_str,
         ledger,
         reserved,
+        unchecked,
     };
     plan::build(&loaded.resolved, &cx, &obs)
 }

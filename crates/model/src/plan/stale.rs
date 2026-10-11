@@ -133,13 +133,15 @@ pub fn stale(old: &Plan, new: &Plan) -> Result<Vec<Stale>, Refusal> {
     }
 
     // Observations that no operation precondition covers still count: a fragment appearing
-    // changes the input set even when no precondition names it.
+    // changes the input set even when no precondition names it. The text is the same
+    // `node_state` string a precondition shows, so a path reads one way wherever it appears.
+    // A change `node_state` does not show (an owner flag) is caught by the digest entry below.
     let obs = |p: &Plan| -> BTreeMap<String, String> {
         let mut m: BTreeMap<String, String> = p
             .observations
             .seen
             .iter()
-            .map(|(k, v)| (format!("path:{k}"), format!("{v:?}")))
+            .map(|(k, v)| (format!("path:{k}"), super::node_state(v, false)))
             .collect();
         m.extend(p.observations.listings.iter().map(|(k, v)| {
             (

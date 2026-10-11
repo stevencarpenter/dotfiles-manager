@@ -39,6 +39,20 @@ pub fn created() -> bool {
     CREATED.with(Cell::get)
 }
 
+thread_local! {
+    static LISTED: Cell<usize> = const { Cell::new(0) };
+}
+
+/// How many directory listings this thread has read. For tests that check a directory is
+/// listed once.
+pub fn listed() -> usize {
+    LISTED.with(Cell::get)
+}
+
+pub fn reset_listed() {
+    LISTED.with(|c| c.set(0));
+}
+
 fn note_created() {
     CREATED.with(|c| c.set(true));
 }
@@ -738,6 +752,7 @@ impl Dir {
 
     /// Lists this directory. Entry names that are not UTF-8 are counted, not dropped silently.
     pub fn list(&self) -> Result<Listing, Refusal> {
+        LISTED.with(|c| c.set(c.get() + 1));
         let mut rd = rfs::Dir::read_from(&self.fd).map_err(|e| sys_err("list directory", e))?;
         rd.rewind();
         let mut out = Listing::default();

@@ -29,9 +29,9 @@ pub const MAX_HASHED_BYTES: u64 = 16 << 20;
 /// What was found at one HOME-relative path, without following a link at the path itself.
 /// `own` says whether the current user owns it. Raw user ids are not recorded.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Node {
-    Missing,
+    Missing {},
     Dir {
         mode: u32,
         own: bool,
@@ -68,6 +68,18 @@ pub enum LinkTo {
     Other,
     Dangling,
     Loop,
+}
+
+impl LinkTo {
+    pub fn name(self) -> &'static str {
+        match self {
+            LinkTo::Dir => "dir",
+            LinkTo::File => "file",
+            LinkTo::Other => "other",
+            LinkTo::Dangling => "dangling",
+            LinkTo::Loop => "loop",
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -303,17 +315,11 @@ pub struct Plan {
     pub blockers: Vec<Blocker>,
 }
 
-fn serialization(e: &Refusal) -> Refusal {
-    Refusal::new(
-        Code::IoFailed,
-        format!("cannot serialize the plan: {}", e.detail),
-    )
-}
-
 impl Plan {
     /// SHA-256 of the canonical JSON of the plan (sorted keys, no insignificant whitespace).
     pub fn digest(&self) -> Result<String, Refusal> {
-        Ok(sha256_hex(&canonical(self).map_err(|e| serialization(&e))?))
+        // `canonical` reports an impossible serialization failure as E_STATE_INVALID; it is passed on.
+        Ok(sha256_hex(&canonical(self)?))
     }
 
     pub fn saved(&self) -> Result<Saved, Refusal> {
@@ -388,7 +394,7 @@ impl Saved {
 /// path carries no hash and no size.
 pub fn node_state(seen: &Seen, sensitive: bool) -> String {
     let base = match &seen.node {
-        Node::Missing => "missing".to_string(),
+        Node::Missing {} => "missing".to_string(),
         Node::Dir { mode, .. } => format!("dir:{mode:o}"),
         Node::File {
             mode, size, sha256, ..
@@ -397,7 +403,8 @@ pub fn node_state(seen: &Seen, sensitive: bool) -> String {
             (None, false) => format!("file:{mode:o}:size:{size}"),
             (_, true) => format!("file:{mode:o}"),
         },
-        Node::Link { target, to, .. } => format!("link:{target}:{to:?}").to_lowercase(),
+        // The target text is compared exactly: a case-only retarget is a different link.
+        Node::Link { target, to, .. } => format!("link:{target}:{}", to.name()),
         Node::Other { mode, .. } => format!("other:{mode:o}"),
         Node::Unknown { reason } => format!("unknown:{reason}"),
     };
@@ -503,7 +510,7 @@ mod tests {
         c.observations.seen.insert(
             "x".into(),
             Seen {
-                node: Node::Missing,
+                node: Node::Missing {},
                 alias: None,
             },
         );

@@ -481,11 +481,15 @@ fn state_is_required_because_ownership_would_be_unknown() {
 
 #[test]
 fn a_directory_the_user_cannot_write_is_a_privilege_failure() {
+    if is_root() {
+        eprintln!("SKIPPED: running as root");
+        return;
+    }
     let e = Env::personal();
     e.mkdirs(".ssh");
+    let _restore = Restore(e.h(".ssh"), 0o700);
     fs::set_permissions(e.h(".ssh"), fs::Permissions::from_mode(0o500)).unwrap();
     let s = e.saved().1;
-    fs::set_permissions(e.h(".ssh"), fs::Permissions::from_mode(0o700)).unwrap();
     let b = &s.plan.blockers[0];
     assert_eq!(b.code.as_str(), "E_PRIVILEGE_UNSUPPORTED");
     assert_eq!(
@@ -1033,6 +1037,7 @@ mod synthetic {
             root: "/r",
             ledger,
             reserved,
+            unchecked: BTreeMap::new(),
         };
         build(resolved, &cx, obs).unwrap()
     }
@@ -1281,14 +1286,32 @@ fn first(s: &Saved) -> (&str, &str, &str) {
     (b.code.as_str(), b.resource.as_str(), b.detail.as_str())
 }
 
+/// Restores a mode when dropped, so a failed assertion cannot leave an undeletable tree.
+struct Restore(PathBuf, u32);
+
+impl Drop for Restore {
+    fn drop(&mut self) {
+        let _ = fs::set_permissions(&self.0, fs::Permissions::from_mode(self.1));
+    }
+}
+
+/// Permission tests mean nothing for root, which ignores modes.
+fn is_root() -> bool {
+    dfm_platform_macos::current_uid() == Some(0)
+}
+
 fn unreadable(e: &Env, rel: &str, mode: u32, f: impl FnOnce(&Env)) {
+    let _restore = Restore(e.h(rel), mode);
     fs::set_permissions(e.h(rel), fs::Permissions::from_mode(0o000)).unwrap();
     f(e);
-    fs::set_permissions(e.h(rel), fs::Permissions::from_mode(mode)).unwrap();
 }
 
 #[test]
 fn an_unreadable_file_or_directory_is_an_unknown_fact_not_a_crash() {
+    if is_root() {
+        eprintln!("SKIPPED: running as root");
+        return;
+    }
     // A claimed leaf that cannot be read.
     let e = Env::personal();
     e.mkdirs(".ssh");
@@ -1791,7 +1814,7 @@ mod removal {
         let resolved = resolve(&set, "profiles/personal-dev-01.toml", &builtin_catalog()).unwrap();
         let mut obs = Observations::default();
         let missing = Seen {
-            node: Node::Missing,
+            node: Node::Missing {},
             alias: None,
         };
         for r in requests(&resolved, &ledger) {
@@ -1827,6 +1850,7 @@ mod removal {
             root: "/r",
             ledger,
             reserved: BTreeMap::new(),
+            unchecked: BTreeMap::new(),
         };
         build(&resolved, &cx, &obs).unwrap()
     }
@@ -1889,5 +1913,359 @@ mod removal {
             link("/src/x"),
         );
         assert!(p.operations.iter().all(|o| !o.id.starts_with("remove@")));
+    }
+}
+
+// ---- final round: hashes, removal order, unchecked claims ---------------------------------
+
+#[test]
+fn a_ledger_entry_on_a_sensitive_claim_leaks_no_hash_and_is_not_a_removal() {
+    let e = Env::personal();
+    e.mkdirs(".claude");
+    let out = e.h(".claude/settings.json");
+    // Another, deselected, normal resource owns the file in the ledger (its fingerprint is the
+    // content hash), and a selected sensitive resource now claims it.
+    record(&e, "gone.res", &out, "SECRETTOKEN123");
+    let digest = format!("{:x}", Sha256::digest(b"SECRETTOKEN123"));
+    for extra in [&["--json"][..], &[][..]] {
+        let o = e.plan(extra);
+        let all = format!("{}{}", text(&o.stdout), text(&o.stderr));
+        assert_eq!(code(&o), 3, "{all}");
+        assert!(
+            !all.contains(&digest) && !all.contains("SECRETTOKEN123"),
+            "{all}"
+        );
+    }
+    let s = e.saved().1;
+    match &s.plan.observations.seen[".claude/settings.json"].node {
+        dfm_model::plan::Node::File { sha256, .. } => assert_eq!(sha256, &None),
+        n => panic!("{n:?}"),
+    }
+    assert!(
+        s.plan
+            .operations
+            .iter()
+            .all(|o| !o.id.starts_with("remove@"))
+    );
+    let leaf = op(&s, "agents.claude-settings@.claude/settings.json");
+    assert!(leaf
+        .preconditions
+        .iter()
+        .any(|c| c.subject == "ledger:.claude/settings.json" && c.state == "gone.res:sensitive"));
+}
+
+#[test]
+fn a_fragment_that_is_being_removed_is_read_first_and_removed_after_its_consumer() {
+    let e = Env::personal();
+    e.mkdirs(".codex/AGENTS.d");
+    let gone = e.h(".codex/AGENTS.d/30-gone.md");
+    record(&e, "gone.res", &gone, "old fragment\n");
+    let (o, s) = e.saved();
+    assert_eq!(code(&o), 0, "{}", text(&o.stderr));
+    let consumer = op(&s, "agents.codex-instructions@.codex/AGENTS.md");
+    let rm = op(&s, "remove@gone.res@.codex/AGENTS.d/30-gone.md");
+    assert_eq!((rm.action, rm.status), (Action::Remove, Status::Planned));
+    assert!(rm.after.contains(&consumer.id), "{:?}", rm.after);
+    assert!(!consumer.after.contains(&rm.id));
+    let frag: Vec<_> = consumer
+        .fragments
+        .iter()
+        .map(|f| (&f.name[..], &f.origin[..]))
+        .collect();
+    assert_eq!(frag, [("30-gone.md", "removing:gone.res")]);
+    assert!(
+        consumer
+            .preconditions
+            .iter()
+            .any(|c| c.state == "selected=[] foreign=[] removing=[30-gone.md]")
+    );
+    let pos = |id: &str| s.plan.operations.iter().position(|o| o.id == id).unwrap();
+    assert!(pos(&consumer.id) < pos(&rm.id));
+
+    // A removal that is blocked (the file was edited) is not a producer and no edge is added:
+    // the edited file is an ordinary foreign fragment.
+    fs::write(&gone, "edited\n").unwrap();
+    let s = e.saved().1;
+    let consumer = op(&s, "agents.codex-instructions@.codex/AGENTS.md");
+    assert!(consumer.after.iter().all(|a| !a.starts_with("remove@")));
+    assert_eq!(consumer.fragments[0].origin, "foreign");
+    assert_eq!(
+        op(&s, "remove@gone.res@.codex/AGENTS.d/30-gone.md").action,
+        Action::None
+    );
+}
+
+#[test]
+fn outputs_of_a_resource_that_is_still_selected_are_never_removed() {
+    let e = Env::personal();
+    // `personal-dev.atuin` is selected and claims nothing.
+    record(&e, "personal-dev.atuin", &e.h("kept.txt"), "x");
+    let (o, s) = e.saved();
+    assert_eq!(code(&o), 0, "{}", text(&o.stderr));
+    assert!(
+        s.plan
+            .operations
+            .iter()
+            .all(|o| !o.id.starts_with("remove@"))
+    );
+}
+
+#[test]
+fn a_removal_candidate_with_a_non_ascii_path_is_refused() {
+    let e = Env::personal();
+    let out = e.h("caf\u{e9}.txt");
+    record(&e, "gone.res", &out, "x");
+    let s = blocked(&e);
+    let b = &s.plan.blockers[0];
+    assert_eq!(
+        (b.code.as_str(), b.resource.as_str()),
+        ("E_TARGET_INVALID", "gone.res")
+    );
+    assert!(
+        b.detail
+            .starts_with("caf\u{e9}.txt contains non-ASCII characters"),
+        "{}",
+        b.detail
+    );
+    assert_eq!(fs::read_to_string(&out).unwrap(), "x");
+}
+
+#[test]
+fn a_claim_that_cannot_be_checked_against_the_manager_s_paths_is_an_unknown_fact() {
+    if is_root() {
+        eprintln!("SKIPPED: running as root");
+        return;
+    }
+    let e = Env::personal();
+    e.mkdirs(".ssh");
+    fs::write(e.h(".ssh/config"), "x").unwrap();
+    // Readable but not searchable: the leaf cannot be examined.
+    let _restore = Restore(e.h(".ssh"), 0o700);
+    fs::set_permissions(e.h(".ssh"), fs::Permissions::from_mode(0o600)).unwrap();
+    let s = blocked(&e);
+    let b = &s.plan.blockers[0];
+    assert_eq!(
+        (b.code.as_str(), b.resource.as_str()),
+        ("E_OBSERVATION_UNKNOWN", "core.ssh")
+    );
+    assert!(
+        b.detail
+            .starts_with(".ssh/config could not be checked against the manager's own paths: "),
+        "{}",
+        b.detail
+    );
+}
+
+mod hardening {
+    use super::*;
+    use dfm_cli::builtin_catalog;
+    use dfm_model::plan::{
+        Binary, Context, LinkTo, Node, Observations, Owned, Seen, Source, build, node_state, stale,
+    };
+    use dfm_model::resolve::{SourceSet, resolve};
+    use dfm_model::state::Class;
+    use std::collections::BTreeMap;
+
+    fn resolved() -> dfm_model::resolve::Resolved {
+        let mut set = SourceSet::new();
+        fn load(dir: &Path, rel: &str, out: &mut SourceSet) {
+            for e in fs::read_dir(dir).unwrap() {
+                let e = e.unwrap();
+                let name = e.file_name().into_string().unwrap();
+                let path = if rel.is_empty() {
+                    name
+                } else {
+                    format!("{rel}/{name}")
+                };
+                if e.file_type().unwrap().is_dir() {
+                    load(&e.path(), &path, out);
+                } else {
+                    out.insert_file(path, fs::read(e.path()).unwrap());
+                }
+            }
+        }
+        load(&repo_root().join("examples"), "", &mut set);
+        resolve(&set, "profiles/personal-dev-01.toml", &builtin_catalog()).unwrap()
+    }
+
+    fn all_missing(r: &dfm_model::resolve::Resolved, ledger: &[Owned]) -> Observations {
+        let mut obs = Observations::default();
+        for q in dfm_model::plan::requests(r, ledger) {
+            for i in 0..q.path.split('/').count() {
+                let p = q.path.split('/').take(i + 1).collect::<Vec<_>>().join("/");
+                obs.seen.entry(p).or_insert(Seen {
+                    node: Node::Missing {},
+                    alias: None,
+                });
+            }
+        }
+        obs
+    }
+
+    fn run(
+        r: &dfm_model::resolve::Resolved,
+        obs: &Observations,
+        ledger: Vec<Owned>,
+    ) -> dfm_model::plan::Plan {
+        let cx = Context {
+            binary: Binary {
+                version: "0".into(),
+                sha256: "0".repeat(64),
+            },
+            profile: "p",
+            machine_id: "m",
+            sources: vec![Source {
+                kind: "path".into(),
+                root: "/r".into(),
+                tree: "sha256:0".into(),
+            }],
+            root: "/r",
+            ledger,
+            reserved: BTreeMap::new(),
+            unchecked: BTreeMap::new(),
+        };
+        build(r, &cx, obs).unwrap()
+    }
+
+    #[test]
+    fn a_mode_outside_the_permission_bits_is_refused_not_dropped() {
+        for bad in [0o4755_i64, 0o2755, 0o1777, -1, 0o1000] {
+            let mut r = resolved();
+            let git = r.resources.get_mut("core.git").unwrap();
+            git.value
+                .as_table_mut()
+                .unwrap()
+                .insert("mode".into(), toml::Value::Integer(bad));
+            let p = run(&r, &all_missing(&r, &[]), vec![]);
+            let b = p
+                .blockers
+                .iter()
+                .find(|b| b.resource == "core.git")
+                .expect("a blocker");
+            assert_eq!(b.code.as_str(), "E_MANIFEST_INVALID", "{bad:o}");
+            assert_eq!(b.field.as_deref(), Some("/mode"));
+        }
+        let mut r = resolved();
+        r.resources
+            .get_mut("core.git")
+            .unwrap()
+            .value
+            .as_table_mut()
+            .unwrap()
+            .insert("mode".into(), toml::Value::Integer(0o644));
+        let p = run(&r, &all_missing(&r, &[]), vec![]);
+        assert_eq!(
+            p.operations
+                .iter()
+                .find(|o| o.id == "core.git@.config/git/config")
+                .unwrap()
+                .mode,
+            Some(0o644)
+        );
+    }
+
+    #[test]
+    fn a_removal_candidate_owned_by_another_user_needs_privilege() {
+        let r = resolved();
+        let ledger = vec![Owned {
+            resource: "gone.res".into(),
+            adapter: "fs-link/v1".into(),
+            class: Class::Normal,
+            path: "old/file".into(),
+            fingerprint: Some("0".repeat(64)),
+        }];
+        let mut obs = all_missing(&r, &ledger);
+        obs.seen.insert(
+            "old".into(),
+            Seen {
+                node: Node::Dir {
+                    mode: 0o755,
+                    own: true,
+                },
+                alias: None,
+            },
+        );
+        obs.seen.insert(
+            "old/file".into(),
+            Seen {
+                node: Node::File {
+                    mode: 0o644,
+                    own: false,
+                    size: 1,
+                    sha256: Some("0".repeat(64)),
+                },
+                alias: None,
+            },
+        );
+        let p = run(&r, &obs, ledger);
+        let b = p
+            .blockers
+            .iter()
+            .find(|b| b.resource == "gone.res")
+            .unwrap();
+        assert_eq!(b.code.as_str(), "E_PRIVILEGE_UNSUPPORTED");
+    }
+
+    #[test]
+    fn a_case_only_retarget_is_a_different_link_and_makes_the_plan_stale() {
+        let link = |t: &str| Seen {
+            node: Node::Link {
+                target: t.into(),
+                to: LinkTo::File,
+                own: true,
+            },
+            alias: None,
+        };
+        assert_ne!(
+            node_state(&link("/a/Config"), false),
+            node_state(&link("/a/config"), false)
+        );
+        assert_eq!(node_state(&link("/a/Config"), false), "link:/a/Config:file");
+        let r = resolved();
+        let mk = |t: &str| {
+            let mut obs = all_missing(&r, &[]);
+            obs.seen.insert(
+                ".ssh".into(),
+                Seen {
+                    node: Node::Dir {
+                        mode: 0o700,
+                        own: true,
+                    },
+                    alias: None,
+                },
+            );
+            obs.seen.insert(".ssh/config".into(), link(t));
+            run(&r, &obs, vec![])
+        };
+        let (a, b) = (mk("/a/Config"), mk("/a/config"));
+        let diffs = stale(&a, &b).unwrap();
+        let d = diffs
+            .iter()
+            .find(|d| d.subject == "path:.ssh/config")
+            .expect("stale path");
+        assert_eq!(
+            (d.was.as_str(), d.now.as_str()),
+            ("link:/a/Config:file", "link:/a/config:file")
+        );
+        assert_eq!(
+            diffs
+                .iter()
+                .filter(|d| d.subject == "path:.ssh/config")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn a_node_with_an_unknown_key_is_refused() {
+        let ok: Result<Node, _> = serde_json::from_value(serde_json::json!({"kind": "missing"}));
+        assert!(ok.is_ok());
+        let bad: Result<Node, _> =
+            serde_json::from_value(serde_json::json!({"kind": "missing", "extra": 1}));
+        assert!(bad.is_err());
+        let bad: Result<Node, _> = serde_json::from_value(
+            serde_json::json!({"kind": "dir", "mode": 493, "own": true, "extra": 1}),
+        );
+        assert!(bad.is_err());
     }
 }

@@ -32,7 +32,7 @@ fn every_prefix_is_observed_and_a_missing_one_ends_the_walk() {
     let keys: Vec<_> = o.seen.keys().map(String::as_str).collect();
     assert_eq!(keys, ["a", "a/b", "a/b/c"]);
     assert!(matches!(o.seen["a/b"].node, Node::Dir { own: true, .. }));
-    assert_eq!(o.seen["a/b/c"].node, Node::Missing);
+    assert_eq!(o.seen["a/b/c"].node, Node::Missing {});
 }
 
 #[test]
@@ -119,7 +119,7 @@ fn a_wrong_case_spelling_is_reported_as_an_alias_when_the_filesystem_folds_case(
         assert_eq!(o.seen["config"].alias.as_deref(), Some("Config"));
     } else {
         eprintln!("SKIPPED: this volume is case sensitive");
-        assert_eq!(o.seen["config"].node, Node::Missing);
+        assert_eq!(o.seen["config"].node, Node::Missing {});
     }
     // The exact spelling is never an alias.
     let o = seen(&h, &[req("Config", false, false)]);
@@ -172,6 +172,10 @@ fn tree(root: &std::path::Path) -> Vec<(String, u32, u64)> {
 
 #[test]
 fn unreadable_entries_are_unknown_facts_and_never_abort_the_walk() {
+    if sys(&Home::new()).uid == 0 {
+        eprintln!("SKIPPED: running as root");
+        return;
+    }
     let h = Home::new();
     fs::create_dir_all(h.0.join("closed/inner")).unwrap();
     fs::write(h.0.join("secret"), "x").unwrap();
@@ -206,6 +210,7 @@ fn unreadable_entries_are_unknown_facts_and_never_abort_the_walk() {
 
 #[test]
 fn a_directory_is_listed_once_for_many_requests() {
+    dfm_engine::reset_listed();
     let h = Home::new();
     fs::create_dir_all(h.0.join("d")).unwrap();
     for n in ["a", "b", "c"] {
@@ -215,7 +220,10 @@ fn a_directory_is_listed_once_for_many_requests() {
         .iter()
         .map(|p| req(p, true, false))
         .collect();
+    dfm_engine::reset_listed();
     let o = seen(&h, &reqs);
+    // HOME and `d`, once each, for three requests that share them.
+    assert_eq!(dfm_engine::listed(), 2);
     assert_eq!(o.seen.len(), 4);
     assert!(o.seen.values().all(|s| s.alias.is_none()));
 }

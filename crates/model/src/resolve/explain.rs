@@ -189,14 +189,14 @@ fn describe(resolved: &Resolved, r: &ResolvedResource, out: &mut String) -> Resu
         );
         // Any selected module may place a matching file here, and its name sets its position.
         // The owner does not opt in, so every supplier is listed.
-        let dir = d.dir.to_lowercase();
-        let pattern = d.pattern.to_lowercase();
+        let dir = crate::fold::fold(&d.dir);
+        let pattern = crate::fold::fold(&d.pattern);
         let mut suppliers: Vec<(&str, &ResolvedResource)> = Vec::new();
         for o in resolved.resources.values().filter(|o| o.id != r.id) {
             for claim in &o.claims {
                 if let Some((parent, name)) = claim.rsplit_once('/')
-                    && parent.to_lowercase() == dir
-                    && glob(&pattern, &name.to_lowercase())
+                    && crate::fold::fold(parent) == dir
+                    && glob(&pattern, &crate::fold::fold(name))
                 {
                     suppliers.push((name, o));
                 }

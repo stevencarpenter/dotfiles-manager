@@ -8,7 +8,7 @@ use super::{
 use crate::digest::sha256_hex;
 use crate::fold::fold;
 use crate::refusal::{Code, Refusal};
-use crate::resolve::{Resolved, ResolvedResource, glob};
+use crate::resolve::{DirClaim, Resolved, ResolvedResource, glob};
 use crate::state::Class;
 use std::collections::{BTreeMap, BTreeSet};
 use toml::Value;
@@ -48,18 +48,23 @@ pub struct Context<'a> {
     /// HOME-relative claimed paths that overlap the manager's own paths, with the reason. The
     /// caller decides this with the store's rules (text scope and filesystem identity).
     pub reserved: BTreeMap<String, String>,
+    /// HOME-relative claimed paths for which that check failed for another reason, with it.
+    pub unchecked: BTreeMap<String, String>,
 }
 
-/// Ledger outputs that no selected resource claims any more: candidates for removal.
+/// Ledger outputs of a resource that is no longer selected, at a path no selected resource
+/// claims: candidates for removal. A resource that is still selected keeps its outputs even when
+/// it claims nothing now, and a path that another resource claims is that resource's business.
 fn removals<'a>(resolved: &Resolved, ledger: &'a [Owned]) -> Vec<&'a Owned> {
+    let claimed: BTreeSet<String> = resolved
+        .resources
+        .values()
+        .flat_map(|r| r.claims.iter().map(|c| fold(c)))
+        .collect();
     ledger
         .iter()
         .filter(|o| {
-            let f = fold(&o.path);
-            !resolved
-                .resources
-                .get(&o.resource)
-                .is_some_and(|r| r.claims.iter().any(|c| fold(c) == f))
+            !resolved.resources.contains_key(&o.resource) && !claimed.contains(&fold(&o.path))
         })
         .collect()
 }
@@ -79,6 +84,14 @@ pub fn requests(resolved: &Resolved, ledger: &[Owned]) -> Vec<Request> {
     }
     for o in removals(resolved, ledger) {
         want.entry(o.path.clone()).or_default().0 |= o.class == Class::Normal;
+    }
+    // Whatever else asked for it, a path that a selected sensitive resource claims is never hashed.
+    for r in resolved.resources.values().filter(|r| r.sensitive) {
+        for c in &r.claims {
+            if let Some(w) = want.get_mut(c) {
+                w.0 = false;
+            }
+        }
     }
     want.into_iter()
         .map(|(path, (hash, list))| Request { path, hash, list })
@@ -151,6 +164,10 @@ struct Planner<'a> {
     ledger: BTreeMap<String, &'a Owned>,
     ops: BTreeMap<String, Operation>,
     blockers: Vec<Blocker>,
+    /// Operations made for claims, and for removals. Edges look at these sets, never at the
+    /// action, so a blocked or absent removal cannot count as a producer.
+    leaf_ids: BTreeSet<String>,
+    removal_ids: BTreeSet<String>,
 }
 
 pub fn build(resolved: &Resolved, cx: &Context<'_>, obs: &Observations) -> Result<Plan, Refusal> {
@@ -164,6 +181,8 @@ pub fn build(resolved: &Resolved, cx: &Context<'_>, obs: &Observations) -> Resul
         ledger,
         ops: BTreeMap::new(),
         blockers: Vec::new(),
+        leaf_ids: BTreeSet::new(),
+        removal_ids: BTreeSet::new(),
     };
     for r in resolved.resources.values() {
         p.resource(r);
@@ -228,8 +247,13 @@ fn journal_id(model_digest: &str, trees: &[&str], op_id: &str) -> String {
 /// Digest of the resolved model. Values of secret-bearing resources are left out: they are
 /// references, and no hash of secret material belongs in a plan (DESIGN.md section 8).
 fn model_digest(resolved: &Resolved) -> Result<String, Refusal> {
+    // Serializing these types cannot fail. If it ever does, it is reported as the same internal
+    // class `state::canonical` uses (E_STATE_INVALID), never as an I/O failure.
     let ser = |e: serde_json::Error| {
-        Refusal::new(Code::IoFailed, format!("cannot serialize the model: {e}"))
+        Refusal::new(
+            Code::StateInvalid,
+            format!("cannot serialize the model: {e}"),
+        )
     };
     let mut doc = serde_json::Map::new();
     for (id, r) in &resolved.resources {
@@ -257,10 +281,18 @@ fn pointer_escape(s: &str) -> String {
     s.replace('~', "~0").replace('/', "~1")
 }
 
-fn declared_mode(r: &ResolvedResource) -> Option<u32> {
+/// The mode a resource declares for its output. Only the permission bits are allowed: a value
+/// outside `0..=0o777` (including setuid, setgid and sticky) is refused, not dropped.
+fn declared_mode(r: &ResolvedResource) -> Result<Option<u32>, Fail> {
     match r.value.get("mode") {
-        Some(Value::Integer(m)) => u32::try_from(*m).ok(),
-        _ => None,
+        None => Ok(None),
+        Some(Value::Integer(m)) if (0..=0o777).contains(m) => Ok(u32::try_from(*m).ok()),
+        Some(_) => Err(fail(
+            Code::ManifestInvalid,
+            "/mode",
+            "the declared mode is not an integer from 0 to 0o777; setuid, setgid and sticky bits are not allowed".into(),
+            "declare permission bits only, for example 0o644",
+        )),
     }
 }
 
@@ -305,16 +337,24 @@ impl Planner<'_> {
             ));
         }
         if !path.is_ascii() {
-            return Err(fail(
-                Code::TargetInvalid,
-                field,
-                format!(
-                    "{path} contains non-ASCII characters; Unicode normalization is not supported yet, so two spellings could be one entry"
-                ),
-                "use an ASCII name for the target",
-            ));
+            return Err(non_ascii(field, path));
         }
         Ok(())
+    }
+
+    /// A path the manager's own paths could not be checked against (the check failed for a
+    /// reason other than an overlap). It runs after the topology walk, so a link loop or an
+    /// unreadable parent is reported with its own, more specific code first.
+    fn unchecked(&self, path: &str, field: &'static str) -> Result<(), Fail> {
+        match self.cx.unchecked.get(path) {
+            None => Ok(()),
+            Some(why) => Err(fail(
+                Code::ObservationUnknown,
+                field,
+                format!("{path} could not be checked against the manager's own paths: {why}"),
+                "make the path readable and run plan again",
+            )),
+        }
     }
 
     /// Walks the parents of `path` (every proper prefix). `write` means entries will be created
@@ -330,7 +370,7 @@ impl Planner<'_> {
                 return Err(alias_fail(field, &p, actual));
             }
             match &seen.node {
-                Node::Missing => {
+                Node::Missing {} => {
                     if write
                         && let Some((d, mode)) = &deepest
                         && mode & 0o200 == 0
@@ -404,7 +444,7 @@ impl Planner<'_> {
             action: Action::None,
             status: Status::Blocked,
             path,
-            mode: declared_mode(r),
+            mode: None,
             link: None,
             privilege: "user".into(),
             effect: String::new(),
@@ -435,6 +475,10 @@ impl Planner<'_> {
         let mut op = self.skeleton(r, id.clone(), path);
         op.status = Status::NotInScope;
         op.effect = effect;
+        match declared_mode(r) {
+            Ok(m) => op.mode = m,
+            Err(f) => self.blocker(r, op.path.clone().as_deref(), f),
+        }
         self.ops.insert(id, op);
     }
 
@@ -472,7 +516,7 @@ impl Planner<'_> {
     }
 
     fn ownership(&self, resource: &str, sensitive: bool, path: &str, seen: &Seen) -> Ownership {
-        if matches!(seen.node, Node::Missing) {
+        if matches!(seen.node, Node::Missing {}) {
             return Ownership::Absent;
         }
         let Some(e) = self.ledger_entry(path) else {
@@ -498,15 +542,14 @@ impl Planner<'_> {
         }
     }
 
-    fn ledger_state(&self, path: &str) -> String {
+    /// The ledger entry for a path as a precondition string. For a sensitive path the
+    /// fingerprint is left out, whoever owns the entry: it can be a hash of credentials.
+    fn ledger_state(&self, path: &str, sensitive: bool) -> String {
         self.ledger_entry(path).map_or_else(
             || "none".into(),
-            |e| {
-                format!(
-                    "{}:{}",
-                    e.resource,
-                    e.fingerprint.clone().unwrap_or_else(|| "sensitive".into())
-                )
+            |e| match (&e.fingerprint, sensitive) {
+                (Some(f), false) => format!("{}:{f}", e.resource),
+                _ => format!("{}:sensitive", e.resource),
             },
         )
     }
@@ -518,6 +561,7 @@ impl Planner<'_> {
             "target"
         };
         let id = format!("{}@{claim}", r.id);
+        self.leaf_ids.insert(id.clone());
         let (inputs, link) = self.inputs(r, claim);
         let mut op = self.skeleton(r, id.clone(), Some(claim.into()));
         op.inputs = inputs;
@@ -544,7 +588,9 @@ impl Planner<'_> {
         op: &mut Operation,
     ) -> Result<(), Fail> {
         self.claim_checks(claim, field)?;
+        op.mode = declared_mode(r)?;
         let parents = self.parents(claim, field, true)?;
+        self.unchecked(claim, field)?;
         op.preconditions.extend(parents.states.clone());
         let comps = parts(claim);
         let mut prev: Option<String> = None;
@@ -556,7 +602,7 @@ impl Planner<'_> {
         }
         let seen = if parents.missing_from.is_some() {
             Seen {
-                node: Node::Missing,
+                node: Node::Missing {},
                 alias: None,
             }
         } else {
@@ -574,7 +620,7 @@ impl Planner<'_> {
         op.ownership = self.ownership(&r.id, r.sensitive, claim, &seen);
         op.preconditions.push(Precondition {
             subject: format!("ledger:{claim}"),
-            state: self.ledger_state(claim),
+            state: self.ledger_state(claim, r.sensitive),
         });
         let (action, status, ownership, effect, post) =
             decide(r, claim, &seen, link, op.ownership)?;
@@ -591,6 +637,7 @@ impl Planner<'_> {
     /// the live output is the one the manager wrote. Anything else is a conflict.
     fn remove(&mut self, o: &Owned) {
         let id = format!("remove@{}@{}", o.resource, o.path);
+        self.removal_ids.insert(id.clone());
         let mut op = Operation {
             id: id.clone(),
             journal_id: String::new(),
@@ -623,11 +670,14 @@ impl Planner<'_> {
     fn remove_checks(&self, o: &Owned, op: &mut Operation) -> Result<(), Fail> {
         let field = "owned_outputs";
         let path = o.path.as_str();
+        if !path.is_ascii() {
+            return Err(non_ascii(field, path));
+        }
         let parents = self.parents(path, field, true)?;
         op.preconditions.extend(parents.states.clone());
         let seen = if parents.missing_from.is_some() {
             Seen {
-                node: Node::Missing,
+                node: Node::Missing {},
                 alias: None,
             }
         } else {
@@ -642,15 +692,20 @@ impl Planner<'_> {
         });
         op.preconditions.push(Precondition {
             subject: format!("ledger:{path}"),
-            state: self.ledger_state(path),
+            state: self.ledger_state(path, o.class == Class::Sensitive),
         });
         match &seen.node {
-            Node::Missing => {
+            Node::Missing {} => {
                 op.status = Status::Current;
                 op.effect = format!("{path} is already absent; no longer selected");
                 return Ok(());
             }
             Node::Unknown { reason } => return Err(unknown_fail(field, path, reason)),
+            Node::File { own: false, .. }
+            | Node::Link { own: false, .. }
+            | Node::Other { own: false, .. } => {
+                return Err(privilege(field, path, "is owned by another user"));
+            }
             Node::Dir { .. } => {
                 return Err(fail(
                     Code::Conflict,
@@ -710,6 +765,7 @@ impl Planner<'_> {
         let check = self
             .claim_checks(dir, "/fragments_dir")
             .and_then(|()| self.parents(dir, "/fragments_dir", false))
+            .and_then(|p| self.unchecked(dir, "/fragments_dir").map(|()| p))
             .and_then(|p| {
                 if p.missing_from.is_some() {
                     return Ok(());
@@ -719,7 +775,7 @@ impl Planner<'_> {
                     return Err(alias_fail("/fragments_dir", dir, a));
                 }
                 match &seen.node {
-                    Node::Missing => Ok(()),
+                    Node::Missing {} => Ok(()),
                     Node::Dir { own: true, .. } => Ok(()),
                     Node::Dir { .. } => {
                         Err(privilege("/fragments_dir", dir, "is owned by another user"))
@@ -818,89 +874,131 @@ impl Planner<'_> {
     fn edges(&mut self, resolved: &Resolved) {
         for r in resolved.resources.values().filter(|r| in_scope(r)) {
             for d in &r.dir_claims {
-                let consumers: Vec<String> = r
-                    .claims
-                    .iter()
-                    .map(|c| format!("{}@{c}", r.id))
-                    .filter(|id| self.ops.contains_key(id))
-                    .collect();
-                let dir_f = fold(&d.dir);
-                let mut selected: Vec<(String, String, String)> = Vec::new();
-                for (id, o) in &self.ops {
-                    let Some(p) = &o.path else { continue };
-                    if matches!(o.action, Action::CreateDir | Action::Remove)
-                        || o.status == Status::NotInScope
-                    {
-                        continue;
-                    }
-                    let Some((parent, name)) = p.rsplit_once('/') else {
-                        continue;
-                    };
-                    if fold(parent) == dir_f && matches_pattern(&d.pattern, name) {
-                        selected.push((id.clone(), o.resource.clone(), name.to_string()));
-                    }
+                self.fragment_edges(r, d);
+            }
+        }
+    }
+
+    /// Operations made for claims that put a file directly in `dir` and match `pattern`:
+    /// (operation id, resource, file name). Removals and directory creation never produce.
+    fn producers(&self, dir: &str, pattern: &str) -> Vec<(String, String, String)> {
+        let dir_f = fold(dir);
+        let mut out = Vec::new();
+        for id in &self.leaf_ids {
+            let Some(o) = self.ops.get(id) else { continue };
+            let Some((parent, name)) = o.path.as_deref().and_then(|p| p.rsplit_once('/')) else {
+                continue;
+            };
+            if fold(parent) == dir_f && matches_pattern(pattern, name) {
+                out.push((id.clone(), o.resource.clone(), name.to_string()));
+            }
+        }
+        out
+    }
+
+    /// Planned removals by folded path: (operation id, resource).
+    fn planned_removals(&self) -> BTreeMap<String, (String, String)> {
+        self.removal_ids
+            .iter()
+            .filter_map(|id| self.ops.get(id))
+            .filter(|o| o.action == Action::Remove && o.status == Status::Planned)
+            .filter_map(|o| Some((fold(o.path.as_deref()?), (o.id.clone(), o.resource.clone()))))
+            .collect()
+    }
+
+    fn fragment_edges(&mut self, r: &ResolvedResource, d: &DirClaim) {
+        let consumers: Vec<String> = r
+            .claims
+            .iter()
+            .map(|c| format!("{}@{c}", r.id))
+            .filter(|id| self.ops.contains_key(id))
+            .collect();
+        let selected = self.producers(&d.dir, &d.pattern);
+        let selected_names: BTreeSet<String> = selected.iter().map(|(_, _, n)| fold(n)).collect();
+        let mut fragments: Vec<Fragment> = selected
+            .iter()
+            .map(|(_, res, n)| Fragment {
+                name: n.clone(),
+                origin: format!("selected:{res}"),
+            })
+            .collect();
+        let removals = self.planned_removals();
+        let (mut foreign_state, mut removing, mut problems) = (Vec::new(), Vec::new(), Vec::new());
+        if let Some(l) = self.obs.listings.get(&d.dir) {
+            for n in l.names.iter().filter(|n| matches_pattern(&d.pattern, n)) {
+                let path = format!("{}/{n}", d.dir);
+                if selected_names.contains(&fold(n)) {
+                    continue;
                 }
-                let selected_names: BTreeSet<String> =
-                    selected.iter().map(|(_, _, n)| fold(n)).collect();
-                let mut fragments: Vec<Fragment> = selected
-                    .iter()
-                    .map(|(_, res, n)| Fragment {
+                // A fragment that a planned removal deletes is read first, then removed.
+                if let Some((rid, res)) = removals.get(&fold(&path)) {
+                    fragments.push(Fragment {
                         name: n.clone(),
-                        origin: format!("selected:{res}"),
-                    })
-                    .collect();
-                let mut foreign_state = Vec::new();
-                let mut problems = Vec::new();
-                if let Some(l) = self.obs.listings.get(&d.dir) {
-                    for n in l.names.iter().filter(|n| matches_pattern(&d.pattern, n)) {
-                        if selected_names.contains(&fold(n)) {
-                            continue;
-                        }
-                        fragments.push(Fragment {
-                            name: n.clone(),
-                            origin: "foreign".into(),
-                        });
-                        let st = self
-                            .obs
-                            .seen
-                            .get(&format!("{}/{n}", d.dir))
-                            .map_or_else(|| "unobserved".into(), |s| node_state(s, false));
-                        foreign_state.push(format!("{n}={st}"));
-                        if let Some(f) = self.fragment_problem(&d.dir, n) {
-                            problems.push((format!("{}/{n}", d.dir), f));
-                        }
+                        origin: format!("removing:{res}"),
+                    });
+                    removing.push((n.clone(), rid.clone()));
+                    continue;
+                }
+                fragments.push(Fragment {
+                    name: n.clone(),
+                    origin: "foreign".into(),
+                });
+                let st = self
+                    .obs
+                    .seen
+                    .get(&path)
+                    .map_or_else(|| "unobserved".into(), |s| node_state(s, false));
+                foreign_state.push(format!("{n}={st}"));
+                if let Some(f) = self.fragment_problem(&d.dir, n) {
+                    problems.push((path, f));
+                }
+            }
+        }
+        fragments.sort_by(|a, b| (&a.name, &a.origin).cmp(&(&b.name, &b.origin)));
+        let mut names: Vec<String> = selected.iter().map(|(_, _, n)| n.clone()).collect();
+        names.sort();
+        let state = format!(
+            "selected=[{}] foreign=[{}] removing=[{}]",
+            names.join(","),
+            foreign_state.join(","),
+            removing
+                .iter()
+                .map(|(n, _)| n.as_str())
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        let blocked = !problems.is_empty();
+        for (path, f) in problems {
+            self.blocker(r, Some(&path), f);
+        }
+        for cid in &consumers {
+            if let Some(op) = self.ops.get_mut(cid) {
+                for (pid, _, _) in &selected {
+                    if !op.after.contains(pid) {
+                        op.after.push(pid.clone());
                     }
                 }
-                fragments.sort_by(|a, b| (&a.name, &a.origin).cmp(&(&b.name, &b.origin)));
-                let mut names: Vec<String> = selected.iter().map(|(_, _, n)| n.clone()).collect();
-                names.sort();
-                let blocked = !problems.is_empty();
-                for (path, f) in problems {
-                    self.blocker(r, Some(&path), f);
+                op.after.sort();
+                op.fragments = fragments.clone();
+                op.preconditions.push(Precondition {
+                    subject: format!("fragments:{}", d.dir),
+                    state: state.clone(),
+                });
+                if blocked {
+                    op.status = Status::Blocked;
+                    op.effect = format!("blocked: a fragment in {} cannot be used", d.dir);
                 }
-                for cid in consumers {
-                    if let Some(op) = self.ops.get_mut(&cid) {
-                        for (pid, _, _) in &selected {
-                            if !op.after.contains(pid) {
-                                op.after.push(pid.clone());
-                            }
-                        }
-                        op.after.sort();
-                        op.fragments = fragments.clone();
-                        op.preconditions.push(Precondition {
-                            subject: format!("fragments:{}", d.dir),
-                            state: format!(
-                                "selected=[{}] foreign=[{}]",
-                                names.join(","),
-                                foreign_state.join(",")
-                            ),
-                        });
-                        if blocked {
-                            op.status = Status::Blocked;
-                            op.effect = format!("blocked: a fragment in {} cannot be used", d.dir);
-                        }
+            }
+        }
+        // The removal waits for every consumer that reads the file.
+        for (_, rid) in removing {
+            if let Some(rm) = self.ops.get_mut(&rid) {
+                for cid in &consumers {
+                    if !rm.after.contains(cid) {
+                        rm.after.push(cid.clone());
                     }
                 }
+                rm.after.sort();
             }
         }
     }
@@ -981,7 +1079,7 @@ fn decide(
         Some(want) => {
             let post = format!("readlink {path} equals {want}");
             match (&seen.node, ownership) {
-                (Node::Missing, _) => Ok((
+                (Node::Missing {}, _) => Ok((
                     Action::CreateLink,
                     Status::Planned,
                     Ownership::Absent,
@@ -1018,7 +1116,7 @@ fn decide(
         None => {
             let post = format!("{path} holds the rendered content of {}", r.adapter);
             match (&seen.node, ownership) {
-                (Node::Missing, _) => Ok((
+                (Node::Missing {}, _) => Ok((
                     Action::CreateFile,
                     Status::Planned,
                     Ownership::Absent,
@@ -1042,6 +1140,17 @@ fn decide(
             }
         }
     }
+}
+
+fn non_ascii(field: &'static str, path: &str) -> Fail {
+    fail(
+        Code::TargetInvalid,
+        field,
+        format!(
+            "{path} contains non-ASCII characters; Unicode normalization is not supported yet, so two spellings could be one entry"
+        ),
+        "use an ASCII name for the target",
+    )
 }
 
 fn alias_fail(field: &'static str, path: &str, actual: &str) -> Fail {

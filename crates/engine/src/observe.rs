@@ -14,6 +14,7 @@ use dfm_model::plan::{
     Incomplete, LinkTo, Listing, MAX_HASHED_BYTES, MAX_LISTING, Node, Observations, Request, Seen,
 };
 use std::collections::BTreeMap;
+use std::rc::Rc;
 
 fn lower(to: PeekTo) -> LinkTo {
     match to {
@@ -57,7 +58,7 @@ fn unknown(reason: &str) -> Node {
 
 fn node(peek: Peek, dir: &Dir, name: &str, hash: bool) -> Node {
     match peek {
-        Peek::Missing => Node::Missing,
+        Peek::Missing => Node::Missing {},
         Peek::Dir { mode, own } => Node::Dir { mode, own },
         Peek::File { mode, own, size } => {
             let sha256 = if !hash {
@@ -96,7 +97,7 @@ fn node(peek: Peek, dir: &Dir, name: &str, hash: bool) -> Node {
 pub fn observe(sys: &Sys, home: &Dir, requests: &[Request]) -> Result<Observations, Refusal> {
     let mut out = Observations::default();
     // Entry names of each directory, by its HOME-relative path, for the case check.
-    let mut names: BTreeMap<String, Listing> = BTreeMap::new();
+    let mut names: BTreeMap<String, Rc<Listing>> = BTreeMap::new();
     for req in requests {
         let comps: Vec<&str> = req.path.split('/').collect();
         let mut dir = home.try_clone()?;
@@ -116,10 +117,11 @@ pub fn observe(sys: &Sys, home: &Dir, requests: &[Request]) -> Result<Observatio
             if !known {
                 // On a case-folding filesystem a lookup of the wrong case succeeds, so the
                 // listing of the parent is what tells the two spellings apart.
-                let siblings = names
-                    .entry(parent.clone())
-                    .or_insert_with(|| list(&dir))
-                    .clone();
+                let siblings = Rc::clone(
+                    names
+                        .entry(parent.clone())
+                        .or_insert_with(|| Rc::new(list(&dir))),
+                );
                 let al = if exists && !siblings.names.iter().any(|n| n == name) {
                     let f = fold(name);
                     siblings.names.iter().find(|n| fold(n) == f).cloned()
@@ -161,8 +163,10 @@ pub fn observe(sys: &Sys, home: &Dir, requests: &[Request]) -> Result<Observatio
                 }
             };
             if last && req.list && !out.listings.contains_key(&path) {
-                let l = names.entry(path.clone()).or_insert_with(|| list(&next));
-                out.listings.insert(path.clone(), l.clone());
+                let l = names
+                    .entry(path.clone())
+                    .or_insert_with(|| Rc::new(list(&next)));
+                out.listings.insert(path.clone(), Listing::clone(l));
             }
             dir = next;
             parent = path;

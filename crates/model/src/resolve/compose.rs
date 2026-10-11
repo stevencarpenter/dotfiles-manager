@@ -1029,7 +1029,7 @@ fn include_groups(
 ) -> Vec<IncludeGroup> {
     let by_target: BTreeMap<String, &ResolvedResource> = resolved
         .values()
-        .filter_map(|r| r.target.as_ref().map(|t| (t.to_lowercase(), r)))
+        .filter_map(|r| r.target.as_ref().map(|t| (crate::fold::fold(t), r)))
         .collect();
     raw.into_iter()
         .map(|(base, includes)| {
@@ -1040,7 +1040,7 @@ fn include_groups(
                     let hit = inc
                         .path
                         .strip_prefix("~/")
-                        .and_then(|rel| by_target.get(&rel.to_lowercase()))
+                        .and_then(|rel| by_target.get(&crate::fold::fold(rel)))
                         .filter(|r| r.id != base);
                     IncludeEntry {
                         position: i + 1,
@@ -1251,7 +1251,7 @@ pub(crate) fn glob(pattern: &str, name: &str) -> bool {
 fn check_claims(resolved: &BTreeMap<String, ResolvedResource>) -> Result<(), ResolveError> {
     let fold = |p: &str| {
         p.split('/')
-            .map(str::to_lowercase)
+            .map(crate::fold::fold)
             .collect::<Vec<_>>()
             .join("/")
     };
@@ -1324,7 +1324,7 @@ fn check_claims(resolved: &BTreeMap<String, ResolvedResource>) -> Result<(), Res
                     let rest = &parts[end..];
                     let as_fragment = owner != gid.as_str()
                         && rest.len() == 1
-                        && glob(&d.pattern.to_lowercase(), rest[0]);
+                        && glob(&crate::fold::fold(&d.pattern), rest[0]);
                     if !as_fragment {
                         return Err(collision(
                             r,
