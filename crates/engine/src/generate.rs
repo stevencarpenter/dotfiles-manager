@@ -34,6 +34,9 @@ pub struct GeneratorInputs {
     pub live: Option<Vec<u8>>,
     /// The handler entries the ledger records as added by the manager (merge and retire).
     pub owned_entries: Vec<OwnedEntry>,
+    /// The operation is the approved first write into an existing co-owned file with no ledger
+    /// entry. A merge then records an identical entry already in place as owned.
+    pub takeover: bool,
 }
 
 /// `Debug` prints the size of the live file and never its bytes: it can hold credentials.

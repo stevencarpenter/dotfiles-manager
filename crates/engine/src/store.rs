@@ -1119,5 +1119,17 @@ pub fn verify_identity(l: &Loaded, b: &Binding) -> Vec<Finding> {
         }
         Err(r) => add(r.code, "journal.jsonl", r.detail.clone()),
     }
+    if let Ok(entries) = &l.journal {
+        for u in state::unresolved(entries) {
+            add(
+                Code::OpInterrupted,
+                "journal.jsonl",
+                format!(
+                    "operation {} of run {} ended unknown and still blocks its path",
+                    u.unknown.op, u.unknown.op_id
+                ),
+            );
+        }
+    }
     out
 }

@@ -2097,3 +2097,366 @@ fn a_signal_before_a_pre_run_check_fails_still_decides_the_exit() {
     assert_eq!(code(&o), 143, "{}\n{out}", stderr(&o));
     assert!(out.contains("result: terminated"), "{out}");
 }
+
+// ---- recovery of unknown outcomes across runs (DFM-19) -----------------------------------
+
+impl Fx {
+    /// Applies with one failpoint armed. `link-after-create:error` ends the first link
+    /// `unknown`: the link exists and its durability is unconfirmed.
+    fn apply_failing(&self, point: &str, extra: &[&str]) -> Output {
+        let d = self.digest();
+        Command::new(BIN)
+            .env_clear()
+            .env("DFM_FAILPOINT", point)
+            .arg("--home")
+            .arg(self.home.path())
+            .args(["apply", "--root", self.root_arg(), "--yes-plan", &d])
+            .args(extra)
+            .output()
+            .unwrap()
+    }
+
+    /// The journal id of the one operation that is still `unknown`, and its path.
+    fn unknown_entry(&self) -> (String, PathBuf) {
+        let j = self.journal();
+        let u = j.iter().find(|e| e["phase"] == "unknown").unwrap();
+        let id = u["op_id"].as_str().unwrap().to_string();
+        let intent = j
+            .iter()
+            .find(|e| e["op_id"] == id.as_str() && e["phase"] == "intent")
+            .unwrap();
+        let path = intent["recovery"]["outputs"][0]["path"].as_str().unwrap();
+        (id, PathBuf::from(path))
+    }
+
+    fn doctor(&self) -> Output {
+        self.run(&["doctor", "--root", self.root_arg()])
+    }
+}
+
+fn after_unknown_link() -> (Fx, String, PathBuf) {
+    let fx = Fx::new();
+    let o = fx.apply_failing("link-after-create:error", &[]);
+    assert_eq!(code(&o), 1, "{}\n{}", stderr(&o), text(&o.stdout));
+    assert!(stderr(&o).contains("E_IO_UNCONFIRMED"), "{}", stderr(&o));
+    let (id, path) = fx.unknown_entry();
+    assert!(fx.owned_paths().is_empty(), "unknown records no ownership");
+    (fx, id, path)
+}
+
+#[test]
+fn a_second_run_settles_an_unconfirmed_link_done_and_records_ownership() {
+    let (fx, id, path) = after_unknown_link();
+    // The link exists and is exactly the planned one, so the plan adopts it.
+    let ids = fx.adopt_ids();
+    assert_eq!(ids.len(), 1, "{ids:?}");
+    let o = fx.apply(&adopt_args(&ids));
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+    let j = fx.journal();
+    let settled = j
+        .iter()
+        .find(|e| e["op_id"] == id.as_str() && e["phase"] == "done")
+        .unwrap();
+    assert_eq!(settled["reason"], "recovered: done");
+    let rel = path.strip_prefix(fx.home.path()).unwrap().to_str().unwrap();
+    assert!(fx.owned_paths().contains(&rel.to_string()));
+    // Everything else was published and the machine is now clean.
+    assert_eq!(fx.owned_paths().len(), 4, "{:?}", fx.owned_paths());
+    let o = fx.apply(&[]);
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+    assert_eq!(code(&fx.doctor()), 0, "{}", text(&fx.doctor().stdout));
+}
+
+#[test]
+fn a_second_run_settles_an_unconfirmed_link_failed_when_it_was_removed_between_runs() {
+    let (fx, id, path) = after_unknown_link();
+    fs::remove_file(&path).unwrap();
+    let o = fx.apply(&[]);
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+    let j = fx.journal();
+    let settled = j
+        .iter()
+        .find(|e| e["op_id"] == id.as_str() && e["phase"] == "failed")
+        .unwrap();
+    assert_eq!(settled["reason"], "recovered: not done");
+    // The path is free again: this same run created the link and owns it.
+    assert!(path.symlink_metadata().is_ok());
+    assert_eq!(fx.owned_paths().len(), 4);
+}
+
+#[test]
+fn doctor_and_status_show_an_open_unknown_as_an_error_with_its_journal_id() {
+    let (fx, id, path) = after_unknown_link();
+    // A directory in place of the link: no probe can call the operation done or not done.
+    fs::remove_file(&path).unwrap();
+    fs::create_dir(&path).unwrap();
+    for cmd in ["doctor", "status"] {
+        let o = fx.run(&[cmd, "--root", fx.root_arg()]);
+        assert_eq!(code(&o), 1, "{cmd}: {}", text(&o.stdout));
+        let out = text(&o.stdout);
+        assert!(
+            out.lines()
+                .any(|l| l.starts_with("ERROR") && l.contains("E_OP_INTERRUPTED")),
+            "{cmd}: {out}"
+        );
+    }
+    let o = fx.run(&["doctor", "--root", fx.root_arg(), "--json"]);
+    let v: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
+    let row = v["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["kind"] == "intent" && r["detail"].as_str().unwrap().contains(&id))
+        .unwrap();
+    assert_eq!(row["status"], "ERROR");
+    assert_eq!(row["required"], true);
+    assert_eq!(row["code"], "E_OP_INTERRUPTED");
+    // It stays open across runs: apply refuses (the directory conflicts) and settles nothing.
+    for _ in 0..2 {
+        let o = fx.apply(&[]);
+        assert_eq!(code(&o), 3, "{}\n{}", stderr(&o), text(&o.stdout));
+        assert_eq!(fx.unknown_entry().0, id);
+    }
+}
+
+#[test]
+fn state_resolve_done_records_ownership_only_when_the_path_matches() {
+    let (fx, id, path) = after_unknown_link();
+    let target = fs::read_link(&path).unwrap();
+    // Mismatch: the link is retargeted. Nothing in HOME or state changes.
+    fs::remove_file(&path).unwrap();
+    symlink("/elsewhere", &path).unwrap();
+    let before = fingerprint(fx.home.path());
+    let o = fx.run(&["state", "resolve", &id, "--as", "done"]);
+    assert_eq!(code(&o), 3, "{}\n{}", stderr(&o), text(&o.stdout));
+    assert!(stderr(&o).contains("E_CONFLICT"), "{}", stderr(&o));
+    assert!(stderr(&o).contains("--as failed"), "{}", stderr(&o));
+    assert_eq!(fingerprint(fx.home.path()), before);
+    assert!(fx.owned_paths().is_empty());
+    // Match: put the link back.
+    fs::remove_file(&path).unwrap();
+    symlink(&target, &path).unwrap();
+    let o = fx.run(&["state", "resolve", &id, "--as", "done"]);
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+    let j = fx.journal();
+    let last = j.last().unwrap();
+    assert_eq!(last["phase"], "done");
+    assert_eq!(last["reason"], "resolved by operator");
+    let rel = path.strip_prefix(fx.home.path()).unwrap().to_str().unwrap();
+    assert!(fx.owned_paths().contains(&rel.to_string()));
+    // No receipt is written for a resolution, and the entry is closed.
+    assert_eq!(fx.receipts().len(), 1);
+    let o = fx.run(&["state", "resolve", &id, "--as", "done"]);
+    assert_eq!(code(&o), 2, "{}", stderr(&o));
+}
+
+#[test]
+fn state_resolve_failed_needs_no_match_and_frees_the_path() {
+    let (fx, id, path) = after_unknown_link();
+    fs::remove_file(&path).unwrap();
+    fs::create_dir(&path).unwrap();
+    let o = fx.run(&["state", "resolve", &id, "--as", "failed"]);
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+    assert_eq!(fx.journal().last().unwrap()["phase"], "failed");
+    assert!(fx.owned_paths().is_empty());
+    assert_eq!(code(&fx.run(&["doctor", "--root", fx.root_arg()])), 1);
+    fs::remove_dir(&path).unwrap();
+    let o = fx.apply(&[]);
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+}
+
+#[test]
+fn state_resolve_usage_errors_exit_2_and_write_nothing() {
+    let (fx, id, _) = after_unknown_link();
+    let before = fingerprint(fx.home.path());
+    for args in [
+        vec!["state", "resolve"],
+        vec!["state", "resolve", &id],
+        vec!["state", "resolve", &id, "--as"],
+        vec!["state", "resolve", &id, "--as", "maybe"],
+        vec!["state", "resolve", &id, "--to", "done"],
+        vec!["state", "resolve", &id, "--as", "done", "extra"],
+        vec!["state", "resolve", "no-such-id-1", "--as", "failed"],
+    ] {
+        let o = fx.run(&args);
+        assert_eq!(code(&o), 2, "{args:?}: {}", stderr(&o));
+    }
+    assert_eq!(fingerprint(fx.home.path()), before);
+}
+
+#[test]
+fn state_recover_settles_a_new_resource_done_without_ownership_and_the_plan_offers_adopt() {
+    let (fx, id, _) = after_unknown_link();
+    let o = fx.run(&["state", "recover"]);
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+    assert!(
+        text(&o.stdout).contains(&format!("settled {id} as done")),
+        "{}",
+        text(&o.stdout)
+    );
+    let settled = fx.journal();
+    let last = settled.last().unwrap();
+    assert_eq!(
+        (last["phase"].as_str(), last["reason"].as_str()),
+        (Some("done"), Some("recovered: done"))
+    );
+    // The resource has no ledger entry and no plan was given, so nothing is owned. The next
+    // plan offers the adoption.
+    assert!(fx.owned_paths().is_empty());
+    assert_eq!(fx.adopt_ids().len(), 1);
+    // No receipt for a settle-only command.
+    assert_eq!(fx.receipts().len(), 1);
+    // Nothing is open any more.
+    let o = fx.run(&["state", "recover"]);
+    assert_eq!(code(&o), 0);
+    assert!(
+        text(&o.stdout).contains("nothing to recover"),
+        "{}",
+        text(&o.stdout)
+    );
+}
+
+#[test]
+fn state_recover_fixes_the_ledger_after_an_unknown_replace_link() {
+    let fx = Fx::new();
+    assert_eq!(code(&fx.apply(&[])), 0);
+    fx.put("base/modules/extra/files/zshrc2", "export B=2\n");
+    let m = fs::read_to_string(fx.root.join("base/modules/extra/module.toml")).unwrap();
+    fs::write(
+        fx.root.join("base/modules/extra/module.toml"),
+        m.replace("files/zshrc\"", "files/zshrc2\""),
+    )
+    .unwrap();
+    let o = fx.apply_failing("link-after-rename:error", &[]);
+    assert_eq!(code(&o), 1, "{}\n{}", stderr(&o), text(&o.stdout));
+    let (id, _) = fx.unknown_entry();
+    // The link already shows the planned target, so a plan calls it current ("already holds;
+    // not adopted: the ledger already has an entry") and nothing fixes the stale ledger
+    // fingerprint. Without recovery the ledger keeps the old target.
+    let old = fx.root.join("base/modules/extra/files/zshrc");
+    let fp_of = |fx: &Fx| {
+        fx.ledger()["resources"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|r| r["owned_outputs"].as_array().unwrap().iter())
+            .find(|o| o["path"].as_str().unwrap().ends_with("/.zshrc"))
+            .unwrap()["fingerprint"]
+            .clone()
+    };
+    assert_eq!(
+        fp_of(&fx),
+        dfm_model::plan::link_fingerprint(old.to_str().unwrap()).as_str()
+    );
+    let o = fx.run(&["plan", "--root", fx.root_arg()]);
+    let plan_text = text(&o.stdout);
+    assert!(
+        plan_text
+            .lines()
+            .any(|l| l.contains("current extra.zsh@.zshrc") && l.contains("already holds")),
+        "{plan_text}"
+    );
+    // The stale fingerprint also stops a removal: deselecting the module is refused.
+    fx.set_profile("");
+    assert_eq!(code(&fx.apply(&[])), 3);
+    fx.set_profile("\"extra\"");
+    // No flag and no plan are needed to clear it.
+    let o = fx.run(&["state", "recover"]);
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+    assert!(text(&o.stdout).contains(&format!("settled {id} as done")));
+    let new = fx.root.join("base/modules/extra/files/zshrc2");
+    let want = dfm_model::plan::link_fingerprint(new.to_str().unwrap());
+    let fp = fp_of(&fx);
+    assert_eq!(fp, want.as_str());
+    let o = fx.apply(&[]);
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+    // The new fingerprint authorizes the removal that the old one blocked.
+    fx.set_profile("");
+    let ids: Vec<String> = fx
+        .saved()
+        .plan
+        .operations
+        .iter()
+        .filter(|o| o.action == dfm_model::plan::Action::Remove)
+        .map(|o| o.id.clone())
+        .collect();
+    assert!(ids.iter().any(|i| i.ends_with("@.zshrc")), "{ids:?}");
+    let args: Vec<&str> = ids
+        .iter()
+        .flat_map(|i| ["--allow-disruptive", i.as_str()])
+        .collect();
+    let o = fx.apply(&args);
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+    assert!(fx.h(".zshrc").symlink_metadata().is_err());
+}
+
+#[test]
+fn a_mismatch_at_the_first_settle_closes_the_entry_so_a_later_match_is_never_owned() {
+    let (fx, id, path) = after_unknown_link();
+    let target = fs::read_link(&path).unwrap();
+    fs::remove_file(&path).unwrap();
+    symlink("/elsewhere", &path).unwrap();
+    let o = fx.run(&["state", "recover"]);
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+    assert!(text(&o.stdout).contains(&format!("settled {id} as failed")));
+    let j = fx.journal();
+    assert_eq!(
+        j.last().unwrap()["reason"],
+        "recovered: not done; a later match is not owned"
+    );
+    // Put the exact link back by hand. The entry is closed, so nothing owns the link.
+    fs::remove_file(&path).unwrap();
+    symlink(&target, &path).unwrap();
+    let o = fx.run(&["state", "recover"]);
+    assert_eq!(code(&o), 0);
+    assert!(
+        text(&o.stdout).contains("nothing to recover"),
+        "{}",
+        text(&o.stdout)
+    );
+    assert!(fx.owned_paths().is_empty());
+    // The plan offers the adoption, which needs its approval.
+    let ids = fx.adopt_ids();
+    assert_eq!(ids.len(), 1, "{ids:?}");
+    let o = fx.apply(&[]);
+    assert_eq!(code(&o), 3, "{}", stderr(&o));
+    assert!(stderr(&o).contains("E_ADOPT_UNAPPROVED"), "{}", stderr(&o));
+    assert_eq!(code(&fx.apply(&adopt_args(&ids))), 0);
+    assert_eq!(fx.owned_paths().len(), 4);
+}
+
+#[test]
+fn state_recover_exits_3_naming_the_id_while_an_entry_stays_open() {
+    let (fx, id, path) = after_unknown_link();
+    fs::remove_file(&path).unwrap();
+    fs::create_dir(&path).unwrap();
+    let before = fingerprint(fx.home.path());
+    let o = fx.run(&["state", "recover"]);
+    assert_eq!(code(&o), 3, "{}\n{}", stderr(&o), text(&o.stdout));
+    assert!(
+        stderr(&o).contains("E_OP_INTERRUPTED") && stderr(&o).contains(&id),
+        "{}",
+        stderr(&o)
+    );
+    assert!(
+        text(&o.stdout).contains(&format!("open {id}")),
+        "{}",
+        text(&o.stdout)
+    );
+    assert_eq!(fingerprint(fx.home.path()), before, "nothing was written");
+    for args in [
+        vec!["state", "recover", "extra"],
+        vec!["state", "recover", "--as", "done"],
+    ] {
+        assert_eq!(code(&fx.run(&args)), 2, "{args:?}");
+    }
+}
+
+#[test]
+fn state_recover_on_a_clean_machine_settles_nothing_and_exits_0() {
+    let fx = Fx::new();
+    assert_eq!(code(&fx.apply(&[])), 0);
+    let o = fx.run(&["state", "recover"]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    assert!(text(&o.stdout).contains("nothing to recover"));
+}

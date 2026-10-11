@@ -5,7 +5,7 @@ use super::{Adapter, registry};
 use dfm_engine::{Dir, Generator, GeneratorInputs, Got, Sys};
 use dfm_model::digest::sha256_hex;
 use dfm_model::fold;
-use dfm_model::merge::{Desired, Merged, merge, retire};
+use dfm_model::merge::{Desired, Merged, merge_with, retire};
 use dfm_model::plan::{
     Action, Blocker, MAX_HASHED_BYTES, Node, Observations, Operation, Ownership, Plan, Status,
     matches_pattern,
@@ -107,7 +107,12 @@ impl Generator for Generators<'_> {
             });
         }
         let desired = Desired::from_value(self.value(op)?)?;
-        merge(inputs.live.as_deref(), &desired, &inputs.owned_entries)
+        merge_with(
+            inputs.live.as_deref(),
+            &desired,
+            &inputs.owned_entries,
+            inputs.takeover,
+        )
     }
 
     fn supports(&self, op: &Operation) -> bool {

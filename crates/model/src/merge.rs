@@ -370,6 +370,19 @@ pub fn merge(
     desired: &Desired,
     owned: &[OwnedEntry],
 ) -> Result<Merged, Refusal> {
+    merge_with(live, desired, owned, false)
+}
+
+/// As [`merge`]. With `takeover` (the first write into an existing file with no ledger entry,
+/// approved with `--allow-adopt`), an identical entry already in place is recorded as owned. The
+/// approval covers it: after an interrupted first merge the file already holds the manager's own
+/// entries, and nothing tells them from the user's copy.
+pub fn merge_with(
+    live: Option<&[u8]>,
+    desired: &Desired,
+    owned: &[OwnedEntry],
+    takeover: bool,
+) -> Result<Merged, Refusal> {
     let mut doc = parse_live(live)?;
     let live_view = view_of(&doc, &desired.managed);
     for (k, v) in &desired.managed {
@@ -419,13 +432,13 @@ pub fn merge(
                 false
             }
         };
-        // The manager owns an entry it added now or recorded as its own before. An identical
-        // entry that was already there and is not recorded belongs to the user: a later retire
-        // must never delete it.
+        // The manager owns an entry it added now or recorded as its own before, and, at an
+        // approved take-over, an identical entry already there. Otherwise an identical entry
+        // that is not recorded belongs to the user: a later retire must never delete it.
         let was_owned = owned
             .iter()
             .any(|o| o.id == h.id && o.key == h.event && o.sha256 == h.sha256);
-        if !present || was_owned {
+        if !present || was_owned || takeover {
             entries.push(OwnedEntry {
                 id: h.id.clone(),
                 key: h.event.clone(),
@@ -632,6 +645,15 @@ argv = ["audit", "--quiet", "two words"]
         let m = merge(None, &desired(BASE), &[]).unwrap();
         let (bytes, _) = retire(&m.bytes, &m.entries).unwrap();
         assert!(json(&bytes).get("hooks").is_none());
+    }
+
+    #[test]
+    fn an_identical_entry_in_place_is_owned_only_at_an_approved_take_over() {
+        let first = merge(None, &desired(BASE), &[]).unwrap();
+        let plain = merge(Some(&first.bytes), &desired(BASE), &[]).unwrap();
+        assert!(plain.entries.is_empty(), "the user's copy stays the user's");
+        let taken = merge_with(Some(&first.bytes), &desired(BASE), &[], true).unwrap();
+        assert_eq!(taken.entries, first.entries);
     }
 
     #[test]

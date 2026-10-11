@@ -969,14 +969,16 @@ fn a_module_that_names_another_target_is_refused_at_resolution() {
 }
 
 #[test]
-fn an_identical_hook_that_was_already_there_is_not_owned_and_retire_leaves_it() {
+fn an_identical_hook_present_at_take_over_is_owned_by_the_approval_and_retire_removes_it() {
     let fx = Fx::new();
     let same =
         r#"{"hooks":{"PreToolUse":[{"hooks":[{"command":"audit --quiet","type":"command"}]}]}}"#;
     fx.live(same);
+    // The first write into an existing file needs --allow-adopt. That approval covers an
+    // identical entry already in place: after an interrupted first merge it is the manager's.
     assert_eq!(code(&fx.apply()), 0);
     let c = fx.coowned().unwrap();
-    assert_eq!(c["coowned"]["entries"], serde_json::json!([]), "{c}");
+    assert_eq!(c["coowned"]["entries"].as_array().unwrap().len(), 1, "{c}");
     assert_eq!(
         fx.live_json()["hooks"]["PreToolUse"]
             .as_array()
@@ -987,10 +989,10 @@ fn an_identical_hook_that_was_already_there_is_not_owned_and_retire_leaves_it() 
     fx.set_profile("");
     let o = fx.apply_bare();
     assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
-    assert_eq!(
-        fx.live_json()["hooks"]["PreToolUse"][0]["hooks"][0]["command"],
-        "audit --quiet",
-        "the user's copy stays"
+    assert!(
+        fx.live_json().get("hooks").is_none(),
+        "the owned entry is retired: {}",
+        fx.live_json()
     );
 }
 
@@ -1119,4 +1121,79 @@ fn a_retire_needs_no_salt_even_when_it_is_open_to_others() {
 #[test]
 fn a_retire_needs_no_salt_even_when_it_is_missing() {
     retire_with(|p| fs::remove_file(p).unwrap());
+}
+
+// ---- recovery of an unknown merge outcome (DFM-19) -----------------------------------------
+
+#[test]
+fn a_merge_that_ends_unknown_stays_open_is_never_auto_owned_and_clears_only_by_hand() {
+    let fx = Fx::new();
+    let saved = fx.saved();
+    let o = Command::new(BIN)
+        .env_clear()
+        .env("DFM_FAILPOINT", "file-after-rename:error")
+        .arg("--home")
+        .arg(fx.home.path())
+        .args([
+            "apply",
+            "--root",
+            fx.root_arg(),
+            "--yes-plan",
+            &saved.plan_digest,
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(code(&o), 1, "{}\n{}", stderr(&o), text(&o.stdout));
+    assert!(stderr(&o).contains("E_IO_UNCONFIRMED"), "{}", stderr(&o));
+    let id = fx
+        .journal_text()
+        .lines()
+        .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap())
+        .find(|e| e["phase"] == "unknown")
+        .unwrap()["op_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(fx.coowned().is_none(), "unknown records no ownership");
+    assert!(fx.settings().exists(), "the file is in place");
+
+    // Settling cannot decide a sensitive path, so it stays open: recover reports it, exit 3.
+    let o = fx.run(&["state", "recover"]);
+    assert_eq!(code(&o), 3, "{}\n{}", stderr(&o), text(&o.stdout));
+    assert!(stderr(&o).contains("E_OP_INTERRUPTED") && stderr(&o).contains(&id));
+    assert!(
+        text(&o.stdout).contains(&format!("open {id}")),
+        "{}",
+        text(&o.stdout)
+    );
+    assert!(fx.coowned().is_none());
+    // An apply is blocked on the path, names the id and leaves the file as it is.
+    let before = fs::read(fx.settings()).unwrap();
+    let o = fx.apply();
+    assert_eq!(code(&o), 3, "{}\n{}", stderr(&o), text(&o.stdout));
+    assert!(stderr(&o).contains("E_OP_INTERRUPTED"), "{}", stderr(&o));
+    assert!(stderr(&o).contains(&id), "{}", stderr(&o));
+    assert_eq!(hex(&fs::read(fx.settings()).unwrap()), hex(&before));
+    // `done` is refused: nothing about a sensitive file can be checked.
+    let o = fx.run(&["state", "resolve", &id, "--as", "done"]);
+    assert_eq!(code(&o), 3, "{}\n{}", stderr(&o), text(&o.stdout));
+    assert!(stderr(&o).contains("E_CONFLICT"), "{}", stderr(&o));
+    assert!(fx.coowned().is_none());
+    // `failed` clears it. The file is still there with no ledger entry, so the plan takes it
+    // over with the usual approval, and the machine is clean afterwards.
+    let o = fx.run(&["state", "resolve", &id, "--as", "failed"]);
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+    assert_eq!(code(&fx.run(&["state", "recover"])), 0);
+    let o = fx.apply();
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+    let c = fx.coowned().unwrap();
+    // The take-over approval covers the manager's own hook that the interrupted run left in
+    // the file: it is recorded, so a later retire removes it.
+    assert_eq!(c["coowned"]["entries"].as_array().unwrap().len(), 1, "{c}");
+    let o = fx.apply_bare();
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+    fx.set_profile("");
+    let o = fx.apply_bare();
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+    assert!(fx.live_json().get("hooks").is_none(), "{}", fx.live_json());
 }

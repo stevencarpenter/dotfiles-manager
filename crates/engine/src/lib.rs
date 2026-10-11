@@ -14,6 +14,7 @@ pub mod fsys;
 pub mod generate;
 pub mod observe;
 pub mod publish;
+pub mod recover;
 pub mod signal;
 pub mod store;
 
@@ -29,4 +30,5 @@ pub use fsys::{
 };
 pub use generate::{Generator, GeneratorInputs, NoGenerator};
 pub use observe::{merge, observe};
+pub use recover::{Open, Settled, recover, resolve};
 pub use store::{Finding, Loaded, Probe, Store, now_unix, verify_identity};
