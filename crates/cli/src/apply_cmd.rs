@@ -169,12 +169,7 @@ fn run_inner(
     // The gates that need no write run before the lock and in a preview, so a plan that apply
     // would refuse is refused here with the same code.
     let (layout, sys) = (ctx.layout(), ctx.sys()?);
-    let g = gates(
-        &plan,
-        &Generators {
-            resolved: &first.resolved,
-        },
-    );
+    let g = gates(&plan, &Generators::new(&first.resolved));
     if let Some(r) = g.refusal {
         return Err(r);
     }
@@ -235,9 +230,7 @@ fn run_inner(
         sys,
         home: &home,
         home_path: &layout.home,
-        generator: &Generators {
-            resolved: &second.resolved,
-        },
+        generator: &Generators::new(&second.resolved),
         allow: &args.allow,
         allow_adopt: &args.allow_adopt,
         fail: &fail,

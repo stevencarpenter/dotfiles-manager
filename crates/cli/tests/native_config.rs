@@ -481,3 +481,90 @@ fn example() -> Fx {
     assert_eq!(code(&o), 0, "{}", text(&o.stderr));
     fx
 }
+
+#[test]
+fn a_new_setting_name_is_visible_in_the_plan_before_approval_and_its_value_is_not() {
+    let fx = Fx::new("\"agents\"");
+    let m = fs::read_to_string(fx.root.join("base/modules/core/module.toml")).unwrap();
+    fx.put(
+        "base/modules/core/module.toml",
+        &m.replace(
+            "editor = \"nvim\"",
+            "editor = \"nvim\"\nsshCommand = \"ssh -i /home/me/.ssh/key\"",
+        ),
+    );
+    let o = fx.run(&["plan", "--root", fx.root_arg()]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let out = text(&o.stdout);
+    assert!(
+        out.contains("sets: core.editor, core.sshCommand, credential.helper, url.ssh://git@example.test/.insteadOf"),
+        "{out}"
+    );
+    assert!(out.contains(" bytes"), "{out}");
+    assert!(
+        !out.contains("/home/me/.ssh/key"),
+        "no value in the plan output"
+    );
+    let op = fx
+        .saved()
+        .plan
+        .operations
+        .into_iter()
+        .find(|o| o.resource == "core.git-defaults" && o.output_sha256.is_some())
+        .unwrap();
+    assert!(
+        op.sets.contains(&"core.sshCommand".to_string()),
+        "{:?}",
+        op.sets
+    );
+    assert!(op.output_bytes.is_some_and(|n| n > 0));
+}
+
+#[test]
+fn a_consumer_of_a_blocked_producer_reports_the_producers_blocker() {
+    let fx = Fx::new("\"agents\", \"frag\"");
+    let m = fs::read_to_string(fx.root.join("base/modules/frag/module.toml")).unwrap();
+    fx.put(
+        "base/modules/frag/module.toml",
+        &m.replace("pager = \"less\"", "pager = \"a\\u0001b\""),
+    );
+    fx.fragments(&[]);
+    let blockers = fx.saved().plan.blockers;
+    let producer = blockers
+        .iter()
+        .find(|b| b.resource == "frag.git-note")
+        .unwrap();
+    let consumer = blockers
+        .iter()
+        .find(|b| b.resource == "agents.instructions")
+        .unwrap();
+    assert_eq!(producer.code.as_str(), "E_MANIFEST_INVALID");
+    assert_eq!(consumer.code, producer.code, "{consumer:?}");
+    assert!(
+        consumer.detail.contains("depends on a blocked producer")
+            && consumer.detail.contains("control character"),
+        "{}",
+        consumer.detail
+    );
+}
+
+#[test]
+fn fragments_that_are_each_small_enough_but_too_big_together_block_the_plan() {
+    let fx = Fx::new("\"agents\"");
+    let big = vec![b'x'; 4 << 20];
+    let names = ["0.md", "1.md", "2.md", "3.md", "4.md"];
+    let list: Vec<(&str, &[u8])> = names.iter().map(|n| (*n, big.as_slice())).collect();
+    fx.fragments(&list);
+    let blocker = fx
+        .saved()
+        .plan
+        .blockers
+        .into_iter()
+        .find(|b| b.resource == "agents.instructions")
+        .unwrap();
+    assert_eq!(blocker.code.as_str(), "E_LIMIT_EXCEEDED", "{blocker:?}");
+    let before = fingerprint(fx.home.path());
+    let o = fx.apply(&[]);
+    assert_eq!(code(&o), 3, "{}", stderr(&o));
+    assert_eq!(fingerprint(fx.home.path()), before);
+}

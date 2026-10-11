@@ -119,6 +119,8 @@ fn op(h: &Home, store: &Store, id: &str, n: u32, action: Action, rel: &str) -> O
         fragments: vec![],
         fragment_dir: None,
         output_sha256: None,
+        output_bytes: None,
+        sets: vec![],
         after: vec![],
         preconditions: pre,
         postcondition: String::new(),
@@ -1416,10 +1418,25 @@ fn asm(s: &Setup, tag: &str, body: &str, frags: &[(&str, &[u8])]) -> Asm {
     Asm { plan: p, src }
 }
 
+/// Whether `text` holds a run of 64 hex digits: a SHA-256 printed in full.
+fn prints_a_hash(text: &str) -> bool {
+    let mut run = 0;
+    for c in text.chars() {
+        run = if c.is_ascii_hexdigit() { run + 1 } else { 0 };
+        if run >= 64 {
+            return true;
+        }
+    }
+    false
+}
+
 fn blocked_stale(s: &Setup, a: &Asm) {
     let r = go(s, &a.plan, &Joiner, &none());
     assert_eq!(r.operations[0].status, Status::Blocked, "{:?}", r.stopped);
     assert_eq!(r.stopped.as_ref().unwrap().code, Code::PlanStale);
+    // The message names the path. It does not print a live hash of someone's file.
+    let why = &r.stopped.as_ref().unwrap().detail;
+    assert!(!prints_a_hash(why), "{why}");
     assert!(!s.h.0.join("out").exists(), "nothing was written");
     assert!(
         s.store.read_journal().unwrap().is_empty(),
@@ -1459,7 +1476,7 @@ fn a_missing_fragment_directory_with_no_listed_fragment_assembles_the_body_alone
 fn a_fragment_that_disappeared_changed_or_was_swapped_is_stale_and_writes_nothing() {
     let frags: &[(&str, &[u8])] = &[("a.md", b"one"), ("b.md", b"two")];
     type Swap = fn(&Setup);
-    let swaps: [(&str, Swap); 5] = [
+    let swaps: [(&str, Swap); 6] = [
         ("gone", |s| {
             fs::remove_file(s.h.0.join("frags/a.md")).unwrap()
         }),
@@ -1470,6 +1487,10 @@ fn a_fragment_that_disappeared_changed_or_was_swapped_is_stale_and_writes_nothin
             fs::remove_file(s.h.0.join("frags/a.md")).unwrap();
             fs::write(s.h.0.join("elsewhere"), "one").unwrap();
             symlink(s.h.0.join("elsewhere"), s.h.0.join("frags/a.md")).unwrap();
+        }),
+        ("hardlink", |s| {
+            // Same bytes, same hash, but a second name: not the file the plan hashed.
+            fs::hard_link(s.h.0.join("frags/a.md"), s.h.0.join("second-name")).unwrap();
         }),
         ("fifo", |s| {
             fs::remove_file(s.h.0.join("frags/a.md")).unwrap();
@@ -1565,4 +1586,31 @@ fn a_generation_failure_keeps_the_last_good_output_and_blocks_dependents() {
         l.resources[0].owned_outputs[0].fingerprint.as_deref(),
         Some(sha256_hex(b"good\n").as_str())
     );
+}
+
+#[test]
+fn fragments_together_over_the_cap_are_refused_before_they_are_all_read() {
+    let s = setup();
+    // Five fragments of 4 MiB: each is within the file bound, together they are 20 MiB.
+    let big = vec![b'x'; 4 << 20];
+    let frags: Vec<(String, &[u8])> = (0..5)
+        .map(|i| (format!("{i}.md"), big.as_slice()))
+        .collect();
+    let refs: Vec<(&str, &[u8])> = frags.iter().map(|(n, b)| (n.as_str(), *b)).collect();
+    let a = asm(&s, "cap", "body", &refs);
+    let r = go(&s, &a.plan, &Joiner, &none());
+    assert_eq!(r.operations[0].status, Status::Failed, "{:?}", r.stopped);
+    assert_eq!(r.stopped.as_ref().unwrap().code, Code::LimitExceeded);
+    assert!(!s.h.0.join("out").exists());
+    assert!(s.store.read_journal().unwrap().is_empty());
+}
+
+#[test]
+fn a_fragment_directory_with_too_many_entries_is_stale() {
+    let s = setup();
+    let a = asm(&s, "many", "body", &[("a.md", b"one")]);
+    for i in 0..=dfm_model::plan::MAX_LISTING {
+        fs::write(s.h.0.join("frags").join(format!("n{i}.txt")), "").unwrap();
+    }
+    blocked_stale(&s, &a);
 }

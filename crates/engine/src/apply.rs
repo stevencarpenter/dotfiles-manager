@@ -33,7 +33,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 /// A published file is at most this large (the same bound the planner hashes).
-pub(crate) const MAX_FILE: u64 = dfm_model::plan::MAX_HASHED_BYTES;
+const MAX_FILE: u64 = dfm_model::plan::MAX_HASHED_BYTES;
 
 /// A conservative size for the two journal entries (intent and outcome) of one operation. An
 /// entry is bounded to 64 KiB, and apply writes reasons of at most 1024 characters.
@@ -608,12 +608,11 @@ impl Exec<'_, '_> {
         let dir = match op.fragment_dir.as_deref() {
             Some(d) => {
                 let comps = components(d).map_err(failed)?;
-                match self.run.home.open_below(&self.run.sys, &comps) {
-                    Ok(dir) => Some(dir),
-                    // A fragment directory that does not exist yet holds no fragments.
-                    Err(_) if self.absent(&comps) => None,
-                    Err(e) => return Err(Ended::Blocked(e)),
-                }
+                // A fragment directory that does not exist yet holds no fragments.
+                self.run
+                    .home
+                    .open_below_opt(&self.run.sys, &comps)
+                    .map_err(Ended::Blocked)?
             }
             None => None,
         };
@@ -634,35 +633,15 @@ impl Exec<'_, '_> {
                 format!("{rel}: generated content exceeds 16 MiB"),
             )));
         }
-        let have = sha256_hex(&bytes);
-        if op.output_sha256.as_deref() != Some(have.as_str()) {
+        if op.output_sha256.as_deref() != Some(sha256_hex(&bytes).as_str()) {
             return Err(blocked(
                 Code::PlanStale,
                 format!(
-                    "{rel}: generated content is sha256:{have}, not the planned output; nothing was changed"
+                    "{rel}: generated content differs from the planned output; nothing was changed"
                 ),
             ));
         }
         Ok(bytes)
-    }
-
-    /// Whether the path is missing: the walk from HOME reaches an absent entry before anything
-    /// that is not a plain directory. A link or a file on the way is not "missing".
-    fn absent(&self, comps: &[&str]) -> bool {
-        let Ok(mut cur) = self.run.home.try_clone() else {
-            return false;
-        };
-        for c in comps {
-            match cur.peek(&self.run.sys, c) {
-                Ok(Peek::Missing) => return true,
-                Ok(Peek::Dir { .. }) => match cur.peek_dir(c) {
-                    Ok(Some(next)) => cur = next,
-                    _ => return false,
-                },
-                _ => return false,
-            }
-        }
-        false
     }
 
     fn run_op(&mut self, op: &Operation) -> Ended {

@@ -220,13 +220,17 @@ fn op_diff(out: &mut Vec<Stale>, a: &Operation, b: &Operation) {
     ) {
         let show = |o: &Operation| {
             format!(
-                "{:?} {:?} after={:?} link={:?} mode={:?} fragments={}",
+                "{:?} {:?} after={:?} link={:?} mode={:?} fragments={} fragment_hashes={} output={}",
                 o.action,
                 o.status,
                 o.after,
                 o.link,
                 o.mode,
-                o.fragments.len()
+                o.fragments.len(),
+                o.fragments.iter().filter(|f| f.sha256.is_some()).count(),
+                o.output_sha256
+                    .as_deref()
+                    .map_or("-", |h| h.get(..12).unwrap_or(h))
             )
         };
         diff(out, StaleKind::Operation, &subject, &show(a), &show(b));

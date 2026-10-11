@@ -6,11 +6,10 @@
 //! serves `render` (no inputs beyond the resource value) and `assemble` (a body and the
 //! fragments the planner listed).
 
-use crate::apply::MAX_FILE;
-use crate::fsys::{Dir, Peek, Sys};
+use crate::fsys::{Dir, Got, Peek, Sys};
 use dfm_model::digest::sha256_hex;
 use dfm_model::fold;
-use dfm_model::plan::{Operation, Plan};
+use dfm_model::plan::{MAX_HASHED_BYTES, MAX_LISTING, Operation, Plan};
 use dfm_model::{Code, Refusal};
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -79,23 +78,67 @@ fn invalid(detail: impl Into<String>) -> Gather {
     Gather::Failed(Refusal::new(Code::PlanInvalid, detail))
 }
 
+/// Total bytes of the fragments one assemble operation may read. It equals the output cap, so
+/// the fragments alone can never make a larger file than apply would publish.
+pub const MAX_FRAGMENT_BYTES: u64 = MAX_HASHED_BYTES;
+
+/// The bytes still open to an assemble operation's fragments. It is checked before each read.
+struct Budget(u64);
+
+impl Budget {
+    fn read(&mut self, sys: &Sys, dir: &Dir, name: &str, path: &str) -> Result<Vec<u8>, Gather> {
+        let whole = self.0 == MAX_FRAGMENT_BYTES;
+        match dir.read_input(sys, name, self.0)? {
+            Got::Bytes(b) => {
+                self.0 -= u64::try_from(b.len()).unwrap_or(u64::MAX);
+                Ok(b)
+            }
+            Got::Absent => Err(stale(format!(
+                "fragment {path} changed since the plan: it is gone, not a plain file of yours or linked twice"
+            ))),
+            // Nothing was consumed yet: this one file is over the cap, as the planner found.
+            Got::TooBig if whole => Err(stale(format!(
+                "fragment {path} changed since the plan: it is over 16 MiB"
+            ))),
+            Got::TooBig => Err(too_much()),
+        }
+    }
+
+    /// Takes bytes that were read elsewhere (a link producer's source file).
+    fn take(&mut self, n: usize) -> Result<(), Gather> {
+        self.0 = self
+            .0
+            .checked_sub(u64::try_from(n).unwrap_or(u64::MAX))
+            .ok_or_else(too_much)?;
+        Ok(())
+    }
+}
+
+fn too_much() -> Gather {
+    Gather::Failed(Refusal::new(
+        Code::LimitExceeded,
+        "the fragments together exceed 16 MiB",
+    ))
+}
+
 /// Reads one source file of `owner` through the opened source root and compares it with the
-/// `source:` precondition the plan recorded for it.
-fn read_source(root: &Dir, owner: &Operation, path: &str) -> Result<Vec<u8>, Gather> {
+/// `source:` precondition the plan recorded for it. The message names the path only.
+fn read_source(sys: &Sys, root: &Dir, owner: &Operation, path: &str) -> Result<Vec<u8>, Gather> {
     let want = owner
         .preconditions
         .iter()
         .find(|p| p.subject == format!("source:{path}"))
         .map(|p| p.state.as_str());
-    let bytes = root
-        .read_below(path, MAX_FILE)?
-        .ok_or_else(|| stale(format!("source {path} is gone or not a plain file")))?;
-    let have = format!("sha256:{}", sha256_hex(&bytes));
-    if want != Some(have.as_str()) {
-        return Err(stale(format!(
-            "source {path} was {} and is now {have}",
-            want.unwrap_or("not recorded")
-        )));
+    let bytes = match root.read_input_below(sys, path, MAX_HASHED_BYTES)? {
+        Got::Bytes(b) => b,
+        _ => {
+            return Err(stale(format!(
+                "source {path} changed since the plan: it is gone, not a plain file of yours, linked twice or over 16 MiB"
+            )));
+        }
+    };
+    if want != Some(format!("sha256:{}", sha256_hex(&bytes)).as_str()) {
+        return Err(stale(format!("source {path} changed since the plan")));
     }
     Ok(bytes)
 }
@@ -120,7 +163,7 @@ pub(crate) fn gather(
     };
     let root = Dir::open_plain(Path::new(&source.root))?;
     for input in &op.inputs {
-        let bytes = read_source(&root, op, &input.path)?;
+        let bytes = read_source(sys, &root, op, &input.path)?;
         out.sources.insert(input.path.clone(), bytes);
     }
     let Some(dir_rel) = op.fragment_dir.as_deref() else {
@@ -134,22 +177,23 @@ pub(crate) fn gather(
     };
     let Some(dir) = fragment_dir else {
         // The directory does not exist. That is the plan's picture only when it lists nothing.
-        if let Some(f) = op.fragments.first() {
+        if !op.fragments.is_empty() {
             return Err(stale(format!(
-                "{dir_rel} is gone; the plan lists {}",
-                f.name
+                "{dir_rel} changed since the plan: it is gone"
             )));
         }
         out.listing = Some(Vec::new());
         return Ok(out);
     };
-    let listing = dir.list()?;
-    if listing.odd > 0 {
+    // The listing is cut like the planner's. A cut listing is not the plan's picture.
+    let listing = dir.list_upto(MAX_LISTING)?;
+    if listing.odd > 0 || listing.names.len() > MAX_LISTING {
         return Err(stale(format!(
-            "{dir_rel} now holds a name that is not UTF-8"
+            "{dir_rel} changed since the plan: it holds a name that is not UTF-8 or too many entries"
         )));
     }
     out.listing = Some(listing.names);
+    let mut budget = Budget(MAX_FRAGMENT_BYTES);
     for f in &op.fragments {
         let path = format!("{dir_rel}/{}", f.name);
         let bytes = match f.origin.strip_prefix("selected:") {
@@ -162,18 +206,15 @@ pub(crate) fn gather(
                             && p.path.as_deref().is_some_and(|pp| fold(pp) == fold(&path))
                     })
                     .ok_or_else(|| invalid(format!("no operation produces fragment {path}")))?;
-                selected(&root, dir, sys, producer, &f.name, &path)?
+                selected(sys, &root, dir, producer, &mut budget, &f.name, &path)?
             }
             None => {
                 let want = f.sha256.as_deref().ok_or_else(|| {
                     invalid(format!("foreign fragment {path} has no recorded hash"))
                 })?;
-                let bytes = plain(dir, &f.name, &path)?;
-                let have = sha256_hex(&bytes);
-                if have != want {
-                    return Err(stale(format!(
-                        "fragment {path} was {want} and is now {have}"
-                    )));
+                let bytes = budget.read(sys, dir, &f.name, &path)?;
+                if sha256_hex(&bytes) != want {
+                    return Err(stale(format!("fragment {path} changed since the plan")));
                 }
                 bytes
             }
@@ -183,33 +224,23 @@ pub(crate) fn gather(
     Ok(out)
 }
 
-fn plain(dir: &Dir, name: &str, path: &str) -> Result<Vec<u8>, Gather> {
-    dir.read_plain(name, MAX_FILE)?.ok_or_else(|| {
-        stale(format!(
-            "fragment {path} is gone, is not a plain file or is over 16 MiB"
-        ))
-    })
-}
-
 /// The content of a fragment another selected resource produces. A generated producer wrote a
 /// regular file whose hash is its planned output. A link producer wrote a link to its source
 /// file: the link must be the planned one, and the content is that source file, read and
 /// compared with the plan like any other input.
 fn selected(
+    sys: &Sys,
     root: &Dir,
     dir: &Dir,
-    sys: &Sys,
     producer: &Operation,
+    budget: &mut Budget,
     name: &str,
     path: &str,
 ) -> Result<Vec<u8>, Gather> {
     if let Some(want) = &producer.output_sha256 {
-        let bytes = plain(dir, name, path)?;
-        let have = sha256_hex(&bytes);
-        if &have != want {
-            return Err(stale(format!(
-                "fragment {path} was {want} and is now {have}"
-            )));
+        let bytes = budget.read(sys, dir, name, path)?;
+        if &sha256_hex(&bytes) != want {
+            return Err(stale(format!("fragment {path} changed since the plan")));
         }
         return Ok(bytes);
     }
@@ -223,9 +254,11 @@ fn selected(
         Peek::Link { target, .. } if &target == link => {}
         _ => {
             return Err(stale(format!(
-                "fragment {path} is not the link the plan made"
+                "fragment {path} changed since the plan: it is not the link the plan made"
             )));
         }
     }
-    read_source(root, producer, &input.path)
+    let bytes = read_source(sys, root, producer, &input.path)?;
+    budget.take(bytes.len())?;
+    Ok(bytes)
 }

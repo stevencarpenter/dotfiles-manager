@@ -1,11 +1,13 @@
 //! The `render` and `assemble` adapters (docs/adapters.md). Pure functions of the resource
 //! value and the verified inputs apply or the planner supplies. They open no file.
 
-use dfm_engine::{Dir, Generator, GeneratorInputs};
+use super::{Adapter, registry};
+use dfm_engine::{Dir, Generator, GeneratorInputs, Got, Sys};
 use dfm_model::digest::sha256_hex;
 use dfm_model::fold;
 use dfm_model::plan::{
-    Action, Blocker, MAX_HASHED_BYTES, Node, Operation, Ownership, Plan, Status, matches_pattern,
+    Action, Blocker, MAX_HASHED_BYTES, Node, Observations, Operation, Ownership, Plan, Status,
+    matches_pattern,
 };
 use dfm_model::resolve::{Entry, Resolved, SourceSet, Table, Value};
 use dfm_model::state::Class;
@@ -13,42 +15,76 @@ use dfm_model::{Code, Refusal};
 use std::collections::BTreeMap;
 use std::fmt::Write;
 
-pub const GIT_CONFIG: &str = "git-config/v1";
-pub const TEXT_FRAGMENTS: &str = "text-fragments/v1";
+/// What an adapter that produces file content provides, besides its catalog entry.
+pub struct Gen {
+    /// The content, from the resource value and the verified inputs.
+    pub run: fn(&Value, &Operation, &GeneratorInputs) -> Result<Vec<u8>, Refusal>,
+    /// The settings the value sets, as names only, for the reviewer. Never values.
+    pub sets: fn(&Value) -> Vec<String>,
+}
+
+pub const GIT_CONFIG: Gen = Gen {
+    run: |value, _, _| git_config(value),
+    sets: git_config_names,
+};
+
+pub const TEXT_FRAGMENTS: Gen = Gen {
+    run: text_fragments,
+    sets: |_| Vec::new(),
+};
 
 /// The generators of this build, reading each resource value from the resolved model of the
 /// plan being applied. The value is data read at run time: a config edit needs no rebuild.
+/// Which adapters generate is decided by the registry in `adapters.rs`, nowhere else.
 pub struct Generators<'a> {
-    pub resolved: &'a Resolved,
+    resolved: &'a Resolved,
+    table: Vec<Adapter>,
 }
 
-impl Generator for Generators<'_> {
-    fn supports(&self, op: &Operation) -> bool {
-        op.class == Class::Normal
-            && matches!(op.adapter.as_str(), GIT_CONFIG | TEXT_FRAGMENTS)
-            && self.resolved.resources.contains_key(&op.resource)
+impl<'a> Generators<'a> {
+    pub fn new(resolved: &'a Resolved) -> Self {
+        Generators {
+            resolved,
+            table: registry(),
+        }
     }
 
-    fn generate(&self, op: &Operation, inputs: &GeneratorInputs) -> Result<Vec<u8>, Refusal> {
-        let value = &self
-            .resolved
+    fn gen_of(&self, op: &Operation) -> Option<&Gen> {
+        self.table
+            .iter()
+            .find(|a| a.spec.id == op.adapter)
+            .and_then(|a| a.generator.as_ref())
+    }
+
+    fn value(&self, op: &Operation) -> Result<&'a Value, Refusal> {
+        self.resolved
             .resources
             .get(&op.resource)
+            .map(|r| &r.value)
             .ok_or_else(|| {
                 Refusal::new(
                     Code::GeneratorUnavailable,
                     format!("{} is not in the resolved model", op.resource),
                 )
-            })?
-            .value;
-        match op.adapter.as_str() {
-            GIT_CONFIG => git_config(value),
-            TEXT_FRAGMENTS => text_fragments(value, op, inputs),
-            other => Err(Refusal::new(
+            })
+    }
+}
+
+impl Generator for Generators<'_> {
+    fn supports(&self, op: &Operation) -> bool {
+        op.class == Class::Normal
+            && self.gen_of(op).is_some()
+            && self.resolved.resources.contains_key(&op.resource)
+    }
+
+    fn generate(&self, op: &Operation, inputs: &GeneratorInputs) -> Result<Vec<u8>, Refusal> {
+        let gen_fn = self.gen_of(op).ok_or_else(|| {
+            Refusal::new(
                 Code::GeneratorUnavailable,
-                format!("no generator for {other}"),
-            )),
-        }
+                format!("no generator for {}", op.adapter),
+            )
+        })?;
+        (gen_fn.run)(self.value(op)?, op, inputs)
     }
 }
 
@@ -70,7 +106,7 @@ fn git_name(kind: &str, n: &str) -> Result<(), Refusal> {
     }
 }
 
-/// A quoted Git value or subsection. Backslash and quote are escaped. Newline and tab use
+/// A quoted Git value. Backslash and quote are escaped. Newline and tab use
 /// their escapes. Any other control character is refused, not rewritten.
 fn quote(s: &str) -> Result<String, Refusal> {
     let mut out = String::with_capacity(s.len() + 2);
@@ -84,6 +120,29 @@ fn quote(s: &str) -> Result<String, Refusal> {
             c if c.is_control() => {
                 return Err(invalid(format!(
                     "git-config text holds the control character U+{:04X}",
+                    u32::from(c)
+                )));
+            }
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    Ok(out)
+}
+
+/// A quoted subsection name. Git decodes only `\\` and `\"` in it, so those two are escaped and
+/// nothing else is: a newline, a tab or another control character cannot be written and is
+/// refused.
+fn subsection(s: &str) -> Result<String, Refusal> {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            c if c.is_control() => {
+                return Err(invalid(format!(
+                    "git-config subsection holds the control character U+{:04X}",
                     u32::from(c)
                 )));
             }
@@ -152,11 +211,27 @@ fn git_config(value: &Value) -> Result<Vec<u8>, Refusal> {
                     "git-config {name}.{sub} nests deeper than one subsection"
                 )));
             }
-            let _ = writeln!(out, "[{name} {}]", quote(sub)?);
+            let _ = writeln!(out, "[{name} {}]", subsection(sub)?);
             entries(&mut out, inner)?;
         }
     }
     Ok(out.into_bytes())
+}
+
+/// `section.key` and `section.subsection.key` for every key the value sets, sorted, once per
+/// key. Names only: a reviewer sees what is set without any value.
+fn git_config_names(value: &Value) -> Vec<String> {
+    let mut out = Vec::new();
+    for (name, section) in value.as_table().into_iter().flatten() {
+        for (key, v) in section.as_table().into_iter().flatten() {
+            match v.as_table() {
+                Some(sub) => out.extend(sub.keys().map(|k| format!("{name}.{key}.{k}"))),
+                None => out.push(format!("{name}.{key}")),
+            }
+        }
+    }
+    out.sort();
+    out
 }
 
 fn text<'a>(value: &'a Value, key: &str) -> Result<&'a str, Refusal> {
@@ -208,22 +283,14 @@ fn text_fragments(
     Ok(parts.join(separator).into_bytes())
 }
 
-/// Fills `output_sha256` of every planned generated file and marks one `current` when the
-/// owned live file already equals it (so a rerun plans nothing). The generators run on the
-/// same inputs apply reads again: source files from the loaded snapshot, foreign fragments from
-/// HOME, and selected fragments from the output their producer will write. Operations are in
-/// dependency order, so a producer comes before its consumer. A generation failure blocks the
-/// operation with a blocker that names the field and carries no content.
-pub fn plan_outputs(
-    plan: &mut Plan,
-    resolved: &Resolved,
-    sources: &SourceSet,
-    home: &Dir,
-) -> Result<(), Refusal> {
-    let generators = Generators { resolved };
-    let mut made: BTreeMap<String, Vec<u8>> = BTreeMap::new();
-    // A link producer puts its source file in the fragment directory.
-    for op in &plan.operations {
+/// The files link producers will put in a fragment directory, by folded path: their source
+/// files. Only a planned or current operation of normal class produces anything.
+fn link_producers(ops: &[Operation], sources: &SourceSet) -> BTreeMap<String, Vec<u8>> {
+    let mut made = BTreeMap::new();
+    for op in ops {
+        if op.class != Class::Normal || !matches!(op.status, Status::Planned | Status::Current) {
+            continue;
+        }
         if let (Some(p), Some(_), Some(Entry::File(b))) = (
             &op.path,
             &op.link,
@@ -232,16 +299,42 @@ pub fn plan_outputs(
             made.insert(fold(p), b.clone());
         }
     }
+    made
+}
+
+/// Fills `output_sha256`, `output_bytes` and `sets` of every planned generated file and marks
+/// one `current` when the owned live file already equals its output (so a rerun plans nothing).
+/// The generators run on the same inputs apply reads again: source files from the loaded
+/// snapshot, foreign fragments from HOME, and selected fragments from the output their producer
+/// will write. Operations are in dependency order, so a producer comes before its consumer. A
+/// generation failure blocks the operation with a blocker that names the field and carries no
+/// content. A consumer of a blocked producer reports the producer's blocker as the cause.
+pub fn plan_outputs(
+    plan: &mut Plan,
+    resolved: &Resolved,
+    sources: &SourceSet,
+    sys: &Sys,
+    home: &Dir,
+) {
+    let generators = Generators::new(resolved);
+    let mut made = link_producers(&plan.operations, sources);
+    // Why a path has no content: the blocker that stopped its producer, by folded path.
+    let mut causes: BTreeMap<String, (Code, String)> = plan
+        .blockers
+        .iter()
+        .filter_map(|b| Some((fold(b.path.as_deref()?), (b.code, b.detail.clone()))))
+        .collect();
     let mut blockers = Vec::new();
     for i in 0..plan.operations.len() {
         let op = plan.operations[i].clone();
-        if op.status != Status::Planned
+        if op.class != Class::Normal
+            || op.status != Status::Planned
             || !matches!(op.action, Action::CreateFile | Action::UpdateFile)
             || !generators.supports(&op)
         {
             continue;
         }
-        let built = inputs_for(&op, &made, sources, home)
+        let built = inputs_for(&op, &made, &causes, sources, sys, home)
             .and_then(|inputs| generators.generate(&op, &inputs));
         let out = &mut plan.operations[i];
         match built {
@@ -256,23 +349,25 @@ pub fn plan_outputs(
                     out.effect = format!("{} already holds the generated content", op.id);
                 }
                 out.output_sha256 = Some(hash);
+                out.output_bytes = u64::try_from(bytes.len()).ok();
+                if let (Some(g), Ok(v)) = (generators.gen_of(&op), generators.value(&op)) {
+                    out.sets = (g.sets)(v);
+                }
                 if let Some(p) = &op.path {
                     made.insert(fold(p), bytes);
                 }
             }
-            Ok(_) => blockers.push(blocker(
-                resolved,
-                out,
-                Refusal::new(Code::LimitExceeded, "the generated content exceeds 16 MiB"),
-            )),
-            Err(r) => blockers.push(blocker(resolved, out, r)),
+            Ok(_) => {
+                let r = Refusal::new(Code::LimitExceeded, "the generated content exceeds 16 MiB");
+                blockers.push(blocker(resolved, out, r, &mut causes));
+            }
+            Err(r) => blockers.push(blocker(resolved, out, r, &mut causes)),
         }
     }
     plan.blockers.extend(blockers);
-    Ok(())
 }
 
-fn live_equals(obs: &dfm_model::plan::Observations, op: &Operation, hash: &str) -> bool {
+fn live_equals(obs: &Observations, op: &Operation, hash: &str) -> bool {
     let Some(Node::File { mode, sha256, .. }) = op
         .path
         .as_ref()
@@ -284,9 +379,17 @@ fn live_equals(obs: &dfm_model::plan::Observations, op: &Operation, hash: &str) 
     sha256.as_deref() == Some(hash) && op.mode.is_none_or(|m| m == *mode)
 }
 
-fn blocker(resolved: &Resolved, op: &mut Operation, r: Refusal) -> Blocker {
+fn blocker(
+    resolved: &Resolved,
+    op: &mut Operation,
+    r: Refusal,
+    causes: &mut BTreeMap<String, (Code, String)>,
+) -> Blocker {
     op.status = Status::Blocked;
     op.effect = format!("blocked: {}", r.detail);
+    if let Some(p) = &op.path {
+        causes.insert(fold(p), (r.code, r.detail.clone()));
+    }
     Blocker {
         code: r.code,
         resource: op.resource.clone(),
@@ -303,11 +406,13 @@ fn blocker(resolved: &Resolved, op: &mut Operation, r: Refusal) -> Blocker {
 
 /// The inputs as they stand at plan time. The listing is exactly the planned fragments: the
 /// fragments a planned removal deletes and the producers not yet written are accounted for by
-/// the plan itself.
+/// the plan itself. Fragments together are bounded like at apply time.
 fn inputs_for(
     op: &Operation,
     made: &BTreeMap<String, Vec<u8>>,
+    causes: &BTreeMap<String, (Code, String)>,
     sources: &SourceSet,
+    sys: &Sys,
     home: &Dir,
 ) -> Result<GeneratorInputs, Refusal> {
     let mut inputs = GeneratorInputs::default();
@@ -327,23 +432,42 @@ fn inputs_for(
     let Some(dir) = op.fragment_dir.as_deref() else {
         return Ok(inputs);
     };
+    let too_much = || Refusal::new(Code::LimitExceeded, "the fragments together exceed 16 MiB");
+    let mut left = MAX_HASHED_BYTES;
     for f in &op.fragments {
         let path = format!("{dir}/{}", f.name);
         let bytes = if f.origin.starts_with("selected:") {
-            made.get(&fold(&path)).cloned().ok_or_else(|| {
-                Refusal::new(
-                    Code::GeneratorUnavailable,
-                    format!("fragment {path} is not produced by a generated operation"),
-                )
-            })?
+            match made.get(&fold(&path)) {
+                Some(b) => b.clone(),
+                // The producer has no content because something stopped it: say what.
+                None => {
+                    return Err(match causes.get(&fold(&path)) {
+                        Some((code, why)) => Refusal::new(
+                            *code,
+                            format!("fragment {path} depends on a blocked producer: {why}"),
+                        ),
+                        None => Refusal::new(
+                            Code::GeneratorUnavailable,
+                            format!("fragment {path} is not produced by a generated operation"),
+                        ),
+                    });
+                }
+            }
         } else {
-            home.read_below(&path, MAX_HASHED_BYTES)?.ok_or_else(|| {
-                Refusal::new(
-                    Code::Conflict,
-                    format!("fragment {path} is not a plain file within 16 MiB"),
-                )
-            })?
+            match home.read_input_below(sys, &path, left)? {
+                Got::Bytes(b) => b,
+                Got::TooBig => return Err(too_much()),
+                Got::Absent => {
+                    return Err(Refusal::new(
+                        Code::Conflict,
+                        format!("fragment {path} is not a plain file of yours with one link"),
+                    ));
+                }
+            }
         };
+        left = left
+            .checked_sub(u64::try_from(bytes.len()).unwrap_or(u64::MAX))
+            .ok_or_else(too_much)?;
         inputs.fragments.insert(f.name.clone(), bytes);
     }
     inputs.listing = Some(inputs.fragments.keys().cloned().collect());
@@ -387,6 +511,65 @@ mod tests {
             t,
             "[includeIf \"gitdir:~/work/\"]\n\tpath = \"a\\\"b\\\\c\"\n"
         );
+    }
+
+    #[test]
+    fn a_subsection_escapes_only_backslash_and_quote_and_refuses_control_characters() {
+        let t = cfg("[url.\"a\\\\b\\\"c\"]\nk = 1\n").expect("renders");
+        assert_eq!(t, "[url \"a\\\\b\\\"c\"]\n\tk = 1\n");
+        for bad in [
+            "[url.\"a\\nb\"]\nk = 1\n",
+            "[url.\"a\\tb\"]\nk = 1\n",
+            "[url.\"x\\\"]\\n[core]\"]\nk = 1\n",
+            "[url.\"a\\u0001b\"]\nk = 1\n",
+        ] {
+            let e = cfg(bad).expect_err(bad);
+            assert_eq!(e.code, Code::ManifestInvalid, "{bad}");
+            assert!(e.detail.contains("subsection"), "{}", e.detail);
+        }
+    }
+
+    #[test]
+    fn the_setting_names_list_keys_and_never_values() {
+        let v = Value::Table(
+            "[core]\nsshCommand = \"ssh -i secret\"\n[credential]\nhelper = [\"a\", \"b\"]\n[url.\"x\"]\ninsteadOf = \"y\"\n"
+                .parse::<Table>()
+                .expect("toml"),
+        );
+        let names = git_config_names(&v);
+        assert_eq!(
+            names,
+            ["core.sshCommand", "credential.helper", "url.x.insteadOf"]
+        );
+        assert!(!names.join(" ").contains("secret"));
+    }
+
+    fn link_op(path: &str, class: Class, status: Status) -> Operation {
+        serde_json::from_value(serde_json::json!({
+            "id": format!("r@{path}"), "journal_id": "j", "resource": "r", "module": "m",
+            "adapter": "fs-link/v1", "class": class, "action": "create_link",
+            "status": status, "path": path, "mode": null, "link": "/src/f",
+            "privilege": "user", "effect": "", "ownership": "absent",
+            "inputs": [{"path": "f", "content_id": null}], "fragments": [],
+            "after": [], "preconditions": [], "postcondition": ""
+        }))
+        .expect("operation")
+    }
+
+    #[test]
+    fn only_a_planned_or_current_normal_link_produces_a_fragment() {
+        let mut src = SourceSet::new();
+        src.insert_file("f", "body");
+        let ops = [
+            link_op("ok-planned", Class::Normal, Status::Planned),
+            link_op("ok-current", Class::Normal, Status::Current),
+            link_op("blocked", Class::Normal, Status::Blocked),
+            link_op("scope", Class::Normal, Status::NotInScope),
+            link_op("sensitive", Class::Sensitive, Status::Planned),
+        ];
+        let made = link_producers(&ops, &src);
+        let keys: Vec<&str> = made.keys().map(String::as_str).collect();
+        assert_eq!(keys, ["ok-current", "ok-planned"]);
     }
 
     #[test]

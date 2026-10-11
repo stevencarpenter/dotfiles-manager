@@ -19,7 +19,7 @@ pub use apply::{
 #[cfg(feature = "failpoints")]
 pub use fail::Action;
 pub use fail::Fail;
-pub use fsys::{Dir, Layout, Lock, Peek, PeekTo, Sys, listed, open_config, reset_listed};
+pub use fsys::{Dir, Got, Layout, Lock, Peek, PeekTo, Sys, listed, open_config, reset_listed};
 pub use generate::{Generator, GeneratorInputs, NoGenerator};
 pub use observe::{merge, observe};
 pub use store::{Finding, Loaded, Probe, Store, now_unix, verify_identity};
