@@ -107,7 +107,7 @@ Read the plan. Each line is one operation:
 
    ```sh
    dotfiles-manager plan --root <checkout> --json > /tmp/plan.json
-   python3 -c 'import json;[print(o["path"]) for o in json.load(open("/tmp/plan.json"))["operations"] if o.get("path")]' > /tmp/targets.txt
+   python3 -c 'import json;[print(o["path"]) for o in json.load(open("/tmp/plan.json"))["plan"]["operations"] if o.get("path")]' > /tmp/targets.txt
    ```
 
 2. Back up those paths and the manager state. `tar` skips paths that do not exist yet and says so:
