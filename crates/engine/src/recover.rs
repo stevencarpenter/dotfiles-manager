@@ -203,21 +203,26 @@ pub(crate) fn forget_output(
 
 /// Settles one outstanding entry on the operator's word (`state resolve`). `done` needs the
 /// live state to match what the intent expected, else `E_CONFLICT`. `failed` needs nothing.
-pub fn resolve(run: &Run<'_>, journal_id: &str, as_done: bool) -> Result<(), Refusal> {
-    let entries = run.store.read_journal_lenient()?;
+pub fn resolve(
+    store: &Store,
+    (sys, home, home_path): (&Sys, &Dir, &Path),
+    journal_id: &str,
+    as_done: bool,
+) -> Result<(), Refusal> {
+    let entries = store.read_journal_lenient()?;
     let open = unresolved(&entries);
     let mut hits = open.iter().filter(|u| u.unknown.op_id == journal_id);
     let (Some(u), None) = (hits.next(), hits.next()) else {
         return Err(Refusal::new(
             Code::Usage,
             format!(
-                "no single unresolved operation has the journal id {journal_id}. Fix: list them with doctor"
+                "no single unresolved operation has the journal id {journal_id}. Fix: doctor lists them"
             ),
         ));
     };
     let reason = "resolved by operator";
     if !as_done {
-        return finish(run.store, u, false, None, reason);
+        return finish(store, u, false, None, reason);
     }
     let conflict = |what: &str| {
         Refusal::new(
@@ -232,11 +237,11 @@ pub fn resolve(run: &Run<'_>, journal_id: &str, as_done: bool) -> Result<(), Ref
             "the journal has no intent entry for it, so nothing can be checked",
         ));
     };
-    let (probe, live) = inspect(&run.sys, run.home, run.home_path, intent);
+    let (probe, live) = inspect(sys, home, home_path, intent);
     if probe != Probe::Done {
         return Err(conflict(
             "the live path does not match the result the operation expected",
         ));
     }
-    finish(run.store, u, true, live.as_ref(), reason)
+    finish(store, u, true, live.as_ref(), reason)
 }

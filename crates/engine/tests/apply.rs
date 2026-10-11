@@ -1890,30 +1890,32 @@ fn resolve_done_records_ownership_only_for_a_matching_path_and_failed_needs_noth
     unknown_link(&s);
     let id = last_of(&s, &jid(1)).op_id;
     let home = Dir::open_home(&sys(&s.h), &s.h.0).unwrap();
-    let (g, fail, allow) = (gens(), Fail::none(), none());
-    let r = run(&s, &g, &allow, &fail, &home);
+    let sy = sys(&s.h);
+    let r = (&sy, &home, s.h.0.as_path());
     // Mismatch: the link is retargeted. `done` is refused with E_CONFLICT, nothing is written.
     fs::remove_file(s.h.0.join("l")).unwrap();
     symlink("/elsewhere", s.h.0.join("l")).unwrap();
     let len = s.store.journal_len().unwrap();
-    let e = dfm_engine::resolve(&r, &id, true).unwrap_err();
+    let e = dfm_engine::resolve(&s.store, r, &id, true).unwrap_err();
     assert_eq!(e.code, Code::Conflict);
     assert!(e.detail.contains("--as failed"), "{}", e.detail);
     assert_eq!(s.store.journal_len().unwrap(), len);
     // An id that names nothing is a usage error.
-    let e = dfm_engine::resolve(&r, "nope-1", true).unwrap_err();
+    let e = dfm_engine::resolve(&s.store, r, "nope-1", true).unwrap_err();
     assert_eq!(e.code, Code::Usage);
     // Match: restore the link.
     fs::remove_file(s.h.0.join("l")).unwrap();
     symlink("/src/x", s.h.0.join("l")).unwrap();
-    dfm_engine::resolve(&r, &id, true).unwrap();
+    dfm_engine::resolve(&s.store, r, &id, true).unwrap();
     let last = last_of(&s, &jid(1));
     assert_eq!(last.phase, Phase::Done);
     assert_eq!(last.reason.as_deref(), Some("resolved by operator"));
     assert_eq!(owned_paths(&s).len(), 1);
     // It is settled now: resolving again is a usage error.
     assert_eq!(
-        dfm_engine::resolve(&r, &id, false).unwrap_err().code,
+        dfm_engine::resolve(&s.store, r, &id, false)
+            .unwrap_err()
+            .code,
         Code::Usage
     );
 
@@ -1922,10 +1924,10 @@ fn resolve_done_records_ownership_only_for_a_matching_path_and_failed_needs_noth
     unknown_link(&s);
     let id = last_of(&s, &jid(1)).op_id;
     let home = Dir::open_home(&sys(&s.h), &s.h.0).unwrap();
-    let r = run(&s, &g, &allow, &fail, &home);
+    let r = (&sy, &home, s.h.0.as_path());
     fs::remove_file(s.h.0.join("l")).unwrap();
     fs::create_dir(s.h.0.join("l")).unwrap();
-    dfm_engine::resolve(&r, &id, false).unwrap();
+    dfm_engine::resolve(&s.store, r, &id, false).unwrap();
     assert_eq!(last_of(&s, &jid(1)).phase, Phase::Failed);
     assert!(owned_paths(&s).is_empty());
 }

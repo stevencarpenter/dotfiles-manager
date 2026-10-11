@@ -632,6 +632,15 @@ impl Exec<'_, '_> {
             } else {
                 continue;
             };
+            // Settling an earlier `unknown` just recorded this very link: adoption has nothing
+            // left to do, and the operation is not stale.
+            let recorded = op.action == Action::Adopt
+                && p.subject.starts_with("ledger:")
+                && op.link.as_deref().map(link_fingerprint).as_deref()
+                    == entry.and_then(|e| e.fingerprint.as_deref());
+            if actual != p.state && recorded {
+                return Err(Ended::Current);
+            }
             if actual != p.state {
                 return Err(blocked(
                     Code::PlanStale,

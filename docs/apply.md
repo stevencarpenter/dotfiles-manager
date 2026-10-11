@@ -164,11 +164,16 @@ The planner's `journal_id` ignores observations. A rerun after a partial apply p
 
 ## Interrupted runs
 
-An `intent` entry without a terminal entry is an interruption record. At the start of a run, after the gates, apply settles each one (`Store::reconcile`) with the operation's `already_done` check: the live entry is read through the opened HOME and compared with the recorded expectation. The result is journaled `done`, `failed` or `unknown`. Apply runs nothing again and creates no ownership. An `unknown` result blocks every operation on that path in this run. Settling writes the journal, so it counts as a mutation.
+Settling runs at the start of a run, after the gates and before the first operation. It has two steps.
+
+1. An `intent` entry without a terminal entry is an interruption record. Apply asks the operation's `already_done` check (`Store::reconcile`): the live entry is read through the opened HOME and compared with the recorded expectation. The result is journaled `done`, `failed` or `unknown`. Apply runs nothing again and creates no ownership for this step.
+2. Every `unknown` entry that no later entry settled is probed again, also one from an earlier run (DFM-19). A clear answer is journaled `done` or `failed` ("recovered: done", "recovered: not done"). For `done`, ownership follows the original operation, as in docs/state.md rule 5: the fingerprint of the live link or file must equal the intent's expected value, and a removal drops the ledger entry of the absent path. An answer that is not clear keeps the entry and blocks its path (and its ancestors and descendants) for this run. Each operation on such a path is `blocked` with `E_OP_INTERRUPTED`. The text names the journal id and the fix: `state resolve <journal-id> --as done|failed`.
+
+Settling writes the journal, so it counts as a mutation. A blocked operation stops the run like any other block. The planner does not block these paths (docs/state.md explains why), so plan and apply agree on the operation list and apply adds the block.
 
 ## Unconfirmed durability
 
-A primitive that committed its effect but could not confirm durability returns `E_IO_UNCONFIRMED` (`make_dir`, `make_link`, `replace_link`, `publish_file` and `remove_entry` all do this now). The executor does not call that a failure. The operation is `unknown`: the journal gets an `unknown` entry, the path is blocked for the rest of the run, dependents are `blocked`, no ownership is recorded, and the run stops. The effect is in place. A later run plans from the live machine again. An `unknown` result blocks only the run that produced it. A recovery step that keeps a path blocked across runs is DFM-19 work.
+A primitive that committed its effect but could not confirm durability returns `E_IO_UNCONFIRMED` (`make_dir`, `make_link`, `replace_link`, `publish_file` and `remove_entry` all do this now). The executor does not call that a failure. The operation is `unknown`: the journal gets an `unknown` entry, the path is blocked for the rest of the run, dependents are `blocked`, no ownership is recorded, and the run stops. The effect is in place. The entry stays open in later runs: each apply probes it again, as described above, and `doctor` lists it until it is settled.
 
 ## Failure and accounting
 

@@ -33,6 +33,7 @@ usage:
   dotfiles-manager bind --profile <file> --machine-id <id>
   dotfiles-manager binding
   dotfiles-manager state check
+  dotfiles-manager state resolve <journal-id> --as done|failed
   dotfiles-manager explain <resource-or-target> --root <dir>
   dotfiles-manager plan --root <dir> [--json] [--against <saved plan>]
   dotfiles-manager doctor --root <dir> [--json]
@@ -69,6 +70,12 @@ journals each step and writes a receipt. A removal also needs --allow-disruptive
 An existing link that is exactly the planned link is adopted (ownership is recorded, nothing is
 written) only with --allow-adopt <operation-id>.
 --preview prints the plan and its digest and changes nothing.
+
+An operation that ended unknown (E_OP_INTERRUPTED) blocks its path in every later run. Each apply
+checks the path again and settles the entry when the result is clear. Doctor and status list the
+entries that are still open with their journal id. state resolve <journal-id> --as done|failed
+settles one by hand: done needs the path to hold the result the operation expected (else
+E_CONFLICT); failed needs nothing. It takes the writer lock and journals the reason: resolved by operator.
 
 exit codes: 0 ok, 1 failed, 2 usage, 3 blocked before mutation, 4 declined,
 5 pending, 130 interrupted, 143 terminated.

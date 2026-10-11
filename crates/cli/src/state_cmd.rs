@@ -2,7 +2,7 @@
 //! binary (isolated builds only).
 
 use super::{Ctx, bounded, header, usage};
-use dfm_engine::{Fail, Store, verify_identity};
+use dfm_engine::{Dir, Fail, Store, resolve, verify_identity};
 use dfm_model::{Code, Refusal};
 use std::io::Write;
 
@@ -130,9 +130,55 @@ pub fn check(ctx: &Ctx, out: &mut dyn Write) -> Result<(), Refusal> {
     }
 }
 
+/// `state resolve <journal-id> --as done|failed`: settles an `unknown` outcome that no probe
+/// can decide. It takes the writer lock and appends one journal entry with the reason
+/// "resolved by operator". `done` needs the live path to match what the operation expected,
+/// and then records ownership as the operation would have. No receipt is written: the journal
+/// entry is the record.
+pub fn resolve_cmd(ctx: &Ctx, id: &str, as_done: bool, out: &mut dyn Write) -> Result<(), Refusal> {
+    let w =
+        |e: std::io::Error| Refusal::new(Code::IoFailed, format!("output failed: {}", e.kind()));
+    let binding = super::read_existing_binding(ctx)?.ok_or_else(|| {
+        Refusal::new(
+            Code::BindingInvalid,
+            "this machine is not bound; run bind first",
+        )
+    })?;
+    let (layout, sys) = (ctx.layout(), ctx.sys()?);
+    let store = Store::open_write_with(sys, &layout, fail_from_env()?, false)?;
+    let stamped = |store: &Store, r: Refusal| {
+        if store.mutated() {
+            r.after_mutation()
+        } else {
+            r
+        }
+    };
+    if !store.is_initialized() {
+        return Err(stamped(&store, super::state_lost_refusal()));
+    }
+    store
+        .require_identity(&binding)
+        .map_err(|r| stamped(&store, r))?;
+    let home = Dir::open_home(&sys, &layout.home).map_err(|r| stamped(&store, r))?;
+    resolve(&store, (&sys, &home, &layout.home), id, as_done).map_err(|r| stamped(&store, r))?;
+    header(out, ctx).map_err(w)?;
+    writeln!(
+        out,
+        "resolved {} as {}",
+        bounded(id),
+        if as_done { "done" } else { "failed" }
+    )
+    .map_err(w)
+}
+
 pub fn dispatch_state(ctx: &Ctx, rest: &[String], out: &mut dyn Write) -> Result<(), Refusal> {
+    const USAGE: &str = "usage: state check | state resolve <journal-id> --as done|failed";
     match rest {
         [sub] if sub == "check" => check(ctx, out),
-        _ => Err(usage("usage: state check")),
+        [sub, id, flag, kind] if sub == "resolve" && flag == "--as" => match kind.as_str() {
+            "done" | "failed" => resolve_cmd(ctx, id, kind == "done", out),
+            _ => Err(usage("state resolve: --as is done or failed")),
+        },
+        _ => Err(usage(USAGE)),
     }
 }

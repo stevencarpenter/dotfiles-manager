@@ -15,7 +15,7 @@ use dfm_model::plan::{
     Action, Node, Observations, Operation, Owned, Ownership, Plan, Request, Status, in_scope,
     link_fingerprint, sensitive_paths,
 };
-use dfm_model::state::{Class, Ledger, unfinished};
+use dfm_model::state::{Class, Ledger, unfinished, unresolved};
 use dfm_model::{Code, Refusal};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Write};
@@ -301,6 +301,23 @@ fn journal_rows(store: &Store, rows: &mut Vec<Row>) {
                 e.op, e.op_id, e.resource, e.at
             ),
             "Wait for a running apply to finish, then run apply. An apply that holds the lock reports E_LOCKED. Doctor never settles or replays.",
+        ));
+    }
+    for u in unresolved(&entries) {
+        let id = &u.unknown.op_id;
+        let subject = u.paths().next().unwrap_or(&u.unknown.op);
+        rows.push(Row::new(
+            "intent",
+            Code::OpInterrupted,
+            Level::Error,
+            subject,
+            &format!(
+                "operation {} (journal id {id}, resource {}, since {}) ended unknown and blocks this path in every run",
+                u.unknown.op, u.unknown.resource, u.unknown.at
+            ),
+            &format!(
+                "Check the path. Run apply: it settles the entry when the path shows a clear result. Otherwise run `dotfiles-manager state resolve {id} --as done` or `--as failed`. Doctor never settles."
+            ),
         ));
     }
 }
