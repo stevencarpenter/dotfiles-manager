@@ -189,6 +189,13 @@ fn shell_word(a: &str) -> String {
 }
 
 fn handler(id: &str, v: &Toml) -> Result<Handler, Refusal> {
+    // The id becomes `OwnedEntry.id` in the ledger, which refuses an empty id or a control
+    // character. Refuse it here, before any write.
+    if id.is_empty() || id.chars().any(char::is_control) {
+        return Err(invalid(
+            "a handler id must be a non-empty name without control characters",
+        ));
+    }
     let at = format!("handlers.{id}");
     let t = v
         .as_table()
@@ -649,9 +656,10 @@ fn remove_owned(
     let Some(arr) = event_array(hooks, event)? else {
         return Ok(());
     };
-    let before = arr.len();
-    arr.retain(|e| sha_of(e) != sha256);
-    if arr.len() != before {
+    // One ownership record authorizes the removal of one element. An identical copy that the
+    // user added is foreign configuration and stays.
+    if let Some(i) = arr.iter().position(|e| sha_of(e) == sha256) {
+        arr.remove(i);
         touched.insert(event.into());
     }
     Ok(())
@@ -681,11 +689,14 @@ fn remove_item(map: &mut Map<String, Json>, tokens: &[String], sha256: &str) -> 
     };
     let emptied = if rest.is_empty() {
         match map.get_mut(first) {
-            Some(Json::Array(a)) => {
-                let before = a.len();
-                a.retain(|e| sha_of(e) != sha256);
-                a.is_empty() && a.len() != before
-            }
+            // One record removes one item: an identical copy of the user's stays.
+            Some(Json::Array(a)) => match a.iter().position(|e| sha_of(e) == sha256) {
+                Some(i) => {
+                    a.remove(i);
+                    a.is_empty()
+                }
+                None => false,
+            },
             _ => false,
         }
     } else {
@@ -1154,13 +1165,10 @@ pub const SALT_LOST: &str = "state/salt is missing or unusable, but the ledger r
 /// managed view must differ from the salted hash the ledger holds, and must not already equal
 /// the declared values (then nothing is overwritten). Plan and apply both decide through this.
 pub fn foreign_edit(salt: &[u8], recorded: &CoOwned, m: &Merged) -> bool {
-    if recorded.leaves.is_empty() {
-        // A ledger written before DFM-48 holds the hash of the whole view only.
-        return salted(salt, &m.live_view) != recorded.managed_hash
-            && m.live_view != m.rendered_view;
-    }
     // Leaf by leaf, over the leaves both the ledger and the module name now. A leaf the module
-    // dropped, or one it added, is not an edit: the declared key set changed, not the file.
+    // dropped, renamed or added is not an edit: the declared key set changed, not the file. The
+    // whole-view hash is not consulted here, because it covers the old key set. A ledger written
+    // before DFM-48 has no leaf hashes, so its first write has nothing to compare and records them.
     recorded.leaves.iter().any(|(path, hash)| {
         let Some(declared) = m.rendered_leaves.get(path) else {
             return false;
@@ -1945,5 +1953,99 @@ defaultMode = "auto"
         let e = merge(None, &layered, &[]).unwrap_err();
         assert_eq!(e.code, Code::LimitExceeded);
         assert!(merge(None, &d, &[]).is_ok());
+    }
+
+    #[test]
+    fn an_owned_record_removes_one_element_and_an_identical_user_copy_stays() {
+        let d = desired(BASE);
+        let first = merge(None, &d, &[]).unwrap();
+        // The user adds an identical copy of the manager's hook.
+        let mut doc = json(&first.bytes);
+        let copy = doc["hooks"]["PreToolUse"][0].clone();
+        doc["hooks"]["PreToolUse"]
+            .as_array_mut()
+            .unwrap()
+            .push(copy);
+        let live = serde_json::to_vec(&doc).unwrap();
+        // The handler leaves the module: one element goes.
+        let gone = desired("[managed]\noutputStyle = \"STE\"\n");
+        let m = merge(Some(&live), &gone, &first.entries).unwrap();
+        assert_eq!(
+            json(&m.bytes)["hooks"]["PreToolUse"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        // A retire removes one element too.
+        let (bytes, _) = retire(&live, &first.entries, &[]).unwrap();
+        assert_eq!(
+            json(&bytes)["hooks"]["PreToolUse"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        // The same holds for an appended array item.
+        let n = desired(NESTED);
+        let a = merge(
+            Some(br#"{"sandbox":{"filesystem":{"allowWrite":["/m/one","/m/one"]}}}"#),
+            &n,
+            &[],
+        )
+        .unwrap();
+        let rec = vec![AppendedItem {
+            pointer: "/sandbox/filesystem/allowWrite".into(),
+            sha256: sha_of(&Json::from("/m/one")),
+        }];
+        let (bytes, _) = retire(&serde_json::to_vec(&json(&a.bytes)).unwrap(), &[], &rec).unwrap();
+        assert_eq!(
+            json(&bytes)["sandbox"]["filesystem"]["allowWrite"],
+            serde_json::json!(["/m/one", "/m/two"]),
+            "one copy of /m/one is removed and the other stays"
+        );
+    }
+
+    #[test]
+    fn a_handler_id_that_the_ledger_would_refuse_is_refused_when_desired_is_built() {
+        for id in ["\"\"", "\"a\\nb\"", "\"a\\u0001\""] {
+            let v = toml::from_str::<Toml>(&format!(
+                "[managed]\n[handlers.{id}]\nevent = \"E\"\ntype = \"command\"\nargv = [\"g\"]\n"
+            ))
+            .unwrap();
+            let e = Desired::from_value(&v).unwrap_err();
+            assert_eq!(e.code, Code::ManifestInvalid, "{id}");
+        }
+    }
+
+    #[test]
+    fn renaming_a_managed_key_in_one_update_is_no_conflict() {
+        let salt = [8u8; 32];
+        let old = desired("[managed]\nkeep = 1\nold = 2\n");
+        let first = merge(None, &old, &[]).unwrap();
+        let rec = CoOwned {
+            managed_hash: salted(&salt, &first.rendered_view),
+            entries: vec![],
+            appended: vec![],
+            leaves: leaf_hashes(&salt, &first),
+        };
+        // `old` is removed and `new` is added in one source update. The live file is untouched.
+        let renamed = desired("[managed]\nkeep = 1\nnew = 2\n");
+        let (m, o) = classify(Some(&first.bytes), &renamed, Some(&rec), Some(&salt)).unwrap();
+        assert_eq!(o, Outcome::Write);
+        let out = json(&m.bytes);
+        assert_eq!(
+            (out["new"].clone(), out["old"].clone()),
+            (2.into(), 2.into())
+        );
+        // A hand edit of the kept key in the same state is still a conflict.
+        let e = classify(
+            Some(br#"{"keep":9,"old":2}"#),
+            &renamed,
+            Some(&rec),
+            Some(&salt),
+        )
+        .unwrap_err();
+        assert_eq!(e.code, Code::Conflict);
     }
 }

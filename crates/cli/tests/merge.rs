@@ -2238,3 +2238,18 @@ fn partly_quoted_home_spellings_are_other_commands() {
         );
     }
 }
+
+#[test]
+fn renaming_a_managed_key_in_the_module_applies_in_one_update() {
+    let fx = Fx::base();
+    assert_eq!(code(&fx.apply()), 0);
+    // `teammateMode` is renamed: one key removed, another added, in one source update.
+    fx.base_module(|m| m.replace("teammateMode = \"tmux\"", "teammateModeRenamed = \"tmux\""));
+    let o = fx.plan();
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+    let o = fx.apply();
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+    let j = fx.live_json();
+    assert_eq!(j["teammateModeRenamed"], "tmux");
+    assert_eq!(code(&fx.apply()), 0);
+}
