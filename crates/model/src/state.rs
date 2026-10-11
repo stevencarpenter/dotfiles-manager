@@ -1076,6 +1076,17 @@ impl Scope {
     }
 
     pub fn admits(&self, path: &str) -> bool {
+        self.admits_with(path, true)
+    }
+
+    /// As [`Scope::admits`], for a directory the manager creates only while it is missing: it
+    /// may be an ancestor of a reserved path (`~/.local/share` above `~/.local/share/<manager>`),
+    /// because a missing directory holds nothing reserved. It may not be, or lie inside, one.
+    pub fn admits_new_dir(&self, path: &str) -> bool {
+        self.admits_with(path, false)
+    }
+
+    fn admits_with(&self, path: &str, ancestors_reserved: bool) -> bool {
         if !valid_path(path) {
             return false;
         }
@@ -1085,7 +1096,9 @@ impl Scope {
             .is_some_and(|rest| rest.starts_with('/') && rest.len() > 1);
         inside
             && !self.reserved.iter().any(|r| {
-                p == *r || p.starts_with(&format!("{r}/")) || r.starts_with(&format!("{p}/"))
+                p == *r
+                    || p.starts_with(&format!("{r}/"))
+                    || (ancestors_reserved && r.starts_with(&format!("{p}/")))
             })
     }
 
@@ -1130,13 +1143,34 @@ impl TrialRecord {
 }
 
 impl JournalEntry {
+    /// The step name of a directory the manager creates (see `JournalEntry::op`).
+    pub const CREATE_DIR: &'static str = "create-dir";
+
+    /// Whether this entry records the creation of a directory, which may lie above a reserved
+    /// path ([`Scope::admits_new_dir`]).
+    pub fn creates_dir(&self) -> bool {
+        self.op == Self::CREATE_DIR
+    }
+
     pub fn validate_within(&self, scope: &Scope) -> Result<(), Refusal> {
-        scope.check(
-            self.recovery
-                .iter()
-                .flat_map(|r| &r.outputs)
-                .map(|o| &o.path),
-        )
+        let new_dir = self.creates_dir();
+        let paths = self
+            .recovery
+            .iter()
+            .flat_map(|r| &r.outputs)
+            .map(|o| &o.path);
+        match paths.into_iter().find(|p| {
+            if new_dir {
+                !scope.admits_new_dir(p)
+            } else {
+                !scope.admits(p)
+            }
+        }) {
+            None => Ok(()),
+            Some(p) => Err(bad(format!(
+                "{p} is outside HOME or overlaps the manager's own paths"
+            ))),
+        }
     }
 }
 
@@ -1757,6 +1791,23 @@ mod tests {
         assert!(!sc.admits("/H/.local/\u{17f}hare/dotfiles-manager/new"));
         assert!(!sc.admits("/H/.local/share/DOTFILE\u{17f}-manager/x"));
         assert!(sc.admits("/H/.local/share/other"));
+    }
+
+    #[test]
+    fn a_directory_created_while_missing_may_lie_above_a_reserved_path_but_not_in_one() {
+        let sc = Scope::new("/H", &["/H/.local/share/dotfiles-manager".to_string()]);
+        assert!(!sc.admits("/H/.local/share"));
+        assert!(sc.admits_new_dir("/H/.local/share"));
+        assert!(sc.admits_new_dir("/H/.local/share/other"));
+        for no in [
+            "/H/.local/share/dotfiles-manager",
+            "/H/.local/share/Dotfiles-Manager/x",
+            "/H/.local/share/dotfiles-manager/x/y",
+            "/H",
+            "/elsewhere/x",
+        ] {
+            assert!(!sc.admits_new_dir(no), "{no}");
+        }
     }
 
     #[test]
