@@ -29,6 +29,14 @@ pub const MAX_PLAN_BYTES: usize = 16 << 20;
 pub const MAX_LISTING: usize = 50_000;
 pub const MAX_HASHED_BYTES: u64 = 16 << 20;
 
+/// What the source loader reads of one tree: entries (files, links and directories), bytes per
+/// file and bytes in total. The CLI loader refuses a tree over them, and apply uses the same
+/// numbers when it reads a directory source again, so a tree that loaded is never refused for
+/// size on the second read.
+pub const MAX_SOURCE_ENTRIES: usize = 20_000;
+pub const MAX_SOURCE_FILE_BYTES: u64 = 1 << 20;
+pub const MAX_SOURCE_TOTAL_BYTES: u64 = 64 << 20;
+
 /// What was found at one HOME-relative path, without following a link at the path itself.
 /// `own` says whether the current user owns it. Raw user ids are not recorded.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -514,6 +522,10 @@ pub fn source_identity(root: &str, set: &crate::resolve::SourceSet) -> Source {
                 kind,
             })
         })
+        .chain(set.dirs().map(|d| TreeEntry {
+            path: d.to_string(),
+            kind: EntryKind::Dir,
+        }))
         .collect();
     Source {
         kind: "path".into(),

@@ -7,10 +7,13 @@
 //! fragments the planner listed).
 
 use crate::fsys::{Dir, Got, Peek, Sys};
-use dfm_model::digest::sha256_hex;
+use dfm_model::digest::{EntryKind, TreeEntry, sha256_hex, tree_digest};
 use dfm_model::fold;
 use dfm_model::merge::{Merged, fragment_token};
-use dfm_model::plan::{MAX_HASHED_BYTES, MAX_LISTING, Operation, Plan};
+use dfm_model::plan::{
+    MAX_HASHED_BYTES, MAX_LISTING, MAX_SOURCE_ENTRIES, MAX_SOURCE_FILE_BYTES,
+    MAX_SOURCE_TOTAL_BYTES, Operation, Plan,
+};
 use dfm_model::state::{AppendedItem, Class, OwnedEntry};
 use dfm_model::{Code, Refusal};
 use std::collections::BTreeMap;
@@ -254,7 +257,7 @@ pub(crate) fn gather(
                     .iter()
                     .find(|p| {
                         p.resource == resource
-                            && p.path.as_deref().is_some_and(|pp| fold(pp) == fold(&path))
+                            && p.path.as_deref().is_some_and(|pp| fold::eq(pp, &path))
                     })
                     .ok_or_else(|| invalid(format!("no operation produces fragment {path}")))?;
                 selected(sys, &root, dir, producer, &mut budget, &f.name, &path)?
@@ -337,4 +340,139 @@ fn selected(
     let bytes = read_source(sys, root, producer, &input.path)?;
     budget.take(bytes.len())?;
     Ok(bytes)
+}
+
+/// The live tree below one directory source: the entries the planner digests.
+struct Tree {
+    entries: Vec<TreeEntry>,
+    bytes: u64,
+}
+
+fn tree_stale(path: &str) -> Gather {
+    stale(format!(
+        "source {path} changed since the plan: a directory entry is gone, special, not UTF-8 or over a limit"
+    ))
+}
+
+/// An entry that could not be examined is an I/O fault, not a change of the source.
+fn unreadable(path: &str, why: &str) -> Gather {
+    Gather::Failed(Refusal::new(
+        Code::IoFailed,
+        format!("source {path} cannot be examined: {why}"),
+    ))
+}
+
+/// Lists `dir` without following a link and records what the planner records for a directory
+/// source: a directory, a file with its hash, or a link with its target text.
+fn walk(
+    sys: &Sys,
+    dir: &Dir,
+    (prefix, shown): (&str, &str),
+    tree: &mut Tree,
+) -> Result<(), Gather> {
+    let room = MAX_SOURCE_ENTRIES.saturating_sub(tree.entries.len());
+    let listing = dir.list_upto(room)?;
+    if listing.odd > 0 || listing.names.len() > room {
+        return Err(tree_stale(shown));
+    }
+    for name in listing.names {
+        let rel = if prefix.is_empty() {
+            name.clone()
+        } else {
+            format!("{prefix}/{name}")
+        };
+        let kind = match dir.peek(sys, &name)? {
+            Peek::Dir { .. } => {
+                let child = dir.peek_dir(&name)?.ok_or_else(|| tree_stale(shown))?;
+                tree.entries.push(TreeEntry {
+                    path: rel.clone(),
+                    kind: EntryKind::Dir,
+                });
+                walk(sys, &child, (&rel, shown), tree)?;
+                continue;
+            }
+            Peek::File { .. } => {
+                let bytes = dir
+                    .read_plain(&name, MAX_SOURCE_FILE_BYTES)?
+                    .ok_or_else(|| tree_stale(shown))?;
+                tree.bytes += u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+                if tree.bytes > MAX_SOURCE_TOTAL_BYTES {
+                    return Err(tree_stale(shown));
+                }
+                EntryKind::File {
+                    exec: false,
+                    sha256: sha256_hex(&bytes),
+                }
+            }
+            Peek::Link { target, .. } => EntryKind::Symlink { target },
+            Peek::Unknown(why) => return Err(unreadable(shown, &why)),
+            _ => return Err(tree_stale(shown)),
+        };
+        tree.entries.push(TreeEntry { path: rel, kind });
+    }
+    Ok(())
+}
+
+/// Reads the source of a link operation again, immediately before the operation is journaled.
+/// The source root is the trusted start; every component below it is opened without following a
+/// link. The path must still be a regular file or a directory, and its content hash (file) or
+/// tree digest (directory) must equal the plan's `source:` precondition. A source with no
+/// recorded identity (a secret value) is checked for presence and type only.
+///
+/// shortcut: a directory source with entries that `[sources].exclude` left out is checked for
+/// presence and type only, because the plan does not record the exclude patterns; revisit when
+/// the plan carries the scope.
+pub(crate) fn link_source(sys: &Sys, plan: &Plan, op: &Operation) -> Result<(), Gather> {
+    let (Some(input), Some(link)) = (op.inputs.first(), op.link.as_deref()) else {
+        return Ok(());
+    };
+    let source = plan
+        .sources
+        .iter()
+        .find(|s| {
+            link.strip_prefix(s.root.as_str())
+                .is_some_and(|rest| rest.starts_with('/'))
+        })
+        .ok_or_else(|| invalid(format!("{}: the link target lies in no source", op.id)))?;
+    let path = input.path.as_str();
+    let gone = || {
+        stale(format!(
+            "source {path} changed since the plan: it is gone, a parent is a link, or it is not a file or directory"
+        ))
+    };
+    let want = op
+        .preconditions
+        .iter()
+        .find(|p| p.subject == format!("source:{path}"))
+        .and_then(|p| p.state.strip_prefix("sha256:"));
+    let mut cur = Dir::open_plain(Path::new(&source.root))?;
+    let mut parts: Vec<&str> = path.split('/').collect();
+    let name = parts.pop().ok_or_else(gone)?;
+    for part in parts {
+        cur = cur.peek_dir(part)?.ok_or_else(gone)?;
+    }
+    match cur.peek(sys, name)? {
+        Peek::File { .. } => {
+            let bytes = cur.read_plain(name, MAX_HASHED_BYTES)?.ok_or_else(gone)?;
+            if want.is_some_and(|h| h != sha256_hex(&bytes)) {
+                return Err(stale(format!("source {path} changed since the plan")));
+            }
+        }
+        Peek::Dir { .. } => {
+            let dir = cur.peek_dir(name)?.ok_or_else(gone)?;
+            if let (Some(want), None) = (want, op.excluded) {
+                let mut tree = Tree {
+                    entries: Vec::new(),
+                    bytes: 0,
+                };
+                walk(sys, &dir, ("", path), &mut tree)?;
+                if want != tree_digest(tree.entries) {
+                    return Err(stale(format!("source {path} changed since the plan")));
+                }
+            }
+        }
+        Peek::Unknown(why) => return Err(unreadable(path, &why)),
+        _ => return Err(gone()),
+    }
+    Ok(())
 }

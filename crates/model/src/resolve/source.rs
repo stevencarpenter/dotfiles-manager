@@ -16,6 +16,9 @@ pub struct SourceSet {
     /// Lowercased path to the spellings that fold to it. A case-insensitive filesystem resolves
     /// `Files/Link` and `files/link` to one entry, so lookups go through this index.
     folded: BTreeMap<String, Vec<String>>,
+    /// Real directories the loader walked, by folded path. A directory with no loaded entry (an
+    /// empty one, or one whose children are all excluded) exists only here.
+    dirs: BTreeMap<String, String>,
     /// The bundle's `[sources]` declaration when the loader read only part of the root.
     scope: Option<SourceScope>,
     /// Folded paths of excluded entries that exist on disk and were not read. A directory source
@@ -101,6 +104,27 @@ impl SourceSet {
         self.insert(path.into(), Entry::Link(target.into()));
     }
 
+    /// Records a real directory, so an empty one is still a directory and part of the identity.
+    pub fn insert_dir(&mut self, path: impl Into<String>) {
+        let path = path.into();
+        self.dirs.insert(fold(&path), path);
+    }
+
+    /// Every recorded directory, in folded-path order.
+    pub fn dirs(&self) -> impl Iterator<Item = &str> {
+        self.dirs.values().map(String::as_str)
+    }
+
+    /// Recorded directories below `dir`, as paths relative to `dir`.
+    pub(crate) fn dirs_below<'a>(&'a self, dir: &str) -> impl Iterator<Item = &'a str> {
+        let prefix = format!("{}/", fold(dir));
+        let depth = dir.split('/').filter(|c| !c.is_empty()).count();
+        self.dirs
+            .range(prefix.clone()..)
+            .take_while(move |(k, _)| k.starts_with(&prefix))
+            .filter_map(move |(_, v)| v.splitn(depth + 1, '/').nth(depth))
+    }
+
     pub fn get(&self, path: &str) -> Option<&Entry> {
         self.entries.get(path)
     }
@@ -127,11 +151,19 @@ impl SourceSet {
     }
 
     fn is_dir(&self, path: &str) -> bool {
-        let prefix = format!("{}/", fold(path));
-        self.folded
-            .range(prefix.clone()..)
-            .next()
-            .is_some_and(|(k, _)| k.starts_with(&prefix))
+        let folded = fold(path);
+        let prefix = format!("{folded}/");
+        self.dirs.contains_key(&folded)
+            || self
+                .folded
+                .range(prefix.clone()..)
+                .next()
+                .is_some_and(|(k, _)| k.starts_with(&prefix))
+            || self
+                .dirs
+                .range(prefix.clone()..)
+                .next()
+                .is_some_and(|(k, _)| k.starts_with(&prefix))
     }
 
     /// Entries below `dir`, matched without regard to case, as paths relative to `dir`.
@@ -371,6 +403,22 @@ mod tests {
             s.locate("m/files/other", "m"),
             Err(LocateFault::Scope(ScopeFault::Outside { .. }))
         ));
+    }
+
+    #[test]
+    fn an_empty_directory_is_a_directory_and_is_listed_below_its_parent() {
+        let mut s = SourceSet::new();
+        s.insert_dir("m/files/empty");
+        s.insert_dir("m/files/empty/inner");
+        assert!(matches!(
+            s.locate("m/files/empty", "m"),
+            Ok(Located::Dir { .. })
+        ));
+        // An ancestor of an empty directory is a directory too.
+        assert!(matches!(s.locate("m/files", "m"), Ok(Located::Dir { .. })));
+        assert_eq!(s.locate("m/files/none", "m"), Err(LocateFault::Missing));
+        let below: Vec<&str> = s.dirs_below("m/files").collect();
+        assert_eq!(below, ["empty", "empty/inner"]);
     }
 
     #[test]

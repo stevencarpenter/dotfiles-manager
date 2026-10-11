@@ -747,13 +747,13 @@ fn a_path_a_sensitive_resource_now_claims_is_not_read_even_if_the_ledger_has_a_n
 #[test]
 fn a_case_variant_of_a_sensitive_ledger_entry_is_not_read() {
     let fx = personal();
-    // The ledger records the sensitive class for `.CLAUDE/settings.json`. The file on disk is the
-    // normal-class entry of another resource at the lower-case spelling of the same path.
+    // The ledger records the sensitive class for `.CLAUDE/settings.json`. The file on disk is at
+    // the lower-case spelling of the same path. (A ledger that lists both spellings is
+    // `E_STATE_INVALID`, so only the sensitive one is recorded.)
     let target = fx.h(".claude/settings.json");
     fs::create_dir_all(target.parent().unwrap()).unwrap();
     fs::write(&target, "secret-bytes").unwrap();
     own(&fx, "vault-owner", "sensitive", ".CLAUDE/settings.json");
-    own(&fx, "other", "normal", ".claude/settings.json");
     let old = old_atime(&target);
     // Without a profile there is no plan, so only the ledger decides what is sensitive.
     fs::remove_file(fx.root.join("profiles/personal-dev-01.toml")).unwrap();
@@ -763,7 +763,7 @@ fn a_case_variant_of_a_sensitive_ledger_entry_is_not_read() {
         old,
         "doctor read a case alias of a sensitive entry"
     );
-    assert_eq!(at(&rows, ".claude/settings.json")["status"], "N/A");
+    assert_eq!(at(&rows, ".CLAUDE/settings.json")["status"], "N/A");
 }
 
 #[test]

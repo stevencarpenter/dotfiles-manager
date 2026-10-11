@@ -247,7 +247,7 @@ A source identity is `(canonical origin, resolved commit, tree digest)`.
 
 **Tree digest (S1).** The manager recomputes the digest from the checked-out staging tree. It never trusts a digest supplied by the source.
 
-1. The digest is SHA-256 over sorted entries `<relative path> NUL <mode class> NUL <content sha256 or symlink target>`. Mode class is `file` or `exec` (executable bit), or `symlink`.
+1. The digest is SHA-256 over sorted entries `<relative path> NUL <mode class> NUL <content sha256 or symlink target>`. Mode class is `file` or `exec` (executable bit), `symlink`, or `dir` (a real directory, with an empty value; a path source records every directory it walked, so an empty one is part of the identity).
 2. Entries allowed: regular files and symlinks. Submodules, gitlinks, devices, sockets, FIFOs and any non-regular entry are rejected with `E_SOURCE_UNTRUSTED`.
 3. A symlink target must stay inside the source root; otherwise `E_SOURCE_ESCAPE`.
 4. The pinned commit must be reachable from the declared `ref` in the fetched history.
