@@ -43,12 +43,15 @@ thread_local! {
     static LISTED: Cell<usize> = const { Cell::new(0) };
 }
 
-/// How many directory listings this thread has read. For tests that check a directory is
-/// listed once.
+/// Test seam: how many directory listings this thread has read, so a test can check that a
+/// directory is listed once. Not part of the engine's API.
+#[doc(hidden)]
 pub fn listed() -> usize {
     LISTED.with(Cell::get)
 }
 
+/// Test seam, see [`listed`].
+#[doc(hidden)]
 pub fn reset_listed() {
     LISTED.with(|c| c.set(0));
 }

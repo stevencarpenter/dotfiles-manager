@@ -210,7 +210,6 @@ fn unreadable_entries_are_unknown_facts_and_never_abort_the_walk() {
 
 #[test]
 fn a_directory_is_listed_once_for_many_requests() {
-    dfm_engine::reset_listed();
     let h = Home::new();
     fs::create_dir_all(h.0.join("d")).unwrap();
     for n in ["a", "b", "c"] {

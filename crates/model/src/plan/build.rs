@@ -85,7 +85,14 @@ pub fn requests(resolved: &Resolved, ledger: &[Owned]) -> Vec<Request> {
     for o in removals(resolved, ledger) {
         want.entry(o.path.clone()).or_default().0 |= o.class == Class::Normal;
     }
-    // Whatever else asked for it, a path that a selected sensitive resource claims is never hashed.
+    // Whatever else asked for it, a path that a selected sensitive resource claims, or that the
+    // ledger records as sensitive (whoever claims it now), is never hashed.
+    let sensitive_ledger = sensitive_ledger_paths(ledger);
+    for (path, w) in &mut want {
+        if sensitive_ledger.contains(&fold(path)) {
+            w.0 = false;
+        }
+    }
     for r in resolved.resources.values().filter(|r| r.sensitive) {
         for c in &r.claims {
             if let Some(w) = want.get_mut(c) {
@@ -98,10 +105,20 @@ pub fn requests(resolved: &Resolved, ledger: &[Owned]) -> Vec<Request> {
         .collect()
 }
 
+/// Folded paths the ledger records with the sensitive class.
+fn sensitive_ledger_paths(ledger: &[Owned]) -> BTreeSet<String> {
+    ledger
+        .iter()
+        .filter(|o| o.class == Class::Sensitive)
+        .map(|o| fold(&o.path))
+        .collect()
+}
+
 /// The second pass: fragments already in a fragment directory that no resource claims. They are
 /// inputs the manager does not produce, so they are hashed. A claimed path is never requested
 /// here: whether it is hashed depends on its sensitivity and was decided in the first pass.
-pub fn followups(resolved: &Resolved, obs: &Observations) -> Vec<Request> {
+pub fn followups(resolved: &Resolved, obs: &Observations, ledger: &[Owned]) -> Vec<Request> {
+    let sensitive = sensitive_ledger_paths(ledger);
     let claimed: BTreeSet<String> = resolved
         .resources
         .values()
@@ -115,7 +132,8 @@ pub fn followups(resolved: &Resolved, obs: &Observations) -> Vec<Request> {
             };
             for n in l.names.iter().filter(|n| matches_pattern(&d.pattern, n)) {
                 let path = format!("{}/{n}", d.dir);
-                if !claimed.contains(&fold(&path)) {
+                let folded = fold(&path);
+                if !claimed.contains(&folded) && !sensitive.contains(&folded) {
                     out.insert(Request {
                         path,
                         hash: true,
@@ -670,10 +688,9 @@ impl Planner<'_> {
     fn remove_checks(&self, o: &Owned, op: &mut Operation) -> Result<(), Fail> {
         let field = "owned_outputs";
         let path = o.path.as_str();
-        if !path.is_ascii() {
-            return Err(non_ascii(field, path));
-        }
+        self.claim_checks(path, field)?;
         let parents = self.parents(path, field, true)?;
+        self.unchecked(path, field)?;
         op.preconditions.extend(parents.states.clone());
         let seen = if parents.missing_from.is_some() {
             Seen {
@@ -930,12 +947,10 @@ impl Planner<'_> {
                 if selected_names.contains(&fold(n)) {
                     continue;
                 }
-                // A fragment that a planned removal deletes is read first, then removed.
-                if let Some((rid, res)) = removals.get(&fold(&path)) {
-                    fragments.push(Fragment {
-                        name: n.clone(),
-                        origin: format!("removing:{res}"),
-                    });
+                // A fragment that a planned removal deletes is not an input. It leaves the list,
+                // and the consumer runs after the removal, so deselected content never reaches
+                // the assembled file and one apply converges.
+                if let Some((rid, _)) = removals.get(&fold(&path)) {
                     removing.push((n.clone(), rid.clone()));
                     continue;
                 }
@@ -973,7 +988,11 @@ impl Planner<'_> {
         }
         for cid in &consumers {
             if let Some(op) = self.ops.get_mut(cid) {
-                for (pid, _, _) in &selected {
+                let waits = selected
+                    .iter()
+                    .map(|(pid, _, _)| pid)
+                    .chain(removing.iter().map(|(_, rid)| rid));
+                for pid in waits {
                     if !op.after.contains(pid) {
                         op.after.push(pid.clone());
                     }
@@ -988,17 +1007,6 @@ impl Planner<'_> {
                     op.status = Status::Blocked;
                     op.effect = format!("blocked: a fragment in {} cannot be used", d.dir);
                 }
-            }
-        }
-        // The removal waits for every consumer that reads the file.
-        for (_, rid) in removing {
-            if let Some(rm) = self.ops.get_mut(&rid) {
-                for cid in &consumers {
-                    if !rm.after.contains(cid) {
-                        rm.after.push(cid.clone());
-                    }
-                }
-                rm.after.sort();
             }
         }
     }

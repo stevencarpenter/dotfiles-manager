@@ -97,6 +97,7 @@ fn node(peek: Peek, dir: &Dir, name: &str, hash: bool) -> Node {
 pub fn observe(sys: &Sys, home: &Dir, requests: &[Request]) -> Result<Observations, Refusal> {
     let mut out = Observations::default();
     // Entry names of each directory, by its HOME-relative path, for the case check.
+    // `Rc` avoids cloning a listing per node; the saving is not measured.
     let mut names: BTreeMap<String, Rc<Listing>> = BTreeMap::new();
     for req in requests {
         let comps: Vec<&str> = req.path.split('/').collect();

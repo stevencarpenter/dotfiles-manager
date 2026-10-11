@@ -308,12 +308,12 @@ pub fn explain(resolved: &Resolved, query: &str) -> Result<String, Refusal> {
     if let Some(r) = resolved.resources.get(query) {
         hits.push(r);
     } else {
-        let q = query.trim_end_matches('/').to_lowercase();
+        let q = crate::fold::fold(query.trim_end_matches('/'));
         hits.extend(resolved.resources.values().filter(|r| {
             r.target
                 .iter()
                 .chain(&r.claims)
-                .any(|t| t.to_lowercase() == q)
+                .any(|t| crate::fold::fold(t) == q)
         }));
     }
     if hits.is_empty() {

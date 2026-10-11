@@ -145,28 +145,34 @@ pub fn make_plan(ctx: &Ctx, root: &Path) -> Result<Plan, Refusal> {
     let home = Dir::open_home(&sys, &layout.home)?;
     let reqs = plan::requests(&loaded.resolved, &ledger);
     let mut obs = observe(&sys, &home, &reqs)?;
-    let more = observe(&sys, &home, &plan::followups(&loaded.resolved, &obs))?;
+    let more = observe(
+        &sys,
+        &home,
+        &plan::followups(&loaded.resolved, &obs, &ledger),
+    )?;
     merge(&mut obs, more);
 
     // Claims that overlap the manager's own paths, by the store's rules: the text scope (case
     // folded, so it holds for directories that do not exist yet) and filesystem identity.
     let mut reserved = BTreeMap::new();
     let mut unchecked = BTreeMap::new();
-    for r in loaded.resolved.resources.values() {
+    let claimed = loaded.resolved.resources.values().flat_map(|r| {
         let dirs = r.dir_claims.iter().map(|d| &d.dir);
-        for rel in r.claims.iter().chain(dirs) {
-            let abs = home.shown().join(rel);
-            // An overlap is a reserved path (E_STATE_INVALID from the store). Any other failure
-            // means the path could not be checked, so the plan reports an unknown fact
-            // (E_OBSERVATION_UNKNOWN, exit 3: "a required prerequisite that is UNKNOWN",
-            // architecture section 10). The planner reports a link loop or an unreadable parent
-            // first, with its own code.
-            if let Err(e) = store.check_claim(&abs.to_string_lossy()) {
-                if e.code == Code::StateInvalid {
-                    reserved.insert(rel.clone(), visible(&e.detail));
-                } else {
-                    unchecked.insert(rel.clone(), visible(&e.detail));
-                }
+        r.claims.iter().chain(dirs)
+    });
+    // Ledger outputs are checked too: a removal candidate is a path the manager would touch.
+    for rel in claimed.chain(ledger.iter().map(|o| &o.path)) {
+        let abs = home.shown().join(rel);
+        // An overlap is a reserved path (E_STATE_INVALID from the store). Any other failure
+        // means the path could not be checked, so the plan reports an unknown fact
+        // (E_OBSERVATION_UNKNOWN, exit 3: "a required prerequisite that is UNKNOWN",
+        // architecture section 10). The planner reports a link loop or an unreadable parent
+        // first, with its own code.
+        if let Err(e) = store.check_claim(&abs.to_string_lossy()) {
+            if e.code == Code::StateInvalid {
+                reserved.insert(rel.clone(), visible(&e.detail));
+            } else {
+                unchecked.insert(rel.clone(), visible(&e.detail));
             }
         }
     }

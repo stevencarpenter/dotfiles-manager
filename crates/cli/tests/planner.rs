@@ -1007,7 +1007,7 @@ mod synthetic {
         };
         let dir = dfm_engine::Dir::open_home(&sys, home.path()).unwrap();
         let mut obs = dfm_engine::observe(&sys, &dir, &requests(&resolved, &[])).unwrap();
-        let more = dfm_engine::observe(&sys, &dir, &followups(&resolved, &obs)).unwrap();
+        let more = dfm_engine::observe(&sys, &dir, &followups(&resolved, &obs, &[])).unwrap();
         dfm_engine::merge(&mut obs, more);
         (resolved, obs)
     }
@@ -1955,7 +1955,7 @@ fn a_ledger_entry_on_a_sensitive_claim_leaks_no_hash_and_is_not_a_removal() {
 }
 
 #[test]
-fn a_fragment_that_is_being_removed_is_read_first_and_removed_after_its_consumer() {
+fn a_fragment_being_removed_is_not_an_input_and_its_consumer_runs_after_the_removal() {
     let e = Env::personal();
     e.mkdirs(".codex/AGENTS.d");
     let gone = e.h(".codex/AGENTS.d/30-gone.md");
@@ -1965,14 +1965,11 @@ fn a_fragment_that_is_being_removed_is_read_first_and_removed_after_its_consumer
     let consumer = op(&s, "agents.codex-instructions@.codex/AGENTS.md");
     let rm = op(&s, "remove@gone.res@.codex/AGENTS.d/30-gone.md");
     assert_eq!((rm.action, rm.status), (Action::Remove, Status::Planned));
-    assert!(rm.after.contains(&consumer.id), "{:?}", rm.after);
-    assert!(!consumer.after.contains(&rm.id));
-    let frag: Vec<_> = consumer
-        .fragments
-        .iter()
-        .map(|f| (&f.name[..], &f.origin[..]))
-        .collect();
-    assert_eq!(frag, [("30-gone.md", "removing:gone.res")]);
+    // The consumer waits for the removal, never the other way round, so there is no cycle.
+    assert!(consumer.after.contains(&rm.id), "{:?}", consumer.after);
+    assert!(rm.after.is_empty(), "{:?}", rm.after);
+    // Deselected content is not an input.
+    assert!(consumer.fragments.is_empty(), "{:?}", consumer.fragments);
     assert!(
         consumer
             .preconditions
@@ -1980,7 +1977,8 @@ fn a_fragment_that_is_being_removed_is_read_first_and_removed_after_its_consumer
             .any(|c| c.state == "selected=[] foreign=[] removing=[30-gone.md]")
     );
     let pos = |id: &str| s.plan.operations.iter().position(|o| o.id == id).unwrap();
-    assert!(pos(&consumer.id) < pos(&rm.id));
+    assert!(pos(&rm.id) < pos(&consumer.id));
+    assert!(s.plan.blockers.is_empty());
 
     // A removal that is blocked (the file was edited) is not a producer and no edge is added:
     // the edited file is an ordinary foreign fragment.
@@ -2267,5 +2265,178 @@ mod hardening {
             serde_json::json!({"kind": "dir", "mode": 493, "own": true, "extra": 1}),
         );
         assert!(bad.is_err());
+    }
+}
+
+#[test]
+fn a_path_the_ledger_records_as_sensitive_is_never_hashed_whoever_claims_it_now() {
+    let e = Env::personal();
+    e.mkdirs(".ssh");
+    let out = e.h(".ssh/config");
+    // The ledger says a sensitive resource wrote this file. A normal resource claims it now.
+    let o = e.run(&[
+        "__record-op",
+        "--resource",
+        "gone.res",
+        "--output",
+        out.to_str().unwrap(),
+        "--content",
+        "SECRETX-CONTENT",
+        "--sensitive",
+        "yes",
+    ]);
+    assert_eq!(code(&o), 0, "{}", text(&o.stderr));
+    let digest = format!("{:x}", Sha256::digest(b"SECRETX-CONTENT"));
+    let o = e.plan(&["--json"]);
+    let all = text(&o.stdout);
+    assert!(
+        !all.contains(&digest) && !all.contains("SECRETX-CONTENT"),
+        "{all}"
+    );
+    let s = Saved::parse(&o.stdout).unwrap();
+    match &s.plan.observations.seen[".ssh/config"].node {
+        dfm_model::plan::Node::File { sha256, .. } => assert_eq!(sha256, &None),
+        n => panic!("{n:?}"),
+    }
+}
+
+mod ledger_sensitivity {
+    use super::*;
+    use dfm_cli::builtin_catalog;
+    use dfm_model::plan::{Node, Observations, Owned, Seen, followups, requests};
+    use dfm_model::resolve::{SourceSet, resolve};
+    use dfm_model::state::Class;
+
+    fn resolved() -> dfm_model::resolve::Resolved {
+        let mut set = SourceSet::new();
+        fn load(dir: &Path, rel: &str, out: &mut SourceSet) {
+            for e in fs::read_dir(dir).unwrap() {
+                let e = e.unwrap();
+                let name = e.file_name().into_string().unwrap();
+                let path = if rel.is_empty() {
+                    name
+                } else {
+                    format!("{rel}/{name}")
+                };
+                if e.file_type().unwrap().is_dir() {
+                    load(&e.path(), &path, out);
+                } else {
+                    out.insert_file(path, fs::read(e.path()).unwrap());
+                }
+            }
+        }
+        load(&repo_root().join("examples"), "", &mut set);
+        resolve(&set, "profiles/personal-dev-01.toml", &builtin_catalog()).unwrap()
+    }
+
+    fn entry(path: &str) -> Owned {
+        Owned {
+            resource: "gone.res".into(),
+            adapter: "x/v1".into(),
+            class: Class::Sensitive,
+            path: path.into(),
+            fingerprint: None,
+        }
+    }
+
+    #[test]
+    fn requests_never_hash_a_path_the_ledger_records_as_sensitive() {
+        let r = resolved();
+        let plain = requests(&r, &[]);
+        assert!(plain.iter().any(|q| q.path == ".ssh/config" && q.hash));
+        let with = requests(&r, &[entry(".ssh/config")]);
+        assert!(with.iter().any(|q| q.path == ".ssh/config" && !q.hash));
+        // A spelling that differs only by case is the same path.
+        let with = requests(&r, &[entry(".SSH/Config")]);
+        assert!(with.iter().any(|q| q.path == ".ssh/config" && !q.hash));
+    }
+
+    #[test]
+    fn followups_skip_a_fragment_the_ledger_records_as_sensitive_in_another_case() {
+        let r = resolved();
+        let mut obs = Observations::default();
+        obs.listings.insert(
+            ".codex/AGENTS.d".into(),
+            dfm_model::plan::Listing {
+                names: vec!["50-s.md".into(), "60-t.md".into()],
+                incomplete: None,
+            },
+        );
+        let _ = Seen {
+            node: Node::Missing {},
+            alias: None,
+        };
+        let paths = |l: &[Owned]| {
+            followups(&r, &obs, l)
+                .into_iter()
+                .map(|q| q.path)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            paths(&[]),
+            [".codex/AGENTS.d/50-s.md", ".codex/AGENTS.d/60-t.md"]
+        );
+        assert_eq!(
+            paths(&[entry(".codex/AGENTS.d/50-S.md")]),
+            [".codex/AGENTS.d/60-t.md"]
+        );
+    }
+
+    #[test]
+    fn missing_serializes_to_exactly_its_kind() {
+        assert_eq!(
+            serde_json::to_string(&Node::Missing {}).unwrap(),
+            r#"{"kind":"missing"}"#
+        );
+    }
+
+    #[test]
+    fn an_out_of_scope_resource_with_a_bad_mode_still_raises_a_blocker() {
+        use dfm_model::plan::{Binary, Context, Source, build};
+        let mut r = resolved();
+        r.resources
+            .get_mut("personal-dev.example-secret")
+            .unwrap()
+            .value
+            .as_table_mut()
+            .unwrap()
+            .insert("mode".into(), toml::Value::Integer(0o4755));
+        let cx = Context {
+            binary: Binary {
+                version: "0".into(),
+                sha256: "0".repeat(64),
+            },
+            profile: "p",
+            machine_id: "m",
+            sources: vec![Source {
+                kind: "path".into(),
+                root: "/r".into(),
+                tree: "sha256:0".into(),
+            }],
+            root: "/r",
+            ledger: vec![],
+            reserved: Default::default(),
+            unchecked: Default::default(),
+        };
+        let mut obs = Observations::default();
+        for q in requests(&r, &[]) {
+            for i in 0..q.path.split('/').count() {
+                let p = q.path.split('/').take(i + 1).collect::<Vec<_>>().join("/");
+                obs.seen.entry(p).or_insert(Seen {
+                    node: Node::Missing {},
+                    alias: None,
+                });
+            }
+        }
+        let p = build(&r, &cx, &obs).unwrap();
+        let b = p
+            .blockers
+            .iter()
+            .find(|b| b.resource == "personal-dev.example-secret")
+            .unwrap();
+        assert_eq!(
+            (b.code.as_str(), b.field.as_deref()),
+            ("E_MANIFEST_INVALID", Some("/mode"))
+        );
     }
 }
