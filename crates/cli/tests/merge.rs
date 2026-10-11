@@ -2253,3 +2253,32 @@ fn renaming_a_managed_key_in_the_module_applies_in_one_update() {
     assert_eq!(j["teammateModeRenamed"], "tmux");
     assert_eq!(code(&fx.apply()), 0);
 }
+
+#[test]
+fn bind_with_a_missing_salt_and_an_unreadable_ledger_refuses_and_creates_no_salt() {
+    let fx = Fx::base();
+    assert_eq!(code(&fx.apply()), 0);
+    let salt = fx.state().join("salt");
+    let ledger = fx.state().join("ledger.json");
+    fs::remove_file(&salt).unwrap();
+    fs::set_permissions(&ledger, fs::Permissions::from_mode(0o644)).unwrap();
+    let p = fx.root.join("profiles/t-01.toml");
+    let args = [
+        "bind",
+        "--profile",
+        p.to_str().unwrap(),
+        "--machine-id",
+        "m5-test",
+    ];
+    let o = fx.run(&args);
+    assert_eq!(code(&o), 3, "{}\n{}", stderr(&o), text(&o.stdout));
+    assert!(stderr(&o).contains("E_STORAGE_INVALID"), "{}", stderr(&o));
+    assert!(stderr(&o).contains("ledger"), "{}", stderr(&o));
+    assert!(!salt.exists(), "no salt was made from missing evidence");
+    // Repaired, the ledger proves the hashes exist, so the lost salt is still refused.
+    fs::set_permissions(&ledger, fs::Permissions::from_mode(0o600)).unwrap();
+    let o = fx.run(&args);
+    assert_eq!(code(&o), 3, "{}\n{}", stderr(&o), text(&o.stdout));
+    assert!(stderr(&o).contains("E_STATE_INVALID"), "{}", stderr(&o));
+    assert!(!salt.exists());
+}

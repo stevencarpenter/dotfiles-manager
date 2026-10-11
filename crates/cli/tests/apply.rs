@@ -2582,3 +2582,48 @@ fn a_home_that_resolves_to_a_path_with_a_space_is_refused() {
     assert_eq!(code(&o), 3, "{}", stderr(&o));
     assert!(stderr(&o).contains("E_HOME_MISMATCH"), "{}", stderr(&o));
 }
+
+#[test]
+fn state_recover_keeps_the_entry_open_on_an_unreadable_ledger_then_settles_it() {
+    let fx = Fx::new();
+    assert_eq!(code(&fx.apply(&[])), 0);
+    fx.put("base/modules/extra/files/zshrc2", "export B=2\n");
+    let m = fs::read_to_string(fx.root.join("base/modules/extra/module.toml")).unwrap();
+    fs::write(
+        fx.root.join("base/modules/extra/module.toml"),
+        m.replace("files/zshrc\"", "files/zshrc2\""),
+    )
+    .unwrap();
+    let o = fx.apply_failing("link-after-rename:error", &[]);
+    assert_eq!(code(&o), 1, "{}\n{}", stderr(&o), text(&o.stdout));
+    let (id, _) = fx.unknown_entry();
+    let ledger = fx.state().join("ledger.json");
+    fs::set_permissions(&ledger, fs::Permissions::from_mode(0o644)).unwrap();
+    let before = fx.journal().len();
+    let o = fx.run(&["state", "recover"]);
+    assert_ne!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+    assert!(stderr(&o).contains("ledger"), "{}", stderr(&o));
+    let journal = fx.journal();
+    assert_eq!(journal.len(), before, "nothing was journaled");
+    assert!(
+        !journal
+            .iter()
+            .any(|e| e["op_id"] == id.as_str() && e["phase"] == "done"),
+        "no done entry for {id}"
+    );
+    fs::set_permissions(&ledger, fs::Permissions::from_mode(0o600)).unwrap();
+    let o = fx.run(&["state", "recover"]);
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+    assert!(text(&o.stdout).contains(&format!("settled {id} as done")));
+    let new = fx.root.join("base/modules/extra/files/zshrc2");
+    let want = dfm_model::plan::link_fingerprint(new.to_str().unwrap());
+    let fp = fx.ledger()["resources"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|r| r["owned_outputs"].as_array().unwrap().iter())
+        .find(|o| o["path"].as_str().unwrap().ends_with("/.zshrc"))
+        .unwrap()["fingerprint"]
+        .clone();
+    assert_eq!(fp, want.as_str(), "the ledger was updated");
+}
