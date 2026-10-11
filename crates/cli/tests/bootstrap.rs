@@ -1365,6 +1365,36 @@ fn an_unusable_binding_stops_the_install_before_any_mutation() {
 }
 
 #[test]
+fn a_binding_with_a_second_hard_link_stops_the_install_before_any_mutation() {
+    let (_tmp, home, src, sha) = refusal_setup("binding-nlink");
+    let cfg = home.join(".config/dotfiles-manager");
+    fs::create_dir_all(&cfg).unwrap();
+    let binding = cfg.join("machine.toml");
+    let valid = "schema = 1\nprofile = \"/p\"\nmachine_id = \"m5\"\nplatform = \"macos\"\narch = \"aarch64\"\norigins = []\n";
+    let before = entries_below(&home);
+    fs::write(&binding, valid).unwrap();
+    fs::set_permissions(&binding, fs::Permissions::from_mode(0o600)).unwrap();
+    let other = home.join("other-link.toml");
+    fs::hard_link(&binding, &other).unwrap();
+    let o = install_tiny(&home, &src, &sha);
+    assert_eq!(o.status.code(), Some(3), "{}", err(&o));
+    assert!(
+        err(&o).contains("E_BINDING_INVALID")
+            && err(&o).contains("machine.toml")
+            && err(&o).contains("more than one hard link"),
+        "{}",
+        err(&o)
+    );
+    fs::remove_file(&binding).unwrap();
+    fs::remove_file(&other).unwrap();
+    assert_eq!(
+        entries_below(&home),
+        before,
+        "nothing may be created, and `current` must stay absent"
+    );
+}
+
+#[test]
 fn a_fifo_at_the_binding_path_does_not_hang_the_script_or_the_manager() {
     let (_tmp, home, src, sha) = refusal_setup("binding-fifo");
     let cfg = home.join(".config/dotfiles-manager");
