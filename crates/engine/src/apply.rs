@@ -1507,6 +1507,8 @@ impl Exec<'_, '_> {
 ///    again. A clear answer journals `done` (with ownership as the operation would have
 ///    recorded it) or `failed`. An unclear one blocks its path in this run.
 fn settle(ex: &mut Exec<'_, '_>) -> Result<(), Refusal> {
+    // A torn final journal line is cut and journaled before anything reads the entries.
+    ex.run.store.repair_torn_journal()?;
     let entries = ex.run.store.read_journal_lenient()?;
     let settled = {
         let planned = |resource: &str, abs: &str| {

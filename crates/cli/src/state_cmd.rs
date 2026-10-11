@@ -86,7 +86,7 @@ pub fn check(ctx: &Ctx, out: &mut dyn Write) -> Result<(), Refusal> {
     findings.extend(l.strays.iter().map(|s| Finding {
         code: Code::StateInvalid,
         file: s.clone(),
-        detail: "stray entry from an interrupted write or an unexpected file".into(),
+        detail: "stray entry from an interrupted write or an unexpected file. Fix: remove the temporary file after you confirm that no apply is running; `state recover` does not delete it".into(),
     }));
     let count = |n: usize, bad: usize| format!("{n} ({bad} unreadable)");
     let (r_bad, t_bad) = (
@@ -206,6 +206,14 @@ pub fn recover_cmd(ctx: &Ctx, out: &mut dyn Write) -> Result<(), Refusal> {
     let l = open_locked(ctx)?;
     let s = recover(&l.store, (&l.sys, &l.home, &l.home_path)).map_err(|r| stamped(&l.store, r))?;
     header(out, ctx).map_err(out_err)?;
+    if s.repaired > 0 {
+        writeln!(
+            out,
+            "repaired a torn final journal line ({} bytes removed)",
+            s.repaired
+        )
+        .map_err(out_err)?;
+    }
     for (id, phase) in &s.closed {
         let what = if *phase == Phase::Done {
             "done"
@@ -229,7 +237,7 @@ pub fn recover_cmd(ctx: &Ctx, out: &mut dyn Write) -> Result<(), Refusal> {
         )
         .map_err(out_err)?;
     }
-    if s.closed.is_empty() && s.open.is_empty() {
+    if s.closed.is_empty() && s.open.is_empty() && s.repaired == 0 {
         return writeln!(out, "nothing to recover").map_err(out_err);
     }
     // An open entry is a result to report, not a failure of this command: exit 3 even when

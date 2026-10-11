@@ -733,6 +733,46 @@ impl Store {
         }
     }
 
+    /// Repairs a single torn final journal line, the result of a crash or a failed write in the
+    /// middle of an append. If the journal does not end in a newline, the bytes after the last
+    /// newline are cut off, then one `failed` entry (`op` `repair`) records how many bytes were
+    /// removed. This is the first write of the run that needs it. A torn line that is not the
+    /// last one, or any other damage, is not repaired: the journal then stays unreadable and
+    /// every command refuses it. Returns the number of bytes removed, 0 when nothing was torn.
+    pub fn repair_torn_journal(&self) -> Result<usize, Refusal> {
+        self.guard(None)?;
+        let bytes = self.read_doc("journal.jsonl")?;
+        // Nothing torn: no write, so the store is not marked as mutated.
+        if bytes.last().is_none_or(|b| *b == b'\n') {
+            return Ok(0);
+        }
+        self.wrote(self.repair_torn_journal_inner(&bytes))
+    }
+
+    fn repair_torn_journal_inner(&self, bytes: &[u8]) -> Result<usize, Refusal> {
+        let keep = bytes.iter().rposition(|b| *b == b'\n').map_or(0, |i| i + 1);
+        // Everything before the torn line must be a sound journal.
+        state::parse_journal(&bytes[..keep])?;
+        let removed = bytes.len() - keep;
+        self.state()?
+            .truncate_to(&self.sys, "journal.jsonl", u64::try_from(keep).unwrap_or(0))?;
+        let at = now_unix()?;
+        self.append_journal(&JournalEntry {
+            schema: state::SCHEMA,
+            op_id: format!("journal-repair-{at}"),
+            op: "repair".into(),
+            phase: Phase::Failed,
+            at: state::rfc3339(at),
+            resource: "journal".into(),
+            adapter: "manager".into(),
+            class: Class::Normal,
+            recovery: None,
+            token: None,
+            reason: Some(format!("torn line repaired: removed {removed} bytes")),
+        })?;
+        Ok(removed)
+    }
+
     /// Appends one journal entry and syncs it. Intent entries are written before a side effect.
     pub fn append_journal(&self, e: &JournalEntry) -> Result<(), Refusal> {
         self.wrote(self.append_journal_inner(e))

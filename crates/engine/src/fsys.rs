@@ -680,26 +680,24 @@ impl Dir {
         r
     }
 
-    /// Appends one complete line. The file must exist, be private, have one link and end with a
-    /// newline (or be empty), so a torn earlier line is never extended. Failure points:
-    /// `<label>-before-write` and `<label>-after-write`.
-    #[doc(hidden)]
-    pub fn append_line(
-        &self,
-        sys: &Sys,
-        name: &str,
-        line: &[u8],
-        max_total: u64,
-        fail: &Fail,
-        label: &str,
-    ) -> Result<(), Refusal> {
+    /// Opens a journal-like file for appending: no symlink, a private regular file with one link
+    /// owned by the current user. Returns the descriptor and the size.
+    fn open_append(&self, sys: &Sys, name: &str, append: bool) -> Result<(OwnedFd, u64), Refusal> {
         check_name(name)?;
         let bad = |d: String| storage(format!("{}: {d}", self.at(name).display()));
         let fd = rfs::openat(
             &self.fd,
             name,
             // O_NONBLOCK so a FIFO planted at this name cannot hang the open.
-            OFlags::RDWR | OFlags::APPEND | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+            OFlags::RDWR
+                | if append {
+                    OFlags::APPEND
+                } else {
+                    OFlags::empty()
+                }
+                | OFlags::NOFOLLOW
+                | OFlags::NONBLOCK
+                | OFlags::CLOEXEC,
             Mode::empty(),
         )
         .map_err(|e| match e {
@@ -717,6 +715,42 @@ impl Dir {
             ));
         }
         let size = u64::try_from(st.st_size).map_err(|_| bad("has a negative size".into()))?;
+        Ok((fd, size))
+    }
+
+    /// Cuts `name` back to `len` bytes and syncs it. Used only to remove a torn final journal
+    /// line. A failure of the cut is an unconfirmed outcome: the file may or may not be shorter.
+    pub fn truncate_to(&self, sys: &Sys, name: &str, len: u64) -> Result<(), Refusal> {
+        let (fd, size) = self.open_append(sys, name, false)?;
+        if len > size {
+            return Err(storage(format!(
+                "{}: cannot cut to {len} bytes, the file has {size}",
+                self.at(name).display()
+            )));
+        }
+        let f = File::from(fd);
+        f.set_len(len).and_then(|()| f.sync_all()).map_err(|e| {
+            Refusal::new(
+                Code::IoUnconfirmed,
+                format!("cutting the torn journal line is unconfirmed: {e}"),
+            )
+        })
+    }
+
+    /// Appends one complete line. The file must exist, be private, have one link and end with a
+    /// newline (or be empty), so a torn earlier line is never extended. Failure points:
+    /// `<label>-before-write` and `<label>-after-write`.
+    #[doc(hidden)]
+    pub fn append_line(
+        &self,
+        sys: &Sys,
+        name: &str,
+        line: &[u8],
+        max_total: u64,
+        fail: &Fail,
+        label: &str,
+    ) -> Result<(), Refusal> {
+        let (fd, size) = self.open_append(sys, name, true)?;
         if size.saturating_add(u64::try_from(line.len()).unwrap_or(u64::MAX)) > max_total {
             return Err(Refusal::new(
                 Code::LimitExceeded,

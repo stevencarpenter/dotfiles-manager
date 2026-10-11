@@ -1309,6 +1309,41 @@ fn a_torn_journal_is_reported_and_reconcile_leaves_it_alone() {
 }
 
 #[test]
+fn recover_repairs_one_torn_final_journal_line_and_refuses_a_torn_middle_line() {
+    let h = bound_home("torn-repair");
+    let o = record(h.path(), "core.victim", "victim", "v");
+    assert_eq!(o.status.code(), Some(0), "{}", text(&o.stderr));
+    let j = state(h.path()).join("journal.jsonl");
+    let sound = fs::read(&j).unwrap();
+    let mut torn = sound.clone();
+    torn.extend_from_slice(b"{\"schema\":1,\"op_");
+    fs::write(&j, &torn).unwrap();
+    assert_ne!(check(h.path()).status.code(), Some(0));
+    let r = run(h.path(), &["state", "recover"]);
+    assert_eq!(r.status.code(), Some(0), "{}", text(&r.stderr));
+    assert!(
+        text(&r.stdout).contains("repaired a torn final journal line (16 bytes removed)"),
+        "{}",
+        text(&r.stdout)
+    );
+    let now = fs::read(&j).unwrap();
+    assert!(now.starts_with(&sound));
+    assert!(text(&now).contains("torn line repaired"));
+    assert_eq!(check(h.path()).status.code(), Some(0));
+    // The next write works.
+    let o = record(h.path(), "core.second", "second", "v");
+    assert_eq!(o.status.code(), Some(0), "{}", text(&o.stderr));
+    // A damaged line that is not the last one stays a hard error and is not touched.
+    let mut bad = fs::read(&j).unwrap();
+    bad[3] = b'#';
+    bad.extend_from_slice(b"{\"torn");
+    fs::write(&j, &bad).unwrap();
+    let r = run(h.path(), &["state", "recover"]);
+    assert_eq!(r.status.code(), Some(3), "{}", text(&r.stderr));
+    assert_eq!(fs::read(&j).unwrap(), bad);
+}
+
+#[test]
 fn an_unreadable_receipts_directory_is_a_finding_not_an_empty_list() {
     let h = seeded("unreadable");
     let dir = state(h.path()).join("receipts");

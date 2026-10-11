@@ -133,12 +133,20 @@ impl Ctx {
 
 /// Spells HOME the way `Dir::open_home` and the store scope do (symlinks resolved), so every
 /// path built from it (plan targets, ledger, recovery) lies inside the store's scope. A HOME that
-/// cannot be resolved stays as given; opening it fails later with its own refusal.
-fn canonical_home(platform: Platform) -> Platform {
-    match fs::canonicalize(platform.home()) {
-        Ok(real) => Platform::with_home(real),
-        Err(_) => platform,
+/// cannot be resolved stays as given; opening it fails later with its own refusal. The resolved
+/// spelling gets the same rule as the original: no whitespace, control characters or non-UTF-8
+/// bytes (`E_HOME_MISMATCH`), because these paths reach shell scripts and tool arguments.
+fn canonical_home(platform: Platform) -> Result<Platform, Refusal> {
+    let Ok(real) = fs::canonicalize(platform.home()) else {
+        return Ok(platform);
+    };
+    if !real.to_str().is_some_and(dfm_platform_macos::valid_home) {
+        return Err(Refusal::new(
+            Code::HomeMismatch,
+            "the home directory resolves to a path with whitespace, control characters or non-UTF-8 bytes; this is not supported",
+        ));
     }
+    Ok(Platform::with_home(real))
 }
 
 #[cfg(feature = "test-isolation")]
@@ -155,7 +163,7 @@ fn context(home: Option<String>) -> Result<Ctx, Refusal> {
         Some(h) => Platform::with_home(PathBuf::from(h)),
         None => Platform::detect()?,
     };
-    let platform = canonical_home(platform);
+    let platform = canonical_home(platform)?;
     let binding_path = env("DFM_BINDING").map_or_else(|| platform.binding_path(), PathBuf::from);
     let (os, arch) = match env("DFM_PLATFORM") {
         Some(p) => {
@@ -183,7 +191,7 @@ fn context(home: Option<String>) -> Result<Ctx, Refusal> {
 
 #[cfg(not(feature = "test-isolation"))]
 fn context(_home: Option<String>) -> Result<Ctx, Refusal> {
-    let platform = canonical_home(Platform::detect()?);
+    let platform = canonical_home(Platform::detect()?)?;
     let (os, arch) = current_platform();
     Ok(Ctx {
         binding_path: platform.binding_path(),

@@ -102,6 +102,8 @@ pub struct Settled {
     /// Journal id and the phase written (`Done` or `Failed`).
     pub closed: Vec<(String, Phase)>,
     pub open: Vec<Open>,
+    /// Bytes of a torn final journal line that were cut off first (0 when none).
+    pub repaired: usize,
 }
 
 /// How ownership follows a `done`.
@@ -129,6 +131,8 @@ pub(crate) fn settle_all(
 ) -> Result<Settled, Refusal> {
     let mut out = Settled::default();
     let mut fresh = BTreeSet::new();
+    // A torn final line (a crash or failed write mid-append) is repaired and journaled first.
+    out.repaired = store.repair_torn_journal()?;
     if !unfinished(&store.read_journal_lenient()?).is_empty() {
         for (id, op, phase) in store.reconcile(&|e| inspect(w, e).0)? {
             if phase != Phase::Unknown {

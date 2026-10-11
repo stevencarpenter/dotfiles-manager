@@ -2538,3 +2538,42 @@ fn apply_through_a_symlinked_home_spelling_uses_the_canonical_home() {
         "the ledger records the canonical HOME"
     );
 }
+
+#[test]
+fn apply_repairs_a_torn_final_journal_line_before_it_settles() {
+    let fx = Fx::new();
+    let o = fx.apply(&[]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let j = fx.state().join("journal.jsonl");
+    let mut bytes = fs::read(&j).unwrap();
+    bytes.extend_from_slice(b"{\"schema\":1,\"op_");
+    fs::write(&j, &bytes).unwrap();
+    fs::remove_file(fx.h(".zshrc")).unwrap();
+    let o = fx.apply(&[]);
+    assert_eq!(code(&o), 0, "{}{}", text(&o.stdout), stderr(&o));
+    assert!(fx.h(".zshrc").is_symlink());
+    let journal = fs::read_to_string(&j).unwrap();
+    let repair = journal
+        .find("torn line repaired")
+        .expect("repair journaled");
+    let later = journal.rfind("\"phase\":\"intent\"").unwrap();
+    assert!(repair < later, "the repair precedes the next run's writes");
+}
+
+#[test]
+fn a_home_that_resolves_to_a_path_with_a_space_is_refused() {
+    let t = TempDir::new("apply-space");
+    let real = t.path().join("real home");
+    fs::create_dir(&real).unwrap();
+    let spelled = t.path().join("home");
+    symlink(&real, &spelled).unwrap();
+    let o = Command::new(BIN)
+        .env_clear()
+        .arg("--home")
+        .arg(&spelled)
+        .args(["state", "check"])
+        .output()
+        .unwrap();
+    assert_eq!(code(&o), 3, "{}", stderr(&o));
+    assert!(stderr(&o).contains("E_HOME_MISMATCH"), "{}", stderr(&o));
+}

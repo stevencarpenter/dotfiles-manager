@@ -591,6 +591,46 @@ fn reconcile_refuses_a_torn_journal_and_leaves_it_alone() {
 }
 
 #[test]
+fn a_torn_final_journal_line_is_repaired_and_a_torn_middle_line_is_not() {
+    let h = Home::new();
+    let (s, _) = init(&h);
+    let out = h.0.join("out").to_str().unwrap().to_string();
+    s.append_journal(&intent("op1", &out)).unwrap();
+    let j =
+        h.0.join(".local/state/dotfiles-manager/state/journal.jsonl");
+    let sound = fs::read(&j).unwrap();
+    // Nothing torn: nothing changes.
+    assert_eq!(s.repair_torn_journal().unwrap(), 0);
+    assert_eq!(fs::read(&j).unwrap(), sound);
+    // A partial line after the last newline is cut, and the repair is journaled first.
+    let mut torn = sound.clone();
+    torn.extend_from_slice(b"{\"schema\":1,\"op_");
+    fs::write(&j, &torn).unwrap();
+    assert_eq!(s.read_journal().unwrap_err().code, Code::StateInvalid);
+    assert_eq!(s.repair_torn_journal().unwrap(), 16);
+    let entries = s.read_journal().unwrap();
+    assert_eq!(entries.len(), 2);
+    assert_eq!(entries[1].op, "repair");
+    assert_eq!(entries[1].phase, Phase::Failed);
+    assert!(
+        entries[1]
+            .reason
+            .as_deref()
+            .is_some_and(|r| r.contains("torn line repaired") && r.contains("16 bytes"))
+    );
+    assert!(fs::read(&j).unwrap().starts_with(&sound));
+    // Appending works again.
+    s.append_journal(&intent("op2", &out)).unwrap();
+    // A damaged line that is not the last one is a hard error and is left alone.
+    let mut bytes = fs::read(&j).unwrap();
+    bytes[3] = b'#';
+    bytes.extend_from_slice(b"{\"torn");
+    fs::write(&j, &bytes).unwrap();
+    assert_eq!(code(s.repair_torn_journal()), Code::StateInvalid);
+    assert_eq!(fs::read(&j).unwrap(), bytes);
+}
+
+#[test]
 fn claims_are_judged_by_identity_so_aliases_and_links_cannot_reach_manager_paths() {
     let h = Home::new();
     let (s, stamp) = init(&h);
