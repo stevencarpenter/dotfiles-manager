@@ -413,39 +413,41 @@ fn ownership_comes_from_the_ledger_only() {
 }
 
 #[test]
-fn a_sensitive_destination_that_exists_fails_closed_and_leaks_nothing() {
+fn a_sensitive_destination_that_exists_is_merged_in_place_and_leaks_nothing() {
     let secret = "sk-PLANTED-0123456789";
     let content = format!("{{\"token\":\"{secret}\"}}");
     let digest = format!("{:x}", Sha256::digest(content.as_bytes()));
-    // Two ways to fail closed: no ledger entry, and a ledger entry that has no comparable
-    // fingerprint (docs/state.md: the salted hash is not built).
-    for (recorded, words) in [
-        (false, "no ledger entry"),
-        (true, "ownership cannot be verified"),
+    // The merge adapter owns this path (docs/adapters.md): an existing file is read, never
+    // printed, and merged in place. With no ledger entry the manager may write. A ledger entry
+    // of another resource blocks. A file open to group or others blocks with fix text.
+    for (mode, other_owner, code_want, words) in [
+        (0o600, false, 0, ""),
+        (0o644, false, 3, "chmod 600"),
+        (0o600, true, 3, "recorded in the ledger as an output of"),
     ] {
         let e = Env::personal();
         e.mkdirs(".claude");
         let out = e.h(".claude/settings.json");
-        if recorded {
+        if !other_owner {
+            fs::write(&out, &content).unwrap();
+        }
+        if other_owner {
             let o = e.run(&[
                 "__record-op",
                 "--resource",
-                "agents.claude-settings",
+                "gone.res",
                 "--output",
                 out.to_str().unwrap(),
                 "--content",
                 &content,
-                "--sensitive",
-                "yes",
             ]);
             assert_eq!(code(&o), 0, "{}", text(&o.stderr));
-        } else {
-            fs::write(&out, &content).unwrap();
         }
+        fs::set_permissions(&out, fs::Permissions::from_mode(mode)).unwrap();
         for o in [e.plan(&[]), e.plan(&["--json"])] {
-            assert_eq!(code(&o), 3);
+            assert_eq!(code(&o), code_want, "{}", text(&o.stderr));
             let all = format!("{}{}", text(&o.stdout), text(&o.stderr));
-            assert!(all.contains("E_CONFLICT") && all.contains(words), "{all}");
+            assert!(all.contains(words), "{all}");
             assert!(
                 !all.contains(secret) && !all.contains(&digest),
                 "secret leaked: {all}"
@@ -1125,6 +1127,7 @@ mod synthetic {
             ledger,
             reserved,
             unchecked: BTreeMap::new(),
+            merge: BTreeMap::new(),
         };
         build(resolved, &cx, obs).unwrap()
     }
@@ -1229,6 +1232,7 @@ mod synthetic {
             class: dfm_model::state::Class::Normal,
             path: ".ssh/config".into(),
             fingerprint: Some(dfm_model::plan::link_fingerprint(target)),
+            coowned_entries: None,
         }];
         let p = plan_with(&r, &obs, ledger, BTreeMap::new());
         let b = p
@@ -1519,44 +1523,60 @@ fn a_foreign_fragment_that_is_not_a_plain_readable_file_blocks_the_consumer() {
 
 #[test]
 fn a_sensitive_output_under_a_fragment_pattern_is_never_hashed() {
+    // An assembly reads `.claude/*.json`. The merge target `.claude/settings.json` matches the
+    // pattern, so the merge is a producer of one fragment. A merged file has no content hash by
+    // design, so the assembly blocks, and the live token and its hash appear nowhere.
     let e = Env::personal();
     let m = e.src("base/modules/agents/module.toml");
     let mut t = fs::read_to_string(&m).unwrap();
+    // The example's skills live under `.claude/skills`, which a `.claude` fragment directory
+    // would collide with. They are not part of this case.
+    t.truncate(t.find("[[resources]]\nid = \"skills\"").unwrap());
     t.push_str(
         r#"
 [[resources]]
-id = "claude-copy"
-kind = "merge"
-adapter = "claude-settings/v1"
-target = ".codex/AGENTS.d/60-secret.md"
-[resources.value.managed]
-outputStyle = "STE"
-[resources.value.handlers]
+id = "claude-index"
+kind = "assemble"
+adapter = "text-fragments/v1"
+target = ".codex/INDEX.md"
+[resources.value]
+body = "files/AGENTS.md"
+fragments_dir = ".claude"
+pattern = "*.json"
+separator = "\n"
 "#,
     );
     fs::write(&m, t).unwrap();
-    e.mkdirs(".codex/AGENTS.d");
-    let content = "token = sk-FRAGMENT-SECRET";
-    fs::write(e.h(".codex/AGENTS.d/60-secret.md"), content).unwrap();
+    e.mkdirs(".claude");
+    let content = "{\"token\":\"sk-FRAGMENT-SECRET\"}";
+    let live = e.h(".claude/settings.json");
+    fs::write(&live, content).unwrap();
+    fs::set_permissions(&live, fs::Permissions::from_mode(0o600)).unwrap();
     let digest = format!("{:x}", Sha256::digest(content.as_bytes()));
     let o = e.plan(&["--json"]);
-    let all = text(&o.stdout);
+    assert_eq!(code(&o), 3, "{}", text(&o.stderr));
+    let all = format!("{}{}", text(&o.stdout), text(&o.stderr));
     assert!(
         !all.contains(&digest) && !all.contains("sk-FRAGMENT-SECRET"),
         "{all}"
     );
-    let s = Saved::parse(&o.stdout).unwrap();
-    match &s.plan.observations.seen[".codex/AGENTS.d/60-secret.md"].node {
-        dfm_model::plan::Node::File { sha256, .. } => assert_eq!(sha256, &None),
-        n => panic!("{n:?}"),
-    }
-    // It is the producer of a fragment, not a foreign one.
-    let asm = op(&s, "agents.codex-instructions@.codex/AGENTS.md");
+    let s =
+        Saved::parse(&o.stdout).unwrap_or_else(|er| panic!("{er}\nstderr: {}", text(&o.stderr)));
+    let asm = op(&s, "agents.claude-index@.codex/INDEX.md");
+    assert_eq!(asm.status, Status::Blocked);
     assert!(
-        asm.fragments
+        s.plan
+            .blockers
             .iter()
-            .any(|f| f.name == "60-secret.md" && f.origin == "selected:agents.claude-copy")
+            .any(|b| b.resource == "agents.claude-index" && b.detail.contains("has no content")),
+        "{:?}",
+        s.plan.blockers
     );
+    let seen = &s.plan.observations.seen[".claude/settings.json"];
+    let dfm_model::plan::Node::File { sha256, .. } = &seen.node else {
+        panic!("{:?}", seen.node);
+    };
+    assert_eq!(sha256, &None, "a sensitive path is never hashed");
 }
 
 fn retarget(e: &Env, from: &str, to: &str) {
@@ -1939,6 +1959,7 @@ mod removal {
             ledger,
             reserved: BTreeMap::new(),
             unchecked: BTreeMap::new(),
+            merge: BTreeMap::new(),
         };
         build(&resolved, &cx, &obs).unwrap()
     }
@@ -1950,6 +1971,7 @@ mod removal {
             class,
             path: "old/link".into(),
             fingerprint: fp,
+            coowned_entries: None,
         }]
     }
 
@@ -2004,6 +2026,7 @@ mod removal {
                 class: Class::Normal,
                 path: ".ssh/config".into(),
                 fingerprint: Some(link_fingerprint("/x")),
+                coowned_entries: None,
             }],
             link("/src/x"),
         );
@@ -2216,6 +2239,7 @@ mod hardening {
             ledger,
             reserved: BTreeMap::new(),
             unchecked: BTreeMap::new(),
+            merge: BTreeMap::new(),
         };
         build(r, &cx, obs).unwrap()
     }
@@ -2266,6 +2290,7 @@ mod hardening {
             class: Class::Normal,
             path: "old/file".into(),
             fingerprint: Some("0".repeat(64)),
+            coowned_entries: None,
         }];
         let mut obs = all_missing(&r, &ledger);
         obs.seen.insert(
@@ -2431,6 +2456,7 @@ mod ledger_sensitivity {
             class: Class::Sensitive,
             path: path.into(),
             fingerprint: None,
+            coowned_entries: None,
         }
     }
 
@@ -2511,6 +2537,7 @@ mod ledger_sensitivity {
             root: "/r",
             ledger: vec![],
             reserved: Default::default(),
+            merge: Default::default(),
             unchecked: Default::default(),
         };
         let mut obs = Observations::default();

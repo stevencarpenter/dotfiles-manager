@@ -680,42 +680,6 @@ fn configuration_changes_never_require_rebuilding_the_manager() {
     );
 }
 
-#[test]
-fn a_plan_with_a_sensitive_output_is_refused_before_any_write() {
-    // The example personal profile merges a sensitive settings file. Apply cannot detect an
-    // edit to it yet, so it refuses the whole plan with its own code and changes nothing.
-    let home = TempDir::new("apply-gen-home");
-    let src = TempDir::new("apply-gen-src");
-    let root = src.path().join("examples");
-    common::copy_tree(&common::repo_root().join("examples"), &root);
-    let fx = Fx {
-        home,
-        _src: src,
-        root,
-    };
-    let p = fx.root.join("profiles/personal-dev-01.toml");
-    assert_eq!(
-        code(&fx.run(&[
-            "bind",
-            "--profile",
-            p.to_str().unwrap(),
-            "--machine-id",
-            "m5"
-        ])),
-        0
-    );
-    let before = fingerprint(fx.home.path());
-    let o = fx.apply(&[]);
-    assert_eq!(code(&o), 3, "{}", stderr(&o));
-    assert!(
-        stderr(&o).contains("E_SENSITIVE_UNSUPPORTED"),
-        "{}",
-        stderr(&o)
-    );
-    assert_eq!(fingerprint(fx.home.path()), before);
-    assert!(fx.receipts().is_empty());
-}
-
 // ---- removal ----------------------------------------------------------------------------
 
 #[test]

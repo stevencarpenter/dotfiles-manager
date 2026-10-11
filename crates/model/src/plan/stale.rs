@@ -234,6 +234,15 @@ fn op_diff(out: &mut Vec<Stale>, a: &Operation, b: &Operation) {
             "output changed",
         );
     }
+    if a.managed_sha256 != b.managed_sha256 {
+        diff(
+            out,
+            StaleKind::Operation,
+            &format!("{subject} managed values"),
+            "as planned",
+            "managed values changed",
+        );
+    }
     for f in &a.fragments {
         let moved = b
             .fragments

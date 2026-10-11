@@ -890,7 +890,18 @@ fn finish(
             }
         }
         match (spec.target, &r.target) {
-            (TargetRule::Required, None) => {
+            (TargetRule::Fixed(want), Some(t)) if t != want => {
+                return Err(ResolveError::new(
+                    Code::ManifestInvalid,
+                    &owner.file,
+                    format!("adapter `{}` writes only `{want}`", spec.id),
+                    format!("set the target to `{want}`"),
+                )
+                .resource(gid)
+                .field("/target")
+                .rejected("string"));
+            }
+            (TargetRule::Required | TargetRule::Fixed(_), None) => {
                 return Err(ResolveError::new(
                     Code::ManifestInvalid,
                     &owner.file,

@@ -4,7 +4,9 @@
 //! adapter is run here.
 
 mod generate;
+mod merge_plan;
 pub use generate::{Gen, Generators, plan_outputs};
+pub use merge_plan::merge_facts;
 
 use dfm_model::resolve::{AdapterCatalog, AdapterSpec, Claims, Field, Include, Schema, TargetRule};
 
@@ -103,6 +105,16 @@ pub struct Adapter {
     pub generator: Option<Gen>,
 }
 
+impl Adapter {
+    /// Whether the adapter is the sensitive co-owned merge. It has no `Generator::generate`
+    /// output: apply runs `Generator::merge` for it.
+    pub fn merges(&self) -> bool {
+        self.spec.kind == "merge"
+            && self.spec.sensitive
+            && self.spec.id == dfm_model::merge::ADAPTER
+    }
+}
+
 pub fn registry() -> Vec<Adapter> {
     let native = |mut s: AdapterSpec| {
         s.native_document = true;
@@ -144,7 +156,7 @@ pub fn registry() -> Vec<Adapter> {
                 ..spec(
                     "claude-settings/v1",
                     "merge",
-                    TargetRule::Required,
+                    TargetRule::Fixed(".claude/settings.json"),
                     Claims::Target,
                     Schema::Table(vec![
                         field("managed", Schema::Native, true),
@@ -283,14 +295,15 @@ mod tests {
                 a.spec.kind
             );
         }
-        // Merge is the one generating kind without a generator yet (DFM-21). It is sensitive,
-        // so apply refuses it before it asks for content.
+        // Merge has no `generate` output. It is sensitive, and apply runs `Generator::merge`.
         let merge: Vec<_> = table.iter().filter(|a| a.spec.kind == "merge").collect();
+        assert!(!merge.is_empty());
         assert!(
             merge
                 .iter()
-                .all(|a| a.generator.is_none() && a.spec.sensitive)
+                .all(|a| a.generator.is_none() && a.spec.sensitive && a.merges())
         );
+        assert_eq!(table.iter().filter(|a| a.merges()).count(), merge.len());
     }
 
     #[test]

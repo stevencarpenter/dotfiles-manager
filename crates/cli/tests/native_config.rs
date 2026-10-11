@@ -422,20 +422,6 @@ fn a_fragment_or_body_changed_between_plan_and_apply_is_stale_and_writes_nothing
 }
 
 #[test]
-fn the_example_profile_is_refused_whole_for_its_sensitive_merge() {
-    let fx = example();
-    let before = fingerprint(fx.home.path());
-    let o = fx.apply(&[]);
-    assert_eq!(code(&o), 3, "{}", stderr(&o));
-    assert!(
-        stderr(&o).contains("E_SENSITIVE_UNSUPPORTED"),
-        "{}",
-        stderr(&o)
-    );
-    assert_eq!(fingerprint(fx.home.path()), before);
-}
-
-#[test]
 fn the_example_profile_applies_once_the_sensitive_merge_is_left_out() {
     let fx = example();
     let p = fx.root.join("base/modules/agents/module.toml");

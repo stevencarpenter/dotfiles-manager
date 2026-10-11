@@ -9,13 +9,15 @@
 use crate::fsys::{Dir, Got, Peek, Sys};
 use dfm_model::digest::sha256_hex;
 use dfm_model::fold;
+use dfm_model::merge::Merged;
 use dfm_model::plan::{MAX_HASHED_BYTES, MAX_LISTING, Operation, Plan};
+use dfm_model::state::OwnedEntry;
 use dfm_model::{Code, Refusal};
 use std::collections::BTreeMap;
 use std::path::Path;
 
 /// The verified live input of one generated file.
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
+#[derive(Default, Clone, PartialEq, Eq)]
 pub struct GeneratorInputs {
     /// Source files by their path in the source tree, one per entry of `Operation::inputs`.
     /// Each hash equals the plan's `source:` precondition.
@@ -26,6 +28,28 @@ pub struct GeneratorInputs {
     /// The content of each fragment the plan listed, by name. A foreign fragment equals the
     /// hash the planner observed. A selected fragment equals its producer's planned output.
     pub fragments: BTreeMap<String, Vec<u8>>,
+    /// The live file of a co-owned merge, read under the writer lock immediately before the
+    /// merge. `None` when the file is absent. The bytes may hold credentials in fields the
+    /// manager does not own: the adapter must not copy them into any message.
+    pub live: Option<Vec<u8>>,
+    /// The handler entries the ledger records as added by the manager (merge and retire).
+    pub owned_entries: Vec<OwnedEntry>,
+}
+
+/// `Debug` prints the size of the live file and never its bytes: it can hold credentials.
+impl std::fmt::Debug for GeneratorInputs {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GeneratorInputs")
+            .field("sources", &self.sources.keys().collect::<Vec<_>>())
+            .field("listing", &self.listing)
+            .field("fragments", &self.fragments.keys().collect::<Vec<_>>())
+            .field(
+                "live",
+                &self.live.as_ref().map(|b| format!("{} bytes", b.len())),
+            )
+            .field("owned_entries", &self.owned_entries)
+            .finish()
+    }
 }
 
 /// Produces the bytes of a generated file. Adapters implement it (docs/adapters.md). The trait
@@ -38,6 +62,23 @@ pub struct GeneratorInputs {
 pub trait Generator {
     fn supports(&self, op: &Operation) -> bool;
     fn generate(&self, op: &Operation, inputs: &GeneratorInputs) -> Result<Vec<u8>, Refusal>;
+
+    /// Whether `op` is a sensitive co-owned merge this generator runs (`claude-settings/v1`):
+    /// a `create_file`, `update_file` or `retire` operation. Apply admits exactly these
+    /// sensitive operations and refuses every other one (docs/apply.md, Merge).
+    fn merges(&self, _op: &Operation) -> bool {
+        false
+    }
+
+    /// Merges the declared value into `inputs.live`, or for a `retire` operation removes the
+    /// owned entries. A refusal with `E_CONFLICT` or `E_PLAN_STALE` blocks the operation and
+    /// writes nothing. It never repeats a byte of the live file.
+    fn merge(&self, op: &Operation, _inputs: &GeneratorInputs) -> Result<Merged, Refusal> {
+        Err(Refusal::new(
+            Code::GeneratorUnavailable,
+            format!("no merge adapter for {}", op.adapter),
+        ))
+    }
 }
 
 /// The generator of a build with no adapters: every file operation is unsupported.

@@ -102,6 +102,7 @@ fn claims_outside_home_or_inside_manager_storage_are_refused() {
                 path: bad.clone(),
                 mode: 0o600,
                 fingerprint: Some("a".repeat(64)),
+                coowned: None,
             }],
         });
         assert_eq!(code(s.write_ledger(&l)), Code::StateInvalid, "{bad}");
@@ -659,6 +660,7 @@ fn delete_authority_is_decided_again_at_use_time() {
             path: file.clone(),
             mode: 0o600,
             fingerprint: Some("a".repeat(64)),
+            coowned: None,
         }],
     })
     .unwrap();
@@ -879,6 +881,7 @@ fn every_write_cap_is_enforced_before_anything_is_written() {
                 path: format!("{home}/f{i}-{}", "x".repeat(150)),
                 mode: 0o600,
                 fingerprint: Some("a".repeat(64)),
+                coowned: None,
             }],
         })
         .collect();

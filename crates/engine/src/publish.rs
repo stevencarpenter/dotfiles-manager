@@ -7,7 +7,9 @@
 //! `AT_REMOVEDIR`, so a directory is never removed and a link is removed, not followed.
 
 use crate::fail::Fail;
-use crate::fsys::{Dir, Peek, Sys, check_name, kind, mode_bits, sys_err, temp_name, unconfirmed};
+use crate::fsys::{
+    Dir, Peek, Stamp, Sys, check_name, kind, mode_bits, sys_err, temp_name, unconfirmed,
+};
 use dfm_model::digest::sha256_hex;
 use dfm_model::plan::link_fingerprint;
 use dfm_model::{Code, Refusal};
@@ -24,6 +26,11 @@ pub(crate) enum Publish<'a> {
     Create,
     /// The name must hold a regular file with exactly this content hash.
     Replace { expected_sha256: &'a str },
+    /// The name must still be the file whose [`Stamp`] the caller captured when it read the live
+    /// content: same device, inode, size, change time and modification time. This is the check
+    /// for a co-owned file, whose whole-file hash is never recorded. It narrows the window to the
+    /// gap between this check and `renameat`; it does not close it (docs/apply.md).
+    ReplaceStamp(Stamp),
 }
 
 fn conflict(detail: impl Into<String>) -> Refusal {
@@ -272,6 +279,15 @@ impl Dir {
                 Publish::Replace { expected_sha256 } => {
                     let live = self.hash_file(name, limit)?;
                     if live.as_ref().map(|(h, _)| h.as_str()) != Some(expected_sha256) {
+                        return Err(conflict(format!(
+                            "{} changed while applying; it is left alone",
+                            self.at(name).display()
+                        )));
+                    }
+                    rfs::renameat(&self.fd, &tmp, &self.fd, name).map_err(|e| sys_err("rename", e))
+                }
+                Publish::ReplaceStamp(want) => {
+                    if self.entry_stamp(name)? != Some(want) {
                         return Err(conflict(format!(
                             "{} changed while applying; it is left alone",
                             self.at(name).display()
