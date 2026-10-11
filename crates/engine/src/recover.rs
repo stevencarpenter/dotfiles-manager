@@ -112,8 +112,9 @@ pub(crate) enum Own<'a> {
     Operator,
     /// Automatic settling. The entry must carry [`UNCONFIRMED`], and `known(resource, path)`
     /// must hold: the resource already has a ledger entry, or the current plan has an
-    /// operation for that resource and path.
-    Auto(&'a dyn Fn(&str, &str) -> bool),
+    /// operation for that resource and path. The lookup runs before the `done` entry is
+    /// written. A ledger that cannot be read fails it, and the entry stays open.
+    Auto(&'a dyn Fn(&str, &str) -> Result<bool, Refusal>),
 }
 
 /// Settles what the machine shows clearly, in two steps:
@@ -141,11 +142,13 @@ pub(crate) fn settle_all(
             fresh.insert((id, op));
         }
     }
-    let known = |resource: &str, abs: &str| {
-        plan_has(resource, abs)
+    let known = |resource: &str, abs: &str| -> Result<bool, Refusal> {
+        Ok(plan_has(resource, abs)
             || store
-                .read_ledger_lenient()
-                .is_ok_and(|l| l.resources.iter().any(|r| r.resource == resource))
+                .read_ledger_lenient()?
+                .resources
+                .iter()
+                .any(|r| r.resource == resource))
     };
     let entries = store.read_journal_lenient()?;
     for u in unresolved(&entries) {
@@ -246,8 +249,22 @@ pub(crate) fn close_done(
     reason: &str,
     own: Own<'_>,
 ) -> Result<(), Refusal> {
-    store.append_journal(&closing(u, Phase::Done, reason)?)?;
     let e = u.unknown;
+    let first = u
+        .intent
+        .and_then(|i| i.recovery.as_ref())
+        .and_then(|r| r.outputs.first());
+    // The ledger lookup comes first: if it fails, no terminal entry exists and the operation
+    // can be settled again once the ledger is repaired.
+    let auto_known = match (&own, first) {
+        (Own::Auto(known), Some(out))
+            if e.class == Class::Normal && e.op != "remove" && marked(e) =>
+        {
+            known(&e.resource, &out.path)?
+        }
+        _ => false,
+    };
+    store.append_journal(&closing(u, Phase::Done, reason)?)?;
     let Some(out) = u
         .intent
         .and_then(|i| i.recovery.as_ref())
@@ -263,8 +280,8 @@ pub(crate) fn close_done(
     }
     match own {
         Own::Operator => {}
-        Own::Auto(known) => {
-            if !marked(e) || !known(&e.resource, &out.path) {
+        Own::Auto(_) => {
+            if !auto_known {
                 return Ok(());
             }
         }
