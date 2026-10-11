@@ -1539,7 +1539,7 @@ fn a_fragment_overrides_a_base_value_and_adds_keys() {
     assert_eq!(j["env"]["FROM_FRAGMENT"], "2", "the later name wins");
     assert_eq!(j["env"]["EXAMPLE_FEATURE_FLAG"], "1", "base leaves stay");
     assert_eq!(j["fragmentKey"], true);
-    // The plan JSON lists each fragment with its hash. The hash is of the fragment file.
+    // The plan JSON lists each fragment by name and origin, with no hash.
     let saved = fx.saved();
     let op = saved
         .plan
@@ -1552,7 +1552,7 @@ fn a_fragment_overrides_a_base_value_and_adds_keys() {
     assert!(
         op.fragments
             .iter()
-            .all(|f| f.origin == "foreign" && f.sha256.is_some())
+            .all(|f| f.origin == "foreign" && f.sha256.is_none())
     );
     // The managed fields include the fragments: editing a fragment value is not a conflict,
     // and editing the live value of a fragment key is one.
@@ -1598,7 +1598,7 @@ fn a_malformed_fragment_blocks_with_nothing_written_and_no_content_shown() {
     let d = fx.saved().plan_digest;
     let o = fx.apply_with(&d);
     let all = format!("{}{}", text(&o.stdout), stderr(&o));
-    assert_ne!(code(&o), 0, "{all}");
+    assert_eq!(code(&o), 3, "{all}");
     assert!(!all.contains(TOKEN));
     assert_eq!(
         fs::read(fx.settings()).unwrap(),
@@ -1635,20 +1635,31 @@ fn a_fragment_that_is_not_an_object_or_sets_hooks_blocks() {
 #[test]
 fn a_fragment_that_changes_between_plan_and_apply_is_stale() {
     let fx = Fx::base();
+    // The first apply creates state/salt, which the fragment content tokens need.
+    assert_eq!(code(&fx.apply()), 0);
+    let before = fs::read(fx.settings()).unwrap();
     fx.fragment("10-a.json", r#"{"fragmentKey":1}"#);
     let d = fx.saved().plan_digest;
     fx.fragment("10-a.json", r#"{"fragmentKey":2}"#);
     let o = fx.apply_with(&d);
-    assert_ne!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+    assert_eq!(code(&o), 3, "{}\n{}", stderr(&o), text(&o.stdout));
     assert!(stderr(&o).contains("E_PLAN_STALE"), "{}", stderr(&o));
-    assert!(!fx.settings().exists(), "nothing was written");
+    assert!(
+        !stderr(&o).contains("fragmentKey"),
+        "no fragment content is shown"
+    );
+    assert_eq!(
+        fs::read(fx.settings()).unwrap(),
+        before,
+        "nothing was written"
+    );
     // A fragment that appears after the plan is stale too.
     let d = fx.saved().plan_digest;
     fx.fragment("11-new.json", r#"{"added":true}"#);
     let o = fx.apply_with(&d);
-    assert_ne!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+    assert_eq!(code(&o), 3, "{}\n{}", stderr(&o), text(&o.stdout));
     assert!(stderr(&o).contains("E_PLAN_STALE"), "{}", stderr(&o));
-    assert!(!fx.settings().exists());
+    assert_eq!(fs::read(fx.settings()).unwrap(), before);
 }
 
 #[test]
@@ -1807,7 +1818,7 @@ fn hooks_the_nix_merge_wrote_in_another_spelling_are_never_duplicated() {
             {"type": "command", "command": "~/.claude/hooks/agent-reap-subagent-stop.sh", "timeout": 20}
         ]}],
         "SessionEnd": [{"hooks": [
-            {"type": "command", "command": "'~/.claude/hooks/agent-reap-session-end.sh'", "timeout": 20}
+            {"type": "command", "command": "\"$HOME/.claude/hooks/agent-reap-session-end.sh\"", "timeout": 20}
         ]}],
         "SessionStart": [{"hooks": [h(&format!("{home}/.claude/hooks/emit-routing-context.sh"))]}]
     });
@@ -1875,4 +1886,226 @@ fn a_hook_with_another_matcher_is_a_different_hook() {
             .len(),
         2
     );
+}
+
+// ---- review round: fragments are sensitive, leaves, modes, literals -----------------------
+
+#[test]
+fn fragment_content_and_its_hashes_never_appear_in_any_output_or_state_file() {
+    let fx = Fx::base();
+    assert_eq!(code(&fx.apply()), 0); // creates state/salt
+    let frag = format!(r#"{{"env":{{"FRAG_SECRET":"{TOKEN}"}}}}"#);
+    fx.fragment("10-secret.json", &frag);
+    let plain = hex(frag.as_bytes());
+    let mut seen = String::new();
+    let mut collect = |o: &Output| {
+        seen.push_str(&text(&o.stdout));
+        seen.push_str(&stderr(o));
+    };
+    collect(&fx.plan());
+    let json = fx.run(&["plan", "--root", fx.root_arg(), "--json"]);
+    collect(&json);
+    collect(&fx.run(&["apply", "--root", fx.root_arg(), "--preview"]));
+    // The salted content token is in the plan JSON, in the `fragments:` precondition, and only
+    // there. Find it, then check every other output and state file.
+    let saved = fx.saved();
+    let op = saved
+        .plan
+        .operations
+        .iter()
+        .find(|o| o.managed_sha256.is_some())
+        .unwrap();
+    let pre = op
+        .preconditions
+        .iter()
+        .find(|p| p.subject.starts_with("fragments:"))
+        .unwrap();
+    let state = pre.state.clone();
+    let content = state.split_once(" content=[").unwrap().1;
+    let token = content
+        .trim_end_matches(']')
+        .split_once(':')
+        .unwrap()
+        .1
+        .to_string();
+    assert_eq!(token.len(), 64, "{state}");
+    assert!(op.fragments.iter().all(|f| f.sha256.is_none()));
+    let o = fx.apply();
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+    collect(&o);
+    for args in [
+        vec!["doctor", "--root", fx.root_arg()],
+        vec!["doctor", "--root", fx.root_arg(), "--json"],
+        vec!["status", "--root", fx.root_arg()],
+        vec!["plan", "--root", fx.root_arg()],
+    ] {
+        collect(&fx.run(&args));
+    }
+    // A stale plan names the change and shows no token.
+    let d = fx.saved().plan_digest;
+    fx.fragment(
+        "10-secret.json",
+        &format!(r#"{{"env":{{"FRAG_SECRET":"{TOKEN}2"}}}}"#),
+    );
+    let o = fx.apply_with(&d);
+    collect(&o);
+    assert!(seen.contains("fragments: 10-secret.json"));
+    for (what, needle) in [
+        ("fragment content", TOKEN.to_string()),
+        ("fragment file hash", plain.clone()),
+    ] {
+        assert!(!seen.contains(&needle), "{what} appeared in command output");
+    }
+    // The plan JSON (the only place the token is printed) holds no plain hash. Nothing else
+    // prints the token: not the text plan, a stale report, the receipts or the journal.
+    let json_text = text(&json.stdout);
+    assert!(json_text.contains(&token));
+    assert!(!json_text.contains(&plain) && !json_text.contains(TOKEN));
+    let mut without_json = seen.replace(&json_text, "");
+    without_json.push_str(&fx.journal_text());
+    for f in files_below(&fx.state()) {
+        let name = f.file_name().unwrap().to_string_lossy().into_owned();
+        let t = String::from_utf8_lossy(&fs::read(&f).unwrap()).into_owned();
+        assert!(
+            !t.contains(TOKEN) && !t.contains(&plain),
+            "{name} holds fragment data"
+        );
+        if name != "ledger.json" {
+            without_json.push_str(&t);
+        }
+    }
+    assert!(
+        !without_json.contains(&token),
+        "the salted token was printed outside the plan JSON"
+    );
+}
+
+#[test]
+fn a_world_writable_fragment_blocks_until_it_is_fixed() {
+    let fx = Fx::base();
+    fx.fragment("10-a.json", r#"{"fragmentKey":true}"#);
+    let p = fx.h(".claude/settings.d/10-a.json");
+    fs::set_permissions(&p, fs::Permissions::from_mode(0o666)).unwrap();
+    let o = fx.plan();
+    let all = format!("{}{}", text(&o.stdout), stderr(&o));
+    assert_eq!(code(&o), 3, "{all}");
+    assert!(
+        all.contains("10-a.json") && all.contains("chmod go-w"),
+        "{all}"
+    );
+    assert!(!fx.settings().exists());
+    fs::set_permissions(&p, fs::Permissions::from_mode(0o644)).unwrap();
+    assert_eq!(code(&fx.apply()), 0);
+}
+
+#[test]
+fn dropping_a_fragment_that_added_a_key_is_no_edit_and_a_real_edit_still_is() {
+    let fx = Fx::base();
+    fx.fragment("10-a.json", r#"{"fragmentKey":true,"env":{"FRAG":"1"}}"#);
+    assert_eq!(code(&fx.apply()), 0);
+    fs::remove_file(fx.h(".claude/settings.d/10-a.json")).unwrap();
+    // The key set shrank. The live file is as the manager wrote it, so this is no conflict.
+    let o = fx.plan();
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+    assert_eq!(code(&fx.apply()), 0);
+    // A hand edit of a key that stays managed is still refused.
+    let mut j = fx.live_json();
+    j["env"]["EXAMPLE_FEATURE_FLAG"] = serde_json::json!("0");
+    fx.live(&serde_json::to_string(&j).unwrap());
+    assert_eq!(code(&fx.plan()), 3);
+}
+
+#[test]
+fn a_declared_value_over_a_foreign_table_blocks_and_a_null_is_seeded() {
+    let fx = Fx::base();
+    let live = r#"{"outputStyle":{"nested":"PLANTED-TOKEN-7f3a9c"}}"#;
+    fx.live(live);
+    let o = fx.plan();
+    let all = format!("{}{}", text(&o.stdout), stderr(&o));
+    assert_eq!(code(&o), 3, "{all}");
+    assert!(all.contains("E_CONFLICT") && !all.contains(TOKEN), "{all}");
+    assert_eq!(fs::read_to_string(fx.settings()).unwrap(), live);
+    let fx = Fx::base();
+    fx.live(r#"{"model":null,"effortLevel":null}"#);
+    assert_eq!(code(&fx.apply()), 0);
+    let j = fx.live_json();
+    assert_eq!(
+        (j["model"].clone(), j["effortLevel"].clone()),
+        ("example-model".into(), "high".into())
+    );
+}
+
+#[test]
+fn a_fragment_whose_removal_is_blocked_blocks_the_merge_as_stale() {
+    let fx = Fx::base();
+    fx.put(
+        "base/modules/claude-base/files/20-module.json",
+        r#"{"fromModule":"yes"}"#,
+    );
+    let link_resource = "\n[[resources]]\nid = \"fragment\"\nkind = \"link\"\nadapter = \"fs-link/v1\"\ntarget = \".claude/settings.d/20-module.json\"\n[resources.value]\nsource = \"files/20-module.json\"\n";
+    fx.base_module(|m| format!("{m}{link_resource}"));
+    assert_eq!(code(&fx.apply()), 0);
+    assert_eq!(fx.live_json()["fromModule"], "yes");
+    // The module drops the fragment, and the user replaces the link with a file of their own.
+    // The removal is then a conflict, so the fragment stays in the directory.
+    fx.base_module(|m| m.replace(link_resource, ""));
+    let p = fx.h(".claude/settings.d/20-module.json");
+    fs::remove_file(&p).unwrap();
+    fs::write(&p, r#"{"fromUser":"yes"}"#).unwrap();
+    let o = fx.plan();
+    let all = format!("{}{}", text(&o.stdout), stderr(&o));
+    assert_eq!(code(&o), 3, "{all}");
+    assert!(all.contains("E_PLAN_STALE"), "{all}");
+    assert!(
+        all.contains("20-module.json") || all.contains("settings.d"),
+        "{all}"
+    );
+}
+
+#[test]
+fn a_first_apply_without_a_salt_merges_the_fragments_it_reads() {
+    // state/salt does not exist before the first merge, so the plan has no content token yet.
+    // Apply still reads each fragment under the lock and merges what is there.
+    let fx = Fx::base();
+    fx.fragment("10-a.json", r#"{"fragmentKey":1}"#);
+    let d = fx.saved().plan_digest;
+    fx.fragment("10-a.json", r#"{"fragmentKey":2}"#);
+    let o = fx.apply_with(&d);
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+    assert_eq!(fx.live_json()["fragmentKey"], 2);
+}
+
+#[test]
+fn the_hook_identity_follows_the_shell_for_home_spellings() {
+    // The declared hook is "${HOME}/.claude/hooks/wt-create.sh". These live spellings run the
+    // same command, so nothing is added.
+    for same in [
+        "~/.claude/hooks/wt-create.sh",
+        "$HOME/.claude/hooks/wt-create.sh",
+        "\"${HOME}/.claude/hooks/wt-create.sh\"",
+    ] {
+        let fx = Fx::base();
+        fx.live(&serde_json::json!({"hooks":{"WorktreeCreate":[{"hooks":[{"type":"command","command":same}]}]}}).to_string());
+        assert_eq!(code(&fx.apply()), 0);
+        assert_eq!(
+            commands(&fx.live_json(), "WorktreeCreate").len(),
+            1,
+            "{same}"
+        );
+    }
+    // These name a file whose path starts with a literal `~` or `$HOME`, which is another
+    // command. The declared hook is installed beside it.
+    for other in [
+        "'~/.claude/hooks/wt-create.sh'",
+        "\\$HOME/.claude/hooks/wt-create.sh",
+    ] {
+        let fx = Fx::base();
+        fx.live(&serde_json::json!({"hooks":{"WorktreeCreate":[{"hooks":[{"type":"command","command":other}]}]}}).to_string());
+        assert_eq!(code(&fx.apply()), 0);
+        assert_eq!(
+            commands(&fx.live_json(), "WorktreeCreate").len(),
+            2,
+            "{other}"
+        );
+    }
 }

@@ -32,6 +32,35 @@ fn refused(r: &Refusal) -> MergeVerdict {
     blocked(r.code, &r.detail)
 }
 
+/// What the plan-time reads share.
+#[derive(Clone, Copy)]
+struct Cx<'a> {
+    resolved: &'a Resolved,
+    sys: &'a Sys,
+    home: &'a Dir,
+    /// The opened source root, or why it could not be opened.
+    source: &'a Result<Dir, Refusal>,
+    ledger: &'a [Owned],
+}
+
+/// A salted token for the content of each fragment, by name. Empty while `state/salt` does not
+/// exist or is unusable (the first apply creates it; an unusable one is refused elsewhere).
+fn tokens(store: &Store, frags: &BTreeMap<String, Vec<u8>>) -> Vec<(String, String)> {
+    let salt = store.salt().ok().flatten();
+    frags
+        .iter()
+        .map(|(n, b)| {
+            let t = salt.as_deref().map_or_else(String::new, |s| {
+                let mut v = n.as_bytes().to_vec();
+                v.push(0);
+                v.extend_from_slice(b);
+                merge::salted(s, &v)
+            });
+            (n.clone(), t)
+        })
+        .collect()
+}
+
 /// The fragments the merge of `r` layers over its declared values, by name (byte order), read
 /// as apply reads them: below HOME without following a link, regular, owned by the user, one
 /// hard link, within the shared 16 MiB bound. The set is the planner's: the files in the
@@ -39,14 +68,17 @@ fn refused(r: &Refusal) -> MergeVerdict {
 /// resource puts there (their source files, read from the source root). A fragment made by any
 /// other kind of resource has no content before apply, so it is refused.
 fn read_fragments(
-    resolved: &Resolved,
+    cx: &Cx<'_>,
     dir: &str,
     pattern: &str,
-    sys: &Sys,
-    home: &Dir,
-    source: Option<&Dir>,
-    ledger: &[Owned],
 ) -> Result<BTreeMap<String, Vec<u8>>, Refusal> {
+    let Cx {
+        resolved,
+        sys,
+        home,
+        source,
+        ledger,
+    } = *cx;
     let too_much = || Refusal::new(Code::LimitExceeded, "the fragments together exceed 16 MiB");
     let left = std::cell::Cell::new(MAX_HASHED_BYTES);
     let mut out = BTreeMap::new();
@@ -82,7 +114,7 @@ fn read_fragments(
             })
             .flatten();
         let bytes = match (src, source) {
-            (Some(src), Some(root)) => match root.read_input_below(sys, &src, MAX_HASHED_BYTES)? {
+            (Some(src), Ok(root)) => match root.read_input_below(sys, &src, MAX_HASHED_BYTES)? {
                 Got::Bytes(b) => b,
                 Got::TooBig => return Err(too_much()),
                 Got::Absent => {
@@ -94,6 +126,8 @@ fn read_fragments(
                     ));
                 }
             },
+            // The source root could not be opened: that is the cause, not the fragment.
+            (Some(_), Err(e)) => return Err(e.clone()),
             _ => {
                 return Err(Refusal::new(
                     Code::GeneratorUnavailable,
@@ -153,9 +187,16 @@ pub fn merge_facts(
     sys: &Sys,
     home: &Dir,
     home_path: &Path,
-    source: Option<&Dir>,
+    source: &Result<Dir, Refusal>,
     ledger: &[Owned],
 ) -> BTreeMap<String, MergeFact> {
+    let cx = Cx {
+        resolved,
+        sys,
+        home,
+        source,
+        ledger,
+    };
     let mut out = BTreeMap::new();
     for r in resolved
         .resources
@@ -174,6 +215,7 @@ pub fn merge_facts(
                         managed_sha256: String::new(),
                         sets: Vec::new(),
                         handlers: 0,
+                        fragments: Vec::new(),
                         verdict: blocked(
                             e.code,
                             &format!(
@@ -188,12 +230,15 @@ pub fn merge_facts(
         };
         // The declared values with the fragments merged over them. A fragment that cannot be
         // read or parsed blocks the operation with its name and no content.
-        let layered = match declared.fragment_spec() {
-            None => Ok(declared.clone()),
-            Some((dir, pattern)) => {
-                read_fragments(resolved, dir, pattern, sys, home, source, ledger).and_then(|f| {
-                    declared.with_fragments(f.iter().map(|(n, b)| (n.as_str(), b.as_slice())))
-                })
+        let read = match declared.fragment_spec() {
+            None => Ok(BTreeMap::new()),
+            Some((dir, pattern)) => read_fragments(&cx, dir, pattern),
+        };
+        let layered = match (&read, declared.fragment_spec()) {
+            (Err(e), _) => Err(e.clone()),
+            (Ok(_), None) => Ok(declared.clone()),
+            (Ok(f), Some(_)) => {
+                declared.with_fragments(f.iter().map(|(n, b)| (n.as_str(), b.as_slice())))
             }
         };
         // Another resource's ledger entry on this path decides before anything is read.
@@ -224,6 +269,9 @@ pub fn merge_facts(
                 managed_sha256: declared.managed_sha256(),
                 sets: shown.setting_names(),
                 handlers: declared.handler_count(),
+                fragments: read
+                    .as_ref()
+                    .map_or_else(|_| Vec::new(), |f| tokens(store, f)),
                 verdict,
             },
         );

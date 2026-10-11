@@ -161,14 +161,14 @@ pub fn plan_for(ctx: &Ctx, loaded: &Loaded) -> Result<Plan, Refusal> {
     let root_str = loaded.root.to_str().ok_or_else(|| {
         usage("--root resolves to a path that is not UTF-8; point --root at a UTF-8 path")
     })?;
-    let source_root = Dir::open_plain(&loaded.root).ok();
+    let source_root = Dir::open_plain(&loaded.root);
     let merge = crate::adapters::merge_facts(
         &loaded.resolved,
         &store,
         &sys,
         &home,
         &layout.home,
-        source_root.as_ref(),
+        &source_root,
         &ledger,
     );
     let cx = Context {

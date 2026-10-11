@@ -196,6 +196,11 @@ pub struct CoOwned {
     /// only those. Absent in a ledger written before DFM-48, which reads as empty.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub appended: Vec<AppendedItem>,
+    /// Salted hash of each managed leaf as last written, by JSON pointer (DFM-48). The conflict
+    /// check compares leaf by leaf, so dropping a key or a fragment is not taken for a hand edit.
+    /// Absent in a ledger written before DFM-48: the check then uses `managed_hash` alone.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub leaves: BTreeMap<String, String>,
 }
 
 /// One item the manager appended to a foreign array of a co-owned file. `sha256` is the hash of
@@ -295,11 +300,20 @@ impl Ledger {
                             && !e.id.chars().chain(e.key.chars()).any(char::is_control)
                             && valid_sha256(&e.sha256)
                     });
-                    let appended_ok = c.appended.iter().all(|a| {
-                        a.pointer.starts_with('/')
-                            && !a.pointer.chars().any(char::is_control)
-                            && valid_sha256(&a.sha256)
-                    });
+                    // A pointer must be in canonical spelling and may not reach `hooks`, which the
+                    // manager edits only through handler entries.
+                    let pointer_ok = |p: &str| {
+                        crate::merge::normal_pointer(p).as_deref() == Some(p)
+                            && p != "/hooks"
+                            && !p.starts_with("/hooks/")
+                    };
+                    let appended_ok = c
+                        .appended
+                        .iter()
+                        .all(|a| pointer_ok(&a.pointer) && valid_sha256(&a.sha256))
+                        && c.leaves
+                            .iter()
+                            .all(|(p, h)| pointer_ok(p) && valid_sha256(h));
                     if r.class != Class::Sensitive
                         || !valid_sha256(&c.managed_hash)
                         || !entries_ok
@@ -1371,6 +1385,7 @@ mod tests {
                 pointer: "/sandbox/filesystem/allowWrite".into(),
                 sha256: "d".repeat(64),
             }],
+            leaves: [("/outputStyle".to_string(), "e".repeat(64))].into(),
         };
         let mut l = Ledger::empty(stamp());
         l.record(entry(Class::Sensitive, None, Some(good.clone())))
@@ -1413,6 +1428,24 @@ mod tests {
                     pointer: "no-slash".into(),
                     ..good.appended[0].clone()
                 }],
+                ..good.clone()
+            },
+            CoOwned {
+                appended: vec![AppendedItem {
+                    pointer: "/hooks/Stop".into(),
+                    ..good.appended[0].clone()
+                }],
+                ..good.clone()
+            },
+            CoOwned {
+                appended: vec![AppendedItem {
+                    pointer: "/a/~2".into(),
+                    ..good.appended[0].clone()
+                }],
+                ..good.clone()
+            },
+            CoOwned {
+                leaves: [("/hooks".to_string(), "e".repeat(64))].into(),
                 ..good.clone()
             },
             CoOwned {

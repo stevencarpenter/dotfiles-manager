@@ -71,6 +71,26 @@ fn keyed(
     }
 }
 
+/// The content token of a sensitive merge's fragments is a salted hash. It decides whether a plan
+/// is stale and is never shown: a difference in it reads as a content change.
+fn mask_content_tokens(diffs: &mut [Stale]) {
+    for d in diffs
+        .iter_mut()
+        .filter(|d| d.subject.starts_with("fragments:"))
+    {
+        let head = |s: &str| s.split_once(" content=[").map(|(h, _)| h.to_string());
+        if let (Some(w), Some(n)) = (head(&d.was), head(&d.now)) {
+            if w == n {
+                d.was = format!("{w} (fragment content before)");
+                d.now = format!("{n} (fragment content changed)");
+            } else {
+                d.was = w;
+                d.now = n;
+            }
+        }
+    }
+}
+
 /// Differences between `old` and `new`, most specific first, one entry per kind and subject.
 /// Empty only when the two plans have the same digest.
 pub fn stale(old: &Plan, new: &Plan) -> Result<Vec<Stale>, Refusal> {
@@ -200,7 +220,9 @@ fn op_diff(out: &mut Vec<Stale>, a: &Operation, b: &Operation) {
             .map(|p| (p.subject.clone(), p.state.clone()))
             .collect()
     };
+    let from = out.len();
     keyed(out, StaleKind::Observation, &pre(a), &pre(b));
+    mask_content_tokens(&mut out[from..]);
     let listed = |o: &Operation| -> Vec<(String, String)> {
         o.fragments
             .iter()

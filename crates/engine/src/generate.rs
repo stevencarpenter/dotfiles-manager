@@ -259,12 +259,17 @@ pub(crate) fn gather(
                 selected(sys, &root, dir, producer, &mut budget, &f.name, &path)?
             }
             None => {
-                let want = f.sha256.as_deref().ok_or_else(|| {
-                    invalid(format!("foreign fragment {path} has no recorded hash"))
-                })?;
                 let bytes = budget.read(sys, dir, &f.name, &path)?;
-                if sha256_hex(&bytes) != want {
-                    return Err(stale(format!("fragment {path} changed since the plan")));
+                // A fragment of a sensitive merge has no plain hash in the plan: it can hold
+                // credentials. Its salted content token is part of the approved plan, which
+                // apply plans again under the lock and compares before it writes.
+                if op.class != dfm_model::state::Class::Sensitive {
+                    let want = f.sha256.as_deref().ok_or_else(|| {
+                        invalid(format!("foreign fragment {path} has no recorded hash"))
+                    })?;
+                    if sha256_hex(&bytes) != want {
+                        return Err(stale(format!("fragment {path} changed since the plan")));
+                    }
                 }
                 bytes
             }

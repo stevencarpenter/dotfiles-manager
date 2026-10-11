@@ -20,7 +20,7 @@ use crate::recover;
 use crate::store::{Store, now_unix};
 use dfm_model::digest::sha256_hex;
 use dfm_model::fold;
-use dfm_model::merge::{Merged, check_foreign, salted};
+use dfm_model::merge::{Merged, check_foreign, leaf_hashes, salted};
 use dfm_model::plan::{
     Action, Operation, Owned, Plan, Request, Status as PlanStatus, ledger_state, link_fingerprint,
     node_state,
@@ -127,7 +127,10 @@ pub fn owned_outputs(ledger: &Ledger, home: &Path) -> Result<Vec<Owned>, Refusal
                 class: r.class,
                 path: rel.into(),
                 fingerprint: o.fingerprint.clone(),
-                coowned_entries: o.coowned.as_ref().map(|c| c.entries.len()),
+                coowned_entries: o
+                    .coowned
+                    .as_ref()
+                    .map(|c| (c.entries.len(), c.appended.len())),
             });
         }
     }
@@ -529,6 +532,8 @@ struct MergeRead {
 /// What a merge will write and the salted hash to record (`None` for a retire).
 struct MergeDecision {
     merged: Merged,
+    /// Salted hash of each managed leaf, to record (empty for a retire).
+    leaves: std::collections::BTreeMap<String, String>,
     new_hash: Option<String>,
 }
 
@@ -1044,16 +1049,23 @@ impl Exec<'_, '_> {
                 Ended::Blocked(e)
             })?;
         }
-        let new_hash = if retire {
-            None
+        let (new_hash, leaves) = if retire {
+            (None, Default::default())
         } else {
             let salt = match salt {
                 Some(s) => s,
                 None => self.run.store.salt_or_create().map_err(failed)?,
             };
-            Some(salted(&salt, &merged.rendered_view))
+            (
+                Some(salted(&salt, &merged.rendered_view)),
+                leaf_hashes(&salt, &merged),
+            )
         };
-        Ok(MergeDecision { merged, new_hash })
+        Ok(MergeDecision {
+            merged,
+            leaves,
+            new_hash,
+        })
     }
 
     /// Step 3, settle: intent, publish, read-back, outcome, ledger.
@@ -1071,7 +1083,11 @@ impl Exec<'_, '_> {
         read: &MergeRead,
         decided: MergeDecision,
     ) -> Result<Ended, Ended> {
-        let MergeDecision { merged, new_hash } = decided;
+        let MergeDecision {
+            merged,
+            leaves,
+            new_hash,
+        } = decided;
         let retire = op.action == Action::Retire;
         let id = self.attempt_id(op);
         let recovery = Recovery {
@@ -1116,9 +1132,12 @@ impl Exec<'_, '_> {
                     op,
                     &id,
                     abs,
-                    h,
-                    merged.entries.clone(),
-                    merged.appended.clone(),
+                    CoOwned {
+                        managed_hash: h.clone(),
+                        entries: merged.entries.clone(),
+                        appended: merged.appended.clone(),
+                        leaves,
+                    },
                 ),
             });
         if let Err(e) = settled {
@@ -1184,9 +1203,7 @@ impl Exec<'_, '_> {
         op: &Operation,
         id: &str,
         abs: &str,
-        managed_hash: &str,
-        entries: Vec<dfm_model::state::OwnedEntry>,
-        appended: Vec<dfm_model::state::AppendedItem>,
+        coowned: CoOwned,
     ) -> Result<(), Refusal> {
         let mut ledger = self.run.store.read_ledger_lenient()?;
         let mut outs = ledger
@@ -1200,11 +1217,7 @@ impl Exec<'_, '_> {
             path: abs.into(),
             mode: dfm_model::merge::MODE,
             fingerprint: None,
-            coowned: Some(CoOwned {
-                managed_hash: managed_hash.into(),
-                entries,
-                appended,
-            }),
+            coowned: Some(coowned),
         });
         outs.sort_by(|a, b| a.path.cmp(&b.path));
         ledger.record(LedgerResource {

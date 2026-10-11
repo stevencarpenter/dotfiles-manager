@@ -29,6 +29,9 @@ pub const ADAPTER: &str = "claude-settings/v1";
 /// The mode of the published file. A live file open to group or others is refused.
 pub const MODE: u32 = 0o600;
 
+/// The longest hook timeout the manager declares, in seconds.
+const MAX_TIMEOUT: i64 = 3600;
+
 /// One declared handler: a hook command the manager adds and may later retire.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Handler {
@@ -69,6 +72,11 @@ pub struct Merged {
     pub live_view: Vec<u8>,
     /// Canonical JSON of the managed keys as declared.
     pub rendered_view: Vec<u8>,
+    /// The leaves of `live_view` and `rendered_view` by JSON pointer, as canonical JSON. A leaf
+    /// is a value that is not an object. The conflict check compares leaf by leaf, so a changed
+    /// key set (a dropped key or fragment) is not an edit.
+    pub live_leaves: BTreeMap<String, Vec<u8>>,
+    pub rendered_leaves: BTreeMap<String, Vec<u8>>,
     /// The handler entries the manager owns after this merge. The ledger records them.
     pub entries: Vec<OwnedEntry>,
     /// The array items the manager owns after this merge (`append`). The ledger records them.
@@ -208,16 +216,24 @@ fn handler(id: &str, v: &Toml) -> Result<Handler, Refusal> {
     if let Some(v) = t.get("timeout") {
         let secs = v
             .as_integer()
-            .filter(|n| *n > 0)
-            .ok_or_else(|| invalid(format!("{at}.timeout must be a positive integer")))?;
+            .filter(|n| (1..=MAX_TIMEOUT).contains(n))
+            .ok_or_else(|| {
+                invalid(format!(
+                    "{at}.timeout must be an integer from 1 to {MAX_TIMEOUT} (seconds)"
+                ))
+            })?;
         hook["timeout"] = Json::from(secs);
     }
     let mut entry = serde_json::json!({ "hooks": [hook] });
     if let Some(v) = t.get("matcher") {
         let m = v
             .as_str()
-            .filter(|s| !s.is_empty() && !s.chars().any(char::is_control))
-            .ok_or_else(|| invalid(format!("{at}.matcher must be a non-empty string")))?;
+            .filter(|s| !s.chars().any(char::is_control))
+            .ok_or_else(|| {
+                invalid(format!(
+                    "{at}.matcher must be a string without control characters (an empty string matches everything)"
+                ))
+            })?;
         entry["matcher"] = Json::String(m.into());
     }
     let sha256 = sha256_hex(&canonical(&entry));
@@ -270,6 +286,16 @@ impl Desired {
                 let p = p.as_str().and_then(normal_pointer).ok_or_else(|| {
                     invalid("append must hold JSON pointers such as /sandbox/filesystem/allowWrite")
                 })?;
+                if p == "/hooks" || p.starts_with("/hooks/") {
+                    return Err(invalid(
+                        "append cannot name hooks: hooks are declared as handlers",
+                    ));
+                }
+                if !matches!(pointer_get(&managed, &p), Some(Json::Array(_))) {
+                    return Err(invalid(format!(
+                        "append pointer {p} does not name an array in managed (a pointer is case-sensitive, and a mistyped one would turn append into replace). Fix: declare the array under managed or correct the pointer"
+                    )));
+                }
                 append.insert(p);
             }
         }
@@ -345,7 +371,7 @@ impl Desired {
                     "fragment {name} sets hooks. Fix: declare hooks as handlers in the module so the manager can retire only its own entries"
                 )));
             }
-            overlay(&mut out.effective, &obj);
+            overlay(&mut out.effective, &obj, "", &out.append.clone());
         }
         Ok(out)
     }
@@ -371,13 +397,12 @@ impl Desired {
         names.into_iter().collect()
     }
 
+    fn rendered_map(&self) -> Map<String, Json> {
+        view_of(&self.effective, &self.effective, "", &self.append)
+    }
+
     fn rendered_view(&self) -> Vec<u8> {
-        canonical(&Json::Object(view_of(
-            &self.effective,
-            &self.effective,
-            "",
-            &self.append,
-        )))
+        canonical(&Json::Object(self.rendered_map()))
     }
 }
 
@@ -397,11 +422,26 @@ fn leaf_paths(m: &Map<String, Json>, prefix: &str, out: &mut BTreeSet<String>) {
     }
 }
 
-/// Deep merge of fragment objects: objects merge, everything else replaces.
-fn overlay(dst: &mut Map<String, Json>, src: &Map<String, Json>) {
+/// Deep merge of fragment objects: objects merge and everything else replaces. At an `append`
+/// pointer two arrays concatenate with unique items, so a fragment adds to a declared list.
+fn overlay(
+    dst: &mut Map<String, Json>,
+    src: &Map<String, Json>,
+    at: &str,
+    append: &BTreeSet<String>,
+) {
     for (k, v) in src {
+        let here = format!("{at}/{}", escape_token(k));
         match (dst.get_mut(k), v) {
-            (Some(Json::Object(d)), Json::Object(s)) => overlay(d, s),
+            (Some(Json::Object(d)), Json::Object(s)) => overlay(d, s, &here, append),
+            (Some(Json::Array(d)), Json::Array(s)) if append.contains(&here) => {
+                for item in s {
+                    let sha = sha_of(item);
+                    if !d.iter().any(|e| sha_of(e) == sha) {
+                        d.push(item.clone());
+                    }
+                }
+            }
             _ => {
                 dst.insert(k.clone(), v.clone());
             }
@@ -415,7 +455,7 @@ fn escape_token(t: &str) -> String {
 
 /// A JSON pointer that names at least one key, in its canonical spelling. `None` when the text
 /// is not a pointer (RFC 6901) or names the whole document.
-fn normal_pointer(p: &str) -> Option<String> {
+pub(crate) fn normal_pointer(p: &str) -> Option<String> {
     let rest = p.strip_prefix('/')?;
     let tokens: Vec<String> = rest.split('/').map(unescape_token).collect::<Option<_>>()?;
     if tokens
@@ -507,6 +547,44 @@ fn view_of(
         }
     }
     out
+}
+
+/// The leaves of a managed view by JSON pointer.
+fn leaves_of(view: &Map<String, Json>) -> BTreeMap<String, Vec<u8>> {
+    fn walk(m: &Map<String, Json>, at: &str, out: &mut BTreeMap<String, Vec<u8>>) {
+        for (k, v) in m {
+            // A key the ledger cannot spell as a JSON pointer is not compared leaf by leaf.
+            if k.is_empty() || k.chars().any(char::is_control) {
+                continue;
+            }
+            let here = format!("{at}/{}", escape_token(k));
+            match v {
+                Json::Object(o) => walk(o, &here, out),
+                leaf => {
+                    out.insert(here, canonical(leaf));
+                }
+            }
+        }
+    }
+    let mut out = BTreeMap::new();
+    walk(view, "", &mut out);
+    out
+}
+
+/// The salted hash of one managed leaf, as the ledger records it (`coowned.leaves`).
+pub fn leaf_hash(salt: &[u8], pointer: &str, value: &[u8]) -> String {
+    let mut buf = pointer.as_bytes().to_vec();
+    buf.push(0);
+    buf.extend_from_slice(value);
+    salted(salt, &buf)
+}
+
+/// The salted hashes of every managed leaf this merge declares, by JSON pointer.
+pub fn leaf_hashes(salt: &[u8], m: &Merged) -> BTreeMap<String, String> {
+    m.rendered_leaves
+        .iter()
+        .map(|(p, v)| (p.clone(), leaf_hash(salt, p, v)))
+        .collect()
 }
 
 fn serialize(doc: Map<String, Json>) -> Vec<u8> {
@@ -652,6 +730,11 @@ fn apply_managed(
                 Some(_) => return Err(not_an_object(&ptr)),
             }
         } else {
+            if matches!(live.get(k), Some(Json::Object(_))) {
+                return Err(conflict(format!(
+                    "{ptr} in the live file is a table, but the module sets a value there. Fix: correct it by hand; the manager does not discard a foreign table"
+                )));
+            }
             live.insert(k.clone(), mv.clone());
         }
         path.pop();
@@ -716,7 +799,7 @@ fn append_items(
 fn apply_seed(live: &mut Map<String, Json>, seed: &Map<String, Json>) {
     for (k, sv) in seed {
         match (live.get_mut(k), sv) {
-            (None, _) => {
+            (None | Some(Json::Null), _) => {
                 live.insert(k.clone(), sv.clone());
             }
             (Some(Json::Object(lo)), Json::Object(so)) => apply_seed(lo, so),
@@ -751,12 +834,8 @@ pub fn merge_with(
     takeover: bool,
 ) -> Result<Merged, Refusal> {
     let mut doc = parse_live(live)?;
-    let live_view = canonical(&Json::Object(view_of(
-        &doc,
-        &desired.effective,
-        "",
-        &desired.append,
-    )));
+    let live_map = view_of(&doc, &desired.effective, "", &desired.append);
+    let live_view = canonical(&Json::Object(live_map.clone()));
     // An appended item the module no longer declares goes first, matched by hash.
     for a in appended {
         let declared = desired.append.contains(&a.pointer)
@@ -841,17 +920,36 @@ pub fn merge_with(
         bytes,
         live_view,
         rendered_view: desired.rendered_view(),
+        live_leaves: leaves_of(&live_map),
+        rendered_leaves: leaves_of(&desired.rendered_map()),
         entries,
         appended: walk.appended,
         changed,
     })
 }
 
+/// How the first character of a word was written. Only a character the shell would expand can be
+/// a home spelling: `~` when bare, `$HOME` and `${HOME}` when bare or in double quotes. A
+/// character in single quotes, or escaped with a backslash, is literal text.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Lead {
+    Bare,
+    Double,
+    Literal,
+}
+
 /// Splits a shell command into words the way a POSIX shell reads quotes (single, double and
 /// backslash), without any expansion. `None` when a quote is not closed.
-fn shell_words(s: &str) -> Option<Vec<String>> {
+fn shell_words(s: &str) -> Option<Vec<(String, Lead)>> {
     let (mut words, mut cur, mut open) = (Vec::new(), String::new(), false);
+    let mut lead = Lead::Bare;
     let mut it = s.chars();
+    let push = |cur: &mut String, lead: &mut Lead, c: char, how: Lead| {
+        if cur.is_empty() {
+            *lead = how;
+        }
+        cur.push(c);
+    };
     while let Some(c) = it.next() {
         match c {
             '\'' => {
@@ -859,7 +957,7 @@ fn shell_words(s: &str) -> Option<Vec<String>> {
                 loop {
                     match it.next()? {
                         '\'' => break,
-                        x => cur.push(x),
+                        x => push(&mut cur, &mut lead, x, Lead::Literal),
                     }
                 }
             }
@@ -870,41 +968,50 @@ fn shell_words(s: &str) -> Option<Vec<String>> {
                         '"' => break,
                         '\\' => {
                             let n = it.next()?;
-                            if !matches!(n, '\\' | '"' | '$' | '`') {
-                                cur.push('\\');
+                            if matches!(n, '\\' | '"' | '$' | '`') {
+                                push(&mut cur, &mut lead, n, Lead::Literal);
+                            } else {
+                                push(&mut cur, &mut lead, '\\', Lead::Literal);
+                                cur.push(n);
                             }
-                            cur.push(n);
                         }
-                        x => cur.push(x),
+                        x => push(&mut cur, &mut lead, x, Lead::Double),
                     }
                 }
             }
             '\\' => {
                 open = true;
-                cur.push(it.next()?);
+                let n = it.next()?;
+                push(&mut cur, &mut lead, n, Lead::Literal);
             }
             c if c.is_whitespace() => {
                 if open {
-                    words.push(std::mem::take(&mut cur));
+                    words.push((std::mem::take(&mut cur), lead));
                     open = false;
                 }
             }
             c => {
                 open = true;
-                cur.push(c);
+                push(&mut cur, &mut lead, c, Lead::Bare);
             }
         }
     }
     if open {
-        words.push(cur);
+        words.push((cur, lead));
     }
     Some(words)
 }
 
-/// One word with its home spelling made canonical: `~`, `$HOME`, `${HOME}` and the absolute home
-/// path, each at the start of the word, become `${HOME}`.
-fn canon_word(w: &str, home: Option<&str>) -> String {
-    let mut prefixes = vec!["~", "$HOME", "${HOME}"];
+/// One word with its home spelling made canonical. `~`, `$HOME` and `${HOME}` at the start become
+/// `${HOME}` only when the shell would expand them (see [`Lead`]). The absolute home path is
+/// literal text in any quoting, so it always matches.
+fn canon_word(w: &str, lead: Lead, home: Option<&str>) -> String {
+    let mut prefixes: Vec<&str> = Vec::new();
+    match lead {
+        Lead::Bare => prefixes.extend(["~", "$HOME", "${HOME}"]),
+        Lead::Double => prefixes.extend(["$HOME", "${HOME}"]),
+        Lead::Literal => {}
+    }
     if let Some(h) = home {
         prefixes.push(h);
     }
@@ -912,20 +1019,22 @@ fn canon_word(w: &str, home: Option<&str>) -> String {
         if let Some(rest) = w.strip_prefix(p)
             && (rest.is_empty() || rest.starts_with('/'))
         {
-            return format!("${{HOME}}{rest}");
+            return format!("\u{1}HOME{rest}");
         }
     }
     w.to_string()
 }
 
-/// The identity of a hook command: its words, read as a shell reads them, with the home spelling
-/// made canonical. Quoting and `~/`, `$HOME/`, `${HOME}/` and the absolute home path do not
-/// change it. A command with an unclosed quote is its own identity.
+/// The identity of a hook command: its words, read as a shell reads them, with an expandable home
+/// spelling made canonical. Quoting that does not change the words, and `~/`, `$HOME/`,
+/// `${HOME}/` and the absolute home path at the start of a word, do not change it. A single-quoted
+/// or backslash-escaped `~` or `$HOME` is literal text and does. A command with an unclosed quote
+/// is its own identity.
 fn command_identity(cmd: &str, home: Option<&str>) -> String {
     match shell_words(cmd) {
         Some(w) => w
             .iter()
-            .map(|x| canon_word(x, home))
+            .map(|(x, lead)| canon_word(x, *lead, home))
             .collect::<Vec<_>>()
             .join("\0"),
         None => format!("raw\0{cmd}"),
@@ -1005,7 +1114,22 @@ pub const SALT_LOST: &str = "state/salt is missing or unusable, but the ledger r
 /// managed view must differ from the salted hash the ledger holds, and must not already equal
 /// the declared values (then nothing is overwritten). Plan and apply both decide through this.
 pub fn foreign_edit(salt: &[u8], recorded: &CoOwned, m: &Merged) -> bool {
-    salted(salt, &m.live_view) != recorded.managed_hash && m.live_view != m.rendered_view
+    if recorded.leaves.is_empty() {
+        // A ledger written before DFM-48 holds the hash of the whole view only.
+        return salted(salt, &m.live_view) != recorded.managed_hash
+            && m.live_view != m.rendered_view;
+    }
+    // Leaf by leaf, over the leaves both the ledger and the module name now. A leaf the module
+    // dropped, or one it added, is not an edit: the declared key set changed, not the file.
+    recorded.leaves.iter().any(|(path, hash)| {
+        let Some(declared) = m.rendered_leaves.get(path) else {
+            return false;
+        };
+        match m.live_leaves.get(path) {
+            None => true,
+            Some(live) => live != declared && leaf_hash(salt, path, live) != *hash,
+        }
+    })
 }
 
 /// The shared conflict check for plan and apply. `live_present` is false when the file is
@@ -1056,6 +1180,7 @@ pub fn classify(
         && !merged.changed
         && recorded.zip(salt).is_some_and(|(c, salt)| {
             salted(salt, &merged.rendered_view) == c.managed_hash
+                && c.leaves == leaf_hashes(salt, &merged)
                 && c.entries == merged.entries
                 && c.appended == merged.appended
         });
@@ -1314,6 +1439,7 @@ argv = ["audit", "--quiet", "two words"]
             managed_hash: salted(&salt, &first.rendered_view),
             entries: first.entries.clone(),
             appended: first.appended.clone(),
+            leaves: leaf_hashes(&salt, &first),
         };
         // Unchanged live file: current.
         let (_, o) = classify(Some(&first.bytes), &d, Some(&rec), Some(&salt)).unwrap();
@@ -1458,10 +1584,16 @@ defaultMode = "auto"
             managed_hash: salted(&salt, &m.rendered_view),
             entries: m.entries.clone(),
             appended: m.appended.clone(),
+            leaves: leaf_hashes(&salt, &m),
         };
         // A plugin the user adds, a user sandbox path and a deleted appended item are no edit.
         let live = br#"{"env":{"MANAGED":"1","MINE":"x"},"enabledPlugins":{"a@m":true,"user@m":true},"sandbox":{"filesystem":{"allowWrite":["/user"]}}}"#;
         let (merged, _) = classify(Some(live), &d, Some(&rec), Some(&salt)).unwrap();
+        // The view holds the managed leaves and nothing the user added.
+        assert_eq!(
+            merged.live_view,
+            br#"{"enabledPlugins":{"a@m":true},"env":{"MANAGED":"1"}}"#
+        );
         assert_eq!(
             merged.appended.len(),
             2,
@@ -1502,8 +1634,19 @@ defaultMode = "auto"
                 "{bad}"
             );
         }
-        let d = desired("append = [\"/a/b\"]\n[managed.a]\nb = 1\n");
-        assert!(merge(None, &d, &[]).is_err_and(|e| e.code == Code::ManifestInvalid));
+        // An append pointer must name an array under managed. A mistyped one is refused, because
+        // it would turn append into replace and lose the user's items.
+        for bad in [
+            "append = [\"/a/b\"]\n[managed.a]\nb = 1\n",
+            "append = [\"/sandbox/filesystem/allowwrite\"]\n[managed.sandbox.filesystem]\nallowWrite = [\"x\"]\n",
+            "append = [\"/a/missing\"]\n[managed.a]\nb = [1]\n",
+            "append = [\"/hooks/Stop\"]\n[managed.a]\nb = [1]\n",
+        ] {
+            let v = toml::from_str::<Toml>(bad).unwrap();
+            let e = Desired::from_value(&v).unwrap_err();
+            assert_eq!(e.code, Code::ManifestInvalid, "{bad}");
+        }
+        desired("append = [\"/a/b\"]\n[managed.a]\nb = [1]\n");
     }
 
     #[test]
@@ -1581,11 +1724,23 @@ defaultMode = "auto"
             "$HOME/.claude/hooks/x.sh",
             "${HOME}/.claude/hooks/x.sh",
             "\"${HOME}/.claude/hooks/x.sh\"",
-            "'~/.claude/hooks/x.sh'",
+            "\"$HOME/.claude/hooks/x.sh\"",
             "/home/me/.claude/hooks/x.sh",
+            "'/home/me/.claude/hooks/x.sh'",
             "  ~/.claude/hooks/x.sh  ",
         ] {
             assert_eq!(id(same), want, "{same}");
+        }
+        // A single-quoted or escaped `~` or `$HOME` is literal text, not the home directory.
+        for literal in [
+            "'~/.claude/hooks/x.sh'",
+            "'${HOME}/.claude/hooks/x.sh'",
+            "\\$HOME/.claude/hooks/x.sh",
+            "\"\\${HOME}/.claude/hooks/x.sh\"",
+            "\"~/.claude/hooks/x.sh\"",
+            "\\~/.claude/hooks/x.sh",
+        ] {
+            assert_ne!(id(literal), want, "{literal}");
         }
         for other in [
             "~/.claude/hooks/y.sh",
@@ -1615,5 +1770,120 @@ defaultMode = "auto"
             assert_eq!(json(&m.bytes)["hooks"]["E"].as_array().unwrap().len(), 1);
             assert!(m.entries.is_empty(), "takeover={takeover}");
         }
+    }
+
+    #[test]
+    fn dropping_a_managed_key_is_no_edit_but_a_hand_edit_of_a_kept_key_still_is() {
+        let salt = [5u8; 32];
+        let wide = desired("[managed]\na = 1\nb = 2\n");
+        let first = merge(None, &wide, &[]).unwrap();
+        let rec = CoOwned {
+            managed_hash: salted(&salt, &first.rendered_view),
+            entries: vec![],
+            appended: vec![],
+            leaves: leaf_hashes(&salt, &first),
+        };
+        let narrow = desired("[managed]\na = 1\n");
+        // The module dropped `b`: the live file is as written, so the write is allowed.
+        assert!(classify(Some(&first.bytes), &narrow, Some(&rec), Some(&salt)).is_ok());
+        // A hand edit of the kept key is still a conflict, with or without the dropped key.
+        let edited = br#"{"a":9,"b":2}"#;
+        let e = classify(Some(edited), &narrow, Some(&rec), Some(&salt)).unwrap_err();
+        assert_eq!(e.code, Code::Conflict);
+        assert!(!e.detail.contains('9'));
+        // A key the module added is not compared: there is nothing recorded for it.
+        let wider = desired("[managed]\na = 1\nb = 2\nc = 3\n");
+        assert!(classify(Some(&first.bytes), &wider, Some(&rec), Some(&salt)).is_ok());
+        // A removed kept key is an edit.
+        let e = classify(Some(br#"{"b":2}"#), &narrow, Some(&rec), Some(&salt)).unwrap_err();
+        assert_eq!(e.code, Code::Conflict);
+    }
+
+    #[test]
+    fn a_declared_value_over_a_foreign_table_is_refused_without_content() {
+        let live = br#"{"a":{"secret":"planted-token"}}"#;
+        let e = merge(Some(live), &desired("[managed]\na = 1\n"), &[]).unwrap_err();
+        assert_eq!(e.code, Code::Conflict);
+        assert!(!e.detail.contains("planted-token"));
+        let e = merge(Some(live), &desired("[managed]\na = [1]\n"), &[]).unwrap_err();
+        assert_eq!(e.code, Code::Conflict);
+    }
+
+    #[test]
+    fn a_seed_fills_a_live_null() {
+        let d = desired("[managed]\n[seed]\nmodel = \"m\"\n[seed.p]\nq = 1\n");
+        let out = json(
+            &merge(Some(br#"{"model":null,"p":{"q":null}}"#), &d, &[])
+                .unwrap()
+                .bytes,
+        );
+        assert_eq!(
+            (out["model"].clone(), out["p"]["q"].clone()),
+            ("m".into(), 1.into())
+        );
+    }
+
+    #[test]
+    fn a_fragment_array_at_an_append_pointer_adds_unique_items() {
+        let d = desired(NESTED);
+        let layered = d
+            .with_fragments([(
+                "10.json",
+                br#"{"sandbox":{"filesystem":{"allowWrite":["/m/two","/frag/new"]}}}"#.as_slice(),
+            )])
+            .unwrap();
+        let m = merge(None, &layered, &[]).unwrap();
+        assert_eq!(
+            json(&m.bytes)["sandbox"]["filesystem"]["allowWrite"],
+            serde_json::json!(["/m/one", "/m/two", "/frag/new"])
+        );
+        // Another array in a fragment still replaces.
+        let layered = d
+            .with_fragments([
+                ("10.json", br#"{"extra":[1]}"#.as_slice()),
+                ("20.json", br#"{"extra":[2]}"#.as_slice()),
+            ])
+            .unwrap();
+        assert_eq!(
+            json(&merge(None, &layered, &[]).unwrap().bytes)["extra"],
+            serde_json::json!([2])
+        );
+    }
+
+    #[test]
+    fn handler_matcher_and_timeout_are_validated() {
+        let with = |extra: &str| {
+            toml::from_str::<Toml>(&format!(
+                "[managed]\n[handlers.g]\nevent = \"E\"\ntype = \"command\"\nargv = [\"g\"]\n{extra}\n"
+            ))
+            .unwrap()
+        };
+        for ok in [
+            "matcher = \"\"",
+            "timeout = 3600",
+            "timeout = 1",
+            "matcher = \"Bash|Write\"",
+        ] {
+            assert!(Desired::from_value(&with(ok)).is_ok(), "{ok}");
+        }
+        for bad in [
+            "timeout = 3601",
+            "timeout = -5",
+            "matcher = \"a\\nb\"",
+            "matcher = true",
+        ] {
+            let e = Desired::from_value(&with(bad)).unwrap_err();
+            assert_eq!(e.code, Code::ManifestInvalid, "{bad}");
+        }
+        let out = json(
+            &merge(
+                None,
+                &Desired::from_value(&with("matcher = \"\"")).unwrap(),
+                &[],
+            )
+            .unwrap()
+            .bytes,
+        );
+        assert_eq!(out["hooks"]["E"][0]["matcher"], "");
     }
 }

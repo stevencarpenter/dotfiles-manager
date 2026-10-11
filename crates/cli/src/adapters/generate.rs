@@ -102,6 +102,8 @@ impl Generator for Generators<'_> {
                 bytes,
                 live_view: Vec::new(),
                 rendered_view: Vec::new(),
+                live_leaves: Default::default(),
+                rendered_leaves: Default::default(),
                 entries: Vec::new(),
                 appended: Vec::new(),
                 changed,

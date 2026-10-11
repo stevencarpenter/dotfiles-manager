@@ -35,8 +35,9 @@ pub struct Owned {
     pub class: Class,
     pub path: String,
     pub fingerprint: Option<String>,
-    /// `Some(n)` for a co-owned file (`claude-settings/v1`) with `n` entries the manager added.
-    pub coowned_entries: Option<usize>,
+    /// `Some((entries, appended))` for a co-owned file (`claude-settings/v1`): how many hook
+    /// entries and how many array items the manager added.
+    pub coowned_entries: Option<(usize, usize)>,
 }
 
 /// What the caller learned from the live file of a co-owned merge resource. The planner is pure
@@ -66,6 +67,12 @@ pub struct MergeFact {
     pub sets: Vec<String>,
     /// How many handler entries the merge adds.
     pub handlers: usize,
+    /// The fragments the merge read, by name in byte order, each with a content token. The token
+    /// is a salted hash from the CLI (empty while `state/salt` does not exist yet). The planner
+    /// compares the names with its own fragment list and puts the tokens in the `fragments:`
+    /// precondition, so a changed fragment makes a saved plan stale. A token never reaches text
+    /// output (docs/adapters.md, "Sensitive policy").
+    pub fragments: Vec<(String, String)>,
     pub verdict: MergeVerdict,
 }
 
@@ -205,9 +212,10 @@ pub fn followups(resolved: &Resolved, obs: &Observations, ledger: &[Owned]) -> V
                 let path = format!("{}/{n}", d.dir);
                 let folded = fold(&path);
                 if !claimed.contains(&folded) && !sensitive.contains(&folded) {
+                    // A fragment of a sensitive merge can hold credentials: it is never hashed.
                     out.insert(Request {
                         path,
-                        hash: true,
+                        hash: !r.sensitive,
                         list: false,
                     });
                 }
@@ -828,7 +836,7 @@ impl Planner<'_> {
                     Status::Planned,
                     Ownership::Foreign,
                     format!(
-                        "take over managed fields of an existing file {shown}; foreign keys are kept; hand edits of managed fields are overwritten{what}"
+                        "take over managed fields of an existing file {shown}; foreign keys are kept; hand edits of managed fields are overwritten; identical live hooks and append items become owned, and a later retire removes them{what}"
                     ),
                     post,
                 ))
@@ -954,16 +962,17 @@ impl Planner<'_> {
             }
             _ => {}
         }
-        if let (Some(n), Node::File { .. }) = (o.coowned_entries, &seen.node) {
+        if let (Some((n, items)), Node::File { .. }) = (o.coowned_entries, &seen.node) {
             // A co-owned file is never deleted. Only the entries the manager added are retired.
             op.action = Action::Retire;
             op.status = Status::Planned;
             op.ownership = Ownership::Owned;
             op.mode = Some(0o600);
             op.effect = format!(
-                "retire {n} owned handler(s) in {path} (sensitive: destination and mode only); the file, its managed and seeded values and all foreign entries stay"
+                "retire {n} owned handler(s) and remove {items} appended array item(s) in {path} (sensitive: destination and mode only); the file, its managed and seeded values and all foreign entries and array items stay"
             );
-            op.postcondition = format!("{path} holds none of the owned handler entries");
+            op.postcondition =
+                format!("{path} holds none of the owned handler entries and appended items");
             return Ok(());
         }
         op.ownership = self.ownership(&o.resource, o.class == Class::Sensitive, path, &seen);
@@ -1070,7 +1079,7 @@ impl Planner<'_> {
     }
 
     /// Why a foreign fragment cannot be used as an input, if it cannot.
-    fn fragment_problem(&self, dir: &str, name: &str) -> Option<Fail> {
+    fn fragment_problem(&self, dir: &str, name: &str, sensitive: bool) -> Option<Fail> {
         let path = format!("{dir}/{name}");
         let field = "/fragments_dir";
         if !name.is_ascii() {
@@ -1085,6 +1094,22 @@ impl Planner<'_> {
         }
         let fix = "remove or replace it with a regular file you own";
         match self.obs.seen.get(&path).map(|s| (&s.node, &s.alias)) {
+            // A fragment of a sensitive merge sets keys that run code, so another user must not
+            // be able to write it. It is not hashed: the CLI supplies a salted content token.
+            Some((
+                Node::File {
+                    own: true, mode, ..
+                },
+                None,
+            )) if sensitive && mode & 0o022 != 0 => Some(fail(
+                Code::Conflict,
+                field,
+                format!(
+                    "fragment {path} is mode {mode:o}, writable by group or others, and its keys can run code"
+                ),
+                "run chmod go-w on the fragment",
+            )),
+            Some((Node::File { own: true, .. }, None)) if sensitive => None,
             Some((
                 Node::File {
                     own: true,
@@ -1163,6 +1188,9 @@ impl Planner<'_> {
             .map(|c| format!("{}@{c}", r.id))
             .filter(|id| self.ops.contains_key(id))
             .collect();
+        // The fragments of a sensitive merge can hold credentials. They are not hashed, and the
+        // plan carries a salted content token from the CLI instead of a hash.
+        let sens = r.sensitive;
         let selected = self.producers(&d.dir, &d.pattern);
         let selected_names: BTreeSet<String> = selected.iter().map(|(_, _, n)| fold(n)).collect();
         let mut fragments: Vec<Fragment> = selected
@@ -1189,7 +1217,7 @@ impl Planner<'_> {
                     continue;
                 }
                 let sha256 = match self.obs.seen.get(&path).map(|s| &s.node) {
-                    Some(Node::File { sha256, .. }) => sha256.clone(),
+                    Some(Node::File { sha256, .. }) if !sens => sha256.clone(),
                     _ => None,
                 };
                 fragments.push(Fragment {
@@ -1201,9 +1229,9 @@ impl Planner<'_> {
                     .obs
                     .seen
                     .get(&path)
-                    .map_or_else(|| "unobserved".into(), |s| node_state(s, false));
+                    .map_or_else(|| "unobserved".into(), |s| node_state(s, sens));
                 foreign_state.push(format!("{n}={st}"));
-                if let Some(f) = self.fragment_problem(&d.dir, n) {
+                if let Some(f) = self.fragment_problem(&d.dir, n, sens) {
                     problems.push((path, f));
                 }
             }
@@ -1211,7 +1239,7 @@ impl Planner<'_> {
         fragments.sort_by(|a, b| (&a.name, &a.origin).cmp(&(&b.name, &b.origin)));
         let mut names: Vec<String> = selected.iter().map(|(_, _, n)| n.clone()).collect();
         names.sort();
-        let state = format!(
+        let mut state = format!(
             "selected=[{}] foreign=[{}] removing=[{}]",
             names.join(","),
             foreign_state.join(","),
@@ -1221,6 +1249,40 @@ impl Planner<'_> {
                 .collect::<Vec<_>>()
                 .join(",")
         );
+        // The fragments the merge read must be the fragments the planner lists. They differ when
+        // a deselected producer's fragment is not removed (a removal that is blocked): the merge
+        // verdict was made without it and the plan lists it, so neither can be trusted.
+        let fact = self
+            .cx
+            .merge
+            .get(&r.id)
+            .filter(|f| sens && !matches!(f.verdict, MergeVerdict::Blocked { .. }));
+        if let Some(f) = fact {
+            let mut read: Vec<&str> = f.fragments.iter().map(|(n, _)| n.as_str()).collect();
+            let mut listed: Vec<&str> = fragments.iter().map(|x| x.name.as_str()).collect();
+            read.sort_unstable();
+            listed.sort_unstable();
+            if read != listed {
+                problems.push((
+                    d.dir.clone(),
+                    fail(
+                        Code::PlanStale,
+                        "/fragments_dir",
+                        format!(
+                            "the fragments in {} that the merge read differ from the fragments the plan lists; a fragment of a deselected resource is probably still there",
+                            d.dir
+                        ),
+                        "settle the blocked removal of that fragment (see the other blocker), then plan again",
+                    ),
+                ));
+            }
+            let tokens: Vec<String> = f
+                .fragments
+                .iter()
+                .map(|(n, t)| format!("{n}:{t}"))
+                .collect();
+            state.push_str(&format!(" content=[{}]", tokens.join(",")));
+        }
         let blocked = !problems.is_empty();
         for (path, f) in problems {
             self.blocker(r, Some(&path), f);
