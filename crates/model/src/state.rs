@@ -523,7 +523,12 @@ impl Receipt {
             // no `before` and no `reload`. A failed or blocked operation has neither shape, so
             // only its `how` is checked.
             let fits = op.is_some_and(|o| match a.how.as_str() {
-                "allow_disruptive" => o.owned_outputs.is_empty() && o.after.is_none(),
+                // A removal that ran records the fingerprint it removed as `before`.
+                "allow_disruptive" => {
+                    o.owned_outputs.is_empty()
+                        && o.after.is_none()
+                        && (o.status != Status::Updated || o.before.is_some())
+                }
                 "allow_adopt" => {
                     o.reload.is_none()
                         && o.before.is_none()
@@ -1484,6 +1489,12 @@ mod tests {
         assert!(r.validate().is_err());
         r.approvals[0].how = "allow_disruptive".into();
         r.validate().unwrap();
+        // An updated operation with no `before` (a directory made, say) is not a removal.
+        let mut r = adopted();
+        r.operations[0].owned_outputs.clear();
+        r.operations[0].after = None;
+        r.approvals[0].how = "allow_disruptive".into();
+        assert!(r.validate().is_err());
         // A published link (it has a reload state) is not an adoption.
         let mut r = adopted();
         r.operations[0].reload = Some("not_attempted".into());

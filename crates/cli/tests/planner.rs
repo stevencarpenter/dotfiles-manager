@@ -1982,6 +1982,13 @@ mod removal {
             "old/link is no longer selected but was changed after the manager wrote it"
         );
 
+        // A link entry written before the fingerprint prefix holds the plain hash. Deselected,
+        // it is a conflict and never a removal.
+        let plain = Some(dfm_model::digest::sha256_hex(b"/src/x"));
+        let p = go(owned(Class::Normal, plain), link("/src/x"));
+        assert_eq!(p.blockers[0].code.as_str(), "E_CONFLICT");
+        assert!(p.operations.iter().all(|o| o.action != Action::Remove));
+
         // A sensitive entry has no comparable fingerprint.
         let p = go(owned(Class::Sensitive, None), link("/src/x"));
         assert_eq!(

@@ -1382,6 +1382,18 @@ mod tests {
                 d.3
             );
         }
+        // A ledger entry written before the fingerprint prefix reads as modified. The exact
+        // link is still current and is not adopted, replaced or removed.
+        let d = run(false, &link(LinkTo::File), Ownership::Modified, false);
+        assert_eq!(
+            (d.0, d.1, d.2),
+            (Action::None, Status::Current, Ownership::UnrecordedCurrent)
+        );
+        assert!(
+            d.3.ends_with("not adopted: the ledger already has an entry for this path"),
+            "{}",
+            d.3
+        );
         // An owned link is plain current.
         let d = run(false, &link(LinkTo::File), Ownership::Owned, false);
         assert_eq!((d.0, d.2), (Action::None, Ownership::Owned));
