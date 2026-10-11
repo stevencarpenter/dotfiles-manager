@@ -136,14 +136,29 @@ model = "example-model"
 event = "PreToolUse"
 type = "command"
 argv = ["audit", "--quiet"]
+matcher = "Bash"   # optional: the matcher of the hook group
+timeout = 20       # optional: seconds, a positive integer
 [resources.policy]
 defaults = ["/managed/outputStyle"]
 extensions = ["/handlers"]
 ```
 
+Optional value fields (DFM-48), from `examples/base/modules/claude-base`:
+
+```toml
+[resources.value]
+append = ["/sandbox/filesystem/allowWrite"]
+fragments_dir = ".claude/settings.d"
+pattern = "*.json"
+[resources.value.managed.sandbox.filesystem]
+allowWrite = ["~/.cache/example-tool", "~/projects/example"]
+```
+
+`append` lists JSON pointers into the settings file. `fragments_dir` and `pattern` go together: declare both or neither. `append` is a field of the value, not of `[resources.policy]`. The resolver accepts only `defaults` and `extensions` in `policy` (docs/resolver.md), and it still applies them to any pointer of the value, so an overlay can change `/managed/enabledPlugins/example-tools@example-marketplace`.
+
 The resolver applies `policy.defaults` and `policy.extensions` (an overlay can change a default or add a handler). The adapter reads the resolved value. A config edit needs no rebuild.
 
-**Mapping rule.** `managed` and `seed` act on the top-level keys of the settings file, and a policy pointer addresses the same resolved value: `/managed/outputStyle` is the field `outputStyle` of `managed`, which sets the top-level key `outputStyle`. A nested table under a key is replaced as one value. The adapter writes no nested path.
+**Mapping rule.** `managed` and `seed` act on the settings file at any depth, and a policy pointer addresses the same resolved value: `/managed/outputStyle` is the field `outputStyle` of `managed`, which sets the top-level key `outputStyle`. A managed table merges into the live table (rule 1). The fixture `examples/base/modules/claude-base` shows every shape of a full base settings file: `env`, `permissions`, `statusLine`, `enabledPlugins`, `skillOverrides`, `extraKnownMarketplaces`, flags, an `append` array, seeds and seven handlers.
 
 **Fixed destination.** The adapter writes `.claude/settings.json` only. A resource of this adapter with any other `target` is `E_MANIFEST_INVALID` at resolution (`TargetRule::Fixed`), with the fix text `set the target to .claude/settings.json`. The destination is pinned so a module cannot point the sensitive merge at another file.
 
@@ -151,19 +166,25 @@ The resolver applies `policy.defaults` and `policy.extensions` (an overlay can c
 
 The base is the live document. The merge changes only what the module declares.
 
-1. **Managed.** Each key of `managed` is set to the declared value. The whole value of that top-level key is replaced. A declared `false` is an explicit disable and is written as `false`. TOML has no null, so a JSON `null` cannot be declared.
-2. **Seed.** Each key of `seed` is set only when the live file has no such key. A live value, including `false`, is never overwritten. A key in both `managed` and `seed` is managed.
-3. **Handlers.** Each handler is one hook entry `{"hooks":[{"type":"command","command":"<argv>"}]}` added to the array `hooks.<event>`. `argv` is joined into one shell command. A word is single-quoted unless it only holds `A-Za-z0-9_@%+=:,./-`. A word is also quoted when it starts with `=` (zsh expands it) or `%` (a job spec), or looks like `NAME=value` (an environment assignment in command position). A word that starts with `${HOME}` keeps that reference live in double quotes, so a hook finds the home directory on each machine. Only the type `command` is built. Any other type is `E_MANIFEST_INVALID` with fix text, because the manager cannot reverse it safely.
+1. **Managed.** The manager sets each declared leaf and keeps what else the live file holds.
+   - A declared table merges into the live table at any depth. A managed leaf wins. A leaf the manager does not declare stays, so a plugin the user enabled in Claude Code survives.
+   - A declared array or scalar replaces the live value, with one exception: an `append` array (rule 1a).
+   - A declared `false` is an explicit disable and is written as `false`. TOML has no null, so a JSON `null` cannot be declared.
+   - A declared table over a live value that is a scalar or an array is `E_CONFLICT`. The manager does not rewrite a foreign shape. The message names the path and no content. A live `null` counts as absent.
+1a. **Append.** A key listed in `append` keeps the live array. The manager adds each unique declared item that is not already in it, at the end, in declared order. A live value of another shape is `E_CONFLICT`. An absent array is created from the declared items. The manager records the items it added in the ledger (`coowned.appended`, docs/state.md), keyed by the pointer and the SHA-256 of the item. The next merge removes a recorded item that is no longer declared, and a deselect removes all recorded items. An item the user added is never removed. An identical item that was already in the file before the first write stays the user's, except at the approved take-over, as for hook entries (rule 4). A user who deletes a recorded item gets it back. An array that a removal emptied is removed, and so is every parent table the removal emptied.
+2. **Seed.** Each leaf of `seed` is set only where the live file has nothing, at any depth. A live value, including `false`, is never overwritten. A seed table merges into a live table, so `permissions.defaultMode` is set only when the live file has no such key. A key in both `managed` and `seed` is managed, because seeds apply after managed values.
+2a. **Fragments.** The value can declare `fragments_dir` and `pattern`. The files in the directory that match the pattern are JSON objects. They merge over the declared managed values in byte order of their names, before the live merge (rule 1 then applies to the layered result). A later name wins. Tables merge, and arrays and scalars replace, as for `jq` `*` in the nix merge. A fragment cannot set `hooks`: hooks are declared as handlers. A fragment that is not valid JSON, is not an object or sets `hooks` is `E_CONFLICT`. The message names the fragment, the error category, the line and the column, and no content. The operation is blocked, nothing is written and the last good file stays. The nix merge skips a bad fragment instead. The manager blocks, because a skipped fragment would silently change which managed values apply. Fragment content is data: the manager does not order it by priority beyond the name. A fragment is read as the planner and apply read any input (`Dir::read_input`): a regular file of the user with one hard link, within the 16 MiB bound shared with all fragments of the operation.
+3. **Handlers.** Each handler is one hook group `{"hooks":[{"type":"command","command":"<argv>"}]}` added to the array `hooks.<event>`. A handler can set `matcher`, which becomes the `matcher` of the group, and `timeout`, which becomes the `timeout` of the hook. The nix base file puts two commands in one group (`SubagentStop`). Declare two handlers for that: the manager adds two groups, which Claude Code runs the same way. `argv` is joined into one shell command. A word is single-quoted unless it only holds `A-Za-z0-9_@%+=:,./-`. A word is also quoted when it starts with `=` (zsh expands it) or `%` (a job spec), or looks like `NAME=value` (an environment assignment in command position). A word that starts with `${HOME}` keeps that reference live in double quotes, so a hook finds the home directory on each machine. Only the type `command` is built. Any other type is `E_MANIFEST_INVALID` with fix text, because the manager cannot reverse it safely.
 4. **Owned list.** The ledger records, for each handler the manager added, its id, its event and the SHA-256 of the entry it declared (declared content, not live content). The next merge removes an owned entry whose handler is gone or changed, matching by that hash, so a foreign entry is never touched. It adds each declared entry unless an identical one is already in the array. A user who deleted an owned entry gets it back, because the manager owns it. The ledger records ownership only for an entry the manager added, or one it already recorded. An identical entry that was in the file before the manager first wrote stays the user's, so a later `retire` never removes it, with one exception: the approved take-over. The first write into an existing file with no ledger entry needs `--allow-adopt`, and that approval covers every identical entry already in place. They are recorded as owned, because after an interrupted first merge (an `unknown` outcome that an operator closed with `state resolve --as failed`) the manager's own entries sit in the file and nothing tells them from a user's copy. A later `retire` removes them.
 5. **Retire.** When the resource is no longer selected, the manager removes only the owned entries (the plan action `retire`). Managed and seeded values stay, every foreign key and hook stays, and the file is never deleted. An event array or the `hooks` object that the removal emptied is removed. One that was already empty is left alone.
-6. **Foreign shapes.** If `hooks` is not an object, or `hooks.<event>` is not an array, the merge stops with `E_CONFLICT` and fix text. `managed.hooks` and `seed.hooks` are refused: hooks are declared as handlers.
+6. **Foreign shapes.** If `hooks` is not an object, or `hooks.<event>` is not an array, the merge stops with `E_CONFLICT` and fix text. `managed.hooks` and `seed.hooks` are refused: hooks are declared as handlers. Foreign hook groups keep their `matcher` and every handler type (`command`, `prompt`, `agent`, `http`, `mcp_tool`). The manager removes an owned entry by its recorded hash only. The nix merge removes by command marker, so it also sweeps old hooks the manager never added. The manager does not: a hook it did not record is the user's.
 7. **Normalized formatting.** The output is the document re-serialized with sorted keys, a 2-space indent and a final newline. Comments are not part of JSON. Key order, spacing and number spelling are not preserved. Integers that fit 64 bits and finite floats are kept by value. A number outside those ranges is stored as the nearest `f64`. A duplicate key in the live file keeps the last value (the `serde_json` rule).
 8. **Absent and invalid input.** An absent file is `{}`. A file that is not valid JSON, or is JSON but not an object, blocks with `E_CONFLICT` and writes nothing. The message gives the error category, line and column, and no content.
 
 ### Sensitive policy
 
 - The plan, the receipt, the journal, `--json`, the table and `doctor` hold no live content, no hash of the live file and no salted hash.
-- The plan holds, for this operation: the path, the mode (0600), the setting names (`sets`, names only), and `managed_sha256`. That is the SHA-256 of the canonical JSON of the declared `managed` values. The module declares them, so the digest is not secret. It shows a reviewer that the declared set changed. It says nothing about the live file.
+- The plan holds, for this operation: the path, the mode (0600), the setting names (`sets`, names only), the fragments (`fragments`, names, origin and the hash of each fragment file) and `managed_sha256`. That is the SHA-256 of the canonical JSON of the declared `managed` values. The module declares them, so the digest is not secret. It shows a reviewer that the declared set changed. It says nothing about the live file. A setting name is the dotted path from the top of the file to a leaf, such as `env.EXAMPLE_FEATURE_FLAG`. The names include the keys of the fragments. The hash of a fragment file is of a module file or of a file the user wrote to layer settings. It is not the hash of the live settings file, and no hash of the live settings file exists anywhere.
 - `output_sha256` stays unset: a sensitive output has no content hash.
 - `ledger.json` holds a per-machine salted hash of the managed fields as the manager last wrote them (`coowned.managed_hash`), and the owned handler entries. The salt is 32 random bytes in `state/salt` (docs/state.md). No other file holds the salted hash.
 - A parse error, a conflict and a stale-input message never repeat a byte of the live file.
@@ -172,7 +193,7 @@ The base is the live document. The merge changes only what the module declares.
 
 At plan time and again at apply time the manager reads the live file and compares only the managed fields.
 
-1. The live managed view is the canonical JSON of the declared managed keys as the live file holds them. A key that is absent is left out.
+1. The live managed view is the canonical JSON of the declared managed leaves, with the fragments merged in, as the live file holds them at the same paths. A leaf that is absent is left out. A foreign leaf beside a managed one is not part of the view, so a plugin the user enabled or a sandbox path the user added is no edit. The items of an `append` array are not part of the view either: the manager restores a deleted item, as it does for a hook entry. A table that holds none of the declared leaves is left out.
 2. Its salted hash is compared with `coowned.managed_hash` in the ledger.
 3. If the ledger has no entry for this resource and path and the file exists, the first write is a take-over. It is a planned operation that needs `--allow-adopt '<id>'` (next section). An absent file needs no flag.
 4. If the hashes are equal, the manager may write.
@@ -194,8 +215,11 @@ Owner-delegated decision (2026-10-11), recorded in docs/architecture.md section 
 ```
   planned agents.claude-settings@.claude/settings.json [agents] merge into .claude/settings.json (sensitive: destination and mode only): managed values set, seeds only if absent, owned handlers added; foreign keys and hooks stay: 2 setting(s), 1 handler(s); live content is not shown
     managed: sha256:<digest of the declared managed values>
-    sets: model, outputStyle
+    sets: model, outputStyle, sandbox.filesystem.allowWrite
+    fragments: 10-local.json, 20-later.json
 ```
+
+The `fragments:` line appears when the resource declares a fragment directory and it holds fragments. It lists names in merge order. The plan JSON lists each as `{name, origin, sha256}`. `origin` is `foreign` for a file nobody selects and `selected:<resource>` for a file a selected link resource puts there.
 
 `current` means the merged result equals the live bytes and the ledger already records the same salted hash and the same owned entries. A file that is already correct but has no ledger entry is `planned`: apply records ownership and publishes nothing. A deselected resource shows `retire N owned handler(s)`.
 
@@ -269,6 +293,12 @@ The unmodified example profile now plans and applies in an isolated HOME. The te
 | First write into an existing file | `--allow-adopt` (owner-delegated). The contract asks for an interactive confirmation naming the destination. No prompt exists, so the per-operation flag stands in, as for link adoption. |
 | Ledger key for an owned entry | `coowned.entries[{id, key, sha256}]`. `key` is the list the entry sits in (the hook event). The name is generic so another co-owned list can use it. |
 | Deleted file with a ledger entry | Planned as a create from `{}`. The foreign-edit comparison is skipped because no file exists. |
+| Where does `append` live? | In the resource value, beside `managed`. The resolver refuses any key of `[resources.policy]` other than `defaults` and `extensions`, and a policy is authority over overrides, not adapter input. |
+| Which fragments does a merge layer? | The planner's set (docs/planner.md): files in `fragments_dir` that match `pattern` and that nobody removes, plus the source files of selected link resources. A fragment from a `render`, `assemble` or `merge` resource is `E_GENERATOR_UNAVAILABLE`. |
+| Plan-time and apply-time fragments | Plan time reads them in `merge_facts`, as apply does: below HOME without following a link, regular, one hard link. Apply reads the planned list again and compares each foreign fragment with its recorded hash (`E_PLAN_STALE` on a difference). A matching name in the directory that the plan did not list is `E_PLAN_STALE`. |
+| Live table versus declared table of another shape | `E_CONFLICT`, as for `hooks`. The nix merge replaces it for most keys and fails for `sandbox.filesystem`. A refusal never loses user data. |
+| Seed under a managed table | Applies after managed values, so a seed leaf fills a gap in a table the manager also sets. |
+| A managed array without `append` | Replaces the live array, like `jq` `*`. A user item in such an array is lost. List the pointer in `append` to keep it. |
 | Doctor for a merge output | Row `N/A` (`D_NA_SENSITIVE`) while healthy. A foreign edit or a malformed file is the plan's `E_CONFLICT`, shown as `ERROR` (docs/doctor.md). |
 
 ## Not built
@@ -278,6 +308,11 @@ The unmodified example profile now plans and applies in an isolated HOME. The te
 - **Lossless numbers.** An integer beyond 64 bits in a foreign key becomes an `f64`. Recorded, not fixed.
 - **Forged ledger.** The ledger is not authenticated. A same-user edit of `coowned.entries` can make `retire` remove a hook entry whose hash it names. This is the same limit as for removals (docs/apply.md, "Forged ledger").
 - **Hand edit on the first merge.** A hand edit of a managed field is overwritten by the first write into an existing file. The `--allow-adopt` flag and the plan text say so before it happens.
+- **Nix capability variants.** The nix merge builds `enabledPlugins` and `SessionStart` hooks from the capability set of the host. The manager has no capability input for a merge. Express a variant as an overlay or a second module selected by the profile.
+- **Sweeping by command marker.** The nix merge also removes hooks it never added if the command contains a marker (retired tools). The manager removes only entries its ledger records. A retired hook from before the first manager write stays until the user removes it.
+- **Key order.** The nix merge keeps the live key order. The manager writes sorted keys (rule 7).
+- **Removal of an emptied parent table you declared.** A managed table that the manager declares stays even if every declared leaf is later dropped: only `append` removals prune the tables they empty.
+- **Fragments from generated producers.** See the decisions table.
 - **Capture** (adopting a live file into the sources). The merge never writes the sources.
 - **Native-setting probes** (DFM-20.C03). Nothing runs `git config --list` or similar. The manager does not report whether a protected setting survives every fragment. That stays the open item that docs/resolver.md names.
 - **SSH and shell assemblies.** Only the two fixtures' adapters exist. A tmux, SSH or shell assembly with its own ordering rule needs its own adapter (code), or can use `text-fragments/v1` when "body plus sorted fragments" is the rule.
