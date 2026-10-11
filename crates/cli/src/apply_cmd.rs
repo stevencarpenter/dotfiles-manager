@@ -212,8 +212,6 @@ fn run_inner(
             r
         }
     };
-    // Handlers go in after the lock and before the first mutation (settling writes the journal).
-    dfm_engine::signal::install()?;
     if !store.is_initialized() {
         return Err(stamped(&store, crate::state_lost_refusal()));
     }
@@ -237,6 +235,11 @@ fn run_inner(
         allow_adopt: &args.allow_adopt,
         fail: &fail,
     };
+    // Handlers go in after the lock and the second plan, and before the first mutation (settling
+    // writes the journal). The second plan ran `id -u`, so no child process starts after this.
+    dfm_engine::signal::install().map_err(|r| stamped(&store, r))?;
+    fail.hit("apply-after-install")
+        .map_err(|r| stamped(&store, r))?;
     let started = now_unix().map_err(|r| stamped(&store, r))?;
     let report = apply(&run, &locked).map_err(|r| stamped(&store, r))?;
     let finished = now_unix().unwrap_or(started);
@@ -245,8 +248,10 @@ fn run_inner(
     let n = |s: Status| counts.get(&s).copied().unwrap_or(0);
     let mutated = store.mutated();
     // One exit, derived from the first problem, is both printed and returned.
-    let stopped = report
-        .stopped
+    let is_signal = |r: &Refusal| matches!(r.code, Code::Interrupted | Code::Terminated);
+    // A signal that came during the run wins over any other stop (section 10 precedence).
+    let mut stopped = dfm_engine::signal::requested()
+        .or(report.stopped)
         .map(|r| if mutated { r.after_mutation() } else { r });
     let mut exit = stopped.as_ref().map_or(Exit::Ok, Refusal::exit);
 
@@ -324,11 +329,23 @@ fn run_inner(
         match store.write_receipt(&receipt) {
             Ok(name) => receipt_name = Some(name),
             Err(e) => {
-                // The journal and the ledger stay the record. The run is a failure.
-                exit = Exit::Failed;
+                // The journal and the ledger stay the record. The run is a failure, unless a
+                // signal already decided the exit.
+                exit = exit.combine(Exit::Failed);
                 receipt_error = Some(e.after_mutation());
             }
         }
+    }
+
+    // A signal that arrived while the receipt was written is not in the receipt. It still decides
+    // the exit, and the report says so.
+    let mut late = None;
+    if !stopped.as_ref().is_some_and(is_signal)
+        && let Some(r) = dfm_engine::signal::requested()
+    {
+        exit = exit.combine(r.exit());
+        late = Some(r.code.as_str());
+        stopped = Some(if mutated { r.after_mutation() } else { r });
     }
 
     for (op, rec) in locked.operations.iter().zip(&report.operations) {
@@ -374,9 +391,18 @@ fn run_inner(
     if let Some(e) = &receipt_error {
         writeln!(out, "receipt: not written ({})", visible(&e.to_string())).map_err(w)?;
     }
+    if let Some(c) = late {
+        writeln!(
+            out,
+            "signal: {c} arrived after the receipt content was fixed, so the receipt does not record it"
+        )
+        .map_err(w)?;
+    }
     writeln!(out, "result: {}", exit.name()).map_err(w)?;
     progress.result_printed = true;
     match (receipt_error, stopped) {
+        // A signal decides the exit also when the receipt could not be written.
+        (_, Some(r)) if is_signal(&r) => Err(r),
         (Some(e), _) => Err(e),
         (None, Some(r)) => Err(r),
         (None, None) => Ok(()),

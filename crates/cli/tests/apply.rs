@@ -1923,3 +1923,130 @@ fn the_first_signal_keeps_its_code_when_another_kind_follows() {
     assert_eq!(code(&o), 143, "{}\n{}", stderr(&o), text(&o.stdout));
     assert_eq!(fx.receipts()[0]["result"]["outcome"], "terminated");
 }
+
+/// A fixture whose three operations are all creations in existing parents.
+fn signal_fixture() -> Fx {
+    let fx = Fx::new();
+    fx.without_zsh();
+    for d in [".config/git", ".config/tmux", ".ssh"] {
+        fs::create_dir_all(fx.h(d)).unwrap();
+    }
+    fx
+}
+
+fn journal_phases(fx: &Fx) -> Vec<String> {
+    fs::read_to_string(fx.state().join("journal.jsonl"))
+        .unwrap_or_default()
+        .lines()
+        .map(|l| {
+            let v: serde_json::Value = serde_json::from_str(l).unwrap();
+            v["phase"].as_str().unwrap().to_string()
+        })
+        .collect()
+}
+
+#[test]
+fn a_signal_before_the_first_check_changes_nothing_writes_no_receipt_and_exits_130() {
+    let fx = signal_fixture();
+    let o = parked_apply_pid(&fx, "apply-after-install", &[], |_, pid| send("-INT", pid));
+    let out = text(&o.stdout);
+    assert_eq!(code(&o), 130, "{}\n{out}", stderr(&o));
+    assert!(out.contains("result: interrupted"), "{out}");
+    assert!(
+        out.contains("counts: updated=0 current=0 failed=0 blocked=0 unknown=0 not_started=3"),
+        "{out}"
+    );
+    assert!(journal_phases(&fx).is_empty());
+    assert!(fx.receipts().is_empty());
+    assert!(fx.owned_paths().is_empty());
+    assert!(!fx.h(".config/git/config").exists());
+}
+
+#[test]
+fn a_signal_during_a_removal_lets_it_finish_and_leaves_the_other_removal_alone() {
+    let fx = Fx::new();
+    assert_eq!(code(&fx.apply(&[])), 0);
+    fx.set_profile("");
+    let removals: Vec<String> = fx
+        .saved()
+        .plan
+        .operations
+        .iter()
+        .filter(|o| o.id.starts_with("remove@"))
+        .map(|o| o.id.clone())
+        .collect();
+    assert_eq!(removals.len(), 2, "{removals:?}");
+    let mut extra = Vec::new();
+    for r in &removals {
+        extra.push("--allow-disruptive");
+        extra.push(r.as_str());
+    }
+    let before = fx.journal().len();
+    let o = parked_apply_pid(&fx, "apply-before-unlink", &extra, |_, pid| {
+        send("-TERM", pid)
+    });
+    let out = text(&o.stdout);
+    assert_eq!(code(&o), 143, "{}\n{out}", stderr(&o));
+    assert!(out.contains("result: terminated"), "{out}");
+    // Exactly one removal ran: its intent and done entries, and one ledger entry is gone.
+    assert_eq!(journal_phases(&fx).len() - before, 2, "{:#?}", fx.journal());
+    assert_eq!(fx.owned_paths().len(), 3);
+    let receipts = fx.receipts();
+    let counts = &receipts.last().unwrap()["result"]["counts"];
+    assert_eq!(counts["updated"], 1);
+    assert_eq!(counts["not_started"], 1);
+}
+
+#[test]
+fn a_signal_after_an_earlier_failure_still_exits_130_and_the_receipt_lists_the_failure() {
+    let fx = signal_fixture();
+    let o = parked_apply_pid(&fx, "apply-before-effect", &[], |fx, pid| {
+        fs::write(fx.h(".config/git/config"), "foreign\n").unwrap();
+        send("-INT", pid);
+    });
+    let out = text(&o.stdout);
+    assert_eq!(code(&o), 130, "{}\n{out}", stderr(&o));
+    assert!(out.contains("failed core.git@.config/git/config"), "{out}");
+    assert!(out.contains("result: interrupted"), "{out}");
+    let rs = fx.receipts();
+    assert_eq!(rs[0]["result"]["outcome"], "interrupted");
+    assert_eq!(rs[0]["result"]["counts"]["failed"], 1);
+    assert_eq!(rs[0]["result"]["counts"]["not_started"], 2);
+}
+
+#[test]
+fn a_signal_during_the_receipt_write_still_decides_the_exit() {
+    for point in [
+        "receipt-before-write",
+        "receipt-after-tmp",
+        "receipt-after-rename",
+    ] {
+        let fx = signal_fixture();
+        let o = parked_apply_pid(&fx, point, &[], |_, pid| send("-INT", pid));
+        let out = text(&o.stdout);
+        assert_eq!(code(&o), 130, "{point}: {}\n{out}", stderr(&o));
+        assert!(out.contains("result: interrupted"), "{point}: {out}");
+        assert!(
+            out.contains("signal: E_INTERRUPTED arrived after"),
+            "{point}: {out}"
+        );
+        // The receipt was written before the signal could be added to it, and says so.
+        assert_eq!(fx.receipts()[0]["result"]["outcome"], "ok", "{point}");
+    }
+}
+
+#[test]
+fn a_signal_wins_the_exit_when_the_receipt_cannot_be_written() {
+    let fx = signal_fixture();
+    let receipts = fx.state().join("receipts");
+    let o = parked_apply_pid(&fx, "apply-before-effect", &[], |_, pid| {
+        fs::set_permissions(&receipts, fs::Permissions::from_mode(0o500)).unwrap();
+        send("-INT", pid);
+    });
+    fs::set_permissions(&receipts, fs::Permissions::from_mode(0o700)).unwrap();
+    let out = text(&o.stdout);
+    assert_eq!(code(&o), 130, "{}\n{out}", stderr(&o));
+    assert!(out.contains("receipt: not written"), "{out}");
+    assert!(out.contains("result: interrupted"), "{out}");
+    assert!(fx.receipts().is_empty());
+}

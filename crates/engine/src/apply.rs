@@ -1597,7 +1597,10 @@ fn execute(run: &Run<'_>, plan: &Plan) -> Report {
         clock: Cell::new(*clock.as_ref().unwrap_or(&0)),
     };
     // A failure to settle earlier work stops the run before its first operation.
-    let mut stopped: Option<Refusal> = clock.err().or_else(|| settle(&mut ex).err());
+    // A signal that came before settling wins, and settling (a journal write) is skipped.
+    let mut stopped: Option<Refusal> = crate::signal::requested()
+        .or(clock.err())
+        .or_else(|| settle(&mut ex).err());
     let mut results: BTreeMap<&str, Status> = BTreeMap::new();
     let mut records = Vec::new();
     for op in &plan.operations {

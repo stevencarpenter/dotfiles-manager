@@ -311,8 +311,64 @@ fn has_keyword(code: &str, word: &str) -> bool {
     })
 }
 
-/// DFM-47: the signal module is the one place with `unsafe` code. Every crate root forbids it,
-/// except the engine's, which denies it and lets that one module allow it.
+/// DFM-47: the lint attribute layer. Text that names the lint may appear only in the crate roots
+/// and in the signal module, and the exception is one `expect` on `install`. This reads raw
+/// text, so a comment, a raw string or a character literal cannot hide an attribute.
+#[test]
+fn the_unsafe_lint_is_named_only_in_the_crate_roots_and_on_the_signal_install_function() {
+    let lint = ["un", "safe_code"].concat();
+    let roots = [
+        "crates/model/src/lib.rs",
+        "crates/platform_macos/src/lib.rs",
+        "crates/cli/src/lib.rs",
+        "crates/cli/src/main.rs",
+    ];
+    let mut files = Vec::new();
+    rs_files(&repo_root().join("crates"), &mut files);
+    for f in &files {
+        let rel = f.strip_prefix(repo_root()).unwrap().display().to_string();
+        let t = fs::read_to_string(f).unwrap();
+        let named = t.contains(&lint);
+        let allowed = roots.contains(&rel.as_str())
+            || rel == "crates/engine/src/lib.rs"
+            || rel == "crates/engine/src/signal.rs";
+        assert!(!named || allowed, "{rel} names {lint}");
+    }
+    let forbid = format!("#![forbid({lint})]");
+    for root in roots {
+        let t = fs::read_to_string(repo_root().join(root)).unwrap();
+        assert_eq!(t.matches(&lint).count(), 1, "{root}");
+        assert!(t.contains(&forbid), "{root} lacks {forbid}");
+    }
+    let engine = fs::read_to_string(repo_root().join("crates/engine/src/lib.rs")).unwrap();
+    assert_eq!(engine.matches(&lint).count(), 1);
+    assert!(engine.contains(&format!("#![deny({lint})]")));
+    // The signal module: one `expect`, directly on `pub fn install`, and no `allow`.
+    let module = fs::read_to_string(repo_root().join("crates/engine/src/signal.rs")).unwrap();
+    let flat: String = module.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert_eq!(module.matches(&lint).count(), 1, "{module}");
+    assert!(
+        flat.contains(&format!("#[expect( {lint}, reason = "))
+            || flat.contains(&format!("#[expect({lint}, reason = ")),
+        "signal.rs lacks the expect attribute"
+    );
+    let at = flat.find(&format!("{lint},")).unwrap();
+    let after = &flat[at..];
+    let end = after.find("pub fn ").unwrap();
+    assert!(
+        after[end..].starts_with("pub fn install()"),
+        "the expect is not on install"
+    );
+    assert!(
+        !after[..end].contains("fn "),
+        "the expect is not on install"
+    );
+    let manifest = fs::read_to_string(repo_root().join("Cargo.toml")).unwrap();
+    assert!(manifest.contains(&format!("{lint} = \"deny\"")));
+}
+
+/// DFM-47: the keyword layer, a second check behind the lint layer. Comments and string literals
+/// are stripped by a crude scan.
 #[test]
 fn the_unsafe_keyword_appears_only_in_the_engine_signal_module() {
     let word = ["un", "safe"].concat();
@@ -325,21 +381,8 @@ fn the_unsafe_keyword_appears_only_in_the_engine_signal_module() {
         }
     }
     assert_eq!(seen, ["crates/engine/src/signal.rs"], "{seen:?}");
-    let forbid = format!("#![forbid({word}_code)]");
-    for root in [
-        "crates/model/src/lib.rs",
-        "crates/platform_macos/src/lib.rs",
-        "crates/cli/src/lib.rs",
-        "crates/cli/src/main.rs",
-    ] {
-        let t = fs::read_to_string(repo_root().join(root)).unwrap();
-        assert!(t.contains(&forbid), "{root} lacks {forbid}");
-    }
-    let engine = fs::read_to_string(repo_root().join("crates/engine/src/lib.rs")).unwrap();
-    assert!(engine.contains(&format!("#![deny({word}_code)]")));
-    let module = fs::read_to_string(repo_root().join("crates/engine/src/signal.rs")).unwrap();
-    assert!(module.contains(&format!("#![allow({word}_code)]")));
     // Every block carries its safety argument.
+    let module = fs::read_to_string(repo_root().join("crates/engine/src/signal.rs")).unwrap();
     let blocks = module.matches(&format!("{word} {{")).count();
     assert!(blocks > 0 && module.matches("// SAFETY:").count() >= blocks);
 }
@@ -362,6 +405,8 @@ fn only_the_mutating_path_of_apply_installs_the_signal_handlers() {
     assert_eq!(t.matches("signal::install(").count(), 1);
     assert!(t.find("if args.preview {").unwrap() < install);
     assert!(t.find("Store::open_write_with(").unwrap() < install);
+    // After the second plan (which runs `id -u`), so no child process starts after the install.
+    assert!(t.find("let locked = plan_for(").unwrap() < install);
     assert!(install < t.find("apply(&run, &locked)").unwrap());
 }
 

@@ -233,17 +233,22 @@ Publishing a file does not reload the program that reads it (architecture sectio
 
 ## Signals
 
-`apply` (not `--preview`) handles SIGINT and SIGTERM. It installs the handlers after it takes the writer lock and before it settles earlier work, so before the first mutation. The handler stores the number of the first signal in an atomic and does nothing else. The signal is not an error of the operation. The executor looks at the record before it writes each `intent` entry:
+`apply` (not `--preview`) handles SIGINT and SIGTERM. It installs the handlers after it takes the writer lock and plans again under the lock, and before it settles earlier work. The lock file can exist before the handlers do. No journal, ledger or HOME write happens in that window, and a signal in it ends the process with the default action. The handler stores the number of the first signal in an atomic and does nothing else. The executor looks at the record before it settles and before it writes each `intent` entry:
 
 - The operation in flight finishes: its effect, read-back, outcome entry and ledger write. A staged file is never left half written.
 - No new `intent` entry is written. Every operation that has not started is `not_started`. An operation that needs nothing (`current`, `not_in_scope`) is reported as it is.
-- The receipt has outcome `interrupted` (SIGINT, exit 130) or `terminated` (SIGTERM, exit 143), as for any other run that changed something. A run that changed nothing writes no receipt.
+- The receipt has outcome `interrupted` (SIGINT, exit 130) or `terminated` (SIGTERM, exit 143), as for any other run that changed something. A run that changed nothing writes no receipt, and a signal before the first mutation exits 130 or 143 without one.
 - The report prints, then the last line is `result: interrupted` or `result: terminated`. The process returns the code. The handler never exits the process.
 - A signal has precedence over a failure in the exit code. The operations still show what failed.
-- A second signal, of either kind, changes nothing. The first signal keeps its code and the receipt is still written. A signal that arrives after the last operation also decides the exit.
+- If the receipt cannot be written, the report says `receipt: not written (...)` and the exit is still 130 or 143.
+- A second signal, of either kind, does nothing. The first signal keeps its code and the receipt is still written. SIGKILL is the only forced stop.
+- A signal that arrives while the receipt is written cannot be in that receipt. The exit is still 130 or 143, the report adds a `signal:` line, and the receipt keeps the outcome it had.
+- If the parent set a signal to ignore (`nohup`, a background job), the handler for that signal is not installed and it stays ignored.
 - `plan`, `doctor`, `explain`, `state` and `apply --preview` install no handler, so a signal ends them as before: the kernel kills the process and no receipt exists.
 
-The handlers are installed without `SA_RESTART`, so a blocking call of the main thread returns `EINTR` and the executor sees the record at the next check. SIGKILL cannot be caught. It leaves the `intent` entry, and the next run settles it ("Interrupted runs").
+The handlers are installed with `SA_RESTART`. A blocking call restarts, and the executor sees the record at the next check, so a file system call never reports a spurious `EINTR` as a failed operation. No child process runs after the handlers are installed. Add the 30 s wait and process-group escalation of the target contract (docs/architecture.md section 10) with the first operation that starts a child process.
+
+SIGKILL cannot be caught. It leaves the `intent` entry, and the next run settles it ("Interrupted runs").
 
 ## Known limits
 
