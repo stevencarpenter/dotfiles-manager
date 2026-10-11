@@ -306,10 +306,10 @@ fn journal_rows(store: &Store, rows: &mut Vec<Row>) {
     for u in unresolved(&entries) {
         let id = &u.unknown.op_id;
         let subject = u.paths().next().unwrap_or(&u.unknown.op);
-        let blocks = if u.intent.is_some() {
+        let blocks = if u.paths().next().is_some() {
             "blocks this path in every run"
         } else {
-            "has no intent record, so it blocks every operation of its resource (only `--as failed` clears it)"
+            "has no intent record with a path, so it blocks every operation of its resource (only `--as failed` clears it)"
         };
         rows.push(Row::new(
             "intent",

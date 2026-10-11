@@ -91,7 +91,9 @@ pub struct Open {
     pub resource: String,
     /// The paths the intent recorded. Empty when the journal has no intent entry.
     pub paths: Vec<String>,
-    pub has_intent: bool,
+    /// Whether the intent recorded at least one path. An intent with an empty list is treated
+    /// like a missing intent: nothing can be probed or blocked by path.
+    pub has_paths: bool,
 }
 
 /// What settling did.
@@ -159,6 +161,13 @@ pub(crate) fn settle_all(
                 )?;
                 out.closed.push((e.op_id.clone(), Phase::Done));
             }
+            Some((Probe::Unknown, Some(live))) if marked(e) && live_mismatch(&live, u.intent) => {
+                // The executor had seen the effect when it wrote the entry. A readable file or
+                // link that differs now is not that effect, and a later match must not be
+                // owned: close it.
+                close_failed(store, &u, "recovered: not done; a later match is not owned")?;
+                out.closed.push((e.op_id.clone(), Phase::Failed));
+            }
             Some((Probe::NotDone, _)) => {
                 close_failed(store, &u, "recovered: not done")?;
                 out.closed.push((e.op_id.clone(), Phase::Failed));
@@ -168,11 +177,29 @@ pub(crate) fn settle_all(
                 op: e.op.clone(),
                 resource: e.resource.clone(),
                 paths: u.paths().map(str::to_string).collect(),
-                has_intent: u.intent.is_some(),
+                has_paths: u.paths().next().is_some(),
             }),
         }
     }
     Ok(out)
+}
+
+fn marked(e: &JournalEntry) -> bool {
+    e.reason
+        .as_deref()
+        .is_some_and(|r| r.starts_with(UNCONFIRMED))
+}
+
+/// A readable file or link whose fingerprint differs from the one the intent expected.
+fn live_mismatch(live: &Live, intent: Option<&JournalEntry>) -> bool {
+    let want = intent
+        .and_then(|i| i.recovery.as_ref())
+        .and_then(|r| r.outputs.first())
+        .and_then(|o| o.expected_sha256.as_deref());
+    matches!(live.peek, Peek::File { .. } | Peek::Link { .. })
+        && want.is_some()
+        && live.fingerprint.is_some()
+        && live.fingerprint.as_deref() != want
 }
 
 /// Settle-only entry point (`state recover`). With no plan, automatic ownership needs the
@@ -233,11 +260,7 @@ pub(crate) fn close_done(
     match own {
         Own::Operator => {}
         Own::Auto(known) => {
-            let seen = e
-                .reason
-                .as_deref()
-                .is_some_and(|r| r.starts_with(UNCONFIRMED));
-            if !seen || !known(&e.resource, &out.path) {
+            if !marked(e) || !known(&e.resource, &out.path) {
                 return Ok(());
             }
         }

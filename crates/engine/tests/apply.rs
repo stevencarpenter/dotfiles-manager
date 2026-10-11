@@ -1902,7 +1902,14 @@ fn a_file_edited_after_an_unknown_publish_is_not_claimed() {
     let rep = go(&s, &plan(vec![g]), &gens(), &none());
     // The edited file does not match the expectation: the probe cannot decide and nothing is
     // recorded as owned.
-    assert_eq!(last_of(&s, &jid(1)).phase, Phase::Unknown);
+    // The effect was seen when the entry was written, and the file differs now: closed as
+    // failed, so a later hand-made match is never owned.
+    let last = last_of(&s, &jid(1));
+    assert_eq!(last.phase, Phase::Failed);
+    assert_eq!(
+        last.reason.as_deref(),
+        Some("recovered: not done; a later match is not owned")
+    );
     assert!(owned_paths(&s).iter().all(|(p, _)| !p.ends_with("/f")));
     assert_eq!(rep.operations[0].status, Status::Updated);
 }
@@ -2047,7 +2054,7 @@ fn an_unknown_with_no_intent_blocks_its_whole_resource_until_resolved_failed() {
     // Settling cannot decide it, and `done` is refused.
     let st = recover_now(&s);
     assert_eq!(st.open.len(), 1);
-    assert!(!st.open[0].has_intent);
+    assert!(!st.open[0].has_paths);
     let home = Dir::open_home(&sys(&s.h), &s.h.0).unwrap();
     let sy = sys(&s.h);
     let w = (&sy, &home, s.h.0.as_path());
@@ -2248,4 +2255,46 @@ fn an_adoption_goes_stale_when_the_ledger_changed_to_another_fingerprint_or_reso
         );
         assert_eq!(rep.stopped.unwrap().code, Code::PlanStale);
     }
+}
+
+#[test]
+fn an_intent_with_no_recorded_path_blocks_its_whole_resource() {
+    use dfm_model::state::Recovery;
+    let s = setup();
+    let entry = |phase, recovery| JournalEntry {
+        schema: 1,
+        op_id: "empty-1".into(),
+        op: "create-link".into(),
+        phase,
+        at: "2026-10-10T00:00:00Z".into(),
+        resource: "core.x".into(),
+        adapter: "git-config/v1".into(),
+        class: Class::Normal,
+        recovery,
+        token: None,
+        reason: (phase == Phase::Unknown).then(|| "unconfirmed: x".to_string()),
+    };
+    s.store
+        .append_journal(&entry(
+            Phase::Intent,
+            Some(Recovery {
+                outputs: vec![],
+                snapshot: None,
+            }),
+        ))
+        .unwrap();
+    s.store
+        .append_journal(&entry(Phase::Unknown, None))
+        .unwrap();
+    let g = op(&s.h, &s.store, "x@file", 7, Action::CreateFile, "g");
+    let rep = go(&s, &plan(vec![g]), &gens(), &none());
+    assert_eq!(rep.operations[0].status, Status::Blocked);
+    let r = rep.stopped.unwrap();
+    assert_eq!(r.code, Code::OpInterrupted);
+    assert!(
+        r.detail.contains("empty-1") && r.detail.contains("--as failed"),
+        "{}",
+        r.detail
+    );
+    assert!(!recover_now(&s).open[0].has_paths);
 }

@@ -1472,7 +1472,7 @@ fn settle(ex: &mut Exec<'_, '_>) -> Result<(), Refusal> {
         recover::settle_all(ex.run.store, w, &planned)?
     };
     for o in settled.open {
-        if o.has_intent {
+        if o.has_paths {
             for p in o.paths {
                 ex.unknown_paths.insert(p, o.id.clone());
             }

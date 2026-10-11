@@ -2348,6 +2348,18 @@ fn state_recover_fixes_the_ledger_after_an_unknown_replace_link() {
         fp_of(&fx),
         dfm_model::plan::link_fingerprint(old.to_str().unwrap()).as_str()
     );
+    let o = fx.run(&["plan", "--root", fx.root_arg()]);
+    let plan_text = text(&o.stdout);
+    assert!(
+        plan_text
+            .lines()
+            .any(|l| l.contains("current extra.zsh@.zshrc") && l.contains("already holds")),
+        "{plan_text}"
+    );
+    // The stale fingerprint also stops a removal: deselecting the module is refused.
+    fx.set_profile("");
+    assert_eq!(code(&fx.apply(&[])), 3);
+    fx.set_profile("\"extra\"");
     // No flag and no plan are needed to clear it.
     let o = fx.run(&["state", "recover"]);
     assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
@@ -2358,6 +2370,59 @@ fn state_recover_fixes_the_ledger_after_an_unknown_replace_link() {
     assert_eq!(fp, want.as_str());
     let o = fx.apply(&[]);
     assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+    // The new fingerprint authorizes the removal that the old one blocked.
+    fx.set_profile("");
+    let ids: Vec<String> = fx
+        .saved()
+        .plan
+        .operations
+        .iter()
+        .filter(|o| o.action == dfm_model::plan::Action::Remove)
+        .map(|o| o.id.clone())
+        .collect();
+    assert!(ids.iter().any(|i| i.ends_with("@.zshrc")), "{ids:?}");
+    let args: Vec<&str> = ids
+        .iter()
+        .flat_map(|i| ["--allow-disruptive", i.as_str()])
+        .collect();
+    let o = fx.apply(&args);
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+    assert!(fx.h(".zshrc").symlink_metadata().is_err());
+}
+
+#[test]
+fn a_mismatch_at_the_first_settle_closes_the_entry_so_a_later_match_is_never_owned() {
+    let (fx, id, path) = after_unknown_link();
+    let target = fs::read_link(&path).unwrap();
+    fs::remove_file(&path).unwrap();
+    symlink("/elsewhere", &path).unwrap();
+    let o = fx.run(&["state", "recover"]);
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+    assert!(text(&o.stdout).contains(&format!("settled {id} as failed")));
+    let j = fx.journal();
+    assert_eq!(
+        j.last().unwrap()["reason"],
+        "recovered: not done; a later match is not owned"
+    );
+    // Put the exact link back by hand. The entry is closed, so nothing owns the link.
+    fs::remove_file(&path).unwrap();
+    symlink(&target, &path).unwrap();
+    let o = fx.run(&["state", "recover"]);
+    assert_eq!(code(&o), 0);
+    assert!(
+        text(&o.stdout).contains("nothing to recover"),
+        "{}",
+        text(&o.stdout)
+    );
+    assert!(fx.owned_paths().is_empty());
+    // The plan offers the adoption, which needs its approval.
+    let ids = fx.adopt_ids();
+    assert_eq!(ids.len(), 1, "{ids:?}");
+    let o = fx.apply(&[]);
+    assert_eq!(code(&o), 3, "{}", stderr(&o));
+    assert!(stderr(&o).contains("E_ADOPT_UNAPPROVED"), "{}", stderr(&o));
+    assert_eq!(code(&fx.apply(&adopt_args(&ids))), 0);
+    assert_eq!(fx.owned_paths().len(), 4);
 }
 
 #[test]
