@@ -2063,18 +2063,68 @@ fn a_fragment_whose_removal_is_blocked_blocks_the_merge_as_stale() {
 }
 
 #[test]
-fn a_first_apply_without_a_salt_merges_the_fragments_it_reads() {
-    // state/salt does not exist before the first merge, so the plan has no content token yet.
-    // Apply still reads each fragment under the lock and merges what is there.
+fn bind_creates_the_salt_and_a_content_token_is_stable_from_plan_to_apply() {
+    let fx = Fx::base();
+    let salt = fx.state().join("salt");
+    assert_eq!(fs::read(&salt).unwrap().len(), 32, "bind created the salt");
+    assert_eq!(
+        fs::metadata(&salt).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    fx.fragment("10-a.json", r#"{"fragmentKey":1}"#);
+    // The same fragments give the same plan, and apply accepts it.
+    let (a, b) = (fx.saved().plan_digest, fx.saved().plan_digest);
+    assert_eq!(a, b);
+    let o = fx.apply_with(&a);
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+    // A changed fragment changes the plan, even on the first apply.
     let fx = Fx::base();
     fx.fragment("10-a.json", r#"{"fragmentKey":1}"#);
     let d = fx.saved().plan_digest;
     fx.fragment("10-a.json", r#"{"fragmentKey":2}"#);
     let o = fx.apply_with(&d);
-    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
-    assert_eq!(fx.live_json()["fragmentKey"], 2);
+    assert_eq!(code(&o), 3, "{}\n{}", stderr(&o), text(&o.stdout));
+    assert!(stderr(&o).contains("E_PLAN_STALE"), "{}", stderr(&o));
+    assert!(!fx.settings().exists());
 }
 
+#[test]
+fn a_store_without_a_salt_blocks_a_merge_that_has_fragments_until_bind_creates_it() {
+    // A store made by an older build has no salt before its first merge.
+    let fx = Fx::base();
+    let salt = fx.state().join("salt");
+    fs::remove_file(&salt).unwrap();
+    // Without fragments the plan is fine, and the first merge creates the salt as before.
+    assert_eq!(code(&fx.plan()), 0);
+    fx.fragment("10-a.json", r#"{"fragmentKey":1}"#);
+    let o = fx.plan();
+    let all = format!("{}{}", text(&o.stdout), stderr(&o));
+    assert_eq!(code(&o), 3, "{all}");
+    assert!(
+        all.contains("E_STATE_INVALID") && all.contains("bind"),
+        "{all}"
+    );
+    assert!(!salt.exists(), "plan creates nothing");
+    // Bind again: it is idempotent, changes nothing else and creates the salt.
+    let p = fx.root.join("profiles/t-01.toml");
+    let o = fx.run(&[
+        "bind",
+        "--profile",
+        p.to_str().unwrap(),
+        "--machine-id",
+        "m5-test",
+    ]);
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+    assert_eq!(fs::read(&salt).unwrap().len(), 32);
+    assert_eq!(
+        fs::metadata(&salt).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    let first = fs::read(&salt).unwrap();
+    assert_eq!(code(&fx.apply()), 0);
+    assert_eq!(fs::read(&salt).unwrap(), first, "the salt is created once");
+    assert_eq!(fx.live_json()["fragmentKey"], 1);
+}
 #[test]
 fn the_hook_identity_follows_the_shell_for_home_spellings() {
     // The declared hook is "${HOME}/.claude/hooks/wt-create.sh". These live spellings run the

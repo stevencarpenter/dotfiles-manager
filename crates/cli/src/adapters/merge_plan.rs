@@ -262,6 +262,19 @@ pub fn merge_facts(
                 verdict_for(&r.id, claim, &desired, store, sys, home, home_path)
             }
         };
+        // Fragments are tracked by a salted content token, so the salt must exist. `bind` creates
+        // it (and creates a missing one for a store made by an older build).
+        let verdict = match (&read, store.salt()) {
+            (Ok(f), Ok(None))
+                if !f.is_empty() && !matches!(verdict, MergeVerdict::Blocked { .. }) =>
+            {
+                blocked(
+                    Code::StateInvalid,
+                    "state/salt does not exist, so the content of the fragments cannot be tracked. Fix: run bind again with the same profile and machine id; it creates the missing salt and changes nothing else",
+                )
+            }
+            _ => verdict,
+        };
         let shown = layered.as_ref().unwrap_or(&declared);
         out.insert(
             r.id.clone(),

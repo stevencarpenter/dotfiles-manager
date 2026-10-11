@@ -498,17 +498,20 @@ fn bind(ctx: &Ctx, profile: String, machine_id: String) -> Result<String, Refusa
     {
         return Err(rebind_refusal(h));
     }
+    let mut missing_salt = false;
     let owned = match Store::open_read(sys, &layout, Fail::none())? {
         Some(s) => {
             let doc = s.read_state()?;
             if !doc.binding.same_identity(&stamp) {
                 return Err(state_owner_refusal(&doc.binding));
             }
+            // A store made before the salt was created at init gets it now (docs/state.md).
+            missing_salt = matches!(s.salt(), Ok(None));
             true
         }
         None => false,
     };
-    if have.is_some() {
+    if have.is_some() && !(owned && missing_salt) {
         return if owned {
             Ok("already bound".into())
         } else {
@@ -549,6 +552,9 @@ fn bind(ctx: &Ctx, profile: String, machine_id: String) -> Result<String, Refusa
         store.init(&stamp)?;
     }
     let after = |r: Refusal| stamped(&store, r);
+    if matches!(store.salt(), Ok(None)) {
+        store.salt_or_create().map_err(after)?;
+    }
     if have.is_some() {
         return Ok("already bound".into());
     }
