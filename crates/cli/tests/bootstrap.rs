@@ -1318,3 +1318,312 @@ fn uninstall_removes_only_what_the_manager_created() {
         "a link that is not ours must stay"
     );
 }
+
+/// A tiny committed source with a lock the caller writes, for the early pin reading.
+fn source_with_lock(tmp: &Path, lock: &str) -> (PathBuf, String) {
+    let src = tmp.join("src");
+    fs::create_dir_all(&src).unwrap();
+    fs::write(src.join("dotfiles-manager.lock"), lock).unwrap();
+    git(&src, &["init", "-q", "-b", "main"]);
+    git(&src, &["add", "-A"]);
+    git(&src, &["commit", "-q", "-m", "lock"]);
+    let sha = git(&src, &["rev-parse", "HEAD"]);
+    (src, sha)
+}
+
+#[test]
+fn the_early_pin_is_read_from_the_manager_table_with_the_staged_grammar() {
+    let tree = format!("toolchain_tree_sha256 = \"{}\"\n", "0".repeat(64));
+    let tmp = TempDir::new("pin-hint");
+    let home = tmp.path().join("home");
+    fs::create_dir_all(&home).unwrap();
+    // Indented keys are valid in the restricted grammar, and an earlier table's key is not the pin.
+    let lock = format!(
+        "schema = 1\n[other]\ntoolchain = \"1.1.1\"\n[manager]\n  toolchain = \"9.9.9\"\n  {tree}"
+    );
+    let (src, sha) = source_with_lock(tmp.path(), &lock);
+    let o = install_tiny(&home, &src, &sha);
+    assert_eq!(o.status.code(), Some(3), "{}", err(&o));
+    assert!(
+        err(&o).contains("E_TOOLCHAIN_MISMATCH")
+            && err(&o).contains("9.9.9")
+            && !err(&o).contains("1.1.1"),
+        "{}",
+        err(&o)
+    );
+    // No pin in [manager]: refused, even though another table has one.
+    let tmp = TempDir::new("pin-hint-none");
+    let lock = format!("schema = 1\n[other]\ntoolchain = \"9.9.9\"\n[manager]\n{tree}");
+    let (src, sha) = source_with_lock(tmp.path(), &lock);
+    let o = install_tiny(&home, &src, &sha);
+    assert_eq!(o.status.code(), Some(3), "{}", err(&o));
+    assert!(err(&o).contains("E_SOURCE_UNTRUSTED"), "{}", err(&o));
+    // A repeated key is refused, as the staged check refuses it.
+    let tmp = TempDir::new("pin-hint-twice");
+    let lock =
+        format!("schema = 1\n[manager]\ntoolchain = \"9.9.9\"\ntoolchain = \"9.9.9\"\n{tree}");
+    let (src, sha) = source_with_lock(tmp.path(), &lock);
+    let o = install_tiny(&home, &src, &sha);
+    assert_eq!(o.status.code(), Some(3), "{}", err(&o));
+    assert!(err(&o).contains("E_SOURCE_UNTRUSTED"), "{}", err(&o));
+}
+
+#[test]
+fn a_symlink_target_with_a_trailing_newline_is_refused_like_the_rust_checker() {
+    let tmp = TempDir::new("link-newline");
+    let home = tmp.path().join("home");
+    let tc = tmp.path().join("tc");
+    fs::create_dir_all(&home).unwrap();
+    fs::create_dir_all(tc.join("bin")).unwrap();
+    fs::write(tc.join("bin/a"), "a").unwrap();
+    let link = tc.join("bin/l");
+    std::os::unix::fs::symlink("a", &link).unwrap();
+    let args = ["toolchain-digest", "--dir", tc.to_str().unwrap()];
+    let ok = script_test_mode(&home, &args, &[]);
+    assert_eq!(ok.status.code(), Some(0), "{}", err(&ok));
+    assert_eq!(
+        String::from_utf8_lossy(&ok.stdout).trim(),
+        dfm_cli::toolchain_tree_digest(&tc).unwrap()
+    );
+    for target in ["a\n", "a\n\n", "\n"] {
+        fs::remove_file(&link).unwrap();
+        std::os::unix::fs::symlink(target, &link).unwrap();
+        assert!(
+            dfm_cli::toolchain_tree_digest(&tc).is_err(),
+            "Rust accepted {target:?}"
+        );
+        let o = script_test_mode(&home, &args, &[]);
+        assert_eq!(o.status.code(), Some(3), "shell accepted {target:?}");
+        assert!(o.stdout.is_empty());
+    }
+}
+
+/// Real data the script must never reach through a link: `outside/<name>/keep`.
+fn victim(tmp: &Path, names: &[&str]) -> PathBuf {
+    let outside = tmp.join("outside");
+    for n in names {
+        fs::create_dir_all(outside.join(n)).unwrap();
+        fs::write(outside.join(n).join("keep"), "mine").unwrap();
+    }
+    outside
+}
+
+fn assert_victim_intact(outside: &Path, names: &[&str]) {
+    for n in names {
+        assert_eq!(
+            fs::read_to_string(outside.join(n).join("keep")).unwrap(),
+            "mine",
+            "{n} was changed through a link"
+        );
+    }
+}
+
+#[test]
+fn a_symlinked_cache_hierarchy_is_refused_before_any_recursive_change() {
+    use std::os::unix::fs::symlink;
+    let names = ["build", "dotfiles-manager"];
+    // `.cache/dotfiles-manager` is a link, then `.cache` itself, then `build` itself.
+    for (case, link, to) in [
+        ("leaf-parent", ".cache/dotfiles-manager", "dotfiles-manager"),
+        ("cache", ".cache", "."),
+        ("build", ".cache/dotfiles-manager/build", "build"),
+    ] {
+        let (tmp, home, src, sha) = refusal_setup(&format!("cache-link-{case}"));
+        let outside = victim(tmp.path(), &names);
+        fs::create_dir_all(home.join(link).parent().unwrap()).unwrap();
+        symlink(outside.join(to), home.join(link)).unwrap();
+        let o = install_tiny(&home, &src, &sha);
+        assert_eq!(o.status.code(), Some(3), "install {case}: {}", err(&o));
+        assert!(
+            err(&o).contains("E_PREREQ_MISSING") && err(&o).contains("symlink"),
+            "{case}: {}",
+            err(&o)
+        );
+        let o = script_test_mode(&home, &["uninstall"], &[]);
+        assert_eq!(o.status.code(), Some(3), "uninstall {case}: {}", err(&o));
+        assert!(err(&o).contains("E_PREREQ_MISSING"), "{case}: {}", err(&o));
+        assert_victim_intact(&outside, &names);
+    }
+}
+
+#[test]
+fn a_symlinked_data_hierarchy_is_refused_before_any_recursive_removal() {
+    use std::os::unix::fs::symlink;
+    let names = ["versions", "cargo-home", "rustup-home", "build-home"];
+    for (case, link) in [
+        ("versions", ".local/share/dotfiles-manager/versions"),
+        ("cargo-home", ".local/share/dotfiles-manager/cargo-home"),
+        ("rustup-home", ".local/share/dotfiles-manager/rustup-home"),
+        ("build-home", ".local/share/dotfiles-manager/build-home"),
+    ] {
+        let (tmp, home, src, sha) = refusal_setup(&format!("data-link-{case}"));
+        let outside = victim(tmp.path(), &names);
+        let name = link.rsplit('/').next().unwrap();
+        symlink(outside.join(name), home.join(link)).unwrap();
+        let o = install_tiny(&home, &src, &sha);
+        assert_eq!(o.status.code(), Some(3), "install {case}: {}", err(&o));
+        assert!(err(&o).contains("E_PREREQ_MISSING"), "{case}: {}", err(&o));
+        let o = script_test_mode(&home, &["uninstall"], &[]);
+        assert_eq!(o.status.code(), Some(3), "uninstall {case}: {}", err(&o));
+        assert!(err(&o).contains("E_PREREQ_MISSING"), "{case}: {}", err(&o));
+        assert_victim_intact(&outside, &names);
+    }
+    // The data directory and an ancestor below HOME are links to a tree that holds real data.
+    for (case, link) in [
+        ("data", ".local/share/dotfiles-manager"),
+        ("share", ".local/share"),
+    ] {
+        let tmp = TempDir::new(&format!("data-link-{case}"));
+        let home = tmp.path().join("home");
+        let (src, sha) = tiny_source(tmp.path(), "9.9.9");
+        let real = tmp.path().join("real");
+        fs::create_dir_all(real.join("share/dotfiles-manager/toolchains/9.9.9")).unwrap();
+        for n in names {
+            fs::create_dir_all(real.join("share/dotfiles-manager").join(n)).unwrap();
+            fs::write(
+                real.join("share/dotfiles-manager").join(n).join("keep"),
+                "mine",
+            )
+            .unwrap();
+        }
+        fs::create_dir_all(home.join(".local")).unwrap();
+        let to = if case == "data" {
+            fs::create_dir_all(home.join(".local/share")).unwrap();
+            real.join("share/dotfiles-manager")
+        } else {
+            real.join("share")
+        };
+        symlink(to, home.join(link)).unwrap();
+        for args in [
+            vec!["uninstall"],
+            vec![
+                "install",
+                "--source",
+                src.to_str().unwrap(),
+                "--commit",
+                &sha,
+            ],
+        ] {
+            let o = script_test_mode(&home, &args, &[]);
+            assert_eq!(o.status.code(), Some(3), "{case} {args:?}: {}", err(&o));
+            assert!(err(&o).contains("E_PREREQ_MISSING"), "{case}: {}", err(&o));
+        }
+        for n in names {
+            assert_eq!(
+                fs::read_to_string(real.join("share/dotfiles-manager").join(n).join("keep"))
+                    .unwrap(),
+                "mine",
+                "{case}: {n}"
+            );
+        }
+    }
+}
+
+#[test]
+#[ignore = "needs crates.io"]
+fn a_foreign_dotfiles_manager_new_in_the_bin_directory_is_never_removed() {
+    let p = prepare("foreign-new");
+    let bin = p.home.join(".local/bin");
+    fs::create_dir_all(bin.join("dotfiles-manager.new/inner")).unwrap();
+    fs::write(bin.join("dotfiles-manager.new/inner/keep"), "mine").unwrap();
+    let o = install(&p, &p.sha, &[]);
+    assert_eq!(
+        o.status.code(),
+        Some(0),
+        "{}\n{}",
+        String::from_utf8_lossy(&o.stdout),
+        err(&o)
+    );
+    assert_eq!(
+        fs::read_to_string(bin.join("dotfiles-manager.new/inner/keep")).unwrap(),
+        "mine"
+    );
+    assert_eq!(
+        fs::read_link(bin.join("dotfiles-manager")).unwrap(),
+        p.data.join("current/dotfiles-manager")
+    );
+    let left: Vec<_> = fs::read_dir(&bin)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(left.len(), 2, "a staging entry was left behind: {left:?}");
+}
+
+#[test]
+#[ignore = "needs crates.io"]
+fn a_symlinked_version_directory_or_staged_binary_is_not_written_through() {
+    use std::os::unix::fs::symlink;
+    let p = prepare("version-link");
+    let name = format!("0.1.0-{}", &p.sha[..12]);
+    let versions = p.data.join("versions");
+    fs::create_dir_all(&versions).unwrap();
+    let outside = victim(p.tmp.path(), &["target"]);
+    // The version directory itself is a link to another tree.
+    symlink(outside.join("target"), versions.join(&name)).unwrap();
+    let o = install(&p, &p.sha, &[]);
+    assert_eq!(o.status.code(), Some(3), "{}", err(&o));
+    assert!(
+        err(&o).contains("E_PREREQ_MISSING") && err(&o).contains("symlink"),
+        "{}",
+        err(&o)
+    );
+    assert!(!outside.join("target/dotfiles-manager").exists());
+    assert!(!p.data.join("current").exists(), "current must not flip");
+    // A planted staging name inside a real version directory is a link to a file elsewhere.
+    fs::remove_file(versions.join(&name)).unwrap();
+    fs::create_dir(versions.join(&name)).unwrap();
+    let elsewhere = outside.join("target/keep");
+    symlink(
+        &elsewhere,
+        versions.join(&name).join("dotfiles-manager.new"),
+    )
+    .unwrap();
+    let o = install(&p, &p.sha, &[]);
+    assert_eq!(o.status.code(), Some(0), "{}", err(&o));
+    assert_eq!(fs::read_to_string(&elsewhere).unwrap(), "mine");
+    let installed = versions.join(&name).join("dotfiles-manager");
+    assert!(installed.is_file() && !installed.is_symlink());
+}
+
+#[test]
+#[ignore = "needs crates.io"]
+fn the_command_link_is_staged_before_current_flips() {
+    let p = prepare("link-before-flip");
+    let bin = p.home.join(".local/bin");
+    // First install: the bin directory becomes unwritable right before the swap. The link cannot
+    // be staged, so `current` must not flip.
+    let lock = p.tmp.path().join("lock.sh");
+    fs::write(&lock, format!("chmod 500 '{}'\n", bin.display())).unwrap();
+    let o = install(
+        &p,
+        &p.sha,
+        &[("DFM_TEST_BEFORE_SWAP", lock.to_str().unwrap())],
+    );
+    fs::set_permissions(&bin, fs::Permissions::from_mode(0o755)).unwrap();
+    assert_eq!(o.status.code(), Some(1), "{}", err(&o));
+    assert!(err(&o).contains("command link"), "{}", err(&o));
+    assert!(!p.data.join("current").exists(), "current flipped first");
+    assert!(!String::from_utf8_lossy(&o.stdout).contains("bootstrap: done"));
+    // Upgrade: the link already resolves through `current`, so it is not rewritten and an
+    // unwritable bin directory cannot fail the install after the flip.
+    assert_eq!(install(&p, &p.sha, &[]).status.code(), Some(0));
+    let second = next_commit(&p, "second");
+    let o = install(
+        &p,
+        &second,
+        &[("DFM_TEST_BEFORE_SWAP", lock.to_str().unwrap())],
+    );
+    fs::set_permissions(&bin, fs::Permissions::from_mode(0o755)).unwrap();
+    assert_eq!(
+        o.status.code(),
+        Some(0),
+        "{}\n{}",
+        String::from_utf8_lossy(&o.stdout),
+        err(&o)
+    );
+    assert!(String::from_utf8_lossy(&o.stdout).contains("bootstrap: done"));
+    assert_eq!(
+        fs::read_link(p.data.join("current")).unwrap(),
+        Path::new(&format!("versions/0.1.0-{}", &second[..12]))
+    );
+}

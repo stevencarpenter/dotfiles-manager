@@ -247,6 +247,20 @@ BEGIN {
 END { if (failed) exit 3 }
 '
 
+# Early, read-only pin hint: the same table-aware reading of [manager].toolchain as LOCK_RULES,
+# without the demand for the other keys (the staged check makes that demand later).
+PIN_HINT_RULES='
+function on_header(name, arr) { TABLE = name }
+function on_inline(k, sk) { bad("inline table in lock") }
+function on_pair(key) {
+  if (TABLE == "manager" && key == "toolchain") {
+    if (H != "" || VK != "s" || VS !~ /^[0-9]+\.[0-9]+\.[0-9]+$/) bad("invalid or repeated toolchain")
+    H = VS
+  }
+}
+END { if (failed) exit 3; if (H != "") print H }
+'
+
 LOCK_RULES='
 function on_header(name, arr) {
   if (name == "manager") { if (MSEEN) bad("duplicate [manager]"); MSEEN = 1 }
@@ -370,7 +384,14 @@ toolchain_digest() (
     awk '{ h = $1; sub(/^[0-9a-f]+  \.\//, ""); printf "%s\tfile\t%s\n", $0, h }')
   execs=$(find . -type f -perm -u+x -print0 | xargs -0 -r /usr/bin/shasum -a 256 |
     awk '{ h = $1; sub(/^[0-9a-f]+  \.\//, ""); printf "%s\texec\t%s\n", $0, h }')
-  links=$(find . -type l | while IFS= read -r l; do printf '%s\t%s\n' "${l#./}" "$(readlink "$l")"; done |
+  # `readlink -n` prints the target bytes and nothing else, and the `x` keeps $(...) from dropping
+  # a trailing newline of the target. A target that holds a newline becomes an empty target,
+  # which the awk program below refuses, as the Rust checker refuses a non-printable byte.
+  links=$(find . -type l | while IFS= read -r l; do
+      t=$(readlink -n "$l"; printf x); t=${t%x}
+      [ "${t#*"$NL"}" = "$t" ] || t=
+      printf '%s\t%s\n' "${l#./}" "$t"
+    done |
     awk -F'\t' '
       NF != 2 || $2 ~ /[^ -~]/ || $2 == "" || substr($2, 1, 1) == "/" || substr($2, 1, 1) == "~" || index($2, "\\") > 0 { exit 1 }
       { d = gsub(/\//, "/", $1); n = split($2, c, "/"); seen = 0
@@ -441,6 +462,21 @@ check_command_path() {
   fi
 }
 
+# check_command_path proved that the command path is absent or already this manager's link.
+# An existing link resolves through `current` and is left alone. An absent one is created from a
+# link inside a directory that mktemp -d just made, so no name that existed before is touched,
+# and is renamed into place. A link that exists before `current` does is harmless: it dangles.
+ensure_command_link() {
+  link=$HOME_DIR/.local/bin/dotfiles-manager
+  [ ! -L "$link" ] || return 0
+  link_dir=$(mktemp -d "$HOME_DIR/.local/bin/.dotfiles-manager-link.XXXXXX") || { echo "error: cannot stage the command link" >&2; exit 1; }
+  if ln -s "$DATA/current/dotfiles-manager" "$link_dir/link" && mv -fh "$link_dir/link" "$link"; then
+    rmdir "$link_dir"
+  else
+    rm -rf "$link_dir"; echo "error: cannot create the command link" >&2; exit 1
+  fi
+}
+
 # An existing binding must be usable by the new binary exactly as it is: a regular file, not a
 # symlink or FIFO, mode 0600, owned by the current user (the rules of read_binding in the CLI).
 check_binding() {
@@ -452,6 +488,27 @@ check_binding() {
   [ "$(/usr/bin/stat -f %u "$b")" = "$(/usr/bin/id -u)" ] || binding_bad "$b" "is not owned by the current user"
 }
 binding_bad() { printf 'error: E_BINDING_INVALID %s %s\n' "$1" "$2" >&2; exit 3; }
+
+# $1 is a path below HOME. Refuses when an existing component of it is a symlink or not a
+# directory, so no recursive chmod or rm and no copy can reach another tree through it.
+# Components that do not exist yet are fine: mkdir creates them. HOME itself is not checked.
+# A same-user process can still swap a component after the check; see docs/bootstrap.md.
+check_private_path() {
+  _p=$HOME_DIR _r=$1
+  while [ -n "$_r" ]; do
+    case $_r in */*) _c=${_r%%/*}; _r=${_r#*/} ;; *) _c=$_r; _r= ;; esac
+    _p=$_p/$_c
+    if [ -L "$_p" ]; then
+      refuse E_PREREQ_MISSING "$_p is a symlink; the manager does not follow links in its own directories. Move it away first"
+    fi
+    [ -e "$_p" ] || return 0
+    [ -d "$_p" ] || refuse E_PREREQ_MISSING "$_p exists and is not a directory; move it away first"
+  done
+}
+check_cache_tree() { check_private_path "$CACHE_REL/build"; }
+check_data_tree() {
+  for _d in versions cargo-home rustup-home build-home; do check_private_path "$DATA_REL/$_d"; done
+}
 
 rm_build() { [ ! -e "$build" ] || chmod -R u+w "$build"; rm -rf "$build"; }
 
@@ -478,12 +535,13 @@ cmd_install() {
   # Early, read-only hint of the pin so a missing toolchain is refused before any mutation.
   # The real parse and every other check run later on the staged copy.
   hint=$(git_clean -C "$src" cat-file blob "$commit:dotfiles-manager.lock" 2>/dev/null |
-    sed -n 's/^toolchain = "\([0-9][0-9.]*\)"[ \t]*$/\1/p' | head -n 1)
+    awk -v FN=dotfiles-manager.lock "$SCAN$PIN_HINT_RULES") || refuse_out "$hint"
   [ -n "$hint" ] || refuse E_SOURCE_UNTRUSTED "dotfiles-manager.lock has no toolchain pin"
   [ -d "$DATA/toolchains/$hint" ] ||
     refuse E_TOOLCHAIN_MISMATCH "toolchain $hint is absent at $DATA/toolchains/$hint; install exactly that version there (official Rust release distribution)"
   check_command_path
   check_binding
+  check_cache_tree; check_data_tree
   build=$CACHE/build
   rm_build; mkdir -p "$build/stage"
   # Build the verified commit itself, not whatever HEAD is. Both steps are checked: a pipe would hide
@@ -518,17 +576,24 @@ cmd_install() {
   semver=${ver#dotfiles-manager }; semver=${semver%% *}
   case $semver in ""|*[!0-9.]*) echo "error: unexpected version $semver" >&2; exit 1 ;; esac
   name=$semver-$(printf '%s' "$commit" | cut -c1-12)
+  # Every existing component of versions/<name> must be a real directory. The binary is copied
+  # to a file that mktemp creates exclusively (never through a link), then renamed into place.
+  check_private_path "$DATA_REL/versions/$name"
   mkdir -p "$DATA/versions/$name" "$HOME_DIR/.local/bin"
-  cp "$bin" "$DATA/versions/$name/dotfiles-manager.new"; chmod 755 "$DATA/versions/$name/dotfiles-manager.new"
-  mv -f "$DATA/versions/$name/dotfiles-manager.new" "$DATA/versions/$name/dotfiles-manager"
+  check_private_path "$DATA_REL/versions/$name"
+  [ ! -d "$DATA/versions/$name/dotfiles-manager" ] ||
+    refuse E_PREREQ_MISSING "$DATA/versions/$name/dotfiles-manager is a directory; move it away first"
+  staged_bin=$(mktemp "$DATA/versions/$name/dotfiles-manager.new.XXXXXX") || { echo "error: cannot create the staged binary" >&2; exit 1; }
+  { cp "$bin" "$staged_bin" && chmod 755 "$staged_bin" && mv -f "$staged_bin" "$DATA/versions/$name/dotfiles-manager"; } ||
+    { rm -f "$staged_bin"; echo "error: cannot stage the binary" >&2; exit 1; }
   if test_mode && [ -n "${DFM_TEST_BEFORE_SWAP:-}" ]; then /bin/sh "$DFM_TEST_BEFORE_SWAP"; fi
   check_command_path
   check_binding
+  # The command link is the only step in a directory the manager does not own, so it comes before
+  # the flip. After the flip only the read-back and the cleanup remain.
+  ensure_command_link
   # A stale current.new (even a directory) is removed first, so ln cannot create the link inside it.
   rm -rf "$DATA/current.new"; ln -sfn "versions/$name" "$DATA/current.new"; mv -fh "$DATA/current.new" "$DATA/current"
-  rm -rf "$HOME_DIR/.local/bin/dotfiles-manager.new"
-  ln -sfn "$DATA/current/dotfiles-manager" "$HOME_DIR/.local/bin/dotfiles-manager.new"
-  mv -fh "$HOME_DIR/.local/bin/dotfiles-manager.new" "$HOME_DIR/.local/bin/dotfiles-manager"
   if test_mode && [ -n "${DFM_TEST_AFTER_SWAP:-}" ]; then /bin/sh "$DFM_TEST_AFTER_SWAP"; fi
   # Read both links back: a swap that did not take effect must not be reported as done.
   got_current=$(readlink "$DATA/current") || got_current=
@@ -548,6 +613,7 @@ cmd_install() {
 # root are never touched.
 cmd_uninstall() {
   resolve_home
+  check_cache_tree; check_data_tree
   link=$HOME_DIR/.local/bin/dotfiles-manager
   if [ -L "$link" ] && [ "$(readlink "$link")" = "$DATA/current/dotfiles-manager" ]; then rm -f "$link"; fi
   build=$CACHE/build; rm_build
