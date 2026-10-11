@@ -1,5 +1,7 @@
 //! Pure data and logic for the dotfiles manager. No filesystem, process or network access.
 
+#![forbid(unsafe_code)]
+
 pub mod binding;
 pub mod controls;
 pub mod digest;

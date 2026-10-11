@@ -1,5 +1,7 @@
 //! `dotfiles-manager` command line: version, help, explicit profile binding and self-check.
 
+#![forbid(unsafe_code)]
+
 mod adapters;
 mod apply_cmd;
 mod controls_fs;

@@ -212,6 +212,8 @@ fn run_inner(
             r
         }
     };
+    // Handlers go in after the lock and before the first mutation (settling writes the journal).
+    dfm_engine::signal::install()?;
     if !store.is_initialized() {
         return Err(stamped(&store, crate::state_lost_refusal()));
     }

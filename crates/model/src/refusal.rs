@@ -66,6 +66,9 @@ pub enum Code {
     ApprovalRequired,
     // Added by DFM-45 (docs/apply.md, adoption).
     AdoptUnapproved,
+    // Added by DFM-47 (docs/apply.md, signals). The stop was requested by SIGINT or SIGTERM.
+    Interrupted,
+    Terminated,
 }
 
 impl Code {
@@ -123,6 +126,8 @@ impl Code {
         Code::SensitiveUnsupported,
         Code::ApprovalRequired,
         Code::AdoptUnapproved,
+        Code::Interrupted,
+        Code::Terminated,
     ];
 
     pub fn parse(s: &str) -> Option<Code> {
@@ -183,6 +188,8 @@ impl Code {
             Code::SensitiveUnsupported => "E_SENSITIVE_UNSUPPORTED",
             Code::ApprovalRequired => "E_APPROVAL_REQUIRED",
             Code::AdoptUnapproved => "E_ADOPT_UNAPPROVED",
+            Code::Interrupted => "E_INTERRUPTED",
+            Code::Terminated => "E_TERMINATED",
         }
     }
 
@@ -193,6 +200,9 @@ impl Code {
             Code::ReportUnavailable => Exit::Usage,
             // A failure while writing, or findings from a read-only check, are not refusals.
             Code::IoFailed | Code::Diagnosed | Code::IoUnconfirmed => Exit::Failed,
+            // Section 10: a stop by signal exits 130 or 143, also after a mutation.
+            Code::Interrupted => Exit::Interrupted,
+            Code::Terminated => Exit::Terminated,
             _ => Exit::Blocked,
         }
     }

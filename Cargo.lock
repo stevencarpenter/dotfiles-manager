@@ -59,6 +59,7 @@ name = "dfm-engine"
 version = "0.1.0"
 dependencies = [
  "dfm-model",
+ "libc",
  "rustix",
 ]
 

@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 use dfm_model::{Code, Exit};
 use std::io::Write;
 use std::process::ExitCode;
