@@ -1028,6 +1028,15 @@ impl Store {
                     .and_then(|b| TrialRecord::parse(&b))
                     .and_then(|t| {
                         t.validate_within(&self.scope)?;
+                        for p in t
+                            .baseline
+                            .paths
+                            .iter()
+                            .map(|b| &b.path)
+                            .chain(&t.owned_outputs)
+                        {
+                            self.check_claim(p)?;
+                        }
                         if format!("{}.json", t.trial_id) == n {
                             Ok(t)
                         } else {
@@ -1048,6 +1057,18 @@ impl Store {
                         for n in Self::list_dir(&sd, &op_dir, &mut problems) {
                             if tmp(&n) {
                                 strays.push(format!("{op_dir}/{n} (interrupted write)"));
+                            } else if !state::valid_id(&op) || !state::valid_id(&n) {
+                                problems.push(Finding::new(
+                                    Code::StateInvalid,
+                                    format!("{op_dir}/{n}"),
+                                    "not a valid snapshot name",
+                                ));
+                            } else if let Err(e) = read(&sd, &n) {
+                                problems.push(Finding::new(
+                                    e.code,
+                                    format!("{op_dir}/{n}"),
+                                    e.detail,
+                                ));
                             }
                         }
                     }

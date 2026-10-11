@@ -864,6 +864,77 @@ fn a_hand_written_trial_with_foreign_paths_is_a_finding_not_a_trial() {
 }
 
 #[test]
+fn a_trial_path_under_a_link_parent_is_a_finding() {
+    let h = Home::new();
+    let (s, stamp) = init(&h);
+    let outside = Home::new();
+    symlink(&outside.0, h.0.join("away")).unwrap();
+    let dir = h.0.join(".local/state/dotfiles-manager/state/trials");
+    for (n, baseline, owned) in [("t1", true, false), ("t2", false, true)] {
+        let path = h.0.join("away/x").to_str().unwrap().to_string();
+        let t = dfm_model::state::TrialRecord {
+            schema: 1,
+            binding: stamp.clone(),
+            trial_id: n.into(),
+            tool: "atuin".into(),
+            created_unix: 1,
+            baseline: dfm_model::state::Baseline {
+                tool_preexisting: false,
+                paths: if baseline {
+                    vec![dfm_model::state::BaselinePath {
+                        path: path.clone(),
+                        existed: false,
+                        sha256: None,
+                    }]
+                } else {
+                    vec![]
+                },
+            },
+            owned_outputs: if owned { vec![path] } else { vec![] },
+        };
+        let f = dir.join(format!("{n}.json"));
+        fs::write(&f, dfm_model::state::canonical(&t).unwrap()).unwrap();
+        fs::set_permissions(&f, fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    let loaded = s.load();
+    assert_eq!(loaded.trials.len(), 2);
+    assert!(
+        loaded
+            .trials
+            .iter()
+            .all(|(_, t)| t.as_ref().is_err_and(|e| e.code == Code::StateInvalid)),
+        "{:?}",
+        loaded.trials
+    );
+}
+
+#[test]
+fn a_snapshot_symlink_directory_wrong_mode_or_bad_name_is_a_finding() {
+    let h = Home::new();
+    let (s, _) = init(&h);
+    let snaps = h.0.join(".local/state/dotfiles-manager/state/snapshots");
+    s.write_snapshot("run-1", "good", b"old", Class::Normal)
+        .unwrap();
+    assert!(s.load().problems.is_empty(), "{:?}", s.load().problems);
+    let run = snaps.join("run-1");
+    fs::write(h.0.join("target"), "x").unwrap();
+    symlink(h.0.join("target"), run.join("link")).unwrap();
+    fs::create_dir(run.join("dir")).unwrap();
+    s.write_snapshot("run-1", "loose", b"old", Class::Normal)
+        .unwrap();
+    fs::set_permissions(run.join("loose"), fs::Permissions::from_mode(0o644)).unwrap();
+    fs::write(run.join("bad name"), "x").unwrap();
+    let files: Vec<String> = s.load().problems.into_iter().map(|p| p.file).collect();
+    for n in ["link", "dir", "loose", "bad name"] {
+        assert!(
+            files.contains(&format!("snapshots/run-1/{n}")),
+            "{n}: {files:?}"
+        );
+    }
+    assert!(!files.iter().any(|f| f.ends_with("/good")), "{files:?}");
+}
+
+#[test]
 fn every_write_cap_is_enforced_before_anything_is_written() {
     let h = Home::new();
     let (s, stamp) = init(&h);

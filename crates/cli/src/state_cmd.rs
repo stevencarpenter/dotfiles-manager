@@ -2,7 +2,7 @@
 //! binary (isolated builds only).
 
 use super::{Ctx, bounded, header, usage};
-use dfm_engine::{Dir, Fail, Store, Sys, recover, resolve, verify_identity};
+use dfm_engine::{Dir, Fail, Finding, Store, Sys, recover, resolve, verify_identity};
 use dfm_model::state::Phase;
 use dfm_model::{Code, Refusal};
 use std::io::Write;
@@ -81,7 +81,13 @@ pub fn check(ctx: &Ctx, out: &mut dyn Write) -> Result<(), Refusal> {
         }
     };
     let l = store.load();
-    let findings = verify_identity(&l, &binding);
+    let mut findings = verify_identity(&l, &binding);
+    // An interrupted write leaves evidence on disk, so a stray entry fails the check.
+    findings.extend(l.strays.iter().map(|s| Finding {
+        code: Code::StateInvalid,
+        file: s.clone(),
+        detail: "stray entry from an interrupted write or an unexpected file".into(),
+    }));
     let count = |n: usize, bad: usize| format!("{n} ({bad} unreadable)");
     let (r_bad, t_bad) = (
         l.receipts.iter().filter(|r| r.1.is_err()).count(),
@@ -107,9 +113,6 @@ pub fn check(ctx: &Ctx, out: &mut dyn Write) -> Result<(), Refusal> {
     writeln!(out, "trials: {}", count(l.trials.len(), t_bad)).map_err(w)?;
     if let Ok(j) = &l.journal {
         writeln!(out, "journal: {} entries", j.len()).map_err(w)?;
-    }
-    for s in &l.strays {
-        writeln!(out, "note: {}", bounded(s)).map_err(w)?;
     }
     for f in &findings {
         writeln!(

@@ -743,7 +743,7 @@ impl Dir {
             }
         }
         fail.hit(&format!("{label}-before-write"))?;
-        f.write_all(line).map_err(|e| io("append", &e))?;
+        write_line(&mut f, line)?;
         // The line is written. A failure from here on means its durability is unconfirmed.
         unconfirmed(
             f.sync_all()
@@ -1026,6 +1026,19 @@ pub fn open_config(sys: &Sys, layout: &Layout, create: bool) -> Result<Option<Di
     home.walk(sys, &rel, rel.len(), create)
 }
 
+/// Writes one journal line. A failure here can leave part of the line in the file, so it is an
+/// unconfirmed outcome (the journal may end in a torn line), not an ordinary I/O failure.
+fn write_line(w: &mut impl Write, line: &[u8]) -> Result<(), Refusal> {
+    w.write_all(line).map_err(|e| {
+        Refusal::new(
+            Code::IoUnconfirmed,
+            format!(
+                "the journal append failed part way and the journal may end in a torn line: {e}"
+            ),
+        )
+    })
+}
+
 /// A failure after the commit point: the new content is visible, durability is not confirmed.
 pub fn unconfirmed(r: Result<(), Refusal>) -> Result<(), Refusal> {
     r.map_err(|e| {
@@ -1145,5 +1158,38 @@ impl Lock {
             Some(_) => Err(lost("the lock file was replaced")),
             None => Err(lost("the lock file was removed")),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A writer that accepts a few bytes and then fails, like a full disk.
+    struct Partial(Vec<u8>);
+
+    impl Write for Partial {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            if self.0.is_empty() {
+                let n = buf.len().min(3);
+                self.0.extend_from_slice(&buf[..n]);
+                Ok(n)
+            } else {
+                Err(std::io::Error::from_raw_os_error(28))
+            }
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_partial_journal_write_is_an_unconfirmed_outcome() {
+        let mut w = Partial(Vec::new());
+        let r = write_line(&mut w, b"{\"a\":1}\n").unwrap_err();
+        assert_eq!(w.0, b"{\"a");
+        assert_eq!(r.code, Code::IoUnconfirmed);
+        assert!(r.detail.contains("torn line"), "{}", r.detail);
     }
 }

@@ -297,9 +297,11 @@ fn abrupt_exit_at_every_point_leaves_recoverable_state_and_a_free_lock() {
         let c = check(h.path());
         let report = text(&c.stdout);
         let interrupted = ["after-intent", "after-effect"].contains(&point);
+        // A crash between a temporary file and its rename leaves a stray entry: a finding.
+        let stray = report.contains("stray entry");
         assert_eq!(
             c.status.code(),
-            Some(i32::from(interrupted)),
+            Some(i32::from(interrupted || stray)),
             "{point}: {report}"
         );
         assert_eq!(
@@ -307,7 +309,12 @@ fn abrupt_exit_at_every_point_leaves_recoverable_state_and_a_free_lock() {
             interrupted,
             "{point}: {report}"
         );
-        assert!(!report.contains("E_STATE_INVALID"), "{point}: {report}");
+        assert!(
+            !report
+                .lines()
+                .any(|l| l.contains("E_STATE_INVALID") && !l.contains("stray entry")),
+            "{point}: {report}"
+        );
         // The ledger is either the previous good one or the complete new one, never partial.
         let now = fs::read(state(h.path()).join("ledger.json")).unwrap();
         if point.starts_with("ledger-after-tmp") || interrupted || point == "after-done" {
@@ -747,6 +754,26 @@ fn concurrent_initial_binds_create_one_owner_in_the_binding_and_in_the_state() {
             .collect();
         assert!(stray.is_empty(), "round {round}: {stray:?}");
     }
+}
+
+#[test]
+fn state_check_counts_stray_entries_as_findings() {
+    let h = bound_home("stray-findings");
+    assert_eq!(check(h.path()).status.code(), Some(0));
+    for f in [
+        root(h.path()).join("state.next"),
+        state(h.path()).join("receipts/.20261010T000000Z-run.json.1.2.tmp"),
+        state(h.path()).join("trials/.t.json.1.2.tmp"),
+    ] {
+        fs::write(&f, "half").unwrap();
+        let o = check(h.path());
+        let out = text(&o.stdout);
+        assert_eq!(o.status.code(), Some(1), "{f:?}: {out}");
+        assert!(out.contains("E_STATE_INVALID"), "{out}");
+        assert!(!out.contains("state ok"), "{out}");
+        fs::remove_file(&f).unwrap();
+    }
+    assert_eq!(check(h.path()).status.code(), Some(0));
 }
 
 // ---- C08: topology ---------------------------------------------------------------------------------
