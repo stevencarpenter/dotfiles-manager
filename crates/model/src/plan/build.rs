@@ -37,6 +37,19 @@ pub struct Owned {
     pub fingerprint: Option<String>,
 }
 
+/// The ledger entry for a path as a precondition string. For a sensitive path the fingerprint
+/// is left out, whoever owns the entry: it can be a hash of credentials. Apply builds the same
+/// string from a fresh ledger read, so both sides must use this function.
+pub fn ledger_state(entry: Option<&Owned>, sensitive: bool) -> String {
+    entry.map_or_else(
+        || "none".into(),
+        |e| match (&e.fingerprint, sensitive) {
+            (Some(f), false) => format!("{}:{f}", e.resource),
+            _ => format!("{}:sensitive", e.resource),
+        },
+    )
+}
+
 pub struct Context<'a> {
     pub binary: Binary,
     pub profile: &'a str,
@@ -563,13 +576,7 @@ impl Planner<'_> {
     /// The ledger entry for a path as a precondition string. For a sensitive path the
     /// fingerprint is left out, whoever owns the entry: it can be a hash of credentials.
     fn ledger_state(&self, path: &str, sensitive: bool) -> String {
-        self.ledger_entry(path).map_or_else(
-            || "none".into(),
-            |e| match (&e.fingerprint, sensitive) {
-                (Some(f), false) => format!("{}:{f}", e.resource),
-                _ => format!("{}:sensitive", e.resource),
-            },
-        )
+        ledger_state(self.ledger_entry(path), sensitive)
     }
 
     fn leaf(&mut self, r: &ResolvedResource, claim: &str) {

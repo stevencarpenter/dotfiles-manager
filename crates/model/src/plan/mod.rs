@@ -10,7 +10,7 @@ mod build;
 mod graph;
 mod stale;
 
-pub use build::{Context, Owned, build, followups, requests};
+pub use build::{Context, Owned, build, followups, ledger_state, requests};
 pub use stale::{Stale, StaleKind, stale};
 
 use crate::digest::sha256_hex;

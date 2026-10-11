@@ -330,7 +330,22 @@ pub struct OperationRecord {
     pub after: Option<Fingerprint>,
     pub owned_outputs: Vec<String>,
     pub error: Option<String>,
+    /// What happened to the consumer of a published file, recorded apart from the publication
+    /// (architecture section 8: a correct file and a reloaded consumer are separate
+    /// postconditions). One of [`RELOADS`]. Absent when the operation published nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reload: Option<String>,
 }
+
+/// The consumer reload states: the `Reloader` results of architecture section 11 plus
+/// `not_attempted`, the only one the manager can record until a reloader exists.
+pub const RELOADS: [&str; 5] = [
+    "not_attempted",
+    "requested",
+    "reloaded",
+    "unsupported",
+    "failed",
+];
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -447,6 +462,9 @@ impl Receipt {
             }
             if o.error.as_ref().is_some_and(|e| e.len() > MAX_ERROR_BYTES) {
                 return Err(bad(format!("operation {} error is not bounded", o.id)));
+            }
+            if o.reload.as_deref().is_some_and(|r| !RELOADS.contains(&r)) {
+                return Err(bad(format!("operation {} reload state is unknown", o.id)));
             }
         }
         Ok(())
@@ -1045,6 +1063,7 @@ mod tests {
             after: None,
             owned_outputs: vec!["/h/.gitconfig".into()],
             error: None,
+            reload: None,
         }
     }
 
@@ -1356,6 +1375,27 @@ mod tests {
         assert!(!sc.admits("/H/.local/\u{17f}hare/dotfiles-manager/new"));
         assert!(!sc.admits("/H/.local/share/DOTFILE\u{17f}-manager/x"));
         assert!(sc.admits("/H/.local/share/other"));
+    }
+
+    #[test]
+    fn a_reload_state_must_come_from_the_fixed_list_and_round_trips() {
+        for name in RELOADS {
+            let mut o = op(Status::Updated, Class::Normal);
+            o.reload = Some(name.into());
+            let r = receipt(vec![o]);
+            r.validate().unwrap();
+            let again = Receipt::parse(&canonical(&r).unwrap()).unwrap();
+            assert_eq!(again.operations[0].reload.as_deref(), Some(name));
+        }
+        let mut o = op(Status::Updated, Class::Normal);
+        o.reload = Some("done".into());
+        assert_eq!(
+            receipt(vec![o]).validate().unwrap_err().code,
+            Code::StateInvalid
+        );
+        // An absent field is not written, so receipts without it keep their bytes.
+        let plain = canonical(&receipt(vec![op(Status::Updated, Class::Normal)])).unwrap();
+        assert!(!String::from_utf8(plain).unwrap().contains("reload"));
     }
 
     #[test]

@@ -140,6 +140,7 @@ pub fn receipt(stamp: &Stamp, op_id: &str, outputs: Vec<String>) -> Receipt {
         after: None,
         owned_outputs: outputs,
         error: None,
+        reload: None,
     }];
     Receipt {
         schema: 1,
