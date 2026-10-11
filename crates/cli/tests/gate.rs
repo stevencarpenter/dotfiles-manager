@@ -322,4 +322,28 @@ fn a_plain_release_build_of_every_target_has_no_test_isolation() {
         v.starts_with("dotfiles-manager ") && !v.contains("test-isolation"),
         "{v}"
     );
+    // The release binary has no isolation flag, so `apply` with an override is a usage error
+    // before anything is read or written, and the failure-injection variable has no effect.
+    let scratch = common::TempDir::new("release-apply");
+    let o = Command::new(target.path().join("release/dotfiles-manager"))
+        .env_clear()
+        .env("DFM_HOME", scratch.path())
+        .env("DFM_FAILPOINT", "apply-before-effect:abort")
+        .arg("--home")
+        .arg(scratch.path())
+        .args(["apply", "--root"])
+        .arg(scratch.path())
+        .output()
+        .unwrap();
+    assert_eq!(
+        o.status.code(),
+        Some(2),
+        "{}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+    assert_eq!(
+        fs::read_dir(scratch.path()).unwrap().count(),
+        0,
+        "nothing was created"
+    );
 }
