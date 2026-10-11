@@ -754,6 +754,39 @@ fn next_commit(p: &Prepared, note: &str) -> String {
     git(&p.src, &["rev-parse", "HEAD"])
 }
 
+/// The live step copies the toolchain with `cp -Rp`. The copy must digest like the original.
+#[test]
+fn cp_rp_copy_of_a_toolchain_tree_keeps_its_digest() {
+    let tmp = TempDir::new("cp-rp");
+    let home = tmp.path().join("home");
+    fs::create_dir_all(&home).unwrap();
+    let orig = tmp.path().join("orig");
+    minimal_toolchain(&orig);
+    let copy = tmp.path().join("copy");
+    let st = Command::new("/bin/cp")
+        .arg("-Rp")
+        .arg(&orig)
+        .arg(&copy)
+        .status()
+        .unwrap();
+    assert!(st.success());
+    let want = dfm_cli::toolchain_tree_digest(&orig).unwrap();
+    assert_eq!(dfm_cli::toolchain_tree_digest(&copy).unwrap(), want);
+    for dir in [&orig, &copy] {
+        let o = script_test_mode(
+            &home,
+            &["toolchain-digest", "--dir", dir.to_str().unwrap()],
+            &[],
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&o.stdout).trim(),
+            want,
+            "{}",
+            err(&o)
+        );
+    }
+}
+
 #[test]
 #[ignore = "needs crates.io"]
 fn isolated_install_invocation_and_clean_removal() {

@@ -6,15 +6,23 @@ Board ticket: DFM-46. The agent runs nothing live without written approval that 
 
 ## 1. Build and install the manager
 
-1. Choose the commit to install. The integration branch is `going-to-sleep`. Use the full 40-character object id.
-2. Run the bootstrap script with a clean environment:
+1. Place the pinned toolchain. `~/.local/share/dotfiles-manager` must be a real, user-owned directory first. Then run:
+
+   ```sh
+   cp -Rp ~/.rustup/toolchains/1.98.1-aarch64-apple-darwin ~/.local/share/dotfiles-manager/toolchains/1.98.1
+   sh scripts/bootstrap.sh toolchain-digest --dir ~/.local/share/dotfiles-manager/toolchains/1.98.1
+   ```
+
+   The copy must be a real directory, not a symlink. The printed digest must equal `toolchain_tree_sha256` in `dotfiles-manager.lock` before `install`. The digest is device-specific. The M3 may need its own lock later.
+2. Choose the commit to install. The integration branch is `going-to-sleep`. Use the full 40-character object id.
+3. Run the bootstrap script with a clean environment:
 
    ```sh
    /usr/bin/env -i /bin/sh scripts/bootstrap.sh install --source "$PWD" --commit <full sha>
    ```
 
    It checks Command Line Tools, the pinned toolchain, the staged tree and the build controls before any `cargo` process starts. It builds offline, runs `self-check`, then installs `~/.local/bin/dotfiles-manager` through a `current` symlink. A failed build leaves no installed binary.
-3. Check: `dotfiles-manager --version` prints the semver and the commit. `isolated:` must not appear; the release binary ignores every isolation override.
+4. Check: `dotfiles-manager --version` prints the semver and the commit. `isolated:` must not appear; the release binary ignores every isolation override.
 
 ## 2. Author a link-only bundle in the configuration repository
 
