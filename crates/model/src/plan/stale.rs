@@ -201,8 +201,14 @@ fn op_diff(out: &mut Vec<Stale>, a: &Operation, b: &Operation) {
             .collect()
     };
     keyed(out, StaleKind::Observation, &pre(a), &pre(b));
-    if (a.action, a.status, &a.after, &a.fragments, &a.link, &a.mode)
-        != (b.action, b.status, &b.after, &b.fragments, &b.link, &b.mode)
+    let listed = |o: &Operation| -> Vec<(String, String)> {
+        o.fragments
+            .iter()
+            .map(|f| (f.name.clone(), f.origin.clone()))
+            .collect()
+    };
+    if (a.action, a.status, &a.after, listed(a), &a.link, &a.mode)
+        != (b.action, b.status, &b.after, listed(b), &b.link, &b.mode)
     {
         let show = |o: &Operation| {
             format!(
@@ -216,5 +222,32 @@ fn op_diff(out: &mut Vec<Stale>, a: &Operation, b: &Operation) {
             )
         };
         diff(out, StaleKind::Operation, &subject, &show(a), &show(b));
+    }
+    // Hashes are never printed. A change reads "changed", and a fragment hash change names the
+    // fragment. The subjects differ, so the entries are not merged.
+    if a.output_sha256 != b.output_sha256 {
+        diff(
+            out,
+            StaleKind::Operation,
+            &format!("{subject} output"),
+            "as planned",
+            "output changed",
+        );
+    }
+    for f in &a.fragments {
+        let moved = b
+            .fragments
+            .iter()
+            .find(|g| g.name == f.name && g.origin == f.origin)
+            .is_some_and(|g| g.sha256 != f.sha256);
+        if moved {
+            diff(
+                out,
+                StaleKind::Operation,
+                &format!("{subject} fragment {}", f.name),
+                "as planned",
+                &format!("fragment {} changed", f.name),
+            );
+        }
     }
 }

@@ -78,7 +78,9 @@ impl DoctorCode {
         match self {
             DoctorCode::Ok => "The check passed.",
             DoctorCode::NaSensitive => "A sensitive output. Its content is never read or hashed.",
-            DoctorCode::NaGenerated => "A generated file. No generator exists in this build.",
+            DoctorCode::NaGenerated => {
+                "A generated file. Doctor does not compare generated content."
+            }
             DoctorCode::OutputMissing => {
                 "An owned output no longer exists. Apply publishes it again."
             }

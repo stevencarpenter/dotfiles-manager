@@ -3,6 +3,9 @@
 //! kind, whether it owns a target, how its `value` is typed, and which outputs it claims. No
 //! adapter is run here.
 
+mod generate;
+pub use generate::{Gen, Generators, plan_outputs};
+
 use dfm_model::resolve::{AdapterCatalog, AdapterSpec, Claims, Field, Include, Schema, TargetRule};
 
 fn field(name: &'static str, schema: Schema, required: bool) -> Field {
@@ -92,130 +95,203 @@ fn package(id: &str) -> AdapterSpec {
     )
 }
 
-#[doc(hidden)]
-pub fn builtin_catalog() -> AdapterCatalog {
+/// One adapter: what the resolver validates against, and the generator if the adapter produces
+/// file content. This table is the only place that names an adapter, so the catalog and the
+/// generators cannot disagree.
+pub struct Adapter {
+    pub spec: AdapterSpec,
+    pub generator: Option<Gen>,
+}
+
+pub fn registry() -> Vec<Adapter> {
     let native = |mut s: AdapterSpec| {
         s.native_document = true;
         s
     };
-    AdapterCatalog::new([
-        AdapterSpec {
-            source_includes: Some(git_includes),
-            ..spec(
-                "fs-link/v1",
-                "link",
-                TargetRule::Required,
-                Claims::Target,
-                Schema::Table(vec![field("source", Schema::Source, true)]),
-            )
+    vec![
+        Adapter {
+            spec: AdapterSpec {
+                source_includes: Some(git_includes),
+                ..spec(
+                    "fs-link/v1",
+                    "link",
+                    TargetRule::Required,
+                    Claims::Target,
+                    Schema::Table(vec![field("source", Schema::Source, true)]),
+                )
+            },
+            generator: None,
         },
-        native(AdapterSpec {
-            precedence: Some("later include entries override earlier ones for single-valued keys"),
-            ..spec(
-                "git-config/v1",
-                "render",
-                TargetRule::Required,
-                Claims::Target,
-                Schema::Native,
-            )
-        }),
+        Adapter {
+            spec: native(AdapterSpec {
+                precedence: Some(
+                    "later include entries override earlier ones for single-valued keys",
+                ),
+                ..spec(
+                    "git-config/v1",
+                    "render",
+                    TargetRule::Required,
+                    Claims::Target,
+                    Schema::Native,
+                )
+            }),
+            generator: Some(generate::GIT_CONFIG),
+        },
         // The live file can hold credentials in fields the manager does not own.
-        native(AdapterSpec {
-            sensitive: true,
-            ..spec(
-                "claude-settings/v1",
-                "merge",
+        Adapter {
+            spec: native(AdapterSpec {
+                sensitive: true,
+                ..spec(
+                    "claude-settings/v1",
+                    "merge",
+                    TargetRule::Required,
+                    Claims::Target,
+                    Schema::Table(vec![
+                        field("managed", Schema::Native, true),
+                        field("seed", Schema::Native, false),
+                        field(
+                            "handlers",
+                            Schema::Map(Box::new(Schema::Table(vec![
+                                field("event", Schema::Str, true),
+                                field("type", Schema::Str, true),
+                                field("argv", Schema::Array(Box::new(Schema::Str)), true),
+                            ]))),
+                            true,
+                        ),
+                    ]),
+                )
+            }),
+            generator: None,
+        },
+        Adapter {
+            spec: native(spec(
+                "text-fragments/v1",
+                "assemble",
                 TargetRule::Required,
-                Claims::Target,
+                Claims::TargetAndFragments {
+                    dir: "/fragments_dir",
+                    pattern: "/pattern",
+                },
                 Schema::Table(vec![
-                    field("managed", Schema::Native, true),
-                    field("seed", Schema::Native, false),
+                    field("body", Schema::Source, true),
+                    field("fragments_dir", Schema::HomePath, true),
+                    field("pattern", Schema::Str, true),
+                    field("separator", Schema::Str, true),
+                ]),
+            )),
+            generator: Some(generate::TEXT_FRAGMENTS),
+        },
+        Adapter {
+            spec: spec(
+                "skills/v1",
+                "distribution",
+                TargetRule::Forbidden,
+                Claims::Leaves {
+                    roots: "/target_roots",
+                    entries: "/entries",
+                    enabled: "enabled",
+                },
+                Schema::Table(vec![
                     field(
-                        "handlers",
+                        "target_roots",
+                        Schema::Array(Box::new(Schema::HomePath)),
+                        true,
+                    ),
+                    field(
+                        "entries",
                         Schema::Map(Box::new(Schema::Table(vec![
-                            field("event", Schema::Str, true),
-                            field("type", Schema::Str, true),
-                            field("argv", Schema::Array(Box::new(Schema::Str)), true),
+                            field("source", Schema::Source, true),
+                            field("enabled", Schema::Bool, true),
                         ]))),
                         true,
                     ),
                 ]),
-            )
-        }),
-        native(spec(
-            "text-fragments/v1",
-            "assemble",
-            TargetRule::Required,
-            Claims::TargetAndFragments {
-                dir: "/fragments_dir",
-                pattern: "/pattern",
-            },
-            Schema::Table(vec![
-                field("body", Schema::Source, true),
-                field("fragments_dir", Schema::HomePath, true),
-                field("pattern", Schema::Str, true),
-                field("separator", Schema::Str, true),
-            ]),
-        )),
-        spec(
-            "skills/v1",
-            "distribution",
-            TargetRule::Forbidden,
-            Claims::Leaves {
-                roots: "/target_roots",
-                entries: "/entries",
-                enabled: "enabled",
-            },
-            Schema::Table(vec![
-                field(
-                    "target_roots",
-                    Schema::Array(Box::new(Schema::HomePath)),
-                    true,
-                ),
-                field(
-                    "entries",
-                    Schema::Map(Box::new(Schema::Table(vec![
-                        field("source", Schema::Source, true),
-                        field("enabled", Schema::Bool, true),
-                    ]))),
-                    true,
-                ),
-            ]),
-        ),
-        AdapterSpec {
-            secret_values: true,
-            ..spec(
-                "op-template/v1",
-                "secret",
-                TargetRule::Required,
-                Claims::Target,
-                Schema::Table(vec![
-                    field("template", Schema::Source, true),
-                    field("account", Schema::Str, true),
-                    field("mode", Schema::FileMode { private: true }, true),
-                ]),
-            )
+            ),
+            generator: None,
         },
-        package("homebrew/v1"),
-        package("mise/v1"),
-        package("apt/v1"),
-        spec(
-            "firstmate-native/v1",
-            "application",
-            TargetRule::Forbidden,
-            Claims::None,
-            Schema::Table(vec![
-                field("name", Schema::Str, true),
-                field("update_policy", Schema::Str, true),
-                field("completion", Schema::Str, true),
-            ]),
-        ),
-    ])
+        Adapter {
+            spec: AdapterSpec {
+                secret_values: true,
+                ..spec(
+                    "op-template/v1",
+                    "secret",
+                    TargetRule::Required,
+                    Claims::Target,
+                    Schema::Table(vec![
+                        field("template", Schema::Source, true),
+                        field("account", Schema::Str, true),
+                        field("mode", Schema::FileMode { private: true }, true),
+                    ]),
+                )
+            },
+            generator: None,
+        },
+        Adapter {
+            spec: package("homebrew/v1"),
+            generator: None,
+        },
+        Adapter {
+            spec: package("mise/v1"),
+            generator: None,
+        },
+        Adapter {
+            spec: package("apt/v1"),
+            generator: None,
+        },
+        Adapter {
+            spec: spec(
+                "firstmate-native/v1",
+                "application",
+                TargetRule::Forbidden,
+                Claims::None,
+                Schema::Table(vec![
+                    field("name", Schema::Str, true),
+                    field("update_policy", Schema::Str, true),
+                    field("completion", Schema::Str, true),
+                ]),
+            ),
+            generator: None,
+        },
+    ]
+}
+
+#[doc(hidden)]
+pub fn builtin_catalog() -> AdapterCatalog {
+    AdapterCatalog::new(registry().into_iter().map(|a| a.spec))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::git_includes;
+    use super::{git_includes, registry};
+
+    #[test]
+    fn every_generated_kind_has_a_generator_and_nothing_else_has_one() {
+        let table = registry();
+        assert!(!table.is_empty());
+        let mut ids: Vec<&str> = table.iter().map(|a| a.spec.id.as_str()).collect();
+        let n = ids.len();
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len(), n, "an adapter id appears twice");
+        for a in &table {
+            let generated = matches!(a.spec.kind, "render" | "assemble");
+            assert_eq!(
+                a.generator.is_some(),
+                generated,
+                "{} ({}): a render or assemble adapter needs a generator and no other kind has one",
+                a.spec.id,
+                a.spec.kind
+            );
+        }
+        // Merge is the one generating kind without a generator yet (DFM-21). It is sensitive,
+        // so apply refuses it before it asks for content.
+        let merge: Vec<_> = table.iter().filter(|a| a.spec.kind == "merge").collect();
+        assert!(
+            merge
+                .iter()
+                .all(|a| a.generator.is_none() && a.spec.sensitive)
+        );
+    }
 
     #[test]
     fn untrusted_section_names_never_panic_on_a_character_boundary() {

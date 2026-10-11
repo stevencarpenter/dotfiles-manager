@@ -171,7 +171,10 @@ pub fn plan_for(ctx: &Ctx, loaded: &Loaded) -> Result<Plan, Refusal> {
         reserved,
         unchecked,
     };
-    plan::build(&loaded.resolved, &cx, &obs)
+    let mut plan = plan::build(&loaded.resolved, &cx, &obs)?;
+    // Generated output hashes (architecture section 9 item 1), from the same adapters apply runs.
+    crate::adapters::plan_outputs(&mut plan, &loaded.resolved, &sys, &home);
+    Ok(plan)
 }
 
 pub(crate) fn render(p: &Plan, digest: &str, out: &mut dyn Write) -> std::io::Result<()> {
@@ -202,6 +205,14 @@ pub(crate) fn render(p: &Plan, digest: &str, out: &mut dyn Write) -> std::io::Re
         )?;
         if !o.after.is_empty() {
             writeln!(out, "    after: {}", visible(&o.after.join(", ")))?;
+        }
+        // What a generated file will hold, without its content: size and setting names, so a
+        // reviewer sees a new `core.sshCommand` or `include.path` before approving.
+        if let Some(n) = o.output_bytes {
+            writeln!(out, "    output: {n} bytes")?;
+        }
+        if !o.sets.is_empty() {
+            writeln!(out, "    sets: {}", visible(&o.sets.join(", ")))?;
         }
     }
     for b in &p.blockers {

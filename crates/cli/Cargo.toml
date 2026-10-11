@@ -56,5 +56,9 @@ required-features = ["test-isolation"]
 name = "doctor"
 required-features = ["test-isolation"]
 
+[[test]]
+name = "native_config"
+required-features = ["test-isolation"]
+
 [lints]
 workspace = true

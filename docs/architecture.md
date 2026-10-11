@@ -61,6 +61,8 @@ platform_macos -> ports, model    macOS provider adapters and port implementatio
 cli            -> engine, adapters, platform_macos   parsing, rendering, exit mapping
 ```
 
+Implementation note (DFM-20): no `ports` or `adapters` crate exists yet. The `Generator` trait is in `engine` and the `git-config` and `text-fragments` adapters are in the `cli` crate (docs/adapters.md). `model` re-exports `toml::Value` and `toml::Table` from `dfm_model::resolve` on purpose: the `cli` crate names the value type of a resolved resource through it, so no direct `toml` dependency is added to `cli` and the allow-list in the gate test stays as it is.
+
 
 - `model` takes already-read bytes and returns typed values. It performs no filesystem, process or network call and depends on no other crate. `engine` reads sources through the `Fs` port and passes bytes to `model`.
 - **Status (DFM-18):** the `ports` and `adapters` crates are deferred. The `Generator` trait lives in `dfm-engine` for now and moves to a `ports` crate at DFM-20 kickoff. No adapter exists, so the release binary has no generator.

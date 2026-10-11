@@ -7,7 +7,7 @@
 //! `AT_REMOVEDIR`, so a directory is never removed and a link is removed, not followed.
 
 use crate::fail::Fail;
-use crate::fsys::{Dir, Sys, check_name, kind, mode_bits, sys_err, temp_name, unconfirmed};
+use crate::fsys::{Dir, Peek, Sys, check_name, kind, mode_bits, sys_err, temp_name, unconfirmed};
 use dfm_model::digest::sha256_hex;
 use dfm_model::plan::link_fingerprint;
 use dfm_model::{Code, Refusal};
@@ -71,6 +71,20 @@ impl Dir {
             cur = next;
         }
         Ok(cur)
+    }
+
+    /// As [`Dir::open_below`], but `None` when a component does not exist. A link, a file or
+    /// another owner is still `E_PARENT_UNSAFE`.
+    #[doc(hidden)]
+    pub fn open_below_opt(&self, sys: &Sys, rel: &[&str]) -> Result<Option<Dir>, Refusal> {
+        let mut cur = self.try_clone()?;
+        for name in rel {
+            if matches!(cur.peek(sys, name)?, Peek::Missing) {
+                return Ok(None);
+            }
+            cur = cur.open_below(sys, &[name])?;
+        }
+        Ok(Some(cur))
     }
 
     /// Creates the directory `name` with mode 0700 (the XDG default for a directory created on

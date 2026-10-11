@@ -83,7 +83,7 @@ An output row joins three facts: the ledger entry (who owns it), the live entry 
 | Claimed by the plan, not owned, plan would create it | WARN `D_PLAN_PENDING` |
 | Claimed, not owned, already the wanted result | WARN `D_PLAN_PENDING` when the plan adopts it (an exact link that no ledger entry mentions; the fix names `--allow-adopt`), else WARN `D_UNRECORDED` |
 | Sensitive output: a ledger entry of the sensitive class (compared with case folded), a path a selected sensitive resource claims, or a sensitive plan operation | N/A `D_NA_SENSITIVE`. No content is read or hashed, whoever owns the path. A planner blocker for the path (for example `E_CONFLICT` for a sensitive destination without a ledger entry) is shown instead, because it needs no content. |
-| Operation that needs generated content | N/A `D_NA_GENERATED`: not applicable in this build (no generator). |
+| Operation that needs generated content | N/A `D_NA_GENERATED`: doctor does not compare generated content. Apply checks it against the planned output hash (docs/adapters.md). |
 
 An owned output is compared by fingerprint: SHA-256 of the file content, or of the link target text for a link (`link_fingerprint`). The comparison reads the file (a read, never a write).
 
@@ -95,7 +95,7 @@ An owned output is compared by fingerprint: SHA-256 of the file content, or of t
 | --- | --- |
 | `D_OK` | The check passed. |
 | `D_NA_SENSITIVE` | A sensitive output. Its content is never read or hashed. |
-| `D_NA_GENERATED` | A generated file. No generator exists in this build. |
+| `D_NA_GENERATED` | A generated file. Doctor does not compare generated content. |
 | `D_OUTPUT_MISSING` | An owned output no longer exists. Apply publishes it again. |
 | `D_PLAN_PENDING` | The plan would create or update this output. Nothing owned was edited. |
 | `D_PLAN_REMOVAL` | The plan would remove this owned output. Nothing selects it any more. |

@@ -222,6 +222,16 @@ pub enum PeekTo {
     Loop,
 }
 
+/// The result of reading an input file ([`Dir::read_input`]).
+#[derive(Debug, PartialEq, Eq)]
+pub enum Got {
+    Bytes(Vec<u8>),
+    /// Absent, not a regular file, owned by another user or hard-linked.
+    Absent,
+    /// Larger than the limit. Nothing was read.
+    TooBig,
+}
+
 /// An open directory. Operations take a plain entry name and act on this directory only.
 #[derive(Debug)]
 pub struct Dir {
@@ -772,8 +782,68 @@ impl Dir {
         Ok((u64::try_from(buf.len()).unwrap_or(u64::MAX) <= limit).then_some(buf))
     }
 
+    /// Reads an input of a generated file: the regular file `name`, opened without following a
+    /// link. The file must be owned by the current user and have one hard link, so a file
+    /// planted as a second name for someone else's data is not taken for an input. The size is
+    /// checked on the descriptor before anything is read, so a file over `limit` is never
+    /// allocated.
+    pub fn read_input(&self, sys: &Sys, name: &str, limit: u64) -> Result<Got, Refusal> {
+        check_name(name)?;
+        let fd = match rfs::openat(
+            &self.fd,
+            name,
+            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+            Mode::empty(),
+        ) {
+            Ok(fd) => fd,
+            Err(Errno::NOENT | Errno::LOOP | Errno::NOTDIR) => return Ok(Got::Absent),
+            Err(e) => return Err(sys_err(&format!("open {}", self.at(name).display()), e)),
+        };
+        let st = rfs::fstat(&fd).map_err(|e| sys_err("stat file", e))?;
+        if kind(&st) != FileType::RegularFile || st.st_uid != sys.uid || u64::from(st.st_nlink) != 1
+        {
+            return Ok(Got::Absent);
+        }
+        if u64::try_from(st.st_size).unwrap_or(u64::MAX) > limit {
+            return Ok(Got::TooBig);
+        }
+        let mut buf = Vec::new();
+        File::from(fd)
+            .take(limit.saturating_add(1))
+            .read_to_end(&mut buf)
+            .map_err(|e| io("read file", &e))?;
+        Ok(if u64::try_from(buf.len()).unwrap_or(u64::MAX) <= limit {
+            Got::Bytes(buf)
+        } else {
+            Got::TooBig
+        })
+    }
+
+    /// As [`Dir::read_input`] for the `/`-separated relative path `rel`. Every parent is opened
+    /// without following a link. A missing or non-directory parent is `Absent`.
+    pub fn read_input_below(&self, sys: &Sys, rel: &str, limit: u64) -> Result<Got, Refusal> {
+        let mut parts: Vec<&str> = rel.split('/').collect();
+        let Some(name) = parts.pop() else {
+            return Ok(Got::Absent);
+        };
+        let mut cur = self.try_clone()?;
+        for p in parts {
+            cur = match cur.peek_dir(p)? {
+                Some(next) => next,
+                None => return Ok(Got::Absent),
+            };
+        }
+        cur.read_input(sys, name, limit)
+    }
+
     /// Lists this directory. Entry names that are not UTF-8 are counted, not dropped silently.
     pub fn list(&self) -> Result<Listing, Refusal> {
+        self.list_upto(usize::MAX)
+    }
+
+    /// As [`Dir::list`], but stops after `max + 1` names, so a huge directory is not read into
+    /// memory. More than `max` names in the result means the listing was cut.
+    pub fn list_upto(&self, max: usize) -> Result<Listing, Refusal> {
         LISTED.with(|c| c.set(c.get() + 1));
         let mut rd = rfs::Dir::read_from(&self.fd).map_err(|e| sys_err("list directory", e))?;
         rd.rewind();
@@ -787,6 +857,9 @@ impl Dir {
             match std::str::from_utf8(n) {
                 Ok(s) => out.names.push(s.to_string()),
                 Err(_) => out.odd += 1,
+            }
+            if out.names.len() > max {
+                break;
             }
         }
         out.names.sort();

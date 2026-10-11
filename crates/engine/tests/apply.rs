@@ -6,12 +6,13 @@ mod common;
 
 use common::*;
 use dfm_engine::{
-    Action as Inject, Dir, Fail, Generator, NoGenerator, Run, Store, apply, observe, owned_outputs,
+    Action as Inject, Dir, Fail, Generator, GeneratorInputs, NoGenerator, Run, Store, apply,
+    observe, owned_outputs,
 };
 use dfm_model::digest::sha256_hex;
 use dfm_model::plan::{
-    Action, Binary, Observations, Operation, Ownership, Plan, Precondition, Request, Source,
-    Status as PlanStatus, ledger_state, link_fingerprint, node_state,
+    Action, Binary, Fragment, Input, Observations, Operation, Ownership, Plan, Precondition,
+    Request, Source, Status as PlanStatus, ledger_state, link_fingerprint, node_state,
 };
 use dfm_model::state::{Class, JournalEntry, LedgerResource, OwnedOutput, Phase, Status};
 use dfm_model::{Code, Refusal};
@@ -28,12 +29,27 @@ impl Generator for Gen {
     fn supports(&self, op: &Operation) -> bool {
         self.0.contains_key(&op.id)
     }
-    fn generate(&self, op: &Operation) -> Result<Vec<u8>, Refusal> {
+    fn generate(&self, op: &Operation, _: &GeneratorInputs) -> Result<Vec<u8>, Refusal> {
         self.0
             .get(&op.id)
             .cloned()
             .ok_or_else(|| Refusal::new(Code::GeneratorUnavailable, "none"))
     }
+}
+
+/// The planner records the output hash of a generated file. The test plans carry none, so it is
+/// filled in from the generator, as the CLI does at plan time.
+fn fill(p: &Plan, g: &dyn Generator) -> Plan {
+    let mut p = p.clone();
+    for op in &mut p.operations {
+        if op.output_sha256.is_none()
+            && g.supports(op)
+            && let Ok(b) = g.generate(op, &GeneratorInputs::default())
+        {
+            op.output_sha256 = Some(sha256_hex(&b));
+        }
+    }
+    p
 }
 
 fn gen_for(id: &str, content: &str) -> Gen {
@@ -101,6 +117,10 @@ fn op(h: &Home, store: &Store, id: &str, n: u32, action: Action, rel: &str) -> O
         ownership: Ownership::Absent,
         inputs: vec![],
         fragments: vec![],
+        fragment_dir: None,
+        output_sha256: None,
+        output_bytes: None,
+        sets: vec![],
         after: vec![],
         preconditions: pre,
         postcondition: String::new(),
@@ -173,14 +193,14 @@ fn go_with(
 ) -> dfm_engine::Report {
     let home = Dir::open_home(&sys(&s.h), &s.h.0).unwrap();
     let r = run(s, g, allow, fail, &home);
-    apply(&r, p).unwrap()
+    apply(&r, &fill(p, g)).unwrap()
 }
 
 fn refused(s: &Setup, p: &Plan, g: &dyn Generator, allow: &BTreeSet<String>) -> Refusal {
     let home = Dir::open_home(&sys(&s.h), &s.h.0).unwrap();
     let fail = Fail::none();
     let r = run(s, g, allow, &fail, &home);
-    apply(&r, p).unwrap_err()
+    apply(&r, &fill(p, g)).unwrap_err()
 }
 
 fn none() -> BTreeSet<String> {
@@ -1309,4 +1329,288 @@ fn an_adoption_target_outside_the_source_root_is_refused() {
     o.link = Some("/elsewhere/x".into());
     let e = refused(&s, &plan(vec![o]), &NoGenerator, &none());
     assert_eq!(e.code, Code::PlanInvalid);
+}
+
+// ---- the generator seam: verified inputs, planned output hash, last-good output ------------
+
+/// Joins the body and the listed fragments with a newline, as `text-fragments/v1` does. A name
+/// ending in `.md` in the live listing that the plan does not list is stale.
+struct Joiner;
+
+impl Generator for Joiner {
+    fn supports(&self, op: &Operation) -> bool {
+        op.adapter == "text-fragments/v1"
+    }
+    fn generate(&self, _op: &Operation, i: &GeneratorInputs) -> Result<Vec<u8>, Refusal> {
+        if let Some(n) = i
+            .listing
+            .iter()
+            .flatten()
+            .find(|n| n.ends_with(".md") && !i.fragments.contains_key(*n))
+        {
+            return Err(Refusal::new(Code::PlanStale, format!("{n} appeared")));
+        }
+        let body = i
+            .sources
+            .get("files/body")
+            .ok_or_else(|| Refusal::new(Code::PlanInvalid, "no body"))?;
+        let mut parts = vec![body.clone()];
+        parts.extend(i.fragments.values().cloned());
+        Ok(parts.join(&b'\n'))
+    }
+}
+
+/// Always fails to generate.
+struct Failing;
+
+impl Generator for Failing {
+    fn supports(&self, _op: &Operation) -> bool {
+        true
+    }
+    fn generate(&self, _op: &Operation, _i: &GeneratorInputs) -> Result<Vec<u8>, Refusal> {
+        Err(Refusal::new(
+            Code::ManifestInvalid,
+            "the value is malformed",
+        ))
+    }
+}
+
+struct Asm {
+    plan: Plan,
+    src: std::path::PathBuf,
+}
+
+/// An assemble plan: one `out` file from `files/body` and the foreign fragments in `frags/`.
+fn asm(s: &Setup, tag: &str, body: &str, frags: &[(&str, &[u8])]) -> Asm {
+    // The source tree sits in the test HOME, so it is removed with it.
+    let src = s.h.0.join(format!(".src-{tag}"));
+    fs::create_dir_all(src.join("files")).unwrap();
+    fs::write(src.join("files/body"), body).unwrap();
+    fs::create_dir_all(s.h.0.join("frags")).unwrap();
+    let mut fragments = Vec::new();
+    let mut want = vec![body.as_bytes().to_vec()];
+    let mut sorted: Vec<_> = frags.to_vec();
+    sorted.sort();
+    for (n, b) in &sorted {
+        fs::write(s.h.0.join("frags").join(n), b).unwrap();
+        fragments.push(Fragment {
+            name: (*n).into(),
+            origin: "foreign".into(),
+            sha256: Some(sha256_hex(b)),
+        });
+        want.push(b.to_vec());
+    }
+    let mut o = op(&s.h, &s.store, "x@out", 1, Action::CreateFile, "out");
+    o.adapter = "text-fragments/v1".into();
+    o.inputs = vec![Input {
+        path: "files/body".into(),
+        content_id: Some(format!("sha256:{}", sha256_hex(body.as_bytes()))),
+    }];
+    o.preconditions.push(Precondition {
+        subject: "source:files/body".into(),
+        state: format!("sha256:{}", sha256_hex(body.as_bytes())),
+    });
+    o.fragments = fragments;
+    o.fragment_dir = Some("frags".into());
+    o.output_sha256 = Some(sha256_hex(&want.join(&b'\n')));
+    let mut p = plan(vec![o]);
+    p.sources[0].root = src.to_str().unwrap().into();
+    Asm { plan: p, src }
+}
+
+/// Whether `text` holds a run of 64 hex digits: a SHA-256 printed in full.
+fn prints_a_hash(text: &str) -> bool {
+    let mut run = 0;
+    for c in text.chars() {
+        run = if c.is_ascii_hexdigit() { run + 1 } else { 0 };
+        if run >= 64 {
+            return true;
+        }
+    }
+    false
+}
+
+fn blocked_stale(s: &Setup, a: &Asm) {
+    let r = go(s, &a.plan, &Joiner, &none());
+    assert_eq!(r.operations[0].status, Status::Blocked, "{:?}", r.stopped);
+    assert_eq!(r.stopped.as_ref().unwrap().code, Code::PlanStale);
+    // The message names the path. It does not print a live hash of someone's file.
+    let why = &r.stopped.as_ref().unwrap().detail;
+    assert!(!prints_a_hash(why), "{why}");
+    assert!(!s.h.0.join("out").exists(), "nothing was written");
+    assert!(
+        s.store.read_journal().unwrap().is_empty(),
+        "no intent entry"
+    );
+}
+
+#[test]
+fn fragments_are_read_through_the_opened_directory_and_joined_in_byte_order() {
+    let s = setup();
+    let a = asm(
+        &s,
+        "order",
+        "body",
+        &[("m.md", b"two"), ("Z.md", b"one"), ("a.md", b"three")],
+    );
+    let r = go(&s, &a.plan, &Joiner, &none());
+    assert_eq!(r.operations[0].status, Status::Updated, "{:?}", r.stopped);
+    // Byte order: uppercase before lowercase.
+    assert_eq!(
+        fs::read_to_string(s.h.0.join("out")).unwrap(),
+        "body\none\nthree\ntwo"
+    );
+}
+
+#[test]
+fn a_missing_fragment_directory_with_no_listed_fragment_assembles_the_body_alone() {
+    let s = setup();
+    let a = asm(&s, "nodir", "body", &[]);
+    fs::remove_dir(s.h.0.join("frags")).unwrap();
+    let r = go(&s, &a.plan, &Joiner, &none());
+    assert_eq!(r.operations[0].status, Status::Updated, "{:?}", r.stopped);
+    assert_eq!(fs::read_to_string(s.h.0.join("out")).unwrap(), "body");
+}
+
+#[test]
+fn a_fragment_that_disappeared_changed_or_was_swapped_is_stale_and_writes_nothing() {
+    let frags: &[(&str, &[u8])] = &[("a.md", b"one"), ("b.md", b"two")];
+    type Swap = fn(&Setup);
+    let swaps: [(&str, Swap); 6] = [
+        ("gone", |s| {
+            fs::remove_file(s.h.0.join("frags/a.md")).unwrap()
+        }),
+        ("edited", |s| {
+            fs::write(s.h.0.join("frags/a.md"), "ONE").unwrap()
+        }),
+        ("link", |s| {
+            fs::remove_file(s.h.0.join("frags/a.md")).unwrap();
+            fs::write(s.h.0.join("elsewhere"), "one").unwrap();
+            symlink(s.h.0.join("elsewhere"), s.h.0.join("frags/a.md")).unwrap();
+        }),
+        ("hardlink", |s| {
+            // Same bytes, same hash, but a second name: not the file the plan hashed.
+            fs::hard_link(s.h.0.join("frags/a.md"), s.h.0.join("second-name")).unwrap();
+        }),
+        ("fifo", |s| {
+            fs::remove_file(s.h.0.join("frags/a.md")).unwrap();
+            let st = std::process::Command::new("mkfifo")
+                .arg(s.h.0.join("frags/a.md"))
+                .status()
+                .unwrap();
+            assert!(st.success());
+        }),
+        ("oversize", |s| {
+            fs::write(s.h.0.join("frags/a.md"), vec![b'x'; (16 << 20) + 1]).unwrap();
+        }),
+    ];
+    for (what, swap) in swaps {
+        let s = setup();
+        let a = asm(&s, what, "body", frags);
+        swap(&s);
+        blocked_stale(&s, &a);
+    }
+}
+
+#[test]
+fn a_fragment_that_appeared_after_planning_is_stale_but_an_unmatched_name_is_not() {
+    let s = setup();
+    let a = asm(&s, "appear", "body", &[("a.md", b"one")]);
+    fs::write(s.h.0.join("frags/new.md"), "late").unwrap();
+    blocked_stale(&s, &a);
+    let s = setup();
+    let a = asm(&s, "other", "body", &[("a.md", b"one")]);
+    fs::write(s.h.0.join("frags/notes.txt"), "late").unwrap();
+    let r = go(&s, &a.plan, &Joiner, &none());
+    assert_eq!(r.operations[0].status, Status::Updated, "{:?}", r.stopped);
+}
+
+#[test]
+fn a_source_replaced_after_planning_is_stale_and_writes_nothing() {
+    for what in ["edit", "link", "gone"] {
+        let s = setup();
+        let a = asm(&s, what, "body", &[]);
+        let body = a.src.join("files/body");
+        match what {
+            "edit" => fs::write(&body, "other body").unwrap(),
+            "link" => {
+                fs::remove_file(&body).unwrap();
+                fs::write(a.src.join("files/real"), "body").unwrap();
+                symlink(a.src.join("files/real"), &body).unwrap();
+            }
+            _ => fs::remove_file(&body).unwrap(),
+        }
+        blocked_stale(&s, &a);
+    }
+}
+
+#[test]
+fn generated_bytes_that_differ_from_the_planned_hash_are_stale_and_write_nothing() {
+    let s = setup();
+    let mut a = asm(&s, "hash", "body", &[("a.md", b"one")]);
+    a.plan.operations[0].output_sha256 = Some(sha256_hex(b"something else"));
+    blocked_stale(&s, &a);
+}
+
+#[test]
+fn a_plan_without_an_output_hash_for_a_generated_file_is_invalid() {
+    let s = setup();
+    let mut a = asm(&s, "nohash", "body", &[]);
+    a.plan.operations[0].output_sha256 = None;
+    let e = refused(&s, &a.plan, &Joiner, &none());
+    assert_eq!(e.code, Code::PlanInvalid);
+    assert!(!s.h.0.join("out").exists());
+}
+
+#[test]
+fn a_generation_failure_keeps_the_last_good_output_and_blocks_dependents() {
+    let s = setup();
+    fs::write(s.h.0.join("out"), "good\n").unwrap();
+    own(&s, "out", "good\n");
+    let mut o = op(&s.h, &s.store, "x@out", 1, Action::UpdateFile, "out");
+    o.output_sha256 = Some(sha256_hex(b"new\n"));
+    let mut dep = op(&s.h, &s.store, "x@dep", 2, Action::CreateFile, "dep");
+    dep.after = vec![o.id.clone()];
+    dep.output_sha256 = Some(sha256_hex(b"dep\n"));
+    let r = go(&s, &plan(vec![o, dep]), &Failing, &none());
+    assert_eq!(r.operations[0].status, Status::Failed);
+    assert_eq!(r.operations[1].status, Status::Blocked);
+    assert_eq!(r.stopped.as_ref().unwrap().code, Code::ManifestInvalid);
+    assert_eq!(fs::read_to_string(s.h.0.join("out")).unwrap(), "good\n");
+    assert!(!s.h.0.join("dep").exists());
+    assert!(s.store.read_journal().unwrap().is_empty());
+    assert_eq!(leftovers(&s.h.0), Vec::<String>::new());
+    // The ledger still names the last good content.
+    let l = s.store.read_ledger().unwrap();
+    assert_eq!(
+        l.resources[0].owned_outputs[0].fingerprint.as_deref(),
+        Some(sha256_hex(b"good\n").as_str())
+    );
+}
+
+#[test]
+fn fragments_together_over_the_cap_are_refused_before_they_are_all_read() {
+    let s = setup();
+    // Five fragments of 4 MiB: each is within the file bound, together they are 20 MiB.
+    let big = vec![b'x'; 4 << 20];
+    let frags: Vec<(String, &[u8])> = (0..5)
+        .map(|i| (format!("{i}.md"), big.as_slice()))
+        .collect();
+    let refs: Vec<(&str, &[u8])> = frags.iter().map(|(n, b)| (n.as_str(), *b)).collect();
+    let a = asm(&s, "cap", "body", &refs);
+    let r = go(&s, &a.plan, &Joiner, &none());
+    assert_eq!(r.operations[0].status, Status::Failed, "{:?}", r.stopped);
+    assert_eq!(r.stopped.as_ref().unwrap().code, Code::LimitExceeded);
+    assert!(!s.h.0.join("out").exists());
+    assert!(s.store.read_journal().unwrap().is_empty());
+}
+
+#[test]
+fn a_fragment_directory_with_too_many_entries_is_stale() {
+    let s = setup();
+    let a = asm(&s, "many", "body", &[("a.md", b"one")]);
+    for i in 0..=dfm_model::plan::MAX_LISTING {
+        fs::write(s.h.0.join("frags").join(format!("n{i}.txt")), "").unwrap();
+    }
+    blocked_stale(&s, &a);
 }
