@@ -39,6 +39,41 @@ fn spec(
     }
 }
 
+/// A Git config value as `git config` returns it: double quotes group text, a backslash escapes
+/// the next character (`\n`, `\t`, `\b`, `\\`, `\"`), and an unquoted `#` or `;` starts a comment.
+/// Unquoted leading and trailing white space is dropped.
+fn config_value(raw: &str) -> String {
+    let (mut out, mut keep, mut quoted) = (String::new(), 0, false);
+    let mut chars = raw.trim_start().chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '"' => {
+                quoted = !quoted;
+                keep = out.len();
+            }
+            '#' | ';' if !quoted => break,
+            '\\' => {
+                match chars.next() {
+                    Some('n') => out.push('\n'),
+                    Some('t') => out.push('\t'),
+                    Some('b') => out.push('\u{8}'),
+                    Some(other) => out.push(other),
+                    None => break,
+                }
+                keep = out.len();
+            }
+            c => {
+                out.push(c);
+                if quoted || !c.is_whitespace() {
+                    keep = out.len();
+                }
+            }
+        }
+    }
+    out.truncate(keep);
+    out
+}
+
 /// Include directives of a Git config, in file order: `[include]` and `[includeIf "<cond>"]`
 /// sections with a `path` key. Nothing else in the file matters for precedence. A key may follow
 /// the header on the same line (`[include] path = x`), which Git accepts. A section name that
@@ -75,7 +110,7 @@ fn git_includes(text: &str) -> Vec<Include> {
             && key.trim().eq_ignore_ascii_case("path")
         {
             out.push(Include {
-                path: value.trim().trim_matches('"').to_string(),
+                path: config_value(value),
                 condition: cond.clone(),
             });
         }
@@ -361,6 +396,29 @@ mod tests {
         );
         // A comment after the header is not a key.
         assert!(got("[include] # path = ~/a\n").is_empty());
+    }
+
+    #[test]
+    fn an_include_value_is_read_as_git_reads_it() {
+        let got = |t: &str| {
+            git_includes(t)
+                .into_iter()
+                .map(|i| i.path)
+                .collect::<Vec<_>>()
+        };
+        // Quotes and a trailing comment are not part of the path.
+        assert_eq!(
+            got("[include]\npath = \"~/.config/foo.inc\" # local identity\n"),
+            ["~/.config/foo.inc"]
+        );
+        assert_eq!(
+            got("[include]\npath = ~/a.inc ; note\n[include]\npath=~/b.inc#x\n"),
+            ["~/a.inc", "~/b.inc"]
+        );
+        // A comment character inside quotes stays, and so does white space inside quotes.
+        assert_eq!(got("[include]\npath = \"~/a#b ;c \"  \n"), ["~/a#b ;c "]);
+        // A backslash escapes the next character.
+        assert_eq!(got("[include]\npath = \"~/a\\\"b\"\n"), ["~/a\"b"]);
     }
 
     #[test]
