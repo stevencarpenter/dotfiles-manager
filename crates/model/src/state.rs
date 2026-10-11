@@ -773,6 +773,47 @@ pub fn unfinished(entries: &[JournalEntry]) -> Vec<&JournalEntry> {
         .collect()
 }
 
+/// An operation whose latest outcome entry is `unknown` (DFM-19). It is not settled: the path
+/// stays blocked in every run until a probe or the operator decides it. `intent` is the
+/// operation's last intent entry, which holds the recovery metadata. The `unknown` entry has none.
+#[derive(Debug, Clone, Copy)]
+pub struct Unresolved<'a> {
+    pub intent: Option<&'a JournalEntry>,
+    pub unknown: &'a JournalEntry,
+}
+
+impl Unresolved<'_> {
+    /// The paths the operation may have changed, as the intent recorded them.
+    pub fn paths(&self) -> impl Iterator<Item = &str> {
+        self.intent
+            .into_iter()
+            .flat_map(|i| i.recovery.iter().flat_map(|r| &r.outputs))
+            .map(|o| o.path.as_str())
+    }
+}
+
+/// Operations whose last non-intent entry is `unknown`, in journal order. A later `done` or
+/// `failed` entry for the same `(op_id, op)` settles one.
+pub fn unresolved(entries: &[JournalEntry]) -> Vec<Unresolved<'_>> {
+    entries
+        .iter()
+        .enumerate()
+        .filter(|(i, e)| {
+            e.phase == Phase::Unknown
+                && !entries[i + 1..]
+                    .iter()
+                    .any(|t| t.phase != Phase::Intent && t.op_id == e.op_id && t.op == e.op)
+        })
+        .map(|(i, e)| Unresolved {
+            intent: entries[..i]
+                .iter()
+                .rev()
+                .find(|t| t.phase == Phase::Intent && t.op_id == e.op_id && t.op == e.op),
+            unknown: e,
+        })
+        .collect()
+}
+
 // ---- trials -----------------------------------------------------------------------------------
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

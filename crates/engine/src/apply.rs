@@ -16,6 +16,7 @@ use crate::fsys::{Dir, Live, Peek, Sys};
 use crate::generate::{Gather, Generator, GeneratorInputs, gather};
 use crate::observe::observe;
 use crate::publish::Publish;
+use crate::recover;
 use crate::store::{Probe, Store, now_unix};
 use dfm_model::digest::sha256_hex;
 use dfm_model::fold;
@@ -139,7 +140,7 @@ fn plan_invalid(detail: impl Into<String>) -> Refusal {
 
 /// The components of a HOME-relative path. A component that is empty, `.`, `..` or holds a
 /// control character is refused: the plan is ours, but the check costs nothing.
-fn components(rel: &str) -> Result<Vec<&str>, Refusal> {
+pub(crate) fn components(rel: &str) -> Result<Vec<&str>, Refusal> {
     let comps: Vec<&str> = rel.split('/').collect();
     if comps
         .iter()
@@ -472,7 +473,7 @@ struct Exec<'a, 'r> {
     attempts: BTreeMap<String, u32>,
     /// Paths whose state is unknown (an interrupted or unconfirmed operation). Nothing more is
     /// done to them in this run.
-    unknown_paths: BTreeSet<String>,
+    unknown_paths: BTreeMap<String, String>,
     /// The last good clock reading (unix seconds). A clock that fails later in the run reuses
     /// it, so no stamp is ever invented.
     clock: Cell<u64>,
@@ -543,11 +544,15 @@ impl Exec<'_, '_> {
         rfc3339(self.clock.get())
     }
 
-    fn path_unknown(&self, abs: &str) -> bool {
-        self.unknown_paths.iter().any(|u| {
-            let (a, b) = (u.as_str(), abs);
-            a == b || a.starts_with(&format!("{b}/")) || b.starts_with(&format!("{a}/"))
-        })
+    /// The journal id that holds `abs` (or a descendant or ancestor of it) in an unknown state.
+    fn path_unknown(&self, abs: &str) -> Option<&str> {
+        self.unknown_paths
+            .iter()
+            .find(|(u, _)| {
+                let (a, b) = (u.as_str(), abs);
+                a == b || a.starts_with(&format!("{b}/")) || b.starts_with(&format!("{a}/"))
+            })
+            .map(|(_, id)| id.as_str())
     }
 
     fn abs(&self, rel: &str) -> Result<String, Refusal> {
@@ -695,7 +700,7 @@ impl Exec<'_, '_> {
     /// is `unknown`, its path is blocked for the rest of the run, and it is not a plain failure.
     fn after_intent(&mut self, e: Refusal, id: &str, abs: &str) -> Ended {
         if e.code == Code::IoUnconfirmed {
-            self.unknown_paths.insert(abs.into());
+            self.unknown_paths.insert(abs.into(), id.into());
             Ended::Unknown(e, Some(id.into()))
         } else {
             Ended::Failed(e, Some(id.into()))
@@ -721,11 +726,11 @@ impl Exec<'_, '_> {
             .ok_or_else(|| failed(plan_invalid("no path")))?;
         let comps = components(rel).map_err(failed)?;
         let abs = self.abs(rel).map_err(failed)?;
-        if self.path_unknown(&abs) {
+        if let Some(id) = self.path_unknown(&abs) {
             return Err(blocked(
                 Code::OpInterrupted,
                 format!(
-                    "{rel}: an interrupted or unconfirmed operation left it in an unknown state"
+                    "{rel}: operation {id} left it in an unknown state. Nothing was changed. Fix: check the path, then run `dotfiles-manager state resolve {id} --as done` (the path is the result the operation expected) or `--as failed`. A later apply also settles it when the path again shows a clear result"
                 ),
             ));
         }
@@ -862,11 +867,11 @@ impl Exec<'_, '_> {
             .ok_or_else(|| failed(plan_invalid("no path")))?;
         let comps = components(rel).map_err(failed)?;
         let abs = self.abs(rel).map_err(failed)?;
-        if self.path_unknown(&abs) {
+        if let Some(id) = self.path_unknown(&abs) {
             return Err(blocked(
                 Code::OpInterrupted,
                 format!(
-                    "{rel}: an interrupted or unconfirmed operation left it in an unknown state"
+                    "{rel}: operation {id} left it in an unknown state. Nothing was changed. Fix: check the path, then run `dotfiles-manager state resolve {id} --as done` or `--as failed`"
                 ),
             ));
         }
@@ -1335,42 +1340,13 @@ impl Exec<'_, '_> {
         fp: &str,
         mode: u32,
     ) -> Result<(), Refusal> {
-        let mut ledger = self.run.store.read_ledger_lenient()?;
-        let mut outs = ledger
-            .resources
-            .iter()
-            .find(|r| r.resource == op.resource)
-            .map(|r| r.owned_outputs.clone())
-            .unwrap_or_default();
-        outs.retain(|o| o.path != abs);
-        outs.push(OwnedOutput {
-            path: abs.into(),
-            mode,
-            fingerprint: Some(fp.into()),
-            coowned: None,
-        });
-        outs.sort_by(|a, b| a.path.cmp(&b.path));
-        ledger.record(LedgerResource {
-            resource: op.resource.clone(),
-            adapter: op.adapter.clone(),
-            class: op.class,
-            op_id: id.into(),
-            owned_outputs: outs,
-        })?;
-        self.run.store.write_ledger(&ledger)
+        let who = (op.resource.as_str(), op.adapter.as_str(), op.class);
+        recover::record_output(self.run.store, who, id, abs, fp, mode)
     }
 
     /// Drops one output from the ledger, and the resource when it owns nothing else.
     fn forget_output(&self, op: &Operation, id: &str, abs: &str) -> Result<(), Refusal> {
-        let mut ledger = self.run.store.read_ledger_lenient()?;
-        for r in &mut ledger.resources {
-            if r.resource == op.resource {
-                r.owned_outputs.retain(|o| o.path != abs);
-                r.op_id = id.into();
-            }
-        }
-        ledger.resources.retain(|r| !r.owned_outputs.is_empty());
-        self.run.store.write_ledger(&ledger)
+        recover::forget_output(self.run.store, &op.resource, id, abs)
     }
 
     /// Whether the entry at `rel` is absent right now, read through the opened HOME without
@@ -1406,7 +1382,7 @@ impl Exec<'_, '_> {
                 .any(|r| r.resource == op.resource && r.owned_outputs.iter().any(|o| o.path == abs))
         });
         match listed {
-            Ok(true) if !self.path_unknown(&abs) && self.absent_now(rel) => {}
+            Ok(true) if self.path_unknown(&abs).is_none() && self.absent_now(rel) => {}
             Ok(_) => return Ended::Current,
             Err(e) => return failed(e),
         }
@@ -1443,81 +1419,25 @@ impl Exec<'_, '_> {
     /// Answers an interrupted operation's `already_done` question from the live entry, read
     /// through the opened HOME. It decides nothing about ownership.
     fn probe(&self, e: &JournalEntry) -> Probe {
-        let Some(out) = e.recovery.as_ref().and_then(|r| r.outputs.first()) else {
-            return Probe::Unknown;
-        };
-        let Some(rel) = Path::new(&out.path)
-            .strip_prefix(self.run.home_path)
-            .ok()
-            .and_then(Path::to_str)
-        else {
-            return Probe::Unknown;
-        };
-        let Ok(comps) = components(rel) else {
-            return Probe::Unknown;
-        };
-        let Some((name, parents)) = comps.split_last() else {
-            return Probe::Unknown;
-        };
-        let (sys, home) = (&self.run.sys, self.run.home);
-        let live = home
-            .open_below(sys, parents)
-            .and_then(|p| p.peek(sys, name).map(|l| (p, l)));
-        let Ok((parent, live)) = live else {
-            return Probe::Unknown;
-        };
-        let fp = match &live {
-            Peek::File { .. } => parent
-                .hash_file(name, MAX_FILE)
-                .ok()
-                .flatten()
-                .map(|(h, _)| h),
-            Peek::Link { target, .. } => Some(link_fingerprint(target)),
-            _ => None,
-        };
-        match (e.op.as_str(), &live) {
-            ("remove", Peek::Missing) => Probe::Done,
-            ("remove", _) if fp.is_some() && fp == out.expected_sha256 => Probe::NotDone,
-            ("create-dir", Peek::Dir { .. }) => Probe::Done,
-            (_, Peek::Missing) => Probe::NotDone,
-            ("create-link" | "replace-link" | "create-file" | "update-file" | "adopt", _)
-                if fp.is_some() && fp == out.expected_sha256 =>
-            {
-                Probe::Done
-            }
-            _ => Probe::Unknown,
-        }
+        recover::inspect(&self.run.sys, self.run.home, self.run.home_path, e).0
     }
 }
 
-/// Journal entries of earlier runs that never reached a terminal entry are settled first
-/// (architecture section 5): the operation's `already_done` check decides `done` or `failed`,
-/// or `unknown`, which blocks work on that path for this run. Nothing is run again and no
-/// ownership is created.
+/// Journal entries of earlier runs are settled first (architecture section 5, DFM-19).
+///
+/// 1. An `intent` with no terminal entry is probed with the operation's `already_done` check
+///    and journaled `done`, `failed` or `unknown`. Nothing is run again and no ownership is
+///    created.
+/// 2. Every `unknown` entry still outstanding, from this step or from an earlier run, is probed
+///    again. A clear answer journals `done` (with ownership as the operation would have
+///    recorded it) or `failed`. An unclear one blocks its path in this run.
 fn settle(ex: &mut Exec<'_, '_>) -> Result<(), Refusal> {
     let entries = ex.run.store.read_journal_lenient()?;
-    let pending: Vec<(String, String, Vec<String>)> = unfinished(&entries)
-        .into_iter()
-        .map(|e| {
-            let paths = e
-                .recovery
-                .iter()
-                .flat_map(|r| r.outputs.iter().map(|o| o.path.clone()))
-                .collect();
-            (e.op_id.clone(), e.op.clone(), paths)
-        })
-        .collect();
-    if !pending.is_empty() {
-        let settled = ex.run.store.reconcile(&|e| ex.probe(e))?;
-        for (id, op, phase) in settled {
-            if phase == Phase::Unknown
-                && let Some((_, _, paths)) = pending.iter().find(|(i, o, _)| *i == id && *o == op)
-            {
-                ex.unknown_paths.extend(paths.iter().cloned());
-            }
-        }
+    if !unfinished(&entries).is_empty() {
+        ex.run.store.reconcile(&|e| ex.probe(e))?;
     }
-    // Reconcile appends only terminal entries, so the intents counted here are all there are.
+    ex.unknown_paths.extend(recover::recover_unknown(ex.run)?);
+    // Settling appends only terminal entries, so the intents counted here are all there are.
     for entry in entries.iter().filter(|e| e.phase == Phase::Intent) {
         if let Some((jid, _)) = entry.op_id.rsplit_once('-') {
             *ex.attempts.entry(jid.to_string()).or_insert(0) += 1;
@@ -1593,7 +1513,7 @@ fn execute(run: &Run<'_>, plan: &Plan) -> Report {
         run,
         plan,
         attempts: BTreeMap::new(),
-        unknown_paths: BTreeSet::new(),
+        unknown_paths: BTreeMap::new(),
         clock: Cell::new(*clock.as_ref().unwrap_or(&0)),
     };
     // A failure to settle earlier work stops the run before its first operation.

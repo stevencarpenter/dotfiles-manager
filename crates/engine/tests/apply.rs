@@ -1668,3 +1668,264 @@ fn a_fragment_directory_with_too_many_entries_is_stale() {
     }
     blocked_stale(&s, &a);
 }
+
+// ---- recovery across runs (DFM-19) -----------------------------------------------------------
+
+/// Run 1 ends `unknown` for a link `l` (the failpoint fires after the link exists).
+fn unknown_link(s: &Setup) {
+    let mut l = op(&s.h, &s.store, "x@link", 1, Action::CreateLink, "l");
+    l.link = Some("/src/x".into());
+    let rep = go_with(
+        s,
+        &plan(vec![l]),
+        &gens(),
+        &none(),
+        &Fail::at("link-after-create", Inject::Error),
+    );
+    assert_eq!(rep.operations[0].status, Status::Unknown);
+}
+
+/// A later run that only creates the unrelated file `g`.
+fn later_run(s: &Setup) -> dfm_engine::Report {
+    let g = op(&s.h, &s.store, "x@file", 7, Action::CreateFile, "g");
+    go(s, &plan(vec![g]), &gens(), &none())
+}
+
+fn last_of(s: &Setup, id_prefix: &str) -> JournalEntry {
+    let j = s.store.read_journal().unwrap();
+    j.into_iter()
+        .rev()
+        .find(|e| e.op_id.starts_with(id_prefix))
+        .unwrap()
+}
+
+fn owned_paths(s: &Setup) -> Vec<(String, Option<String>)> {
+    s.store
+        .read_ledger()
+        .unwrap()
+        .resources
+        .iter()
+        .flat_map(|r| r.owned_outputs.iter())
+        .map(|o| (o.path.clone(), o.fingerprint.clone()))
+        .collect()
+}
+
+#[test]
+fn an_unknown_link_that_is_now_present_settles_done_in_the_next_run_with_ownership() {
+    let s = setup();
+    unknown_link(&s);
+    assert!(owned_paths(&s).is_empty(), "unknown records no ownership");
+    let rep = later_run(&s);
+    assert_eq!(rep.operations[0].status, Status::Updated);
+    let e = last_of(&s, &jid(1));
+    assert_eq!(e.phase, Phase::Done);
+    assert_eq!(e.reason.as_deref(), Some("recovered: done"));
+    let abs = s.h.0.join("l").to_str().unwrap().to_string();
+    assert!(owned_paths(&s).contains(&(abs, Some(link_fingerprint("/src/x")))));
+    assert_eq!(fs::read_link(s.h.0.join("l")).unwrap(), Path::new("/src/x"));
+}
+
+#[test]
+fn an_unknown_link_removed_between_runs_settles_failed_and_the_path_is_free() {
+    let s = setup();
+    unknown_link(&s);
+    fs::remove_file(s.h.0.join("l")).unwrap();
+    assert_eq!(later_run(&s).operations[0].status, Status::Updated);
+    let e = last_of(&s, &jid(1));
+    assert_eq!(e.phase, Phase::Failed);
+    assert_eq!(e.reason.as_deref(), Some("recovered: not done"));
+    assert!(owned_paths(&s).iter().all(|(p, _)| !p.ends_with("/l")));
+    // The path is free: a new link there is created.
+    let mut l = op(&s.h, &s.store, "x@link", 2, Action::CreateLink, "l");
+    l.link = Some("/src/x".into());
+    let rep = go(&s, &plan(vec![l]), &gens(), &none());
+    assert_eq!(rep.operations[0].status, Status::Updated);
+}
+
+#[test]
+fn an_unknown_that_the_probe_cannot_decide_blocks_its_path_in_every_run() {
+    let s = setup();
+    unknown_link(&s);
+    // The link is replaced by a directory: the probe cannot say whether the operation is done.
+    fs::remove_file(s.h.0.join("l")).unwrap();
+    fs::create_dir(s.h.0.join("l")).unwrap();
+    let before = fs::read_dir(s.h.0.join("l")).unwrap().count();
+    let id = last_of(&s, &jid(1)).op_id;
+    for n in 0..2 {
+        let g = op(
+            &s.h,
+            &s.store,
+            "x@file",
+            7,
+            Action::CreateFile,
+            &format!("g{n}"),
+        );
+        let mut l = op(&s.h, &s.store, "x@link", 2, Action::CreateLink, "l");
+        l.link = Some("/src/x".into());
+        let rep = go(&s, &plan(vec![g, l]), &gens(), &none());
+        assert_eq!(rep.operations[1].status, Status::Blocked);
+        let r = rep.stopped.unwrap();
+        assert_eq!(r.code, Code::OpInterrupted);
+        assert!(r.detail.contains(&id), "{}", r.detail);
+        assert!(r.detail.contains("state resolve"), "{}", r.detail);
+        assert_eq!(last_of(&s, &jid(1)).phase, Phase::Unknown);
+        assert_eq!(fs::read_dir(s.h.0.join("l")).unwrap().count(), before);
+        assert!(owned_paths(&s).iter().all(|(p, _)| !p.ends_with("/l")));
+    }
+    // A descendant of the blocked path is blocked too.
+    let child = op(&s.h, &s.store, "x@file", 8, Action::CreateFile, "l/child");
+    let rep = go(&s, &plan(vec![child]), &gens(), &none());
+    assert_eq!(rep.operations[0].status, Status::Blocked);
+    assert!(!s.h.0.join("l/child").exists());
+}
+
+#[test]
+fn an_interrupted_intent_the_probe_cannot_decide_stays_blocked_across_runs() {
+    use dfm_model::state::{Recovery, RecoveryOutput};
+    let s = setup();
+    let abs = s.h.0.join("l").to_str().unwrap().to_string();
+    fs::create_dir(s.h.0.join("l")).unwrap();
+    s.store
+        .append_journal(&JournalEntry {
+            schema: 1,
+            op_id: format!("{}-1", jid(1)),
+            op: "create-link".into(),
+            phase: Phase::Intent,
+            at: "2026-10-10T00:00:00Z".into(),
+            resource: "core.x".into(),
+            adapter: "git-config/v1".into(),
+            class: Class::Normal,
+            recovery: Some(Recovery {
+                outputs: vec![RecoveryOutput {
+                    path: abs,
+                    existed_before: false,
+                    expected_sha256: Some(link_fingerprint("/src/x")),
+                }],
+                snapshot: None,
+            }),
+            token: None,
+            reason: None,
+        })
+        .unwrap();
+    for _ in 0..2 {
+        let mut l = op(&s.h, &s.store, "x@link", 2, Action::CreateLink, "l");
+        l.link = Some("/src/x".into());
+        let rep = go(&s, &plan(vec![l]), &gens(), &none());
+        assert_eq!(rep.operations[0].status, Status::Blocked);
+        assert_eq!(rep.stopped.unwrap().code, Code::OpInterrupted);
+    }
+    assert_eq!(last_of(&s, &jid(1)).phase, Phase::Unknown);
+    assert_eq!(
+        dfm_model::state::unresolved(&s.store.read_journal().unwrap()).len(),
+        1
+    );
+}
+
+#[test]
+fn an_unknown_removal_settles_done_when_the_path_is_absent_and_drops_the_ledger_entry() {
+    let s = setup();
+    fs::write(s.h.0.join("f"), "old\n").unwrap();
+    own(&s, "f", "old\n");
+    let id = "remove@core.x@f";
+    let r = op(&s.h, &s.store, id, 1, Action::Remove, "f");
+    let allow = BTreeSet::from([id.to_string()]);
+    let rep = go_with(
+        &s,
+        &plan(vec![r]),
+        &gens(),
+        &allow,
+        &Fail::at("remove-after-unlink", Inject::Error),
+    );
+    assert_eq!(rep.operations[0].status, Status::Unknown);
+    assert_eq!(owned_paths(&s).len(), 1, "unknown keeps the ledger entry");
+    assert_eq!(later_run(&s).operations[0].status, Status::Updated);
+    assert_eq!(last_of(&s, &jid(1)).phase, Phase::Done);
+    assert!(owned_paths(&s).iter().all(|(p, _)| !p.ends_with("/f")));
+}
+
+#[test]
+fn an_unknown_file_update_settles_done_with_the_new_fingerprint_and_mode() {
+    let s = setup();
+    fs::write(s.h.0.join("f"), "old\n").unwrap();
+    own(&s, "f", "old\n");
+    let f = op(&s.h, &s.store, "x@file", 1, Action::UpdateFile, "f");
+    let rep = go_with(
+        &s,
+        &plan(vec![f]),
+        &gens(),
+        &none(),
+        &Fail::at("file-after-rename", Inject::Error),
+    );
+    assert_eq!(rep.operations[0].status, Status::Unknown);
+    later_run(&s);
+    assert_eq!(last_of(&s, &jid(1)).phase, Phase::Done);
+    let abs = s.h.0.join("f").to_str().unwrap().to_string();
+    assert!(owned_paths(&s).contains(&(abs, Some(sha256_hex(b"new\n")))));
+}
+
+#[test]
+fn a_file_edited_after_an_unknown_publish_is_not_claimed() {
+    let s = setup();
+    let f = op(&s.h, &s.store, "x@file", 1, Action::CreateFile, "f");
+    go_with(
+        &s,
+        &plan(vec![f]),
+        &gens(),
+        &none(),
+        &Fail::at("file-after-rename", Inject::Error),
+    );
+    fs::write(s.h.0.join("f"), "edited\n").unwrap();
+    let g = op(&s.h, &s.store, "x@file", 7, Action::CreateFile, "g");
+    let rep = go(&s, &plan(vec![g]), &gens(), &none());
+    // The edited file does not match the expectation: the probe cannot decide and nothing is
+    // recorded as owned.
+    assert_eq!(last_of(&s, &jid(1)).phase, Phase::Unknown);
+    assert!(owned_paths(&s).iter().all(|(p, _)| !p.ends_with("/f")));
+    assert_eq!(rep.operations[0].status, Status::Updated);
+}
+
+#[test]
+fn resolve_done_records_ownership_only_for_a_matching_path_and_failed_needs_nothing() {
+    let s = setup();
+    unknown_link(&s);
+    let id = last_of(&s, &jid(1)).op_id;
+    let home = Dir::open_home(&sys(&s.h), &s.h.0).unwrap();
+    let (g, fail, allow) = (gens(), Fail::none(), none());
+    let r = run(&s, &g, &allow, &fail, &home);
+    // Mismatch: the link is retargeted. `done` is refused with E_CONFLICT, nothing is written.
+    fs::remove_file(s.h.0.join("l")).unwrap();
+    symlink("/elsewhere", s.h.0.join("l")).unwrap();
+    let len = s.store.journal_len().unwrap();
+    let e = dfm_engine::resolve(&r, &id, true).unwrap_err();
+    assert_eq!(e.code, Code::Conflict);
+    assert!(e.detail.contains("--as failed"), "{}", e.detail);
+    assert_eq!(s.store.journal_len().unwrap(), len);
+    // An id that names nothing is a usage error.
+    let e = dfm_engine::resolve(&r, "nope-1", true).unwrap_err();
+    assert_eq!(e.code, Code::Usage);
+    // Match: restore the link.
+    fs::remove_file(s.h.0.join("l")).unwrap();
+    symlink("/src/x", s.h.0.join("l")).unwrap();
+    dfm_engine::resolve(&r, &id, true).unwrap();
+    let last = last_of(&s, &jid(1));
+    assert_eq!(last.phase, Phase::Done);
+    assert_eq!(last.reason.as_deref(), Some("resolved by operator"));
+    assert_eq!(owned_paths(&s).len(), 1);
+    // It is settled now: resolving again is a usage error.
+    assert_eq!(
+        dfm_engine::resolve(&r, &id, false).unwrap_err().code,
+        Code::Usage
+    );
+
+    // `failed` needs no match and records no ownership.
+    let s = setup();
+    unknown_link(&s);
+    let id = last_of(&s, &jid(1)).op_id;
+    let home = Dir::open_home(&sys(&s.h), &s.h.0).unwrap();
+    let r = run(&s, &g, &allow, &fail, &home);
+    fs::remove_file(s.h.0.join("l")).unwrap();
+    fs::create_dir(s.h.0.join("l")).unwrap();
+    dfm_engine::resolve(&r, &id, false).unwrap();
+    assert_eq!(last_of(&s, &jid(1)).phase, Phase::Failed);
+    assert!(owned_paths(&s).is_empty());
+}
