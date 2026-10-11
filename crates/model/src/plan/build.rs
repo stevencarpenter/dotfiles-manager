@@ -119,7 +119,8 @@ pub fn requests(resolved: &Resolved, ledger: &[Owned]) -> Vec<Request> {
 }
 
 /// Folded paths whose content nothing may read or hash: ledger entries of the sensitive class
-/// (whoever claims the path now) and the claims of selected sensitive resources. `resolved` is
+/// (whoever claims the path now), ledger entries owned by a selected sensitive resource, and the
+/// claims of selected sensitive resources. `resolved` is
 /// `None` when the profile could not be resolved; the ledger still protects its own entries.
 pub fn sensitive_paths(resolved: Option<&Resolved>, ledger: &[Owned]) -> BTreeSet<String> {
     let mut set = sensitive_ledger_paths(ledger);
@@ -129,6 +130,14 @@ pub fn sensitive_paths(resolved: Option<&Resolved>, ledger: &[Owned]) -> BTreeSe
         .filter(|r| r.sensitive)
     {
         set.extend(r.claims.iter().map(|c| fold(c)));
+    }
+    if let Some(res) = resolved {
+        set.extend(
+            ledger
+                .iter()
+                .filter(|o| res.resources.get(&o.resource).is_some_and(|r| r.sensitive))
+                .map(|o| fold(&o.path)),
+        );
     }
     set
 }

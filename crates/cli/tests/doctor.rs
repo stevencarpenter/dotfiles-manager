@@ -401,20 +401,34 @@ fn sensitive_and_generated_resources_are_not_applicable_and_read_no_content() {
 
 // ---- formats ------------------------------------------------------------------------------
 
-/// `(status, code, kind)` of each row, read from the table.
-fn table_rows(table: &str) -> Vec<(String, String, String)> {
+/// `(status, code, kind, subject)` of each row, read from the table. Wrapping drops the spaces
+/// at the breaks, so subjects are compared without spaces.
+fn table_rows(table: &str) -> Vec<(String, String, String, String)> {
     let known = ["OK", "WARN", "ERROR", "UNKNOWN", "N/A"];
-    table
-        .lines()
-        .filter(|l| !l.starts_with(' '))
-        .filter_map(|l| {
-            let mut w = l.split_whitespace();
-            let s = w.next()?;
-            known
-                .contains(&s)
-                .then(|| (s.into(), w.next().unwrap().into(), w.next().unwrap().into()))
-        })
-        .collect()
+    let mut rows: Vec<(String, String, String, String)> = Vec::new();
+    let mut in_subject = false;
+    for l in table.lines() {
+        let mut w = l.split_whitespace();
+        let first = w.next();
+        if !l.starts_with(' ') && first.is_some_and(|s| known.contains(&s)) {
+            let s = first.unwrap().to_string();
+            rows.push((
+                s,
+                w.next().unwrap().into(),
+                w.next().unwrap().into(),
+                String::new(),
+            ));
+            in_subject = false;
+        } else if let Some(rest) = l.strip_prefix("  subject: ") {
+            in_subject = true;
+            rows.last_mut().unwrap().3.push_str(&rest.replace(' ', ""));
+        } else if l.starts_with("  detail: ") || l.starts_with("  fix: ") || !l.starts_with(' ') {
+            in_subject = false;
+        } else if in_subject {
+            rows.last_mut().unwrap().3.push_str(&l.replace(' ', ""));
+        }
+    }
+    rows
 }
 
 #[test]
@@ -431,6 +445,7 @@ fn table_status_and_json_agree_on_every_row_for_doctor_and_status() {
                 r["status"].as_str().unwrap().to_string(),
                 r["code"].as_str().unwrap().to_string(),
                 r["kind"].as_str().unwrap().to_string(),
+                r["subject"].as_str().unwrap().replace(' ', ""),
             )
         })
         .collect();
@@ -1027,4 +1042,24 @@ fn the_documented_codes_are_exactly_the_registered_codes() {
             c.as_str()
         );
     }
+}
+
+#[test]
+fn a_ledger_entry_owned_by_a_selected_sensitive_resource_is_not_read() {
+    let fx = personal();
+    let target = fx.h(".zz-other");
+    fs::write(&target, "secret-bytes").unwrap();
+    // The owner is a selected sensitive resource that no longer claims this path.
+    own(&fx, "agents.claude-settings", "normal", ".zz-other");
+    let before = fingerprint(fx.home.path());
+    let old = old_atime(&target);
+    let (_, rows) = fx.rows();
+    assert_eq!(atime(&target), old, "doctor read the file");
+    assert_eq!(fingerprint(fx.home.path()), before);
+    let r = at(&rows, ".zz-other");
+    assert_eq!(
+        (r["status"].as_str(), r["code"].as_str()),
+        (Some("N/A"), Some("D_NA_SENSITIVE")),
+        "{r:#?}"
+    );
 }

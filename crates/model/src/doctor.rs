@@ -410,6 +410,34 @@ mod tests {
         assert!(!row(Level::Unknown, false).required);
     }
 
+    /// An exhaustive match: a new variant does not compile until it is listed here, and then
+    /// `ALL` must list it too.
+    fn index(c: DoctorCode) -> usize {
+        match c {
+            DoctorCode::Ok => 0,
+            DoctorCode::NaSensitive => 1,
+            DoctorCode::NaGenerated => 2,
+            DoctorCode::OutputMissing => 3,
+            DoctorCode::PlanPending => 4,
+            DoctorCode::PlanRemoval => 5,
+            DoctorCode::Unrecorded => 6,
+            DoctorCode::StatePartial => 7,
+            DoctorCode::LastRun => 8,
+            DoctorCode::NoReceipt => 9,
+            DoctorCode::StateAbsent => 10,
+            DoctorCode::LockNote => 11,
+            DoctorCode::DependsUnknown => 12,
+            DoctorCode::ProbingNotBuilt => 13,
+        }
+    }
+
+    #[test]
+    fn all_lists_every_variant_once() {
+        let mut idx: Vec<usize> = DoctorCode::ALL.iter().map(|c| index(*c)).collect();
+        idx.sort_unstable();
+        assert_eq!(idx, (0..=13).collect::<Vec<_>>());
+    }
+
     #[test]
     fn codes_are_unique_prefixed_and_described() {
         let mut names: Vec<_> = DoctorCode::ALL.iter().map(|c| c.as_str()).collect();
