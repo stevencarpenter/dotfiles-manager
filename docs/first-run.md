@@ -75,7 +75,31 @@ Rules that matter on the first run:
 - `target` is relative to HOME and must be ASCII. The source file must exist inside the checkout.
 - Use only `kind = "link"` resources. Any `render`, `merge` or `assemble` resource makes `apply` refuse the whole plan with `E_GENERATOR_UNAVAILABLE` (exit 3, nothing written).
 - Do not list `.claude/settings.json`, files under `.ssh` other than `config`, or any file that holds a secret.
+- A checkout that holds ignored or runtime content (plugin checkouts, `.venv`, `node_modules`, caches) needs `[sources]` in the bundle. See the next section.
 - A `link` resource may point at a file or a directory. A directory link is one operation; the manager never writes through it and never deletes it recursively.
+
+### Declare the source roots
+
+Without `[sources]` the loader reads every file under `--root`. A live checkout often holds content the loader refuses: files over 1 MiB, a nested `.git`, more than 20,000 entries. Declare in the bundle which parts are sources. Example for a checkout with `home/` and `dfm/` at the top and the bundle in `dfm/`:
+
+```toml
+[sources]
+roots = ["home", "dfm"]
+exclude = [
+  "home/.config/tmux/plugins",
+  "home/.pi/agent/extensions/node_modules",
+  "**/__pycache__",
+  "**/.venv",
+  "**/node_modules",
+]
+```
+
+- Roots and patterns are relative to `--root`. A pattern is anchored there, so `**/.venv` is the way to match a `.venv` at any depth.
+- The profile, the bundle and every module must lie inside a root, or directly beside the bundle file. Otherwise `plan` fails with `E_SOURCE_ESCAPE` and names the file.
+- A resource source inside an excluded path fails with `E_SOURCE_ESCAPE` and names the pattern.
+- A change to `[sources]` changes the source digest, so a saved plan goes stale.
+- If `plan` reports `E_LIMIT_EXCEEDED` for the entry count, the message names the three largest directories. Exclude them or narrow the roots.
+- `plan --against` for a bundle without `[sources]` behaves as before.
 
 ## 3. Bind, then look without writing
 
