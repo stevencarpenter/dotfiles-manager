@@ -969,14 +969,16 @@ fn a_module_that_names_another_target_is_refused_at_resolution() {
 }
 
 #[test]
-fn an_identical_hook_that_was_already_there_is_not_owned_and_retire_leaves_it() {
+fn an_identical_hook_present_at_take_over_is_owned_by_the_approval_and_retire_removes_it() {
     let fx = Fx::new();
     let same =
         r#"{"hooks":{"PreToolUse":[{"hooks":[{"command":"audit --quiet","type":"command"}]}]}}"#;
     fx.live(same);
+    // The first write into an existing file needs --allow-adopt. That approval covers an
+    // identical entry already in place: after an interrupted first merge it is the manager's.
     assert_eq!(code(&fx.apply()), 0);
     let c = fx.coowned().unwrap();
-    assert_eq!(c["coowned"]["entries"], serde_json::json!([]), "{c}");
+    assert_eq!(c["coowned"]["entries"].as_array().unwrap().len(), 1, "{c}");
     assert_eq!(
         fx.live_json()["hooks"]["PreToolUse"]
             .as_array()
@@ -987,10 +989,10 @@ fn an_identical_hook_that_was_already_there_is_not_owned_and_retire_leaves_it() 
     fx.set_profile("");
     let o = fx.apply_bare();
     assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
-    assert_eq!(
-        fx.live_json()["hooks"]["PreToolUse"][0]["hooks"][0]["command"],
-        "audit --quiet",
-        "the user's copy stays"
+    assert!(
+        fx.live_json().get("hooks").is_none(),
+        "the owned entry is retired: {}",
+        fx.live_json()
     );
 }
 
@@ -1165,9 +1167,13 @@ fn a_merge_that_ends_unknown_stays_open_is_never_auto_owned_and_clears_only_by_h
         text(&o.stdout)
     );
     assert!(fx.coowned().is_none());
-    // An apply is blocked on the path and names the id.
+    // An apply is blocked on the path, names the id and leaves the file as it is.
+    let before = fs::read(fx.settings()).unwrap();
     let o = fx.apply();
-    assert_ne!(code(&o), 0);
+    assert_eq!(code(&o), 3, "{}\n{}", stderr(&o), text(&o.stdout));
+    assert!(stderr(&o).contains("E_OP_INTERRUPTED"), "{}", stderr(&o));
+    assert!(stderr(&o).contains(&id), "{}", stderr(&o));
+    assert_eq!(hex(&fs::read(fx.settings()).unwrap()), hex(&before));
     // `done` is refused: nothing about a sensitive file can be checked.
     let o = fx.run(&["state", "resolve", &id, "--as", "done"]);
     assert_eq!(code(&o), 3, "{}\n{}", stderr(&o), text(&o.stdout));
@@ -1180,7 +1186,14 @@ fn a_merge_that_ends_unknown_stays_open_is_never_auto_owned_and_clears_only_by_h
     assert_eq!(code(&fx.run(&["state", "recover"])), 0);
     let o = fx.apply();
     assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
-    assert!(fx.coowned().is_some());
+    let c = fx.coowned().unwrap();
+    // The take-over approval covers the manager's own hook that the interrupted run left in
+    // the file: it is recorded, so a later retire removes it.
+    assert_eq!(c["coowned"]["entries"].as_array().unwrap().len(), 1, "{c}");
     let o = fx.apply_bare();
     assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+    fx.set_profile("");
+    let o = fx.apply_bare();
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+    assert!(fx.live_json().get("hooks").is_none(), "{}", fx.live_json());
 }

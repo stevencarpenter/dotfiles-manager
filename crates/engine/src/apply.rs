@@ -989,6 +989,7 @@ impl Exec<'_, '_> {
                 .as_ref()
                 .map(|c| c.entries.clone())
                 .unwrap_or_default(),
+            takeover: op.takeover,
             ..GeneratorInputs::default()
         };
         let merged = match self.run.generator.merge(op, &inputs) {
