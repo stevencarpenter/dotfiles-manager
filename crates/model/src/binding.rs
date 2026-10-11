@@ -28,9 +28,18 @@ pub fn valid_machine_id(id: &str) -> bool {
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || b"._-".contains(c))
 }
 
+/// The machine a profile declares, as written in its top-level `platform` and `architecture`
+/// keys. `None` for a key that is absent or not a string; the resolver validates both.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProfileTarget {
+    pub platform: Option<String>,
+    pub architecture: Option<String>,
+}
+
 /// A profile must be a bounded TOML document with a top-level `schema` key. The resolver
-/// (a later task) validates the rest; this only keeps `bind` from recording an arbitrary file.
-pub fn check_profile(bytes: &[u8]) -> Result<(), Refusal> {
+/// validates the rest; this keeps `bind` from recording an arbitrary file and returns the
+/// declared machine so `bind` can refuse a profile for another one.
+pub fn check_profile(bytes: &[u8]) -> Result<ProfileTarget, Refusal> {
     let bad = |d: &str| Refusal::new(Code::ProfileInvalid, d.to_string());
     if bytes.len() > MAX_BYTES {
         return Err(bad("profile exceeds 1 MiB"));
@@ -40,7 +49,11 @@ pub fn check_profile(bytes: &[u8]) -> Result<(), Refusal> {
         bad(&format!("profile is not valid TOML: {}", e.message()))
     })?;
     if table.contains_key("schema") {
-        Ok(())
+        let get = |k: &str| table.get(k).and_then(|v| v.as_str()).map(str::to_string);
+        Ok(ProfileTarget {
+            platform: get("platform"),
+            architecture: get("architecture"),
+        })
     } else {
         Err(bad("profile has no top-level schema key"))
     }
@@ -145,6 +158,10 @@ mod tests {
 
     #[test]
     fn profile_needs_a_top_level_schema_key() {
+        let t =
+            check_profile(b"schema = 1\nplatform = \"macos\"\narchitecture = \"arm64\"\n").unwrap();
+        assert_eq!(t.platform.as_deref(), Some("macos"));
+        assert_eq!(t.architecture.as_deref(), Some("arm64"));
         assert!(check_profile(b"schema = 1\nid = \"x\"\n").is_ok());
         for bad in [&b""[..], b"[t]\nschema = 1\n", b"[oops", b"\xff"] {
             assert_eq!(check_profile(bad).unwrap_err().code, Code::ProfileInvalid);

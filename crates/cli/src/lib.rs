@@ -424,8 +424,16 @@ fn profile_arch(arch: &str) -> &str {
 
 /// `Some(detail)` when the profile targets another platform or architecture than this machine.
 fn machine_mismatch(ctx: &Ctx, loaded: &Loaded) -> Option<String> {
-    let (platform, arch) = (&loaded.resolved.platform, &loaded.resolved.architecture);
-    (platform != &ctx.os || arch != profile_arch(&ctx.arch)).then(|| {
+    target_mismatch(
+        ctx,
+        &loaded.resolved.platform,
+        &loaded.resolved.architecture,
+    )
+}
+
+/// As [`machine_mismatch`] for a declared `platform` and `arch`.
+fn target_mismatch(ctx: &Ctx, platform: &str, arch: &str) -> Option<String> {
+    (platform != ctx.os || arch != profile_arch(&ctx.arch)).then(|| {
         format!(
             "the profile targets {platform}/{arch} and this machine is {}/{}",
             ctx.os,
@@ -545,7 +553,17 @@ fn bind(ctx: &Ctx, profile: String, machine_id: String) -> Result<String, Refusa
     fs::File::open(real)
         .and_then(|f| f.take(MAX_BYTES as u64 + 1).read_to_end(&mut content))
         .map_err(|e| invalid(format!("{real}: {}", e.kind())))?;
-    check_profile(&content)?;
+    let target = check_profile(&content)?;
+    // Rebinding is unsupported, so a profile for another machine is refused before any write.
+    // A key the profile lacks is left to the resolver, which reports it.
+    let declared = |v: Option<&str>, own: &str| v.unwrap_or(own).to_string();
+    if let Some(d) = target_mismatch(
+        ctx,
+        &declared(target.platform.as_deref(), &ctx.os),
+        &declared(target.architecture.as_deref(), profile_arch(&ctx.arch)),
+    ) {
+        return Err(Refusal::new(Code::PlatformMismatch, d));
+    }
     let want = Binding::new(real, &machine_id)?;
     let stamp = Stamp::of(&want);
     let (layout, sys) = (ctx.layout(), ctx.sys()?);

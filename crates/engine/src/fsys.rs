@@ -530,6 +530,9 @@ impl Dir {
         if st.st_uid != sys.uid {
             return Err(bad("not owned by the current user".into()));
         }
+        if u64::from(st.st_nlink) != 1 {
+            return Err(bad("has more than one hard link".into()));
+        }
         if mode_bits(&st) != 0o600 {
             return Err(bad(format!("mode is {:o}, expected 0600", mode_bits(&st))));
         }
@@ -1142,6 +1145,9 @@ impl Lock {
             return Err(bad(
                 "must be a regular file owned by the current user".into()
             ));
+        }
+        if u64::from(st.st_nlink) != 1 {
+            return Err(bad("has more than one hard link".into()));
         }
         let mode = mode_bits(&st);
         if mode != 0o600 {
