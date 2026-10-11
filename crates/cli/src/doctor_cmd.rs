@@ -750,7 +750,11 @@ fn classify(
                 "resource {who} claims it and does not own it yet: {}",
                 op.effect
             ),
-            "Review plan, then run apply.",
+            if op.action == Action::Adopt {
+                "Review plan, then run apply with --allow-adopt."
+            } else {
+                "Review plan, then run apply."
+            },
         )),
         Status::Current if op.ownership == Ownership::UnrecordedCurrent => Some(Row::new(
             "output",
