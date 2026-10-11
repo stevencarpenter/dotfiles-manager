@@ -16,7 +16,7 @@ use toml::Value;
 /// The kinds a configuration plan covers. Packages and applications are provisioning, and a
 /// secret is rendered only on explicit request (DESIGN.md section 7: "Only configuration work
 /// belongs in a normal config plan").
-fn in_scope(r: &ResolvedResource) -> bool {
+pub fn in_scope(r: &ResolvedResource) -> bool {
     matches!(
         r.kind.as_str(),
         "link" | "render" | "merge" | "assemble" | "distribution"
@@ -116,6 +116,30 @@ pub fn requests(resolved: &Resolved, ledger: &[Owned]) -> Vec<Request> {
     want.into_iter()
         .map(|(path, (hash, list))| Request { path, hash, list })
         .collect()
+}
+
+/// Folded paths whose content nothing may read or hash: ledger entries of the sensitive class
+/// (whoever claims the path now), ledger entries owned by a selected sensitive resource, and the
+/// claims of selected sensitive resources. `resolved` is
+/// `None` when the profile could not be resolved; the ledger still protects its own entries.
+pub fn sensitive_paths(resolved: Option<&Resolved>, ledger: &[Owned]) -> BTreeSet<String> {
+    let mut set = sensitive_ledger_paths(ledger);
+    for r in resolved
+        .iter()
+        .flat_map(|r| r.resources.values())
+        .filter(|r| r.sensitive)
+    {
+        set.extend(r.claims.iter().map(|c| fold(c)));
+    }
+    if let Some(res) = resolved {
+        set.extend(
+            ledger
+                .iter()
+                .filter(|o| res.resources.get(&o.resource).is_some_and(|r| r.sensitive))
+                .map(|o| fold(&o.path)),
+        );
+    }
+    set
 }
 
 /// Folded paths the ledger records with the sensitive class.

@@ -3,6 +3,7 @@
 mod adapters;
 mod apply_cmd;
 mod controls_fs;
+mod doctor_cmd;
 mod plan_cmd;
 mod source_fs;
 mod state_cmd;
@@ -32,6 +33,8 @@ usage:
   dotfiles-manager state check
   dotfiles-manager explain <resource-or-target> --root <dir>
   dotfiles-manager plan --root <dir> [--json] [--against <saved plan>]
+  dotfiles-manager doctor --root <dir> [--json]
+  dotfiles-manager status --root <dir> [--json]
   dotfiles-manager apply --root <dir> [--preview] [--yes-plan <digest>] [--allow-disruptive <operation-id>]...
   dotfiles-manager self-check --build-controls <staged tree>
   dotfiles-manager self-check --fixture-dir <dir>
@@ -48,6 +51,14 @@ plan resolves the bound profile against --root, observes the claimed paths under
 read-only, and prints the typed plan with its digest. It writes nothing, fetches nothing and
 authenticates nothing. --json prints the plan for review. --against compares a saved --json
 plan with a fresh one and exits 3 (E_PLAN_STALE) when any input changed.
+
+doctor and status inspect without changing anything: the binding, the state store, the lock
+note, the resolved profile, the plan and each owned output. They run no program, probe no tool,
+fetch nothing, take no lock and write nothing. Each row has a status (OK, WARN, ERROR, UNKNOWN,
+N/A), a stable code, the path or resource and one line of fix text. doctor prints detail and fix
+for every row, status prints one block per row. --json prints the same rows as one document
+(schema 1). Exit 0 when no row is ERROR and no required row is UNKNOWN, 1 otherwise, 2 for usage.
+See docs/doctor.md.
 
 apply plans again, prints the plan and exits 3 (E_APPROVAL_REQUIRED) unless --yes-plan carries the
 digest of that exact plan. Then it publishes file links and removes previously owned outputs,
@@ -273,6 +284,10 @@ fn dispatch(args: &[String], out: &mut dyn Write) -> Result<(), Refusal> {
         "plan" => {
             let args = plan_cmd::parse_args(rest)?;
             plan_cmd::run(&context(home)?, &args, out)
+        }
+        "doctor" | "status" => {
+            let name = if cmd == "doctor" { "doctor" } else { "status" };
+            doctor_cmd::run(&context(home)?, name, rest, out)
         }
         "apply" => {
             let args = apply_cmd::parse_args(rest)?;

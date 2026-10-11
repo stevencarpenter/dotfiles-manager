@@ -4,6 +4,7 @@ pub mod binding;
 pub mod controls;
 pub mod digest;
 pub mod display;
+pub mod doctor;
 pub mod exit;
 pub mod fold;
 pub mod plan;

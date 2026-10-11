@@ -4,7 +4,7 @@
 //! local state of the claimed paths. It writes nothing, fetches nothing, authenticates nothing
 //! and starts no process.
 
-use crate::{Ctx, load_resolved, read_existing_binding, usage};
+use crate::{Ctx, Loaded, load_resolved, read_existing_binding, usage};
 use dfm_engine::{Dir, Fail, Store, merge, observe};
 use dfm_model::display::visible;
 use dfm_model::plan::{
@@ -109,7 +109,11 @@ fn owned(store: &Store, home: &Path) -> Result<Vec<Owned>, Refusal> {
 
 /// Builds the plan for the bound profile. Read-only.
 pub fn make_plan(ctx: &Ctx, root: &Path) -> Result<Plan, Refusal> {
-    let loaded = load_resolved(ctx, root)?;
+    plan_for(ctx, &load_resolved(ctx, root)?)
+}
+
+/// As [`make_plan`], for sources that are already resolved (`doctor` resolves once).
+pub fn plan_for(ctx: &Ctx, loaded: &Loaded) -> Result<Plan, Refusal> {
     let layout = ctx.layout();
     let sys = ctx.sys()?;
     // Ownership decides what may be replaced. Without state it is unknown, so planning fails
