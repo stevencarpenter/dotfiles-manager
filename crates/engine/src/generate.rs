@@ -10,7 +10,10 @@ use crate::fsys::{Dir, Got, Peek, Sys};
 use dfm_model::digest::{EntryKind, TreeEntry, sha256_hex, tree_digest};
 use dfm_model::fold;
 use dfm_model::merge::{Merged, fragment_token};
-use dfm_model::plan::{MAX_HASHED_BYTES, MAX_LISTING, Operation, Plan};
+use dfm_model::plan::{
+    MAX_HASHED_BYTES, MAX_LISTING, MAX_SOURCE_ENTRIES, MAX_SOURCE_FILE_BYTES,
+    MAX_SOURCE_TOTAL_BYTES, Operation, Plan,
+};
 use dfm_model::state::{AppendedItem, Class, OwnedEntry};
 use dfm_model::{Code, Refusal};
 use std::collections::BTreeMap;
@@ -254,7 +257,7 @@ pub(crate) fn gather(
                     .iter()
                     .find(|p| {
                         p.resource == resource
-                            && p.path.as_deref().is_some_and(|pp| fold(pp) == fold(&path))
+                            && p.path.as_deref().is_some_and(|pp| fold::eq(pp, &path))
                     })
                     .ok_or_else(|| invalid(format!("no operation produces fragment {path}")))?;
                 selected(sys, &root, dir, producer, &mut budget, &f.name, &path)?
@@ -339,13 +342,6 @@ fn selected(
     Ok(bytes)
 }
 
-/// The limits the CLI's source loader applies to a tree, mirrored here so a tree the loader read
-/// is never refused for size when it is read again.
-const LINK_MAX_ENTRIES: usize = 20_000;
-const LINK_MAX_FILE: u64 = 1 << 20;
-const LINK_MAX_TOTAL: u64 = 64 << 20;
-const LINK_MAX_DEPTH: usize = 256;
-
 /// The live tree below one directory source: the entries the planner digests.
 struct Tree {
     entries: Vec<TreeEntry>,
@@ -358,18 +354,25 @@ fn tree_stale(path: &str) -> Gather {
     ))
 }
 
+/// An entry that could not be examined is an I/O fault, not a change of the source.
+fn unreadable(path: &str, why: &str) -> Gather {
+    Gather::Failed(Refusal::new(
+        Code::IoFailed,
+        format!("source {path} cannot be examined: {why}"),
+    ))
+}
+
 /// Lists `dir` without following a link and records what the planner records for a directory
 /// source: a directory, a file with its hash, or a link with its target text.
 fn walk(
     sys: &Sys,
     dir: &Dir,
     (prefix, shown): (&str, &str),
-    depth: usize,
     tree: &mut Tree,
 ) -> Result<(), Gather> {
-    let room = LINK_MAX_ENTRIES.saturating_sub(tree.entries.len());
+    let room = MAX_SOURCE_ENTRIES.saturating_sub(tree.entries.len());
     let listing = dir.list_upto(room)?;
-    if listing.odd > 0 || listing.names.len() > room || depth > LINK_MAX_DEPTH {
+    if listing.odd > 0 || listing.names.len() > room {
         return Err(tree_stale(shown));
     }
     for name in listing.names {
@@ -385,15 +388,15 @@ fn walk(
                     path: rel.clone(),
                     kind: EntryKind::Dir,
                 });
-                walk(sys, &child, (&rel, shown), depth + 1, tree)?;
+                walk(sys, &child, (&rel, shown), tree)?;
                 continue;
             }
             Peek::File { .. } => {
                 let bytes = dir
-                    .read_plain(&name, LINK_MAX_FILE)?
+                    .read_plain(&name, MAX_SOURCE_FILE_BYTES)?
                     .ok_or_else(|| tree_stale(shown))?;
                 tree.bytes += u64::try_from(bytes.len()).unwrap_or(u64::MAX);
-                if tree.bytes > LINK_MAX_TOTAL {
+                if tree.bytes > MAX_SOURCE_TOTAL_BYTES {
                     return Err(tree_stale(shown));
                 }
                 EntryKind::File {
@@ -402,6 +405,7 @@ fn walk(
                 }
             }
             Peek::Link { target, .. } => EntryKind::Symlink { target },
+            Peek::Unknown(why) => return Err(unreadable(shown, &why)),
             _ => return Err(tree_stale(shown)),
         };
         tree.entries.push(TreeEntry { path: rel, kind });
@@ -441,11 +445,7 @@ pub(crate) fn link_source(sys: &Sys, plan: &Plan, op: &Operation) -> Result<(), 
         .iter()
         .find(|p| p.subject == format!("source:{path}"))
         .and_then(|p| p.state.strip_prefix("sha256:"));
-    let mut cur = Dir::open_plain(Path::new(&source.root)).map_err(|_| {
-        stale(format!(
-            "source {path} changed since the plan: the source root is gone"
-        ))
-    })?;
+    let mut cur = Dir::open_plain(Path::new(&source.root))?;
     let mut parts: Vec<&str> = path.split('/').collect();
     let name = parts.pop().ok_or_else(gone)?;
     for part in parts {
@@ -465,12 +465,13 @@ pub(crate) fn link_source(sys: &Sys, plan: &Plan, op: &Operation) -> Result<(), 
                     entries: Vec::new(),
                     bytes: 0,
                 };
-                walk(sys, &dir, ("", path), 0, &mut tree)?;
+                walk(sys, &dir, ("", path), &mut tree)?;
                 if want != tree_digest(tree.entries) {
                     return Err(stale(format!("source {path} changed since the plan")));
                 }
             }
         }
+        Peek::Unknown(why) => return Err(unreadable(path, &why)),
         _ => return Err(gone()),
     }
     Ok(())

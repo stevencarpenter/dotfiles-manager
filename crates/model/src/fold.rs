@@ -7,9 +7,21 @@ pub fn fold(s: &str) -> String {
     s.to_uppercase().to_lowercase()
 }
 
+/// Whether two paths or names are the same after the case fold.
+pub fn eq(a: &str, b: &str) -> bool {
+    fold(a) == fold(b)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::fold;
+    use super::{eq, fold};
+
+    #[test]
+    fn eq_compares_the_folded_text() {
+        assert!(eq("Config", "cONFIG"));
+        assert!(eq("\u{17f}", "S"));
+        assert!(!eq("a", "b"));
+    }
 
     #[test]
     fn folds_what_a_plain_lowercase_misses() {

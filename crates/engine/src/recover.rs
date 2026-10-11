@@ -319,7 +319,8 @@ pub(crate) fn record_output(
         .find(|r| r.resource == resource)
         .map(|r| r.owned_outputs.clone())
         .unwrap_or_default();
-    outs.retain(|o| fold(&o.path) != fold(abs));
+    let want = fold(abs);
+    outs.retain(|o| fold(&o.path) != want);
     outs.push(OwnedOutput {
         path: abs.into(),
         mode,
@@ -345,9 +346,10 @@ pub(crate) fn forget_output(
     abs: &str,
 ) -> Result<(), Refusal> {
     let mut ledger = store.read_ledger_lenient()?;
+    let want = fold(abs);
     for r in &mut ledger.resources {
         if r.resource == resource {
-            r.owned_outputs.retain(|o| fold(&o.path) != fold(abs));
+            r.owned_outputs.retain(|o| fold(&o.path) != want);
             r.op_id = id.into();
         }
     }

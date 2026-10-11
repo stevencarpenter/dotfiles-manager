@@ -22,9 +22,10 @@ use std::io::Read;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
-const MAX_FILE_BYTES: u64 = 1 << 20;
-const MAX_ENTRIES: usize = 20_000;
-const MAX_TOTAL_BYTES: u64 = 64 << 20;
+use dfm_model::plan::{
+    MAX_SOURCE_ENTRIES as MAX_ENTRIES, MAX_SOURCE_FILE_BYTES as MAX_FILE_BYTES,
+    MAX_SOURCE_TOTAL_BYTES as MAX_TOTAL_BYTES,
+};
 
 /// Reads at most `MAX_FILE_BYTES + 1` bytes of a regular file. The open does not follow a final
 /// symlink and does not block on a FIFO, and fstat then confirms the type, so an entry that
@@ -296,6 +297,9 @@ fn load(root: &Path, declared: Option<&SourceScope>) -> Result<SourceSet, Refusa
             .collect::<Result<_, _>>()
             .map_err(|e| io(e, rel))?;
         names.sort_by_key(|e| e.file_name());
+        // Two names that differ only by case are one name to a case-insensitive filesystem, and
+        // the snapshot indexes directories by folded path. Refuse them instead of guessing.
+        let mut folded: BTreeMap<String, String> = BTreeMap::new();
         for e in names {
             // An excluded entry is skipped before its name is validated and before it is listed,
             // opened or counted, so a name that would be refused elsewhere does not abort the load.
@@ -335,6 +339,12 @@ fn load(root: &Path, declared: Option<&SourceScope>) -> Result<SourceSet, Refusa
             } else {
                 format!("{rel}/{name}")
             };
+            if let Some(other) = folded.insert(fold(&name), name.clone()) {
+                return Err(refusal(
+                    Code::SourceUntrusted,
+                    format!("{other} and {name} in {rel} differ only by case"),
+                ));
+            }
             if name.to_lowercase() == ".git" {
                 // Repository metadata beside the bundle or at the top is not source content.
                 if rel.is_empty() || shallow {
@@ -467,6 +477,23 @@ mod tests {
         assert_eq!(e.code, Code::ReportUnavailable);
         // And a regular file reads.
         assert_eq!(read_regular(&d.join("real"), "real").unwrap(), b"x");
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn names_that_differ_only_by_case_are_refused() {
+        let d = scratch();
+        fs::create_dir(d.join("Dir")).unwrap();
+        // A case-insensitive volume cannot hold both names.
+        if fs::create_dir(d.join("dir")).is_err() || fs::read_dir(d.join("Dir")).is_err() {
+            eprintln!("SKIPPED: case-insensitive volume");
+            let _ = fs::remove_dir_all(&d);
+            return;
+        }
+        fs::write(d.join("Dir/a"), "a").unwrap();
+        let e = load(&d, None).unwrap_err();
+        assert_eq!(e.code, Code::SourceUntrusted);
+        assert!(e.detail.contains("differ only by case"), "{}", e.detail);
         let _ = fs::remove_dir_all(&d);
     }
 

@@ -638,7 +638,7 @@ impl Exec<'_, '_> {
         )
         .map_err(failed)?;
         let owned = self.owned().map_err(failed)?;
-        let entry = owned.iter().find(|o| fold(&o.path) == fold(rel));
+        let entry = owned.iter().find(|o| fold::eq(&o.path, rel));
         for p in &op.preconditions {
             let actual = if let Some(path) = p.subject.strip_prefix("path:") {
                 match obs.seen.get(path) {
@@ -1008,12 +1008,13 @@ impl Exec<'_, '_> {
         read: &MergeRead,
     ) -> Result<MergeDecision, Ended> {
         let ledger = self.run.store.read_ledger_lenient().map_err(failed)?;
+        let want = fold(abs);
         let recorded: Option<CoOwned> = ledger
             .resources
             .iter()
             .filter(|r| r.resource == op.resource)
             .flat_map(|r| &r.owned_outputs)
-            .find(|o| fold(&o.path) == fold(abs))
+            .find(|o| fold(&o.path) == want)
             .and_then(|o| o.coowned.clone());
         // The fragments of a merge are read like those of an assembly: the plan lists them, each
         // is read again below the opened directory and compared with the plan. A retire reads
@@ -1241,7 +1242,8 @@ impl Exec<'_, '_> {
             .find(|r| r.resource == op.resource)
             .map(|r| r.owned_outputs.clone())
             .unwrap_or_default();
-        outs.retain(|o| fold(&o.path) != fold(abs));
+        let want = fold(abs);
+        outs.retain(|o| fold(&o.path) != want);
         outs.push(OwnedOutput {
             path: abs.into(),
             mode: dfm_model::merge::MODE,
@@ -1480,10 +1482,10 @@ impl Exec<'_, '_> {
         if self.unknown_resources.contains_key(&op.resource) {
             return Ended::Current;
         }
+        let want = fold(&abs);
         let listed = self.run.store.read_ledger_lenient().map(|l| {
             l.resources.iter().any(|r| {
-                r.resource == op.resource
-                    && r.owned_outputs.iter().any(|o| fold(&o.path) == fold(&abs))
+                r.resource == op.resource && r.owned_outputs.iter().any(|o| fold(&o.path) == want)
             })
         });
         match listed {
@@ -1541,7 +1543,7 @@ fn settle(ex: &mut Exec<'_, '_>) -> Result<(), Refusal> {
                     && o.path
                         .as_deref()
                         .and_then(|p| ex.abs(p).ok())
-                        .is_some_and(|a| fold(&a) == fold(abs))
+                        .is_some_and(|a| fold::eq(&a, abs))
             })
         };
         let w = (&ex.run.sys, ex.run.home, ex.run.home_path);

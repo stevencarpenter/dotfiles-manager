@@ -2437,6 +2437,16 @@ fn a_link_source_that_changed_after_the_plan_is_stale_and_writes_nothing() {
 }
 
 #[test]
+fn a_source_root_that_cannot_be_opened_is_a_failure_not_a_stale_source() {
+    let s = setup();
+    let (p, root) = link_plan(&s, "root-gone", false);
+    fs::remove_dir_all(&root).unwrap();
+    let r = go(&s, &p, &NoGenerator, &none());
+    assert_eq!(r.operations[0].status, Status::Failed, "{:?}", r.stopped);
+    nothing_published(&s);
+}
+
+#[test]
 fn a_link_source_with_no_recorded_identity_is_still_checked_for_presence() {
     let s = setup();
     let (mut p, root) = link_plan(&s, "unhashed", false);
@@ -2575,6 +2585,7 @@ fn an_output_planned_with_another_casing_replaces_its_ledger_entry_in_place() {
     fs::write(s.h.0.join("Foo"), "old\n").unwrap();
     // The volume must fold case for `foo` to name the file `Foo`.
     if !s.h.0.join("foo").exists() {
+        eprintln!("SKIPPED: case-sensitive volume");
         return;
     }
     own(&s, "Foo", "old\n");

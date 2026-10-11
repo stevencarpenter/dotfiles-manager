@@ -417,6 +417,11 @@ mod tests {
         );
         // A comment character inside quotes stays, and so does white space inside quotes.
         assert_eq!(got("[include]\npath = \"~/a#b ;c \"  \n"), ["~/a#b ;c "]);
+        // A trailing backslash ends the value. Git joins the next line to it; this reader does
+        // not, and keeps what came before. An unbalanced quote runs to the end of the line,
+        // where Git reports a bad config line. Both only matter for a file Git itself rejects.
+        assert_eq!(got("[include]\npath = ~/a\\\n"), ["~/a"]);
+        assert_eq!(got("[include]\npath = \"~/a b\n"), ["~/a b"]);
         // A backslash escapes the next character.
         assert_eq!(got("[include]\npath = \"~/a\\\"b\"\n"), ["~/a\"b"]);
     }

@@ -7,6 +7,7 @@
 
 use sha2::{Digest, Sha256};
 
+#[non_exhaustive]
 pub enum EntryKind {
     File {
         exec: bool,

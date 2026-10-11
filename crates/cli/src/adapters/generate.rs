@@ -119,7 +119,7 @@ impl Generator for Generators<'_> {
                 // means the directory changed since the plan.
                 if let Some(extra) = inputs.listing.iter().flatten().find(|n| {
                     matches_pattern(pattern, n)
-                        && !inputs.fragments.keys().any(|k| fold(k) == fold(n))
+                        && !inputs.fragments.keys().any(|k| dfm_model::fold::eq(k, n))
                 }) {
                     return Err(Refusal::new(
                         Code::PlanStale,
@@ -344,7 +344,7 @@ fn text_fragments(
         )
     })?;
     if let Some(extra) = inputs.listing.iter().flatten().find(|n| {
-        matches_pattern(pattern, n) && !inputs.fragments.keys().any(|k| fold(k) == fold(n))
+        matches_pattern(pattern, n) && !inputs.fragments.keys().any(|k| dfm_model::fold::eq(k, n))
     }) {
         return Err(Refusal::new(
             Code::PlanStale,
