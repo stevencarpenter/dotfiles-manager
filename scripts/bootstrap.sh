@@ -497,9 +497,10 @@ check_config_tree() {
       [ ! -L "$_p" ] || refuse E_PREREQ_MISSING "$_p is a symlink; the CLI refuses a binding reached through it. Move it away first"
       [ -d "$_p" ] || refuse E_PREREQ_MISSING "$_p exists and is not a directory; move it away first"
     fi
-    [ "$(/usr/bin/stat -f %u "$_p")" = "$_uid" ] ||
+    _t=$_p; [ "$_p" != "$HOME_DIR" ] || _t=$_p/. # HOME is resolved first, so its target is checked
+    [ "$(/usr/bin/stat -f %u "$_t")" = "$_uid" ] ||
       refuse E_PREREQ_MISSING "$_p is not owned by the current user; the CLI refuses a binding below it"
-    _m=$(/usr/bin/stat -f %Lp "$_p")
+    _m=$(/usr/bin/stat -f %Lp "$_t")
     [ $(( 0$_m & 022 )) -eq 0 ] ||
       refuse E_PREREQ_MISSING "$_p has mode $_m, writable by group or others; the CLI refuses a binding below it"
   done

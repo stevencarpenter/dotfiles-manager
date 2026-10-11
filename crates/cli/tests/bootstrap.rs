@@ -1238,9 +1238,17 @@ fn a_binding_reached_through_an_unusable_config_directory_is_refused_before_any_
         let before = entries_below(&home);
         let o = install_tiny(&home, &src, &sha);
         assert_eq!(o.status.code(), Some(3), "{case}: {}", err(&o));
+        let want = match case {
+            "symlinked-config" => format!("{} is a symlink", cfg.display()),
+            "symlinked-leaf" => format!("{} is a symlink", cfg.join("dotfiles-manager").display()),
+            "group-writable-leaf" => {
+                format!("{} has mode 770", cfg.join("dotfiles-manager").display())
+            }
+            _ => format!("{} has mode 775", cfg.display()),
+        };
         assert!(
-            err(&o).contains("E_PREREQ_MISSING") && err(&o).contains(".config"),
-            "{case}: {}",
+            err(&o).contains("E_PREREQ_MISSING") && err(&o).contains(&want),
+            "{case}: want {want}: {}",
             err(&o)
         );
         assert!(
@@ -1252,6 +1260,33 @@ fn a_binding_reached_through_an_unusable_config_directory_is_refused_before_any_
             before,
             "{case}: the refusal changed HOME"
         );
+    }
+}
+
+#[test]
+fn a_home_alias_is_checked_at_its_target() {
+    use std::os::unix::fs::symlink;
+    for (mode, refused) in [(0o775, true), (0o755, false)] {
+        let (tmp, real, src, sha) = refusal_setup(&format!("home-alias-{mode:o}"));
+        fs::set_permissions(&real, fs::Permissions::from_mode(mode)).unwrap();
+        let alias = tmp.path().join("alias");
+        symlink(&real, &alias).unwrap();
+        let o = install_tiny(&alias, &src, &sha);
+        let want = format!("{} has mode {mode:o}", alias.display());
+        if refused {
+            assert_eq!(o.status.code(), Some(3), "{}", err(&o));
+            assert!(
+                err(&o).contains("E_PREREQ_MISSING") && err(&o).contains(&want),
+                "{}",
+                err(&o)
+            );
+        } else {
+            assert!(
+                !err(&o).contains("has mode") && !err(&o).contains("not owned"),
+                "{}",
+                err(&o)
+            );
+        }
     }
 }
 
