@@ -568,3 +568,30 @@ fn fragments_that_are_each_small_enough_but_too_big_together_block_the_plan() {
     assert_eq!(code(&o), 3, "{}", stderr(&o));
     assert_eq!(fingerprint(fx.home.path()), before);
 }
+
+#[test]
+fn a_hardlinked_source_blocks_the_plan_with_a_source_code_until_the_second_link_goes() {
+    let fx = Fx::new("\"agents\"");
+    let body = fx.root.join("base/modules/agents/files/AGENTS.md");
+    let second = fx.root.join("second-name");
+    fs::hard_link(&body, &second).unwrap();
+    let before = fingerprint(fx.home.path());
+    let blocker = fx
+        .saved()
+        .plan
+        .blockers
+        .into_iter()
+        .find(|b| b.resource == "agents.instructions")
+        .expect("blocked");
+    assert_eq!(blocker.code.as_str(), "E_SOURCE_UNTRUSTED", "{blocker:?}");
+    assert!(blocker.detail.contains("hardlinked"), "{}", blocker.detail);
+    let o = fx.apply(&[]);
+    assert_eq!(code(&o), 3, "{}", stderr(&o));
+    assert!(stderr(&o).contains("E_SOURCE_UNTRUSTED"), "{}", stderr(&o));
+    assert_eq!(fingerprint(fx.home.path()), before);
+    // With one name left, the plan is clean and applies.
+    fs::remove_file(&second).unwrap();
+    assert!(fx.saved().plan.blockers.is_empty());
+    let o = fx.apply(&[]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+}

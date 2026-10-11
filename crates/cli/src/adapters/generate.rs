@@ -9,7 +9,7 @@ use dfm_model::plan::{
     Action, Blocker, MAX_HASHED_BYTES, Node, Observations, Operation, Ownership, Plan, Status,
     matches_pattern,
 };
-use dfm_model::resolve::{Entry, Resolved, SourceSet, Table, Value};
+use dfm_model::resolve::{Resolved, Table, Value};
 use dfm_model::state::Class;
 use dfm_model::{Code, Refusal};
 use std::collections::BTreeMap;
@@ -285,18 +285,21 @@ fn text_fragments(
 
 /// The files link producers will put in a fragment directory, by folded path: their source
 /// files. Only a planned or current operation of normal class produces anything.
-fn link_producers(ops: &[Operation], sources: &SourceSet) -> BTreeMap<String, Vec<u8>> {
+fn link_producers(
+    ops: &[Operation],
+    source: &dyn Fn(&str) -> Option<Vec<u8>>,
+) -> BTreeMap<String, Vec<u8>> {
     let mut made = BTreeMap::new();
     for op in ops {
         if op.class != Class::Normal || !matches!(op.status, Status::Planned | Status::Current) {
             continue;
         }
-        if let (Some(p), Some(_), Some(Entry::File(b))) = (
+        if let (Some(p), Some(_), Some(b)) = (
             &op.path,
             &op.link,
-            op.inputs.first().and_then(|i| sources.get(&i.path)),
+            op.inputs.first().and_then(|i| source(&i.path)),
         ) {
-            made.insert(fold(p), b.clone());
+            made.insert(fold(p), b);
         }
     }
     made
@@ -309,15 +312,22 @@ fn link_producers(ops: &[Operation], sources: &SourceSet) -> BTreeMap<String, Ve
 /// will write. Operations are in dependency order, so a producer comes before its consumer. A
 /// generation failure blocks the operation with a blocker that names the field and carries no
 /// content. A consumer of a blocked producer reports the producer's blocker as the cause.
-pub fn plan_outputs(
-    plan: &mut Plan,
-    resolved: &Resolved,
-    sources: &SourceSet,
-    sys: &Sys,
-    home: &Dir,
-) {
+pub fn plan_outputs(plan: &mut Plan, resolved: &Resolved, sys: &Sys, home: &Dir) {
     let generators = Generators::new(resolved);
-    let mut made = link_producers(&plan.operations, sources);
+    // Source files are read as apply reads them: below the opened source root, without
+    // following a link, regular, owned by the user, one hard link (`Dir::read_input`). A source
+    // that apply would refuse is refused here, as a blocker, not as a surprise at apply.
+    let root = match plan.sources.as_slice() {
+        [one] => Dir::open_plain(std::path::Path::new(&one.root)).ok(),
+        _ => None,
+    };
+    let source = |path: &str| -> Option<Vec<u8>> {
+        match root.as_ref()?.read_input_below(sys, path, MAX_HASHED_BYTES) {
+            Ok(Got::Bytes(b)) => Some(b),
+            _ => None,
+        }
+    };
+    let mut made = link_producers(&plan.operations, &source);
     // Why a path has no content: the blocker that stopped its producer, by folded path.
     let mut causes: BTreeMap<String, (Code, String)> = plan
         .blockers
@@ -334,7 +344,7 @@ pub fn plan_outputs(
         {
             continue;
         }
-        let built = inputs_for(&op, &made, &causes, sources, sys, home)
+        let built = inputs_for(&op, &made, &causes, &source, sys, home)
             .and_then(|inputs| generators.generate(&op, &inputs));
         let out = &mut plan.operations[i];
         match built {
@@ -411,23 +421,28 @@ fn inputs_for(
     op: &Operation,
     made: &BTreeMap<String, Vec<u8>>,
     causes: &BTreeMap<String, (Code, String)>,
-    sources: &SourceSet,
+    source: &dyn Fn(&str) -> Option<Vec<u8>>,
     sys: &Sys,
     home: &Dir,
 ) -> Result<GeneratorInputs, Refusal> {
     let mut inputs = GeneratorInputs::default();
     for i in &op.inputs {
-        match sources.get(&i.path) {
-            Some(Entry::File(b)) => {
-                inputs.sources.insert(i.path.clone(), b.clone());
-            }
-            _ => {
-                return Err(Refusal::new(
-                    Code::SourceMissing,
-                    format!("source {} is not a file in the loaded tree", i.path),
-                ));
-            }
+        let bytes = source(&i.path).ok_or_else(|| {
+            Refusal::new(
+                Code::SourceUntrusted,
+                format!(
+                    "source {} is not a regular file owned by you with one hard link (a hardlinked or foreign-owned source is refused)",
+                    i.path
+                ),
+            )
+        })?;
+        if i.content_id.as_deref() != Some(format!("sha256:{}", sha256_hex(&bytes)).as_str()) {
+            return Err(Refusal::new(
+                Code::SourceUntrusted,
+                format!("source {} changed while the plan was made", i.path),
+            ));
         }
+        inputs.sources.insert(i.path.clone(), bytes);
     }
     let Some(dir) = op.fragment_dir.as_deref() else {
         return Ok(inputs);
@@ -448,7 +463,9 @@ fn inputs_for(
                         ),
                         None => Refusal::new(
                             Code::GeneratorUnavailable,
-                            format!("fragment {path} is not produced by a generated operation"),
+                            format!(
+                                "fragment {path} has no content: its producer is not a generated file, or its source file is missing, hardlinked or not yours"
+                            ),
                         ),
                     });
                 }
@@ -477,6 +494,7 @@ fn inputs_for(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use dfm_model::resolve::SourceSet;
 
     fn cfg(src: &str) -> Result<String, Refusal> {
         let v = Value::Table(src.parse::<Table>().expect("fixture toml"));
@@ -567,7 +585,10 @@ mod tests {
             link_op("scope", Class::Normal, Status::NotInScope),
             link_op("sensitive", Class::Sensitive, Status::Planned),
         ];
-        let made = link_producers(&ops, &src);
+        let made = link_producers(&ops, &|p| match src.get(p) {
+            Some(dfm_model::resolve::Entry::File(b)) => Some(b.clone()),
+            _ => None,
+        });
         let keys: Vec<&str> = made.keys().map(String::as_str).collect();
         assert_eq!(keys, ["ok-current", "ok-planned"]);
     }

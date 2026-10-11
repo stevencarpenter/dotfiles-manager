@@ -173,7 +173,7 @@ pub fn plan_for(ctx: &Ctx, loaded: &Loaded) -> Result<Plan, Refusal> {
     };
     let mut plan = plan::build(&loaded.resolved, &cx, &obs)?;
     // Generated output hashes (architecture section 9 item 1), from the same adapters apply runs.
-    crate::adapters::plan_outputs(&mut plan, &loaded.resolved, &loaded.sources, &sys, &home);
+    crate::adapters::plan_outputs(&mut plan, &loaded.resolved, &sys, &home);
     Ok(plan)
 }
 

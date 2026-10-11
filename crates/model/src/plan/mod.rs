@@ -604,8 +604,25 @@ mod tests {
         let d = stale(&a, &b).unwrap();
         assert_eq!(d.len(), 1, "{d:?}");
         assert_eq!(d[0].what, StaleKind::Operation);
-        assert_ne!(d[0].was, d[0].now, "the two sides read the same: {d:?}");
-        assert!(d[0].was.contains("output=aaaaaaaaaaaa"), "{}", d[0].was);
+        assert!(d[0].subject.ends_with(" output"), "{:?}", d[0]);
+        assert_eq!(d[0].now, "output changed");
+        // A hash is never printed.
+        assert!(!format!("{d:?}").contains(&"a".repeat(12)), "{d:?}");
+        assert!(!format!("{d:?}").contains(&"b".repeat(12)), "{d:?}");
+
+        // A fragment hash change names the fragment and nothing else.
+        let frag = |h: &str| Fragment {
+            name: "10-a.md".into(),
+            origin: "foreign".into(),
+            sha256: Some(h.into()),
+        };
+        let (mut c, mut e) = (a.clone(), a.clone());
+        c.operations[0].fragments = vec![frag(&"c".repeat(64))];
+        e.operations[0].fragments = vec![frag(&"d".repeat(64))];
+        let d = stale(&c, &e).unwrap();
+        assert_eq!(d.len(), 1, "{d:?}");
+        assert_eq!(d[0].now, "fragment 10-a.md changed");
+        assert!(!format!("{d:?}").contains(&"c".repeat(12)), "{d:?}");
     }
 
     #[test]
