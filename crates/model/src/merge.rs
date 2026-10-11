@@ -29,6 +29,10 @@ pub const ADAPTER: &str = "claude-settings/v1";
 /// The mode of the published file. A live file open to group or others is refused.
 pub const MODE: u32 = 0o600;
 
+/// The most managed leaves, hook entries and appended items one merge output may record. The
+/// ledger holds a salted hash for each, so the bound keeps the ledger inside its size limit.
+pub const MAX_RECORDED: usize = 10_000;
+
 /// The longest hook timeout the manager declares, in seconds.
 const MAX_TIMEOUT: i64 = 3600;
 
@@ -571,6 +575,14 @@ fn leaves_of(view: &Map<String, Json>) -> BTreeMap<String, Vec<u8>> {
     out
 }
 
+/// The salted content token of one fragment (`fragments:` precondition of a sensitive merge).
+pub fn fragment_token(salt: &[u8], name: &str, content: &[u8]) -> String {
+    let mut buf = name.as_bytes().to_vec();
+    buf.push(0);
+    buf.extend_from_slice(content);
+    salted(salt, &buf)
+}
+
 /// The salted hash of one managed leaf, as the ledger records it (`coowned.leaves`).
 pub fn leaf_hash(salt: &[u8], pointer: &str, value: &[u8]) -> String {
     let mut buf = pointer.as_bytes().to_vec();
@@ -914,6 +926,15 @@ pub fn merge_with(
             });
         }
     }
+    let rendered_leaves = leaves_of(&desired.rendered_map());
+    if rendered_leaves.len() + entries.len() + walk.appended.len() > MAX_RECORDED {
+        return Err(Refusal::new(
+            Code::LimitExceeded,
+            format!(
+                "the merge would record more than {MAX_RECORDED} managed leaves, hooks and appended items in the ledger. Fix: declare fewer keys, or shrink the fragments"
+            ),
+        ));
+    }
     let bytes = serialize(doc);
     let changed = live != Some(bytes.as_slice());
     Ok(Merged {
@@ -921,16 +942,16 @@ pub fn merge_with(
         live_view,
         rendered_view: desired.rendered_view(),
         live_leaves: leaves_of(&live_map),
-        rendered_leaves: leaves_of(&desired.rendered_map()),
+        rendered_leaves,
         entries,
         appended: walk.appended,
         changed,
     })
 }
 
-/// How the first character of a word was written. Only a character the shell would expand can be
-/// a home spelling: `~` when bare, `$HOME` and `${HOME}` when bare or in double quotes. A
-/// character in single quotes, or escaped with a backslash, is literal text.
+/// How a character of a shell word was written. Only text the shell would expand can be a home
+/// spelling: `~` when bare, `$HOME` and `${HOME}` when bare or in double quotes. A character in
+/// single quotes, or escaped with a backslash, is literal text.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Lead {
     Bare,
@@ -938,103 +959,122 @@ enum Lead {
     Literal,
 }
 
+/// One character with how it was written and the quote span it sits in. A span changes at every
+/// quote that opens or closes, so `"$"HOME` and `$HO"ME"` are not one token.
+type Ch = (char, Lead, u32);
+
 /// Splits a shell command into words the way a POSIX shell reads quotes (single, double and
 /// backslash), without any expansion. `None` when a quote is not closed.
-fn shell_words(s: &str) -> Option<Vec<(String, Lead)>> {
-    let (mut words, mut cur, mut open) = (Vec::new(), String::new(), false);
-    let mut lead = Lead::Bare;
+fn shell_words(s: &str) -> Option<Vec<Vec<Ch>>> {
+    let (mut words, mut cur, mut open, mut span) = (Vec::new(), Vec::<Ch>::new(), false, 0u32);
     let mut it = s.chars();
-    let push = |cur: &mut String, lead: &mut Lead, c: char, how: Lead| {
-        if cur.is_empty() {
-            *lead = how;
-        }
-        cur.push(c);
-    };
     while let Some(c) = it.next() {
         match c {
             '\'' => {
                 open = true;
+                span += 1;
                 loop {
                     match it.next()? {
                         '\'' => break,
-                        x => push(&mut cur, &mut lead, x, Lead::Literal),
+                        x => cur.push((x, Lead::Literal, span)),
                     }
                 }
+                span += 1;
             }
             '"' => {
                 open = true;
+                span += 1;
                 loop {
                     match it.next()? {
                         '"' => break,
                         '\\' => {
                             let n = it.next()?;
                             if matches!(n, '\\' | '"' | '$' | '`') {
-                                push(&mut cur, &mut lead, n, Lead::Literal);
+                                cur.push((n, Lead::Literal, span));
                             } else {
-                                push(&mut cur, &mut lead, '\\', Lead::Literal);
-                                cur.push(n);
+                                cur.push(('\\', Lead::Literal, span));
+                                cur.push((n, Lead::Double, span));
                             }
                         }
-                        x => push(&mut cur, &mut lead, x, Lead::Double),
+                        x => cur.push((x, Lead::Double, span)),
                     }
                 }
+                span += 1;
             }
             '\\' => {
                 open = true;
-                let n = it.next()?;
-                push(&mut cur, &mut lead, n, Lead::Literal);
+                span += 1;
+                cur.push((it.next()?, Lead::Literal, span));
+                span += 1;
             }
             c if c.is_whitespace() => {
                 if open {
-                    words.push((std::mem::take(&mut cur), lead));
+                    words.push(std::mem::take(&mut cur));
                     open = false;
                 }
             }
             c => {
                 open = true;
-                push(&mut cur, &mut lead, c, Lead::Bare);
+                cur.push((c, Lead::Bare, span));
             }
         }
     }
     if open {
-        words.push((cur, lead));
+        words.push(cur);
     }
     Some(words)
 }
 
-/// One word with its home spelling made canonical. `~`, `$HOME` and `${HOME}` at the start become
-/// `${HOME}` only when the shell would expand them (see [`Lead`]). The absolute home path is
+/// One word with its home spelling made canonical. The leading `~`, `$HOME` or `${HOME}` becomes
+/// the home marker only when the shell would expand it: the whole token is written as one unit,
+/// bare (or double-quoted for the variables), and a `~` is followed by a bare `/` or the end. A
+/// partly quoted token (`"$"HOME`, `$HO"ME"`, `~"/x"`) is literal text. The absolute home path is
 /// literal text in any quoting, so it always matches.
-fn canon_word(w: &str, lead: Lead, home: Option<&str>) -> String {
-    let mut prefixes: Vec<&str> = Vec::new();
-    match lead {
-        Lead::Bare => prefixes.extend(["~", "$HOME", "${HOME}"]),
-        Lead::Double => prefixes.extend(["$HOME", "${HOME}"]),
-        Lead::Literal => {}
+fn canon_word(w: &[Ch], home: Option<&str>) -> String {
+    let text: String = w.iter().map(|c| c.0).collect();
+    let unit = |n: usize, lead: Lead| {
+        w.len() >= n
+            && w[..n]
+                .iter()
+                .all(|c| c.1 == lead && c.2 == w.first().map_or(0, |f| f.2))
+    };
+    let at_end = |n: usize, bare_slash: bool| match w.get(n) {
+        None => true,
+        Some(c) => c.0 == '/' && (!bare_slash || c.1 == Lead::Bare),
+    };
+    let marker = |n: usize| {
+        let rest: String = w[n..].iter().map(|c| c.0).collect();
+        format!("\u{1}HOME{rest}")
+    };
+    if unit(1, Lead::Bare) && w[0].0 == '~' && at_end(1, true) {
+        return marker(1);
     }
-    if let Some(h) = home {
-        prefixes.push(h);
-    }
-    for p in prefixes {
-        if let Some(rest) = w.strip_prefix(p)
-            && (rest.is_empty() || rest.starts_with('/'))
-        {
-            return format!("\u{1}HOME{rest}");
+    for (name, n) in [("$HOME", 5), ("${HOME}", 7)] {
+        for lead in [Lead::Bare, Lead::Double] {
+            if text.starts_with(name) && unit(n, lead) && at_end(n, false) {
+                return marker(n);
+            }
         }
     }
-    w.to_string()
+    if let Some(h) = home
+        && let Some(rest) = text.strip_prefix(h)
+        && (rest.is_empty() || rest.starts_with('/'))
+    {
+        return format!("\u{1}HOME{rest}");
+    }
+    text
 }
 
 /// The identity of a hook command: its words, read as a shell reads them, with an expandable home
 /// spelling made canonical. Quoting that does not change the words, and `~/`, `$HOME/`,
-/// `${HOME}/` and the absolute home path at the start of a word, do not change it. A single-quoted
-/// or backslash-escaped `~` or `$HOME` is literal text and does. A command with an unclosed quote
-/// is its own identity.
+/// `${HOME}/` and the absolute home path at the start of a word, do not change it. A `~` or
+/// `$HOME` that is single-quoted, escaped or only partly quoted is literal text and does. A
+/// command with an unclosed quote is its own identity.
 fn command_identity(cmd: &str, home: Option<&str>) -> String {
     match shell_words(cmd) {
         Some(w) => w
             .iter()
-            .map(|(x, lead)| canon_word(x, *lead, home))
+            .map(|x| canon_word(x, home))
             .collect::<Vec<_>>()
             .join("\0"),
         None => format!("raw\0{cmd}"),
@@ -1739,6 +1779,12 @@ defaultMode = "auto"
             "\"\\${HOME}/.claude/hooks/x.sh\"",
             "\"~/.claude/hooks/x.sh\"",
             "\\~/.claude/hooks/x.sh",
+            // A token that is only partly quoted is not one expandable unit.
+            "\"$\"HOME/.claude/hooks/x.sh",
+            "~\"/.claude/hooks/x.sh\"",
+            "$HO\"ME\"/.claude/hooks/x.sh",
+            "$H\"\"OME/.claude/hooks/x.sh",
+            "\"$\"\"HOME\"/.claude/hooks/x.sh",
         ] {
             assert_ne!(id(literal), want, "{literal}");
         }
@@ -1885,5 +1931,19 @@ defaultMode = "auto"
             .bytes,
         );
         assert_eq!(out["hooks"]["E"][0]["matcher"], "");
+    }
+
+    #[test]
+    fn a_merge_that_would_record_too_many_leaves_is_refused() {
+        let d = desired(NESTED);
+        let mut big = String::from("{");
+        for i in 0..=MAX_RECORDED {
+            big.push_str(&format!("\"k{i}\":{i},"));
+        }
+        big.push_str("\"z\":0}");
+        let layered = d.with_fragments([("big.json", big.as_bytes())]).unwrap();
+        let e = merge(None, &layered, &[]).unwrap_err();
+        assert_eq!(e.code, Code::LimitExceeded);
+        assert!(merge(None, &d, &[]).is_ok());
     }
 }

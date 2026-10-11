@@ -666,7 +666,12 @@ impl Exec<'_, '_> {
 
     /// Opens the fragment directory of `op` (if it has one) and reads the sources and fragments
     /// the plan recorded, each compared with the plan. A stale input blocks the operation.
-    fn fragment_inputs(&self, op: &Operation, rel: &str) -> Result<GeneratorInputs, Ended> {
+    fn fragment_inputs(
+        &self,
+        op: &Operation,
+        rel: &str,
+        salt: Option<&[u8]>,
+    ) -> Result<GeneratorInputs, Ended> {
         let dir = match op.fragment_dir.as_deref() {
             Some(d) => {
                 let comps = components(d).map_err(failed)?;
@@ -678,7 +683,7 @@ impl Exec<'_, '_> {
             }
             None => None,
         };
-        gather(self.plan, op, &self.run.sys, dir.as_ref()).map_err(|g| match g {
+        gather(self.plan, op, &self.run.sys, dir.as_ref(), salt).map_err(|g| match g {
             Gather::Stale(d) => {
                 blocked(Code::PlanStale, format!("{rel}: {d}; nothing was changed"))
             }
@@ -691,7 +696,7 @@ impl Exec<'_, '_> {
     /// A stale input or output blocks the operation. Nothing is journaled and nothing is
     /// written, so the previous output stays the last good one.
     fn generated(&self, op: &Operation, rel: &str) -> Result<Vec<u8>, Ended> {
-        let inputs = self.fragment_inputs(op, rel)?;
+        let inputs = self.fragment_inputs(op, rel, None)?;
         let bytes = match self.run.generator.generate(op, &inputs) {
             Ok(b) => b,
             Err(r) if r.code == Code::PlanStale => return Err(Ended::Blocked(r)),
@@ -1000,7 +1005,8 @@ impl Exec<'_, '_> {
         let fragments = if op.action == Action::Retire {
             GeneratorInputs::default()
         } else {
-            self.fragment_inputs(op, rel)?
+            let salt = self.run.store.salt().ok().flatten();
+            self.fragment_inputs(op, rel, salt.as_deref())?
         };
         let inputs = GeneratorInputs {
             live: read.live.clone(),

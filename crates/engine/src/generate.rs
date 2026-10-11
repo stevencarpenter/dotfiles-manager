@@ -9,9 +9,9 @@
 use crate::fsys::{Dir, Got, Peek, Sys};
 use dfm_model::digest::sha256_hex;
 use dfm_model::fold;
-use dfm_model::merge::Merged;
+use dfm_model::merge::{Merged, fragment_token};
 use dfm_model::plan::{MAX_HASHED_BYTES, MAX_LISTING, Operation, Plan};
-use dfm_model::state::{AppendedItem, OwnedEntry};
+use dfm_model::state::{AppendedItem, Class, OwnedEntry};
 use dfm_model::{Code, Refusal};
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -200,6 +200,7 @@ pub(crate) fn gather(
     op: &Operation,
     sys: &Sys,
     fragment_dir: Option<&Dir>,
+    salt: Option<&[u8]>,
 ) -> Result<GeneratorInputs, Gather> {
     let mut out = GeneratorInputs::default();
     // A render has no file input. Nothing is read, so the source root is not opened either.
@@ -263,7 +264,7 @@ pub(crate) fn gather(
                 // A fragment of a sensitive merge has no plain hash in the plan: it can hold
                 // credentials. Its salted content token is part of the approved plan, which
                 // apply plans again under the lock and compares before it writes.
-                if op.class != dfm_model::state::Class::Sensitive {
+                if op.class != Class::Sensitive {
                     let want = f.sha256.as_deref().ok_or_else(|| {
                         invalid(format!("foreign fragment {path} has no recorded hash"))
                     })?;
@@ -275,6 +276,26 @@ pub(crate) fn gather(
             }
         };
         out.fragments.insert(f.name.clone(), bytes);
+    }
+    // The fragments of a sensitive merge are tracked by a salted content token in the plan. The
+    // re-plan under the lock compared it once; compare again with the bytes read now, so a
+    // fragment swapped between that read and this one is stale too.
+    let tokens = op
+        .preconditions
+        .iter()
+        .find(|p| p.subject == format!("fragments:{dir_rel}"))
+        .and_then(|p| p.state.split_once(" content=[").map(|(_, t)| t.to_string()));
+    if let (Some(salt), Some(want), true) = (salt, tokens, op.class == Class::Sensitive) {
+        let got: Vec<String> = out
+            .fragments
+            .iter()
+            .map(|(n, b)| format!("{n}:{}", fragment_token(salt, n, b)))
+            .collect();
+        if got.join(",") != want.strip_suffix(']').unwrap_or(&want) {
+            return Err(stale(format!(
+                "fragment content in {dir_rel} changed since the plan"
+            )));
+        }
     }
     Ok(out)
 }

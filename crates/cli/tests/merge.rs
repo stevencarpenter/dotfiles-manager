@@ -2159,3 +2159,82 @@ fn the_hook_identity_follows_the_shell_for_home_spellings() {
         );
     }
 }
+
+#[test]
+fn a_fragment_with_too_many_keys_blocks_the_plan_and_writes_nothing() {
+    let fx = Fx::base();
+    let mut big = String::from("{");
+    for i in 0..20_000 {
+        big.push_str(&format!("\"k{i}\":{i},"));
+    }
+    big.push_str("\"z\":0}");
+    fx.fragment("10-big.json", &big);
+    let o = fx.plan();
+    let all = format!("{}{}", text(&o.stdout), stderr(&o));
+    assert_eq!(code(&o), 3, "{}", &all[..all.len().min(600)]);
+    assert!(
+        all.contains("E_LIMIT_EXCEEDED"),
+        "{}",
+        &all[..all.len().min(600)]
+    );
+    let d = fx.saved().plan_digest;
+    let o = fx.apply_with(&d);
+    assert_ne!(code(&o), 0);
+    assert!(!fx.settings().exists(), "nothing was written");
+}
+
+#[test]
+fn bind_does_not_recreate_a_lost_salt_when_the_ledger_records_salted_hashes() {
+    let fx = Fx::base();
+    assert_eq!(code(&fx.apply()), 0);
+    let salt = fx.state().join("salt");
+    fs::remove_file(&salt).unwrap();
+    let p = fx.root.join("profiles/t-01.toml");
+    let o = fx.run(&[
+        "bind",
+        "--profile",
+        p.to_str().unwrap(),
+        "--machine-id",
+        "m5-test",
+    ]);
+    assert_eq!(code(&o), 3, "{}\n{}", stderr(&o), text(&o.stdout));
+    assert!(stderr(&o).contains("E_STATE_INVALID"), "{}", stderr(&o));
+    assert!(stderr(&o).contains("restore state/salt"), "{}", stderr(&o));
+    assert!(!salt.exists(), "no new salt was made");
+}
+
+#[test]
+fn a_fragment_swapped_after_the_re_plan_is_stale_at_the_gather_read() {
+    let fx = Fx::base();
+    assert_eq!(code(&fx.apply()), 0);
+    let before = fs::read(fx.settings()).unwrap();
+    fx.fragment("10-a.json", r#"{"fragmentKey":1}"#);
+    let d = fx.saved().plan_digest;
+    // The plan matches when apply plans again. The fragment changes while apply is parked,
+    // after that comparison and before the fragments are read for the merge.
+    let o = parked_apply(&fx, "merge-before-read", &d, |fx| {
+        fx.fragment("10-a.json", r#"{"fragmentKey":2}"#);
+    });
+    assert_eq!(code(&o), 3, "{}\n{}", stderr(&o), text(&o.stdout));
+    assert!(stderr(&o).contains("E_PLAN_STALE"), "{}", stderr(&o));
+    assert!(!stderr(&o).contains("fragmentKey"));
+    assert_eq!(fs::read(fx.settings()).unwrap(), before);
+}
+
+#[test]
+fn partly_quoted_home_spellings_are_other_commands() {
+    for other in [
+        "\"$\"HOME/.claude/hooks/wt-create.sh",
+        "~\"/.claude/hooks/wt-create.sh\"",
+        "$HO\"ME\"/.claude/hooks/wt-create.sh",
+    ] {
+        let fx = Fx::base();
+        fx.live(&serde_json::json!({"hooks":{"WorktreeCreate":[{"hooks":[{"type":"command","command":other}]}]}}).to_string());
+        assert_eq!(code(&fx.apply()), 0);
+        assert_eq!(
+            commands(&fx.live_json(), "WorktreeCreate").len(),
+            2,
+            "{other}"
+        );
+    }
+}

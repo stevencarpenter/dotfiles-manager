@@ -470,6 +470,16 @@ fn state_owner_refusal(owner: &Stamp) -> Refusal {
     )
 }
 
+/// Whether the ledger records a salted hash of a co-owned file.
+fn ledger_has_coowned(store: &Store) -> bool {
+    store.read_ledger_lenient().is_ok_and(|l| {
+        l.resources
+            .iter()
+            .flat_map(|r| &r.owned_outputs)
+            .any(|o| o.coowned.is_some())
+    })
+}
+
 fn bind(ctx: &Ctx, profile: String, machine_id: String) -> Result<String, Refusal> {
     check_supported(&ctx.os, &ctx.arch)?;
     let invalid = |d: String| Refusal::new(Code::ProfileInvalid, d);
@@ -507,6 +517,14 @@ fn bind(ctx: &Ctx, profile: String, machine_id: String) -> Result<String, Refusa
             }
             // A store made before the salt was created at init gets it now (docs/state.md).
             missing_salt = matches!(s.salt(), Ok(None));
+            // A lost salt cannot be recreated when the ledger records salted hashes: they would
+            // no longer match. That needs the recovery text, not a new salt.
+            if missing_salt && ledger_has_coowned(&s) {
+                return Err(Refusal::new(
+                    Code::StateInvalid,
+                    dfm_model::merge::SALT_LOST,
+                ));
+            }
             true
         }
         None => false,
@@ -553,6 +571,12 @@ fn bind(ctx: &Ctx, profile: String, machine_id: String) -> Result<String, Refusa
     }
     let after = |r: Refusal| stamped(&store, r);
     if matches!(store.salt(), Ok(None)) {
+        if ledger_has_coowned(&store) {
+            return Err(after(Refusal::new(
+                Code::StateInvalid,
+                dfm_model::merge::SALT_LOST,
+            )));
+        }
         store.salt_or_create().map_err(after)?;
     }
     if have.is_some() {

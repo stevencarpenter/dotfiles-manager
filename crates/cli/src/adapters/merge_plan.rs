@@ -50,12 +50,9 @@ fn tokens(store: &Store, frags: &BTreeMap<String, Vec<u8>>) -> Vec<(String, Stri
     frags
         .iter()
         .map(|(n, b)| {
-            let t = salt.as_deref().map_or_else(String::new, |s| {
-                let mut v = n.as_bytes().to_vec();
-                v.push(0);
-                v.extend_from_slice(b);
-                merge::salted(s, &v)
-            });
+            let t = salt
+                .as_deref()
+                .map_or_else(String::new, |s| merge::fragment_token(s, n, b));
             (n.clone(), t)
         })
         .collect()
