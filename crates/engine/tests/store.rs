@@ -992,6 +992,34 @@ fn a_snapshot_symlink_directory_wrong_mode_or_bad_name_is_a_finding() {
 }
 
 #[test]
+fn an_empty_snapshot_directory_with_an_invalid_name_is_a_finding() {
+    let h = Home::new();
+    let (s, _) = init(&h);
+    let snaps = h.0.join(".local/state/dotfiles-manager/state/snapshots");
+    fs::create_dir(snaps.join("run-1")).unwrap();
+    fs::set_permissions(snaps.join("run-1"), fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(s.load().problems.is_empty(), "{:?}", s.load().problems);
+    assert!(s.load().strays.is_empty(), "{:?}", s.load().strays);
+    fs::create_dir(snaps.join("bad name")).unwrap();
+    fs::set_permissions(snaps.join("bad name"), fs::Permissions::from_mode(0o700)).unwrap();
+    symlink(h.0.join("nowhere"), snaps.join("link")).unwrap();
+    fs::write(snaps.join("file"), "x").unwrap();
+    let loaded = s.load();
+    let files: Vec<&str> = loaded.problems.iter().map(|p| p.file.as_str()).collect();
+    assert!(files.contains(&"snapshots/bad name"), "{files:?}");
+    for n in ["link", "file"] {
+        assert!(
+            loaded
+                .strays
+                .iter()
+                .any(|f| f.starts_with(&format!("snapshots/{n} "))),
+            "{n}: {:?}",
+            loaded.strays
+        );
+    }
+}
+
+#[test]
 fn every_write_cap_is_enforced_before_anything_is_written() {
     let h = Home::new();
     let (s, stamp) = init(&h);

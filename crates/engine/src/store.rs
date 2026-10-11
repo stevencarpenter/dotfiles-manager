@@ -1099,10 +1099,17 @@ impl Store {
                 let op_dir = format!("snapshots/{op}");
                 match d.child(&self.sys, &op, true, false) {
                     Ok(Some(sd)) => {
+                        if !state::valid_id(&op) {
+                            problems.push(Finding::new(
+                                Code::StateInvalid,
+                                op_dir.clone(),
+                                "not a valid snapshot name",
+                            ));
+                        }
                         for n in Self::list_dir(&sd, &op_dir, &mut problems) {
                             if tmp(&n) {
                                 strays.push(format!("{op_dir}/{n} (interrupted write)"));
-                            } else if !state::valid_id(&op) || !state::valid_id(&n) {
+                            } else if !state::valid_id(&n) {
                                 problems.push(Finding::new(
                                     Code::StateInvalid,
                                     format!("{op_dir}/{n}"),
