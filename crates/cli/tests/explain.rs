@@ -452,3 +452,45 @@ fn a_non_utf8_argument_is_a_usage_error_not_a_panic() {
         assert!(!err.contains("panicked"), "{err}");
     }
 }
+
+#[test]
+fn a_profile_for_another_architecture_is_refused_except_by_explain() {
+    let home = TempDir::new("home");
+    let (_t, root) = examples_copy();
+    let p = root.join("profiles/personal-dev-01.toml");
+    let body = fs::read_to_string(&p).unwrap();
+    assert!(body.contains("architecture = \"arm64\""));
+    fs::write(&p, body.replace("\"arm64\"", "\"x86_64\"")).unwrap();
+    let bind = run(
+        home.path(),
+        &[
+            "bind",
+            "--profile",
+            p.to_str().unwrap(),
+            "--machine-id",
+            "m5-personal",
+        ],
+    );
+    assert_eq!(bind.status.code(), Some(0), "{}", text(&bind.stderr));
+    let r = root.to_str().unwrap();
+    for cmd in ["plan", "apply", "doctor"] {
+        let o = run(home.path(), &[cmd, "--root", r]);
+        let (out, err) = (text(&o.stdout), text(&o.stderr));
+        assert!(
+            out.contains("E_PLATFORM_MISMATCH") || err.contains("E_PLATFORM_MISMATCH"),
+            "{cmd}: {out}{err}"
+        );
+        assert!(
+            cmd == "doctor" || o.status.code() == Some(3),
+            "{cmd}: {:?}",
+            o.status
+        );
+    }
+    let o = run(home.path(), &["explain", "core.git-defaults", "--root", r]);
+    assert_eq!(o.status.code(), Some(0), "{}", text(&o.stderr));
+    let out = text(&o.stdout);
+    assert!(
+        out.contains("note: E_PLATFORM_MISMATCH the profile targets macos/x86_64"),
+        "{out}"
+    );
+}

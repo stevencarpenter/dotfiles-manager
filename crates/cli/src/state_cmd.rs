@@ -2,7 +2,7 @@
 //! binary (isolated builds only).
 
 use super::{Ctx, bounded, header, usage};
-use dfm_engine::{Dir, Fail, Store, Sys, recover, resolve, verify_identity};
+use dfm_engine::{Dir, Fail, Finding, Store, Sys, recover, resolve, verify_identity};
 use dfm_model::state::Phase;
 use dfm_model::{Code, Refusal};
 use std::io::Write;
@@ -81,7 +81,13 @@ pub fn check(ctx: &Ctx, out: &mut dyn Write) -> Result<(), Refusal> {
         }
     };
     let l = store.load();
-    let findings = verify_identity(&l, &binding);
+    let mut findings = verify_identity(&l, &binding);
+    // An interrupted write leaves evidence on disk, so a stray entry fails the check.
+    findings.extend(l.strays.iter().map(|s| Finding {
+        code: Code::StateInvalid,
+        file: s.clone(),
+        detail: "stray entry from an interrupted write or an unexpected file. Fix: remove the temporary file after you confirm that no apply is running; `state recover` does not delete it".into(),
+    }));
     let count = |n: usize, bad: usize| format!("{n} ({bad} unreadable)");
     let (r_bad, t_bad) = (
         l.receipts.iter().filter(|r| r.1.is_err()).count(),
@@ -107,9 +113,6 @@ pub fn check(ctx: &Ctx, out: &mut dyn Write) -> Result<(), Refusal> {
     writeln!(out, "trials: {}", count(l.trials.len(), t_bad)).map_err(w)?;
     if let Ok(j) = &l.journal {
         writeln!(out, "journal: {} entries", j.len()).map_err(w)?;
-    }
-    for s in &l.strays {
-        writeln!(out, "note: {}", bounded(s)).map_err(w)?;
     }
     for f in &findings {
         writeln!(
@@ -203,6 +206,14 @@ pub fn recover_cmd(ctx: &Ctx, out: &mut dyn Write) -> Result<(), Refusal> {
     let l = open_locked(ctx)?;
     let s = recover(&l.store, (&l.sys, &l.home, &l.home_path)).map_err(|r| stamped(&l.store, r))?;
     header(out, ctx).map_err(out_err)?;
+    if s.repaired > 0 {
+        writeln!(
+            out,
+            "repaired a torn final journal line ({} bytes removed)",
+            s.repaired
+        )
+        .map_err(out_err)?;
+    }
     for (id, phase) in &s.closed {
         let what = if *phase == Phase::Done {
             "done"
@@ -226,7 +237,7 @@ pub fn recover_cmd(ctx: &Ctx, out: &mut dyn Write) -> Result<(), Refusal> {
         )
         .map_err(out_err)?;
     }
-    if s.closed.is_empty() && s.open.is_empty() {
+    if s.closed.is_empty() && s.open.is_empty() && s.repaired == 0 {
         return writeln!(out, "nothing to recover").map_err(out_err);
     }
     // An open entry is a result to report, not a failure of this command: exit 3 even when

@@ -131,6 +131,24 @@ impl Ctx {
     }
 }
 
+/// Spells HOME the way `Dir::open_home` and the store scope do (symlinks resolved), so every
+/// path built from it (plan targets, ledger, recovery) lies inside the store's scope. A HOME that
+/// cannot be resolved stays as given; opening it fails later with its own refusal. The resolved
+/// spelling gets the same rule as the original: no whitespace, control characters or non-UTF-8
+/// bytes (`E_HOME_MISMATCH`), because these paths reach shell scripts and tool arguments.
+fn canonical_home(platform: Platform) -> Result<Platform, Refusal> {
+    let Ok(real) = fs::canonicalize(platform.home()) else {
+        return Ok(platform);
+    };
+    if !real.to_str().is_some_and(dfm_platform_macos::valid_home) {
+        return Err(Refusal::new(
+            Code::HomeMismatch,
+            "the home directory resolves to a path with whitespace, control characters or non-UTF-8 bytes; this is not supported",
+        ));
+    }
+    Ok(Platform::with_home(real))
+}
+
 #[cfg(feature = "test-isolation")]
 fn context(home: Option<String>) -> Result<Ctx, Refusal> {
     let env = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
@@ -145,6 +163,7 @@ fn context(home: Option<String>) -> Result<Ctx, Refusal> {
         Some(h) => Platform::with_home(PathBuf::from(h)),
         None => Platform::detect()?,
     };
+    let platform = canonical_home(platform)?;
     let binding_path = env("DFM_BINDING").map_or_else(|| platform.binding_path(), PathBuf::from);
     let (os, arch) = match env("DFM_PLATFORM") {
         Some(p) => {
@@ -172,7 +191,7 @@ fn context(home: Option<String>) -> Result<Ctx, Refusal> {
 
 #[cfg(not(feature = "test-isolation"))]
 fn context(_home: Option<String>) -> Result<Ctx, Refusal> {
-    let platform = Platform::detect()?;
+    let platform = canonical_home(Platform::detect()?)?;
     let (os, arch) = current_platform();
     Ok(Ctx {
         binding_path: platform.binding_path(),
@@ -364,8 +383,8 @@ struct Loaded {
     resolved: dfm_model::resolve::Resolved,
 }
 
-/// Resolves the bound profile against `root`. Read-only.
-fn load_resolved(ctx: &Ctx, root: &Path) -> Result<Loaded, Refusal> {
+/// Resolves the bound profile against `root` without comparing it to this machine. Read-only.
+fn load_resolved_any_machine(ctx: &Ctx, root: &Path) -> Result<Loaded, Refusal> {
     let binding = read_existing_binding(ctx)?.ok_or_else(|| {
         Refusal::new(
             Code::BindingInvalid,
@@ -398,10 +417,41 @@ fn load_resolved(ctx: &Ctx, root: &Path) -> Result<Loaded, Refusal> {
     })
 }
 
+/// The architecture name a profile uses for this machine (`aarch64` is written `arm64`).
+fn profile_arch(arch: &str) -> &str {
+    if arch == "aarch64" { "arm64" } else { arch }
+}
+
+/// `Some(detail)` when the profile targets another platform or architecture than this machine.
+fn machine_mismatch(ctx: &Ctx, loaded: &Loaded) -> Option<String> {
+    let (platform, arch) = (&loaded.resolved.platform, &loaded.resolved.architecture);
+    (platform != &ctx.os || arch != profile_arch(&ctx.arch)).then(|| {
+        format!(
+            "the profile targets {platform}/{arch} and this machine is {}/{}",
+            ctx.os,
+            profile_arch(&ctx.arch)
+        )
+    })
+}
+
+/// Resolves the bound profile against `root` and refuses a profile that targets another
+/// platform or architecture than this machine (`E_PLATFORM_MISMATCH`). Read-only.
+fn load_resolved(ctx: &Ctx, root: &Path) -> Result<Loaded, Refusal> {
+    let loaded = load_resolved_any_machine(ctx, root)?;
+    match machine_mismatch(ctx, &loaded) {
+        Some(d) => Err(Refusal::new(Code::PlatformMismatch, d)),
+        None => Ok(loaded),
+    }
+}
+
 /// Resolves the bound profile against `root` and explains one resource. Read-only.
 fn explain(ctx: &Ctx, query: &str, root: &Path) -> Result<String, Refusal> {
-    let loaded = load_resolved(ctx, root)?;
-    dfm_model::resolve::explain(&loaded.resolved, query)
+    // Explaining a profile for another machine is allowed; the mismatch is a note.
+    let loaded = load_resolved_any_machine(ctx, root)?;
+    let note = machine_mismatch(ctx, &loaded)
+        .map(|d| format!("note: E_PLATFORM_MISMATCH {d}; apply and plan refuse it\n"))
+        .unwrap_or_default();
+    Ok(note + &dfm_model::resolve::explain(&loaded.resolved, query)?)
 }
 
 fn header(out: &mut dyn Write, ctx: &Ctx) -> std::io::Result<()> {

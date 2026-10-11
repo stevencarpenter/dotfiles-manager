@@ -680,26 +680,24 @@ impl Dir {
         r
     }
 
-    /// Appends one complete line. The file must exist, be private, have one link and end with a
-    /// newline (or be empty), so a torn earlier line is never extended. Failure points:
-    /// `<label>-before-write` and `<label>-after-write`.
-    #[doc(hidden)]
-    pub fn append_line(
-        &self,
-        sys: &Sys,
-        name: &str,
-        line: &[u8],
-        max_total: u64,
-        fail: &Fail,
-        label: &str,
-    ) -> Result<(), Refusal> {
+    /// Opens a journal-like file for appending: no symlink, a private regular file with one link
+    /// owned by the current user. Returns the descriptor and the size.
+    fn open_append(&self, sys: &Sys, name: &str, append: bool) -> Result<(OwnedFd, u64), Refusal> {
         check_name(name)?;
         let bad = |d: String| storage(format!("{}: {d}", self.at(name).display()));
         let fd = rfs::openat(
             &self.fd,
             name,
             // O_NONBLOCK so a FIFO planted at this name cannot hang the open.
-            OFlags::RDWR | OFlags::APPEND | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+            OFlags::RDWR
+                | if append {
+                    OFlags::APPEND
+                } else {
+                    OFlags::empty()
+                }
+                | OFlags::NOFOLLOW
+                | OFlags::NONBLOCK
+                | OFlags::CLOEXEC,
             Mode::empty(),
         )
         .map_err(|e| match e {
@@ -717,6 +715,49 @@ impl Dir {
             ));
         }
         let size = u64::try_from(st.st_size).map_err(|_| bad("has a negative size".into()))?;
+        Ok((fd, size))
+    }
+
+    /// Cuts `name` back to `len` bytes and syncs it. Used only to remove a torn final journal
+    /// line. A failure of the cut is an unconfirmed outcome: the file may or may not be shorter.
+    /// `read_size` is the size the caller judged; a file of another size was changed since.
+    pub fn truncate_to(
+        &self,
+        sys: &Sys,
+        name: &str,
+        read_size: u64,
+        len: u64,
+    ) -> Result<(), Refusal> {
+        let (fd, size) = self.open_append(sys, name, false)?;
+        if size != read_size || len > size {
+            return Err(storage(format!(
+                "{}: the file changed while it was read ({read_size} bytes read, {size} now)",
+                self.at(name).display()
+            )));
+        }
+        let f = File::from(fd);
+        f.set_len(len).and_then(|()| f.sync_all()).map_err(|e| {
+            Refusal::new(
+                Code::IoUnconfirmed,
+                format!("cutting the torn journal line is unconfirmed: {e}"),
+            )
+        })
+    }
+
+    /// Appends one complete line. The file must exist, be private, have one link and end with a
+    /// newline (or be empty), so a torn earlier line is never extended. Failure points:
+    /// `<label>-before-write` and `<label>-after-write`.
+    #[doc(hidden)]
+    pub fn append_line(
+        &self,
+        sys: &Sys,
+        name: &str,
+        line: &[u8],
+        max_total: u64,
+        fail: &Fail,
+        label: &str,
+    ) -> Result<(), Refusal> {
+        let (fd, size) = self.open_append(sys, name, true)?;
         if size.saturating_add(u64::try_from(line.len()).unwrap_or(u64::MAX)) > max_total {
             return Err(Refusal::new(
                 Code::LimitExceeded,
@@ -743,7 +784,7 @@ impl Dir {
             }
         }
         fail.hit(&format!("{label}-before-write"))?;
-        f.write_all(line).map_err(|e| io("append", &e))?;
+        write_line(&mut f, line)?;
         // The line is written. A failure from here on means its durability is unconfirmed.
         unconfirmed(
             f.sync_all()
@@ -1026,6 +1067,19 @@ pub fn open_config(sys: &Sys, layout: &Layout, create: bool) -> Result<Option<Di
     home.walk(sys, &rel, rel.len(), create)
 }
 
+/// Writes one journal line. A failure here can leave part of the line in the file, so it is an
+/// unconfirmed outcome (the journal may end in a torn line), not an ordinary I/O failure.
+fn write_line(w: &mut impl Write, line: &[u8]) -> Result<(), Refusal> {
+    w.write_all(line).map_err(|e| {
+        Refusal::new(
+            Code::IoUnconfirmed,
+            format!(
+                "the journal append failed part way and the journal may end in a torn line: {e}"
+            ),
+        )
+    })
+}
+
 /// A failure after the commit point: the new content is visible, durability is not confirmed.
 pub fn unconfirmed(r: Result<(), Refusal>) -> Result<(), Refusal> {
     r.map_err(|e| {
@@ -1145,5 +1199,38 @@ impl Lock {
             Some(_) => Err(lost("the lock file was replaced")),
             None => Err(lost("the lock file was removed")),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A writer that accepts a few bytes and then fails, like a full disk.
+    struct Partial(Vec<u8>);
+
+    impl Write for Partial {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            if self.0.is_empty() {
+                let n = buf.len().min(3);
+                self.0.extend_from_slice(&buf[..n]);
+                Ok(n)
+            } else {
+                Err(std::io::Error::from_raw_os_error(28))
+            }
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_partial_journal_write_is_an_unconfirmed_outcome() {
+        let mut w = Partial(Vec::new());
+        let r = write_line(&mut w, b"{\"a\":1}\n").unwrap_err();
+        assert_eq!(w.0, b"{\"a");
+        assert_eq!(r.code, Code::IoUnconfirmed);
+        assert!(r.detail.contains("torn line"), "{}", r.detail);
     }
 }

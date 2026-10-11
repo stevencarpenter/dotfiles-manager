@@ -76,7 +76,7 @@ Rules that matter on the first run:
 - Use only `kind = "link"` resources. Any `render`, `merge` or `assemble` resource makes `apply` refuse the whole plan with `E_GENERATOR_UNAVAILABLE` (exit 3, nothing written).
 - Do not list `.claude/settings.json`, files under `.ssh` other than `config`, or any file that holds a secret.
 - A checkout that holds ignored or runtime content (plugin checkouts, `.venv`, `node_modules`, caches) needs `[sources]` in the bundle. See the next section.
-- A `link` resource may point at a file or a directory. A directory link is one operation; the manager never writes through it and never deletes it recursively.
+- A `link` resource may point at a file or a directory. A directory source needs `directory = true` in the resource value (`[resources.value]`); without it the resolver refuses with `E_MANIFEST_INVALID`. A directory link is one operation; the manager never writes through it and never deletes it recursively.
 
 ### Declare the source roots
 

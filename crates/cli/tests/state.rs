@@ -297,9 +297,11 @@ fn abrupt_exit_at_every_point_leaves_recoverable_state_and_a_free_lock() {
         let c = check(h.path());
         let report = text(&c.stdout);
         let interrupted = ["after-intent", "after-effect"].contains(&point);
+        // A crash between a temporary file and its rename leaves a stray entry: a finding.
+        let stray = report.contains("stray entry");
         assert_eq!(
             c.status.code(),
-            Some(i32::from(interrupted)),
+            Some(i32::from(interrupted || stray)),
             "{point}: {report}"
         );
         assert_eq!(
@@ -307,7 +309,12 @@ fn abrupt_exit_at_every_point_leaves_recoverable_state_and_a_free_lock() {
             interrupted,
             "{point}: {report}"
         );
-        assert!(!report.contains("E_STATE_INVALID"), "{point}: {report}");
+        assert!(
+            !report
+                .lines()
+                .any(|l| l.contains("E_STATE_INVALID") && !l.contains("stray entry")),
+            "{point}: {report}"
+        );
         // The ledger is either the previous good one or the complete new one, never partial.
         let now = fs::read(state(h.path()).join("ledger.json")).unwrap();
         if point.starts_with("ledger-after-tmp") || interrupted || point == "after-done" {
@@ -747,6 +754,26 @@ fn concurrent_initial_binds_create_one_owner_in_the_binding_and_in_the_state() {
             .collect();
         assert!(stray.is_empty(), "round {round}: {stray:?}");
     }
+}
+
+#[test]
+fn state_check_counts_stray_entries_as_findings() {
+    let h = bound_home("stray-findings");
+    assert_eq!(check(h.path()).status.code(), Some(0));
+    for f in [
+        root(h.path()).join("state.next"),
+        state(h.path()).join("receipts/.20261010T000000Z-run.json.1.2.tmp"),
+        state(h.path()).join("trials/.t.json.1.2.tmp"),
+    ] {
+        fs::write(&f, "half").unwrap();
+        let o = check(h.path());
+        let out = text(&o.stdout);
+        assert_eq!(o.status.code(), Some(1), "{f:?}: {out}");
+        assert!(out.contains("E_STATE_INVALID"), "{out}");
+        assert!(!out.contains("state ok"), "{out}");
+        fs::remove_file(&f).unwrap();
+    }
+    assert_eq!(check(h.path()).status.code(), Some(0));
 }
 
 // ---- C08: topology ---------------------------------------------------------------------------------
@@ -1279,6 +1306,62 @@ fn a_torn_journal_is_reported_and_reconcile_leaves_it_alone() {
     let r = run(h.path(), &["__reconcile"]);
     assert_eq!(r.status.code(), Some(3), "{}", text(&r.stderr));
     assert_eq!(fs::read(&j).unwrap(), bytes);
+}
+
+#[test]
+fn recover_repairs_one_torn_final_journal_line_and_refuses_a_torn_middle_line() {
+    let h = bound_home("torn-repair");
+    let o = record(h.path(), "core.victim", "victim", "v");
+    assert_eq!(o.status.code(), Some(0), "{}", text(&o.stderr));
+    let j = state(h.path()).join("journal.jsonl");
+    let sound = fs::read(&j).unwrap();
+    let mut torn = sound.clone();
+    torn.extend_from_slice(b"{\"schema\":1,\"op_");
+    fs::write(&j, &torn).unwrap();
+    assert_ne!(check(h.path()).status.code(), Some(0));
+    let r = run(h.path(), &["state", "recover"]);
+    assert_eq!(r.status.code(), Some(0), "{}", text(&r.stderr));
+    assert!(
+        text(&r.stdout).contains("repaired a torn final journal line (16 bytes removed)"),
+        "{}",
+        text(&r.stdout)
+    );
+    let now = fs::read(&j).unwrap();
+    assert!(now.starts_with(&sound));
+    assert!(text(&now).contains("torn line repaired"));
+    assert_eq!(check(h.path()).status.code(), Some(0));
+    // The next write works.
+    let o = record(h.path(), "core.second", "second", "v");
+    assert_eq!(o.status.code(), Some(0), "{}", text(&o.stderr));
+    // A damaged line that is not the last one stays a hard error and is not touched.
+    let mut bad = fs::read(&j).unwrap();
+    bad[3] = b'#';
+    bad.extend_from_slice(b"{\"torn");
+    fs::write(&j, &bad).unwrap();
+    let r = run(h.path(), &["state", "recover"]);
+    assert_eq!(r.status.code(), Some(3), "{}", text(&r.stderr));
+    assert_eq!(fs::read(&j).unwrap(), bad);
+}
+
+#[test]
+fn a_failed_repair_after_the_cut_exits_1_because_the_journal_changed() {
+    let h = bound_home("torn-cut");
+    assert_eq!(
+        record(h.path(), "core.victim", "victim", "v").status.code(),
+        Some(0)
+    );
+    let j = state(h.path()).join("journal.jsonl");
+    let mut torn = fs::read(&j).unwrap();
+    let sound = torn.len();
+    torn.extend_from_slice(b"{\"schema\":1,\"op_");
+    fs::write(&j, &torn).unwrap();
+    let r = with_fail(
+        h.path(),
+        "journal-before-write:error",
+        &["state", "recover"],
+    );
+    assert_eq!(r.status.code(), Some(1), "{}", text(&r.stderr));
+    assert_eq!(fs::read(&j).unwrap().len(), sound, "the torn line was cut");
 }
 
 #[test]

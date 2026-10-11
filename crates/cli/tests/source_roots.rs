@@ -382,6 +382,7 @@ adapter = "fs-link/v1"
 target = ".config/plugs"
 [resources.value]
 source = "files/plugdir"
+directory = true
 "#;
 
 fn with_plugs(fx: &Fx) {

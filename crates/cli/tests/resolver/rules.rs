@@ -1169,6 +1169,13 @@ fn c09_competing_owners_are_refused() {
             "a file cannot also be a directory",
         ),
         (
+            ".config/synthetic/TOOL.CONF/child",
+            PRIVATE,
+            "private-mod.extra",
+            "reusable.tool-config",
+            "a file cannot also be a directory",
+        ),
+        (
             ".config",
             "shared/core/module.toml",
             "core.editor-defaults",
@@ -1215,6 +1222,45 @@ fn c09_competing_owners_are_refused() {
         "the same output path, compared without case",
     );
     assert_eq!(e.conflicts_with.as_deref(), Some("agents.skills"));
+}
+
+#[test]
+fn a_link_to_a_directory_needs_the_explicit_directory_flag() {
+    let link = |extra: &str| {
+        format!(
+            "{{ id = \"dirlink\", kind = \"link\", adapter = \"fs-link/v1\", target = \".agents-dir\", value = {{ source = \"files/sample-audit\"{extra} }} }}"
+        )
+    };
+    let mut set = examples();
+    edit(&mut set, AGENTS_MOD, "add", "/resources/-", Some(&link("")));
+    let e = refused(
+        &set,
+        PERSONAL,
+        Code::ManifestInvalid,
+        AGENTS_MOD,
+        Some("agents.dirlink"),
+        "is a directory",
+    );
+    assert!(e.action.contains("directory = true"), "{e}");
+    let mut set = examples();
+    edit(
+        &mut set,
+        AGENTS_MOD,
+        "add",
+        "/resources/-",
+        Some(&link(", directory = true")),
+    );
+    ok(&set, PERSONAL);
+    // The flag does not turn a file into a directory link or make the source optional.
+    let mut set = examples();
+    edit(
+        &mut set,
+        AGENTS_MOD,
+        "add",
+        "/resources/-",
+        Some(&link(", directory = \"yes\"")),
+    );
+    assert_eq!(err(&set, PERSONAL).code, Code::TypeMismatch);
 }
 
 // C10 and C11: what an error says.

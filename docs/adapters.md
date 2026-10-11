@@ -56,6 +56,10 @@ Adapters are code. Everything they read is data and is read at run time.
 
 The adapter id and its version (`git-config/v1`) are part of the code. The value tree and the files it points to are not.
 
+## `fs-link/v1` (link)
+
+Value: `source` (required) and `directory` (optional boolean, default false). A `source` that names a directory is accepted only with `directory = true`, the explicit directory claim. The planner then makes one link to the directory, and apply creates it as before; the manager never writes through it and never deletes it recursively. Without the flag the resolver refuses with `E_MANIFEST_INVALID` (docs/resolver.md, "Directory links"). `skills/v1` distributes directories by design and takes no flag.
+
 ## `git-config/v1` (render)
 
 Output: the Git config text for the resource value. Example from `examples/base/modules/core`:

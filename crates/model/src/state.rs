@@ -647,8 +647,9 @@ impl Receipt {
             }
             let never_ran = matches!(o.status, Status::NotStarted | Status::NotInScope);
             for t in [&o.started_at, &o.finished_at] {
+                // An operation that never ran has no times; one that ran has valid times.
                 let ok = match t {
-                    Some(t) => parse_rfc3339(t).is_some(),
+                    Some(t) => !never_ran && parse_rfc3339(t).is_some(),
                     None => never_ran,
                 };
                 if !ok {
@@ -1774,6 +1775,21 @@ mod tests {
         assert!(receipt(vec![o.clone()]).validate().is_ok());
         o.status = Status::NotInScope;
         assert!(receipt(vec![o.clone()]).validate().is_ok());
+        let at = "2026-10-10T00:00:00Z".to_string();
+        for never in [Status::NotStarted, Status::NotInScope] {
+            o.status = never;
+            for (start, finish) in [
+                (Some(at.clone()), None),
+                (None, Some(at.clone())),
+                (Some(at.clone()), Some(at.clone())),
+            ] {
+                o.started_at = start;
+                o.finished_at = finish;
+                assert!(receipt(vec![o.clone()]).validate().is_err(), "{never:?}");
+            }
+        }
+        o.started_at = None;
+        o.finished_at = None;
         for ran in [
             Status::Updated,
             Status::Failed,
