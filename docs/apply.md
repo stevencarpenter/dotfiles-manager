@@ -106,10 +106,14 @@ An `adopt` operation records ownership of a link that already is the link the pl
 2. Topology: the parent chain is opened without following a link.
 3. Leaf: the entry must be a link whose target text equals `Operation.link`, else `E_CONFLICT` and the entry is left alone.
 4. Intent: the journal gets an `intent` entry with `existed_before = true` and the link fingerprint as the expected value.
-5. Effect step: nothing is written. Apply reads the leaf again where the effect would happen and once more after that, immediately before the outcome entry (the failpoints `apply-before-effect` and `apply-after-effect` sit before each read). A leaf that changed gets a `failed` journal entry, the operation is `failed` with `E_CONFLICT`, and the ledger is not written.
+5. Effect step: nothing is written. After the effect step apply reads the leaf a second time, immediately before the outcome entry (the failpoint `apply-after-effect` sits before this read). So an adoption reads the leaf twice: once at step 3 and once here. A leaf that changed gets a `failed` journal entry, the operation is `failed` with `E_CONFLICT`, and the ledger is not written.
 6. Outcome: the journal gets `done`. Then the ledger records the output with the link fingerprint (`link_fingerprint` of the target text) and mode 0777, as for a published link.
 
 The receipt operation has status `updated`, `before` absent, `after` the link fingerprint, `owned_outputs` the path, and no `reload`, because nothing was published. The report prints the reload note only when an output was published. A rerun finds a `current` link with a ledger entry and does nothing. A later deselect removes the adopted link only with `--allow-disruptive`, like any owned link.
+
+A link's ledger fingerprint is the SHA-256 of `link\0` and the target text (`link_fingerprint`). The prefix keeps it apart from a file fingerprint: an adopted link replaced by a regular file whose bytes equal the target text is a changed output, not the owned link, so neither the planner nor `authorizes_delete` accepts it. A ledger written before DFM-45 holds the plain hash for its links. Those entries no longer match their live links. The planner reports them as modified (`E_CONFLICT`) and nothing removes them. Remove the old link by hand and apply again, or adopt it again after removing the ledger entry by hand (there is no command for that yet). Nothing released wrote a ledger before DFM-45, so no migration is built.
+
+When an exact link is `current` and is deliberately not adopted (the ledger has an entry for the path, the link resolves to something other than a file, or the resource is sensitive), the plan text says `already holds; not adopted: <reason>`, so `current` does not read as owned.
 
 The window between the last read and the ledger write stays open. A process of the same user that swaps the leaf in it is recorded as the owner of a link it did not write. The ledger fingerprint then no longer matches the live link, so a later removal is refused. This is the same check-then-act limit as for `replace_link`.
 
@@ -148,7 +152,7 @@ A receipt is written whenever the run wrote anything, also after a failure. If s
 ## Receipt fields apply adds
 
 - `operations[].reload`: see below.
-- `approvals[{operation_id, how, at}]`: one entry per `--allow-disruptive` removal that ran. `operation_id` is the id of the receipt operation (the journal attempt id). `how` is `allow_disruptive`. Each `--allow-adopt` adoption that reached its intent adds an entry with `how = allow_adopt`. Absent when there is none.
+- `approvals[{operation_id, how, at}]`: one entry per `--allow-disruptive` removal that ran. `operation_id` is the id of the receipt operation (the journal attempt id). `how` is `allow_disruptive`. Each `--allow-adopt` adoption that reached its intent adds an entry with `how = allow_adopt`. The validator checks that `how` fits the operation: `allow_disruptive` needs an operation that owns nothing and has no `after`, `allow_adopt` needs one with no `before` and no `reload` (and, when it is `updated`, an `after` and an owned output). A failed or blocked operation has neither shape, so only `how` is checked for it. Absent when there is none.
 - `sources[{id, tree}]`: a path source has no `commit`, and a source with no commit is a path source. `id` is `path-` and the first 12 hex characters of the tree digest. The tree digest is the one the planner computes.
 - Every operation that ran has the journal attempt id as its receipt `id`, also when it failed, was unknown or was blocked after its intent. An operation that did not reach its intent has the planner's journal id.
 

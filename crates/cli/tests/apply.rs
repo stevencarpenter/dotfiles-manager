@@ -1250,17 +1250,33 @@ fn a_crash_after_a_link_effect_leaves_an_unowned_link_that_a_later_run_adopts() 
     );
     let j = fx.journal();
     assert_eq!((j.len(), j[0]["phase"].as_str()), (1, Some("intent")));
-    // The rerun settles the interruption as done. The link is not owned, so it is only an
-    // adoption candidate: without the flag nothing runs.
+    // The link is not owned, so it is only an adoption candidate: without the flag nothing
+    // runs, not even the settling of the interruption.
     let o = fx.apply(&[]);
     assert_eq!(code(&o), 3, "{}\n{}", stderr(&o), text(&o.stdout));
     assert!(stderr(&o).contains("E_ADOPT_UNAPPROVED"), "{}", stderr(&o));
     assert!(fx.owned_paths().is_empty());
-    // With the flag the link is recorded and the rest of the plan runs.
+    assert_eq!(fx.journal().len(), 1);
+    // A run that deselects the module settles the interruption as done and removes nothing: no
+    // ledger entry says the manager owns the link, so not even an allowance could delete it.
+    fx.set_profile("");
+    let o = fx.apply(&[]);
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+    let j = fx.journal();
+    let first = j[0]["op_id"].as_str().unwrap();
+    assert!(
+        j.iter()
+            .any(|e| e["op_id"] == first && e["phase"] == "done"),
+        "the interrupted entry is settled as done: {j:#?}"
+    );
+    assert!(is_link_to(&fx.h(".zshrc"), &zsh));
+    assert!(!fx.owned_paths().contains(&".zshrc".to_string()));
+    // Selecting the module again plans the leftover link as an adoption. With the flag the link
+    // is recorded and the rest of the plan runs.
+    fx.set_profile("\"extra\"");
     let o = fx.apply(&["--allow-adopt", "extra.zsh@.zshrc"]);
     assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
     assert!(fx.owned_paths().contains(&".zshrc".to_string()));
-    assert_eq!(fx.owned_paths().len(), 4);
     assert!(is_link_to(&fx.h(".zshrc"), &zsh));
 }
 
@@ -1631,7 +1647,7 @@ fn a_stow_style_machine_is_adopted_without_writing_to_home() {
     // The ledger owns every link, with the link fingerprint and the link mode.
     assert_eq!(fx.owned_paths().len(), 4);
     let zsh = fx.root.join("base/modules/extra/files/zshrc");
-    let want = format!("{:x}", Sha256::digest(zsh.to_str().unwrap().as_bytes()));
+    let want = dfm_model::plan::link_fingerprint(zsh.to_str().unwrap());
     let owned: Vec<serde_json::Value> = fx.ledger()["resources"]
         .as_array()
         .unwrap()
@@ -1643,6 +1659,11 @@ fn a_stow_style_machine_is_adopted_without_writing_to_home() {
         .find(|o| o["path"].as_str().unwrap().ends_with("/.zshrc"))
         .unwrap();
     assert_eq!(z["fingerprint"], want.as_str());
+    // The link fingerprint is not the hash of a file with the same bytes.
+    assert_ne!(
+        want,
+        format!("{:x}", Sha256::digest(zsh.to_str().unwrap().as_bytes()))
+    );
     assert_eq!(z["mode"], 0o777);
     // The receipt records each approval and no reload state.
     let r = fx.receipts();
@@ -1752,6 +1773,10 @@ fn an_adoption_without_its_flag_is_refused_before_any_write_and_a_preview_lists_
     // A removal id is not an adoption id.
     let o = fx.apply(&["--allow-adopt", "remove@x@y"]);
     assert_eq!(code(&o), 2, "{}", stderr(&o));
+    // The same holds across kinds: a wrong disruptive id wins over a missing adoption.
+    let o = fx.apply(&["--allow-disruptive", ids[0].as_str()]);
+    assert_eq!(code(&o), 2, "{}", stderr(&o));
+    assert!(stderr(&o).contains("names no removal"), "{}", stderr(&o));
 }
 
 #[test]
@@ -1813,11 +1838,74 @@ fn a_leaf_swapped_after_the_plan_is_not_adopted_and_no_ledger_entry_is_written()
         );
         // The links the swap did not touch were not created: the run stopped at the failure.
         assert!(fs::symlink_metadata(fx.h(".ssh")).is_err(), "{point}");
-        // The failed adoption is not an approval that ran to the end.
-        assert!(
-            fx.receipts()[0]["approvals"]
-                .as_array()
-                .is_none_or(|a| a.len() == 1)
-        );
+        // The attempt reached its intent, so the receipt records exactly its one approval.
+        let approvals = fx.receipts()[0]["approvals"].as_array().unwrap().clone();
+        assert_eq!(approvals.len(), 1, "{point}");
+        assert_eq!(approvals[0]["how"], "allow_adopt", "{point}");
     }
+}
+
+#[test]
+fn a_crash_during_an_adoption_is_settled_and_the_rerun_records_the_link() {
+    // `apply-after-effect` leaves an intent entry that the reconcile probe settles as done.
+    // `apply-after-done` leaves a done entry and no ledger entry.
+    for point in ["apply-after-effect", "apply-after-done"] {
+        let fx = Fx::new();
+        let zsh = fx.root.join("base/modules/extra/files/zshrc");
+        symlink(&zsh, fx.h(".zshrc")).unwrap();
+        let digest = fx.digest();
+        let o = Command::new(BIN)
+            .env_clear()
+            .env("DFM_FAILPOINT", format!("{point}:abort"))
+            .arg("--home")
+            .arg(fx.home.path())
+            .args(["apply", "--root", fx.root_arg(), "--yes-plan", &digest])
+            .args(["--allow-adopt", "extra.zsh@.zshrc"])
+            .output()
+            .unwrap();
+        assert!(!o.status.success(), "{point}");
+        assert!(fx.owned_paths().is_empty(), "{point}: nothing recorded yet");
+        let first: Vec<_> = fx.journal();
+        let id = first[0]["op_id"].as_str().unwrap().to_string();
+        let o = fx.apply(&["--allow-adopt", "extra.zsh@.zshrc"]);
+        assert_eq!(code(&o), 0, "{point}: {}\n{}", stderr(&o), text(&o.stdout));
+        let j = fx.journal();
+        assert!(
+            j.iter()
+                .any(|e| e["op_id"] == id.as_str() && e["phase"] == "done"),
+            "{point}: the interrupted attempt ends done: {j:#?}"
+        );
+        assert!(
+            j.iter()
+                .all(|e| e["op"] != "adopt" || e["phase"] != "failed")
+        );
+        assert!(fx.owned_paths().contains(&".zshrc".to_string()), "{point}");
+        assert!(is_link_to(&fx.h(".zshrc"), &zsh), "{point}");
+    }
+}
+
+#[test]
+fn an_adopted_link_replaced_by_a_file_with_the_link_text_as_bytes_is_not_removed() {
+    let fx = Fx::new();
+    fx.stow();
+    let ids = fx.adopt_ids();
+    assert_eq!(code(&fx.apply(&adopt_args(&ids))), 0);
+    // A regular file whose bytes are exactly the link text: a plain SHA-256 of it would equal
+    // the old link fingerprint.
+    let zsh = fx.root.join("base/modules/extra/files/zshrc");
+    fs::remove_file(fx.h(".zshrc")).unwrap();
+    fs::write(fx.h(".zshrc"), zsh.to_str().unwrap()).unwrap();
+    fx.set_profile("");
+    let plan = fx.saved();
+    let removal = "remove@extra.zsh@.zshrc";
+    let args = ["--allow-disruptive", removal];
+    // The plan itself refuses: the file is not what the ledger recorded.
+    let o = fx.apply_with(&plan.plan_digest, &args);
+    assert_eq!(code(&o), 3, "{}\n{}", stderr(&o), text(&o.stdout));
+    assert!(stderr(&o).contains("E_CONFLICT"), "{}", stderr(&o));
+    assert_eq!(
+        fs::read(fx.h(".zshrc")).unwrap(),
+        zsh.to_str().unwrap().as_bytes()
+    );
+    assert!(fx.owned_paths().contains(&".zshrc".to_string()));
 }

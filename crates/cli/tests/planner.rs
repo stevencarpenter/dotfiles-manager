@@ -2528,3 +2528,26 @@ mod ledger_sensitivity {
         );
     }
 }
+
+#[test]
+fn an_exact_link_that_another_resource_owns_is_not_adopted_and_says_why() {
+    let e = Env::personal();
+    let link = ssh_link(&e);
+    e.mkdirs(".ssh");
+    // Another (deselected) resource has a ledger entry for the path. The link is the one
+    // `core.ssh` would create, but the ledger already has an entry, so nothing is adopted.
+    record(&e, "other.res", &e.h(".ssh/config"), "owned\n");
+    fs::remove_file(e.h(".ssh/config")).unwrap();
+    symlink(&link, e.h(".ssh/config")).unwrap();
+    let (o, s) = e.saved();
+    assert_eq!(code(&o), 0, "{}{}", text(&o.stdout), text(&o.stderr));
+    let a = op(&s, "core.ssh@.ssh/config");
+    assert_eq!((a.action, a.status), (Action::None, Status::Current));
+    assert_eq!(a.ownership, Ownership::UnrecordedCurrent);
+    assert!(
+        a.effect
+            .ends_with("already holds; not adopted: the ledger already has an entry for this path"),
+        "{}",
+        a.effect
+    );
+}

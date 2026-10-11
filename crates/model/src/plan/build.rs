@@ -671,8 +671,7 @@ impl Planner<'_> {
             subject: format!("ledger:{claim}"),
             state: self.ledger_state(claim, r.sensitive),
         });
-        // Only a normal-class output that no ledger entry mentions can be adopted.
-        let unowned = !r.sensitive && self.ledger_entry(claim).is_none();
+        let unowned = self.ledger_entry(claim).is_none();
         let (action, status, ownership, effect, post) =
             decide(r, claim, &seen, link, op.ownership, unowned)?;
         op.action = action;
@@ -1099,6 +1098,8 @@ fn decide(
     ownership: Ownership,
     unowned: bool,
 ) -> Result<Decision, Fail> {
+    // Only a normal-class output that no ledger entry mentions can be adopted.
+    let adoptable = unowned && !r.sensitive;
     let shown = if r.sensitive {
         format!("{path} (sensitive: destination and mode only)")
     } else {
@@ -1152,24 +1153,35 @@ fn decide(
                         ..
                     },
                     _,
-                ) if target == want && unowned => Ok((
+                ) if target == want && adoptable => Ok((
                     Action::Adopt,
                     Status::Planned,
                     Ownership::UnrecordedCurrent,
                     format!("adopt {shown}: record the existing link -> {want}, write nothing"),
                     post,
                 )),
-                (Node::Link { target, .. }, o) if target == want => Ok((
-                    Action::None,
-                    Status::Current,
-                    if o == Ownership::Owned {
-                        Ownership::Owned
+                (Node::Link { target, to, .. }, o) if target == want => {
+                    // `current` must not read as owned: say why an exact link is left alone.
+                    let (own, effect) = if o == Ownership::Owned {
+                        (
+                            Ownership::Owned,
+                            format!("link {shown} -> {want} already holds"),
+                        )
                     } else {
-                        Ownership::UnrecordedCurrent
-                    },
-                    format!("link {shown} -> {want} already holds"),
-                    post,
-                )),
+                        let why = if r.sensitive {
+                            "a sensitive output is never adopted".to_string()
+                        } else if !unowned {
+                            "the ledger already has an entry for this path".to_string()
+                        } else {
+                            format!("it resolves to {}, not a file", to.name())
+                        };
+                        (
+                            Ownership::UnrecordedCurrent,
+                            format!("link {shown} -> {want} already holds; not adopted: {why}"),
+                        )
+                    };
+                    Ok((Action::None, Status::Current, own, effect, post))
+                }
                 (_, Ownership::Owned) => Ok((
                     Action::ReplaceLink,
                     Status::Planned,
@@ -1280,4 +1292,99 @@ fn unknown_fail(field: &'static str, path: &str, reason: &str) -> Fail {
         format!("{path} could not be observed: {reason}"),
         "make the path readable and run plan again",
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn resource(sensitive: bool) -> ResolvedResource {
+        ResolvedResource {
+            id: "core.ssh".into(),
+            module: "core".into(),
+            declared_in: "m.toml".into(),
+            kind: "link".into(),
+            adapter: "fs-link/v1".into(),
+            target: Some(".ssh/config".into()),
+            value: Value::Table(Default::default()),
+            defaults: vec![],
+            extensions: vec![],
+            secret_values: false,
+            sensitive,
+            native_document: false,
+            provenance: BTreeMap::new(),
+            claims: vec![".ssh/config".into()],
+            dir_claims: vec![],
+            precedence: None,
+        }
+    }
+
+    fn link(to: LinkTo) -> Seen {
+        Seen {
+            node: Node::Link {
+                target: "/r/x".into(),
+                to,
+                own: true,
+            },
+            alias: None,
+        }
+    }
+
+    fn run(sensitive: bool, seen: &Seen, ownership: Ownership, unowned: bool) -> Decision {
+        decide(
+            &resource(sensitive),
+            ".ssh/config",
+            seen,
+            Some("/r/x"),
+            ownership,
+            unowned,
+        )
+        .unwrap_or_else(|f| panic!("{}", f.detail))
+    }
+
+    #[test]
+    fn an_exact_unowned_link_to_a_file_is_adopted() {
+        let d = run(false, &link(LinkTo::File), Ownership::Foreign, true);
+        assert_eq!(
+            (d.0, d.1, d.2),
+            (Action::Adopt, Status::Planned, Ownership::UnrecordedCurrent)
+        );
+    }
+
+    #[test]
+    fn an_exact_link_that_is_not_adoptable_stays_current_and_says_why() {
+        let cases = [
+            (
+                "sensitive",
+                run(true, &link(LinkTo::File), Ownership::Foreign, true),
+                "a sensitive output is never adopted",
+            ),
+            (
+                "other owner",
+                run(false, &link(LinkTo::File), Ownership::Foreign, false),
+                "the ledger already has an entry for this path",
+            ),
+            (
+                "directory",
+                run(false, &link(LinkTo::Dir), Ownership::Foreign, true),
+                "it resolves to dir, not a file",
+            ),
+        ];
+        for (what, d, why) in cases {
+            assert_eq!(
+                (d.0, d.1, d.2),
+                (Action::None, Status::Current, Ownership::UnrecordedCurrent),
+                "{what}"
+            );
+            assert!(
+                d.3.ends_with(&format!("already holds; not adopted: {why}")),
+                "{what}: {}",
+                d.3
+            );
+        }
+        // An owned link is plain current.
+        let d = run(false, &link(LinkTo::File), Ownership::Owned, false);
+        assert_eq!((d.0, d.2), (Action::None, Ownership::Owned));
+        assert!(!d.3.contains("not adopted"), "{}", d.3);
+    }
 }

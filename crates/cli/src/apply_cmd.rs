@@ -8,11 +8,10 @@
 use crate::plan_cmd::{make_plan, render};
 use crate::{Ctx, read_existing_binding, state_cmd, usage};
 use dfm_engine::{
-    Dir, NoGenerator, Run, Store, apply, check_allow, check_allow_adopt, check_journal_capacity,
-    gates, now_unix,
+    Approval as Allowance, Dir, NoGenerator, Run, Store, apply, check_allowances,
+    check_journal_capacity, gates, now_unix,
 };
 use dfm_model::display::visible;
-use dfm_model::plan::Action;
 use dfm_model::state::{
     Approval, BinaryId, DisruptiveApproval, ProfileRef, Receipt, RunResult, SourceId, Stamp,
     Status, count_statuses, rfc3339,
@@ -55,13 +54,12 @@ pub fn parse_args(args: &[String]) -> Result<Args, Refusal> {
             "--yes-plan" => {
                 value(Some(&mut yes))?;
             }
-            "--allow-disruptive" => {
+            flag if Allowance::from_flag(flag).is_some() => {
                 let v = value(None)?;
-                allow.insert(v);
-            }
-            "--allow-adopt" => {
-                let v = value(None)?;
-                allow_adopt.insert(v);
+                match Allowance::from_flag(flag) {
+                    Some(Allowance::Adopt) => allow_adopt.insert(v),
+                    _ => allow.insert(v),
+                };
             }
             "--preview" if !preview => preview = true,
             "--preview" => return Err(usage("--preview given twice")),
@@ -173,28 +171,16 @@ fn run_inner(
     if let Some(r) = g.refusal {
         return Err(r);
     }
-    // An id that names no removal is a usage error. A removal without its id is refused, and
-    // every missing id is printed as a flag to paste.
-    // The same holds for adoptions. A usage error wins over a missing approval, and a preview
-    // lists the missing flags of both kinds before it exits 3.
-    let checks = [
-        check_allow(&g.removals, &args.allow),
-        check_allow_adopt(&g.adoptions, &args.allow_adopt),
-    ];
-    if let Some(e) = checks
-        .iter()
-        .filter_map(|c| c.as_ref().err())
-        .find(|e| e.code == Code::Usage)
-    {
-        return Err(e.clone());
-    }
-    let mut first = None;
-    for e in checks.into_iter().filter_map(Result::err) {
-        writeln!(out, "{}", visible(&e.detail)).map_err(w)?;
-        first.get_or_insert(e);
-    }
-    if let Some(e) = first {
-        return Err(e);
+    // An id that names no operation of its kind is a usage error and wins over a missing
+    // approval. A missing approval is refused with every missing flag printed to paste.
+    if let Err(all) = check_allowances(&g, &args.allow, &args.allow_adopt) {
+        for e in all.iter().filter(|e| e.code != Code::Usage) {
+            writeln!(out, "{}", visible(&e.detail)).map_err(w)?;
+        }
+        return Err(all
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| usage("approval check failed")));
     }
     // The journal size is read without the lock. The lock is taken only for a real run.
     let readable = Store::open_read(sys, &layout, state_cmd::fail_from_env()?)?
@@ -270,15 +256,15 @@ fn run_inner(
             .iter()
             .zip(&report.operations)
             .filter_map(|(op, rec)| {
-                let how = match op.action {
-                    Action::Remove if args.allow.contains(&op.id) => "allow_disruptive",
-                    Action::Adopt if args.allow_adopt.contains(&op.id) => "allow_adopt",
-                    _ => return None,
+                let kind = Allowance::of(op.action)?;
+                let approved = match kind {
+                    Allowance::Disruptive => &args.allow,
+                    Allowance::Adopt => &args.allow_adopt,
                 };
                 // The attempt id replaces the planner id once the operation reached its intent.
-                (rec.id != op.journal_id).then(|| DisruptiveApproval {
+                (approved.contains(&op.id) && rec.id != op.journal_id).then(|| DisruptiveApproval {
                     operation_id: rec.id.clone(),
-                    how: how.into(),
+                    how: kind.how().into(),
                     at: rec.started_at.clone().unwrap_or_else(|| rfc3339(started)),
                 })
             })
