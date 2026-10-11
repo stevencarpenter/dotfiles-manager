@@ -515,7 +515,7 @@ check_config_tree() {
 }
 
 # An existing binding must be usable by the new binary exactly as it is: a regular file, not a
-# symlink or FIFO, mode 0600, owned by the current user (the rules of read_binding in the CLI).
+# symlink or FIFO, mode 0600, owned by the current user, a single hard link (the rules of read_binding in the CLI).
 check_binding() {
   b=$HOME_DIR/.config/dotfiles-manager/machine.toml
   { [ -e "$b" ] || [ -L "$b" ]; } || return 0
@@ -523,6 +523,7 @@ check_binding() {
   [ -f "$b" ] || binding_bad "$b" "is not a regular file"
   [ "$(/usr/bin/stat -f %Lp "$b")" = 600 ] || binding_bad "$b" "mode is not 0600"
   [ "$(/usr/bin/stat -f %u "$b")" = "$(/usr/bin/id -u)" ] || binding_bad "$b" "is not owned by the current user"
+  [ "$(/usr/bin/stat -f %l "$b")" = 1 ] || binding_bad "$b" "has more than one hard link"
 }
 binding_bad() { printf 'error: E_BINDING_INVALID %s %s\n' "$1" "$2" >&2; exit 3; }
 
