@@ -161,6 +161,8 @@ pub fn plan_for(ctx: &Ctx, loaded: &Loaded) -> Result<Plan, Refusal> {
     let root_str = loaded.root.to_str().ok_or_else(|| {
         usage("--root resolves to a path that is not UTF-8; point --root at a UTF-8 path")
     })?;
+    let merge =
+        crate::adapters::merge_facts(&loaded.resolved, &store, &sys, &home, &layout.home, &ledger);
     let cx = Context {
         binary: binary_identity()?,
         profile: loaded.binding.profile(),
@@ -170,6 +172,7 @@ pub fn plan_for(ctx: &Ctx, loaded: &Loaded) -> Result<Plan, Refusal> {
         ledger,
         reserved,
         unchecked,
+        merge,
     };
     let mut plan = plan::build(&loaded.resolved, &cx, &obs)?;
     // Generated output hashes (architecture section 9 item 1), from the same adapters apply runs.
@@ -210,6 +213,11 @@ pub(crate) fn render(p: &Plan, digest: &str, out: &mut dyn Write) -> std::io::Re
         // reviewer sees a new `core.sshCommand` or `include.path` before approving.
         if let Some(n) = o.output_bytes {
             writeln!(out, "    output: {n} bytes")?;
+        }
+        // A co-owned merge shows the digest of its declared managed values (not secret) and the
+        // setting names. It never shows the live file, a hash of it or a value.
+        if let Some(h) = &o.managed_sha256 {
+            writeln!(out, "    managed: sha256:{h}")?;
         }
         if !o.sets.is_empty() {
             writeln!(out, "    sets: {}", visible(&o.sets.join(", ")))?;

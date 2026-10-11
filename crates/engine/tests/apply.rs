@@ -6,7 +6,7 @@ mod common;
 
 use common::*;
 use dfm_engine::{
-    Action as Inject, Dir, Fail, Generator, GeneratorInputs, NoGenerator, Run, Store, apply,
+    Action as Inject, Dir, Fail, Generator, GeneratorInputs, NoGenerator, Run, Store, apply, gates,
     observe, owned_outputs,
 };
 use dfm_model::digest::sha256_hex;
@@ -119,6 +119,7 @@ fn op(h: &Home, store: &Store, id: &str, n: u32, action: Action, rel: &str) -> O
         fragments: vec![],
         fragment_dir: None,
         output_sha256: None,
+        managed_sha256: None,
         output_bytes: None,
         sets: vec![],
         after: vec![],
@@ -230,6 +231,7 @@ fn own_fp(s: &Setup, rel: &str, fingerprint: &str) {
             path: s.h.0.join(rel).to_str().unwrap().into(),
             mode: 0o600,
             fingerprint: Some(fingerprint.into()),
+            coowned: None,
         }],
     })
     .unwrap();
@@ -840,6 +842,57 @@ fn a_sensitive_output_is_refused_whatever_its_action_and_with_its_own_code() {
         assert_eq!(e.code, Code::SensitiveUnsupported, "{action:?}");
     }
     assert!(s.store.read_journal().unwrap().is_empty() && !s.h.0.join("a").exists());
+}
+
+/// A generator that runs sensitive merges and nothing else.
+struct MergeOnly;
+
+impl Generator for MergeOnly {
+    fn supports(&self, _: &Operation) -> bool {
+        false
+    }
+    fn generate(&self, _: &Operation, _: &GeneratorInputs) -> Result<Vec<u8>, Refusal> {
+        Err(Refusal::new(Code::GeneratorUnavailable, "none"))
+    }
+    fn merges(&self, op: &Operation) -> bool {
+        matches!(
+            op.action,
+            Action::CreateFile | Action::UpdateFile | Action::Retire
+        )
+    }
+}
+
+#[test]
+fn only_a_merge_the_generator_runs_is_admitted_among_sensitive_operations() {
+    let s = setup();
+    // Admitted: a merge with its managed fingerprint. The gate passes (nothing runs here).
+    let mut m = op(&s.h, &s.store, "x@a", 1, Action::CreateFile, "a");
+    m.class = Class::Sensitive;
+    m.managed_sha256 = Some("a".repeat(64));
+    assert!(gates(&plan(vec![m.clone()]), &MergeOnly).refusal.is_none());
+    // A merge without its fingerprint is a malformed plan, not a sensitive refusal.
+    let mut bad = m.clone();
+    bad.managed_sha256 = None;
+    let r = gates(&plan(vec![bad]), &MergeOnly).refusal.unwrap();
+    assert_eq!(r.code, Code::PlanInvalid);
+    // Retire carries none.
+    let mut retire = m.clone();
+    retire.action = Action::Retire;
+    retire.managed_sha256 = None;
+    assert!(gates(&plan(vec![retire]), &MergeOnly).refusal.is_none());
+    // Every other sensitive operation is still refused, and the plan is refused whole.
+    for action in [Action::CreateLink, Action::ReplaceLink, Action::Remove] {
+        let mut o = op(&s.h, &s.store, "x@b", 2, action, "b");
+        o.class = Class::Sensitive;
+        o.link = Some("/src/x".into());
+        let r = gates(&plan(vec![m.clone(), o]), &MergeOnly)
+            .refusal
+            .unwrap();
+        assert_eq!(r.code, Code::SensitiveUnsupported, "{action:?}");
+    }
+    // The same operation under a generator that does not merge is refused.
+    let r = gates(&plan(vec![m]), &NoGenerator).refusal.unwrap();
+    assert_eq!(r.code, Code::SensitiveUnsupported);
 }
 
 #[test]

@@ -35,6 +35,38 @@ pub struct Owned {
     pub class: Class,
     pub path: String,
     pub fingerprint: Option<String>,
+    /// `Some(n)` for a co-owned file (`claude-settings/v1`) with `n` entries the manager added.
+    pub coowned_entries: Option<usize>,
+}
+
+/// What the caller learned from the live file of a co-owned merge resource. The planner is pure
+/// and never reads a sensitive file, so the caller reads it and reports only this verdict.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MergeVerdict {
+    /// The merge changes the file, or the ledger needs an entry. The file is absent, or it can
+    /// be merged.
+    Write,
+    /// The merged result equals the live file and the ledger already records it.
+    Current,
+    /// The file cannot be merged: malformed, open to group or others, or a managed field was
+    /// changed outside the manager. The detail carries no live content.
+    Blocked {
+        code: Code,
+        detail: String,
+        correction: String,
+    },
+}
+
+/// The plan-time facts of one merge resource.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MergeFact {
+    /// SHA-256 of the canonical JSON of the declared managed values.
+    pub managed_sha256: String,
+    /// Names of the top-level settings the merge sets or seeds. Names only.
+    pub sets: Vec<String>,
+    /// How many handler entries the merge adds.
+    pub handlers: usize,
+    pub verdict: MergeVerdict,
 }
 
 /// The ledger entry for a path as a precondition string. For a sensitive path the fingerprint
@@ -63,6 +95,8 @@ pub struct Context<'a> {
     pub reserved: BTreeMap<String, String>,
     /// HOME-relative claimed paths for which that check failed for another reason, with it.
     pub unchecked: BTreeMap<String, String>,
+    /// Facts about the live file of each selected merge resource, by resource id.
+    pub merge: BTreeMap<String, MergeFact>,
 }
 
 /// Ledger outputs of a resource that is no longer selected, at a path no selected resource
@@ -192,15 +226,20 @@ struct Fail {
     code: Code,
     field: &'static str,
     detail: String,
-    correction: &'static str,
+    correction: std::borrow::Cow<'static, str>,
 }
 
-fn fail(code: Code, field: &'static str, detail: String, correction: &'static str) -> Fail {
+fn fail(
+    code: Code,
+    field: &'static str,
+    detail: String,
+    correction: impl Into<std::borrow::Cow<'static, str>>,
+) -> Fail {
     Fail {
         code,
         field,
         detail,
-        correction,
+        correction: correction.into(),
     }
 }
 
@@ -360,7 +399,7 @@ impl Planner<'_> {
             field: Some(f.field.into()),
             path: path.map(String::from),
             detail: f.detail,
-            correction: f.correction.into(),
+            correction: f.correction.into_owned(),
         });
     }
 
@@ -508,6 +547,7 @@ impl Planner<'_> {
             fragments: Vec::new(),
             fragment_dir: None,
             output_sha256: None,
+            managed_sha256: None,
             output_bytes: None,
             sets: Vec::new(),
             after: Vec::new(),
@@ -676,8 +716,11 @@ impl Planner<'_> {
             state: self.ledger_state(claim, r.sensitive),
         });
         let unowned = self.ledger_entry(claim).is_none();
-        let (action, status, ownership, effect, post) =
-            decide(r, claim, &seen, link, op.ownership, unowned)?;
+        let (action, status, ownership, effect, post) = if r.kind == "merge" {
+            self.decide_merge(r, claim, &seen, op)?
+        } else {
+            decide(r, claim, &seen, link, op.ownership, unowned)?
+        };
         op.action = action;
         op.status = status;
         op.ownership = ownership;
@@ -685,6 +728,114 @@ impl Planner<'_> {
         op.postcondition = post;
         op.link = link.map(String::from);
         Ok(())
+    }
+
+    /// A co-owned merge file (`claude-settings/v1`). The manager never owns the whole file, so
+    /// the ledger fingerprint does not decide: the caller's verdict does. It read the live file
+    /// and compared only the managed fields with the salted hash in the ledger. No live content
+    /// reaches the plan, only the declared values' digest, the setting names and the verdict.
+    fn decide_merge(
+        &self,
+        r: &ResolvedResource,
+        path: &str,
+        seen: &Seen,
+        op: &mut Operation,
+    ) -> Result<Decision, Fail> {
+        let conflict = |what: String, fix: &'static str| fail(Code::Conflict, "target", what, fix);
+        match &seen.node {
+            Node::Unknown { reason } => return Err(unknown_fail("target", path, reason)),
+            Node::Dir { .. } => {
+                return Err(conflict(
+                    format!("{path} is a directory where a settings file is needed"),
+                    "move the directory aside; the manager never replaces a directory",
+                ));
+            }
+            Node::Link { .. } | Node::Other { .. } => {
+                return Err(conflict(
+                    format!(
+                        "{path} is a link or special file; the manager merges only a regular file"
+                    ),
+                    "replace it with a regular file that holds a JSON object, or remove it",
+                ));
+            }
+            Node::File { own: false, .. } => {
+                return Err(privilege("target", path, "is owned by another user"));
+            }
+            Node::File { mode, .. } if mode & 0o077 != 0 => {
+                return Err(conflict(
+                    format!(
+                        "{path} is mode {mode:o}, open to group or others, and can hold credentials"
+                    ),
+                    "run chmod 600 on the file, then plan again; the manager does not change a mode it did not set",
+                ));
+            }
+            _ => {}
+        }
+        let fact = self.cx.merge.get(&r.id);
+        if let Some(f) = fact {
+            op.managed_sha256 = Some(f.managed_sha256.clone());
+            op.sets = f.sets.clone();
+        }
+        op.mode = Some(0o600);
+        let what = fact.map_or_else(String::new, |f| {
+            format!(
+                ": {} setting(s), {} handler(s); live content is not shown",
+                f.sets.len(),
+                f.handlers
+            )
+        });
+        let owned = self
+            .ledger_entry(path)
+            .is_some_and(|e| e.resource == r.id && e.coowned_entries.is_some());
+        let post = format!(
+            "{path} holds the declared managed values, seeds and handlers of {}",
+            r.adapter
+        );
+        let shown = format!("{path} (sensitive: destination and mode only)");
+        if let Some(MergeVerdict::Blocked {
+            code,
+            detail,
+            correction,
+        }) = fact.map(|f| &f.verdict)
+        {
+            return Err(fail(*code, "target", detail.clone(), correction.clone()));
+        }
+        if matches!(seen.node, Node::Missing {}) {
+            return Ok((
+                Action::CreateFile,
+                Status::Planned,
+                Ownership::Absent,
+                format!("create {shown} by merge, mode 600{what}"),
+                post,
+            ));
+        }
+        match fact.map(|f| &f.verdict) {
+            Some(MergeVerdict::Current) => Ok((
+                Action::None,
+                Status::Current,
+                Ownership::Owned,
+                format!("{shown} already holds the merge result{what}"),
+                post,
+            )),
+            Some(MergeVerdict::Write) => Ok((
+                Action::UpdateFile,
+                Status::Planned,
+                if owned {
+                    Ownership::Owned
+                } else {
+                    Ownership::Foreign
+                },
+                format!(
+                    "merge into {shown}: managed values set, seeds only if absent, owned handlers added; foreign keys and hooks stay{what}"
+                ),
+                post,
+            )),
+            // A blocked verdict returned above. No fact means the caller did not read the file.
+            Some(MergeVerdict::Blocked { .. }) | None => Err(conflict(
+                format!("{path} exists and its merge state was not read"),
+                "run plan again; if it repeats, report the path",
+            )),
+        }
     }
 
     /// A ledger output that nothing selects any more. It is removed only when the ledger proves
@@ -711,6 +862,7 @@ impl Planner<'_> {
             fragments: Vec::new(),
             fragment_dir: None,
             output_sha256: None,
+            managed_sha256: None,
             output_bytes: None,
             sets: Vec::new(),
             after: Vec::new(),
@@ -787,6 +939,18 @@ impl Planner<'_> {
                 ));
             }
             _ => {}
+        }
+        if let (Some(n), Node::File { .. }) = (o.coowned_entries, &seen.node) {
+            // A co-owned file is never deleted. Only the entries the manager added are retired.
+            op.action = Action::Retire;
+            op.status = Status::Planned;
+            op.ownership = Ownership::Owned;
+            op.mode = Some(0o600);
+            op.effect = format!(
+                "retire {n} owned handler(s) in {path} (sensitive: destination and mode only); the file, its managed and seeded values and all foreign entries stay"
+            );
+            op.postcondition = format!("{path} holds none of the owned handler entries");
+            return Ok(());
         }
         op.ownership = self.ownership(&o.resource, o.class == Class::Sensitive, path, &seen);
         let why = match op.ownership {

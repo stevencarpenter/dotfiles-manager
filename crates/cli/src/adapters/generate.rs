@@ -5,6 +5,7 @@ use super::{Adapter, registry};
 use dfm_engine::{Dir, Generator, GeneratorInputs, Got, Sys};
 use dfm_model::digest::sha256_hex;
 use dfm_model::fold;
+use dfm_model::merge::{Desired, Merged, merge, retire};
 use dfm_model::plan::{
     Action, Blocker, MAX_HASHED_BYTES, Node, Observations, Operation, Ownership, Plan, Status,
     matches_pattern,
@@ -71,6 +72,44 @@ impl<'a> Generators<'a> {
 }
 
 impl Generator for Generators<'_> {
+    fn merges(&self, op: &Operation) -> bool {
+        op.class == Class::Sensitive
+            && matches!(
+                op.action,
+                Action::CreateFile | Action::UpdateFile | Action::Retire
+            )
+            && self
+                .table
+                .iter()
+                .any(|a| a.spec.id == op.adapter && a.merges())
+    }
+
+    fn merge(&self, op: &Operation, inputs: &GeneratorInputs) -> Result<Merged, Refusal> {
+        if !self.merges(op) {
+            return Err(Refusal::new(
+                Code::GeneratorUnavailable,
+                format!("no merge adapter for {}", op.adapter),
+            ));
+        }
+        if op.action == Action::Retire {
+            // The resource is no longer selected, so there is no declared value. Only the
+            // entries the ledger records are removed.
+            let live = inputs.live.as_deref().ok_or_else(|| {
+                Refusal::new(Code::Conflict, "the file to retire entries from is gone")
+            })?;
+            let (bytes, changed) = retire(live, &inputs.owned_entries)?;
+            return Ok(Merged {
+                bytes,
+                live_view: Vec::new(),
+                rendered_view: Vec::new(),
+                entries: Vec::new(),
+                changed,
+            });
+        }
+        let desired = Desired::from_value(self.value(op)?)?;
+        merge(inputs.live.as_deref(), &desired, &inputs.owned_entries)
+    }
+
     fn supports(&self, op: &Operation) -> bool {
         op.class == Class::Normal
             && self.gen_of(op).is_some()

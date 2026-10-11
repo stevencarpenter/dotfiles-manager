@@ -413,39 +413,41 @@ fn ownership_comes_from_the_ledger_only() {
 }
 
 #[test]
-fn a_sensitive_destination_that_exists_fails_closed_and_leaks_nothing() {
+fn a_sensitive_destination_that_exists_is_merged_in_place_and_leaks_nothing() {
     let secret = "sk-PLANTED-0123456789";
     let content = format!("{{\"token\":\"{secret}\"}}");
     let digest = format!("{:x}", Sha256::digest(content.as_bytes()));
-    // Two ways to fail closed: no ledger entry, and a ledger entry that has no comparable
-    // fingerprint (docs/state.md: the salted hash is not built).
-    for (recorded, words) in [
-        (false, "no ledger entry"),
-        (true, "ownership cannot be verified"),
+    // The merge adapter owns this path (docs/adapters.md): an existing file is read, never
+    // printed, and merged in place. With no ledger entry the manager may write. A ledger entry
+    // of another resource blocks. A file open to group or others blocks with fix text.
+    for (mode, other_owner, code_want, words) in [
+        (0o600, false, 0, ""),
+        (0o644, false, 3, "chmod 600"),
+        (0o600, true, 3, "recorded in the ledger as an output of"),
     ] {
         let e = Env::personal();
         e.mkdirs(".claude");
         let out = e.h(".claude/settings.json");
-        if recorded {
+        if !other_owner {
+            fs::write(&out, &content).unwrap();
+        }
+        if other_owner {
             let o = e.run(&[
                 "__record-op",
                 "--resource",
-                "agents.claude-settings",
+                "gone.res",
                 "--output",
                 out.to_str().unwrap(),
                 "--content",
                 &content,
-                "--sensitive",
-                "yes",
             ]);
             assert_eq!(code(&o), 0, "{}", text(&o.stderr));
-        } else {
-            fs::write(&out, &content).unwrap();
         }
+        fs::set_permissions(&out, fs::Permissions::from_mode(mode)).unwrap();
         for o in [e.plan(&[]), e.plan(&["--json"])] {
-            assert_eq!(code(&o), 3);
+            assert_eq!(code(&o), code_want, "{}", text(&o.stderr));
             let all = format!("{}{}", text(&o.stdout), text(&o.stderr));
-            assert!(all.contains("E_CONFLICT") && all.contains(words), "{all}");
+            assert!(all.contains(words), "{all}");
             assert!(
                 !all.contains(secret) && !all.contains(&digest),
                 "secret leaked: {all}"
@@ -1125,6 +1127,7 @@ mod synthetic {
             ledger,
             reserved,
             unchecked: BTreeMap::new(),
+            merge: BTreeMap::new(),
         };
         build(resolved, &cx, obs).unwrap()
     }
@@ -1229,6 +1232,7 @@ mod synthetic {
             class: dfm_model::state::Class::Normal,
             path: ".ssh/config".into(),
             fingerprint: Some(dfm_model::plan::link_fingerprint(target)),
+            coowned_entries: None,
         }];
         let p = plan_with(&r, &obs, ledger, BTreeMap::new());
         let b = p
@@ -1939,6 +1943,7 @@ mod removal {
             ledger,
             reserved: BTreeMap::new(),
             unchecked: BTreeMap::new(),
+            merge: BTreeMap::new(),
         };
         build(&resolved, &cx, &obs).unwrap()
     }
@@ -1950,6 +1955,7 @@ mod removal {
             class,
             path: "old/link".into(),
             fingerprint: fp,
+            coowned_entries: None,
         }]
     }
 
@@ -2004,6 +2010,7 @@ mod removal {
                 class: Class::Normal,
                 path: ".ssh/config".into(),
                 fingerprint: Some(link_fingerprint("/x")),
+                coowned_entries: None,
             }],
             link("/src/x"),
         );
@@ -2216,6 +2223,7 @@ mod hardening {
             ledger,
             reserved: BTreeMap::new(),
             unchecked: BTreeMap::new(),
+            merge: BTreeMap::new(),
         };
         build(r, &cx, obs).unwrap()
     }
@@ -2266,6 +2274,7 @@ mod hardening {
             class: Class::Normal,
             path: "old/file".into(),
             fingerprint: Some("0".repeat(64)),
+            coowned_entries: None,
         }];
         let mut obs = all_missing(&r, &ledger);
         obs.seen.insert(
@@ -2431,6 +2440,7 @@ mod ledger_sensitivity {
             class: Class::Sensitive,
             path: path.into(),
             fingerprint: None,
+            coowned_entries: None,
         }
     }
 
@@ -2511,6 +2521,7 @@ mod ledger_sensitivity {
             root: "/r",
             ledger: vec![],
             reserved: Default::default(),
+            merge: Default::default(),
             unchecked: Default::default(),
         };
         let mut obs = Observations::default();

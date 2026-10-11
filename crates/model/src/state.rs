@@ -177,6 +177,31 @@ pub struct OwnedOutput {
     pub mode: u32,
     /// SHA-256 of the content the manager wrote. Absent for sensitive resources.
     pub fingerprint: Option<String>,
+    /// Present only for a co-owned sensitive file (`claude-settings/v1`, DFM-21). It holds the
+    /// one salted hash the ledger may keep and the entries the manager added to the file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub coowned: Option<CoOwned>,
+}
+
+/// What the manager records about a co-owned file (docs/architecture.md section 8 item 7).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CoOwned {
+    /// Per-machine salted hash of the managed fields as the manager last wrote them. It lives
+    /// in `ledger.json` only: never in a receipt, journal, snapshot, plan, table or `doctor`.
+    pub managed_hash: String,
+    /// The handler entries the manager added, so it retires only those.
+    pub entries: Vec<OwnedEntry>,
+}
+
+/// One list entry the manager added to a co-owned file. `sha256` is the hash of the entry the
+/// module declared (the manager's own content), never of live content.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OwnedEntry {
+    pub id: String,
+    pub event: String,
+    pub sha256: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -244,6 +269,21 @@ impl Ledger {
                     _ => {
                         return Err(bad(format!(
                             "ledger fingerprint for {} does not fit its class",
+                            o.path
+                        )));
+                    }
+                }
+                if let Some(c) = &o.coowned {
+                    let entries_ok = c.entries.iter().all(|e| {
+                        !e.id.is_empty()
+                            && !e.event.is_empty()
+                            && !e.id.chars().chain(e.event.chars()).any(char::is_control)
+                            && valid_sha256(&e.sha256)
+                    });
+                    if r.class != Class::Sensitive || !valid_sha256(&c.managed_hash) || !entries_ok
+                    {
+                        return Err(bad(format!(
+                            "ledger co-owned record for {} is malformed or not sensitive",
                             o.path
                         )));
                     }
@@ -1186,6 +1226,7 @@ mod tests {
                 path: path.into(),
                 mode: 0o600,
                 fingerprint: Some("a".repeat(64)),
+                coowned: None,
             }],
         };
         let mut l = Ledger::empty(stamp());
@@ -1224,6 +1265,7 @@ mod tests {
                 path: "/h/.secret".into(),
                 mode: 0o600,
                 fingerprint: Some("a".repeat(64)),
+                coowned: None,
             }],
         };
         assert!(l.record(e.clone()).is_err());

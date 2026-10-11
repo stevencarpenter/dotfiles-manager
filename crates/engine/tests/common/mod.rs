@@ -98,6 +98,7 @@ pub fn ledger_with(stamp: &Stamp, home: &Home, resource: &str, file: &str, fp: c
             path: home.0.join(file).to_str().unwrap().into(),
             mode: 0o600,
             fingerprint: Some(fp.to_string().repeat(64)),
+            coowned: None,
         }],
     })
     .unwrap();

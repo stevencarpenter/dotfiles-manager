@@ -145,6 +145,43 @@ pub(crate) fn ident_of(st: &Stat) -> Result<Ident, Refusal> {
     })
 }
 
+/// What identifies one state of a file without reading it: device, inode, size, and the change
+/// and modification times in nanoseconds. A write in place changes the times, a replacement
+/// changes the inode, and a user cannot restore the change time. It is a check-then-act guard
+/// for a co-owned file, not a content hash (docs/apply.md, "Merge").
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Stamp {
+    ident: Ident,
+    size: u64,
+    mtime_ns: i128,
+    ctime_ns: i128,
+}
+
+fn stamp_of(st: &Stat) -> Result<Stamp, Refusal> {
+    let ns = |s: i64, n: i64| i128::from(s) * 1_000_000_000 + i128::from(n);
+    Ok(Stamp {
+        ident: ident_of(st)?,
+        size: u64::try_from(st.st_size).unwrap_or(u64::MAX),
+        mtime_ns: ns(st.st_mtime, st.st_mtime_nsec),
+        ctime_ns: ns(st.st_ctime, st.st_ctime_nsec),
+    })
+}
+
+/// The live file of a co-owned destination, read for one merge ([`Dir::read_live`]).
+#[derive(Debug)]
+pub enum Live {
+    Missing,
+    /// Not a regular file, owned by another user, or hard-linked. The text says which.
+    Unusable(&'static str),
+    TooBig,
+    File {
+        bytes: Vec<u8>,
+        mode: u32,
+        /// The state the bytes were read from. Publication compares it again before the rename.
+        stamp: Stamp,
+    },
+}
+
 pub(crate) fn mode_bits(st: &Stat) -> u32 {
     u32::from(st.st_mode) & 0o777
 }
@@ -780,6 +817,74 @@ impl Dir {
             .read_to_end(&mut buf)
             .map_err(|e| io("read file", &e))?;
         Ok((u64::try_from(buf.len()).unwrap_or(u64::MAX) <= limit).then_some(buf))
+    }
+
+    /// Reads the live file `name` of a co-owned destination from one descriptor opened without
+    /// following a link, with its mode and a [`Stamp`] taken after the read. The stamp before and
+    /// after the read must agree, so a writer that overlaps the read is a conflict, not a torn
+    /// result. The file must be regular, owned by the current user, with one hard link.
+    pub fn read_live(&self, sys: &Sys, name: &str, limit: u64) -> Result<Live, Refusal> {
+        check_name(name)?;
+        let fd = match rfs::openat(
+            &self.fd,
+            name,
+            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+            Mode::empty(),
+        ) {
+            Ok(fd) => fd,
+            Err(Errno::NOENT) => return Ok(Live::Missing),
+            Err(Errno::LOOP) => return Ok(Live::Unusable("is a link")),
+            Err(Errno::NOTDIR) => return Ok(Live::Unusable("is not reachable as a file")),
+            Err(e) => return Err(sys_err(&format!("open {}", self.at(name).display()), e)),
+        };
+        let st = rfs::fstat(&fd).map_err(|e| sys_err("stat file", e))?;
+        if kind(&st) != FileType::RegularFile {
+            return Ok(Live::Unusable("is not a regular file"));
+        }
+        if st.st_uid != sys.uid {
+            return Ok(Live::Unusable("is owned by another user"));
+        }
+        if u64::from(st.st_nlink) != 1 {
+            return Ok(Live::Unusable("has more than one hard link"));
+        }
+        if u64::try_from(st.st_size).unwrap_or(u64::MAX) > limit {
+            return Ok(Live::TooBig);
+        }
+        let mut buf = Vec::new();
+        let mut f = File::from(fd);
+        (&mut f)
+            .take(limit.saturating_add(1))
+            .read_to_end(&mut buf)
+            .map_err(|e| io("read file", &e))?;
+        if u64::try_from(buf.len()).unwrap_or(u64::MAX) > limit {
+            return Ok(Live::TooBig);
+        }
+        let after = rfs::fstat(&f).map_err(|e| sys_err("stat file", e))?;
+        let (a, b) = (stamp_of(&st)?, stamp_of(&after)?);
+        if a != b {
+            return Err(Refusal::new(
+                Code::Conflict,
+                format!(
+                    "{} changed while it was read; another program is writing it. Fix: close the program or retry",
+                    self.at(name).display()
+                ),
+            ));
+        }
+        Ok(Live::File {
+            bytes: buf,
+            mode: mode_bits(&after),
+            stamp: b,
+        })
+    }
+
+    /// The [`Stamp`] of the entry `name` itself, without following a link. `None` when absent.
+    pub(crate) fn entry_stamp(&self, name: &str) -> Result<Option<Stamp>, Refusal> {
+        check_name(name)?;
+        match rfs::statat(&self.fd, name, AtFlags::SYMLINK_NOFOLLOW) {
+            Ok(st) => stamp_of(&st).map(Some),
+            Err(Errno::NOENT) => Ok(None),
+            Err(e) => Err(sys_err("stat entry", e)),
+        }
     }
 
     /// Reads an input of a generated file: the regular file `name`, opened without following a

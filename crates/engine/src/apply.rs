@@ -12,20 +12,21 @@
 //! update. The receipt is written by the caller after the last operation.
 
 use crate::fail::Fail;
-use crate::fsys::{Dir, Peek, Sys};
-use crate::generate::{Gather, Generator, gather};
+use crate::fsys::{Dir, Live, Peek, Sys};
+use crate::generate::{Gather, Generator, GeneratorInputs, gather};
 use crate::observe::observe;
 use crate::publish::Publish;
 use crate::store::{Probe, Store, now_unix};
 use dfm_model::digest::sha256_hex;
 use dfm_model::fold;
+use dfm_model::merge::salted;
 use dfm_model::plan::{
     Action, Operation, Owned, Plan, Request, Status as PlanStatus, ledger_state, link_fingerprint,
     node_state,
 };
 use dfm_model::state::{
-    Class, Fingerprint, JournalEntry, Ledger, LedgerResource, OperationRecord, OwnedOutput, Phase,
-    Recovery, RecoveryOutput, Status, rfc3339, unfinished, valid_id,
+    Class, CoOwned, Fingerprint, JournalEntry, Ledger, LedgerResource, OperationRecord,
+    OwnedOutput, Phase, Recovery, RecoveryOutput, Status, rfc3339, unfinished, valid_id,
 };
 use dfm_model::{Code, Refusal};
 use std::cell::Cell;
@@ -125,6 +126,7 @@ pub fn owned_outputs(ledger: &Ledger, home: &Path) -> Result<Vec<Owned>, Refusal
                 class: r.class,
                 path: rel.into(),
                 fingerprint: o.fingerprint.clone(),
+                coowned_entries: o.coowned.as_ref().map(|c| c.entries.len()),
             });
         }
     }
@@ -291,16 +293,33 @@ fn first_refusal(plan: &Plan, generator: &dyn Generator) -> Result<(), Refusal> 
             .as_deref()
             .ok_or_else(|| plan_invalid(format!("{} has no path", op.id)))?;
         components(path)?;
-        // A sensitive output has no comparable fingerprint and no conflict detection yet
-        // (docs/state.md), so apply writes, links and removes none of them.
-        if op.class == Class::Sensitive && op.action != Action::CreateDir {
+        // A sensitive output has no content hash. Apply admits one kind of sensitive operation,
+        // the co-owned merge, which has its own conflict detection (docs/apply.md, Merge). Any
+        // other sensitive operation refuses the whole plan.
+        let merge = op.class == Class::Sensitive && generator.merges(op);
+        if op.class == Class::Sensitive && op.action != Action::CreateDir && !merge {
             return Err(Refusal::new(
                 Code::SensitiveUnsupported,
                 format!(
-                    "{}: sensitive outputs are not published or removed yet (no conflict detection)",
+                    "{}: this sensitive output is not published or removed by this build (only the claude-settings/v1 merge is)",
                     op.id
                 ),
             ));
+        }
+        if merge {
+            if op.action != Action::Retire && op.managed_sha256.is_none() {
+                return Err(plan_invalid(format!(
+                    "{} is a merge but the plan records no managed fingerprint",
+                    op.id
+                )));
+            }
+            if op.action == Action::Retire && op.managed_sha256.is_some() {
+                return Err(plan_invalid(format!(
+                    "{} retires entries but carries a managed fingerprint",
+                    op.id
+                )));
+            }
+            continue;
         }
         match op.action {
             Action::CreateLink | Action::ReplaceLink | Action::Adopt => {
@@ -333,6 +352,12 @@ fn first_refusal(plan: &Plan, generator: &dyn Generator) -> Result<(), Refusal> 
                 }
             }
             Action::Remove | Action::CreateDir => {}
+            Action::Retire => {
+                return Err(plan_invalid(format!(
+                    "{} retires entries of an output that is not a co-owned merge",
+                    op.id
+                )));
+            }
             Action::None => {
                 return Err(plan_invalid(format!("{} is planned with no action", op.id)));
             }
@@ -482,6 +507,7 @@ fn step_name(op: &Operation) -> &'static str {
         Action::UpdateFile => "update-file",
         Action::Remove => "remove",
         Action::Adopt => "adopt",
+        Action::Retire => "retire",
         Action::None => "none",
     }
 }
@@ -661,9 +687,12 @@ impl Exec<'_, '_> {
     }
 
     fn try_op(&mut self, op: &Operation) -> Result<Ended, Ended> {
-        // The gates refuse a sensitive operation before the run starts. Nothing below hashes,
-        // fingerprints or journals the content of a sensitive path.
+        // The gates admit one sensitive kind, the co-owned merge, which has its own path. Nothing
+        // below hashes, fingerprints or journals the content of a sensitive path.
         if op.class == Class::Sensitive {
+            if self.run.generator.merges(op) {
+                return self.try_merge(op);
+            }
             debug_assert!(false, "a sensitive operation reached apply");
             return Err(failed(Refusal::new(
                 Code::SensitiveUnsupported,
@@ -717,7 +746,9 @@ impl Exec<'_, '_> {
                     "is no longer the entry the plan found; it is left alone",
                 ));
             }
-            (Action::None, _) => return Err(failed(plan_invalid("no action"))),
+            (Action::None | Action::Retire, _) => {
+                return Err(failed(plan_invalid("no action")));
+            }
         }
         // Content and fingerprints are decided before the intent is written, so a generator
         // failure leaves no interruption record.
@@ -804,6 +835,257 @@ impl Exec<'_, '_> {
         })
     }
 
+    /// A co-owned merge (`claude-settings/v1`, docs/apply.md "Merge"). The live file is read now,
+    /// under the writer lock, and the result is made from THAT content. Only a salted hash of the
+    /// managed fields is compared and recorded; no hash of the whole file exists anywhere.
+    /// Order: prerequisites, topology, re-read, merge, conflict check, salt, intent, publish
+    /// (identity guarded), read-back, outcome, ledger.
+    fn try_merge(&mut self, op: &Operation) -> Result<Ended, Ended> {
+        let rel = op
+            .path
+            .as_deref()
+            .ok_or_else(|| failed(plan_invalid("no path")))?;
+        let comps = components(rel).map_err(failed)?;
+        let abs = self.abs(rel).map_err(failed)?;
+        if self.path_unknown(&abs) {
+            return Err(blocked(
+                Code::OpInterrupted,
+                format!(
+                    "{rel}: an interrupted or unconfirmed operation left it in an unknown state"
+                ),
+            ));
+        }
+        self.prerequisites(op, rel)?;
+        let (name, parents) = comps
+            .split_last()
+            .ok_or_else(|| failed(plan_invalid("empty path")))?;
+        let parent = self
+            .run
+            .home
+            .open_below(&self.run.sys, parents)
+            .map_err(Ended::Blocked)?;
+        let retire = op.action == Action::Retire;
+        self.run.fail.hit("merge-before-read").map_err(failed)?;
+        let (live, stamp) = match (parent.read_live(&self.run.sys, name, MAX_FILE), op.action) {
+            (Err(e), _) => return Err(Ended::Blocked(e)),
+            (Ok(Live::Missing), Action::CreateFile) => (None, None),
+            (Ok(Live::Missing), _) => {
+                return Err(blocked(
+                    Code::Conflict,
+                    format!("{rel} is gone since the plan; it is not recreated by this operation"),
+                ));
+            }
+            (Ok(Live::File { .. }), Action::CreateFile) => {
+                return Err(blocked(
+                    Code::Conflict,
+                    format!("{rel} appeared before it could be created; it is left alone"),
+                ));
+            }
+            (Ok(Live::File { bytes, mode, stamp }), _) => {
+                if mode & 0o077 != 0 {
+                    return Err(blocked(
+                        Code::Conflict,
+                        format!(
+                            "{rel} is mode {mode:o}, open to group or others, and can hold credentials. Fix: run chmod 600 on it; nothing was changed"
+                        ),
+                    ));
+                }
+                (Some(bytes), Some(stamp))
+            }
+            (Ok(Live::Unusable(why)), _) => {
+                return Err(blocked(
+                    Code::Conflict,
+                    format!("{rel} {why}; it is left alone"),
+                ));
+            }
+            (Ok(Live::TooBig), _) => {
+                return Err(failed(Refusal::new(
+                    Code::LimitExceeded,
+                    format!("{rel} exceeds 16 MiB"),
+                )));
+            }
+        };
+        let ledger = self.run.store.read_ledger_lenient().map_err(failed)?;
+        let recorded: Option<&CoOwned> = ledger
+            .resources
+            .iter()
+            .filter(|r| r.resource == op.resource)
+            .flat_map(|r| &r.owned_outputs)
+            .find(|o| o.path == abs)
+            .and_then(|o| o.coowned.as_ref());
+        let inputs = GeneratorInputs {
+            live: live.clone(),
+            owned_entries: recorded.map(|c| c.entries.clone()).unwrap_or_default(),
+            ..GeneratorInputs::default()
+        };
+        let merged = match self.run.generator.merge(op, &inputs) {
+            Ok(m) => m,
+            Err(r) if matches!(r.code, Code::Conflict | Code::PlanStale) => {
+                return Err(Ended::Blocked(r));
+            }
+            Err(r) => return Err(failed(r)),
+        };
+        // Conflict detection: a managed field changed outside the manager. Both sides are
+        // salted hashes of the managed fields only. A live value already equal to the declared
+        // one needs no overwrite, so it is accepted.
+        let salt_now = self.run.store.salt().map_err(failed)?;
+        if !retire && let Some(c) = recorded {
+            let salt = salt_now.as_deref().ok_or_else(|| {
+                failed(Refusal::new(
+                    Code::StateInvalid,
+                    "state/salt is missing but the ledger records a salted hash; the foreign-edit check cannot run. Fix: restore state/salt from a copy",
+                ))
+            })?;
+            if salted(salt, &merged.live_view) != c.managed_hash
+                && merged.live_view != merged.rendered_view
+            {
+                return Err(blocked(
+                    Code::Conflict,
+                    format!(
+                        "a managed field of {rel} was changed outside the manager since the last apply; nothing was changed. Fix: restore the declared value in the file, or set the same value in the module so the manager adopts your edit"
+                    ),
+                ));
+            }
+        }
+        let new_hash = if retire {
+            None
+        } else {
+            let salt = match salt_now {
+                Some(s) => s,
+                None => self.run.store.salt_or_create().map_err(failed)?,
+            };
+            Some(salted(&salt, &merged.rendered_view))
+        };
+        let id = self.attempt_id(op);
+        let recovery = Recovery {
+            outputs: vec![RecoveryOutput {
+                path: abs.clone(),
+                existed_before: live.is_some(),
+                expected_sha256: None,
+            }],
+            snapshot: None,
+        };
+        self.journal(op, &id, Phase::Intent, Some(recovery), None)
+            .map_err(|e| Ended::Failed(e, Some(id.clone())))?;
+        let effect = self.merge_effect(rel, &parent, name, stamp, &merged.bytes, merged.changed);
+        if let Err(e) = effect {
+            let unconfirmed = e.code == Code::IoUnconfirmed;
+            let why: String = dfm_model::display::visible(&e.detail)
+                .chars()
+                .take(1024)
+                .collect();
+            let phase = if unconfirmed {
+                Phase::Unknown
+            } else {
+                Phase::Failed
+            };
+            let note = self.journal(op, &id, phase, None, Some(why.clone()));
+            let e = match note {
+                Ok(()) => e,
+                Err(n) => Refusal::new(
+                    e.code,
+                    format!("{why}; the outcome could not be journaled: {}", n.detail),
+                ),
+            };
+            return Err(self.after_intent(e, &id, &abs));
+        }
+        let settled = self
+            .journal(op, &id, Phase::Done, None, None)
+            .and_then(|()| self.run.fail.hit("apply-after-done"))
+            .and_then(|()| match &new_hash {
+                None => self.forget_output(op, &id, &abs),
+                Some(h) => self.record_coowned(op, &id, &abs, h, merged.entries.clone()),
+            });
+        if let Err(e) = settled {
+            return Err(self.after_intent(e, &id, &abs));
+        }
+        Ok(Ended::Updated {
+            id,
+            before: None,
+            after: None,
+            owned: if retire { Vec::new() } else { vec![abs] },
+            reload: merged.changed.then(|| RELOAD_NOT_ATTEMPTED.to_string()),
+        })
+    }
+
+    /// Publishes the merged bytes when they differ from the live file, then reads the result
+    /// back. The replace is guarded by the identity captured at the re-read, not by a hash of
+    /// the whole file. The read-back compares in memory and records nothing.
+    fn merge_effect(
+        &self,
+        rel: &str,
+        parent: &Dir,
+        name: &str,
+        stamp: Option<crate::fsys::Stamp>,
+        bytes: &[u8],
+        changed: bool,
+    ) -> Result<(), Refusal> {
+        let fail = self.run.fail;
+        fail.hit("apply-before-effect")?;
+        if changed {
+            let how = match stamp {
+                Some(s) => Publish::ReplaceStamp(s),
+                None => Publish::Create,
+            };
+            parent.publish_file(name, bytes, dfm_model::merge::MODE, how, MAX_FILE, fail)?;
+        }
+        fail.hit("apply-after-effect")?;
+        let bad = |what: &str| {
+            Refusal::new(
+                Code::IoFailed,
+                format!("postcondition failed for {rel}: {what}"),
+            )
+        };
+        let (h, _) = parent
+            .hash_file(name, MAX_FILE)?
+            .ok_or_else(|| bad("the file cannot be read back"))?;
+        if changed && h != sha256_hex(bytes) {
+            return Err(bad("the content read back differs"));
+        }
+        if changed && parent.entry_mode(name)? != Some(dfm_model::merge::MODE) {
+            return Err(bad("the mode differs"));
+        }
+        Ok(())
+    }
+
+    /// Records the co-owned file: no content fingerprint, only the salted managed hash and the
+    /// entries the manager added.
+    fn record_coowned(
+        &self,
+        op: &Operation,
+        id: &str,
+        abs: &str,
+        managed_hash: &str,
+        entries: Vec<dfm_model::state::OwnedEntry>,
+    ) -> Result<(), Refusal> {
+        let mut ledger = self.run.store.read_ledger_lenient()?;
+        let mut outs = ledger
+            .resources
+            .iter()
+            .find(|r| r.resource == op.resource)
+            .map(|r| r.owned_outputs.clone())
+            .unwrap_or_default();
+        outs.retain(|o| o.path != abs);
+        outs.push(OwnedOutput {
+            path: abs.into(),
+            mode: dfm_model::merge::MODE,
+            fingerprint: None,
+            coowned: Some(CoOwned {
+                managed_hash: managed_hash.into(),
+                entries,
+            }),
+        });
+        outs.sort_by(|a, b| a.path.cmp(&b.path));
+        ledger.record(LedgerResource {
+            resource: op.resource.clone(),
+            adapter: op.adapter.clone(),
+            class: Class::Sensitive,
+            op_id: id.into(),
+            owned_outputs: outs,
+        })?;
+        self.run.store.write_ledger(&ledger)
+    }
+
     /// The outcome entry, then ownership: the ledger changes only after `done`.
     fn settle_outcome(
         &self,
@@ -884,7 +1166,7 @@ impl Exec<'_, '_> {
             Action::Remove => removed = Some(self.remove(op, abs, parent, name, live)?),
             // Nothing is written. The read-back below is the last look at the leaf.
             Action::Adopt => {}
-            Action::None => return Err(plan_invalid("no action")),
+            Action::None | Action::Retire => return Err(plan_invalid("no action")),
         }
         fail.hit("apply-after-effect")?;
         let bad = |what: &str| {
@@ -998,6 +1280,7 @@ impl Exec<'_, '_> {
             path: abs.into(),
             mode,
             fingerprint: Some(fp.into()),
+            coowned: None,
         });
         outs.sort_by(|a, b| a.path.cmp(&b.path));
         ledger.record(LedgerResource {

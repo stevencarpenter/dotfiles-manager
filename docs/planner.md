@@ -42,6 +42,7 @@ Architecture section 9 lists the plan content. This is how each item is met.
 | resolved model digest | `model_digest`: SHA-256 over resources, values, claims. Values of secret-bearing resources are left out. |
 | source identities | `sources[{kind: "path", root, tree}]`: canonical root and tree digest of the loaded source set (section 9, "Path-source identity") |
 | observation fingerprints | `observations`: one `Seen` per observed path and one listing per fragment directory. Each operation also lists `preconditions`. |
+| managed fingerprint (DFM-21) | `managed_sha256` on a merge operation: SHA-256 of the canonical JSON of the declared managed values. |
 | ordered operations, prerequisites, privilege | `operations`, in dependency order, each with `after`, `preconditions`, `privilege` (always `user`) and `postcondition` |
 | redacted effects | `effect`. A sensitive output shows destination and mode only and has no content hash. |
 | ownership | `ownership` per operation, from the ledger |
@@ -49,6 +50,8 @@ Architecture section 9 lists the plan content. This is how each item is met.
 Operation ids are `<resource>@<path>`, `mkdir@<path>`, `<resource>@scope` and `remove@<resource>@<path>`.
 
 For apply (DFM-18) each operation also carries: `journal_id` (a valid journal id, derived from the model digest, the source trees and the operation id, not from the plan digest, which covers it), `link` (the absolute link target), and `mode` (the mode the resource declares). Apply must read these fields and never parse `effect` or `postcondition`, which are prose. Precondition strings come from `dfm_model::plan::node_state`, and a link's ledger fingerprint is `dfm_model::plan::link_fingerprint` (SHA-256 of `link\0` and the target text). Apply must re-observe with the same requests and use these two functions, so both sides build identical strings. Re-checking them immediately before each write is apply's duty (architecture section 8).
+
+**Retire (DFM-21).** A ledger output with a co-owned record (`coowned`) whose resource is no longer selected, at a path nobody claims, is planned as `retire` when the file exists as a regular file of the user. The effect text reads `retire N owned handler(s) in <path> (sensitive: destination and mode only); the file, its managed and seeded values and all foreign entries stay`. A file that is already gone is `current` with `action = remove`, as for any removal.
 
 **Removal.** A ledger output is a removal candidate when its resource is no longer selected and no selected resource claims its path. (A resource that is still selected keeps its outputs even if it claims nothing now.) It is planned as `remove` only when the live output matches the ledger fingerprint (`owned`). A changed, foreign, sensitive, directory, non-ASCII or other-user output is a blocker (`E_CONFLICT`, `E_TARGET_INVALID` or `E_PRIVILEGE_UNSUPPORTED`). An output that is already gone is `current` with `action = remove`, so apply can drop its stale ledger entry (docs/apply.md). An output whose parent directory is a link is `E_PARENT_UNSAFE` for that entry only, and every other operation stays plannable. A path claimed by a selected sensitive resource is never hashed, and its ledger fingerprint is never printed, whoever owns the entry. `apply` executes removals (docs/apply.md).
 
@@ -98,7 +101,7 @@ An unsupported saved-plan schema is `E_SCHEMA_UNSUPPORTED`. A missing state dire
 
 ## Known limits
 
-- **Merge output.** `merge` operations (`claude-settings/v1`) have no adapter (DFM-21). They are planned as `create_file` or `update_file` with no output hash. A `skills/v1` leaf is planned as a link to its source, which is an assumption about that adapter.
+- **Merge output.** A `claude-settings/v1` merge is planned as `create_file`, `update_file` or `none` (current), never with `output_sha256`. It carries `managed_sha256` instead, the digest of the declared managed values, which is not secret (docs/adapters.md). The planner is pure and never reads a sensitive file. `plan` reads it through the CLI (`merge_facts`) and passes a verdict per resource in `Context.merge`: `Write`, `Current` or `Blocked{code, detail, correction}`. A blocked verdict is a blocker with fix text and no live content. A resource deselected after a merge is planned as `retire`, not `remove`. A `skills/v1` leaf is planned as a link to its source, which is an assumption about that adapter.
 - **Generated files already current.** After the CLI computes `output_sha256`, an owned `update_file` whose live content and mode already equal it becomes `current` with action `none`. A rerun then plans nothing. An unowned file with the same content stays a conflict.
 - **Mode on out-of-scope resources.** A bad `mode` on an out-of-scope resource (for example a secret) still raises a blocker.
 - **Sensitive ledger entries.** A path the ledger records as sensitive is never hashed and its ledger text is never printed, whoever claims it now, and a fragment-directory name that matches it in another case is not hashed.
@@ -111,7 +114,7 @@ An unsupported saved-plan schema is `E_SCHEMA_UNSUPPORTED`. A missing state dire
 - **Mutual-feed assemblers** are rejected as `E_PLAN_CYCLE`.
 - **Non-ASCII names** are refused (above), not normalized.
 - **Source mode.** The source loader records no executable bit, so a mode-only edit of a source file does not change the tree digest.
-- **Sensitive conflicts.** The salted hash is not built (docs/state.md), so any existing sensitive destination blocks the plan, owned or not.
+- **Sensitive conflicts.** A sensitive destination of the merge adapter is compared by the salted hash of its managed fields (docs/state.md, docs/adapters.md). Any other existing sensitive destination still blocks the plan, owned or not. `plan` and `doctor` read a merge file and keep the result in memory only. A ledger entry of another resource on the path blocks before the read.
 - **Removal scope.** Removal is planned only for a resource that is no longer selected, at a path nobody claims. There is no mass-removal guard: deselecting everything plans the removal of every fingerprint-verified owned output. That is by design. The ledger is the only authority and a changed output is never removed.
 - **No source lock.** The source identity is the loaded tree under `--root`. Lock and origin checks belong to DFM-30.
 - **Races.** Observation and the resolver's source read are separate reads. A change between them shows up as a stale plan at the next comparison, not during the run. `apply` must observe again (section 6, step 4).

@@ -57,6 +57,10 @@ name = "doctor"
 required-features = ["test-isolation"]
 
 [[test]]
+name = "merge"
+required-features = ["test-isolation"]
+
+[[test]]
 name = "native_config"
 required-features = ["test-isolation"]
 

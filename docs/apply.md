@@ -1,6 +1,6 @@
-# Apply (DFM-18)
+# Apply (DFM-18, DFM-21)
 
-Task: DFM-18. This document records what the first `apply` does and where it resolves or differs from [docs/architecture.md](architecture.md) (the contract). The contract wins where this document is silent. The planner is in [docs/planner.md](planner.md) and the ledger in [docs/state.md](state.md).
+Task: DFM-18, and DFM-21 for the co-owned merge. This document records what the first `apply` does and where it resolves or differs from [docs/architecture.md](architecture.md) (the contract). The contract wins where this document is silent. The planner is in [docs/planner.md](planner.md) and the ledger in [docs/state.md](state.md).
 
 ## What exists
 
@@ -40,8 +40,8 @@ All of these exit 3 and change nothing:
 - The plan has a blocker (`E_CONFLICT`, `E_PARENT_UNSAFE`, `E_PRIVILEGE_UNSUPPORTED`, and the other planner codes).
 - The digest is stale or missing.
 - Each operation is checked for shape: its `after` entries come earlier in the order, its journal id is valid, a link target lies inside the source root, and its path has no empty, `.` or `..` component.
-- A planned file operation needs content. The generator must support it and the plan must carry its output hash (`output_sha256`). Otherwise the gate refuses with `E_GENERATOR_UNAVAILABLE` or `E_PLAN_INVALID`. This applies to the whole plan, so apply never publishes half of a profile. The release binary has generators for `git-config/v1` and `text-fragments/v1` (docs/adapters.md). `claude-settings/v1` has none (DFM-21) and is also sensitive, so a plan that contains it is refused with `E_SENSITIVE_UNSUPPORTED`.
-- Any planned operation on a sensitive output (create or replace a link or file, update, remove) is refused with its own code, `E_SENSITIVE_UNSUPPORTED`, because conflict detection for sensitive paths does not exist (docs/state.md).
+- A planned file operation needs content. The generator must support it and the plan must carry its output hash (`output_sha256`). Otherwise the gate refuses with `E_GENERATOR_UNAVAILABLE` or `E_PLAN_INVALID`. This applies to the whole plan, so apply never publishes half of a profile. The release binary has generators for `git-config/v1` and `text-fragments/v1` (docs/adapters.md). `claude-settings/v1` is a sensitive co-owned merge with its own path (see "Merge").
+- Any planned operation on a sensitive output is refused with its own code, `E_SENSITIVE_UNSUPPORTED`, unless the generator runs it as a merge (`Generator::merges`). Today that is exactly the `create_file`, `update_file` and `retire` operations of `claude-settings/v1`. A secret output, a sensitive link and a sensitive removal stay refused. The rule "a plan with any unsupported sensitive operation is refused whole" is unchanged: one refused operation refuses the plan. A merge operation must carry `managed_sha256` (`retire` must carry none), otherwise the plan is `E_PLAN_INVALID`.
 - A link target must lie in the root of the operation's own source: the plan source whose `<root>/<first input path>` is the target. A target outside every source root, or one that names another file than the operation's input, is `E_PLAN_INVALID`.
 - The journal must be able to take this run's entries. The check assumes 4096 bytes for the two entries of each journaled operation. If the journal would pass 8 MiB, apply refuses before any write with `E_LIMIT_EXCEEDED`. Journal rotation belongs to DFM-19.
 - Each planned `remove` operation needs its own `--allow-disruptive <operation-id>` (`E_DISRUPTIVE_UNAPPROVED`). The allow set must equal the set of planned removals, so the plan determines it. The refusal lists every missing id as a pasteable flag, with no cap. Architecture section 10 item 8 lists deletion of an owned file as disruptive.
@@ -49,7 +49,7 @@ All of these exit 3 and change nothing:
 
 ## Generator
 
-`Generator` is a trait in `dfm_engine::generate`. The adapters implement it in the CLI crate (`crates/cli/src/adapters/generate.rs`). `generate(&Operation, &GeneratorInputs) -> Result<Vec<u8>, Refusal>` never opens a file. Apply collects the inputs first:
+`Generator` is a trait in `dfm_engine::generate`. The adapters implement it in the CLI crate (`crates/cli/src/adapters/generate.rs`). `generate(&Operation, &GeneratorInputs) -> Result<Vec<u8>, Refusal>` never opens a file. Apply collects the inputs first. (A merge does not use this path: see "Merge".)
 
 1. **Sources.** Each `Operation.inputs` path is read below the plan's source root. Every parent and the file are opened with `O_NOFOLLOW`, the file must be regular, owned by the current user, with one hard link, and at most 16 MiB (`MAX_HASHED_BYTES`). The hash must equal the operation's `source:` precondition. A plan with generated files must have exactly one source.
 2. **Fragment directory.** For an `assemble` operation, apply opens `Operation.fragment_dir` from HOME one component at a time without following a link, lists it (names only) and reads each fragment the plan lists through that descriptor.
@@ -92,6 +92,7 @@ The receipt is written once, after the last operation (architecture section 9 it
 | `update_file` | staged file, then `renameat` | The live content hash must equal the ledger fingerprint, read just before the rename. |
 | `remove` | `unlinkat` without `AT_REMOVEDIR` | See Delete safety. |
 | `adopt` | none | No effect on HOME. See Adoption. |
+| merge `create_file`, `update_file`, `retire` | staged file (`O_EXCL`, 0600, `fsync`), then `linkat` (create) or `renameat` guarded by file identity | See Merge. |
 
 Staged files are named `.<name>.<pid>.<n>.<nanos>.tmp` and staged links `.<name>.<pid>.<n>.<nanos>.stage`. A link is given mode 0755 after it is made, because macOS applies the umask to a link and a link made under a restrictive umask cannot be read by its owner. A failure before the commit point removes the staged name and leaves the previous state. A failure after it is `E_IO_UNCONFIRMED` (below).
 
@@ -132,6 +133,27 @@ A link's ledger fingerprint is the SHA-256 of `link\0` and the target text (`lin
 When an exact link is `current` and is deliberately not adopted (the ledger has an entry for the path, the link resolves to something other than a file, or the resource is sensitive), the plan text says `already holds; not adopted: <reason>`, so `current` does not read as owned.
 
 The window between the last read and the ledger write stays open. A process of the same user that swaps the leaf in it is recorded as the owner of a link it did not write. The ledger fingerprint then no longer matches the live link, so a later removal is refused. This is the same check-then-act limit as for `replace_link`.
+
+## Merge
+
+A sensitive co-owned file (`claude-settings/v1`, docs/adapters.md) runs through `try_merge`, not the normal path. There is no output hash, no `path:` content hash and no ledger fingerprint. For one operation, in this order:
+
+1. **Prerequisites** as for any operation. The `path:` precondition of a sensitive file holds its mode and no hash or size.
+2. **Topology**: the parent chain is opened without following a link.
+3. **Re-read under the lock** (`Dir::read_live`): one descriptor opened without following a link. The file must be regular, owned by the user, with one hard link, at most 16 MiB, and the stamp before and after the read must agree (device, inode, size, modification time, change time). A mode open to group or others is `E_CONFLICT` (blocked, exit 3). The failpoint `merge-before-read` sits before this read.
+4. **Merge** (`Generator::merge`) with `GeneratorInputs.live` (the bytes just read, or `None`) and `owned_entries` (from the ledger). A malformed or foreign-shaped file is `E_CONFLICT` and blocks. The result is made from the bytes just read, not from the plan-time file.
+5. **Conflict check**: the salted hash of the live managed fields against the ledger (docs/adapters.md, "Conflict detection"). A foreign edit is `E_CONFLICT`, blocked, nothing written. `retire` skips this check: it touches no managed field.
+6. **Salt**: `state/salt` is created now if it does not exist (docs/state.md).
+7. **Intent**: the journal gets an `intent` entry with `existed_before` and no expected hash.
+8. **Effect**: if the bytes differ from the live file, publish them. A new file uses `linkat`, which never replaces. An existing file uses `renameat` after a last identity check (`Publish::ReplaceStamp`). If the bytes are equal nothing is written, and the ledger is still updated. The failpoints are `apply-before-effect`, `file-after-tmp` and `apply-after-effect`.
+9. **Read-back**: the file is read and compared with the bytes in memory, and the mode must be 0600. Nothing of this is recorded.
+10. **Outcome and ledger**: the journal gets `done`. The ledger records the output with no fingerprint, the salted hash of the managed fields as written, and the owned handler entries. A `retire` drops the output from the ledger.
+
+The receipt operation has class `sensitive`, no `before` and no `after`, the output path as owned (not for `retire`), and `reload = not_attempted` when a file was published. The report prints the same line as for any operation.
+
+`retire` needs no `--allow-disruptive`. It deletes no file. The rule for deletion (Delete safety) is unchanged and a sensitive removal is still refused.
+
+A stale ledger entry of a co-owned file whose file is gone is a removal candidate that is already gone. Apply drops the entry like any other (`prune`).
 
 ## Journal ids
 
@@ -191,7 +213,9 @@ Publishing a file does not reload the program that reads it (architecture sectio
 | Directories | Never recorded as owned, never removed. |
 | Receipt `sources` | A path source as `{id, tree}` with no commit. The plan digest covers the same tree digest. |
 | Receipt `approval.kind` | `yes_plan`. |
-| New codes | `E_APPROVAL_REQUIRED` (3), `E_GENERATOR_UNAVAILABLE` (3), `E_SENSITIVE_UNSUPPORTED` (3), `E_DISRUPTIVE_UNAPPROVED` (3), `E_ADOPT_UNAPPROVED` (3, DFM-45). |
+| New codes | `E_APPROVAL_REQUIRED` (3), `E_GENERATOR_UNAVAILABLE` (3), `E_SENSITIVE_UNSUPPORTED` (3), `E_DISRUPTIVE_UNAPPROVED` (3), `E_ADOPT_UNAPPROVED` (3, DFM-45). DFM-21 adds none. |
+| Adoption and merge order | Adoption (`adopt`) and merge never apply to one path: adoption is for a normal-class link, and a merge output is sensitive. The planner never emits `adopt` for a sensitive resource. Operations still run in the planner's order. |
+| Sensitive operation and `--allow-*` | A merge needs only `--yes-plan`. It is neither a removal nor an adoption. |
 | Stale ledger entry of a removal candidate that is already gone | Dropped (journaled). The planner now gives that case `action = remove` with status `current`. |
 | One ledger entry behind a link that leaves HOME (stow style) | Blocks only the operations on that entry. A removal candidate gets `E_PARENT_UNSAFE`. A claim gets `E_TARGET_RESERVED` (the store's check). The plan has a blocker, so apply refuses it (exit 3), but plan and apply no longer fail with `E_STATE_INVALID` for the whole machine, and other operations stay plannable. |
 | New receipt field | `operations[].reload`, optional, from a fixed list. The contract's receipt shape does not have it. Nothing released wrote receipts before, so no schema bump is made. |
@@ -207,7 +231,9 @@ Publishing a file does not reload the program that reads it (architecture sectio
 ## Known limits
 
 - **Clock.** The run reads the clock at its start. If the clock fails then, the run does not start. If it fails later, the last good reading is reused. No 1970 stamp is written.
-- **Merge is not built.** `merge` (`claude-settings/v1`) has no generator (DFM-21) and its output is sensitive. A plan that contains it is refused as a whole, so the unmodified example personal profile cannot be applied. With the `claude-settings` resource left out it applies (docs/adapters.md).
+- **Merge check-then-act.** Between the identity check and `renameat` a write by another process is not detected and is replaced by a merge of the older content. A manager lock does not lock the application (docs/adapters.md, "Check-then-act limit"). The identity check does catch a file replaced or rewritten between the re-read and the check, with a test for each.
+- **Merge crash recovery.** A crash after the rename and before the outcome entry leaves an `intent` for a sensitive file. `reconcile` has no expected hash for it, so the answer is `unknown`, which blocks that path for one run. The next run plans from the live file and merges again. The ledger may then lack the salted hash for a file the manager did write: the next merge treats the file as one with no ledger entry and takes over the managed fields.
+- **Salted hash on a restored state.** If `state/salt` is lost while the ledger holds a salted hash, the foreign-edit check cannot run and the plan is blocked (`E_STATE_INVALID`) until the file is restored.
 - **Replace and remove check, then act.** `replace_link`, `update_file` and `remove` verify the leaf and then call `renameat` or `unlinkat`. These are two system calls. A process of the same user that swaps the leaf between them wins. Create operations have no such window (`EEXIST`). A swap of a parent directory cannot redirect any step, because every step uses the opened descriptor. A parent swapped after it was opened is not detected for the operations that already hold it. The effect lands in the directory that was verified, and the next operation sees the changed topology and is blocked.
 - **Source content during the run.** The `source:` preconditions are checked when the plan is made and again under the lock. A link does not read its source. A generated file reads its sources again immediately before it is generated and compares them (see Generator). A source read after that point is not compared again.
 - **Crash between the effect and the ledger.** The output exists, the journal says `done` (or `intent` only), and the ledger has no entry. The next plan sees an exact link as an `adopt` operation, and `--allow-adopt` records it (DFM-45). Until then the output stays and is not owned, so it is never removed. This is the safe direction. Recovering ownership from the journal alone is not built, and a regular file with the right content is not recovered at all.

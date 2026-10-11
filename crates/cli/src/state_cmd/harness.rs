@@ -162,6 +162,7 @@ pub fn record_op(ctx: &Ctx, args: &[String], out: &mut dyn Write) -> Result<(), 
                 path: output.clone(),
                 mode: 0o600,
                 fingerprint: (class == Class::Normal).then(|| digest.clone()),
+                coowned: None,
             }],
         })?;
         store.write_ledger(&ledger)?;

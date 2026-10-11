@@ -30,6 +30,9 @@ pub fn now_unix() -> Result<u64, Refusal> {
 const STATE: &str = "state";
 const STAGING: &str = "state.next";
 const SUBDIRS: [&str; 3] = ["receipts", "snapshots", "trials"];
+/// The per-machine salt for the salted hash of a co-owned file's managed fields.
+const SALT: &str = "salt";
+const SALT_BYTES: usize = 32;
 
 /// What a probe learned about an interrupted operation (its `already_done` check).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -438,6 +441,47 @@ impl Store {
         let l = self.ledger_parsed()?;
         self.check_owner(&l.binding)?;
         Ok(l)
+    }
+
+    /// The per-machine salt for conflict detection on co-owned files (docs/architecture.md
+    /// section 8 item 7), or `None` when `state/salt` does not exist yet. It must be exactly 32
+    /// bytes in a private regular file. The salt never leaves `state` and is never printed.
+    pub fn salt(&self) -> Result<Option<Vec<u8>>, Refusal> {
+        match self
+            .state()?
+            .read_private(&self.sys, SALT, SALT_BYTES + 1)?
+        {
+            None => Ok(None),
+            Some(b) if b.len() == SALT_BYTES => Ok(Some(b)),
+            Some(_) => Err(Refusal::new(
+                Code::StateInvalid,
+                "state/salt is not 32 bytes; it is not replaced. Fix: restore the file from a copy. If none exists, move it aside and run apply again; every co-owned file is then merged without a foreign-edit check once",
+            )),
+        }
+    }
+
+    /// As [`Store::salt`], and creates it once when absent: 32 random bytes from the operating
+    /// system, mode 0600, published with `linkat` so a racing writer cannot replace it. Needs the
+    /// writer lock.
+    pub fn salt_or_create(&self) -> Result<Vec<u8>, Refusal> {
+        if let Some(s) = self.salt()? {
+            return Ok(s);
+        }
+        self.wrote(self.create_salt())?;
+        self.salt()?
+            .ok_or_else(|| storage("state/salt vanished after it was created"))
+    }
+
+    fn create_salt(&self) -> Result<(), Refusal> {
+        use std::io::Read;
+        let dir = self.state()?;
+        self.guard(None)?;
+        let mut buf = [0u8; SALT_BYTES];
+        fs::File::open("/dev/urandom")
+            .and_then(|mut f| f.read_exact(&mut buf))
+            .map_err(|e| crate::fsys::io("read /dev/urandom", &e))?;
+        dir.publish_new(SALT, &buf, &self.fail, "salt")?;
+        Ok(())
     }
 
     /// The size of `journal.jsonl` in bytes, as stored.
@@ -934,7 +978,7 @@ impl Store {
         }
         if let Ok(state) = self.state() {
             for n in Self::list_dir(state, STATE, &mut problems) {
-                let known = ["state.json", "ledger.json", "journal.jsonl"];
+                let known = ["state.json", "ledger.json", "journal.jsonl", SALT];
                 if !known.contains(&n.as_str()) && !SUBDIRS.contains(&n.as_str()) {
                     strays.push(format!("{n} (unexpected)"));
                 }
