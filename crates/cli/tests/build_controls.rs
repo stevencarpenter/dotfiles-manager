@@ -255,3 +255,35 @@ fn unreadable_directory_in_the_staged_tree_is_refused_by_both_checkers() {
         s.stderr
     );
 }
+
+fn shell_digest(home: &Path, dir: &Path) -> Output {
+    Command::new("/bin/sh")
+        .arg(repo_root().join("scripts/bootstrap.sh"))
+        .args(["toolchain-digest", "--dir", dir.to_str().unwrap()])
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("HOME", home)
+        .env("DFM_BOOTSTRAP_TEST", "1")
+        .env("DFM_TEST_HOME", home)
+        .output()
+        .unwrap()
+}
+
+#[test]
+fn a_toolchain_tree_without_a_regular_file_is_refused_by_both_digests() {
+    let tmp = TempDir::new("no-file");
+    let home = tmp.path().join("home");
+    fs::create_dir_all(&home).unwrap();
+    let empty = tmp.path().join("empty");
+    fs::create_dir_all(empty.join("bin")).unwrap();
+    let links_only = tmp.path().join("links");
+    fs::create_dir_all(links_only.join("bin")).unwrap();
+    std::os::unix::fs::symlink("../elsewhere", links_only.join("bin/a")).unwrap();
+    for tree in [&empty, &links_only] {
+        let rust = dfm_cli::toolchain_tree_digest(tree);
+        assert!(rust.is_err(), "{}: Rust digest {rust:?}", tree.display());
+        let sh = shell_digest(&home, tree);
+        assert_eq!(sh.status.code(), Some(3), "{}", tree.display());
+        assert!(sh.stdout.is_empty());
+    }
+}
