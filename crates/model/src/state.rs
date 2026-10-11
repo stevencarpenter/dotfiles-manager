@@ -375,14 +375,14 @@ pub struct SourceId {
     pub tree: String,
 }
 
-/// One approved disruptive operation (architecture section 5, `approvals[]`).
+/// One approved disruptive operation or adoption (architecture section 5, `approvals[]`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DisruptiveApproval {
     /// The `id` of the receipt operation that ran with this approval.
     pub operation_id: String,
-    /// `allow_disruptive`. The contract also names `interactive`, which needs a prompt that
-    /// does not exist yet.
+    /// `allow_disruptive` or `allow_adopt` (DFM-45). The contract also names `interactive`,
+    /// which needs a prompt that does not exist yet.
     pub how: String,
     pub at: String,
 }
@@ -410,7 +410,7 @@ pub struct Receipt {
     pub plan_digest: Option<String>,
     pub approval: Option<Approval>,
     pub sources: Vec<SourceId>,
-    /// One entry per disruptive operation that ran with an approval.
+    /// One entry per disruptive operation or adoption that ran with an approval.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub approvals: Vec<DisruptiveApproval>,
     pub operations: Vec<OperationRecord>,
@@ -517,8 +517,27 @@ impl Receipt {
             }
         }
         for a in &self.approvals {
-            let known = self.operations.iter().any(|o| o.id == a.operation_id);
-            if a.how != "allow_disruptive" || !known || parse_rfc3339(&a.at).is_none() {
+            let op = self.operations.iter().find(|o| o.id == a.operation_id);
+            // The receipt keeps no action, so the approval must fit the shape of its operation.
+            // A removal publishes and owns nothing. An adoption that ran owns its link and has
+            // no `before` and no `reload`. A failed or blocked operation has neither shape, so
+            // only its `how` is checked.
+            let fits = op.is_some_and(|o| match a.how.as_str() {
+                // A removal that ran records the fingerprint it removed as `before`.
+                "allow_disruptive" => {
+                    o.owned_outputs.is_empty()
+                        && o.after.is_none()
+                        && (o.status != Status::Updated || o.before.is_some())
+                }
+                "allow_adopt" => {
+                    o.reload.is_none()
+                        && o.before.is_none()
+                        && (o.status != Status::Updated
+                            || (o.after.is_some() && !o.owned_outputs.is_empty()))
+                }
+                _ => false,
+            });
+            if !fits || parse_rfc3339(&a.at).is_none() {
                 return Err(bad("receipt approvals[] entry is malformed"));
             }
         }
@@ -1426,6 +1445,11 @@ mod tests {
             commit: None,
             tree: format!("sha256:{}", "b".repeat(64)),
         }];
+        // A removal: it owns and publishes nothing, and `before` is the fingerprint it removed.
+        r.operations[0].owned_outputs.clear();
+        r.operations[0].before = Some(Fingerprint {
+            fingerprint: "a".repeat(64),
+        });
         r.approvals = vec![DisruptiveApproval {
             operation_id: "op1".into(),
             how: "allow_disruptive".into(),
@@ -1434,6 +1458,47 @@ mod tests {
         r.validate().unwrap();
         let again = Receipt::parse(&canonical(&r).unwrap()).unwrap();
         assert_eq!(again, r);
+    }
+
+    #[test]
+    fn an_approval_must_fit_the_operation_it_names() {
+        let adopted = || {
+            let mut r = receipt(vec![op(Status::Updated, Class::Normal)]);
+            r.operations[0].after = Some(Fingerprint {
+                fingerprint: "a".repeat(64),
+            });
+            r.approvals = vec![DisruptiveApproval {
+                operation_id: "op1".into(),
+                how: "allow_adopt".into(),
+                at: "2026-10-10T00:00:00Z".into(),
+            }];
+            r
+        };
+        adopted().validate().unwrap();
+        // The same operation cannot carry the disruptive approval: it owns an output.
+        let mut r = adopted();
+        r.approvals[0].how = "allow_disruptive".into();
+        assert!(r.validate().is_err());
+        // A removal (nothing owned, a `before`) cannot carry an adoption approval.
+        let mut r = adopted();
+        r.operations[0].owned_outputs.clear();
+        r.operations[0].after = None;
+        r.operations[0].before = Some(Fingerprint {
+            fingerprint: "a".repeat(64),
+        });
+        assert!(r.validate().is_err());
+        r.approvals[0].how = "allow_disruptive".into();
+        r.validate().unwrap();
+        // An updated operation with no `before` (a directory made, say) is not a removal.
+        let mut r = adopted();
+        r.operations[0].owned_outputs.clear();
+        r.operations[0].after = None;
+        r.approvals[0].how = "allow_disruptive".into();
+        assert!(r.validate().is_err());
+        // A published link (it has a reload state) is not an adoption.
+        let mut r = adopted();
+        r.operations[0].reload = Some("not_attempted".into());
+        assert!(r.validate().is_err());
     }
 
     #[test]

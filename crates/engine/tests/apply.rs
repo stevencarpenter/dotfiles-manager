@@ -20,6 +20,8 @@ use std::fs;
 use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::Path;
 
+static NO_ADOPT: BTreeSet<String> = BTreeSet::new();
+
 struct Gen(BTreeMap<String, Vec<u8>>);
 
 impl Generator for Gen {
@@ -153,6 +155,7 @@ fn run<'a>(
         home_path: &s.h.0,
         generator: g,
         allow,
+        allow_adopt: &NO_ADOPT,
         fail,
     }
 }
@@ -1131,4 +1134,179 @@ fn a_stale_entry_whose_ledger_write_is_unconfirmed_is_unknown() {
     let rep = go(&s, &p, &NoGenerator, &none());
     assert_eq!(rep.operations[0].status, Status::Unknown);
     assert_eq!(rep.stopped.as_ref().unwrap().code, Code::IoUnconfirmed);
+}
+
+// ---- adoption (DFM-45) ------------------------------------------------------------------
+
+fn adopt_op(s: &Setup) -> Operation {
+    symlink("/src/x", s.h.0.join("l")).unwrap();
+    let mut o = op(&s.h, &s.store, "x@l", 1, Action::Adopt, "l");
+    o.link = Some("/src/x".into());
+    o
+}
+
+fn go_adopt(
+    s: &Setup,
+    p: &Plan,
+    allow_adopt: &BTreeSet<String>,
+    fail: &Fail,
+) -> dfm_engine::Report {
+    let home = Dir::open_home(&sys(&s.h), &s.h.0).unwrap();
+    let no = none();
+    let mut r = run(s, &NoGenerator, &no, fail, &home);
+    r.allow_adopt = allow_adopt;
+    apply(&r, p).unwrap()
+}
+
+fn ids(v: &[&str]) -> BTreeSet<String> {
+    v.iter().map(|s| (*s).to_string()).collect()
+}
+
+#[test]
+fn an_adoption_records_the_link_and_writes_nothing_to_home() {
+    let s = setup();
+    let p = plan(vec![adopt_op(&s)]);
+    let before = fs::symlink_metadata(s.h.0.join("l"))
+        .unwrap()
+        .modified()
+        .unwrap();
+    let r = go_adopt(&s, &p, &ids(&["x@l"]), &Fail::none());
+    assert_eq!(r.operations[0].status, Status::Updated, "{:?}", r.stopped);
+    let rec = &r.operations[0];
+    assert!(rec.before.is_none());
+    assert_eq!(
+        rec.after.as_ref().map(|f| f.fingerprint.as_str()),
+        Some(link_fingerprint("/src/x").as_str())
+    );
+    assert_eq!(rec.reload, None, "nothing was published");
+    assert_eq!(rec.owned_outputs, [s.h.0.join("l").to_str().unwrap()]);
+    // The link is untouched.
+    assert_eq!(fs::read_link(s.h.0.join("l")).unwrap(), Path::new("/src/x"));
+    assert_eq!(
+        fs::symlink_metadata(s.h.0.join("l"))
+            .unwrap()
+            .modified()
+            .unwrap(),
+        before
+    );
+    let l = s.store.read_ledger().unwrap();
+    let out = &l.resources[0].owned_outputs[0];
+    assert_eq!(
+        out.fingerprint.as_deref(),
+        Some(link_fingerprint("/src/x").as_str())
+    );
+    assert_eq!(out.mode, 0o777);
+    let j = s.store.read_journal().unwrap();
+    assert_eq!(
+        j.iter()
+            .map(|e| (e.op.as_str(), e.phase))
+            .collect::<Vec<_>>(),
+        [("adopt", Phase::Intent), ("adopt", Phase::Done)]
+    );
+    let out = &j[0].recovery.as_ref().unwrap().outputs[0];
+    assert!(out.existed_before);
+    // Owned now: the same link is no longer an adoption but a plain current output.
+    assert!(
+        s.store
+            .authorizes_delete(
+                "core.x",
+                s.h.0.join("l").to_str().unwrap(),
+                &link_fingerprint("/src/x")
+            )
+            .unwrap()
+    );
+}
+
+#[test]
+fn an_adoption_needs_its_own_allowance_and_an_unknown_id_is_a_usage_error() {
+    let s = setup();
+    let p = plan(vec![adopt_op(&s)]);
+    let home = Dir::open_home(&sys(&s.h), &s.h.0).unwrap();
+    let fail = Fail::none();
+    let no = none();
+    let r = run(&s, &NoGenerator, &no, &fail, &home);
+    let e = apply(&r, &p).unwrap_err();
+    assert_eq!(e.code, Code::AdoptUnapproved);
+    assert!(e.detail.contains("--allow-adopt 'x@l'"), "{}", e.detail);
+    assert!(s.store.read_journal().unwrap().is_empty());
+    assert!(s.store.read_ledger().unwrap().resources.is_empty());
+    // An allow-disruptive id does not approve an adoption: it names no removal.
+    let allow = ids(&["x@l"]);
+    let r = run(&s, &NoGenerator, &allow, &fail, &home);
+    assert_eq!(apply(&r, &p).unwrap_err().code, Code::Usage);
+    // An id that names no adoption is usage.
+    let mut r = run(&s, &NoGenerator, &no, &fail, &home);
+    let bad = ids(&["x@l", "other"]);
+    r.allow_adopt = &bad;
+    assert_eq!(apply(&r, &p).unwrap_err().code, Code::Usage);
+}
+
+#[test]
+fn an_adoption_blocks_when_the_leaf_changed_since_the_plan() {
+    let s = setup();
+    let p = plan(vec![adopt_op(&s)]);
+    fs::remove_file(s.h.0.join("l")).unwrap();
+    symlink("/src/y", s.h.0.join("l")).unwrap();
+    let r = go_adopt(&s, &p, &ids(&["x@l"]), &Fail::none());
+    assert_eq!(r.operations[0].status, Status::Blocked);
+    assert_eq!(r.stopped.as_ref().unwrap().code, Code::PlanStale);
+    assert!(s.store.read_ledger().unwrap().resources.is_empty());
+    assert!(s.store.read_journal().unwrap().is_empty());
+}
+
+#[test]
+fn an_adoption_whose_leaf_is_swapped_after_the_checks_writes_no_ledger_entry() {
+    for point in ["apply-before-effect", "apply-after-effect"] {
+        let s = setup();
+        let p = plan(vec![adopt_op(&s)]);
+        let gate =
+            s.h.0
+                .parent()
+                .unwrap()
+                .join(format!("adopt-gate-{}-{point}", std::process::id()));
+        let _ = fs::remove_file(&gate);
+        let reached = gate.with_extension("reached");
+        let _ = fs::remove_file(&reached);
+        let fail = Fail::at(point, Inject::Wait(gate.clone()));
+        let leaf = s.h.0.join("l");
+        let t = std::thread::spawn({
+            let (gate, reached) = (gate.clone(), reached.clone());
+            move || {
+                let end = std::time::Instant::now() + std::time::Duration::from_secs(20);
+                while !reached.exists() && std::time::Instant::now() < end {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                fs::remove_file(&leaf).unwrap();
+                symlink("/src/y", &leaf).unwrap();
+                fs::write(&gate, "").unwrap();
+            }
+        });
+        let r = go_adopt(&s, &p, &ids(&["x@l"]), &fail);
+        t.join().unwrap();
+        assert_eq!(r.operations[0].status, Status::Failed, "{point}");
+        assert_eq!(r.stopped.as_ref().unwrap().code, Code::Conflict, "{point}");
+        assert!(
+            s.store.read_ledger().unwrap().resources.is_empty(),
+            "{point}"
+        );
+        let j = s.store.read_journal().unwrap();
+        assert_eq!(
+            j.iter().map(|e| e.phase).collect::<Vec<_>>(),
+            [Phase::Intent, Phase::Failed],
+            "{point}"
+        );
+        assert_eq!(fs::read_link(s.h.0.join("l")).unwrap(), Path::new("/src/y"));
+        let _ = fs::remove_file(&reached);
+        let _ = fs::remove_file(&gate);
+    }
+}
+
+#[test]
+fn an_adoption_target_outside_the_source_root_is_refused() {
+    let s = setup();
+    symlink("/elsewhere/x", s.h.0.join("l")).unwrap();
+    let mut o = op(&s.h, &s.store, "x@l", 1, Action::Adopt, "l");
+    o.link = Some("/elsewhere/x".into());
+    let e = refused(&s, &plan(vec![o]), &NoGenerator, &none());
+    assert_eq!(e.code, Code::PlanInvalid);
 }

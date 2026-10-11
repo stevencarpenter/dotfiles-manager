@@ -81,7 +81,7 @@ An output row joins three facts: the ledger entry (who owns it), the live entry 
 | Owned, a parent is a link or not a directory | ERROR `E_PARENT_UNSAFE` (found from the ledger when no plan exists) |
 | Owned, live entry cannot be read | UNKNOWN `E_OBSERVATION_UNKNOWN` |
 | Claimed by the plan, not owned, plan would create it | WARN `D_PLAN_PENDING` |
-| Claimed, not owned, already the wanted result | WARN `D_UNRECORDED` |
+| Claimed, not owned, already the wanted result | WARN `D_PLAN_PENDING` when the plan adopts it (an exact link that no ledger entry mentions; the fix names `--allow-adopt`), else WARN `D_UNRECORDED` |
 | Sensitive output: a ledger entry of the sensitive class (compared with case folded), a path a selected sensitive resource claims, or a sensitive plan operation | N/A `D_NA_SENSITIVE`. No content is read or hashed, whoever owns the path. A planner blocker for the path (for example `E_CONFLICT` for a sensitive destination without a ledger entry) is shown instead, because it needs no content. |
 | Operation that needs generated content | N/A `D_NA_GENERATED`: not applicable in this build (no generator). |
 

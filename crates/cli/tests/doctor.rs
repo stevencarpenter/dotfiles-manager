@@ -789,13 +789,17 @@ fn row_code<'a>(rows: &'a [Value], subject: &str) -> &'a str {
 }
 
 #[test]
-fn an_output_that_is_already_the_wanted_result_but_unrecorded_is_a_warning() {
+fn an_exact_unowned_link_is_a_pending_warning_that_names_the_adopt_flag() {
     let fx = Fx::new();
     let link = fx.root.join("base/modules/extra/files/zshrc");
     symlink(&link, fx.h(".zshrc")).unwrap();
     let (c, rows) = fx.rows();
     assert_eq!(c, 0, "{rows:#?}");
-    assert_eq!(status(&rows, ".zshrc"), ("WARN", "D_UNRECORDED"));
+    // DFM-45: the planner adopts it, so doctor shows a pending plan row, not D_UNRECORDED.
+    assert_eq!(status(&rows, ".zshrc"), ("WARN", "D_PLAN_PENDING"));
+    let r = at(&rows, ".zshrc");
+    assert!(r["detail"].as_str().unwrap().contains("adopt"), "{r}");
+    assert!(r["fix"].as_str().unwrap().contains("--allow-adopt"), "{r}");
 }
 
 #[test]

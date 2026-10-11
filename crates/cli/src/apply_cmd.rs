@@ -8,10 +8,10 @@
 use crate::plan_cmd::{make_plan, render};
 use crate::{Ctx, read_existing_binding, state_cmd, usage};
 use dfm_engine::{
-    Dir, NoGenerator, Run, Store, apply, check_allow, check_journal_capacity, gates, now_unix,
+    Approval as Allowance, Dir, NoGenerator, Run, Store, apply, check_allowances,
+    check_journal_capacity, gates, now_unix,
 };
 use dfm_model::display::visible;
-use dfm_model::plan::Action;
 use dfm_model::state::{
     Approval, BinaryId, DisruptiveApproval, ProfileRef, Receipt, RunResult, SourceId, Stamp,
     Status, count_statuses, rfc3339,
@@ -25,13 +25,15 @@ pub struct Args {
     pub root: String,
     pub yes_plan: Option<String>,
     pub allow: BTreeSet<String>,
+    pub allow_adopt: BTreeSet<String>,
     pub preview: bool,
 }
 
-/// `apply --root <dir> [--yes-plan <digest>] [--allow-disruptive <operation-id>]... [--preview]`.
+/// `apply --root <dir> [--yes-plan <digest>] [--allow-disruptive <operation-id>]...
+/// [--allow-adopt <operation-id>]... [--preview]`.
 pub fn parse_args(args: &[String]) -> Result<Args, Refusal> {
     let (mut root, mut yes, mut preview) = (None, None, false);
-    let mut allow = BTreeSet::new();
+    let (mut allow, mut allow_adopt) = (BTreeSet::new(), BTreeSet::new());
     let mut it = args.iter();
     while let Some(a) = it.next() {
         let mut value = |slot: Option<&mut Option<String>>| -> Result<String, Refusal> {
@@ -52,9 +54,12 @@ pub fn parse_args(args: &[String]) -> Result<Args, Refusal> {
             "--yes-plan" => {
                 value(Some(&mut yes))?;
             }
-            "--allow-disruptive" => {
+            flag if Allowance::from_flag(flag).is_some() => {
                 let v = value(None)?;
-                allow.insert(v);
+                match Allowance::from_flag(flag) {
+                    Some(Allowance::Adopt) => allow_adopt.insert(v),
+                    _ => allow.insert(v),
+                };
             }
             "--preview" if !preview => preview = true,
             "--preview" => return Err(usage("--preview given twice")),
@@ -77,6 +82,7 @@ pub fn parse_args(args: &[String]) -> Result<Args, Refusal> {
         root: root.ok_or_else(|| usage("--root is required"))?,
         yes_plan: yes,
         allow,
+        allow_adopt,
         preview,
     })
 }
@@ -165,13 +171,16 @@ fn run_inner(
     if let Some(r) = g.refusal {
         return Err(r);
     }
-    // An id that names no removal is a usage error. A removal without its id is refused, and
-    // every missing id is printed as a flag to paste.
-    if let Err(e) = check_allow(&g.removals, &args.allow) {
-        if e.code == Code::DisruptiveUnapproved {
+    // An id that names no operation of its kind is a usage error and wins over a missing
+    // approval. A missing approval is refused with every missing flag printed to paste.
+    if let Err(all) = check_allowances(&g, &args.allow, &args.allow_adopt) {
+        for e in all.iter().filter(|e| e.code != Code::Usage) {
             writeln!(out, "{}", visible(&e.detail)).map_err(w)?;
         }
-        return Err(e);
+        return Err(all
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| usage("approval check failed")));
     }
     // The journal size is read without the lock. The lock is taken only for a real run.
     let readable = Store::open_read(sys, &layout, state_cmd::fail_from_env()?)?
@@ -220,6 +229,7 @@ fn run_inner(
         home_path: &layout.home,
         generator: &NoGenerator,
         allow: &args.allow,
+        allow_adopt: &args.allow_adopt,
         fail: &fail,
     };
     let started = now_unix().map_err(|r| stamped(&store, r))?;
@@ -245,16 +255,18 @@ fn run_inner(
             .operations
             .iter()
             .zip(&report.operations)
-            .filter(|(op, rec)| {
-                op.action == Action::Remove
-                    && args.allow.contains(&op.id)
-                    // The attempt id replaces the planner id once the operation reached its intent.
-                    && rec.id != op.journal_id
-            })
-            .map(|(_, rec)| DisruptiveApproval {
-                operation_id: rec.id.clone(),
-                how: "allow_disruptive".into(),
-                at: rec.started_at.clone().unwrap_or_else(|| rfc3339(started)),
+            .filter_map(|(op, rec)| {
+                let kind = Allowance::of(op.action)?;
+                let approved = match kind {
+                    Allowance::Disruptive => &args.allow,
+                    Allowance::Adopt => &args.allow_adopt,
+                };
+                // The attempt id replaces the planner id once the operation reached its intent.
+                (approved.contains(&op.id) && rec.id != op.journal_id).then(|| DisruptiveApproval {
+                    operation_id: rec.id.clone(),
+                    how: kind.how().into(),
+                    at: rec.started_at.clone().unwrap_or_else(|| rfc3339(started)),
+                })
             })
             .collect();
         let sources = locked
@@ -343,7 +355,8 @@ fn run_inner(
         n(Status::NotInScope)
     )
     .map_err(w)?;
-    if n(Status::Updated) > 0 {
+    // An adoption publishes nothing, so only a published output earns this note.
+    if report.operations.iter().any(|r| r.reload.is_some()) {
         writeln!(
             out,
             "reload: not attempted. Publishing a file does not reload the program that reads it"

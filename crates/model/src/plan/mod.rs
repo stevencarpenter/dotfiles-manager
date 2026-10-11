@@ -160,8 +160,31 @@ pub enum Action {
     /// Remove an output the ledger proves this manager wrote and nothing selects any more.
     /// Apply (DFM-18) executes it after re-checking the fingerprint precondition.
     Remove,
+    /// Record ownership of an existing link that is exactly the link the resource would create.
+    /// Apply writes nothing to HOME for it and needs `--allow-adopt <operation-id>`.
+    Adopt,
     /// Nothing to do, or out of scope.
     None,
+}
+
+impl Action {
+    /// Whether the operation carries a link target that apply checks against its source root and
+    /// fingerprints: it creates, replaces or adopts a link.
+    pub fn carries_link(self) -> bool {
+        matches!(
+            self,
+            Action::CreateLink | Action::ReplaceLink | Action::Adopt
+        )
+    }
+
+    /// Whether the operation puts a link or file into HOME. Adoption records ownership of what
+    /// is already there, so it publishes nothing and has no reload state.
+    pub fn publishes(self) -> bool {
+        matches!(
+            self,
+            Action::CreateLink | Action::ReplaceLink | Action::CreateFile | Action::UpdateFile
+        )
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -416,11 +439,17 @@ pub fn node_state(seen: &Seen, sensitive: bool) -> String {
     }
 }
 
-/// The ledger fingerprint of a link: SHA-256 of the link target text. DFM-17 left link
-/// fingerprints open; the planner and apply both use this function. A file's fingerprint is the
-/// SHA-256 of its content.
+/// The ledger fingerprint of a link: SHA-256 of `link\0` and the link target text. DFM-17 left
+/// link fingerprints open; the planner and apply both use this function. A file's fingerprint is
+/// the SHA-256 of its content. The prefix keeps the two apart: a regular file whose bytes equal
+/// a link's target text has a different fingerprint, so it is never taken for that link, not
+/// for ownership and not for a deletion (DFM-45). A ledger written before this prefix holds the
+/// plain hash for its links. Such an entry no longer matches its live link, so the planner calls
+/// it modified and nothing removes it until the link is applied or adopted again.
 pub fn link_fingerprint(target: &str) -> String {
-    sha256_hex(target.as_bytes())
+    let mut bytes = b"link\0".to_vec();
+    bytes.extend_from_slice(target.as_bytes());
+    sha256_hex(&bytes)
 }
 
 /// The identity of a source tree read from `root` (section 9, "Path-source identity"): the
@@ -517,6 +546,12 @@ mod tests {
             },
         );
         assert_ne!(a.digest().unwrap(), c.digest().unwrap());
+    }
+
+    #[test]
+    fn a_link_fingerprint_is_never_the_hash_of_a_file_with_the_same_bytes() {
+        assert_ne!(link_fingerprint("/src/x"), sha256_hex(b"/src/x"));
+        assert_eq!(link_fingerprint("/src/x"), link_fingerprint("/src/x"));
     }
 
     #[test]

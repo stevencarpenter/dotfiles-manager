@@ -12,8 +12,8 @@ pub mod publish;
 pub mod store;
 
 pub use apply::{
-    Gates, Generator, NoGenerator, RELOAD_NOT_ATTEMPTED, Report, Run, allow_flag, apply,
-    check_allow, check_journal_capacity, gates, owned_outputs,
+    Approval, Gates, Generator, NoGenerator, RELOAD_NOT_ATTEMPTED, Report, Run, apply, check_allow,
+    check_allowances, check_journal_capacity, flag, gates, owned_outputs,
 };
 #[cfg(feature = "failpoints")]
 pub use fail::Action;

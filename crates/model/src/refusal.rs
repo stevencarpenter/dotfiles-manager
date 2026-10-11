@@ -64,6 +64,8 @@ pub enum Code {
     DisruptiveUnapproved,
     SensitiveUnsupported,
     ApprovalRequired,
+    // Added by DFM-45 (docs/apply.md, adoption).
+    AdoptUnapproved,
 }
 
 impl Code {
@@ -120,6 +122,7 @@ impl Code {
         Code::DisruptiveUnapproved,
         Code::SensitiveUnsupported,
         Code::ApprovalRequired,
+        Code::AdoptUnapproved,
     ];
 
     pub fn parse(s: &str) -> Option<Code> {
@@ -179,6 +182,7 @@ impl Code {
             Code::DisruptiveUnapproved => "E_DISRUPTIVE_UNAPPROVED",
             Code::SensitiveUnsupported => "E_SENSITIVE_UNSUPPORTED",
             Code::ApprovalRequired => "E_APPROVAL_REQUIRED",
+            Code::AdoptUnapproved => "E_ADOPT_UNAPPROVED",
         }
     }
 

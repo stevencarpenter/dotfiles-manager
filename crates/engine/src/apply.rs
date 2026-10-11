@@ -78,7 +78,20 @@ pub struct Run<'a> {
     /// Operation ids the caller approved as disruptive (`--allow-disruptive`). The set must
     /// equal the set of planned removals: the plan determines it.
     pub allow: &'a BTreeSet<String>,
+    /// Operation ids the caller approved as adoptions (`--allow-adopt`). The set must equal the
+    /// set of planned adoptions.
+    pub allow_adopt: &'a BTreeSet<String>,
     pub fail: &'a Fail,
+}
+
+impl Run<'_> {
+    /// The ids the caller approved for one kind.
+    pub fn allowed(&self, kind: Approval) -> &BTreeSet<String> {
+        match kind {
+            Approval::Disruptive => self.allow,
+            Approval::Adopt => self.allow_adopt,
+        }
+    }
 }
 
 /// What happened to every operation of the plan, in plan order.
@@ -95,9 +108,21 @@ pub struct Report {
 pub struct Gates {
     /// Ids of the planned removals, in plan order. Each needs `--allow-disruptive <id>`.
     pub removals: Vec<String>,
+    /// Ids of the planned adoptions, in plan order. Each needs `--allow-adopt <id>`.
+    pub adoptions: Vec<String>,
     /// The first gate that refuses the plan (a blocker, a malformed plan, a file with no
     /// generator, a sensitive output), if any.
     pub refusal: Option<Refusal>,
+}
+
+impl Gates {
+    /// The planned operation ids that need this kind of approval.
+    pub fn planned(&self, kind: Approval) -> &[String] {
+        match kind {
+            Approval::Disruptive => &self.removals,
+            Approval::Adopt => &self.adoptions,
+        }
+    }
 }
 
 /// Converts the ledger into the planner's view: paths relative to HOME.
@@ -153,10 +178,71 @@ fn is_file_action(a: Action) -> bool {
     matches!(a, Action::CreateFile | Action::UpdateFile)
 }
 
-/// `--allow-disruptive '<id>'`, quoted so a user can paste it into a shell.
-pub fn allow_flag(id: &str) -> String {
+/// The two approvals a plan can need before apply writes: each names its operations by id.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Approval {
+    /// `--allow-disruptive`: deleting an owned output.
+    Disruptive,
+    /// `--allow-adopt`: recording ownership of an existing link (DFM-45).
+    Adopt,
+}
+
+impl Approval {
+    pub const ALL: [Approval; 2] = [Approval::Disruptive, Approval::Adopt];
+
+    pub fn from_flag(flag: &str) -> Option<Approval> {
+        Approval::ALL.into_iter().find(|a| a.flag() == flag)
+    }
+
+    /// The operation the approval covers.
+    pub fn of(action: Action) -> Option<Approval> {
+        Approval::ALL.into_iter().find(|a| a.action() == action)
+    }
+
+    pub fn flag(self) -> &'static str {
+        match self {
+            Approval::Disruptive => "--allow-disruptive",
+            Approval::Adopt => "--allow-adopt",
+        }
+    }
+
+    pub fn noun(self) -> &'static str {
+        match self {
+            Approval::Disruptive => "removal",
+            Approval::Adopt => "adoption",
+        }
+    }
+
+    /// The refusal for a planned operation without its approval.
+    pub fn code(self) -> Code {
+        match self {
+            Approval::Disruptive => Code::DisruptiveUnapproved,
+            Approval::Adopt => Code::AdoptUnapproved,
+        }
+    }
+
+    /// The `how` of a receipt `approvals[]` entry.
+    pub fn how(self) -> &'static str {
+        match self {
+            Approval::Disruptive => "allow_disruptive",
+            Approval::Adopt => "allow_adopt",
+        }
+    }
+
+    pub fn action(self) -> Action {
+        match self {
+            Approval::Disruptive => Action::Remove,
+            Approval::Adopt => Action::Adopt,
+        }
+    }
+}
+
+/// `--allow-disruptive '<id>'` or `--allow-adopt '<id>'`, quoted so a user can paste it into a
+/// shell.
+pub fn flag(kind: Approval, id: &str) -> String {
     format!(
-        "--allow-disruptive '{}'",
+        "{} '{}'",
+        kind.flag(),
         dfm_model::display::visible(id).replace('\'', "'\\''")
     )
 }
@@ -183,14 +269,16 @@ fn link_inside_its_source(plan: &Plan, op: &Operation, link: &str) -> bool {
 /// The gates that need no write. They are pure, so a preview can run them. A refusal means
 /// nothing was changed (exit 3).
 pub fn gates(plan: &Plan, generator: &dyn Generator) -> Gates {
-    let removals = plan
-        .operations
-        .iter()
-        .filter(|o| o.status == PlanStatus::Planned && o.action == Action::Remove)
-        .map(|o| o.id.clone())
-        .collect();
+    let planned = |kind: Approval| {
+        plan.operations
+            .iter()
+            .filter(|o| o.status == PlanStatus::Planned && o.action == kind.action())
+            .map(|o| o.id.clone())
+            .collect()
+    };
     Gates {
-        removals,
+        removals: planned(Approval::Disruptive),
+        adoptions: planned(Approval::Adopt),
         refusal: first_refusal(plan, generator).err(),
     }
 }
@@ -239,7 +327,7 @@ fn first_refusal(plan: &Plan, generator: &dyn Generator) -> Result<(), Refusal> 
             ));
         }
         match op.action {
-            Action::CreateLink | Action::ReplaceLink => {
+            Action::CreateLink | Action::ReplaceLink | Action::Adopt => {
                 let link = op
                     .link
                     .as_deref()
@@ -271,31 +359,72 @@ fn first_refusal(plan: &Plan, generator: &dyn Generator) -> Result<(), Refusal> 
     Ok(())
 }
 
-/// The allowances must equal the planned removals: an id that names no removal is a usage
-/// error, and every removal needs its own id. The message lists every missing id as a flag.
-pub fn check_allow(removals: &[String], allow: &BTreeSet<String>) -> Result<(), Refusal> {
-    if let Some(bad) = allow.iter().find(|a| !removals.contains(a)) {
+/// The allowances of one kind must equal the planned operations of that kind: an id that names
+/// none is a usage error, and every planned one needs its own id. The message lists every
+/// missing id as a flag to paste.
+pub fn check_allow(
+    kind: Approval,
+    planned: &[String],
+    allow: &BTreeSet<String>,
+) -> Result<(), Refusal> {
+    if let Some(bad) = allow.iter().find(|a| !planned.contains(a)) {
         return Err(Refusal::new(
             Code::Usage,
-            format!("--allow-disruptive {bad} names no removal in this plan"),
+            format!(
+                "{} {bad} names no {} in this plan",
+                kind.flag(),
+                kind.noun()
+            ),
         ));
     }
-    let missing: Vec<String> = removals
+    let missing: Vec<String> = planned
         .iter()
         .filter(|id| !allow.contains(*id))
-        .map(|id| allow_flag(id))
+        .map(|id| flag(kind, id))
         .collect();
     if missing.is_empty() {
         return Ok(());
     }
     Err(Refusal::new(
-        Code::DisruptiveUnapproved,
+        kind.code(),
         format!(
-            "{} removal(s) need approval. Add: {}",
+            "{} {}(s) need approval. Add: {}",
             missing.len(),
+            kind.noun(),
             missing.join(" ")
         ),
     ))
+}
+
+/// Checks both kinds. A usage error of either kind wins over a missing approval, so the caller
+/// reports a wrong id before it asks for more. Otherwise it returns every missing approval, one
+/// refusal per kind, so a preview can list all of them.
+pub fn check_allowances(
+    gates: &Gates,
+    disruptive: &BTreeSet<String>,
+    adopt: &BTreeSet<String>,
+) -> Result<(), Vec<Refusal>> {
+    let results = [
+        check_allow(
+            Approval::Disruptive,
+            gates.planned(Approval::Disruptive),
+            disruptive,
+        ),
+        check_allow(Approval::Adopt, gates.planned(Approval::Adopt), adopt),
+    ];
+    if let Some(usage) = results
+        .iter()
+        .filter_map(|r| r.as_ref().err())
+        .find(|e| e.code == Code::Usage)
+    {
+        return Err(vec![usage.clone()]);
+    }
+    let missing: Vec<Refusal> = results.into_iter().filter_map(Result::err).collect();
+    if missing.is_empty() {
+        Ok(())
+    } else {
+        Err(missing)
+    }
 }
 
 /// Refuses before any write when the journal could not take this run's entries. `journal_len`
@@ -369,6 +498,7 @@ fn step_name(op: &Operation) -> &'static str {
         Action::CreateFile => "create-file",
         Action::UpdateFile => "update-file",
         Action::Remove => "remove",
+        Action::Adopt => "adopt",
         Action::None => "none",
     }
 }
@@ -553,7 +683,9 @@ impl Exec<'_, '_> {
                 }
             }
             (Action::Remove, Peek::File { .. } | Peek::Link { .. }) => {}
-            (Action::ReplaceLink | Action::UpdateFile | Action::Remove, _) => {
+            (Action::Adopt, Peek::Link { target, .. })
+                if Some(target.as_str()) == op.link.as_deref() => {}
+            (Action::ReplaceLink | Action::UpdateFile | Action::Remove | Action::Adopt, _) => {
                 return Err(appeared(
                     "is no longer the entry the plan found; it is left alone",
                 ));
@@ -576,9 +708,7 @@ impl Exec<'_, '_> {
         };
         let new_fp = match (&bytes, op.link.as_deref()) {
             (Some(b), _) => Some(sha256_hex(b)),
-            (None, Some(l)) if matches!(op.action, Action::CreateLink | Action::ReplaceLink) => {
-                Some(link_fingerprint(l))
-            }
+            (None, Some(l)) if op.action.carries_link() => Some(link_fingerprint(l)),
             _ => None,
         };
         let expected = match op.action {
@@ -633,12 +763,12 @@ impl Exec<'_, '_> {
             }
         };
         // The effect is read back. Now the outcome entry, then ownership.
-        let published = matches!(
-            op.action,
-            Action::CreateLink | Action::ReplaceLink | Action::CreateFile | Action::UpdateFile
-        );
+        let published = op.action.publishes();
+        // An adoption records ownership of an output that was already there. Nothing was
+        // published, so no consumer reload state is recorded for it.
+        let records = published || op.action == Action::Adopt;
         if let Err(e) =
-            self.settle_outcome(op, &id, &abs, published, bytes.is_some(), new_fp.as_deref())
+            self.settle_outcome(op, &id, &abs, records, bytes.is_some(), new_fp.as_deref())
         {
             return Err(self.after_intent(e, &id, &abs));
         }
@@ -649,7 +779,7 @@ impl Exec<'_, '_> {
                 _ => facts.ledger_fp.clone(),
             },
             after: new_fp,
-            owned: if published { vec![abs] } else { Vec::new() },
+            owned: if records { vec![abs] } else { Vec::new() },
             reload: published.then(|| RELOAD_NOT_ATTEMPTED.to_string()),
         })
     }
@@ -660,7 +790,7 @@ impl Exec<'_, '_> {
         op: &Operation,
         id: &str,
         abs: &str,
-        published: bool,
+        records: bool,
         generated: bool,
         new_fp: Option<&str>,
     ) -> Result<(), Refusal> {
@@ -668,7 +798,7 @@ impl Exec<'_, '_> {
         self.run.fail.hit("apply-after-done")?;
         match op.action {
             Action::Remove => self.forget_output(op, id, abs),
-            _ if published => {
+            _ if records => {
                 let mode = if generated {
                     op.mode.unwrap_or(0o600)
                 } else {
@@ -732,6 +862,8 @@ impl Exec<'_, '_> {
                 )?;
             }
             Action::Remove => removed = Some(self.remove(op, abs, parent, name, live)?),
+            // Nothing is written. The read-back below is the last look at the leaf.
+            Action::Adopt => {}
             Action::None => return Err(plan_invalid("no action")),
         }
         fail.hit("apply-after-effect")?;
@@ -742,6 +874,7 @@ impl Exec<'_, '_> {
             )
         };
         match (op.action, parent.peek(sys, name)?) {
+            (Action::Adopt, _) => self.still_exact_link(op, abs, parent, name)?,
             (Action::CreateDir, Peek::Dir { .. }) | (Action::Remove, Peek::Missing) => {}
             (Action::CreateLink | Action::ReplaceLink, Peek::Link { target, .. })
                 if Some(target.as_str()) == op.link.as_deref() => {}
@@ -759,6 +892,27 @@ impl Exec<'_, '_> {
             _ => return Err(bad("the entry is not what was published")),
         }
         Ok(removed)
+    }
+
+    /// The adoption read-back, immediately before the outcome entry and the ledger write: the
+    /// leaf is still a link with the planned text.
+    /// A change is a conflict. The entry is left alone and no ledger entry is written.
+    fn still_exact_link(
+        &self,
+        op: &Operation,
+        abs: &str,
+        parent: &Dir,
+        name: &str,
+    ) -> Result<(), Refusal> {
+        match parent.peek(&self.run.sys, name)? {
+            Peek::Link { target, .. } if Some(target.as_str()) == op.link.as_deref() => Ok(()),
+            _ => Err(Refusal::new(
+                Code::Conflict,
+                format!(
+                    "{abs} is no longer the link the plan found; it is left alone and not adopted"
+                ),
+            )),
+        }
     }
 
     /// Deletes one owned output. Authorization is decided again here, with the ledger read now
@@ -956,7 +1110,7 @@ impl Exec<'_, '_> {
             ("remove", _) if fp.is_some() && fp == out.expected_sha256 => Probe::NotDone,
             ("create-dir", Peek::Dir { .. }) => Probe::Done,
             (_, Peek::Missing) => Probe::NotDone,
-            ("create-link" | "replace-link" | "create-file" | "update-file", _)
+            ("create-link" | "replace-link" | "create-file" | "update-file" | "adopt", _)
                 if fp.is_some() && fp == out.expected_sha256 =>
             {
                 Probe::Done
@@ -1057,7 +1211,7 @@ pub fn apply(run: &Run<'_>, plan: &Plan) -> Result<Report, Refusal> {
     if let Some(r) = g.refusal {
         return Err(r);
     }
-    check_allow(&g.removals, run.allow)?;
+    check_allowances(&g, run.allow, run.allow_adopt).map_err(|mut all| all.remove(0))?;
     check_journal_capacity(run.store.journal_len()?, plan)?;
     Ok(execute(run, plan))
 }
