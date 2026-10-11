@@ -1187,6 +1187,110 @@ fn install_tiny(home: &Path, src: &Path, sha: &str) -> Output {
 }
 
 #[test]
+fn a_binding_reached_through_an_unusable_config_directory_is_refused_before_any_build() {
+    use std::os::unix::fs::symlink;
+    let valid = "schema = 1\nprofile = \"/p\"\nmachine_id = \"m5\"\nplatform = \"macos\"\narch = \"aarch64\"\norigins = []\n";
+    for case in [
+        "symlinked-config",
+        "symlinked-leaf",
+        "group-writable-leaf",
+        "group-writable-config",
+    ] {
+        let (tmp, home, src, sha) = refusal_setup(&format!("config-tree-{case}"));
+        let real = tmp.path().join("real-config");
+        fs::create_dir_all(real.join("dotfiles-manager")).unwrap();
+        fs::write(real.join("dotfiles-manager/machine.toml"), valid).unwrap();
+        fs::set_permissions(
+            real.join("dotfiles-manager/machine.toml"),
+            fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+        let cfg = home.join(".config");
+        let mode =
+            |p: &Path, m: u32| fs::set_permissions(p, fs::Permissions::from_mode(m)).unwrap();
+        match case {
+            "symlinked-config" => symlink(&real, &cfg).unwrap(),
+            "symlinked-leaf" => {
+                fs::create_dir_all(&cfg).unwrap();
+                symlink(real.join("dotfiles-manager"), cfg.join("dotfiles-manager")).unwrap();
+            }
+            "group-writable-leaf" => {
+                fs::create_dir_all(cfg.join("dotfiles-manager")).unwrap();
+                fs::copy(
+                    real.join("dotfiles-manager/machine.toml"),
+                    cfg.join("dotfiles-manager/machine.toml"),
+                )
+                .unwrap();
+                mode(&cfg.join("dotfiles-manager/machine.toml"), 0o600);
+                mode(&cfg.join("dotfiles-manager"), 0o770);
+            }
+            _ => {
+                fs::create_dir_all(cfg.join("dotfiles-manager")).unwrap();
+                fs::copy(
+                    real.join("dotfiles-manager/machine.toml"),
+                    cfg.join("dotfiles-manager/machine.toml"),
+                )
+                .unwrap();
+                mode(&cfg.join("dotfiles-manager/machine.toml"), 0o600);
+                mode(&cfg, 0o775);
+            }
+        }
+        let before = entries_below(&home);
+        let o = install_tiny(&home, &src, &sha);
+        assert_eq!(o.status.code(), Some(3), "{case}: {}", err(&o));
+        let want = match case {
+            "symlinked-config" => format!("{} is a symlink", cfg.display()),
+            "symlinked-leaf" => format!("{} is a symlink", cfg.join("dotfiles-manager").display()),
+            "group-writable-leaf" => {
+                format!("{} has mode 770", cfg.join("dotfiles-manager").display())
+            }
+            _ => format!("{} has mode 775", cfg.display()),
+        };
+        assert!(
+            err(&o).contains("E_PREREQ_MISSING") && err(&o).contains(&want),
+            "{case}: want {want}: {}",
+            err(&o)
+        );
+        assert!(
+            !home.join(".cache/dotfiles-manager/build").exists(),
+            "{case}: a build artefact exists"
+        );
+        assert_eq!(
+            entries_below(&home),
+            before,
+            "{case}: the refusal changed HOME"
+        );
+    }
+}
+
+#[test]
+fn a_home_alias_is_checked_at_its_target() {
+    use std::os::unix::fs::symlink;
+    for (mode, refused) in [(0o775, true), (0o755, false)] {
+        let (tmp, real, src, sha) = refusal_setup(&format!("home-alias-{mode:o}"));
+        fs::set_permissions(&real, fs::Permissions::from_mode(mode)).unwrap();
+        let alias = tmp.path().join("alias");
+        symlink(&real, &alias).unwrap();
+        let o = install_tiny(&alias, &src, &sha);
+        let want = format!("{} has mode {mode:o}", alias.display());
+        if refused {
+            assert_eq!(o.status.code(), Some(3), "{}", err(&o));
+            assert!(
+                err(&o).contains("E_PREREQ_MISSING") && err(&o).contains(&want),
+                "{}",
+                err(&o)
+            );
+        } else {
+            assert!(
+                !err(&o).contains("has mode") && !err(&o).contains("not owned"),
+                "{}",
+                err(&o)
+            );
+        }
+    }
+}
+
+#[test]
 fn an_unusable_binding_stops_the_install_before_any_mutation() {
     use std::os::unix::fs::symlink;
     let (_tmp, home, src, sha) = refusal_setup("binding-pre");
