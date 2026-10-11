@@ -52,7 +52,7 @@ For apply (DFM-18) each operation also carries: `journal_id` (a valid journal id
 
 **Removal.** A ledger output is a removal candidate when its resource is no longer selected and no selected resource claims its path. (A resource that is still selected keeps its outputs even if it claims nothing now.) It is planned as `remove` only when the live output matches the ledger fingerprint (`owned`). A changed, foreign, sensitive, directory, non-ASCII or other-user output is a blocker (`E_CONFLICT`, `E_TARGET_INVALID` or `E_PRIVILEGE_UNSUPPORTED`). An output that is already gone is `current`. A path claimed by a selected sensitive resource is never hashed, and its ledger fingerprint is never printed, whoever owns the entry. Removal is only planned here. Nothing deletes in this task.
 
-A planned removal of a file in a fragment directory is listed in the consumer's `fragments` as `removing:<resource>`. The removal runs after the consumer (`after`), so the consumer reads the file first. A blocked or absent removal adds no edge and is not a producer.
+A fragment that a planned removal deletes is not an input. It is left out of the consumer's `fragments`, the consumer's `fragments:` precondition lists it as `removing=[...]`, and the consumer runs after the removal (`after`). Deselected content never reaches the assembled file, and one apply converges. A blocked or absent removal adds no edge and is not a producer.
 
 ## Rules the planner enforces
 
@@ -99,7 +99,9 @@ An unsupported saved-plan schema is `E_SCHEMA_UNSUPPORTED`. A missing state dire
 ## Known limits
 
 - **No adapter output.** `render`, `merge` and `assemble` operations are planned as `create_file` or `update_file` without comparing desired content, so a file that already equals the desired content is still planned when the ledger owns it. `already_done` needs the adapters. A `skills/v1` leaf is planned as a link to its source, which is an assumption about that adapter.
-- **Hidden or unverified decisions.** A mode a resource declares outside `0..=0o777` is `E_MANIFEST_INVALID`, not dropped. A claim that cannot be checked against the manager's own paths (an I/O error, not an overlap) is `E_OBSERVATION_UNKNOWN`, exit 3 (architecture section 10, an unknown required fact). The topology walk reports a link loop or unreadable parent first.
+- **Mode on out-of-scope resources.** A bad `mode` on an out-of-scope resource (for example a secret) still raises a blocker.
+- **Sensitive ledger entries.** A path the ledger records as sensitive is never hashed and its ledger text is never printed, whoever claims it now, and a fragment-directory name that matches it in another case is not hashed.
+- **Hidden or unverified decisions.** A mode a resource declares outside `0..=0o777` is `E_MANIFEST_INVALID`, not dropped. A claim that cannot be checked against the manager's own paths (an I/O error, not an overlap) is `E_OBSERVATION_UNKNOWN`, exit 3 (architecture section 10, an unknown required fact). The topology walk reports a link loop or unreadable parent first. The reserved-path and unchecked maps are computed for ledger outputs too, so removal candidates get the same checks.
 - **Generated-output hashes.** Section 9 asks for content hashes of generated normal outputs. They need the adapters (DFM-20). Until then the plan records input identities and the model digest.
 - **Prose fields.** `effect` and `postcondition` are free text for people. Apply uses `action`, `path`, `link`, `mode` and `preconditions`.
 - **Field claims.** The resolver models path claims only. Claims on fields inside a co-owned document (for example one key of `settings.json`) are not modelled, so two resources writing different fields of one file collide as a path.
