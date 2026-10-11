@@ -54,6 +54,9 @@ pub struct Desired {
     append: BTreeSet<String>,
     /// The fragment directory (a HOME path) and the file name pattern, when declared.
     fragments: Option<(String, String)>,
+    /// HOME as the machine spells it. Only used to recognize an existing hook that spells the
+    /// same command with the absolute home path.
+    home: Option<String>,
 }
 
 /// The result of a merge. `Debug` prints lengths only: the bytes can hold credentials.
@@ -291,7 +294,15 @@ impl Desired {
             handlers,
             append,
             fragments,
+            home: None,
         })
+    }
+
+    /// Sets HOME, so an existing hook that spells the home directory as an absolute path is
+    /// recognized as the declared hook.
+    pub fn with_home(mut self, home: &str) -> Desired {
+        self.home = Some(home.trim_end_matches('/').to_string()).filter(|h| !h.is_empty());
+        self
     }
 
     /// The fragment directory and the file name pattern, when the resource declares them.
@@ -793,17 +804,21 @@ pub fn merge_with(
                 ));
             }
         };
-        let present = match event_array(hooks, &h.event)? {
+        let (added, exact) = match event_array(hooks, &h.event)? {
             Some(arr) => {
-                let found = arr.iter().any(|e| sha_of(e) == h.sha256);
-                if !found {
+                // An exact copy is the manager's to own. An equivalent hook (another spelling of
+                // the same command) is the user's: it is not duplicated and not recorded, so a
+                // retire can never remove a group that holds foreign hooks too.
+                let exact = arr.iter().any(|e| sha_of(e) == h.sha256);
+                let added = !exact && !hook_present(arr, &h.entry, desired.home.as_deref());
+                if added {
                     arr.push(h.entry.clone());
                 }
-                found
+                (added, exact)
             }
             None => {
                 hooks.insert(h.event.clone(), Json::Array(vec![h.entry.clone()]));
-                false
+                (true, false)
             }
         };
         // The manager owns an entry it added now or recorded as its own before, and, at an
@@ -812,7 +827,7 @@ pub fn merge_with(
         let was_owned = owned
             .iter()
             .any(|o| o.id == h.id && o.key == h.event && o.sha256 == h.sha256);
-        if !present || was_owned || takeover {
+        if added || exact && (was_owned || takeover) {
             entries.push(OwnedEntry {
                 id: h.id.clone(),
                 key: h.event.clone(),
@@ -829,6 +844,114 @@ pub fn merge_with(
         entries,
         appended: walk.appended,
         changed,
+    })
+}
+
+/// Splits a shell command into words the way a POSIX shell reads quotes (single, double and
+/// backslash), without any expansion. `None` when a quote is not closed.
+fn shell_words(s: &str) -> Option<Vec<String>> {
+    let (mut words, mut cur, mut open) = (Vec::new(), String::new(), false);
+    let mut it = s.chars();
+    while let Some(c) = it.next() {
+        match c {
+            '\'' => {
+                open = true;
+                loop {
+                    match it.next()? {
+                        '\'' => break,
+                        x => cur.push(x),
+                    }
+                }
+            }
+            '"' => {
+                open = true;
+                loop {
+                    match it.next()? {
+                        '"' => break,
+                        '\\' => {
+                            let n = it.next()?;
+                            if !matches!(n, '\\' | '"' | '$' | '`') {
+                                cur.push('\\');
+                            }
+                            cur.push(n);
+                        }
+                        x => cur.push(x),
+                    }
+                }
+            }
+            '\\' => {
+                open = true;
+                cur.push(it.next()?);
+            }
+            c if c.is_whitespace() => {
+                if open {
+                    words.push(std::mem::take(&mut cur));
+                    open = false;
+                }
+            }
+            c => {
+                open = true;
+                cur.push(c);
+            }
+        }
+    }
+    if open {
+        words.push(cur);
+    }
+    Some(words)
+}
+
+/// One word with its home spelling made canonical: `~`, `$HOME`, `${HOME}` and the absolute home
+/// path, each at the start of the word, become `${HOME}`.
+fn canon_word(w: &str, home: Option<&str>) -> String {
+    let mut prefixes = vec!["~", "$HOME", "${HOME}"];
+    if let Some(h) = home {
+        prefixes.push(h);
+    }
+    for p in prefixes {
+        if let Some(rest) = w.strip_prefix(p)
+            && (rest.is_empty() || rest.starts_with('/'))
+        {
+            return format!("${{HOME}}{rest}");
+        }
+    }
+    w.to_string()
+}
+
+/// The identity of a hook command: its words, read as a shell reads them, with the home spelling
+/// made canonical. Quoting and `~/`, `$HOME/`, `${HOME}/` and the absolute home path do not
+/// change it. A command with an unclosed quote is its own identity.
+fn command_identity(cmd: &str, home: Option<&str>) -> String {
+    match shell_words(cmd) {
+        Some(w) => w
+            .iter()
+            .map(|x| canon_word(x, home))
+            .collect::<Vec<_>>()
+            .join("\0"),
+        None => format!("raw\0{cmd}"),
+    }
+}
+
+/// Whether `arr` (the groups of one event) already runs the declared hook: a group with the same
+/// matcher that holds a `command` hook of the same identity. The timeout does not matter, and
+/// neither does what else the group holds, so a group the nix merge wrote with two hooks counts.
+fn hook_present(arr: &[Json], entry: &Json, home: Option<&str>) -> bool {
+    let Some(want) = entry["hooks"][0]["command"]
+        .as_str()
+        .map(|c| command_identity(c, home))
+    else {
+        return false;
+    };
+    arr.iter().any(|g| {
+        g.get("matcher") == entry.get("matcher")
+            && g["hooks"].as_array().is_some_and(|hs| {
+                hs.iter().any(|h| {
+                    h["type"] == "command"
+                        && h["command"]
+                            .as_str()
+                            .is_some_and(|c| command_identity(c, home) == want)
+                })
+            })
     })
 }
 
@@ -1446,6 +1569,51 @@ defaultMode = "auto"
             ))
             .unwrap();
             assert!(Desired::from_value(&v).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn command_identity_ignores_home_spelling_and_quoting() {
+        let home = Some("/home/me");
+        let id = |c: &str| command_identity(c, home);
+        let want = id("~/.claude/hooks/x.sh");
+        for same in [
+            "$HOME/.claude/hooks/x.sh",
+            "${HOME}/.claude/hooks/x.sh",
+            "\"${HOME}/.claude/hooks/x.sh\"",
+            "'~/.claude/hooks/x.sh'",
+            "/home/me/.claude/hooks/x.sh",
+            "  ~/.claude/hooks/x.sh  ",
+        ] {
+            assert_eq!(id(same), want, "{same}");
+        }
+        for other in [
+            "~/.claude/hooks/y.sh",
+            "/home/mex/.claude/hooks/x.sh",
+            "bash ~/.claude/hooks/x.sh",
+            "/opt/x/.claude/hooks/x.sh",
+        ] {
+            assert_ne!(id(other), want, "{other}");
+        }
+        assert_ne!(id("a 'b c'"), id("a b c"), "word boundaries count");
+        assert_eq!(
+            id("a 'b c"),
+            "raw\0a 'b c",
+            "an unclosed quote is its own identity"
+        );
+    }
+
+    #[test]
+    fn an_equivalent_hook_is_not_duplicated_and_not_owned_even_at_take_over() {
+        let d = desired(
+            "[managed]\n[handlers.g]\nevent = \"E\"\ntype = \"command\"\nargv = [\"${HOME}/h/x.sh\"]\n",
+        )
+        .with_home("/home/me");
+        let live = br#"{"hooks":{"E":[{"hooks":[{"type":"command","command":"/home/me/h/x.sh"},{"type":"command","command":"foreign"}]}]}}"#;
+        for takeover in [false, true] {
+            let m = merge_with(Some(live), &d, &[], &[], takeover).unwrap();
+            assert_eq!(json(&m.bytes)["hooks"]["E"].as_array().unwrap().len(), 1);
+            assert!(m.entries.is_empty(), "takeover={takeover}");
         }
     }
 }

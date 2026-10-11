@@ -1784,3 +1784,95 @@ fn no_foreign_nested_content_reaches_any_output_or_state_file() {
             .contains(&hash)
     );
 }
+
+#[test]
+fn hooks_the_nix_merge_wrote_in_another_spelling_are_never_duplicated() {
+    let fx = Fx::base();
+    // The eighth hook of the owner's set: a SessionStart handler.
+    fx.base_module(|m| {
+        format!(
+            "{m}\n[resources.value.handlers.session-routing]\nevent = \"SessionStart\"\ntype = \"command\"\nargv = [\"${{HOME}}/.claude/hooks/emit-routing-context.sh\"]\n"
+        )
+    });
+    let home = fx.home.path().to_str().unwrap().to_string();
+    let h = |c: &str| serde_json::json!({"type": "command", "command": c});
+    // As the nix merge writes them: `~/` spelling, the two SubagentStop hooks in one group, and
+    // one entry with the absolute home path. WorktreeRemove is missing on purpose.
+    let live_hooks = serde_json::json!({
+        "PreToolUse": [{"matcher": "Bash", "hooks": [h("~/.claude/hooks/no-em-dash-commit.sh")]}],
+        "WorktreeCreate": [{"hooks": [h("~/.claude/hooks/wt-create.sh")]}],
+        "Stop": [{"hooks": [h("$HOME/.claude/hooks/agent-journal-stop.sh")]}],
+        "SubagentStop": [{"hooks": [
+            h("~/.claude/hooks/agent-journal-stop.sh"),
+            {"type": "command", "command": "~/.claude/hooks/agent-reap-subagent-stop.sh", "timeout": 20}
+        ]}],
+        "SessionEnd": [{"hooks": [
+            {"type": "command", "command": "'~/.claude/hooks/agent-reap-session-end.sh'", "timeout": 20}
+        ]}],
+        "SessionStart": [{"hooks": [h(&format!("{home}/.claude/hooks/emit-routing-context.sh"))]}]
+    });
+    fx.live(&serde_json::json!({ "hooks": live_hooks }).to_string());
+    assert_eq!(code(&fx.apply()), 0);
+    let j = fx.live_json();
+    for ev in [
+        "PreToolUse",
+        "WorktreeCreate",
+        "Stop",
+        "SubagentStop",
+        "SessionEnd",
+        "SessionStart",
+    ] {
+        assert_eq!(
+            j["hooks"][ev], live_hooks[ev],
+            "{ev} was changed or duplicated"
+        );
+    }
+    // Only the missing hook was added, and it is the only entry the manager owns.
+    assert_eq!(
+        commands(&j, "WorktreeRemove"),
+        ["\"${HOME}/.claude/hooks/wt-remove.sh\""]
+    );
+    let owned = fx.coowned_of(BASE_ID)["coowned"]["entries"].clone();
+    assert_eq!(owned.as_array().unwrap().len(), 1, "{owned}");
+    assert_eq!(owned[0]["id"], "worktree-remove");
+    // A rerun changes nothing.
+    let receipts = fx.receipts();
+    let o = fx.apply();
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    assert_eq!(fx.receipts(), receipts);
+    assert_eq!(fx.live_json()["hooks"], j["hooks"]);
+    // Deselecting removes the entry the manager added and no other.
+    fx.set_profile("");
+    assert_eq!(code(&fx.apply()), 0);
+    let j = fx.live_json();
+    assert!(j["hooks"].get("WorktreeRemove").is_none());
+    for ev in [
+        "PreToolUse",
+        "WorktreeCreate",
+        "Stop",
+        "SubagentStop",
+        "SessionEnd",
+        "SessionStart",
+    ] {
+        assert_eq!(
+            j["hooks"][ev], live_hooks[ev],
+            "{ev} was touched by the retire"
+        );
+    }
+}
+
+#[test]
+fn a_hook_with_another_matcher_is_a_different_hook() {
+    let fx = Fx::base();
+    fx.live(
+        r#"{"hooks":{"PreToolUse":[{"matcher":"Write","hooks":[{"type":"command","command":"~/.claude/hooks/no-em-dash-commit.sh"}]}]}}"#,
+    );
+    assert_eq!(code(&fx.apply()), 0);
+    assert_eq!(
+        fx.live_json()["hooks"]["PreToolUse"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+}

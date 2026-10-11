@@ -107,7 +107,10 @@ impl Generator for Generators<'_> {
                 changed,
             });
         }
-        let desired = Desired::from_value(self.value(op)?)?;
+        let mut desired = Desired::from_value(self.value(op)?)?;
+        if let Some(h) = &inputs.home {
+            desired = desired.with_home(h);
+        }
         let desired = match desired.fragment_spec() {
             Some((_, pattern)) => {
                 // As an assembly: a matching name in the directory that the plan did not list

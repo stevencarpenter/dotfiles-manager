@@ -1008,6 +1008,7 @@ impl Exec<'_, '_> {
                 .map(|c| c.appended.clone())
                 .unwrap_or_default(),
             takeover: op.takeover,
+            home: self.run.home.shown().to_str().map(String::from),
             listing: fragments.listing,
             fragments: fragments.fragments,
             ..GeneratorInputs::default()

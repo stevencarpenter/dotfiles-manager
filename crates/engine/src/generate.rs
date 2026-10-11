@@ -39,6 +39,9 @@ pub struct GeneratorInputs {
     /// The operation is the approved first write into an existing co-owned file with no ledger
     /// entry. A merge then records an identical entry already in place as owned.
     pub takeover: bool,
+    /// HOME as the machine spells it, for the merge to recognize an existing hook that spells the
+    /// same command with the absolute home path.
+    pub home: Option<String>,
 }
 
 /// `Debug` prints the size of the live file and never its bytes: it can hold credentials.

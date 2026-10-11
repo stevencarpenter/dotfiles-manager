@@ -209,7 +209,13 @@ pub fn merge_facts(
                 ),
             ),
             (Err(e), None) => refused(e),
-            (Ok(desired), None) => verdict_for(&r.id, claim, desired, store, sys, home, home_path),
+            (Ok(desired), None) => {
+                let desired = match home_path.to_str() {
+                    Some(h) => desired.clone().with_home(h),
+                    None => desired.clone(),
+                };
+                verdict_for(&r.id, claim, &desired, store, sys, home, home_path)
+            }
         };
         let shown = layered.as_ref().unwrap_or(&declared);
         out.insert(
