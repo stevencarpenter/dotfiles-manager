@@ -872,6 +872,23 @@ fn parked_apply(fx: &Fx, point: &str, during: impl FnOnce(&Fx)) -> Output {
 
 /// As [`parked_apply`], with more `apply` arguments.
 fn parked_apply_with(fx: &Fx, point: &str, extra: &[&str], during: impl FnOnce(&Fx)) -> Output {
+    parked_apply_pid(fx, point, extra, |fx, _pid| during(fx))
+}
+
+/// As [`parked_apply_with`], and `during` also gets the process id of the parked `apply`.
+fn parked_apply_pid(fx: &Fx, point: &str, extra: &[&str], during: impl FnOnce(&Fx, u32)) -> Output {
+    parked_apply_launched(fx, point, extra, false, during)
+}
+
+/// As [`parked_apply_pid`]. With `ignore_int`, a shell sets SIGINT to ignored and then execs the
+/// binary, as `nohup` or a background job does.
+fn parked_apply_launched(
+    fx: &Fx,
+    point: &str,
+    extra: &[&str],
+    ignore_int: bool,
+    during: impl FnOnce(&Fx, u32),
+) -> Output {
     let gate = fx.home.path().parent().unwrap().join(format!(
         "gate-{}-{:?}",
         std::process::id(),
@@ -881,7 +898,14 @@ fn parked_apply_with(fx: &Fx, point: &str, extra: &[&str], during: impl FnOnce(&
     let _ = fs::remove_file(&gate);
     let _ = fs::remove_file(gate.with_extension("reached"));
     let digest = fx.digest();
-    let child = Command::new(BIN)
+    let mut launch = if ignore_int {
+        let mut c = Command::new("/bin/sh");
+        c.args(["-c", "trap '' INT; exec \"$0\" \"$@\"", BIN]);
+        c
+    } else {
+        Command::new(BIN)
+    };
+    let child = launch
         .env_clear()
         .env("DFM_FAILPOINT", format!("{point}:wait-{}", gate.display()))
         .arg("--home")
@@ -901,7 +925,7 @@ fn parked_apply_with(fx: &Fx, point: &str, extra: &[&str], during: impl FnOnce(&
         );
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
-    during(fx);
+    during(fx, child.id());
     fs::write(&gate, "").unwrap();
     let out = child.wait_with_output().unwrap();
     let _ = fs::remove_file(&gate);
@@ -1826,4 +1850,250 @@ fn an_adopted_link_replaced_by_a_file_with_the_link_text_as_bytes_is_not_removed
         zsh.to_str().unwrap().as_bytes()
     );
     assert!(fx.owned_paths().contains(&".zshrc".to_string()));
+}
+
+// ---- signals (DFM-47) -------------------------------------------------------------------
+
+/// Sends `signal` (`-INT` or `-TERM`) to `pid`. The test crate has no `unsafe`, so it uses kill(1).
+fn send(signal: &str, pid: u32) {
+    let st = Command::new("/bin/kill")
+        .args([signal, &pid.to_string()])
+        .status()
+        .unwrap();
+    assert!(st.success(), "kill {signal} {pid} failed");
+}
+
+/// Parks `apply` before the effect of its first operation, signals it (twice when `twice`), and
+/// checks everything the contract promises: the parked operation finished, the rest did not
+/// start, the receipt and the exit code name the signal.
+fn signal_during_apply(signal: &str, twice: bool, exit: i32, name: &str) {
+    let fx = Fx::new();
+    fx.without_zsh();
+    // Every parent exists, so the first operation is the creation of the git link.
+    fs::create_dir_all(fx.h(".config/git")).unwrap();
+    fs::create_dir_all(fx.h(".config/tmux")).unwrap();
+    fs::create_dir_all(fx.h(".ssh")).unwrap();
+    let o = parked_apply_pid(&fx, "apply-before-effect", &[], |_, pid| {
+        send(signal, pid);
+        if twice {
+            send(signal, pid);
+        }
+    });
+    let out = text(&o.stdout);
+    assert_eq!(code(&o), exit, "{}\n{out}", stderr(&o));
+    // Not killed by the signal: the process chose its exit.
+    assert_eq!(
+        std::os::unix::process::ExitStatusExt::signal(&o.status),
+        None
+    );
+    assert!(out.contains("updated core.git@.config/git/config"), "{out}");
+    assert!(
+        out.contains("counts: updated=1 current=0 failed=0 blocked=0 unknown=0 not_started=2"),
+        "{out}"
+    );
+    assert!(out.contains(&format!("result: {name}")), "{out}");
+    assert!(is_link_to(
+        &fx.h(".config/git/config"),
+        &fx.root.join("base/modules/core/files/gitconfig")
+    ));
+    assert!(!fx.h(".config/tmux/tmux.conf").exists() && !fx.h(".ssh/config").exists());
+    // Journal: one intent and its done entry. Nothing for the two operations that did not start.
+    let j = fx.journal();
+    let phases: Vec<_> = j.iter().map(|e| e["phase"].as_str().unwrap()).collect();
+    assert_eq!(phases, ["intent", "done"], "{j:#?}");
+    assert_eq!(fx.owned_paths(), [".config/git/config"]);
+    let rs = fx.receipts();
+    assert_eq!(rs.len(), 1);
+    assert_eq!(rs[0]["result"]["outcome"], name);
+    assert_eq!(rs[0]["result"]["exit_code"], exit);
+    let counts = &rs[0]["result"]["counts"];
+    assert_eq!(
+        (counts["updated"].as_u64(), counts["not_started"].as_u64()),
+        (Some(1), Some(2))
+    );
+}
+
+#[test]
+fn sigint_finishes_the_running_operation_writes_the_receipt_and_exits_130() {
+    signal_during_apply("-INT", false, 130, "interrupted");
+}
+
+#[test]
+fn sigterm_finishes_the_running_operation_writes_the_receipt_and_exits_143() {
+    signal_during_apply("-TERM", false, 143, "terminated");
+}
+
+#[test]
+fn a_second_signal_during_shutdown_changes_nothing() {
+    signal_during_apply("-INT", true, 130, "interrupted");
+}
+
+#[test]
+fn the_first_signal_keeps_its_code_when_another_kind_follows() {
+    let fx = Fx::new();
+    fx.without_zsh();
+    fs::create_dir_all(fx.h(".config/git")).unwrap();
+    fs::create_dir_all(fx.h(".config/tmux")).unwrap();
+    fs::create_dir_all(fx.h(".ssh")).unwrap();
+    let o = parked_apply_pid(&fx, "apply-before-effect", &[], |_, pid| {
+        send("-TERM", pid);
+        send("-INT", pid);
+    });
+    assert_eq!(code(&o), 143, "{}\n{}", stderr(&o), text(&o.stdout));
+    assert_eq!(fx.receipts()[0]["result"]["outcome"], "terminated");
+}
+
+/// A fixture whose three operations are all creations in existing parents.
+fn signal_fixture() -> Fx {
+    let fx = Fx::new();
+    fx.without_zsh();
+    for d in [".config/git", ".config/tmux", ".ssh"] {
+        fs::create_dir_all(fx.h(d)).unwrap();
+    }
+    fx
+}
+
+fn journal_phases(fx: &Fx) -> Vec<String> {
+    fs::read_to_string(fx.state().join("journal.jsonl"))
+        .unwrap_or_default()
+        .lines()
+        .map(|l| {
+            let v: serde_json::Value = serde_json::from_str(l).unwrap();
+            v["phase"].as_str().unwrap().to_string()
+        })
+        .collect()
+}
+
+#[test]
+fn a_signal_before_the_first_check_changes_nothing_writes_no_receipt_and_exits_130() {
+    let fx = signal_fixture();
+    let o = parked_apply_pid(&fx, "apply-after-install", &[], |_, pid| send("-INT", pid));
+    let out = text(&o.stdout);
+    assert_eq!(code(&o), 130, "{}\n{out}", stderr(&o));
+    assert!(out.contains("result: interrupted"), "{out}");
+    assert!(
+        out.contains("counts: updated=0 current=0 failed=0 blocked=0 unknown=0 not_started=3"),
+        "{out}"
+    );
+    assert!(journal_phases(&fx).is_empty());
+    assert!(fx.receipts().is_empty());
+    assert!(fx.owned_paths().is_empty());
+    assert!(!fx.h(".config/git/config").exists());
+}
+
+#[test]
+fn a_signal_during_a_removal_lets_it_finish_and_leaves_the_other_removal_alone() {
+    let fx = Fx::new();
+    assert_eq!(code(&fx.apply(&[])), 0);
+    fx.set_profile("");
+    let removals: Vec<String> = fx
+        .saved()
+        .plan
+        .operations
+        .iter()
+        .filter(|o| o.id.starts_with("remove@"))
+        .map(|o| o.id.clone())
+        .collect();
+    assert_eq!(removals.len(), 2, "{removals:?}");
+    let mut extra = Vec::new();
+    for r in &removals {
+        extra.push("--allow-disruptive");
+        extra.push(r.as_str());
+    }
+    let before = fx.journal().len();
+    let o = parked_apply_pid(&fx, "apply-before-unlink", &extra, |_, pid| {
+        send("-TERM", pid)
+    });
+    let out = text(&o.stdout);
+    assert_eq!(code(&o), 143, "{}\n{out}", stderr(&o));
+    assert!(out.contains("result: terminated"), "{out}");
+    // Exactly one removal ran: its intent and done entries, and one ledger entry is gone.
+    assert_eq!(journal_phases(&fx).len() - before, 2, "{:#?}", fx.journal());
+    assert_eq!(fx.owned_paths().len(), 3);
+    let receipts = fx.receipts();
+    let counts = &receipts.last().unwrap()["result"]["counts"];
+    assert_eq!(counts["updated"], 1);
+    assert_eq!(counts["not_started"], 1);
+}
+
+#[test]
+fn a_signal_after_an_earlier_failure_still_exits_130_and_the_receipt_lists_the_failure() {
+    let fx = signal_fixture();
+    let o = parked_apply_pid(&fx, "apply-before-effect", &[], |fx, pid| {
+        fs::write(fx.h(".config/git/config"), "foreign\n").unwrap();
+        send("-INT", pid);
+    });
+    let out = text(&o.stdout);
+    assert_eq!(code(&o), 130, "{}\n{out}", stderr(&o));
+    assert!(out.contains("failed core.git@.config/git/config"), "{out}");
+    assert!(out.contains("result: interrupted"), "{out}");
+    let rs = fx.receipts();
+    assert_eq!(rs[0]["result"]["outcome"], "interrupted");
+    assert_eq!(rs[0]["result"]["counts"]["failed"], 1);
+    assert_eq!(rs[0]["result"]["counts"]["not_started"], 2);
+}
+
+#[test]
+fn a_signal_during_the_receipt_write_still_decides_the_exit() {
+    for point in [
+        "receipt-before-write",
+        "receipt-after-tmp",
+        "receipt-after-rename",
+    ] {
+        let fx = signal_fixture();
+        let o = parked_apply_pid(&fx, point, &[], |_, pid| send("-INT", pid));
+        let out = text(&o.stdout);
+        assert_eq!(code(&o), 130, "{point}: {}\n{out}", stderr(&o));
+        assert!(out.contains("result: interrupted"), "{point}: {out}");
+        assert!(
+            out.contains("signal: E_INTERRUPTED arrived after"),
+            "{point}: {out}"
+        );
+        // The receipt was written before the signal could be added to it, and says so.
+        assert_eq!(fx.receipts()[0]["result"]["outcome"], "ok", "{point}");
+    }
+}
+
+#[test]
+fn a_signal_wins_the_exit_when_the_receipt_cannot_be_written() {
+    let fx = signal_fixture();
+    let receipts = fx.state().join("receipts");
+    let o = parked_apply_pid(&fx, "apply-before-effect", &[], |_, pid| {
+        fs::set_permissions(&receipts, fs::Permissions::from_mode(0o500)).unwrap();
+        send("-INT", pid);
+    });
+    fs::set_permissions(&receipts, fs::Permissions::from_mode(0o700)).unwrap();
+    let out = text(&o.stdout);
+    assert_eq!(code(&o), 130, "{}\n{out}", stderr(&o));
+    assert!(out.contains("receipt: not written"), "{out}");
+    assert!(out.contains("result: interrupted"), "{out}");
+    assert!(fx.receipts().is_empty());
+}
+
+#[test]
+fn a_signal_the_parent_ignored_stays_ignored_and_the_run_completes() {
+    let fx = signal_fixture();
+    let o = parked_apply_launched(&fx, "apply-before-effect", &[], true, |_, pid| {
+        send("-INT", pid)
+    });
+    let out = text(&o.stdout);
+    assert_eq!(code(&o), 0, "{}\n{out}", stderr(&o));
+    assert!(out.contains("result: ok"), "{out}");
+    assert_eq!(fx.receipts()[0]["result"]["outcome"], "ok");
+    assert_eq!(fx.owned_paths().len(), 3);
+}
+
+#[test]
+fn a_signal_before_a_pre_run_check_fails_still_decides_the_exit() {
+    // The journal grows past its limit after the install, so a pre-run check in apply() fails.
+    let fx = signal_fixture();
+    let journal = fx.state().join("journal.jsonl");
+    let o = parked_apply_pid(&fx, "apply-after-install", &[], |_, pid| {
+        let mut f = fs::OpenOptions::new().append(true).open(&journal).unwrap();
+        std::io::Write::write_all(&mut f, &vec![b' '; 9 << 20]).unwrap();
+        send("-TERM", pid);
+    });
+    let out = text(&o.stdout);
+    assert_eq!(code(&o), 143, "{}\n{out}", stderr(&o));
+    assert!(out.contains("result: terminated"), "{out}");
 }

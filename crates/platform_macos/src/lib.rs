@@ -1,5 +1,7 @@
 //! macOS platform provider: the only crate that names macOS paths and tools.
 
+#![forbid(unsafe_code)]
+
 use dfm_model::{Code, Refusal};
 use std::path::{Path, PathBuf};
 use std::process::Command;

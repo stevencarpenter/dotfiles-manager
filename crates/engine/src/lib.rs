@@ -3,6 +3,10 @@
 //!
 //! The crate names no OS constant: the caller supplies them in [`Sys`] and the paths in
 //! [`Layout`].
+//!
+//! `unsafe` is denied here. The one module that needs it is `signal`, which allows it for itself.
+
+#![deny(unsafe_code)]
 
 pub mod apply;
 pub mod fail;
@@ -10,6 +14,7 @@ pub mod fsys;
 pub mod generate;
 pub mod observe;
 pub mod publish;
+pub mod signal;
 pub mod store;
 
 pub use apply::{

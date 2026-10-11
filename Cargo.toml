@@ -19,9 +19,14 @@ serde_json = "=1.0.149"
 # Safe descriptor-relative file operations (openat, mkdirat, renameat, linkat, fstatat). Only the
 # fs and std features: no process, net or unsafe-bearing extras. Released 2026-09-16.
 rustix = { version = "=1.1.5", default-features = false, features = ["std", "fs"] }
+# SIGINT and SIGTERM handlers (sigaction), used only by crates/engine/src/signal.rs. Already in the
+# lock file as rustix's dependency, so no new package. No default features (no std wrapper needed).
+libc = { version = "=0.2.190", default-features = false }
 
 [workspace.lints.rust]
-unsafe_code = "forbid"
+# Not "forbid": forbid cannot be relaxed, and crates/engine/src/signal.rs must. Every other crate
+# root says #![forbid(unsafe_code)] itself and a gate test checks it (docs/architecture.md section 14).
+unsafe_code = "deny"
 
 [workspace.lints.clippy]
 all = "warn"

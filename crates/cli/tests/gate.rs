@@ -190,7 +190,11 @@ fn the_direct_dependencies_of_every_member_match_the_allow_list_exactly() {
         ),
         (
             "dfm-engine",
-            vec!["normal:dfm-model:*", "normal:rustix:=1.1.5"],
+            vec![
+                "normal:dfm-model:*",
+                "normal:libc:=0.2.190",
+                "normal:rustix:=1.1.5",
+            ],
         ),
         ("dfm-platform-macos", vec!["normal:dfm-model:*"]),
         (
@@ -241,6 +245,169 @@ fn the_direct_dependencies_of_every_member_match_the_allow_list_exactly() {
             "{name} depends on dfm-cli"
         );
     }
+}
+
+/// libc is used by one module only (the signal handler). It is already in the lock file as
+/// rustix's dependency. The engine asks for no default features.
+#[test]
+fn libc_is_one_exact_version_with_no_default_features_and_one_resolved_package() {
+    let m = metadata();
+    let ids = m["packages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|p| p["name"] == "libc")
+        .count();
+    assert_eq!(ids, 1, "exactly one libc version");
+    let engine = m["packages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["name"] == "dfm-engine")
+        .unwrap();
+    let dep = engine["dependencies"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|d| d["name"] == "libc")
+        .unwrap();
+    assert_eq!(dep["uses_default_features"], false);
+    assert!(dep["features"].as_array().unwrap().is_empty());
+}
+
+/// The source of a file without `//` comments and without the text inside string literals (a
+/// crude scan, a guard rail: the compiler lint is the enforcement). The keyword is built in the
+/// tests, so this file does not contain it itself.
+fn code_only(text: &str) -> String {
+    let (mut out, mut in_str, mut chars) = (String::new(), false, text.chars().peekable());
+    while let Some(c) = chars.next() {
+        match (in_str, c) {
+            (true, '\\') => {
+                chars.next();
+            }
+            (true, '"') => in_str = false,
+            (true, _) => {}
+            (false, '"') => in_str = true,
+            (false, '/') if chars.peek() == Some(&'/') => {
+                for d in chars.by_ref() {
+                    if d == '\n' {
+                        out.push('\n');
+                        break;
+                    }
+                }
+            }
+            (false, _) => out.push(c),
+        }
+    }
+    out
+}
+
+fn has_keyword(code: &str, word: &str) -> bool {
+    code.match_indices(word).any(|(i, _)| {
+        let before = code[..i].chars().next_back();
+        let after = code[i + word.len()..].chars().next();
+        let ident = |c: char| c.is_alphanumeric() || c == '_';
+        !before.is_some_and(ident) && !after.is_some_and(ident)
+    })
+}
+
+/// DFM-47: the lint attribute layer. Text that names the lint may appear only in the crate roots
+/// and in the signal module, and the exception is one `expect` on `install`. This reads raw
+/// text, so a comment, a raw string or a character literal cannot hide an attribute.
+#[test]
+fn the_unsafe_lint_is_named_only_in_the_crate_roots_and_on_the_signal_install_function() {
+    let lint = ["un", "safe_code"].concat();
+    let roots = [
+        "crates/model/src/lib.rs",
+        "crates/platform_macos/src/lib.rs",
+        "crates/cli/src/lib.rs",
+        "crates/cli/src/main.rs",
+    ];
+    let mut files = Vec::new();
+    rs_files(&repo_root().join("crates"), &mut files);
+    for f in &files {
+        let rel = f.strip_prefix(repo_root()).unwrap().display().to_string();
+        let t = fs::read_to_string(f).unwrap();
+        let named = t.contains(&lint);
+        let allowed = roots.contains(&rel.as_str())
+            || rel == "crates/engine/src/lib.rs"
+            || rel == "crates/engine/src/signal.rs";
+        assert!(!named || allowed, "{rel} names {lint}");
+    }
+    let forbid = format!("#![forbid({lint})]");
+    for root in roots {
+        let t = fs::read_to_string(repo_root().join(root)).unwrap();
+        assert_eq!(t.matches(&lint).count(), 1, "{root}");
+        assert!(t.contains(&forbid), "{root} lacks {forbid}");
+    }
+    let engine = fs::read_to_string(repo_root().join("crates/engine/src/lib.rs")).unwrap();
+    assert_eq!(engine.matches(&lint).count(), 1);
+    assert!(engine.contains(&format!("#![deny({lint})]")));
+    // The signal module: one `expect`, directly on `pub fn install`, and no `allow`.
+    let module = fs::read_to_string(repo_root().join("crates/engine/src/signal.rs")).unwrap();
+    let flat: String = module.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert_eq!(module.matches(&lint).count(), 1, "{module}");
+    assert!(
+        flat.contains(&format!("#[expect( {lint}, reason = "))
+            || flat.contains(&format!("#[expect({lint}, reason = ")),
+        "signal.rs lacks the expect attribute"
+    );
+    let at = flat.find(&format!("{lint},")).unwrap();
+    let after = &flat[at..];
+    let end = after.find("pub fn ").unwrap();
+    assert!(
+        after[end..].starts_with("pub fn install()"),
+        "the expect is not on install"
+    );
+    assert!(
+        !after[..end].contains("fn "),
+        "the expect is not on install"
+    );
+    let manifest = fs::read_to_string(repo_root().join("Cargo.toml")).unwrap();
+    assert!(manifest.contains(&format!("{lint} = \"deny\"")));
+}
+
+/// DFM-47: the keyword layer, a second check behind the lint layer. Comments and string literals
+/// are stripped by a crude scan.
+#[test]
+fn the_unsafe_keyword_appears_only_in_the_engine_signal_module() {
+    let word = ["un", "safe"].concat();
+    let mut files = Vec::new();
+    rs_files(&repo_root().join("crates"), &mut files);
+    let mut seen = Vec::new();
+    for f in &files {
+        if has_keyword(&code_only(&fs::read_to_string(f).unwrap()), &word) {
+            seen.push(f.strip_prefix(repo_root()).unwrap().display().to_string());
+        }
+    }
+    assert_eq!(seen, ["crates/engine/src/signal.rs"], "{seen:?}");
+    // Every block carries its safety argument.
+    let module = fs::read_to_string(repo_root().join("crates/engine/src/signal.rs")).unwrap();
+    let blocks = module.matches(&format!("{word} {{")).count();
+    assert!(blocks > 0 && module.matches("// SAFETY:").count() >= blocks);
+}
+
+/// DFM-47 C03: only the mutating path of `apply` installs the handlers. The call is in one place
+/// and it comes after the preview return, the lock and no earlier.
+#[test]
+fn only_the_mutating_path_of_apply_installs_the_signal_handlers() {
+    let mut files = Vec::new();
+    rs_files(&repo_root().join("crates"), &mut files);
+    let callers: Vec<_> = files
+        .iter()
+        .filter(|f| !f.ends_with("crates/engine/src/signal.rs") && !f.ends_with("tests/gate.rs"))
+        .filter(|f| fs::read_to_string(f).unwrap().contains("signal::install("))
+        .map(|f| f.strip_prefix(repo_root()).unwrap().display().to_string())
+        .collect();
+    assert_eq!(callers, ["crates/cli/src/apply_cmd.rs"]);
+    let t = fs::read_to_string(repo_root().join("crates/cli/src/apply_cmd.rs")).unwrap();
+    let install = t.find("signal::install(").unwrap();
+    assert_eq!(t.matches("signal::install(").count(), 1);
+    assert!(t.find("if args.preview {").unwrap() < install);
+    assert!(t.find("Store::open_write_with(").unwrap() < install);
+    // After the second plan (which runs `id -u`), so no child process starts after the install.
+    assert!(t.find("let locked = plan_for(").unwrap() < install);
+    assert!(install < t.find("apply(&run, &locked)").unwrap());
 }
 
 /// rustix is the one crate allowed to reach the OS, through its safe fs API only. Its resolved

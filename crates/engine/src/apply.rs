@@ -1597,10 +1597,15 @@ fn execute(run: &Run<'_>, plan: &Plan) -> Report {
         clock: Cell::new(*clock.as_ref().unwrap_or(&0)),
     };
     // A failure to settle earlier work stops the run before its first operation.
-    let mut stopped: Option<Refusal> = clock.err().or_else(|| settle(&mut ex).err());
+    // A signal that came before settling wins, and settling (a journal write) is skipped.
+    let mut stopped: Option<Refusal> = crate::signal::requested()
+        .or(clock.err())
+        .or_else(|| settle(&mut ex).err());
     let mut results: BTreeMap<&str, Status> = BTreeMap::new();
     let mut records = Vec::new();
     for op in &plan.operations {
+        // A signal stops new work before the next intent entry. The operation in flight is done.
+        stopped = stopped.or_else(crate::signal::requested);
         let (status, rec) = match op.status {
             PlanStatus::NotInScope => (
                 Status::NotInScope,
@@ -1677,8 +1682,9 @@ fn execute(run: &Run<'_>, plan: &Plan) -> Report {
         results.insert(&op.id, status);
         records.push(rec);
     }
+    // A signal after the last operation, or after a failure, still decides the exit (section 10).
     Report {
         operations: records,
-        stopped,
+        stopped: crate::signal::requested().or(stopped),
     }
 }
