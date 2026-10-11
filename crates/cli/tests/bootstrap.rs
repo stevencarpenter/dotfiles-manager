@@ -886,8 +886,8 @@ fn upgrade_retries_after_a_stale_current_new_and_rolls_back() {
     let (data, first) = (&p.data, p.sha.clone());
     assert_eq!(install(&p, &first, &[]).status.code(), Some(0));
     let second = next_commit(&p, "second");
-    // A leftover from an interrupted earlier run: a directory named current.new.
-    fs::create_dir_all(data.join("current.new/inner")).unwrap();
+    // A leftover from an interrupted earlier run: a dangling symlink named current.new.
+    std::os::unix::fs::symlink("versions/gone", data.join("current.new")).unwrap();
     let o = install(&p, &second, &[]);
     assert_eq!(
         o.status.code(),
@@ -1372,6 +1372,19 @@ fn an_existing_current_that_is_not_a_symlink_is_refused() {
 }
 
 #[test]
+fn an_existing_current_new_that_is_not_a_symlink_is_refused() {
+    let (_tmp, home, src, sha) = refusal_setup("current-new-dir");
+    let leaf = home.join(".local/share/dotfiles-manager/current.new");
+    fs::create_dir_all(&leaf).unwrap();
+    fs::write(leaf.join("mine"), "x").unwrap();
+    let o = install_tiny(&home, &src, &sha);
+    assert_eq!(o.status.code(), Some(3), "{}", err(&o));
+    assert!(err(&o).contains("current.new"), "{}", err(&o));
+    assert_eq!(fs::read_to_string(leaf.join("mine")).unwrap(), "x");
+    assert!(!home.join(".cache").exists());
+}
+
+#[test]
 fn a_foreign_file_at_the_command_path_is_never_replaced() {
     let tmp = TempDir::new("foreign");
     let home = tmp.path().join("home");
@@ -1421,6 +1434,59 @@ fn uninstall_removes_only_what_the_manager_created() {
         Path::new("/usr/bin/true"),
         "a link that is not ours must stay"
     );
+}
+
+/// Sets up a data tree whose `leaf` is a directory holding a victim file, then uninstalls.
+fn uninstall_with_directory_at(leaf: &str) {
+    let tmp = TempDir::new("uninstall-leaf");
+    let home = tmp.path().join("home");
+    let data = home.join(".local/share/dotfiles-manager");
+    fs::create_dir_all(data.join("versions/v1")).unwrap();
+    fs::create_dir_all(data.join(leaf)).unwrap();
+    fs::write(data.join(leaf).join("victim"), "keep").unwrap();
+    let o = script_test_mode(&home, &["uninstall"], &[]);
+    assert_eq!(o.status.code(), Some(3), "{}", err(&o));
+    assert!(
+        err(&o).contains("E_PREREQ_MISSING") && err(&o).contains(leaf),
+        "{}",
+        err(&o)
+    );
+    assert_eq!(
+        fs::read_to_string(data.join(leaf).join("victim")).unwrap(),
+        "keep"
+    );
+    assert!(
+        data.join("versions/v1").is_dir(),
+        "nothing may be removed before the refusal"
+    );
+}
+
+#[test]
+fn uninstall_refuses_a_directory_at_current() {
+    uninstall_with_directory_at("current");
+}
+
+#[test]
+fn uninstall_refuses_a_directory_at_current_new() {
+    uninstall_with_directory_at("current.new");
+}
+
+#[test]
+fn uninstall_removes_symlinked_current_and_current_new_without_following() {
+    let tmp = TempDir::new("uninstall-links");
+    let home = tmp.path().join("home");
+    let data = home.join(".local/share/dotfiles-manager");
+    let outside = tmp.path().join("outside");
+    fs::create_dir_all(data.join("versions/v1")).unwrap();
+    fs::create_dir_all(&outside).unwrap();
+    fs::write(outside.join("victim"), "keep").unwrap();
+    std::os::unix::fs::symlink(&outside, data.join("current")).unwrap();
+    std::os::unix::fs::symlink("versions/gone", data.join("current.new")).unwrap();
+    let o = script_test_mode(&home, &["uninstall"], &[]);
+    assert_eq!(o.status.code(), Some(0), "{}", err(&o));
+    assert!(fs::symlink_metadata(data.join("current")).is_err());
+    assert!(fs::symlink_metadata(data.join("current.new")).is_err());
+    assert_eq!(fs::read_to_string(outside.join("victim")).unwrap(), "keep");
 }
 
 /// A tiny committed source with a lock the caller writes, for the early pin reading.
