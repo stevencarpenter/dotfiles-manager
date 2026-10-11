@@ -900,6 +900,20 @@ fn conflicting_path_types_and_loose_permissions_are_refused_not_repaired() {
 }
 
 #[test]
+fn a_hard_linked_state_document_is_a_finding() {
+    let h = bound_home("hardlink");
+    let j = state(h.path()).join("journal.jsonl");
+    fs::hard_link(&j, h.path().join("second-name")).unwrap();
+    let c = check(h.path());
+    assert_eq!(c.status.code(), Some(1), "{}", text(&c.stdout));
+    assert!(
+        text(&c.stdout).contains("E_STORAGE_INVALID journal.jsonl"),
+        "{}",
+        text(&c.stdout)
+    );
+}
+
+#[test]
 fn a_legitimate_alias_of_home_is_recognized() {
     // macOS reaches temporary directories through /var, which is a link to /private/var.
     let h = TempDir::new("alias");

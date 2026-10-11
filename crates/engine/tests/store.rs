@@ -483,6 +483,23 @@ fn a_planted_fifo_or_loose_lock_file_cannot_hang_or_be_trusted() {
 }
 
 #[test]
+fn a_lock_file_that_is_a_second_name_for_a_user_file_is_refused_untouched() {
+    let h = Home::new();
+    let parent = h.0.join(".local/state");
+    fs::create_dir_all(&parent).unwrap();
+    fs::set_permissions(&parent, fs::Permissions::from_mode(0o700)).unwrap();
+    let other = h.0.join("precious");
+    fs::write(&other, "keep me").unwrap();
+    fs::set_permissions(&other, fs::Permissions::from_mode(0o600)).unwrap();
+    fs::hard_link(&other, parent.join("dotfiles-manager.lock")).unwrap();
+    assert_eq!(
+        code(Store::open_write(sys(&h), &h.layout(), Fail::none())),
+        Code::StorageInvalid
+    );
+    assert_eq!(fs::read_to_string(&other).unwrap(), "keep me");
+}
+
+#[test]
 fn the_directory_chain_is_checked_again_just_before_each_write() {
     let h = Home::new();
     let (s, stamp) = init(&h);

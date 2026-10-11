@@ -460,7 +460,6 @@ fn a_profile_for_another_architecture_is_refused_except_by_explain() {
     let p = root.join("profiles/personal-dev-01.toml");
     let body = fs::read_to_string(&p).unwrap();
     assert!(body.contains("architecture = \"arm64\""));
-    fs::write(&p, body.replace("\"arm64\"", "\"x86_64\"")).unwrap();
     let bind = run(
         home.path(),
         &[
@@ -472,6 +471,8 @@ fn a_profile_for_another_architecture_is_refused_except_by_explain() {
         ],
     );
     assert_eq!(bind.status.code(), Some(0), "{}", text(&bind.stderr));
+    // The profile changes after the bind: bind itself refuses a profile for another machine.
+    fs::write(&p, body.replace("\"arm64\"", "\"x86_64\"")).unwrap();
     let r = root.to_str().unwrap();
     for cmd in ["plan", "apply", "doctor"] {
         let o = run(home.path(), &[cmd, "--root", r]);
@@ -492,5 +493,31 @@ fn a_profile_for_another_architecture_is_refused_except_by_explain() {
     assert!(
         out.contains("note: E_PLATFORM_MISMATCH the profile targets macos/x86_64"),
         "{out}"
+    );
+}
+
+#[test]
+fn bind_refuses_a_profile_for_another_architecture_and_writes_nothing() {
+    let home = TempDir::new("home");
+    let (_t, root) = examples_copy();
+    let p = root.join("profiles/personal-dev-01.toml");
+    let body = fs::read_to_string(&p).unwrap();
+    fs::write(&p, body.replace("\"arm64\"", "\"x86_64\"")).unwrap();
+    let o = run(
+        home.path(),
+        &[
+            "bind",
+            "--profile",
+            p.to_str().unwrap(),
+            "--machine-id",
+            "m5-personal",
+        ],
+    );
+    assert_eq!(o.status.code(), Some(3), "{}", text(&o.stderr));
+    let err = text(&o.stderr);
+    assert!(err.contains("E_PLATFORM_MISMATCH"), "{err}");
+    assert!(
+        fs::read_dir(home.path()).unwrap().next().is_none(),
+        "bind wrote under HOME"
     );
 }
