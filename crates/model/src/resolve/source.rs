@@ -16,6 +16,8 @@ pub struct SourceSet {
     /// Lowercased path to the spellings that fold to it. A case-insensitive filesystem resolves
     /// `Files/Link` and `files/link` to one entry, so lookups go through this index.
     folded: BTreeMap<String, Vec<String>>,
+    /// The bundle's `[sources]` declaration when the loader read only part of the root.
+    scope: Option<SourceScope>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -33,6 +35,8 @@ pub(crate) enum LocateFault {
     Loop,
     /// Two entries differ only by case, so a case-insensitive filesystem cannot tell them apart.
     CaseAlias,
+    /// The loader did not read this path because the bundle's `[sources]` leaves it out.
+    Scope(ScopeFault),
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -43,11 +47,22 @@ pub(crate) enum Located<'a> {
 
 const MAX_HOPS: usize = 40;
 
+use super::scope::{ScopeFault, SourceScope};
 use crate::fold::fold;
 
 impl SourceSet {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Records that only the parts of the root named by `scope` were loaded. Path lookups then
+    /// refuse a path outside them as an escape instead of reporting it missing.
+    pub fn set_scope(&mut self, scope: Option<SourceScope>) {
+        self.scope = scope;
+    }
+
+    pub fn scope(&self) -> Option<&SourceScope> {
+        self.scope.as_ref()
     }
 
     fn insert(&mut self, path: String, entry: Entry) {
@@ -140,6 +155,13 @@ impl SourceSet {
                     continue;
                 }
                 _ => resolved.push(c),
+            }
+            if let Some(f) = self
+                .scope
+                .as_ref()
+                .and_then(|s| s.fault(&resolved.join("/")))
+            {
+                return Err(LocateFault::Scope(f));
             }
             match self.entry_at(&resolved.join("/"))? {
                 Some((_, Entry::Link(target))) => {

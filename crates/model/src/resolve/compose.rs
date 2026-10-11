@@ -10,6 +10,7 @@ use super::docs::{
 use super::error::{ResolveError, category};
 use super::pointer;
 use super::schema::{self, AdapterCatalog, AdapterSpec, Claims, Fault, Found, Include, TargetRule};
+use super::scope::ScopeFault;
 use super::source::{self, LocateFault, Located, PathFault, SourceSet};
 use super::{
     ChangeKind, DirClaim, IncludeEntry, IncludeGroup, Provenance, Resolved, ResolvedResource,
@@ -121,6 +122,18 @@ fn locate_error(from: &str, field: &str, f: LocateFault) -> ResolveError {
             from,
             "symlinks in the path form a loop or are nested too deeply",
             "remove the link loop",
+        ),
+        LocateFault::Scope(ScopeFault::Excluded { pattern, path }) => ResolveError::new(
+            Code::SourceEscape,
+            from,
+            format!("`{path}` is excluded from the loaded sources by `{pattern}`"),
+            format!("point the source outside `{pattern}`, or narrow `[sources].exclude` in the bundle"),
+        ),
+        LocateFault::Scope(ScopeFault::Outside { roots, path }) => ResolveError::new(
+            Code::SourceEscape,
+            from,
+            format!("`{path}` is outside the declared source roots ({roots})"),
+            format!("point the source into a declared root ({roots}), or add a root that holds it to `[sources].roots` in the bundle"),
         ),
         LocateFault::CaseAlias => ResolveError::new(
             Code::SourceEscape,
@@ -257,6 +270,15 @@ fn bundle_chain(l: &Loaded, profile: &ProfileDoc) -> Result<Vec<BundleDoc>, Reso
             )
             .field("/id")
             .conflicts_with(prev.file.clone()));
+        }
+        if !chain.is_empty() && b.sources.is_some() {
+            return Err(ResolveError::new(
+                Code::ManifestInvalid,
+                &path,
+                "an extended bundle declares `[sources]`; only the bundle the profile names may",
+                "move `[sources]` to the bundle the profile names",
+            )
+            .field("/sources"));
         }
         let next = b.extends.clone();
         chain.push(b);

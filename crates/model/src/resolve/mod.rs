@@ -6,11 +6,13 @@ mod error;
 mod explain;
 mod pointer;
 mod schema;
+mod scope;
 mod source;
 
 pub use error::ResolveError;
 pub use explain::explain;
 pub use schema::{AdapterCatalog, AdapterSpec, Claims, Field, Include, Schema, TargetRule};
+pub use scope::{SourceScope, bundle_scope, profile_bundle_path};
 pub use source::{Entry, SourceSet};
 mod compose;
 pub(crate) use compose::glob;

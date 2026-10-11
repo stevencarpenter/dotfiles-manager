@@ -61,6 +61,7 @@ pub(crate) struct BundleDoc {
     pub core: Option<String>,
     pub extends: Option<String>,
     pub modules: BTreeMap<String, String>,
+    pub sources: Option<super::scope::SourceScope>,
 }
 
 #[derive(Clone, Debug)]
@@ -456,7 +457,7 @@ pub(crate) fn bundle(file: &str, bytes: &[u8]) -> Result<BundleDoc, ResolveError
     only_keys(
         file,
         &t,
-        &["schema", "id", "core", "extends", "modules"],
+        &["schema", "id", "core", "extends", "modules", "sources"],
         "",
     )?;
     let id = string(file, &t, "id", "")?;
@@ -517,12 +518,17 @@ pub(crate) fn bundle(file: &str, bytes: &[u8]) -> Result<BundleDoc, ResolveError
         )
         .field(pointer::join("/modules", k)));
     }
+    let sources = t
+        .get("sources")
+        .map(|v| super::scope::SourceScope::parse(file, v))
+        .transpose()?;
     Ok(BundleDoc {
         file: file.into(),
         id,
         core,
         extends,
         modules,
+        sources,
     })
 }
 

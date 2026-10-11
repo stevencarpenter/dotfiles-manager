@@ -19,7 +19,7 @@ use dfm_model::resolve::resolve;
 use dfm_model::state::Stamp;
 use dfm_model::{Code, Exit, Refusal};
 use dfm_platform_macos::{Platform, check_supported, current_platform};
-use source_fs::load_source_set;
+use source_fs::load_scoped;
 use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -388,7 +388,7 @@ fn load_resolved(ctx: &Ctx, root: &Path) -> Result<Loaded, Refusal> {
                 "the bound profile is not inside --root; point --root at the trusted source tree that contains it",
             )
         })?;
-    let sources = load_source_set(&root)?;
+    let sources = load_scoped(&root, rel)?;
     let resolved = resolve(&sources, rel, &builtin_catalog())?;
     Ok(Loaded {
         binding,
