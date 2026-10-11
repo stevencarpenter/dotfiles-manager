@@ -446,13 +446,21 @@ ensure_clt() {
   fi
 }
 
+# `current` and `current.new` are only ever symlinks that the installer creates. Each leaf is tested
+# without following links: absent or a symlink passes, anything else (directory, file, FIFO) is
+# refused, so no recursive removal ever runs on a name the installer does not own.
+check_current_leaves() {
+  for _l in "$DATA/current" "$DATA/current.new"; do
+    if [ ! -L "$_l" ] && [ -e "$_l" ]; then
+      refuse E_PREREQ_MISSING "$_l exists and is not a symlink; move it away first"
+    fi
+  done
+}
+
 # The command path may only be replaced when it is absent or already ours, and `current`
 # may only be replaced when it is absent or a symlink. Checked early and again before the swap.
 check_command_path() {
-  cur=$DATA/current
-  if { [ -e "$cur" ] || [ -L "$cur" ]; } && [ ! -L "$cur" ]; then
-    refuse E_PREREQ_MISSING "$cur exists and is not a symlink; move it away first"
-  fi
+  check_current_leaves
   link=$HOME_DIR/.local/bin/dotfiles-manager
   if [ -L "$link" ]; then
     [ "$(readlink "$link")" = "$DATA/current/dotfiles-manager" ] ||
@@ -628,8 +636,8 @@ cmd_install() {
   # The command link is the only step in a directory the manager does not own, so it comes before
   # the flip. After the flip only the read-back and the cleanup remain.
   ensure_command_link
-  # A stale current.new (even a directory) is removed first, so ln cannot create the link inside it.
-  rm -rf "$DATA/current.new"; ln -sfn "versions/$name" "$DATA/current.new"; mv -fh "$DATA/current.new" "$DATA/current"
+  # check_command_path proved current.new is absent or a symlink; a stale link is removed first.
+  rm -f "$DATA/current.new"; ln -sfn "versions/$name" "$DATA/current.new"; mv -fh "$DATA/current.new" "$DATA/current"
   if test_mode && [ -n "${DFM_TEST_AFTER_SWAP:-}" ]; then /bin/sh "$DFM_TEST_AFTER_SWAP"; fi
   # Read both links back: a swap that did not take effect must not be reported as done.
   got_current=$(readlink "$DATA/current") || got_current=
@@ -650,11 +658,12 @@ cmd_install() {
 # root are never touched.
 cmd_uninstall() {
   resolve_home
-  check_cache_tree; check_data_tree
+  check_cache_tree; check_data_tree; check_current_leaves
   link=$HOME_DIR/.local/bin/dotfiles-manager
   if [ -L "$link" ] && [ "$(readlink "$link")" = "$DATA/current/dotfiles-manager" ]; then rm -f "$link"; fi
   build=$CACHE/build; rm_build
-  rm -rf "${DATA:?}/versions" "$DATA/current" "$DATA/current.new" "$DATA/cargo-home" "$DATA/rustup-home" "$DATA/build-home"
+  rm -f "$DATA/current" "$DATA/current.new"
+  rm -rf "${DATA:?}/versions" "$DATA/cargo-home" "$DATA/rustup-home" "$DATA/build-home"
   rmdir "$CACHE" "$DATA" "$HOME_DIR/.local/bin" 2>/dev/null || true
   printf 'removed the installed manager; toolchains, state and binding were left in place\n'
 }
