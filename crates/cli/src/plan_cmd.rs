@@ -145,11 +145,12 @@ pub fn plan_for(ctx: &Ctx, loaded: &Loaded) -> Result<Plan, Refusal> {
     for rel in claimed.chain(ledger.iter().map(|o| &o.path)) {
         let abs = home.shown().join(rel);
         // An overlap is a reserved path (E_STATE_INVALID from the store). Any other failure
-        // means the path could not be checked, so the plan reports an unknown fact
+        // (a parent link out of HOME is E_PARENT_UNSAFE, and the topology walk reports it with
+        // that code) means the path could not be checked, so the plan reports an unknown fact
         // (E_OBSERVATION_UNKNOWN, exit 3: "a required prerequisite that is UNKNOWN",
         // architecture section 10). The planner reports a link loop or an unreadable parent
         // first, with its own code.
-        if let Err(e) = store.check_claim(&abs.to_string_lossy()) {
+        if let Err(e) = store.check_claim_for_plan(&abs.to_string_lossy()) {
             if e.code == Code::StateInvalid {
                 reserved.insert(rel.clone(), visible(&e.detail));
             } else {

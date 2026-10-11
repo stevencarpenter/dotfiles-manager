@@ -72,7 +72,7 @@ pub(crate) fn inspect(w: Where<'_>, e: &JournalEntry) -> (Probe, Option<Live>) {
     let probe = match (e.op.as_str(), &live.peek) {
         ("remove", Peek::Missing) => Probe::Done,
         ("remove", _) if same => Probe::NotDone,
-        ("create-dir", Peek::Dir { .. }) => Probe::Done,
+        (JournalEntry::CREATE_DIR, Peek::Dir { .. }) => Probe::Done,
         (_, Peek::Missing) => Probe::NotDone,
         ("create-link" | "replace-link" | "create-file" | "update-file" | "adopt", _) if same => {
             Probe::Done

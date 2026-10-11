@@ -63,6 +63,15 @@ pub struct Store {
     lock: Option<Lock>,
 }
 
+/// Filesystem identities of the manager's reserved paths. `inside`: reserved directories (a
+/// claim may not lie in one). `own`: the reserved paths themselves. `exact`: `own` plus the
+/// ancestors that exist today.
+struct ReservedIdents {
+    inside: Vec<crate::fsys::Ident>,
+    exact: Vec<crate::fsys::Ident>,
+    own: Vec<crate::fsys::Ident>,
+}
+
 /// A path the manager owns. A claim may not be, lie inside, or contain it.
 #[derive(Debug)]
 struct Reserved {
@@ -514,7 +523,7 @@ impl Store {
         let entries = self.read_journal_lenient()?;
         for e in &entries {
             for o in e.recovery.iter().flat_map(|r| &r.outputs) {
-                self.check_claim(&o.path)?;
+                self.check_entry_path(e, &o.path)?;
             }
         }
         Ok(entries)
@@ -535,14 +544,14 @@ impl Store {
     /// The manager's reserved directories and files, and their ancestors, by filesystem identity
     /// (device and inode), not by spelling. A case or Unicode alias, a hard path through a
     /// symlink, or any other name for the same directory has the same identity.
-    fn reserved_idents(
-        &self,
-    ) -> Result<(Vec<crate::fsys::Ident>, Vec<crate::fsys::Ident>), Refusal> {
+    fn reserved_idents(&self) -> Result<ReservedIdents, Refusal> {
         let mut inside = Vec::new();
         let mut exact = Vec::new();
+        let mut own = Vec::new();
         for r in &self.reserved {
             if let Some(id) = path_ident(&r.path, true)? {
                 exact.push(id);
+                own.push(id);
                 // A claim may not lie inside a reserved directory. The lock file has no inside.
                 if r.is_dir {
                     inside.push(id);
@@ -562,21 +571,25 @@ impl Store {
                 }
             }
         }
-        Ok((inside, exact))
+        Ok(ReservedIdents { inside, exact, own })
     }
 
     /// Refuses a claim that is, lies inside, or contains a reserved path, judged by identity: a
     /// directory above the leaf (symlinks followed) that is a reserved directory, or a leaf that
     /// is a reserved path or an ancestor of one. A symlink as the leaf is allowed: the link
     /// itself is the claim.
-    fn identity_check(&self, path: &str) -> Result<(), Refusal> {
+    ///
+    /// `new_dir` is a directory the manager creates while it is missing. It may be an ancestor
+    /// of a reserved path, so only the reserved paths themselves count as leaf identities.
+    fn identity_check(&self, path: &str, new_dir: bool) -> Result<(), Refusal> {
         let outside = || {
             Refusal::new(
                 Code::StateInvalid,
                 format!("{path} is, contains or lies inside a path the manager owns"),
             )
         };
-        let (inside, exact) = self.reserved_idents()?;
+        let ReservedIdents { inside, exact, own } = self.reserved_idents()?;
+        let leaf_ids = if new_dir { &own } else { &exact };
         let p = Path::new(path);
         for a in p
             .ancestors()
@@ -587,7 +600,7 @@ impl Store {
                 return Err(outside());
             }
         }
-        if path_ident(p, false)?.is_some_and(|id| exact.contains(&id)) {
+        if path_ident(p, false)?.is_some_and(|id| leaf_ids.contains(&id)) {
             return Err(outside());
         }
         Ok(())
@@ -634,16 +647,55 @@ impl Store {
     /// symlinks in its parent directories are resolved. Whether a path in HOME belongs to the
     /// manager is the adapter's evidence, not a guess.
     pub fn check_claim(&self, path: &str) -> Result<(), Refusal> {
+        self.check_path(path, false)
+    }
+
+    /// Stored paths and writes keep one code for every refusal here, `E_STATE_INVALID`.
+    fn check_path(&self, path: &str, new_dir: bool) -> Result<(), Refusal> {
+        self.resolve_path(path, new_dir).map_err(|e| {
+            if e.code == Code::ParentUnsafe {
+                Refusal::new(
+                    Code::StateInvalid,
+                    format!("{path} is outside HOME or overlaps the manager's own paths"),
+                )
+            } else {
+                e
+            }
+        })
+    }
+
+    /// As [`Store::check_claim`], for the planner: a parent link that leads out of HOME is
+    /// `E_PARENT_UNSAFE`, which is not an overlap with the manager's own paths. Every other
+    /// overlap is `E_STATE_INVALID`.
+    pub fn check_claim_for_plan(&self, path: &str) -> Result<(), Refusal> {
+        self.resolve_path(path, false)
+    }
+
+    /// A path in a journal entry. A directory the plan created while it was missing may lie
+    /// above a reserved path: `~/.local/share` is made before `~/.local/share/<manager>`
+    /// exists. It may not be a reserved path or lie inside one. Any other path is a claim.
+    fn check_entry_path(&self, e: &JournalEntry, path: &str) -> Result<(), Refusal> {
+        self.check_path(path, e.creates_dir())
+    }
+
+    fn resolve_path(&self, path: &str, new_dir: bool) -> Result<(), Refusal> {
+        let admits = |p: &str| {
+            if new_dir {
+                self.scope.admits_new_dir(p)
+            } else {
+                self.scope.admits(p)
+            }
+        };
         let outside = || {
             Refusal::new(
                 Code::StateInvalid,
                 format!("{path} is outside HOME or overlaps the manager's own paths"),
             )
         };
-        if !self.scope.admits(path) {
+        if !admits(path) {
             return Err(outside());
         }
-        self.identity_check(path)?;
+        self.identity_check(path, new_dir)?;
         let p = Path::new(path);
         let (Some(parent), Some(leaf)) = (p.parent(), p.file_name()) else {
             return Err(outside());
@@ -670,7 +722,13 @@ impl Store {
         full.extend(tail.iter().rev());
         full.push(leaf);
         match full.to_str() {
-            Some(s) if self.scope.admits(s) => Ok(()),
+            Some(s) if admits(s) => Ok(()),
+            // A link in a parent leads out of HOME. That is an unsafe parent, not an overlap with
+            // the manager's own paths.
+            Some(_) if !full.starts_with(&self.home) => Err(Refusal::new(
+                Code::ParentUnsafe,
+                format!("a parent directory of {path} leads outside HOME through a link"),
+            )),
             _ => Err(outside()),
         }
     }
@@ -685,7 +743,7 @@ impl Store {
         let mut e = e.clone();
         e.scrub(&self.secret_refs())?;
         for o in e.recovery.iter().flat_map(|r| &r.outputs) {
-            self.check_claim(&o.path)?;
+            self.check_entry_path(&e, &o.path)?;
         }
         self.state()?.append_line(
             &self.sys,

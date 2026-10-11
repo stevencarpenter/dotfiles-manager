@@ -567,9 +567,23 @@ fn s3_a_large_file_reached_by_many_references_is_hashed_once() {
         .collect();
     let mut set = build(&modules, &ids);
     set.insert_file("b/m/files/big", vec![b'x'; 1 << 20]);
+    // The bound scales with this machine's cost of one hash, so a loaded machine does not fail
+    // it. Hashing the file once per reference would take about 9000 times the single hash.
+    let one = {
+        use sha2::Digest;
+        let t = Instant::now();
+        let d = sha2::Sha256::digest(vec![b'x'; 1 << 20]);
+        std::hint::black_box(d);
+        t.elapsed()
+    };
+    let bound = Duration::from_secs(20).max(one * 50);
     let t = Instant::now();
     let r = run(&set).unwrap();
-    assert!(t.elapsed() < Duration::from_secs(6), "{:?}", t.elapsed());
+    assert!(
+        t.elapsed() < bound,
+        "{:?} (bound {bound:?}, one hash {one:?})",
+        t.elapsed()
+    );
     assert_eq!(r.resources.len(), 9000);
 }
 

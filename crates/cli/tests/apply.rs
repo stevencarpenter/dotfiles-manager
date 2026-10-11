@@ -2460,3 +2460,50 @@ fn state_recover_on_a_clean_machine_settles_nothing_and_exits_0() {
     assert_eq!(code(&o), 0, "{}", stderr(&o));
     assert!(text(&o.stdout).contains("nothing to recover"));
 }
+
+#[test]
+fn claims_under_missing_share_config_and_cache_directories_apply_with_private_parents() {
+    let fx = Fx::new();
+    for (m, from, to) in [
+        ("core", ".ssh/config", ".local/share/firstmate/config"),
+        ("extra", ".zshrc", ".cache/firstmate/zshrc"),
+    ] {
+        let f = fx.root.join(format!("base/modules/{m}/module.toml"));
+        let t = fs::read_to_string(&f).unwrap();
+        fx.put(
+            &format!("base/modules/{m}/module.toml"),
+            &t.replacen(from, to, 1),
+        );
+    }
+    for d in [".local/share", ".cache", ".config/git", ".config/tmux"] {
+        assert!(!fx.h(d).exists(), "{d}");
+    }
+    let o = fx.apply(&[]);
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+    for d in [
+        ".local/share",
+        ".local/share/firstmate",
+        ".cache",
+        ".cache/firstmate",
+    ] {
+        let m = fs::metadata(fx.h(d)).unwrap().permissions().mode() & 0o777;
+        assert_eq!(m, 0o700, "{d}");
+    }
+    assert!(is_link_to(
+        &fx.h(".local/share/firstmate/config"),
+        &fx.root.join("base/modules/core/files/ssh_config")
+    ));
+    assert!(is_link_to(
+        &fx.h(".cache/firstmate/zshrc"),
+        &fx.root.join("base/modules/extra/files/zshrc")
+    ));
+    // The created directories are in the journal, which the second run reads again.
+    let again = fx.apply(&[]);
+    assert_eq!(
+        code(&again),
+        0,
+        "{}\n{}",
+        stderr(&again),
+        text(&again.stdout)
+    );
+}

@@ -511,7 +511,7 @@ fn failed(r: Refusal) -> Ended {
 
 fn step_name(op: &Operation) -> &'static str {
     match op.action {
-        Action::CreateDir => "create-dir",
+        Action::CreateDir => JournalEntry::CREATE_DIR,
         Action::CreateLink => "create-link",
         Action::ReplaceLink => "replace-link",
         Action::CreateFile => "create-file",

@@ -2585,3 +2585,56 @@ fn an_exact_link_that_another_resource_owns_is_not_adopted_and_says_why() {
         a.effect
     );
 }
+
+#[test]
+fn claims_under_missing_share_config_and_cache_directories_plan_clean_with_mkdirs() {
+    let e = Env::personal();
+    for d in [".local/share", ".config/firstmate", ".cache"] {
+        assert!(!e.h(d).exists(), "{d}");
+    }
+    retarget(
+        &e,
+        "target = \".ssh/config\"",
+        "target = \".local/share/firstmate/config\"",
+    );
+    let m = e.src("base/modules/core/module.toml");
+    let t = fs::read_to_string(&m).unwrap();
+    fs::write(
+        &m,
+        t.replacen(".config/git/config", ".cache/firstmate/git", 1),
+    )
+    .unwrap();
+    let (o, s) = e.saved();
+    assert_eq!(code(&o), 0, "{}{}", text(&o.stdout), text(&o.stderr));
+    assert!(s.plan.blockers.is_empty(), "{:?}", s.plan.blockers);
+    for d in [
+        ".local/share",
+        ".local/share/firstmate",
+        ".cache",
+        ".cache/firstmate",
+    ] {
+        assert_eq!(
+            op(&s, &format!("mkdir@{d}")).action,
+            Action::CreateDir,
+            "{d}"
+        );
+    }
+}
+
+#[test]
+fn a_link_parent_that_leaves_home_is_a_parent_refusal_not_an_overlap() {
+    let e = Env::personal();
+    let outside = TempDir::new("plan-outside");
+    // `.local/share` exists but is a link out of HOME: it is the first existing prefix.
+    e.mkdirs(".local");
+    symlink(outside.path(), e.h(".local/share")).unwrap();
+    retarget(
+        &e,
+        "target = \".ssh/config\"",
+        "target = \".local/share/firstmate/config\"",
+    );
+    let (o, s) = e.saved();
+    assert_eq!(code(&o), 3, "{}{}", text(&o.stdout), text(&o.stderr));
+    let b = &s.plan.blockers[0];
+    assert_eq!(b.code.as_str(), "E_PARENT_UNSAFE", "{b:?}");
+}

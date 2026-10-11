@@ -184,6 +184,24 @@ fn deselecting_a_module_shows_its_owned_outputs_as_removals() {
 }
 
 #[test]
+fn claims_under_missing_share_and_cache_directories_are_not_errors() {
+    let fx = Fx::new();
+    for (m, from, to) in [
+        ("core", ".ssh/config", ".local/share/firstmate/config"),
+        ("extra", ".zshrc", ".cache/firstmate/zshrc"),
+    ] {
+        let rel = format!("base/modules/{m}/module.toml");
+        let t = fs::read_to_string(fx.root.join(&rel)).unwrap();
+        fx.put(&rel, &t.replacen(from, to, 1));
+    }
+    for d in [".local/share", ".cache"] {
+        assert!(!fx.h(d).exists(), "{d}");
+    }
+    let (_, rows) = fx.rows();
+    assert!(rows.iter().all(|r| r["status"] != "ERROR"), "{rows:#?}");
+}
+
+#[test]
 fn a_linked_parent_of_an_owned_output_is_unsafe() {
     let fx = applied();
     let elsewhere = fx._src.path().join("moved-tmux");
@@ -193,8 +211,7 @@ fn a_linked_parent_of_an_owned_output_is_unsafe() {
     assert_eq!(c, 1);
     let r = at(&rows, ".config/tmux/tmux.conf");
     assert_eq!(r["status"], "ERROR");
-    // The planner judges a link that leaves HOME to be a reserved target.
-    assert_eq!(r["code"], "E_TARGET_RESERVED");
+    assert_eq!(r["code"], "E_PARENT_UNSAFE");
     assert_eq!(status(&rows, ".ssh/config").0, "OK", "other rows stay");
 }
 
