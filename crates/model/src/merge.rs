@@ -138,9 +138,17 @@ fn shell_word(a: &str) -> String {
         out.push('"');
         return out;
     }
-    // A leading `=` is expanded by zsh (`=cmd` is the path of cmd), so such a word is quoted.
+    // Quoted although safe elsewhere: a leading `=` (zsh expands `=cmd`), a leading `%` (a job
+    // spec in command position) and `NAME=value` (an environment assignment in command position).
+    let assignment = a.split_once('=').is_some_and(|(n, _)| {
+        n.chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+            && n.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+    });
     let plain = !a.is_empty()
-        && !a.starts_with('=')
+        && !a.starts_with(['=', '%'])
+        && !assignment
         && a.bytes()
             .all(|b| b.is_ascii_alphanumeric() || b"_@%+=:,./-".contains(&b));
     if plain {
@@ -724,7 +732,11 @@ argv = ["audit", "--quiet", "two words"]
     #[test]
     fn a_word_that_starts_with_equals_is_quoted() {
         assert_eq!(shell_word("=cmd"), "'=cmd'");
-        assert_eq!(shell_word("a=b"), "a=b");
+        assert_eq!(shell_word("FOO=bar"), "'FOO=bar'");
+        assert_eq!(shell_word("_x1=y"), "'_x1=y'");
+        assert_eq!(shell_word("%1"), "'%1'");
+        assert_eq!(shell_word("--flag=1"), "--flag=1", "not an assignment name");
+        assert_eq!(shell_word("a%b"), "a%b");
     }
 
     #[test]

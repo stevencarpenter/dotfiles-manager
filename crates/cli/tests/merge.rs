@@ -1004,7 +1004,7 @@ fn bad_salt(change: impl FnOnce(&Path)) {
     let o = fx.plan();
     assert_eq!(code(&o), 3, "{}\n{}", stderr(&o), text(&o.stdout));
     let e = stderr(&o);
-    assert!(e.contains("restore state/salt from a copy"), "{e}");
+    assert!(e.contains("from a copy"), "{e}");
     assert!(e.contains("coowned"), "names the ledger key: {e}");
     let a = fx.run(&[
         "apply",
@@ -1042,4 +1042,81 @@ fn a_symlinked_salt_is_refused() {
         fs::rename(p, &real).unwrap();
         std::os::unix::fs::symlink(&real, p).unwrap();
     });
+}
+
+#[test]
+fn the_recovery_text_for_an_unusable_salt_works_when_followed_literally() {
+    let fx = Fx::new();
+    assert_eq!(code(&fx.apply()), 0);
+    let salt = fx.state().join("salt");
+    fs::set_permissions(&salt, fs::Permissions::from_mode(0o644)).unwrap();
+    let o = fx.plan();
+    assert_eq!(code(&o), 3, "{}", stderr(&o));
+    let e = stderr(&o);
+    assert!(e.contains("move it out of state/"), "{e}");
+    assert!(e.contains("The ledger records a salted hash"), "{e}");
+    assert!(e.contains("delete the `coowned` object"), "{e}");
+    // Step 1: move the bad salt aside. Step 2: delete every coowned object.
+    fs::rename(&salt, fx.h("salt.bad")).unwrap();
+    let path = fx.state().join("ledger.json");
+    let mut l: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    for r in l["resources"].as_array_mut().unwrap() {
+        for o in r["owned_outputs"].as_array_mut().unwrap() {
+            o.as_object_mut().unwrap().remove("coowned");
+        }
+    }
+    fs::write(&path, serde_json::to_vec(&l).unwrap()).unwrap();
+    let o = fx.plan();
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+    let c = fx.run(&["state", "check"]);
+    assert_eq!(code(&c), 0, "{}\n{}", stderr(&c), text(&c.stdout));
+    // The file is a take-over again, and the next apply makes a new salt.
+    assert_eq!(code(&fx.apply()), 0);
+    assert_eq!(fs::read(&salt).unwrap().len(), 32);
+}
+
+#[test]
+fn the_text_without_a_recorded_hash_says_the_next_apply_creates_a_salt() {
+    let fx = Fx::new();
+    fs::create_dir_all(fx.state()).unwrap();
+    fs::write(fx.state().join("salt"), [1u8; 16]).unwrap();
+    fs::set_permissions(fx.state().join("salt"), fs::Permissions::from_mode(0o600)).unwrap();
+    let o = fx.plan();
+    assert_eq!(code(&o), 3, "{}", stderr(&o));
+    let e = stderr(&o);
+    assert!(e.contains("The ledger records no salted hash"), "{e}");
+    assert!(!e.contains("The ledger records a salted hash"), "{e}");
+}
+
+fn retire_with(change: impl FnOnce(&Path)) {
+    let fx = Fx::new();
+    fx.live(LIVE);
+    assert_eq!(code(&fx.apply()), 0);
+    change(&fx.state().join("salt"));
+    fx.set_profile("");
+    let o = fx.plan();
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+    assert!(
+        text(&o.stdout).contains("retire 1 owned handler(s)"),
+        "{}",
+        text(&o.stdout)
+    );
+    let o = fx.apply_bare();
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+    let pre = fx.live_json()["hooks"]["PreToolUse"]
+        .as_array()
+        .unwrap()
+        .len();
+    assert_eq!(pre, 1, "only the owned entry is gone");
+    assert!(fx.coowned().is_none());
+}
+
+#[test]
+fn a_retire_needs_no_salt_even_when_it_is_open_to_others() {
+    retire_with(|p| fs::set_permissions(p, fs::Permissions::from_mode(0o644)).unwrap());
+}
+
+#[test]
+fn a_retire_needs_no_salt_even_when_it_is_missing() {
+    retire_with(|p| fs::remove_file(p).unwrap());
 }

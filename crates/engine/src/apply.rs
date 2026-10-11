@@ -966,10 +966,16 @@ impl Exec<'_, '_> {
             Err(r) => return Err(failed(r)),
         };
         let retire = op.action == Action::Retire;
-        let salt = match self.run.store.salt() {
-            Ok(s) => s,
-            Err(e) if recorded.is_some() => return Err(Ended::Blocked(e)),
-            Err(e) => return Err(failed(e)),
+        // A retire removes owned entries by the hash of the declared entry. It reads no managed
+        // field, so it needs no salt and a lost or unusable salt does not stop it.
+        let salt = if retire {
+            None
+        } else {
+            match self.run.store.salt() {
+                Ok(s) => s,
+                Err(e) if recorded.is_some() => return Err(Ended::Blocked(e)),
+                Err(e) => return Err(failed(e)),
+            }
         };
         if !retire {
             check_foreign(

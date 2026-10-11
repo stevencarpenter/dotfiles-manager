@@ -1523,50 +1523,60 @@ fn a_foreign_fragment_that_is_not_a_plain_readable_file_blocks_the_consumer() {
 
 #[test]
 fn a_sensitive_output_under_a_fragment_pattern_is_never_hashed() {
+    // An assembly reads `.claude/*.json`. The merge target `.claude/settings.json` matches the
+    // pattern, so the merge is a producer of one fragment. A merged file has no content hash by
+    // design, so the assembly blocks, and the live token and its hash appear nowhere.
     let e = Env::personal();
     let m = e.src("base/modules/agents/module.toml");
     let mut t = fs::read_to_string(&m).unwrap();
+    // The example's skills live under `.claude/skills`, which a `.claude` fragment directory
+    // would collide with. They are not part of this case.
+    t.truncate(t.find("[[resources]]\nid = \"skills\"").unwrap());
     t.push_str(
         r#"
 [[resources]]
-id = "claude-copy"
-kind = "secret"
-adapter = "op-template/v1"
-target = ".codex/AGENTS.d/60-secret.md"
+id = "claude-index"
+kind = "assemble"
+adapter = "text-fragments/v1"
+target = ".codex/INDEX.md"
 [resources.value]
-template = "files/AGENTS.md"
-account = "example-account"
-mode = 0o600
+body = "files/AGENTS.md"
+fragments_dir = ".claude"
+pattern = "*.json"
+separator = "\n"
 "#,
     );
     fs::write(&m, t).unwrap();
-    e.mkdirs(".codex/AGENTS.d");
-    let content = "token = sk-FRAGMENT-SECRET";
-    fs::write(e.h(".codex/AGENTS.d/60-secret.md"), content).unwrap();
+    e.mkdirs(".claude");
+    let content = "{\"token\":\"sk-FRAGMENT-SECRET\"}";
+    let live = e.h(".claude/settings.json");
+    fs::write(&live, content).unwrap();
+    fs::set_permissions(&live, fs::Permissions::from_mode(0o600)).unwrap();
     let digest = format!("{:x}", Sha256::digest(content.as_bytes()));
     let o = e.plan(&["--json"]);
-    let all = text(&o.stdout);
+    assert_eq!(code(&o), 3, "{}", text(&o.stderr));
+    let all = format!("{}{}", text(&o.stdout), text(&o.stderr));
     assert!(
         !all.contains(&digest) && !all.contains("sk-FRAGMENT-SECRET"),
         "{all}"
     );
-    let s = Saved::parse(&o.stdout).unwrap();
-    // The merge adapter now pins its target (`.claude/settings.json`), so the sensitive claim
-    // under the fragment pattern is a secret output. It is out of scope, so it is not observed
-    // as a file and no fragment of the assembly is its content. Whatever was observed holds no
-    // hash.
-    if let Some(seen) = s.plan.observations.seen.get(".codex/AGENTS.d/60-secret.md")
-        && let dfm_model::plan::Node::File { sha256, .. } = &seen.node
-    {
-        assert_eq!(sha256, &None);
-    }
-    let asm = op(&s, "agents.codex-instructions@.codex/AGENTS.md");
+    let s =
+        Saved::parse(&o.stdout).unwrap_or_else(|er| panic!("{er}\nstderr: {}", text(&o.stderr)));
+    let asm = op(&s, "agents.claude-index@.codex/INDEX.md");
+    assert_eq!(asm.status, Status::Blocked);
     assert!(
-        asm.fragments
+        s.plan
+            .blockers
             .iter()
-            .all(|f| f.sha256.is_none() || f.name != "60-secret.md"),
-        "a claimed sensitive path is never hashed as a foreign fragment"
+            .any(|b| b.resource == "agents.claude-index" && b.detail.contains("has no content")),
+        "{:?}",
+        s.plan.blockers
     );
+    let seen = &s.plan.observations.seen[".claude/settings.json"];
+    let dfm_model::plan::Node::File { sha256, .. } = &seen.node else {
+        panic!("{:?}", seen.node);
+    };
+    assert_eq!(sha256, &None, "a sensitive path is never hashed");
 }
 
 fn retarget(e: &Env, from: &str, to: &str) {

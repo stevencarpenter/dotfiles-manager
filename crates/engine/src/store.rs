@@ -449,14 +449,23 @@ impl Store {
     pub fn salt(&self) -> Result<Option<Vec<u8>>, Refusal> {
         // A symlink, a wrong owner or mode, or a wrong size is an error that is never repaired.
         let bad = |e: Refusal| {
+            let recorded = self.ledger_raw().is_ok_and(|l| {
+                l.resources
+                    .iter()
+                    .flat_map(|r| &r.owned_outputs)
+                    .any(|o| o.coowned.is_some())
+            });
+            let next = if recorded {
+                "The ledger records a salted hash: also restore a good salt from a copy, or delete the `coowned` object of each co-owned output in state/ledger.json (the next apply then needs --allow-adopt)"
+            } else {
+                "The ledger records no salted hash, so the next apply creates a new salt"
+            };
+            // The reason without the path: `mode is 644, expected 0600`.
+            let why = e.detail.rsplit(": ").next().unwrap_or(&e.detail);
             Refusal::new(
                 Code::StorageInvalid,
                 format!(
-                    "state/salt is unusable ({}). It is not replaced. {}",
-                    e.detail,
-                    dfm_model::merge::SALT_LOST
-                        .split_once(". ")
-                        .map_or("", |(_, r)| r)
+                    "state/salt is unusable ({why}). Fix: move it out of state/ (mv state/salt ~/salt.bad). {next}"
                 ),
             )
         };
