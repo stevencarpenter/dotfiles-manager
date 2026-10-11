@@ -599,7 +599,7 @@ fn s3_the_digest_cache_does_not_let_a_narrower_root_skip_the_containment_check()
     };
     let thing = |id: &str| {
         format!(
-            "[[resources]]\nid = \"{id}\"\nkind = \"link\"\nadapter = \"fs-link/v1\"\ntarget = \"t/{id}\"\n[resources.value]\nsource = \"sub/files/d\"\n[resources.policy]\ndefaults = [\"/source\"]\n"
+            "[[resources]]\nid = \"{id}\"\nkind = \"link\"\nadapter = \"fs-link/v1\"\ntarget = \"t/{id}\"\n[resources.value]\nsource = \"sub/files/d\"\ndirectory = true\n[resources.policy]\ndefaults = [\"/source\"]\n"
         )
     };
     let mut set = SourceSet::new();

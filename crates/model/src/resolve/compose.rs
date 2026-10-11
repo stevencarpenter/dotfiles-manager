@@ -988,7 +988,25 @@ fn finish(
         let mut srcs: BTreeMap<String, (String, Option<String>)> = BTreeMap::new();
         for s in &found.sources {
             let sup = supplier_for(owner, roots, &s.pointer);
-            let (path, id) = contain(sources, &sup, gid, &s.pointer, &s.rel, spec, &mut digests)?;
+            // `directory = true` is the explicit claim that the source is a directory link.
+            let dir_ok = matches!(spec.claims, Claims::Leaves { .. })
+                || (s.pointer == "/source"
+                    && matches!(
+                        pointer::get(
+                            value,
+                            &pointer::parse("/directory").expect("static pointer")
+                        ),
+                        Some(Value::Boolean(true))
+                    ));
+            let (path, id) = contain(
+                sources,
+                &sup,
+                gid,
+                (&s.pointer, &s.rel),
+                spec,
+                dir_ok,
+                &mut digests,
+            )?;
             srcs.insert(s.pointer.clone(), (path, id));
         }
         let base_tokens = |p: &str| {
@@ -1138,9 +1156,9 @@ fn contain(
     sources: &SourceSet,
     sup: &Supplier,
     gid: &str,
-    ptr: &str,
-    rel: &str,
+    (ptr, rel): (&str, &str),
     spec: &AdapterSpec,
+    dir_ok: bool,
     digests: &mut BTreeMap<String, String>,
 ) -> Result<(String, Option<String>), ResolveError> {
     let wrap = |e: ResolveError| e.resource(gid).field(ptr);
@@ -1159,6 +1177,12 @@ fn contain(
             });
             Ok((path, id))
         }
+        Located::Dir { .. } if !dir_ok => Err(wrap(ResolveError::new(
+            Code::ManifestInvalid,
+            &sup.file,
+            format!("the source `{rel}` is a directory"),
+            "set `directory = true` in the resource value to link the directory, or point `source` at a file",
+        ))),
         Located::Dir { path } => {
             // A directory reached again was already checked entry by entry, and its digest is
             // the same, so do not walk and hash it again for every reference.

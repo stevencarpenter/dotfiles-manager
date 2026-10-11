@@ -129,7 +129,10 @@ pub fn registry() -> Vec<Adapter> {
                     "link",
                     TargetRule::Required,
                     Claims::Target,
-                    Schema::Table(vec![field("source", Schema::Source, true)]),
+                    Schema::Table(vec![
+                        field("source", Schema::Source, true),
+                        field("directory", Schema::Bool, false),
+                    ]),
                 )
             },
             generator: None,
