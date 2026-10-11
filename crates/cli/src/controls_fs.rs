@@ -217,6 +217,13 @@ pub fn toolchain_tree_digest(dir: &Path) -> Result<String, String> {
         };
         entries.push(TreeEntry { path: rel, kind });
     }
+    // Parity with the shell checker: an empty or symlink-only tree is not a toolchain.
+    if !entries
+        .iter()
+        .any(|e| matches!(e.kind, EntryKind::File { .. }))
+    {
+        return Err("the toolchain tree has no regular file".into());
+    }
     Ok(tree_digest(entries))
 }
 
