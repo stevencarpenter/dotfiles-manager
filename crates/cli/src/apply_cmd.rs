@@ -241,7 +241,9 @@ fn run_inner(
     fail.hit("apply-after-install")
         .map_err(|r| stamped(&store, r))?;
     let started = now_unix().map_err(|r| stamped(&store, r))?;
-    let report = apply(&run, &locked).map_err(|r| stamped(&store, r))?;
+    // A signal that came before a pre-run check failed still decides the exit.
+    let report = apply(&run, &locked)
+        .map_err(|r| stamped(&store, dfm_engine::signal::requested().unwrap_or(r)))?;
     let finished = now_unix().unwrap_or(started);
 
     let counts = count_statuses(&report.operations);
@@ -253,7 +255,7 @@ fn run_inner(
     let mut stopped = dfm_engine::signal::requested()
         .or(report.stopped)
         .map(|r| if mutated { r.after_mutation() } else { r });
-    let mut exit = stopped.as_ref().map_or(Exit::Ok, Refusal::exit);
+    let exit = stopped.as_ref().map_or(Exit::Ok, Refusal::exit);
 
     // The receipt is written whenever anything changed, also after a failure. A run that
     // changed nothing (a safe rerun, or a stop before the first effect) writes none.
@@ -329,9 +331,8 @@ fn run_inner(
         match store.write_receipt(&receipt) {
             Ok(name) => receipt_name = Some(name),
             Err(e) => {
-                // The journal and the ledger stay the record. The run is a failure, unless a
-                // signal already decided the exit.
-                exit = exit.combine(Exit::Failed);
+                // The journal and the ledger stay the record. The run is a failure; the final
+                // exit below takes the higher-ranked of this and the stop.
                 receipt_error = Some(e.after_mutation());
             }
         }
@@ -343,7 +344,6 @@ fn run_inner(
     if !stopped.as_ref().is_some_and(is_signal)
         && let Some(r) = dfm_engine::signal::requested()
     {
-        exit = exit.combine(r.exit());
         late = Some(r.code.as_str());
         stopped = Some(if mutated { r.after_mutation() } else { r });
     }
@@ -398,13 +398,16 @@ fn run_inner(
         )
         .map_err(w)?;
     }
-    writeln!(out, "result: {}", exit.name()).map_err(w)?;
-    progress.result_printed = true;
-    match (receipt_error, stopped) {
-        // A signal decides the exit also when the receipt could not be written.
-        (_, Some(r)) if is_signal(&r) => Err(r),
+    // One value is both printed and returned. The higher-ranked of the stop and the receipt
+    // failure wins, and the receipt failure wins a tie (section 10 precedence).
+    let outcome = match (receipt_error, stopped) {
+        (Some(e), Some(r)) if e.exit().combine(r.exit()) != e.exit() => Err(r),
         (Some(e), _) => Err(e),
         (None, Some(r)) => Err(r),
         (None, None) => Ok(()),
-    }
+    };
+    let final_exit = outcome.as_ref().err().map_or(Exit::Ok, Refusal::exit);
+    writeln!(out, "result: {}", final_exit.name()).map_err(w)?;
+    progress.result_printed = true;
+    outcome
 }

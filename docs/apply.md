@@ -240,6 +240,7 @@ Publishing a file does not reload the program that reads it (architecture sectio
 - The receipt has outcome `interrupted` (SIGINT, exit 130) or `terminated` (SIGTERM, exit 143), as for any other run that changed something. A run that changed nothing writes no receipt, and a signal before the first mutation exits 130 or 143 without one.
 - The report prints, then the last line is `result: interrupted` or `result: terminated`. The process returns the code. The handler never exits the process.
 - A signal has precedence over a failure in the exit code. The operations still show what failed.
+- A signal that arrived before a pre-run check refused the plan still gives 130 or 143.
 - If the receipt cannot be written, the report says `receipt: not written (...)` and the exit is still 130 or 143.
 - A second signal, of either kind, does nothing. The first signal keeps its code and the receipt is still written. SIGKILL is the only forced stop.
 - A signal that arrives while the receipt is written cannot be in that receipt. The exit is still 130 or 143, the report adds a `signal:` line, and the receipt keeps the outcome it had.

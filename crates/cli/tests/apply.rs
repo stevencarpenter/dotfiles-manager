@@ -877,6 +877,18 @@ fn parked_apply_with(fx: &Fx, point: &str, extra: &[&str], during: impl FnOnce(&
 
 /// As [`parked_apply_with`], and `during` also gets the process id of the parked `apply`.
 fn parked_apply_pid(fx: &Fx, point: &str, extra: &[&str], during: impl FnOnce(&Fx, u32)) -> Output {
+    parked_apply_launched(fx, point, extra, false, during)
+}
+
+/// As [`parked_apply_pid`]. With `ignore_int`, a shell sets SIGINT to ignored and then execs the
+/// binary, as `nohup` or a background job does.
+fn parked_apply_launched(
+    fx: &Fx,
+    point: &str,
+    extra: &[&str],
+    ignore_int: bool,
+    during: impl FnOnce(&Fx, u32),
+) -> Output {
     let gate = fx.home.path().parent().unwrap().join(format!(
         "gate-{}-{:?}",
         std::process::id(),
@@ -886,7 +898,14 @@ fn parked_apply_pid(fx: &Fx, point: &str, extra: &[&str], during: impl FnOnce(&F
     let _ = fs::remove_file(&gate);
     let _ = fs::remove_file(gate.with_extension("reached"));
     let digest = fx.digest();
-    let child = Command::new(BIN)
+    let mut launch = if ignore_int {
+        let mut c = Command::new("/bin/sh");
+        c.args(["-c", "trap '' INT; exec \"$0\" \"$@\"", BIN]);
+        c
+    } else {
+        Command::new(BIN)
+    };
+    let child = launch
         .env_clear()
         .env("DFM_FAILPOINT", format!("{point}:wait-{}", gate.display()))
         .arg("--home")
@@ -2049,4 +2068,32 @@ fn a_signal_wins_the_exit_when_the_receipt_cannot_be_written() {
     assert!(out.contains("receipt: not written"), "{out}");
     assert!(out.contains("result: interrupted"), "{out}");
     assert!(fx.receipts().is_empty());
+}
+
+#[test]
+fn a_signal_the_parent_ignored_stays_ignored_and_the_run_completes() {
+    let fx = signal_fixture();
+    let o = parked_apply_launched(&fx, "apply-before-effect", &[], true, |_, pid| {
+        send("-INT", pid)
+    });
+    let out = text(&o.stdout);
+    assert_eq!(code(&o), 0, "{}\n{out}", stderr(&o));
+    assert!(out.contains("result: ok"), "{out}");
+    assert_eq!(fx.receipts()[0]["result"]["outcome"], "ok");
+    assert_eq!(fx.owned_paths().len(), 3);
+}
+
+#[test]
+fn a_signal_before_a_pre_run_check_fails_still_decides_the_exit() {
+    // The journal grows past its limit after the install, so a pre-run check in apply() fails.
+    let fx = signal_fixture();
+    let journal = fx.state().join("journal.jsonl");
+    let o = parked_apply_pid(&fx, "apply-after-install", &[], |_, pid| {
+        let mut f = fs::OpenOptions::new().append(true).open(&journal).unwrap();
+        std::io::Write::write_all(&mut f, &vec![b' '; 9 << 20]).unwrap();
+        send("-TERM", pid);
+    });
+    let out = text(&o.stdout);
+    assert_eq!(code(&o), 143, "{}\n{out}", stderr(&o));
+    assert!(out.contains("result: terminated"), "{out}");
 }
