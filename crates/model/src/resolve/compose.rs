@@ -141,6 +141,12 @@ fn locate_error(from: &str, field: &str, f: LocateFault) -> ResolveError {
             "two source entries differ only by case, so a case-insensitive filesystem cannot tell them apart",
             "rename one of them",
         ),
+        LocateFault::Hidden(path) => ResolveError::new(
+            Code::SourceEscape,
+            from,
+            format!("a link in the directory source leads to `{path}`, which holds an excluded directory; the links inside that directory cannot be checked"),
+            format!("point the link elsewhere, or stop excluding the directories under `{path}`"),
+        ),
     }
     .field(field)
     .rejected("string")
@@ -192,6 +198,21 @@ pub(crate) fn resolve(
     let order = select(&profile, &catalogue, &modules)?;
 
     // Phase 3: authority and conflicts.
+    // Count before cloning any resource document. Resource IDs are unique per module, so the
+    // sum equals the number of composed resources.
+    if order
+        .iter()
+        .map(|id| modules[id].resources.len())
+        .sum::<usize>()
+        > MAX_RESOURCES
+    {
+        return Err(ResolveError::new(
+            Code::LimitExceeded,
+            &profile.file,
+            "the composition has more than 10000 resources",
+            "split the composition",
+        ));
+    }
     let mut resources: BTreeMap<String, Owned> = BTreeMap::new();
     for m in order.iter().map(|id| &modules[id]) {
         for r in &m.resources {
@@ -207,14 +228,6 @@ pub(crate) fn resolve(
                 },
             );
         }
-    }
-    if resources.len() > MAX_RESOURCES {
-        return Err(ResolveError::new(
-            Code::LimitExceeded,
-            &profile.file,
-            "the composition has more than 10000 resources",
-            "split the composition",
-        ));
     }
     let changes = collect_changes(&order, &modules, &profile);
     let effective = authorize(&resources, &changes)?;
@@ -442,9 +455,22 @@ fn select(
     catalogue: &BTreeMap<String, CatalogueEntry>,
     modules: &BTreeMap<String, ModuleDoc>,
 ) -> Result<Vec<String>, ResolveError> {
+    // Every unknown ID is reported before any duplicate, in the profile list first and then in
+    // the `requires` of each module in ID order, so the code does not depend on list order.
+    for (i, m) in profile.modules.iter().enumerate() {
+        if m != "core" && !catalogue.contains_key(m) {
+            return Err(unknown_module(&profile.file, &format!("/modules/{i}"), m));
+        }
+    }
+    for m in modules.values().filter(|m| m.id != "core") {
+        for (i, r) in m.requires.iter().enumerate() {
+            if r != "core" && !catalogue.contains_key(r) {
+                return Err(unknown_module(&m.file, &format!("/requires/{i}"), r));
+            }
+        }
+    }
     let mut seen = BTreeSet::new();
     for (i, m) in profile.modules.iter().enumerate() {
-        let field = format!("/modules/{i}");
         if m == "core" || !seen.insert(m.as_str()) {
             return Err(ResolveError::new(
                 Code::ModuleDuplicate,
@@ -452,11 +478,8 @@ fn select(
                 format!("module `{m}` is selected more than once; core is always selected"),
                 "list each non-core module once",
             )
-            .field(field)
+            .field(format!("/modules/{i}"))
             .rejected("string"));
-        }
-        if !catalogue.contains_key(m) {
-            return Err(unknown_module(&profile.file, &field, m));
         }
     }
     let core = &modules["core"];
@@ -472,7 +495,6 @@ fn select(
     for m in modules.values() {
         let mut seen = BTreeSet::new();
         for (i, r) in m.requires.iter().enumerate() {
-            let field = format!("/requires/{i}");
             if r == "core" || !seen.insert(r.as_str()) {
                 return Err(ResolveError::new(
                     Code::ModuleDuplicate,
@@ -480,11 +502,8 @@ fn select(
                     format!("`{r}` is required more than once; core is always required"),
                     "list each prerequisite once and omit core",
                 )
-                .field(field)
+                .field(format!("/requires/{i}"))
                 .rejected("string"));
-            }
-            if !catalogue.contains_key(r) {
-                return Err(unknown_module(&m.file, &field, r));
             }
         }
     }
@@ -533,10 +552,31 @@ fn select(
         }
     }
     if let Some((first, _)) = waiting.iter().next() {
-        let names: Vec<&str> = waiting.keys().copied().collect();
+        // Every waiting module has a waiting prerequisite, so walking back along `requires`
+        // reaches a module twice. The walk from that module on is the cycle; downstream modules
+        // that only wait on it are left out.
+        let mut path: Vec<&str> = vec![*first];
+        let cycle: Vec<&str> = loop {
+            let last = path[path.len() - 1];
+            let next = modules[last]
+                .requires
+                .iter()
+                .map(String::as_str)
+                .filter(|r| waiting.contains_key(r))
+                .min();
+            match next {
+                Some(n) => match path.iter().position(|p| *p == n) {
+                    Some(at) => break path[at..].to_vec(),
+                    None => path.push(n),
+                },
+                None => break path,
+            }
+        };
+        let mut names = cycle.clone();
+        names.sort_unstable();
         return Err(ResolveError::new(
             Code::DependencyCycle,
-            &modules[*first].file,
+            &modules[names[0]].file,
             format!(
                 "modules depend on each other in a cycle: {}",
                 names.join(", ")
@@ -920,6 +960,11 @@ fn finish(
                     "a required key is missing".into(),
                     "add the key",
                 ),
+                Fault::EmptyKey => at(
+                    Code::ManifestInvalid,
+                    "a map key is empty".into(),
+                    "give the entry a non-empty name",
+                ),
                 Fault::OutOfRange(why) => at(
                     Code::ManifestInvalid,
                     why.into(),
@@ -1048,9 +1093,20 @@ fn finish(
             let key = format!("{}\0{path}", spec.id);
             if !include_cache.contains_key(&key) {
                 let parsed = match sources.locate(path, "") {
-                    Ok(Located::File { bytes, .. }) => {
-                        std::str::from_utf8(bytes).map(parse).unwrap_or_default()
-                    }
+                    Ok(Located::File { bytes, .. }) => std::str::from_utf8(bytes)
+                        .map(parse)
+                        .map_err(|_| {
+                            ResolveError::new(
+                                Code::ManifestInvalid,
+                                &owner.file,
+                                format!(
+                                    "the native source `{path}` is not valid UTF-8, so its include directives cannot be read"
+                                ),
+                                "save the file as UTF-8",
+                            )
+                            .resource(gid)
+                            .field("/source")
+                        })?,
                     _ => Vec::new(),
                 };
                 if parsed.len() > MAX_INCLUDES_PER_DOC {
@@ -1099,6 +1155,32 @@ fn finish(
     Ok((out, groups))
 }
 
+/// The HOME-relative output path an include names. `~/x` is `x`. A relative path is taken
+/// against the directory of the including file's output, as Git does, with `.` and `..`
+/// applied; a path that climbs above HOME names nothing. An absolute path or `~user/...` is not
+/// matched, because it names no HOME-relative output.
+fn include_output_path(including: Option<&str>, path: &str) -> Option<String> {
+    if let Some(rel) = path.strip_prefix("~/") {
+        return Some(rel.to_string());
+    }
+    if path.starts_with('/') || path.starts_with('~') {
+        return None;
+    }
+    let mut parts: Vec<&str> = including
+        .and_then(|t| t.rsplit_once('/'))
+        .map_or_else(Vec::new, |(dir, _)| dir.split('/').collect());
+    for c in path.split('/') {
+        match c {
+            "" | "." => {}
+            ".." => {
+                parts.pop()?;
+            }
+            c => parts.push(c),
+        }
+    }
+    Some(parts.join("/"))
+}
+
 /// Orders each authored native document's includes and ties each to the resource that
 /// declares the included file. Matching is by output path, without regard to case.
 fn include_groups(
@@ -1115,10 +1197,8 @@ fn include_groups(
                 .into_iter()
                 .enumerate()
                 .map(|(i, inc)| {
-                    let hit = inc
-                        .path
-                        .strip_prefix("~/")
-                        .and_then(|rel| by_target.get(&crate::fold::fold(rel)))
+                    let hit = include_output_path(resolved[&base].target.as_deref(), &inc.path)
+                        .and_then(|rel| by_target.get(&crate::fold::fold(&rel)))
                         .filter(|r| r.id != base);
                     IncludeEntry {
                         position: i + 1,
@@ -1192,6 +1272,14 @@ fn contain(
             if let Some(id) = digests.get(&key) {
                 return Ok((path.clone(), (!spec.secret_values).then(|| id.clone())));
             }
+            // Apply cannot see the exclude patterns, so a directory with excluded entries is held
+            // to the rule apply uses; any other directory keeps the module root as its bound.
+            if sources.pruned_under(&path) > 0 {
+                check_links_inside(sources, &path)
+            } else {
+                check_nested(sources, &sup.dir, &path, digests)
+            }
+            .map_err(|f| wrap(locate_error(&sup.file, ptr, f)))?;
             let mut entries = Vec::new();
             for (name, e) in sources.below(&path) {
                 let full = format!("{path}/{name}");
@@ -1232,6 +1320,84 @@ fn contain(
             Ok((path, (!spec.secret_values).then_some(id)))
         }
     }
+}
+
+/// Holds every link below `dir`, loaded or excluded, to [`source::target_stays_inside`], the
+/// rule apply uses for a directory source that has excluded entries. Plan and apply then agree
+/// on every link plan can see. A link inside an excluded directory is not listed here, and apply
+/// still checks it.
+fn check_links_inside(sources: &SourceSet, dir: &str) -> Result<(), LocateFault> {
+    let base = dir.split('/').filter(|c| !c.is_empty()).count();
+    let loaded = sources.below(dir).filter_map(|(rel, e)| match e {
+        source::Entry::Link(t) => Some((rel.matches('/').count(), t.as_str())),
+        _ => None,
+    });
+    let excluded = sources
+        .pruned_links_below(dir)
+        .map(|(p, t)| (p.split('/').count().saturating_sub(base + 1), t));
+    if loaded
+        .chain(excluded)
+        .all(|(depth, t)| source::target_stays_inside(t, depth))
+    {
+        Ok(())
+    } else {
+        Err(LocateFault::Escape)
+    }
+}
+
+/// Checks every link below `dir` at any depth, including excluded ones, and follows each link
+/// that reaches another directory into that directory's entries too: a link published inside
+/// a linked tree can lead out of the root through its target. A scan of a directory covers all
+/// of its descendants, so a directory below one already scanned is skipped, and parents are
+/// scanned first. That keeps the work linear in the entries under each reachable top directory
+/// and ends link cycles. `memo` keeps the directories already checked against `root`, so a
+/// shared target is walked once for the whole composition, not once per resource.
+fn check_nested(
+    sources: &SourceSet,
+    root: &str,
+    dir: &str,
+    memo: &mut BTreeMap<String, String>,
+) -> Result<(), LocateFault> {
+    let key = |folded: &str| format!("nested\0{root}\0{folded}");
+    let mut scanned: BTreeSet<String> = BTreeSet::new();
+    let mut work = BTreeMap::from([(crate::fold::fold(dir), dir.to_string())]);
+    while let Some((folded, dir)) = work.pop_first() {
+        let covered = scanned.contains(&folded)
+            || folded
+                .match_indices('/')
+                .any(|(i, _)| scanned.contains(&folded[..i]));
+        if covered || memo.contains_key(&key(&folded)) {
+            continue;
+        }
+        let mut hops = Vec::new();
+        for (name, e) in sources.below(&dir) {
+            if let source::Entry::Link(_) = e {
+                hops.push(sources.locate(&format!("{dir}/{name}"), root)?);
+            }
+        }
+        for (link, target) in sources.pruned_links_below(&dir) {
+            if target.starts_with('/') {
+                return Err(LocateFault::Escape);
+            }
+            hops.push(sources.locate(&format!("{}/{target}", source::parent(link)), root)?);
+        }
+        scanned.insert(folded);
+        for hop in hops {
+            if let Located::Dir { path } = hop {
+                // `dir` has no excluded entry (the caller checked), so an excluded directory
+                // below a reached directory is content that nothing lists and apply does not
+                // walk: a link inside it could lead out of the root unseen.
+                if sources.pruned_dirs_under(&path) > 0 {
+                    return Err(LocateFault::Hidden(path));
+                }
+                work.insert(crate::fold::fold(&path), path);
+            }
+        }
+    }
+    for folded in scanned {
+        memo.insert(key(&folded), String::new());
+    }
+    Ok(())
 }
 
 fn claims_of(
@@ -1314,13 +1480,14 @@ pub(crate) fn glob(pattern: &str, name: &str) -> bool {
     let (p, n): (Vec<char>, Vec<char>) = (pattern.chars().collect(), name.chars().collect());
     let (mut pi, mut ni, mut star, mut mark) = (0, 0, None, 0);
     while ni < n.len() {
-        if pi < p.len() && (p[pi] == '?' || p[pi] == n[ni]) {
-            pi += 1;
-            ni += 1;
-        } else if pi < p.len() && p[pi] == '*' {
+        // A pattern `*` is a wildcard even when the name holds a literal `*` at that position.
+        if pi < p.len() && p[pi] == '*' {
             star = Some(pi);
             mark = ni;
             pi += 1;
+        } else if pi < p.len() && (p[pi] == '?' || p[pi] == n[ni]) {
+            pi += 1;
+            ni += 1;
         } else if let Some(s) = star {
             pi = s + 1;
             mark += 1;
@@ -1468,4 +1635,71 @@ fn collision(
     .field("/target")
     .rejected("string")
     .conflicts_with(other)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{SourceSet, check_nested, glob, include_output_path};
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn a_pattern_star_stays_a_wildcard_when_the_name_holds_a_literal_star() {
+        assert!(glob("*.md", "*x.md"));
+        assert!(glob("foo*", "foo*bar"));
+        assert!(glob("*b", "*ab"));
+        assert!(glob("*", "*"));
+        assert!(glob("a*c", "a*bc"));
+        // Unchanged behaviour.
+        assert!(glob("*.md", "a.md"));
+        assert!(glob("a?c", "abc"));
+        assert!(glob("a*", "a"));
+        assert!(!glob("*.md", "a.txt"));
+        assert!(!glob("a?c", "ac"));
+        assert!(!glob("*b", "*a"));
+        assert!(glob("", ""));
+        assert!(!glob("", "x"));
+    }
+
+    #[test]
+    fn include_paths_resolve_against_home_or_the_including_directory() {
+        let at = |p: &str| include_output_path(Some(".config/git/config"), p);
+        assert_eq!(at("~/x/y").as_deref(), Some("x/y"));
+        assert_eq!(at("extra").as_deref(), Some(".config/git/extra"));
+        assert_eq!(at("./a/../b").as_deref(), Some(".config/git/b"));
+        assert_eq!(at("../../top").as_deref(), Some("top"));
+        assert_eq!(at("../../../up"), None);
+        assert_eq!(at("/abs/x"), None);
+        assert_eq!(at("~user/x"), None);
+        // A document at the top of HOME resolves against HOME itself.
+        assert_eq!(
+            include_output_path(Some(".gitconfig"), "x").as_deref(),
+            Some("x")
+        );
+        assert_eq!(include_output_path(None, "x").as_deref(), Some("x"));
+    }
+
+    #[test]
+    fn nested_links_are_scanned_once_per_top_directory_and_remembered() {
+        // D/d1/.../d30 with a link from D to every level: every reached directory lies below D,
+        // which the first scan covers, so the work is one scan and not 31.
+        let chain = |n: usize| {
+            (1..=n)
+                .map(|i| format!("d{i}"))
+                .collect::<Vec<_>>()
+                .join("/")
+        };
+        let mut set = SourceSet::new();
+        for k in 1..=30 {
+            set.insert_link(format!("r/D/l{k}"), chain(k));
+        }
+        set.insert_file(format!("r/D/{}/leaf", chain(30)), "l");
+        let mut memo = BTreeMap::new();
+        assert!(check_nested(&set, "r", "r/D", &mut memo).is_ok());
+        assert_eq!(memo.len(), 1, "{memo:?}");
+        // A directory that was checked is not walked again for the same root: a link added now
+        // is not seen with the same memo, and is seen with a fresh one.
+        set.insert_link(format!("r/D/{}/esc", chain(30)), "/etc");
+        assert!(check_nested(&set, "r", "r/D", &mut memo).is_ok());
+        assert!(check_nested(&set, "r", "r/D", &mut BTreeMap::new()).is_err());
+    }
 }

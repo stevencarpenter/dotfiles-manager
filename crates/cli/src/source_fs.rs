@@ -1,7 +1,9 @@
 //! Reads a materialized source directory into an in-memory `SourceSet` for the resolver.
 //! Read-only. A bundle's `[sources]` table limits the walk to its roots and skips excluded
 //! paths before they are listed or opened (docs/resolver.md, "Source roots and excludes").
-//! Symlinks are recorded, never followed, so the resolver decides containment.
+//! Symlinks are recorded, never followed, so the resolver decides containment. An excluded
+//! symlink is recorded too, apart from the hashed entries, because exclusion never hides a link
+//! from the containment check.
 //! A top-level `.git` (any letter case) is repository metadata, not source content, and is
 //! skipped. A `.git` anywhere deeper is a submodule or gitlink, which the tree rules refuse
 //! (E_SOURCE_UNTRUSTED, docs/architecture.md section 8).
@@ -55,10 +57,10 @@ fn read_regular(path: &Path, shown: &str) -> Result<Vec<u8>, Refusal> {
     Ok(buf)
 }
 
-/// A refusal whose detail is safe to print: paths come from the tree being read and may hold
-/// control, bidirectional or zero-width characters.
+/// A refusal whose detail may hold control, bidirectional or zero-width characters from the tree
+/// being read. Every command escapes a detail once, when it prints it, so it is not escaped here.
 fn refusal(code: Code, detail: String) -> Refusal {
-    Refusal::new(code, dfm_model::display::visible(&detail))
+    Refusal::new(code, detail)
 }
 
 /// Reads the parts of `root` that the profile's bundle declares in `[sources]`, or the whole
@@ -290,6 +292,24 @@ fn load(root: &Path, declared: Option<&SourceScope>) -> Result<SourceSet, Refusa
             format!("cannot read source {p}: {}", e.kind()),
         )
     }
+    /// The target text of the link `e`, which must be UTF-8 and hold no control character, like a
+    /// name. An excluded link is read the same way, because containment is decided on the text.
+    fn link_target(e: &fs::DirEntry, path: &str, rel: &str) -> Result<String, Refusal> {
+        let target = fs::read_link(e.path()).map_err(|e| io(e, path))?;
+        let target = target.into_os_string().into_string().map_err(|_| {
+            refusal(
+                Code::SourceUntrusted,
+                format!("non-UTF-8 link target at {path}"),
+            )
+        })?;
+        if target.chars().any(char::is_control) {
+            return Err(refusal(
+                Code::SourceUntrusted,
+                format!("control character in a name under {rel}"),
+            ));
+        }
+        Ok(target)
+    }
     /// Reads the entries of `dir`. With `shallow`, subdirectories are left alone.
     fn go(dir: &Path, rel: &str, st: &mut State, shallow: bool) -> Result<(), Refusal> {
         let mut names: Vec<_> = fs::read_dir(dir)
@@ -321,6 +341,16 @@ fn load(root: &Path, declared: Option<&SourceScope>) -> Result<SourceSet, Refusa
                         ));
                     }
                     st.set.record_pruned(&shown);
+                    // Exclusion hides an entry from hashing, never from containment: a link
+                    // that is excluded is still published inside a directory source. An excluded
+                    // directory is not listed, so the resolver needs to know it is there.
+                    let ty = e.file_type().map_err(|e| io(e, &shown))?;
+                    if ty.is_symlink() {
+                        let target = link_target(&e, &shown, rel)?;
+                        st.set.record_pruned_link(&shown, &target);
+                    } else if ty.is_dir() {
+                        st.set.record_pruned_dir(&shown);
+                    }
                     continue;
                 }
             }
@@ -364,13 +394,7 @@ fn load(root: &Path, declared: Option<&SourceScope>) -> Result<SourceSet, Refusa
                 return Err(st.too_many_entries());
             }
             if ty.is_symlink() {
-                let target = fs::read_link(e.path()).map_err(|e| io(e, &path))?;
-                let target = target.into_os_string().into_string().map_err(|_| {
-                    refusal(
-                        Code::SourceUntrusted,
-                        format!("non-UTF-8 link target at {path}"),
-                    )
-                })?;
+                let target = link_target(&e, &path, rel)?;
                 st.set.insert_link(path, target);
             } else if ty.is_dir() {
                 st.set.insert_dir(path.clone());

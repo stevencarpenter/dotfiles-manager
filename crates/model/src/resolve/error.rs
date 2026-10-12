@@ -70,35 +70,39 @@ impl ResolveError {
 
 pub(crate) use crate::display::{is_invisible, visible};
 
-impl fmt::Display for ResolveError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "{} (source: {}",
-            visible(&self.message),
-            visible(&self.source)
-        )?;
+impl ResolveError {
+    /// The one-line text, with `esc` applied to every field that can hold text from a source.
+    fn text(&self, esc: fn(&str) -> String) -> String {
+        let mut out = format!("{} (source: {}", esc(&self.message), esc(&self.source));
         if let Some(r) = &self.resource {
-            write!(f, "; resource: {}", visible(r))?;
+            out.push_str(&format!("; resource: {}", esc(r)));
         }
         if let Some(p) = &self.field {
-            write!(f, "; field: {}", visible(p))?;
+            out.push_str(&format!("; field: {}", esc(p)));
         }
         if let Some(c) = self.rejected {
-            write!(f, "; rejected value: {c}")?;
+            out.push_str(&format!("; rejected value: {c}"));
         }
         if let Some(o) = &self.conflicts_with {
-            write!(f, "; conflicts with: {}", visible(o))?;
+            out.push_str(&format!("; conflicts with: {}", esc(o)));
         }
-        write!(f, "). Fix: {}", visible(&self.action))
+        out.push_str(&format!("). Fix: {}", esc(&self.action)));
+        out
+    }
+}
+
+impl fmt::Display for ResolveError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.text(visible))
     }
 }
 
 impl std::error::Error for ResolveError {}
 
+/// The detail keeps the raw text: the command that prints a refusal escapes it once.
 impl From<ResolveError> for Refusal {
     fn from(e: ResolveError) -> Refusal {
-        Refusal::new(e.code, e.to_string())
+        Refusal::new(e.code, e.text(str::to_string))
     }
 }
 

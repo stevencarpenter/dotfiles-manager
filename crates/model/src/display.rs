@@ -18,6 +18,7 @@ pub fn is_invisible(c: char) -> bool {
             | '\u{200b}'..='\u{200f}'
             | '\u{2028}'..='\u{202e}'
             | '\u{2060}'..='\u{206f}'
+            | '\u{2800}'
             | '\u{3164}'
             | '\u{fe00}'..='\u{fe0f}'
             | '\u{feff}'
@@ -31,11 +32,15 @@ pub fn is_invisible(c: char) -> bool {
 }
 
 /// Replaces control and invisible characters with visible escapes so untrusted text cannot
-/// rewrite a terminal or disguise itself.
+/// rewrite a terminal or disguise itself. A backslash becomes `\\`, so literal text such as
+/// `\n` cannot pass for the escape of a real newline. Apply it once, to the text that is
+/// printed: a second pass escapes the first pass's backslashes again.
 pub fn visible(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
-        if c.is_control() {
+        if c == '\\' {
+            out.push_str("\\\\");
+        } else if c.is_control() {
             out.extend(c.escape_default());
         } else if is_invisible(c) {
             out.extend(c.escape_unicode());
@@ -60,6 +65,19 @@ mod tests {
     }
 
     #[test]
+    fn a_backslash_is_escaped_so_literal_text_cannot_pass_for_an_escape() {
+        // A real newline and the two characters `\` `n` must print differently.
+        assert_eq!(visible("a\nb"), "a\\nb");
+        assert_eq!(visible("a\\nb"), "a\\\\nb");
+        assert_ne!(visible("\n"), visible("\\n"));
+        assert_eq!(visible("C:\\x"), "C:\\\\x");
+        // The braille blank renders as an empty cell.
+        assert_eq!(visible("a\u{2800}b"), "a\\u{2800}b");
+        // Text with no backslash that was escaped once is escaped again, so apply it once.
+        assert_ne!(visible(&visible("\n")), visible("\n"));
+    }
+
+    #[test]
     fn the_wider_invisible_set_is_covered() {
         for c in [
             '\u{061c}',
@@ -81,6 +99,7 @@ mod tests {
             '\u{200d}',
             '\u{2064}',
             '\u{206f}',
+            '\u{2800}',
         ] {
             assert!(is_invisible(c), "{:x}", c as u32);
             assert!(!visible(&c.to_string()).contains(c), "{:x}", c as u32);

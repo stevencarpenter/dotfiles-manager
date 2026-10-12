@@ -6,7 +6,7 @@
 //! serves `render` (no inputs beyond the resource value) and `assemble` (a body and the
 //! fragments the planner listed).
 
-use crate::fsys::{Dir, Got, Peek, Sys};
+use crate::fsys::{Dir, Got, Listing, Peek, Sys};
 use dfm_model::digest::{EntryKind, TreeEntry, sha256_hex, tree_digest};
 use dfm_model::fold;
 use dfm_model::merge::{Merged, fragment_token};
@@ -413,15 +413,82 @@ fn walk(
     Ok(())
 }
 
+/// Entries the containment walk of a directory source with excluded content may examine in all.
+/// The plan never lists inside an excluded directory, so the walk has to cover a large virtual
+/// environment or `node_modules`. It matches the count the source loader stops at when it
+/// reports the biggest directories.
+const MAX_LINK_WALK_ENTRIES: usize = 1_000_000;
+/// Deepest directory the walk enters. It holds one descriptor per level.
+const MAX_LINK_WALK_DEPTH: usize = 64;
+
+/// The refusal for a listing the walk cannot trust: a name that is not UTF-8, or more entries
+/// than the walk has left (the listing stops one past the budget, so it may be cut).
+fn listing_refusal(listing: &Listing, budget: usize, shown: &str) -> Option<Refusal> {
+    if listing.odd > 0 {
+        return Some(Refusal::new(
+            Code::SourceUntrusted,
+            format!("source {shown} holds an entry whose name is not UTF-8"),
+        ));
+    }
+    (listing.names.len() > budget).then(|| {
+        Refusal::new(
+            Code::LimitExceeded,
+            format!("source {shown} holds more than {MAX_LINK_WALK_ENTRIES} entries"),
+        )
+    })
+}
+
+/// A directory source with excluded content is not hashed, but a link inside it is still
+/// published. Every link below `dir` must stay inside the source directory (see
+/// [`dfm_model::resolve::target_stays_inside`]); `depth` is the number of levels between that directory and `dir`.
+/// The check fails closed: a listing that was cut, an entry that is not UTF-8, a directory or
+/// entry that cannot be examined, and a walk over the entry or depth limits all refuse.
+fn links_stay_inside(
+    sys: &Sys,
+    dir: &Dir,
+    (depth, shown): (usize, &str),
+    budget: &mut usize,
+) -> Result<(), Gather> {
+    if depth > MAX_LINK_WALK_DEPTH {
+        return Err(Gather::Failed(Refusal::new(
+            Code::LimitExceeded,
+            format!("source {shown} has directories nested more than {MAX_LINK_WALK_DEPTH} deep"),
+        )));
+    }
+    let listing = dir.list_upto(*budget)?;
+    listing_refusal(&listing, *budget, shown).map_or(Ok(()), |r| Err(Gather::Failed(r)))?;
+    *budget -= listing.names.len();
+    for name in listing.names {
+        match dir.peek(sys, &name)? {
+            Peek::Link { target, .. }
+                if !dfm_model::resolve::target_stays_inside(&target, depth) =>
+            {
+                return Err(Gather::Failed(Refusal::new(
+                    Code::SourceEscape,
+                    format!("source link {name} in {shown} leaves the source directory"),
+                )));
+            }
+            Peek::Dir { .. } => {
+                let child = dir.peek_dir(&name)?.ok_or_else(|| tree_stale(shown))?;
+                links_stay_inside(sys, &child, (depth + 1, shown), budget)?;
+            }
+            Peek::Missing => return Err(tree_stale(shown)),
+            Peek::Unknown(why) => return Err(unreadable(shown, &why)),
+            Peek::File { .. } | Peek::Link { .. } | Peek::Other { .. } => {}
+        }
+    }
+    Ok(())
+}
+
 /// Reads the source of a link operation again, immediately before the operation is journaled.
 /// The source root is the trusted start; every component below it is opened without following a
 /// link. The path must still be a regular file or a directory, and its content hash (file) or
 /// tree digest (directory) must equal the plan's `source:` precondition. A source with no
 /// recorded identity (a secret value) is checked for presence and type only.
 ///
-/// shortcut: a directory source with entries that `[sources].exclude` left out is checked for
-/// presence and type only, because the plan does not record the exclude patterns; revisit when
-/// the plan carries the scope.
+/// shortcut: a directory source with entries that `[sources].exclude` left out is not compared
+/// with its digest, because the plan does not record the exclude patterns; its links are only
+/// checked to stay inside the source directory. Revisit when the plan carries the scope.
 pub(crate) fn link_source(sys: &Sys, plan: &Plan, op: &Operation) -> Result<(), Gather> {
     let (Some(input), Some(link)) = (op.inputs.first(), op.link.as_deref()) else {
         return Ok(());
@@ -460,7 +527,9 @@ pub(crate) fn link_source(sys: &Sys, plan: &Plan, op: &Operation) -> Result<(), 
         }
         Peek::Dir { .. } => {
             let dir = cur.peek_dir(name)?.ok_or_else(gone)?;
-            if let (Some(want), None) = (want, op.excluded) {
+            if op.excluded.is_some() {
+                links_stay_inside(sys, &dir, (0, path), &mut { MAX_LINK_WALK_ENTRIES })?;
+            } else if let Some(want) = want {
                 let mut tree = Tree {
                     entries: Vec::new(),
                     bytes: 0,
@@ -475,4 +544,132 @@ pub(crate) fn link_source(sys: &Sys, plan: &Plan, op: &Operation) -> Result<(), 
         _ => return Err(gone()),
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
+    use std::path::PathBuf;
+
+    /// A scratch directory below the system temporary directory, removed on drop.
+    struct Scratch(PathBuf);
+
+    impl Scratch {
+        fn new(label: &str) -> Scratch {
+            let p = std::env::temp_dir().join(format!("dfm-gen-{label}-{}", std::process::id()));
+            let _ = fs::remove_dir_all(&p);
+            fs::create_dir_all(&p).unwrap();
+            Scratch(p)
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            // A test may leave a directory unreadable on purpose.
+            let _ = fs::set_permissions(self.0.join("d/locked"), fs::Permissions::from_mode(0o755));
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// The outcome of the walk over `<scratch>/d` with `budget` entries: `None` when it passes,
+    /// else the code of the refusal.
+    fn walk_code(s: &Scratch, budget: usize) -> Option<Code> {
+        let sys = Sys { uid: 0 };
+        let dir = Dir::open_plain(&s.0.join("d")).unwrap();
+        match links_stay_inside(&sys, &dir, (0, "d"), &mut { budget }) {
+            Ok(()) => None,
+            Err(Gather::Failed(r)) => Some(r.code),
+            Err(Gather::Stale(why)) => panic!("stale: {why}"),
+        }
+    }
+
+    #[test]
+    fn a_link_two_levels_down_may_climb_two_levels_and_not_three() {
+        let s = Scratch::new("climb");
+        fs::create_dir_all(s.0.join("d/a/b")).unwrap();
+        symlink("../../x", s.0.join("d/a/b/ok")).unwrap();
+        assert_eq!(walk_code(&s, 100), None);
+        symlink("../../../x", s.0.join("d/a/b/out")).unwrap();
+        assert_eq!(walk_code(&s, 100), Some(Code::SourceEscape));
+    }
+
+    #[test]
+    fn a_chain_of_links_cannot_climb_past_the_directory() {
+        // l1 -> .. (the directory), and then l3 -> l1/../x would leave it.
+        let s = Scratch::new("chain");
+        fs::create_dir_all(s.0.join("d/a")).unwrap();
+        symlink("..", s.0.join("d/a/l1")).unwrap();
+        assert_eq!(walk_code(&s, 100), None);
+        symlink("l1/../../x", s.0.join("d/a/l3")).unwrap();
+        assert_eq!(walk_code(&s, 100), Some(Code::SourceEscape));
+    }
+
+    #[test]
+    fn a_listing_that_was_cut_is_a_refusal_not_a_pass() {
+        let s = Scratch::new("cut");
+        fs::create_dir_all(s.0.join("d")).unwrap();
+        for n in ["a", "b", "c"] {
+            fs::write(s.0.join("d").join(n), "x").unwrap();
+        }
+        symlink("/etc", s.0.join("d/z")).unwrap();
+        assert_eq!(walk_code(&s, 3), Some(Code::LimitExceeded));
+        // With room for every entry the link is found.
+        assert_eq!(walk_code(&s, 4), Some(Code::SourceEscape));
+        // The budget is shared over the whole walk, so a later directory cannot be skipped.
+        fs::remove_file(s.0.join("d/z")).unwrap();
+        fs::create_dir_all(s.0.join("d/e")).unwrap();
+        symlink("/etc", s.0.join("d/e/z")).unwrap();
+        assert_eq!(walk_code(&s, 4), Some(Code::LimitExceeded));
+        assert_eq!(walk_code(&s, 5), Some(Code::SourceEscape));
+    }
+
+    #[test]
+    fn a_name_that_is_not_utf8_is_a_refusal() {
+        let s = Scratch::new("odd");
+        fs::create_dir_all(s.0.join("d")).unwrap();
+        let odd = std::ffi::OsStr::from_bytes(b"bad\xff");
+        // APFS refuses a name that is not UTF-8, so there is nothing to walk on that volume.
+        if symlink("/etc", s.0.join("d").join(odd)).is_ok() {
+            assert_eq!(walk_code(&s, 100), Some(Code::SourceUntrusted));
+        }
+    }
+
+    #[test]
+    fn a_listing_with_an_odd_name_or_too_many_entries_is_refused_on_every_volume() {
+        // The same decision as the walk makes, on a listing built by hand, so it does not need a
+        // volume that accepts a name which is not UTF-8.
+        let names = |n: usize| (0..n).map(|i| i.to_string()).collect::<Vec<_>>();
+        let listing = |names: Vec<String>, odd| Listing { names, odd };
+        let code = |l: Listing, budget| listing_refusal(&l, budget, "d").map(|r| r.code);
+        assert_eq!(code(listing(names(1), 1), 10), Some(Code::SourceUntrusted));
+        assert_eq!(code(listing(names(4), 0), 3), Some(Code::LimitExceeded));
+        assert_eq!(code(listing(names(3), 0), 3), None);
+        assert_eq!(code(listing(Vec::new(), 0), 0), None);
+    }
+
+    #[test]
+    fn a_directory_that_cannot_be_opened_is_a_refusal() {
+        let s = Scratch::new("locked");
+        fs::create_dir_all(s.0.join("d/locked")).unwrap();
+        symlink("/etc", s.0.join("d/locked/esc")).unwrap();
+        fs::set_permissions(s.0.join("d/locked"), fs::Permissions::from_mode(0o000)).unwrap();
+        // Root reads any directory, so the mode proves nothing there.
+        if fs::metadata(&s.0).unwrap().uid() != 0 {
+            assert!(walk_code(&s, 100).is_some());
+        }
+    }
+
+    #[test]
+    fn a_walk_deeper_than_the_limit_is_a_refusal() {
+        let s = Scratch::new("deep");
+        let deep = (0..=MAX_LINK_WALK_DEPTH + 1)
+            .map(|_| "n")
+            .collect::<Vec<_>>()
+            .join("/");
+        fs::create_dir_all(s.0.join("d").join(deep)).unwrap();
+        assert_eq!(walk_code(&s, 1000), Some(Code::LimitExceeded));
+    }
 }

@@ -13,7 +13,7 @@ pub use error::ResolveError;
 pub use explain::explain;
 pub use schema::{AdapterCatalog, AdapterSpec, Claims, Field, Include, Schema, TargetRule};
 pub use scope::{SourceScope, bundle_scope, profile_bundle_path};
-pub use source::{Entry, SourceSet};
+pub use source::{Entry, SourceSet, target_stays_inside};
 mod compose;
 pub(crate) use compose::glob;
 

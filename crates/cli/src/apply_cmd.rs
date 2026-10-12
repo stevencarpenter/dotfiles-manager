@@ -364,7 +364,7 @@ fn run_inner(
         let error = rec
             .error
             .as_deref()
-            .map_or(String::new(), |e| format!(": {}", visible(e)));
+            .map_or(String::new(), |e| format!(": {e}"));
         writeln!(
             out,
             "  {} {}{reload}{error}",

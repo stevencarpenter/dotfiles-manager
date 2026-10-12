@@ -77,7 +77,7 @@ fn binary_identity() -> Result<Binary, Refusal> {
 
 /// Reads a saved plan: a regular file, not a link, at most 16 MiB.
 fn read_saved(path: &Path) -> Result<Vec<u8>, Refusal> {
-    let shown = visible(&path.display().to_string());
+    let shown = path.display().to_string();
     let io = |e: std::io::Error| {
         Refusal::new(
             Code::ReportUnavailable,
@@ -152,9 +152,9 @@ pub fn plan_for(ctx: &Ctx, loaded: &Loaded) -> Result<Plan, Refusal> {
         // first, with its own code.
         if let Err(e) = store.check_claim_for_plan(&abs.to_string_lossy()) {
             if e.code == Code::StateInvalid {
-                reserved.insert(rel.clone(), visible(&e.detail));
+                reserved.insert(rel.clone(), e.detail);
             } else {
-                unchecked.insert(rel.clone(), visible(&e.detail));
+                unchecked.insert(rel.clone(), e.detail);
             }
         }
     }
@@ -243,6 +243,10 @@ pub(crate) fn render(p: &Plan, digest: &str, out: &mut dyn Write) -> std::io::Re
         }
         if let Some(n) = o.excluded {
             writeln!(out, "    note: contains {n} excluded entries, not hashed")?;
+            writeln!(
+                out,
+                "    note: apply refuses a link inside an excluded entry that is absolute or leaves the directory"
+            )?;
         }
         // The fragments a merge layers over its declared values, by name, in merge order. The
         // names are module data or the user's own files; no content and no hash is shown.
@@ -252,7 +256,7 @@ pub(crate) fn render(p: &Plan, digest: &str, out: &mut dyn Write) -> std::io::Re
         }
     }
     for b in &p.blockers {
-        writeln!(out, "blocked: {}", b.refusal())?;
+        writeln!(out, "blocked: {}", visible(&b.refusal().to_string()))?;
     }
     writeln!(out, "plan digest: {digest}")
 }
@@ -313,13 +317,14 @@ pub fn run(ctx: &Ctx, args: &Args, out: &mut dyn Write) -> Result<(), Refusal> {
     if let Some(first) = diffs.first() {
         return Err(Refusal::new(
             Code::PlanStale,
-            visible(&format!(
+            // Raw: the command escapes the error line once, when it prints it.
+            format!(
                 "{} changed: {} was {} now {}. Fix: review the new plan and approve it again; a plan whose inputs changed cannot be applied",
                 first.what.as_str(),
                 first.subject,
                 first.was,
                 first.now
-            )),
+            ),
         ));
     }
     if old.is_some() && !args.json {

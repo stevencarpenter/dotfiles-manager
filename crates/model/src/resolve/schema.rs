@@ -125,6 +125,7 @@ pub(crate) enum Fault {
         found: &'static str,
     },
     MissingKey,
+    EmptyKey,
     OutOfRange(&'static str),
 }
 
@@ -178,10 +179,20 @@ pub(crate) fn validate(
         },
     };
     match (schema, value) {
+        // An empty key has no RFC 6901 pointer (the empty token is refused), so nothing could
+        // report or address its value. A native document is checked at every depth.
+        (Schema::Native, Value::Table(_)) if has_empty_key(value) => Err(SchemaFault {
+            pointer: ptr.into(),
+            fault: Fault::EmptyKey,
+        }),
+        (Schema::Map(_), Value::Table(t)) if t.contains_key("") => Err(SchemaFault {
+            pointer: ptr.into(),
+            fault: Fault::EmptyKey,
+        }),
         (Schema::Str, Value::String(_))
         | (Schema::Int, Value::Integer(_))
         | (Schema::Bool, Value::Boolean(_))
-        | (Schema::Native, _) => Ok(()),
+        | (Schema::Native, Value::Table(_)) => Ok(()),
         (Schema::FileMode { private }, Value::Integer(n)) => {
             let fault = |why| SchemaFault {
                 pointer: ptr.into(),
@@ -248,6 +259,15 @@ pub(crate) fn validate(
     }
 }
 
+/// Whether a table, or a table inside an array or table below it, has the key `""`.
+fn has_empty_key(v: &Value) -> bool {
+    match v {
+        Value::Table(t) => t.contains_key("") || t.values().any(has_empty_key),
+        Value::Array(a) => a.iter().any(has_empty_key),
+        _ => false,
+    }
+}
+
 /// A HOME-relative output path (DESIGN.md section 4): no absolute path, empty, `.` or `..`
 /// component, NUL or other control character. A leading `~` component is refused too, because
 /// nothing expands it and a literal directory named `~` is never intended.
@@ -263,6 +283,10 @@ pub(crate) fn home_path_fault(path: &str) -> Option<&'static str> {
     }
     if path.chars().any(super::error::is_invisible) {
         return Some("invisible or bidirectional-control character");
+    }
+    // Printed text escapes a backslash, so an id that holds one could not be pasted back as a flag.
+    if path.contains('\\') {
+        return Some("backslash");
     }
     for c in path.split('/') {
         match c {
@@ -369,6 +393,7 @@ mod tests {
             "a\u{202e}b",
             "a\u{200b}b",
             "\u{feff}a",
+            "a\\b",
         ] {
             assert!(home_path_fault(bad).is_some(), "{bad:?}");
         }

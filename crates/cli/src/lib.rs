@@ -86,10 +86,16 @@ exit codes: 0 ok, 1 failed, 2 usage, 3 blocked before mutation, 4 declined,
 
 const MAX_ERROR_CHARS: usize = 512;
 
+/// The first `MAX_ERROR_CHARS` characters of `s`, not escaped. Use it where the sink escapes the
+/// text itself (a doctor `Row`); escaping twice doubles each backslash.
+fn clip(s: &str) -> String {
+    s.chars().take(MAX_ERROR_CHARS).collect()
+}
+
 /// Control, invisible and bidirectional characters become visible escapes, and the length is
 /// bounded.
 fn bounded(s: &str) -> String {
-    dfm_model::display::visible(&s.chars().take(MAX_ERROR_CHARS).collect::<String>())
+    dfm_model::display::visible(&clip(s))
 }
 
 struct Ctx {
@@ -394,7 +400,7 @@ fn load_resolved_any_machine(ctx: &Ctx, root: &Path) -> Result<Loaded, Refusal> 
     let root = fs::canonicalize(root).map_err(|e| {
         Refusal::new(
             Code::ReportUnavailable,
-            dfm_model::display::visible(&format!("{}: {}", root.display(), e.kind())),
+            format!("{}: {}", root.display(), e.kind()),
         )
     })?;
     let rel = Path::new(binding.profile())

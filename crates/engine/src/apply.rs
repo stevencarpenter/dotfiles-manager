@@ -117,10 +117,7 @@ pub fn owned_outputs(ledger: &Ledger, home: &Path) -> Result<Vec<Owned>, Refusal
                 .ok_or_else(|| {
                     Refusal::new(
                         Code::StateInvalid,
-                        format!(
-                            "ledger path {} is outside HOME",
-                            dfm_model::display::visible(&o.path)
-                        ),
+                        format!("ledger path {} is outside HOME", o.path),
                     )
                 })?;
             out.push(Owned {
@@ -234,13 +231,10 @@ impl Approval {
 }
 
 /// `--allow-disruptive '<id>'` or `--allow-adopt '<id>'`, quoted so a user can paste it into a
-/// shell.
+/// shell. The id is raw: the command escapes the whole refusal once when it prints it, and a
+/// resolved target holds no control or backslash character, so the printed id is the real one.
 pub fn flag(kind: Approval, id: &str) -> String {
-    format!(
-        "{} '{}'",
-        kind.flag(),
-        dfm_model::display::visible(id).replace('\'', "'\\''")
-    )
+    format!("{} '{}'", kind.flag(), id.replace('\'', "'\\''"))
 }
 
 /// A link target must lie inside the root of the operation's own source: the root whose
@@ -918,10 +912,10 @@ impl Exec<'_, '_> {
             Ok(fp) => fp,
             Err(e) => {
                 let unconfirmed = e.code == Code::IoUnconfirmed;
-                let why: String = dfm_model::display::visible(&e.detail)
-                    .chars()
-                    .take(1024)
-                    .collect();
+                // The journal keeps escaped text. The refusal keeps the raw text, which the
+                // command escapes once when it prints it.
+                let raw: String = e.detail.chars().take(1024).collect();
+                let why = dfm_model::display::visible(&raw);
                 let phase = if unconfirmed {
                     Phase::Unknown
                 } else {
@@ -937,7 +931,7 @@ impl Exec<'_, '_> {
                     Ok(()) => e,
                     Err(n) => Refusal::new(
                         e.code,
-                        format!("{why}; the outcome could not be journaled: {}", n.detail),
+                        format!("{raw}; the outcome could not be journaled: {}", n.detail),
                     ),
                 };
                 return Err(self.after_intent(e, &id, &abs));
@@ -1165,10 +1159,8 @@ impl Exec<'_, '_> {
         let effect = self.merge_effect(rel, parent, name, read, &merged.bytes, merged.changed);
         if let Err(e) = effect {
             let unconfirmed = e.code == Code::IoUnconfirmed;
-            let why: String = dfm_model::display::visible(&e.detail)
-                .chars()
-                .take(1024)
-                .collect();
+            let raw: String = e.detail.chars().take(1024).collect();
+            let why = dfm_model::display::visible(&raw);
             let phase = if unconfirmed {
                 Phase::Unknown
             } else {
@@ -1179,7 +1171,7 @@ impl Exec<'_, '_> {
                 Ok(()) => e,
                 Err(n) => Refusal::new(
                     e.code,
-                    format!("{why}; the outcome could not be journaled: {}", n.detail),
+                    format!("{raw}; the outcome could not be journaled: {}", n.detail),
                 ),
             };
             return Err(self.after_intent(e, &id, abs));
