@@ -292,6 +292,24 @@ fn load(root: &Path, declared: Option<&SourceScope>) -> Result<SourceSet, Refusa
             format!("cannot read source {p}: {}", e.kind()),
         )
     }
+    /// The target text of the link `e`, which must be UTF-8 and hold no control character, like a
+    /// name. An excluded link is read the same way, because containment is decided on the text.
+    fn link_target(e: &fs::DirEntry, path: &str, rel: &str) -> Result<String, Refusal> {
+        let target = fs::read_link(e.path()).map_err(|e| io(e, path))?;
+        let target = target.into_os_string().into_string().map_err(|_| {
+            refusal(
+                Code::SourceUntrusted,
+                format!("non-UTF-8 link target at {path}"),
+            )
+        })?;
+        if target.chars().any(char::is_control) {
+            return Err(refusal(
+                Code::SourceUntrusted,
+                format!("control character in a name under {rel}"),
+            ));
+        }
+        Ok(target)
+    }
     /// Reads the entries of `dir`. With `shallow`, subdirectories are left alone.
     fn go(dir: &Path, rel: &str, st: &mut State, shallow: bool) -> Result<(), Refusal> {
         let mut names: Vec<_> = fs::read_dir(dir)
@@ -325,9 +343,9 @@ fn load(root: &Path, declared: Option<&SourceScope>) -> Result<SourceSet, Refusa
                     st.set.record_pruned(&shown);
                     // Exclusion hides an entry from hashing, never from containment: a link
                     // that is excluded is still published inside a directory source.
-                    if e.file_type().is_ok_and(|t| t.is_symlink()) {
-                        let target = fs::read_link(e.path()).map_err(|e| io(e, &shown))?;
-                        st.set.record_pruned_link(&shown, &target.to_string_lossy());
+                    if e.file_type().map_err(|e| io(e, &shown))?.is_symlink() {
+                        let target = link_target(&e, &shown, rel)?;
+                        st.set.record_pruned_link(&shown, &target);
                     }
                     continue;
                 }
@@ -372,19 +390,7 @@ fn load(root: &Path, declared: Option<&SourceScope>) -> Result<SourceSet, Refusa
                 return Err(st.too_many_entries());
             }
             if ty.is_symlink() {
-                let target = fs::read_link(e.path()).map_err(|e| io(e, &path))?;
-                let target = target.into_os_string().into_string().map_err(|_| {
-                    refusal(
-                        Code::SourceUntrusted,
-                        format!("non-UTF-8 link target at {path}"),
-                    )
-                })?;
-                if target.chars().any(char::is_control) {
-                    return Err(refusal(
-                        Code::SourceUntrusted,
-                        format!("control character in a name under {rel}"),
-                    ));
-                }
+                let target = link_target(&e, &path, rel)?;
                 st.set.insert_link(path, target);
             } else if ty.is_dir() {
                 st.set.insert_dir(path.clone());

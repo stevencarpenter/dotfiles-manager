@@ -1996,6 +1996,76 @@ fn se2_an_excluded_link_is_still_checked_for_containment() {
 }
 
 #[test]
+fn se2_a_directory_with_excluded_entries_keeps_its_links_inside_itself() {
+    // Apply cannot see the exclude patterns, so it holds every link in such a directory to the
+    // directory itself. Plan uses the same bound: a sibling in the module root is refused too.
+    let esc = format!("{REUSABLE_FILES}/D/esc");
+    let sibling = |set: &mut SourceSet| {
+        set.insert_file(format!("{REUSABLE_FILES}/x/in"), "i");
+        set.record_pruned_link(&esc, "../x");
+    };
+    let mut set = tree_set();
+    sibling(&mut set);
+    set.record_pruned(&esc);
+    tree_escape(&set);
+    // The same link in a directory with nothing excluded keeps the module root as its bound.
+    let mut set = tree_set();
+    sibling(&mut set);
+    ok(&set, B);
+    // A loaded link of a directory that has excluded entries is held to the directory as well.
+    let mut set = tree_set();
+    set.insert_file(format!("{REUSABLE_FILES}/x/in"), "i");
+    set.insert_link(format!("{REUSABLE_FILES}/D/ln"), "../x");
+    set.record_pruned(&format!("{REUSABLE_FILES}/D/.venv"));
+    tree_escape(&set);
+    // Control: links that stay inside the directory resolve.
+    let mut set = tree_set();
+    set.insert_link(format!("{REUSABLE_FILES}/D/ln"), "keep");
+    set.record_pruned_link(&esc, "keep");
+    set.record_pruned(&esc);
+    ok(&set, B);
+}
+
+#[test]
+fn se2_excluded_links_whose_names_differ_only_by_case_are_all_checked() {
+    let (upper, lower) = (
+        format!("{REUSABLE_FILES}/D/Esc"),
+        format!("{REUSABLE_FILES}/D/esc"),
+    );
+    for escaping_first in [true, false] {
+        let mut set = tree_set();
+        let (first, second) = if escaping_first {
+            (("/etc", &upper), ("keep", &lower))
+        } else {
+            (("keep", &lower), ("/etc", &upper))
+        };
+        set.record_pruned_link(first.1, first.0);
+        set.record_pruned_link(second.1, second.0);
+        tree_escape(&set);
+    }
+}
+
+#[test]
+fn se1_many_links_into_nested_directories_are_checked_once_and_still_find_an_escape() {
+    // D/d1/d2/.../d30 with a link from D to each level: every level is reached by a link and
+    // lies below another reached level. The escape sits at the bottom, behind the last link.
+    let chain = |n: usize| {
+        (1..=n)
+            .map(|i| format!("d{i}"))
+            .collect::<Vec<_>>()
+            .join("/")
+    };
+    let mut set = tree_set();
+    for k in 1..=30 {
+        set.insert_link(format!("{REUSABLE_FILES}/D/l{k}"), chain(k));
+    }
+    set.insert_file(format!("{REUSABLE_FILES}/D/{}/leaf", chain(30)), "l");
+    ok(&set, B);
+    set.insert_link(format!("{REUSABLE_FILES}/D/{}/esc", chain(30)), "/etc");
+    tree_escape(&set);
+}
+
+#[test]
 fn r2_a_native_source_that_is_not_utf8_is_refused_by_name() {
     let mut set = synthetic();
     set.insert_file(
@@ -2056,6 +2126,27 @@ fn r8_an_empty_map_key_is_refused() {
         "a map key is empty",
     );
     assert_eq!(e.field.as_deref(), Some("/entries"));
+}
+
+#[test]
+fn r8_an_empty_key_inside_a_native_table_is_refused() {
+    // The empty key has no JSON pointer at any depth, so a leaf below it could not be reported.
+    for (at, value) in [
+        ("/resources/0/value/seed/", "1"),
+        ("/resources/0/value/managed/sub", "{ \"\" = 1 }"),
+    ] {
+        let mut set = examples();
+        edit(&mut set, AGENTS_MOD, "add", at, Some(value));
+        let e = refused(
+            &set,
+            PERSONAL,
+            Code::ManifestInvalid,
+            AGENTS_MOD,
+            Some("agents.claude-settings"),
+            "a map key is empty",
+        );
+        assert!(e.field.is_some(), "{e}");
+    }
 }
 
 /// Includes written relative to the including file's directory match the resource that
@@ -2178,6 +2269,25 @@ fn r6_selection_errors_do_not_depend_on_list_order() {
         assert_eq!(e.code, Code::ModuleUnknown, "{requires:?}: {e}");
         assert_eq!(e.source, "b/m/b.toml");
     }
+    // It holds across lists too: a duplicate in the profile does not hide an unknown
+    // prerequisite of a module, and a duplicate in one module's prerequisites does not hide an
+    // unknown one in a module with a later ID.
+    let mods = [("a", &[][..], none()), ("b", &["ghost"][..], none())];
+    for list in [["a", "a", "b"], ["b", "a", "a"]] {
+        let e = err(&graph(&mods, &list), "p/profile.toml");
+        assert_eq!(e.code, Code::ModuleUnknown, "{list:?}: {e}");
+        assert_eq!(e.source, "b/m/b.toml");
+    }
+    let mods = [
+        ("a", &[][..], none()),
+        ("b", &["a", "a"][..], none()),
+        ("c", &["ghost"][..], none()),
+    ];
+    let e = err(&graph(&mods, &["a", "b", "c"]), "p/profile.toml");
+    assert_eq!(
+        (e.code, e.source.as_str()),
+        (Code::ModuleUnknown, "b/m/c.toml")
+    );
 }
 
 #[test]
@@ -2212,4 +2322,18 @@ fn r9_the_resource_cap_is_exact_and_refused_before_the_resources_are_composed() 
     let e = err(&graph(&mods(1), &selected), "p/profile.toml");
     assert_eq!(e.code, Code::LimitExceeded);
     assert!(e.message.contains("more than 10000 resources"), "{e}");
+    // The cap is checked from the counts, before any resource is composed: a module whose
+    // resource names an unknown adapter (a refusal of its own, in module ID order before the
+    // module that crosses the cap) still gets the limit error.
+    let bad = "[[resources]]\nid = \"bad\"\nkind = \"link\"\nadapter = \"nope/v1\"\ntarget = \"t/bad\"\n[resources.value]\nsource = \"files/f\"\n";
+    let mut with_bad = mods(1);
+    with_bad[0].2.push_str(bad);
+    let e = err(&graph(&with_bad, &selected), "p/profile.toml");
+    assert_eq!(e.code, Code::LimitExceeded, "{e}");
+    // Control: the same module without the extra resources is refused for its adapter.
+    let e = err(
+        &graph(&[("a", &[][..], bad.to_string())], &["a"]),
+        "p/profile.toml",
+    );
+    assert_eq!(e.code, Code::AdapterUnknown, "{e}");
 }

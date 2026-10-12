@@ -678,6 +678,52 @@ fn a_backslash_in_a_refused_path_is_escaped_once() {
     assert!(!err.contains("pi\\\\\\\\npe"), "{err}");
 }
 
+/// Every path below `dir` (the lock file apart, which every mutating command rewrites with its
+/// holder note), the content of the binding and of the whole state store.
+fn home_state(fx: &Fx) -> (Vec<PathBuf>, String, String) {
+    fn paths(dir: &Path, out: &mut Vec<PathBuf>) {
+        for e in fs::read_dir(dir).unwrap() {
+            let p = e.unwrap().path();
+            if p.file_name().unwrap() == "dotfiles-manager.lock" {
+                continue;
+            }
+            out.push(p.clone());
+            if p.symlink_metadata().unwrap().is_dir() {
+                paths(&p, out);
+            }
+        }
+    }
+    let mut all = Vec::new();
+    paths(fx.home.path(), &mut all);
+    (
+        all,
+        fingerprint(&fx.h(".config")),
+        fingerprint(&fx.h(".local/state/dotfiles-manager")),
+    )
+}
+
+/// Applies the plan and expects a refusal that names `want`. The first refusal may create the
+/// state store. A second one must then leave HOME and the whole store as they were, and no link
+/// may have been published.
+fn apply_refused(fx: &Fx, digest: &str, want: &str) -> String {
+    let apply = || {
+        let o = fx.run(&["apply", "--root", fx.root_arg(), "--yes-plan", digest]);
+        let all = format!("{}{}", text(&o.stdout), text(&o.stderr));
+        assert_ne!(code(&o), 0, "{all}");
+        assert!(all.contains(want), "{want} not in: {all}");
+        all
+    };
+    apply();
+    let before = home_state(fx);
+    let all = apply();
+    assert_eq!(home_state(fx), before, "HOME or the state store changed");
+    assert!(
+        fs::symlink_metadata(fx.h(".config/plugs")).is_err(),
+        "the directory link was published"
+    );
+    all
+}
+
 #[test]
 fn apply_refuses_a_link_planted_in_excluded_content_after_the_plan() {
     let fx = scoped(r#""base", "profiles""#, r#""**/.venv""#);
@@ -687,18 +733,42 @@ fn apply_refuses_a_link_planted_in_excluded_content_after_the_plan() {
     // The excluded directory is neither listed nor hashed, so the plan digest does not change.
     let venv = fx.root.join(PLUGDIR).join(".venv");
     symlink("/etc", venv.join("esc")).unwrap();
-    let o = fx.run(&["apply", "--root", fx.root_arg(), "--yes-plan", &digest]);
-    let all = format!("{}{}", text(&o.stdout), text(&o.stderr));
-    assert_ne!(code(&o), 0, "{all}");
-    assert!(all.contains("E_SOURCE_ESCAPE"), "{all}");
-    assert!(
-        fs::symlink_metadata(fx.h(".config/plugs")).is_err(),
-        "the directory link was published"
-    );
+    apply_refused(&fx, &digest, "E_SOURCE_ESCAPE");
     // Control: a link that stays inside the source root applies.
     fs::remove_file(venv.join("esc")).unwrap();
     symlink("lib", venv.join("ok")).unwrap();
     let o = fx.run(&["apply", "--root", fx.root_arg(), "--yes-plan", &digest]);
     assert_eq!(code(&o), 0, "{}{}", text(&o.stdout), text(&o.stderr));
     assert!(fs::symlink_metadata(fx.h(".config/plugs")).is_ok());
+}
+
+#[test]
+fn apply_holds_links_in_excluded_content_to_the_directory_source_not_the_root() {
+    let fx = scoped(r#""base", "profiles""#, r#""**/.venv""#);
+    with_plugs(&fx);
+    let o = fx.run(&["plan", "--root", fx.root_arg(), "--json"]);
+    let digest = Saved::parse(&o.stdout).unwrap().plan_digest;
+    // The target stays under --root (in the core module) but leaves the directory source.
+    let venv = fx.root.join(PLUGDIR).join(".venv");
+    let out = "../../../../core/files/gitconfig";
+    assert!(venv.join(out).exists(), "the target must exist: {out}");
+    symlink(out, venv.join("up")).unwrap();
+    apply_refused(&fx, &digest, "E_SOURCE_ESCAPE");
+    // A chain: the first link stays inside, the second climbs from where the first points.
+    fs::remove_file(venv.join("up")).unwrap();
+    symlink("..", venv.join("l1")).unwrap();
+    symlink("l1/../x", venv.join("l3")).unwrap();
+    apply_refused(&fx, &digest, "E_SOURCE_ESCAPE");
+}
+
+#[test]
+fn an_excluded_link_target_with_a_control_character_is_refused_like_a_name() {
+    // Exclusion hides the link from hashing, not from the checks on its target text.
+    let fx = scoped(r#""base", "profiles""#, r#""**/esc""#);
+    add_plugs_module(&fx);
+    fx.put(&format!("{PLUGDIR}/keep"), "k");
+    symlink("keep\u{1b}[2J", fx.root.join(PLUGDIR).join("esc")).unwrap();
+    let err = plan_refused(&fx, "E_SOURCE_UNTRUSTED");
+    assert!(err.contains("control character"), "{err}");
+    assert!(!err.contains('\u{1b}'), "{err:?}");
 }

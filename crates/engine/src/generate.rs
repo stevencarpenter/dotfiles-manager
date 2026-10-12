@@ -413,54 +413,83 @@ fn walk(
     Ok(())
 }
 
+/// Entries the containment walk of a directory source with excluded content may examine in all.
+/// The plan never lists inside an excluded directory, so the walk has to cover a large virtual
+/// environment or `node_modules`. It matches the count the source loader stops at when it
+/// reports the biggest directories.
+const MAX_LINK_WALK_ENTRIES: usize = 1_000_000;
+/// Deepest directory the walk enters. It holds one descriptor per level.
+const MAX_LINK_WALK_DEPTH: usize = 64;
+
+/// Whether a link in a directory `depth` levels below the source directory stays inside that
+/// directory. The target must be relative and may climb only with leading `..` components, no
+/// more than `depth` of them. A `..` after a name is refused: the name may be a link, and then
+/// the climb starts from where that link points, which a lexical count cannot see. With this
+/// rule every link target resolves under the source directory, whatever chain of links it
+/// passes through, because each link in the chain obeys the same rule.
+fn target_stays_inside(target: &str, depth: usize) -> bool {
+    if target.starts_with('/') {
+        return false;
+    }
+    let mut left = depth;
+    let mut named = false;
+    for c in target.split('/') {
+        match c {
+            "" | "." => {}
+            ".." if named || left == 0 => return false,
+            ".." => left -= 1,
+            _ => named = true,
+        }
+    }
+    true
+}
+
 /// A directory source with excluded content is not hashed, but a link inside it is still
-/// published. Every link found must stay lexically inside the source root: `depth` is the
-/// number of components between the root and `dir`, and a target may not climb past it or be
-/// absolute. This is a bounded check of what the engine can see without the exclude patterns.
-///
-/// shortcut: it stops listing after `MAX_SOURCE_ENTRIES` entries and skips entries it cannot
-/// examine, because excluded trees (virtual environments) can be large or unreadable; the
-/// plan-time check in the resolver covers everything it loaded.
-fn links_stay_in_root(
+/// published. Every link below `dir` must stay inside the source directory (see
+/// [`target_stays_inside`]); `depth` is the number of levels between that directory and `dir`.
+/// The check fails closed: a listing that was cut, an entry that is not UTF-8, a directory or
+/// entry that cannot be examined, and a walk over the entry or depth limits all refuse.
+fn links_stay_inside(
     sys: &Sys,
     dir: &Dir,
-    depth: usize,
+    (depth, shown): (usize, &str),
     budget: &mut usize,
 ) -> Result<(), Gather> {
-    let Ok(listing) = dir.list_upto(*budget) else {
-        return Ok(());
-    };
-    *budget = budget.saturating_sub(listing.names.len());
+    if depth > MAX_LINK_WALK_DEPTH {
+        return Err(Gather::Failed(Refusal::new(
+            Code::LimitExceeded,
+            format!("source {shown} has directories nested more than {MAX_LINK_WALK_DEPTH} deep"),
+        )));
+    }
+    let listing = dir.list_upto(*budget)?;
+    if listing.odd > 0 {
+        return Err(Gather::Failed(Refusal::new(
+            Code::SourceUntrusted,
+            format!("source {shown} holds an entry whose name is not UTF-8"),
+        )));
+    }
+    if listing.names.len() > *budget {
+        return Err(Gather::Failed(Refusal::new(
+            Code::LimitExceeded,
+            format!("source {shown} holds more than {MAX_LINK_WALK_ENTRIES} entries"),
+        )));
+    }
+    *budget -= listing.names.len();
     for name in listing.names {
-        match dir.peek(sys, &name) {
-            Ok(Peek::Link { target, .. }) => {
-                let mut left = depth;
-                let escapes = target.starts_with('/')
-                    || target.split('/').any(|c| match c {
-                        "" | "." => false,
-                        ".." if left == 0 => true,
-                        ".." => {
-                            left -= 1;
-                            false
-                        }
-                        _ => {
-                            left += 1;
-                            false
-                        }
-                    });
-                if escapes {
-                    return Err(Gather::Failed(Refusal::new(
-                        Code::SourceEscape,
-                        format!("source link {name} leaves the source root"),
-                    )));
-                }
+        match dir.peek(sys, &name)? {
+            Peek::Link { target, .. } if !target_stays_inside(&target, depth) => {
+                return Err(Gather::Failed(Refusal::new(
+                    Code::SourceEscape,
+                    format!("source link {name} in {shown} leaves the source directory"),
+                )));
             }
-            Ok(Peek::Dir { .. }) => {
-                if let Ok(Some(child)) = dir.peek_dir(&name) {
-                    links_stay_in_root(sys, &child, depth + 1, budget)?;
-                }
+            Peek::Dir { .. } => {
+                let child = dir.peek_dir(&name)?.ok_or_else(|| tree_stale(shown))?;
+                links_stay_inside(sys, &child, (depth + 1, shown), budget)?;
             }
-            _ => {}
+            Peek::Missing => return Err(tree_stale(shown)),
+            Peek::Unknown(why) => return Err(unreadable(shown, &why)),
+            Peek::File { .. } | Peek::Link { .. } | Peek::Other { .. } => {}
         }
     }
     Ok(())
@@ -474,7 +503,7 @@ fn links_stay_in_root(
 ///
 /// shortcut: a directory source with entries that `[sources].exclude` left out is not compared
 /// with its digest, because the plan does not record the exclude patterns; its links are only
-/// checked to stay inside the source root. Revisit when the plan carries the scope.
+/// checked to stay inside the source directory. Revisit when the plan carries the scope.
 pub(crate) fn link_source(sys: &Sys, plan: &Plan, op: &Operation) -> Result<(), Gather> {
     let (Some(input), Some(link)) = (op.inputs.first(), op.link.as_deref()) else {
         return Ok(());
@@ -514,8 +543,7 @@ pub(crate) fn link_source(sys: &Sys, plan: &Plan, op: &Operation) -> Result<(), 
         Peek::Dir { .. } => {
             let dir = cur.peek_dir(name)?.ok_or_else(gone)?;
             if op.excluded.is_some() {
-                let depth = path.split('/').count();
-                links_stay_in_root(sys, &dir, depth, &mut { MAX_SOURCE_ENTRIES })?;
+                links_stay_inside(sys, &dir, (0, path), &mut { MAX_LINK_WALK_ENTRIES })?;
             } else if let Some(want) = want {
                 let mut tree = Tree {
                     entries: Vec::new(),
@@ -531,4 +559,143 @@ pub(crate) fn link_source(sys: &Sys, plan: &Plan, op: &Operation) -> Result<(), 
         _ => return Err(gone()),
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
+    use std::path::PathBuf;
+
+    /// A scratch directory below the system temporary directory, removed on drop.
+    struct Scratch(PathBuf);
+
+    impl Scratch {
+        fn new(label: &str) -> Scratch {
+            let p = std::env::temp_dir().join(format!("dfm-gen-{label}-{}", std::process::id()));
+            let _ = fs::remove_dir_all(&p);
+            fs::create_dir_all(&p).unwrap();
+            Scratch(p)
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            // A test may leave a directory unreadable on purpose.
+            let _ = fs::set_permissions(self.0.join("d/locked"), fs::Permissions::from_mode(0o755));
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// The outcome of the walk over `<scratch>/d` with `budget` entries: `None` when it passes,
+    /// else the code of the refusal.
+    fn walk_code(s: &Scratch, budget: usize) -> Option<Code> {
+        let sys = Sys { uid: 0 };
+        let dir = Dir::open_plain(&s.0.join("d")).unwrap();
+        match links_stay_inside(&sys, &dir, (0, "d"), &mut { budget }) {
+            Ok(()) => None,
+            Err(Gather::Failed(r)) => Some(r.code),
+            Err(Gather::Stale(why)) => panic!("stale: {why}"),
+        }
+    }
+
+    #[test]
+    fn a_target_may_only_climb_with_leading_parents_and_not_past_the_directory() {
+        for (target, depth, ok) in [
+            ("keep", 0, true),
+            ("./a/b", 0, true),
+            ("", 0, true),
+            ("..", 0, false),
+            ("..", 1, true),
+            ("../..", 1, false),
+            ("../../x", 2, true),
+            ("../../../x", 2, false),
+            // A `..` after a name starts from wherever that name leads, which may be a link.
+            ("a/../b", 3, false),
+            ("../a/..", 3, false),
+            ("/etc", 3, false),
+        ] {
+            assert_eq!(
+                target_stays_inside(target, depth),
+                ok,
+                "{target} at {depth}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_link_two_levels_down_may_climb_two_levels_and_not_three() {
+        let s = Scratch::new("climb");
+        fs::create_dir_all(s.0.join("d/a/b")).unwrap();
+        symlink("../../x", s.0.join("d/a/b/ok")).unwrap();
+        assert_eq!(walk_code(&s, 100), None);
+        symlink("../../../x", s.0.join("d/a/b/out")).unwrap();
+        assert_eq!(walk_code(&s, 100), Some(Code::SourceEscape));
+    }
+
+    #[test]
+    fn a_chain_of_links_cannot_climb_past_the_directory() {
+        // l1 -> .. (the directory), and then l3 -> l1/../x would leave it.
+        let s = Scratch::new("chain");
+        fs::create_dir_all(s.0.join("d/a")).unwrap();
+        symlink("..", s.0.join("d/a/l1")).unwrap();
+        assert_eq!(walk_code(&s, 100), None);
+        symlink("l1/../../x", s.0.join("d/a/l3")).unwrap();
+        assert_eq!(walk_code(&s, 100), Some(Code::SourceEscape));
+    }
+
+    #[test]
+    fn a_listing_that_was_cut_is_a_refusal_not_a_pass() {
+        let s = Scratch::new("cut");
+        fs::create_dir_all(s.0.join("d")).unwrap();
+        for n in ["a", "b", "c"] {
+            fs::write(s.0.join("d").join(n), "x").unwrap();
+        }
+        symlink("/etc", s.0.join("d/z")).unwrap();
+        assert_eq!(walk_code(&s, 3), Some(Code::LimitExceeded));
+        // With room for every entry the link is found.
+        assert_eq!(walk_code(&s, 4), Some(Code::SourceEscape));
+        // The budget is shared over the whole walk, so a later directory cannot be skipped.
+        fs::remove_file(s.0.join("d/z")).unwrap();
+        fs::create_dir_all(s.0.join("d/e")).unwrap();
+        symlink("/etc", s.0.join("d/e/z")).unwrap();
+        assert_eq!(walk_code(&s, 4), Some(Code::LimitExceeded));
+        assert_eq!(walk_code(&s, 5), Some(Code::SourceEscape));
+    }
+
+    #[test]
+    fn a_name_that_is_not_utf8_is_a_refusal() {
+        let s = Scratch::new("odd");
+        fs::create_dir_all(s.0.join("d")).unwrap();
+        let odd = std::ffi::OsStr::from_bytes(b"bad\xff");
+        // APFS refuses a name that is not UTF-8, so there is nothing to walk on that volume.
+        if symlink("/etc", s.0.join("d").join(odd)).is_ok() {
+            assert_eq!(walk_code(&s, 100), Some(Code::SourceUntrusted));
+        }
+    }
+
+    #[test]
+    fn a_directory_that_cannot_be_opened_is_a_refusal() {
+        let s = Scratch::new("locked");
+        fs::create_dir_all(s.0.join("d/locked")).unwrap();
+        symlink("/etc", s.0.join("d/locked/esc")).unwrap();
+        fs::set_permissions(s.0.join("d/locked"), fs::Permissions::from_mode(0o000)).unwrap();
+        // Root reads any directory, so the mode proves nothing there.
+        if fs::metadata(&s.0).unwrap().uid() != 0 {
+            assert!(walk_code(&s, 100).is_some());
+        }
+    }
+
+    #[test]
+    fn a_walk_deeper_than_the_limit_is_a_refusal() {
+        let s = Scratch::new("deep");
+        let deep = (0..=MAX_LINK_WALK_DEPTH + 1)
+            .map(|_| "n")
+            .collect::<Vec<_>>()
+            .join("/");
+        fs::create_dir_all(s.0.join("d").join(deep)).unwrap();
+        assert_eq!(walk_code(&s, 1000), Some(Code::LimitExceeded));
+    }
 }

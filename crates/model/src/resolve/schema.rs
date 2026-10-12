@@ -179,6 +179,16 @@ pub(crate) fn validate(
         },
     };
     match (schema, value) {
+        // An empty key has no RFC 6901 pointer (the empty token is refused), so nothing could
+        // report or address its value. A native document is checked at every depth.
+        (Schema::Native, Value::Table(_)) if has_empty_key(value) => Err(SchemaFault {
+            pointer: ptr.into(),
+            fault: Fault::EmptyKey,
+        }),
+        (Schema::Map(_), Value::Table(t)) if t.contains_key("") => Err(SchemaFault {
+            pointer: ptr.into(),
+            fault: Fault::EmptyKey,
+        }),
         (Schema::Str, Value::String(_))
         | (Schema::Int, Value::Integer(_))
         | (Schema::Bool, Value::Boolean(_))
@@ -242,16 +252,19 @@ pub(crate) fn validate(
             }
             Ok(())
         }
-        // An empty key has no RFC 6901 pointer (the empty token is refused), so nothing could
-        // report or address its value.
-        (Schema::Map(_), Value::Table(t)) if t.contains_key("") => Err(SchemaFault {
-            pointer: ptr.into(),
-            fault: Fault::EmptyKey,
-        }),
         (Schema::Map(item), Value::Table(t)) => t
             .iter()
             .try_for_each(|(k, v)| validate(v, item, &pointer::join(ptr, k), found)),
         _ => Err(wrong()),
+    }
+}
+
+/// Whether a table, or a table inside an array or table below it, has the key `""`.
+fn has_empty_key(v: &Value) -> bool {
+    match v {
+        Value::Table(t) => t.contains_key("") || t.values().any(has_empty_key),
+        Value::Array(a) => a.iter().any(has_empty_key),
+        _ => false,
     }
 }
 

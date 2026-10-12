@@ -449,10 +449,18 @@ fn select(
     catalogue: &BTreeMap<String, CatalogueEntry>,
     modules: &BTreeMap<String, ModuleDoc>,
 ) -> Result<Vec<String>, ResolveError> {
-    // Unknown IDs are reported before duplicates, so the code does not depend on list order.
+    // Every unknown ID is reported before any duplicate, in the profile list first and then in
+    // the `requires` of each module in ID order, so the code does not depend on list order.
     for (i, m) in profile.modules.iter().enumerate() {
         if m != "core" && !catalogue.contains_key(m) {
             return Err(unknown_module(&profile.file, &format!("/modules/{i}"), m));
+        }
+    }
+    for m in modules.values().filter(|m| m.id != "core") {
+        for (i, r) in m.requires.iter().enumerate() {
+            if r != "core" && !catalogue.contains_key(r) {
+                return Err(unknown_module(&m.file, &format!("/requires/{i}"), r));
+            }
         }
     }
     let mut seen = BTreeSet::new();
@@ -479,11 +487,6 @@ fn select(
         .field("/requires"));
     }
     for m in modules.values() {
-        for (i, r) in m.requires.iter().enumerate() {
-            if r != "core" && !catalogue.contains_key(r) {
-                return Err(unknown_module(&m.file, &format!("/requires/{i}"), r));
-            }
-        }
         let mut seen = BTreeSet::new();
         for (i, r) in m.requires.iter().enumerate() {
             if r == "core" || !seen.insert(r.as_str()) {
@@ -1263,13 +1266,15 @@ fn contain(
             if let Some(id) = digests.get(&key) {
                 return Ok((path.clone(), (!spec.secret_values).then(|| id.clone())));
             }
-            check_nested(
-                sources,
-                &sup.dir,
-                &path,
-                &mut BTreeSet::from([crate::fold::fold(&path)]),
-            )
-            .map_err(|f| wrap(locate_error(&sup.file, ptr, f)))?;
+            // Apply cannot see the exclude patterns, so it holds every link in a directory that
+            // has excluded entries to the directory itself. Plan uses the same bound.
+            let bound = if sources.pruned_under(&path) > 0 {
+                path.as_str()
+            } else {
+                sup.dir.as_str()
+            };
+            check_nested(sources, bound, &path, digests)
+                .map_err(|f| wrap(locate_error(&sup.file, ptr, f)))?;
             let mut entries = Vec::new();
             for (name, e) in sources.below(&path) {
                 let full = format!("{path}/{name}");
@@ -1314,16 +1319,28 @@ fn contain(
 
 /// Checks every link below `dir` at any depth, including excluded ones, and follows each link
 /// that reaches another directory into that directory's entries too: a link published inside
-/// a linked tree can lead out of the root through its target. Each directory is visited once
-/// (`seen`), which bounds the walk and ends link cycles.
+/// a linked tree can lead out of the root through its target. A scan of a directory covers all
+/// of its descendants, so a directory below one already scanned is skipped, and parents are
+/// scanned first. That keeps the work linear in the entries under each reachable top directory
+/// and ends link cycles. `memo` keeps the directories already checked against `root`, so a
+/// shared target is walked once for the whole composition, not once per resource.
 fn check_nested(
     sources: &SourceSet,
     root: &str,
     dir: &str,
-    seen: &mut BTreeSet<String>,
+    memo: &mut BTreeMap<String, String>,
 ) -> Result<(), LocateFault> {
-    let mut work = vec![dir.to_string()];
-    while let Some(dir) = work.pop() {
+    let key = |folded: &str| format!("nested\0{root}\0{folded}");
+    let mut scanned: BTreeSet<String> = BTreeSet::new();
+    let mut work = BTreeMap::from([(crate::fold::fold(dir), dir.to_string())]);
+    while let Some((folded, dir)) = work.pop_first() {
+        let covered = scanned.contains(&folded)
+            || folded
+                .match_indices('/')
+                .any(|(i, _)| scanned.contains(&folded[..i]));
+        if covered || memo.contains_key(&key(&folded)) {
+            continue;
+        }
         let mut hops = Vec::new();
         for (name, e) in sources.below(&dir) {
             if let source::Entry::Link(_) = e {
@@ -1336,13 +1353,15 @@ fn check_nested(
             }
             hops.push(sources.locate(&format!("{}/{target}", source::parent(link)), root)?);
         }
+        scanned.insert(folded);
         for hop in hops {
-            if let Located::Dir { path } = hop
-                && seen.insert(crate::fold::fold(&path))
-            {
-                work.push(path);
+            if let Located::Dir { path } = hop {
+                work.insert(crate::fold::fold(&path), path);
             }
         }
+    }
+    for folded in scanned {
+        memo.insert(key(&folded), String::new());
     }
     Ok(())
 }
