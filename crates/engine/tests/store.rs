@@ -1159,7 +1159,8 @@ fn a_writer_refuses_a_state_directory_that_lacks_a_subdirectory_and_changes_noth
 
 fn two_output_intent(h: &Home) -> dfm_model::state::JournalEntry {
     let mut e = intent("create-file", h.0.join("one").to_str().unwrap());
-    let sha = dfm_model::digest::sha256_hex(b"x");
+    // Recovery compares the domain-separated file fingerprint, not a plain digest.
+    let sha = dfm_model::plan::file_fingerprint(b"x");
     let outs = &mut e.recovery.as_mut().unwrap().outputs;
     outs[0].expected_sha256 = Some(sha.clone());
     outs.push(dfm_model::state::RecoveryOutput {
@@ -1213,7 +1214,7 @@ fn a_repair_record_that_cannot_be_written_keeps_the_cut_text_in_the_error() {
     let j = state_dir(&h).join("journal.jsonl");
     let sound = fs::read(&j).unwrap();
     let mut torn = sound.clone();
-    torn.extend_from_slice(b"{\"schema\":1,\"op_id\":\"half-written");
+    torn.extend_from_slice(b"{\"schema\":1,\"op_id\":\"half-written\\\"\x07");
     fs::write(&j, &torn).unwrap();
 
     let s = Store::open_write(
@@ -1227,7 +1228,7 @@ fn a_repair_record_that_cannot_be_written_keeps_the_cut_text_in_the_error() {
     assert!(e.mutated, "the journal was cut");
     assert_eq!(e.exit(), dfm_model::Exit::Failed);
     assert!(
-        e.detail.contains("already cut off") && e.detail.contains("half-written"),
+        e.detail.contains("already cut off") && e.detail.ends_with("half-written\\\"\x07"),
         "{}",
         e.detail
     );
@@ -1236,7 +1237,7 @@ fn a_repair_record_that_cannot_be_written_keeps_the_cut_text_in_the_error() {
     let kept = state_dir(&h).join("journal.torn");
     assert_eq!(
         fs::read(&kept).unwrap(),
-        b"{\"schema\":1,\"op_id\":\"half-written"
+        b"{\"schema\":1,\"op_id\":\"half-written\\\"\x07"
     );
     assert!(e.detail.contains("state/journal.torn"), "{}", e.detail);
     assert!(
@@ -1262,7 +1263,7 @@ fn a_repair_record_that_cannot_be_written_keeps_the_cut_text_in_the_error() {
     assert_eq!(fs::read(&j).unwrap(), other);
     assert_eq!(
         fs::read(&kept).unwrap(),
-        b"{\"schema\":1,\"op_id\":\"half-written"
+        b"{\"schema\":1,\"op_id\":\"half-written\\\"\x07"
     );
 }
 

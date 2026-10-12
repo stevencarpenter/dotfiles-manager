@@ -428,6 +428,73 @@ fn a_file_that_appears_between_the_last_check_and_the_publish_is_never_replaced(
 }
 
 #[test]
+fn a_link_planted_in_excluded_content_after_the_containment_walk_is_published_unseen() {
+    // The walk of an excluded directory source ends before the link is published, and the
+    // publish never reads the source again. The same user can change the tree in between. This
+    // pins that accepted window (docs/apply.md): the walk is not a lock on the tree.
+    let s = setup();
+    let root = real_src(&s);
+    let dir = Path::new(&root).join("dir");
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(dir.join("inner"), "i\n").unwrap();
+    let mut o = op(&s.h, &s.store, "x@l", 1, Action::CreateLink, "l");
+    o.link = Some(format!("{root}/dir"));
+    o.inputs = vec![Input {
+        path: "dir".into(),
+        content_id: None,
+    }];
+    o.excluded = Some(1);
+    let planted = dir.join("esc");
+    let rep = parked(
+        &s,
+        &plan_in(&root, vec![o]),
+        &NoGenerator,
+        &none(),
+        "apply-after-prereq",
+        {
+            let planted = planted.clone();
+            move || symlink("../../../etc/passwd", planted).unwrap()
+        },
+    );
+    assert_eq!(
+        rep.operations[0].status,
+        Status::Updated,
+        "{:?}",
+        rep.stopped
+    );
+    assert_eq!(
+        fs::read_link(s.h.0.join("l")).unwrap(),
+        Path::new(&root).join("dir")
+    );
+    assert!(
+        fs::symlink_metadata(&planted).is_ok(),
+        "the entry planted after the walk was not seen"
+    );
+    // The next walk sees it: the same source, with the entry already there, is refused before
+    // any link is published.
+    let s = setup();
+    let root = real_src(&s);
+    let dir = Path::new(&root).join("dir");
+    fs::create_dir_all(&dir).unwrap();
+    symlink("../../../etc/passwd", dir.join("esc")).unwrap();
+    let mut o = op(&s.h, &s.store, "x@l", 1, Action::CreateLink, "l");
+    o.link = Some(format!("{root}/dir"));
+    o.inputs = vec![Input {
+        path: "dir".into(),
+        content_id: None,
+    }];
+    o.excluded = Some(1);
+    let rep = go(&s, &plan_in(&root, vec![o]), &NoGenerator, &none());
+    assert_eq!(
+        rep.stopped.as_ref().unwrap().code,
+        Code::SourceEscape,
+        "{:?}",
+        rep.operations[0].status
+    );
+    assert!(fs::symlink_metadata(s.h.0.join("l")).is_err());
+}
+
+#[test]
 fn an_owned_file_edited_after_the_last_check_is_not_replaced_by_the_update() {
     // Publish::Replace compares the live content with the ledger fingerprint just before the
     // rename. The edit lands after every earlier check, while the staged file waits.

@@ -1,4 +1,5 @@
-//! `dotfiles-manager` command line: version, help, explicit profile binding and self-check.
+//! `dotfiles-manager` command line: version, help, profile binding, state, explain, plan,
+//! doctor, status, apply and self-check.
 
 #![forbid(unsafe_code)]
 

@@ -1,7 +1,7 @@
 //! Health rows for `doctor` and `status` (docs/doctor.md): the row type, the code registry, the
 //! exit rule and the two output formats. Pure: the caller gathers the facts.
 
-use crate::display::visible;
+use crate::display::{bounded_visible, visible};
 use crate::refusal::Code;
 use serde::Serialize;
 
@@ -184,25 +184,6 @@ pub struct Row {
     pub required: bool,
     /// The row comes from an inventory that could not be read in full.
     pub partial: bool,
-}
-
-/// `visible(s)` cut to `max` characters of the visible text. The cut falls between the escapes
-/// of two source characters, never inside one, and counts what is shown: a control character
-/// grows to up to ten characters (`\u{1b}` is six), so cutting the source first would let a
-/// subject exceed the bound.
-fn bounded_visible(s: &str, max: usize) -> String {
-    let mut out = String::new();
-    let mut shown = 0;
-    let mut buf = [0u8; 4];
-    for c in s.chars() {
-        let piece = visible(c.encode_utf8(&mut buf));
-        shown += piece.chars().count();
-        if shown > max {
-            break;
-        }
-        out.push_str(&piece);
-    }
-    out
 }
 
 impl Row {

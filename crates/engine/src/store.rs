@@ -840,7 +840,7 @@ impl Store {
                 format!(
                     "{}. The torn final line ({removed} bytes) was already cut off and its repair record was not written. The cut text is kept in state/{TORN} (`state check` reports it) and begins: {}",
                     e.detail,
-                    dfm_model::display::visible(&head)
+                    head
                 ),
             )
             .after_mutation()
