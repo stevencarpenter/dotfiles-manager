@@ -1,6 +1,6 @@
 //! Reads a staged tree and the toolchain tree from disk and applies the build
 //! controls in `dfm_model::controls` (docs/architecture.md section 8, item 3a).
-//! Read-only. Starts no process.
+//! Read-only. Starts no process except `id -u`, which names the user that must own the toolchain.
 
 use dfm_model::controls::{self, MAX_FILE_BYTES};
 use dfm_model::digest::{EntryKind, TreeEntry, hex, tree_digest};
@@ -158,38 +158,44 @@ fn file_sha256(path: &Path) -> std::io::Result<String> {
     }
 }
 
+/// One toolchain entry must belong to `uid` and, unless it is a symlink (whose mode is not used),
+/// must not be writable by group or others.
+fn closed_entry(md: &fs::Metadata, name: &str, uid: u32) -> Result<(), String> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    if md.uid() != uid {
+        return Err(format!("{name} is not owned by the current user"));
+    }
+    if !md.file_type().is_symlink() && md.permissions().mode() & 0o022 != 0 {
+        return Err(format!("{name} is writable by group or others"));
+    }
+    Ok(())
+}
+
+/// Refuses a toolchain tree that another user owns or that group or others can modify. The digest
+/// records only the owner-execute bit, and an entry with another owner could be rewritten after the
+/// digest. `uid` is the one owner allowed. The script's `toolchain_digest` applies the same rules.
+fn closed_tree(dir: &Path, rel: &str, uid: u32) -> Result<(), String> {
+    let ioerr = |e: std::io::Error| format!("{rel}: {}", e.kind());
+    closed_entry(&fs::symlink_metadata(dir).map_err(ioerr)?, rel, uid)?;
+    for e in fs::read_dir(dir).map_err(ioerr)? {
+        let e = e.map_err(ioerr)?;
+        let name = format!("{rel}/{}", e.file_name().to_string_lossy());
+        if e.file_type().map_err(ioerr)?.is_dir() {
+            closed_tree(&e.path(), &name, uid)?;
+        } else {
+            // DirEntry::metadata does not follow a symlink, so a link is checked for its own owner.
+            closed_entry(&e.metadata().map_err(ioerr)?, &name, uid)?;
+        }
+    }
+    Ok(())
+}
+
 /// Digest of an installed toolchain tree (docs/architecture.md section 8, item 4a).
 pub fn toolchain_tree_digest(dir: &Path) -> Result<String, String> {
     use std::os::unix::fs::PermissionsExt;
-    // The digest records only the owner-execute bit, so a tree that others can modify is
-    // refused instead of being described.
-    fn others_can_write(dir: &Path, rel: &str) -> Result<(), String> {
-        use std::os::unix::fs::PermissionsExt;
-        let ioerr = |e: std::io::Error| format!("{rel}: {}", e.kind());
-        if fs::symlink_metadata(dir)
-            .map_err(ioerr)?
-            .permissions()
-            .mode()
-            & 0o022
-            != 0
-        {
-            return Err(format!("{rel} is writable by group or others"));
-        }
-        for e in fs::read_dir(dir).map_err(ioerr)? {
-            let e = e.map_err(ioerr)?;
-            let ty = e.file_type().map_err(ioerr)?;
-            let name = format!("{rel}/{}", e.file_name().to_string_lossy());
-            if ty.is_dir() {
-                others_can_write(&e.path(), &name)?;
-            } else if !ty.is_symlink()
-                && e.metadata().map_err(ioerr)?.permissions().mode() & 0o022 != 0
-            {
-                return Err(format!("{name} is writable by group or others"));
-            }
-        }
-        Ok(())
-    }
-    others_can_write(dir, ".")?;
+    let uid = dfm_platform_macos::current_uid()
+        .ok_or_else(|| "cannot determine the current user".to_string())?;
+    closed_tree(dir, ".", uid)?;
     let mut entries = Vec::new();
     for (rel, node) in walk(dir)? {
         let kind = match node {
@@ -293,4 +299,40 @@ pub fn check_build_controls(platform: &Platform, stage: &Path) -> Result<(), Ref
         ));
     }
     ancestors(platform)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn a_toolchain_entry_with_another_owner_is_refused_and_named() {
+        let d = std::env::temp_dir().join(format!("dfm-closed-tree-{}", std::process::id()));
+        fs::create_dir_all(d.join("bin")).unwrap();
+        fs::write(d.join("bin/a"), "a").unwrap();
+        std::os::unix::fs::symlink("a", d.join("bin/l")).unwrap();
+        let me = dfm_platform_macos::current_uid().unwrap();
+        // A test cannot create a file owned by someone else, so the expected owner is the other one.
+        let other = me + 1;
+        assert_eq!(closed_tree(&d, ".", me), Ok(()));
+        assert_eq!(
+            closed_tree(&d, ".", other),
+            Err(". is not owned by the current user".to_string())
+        );
+        for (rel, want) in [("bin/a", "./bin/a"), ("bin/l", "./bin/l"), ("bin", "./bin")] {
+            let md = fs::symlink_metadata(d.join(rel)).unwrap();
+            assert_eq!(closed_entry(&md, want, me), Ok(()), "{rel}");
+            assert_eq!(
+                closed_entry(&md, want, other),
+                Err(format!("{want} is not owned by the current user")),
+                "{rel}"
+            );
+        }
+        // Mode is still refused for a file, and ignored for a link.
+        fs::set_permissions(d.join("bin/a"), fs::Permissions::from_mode(0o666)).unwrap();
+        let md = fs::symlink_metadata(d.join("bin/a")).unwrap();
+        assert!(closed_entry(&md, "./bin/a", me).is_err());
+        fs::remove_dir_all(&d).unwrap();
+    }
 }

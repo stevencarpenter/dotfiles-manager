@@ -34,6 +34,7 @@ case ${1:-} in
           ${DFM_TEST_BEFORE_SWAP:+"DFM_TEST_BEFORE_SWAP=$DFM_TEST_BEFORE_SWAP"} \
           ${DFM_TEST_AFTER_SWAP:+"DFM_TEST_AFTER_SWAP=$DFM_TEST_AFTER_SWAP"} \
           ${DFM_TEST_BEFORE_COPY:+"DFM_TEST_BEFORE_COPY=$DFM_TEST_BEFORE_COPY"} \
+          ${DFM_TEST_UID:+"DFM_TEST_UID=$DFM_TEST_UID"} \
           /bin/sh "$0" --dfm-scrubbed "$@" ;;
     esac
     exec /usr/bin/env -i PATH=/usr/bin:/bin:/usr/sbin:/sbin HOME="${HOME:-}" /bin/sh "$0" --dfm-scrubbed "$@" ;;
@@ -41,7 +42,7 @@ esac
 shift
 env_check=$(/usr/bin/env | /usr/bin/awk -F= -v test="${DFM_BOOTSTRAP_TEST:-}" '
   BEGIN { split("PATH HOME PWD OLDPWD SHLVL _", a, " "); for (i in a) ok[a[i]] = 1
-    if (test == "1") { split("DFM_BOOTSTRAP_TEST DFM_TEST_HOME DFM_TEST_OS DFM_TEST_ARCH DFM_TEST_CLT DFM_TEST_BEFORE_SWAP DFM_TEST_AFTER_SWAP DFM_TEST_BEFORE_COPY", t, " "); for (i in t) ok[t[i]] = 1 } }
+    if (test == "1") { split("DFM_BOOTSTRAP_TEST DFM_TEST_HOME DFM_TEST_OS DFM_TEST_ARCH DFM_TEST_CLT DFM_TEST_BEFORE_SWAP DFM_TEST_AFTER_SWAP DFM_TEST_BEFORE_COPY DFM_TEST_UID", t, " "); for (i in t) ok[t[i]] = 1 } }
   /^[^=]+=/ { if (!($1 in ok)) { print "unexpected " $1; bad = 1; exit } }
   END { if (!bad) print "clean" }') || env_check=
 case $env_check:$PATH in
@@ -69,6 +70,10 @@ refuse_out() { [ -z "$1" ] || printf 'error: %s\n' "$1" >&2; exit 3; }
 
 # Test hooks exist only when DFM_BOOTSTRAP_TEST=1 and replace the dscl and uname answers.
 test_mode() { [ "${DFM_BOOTSTRAP_TEST:-}" = 1 ]; }
+
+# The user id that must own every directory the manager uses and every toolchain entry. Test mode may
+# name another one (DFM_TEST_UID), because a test cannot create a file owned by another user.
+owner_uid() { if test_mode && [ -n "${DFM_TEST_UID:-}" ]; then printf '%s\n' "$DFM_TEST_UID"; else /usr/bin/id -u; fi; }
 
 resolve_home() {
   if test_mode && [ -n "${DFM_TEST_HOME:-}" ]; then
@@ -378,6 +383,8 @@ toolchain_digest() (
   ! find . -print | grep -q '[^ -~]\|\\' || exit 1
   # The digest records only the owner-execute bit, so group- or world-writable entries are refused.
   [ -z "$(find . ! -type l \( -perm -020 -o -perm -002 \) -print | head -n 1)" ] || exit 1
+  # Another owner could rewrite an entry after the digest, so every entry (a link too) must belong to the current user.
+  [ -z "$(find . ! -user "$(owner_uid)" -print | head -n 1)" ] || exit 1
   nf=$(find . -type f | wc -l); nl=$(find . -type l | wc -l)
   [ "$nf" -gt 0 ] || exit 1
   plain=$(find . -type f ! -perm -u+x -print0 | xargs -0 -r /usr/bin/shasum -a 256 |
@@ -533,9 +540,11 @@ check_binding() {
 }
 binding_bad() { printf 'error: E_BINDING_INVALID %s %s\n' "$1" "$2" >&2; exit 3; }
 
-# $1 is a path below HOME. Refuses when an existing component of it is a symlink or not a
-# directory, so no recursive chmod or rm and no copy can reach another tree through it.
-# Components that do not exist yet are fine: mkdir creates them. HOME itself is not checked.
+# $1 is a path below HOME. Refuses when an existing component of it is a symlink, not a
+# directory, not owned by the current user or writable by group or others (mode & 022), so no
+# recursive chmod or rm and no copy can reach another tree through it, and no other user can
+# rename a component. Components that do not exist yet are fine: mkdir creates them. HOME
+# itself is not checked here (check_config_tree does).
 # A same-user process can still swap a component after the check; see docs/bootstrap.md.
 check_private_path() {
   _p=$HOME_DIR _r=$1
@@ -547,34 +556,24 @@ check_private_path() {
     fi
     [ -e "$_p" ] || return 0
     [ -d "$_p" ] || refuse E_PREREQ_MISSING "$_p exists and is not a directory; move it away first"
+    [ "$(/usr/bin/stat -f %u "$_p")" = "$(owner_uid)" ] ||
+      refuse E_PREREQ_MISSING "$_p is not owned by the current user; move it away first"
+    _m=$(/usr/bin/stat -f %Lp "$_p")
+    [ $(( 0$_m & 022 )) -eq 0 ] ||
+      refuse E_PREREQ_MISSING "$_p has mode $_m, writable by group or others; run chmod go-w on it first"
   done
 }
-# A directory the manager writes into must belong to the current user and be closed to group and
-# others, as the binding's directory chain is. $1 is a path below HOME; an absent one is fine.
-check_owned_dir() {
-  _o=$HOME_DIR/$1
-  [ -d "$_o" ] || return 0
-  [ "$(/usr/bin/stat -f %u "$_o")" = "$(/usr/bin/id -u)" ] ||
-    refuse E_PREREQ_MISSING "$_o is not owned by the current user; move it away first"
-  _m=$(/usr/bin/stat -f %Lp "$_o")
-  [ $(( 0$_m & 022 )) -eq 0 ] ||
-    refuse E_PREREQ_MISSING "$_o has mode $_m, writable by group or others; run chmod go-w on it first"
-}
-check_cache_tree() { check_private_path "$CACHE_REL/build"; check_owned_dir "$CACHE_REL"; check_owned_dir "$CACHE_REL/build"; }
+check_cache_tree() { check_private_path "$CACHE_REL/build"; }
 # The bin directory receives the command link: a real directory the current user owns.
-check_bin_dir() {
-  check_private_path .local/bin
-  [ ! -d "$HOME_DIR/.local/bin" ] || [ "$(/usr/bin/stat -f %u "$HOME_DIR/.local/bin")" = "$(/usr/bin/id -u)" ] ||
-    refuse E_PREREQ_MISSING "$HOME_DIR/.local/bin is not owned by the current user; move it away first"
-}
+check_bin_dir() { check_private_path .local/bin; }
 check_data_tree() {
   for _d in toolchains versions cargo-home rustup-home build-home; do check_private_path "$DATA_REL/$_d"; done
-  for _d in "" toolchains versions cargo-home rustup-home build-home; do check_owned_dir "$DATA_REL${_d:+/$_d}"; done
 }
 
 rm_build() { [ ! -e "$build" ] || chmod -R u+w "$build"; rm -rf "$build"; }
 
 # Replacement refs (refs/replace) would let a ref swap the content of the verified commit.
+# Checkout-local attributes and filters are not scrubbed here: cmd_install refuses a checkout that has them.
 git_clean() { /usr/bin/env -i PATH="$SYSPATH" HOME=/var/empty LANG=C GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null \
   GIT_CONFIG_NOSYSTEM=1 GIT_TERMINAL_PROMPT=0 GIT_NO_REPLACE_OBJECTS=1 /usr/bin/git -c core.fsmonitor=false \
   -c core.hooksPath=/dev/null -c core.useReplaceRefs=false "$@"; }
@@ -585,7 +584,7 @@ clean_build() {
   left=
   if why=$( (check_cache_tree) 2>&1 ); then rm_build || left=$build; else left="$build ($why)"; fi
   for _h in cargo-home rustup-home build-home; do
-    if why=$( (check_private_path "$DATA_REL/$_h"; check_owned_dir "$DATA_REL"; check_owned_dir "$DATA_REL/$_h") 2>&1 ); then
+    if why=$( (check_private_path "$DATA_REL/$_h") 2>&1 ); then
       rm -rf "${DATA:?}/$_h" || left="$left; $DATA/$_h"
     else left="$left; $DATA/$_h ($why)"; fi
   done
@@ -613,6 +612,13 @@ cmd_install() {
     refuse E_SOURCE_UNTRUSTED "the source checkout does not use the $fmt object format of the pin"
   resolved=$(git_clean -C "$src" rev-parse --verify --end-of-options "$commit^{commit}" 2>/dev/null) || resolved=
   [ "$resolved" = "$commit" ] || refuse E_SOURCE_UNTRUSTED "$commit is not a commit in the source checkout"
+  # git archive would apply checkout-local attributes (export-ignore, export-subst) and run filter
+  # commands from the checkout's config, so the staged tree could differ from the pinned commit.
+  # Attributes committed in the pinned tree stay part of that commit; no filter can run for them.
+  [ ! -s "$(git_clean -C "$src" rev-parse --path-format=absolute --git-path info/attributes)" ] ||
+    refuse E_SOURCE_UNTRUSTED "the source checkout has .git/info/attributes; remove it first"
+  [ -z "$(git_clean -C "$src" config --get-regexp '^(core\.attributesfile|filter\.)' 2>/dev/null)" ] ||
+    refuse E_SOURCE_UNTRUSTED "the source checkout configures core.attributesFile or a filter; remove it first"
   # Early, read-only hint of the pin so a missing toolchain is refused before any mutation.
   # The real parse and every other check run later on the staged copy.
   hint=$(git_clean -C "$src" cat-file blob "$commit:dotfiles-manager.lock" 2>/dev/null |
@@ -663,7 +669,7 @@ cmd_install() {
   # to a file that mktemp creates exclusively (never through a link), then renamed into place.
   check_private_path "$DATA_REL/versions/$name"
   mkdir -p "$DATA/versions/$name" "$HOME_DIR/.local/bin"
-  check_private_path "$DATA_REL/versions/$name"; check_owned_dir "$DATA_REL/versions/$name"
+  check_private_path "$DATA_REL/versions/$name"
   [ ! -d "$DATA/versions/$name/dotfiles-manager" ] ||
     refuse E_PREREQ_MISSING "$DATA/versions/$name/dotfiles-manager is a directory; move it away first"
   staged_bin=$(mktemp "$DATA/versions/$name/dotfiles-manager.new.XXXXXX") || { echo "error: cannot create the staged binary" >&2; exit 1; }
@@ -703,7 +709,7 @@ cmd_install() {
 # root are never touched.
 cmd_uninstall() {
   resolve_home
-  check_cache_tree; check_data_tree; check_current_leaves
+  check_cache_tree; check_data_tree; check_current_leaves; check_bin_dir
   link=$HOME_DIR/.local/bin/dotfiles-manager
   if [ -L "$link" ] && [ "$(readlink "$link")" = "$DATA/current/dotfiles-manager" ]; then rm -f "$link"; fi
   build=$CACHE/build; rm_build

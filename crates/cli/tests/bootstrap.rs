@@ -161,6 +161,25 @@ fn toolchain_digest_refuses_entries_writable_by_group_or_others() {
 }
 
 #[test]
+fn toolchain_digest_refuses_entries_owned_by_another_user() {
+    let tmp = TempDir::new("owner");
+    let home = tmp.path().join("home");
+    let tc = tmp.path().join("tc");
+    fs::create_dir_all(&home).unwrap();
+    fs::create_dir_all(tc.join("bin")).unwrap();
+    fs::write(tc.join("bin/a"), "a").unwrap();
+    std::os::unix::fs::symlink("a", tc.join("bin/l")).unwrap();
+    let args = ["toolchain-digest", "--dir", tc.to_str().unwrap()];
+    assert_eq!(script_test_mode(&home, &args, &[]).status.code(), Some(0));
+    // A test cannot create an entry owned by another user, so the expected owner is another one.
+    let other = (dfm_platform_macos::current_uid().unwrap() + 1).to_string();
+    let o = script_test_mode(&home, &args, &[("DFM_TEST_UID", &other)]);
+    assert_eq!(o.status.code(), Some(3), "{}", err(&o));
+    assert!(err(&o).contains("E_TOOLCHAIN_MISMATCH"), "{}", err(&o));
+    assert!(o.stdout.is_empty());
+}
+
+#[test]
 fn toolchain_digest_refuses_file_names_with_backslashes() {
     let tmp = TempDir::new("backslash");
     let home = tmp.path().join("home");
@@ -235,7 +254,11 @@ fn missing_toolchain_wrong_commit_and_hostile_repo_config_are_refused_before_mut
     let o = script_test_mode(&home, &["install", "--source", s, "--commit", &sha], &[]);
     assert!(!marker.exists(), "repository configuration executed code");
     assert_eq!(o.status.code(), Some(3));
-    assert!(err(&o).contains("E_TOOLCHAIN_MISMATCH"), "{}", err(&o));
+    assert!(
+        err(&o).contains("E_SOURCE_UNTRUSTED") && err(&o).contains("filter"),
+        "{}",
+        err(&o)
+    );
 
     for bad in [vec!["install"], vec!["bogus"], vec!["install", "--nope"]] {
         assert_eq!(
@@ -1902,6 +1925,72 @@ fn the_command_link_is_staged_before_current_flips() {
     );
 }
 
+/// git archive would apply checkout-local attributes and run filter commands from the checkout's
+/// config. Each case is refused before the toolchain is looked at, with HOME untouched.
+#[test]
+fn checkout_local_attributes_and_filters_are_refused_before_git_archive_runs() {
+    type Setup = fn(&Path, &Path);
+    let cases: [(&str, Setup); 4] = [
+        ("info-attributes", |src, _| {
+            fs::write(
+                src.join(".git/info/attributes"),
+                "dotfiles-manager.lock export-ignore\n",
+            )
+            .unwrap();
+        }),
+        ("attributes-file", |src, _| {
+            git(
+                src,
+                &["config", "core.attributesFile", "/tmp/dfm-attributes"],
+            );
+        }),
+        ("smudge-filter", |src, marker| {
+            fs::write(src.join(".gitattributes"), "* filter=ev\n").unwrap();
+            git(src, &["add", ".gitattributes"]);
+            git(src, &["commit", "-q", "-m", "attributes"]);
+            git(
+                src,
+                &[
+                    "config",
+                    "filter.ev.smudge",
+                    &format!("touch {}", marker.display()),
+                ],
+            );
+        }),
+        ("clean-filter", |src, marker| {
+            git(
+                src,
+                &[
+                    "config",
+                    "filter.ev.clean",
+                    &format!("touch {}", marker.display()),
+                ],
+            );
+        }),
+    ];
+    for (name, setup) in cases {
+        let tmp = TempDir::new(name);
+        let home = tmp.path().join("home");
+        fs::create_dir(&home).unwrap();
+        let (src, _) = tiny_source(tmp.path(), "9.9.9");
+        let marker = tmp.path().join("filter-ran");
+        setup(&src, &marker);
+        let sha = git(&src, &["rev-parse", "HEAD"]);
+        let o = install_tiny(&home, &src, &sha);
+        assert_eq!(o.status.code(), Some(3), "{name}: {}", err(&o));
+        assert!(
+            err(&o).contains("E_SOURCE_UNTRUSTED") && !err(&o).contains("E_TOOLCHAIN_MISMATCH"),
+            "{name}: {}",
+            err(&o)
+        );
+        assert!(!marker.exists(), "{name}: a filter ran");
+        assert!(
+            entries_below(&home).is_empty(),
+            "{name}: refusal must not write"
+        );
+    }
+}
+
 #[test]
 fn a_symlinked_bin_directory_is_refused_before_the_command_link_is_staged() {
     let (tmp, home, src, sha) = refusal_setup("bin-link");
@@ -1977,6 +2066,10 @@ fn snapshot(dir: &Path) -> Vec<(PathBuf, u32)> {
 #[test]
 fn a_manager_directory_open_to_group_or_others_stops_install_and_uninstall() {
     let rels = [
+        ".local",
+        ".local/share",
+        ".local/bin",
+        ".cache",
         ".local/share/dotfiles-manager",
         ".local/share/dotfiles-manager/toolchains",
         ".local/share/dotfiles-manager/versions",
@@ -2018,6 +2111,61 @@ fn a_manager_directory_open_to_group_or_others_stops_install_and_uninstall() {
             drop(tmp);
         }
     }
+}
+
+/// The owner branch cannot be reached with a real foreign directory, so the expected owner is
+/// another user id (test mode only). The first existing component below HOME is the one named.
+#[test]
+fn a_directory_below_home_owned_by_another_user_stops_install_and_uninstall() {
+    let (tmp, home, src, sha) = refusal_setup("foreign-owner");
+    let before = snapshot(&home);
+    let other = (dfm_platform_macos::current_uid().unwrap() + 1).to_string();
+    let env = [("DFM_TEST_UID", other.as_str())];
+    let install = script_test_mode(
+        &home,
+        &[
+            "install",
+            "--source",
+            src.to_str().unwrap(),
+            "--commit",
+            &sha,
+        ],
+        &env,
+    );
+    let uninstall = script_test_mode(&home, &["uninstall"], &env);
+    for (what, o) in [("install", install), ("uninstall", uninstall)] {
+        assert_eq!(o.status.code(), Some(3), "{what}: {}", err(&o));
+        assert!(
+            err(&o).contains("E_PREREQ_MISSING")
+                && err(&o).contains(home.join(".local").to_str().unwrap())
+                && err(&o).contains("is not owned by the current user"),
+            "{what}: {}",
+            err(&o)
+        );
+    }
+    assert_eq!(snapshot(&home), before, "refusal must not write");
+    drop(tmp);
+}
+
+#[test]
+fn a_symlinked_bin_directory_is_refused_by_uninstall_and_nothing_is_removed() {
+    let (tmp, home, _src, _sha) = refusal_setup("bin-link-uninstall");
+    let outside = victim(tmp.path(), &["bin"]);
+    let ours = home.join(".local/share/dotfiles-manager/current/dotfiles-manager");
+    let planted = outside.join("bin/dotfiles-manager");
+    std::os::unix::fs::symlink(&ours, &planted).unwrap();
+    std::os::unix::fs::symlink(outside.join("bin"), home.join(".local/bin")).unwrap();
+    let before = snapshot(&home);
+    let o = script_test_mode(&home, &["uninstall"], &[]);
+    assert_eq!(o.status.code(), Some(3), "{}", err(&o));
+    assert!(
+        err(&o).contains("E_PREREQ_MISSING") && err(&o).contains("symlink"),
+        "{}",
+        err(&o)
+    );
+    assert_eq!(fs::read_link(&planted).unwrap(), ours);
+    assert_victim_intact(&outside, &["bin"]);
+    assert_eq!(snapshot(&home), before);
 }
 
 #[test]
