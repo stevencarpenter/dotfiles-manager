@@ -770,7 +770,10 @@ impl Exec<'_, '_> {
                 Code::OpInterrupted,
                 format!(
                     "{rel}: operation {id} left it in an unknown state. Nothing was changed. {}",
-                    recover::fix_text(id)
+                    recover::fix_text(
+                        id,
+                        self.unknown_paths.values().filter(|v| *v == id).count() > 1
+                    )
                 ),
             ));
         }

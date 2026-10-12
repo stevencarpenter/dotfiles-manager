@@ -247,14 +247,19 @@ pub fn recover_cmd(ctx: &Ctx, out: &mut dyn Write) -> Result<(), Refusal> {
         Some(first) => Err(Refusal::new(
             Code::OpInterrupted,
             format!(
-                "{} operation(s) stay open: {}. Nothing the machine shows clearly is left unsettled. Check the path, then run `dotfiles-manager state resolve '{}' --as done|failed` (an entry with more than one path cannot be resolved as done)",
+                "{} operation(s) stay open: {}. Nothing the machine shows clearly is left unsettled. Check the path, then run `dotfiles-manager state resolve '{}' --as done|failed`{}",
                 s.open.len(),
                 s.open
                     .iter()
                     .map(|o| bounded(&o.id))
                     .collect::<Vec<_>>()
                     .join(", "),
-                bounded(&first.id)
+                bounded(&first.id),
+                if s.open.iter().any(|o| o.paths.len() > 1) {
+                    " (an entry with more than one path cannot be resolved as done)"
+                } else {
+                    ""
+                }
             ),
         )),
     }

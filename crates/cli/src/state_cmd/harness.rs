@@ -291,6 +291,8 @@ pub fn record_trial(ctx: &Ctx, args: &[String], out: &mut dyn Write) -> Result<(
 /// `__reconcile`: settle interrupted operations by checking their recorded outputs.
 pub fn reconcile(ctx: &Ctx, out: &mut dyn Write) -> Result<(), Refusal> {
     let (store, _) = open_bound(ctx, super::fail_from_env()?, Vec::new())?;
+    // The probe has no way to carry a cause, so the unreadable outputs are collected here.
+    let unreadable = std::cell::RefCell::new(Vec::new());
     let probe = |e: &JournalEntry| {
         let outs = e
             .recovery
@@ -299,12 +301,16 @@ pub fn reconcile(ctx: &Ctx, out: &mut dyn Write) -> Result<(), Refusal> {
             .collect::<Vec<_>>();
         // An output that cannot be read as a plain file (a link, a directory, no permission) is
         // not absent: the probe cannot decide.
-        let Ok(seen) = outs
+        let seen = match outs
             .iter()
             .map(|o| read_regular(&o.path))
             .collect::<Result<Vec<_>, _>>()
-        else {
-            return Probe::Unknown;
+        {
+            Ok(seen) => seen,
+            Err(r) => {
+                unreadable.borrow_mut().push((e.op_id.clone(), r.detail));
+                return Probe::Unknown;
+            }
         };
         if seen.iter().all(Option::is_none) {
             return Probe::NotDone;
@@ -322,6 +328,15 @@ pub fn reconcile(ctx: &Ctx, out: &mut dyn Write) -> Result<(), Refusal> {
             bounded(&op),
             bounded(&step),
             phase
+        )
+        .map_err(|e| io("output", &e))?;
+    }
+    for (op, why) in unreadable.into_inner() {
+        writeln!(
+            out,
+            "cannot read an output of {}: {}",
+            bounded(&op),
+            bounded(&why)
         )
         .map_err(|e| io("output", &e))?;
     }

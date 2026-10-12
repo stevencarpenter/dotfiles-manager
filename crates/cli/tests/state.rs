@@ -1673,6 +1673,12 @@ fn reconcile_does_not_settle_an_output_that_is_a_link_or_a_directory() {
         assert_eq!(r.status.code(), Some(0), "{label}: {}", text(&r.stderr));
         let said = text(&r.stdout);
         assert!(said.contains("as Unknown"), "{label}: {said}");
+        // The operator can tell why the output was not read.
+        assert!(
+            said.contains("cannot read an output of")
+                && said.contains("link or not a regular file"),
+            "{label}: {said}"
+        );
         assert!(
             !said.contains("as Done") && !said.contains("as Failed"),
             "{label}: {said}"
@@ -1704,6 +1710,16 @@ fn recover_does_not_advise_resolving_a_multi_path_entry_as_done() {
         ],
     );
     assert_eq!(o.status.signal(), Some(6));
+    // One recorded path that shows no clear result (a directory): the advice does not mention
+    // the multi-path limit.
+    fs::create_dir(&out).unwrap();
+    let r = run(h.path(), &["state", "recover"]);
+    assert_eq!(r.status.code(), Some(3), "{}", text(&r.stderr));
+    assert!(
+        !text(&r.stderr).contains("more than one path"),
+        "{}",
+        text(&r.stderr)
+    );
     // Give the intent a second recorded output, as a hand-written journal could.
     let j = state(h.path()).join("journal.jsonl");
     let mut lines: Vec<serde_json::Value> = fs::read_to_string(&j)
@@ -1732,7 +1748,7 @@ fn recover_does_not_advise_resolving_a_multi_path_entry_as_done() {
     let d = run(h.path(), &["state", "resolve", id, "--as", "done"]);
     assert_eq!(d.status.code(), Some(3), "{}", text(&d.stderr));
     assert!(
-        text(&d.stderr).contains("E_CONFLICT"),
+        text(&d.stderr).contains("E_CONFLICT") && text(&d.stderr).contains("more than one path"),
         "{}",
         text(&d.stderr)
     );
