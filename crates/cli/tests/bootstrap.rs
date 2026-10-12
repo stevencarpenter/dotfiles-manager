@@ -177,6 +177,13 @@ fn toolchain_digest_refuses_entries_owned_by_another_user() {
     assert_eq!(o.status.code(), Some(3), "{}", err(&o));
     assert!(err(&o).contains("E_TOOLCHAIN_MISMATCH"), "{}", err(&o));
     assert!(o.stdout.is_empty());
+    // A find that fails (an owner name it cannot resolve) prints nothing; that is not "no foreign entry".
+    let o = script_test_mode(&home, &args, &[("DFM_TEST_UID", "no-such-user-dfm")]);
+    assert_eq!(o.status.code(), Some(3), "{}", err(&o));
+    assert!(
+        o.stdout.is_empty(),
+        "a digest was printed after a failed owner check"
+    );
 }
 
 #[test]
@@ -1991,6 +1998,76 @@ fn checkout_local_attributes_and_filters_are_refused_before_git_archive_runs() {
     }
 }
 
+/// git archive would also apply core.autocrlf and core.eol from the checkout's config (a committed
+/// `text` attribute makes core.eol take effect). The script pins both, so the staged tree keeps the
+/// committed bytes: a stand-in `cargo fetch` reports a carriage return in the staged manifest.
+/// Hostile config that no git call of the script uses (fsmonitor, hooks) is set too: it must not run.
+#[test]
+fn checkout_local_line_ending_config_cannot_change_the_staged_tree() {
+    type Setup = fn(&Path);
+    let cases: [(&str, Setup); 2] = [
+        ("autocrlf", |src| {
+            git(src, &["config", "core.autocrlf", "true"]);
+        }),
+        ("eol", |src| {
+            fs::write(src.join(".gitattributes"), "* text\n").unwrap();
+            git(src, &["add", ".gitattributes"]);
+            git(src, &["commit", "-q", "-m", "attributes"]);
+            git(src, &["config", "core.eol", "crlf"]);
+        }),
+    ];
+    let on_fetch =
+        r#"if [ -n "$(tr -cd '\r' <stage/Cargo.toml)" ]; then echo STAGED-CR >&2; fi; exit 1"#;
+    for (name, setup) in cases {
+        let p = prepare_with(name, fake_toolchain(on_fetch.into()));
+        setup(&p.src);
+        // Set after setup: the test's own git calls must not run it.
+        let marker = p.tmp.path().join("config-ran");
+        let hooks = p.tmp.path().join("hooks");
+        fs::create_dir(&hooks).unwrap();
+        let fsmonitor = format!("touch {}", marker.display());
+        git(&p.src, &["config", "core.fsmonitor", &fsmonitor]);
+        git(
+            &p.src,
+            &["config", "core.hooksPath", hooks.to_str().unwrap()],
+        );
+        let sha = git(&p.src, &["rev-parse", "HEAD"]);
+        let o = install(&p, &sha, &[]);
+        assert!(
+            !err(&o).contains("STAGED-CR"),
+            "{name}: the staged tree has line endings the commit does not: {}",
+            err(&o)
+        );
+        assert_eq!(o.status.code(), Some(1), "{name}: {}", err(&o));
+        assert!(
+            err(&o).contains("cargo fetch failed"),
+            "{name}: {}",
+            err(&o)
+        );
+        assert!(!marker.exists(), "{name}: checkout config ran code");
+        assert!(build_dirs_gone(&p), "{name}");
+        assert!(!p.data.join("current").exists(), "{name}");
+    }
+}
+
+/// An unreadable git configuration must refuse, not read as "no attributes and no filters".
+#[test]
+fn an_unreadable_checkout_config_is_refused_before_anything_else() {
+    let (tmp, home, src, sha) = refusal_setup("bad-config");
+    let dir = tmp.path().join("include-dir");
+    fs::create_dir(&dir).unwrap();
+    git(&src, &["config", "include.path", dir.to_str().unwrap()]);
+    let before = snapshot(&home);
+    let o = install_tiny(&home, &src, &sha);
+    assert_eq!(o.status.code(), Some(3), "{}", err(&o));
+    assert!(
+        err(&o).contains("E_SOURCE_UNTRUSTED") && err(&o).contains("cannot read the git directory"),
+        "{}",
+        err(&o)
+    );
+    assert_eq!(snapshot(&home), before);
+}
+
 #[test]
 fn a_symlinked_bin_directory_is_refused_before_the_command_link_is_staged() {
     let (tmp, home, src, sha) = refusal_setup("bin-link");
@@ -2166,6 +2243,33 @@ fn a_symlinked_bin_directory_is_refused_by_uninstall_and_nothing_is_removed() {
     assert_eq!(fs::read_link(&planted).unwrap(), ours);
     assert_victim_intact(&outside, &["bin"]);
     assert_eq!(snapshot(&home), before);
+}
+
+/// Another user who can write HOME could rename `.local` and plant a link before the removals.
+#[test]
+fn uninstall_refuses_a_home_open_to_group_or_others_and_removes_nothing() {
+    for mode in [0o775, 0o757] {
+        let tmp = TempDir::new("uninstall-home-open");
+        let home = tmp.path().join("home");
+        let kept = home.join(".local/share/dotfiles-manager/versions/v1/dotfiles-manager");
+        fs::create_dir_all(kept.parent().unwrap()).unwrap();
+        fs::write(&kept, "x").unwrap();
+        fs::create_dir_all(home.join(".cache/dotfiles-manager/build")).unwrap();
+        let before = snapshot(&home);
+        fs::set_permissions(&home, fs::Permissions::from_mode(mode)).unwrap();
+        let o = script_test_mode(&home, &["uninstall"], &[]);
+        fs::set_permissions(&home, fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(o.status.code(), Some(3), "{mode:o}: {}", err(&o));
+        assert!(
+            err(&o).contains("E_PREREQ_MISSING")
+                && err(&o).contains(home.to_str().unwrap())
+                && err(&o).contains("writable by group or others"),
+            "{mode:o}: {}",
+            err(&o)
+        );
+        assert!(kept.exists(), "{mode:o}: uninstall removed a file");
+        assert_eq!(snapshot(&home), before, "{mode:o}");
+    }
 }
 
 #[test]
