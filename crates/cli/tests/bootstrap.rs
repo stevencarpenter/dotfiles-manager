@@ -124,6 +124,11 @@ fn a_home_with_whitespace_is_refused_by_the_script() {
         "a\u{85}b",   // next line (C1 control)
         "a\u{2028}b", // line separator
         "a\u{3000}b", // ideographic space
+        "a\u{90}b",   // C1 control that is not White_Space
+        "a\u{200a}b", // top of the U+2000..U+200A range
+        "a\u{1680}b",
+        "a\u{202f}b",
+        "a\u{205f}b",
     ] {
         let tmp = TempDir::new("script-space");
         let home = tmp.path().join(name);
@@ -137,12 +142,15 @@ fn a_home_with_whitespace_is_refused_by_the_script() {
         );
         assert!(entries_below(&home).is_empty());
     }
-    // Control: a non-ASCII letter is not whitespace, so the home passes this check.
-    let tmp = TempDir::new("script-space");
-    let home = tmp.path().join("caf\u{e9}");
-    fs::create_dir(&home).unwrap();
-    let o = script_test_mode(&home, &["uninstall"], &[]);
-    assert!(!err(&o).contains("whitespace"), "{}", err(&o));
+    // Controls: non-ASCII letters, U+00A1, a soft hyphen and a zero-width space (both Cf, not
+    // White_Space) are accepted by valid_home, so the script must pass them too.
+    for name in ["caf\u{e9}", "a\u{a1}b", "a\u{ad}b", "a\u{200b}b"] {
+        let tmp = TempDir::new("script-space");
+        let home = tmp.path().join(name);
+        fs::create_dir(&home).unwrap();
+        let o = script_test_mode(&home, &["uninstall"], &[]);
+        assert!(!err(&o).contains("whitespace"), "{name:?}: {}", err(&o));
+    }
 }
 
 #[test]
