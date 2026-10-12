@@ -1232,6 +1232,42 @@ fn a_repair_record_that_cannot_be_written_keeps_the_cut_text_in_the_error() {
         e.detail
     );
     assert_eq!(fs::read(&j).unwrap(), sound, "the cut is not undone");
+    // The whole cut text survives, and `state check` reports the leftover file.
+    let kept = state_dir(&h).join("journal.torn");
+    assert_eq!(
+        fs::read(&kept).unwrap(),
+        b"{\"schema\":1,\"op_id\":\"half-written"
+    );
+    assert!(e.detail.contains("state/journal.torn"), "{}", e.detail);
+    assert!(
+        s.load()
+            .strays
+            .iter()
+            .any(|n| n.starts_with("journal.torn")),
+        "{:?}",
+        s.load().strays
+    );
+    // A second repair does not overwrite the kept text and does not cut.
+    fs::write(&j, &torn).unwrap();
+    let e = s.repair_torn_journal().unwrap_err();
+    assert_eq!(e.code, Code::StorageInvalid);
+    assert!(e.detail.contains("nothing was cut"), "{}", e.detail);
+    assert_eq!(fs::read(&j).unwrap(), torn);
+}
+
+#[test]
+fn a_repaired_torn_journal_leaves_no_kept_copy_behind() {
+    let h = Home::new();
+    let (s, _) = init(&h);
+    s.append_journal(&intent("op1", h.0.join("out").to_str().unwrap()))
+        .unwrap();
+    let j = state_dir(&h).join("journal.jsonl");
+    let mut torn = fs::read(&j).unwrap();
+    torn.extend_from_slice(b"{\"schema\":1,\"op_id\":\"half");
+    fs::write(&j, &torn).unwrap();
+    assert_eq!(s.repair_torn_journal().unwrap(), 25);
+    assert!(!state_dir(&h).join("journal.torn").exists());
+    assert!(s.load().strays.is_empty(), "{:?}", s.load().strays);
 }
 
 #[test]
@@ -1336,11 +1372,24 @@ fn a_store_cannot_be_rooted_at_home_or_use_home_as_its_lock_file() {
     assert_eq!(e.code, Code::StorageInvalid);
     assert!(e.detail.contains("HOME itself"), "{}", e.detail);
     assert_eq!(tree(&h.0), before, "a reader creates nothing");
-    // A writer creates the lock directory before it looks for the root, as for any layout.
+    // A writer creates the lock directory and the lock file before it looks for the root, as for
+    // any layout, and nothing else: no state root and no state files.
     let e = Store::open_write(sys(&h), &l, Fail::none()).unwrap_err();
     assert_eq!(e.code, Code::StorageInvalid);
     assert!(e.detail.contains("HOME itself"), "{}", e.detail);
-    assert!(!h.0.join(".local/state/dotfiles-manager").exists());
+    let mut made = files_below(&h.0);
+    made.sort();
+    assert_eq!(
+        made,
+        [
+            h.0.join(".local"),
+            h.0.join(".local/state"),
+            h.0.join(".local/state/dotfiles-manager.lock"),
+        ]
+    );
+
+    // A lock file that is HOME itself is refused before anything is created.
+    let h = Home::new();
     let before = tree(&h.0);
     let mut l = h.layout();
     l.lock_file = h.0.clone();
@@ -1352,6 +1401,7 @@ fn a_store_cannot_be_rooted_at_home_or_use_home_as_its_lock_file() {
         e.detail
     );
     assert_eq!(tree(&h.0), before, "nothing was created");
+    assert!(files_below(&h.0).is_empty());
 }
 
 /// Moves the state root aside and puts a new, empty, private directory at its name.
@@ -1491,4 +1541,82 @@ fn a_claim_that_is_a_hard_link_of_a_manager_file_or_reaches_state_through_a_link
         );
     }
     assert!(s.read_ledger().unwrap().resources.is_empty());
+}
+
+#[test]
+fn an_empty_state_directory_is_replaced_by_init_for_bind_and_refused_for_other_writers() {
+    let h = Home::new();
+    let (s, _) = init(&h);
+    drop(s);
+    let state = state_dir(&h);
+    fs::remove_dir_all(&state).unwrap();
+    fs::create_dir(&state).unwrap();
+    fs::set_permissions(&state, fs::Permissions::from_mode(0o700)).unwrap();
+
+    // Apply, resolve and recover open without `create_root`: an empty `state/` is damage.
+    let before = tree(&h.0);
+    let e = Store::open_write_with(sys(&h), &h.layout(), Fail::none(), false).unwrap_err();
+    assert_eq!(e.code, Code::StorageInvalid, "{e}");
+    assert_eq!(tree(&h.0), before, "the refusal changed nothing");
+
+    // Bind opens with `create_root` and runs `init`, which allows an empty directory.
+    let mut s = open(&h);
+    let stamp = Stamp::of(&binding("/p/profile.toml", "m5"));
+    s.init(&stamp).unwrap();
+    assert!(s.load().problems.is_empty(), "{:?}", s.load().problems);
+    assert!(state.join("receipts").is_dir() && state.join("ledger.json").is_file());
+}
+
+#[test]
+fn one_output_under_an_unsafe_link_does_not_hide_a_recorded_salted_hash() {
+    let h = Home::new();
+    let (s, stamp) = init(&h);
+    let state = state_dir(&h);
+    let elsewhere = Home::new();
+    symlink(&elsewhere.0, h.0.join("escape")).unwrap();
+    let mut l = ledger_with(&stamp, &h, "claude.settings", "settings.json", 'a');
+    l.resources[0].class = Class::Sensitive;
+    let o = &mut l.resources[0].owned_outputs[0];
+    o.fingerprint = None;
+    o.coowned = Some(dfm_model::state::CoOwned {
+        managed_hash: "b".repeat(64),
+        entries: vec![],
+        appended: vec![],
+        leaves: BTreeMap::new(),
+    });
+    l.record(LedgerResource {
+        resource: "core.y".into(),
+        adapter: "fs-link/v1".into(),
+        class: Class::Normal,
+        op_id: "op2".into(),
+        owned_outputs: vec![OwnedOutput {
+            path: h.0.join("escape/y").to_str().unwrap().into(),
+            mode: 0o777,
+            fingerprint: Some("c".repeat(64)),
+            coowned: None,
+        }],
+    })
+    .unwrap();
+    let ledger = state.join("ledger.json");
+    fs::write(&ledger, dfm_model::state::canonical(&l).unwrap()).unwrap();
+    fs::set_permissions(&ledger, fs::Permissions::from_mode(0o600)).unwrap();
+    assert!(
+        s.read_ledger().is_err(),
+        "the strict read refuses the unsafe output"
+    );
+    let salt = state.join("salt");
+    fs::write(&salt, b"short").unwrap();
+    fs::set_permissions(&salt, fs::Permissions::from_mode(0o600)).unwrap();
+    let e = s.salt().unwrap_err();
+    assert!(e.detail.contains("records a salted hash"), "{}", e.detail);
+    assert!(!e.detail.contains("unknown"), "{}", e.detail);
+    fs::remove_file(&salt).unwrap();
+    assert!(
+        s.load()
+            .problems
+            .iter()
+            .any(|p| p.file == "salt" && !p.detail.contains("unknown")),
+        "a missing salt over a recorded hash is a definite finding: {:?}",
+        s.load().problems
+    );
 }
