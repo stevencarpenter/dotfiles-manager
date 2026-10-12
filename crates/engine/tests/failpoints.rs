@@ -331,8 +331,27 @@ fn published_state_files_have_one_link_and_a_leftover_staged_name_is_a_stray_fin
         ]
     );
     assert!(loaded.problems.is_empty(), "{:?}", loaded.problems);
-    assert_eq!(s.salt().unwrap().unwrap().len(), 32);
-    // A create that finds the name taken reports it and leaves nothing staged.
-    let again = s.salt_or_create().unwrap();
-    assert_eq!(again.len(), 32);
+    let salt = s.salt().unwrap().unwrap();
+    assert_eq!(salt.len(), 32);
+    // A create that finds the name taken reports it, changes nothing and leaves nothing staged.
+    // `salt_or_create` returns the existing salt before it publishes, so the create is driven
+    // on the directory itself.
+    for rel in [".salt.1.2.3.4.tmp", "receipts/.r.1.2.3.4.tmp"] {
+        fs::remove_file(state.join(rel)).unwrap();
+    }
+    let dir = dfm_engine::fsys::Dir::open_home(&sys(&h), &state).unwrap();
+    assert!(
+        !dir.publish_new("salt", b"other", &Fail::none(), "salt")
+            .unwrap()
+    );
+    assert_eq!(s.salt().unwrap().unwrap(), salt);
+    assert!(
+        files_below(&state).iter().all(|p| !p
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with('.')),
+        "nothing is left staged: {:?}",
+        files_below(&state)
+    );
 }

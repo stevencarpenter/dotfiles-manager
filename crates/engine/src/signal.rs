@@ -160,11 +160,16 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_secs(3));
             std::process::exit(if first() == INT { 42 } else { 43 });
         }
-        let status = std::process::Command::new(std::env::current_exe().unwrap())
+        // A background job or `nohup` starts this process with SIGINT ignored, and `install`
+        // then leaves SIGINT alone, so there would be nothing to put back. perl sets the default
+        // action first and keeps it across the `exec`, so the check runs in every environment.
+        let status = std::process::Command::new("perl")
+            .args(["-e", "$SIG{INT} = 'DEFAULT'; exec { $ARGV[0] } @ARGV"])
+            .arg(std::env::current_exe().unwrap())
             .args(["--exact", NAME, "--nocapture", "--test-threads=1"])
             .env(CHILD, "1")
             .status()
-            .unwrap();
+            .expect("perl is needed to reset an inherited SIGINT");
         assert_eq!(
             status.signal(),
             Some(libc::SIGINT),
