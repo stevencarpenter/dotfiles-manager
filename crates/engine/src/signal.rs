@@ -3,11 +3,13 @@
 //! This is the only module of the workspace with `unsafe` code, and only [`install`] has it. A
 //! gate test (`crates/cli/tests/gate.rs`) rejects the keyword and the lint attributes in any
 //! other place. The handler does one thing: it stores a number in a static atomic. The executor
-//! reads the number between operations. Nothing here kills a process or exits from a handler.
+//! reads the number between operations, and once more inside an operation just before its
+//! `intent` entry (see docs/apply.md, "Signals"). After that entry it does not read the number
+//! until the operation ends. Nothing here kills a process or exits from a handler.
 //!
-//! The handlers are installed with `SA_RESTART`. The executor looks at the number only between
-//! operations, and a restarted call keeps `openat`, `renameat`, `unlinkat` and `fsync` from
-//! reporting a spurious `EINTR` as a failed or unknown operation.
+//! The handlers are installed with `SA_RESTART`. The executor never acts on the number in the
+//! middle of a file system call, and a restarted call keeps `openat`, `renameat`, `unlinkat`
+//! and `fsync` from reporting a spurious `EINTR` as a failed or unknown operation.
 //!
 //! No child process runs after [`install`] today, so there is no 30 s wait and no process-group
 //! escalation. Add them with the first operation that starts a child process.
@@ -44,6 +46,11 @@ pub fn simulate(term: bool) {
 #[cfg(feature = "failpoints")]
 pub static FAIL_TERM_SET: AtomicBool = AtomicBool::new(false);
 
+/// Test seam: makes [`install`] see a failed restore after an error. The actions are still put
+/// back; only the result is replaced.
+#[cfg(feature = "failpoints")]
+pub static FAIL_RESTORE: AtomicBool = AtomicBool::new(false);
+
 fn first() -> u8 {
     #[cfg(feature = "failpoints")]
     if let n @ (INT | TERM) = SIMULATED.with(Cell::get) {
@@ -73,6 +80,7 @@ fn failed(what: &str) -> Refusal {
 /// example `nohup` or a background job) stays ignored. Call it once, after the writer lock is
 /// taken and before the first mutation. A read-only command never calls it. On an error the
 /// actions this call already changed are put back, so a failed call leaves no handler behind.
+/// If a put-back itself fails, the error says so: a handler may still be installed.
 #[expect(
     unsafe_code,
     reason = "sigaction has no safe API; each block states its invariant"
@@ -113,10 +121,19 @@ pub fn install() -> Result<(), Refusal> {
         Ok(())
     })();
     if result.is_err() {
+        let mut restored = true;
         for (sig, old) in installed.iter().rev() {
             // SAFETY: `old` is the action `sigaction` itself returned for `sig`, so it is valid to
             // set again. The previous action is not wanted: null.
-            unsafe { libc::sigaction(*sig, old, std::ptr::null_mut()) };
+            let rc = unsafe { libc::sigaction(*sig, old, std::ptr::null_mut()) };
+            restored &= rc == 0;
+        }
+        #[cfg(feature = "failpoints")]
+        {
+            restored &= !FAIL_RESTORE.load(Ordering::SeqCst);
+        }
+        if !restored {
+            return Err(failed("restore: a handler may still be installed"));
         }
     }
     result
@@ -143,6 +160,17 @@ mod tests {
 
     const CHILD: &str = "DFM_SIGNAL_TEST_CHILD";
     const NAME: &str = "signal::tests::a_failed_install_puts_the_sigint_action_back";
+
+    #[test]
+    fn a_failed_restore_is_named_in_the_error() {
+        FAIL_TERM_SET.store(true, Ordering::SeqCst);
+        FAIL_RESTORE.store(true, Ordering::SeqCst);
+        let e = install().unwrap_err();
+        FAIL_TERM_SET.store(false, Ordering::SeqCst);
+        FAIL_RESTORE.store(false, Ordering::SeqCst);
+        assert!(e.detail.contains("restore"), "{e}");
+        assert!(e.detail.contains("may still be installed"), "{e}");
+    }
 
     #[test]
     fn a_failed_install_puts_the_sigint_action_back() {
