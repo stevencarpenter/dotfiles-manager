@@ -59,9 +59,11 @@ pub(crate) fn observe_live(
 }
 
 /// Answers an interrupted operation's `already_done` question. It decides nothing about
-/// ownership.
+/// ownership. The manager writes one output per intent, so an intent with none or with more
+/// than one is not probed (probing only the first would settle the others unseen): it stays
+/// open for the operator.
 pub(crate) fn inspect(w: Where<'_>, e: &JournalEntry) -> (Probe, Option<Live>) {
-    let Some(out) = e.recovery.as_ref().and_then(|r| r.outputs.first()) else {
+    let Some([out]) = e.recovery.as_ref().map(|r| r.outputs.as_slice()) else {
         return (Probe::Unknown, None);
     };
     let Some(live) = observe_live(w, &out.path, out.expected_sha256.is_some()) else {
