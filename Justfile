@@ -17,6 +17,6 @@ check-tests:
 # Every named check above, in order.
 check: check-fixtures check-scripts check-style check-tests
 
-# Full local validation, shared with the commit hook and hosted CI.
+# Full local validation, the same script as the commit hook. Hosted CI runs scripts/check_all.sh once per step, not this recipe.
 check-all:
     bash scripts/check_all.sh

@@ -12,8 +12,17 @@ step_fixtures() {
 step_scripts() {
     uvx --python 3.14 ruff@0.14.14 check scripts
     uvx --python 3.14 ruff@0.14.14 format --check scripts
-    bash -n scripts/check_all.sh scripts/check_staged.sh examples/external/modules/work/files/session-hook.sh
+    # `bash -n a b c` parses only the first file, so each file gets its own run.
+    for f in scripts/check_all.sh scripts/check_staged.sh examples/external/modules/work/files/session-hook.sh; do
+        bash -n "$f"
+    done
+    # macOS /bin/sh is bash 3.2 in POSIX mode: `sh -n` checks syntax only, nothing else.
     sh -n scripts/bootstrap.sh
+    if command -v shellcheck >/dev/null 2>&1; then
+        shellcheck -s sh -S warning scripts/bootstrap.sh
+    else
+        echo "SKIPPED: shellcheck is not installed"
+    fi
     uv run --python 3.14 scripts/test_check_staged.py
 }
 
