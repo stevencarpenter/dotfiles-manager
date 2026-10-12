@@ -158,6 +158,14 @@ pub(crate) fn components(rel: &str) -> Result<Vec<&str>, Refusal> {
     Ok(comps)
 }
 
+/// Whether the action publishes through a same-directory staged name.
+fn stages(a: Action) -> bool {
+    matches!(
+        a,
+        Action::CreateFile | Action::UpdateFile | Action::ReplaceLink | Action::Retire
+    )
+}
+
 fn is_file_action(a: Action) -> bool {
     matches!(a, Action::CreateFile | Action::UpdateFile)
 }
@@ -302,12 +310,26 @@ fn first_refusal(plan: &Plan, generator: &dyn Generator) -> Result<(), Refusal> 
             .path
             .as_deref()
             .ok_or_else(|| plan_invalid(format!("{} has no path", op.id)))?;
-        components(path)?;
+        let comps = components(path)?;
+        // A file or link is staged under a longer hidden name in its own directory. A leaf that
+        // leaves no room for that name would fail with `ENAMETOOLONG` after the intent entry.
+        let leaf = comps.last().map_or(0, |l| l.len());
+        if stages(op.action) && leaf + crate::fsys::TEMP_NAME_EXTRA > crate::fsys::NAME_MAX {
+            return Err(Refusal::new(
+                Code::LimitExceeded,
+                format!(
+                    "{}: the file name is {leaf} bytes; the staged name needs up to {} more and a name holds {}. Nothing was changed",
+                    op.id,
+                    crate::fsys::TEMP_NAME_EXTRA,
+                    crate::fsys::NAME_MAX
+                ),
+            ));
+        }
         // A sensitive output has no content hash. Apply admits one kind of sensitive operation,
         // the co-owned merge, which has its own conflict detection (docs/apply.md, Merge). Any
-        // other sensitive operation refuses the whole plan.
+        // other sensitive operation, a directory included, refuses the whole plan.
         let merge = op.class == Class::Sensitive && generator.merges(op);
-        if op.class == Class::Sensitive && op.action != Action::CreateDir && !merge {
+        if op.class == Class::Sensitive && !merge {
             return Err(Refusal::new(
                 Code::SensitiveUnsupported,
                 format!(
@@ -500,6 +522,8 @@ enum Ended {
         reload: Option<String>,
     },
     Current,
+    /// A stop request (SIGINT or SIGTERM) arrived before the intent entry. Nothing was written.
+    NotStarted(Refusal),
     Failed(Refusal, Option<String>),
     Blocked(Refusal),
     Unknown(Refusal, Option<String>),
@@ -753,6 +777,13 @@ impl Exec<'_, '_> {
         Ok(())
     }
 
+    /// The last look at the signal record before an operation writes its intent entry. A signal
+    /// that arrived during the checks, the link walk or the generation ends the operation as
+    /// not started, with nothing journaled.
+    fn stop_requested(&self) -> Result<(), Ended> {
+        crate::signal::requested().map_or(Ok(()), |r| Err(Ended::NotStarted(r)))
+    }
+
     fn run_op(&mut self, op: &Operation) -> Ended {
         self.try_op(op).unwrap_or_else(|e| e)
     }
@@ -776,7 +807,6 @@ impl Exec<'_, '_> {
             if self.run.generator.merges(op) {
                 return self.try_merge(op);
             }
-            debug_assert!(false, "a sensitive operation reached apply");
             return Err(failed(Refusal::new(
                 Code::SensitiveUnsupported,
                 format!("{}: sensitive outputs are not supported", op.id),
@@ -847,6 +877,7 @@ impl Exec<'_, '_> {
             Action::Remove => facts.ledger_fp.clone(),
             _ => new_fp.clone(),
         };
+        self.stop_requested()?;
         let id = self.attempt_id(op);
         let recovery = Recovery {
             outputs: vec![RecoveryOutput {
@@ -1112,6 +1143,7 @@ impl Exec<'_, '_> {
             new_hash,
         } = decided;
         let retire = op.action == Action::Retire;
+        self.stop_requested()?;
         let id = self.attempt_id(op);
         let recovery = Recovery {
             outputs: vec![RecoveryOutput {
@@ -1696,6 +1728,13 @@ fn execute(run: &Run<'_>, plan: &Plan) -> Report {
                         Status::Updated,
                         record(op, id, Status::Updated, times, None, Some(&ended)),
                     ),
+                    Ended::NotStarted(r) => {
+                        stopped.get_or_insert_with(|| r.clone());
+                        (
+                            Status::NotStarted,
+                            record(op, &op.journal_id, Status::NotStarted, None, None, None),
+                        )
+                    }
                     Ended::Failed(r, id) => {
                         stopped.get_or_insert_with(|| r.clone());
                         let id = id.as_deref().unwrap_or(&op.journal_id);

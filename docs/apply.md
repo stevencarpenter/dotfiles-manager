@@ -39,9 +39,9 @@ All of these exit 3 and change nothing:
 
 - The plan has a blocker (`E_CONFLICT`, `E_PARENT_UNSAFE`, `E_PRIVILEGE_UNSUPPORTED`, and the other planner codes).
 - The digest is stale or missing.
-- Each operation is checked for shape: its `after` entries come earlier in the order, its journal id is valid, a link target lies inside the source root, and its path has no empty, `.` or `..` component.
+- Each operation is checked for shape: its `after` entries come earlier in the order, its journal id is valid, a link target lies inside the source root, and its path has no empty, `.` or `..` component. An operation that stages a file or link under a hidden name (`create_file`, `update_file`, `replace_link`, `retire`) also needs a leaf name of at most 216 bytes, because the staged name adds up to 39 bytes and a name holds 255 (`E_LIMIT_EXCEEDED`).
 - A planned file operation needs content. The generator must support it and the plan must carry its output hash (`output_sha256`). Otherwise the gate refuses with `E_GENERATOR_UNAVAILABLE` or `E_PLAN_INVALID`. This applies to the whole plan, so apply never publishes half of a profile. The release binary has generators for `git-config/v1` and `text-fragments/v1` (docs/adapters.md). `claude-settings/v1` is a sensitive co-owned merge with its own path (see "Merge").
-- Any planned operation on a sensitive output is refused with its own code, `E_SENSITIVE_UNSUPPORTED`, unless the generator runs it as a merge (`Generator::merges`). Today that is exactly the `create_file`, `update_file` and `retire` operations of `claude-settings/v1`. A secret output, a sensitive link and a sensitive removal stay refused. The rule "a plan with any unsupported sensitive operation is refused whole" is unchanged: one refused operation refuses the plan. A merge operation must carry `managed_sha256` (`retire` must carry none), otherwise the plan is `E_PLAN_INVALID`.
+- Any planned operation on a sensitive output is refused with its own code, `E_SENSITIVE_UNSUPPORTED`, unless the generator runs it as a merge (`Generator::merges`). Today that is exactly the `create_file`, `update_file` and `retire` operations of `claude-settings/v1`. A secret output, a sensitive link, a sensitive directory and a sensitive removal stay refused. The gate refuses them, so the executor never meets one. The rule "a plan with any unsupported sensitive operation is refused whole" is unchanged: one refused operation refuses the plan. A merge operation must carry `managed_sha256` (`retire` must carry none), otherwise the plan is `E_PLAN_INVALID`.
 - A link target must lie in the root of the operation's own source: the plan source whose `<root>/<first input path>` is the target. A target outside every source root, or one that names another file than the operation's input, is `E_PLAN_INVALID`.
 - The journal must be able to take this run's entries. The check assumes 4096 bytes for the two entries of each journaled operation. If the journal would pass 8 MiB, apply refuses before any write with `E_LIMIT_EXCEEDED`. Journal rotation belongs to DFM-19.
 - Each planned `remove` operation needs its own `--allow-disruptive <operation-id>` (`E_DISRUPTIVE_UNAPPROVED`). The allow set must equal the set of planned removals, so the plan determines it. The refusal lists every missing id as a pasteable flag, with no cap. Architecture section 10 item 8 lists deletion of an owned file as disruptive.
@@ -99,11 +99,11 @@ The receipt is written once, after the last operation (architecture section 9 it
 | `create_dir` | `mkdirat`, then `fchmodat` to 0700 by name without following a link | `EEXIST` is a conflict. The mode is stated before the directory is opened, so a restrictive umask cannot leave a directory the process cannot open. A created directory is never recorded as owned and never removed. |
 | `create_link` | `symlinkat` | `EEXIST` is a conflict. A leaf that appeared is never replaced. |
 | `replace_link` | `symlinkat` to a hidden name, then `renameat` | The fingerprint of the live link (`link_fingerprint` of its target text) must equal the ledger fingerprint, read just before the rename. |
-| `create_file` | staged file (`O_EXCL`, mode set before content, `fsync`), then `linkat` | `linkat` never replaces. The staged name is removed. The directory is synced. |
+| `create_file` | staged file (`O_EXCL`, mode set before content, `fsync`), then `renameat` with `RENAME_EXCL` | The exclusive rename never replaces and leaves one name for the file, so no second link exists at any time. The directory is synced. |
 | `update_file` | staged file, then `renameat` | The live content hash must equal the ledger fingerprint, read just before the rename. |
 | `remove` | `unlinkat` without `AT_REMOVEDIR` | See Delete safety. |
 | `adopt` | none | No effect on HOME. See Adoption. |
-| merge `create_file`, `update_file`, `retire` | staged file (`O_EXCL`, 0600, `fsync`), then `linkat` (create) or `renameat` guarded by file identity | See Merge. |
+| merge `create_file`, `update_file`, `retire` | staged file (`O_EXCL`, 0600, `fsync`), then an exclusive `renameat` (create) or `renameat` guarded by file identity | See Merge. |
 
 Staged files are named `.<name>.<pid>.<n>.<nanos>.tmp` and staged links `.<name>.<pid>.<n>.<nanos>.stage`. A link is given mode 0755 after it is made, because macOS applies the umask to a link and a link made under a restrictive umask cannot be read by its owner. A failure before the commit point removes the staged name and leaves the previous state. A failure after it is `E_IO_UNCONFIRMED` (below).
 
@@ -122,7 +122,7 @@ A removal needs all of the following at the moment of deletion:
 5. The entry is not a directory, and is not sensitive.
 6. The name still refers to the entry that was hashed (device and inode for a file, the same target for a link).
 
-Then `unlinkat` removes the name. A link is removed, never followed. Anything modified or foreign is kept and reported. Deselecting a module removes only the outputs the ledger proves the manager wrote. It does not uninstall a package, erase runtime state, remove a directory, or touch a sibling.
+Then `unlinkat` removes the name. A link is removed, never followed. An immutable flag (`uchg`) or a sticky directory owned by another user makes `unlinkat` fail with `EPERM`. That is reported as `E_IO_FAILED` with the cause, and the entry is kept. It is not reported as a directory. Anything modified or foreign is kept and reported. Deselecting a module removes only the outputs the ledger proves the manager wrote. It does not uninstall a package, erase runtime state, remove a directory, or touch a sibling.
 
 A removal candidate that is already gone has a stale ledger entry. Apply drops that entry (journaled), so a later file with the same content at the same path does not look owned. Apply checks absence through the opened HOME before the intent entry and again right before the ledger write. A path that exists again, a parent that cannot be opened, or a path in an unknown state keeps its entry. An unconfirmed ledger write there is `unknown`, like any other.
 
@@ -159,7 +159,7 @@ A sensitive co-owned file (`claude-settings/v1`, docs/adapters.md) runs through 
 The code is three functions: `merge_read`, `merge_decide` and `merge_settle`.
 6. **Salt**: `state/salt` is created now if it does not exist (docs/state.md).
 7. **Intent**: the journal gets an `intent` entry with `existed_before` and no expected hash.
-8. **Effect**: if the bytes differ from the live file, publish them. A new file uses `linkat`, which never replaces. An existing file uses `renameat` after a last identity check (`Publish::ReplaceStamp`). If the bytes are equal nothing is written, and the ledger is still updated. The failpoints are `apply-before-effect`, `file-after-tmp` and `apply-after-effect`.
+8. **Effect**: if the bytes differ from the live file, publish them. A new file uses an exclusive rename (`RENAME_EXCL`), which never replaces. An existing file uses `renameat` after a last identity check (`Publish::ReplaceStamp`). If the bytes are equal nothing is written, and the ledger is still updated. The failpoints are `apply-before-effect`, `file-after-tmp` and `apply-after-effect`.
 9. **Read-back**: the file is always read and compared with the bytes in memory, also when nothing was written (an unchanged merge or a takeover). The mode must be 0600 after a write, and the mode read at step 3 when nothing was written. A file rewritten or changed with `chmod` between the read and this step fails the postcondition (`E_IO_FAILED`, journal `failed`), and the ledger is not written. So a merge now reports `E_IO_FAILED` when another program rewrites the file between the read and the read-back, also when the merge changed nothing. Nothing of this is recorded.
 10. **Outcome and ledger**: the journal gets `done`. The ledger records the output with no fingerprint, the salted hash of the managed fields as written (fragments included), the owned handler entries and the appended array items. A `retire` drops the output from the ledger.
 
@@ -251,7 +251,7 @@ Publishing a file does not reload the program that reads it (architecture sectio
 
 ## Signals
 
-`apply` (not `--preview`) handles SIGINT and SIGTERM. It installs the handlers after it takes the writer lock and plans again under the lock, and before it settles earlier work. The lock file can exist before the handlers do. No journal, ledger or HOME write happens in that window, and a signal in it ends the process with the default action. The handler stores the number of the first signal in an atomic and does nothing else. The executor looks at the record before it settles and before it writes each `intent` entry:
+`apply` (not `--preview`) handles SIGINT and SIGTERM. It installs the handlers after it takes the writer lock and plans again under the lock, and before it settles earlier work. The lock file can exist before the handlers do. No journal, ledger or HOME write happens in that window, and a signal in it ends the process with the default action. The handler stores the number of the first signal in an atomic and does nothing else. The executor looks at the record before it settles, before each operation, and again immediately before it writes the `intent` entry (after the checks, the link source walk and the generation). A signal seen at that last look ends the operation as `not_started` with no `intent` entry:
 
 - The operation in flight finishes: its effect, read-back, outcome entry and ledger write. A staged file is never left half written.
 - No new `intent` entry is written. Every operation that has not started is `not_started`. An operation that needs nothing (`current`, `not_in_scope`) is reported as it is.
@@ -260,14 +260,14 @@ Publishing a file does not reload the program that reads it (architecture sectio
 - A signal has precedence over a failure in the exit code. The operations still show what failed.
 - A signal that arrived before a pre-run check refused the plan still gives 130 or 143.
 - If the receipt cannot be written, the report says `receipt: not written (...)` and the exit is still 130 or 143.
-- A second signal, of either kind, does nothing. The first signal keeps its code and the receipt is still written. SIGKILL is the only forced stop.
+- A second signal, of either kind, does nothing. The first signal keeps its code and the receipt is still written. SIGKILL cannot be caught and ends the process at once.
 - A signal that arrives while the receipt is written cannot be in that receipt. The exit is still 130 or 143, the report adds a `signal:` line, and the receipt keeps the outcome it had.
 - If the parent set a signal to ignore (`nohup`, a background job), the handler for that signal is not installed and it stays ignored.
 - `plan`, `doctor`, `explain`, `state` and `apply --preview` install no handler, so a signal ends them as before: the kernel kills the process and no receipt exists.
 
 The handlers are installed with `SA_RESTART`. A blocking call restarts, and the executor sees the record at the next check, so a file system call never reports a spurious `EINTR` as a failed operation. No child process runs after the handlers are installed. Add the 30 s wait and process-group escalation of the target contract (docs/architecture.md section 10) with the first operation that starts a child process.
 
-SIGKILL cannot be caught. It leaves the `intent` entry, and the next run settles it ("Interrupted runs").
+SIGKILL, or any signal with no handler (SIGHUP, SIGQUIT, ...), ends the process with no cleanup. It can leave an `intent` entry, and the next run settles it ("Interrupted runs").
 
 ## Known limits
 
@@ -278,7 +278,7 @@ SIGKILL cannot be caught. It leaves the `intent` entry, and the next run settles
 - **Replace and remove check, then act.** `replace_link`, `update_file` and `remove` verify the leaf and then call `renameat` or `unlinkat`. These are two system calls. A process of the same user that swaps the leaf between them wins. Create operations have no such window (`EEXIST`). A swap of a parent directory cannot redirect any step, because every step uses the opened descriptor. A parent swapped after it was opened is not detected for the operations that already hold it. The effect lands in the directory that was verified, and the next operation sees the changed topology and is blocked.
 - **Source content during the run.** The `source:` preconditions are checked when the plan is made and again under the lock. A link reads its source again immediately before its intent entry (see Link source), and a generated file reads its sources again immediately before it is generated and compares them (see Generator). A source changed after that point is not compared again: a link publishes a path, so a later change shows only in the next plan.
 - **Crash between the effect and the ledger.** The output exists, the journal says `done` (or `intent` only), and the ledger has no entry. The next plan sees an exact link as an `adopt` operation, and `--allow-adopt` records it (DFM-45). Until then the output stays and is not owned, so it is never removed. This is the safe direction. Recovering ownership from the journal alone is not built, and a regular file with the right content is not recovered at all.
-- **Signals.** Only SIGKILL (and a crash or power loss) leaves an `intent` entry without an outcome. The next run settles it. See Signals.
+- **Signals.** SIGKILL or any unhandled signal (SIGHUP, SIGQUIT, ...), a crash or a power loss can leave an `intent` entry without an outcome. The next run settles it. See Signals.
 - **Not implemented flags and modes.** `--json`, `--no-input`, `--timeout`, an interactive approval and a run limit do not exist. Every run is noninteractive, so exit 4 does not occur.
 - **Forged ledger.** The ledger is not authenticated. A ledger edited by hand, with correct hashes for a user's own regular files, can make apply delete those files when the matching `--allow-disruptive` ids are given. The per-id flag and a review of the plan (which lists every removal) limit this. A stronger fix is a per-machine MAC over the ledger, or a device and inode record per output. Neither is built.
 - **Receipt write after the work.** If the receipt cannot be written, the run exits 1 and the journal and ledger are the record.

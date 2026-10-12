@@ -111,6 +111,14 @@ pub fn below(home: &Path, path: &Path) -> Result<Vec<String>, Refusal> {
         .collect()
 }
 
+/// The longest a file name can be on the supported file system.
+pub(crate) const NAME_MAX: usize = 255;
+
+/// The most bytes [`temp_name`] adds to a name: two dots and two more separators, a process id
+/// and a counter of up to 10 digits each, up to 9 digits of nanoseconds and a suffix of up to 5
+/// letters (`stage`).
+pub(crate) const TEMP_NAME_EXTRA: usize = 1 + 1 + 10 + 1 + 10 + 1 + 9 + 1 + 5;
+
 /// A hidden same-directory name for a staged file or link: unique per process and call.
 pub(crate) fn temp_name(name: &str, suffix: &str) -> String {
     static N: AtomicU32 = AtomicU32::new(0);
