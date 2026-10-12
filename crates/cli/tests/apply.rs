@@ -2627,3 +2627,23 @@ fn state_recover_keeps_the_entry_open_on_an_unreadable_ledger_then_settles_it() 
         .clone();
     assert_eq!(fp, want.as_str(), "the ledger was updated");
 }
+
+#[test]
+fn apply_refuses_a_state_store_that_lacks_a_subdirectory_before_any_change() {
+    for missing in ["receipts", "snapshots", "trials"] {
+        let fx = Fx::new();
+        let digest = fx.digest();
+        fs::remove_dir(fx.state().join(missing)).unwrap();
+        let before = fingerprint(fx.home.path());
+        let o = fx.apply_with(&digest, &[]);
+        assert_eq!(code(&o), 3, "{missing}: {}", stderr(&o));
+        assert!(stderr(&o).contains("E_STORAGE_INVALID"), "{}", stderr(&o));
+        assert!(stderr(&o).contains(missing), "{}", stderr(&o));
+        assert_eq!(
+            fingerprint(fx.home.path()),
+            before,
+            "{missing}: no link, journal entry or ledger change"
+        );
+        assert!(!fx.h(".zshrc").exists(), "{missing}");
+    }
+}

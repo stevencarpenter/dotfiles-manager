@@ -388,7 +388,7 @@ pub(crate) fn quoted(id: &str) -> String {
 pub(crate) fn fix_text(id: &str) -> String {
     let q = quoted(id);
     format!(
-        "Fix: run `dotfiles-manager state recover` (it settles what the machine shows clearly) or apply. If the entry stays open, check the path, then run `dotfiles-manager state resolve {q} --as done` (the path holds the result the operation expected) or `--as failed`"
+        "Fix: run `dotfiles-manager state recover` (it settles what the machine shows clearly) or apply. If the entry stays open, check the path, then run `dotfiles-manager state resolve {q} --as done` (the path holds the result the operation expected; an entry with more than one path cannot be resolved as done) or `--as failed`"
     )
 }
 

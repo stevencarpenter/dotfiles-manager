@@ -118,7 +118,13 @@ fn snapshot(dir: &Path) -> BTreeMap<PathBuf, (Vec<u8>, u32)> {
                 out.insert(p.clone(), (vec![], m.mode()));
                 walk(&p, out);
             } else {
-                out.insert(p.clone(), (fs::read(&p).unwrap(), m.mode()));
+                // A FIFO or device has no bytes to compare, and reading a FIFO would block.
+                let bytes = if m.is_file() {
+                    fs::read(&p).unwrap()
+                } else {
+                    vec![]
+                };
+                out.insert(p.clone(), (bytes, m.mode()));
             }
         }
     }
@@ -1489,6 +1495,59 @@ fn a_writer_refuses_a_state_store_that_lacks_a_subdirectory_before_any_change() 
     }
 }
 
+#[test]
+fn resolve_and_a_first_bind_refuse_a_state_store_that_lacks_a_subdirectory_before_any_change() {
+    for missing in ["receipts", "snapshots", "trials"] {
+        let h = bound_home("missing-sub-cmds");
+        fs::remove_dir(state(h.path()).join(missing)).unwrap();
+        let before = snapshot(h.path());
+        let resolve = run(h.path(), &["state", "resolve", "nope", "--as", "failed"]);
+        assert_eq!(resolve.status.code(), Some(3), "{}", text(&resolve.stderr));
+        assert!(
+            text(&resolve.stderr).contains("E_STORAGE_INVALID"),
+            "{missing}"
+        );
+        assert_eq!(
+            snapshot(h.path()),
+            before,
+            "{missing}: resolve changed nothing"
+        );
+
+        // Without its binding file, a bind writes: it takes the same gate as the other writers.
+        fs::remove_dir_all(h.path().join(".config/dotfiles-manager")).unwrap();
+        let before = snapshot(h.path());
+        let o = bind(h.path());
+        assert_eq!(o.status.code(), Some(3), "{missing}: {}", text(&o.stderr));
+        assert!(text(&o.stderr).contains("E_STORAGE_INVALID"), "{missing}");
+        assert_eq!(
+            snapshot(h.path()),
+            before,
+            "{missing}: bind changed nothing"
+        );
+    }
+}
+
+#[test]
+fn a_first_bind_refuses_an_empty_state_directory_before_any_write() {
+    // The engine's `init` accepts an empty `state/`, but `bind` reads the store first (phase 1)
+    // and a store without `state.json` is state loss, so nothing reaches `init`.
+    let h = bound_home("empty-state");
+    fs::remove_dir_all(h.path().join(".config/dotfiles-manager")).unwrap();
+    let st = state(h.path());
+    fs::remove_dir_all(&st).unwrap();
+    fs::create_dir(&st).unwrap();
+    fs::set_permissions(&st, fs::Permissions::from_mode(0o700)).unwrap();
+    let before = snapshot(h.path());
+    let o = bind(h.path());
+    assert_eq!(o.status.code(), Some(3), "{}", text(&o.stderr));
+    assert!(
+        text(&o.stderr).contains("E_STATE_INVALID"),
+        "{}",
+        text(&o.stderr)
+    );
+    assert_eq!(snapshot(h.path()), before);
+}
+
 fn record_trial(h: &Path, id: &str, baseline: &Path) -> Output {
     run(
         h,
@@ -1540,6 +1599,27 @@ fn a_trial_baseline_that_cannot_be_read_or_is_a_link_is_an_error_not_an_absent_f
     }
     assert_eq!(snapshot(h.path()), before, "nothing was recorded");
 
+    // A FIFO is not read (a read would wait for a writer), and a second hard link is refused.
+    let fifo = h.path().join("fifo");
+    let made = std::process::Command::new("/usr/bin/mkfifo")
+        .arg(&fifo)
+        .status()
+        .unwrap();
+    assert!(made.success());
+    let twin = h.path().join("twin");
+    fs::hard_link(&plain, &twin).unwrap();
+    let before = snapshot(h.path());
+    for (id, p) in [("t6", &fifo), ("t7", &twin)] {
+        let o = record_trial(h.path(), id, p);
+        assert_ne!(o.status.code(), Some(0), "{id}");
+        assert!(
+            text(&o.stderr).contains("E_STATE_INVALID"),
+            "{id}: {}",
+            text(&o.stderr)
+        );
+    }
+    assert_eq!(snapshot(h.path()), before, "nothing was recorded");
+
     // An unreadable file is an I/O error, not "did not exist".
     if is_root() {
         println!("SKIPPED: unreadable baseline (runs as root)");
@@ -1558,4 +1638,102 @@ fn a_trial_baseline_that_cannot_be_read_or_is_a_link_is_an_error_not_an_absent_f
         text(&o.stderr)
     );
     assert_eq!(snapshot(&state(h.path())), before, "no trial was recorded");
+}
+
+#[test]
+fn reconcile_does_not_settle_an_output_that_is_a_link_or_a_directory() {
+    for (label, shape) in [("link", 0), ("directory", 1)] {
+        let h = bound_home("reconcile-shape");
+        let out = out_file(h.path(), "victim");
+        let o = with_fail(
+            h.path(),
+            "after-intent:abort",
+            &[
+                "__record-op",
+                "--resource",
+                "core.victim",
+                "--output",
+                &out,
+                "--content",
+                "v",
+            ],
+        );
+        assert_eq!(o.status.signal(), Some(6), "{label}");
+        // The output now exists, but not as the plain file the intent expected. A link to a
+        // file with the expected content is the case a following read would call done.
+        if shape == 0 {
+            let real = h.path().join("real");
+            fs::write(&real, "v").unwrap();
+            symlink(&real, &out).unwrap();
+        } else {
+            fs::create_dir(&out).unwrap();
+        }
+        let before = snapshot(&state(h.path()));
+        let r = run(h.path(), &["__reconcile"]);
+        assert_eq!(r.status.code(), Some(0), "{label}: {}", text(&r.stderr));
+        let said = text(&r.stdout);
+        assert!(said.contains("as Unknown"), "{label}: {said}");
+        assert!(
+            !said.contains("as Done") && !said.contains("as Failed"),
+            "{label}: {said}"
+        );
+        assert_ne!(
+            snapshot(&state(h.path())),
+            before,
+            "{label}: the open entry was journaled"
+        );
+        assert!(!text(&fs::read(state(h.path()).join("ledger.json")).unwrap()).contains(&out));
+    }
+}
+
+#[test]
+fn recover_does_not_advise_resolving_a_multi_path_entry_as_done() {
+    let h = bound_home("multi-path");
+    let out = out_file(h.path(), "victim");
+    let o = with_fail(
+        h.path(),
+        "after-intent:abort",
+        &[
+            "__record-op",
+            "--resource",
+            "core.victim",
+            "--output",
+            &out,
+            "--content",
+            "v",
+        ],
+    );
+    assert_eq!(o.status.signal(), Some(6));
+    // Give the intent a second recorded output, as a hand-written journal could.
+    let j = state(h.path()).join("journal.jsonl");
+    let mut lines: Vec<serde_json::Value> = fs::read_to_string(&j)
+        .unwrap()
+        .lines()
+        .map(|l| json(l.as_bytes()))
+        .collect();
+    let first = lines[0]["recovery"]["outputs"][0].clone();
+    let mut second = first.clone();
+    second["path"] = out_file(h.path(), "other").into();
+    lines[0]["recovery"]["outputs"]
+        .as_array_mut()
+        .unwrap()
+        .push(second);
+    let body: String = lines.iter().map(|l| format!("{l}\n")).collect();
+    fs::write(&j, body).unwrap();
+
+    let r = run(h.path(), &["state", "recover"]);
+    assert_eq!(r.status.code(), Some(3), "{}", text(&r.stderr));
+    assert!(
+        text(&r.stderr).contains("more than one path cannot be resolved as done"),
+        "{}",
+        text(&r.stderr)
+    );
+    let id = lines[0]["op_id"].as_str().unwrap();
+    let d = run(h.path(), &["state", "resolve", id, "--as", "done"]);
+    assert_eq!(d.status.code(), Some(3), "{}", text(&d.stderr));
+    assert!(
+        text(&d.stderr).contains("E_CONFLICT"),
+        "{}",
+        text(&d.stderr)
+    );
 }

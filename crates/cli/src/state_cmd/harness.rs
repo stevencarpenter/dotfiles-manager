@@ -215,36 +215,48 @@ pub fn record_op(ctx: &Ctx, args: &[String], out: &mut dyn Write) -> Result<(), 
     writeln!(out, "recorded {id}").map_err(|e| io("output", &e))
 }
 
-/// The bytes of a baseline file, read without following a link. `None` only when the path does
-/// not exist: any other failure (a link, a directory, no permission) is an error, because
-/// recording it as "did not exist" would make a later restore delete a file that was there.
-fn read_baseline(path: &str) -> Result<Option<Vec<u8>>, Refusal> {
+/// The most a harness read takes from a file, as for the manager's own documents.
+const MAX_READ: u64 = 16 << 20;
+
+/// The bytes of a regular file, read without following a link. `None` only when the path does
+/// not exist: any other failure (a link, a directory, a FIFO, a second hard link, no permission,
+/// more than [`MAX_READ`] bytes) is an error, because recording it as "did not exist" would make
+/// a later restore delete a file that was there.
+fn read_regular(path: &str) -> Result<Option<Vec<u8>>, Refusal> {
     use std::io::Read;
     use std::os::unix::fs::MetadataExt;
     let seen = match fs::symlink_metadata(path) {
         Ok(m) => m,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(io("stat baseline", &e)),
+        Err(e) => return Err(io("stat path", &e)),
     };
+    let refuse = |what: &str| Refusal::new(Code::StateInvalid, format!("the path {what}"));
     if !seen.is_file() {
-        return Err(Refusal::new(
-            Code::StateInvalid,
-            "the baseline path is a link or not a regular file",
-        ));
+        return Err(refuse("is a link or not a regular file"));
     }
-    let mut f = fs::File::open(path).map_err(|e| io("open baseline", &e))?;
-    // The path may have been swapped for a link after the check above: the open file must be
-    // the file that was checked.
-    let opened = f.metadata().map_err(|e| io("stat baseline", &e))?;
-    if (opened.dev(), opened.ino()) != (seen.dev(), seen.ino()) {
-        return Err(Refusal::new(
-            Code::StateInvalid,
-            "the baseline path changed while it was read",
-        ));
+    // No-follow and non-blocking, so a swap for a link or a FIFO after the check above fails
+    // or is caught below instead of hanging the harness.
+    let mut f = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(dfm_platform_macos::O_NOFOLLOW | dfm_platform_macos::O_NONBLOCK)
+        .open(path)
+        .map_err(|e| io("open path", &e))?;
+    // The open file must be the file that was checked.
+    let opened = f.metadata().map_err(|e| io("stat path", &e))?;
+    if !opened.is_file() || (opened.dev(), opened.ino()) != (seen.dev(), seen.ino()) {
+        return Err(refuse("changed while it was read"));
+    }
+    if opened.nlink() != 1 {
+        return Err(refuse("has more than one hard link"));
     }
     let mut bytes = Vec::new();
-    f.read_to_end(&mut bytes)
-        .map_err(|e| io("read baseline", &e))?;
+    (&mut f)
+        .take(MAX_READ + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|e| io("read path", &e))?;
+    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > MAX_READ {
+        return Err(refuse("is larger than the read limit"));
+    }
     Ok(Some(bytes))
 }
 
@@ -255,7 +267,7 @@ pub fn record_trial(ctx: &Ctx, args: &[String], out: &mut dyn Write) -> Result<(
         return Err(usage("--id, --tool and --baseline-path are required"));
     };
     let (store, binding) = open_bound(ctx, super::fail_from_env()?, Vec::new())?;
-    let existing = read_baseline(&path)?;
+    let existing = read_regular(&path)?;
     let trial = TrialRecord {
         schema: 1,
         binding: Stamp::of(&binding),
@@ -285,7 +297,15 @@ pub fn reconcile(ctx: &Ctx, out: &mut dyn Write) -> Result<(), Refusal> {
             .iter()
             .flat_map(|r| &r.outputs)
             .collect::<Vec<_>>();
-        let seen: Vec<Option<Vec<u8>>> = outs.iter().map(|o| fs::read(&o.path).ok()).collect();
+        // An output that cannot be read as a plain file (a link, a directory, no permission) is
+        // not absent: the probe cannot decide.
+        let Ok(seen) = outs
+            .iter()
+            .map(|o| read_regular(&o.path))
+            .collect::<Result<Vec<_>, _>>()
+        else {
+            return Probe::Unknown;
+        };
         if seen.iter().all(Option::is_none) {
             return Probe::NotDone;
         }
