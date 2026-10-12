@@ -1599,6 +1599,18 @@ fn the_early_pin_is_read_from_the_manager_table_with_the_staged_grammar() {
     let o = install_tiny(&home, &src, &sha);
     assert_eq!(o.status.code(), Some(3), "{}", err(&o));
     assert!(err(&o).contains("E_SOURCE_UNTRUSTED"), "{}", err(&o));
+    // An array of tables is not the [manager] table; the staged check refuses it as well
+    // (fixture srclock-manager-array).
+    let tmp = TempDir::new("pin-hint-array");
+    let lock = format!("schema = 1\n[[manager]]\ntoolchain = \"9.9.9\"\n{tree}");
+    let (src, sha) = source_with_lock(tmp.path(), &lock);
+    let o = install_tiny(&home, &src, &sha);
+    assert_eq!(o.status.code(), Some(3), "{}", err(&o));
+    assert!(
+        err(&o).contains("E_SOURCE_UNTRUSTED") && err(&o).contains("[[manager]]"),
+        "{}",
+        err(&o)
+    );
     // A repeated key is refused, as the staged check refuses it.
     let tmp = TempDir::new("pin-hint-twice");
     let lock =
@@ -1912,7 +1924,125 @@ fn the_data_directories_are_checked_again_before_the_late_removals() {
         &p.sha,
         &[("DFM_TEST_AFTER_SWAP", hook.to_str().unwrap())],
     );
-    assert_eq!(o.status.code(), Some(3), "{}", err(&o));
-    assert!(err(&o).contains("E_PREREQ_MISSING"), "{}", err(&o));
+    // The swap already happened, so the failed re-check is exit 1, not a refusal with exit 3.
+    assert_eq!(o.status.code(), Some(1), "{}", err(&o));
+    assert!(
+        err(&o).contains("the swap took effect") && err(&o).contains("E_PREREQ_MISSING"),
+        "{}",
+        err(&o)
+    );
+    assert!(!String::from_utf8_lossy(&o.stdout).contains("bootstrap: done"));
+    assert!(
+        fs::read_link(p.data.join("current"))
+            .unwrap()
+            .starts_with("versions/"),
+        "the new version stays current"
+    );
+    assert!(
+        !p.home.join(".cache/dotfiles-manager/build").exists(),
+        "the build directory is removed before the exit"
+    );
     assert_victim_intact(&outside, &["cargo-home"]);
+}
+
+/// Every path under `dir` with its mode, so a refusal can prove it changed nothing.
+fn snapshot(dir: &Path) -> Vec<(PathBuf, u32)> {
+    let mut v: Vec<_> = entries_below(dir)
+        .into_iter()
+        .map(|p| {
+            let m = fs::symlink_metadata(&p).unwrap().permissions().mode();
+            (p, m)
+        })
+        .collect();
+    v.sort();
+    v
+}
+
+#[test]
+fn a_manager_directory_open_to_group_or_others_stops_install_and_uninstall() {
+    let rels = [
+        ".local/share/dotfiles-manager",
+        ".local/share/dotfiles-manager/toolchains",
+        ".local/share/dotfiles-manager/versions",
+        ".local/share/dotfiles-manager/cargo-home",
+        ".local/share/dotfiles-manager/rustup-home",
+        ".local/share/dotfiles-manager/build-home",
+        ".cache/dotfiles-manager",
+        ".cache/dotfiles-manager/build",
+    ];
+    for rel in rels {
+        for mode in [0o775, 0o757] {
+            let (tmp, home, src, sha) = refusal_setup("open-dir");
+            let dir = home.join(rel);
+            fs::create_dir_all(&dir).unwrap();
+            fs::set_permissions(&dir, fs::Permissions::from_mode(mode)).unwrap();
+            let before = snapshot(&home);
+            let install = install_tiny(&home, &src, &sha);
+            let uninstall = script_test_mode(&home, &["uninstall"], &[]);
+            for (what, o) in [("install", install), ("uninstall", uninstall)] {
+                assert_eq!(
+                    o.status.code(),
+                    Some(3),
+                    "{what} {rel} {mode:o}: {}",
+                    err(&o)
+                );
+                assert!(
+                    err(&o).contains("E_PREREQ_MISSING")
+                        && err(&o).contains(dir.to_str().unwrap())
+                        && err(&o).contains("writable by group or others"),
+                    "{what} {rel} {mode:o}: {}",
+                    err(&o)
+                );
+            }
+            assert_eq!(
+                snapshot(&home),
+                before,
+                "{rel} {mode:o}: refusal must not write"
+            );
+            drop(tmp);
+        }
+    }
+}
+
+#[test]
+fn uninstall_leaves_the_bin_directory_and_removes_the_empty_directories_it_created() {
+    let tmp = TempDir::new("uninstall-bin");
+    let home = tmp.path().join("home");
+    let bin = home.join(".local/bin");
+    fs::create_dir_all(&bin).unwrap();
+    fs::create_dir_all(home.join(".local/share/dotfiles-manager")).unwrap();
+    fs::create_dir_all(home.join(".cache/dotfiles-manager/build")).unwrap();
+    let o = script_test_mode(&home, &["uninstall"], &[]);
+    assert_eq!(o.status.code(), Some(0), "{}", err(&o));
+    assert!(
+        bin.is_dir(),
+        "~/.local/bin is not the installer's to remove"
+    );
+    assert!(!home.join(".local/share/dotfiles-manager").exists());
+    assert!(!home.join(".cache/dotfiles-manager").exists());
+}
+
+/// A pin directory that holds the copy one level down (cp -R into an existing destination) is
+/// named in the refusal, and the failed run leaves no build directory behind.
+#[test]
+fn a_nested_toolchain_copy_is_named_and_a_refused_install_removes_its_build_directory() {
+    let p = prepare("nested-toolchain");
+    let pin = p.tc.file_name().unwrap().to_str().unwrap().to_string();
+    let moved = p.tmp.path().join("moved");
+    fs::rename(&p.tc, &moved).unwrap();
+    fs::create_dir(&p.tc).unwrap();
+    let nested = p.tc.join(format!("{pin}-aarch64-apple-darwin"));
+    fs::rename(&moved, &nested).unwrap();
+    let o = install(&p, &p.sha, &[]);
+    assert_eq!(o.status.code(), Some(3), "{}", err(&o));
+    assert!(
+        err(&o).contains("E_TOOLCHAIN_MISMATCH") && err(&o).contains(nested.to_str().unwrap()),
+        "{}",
+        err(&o)
+    );
+    assert!(
+        !p.home.join(".cache/dotfiles-manager/build").exists(),
+        "the build directory must not outlive a refused install"
+    );
+    assert!(!p.data.join("cargo-home").exists());
 }

@@ -452,8 +452,11 @@ struct LockRules {
 }
 
 impl Hooks for LockRules {
-    fn header(&mut self, name: &str, _array: bool) -> Res {
+    fn header(&mut self, name: &str, array: bool) -> Res {
         if name == "manager" {
+            if array {
+                return Err("[[manager]] is an array of tables".into());
+            }
             if self.manager_seen {
                 return Err("duplicate [manager]".into());
             }
