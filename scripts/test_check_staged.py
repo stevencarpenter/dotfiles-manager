@@ -64,6 +64,10 @@ class StagedGateTest(unittest.TestCase):
                         env=env,
                     )
                     self.assertEqual(result.returncode == 0, succeeds, result.stderr)
+                    if note != "clean":
+                        # The stub ignores notes, so only the diff check can fail here.
+                        output = result.stdout + result.stderr
+                        self.assertIn(b"trailing whitespace", output)
                     self.assertEqual(fixture.read_text(), working + "\n")
                     self.assertEqual(
                         subprocess.check_output(

@@ -568,7 +568,7 @@ check_bin_dir() {
     refuse E_PREREQ_MISSING "$HOME_DIR/.local/bin is not owned by the current user; move it away first"
 }
 check_data_tree() {
-  for _d in versions cargo-home rustup-home build-home; do check_private_path "$DATA_REL/$_d"; done
+  for _d in toolchains versions cargo-home rustup-home build-home; do check_private_path "$DATA_REL/$_d"; done
   for _d in "" toolchains versions cargo-home rustup-home build-home; do check_owned_dir "$DATA_REL${_d:+/$_d}"; done
 }
 

@@ -1711,8 +1711,15 @@ fn a_symlinked_cache_hierarchy_is_refused_before_any_recursive_change() {
 #[test]
 fn a_symlinked_data_hierarchy_is_refused_before_any_recursive_removal() {
     use std::os::unix::fs::symlink;
-    let names = ["versions", "cargo-home", "rustup-home", "build-home"];
+    let names = [
+        "toolchains",
+        "versions",
+        "cargo-home",
+        "rustup-home",
+        "build-home",
+    ];
     for (case, link) in [
+        ("toolchains", ".local/share/dotfiles-manager/toolchains"),
         ("versions", ".local/share/dotfiles-manager/versions"),
         ("cargo-home", ".local/share/dotfiles-manager/cargo-home"),
         ("rustup-home", ".local/share/dotfiles-manager/rustup-home"),
@@ -1721,6 +1728,11 @@ fn a_symlinked_data_hierarchy_is_refused_before_any_recursive_removal() {
         let (tmp, home, src, sha) = refusal_setup(&format!("data-link-{case}"));
         let outside = victim(tmp.path(), &names);
         let name = link.rsplit('/').next().unwrap();
+        if case == "toolchains" {
+            // The setup made a real directory; the link must hold the pinned tree the install needs.
+            fs::remove_dir_all(home.join(link)).unwrap();
+            fs::create_dir_all(outside.join(name).join("9.9.9")).unwrap();
+        }
         symlink(outside.join(name), home.join(link)).unwrap();
         let o = install_tiny(&home, &src, &sha);
         assert_eq!(o.status.code(), Some(3), "install {case}: {}", err(&o));
