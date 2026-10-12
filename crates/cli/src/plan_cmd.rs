@@ -77,7 +77,7 @@ fn binary_identity() -> Result<Binary, Refusal> {
 
 /// Reads a saved plan: a regular file, not a link, at most 16 MiB.
 fn read_saved(path: &Path) -> Result<Vec<u8>, Refusal> {
-    let shown = visible(&path.display().to_string());
+    let shown = path.display().to_string();
     let io = |e: std::io::Error| {
         Refusal::new(
             Code::ReportUnavailable,
@@ -152,9 +152,9 @@ pub fn plan_for(ctx: &Ctx, loaded: &Loaded) -> Result<Plan, Refusal> {
         // first, with its own code.
         if let Err(e) = store.check_claim_for_plan(&abs.to_string_lossy()) {
             if e.code == Code::StateInvalid {
-                reserved.insert(rel.clone(), visible(&e.detail));
+                reserved.insert(rel.clone(), e.detail);
             } else {
-                unchecked.insert(rel.clone(), visible(&e.detail));
+                unchecked.insert(rel.clone(), e.detail);
             }
         }
     }
@@ -252,7 +252,7 @@ pub(crate) fn render(p: &Plan, digest: &str, out: &mut dyn Write) -> std::io::Re
         }
     }
     for b in &p.blockers {
-        writeln!(out, "blocked: {}", b.refusal())?;
+        writeln!(out, "blocked: {}", visible(&b.refusal().to_string()))?;
     }
     writeln!(out, "plan digest: {digest}")
 }

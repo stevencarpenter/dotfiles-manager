@@ -4,7 +4,7 @@
 //! the plan and the owned outputs. It runs no program, probes no tool, fetches nothing, takes no
 //! lock and writes nothing. A failing source gives its own row and the other rows still appear.
 
-use crate::{Ctx, Loaded, bounded, header, load_resolved, plan_cmd, read_existing_binding, usage};
+use crate::{Ctx, Loaded, clip, header, load_resolved, plan_cmd, read_existing_binding, usage};
 use dfm_engine::{
     Dir, Fail, Layout, Loaded as StateLoaded, Store, Sys, merge, observe, verify_identity,
 };
@@ -128,7 +128,7 @@ fn refusal_row(kind: &'static str, subject: &str, r: &Refusal) -> Row {
         r.code,
         status,
         subject,
-        &bounded(&r.detail),
+        &clip(&r.detail),
         fix_for(r.code),
     )
 }
@@ -351,7 +351,7 @@ fn evidence_rows(l: &StateLoaded, findings: &[dfm_engine::Finding], rows: &mut V
                 f.code,
                 Level::Warn,
                 &f.file,
-                &bounded(&f.detail),
+                &clip(&f.detail),
                 "Audit evidence only: no ownership depends on it. Fix or remove it by hand.",
             )
             .partial(),
@@ -690,8 +690,8 @@ fn output_rows(
             b.code,
             status,
             subject,
-            &bounded(&format!("{} in {}: {}", b.resource, b.source, b.detail)),
-            &bounded(&b.correction),
+            &clip(&format!("{} in {}: {}", b.resource, b.source, b.detail)),
+            &clip(&b.correction),
         ));
     }
     let mut by_path: BTreeMap<&str, (Option<&Owned>, Option<&Operation>)> = BTreeMap::new();
@@ -764,7 +764,7 @@ fn classify(
                 path,
                 &format!(
                     "resource {who}: HOME cannot be observed: {}",
-                    bounded(&r.detail)
+                    clip(&r.detail)
                 ),
                 fix_for(Code::ObservationUnknown),
             ),
@@ -815,12 +815,12 @@ fn owned_row(path: &str, who: &str, op: Option<&Operation>, live: Live) -> Row {
         Live::Unknown(why) => row(
             Code::ObservationUnknown,
             Level::Unknown,
-            &format!("resource {who}: {}", bounded(&why)),
+            &format!("resource {who}: {}", clip(&why)),
         ),
         Live::Parent(why) => row(
             Code::ParentUnsafe,
             Level::Error,
-            &format!("resource {who}: {}", bounded(&why)),
+            &format!("resource {who}: {}", clip(&why)),
         ),
         Live::Missing => Row::new(
             "output",

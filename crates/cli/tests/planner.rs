@@ -731,6 +731,23 @@ fn a_regular_file_at_a_link_target_is_a_conflict_that_names_the_file_and_the_fix
     assert!(op(&s, "core.ssh@.ssh/config").action != Action::Adopt);
 }
 
+#[test]
+fn a_blocker_detail_is_escaped_once_where_it_is_printed() {
+    // The link text holds a backslash and a real newline. Escaped once, that prints as `\\` and
+    // `\n`. Escaped twice, the backslash would print as four characters.
+    let e = Env::personal();
+    e.mkdirs(".config");
+    symlink("/nonexistent/a\\b\nc", e.h(".config/git")).unwrap();
+    let once = "(-> /nonexistent/a\\\\b\\nc)";
+    let o = e.plan(&[]);
+    assert_eq!(code(&o), 3);
+    let (out, err) = (text(&o.stdout), text(&o.stderr));
+    assert!(out.contains(once), "{out}");
+    assert!(err.contains(once), "{err}");
+    assert!(!out.contains("\\\\\\"), "{out}");
+    assert!(!err.contains("\\\\\\"), "{err}");
+}
+
 // ---- C06/C07: stale plans ----------------------------------------------------------------
 
 fn save(e: &Env) -> (PathBuf, Saved) {

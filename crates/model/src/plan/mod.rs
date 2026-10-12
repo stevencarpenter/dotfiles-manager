@@ -363,10 +363,10 @@ impl Blocker {
         };
         Refusal::new(
             self.code,
-            crate::display::visible(&format!(
+            format!(
                 "{place} in {}: {}. Fix: {}",
                 self.source, self.detail, self.correction
-            )),
+            ),
         )
     }
 }

@@ -676,6 +676,13 @@ fn a_backslash_in_a_refused_path_is_escaped_once() {
     // One backslash in the name is two in the output, never four, and not a bare `\n`.
     assert!(err.contains("files/pi\\\\npe"), "{err}");
     assert!(!err.contains("pi\\\\\\\\npe"), "{err}");
+    // `doctor` puts the same text in a row, which escapes it itself.
+    let before = fingerprint(fx.home.path());
+    let o = fx.run(&["doctor", "--root", fx.root_arg()]);
+    let all = format!("{}{}", text(&o.stdout), text(&o.stderr));
+    assert!(all.contains(r"files/pi\\npe"), "{all}");
+    assert!(!all.contains(r"pi\\\\npe"), "{all}");
+    assert_eq!(fingerprint(fx.home.path()), before, "HOME changed");
 }
 
 /// Every path below `dir` (the lock file apart, which every mutating command rewrites with its
@@ -740,6 +747,22 @@ fn apply_refuses_a_link_planted_in_excluded_content_after_the_plan() {
     let o = fx.run(&["apply", "--root", fx.root_arg(), "--yes-plan", &digest]);
     assert_eq!(code(&o), 0, "{}{}", text(&o.stdout), text(&o.stderr));
     assert!(fs::symlink_metadata(fx.h(".config/plugs")).is_ok());
+}
+
+#[test]
+fn a_backslash_in_a_refused_apply_message_is_escaped_once() {
+    let fx = scoped(r#""base", "profiles""#, r#""**/.venv""#);
+    let m = fs::read_to_string(fx.root.join("base/modules/extra/module.toml")).unwrap();
+    let plugs = PLUGS.replace("files/plugdir", r"files/plug\\dir");
+    fx.put("base/modules/extra/module.toml", &format!("{m}{plugs}"));
+    let dir = fx.root.join(r"base/modules/extra/files/plug\dir");
+    fx.put(r"base/modules/extra/files/plug\dir/.venv/lib", "x");
+    let o = fx.run(&["plan", "--root", fx.root_arg(), "--json"]);
+    let digest = Saved::parse(&o.stdout).unwrap().plan_digest;
+    symlink("/etc", dir.join(".venv/esc")).unwrap();
+    let all = apply_refused(&fx, &digest, "E_SOURCE_ESCAPE");
+    assert!(all.contains(r"files/plug\\dir"), "{all}");
+    assert!(!all.contains(r"plug\\\\dir"), "{all}");
 }
 
 #[test]
