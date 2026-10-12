@@ -302,6 +302,32 @@ fn a_new_directory_is_opened_under_a_restrictive_umask() {
     }
 }
 
+/// The crash window of `linkat` followed by `unlinkat` (a second name for the file until the
+/// unlink) cannot be driven from a test: no failure point sits between two system calls that
+/// the code no longer makes. So this pins the call itself. The result tests below (one link, no
+/// staged name) also hold for a link and unlink pair, because they look after the unlink.
+#[test]
+fn create_only_publication_renames_exclusively_and_never_links() {
+    for (file, src) in [
+        ("fsys.rs", include_str!("../src/fsys.rs")),
+        ("publish.rs", include_str!("../src/publish.rs")),
+    ] {
+        for (at, _) in src.match_indices("linkat") {
+            let before = &src[..at];
+            // `unlinkat`, `symlinkat` and `readlinkat` are other calls.
+            assert!(
+                before.ends_with(|c: char| c.is_ascii_alphabetic()),
+                "{file} calls linkat: a crash between it and the unlink leaves a second name"
+            );
+        }
+        assert!(!src.contains("rfs::link("), "{file} calls link");
+    }
+    assert!(
+        include_str!("../src/fsys.rs").contains("RenameFlags::NOREPLACE"),
+        "rename_new must refuse to replace"
+    );
+}
+
 #[test]
 fn published_state_files_have_one_link_and_a_leftover_staged_name_is_a_stray_finding() {
     let h = Home::new();

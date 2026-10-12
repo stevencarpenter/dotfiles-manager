@@ -114,9 +114,9 @@ pub fn below(home: &Path, path: &Path) -> Result<Vec<String>, Refusal> {
 /// The longest a file name can be on the supported file system.
 pub(crate) const NAME_MAX: usize = 255;
 
-/// The most bytes [`temp_name`] adds to a name: two dots and two more separators, a process id
-/// and a counter of up to 10 digits each, up to 9 digits of nanoseconds and a suffix of up to 5
-/// letters (`stage`).
+/// The most bytes [`temp_name`] adds to a name: five dots, a process id and a counter of up to
+/// 10 digits each, up to 9 digits of nanoseconds and a suffix of up to 5 letters (`stage`). A
+/// unit test builds the longest name and compares its length with this value.
 pub(crate) const TEMP_NAME_EXTRA: usize = 1 + 1 + 10 + 1 + 10 + 1 + 9 + 1 + 5;
 
 /// A hidden same-directory name for a staged file or link: unique per process and call.
@@ -125,11 +125,33 @@ pub(crate) fn temp_name(name: &str, suffix: &str) -> String {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.subsec_nanos());
-    format!(
-        ".{name}.{}.{}.{nanos}.{suffix}",
+    temp_name_of(
+        name,
         std::process::id(),
-        N.fetch_add(1, Ordering::Relaxed)
+        N.fetch_add(1, Ordering::Relaxed),
+        nanos,
+        suffix,
     )
+}
+
+fn temp_name_of(name: &str, pid: u32, n: u32, nanos: u32, suffix: &str) -> String {
+    format!(".{name}.{pid}.{n}.{nanos}.{suffix}")
+}
+
+/// The refusal for a failed exclusive rename that is not `EEXIST`. `ENOTSUP` and `EINVAL` mean
+/// that the file system does not take `RENAME_EXCL`: there is no fallback, so the text names
+/// the path and the requirement (docs/state.md, "Known limits").
+pub(crate) fn publish_err(path: &Path, e: Errno) -> Refusal {
+    if matches!(e, Errno::NOTSUP | Errno::INVAL) {
+        return io(
+            &format!(
+                "publish {} (creating a file needs a file system that supports an exclusive rename, RENAME_EXCL)",
+                path.display()
+            ),
+            &std::io::Error::from(e),
+        );
+    }
+    sys_err("publish", e)
 }
 
 /// Renames `from` to `to` in the directory `dir` and fails with `EEXIST` when `to` exists.
@@ -676,7 +698,7 @@ impl Dir {
             match rename_new(&self.fd, &tmp, name) {
                 Ok(()) => Ok(true),
                 Err(Errno::EXIST) => Ok(false),
-                Err(e) => Err(sys_err("publish", e)),
+                Err(e) => Err(publish_err(&self.at(name), e)),
             }
         };
         let r = step();
@@ -1246,5 +1268,28 @@ mod tests {
         assert_eq!(w.0, b"{\"a");
         assert_eq!(r.code, Code::IoUnconfirmed);
         assert!(r.detail.contains("torn line"), "{}", r.detail);
+    }
+
+    #[test]
+    fn the_longest_staged_name_fits_the_reserved_extra() {
+        // The widest value of every field, and the longest suffix in use.
+        let name = temp_name_of("", u32::MAX, u32::MAX, 999_999_999, "stage");
+        assert_eq!(name.len(), TEMP_NAME_EXTRA, "{name}");
+        // A real name for any suffix in use stays within the reservation too.
+        for suffix in ["stage", "tmp"] {
+            assert!(temp_name("", suffix).len() <= TEMP_NAME_EXTRA);
+        }
+    }
+
+    #[test]
+    fn a_file_system_without_exclusive_rename_is_named_in_the_refusal() {
+        for e in [Errno::NOTSUP, Errno::INVAL] {
+            let r = publish_err(Path::new("/h/.config/a"), e);
+            assert_eq!(r.code, Code::IoFailed);
+            assert!(r.detail.contains("/h/.config/a"), "{}", r.detail);
+            assert!(r.detail.contains("RENAME_EXCL"), "{}", r.detail);
+        }
+        let other = publish_err(Path::new("/h/a"), Errno::ACCESS);
+        assert!(!other.detail.contains("RENAME_EXCL"), "{}", other.detail);
     }
 }

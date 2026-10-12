@@ -2844,19 +2844,28 @@ fn an_immutable_file_is_a_permission_failure_not_a_directory() {
     own(&s, "a", "mine\n");
     let id = "remove@core.x@a";
     let o = op(&s.h, &s.store, id, 1, Action::Remove, "a");
-    let flag = |f: &str| {
+    let chflags = |f: &str| {
         std::process::Command::new("chflags")
             .args([f, a.to_str().unwrap()])
             .status()
             .is_ok_and(|s| s.success())
     };
-    if !flag("uchg") {
-        eprintln!("SKIPPED: chflags uchg is not available");
-        return;
+    // Clears the flag on every exit, also a panic in `go`, so the HOME can be deleted.
+    struct Clear<F: Fn(&str) -> bool>(F);
+    impl<F: Fn(&str) -> bool> Drop for Clear<F> {
+        fn drop(&mut self) {
+            (self.0)("nouchg");
+        }
     }
+    let clear = Clear(chflags);
+    // chflags ships with macOS, the only supported platform, so a failure here is a failure of
+    // the test and not a reason to pass without running it.
+    assert!(
+        (clear.0)("uchg"),
+        "chflags uchg failed: the check cannot run"
+    );
     let allow = BTreeSet::from([id.to_string()]);
     let rep = go(&s, &plan(vec![o]), &NoGenerator, &allow);
-    assert!(flag("nouchg"));
     assert_eq!(
         rep.operations[0].status,
         Status::Failed,

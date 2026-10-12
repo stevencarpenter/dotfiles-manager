@@ -9,7 +9,8 @@
 
 use crate::fail::Fail;
 use crate::fsys::{
-    Dir, Peek, Stamp, Sys, check_name, kind, mode_bits, rename_new, sys_err, temp_name, unconfirmed,
+    Dir, Peek, Stamp, Sys, check_name, kind, mode_bits, publish_err, rename_new, sys_err,
+    temp_name, unconfirmed,
 };
 use dfm_model::digest::sha256_hex;
 use dfm_model::plan::link_fingerprint;
@@ -282,7 +283,7 @@ impl Dir {
                         "{} appeared while applying; it is left alone",
                         self.at(name).display()
                     ))),
-                    Err(e) => Err(sys_err("publish", e)),
+                    Err(e) => Err(publish_err(&self.at(name), e)),
                 },
                 Publish::Replace { expected_sha256 } => {
                     let live = self.hash_file(name, limit)?;
