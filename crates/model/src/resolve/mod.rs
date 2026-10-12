@@ -9,6 +9,7 @@ mod schema;
 mod scope;
 mod source;
 
+pub(crate) use docs::PROFILE_SCHEMA;
 pub use error::ResolveError;
 pub use explain::explain;
 pub use schema::{AdapterCatalog, AdapterSpec, Claims, Field, Include, Schema, TargetRule};

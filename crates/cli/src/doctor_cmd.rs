@@ -490,13 +490,14 @@ fn lock_row(ctx: &Ctx, uid: u32, rows: &mut Vec<Row>) {
     };
     match f.metadata() {
         Ok(m) if m.is_file() && m.uid() == uid => {
-            // The writer lock refuses both states. A mode with only owner bits is tightened.
+            // The writer lock refuses both states. It opens the file read-write before it can
+            // tighten anything, so a mode without the owner read or write bit fails there.
             let mode = m.mode() & 0o7777;
             if m.nlink() != 1 {
                 rows.push(warn("the lock file has more than one hard link"));
                 return;
             }
-            if mode & !0o600 != 0 {
+            if mode != 0o600 {
                 rows.push(warn(&format!(
                     "the lock file mode is {mode:o}, expected 0600"
                 )));

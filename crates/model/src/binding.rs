@@ -1,5 +1,6 @@
 //! The machine binding document (`machine.toml`, schema 1).
 
+use crate::resolve::PROFILE_SCHEMA;
 use crate::{Code, Refusal};
 use serde::{Deserialize, Serialize};
 
@@ -49,11 +50,11 @@ pub fn check_profile(bytes: &[u8]) -> Result<ProfileTarget, Refusal> {
         bad(&format!("profile is not valid TOML: {}", e.message()))
     })?;
     match table.get("schema") {
-        Some(toml::Value::Integer(SCHEMA)) => {}
+        Some(toml::Value::Integer(PROFILE_SCHEMA)) => {}
         Some(toml::Value::Integer(n)) => {
             return Err(Refusal::new(
                 Code::SchemaUnsupported,
-                format!("profile schema {n} is not supported (supported: 1)"),
+                format!("profile schema {n} is not supported (supported: {PROFILE_SCHEMA})"),
             ));
         }
         Some(_) => return Err(bad("profile schema must be an integer")),
@@ -173,6 +174,18 @@ mod tests {
         for bad in [&b""[..], b"[t]\nschema = 1\n", b"[oops", b"\xff"] {
             assert_eq!(check_profile(bad).unwrap_err().code, Code::ProfileInvalid);
         }
+    }
+
+    #[test]
+    fn the_profile_schema_check_follows_the_resolver_constant_not_the_binding_schema() {
+        // The resolver accepts exactly PROFILE_SCHEMA. A bump of the binding schema alone must
+        // not change which profiles bind accepts.
+        let ok = format!("schema = {PROFILE_SCHEMA}\n");
+        assert!(check_profile(ok.as_bytes()).is_ok());
+        let next = format!("schema = {}\n", PROFILE_SCHEMA + 1);
+        let e = check_profile(next.as_bytes()).unwrap_err();
+        assert_eq!(e.code, Code::SchemaUnsupported);
+        assert!(e.detail.contains(&format!("supported: {PROFILE_SCHEMA}")));
     }
 
     #[test]

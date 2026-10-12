@@ -2342,6 +2342,37 @@ fn bind_with_an_unusable_salt_refuses_instead_of_reporting_already_bound() {
     }
 }
 
+#[test]
+fn bind_with_an_unusable_salt_and_no_binding_file_publishes_no_binding() {
+    let fx = Fx::base();
+    assert_eq!(code(&fx.apply()), 0);
+    // State exists but the binding was never published (or was moved aside).
+    let binding = fx.h(".config/dotfiles-manager/machine.toml");
+    fs::remove_file(&binding).unwrap();
+    let salt = fx.state().join("salt");
+    fs::set_permissions(&salt, fs::Permissions::from_mode(0o644)).unwrap();
+    let p = fx.root.join("profiles/t-01.toml");
+    let o = fx.run(&[
+        "bind",
+        "--profile",
+        p.to_str().unwrap(),
+        "--machine-id",
+        "m5-test",
+    ]);
+    assert_eq!(code(&o), 3, "{}\n{}", stderr(&o), text(&o.stdout));
+    assert!(
+        stderr(&o).contains("state/salt is unusable"),
+        "{}",
+        stderr(&o)
+    );
+    assert!(!binding.exists(), "no binding was published");
+    assert_eq!(
+        fs::metadata(&salt).unwrap().permissions().mode() & 0o777,
+        0o644,
+        "the salt is unchanged"
+    );
+}
+
 // ---- review fixes (DFM-57) ---------------------------------------------------------------
 
 #[test]

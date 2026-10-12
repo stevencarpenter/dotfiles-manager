@@ -99,7 +99,8 @@ pub fn fingerprint(root: &Path) -> String {
             if m.is_dir() {
                 go(&e.path(), h);
             } else if m.is_file() {
-                h.update(fs::read(e.path()).unwrap());
+                // A file with no read bit (mode 0200) is covered by its hashed mode alone.
+                h.update(fs::read(e.path()).unwrap_or_default());
             } else if m.file_type().is_symlink() {
                 h.update(
                     fs::read_link(e.path())

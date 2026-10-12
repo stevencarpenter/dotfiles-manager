@@ -1068,12 +1068,34 @@ fn the_lock_row_warns_on_a_mode_or_link_count_that_the_writer_lock_refuses() {
     warns("hard link");
     let o = fx.run(&["apply", "--root", fx.root_arg(), "--yes-plan", &digest]);
     assert_eq!(code(&o), 3, "{}", text(&o.stderr));
+    assert!(
+        text(&o.stderr).contains("E_STORAGE_INVALID") && text(&o.stderr).contains("hard link"),
+        "{}",
+        text(&o.stderr)
+    );
     fs::remove_file(&second).unwrap();
-    // The writer lock tightens an owner-only mode itself, so doctor stays OK.
-    fs::set_permissions(&lock, fs::Permissions::from_mode(0o400)).unwrap();
-    let r = lock_of(&fx);
-    assert_eq!(r["status"], "OK", "{r:#?}");
+    // A mode with owner bits only is refused too: the writer lock opens the file read-write
+    // before it can tighten it, so 0400, 0200 and 0000 fail at the open.
+    // Doctor reads the file, so it names the mode only where it can open the file.
+    for (mode, detail) in [
+        (0o400, "mode is 400"),
+        (0o200, "cannot open"),
+        (0o000, "cannot open"),
+    ] {
+        fs::set_permissions(&lock, fs::Permissions::from_mode(mode)).unwrap();
+        warns(detail);
+        let before = fingerprint(fx.home.path());
+        let o = fx.run(&["apply", "--root", fx.root_arg(), "--yes-plan", &digest]);
+        assert_eq!(code(&o), 3, "{mode:o}: {}", text(&o.stderr));
+        assert!(
+            text(&o.stderr).contains("E_STORAGE_INVALID"),
+            "{mode:o}: {}",
+            text(&o.stderr)
+        );
+        assert_eq!(fingerprint(fx.home.path()), before, "{mode:o}");
+    }
     fs::set_permissions(&lock, fs::Permissions::from_mode(0o600)).unwrap();
+    assert_eq!(lock_of(&fx)["status"], "OK");
 }
 
 // ---- docs -----------------------------------------------------------------------------------

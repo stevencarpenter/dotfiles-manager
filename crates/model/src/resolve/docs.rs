@@ -176,9 +176,12 @@ fn sniff(t: &Table) -> Option<Kind> {
     }
 }
 
+/// The schema version every authored document (profile, bundle, module) must declare.
+pub(crate) const PROFILE_SCHEMA: i64 = 1;
+
 fn check_schema_then_kind(file: &str, t: &Table, want: Kind) -> Result<(), ResolveError> {
     match t.get("schema") {
-        Some(Value::Integer(1)) => {}
+        Some(Value::Integer(PROFILE_SCHEMA)) => {}
         Some(Value::Integer(n)) => {
             return Err(ResolveError::new(
                 Code::SchemaUnsupported,
