@@ -141,7 +141,9 @@ fn fix_for(code: Code) -> &'static str {
         }
         Code::ParentUnsafe => "Replace the linked parent with a real directory, then run plan.",
         Code::Conflict => "Review the file. Move it aside or restore it, then run plan.",
-        Code::HomeMismatch => "Run from an account whose home directory has no whitespace.",
+        Code::HomeMismatch => {
+            "Run from the account whose password-database home equals HOME and has no whitespace or control characters."
+        }
         Code::ReportUnavailable => "Pass an existing --root directory.",
         Code::ObservationUnknown => "Fix the permissions or the path named here, then run doctor.",
         _ => "Fix the file named here, then run doctor.",

@@ -111,12 +111,17 @@ fn git_includes(text: &str) -> Vec<Include> {
         if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
             continue;
         }
-        let key_line = match line.starts_with('[').then(|| split_header(line)).flatten() {
-            Some((name, tail)) => {
-                current = section(name.trim());
-                tail.trim()
-            }
-            None => line,
+        let key_line = if line.starts_with('[') {
+            // A header that never closes is an error in Git, which reads nothing after it. Keys
+            // below it must not count toward the section above.
+            let Some((name, tail)) = split_header(line) else {
+                current = None;
+                continue;
+            };
+            current = section(name.trim());
+            tail.trim()
+        } else {
+            line
         };
         if key_line.is_empty() || key_line.starts_with('#') || key_line.starts_with(';') {
             continue;
@@ -418,6 +423,8 @@ mod tests {
             [("~/a".to_string(), Some("gitdir:~/work[12]/".to_string()))]
         );
         assert_eq!(got("[includeIf \"a\\\"]b\"] path = ~/q\n"), ["~/q"]);
+        // A header with an unbalanced quote ends the include section above it.
+        assert!(got("[include]\n[x \"]\npath = /etc/foo\n").is_empty());
         // A comment after the header is not a key.
         assert!(got("[include] # path = ~/a\n").is_empty());
     }

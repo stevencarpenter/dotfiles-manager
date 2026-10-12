@@ -27,10 +27,6 @@ fn applied() -> Fx {
     fx
 }
 
-fn skipped(why: &str) {
-    println!("SKIPPED: {why}");
-}
-
 impl Fx {
     fn state(&self) -> PathBuf {
         self.h(".local/state/dotfiles-manager/state")
@@ -235,7 +231,7 @@ fn without_a_plan_a_linked_parent_of_an_owned_output_is_still_found() {
 #[test]
 fn an_unreadable_parent_is_an_unknown_required_row_and_exits_1() {
     if is_root() {
-        skipped("running as root: directory modes do not apply");
+        common::skip("running as root: directory modes do not apply");
         return;
     }
     let fx = applied();
@@ -769,7 +765,7 @@ fn a_case_variant_of_a_sensitive_ledger_entry_is_not_read() {
 #[test]
 fn a_sensitive_destination_with_no_read_permission_is_not_applicable_not_an_error() {
     if is_root() {
-        skipped("running as root: file modes do not apply");
+        common::skip("running as root: file modes do not apply");
         return;
     }
     let fx = personal();
@@ -1015,7 +1011,7 @@ fn the_lock_row_handles_every_kind_of_lock_file() {
     fs::remove_file(&lock).unwrap();
     // A file the user cannot read.
     if is_root() {
-        skipped("running as root: the unreadable lock file case");
+        common::skip("running as root: the unreadable lock file case");
         return;
     }
     fs::write(&lock, "pid 1 since x\n").unwrap();
@@ -1111,6 +1107,9 @@ fn doctor_and_status_report_an_unusable_home_as_rows_and_exit_1() {
             (Some("binding"), Some("ERROR"))
         );
         assert_eq!(first["code"], "E_HOME_MISMATCH");
+        // HOME mismatch has more than one cause, so the fix names the whole rule.
+        let fix = first["fix"].as_str().unwrap();
+        assert!(fix.contains("password-database home equals HOME"), "{fix}");
         let t = bad_home(&[cmd, "--root", fx.root_arg()]);
         assert_eq!(code(&t), 1, "{cmd}");
         assert!(
@@ -1126,4 +1125,16 @@ fn a_usage_error_wins_over_an_unusable_home() {
     assert_eq!(code(&o), 2, "{}", text(&o.stderr));
     assert!(text(&o.stderr).contains("--root is required"));
     assert!(o.stdout.is_empty());
+}
+
+#[test]
+fn an_unusable_root_is_a_row_and_exit_1_whether_or_not_home_is_usable() {
+    let fx = Fx::new();
+    let o = fx.run(&["doctor", "--root", "/nonexistent-dfm-root"]);
+    assert_eq!(code(&o), 1, "{}", text(&o.stderr));
+    assert!(text(&o.stdout).contains("ERROR   E_REPORT_UNAVAILABLE profile"));
+    let o = bad_home(&["doctor", "--root", "/nonexistent-dfm-root"]);
+    assert_eq!(code(&o), 1, "{}", text(&o.stderr));
+    assert!(text(&o.stderr).contains("E_DIAGNOSED"));
+    assert!(text(&o.stdout).contains("ERROR   E_HOME_MISMATCH binding"));
 }
