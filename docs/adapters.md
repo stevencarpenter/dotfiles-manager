@@ -285,7 +285,7 @@ The unmodified example profile now plans and applies in an isolated HOME. The te
 
 ## Digest change
 
-`Operation` gains `output_sha256`, `output_bytes`, `sets` and `fragment_dir`, and `Fragment` gains `sha256`. Each is left out of the JSON when empty. A plan with no generated file serializes as before and keeps its digest. A plan with a `render` or `assemble` operation has a new digest, because the output hash, size, setting names and fragment hashes are inside the plan.
+`Operation` gains `output_sha256`, `output_bytes`, `sets` and `fragment_dir`, and `Fragment` gains `sha256` (the `file_fingerprint` of a foreign fragment, SHA-256 of `file\0` and the bytes). Each is left out of the JSON when empty. A plan with no generated file serializes as before and keeps its digest. A plan with a `render` or `assemble` operation has a new digest, because the output hash, size, setting names and fragment hashes are inside the plan.
 
 ## Decisions where the documents were silent
 

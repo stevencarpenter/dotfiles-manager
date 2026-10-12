@@ -507,9 +507,11 @@ pub fn link_fingerprint(target: &str) -> String {
 /// apply, recovery and `doctor` compare one value. Content that must match a plan hash
 /// (`output_sha256`, an input `content_id`) stays a plain SHA-256.
 pub fn file_fingerprint(content: &[u8]) -> String {
-    let mut bytes = b"file\0".to_vec();
-    bytes.extend_from_slice(content);
-    sha256_hex(&bytes)
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(b"file\0");
+    h.update(content);
+    crate::digest::hex(h.finalize().as_slice())
 }
 
 /// The identity of a source tree read from `root` (section 9, "Path-source identity"): the

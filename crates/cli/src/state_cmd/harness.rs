@@ -6,7 +6,6 @@
 use super::super::{Ctx, bounded, flags, header, read_existing_binding, usage};
 use dfm_engine::{Fail, Probe, Store, now_unix};
 use dfm_model::binding::Binding;
-use dfm_model::digest::sha256_hex;
 use dfm_model::plan::file_fingerprint;
 use dfm_model::state::{
     Baseline, BaselinePath, BinaryId, Class, JournalEntry, LedgerResource, OperationRecord,
@@ -239,7 +238,7 @@ pub fn record_trial(ctx: &Ctx, args: &[String], out: &mut dyn Write) -> Result<(
             paths: vec![BaselinePath {
                 path,
                 existed: existing.is_some(),
-                sha256: existing.map(|b| sha256_hex(&b)),
+                sha256: existing.map(|b| file_fingerprint(&b)),
             }],
         },
         owned_outputs: vec![],

@@ -530,6 +530,14 @@ fn seeded(label: &str) -> TempDir {
 }
 
 #[test]
+fn a_trial_baseline_hash_is_the_file_fingerprint() {
+    let h = seeded("baseline-fingerprint");
+    let trial = text(&fs::read(state(h.path()).join("trials/try-atuin.json")).unwrap());
+    let want = dfm_model::plan::file_fingerprint(b"baseline");
+    assert!(trial.contains(&format!("\"sha256\":\"{want}\"")), "{trial}");
+}
+
+#[test]
 fn receipts_and_trials_for_another_identity_are_reported_by_file() {
     let h = seeded("identity");
     let c = check(h.path());
