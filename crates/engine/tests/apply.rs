@@ -866,6 +866,7 @@ fn a_replaced_link_is_compared_with_the_ledger_fingerprint_not_the_earlier_peek(
             "l",
             "/src/new",
             &link_fingerprint("/src/old"),
+            sys(&s.h).uid,
             &Fail::none(),
         )
         .unwrap_err();
@@ -880,6 +881,7 @@ fn a_replaced_link_is_compared_with_the_ledger_fingerprint_not_the_earlier_peek(
         "l",
         "/src/new",
         &link_fingerprint("/src/other"),
+        sys(&s.h).uid,
         &Fail::none(),
     )
     .unwrap();
@@ -887,6 +889,30 @@ fn a_replaced_link_is_compared_with_the_ledger_fingerprint_not_the_earlier_peek(
         fs::read_link(s.h.0.join("l")).unwrap(),
         Path::new("/src/new")
     );
+}
+
+#[test]
+fn replacing_a_link_checks_its_owner_where_it_is_replaced() {
+    let s = setup();
+    symlink("/src/old", s.h.0.join("l")).unwrap();
+    let home = Dir::open_home(&sys(&s.h), &s.h.0).unwrap();
+    // The ledger fingerprint matches, so only the owner differs.
+    let e = home
+        .replace_link(
+            "l",
+            "/src/new",
+            &link_fingerprint("/src/old"),
+            sys(&s.h).uid + 1,
+            &Fail::none(),
+        )
+        .unwrap_err();
+    assert_eq!(e.code, Code::Conflict);
+    assert!(e.detail.contains("owned by another user"), "{}", e.detail);
+    assert_eq!(
+        fs::read_link(s.h.0.join("l")).unwrap(),
+        Path::new("/src/old")
+    );
+    assert!(leftovers(&s.h.0).is_empty());
 }
 
 #[test]
@@ -1224,10 +1250,12 @@ fn the_journal_gate_reserves_room_for_settling_earlier_work() {
         }
         e.to_line().unwrap()
     };
+    // An `unknown` entry settling can close has its intent record before it.
+    let paired = [open(Phase::Intent), open(Phase::Unknown)].concat();
     let torn = b"{\"schema\":1,\"op_id\":\"tor".to_vec();
     let cases: [(&str, Vec<u8>); 3] = [
         ("an open intent", open(Phase::Intent)),
-        ("an open unknown entry", open(Phase::Unknown)),
+        ("an open unknown entry with its intent", paired),
         ("a torn final line", torn),
     ];
     for (what, tail) in cases {
@@ -1254,6 +1282,18 @@ fn the_journal_gate_reserves_room_for_settling_earlier_work() {
     // The same size with nothing to settle still applies.
     let s = setup();
     near_cap_journal(&s, b"");
+    let o = op(&s.h, &s.store, "x@a", 1, Action::CreateFile, "a");
+    let rep = go(&s, &plan(vec![o]), &gen_for("x@a", "x"), &none());
+    assert_eq!(rep.operations[0].status, Status::Updated);
+    assert!(s.h.0.join("a").exists());
+    // An `unknown` entry with no intent record is never closed, so it reserves nothing.
+    let s = setup();
+    let mut stray = intent("create-other", "/z/other");
+    stray.phase = Phase::Unknown;
+    stray.resource = "other.y".into();
+    stray.recovery = None;
+    stray.reason = Some("unconfirmed: x".into());
+    near_cap_journal(&s, &stray.to_line().unwrap());
     let o = op(&s.h, &s.store, "x@a", 1, Action::CreateFile, "a");
     let rep = go(&s, &plan(vec![o]), &gen_for("x@a", "x"), &none());
     assert_eq!(rep.operations[0].status, Status::Updated);

@@ -1370,13 +1370,15 @@ impl Exec<'_, '_> {
                 name,
                 op.link.as_deref().unwrap_or_default(),
                 ledger_fp.unwrap_or_default(),
+                sys.uid,
                 fail,
             )?,
             Action::CreateFile | Action::UpdateFile => {
                 let how = match ledger_fp {
-                    Some(h) if op.action == Action::UpdateFile => {
-                        Publish::Replace { expected_sha256: h }
-                    }
+                    Some(h) if op.action == Action::UpdateFile => Publish::Replace {
+                        expected_sha256: h,
+                        uid: sys.uid,
+                    },
                     _ => Publish::Create,
                 };
                 parent.publish_file(
@@ -1483,6 +1485,8 @@ impl Exec<'_, '_> {
             },
             _ => {}
         }
+        // The identity above names the hashed inode. Its owner is checked beside the unlink.
+        parent.require_owner(name, self.run.sys.uid)?;
         parent.remove_entry(name, self.run.fail)?;
         Ok(fp)
     }
