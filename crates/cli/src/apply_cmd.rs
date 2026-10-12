@@ -12,7 +12,7 @@ use dfm_engine::{
     Approval as Allowance, Dir, Run, Store, apply, check_allowances, check_journal_capacity, gates,
     now_unix,
 };
-use dfm_model::display::visible;
+use dfm_model::display::{visible, visible_for_paste};
 use dfm_model::state::{
     Approval, BinaryId, DisruptiveApproval, ProfileRef, Receipt, RunResult, SourceId, Stamp,
     Status, count_statuses, rfc3339,
@@ -199,7 +199,7 @@ fn run_inner(
     // approval. A missing approval is refused with every missing flag printed to paste.
     if let Err(all) = check_allowances(&g, &args.allow, &args.allow_adopt) {
         for e in all.iter().filter(|e| e.code != Code::Usage) {
-            writeln!(out, "{}", visible(&e.detail)).map_err(w)?;
+            writeln!(out, "{}", visible_for_paste(&e.detail)).map_err(w)?;
         }
         return Err(all
             .into_iter()

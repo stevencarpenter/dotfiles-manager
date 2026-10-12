@@ -36,10 +36,23 @@ pub fn is_invisible(c: char) -> bool {
 /// `\n` cannot pass for the escape of a real newline. Apply it once, to the text that is
 /// printed: a second pass escapes the first pass's backslashes again.
 pub fn visible(s: &str) -> String {
+    escape(s, true)
+}
+
+/// Like [`visible`], but a backslash stays as it is. Use it only for text a user pastes back
+/// into single quotes of a shell, where a backslash is literal and a doubled one would change
+/// the value (`--allow-disruptive 'remove@core.x@a\b'`).
+pub fn visible_for_paste(s: &str) -> String {
+    escape(s, false)
+}
+
+fn escape(s: &str, double_backslash: bool) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
-        if c == '\\' {
+        if c == '\\' && double_backslash {
             out.push_str("\\\\");
+        } else if c == '\\' {
+            out.push(c);
         } else if c.is_control() {
             out.extend(c.escape_default());
         } else if is_invisible(c) {
@@ -47,6 +60,25 @@ pub fn visible(s: &str) -> String {
         } else {
             out.push(c);
         }
+    }
+    out
+}
+
+/// `visible(s)` cut to `max` characters of the visible text. The cut falls between the escapes
+/// of two source characters, never inside one, and counts what is shown: a control character
+/// grows to up to ten characters (`\u{1b}` is six), so cutting the source first would let a
+/// subject exceed the bound.
+pub fn bounded_visible(s: &str, max: usize) -> String {
+    let mut out = String::new();
+    let mut shown = 0;
+    let mut buf = [0u8; 4];
+    for c in s.chars() {
+        let piece = visible(c.encode_utf8(&mut buf));
+        shown += piece.chars().count();
+        if shown > max {
+            break;
+        }
+        out.push_str(&piece);
     }
     out
 }
@@ -62,6 +94,21 @@ mod tests {
             "a\\nb\\u{202e}c\\u{200b}d\\u{feff}e\\u{2066}f\\u{7}"
         );
         assert_eq!(visible("plain ünï text"), "plain ünï text");
+    }
+
+    #[test]
+    fn visible_for_paste_keeps_a_backslash_and_still_escapes_controls() {
+        assert_eq!(visible_for_paste("'a\\b'\n\u{202e}"), "'a\\b'\\n\\u{202e}");
+    }
+
+    #[test]
+    fn bounded_visible_counts_the_escaped_text_and_never_cuts_an_escape() {
+        let long = "\u{1b}".repeat(5000);
+        let cut = bounded_visible(&long, 1024);
+        assert!(cut.chars().count() <= 1024, "{}", cut.chars().count());
+        assert_eq!(cut, "\\u{1b}".repeat(1024 / 6));
+        assert_eq!(bounded_visible("a\\b", 1024), "a\\\\b");
+        assert_eq!(bounded_visible("abc", 2), "ab");
     }
 
     #[test]

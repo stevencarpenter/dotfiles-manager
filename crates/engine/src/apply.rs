@@ -867,6 +867,7 @@ impl Exec<'_, '_> {
         // that changed since the locked re-plan is never published or recorded as owned.
         if op.action.carries_link() {
             link_source(&self.run.sys, self.plan, op).map_err(|g| ended(g, rel))?;
+            self.run.fail.hit("apply-after-prereq").map_err(failed)?;
         }
         // Content and fingerprints are decided before the intent is written, so a generator
         // failure leaves no interruption record.
@@ -915,7 +916,7 @@ impl Exec<'_, '_> {
                 // The journal keeps escaped text. The refusal keeps the raw text, which the
                 // command escapes once when it prints it.
                 let raw: String = e.detail.chars().take(1024).collect();
-                let why = dfm_model::display::visible(&raw);
+                let why = dfm_model::display::bounded_visible(&e.detail, 1024);
                 let phase = if unconfirmed {
                     Phase::Unknown
                 } else {
@@ -1160,7 +1161,7 @@ impl Exec<'_, '_> {
         if let Err(e) = effect {
             let unconfirmed = e.code == Code::IoUnconfirmed;
             let raw: String = e.detail.chars().take(1024).collect();
-            let why = dfm_model::display::visible(&raw);
+            let why = dfm_model::display::bounded_visible(&e.detail, 1024);
             let phase = if unconfirmed {
                 Phase::Unknown
             } else {

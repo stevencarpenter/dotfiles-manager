@@ -1382,6 +1382,37 @@ fn ledger_writes_still_work_when_another_entry_has_a_linked_parent() {
 }
 
 #[test]
+fn a_flag_for_a_ledger_path_with_a_backslash_prints_the_real_id() {
+    let fx = Fx::new();
+    assert_eq!(code(&fx.apply(&[])), 0);
+    // A legacy ledger can own a path with a backslash, which new targets no longer allow.
+    let ledger = fx.state().join("ledger.json");
+    let old = format!("{}/.zshrc\"", fx.home.path().display());
+    let new = format!("{}/a\\\\b\"", fx.home.path().display());
+    let json = fs::read_to_string(&ledger).unwrap();
+    assert!(json.contains(&old), "{json}");
+    fs::write(&ledger, json.replace(&old, &new)).unwrap();
+    fs::rename(fx.h(".zshrc"), fx.h("a\\b")).unwrap();
+    fx.set_profile("");
+    let o = fx.apply(&[]);
+    assert_eq!(code(&o), 3, "{}\n{}", stderr(&o), text(&o.stdout));
+    let out = text(&o.stdout);
+    assert!(
+        out.contains("--allow-disruptive 'remove@extra.zsh@a\\b'"),
+        "{out}"
+    );
+    // The printed flag, pasted back, is accepted.
+    let o = fx.apply(&[
+        "--allow-disruptive",
+        "remove@extra.zsh@a\\b",
+        "--allow-disruptive",
+        "remove@extra.tmux@.config/tmux/tmux.conf",
+    ]);
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+    assert!(!fx.h("a\\b").exists());
+}
+
+#[test]
 fn preview_refuses_unapproved_removals_with_pasteable_flags_and_accepts_them_when_given() {
     let fx = Fx::new();
     assert_eq!(code(&fx.apply(&[])), 0);
