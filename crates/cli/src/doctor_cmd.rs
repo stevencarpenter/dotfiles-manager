@@ -40,8 +40,10 @@ fn width() -> usize {
     DEFAULT_WIDTH
 }
 
+/// Arguments are parsed first, so a usage error exits 2 whatever HOME is. A failed `ctx` is a
+/// report: an ERROR row for the binding and UNKNOWN rows for the checks that need it (exit 1).
 pub fn run(
-    ctx: &Ctx,
+    ctx: Result<Ctx, Refusal>,
     command: &'static str,
     rest: &[String],
     out: &mut dyn Write,
@@ -52,14 +54,19 @@ pub fn run(
     if args.against.is_some() {
         return Err(usage(format!("{command} does not take --against")));
     }
-    let report = inspect(ctx, command, Path::new(&args.root))?;
+    let (report, ctx) = match ctx {
+        Ok(ctx) => (inspect(&ctx, command, Path::new(&args.root))?, Some(ctx)),
+        Err(r) => (no_context_report(command, &r), None),
+    };
     if args.json {
         let json = report
             .to_json()
             .map_err(|e| Refusal::new(Code::IoFailed, format!("json output failed: {e}")))?;
         out.write_all(&json).map_err(w)?;
     } else {
-        header(out, ctx).map_err(w)?;
+        if let Some(ctx) = &ctx {
+            header(out, ctx).map_err(w)?;
+        }
         write!(out, "{}", report.render(width(), command == "doctor")).map_err(w)?;
     }
     if report.failed() {
@@ -73,6 +80,30 @@ pub fn run(
         ));
     }
     Ok(())
+}
+
+/// The report when HOME could not be resolved: nothing else can be inspected.
+fn no_context_report(command: &'static str, r: &Refusal) -> Report {
+    let rows = vec![
+        refusal_row("binding", "home directory", r),
+        Row::new(
+            "state",
+            D::DependsUnknown,
+            Level::Unknown,
+            "state directory",
+            "needs a usable home directory",
+            "Fix the failed row above first.",
+        ),
+        Row::new(
+            "profile",
+            D::DependsUnknown,
+            Level::Unknown,
+            "bound profile",
+            "needs a usable home directory",
+            "Fix the failed row above first.",
+        ),
+    ];
+    Report::new(command, None, rows)
 }
 
 /// The shared inspection. Fails only when no report can be made at all (exit 2).
@@ -110,6 +141,7 @@ fn fix_for(code: Code) -> &'static str {
         }
         Code::ParentUnsafe => "Replace the linked parent with a real directory, then run plan.",
         Code::Conflict => "Review the file. Move it aside or restore it, then run plan.",
+        Code::HomeMismatch => "Run from an account whose home directory has no whitespace.",
         Code::ReportUnavailable => "Pass an existing --root directory.",
         Code::ObservationUnknown => "Fix the permissions or the path named here, then run doctor.",
         _ => "Fix the file named here, then run doctor.",

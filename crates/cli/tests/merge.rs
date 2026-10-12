@@ -441,6 +441,21 @@ fn a_symlinked_settings_file_is_not_followed() {
     );
 }
 
+#[test]
+fn a_module_with_only_managed_values_merges_and_adds_no_hook() {
+    let fx = Fx::new();
+    fx.module(|m| {
+        let cut = m.find("[resources.value.handlers.audit]").unwrap();
+        let policy = m.find("[resources.policy]").unwrap();
+        format!("{}{}", &m[..cut], &m[policy..]).replace("extensions = [\"/handlers\"]\n", "")
+    });
+    let o = fx.apply();
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let j = fx.live_json();
+    assert_eq!(j["outputStyle"], "STE");
+    assert!(j.get("hooks").is_none(), "{j}");
+}
+
 // ---- foreign edits of managed fields -----------------------------------------------------
 
 #[test]

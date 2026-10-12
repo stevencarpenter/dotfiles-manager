@@ -147,6 +147,8 @@ defaults = ["/managed/outputStyle"]
 extensions = ["/handlers"]
 ```
 
+`handlers` is optional: a value with only `managed` (and `seed`) merges settings and adds no hook.
+
 Optional value fields (DFM-48), from `examples/base/modules/claude-base`:
 
 ```toml

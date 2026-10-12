@@ -1084,3 +1084,46 @@ fn a_ledger_entry_owned_by_a_selected_sensitive_resource_is_not_read() {
         "{r:#?}"
     );
 }
+
+// ---- unusable HOME (DFM-57 C1) --------------------------------------------------------------
+
+fn bad_home(args: &[&str]) -> std::process::Output {
+    Command::new(BIN)
+        .env_clear()
+        .args(["--home", "/a b"])
+        .args(args)
+        .output()
+        .unwrap()
+}
+
+#[test]
+fn doctor_and_status_report_an_unusable_home_as_rows_and_exit_1() {
+    let fx = Fx::new();
+    for cmd in ["doctor", "status"] {
+        let o = bad_home(&[cmd, "--root", fx.root_arg(), "--json"]);
+        assert_eq!(code(&o), 1, "{cmd}: {}", text(&o.stderr));
+        assert!(text(&o.stderr).contains("E_DIAGNOSED"), "{cmd}");
+        let v: Value = serde_json::from_slice(&o.stdout).unwrap();
+        let rows = v["rows"].as_array().unwrap();
+        let first = &rows[0];
+        assert_eq!(
+            (first["kind"].as_str(), first["status"].as_str()),
+            (Some("binding"), Some("ERROR"))
+        );
+        assert_eq!(first["code"], "E_HOME_MISMATCH");
+        let t = bad_home(&[cmd, "--root", fx.root_arg()]);
+        assert_eq!(code(&t), 1, "{cmd}");
+        assert!(
+            text(&t.stdout).contains("ERROR   E_HOME_MISMATCH binding"),
+            "{cmd}"
+        );
+    }
+}
+
+#[test]
+fn a_usage_error_wins_over_an_unusable_home() {
+    let o = bad_home(&["doctor"]);
+    assert_eq!(code(&o), 2, "{}", text(&o.stderr));
+    assert!(text(&o.stderr).contains("--root is required"));
+    assert!(o.stdout.is_empty());
+}

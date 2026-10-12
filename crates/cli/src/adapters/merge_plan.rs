@@ -289,6 +289,16 @@ pub fn merge_facts(
     out
 }
 
+/// The live target, or `Live::Missing` when a parent directory does not exist (a directory to
+/// create). A parent that cannot be opened (a link, a file, no permission) is an error, so the
+/// verdict is blocked and never a create over a parent that was not read.
+fn read_target(sys: &Sys, home: &Dir, parents: &[&str], name: &str) -> Result<Live, Refusal> {
+    match home.open_below_opt(sys, parents)? {
+        Some(dir) => dir.read_live(sys, name, MAX_HASHED_BYTES),
+        None => Ok(Live::Missing),
+    }
+}
+
 fn verdict_for(
     resource: &str,
     claim: &str,
@@ -302,14 +312,9 @@ fn verdict_for(
     let Some((name, parents)) = comps.split_last() else {
         return blocked(Code::TargetInvalid, "the target is empty");
     };
-    // A parent that is a link or missing is the planner's own finding (E_PARENT_UNSAFE, or a
-    // directory to create). Nothing is read through it.
-    let live = match home.open_below_opt(sys, parents) {
-        Ok(Some(dir)) => match dir.read_live(sys, name, MAX_HASHED_BYTES) {
-            Ok(l) => l,
-            Err(e) => return refused(&e),
-        },
-        Ok(None) | Err(_) => Live::Missing,
+    let live = match read_target(sys, home, parents, name) {
+        Ok(l) => l,
+        Err(e) => return refused(&e),
     };
     let bytes = match live {
         Live::Missing => None,
@@ -356,5 +361,38 @@ fn verdict_for(
         Ok((_, merge::Outcome::Current)) => MergeVerdict::Current,
         Ok((_, merge::Outcome::Write)) => MergeVerdict::Write,
         Err(e) => refused(&e),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn a_parent_that_cannot_be_opened_is_an_error_and_a_missing_parent_is_missing() {
+        let d = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .join(format!("dfm-mergeplan-{}", std::process::id()));
+        fs::create_dir_all(d.join("locked")).unwrap();
+        fs::write(d.join("file"), "x").unwrap();
+        fs::set_permissions(d.join("locked"), fs::Permissions::from_mode(0o000)).unwrap();
+        let sys = Sys {
+            uid: dfm_platform_macos::current_uid().unwrap(),
+        };
+        let home = Dir::open_home(&sys, &d).unwrap();
+        let got = |parents: &[&str]| read_target(&sys, &home, parents, "settings.json");
+        assert!(matches!(got(&["absent"]), Ok(Live::Missing)));
+        assert!(got(&["file"]).is_err(), "a file is not a parent directory");
+        if sys.uid != 0 {
+            assert!(
+                got(&["locked"]).is_err(),
+                "an unreadable parent is not a create"
+            );
+        }
+        fs::set_permissions(d.join("locked"), fs::Permissions::from_mode(0o700)).unwrap();
+        fs::remove_dir_all(&d).unwrap();
     }
 }
