@@ -60,8 +60,26 @@ pub fn binding(profile: &str, id: &str) -> Binding {
     Binding::new(profile, id).unwrap()
 }
 
+/// Opens the store for writing right after the previous holder in this process dropped it.
+/// Tests run in parallel threads, and another thread may be starting a child process. Between
+/// its fork and its exec the child holds a copy of every open descriptor, so a lock that was
+/// just released can still look held for a few milliseconds. This waits for that, for 5 s at
+/// most, and only on `E_LOCKED`. Every other refusal is returned at once.
+pub fn open_write_after_drop(h: &Home, fail: Fail) -> Store {
+    let mut tries = 0;
+    loop {
+        match Store::open_write(sys(h), &h.layout(), fail.clone()) {
+            Err(e) if e.code == Code::Locked && tries < 100 => {
+                tries += 1;
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            r => return r.unwrap(),
+        }
+    }
+}
+
 pub fn open(h: &Home) -> Store {
-    Store::open_write(sys(h), &h.layout(), Fail::none()).unwrap()
+    open_write_after_drop(h, Fail::none())
 }
 
 pub fn init(h: &Home) -> (Store, Stamp) {

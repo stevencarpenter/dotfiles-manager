@@ -7,7 +7,7 @@ use dfm_engine::{Action, Fail, Store};
 use dfm_model::Code;
 use dfm_model::state::Stamp;
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
 #[test]
 fn a_crashed_init_staging_directory_is_discarded_and_state_is_not_half_built() {
@@ -265,4 +265,119 @@ fn a_refusal_before_anything_was_created_still_exits_3() {
     assert_eq!(e.exit(), dfm_model::Exit::Blocked);
     assert!(!e.mutated);
     drop(first);
+}
+
+#[test]
+fn a_new_directory_is_opened_under_a_restrictive_umask() {
+    const CHILD: &str = "DFM_UMASK_CHILD";
+    const NAME: &str = "a_new_directory_is_opened_under_a_restrictive_umask";
+    if let Some(dir) = std::env::var_os(CHILD) {
+        // The child runs under umask 0500, which clears the owner's read bit of a new directory.
+        let h = Home(dir.into());
+        let (s, _) = init(&h);
+        drop(s);
+        std::mem::forget(h);
+        return;
+    }
+    let h = Home::new();
+    let exe = std::env::current_exe().unwrap();
+    let status = std::process::Command::new("sh")
+        .arg("-c")
+        .arg("umask 0500; exec \"$0\" --exact \"$1\" --nocapture --test-threads=1")
+        .arg(exe)
+        .arg(NAME)
+        .env(CHILD, &h.0)
+        .status()
+        .unwrap();
+    assert!(status.success(), "init failed under umask 0500: {status:?}");
+    for dir in [
+        ".local",
+        ".local/state",
+        ".local/state/dotfiles-manager",
+        ".local/state/dotfiles-manager/state",
+        ".local/state/dotfiles-manager/state/receipts",
+    ] {
+        let mode = fs::metadata(h.0.join(dir)).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700, "{dir}");
+    }
+}
+
+/// The crash window of `linkat` followed by `unlinkat` (a second name for the file until the
+/// unlink) cannot be driven from a test: no failure point sits between two system calls that
+/// the code no longer makes. So this pins the call itself. The result tests below (one link, no
+/// staged name) also hold for a link and unlink pair, because they look after the unlink.
+#[test]
+fn create_only_publication_renames_exclusively_and_never_links() {
+    for (file, src) in [
+        ("fsys.rs", include_str!("../src/fsys.rs")),
+        ("publish.rs", include_str!("../src/publish.rs")),
+    ] {
+        for (at, _) in src.match_indices("linkat") {
+            let before = &src[..at];
+            // `unlinkat`, `symlinkat` and `readlinkat` are other calls.
+            assert!(
+                before.ends_with(|c: char| c.is_ascii_alphabetic()),
+                "{file} calls linkat: a crash between it and the unlink leaves a second name"
+            );
+        }
+        assert!(!src.contains("rfs::link("), "{file} calls link");
+    }
+    assert!(
+        include_str!("../src/fsys.rs").contains("RenameFlags::NOREPLACE"),
+        "rename_new must refuse to replace"
+    );
+}
+
+#[test]
+fn published_state_files_have_one_link_and_a_leftover_staged_name_is_a_stray_finding() {
+    let h = Home::new();
+    let (s, _) = init(&h);
+    let state = h.0.join(".local/state/dotfiles-manager/state");
+    // The exclusive rename leaves one name per file and nothing staged.
+    for f in ["state.json", "ledger.json", "journal.jsonl", "salt"] {
+        assert_eq!(fs::metadata(state.join(f)).unwrap().nlink(), 1, "{f}");
+    }
+    assert!(
+        files_below(&state)
+            .iter()
+            .all(|p| p.extension().is_none_or(|e| e != "tmp"))
+    );
+    // A name left by a crash before the rename is reported. It does not stop any read.
+    for rel in [".salt.1.2.3.4.tmp", "receipts/.r.1.2.3.4.tmp"] {
+        let p = state.join(rel);
+        fs::write(&p, "x").unwrap();
+        fs::set_permissions(&p, fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    let loaded = s.load();
+    assert_eq!(
+        loaded.strays,
+        [
+            ".salt.1.2.3.4.tmp (unexpected)",
+            "receipts/.r.1.2.3.4.tmp (interrupted write)"
+        ]
+    );
+    assert!(loaded.problems.is_empty(), "{:?}", loaded.problems);
+    let salt = s.salt().unwrap().unwrap();
+    assert_eq!(salt.len(), 32);
+    // A create that finds the name taken reports it, changes nothing and leaves nothing staged.
+    // `salt_or_create` returns the existing salt before it publishes, so the create is driven
+    // on the directory itself.
+    for rel in [".salt.1.2.3.4.tmp", "receipts/.r.1.2.3.4.tmp"] {
+        fs::remove_file(state.join(rel)).unwrap();
+    }
+    let dir = dfm_engine::fsys::Dir::open_home(&sys(&h), &state).unwrap();
+    assert!(
+        !dir.publish_new("salt", b"other", &Fail::none(), "salt")
+            .unwrap()
+    );
+    assert_eq!(s.salt().unwrap().unwrap(), salt);
+    assert!(
+        files_below(&state).iter().all(|p| !p
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with('.')),
+        "nothing is left staged: {:?}",
+        files_below(&state)
+    );
 }

@@ -158,6 +158,14 @@ pub(crate) fn components(rel: &str) -> Result<Vec<&str>, Refusal> {
     Ok(comps)
 }
 
+/// Whether the action publishes through a same-directory staged name.
+fn stages(a: Action) -> bool {
+    matches!(
+        a,
+        Action::CreateFile | Action::UpdateFile | Action::ReplaceLink | Action::Retire
+    )
+}
+
 fn is_file_action(a: Action) -> bool {
     matches!(a, Action::CreateFile | Action::UpdateFile)
 }
@@ -302,12 +310,36 @@ fn first_refusal(plan: &Plan, generator: &dyn Generator) -> Result<(), Refusal> 
             .path
             .as_deref()
             .ok_or_else(|| plan_invalid(format!("{} has no path", op.id)))?;
-        components(path)?;
+        let comps = components(path)?;
+        // A file or link is staged under a longer hidden name in its own directory. A leaf that
+        // leaves no room for that name would fail with `ENAMETOOLONG` after the intent entry.
+        // Every other action still needs a name the file system accepts.
+        let leaf = comps.last().map_or(0, |l| l.len());
+        let extra = if stages(op.action) {
+            crate::fsys::TEMP_NAME_EXTRA
+        } else {
+            0
+        };
+        if leaf + extra > crate::fsys::NAME_MAX {
+            let staged = if extra > 0 {
+                format!("the staged name needs up to {extra} more and ")
+            } else {
+                String::new()
+            };
+            return Err(Refusal::new(
+                Code::LimitExceeded,
+                format!(
+                    "{}: the file name is {leaf} bytes; {staged}a name holds {}. Nothing was changed",
+                    op.id,
+                    crate::fsys::NAME_MAX
+                ),
+            ));
+        }
         // A sensitive output has no content hash. Apply admits one kind of sensitive operation,
         // the co-owned merge, which has its own conflict detection (docs/apply.md, Merge). Any
-        // other sensitive operation refuses the whole plan.
+        // other sensitive operation, a directory included, refuses the whole plan.
         let merge = op.class == Class::Sensitive && generator.merges(op);
-        if op.class == Class::Sensitive && op.action != Action::CreateDir && !merge {
+        if op.class == Class::Sensitive && !merge {
             return Err(Refusal::new(
                 Code::SensitiveUnsupported,
                 format!(
@@ -500,6 +532,8 @@ enum Ended {
         reload: Option<String>,
     },
     Current,
+    /// A stop request (SIGINT or SIGTERM) arrived before the intent entry. Nothing was written.
+    NotStarted(Refusal),
     Failed(Refusal, Option<String>),
     Blocked(Refusal),
     Unknown(Refusal, Option<String>),
@@ -543,12 +577,12 @@ struct MergeRead {
     mode: Option<u32>,
 }
 
-/// What a merge will write and the salted hash to record (`None` for a retire).
+/// What a merge will write. The salted hashes to record are made at the settle step, after the
+/// last stop check, because a store from an older build gets its salt created there.
 struct MergeDecision {
     merged: Merged,
-    /// Salted hash of each managed leaf, to record (empty for a retire).
-    leaves: std::collections::BTreeMap<String, String>,
-    new_hash: Option<String>,
+    /// The salt as it was when the decision was made (`None`: not created yet, or a retire).
+    salt: Option<Vec<u8>>,
 }
 
 /// Facts read again immediately before the effect.
@@ -753,6 +787,13 @@ impl Exec<'_, '_> {
         Ok(())
     }
 
+    /// The last look at the signal record before an operation writes its intent entry. A signal
+    /// that arrived during the checks, the link walk or the generation ends the operation as
+    /// not started, with nothing journaled.
+    fn stop_requested(&self) -> Result<(), Ended> {
+        crate::signal::requested().map_or(Ok(()), |r| Err(Ended::NotStarted(r)))
+    }
+
     fn run_op(&mut self, op: &Operation) -> Ended {
         self.try_op(op).unwrap_or_else(|e| e)
     }
@@ -776,7 +817,6 @@ impl Exec<'_, '_> {
             if self.run.generator.merges(op) {
                 return self.try_merge(op);
             }
-            debug_assert!(false, "a sensitive operation reached apply");
             return Err(failed(Refusal::new(
                 Code::SensitiveUnsupported,
                 format!("{}: sensitive outputs are not supported", op.id),
@@ -847,6 +887,7 @@ impl Exec<'_, '_> {
             Action::Remove => facts.ledger_fp.clone(),
             _ => new_fp.clone(),
         };
+        self.stop_requested()?;
         let id = self.attempt_id(op);
         let recovery = Recovery {
             outputs: vec![RecoveryOutput {
@@ -1072,23 +1113,7 @@ impl Exec<'_, '_> {
                 Ended::Blocked(e)
             })?;
         }
-        let (new_hash, leaves) = if retire {
-            (None, Default::default())
-        } else {
-            let salt = match salt {
-                Some(s) => s,
-                None => self.run.store.salt_or_create().map_err(failed)?,
-            };
-            (
-                Some(salted(&salt, &merged.rendered_view)),
-                leaf_hashes(&salt, &merged),
-            )
-        };
-        Ok(MergeDecision {
-            merged,
-            leaves,
-            new_hash,
-        })
+        Ok(MergeDecision { merged, salt })
     }
 
     /// Step 3, settle: intent, publish, read-back, outcome, ledger.
@@ -1106,12 +1131,23 @@ impl Exec<'_, '_> {
         read: &MergeRead,
         decided: MergeDecision,
     ) -> Result<Ended, Ended> {
-        let MergeDecision {
-            merged,
-            leaves,
-            new_hash,
-        } = decided;
+        let MergeDecision { merged, salt } = decided;
         let retire = op.action == Action::Retire;
+        self.stop_requested()?;
+        // The salt of a store from an older build is created only now, so an operation that
+        // ends as not started leaves the state store as it was.
+        let (new_hash, leaves) = if retire {
+            (None, Default::default())
+        } else {
+            let salt = match salt {
+                Some(s) => s,
+                None => self.run.store.salt_or_create().map_err(failed)?,
+            };
+            (
+                Some(salted(&salt, &merged.rendered_view)),
+                leaf_hashes(&salt, &merged),
+            )
+        };
         let id = self.attempt_id(op);
         let recovery = Recovery {
             outputs: vec![RecoveryOutput {
@@ -1493,6 +1529,13 @@ impl Exec<'_, '_> {
             Ok(_) => return Ended::Current,
             Err(e) => return failed(e),
         }
+        if let Err(e) = self.run.fail.hit("prune-before-intent") {
+            return failed(e);
+        }
+        // A stop request keeps the entry: pruning is only housekeeping, so no intent is written.
+        if crate::signal::requested().is_some() {
+            return Ended::Current;
+        }
         let id = self.attempt_id(op);
         let recovery = Recovery {
             outputs: vec![RecoveryOutput {
@@ -1696,6 +1739,13 @@ fn execute(run: &Run<'_>, plan: &Plan) -> Report {
                         Status::Updated,
                         record(op, id, Status::Updated, times, None, Some(&ended)),
                     ),
+                    Ended::NotStarted(r) => {
+                        stopped.get_or_insert_with(|| r.clone());
+                        (
+                            Status::NotStarted,
+                            record(op, &op.journal_id, Status::NotStarted, None, None, None),
+                        )
+                    }
                     Ended::Failed(r, id) => {
                         stopped.get_or_insert_with(|| r.clone());
                         let id = id.as_deref().unwrap_or(&op.journal_id);

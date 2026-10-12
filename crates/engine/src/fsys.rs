@@ -1,11 +1,11 @@
 //! Storage topology, the writer lock and atomic file operations (docs/state.md).
 //!
 //! Every operation is relative to an open, verified directory descriptor ([`Dir`]): `openat`,
-//! `mkdirat`, `renameat`, `linkat`, `unlinkat` and `fstatat`, all with `O_NOFOLLOW` or
+//! `mkdirat`, `renameat`, `unlinkat` and `fstatat`, all with `O_NOFOLLOW` or
 //! `AT_SYMLINK_NOFOLLOW`, through the safe API of `rustix`. A directory is checked on the
 //! descriptor it opened (`fstat`), never by path, so swapping a path component after the check
 //! cannot redirect a later operation: the descriptor keeps naming the directory that was
-//! verified. `unsafe` stays forbidden in this workspace.
+//! verified. `unsafe` is denied workspace-wide, with one `expect` in `signal.rs`.
 //!
 //! What is still path-based: HOME is resolved once with `canonicalize` and then opened (aliases
 //! such as `/var` to `/private/var` are accepted above HOME), and a claim's parent directories
@@ -111,17 +111,52 @@ pub fn below(home: &Path, path: &Path) -> Result<Vec<String>, Refusal> {
         .collect()
 }
 
+/// The longest a file name can be on the supported file system.
+pub(crate) const NAME_MAX: usize = 255;
+
+/// The most bytes [`temp_name`] adds to a name: five dots, a process id and a counter of up to
+/// 10 digits each, up to 9 digits of nanoseconds and a suffix of up to 5 letters (`stage`). A
+/// unit test builds the longest name and compares its length with this value.
+pub(crate) const TEMP_NAME_EXTRA: usize = 1 + 1 + 10 + 1 + 10 + 1 + 9 + 1 + 5;
+
 /// A hidden same-directory name for a staged file or link: unique per process and call.
 pub(crate) fn temp_name(name: &str, suffix: &str) -> String {
     static N: AtomicU32 = AtomicU32::new(0);
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.subsec_nanos());
-    format!(
-        ".{name}.{}.{}.{nanos}.{suffix}",
+    temp_name_of(
+        name,
         std::process::id(),
-        N.fetch_add(1, Ordering::Relaxed)
+        N.fetch_add(1, Ordering::Relaxed),
+        nanos,
+        suffix,
     )
+}
+
+fn temp_name_of(name: &str, pid: u32, n: u32, nanos: u32, suffix: &str) -> String {
+    format!(".{name}.{pid}.{n}.{nanos}.{suffix}")
+}
+
+/// The refusal for a failed exclusive rename that is not `EEXIST`. `ENOTSUP` and `EINVAL` mean
+/// that the file system does not take `RENAME_EXCL`: there is no fallback, so the text names
+/// the path and the requirement (docs/state.md, "Known limits").
+pub(crate) fn publish_err(path: &Path, e: Errno) -> Refusal {
+    if matches!(e, Errno::NOTSUP | Errno::INVAL) {
+        return io(
+            &format!(
+                "publish {} (creating a file needs a file system that supports an exclusive rename, RENAME_EXCL)",
+                path.display()
+            ),
+            &std::io::Error::from(e),
+        );
+    }
+    sys_err("publish", e)
+}
+
+/// Renames `from` to `to` in the directory `dir` and fails with `EEXIST` when `to` exists.
+pub(crate) fn rename_new(dir: &OwnedFd, from: &str, to: &str) -> Result<(), Errno> {
+    rfs::renameat_with(dir, from, dir, to, rfs::RenameFlags::NOREPLACE)
 }
 
 pub(crate) fn check_name(name: &str) -> Result<(), Refusal> {
@@ -391,11 +426,20 @@ impl Dir {
                         return Err(sys_err(&format!("create {}", self.at(name).display()), e));
                     }
                 };
+                if made {
+                    // By name and before the open: a umask that clears the owner's read bit
+                    // would leave a directory this process cannot open.
+                    rfs::chmodat(
+                        &self.fd,
+                        name,
+                        Mode::from_raw_mode(0o700),
+                        AtFlags::SYMLINK_NOFOLLOW,
+                    )
+                    .map_err(|e| sys_err("chmod new directory", e))?;
+                }
                 let fd = rfs::openat(&self.fd, name, flags, Mode::empty())
                     .map_err(|e| self.classify(name, e))?;
                 if made {
-                    rfs::fchmod(&fd, Mode::from_raw_mode(0o700))
-                        .map_err(|e| sys_err("chmod new directory", e))?;
                     // The new entry must be durable before anything is written inside.
                     self.sync()?;
                 }
@@ -594,20 +638,6 @@ impl Dir {
         let _ = rfs::unlinkat(&self.fd, tmp, AtFlags::empty());
     }
 
-    /// Removes the temporary name after a successful `linkat`. A failure leaves the published
-    /// file with two links, which the append check would later refuse, so it is reported.
-    fn drop_linked_temp(&self, tmp: &str) -> Result<(), Refusal> {
-        rfs::unlinkat(&self.fd, tmp, AtFlags::empty()).map_err(|e| {
-            Refusal::new(
-                Code::IoUnconfirmed,
-                format!(
-                    "published, but the temporary name {tmp} could not be removed: {}",
-                    std::io::Error::from(e)
-                ),
-            )
-        })
-    }
-
     fn require_plain(&self, name: &str) -> Result<(), Refusal> {
         match rfs::statat(&self.fd, name, AtFlags::SYMLINK_NOFOLLOW) {
             Ok(st) if kind(&st) == FileType::RegularFile => Ok(()),
@@ -649,9 +679,10 @@ impl Dir {
         )
     }
 
-    /// Create-only publication (`linkat` never replaces). `Ok(false)` means the name existed and
-    /// nothing was written. Failure points are as for [`Dir::replace_file`], with `-after-tmp`
-    /// before the link.
+    /// Create-only publication: the staged file is renamed with `RENAME_EXCL`, which never
+    /// replaces and leaves one link, so there is no moment with two names for the file.
+    /// `Ok(false)` means the name existed and nothing was written. Failure points are as for
+    /// [`Dir::replace_file`], with `-after-tmp` before the rename.
     pub fn publish_new(
         &self,
         name: &str,
@@ -664,15 +695,14 @@ impl Dir {
         let tmp = self.write_temp(name, bytes)?;
         let step = || -> Result<bool, Refusal> {
             fail.hit(&format!("{label}-after-tmp"))?;
-            match rfs::linkat(&self.fd, &tmp, &self.fd, name, AtFlags::empty()) {
+            match rename_new(&self.fd, &tmp, name) {
                 Ok(()) => Ok(true),
                 Err(Errno::EXIST) => Ok(false),
-                Err(e) => Err(sys_err("publish", e)),
+                Err(e) => Err(publish_err(&self.at(name), e)),
             }
         };
         let r = step();
         if r.as_ref().is_ok_and(|created| *created) {
-            self.drop_linked_temp(&tmp)?;
             unconfirmed(
                 fail.hit(&format!("{label}-after-rename"))
                     .and_then(|()| self.sync()),
@@ -1238,5 +1268,28 @@ mod tests {
         assert_eq!(w.0, b"{\"a");
         assert_eq!(r.code, Code::IoUnconfirmed);
         assert!(r.detail.contains("torn line"), "{}", r.detail);
+    }
+
+    #[test]
+    fn the_longest_staged_name_fits_the_reserved_extra() {
+        // The widest value of every field, and the longest suffix in use.
+        let name = temp_name_of("", u32::MAX, u32::MAX, 999_999_999, "stage");
+        assert_eq!(name.len(), TEMP_NAME_EXTRA, "{name}");
+        // A real name for any suffix in use stays within the reservation too.
+        for suffix in ["stage", "tmp"] {
+            assert!(temp_name("", suffix).len() <= TEMP_NAME_EXTRA);
+        }
+    }
+
+    #[test]
+    fn a_file_system_without_exclusive_rename_is_named_in_the_refusal() {
+        for e in [Errno::NOTSUP, Errno::INVAL] {
+            let r = publish_err(Path::new("/h/.config/a"), e);
+            assert_eq!(r.code, Code::IoFailed);
+            assert!(r.detail.contains("/h/.config/a"), "{}", r.detail);
+            assert!(r.detail.contains("RENAME_EXCL"), "{}", r.detail);
+        }
+        let other = publish_err(Path::new("/h/a"), Errno::ACCESS);
+        assert!(!other.detail.contains("RENAME_EXCL"), "{}", other.detail);
     }
 }

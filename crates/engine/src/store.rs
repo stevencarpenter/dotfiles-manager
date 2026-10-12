@@ -496,7 +496,7 @@ impl Store {
     }
 
     /// As [`Store::salt`], and creates it once when absent: 32 random bytes from the operating
-    /// system, mode 0600, published with `linkat` so a racing writer cannot replace it. Needs the
+    /// system, mode 0600, published with an exclusive rename so a racing writer cannot replace it. Needs the
     /// writer lock.
     pub fn salt_or_create(&self) -> Result<Vec<u8>, Refusal> {
         if let Some(s) = self.salt()? {

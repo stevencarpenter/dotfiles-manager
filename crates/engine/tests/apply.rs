@@ -12,15 +12,18 @@ use dfm_engine::{
 use dfm_model::digest::{EntryKind, TreeEntry, sha256_hex, tree_digest};
 use dfm_model::merge::Merged;
 use dfm_model::plan::{
-    Action, Binary, Fragment, Input, Observations, Operation, Ownership, Plan, Precondition,
-    Request, Source, Status as PlanStatus, ledger_state, link_fingerprint, node_state,
+    Action, Binary, Blocker, Fragment, Input, Observations, Operation, Ownership, Plan,
+    Precondition, Request, Source, Status as PlanStatus, ledger_state, link_fingerprint,
+    node_state,
 };
 use dfm_model::state::{Class, JournalEntry, LedgerResource, OwnedOutput, Phase, Status};
 use dfm_model::{Code, Refusal};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::os::unix::fs::{PermissionsExt, symlink};
-use std::path::Path;
+use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
+use std::os::unix::process::ExitStatusExt;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU32, Ordering};
 
 static NO_ADOPT: BTreeSet<String> = BTreeSet::new();
 
@@ -249,6 +252,19 @@ fn own(s: &Setup, rel: &str, content: &str) {
     own_fp(s, rel, &sha256_hex(content.as_bytes()));
 }
 
+/// Waits (at most 20 s) until the parked run reports that it reached its failpoint. Otherwise it
+/// releases the gate, so the run does not wait for its own 30 s timeout, and fails the test.
+fn wait_reached(reached: &Path, gate: &Path, point: &str) {
+    let end = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while !reached.exists() && std::time::Instant::now() < end {
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    if !reached.exists() {
+        let _ = fs::write(gate, "");
+        panic!("the failpoint {point} was not reached");
+    }
+}
+
 /// Runs `apply` parked at the failpoint `point`. `during` runs on another thread once the
 /// operation is parked there, and the run continues when it returns.
 fn parked(
@@ -259,22 +275,25 @@ fn parked(
     point: &str,
     during: impl FnOnce() + Send + 'static,
 ) -> dfm_engine::Report {
+    // The thread id keeps the gate of one test apart from that of another test in this process
+    // that parks at the same point.
+    let thread: String = format!("{:?}", std::thread::current().id())
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .collect();
     let gate =
         s.h.0
             .parent()
             .unwrap()
-            .join(format!("gate-{}-{point}", std::process::id()));
+            .join(format!("gate-{}-{thread}-{point}", std::process::id()));
     let _ = fs::remove_file(&gate);
     let reached = gate.with_extension("reached");
     let _ = fs::remove_file(&reached);
     let fail = Fail::at(point, Inject::Wait(gate.clone()));
     let t = std::thread::spawn({
-        let (gate, reached) = (gate.clone(), reached.clone());
+        let (gate, reached, point) = (gate.clone(), reached.clone(), point.to_string());
         move || {
-            let end = std::time::Instant::now() + std::time::Duration::from_secs(20);
-            while !reached.exists() && std::time::Instant::now() < end {
-                std::thread::sleep(std::time::Duration::from_millis(5));
-            }
+            wait_reached(&reached, &gate, &point);
             during();
             fs::write(&gate, "").unwrap();
         }
@@ -309,6 +328,8 @@ fn a_generated_file_is_staged_in_its_directory_published_with_its_mode_and_owned
     let p = s.h.0.join(".config/app.conf");
     assert_eq!(fs::read_to_string(&p).unwrap(), "a=1\n");
     assert_eq!(mode_of(&p), 0o640);
+    // The staged name was renamed, not linked: the published file has one name.
+    assert_eq!(fs::metadata(&p).unwrap().nlink(), 1);
     assert!(leftovers(&s.h.0.join(".config")).is_empty());
     let l = s.store.read_ledger().unwrap();
     assert_eq!(
@@ -899,7 +920,12 @@ fn only_a_merge_the_generator_runs_is_admitted_among_sensitive_operations() {
     retire.managed_sha256 = None;
     assert!(gates(&plan(vec![retire]), &MergeOnly).refusal.is_none());
     // Every other sensitive operation is still refused, and the plan is refused whole.
-    for action in [Action::CreateLink, Action::ReplaceLink, Action::Remove] {
+    for action in [
+        Action::CreateLink,
+        Action::ReplaceLink,
+        Action::Remove,
+        Action::CreateDir,
+    ] {
         let mut o = op(&s.h, &s.store, "x@b", 2, action, "b");
         o.class = Class::Sensitive;
         o.link = Some("/src/x".into());
@@ -1110,12 +1136,7 @@ fn a_failure_while_settling_earlier_work_still_returns_a_report() {
         .append_journal(&intent("create-link", &h.0.join("z").to_string_lossy()))
         .unwrap();
     drop(first);
-    let store = Store::open_write(
-        sys(&h),
-        &h.layout(),
-        Fail::at("journal-before-write", Inject::Error),
-    )
-    .unwrap();
+    let store = open_write_after_drop(&h, Fail::at("journal-before-write", Inject::Error));
     let s = Setup { h, store };
     let o = op(&s.h, &s.store, "x@a", 1, Action::CreateFile, "a");
     let rep = go(&s, &plan(vec![o]), &gen_for("x@a", "x"), &none());
@@ -1159,7 +1180,7 @@ fn rearmed(prepare: impl FnOnce(&Setup), fail: Fail) -> Setup {
     prepare(&s);
     let Setup { h, store } = s;
     drop(store);
-    let store = Store::open_write(sys(&h), &h.layout(), fail).unwrap();
+    let store = open_write_after_drop(&h, fail);
     Setup { h, store }
 }
 
@@ -1194,10 +1215,7 @@ fn a_file_that_appears_while_a_stale_entry_is_pruned_keeps_its_ledger_entry() {
     let t = std::thread::spawn({
         let (gate, reached) = (gate.clone(), reached.clone());
         move || {
-            let end = std::time::Instant::now() + std::time::Duration::from_secs(20);
-            while !reached.exists() && std::time::Instant::now() < end {
-                std::thread::sleep(std::time::Duration::from_millis(5));
-            }
+            wait_reached(&reached, &gate, "journal-before-write");
             fs::write(&leaf, "x").unwrap();
             fs::write(&gate, "").unwrap();
         }
@@ -1368,10 +1386,7 @@ fn an_adoption_whose_leaf_is_swapped_after_the_checks_writes_no_ledger_entry() {
         let t = std::thread::spawn({
             let (gate, reached) = (gate.clone(), reached.clone());
             move || {
-                let end = std::time::Instant::now() + std::time::Duration::from_secs(20);
-                while !reached.exists() && std::time::Instant::now() < end {
-                    std::thread::sleep(std::time::Duration::from_millis(5));
-                }
+                wait_reached(&reached, &gate, point);
                 fs::remove_file(&leaf).unwrap();
                 symlink("/src/y", &leaf).unwrap();
                 fs::write(&gate, "").unwrap();
@@ -2496,19 +2511,15 @@ impl Generator for Unchanged {
     }
 }
 
-/// An `update_file` merge of `settings.json`, planned from the live machine.
-fn merge_plan(s: &Setup) -> Plan {
+/// A merge of `settings.json`, planned from the live machine. `existing` writes the live file
+/// first (mode 0600), so the plan finds it.
+fn merge_plan_of(s: &Setup, action: Action, existing: bool) -> Plan {
     let live = s.h.0.join("settings.json");
-    fs::write(&live, "{\"a\":1}\n").unwrap();
-    fs::set_permissions(&live, fs::Permissions::from_mode(0o600)).unwrap();
-    let mut o = op(
-        &s.h,
-        &s.store,
-        "x@s",
-        1,
-        Action::UpdateFile,
-        "settings.json",
-    );
+    if existing {
+        fs::write(&live, "{\"a\":1}\n").unwrap();
+        fs::set_permissions(&live, fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    let mut o = op(&s.h, &s.store, "x@s", 1, action, "settings.json");
     o.class = Class::Sensitive;
     o.managed_sha256 = Some("a".repeat(64));
     let sys = sys(&s.h);
@@ -2531,6 +2542,11 @@ fn merge_plan(s: &Setup) -> Plan {
         }
     }
     plan(vec![o])
+}
+
+/// An `update_file` merge of `settings.json`, planned from the live machine.
+fn merge_plan(s: &Setup) -> Plan {
+    merge_plan_of(s, Action::UpdateFile, true)
 }
 
 #[test]
@@ -2605,4 +2621,1039 @@ fn an_output_planned_with_another_casing_replaces_its_ledger_entry_in_place() {
         .flat_map(|r| r.owned_outputs.iter().map(|o| o.path.as_str()))
         .collect();
     assert_eq!(paths, [s.h.0.join("foo").to_str().unwrap()]);
+}
+
+// ---- review fixes (DFM-57): refusals leave HOME and the store alone ---------------------------
+
+/// Every entry below HOME with its bytes (a link with its target), the state store included.
+fn tree(s: &Setup) -> BTreeMap<PathBuf, Vec<u8>> {
+    files_below(&s.h.0)
+        .into_iter()
+        .map(|p| {
+            let m = fs::symlink_metadata(&p).unwrap();
+            let bytes = if m.file_type().is_symlink() {
+                fs::read_link(&p)
+                    .unwrap()
+                    .into_os_string()
+                    .into_encoded_bytes()
+            } else if m.is_file() {
+                fs::read(&p).unwrap()
+            } else {
+                Vec::new()
+            };
+            (p, bytes)
+        })
+        .collect()
+}
+
+/// The whole plan is refused with `want` before any write: HOME, the journal and the ledger are
+/// byte for byte what they were.
+fn assert_refused_untouched(s: &Setup, p: &Plan, g: &dyn Generator, want: Code) -> Refusal {
+    let before = tree(s);
+    let e = refused(s, p, g, &none());
+    assert_eq!(e.code, want, "{e}");
+    assert_eq!(tree(s), before, "HOME or the state store changed");
+    assert!(s.store.read_journal().unwrap().is_empty());
+    e
+}
+
+fn phases(s: &Setup) -> Vec<Phase> {
+    s.store
+        .read_journal()
+        .unwrap()
+        .iter()
+        .map(|e| e.phase)
+        .collect()
+}
+
+#[test]
+fn a_path_that_is_not_a_normalized_home_relative_path_is_refused_before_any_write() {
+    for bad in ["", ".", "a/../b", "a/\u{7}b", "/abs", "a//b"] {
+        let s = setup();
+        let mut o = op(&s.h, &s.store, "x@a", 1, Action::CreateFile, "a");
+        o.path = Some(bad.into());
+        let g = gen_for("x@a", "x");
+        assert_refused_untouched(&s, &plan(vec![o]), &g, Code::PlanInvalid);
+    }
+}
+
+#[test]
+fn a_plan_with_blockers_is_refused_with_the_first_blockers_code() {
+    let s = setup();
+    let o = op(&s.h, &s.store, "x@a", 1, Action::CreateFile, "a");
+    let mut p = plan(vec![o]);
+    p.blockers = vec![Blocker {
+        code: Code::TargetCollision,
+        resource: "core.x".into(),
+        source: "/p".into(),
+        field: None,
+        path: Some("a".into()),
+        detail: "collides".into(),
+        correction: "rename it".into(),
+    }];
+    let e = assert_refused_untouched(&s, &p, &gen_for("x@a", "x"), Code::TargetCollision);
+    assert!(e.detail.contains("collides"), "{e}");
+}
+
+#[test]
+fn a_duplicate_operation_id_is_refused_before_any_write() {
+    let s = setup();
+    let a = op(&s.h, &s.store, "x@a", 1, Action::CreateFile, "a");
+    let b = op(&s.h, &s.store, "x@a", 2, Action::CreateFile, "b");
+    let e = assert_refused_untouched(
+        &s,
+        &plan(vec![a, b]),
+        &gen_for("x@a", "x"),
+        Code::PlanInvalid,
+    );
+    assert!(e.detail.contains("appears twice"), "{e}");
+}
+
+#[test]
+fn an_after_edge_to_a_later_operation_is_refused_before_any_write() {
+    let s = setup();
+    let mut a = op(&s.h, &s.store, "x@a", 1, Action::CreateFile, "a");
+    let b = op(&s.h, &s.store, "x@b", 2, Action::CreateFile, "b");
+    a.after = vec![b.id.clone()];
+    let g = Gen(BTreeMap::from([
+        ("x@a".to_string(), b"a".to_vec()),
+        ("x@b".to_string(), b"b".to_vec()),
+    ]));
+    let e = assert_refused_untouched(&s, &plan(vec![a, b]), &g, Code::PlanInvalid);
+    assert!(e.detail.contains("does not come earlier"), "{e}");
+}
+
+#[test]
+fn an_invalid_journal_id_is_refused_before_any_write() {
+    let s = setup();
+    let mut a = op(&s.h, &s.store, "x@a", 1, Action::CreateFile, "a");
+    a.journal_id = "not a journal id".into();
+    let e = assert_refused_untouched(&s, &plan(vec![a]), &gen_for("x@a", "x"), Code::PlanInvalid);
+    assert!(e.detail.contains("journal id"), "{e}");
+}
+
+#[test]
+fn a_blocked_operation_with_no_listed_blocker_is_refused_before_any_write() {
+    let s = setup();
+    let mut a = op(&s.h, &s.store, "x@a", 1, Action::CreateFile, "a");
+    a.status = PlanStatus::Blocked;
+    let e = assert_refused_untouched(&s, &plan(vec![a]), &gen_for("x@a", "x"), Code::PlanInvalid);
+    assert!(e.detail.contains("lists no blocker"), "{e}");
+}
+
+#[test]
+fn a_retire_that_carries_a_managed_fingerprint_is_refused_before_any_write() {
+    let s = setup();
+    let mut a = op(&s.h, &s.store, "x@a", 1, Action::Retire, "a");
+    a.class = Class::Sensitive;
+    a.managed_sha256 = Some("a".repeat(64));
+    let e = assert_refused_untouched(&s, &plan(vec![a]), &MergeOnly, Code::PlanInvalid);
+    assert!(e.detail.contains("carries a managed fingerprint"), "{e}");
+}
+
+#[test]
+fn a_retire_of_an_output_that_is_not_a_merge_is_refused_before_any_write() {
+    let s = setup();
+    let a = op(&s.h, &s.store, "x@a", 1, Action::Retire, "a");
+    let e = assert_refused_untouched(&s, &plan(vec![a]), &NoGenerator, Code::PlanInvalid);
+    assert!(e.detail.contains("not a co-owned merge"), "{e}");
+}
+
+#[test]
+fn a_planned_operation_with_no_action_is_refused_before_any_write() {
+    let s = setup();
+    let a = op(&s.h, &s.store, "x@a", 1, Action::None, "a");
+    let e = assert_refused_untouched(&s, &plan(vec![a]), &NoGenerator, Code::PlanInvalid);
+    assert!(e.detail.contains("no action"), "{e}");
+}
+
+#[test]
+fn a_sensitive_directory_is_refused_by_the_gates_not_by_the_executor() {
+    let s = setup();
+    let mut d = op(&s.h, &s.store, "x@d", 1, Action::CreateDir, "d");
+    d.class = Class::Sensitive;
+    for g in [&NoGenerator as &dyn Generator, &MergeOnly] {
+        assert_refused_untouched(&s, &plan(vec![d.clone()]), g, Code::SensitiveUnsupported);
+    }
+    assert!(!s.h.0.join("d").exists());
+}
+
+#[test]
+fn a_leaf_with_no_room_for_the_staged_name_is_refused_before_any_write() {
+    // A staged name adds up to 39 bytes, and a name holds 255. 216 fits and is really published.
+    let s = setup();
+    let fits = "a".repeat(216);
+    let o = op(&s.h, &s.store, "x@fits", 1, Action::CreateFile, &fits);
+    let r = go(&s, &plan(vec![o]), &gen_for("x@fits", "x"), &none());
+    assert_eq!(r.operations[0].status, Status::Updated, "{:?}", r.stopped);
+    assert!(s.h.0.join(&fits).is_file());
+    assert!(leftovers(&s.h.0).is_empty());
+    // 217 does not, for every action that stages. The refusal names the limit.
+    let long = "b".repeat(217);
+    let s = setup();
+    let o = op(&s.h, &s.store, "x@long", 1, Action::CreateFile, &long);
+    let e = assert_refused_untouched(
+        &s,
+        &plan(vec![o]),
+        &gen_for("x@long", "x"),
+        Code::LimitExceeded,
+    );
+    assert!(e.detail.contains("217 bytes"), "{e}");
+    let mut l = op(&s.h, &s.store, "x@link", 2, Action::ReplaceLink, &long);
+    l.link = Some("/src/x".into());
+    let g = gates(&plan(vec![l]), &NoGenerator);
+    assert_eq!(g.refusal.unwrap().code, Code::LimitExceeded);
+    // A link that is created is not staged, so 217 bytes still fit. A name over the limit of a
+    // name is refused for every action, also one that stages nothing, before any write.
+    let mut c = op(&s.h, &s.store, "x@create", 3, Action::CreateLink, &long);
+    c.link = Some("/src/x".into());
+    assert!(gates(&plan(vec![c]), &NoGenerator).refusal.is_none());
+    let over = "c".repeat(256);
+    for action in [
+        Action::CreateLink,
+        Action::CreateDir,
+        Action::Remove,
+        Action::Adopt,
+    ] {
+        let s = setup();
+        let link =
+            matches!(action, Action::CreateLink | Action::Adopt).then(|| "/src/x".to_string());
+        let mut o = op(&s.h, &s.store, "x@over", 4, action, "short");
+        o.path = Some(over.clone());
+        o.link = link.clone();
+        let e = assert_refused_untouched(&s, &plan(vec![o]), &NoGenerator, Code::LimitExceeded);
+        assert!(e.detail.contains("256 bytes"), "{action:?}: {e}");
+        // The limit itself is a name the file system takes.
+        let mut ok = op(&s.h, &s.store, "x@max", 5, action, "short");
+        ok.path = Some("d".repeat(255));
+        ok.link = link;
+        let g = gates(&plan(vec![ok]), &NoGenerator);
+        assert_ne!(
+            g.refusal.map(|r| r.code),
+            Some(Code::LimitExceeded),
+            "{action:?}"
+        );
+    }
+}
+
+#[test]
+fn an_immutable_file_is_a_permission_failure_not_a_directory() {
+    let s = setup();
+    let a = s.h.0.join("a");
+    fs::write(&a, "mine\n").unwrap();
+    own(&s, "a", "mine\n");
+    let id = "remove@core.x@a";
+    let o = op(&s.h, &s.store, id, 1, Action::Remove, "a");
+    let chflags = |f: &str| {
+        std::process::Command::new("chflags")
+            .args([f, a.to_str().unwrap()])
+            .status()
+            .is_ok_and(|s| s.success())
+    };
+    // Clears the flag on every exit, also a panic in `go`, so the HOME can be deleted.
+    struct Clear<F: Fn(&str) -> bool>(F);
+    impl<F: Fn(&str) -> bool> Drop for Clear<F> {
+        fn drop(&mut self) {
+            (self.0)("nouchg");
+        }
+    }
+    let clear = Clear(chflags);
+    // chflags ships with macOS, the only supported platform, so a failure here is a failure of
+    // the test and not a reason to pass without running it.
+    assert!(
+        (clear.0)("uchg"),
+        "chflags uchg failed: the check cannot run"
+    );
+    let allow = BTreeSet::from([id.to_string()]);
+    let rep = go(&s, &plan(vec![o]), &NoGenerator, &allow);
+    assert_eq!(
+        rep.operations[0].status,
+        Status::Failed,
+        "{:?}",
+        rep.stopped
+    );
+    let e = rep.stopped.unwrap();
+    assert_eq!(e.code, Code::IoFailed);
+    assert!(e.detail.contains("immutable flag"), "{e}");
+    assert!(!e.detail.contains("is a directory"), "{e}");
+    assert_eq!(fs::read_to_string(&a).unwrap(), "mine\n");
+    assert_eq!(s.store.read_ledger().unwrap().resources.len(), 1);
+}
+
+// ---- a stop request before the intent entry (A2) --------------------------------------------
+
+/// Asks for a stop (SIGTERM or SIGINT) when the executor calls it, as a signal that arrives
+/// during generation would. The first call is the plan fill in `go_with`, which asks for none.
+struct Stopping {
+    calls: AtomicU32,
+    term: bool,
+}
+
+impl Generator for Stopping {
+    fn supports(&self, op: &Operation) -> bool {
+        op.action == Action::CreateFile
+    }
+    fn generate(&self, _: &Operation, _: &GeneratorInputs) -> Result<Vec<u8>, Refusal> {
+        if self.calls.fetch_add(1, Ordering::SeqCst) >= 1 {
+            dfm_engine::signal::simulate(self.term);
+        }
+        Ok(b"x".to_vec())
+    }
+}
+
+#[test]
+fn a_signal_during_generation_ends_the_operation_not_started_with_no_intent_entry() {
+    for (term, code, exit) in [
+        (true, Code::Terminated, 143),
+        (false, Code::Interrupted, 130),
+    ] {
+        // The simulated stop belongs to its thread, so each case gets its own.
+        std::thread::spawn(move || {
+            let s = setup();
+            let a = op(&s.h, &s.store, "x@a", 1, Action::CreateFile, "a");
+            let b = op(&s.h, &s.store, "x@b", 2, Action::CreateDir, "b");
+            let g = Stopping {
+                calls: AtomicU32::new(0),
+                term,
+            };
+            let before = tree(&s);
+            let rep = go(&s, &plan(vec![a, b]), &g, &none());
+            let st: Vec<_> = rep.operations.iter().map(|o| o.status).collect();
+            assert_eq!(st, [Status::NotStarted, Status::NotStarted], "{term}");
+            let stop = rep.stopped.unwrap();
+            assert_eq!((stop.code, stop.exit().code()), (code, exit));
+            assert_eq!(tree(&s), before, "nothing was written, not even an intent");
+            assert!(s.store.read_journal().unwrap().is_empty());
+        })
+        .join()
+        .unwrap();
+    }
+}
+
+/// A merge that asks for a stop while it is decided.
+struct StoppingMerge;
+
+impl Generator for StoppingMerge {
+    fn supports(&self, _: &Operation) -> bool {
+        false
+    }
+    fn generate(&self, _: &Operation, _: &GeneratorInputs) -> Result<Vec<u8>, Refusal> {
+        Err(Refusal::new(Code::GeneratorUnavailable, "none"))
+    }
+    fn merges(&self, _: &Operation) -> bool {
+        true
+    }
+    fn merge(&self, op: &Operation, i: &GeneratorInputs) -> Result<Merged, Refusal> {
+        dfm_engine::signal::simulate(true);
+        Unchanged.merge(op, i)
+    }
+}
+
+#[test]
+fn a_signal_during_a_merge_decision_ends_it_not_started_with_no_intent_entry() {
+    let s = setup();
+    let p = merge_plan(&s);
+    let before = tree(&s);
+    let rep = go(&s, &p, &StoppingMerge, &none());
+    assert_eq!(rep.operations[0].status, Status::NotStarted);
+    assert_eq!(rep.stopped.unwrap().exit().code(), 143);
+    assert_eq!(tree(&s), before);
+    assert!(s.store.read_journal().unwrap().is_empty());
+}
+
+#[test]
+fn a_signal_during_a_merge_decision_does_not_create_the_missing_salt() {
+    // A store from an older build has no salt. A merge creates it only after its last stop
+    // check, so an operation that ends as not started leaves the state store as it was.
+    let s = setup();
+    let salt = s.h.0.join(".local/state/dotfiles-manager/state/salt");
+    fs::remove_file(&salt).unwrap();
+    let p = merge_plan(&s);
+    let before = tree(&s);
+    let rep = go(&s, &p, &StoppingMerge, &none());
+    assert_eq!(rep.operations[0].status, Status::NotStarted);
+    assert_eq!(rep.stopped.unwrap().exit().code(), 143);
+    assert!(!salt.exists(), "the salt was created before the stop check");
+    assert_eq!(tree(&s), before);
+    assert!(s.store.read_journal().unwrap().is_empty());
+}
+
+#[test]
+fn a_signal_before_a_stale_entry_is_pruned_keeps_the_entry_and_writes_no_intent() {
+    // The simulated stop belongs to its thread, so the run gets its own.
+    std::thread::spawn(|| {
+        let s = setup();
+        own(&s, "gone", "x");
+        let p = absent_candidate(&s);
+        let before = tree(&s);
+        let rep = go_with(
+            &s,
+            &p,
+            &NoGenerator,
+            &none(),
+            &Fail::at("prune-before-intent", Inject::Stop),
+        );
+        assert_eq!(rep.operations[0].status, Status::Current);
+        assert_eq!(rep.stopped.unwrap().exit().code(), 143);
+        assert_eq!(tree(&s), before, "no intent, no ledger change");
+        assert!(s.store.read_journal().unwrap().is_empty());
+        assert_eq!(s.store.read_ledger().unwrap().resources.len(), 1);
+    })
+    .join()
+    .unwrap();
+}
+
+// ---- a publish whose read-back differs (T1) ------------------------------------------------
+
+#[test]
+fn a_publish_whose_read_back_differs_fails_and_is_never_recorded_as_owned() {
+    type Mutate = fn(&Path);
+    let cases: [(&str, Action, Mutate); 6] = [
+        ("content", Action::CreateFile, |p| {
+            fs::write(p, "tampered\n").unwrap()
+        }),
+        ("mode", Action::CreateFile, |p| {
+            fs::set_permissions(p, fs::Permissions::from_mode(0o644)).unwrap()
+        }),
+        ("file to link", Action::CreateFile, |p| {
+            fs::remove_file(p).unwrap();
+            symlink("/elsewhere", p).unwrap();
+        }),
+        ("link retargeted", Action::CreateLink, |p| {
+            fs::remove_file(p).unwrap();
+            symlink("/src/other", p).unwrap();
+        }),
+        ("link to file", Action::CreateLink, |p| {
+            fs::remove_file(p).unwrap();
+            fs::write(p, "x").unwrap();
+        }),
+        ("dir to file", Action::CreateDir, |p| {
+            fs::remove_dir(p).unwrap();
+            fs::write(p, "x").unwrap();
+        }),
+    ];
+    for (tag, action, mutate) in cases {
+        let s = setup();
+        let mut o = op(&s.h, &s.store, "x@file", 1, action, "t");
+        o.link = (action == Action::CreateLink).then(|| "/src/x".to_string());
+        let target = s.h.0.join("t");
+        let rep = parked(
+            &s,
+            &plan(vec![o]),
+            &gens(),
+            &none(),
+            "apply-after-effect",
+            move || mutate(&target),
+        );
+        assert_eq!(rep.operations[0].status, Status::Failed, "{tag}");
+        let e = rep.stopped.unwrap();
+        assert_eq!(e.code, Code::IoFailed, "{tag}: {e}");
+        assert!(e.detail.contains("postcondition failed"), "{tag}: {e}");
+        assert!(
+            s.store.read_ledger().unwrap().resources.is_empty(),
+            "{tag}: nothing is owned with the planned fingerprint"
+        );
+        assert_eq!(phases(&s), [Phase::Intent, Phase::Failed], "{tag}: no done");
+    }
+}
+
+// ---- the final delete authorization (T2) ---------------------------------------------------
+
+#[test]
+fn a_ledger_rewritten_before_the_unlink_keeps_the_file_and_fails_the_removal() {
+    let s = setup();
+    fs::write(s.h.0.join("a"), "mine\n").unwrap();
+    own(&s, "a", "mine\n");
+    let id = "remove@core.x@a";
+    let o = op(&s.h, &s.store, id, 1, Action::Remove, "a");
+    let ledger =
+        s.h.0
+            .join(".local/state/dotfiles-manager/state/ledger.json");
+    let mut other = s.store.read_ledger().unwrap();
+    other
+        .record(LedgerResource {
+            resource: "core.x".into(),
+            adapter: "git-config/v1".into(),
+            class: Class::Normal,
+            op_id: "seed-2".into(),
+            owned_outputs: vec![OwnedOutput {
+                path: s.h.0.join("a").to_str().unwrap().into(),
+                mode: 0o600,
+                fingerprint: Some("b".repeat(64)),
+                coowned: None,
+            }],
+        })
+        .unwrap();
+    let bytes = dfm_model::state::canonical(&other).unwrap();
+    let allow = BTreeSet::from([id.to_string()]);
+    // Every earlier check passed. The ledger changes while the removal is about to run.
+    let rep = parked(
+        &s,
+        &plan(vec![o]),
+        &NoGenerator,
+        &allow,
+        "apply-before-effect",
+        move || fs::write(&ledger, bytes).unwrap(),
+    );
+    assert_eq!(
+        rep.operations[0].status,
+        Status::Failed,
+        "{:?}",
+        rep.stopped
+    );
+    let e = rep.stopped.unwrap();
+    assert_eq!(e.code, Code::Conflict);
+    assert!(
+        e.detail.contains("no longer matches the fingerprint"),
+        "{e}"
+    );
+    assert_eq!(fs::read_to_string(s.h.0.join("a")).unwrap(), "mine\n");
+    assert_eq!(phases(&s), [Phase::Intent, Phase::Failed]);
+    assert_eq!(s.store.read_ledger().unwrap().resources.len(), 1);
+}
+
+// ---- an outcome that cannot be settled after a good effect (T3, T10, T14) ------------------
+
+/// A plan for a new file or a new link, and what to check for the effect.
+fn new_output(s: &Setup, link: bool) -> Plan {
+    if link {
+        let mut l = op(&s.h, &s.store, "x@file", 1, Action::CreateLink, "t");
+        l.link = Some("/src/x".into());
+        plan(vec![l])
+    } else {
+        plan(vec![op(
+            &s.h,
+            &s.store,
+            "x@file",
+            1,
+            Action::CreateFile,
+            "t",
+        )])
+    }
+}
+
+/// The same store without its failpoint, as a later run opens it.
+fn reopened(s: Setup) -> Setup {
+    let Setup { h, store } = s;
+    drop(store);
+    let store = open(&h);
+    Setup { h, store }
+}
+
+#[test]
+fn an_outcome_that_cannot_be_settled_after_a_good_effect_blocks_the_path_in_the_next_run() {
+    // (tag, store failpoint, run failpoint, status, ledger entry written)
+    type Case = (
+        &'static str,
+        Option<&'static str>,
+        Option<&'static str>,
+        Status,
+        bool,
+    );
+    let cases: [Case; 3] = [
+        (
+            "done hook",
+            None,
+            Some("apply-after-done"),
+            Status::Failed,
+            false,
+        ),
+        (
+            "ledger write",
+            Some("ledger-before-write"),
+            None,
+            Status::Failed,
+            false,
+        ),
+        (
+            "ledger rename",
+            Some("ledger-after-rename"),
+            None,
+            Status::Unknown,
+            true,
+        ),
+    ];
+    for link in [false, true] {
+        for (tag, store_fp, run_fp, status, owned) in cases {
+            let s = match store_fp {
+                Some(fp) => rearmed(|_| {}, Fail::at(fp, Inject::Error)),
+                None => setup(),
+            };
+            let p = new_output(&s, link);
+            let fail = run_fp.map_or_else(Fail::none, |fp| Fail::at(fp, Inject::Error));
+            let rep = go_with(&s, &p, &gens(), &none(), &fail);
+            let what = format!("{tag}, link={link}");
+            assert_eq!(rep.operations[0].status, status, "{what}");
+            let e = rep.stopped.clone().unwrap();
+            assert_eq!(e.exit(), dfm_model::Exit::Failed, "{what}: {e}");
+            // The effect is in place and the journal holds the intent and the done entry.
+            assert!(fs::symlink_metadata(s.h.0.join("t")).is_ok(), "{what}");
+            assert_eq!(phases(&s), [Phase::Intent, Phase::Done], "{what}");
+            let ledger = s.store.read_ledger().unwrap();
+            assert_eq!(!ledger.resources.is_empty(), owned, "{what}");
+            // The next run does not take the path over: the plan is stale for it.
+            let s = reopened(s);
+            let before = tree(&s);
+            let again = go(&s, &p, &gens(), &none());
+            assert_eq!(again.operations[0].status, Status::Blocked, "{what}");
+            assert_eq!(again.stopped.unwrap().code, Code::PlanStale, "{what}");
+            assert_eq!(tree(&s), before, "{what}");
+            // A plan made from the machine as it is now still does not take the path over:
+            // nothing records an owner for it, so the create is a conflict.
+            let fresh = new_output(&s, link);
+            let again = go(&s, &fresh, &gens(), &none());
+            assert_eq!(again.operations[0].status, Status::Blocked, "{what}");
+            assert_eq!(again.stopped.unwrap().code, Code::Conflict, "{what}");
+            assert_eq!(tree(&s), before, "{what}");
+            assert_eq!(s.store.read_ledger().unwrap().resources.len() == 1, owned);
+        }
+    }
+}
+
+#[test]
+fn a_merge_whose_outcome_cannot_be_settled_is_reported_and_the_next_run_records_it() {
+    // (tag, store failpoint, run failpoint, status, ledger entry written)
+    type Case = (
+        &'static str,
+        Option<&'static str>,
+        Option<&'static str>,
+        Status,
+        bool,
+    );
+    let cases: [Case; 3] = [
+        (
+            "done hook",
+            None,
+            Some("apply-after-done"),
+            Status::Failed,
+            false,
+        ),
+        (
+            "ledger write",
+            Some("ledger-before-write"),
+            None,
+            Status::Failed,
+            false,
+        ),
+        (
+            "ledger rename",
+            Some("ledger-after-rename"),
+            None,
+            Status::Unknown,
+            true,
+        ),
+    ];
+    for (tag, store_fp, run_fp, status, owned) in cases {
+        let s = match store_fp {
+            Some(fp) => rearmed(|_| {}, Fail::at(fp, Inject::Error)),
+            None => setup(),
+        };
+        let p = merge_plan(&s);
+        let fail = run_fp.map_or_else(Fail::none, |fp| Fail::at(fp, Inject::Error));
+        let rep = go_with(&s, &p, &Unchanged, &none(), &fail);
+        assert_eq!(rep.operations[0].status, status, "{tag}: {:?}", rep.stopped);
+        let e = rep.stopped.clone().unwrap();
+        assert_eq!(e.exit(), dfm_model::Exit::Failed, "{tag}: {e}");
+        // The file is in place, and the journal holds the intent and the done entry.
+        assert!(s.h.0.join("settings.json").exists(), "{tag}");
+        assert_eq!(phases(&s), [Phase::Intent, Phase::Done], "{tag}");
+        assert_eq!(
+            !s.store.read_ledger().unwrap().resources.is_empty(),
+            owned,
+            "{tag}"
+        );
+        // A merge is decided from the bytes read under the lock, so a run that has no record of
+        // the file merges again and records it, and does not rewrite the file. A plan that
+        // expects no record, made before the ledger got one, is stale.
+        let s = reopened(s);
+        let live = fs::read(s.h.0.join("settings.json")).unwrap();
+        let again = go(&s, &merge_plan(&s), &Unchanged, &none());
+        let want = if owned {
+            Status::Blocked
+        } else {
+            Status::Updated
+        };
+        assert_eq!(again.operations[0].status, want, "{tag}");
+        assert_eq!(
+            fs::read(s.h.0.join("settings.json")).unwrap(),
+            live,
+            "{tag}"
+        );
+        assert_eq!(s.store.read_ledger().unwrap().resources.len(), 1, "{tag}");
+    }
+}
+
+#[test]
+fn a_journal_line_that_is_kept_but_unconfirmed_makes_the_operation_unknown() {
+    // The second journal write is the outcome entry: the line stays, its sync is unconfirmed.
+    let s = rearmed(
+        |_| {},
+        Fail::at_nth("journal-after-write", Inject::Error, 2),
+    );
+    let o = op(&s.h, &s.store, "x@file", 1, Action::CreateFile, "f");
+    let rep = go(&s, &with_dependent(&s, o), &gens(), &none());
+    let st: Vec<_> = rep.operations.iter().map(|o| o.status).collect();
+    assert_eq!(st, [Status::Unknown, Status::Blocked]);
+    assert_eq!(rep.stopped.unwrap().code, Code::IoUnconfirmed);
+    assert_eq!(phases(&s), [Phase::Intent, Phase::Done], "the line is kept");
+    assert!(s.store.mutated());
+    assert_eq!(fs::read_to_string(s.h.0.join("f")).unwrap(), "new\n");
+    assert!(s.store.read_ledger().unwrap().resources.is_empty());
+    assert!(!s.h.0.join("dep").exists());
+    // The first write is the intent. Its line is kept and no effect ran.
+    let s = rearmed(
+        |_| {},
+        Fail::at_nth("journal-after-write", Inject::Error, 1),
+    );
+    let o = op(&s.h, &s.store, "x@file", 1, Action::CreateFile, "f");
+    let rep = go(&s, &plan(vec![o]), &gens(), &none());
+    assert_eq!(rep.operations[0].status, Status::Failed);
+    assert_eq!(rep.stopped.unwrap().code, Code::IoUnconfirmed);
+    assert_eq!(phases(&s), [Phase::Intent]);
+    assert!(!s.h.0.join("f").exists());
+}
+
+#[test]
+fn a_staged_link_is_removed_when_the_rename_after_it_fails() {
+    let s = setup();
+    symlink("/src/old", s.h.0.join("l")).unwrap();
+    own_fp(&s, "l", &link_fingerprint("/src/old"));
+    let mut o = op(&s.h, &s.store, "x@l", 1, Action::ReplaceLink, "l");
+    o.link = Some("/src/new".into());
+    let rep = go_with(
+        &s,
+        &plan(vec![o]),
+        &gens(),
+        &none(),
+        &Fail::at("link-after-tmp", Inject::Error),
+    );
+    assert_eq!(rep.operations[0].status, Status::Failed);
+    assert!(leftovers(&s.h.0).is_empty(), "{:?}", leftovers(&s.h.0));
+    assert!(
+        fs::read_dir(&s.h.0).unwrap().all(|e| !e
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .ends_with(".stage")),
+        "no staged link remains"
+    );
+    assert_eq!(
+        fs::read_link(s.h.0.join("l")).unwrap(),
+        Path::new("/src/old")
+    );
+    assert_eq!(phases(&s), [Phase::Intent, Phase::Failed]);
+}
+
+#[test]
+fn an_outcome_that_cannot_be_journaled_is_reported_and_the_run_stops() {
+    // An unconfirmed effect whose `unknown` entry cannot be written: the operation is unknown.
+    let s = rearmed(
+        |_| {},
+        Fail::at_nth("journal-before-write", Inject::Error, 2),
+    );
+    let o = op(&s.h, &s.store, "x@file", 1, Action::CreateFile, "f");
+    let rep = go_with(
+        &s,
+        &with_dependent(&s, o),
+        &gens(),
+        &none(),
+        &Fail::at("file-after-rename", Inject::Error),
+    );
+    let st: Vec<_> = rep.operations.iter().map(|o| o.status).collect();
+    assert_eq!(st, [Status::Unknown, Status::Blocked]);
+    let why = rep.operations[0].error.clone().unwrap();
+    assert!(why.contains("the outcome could not be journaled"), "{why}");
+    assert_eq!(rep.stopped.unwrap().code, Code::IoUnconfirmed);
+    assert_eq!(phases(&s), [Phase::Intent], "only the intent is on disk");
+    assert!(!s.h.0.join("dep").exists());
+    // The next run settles the intent from the live file but records no ownership (the resource
+    // owns nothing yet), so the file is not taken over and the create is blocked.
+    let s = reopened(s);
+    let o = op(&s.h, &s.store, "x@file", 1, Action::CreateFile, "f");
+    let before = tree(&s);
+    let again = go(&s, &plan(vec![o]), &gens(), &none());
+    assert_eq!(again.operations[0].status, Status::Blocked);
+    assert_eq!(again.stopped.unwrap().code, Code::Conflict);
+    assert_eq!(fs::read_to_string(s.h.0.join("f")).unwrap(), "new\n");
+    assert!(s.store.read_ledger().unwrap().resources.is_empty());
+    assert!(
+        tree(&s)
+            .into_iter()
+            .all(|(p, b)| p.ends_with("journal.jsonl") || before.get(&p) == Some(&b)),
+        "only the journal may grow"
+    );
+    // A failed effect whose `failed` entry cannot be written: the operation is failed.
+    let s = rearmed(
+        |_| {},
+        Fail::at_nth("journal-before-write", Inject::Error, 2),
+    );
+    let o = op(&s.h, &s.store, "x@file", 1, Action::CreateFile, "f");
+    let rep = go_with(
+        &s,
+        &plan(vec![o]),
+        &gens(),
+        &none(),
+        &Fail::at("apply-before-effect", Inject::Error),
+    );
+    assert_eq!(rep.operations[0].status, Status::Failed);
+    let why = rep.operations[0].error.clone().unwrap();
+    assert!(why.contains("the outcome could not be journaled"), "{why}");
+    assert_eq!(phases(&s), [Phase::Intent]);
+    assert!(!s.h.0.join("f").exists());
+}
+
+// ---- merge read-state refusals (T13) -------------------------------------------------------
+
+#[test]
+fn a_merge_target_that_changed_since_the_plan_is_refused_before_the_intent_entry() {
+    type Mutate = fn(&Path);
+    // (tag, action, the live file exists in the plan, change at the read, status, code, text)
+    type Case = (
+        &'static str,
+        Action,
+        bool,
+        Mutate,
+        Status,
+        Code,
+        &'static str,
+    );
+    let cases: [Case; 6] = [
+        (
+            "gone",
+            Action::UpdateFile,
+            true,
+            |p| fs::remove_file(p).unwrap(),
+            Status::Blocked,
+            Code::Conflict,
+            "is gone since the plan",
+        ),
+        (
+            "appeared",
+            Action::CreateFile,
+            false,
+            |p| {
+                fs::write(p, "{}\n").unwrap();
+                fs::set_permissions(p, fs::Permissions::from_mode(0o600)).unwrap();
+            },
+            Status::Blocked,
+            Code::Conflict,
+            "appeared before it could be created",
+        ),
+        (
+            "open mode",
+            Action::UpdateFile,
+            true,
+            |p| fs::set_permissions(p, fs::Permissions::from_mode(0o644)).unwrap(),
+            Status::Blocked,
+            Code::Conflict,
+            "open to group or others",
+        ),
+        (
+            "link",
+            Action::UpdateFile,
+            true,
+            |p| {
+                let real = p.with_file_name("real.json");
+                fs::rename(p, &real).unwrap();
+                symlink(&real, p).unwrap();
+            },
+            Status::Blocked,
+            Code::Conflict,
+            "is a link",
+        ),
+        (
+            "hard link",
+            Action::UpdateFile,
+            true,
+            |p| fs::hard_link(p, p.with_file_name("second.json")).unwrap(),
+            Status::Blocked,
+            Code::Conflict,
+            "more than one hard link",
+        ),
+        (
+            "over 16 MiB",
+            Action::UpdateFile,
+            true,
+            |p| {
+                let len = usize::try_from(dfm_model::plan::MAX_HASHED_BYTES).unwrap() + 1;
+                fs::write(p, vec![b'x'; len]).unwrap()
+            },
+            Status::Failed,
+            Code::LimitExceeded,
+            "exceeds 16 MiB",
+        ),
+    ];
+    for (tag, action, existing, mutate, status, code, text) in cases {
+        let s = setup();
+        let p = merge_plan_of(&s, action, existing);
+        let live = s.h.0.join("settings.json");
+        let rep = parked(
+            &s,
+            &p,
+            &Unchanged,
+            &none(),
+            "merge-before-read",
+            move || mutate(&live),
+        );
+        assert_eq!(rep.operations[0].status, status, "{tag}");
+        let e = rep.stopped.unwrap();
+        assert_eq!(e.code, code, "{tag}: {e}");
+        assert!(e.detail.contains(text), "{tag}: {e}");
+        assert!(
+            s.store.read_journal().unwrap().is_empty(),
+            "{tag}: no intent"
+        );
+        assert!(s.store.read_ledger().unwrap().resources.is_empty(), "{tag}");
+        assert!(leftovers(&s.h.0).is_empty(), "{tag}: nothing was staged");
+    }
+}
+
+// ---- races the primitives refuse (T16) -----------------------------------------------------
+
+#[test]
+fn a_leaf_that_changes_just_before_a_primitive_acts_is_refused_and_left_alone() {
+    // A directory that appears before `mkdirat`.
+    let s = setup();
+    let o = op(&s.h, &s.store, "x@d", 1, Action::CreateDir, "d");
+    let d = s.h.0.join("d");
+    let rep = parked(
+        &s,
+        &plan(vec![o]),
+        &gens(),
+        &none(),
+        "apply-before-effect",
+        move || fs::create_dir(&d).unwrap(),
+    );
+    assert_eq!(rep.operations[0].status, Status::Failed);
+    let e = rep.stopped.unwrap();
+    assert_eq!(e.code, Code::Conflict);
+    assert!(e.detail.contains("appeared while applying"), "{e}");
+    assert!(s.h.0.join("d").is_dir());
+    assert!(s.store.read_ledger().unwrap().resources.is_empty());
+
+    // A link replaced by a regular file before `replace_link` reads it.
+    let s = setup();
+    symlink("/src/old", s.h.0.join("l")).unwrap();
+    own_fp(&s, "l", &link_fingerprint("/src/old"));
+    let mut o = op(&s.h, &s.store, "x@l", 1, Action::ReplaceLink, "l");
+    o.link = Some("/src/new".into());
+    let l = s.h.0.join("l");
+    let rep = parked(
+        &s,
+        &plan(vec![o]),
+        &gens(),
+        &none(),
+        "apply-before-effect",
+        move || {
+            fs::remove_file(&l).unwrap();
+            fs::write(&l, "mine\n").unwrap();
+        },
+    );
+    assert_eq!(rep.operations[0].status, Status::Failed);
+    let e = rep.stopped.unwrap();
+    assert_eq!(e.code, Code::Conflict);
+    assert!(e.detail.contains("is no longer a link"), "{e}");
+    assert_eq!(fs::read_to_string(s.h.0.join("l")).unwrap(), "mine\n");
+    assert!(leftovers(&s.h.0).is_empty());
+
+    // An owned file that vanishes between the identity check and `unlinkat`.
+    let s = setup();
+    fs::write(s.h.0.join("a"), "mine\n").unwrap();
+    own(&s, "a", "mine\n");
+    let id = "remove@core.x@a";
+    let o = op(&s.h, &s.store, id, 1, Action::Remove, "a");
+    let a = s.h.0.join("a");
+    let allow = BTreeSet::from([id.to_string()]);
+    let rep = parked(
+        &s,
+        &plan(vec![o]),
+        &NoGenerator,
+        &allow,
+        "remove-before-unlink",
+        move || fs::remove_file(&a).unwrap(),
+    );
+    assert_eq!(rep.operations[0].status, Status::Failed);
+    let e = rep.stopped.unwrap();
+    assert_eq!(e.code, Code::Conflict);
+    assert!(e.detail.contains("vanished while applying"), "{e}");
+    assert_eq!(phases(&s), [Phase::Intent, Phase::Failed]);
+    assert_eq!(s.store.read_ledger().unwrap().resources.len(), 1);
+
+    // A mode above 0777 is never published.
+    let s = setup();
+    let mut o = op(&s.h, &s.store, "x@file", 1, Action::CreateFile, "f");
+    o.mode = Some(0o4755);
+    let rep = go(&s, &plan(vec![o]), &gens(), &none());
+    assert_eq!(rep.operations[0].status, Status::Failed);
+    let e = rep.stopped.unwrap();
+    assert_eq!(e.code, Code::Conflict);
+    assert!(e.detail.contains("above 0777"), "{e}");
+    assert!(!s.h.0.join("f").exists());
+    assert!(leftovers(&s.h.0).is_empty());
+}
+
+// ---- a merge that crashed with only its intent (A1t) ---------------------------------------
+
+#[test]
+fn a_merge_that_crashed_with_only_its_intent_blocks_its_path_until_resolved_failed() {
+    const CHILD: &str = "DFM_APPLY_CRASH_HOME";
+    if let Some(dir) = std::env::var_os(CHILD) {
+        // The child: writes the intent, then ends at once with no terminal entry, as a crash does.
+        let h = Home(dir.into());
+        let store = open(&h);
+        let s = Setup { h, store };
+        let p = merge_plan(&s);
+        go_with(
+            &s,
+            &p,
+            &Unchanged,
+            &none(),
+            &Fail::at("apply-before-effect", Inject::Abort),
+        );
+        std::process::exit(9);
+    }
+    let Setup { h, store } = setup();
+    drop(store);
+    let status = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "a_merge_that_crashed_with_only_its_intent_blocks_its_path_until_resolved_failed",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env(CHILD, &h.0)
+        .status()
+        .unwrap();
+    assert_eq!(status.signal(), Some(6), "the child must abort: {status:?}");
+    let s = Setup { store: open(&h), h };
+    assert_eq!(phases(&s), [Phase::Intent], "only the intent was written");
+    let live = fs::read(s.h.0.join("settings.json")).unwrap();
+    // Run 1 settles the intent: a sensitive file has no expected hash, so it stays unknown and
+    // blocks the path. Run 2 meets the same block. Neither changes the file.
+    for run in 1..=2 {
+        let rep = go(&s, &merge_plan(&s), &Unchanged, &none());
+        assert_eq!(rep.operations[0].status, Status::Blocked, "run {run}");
+        assert_eq!(rep.stopped.unwrap().code, Code::OpInterrupted, "run {run}");
+        assert_eq!(
+            fs::read(s.h.0.join("settings.json")).unwrap(),
+            live,
+            "run {run}"
+        );
+        assert!(
+            s.store.read_ledger().unwrap().resources.is_empty(),
+            "run {run}"
+        );
+    }
+    // Only `state resolve --as failed` clears it.
+    let id = s.store.read_journal().unwrap()[0].op_id.clone();
+    let sy = sys(&s.h);
+    let home = Dir::open_home(&sy, &s.h.0).unwrap();
+    dfm_engine::resolve(&s.store, (&sy, &home, s.h.0.as_path()), &id, false).unwrap();
+    let rep = go(&s, &merge_plan(&s), &Unchanged, &none());
+    assert_eq!(
+        rep.operations[0].status,
+        Status::Updated,
+        "{:?}",
+        rep.stopped
+    );
 }
