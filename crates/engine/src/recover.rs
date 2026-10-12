@@ -29,7 +29,7 @@ pub(crate) type Where<'a> = (&'a Sys, &'a Dir, &'a Path);
 #[derive(Debug)]
 pub(crate) struct Live {
     pub peek: Peek,
-    /// SHA-256 of a file's content, or `link_fingerprint` of a link's target text.
+    /// `file_fingerprint` of a file's content, or `link_fingerprint` of a link's target text.
     pub fingerprint: Option<String>,
 }
 

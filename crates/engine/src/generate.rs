@@ -12,7 +12,7 @@ use dfm_model::fold;
 use dfm_model::merge::{Merged, fragment_token};
 use dfm_model::plan::{
     MAX_HASHED_BYTES, MAX_LISTING, MAX_SOURCE_ENTRIES, MAX_SOURCE_FILE_BYTES,
-    MAX_SOURCE_TOTAL_BYTES, Operation, Plan,
+    MAX_SOURCE_TOTAL_BYTES, Operation, Plan, file_fingerprint,
 };
 use dfm_model::state::{AppendedItem, Class, OwnedEntry};
 use dfm_model::{Code, Refusal};
@@ -271,7 +271,7 @@ pub(crate) fn gather(
                     let want = f.sha256.as_deref().ok_or_else(|| {
                         invalid(format!("foreign fragment {path} has no recorded hash"))
                     })?;
-                    if sha256_hex(&bytes) != want {
+                    if file_fingerprint(&bytes) != want {
                         return Err(stale(format!("fragment {path} changed since the plan")));
                     }
                 }

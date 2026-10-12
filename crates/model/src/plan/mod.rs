@@ -47,8 +47,9 @@ pub enum Node {
         mode: u32,
         own: bool,
     },
-    /// `sha256` is present only when the caller asked for it and the file is a bounded regular
-    /// file. It is never recorded for a sensitive path.
+    /// `sha256` is the [`file_fingerprint`] of the content (the field name is the serialized
+    /// plan format). It is present only when the caller asked for it and the file is a bounded
+    /// regular file. It is never recorded for a sensitive path.
     File {
         mode: u32,
         own: bool,
@@ -241,7 +242,7 @@ pub struct Fragment {
     pub name: String,
     /// `selected:<resource>` or `foreign`.
     pub origin: String,
-    /// SHA-256 of a foreign fragment's content as the planner observed it. Apply reads the
+    /// The [`file_fingerprint`] of a foreign fragment's content as the planner observed it. Apply reads the
     /// fragment again and compares. A selected fragment has none: its content is the planned
     /// output of its producer (`Operation::output_sha256`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -490,15 +491,27 @@ pub fn node_state(seen: &Seen, sensitive: bool) -> String {
 
 /// The ledger fingerprint of a link: SHA-256 of `link\0` and the link target text. DFM-17 left
 /// link fingerprints open; the planner and apply both use this function. A file's fingerprint is
-/// the SHA-256 of its content. The prefix keeps the two apart: a regular file whose bytes equal
-/// a link's target text has a different fingerprint, so it is never taken for that link, not
-/// for ownership and not for a deletion (DFM-45). A ledger written before this prefix holds the
-/// plain hash for its links. Such an entry no longer matches its live link, so the planner calls
-/// it modified and nothing removes it until the link is applied or adopted again.
+/// [`file_fingerprint`]. The two prefixes keep the kinds apart: a regular file whose bytes are
+/// `link\0` and a target has a different fingerprint from that link, so it is never taken for
+/// that link, not for ownership and not for a deletion (DFM-45). A ledger written before the
+/// prefix holds the plain hash. Such an entry no longer matches its live output, so the planner
+/// calls it modified and nothing removes it until the output is applied or adopted again.
 pub fn link_fingerprint(target: &str) -> String {
     let mut bytes = b"link\0".to_vec();
     bytes.extend_from_slice(target.as_bytes());
     sha256_hex(&bytes)
+}
+
+/// The ledger fingerprint of a regular file: SHA-256 of `file\0` and the content. It is also
+/// what an observation records as the hash of a regular file, so the planner,
+/// apply, recovery and `doctor` compare one value. Content that must match a plan hash
+/// (`output_sha256`, an input `content_id`) stays a plain SHA-256.
+pub fn file_fingerprint(content: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(b"file\0");
+    h.update(content);
+    crate::digest::hex(h.finalize().as_slice())
 }
 
 /// The identity of a source tree read from `root` (section 9, "Path-source identity"): the
@@ -601,18 +614,17 @@ mod tests {
         assert_ne!(a.digest().unwrap(), c.digest().unwrap());
     }
 
-    #[test]
-    fn an_output_hash_only_change_prints_a_visible_difference() {
-        let op = |hash: &str| Operation {
+    fn operation(class: Class, path: &str, hash: Option<&str>) -> Operation {
+        Operation {
             id: "r@x".into(),
             journal_id: "j".into(),
             resource: "r".into(),
             module: "m".into(),
             adapter: "git-config/v1".into(),
-            class: Class::Normal,
+            class,
             action: Action::CreateFile,
             status: Status::Planned,
-            path: Some("x".into()),
+            path: Some(path.into()),
             mode: None,
             link: None,
             privilege: "user".into(),
@@ -621,7 +633,7 @@ mod tests {
             inputs: vec![],
             fragments: vec![],
             fragment_dir: None,
-            output_sha256: Some(hash.into()),
+            output_sha256: hash.map(String::from),
             managed_sha256: None,
             takeover: false,
             output_bytes: None,
@@ -630,7 +642,12 @@ mod tests {
             after: vec![],
             preconditions: vec![],
             postcondition: String::new(),
-        };
+        }
+    }
+
+    #[test]
+    fn an_output_hash_only_change_prints_a_visible_difference() {
+        let op = |hash: &str| operation(Class::Normal, "x", Some(hash));
         let (mut a, mut b) = (empty(), empty());
         a.operations = vec![op(&"a".repeat(64))];
         b.operations = vec![op(&"b".repeat(64))];
@@ -658,10 +675,75 @@ mod tests {
         assert!(!format!("{d:?}").contains(&"c".repeat(12)), "{d:?}");
     }
 
+    fn file_seen(size: u64) -> Seen {
+        Seen {
+            node: Node::File {
+                mode: 0o600,
+                own: true,
+                size,
+                sha256: None,
+            },
+            alias: None,
+        }
+    }
+
+    #[test]
+    fn the_observation_diff_of_a_sensitive_claim_shows_no_size() {
+        let plan = |class: Class, size: u64| {
+            let mut p = empty();
+            p.operations = vec![operation(class, "s", None)];
+            p.observations.seen.insert("s".into(), file_seen(size));
+            p
+        };
+        let shown = |class: Class| {
+            let d = stale(&plan(class, 3), &plan(class, 4)).unwrap();
+            format!("{d:?}")
+        };
+        let sensitive = shown(Class::Sensitive);
+        assert!(!sensitive.contains("size"), "{sensitive}");
+        // The size change is still found: the digest entry says the plan differs.
+        assert!(sensitive.contains("digest"), "{sensitive}");
+        assert!(shown(Class::Normal).contains("file:600:size:3"));
+    }
+
+    #[test]
+    fn a_content_token_on_one_side_only_is_never_shown() {
+        // A blocked merge has no token; the fresh plan has one (docs/adapters.md).
+        let plan = |state: &str| {
+            let mut p = empty();
+            let mut o = operation(Class::Sensitive, "s", None);
+            o.preconditions = vec![Precondition {
+                subject: "fragments:d".into(),
+                state: state.into(),
+            }];
+            p.operations = vec![o];
+            p
+        };
+        let token = "f".repeat(64);
+        let with = format!("10-a.json content=[10-a.json:{token}]");
+        for (a, b) in [("10-a.json", with.as_str()), (with.as_str(), "10-a.json")] {
+            let d = stale(&plan(a), &plan(b)).unwrap();
+            let all = format!("{d:?}");
+            assert!(!all.contains(&token) && !all.contains("content=["), "{all}");
+            assert!(all.contains("fragment content"), "{all}");
+        }
+        assert!(
+            !serde_json::to_string(&stale(&plan("x"), &plan(&with)).unwrap())
+                .unwrap()
+                .contains(&token)
+        );
+    }
+
     #[test]
     fn a_link_fingerprint_is_never_the_hash_of_a_file_with_the_same_bytes() {
         assert_ne!(link_fingerprint("/src/x"), sha256_hex(b"/src/x"));
         assert_eq!(link_fingerprint("/src/x"), link_fingerprint("/src/x"));
+        // The crafted file: its bytes are the link domain prefix and the target.
+        assert_ne!(
+            file_fingerprint(b"link\0/src/x"),
+            link_fingerprint("/src/x")
+        );
+        assert_ne!(file_fingerprint(b"/src/x"), sha256_hex(b"/src/x"));
     }
 
     #[test]

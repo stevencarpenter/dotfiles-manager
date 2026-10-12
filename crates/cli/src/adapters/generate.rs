@@ -8,7 +8,7 @@ use dfm_model::fold;
 use dfm_model::merge::{Desired, Merged, merge_with, retire};
 use dfm_model::plan::{
     Action, Blocker, MAX_HASHED_BYTES, Node, Observations, Operation, Ownership, Plan, Status,
-    matches_pattern,
+    file_fingerprint, matches_pattern,
 };
 use dfm_model::resolve::{Resolved, Table, Value};
 use dfm_model::state::Class;
@@ -427,7 +427,7 @@ pub fn plan_outputs(plan: &mut Plan, resolved: &Resolved, sys: &Sys, home: &Dir)
                 let hash = sha256_hex(&bytes);
                 if out.action == Action::UpdateFile
                     && out.ownership == Ownership::Owned
-                    && live_equals(&plan.observations, out, &hash)
+                    && live_equals(&plan.observations, out, &file_fingerprint(&bytes))
                 {
                     out.action = Action::None;
                     out.status = Status::Current;

@@ -53,7 +53,7 @@ All of these exit 3 and change nothing:
 
 1. **Sources.** Each `Operation.inputs` path is read below the plan's source root. Every parent and the file are opened with `O_NOFOLLOW`, the file must be regular, owned by the current user, with one hard link, and at most 16 MiB (`MAX_HASHED_BYTES`). The hash must equal the operation's `source:` precondition. A plan with generated files must have exactly one source.
 2. **Fragment directory.** For an `assemble` operation, apply opens `Operation.fragment_dir` from HOME one component at a time without following a link, lists it (names only) and reads each fragment the plan lists through that descriptor.
-   - A foreign fragment must hash to `Fragment.sha256`, which the planner observed.
+   - A foreign fragment must have the `file_fingerprint` recorded in `Fragment.sha256`, which the planner observed.
    - A fragment from a selected generated producer must hash to that producer's `output_sha256`.
    - A fragment from a selected link producer must be the link the plan made. Its content is the producer's source file, read and compared like any other source.
    - Together the fragments are at most 16 MiB (`E_LIMIT_EXCEEDED`), checked before each read. The listing is cut at 50,000 entries and a cut listing is stale.
@@ -84,7 +84,7 @@ For one operation, apply does these steps in this order:
 2. **Topology.** Apply opens the parent chain from HOME one component at a time with `O_NOFOLLOW | O_DIRECTORY`. Each directory must be owned by the current user. A link, a file, a missing directory or another owner is `E_PARENT_UNSAFE`. All later steps use the opened parent descriptor, never the path.
 3. **Leaf.** Apply looks at the leaf through that descriptor (`fstatat` without following). It must be what the operation expects: absent for a create, the same link for a replace, a regular file for an update, a file or link for a remove.
 4. **Content.** For a file, apply reads the operation's inputs and calls the generator (see Generator). A stale input, a generator failure or a hash that differs from the plan leaves no journal entry and no write. For a link (`create_link`, `replace_link`, `adopt`), apply reads the source again (see Link source). A source that changed is `E_PLAN_STALE`, with no journal entry and no write.
-5. **Intent.** The journal gets an `intent` entry (durable) with the path, whether it existed, and the expected SHA-256.
+5. **Intent.** The journal gets an `intent` entry (durable) with the path, whether it existed, and the expected fingerprint (`expected_sha256`, a `file_fingerprint` for a file).
 6. **Effect.** See the next section.
 7. **Read-back.** Apply reads the result through the same descriptor: link target, content hash and mode, or absence.
 8. **Outcome.** The journal gets `done`. If the effect or the read-back failed, it gets `failed` with a redacted reason.
@@ -100,7 +100,7 @@ The receipt is written once, after the last operation (architecture section 9 it
 | `create_link` | `symlinkat` | `EEXIST` is a conflict. A leaf that appeared is never replaced. |
 | `replace_link` | `symlinkat` to a hidden name, then `renameat` | The fingerprint of the live link (`link_fingerprint` of its target text) must equal the ledger fingerprint, read just before the rename. |
 | `create_file` | staged file (`O_EXCL`, mode set before content, `fsync`), then `renameat` with `RENAME_EXCL` | The exclusive rename never replaces and leaves one name for the file, so no second link exists at any time. The directory is synced. |
-| `update_file` | staged file, then `renameat` | The live content hash must equal the ledger fingerprint, read just before the rename. |
+| `update_file` | staged file, then `renameat` | The live file fingerprint (`file_fingerprint`) must equal the ledger fingerprint, read just before the rename. |
 | `remove` | `unlinkat` without `AT_REMOVEDIR` | See Delete safety. |
 | `adopt` | none | No effect on HOME. See Adoption. |
 | merge `create_file`, `update_file`, `retire` | staged file (`O_EXCL`, 0600, `fsync`), then an exclusive `renameat` (create) or `renameat` guarded by file identity | See Merge. |
@@ -118,7 +118,7 @@ A removal needs all of the following at the moment of deletion:
 1. The plan lists it as `remove` (the planner proved the ledger fingerprint matches the live output and nothing selects the path).
 2. `--allow-disruptive <operation-id>` names it.
 3. The recorded preconditions still hold (the file or link is unchanged since planning).
-4. `Store::authorizes_delete` returns true now: the ledger is read again, the path is inside HOME and outside the manager's paths (by text and by filesystem identity), the resource is `normal` class, and the fingerprint recorded equals the live one. The live fingerprint comes from a descriptor opened with `O_NOFOLLOW` (file content hash) or from `readlinkat` (link target text hash).
+4. `Store::authorizes_delete` returns true now: the ledger is read again, the path is inside HOME and outside the manager's paths (by text and by filesystem identity), the resource is `normal` class, and the fingerprint recorded equals the live one. The live fingerprint comes from a descriptor opened with `O_NOFOLLOW` (`file_fingerprint` of the content) or from `readlinkat` (link target text hash).
 5. The entry is not a directory, and is not sensitive.
 6. The name still refers to the entry that was hashed (device and inode for a file, the same target for a link).
 

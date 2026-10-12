@@ -270,6 +270,9 @@ struct Planner<'a> {
     /// action, so a blocked or absent removal cannot count as a producer.
     leaf_ids: BTreeSet<String>,
     removal_ids: BTreeSet<String>,
+    /// Directories the plan creates, by folded path: the spelling the first claim used. A second
+    /// spelling that differs only by case would be one directory on a case-insensitive volume.
+    mkdirs: BTreeMap<String, String>,
 }
 
 pub fn build(resolved: &Resolved, cx: &Context<'_>, obs: &Observations) -> Result<Plan, Refusal> {
@@ -285,6 +288,7 @@ pub fn build(resolved: &Resolved, cx: &Context<'_>, obs: &Observations) -> Resul
         blockers: Vec::new(),
         leaf_ids: BTreeSet::new(),
         removal_ids: BTreeSet::new(),
+        mkdirs: BTreeMap::new(),
     };
     for r in resolved.resources.values() {
         p.resource(r);
@@ -699,7 +703,7 @@ impl Planner<'_> {
         let mut prev: Option<String> = None;
         if let Some(from) = parents.missing_from {
             for i in from..comps.len() - 1 {
-                prev = Some(self.mkdir(r, &comps[..=i].join("/"), prev.take()));
+                prev = Some(self.mkdir(r, &comps[..=i].join("/"), prev.take(), field)?);
             }
             op.after.extend(prev);
         }
@@ -999,7 +1003,24 @@ impl Planner<'_> {
 
     /// A directory the plan must create. One operation per directory, shared by every claim
     /// below it, chained so a child follows its parent.
-    fn mkdir(&mut self, r: &ResolvedResource, path: &str, parent: Option<String>) -> String {
+    fn mkdir(
+        &mut self,
+        r: &ResolvedResource,
+        path: &str,
+        parent: Option<String>,
+        field: &'static str,
+    ) -> Result<String, Fail> {
+        let first = self.mkdirs.entry(fold(path)).or_insert_with(|| path.into());
+        if first != path {
+            return Err(fail(
+                Code::TargetCollision,
+                field,
+                format!(
+                    "the missing parent {path} differs from the directory `{first}` another claim creates only by case; the filesystem treats them as one"
+                ),
+                "spell both claims with the same case",
+            ));
+        }
         let id = format!("mkdir@{path}");
         if !self.ops.contains_key(&id) {
             let mut op = self.skeleton(r, id.clone(), Some(path.into()));
@@ -1016,7 +1037,7 @@ impl Planner<'_> {
             op.postcondition = format!("{path} is a real directory");
             self.ops.insert(id.clone(), op);
         }
-        id
+        Ok(id)
     }
 
     /// A fragment directory is read, not written: it must be absent or a real directory.
@@ -1437,12 +1458,22 @@ fn decide(
                     };
                     Ok((Action::None, Status::Current, own, effect, post))
                 }
-                (_, Ownership::Owned) => Ok((
+                (Node::Link { .. }, Ownership::Owned) => Ok((
                     Action::ReplaceLink,
                     Status::Planned,
                     Ownership::Owned,
                     format!("replace {shown} with a link -> {want}"),
                     post,
+                )),
+                // The ledger owns a file here (the resource was a render before). A link
+                // replacement over it would fail at apply, after earlier operations ran.
+                (_, Ownership::Owned) => Err(fail(
+                    Code::Conflict,
+                    "target",
+                    format!(
+                        "{path} is a file where this resource now creates a link; the manager never replaces a file with a link"
+                    ),
+                    "remove the file yourself, then plan again to create the link",
                 )),
                 (_, Ownership::Modified) => Err(conflict("was changed after the manager wrote it")),
                 (_, Ownership::Unverifiable) => {
@@ -1471,12 +1502,22 @@ fn decide(
                     format!("write {shown} with {}", r.adapter),
                     post,
                 )),
-                (_, Ownership::Owned) => Ok((
+                (Node::File { .. }, Ownership::Owned) => Ok((
                     Action::UpdateFile,
                     Status::Planned,
                     Ownership::Owned,
                     format!("update {shown} with {}", r.adapter),
                     post,
+                )),
+                // The ledger owns a link here (the resource was a link before). A file update
+                // must not write through it or replace it.
+                (_, Ownership::Owned) => Err(fail(
+                    Code::Conflict,
+                    "target",
+                    format!(
+                        "{path} is a link where this resource now generates a file; the manager never updates a file through a link"
+                    ),
+                    "remove the link yourself, then plan again to create the file",
                 )),
                 (_, Ownership::Modified) => Err(conflict("was changed after the manager wrote it")),
                 (_, Ownership::Unverifiable) => Err(conflict(

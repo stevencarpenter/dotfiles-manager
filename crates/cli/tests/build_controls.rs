@@ -62,6 +62,33 @@ impl Run {
         }
     }
 
+    /// The refusing path: the first path-like word after the stable code (it has a `/` or an
+    /// extension, so a bare version such as `9.9.9` is not one), with the fixture directories
+    /// removed and a trailing colon trimmed. The two implementations word the rest of the line
+    /// differently, and the script names no path for a toolchain digest mismatch.
+    fn location(&self, roots: &[PathBuf]) -> Option<String> {
+        let at = self.stderr.find("E_")?;
+        let mut text = self.stderr[at..].to_string();
+        for r in roots {
+            let canonical = fs::canonicalize(r).unwrap_or_else(|_| r.clone());
+            for p in [r, &canonical] {
+                text = text.replace(&format!("{}/", p.display()), "");
+            }
+        }
+        let is_path = |w: &&str| {
+            w.contains('/')
+                || w.trim_end_matches(':')
+                    .rsplit_once('.')
+                    .is_some_and(|(_, ext)| {
+                        !ext.is_empty() && ext.chars().all(|c| c.is_ascii_alphabetic())
+                    })
+        };
+        text.split_whitespace()
+            .skip(1)
+            .find(is_path)
+            .map(|w| w.trim_end_matches(':').to_string())
+    }
+
     /// `ok` or the first stable error code.
     fn verdict(&self) -> String {
         if self.code == 0 {
@@ -185,6 +212,40 @@ fn fixture_toolchain_digest_is_pinned() {
     );
 }
 
+/// Refusing fixtures where at least one implementation names no path of its own. The script
+/// names none for a toolchain digest mismatch or a legacy toolchain pin, and each side names a
+/// different set for the stage symlink and the two writable toolchain entries. Any other
+/// refusing fixture must name a path on both sides, and the two must agree.
+const WITHOUT_BOTH_PATHS: [&str; 7] = [
+    "stage-rust-toolchain-legacy",
+    "stage-rust-toolchain-legacy-case-variant",
+    "stage-symlink",
+    "toolchain-digest-differs-in-lock",
+    "toolchain-group-writable-file",
+    "toolchain-tampered",
+    "toolchain-world-writable-dir",
+];
+
+/// Whether two refusing paths differ. For an unsearchable ancestor the script names that
+/// directory (its `cd` fails) and the manager names the config file it cannot stat below it,
+/// so there one path may lie inside the other, on a path component boundary.
+fn paths_differ(a: &str, b: &str, nested_ok: bool) -> bool {
+    let inside = |p: &str, dir: &str| p == dir || p.starts_with(&format!("{dir}/"));
+    if nested_ok {
+        !(inside(a, b) || inside(b, a))
+    } else {
+        a != b
+    }
+}
+
+#[test]
+fn nested_paths_are_accepted_only_on_a_component_boundary() {
+    assert!(!paths_differ(".claude", ".claude/settings.json", true));
+    assert!(!paths_differ(".claude/settings.json", ".claude", true));
+    assert!(paths_differ(".claude", ".claude2", true));
+    assert!(paths_differ(".claude", ".claude/settings.json", false));
+}
+
 #[test]
 fn shell_checker_and_manager_agree_on_every_fixture() {
     let mut cases: Vec<PathBuf> = fs::read_dir(fixtures().join("cases"))
@@ -192,8 +253,10 @@ fn shell_checker_and_manager_agree_on_every_fixture() {
         .map(|e| e.unwrap().path())
         .collect();
     cases.sort();
-    assert!(cases.len() >= 60, "fixtures went missing");
+    // 114 fixtures today; the margin allows a few removals but not a lost group.
+    assert!(cases.len() >= 110, "fixtures went missing");
     let mut failures = Vec::new();
+    let mut compared = 0;
     for case in &cases {
         let name = case.file_name().unwrap().to_string_lossy().into_owned();
         let want = fs::read_to_string(case.join("expect"))
@@ -206,20 +269,36 @@ fn shell_checker_and_manager_agree_on_every_fixture() {
         let (home, stage) = materialize(case, tmp.path());
         let _restore = RestoreMode(home.join(".cache/dotfiles-manager"));
         let (m, s) = (run_manager(&home, &stage), run_script(&home, &stage));
+        let roots = [home.clone(), stage.clone()];
+        let nested_ok = fs::read_to_string(case.join("expect"))
+            .unwrap()
+            .lines()
+            .any(|l| l == "unsearchable-ancestor");
         let expected_exit = if want == "ok" { 0 } else { 3 };
+        let path_mismatch = want != "ok"
+            && match (m.location(&roots), s.location(&roots)) {
+                (Some(a), Some(b)) => {
+                    compared += 1;
+                    paths_differ(&a, &b, nested_ok)
+                }
+                _ => !WITHOUT_BOTH_PATHS.contains(&name.as_str()),
+            };
         if m.verdict() != want
             || s.verdict() != want
             || m.code != expected_exit
             || s.code != expected_exit
+            || path_mismatch
         {
             failures.push(format!(
-                "{name}: want {want}/{expected_exit}, manager {}/{} ({}), script {}/{} ({})",
+                "{name}: want {want}/{expected_exit}, manager {}/{} ({}), script {}/{} ({}), paths {:?} and {:?}",
                 m.verdict(),
                 m.code,
                 m.stderr.trim(),
                 s.verdict(),
                 s.code,
-                s.stderr.trim()
+                s.stderr.trim(),
+                m.location(&roots),
+                s.location(&roots)
             ));
         }
     }
@@ -230,6 +309,8 @@ fn shell_checker_and_manager_agree_on_every_fixture() {
         cases.len(),
         failures.join("\n")
     );
+    // 97 of 104 refusing fixtures compare two paths today; a lost extraction would show here.
+    assert!(compared >= 90, "only {compared} fixtures compared paths");
 }
 
 #[test]

@@ -5,8 +5,9 @@
 
 use super::{Operation, Plan};
 use crate::refusal::Refusal;
+use crate::state::Class;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// What kind of input changed, most specific first (the derived order is the report order).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -72,21 +73,23 @@ fn keyed(
 }
 
 /// The content token of a sensitive merge's fragments is a salted hash. It decides whether a plan
-/// is stale and is never shown: a difference in it reads as a content change.
+/// is stale and is never shown: a difference in it reads as a content change. One side can lack
+/// the token (a blocked merge has none), so a token on either side is masked.
 fn mask_content_tokens(diffs: &mut [Stale]) {
+    const TOKEN: &str = " content=[";
     for d in diffs
         .iter_mut()
         .filter(|d| d.subject.starts_with("fragments:"))
+        .filter(|d| d.was.contains(TOKEN) || d.now.contains(TOKEN))
     {
-        let head = |s: &str| s.split_once(" content=[").map(|(h, _)| h.to_string());
-        if let (Some(w), Some(n)) = (head(&d.was), head(&d.now)) {
-            if w == n {
-                d.was = format!("{w} (fragment content before)");
-                d.now = format!("{n} (fragment content changed)");
-            } else {
-                d.was = w;
-                d.now = n;
-            }
+        let head = |s: &str| s.split_once(TOKEN).map_or(s, |(h, _)| h).to_string();
+        let (w, n) = (head(&d.was), head(&d.now));
+        if w == n {
+            d.was = format!("{w} (fragment content before)");
+            d.now = format!("{n} (fragment content changed)");
+        } else {
+            d.was = w;
+            d.now = n;
         }
     }
 }
@@ -156,12 +159,25 @@ pub fn stale(old: &Plan, new: &Plan) -> Result<Vec<Stale>, Refusal> {
     // changes the input set even when no precondition names it. The text is the same
     // `node_state` string a precondition shows, so a path reads one way wherever it appears.
     // A change `node_state` does not show (an owner flag) is caught by the digest entry below.
+    // A sensitive claim shows no size either, as in its precondition (`node_state`).
     let obs = |p: &Plan| -> BTreeMap<String, String> {
+        // The claim of a sensitive operation, and the unhashed fragments it merges: those are
+        // observed by path only, so no operation names them (`followups`, `fragment_edges`).
+        let mut sensitive: BTreeSet<String> = BTreeSet::new();
+        for o in p.operations.iter().filter(|o| o.class == Class::Sensitive) {
+            sensitive.extend(o.path.clone());
+            if let Some(dir) = &o.fragment_dir {
+                sensitive.extend(o.fragments.iter().map(|f| format!("{dir}/{}", f.name)));
+            }
+        }
         let mut m: BTreeMap<String, String> = p
             .observations
             .seen
             .iter()
-            .map(|(k, v)| (format!("path:{k}"), super::node_state(v, false)))
+            .map(|(k, v)| {
+                let state = super::node_state(v, sensitive.contains(k));
+                (format!("path:{k}"), state)
+            })
             .collect();
         m.extend(p.observations.listings.iter().map(|(k, v)| {
             (

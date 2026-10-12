@@ -12,8 +12,7 @@ use crate::fsys::{
     Dir, Peek, Stamp, Sys, check_name, kind, mode_bits, publish_err, rename_new, sys_err,
     temp_name, unconfirmed,
 };
-use dfm_model::digest::sha256_hex;
-use dfm_model::plan::link_fingerprint;
+use dfm_model::plan::{file_fingerprint, link_fingerprint};
 use dfm_model::{Code, Refusal};
 use rustix::fs::{self as rfs, AtFlags, FileType, Mode, OFlags};
 use rustix::io::Errno;
@@ -251,7 +250,7 @@ impl Dir {
         if u64::try_from(buf.len()).unwrap_or(u64::MAX) > limit {
             return Ok(None);
         }
-        Ok(Some((sha256_hex(&buf), ident)))
+        Ok(Some((file_fingerprint(&buf), ident)))
     }
 
     /// Publishes `bytes` as the regular file `name` with `mode`: a same-directory staged file

@@ -1086,11 +1086,17 @@ mod synthetic {
     }
 
     fn observed() -> (dfm_model::resolve::Resolved, Observations) {
+        observed_with(|_| {})
+    }
+
+    /// Like `observed`, after `prep` has made real entries in the temporary HOME.
+    fn observed_with(prep: impl FnOnce(&Path)) -> (dfm_model::resolve::Resolved, Observations) {
         let mut set = SourceSet::new();
         load(&repo_root().join("examples"), "", &mut set);
         let resolved = resolve(&set, "profiles/personal-dev-01.toml", &builtin_catalog()).unwrap();
         let home = TempDir::new("synthetic-home");
         fs::set_permissions(home.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        prep(home.path());
         let sys = dfm_engine::Sys {
             uid: dfm_platform_macos::current_uid().unwrap(),
         };
@@ -1111,6 +1117,16 @@ mod synthetic {
         ledger: Vec<Owned>,
         reserved: BTreeMap<String, String>,
     ) -> Plan {
+        plan_full(resolved, obs, ledger, reserved, BTreeMap::new())
+    }
+
+    fn plan_full(
+        resolved: &dfm_model::resolve::Resolved,
+        obs: &Observations,
+        ledger: Vec<Owned>,
+        reserved: BTreeMap<String, String>,
+        merge: BTreeMap<String, dfm_model::plan::MergeFact>,
+    ) -> Plan {
         let cx = Context {
             binary: Binary {
                 version: "0".into(),
@@ -1127,7 +1143,7 @@ mod synthetic {
             ledger,
             reserved,
             unchecked: BTreeMap::new(),
-            merge: BTreeMap::new(),
+            merge,
         };
         build(resolved, &cx, obs).unwrap()
     }
@@ -1253,6 +1269,398 @@ mod synthetic {
         assert_eq!(op.action, dfm_model::plan::Action::None);
     }
 
+    fn dir(own: bool) -> Node {
+        Node::Dir { mode: 0o755, own }
+    }
+
+    fn file(own: bool, mode: u32) -> Node {
+        Node::File {
+            mode,
+            own,
+            size: 1,
+            sha256: Some("0".repeat(64)),
+        }
+    }
+
+    fn owned(resource: &str, path: &str, fingerprint: Option<String>) -> Owned {
+        Owned {
+            resource: resource.into(),
+            adapter: "x/v1".into(),
+            class: dfm_model::state::Class::Normal,
+            path: path.into(),
+            fingerprint,
+            coowned_entries: None,
+        }
+    }
+
+    /// The blocker of `resource` whose `field` is `field`, with its code and detail.
+    fn blocker_at<'a>(p: &'a Plan, resource: &str, field: &str) -> (Code, &'a str) {
+        let b = p
+            .blockers
+            .iter()
+            .find(|b| b.resource == resource && b.field.as_deref() == Some(field))
+            .unwrap_or_else(|| panic!("no {field} blocker for {resource}: {:?}", p.blockers));
+        (b.code, b.detail.as_str())
+    }
+
+    fn action_of(p: &Plan, id: &str) -> (dfm_model::plan::Action, Status) {
+        let o = p.operations.iter().find(|o| o.id == id).unwrap();
+        (o.action, o.status)
+    }
+
+    const GD: &str = ".config/external-overlays/git/base.inc";
+
+    /// Parents of the render `core.git-defaults` exist, so only its leaf decides.
+    fn with_git_defaults_parents(obs: &mut Observations) {
+        for d in [
+            ".config",
+            ".config/external-overlays",
+            ".config/external-overlays/git",
+        ] {
+            put(obs, d, dir(true), None);
+        }
+    }
+
+    #[test]
+    fn a_file_whose_bytes_spell_a_link_fingerprint_is_not_the_owned_link() {
+        let (r, obs) = observed();
+        let want = plan(&r, &obs)
+            .operations
+            .iter()
+            .find(|o| o.id == "core.ssh@.ssh/config")
+            .and_then(|o| o.link.clone())
+            .unwrap();
+        // A regular file whose content is `link\0<target>` hashes like the link would, without
+        // the file domain prefix.
+        let crafted = format!("link\0{want}");
+        let (r, obs) = observed_with(|home| {
+            fs::create_dir(home.join(".ssh")).unwrap();
+            fs::write(home.join(".ssh/config"), crafted.as_bytes()).unwrap();
+        });
+        let ledger = vec![owned(
+            "core.ssh",
+            ".ssh/config",
+            Some(dfm_model::plan::link_fingerprint(&want)),
+        )];
+        let p = plan_with(&r, &obs, ledger, BTreeMap::new());
+        assert_eq!(first(&p, "core.ssh"), Code::Conflict);
+        let op = p
+            .operations
+            .iter()
+            .find(|o| o.id == "core.ssh@.ssh/config")
+            .unwrap();
+        assert_eq!(
+            (op.action, op.ownership),
+            (Action::None, Ownership::Modified)
+        );
+        // The observed hash of the file is its file fingerprint, never the plain hash.
+        let Some(Node::File { sha256, .. }) = obs.seen.get(".ssh/config").map(|s| &s.node) else {
+            panic!("no file observed");
+        };
+        assert_eq!(
+            sha256.as_deref(),
+            Some(dfm_model::plan::file_fingerprint(crafted.as_bytes()).as_str())
+        );
+    }
+
+    #[test]
+    fn a_link_the_ledger_owns_is_not_updated_as_a_file_when_the_resource_became_a_render() {
+        let (r, mut obs) = observed();
+        with_git_defaults_parents(&mut obs);
+        let target = "/src/old";
+        let link = Node::Link {
+            target: target.into(),
+            to: dfm_model::plan::LinkTo::File,
+            own: true,
+        };
+        put(&mut obs, GD, link, None);
+        let ledger = vec![owned(
+            "core.git-defaults",
+            GD,
+            Some(dfm_model::plan::link_fingerprint(target)),
+        )];
+        let p = plan_with(&r, &obs, ledger, BTreeMap::new());
+        assert_eq!(first(&p, "core.git-defaults"), Code::Conflict);
+        assert!(p.blockers.iter().any(|b| {
+            b.detail
+                .contains("is a link where this resource now generates a file")
+        }));
+        assert_eq!(
+            action_of(&p, &format!("core.git-defaults@{GD}")),
+            (Action::None, Status::Blocked)
+        );
+        assert!(p.operations.iter().all(|o| o.action != Action::UpdateFile));
+    }
+
+    #[test]
+    fn a_file_the_ledger_owns_is_not_replaced_by_a_link_when_the_resource_became_a_link() {
+        let (r, mut obs) = observed();
+        put(&mut obs, ".ssh", dir(true), None);
+        // The ledger holds the fingerprint of this very file, so ownership reads Owned.
+        put(&mut obs, ".ssh/config", file(true, 0o600), None);
+        let ledger = vec![owned("core.ssh", ".ssh/config", Some("0".repeat(64)))];
+        let p = plan_with(&r, &obs, ledger, BTreeMap::new());
+        assert_eq!(first(&p, "core.ssh"), Code::Conflict);
+        assert!(p.blockers.iter().any(|b| {
+            b.detail
+                .contains("is a file where this resource now creates a link")
+        }));
+        assert_eq!(
+            action_of(&p, "core.ssh@.ssh/config"),
+            (Action::None, Status::Blocked)
+        );
+        assert!(p.operations.iter().all(|o| o.action != Action::ReplaceLink));
+    }
+
+    #[test]
+    fn an_owner_that_cannot_be_verified_blocks_a_link_replace_and_a_file_update() {
+        // No fingerprint is recorded for the entry, so ownership is unverifiable.
+        let (r, mut obs) = observed();
+        put(&mut obs, ".ssh", dir(true), None);
+        let other = Node::Link {
+            target: "/src/other".into(),
+            to: dfm_model::plan::LinkTo::File,
+            own: true,
+        };
+        put(&mut obs, ".ssh/config", other, None);
+        let p = plan_with(
+            &r,
+            &obs,
+            vec![owned("core.ssh", ".ssh/config", None)],
+            BTreeMap::new(),
+        );
+        assert_eq!(first(&p, "core.ssh"), Code::Conflict);
+        assert!(
+            p.blockers
+                .iter()
+                .any(|b| b.detail.ends_with("has an owner the manager cannot verify"))
+        );
+        assert_eq!(
+            action_of(&p, "core.ssh@.ssh/config"),
+            (Action::None, Status::Blocked)
+        );
+
+        let (r, mut obs) = observed();
+        with_git_defaults_parents(&mut obs);
+        put(&mut obs, GD, file(true, 0o600), None);
+        let p = plan_with(
+            &r,
+            &obs,
+            vec![owned("core.git-defaults", GD, None)],
+            BTreeMap::new(),
+        );
+        assert_eq!(first(&p, "core.git-defaults"), Code::Conflict);
+        assert!(
+            p.blockers
+                .iter()
+                .any(|b| b.detail.contains("its ownership cannot be verified"))
+        );
+        assert!(p.operations.iter().all(|o| o.action != Action::UpdateFile));
+    }
+
+    #[test]
+    fn two_ledger_entries_on_one_path_never_make_a_removal() {
+        // The ledger check refuses this shape, but the planner takes its ledger from the caller.
+        // The entry the planner looks up by path belongs to another resource, so the removal is
+        // refused as not owned and nothing is removed.
+        let (r, mut obs) = observed();
+        put(&mut obs, "old", dir(true), None);
+        put(&mut obs, "old/out", file(true, 0o600), None);
+        let ledger = vec![
+            owned("gone.a", "old/out", Some("1".repeat(64))),
+            owned("gone.b", "old/out", Some("1".repeat(64))),
+        ];
+        let p = plan_with(&r, &obs, ledger, BTreeMap::new());
+        let b = p
+            .blockers
+            .iter()
+            .find(|b| b.resource == "gone.b")
+            .expect("a blocker for the second entry");
+        assert_eq!(b.code, Code::Conflict);
+        assert_eq!(
+            b.detail,
+            "old/out is no longer selected but is not owned by this resource according to the ledger"
+        );
+        assert_eq!(
+            action_of(&p, "remove@gone.b@old/out"),
+            (Action::None, Status::Blocked)
+        );
+    }
+
+    #[test]
+    fn a_fragment_directory_that_is_unsafe_or_unreadable_blocks_only_its_consumer() {
+        const DIR: &str = ".codex/AGENTS.d";
+        let cases: [(&str, Node, Option<&str>, Code, &str); 4] = [
+            (
+                "an alias",
+                dir(true),
+                Some("agents.d"),
+                Code::TargetCollision,
+                ".codex/AGENTS.d differs from the existing entry `agents.d` only by case; the filesystem treats them as one",
+            ),
+            (
+                "a link",
+                Node::Link {
+                    target: "/elsewhere".into(),
+                    to: dfm_model::plan::LinkTo::Dir,
+                    own: true,
+                },
+                None,
+                Code::ParentUnsafe,
+                "parent .codex/AGENTS.d is a link to a directory, so a write would land outside the claim (-> /elsewhere)",
+            ),
+            (
+                "another user's directory",
+                dir(false),
+                None,
+                Code::PrivilegeUnsupported,
+                ".codex/AGENTS.d is owned by another user; a HOME adapter never escalates",
+            ),
+            (
+                "an unknown fact",
+                Node::Unknown {
+                    reason: "EIO".into(),
+                },
+                None,
+                Code::ObservationUnknown,
+                "",
+            ),
+        ];
+        for (what, node, alias, want, detail) in cases {
+            let (r, mut obs) = observed();
+            put(&mut obs, ".codex", dir(true), None);
+            put(&mut obs, DIR, node, alias);
+            let p = plan(&r, &obs);
+            let (code, got) = blocker_at(&p, "agents.codex-instructions", "/fragments_dir");
+            assert_eq!(code, want, "{what}: {got}");
+            if !detail.is_empty() {
+                assert_eq!(got, detail, "{what}");
+            }
+            // Other resources stay plannable.
+            assert!(
+                p.blockers
+                    .iter()
+                    .all(|b| b.resource == "agents.codex-instructions"),
+                "{what}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_foreign_fragment_owned_by_another_user_blocks_its_consumer() {
+        let (r, mut obs) = observed();
+        put(&mut obs, ".codex", dir(true), None);
+        put(&mut obs, ".codex/AGENTS.d", dir(true), None);
+        put(
+            &mut obs,
+            ".codex/AGENTS.d/10-a.md",
+            file(false, 0o644),
+            None,
+        );
+        obs.listings.insert(
+            ".codex/AGENTS.d".into(),
+            dfm_model::plan::Listing {
+                names: vec!["10-a.md".into()],
+                incomplete: None,
+            },
+        );
+        let p = plan(&r, &obs);
+        let (code, detail) = blocker_at(&p, "agents.codex-instructions", "/fragments_dir");
+        assert_eq!(code, Code::PrivilegeUnsupported);
+        assert_eq!(
+            detail,
+            "fragment .codex/AGENTS.d/10-a.md is owned by another user"
+        );
+    }
+
+    #[test]
+    fn a_merge_target_that_is_not_a_plain_user_file_is_refused() {
+        use dfm_model::plan::{MergeFact, MergeVerdict};
+        const T: &str = ".claude/settings.json";
+        let link = Node::Link {
+            target: "/elsewhere".into(),
+            to: dfm_model::plan::LinkTo::File,
+            own: true,
+        };
+        let fact = |verdict| MergeFact {
+            managed_sha256: "0".repeat(64),
+            sets: vec![],
+            handlers: 0,
+            fragments: vec![],
+            verdict,
+        };
+        let cases: Vec<(&str, Node, Option<MergeFact>, Code, &str)> = vec![
+            (
+                "a directory",
+                dir(true),
+                None,
+                Code::Conflict,
+                ".claude/settings.json is a directory where a settings file is needed",
+            ),
+            (
+                "a link",
+                link,
+                None,
+                Code::Conflict,
+                ".claude/settings.json is a link or special file; the manager merges only a regular file",
+            ),
+            (
+                "another user's file",
+                file(false, 0o600),
+                None,
+                Code::PrivilegeUnsupported,
+                ".claude/settings.json is owned by another user; a HOME adapter never escalates",
+            ),
+            (
+                "an unknown fact",
+                Node::Unknown {
+                    reason: "EIO".into(),
+                },
+                None,
+                Code::ObservationUnknown,
+                "",
+            ),
+            (
+                "a file with no merge fact",
+                file(true, 0o600),
+                None,
+                Code::Conflict,
+                ".claude/settings.json exists and its merge state was not read",
+            ),
+            (
+                "a blocked verdict",
+                file(true, 0o600),
+                Some(fact(MergeVerdict::Blocked {
+                    code: Code::Conflict,
+                    detail: "the file is not a JSON object".into(),
+                    correction: "fix it".into(),
+                })),
+                Code::Conflict,
+                "the file is not a JSON object",
+            ),
+        ];
+        for (what, node, fact, want, detail) in cases {
+            let (r, mut obs) = observed();
+            put(&mut obs, ".claude", dir(true), None);
+            put(&mut obs, T, node, None);
+            let merge: BTreeMap<_, _> = fact
+                .into_iter()
+                .map(|f| ("agents.claude-settings".to_string(), f))
+                .collect();
+            let p = plan_full(&r, &obs, vec![], BTreeMap::new(), merge);
+            let (code, got) = blocker_at(&p, "agents.claude-settings", "target");
+            assert_eq!(code, want, "{what}: {got}");
+            if !detail.is_empty() {
+                assert_eq!(got, detail, "{what}");
+            }
+            assert_eq!(
+                action_of(&p, &format!("agents.claude-settings@{T}")),
+                (Action::None, Status::Blocked),
+                "{what}"
+            );
+        }
+    }
+
     #[test]
     fn an_incomplete_listing_says_why() {
         use dfm_model::plan::{Incomplete, Listing};
@@ -1329,6 +1737,49 @@ mod synthetic {
             .collect();
         assert_eq!(ssh.len(), 1, "{ssh:?}");
         assert!(stale(&old, &old).unwrap().is_empty());
+    }
+
+    #[test]
+    fn the_observation_diff_hides_the_size_of_an_unhashed_fragment_of_a_sensitive_merge() {
+        use dfm_model::plan::{Fragment, stale};
+        let (r, obs) = observed();
+        let mut old = plan(&r, &obs);
+        let op = &mut old.operations[0];
+        op.class = dfm_model::state::Class::Sensitive;
+        op.fragment_dir = Some(".claude/frag".into());
+        op.fragments = vec![Fragment {
+            name: "x.json".into(),
+            origin: "foreign".into(),
+            sha256: None,
+        }];
+        let sized = |size| Node::File {
+            mode: 0o600,
+            own: true,
+            size,
+            sha256: None,
+        };
+        let mut new = old.clone();
+        put(
+            &mut old.observations,
+            ".claude/frag/x.json",
+            sized(120),
+            None,
+        );
+        put(
+            &mut new.observations,
+            ".claude/frag/x.json",
+            sized(131),
+            None,
+        );
+        // Only the hidden size changed: no observation line prints it, and the digest entry
+        // still reports that the plan differs.
+        let diff = stale(&old, &new).unwrap();
+        assert!(
+            diff.iter()
+                .all(|s| !s.was.contains("size:") && !s.now.contains("size:")),
+            "{diff:?}"
+        );
+        assert!(diff.iter().any(|s| s.subject == "digest"), "{diff:?}");
     }
 
     #[test]
@@ -1688,6 +2139,111 @@ fn a_leaf_alias_is_a_collision_even_when_the_ledger_owns_the_entry() {
         ".ssh/config",
         ".ssh/config differs from the existing entry `CONFIG` only by case; the filesystem treats them as one",
     );
+}
+
+#[test]
+fn two_claims_whose_missing_parents_differ_only_by_case_are_a_collision() {
+    // `.aa` and `.AA` are missing, so no listing can show the alias. On a case-insensitive
+    // volume the two mkdir operations would name one directory.
+    let e = Env::personal();
+    retarget(
+        &e,
+        "target = \".ssh/config\"",
+        "target = \".AA/ssh-config\"",
+    );
+    retarget(&e, ".config/git/config", ".aa/git-config");
+    let before = fingerprint(e.home.path());
+    let s = expect_blocked(
+        &e,
+        "E_TARGET_COLLISION",
+        "core.ssh",
+        ".AA/ssh-config",
+        "the missing parent .AA differs from the directory `.aa` another claim creates only by case; the filesystem treats them as one",
+    );
+    assert!(!s.plan.operations.iter().any(|o| o.id == "mkdir@.AA"));
+    assert_eq!(fingerprint(e.home.path()), before);
+}
+
+#[test]
+fn an_unsafe_merge_target_or_fragment_directory_is_refused_and_changes_nothing() {
+    // A directory and a link where the merge file goes.
+    let e = Env::personal();
+    e.mkdirs(".claude/settings.json");
+    let before = fingerprint(e.home.path());
+    expect_blocked(
+        &e,
+        "E_CONFLICT",
+        "agents.claude-settings",
+        ".claude/settings.json",
+        ".claude/settings.json is a directory where a settings file is needed",
+    );
+    assert_eq!(fingerprint(e.home.path()), before);
+
+    let e = Env::personal();
+    e.mkdirs(".claude");
+    symlink("/somewhere/else", e.h(".claude/settings.json")).unwrap();
+    let before = fingerprint(e.home.path());
+    expect_blocked(
+        &e,
+        "E_CONFLICT",
+        "agents.claude-settings",
+        ".claude/settings.json",
+        ".claude/settings.json is a link or special file; the manager merges only a regular file",
+    );
+    assert_eq!(fingerprint(e.home.path()), before);
+
+    // A merge file that is not JSON: the caller's verdict is Blocked.
+    let e = Env::personal();
+    e.mkdirs(".claude");
+    fs::write(e.h(".claude/settings.json"), "not json").unwrap();
+    fs::set_permissions(
+        e.h(".claude/settings.json"),
+        fs::Permissions::from_mode(0o600),
+    )
+    .unwrap();
+    let before = fingerprint(e.home.path());
+    let s = blocked(&e);
+    let b = s
+        .plan
+        .blockers
+        .iter()
+        .find(|b| b.resource == "agents.claude-settings")
+        .expect("the merge is blocked");
+    assert_eq!(
+        (b.code.as_str(), b.path.as_deref()),
+        ("E_CONFLICT", Some(".claude/settings.json"))
+    );
+    assert!(
+        b.detail
+            .starts_with("the live settings file is not valid JSON ("),
+        "{}",
+        b.detail
+    );
+    // The detail names the parse position and never echoes the content.
+    assert!(!b.detail.contains("not json"), "{}", b.detail);
+    assert!(
+        s.plan
+            .operations
+            .iter()
+            .all(|o| !(o.resource == "agents.claude-settings" && o.action == Action::UpdateFile))
+    );
+    assert_eq!(fingerprint(e.home.path()), before);
+
+    // A fragment directory that is a link.
+    let e = Env::personal();
+    e.mkdirs(".codex");
+    let outside = TempDir::new("plan-fragments");
+    symlink(outside.path(), e.h(".codex/AGENTS.d")).unwrap();
+    let before = fingerprint(e.home.path());
+    let s = blocked(&e);
+    let b = s
+        .plan
+        .blockers
+        .iter()
+        .find(|b| b.field.as_deref() == Some("/fragments_dir"))
+        .expect("the fragment directory is refused");
+    assert_eq!(b.code.as_str(), "E_PARENT_UNSAFE");
+    assert_eq!(fingerprint(e.home.path()), before);
 }
 
 // ---- the saved plan: JSON stays one document, the comparison is complete -----------------
