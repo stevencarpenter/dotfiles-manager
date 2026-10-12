@@ -9,14 +9,19 @@ Board ticket: DFM-46. The agent runs nothing live without written approval that 
 1. Place the pinned toolchain. `~/.local/share/dotfiles-manager` must be a real directory that you own and that group and others cannot write. Then run:
 
    ```sh
-   mkdir -p ~/.local/share/dotfiles-manager/toolchains
-   if [ -e ~/.local/share/dotfiles-manager/toolchains/1.98.1 ]; then
-     echo 'stopped: remove toolchains/1.98.1 first, because cp would nest the copy'
-   else
+   (
+     set -e
+     mkdir -p ~/.local/share/dotfiles-manager/toolchains
+     if [ -e ~/.local/share/dotfiles-manager/toolchains/1.98.1 ]; then
+       echo 'stopped: remove toolchains/1.98.1 first, because cp would nest the copy' >&2
+       exit 1
+     fi
      cp -Rp ~/.rustup/toolchains/1.98.1-aarch64-apple-darwin ~/.local/share/dotfiles-manager/toolchains/1.98.1
      sh scripts/bootstrap.sh toolchain-digest --dir ~/.local/share/dotfiles-manager/toolchains/1.98.1
-   fi
+   )
    ```
+
+   The block runs in a subshell. If it prints `stopped` or any error, or the status is not 0, do not go on to step 3.
 
    The copy must be a real directory, not a symlink. The printed digest must equal `toolchain_tree_sha256` in `dotfiles-manager.lock` before `install`. The digest is device-specific. The M3 may need its own lock later.
 2. Choose the commit to install. The integration branch is `going-to-sleep`. Use the full 40-character object id.

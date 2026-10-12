@@ -85,7 +85,7 @@ The checker and `toolchain-digest` fail closed: an unreadable entry, a failed ha
 
 - The early pin hint is looser than the staged check: it applies no 1 MiB limit and no ASCII filter. Both refuse `[[manager]]` (an array of tables). The staged check is authoritative and runs before any build.
 - An install that ends without finishing (a refusal or failure after the build directory exists, SIGINT or SIGTERM) removes the build directory and the build homes, each only if the directory check for that tree passes (tested per tree), and prints what it left. SIGINT and SIGTERM end the script with 130 and 143 after the cleanup (tested with a stand-in `cargo`). SIGKILL and any signal the script does not trap leave them in place, together with the staging leftovers (hidden `.dotfiles-manager-link.XXXXXX` directories in `~/.local/bin`, `dotfiles-manager.new.XXXXXX` files in a version directory). The next `install` and `uninstall` remove the build directory and homes; neither cleans the staging leftovers.
-- A symlinked `~/.cache`, `~/.local`, `~/.local/bin` or `~/.local/share` is refused by policy, even when the link is the owner's own arrangement.
+- A symlinked `~/.cache`, `~/.local`, `~/.local/bin`, `~/.local/share` or `toolchains` (also `versions`, `cargo-home`, `rustup-home` and `build-home`) below the data directory is refused by policy, even when the link is the owner's own arrangement.
 
 ## Known gaps and deviations kept for later
 
