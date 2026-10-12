@@ -279,11 +279,22 @@ fn handler(id: &str, v: &Toml) -> Result<Handler, Refusal> {
     })
 }
 
+/// A key the ledger cannot spell as a JSON pointer: empty, or with a control character.
+fn unspellable(k: &str) -> bool {
+    k.is_empty() || k.chars().any(char::is_control)
+}
+
+/// Whether any key at any object depth is [`unspellable`].
+fn has_unspellable_key(m: &Map<String, Json>) -> bool {
+    m.iter()
+        .any(|(k, v)| unspellable(k) || matches!(v, Json::Object(o) if has_unspellable_key(o)))
+}
+
 /// A managed key the ledger cannot spell as a JSON pointer would drop out of the leaf-by-leaf
 /// conflict check, so an edit of it would go unseen. Such a key is refused at the source.
 fn managed_keys_usable(m: &Map<String, Json>, at: &str) -> Result<(), Refusal> {
     for (k, v) in m {
-        if k.is_empty() || k.chars().any(char::is_control) {
+        if unspellable(k) {
             return Err(invalid(format!(
                 "{at} holds a key that is empty or has a control character; use a plain key name"
             )));
@@ -420,6 +431,11 @@ impl Desired {
             if obj.contains_key("hooks") {
                 return Err(conflict(format!(
                     "fragment {name} sets hooks. Fix: declare hooks as handlers in the module so the manager can retire only its own entries"
+                )));
+            }
+            if has_unspellable_key(&obj) {
+                return Err(conflict(format!(
+                    "fragment {name} holds a key that is empty or has a control character, so an edit of it could not be detected. {fix}"
                 )));
             }
             overlay(&mut out.effective, &obj, "", &out.append.clone());
@@ -605,7 +621,7 @@ fn leaves_of(view: &Map<String, Json>) -> BTreeMap<String, Vec<u8>> {
     fn walk(m: &Map<String, Json>, at: &str, out: &mut BTreeMap<String, Vec<u8>>) {
         for (k, v) in m {
             // A key the ledger cannot spell as a JSON pointer is not compared leaf by leaf.
-            if k.is_empty() || k.chars().any(char::is_control) {
+            if unspellable(k) {
                 continue;
             }
             let here = format!("{at}/{}", escape_token(k));
@@ -1774,6 +1790,12 @@ defaultMode = "auto"
             (b"{not json planted-token".as_slice(), "not valid JSON"),
             (b"[1]".as_slice(), "not an object"),
             (br#"{"hooks":{}}"#.as_slice(), "sets hooks"),
+            (br#"{"":1}"#.as_slice(), "empty or has a control"),
+            (br#"{"a\nb":1}"#.as_slice(), "empty or has a control"),
+            (
+                br#"{"env":{"x\u0001":1}}"#.as_slice(),
+                "empty or has a control",
+            ),
         ] {
             let e = d.with_fragments([("02-bad.json", bytes)]).unwrap_err();
             assert_eq!(e.code, Code::Conflict);

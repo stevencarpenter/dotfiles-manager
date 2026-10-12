@@ -193,7 +193,7 @@ A primitive that committed its effect but could not confirm durability returns `
 - The first operation that fails or blocks stops all further mutation. This is the default and there is no `--continue`.
 - An operation that depends on it (through `after`, transitively through results) is `blocked`. Every other operation that has not started is `not_started`. `current` and `not_in_scope` operations are reported as they are.
 - Completed operations stay `updated`. There is no rollback.
-- The report lists one line per operation and the counts `updated`, `current`, `failed`, `blocked`, `unknown`, `not_started`, `not_in_scope`. These are the contract status names, the same as in the receipt.
+- The report lists one line per operation and the counts `updated`, `current`, `failed`, `blocked`, `unknown`, `not_started`, `not_in_scope`, `held`, `pending`, `blocked_pending`, so the counts add up to the number of operations. These are the contract status names, the same as in the receipt.
 - The first problem keeps its own code (`E_IO_FAILED`, `E_PLAN_STALE`, `E_CONFLICT`, `E_IO_UNCONFIRMED`, and so on). There is no umbrella code. When the store wrote anything, the refusal is marked `after_mutation`, which is what turns a block code into exit 1.
 
 | Result | Exit |
