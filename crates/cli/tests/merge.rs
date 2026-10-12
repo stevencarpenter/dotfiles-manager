@@ -2290,6 +2290,58 @@ fn bind_with_a_missing_salt_and_an_unreadable_ledger_refuses_and_creates_no_salt
     assert!(!salt.exists());
 }
 
+#[test]
+fn bind_with_an_unusable_salt_refuses_instead_of_reporting_already_bound() {
+    use std::os::unix::fs::symlink;
+    type Damage = fn(&Path);
+    let damages: [(&str, Damage); 3] = [
+        ("mode", |p| {
+            fs::set_permissions(p, fs::Permissions::from_mode(0o644)).unwrap()
+        }),
+        ("size", |p| fs::write(p, [7u8; 16]).unwrap()),
+        ("link", |p| {
+            let real = p.with_file_name("salt-real");
+            fs::rename(p, &real).unwrap();
+            symlink(&real, p).unwrap();
+        }),
+    ];
+    for (what, damage) in damages {
+        let fx = Fx::base();
+        assert_eq!(code(&fx.apply()), 0);
+        let salt = fx.state().join("salt");
+        damage(&salt);
+        let before = (
+            fs::symlink_metadata(&salt).unwrap().file_type(),
+            fs::read(&salt).unwrap(),
+        );
+        let p = fx.root.join("profiles/t-01.toml");
+        let o = fx.run(&[
+            "bind",
+            "--profile",
+            p.to_str().unwrap(),
+            "--machine-id",
+            "m5-test",
+        ]);
+        assert_eq!(code(&o), 3, "{what}: {}\n{}", stderr(&o), text(&o.stdout));
+        assert!(
+            stderr(&o).contains("E_STORAGE_INVALID"),
+            "{what}: {}",
+            stderr(&o)
+        );
+        assert!(
+            stderr(&o).contains("state/salt is unusable"),
+            "{what}: {}",
+            stderr(&o)
+        );
+        assert!(!text(&o.stdout).contains("already bound"), "{what}");
+        let after = (
+            fs::symlink_metadata(&salt).unwrap().file_type(),
+            fs::read(&salt).unwrap(),
+        );
+        assert_eq!(before, after, "{what}: the salt is unchanged");
+    }
+}
+
 // ---- review fixes (DFM-57) ---------------------------------------------------------------
 
 #[test]

@@ -422,11 +422,21 @@ fn a_home_with_whitespace_is_refused() {
 fn a_profile_must_be_a_toml_file_with_a_schema_key() {
     let home = TempDir::new("profile-content");
     let dir = TempDir::new("profile-files");
-    for (name, content) in [
-        ("empty.toml", ""),
-        ("not-toml.toml", "this is [not toml"),
-        ("no-schema.toml", "id = \"x\"\n"),
-        ("nested-schema.toml", "[t]\nschema = 1\n"),
+    for (name, content, want) in [
+        ("empty.toml", "", "E_PROFILE_INVALID"),
+        ("not-toml.toml", "this is [not toml", "E_PROFILE_INVALID"),
+        ("no-schema.toml", "id = \"x\"\n", "E_PROFILE_INVALID"),
+        (
+            "nested-schema.toml",
+            "[t]\nschema = 1\n",
+            "E_PROFILE_INVALID",
+        ),
+        ("schema-2.toml", "schema = 2\n", "E_SCHEMA_UNSUPPORTED"),
+        (
+            "schema-string.toml",
+            "schema = \"1\"\n",
+            "E_PROFILE_INVALID",
+        ),
     ] {
         let f = dir.path().join(name);
         fs::write(&f, content).unwrap();
@@ -442,7 +452,7 @@ fn a_profile_must_be_a_toml_file_with_a_schema_key() {
         );
         assert_eq!(o.status.code(), Some(3), "{name}");
         assert!(
-            text(&o.stderr).contains("E_PROFILE_INVALID"),
+            text(&o.stderr).contains(want),
             "{name}: {}",
             text(&o.stderr)
         );

@@ -459,7 +459,7 @@ fn receipt_row(l: &StateLoaded, bad: usize, rows: &mut Vec<Row>) {
 // ---- lock ---------------------------------------------------------------------------------
 
 /// The lock file note. Doctor never takes the lock, so a note only says who held it last. The
-/// file must be a regular file owned by the user, or the row is a WARN.
+/// file must be a regular file owned by the user with one hard link and no group or other mode bits, or the row is a WARN.
 fn lock_row(ctx: &Ctx, uid: u32, rows: &mut Vec<Row>) {
     let path = ctx.platform.lock_path();
     let shown = path.display().to_string();
@@ -470,7 +470,7 @@ fn lock_row(ctx: &Ctx, uid: u32, rows: &mut Vec<Row>) {
             Level::Warn,
             &shown,
             why,
-            "Check that the lock file is a regular file owned by you.",
+            "Check that the lock file is a regular file owned by you, with mode 0600 and one hard link.",
         )
     };
     let opened = std::fs::OpenOptions::new()
@@ -489,7 +489,20 @@ fn lock_row(ctx: &Ctx, uid: u32, rows: &mut Vec<Row>) {
         }
     };
     match f.metadata() {
-        Ok(m) if m.is_file() && m.uid() == uid => {}
+        Ok(m) if m.is_file() && m.uid() == uid => {
+            // The writer lock refuses both states. A mode with only owner bits is tightened.
+            let mode = m.mode() & 0o7777;
+            if m.nlink() != 1 {
+                rows.push(warn("the lock file has more than one hard link"));
+                return;
+            }
+            if mode & !0o600 != 0 {
+                rows.push(warn(&format!(
+                    "the lock file mode is {mode:o}, expected 0600"
+                )));
+                return;
+            }
+        }
         Ok(_) => {
             rows.push(warn("the lock file is not a regular file owned by you"));
             return;

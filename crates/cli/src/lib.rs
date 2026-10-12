@@ -591,7 +591,7 @@ fn bind(ctx: &Ctx, profile: String, machine_id: String) -> Result<String, Refusa
                 return Err(state_owner_refusal(&doc.binding));
             }
             // A store made before the salt was created at init gets it now (docs/state.md).
-            missing_salt = matches!(s.salt(), Ok(None));
+            missing_salt = s.salt()?.is_none();
             // A lost salt cannot be recreated when the ledger records salted hashes: they would
             // no longer match. That needs the recovery text, not a new salt.
             if missing_salt && ledger_has_coowned(&s)? {
@@ -645,7 +645,7 @@ fn bind(ctx: &Ctx, profile: String, machine_id: String) -> Result<String, Refusa
         store.init(&stamp)?;
     }
     let after = |r: Refusal| stamped(&store, r);
-    if matches!(store.salt(), Ok(None)) {
+    if store.salt().map_err(after)?.is_none() {
         if ledger_has_coowned(&store).map_err(after)? {
             return Err(after(Refusal::new(
                 Code::StateInvalid,
