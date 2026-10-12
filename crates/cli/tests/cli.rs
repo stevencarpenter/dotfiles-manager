@@ -250,6 +250,11 @@ fn invalid_profile_and_machine_id_are_refused_before_mutation() {
         ],
     );
     assert_eq!(o.status.code(), Some(3));
+    assert!(
+        text(&o.stderr).contains("E_PROFILE_INVALID"),
+        "{}",
+        text(&o.stderr)
+    );
     let o = run(
         home.path(),
         &[

@@ -866,6 +866,11 @@ fn redirected_manager_paths_are_refused_with_zero_writes_to_the_destination() {
         ],
     );
     assert_eq!(o.status.code(), Some(3), "{}", text(&o.stderr));
+    assert!(
+        text(&o.stderr).contains("E_STORAGE_INVALID"),
+        "{}",
+        text(&o.stderr)
+    );
     assert!(names_below(foreign.path()).is_empty());
 }
 
@@ -902,6 +907,11 @@ fn conflicting_path_types_and_loose_permissions_are_refused_not_repaired() {
         assert!(text(&o.stdout).contains("E_STORAGE_INVALID"), "{label}");
         let o = record(h.path(), "core.x", "x", "x");
         assert_eq!(o.status.code(), Some(3), "{label}");
+        assert!(
+            text(&o.stderr).contains("E_STORAGE_INVALID"),
+            "{}",
+            text(&o.stderr)
+        );
         assert!(
             !h.path().join("x").exists(),
             "{label}: refused before the effect"
@@ -1201,6 +1211,11 @@ fn a_refusal_after_the_effect_exits_1_not_3() {
     // A refusal before the intent is still a gate: exit 3.
     let o = record(h.path(), "core.dup", "first", "x");
     assert_eq!(o.status.code(), Some(3));
+    assert!(
+        text(&o.stderr).contains("E_STATE_INVALID"),
+        "{}",
+        text(&o.stderr)
+    );
 }
 
 #[test]
@@ -1254,6 +1269,11 @@ fn a_hand_written_ledger_cannot_grant_authority_over_foreign_paths() {
         assert!(!report.contains("owned outputs"), "{target}: {report}");
         let o = record(h.path(), "core.z", "z", "z");
         assert_eq!(o.status.code(), Some(3), "{target}");
+        assert!(
+            text(&o.stderr).contains("E_STATE_INVALID"),
+            "{}",
+            text(&o.stderr)
+        );
         assert!(!h.path().join("z").exists());
     }
 }
@@ -1351,6 +1371,11 @@ fn a_torn_journal_is_reported_and_reconcile_leaves_it_alone() {
     );
     let r = run(h.path(), &["__reconcile"]);
     assert_eq!(r.status.code(), Some(3), "{}", text(&r.stderr));
+    assert!(
+        text(&r.stderr).contains("E_STATE_INVALID"),
+        "{}",
+        text(&r.stderr)
+    );
     assert_eq!(fs::read(&j).unwrap(), bytes);
 }
 
@@ -1386,6 +1411,11 @@ fn recover_repairs_one_torn_final_journal_line_and_refuses_a_torn_middle_line() 
     fs::write(&j, &bad).unwrap();
     let r = run(h.path(), &["state", "recover"]);
     assert_eq!(r.status.code(), Some(3), "{}", text(&r.stderr));
+    assert!(
+        text(&r.stderr).contains("E_STATE_INVALID"),
+        "{}",
+        text(&r.stderr)
+    );
     assert_eq!(fs::read(&j).unwrap(), bad);
 }
 
@@ -1463,6 +1493,11 @@ fn a_binding_without_its_state_is_state_loss_and_is_never_recreated() {
         // Writers refuse too, before any effect.
         let o = record(h.path(), "core.y", "y", "y");
         assert_eq!(o.status.code(), Some(3), "{lose}");
+        assert!(
+            text(&o.stderr).contains("E_STATE_INVALID"),
+            "{}",
+            text(&o.stderr)
+        );
         assert!(!h.path().join("y").exists());
         assert_eq!(snapshot(h.path()), before, "{lose}");
     }

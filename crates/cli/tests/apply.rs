@@ -5,7 +5,7 @@
 
 mod common;
 
-use common::TempDir;
+use common::{TempDir, skip};
 use dfm_model::plan::Saved;
 use sha2::{Digest, Sha256};
 use std::fs;
@@ -719,6 +719,11 @@ fn deselecting_a_module_removes_only_its_owned_links_and_nothing_else() {
     // One allowance is not enough either.
     let o = fx.apply_with(&d, &["--allow-disruptive", &removals[0]]);
     assert_eq!(code(&o), 3, "{}", stderr(&o));
+    assert!(
+        stderr(&o).contains("E_DISRUPTIVE_UNAPPROVED"),
+        "{}",
+        stderr(&o)
+    );
     assert_eq!(fingerprint(fx.home.path()), before);
     // With every removal approved, exactly the two owned links go.
     let mut args = Vec::new();
@@ -1093,7 +1098,7 @@ fn a_failure_before_any_write_prints_failed_and_exits_1() {
 #[test]
 fn an_unwritable_directory_is_a_failure_and_never_data_loss() {
     if running_as_root() {
-        println!("SKIPPED: runs as root");
+        skip("runs as root");
         return;
     }
     let fx = Fx::new();
@@ -1122,7 +1127,7 @@ fn an_unwritable_directory_is_a_failure_and_never_data_loss() {
 #[test]
 fn an_unwritable_directory_known_at_plan_time_blocks_before_any_write() {
     if running_as_root() {
-        println!("SKIPPED: runs as root");
+        skip("runs as root");
         return;
     }
     let fx = Fx::new();
@@ -1495,6 +1500,7 @@ fn a_self_looping_parent_of_one_owned_output_blocks_only_that_entry() {
     assert!(stderr(&o).contains("E_PARENT_UNSAFE"), "{}", stderr(&o));
     let o = fx.apply(&[]);
     assert_eq!(code(&o), 3, "{}", stderr(&o));
+    assert!(stderr(&o).contains("E_PARENT_UNSAFE"), "{}", stderr(&o));
     assert_eq!(fingerprint(fx.home.path()), before, "nothing was written");
 }
 
@@ -2223,6 +2229,7 @@ fn doctor_and_status_show_an_open_unknown_as_an_error_with_its_journal_id() {
     for _ in 0..2 {
         let o = fx.apply(&[]);
         assert_eq!(code(&o), 3, "{}\n{}", stderr(&o), text(&o.stdout));
+        assert!(stderr(&o).contains("E_CONFLICT"), "{}", stderr(&o));
         assert_eq!(fx.unknown_entry().0, id);
     }
 }
