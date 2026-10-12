@@ -317,13 +317,14 @@ pub fn run(ctx: &Ctx, args: &Args, out: &mut dyn Write) -> Result<(), Refusal> {
     if let Some(first) = diffs.first() {
         return Err(Refusal::new(
             Code::PlanStale,
-            visible(&format!(
+            // Raw: the command escapes the error line once, when it prints it.
+            format!(
                 "{} changed: {} was {} now {}. Fix: review the new plan and approve it again; a plan whose inputs changed cannot be applied",
                 first.what.as_str(),
                 first.subject,
                 first.was,
                 first.now
-            )),
+            ),
         ));
     }
     if old.is_some() && !args.json {

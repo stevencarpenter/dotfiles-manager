@@ -284,6 +284,10 @@ pub(crate) fn home_path_fault(path: &str) -> Option<&'static str> {
     if path.chars().any(super::error::is_invisible) {
         return Some("invisible or bidirectional-control character");
     }
+    // Printed text escapes a backslash, so an id that holds one could not be pasted back as a flag.
+    if path.contains('\\') {
+        return Some("backslash");
+    }
     for c in path.split('/') {
         match c {
             "" => return Some("empty component"),
@@ -389,6 +393,7 @@ mod tests {
             "a\u{202e}b",
             "a\u{200b}b",
             "\u{feff}a",
+            "a\\b",
         ] {
             assert!(home_path_fault(bad).is_some(), "{bad:?}");
         }

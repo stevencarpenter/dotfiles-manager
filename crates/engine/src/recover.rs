@@ -376,12 +376,10 @@ pub(crate) fn forget_output(
     store.write_ledger(&ledger)
 }
 
-/// A journal id quoted so a user can paste it into a shell.
+/// A journal id quoted so a user can paste it into a shell. The id is raw: the command escapes
+/// the refusal that holds it once, when it prints it.
 pub(crate) fn quoted(id: &str) -> String {
-    format!(
-        "'{}'",
-        dfm_model::display::visible(id).replace('\'', "'\\''")
-    )
+    format!("'{}'", id.replace('\'', "'\\''"))
 }
 
 /// The text that tells an operator how to clear an open entry. `multi` is true for an entry
@@ -457,4 +455,14 @@ pub fn resolve(
 pub(crate) fn related(a: &str, b: &str) -> bool {
     let (a, b) = (fold(a), fold(b));
     a == b || a.starts_with(&format!("{b}/")) || b.starts_with(&format!("{a}/"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::quoted;
+
+    #[test]
+    fn a_quoted_id_is_raw_so_the_command_escapes_it_once() {
+        assert_eq!(quoted(r"p\1'x"), r"'p\1'\''x'");
+    }
 }

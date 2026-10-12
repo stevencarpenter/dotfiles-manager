@@ -3657,3 +3657,106 @@ fn a_merge_that_crashed_with_only_its_intent_blocks_its_path_until_resolved_fail
         rep.stopped
     );
 }
+
+#[test]
+fn a_flag_and_a_ledger_refusal_carry_raw_text_that_the_command_escapes_once() {
+    // The command escapes the whole refusal once when it prints it. A flag or a path escaped
+    // here as well would print each backslash as four characters, and the pasted id would differ.
+    assert_eq!(
+        dfm_engine::flag(dfm_engine::Approval::Disruptive, r"remove@core.x@a\b'c"),
+        r"--allow-disruptive 'remove@core.x@a\b'\''c'"
+    );
+    let s = setup();
+    let mut l = s.store.read_ledger().unwrap();
+    l.record(LedgerResource {
+        resource: "core.x".into(),
+        adapter: "git-config/v1".into(),
+        class: Class::Normal,
+        op_id: "seed-1".into(),
+        owned_outputs: vec![OwnedOutput {
+            path: r"/elsewhere/a\b".into(),
+            mode: 0o600,
+            fingerprint: Some(sha256_hex(b"x")),
+            coowned: None,
+        }],
+    })
+    .unwrap();
+    let e = owned_outputs(&l, &s.h.0).unwrap_err();
+    assert_eq!(e.code, Code::StateInvalid);
+    assert!(
+        e.detail.contains(r"/elsewhere/a\b is outside HOME"),
+        "{}",
+        e.detail
+    );
+}
+
+#[test]
+fn a_removal_of_a_file_with_a_backslash_names_its_real_id_in_the_flag() {
+    let s = setup();
+    fs::write(s.h.0.join(r"a\b"), "x").unwrap();
+    own(&s, r"a\b", "x");
+    let o = op(
+        &s.h,
+        &s.store,
+        r"remove@core.x@a\b",
+        1,
+        Action::Remove,
+        r"a\b",
+    );
+    let e = refused(&s, &plan(vec![o]), &NoGenerator, &none());
+    assert_eq!(e.code, Code::DisruptiveUnapproved);
+    assert!(
+        e.detail.contains(r"--allow-disruptive 'remove@core.x@a\b'"),
+        "{}",
+        e.detail
+    );
+    assert!(s.h.0.join(r"a\b").exists());
+}
+
+#[test]
+fn an_effect_failure_that_cannot_be_journaled_keeps_its_path_unescaped_in_the_refusal() {
+    // The removal fails after its intent, and then the journal rejects the failure note. The
+    // refusal carries the raw detail; the command escapes it once when it prints it.
+    if Home::new().0.metadata().unwrap().uid() == 0 {
+        eprintln!("SKIPPED: runs as root, which can write a read-only journal");
+        return;
+    }
+    let s = setup();
+    fs::write(s.h.0.join(r"a\b"), "mine\n").unwrap();
+    own(&s, r"a\b", "mine\n");
+    let o = op(
+        &s.h,
+        &s.store,
+        r"remove@core.x@a\b",
+        1,
+        Action::Remove,
+        r"a\b",
+    );
+    let home = s.h.0.clone();
+    let journal = home.join(".local/state/dotfiles-manager/state/journal.jsonl");
+    let allow = BTreeSet::from([r"remove@core.x@a\b".to_string()]);
+    let rep = parked(
+        &s,
+        &plan(vec![o]),
+        &NoGenerator,
+        &allow,
+        "apply-before-unlink",
+        move || {
+            fs::write(home.join("swap"), "mine\n").unwrap();
+            fs::rename(home.join("swap"), home.join(r"a\b")).unwrap();
+            fs::set_permissions(&journal, fs::Permissions::from_mode(0o400)).unwrap();
+        },
+    );
+    let stopped = rep.stopped.expect("the run stopped");
+    assert!(
+        stopped.detail.contains("could not be journaled"),
+        "{}",
+        stopped.detail
+    );
+    assert!(
+        stopped.detail.contains(r"a\b was replaced"),
+        "{}",
+        stopped.detail
+    );
+    assert!(!stopped.detail.contains(r"a\\b"), "{}", stopped.detail);
+}

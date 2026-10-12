@@ -807,6 +807,25 @@ fn a_source_edit_after_planning_invalidates_the_plan() {
 }
 
 #[test]
+fn a_stale_refusal_is_escaped_once_where_it_is_printed() {
+    // A new fragment name holds a backslash and shows in the stale values. The stale line and the
+    // error line each print it once escaped (two backslashes), never four.
+    let e = Env::personal();
+    e.mkdirs(".codex/AGENTS.d");
+    fs::write(e.h(".codex/AGENTS.d/10-a.md"), "a").unwrap();
+    let (f, _) = save(&e);
+    fs::write(e.h(".codex/AGENTS.d/20-b\\c.md"), "b").unwrap();
+    let o = against(&e, &f);
+    assert_eq!(code(&o), 3, "{}{}", text(&o.stdout), text(&o.stderr));
+    let (out, err) = (text(&o.stdout), text(&o.stderr));
+    assert!(err.starts_with("error: E_PLAN_STALE "), "{err}");
+    for all in [&out, &err] {
+        assert!(all.contains("20-b\\\\c.md"), "{all}");
+        assert!(!all.contains("b\\\\\\"), "{all}");
+    }
+}
+
+#[test]
 fn a_new_foreign_fragment_or_a_removed_one_changes_the_input_set() {
     let e = Env::personal();
     e.mkdirs(".codex/AGENTS.d");
