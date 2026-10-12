@@ -584,9 +584,11 @@ git_clean() { /usr/bin/env -i PATH="$SYSPATH" HOME=/var/empty LANG=C GIT_CONFIG_
 clean_build() {
   left=
   if why=$( (check_cache_tree) 2>&1 ); then rm_build || left=$build; else left="$build ($why)"; fi
-  if why=$( (check_data_tree) 2>&1 ); then
-    rm -rf "$DATA/cargo-home" "$DATA/rustup-home" "$DATA/build-home" || left="$left; the build homes in $DATA"
-  else left="$left; the build homes in $DATA ($why)"; fi
+  for _h in cargo-home rustup-home build-home; do
+    if why=$( (check_private_path "$DATA_REL/$_h"; check_owned_dir "$DATA_REL"; check_owned_dir "$DATA_REL/$_h") 2>&1 ); then
+      rm -rf "${DATA:?}/$_h" || left="$left; $DATA/$_h"
+    else left="$left; $DATA/$_h ($why)"; fi
+  done
   left=${left#; }
 }
 # Armed once install first changes the build directories; a run that did not finish removes them.
