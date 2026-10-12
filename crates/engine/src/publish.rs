@@ -205,23 +205,14 @@ impl Dir {
             // macOS answers `unlink` of a directory with EPERM, as does an immutable flag (uchg)
             // or a sticky directory. Look at the entry to tell them apart.
             Err(e @ (Errno::ISDIR | Errno::PERM)) => {
-                let dir = e == Errno::ISDIR
-                    || rfs::statat(&self.fd, name, AtFlags::SYMLINK_NOFOLLOW)
-                        .is_ok_and(|st| kind(&st) == FileType::Directory);
-                Err(if dir {
-                    conflict(format!(
-                        "{} is a directory; the manager never removes a directory",
-                        self.at(name).display()
-                    ))
-                } else {
-                    sys_err(
-                        &format!(
-                            "remove {} (an immutable flag such as uchg, or a sticky directory owned by another user, forbids it; the entry is kept)",
-                            self.at(name).display()
-                        ),
-                        e,
-                    )
-                })
+                let found = rfs::statat(&self.fd, name, AtFlags::SYMLINK_NOFOLLOW)
+                    .ok()
+                    .map(|st| kind(&st));
+                Err(unlink_refusal(
+                    &self.at(name).display().to_string(),
+                    e,
+                    found,
+                ))
             }
             Err(e) => Err(sys_err(&format!("remove {}", self.at(name).display()), e)),
         }
@@ -329,6 +320,46 @@ impl Dir {
             Ok(st) => Ok(Some(mode_bits(&st))),
             Err(Errno::NOENT) => Ok(None),
             Err(e) => Err(sys_err("stat entry", e)),
+        }
+    }
+}
+
+/// The refusal for an `unlinkat` that answered `ISDIR` or `PERM`. `found` is what a stat of the
+/// entry says. A non-directory with `PERM` is an immutable flag (uchg) or a sticky directory.
+fn unlink_refusal(shown: &str, e: Errno, found: Option<FileType>) -> Refusal {
+    if e == Errno::ISDIR || found == Some(FileType::Directory) {
+        conflict(format!(
+            "{shown} is a directory; the manager never removes a directory"
+        ))
+    } else {
+        sys_err(
+            &format!(
+                "remove {shown} (an immutable flag such as uchg, or a sticky directory owned by another user, forbids it; the entry is kept)"
+            ),
+            e,
+        )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_eperm_on_a_non_directory_is_a_permission_failure_not_a_directory() {
+        for found in [Some(FileType::RegularFile), Some(FileType::Symlink), None] {
+            let r = unlink_refusal("/h/a", Errno::PERM, found);
+            assert_eq!(r.code, Code::IoFailed, "{found:?}");
+            assert!(r.detail.contains("immutable flag"), "{}", r.detail);
+            assert!(!r.detail.contains("is a directory"), "{}", r.detail);
+        }
+        for (e, found) in [
+            (Errno::PERM, Some(FileType::Directory)),
+            (Errno::ISDIR, None),
+        ] {
+            let r = unlink_refusal("/h/d", e, found);
+            assert_eq!(r.code, Code::Conflict, "{e:?}");
+            assert!(r.detail.contains("is a directory"), "{}", r.detail);
         }
     }
 }

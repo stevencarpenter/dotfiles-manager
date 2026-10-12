@@ -1136,12 +1136,7 @@ fn a_failure_while_settling_earlier_work_still_returns_a_report() {
         .append_journal(&intent("create-link", &h.0.join("z").to_string_lossy()))
         .unwrap();
     drop(first);
-    let store = Store::open_write(
-        sys(&h),
-        &h.layout(),
-        Fail::at("journal-before-write", Inject::Error),
-    )
-    .unwrap();
+    let store = open_write_after_drop(&h, Fail::at("journal-before-write", Inject::Error));
     let s = Setup { h, store };
     let o = op(&s.h, &s.store, "x@a", 1, Action::CreateFile, "a");
     let rep = go(&s, &plan(vec![o]), &gen_for("x@a", "x"), &none());
@@ -1185,7 +1180,7 @@ fn rearmed(prepare: impl FnOnce(&Setup), fail: Fail) -> Setup {
     prepare(&s);
     let Setup { h, store } = s;
     drop(store);
-    let store = Store::open_write(sys(&h), &h.layout(), fail).unwrap();
+    let store = open_write_after_drop(&h, fail);
     Setup { h, store }
 }
 
@@ -2808,10 +2803,37 @@ fn a_leaf_with_no_room_for_the_staged_name_is_refused_before_any_write() {
     l.link = Some("/src/x".into());
     let g = gates(&plan(vec![l]), &NoGenerator);
     assert_eq!(g.refusal.unwrap().code, Code::LimitExceeded);
-    // A link that is created is not staged, so its long name is not this gate's concern.
+    // A link that is created is not staged, so 217 bytes still fit. A name over the limit of a
+    // name is refused for every action, also one that stages nothing, before any write.
     let mut c = op(&s.h, &s.store, "x@create", 3, Action::CreateLink, &long);
     c.link = Some("/src/x".into());
     assert!(gates(&plan(vec![c]), &NoGenerator).refusal.is_none());
+    let over = "c".repeat(256);
+    for action in [
+        Action::CreateLink,
+        Action::CreateDir,
+        Action::Remove,
+        Action::Adopt,
+    ] {
+        let s = setup();
+        let link =
+            matches!(action, Action::CreateLink | Action::Adopt).then(|| "/src/x".to_string());
+        let mut o = op(&s.h, &s.store, "x@over", 4, action, "short");
+        o.path = Some(over.clone());
+        o.link = link.clone();
+        let e = assert_refused_untouched(&s, &plan(vec![o]), &NoGenerator, Code::LimitExceeded);
+        assert!(e.detail.contains("256 bytes"), "{action:?}: {e}");
+        // The limit itself is a name the file system takes.
+        let mut ok = op(&s.h, &s.store, "x@max", 5, action, "short");
+        ok.path = Some("d".repeat(255));
+        ok.link = link;
+        let g = gates(&plan(vec![ok]), &NoGenerator);
+        assert_ne!(
+            g.refusal.map(|r| r.code),
+            Some(Code::LimitExceeded),
+            "{action:?}"
+        );
+    }
 }
 
 #[test]
@@ -2928,6 +2950,48 @@ fn a_signal_during_a_merge_decision_ends_it_not_started_with_no_intent_entry() {
     assert_eq!(rep.stopped.unwrap().exit().code(), 143);
     assert_eq!(tree(&s), before);
     assert!(s.store.read_journal().unwrap().is_empty());
+}
+
+#[test]
+fn a_signal_during_a_merge_decision_does_not_create_the_missing_salt() {
+    // A store from an older build has no salt. A merge creates it only after its last stop
+    // check, so an operation that ends as not started leaves the state store as it was.
+    let s = setup();
+    let salt = s.h.0.join(".local/state/dotfiles-manager/state/salt");
+    fs::remove_file(&salt).unwrap();
+    let p = merge_plan(&s);
+    let before = tree(&s);
+    let rep = go(&s, &p, &StoppingMerge, &none());
+    assert_eq!(rep.operations[0].status, Status::NotStarted);
+    assert_eq!(rep.stopped.unwrap().exit().code(), 143);
+    assert!(!salt.exists(), "the salt was created before the stop check");
+    assert_eq!(tree(&s), before);
+    assert!(s.store.read_journal().unwrap().is_empty());
+}
+
+#[test]
+fn a_signal_before_a_stale_entry_is_pruned_keeps_the_entry_and_writes_no_intent() {
+    // The simulated stop belongs to its thread, so the run gets its own.
+    std::thread::spawn(|| {
+        let s = setup();
+        own(&s, "gone", "x");
+        let p = absent_candidate(&s);
+        let before = tree(&s);
+        let rep = go_with(
+            &s,
+            &p,
+            &NoGenerator,
+            &none(),
+            &Fail::at("prune-before-intent", Inject::Stop),
+        );
+        assert_eq!(rep.operations[0].status, Status::Current);
+        assert_eq!(rep.stopped.unwrap().exit().code(), 143);
+        assert_eq!(tree(&s), before, "no intent, no ledger change");
+        assert!(s.store.read_journal().unwrap().is_empty());
+        assert_eq!(s.store.read_ledger().unwrap().resources.len(), 1);
+    })
+    .join()
+    .unwrap();
 }
 
 // ---- a publish whose read-back differs (T1) ------------------------------------------------
@@ -3125,7 +3189,88 @@ fn an_outcome_that_cannot_be_settled_after_a_good_effect_blocks_the_path_in_the_
             assert_eq!(again.operations[0].status, Status::Blocked, "{what}");
             assert_eq!(again.stopped.unwrap().code, Code::PlanStale, "{what}");
             assert_eq!(tree(&s), before, "{what}");
+            // A plan made from the machine as it is now still does not take the path over:
+            // nothing records an owner for it, so the create is a conflict.
+            let fresh = new_output(&s, link);
+            let again = go(&s, &fresh, &gens(), &none());
+            assert_eq!(again.operations[0].status, Status::Blocked, "{what}");
+            assert_eq!(again.stopped.unwrap().code, Code::Conflict, "{what}");
+            assert_eq!(tree(&s), before, "{what}");
+            assert_eq!(s.store.read_ledger().unwrap().resources.len() == 1, owned);
         }
+    }
+}
+
+#[test]
+fn a_merge_whose_outcome_cannot_be_settled_is_reported_and_the_next_run_records_it() {
+    // (tag, store failpoint, run failpoint, status, ledger entry written)
+    type Case = (
+        &'static str,
+        Option<&'static str>,
+        Option<&'static str>,
+        Status,
+        bool,
+    );
+    let cases: [Case; 3] = [
+        (
+            "done hook",
+            None,
+            Some("apply-after-done"),
+            Status::Failed,
+            false,
+        ),
+        (
+            "ledger write",
+            Some("ledger-before-write"),
+            None,
+            Status::Failed,
+            false,
+        ),
+        (
+            "ledger rename",
+            Some("ledger-after-rename"),
+            None,
+            Status::Unknown,
+            true,
+        ),
+    ];
+    for (tag, store_fp, run_fp, status, owned) in cases {
+        let s = match store_fp {
+            Some(fp) => rearmed(|_| {}, Fail::at(fp, Inject::Error)),
+            None => setup(),
+        };
+        let p = merge_plan(&s);
+        let fail = run_fp.map_or_else(Fail::none, |fp| Fail::at(fp, Inject::Error));
+        let rep = go_with(&s, &p, &Unchanged, &none(), &fail);
+        assert_eq!(rep.operations[0].status, status, "{tag}: {:?}", rep.stopped);
+        let e = rep.stopped.clone().unwrap();
+        assert_eq!(e.exit(), dfm_model::Exit::Failed, "{tag}: {e}");
+        // The file is in place, and the journal holds the intent and the done entry.
+        assert!(s.h.0.join("settings.json").exists(), "{tag}");
+        assert_eq!(phases(&s), [Phase::Intent, Phase::Done], "{tag}");
+        assert_eq!(
+            !s.store.read_ledger().unwrap().resources.is_empty(),
+            owned,
+            "{tag}"
+        );
+        // A merge is decided from the bytes read under the lock, so a run that has no record of
+        // the file merges again and records it, and does not rewrite the file. A plan that
+        // expects no record, made before the ledger got one, is stale.
+        let s = reopened(s);
+        let live = fs::read(s.h.0.join("settings.json")).unwrap();
+        let again = go(&s, &merge_plan(&s), &Unchanged, &none());
+        let want = if owned {
+            Status::Blocked
+        } else {
+            Status::Updated
+        };
+        assert_eq!(again.operations[0].status, want, "{tag}");
+        assert_eq!(
+            fs::read(s.h.0.join("settings.json")).unwrap(),
+            live,
+            "{tag}"
+        );
+        assert_eq!(s.store.read_ledger().unwrap().resources.len(), 1, "{tag}");
     }
 }
 
@@ -3446,7 +3591,7 @@ fn a_merge_that_crashed_with_only_its_intent_blocks_its_path_until_resolved_fail
     if let Some(dir) = std::env::var_os(CHILD) {
         // The child: writes the intent, then ends at once with no terminal entry, as a crash does.
         let h = Home(dir.into());
-        let store = Store::open_write(sys(&h), &h.layout(), Fail::none()).unwrap();
+        let store = open(&h);
         let s = Setup { h, store };
         let p = merge_plan(&s);
         go_with(

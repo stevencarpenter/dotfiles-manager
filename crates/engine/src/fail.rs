@@ -24,6 +24,9 @@ pub enum Action {
     /// point first creates `<file>.reached` (extension replaced), then the test creates the file.
     /// So the test waits on a file and never guesses a delay.
     Wait(PathBuf),
+    /// Make this thread's next stop check see SIGTERM (`signal::simulate`), then go on. It lets a
+    /// test deliver the stop request at one exact point of the run.
+    Stop,
 }
 
 /// At most one armed point. [`Fail::none`] is inert.
@@ -77,6 +80,10 @@ impl Fail {
                     format!("injected failure at {point}"),
                 )),
                 Action::Abort => std::process::abort(),
+                Action::Stop => {
+                    crate::signal::simulate(true);
+                    Ok(())
+                }
                 Action::Wait(file) => {
                     // Tell the test the point was reached, so it never has to guess a delay.
                     let _ = std::fs::write(file.with_extension("reached"), "");

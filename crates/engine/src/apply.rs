@@ -313,14 +313,24 @@ fn first_refusal(plan: &Plan, generator: &dyn Generator) -> Result<(), Refusal> 
         let comps = components(path)?;
         // A file or link is staged under a longer hidden name in its own directory. A leaf that
         // leaves no room for that name would fail with `ENAMETOOLONG` after the intent entry.
+        // Every other action still needs a name the file system accepts.
         let leaf = comps.last().map_or(0, |l| l.len());
-        if stages(op.action) && leaf + crate::fsys::TEMP_NAME_EXTRA > crate::fsys::NAME_MAX {
+        let extra = if stages(op.action) {
+            crate::fsys::TEMP_NAME_EXTRA
+        } else {
+            0
+        };
+        if leaf + extra > crate::fsys::NAME_MAX {
+            let staged = if extra > 0 {
+                format!("the staged name needs up to {extra} more and ")
+            } else {
+                String::new()
+            };
             return Err(Refusal::new(
                 Code::LimitExceeded,
                 format!(
-                    "{}: the file name is {leaf} bytes; the staged name needs up to {} more and a name holds {}. Nothing was changed",
+                    "{}: the file name is {leaf} bytes; {staged}a name holds {}. Nothing was changed",
                     op.id,
-                    crate::fsys::TEMP_NAME_EXTRA,
                     crate::fsys::NAME_MAX
                 ),
             ));
@@ -567,12 +577,12 @@ struct MergeRead {
     mode: Option<u32>,
 }
 
-/// What a merge will write and the salted hash to record (`None` for a retire).
+/// What a merge will write. The salted hashes to record are made at the settle step, after the
+/// last stop check, because a store from an older build gets its salt created there.
 struct MergeDecision {
     merged: Merged,
-    /// Salted hash of each managed leaf, to record (empty for a retire).
-    leaves: std::collections::BTreeMap<String, String>,
-    new_hash: Option<String>,
+    /// The salt as it was when the decision was made (`None`: not created yet, or a retire).
+    salt: Option<Vec<u8>>,
 }
 
 /// Facts read again immediately before the effect.
@@ -1103,23 +1113,7 @@ impl Exec<'_, '_> {
                 Ended::Blocked(e)
             })?;
         }
-        let (new_hash, leaves) = if retire {
-            (None, Default::default())
-        } else {
-            let salt = match salt {
-                Some(s) => s,
-                None => self.run.store.salt_or_create().map_err(failed)?,
-            };
-            (
-                Some(salted(&salt, &merged.rendered_view)),
-                leaf_hashes(&salt, &merged),
-            )
-        };
-        Ok(MergeDecision {
-            merged,
-            leaves,
-            new_hash,
-        })
+        Ok(MergeDecision { merged, salt })
     }
 
     /// Step 3, settle: intent, publish, read-back, outcome, ledger.
@@ -1137,13 +1131,23 @@ impl Exec<'_, '_> {
         read: &MergeRead,
         decided: MergeDecision,
     ) -> Result<Ended, Ended> {
-        let MergeDecision {
-            merged,
-            leaves,
-            new_hash,
-        } = decided;
+        let MergeDecision { merged, salt } = decided;
         let retire = op.action == Action::Retire;
         self.stop_requested()?;
+        // The salt of a store from an older build is created only now, so an operation that
+        // ends as not started leaves the state store as it was.
+        let (new_hash, leaves) = if retire {
+            (None, Default::default())
+        } else {
+            let salt = match salt {
+                Some(s) => s,
+                None => self.run.store.salt_or_create().map_err(failed)?,
+            };
+            (
+                Some(salted(&salt, &merged.rendered_view)),
+                leaf_hashes(&salt, &merged),
+            )
+        };
         let id = self.attempt_id(op);
         let recovery = Recovery {
             outputs: vec![RecoveryOutput {
@@ -1524,6 +1528,13 @@ impl Exec<'_, '_> {
             Ok(true) if self.path_unknown(&abs).is_none() && self.absent_now(rel) => {}
             Ok(_) => return Ended::Current,
             Err(e) => return failed(e),
+        }
+        if let Err(e) = self.run.fail.hit("prune-before-intent") {
+            return failed(e);
+        }
+        // A stop request keeps the entry: pruning is only housekeeping, so no intent is written.
+        if crate::signal::requested().is_some() {
+            return Ended::Current;
         }
         let id = self.attempt_id(op);
         let recovery = Recovery {
