@@ -86,7 +86,7 @@ An output row joins three facts: the ledger entry (who owns it), the live entry 
 | Sensitive output: a ledger entry of the sensitive class (compared with case folded), a path a selected sensitive resource claims, or a sensitive plan operation | N/A `D_NA_SENSITIVE`. Doctor's own inspection reads and hashes no content, whoever owns the path. A planner blocker for the path is shown instead, because it needs no content. For the `claude-settings/v1` merge output (DFM-21) the plan it reuses reads the live file in memory to compare the managed fields by salted hash (docs/adapters.md). So a healthy merge output is N/A, a lost or unusable salt is the plan's `E_STATE_INVALID` or `E_STORAGE_INVALID` blocker, `state check` reports the salt file itself (docs/state.md), and a foreign edit of a managed field, a malformed file or a file open to group or others is `ERROR` with the plan's `E_CONFLICT` and fix text. Doctor prints no content, no hash and no value for it. |
 | Operation that needs generated content | N/A `D_NA_GENERATED`: doctor does not compare generated content. Apply checks it against the planned output hash (docs/adapters.md). |
 
-An owned output is compared by fingerprint: SHA-256 of the file content, or of the link target text for a link (`link_fingerprint`). The comparison reads the file (a read, never a write).
+An owned output is compared by fingerprint: `file_fingerprint` of the file content (SHA-256 of `file\0` and the bytes), or `link_fingerprint` of the target text for a link. The comparison reads the file (a read, never a write).
 
 ## Codes
 

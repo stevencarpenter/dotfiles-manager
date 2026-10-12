@@ -5,7 +5,6 @@ mod common;
 
 use common::*;
 use dfm_engine::{Dir, observe};
-use dfm_model::digest::sha256_hex;
 use dfm_model::plan::{LinkTo, MAX_HASHED_BYTES, Node, Request};
 use std::fs;
 use std::os::unix::fs::{PermissionsExt, symlink};
@@ -76,7 +75,10 @@ fn files_are_hashed_only_on_request_and_within_the_bound() {
     let o = seen(&h, &[req("f", true, false), req("big", true, false)]);
     match &o.seen["f"].node {
         Node::File { sha256, size, .. } => {
-            assert_eq!(sha256.as_deref(), Some(sha256_hex(b"content").as_str()));
+            assert_eq!(
+                sha256.as_deref(),
+                Some(dfm_model::plan::file_fingerprint(b"content").as_str())
+            );
             assert_eq!(*size, 7);
         }
         n => panic!("{n:?}"),

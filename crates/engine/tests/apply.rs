@@ -13,8 +13,8 @@ use dfm_model::digest::{EntryKind, TreeEntry, sha256_hex, tree_digest};
 use dfm_model::merge::Merged;
 use dfm_model::plan::{
     Action, Binary, Blocker, Fragment, Input, Observations, Operation, Ownership, Plan,
-    Precondition, Request, Source, Status as PlanStatus, ledger_state, link_fingerprint,
-    node_state,
+    Precondition, Request, Source, Status as PlanStatus, file_fingerprint, ledger_state,
+    link_fingerprint, node_state,
 };
 use dfm_model::state::{Class, JournalEntry, LedgerResource, OwnedOutput, Phase, Status};
 use dfm_model::{Code, Refusal};
@@ -249,7 +249,7 @@ fn own_fp(s: &Setup, rel: &str, fingerprint: &str) {
 }
 
 fn own(s: &Setup, rel: &str, content: &str) {
-    own_fp(s, rel, &sha256_hex(content.as_bytes()));
+    own_fp(s, rel, &file_fingerprint(content.as_bytes()));
 }
 
 /// Waits (at most 20 s) until the parked run reports that it reached its failpoint. Otherwise it
@@ -334,7 +334,7 @@ fn a_generated_file_is_staged_in_its_directory_published_with_its_mode_and_owned
     let l = s.store.read_ledger().unwrap();
     assert_eq!(
         l.resources[0].owned_outputs[0].fingerprint.as_deref(),
-        Some(sha256_hex(b"a=1\n").as_str())
+        Some(file_fingerprint(b"a=1\n").as_str())
     );
     // Publication is recorded; the reload of its consumer is a separate state.
     assert_eq!(r.operations[0].reload.as_deref(), Some("not_attempted"));
@@ -377,7 +377,7 @@ fn an_owned_file_is_updated_and_its_fingerprint_follows() {
     let l = s.store.read_ledger().unwrap();
     assert_eq!(
         l.resources[0].owned_outputs[0].fingerprint.as_deref(),
-        Some(sha256_hex(b"new\n").as_str())
+        Some(file_fingerprint(b"new\n").as_str())
     );
     assert!(leftovers(&s.h.0).is_empty());
 }
@@ -452,7 +452,7 @@ fn an_owned_file_edited_after_the_last_check_is_not_replaced_by_the_update() {
         s.store.read_ledger().unwrap().resources[0].owned_outputs[0]
             .fingerprint
             .as_deref(),
-        Some(sha256_hex(b"old\n").as_str()),
+        Some(file_fingerprint(b"old\n").as_str()),
         "the ledger still describes what the manager wrote"
     );
 }
@@ -1487,7 +1487,7 @@ fn asm(s: &Setup, tag: &str, body: &str, frags: &[(&str, &[u8])]) -> Asm {
         fragments.push(Fragment {
             name: (*n).into(),
             origin: "foreign".into(),
-            sha256: Some(sha256_hex(b)),
+            sha256: Some(file_fingerprint(b)),
         });
         want.push(b.to_vec());
     }
@@ -1675,7 +1675,7 @@ fn a_generation_failure_keeps_the_last_good_output_and_blocks_dependents() {
     let l = s.store.read_ledger().unwrap();
     assert_eq!(
         l.resources[0].owned_outputs[0].fingerprint.as_deref(),
-        Some(sha256_hex(b"good\n").as_str())
+        Some(file_fingerprint(b"good\n").as_str())
     );
 }
 
@@ -1916,7 +1916,7 @@ fn an_unknown_file_update_settles_done_with_the_new_fingerprint_and_mode() {
     later_run(&s);
     assert_eq!(last_of(&s, &jid(1)).phase, Phase::Done);
     let abs = s.h.0.join("f").to_str().unwrap().to_string();
-    assert!(owned_paths(&s).contains(&(abs, Some(sha256_hex(b"new\n")))));
+    assert!(owned_paths(&s).contains(&(abs, Some(file_fingerprint(b"new\n")))));
 }
 
 #[test]

@@ -22,8 +22,8 @@ use dfm_model::digest::sha256_hex;
 use dfm_model::fold;
 use dfm_model::merge::{Merged, check_foreign, leaf_hashes, salted};
 use dfm_model::plan::{
-    Action, Operation, Owned, Plan, Request, Status as PlanStatus, ledger_state, link_fingerprint,
-    node_state,
+    Action, Operation, Owned, Plan, Request, Status as PlanStatus, file_fingerprint, ledger_state,
+    link_fingerprint, node_state,
 };
 use dfm_model::state::{
     Class, CoOwned, Fingerprint, JournalEntry, Ledger, LedgerResource, OperationRecord,
@@ -879,7 +879,7 @@ impl Exec<'_, '_> {
             None
         };
         let new_fp = match (&bytes, op.link.as_deref()) {
-            (Some(b), _) => Some(sha256_hex(b)),
+            (Some(b), _) => Some(file_fingerprint(b)),
             (None, Some(l)) if op.action.carries_link() => Some(link_fingerprint(l)),
             _ => None,
         };
@@ -1248,7 +1248,7 @@ impl Exec<'_, '_> {
         let (h, _) = parent
             .hash_file(name, MAX_FILE)?
             .ok_or_else(|| bad("the file cannot be read back"))?;
-        if h != sha256_hex(bytes) {
+        if h != file_fingerprint(bytes) {
             return Err(bad("the content read back differs"));
         }
         let want_mode = if changed {

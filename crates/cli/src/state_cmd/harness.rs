@@ -7,6 +7,7 @@ use super::super::{Ctx, bounded, flags, header, read_existing_binding, usage};
 use dfm_engine::{Fail, Probe, Store, now_unix};
 use dfm_model::binding::Binding;
 use dfm_model::digest::sha256_hex;
+use dfm_model::plan::file_fingerprint;
 use dfm_model::state::{
     Baseline, BaselinePath, BinaryId, Class, JournalEntry, LedgerResource, OperationRecord,
     OwnedOutput, Phase, ProfileRef, Receipt, Recovery, RecoveryOutput, RunResult, Stamp, Status,
@@ -96,7 +97,7 @@ pub fn record_op(ctx: &Ctx, args: &[String], out: &mut dyn Write) -> Result<(), 
             "the output already exists; it is never claimed",
         ));
     }
-    let digest = sha256_hex(content.as_bytes());
+    let digest = file_fingerprint(content.as_bytes());
     let now = || now_unix().map(rfc3339);
     let entry = |phase, recovery, reason| -> Result<JournalEntry, Refusal> {
         Ok(JournalEntry {
@@ -262,7 +263,7 @@ pub fn reconcile(ctx: &Ctx, out: &mut dyn Write) -> Result<(), Refusal> {
         }
         let proven = outs.iter().zip(&seen).all(|(o, s)| {
             matches!((&o.expected_sha256, s),
-                (Some(want), Some(b)) if &sha256_hex(b) == want)
+                (Some(want), Some(b)) if &file_fingerprint(b) == want)
         });
         if proven { Probe::Done } else { Probe::Unknown }
     };

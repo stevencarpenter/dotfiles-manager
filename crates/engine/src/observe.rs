@@ -8,10 +8,10 @@
 
 use crate::fsys::{Dir, Peek, PeekTo, Sys};
 use dfm_model::Refusal;
-use dfm_model::digest::sha256_hex;
 use dfm_model::fold;
 use dfm_model::plan::{
     Incomplete, LinkTo, Listing, MAX_HASHED_BYTES, MAX_LISTING, Node, Observations, Request, Seen,
+    file_fingerprint,
 };
 use std::collections::BTreeMap;
 use std::rc::Rc;
@@ -67,7 +67,7 @@ fn node(peek: Peek, dir: &Dir, name: &str, hash: bool) -> Node {
                 return unknown("file is larger than the 16 MiB hash bound");
             } else {
                 match dir.read_plain(name, MAX_HASHED_BYTES) {
-                    Ok(Some(b)) => Some(sha256_hex(&b)),
+                    Ok(Some(b)) => Some(file_fingerprint(&b)),
                     Ok(None) => return unknown("file changed while it was read"),
                     Err(_) => return unknown("file cannot be read; check its permissions"),
                 }

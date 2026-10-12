@@ -161,6 +161,11 @@ fn sha_hex(s: &str) -> String {
         .collect()
 }
 
+/// The ledger fingerprint of a regular file with this content.
+fn fp_hex(s: &str) -> String {
+    dfm_model::plan::file_fingerprint(s.as_bytes())
+}
+
 // ---- C01, C08: creation and layout --------------------------------------------------------------
 
 #[test]
@@ -226,7 +231,7 @@ fn an_operation_journals_intent_then_done_then_records_ownership_and_a_receipt()
     assert_eq!(journal_phases(h.path()), ["intent", "done"]);
     let intent = fs::read_to_string(state(h.path()).join("journal.jsonl")).unwrap();
     let first = intent.lines().next().unwrap();
-    assert!(first.contains("\"existed_before\":false") && first.contains(&sha_hex("[user]\n")));
+    assert!(first.contains("\"existed_before\":false") && first.contains(&fp_hex("[user]\n")));
 
     let ledger = json(&fs::read(state(h.path()).join("ledger.json")).unwrap());
     let owned = &ledger["resources"][0];
@@ -235,10 +240,7 @@ fn an_operation_journals_intent_then_done_then_records_ownership_and_a_receipt()
         owned["owned_outputs"][0]["path"],
         out_file(h.path(), "gitconfig")
     );
-    assert_eq!(
-        owned["owned_outputs"][0]["fingerprint"],
-        sha_hex("[user]\n")
-    );
+    assert_eq!(owned["owned_outputs"][0]["fingerprint"], fp_hex("[user]\n"));
     let receipts = names_below(&state(h.path()).join("receipts"));
     assert_eq!(receipts.len(), 1, "{receipts:?}");
     let rp = state(h.path()).join("receipts").join(&receipts[0]);
@@ -1040,7 +1042,8 @@ fn a_planted_secret_and_its_hash_never_reach_state_or_output() {
         ],
     );
     assert_eq!(o.status.code(), Some(0), "{}", text(&o.stderr));
-    let (digest, plain) = (sha_hex(secret), secret.to_string());
+    let (digest, plain) = (fp_hex(secret), secret.to_string());
+    let raw = sha_hex(secret);
     let mut seen = 0;
     let mut stack = vec![root(h.path()), h.path().join(".config")];
     while let Some(p) = stack.pop() {
@@ -1052,7 +1055,7 @@ fn a_planted_secret_and_its_hash_never_reach_state_or_output() {
             let body = fs::read_to_string(e.path()).unwrap_or_default();
             assert!(!body.contains(&plain), "{:?} holds the secret", e.path());
             assert!(
-                !body.contains(&digest),
+                !body.contains(&digest) && !body.contains(&raw),
                 "{:?} holds the secret's hash",
                 e.path()
             );
@@ -1067,7 +1070,10 @@ fn a_planted_secret_and_its_hash_never_reach_state_or_output() {
         &check(h.path()).stderr,
     ] {
         let s = text(stream);
-        assert!(!s.contains(&plain) && !s.contains(&digest), "{s}");
+        assert!(
+            !s.contains(&plain) && !s.contains(&digest) && !s.contains(&raw),
+            "{s}"
+        );
     }
     let ledger = fs::read_to_string(state(h.path()).join("ledger.json")).unwrap();
     assert!(

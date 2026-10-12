@@ -100,7 +100,7 @@ The receipt is written once, after the last operation (architecture section 9 it
 | `create_link` | `symlinkat` | `EEXIST` is a conflict. A leaf that appeared is never replaced. |
 | `replace_link` | `symlinkat` to a hidden name, then `renameat` | The fingerprint of the live link (`link_fingerprint` of its target text) must equal the ledger fingerprint, read just before the rename. |
 | `create_file` | staged file (`O_EXCL`, mode set before content, `fsync`), then `renameat` with `RENAME_EXCL` | The exclusive rename never replaces and leaves one name for the file, so no second link exists at any time. The directory is synced. |
-| `update_file` | staged file, then `renameat` | The live content hash must equal the ledger fingerprint, read just before the rename. |
+| `update_file` | staged file, then `renameat` | The live file fingerprint (`file_fingerprint`) must equal the ledger fingerprint, read just before the rename. |
 | `remove` | `unlinkat` without `AT_REMOVEDIR` | See Delete safety. |
 | `adopt` | none | No effect on HOME. See Adoption. |
 | merge `create_file`, `update_file`, `retire` | staged file (`O_EXCL`, 0600, `fsync`), then an exclusive `renameat` (create) or `renameat` guarded by file identity | See Merge. |
@@ -118,7 +118,7 @@ A removal needs all of the following at the moment of deletion:
 1. The plan lists it as `remove` (the planner proved the ledger fingerprint matches the live output and nothing selects the path).
 2. `--allow-disruptive <operation-id>` names it.
 3. The recorded preconditions still hold (the file or link is unchanged since planning).
-4. `Store::authorizes_delete` returns true now: the ledger is read again, the path is inside HOME and outside the manager's paths (by text and by filesystem identity), the resource is `normal` class, and the fingerprint recorded equals the live one. The live fingerprint comes from a descriptor opened with `O_NOFOLLOW` (file content hash) or from `readlinkat` (link target text hash).
+4. `Store::authorizes_delete` returns true now: the ledger is read again, the path is inside HOME and outside the manager's paths (by text and by filesystem identity), the resource is `normal` class, and the fingerprint recorded equals the live one. The live fingerprint comes from a descriptor opened with `O_NOFOLLOW` (`file_fingerprint` of the content) or from `readlinkat` (link target text hash).
 5. The entry is not a directory, and is not sensitive.
 6. The name still refers to the entry that was hashed (device and inode for a file, the same target for a link).
 
