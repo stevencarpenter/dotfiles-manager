@@ -116,17 +116,33 @@ fn unsupported_os_or_architecture_is_refused_before_mutation() {
 
 #[test]
 fn a_home_with_whitespace_is_refused_by_the_script() {
+    // The script runs under LC_ALL=C, so the Unicode cases need the byte-level rule that mirrors
+    // valid_home in the CLI (char::is_whitespace, char::is_control).
+    for name in [
+        "a b",
+        "a\u{a0}b",   // no-break space
+        "a\u{85}b",   // next line (C1 control)
+        "a\u{2028}b", // line separator
+        "a\u{3000}b", // ideographic space
+    ] {
+        let tmp = TempDir::new("script-space");
+        let home = tmp.path().join(name);
+        fs::create_dir(&home).unwrap();
+        let o = script_test_mode(&home, &["uninstall"], &[]);
+        assert_eq!(o.status.code(), Some(3), "{name:?}: {}", err(&o));
+        assert!(
+            err(&o).contains("E_HOME_MISMATCH") && err(&o).contains("whitespace"),
+            "{name:?}: {}",
+            err(&o)
+        );
+        assert!(entries_below(&home).is_empty());
+    }
+    // Control: a non-ASCII letter is not whitespace, so the home passes this check.
     let tmp = TempDir::new("script-space");
-    let home = tmp.path().join("a b");
+    let home = tmp.path().join("caf\u{e9}");
     fs::create_dir(&home).unwrap();
     let o = script_test_mode(&home, &["uninstall"], &[]);
-    assert_eq!(o.status.code(), Some(3));
-    assert!(
-        err(&o).contains("E_HOME_MISMATCH") && err(&o).contains("whitespace"),
-        "{}",
-        err(&o)
-    );
-    assert!(entries_below(&home).is_empty());
+    assert!(!err(&o).contains("whitespace"), "{}", err(&o));
 }
 
 #[test]

@@ -84,6 +84,14 @@ resolve_home() {
   fi
   [ -n "$pw_home" ] || refuse E_HOME_MISMATCH "cannot read the home directory from the password database"
   case $pw_home in *[[:space:][:cntrl:]]*) refuse E_HOME_MISMATCH "the home directory contains whitespace or control characters; this is not supported" ;; esac
+  # LC_ALL=C makes [:space:] ASCII only. The CLI (valid_home) also refuses Unicode White_Space and the C1
+  # controls, matched here on the UTF-8 bytes: U+0080..U+00A0, U+1680, U+2000..U+200A, U+2028, U+2029,
+  # U+202F, U+205F, U+3000.
+  hex=$(printf '%s' "$pw_home" | /usr/bin/od -An -tx1 -v | /usr/bin/tr -s ' \n' '  ')
+  case $hex in
+    *" c2 8"[0-9a-f]" "*|*" c2 9"[0-9a-f]" "*|*" c2 a0 "*|*" e1 9a 80 "*|*" e2 80 8"[0-9a]" "*|*" e2 80 a8 "*|*" e2 80 a9 "*|*" e2 80 af "*|*" e2 81 9f "*|*" e3 80 80 "*)
+      refuse E_HOME_MISMATCH "the home directory contains whitespace or control characters; this is not supported" ;;
+  esac
   [ "$pw_home" = "${HOME:-}" ] || refuse E_HOME_MISMATCH "password database home $pw_home differs from HOME"
   HOME_DIR=$pw_home
   DATA=$HOME_DIR/$DATA_REL
