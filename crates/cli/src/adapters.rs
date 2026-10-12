@@ -90,18 +90,38 @@ fn git_includes(text: &str) -> Vec<Include> {
         let cond = rest.trim().strip_prefix('"')?.strip_suffix('"')?;
         Some(Some(cond.to_string()))
     }
+    /// Splits `[name] tail` at the first `]` outside a quoted subsection, so a condition such as
+    /// `"gitdir:~/work[12]/"` keeps its bracket.
+    fn split_header(line: &str) -> Option<(&str, &str)> {
+        let (mut quoted, mut escaped) = (false, false);
+        for (i, c) in line.char_indices().skip(1) {
+            match c {
+                _ if escaped => escaped = false,
+                '\\' if quoted => escaped = true,
+                '"' => quoted = !quoted,
+                ']' if !quoted => return Some((&line[1..i], &line[i + 1..])),
+                _ => {}
+            }
+        }
+        None
+    }
     let mut current: Option<Option<String>> = None;
     let mut out = Vec::new();
     for line in text.lines().map(str::trim) {
         if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
             continue;
         }
-        let key_line = match line.strip_prefix('[').and_then(|l| l.split_once(']')) {
-            Some((name, tail)) => {
-                current = section(name.trim());
-                tail.trim()
-            }
-            None => line,
+        let key_line = if line.starts_with('[') {
+            // A header that never closes is an error in Git, which reads nothing after it. Keys
+            // below it must not count toward the section above.
+            let Some((name, tail)) = split_header(line) else {
+                current = None;
+                continue;
+            };
+            current = section(name.trim());
+            tail.trim()
+        } else {
+            line
         };
         if key_line.is_empty() || key_line.starts_with('#') || key_line.starts_with(';') {
             continue;
@@ -214,7 +234,7 @@ pub fn registry() -> Vec<Adapter> {
                                 field("matcher", Schema::Str, false),
                                 field("timeout", Schema::Int, false),
                             ]))),
-                            true,
+                            false,
                         ),
                     ]),
                 )
@@ -394,6 +414,17 @@ mod tests {
             ),
             ["~/one", "~/two", "~/three"]
         );
+        // A `]` inside the quoted condition does not end the header.
+        assert_eq!(
+            git_includes("[includeIf \"gitdir:~/work[12]/\"]\npath = ~/a\n")
+                .into_iter()
+                .map(|i| (i.path, i.condition))
+                .collect::<Vec<_>>(),
+            [("~/a".to_string(), Some("gitdir:~/work[12]/".to_string()))]
+        );
+        assert_eq!(got("[includeIf \"a\\\"]b\"] path = ~/q\n"), ["~/q"]);
+        // A header with an unbalanced quote ends the include section above it.
+        assert!(got("[include]\n[x \"]\npath = /etc/foo\n").is_empty());
         // A comment after the header is not a key.
         assert!(got("[include] # path = ~/a\n").is_empty());
     }

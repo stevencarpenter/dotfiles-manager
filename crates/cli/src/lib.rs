@@ -327,7 +327,7 @@ fn dispatch(args: &[String], out: &mut dyn Write) -> Result<(), Refusal> {
         }
         "doctor" | "status" => {
             let name = if cmd == "doctor" { "doctor" } else { "status" };
-            doctor_cmd::run(&context(home)?, name, rest, out)
+            doctor_cmd::run(context(home), name, rest, out)
         }
         "apply" => {
             let args = apply_cmd::parse_args(rest)?;

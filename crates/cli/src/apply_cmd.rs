@@ -18,7 +18,7 @@ use dfm_model::state::{
     Status, count_statuses, rfc3339,
 };
 use dfm_model::{Code, Exit, Refusal};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
 use std::path::Path;
 
@@ -110,6 +110,28 @@ fn label(s: Status) -> &'static str {
         Status::Pending => "pending",
         Status::BlockedPending => "blocked_pending",
     }
+}
+
+/// Every status, so the counts add up to the number of operations.
+fn counts_line(counts: &BTreeMap<Status, u32>) -> String {
+    const ORDER: [Status; 10] = [
+        Status::Updated,
+        Status::Current,
+        Status::Failed,
+        Status::Blocked,
+        Status::Unknown,
+        Status::NotStarted,
+        Status::NotInScope,
+        Status::Held,
+        Status::Pending,
+        Status::BlockedPending,
+    ];
+    let mut line = String::from("counts:");
+    for s in ORDER {
+        let n = counts.get(&s).copied().unwrap_or(0);
+        line.push_str(&format!(" {}={n}", label(s)));
+    }
+    line
 }
 
 /// What was printed so far, so a refusal prints its `result:` line exactly once.
@@ -255,7 +277,6 @@ fn run_inner(
         .map_err(w)?;
     }
     let counts = count_statuses(&report.operations);
-    let n = |s: Status| counts.get(&s).copied().unwrap_or(0);
     let mutated = store.mutated();
     // One exit, derived from the first problem, is both printed and returned.
     let is_signal = |r: &Refusal| matches!(r.code, Code::Interrupted | Code::Terminated);
@@ -373,18 +394,7 @@ fn run_inner(
         )
         .map_err(w)?;
     }
-    writeln!(
-        out,
-        "counts: updated={} current={} failed={} blocked={} unknown={} not_started={} not_in_scope={}",
-        n(Status::Updated),
-        n(Status::Current),
-        n(Status::Failed),
-        n(Status::Blocked),
-        n(Status::Unknown),
-        n(Status::NotStarted),
-        n(Status::NotInScope)
-    )
-    .map_err(w)?;
+    writeln!(out, "{}", counts_line(&counts)).map_err(w)?;
     // An adoption publishes nothing, so only a published output earns this note.
     if report.operations.iter().any(|r| r.reload.is_some()) {
         writeln!(
@@ -418,4 +428,32 @@ fn run_inner(
     writeln!(out, "result: {}", final_exit.name()).map_err(w)?;
     progress.result_printed = true;
     outcome
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_counts_line_names_every_status_and_sums_to_the_operation_count() {
+        let counts: BTreeMap<Status, u32> = Status::ALL
+            .iter()
+            .zip(1u32..)
+            .map(|(s, n)| (*s, n))
+            .collect();
+        let line = counts_line(&counts);
+        for s in Status::ALL {
+            assert!(line.contains(&format!(" {}=", label(s))), "{line}");
+        }
+        let sum: u32 = line
+            .split(' ')
+            .skip(1)
+            .map(|kv| kv.split_once('=').unwrap().1.parse::<u32>().unwrap())
+            .sum();
+        assert_eq!(sum, counts.values().sum::<u32>(), "{line}");
+        assert!(
+            line.contains(" held=3 pending=4 blocked_pending=7"),
+            "{line}"
+        );
+    }
 }

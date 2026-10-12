@@ -78,6 +78,16 @@ fn stderr(o: &Output) -> String {
     text(&o.stderr)
 }
 
+/// The digest line a blocked plan still prints, so an apply that follows is refused for the
+/// plan's blocker and not as a stale approval.
+fn digest_of(plan: &Output) -> String {
+    text(&plan.stdout)
+        .lines()
+        .find_map(|l| l.strip_prefix("plan digest: "))
+        .expect("a digest line")
+        .to_string()
+}
+
 fn hex(b: &[u8]) -> String {
     format!("{:x}", Sha256::digest(b))
 }
@@ -380,14 +390,9 @@ fn a_live_file_open_to_group_or_others_blocks_with_fix_text_and_nothing_changes(
     assert!(stderr(&o).contains("E_CONFLICT"), "{}", stderr(&o));
     assert!(stderr(&o).contains("chmod 600"), "{}", stderr(&o));
     assert!(!stderr(&o).contains(TOKEN) && !text(&o.stdout).contains(TOKEN));
-    let a = fx.run(&[
-        "apply",
-        "--root",
-        fx.root_arg(),
-        "--yes-plan",
-        &"0".repeat(64),
-    ]);
-    assert_eq!(code(&a), 3);
+    let a = fx.apply_with(&digest_of(&o));
+    assert_eq!(code(&a), 3, "{}", stderr(&a));
+    assert!(stderr(&a).contains("E_CONFLICT"), "{}", stderr(&a));
     assert_eq!(fs::read(fx.settings()).unwrap(), before);
     assert_eq!(
         fx.mode(),
@@ -410,14 +415,9 @@ fn malformed_json_blocks_with_e_conflict_and_the_last_good_file_stays() {
     assert!(stderr(&o).contains("E_CONFLICT") && stderr(&o).contains("not valid JSON"));
     assert!(!stderr(&o).contains(TOKEN) && !text(&o.stdout).contains(TOKEN));
     // Apply plans again and refuses. It writes nothing.
-    let a = fx.run(&[
-        "apply",
-        "--root",
-        fx.root_arg(),
-        "--yes-plan",
-        &"0".repeat(64),
-    ]);
-    assert_eq!(code(&a), 3);
+    let a = fx.apply_with(&digest_of(&o));
+    assert_eq!(code(&a), 3, "{}", stderr(&a));
+    assert!(stderr(&a).contains("E_CONFLICT"), "{}", stderr(&a));
     assert_eq!(fs::read_to_string(fx.settings()).unwrap(), bad);
     assert_eq!(fx.receipts(), receipts);
     assert_eq!(fx.journal_text(), journal);
@@ -435,10 +435,24 @@ fn a_symlinked_settings_file_is_not_followed() {
     std::os::unix::fs::symlink(&elsewhere, fx.settings()).unwrap();
     let o = fx.plan();
     assert_eq!(code(&o), 3, "{}", stderr(&o));
+    assert!(stderr(&o).contains("E_CONFLICT"), "{}", stderr(&o));
+    // Apply refuses the same way and writes nothing: not through the link, not beside it.
+    let before = common::fingerprint(fx.home.path());
+    // The blocked plan still prints its digest, so the approval is real and the refusal is the
+    // symlink's, not a stale digest.
+    let a = fx.apply_with(&digest_of(&o));
+    assert_eq!(code(&a), 3, "{}", stderr(&a));
+    assert!(stderr(&a).contains("E_CONFLICT"), "{}", stderr(&a));
+    assert_eq!(
+        common::fingerprint(fx.home.path()),
+        before,
+        "HOME and state"
+    );
     assert_eq!(
         fs::read_to_string(&elsewhere).unwrap(),
         "{\"apiKeyHelper\": \"x\"}\n"
     );
+    assert_eq!(fs::read_link(fx.settings()).unwrap(), elsewhere);
 }
 
 // ---- foreign edits of managed fields -----------------------------------------------------
@@ -460,14 +474,9 @@ fn an_edit_to_a_managed_field_is_a_conflict_at_plan_and_the_fix_is_to_adopt_it()
         !all.contains("hand-edited-secret-style"),
         "no value is shown: {all}"
     );
-    let a = fx.run(&[
-        "apply",
-        "--root",
-        fx.root_arg(),
-        "--yes-plan",
-        &"0".repeat(64),
-    ]);
-    assert_eq!(code(&a), 3);
+    let a = fx.apply_with(&digest_of(&o));
+    assert_eq!(code(&a), 3, "{}", stderr(&a));
+    assert!(stderr(&a).contains("E_CONFLICT"), "{}", stderr(&a));
     assert_eq!(fs::read(fx.settings()).unwrap(), before);
     // The documented fix: declare the edited value in the module. The manager then adopts it.
     fx.module(|m| m.replace("\"STE\"", "\"hand-edited-secret-style\""));
@@ -1008,14 +1017,9 @@ fn bad_salt(change: impl FnOnce(&Path)) {
     let e = stderr(&o);
     assert!(e.contains("from a copy"), "{e}");
     assert!(e.contains("coowned"), "names the ledger key: {e}");
-    let a = fx.run(&[
-        "apply",
-        "--root",
-        fx.root_arg(),
-        "--yes-plan",
-        &"0".repeat(64),
-    ]);
+    let a = fx.apply_with(&digest_of(&o));
     assert_eq!(code(&a), 3, "{}", stderr(&a));
+    assert!(stderr(&a).contains("from a copy"), "{}", stderr(&a));
     let c = fx.run(&["state", "check"]);
     assert_eq!(code(&c), 1, "{}\n{}", stderr(&c), text(&c.stdout));
     let all = format!("{}{}", stderr(&c), text(&c.stdout));
@@ -1562,6 +1566,7 @@ fn a_fragment_overrides_a_base_value_and_adds_keys() {
     fx.live(&serde_json::to_string(&j).unwrap());
     let o = fx.plan();
     assert_eq!(code(&o), 3, "{}\n{}", stderr(&o), text(&o.stdout));
+    assert!(stderr(&o).contains("E_CONFLICT"), "{}", stderr(&o));
 }
 
 #[test]
@@ -2012,7 +2017,9 @@ fn dropping_a_fragment_that_added_a_key_is_no_edit_and_a_real_edit_still_is() {
     let mut j = fx.live_json();
     j["env"]["EXAMPLE_FEATURE_FLAG"] = serde_json::json!("0");
     fx.live(&serde_json::to_string(&j).unwrap());
-    assert_eq!(code(&fx.plan()), 3);
+    let o = fx.plan();
+    assert_eq!(code(&o), 3, "{}", stderr(&o));
+    assert!(stderr(&o).contains("E_CONFLICT"), "{}", stderr(&o));
 }
 
 #[test]
@@ -2281,4 +2288,100 @@ fn bind_with_a_missing_salt_and_an_unreadable_ledger_refuses_and_creates_no_salt
     assert_eq!(code(&o), 3, "{}\n{}", stderr(&o), text(&o.stdout));
     assert!(stderr(&o).contains("E_STATE_INVALID"), "{}", stderr(&o));
     assert!(!salt.exists());
+}
+
+// ---- review fixes (DFM-57) ---------------------------------------------------------------
+
+#[test]
+fn a_module_with_only_managed_plans_and_applies_with_no_hook() {
+    let fx = Fx::new();
+    fx.put(
+        "base/modules/agents/module.toml",
+        r#"schema = 1
+id = "agents"
+platforms = ["macos", "linux"]
+requires = []
+
+[[resources]]
+id = "claude-settings"
+kind = "merge"
+adapter = "claude-settings/v1"
+target = ".claude/settings.json"
+[resources.value.managed]
+outputStyle = "STE"
+"#,
+    );
+    let o = fx.plan();
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+    let o = fx.apply();
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+    let j = fx.live_json();
+    assert_eq!(j["outputStyle"], "STE");
+    assert!(j.get("hooks").is_none(), "no handler, no hook: {j}");
+    assert_eq!(
+        fx.coowned().unwrap()["coowned"]["entries"],
+        serde_json::json!([])
+    );
+}
+
+#[test]
+fn a_fragment_key_that_cannot_be_compared_is_refused_and_nothing_is_written() {
+    for (name, body) in [
+        ("empty", "{\"\": \"frag\"}"),
+        ("control", "{\"a\\u0001b\": \"frag\"}"),
+        ("nested", "{\"env\": {\"\": \"frag\"}}"),
+    ] {
+        let fx = Fx::base();
+        fx.fragment("10-bad.json", body);
+        let before = common::fingerprint(fx.home.path());
+        let o = fx.plan();
+        assert_eq!(code(&o), 3, "{name}: {}", stderr(&o));
+        assert!(stderr(&o).contains("E_CONFLICT"), "{name}: {}", stderr(&o));
+        assert!(stderr(&o).contains("10-bad.json"), "{name}: {}", stderr(&o));
+        let a = fx.apply_with(&digest_of(&o));
+        assert_eq!(code(&a), 3, "{name}: {}", stderr(&a));
+        assert!(stderr(&a).contains("E_CONFLICT"), "{name}: {}", stderr(&a));
+        assert!(!fx.settings().exists(), "{name}");
+        assert_eq!(common::fingerprint(fx.home.path()), before, "{name}");
+    }
+}
+
+/// Restores a directory mode on drop, so a failed assertion leaves a removable tree.
+struct Reopen(PathBuf);
+
+impl Drop for Reopen {
+    fn drop(&mut self) {
+        let _ = fs::set_permissions(&self.0, fs::Permissions::from_mode(0o700));
+    }
+}
+
+#[test]
+fn an_unreadable_parent_blocks_the_merge_and_is_never_a_create() {
+    if common::is_root() {
+        common::skip("runs as root");
+        return;
+    }
+    let fx = Fx::new();
+    let dir = fx.h(".claude");
+    fs::create_dir_all(&dir).unwrap();
+    let _reopen = Reopen(dir.clone());
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+    let before = common::fingerprint(fx.home.path());
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o000)).unwrap();
+    let o = fx.plan();
+    assert_eq!(code(&o), 3, "{}\n{}", stderr(&o), text(&o.stdout));
+    assert!(
+        stderr(&o).contains(".claude"),
+        "the blocker names the parent: {}",
+        stderr(&o)
+    );
+    let a = fx.apply_with(&digest_of(&o));
+    assert_eq!(code(&a), 3, "{}", stderr(&a));
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(!fx.settings().exists(), "nothing was created");
+    assert_eq!(
+        common::fingerprint(fx.home.path()),
+        before,
+        "HOME and state"
+    );
 }

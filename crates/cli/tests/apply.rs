@@ -5,7 +5,7 @@
 
 mod common;
 
-use common::TempDir;
+use common::{TempDir, skip};
 use dfm_model::plan::Saved;
 use sha2::{Digest, Sha256};
 use std::fs;
@@ -651,6 +651,11 @@ fn configuration_changes_never_require_rebuilding_the_manager() {
     fx.put("base/modules/extra/files/zshrc", "export A=changed\n");
     let stale = fx.apply_with(&p1.plan_digest, &[]);
     assert_eq!(code(&stale), 3, "{}", stderr(&stale));
+    assert!(
+        stderr(&stale).contains("E_PLAN_STALE"),
+        "{}",
+        stderr(&stale)
+    );
     // Add a new resource: a new module file, no new manager.
     let m = fs::read_to_string(fx.root.join("base/modules/extra/module.toml")).unwrap();
     fx.put(
@@ -714,6 +719,11 @@ fn deselecting_a_module_removes_only_its_owned_links_and_nothing_else() {
     // One allowance is not enough either.
     let o = fx.apply_with(&d, &["--allow-disruptive", &removals[0]]);
     assert_eq!(code(&o), 3, "{}", stderr(&o));
+    assert!(
+        stderr(&o).contains("E_DISRUPTIVE_UNAPPROVED"),
+        "{}",
+        stderr(&o)
+    );
     assert_eq!(fingerprint(fx.home.path()), before);
     // With every removal approved, exactly the two owned links go.
     let mut args = Vec::new();
@@ -859,6 +869,7 @@ fn deselecting_everything_still_removes_only_proven_outputs_one_approval_each() 
     // The profile still selects core, so nothing is deselected: nothing to remove.
     let o = fx.apply(&[]);
     assert_eq!(code(&o), 3, "{}", stderr(&o));
+    assert!(stderr(&o).contains("E_CONFLICT"), "{}", stderr(&o));
     assert!(is_link_to(&fx.h(".ssh/config"), Path::new("/mine")));
     assert_eq!(fx.owned_paths().len(), 4, "the ledger keeps what it proves");
 }
@@ -1087,6 +1098,7 @@ fn a_failure_before_any_write_prints_failed_and_exits_1() {
 #[test]
 fn an_unwritable_directory_is_a_failure_and_never_data_loss() {
     if running_as_root() {
+        skip("runs as root");
         return;
     }
     let fx = Fx::new();
@@ -1115,6 +1127,7 @@ fn an_unwritable_directory_is_a_failure_and_never_data_loss() {
 #[test]
 fn an_unwritable_directory_known_at_plan_time_blocks_before_any_write() {
     if running_as_root() {
+        skip("runs as root");
         return;
     }
     let fx = Fx::new();
@@ -1487,6 +1500,7 @@ fn a_self_looping_parent_of_one_owned_output_blocks_only_that_entry() {
     assert!(stderr(&o).contains("E_PARENT_UNSAFE"), "{}", stderr(&o));
     let o = fx.apply(&[]);
     assert_eq!(code(&o), 3, "{}", stderr(&o));
+    assert!(stderr(&o).contains("E_PARENT_UNSAFE"), "{}", stderr(&o));
     assert_eq!(fingerprint(fx.home.path()), before, "nothing was written");
 }
 
@@ -1955,7 +1969,7 @@ fn signal_fixture() -> Fx {
 
 fn journal_phases(fx: &Fx) -> Vec<String> {
     fs::read_to_string(fx.state().join("journal.jsonl"))
-        .unwrap_or_default()
+        .expect("the journal exists: a missing journal is not an empty one")
         .lines()
         .map(|l| {
             let v: serde_json::Value = serde_json::from_str(l).unwrap();
@@ -2215,6 +2229,7 @@ fn doctor_and_status_show_an_open_unknown_as_an_error_with_its_journal_id() {
     for _ in 0..2 {
         let o = fx.apply(&[]);
         assert_eq!(code(&o), 3, "{}\n{}", stderr(&o), text(&o.stdout));
+        assert!(stderr(&o).contains("E_CONFLICT"), "{}", stderr(&o));
         assert_eq!(fx.unknown_entry().0, id);
     }
 }

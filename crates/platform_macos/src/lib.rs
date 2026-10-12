@@ -33,6 +33,11 @@ pub fn current_platform() -> (&'static str, &'static str) {
     (std::env::consts::OS, std::env::consts::ARCH)
 }
 
+// The flag values below are Darwin's. The workspace is macOS-only by contract, so another target
+// must fail to build instead of passing the wrong numbers to `open`.
+#[cfg(not(target_os = "macos"))]
+compile_error!("dfm-platform-macos builds only for macOS: its open(2) flag values are Darwin's");
+
 /// `O_NOFOLLOW` on Darwin. Opening a symlink with it fails instead of following the link. Used by
 /// the source loader, which reads files outside the state directory.
 pub const O_NOFOLLOW: i32 = 0x0100;

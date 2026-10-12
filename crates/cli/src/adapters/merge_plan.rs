@@ -289,6 +289,43 @@ pub fn merge_facts(
     out
 }
 
+/// The live target, or `Live::Missing` when a parent directory does not exist (a directory to
+/// create). A parent that cannot be opened (a link, a file, no permission) is an error, so the
+/// verdict is blocked and never a create over a parent that was not read.
+fn read_target(sys: &Sys, home: &Dir, parents: &[&str], name: &str) -> Result<Live, Refusal> {
+    match home.open_below_opt(sys, parents)? {
+        Some(dir) => dir.read_live(sys, name, MAX_HASHED_BYTES),
+        None => Ok(Live::Missing),
+    }
+}
+
+/// The live bytes of the claimed file (`None` when it or a parent directory is absent), or the
+/// blocked verdict for a target that must not be merged into.
+fn live_bytes(sys: &Sys, home: &Dir, claim: &str) -> Result<Option<Vec<u8>>, MergeVerdict> {
+    let comps: Vec<&str> = claim.split('/').collect();
+    let Some((name, parents)) = comps.split_last() else {
+        return Err(blocked(Code::TargetInvalid, "the target is empty"));
+    };
+    match read_target(sys, home, parents, name).map_err(|e| refused(&e))? {
+        Live::Missing => Ok(None),
+        Live::Unusable(why) => Err(blocked(
+            Code::Conflict,
+            &format!("{claim} {why}. Fix: replace it with a plain regular file of yours"),
+        )),
+        Live::TooBig => Err(blocked(
+            Code::LimitExceeded,
+            &format!("{claim} exceeds 16 MiB"),
+        )),
+        Live::File { mode, .. } if mode & 0o077 != 0 => Err(blocked(
+            Code::Conflict,
+            &format!(
+                "{claim} is mode {mode:o}, open to group or others, and can hold credentials. Fix: run chmod 600 on it, then plan again"
+            ),
+        )),
+        Live::File { bytes, .. } => Ok(Some(bytes)),
+    }
+}
+
 fn verdict_for(
     resource: &str,
     claim: &str,
@@ -298,39 +335,9 @@ fn verdict_for(
     home: &Dir,
     home_path: &Path,
 ) -> MergeVerdict {
-    let comps: Vec<&str> = claim.split('/').collect();
-    let Some((name, parents)) = comps.split_last() else {
-        return blocked(Code::TargetInvalid, "the target is empty");
-    };
-    // A parent that is a link or missing is the planner's own finding (E_PARENT_UNSAFE, or a
-    // directory to create). Nothing is read through it.
-    let live = match home.open_below_opt(sys, parents) {
-        Ok(Some(dir)) => match dir.read_live(sys, name, MAX_HASHED_BYTES) {
-            Ok(l) => l,
-            Err(e) => return refused(&e),
-        },
-        Ok(None) | Err(_) => Live::Missing,
-    };
-    let bytes = match live {
-        Live::Missing => None,
-        Live::Unusable(why) => {
-            return blocked(
-                Code::Conflict,
-                &format!("{claim} {why}. Fix: replace it with a plain regular file of yours"),
-            );
-        }
-        Live::TooBig => return blocked(Code::LimitExceeded, &format!("{claim} exceeds 16 MiB")),
-        Live::File { bytes, mode, .. } => {
-            if mode & 0o077 != 0 {
-                return blocked(
-                    Code::Conflict,
-                    &format!(
-                        "{claim} is mode {mode:o}, open to group or others, and can hold credentials. Fix: run chmod 600 on it, then plan again"
-                    ),
-                );
-            }
-            Some(bytes)
-        }
+    let bytes = match live_bytes(sys, home, claim) {
+        Ok(b) => b,
+        Err(v) => return v,
     };
     let abs = home_path.join(claim);
     let recorded: Option<CoOwned> = match store.read_ledger_lenient() {
@@ -356,5 +363,65 @@ fn verdict_for(
         Ok((_, merge::Outcome::Current)) => MergeVerdict::Current,
         Ok((_, merge::Outcome::Write)) => MergeVerdict::Write,
         Err(e) => refused(&e),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::io::Write;
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::PathBuf;
+
+    /// Opens `locked` again and removes the tree, also when an assertion panics.
+    struct Cleanup(PathBuf);
+
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let _ = fs::set_permissions(self.0.join("locked"), fs::Permissions::from_mode(0o700));
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn a_parent_that_cannot_be_opened_is_an_error_and_a_missing_parent_is_missing() {
+        let d = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .join(format!("dfm-mergeplan-{}", std::process::id()));
+        let _cleanup = Cleanup(d.clone());
+        fs::create_dir_all(d.join("locked")).unwrap();
+        fs::write(d.join("file"), "x").unwrap();
+        fs::set_permissions(d.join("locked"), fs::Permissions::from_mode(0o000)).unwrap();
+        let sys = Sys {
+            uid: dfm_platform_macos::current_uid().unwrap(),
+        };
+        let home = Dir::open_home(&sys, &d).unwrap();
+        let got = |parents: &[&str]| read_target(&sys, &home, parents, "settings.json");
+        assert!(matches!(got(&["absent"]), Ok(Live::Missing)));
+        assert!(got(&["file"]).is_err(), "a file is not a parent directory");
+        let verdict = |claim: &str| live_bytes(&sys, &home, claim);
+        assert!(matches!(verdict("absent/settings.json"), Ok(None)));
+        assert!(matches!(
+            verdict("file/settings.json"),
+            Err(MergeVerdict::Blocked { .. })
+        ));
+        if sys.uid == 0 {
+            // `eprintln!` is captured for a passing test; the real handle is not.
+            let _ = writeln!(std::io::stderr(), "SKIPPED: runs as root");
+        } else {
+            assert!(
+                got(&["locked"]).is_err(),
+                "an unreadable parent is not a create"
+            );
+            assert!(
+                matches!(
+                    verdict("locked/settings.json"),
+                    Err(MergeVerdict::Blocked { .. })
+                ),
+                "an unreadable parent blocks the verdict"
+            );
+        }
     }
 }

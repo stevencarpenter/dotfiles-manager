@@ -113,9 +113,32 @@ fn conflict(detail: impl Into<String>) -> Refusal {
     Refusal::new(Code::Conflict, detail)
 }
 
+/// `1.0`, `1e0` and `1` are one value in JSON. A float with no fractional part that fits an
+/// `i64` is spelled as that integer, so a live file that spells a number differently is not an
+/// edit. Larger floats keep their spelling.
+fn integral(v: &Json) -> Json {
+    match v {
+        Json::Number(n) => match n.as_f64() {
+            Some(f)
+                if n.is_f64()
+                    && f.fract() == 0.0
+                    && (-(2f64.powi(63))..2f64.powi(63)).contains(&f) =>
+            {
+                // In range and integral, so the conversion is exact.
+                Json::from(f as i64)
+            }
+            _ => v.clone(),
+        },
+        Json::Array(a) => Json::Array(a.iter().map(integral).collect()),
+        Json::Object(o) => Json::Object(o.iter().map(|(k, x)| (k.clone(), integral(x))).collect()),
+        _ => v.clone(),
+    }
+}
+
 fn canonical(v: &Json) -> Vec<u8> {
     // `serde_json::Map` is a sorted map here (no `preserve_order`), so this is canonical.
-    serde_json::to_vec(v).expect("a serde_json::Value always serializes: its keys are strings")
+    serde_json::to_vec(&integral(v))
+        .expect("a serde_json::Value always serializes: its keys are strings")
 }
 
 fn to_json(v: &Toml, at: &str) -> Result<Json, Refusal> {
@@ -256,6 +279,33 @@ fn handler(id: &str, v: &Toml) -> Result<Handler, Refusal> {
     })
 }
 
+/// A key the ledger cannot spell as a JSON pointer: empty, or with a control character.
+fn unspellable(k: &str) -> bool {
+    k.is_empty() || k.chars().any(char::is_control)
+}
+
+/// Whether any key at any object depth is [`unspellable`].
+fn has_unspellable_key(m: &Map<String, Json>) -> bool {
+    m.iter()
+        .any(|(k, v)| unspellable(k) || matches!(v, Json::Object(o) if has_unspellable_key(o)))
+}
+
+/// A managed key the ledger cannot spell as a JSON pointer would drop out of the leaf-by-leaf
+/// conflict check, so an edit of it would go unseen. Such a key is refused at the source.
+fn managed_keys_usable(m: &Map<String, Json>, at: &str) -> Result<(), Refusal> {
+    for (k, v) in m {
+        if unspellable(k) {
+            return Err(invalid(format!(
+                "{at} holds a key that is empty or has a control character; use a plain key name"
+            )));
+        }
+        if let Json::Object(o) = v {
+            managed_keys_usable(o, &format!("{at}.{k}"))?;
+        }
+    }
+    Ok(())
+}
+
 impl Desired {
     /// Converts the resolved resource value. `managed` is required. `hooks` is reserved for
     /// handlers, so a managed or seed key named `hooks` is refused.
@@ -272,6 +322,7 @@ impl Desired {
             }
         };
         let (managed, seed) = (section("managed", true)?, section("seed", false)?);
+        managed_keys_usable(&managed, "managed")?;
         for (name, m) in [("managed", &managed), ("seed", &seed)] {
             if m.contains_key("hooks") {
                 return Err(invalid(format!(
@@ -380,6 +431,11 @@ impl Desired {
             if obj.contains_key("hooks") {
                 return Err(conflict(format!(
                     "fragment {name} sets hooks. Fix: declare hooks as handlers in the module so the manager can retire only its own entries"
+                )));
+            }
+            if has_unspellable_key(&obj) {
+                return Err(conflict(format!(
+                    "fragment {name} holds a key that is empty or has a control character, so an edit of it could not be detected. {fix}"
                 )));
             }
             overlay(&mut out.effective, &obj, "", &out.append.clone());
@@ -565,7 +621,7 @@ fn leaves_of(view: &Map<String, Json>) -> BTreeMap<String, Vec<u8>> {
     fn walk(m: &Map<String, Json>, at: &str, out: &mut BTreeMap<String, Vec<u8>>) {
         for (k, v) in m {
             // A key the ledger cannot spell as a JSON pointer is not compared leaf by leaf.
-            if k.is_empty() || k.chars().any(char::is_control) {
+            if unspellable(k) {
                 continue;
             }
             let here = format!("{at}/{}", escape_token(k));
@@ -1018,7 +1074,8 @@ fn shell_words(s: &str) -> Option<Vec<Vec<Ch>>> {
                 cur.push((it.next()?, Lead::Literal, span));
                 span += 1;
             }
-            c if c.is_whitespace() => {
+            // POSIX sh splits on blank and newline only, so a no-break space stays in its word.
+            ' ' | '\t' | '\n' => {
                 if open {
                     words.push(std::mem::take(&mut cur));
                     open = false;
@@ -1733,6 +1790,12 @@ defaultMode = "auto"
             (b"{not json planted-token".as_slice(), "not valid JSON"),
             (b"[1]".as_slice(), "not an object"),
             (br#"{"hooks":{}}"#.as_slice(), "sets hooks"),
+            (br#"{"":1}"#.as_slice(), "empty or has a control"),
+            (br#"{"a\nb":1}"#.as_slice(), "empty or has a control"),
+            (
+                br#"{"env":{"x\u0001":1}}"#.as_slice(),
+                "empty or has a control",
+            ),
         ] {
             let e = d.with_fragments([("02-bad.json", bytes)]).unwrap_err();
             assert_eq!(e.code, Code::Conflict);
@@ -2047,5 +2110,60 @@ defaultMode = "auto"
         )
         .unwrap_err();
         assert_eq!(e.code, Code::Conflict);
+    }
+
+    #[test]
+    fn a_number_spelled_as_a_float_is_the_same_leaf_as_the_integer() {
+        let salt = [9u8; 32];
+        let d = desired("[managed]\nretries = 1\nbig = 1e20\n");
+        let first = merge(None, &d, &[]).unwrap();
+        let rec = CoOwned {
+            managed_hash: salted(&salt, &first.rendered_view),
+            entries: vec![],
+            appended: vec![],
+            leaves: leaf_hashes(&salt, &first),
+        };
+        // The same value spelled `1.0` is no foreign edit. A real change still is one.
+        let (_, o) = classify(
+            Some(br#"{"retries":1.0,"big":1e20}"#),
+            &d,
+            Some(&rec),
+            Some(&salt),
+        )
+        .unwrap();
+        assert_eq!(o, Outcome::Write);
+        let e = classify(
+            Some(br#"{"retries":1.5,"big":1e20}"#),
+            &d,
+            Some(&rec),
+            Some(&salt),
+        )
+        .unwrap_err();
+        assert_eq!(e.code, Code::Conflict);
+        assert_eq!(canonical(&json(b"[1.0, 2.5, -0.0]")), b"[1,2.5,0]");
+    }
+
+    #[test]
+    fn a_managed_key_the_ledger_cannot_spell_is_refused_at_any_depth() {
+        for src in [
+            "[managed]\n\"\" = 1\n",
+            "[managed]\n\"a\\nb\" = 1\n",
+            "[managed.outer]\n\"\" = 1\n",
+            "[managed.outer.inner]\n\"x\\u0001\" = 1\n",
+        ] {
+            let e = Desired::from_value(&toml::from_str::<Toml>(src).unwrap()).unwrap_err();
+            assert_eq!(e.code, Code::ManifestInvalid, "{src}");
+        }
+    }
+
+    #[test]
+    fn a_no_break_space_stays_inside_a_shell_word() {
+        let split = |c: &str| shell_words(c).unwrap().len();
+        assert_eq!(split("a\u{a0}b"), 1);
+        assert_eq!(split("a b\tc\nd"), 4);
+        assert_ne!(
+            command_identity("run a\u{a0}b", None),
+            command_identity("run a b", None)
+        );
     }
 }

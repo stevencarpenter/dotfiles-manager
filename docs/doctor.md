@@ -29,9 +29,9 @@ Both commands are read-only. They run no program, probe no tool, version or PATH
 | --- | --- |
 | 0 | No row is ERROR and no required row is UNKNOWN. A WARN row is listed and does not change the exit. |
 | 1 | Any ERROR row, or any UNKNOWN row of a required check. The process prints `E_DIAGNOSED` on standard error. |
-| 2 | Usage error (missing `--root`, unknown flag, repeated flag, `--against`), or no report can be made at all. |
+| 2 | Usage error (missing `--root`, unknown flag, repeated flag, `--against`), or no report can be made at all. Arguments are parsed before HOME is resolved. |
 
-`doctor` never exits 3 or 4 (architecture section 10). A malformed manifest, a missing profile or an unreadable state file is a row, and exit 1.
+`doctor` never exits 3 or 4 (architecture section 10). A malformed manifest, a missing profile, an unreadable state file or an unusable HOME is a row, and exit 1. An unusable HOME gives an ERROR `binding` row and UNKNOWN `state` and `profile` rows.
 
 ## Row fields
 

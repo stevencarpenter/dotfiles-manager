@@ -317,22 +317,22 @@ fn a_malformed_fragment_blocks_the_plan_and_keeps_the_last_good_output() {
     let good = fs::read(fx.h(".codex/AGENTS.md")).unwrap();
 
     type Plant = fn(&Fx);
-    let cases: [(&str, Plant); 4] = [
-        ("not UTF-8", |fx| {
+    let cases: [(&str, &str, Plant); 4] = [
+        ("not UTF-8", "E_CONFLICT", |fx| {
             fs::write(fx.h(".codex/AGENTS.d/20-bad.md"), [0xff, 0xfe, b'\n']).unwrap();
         }),
-        ("oversize", |fx| {
+        ("oversize", "E_OBSERVATION_UNKNOWN", |fx| {
             fs::write(
                 fx.h(".codex/AGENTS.d/20-big.md"),
                 vec![b'x'; (16 << 20) + 1],
             )
             .unwrap();
         }),
-        ("link", |fx| {
+        ("link", "E_CONFLICT", |fx| {
             fs::write(fx.h("elsewhere.md"), "outside\n").unwrap();
             symlink(fx.h("elsewhere.md"), fx.h(".codex/AGENTS.d/20-link.md")).unwrap();
         }),
-        ("fifo", |fx| {
+        ("fifo", "E_CONFLICT", |fx| {
             let st = Command::new("mkfifo")
                 .arg(fx.h(".codex/AGENTS.d/20-fifo.md"))
                 .status()
@@ -340,12 +340,13 @@ fn a_malformed_fragment_blocks_the_plan_and_keeps_the_last_good_output() {
             assert!(st.success());
         }),
     ];
-    for (what, plant) in cases {
+    for (what, want, plant) in cases {
         plant(&fx);
         let before = fingerprint(fx.home.path());
         // The plan itself is blocked, so the digest is that of a blocked plan.
         let o = fx.apply(&[]);
         assert_eq!(code(&o), 3, "{what}: {}\n{}", stderr(&o), text(&o.stdout));
+        assert!(stderr(&o).contains(want), "{what}: {}", stderr(&o));
         assert_eq!(
             fingerprint(fx.home.path()),
             before,
@@ -552,6 +553,7 @@ fn fragments_that_are_each_small_enough_but_too_big_together_block_the_plan() {
     let before = fingerprint(fx.home.path());
     let o = fx.apply(&[]);
     assert_eq!(code(&o), 3, "{}", stderr(&o));
+    assert!(stderr(&o).contains("E_LIMIT_EXCEEDED"), "{}", stderr(&o));
     assert_eq!(fingerprint(fx.home.path()), before);
 }
 

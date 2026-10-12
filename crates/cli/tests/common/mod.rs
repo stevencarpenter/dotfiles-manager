@@ -77,6 +77,13 @@ pub fn is_root() -> bool {
         .is_ok_and(|o| text(&o.stdout).trim() == "0")
 }
 
+/// Reports a skipped test on the real standard error. `eprintln!` is captured by the test
+/// harness for a passing test, so the skip would be invisible in a normal run.
+pub fn skip(why: &str) {
+    use std::io::Write;
+    let _ = writeln!(std::io::stderr(), "SKIPPED: {why}");
+}
+
 /// Names, kinds, modes, modification times and bytes of everything below `root`, links unread.
 /// The lock file is included.
 pub fn fingerprint(root: &Path) -> String {

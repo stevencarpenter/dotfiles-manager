@@ -150,6 +150,11 @@ fn toolchain_digest_refuses_entries_writable_by_group_or_others() {
         fs::set_permissions(&p, fs::Permissions::from_mode(mode)).unwrap();
         let o = script_test_mode(&home, &args, &[]);
         assert_eq!(o.status.code(), Some(3), "{path} at {mode:o}");
+        assert!(
+            err(&o).contains("E_TOOLCHAIN_MISMATCH"),
+            "{path} at {mode:o}: {}",
+            err(&o)
+        );
         assert!(o.stdout.is_empty());
         fs::set_permissions(&p, fs::Permissions::from_mode(old)).unwrap();
     }
@@ -173,6 +178,7 @@ fn toolchain_digest_refuses_file_names_with_backslashes() {
         "{}",
         String::from_utf8_lossy(&o.stdout)
     );
+    assert!(err(&o).contains("E_TOOLCHAIN_MISMATCH"), "{}", err(&o));
     assert!(o.stdout.is_empty());
 }
 
@@ -271,6 +277,7 @@ fn toolchain_digest_fails_closed_instead_of_dropping_unreadable_entries() {
         "a partial digest was printed: {}",
         String::from_utf8_lossy(&o.stdout)
     );
+    assert!(err(&o).contains("E_TOOLCHAIN_MISMATCH"), "{}", err(&o));
     assert!(o.stdout.is_empty());
     let empty = tmp.path().join("empty");
     fs::create_dir(&empty).unwrap();
@@ -284,6 +291,7 @@ fn toolchain_digest_fails_closed_instead_of_dropping_unreadable_entries() {
         Some(3),
         "an empty toolchain must not produce a digest"
     );
+    assert!(err(&o).contains("E_TOOLCHAIN_MISMATCH"), "{}", err(&o));
 }
 
 #[test]
@@ -1627,6 +1635,11 @@ fn a_symlink_target_with_a_trailing_newline_is_refused_like_the_rust_checker() {
         );
         let o = script_test_mode(&home, &args, &[]);
         assert_eq!(o.status.code(), Some(3), "shell accepted {target:?}");
+        assert!(
+            err(&o).contains("E_TOOLCHAIN_MISMATCH"),
+            "{target:?}: {}",
+            err(&o)
+        );
         assert!(o.stdout.is_empty());
     }
 }

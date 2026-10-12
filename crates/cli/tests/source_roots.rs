@@ -3,7 +3,7 @@
 
 mod common;
 
-use common::{BUNDLE, Fx, code, fingerprint, is_root, text};
+use common::{BUNDLE, Fx, code, fingerprint, is_root, skip, text};
 use dfm_model::plan::Saved;
 use std::fs;
 use std::os::unix::ffi::OsStrExt;
@@ -218,6 +218,7 @@ impl Drop for Restore {
 #[test]
 fn an_excluded_path_is_never_opened_or_listed_by_a_non_root_user() {
     if is_root() {
+        skip("runs as root");
         return;
     }
     let fx = scoped(
@@ -525,6 +526,7 @@ fn similar_root_names_a_link_loop_and_siblings_load_independently() {
 #[test]
 fn a_root_below_an_unreadable_directory_reports_the_real_error() {
     if is_root() {
+        skip("runs as root");
         return;
     }
     let fx = scoped(r#""base", "profiles", "locked/inner""#, "");

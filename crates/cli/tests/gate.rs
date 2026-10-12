@@ -58,14 +58,22 @@ fn os_bound_names_stay_in_platform_macos() {
         "homebrew",
         "xcode",
     ];
+    // docs/architecture.md section 3: no OS-bound name in `model` or `engine`.
     let mut files = Vec::new();
-    rs_files(&repo_root().join("crates/model/src"), &mut files);
-    assert!(!files.is_empty());
+    for krate in ["model", "engine"] {
+        let before = files.len();
+        rs_files(&repo_root().join(format!("crates/{krate}/src")), &mut files);
+        assert!(files.len() > before, "no sources found for {krate}");
+    }
     for f in files {
-        let text = fs::read_to_string(&f).unwrap();
-        // Compare outside `#[cfg(test)]` modules and comments only by simple containment.
+        // Compared without regard to case, so `Xcode` and `Homebrew` are caught too.
+        let text = fs::read_to_string(&f).unwrap().to_lowercase();
         for needle in forbidden {
-            assert!(!text.contains(needle), "{} names {needle}", f.display());
+            assert!(
+                !text.contains(&needle.to_lowercase()),
+                "{} names {needle}",
+                f.display()
+            );
         }
     }
 }
@@ -461,6 +469,15 @@ fn rustix_is_resolved_with_exactly_the_alloc_fs_and_std_features() {
     assert_eq!(asked, ["fs", "std"]);
 }
 
+/// The environment variables only a `test-isolation` build reads.
+const ISOLATION_NAMES: [&str; 5] = [
+    "DFM_WIDTH",
+    "DFM_FAILPOINT",
+    "DFM_HOME",
+    "DFM_BINDING",
+    "DFM_PLATFORM",
+];
+
 #[test]
 fn a_plain_release_build_of_every_target_has_no_test_isolation() {
     let target = common::TempDir::new("release-graph");
@@ -489,13 +506,70 @@ fn a_plain_release_build_of_every_target_has_no_test_isolation() {
         v.starts_with("dotfiles-manager ") && !v.contains("test-isolation"),
         "{v}"
     );
-    // The release binary has no isolation flag, so `apply` with an override is a usage error
-    // before anything is read or written, and the failure-injection variable has no effect.
+    // The isolation variables are compiled out: `width()` and `fail_from_env()` have no name to
+    // read. The scan has a positive control, the isolated test binary, which must name all of
+    // them, so a renamed or run-time-built variable cannot make the release scan pass vacuously.
+    let release = fs::read(target.path().join("release/dotfiles-manager")).unwrap();
+    let isolated = fs::read(env!("CARGO_BIN_EXE_dotfiles-manager")).unwrap();
+    let names_in = |bin: &[u8]| {
+        ISOLATION_NAMES
+            .into_iter()
+            .filter(|n| bin.windows(n.len()).any(|w| w == n.as_bytes()))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(names_in(&isolated), ISOLATION_NAMES, "the control binary");
+    assert_eq!(names_in(&release), Vec::<&str>::new(), "the release binary");
+    // The release `width()` is the default. `DFM_WIDTH` narrows the isolated table and does
+    // nothing to the release one. HOME is a scratch directory that is not the account home, so
+    // `doctor` stops at the HOME check and reads and writes nothing else.
+    let home = common::TempDir::new("release-width");
+    let doctor = |bin: &Path, width: Option<&str>| {
+        let mut c = Command::new(bin);
+        c.env_clear().env("HOME", home.path());
+        if let Some(w) = width {
+            c.env("DFM_WIDTH", w);
+        }
+        c.args(["doctor", "--root"])
+            .arg(home.path())
+            .output()
+            .unwrap()
+    };
+    let release_bin = target.path().join("release/dotfiles-manager");
+    let (plain, narrow) = (doctor(&release_bin, None), doctor(&release_bin, Some("20")));
+    assert_eq!(plain.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&plain.stdout).contains("E_HOME_MISMATCH"));
+    assert_eq!(
+        plain.stdout, narrow.stdout,
+        "the release width ignores DFM_WIDTH"
+    );
+    assert_eq!(
+        fs::read_dir(home.path()).unwrap().count(),
+        0,
+        "nothing was created"
+    );
+    let isolated_doctor = |width: Option<&str>| {
+        let mut c = Command::new(env!("CARGO_BIN_EXE_dotfiles-manager"));
+        c.env_clear().args(["--home", "/a b"]);
+        if let Some(w) = width {
+            c.env("DFM_WIDTH", w);
+        }
+        c.args(["doctor", "--root"])
+            .arg(home.path())
+            .output()
+            .unwrap()
+            .stdout
+    };
+    assert_ne!(
+        isolated_doctor(None),
+        isolated_doctor(Some("20")),
+        "control: DFM_WIDTH changes the isolated table"
+    );
+    // The release binary has no `--home` flag, so it is a usage error before anything is read
+    // or written. This does not run `apply`: it proves only that the flag is absent.
     let scratch = common::TempDir::new("release-apply");
     let o = Command::new(target.path().join("release/dotfiles-manager"))
         .env_clear()
         .env("DFM_HOME", scratch.path())
-        .env("DFM_FAILPOINT", "apply-before-effect:abort")
         .arg("--home")
         .arg(scratch.path())
         .args(["apply", "--root"])
