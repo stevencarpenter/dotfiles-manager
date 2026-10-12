@@ -500,6 +500,16 @@ fn a_removed_managed_field_is_also_a_foreign_edit() {
 
 /// Starts `apply` parked at `point`, runs `during` while it waits, then releases it.
 fn parked_apply(fx: &Fx, point: &str, digest: &str, during: impl FnOnce(&Fx)) -> Output {
+    parked_command(
+        fx,
+        point,
+        &["apply", "--root", fx.root_arg(), "--yes-plan", digest],
+        during,
+    )
+}
+
+/// Starts a command parked at `point`, runs `during` while it waits, then releases it.
+fn parked_command(fx: &Fx, point: &str, args: &[&str], during: impl FnOnce(&Fx)) -> Output {
     let gate = fx.home.path().parent().unwrap().join(format!(
         "gate-{}-{:?}",
         std::process::id(),
@@ -513,7 +523,7 @@ fn parked_apply(fx: &Fx, point: &str, digest: &str, during: impl FnOnce(&Fx)) ->
         .env("DFM_FAILPOINT", format!("{point}:wait-{}", gate.display()))
         .arg("--home")
         .arg(fx.home.path())
-        .args(["apply", "--root", fx.root_arg(), "--yes-plan", digest])
+        .args(args)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -2365,6 +2375,37 @@ fn bind_with_an_unusable_salt_and_no_binding_file_publishes_no_binding() {
         "{}",
         stderr(&o)
     );
+    assert!(!binding.exists(), "no binding was published");
+    assert_eq!(
+        fs::metadata(&salt).unwrap().permissions().mode() & 0o777,
+        0o644,
+        "the salt is unchanged"
+    );
+}
+
+#[test]
+fn bind_refuses_a_salt_damaged_between_its_two_phases_and_publishes_no_binding() {
+    let fx = Fx::base();
+    assert_eq!(code(&fx.apply()), 0);
+    let binding = fx.h(".config/dotfiles-manager/machine.toml");
+    fs::remove_file(&binding).unwrap();
+    let salt = fx.state().join("salt");
+    let p = fx.root.join("profiles/t-01.toml");
+    // Phase 1 sees a usable salt. The damage lands while phase 2 holds the lock.
+    let o = parked_command(
+        &fx,
+        "bind-after-lock",
+        &[
+            "bind",
+            "--profile",
+            p.to_str().unwrap(),
+            "--machine-id",
+            "m5-test",
+        ],
+        |_| fs::set_permissions(&salt, fs::Permissions::from_mode(0o644)).unwrap(),
+    );
+    let err = String::from_utf8_lossy(&o.stderr);
+    assert!(err.contains("state/salt is unusable"), "{err}");
     assert!(!binding.exists(), "no binding was published");
     assert_eq!(
         fs::metadata(&salt).unwrap().permissions().mode() & 0o777,
