@@ -1998,24 +1998,18 @@ fn checkout_local_attributes_and_filters_are_refused_before_git_archive_runs() {
     }
 }
 
-/// git archive would also apply core.autocrlf and core.eol from the checkout's config (a committed
-/// `text` attribute makes core.eol take effect). The script pins both, so the staged tree keeps the
-/// committed bytes: a stand-in `cargo fetch` reports a carriage return in the staged manifest.
+/// git archive applies core.autocrlf from the checkout's config, so the script pins it on the
+/// command line and the staged tree keeps the committed bytes: a stand-in `cargo fetch` reports a
+/// carriage return in the staged manifest. The script also pins core.eol=lf, but with git 2.54 a
+/// checkout's core.eol alone does not change `git archive` output (checked with a committed
+/// `* text` attribute), so no test can show that pin; it stays as defence for other git versions.
 /// Hostile config that no git call of the script uses (fsmonitor, hooks) is set too: it must not run.
 #[test]
 fn checkout_local_line_ending_config_cannot_change_the_staged_tree() {
     type Setup = fn(&Path);
-    let cases: [(&str, Setup); 2] = [
-        ("autocrlf", |src| {
-            git(src, &["config", "core.autocrlf", "true"]);
-        }),
-        ("eol", |src| {
-            fs::write(src.join(".gitattributes"), "* text\n").unwrap();
-            git(src, &["add", ".gitattributes"]);
-            git(src, &["commit", "-q", "-m", "attributes"]);
-            git(src, &["config", "core.eol", "crlf"]);
-        }),
-    ];
+    let cases: [(&str, Setup); 1] = [("autocrlf", |src| {
+        git(src, &["config", "core.autocrlf", "true"]);
+    })];
     let on_fetch =
         r#"if [ -n "$(tr -cd '\r' <stage/Cargo.toml)" ]; then echo STAGED-CR >&2; fi; exit 1"#;
     for (name, setup) in cases {
@@ -2050,7 +2044,8 @@ fn checkout_local_line_ending_config_cannot_change_the_staged_tree() {
     }
 }
 
-/// An unreadable git configuration must refuse, not read as "no attributes and no filters".
+/// An unreadable git configuration must refuse, not read as "no attributes and no filters". The
+/// configuration is read first, so an include.path that names a directory reaches this refusal.
 #[test]
 fn an_unreadable_checkout_config_is_refused_before_anything_else() {
     let (tmp, home, src, sha) = refusal_setup("bad-config");
@@ -2059,6 +2054,26 @@ fn an_unreadable_checkout_config_is_refused_before_anything_else() {
     git(&src, &["config", "include.path", dir.to_str().unwrap()]);
     let before = snapshot(&home);
     let o = install_tiny(&home, &src, &sha);
+    assert_eq!(o.status.code(), Some(3), "{}", err(&o));
+    assert!(
+        err(&o).contains("E_SOURCE_UNTRUSTED")
+            && err(&o).contains("cannot read the git configuration")
+            && err(&o).contains("git exit 128"),
+        "{}",
+        err(&o)
+    );
+    assert_eq!(snapshot(&home), before);
+}
+
+/// A source directory that is not a git checkout passes the configuration read (git finds no
+/// repository configuration and exits 1), so the git directory read is what refuses it.
+#[test]
+fn a_source_that_is_not_a_git_checkout_is_refused_for_its_git_directory() {
+    let (tmp, home, _src, sha) = refusal_setup("not-a-checkout");
+    let plain = tmp.path().join("plain");
+    fs::create_dir(&plain).unwrap();
+    let before = snapshot(&home);
+    let o = install_tiny(&home, &plain, &sha);
     assert_eq!(o.status.code(), Some(3), "{}", err(&o));
     assert!(
         err(&o).contains("E_SOURCE_UNTRUSTED") && err(&o).contains("cannot read the git directory"),
@@ -2192,13 +2207,14 @@ fn a_manager_directory_open_to_group_or_others_stops_install_and_uninstall() {
 
 /// The owner branch cannot be reached with a real foreign directory, so the expected owner is
 /// another user id (test mode only). The first existing component below HOME is the one named.
+/// Uninstall refuses HOME itself first (check_home_dir uses the same override), so its own test
+/// follows; install checks the binding chain, which always uses the real user id, before the rest.
 #[test]
-fn a_directory_below_home_owned_by_another_user_stops_install_and_uninstall() {
+fn a_directory_below_home_owned_by_another_user_stops_install() {
     let (tmp, home, src, sha) = refusal_setup("foreign-owner");
     let before = snapshot(&home);
     let other = (dfm_platform_macos::current_uid().unwrap() + 1).to_string();
-    let env = [("DFM_TEST_UID", other.as_str())];
-    let install = script_test_mode(
+    let o = script_test_mode(
         &home,
         &[
             "install",
@@ -2207,19 +2223,38 @@ fn a_directory_below_home_owned_by_another_user_stops_install_and_uninstall() {
             "--commit",
             &sha,
         ],
-        &env,
+        &[("DFM_TEST_UID", other.as_str())],
     );
-    let uninstall = script_test_mode(&home, &["uninstall"], &env);
-    for (what, o) in [("install", install), ("uninstall", uninstall)] {
-        assert_eq!(o.status.code(), Some(3), "{what}: {}", err(&o));
-        assert!(
-            err(&o).contains("E_PREREQ_MISSING")
-                && err(&o).contains(home.join(".local").to_str().unwrap())
-                && err(&o).contains("is not owned by the current user"),
-            "{what}: {}",
-            err(&o)
-        );
-    }
+    assert_eq!(o.status.code(), Some(3), "{}", err(&o));
+    assert!(
+        err(&o).contains("E_PREREQ_MISSING")
+            && err(&o).contains(home.join(".local").to_str().unwrap())
+            && err(&o).contains("is not owned by the current user"),
+        "{}",
+        err(&o)
+    );
+    assert_eq!(snapshot(&home), before, "refusal must not write");
+    drop(tmp);
+}
+
+/// HOME owned by another user is refused by uninstall before any tree below it is checked or removed.
+#[test]
+fn uninstall_refuses_a_home_owned_by_another_user_and_removes_nothing() {
+    let (tmp, home, _src, _sha) = refusal_setup("foreign-home");
+    fs::create_dir_all(home.join(".cache/dotfiles-manager/build")).unwrap();
+    let before = snapshot(&home);
+    let other = (dfm_platform_macos::current_uid().unwrap() + 1).to_string();
+    let o = script_test_mode(&home, &["uninstall"], &[("DFM_TEST_UID", other.as_str())]);
+    assert_eq!(o.status.code(), Some(3), "{}", err(&o));
+    assert!(
+        err(&o).contains("E_PREREQ_MISSING")
+            && err(&o).contains(&format!(
+                "{} is not owned by the current user",
+                home.display()
+            )),
+        "{}",
+        err(&o)
+    );
     assert_eq!(snapshot(&home), before, "refusal must not write");
     drop(tmp);
 }

@@ -531,7 +531,7 @@ check_config_tree() {
 # uninstall removes trees below HOME, so HOME itself must be closed to other users too: the same
 # owner and mode rule that check_config_tree applies to it, without the .config components.
 check_home_dir() {
-  [ "$(/usr/bin/stat -f %u "$HOME_DIR/.")" = "$(/usr/bin/id -u)" ] ||
+  [ "$(/usr/bin/stat -f %u "$HOME_DIR/.")" = "$(owner_uid)" ] ||
     refuse E_PREREQ_MISSING "$HOME_DIR is not owned by the current user; move the manager's trees away first"
   _m=$(/usr/bin/stat -f %Lp "$HOME_DIR/.")
   [ $(( 0$_m & 022 )) -eq 0 ] ||
@@ -624,12 +624,12 @@ cmd_install() {
   # commands from the checkout's config, so the staged tree could differ from the pinned commit.
   # Attributes committed in the pinned tree stay part of that commit; no filter can run for them.
   # A failed git call refuses: an empty answer must never read as "nothing found".
+  rc=0; found=$(git_clean -C "$src" config --get-regexp '^(core\.attributesfile|filter\.)' 2>/dev/null) || rc=$?
+  [ "$rc" -le 1 ] || refuse E_SOURCE_UNTRUSTED "cannot read the git configuration of the source checkout (git exit $rc)"
+  [ -z "$found" ] || refuse E_SOURCE_UNTRUSTED "the source checkout configures core.attributesFile or a filter; remove it first"
   attrs=$(git_clean -C "$src" rev-parse --path-format=absolute --git-path info/attributes 2>/dev/null) && [ -n "$attrs" ] ||
     refuse E_SOURCE_UNTRUSTED "cannot read the git directory of the source checkout"
   [ ! -s "$attrs" ] || refuse E_SOURCE_UNTRUSTED "the source checkout has .git/info/attributes; remove it first"
-  rc=0; found=$(git_clean -C "$src" config --get-regexp '^(core\.attributesfile|filter\.)' 2>/dev/null) || rc=$?
-  [ "$rc" -le 1 ] || refuse E_SOURCE_UNTRUSTED "cannot read the git configuration of the source checkout"
-  [ -z "$found" ] || refuse E_SOURCE_UNTRUSTED "the source checkout configures core.attributesFile or a filter; remove it first"
   # Read-only prerequisite and identity checks come first.
   [ "$(git_clean -C "$src" rev-parse --show-object-format 2>/dev/null)" = "$fmt" ] ||
     refuse E_SOURCE_UNTRUSTED "the source checkout does not use the $fmt object format of the pin"

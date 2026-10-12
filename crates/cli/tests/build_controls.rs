@@ -337,6 +337,47 @@ fn unreadable_directory_in_the_staged_tree_is_refused_by_both_checkers() {
     );
 }
 
+/// The manager refuses a toolchain location whose ancestors below HOME another user could swap:
+/// a link, or a directory open to group or others. The shell checker enforces the same rule in
+/// `install` (`check_data_tree`), tested in tests/bootstrap.rs.
+#[test]
+fn a_linked_or_open_toolchain_ancestor_is_refused_by_the_manager() {
+    use std::os::unix::fs::PermissionsExt;
+    type Damage = fn(&Path);
+    let cases: [(&str, Damage); 4] = [
+        ("share-open", |h| set_mode(&h.join(".local/share"), 0o775)),
+        ("toolchains-open", |h| {
+            set_mode(&h.join(".local/share/dotfiles-manager/toolchains"), 0o757)
+        }),
+        ("local-link", |h| {
+            let real = h.join("real-local");
+            fs::rename(h.join(".local"), &real).unwrap();
+            std::os::unix::fs::symlink(&real, h.join(".local")).unwrap();
+        }),
+        ("manager-link", |h| {
+            let m = h.join(".local/share/dotfiles-manager");
+            fs::rename(&m, h.join("real-manager")).unwrap();
+            std::os::unix::fs::symlink(h.join("real-manager"), &m).unwrap();
+        }),
+    ];
+    for (name, damage) in cases {
+        let tmp = TempDir::new(name);
+        let (home, stage) = materialize(&fixtures().join("cases/ok-base"), tmp.path());
+        let ok = run_manager(&home, &stage);
+        assert_eq!(ok.code, 0, "{name} control: {}", ok.stderr);
+        let _restore = RestoreMode(home.join(".local/share"));
+        damage(&home);
+        let m = run_manager(&home, &stage);
+        fs::set_permissions(home.join(".local/share"), fs::Permissions::from_mode(0o755)).ok();
+        assert_eq!(
+            (m.code, m.verdict()),
+            (3, "E_TOOLCHAIN_MISMATCH".into()),
+            "{name}: {}",
+            m.stderr
+        );
+    }
+}
+
 fn shell_digest(home: &Path, dir: &Path) -> Output {
     Command::new("/bin/sh")
         .arg(repo_root().join("scripts/bootstrap.sh"))
