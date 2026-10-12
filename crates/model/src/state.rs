@@ -61,7 +61,8 @@ fn depth(v: &serde_json::Value) -> usize {
 /// before the depth check so a document written by a newer binary is reported as newer even
 /// when its shape (deeper nesting, a schema above `i64`) is not one this binary accepts. The
 /// size cap stays first: an oversize document is never parsed. A document nested past the JSON
-/// parser's own recursion limit (128) is not valid JSON here and cannot be told apart.
+/// parser's own recursion limit (128) fails to parse, so its top-level `schema` is read by
+/// [`deep_schema`], which does not recurse, and a newer one is still reported as newer.
 pub fn parse<T: DeserializeOwned>(kind: &str, bytes: &[u8]) -> Result<T, Refusal> {
     if bytes.len() > MAX_BYTES {
         return Err(Refusal::new(
@@ -69,8 +70,18 @@ pub fn parse<T: DeserializeOwned>(kind: &str, bytes: &[u8]) -> Result<T, Refusal
             format!("{kind} exceeds 16 MiB"),
         ));
     }
-    let v: serde_json::Value =
-        serde_json::from_slice(bytes).map_err(|e| bad(format!("{kind} is not valid JSON: {e}")))?;
+    let v: serde_json::Value = serde_json::from_slice(bytes).map_err(|e| {
+        let newer_n = e
+            .to_string()
+            .contains("recursion limit exceeded")
+            .then(|| deep_schema(bytes))
+            .flatten()
+            .filter(|n| *n > SCHEMA.unsigned_abs());
+        match newer_n {
+            Some(n) => newer(kind, &n.to_string()),
+            None => bad(format!("{kind} is not valid JSON: {e}")),
+        }
+    })?;
     let schema = v.get("schema");
     match schema.and_then(serde_json::Value::as_i64) {
         Some(SCHEMA) => {}
@@ -91,6 +102,46 @@ pub fn parse<T: DeserializeOwned>(kind: &str, bytes: &[u8]) -> Result<T, Refusal
         return Err(bad(format!("{kind} nests deeper than {MAX_DEPTH}")));
     }
     serde_json::from_value(v).map_err(|e| bad(format!("{kind}: {e}")))
+}
+
+/// The unsigned integer value of the top-level `schema` member of a JSON object, found by a
+/// scan that tracks nesting with a counter, so no depth can exhaust the stack. It does not
+/// validate the document. A key spelled with escapes, or a value that is not a plain unsigned
+/// integer, gives `None`.
+fn deep_schema(b: &[u8]) -> Option<u64> {
+    let mut i = b.iter().position(|c| !c.is_ascii_whitespace())?;
+    if b[i] != b'{' {
+        return None;
+    }
+    i += 1;
+    let (mut depth, mut key) = (1_usize, true);
+    while i < b.len() {
+        match b[i] {
+            b'"' => {
+                let start = i + 1;
+                i = start;
+                while i < b.len() && b[i] != b'"' {
+                    i += if b[i] == b'\\' { 2 } else { 1 };
+                }
+                if depth == 1 && key && b.get(start..i) == Some(b"schema".as_slice()) {
+                    let rest = b.get(i + 1..)?.trim_ascii_start();
+                    let rest = rest.strip_prefix(b":")?.trim_ascii_start();
+                    let digits = rest.iter().take_while(|c| c.is_ascii_digit()).count();
+                    if matches!(rest.get(digits), Some(b'.' | b'e' | b'E')) {
+                        return None;
+                    }
+                    return std::str::from_utf8(&rest[..digits]).ok()?.parse().ok();
+                }
+                key = false;
+            }
+            b'{' | b'[' => depth += 1,
+            b'}' | b']' => depth = depth.checked_sub(1).filter(|d| *d > 0)?,
+            b',' if depth == 1 => key = true,
+            _ => {}
+        }
+        i += 1;
+    }
+    None
 }
 
 fn newer(kind: &str, n: &str) -> Refusal {
@@ -2115,6 +2166,30 @@ mod tests {
         assert_eq!(code(&deep("2")), Code::StateNewer);
         assert_eq!(code(&deep("0")), Code::SchemaUnsupported);
         assert_eq!(code(&deep("1")), Code::StateInvalid);
+        // Past the JSON parser's own recursion limit the schema is still read first.
+        let very_deep = |schema: &str, extra: &str| {
+            format!(
+                "{{\"x\":{}1{},{extra}\"schema\":{schema}}}",
+                "[".repeat(200),
+                "]".repeat(200)
+            )
+        };
+        assert_eq!(code(&very_deep("2", "")), Code::StateNewer);
+        assert_eq!(
+            code(&very_deep(" 3 ", "\"y\":\"a\\\"b\",")),
+            Code::StateNewer
+        );
+        assert_eq!(code(&very_deep("1", "")), Code::StateInvalid);
+        assert_eq!(code(&very_deep("2.5", "")), Code::StateInvalid);
+        // Only the top-level member counts: a nested `schema` is not the document's.
+        let nested = format!(
+            "{{\"x\":{{\"schema\":9}},\"y\":{}1{}}}",
+            "[".repeat(200),
+            "]".repeat(200)
+        );
+        assert_eq!(code(&nested), Code::StateInvalid);
+        // Broken JSON that is not a depth failure is invalid, whatever its schema says.
+        assert_eq!(code("{\"schema\":2,"), Code::StateInvalid);
         // A schema above i64::MAX is a schema from the future, not a missing one.
         assert_eq!(code("{\"schema\":18446744073709551615}"), Code::StateNewer);
         assert_eq!(code("{\"schema\":1.5}"), Code::StateInvalid);
