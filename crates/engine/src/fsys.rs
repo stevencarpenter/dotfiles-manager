@@ -1,11 +1,11 @@
 //! Storage topology, the writer lock and atomic file operations (docs/state.md).
 //!
 //! Every operation is relative to an open, verified directory descriptor ([`Dir`]): `openat`,
-//! `mkdirat`, `renameat`, `linkat`, `unlinkat` and `fstatat`, all with `O_NOFOLLOW` or
+//! `mkdirat`, `renameat`, `unlinkat` and `fstatat`, all with `O_NOFOLLOW` or
 //! `AT_SYMLINK_NOFOLLOW`, through the safe API of `rustix`. A directory is checked on the
 //! descriptor it opened (`fstat`), never by path, so swapping a path component after the check
 //! cannot redirect a later operation: the descriptor keeps naming the directory that was
-//! verified. `unsafe` stays forbidden in this workspace.
+//! verified. `unsafe` is denied workspace-wide, with one `expect` in `signal.rs`.
 //!
 //! What is still path-based: HOME is resolved once with `canonicalize` and then opened (aliases
 //! such as `/var` to `/private/var` are accepted above HOME), and a claim's parent directories
@@ -122,6 +122,11 @@ pub(crate) fn temp_name(name: &str, suffix: &str) -> String {
         std::process::id(),
         N.fetch_add(1, Ordering::Relaxed)
     )
+}
+
+/// Renames `from` to `to` in the directory `dir` and fails with `EEXIST` when `to` exists.
+pub(crate) fn rename_new(dir: &OwnedFd, from: &str, to: &str) -> Result<(), Errno> {
+    rfs::renameat_with(dir, from, dir, to, rfs::RenameFlags::NOREPLACE)
 }
 
 pub(crate) fn check_name(name: &str) -> Result<(), Refusal> {
@@ -391,11 +396,20 @@ impl Dir {
                         return Err(sys_err(&format!("create {}", self.at(name).display()), e));
                     }
                 };
+                if made {
+                    // By name and before the open: a umask that clears the owner's read bit
+                    // would leave a directory this process cannot open.
+                    rfs::chmodat(
+                        &self.fd,
+                        name,
+                        Mode::from_raw_mode(0o700),
+                        AtFlags::SYMLINK_NOFOLLOW,
+                    )
+                    .map_err(|e| sys_err("chmod new directory", e))?;
+                }
                 let fd = rfs::openat(&self.fd, name, flags, Mode::empty())
                     .map_err(|e| self.classify(name, e))?;
                 if made {
-                    rfs::fchmod(&fd, Mode::from_raw_mode(0o700))
-                        .map_err(|e| sys_err("chmod new directory", e))?;
                     // The new entry must be durable before anything is written inside.
                     self.sync()?;
                 }
@@ -594,20 +608,6 @@ impl Dir {
         let _ = rfs::unlinkat(&self.fd, tmp, AtFlags::empty());
     }
 
-    /// Removes the temporary name after a successful `linkat`. A failure leaves the published
-    /// file with two links, which the append check would later refuse, so it is reported.
-    fn drop_linked_temp(&self, tmp: &str) -> Result<(), Refusal> {
-        rfs::unlinkat(&self.fd, tmp, AtFlags::empty()).map_err(|e| {
-            Refusal::new(
-                Code::IoUnconfirmed,
-                format!(
-                    "published, but the temporary name {tmp} could not be removed: {}",
-                    std::io::Error::from(e)
-                ),
-            )
-        })
-    }
-
     fn require_plain(&self, name: &str) -> Result<(), Refusal> {
         match rfs::statat(&self.fd, name, AtFlags::SYMLINK_NOFOLLOW) {
             Ok(st) if kind(&st) == FileType::RegularFile => Ok(()),
@@ -649,9 +649,10 @@ impl Dir {
         )
     }
 
-    /// Create-only publication (`linkat` never replaces). `Ok(false)` means the name existed and
-    /// nothing was written. Failure points are as for [`Dir::replace_file`], with `-after-tmp`
-    /// before the link.
+    /// Create-only publication: the staged file is renamed with `RENAME_EXCL`, which never
+    /// replaces and leaves one link, so there is no moment with two names for the file.
+    /// `Ok(false)` means the name existed and nothing was written. Failure points are as for
+    /// [`Dir::replace_file`], with `-after-tmp` before the rename.
     pub fn publish_new(
         &self,
         name: &str,
@@ -664,7 +665,7 @@ impl Dir {
         let tmp = self.write_temp(name, bytes)?;
         let step = || -> Result<bool, Refusal> {
             fail.hit(&format!("{label}-after-tmp"))?;
-            match rfs::linkat(&self.fd, &tmp, &self.fd, name, AtFlags::empty()) {
+            match rename_new(&self.fd, &tmp, name) {
                 Ok(()) => Ok(true),
                 Err(Errno::EXIST) => Ok(false),
                 Err(e) => Err(sys_err("publish", e)),
@@ -672,7 +673,6 @@ impl Dir {
         };
         let r = step();
         if r.as_ref().is_ok_and(|created| *created) {
-            self.drop_linked_temp(&tmp)?;
             unconfirmed(
                 fail.hit(&format!("{label}-after-rename"))
                     .and_then(|()| self.sync()),

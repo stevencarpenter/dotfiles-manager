@@ -676,8 +676,8 @@ fn bind(ctx: &Ctx, profile: String, machine_id: String) -> Result<String, Refusa
 }
 
 /// Writes the binding with create-new semantics. `Ok(false)` means the file already existed.
-/// The content is complete before it becomes visible: temporary file, fsync, then `linkat`
-/// (which never replaces an existing file), all relative to the verified directory.
+/// The content is complete before it becomes visible: temporary file, fsync, then an exclusive
+/// rename (which never replaces an existing file), all relative to the verified directory.
 fn publish(dir: &Dir, name: &str, b: &Binding) -> Result<bool, Refusal> {
     dir.publish_new(name, b.to_toml().as_bytes(), &Fail::none(), "binding")
 }
