@@ -1567,7 +1567,7 @@ fn record_trial(h: &Path, id: &str, baseline: &Path) -> Output {
 fn a_trial_baseline_that_cannot_be_read_or_is_a_link_is_an_error_not_an_absent_file() {
     let h = bound_home("baseline");
     let trial = state(h.path()).join("trials/t1.json");
-    // A missing path is recorded as absent; a plain file is recorded with its hash.
+    // A missing path is recorded as absent; a plain file is recorded with its file fingerprint.
     let o = record_trial(h.path(), "t1", &h.path().join("nothing"));
     assert_eq!(o.status.code(), Some(0), "{}", text(&o.stderr));
     assert_eq!(
@@ -1580,7 +1580,7 @@ fn a_trial_baseline_that_cannot_be_read_or_is_a_link_is_an_error_not_an_absent_f
     assert_eq!(o.status.code(), Some(0), "{}", text(&o.stderr));
     let t2 = json(&fs::read(state(h.path()).join("trials/t2.json")).unwrap());
     assert_eq!(t2["baseline"]["paths"][0]["existed"], true);
-    assert_eq!(t2["baseline"]["paths"][0]["sha256"], sha_hex("baseline"));
+    assert_eq!(t2["baseline"]["paths"][0]["sha256"], fp_hex("baseline"));
 
     // A link (also one to a readable file) and a directory are refused, and no trial is written.
     let link = h.path().join("link");
