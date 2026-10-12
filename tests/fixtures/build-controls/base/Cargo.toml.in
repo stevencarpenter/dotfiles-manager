@@ -1,0 +1,7 @@
+[workspace]
+resolver = "3"
+members = ["crates/a", "crates/b"]
+
+[workspace.dependencies]
+serde = { version = "=1.0.229", features = ["derive"] }
+b = { path = "crates/b" }

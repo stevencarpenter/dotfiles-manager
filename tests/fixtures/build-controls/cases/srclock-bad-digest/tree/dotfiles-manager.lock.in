@@ -1,0 +1,5 @@
+schema = 1
+
+[manager]
+toolchain = "9.9.9"
+toolchain_tree_sha256 = "XYZ"

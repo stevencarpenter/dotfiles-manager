@@ -1,0 +1,7 @@
+# Synthetic public bundle shared by every machine in these fixtures.
+schema = 1
+id = "synthetic-shared"
+core = "core/module.toml"
+
+[modules]
+reusable = "reusable/module.toml"

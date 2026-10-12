@@ -1,0 +1,2430 @@
+//! Versioned machine-written state documents (docs/architecture.md sections 4 and 5, docs/state.md).
+//!
+//! Pure data: parsing takes already-read bytes. Every document has an integer `schema` that is
+//! checked before any other field, and unknown keys are refused.
+
+use crate::binding::Binding;
+use crate::fold::fold;
+use crate::{Code, Refusal};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use std::collections::{BTreeMap, BTreeSet};
+
+pub const SCHEMA: i64 = 1;
+/// Largest JSON state file (section 5, parser and read limits).
+pub const MAX_BYTES: usize = 16 << 20;
+/// Longest journal line. A longer line is a journal error, not a skipped line.
+pub const MAX_JOURNAL_LINE: usize = 64 << 10;
+const MAX_DEPTH: usize = 32;
+/// Provider text kept in a receipt or journal entry (section 8, secrets item 3).
+pub const MAX_ERROR_BYTES: usize = 4096;
+/// Largest ledger, receipt or trial document the manager writes. The read cap is larger, so a
+/// document the manager wrote is always readable and a hand-made huge one is still refused.
+pub const MAX_WRITE_BYTES: usize = 4 << 20;
+/// Largest total size of the journal. An append that would pass it is refused before writing.
+pub const MAX_JOURNAL_BYTES: u64 = 8 << 20;
+
+fn bad(d: impl Into<String>) -> Refusal {
+    Refusal::new(Code::StateInvalid, d)
+}
+
+/// Valid id for operations, trials and resources: lowercase ASCII, 1 to 64 characters.
+pub fn valid_id(id: &str) -> bool {
+    crate::binding::valid_machine_id(id)
+}
+
+fn valid_sha256(s: &str) -> bool {
+    s.len() == 64
+        && s.bytes()
+            .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
+}
+
+/// An absolute path with no `.` or `..` component, no empty component and no control character.
+pub fn valid_path(p: &str) -> bool {
+    p.starts_with('/')
+        && p.len() > 1
+        && !p.ends_with('/')
+        && !p.chars().any(char::is_control)
+        && p[1..]
+            .split('/')
+            .all(|c| !c.is_empty() && c != "." && c != "..")
+}
+
+fn depth(v: &serde_json::Value) -> usize {
+    match v {
+        serde_json::Value::Array(a) => 1 + a.iter().map(depth).max().unwrap_or(0),
+        serde_json::Value::Object(o) => 1 + o.values().map(depth).max().unwrap_or(0),
+        _ => 0,
+    }
+}
+
+/// Strict parse. Order: size, JSON, schema, depth, then the typed fields. The schema comes
+/// before the depth check so a document written by a newer binary is reported as newer even
+/// when its shape (deeper nesting, a schema above `i64`) is not one this binary accepts. The
+/// size cap stays first: an oversize document is never parsed. A document nested past the JSON
+/// parser's own recursion limit (128) fails to parse, so its top-level `schema` is read by
+/// [`deep_schema`], which does not recurse, and a newer one is still reported as newer.
+pub fn parse<T: DeserializeOwned>(kind: &str, bytes: &[u8]) -> Result<T, Refusal> {
+    if bytes.len() > MAX_BYTES {
+        return Err(Refusal::new(
+            Code::LimitExceeded,
+            format!("{kind} exceeds 16 MiB"),
+        ));
+    }
+    let v: serde_json::Value = serde_json::from_slice(bytes).map_err(|e| {
+        let newer_n = e
+            .to_string()
+            .contains("recursion limit exceeded")
+            .then(|| deep_schema(bytes))
+            .flatten()
+            .filter(|n| *n > SCHEMA.unsigned_abs());
+        match newer_n {
+            Some(n) => newer(kind, &n.to_string()),
+            None => bad(format!("{kind} is not valid JSON: {e}")),
+        }
+    })?;
+    let schema = v.get("schema");
+    match schema.and_then(serde_json::Value::as_i64) {
+        Some(SCHEMA) => {}
+        Some(n) if n > SCHEMA => return Err(newer(kind, &n.to_string())),
+        Some(n) => {
+            return Err(Refusal::new(
+                Code::SchemaUnsupported,
+                format!("{kind} schema {n} is not supported (supported: 1)"),
+            ));
+        }
+        // An integer above `i64::MAX` is a schema this binary has never heard of: newer.
+        None => match schema.and_then(serde_json::Value::as_u64) {
+            Some(n) => return Err(newer(kind, &n.to_string())),
+            None => return Err(bad(format!("{kind} has no integer schema"))),
+        },
+    }
+    if depth(&v) > MAX_DEPTH {
+        return Err(bad(format!("{kind} nests deeper than {MAX_DEPTH}")));
+    }
+    serde_json::from_value(v).map_err(|e| bad(format!("{kind}: {e}")))
+}
+
+/// The unsigned integer value of the top-level `schema` member of a JSON object, found by a
+/// scan that tracks nesting with a counter, so no depth can exhaust the stack. It does not
+/// validate the document. A key spelled with escapes, or a value that is not a plain unsigned
+/// integer, gives `None`.
+fn deep_schema(b: &[u8]) -> Option<u64> {
+    let mut i = b.iter().position(|c| !c.is_ascii_whitespace())?;
+    if b[i] != b'{' {
+        return None;
+    }
+    i += 1;
+    let (mut depth, mut key) = (1_usize, true);
+    while i < b.len() {
+        match b[i] {
+            b'"' => {
+                let start = i + 1;
+                i = start;
+                while i < b.len() && b[i] != b'"' {
+                    i += if b[i] == b'\\' { 2 } else { 1 };
+                }
+                if depth == 1 && key && b.get(start..i) == Some(b"schema".as_slice()) {
+                    let rest = b.get(i + 1..)?.trim_ascii_start();
+                    let rest = rest.strip_prefix(b":")?.trim_ascii_start();
+                    let digits = rest.iter().take_while(|c| c.is_ascii_digit()).count();
+                    if matches!(rest.get(digits), Some(b'.' | b'e' | b'E')) {
+                        return None;
+                    }
+                    return std::str::from_utf8(&rest[..digits]).ok()?.parse().ok();
+                }
+                key = false;
+            }
+            b'{' | b'[' => depth += 1,
+            b'}' | b']' => depth = depth.checked_sub(1).filter(|d| *d > 0)?,
+            b',' if depth == 1 => key = true,
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+fn newer(kind: &str, n: &str) -> Refusal {
+    Refusal::new(
+        Code::StateNewer,
+        format!("{kind} schema {n} is newer than this binary supports (supported: 1)"),
+    )
+}
+
+/// Canonical form: UTF-8, sorted keys, no insignificant whitespace.
+pub fn canonical<T: Serialize>(doc: &T) -> Result<Vec<u8>, Refusal> {
+    // `Value` keeps objects in a sorted map (serde_json without `preserve_order`).
+    serde_json::to_value(doc)
+        .and_then(|v| serde_json::to_vec(&v))
+        .map_err(|e| bad(format!("cannot serialize: {e}")))
+}
+
+// ---- identity ---------------------------------------------------------------------------------
+
+/// The binding identity a record was written under. Identity is profile plus machine id;
+/// the binding digest is audit evidence and is not compared, because an authored binding edit
+/// (for example its origins) changes the digest without changing the owner.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Stamp {
+    pub profile: String,
+    pub machine_id: String,
+    pub binding_digest: String,
+}
+
+impl Stamp {
+    pub fn of(b: &Binding) -> Stamp {
+        Stamp {
+            profile: b.profile().into(),
+            machine_id: b.machine_id().into(),
+            binding_digest: b.digest(),
+        }
+    }
+
+    pub fn matches(&self, b: &Binding) -> bool {
+        self.profile == b.profile() && self.machine_id == b.machine_id()
+    }
+
+    pub fn same_identity(&self, other: &Stamp) -> bool {
+        self.profile == other.profile && self.machine_id == other.machine_id
+    }
+
+    fn validate(&self) -> Result<(), Refusal> {
+        Binding::new(&self.profile, &self.machine_id).map_err(|r| bad(r.detail))?;
+        if !valid_sha256(&self.binding_digest) {
+            return Err(bad("binding_digest is not a SHA-256"));
+        }
+        Ok(())
+    }
+}
+
+/// `state/state.json`: records which identity owns this state directory.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StateDoc {
+    pub schema: i64,
+    pub binding: Stamp,
+    pub created_unix: u64,
+}
+
+impl StateDoc {
+    pub fn new(binding: Stamp, created_unix: u64) -> StateDoc {
+        StateDoc {
+            schema: SCHEMA,
+            binding,
+            created_unix,
+        }
+    }
+
+    pub fn parse(bytes: &[u8]) -> Result<StateDoc, Refusal> {
+        let d: StateDoc = parse("state.json", bytes)?;
+        d.binding.validate()?;
+        Ok(d)
+    }
+}
+
+// ---- ledger -----------------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Class {
+    Normal,
+    Sensitive,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OwnedOutput {
+    pub path: String,
+    pub mode: u32,
+    /// SHA-256 of the content the manager wrote. Absent for sensitive resources.
+    pub fingerprint: Option<String>,
+    /// Present only for a co-owned sensitive file (`claude-settings/v1`, DFM-21). It holds the
+    /// one salted hash the ledger may keep and the entries the manager added to the file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub coowned: Option<CoOwned>,
+}
+
+/// What the manager records about a co-owned file (docs/architecture.md section 8 item 7).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CoOwned {
+    /// Per-machine salted hash of the managed fields as the manager last wrote them. It lives
+    /// in `ledger.json` only: never in a receipt, journal, snapshot, plan, table or `doctor`.
+    pub managed_hash: String,
+    /// The handler entries the manager added, so it retires only those.
+    pub entries: Vec<OwnedEntry>,
+    /// The array items the manager appended under an `append` policy (DFM-48), so it removes
+    /// only those. Absent in a ledger written before DFM-48, which reads as empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub appended: Vec<AppendedItem>,
+    /// Salted hash of each managed leaf as last written, by JSON pointer (DFM-48). The conflict
+    /// check compares leaf by leaf, so dropping a key or a fragment is not taken for a hand edit.
+    /// Absent in a ledger written before DFM-48: the check then uses `managed_hash` alone.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub leaves: BTreeMap<String, String>,
+}
+
+/// One item the manager appended to a foreign array of a co-owned file. `sha256` is the hash of
+/// the item the module declared (the manager's own content), never of live content.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AppendedItem {
+    /// JSON pointer of the array in the settings document, such as `/sandbox/filesystem/allowWrite`.
+    pub pointer: String,
+    pub sha256: String,
+}
+
+/// One list entry the manager added to a co-owned file. `sha256` is the hash of the entry the
+/// module declared (the manager's own content), never of live content.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OwnedEntry {
+    pub id: String,
+    /// The list the entry sits in (for the settings merge, the hook event name).
+    pub key: String,
+    pub sha256: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LedgerResource {
+    pub resource: String,
+    pub adapter: String,
+    pub class: Class,
+    /// The operation that last wrote these outputs.
+    pub op_id: String,
+    pub owned_outputs: Vec<OwnedOutput>,
+}
+
+/// `state/ledger.json`: the only source of delete authority (section 4).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Ledger {
+    pub schema: i64,
+    pub binding: Stamp,
+    pub resources: Vec<LedgerResource>,
+}
+
+impl Ledger {
+    pub fn empty(binding: Stamp) -> Ledger {
+        Ledger {
+            schema: SCHEMA,
+            binding,
+            resources: Vec::new(),
+        }
+    }
+
+    pub fn parse(bytes: &[u8]) -> Result<Ledger, Refusal> {
+        let l: Ledger = parse("ledger.json", bytes)?;
+        l.validate()?;
+        Ok(l)
+    }
+
+    /// Exact ownership: unique resources, unique output paths across all resources (two owners
+    /// for one path is a conflict; paths that differ only by case name one output on a
+    /// case-insensitive volume, so they count as one path), normalized absolute paths, and no content hash for a
+    /// sensitive resource.
+    pub fn validate(&self) -> Result<(), Refusal> {
+        if self.schema != SCHEMA {
+            return Err(bad("ledger schema"));
+        }
+        self.binding.validate()?;
+        let mut resources = BTreeSet::new();
+        let mut paths = BTreeSet::new();
+        for r in &self.resources {
+            if !valid_id(&r.op_id) || r.resource.is_empty() || r.adapter.is_empty() {
+                return Err(bad(format!(
+                    "ledger resource {:?} is malformed",
+                    r.resource
+                )));
+            }
+            if !resources.insert(&r.resource) {
+                return Err(bad(format!("ledger lists {} twice", r.resource)));
+            }
+            for o in &r.owned_outputs {
+                if !valid_path(&o.path) {
+                    return Err(bad(format!("ledger path {:?} is not normalized", o.path)));
+                }
+                if !paths.insert(fold(&o.path)) {
+                    return Err(bad(format!(
+                        "ledger gives {} two owners or two spellings",
+                        o.path
+                    )));
+                }
+                match (r.class, &o.fingerprint) {
+                    (Class::Normal, Some(f)) if valid_sha256(f) => {}
+                    (Class::Sensitive, None) => {}
+                    _ => {
+                        return Err(bad(format!(
+                            "ledger fingerprint for {} does not fit its class",
+                            o.path
+                        )));
+                    }
+                }
+                if let Some(c) = &o.coowned {
+                    let entries_ok = c.entries.iter().all(|e| {
+                        !e.id.is_empty()
+                            && !e.key.is_empty()
+                            && !e.id.chars().chain(e.key.chars()).any(char::is_control)
+                            && valid_sha256(&e.sha256)
+                    });
+                    // A pointer must be in canonical spelling and may not reach `hooks`, which the
+                    // manager edits only through handler entries.
+                    let pointer_ok = |p: &str| {
+                        crate::merge::normal_pointer(p).as_deref() == Some(p)
+                            && p != "/hooks"
+                            && !p.starts_with("/hooks/")
+                    };
+                    let appended_ok = c
+                        .appended
+                        .iter()
+                        .all(|a| pointer_ok(&a.pointer) && valid_sha256(&a.sha256))
+                        && c.leaves
+                            .iter()
+                            .all(|(p, h)| pointer_ok(p) && valid_sha256(h));
+                    if r.class != Class::Sensitive
+                        || !valid_sha256(&c.managed_hash)
+                        || !entries_ok
+                        || !appended_ok
+                    {
+                        return Err(bad(format!(
+                            "ledger co-owned record for {} is malformed or not sensitive",
+                            o.path
+                        )));
+                    }
+                    // Retire removes one live element for each record, so a repeated record would
+                    // also remove a user's identical copy.
+                    let mut hooks = BTreeSet::new();
+                    let mut items = BTreeSet::new();
+                    if !c.entries.iter().all(|e| hooks.insert((&e.key, &e.sha256)))
+                        || !c
+                            .appended
+                            .iter()
+                            .all(|a| items.insert((&a.pointer, &a.sha256)))
+                    {
+                        return Err(bad(format!(
+                            "ledger co-owned record for {} repeats a hook or appended record",
+                            o.path
+                        )));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Delete authority for one exact output. It needs a ledger entry for this resource and path
+    /// whose fingerprint equals the live one. A mismatch is a conflict and authorizes nothing,
+    /// and so does a sensitive resource (its salted comparison is not implemented).
+    pub fn authorizes_delete(&self, resource: &str, path: &str, live_sha256: &str) -> bool {
+        self.resources
+            .iter()
+            .filter(|r| r.resource == resource && r.class == Class::Normal)
+            .flat_map(|r| &r.owned_outputs)
+            .any(|o| o.path == path && o.fingerprint.as_deref() == Some(live_sha256))
+    }
+
+    /// Replaces or adds one resource entry. Refuses an output another resource already owns.
+    pub fn record(&mut self, entry: LedgerResource) -> Result<(), Refusal> {
+        let mut next = self.clone();
+        next.resources.retain(|r| r.resource != entry.resource);
+        next.resources.push(entry);
+        next.resources.sort_by(|a, b| a.resource.cmp(&b.resource));
+        next.validate()?;
+        *self = next;
+        Ok(())
+    }
+}
+
+// ---- receipts ---------------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Status {
+    Updated,
+    Current,
+    Held,
+    Pending,
+    Failed,
+    Blocked,
+    BlockedPending,
+    NotStarted,
+    NotInScope,
+    Unknown,
+}
+
+impl Status {
+    pub const ALL: [Status; 10] = [
+        Status::Updated,
+        Status::Current,
+        Status::Held,
+        Status::Pending,
+        Status::Failed,
+        Status::Blocked,
+        Status::BlockedPending,
+        Status::NotStarted,
+        Status::NotInScope,
+        Status::Unknown,
+    ];
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Fingerprint {
+    pub fingerprint: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OperationRecord {
+    pub id: String,
+    pub resource: String,
+    pub adapter: String,
+    /// Sensitivity class. A sensitive operation carries no `before` or `after`.
+    pub class: Class,
+    pub status: Status,
+    /// Absent only for an operation that never ran (`not_started`, `not_in_scope`).
+    pub started_at: Option<String>,
+    pub finished_at: Option<String>,
+    pub before: Option<Fingerprint>,
+    pub after: Option<Fingerprint>,
+    pub owned_outputs: Vec<String>,
+    pub error: Option<String>,
+    /// What happened to the consumer of a published file, recorded apart from the publication
+    /// (architecture section 8: a correct file and a reloaded consumer are separate
+    /// postconditions). One of [`RELOADS`]. Absent when the operation published nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reload: Option<String>,
+}
+
+/// The consumer reload states the manager can record. Only `not_attempted` exists until a
+/// `Reloader` does (architecture section 11 names `requested`, `reloaded`, `unsupported` and
+/// `failed` for it). A state nothing can write is refused, so a receipt cannot claim one.
+pub const RELOADS: [&str; 1] = ["not_attempted"];
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BinaryId {
+    pub version: String,
+    pub commit: String,
+    pub sha256: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProfileRef {
+    pub id: String,
+    pub binding_digest: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Approval {
+    pub kind: String,
+    pub plan_digest: String,
+    pub at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SourceId {
+    pub id: String,
+    /// Absent for a local path source, which has no commit. The `tree` digest identifies it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commit: Option<String>,
+    pub tree: String,
+}
+
+/// One approved disruptive operation or adoption (architecture section 5, `approvals[]`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DisruptiveApproval {
+    /// The `id` of the receipt operation that ran with this approval.
+    pub operation_id: String,
+    /// `allow_disruptive` or `allow_adopt` (DFM-45). The contract also names `interactive`,
+    /// which needs a prompt that does not exist yet.
+    pub how: String,
+    pub at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RunResult {
+    pub outcome: String,
+    pub exit_code: u8,
+    pub counts: BTreeMap<Status, u32>,
+}
+
+/// `state/receipts/<utc-timestamp>-<op-id>.json`: audit evidence, immutable, never authority.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Receipt {
+    pub schema: i64,
+    pub op_id: String,
+    pub command: String,
+    pub started_at: String,
+    pub finished_at: String,
+    pub binary: BinaryId,
+    pub profile: ProfileRef,
+    pub machine_id: String,
+    pub plan_digest: Option<String>,
+    pub approval: Option<Approval>,
+    pub sources: Vec<SourceId>,
+    /// One entry per disruptive operation or adoption that ran with an approval.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub approvals: Vec<DisruptiveApproval>,
+    pub operations: Vec<OperationRecord>,
+    pub result: RunResult,
+}
+
+impl Status {
+    /// An operation that did not complete as asked. A run with one cannot exit 0.
+    pub const fn is_problem(self) -> bool {
+        matches!(
+            self,
+            Status::Failed
+                | Status::Unknown
+                | Status::Blocked
+                | Status::BlockedPending
+                | Status::Pending
+        )
+    }
+}
+
+impl RunResult {
+    /// The result of a run that ended without a refusal or a signal: exit 0, or exit 1 when an
+    /// operation did not complete.
+    pub fn from_operations(ops: &[OperationRecord]) -> RunResult {
+        let failed = ops.iter().any(|o| o.status.is_problem());
+        RunResult {
+            outcome: if failed { "failed" } else { "ok" }.into(),
+            exit_code: u8::from(failed),
+            counts: count_statuses(ops),
+        }
+    }
+}
+
+/// One count per status; their sum is the number of participants.
+pub fn count_statuses(ops: &[OperationRecord]) -> BTreeMap<Status, u32> {
+    let mut counts: BTreeMap<Status, u32> = Status::ALL.iter().map(|s| (*s, 0)).collect();
+    for o in ops {
+        *counts.entry(o.status).or_insert(0) += 1;
+    }
+    counts
+}
+
+impl Receipt {
+    pub fn parse(bytes: &[u8]) -> Result<Receipt, Refusal> {
+        let r: Receipt = parse("receipt", bytes)?;
+        r.validate()?;
+        Ok(r)
+    }
+
+    pub fn stamp(&self) -> Stamp {
+        Stamp {
+            profile: self.profile.id.clone(),
+            machine_id: self.machine_id.clone(),
+            binding_digest: self.profile.binding_digest.clone(),
+        }
+    }
+
+    pub fn validate(&self) -> Result<(), Refusal> {
+        if self.schema != SCHEMA {
+            return Err(bad("receipt schema"));
+        }
+        if !valid_id(&self.op_id) || self.command.is_empty() || self.command.len() > MAX_ERROR_BYTES
+        {
+            return Err(bad("receipt op_id or command is malformed"));
+        }
+        self.stamp().validate()?;
+        for t in [&self.started_at, &self.finished_at] {
+            if parse_rfc3339(t).is_none() {
+                return Err(bad(format!(
+                    "receipt time {t:?} is not YYYY-MM-DDTHH:MM:SSZ"
+                )));
+            }
+        }
+        if self.result.counts != count_statuses(&self.operations) {
+            return Err(bad("receipt counts do not match its operations"));
+        }
+        self.validate_fields()?;
+        for o in &self.operations {
+            if o.class == Class::Sensitive && (o.before.is_some() || o.after.is_some()) {
+                return Err(bad(format!(
+                    "sensitive operation {} carries a fingerprint",
+                    o.id
+                )));
+            }
+            for f in [&o.before, &o.after].into_iter().flatten() {
+                if !valid_sha256(&f.fingerprint) {
+                    return Err(bad(format!("operation {} fingerprint is malformed", o.id)));
+                }
+            }
+            if o.owned_outputs.iter().any(|p| !valid_path(p)) {
+                return Err(bad(format!("operation {} output path is malformed", o.id)));
+            }
+            if o.error.as_ref().is_some_and(|e| e.len() > MAX_ERROR_BYTES) {
+                return Err(bad(format!("operation {} error is not bounded", o.id)));
+            }
+            if o.reload.as_deref().is_some_and(|r| !RELOADS.contains(&r)) {
+                return Err(bad(format!("operation {} reload state is unknown", o.id)));
+            }
+        }
+        Ok(())
+    }
+
+    /// The fields that carry no free text: each must have its exact shape, so nothing can be
+    /// hidden in them.
+    fn validate_fields(&self) -> Result<(), Refusal> {
+        let plain =
+            |t: &str| !t.is_empty() && t.len() <= 64 && t.chars().all(|c| c.is_ascii_graphic());
+        let hex_id =
+            |t: &str| matches!(t.len(), 40 | 64) && t.bytes().all(|c| c.is_ascii_hexdigit());
+        if !plain(&self.binary.version) || !plain(&self.binary.commit) {
+            return Err(bad("receipt binary version or commit is malformed"));
+        }
+        if !valid_sha256(&self.binary.sha256) {
+            return Err(bad("receipt binary sha256 is malformed"));
+        }
+        if self
+            .plan_digest
+            .as_deref()
+            .is_some_and(|d| !valid_sha256(d))
+        {
+            return Err(bad("receipt plan_digest is malformed"));
+        }
+        if let Some(a) = &self.approval
+            && (!matches!(a.kind.as_str(), "interactive" | "yes_plan")
+                || !valid_sha256(&a.plan_digest)
+                || parse_rfc3339(&a.at).is_none())
+        {
+            return Err(bad("receipt approval is malformed"));
+        }
+        for src in &self.sources {
+            let tree_ok = src.tree.strip_prefix("sha256:").is_some_and(valid_sha256);
+            let commit_ok = src.commit.as_deref().is_none_or(hex_id);
+            if !valid_id(&src.id) || !commit_ok || !tree_ok {
+                return Err(bad("receipt source identity is malformed"));
+            }
+        }
+        for a in &self.approvals {
+            let op = self.operations.iter().find(|o| o.id == a.operation_id);
+            // The receipt keeps no action, so the approval must fit the shape of its operation.
+            // A removal publishes and owns nothing. An adoption that ran owns its link and has
+            // no `before` and no `reload`. A failed or blocked operation has neither shape, so
+            // only its `how` is checked.
+            let fits = op.is_some_and(|o| match a.how.as_str() {
+                // A removal that ran records the fingerprint it removed as `before`.
+                "allow_disruptive" => {
+                    o.owned_outputs.is_empty()
+                        && o.after.is_none()
+                        && (o.status != Status::Updated || o.before.is_some())
+                }
+                // A link adoption publishes nothing. The first write into an existing co-owned
+                // (sensitive) file is also approved this way: it has no fingerprints, owns its
+                // output, and may carry a reload state because it published.
+                "allow_adopt" if o.class == Class::Sensitive => {
+                    o.before.is_none()
+                        && (o.status != Status::Updated || !o.owned_outputs.is_empty())
+                }
+                "allow_adopt" => {
+                    o.reload.is_none()
+                        && o.before.is_none()
+                        && (o.status != Status::Updated
+                            || (o.after.is_some() && !o.owned_outputs.is_empty()))
+                }
+                _ => false,
+            });
+            if !fits || parse_rfc3339(&a.at).is_none() {
+                return Err(bad("receipt approvals[] entry is malformed"));
+            }
+        }
+        let exit_name = match self.result.exit_code {
+            0 => "ok",
+            1 => "failed",
+            2 => "usage",
+            3 => "blocked",
+            4 => "declined",
+            5 => "pending",
+            130 => "interrupted",
+            143 => "terminated",
+            _ => return Err(bad("receipt exit_code is not a contract code")),
+        };
+        if self.result.outcome != exit_name {
+            return Err(bad("receipt outcome does not match its exit_code"));
+        }
+        // A run that reports success cannot hold an operation that did not succeed. The
+        // reverse (exit 1 with no such operation) is a real shape: a run can stop after a
+        // mutation, for example when settling an earlier journal fails, with every operation
+        // `current` or `not_started`.
+        if self.result.exit_code == 0 && self.operations.iter().any(|o| o.status.is_problem()) {
+            return Err(bad(
+                "receipt exit_code 0 contradicts a failed, unknown, blocked or pending operation",
+            ));
+        }
+        for o in &self.operations {
+            let named =
+                |t: &str| !t.is_empty() && t.len() <= 256 && !t.chars().any(char::is_control);
+            if !valid_id(&o.id) || !named(&o.resource) || !named(&o.adapter) {
+                return Err(bad(format!("operation {} has a malformed name", o.id)));
+            }
+            let never_ran = matches!(o.status, Status::NotStarted | Status::NotInScope);
+            for t in [&o.started_at, &o.finished_at] {
+                // An operation that never ran has no times; one that ran has valid times.
+                let ok = match t {
+                    Some(t) => !never_ran && parse_rfc3339(t).is_some(),
+                    None => never_ran,
+                };
+                if !ok {
+                    return Err(bad(format!(
+                        "operation {} time is missing or malformed",
+                        o.id
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub fn file_name(&self) -> Option<String> {
+        Some(format!(
+            "{}-{}.json",
+            compact_utc(parse_rfc3339(&self.started_at)?),
+            self.op_id
+        ))
+    }
+}
+
+// ---- journal ----------------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Phase {
+    Intent,
+    Done,
+    Failed,
+    Blocked,
+    Pending,
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RecoveryOutput {
+    pub path: String,
+    /// Whether the path existed before the operation. A pre-existing path is never claimed.
+    pub existed_before: bool,
+    /// Expected content SHA-256. Absent for a sensitive operation.
+    pub expected_sha256: Option<String>,
+}
+
+/// What a later run needs to decide whether an interrupted operation finished.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Recovery {
+    pub outputs: Vec<RecoveryOutput>,
+    pub snapshot: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct JournalEntry {
+    pub schema: i64,
+    pub op_id: String,
+    pub op: String,
+    pub phase: Phase,
+    pub at: String,
+    pub resource: String,
+    pub adapter: String,
+    pub class: Class,
+    pub recovery: Option<Recovery>,
+    pub token: Option<String>,
+    pub reason: Option<String>,
+}
+
+impl JournalEntry {
+    pub fn validate(&self) -> Result<(), Refusal> {
+        if self.schema != SCHEMA {
+            return Err(bad("journal entry schema"));
+        }
+        let snapshot = self.recovery.as_ref().and_then(|r| r.snapshot.as_deref());
+        if snapshot.is_some_and(|s| !valid_id(s)) {
+            return Err(bad("journal recovery snapshot is not a valid id"));
+        }
+        if self
+            .token
+            .as_ref()
+            .is_some_and(|t| t.len() > MAX_ERROR_BYTES)
+        {
+            return Err(bad("journal token is not bounded"));
+        }
+        if !valid_id(&self.op_id) || !valid_id(&self.op) || parse_rfc3339(&self.at).is_none() {
+            return Err(bad("journal entry ids or time are malformed"));
+        }
+        if self.phase == Phase::Intent && self.recovery.is_none() {
+            return Err(bad("an intent entry needs recovery metadata"));
+        }
+        for o in self.recovery.iter().flat_map(|r| &r.outputs) {
+            let hash_ok = match (self.class, &o.expected_sha256) {
+                (Class::Sensitive, h) => h.is_none(),
+                (Class::Normal, h) => h.as_deref().is_none_or(valid_sha256),
+            };
+            if !valid_path(&o.path) || !hash_ok {
+                return Err(bad(format!("recovery output {:?} is malformed", o.path)));
+            }
+        }
+        if self
+            .reason
+            .as_ref()
+            .is_some_and(|r| r.len() > MAX_ERROR_BYTES)
+        {
+            return Err(bad("journal reason is not bounded"));
+        }
+        Ok(())
+    }
+
+    /// One line of `journal.jsonl`, with the trailing newline.
+    pub fn to_line(&self) -> Result<Vec<u8>, Refusal> {
+        self.validate()?;
+        let mut l = canonical(self)?;
+        l.push(b'\n');
+        if l.len() > MAX_JOURNAL_LINE {
+            return Err(Refusal::new(
+                Code::LimitExceeded,
+                "journal entry exceeds 64 KiB",
+            ));
+        }
+        Ok(l)
+    }
+}
+
+/// Parses the whole journal. A bad, oversize or unterminated (torn) line is an error naming the
+/// line; nothing is skipped.
+pub fn parse_journal(bytes: &[u8]) -> Result<Vec<JournalEntry>, Refusal> {
+    if bytes.len() > MAX_BYTES {
+        return Err(Refusal::new(Code::LimitExceeded, "journal exceeds 16 MiB"));
+    }
+    let mut out = Vec::new();
+    let mut rest = bytes;
+    let mut n = 0;
+    while !rest.is_empty() {
+        n += 1;
+        let Some(end) = rest.iter().position(|b| *b == b'\n') else {
+            return Err(bad(format!("journal line {n} is not terminated")));
+        };
+        let (line, tail) = rest.split_at(end);
+        rest = &tail[1..];
+        if line.len() + 1 > MAX_JOURNAL_LINE {
+            return Err(Refusal::new(
+                Code::LimitExceeded,
+                format!("journal line {n} exceeds 64 KiB"),
+            ));
+        }
+        let e: JournalEntry = parse("journal entry", line)
+            .map_err(|r| Refusal::new(r.code, format!("line {n}: {}", r.detail)))?;
+        e.validate()
+            .map_err(|r| Refusal::new(r.code, format!("line {n}: {}", r.detail)))?;
+        out.push(e);
+    }
+    Ok(out)
+}
+
+/// Intent entries with no later terminal entry for the same operation: interruption records.
+pub fn unfinished(entries: &[JournalEntry]) -> Vec<&JournalEntry> {
+    entries
+        .iter()
+        .enumerate()
+        .filter(|(i, e)| {
+            e.phase == Phase::Intent
+                && !entries[i + 1..]
+                    .iter()
+                    .any(|t| t.phase != Phase::Intent && t.op_id == e.op_id && t.op == e.op)
+        })
+        .map(|(_, e)| e)
+        .collect()
+}
+
+/// An operation whose latest outcome entry is `unknown` (DFM-19). It is not settled: the path
+/// stays blocked in every run until a probe or the operator decides it. `intent` is the
+/// operation's last intent entry, which holds the recovery metadata. The `unknown` entry has none.
+#[derive(Debug, Clone, Copy)]
+pub struct Unresolved<'a> {
+    pub intent: Option<&'a JournalEntry>,
+    pub unknown: &'a JournalEntry,
+}
+
+impl Unresolved<'_> {
+    /// The paths the operation may have changed, as the intent recorded them.
+    pub fn paths(&self) -> impl Iterator<Item = &str> {
+        self.intent
+            .into_iter()
+            .flat_map(|i| i.recovery.iter().flat_map(|r| &r.outputs))
+            .map(|o| o.path.as_str())
+    }
+}
+
+/// Operations whose last non-intent entry is `unknown`, in journal order. A later `done` or
+/// `failed` entry for the same `(op_id, op)` settles one.
+pub fn unresolved(entries: &[JournalEntry]) -> Vec<Unresolved<'_>> {
+    entries
+        .iter()
+        .enumerate()
+        .filter(|(i, e)| {
+            e.phase == Phase::Unknown
+                && !entries[i + 1..]
+                    .iter()
+                    .any(|t| t.phase != Phase::Intent && t.op_id == e.op_id && t.op == e.op)
+        })
+        .map(|(i, e)| Unresolved {
+            intent: entries[..i]
+                .iter()
+                .rev()
+                .find(|t| t.phase == Phase::Intent && t.op_id == e.op_id && t.op == e.op),
+            unknown: e,
+        })
+        .collect()
+}
+
+// ---- trials -----------------------------------------------------------------------------------
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BaselinePath {
+    pub path: String,
+    pub existed: bool,
+    pub sha256: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Baseline {
+    pub tool_preexisting: bool,
+    pub paths: Vec<BaselinePath>,
+}
+
+/// `state/trials/<id>.json`: an active trial and its recoverable baseline.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TrialRecord {
+    pub schema: i64,
+    pub binding: Stamp,
+    pub trial_id: String,
+    pub tool: String,
+    pub created_unix: u64,
+    pub baseline: Baseline,
+    pub owned_outputs: Vec<String>,
+}
+
+impl TrialRecord {
+    pub fn parse(bytes: &[u8]) -> Result<TrialRecord, Refusal> {
+        let t: TrialRecord = parse("trial", bytes)?;
+        t.validate()?;
+        Ok(t)
+    }
+
+    pub fn validate(&self) -> Result<(), Refusal> {
+        if self.schema != SCHEMA {
+            return Err(bad("trial schema"));
+        }
+        self.binding.validate()?;
+        if !valid_id(&self.trial_id) || !valid_id(&self.tool) {
+            return Err(bad("trial id or tool is malformed"));
+        }
+        let paths_ok = self
+            .baseline
+            .paths
+            .iter()
+            .all(|p| valid_path(&p.path) && p.sha256.as_deref().is_none_or(valid_sha256))
+            && self.owned_outputs.iter().all(|p| valid_path(p));
+        if paths_ok {
+            Ok(())
+        } else {
+            Err(bad("trial paths are malformed"))
+        }
+    }
+}
+
+// ---- redaction and time -----------------------------------------------------------------------
+
+fn hidden(c: char) -> bool {
+    // Bidirectional overrides and isolates, zero-width characters and the byte order mark can
+    // hide or reorder text on a terminal.
+    matches!(c, '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2060}'..='\u{2064}'
+        | '\u{2066}'..='\u{2069}' | '\u{FEFF}')
+}
+
+/// True when any known secret value occurs in `text`.
+pub fn leaks(text: &str, secrets: &[&str]) -> bool {
+    secrets.iter().any(|s| !s.is_empty() && text.contains(s))
+}
+
+/// Text for a receipt, journal or log: every occurrence of a known secret value becomes
+/// `[redacted]` (overlapping and adjacent occurrences are merged, so no part of a longer match
+/// survives), control, bidirectional and zero-width characters become visible escapes, and the
+/// length is bounded.
+pub fn redact(text: &str, secrets: &[&str]) -> String {
+    let mut ranges: Vec<(usize, usize)> = secrets
+        .iter()
+        .filter(|s| !s.is_empty())
+        // Every start position, so a match that overlaps itself ("aaaa" in "xaaaaaax") is found.
+        .flat_map(|s| {
+            text.char_indices()
+                .filter(move |(i, _)| text[*i..].starts_with(s))
+                .map(move |(i, _)| (i, i + s.len()))
+        })
+        .collect();
+    ranges.sort_unstable();
+    let mut merged: Vec<(usize, usize)> = Vec::new();
+    for (start, end) in ranges {
+        match merged.last_mut() {
+            Some(last) if start <= last.1 => last.1 = last.1.max(end),
+            _ => merged.push((start, end)),
+        }
+    }
+    let mut t = String::with_capacity(text.len());
+    let mut at = 0;
+    for (start, end) in merged {
+        t.push_str(&text[at..start]);
+        t.push_str("[redacted]");
+        at = end;
+    }
+    t.push_str(&text[at..]);
+    let mut out = String::new();
+    for c in t.chars() {
+        let piece: String = if c.is_control() || hidden(c) {
+            c.escape_default().collect()
+        } else {
+            c.to_string()
+        };
+        if out.len() + piece.len() > MAX_ERROR_BYTES {
+            break;
+        }
+        out.push_str(&piece);
+    }
+    out
+}
+
+fn secret_in_path() -> Refusal {
+    // The value is not repeated: this text is printed.
+    bad("a path or identifier contains a known secret; it is refused, not redacted")
+}
+
+impl Receipt {
+    /// Redacts descriptive text with `secrets` in one pass. A path or identifier that contains
+    /// a secret cannot be redacted without breaking its use, so it is refused.
+    pub fn scrub(&mut self, secrets: &[&str]) -> Result<(), Refusal> {
+        if leaks(&self.op_id, secrets) {
+            return Err(secret_in_path());
+        }
+        for o in &self.operations {
+            let ids = [&o.id, &o.resource, &o.adapter];
+            if ids.iter().any(|t| leaks(t, secrets))
+                || o.owned_outputs.iter().any(|p| leaks(p, secrets))
+            {
+                return Err(secret_in_path());
+            }
+        }
+        let red = |t: &mut String| *t = redact(t, secrets);
+        red(&mut self.command);
+        red(&mut self.binary.version);
+        red(&mut self.binary.commit);
+        if let Some(a) = &mut self.approval {
+            red(&mut a.kind);
+        }
+        for o in &mut self.operations {
+            if let Some(e) = &mut o.error {
+                red(e);
+            }
+        }
+        Ok(())
+    }
+}
+
+impl JournalEntry {
+    /// Redacts descriptive text with `secrets`. Identifiers and recovery paths that contain a
+    /// secret are refused.
+    pub fn scrub(&mut self, secrets: &[&str]) -> Result<(), Refusal> {
+        let paths = self
+            .recovery
+            .iter()
+            .flat_map(|r| &r.outputs)
+            .map(|o| &o.path);
+        let ids = [&self.op_id, &self.op, &self.resource, &self.adapter];
+        if ids.iter().any(|t| leaks(t, secrets)) || paths.into_iter().any(|p| leaks(p, secrets)) {
+            return Err(secret_in_path());
+        }
+        for t in [&mut self.token, &mut self.reason].into_iter().flatten() {
+            *t = redact(t, secrets);
+        }
+        Ok(())
+    }
+}
+
+impl Ledger {
+    /// A ledger key or path that contains a known secret is refused.
+    pub fn check_secrets(&self, secrets: &[&str]) -> Result<(), Refusal> {
+        let bad_text = self.resources.iter().any(|r| {
+            leaks(&r.resource, secrets)
+                || leaks(&r.adapter, secrets)
+                || r.owned_outputs.iter().any(|o| leaks(&o.path, secrets))
+        });
+        if bad_text {
+            Err(secret_in_path())
+        } else {
+            Ok(())
+        }
+    }
+}
+
+impl TrialRecord {
+    /// A trial id, tool or path that contains a known secret is refused.
+    pub fn check_secrets(&self, secrets: &[&str]) -> Result<(), Refusal> {
+        let paths = self
+            .baseline
+            .paths
+            .iter()
+            .map(|p| &p.path)
+            .chain(&self.owned_outputs);
+        let hit = [&self.trial_id, &self.tool]
+            .iter()
+            .any(|t| leaks(t, secrets))
+            || paths.into_iter().any(|p| leaks(p, secrets));
+        if hit { Err(secret_in_path()) } else { Ok(()) }
+    }
+}
+
+// ---- scope ------------------------------------------------------------------------------------
+
+/// Where a claim may point: strictly inside HOME, and neither inside, equal to, nor an ancestor
+/// of a reserved manager path (state, config, lock, data, cache). Comparison is case-folded,
+/// because APFS is case-insensitive by default, so it also holds when the reserved directory
+/// does not exist yet. Unicode normalization differences are not folded (a known limit).
+#[derive(Debug, Clone)]
+pub struct Scope {
+    home: String,
+    reserved: Vec<String>,
+}
+
+impl Scope {
+    pub fn new(home: &str, reserved: &[String]) -> Scope {
+        Scope {
+            home: fold(home),
+            reserved: reserved.iter().map(|r| fold(r)).collect(),
+        }
+    }
+
+    pub fn admits(&self, path: &str) -> bool {
+        self.admits_with(path, true)
+    }
+
+    /// As [`Scope::admits`], for a directory the manager creates only while it is missing: it
+    /// may be an ancestor of a reserved path (`~/.local/share` above `~/.local/share/<manager>`),
+    /// because a missing directory holds nothing reserved. It may not be, or lie inside, one.
+    pub fn admits_new_dir(&self, path: &str) -> bool {
+        self.admits_with(path, false)
+    }
+
+    fn admits_with(&self, path: &str, ancestors_reserved: bool) -> bool {
+        if !valid_path(path) {
+            return false;
+        }
+        let p = fold(path);
+        let inside = p
+            .strip_prefix(&self.home)
+            .is_some_and(|rest| rest.starts_with('/') && rest.len() > 1);
+        inside
+            && !self.reserved.iter().any(|r| {
+                p == *r
+                    || p.starts_with(&format!("{r}/"))
+                    || (ancestors_reserved && r.starts_with(&format!("{p}/")))
+            })
+    }
+
+    fn check<'a>(&self, paths: impl IntoIterator<Item = &'a String>) -> Result<(), Refusal> {
+        match paths.into_iter().find(|p| !self.admits(p)) {
+            None => Ok(()),
+            Some(p) => Err(bad(format!(
+                "{p} is outside HOME or overlaps the manager's own paths"
+            ))),
+        }
+    }
+}
+
+impl Ledger {
+    /// Containment of every owned output. Applied on read as well as on write.
+    pub fn validate_within(&self, scope: &Scope) -> Result<(), Refusal> {
+        scope.check(
+            self.resources
+                .iter()
+                .flat_map(|r| &r.owned_outputs)
+                .map(|o| &o.path),
+        )
+    }
+}
+
+impl Receipt {
+    pub fn validate_within(&self, scope: &Scope) -> Result<(), Refusal> {
+        scope.check(self.operations.iter().flat_map(|o| &o.owned_outputs))
+    }
+}
+
+impl TrialRecord {
+    pub fn validate_within(&self, scope: &Scope) -> Result<(), Refusal> {
+        scope.check(
+            self.baseline
+                .paths
+                .iter()
+                .map(|p| &p.path)
+                .chain(&self.owned_outputs),
+        )
+    }
+}
+
+impl JournalEntry {
+    /// The step name of a directory the manager creates (see `JournalEntry::op`).
+    pub const CREATE_DIR: &'static str = "create-dir";
+
+    /// Whether this entry records the creation of a directory, which may lie above a reserved
+    /// path ([`Scope::admits_new_dir`]).
+    pub fn creates_dir(&self) -> bool {
+        self.op == Self::CREATE_DIR
+    }
+
+    pub fn validate_within(&self, scope: &Scope) -> Result<(), Refusal> {
+        let new_dir = self.creates_dir();
+        let paths = self
+            .recovery
+            .iter()
+            .flat_map(|r| &r.outputs)
+            .map(|o| &o.path);
+        match paths.into_iter().find(|p| {
+            if new_dir {
+                !scope.admits_new_dir(p)
+            } else {
+                !scope.admits(p)
+            }
+        }) {
+            None => Ok(()),
+            Some(p) => Err(bad(format!(
+                "{p} is outside HOME or overlaps the manager's own paths"
+            ))),
+        }
+    }
+}
+
+// ---- time -------------------------------------------------------------------------------------
+
+/// Days since 1970-01-01 to a civil date (proleptic Gregorian).
+fn civil(days: i64) -> (i64, u32, u32) {
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    (yoe + era * 400 + i64::from(m <= 2), m, d)
+}
+
+fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = y.div_euclid(400);
+    let yoe = y.rem_euclid(400);
+    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
+
+pub fn rfc3339(unix: u64) -> String {
+    let (days, secs) = ((unix / 86_400) as i64, unix % 86_400);
+    let (y, m, d) = civil(days);
+    format!(
+        "{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}Z",
+        secs / 3600,
+        secs % 3600 / 60,
+        secs % 60
+    )
+}
+
+/// `20261010T120000Z`, used in receipt file names.
+pub fn compact_utc(unix: u64) -> String {
+    rfc3339(unix).replace(['-', ':'], "")
+}
+
+/// Parses exactly `YYYY-MM-DDTHH:MM:SSZ`.
+pub fn parse_rfc3339(s: &str) -> Option<u64> {
+    let b = s.as_bytes();
+    let shape = b.len() == 20
+        && b[4] == b'-'
+        && b[7] == b'-'
+        && b[10] == b'T'
+        && b[13] == b':'
+        && b[16] == b':'
+        && b[19] == b'Z';
+    let num = |r: std::ops::Range<usize>| s.get(r)?.parse::<i64>().ok();
+    if !shape {
+        return None;
+    }
+    let (y, mo, d) = (num(0..4)?, num(5..7)?, num(8..10)?);
+    let (h, mi, se) = (num(11..13)?, num(14..16)?, num(17..19)?);
+    if !(1..=12).contains(&mo) || !(1..=31).contains(&d) || h > 23 || mi > 59 || se > 60 {
+        return None;
+    }
+    let t = days_from_civil(y, mo, d) * 86_400 + h * 3600 + mi * 60 + se;
+    // Reject dates that do not round-trip (for example February 30).
+    let t = u64::try_from(t).ok()?;
+    (rfc3339(t) == s).then_some(t)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn stamp() -> Stamp {
+        Stamp::of(&Binding::new("/p/profile.toml", "m5").unwrap())
+    }
+
+    fn op(status: Status, class: Class) -> OperationRecord {
+        OperationRecord {
+            id: "op1".into(),
+            resource: "core.git".into(),
+            adapter: "fs-link/v1".into(),
+            class,
+            status,
+            started_at: Some("2026-10-10T00:00:00Z".into()),
+            finished_at: Some("2026-10-10T00:00:01Z".into()),
+            before: None,
+            after: None,
+            owned_outputs: vec!["/h/.gitconfig".into()],
+            error: None,
+            reload: None,
+        }
+    }
+
+    pub(crate) fn receipt(ops: Vec<OperationRecord>) -> Receipt {
+        let s = stamp();
+        Receipt {
+            schema: SCHEMA,
+            op_id: "run-1".into(),
+            command: "sync".into(),
+            started_at: "2026-10-10T00:00:00Z".into(),
+            finished_at: "2026-10-10T00:00:02Z".into(),
+            binary: BinaryId {
+                version: "0.1.0".into(),
+                commit: "unknown".into(),
+                sha256: "0".repeat(64),
+            },
+            profile: ProfileRef {
+                id: s.profile.clone(),
+                binding_digest: s.binding_digest.clone(),
+            },
+            machine_id: s.machine_id,
+            plan_digest: None,
+            approval: None,
+            sources: vec![],
+            approvals: vec![],
+            result: RunResult {
+                outcome: "ok".into(),
+                exit_code: 0,
+                counts: count_statuses(&ops),
+            },
+            operations: ops,
+        }
+    }
+
+    #[test]
+    fn time_round_trips_and_rejects_impossible_dates() {
+        assert_eq!(rfc3339(0), "1970-01-01T00:00:00Z");
+        assert_eq!(rfc3339(1_791_590_400), "2026-10-10T00:00:00Z");
+        assert_eq!(parse_rfc3339("2026-10-10T00:00:00Z"), Some(1_791_590_400));
+        assert_eq!(parse_rfc3339("2026-02-30T00:00:00Z"), None);
+        assert_eq!(parse_rfc3339("2026-10-10 00:00:00Z"), None);
+        assert_eq!(compact_utc(1_791_590_400), "20261010T000000Z");
+    }
+
+    #[test]
+    fn schema_is_checked_before_any_other_field() {
+        let code = |s: &str| StateDoc::parse(s.as_bytes()).unwrap_err().code;
+        assert_eq!(code("{\"schema\":2,\"junk\":1}"), Code::StateNewer);
+        assert_eq!(code("{\"schema\":0}"), Code::SchemaUnsupported);
+        assert_eq!(code("{\"junk\":1}"), Code::StateInvalid);
+        assert_eq!(code("not json"), Code::StateInvalid);
+        assert_eq!(code("{\"schema\":1,\"junk\":1}"), Code::StateInvalid);
+        let deep = format!(
+            "{{\"schema\":1,\"x\":{}1{}}}",
+            "[".repeat(40),
+            "]".repeat(40)
+        );
+        assert_eq!(code(&deep), Code::StateInvalid);
+        let big = vec![b' '; MAX_BYTES + 1];
+        assert_eq!(StateDoc::parse(&big).unwrap_err().code, Code::LimitExceeded);
+    }
+
+    #[test]
+    fn documents_round_trip_in_canonical_form() {
+        let doc = StateDoc::new(stamp(), 7);
+        let bytes = canonical(&doc).unwrap();
+        assert_eq!(StateDoc::parse(&bytes).unwrap(), doc);
+        let text = String::from_utf8(bytes).unwrap();
+        assert!(!text.contains(' ') && !text.contains('\n'));
+        assert!(text.find("\"binding\"").unwrap() < text.find("\"created_unix\"").unwrap());
+        assert!(text.find("\"created_unix\"").unwrap() < text.find("\"schema\"").unwrap());
+    }
+
+    #[test]
+    fn ledger_paths_that_differ_only_by_case_are_one_path() {
+        let out = |path: &str| OwnedOutput {
+            path: path.into(),
+            mode: 0o600,
+            fingerprint: Some("a".repeat(64)),
+            coowned: None,
+        };
+        let entry = |res: &str, paths: &[&str]| LedgerResource {
+            resource: res.into(),
+            adapter: "fs-link/v1".into(),
+            class: Class::Normal,
+            op_id: "op1".into(),
+            owned_outputs: paths.iter().map(|p| out(p)).collect(),
+        };
+        // Both spellings in one resource, and in two, are refused.
+        for res in [
+            vec![entry("a", &["/h/.config/foo", "/h/.config/Foo"])],
+            vec![
+                entry("a", &["/h/.config/foo"]),
+                entry("b", &["/h/.config/Foo"]),
+            ],
+        ] {
+            let mut l = Ledger::empty(stamp());
+            l.resources = res;
+            assert_eq!(l.validate().unwrap_err().code, Code::StateInvalid);
+            let bytes = serde_json::to_vec(&l).unwrap();
+            assert_eq!(Ledger::parse(&bytes).unwrap_err().code, Code::StateInvalid);
+        }
+        // Re-recording a resource with the other spelling replaces its entry.
+        let mut l = Ledger::empty(stamp());
+        l.record(entry("a", &["/h/.config/foo"])).unwrap();
+        l.record(entry("a", &["/h/.config/Foo"])).unwrap();
+        assert_eq!(l.resources[0].owned_outputs.len(), 1);
+        assert_eq!(l.resources[0].owned_outputs[0].path, "/h/.config/Foo");
+        // Another resource may not take the other spelling.
+        assert_eq!(
+            l.record(entry("b", &["/h/.config/FOO"])).unwrap_err().code,
+            Code::StateInvalid
+        );
+    }
+
+    #[test]
+    fn ledger_ownership_is_exact_and_unique() {
+        let entry = |res: &str, path: &str| LedgerResource {
+            resource: res.into(),
+            adapter: "fs-link/v1".into(),
+            class: Class::Normal,
+            op_id: "op1".into(),
+            owned_outputs: vec![OwnedOutput {
+                path: path.into(),
+                mode: 0o600,
+                fingerprint: Some("a".repeat(64)),
+                coowned: None,
+            }],
+        };
+        let mut l = Ledger::empty(stamp());
+        l.record(entry("a", "/h/x")).unwrap();
+        assert_eq!(
+            l.record(entry("b", "/h/x")).unwrap_err().code,
+            Code::StateInvalid
+        );
+        assert!(l.authorizes_delete("a", "/h/x", &"a".repeat(64)));
+        assert!(
+            !l.authorizes_delete("a", "/h/x", &"b".repeat(64)),
+            "conflict"
+        );
+        assert!(
+            !l.authorizes_delete("b", "/h/x", &"a".repeat(64)),
+            "wrong owner"
+        );
+        assert!(
+            !l.authorizes_delete("a", "/h/y", &"a".repeat(64)),
+            "not owned"
+        );
+        for bad in ["rel", "/h/../x", "/h//x", "/h/x/", "/", "/h/\nx"] {
+            assert!(!valid_path(bad), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn a_sensitive_resource_never_stores_a_hash() {
+        let mut l = Ledger::empty(stamp());
+        let e = LedgerResource {
+            resource: "s".into(),
+            adapter: "op-template/v1".into(),
+            class: Class::Sensitive,
+            op_id: "op1".into(),
+            owned_outputs: vec![OwnedOutput {
+                path: "/h/.secret".into(),
+                mode: 0o600,
+                fingerprint: Some("a".repeat(64)),
+                coowned: None,
+            }],
+        };
+        assert!(l.record(e.clone()).is_err());
+        let mut e = e;
+        e.owned_outputs[0].fingerprint = None;
+        l.record(e).unwrap();
+        assert!(!l.authorizes_delete("s", "/h/.secret", &"a".repeat(64)));
+    }
+
+    #[test]
+    fn a_coowned_record_is_validated() {
+        let entry = |class, fp: Option<String>, co: Option<CoOwned>| LedgerResource {
+            resource: "s".into(),
+            adapter: "claude-settings/v1".into(),
+            class,
+            op_id: "op1".into(),
+            owned_outputs: vec![OwnedOutput {
+                path: "/h/.claude/settings.json".into(),
+                mode: 0o600,
+                fingerprint: fp,
+                coowned: co,
+            }],
+        };
+        let good = CoOwned {
+            managed_hash: "b".repeat(64),
+            entries: vec![OwnedEntry {
+                id: "audit".into(),
+                key: "PreToolUse".into(),
+                sha256: "c".repeat(64),
+            }],
+            appended: vec![AppendedItem {
+                pointer: "/sandbox/filesystem/allowWrite".into(),
+                sha256: "d".repeat(64),
+            }],
+            leaves: [("/outputStyle".to_string(), "e".repeat(64))].into(),
+        };
+        let mut l = Ledger::empty(stamp());
+        l.record(entry(Class::Sensitive, None, Some(good.clone())))
+            .unwrap();
+        let back = Ledger::parse(&canonical(&l).unwrap()).unwrap();
+        assert_eq!(back, l, "a co-owned record round-trips");
+        // A bad managed hash, a bad entry hash, an empty id or key, a control character.
+        for bad in [
+            CoOwned {
+                managed_hash: "xyz".into(),
+                ..good.clone()
+            },
+            CoOwned {
+                managed_hash: "B".repeat(64),
+                ..good.clone()
+            },
+            CoOwned {
+                entries: vec![OwnedEntry {
+                    sha256: "short".into(),
+                    ..good.entries[0].clone()
+                }],
+                ..good.clone()
+            },
+            CoOwned {
+                entries: vec![OwnedEntry {
+                    id: String::new(),
+                    ..good.entries[0].clone()
+                }],
+                ..good.clone()
+            },
+            CoOwned {
+                entries: vec![OwnedEntry {
+                    key: "a\nb".into(),
+                    ..good.entries[0].clone()
+                }],
+                ..good.clone()
+            },
+            CoOwned {
+                appended: vec![AppendedItem {
+                    pointer: "no-slash".into(),
+                    ..good.appended[0].clone()
+                }],
+                ..good.clone()
+            },
+            CoOwned {
+                appended: vec![AppendedItem {
+                    pointer: "/hooks/Stop".into(),
+                    ..good.appended[0].clone()
+                }],
+                ..good.clone()
+            },
+            CoOwned {
+                appended: vec![AppendedItem {
+                    pointer: "/a/~2".into(),
+                    ..good.appended[0].clone()
+                }],
+                ..good.clone()
+            },
+            CoOwned {
+                leaves: [("/hooks".to_string(), "e".repeat(64))].into(),
+                ..good.clone()
+            },
+            CoOwned {
+                appended: vec![AppendedItem {
+                    sha256: "short".into(),
+                    ..good.appended[0].clone()
+                }],
+                ..good.clone()
+            },
+            // A repeated (key, sha256) or (pointer, sha256), with the same or another id.
+            CoOwned {
+                entries: vec![good.entries[0].clone(), good.entries[0].clone()],
+                ..good.clone()
+            },
+            CoOwned {
+                entries: vec![
+                    good.entries[0].clone(),
+                    OwnedEntry {
+                        id: "other".into(),
+                        ..good.entries[0].clone()
+                    },
+                ],
+                ..good.clone()
+            },
+            CoOwned {
+                appended: vec![good.appended[0].clone(), good.appended[0].clone()],
+                ..good.clone()
+            },
+        ] {
+            let mut l = Ledger::empty(stamp());
+            assert!(
+                l.record(entry(Class::Sensitive, None, Some(bad.clone())))
+                    .is_err(),
+                "{bad:?}"
+            );
+        }
+        // A normal-class resource may not carry a co-owned record.
+        let mut l = Ledger::empty(stamp());
+        assert!(
+            l.record(entry(
+                Class::Normal,
+                Some("a".repeat(64)),
+                Some(good.clone())
+            ))
+            .is_err()
+        );
+        // A fingerprint must be absent when the record is set (sensitive class has none).
+        assert!(
+            l.record(entry(Class::Sensitive, Some("a".repeat(64)), Some(good)))
+                .is_err()
+        );
+        // Unknown fields are refused, like everywhere in the ledger.
+        let json = String::from_utf8(canonical(&Ledger::empty(stamp())).unwrap()).unwrap();
+        assert!(json.contains("resources"));
+    }
+
+    #[test]
+    fn receipt_counts_and_sensitive_fingerprints_are_enforced() {
+        let ok = receipt(vec![
+            op(Status::Updated, Class::Normal),
+            op(Status::Current, Class::Normal),
+        ]);
+        let back = Receipt::parse(&canonical(&ok).unwrap()).unwrap();
+        assert_eq!(back, ok);
+        assert_eq!(back.result.counts.values().sum::<u32>(), 2);
+        assert_eq!(back.file_name().unwrap(), "20261010T000000Z-run-1.json");
+
+        let mut skew = ok.clone();
+        skew.result.counts.insert(Status::Failed, 1);
+        assert!(Receipt::parse(&canonical(&skew).unwrap()).is_err());
+
+        let mut s = op(Status::Updated, Class::Sensitive);
+        s.after = Some(Fingerprint {
+            fingerprint: "a".repeat(64),
+        });
+        assert!(receipt(vec![s]).validate().is_err());
+    }
+
+    fn je(id: &str, op: &str, phase: Phase) -> JournalEntry {
+        JournalEntry {
+            schema: SCHEMA,
+            op_id: id.into(),
+            op: op.into(),
+            phase,
+            at: "2026-10-10T00:00:00Z".into(),
+            resource: "r".into(),
+            adapter: "a".into(),
+            class: Class::Normal,
+            recovery: (phase == Phase::Intent).then(|| Recovery {
+                outputs: vec![RecoveryOutput {
+                    path: format!("/h/{id}"),
+                    existed_before: false,
+                    expected_sha256: None,
+                }],
+                snapshot: None,
+            }),
+            token: None,
+            reason: None,
+        }
+    }
+
+    #[test]
+    fn unresolved_pairs_an_unknown_with_its_intent_by_id_and_op() {
+        let j = [
+            je("a-1", "create-link", Phase::Intent),
+            je("a-1", "create-file", Phase::Intent),
+            je("a-1", "create-link", Phase::Unknown),
+        ];
+        let open = unresolved(&j);
+        assert_eq!(open.len(), 1);
+        assert_eq!(open[0].unknown.op, "create-link");
+        assert_eq!(open[0].intent.unwrap().op, "create-link");
+        assert_eq!(open[0].paths().collect::<Vec<_>>(), ["/h/a-1"]);
+        // Another id never pairs.
+        let j = [
+            je("b-1", "create-link", Phase::Intent),
+            je("a-1", "create-link", Phase::Unknown),
+        ];
+        assert!(unresolved(&j)[0].intent.is_none());
+    }
+
+    #[test]
+    fn unresolved_a_later_done_or_failed_closes_and_a_later_unknown_supersedes() {
+        for closing in [Phase::Done, Phase::Failed] {
+            let j = [
+                je("a-1", "x", Phase::Intent),
+                je("a-1", "x", Phase::Unknown),
+                je("a-1", "x", closing),
+            ];
+            assert!(unresolved(&j).is_empty(), "{closing:?}");
+        }
+        // Two unknown entries for one operation are one open operation, not two.
+        let j = [
+            je("a-1", "x", Phase::Intent),
+            je("a-1", "x", Phase::Unknown),
+            je("a-1", "x", Phase::Unknown),
+        ];
+        let open = unresolved(&j);
+        assert_eq!(open.len(), 1);
+        assert!(
+            std::ptr::eq(open[0].unknown, &j[2]),
+            "the later entry stands"
+        );
+        // An unknown after a closing entry (a new outcome) is open again.
+        let j = [
+            je("a-1", "x", Phase::Intent),
+            je("a-1", "x", Phase::Failed),
+            je("a-1", "x", Phase::Unknown),
+        ];
+        assert_eq!(unresolved(&j).len(), 1);
+    }
+
+    #[test]
+    fn unresolved_an_intent_after_the_unknown_is_not_its_recovery_record() {
+        let j = [
+            je("a-1", "x", Phase::Unknown),
+            je("a-1", "x", Phase::Intent),
+        ];
+        let open = unresolved(&j);
+        assert_eq!(open.len(), 1);
+        assert!(open[0].intent.is_none());
+        assert_eq!(open[0].paths().count(), 0);
+        // And an unknown with no intent at all.
+        assert!(
+            unresolved(&[je("z-1", "x", Phase::Unknown)])[0]
+                .intent
+                .is_none()
+        );
+        assert!(unresolved(&[je("z-1", "x", Phase::Done)]).is_empty());
+    }
+
+    #[test]
+    fn journal_torn_oversize_and_unfinished_entries() {
+        let intent = |op: &str| JournalEntry {
+            schema: SCHEMA,
+            op_id: "run-1".into(),
+            op: op.into(),
+            phase: Phase::Intent,
+            at: "2026-10-10T00:00:00Z".into(),
+            resource: "r".into(),
+            adapter: "a".into(),
+            class: Class::Normal,
+            recovery: Some(Recovery {
+                outputs: vec![],
+                snapshot: None,
+            }),
+            token: None,
+            reason: None,
+        };
+        let done = |op: &str| JournalEntry {
+            phase: Phase::Done,
+            recovery: None,
+            ..intent(op)
+        };
+        let mut bytes = Vec::new();
+        for e in [intent("a"), intent("b"), done("a")] {
+            bytes.extend(e.to_line().unwrap());
+        }
+        let entries = parse_journal(&bytes).unwrap();
+        let open = unfinished(&entries);
+        assert_eq!(open.len(), 1);
+        assert_eq!(open[0].op, "b");
+
+        let torn = &bytes[..bytes.len() - 1];
+        assert_eq!(parse_journal(torn).unwrap_err().code, Code::StateInvalid);
+        let mut long = intent("a");
+        long.recovery = None;
+        assert!(long.to_line().is_err(), "intent without recovery metadata");
+        let mut huge = intent("a");
+        huge.reason = Some("x".into());
+        let line = vec![b'x'; MAX_JOURNAL_LINE];
+        assert_eq!(
+            parse_journal(&[line, b"\n".to_vec()].concat())
+                .unwrap_err()
+                .code,
+            Code::LimitExceeded
+        );
+    }
+
+    #[test]
+    fn redaction_removes_secrets_escapes_controls_and_bounds_length() {
+        let out = redact("token=hunter2\x1b[31m ok", &["hunter2"]);
+        assert_eq!(out, "token=[redacted]\\u{1b}[31m ok");
+        assert!(!out.contains("hunter2"));
+        assert!(redact(&"x".repeat(10_000), &[]).len() <= MAX_ERROR_BYTES);
+        // Overlapping matches merge, so no tail of the longer one survives.
+        assert_eq!(redact("abcdef", &["abcd", "cdef"]), "[redacted]");
+        assert_eq!(redact("abcdefgh", &["abcd", "efgh"]), "[redacted]");
+        // Bidirectional and zero-width characters become visible.
+        assert_eq!(redact("a\u{202E}b\u{200B}c", &[]), "a\\u{202e}b\\u{200b}c");
+        // A match that overlaps itself is found at every start.
+        assert_eq!(redact("ababab", &["abab"]), "[redacted]");
+        assert_eq!(redact("xaaaaaax", &["aaaa"]), "x[redacted]x");
+        // A secret that contains another secret is redacted whole, whatever the list order.
+        for list in [["abc", "abcdef"], ["abcdef", "abc"]] {
+            assert_eq!(redact("x abcdef y", &list), "x [redacted] y");
+        }
+    }
+
+    #[test]
+    fn trial_records_validate_identity_and_paths() {
+        let t = TrialRecord {
+            schema: SCHEMA,
+            binding: stamp(),
+            trial_id: "t1".into(),
+            tool: "atuin".into(),
+            created_unix: 1,
+            baseline: Baseline {
+                tool_preexisting: false,
+                paths: vec![BaselinePath {
+                    path: "/h/.config/a".into(),
+                    existed: false,
+                    sha256: None,
+                }],
+            },
+            owned_outputs: vec![],
+        };
+        assert_eq!(TrialRecord::parse(&canonical(&t).unwrap()).unwrap(), t);
+        let mut bad = t;
+        bad.trial_id = "Bad Id".into();
+        assert!(bad.validate().is_err());
+    }
+
+    #[test]
+    fn scope_is_case_folded_strict_and_refuses_ancestors() {
+        let reserved = [
+            "/H/.local/state/dotfiles-manager".to_string(),
+            "/H/.config/dotfiles-manager".to_string(),
+        ];
+        let sc = Scope::new("/H", &reserved);
+        for ok in [
+            "/H/.gitconfig",
+            "/h/.config/git/config",
+            "/H/.local/share/x",
+        ] {
+            assert!(sc.admits(ok), "{ok}");
+        }
+        for no in [
+            "/H",
+            "/etc/hosts",
+            "/Hx/y",
+            "/H/.local/state/dotfiles-manager/state/state.json",
+            "/h/.LOCAL/STATE/Dotfiles-Manager/state/ledger.json",
+            "/H/.local/state",
+            "/H/.config",
+            "/H/.local",
+            "/H/.config/dotfiles-manager/machine.toml",
+        ] {
+            assert!(!sc.admits(no), "{no}");
+        }
+    }
+
+    #[test]
+    fn scrub_redacts_text_and_refuses_secret_paths_without_echoing_them() {
+        let mut r = receipt(vec![op(Status::Updated, Class::Normal)]);
+        r.command = "sync hunter2".into();
+        r.operations[0].error = Some("bad hunter2".into());
+        r.scrub(&["hunter2"]).unwrap();
+        assert_eq!(r.command, "sync [redacted]");
+        assert_eq!(r.operations[0].error.as_deref(), Some("bad [redacted]"));
+        r.operations[0].owned_outputs = vec!["/h/tok-hunter2".into()];
+        let e = r.scrub(&["hunter2"]).unwrap_err();
+        assert!(!e.detail.contains("hunter2"));
+    }
+
+    #[test]
+    fn an_operation_that_never_ran_has_no_times_and_one_that_ran_must() {
+        let mut o = op(Status::NotStarted, Class::Normal);
+        o.started_at = None;
+        o.finished_at = None;
+        assert!(receipt(vec![o.clone()]).validate().is_ok());
+        o.status = Status::NotInScope;
+        assert!(receipt(vec![o.clone()]).validate().is_ok());
+        let at = "2026-10-10T00:00:00Z".to_string();
+        for never in [Status::NotStarted, Status::NotInScope] {
+            o.status = never;
+            for (start, finish) in [
+                (Some(at.clone()), None),
+                (None, Some(at.clone())),
+                (Some(at.clone()), Some(at.clone())),
+            ] {
+                o.started_at = start;
+                o.finished_at = finish;
+                assert!(receipt(vec![o.clone()]).validate().is_err(), "{never:?}");
+            }
+        }
+        o.started_at = None;
+        o.finished_at = None;
+        for ran in [
+            Status::Updated,
+            Status::Failed,
+            Status::Pending,
+            Status::Unknown,
+        ] {
+            o.status = ran;
+            assert!(receipt(vec![o.clone()]).validate().is_err(), "{ran:?}");
+        }
+    }
+
+    #[test]
+    fn the_fold_catches_unicode_aliases_even_when_nothing_exists() {
+        let sc = Scope::new("/H", &["/H/.local/share/dotfiles-manager".to_string()]);
+        assert!(!sc.admits("/H/.local/\u{17f}hare/dotfiles-manager/new"));
+        assert!(!sc.admits("/H/.local/share/DOTFILE\u{17f}-manager/x"));
+        assert!(sc.admits("/H/.local/share/other"));
+    }
+
+    #[test]
+    fn a_directory_created_while_missing_may_lie_above_a_reserved_path_but_not_in_one() {
+        let sc = Scope::new("/H", &["/H/.local/share/dotfiles-manager".to_string()]);
+        assert!(!sc.admits("/H/.local/share"));
+        assert!(sc.admits_new_dir("/H/.local/share"));
+        assert!(sc.admits_new_dir("/H/.local/share/other"));
+        for no in [
+            "/H/.local/share/dotfiles-manager",
+            "/H/.local/share/Dotfiles-Manager/x",
+            "/H/.local/share/dotfiles-manager/x/y",
+            "/H",
+            "/elsewhere/x",
+        ] {
+            assert!(!sc.admits_new_dir(no), "{no}");
+        }
+    }
+
+    #[test]
+    fn a_reload_state_must_come_from_the_fixed_list_and_round_trips() {
+        for name in RELOADS {
+            let mut o = op(Status::Updated, Class::Normal);
+            o.reload = Some(name.into());
+            let r = receipt(vec![o]);
+            r.validate().unwrap();
+            let again = Receipt::parse(&canonical(&r).unwrap()).unwrap();
+            assert_eq!(again.operations[0].reload.as_deref(), Some(name));
+        }
+        let mut o = op(Status::Updated, Class::Normal);
+        o.reload = Some("done".into());
+        assert_eq!(
+            receipt(vec![o]).validate().unwrap_err().code,
+            Code::StateInvalid
+        );
+        // An absent field is not written, so receipts without it keep their bytes.
+        let plain = canonical(&receipt(vec![op(Status::Updated, Class::Normal)])).unwrap();
+        assert!(!String::from_utf8(plain).unwrap().contains("reload"));
+    }
+
+    #[test]
+    fn a_path_source_and_a_disruptive_approval_validate_and_round_trip() {
+        let mut r = receipt(vec![op(Status::Updated, Class::Normal)]);
+        r.sources = vec![SourceId {
+            id: "path-0123456789ab".into(),
+            commit: None,
+            tree: format!("sha256:{}", "b".repeat(64)),
+        }];
+        // A removal: it owns and publishes nothing, and `before` is the fingerprint it removed.
+        r.operations[0].owned_outputs.clear();
+        r.operations[0].before = Some(Fingerprint {
+            fingerprint: "a".repeat(64),
+        });
+        r.approvals = vec![DisruptiveApproval {
+            operation_id: "op1".into(),
+            how: "allow_disruptive".into(),
+            at: "2026-10-10T00:00:00Z".into(),
+        }];
+        r.validate().unwrap();
+        let again = Receipt::parse(&canonical(&r).unwrap()).unwrap();
+        assert_eq!(again, r);
+    }
+
+    #[test]
+    fn an_approval_must_fit_the_operation_it_names() {
+        let adopted = || {
+            let mut r = receipt(vec![op(Status::Updated, Class::Normal)]);
+            r.operations[0].after = Some(Fingerprint {
+                fingerprint: "a".repeat(64),
+            });
+            r.approvals = vec![DisruptiveApproval {
+                operation_id: "op1".into(),
+                how: "allow_adopt".into(),
+                at: "2026-10-10T00:00:00Z".into(),
+            }];
+            r
+        };
+        adopted().validate().unwrap();
+        // The same operation cannot carry the disruptive approval: it owns an output.
+        let mut r = adopted();
+        r.approvals[0].how = "allow_disruptive".into();
+        assert!(r.validate().is_err());
+        // A removal (nothing owned, a `before`) cannot carry an adoption approval.
+        let mut r = adopted();
+        r.operations[0].owned_outputs.clear();
+        r.operations[0].after = None;
+        r.operations[0].before = Some(Fingerprint {
+            fingerprint: "a".repeat(64),
+        });
+        assert!(r.validate().is_err());
+        r.approvals[0].how = "allow_disruptive".into();
+        r.validate().unwrap();
+        // An updated operation with no `before` (a directory made, say) is not a removal.
+        let mut r = adopted();
+        r.operations[0].owned_outputs.clear();
+        r.operations[0].after = None;
+        r.approvals[0].how = "allow_disruptive".into();
+        assert!(r.validate().is_err());
+        // A published link (it has a reload state) is not an adoption.
+        let mut r = adopted();
+        r.operations[0].reload = Some("not_attempted".into());
+        assert!(r.validate().is_err());
+    }
+
+    #[test]
+    fn receipt_fields_without_free_text_must_have_their_exact_shape() {
+        let good = receipt(vec![op(Status::Updated, Class::Normal)]);
+        assert!(good.validate().is_ok());
+        let mut cases: Vec<(&str, Receipt)> = Vec::new();
+        let mut r = good.clone();
+        r.result.outcome = "all fine, token=abc".into();
+        cases.push(("outcome", r));
+        let mut r = good.clone();
+        r.binary.sha256 = "not a hash".into();
+        cases.push(("sha", r));
+        let mut r = good.clone();
+        r.plan_digest = Some("secret".into());
+        cases.push(("plan", r));
+        let mut r = good.clone();
+        r.approval = Some(Approval {
+            kind: "hunter2".into(),
+            plan_digest: "a".repeat(64),
+            at: "2026-10-10T00:00:00Z".into(),
+        });
+        cases.push(("approval", r));
+        let mut r = good.clone();
+        r.sources = vec![SourceId {
+            id: "s".into(),
+            commit: Some("zz".into()),
+            tree: "x".into(),
+        }];
+        cases.push(("source", r));
+        let mut r = good.clone();
+        r.approvals = vec![DisruptiveApproval {
+            operation_id: "no-such-op".into(),
+            how: "allow_disruptive".into(),
+            at: "2026-10-10T00:00:00Z".into(),
+        }];
+        cases.push(("approval for an unknown operation", r));
+        let mut r = good.clone();
+        r.approvals = vec![DisruptiveApproval {
+            operation_id: "op1".into(),
+            how: "interactive".into(),
+            at: "2026-10-10T00:00:00Z".into(),
+        }];
+        cases.push(("approval kind with no prompt behind it", r));
+        let mut r = good.clone();
+        r.operations[0].started_at = Some("yesterday".into());
+        cases.push(("time", r));
+        let mut r = good.clone();
+        r.operations[0].resource = "line\nbreak".into();
+        cases.push(("name", r));
+        for (what, r) in cases {
+            assert!(r.validate().is_err(), "{what}");
+        }
+    }
+
+    // ---- DFM-57 WP-B -------------------------------------------------------------------------
+
+    type LedgerEdit = fn(&mut Ledger);
+    type EntryEdit = fn(&mut JournalEntry);
+
+    fn ledger_entry() -> Ledger {
+        let mut l = Ledger::empty(stamp());
+        l.record(LedgerResource {
+            resource: "a".into(),
+            adapter: "fs-link/v1".into(),
+            class: Class::Normal,
+            op_id: "op1".into(),
+            owned_outputs: vec![OwnedOutput {
+                path: "/h/x".into(),
+                mode: 0o600,
+                fingerprint: Some("a".repeat(64)),
+                coowned: None,
+            }],
+        })
+        .unwrap();
+        l
+    }
+
+    #[test]
+    fn a_newer_schema_wins_over_nesting_and_over_a_value_above_i64() {
+        let code = |s: &str| StateDoc::parse(s.as_bytes()).unwrap_err().code;
+        let deep = |schema: &str| {
+            format!(
+                "{{\"schema\":{schema},\"x\":{}1{}}}",
+                "[".repeat(40),
+                "]".repeat(40)
+            )
+        };
+        // Deeper than 32: a newer document is still reported as newer, an own-schema one is not.
+        assert_eq!(code(&deep("2")), Code::StateNewer);
+        assert_eq!(code(&deep("0")), Code::SchemaUnsupported);
+        assert_eq!(code(&deep("1")), Code::StateInvalid);
+        // Past the JSON parser's own recursion limit the schema is still read first.
+        let very_deep = |schema: &str, extra: &str| {
+            format!(
+                "{{\"x\":{}1{},{extra}\"schema\":{schema}}}",
+                "[".repeat(200),
+                "]".repeat(200)
+            )
+        };
+        assert_eq!(code(&very_deep("2", "")), Code::StateNewer);
+        assert_eq!(
+            code(&very_deep(" 3 ", "\"y\":\"a\\\"b\",")),
+            Code::StateNewer
+        );
+        assert_eq!(code(&very_deep("1", "")), Code::StateInvalid);
+        assert_eq!(code(&very_deep("2.5", "")), Code::StateInvalid);
+        // Only the top-level member counts: a nested `schema` is not the document's.
+        let nested = format!(
+            "{{\"x\":{{\"schema\":9}},\"y\":{}1{}}}",
+            "[".repeat(200),
+            "]".repeat(200)
+        );
+        assert_eq!(code(&nested), Code::StateInvalid);
+        // Broken JSON that is not a depth failure is invalid, whatever its schema says.
+        assert_eq!(code("{\"schema\":2,"), Code::StateInvalid);
+        // A schema above i64::MAX is a schema from the future, not a missing one.
+        assert_eq!(code("{\"schema\":18446744073709551615}"), Code::StateNewer);
+        assert_eq!(code("{\"schema\":1.5}"), Code::StateInvalid);
+        assert_eq!(code("{\"schema\":-1}"), Code::SchemaUnsupported);
+        // The size cap still comes first: an oversize document is not parsed at all.
+        let mut big = b"{\"schema\":2,\"x\":\"".to_vec();
+        big.resize(MAX_BYTES + 1, b'a');
+        assert_eq!(StateDoc::parse(&big).unwrap_err().code, Code::LimitExceeded);
+    }
+
+    #[test]
+    fn every_document_validator_checks_the_schema() {
+        let mut l = ledger_entry();
+        l.validate().unwrap();
+        l.schema = 2;
+        assert!(l.validate().is_err());
+
+        let mut r = receipt(vec![op(Status::Updated, Class::Normal)]);
+        r.validate().unwrap();
+        r.schema = 2;
+        assert!(r.validate().is_err());
+
+        let mut t = TrialRecord {
+            schema: SCHEMA,
+            binding: stamp(),
+            trial_id: "t1".into(),
+            tool: "atuin".into(),
+            created_unix: 1,
+            baseline: Baseline {
+                tool_preexisting: false,
+                paths: vec![],
+            },
+            owned_outputs: vec![],
+        };
+        t.validate().unwrap();
+        t.schema = 2;
+        assert!(t.validate().is_err());
+    }
+
+    #[test]
+    fn the_ledger_validator_refuses_each_malformed_shape() {
+        let cases: [(&str, LedgerEdit); 6] = [
+            ("binding digest that is not a SHA-256", |l| {
+                l.binding.binding_digest = "xyz".into()
+            }),
+            ("empty adapter", |l| l.resources[0].adapter = String::new()),
+            ("empty resource", |l| {
+                l.resources[0].resource = String::new()
+            }),
+            ("bad op id", |l| l.resources[0].op_id = "Op 1".into()),
+            ("duplicate resource", |l| {
+                let again = l.resources[0].clone();
+                l.resources.push(again);
+            }),
+            ("non-normalized path", |l| {
+                l.resources[0].owned_outputs[0].path = "/h/x/../x".into()
+            }),
+        ];
+        for (what, f) in cases {
+            let mut l = ledger_entry();
+            f(&mut l);
+            assert_eq!(l.validate().unwrap_err().code, Code::StateInvalid, "{what}");
+            // The same shapes are refused when the bytes are parsed.
+            let bytes = canonical(&l).unwrap();
+            assert_eq!(
+                Ledger::parse(&bytes).unwrap_err().code,
+                Code::StateInvalid,
+                "{what}"
+            );
+        }
+    }
+
+    fn journal_entry() -> JournalEntry {
+        let mut e = je("run-1", "create-link", Phase::Intent);
+        e.recovery.as_mut().unwrap().outputs[0].path = "/h/x".into();
+        e
+    }
+
+    #[test]
+    fn the_journal_entry_validator_refuses_each_malformed_field() {
+        journal_entry().validate().unwrap();
+        let cases: [(&str, EntryEdit); 11] = [
+            ("schema", |e| e.schema = 2),
+            ("op id", |e| e.op_id = "Run 1".into()),
+            ("op", |e| e.op = String::new()),
+            ("time", |e| e.at = "yesterday".into()),
+            ("impossible time", |e| e.at = "2026-02-30T00:00:00Z".into()),
+            ("relative recovery path", |e| {
+                e.recovery.as_mut().unwrap().outputs[0].path = "x".into()
+            }),
+            ("recovery path with dot-dot", |e| {
+                e.recovery.as_mut().unwrap().outputs[0].path = "/h/../x".into()
+            }),
+            ("reason over 4 KiB", |e| {
+                e.reason = Some("r".repeat(MAX_ERROR_BYTES + 1))
+            }),
+            ("token over 4 KiB", |e| {
+                e.token = Some("t".repeat(MAX_ERROR_BYTES + 1))
+            }),
+            ("snapshot that is not an id", |e| {
+                e.recovery.as_mut().unwrap().snapshot = Some("../x".into())
+            }),
+            ("intent without recovery", |e| e.recovery = None),
+        ];
+        for (what, f) in cases {
+            let mut e = journal_entry();
+            f(&mut e);
+            assert_eq!(e.validate().unwrap_err().code, Code::StateInvalid, "{what}");
+            assert!(e.to_line().is_err(), "{what}");
+        }
+        // The bounds are inclusive.
+        let mut e = journal_entry();
+        e.reason = Some("r".repeat(MAX_ERROR_BYTES));
+        e.token = Some("t".repeat(MAX_ERROR_BYTES));
+        e.recovery.as_mut().unwrap().snapshot = Some("snap-1".into());
+        e.validate().unwrap();
+    }
+
+    #[test]
+    fn a_journal_line_over_64_kib_or_a_journal_over_16_mib_is_refused() {
+        let mut e = journal_entry();
+        // Valid outputs add up past the line cap although each field is within its own bound.
+        e.recovery.as_mut().unwrap().outputs = (0..200)
+            .map(|i| RecoveryOutput {
+                path: format!("/h/{i}-{}", "p".repeat(400)),
+                existed_before: false,
+                expected_sha256: None,
+            })
+            .collect();
+        e.validate().unwrap();
+        assert_eq!(e.to_line().unwrap_err().code, Code::LimitExceeded);
+        let big = vec![b'\n'; MAX_BYTES + 1];
+        assert_eq!(parse_journal(&big).unwrap_err().code, Code::LimitExceeded);
+        // At the cap the size check passes (the content is then judged line by line).
+        assert_eq!(
+            parse_journal(&big[1..]).unwrap_err().code,
+            Code::StateInvalid
+        );
+    }
+
+    #[test]
+    fn a_journal_recovery_path_outside_home_is_refused_by_the_scope_check() {
+        let scope = Scope::new("/h", &["/h/.local/state/dotfiles-manager".to_string()]);
+        let mut e = journal_entry();
+        e.validate_within(&scope).unwrap();
+        for bad in [
+            "/etc/x",
+            "/h",
+            "/h/.local/state/dotfiles-manager/state/ledger.json",
+        ] {
+            e.recovery.as_mut().unwrap().outputs[0].path = bad.into();
+            assert_eq!(
+                e.validate_within(&scope).unwrap_err().code,
+                Code::StateInvalid,
+                "{bad}"
+            );
+        }
+        // A created directory may lie above a reserved path, but never outside HOME.
+        e.op = JournalEntry::CREATE_DIR.into();
+        e.recovery.as_mut().unwrap().outputs[0].path = "/h/.local/state".into();
+        e.validate_within(&scope).unwrap();
+        e.recovery.as_mut().unwrap().outputs[0].path = "/etc".into();
+        assert!(e.validate_within(&scope).is_err());
+    }
+
+    #[test]
+    fn a_receipt_command_snapshot_and_exit_must_fit_the_contract() {
+        // The command is free text: bounded like the other free text of a receipt.
+        let mut r = receipt(vec![op(Status::Updated, Class::Normal)]);
+        r.command = "c".repeat(MAX_ERROR_BYTES);
+        r.validate().unwrap();
+        r.command.push('c');
+        assert!(r.validate().is_err());
+
+        // Exit 0 cannot hold an operation that did not succeed.
+        for status in [
+            Status::Failed,
+            Status::Unknown,
+            Status::Blocked,
+            Status::BlockedPending,
+            Status::Pending,
+        ] {
+            let mut r = receipt(vec![
+                op(Status::Updated, Class::Normal),
+                op(status, Class::Normal),
+            ]);
+            // Operation ids are not unique in this fixture; the receipt does not need them to be.
+            assert_eq!(r.result.exit_code, 0);
+            assert!(r.validate().is_err(), "{status:?} with exit 0");
+            r.result = RunResult::from_operations(&r.operations);
+            assert_eq!(r.result.exit_code, 1, "{status:?}");
+            r.validate().unwrap();
+        }
+        // Exit 1 without such an operation is a real shape (a run stopped after a mutation with
+        // every operation current), so it stays valid.
+        let mut r = receipt(vec![op(Status::Current, Class::Normal)]);
+        r.result.exit_code = 1;
+        r.result.outcome = "failed".into();
+        r.validate().unwrap();
+        // The derived result for a clean run is exit 0.
+        let ok = RunResult::from_operations(&r.operations);
+        assert_eq!((ok.exit_code, ok.outcome.as_str()), (0, "ok"));
+    }
+}

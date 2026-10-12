@@ -4,6 +4,7 @@ core = "modules/core/module.toml"
 
 [modules]
 agents = "modules/agents/module.toml"
+claude-base = "modules/claude-base/module.toml"
 desktop = "modules/desktop/module.toml"
 personal-dev = "modules/personal-dev/module.toml"
 server = "modules/server/module.toml"

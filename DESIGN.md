@@ -330,10 +330,12 @@ The current private wrapper has not been inspected in this workspace. Synthetic 
 
 ## 11. Decisions still proposed
 
+The [minimum implementation contract](docs/architecture.md) proposes answers for the language, source lock, receipt format, adapter packaging and CLI exit semantics below. Its status is proposed, with owner review pending. Until the owner accepts it, the items below stay open.
+
 - TOML schema and the exact catalogue/override syntax.
 - The CLI and state-directory working name.
 - Which real configurations are universal core, exposed defaults, or optional modules.
 - Production adapter packaging and the implementation language.
 - Source-lock representation, native-provider coverage, and compatibility details for the current private wrapper.
 
-These are review questions, not implicit permission to modify deployed configuration. Unified updates, GitHub pull-and-apply, trial/adopt/purge, and read-only doctor diagnostics are fixed first-implementation requirements. Read-only resolution and provenance can be built first internally, but are not an acceptable standalone first implementation. No manager commands or apply engine are present in this draft.
+These are review questions, not implicit permission to modify deployed configuration. Unified updates, GitHub pull-and-apply, trial/adopt/purge, and read-only doctor diagnostics are fixed first-implementation requirements. Read-only resolution and provenance can be built first internally, but are not an acceptable standalone first implementation. This draft is implemented in part: `bind`, `binding`, `explain`, `plan`, `doctor`, `status`, `apply` (links, rendered and assembled files, and the `claude-settings/v1` merge), and `state` exist (README and docs/apply.md). The `update`, `sync`, `try`, `adopt <trial>` and `purge` workflows are not built.

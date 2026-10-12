@@ -1,0 +1,54 @@
+schema = 1
+id = "reusable"
+platforms = ["macos", "linux"]
+requires = []
+
+[[resources]]
+id = "tool-config"
+kind = "link"
+adapter = "fs-link/v1"
+target = ".config/synthetic/tool.conf"
+[resources.value]
+source = "files/tool.conf"
+[resources.policy]
+defaults = ["/source"]
+extensions = []
+
+[[resources]]
+id = "tool-banner"
+kind = "link"
+adapter = "fs-link/v1"
+target = ".config/synthetic/banner"
+[resources.value]
+source = "files/banner"
+[resources.policy]
+defaults = ["/source"]
+extensions = []
+
+[[resources]]
+id = "tool-settings"
+kind = "render"
+adapter = "git-config/v1"
+target = ".config/synthetic/tool.inc"
+[resources.value.tool]
+retries = 3
+timeout = 30
+verbose = false
+paths = ["a", "b"]
+[resources.policy]
+defaults = ["/tool/retries", "/tool/timeout", "/tool/verbose", "/tool/paths"]
+extensions = []
+
+[[resources]]
+id = "agent-settings"
+kind = "merge"
+adapter = "claude-settings/v1"
+target = ".claude/settings.json"
+[resources.value.managed]
+mode = "strict"
+[resources.value.seed]
+theme = "plain"
+[resources.value.handlers]
+[resources.policy]
+defaults = ["/managed/mode"]
+extensions = ["/handlers"]

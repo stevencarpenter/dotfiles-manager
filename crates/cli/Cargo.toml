@@ -1,0 +1,68 @@
+[package]
+name = "dfm-cli"
+version = { workspace = true }
+edition = { workspace = true }
+rust-version = { workspace = true }
+publish = { workspace = true }
+
+[[bin]]
+name = "dotfiles-manager"
+path = "src/main.rs"
+
+[features]
+# Never in default. Compiles DFM_HOME, DFM_BINDING, DFM_PLATFORM and --home.
+test-isolation = ["dfm-engine/failpoints"]
+
+[dependencies]
+dfm-model = { workspace = true }
+dfm-engine = { workspace = true }
+dfm-platform-macos = { workspace = true }
+sha2 = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
+# Resolver tests parse and patch fixture documents in memory. Already an accepted direct crate.
+toml = { workspace = true }
+
+# These tests drive the isolated build through --home, so they need the feature. Run them with
+# `cargo test --features test-isolation` (scripts/check_all.sh does). A plain `cargo test`
+# skips them; there is deliberately no self dev-dependency that would switch the feature on
+# for every build of the package.
+[[test]]
+name = "cli"
+required-features = ["test-isolation"]
+
+[[test]]
+name = "state"
+required-features = ["test-isolation"]
+
+[[test]]
+name = "build_controls"
+required-features = ["test-isolation"]
+
+[[test]]
+name = "explain"
+required-features = ["test-isolation"]
+
+[[test]]
+name = "planner"
+required-features = ["test-isolation"]
+
+[[test]]
+name = "apply"
+required-features = ["test-isolation"]
+
+[[test]]
+name = "doctor"
+required-features = ["test-isolation"]
+
+[[test]]
+name = "merge"
+required-features = ["test-isolation"]
+
+[[test]]
+name = "native_config"
+required-features = ["test-isolation"]
+
+[lints]
+workspace = true
