@@ -786,22 +786,32 @@ impl Store {
         state::parse_journal(&bytes[..keep])?;
         let removed = bytes.len() - keep;
         // Keep the text before it is cut: nothing is lost if the cut or the record then fails.
-        let kept =
-            self.wrote(
-                self.state()?
-                    .publish_new(TORN, &bytes[keep..], &self.fail, "repair-keep"),
-            )?;
-        if !kept {
-            return Err(storage(format!(
-                "state/{TORN} exists from an earlier repair; nothing was cut. Fix: read it, then remove it by hand"
-            )));
+        let tail = &bytes[keep..];
+        match self
+            .state()?
+            .publish_new(TORN, tail, &self.fail, "repair-keep")
+        {
+            // Nothing was written, so the store is not marked as mutated. A copy of the same text
+            // is the leftover of a repair that stopped before the cut or before its record: the
+            // cut resumes. A copy of other text may be an earlier cut that was never read.
+            Ok(false) if self.read_doc(TORN)? == tail => {}
+            Ok(false) => {
+                return Err(storage(format!(
+                    "state/{TORN} holds other text, kept by an earlier repair; nothing was cut. Fix: read it, then remove it by hand"
+                )));
+            }
+            r => {
+                self.wrote(r)?;
+            }
         }
-        self.wrote(self.state()?.truncate_to(
-            &self.sys,
-            "journal.jsonl",
-            u64::try_from(bytes.len()).unwrap_or(u64::MAX),
-            u64::try_from(keep).unwrap_or(0),
-        ))?;
+        self.wrote(self.fail.hit("repair-cut").and_then(|()| {
+            self.state()?.truncate_to(
+                &self.sys,
+                "journal.jsonl",
+                u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+                u64::try_from(keep).unwrap_or(0),
+            )
+        }))?;
         // The cut cannot be undone. If the record fails, the removed text stays in `TORN` and
         // the error carries the start of it.
         let record = || -> Result<(), Refusal> {
@@ -835,8 +845,9 @@ impl Store {
             )
             .after_mutation()
         })?;
-        // The record exists, so the kept copy is no longer needed.
-        self.wrote(self.state()?.remove_entry(TORN, &self.fail))?;
+        // The record exists, so the kept copy is no longer needed. The repair is complete even if
+        // the copy cannot be removed: `state check` reports it as a stray entry.
+        let _ = self.wrote(self.state()?.remove_entry(TORN, &self.fail));
         Ok(removed)
     }
 

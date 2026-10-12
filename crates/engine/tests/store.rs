@@ -1247,12 +1247,78 @@ fn a_repair_record_that_cannot_be_written_keeps_the_cut_text_in_the_error() {
         "{:?}",
         s.load().strays
     );
-    // A second repair does not overwrite the kept text and does not cut.
-    fs::write(&j, &torn).unwrap();
+    // A later torn line with other text does not overwrite the kept text and does not cut. The
+    // refusal wrote nothing, so a fresh store is not marked as mutated by it.
+    drop(s);
+    let mut other = sound.clone();
+    other.extend_from_slice(b"{\"schema\":1,\"op_id\":\"other");
+    fs::write(&j, &other).unwrap();
+    let s = open(&h);
     let e = s.repair_torn_journal().unwrap_err();
     assert_eq!(e.code, Code::StorageInvalid);
     assert!(e.detail.contains("nothing was cut"), "{}", e.detail);
-    assert_eq!(fs::read(&j).unwrap(), torn);
+    assert!(!e.mutated && !s.mutated(), "nothing was written");
+    assert_eq!(e.exit(), dfm_model::Exit::Blocked);
+    assert_eq!(fs::read(&j).unwrap(), other);
+    assert_eq!(
+        fs::read(&kept).unwrap(),
+        b"{\"schema\":1,\"op_id\":\"half-written"
+    );
+}
+
+#[cfg(feature = "failpoints")]
+#[test]
+fn a_cut_that_fails_can_be_repaired_by_the_next_run() {
+    use dfm_engine::Action;
+    let h = Home::new();
+    let (s, _) = init(&h);
+    s.append_journal(&intent("op1", h.0.join("out").to_str().unwrap()))
+        .unwrap();
+    drop(s);
+    let j = state_dir(&h).join("journal.jsonl");
+    let mut torn = fs::read(&j).unwrap();
+    torn.extend_from_slice(b"{\"schema\":1,\"op_id\":\"half");
+    fs::write(&j, &torn).unwrap();
+
+    let s = Store::open_write(sys(&h), &h.layout(), Fail::at("repair-cut", Action::Error)).unwrap();
+    let e = s.repair_torn_journal().unwrap_err();
+    assert_eq!(e.code, Code::IoFailed);
+    assert_eq!(fs::read(&j).unwrap(), torn, "nothing was cut");
+    let kept = state_dir(&h).join("journal.torn");
+    assert_eq!(fs::read(&kept).unwrap(), b"{\"schema\":1,\"op_id\":\"half");
+    drop(s);
+
+    // The leftover copy holds the same text: the next run resumes the cut and clears the copy.
+    let s = open(&h);
+    assert_eq!(s.repair_torn_journal().unwrap(), 25);
+    assert!(!kept.exists());
+    assert!(s.read_journal().unwrap().iter().any(|e| e.op == "repair"));
+    assert!(s.load().strays.is_empty(), "{:?}", s.load().strays);
+}
+
+#[cfg(feature = "failpoints")]
+#[test]
+fn a_kept_copy_that_cannot_be_removed_does_not_fail_a_finished_repair() {
+    use dfm_engine::Action;
+    let h = Home::new();
+    let (s, _) = init(&h);
+    s.append_journal(&intent("op1", h.0.join("out").to_str().unwrap()))
+        .unwrap();
+    drop(s);
+    let j = state_dir(&h).join("journal.jsonl");
+    let mut torn = fs::read(&j).unwrap();
+    torn.extend_from_slice(b"{\"schema\":1,\"op_id\":\"half");
+    fs::write(&j, &torn).unwrap();
+
+    let s = Store::open_write(
+        sys(&h),
+        &h.layout(),
+        Fail::at("remove-after-unlink", Action::Error),
+    )
+    .unwrap();
+    assert_eq!(s.repair_torn_journal().unwrap(), 25);
+    assert!(s.mutated());
+    assert!(s.read_journal().unwrap().iter().any(|e| e.op == "repair"));
 }
 
 #[test]
@@ -1333,15 +1399,25 @@ fn every_malformed_ledger_shape_is_refused_on_read_and_load() {
         let again = l.resources[0].clone();
         l.resources.push(again);
     };
-    let cases: [(&str, LedgerEdit, Code); 5] = [
+    let cases: [(&str, LedgerEdit, Code); 7] = [
         (
             "binding digest that is not a SHA-256",
             |l| l.binding.binding_digest = "xyz".into(),
             Code::StateInvalid,
         ),
         (
-            "malformed resource",
+            "malformed resource: empty name",
+            |l| l.resources[0].resource = String::new(),
+            Code::StateInvalid,
+        ),
+        (
+            "malformed resource: empty adapter",
             |l| l.resources[0].adapter = String::new(),
+            Code::StateInvalid,
+        ),
+        (
+            "malformed resource: bad op id",
+            |l| l.resources[0].op_id = "not an id".into(),
             Code::StateInvalid,
         ),
         ("duplicate resource", dup, Code::StateInvalid),
@@ -1357,7 +1433,15 @@ fn every_malformed_ledger_shape_is_refused_on_read_and_load() {
     ];
     for (what, f, want) in cases {
         handwritten_ledger(&h, &stamp, f);
-        assert_eq!(code(s.read_ledger()), want, "{what}");
+        let e = s.read_ledger().unwrap_err();
+        assert_eq!(e.code, want, "{what}");
+        // The resource arm names itself, so a different failure cannot satisfy the case.
+        assert_eq!(
+            e.detail.contains("is malformed"),
+            what.starts_with("malformed resource"),
+            "{what}: {}",
+            e.detail
+        );
         assert_eq!(s.load().ledger.unwrap_err().code, want, "{what}");
     }
 }
