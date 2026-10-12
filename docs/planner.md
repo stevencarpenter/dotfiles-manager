@@ -83,7 +83,7 @@ A rejected plan still prints. Its `blockers` list gives for each: code, resource
 | `E_PLAN_CYCLE` | Operations depend on each other in a loop. | 3 |
 | `E_PLAN_STALE` | A saved plan differs from a fresh one. | 3 |
 | `E_PLAN_INVALID` | A saved plan is not valid JSON, has the wrong shape, or its digest does not match. | 3 |
-| `E_PRIVILEGE_UNSUPPORTED` | A path needs another owner or write access the user lacks. | 3 |
+| `E_PRIVILEGE_UNSUPPORTED` | A path needs another owner or write access the user lacks. Apply also raises it for a leaf that has another owner than the plan found. | 3 |
 | `E_OBSERVATION_UNKNOWN` | A required fact could not be observed (too large, unreadable, not observed). | 3 |
 | `E_TARGET_RESERVED` | A claim overlaps the manager's own state, config, lock, data or cache paths. | 3 |
 

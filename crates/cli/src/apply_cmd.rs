@@ -209,7 +209,11 @@ fn run_inner(
     // The journal size is read without the lock. The lock is taken only for a real run.
     let readable = Store::open_read(sys, &layout, state_cmd::fail_from_env()?)?
         .ok_or_else(crate::state_lost_refusal)?;
-    check_journal_capacity(readable.journal_len()?, &plan)?;
+    check_journal_capacity(
+        readable.journal_len()?,
+        readable.settlement_entries()?,
+        &plan,
+    )?;
     drop(readable);
     if args.preview {
         return Ok(());
