@@ -1458,12 +1458,22 @@ fn decide(
                     };
                     Ok((Action::None, Status::Current, own, effect, post))
                 }
-                (_, Ownership::Owned) => Ok((
+                (Node::Link { .. }, Ownership::Owned) => Ok((
                     Action::ReplaceLink,
                     Status::Planned,
                     Ownership::Owned,
                     format!("replace {shown} with a link -> {want}"),
                     post,
+                )),
+                // The ledger owns a file here (the resource was a render before). A link
+                // replacement over it would fail at apply, after earlier operations ran.
+                (_, Ownership::Owned) => Err(fail(
+                    Code::Conflict,
+                    "target",
+                    format!(
+                        "{path} is a file where this resource now creates a link; the manager never replaces a file with a link"
+                    ),
+                    "remove the file yourself, then plan again to create the link",
                 )),
                 (_, Ownership::Modified) => Err(conflict("was changed after the manager wrote it")),
                 (_, Ownership::Unverifiable) => {

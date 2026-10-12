@@ -161,18 +161,21 @@ pub fn stale(old: &Plan, new: &Plan) -> Result<Vec<Stale>, Refusal> {
     // A change `node_state` does not show (an owner flag) is caught by the digest entry below.
     // A sensitive claim shows no size either, as in its precondition (`node_state`).
     let obs = |p: &Plan| -> BTreeMap<String, String> {
-        let sensitive: BTreeSet<&str> = p
-            .operations
-            .iter()
-            .filter(|o| o.class == Class::Sensitive)
-            .filter_map(|o| o.path.as_deref())
-            .collect();
+        // The claim of a sensitive operation, and the unhashed fragments it merges: those are
+        // observed by path only, so no operation names them (`followups`, `fragment_edges`).
+        let mut sensitive: BTreeSet<String> = BTreeSet::new();
+        for o in p.operations.iter().filter(|o| o.class == Class::Sensitive) {
+            sensitive.extend(o.path.clone());
+            if let Some(dir) = &o.fragment_dir {
+                sensitive.extend(o.fragments.iter().map(|f| format!("{dir}/{}", f.name)));
+            }
+        }
         let mut m: BTreeMap<String, String> = p
             .observations
             .seen
             .iter()
             .map(|(k, v)| {
-                let state = super::node_state(v, sensitive.contains(k.as_str()));
+                let state = super::node_state(v, sensitive.contains(k));
                 (format!("path:{k}"), state)
             })
             .collect();

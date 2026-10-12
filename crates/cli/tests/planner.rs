@@ -1393,6 +1393,26 @@ mod synthetic {
     }
 
     #[test]
+    fn a_file_the_ledger_owns_is_not_replaced_by_a_link_when_the_resource_became_a_link() {
+        let (r, mut obs) = observed();
+        put(&mut obs, ".ssh", dir(true), None);
+        // The ledger holds the fingerprint of this very file, so ownership reads Owned.
+        put(&mut obs, ".ssh/config", file(true, 0o600), None);
+        let ledger = vec![owned("core.ssh", ".ssh/config", Some("0".repeat(64)))];
+        let p = plan_with(&r, &obs, ledger, BTreeMap::new());
+        assert_eq!(first(&p, "core.ssh"), Code::Conflict);
+        assert!(p.blockers.iter().any(|b| {
+            b.detail
+                .contains("is a file where this resource now creates a link")
+        }));
+        assert_eq!(
+            action_of(&p, "core.ssh@.ssh/config"),
+            (Action::None, Status::Blocked)
+        );
+        assert!(p.operations.iter().all(|o| o.action != Action::ReplaceLink));
+    }
+
+    #[test]
     fn an_owner_that_cannot_be_verified_blocks_a_link_replace_and_a_file_update() {
         // No fingerprint is recorded for the entry, so ownership is unverifiable.
         let (r, mut obs) = observed();
@@ -1717,6 +1737,49 @@ mod synthetic {
             .collect();
         assert_eq!(ssh.len(), 1, "{ssh:?}");
         assert!(stale(&old, &old).unwrap().is_empty());
+    }
+
+    #[test]
+    fn the_observation_diff_hides_the_size_of_an_unhashed_fragment_of_a_sensitive_merge() {
+        use dfm_model::plan::{Fragment, stale};
+        let (r, obs) = observed();
+        let mut old = plan(&r, &obs);
+        let op = &mut old.operations[0];
+        op.class = dfm_model::state::Class::Sensitive;
+        op.fragment_dir = Some(".claude/frag".into());
+        op.fragments = vec![Fragment {
+            name: "x.json".into(),
+            origin: "foreign".into(),
+            sha256: None,
+        }];
+        let sized = |size| Node::File {
+            mode: 0o600,
+            own: true,
+            size,
+            sha256: None,
+        };
+        let mut new = old.clone();
+        put(
+            &mut old.observations,
+            ".claude/frag/x.json",
+            sized(120),
+            None,
+        );
+        put(
+            &mut new.observations,
+            ".claude/frag/x.json",
+            sized(131),
+            None,
+        );
+        // Only the hidden size changed: no observation line prints it, and the digest entry
+        // still reports that the plan differs.
+        let diff = stale(&old, &new).unwrap();
+        assert!(
+            diff.iter()
+                .all(|s| !s.was.contains("size:") && !s.now.contains("size:")),
+            "{diff:?}"
+        );
+        assert!(diff.iter().any(|s| s.subject == "digest"), "{diff:?}");
     }
 
     #[test]
@@ -2146,6 +2209,17 @@ fn an_unsafe_merge_target_or_fragment_directory_is_refused_and_changes_nothing()
         .iter()
         .find(|b| b.resource == "agents.claude-settings")
         .expect("the merge is blocked");
+    assert_eq!(
+        (b.code.as_str(), b.path.as_deref()),
+        ("E_CONFLICT", Some(".claude/settings.json"))
+    );
+    assert!(
+        b.detail
+            .starts_with("the live settings file is not valid JSON ("),
+        "{}",
+        b.detail
+    );
+    // The detail names the parse position and never echoes the content.
     assert!(!b.detail.contains("not json"), "{}", b.detail);
     assert!(
         s.plan
