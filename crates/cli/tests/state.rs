@@ -5,7 +5,7 @@
 
 mod common;
 
-use common::{TempDir, repo_root};
+use common::{TempDir, is_root, repo_root};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::fs;
@@ -1448,4 +1448,114 @@ fn a_binding_without_its_state_is_state_loss_and_is_never_recreated() {
         assert!(!h.path().join("y").exists());
         assert_eq!(snapshot(h.path()), before, "{lose}");
     }
+}
+
+// ---- DFM-57 WP-B ---------------------------------------------------------------------------------
+
+#[test]
+fn a_writer_refuses_a_state_store_that_lacks_a_subdirectory_before_any_change() {
+    for missing in ["receipts", "snapshots", "trials"] {
+        let h = bound_home("missing-sub");
+        fs::remove_dir(state(h.path()).join(missing)).unwrap();
+        let before = snapshot(h.path());
+        // Each command that opens the store for writing refuses, and nothing changes.
+        let o = record(h.path(), "core.y", "y", "y");
+        assert_eq!(o.status.code(), Some(3), "{missing}: {}", text(&o.stderr));
+        assert!(
+            text(&o.stderr).contains("E_STORAGE_INVALID"),
+            "{missing}: {}",
+            text(&o.stderr)
+        );
+        assert!(
+            text(&o.stderr).contains(missing),
+            "{missing}: {}",
+            text(&o.stderr)
+        );
+        let o = run(h.path(), &["state", "recover"]);
+        assert_eq!(o.status.code(), Some(3), "{missing}: {}", text(&o.stderr));
+        assert!(!h.path().join("y").exists(), "{missing}");
+        assert_eq!(
+            snapshot(h.path()),
+            before,
+            "{missing}: HOME and the store are unchanged"
+        );
+        // `state check` still reports the same layout as a finding.
+        let c = check(h.path());
+        assert_eq!(c.status.code(), Some(1), "{missing}: {}", text(&c.stdout));
+        assert!(
+            text(&c.stdout).contains("this directory is missing"),
+            "{missing}"
+        );
+    }
+}
+
+fn record_trial(h: &Path, id: &str, baseline: &Path) -> Output {
+    run(
+        h,
+        &[
+            "__record-trial",
+            "--id",
+            id,
+            "--tool",
+            "atuin",
+            "--baseline-path",
+            baseline.to_str().unwrap(),
+        ],
+    )
+}
+
+#[test]
+fn a_trial_baseline_that_cannot_be_read_or_is_a_link_is_an_error_not_an_absent_file() {
+    let h = bound_home("baseline");
+    let trial = state(h.path()).join("trials/t1.json");
+    // A missing path is recorded as absent; a plain file is recorded with its hash.
+    let o = record_trial(h.path(), "t1", &h.path().join("nothing"));
+    assert_eq!(o.status.code(), Some(0), "{}", text(&o.stderr));
+    assert_eq!(
+        json(&fs::read(&trial).unwrap())["baseline"]["paths"][0]["existed"],
+        false
+    );
+    let plain = h.path().join("plain");
+    fs::write(&plain, "baseline").unwrap();
+    let o = record_trial(h.path(), "t2", &plain);
+    assert_eq!(o.status.code(), Some(0), "{}", text(&o.stderr));
+    let t2 = json(&fs::read(state(h.path()).join("trials/t2.json")).unwrap());
+    assert_eq!(t2["baseline"]["paths"][0]["existed"], true);
+    assert_eq!(t2["baseline"]["paths"][0]["sha256"], sha_hex("baseline"));
+
+    // A link (also one to a readable file) and a directory are refused, and no trial is written.
+    let link = h.path().join("link");
+    symlink(&plain, &link).unwrap();
+    let dir = h.path().join("dir");
+    fs::create_dir(&dir).unwrap();
+    let before = snapshot(h.path());
+    for (id, p) in [("t3", &link), ("t4", &dir)] {
+        let o = record_trial(h.path(), id, p);
+        assert_ne!(o.status.code(), Some(0), "{id}");
+        assert!(
+            text(&o.stderr).contains("E_STATE_INVALID"),
+            "{id}: {}",
+            text(&o.stderr)
+        );
+    }
+    assert_eq!(snapshot(h.path()), before, "nothing was recorded");
+
+    // An unreadable file is an I/O error, not "did not exist".
+    if is_root() {
+        println!("SKIPPED: unreadable baseline (runs as root)");
+        return;
+    }
+    let secret = h.path().join("secret");
+    fs::write(&secret, "x").unwrap();
+    let before = snapshot(&state(h.path()));
+    fs::set_permissions(&secret, fs::Permissions::from_mode(0o000)).unwrap();
+    let o = record_trial(h.path(), "t5", &secret);
+    fs::set_permissions(&secret, fs::Permissions::from_mode(0o600)).unwrap();
+    assert_eq!(o.status.code(), Some(1), "{}", text(&o.stderr));
+    assert!(
+        text(&o.stderr).contains("E_IO_FAILED"),
+        "{}",
+        text(&o.stderr)
+    );
+    assert_eq!(snapshot(&state(h.path())), before, "no trial was recorded");
 }

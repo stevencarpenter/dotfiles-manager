@@ -57,7 +57,11 @@ fn depth(v: &serde_json::Value) -> usize {
     }
 }
 
-/// Strict parse. Order: size, JSON, depth, schema, then the typed fields.
+/// Strict parse. Order: size, JSON, schema, depth, then the typed fields. The schema comes
+/// before the depth check so a document written by a newer binary is reported as newer even
+/// when its shape (deeper nesting, a schema above `i64`) is not one this binary accepts. The
+/// size cap stays first: an oversize document is never parsed. A document nested past the JSON
+/// parser's own recursion limit (128) is not valid JSON here and cannot be told apart.
 pub fn parse<T: DeserializeOwned>(kind: &str, bytes: &[u8]) -> Result<T, Refusal> {
     if bytes.len() > MAX_BYTES {
         return Err(Refusal::new(
@@ -67,26 +71,33 @@ pub fn parse<T: DeserializeOwned>(kind: &str, bytes: &[u8]) -> Result<T, Refusal
     }
     let v: serde_json::Value =
         serde_json::from_slice(bytes).map_err(|e| bad(format!("{kind} is not valid JSON: {e}")))?;
-    if depth(&v) > MAX_DEPTH {
-        return Err(bad(format!("{kind} nests deeper than {MAX_DEPTH}")));
-    }
-    match v.get("schema").and_then(serde_json::Value::as_i64) {
+    let schema = v.get("schema");
+    match schema.and_then(serde_json::Value::as_i64) {
         Some(SCHEMA) => {}
-        Some(n) if n > SCHEMA => {
-            return Err(Refusal::new(
-                Code::StateNewer,
-                format!("{kind} schema {n} is newer than this binary supports (supported: 1)"),
-            ));
-        }
+        Some(n) if n > SCHEMA => return Err(newer(kind, &n.to_string())),
         Some(n) => {
             return Err(Refusal::new(
                 Code::SchemaUnsupported,
                 format!("{kind} schema {n} is not supported (supported: 1)"),
             ));
         }
-        None => return Err(bad(format!("{kind} has no integer schema"))),
+        // An integer above `i64::MAX` is a schema this binary has never heard of: newer.
+        None => match schema.and_then(serde_json::Value::as_u64) {
+            Some(n) => return Err(newer(kind, &n.to_string())),
+            None => return Err(bad(format!("{kind} has no integer schema"))),
+        },
+    }
+    if depth(&v) > MAX_DEPTH {
+        return Err(bad(format!("{kind} nests deeper than {MAX_DEPTH}")));
     }
     serde_json::from_value(v).map_err(|e| bad(format!("{kind}: {e}")))
+}
+
+fn newer(kind: &str, n: &str) -> Refusal {
+    Refusal::new(
+        Code::StateNewer,
+        format!("{kind} schema {n} is newer than this binary supports (supported: 1)"),
+    )
 }
 
 /// Canonical form: UTF-8, sorted keys, no insignificant whitespace.
@@ -264,6 +275,9 @@ impl Ledger {
     /// case-insensitive volume, so they count as one path), normalized absolute paths, and no content hash for a
     /// sensitive resource.
     pub fn validate(&self) -> Result<(), Refusal> {
+        if self.schema != SCHEMA {
+            return Err(bad("ledger schema"));
+        }
         self.binding.validate()?;
         let mut resources = BTreeSet::new();
         let mut paths = BTreeSet::new();
@@ -498,6 +512,33 @@ pub struct Receipt {
     pub result: RunResult,
 }
 
+impl Status {
+    /// An operation that did not complete as asked. A run with one cannot exit 0.
+    pub const fn is_problem(self) -> bool {
+        matches!(
+            self,
+            Status::Failed
+                | Status::Unknown
+                | Status::Blocked
+                | Status::BlockedPending
+                | Status::Pending
+        )
+    }
+}
+
+impl RunResult {
+    /// The result of a run that ended without a refusal or a signal: exit 0, or exit 1 when an
+    /// operation did not complete.
+    pub fn from_operations(ops: &[OperationRecord]) -> RunResult {
+        let failed = ops.iter().any(|o| o.status.is_problem());
+        RunResult {
+            outcome: if failed { "failed" } else { "ok" }.into(),
+            exit_code: u8::from(failed),
+            counts: count_statuses(ops),
+        }
+    }
+}
+
 /// One count per status; their sum is the number of participants.
 pub fn count_statuses(ops: &[OperationRecord]) -> BTreeMap<Status, u32> {
     let mut counts: BTreeMap<Status, u32> = Status::ALL.iter().map(|s| (*s, 0)).collect();
@@ -523,7 +564,11 @@ impl Receipt {
     }
 
     pub fn validate(&self) -> Result<(), Refusal> {
-        if !valid_id(&self.op_id) || self.command.is_empty() {
+        if self.schema != SCHEMA {
+            return Err(bad("receipt schema"));
+        }
+        if !valid_id(&self.op_id) || self.command.is_empty() || self.command.len() > MAX_ERROR_BYTES
+        {
             return Err(bad("receipt op_id or command is malformed"));
         }
         self.stamp().validate()?;
@@ -643,6 +688,15 @@ impl Receipt {
         if self.result.outcome != exit_name {
             return Err(bad("receipt outcome does not match its exit_code"));
         }
+        // A run that reports success cannot hold an operation that did not succeed. The
+        // reverse (exit 1 with no such operation) is a real shape: a run can stop after a
+        // mutation, for example when settling an earlier journal fails, with every operation
+        // `current` or `not_started`.
+        if self.result.exit_code == 0 && self.operations.iter().any(|o| o.status.is_problem()) {
+            return Err(bad(
+                "receipt exit_code 0 contradicts a failed, unknown, blocked or pending operation",
+            ));
+        }
         for o in &self.operations {
             let named =
                 |t: &str| !t.is_empty() && t.len() <= 256 && !t.chars().any(char::is_control);
@@ -727,6 +781,17 @@ impl JournalEntry {
     pub fn validate(&self) -> Result<(), Refusal> {
         if self.schema != SCHEMA {
             return Err(bad("journal entry schema"));
+        }
+        let snapshot = self.recovery.as_ref().and_then(|r| r.snapshot.as_deref());
+        if snapshot.is_some_and(|s| !valid_id(s)) {
+            return Err(bad("journal recovery snapshot is not a valid id"));
+        }
+        if self
+            .token
+            .as_ref()
+            .is_some_and(|t| t.len() > MAX_ERROR_BYTES)
+        {
+            return Err(bad("journal token is not bounded"));
         }
         if !valid_id(&self.op_id) || !valid_id(&self.op) || parse_rfc3339(&self.at).is_none() {
             return Err(bad("journal entry ids or time are malformed"));
@@ -893,6 +958,9 @@ impl TrialRecord {
     }
 
     pub fn validate(&self) -> Result<(), Refusal> {
+        if self.schema != SCHEMA {
+            return Err(bad("trial schema"));
+        }
         self.binding.validate()?;
         if !valid_id(&self.trial_id) || !valid_id(&self.tool) {
             return Err(bad("trial id or tool is malformed"));
@@ -2008,5 +2076,246 @@ mod tests {
         for (what, r) in cases {
             assert!(r.validate().is_err(), "{what}");
         }
+    }
+
+    // ---- DFM-57 WP-B -------------------------------------------------------------------------
+
+    type LedgerEdit = fn(&mut Ledger);
+    type EntryEdit = fn(&mut JournalEntry);
+
+    fn ledger_entry() -> Ledger {
+        let mut l = Ledger::empty(stamp());
+        l.record(LedgerResource {
+            resource: "a".into(),
+            adapter: "fs-link/v1".into(),
+            class: Class::Normal,
+            op_id: "op1".into(),
+            owned_outputs: vec![OwnedOutput {
+                path: "/h/x".into(),
+                mode: 0o600,
+                fingerprint: Some("a".repeat(64)),
+                coowned: None,
+            }],
+        })
+        .unwrap();
+        l
+    }
+
+    #[test]
+    fn a_newer_schema_wins_over_nesting_and_over_a_value_above_i64() {
+        let code = |s: &str| StateDoc::parse(s.as_bytes()).unwrap_err().code;
+        let deep = |schema: &str| {
+            format!(
+                "{{\"schema\":{schema},\"x\":{}1{}}}",
+                "[".repeat(40),
+                "]".repeat(40)
+            )
+        };
+        // Deeper than 32: a newer document is still reported as newer, an own-schema one is not.
+        assert_eq!(code(&deep("2")), Code::StateNewer);
+        assert_eq!(code(&deep("0")), Code::SchemaUnsupported);
+        assert_eq!(code(&deep("1")), Code::StateInvalid);
+        // A schema above i64::MAX is a schema from the future, not a missing one.
+        assert_eq!(code("{\"schema\":18446744073709551615}"), Code::StateNewer);
+        assert_eq!(code("{\"schema\":1.5}"), Code::StateInvalid);
+        assert_eq!(code("{\"schema\":-1}"), Code::SchemaUnsupported);
+        // The size cap still comes first: an oversize document is not parsed at all.
+        let mut big = b"{\"schema\":2,\"x\":\"".to_vec();
+        big.resize(MAX_BYTES + 1, b'a');
+        assert_eq!(StateDoc::parse(&big).unwrap_err().code, Code::LimitExceeded);
+    }
+
+    #[test]
+    fn every_document_validator_checks_the_schema() {
+        let mut l = ledger_entry();
+        l.validate().unwrap();
+        l.schema = 2;
+        assert!(l.validate().is_err());
+
+        let mut r = receipt(vec![op(Status::Updated, Class::Normal)]);
+        r.validate().unwrap();
+        r.schema = 2;
+        assert!(r.validate().is_err());
+
+        let mut t = TrialRecord {
+            schema: SCHEMA,
+            binding: stamp(),
+            trial_id: "t1".into(),
+            tool: "atuin".into(),
+            created_unix: 1,
+            baseline: Baseline {
+                tool_preexisting: false,
+                paths: vec![],
+            },
+            owned_outputs: vec![],
+        };
+        t.validate().unwrap();
+        t.schema = 2;
+        assert!(t.validate().is_err());
+    }
+
+    #[test]
+    fn the_ledger_validator_refuses_each_malformed_shape() {
+        let cases: [(&str, LedgerEdit); 6] = [
+            ("binding digest that is not a SHA-256", |l| {
+                l.binding.binding_digest = "xyz".into()
+            }),
+            ("empty adapter", |l| l.resources[0].adapter = String::new()),
+            ("empty resource", |l| {
+                l.resources[0].resource = String::new()
+            }),
+            ("bad op id", |l| l.resources[0].op_id = "Op 1".into()),
+            ("duplicate resource", |l| {
+                let again = l.resources[0].clone();
+                l.resources.push(again);
+            }),
+            ("non-normalized path", |l| {
+                l.resources[0].owned_outputs[0].path = "/h/x/../x".into()
+            }),
+        ];
+        for (what, f) in cases {
+            let mut l = ledger_entry();
+            f(&mut l);
+            assert_eq!(l.validate().unwrap_err().code, Code::StateInvalid, "{what}");
+            // The same shapes are refused when the bytes are parsed.
+            let bytes = canonical(&l).unwrap();
+            assert_eq!(
+                Ledger::parse(&bytes).unwrap_err().code,
+                Code::StateInvalid,
+                "{what}"
+            );
+        }
+    }
+
+    fn journal_entry() -> JournalEntry {
+        let mut e = je("run-1", "create-link", Phase::Intent);
+        e.recovery.as_mut().unwrap().outputs[0].path = "/h/x".into();
+        e
+    }
+
+    #[test]
+    fn the_journal_entry_validator_refuses_each_malformed_field() {
+        journal_entry().validate().unwrap();
+        let cases: [(&str, EntryEdit); 11] = [
+            ("schema", |e| e.schema = 2),
+            ("op id", |e| e.op_id = "Run 1".into()),
+            ("op", |e| e.op = String::new()),
+            ("time", |e| e.at = "yesterday".into()),
+            ("impossible time", |e| e.at = "2026-02-30T00:00:00Z".into()),
+            ("relative recovery path", |e| {
+                e.recovery.as_mut().unwrap().outputs[0].path = "x".into()
+            }),
+            ("recovery path with dot-dot", |e| {
+                e.recovery.as_mut().unwrap().outputs[0].path = "/h/../x".into()
+            }),
+            ("reason over 4 KiB", |e| {
+                e.reason = Some("r".repeat(MAX_ERROR_BYTES + 1))
+            }),
+            ("token over 4 KiB", |e| {
+                e.token = Some("t".repeat(MAX_ERROR_BYTES + 1))
+            }),
+            ("snapshot that is not an id", |e| {
+                e.recovery.as_mut().unwrap().snapshot = Some("../x".into())
+            }),
+            ("intent without recovery", |e| e.recovery = None),
+        ];
+        for (what, f) in cases {
+            let mut e = journal_entry();
+            f(&mut e);
+            assert_eq!(e.validate().unwrap_err().code, Code::StateInvalid, "{what}");
+            assert!(e.to_line().is_err(), "{what}");
+        }
+        // The bounds are inclusive.
+        let mut e = journal_entry();
+        e.reason = Some("r".repeat(MAX_ERROR_BYTES));
+        e.token = Some("t".repeat(MAX_ERROR_BYTES));
+        e.recovery.as_mut().unwrap().snapshot = Some("snap-1".into());
+        e.validate().unwrap();
+    }
+
+    #[test]
+    fn a_journal_line_over_64_kib_or_a_journal_over_16_mib_is_refused() {
+        let mut e = journal_entry();
+        // Valid outputs add up past the line cap although each field is within its own bound.
+        e.recovery.as_mut().unwrap().outputs = (0..200)
+            .map(|i| RecoveryOutput {
+                path: format!("/h/{i}-{}", "p".repeat(400)),
+                existed_before: false,
+                expected_sha256: None,
+            })
+            .collect();
+        e.validate().unwrap();
+        assert_eq!(e.to_line().unwrap_err().code, Code::LimitExceeded);
+        let big = vec![b'\n'; MAX_BYTES + 1];
+        assert_eq!(parse_journal(&big).unwrap_err().code, Code::LimitExceeded);
+        // At the cap the size check passes (the content is then judged line by line).
+        assert_eq!(
+            parse_journal(&big[1..]).unwrap_err().code,
+            Code::StateInvalid
+        );
+    }
+
+    #[test]
+    fn a_journal_recovery_path_outside_home_is_refused_by_the_scope_check() {
+        let scope = Scope::new("/h", &["/h/.local/state/dotfiles-manager".to_string()]);
+        let mut e = journal_entry();
+        e.validate_within(&scope).unwrap();
+        for bad in [
+            "/etc/x",
+            "/h",
+            "/h/.local/state/dotfiles-manager/state/ledger.json",
+        ] {
+            e.recovery.as_mut().unwrap().outputs[0].path = bad.into();
+            assert_eq!(
+                e.validate_within(&scope).unwrap_err().code,
+                Code::StateInvalid,
+                "{bad}"
+            );
+        }
+        // A created directory may lie above a reserved path, but never outside HOME.
+        e.op = JournalEntry::CREATE_DIR.into();
+        e.recovery.as_mut().unwrap().outputs[0].path = "/h/.local/state".into();
+        e.validate_within(&scope).unwrap();
+        e.recovery.as_mut().unwrap().outputs[0].path = "/etc".into();
+        assert!(e.validate_within(&scope).is_err());
+    }
+
+    #[test]
+    fn a_receipt_command_snapshot_and_exit_must_fit_the_contract() {
+        // The command is free text: bounded like the other free text of a receipt.
+        let mut r = receipt(vec![op(Status::Updated, Class::Normal)]);
+        r.command = "c".repeat(MAX_ERROR_BYTES);
+        r.validate().unwrap();
+        r.command.push('c');
+        assert!(r.validate().is_err());
+
+        // Exit 0 cannot hold an operation that did not succeed.
+        for status in [
+            Status::Failed,
+            Status::Unknown,
+            Status::Blocked,
+            Status::BlockedPending,
+            Status::Pending,
+        ] {
+            let mut r = receipt(vec![
+                op(Status::Updated, Class::Normal),
+                op(status, Class::Normal),
+            ]);
+            // Operation ids are not unique in this fixture; the receipt does not need them to be.
+            assert_eq!(r.result.exit_code, 0);
+            assert!(r.validate().is_err(), "{status:?} with exit 0");
+            r.result = RunResult::from_operations(&r.operations);
+            assert_eq!(r.result.exit_code, 1, "{status:?}");
+            r.validate().unwrap();
+        }
+        // Exit 1 without such an operation is a real shape (a run stopped after a mutation with
+        // every operation current), so it stays valid.
+        let mut r = receipt(vec![op(Status::Current, Class::Normal)]);
+        r.result.exit_code = 1;
+        r.result.outcome = "failed".into();
+        r.validate().unwrap();
+        // The derived result for a clean run is exit 0.
+        let ok = RunResult::from_operations(&r.operations);
+        assert_eq!((ok.exit_code, ok.outcome.as_str()), (0, "ok"));
     }
 }

@@ -10,7 +10,7 @@ use dfm_model::plan::file_fingerprint;
 use dfm_model::state::{
     Baseline, BaselinePath, BinaryId, Class, JournalEntry, LedgerResource, OperationRecord,
     OwnedOutput, Phase, ProfileRef, Receipt, Recovery, RecoveryOutput, RunResult, Stamp, Status,
-    TrialRecord, count_statuses, redact, rfc3339,
+    TrialRecord, redact, rfc3339,
 };
 use dfm_model::{Code, Refusal};
 use std::fs;
@@ -205,11 +205,7 @@ pub fn record_op(ctx: &Ctx, args: &[String], out: &mut dyn Write) -> Result<(), 
             approval: None,
             sources: vec![],
             approvals: vec![],
-            result: RunResult {
-                outcome: "ok".into(),
-                exit_code: 0,
-                counts: count_statuses(&ops),
-            },
+            result: RunResult::from_operations(&ops),
             operations: ops,
         };
         store.write_receipt(&receipt)?;
@@ -219,6 +215,39 @@ pub fn record_op(ctx: &Ctx, args: &[String], out: &mut dyn Write) -> Result<(), 
     writeln!(out, "recorded {id}").map_err(|e| io("output", &e))
 }
 
+/// The bytes of a baseline file, read without following a link. `None` only when the path does
+/// not exist: any other failure (a link, a directory, no permission) is an error, because
+/// recording it as "did not exist" would make a later restore delete a file that was there.
+fn read_baseline(path: &str) -> Result<Option<Vec<u8>>, Refusal> {
+    use std::io::Read;
+    use std::os::unix::fs::MetadataExt;
+    let seen = match fs::symlink_metadata(path) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(io("stat baseline", &e)),
+    };
+    if !seen.is_file() {
+        return Err(Refusal::new(
+            Code::StateInvalid,
+            "the baseline path is a link or not a regular file",
+        ));
+    }
+    let mut f = fs::File::open(path).map_err(|e| io("open baseline", &e))?;
+    // The path may have been swapped for a link after the check above: the open file must be
+    // the file that was checked.
+    let opened = f.metadata().map_err(|e| io("stat baseline", &e))?;
+    if (opened.dev(), opened.ino()) != (seen.dev(), seen.ino()) {
+        return Err(Refusal::new(
+            Code::StateInvalid,
+            "the baseline path changed while it was read",
+        ));
+    }
+    let mut bytes = Vec::new();
+    f.read_to_end(&mut bytes)
+        .map_err(|e| io("read baseline", &e))?;
+    Ok(Some(bytes))
+}
+
 /// `__record-trial`: write or replace an active trial record with a baseline of one path.
 pub fn record_trial(ctx: &Ctx, args: &[String], out: &mut dyn Write) -> Result<(), Refusal> {
     let [id, tool, path] = flags(args, ["--id", "--tool", "--baseline-path"])?;
@@ -226,7 +255,7 @@ pub fn record_trial(ctx: &Ctx, args: &[String], out: &mut dyn Write) -> Result<(
         return Err(usage("--id, --tool and --baseline-path are required"));
     };
     let (store, binding) = open_bound(ctx, super::fail_from_env()?, Vec::new())?;
-    let existing = fs::read(&path).ok();
+    let existing = read_baseline(&path)?;
     let trial = TrialRecord {
         schema: 1,
         binding: Stamp::of(&binding),

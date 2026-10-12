@@ -40,7 +40,7 @@ Both commands are read-only. They run no program, probe no tool, version or PATH
 | `kind` | `binding`, `state`, `lock`, `profile`, `module`, `resource`, `output`, `intent`, `receipt` or `plan`. |
 | `code` | A stable code. Either an `E_*` code that already exists, or a `D_*` code from the table below. |
 | `status` | `OK`, `WARN`, `ERROR`, `UNKNOWN` or `N/A`. |
-| `subject` | The path, file or resource. Output paths and the stray state entries are relative to HOME or to the state directory. The subjects of the `binding`, `profile` and `lock` rows are absolute paths. A subject is cut at 4096 characters. |
+| `subject` | The path, file or resource. Output paths and the stray state entries are relative to HOME or to the state directory. The subjects of the `binding`, `profile` and `lock` rows are absolute paths. A subject is cut at 4096 characters of the visible text, after control and invisible characters became escapes, and never inside one escape. |
 | `detail` | What was found. It never holds a file content or a secret value. |
 | `fix` | One line of fix text. |
 | `required` | `true` unless the row is a check this build cannot run. An UNKNOWN required row is exit 1. |
