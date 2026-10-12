@@ -212,15 +212,38 @@ fn fixture_toolchain_digest_is_pinned() {
     );
 }
 
-/// Whether two refusing paths differ. A side that names none is not compared. For an
-/// unsearchable ancestor the script names that directory (its `cd` fails) and the manager names
-/// the config file it cannot stat below it, so there one path may lie inside the other.
-fn paths_differ(a: Option<String>, b: Option<String>, nested_ok: bool) -> bool {
-    match (a, b) {
-        (Some(a), Some(b)) if nested_ok => !(a.starts_with(&b) || b.starts_with(&a)),
-        (Some(a), Some(b)) => a != b,
-        _ => false,
+/// Refusing fixtures where at least one implementation names no path of its own. The script
+/// names none for a toolchain digest mismatch or a legacy toolchain pin, and each side names a
+/// different set for the stage symlink and the two writable toolchain entries. Any other
+/// refusing fixture must name a path on both sides, and the two must agree.
+const WITHOUT_BOTH_PATHS: [&str; 7] = [
+    "stage-rust-toolchain-legacy",
+    "stage-rust-toolchain-legacy-case-variant",
+    "stage-symlink",
+    "toolchain-digest-differs-in-lock",
+    "toolchain-group-writable-file",
+    "toolchain-tampered",
+    "toolchain-world-writable-dir",
+];
+
+/// Whether two refusing paths differ. For an unsearchable ancestor the script names that
+/// directory (its `cd` fails) and the manager names the config file it cannot stat below it,
+/// so there one path may lie inside the other, on a path component boundary.
+fn paths_differ(a: &str, b: &str, nested_ok: bool) -> bool {
+    let inside = |p: &str, dir: &str| p == dir || p.starts_with(&format!("{dir}/"));
+    if nested_ok {
+        !(inside(a, b) || inside(b, a))
+    } else {
+        a != b
     }
+}
+
+#[test]
+fn nested_paths_are_accepted_only_on_a_component_boundary() {
+    assert!(!paths_differ(".claude", ".claude/settings.json", true));
+    assert!(!paths_differ(".claude/settings.json", ".claude", true));
+    assert!(paths_differ(".claude", ".claude2", true));
+    assert!(paths_differ(".claude", ".claude/settings.json", false));
 }
 
 #[test]
@@ -233,6 +256,7 @@ fn shell_checker_and_manager_agree_on_every_fixture() {
     // 114 fixtures today; the margin allows a few removals but not a lost group.
     assert!(cases.len() >= 110, "fixtures went missing");
     let mut failures = Vec::new();
+    let mut compared = 0;
     for case in &cases {
         let name = case.file_name().unwrap().to_string_lossy().into_owned();
         let want = fs::read_to_string(case.join("expect"))
@@ -251,11 +275,19 @@ fn shell_checker_and_manager_agree_on_every_fixture() {
             .lines()
             .any(|l| l == "unsearchable-ancestor");
         let expected_exit = if want == "ok" { 0 } else { 3 };
+        let path_mismatch = want != "ok"
+            && match (m.location(&roots), s.location(&roots)) {
+                (Some(a), Some(b)) => {
+                    compared += 1;
+                    paths_differ(&a, &b, nested_ok)
+                }
+                _ => !WITHOUT_BOTH_PATHS.contains(&name.as_str()),
+            };
         if m.verdict() != want
             || s.verdict() != want
             || m.code != expected_exit
             || s.code != expected_exit
-            || paths_differ(m.location(&roots), s.location(&roots), nested_ok)
+            || path_mismatch
         {
             failures.push(format!(
                 "{name}: want {want}/{expected_exit}, manager {}/{} ({}), script {}/{} ({}), paths {:?} and {:?}",
@@ -277,6 +309,8 @@ fn shell_checker_and_manager_agree_on_every_fixture() {
         cases.len(),
         failures.join("\n")
     );
+    // 97 of 104 refusing fixtures compare two paths today; a lost extraction would show here.
+    assert!(compared >= 90, "only {compared} fixtures compared paths");
 }
 
 #[test]
