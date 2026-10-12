@@ -6,9 +6,33 @@ use common::*;
 use dfm_engine::{Fail, Probe, Store, verify_identity};
 use dfm_model::Code;
 use dfm_model::state::{Class, Ledger, LedgerResource, OwnedOutput, Phase, Stamp};
+use std::collections::BTreeMap;
 use std::fs;
 use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+
+/// Every entry below `dir` with its bytes (a directory has none). The lock file is skipped: its
+/// note is rewritten whenever a writer takes the lock.
+fn tree(dir: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
+    let mut out = BTreeMap::new();
+    for p in files_below(dir) {
+        if p.ends_with("dotfiles-manager.lock") {
+            continue;
+        }
+        let m = fs::symlink_metadata(&p).unwrap();
+        let bytes = if m.is_file() {
+            fs::read(&p).unwrap()
+        } else {
+            vec![]
+        };
+        out.insert(p, bytes);
+    }
+    out
+}
+
+fn state_dir(h: &Home) -> PathBuf {
+    h.0.join(".local/state/dotfiles-manager/state")
+}
 
 #[test]
 fn init_builds_a_private_layout_once() {
@@ -141,11 +165,12 @@ fn snapshots_are_private_scoped_and_never_hold_sensitive_content() {
 #[test]
 fn an_interrupted_operation_is_reconciled_without_replay_or_ownership() {
     let h = Home::new();
-    let (s, stamp) = init(&h);
+    let (s, _) = init(&h);
     let out = h.0.join("out").to_str().unwrap().to_string();
     let ledger = s.read_ledger().unwrap();
     s.append_journal(&intent("op1", &out)).unwrap();
     s.append_journal(&intent("op2", &out)).unwrap();
+    let home_before = tree(&h.0);
     let l = s.load();
     let findings = verify_identity(&l, &binding("/p/profile.toml", "m5"));
     assert_eq!(
@@ -183,11 +208,27 @@ fn an_interrupted_operation_is_reconciled_without_replay_or_ownership() {
             .unwrap()
             .authorizes_delete("core.x", &out, &"a".repeat(64))
     );
-    assert!(
-        !out.is_empty() && !Path::new(&out).exists(),
-        "nothing was replayed"
+    // Settling wrote journal entries only: no file appeared or changed anywhere else in HOME.
+    let mut expected = home_before;
+    let j =
+        h.0.join(".local/state/dotfiles-manager/state/journal.jsonl");
+    expected.insert(j.clone(), fs::read(&j).unwrap());
+    assert_eq!(tree(&h.0), expected, "nothing was replayed");
+    let phases: Vec<(String, Phase)> = s
+        .read_journal()
+        .unwrap()
+        .into_iter()
+        .map(|e| (e.op, e.phase))
+        .collect();
+    assert_eq!(
+        phases,
+        [
+            ("op1".to_string(), Phase::Intent),
+            ("op2".to_string(), Phase::Intent),
+            ("op1".to_string(), Phase::Done),
+            ("op2".to_string(), Phase::Unknown),
+        ]
     );
-    let _ = stamp;
 }
 
 #[test]
@@ -1082,4 +1123,584 @@ fn every_write_cap_is_enforced_before_anything_is_written() {
     let e = s.append_journal(&intent("op1", &out)).unwrap_err();
     assert_eq!(e.code, Code::LimitExceeded, "{e}");
     assert_eq!(fs::read(&j).unwrap(), fill, "a full journal is left alone");
+}
+
+// ---- DFM-57 WP-B ----------------------------------------------------------------------------
+
+#[test]
+fn a_writer_refuses_a_state_directory_that_lacks_a_subdirectory_and_changes_nothing() {
+    for missing in ["receipts", "snapshots", "trials"] {
+        let h = Home::new();
+        let (s, _) = init(&h);
+        drop(s);
+        fs::remove_dir(state_dir(&h).join(missing)).unwrap();
+        let before = tree(&h.0);
+        let e = Store::open_write(sys(&h), &h.layout(), Fail::none()).unwrap_err();
+        assert_eq!(e.code, Code::StorageInvalid, "{missing}: {e}");
+        assert!(e.detail.contains(missing), "{missing}: {e}");
+        assert_eq!(
+            tree(&h.0),
+            before,
+            "{missing}: HOME and the state store are unchanged"
+        );
+        // The reader still opens it, and `state check` reports the directory as a finding.
+        let r = Store::open_read(sys(&h), &h.layout(), Fail::none())
+            .unwrap()
+            .unwrap();
+        assert!(
+            r.load()
+                .problems
+                .iter()
+                .any(|p| p.file == missing && p.detail.contains("missing")),
+            "{missing}"
+        );
+    }
+}
+
+fn two_output_intent(h: &Home) -> dfm_model::state::JournalEntry {
+    let mut e = intent("create-file", h.0.join("one").to_str().unwrap());
+    let sha = dfm_model::digest::sha256_hex(b"x");
+    let outs = &mut e.recovery.as_mut().unwrap().outputs;
+    outs[0].expected_sha256 = Some(sha.clone());
+    outs.push(dfm_model::state::RecoveryOutput {
+        path: h.0.join("two").to_str().unwrap().into(),
+        existed_before: false,
+        expected_sha256: Some(sha),
+    });
+    e
+}
+
+#[test]
+fn an_intent_with_more_than_one_output_is_never_probed_by_its_first_output() {
+    let h = Home::new();
+    let (s, _) = init(&h);
+    // The first output holds exactly the expected content, the second does not exist.
+    fs::write(h.0.join("one"), "x").unwrap();
+    s.append_journal(&two_output_intent(&h)).unwrap();
+    let home = dfm_engine::Dir::open_home(&sys(&h), &h.0).unwrap();
+    let w = (&sys(&h), &home, h.0.as_path());
+
+    let st = dfm_engine::recover(&s, w).unwrap();
+    assert!(st.closed.is_empty(), "{:?}", st.closed);
+    assert_eq!(st.open.len(), 1);
+    assert_eq!(
+        st.open[0].paths.len(),
+        2,
+        "both recorded paths stay blocked"
+    );
+    let last = s.read_journal().unwrap().pop().unwrap();
+    assert_eq!(last.phase, Phase::Unknown);
+
+    // The operator cannot resolve it as done either: nothing can be checked.
+    let before = tree(&h.0);
+    let e = dfm_engine::resolve(&s, w, "run-1", true).unwrap_err();
+    assert_eq!(e.code, Code::Conflict);
+    assert_eq!(tree(&h.0), before, "a refused resolve writes nothing");
+    // `failed` stays available.
+    dfm_engine::resolve(&s, w, "run-1", false).unwrap();
+    assert!(dfm_engine::recover(&s, w).unwrap().open.is_empty());
+}
+
+#[cfg(feature = "failpoints")]
+#[test]
+fn a_repair_record_that_cannot_be_written_keeps_the_cut_text_in_the_error() {
+    use dfm_engine::Action;
+    let h = Home::new();
+    let (s, _) = init(&h);
+    let out = h.0.join("out").to_str().unwrap().to_string();
+    s.append_journal(&intent("op1", &out)).unwrap();
+    drop(s);
+    let j = state_dir(&h).join("journal.jsonl");
+    let sound = fs::read(&j).unwrap();
+    let mut torn = sound.clone();
+    torn.extend_from_slice(b"{\"schema\":1,\"op_id\":\"half-written");
+    fs::write(&j, &torn).unwrap();
+
+    let s = Store::open_write(
+        sys(&h),
+        &h.layout(),
+        Fail::at("journal-before-write", Action::Error),
+    )
+    .unwrap();
+    let e = s.repair_torn_journal().unwrap_err();
+    assert_eq!(e.code, Code::IoFailed);
+    assert!(e.mutated, "the journal was cut");
+    assert_eq!(e.exit(), dfm_model::Exit::Failed);
+    assert!(
+        e.detail.contains("already cut off") && e.detail.contains("half-written"),
+        "{}",
+        e.detail
+    );
+    assert_eq!(fs::read(&j).unwrap(), sound, "the cut is not undone");
+    // The whole cut text survives, and `state check` reports the leftover file.
+    let kept = state_dir(&h).join("journal.torn");
+    assert_eq!(
+        fs::read(&kept).unwrap(),
+        b"{\"schema\":1,\"op_id\":\"half-written"
+    );
+    assert!(e.detail.contains("state/journal.torn"), "{}", e.detail);
+    assert!(
+        s.load()
+            .strays
+            .iter()
+            .any(|n| n.starts_with("journal.torn")),
+        "{:?}",
+        s.load().strays
+    );
+    // A later torn line with other text does not overwrite the kept text and does not cut. The
+    // refusal wrote nothing, so a fresh store is not marked as mutated by it.
+    drop(s);
+    let mut other = sound.clone();
+    other.extend_from_slice(b"{\"schema\":1,\"op_id\":\"other");
+    fs::write(&j, &other).unwrap();
+    let s = open(&h);
+    let e = s.repair_torn_journal().unwrap_err();
+    assert_eq!(e.code, Code::StorageInvalid);
+    assert!(e.detail.contains("nothing was cut"), "{}", e.detail);
+    assert!(!e.mutated && !s.mutated(), "nothing was written");
+    assert_eq!(e.exit(), dfm_model::Exit::Blocked);
+    assert_eq!(fs::read(&j).unwrap(), other);
+    assert_eq!(
+        fs::read(&kept).unwrap(),
+        b"{\"schema\":1,\"op_id\":\"half-written"
+    );
+}
+
+#[cfg(feature = "failpoints")]
+#[test]
+fn a_cut_that_fails_can_be_repaired_by_the_next_run() {
+    use dfm_engine::Action;
+    let h = Home::new();
+    let (s, _) = init(&h);
+    s.append_journal(&intent("op1", h.0.join("out").to_str().unwrap()))
+        .unwrap();
+    drop(s);
+    let j = state_dir(&h).join("journal.jsonl");
+    let mut torn = fs::read(&j).unwrap();
+    torn.extend_from_slice(b"{\"schema\":1,\"op_id\":\"half");
+    fs::write(&j, &torn).unwrap();
+
+    let s = Store::open_write(sys(&h), &h.layout(), Fail::at("repair-cut", Action::Error)).unwrap();
+    let e = s.repair_torn_journal().unwrap_err();
+    assert_eq!(e.code, Code::IoFailed);
+    assert_eq!(fs::read(&j).unwrap(), torn, "nothing was cut");
+    let kept = state_dir(&h).join("journal.torn");
+    assert_eq!(fs::read(&kept).unwrap(), b"{\"schema\":1,\"op_id\":\"half");
+    drop(s);
+
+    // The leftover copy holds the same text: the next run resumes the cut and clears the copy.
+    let s = open(&h);
+    assert_eq!(s.repair_torn_journal().unwrap(), 25);
+    assert!(!kept.exists());
+    assert!(s.read_journal().unwrap().iter().any(|e| e.op == "repair"));
+    assert!(s.load().strays.is_empty(), "{:?}", s.load().strays);
+}
+
+#[cfg(feature = "failpoints")]
+#[test]
+fn a_kept_copy_that_cannot_be_removed_does_not_fail_a_finished_repair() {
+    use dfm_engine::Action;
+    let h = Home::new();
+    let (s, _) = init(&h);
+    s.append_journal(&intent("op1", h.0.join("out").to_str().unwrap()))
+        .unwrap();
+    drop(s);
+    let j = state_dir(&h).join("journal.jsonl");
+    let mut torn = fs::read(&j).unwrap();
+    torn.extend_from_slice(b"{\"schema\":1,\"op_id\":\"half");
+    fs::write(&j, &torn).unwrap();
+
+    let s = Store::open_write(
+        sys(&h),
+        &h.layout(),
+        Fail::at("remove-after-unlink", Action::Error),
+    )
+    .unwrap();
+    assert_eq!(s.repair_torn_journal().unwrap(), 25);
+    assert!(s.mutated());
+    assert!(s.read_journal().unwrap().iter().any(|e| e.op == "repair"));
+}
+
+#[test]
+fn a_repaired_torn_journal_leaves_no_kept_copy_behind() {
+    let h = Home::new();
+    let (s, _) = init(&h);
+    s.append_journal(&intent("op1", h.0.join("out").to_str().unwrap()))
+        .unwrap();
+    let j = state_dir(&h).join("journal.jsonl");
+    let mut torn = fs::read(&j).unwrap();
+    torn.extend_from_slice(b"{\"schema\":1,\"op_id\":\"half");
+    fs::write(&j, &torn).unwrap();
+    assert_eq!(s.repair_torn_journal().unwrap(), 25);
+    assert!(!state_dir(&h).join("journal.torn").exists());
+    assert!(s.load().strays.is_empty(), "{:?}", s.load().strays);
+}
+
+#[test]
+fn an_unreadable_ledger_is_not_reported_as_holding_no_salted_hash() {
+    let h = Home::new();
+    let (s, _) = init(&h);
+    let state = state_dir(&h);
+    let salt = state.join("salt");
+    // A bad salt over a good ledger: the advice may say a new salt is created.
+    fs::write(&salt, b"short").unwrap();
+    fs::set_permissions(&salt, fs::Permissions::from_mode(0o600)).unwrap();
+    let e = s.salt().unwrap_err();
+    assert_eq!(e.code, Code::StorageInvalid);
+    assert!(e.detail.contains("records no salted hash"), "{}", e.detail);
+
+    // The same salt over a ledger that cannot be read: the answer is "unknown".
+    let ledger = state.join("ledger.json");
+    fs::write(&ledger, b"{not json").unwrap();
+    let e = s.salt().unwrap_err();
+    assert!(!e.detail.contains("records no salted hash"), "{}", e.detail);
+    assert!(
+        e.detail.contains("cannot be read") && e.detail.contains("unknown"),
+        "{}",
+        e.detail
+    );
+
+    // A missing salt over that ledger is a finding too, beside the ledger finding.
+    fs::remove_file(&salt).unwrap();
+    let l = s.load();
+    assert!(l.ledger.is_err());
+    assert!(
+        l.problems
+            .iter()
+            .any(|p| p.file == "salt" && p.detail.contains("unknown")),
+        "{:?}",
+        l.problems
+    );
+    // With a readable ledger and no salted hash, a missing salt is still not a finding.
+    fs::write(
+        &ledger,
+        dfm_model::state::canonical(&Ledger::empty(Stamp::of(&binding("/p/profile.toml", "m5"))))
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(s.load().problems.is_empty(), "{:?}", s.load().problems);
+}
+
+type LedgerEdit = fn(&mut Ledger);
+
+fn handwritten_ledger(h: &Home, stamp: &Stamp, f: impl FnOnce(&mut Ledger)) {
+    let mut l = ledger_with(stamp, h, "core.x", "a", 'a');
+    f(&mut l);
+    let p = state_dir(h).join("ledger.json");
+    fs::write(&p, dfm_model::state::canonical(&l).unwrap()).unwrap();
+    fs::set_permissions(&p, fs::Permissions::from_mode(0o600)).unwrap();
+}
+
+#[test]
+fn every_malformed_ledger_shape_is_refused_on_read_and_load() {
+    let h = Home::new();
+    let (s, stamp) = init(&h);
+    let dup = |l: &mut Ledger| {
+        let again = l.resources[0].clone();
+        l.resources.push(again);
+    };
+    let cases: [(&str, LedgerEdit, Code); 7] = [
+        (
+            "binding digest that is not a SHA-256",
+            |l| l.binding.binding_digest = "xyz".into(),
+            Code::StateInvalid,
+        ),
+        (
+            "malformed resource: empty name",
+            |l| l.resources[0].resource = String::new(),
+            Code::StateInvalid,
+        ),
+        (
+            "malformed resource: empty adapter",
+            |l| l.resources[0].adapter = String::new(),
+            Code::StateInvalid,
+        ),
+        (
+            "malformed resource: bad op id",
+            |l| l.resources[0].op_id = "not an id".into(),
+            Code::StateInvalid,
+        ),
+        ("duplicate resource", dup, Code::StateInvalid),
+        (
+            "non-normalized path",
+            |l| {
+                let o = &mut l.resources[0].owned_outputs[0];
+                o.path = format!("{}/sub/../x", o.path.rsplit_once('/').unwrap().0);
+            },
+            Code::StateInvalid,
+        ),
+        ("newer schema", |l| l.schema = 2, Code::StateNewer),
+    ];
+    for (what, f, want) in cases {
+        handwritten_ledger(&h, &stamp, f);
+        let e = s.read_ledger().unwrap_err();
+        assert_eq!(e.code, want, "{what}");
+        // The resource arm names itself, so a different failure cannot satisfy the case.
+        assert_eq!(
+            e.detail.contains("is malformed"),
+            what.starts_with("malformed resource"),
+            "{what}: {}",
+            e.detail
+        );
+        assert_eq!(s.load().ledger.unwrap_err().code, want, "{what}");
+    }
+}
+
+#[test]
+fn a_store_cannot_be_rooted_at_home_or_use_home_as_its_lock_file() {
+    let h = Home::new();
+    let mut l = h.layout();
+    l.state_root = h.0.clone();
+    let before = tree(&h.0);
+    let e = Store::open_read(sys(&h), &l, Fail::none()).unwrap_err();
+    assert_eq!(e.code, Code::StorageInvalid);
+    assert!(e.detail.contains("HOME itself"), "{}", e.detail);
+    assert_eq!(tree(&h.0), before, "a reader creates nothing");
+    // A writer creates the lock directory and the lock file before it looks for the root, as for
+    // any layout, and nothing else: no state root and no state files.
+    let e = Store::open_write(sys(&h), &l, Fail::none()).unwrap_err();
+    assert_eq!(e.code, Code::StorageInvalid);
+    assert!(e.detail.contains("HOME itself"), "{}", e.detail);
+    let mut made = files_below(&h.0);
+    made.sort();
+    assert_eq!(
+        made,
+        [
+            h.0.join(".local"),
+            h.0.join(".local/state"),
+            h.0.join(".local/state/dotfiles-manager.lock"),
+        ]
+    );
+
+    // A lock file that is HOME itself is refused before anything is created.
+    let h = Home::new();
+    let before = tree(&h.0);
+    let mut l = h.layout();
+    l.lock_file = h.0.clone();
+    let e = Store::open_write(sys(&h), &l, Fail::none()).unwrap_err();
+    assert_eq!(e.code, Code::StorageInvalid);
+    assert!(
+        e.detail.contains("lock file is HOME itself"),
+        "{}",
+        e.detail
+    );
+    assert_eq!(tree(&h.0), before, "nothing was created");
+    assert!(files_below(&h.0).is_empty());
+}
+
+/// Moves the state root aside and puts a new, empty, private directory at its name.
+fn swap_state_root(h: &Home) -> PathBuf {
+    let root = h.0.join(".local/state/dotfiles-manager");
+    fs::rename(&root, h.0.join(".local/state/dotfiles-manager.aside")).unwrap();
+    fs::create_dir(&root).unwrap();
+    fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+    root
+}
+
+#[test]
+fn a_state_root_swapped_after_open_stops_init_and_every_write() {
+    // Before init: the store holds the old root descriptor; the name now leads elsewhere.
+    let h = Home::new();
+    let mut s = open(&h);
+    let stamp = Stamp::of(&binding("/p/profile.toml", "m5"));
+    let new_root = swap_state_root(&h);
+    let e = s.init(&stamp).unwrap_err();
+    assert_eq!(e.code, Code::StorageInvalid);
+    assert!(
+        e.detail.contains("replaced or removed; init stops"),
+        "{}",
+        e.detail
+    );
+    assert!(
+        files_below(&new_root).is_empty(),
+        "nothing was built in the new root"
+    );
+    drop(s);
+
+    // After init: every write path re-checks the root.
+    let h = Home::new();
+    let (s, stamp) = init(&h);
+    let new_root = swap_state_root(&h);
+    let e = s
+        .write_ledger(&ledger_with(&stamp, &h, "core.x", "a", 'a'))
+        .unwrap_err();
+    assert_eq!(e.code, Code::StorageInvalid);
+    assert!(e.detail.contains("state root was replaced"), "{}", e.detail);
+    assert_eq!(
+        code(s.append_journal(&intent("op1", h.0.join("o").to_str().unwrap()))),
+        Code::StorageInvalid
+    );
+    assert!(
+        files_below(&new_root).is_empty(),
+        "no write reached the new root"
+    );
+}
+
+#[cfg(feature = "failpoints")]
+#[test]
+fn a_staging_directory_replaced_while_init_waits_is_not_renamed_into_place() {
+    use dfm_engine::Action;
+    let h = Home::new();
+    let gate = h.0.join("gate");
+    let stamp = Stamp::of(&binding("/p/profile.toml", "m5"));
+    let root = h.0.join(".local/state/dotfiles-manager");
+    let result = std::thread::scope(|sc| {
+        let task = sc.spawn(|| {
+            let mut s = Store::open_write(
+                sys(&h),
+                &h.layout(),
+                Fail::at("init-before-rename", Action::Wait(gate.clone())),
+            )
+            .unwrap();
+            s.init(&stamp)
+        });
+        let reached = gate.with_extension("reached");
+        let end = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while !reached.exists() {
+            assert!(
+                std::time::Instant::now() < end,
+                "init never reached the rename"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        // Swap the staging directory for another one of the same name.
+        fs::rename(root.join("state.next"), root.join("elsewhere")).unwrap();
+        fs::create_dir(root.join("state.next")).unwrap();
+        fs::set_permissions(root.join("state.next"), fs::Permissions::from_mode(0o700)).unwrap();
+        fs::write(&gate, "").unwrap();
+        task.join().unwrap()
+    });
+    let e = result.unwrap_err();
+    assert_eq!(e.code, Code::StorageInvalid);
+    assert!(
+        e.detail.contains("staging directory was replaced"),
+        "{}",
+        e.detail
+    );
+    assert!(
+        !root.join("state").exists(),
+        "the impostor was not renamed to state"
+    );
+}
+
+#[test]
+fn a_snapshot_that_already_exists_is_never_overwritten() {
+    let h = Home::new();
+    let (s, _) = init(&h);
+    s.write_snapshot("run-1", "core-x", b"old", Class::Normal)
+        .unwrap();
+    let e = s
+        .write_snapshot("run-1", "core-x", b"new", Class::Normal)
+        .unwrap_err();
+    assert_eq!(e.code, Code::StorageInvalid);
+    assert!(e.detail.contains("already exists"), "{}", e.detail);
+    assert_eq!(
+        fs::read(state_dir(&h).join("snapshots/run-1/core-x")).unwrap(),
+        b"old"
+    );
+}
+
+#[test]
+fn a_claim_that_is_a_hard_link_of_a_manager_file_or_reaches_state_through_a_link_is_refused() {
+    let h = Home::new();
+    let (s, stamp) = init(&h);
+    let home = h.0.to_str().unwrap().to_string();
+    let lock = h.0.join(".local/state/dotfiles-manager.lock");
+    // A second name for the lock file has the lock file's identity, whatever its spelling.
+    fs::hard_link(&lock, h.0.join("lockcopy")).unwrap();
+    // A link to `state/` has no reserved identity of its own (only the state root is a
+    // reserved directory), so the text check on the resolved path refuses it.
+    symlink(state_dir(&h), h.0.join("viastate")).unwrap();
+    for bad in [
+        format!("{home}/lockcopy"),
+        format!("{home}/viastate/ledger.json"),
+    ] {
+        let mut l = ledger_with(&stamp, &h, "core.x", "a", 'a');
+        l.resources[0].owned_outputs[0].path = bad.clone();
+        assert_eq!(code(s.write_ledger(&l)), Code::StateInvalid, "{bad}");
+        assert_eq!(
+            code(s.append_journal(&intent("op1", &bad))),
+            Code::StateInvalid,
+            "{bad}"
+        );
+    }
+    assert!(s.read_ledger().unwrap().resources.is_empty());
+}
+
+#[test]
+fn an_empty_state_directory_is_replaced_by_init_for_bind_and_refused_for_other_writers() {
+    let h = Home::new();
+    let (s, _) = init(&h);
+    drop(s);
+    let state = state_dir(&h);
+    fs::remove_dir_all(&state).unwrap();
+    fs::create_dir(&state).unwrap();
+    fs::set_permissions(&state, fs::Permissions::from_mode(0o700)).unwrap();
+
+    // Apply, resolve and recover open without `create_root`: an empty `state/` is damage.
+    let before = tree(&h.0);
+    let e = Store::open_write_with(sys(&h), &h.layout(), Fail::none(), false).unwrap_err();
+    assert_eq!(e.code, Code::StorageInvalid, "{e}");
+    assert_eq!(tree(&h.0), before, "the refusal changed nothing");
+
+    // Bind opens with `create_root` and runs `init`, which allows an empty directory.
+    let mut s = open(&h);
+    let stamp = Stamp::of(&binding("/p/profile.toml", "m5"));
+    s.init(&stamp).unwrap();
+    assert!(s.load().problems.is_empty(), "{:?}", s.load().problems);
+    assert!(state.join("receipts").is_dir() && state.join("ledger.json").is_file());
+}
+
+#[test]
+fn one_output_under_an_unsafe_link_does_not_hide_a_recorded_salted_hash() {
+    let h = Home::new();
+    let (s, stamp) = init(&h);
+    let state = state_dir(&h);
+    let elsewhere = Home::new();
+    symlink(&elsewhere.0, h.0.join("escape")).unwrap();
+    let mut l = ledger_with(&stamp, &h, "claude.settings", "settings.json", 'a');
+    l.resources[0].class = Class::Sensitive;
+    let o = &mut l.resources[0].owned_outputs[0];
+    o.fingerprint = None;
+    o.coowned = Some(dfm_model::state::CoOwned {
+        managed_hash: "b".repeat(64),
+        entries: vec![],
+        appended: vec![],
+        leaves: BTreeMap::new(),
+    });
+    l.record(LedgerResource {
+        resource: "core.y".into(),
+        adapter: "fs-link/v1".into(),
+        class: Class::Normal,
+        op_id: "op2".into(),
+        owned_outputs: vec![OwnedOutput {
+            path: h.0.join("escape/y").to_str().unwrap().into(),
+            mode: 0o777,
+            fingerprint: Some("c".repeat(64)),
+            coowned: None,
+        }],
+    })
+    .unwrap();
+    let ledger = state.join("ledger.json");
+    fs::write(&ledger, dfm_model::state::canonical(&l).unwrap()).unwrap();
+    fs::set_permissions(&ledger, fs::Permissions::from_mode(0o600)).unwrap();
+    assert!(
+        s.read_ledger().is_err(),
+        "the strict read refuses the unsafe output"
+    );
+    let salt = state.join("salt");
+    fs::write(&salt, b"short").unwrap();
+    fs::set_permissions(&salt, fs::Permissions::from_mode(0o600)).unwrap();
+    let e = s.salt().unwrap_err();
+    assert!(e.detail.contains("records a salted hash"), "{}", e.detail);
+    assert!(!e.detail.contains("unknown"), "{}", e.detail);
+    fs::remove_file(&salt).unwrap();
+    assert!(
+        s.load()
+            .problems
+            .iter()
+            .any(|p| p.file == "salt" && !p.detail.contains("unknown")),
+        "a missing salt over a recorded hash is a definite finding: {:?}",
+        s.load().problems
+    );
 }

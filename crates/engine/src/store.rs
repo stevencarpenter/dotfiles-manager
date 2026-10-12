@@ -33,6 +33,11 @@ const SUBDIRS: [&str; 3] = ["receipts", "snapshots", "trials"];
 /// The per-machine salt for the salted hash of a co-owned file's managed fields.
 const SALT: &str = "salt";
 const SALT_BYTES: usize = 32;
+/// Characters of a cut journal line echoed in the error when its repair record cannot be written.
+const REPAIR_ECHO_CHARS: usize = 512;
+/// Holds the cut journal text while the repair is unfinished. `state check` reports it as a
+/// stray entry, so a repair whose record could not be written stays visible.
+const TORN: &str = "journal.torn";
 
 /// What a probe learned about an interrupted operation (its `already_done` check).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -180,14 +185,22 @@ impl Store {
     }
 
     /// Opens `state/` and its subdirectories if they exist and validates them on their
-    /// descriptors. `false` when `state` is absent.
-    fn attach_state(&mut self) -> Result<bool, Refusal> {
+    /// descriptors. `false` when `state` is absent. With `whole`, a missing subdirectory is a
+    /// refusal (a writer must not act on a layout `state check` reports as damaged); without
+    /// it a reader accepts that layout and `load` reports the missing directory. With `empty_ok`
+    /// a `state/` that holds nothing is accepted too: `init` replaces it.
+    fn attach_state(&mut self, whole: bool, empty_ok: bool) -> Result<bool, Refusal> {
         let Some(state) = self.root.child(&self.sys, STATE, true, false)? else {
             self.state = None;
             return Ok(false);
         };
+        let skip = empty_ok && state.list()?.names.is_empty();
         for d in SUBDIRS {
-            state.child(&self.sys, d, true, false)?;
+            if state.child(&self.sys, d, true, false)?.is_none() && whole && !skip {
+                return Err(storage(format!(
+                    "state/{d} is missing; it is not recreated (state loss)"
+                )));
+            }
         }
         self.state = Some(state);
         Ok(true)
@@ -212,7 +225,7 @@ impl Store {
             return Ok(None);
         };
         let mut s = Store::build(sys, layout, &home, located, fail)?;
-        Ok(s.attach_state()?.then_some(s))
+        Ok(s.attach_state(false, false)?.then_some(s))
     }
 
     /// Opens for writing and may create the state root: see [`Store::open_write_with`].
@@ -267,8 +280,9 @@ impl Store {
         let located = Self::locate(&sys, layout, &home, create_root)?.ok_or_else(lost)?;
         let mut s = Store::build(sys, layout, &home, located, fail)?;
         s.lock = Some(lock);
-        // A writer must not act on a state directory whose layout it would refuse to read.
-        s.attach_state()?;
+        // A writer must not act on a state directory whose layout `state check` refuses. Only a
+        // bind (which runs `init`) may meet an empty one: `init` accepts and replaces it.
+        s.attach_state(true, create_root)?;
         Ok(s)
     }
 
@@ -381,7 +395,7 @@ impl Store {
         }
         self.root.rename(STAGING, STATE)?;
         let synced = unconfirmed(self.root.sync());
-        self.attach_state()?;
+        self.attach_state(true, false)?;
         synced
     }
 
@@ -461,16 +475,15 @@ impl Store {
     pub fn salt(&self) -> Result<Option<Vec<u8>>, Refusal> {
         // A symlink, a wrong owner or mode, or a wrong size is an error that is never repaired.
         let bad = |e: Refusal| {
-            let recorded = self.ledger_raw().is_ok_and(|l| {
-                l.resources
-                    .iter()
-                    .flat_map(|r| &r.owned_outputs)
-                    .any(|o| o.coowned.is_some())
-            });
-            let next = if recorded {
-                "The ledger records a salted hash: also restore a good salt from a copy, or delete the `coowned` object of each co-owned output in state/ledger.json (the next apply then needs --allow-adopt)"
-            } else {
-                "The ledger records no salted hash, so the next apply creates a new salt"
+            let next = match self.records_salted_hash() {
+                Ok(true) => "The ledger records a salted hash: also restore a good salt from a copy, or delete the `coowned` object of each co-owned output in state/ledger.json (the next apply then needs --allow-adopt)".to_string(),
+                Ok(false) => "The ledger records no salted hash, so the next apply creates a new salt".to_string(),
+                // An unreadable ledger proves nothing about the hash. A new salt would make a
+                // recorded hash useless, so do not advise it.
+                Err(le) => format!(
+                    "The ledger cannot be read ({}), so whether it records a salted hash is unknown. Fix the ledger first; do not replace the salt until it is known",
+                    le.detail
+                ),
             };
             // The reason without the path: `mode is 644, expected 0600`.
             let why = e.detail.rsplit(": ").next().unwrap_or(&e.detail);
@@ -493,6 +506,18 @@ impl Store {
                 b.len()
             )))),
         }
+    }
+
+    /// Whether the ledger records a salted hash. A ledger that cannot be read is an error, not
+    /// "no". The claim check of each output is skipped (as in [`Store::read_ledger_lenient`]):
+    /// one output whose parent became an unsafe link does not change what the ledger records.
+    fn records_salted_hash(&self) -> Result<bool, Refusal> {
+        Ok(self
+            .ledger_parsed()?
+            .resources
+            .iter()
+            .flat_map(|r| &r.owned_outputs)
+            .any(|o| o.coowned.is_some()))
     }
 
     /// As [`Store::salt`], and creates it once when absent: 32 random bytes from the operating
@@ -697,6 +722,8 @@ impl Store {
         }
         self.identity_check(path, new_dir)?;
         let p = Path::new(path);
+        // `admits` accepted the path, so it is absolute with at least one component: both exist.
+        // The refusal is a guard against a change to `valid_path`, and no test can reach it.
         let (Some(parent), Some(leaf)) = (p.parent(), p.file_name()) else {
             return Err(outside());
         };
@@ -707,6 +734,9 @@ impl Store {
             match fs::canonicalize(&base) {
                 Ok(r) => break r,
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    // HOME exists, so the walk up ends at an existing directory before it runs
+                    // out of components. The two refusals below guard that invariant and no test
+                    // can reach them.
                     let Some(name) = base.file_name().map(ToOwned::to_owned) else {
                         return Err(outside());
                     };
@@ -755,26 +785,69 @@ impl Store {
         // Everything before the torn line must be a sound journal.
         state::parse_journal(&bytes[..keep])?;
         let removed = bytes.len() - keep;
-        self.wrote(self.state()?.truncate_to(
-            &self.sys,
-            "journal.jsonl",
-            u64::try_from(bytes.len()).unwrap_or(u64::MAX),
-            u64::try_from(keep).unwrap_or(0),
-        ))?;
-        let at = now_unix()?;
-        self.append_journal(&JournalEntry {
-            schema: state::SCHEMA,
-            op_id: format!("journal-repair-{at}"),
-            op: "repair".into(),
-            phase: Phase::Failed,
-            at: state::rfc3339(at),
-            resource: "journal".into(),
-            adapter: "manager".into(),
-            class: Class::Normal,
-            recovery: None,
-            token: None,
-            reason: Some(format!("torn line repaired: removed {removed} bytes")),
+        // Keep the text before it is cut: nothing is lost if the cut or the record then fails.
+        let tail = &bytes[keep..];
+        match self
+            .state()?
+            .publish_new(TORN, tail, &self.fail, "repair-keep")
+        {
+            // Nothing was written, so the store is not marked as mutated. A copy of the same text
+            // is the leftover of a repair that stopped before the cut or before its record: the
+            // cut resumes. A copy of other text may be an earlier cut that was never read.
+            Ok(false) if self.read_doc(TORN)? == tail => {}
+            Ok(false) => {
+                return Err(storage(format!(
+                    "state/{TORN} holds other text, kept by an earlier repair; nothing was cut. Fix: read it, then remove it by hand"
+                )));
+            }
+            r => {
+                self.wrote(r)?;
+            }
+        }
+        self.wrote(self.fail.hit("repair-cut").and_then(|()| {
+            self.state()?.truncate_to(
+                &self.sys,
+                "journal.jsonl",
+                u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+                u64::try_from(keep).unwrap_or(0),
+            )
+        }))?;
+        // The cut cannot be undone. If the record fails, the removed text stays in `TORN` and
+        // the error carries the start of it.
+        let record = || -> Result<(), Refusal> {
+            let at = now_unix()?;
+            self.append_journal(&JournalEntry {
+                schema: state::SCHEMA,
+                op_id: format!("journal-repair-{at}"),
+                op: "repair".into(),
+                phase: Phase::Failed,
+                at: state::rfc3339(at),
+                resource: "journal".into(),
+                adapter: "manager".into(),
+                class: Class::Normal,
+                recovery: None,
+                token: None,
+                reason: Some(format!("torn line repaired: removed {removed} bytes")),
+            })
+        };
+        record().map_err(|e| {
+            let head: String = String::from_utf8_lossy(&bytes[keep..])
+                .chars()
+                .take(REPAIR_ECHO_CHARS)
+                .collect();
+            Refusal::new(
+                e.code,
+                format!(
+                    "{}. The torn final line ({removed} bytes) was already cut off and its repair record was not written. The cut text is kept in state/{TORN} (`state check` reports it) and begins: {}",
+                    e.detail,
+                    dfm_model::display::visible(&head)
+                ),
+            )
+            .after_mutation()
         })?;
+        // The record exists, so the kept copy is no longer needed. The repair is complete even if
+        // the copy cannot be removed: `state check` reports it as a stray entry.
+        let _ = self.wrote(self.state()?.remove_entry(TORN, &self.fail));
         Ok(removed)
     }
 
@@ -1129,21 +1202,24 @@ impl Store {
             }
         }
         if self.state().is_ok() {
-            let salt = self.salt();
-            let recorded = self.ledger_raw().is_ok_and(|l| {
-                l.resources
-                    .iter()
-                    .flat_map(|r| &r.owned_outputs)
-                    .any(|o| o.coowned.is_some())
-            });
-            match salt {
-                Err(e) => problems.push(Finding::new(Code::StorageInvalid, "salt", e.detail)),
-                Ok(None) if recorded => problems.push(Finding::new(
+            match (self.salt(), self.records_salted_hash()) {
+                (Err(e), _) => problems.push(Finding::new(Code::StorageInvalid, "salt", e.detail)),
+                (Ok(None), Ok(true)) => problems.push(Finding::new(
                     Code::StateInvalid,
                     "salt",
                     dfm_model::merge::SALT_LOST,
                 )),
-                Ok(_) => {}
+                // The ledger finding reports the read error itself. This one says what it
+                // leaves open.
+                (Ok(None), Err(le)) => problems.push(Finding::new(
+                    Code::StateInvalid,
+                    "salt",
+                    format!(
+                        "state/salt is missing and the ledger cannot be read ({}), so whether the ledger records a salted hash is unknown",
+                        le.detail
+                    ),
+                )),
+                (Ok(_), _) => {}
             }
         }
         if let Ok(state) = self.state() {

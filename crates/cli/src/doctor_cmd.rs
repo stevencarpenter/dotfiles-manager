@@ -324,8 +324,13 @@ fn journal_rows(store: &Store, rows: &mut Vec<Row>) {
                 u.unknown.op, u.unknown.resource, u.unknown.at
             ),
             &format!(
-                "Run `dotfiles-manager state recover` or apply: they settle the entry when the path shows a clear result. Otherwise check the path, then run `dotfiles-manager state resolve '{}' --as done` or `--as failed`. Doctor never settles.",
-                id.replace('\'', "'\\''")
+                "Run `dotfiles-manager state recover` or apply: they settle the entry when the path shows a clear result. Otherwise check the path, then run `dotfiles-manager state resolve '{}' --as done`{} or `--as failed`. Doctor never settles.",
+                id.replace('\'', "'\\''"),
+                if u.paths().nth(1).is_some() {
+                    " (this entry has more than one path and cannot be resolved as done)"
+                } else {
+                    ""
+                }
             ),
         ));
     }

@@ -186,6 +186,25 @@ pub struct Row {
     pub partial: bool,
 }
 
+/// `visible(s)` cut to `max` characters of the visible text. The cut falls between the escapes
+/// of two source characters, never inside one, and counts what is shown: a control character
+/// grows to up to ten characters (`\u{1b}` is six), so cutting the source first would let a
+/// subject exceed the bound.
+fn bounded_visible(s: &str, max: usize) -> String {
+    let mut out = String::new();
+    let mut shown = 0;
+    let mut buf = [0u8; 4];
+    for c in s.chars() {
+        let piece = visible(c.encode_utf8(&mut buf));
+        shown += piece.chars().count();
+        if shown > max {
+            break;
+        }
+        out.push_str(&piece);
+    }
+    out
+}
+
 impl Row {
     pub fn new(
         kind: &'static str,
@@ -199,7 +218,7 @@ impl Row {
             kind,
             code: code.into(),
             status,
-            subject: visible(&subject.chars().take(MAX_SUBJECT_CHARS).collect::<String>()),
+            subject: bounded_visible(subject, MAX_SUBJECT_CHARS),
             detail: visible(detail),
             fix: visible(fix),
             required: true,
@@ -483,6 +502,33 @@ mod tests {
         // The subject is bounded when the row is made.
         assert_eq!(r.subject.chars().count(), MAX_SUBJECT_CHARS);
         assert_eq!(out.chars().filter(|c| *c == 'é').count(), 1 << 20);
+    }
+
+    #[test]
+    fn a_subject_is_cut_after_its_escapes_are_expanded_and_never_inside_one() {
+        // 5000 ESC characters expand to six characters each. The cut is on the visible text.
+        let r = Row::new(
+            "output",
+            DoctorCode::Ok,
+            Level::Ok,
+            &"\u{1b}".repeat(5000),
+            "d",
+            "f",
+        );
+        assert!(r.subject.chars().count() <= MAX_SUBJECT_CHARS);
+        assert_eq!(r.subject.chars().count(), 6 * (MAX_SUBJECT_CHARS / 6));
+        assert!(r.subject.starts_with("\\u{1b}\\u{1b}") && r.subject.ends_with("\\u{1b}"));
+        assert_eq!(r.subject.matches("\\u{1b}").count(), MAX_SUBJECT_CHARS / 6);
+        // Plain text keeps the old bound exactly.
+        let plain = Row::new(
+            "output",
+            DoctorCode::Ok,
+            Level::Ok,
+            &"a".repeat(5000),
+            "d",
+            "f",
+        );
+        assert_eq!(plain.subject.chars().count(), MAX_SUBJECT_CHARS);
     }
 
     #[test]

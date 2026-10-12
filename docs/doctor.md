@@ -40,7 +40,7 @@ Both commands are read-only. They run no program, probe no tool, version or PATH
 | `kind` | `binding`, `state`, `lock`, `profile`, `module`, `resource`, `output`, `intent`, `receipt` or `plan`. |
 | `code` | A stable code. Either an `E_*` code that already exists, or a `D_*` code from the table below. |
 | `status` | `OK`, `WARN`, `ERROR`, `UNKNOWN` or `N/A`. |
-| `subject` | The path, file or resource. Output paths and the stray state entries are relative to HOME or to the state directory. The subjects of the `binding`, `profile` and `lock` rows are absolute paths. A subject is cut at 4096 characters. |
+| `subject` | The path, file or resource. Output paths and the stray state entries are relative to HOME or to the state directory. The subjects of the `binding`, `profile` and `lock` rows are absolute paths. A subject is cut at 4096 characters of the visible text, after control and invisible characters became escapes, and never inside one escape. |
 | `detail` | What was found. It never holds a file content or a secret value. |
 | `fix` | One line of fix text. |
 | `required` | `true` unless the row is a check this build cannot run. An UNKNOWN required row is exit 1. |
@@ -58,7 +58,7 @@ All text passes through `dfm_model::display::visible`. Neither format has an ANS
 | `state` | A receipt or trial that cannot be read, or belongs to another identity | WARN with the file's code, labeled partial. Receipts are audit evidence and never authority. |
 | `state` | Stray entries (interrupted writes, staging directories) | WARN `D_STATE_PARTIAL`, labeled partial. |
 | `intent` | A journal intent with no outcome | ERROR `E_OP_INTERRUPTED`. A running apply also leaves an intent until it ends, and doctor cannot tell the two apart. The fix is to wait for a running apply, then run `apply`, which settles it. |
-| `intent` | A journal `unknown` entry that no later entry settled (DFM-19) | ERROR `E_OP_INTERRUPTED`, required. The detail names the operation and its journal id, and says whether it blocks one path or, with no intent record, a whole resource. The fix is `state recover` or `apply`, which probe it again, or `state resolve '<journal-id>' --as done|failed`. Doctor never settles. The row stays until a later entry settles the operation. |
+| `intent` | A journal `unknown` entry that no later entry settled (DFM-19) | ERROR `E_OP_INTERRUPTED`, required. The detail names the operation and its journal id, and says whether it blocks one path or, with no intent record, a whole resource. The fix is `state recover` or `apply`, which probe it again, or `state resolve '<journal-id>' --as done|failed` (`done` is refused for an entry with more than one path). Doctor never settles. The row stays until a later entry settles the operation. |
 | `receipt` | The newest readable receipt | OK `D_OK`, WARN `D_LAST_RUN` when its outcome is not `ok`, N/A `D_NO_RECEIPT`. |
 | `lock` | The lock file | OK `D_OK` (no file, or an empty file with no note) or OK `D_LOCK_NOTE`. WARN `E_STORAGE_INVALID` when the file is a link, a directory, a FIFO, owned by another user, or cannot be opened or read. The file is opened without following a link and checked on the descriptor. |
 | `profile` | The resolved profile | OK `D_OK`. ERROR with the resolver's code (`E_MANIFEST_INVALID`, `E_SOURCE_MISSING`, `E_PROFILE_INVALID`, and so on). UNKNOWN `D_DEPENDS_UNKNOWN` without a readable binding. |

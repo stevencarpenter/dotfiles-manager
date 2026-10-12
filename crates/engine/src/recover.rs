@@ -59,9 +59,11 @@ pub(crate) fn observe_live(
 }
 
 /// Answers an interrupted operation's `already_done` question. It decides nothing about
-/// ownership.
+/// ownership. The manager writes one output per intent, so an intent with none or with more
+/// than one is not probed (probing only the first would settle the others unseen): it stays
+/// open for the operator.
 pub(crate) fn inspect(w: Where<'_>, e: &JournalEntry) -> (Probe, Option<Live>) {
-    let Some(out) = e.recovery.as_ref().and_then(|r| r.outputs.first()) else {
+    let Some([out]) = e.recovery.as_ref().map(|r| r.outputs.as_slice()) else {
         return (Probe::Unknown, None);
     };
     let Some(live) = observe_live(w, &out.path, out.expected_sha256.is_some()) else {
@@ -382,11 +384,17 @@ pub(crate) fn quoted(id: &str) -> String {
     )
 }
 
-/// The text that tells an operator how to clear an open entry.
-pub(crate) fn fix_text(id: &str) -> String {
+/// The text that tells an operator how to clear an open entry. `multi` is true for an entry
+/// with more than one recorded path, which cannot be resolved as done.
+pub(crate) fn fix_text(id: &str, multi: bool) -> String {
     let q = quoted(id);
+    let done = if multi {
+        "(this entry has more than one path and cannot be resolved as done)"
+    } else {
+        "(the path holds the result the operation expected)"
+    };
     format!(
-        "Fix: run `dotfiles-manager state recover` (it settles what the machine shows clearly) or apply. If the entry stays open, check the path, then run `dotfiles-manager state resolve {q} --as done` (the path holds the result the operation expected) or `--as failed`"
+        "Fix: run `dotfiles-manager state recover` (it settles what the machine shows clearly) or apply. If the entry stays open, check the path, then run `dotfiles-manager state resolve {q} --as done` {done} or `--as failed`"
     )
 }
 
@@ -427,6 +435,15 @@ pub fn resolve(
             "the journal has no intent entry for it, so nothing can be checked",
         ));
     };
+    if intent
+        .recovery
+        .as_ref()
+        .is_some_and(|r| r.outputs.len() > 1)
+    {
+        return Err(conflict(
+            "the intent records more than one path, and only one path can be checked. Use --as failed",
+        ));
+    }
     let (probe, live) = inspect(w, intent);
     if probe != Probe::Done {
         return Err(conflict(
