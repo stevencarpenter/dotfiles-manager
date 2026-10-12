@@ -57,10 +57,10 @@ fn read_regular(path: &Path, shown: &str) -> Result<Vec<u8>, Refusal> {
     Ok(buf)
 }
 
-/// A refusal whose detail is safe to print: paths come from the tree being read and may hold
-/// control, bidirectional or zero-width characters.
+/// A refusal whose detail may hold control, bidirectional or zero-width characters from the tree
+/// being read. Every command escapes a detail once, when it prints it, so it is not escaped here.
 fn refusal(code: Code, detail: String) -> Refusal {
-    Refusal::new(code, dfm_model::display::visible(&detail))
+    Refusal::new(code, detail)
 }
 
 /// Reads the parts of `root` that the profile's bundle declares in `[sources]`, or the whole

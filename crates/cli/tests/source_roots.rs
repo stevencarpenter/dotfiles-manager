@@ -668,6 +668,17 @@ fn a_link_target_with_a_control_character_is_refused_like_a_name() {
 }
 
 #[test]
+fn a_backslash_in_a_refused_path_is_escaped_once() {
+    let fx = scoped(r#""base", "profiles""#, "");
+    mkfifo(&fx.root.join("base/modules/core/files/pi\\npe"));
+    let err = plan_refused(&fx, "E_SOURCE_UNTRUSTED");
+    assert!(err.contains("special file at"), "{err}");
+    // One backslash in the name is two in the output, never four, and not a bare `\n`.
+    assert!(err.contains("files/pi\\\\npe"), "{err}");
+    assert!(!err.contains("pi\\\\\\\\npe"), "{err}");
+}
+
+#[test]
 fn apply_refuses_a_link_planted_in_excluded_content_after_the_plan() {
     let fx = scoped(r#""base", "profiles""#, r#""**/.venv""#);
     with_plugs(&fx);
