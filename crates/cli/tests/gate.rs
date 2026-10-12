@@ -58,9 +58,13 @@ fn os_bound_names_stay_in_platform_macos() {
         "homebrew",
         "xcode",
     ];
+    // docs/architecture.md section 3: no OS-bound name in `model` or `engine`.
     let mut files = Vec::new();
-    rs_files(&repo_root().join("crates/model/src"), &mut files);
-    assert!(!files.is_empty());
+    for krate in ["model", "engine"] {
+        let before = files.len();
+        rs_files(&repo_root().join(format!("crates/{krate}/src")), &mut files);
+        assert!(files.len() > before, "no sources found for {krate}");
+    }
     for f in files {
         let text = fs::read_to_string(&f).unwrap();
         // Compare outside `#[cfg(test)]` modules and comments only by simple containment.
@@ -489,13 +493,28 @@ fn a_plain_release_build_of_every_target_has_no_test_isolation() {
         v.starts_with("dotfiles-manager ") && !v.contains("test-isolation"),
         "{v}"
     );
-    // The release binary has no isolation flag, so `apply` with an override is a usage error
-    // before anything is read or written, and the failure-injection variable has no effect.
+    // The isolation variables are compiled out. A release binary cannot reach a state path
+    // without the real HOME, so their absence is proven in the binary itself: `width()` and
+    // `fail_from_env()` have no `DFM_WIDTH` or `DFM_FAILPOINT` to read, and are no-ops.
+    let bin = fs::read(target.path().join("release/dotfiles-manager")).unwrap();
+    for name in [
+        "DFM_WIDTH",
+        "DFM_FAILPOINT",
+        "DFM_HOME",
+        "DFM_BINDING",
+        "DFM_PLATFORM",
+    ] {
+        assert!(
+            !bin.windows(name.len()).any(|w| w == name.as_bytes()),
+            "the release binary names {name}"
+        );
+    }
+    // The release binary has no `--home` flag, so it is a usage error before anything is read
+    // or written. This does not run `apply`: it proves only that the flag is absent.
     let scratch = common::TempDir::new("release-apply");
     let o = Command::new(target.path().join("release/dotfiles-manager"))
         .env_clear()
         .env("DFM_HOME", scratch.path())
-        .env("DFM_FAILPOINT", "apply-before-effect:abort")
         .arg("--home")
         .arg(scratch.path())
         .args(["apply", "--root"])

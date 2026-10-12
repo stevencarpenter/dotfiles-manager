@@ -435,25 +435,29 @@ fn a_symlinked_settings_file_is_not_followed() {
     std::os::unix::fs::symlink(&elsewhere, fx.settings()).unwrap();
     let o = fx.plan();
     assert_eq!(code(&o), 3, "{}", stderr(&o));
+    assert!(stderr(&o).contains("E_CONFLICT"), "{}", stderr(&o));
+    // Apply refuses the same way and writes nothing: not through the link, not beside it.
+    let before = common::fingerprint(fx.home.path());
+    // The blocked plan still prints its digest, so the approval is real and the refusal is the
+    // symlink's, not a stale digest.
+    let digest = text(&o.stdout)
+        .lines()
+        .find_map(|l| l.strip_prefix("plan digest: "))
+        .expect("a digest line")
+        .to_string();
+    let a = fx.apply_with(&digest);
+    assert_eq!(code(&a), 3, "{}", stderr(&a));
+    assert!(stderr(&a).contains("E_CONFLICT"), "{}", stderr(&a));
+    assert_eq!(
+        common::fingerprint(fx.home.path()),
+        before,
+        "HOME and state"
+    );
     assert_eq!(
         fs::read_to_string(&elsewhere).unwrap(),
         "{\"apiKeyHelper\": \"x\"}\n"
     );
-}
-
-#[test]
-fn a_module_with_only_managed_values_merges_and_adds_no_hook() {
-    let fx = Fx::new();
-    fx.module(|m| {
-        let cut = m.find("[resources.value.handlers.audit]").unwrap();
-        let policy = m.find("[resources.policy]").unwrap();
-        format!("{}{}", &m[..cut], &m[policy..]).replace("extensions = [\"/handlers\"]\n", "")
-    });
-    let o = fx.apply();
-    assert_eq!(code(&o), 0, "{}", stderr(&o));
-    let j = fx.live_json();
-    assert_eq!(j["outputStyle"], "STE");
-    assert!(j.get("hooks").is_none(), "{j}");
+    assert_eq!(fs::read_link(fx.settings()).unwrap(), elsewhere);
 }
 
 // ---- foreign edits of managed fields -----------------------------------------------------

@@ -380,14 +380,20 @@ fn self_check_fixture_dir_reads_only_that_directory() {
         &["self-check", "--fixture-dir", dir.path().to_str().unwrap()],
     );
     assert_eq!(o.status.code(), Some(3));
-    assert_eq!(
-        run(
-            home.path(),
-            &["self-check", "--fixture-dir", "/nonexistent"]
-        )
-        .status
-        .code(),
-        Some(3)
+    assert!(
+        text(&o.stderr).contains("E_BINDING_INVALID"),
+        "{}",
+        text(&o.stderr)
+    );
+    let missing = run(
+        home.path(),
+        &["self-check", "--fixture-dir", "/nonexistent"],
+    );
+    assert_eq!(missing.status.code(), Some(3));
+    assert!(
+        text(&missing.stderr).contains("E_BINDING_INVALID"),
+        "{}",
+        text(&missing.stderr)
     );
     assert!(files_below(home.path()).is_empty());
 }
@@ -547,6 +553,9 @@ fn a_fifo_at_the_binding_path_is_refused_without_blocking() {
             std::thread::sleep(std::time::Duration::from_millis(50));
         };
         assert_eq!(status.code(), Some(3), "{args:?}");
+        let mut said = String::new();
+        std::io::Read::read_to_string(&mut child.stderr.take().unwrap(), &mut said).unwrap();
+        assert!(said.contains("E_BINDING_INVALID"), "{args:?}: {said}");
     }
 }
 

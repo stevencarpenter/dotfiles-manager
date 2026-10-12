@@ -261,6 +261,11 @@ fn an_operation_journals_intent_then_done_then_records_ownership_and_a_receipt()
     // A second operation never claims a path that already exists.
     let again = record(h.path(), "core.other", "gitconfig", "x");
     assert_eq!(again.status.code(), Some(3), "{}", text(&again.stderr));
+    assert!(
+        text(&again.stderr).contains("E_STATE_INVALID"),
+        "{}",
+        text(&again.stderr)
+    );
     assert_eq!(
         journal_phases(h.path()),
         ["intent", "done"],
@@ -1066,10 +1071,12 @@ fn a_planted_secret_and_its_hash_never_reach_state_or_output() {
                 stack.push(e.path());
                 continue;
             }
-            let body = fs::read_to_string(e.path()).unwrap_or_default();
-            assert!(!body.contains(&plain), "{:?} holds the secret", e.path());
+            // Bytes, not text: a non-UTF-8 file must be scanned too, and a read error must fail.
+            let body = fs::read(e.path()).unwrap_or_else(|err| panic!("{:?}: {err}", e.path()));
+            let has = |needle: &str| body.windows(needle.len()).any(|w| w == needle.as_bytes());
+            assert!(!has(&plain), "{:?} holds the secret", e.path());
             assert!(
-                !body.contains(&digest) && !body.contains(&raw),
+                !has(&digest) && !has(&raw),
                 "{:?} holds the secret's hash",
                 e.path()
             );
@@ -1147,6 +1154,11 @@ fn claims_are_limited_to_exact_paths_inside_home() {
             ],
         );
         assert_eq!(o.status.code(), Some(3), "{path}: {}", text(&o.stderr));
+        assert!(
+            text(&o.stderr).contains("E_STATE_INVALID"),
+            "{path}: {}",
+            text(&o.stderr)
+        );
         assert_eq!(snapshot(h.path()), before, "{path}");
     }
     assert!(!Path::new("/etc/dotfiles-manager-test").exists());
