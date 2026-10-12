@@ -24,7 +24,7 @@ The `expected_error` codes in `examples/cases.toml` and `E_ADAPTER_UNKNOWN` are 
 | `E_TYPE_MISMATCH` | A value whose type differs from the owner's value or the adapter schema. Boolean and integer are different types. |
 | `E_EXTENSION_CONFLICT` | A contribution to a key that already exists, or two contributors for one key. |
 | `E_BUNDLE_CYCLE` | Bundles extend each other in a cycle. |
-| `E_PLATFORM_MISMATCH` | The bound profile declares a platform or architecture that differs from this machine (the `Platform` port and `std::env::consts::ARCH`, where `aarch64` is written `arm64`). It is checked after resolution and before `plan`, `doctor` and `apply`, which refuse with exit 3. `explain` still works and prints the mismatch as a `note:`. Distinct from `E_PLATFORM_UNSUPPORTED`, which refuses a module that does not list the profile's platform. |
+| `E_PLATFORM_MISMATCH` | The bound profile declares a platform or architecture that differs from this machine (the `Platform` port and `std::env::consts::ARCH`, where `aarch64` is written `arm64`). It is checked after resolution. `plan` and `apply` refuse with exit 3. `doctor` reports it as an ERROR row in the `profile` line and exits 1, and its plan row is UNKNOWN. `explain` still works and prints the mismatch as a `note:`. Distinct from `E_PLATFORM_UNSUPPORTED`, which refuses a module that does not list the profile's platform. |
 | `E_REPORT_UNAVAILABLE` | A source or root cannot be read, so the requested report cannot be produced. Exit 2: architecture section 10 defines exit 2 as "Invalid invocation, or inability to produce the requested report." Limit and trust failures while loading (`E_LIMIT_EXCEEDED`, `E_SOURCE_UNTRUSTED`) stay exit 3. |
 
 All other resolver codes exit 3 (blocked before mutation).

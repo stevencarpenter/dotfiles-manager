@@ -1,17 +1,27 @@
 # First live run (owner runbook)
 
-This is the shortest safe path from the current integration branch to a first `apply` on a real machine. It covers only file links. Generated files (render, merge, assemble) are refused by `apply` until adapters exist (DFM-20). Nothing in this document runs by itself. Every step is a command the owner runs and can stop before.
+This is the shortest safe path from the current integration branch to a first `apply` on a real machine. It covers links and the generated files that the release binary has adapters for. Nothing in this document runs by itself. Every step is a command the owner runs and can stop before.
 
-Board ticket: DFM-46. The agent runs nothing live without written approval that names the plan digest (AGENTS.md).
+Board ticket: DFM-46. The agent runs nothing live without written approval that names the plan digest. The rule is step 3 of section 4 below.
 
 ## 1. Build and install the manager
 
-1. Place the pinned toolchain. `~/.local/share/dotfiles-manager` must be a real, user-owned directory first. Then run:
+1. Place the pinned toolchain. `~/.local/share/dotfiles-manager` must be a real directory that you own and that group and others cannot write. Then run:
 
    ```sh
-   cp -Rp ~/.rustup/toolchains/1.98.1-aarch64-apple-darwin ~/.local/share/dotfiles-manager/toolchains/1.98.1
-   sh scripts/bootstrap.sh toolchain-digest --dir ~/.local/share/dotfiles-manager/toolchains/1.98.1
+   (
+     set -e
+     mkdir -p ~/.local/share/dotfiles-manager/toolchains
+     if [ -e ~/.local/share/dotfiles-manager/toolchains/1.98.1 ]; then
+       echo 'stopped: remove toolchains/1.98.1 first, because cp would nest the copy' >&2
+       exit 1
+     fi
+     cp -Rp ~/.rustup/toolchains/1.98.1-aarch64-apple-darwin ~/.local/share/dotfiles-manager/toolchains/1.98.1
+     sh scripts/bootstrap.sh toolchain-digest --dir ~/.local/share/dotfiles-manager/toolchains/1.98.1
+   )
    ```
+
+   The block runs in a subshell. If it prints `stopped` or any error, or the status is not 0, do not go on to step 3.
 
    The copy must be a real directory, not a symlink. The printed digest must equal `toolchain_tree_sha256` in `dotfiles-manager.lock` before `install`. The digest is device-specific. The M3 may need its own lock later.
 2. Choose the commit to install. The integration branch is `going-to-sleep`. Use the full 40-character object id.
@@ -21,10 +31,10 @@ Board ticket: DFM-46. The agent runs nothing live without written approval that 
    /usr/bin/env -i /bin/sh scripts/bootstrap.sh install --source "$PWD" --commit <full sha>
    ```
 
-   It checks Command Line Tools, the pinned toolchain, the staged tree and the build controls before any `cargo` process starts. It builds offline, runs `self-check`, then installs `~/.local/bin/dotfiles-manager` through a `current` symlink. A failed build leaves no installed binary.
-4. Check: `dotfiles-manager --version` prints the semver and the commit. `isolated:` must not appear; the release binary ignores every isolation override.
+   It checks Command Line Tools, the pinned toolchain, the staged tree and the build controls before any `cargo` process starts. It runs `cargo fetch --locked`, which needs network access, then builds offline, runs `self-check`, then installs `~/.local/bin/dotfiles-manager` through a `current` symlink. A failed build leaves no installed binary.
+4. Check: `dotfiles-manager --version` prints the semver and the commit. The output must not contain `test-isolation`; the release binary ignores every isolation override.
 
-## 2. Author a link-only bundle in the configuration repository
+## 2. Author a bundle in the configuration repository
 
 The bundle lives in the dotfiles repository, not in this manager repository. Minimum layout:
 
@@ -81,8 +91,8 @@ overrides = []
 Rules that matter on the first run:
 
 - `target` is relative to HOME and must be ASCII. The source file must exist inside the checkout.
-- Use only `kind = "link"` resources. Any `render`, `merge` or `assemble` resource makes `apply` refuse the whole plan with `E_GENERATOR_UNAVAILABLE` (exit 3, nothing written).
-- Do not list `.claude/settings.json`, files under `.ssh` other than `config`, or any file that holds a secret.
+- Know every file class the first apply writes. `link` resources (`fs-link/v1`) create symlinks. `render` resources (`git-config/v1`) write a whole file. `assemble` resources (`text-fragments/v1`) write a file built from fragments. A `merge` resource (`claude-settings/v1`, `.claude/settings.json` only) writes into a file that the application also owns: it sets the declared values and keeps foreign keys, and its first write into an existing file needs `--allow-adopt` because hand edits of managed fields are overwritten (docs/adapters.md). Apply also creates missing parent directories (mode 0700). A resource whose adapter is not registered in the release binary makes `apply` refuse the whole plan with `E_GENERATOR_UNAVAILABLE` (exit 3, nothing written).
+- Do not list files under `.ssh` other than `config`, or any file that holds a secret. List `.claude/settings.json` only as a `claude-settings/v1` merge resource, never as a link, a render or an assemble resource; the planner refuses a sensitive link or removal.
 - A checkout that holds ignored or runtime content (plugin checkouts, `.venv`, `node_modules`, caches) needs `[sources]` in the bundle. See the next section.
 - A `link` resource may point at a file or a directory. A directory source needs `directory = true` in the resource value (`[resources.value]`); without it the resolver refuses with `E_MANIFEST_INVALID`. A directory link is one operation; the manager never writes through it and never deletes it recursively.
 
@@ -120,15 +130,17 @@ dotfiles-manager doctor --root <checkout>
 dotfiles-manager apply --root <checkout> --preview
 ```
 
-`bind` writes only the binding file and the empty state store under `~/.local/state/dotfiles-manager`. `plan`, `doctor` and `--preview` write nothing.
+`bind` writes only the binding file, the empty state store under `~/.local/state/dotfiles-manager` and the lock file `~/.local/state/dotfiles-manager.lock`. `plan`, `doctor` and `--preview` write nothing.
 
 Read the plan. Each line is one operation:
 
 | Line | Meaning |
 | --- | --- |
 | `planned mkdir@...` | a parent directory will be created (mode 0700) |
-| `planned <res>@<path> link ...` | a new link will be created |
-| `planned adopt@...` | an existing link already has the exact text; it will be recorded as owned, nothing written. Needs `--allow-adopt '<id>'` |
+| `planned <resource>@<path> [module] link <path> -> <source>` | a new link will be created |
+| `planned <resource>@<path> [module] write <path> with <adapter>` or `update <path> with <adapter>` | a rendered or assembled file will be created or replaced (`output: N bytes` and the setting names follow, never the content) |
+| `planned <resource>@<path> [module] create <path> by merge ...` or `merge into <path> ...` | a merge into the application's file; `managed:` and `sets:` lines follow. `take over managed fields ...` needs `--allow-adopt '<id>'` |
+| `planned <resource>@<path> [module] adopt <path>: ...` | an existing link already has the exact text; it will be recorded as owned, nothing written. Needs `--allow-adopt '<id>'` |
 | `planned remove@...` | an owned output will be deleted. Needs `--allow-disruptive '<id>'` |
 | `blocked ... E_CONFLICT` | a file exists at the target and the manager does not own it. Move it aside by hand, or change the profile |
 | `current ...` | already correct |
@@ -172,11 +184,11 @@ exec zsh
 
 ## 6. Undo
 
-Deselect the module in the profile (`modules = []`), run `plan`, then `apply --preview`. It lists one `--allow-disruptive` flag per owned output. Apply with those flags removes only the links the manager created or adopted; the source files are untouched. Files that existed before and were not adopted are never deleted. The backup from step 4 restores anything else.
+Deselect the module in the profile (`modules = []`), run `plan`, then `apply --preview`. It lists one `--allow-disruptive` flag per owned output. Apply with those flags removes the links the manager created or adopted and the rendered or assembled files it wrote that still match the ledger; the source files are untouched. A `claude-settings/v1` merge is retired without a flag: it removes only the hook entries the manager added, and the managed values stay in `.claude/settings.json`, which is never deleted. Files that existed before and were not adopted are never deleted. The backup from step 4 restores anything else.
 
 ## Known limits on the first run
 
-- Only links. No generated files, no secrets, no packages, no reloads of running programs.
-- `Ctrl-C` during `apply` stops cleanly. The operation in flight finishes, the receipt has outcome `interrupted`, and the exit code is 130. SIGTERM gives `terminated` and 143. After SIGKILL or a crash, the next run settles the interrupted operation from the journal before it does anything else.
+- Links, rendered and assembled files, and the one `claude-settings/v1` merge. No secrets, no packages, no reloads of running programs.
+- `Ctrl-C` during `apply` stops cleanly. The operation in flight finishes, the receipt has outcome `interrupted`, and the exit code is 130. SIGTERM gives `terminated` and 143. After SIGKILL, a signal with no handler (SIGHUP, SIGQUIT, ...) or a crash, the next run settles the interrupted operation from the journal before it does anything else. A merge that was interrupted after its rename cannot be settled that way: its path stays blocked with `E_OP_INTERRUPTED` in every run until `dotfiles-manager state resolve <journal-id> --as failed` (docs/apply.md, "Known limits").
 - A removal or link replacement checks the leaf and then acts in a second step. A concurrent same-user process could change the leaf in between.
 - Config edits in the checkout never require rebuilding the manager. Only a new manager commit does, through `bootstrap.sh install`.

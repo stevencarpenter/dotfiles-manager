@@ -90,7 +90,7 @@ An owned output is compared by fingerprint: `file_fingerprint` of the file conte
 
 ## Codes
 
-`D_*` codes belong to `doctor`. They are registered in one place, `dfm_model::doctor::CODES`, and a test requires each one to appear in this file.
+`D_*` codes belong to `doctor`. They are registered in one place, `DoctorCode::ALL` (`dfm_model::doctor`), and a test requires each one to appear in this file.
 
 | Code | Meaning |
 | --- | --- |

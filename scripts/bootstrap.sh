@@ -9,7 +9,7 @@
 #
 # POSIX sh plus system tools from a fixed PATH. No cargo, rustc or rustup process
 # starts before the toolchain tree digest and the build controls pass.
-# Exit: 0 ok, 1 build failed, 2 usage, 3 refused before the build.
+# Exit: 0 ok, 1 failed (build, or a check after the swap), 2 usage, 3 refused before the build.
 # Scrub the caller's environment before anything else runs: exported shell functions of any
 # name (BASH_FUNC_*, including ones named like `[` or `test`), PERL5LIB or PERL5OPT (shasum
 # is perl), CDPATH, ENV and the like must not influence the checks. Before the scrub this
@@ -250,7 +250,7 @@ END { if (failed) exit 3 }
 # Early, read-only pin hint: the same table-aware reading of [manager].toolchain as LOCK_RULES,
 # without the demand for the other keys (the staged check makes that demand later).
 PIN_HINT_RULES='
-function on_header(name, arr) { TABLE = name }
+function on_header(name, arr) { if (name == "manager" && arr) bad("[[manager]] is an array of tables"); TABLE = name }
 function on_inline(k, sk) { bad("inline table in lock") }
 function on_pair(key) {
   if (TABLE == "manager" && key == "toolchain") {
@@ -263,7 +263,7 @@ END { if (failed) exit 3; if (H != "") print H }
 
 LOCK_RULES='
 function on_header(name, arr) {
-  if (name == "manager") { if (MSEEN) bad("duplicate [manager]"); MSEEN = 1 }
+  if (name == "manager") { if (arr) bad("[[manager]] is an array of tables"); if (MSEEN) bad("duplicate [manager]"); MSEEN = 1 }
   TABLE = name
 }
 function on_inline(k, sk) { bad("inline table in lock") }
@@ -411,7 +411,13 @@ controls_toolchain() { # uses PIN, TREE, DATA
   [ -d "$TC" ] && [ ! -L "$TC" ] ||
     refuse E_TOOLCHAIN_MISMATCH "toolchain $PIN is absent at $TC; install exactly that version there (official Rust release distribution)"
   got=$(toolchain_digest "$TC") || got=
-  [ -n "$PIN" ] && [ -n "$TREE" ] && [ -n "$got" ] && [ "$got" = "$TREE" ] || refuse E_TOOLCHAIN_MISMATCH "toolchain $PIN tree digest differs from the lock"
+  [ -n "$PIN" ] && [ -n "$TREE" ] && [ -n "$got" ] && [ "$got" = "$TREE" ] || {
+    # cp -R into an existing destination nests the copy one level down.
+    for _n in "$TC/$PIN" "$TC/$PIN"-*; do
+      [ ! -d "$_n" ] || refuse E_TOOLCHAIN_MISMATCH "toolchain $PIN tree digest differs from the lock; $_n is nested inside it (cp -R into an existing directory). Remove $TC and copy the toolchain to $TC again"
+    done
+    refuse E_TOOLCHAIN_MISMATCH "toolchain $PIN tree digest differs from the lock"
+  }
 }
 
 controls_ancestors() { # uses CACHE
@@ -543,7 +549,18 @@ check_private_path() {
     [ -d "$_p" ] || refuse E_PREREQ_MISSING "$_p exists and is not a directory; move it away first"
   done
 }
-check_cache_tree() { check_private_path "$CACHE_REL/build"; }
+# A directory the manager writes into must belong to the current user and be closed to group and
+# others, as the binding's directory chain is. $1 is a path below HOME; an absent one is fine.
+check_owned_dir() {
+  _o=$HOME_DIR/$1
+  [ -d "$_o" ] || return 0
+  [ "$(/usr/bin/stat -f %u "$_o")" = "$(/usr/bin/id -u)" ] ||
+    refuse E_PREREQ_MISSING "$_o is not owned by the current user; move it away first"
+  _m=$(/usr/bin/stat -f %Lp "$_o")
+  [ $(( 0$_m & 022 )) -eq 0 ] ||
+    refuse E_PREREQ_MISSING "$_o has mode $_m, writable by group or others; run chmod go-w on it first"
+}
+check_cache_tree() { check_private_path "$CACHE_REL/build"; check_owned_dir "$CACHE_REL"; check_owned_dir "$CACHE_REL/build"; }
 # The bin directory receives the command link: a real directory the current user owns.
 check_bin_dir() {
   check_private_path .local/bin
@@ -551,7 +568,8 @@ check_bin_dir() {
     refuse E_PREREQ_MISSING "$HOME_DIR/.local/bin is not owned by the current user; move it away first"
 }
 check_data_tree() {
-  for _d in versions cargo-home rustup-home build-home; do check_private_path "$DATA_REL/$_d"; done
+  for _d in toolchains versions cargo-home rustup-home build-home; do check_private_path "$DATA_REL/$_d"; done
+  for _d in "" toolchains versions cargo-home rustup-home build-home; do check_owned_dir "$DATA_REL${_d:+/$_d}"; done
 }
 
 rm_build() { [ ! -e "$build" ] || chmod -R u+w "$build"; rm -rf "$build"; }
@@ -560,6 +578,25 @@ rm_build() { [ ! -e "$build" ] || chmod -R u+w "$build"; rm -rf "$build"; }
 git_clean() { /usr/bin/env -i PATH="$SYSPATH" HOME=/var/empty LANG=C GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null \
   GIT_CONFIG_NOSYSTEM=1 GIT_TERMINAL_PROMPT=0 GIT_NO_REPLACE_OBJECTS=1 /usr/bin/git -c core.fsmonitor=false \
   -c core.hooksPath=/dev/null -c core.useReplaceRefs=false "$@"; }
+
+# Removes the build directory and the build homes. Each tree goes only when its own check passes,
+# so a link planted since the last check is never followed. Sets `left` to what stayed and why.
+clean_build() {
+  left=
+  if why=$( (check_cache_tree) 2>&1 ); then rm_build || left=$build; else left="$build ($why)"; fi
+  for _h in cargo-home rustup-home build-home; do
+    if why=$( (check_private_path "$DATA_REL/$_h"; check_owned_dir "$DATA_REL"; check_owned_dir "$DATA_REL/$_h") 2>&1 ); then
+      rm -rf "${DATA:?}/$_h" || left="$left; $DATA/$_h"
+    else left="$left; $DATA/$_h ($why)"; fi
+  done
+  left=${left#; }
+}
+# Armed once install first changes the build directories; a run that did not finish removes them.
+install_unfinished() {
+  [ -z "${install_ok:-}" ] || return 0
+  clean_build || :
+  [ -z "$left" ] || echo "bootstrap: install did not finish; left in place: $left" >&2
+}
 
 cmd_install() {
   [ -n "${src:-}" ] && [ -n "${commit:-}" ] || usage "install needs --source and --commit"
@@ -587,6 +624,7 @@ cmd_install() {
   check_config_tree; check_binding
   check_cache_tree; check_data_tree; check_bin_dir
   build=$CACHE/build
+  trap install_unfinished EXIT; trap 'exit 130' INT; trap 'exit 143' TERM
   rm_build; mkdir -p "$build/stage"
   # Build the verified commit itself, not whatever HEAD is. Both steps are checked: a pipe would hide
   # the status of git archive.
@@ -625,7 +663,7 @@ cmd_install() {
   # to a file that mktemp creates exclusively (never through a link), then renamed into place.
   check_private_path "$DATA_REL/versions/$name"
   mkdir -p "$DATA/versions/$name" "$HOME_DIR/.local/bin"
-  check_private_path "$DATA_REL/versions/$name"
+  check_private_path "$DATA_REL/versions/$name"; check_owned_dir "$DATA_REL/versions/$name"
   [ ! -d "$DATA/versions/$name/dotfiles-manager" ] ||
     refuse E_PREREQ_MISSING "$DATA/versions/$name/dotfiles-manager is a directory; move it away first"
   staged_bin=$(mktemp "$DATA/versions/$name/dotfiles-manager.new.XXXXXX") || { echo "error: cannot create the staged binary" >&2; exit 1; }
@@ -649,8 +687,14 @@ cmd_install() {
   if [ "$got_link" != "$DATA/current/dotfiles-manager" ]; then
     echo "error: swap did not take effect: the command path is '$got_link', expected '$DATA/current/dotfiles-manager'" >&2; exit 1
   fi
-  check_cache_tree; check_data_tree # again: the window since the last check was the whole build
-  rm_build; rm -rf "$DATA/cargo-home" "$DATA/rustup-home" "$DATA/build-home"
+  # Again: the window since the last check was the whole build. The swap is done, so a failed
+  # check is an exit 1 after cleaning what is safe to clean, never a refusal with exit 3.
+  clean_build
+  if [ -n "$left" ]; then
+    install_ok=1
+    echo "error: the swap took effect and $DATA/current is the new version, but a directory check failed afterwards; not removed: $left. Fix the directory and remove it yourself" >&2; exit 1
+  fi
+  install_ok=1
   sha=$(/usr/bin/shasum -a 256 "$DATA/versions/$name/dotfiles-manager" | cut -d' ' -f1)
   printf 'installed %s\nsource commit %s\nbinary sha256 %s (record only)\nbootstrap: done\n' "$DATA/versions/$name" "$commit" "$sha"
 }
@@ -665,12 +709,12 @@ cmd_uninstall() {
   build=$CACHE/build; rm_build
   rm -f "$DATA/current" "$DATA/current.new"
   rm -rf "${DATA:?}/versions" "$DATA/cargo-home" "$DATA/rustup-home" "$DATA/build-home"
-  rmdir "$CACHE" "$DATA" "$HOME_DIR/.local/bin" 2>/dev/null || true
+  rmdir "$CACHE" "$DATA" 2>/dev/null || true # ~/.local/bin is not ours to remove
   printf 'removed the installed manager; toolchains, state and binding were left in place\n'
 }
 
 cmd=${1:-}; [ $# -gt 0 ] && shift
-src= commit= dir=
+src='' commit='' dir=''
 while [ $# -gt 0 ]; do
   case $1 in
     --source) [ $# -ge 2 ] || usage "--source needs a value"; src=$2; shift 2 ;;

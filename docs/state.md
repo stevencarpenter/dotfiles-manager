@@ -23,7 +23,7 @@ No workflow (`sync`, `update`, `try`, `purge`) exists. `apply` adopts exact exis
 ~/.local/state/dotfiles-manager.lock               writer lock (flock), outside the state root
 ~/.local/state/dotfiles-manager/state/             0700
     state.json   ledger.json   journal.jsonl       0600
-    salt                                           0600, 32 bytes, created on first merge
+    salt                                           0600, 32 bytes, created by Store::init
     receipts/ snapshots/ trials/                   0700
 ~/.local/state/dotfiles-manager/state.next/        only during init
 ```
@@ -62,7 +62,7 @@ All are JSON in canonical form (UTF-8, sorted keys, no extra whitespace), at mos
   3. A create operation did not find the path present before (`existed_before` is false).
   4. The leaf is owned by the current user, and a link resolves to a regular file.
   5. The resource is known. In `apply`, the resource has a ledger entry or the current plan has an operation for that resource and path. In `state recover` there is no plan, so the resource must already have a ledger entry. A new resource is settled `done` without ownership there, and the next plan offers `adopt`. The ledger lookup for this rule runs before the `done` entry is written. A ledger that cannot be read fails the run with the ledger's code and leaves the entry open (`unknown`), so the next recover after the repair settles it and updates the ledger.
-  The recorded mode is the live mode of a file (the intent carries no mode) and 0777 for a link.
+  The recorded mode is the live mode of a file (the intent carries no mode) and 0777 for a link. The recorded fingerprint is the intent's `expected_sha256` (`Own::Auto`), not a fresh observation. A file that changes after the probe read it and before the ledger write is recorded as owned with that stale fingerprint, and the next plan refuses it as drift.
 - The probe says not done (the path is gone, or a removal target is still there unchanged): the journal gets `failed` ("recovered: not done"). The path is free.
 - The probe cannot decide, the entry has the `unconfirmed:` mark, and the live entry is a readable file or link with another fingerprint: the journal gets `failed` ("recovered: not done; a later match is not owned"). The executor saw the effect when it wrote the entry, so a different file is not that effect, and a match restored by hand later is never owned automatically. The next plan offers `adopt` for an exact link, with its approval. A directory, an unreadable entry or a path outside HOME does not close the entry.
 - The probe cannot decide: the entry stays as it is, and every operation on that path is `blocked` with `E_OP_INTERRUPTED`. The text names the journal id and the fix.
@@ -107,6 +107,7 @@ The planner does not read the journal. A plan with a blocker cannot be approved,
 
 The first item is closed except for its residual list. Owner decisions are pending on state upgrade, sensitive conflict detection, trial baseline class, bind placement and parser strictness. They are not worked around here.
 
+- **Rename of the state parent.** The writer lock holds descriptors only. A rename of `~/.local/state` (or of `~/.local/state/dotfiles-manager`) after the lock is taken is not detected by the lock.
 - **Residual after descriptor-relative writes (C08).** The redirection class is closed for the manager's storage: a swapped path cannot send a write elsewhere. These remain:
   1. HOME is resolved with `canonicalize` and then opened. A swap of a system-owned ancestor of HOME between those two calls is not covered.
   2. A held descriptor does not stop another process of the same user from changing, unlinking or chmod-ing files inside the verified directory. It stops redirection only. The re-check refuses a writer after a swap or a mode change, but a change made after the check and before the write is not detected.

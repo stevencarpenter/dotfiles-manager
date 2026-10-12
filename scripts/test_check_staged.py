@@ -40,14 +40,18 @@ class StagedGateTest(unittest.TestCase):
             )
             (scripts / "check_all.sh").write_text('test "$(cat fixture)" = valid\n')
             fixture = root / "fixture"
-            for staged, working, succeeds in [
-                ("valid", "valid", True),
-                ("invalid", "valid", False),
-                ("valid", "invalid", True),
-                ("valid ", "valid", False),
+            # The stub ignores this file; only `git diff --cached --check` reads it.
+            notes = root / "notes"
+            for staged, working, succeeds, note in [
+                ("valid", "valid", True, "clean"),
+                ("invalid", "valid", False, "clean"),
+                ("valid", "invalid", True, "clean"),
+                ("valid ", "valid", False, "clean"),
+                ("valid", "valid", False, "trailing "),
             ]:
-                with self.subTest(staged=staged, working=working):
+                with self.subTest(staged=staged, working=working, note=note):
                     fixture.write_text(staged + "\n")
+                    notes.write_text(note + "\n")
                     subprocess.run(["git", "add", "."], cwd=root, check=True, env=env)
                     fixture.write_text(working + "\n")
                     before = subprocess.check_output(
@@ -60,6 +64,10 @@ class StagedGateTest(unittest.TestCase):
                         env=env,
                     )
                     self.assertEqual(result.returncode == 0, succeeds, result.stderr)
+                    if note != "clean":
+                        # The stub ignores notes, so only the diff check can fail here.
+                        output = result.stdout + result.stderr
+                        self.assertIn(b"trailing whitespace", output)
                     self.assertEqual(fixture.read_text(), working + "\n")
                     self.assertEqual(
                         subprocess.check_output(

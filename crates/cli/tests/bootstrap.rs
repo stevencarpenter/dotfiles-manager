@@ -708,13 +708,17 @@ struct Prepared {
 }
 
 fn prepare(label: &str) -> Prepared {
+    prepare_with(label, minimal_toolchain)
+}
+
+fn prepare_with(label: &str, make_toolchain: impl FnOnce(&Path) -> String) -> Prepared {
     let tmp = TempDir::new(label);
     let home = tmp.path().join("home");
     let data = home.join(".local/share/dotfiles-manager");
     fs::create_dir_all(&home).unwrap();
     // Owner step: place the exact pinned toolchain and record its tree digest in the lock.
     let tc_tmp = tmp.path().join("tc");
-    let pin = minimal_toolchain(&tc_tmp);
+    let pin = make_toolchain(&tc_tmp);
     let tc = data.join("toolchains").join(&pin);
     fs::create_dir_all(tc.parent().unwrap()).unwrap();
     fs::rename(&tc_tmp, &tc).unwrap();
@@ -1599,6 +1603,18 @@ fn the_early_pin_is_read_from_the_manager_table_with_the_staged_grammar() {
     let o = install_tiny(&home, &src, &sha);
     assert_eq!(o.status.code(), Some(3), "{}", err(&o));
     assert!(err(&o).contains("E_SOURCE_UNTRUSTED"), "{}", err(&o));
+    // An array of tables is not the [manager] table; the staged check refuses it as well
+    // (fixture srclock-manager-array).
+    let tmp = TempDir::new("pin-hint-array");
+    let lock = format!("schema = 1\n[[manager]]\ntoolchain = \"9.9.9\"\n{tree}");
+    let (src, sha) = source_with_lock(tmp.path(), &lock);
+    let o = install_tiny(&home, &src, &sha);
+    assert_eq!(o.status.code(), Some(3), "{}", err(&o));
+    assert!(
+        err(&o).contains("E_SOURCE_UNTRUSTED") && err(&o).contains("[[manager]]"),
+        "{}",
+        err(&o)
+    );
     // A repeated key is refused, as the staged check refuses it.
     let tmp = TempDir::new("pin-hint-twice");
     let lock =
@@ -1695,8 +1711,15 @@ fn a_symlinked_cache_hierarchy_is_refused_before_any_recursive_change() {
 #[test]
 fn a_symlinked_data_hierarchy_is_refused_before_any_recursive_removal() {
     use std::os::unix::fs::symlink;
-    let names = ["versions", "cargo-home", "rustup-home", "build-home"];
+    let names = [
+        "toolchains",
+        "versions",
+        "cargo-home",
+        "rustup-home",
+        "build-home",
+    ];
     for (case, link) in [
+        ("toolchains", ".local/share/dotfiles-manager/toolchains"),
         ("versions", ".local/share/dotfiles-manager/versions"),
         ("cargo-home", ".local/share/dotfiles-manager/cargo-home"),
         ("rustup-home", ".local/share/dotfiles-manager/rustup-home"),
@@ -1705,6 +1728,11 @@ fn a_symlinked_data_hierarchy_is_refused_before_any_recursive_removal() {
         let (tmp, home, src, sha) = refusal_setup(&format!("data-link-{case}"));
         let outside = victim(tmp.path(), &names);
         let name = link.rsplit('/').next().unwrap();
+        if case == "toolchains" {
+            // The setup made a real directory; the link must hold the pinned tree the install needs.
+            fs::remove_dir_all(home.join(link)).unwrap();
+            fs::create_dir_all(outside.join(name).join("9.9.9")).unwrap();
+        }
         symlink(outside.join(name), home.join(link)).unwrap();
         let o = install_tiny(&home, &src, &sha);
         assert_eq!(o.status.code(), Some(3), "install {case}: {}", err(&o));
@@ -1912,7 +1940,261 @@ fn the_data_directories_are_checked_again_before_the_late_removals() {
         &p.sha,
         &[("DFM_TEST_AFTER_SWAP", hook.to_str().unwrap())],
     );
+    // The swap already happened, so the failed re-check is exit 1, not a refusal with exit 3.
+    assert_eq!(o.status.code(), Some(1), "{}", err(&o));
+    assert!(
+        err(&o).contains("the swap took effect") && err(&o).contains("E_PREREQ_MISSING"),
+        "{}",
+        err(&o)
+    );
+    assert!(!String::from_utf8_lossy(&o.stdout).contains("bootstrap: done"));
+    assert!(
+        fs::read_link(p.data.join("current"))
+            .unwrap()
+            .starts_with("versions/"),
+        "the new version stays current"
+    );
+    assert!(
+        !p.home.join(".cache/dotfiles-manager/build").exists(),
+        "the build directory is removed before the exit"
+    );
+    assert_victim_intact(&outside, &["cargo-home"]);
+}
+
+/// Every path under `dir` with its mode, so a refusal can prove it changed nothing.
+fn snapshot(dir: &Path) -> Vec<(PathBuf, u32)> {
+    let mut v: Vec<_> = entries_below(dir)
+        .into_iter()
+        .map(|p| {
+            let m = fs::symlink_metadata(&p).unwrap().permissions().mode();
+            (p, m)
+        })
+        .collect();
+    v.sort();
+    v
+}
+
+#[test]
+fn a_manager_directory_open_to_group_or_others_stops_install_and_uninstall() {
+    let rels = [
+        ".local/share/dotfiles-manager",
+        ".local/share/dotfiles-manager/toolchains",
+        ".local/share/dotfiles-manager/versions",
+        ".local/share/dotfiles-manager/cargo-home",
+        ".local/share/dotfiles-manager/rustup-home",
+        ".local/share/dotfiles-manager/build-home",
+        ".cache/dotfiles-manager",
+        ".cache/dotfiles-manager/build",
+    ];
+    for rel in rels {
+        for mode in [0o775, 0o757] {
+            let (tmp, home, src, sha) = refusal_setup("open-dir");
+            let dir = home.join(rel);
+            fs::create_dir_all(&dir).unwrap();
+            fs::set_permissions(&dir, fs::Permissions::from_mode(mode)).unwrap();
+            let before = snapshot(&home);
+            let install = install_tiny(&home, &src, &sha);
+            let uninstall = script_test_mode(&home, &["uninstall"], &[]);
+            for (what, o) in [("install", install), ("uninstall", uninstall)] {
+                assert_eq!(
+                    o.status.code(),
+                    Some(3),
+                    "{what} {rel} {mode:o}: {}",
+                    err(&o)
+                );
+                assert!(
+                    err(&o).contains("E_PREREQ_MISSING")
+                        && err(&o).contains(dir.to_str().unwrap())
+                        && err(&o).contains("writable by group or others"),
+                    "{what} {rel} {mode:o}: {}",
+                    err(&o)
+                );
+            }
+            assert_eq!(
+                snapshot(&home),
+                before,
+                "{rel} {mode:o}: refusal must not write"
+            );
+            drop(tmp);
+        }
+    }
+}
+
+#[test]
+fn uninstall_leaves_the_bin_directory_and_removes_the_empty_directories_it_created() {
+    let tmp = TempDir::new("uninstall-bin");
+    let home = tmp.path().join("home");
+    let bin = home.join(".local/bin");
+    fs::create_dir_all(&bin).unwrap();
+    fs::create_dir_all(home.join(".local/share/dotfiles-manager")).unwrap();
+    fs::create_dir_all(home.join(".cache/dotfiles-manager/build")).unwrap();
+    let o = script_test_mode(&home, &["uninstall"], &[]);
+    assert_eq!(o.status.code(), Some(0), "{}", err(&o));
+    assert!(
+        bin.is_dir(),
+        "~/.local/bin is not the installer's to remove"
+    );
+    assert!(!home.join(".local/share/dotfiles-manager").exists());
+    assert!(!home.join(".cache/dotfiles-manager").exists());
+}
+
+/// A pin directory that holds the copy one level down (cp -R into an existing destination) is
+/// named in the refusal, and the failed run leaves no build directory behind.
+#[test]
+fn a_nested_toolchain_copy_is_named_and_a_refused_install_removes_its_build_directory() {
+    let p = prepare("nested-toolchain");
+    let pin = p.tc.file_name().unwrap().to_str().unwrap().to_string();
+    let moved = p.tmp.path().join("moved");
+    fs::rename(&p.tc, &moved).unwrap();
+    fs::create_dir(&p.tc).unwrap();
+    let nested = p.tc.join(format!("{pin}-aarch64-apple-darwin"));
+    fs::rename(&moved, &nested).unwrap();
+    let o = install(&p, &p.sha, &[]);
     assert_eq!(o.status.code(), Some(3), "{}", err(&o));
-    assert!(err(&o).contains("E_PREREQ_MISSING"), "{}", err(&o));
+    assert!(
+        err(&o).contains("E_TOOLCHAIN_MISMATCH") && err(&o).contains(nested.to_str().unwrap()),
+        "{}",
+        err(&o)
+    );
+    assert!(
+        !p.home.join(".cache/dotfiles-manager/build").exists(),
+        "the build directory must not outlive a refused install"
+    );
+}
+
+/// A toolchain whose `cargo` is a shell script, so the build steps run without network access.
+/// `fetch` runs `on_fetch` (shell text); `build` writes a stand-in binary that reports the
+/// identity the script requires and passes `self-check`.
+fn fake_toolchain(on_fetch: String) -> impl FnOnce(&Path) -> String {
+    move |dest| {
+        let bin = dest.join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        let cargo = format!(
+            r#"#!/bin/sh
+case $1 in
+  fetch) {on_fetch} ;;
+  build)
+    while [ $# -gt 0 ]; do [ "$1" = --target-dir ] && t=$2; shift; done
+    mkdir -p "$t/release"
+    printf '#!/bin/sh\ncase $1 in --version) echo "dotfiles-manager 0.1.0 (commit %s)" ;; esac\n' "$DFM_BUILD_COMMIT" >"$t/release/dotfiles-manager"
+    chmod 755 "$t/release/dotfiles-manager" ;;
+esac
+"#
+        );
+        fs::write(bin.join("cargo"), cargo).unwrap();
+        fs::write(bin.join("rustc"), "#!/bin/sh\n").unwrap();
+        for f in ["cargo", "rustc"] {
+            fs::set_permissions(bin.join(f), fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        "9.9.9".to_string()
+    }
+}
+
+fn build_dirs_gone(p: &Prepared) -> bool {
+    !p.home.join(".cache/dotfiles-manager/build").exists()
+        && ["cargo-home", "rustup-home", "build-home"]
+            .iter()
+            .all(|d| !p.data.join(d).exists())
+}
+
+#[test]
+fn a_successful_install_with_a_stand_in_cargo_leaves_no_build_directories() {
+    let p = prepare_with("fake-ok", fake_toolchain("exit 0".into()));
+    let o = install(&p, &p.sha, &[]);
+    assert_eq!(o.status.code(), Some(0), "{}", err(&o));
+    assert!(build_dirs_gone(&p));
+    assert!(p.data.join("current").is_symlink());
+}
+
+#[test]
+fn a_failed_fetch_removes_the_build_directory_and_the_build_homes() {
+    // The stand-in fails only when the homes exist, so the cleanup has something to remove.
+    let on_fetch =
+        r#"test -d "$CARGO_HOME" && test -d "$RUSTUP_HOME" && test -d "$HOME" && exit 1; exit 9"#;
+    let p = prepare_with("fake-fetch-fails", fake_toolchain(on_fetch.into()));
+    let o = install(&p, &p.sha, &[]);
+    assert_eq!(o.status.code(), Some(1), "{}", err(&o));
+    assert!(err(&o).contains("cargo fetch failed"), "{}", err(&o));
+    assert!(build_dirs_gone(&p), "the failed build must clean up");
+    assert!(!p.data.join("current").exists());
+}
+
+#[test]
+fn sigint_and_sigterm_during_the_build_clean_up_and_exit_with_the_signal_code() {
+    for (sig, code) in [("INT", 130), ("TERM", 143)] {
+        // cargo is a child of the install shell: it signals its parent, which runs the trap
+        // when the child has ended.
+        let p = prepare_with(
+            "fake-signal",
+            fake_toolchain(format!("kill -{sig} $PPID; exit 1")),
+        );
+        let o = install(&p, &p.sha, &[]);
+        assert_eq!(o.status.code(), Some(code), "{sig}: {}", err(&o));
+        assert!(build_dirs_gone(&p), "{sig}: the build directories stay");
+        assert!(!p.data.join("current").exists(), "{sig}");
+    }
+}
+
+#[test]
+fn a_group_writable_version_directory_stops_install_before_the_binary_is_staged() {
+    let p = prepare_with("fake-version-dir", fake_toolchain("exit 0".into()));
+    let name = format!("0.1.0-{}", &p.sha[..12]);
+    let vdir = p.data.join("versions").join(&name);
+    fs::create_dir_all(&vdir).unwrap();
+    fs::set_permissions(&vdir, fs::Permissions::from_mode(0o775)).unwrap();
+    let o = install(&p, &p.sha, &[]);
+    assert_eq!(o.status.code(), Some(3), "{}", err(&o));
+    assert!(
+        err(&o).contains("E_PREREQ_MISSING") && err(&o).contains("writable by group or others"),
+        "{}",
+        err(&o)
+    );
+    assert!(!p.data.join("current").exists());
+    assert!(!p.home.join(".local/bin/dotfiles-manager").exists());
+    assert!(
+        fs::read_dir(&vdir).unwrap().next().is_none(),
+        "nothing staged"
+    );
+    assert!(build_dirs_gone(&p));
+}
+
+/// After the swap a failed check of one build home leaves that home and removes the others,
+/// and a mode problem in `versions` (which cleanup does not touch) stops nothing.
+#[test]
+fn the_build_directories_are_cleaned_one_by_one_after_the_swap() {
+    let p = prepare_with("fake-per-tree", fake_toolchain("exit 0".into()));
+    let outside = victim(p.tmp.path(), &["cargo-home"]);
+    let hook = p.tmp.path().join("hook.sh");
+    fs::write(
+        &hook,
+        format!(
+            "rm -rf '{0}/cargo-home' && ln -s '{1}' '{0}/cargo-home'\nchmod 775 '{0}/versions'\n",
+            p.data.display(),
+            outside.join("cargo-home").display()
+        ),
+    )
+    .unwrap();
+    let o = install(
+        &p,
+        &p.sha,
+        &[("DFM_TEST_AFTER_SWAP", hook.to_str().unwrap())],
+    );
+    assert_eq!(o.status.code(), Some(1), "{}", err(&o));
+    assert!(
+        err(&o).contains("the swap took effect") && err(&o).contains("cargo-home"),
+        "{}",
+        err(&o)
+    );
+    assert!(
+        !err(&o).contains("rustup-home") && !err(&o).contains("build-home"),
+        "only the bad tree is named: {}",
+        err(&o)
+    );
+    assert!(
+        p.data.join("cargo-home").is_symlink(),
+        "the link is neither followed nor removed"
+    );
+    assert!(!p.data.join("rustup-home").exists() && !p.data.join("build-home").exists());
+    assert!(!p.home.join(".cache/dotfiles-manager/build").exists());
     assert_victim_intact(&outside, &["cargo-home"]);
 }
