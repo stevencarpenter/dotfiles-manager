@@ -525,6 +525,39 @@ fn an_owned_file_edited_after_the_last_check_is_not_replaced_by_the_update() {
 }
 
 #[test]
+fn a_file_swapped_for_an_identical_one_after_the_content_check_is_not_replaced() {
+    // The content check passes for the swapped-in file too. Only the identity of the inode that
+    // was hashed, compared at the owner check, sees that the name now refers to another file.
+    let s = setup();
+    fs::write(s.h.0.join("a"), "old\n").unwrap();
+    own(&s, "a", "old\n");
+    let o = op(&s.h, &s.store, "x@a", 1, Action::UpdateFile, "a");
+    let home_path = s.h.0.clone();
+    let rep = parked(
+        &s,
+        &plan(vec![o]),
+        &gen_for("x@a", "new\n"),
+        &none(),
+        "file-after-hash",
+        move || {
+            fs::write(home_path.join("a.swap"), "old\n").unwrap();
+            fs::rename(home_path.join("a.swap"), home_path.join("a")).unwrap();
+        },
+    );
+    assert_eq!(rep.operations[0].status, Status::Failed);
+    assert_eq!(rep.stopped.as_ref().unwrap().code, Code::Conflict);
+    assert!(
+        rep.stopped
+            .as_ref()
+            .unwrap()
+            .detail
+            .contains("replaced while applying")
+    );
+    assert_eq!(fs::read_to_string(s.h.0.join("a")).unwrap(), "old\n");
+    assert!(leftovers(&s.h.0).is_empty());
+}
+
+#[test]
 fn a_failure_before_the_commit_leaves_no_file_and_no_staged_name() {
     for point in ["file-before-write", "file-after-tmp"] {
         let s = setup();

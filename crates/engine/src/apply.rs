@@ -1433,17 +1433,16 @@ impl Exec<'_, '_> {
         parent: &Dir,
         name: &str,
     ) -> Result<(), Refusal> {
-        match parent.peek(&self.run.sys, name)? {
-            Peek::Link {
-                target, own: true, ..
-            } if Some(target.as_str()) == op.link.as_deref() => Ok(()),
-            _ => Err(Refusal::new(
-                Code::Conflict,
-                format!(
-                    "{abs} is no longer the link the plan found; it is left alone and not adopted"
-                ),
-            )),
+        if parent
+            .peek(&self.run.sys, name)?
+            .is_owned_link_to(op.link.as_deref())
+        {
+            return Ok(());
         }
+        Err(Refusal::new(
+            Code::Conflict,
+            format!("{abs} is no longer the link the plan found; it is left alone and not adopted"),
+        ))
     }
 
     /// Deletes one owned output. Authorization is decided again here, with the ledger read now
@@ -1486,8 +1485,7 @@ impl Exec<'_, '_> {
             _ => {}
         }
         // The identity above names the hashed inode. Its owner is checked beside the unlink.
-        parent.require_owner(name, self.run.sys.uid)?;
-        parent.remove_entry(name, self.run.fail)?;
+        parent.remove_owned(name, self.run.sys.uid, self.run.fail)?;
         Ok(fp)
     }
 

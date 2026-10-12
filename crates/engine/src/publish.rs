@@ -9,8 +9,8 @@
 
 use crate::fail::Fail;
 use crate::fsys::{
-    Dir, Peek, Stamp, Sys, check_name, kind, mode_bits, publish_err, rename_new, sys_err,
-    temp_name, unconfirmed,
+    Dir, Ident, Peek, Stamp, Sys, check_name, ident_of, kind, mode_bits, publish_err, rename_new,
+    sys_err, temp_name, unconfirmed,
 };
 use dfm_model::plan::{file_fingerprint, link_fingerprint};
 use dfm_model::{Code, Refusal};
@@ -192,13 +192,15 @@ impl Dir {
         unconfirmed(fail.hit("link-after-rename").and_then(|()| self.sync()))
     }
 
-    /// Refuses unless the entry `name` exists and `uid` owns it (`fstatat`, no link followed). A
-    /// publisher calls it beside its own content check, so the owner is checked where the entry is
-    /// replaced or removed, not only when the operation started.
-    pub(crate) fn require_owner(&self, name: &str, uid: u32) -> Result<(), Refusal> {
+    /// Refuses unless the entry `name` exists and `uid` owns it (`fstatat`, no link followed), and
+    /// returns the identity of the entry that was examined, so a caller that hashed an inode can
+    /// tell that the owner check saw the same one. A publisher calls it beside its own content
+    /// check, so the owner is checked where the entry is replaced or removed, not only when the
+    /// operation started.
+    pub(crate) fn require_owner(&self, name: &str, uid: u32) -> Result<Ident, Refusal> {
         check_name(name)?;
         match rfs::statat(&self.fd, name, AtFlags::SYMLINK_NOFOLLOW) {
-            Ok(st) if st.st_uid == uid => Ok(()),
+            Ok(st) if st.st_uid == uid => ident_of(&st),
             Ok(_) => Err(conflict(format!(
                 "{} is owned by another user; it is left alone",
                 self.at(name).display()
@@ -209,6 +211,13 @@ impl Dir {
             ))),
             Err(e) => Err(sys_err("stat entry", e)),
         }
+    }
+
+    /// Removes the entry `name` like [`Dir::remove_entry`], after checking that `uid` owns it. The
+    /// owner is checked beside the unlink, not only when the operation started.
+    pub(crate) fn remove_owned(&self, name: &str, uid: u32, fail: &Fail) -> Result<(), Refusal> {
+        self.require_owner(name, uid)?;
+        self.remove_entry(name, fail)
     }
 
     /// Removes the non-directory entry `name`. A link is removed, not followed. A directory is
@@ -278,7 +287,7 @@ impl Dir {
     /// (`O_EXCL`, written, synced), then an exclusive rename (create) or `renameat` (replace). A failure
     /// before the commit point leaves the previous state and removes the staged file. A failure
     /// after it is `E_IO_UNCONFIRMED`. Failure points: `file-before-write`, `file-after-tmp`,
-    /// `file-after-rename`.
+    /// `file-after-hash` (a replace, between the content check and the owner check), `file-after-rename`.
     pub(crate) fn publish_file(
         &self,
         name: &str,
@@ -310,13 +319,23 @@ impl Dir {
                     uid,
                 } => {
                     let live = self.hash_file(name, limit)?;
-                    if live.as_ref().map(|(h, _)| h.as_str()) != Some(expected_sha256) {
+                    fail.hit("file-after-hash")?;
+                    let hashed = match &live {
+                        Some((h, ident)) if h == expected_sha256 => *ident,
+                        _ => {
+                            return Err(conflict(format!(
+                                "{} changed while applying; it is left alone",
+                                self.at(name).display()
+                            )));
+                        }
+                    };
+                    // The owner check must see the inode that was hashed.
+                    if self.require_owner(name, uid)? != hashed {
                         return Err(conflict(format!(
-                            "{} changed while applying; it is left alone",
+                            "{} was replaced while applying; it is left alone",
                             self.at(name).display()
                         )));
                     }
-                    self.require_owner(name, uid)?;
                     rfs::renameat(&self.fd, &tmp, &self.fd, name).map_err(|e| sys_err("rename", e))
                 }
                 Publish::ReplaceStamp(want) => {
@@ -400,6 +419,25 @@ mod tests {
         dir.publish_file("f", b"new", 0o600, replace(uid), 1024, &fail)
             .unwrap();
         assert_eq!(std::fs::read(home.join("f")).unwrap(), b"new");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn an_entry_of_another_owner_is_not_removed() {
+        let home = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .join(format!("dfm-publish-remove-owner-{}", std::process::id()));
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(home.join("f"), "old").unwrap();
+        let uid = std::fs::metadata(&home).unwrap().uid();
+        let dir = Dir::open_home(&Sys { uid }, &home).unwrap();
+        let e = dir.remove_owned("f", uid + 1, &Fail::none()).unwrap_err();
+        assert_eq!(e.code, Code::Conflict);
+        assert!(e.detail.contains("owned by another user"), "{}", e.detail);
+        assert!(home.join("f").exists(), "the entry is kept");
+        dir.remove_owned("f", uid, &Fail::none()).unwrap();
+        assert!(!home.join("f").exists());
         let _ = std::fs::remove_dir_all(&home);
     }
 
