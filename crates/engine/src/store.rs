@@ -544,6 +544,24 @@ impl Store {
         Ok(u64::try_from(self.read_doc("journal.jsonl")?.len()).unwrap_or(u64::MAX))
     }
 
+    /// An upper bound on the entries that settling earlier work will append: one for each open
+    /// intent, one for each open `unknown` entry that has an intent record, and one for the repair
+    /// of a torn final line. An `unknown` entry with no intent record is never closed, so it
+    /// appends nothing and reserves nothing. An entry whose probe stays unclear is still counted,
+    /// because the probe result is not known before the run.
+    /// A torn final line is skipped here, not an error, because the repair cuts it first.
+    pub fn settlement_entries(&self) -> Result<usize, Refusal> {
+        let bytes = self.read_doc("journal.jsonl")?;
+        let keep = bytes.iter().rposition(|b| *b == b'\n').map_or(0, |i| i + 1);
+        let entries = state::parse_journal(&bytes[..keep])?;
+        Ok(state::unfinished(&entries).len()
+            + state::unresolved(&entries)
+                .iter()
+                .filter(|u| u.intent.is_some())
+                .count()
+            + usize::from(keep < bytes.len()))
+    }
+
     pub fn read_journal(&self) -> Result<Vec<JournalEntry>, Refusal> {
         let entries = self.read_journal_lenient()?;
         for e in &entries {

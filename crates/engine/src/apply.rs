@@ -471,9 +471,14 @@ pub fn check_allowances(
 }
 
 /// Refuses before any write when the journal could not take this run's entries. `journal_len`
-/// is the stored size of `journal.jsonl`. Journal rotation is not built (DFM-19), so a full
-/// journal stops every mutating run.
-pub fn check_journal_capacity(journal_len: u64, plan: &Plan) -> Result<(), Refusal> {
+/// is the stored size of `journal.jsonl`. `settling` is [`Store::settlement_entries`]: settling
+/// earlier work appends one entry each before the plan runs, and the room for them is reserved
+/// as well. Journal rotation is not built (DFM-19), so a full journal stops every mutating run.
+pub fn check_journal_capacity(
+    journal_len: u64,
+    settling: usize,
+    plan: &Plan,
+) -> Result<(), Refusal> {
     let journaled = plan
         .operations
         .iter()
@@ -482,14 +487,14 @@ pub fn check_journal_capacity(journal_len: u64, plan: &Plan) -> Result<(), Refus
                 || (o.status == PlanStatus::Current && o.action == Action::Remove)
         })
         .count();
-    let need = u64::try_from(journaled)
+    let need = u64::try_from(journaled.saturating_add(settling))
         .unwrap_or(u64::MAX)
         .saturating_mul(JOURNAL_BYTES_PER_OPERATION);
     if journal_len.saturating_add(need) > dfm_model::state::MAX_JOURNAL_BYTES {
         return Err(Refusal::new(
             Code::LimitExceeded,
             format!(
-                "the journal ({journal_len} bytes) cannot take the entries of {journaled} operations without passing {} bytes. Nothing was changed. Journal rotation is not built (DFM-19)",
+                "the journal ({journal_len} bytes) cannot take the entries of {journaled} operations and {settling} entries of earlier work to settle without passing {} bytes. Nothing was changed. Journal rotation is not built (DFM-19)",
                 dfm_model::state::MAX_JOURNAL_BYTES
             ),
         ));
@@ -840,6 +845,19 @@ impl Exec<'_, '_> {
         let live = parent.peek(&self.run.sys, name).map_err(failed)?;
         let appeared = |what: &str| blocked(Code::Conflict, format!("{rel} {what}"));
         match (op.action, &live) {
+            // The planner blocks a leaf of another user. A leaf swapped in after the plan is
+            // caught here, because the prerequisites compare no owner.
+            (
+                Action::ReplaceLink | Action::UpdateFile | Action::Remove | Action::Adopt,
+                Peek::File { own: false, .. }
+                | Peek::Link { own: false, .. }
+                | Peek::Other { own: false, .. },
+            ) => {
+                return Err(blocked(
+                    Code::PrivilegeUnsupported,
+                    format!("{rel} is owned by another user; a HOME adapter never escalates"),
+                ));
+            }
             (Action::CreateDir | Action::CreateLink | Action::CreateFile, Peek::Missing) => {}
             (Action::CreateDir | Action::CreateLink | Action::CreateFile, _) => {
                 return Err(appeared(
@@ -1352,13 +1370,15 @@ impl Exec<'_, '_> {
                 name,
                 op.link.as_deref().unwrap_or_default(),
                 ledger_fp.unwrap_or_default(),
+                sys.uid,
                 fail,
             )?,
             Action::CreateFile | Action::UpdateFile => {
                 let how = match ledger_fp {
-                    Some(h) if op.action == Action::UpdateFile => {
-                        Publish::Replace { expected_sha256: h }
-                    }
+                    Some(h) if op.action == Action::UpdateFile => Publish::Replace {
+                        expected_sha256: h,
+                        uid: sys.uid,
+                    },
                     _ => Publish::Create,
                 };
                 parent.publish_file(
@@ -1413,15 +1433,16 @@ impl Exec<'_, '_> {
         parent: &Dir,
         name: &str,
     ) -> Result<(), Refusal> {
-        match parent.peek(&self.run.sys, name)? {
-            Peek::Link { target, .. } if Some(target.as_str()) == op.link.as_deref() => Ok(()),
-            _ => Err(Refusal::new(
-                Code::Conflict,
-                format!(
-                    "{abs} is no longer the link the plan found; it is left alone and not adopted"
-                ),
-            )),
+        if parent
+            .peek(&self.run.sys, name)?
+            .is_owned_link_to(op.link.as_deref())
+        {
+            return Ok(());
         }
+        Err(Refusal::new(
+            Code::Conflict,
+            format!("{abs} is no longer the link the plan found; it is left alone and not adopted"),
+        ))
     }
 
     /// Deletes one owned output. Authorization is decided again here, with the ledger read now
@@ -1463,7 +1484,8 @@ impl Exec<'_, '_> {
             },
             _ => {}
         }
-        parent.remove_entry(name, self.run.fail)?;
+        // The identity above names the hashed inode. Its owner is checked beside the unlink.
+        parent.remove_owned(name, self.run.sys.uid, self.run.fail)?;
         Ok(fp)
     }
 
@@ -1662,7 +1684,11 @@ pub fn apply(run: &Run<'_>, plan: &Plan) -> Result<Report, Refusal> {
         return Err(r);
     }
     check_allowances(&g, run.allow, run.allow_adopt).map_err(|mut all| all.remove(0))?;
-    check_journal_capacity(run.store.journal_len()?, plan)?;
+    check_journal_capacity(
+        run.store.journal_len()?,
+        run.store.settlement_entries()?,
+        plan,
+    )?;
     Ok(execute(run, plan))
 }
 

@@ -500,6 +500,16 @@ fn a_removed_managed_field_is_also_a_foreign_edit() {
 
 /// Starts `apply` parked at `point`, runs `during` while it waits, then releases it.
 fn parked_apply(fx: &Fx, point: &str, digest: &str, during: impl FnOnce(&Fx)) -> Output {
+    parked_command(
+        fx,
+        point,
+        &["apply", "--root", fx.root_arg(), "--yes-plan", digest],
+        during,
+    )
+}
+
+/// Starts a command parked at `point`, runs `during` while it waits, then releases it.
+fn parked_command(fx: &Fx, point: &str, args: &[&str], during: impl FnOnce(&Fx)) -> Output {
     let gate = fx.home.path().parent().unwrap().join(format!(
         "gate-{}-{:?}",
         std::process::id(),
@@ -513,7 +523,7 @@ fn parked_apply(fx: &Fx, point: &str, digest: &str, during: impl FnOnce(&Fx)) ->
         .env("DFM_FAILPOINT", format!("{point}:wait-{}", gate.display()))
         .arg("--home")
         .arg(fx.home.path())
-        .args(["apply", "--root", fx.root_arg(), "--yes-plan", digest])
+        .args(args)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -2288,6 +2298,120 @@ fn bind_with_a_missing_salt_and_an_unreadable_ledger_refuses_and_creates_no_salt
     assert_eq!(code(&o), 3, "{}\n{}", stderr(&o), text(&o.stdout));
     assert!(stderr(&o).contains("E_STATE_INVALID"), "{}", stderr(&o));
     assert!(!salt.exists());
+}
+
+#[test]
+fn bind_with_an_unusable_salt_refuses_instead_of_reporting_already_bound() {
+    use std::os::unix::fs::symlink;
+    type Damage = fn(&Path);
+    let damages: [(&str, Damage); 3] = [
+        ("mode", |p| {
+            fs::set_permissions(p, fs::Permissions::from_mode(0o644)).unwrap()
+        }),
+        ("size", |p| fs::write(p, [7u8; 16]).unwrap()),
+        ("link", |p| {
+            let real = p.with_file_name("salt-real");
+            fs::rename(p, &real).unwrap();
+            symlink(&real, p).unwrap();
+        }),
+    ];
+    for (what, damage) in damages {
+        let fx = Fx::base();
+        assert_eq!(code(&fx.apply()), 0);
+        let salt = fx.state().join("salt");
+        damage(&salt);
+        let before = (
+            fs::symlink_metadata(&salt).unwrap().file_type(),
+            fs::read(&salt).unwrap(),
+        );
+        let p = fx.root.join("profiles/t-01.toml");
+        let o = fx.run(&[
+            "bind",
+            "--profile",
+            p.to_str().unwrap(),
+            "--machine-id",
+            "m5-test",
+        ]);
+        assert_eq!(code(&o), 3, "{what}: {}\n{}", stderr(&o), text(&o.stdout));
+        assert!(
+            stderr(&o).contains("E_STORAGE_INVALID"),
+            "{what}: {}",
+            stderr(&o)
+        );
+        assert!(
+            stderr(&o).contains("state/salt is unusable"),
+            "{what}: {}",
+            stderr(&o)
+        );
+        assert!(!text(&o.stdout).contains("already bound"), "{what}");
+        let after = (
+            fs::symlink_metadata(&salt).unwrap().file_type(),
+            fs::read(&salt).unwrap(),
+        );
+        assert_eq!(before, after, "{what}: the salt is unchanged");
+    }
+}
+
+#[test]
+fn bind_with_an_unusable_salt_and_no_binding_file_publishes_no_binding() {
+    let fx = Fx::base();
+    assert_eq!(code(&fx.apply()), 0);
+    // State exists but the binding was never published (or was moved aside).
+    let binding = fx.h(".config/dotfiles-manager/machine.toml");
+    fs::remove_file(&binding).unwrap();
+    let salt = fx.state().join("salt");
+    fs::set_permissions(&salt, fs::Permissions::from_mode(0o644)).unwrap();
+    let p = fx.root.join("profiles/t-01.toml");
+    let o = fx.run(&[
+        "bind",
+        "--profile",
+        p.to_str().unwrap(),
+        "--machine-id",
+        "m5-test",
+    ]);
+    assert_eq!(code(&o), 3, "{}\n{}", stderr(&o), text(&o.stdout));
+    assert!(
+        stderr(&o).contains("state/salt is unusable"),
+        "{}",
+        stderr(&o)
+    );
+    assert!(!binding.exists(), "no binding was published");
+    assert_eq!(
+        fs::metadata(&salt).unwrap().permissions().mode() & 0o777,
+        0o644,
+        "the salt is unchanged"
+    );
+}
+
+#[test]
+fn bind_refuses_a_salt_damaged_between_its_two_phases_and_publishes_no_binding() {
+    let fx = Fx::base();
+    assert_eq!(code(&fx.apply()), 0);
+    let binding = fx.h(".config/dotfiles-manager/machine.toml");
+    fs::remove_file(&binding).unwrap();
+    let salt = fx.state().join("salt");
+    let p = fx.root.join("profiles/t-01.toml");
+    // Phase 1 sees a usable salt. The damage lands while phase 2 holds the lock.
+    let o = parked_command(
+        &fx,
+        "bind-after-lock",
+        &[
+            "bind",
+            "--profile",
+            p.to_str().unwrap(),
+            "--machine-id",
+            "m5-test",
+        ],
+        |_| fs::set_permissions(&salt, fs::Permissions::from_mode(0o644)).unwrap(),
+    );
+    let err = String::from_utf8_lossy(&o.stderr);
+    assert!(err.contains("state/salt is unusable"), "{err}");
+    assert!(!binding.exists(), "no binding was published");
+    assert_eq!(
+        fs::metadata(&salt).unwrap().permissions().mode() & 0o777,
+        0o644,
+        "the salt is unchanged"
+    );
 }
 
 // ---- review fixes (DFM-57) ---------------------------------------------------------------

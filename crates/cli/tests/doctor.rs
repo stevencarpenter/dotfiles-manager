@@ -974,6 +974,7 @@ fn the_lock_row_handles_every_kind_of_lock_file() {
     assert!(!lock.exists());
     // An empty file has no note.
     fs::write(&lock, "").unwrap();
+    fs::set_permissions(&lock, fs::Permissions::from_mode(0o600)).unwrap();
     let r = lock_of(&fx);
     assert_eq!(r["status"], "OK");
     assert!(r["detail"].as_str().unwrap().contains("no holder note"));
@@ -1023,6 +1024,78 @@ fn the_lock_row_handles_every_kind_of_lock_file() {
         (Some("WARN"), Some("E_STORAGE_INVALID")),
         "{r:#?}"
     );
+}
+
+#[test]
+fn the_lock_row_warns_on_a_mode_or_link_count_that_the_writer_lock_refuses() {
+    let fx = applied();
+    let lock = fx.h(".local/state/dotfiles-manager.lock");
+    let digest = {
+        let o = fx.run(&["plan", "--root", fx.root_arg(), "--json"]);
+        dfm_model::plan::Saved::parse(&o.stdout)
+            .unwrap()
+            .plan_digest
+    };
+    let warns = |detail: &str| {
+        let r = lock_of(&fx);
+        assert_eq!(
+            (r["status"].as_str(), r["code"].as_str()),
+            (Some("WARN"), Some("E_STORAGE_INVALID")),
+            "{r:#?}"
+        );
+        assert!(r["detail"].as_str().unwrap().contains(detail), "{r:#?}");
+    };
+    // A mode with group bits: doctor warns and the writer lock refuses.
+    fs::set_permissions(&lock, fs::Permissions::from_mode(0o644)).unwrap();
+    warns("mode is 644");
+    let before = fingerprint(fx.home.path());
+    let o = fx.run(&["apply", "--root", fx.root_arg(), "--yes-plan", &digest]);
+    assert_eq!(code(&o), 3, "{}", text(&o.stderr));
+    assert!(
+        text(&o.stderr).contains("E_STORAGE_INVALID"),
+        "{}",
+        text(&o.stderr)
+    );
+    assert_eq!(
+        fingerprint(fx.home.path()),
+        before,
+        "doctor and the refusal must not write"
+    );
+    fs::set_permissions(&lock, fs::Permissions::from_mode(0o600)).unwrap();
+    // A second hard link.
+    let second = fx.h(".local/state/second-name");
+    fs::hard_link(&lock, &second).unwrap();
+    warns("hard link");
+    let o = fx.run(&["apply", "--root", fx.root_arg(), "--yes-plan", &digest]);
+    assert_eq!(code(&o), 3, "{}", text(&o.stderr));
+    assert!(
+        text(&o.stderr).contains("E_STORAGE_INVALID") && text(&o.stderr).contains("hard link"),
+        "{}",
+        text(&o.stderr)
+    );
+    fs::remove_file(&second).unwrap();
+    // A mode with owner bits only is refused too: the writer lock opens the file read-write
+    // before it can tighten it, so 0400, 0200 and 0000 fail at the open.
+    // Doctor reads the file, so it names the mode only where it can open the file.
+    for (mode, detail) in [
+        (0o400, "mode is 400"),
+        (0o200, "cannot open"),
+        (0o000, "cannot open"),
+    ] {
+        fs::set_permissions(&lock, fs::Permissions::from_mode(mode)).unwrap();
+        warns(detail);
+        let before = fingerprint(fx.home.path());
+        let o = fx.run(&["apply", "--root", fx.root_arg(), "--yes-plan", &digest]);
+        assert_eq!(code(&o), 3, "{mode:o}: {}", text(&o.stderr));
+        assert!(
+            text(&o.stderr).contains("E_STORAGE_INVALID"),
+            "{mode:o}: {}",
+            text(&o.stderr)
+        );
+        assert_eq!(fingerprint(fx.home.path()), before, "{mode:o}");
+    }
+    fs::set_permissions(&lock, fs::Permissions::from_mode(0o600)).unwrap();
+    assert_eq!(lock_of(&fx)["status"], "OK");
 }
 
 // ---- docs -----------------------------------------------------------------------------------

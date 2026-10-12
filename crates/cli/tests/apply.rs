@@ -1504,6 +1504,65 @@ fn a_full_journal_refuses_a_preview_and_a_run_before_any_write() {
 }
 
 #[test]
+fn a_journal_with_open_work_refuses_a_preview_when_settling_would_not_fit() {
+    use dfm_model::state::{Class, JournalEntry, Phase, Recovery, RecoveryOutput};
+    let fx = Fx::new();
+    let o = fx.run(&["plan", "--root", fx.root_arg(), "--json"]);
+    let planned = Saved::parse(&o.stdout)
+        .unwrap()
+        .plan
+        .operations
+        .iter()
+        .filter(|o| o.status == dfm_model::plan::Status::Planned)
+        .count();
+    let entry = |op_id: &str, phase, recovery| JournalEntry {
+        schema: 1,
+        op_id: op_id.into(),
+        op: "create-link".into(),
+        phase,
+        at: "2026-10-10T00:00:00Z".into(),
+        resource: "r".into(),
+        adapter: "fs-link/v1".into(),
+        class: Class::Normal,
+        recovery,
+        token: None,
+        reason: None,
+    };
+    let done = entry("p1-1", Phase::Done, None).to_line().unwrap();
+    let open = entry(
+        "p1-2",
+        Phase::Intent,
+        Some(Recovery {
+            outputs: vec![RecoveryOutput {
+                path: fx.h(".zshrc").to_str().unwrap().into(),
+                existed_before: false,
+                expected_sha256: None,
+            }],
+            snapshot: None,
+        }),
+    )
+    .to_line()
+    .unwrap();
+    // The plan fits, with 1 KiB to spare, only while nothing is open.
+    let room = dfm_model::state::MAX_JOURNAL_BYTES as usize - planned * 4096 - 1024 - open.len();
+    let path = fx.state().join("journal.jsonl");
+    let mut bytes = done.repeat(room / done.len());
+    fs::write(&path, &bytes).unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+    let o = fx.run(&["apply", "--root", fx.root_arg(), "--preview"]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    bytes.extend_from_slice(&open);
+    fs::write(&path, &bytes).unwrap();
+    let before = fingerprint(fx.home.path());
+    let o = fx.run(&["apply", "--root", fx.root_arg(), "--preview"]);
+    assert_eq!(code(&o), 3, "{}", stderr(&o));
+    assert!(stderr(&o).contains("E_LIMIT_EXCEEDED"), "{}", stderr(&o));
+    assert!(stderr(&o).contains("earlier work"), "{}", stderr(&o));
+    assert_eq!(fingerprint(fx.home.path()), before);
+    assert_eq!(fs::read(&path).unwrap(), bytes, "the journal is unchanged");
+}
+
+#[test]
 fn a_self_looping_parent_of_one_owned_output_blocks_only_that_entry() {
     let fx = Fx::new();
     assert_eq!(code(&fx.apply(&[])), 0);

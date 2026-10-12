@@ -525,6 +525,39 @@ fn an_owned_file_edited_after_the_last_check_is_not_replaced_by_the_update() {
 }
 
 #[test]
+fn a_file_swapped_for_an_identical_one_after_the_content_check_is_not_replaced() {
+    // The content check passes for the swapped-in file too. Only the identity of the inode that
+    // was hashed, compared at the owner check, sees that the name now refers to another file.
+    let s = setup();
+    fs::write(s.h.0.join("a"), "old\n").unwrap();
+    own(&s, "a", "old\n");
+    let o = op(&s.h, &s.store, "x@a", 1, Action::UpdateFile, "a");
+    let home_path = s.h.0.clone();
+    let rep = parked(
+        &s,
+        &plan(vec![o]),
+        &gen_for("x@a", "new\n"),
+        &none(),
+        "file-after-hash",
+        move || {
+            fs::write(home_path.join("a.swap"), "old\n").unwrap();
+            fs::rename(home_path.join("a.swap"), home_path.join("a")).unwrap();
+        },
+    );
+    assert_eq!(rep.operations[0].status, Status::Failed);
+    assert_eq!(rep.stopped.as_ref().unwrap().code, Code::Conflict);
+    assert!(
+        rep.stopped
+            .as_ref()
+            .unwrap()
+            .detail
+            .contains("replaced while applying")
+    );
+    assert_eq!(fs::read_to_string(s.h.0.join("a")).unwrap(), "old\n");
+    assert!(leftovers(&s.h.0).is_empty());
+}
+
+#[test]
 fn a_failure_before_the_commit_leaves_no_file_and_no_staged_name() {
     for point in ["file-before-write", "file-after-tmp"] {
         let s = setup();
@@ -866,6 +899,7 @@ fn a_replaced_link_is_compared_with_the_ledger_fingerprint_not_the_earlier_peek(
             "l",
             "/src/new",
             &link_fingerprint("/src/old"),
+            sys(&s.h).uid,
             &Fail::none(),
         )
         .unwrap_err();
@@ -880,6 +914,7 @@ fn a_replaced_link_is_compared_with_the_ledger_fingerprint_not_the_earlier_peek(
         "l",
         "/src/new",
         &link_fingerprint("/src/other"),
+        sys(&s.h).uid,
         &Fail::none(),
     )
     .unwrap();
@@ -887,6 +922,30 @@ fn a_replaced_link_is_compared_with_the_ledger_fingerprint_not_the_earlier_peek(
         fs::read_link(s.h.0.join("l")).unwrap(),
         Path::new("/src/new")
     );
+}
+
+#[test]
+fn replacing_a_link_checks_its_owner_where_it_is_replaced() {
+    let s = setup();
+    symlink("/src/old", s.h.0.join("l")).unwrap();
+    let home = Dir::open_home(&sys(&s.h), &s.h.0).unwrap();
+    // The ledger fingerprint matches, so only the owner differs.
+    let e = home
+        .replace_link(
+            "l",
+            "/src/new",
+            &link_fingerprint("/src/old"),
+            sys(&s.h).uid + 1,
+            &Fail::none(),
+        )
+        .unwrap_err();
+    assert_eq!(e.code, Code::Conflict);
+    assert!(e.detail.contains("owned by another user"), "{}", e.detail);
+    assert_eq!(
+        fs::read_link(s.h.0.join("l")).unwrap(),
+        Path::new("/src/old")
+    );
+    assert!(leftovers(&s.h.0).is_empty());
 }
 
 #[test]
@@ -1193,6 +1252,87 @@ fn a_full_journal_refuses_before_any_write() {
     assert!(!s.h.0.join("a").exists());
 }
 
+/// Writes a journal of `done` lines, then `tail`, whose size leaves room for one operation
+/// (4096 bytes) but not for the entries that settling `tail` adds. Returns the bytes written.
+fn near_cap_journal(s: &Setup, tail: &[u8]) -> Vec<u8> {
+    let e = JournalEntry {
+        phase: Phase::Done,
+        recovery: None,
+        ..intent("create-link", &s.h.0.join("z").to_string_lossy())
+    };
+    let line = e.to_line().unwrap();
+    let room = dfm_model::state::MAX_JOURNAL_BYTES as usize - 4096 - 1024 - tail.len();
+    let mut bytes = line.repeat(room / line.len());
+    bytes.extend_from_slice(tail);
+    let path =
+        s.h.0
+            .join(".local/state/dotfiles-manager/state/journal.jsonl");
+    fs::write(&path, &bytes).unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+    bytes
+}
+
+#[test]
+fn the_journal_gate_reserves_room_for_settling_earlier_work() {
+    let open = |phase| {
+        let mut e = intent("create-other", "/z/other");
+        e.phase = phase;
+        if phase == Phase::Unknown {
+            e.recovery = None;
+            e.reason = Some("unconfirmed: x".into());
+        }
+        e.to_line().unwrap()
+    };
+    // An `unknown` entry settling can close has its intent record before it.
+    let paired = [open(Phase::Intent), open(Phase::Unknown)].concat();
+    let torn = b"{\"schema\":1,\"op_id\":\"tor".to_vec();
+    let cases: [(&str, Vec<u8>); 3] = [
+        ("an open intent", open(Phase::Intent)),
+        ("an open unknown entry with its intent", paired),
+        ("a torn final line", torn),
+    ];
+    for (what, tail) in cases {
+        let s = setup();
+        let before = near_cap_journal(&s, &tail);
+        let path =
+            s.h.0
+                .join(".local/state/dotfiles-manager/state/journal.jsonl");
+        let o = op(&s.h, &s.store, "x@a", 1, Action::CreateFile, "a");
+        let err = refused(&s, &plan(vec![o]), &gen_for("x@a", "x"), &none());
+        assert_eq!(err.code, Code::LimitExceeded, "{what}: {err:?}");
+        assert!(
+            err.detail.contains("earlier work"),
+            "{what}: {}",
+            err.detail
+        );
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            before,
+            "{what}: nothing was appended"
+        );
+        assert!(!s.h.0.join("a").exists(), "{what}");
+    }
+    // The same size with nothing to settle still applies.
+    let s = setup();
+    near_cap_journal(&s, b"");
+    let o = op(&s.h, &s.store, "x@a", 1, Action::CreateFile, "a");
+    let rep = go(&s, &plan(vec![o]), &gen_for("x@a", "x"), &none());
+    assert_eq!(rep.operations[0].status, Status::Updated);
+    assert!(s.h.0.join("a").exists());
+    // An `unknown` entry with no intent record is never closed, so it reserves nothing.
+    let s = setup();
+    let mut stray = intent("create-other", "/z/other");
+    stray.phase = Phase::Unknown;
+    stray.resource = "other.y".into();
+    stray.recovery = None;
+    stray.reason = Some("unconfirmed: x".into());
+    near_cap_journal(&s, &stray.to_line().unwrap());
+    let o = op(&s.h, &s.store, "x@a", 1, Action::CreateFile, "a");
+    let rep = go(&s, &plan(vec![o]), &gen_for("x@a", "x"), &none());
+    assert_eq!(rep.operations[0].status, Status::Updated);
+    assert!(s.h.0.join("a").exists());
+}
+
 #[test]
 fn a_failure_while_settling_earlier_work_still_returns_a_report() {
     // An earlier run left an intent entry. Writing its outcome fails. The run stops before its
@@ -1315,6 +1455,92 @@ fn a_stale_entry_whose_ledger_write_is_unconfirmed_is_unknown() {
     let rep = go(&s, &p, &NoGenerator, &none());
     assert_eq!(rep.operations[0].status, Status::Unknown);
     assert_eq!(rep.stopped.as_ref().unwrap().code, Code::IoUnconfirmed);
+}
+
+// ---- leaf ownership (DFM-58) ------------------------------------------------------------
+
+/// The planner blocks a leaf of another user, but the prerequisites compare no owner. A leaf that
+/// is swapped in after the plan must still be refused. A real foreign owner needs root, so the
+/// run's uid is shifted: `peek` then reports `own: false` while mode, content and target match.
+#[test]
+fn a_leaf_owned_by_another_user_is_blocked_before_any_journal_entry() {
+    type Prep = fn(&Setup) -> Operation;
+    let cases: [(&str, Prep); 4] = [
+        ("replace_link", |s| {
+            symlink("/src/old", s.h.0.join("l")).unwrap();
+            own_fp(s, "l", &link_fingerprint("/src/old"));
+            let mut o = op(&s.h, &s.store, "x@l", 1, Action::ReplaceLink, "l");
+            o.link = Some("/src/new".into());
+            o
+        }),
+        ("update_file", |s| {
+            fs::write(s.h.0.join("l"), "old\n").unwrap();
+            own(s, "l", "old\n");
+            op(&s.h, &s.store, "x@l", 1, Action::UpdateFile, "l")
+        }),
+        ("remove", |s| {
+            fs::write(s.h.0.join("l"), "old\n").unwrap();
+            own(s, "l", "old\n");
+            op(&s.h, &s.store, "x@l", 1, Action::Remove, "l")
+        }),
+        ("adopt", adopt_op),
+    ];
+    for (what, prep) in cases {
+        for shifted in [true, false] {
+            let s = setup();
+            let o = prep(&s);
+            let p = fill(&plan(vec![o]), &gen_for("x@l", "new\n"));
+            let ledger = s.store.read_ledger().unwrap();
+            let journal = s.store.read_journal().unwrap().len();
+            let before = fs::symlink_metadata(s.h.0.join("l")).unwrap().ino();
+            let home = Dir::open_home(&sys(&s.h), &s.h.0).unwrap();
+            let g = gen_for("x@l", "new\n");
+            let id = p.operations[0].id.clone();
+            let (allow, adopt) = match what {
+                "remove" => (ids(&[&id]), none()),
+                "adopt" => (none(), ids(&[&id])),
+                _ => (none(), none()),
+            };
+            let nofail = Fail::none();
+            let mut r = run(&s, &g, &allow, &nofail, &home);
+            r.allow_adopt = &adopt;
+            if shifted {
+                r.sys.uid += 1;
+            }
+            let rep = apply(&r, &p).unwrap();
+            let st = rep.operations[0].status;
+            if !shifted {
+                // The control: with the real owner the same plan applies.
+                assert_eq!(st, Status::Updated, "{what}: {:?}", rep.stopped);
+                continue;
+            }
+            assert_eq!(st, Status::Blocked, "{what}: {:?}", rep.stopped);
+            let stopped = rep
+                .stopped
+                .as_ref()
+                .unwrap_or_else(|| panic!("{what}: no stop"));
+            assert_eq!(
+                stopped.code,
+                Code::PrivilegeUnsupported,
+                "{what}: {stopped:?}"
+            );
+            assert_eq!(
+                fs::symlink_metadata(s.h.0.join("l")).unwrap().ino(),
+                before,
+                "{what}: the leaf is untouched"
+            );
+            assert_eq!(
+                s.store.read_journal().unwrap().len(),
+                journal,
+                "{what}: no journal entry"
+            );
+            assert_eq!(
+                s.store.read_ledger().unwrap(),
+                ledger,
+                "{what}: the ledger is unchanged"
+            );
+        }
+    }
 }
 
 // ---- adoption (DFM-45) ------------------------------------------------------------------

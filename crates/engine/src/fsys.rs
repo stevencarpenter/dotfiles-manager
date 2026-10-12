@@ -297,6 +297,13 @@ pub enum Peek {
     Unknown(String),
 }
 
+impl Peek {
+    /// Whether this is a link owned by the current user whose text is exactly `want`.
+    pub(crate) fn is_owned_link_to(&self, want: Option<&str>) -> bool {
+        matches!(self, Peek::Link { target, own: true, .. } if Some(target.as_str()) == want)
+    }
+}
+
 /// What a link resolves to when followed once.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PeekTo {
@@ -1259,6 +1266,20 @@ mod tests {
         fn flush(&mut self) -> std::io::Result<()> {
             Ok(())
         }
+    }
+
+    #[test]
+    fn only_a_link_of_the_current_user_with_the_planned_text_is_the_adopted_link() {
+        let link = |target: &str, own| Peek::Link {
+            target: target.into(),
+            to: PeekTo::File,
+            own,
+        };
+        assert!(link("/src/x", true).is_owned_link_to(Some("/src/x")));
+        assert!(!link("/src/x", false).is_owned_link_to(Some("/src/x")));
+        assert!(!link("/src/y", true).is_owned_link_to(Some("/src/x")));
+        assert!(!link("/src/x", true).is_owned_link_to(None));
+        assert!(!Peek::Missing.is_owned_link_to(Some("/src/x")));
     }
 
     #[test]

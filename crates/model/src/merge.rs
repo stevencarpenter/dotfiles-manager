@@ -949,7 +949,7 @@ pub fn merge_with(
         }
     }
     tidy(&mut doc, &touched);
-    let mut entries = Vec::new();
+    let mut entries: Vec<OwnedEntry> = Vec::new();
     for h in &desired.handlers {
         let hooks = match doc
             .entry("hooks")
@@ -985,7 +985,12 @@ pub fn merge_with(
         let was_owned = owned
             .iter()
             .any(|o| o.id == h.id && o.key == h.event && o.sha256 == h.sha256);
-        if added || exact && (was_owned || takeover) {
+        // One record per (event, entry hash): handlers with the same content share one live copy,
+        // and a repeated record would let a retire remove a user's identical copy as well.
+        let recorded = entries
+            .iter()
+            .any(|e| e.key == h.event && e.sha256 == h.sha256);
+        if (added || exact && (was_owned || takeover)) && !recorded {
             entries.push(OwnedEntry {
                 id: h.id.clone(),
                 key: h.event.clone(),
@@ -1408,6 +1413,31 @@ argv = ["audit", "--quiet", "two words"]
         assert!(plain.entries.is_empty(), "the user's copy stays the user's");
         let taken = merge_with(Some(&first.bytes), &desired(BASE), &[], &[], true).unwrap();
         assert_eq!(taken.entries, first.entries);
+    }
+
+    #[test]
+    fn handlers_with_the_same_content_share_one_record_and_retire_keeps_a_user_copy() {
+        let two = format!(
+            "{BASE}[handlers.audit2]\nevent = \"PreToolUse\"\ntype = \"command\"\nargv = [\"audit\", \"--quiet\", \"two words\"]\n"
+        );
+        let first = merge(None, &desired(BASE), &[]).unwrap();
+        let taken = merge_with(Some(&first.bytes), &desired(&two), &[], &[], true).unwrap();
+        assert_eq!(taken.entries.len(), 1, "{:?}", taken.entries);
+        // The user later adds an identical second copy: retire removes one element only.
+        let mut live = json(&taken.bytes);
+        let copy = live["hooks"]["PreToolUse"][0].clone();
+        live["hooks"]["PreToolUse"]
+            .as_array_mut()
+            .unwrap()
+            .push(copy);
+        let (bytes, _) = retire(&serde_json::to_vec(&live).unwrap(), &taken.entries, &[]).unwrap();
+        assert_eq!(
+            json(&bytes)["hooks"]["PreToolUse"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     #[test]

@@ -393,6 +393,21 @@ impl Ledger {
                             o.path
                         )));
                     }
+                    // Retire removes one live element for each record, so a repeated record would
+                    // also remove a user's identical copy.
+                    let mut hooks = BTreeSet::new();
+                    let mut items = BTreeSet::new();
+                    if !c.entries.iter().all(|e| hooks.insert((&e.key, &e.sha256)))
+                        || !c
+                            .appended
+                            .iter()
+                            .all(|a| items.insert((&a.pointer, &a.sha256)))
+                    {
+                        return Err(bad(format!(
+                            "ledger co-owned record for {} repeats a hook or appended record",
+                            o.path
+                        )));
+                    }
                 }
             }
         }
@@ -1653,6 +1668,25 @@ mod tests {
                     sha256: "short".into(),
                     ..good.appended[0].clone()
                 }],
+                ..good.clone()
+            },
+            // A repeated (key, sha256) or (pointer, sha256), with the same or another id.
+            CoOwned {
+                entries: vec![good.entries[0].clone(), good.entries[0].clone()],
+                ..good.clone()
+            },
+            CoOwned {
+                entries: vec![
+                    good.entries[0].clone(),
+                    OwnedEntry {
+                        id: "other".into(),
+                        ..good.entries[0].clone()
+                    },
+                ],
+                ..good.clone()
+            },
+            CoOwned {
+                appended: vec![good.appended[0].clone(), good.appended[0].clone()],
                 ..good.clone()
             },
         ] {

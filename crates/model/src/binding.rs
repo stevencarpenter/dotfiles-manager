@@ -1,5 +1,6 @@
 //! The machine binding document (`machine.toml`, schema 1).
 
+use crate::resolve::PROFILE_SCHEMA;
 use crate::{Code, Refusal};
 use serde::{Deserialize, Serialize};
 
@@ -36,7 +37,7 @@ pub struct ProfileTarget {
     pub architecture: Option<String>,
 }
 
-/// A profile must be a bounded TOML document with a top-level `schema` key. The resolver
+/// A profile must be a bounded TOML document with a top-level `schema = 1`. The resolver
 /// validates the rest; this keeps `bind` from recording an arbitrary file and returns the
 /// declared machine so `bind` can refuse a profile for another one.
 pub fn check_profile(bytes: &[u8]) -> Result<ProfileTarget, Refusal> {
@@ -48,15 +49,22 @@ pub fn check_profile(bytes: &[u8]) -> Result<ProfileTarget, Refusal> {
     let table: toml::Table = text.parse().map_err(|e: toml::de::Error| {
         bad(&format!("profile is not valid TOML: {}", e.message()))
     })?;
-    if table.contains_key("schema") {
-        let get = |k: &str| table.get(k).and_then(|v| v.as_str()).map(str::to_string);
-        Ok(ProfileTarget {
-            platform: get("platform"),
-            architecture: get("architecture"),
-        })
-    } else {
-        Err(bad("profile has no top-level schema key"))
+    match table.get("schema") {
+        Some(toml::Value::Integer(PROFILE_SCHEMA)) => {}
+        Some(toml::Value::Integer(n)) => {
+            return Err(Refusal::new(
+                Code::SchemaUnsupported,
+                format!("profile schema {n} is not supported (supported: {PROFILE_SCHEMA})"),
+            ));
+        }
+        Some(_) => return Err(bad("profile schema must be an integer")),
+        None => return Err(bad("profile has no top-level schema key")),
     }
+    let get = |k: &str| table.get(k).and_then(|v| v.as_str()).map(str::to_string);
+    Ok(ProfileTarget {
+        platform: get("platform"),
+        architecture: get("architecture"),
+    })
 }
 
 impl Binding {
@@ -164,6 +172,32 @@ mod tests {
         assert_eq!(t.architecture.as_deref(), Some("arm64"));
         assert!(check_profile(b"schema = 1\nid = \"x\"\n").is_ok());
         for bad in [&b""[..], b"[t]\nschema = 1\n", b"[oops", b"\xff"] {
+            assert_eq!(check_profile(bad).unwrap_err().code, Code::ProfileInvalid);
+        }
+    }
+
+    #[test]
+    fn the_profile_schema_check_follows_the_resolver_constant_not_the_binding_schema() {
+        // The resolver accepts exactly PROFILE_SCHEMA. A bump of the binding schema alone must
+        // not change which profiles bind accepts.
+        let ok = format!("schema = {PROFILE_SCHEMA}\n");
+        assert!(check_profile(ok.as_bytes()).is_ok());
+        let next = format!("schema = {}\n", PROFILE_SCHEMA + 1);
+        let e = check_profile(next.as_bytes()).unwrap_err();
+        assert_eq!(e.code, Code::SchemaUnsupported);
+        assert!(e.detail.contains(&format!("supported: {PROFILE_SCHEMA}")));
+    }
+
+    #[test]
+    fn profile_schema_must_be_integer_one() {
+        for n in [&b"schema = 2\n"[..], b"schema = 0\n", b"schema = -1\n"] {
+            assert_eq!(check_profile(n).unwrap_err().code, Code::SchemaUnsupported);
+        }
+        for bad in [
+            &b"schema = \"1\"\n"[..],
+            b"schema = 1.0\n",
+            b"schema = true\n",
+        ] {
             assert_eq!(check_profile(bad).unwrap_err().code, Code::ProfileInvalid);
         }
     }
