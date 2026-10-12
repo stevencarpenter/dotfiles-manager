@@ -125,6 +125,7 @@ pub(crate) enum Fault {
         found: &'static str,
     },
     MissingKey,
+    EmptyKey,
     OutOfRange(&'static str),
 }
 
@@ -181,7 +182,7 @@ pub(crate) fn validate(
         (Schema::Str, Value::String(_))
         | (Schema::Int, Value::Integer(_))
         | (Schema::Bool, Value::Boolean(_))
-        | (Schema::Native, _) => Ok(()),
+        | (Schema::Native, Value::Table(_)) => Ok(()),
         (Schema::FileMode { private }, Value::Integer(n)) => {
             let fault = |why| SchemaFault {
                 pointer: ptr.into(),
@@ -241,6 +242,12 @@ pub(crate) fn validate(
             }
             Ok(())
         }
+        // An empty key has no RFC 6901 pointer (the empty token is refused), so nothing could
+        // report or address its value.
+        (Schema::Map(_), Value::Table(t)) if t.contains_key("") => Err(SchemaFault {
+            pointer: ptr.into(),
+            fault: Fault::EmptyKey,
+        }),
         (Schema::Map(item), Value::Table(t)) => t
             .iter()
             .try_for_each(|(k, v)| validate(v, item, &pointer::join(ptr, k), found)),

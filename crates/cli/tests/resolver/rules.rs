@@ -1910,3 +1910,306 @@ fn l6_secret_file_modes_are_bounded_and_private() {
         }
     }
 }
+
+// DFM-57 review fixes: containment of nested links, selection and cycle errors, includes.
+
+const CORE_MOD: &str = "shared/core/module.toml";
+const REUSABLE_FILES: &str = "shared/reusable/files";
+
+/// The synthetic composition plus a directory link `reusable.tree` over `files/D`.
+fn tree_set() -> SourceSet {
+    let mut set = synthetic();
+    edit(
+        &mut set,
+        REUSABLE,
+        "add",
+        "/resources/-",
+        Some(
+            "{ id = \"tree\", kind = \"link\", adapter = \"fs-link/v1\", target = \".local/tree\", value = { source = \"files/D\", directory = true } }",
+        ),
+    );
+    set.insert_file(format!("{REUSABLE_FILES}/D/keep"), "k");
+    set
+}
+
+fn tree_escape(set: &SourceSet) {
+    refused(
+        set,
+        B,
+        Code::SourceEscape,
+        REUSABLE,
+        Some("reusable.tree"),
+        "leaves the trusted root",
+    );
+}
+
+#[test]
+fn se1_a_link_to_a_directory_inside_a_linked_tree_is_checked_to_its_entries() {
+    // D/ln points at files/x, which is inside the root. files/x/esc points out of it, so the
+    // published tree would lead out through D/ln/esc.
+    let mut set = tree_set();
+    set.insert_link(format!("{REUSABLE_FILES}/D/ln"), "../x");
+    set.insert_link(format!("{REUSABLE_FILES}/x/esc"), "/etc");
+    tree_escape(&set);
+    // A relative target that climbs out of the root is refused the same way.
+    let mut set = tree_set();
+    set.insert_link(format!("{REUSABLE_FILES}/D/ln"), "../x");
+    set.insert_link(
+        format!("{REUSABLE_FILES}/x/esc"),
+        "../../../core/files/gitconfig",
+    );
+    tree_escape(&set);
+    // The link sits several directories down and goes through two link hops.
+    let mut set = tree_set();
+    set.insert_link(format!("{REUSABLE_FILES}/D/a/b/ln"), "../../../x");
+    set.insert_link(format!("{REUSABLE_FILES}/x/mid"), "../y");
+    set.insert_link(format!("{REUSABLE_FILES}/y/esc"), "/etc");
+    tree_escape(&set);
+    // Control: the same layout with the inner link kept inside the root resolves, and a link
+    // back to the tree itself or to its parent ends instead of looping.
+    let mut set = tree_set();
+    set.insert_link(format!("{REUSABLE_FILES}/D/ln"), "../x");
+    set.insert_link(format!("{REUSABLE_FILES}/x/esc"), "../tool.conf");
+    set.insert_link(format!("{REUSABLE_FILES}/D/self"), ".");
+    set.insert_link(format!("{REUSABLE_FILES}/D/up"), "..");
+    let r = ok(&set, B);
+    assert!(r.resources.contains_key("reusable.tree"));
+}
+
+#[test]
+fn se2_an_excluded_link_is_still_checked_for_containment() {
+    let esc = format!("{REUSABLE_FILES}/D/esc");
+    let mut set = tree_set();
+    set.record_pruned_link(&esc, "/etc");
+    tree_escape(&set);
+    let mut set = tree_set();
+    set.record_pruned_link(&esc, "../../../core/files/gitconfig");
+    tree_escape(&set);
+    // An excluded link that stays inside the root is fine, and one into a directory is followed.
+    let mut set = tree_set();
+    set.record_pruned_link(&esc, "../x");
+    set.insert_link(format!("{REUSABLE_FILES}/x/out"), "/etc");
+    tree_escape(&set);
+    let mut set = tree_set();
+    set.record_pruned_link(&esc, "keep");
+    ok(&set, B);
+}
+
+#[test]
+fn r2_a_native_source_that_is_not_utf8_is_refused_by_name() {
+    let mut set = synthetic();
+    set.insert_file(
+        "shared/core/files/gitconfig",
+        b"[user]\n\tname = Jos\xe9\n[include]\n\tpath = ~/.config/synthetic/editor.inc\n".to_vec(),
+    );
+    let e = refused(
+        &set,
+        B,
+        Code::ManifestInvalid,
+        CORE_MOD,
+        Some("core.git"),
+        "`shared/core/files/gitconfig` is not valid UTF-8",
+    );
+    assert_eq!(e.field.as_deref(), Some("/source"));
+}
+
+#[test]
+fn r4_a_native_value_must_be_a_table() {
+    let mut set = examples();
+    edit(
+        &mut set,
+        AGENTS_MOD,
+        "replace",
+        "/resources/0/value/seed",
+        Some("5"),
+    );
+    let e = refused(
+        &set,
+        PERSONAL,
+        Code::TypeMismatch,
+        AGENTS_MOD,
+        Some("agents.claude-settings"),
+        "expected type table",
+    );
+    assert_eq!(
+        (e.field.as_deref(), e.rejected),
+        (Some("/seed"), Some("integer"))
+    );
+}
+
+#[test]
+fn r8_an_empty_map_key_is_refused() {
+    let mut set = examples();
+    edit(
+        &mut set,
+        AGENTS_MOD,
+        "add",
+        "/resources/2/value/entries/",
+        Some("{ source = \"files/sample-audit\", enabled = true }"),
+    );
+    let e = refused(
+        &set,
+        PERSONAL,
+        Code::ManifestInvalid,
+        AGENTS_MOD,
+        Some("agents.skills"),
+        "a map key is empty",
+    );
+    assert_eq!(e.field.as_deref(), Some("/entries"));
+}
+
+/// Includes written relative to the including file's directory match the resource that
+/// declares the included file. Absolute and `~user/` paths match nothing.
+#[test]
+fn r7_a_relative_include_path_matches_the_declared_output() {
+    let mut set = synthetic();
+    // The document is the output `.config/synthetic/gitconfig`, so its directory is
+    // `.config/synthetic`.
+    set.insert_file(
+        "shared/core/files/gitconfig",
+        "[include]\n\tpath = editor.inc\n[include]\n\tpath = ./sub/../local.inc\n[include]\n\tpath = ../synthetic/editor.inc\n[include]\n\tpath = /abs/.config/synthetic/editor.inc\n[include]\n\tpath = ~root/.config/synthetic/editor.inc\n[include]\n\tpath = ../../../editor.inc\n",
+    );
+    let r = ok(&set, B);
+    let hits: Vec<_> = r.includes[0]
+        .entries
+        .iter()
+        .map(|e| e.resource.as_deref())
+        .collect();
+    assert_eq!(
+        hits,
+        [
+            Some("core.editor-defaults"),
+            Some("private-mod.local-overrides"),
+            Some("core.editor-defaults"),
+            None,
+            None,
+            None
+        ]
+    );
+}
+
+// Module graphs built in memory: selection order, cycles and the resource cap.
+
+/// One bundle with a core and `mods` (id, requires, body), and a profile selecting `selected`.
+fn graph(mods: &[(&str, &[&str], String)], selected: &[&str]) -> SourceSet {
+    let mut set = SourceSet::new();
+    let mut bundle = String::from("schema = 1\nid = \"gen\"\ncore = \"m/core.toml\"\n[modules]\n");
+    for (id, requires, body) in mods {
+        bundle.push_str(&format!("{id} = \"m/{id}.toml\"\n"));
+        let req: Vec<String> = requires.iter().map(|r| format!("\"{r}\"")).collect();
+        set.insert_file(
+            format!("b/m/{id}.toml"),
+            format!(
+                "schema = 1\nid = \"{id}\"\nplatforms = [\"macos\"]\nrequires = [{}]\n{body}",
+                req.join(", ")
+            ),
+        );
+    }
+    set.insert_file("b/bundle.toml", bundle);
+    set.insert_file(
+        "b/m/core.toml",
+        "schema = 1\nid = \"core\"\nplatforms = [\"macos\"]\nrequires = []\n",
+    );
+    let list: Vec<String> = selected.iter().map(|s| format!("\"{s}\"")).collect();
+    set.insert_file(
+        "p/profile.toml",
+        format!(
+            "schema = 1\nid = \"gen-01\"\nbundle = \"../b/bundle.toml\"\nplatform = \"macos\"\narchitecture = \"arm64\"\nmodules = [{}]\n",
+            list.join(", ")
+        ),
+    );
+    set.insert_file("b/m/files/f", "f");
+    set
+}
+
+#[test]
+fn r5_a_cycle_error_names_only_the_modules_on_the_cycle() {
+    // a and b form the cycle. c waits on it, d waits on c, and e is fine.
+    let none = String::new;
+    let set = graph(
+        &[
+            ("a", &["b"], none()),
+            ("b", &["a"], none()),
+            ("c", &["a"], none()),
+            ("d", &["c"], none()),
+            ("e", &[], none()),
+        ],
+        &["a", "b", "c", "d", "e"],
+    );
+    let e = err(&set, "p/profile.toml");
+    assert_eq!(e.code, Code::DependencyCycle);
+    assert!(e.message.ends_with("cycle: a, b"), "{e}");
+    assert_eq!(e.source, "b/m/a.toml");
+    // The lexically first waiting module is downstream of the cycle: the error still points at
+    // a module on the cycle.
+    let set = graph(
+        &[
+            ("a", &["y"], none()),
+            ("x", &["y"], none()),
+            ("y", &["x"], none()),
+        ],
+        &["a", "x", "y"],
+    );
+    let e = err(&set, "p/profile.toml");
+    assert_eq!(e.code, Code::DependencyCycle);
+    assert!(e.message.ends_with("cycle: x, y"), "{e}");
+    assert_eq!(e.source, "b/m/x.toml");
+}
+
+#[test]
+fn r6_selection_errors_do_not_depend_on_list_order() {
+    let none = String::new;
+    let mods = [("a", &[][..], none())];
+    for list in [
+        ["a", "a", "ghost"],
+        ["ghost", "a", "a"],
+        ["a", "ghost", "a"],
+    ] {
+        let e = err(&graph(&mods, &list), "p/profile.toml");
+        assert_eq!(e.code, Code::ModuleUnknown, "{list:?}: {e}");
+    }
+    // Without an unknown ID the duplicate is reported.
+    let e = err(&graph(&mods, &["a", "a"]), "p/profile.toml");
+    assert_eq!(e.code, Code::ModuleDuplicate);
+    // The same holds for the prerequisites of one module.
+    for requires in [["a", "a", "ghost"], ["ghost", "a", "a"]] {
+        let set = graph(&[("a", &[], none()), ("b", &requires, none())], &["b"]);
+        let e = err(&set, "p/profile.toml");
+        assert_eq!(e.code, Code::ModuleUnknown, "{requires:?}: {e}");
+        assert_eq!(e.source, "b/m/b.toml");
+    }
+}
+
+#[test]
+fn r9_the_resource_cap_is_exact_and_refused_before_the_resources_are_composed() {
+    let links = |m: &str, n: usize| {
+        (0..n)
+            .map(|j| {
+                format!(
+                    "[[resources]]\nid = \"r{j:04}\"\nkind = \"link\"\nadapter = \"fs-link/v1\"\ntarget = \"t/{m}/r{j:04}\"\n[resources.value]\nsource = \"files/f\"\n"
+                )
+            })
+            .collect::<String>()
+    };
+    let ids: Vec<String> = (0..11).map(|i| format!("m{i:02}")).collect();
+    let mods = |last: usize| -> Vec<(&str, &[&str], String)> {
+        ids.iter()
+            .enumerate()
+            .map(|(i, id)| {
+                let n = if i == 10 { last } else { 1000 };
+                (id.as_str(), &[][..], links(id, n))
+            })
+            .collect()
+    };
+    let selected: Vec<&str> = ids.iter().map(String::as_str).collect();
+    // 10 x 1000 + 0 resources is the cap itself.
+    assert_eq!(
+        ok(&graph(&mods(0), &selected), "p/profile.toml")
+            .resources
+            .len(),
+        10_000
+    );
+    let e = err(&graph(&mods(1), &selected), "p/profile.toml");
+    assert_eq!(e.code, Code::LimitExceeded);
+    assert!(e.message.contains("more than 10000 resources"), "{e}");
+}

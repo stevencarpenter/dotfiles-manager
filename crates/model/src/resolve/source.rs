@@ -24,6 +24,9 @@ pub struct SourceSet {
     /// Folded paths of excluded entries that exist on disk and were not read. A directory source
     /// that holds some is not fully hashed.
     pruned: BTreeSet<String>,
+    /// Excluded entries that are symlinks, by folded path: spelling and target text. Exclusion
+    /// hides an entry from hashing only, so containment still applies to these links.
+    pruned_links: BTreeMap<String, (String, String)>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -74,6 +77,24 @@ impl SourceSet {
     /// Records an excluded entry that exists but was left unread.
     pub fn record_pruned(&mut self, path: &str) {
         self.pruned.insert(fold(path));
+    }
+
+    /// Records an excluded entry that is a symlink, with its target text.
+    pub fn record_pruned_link(&mut self, path: &str, target: &str) {
+        self.pruned_links
+            .insert(fold(path), (path.to_string(), target.to_string()));
+    }
+
+    /// Excluded symlinks below `dir` as (path, target text) pairs.
+    pub(crate) fn pruned_links_below<'a>(
+        &'a self,
+        dir: &str,
+    ) -> impl Iterator<Item = (&'a str, &'a str)> {
+        let prefix = format!("{}/", fold(dir));
+        self.pruned_links
+            .range(prefix.clone()..)
+            .take_while(move |(k, _)| k.starts_with(&prefix))
+            .map(|(_, (p, t))| (p.as_str(), t.as_str()))
     }
 
     /// Excluded entries at or below `dir` that were left unread.

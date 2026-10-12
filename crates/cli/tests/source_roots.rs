@@ -3,7 +3,7 @@
 
 mod common;
 
-use common::{BUNDLE, Fx, code, is_root, text};
+use common::{BUNDLE, Fx, code, fingerprint, is_root, text};
 use dfm_model::plan::Saved;
 use std::fs;
 use std::os::unix::ffi::OsStrExt;
@@ -603,4 +603,91 @@ fn an_exclude_that_names_the_bundle_directory_is_refused() {
         err.contains("E_MANIFEST_INVALID") && err.contains("bundle directory"),
         "{err}"
     );
+}
+
+/// Refuses `plan` with `want` in stderr and exit 3, and proves HOME (and with it the state
+/// store) is byte for byte what it was.
+fn plan_refused(fx: &Fx, want: &str) -> String {
+    let before = fingerprint(fx.home.path());
+    let o = plan(fx);
+    let err = text(&o.stderr);
+    assert_eq!(code(&o), 3, "{err}");
+    assert!(err.contains(want), "{want} not in: {err}");
+    assert_eq!(fingerprint(fx.home.path()), before, "HOME changed");
+    err
+}
+
+const PLUGDIR: &str = "base/modules/extra/files/plugdir";
+
+#[test]
+fn a_link_to_a_directory_inside_a_linked_tree_must_not_lead_out_of_the_root() {
+    // plugdir/ln -> ../x (a directory in the module root), and x/esc -> /etc.
+    let fx = scoped(r#""base", "profiles""#, "");
+    add_plugs_module(&fx);
+    fx.put(&format!("{PLUGDIR}/keep"), "k");
+    fx.put("base/modules/extra/files/x/inside", "i");
+    let x = fx.root.join("base/modules/extra/files/x");
+    symlink("../x", fx.root.join(PLUGDIR).join("ln")).unwrap();
+    symlink("/etc", x.join("esc")).unwrap();
+    plan_refused(&fx, "E_SOURCE_ESCAPE");
+    // Control: the same layout with the inner link kept inside the root plans.
+    fs::remove_file(x.join("esc")).unwrap();
+    symlink("inside", x.join("esc")).unwrap();
+    assert_eq!(code(&plan(&fx)), 0, "{}", text(&plan(&fx).stderr));
+}
+
+#[test]
+fn an_excluded_link_that_leaves_the_root_is_still_refused_in_a_directory_source() {
+    let fx = scoped(r#""base", "profiles""#, r#""**/esc""#);
+    add_plugs_module(&fx);
+    fx.put(&format!("{PLUGDIR}/keep"), "k");
+    let esc = fx.root.join(PLUGDIR).join("esc");
+    symlink("/etc", &esc).unwrap();
+    plan_refused(&fx, "E_SOURCE_ESCAPE");
+    // A relative target that climbs out of the root is refused the same way.
+    fs::remove_file(&esc).unwrap();
+    symlink("../../../../../../../../etc", &esc).unwrap();
+    plan_refused(&fx, "E_SOURCE_ESCAPE");
+    // Control: an excluded link that stays inside the root plans and is still not hashed.
+    fs::remove_file(&esc).unwrap();
+    symlink("keep", &esc).unwrap();
+    let o = plan(&fx);
+    assert_eq!(code(&o), 0, "{}", text(&o.stderr));
+    assert!(text(&o.stdout).contains("note: contains 1 excluded entries, not hashed"));
+}
+
+#[test]
+fn a_link_target_with_a_control_character_is_refused_like_a_name() {
+    let fx = scoped(r#""base", "profiles""#, "");
+    add_plugs_module(&fx);
+    fx.put(&format!("{PLUGDIR}/keep"), "k");
+    symlink("keep\u{1b}[2J", fx.root.join(PLUGDIR).join("ln")).unwrap();
+    let err = plan_refused(&fx, "E_SOURCE_UNTRUSTED");
+    assert!(err.contains("control character"), "{err}");
+    assert!(!err.contains('\u{1b}'), "{err:?}");
+}
+
+#[test]
+fn apply_refuses_a_link_planted_in_excluded_content_after_the_plan() {
+    let fx = scoped(r#""base", "profiles""#, r#""**/.venv""#);
+    with_plugs(&fx);
+    let o = fx.run(&["plan", "--root", fx.root_arg(), "--json"]);
+    let digest = Saved::parse(&o.stdout).unwrap().plan_digest;
+    // The excluded directory is neither listed nor hashed, so the plan digest does not change.
+    let venv = fx.root.join(PLUGDIR).join(".venv");
+    symlink("/etc", venv.join("esc")).unwrap();
+    let o = fx.run(&["apply", "--root", fx.root_arg(), "--yes-plan", &digest]);
+    let all = format!("{}{}", text(&o.stdout), text(&o.stderr));
+    assert_ne!(code(&o), 0, "{all}");
+    assert!(all.contains("E_SOURCE_ESCAPE"), "{all}");
+    assert!(
+        fs::symlink_metadata(fx.h(".config/plugs")).is_err(),
+        "the directory link was published"
+    );
+    // Control: a link that stays inside the source root applies.
+    fs::remove_file(venv.join("esc")).unwrap();
+    symlink("lib", venv.join("ok")).unwrap();
+    let o = fx.run(&["apply", "--root", fx.root_arg(), "--yes-plan", &digest]);
+    assert_eq!(code(&o), 0, "{}{}", text(&o.stdout), text(&o.stderr));
+    assert!(fs::symlink_metadata(fx.h(".config/plugs")).is_ok());
 }

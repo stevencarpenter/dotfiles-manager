@@ -1,7 +1,9 @@
 //! Reads a materialized source directory into an in-memory `SourceSet` for the resolver.
 //! Read-only. A bundle's `[sources]` table limits the walk to its roots and skips excluded
 //! paths before they are listed or opened (docs/resolver.md, "Source roots and excludes").
-//! Symlinks are recorded, never followed, so the resolver decides containment.
+//! Symlinks are recorded, never followed, so the resolver decides containment. An excluded
+//! symlink is recorded too, apart from the hashed entries, because exclusion never hides a link
+//! from the containment check.
 //! A top-level `.git` (any letter case) is repository metadata, not source content, and is
 //! skipped. A `.git` anywhere deeper is a submodule or gitlink, which the tree rules refuse
 //! (E_SOURCE_UNTRUSTED, docs/architecture.md section 8).
@@ -321,6 +323,12 @@ fn load(root: &Path, declared: Option<&SourceScope>) -> Result<SourceSet, Refusa
                         ));
                     }
                     st.set.record_pruned(&shown);
+                    // Exclusion hides an entry from hashing, never from containment: a link
+                    // that is excluded is still published inside a directory source.
+                    if e.file_type().is_ok_and(|t| t.is_symlink()) {
+                        let target = fs::read_link(e.path()).map_err(|e| io(e, &shown))?;
+                        st.set.record_pruned_link(&shown, &target.to_string_lossy());
+                    }
                     continue;
                 }
             }
@@ -371,6 +379,12 @@ fn load(root: &Path, declared: Option<&SourceScope>) -> Result<SourceSet, Refusa
                         format!("non-UTF-8 link target at {path}"),
                     )
                 })?;
+                if target.chars().any(char::is_control) {
+                    return Err(refusal(
+                        Code::SourceUntrusted,
+                        format!("control character in a name under {rel}"),
+                    ));
+                }
                 st.set.insert_link(path, target);
             } else if ty.is_dir() {
                 st.set.insert_dir(path.clone());

@@ -192,6 +192,21 @@ pub(crate) fn resolve(
     let order = select(&profile, &catalogue, &modules)?;
 
     // Phase 3: authority and conflicts.
+    // Count before cloning any resource document. Resource IDs are unique per module, so the
+    // sum equals the number of composed resources.
+    if order
+        .iter()
+        .map(|id| modules[id].resources.len())
+        .sum::<usize>()
+        > MAX_RESOURCES
+    {
+        return Err(ResolveError::new(
+            Code::LimitExceeded,
+            &profile.file,
+            "the composition has more than 10000 resources",
+            "split the composition",
+        ));
+    }
     let mut resources: BTreeMap<String, Owned> = BTreeMap::new();
     for m in order.iter().map(|id| &modules[id]) {
         for r in &m.resources {
@@ -207,14 +222,6 @@ pub(crate) fn resolve(
                 },
             );
         }
-    }
-    if resources.len() > MAX_RESOURCES {
-        return Err(ResolveError::new(
-            Code::LimitExceeded,
-            &profile.file,
-            "the composition has more than 10000 resources",
-            "split the composition",
-        ));
     }
     let changes = collect_changes(&order, &modules, &profile);
     let effective = authorize(&resources, &changes)?;
@@ -442,9 +449,14 @@ fn select(
     catalogue: &BTreeMap<String, CatalogueEntry>,
     modules: &BTreeMap<String, ModuleDoc>,
 ) -> Result<Vec<String>, ResolveError> {
+    // Unknown IDs are reported before duplicates, so the code does not depend on list order.
+    for (i, m) in profile.modules.iter().enumerate() {
+        if m != "core" && !catalogue.contains_key(m) {
+            return Err(unknown_module(&profile.file, &format!("/modules/{i}"), m));
+        }
+    }
     let mut seen = BTreeSet::new();
     for (i, m) in profile.modules.iter().enumerate() {
-        let field = format!("/modules/{i}");
         if m == "core" || !seen.insert(m.as_str()) {
             return Err(ResolveError::new(
                 Code::ModuleDuplicate,
@@ -452,11 +464,8 @@ fn select(
                 format!("module `{m}` is selected more than once; core is always selected"),
                 "list each non-core module once",
             )
-            .field(field)
+            .field(format!("/modules/{i}"))
             .rejected("string"));
-        }
-        if !catalogue.contains_key(m) {
-            return Err(unknown_module(&profile.file, &field, m));
         }
     }
     let core = &modules["core"];
@@ -470,9 +479,13 @@ fn select(
         .field("/requires"));
     }
     for m in modules.values() {
+        for (i, r) in m.requires.iter().enumerate() {
+            if r != "core" && !catalogue.contains_key(r) {
+                return Err(unknown_module(&m.file, &format!("/requires/{i}"), r));
+            }
+        }
         let mut seen = BTreeSet::new();
         for (i, r) in m.requires.iter().enumerate() {
-            let field = format!("/requires/{i}");
             if r == "core" || !seen.insert(r.as_str()) {
                 return Err(ResolveError::new(
                     Code::ModuleDuplicate,
@@ -480,11 +493,8 @@ fn select(
                     format!("`{r}` is required more than once; core is always required"),
                     "list each prerequisite once and omit core",
                 )
-                .field(field)
+                .field(format!("/requires/{i}"))
                 .rejected("string"));
-            }
-            if !catalogue.contains_key(r) {
-                return Err(unknown_module(&m.file, &field, r));
             }
         }
     }
@@ -533,10 +543,31 @@ fn select(
         }
     }
     if let Some((first, _)) = waiting.iter().next() {
-        let names: Vec<&str> = waiting.keys().copied().collect();
+        // Every waiting module has a waiting prerequisite, so walking back along `requires`
+        // reaches a module twice. The walk from that module on is the cycle; downstream modules
+        // that only wait on it are left out.
+        let mut path: Vec<&str> = vec![*first];
+        let cycle: Vec<&str> = loop {
+            let last = path[path.len() - 1];
+            let next = modules[last]
+                .requires
+                .iter()
+                .map(String::as_str)
+                .filter(|r| waiting.contains_key(r))
+                .min();
+            match next {
+                Some(n) => match path.iter().position(|p| *p == n) {
+                    Some(at) => break path[at..].to_vec(),
+                    None => path.push(n),
+                },
+                None => break path,
+            }
+        };
+        let mut names = cycle.clone();
+        names.sort_unstable();
         return Err(ResolveError::new(
             Code::DependencyCycle,
-            &modules[*first].file,
+            &modules[names[0]].file,
             format!(
                 "modules depend on each other in a cycle: {}",
                 names.join(", ")
@@ -920,6 +951,11 @@ fn finish(
                     "a required key is missing".into(),
                     "add the key",
                 ),
+                Fault::EmptyKey => at(
+                    Code::ManifestInvalid,
+                    "a map key is empty".into(),
+                    "give the entry a non-empty name",
+                ),
                 Fault::OutOfRange(why) => at(
                     Code::ManifestInvalid,
                     why.into(),
@@ -1048,9 +1084,20 @@ fn finish(
             let key = format!("{}\0{path}", spec.id);
             if !include_cache.contains_key(&key) {
                 let parsed = match sources.locate(path, "") {
-                    Ok(Located::File { bytes, .. }) => {
-                        std::str::from_utf8(bytes).map(parse).unwrap_or_default()
-                    }
+                    Ok(Located::File { bytes, .. }) => std::str::from_utf8(bytes)
+                        .map(parse)
+                        .map_err(|_| {
+                            ResolveError::new(
+                                Code::ManifestInvalid,
+                                &owner.file,
+                                format!(
+                                    "the native source `{path}` is not valid UTF-8, so its include directives cannot be read"
+                                ),
+                                "save the file as UTF-8",
+                            )
+                            .resource(gid)
+                            .field("/source")
+                        })?,
                     _ => Vec::new(),
                 };
                 if parsed.len() > MAX_INCLUDES_PER_DOC {
@@ -1099,6 +1146,32 @@ fn finish(
     Ok((out, groups))
 }
 
+/// The HOME-relative output path an include names. `~/x` is `x`. A relative path is taken
+/// against the directory of the including file's output, as Git does, with `.` and `..`
+/// applied; a path that climbs above HOME names nothing. An absolute path or `~user/...` is not
+/// matched, because it names no HOME-relative output.
+fn include_output_path(including: Option<&str>, path: &str) -> Option<String> {
+    if let Some(rel) = path.strip_prefix("~/") {
+        return Some(rel.to_string());
+    }
+    if path.starts_with('/') || path.starts_with('~') {
+        return None;
+    }
+    let mut parts: Vec<&str> = including
+        .and_then(|t| t.rsplit_once('/'))
+        .map_or_else(Vec::new, |(dir, _)| dir.split('/').collect());
+    for c in path.split('/') {
+        match c {
+            "" | "." => {}
+            ".." => {
+                parts.pop()?;
+            }
+            c => parts.push(c),
+        }
+    }
+    Some(parts.join("/"))
+}
+
 /// Orders each authored native document's includes and ties each to the resource that
 /// declares the included file. Matching is by output path, without regard to case.
 fn include_groups(
@@ -1115,10 +1188,8 @@ fn include_groups(
                 .into_iter()
                 .enumerate()
                 .map(|(i, inc)| {
-                    let hit = inc
-                        .path
-                        .strip_prefix("~/")
-                        .and_then(|rel| by_target.get(&crate::fold::fold(rel)))
+                    let hit = include_output_path(resolved[&base].target.as_deref(), &inc.path)
+                        .and_then(|rel| by_target.get(&crate::fold::fold(&rel)))
                         .filter(|r| r.id != base);
                     IncludeEntry {
                         position: i + 1,
@@ -1192,6 +1263,13 @@ fn contain(
             if let Some(id) = digests.get(&key) {
                 return Ok((path.clone(), (!spec.secret_values).then(|| id.clone())));
             }
+            check_nested(
+                sources,
+                &sup.dir,
+                &path,
+                &mut BTreeSet::from([crate::fold::fold(&path)]),
+            )
+            .map_err(|f| wrap(locate_error(&sup.file, ptr, f)))?;
             let mut entries = Vec::new();
             for (name, e) in sources.below(&path) {
                 let full = format!("{path}/{name}");
@@ -1232,6 +1310,41 @@ fn contain(
             Ok((path, (!spec.secret_values).then_some(id)))
         }
     }
+}
+
+/// Checks every link below `dir` at any depth, including excluded ones, and follows each link
+/// that reaches another directory into that directory's entries too: a link published inside
+/// a linked tree can lead out of the root through its target. Each directory is visited once
+/// (`seen`), which bounds the walk and ends link cycles.
+fn check_nested(
+    sources: &SourceSet,
+    root: &str,
+    dir: &str,
+    seen: &mut BTreeSet<String>,
+) -> Result<(), LocateFault> {
+    let mut work = vec![dir.to_string()];
+    while let Some(dir) = work.pop() {
+        let mut hops = Vec::new();
+        for (name, e) in sources.below(&dir) {
+            if let source::Entry::Link(_) = e {
+                hops.push(sources.locate(&format!("{dir}/{name}"), root)?);
+            }
+        }
+        for (link, target) in sources.pruned_links_below(&dir) {
+            if target.starts_with('/') {
+                return Err(LocateFault::Escape);
+            }
+            hops.push(sources.locate(&format!("{}/{target}", source::parent(link)), root)?);
+        }
+        for hop in hops {
+            if let Located::Dir { path } = hop
+                && seen.insert(crate::fold::fold(&path))
+            {
+                work.push(path);
+            }
+        }
+    }
+    Ok(())
 }
 
 fn claims_of(
@@ -1314,13 +1427,14 @@ pub(crate) fn glob(pattern: &str, name: &str) -> bool {
     let (p, n): (Vec<char>, Vec<char>) = (pattern.chars().collect(), name.chars().collect());
     let (mut pi, mut ni, mut star, mut mark) = (0, 0, None, 0);
     while ni < n.len() {
-        if pi < p.len() && (p[pi] == '?' || p[pi] == n[ni]) {
-            pi += 1;
-            ni += 1;
-        } else if pi < p.len() && p[pi] == '*' {
+        // A pattern `*` is a wildcard even when the name holds a literal `*` at that position.
+        if pi < p.len() && p[pi] == '*' {
             star = Some(pi);
             mark = ni;
             pi += 1;
+        } else if pi < p.len() && (p[pi] == '?' || p[pi] == n[ni]) {
+            pi += 1;
+            ni += 1;
         } else if let Some(s) = star {
             pi = s + 1;
             mark += 1;
@@ -1468,4 +1582,45 @@ fn collision(
     .field("/target")
     .rejected("string")
     .conflicts_with(other)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{glob, include_output_path};
+
+    #[test]
+    fn a_pattern_star_stays_a_wildcard_when_the_name_holds_a_literal_star() {
+        assert!(glob("*.md", "*x.md"));
+        assert!(glob("foo*", "foo*bar"));
+        assert!(glob("*b", "*ab"));
+        assert!(glob("*", "*"));
+        assert!(glob("a*c", "a*bc"));
+        // Unchanged behaviour.
+        assert!(glob("*.md", "a.md"));
+        assert!(glob("a?c", "abc"));
+        assert!(glob("a*", "a"));
+        assert!(!glob("*.md", "a.txt"));
+        assert!(!glob("a?c", "ac"));
+        assert!(!glob("*b", "*a"));
+        assert!(glob("", ""));
+        assert!(!glob("", "x"));
+    }
+
+    #[test]
+    fn include_paths_resolve_against_home_or_the_including_directory() {
+        let at = |p: &str| include_output_path(Some(".config/git/config"), p);
+        assert_eq!(at("~/x/y").as_deref(), Some("x/y"));
+        assert_eq!(at("extra").as_deref(), Some(".config/git/extra"));
+        assert_eq!(at("./a/../b").as_deref(), Some(".config/git/b"));
+        assert_eq!(at("../../top").as_deref(), Some("top"));
+        assert_eq!(at("../../../up"), None);
+        assert_eq!(at("/abs/x"), None);
+        assert_eq!(at("~user/x"), None);
+        // A document at the top of HOME resolves against HOME itself.
+        assert_eq!(
+            include_output_path(Some(".gitconfig"), "x").as_deref(),
+            Some("x")
+        );
+        assert_eq!(include_output_path(None, "x").as_deref(), Some("x"));
+    }
 }

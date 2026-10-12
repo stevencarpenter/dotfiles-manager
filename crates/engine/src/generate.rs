@@ -413,15 +413,68 @@ fn walk(
     Ok(())
 }
 
+/// A directory source with excluded content is not hashed, but a link inside it is still
+/// published. Every link found must stay lexically inside the source root: `depth` is the
+/// number of components between the root and `dir`, and a target may not climb past it or be
+/// absolute. This is a bounded check of what the engine can see without the exclude patterns.
+///
+/// shortcut: it stops listing after `MAX_SOURCE_ENTRIES` entries and skips entries it cannot
+/// examine, because excluded trees (virtual environments) can be large or unreadable; the
+/// plan-time check in the resolver covers everything it loaded.
+fn links_stay_in_root(
+    sys: &Sys,
+    dir: &Dir,
+    depth: usize,
+    budget: &mut usize,
+) -> Result<(), Gather> {
+    let Ok(listing) = dir.list_upto(*budget) else {
+        return Ok(());
+    };
+    *budget = budget.saturating_sub(listing.names.len());
+    for name in listing.names {
+        match dir.peek(sys, &name) {
+            Ok(Peek::Link { target, .. }) => {
+                let mut left = depth;
+                let escapes = target.starts_with('/')
+                    || target.split('/').any(|c| match c {
+                        "" | "." => false,
+                        ".." if left == 0 => true,
+                        ".." => {
+                            left -= 1;
+                            false
+                        }
+                        _ => {
+                            left += 1;
+                            false
+                        }
+                    });
+                if escapes {
+                    return Err(Gather::Failed(Refusal::new(
+                        Code::SourceEscape,
+                        format!("source link {name} leaves the source root"),
+                    )));
+                }
+            }
+            Ok(Peek::Dir { .. }) => {
+                if let Ok(Some(child)) = dir.peek_dir(&name) {
+                    links_stay_in_root(sys, &child, depth + 1, budget)?;
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
 /// Reads the source of a link operation again, immediately before the operation is journaled.
 /// The source root is the trusted start; every component below it is opened without following a
 /// link. The path must still be a regular file or a directory, and its content hash (file) or
 /// tree digest (directory) must equal the plan's `source:` precondition. A source with no
 /// recorded identity (a secret value) is checked for presence and type only.
 ///
-/// shortcut: a directory source with entries that `[sources].exclude` left out is checked for
-/// presence and type only, because the plan does not record the exclude patterns; revisit when
-/// the plan carries the scope.
+/// shortcut: a directory source with entries that `[sources].exclude` left out is not compared
+/// with its digest, because the plan does not record the exclude patterns; its links are only
+/// checked to stay inside the source root. Revisit when the plan carries the scope.
 pub(crate) fn link_source(sys: &Sys, plan: &Plan, op: &Operation) -> Result<(), Gather> {
     let (Some(input), Some(link)) = (op.inputs.first(), op.link.as_deref()) else {
         return Ok(());
@@ -460,7 +513,10 @@ pub(crate) fn link_source(sys: &Sys, plan: &Plan, op: &Operation) -> Result<(), 
         }
         Peek::Dir { .. } => {
             let dir = cur.peek_dir(name)?.ok_or_else(gone)?;
-            if let (Some(want), None) = (want, op.excluded) {
+            if op.excluded.is_some() {
+                let depth = path.split('/').count();
+                links_stay_in_root(sys, &dir, depth, &mut { MAX_SOURCE_ENTRIES })?;
+            } else if let Some(want) = want {
                 let mut tree = Tree {
                     entries: Vec::new(),
                     bytes: 0,
