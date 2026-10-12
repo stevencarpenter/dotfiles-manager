@@ -1999,18 +1999,17 @@ fn se2_an_excluded_link_is_still_checked_for_containment() {
 fn se2_a_directory_with_excluded_entries_keeps_its_links_inside_itself() {
     // Apply cannot see the exclude patterns, so it holds every link in such a directory to the
     // directory itself. Plan uses the same bound: a sibling in the module root is refused too.
+    // The loader records an excluded entry and, for a link, its target as well.
     let esc = format!("{REUSABLE_FILES}/D/esc");
-    let sibling = |set: &mut SourceSet| {
-        set.insert_file(format!("{REUSABLE_FILES}/x/in"), "i");
-        set.record_pruned_link(&esc, "../x");
-    };
     let mut set = tree_set();
-    sibling(&mut set);
+    set.insert_file(format!("{REUSABLE_FILES}/x/in"), "i");
     set.record_pruned(&esc);
+    set.record_pruned_link(&esc, "../x");
     tree_escape(&set);
     // The same link in a directory with nothing excluded keeps the module root as its bound.
     let mut set = tree_set();
-    sibling(&mut set);
+    set.insert_file(format!("{REUSABLE_FILES}/x/in"), "i");
+    set.insert_link(format!("{REUSABLE_FILES}/D/ln"), "../x");
     ok(&set, B);
     // A loaded link of a directory that has excluded entries is held to the directory as well.
     let mut set = tree_set();
@@ -2021,9 +2020,78 @@ fn se2_a_directory_with_excluded_entries_keeps_its_links_inside_itself() {
     // Control: links that stay inside the directory resolve.
     let mut set = tree_set();
     set.insert_link(format!("{REUSABLE_FILES}/D/ln"), "keep");
-    set.record_pruned_link(&esc, "keep");
     set.record_pruned(&esc);
+    set.record_pruned_link(&esc, "keep");
     ok(&set, B);
+}
+
+#[test]
+fn se2_plan_holds_a_directory_with_excluded_entries_to_the_rule_apply_uses() {
+    // `sub/../keep` stays inside the directory, but a `..` after a name may start from a link,
+    // so apply refuses it. Plan refuses it too, so a plan that passes is not refused at apply.
+    let mut set = tree_set();
+    set.insert_file(format!("{REUSABLE_FILES}/D/sub/f"), "f");
+    set.insert_link(format!("{REUSABLE_FILES}/D/ln"), "sub/../keep");
+    ok(&set, B);
+    set.record_pruned(&format!("{REUSABLE_FILES}/D/.venv"));
+    tree_escape(&set);
+    // Leading `..` up to the link's depth, and names, are inside.
+    let mut set = tree_set();
+    set.insert_file(format!("{REUSABLE_FILES}/D/sub/f"), "f");
+    set.insert_link(format!("{REUSABLE_FILES}/D/sub/up"), "../keep");
+    set.insert_link(format!("{REUSABLE_FILES}/D/down"), "sub/f");
+    set.record_pruned(&format!("{REUSABLE_FILES}/D/.venv"));
+    ok(&set, B);
+    // An excluded link is held to the same rule.
+    let esc = format!("{REUSABLE_FILES}/D/sub/esc");
+    set.record_pruned(&esc);
+    set.record_pruned_link(&esc, "../../x");
+    tree_escape(&set);
+}
+
+#[test]
+fn se1_a_link_to_a_directory_that_holds_an_excluded_directory_is_refused() {
+    // D/ln -> ../x and x/.venv is excluded. The loader never lists x/.venv, so a link inside it
+    // (x/.venv/esc -> /etc) is not seen, and D has no excluded entry that would make apply walk it.
+    let venv = format!("{REUSABLE_FILES}/x/.venv");
+    let mut set = tree_set();
+    set.insert_link(format!("{REUSABLE_FILES}/D/ln"), "../x");
+    set.insert_file(format!("{REUSABLE_FILES}/x/in"), "i");
+    set.record_pruned(&venv);
+    set.record_pruned_dir(&venv);
+    refused(
+        &set,
+        B,
+        Code::SourceEscape,
+        REUSABLE,
+        Some("reusable.tree"),
+        "which holds an excluded directory",
+    );
+    // The same for a link to a directory above the one that holds the excluded directory.
+    let mut up = tree_set();
+    up.insert_link(format!("{REUSABLE_FILES}/D/ln"), "..");
+    up.record_pruned(&venv);
+    up.record_pruned_dir(&venv);
+    refused(
+        &up,
+        B,
+        Code::SourceEscape,
+        REUSABLE,
+        Some("reusable.tree"),
+        "which holds an excluded directory",
+    );
+    // An excluded file or link is not a hidden directory: x is listed in full for links.
+    let mut set = tree_set();
+    set.insert_link(format!("{REUSABLE_FILES}/D/ln"), "../x");
+    set.insert_file(format!("{REUSABLE_FILES}/x/in"), "i");
+    set.record_pruned(&format!("{REUSABLE_FILES}/x/.DS_Store"));
+    ok(&set, B);
+    // Inside D itself an excluded directory makes apply walk D, and the bound is D.
+    let mut set = tree_set();
+    set.insert_link(format!("{REUSABLE_FILES}/D/ln"), "../x");
+    set.record_pruned(&format!("{REUSABLE_FILES}/D/.venv"));
+    set.record_pruned_dir(&format!("{REUSABLE_FILES}/D/.venv"));
+    tree_escape(&set);
 }
 
 #[test]

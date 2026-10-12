@@ -24,6 +24,9 @@ pub struct SourceSet {
     /// Folded paths of excluded entries that exist on disk and were not read. A directory source
     /// that holds some is not fully hashed.
     pruned: BTreeSet<String>,
+    /// The part of `pruned` that is directories. Only an excluded directory can hide a link that
+    /// the loader never lists.
+    pruned_dirs: BTreeSet<String>,
     /// Excluded entries that are symlinks, by folded path and spelling, with the target text.
     /// Exclusion hides an entry from hashing only, so containment still applies to these links.
     /// Two spellings of one folded path are both kept: each one is checked.
@@ -45,6 +48,9 @@ pub(crate) enum LocateFault {
     Loop,
     /// Two entries differ only by case, so a case-insensitive filesystem cannot tell them apart.
     CaseAlias,
+    /// A link leads to this directory, which holds an excluded directory. The loader never lists
+    /// an excluded directory, so the links inside it cannot be checked.
+    Hidden(String),
     /// The loader did not read this path because the bundle's `[sources]` leaves it out.
     Scope(ScopeFault),
 }
@@ -80,6 +86,11 @@ impl SourceSet {
         self.pruned.insert(fold(path));
     }
 
+    /// Records an excluded entry that is a real directory. Call it with [`Self::record_pruned`].
+    pub fn record_pruned_dir(&mut self, path: &str) {
+        self.pruned_dirs.insert(fold(path));
+    }
+
     /// Records an excluded entry that is a symlink, with its target text.
     pub fn record_pruned_link(&mut self, path: &str, target: &str) {
         self.pruned_links
@@ -100,14 +111,12 @@ impl SourceSet {
 
     /// Excluded entries at or below `dir` that were left unread.
     pub fn pruned_under(&self, dir: &str) -> usize {
-        let dir = fold(dir);
-        let prefix = format!("{dir}/");
-        usize::from(self.pruned.contains(&dir))
-            + self
-                .pruned
-                .range(prefix.clone()..)
-                .take_while(|k| k.starts_with(&prefix))
-                .count()
+        count_under(&self.pruned, dir)
+    }
+
+    /// Excluded directories at or below `dir`, whose content was never listed.
+    pub(crate) fn pruned_dirs_under(&self, dir: &str) -> usize {
+        count_under(&self.pruned_dirs, dir)
     }
 
     fn insert(&mut self, path: String, entry: Entry) {
@@ -304,6 +313,41 @@ pub(crate) fn join(base_dir: &str, rel: &str, _root: &str) -> Result<String, Pat
     })
 }
 
+/// Whether a link whose target is `target` stays inside the directory it is published in, when
+/// the link sits `depth` levels below that directory. The target must be relative and may climb
+/// only with leading `..` components, no more than `depth` of them. A `..` after a name is
+/// refused: the name may be a link, and then the climb starts from where that link points, which
+/// a lexical count cannot see. With this rule every link target resolves under the directory,
+/// whatever chain of links it passes through, because each link in the chain obeys the same
+/// rule. Plan and apply both use it for a directory source that has excluded entries.
+pub fn target_stays_inside(target: &str, depth: usize) -> bool {
+    if target.starts_with('/') {
+        return false;
+    }
+    let mut left = depth;
+    let mut named = false;
+    for c in target.split('/') {
+        match c {
+            "" | "." => {}
+            ".." if named || left == 0 => return false,
+            ".." => left -= 1,
+            _ => named = true,
+        }
+    }
+    true
+}
+
+/// The entries of `set` equal to `dir` or below it.
+fn count_under(set: &BTreeSet<String>, dir: &str) -> usize {
+    let dir = fold(dir);
+    let prefix = format!("{dir}/");
+    usize::from(set.contains(&dir))
+        + set
+            .range(prefix.clone()..)
+            .take_while(|k| k.starts_with(&prefix))
+            .count()
+}
+
 pub(crate) fn parent(path: &str) -> &str {
     path.rsplit_once('/').map_or("", |(dir, _)| dir)
 }
@@ -311,6 +355,30 @@ pub(crate) fn parent(path: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_target_may_only_climb_with_leading_parents_and_not_past_the_directory() {
+        for (target, depth, ok) in [
+            ("keep", 0, true),
+            ("./a/b", 0, true),
+            ("", 0, true),
+            ("..", 0, false),
+            ("..", 1, true),
+            ("../..", 1, false),
+            ("../../x", 2, true),
+            ("../../../x", 2, false),
+            // A `..` after a name starts from wherever that name leads, which may be a link.
+            ("a/../b", 3, false),
+            ("../a/..", 3, false),
+            ("/etc", 3, false),
+        ] {
+            assert_eq!(
+                target_stays_inside(target, depth),
+                ok,
+                "{target} at {depth}"
+            );
+        }
+    }
 
     #[test]
     fn join_refuses_absolute_and_malformed_paths_and_keeps_dots_for_locate() {

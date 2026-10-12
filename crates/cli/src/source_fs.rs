@@ -342,10 +342,14 @@ fn load(root: &Path, declared: Option<&SourceScope>) -> Result<SourceSet, Refusa
                     }
                     st.set.record_pruned(&shown);
                     // Exclusion hides an entry from hashing, never from containment: a link
-                    // that is excluded is still published inside a directory source.
-                    if e.file_type().map_err(|e| io(e, &shown))?.is_symlink() {
+                    // that is excluded is still published inside a directory source. An excluded
+                    // directory is not listed, so the resolver needs to know it is there.
+                    let ty = e.file_type().map_err(|e| io(e, &shown))?;
+                    if ty.is_symlink() {
                         let target = link_target(&e, &shown, rel)?;
                         st.set.record_pruned_link(&shown, &target);
+                    } else if ty.is_dir() {
+                        st.set.record_pruned_dir(&shown);
                     }
                     continue;
                 }

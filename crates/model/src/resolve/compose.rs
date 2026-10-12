@@ -141,6 +141,12 @@ fn locate_error(from: &str, field: &str, f: LocateFault) -> ResolveError {
             "two source entries differ only by case, so a case-insensitive filesystem cannot tell them apart",
             "rename one of them",
         ),
+        LocateFault::Hidden(path) => ResolveError::new(
+            Code::SourceEscape,
+            from,
+            format!("a link in the directory source leads to `{path}`, which holds an excluded directory; the links inside that directory cannot be checked"),
+            format!("point the link elsewhere, or stop excluding the directories under `{path}`"),
+        ),
     }
     .field(field)
     .rejected("string")
@@ -1266,15 +1272,14 @@ fn contain(
             if let Some(id) = digests.get(&key) {
                 return Ok((path.clone(), (!spec.secret_values).then(|| id.clone())));
             }
-            // Apply cannot see the exclude patterns, so it holds every link in a directory that
-            // has excluded entries to the directory itself. Plan uses the same bound.
-            let bound = if sources.pruned_under(&path) > 0 {
-                path.as_str()
+            // Apply cannot see the exclude patterns, so a directory with excluded entries is held
+            // to the rule apply uses; any other directory keeps the module root as its bound.
+            if sources.pruned_under(&path) > 0 {
+                check_links_inside(sources, &path)
             } else {
-                sup.dir.as_str()
-            };
-            check_nested(sources, bound, &path, digests)
-                .map_err(|f| wrap(locate_error(&sup.file, ptr, f)))?;
+                check_nested(sources, &sup.dir, &path, digests)
+            }
+            .map_err(|f| wrap(locate_error(&sup.file, ptr, f)))?;
             let mut entries = Vec::new();
             for (name, e) in sources.below(&path) {
                 let full = format!("{path}/{name}");
@@ -1317,6 +1322,29 @@ fn contain(
     }
 }
 
+/// Holds every link below `dir`, loaded or excluded, to [`source::target_stays_inside`], the
+/// rule apply uses for a directory source that has excluded entries. Plan and apply then agree
+/// on every link plan can see. A link inside an excluded directory is not listed here, and apply
+/// still checks it.
+fn check_links_inside(sources: &SourceSet, dir: &str) -> Result<(), LocateFault> {
+    let base = dir.split('/').filter(|c| !c.is_empty()).count();
+    let loaded = sources.below(dir).filter_map(|(rel, e)| match e {
+        source::Entry::Link(t) => Some((rel.matches('/').count(), t.as_str())),
+        _ => None,
+    });
+    let excluded = sources
+        .pruned_links_below(dir)
+        .map(|(p, t)| (p.split('/').count().saturating_sub(base + 1), t));
+    if loaded
+        .chain(excluded)
+        .all(|(depth, t)| source::target_stays_inside(t, depth))
+    {
+        Ok(())
+    } else {
+        Err(LocateFault::Escape)
+    }
+}
+
 /// Checks every link below `dir` at any depth, including excluded ones, and follows each link
 /// that reaches another directory into that directory's entries too: a link published inside
 /// a linked tree can lead out of the root through its target. A scan of a directory covers all
@@ -1356,6 +1384,12 @@ fn check_nested(
         scanned.insert(folded);
         for hop in hops {
             if let Located::Dir { path } = hop {
+                // `dir` has no excluded entry (the caller checked), so an excluded directory
+                // below a reached directory is content that nothing lists and apply does not
+                // walk: a link inside it could lead out of the root unseen.
+                if sources.pruned_dirs_under(&path) > 0 {
+                    return Err(LocateFault::Hidden(path));
+                }
                 work.insert(crate::fold::fold(&path), path);
             }
         }
@@ -1605,7 +1639,8 @@ fn collision(
 
 #[cfg(test)]
 mod tests {
-    use super::{glob, include_output_path};
+    use super::{SourceSet, check_nested, glob, include_output_path};
+    use std::collections::BTreeMap;
 
     #[test]
     fn a_pattern_star_stays_a_wildcard_when_the_name_holds_a_literal_star() {
@@ -1641,5 +1676,30 @@ mod tests {
             Some("x")
         );
         assert_eq!(include_output_path(None, "x").as_deref(), Some("x"));
+    }
+
+    #[test]
+    fn nested_links_are_scanned_once_per_top_directory_and_remembered() {
+        // D/d1/.../d30 with a link from D to every level: every reached directory lies below D,
+        // which the first scan covers, so the work is one scan and not 31.
+        let chain = |n: usize| {
+            (1..=n)
+                .map(|i| format!("d{i}"))
+                .collect::<Vec<_>>()
+                .join("/")
+        };
+        let mut set = SourceSet::new();
+        for k in 1..=30 {
+            set.insert_link(format!("r/D/l{k}"), chain(k));
+        }
+        set.insert_file(format!("r/D/{}/leaf", chain(30)), "l");
+        let mut memo = BTreeMap::new();
+        assert!(check_nested(&set, "r", "r/D", &mut memo).is_ok());
+        assert_eq!(memo.len(), 1, "{memo:?}");
+        // A directory that was checked is not walked again for the same root: a link added now
+        // is not seen with the same memo, and is seen with a fresh one.
+        set.insert_link(format!("r/D/{}/esc", chain(30)), "/etc");
+        assert!(check_nested(&set, "r", "r/D", &mut memo).is_ok());
+        assert!(check_nested(&set, "r", "r/D", &mut BTreeMap::new()).is_err());
     }
 }

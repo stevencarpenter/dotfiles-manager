@@ -243,6 +243,10 @@ pub(crate) fn render(p: &Plan, digest: &str, out: &mut dyn Write) -> std::io::Re
         }
         if let Some(n) = o.excluded {
             writeln!(out, "    note: contains {n} excluded entries, not hashed")?;
+            writeln!(
+                out,
+                "    note: apply refuses a link inside an excluded entry that is absolute or leaves the directory"
+            )?;
         }
         // The fragments a merge layers over its declared values, by name, in merge order. The
         // names are module data or the user's own files; no content and no hash is shown.

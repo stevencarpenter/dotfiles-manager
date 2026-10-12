@@ -6,7 +6,7 @@
 //! serves `render` (no inputs beyond the resource value) and `assemble` (a body and the
 //! fragments the planner listed).
 
-use crate::fsys::{Dir, Got, Peek, Sys};
+use crate::fsys::{Dir, Got, Listing, Peek, Sys};
 use dfm_model::digest::{EntryKind, TreeEntry, sha256_hex, tree_digest};
 use dfm_model::fold;
 use dfm_model::merge::{Merged, fragment_token};
@@ -421,32 +421,26 @@ const MAX_LINK_WALK_ENTRIES: usize = 1_000_000;
 /// Deepest directory the walk enters. It holds one descriptor per level.
 const MAX_LINK_WALK_DEPTH: usize = 64;
 
-/// Whether a link in a directory `depth` levels below the source directory stays inside that
-/// directory. The target must be relative and may climb only with leading `..` components, no
-/// more than `depth` of them. A `..` after a name is refused: the name may be a link, and then
-/// the climb starts from where that link points, which a lexical count cannot see. With this
-/// rule every link target resolves under the source directory, whatever chain of links it
-/// passes through, because each link in the chain obeys the same rule.
-fn target_stays_inside(target: &str, depth: usize) -> bool {
-    if target.starts_with('/') {
-        return false;
+/// The refusal for a listing the walk cannot trust: a name that is not UTF-8, or more entries
+/// than the walk has left (the listing stops one past the budget, so it may be cut).
+fn listing_refusal(listing: &Listing, budget: usize, shown: &str) -> Option<Refusal> {
+    if listing.odd > 0 {
+        return Some(Refusal::new(
+            Code::SourceUntrusted,
+            format!("source {shown} holds an entry whose name is not UTF-8"),
+        ));
     }
-    let mut left = depth;
-    let mut named = false;
-    for c in target.split('/') {
-        match c {
-            "" | "." => {}
-            ".." if named || left == 0 => return false,
-            ".." => left -= 1,
-            _ => named = true,
-        }
-    }
-    true
+    (listing.names.len() > budget).then(|| {
+        Refusal::new(
+            Code::LimitExceeded,
+            format!("source {shown} holds more than {MAX_LINK_WALK_ENTRIES} entries"),
+        )
+    })
 }
 
 /// A directory source with excluded content is not hashed, but a link inside it is still
 /// published. Every link below `dir` must stay inside the source directory (see
-/// [`target_stays_inside`]); `depth` is the number of levels between that directory and `dir`.
+/// [`dfm_model::resolve::target_stays_inside`]); `depth` is the number of levels between that directory and `dir`.
 /// The check fails closed: a listing that was cut, an entry that is not UTF-8, a directory or
 /// entry that cannot be examined, and a walk over the entry or depth limits all refuse.
 fn links_stay_inside(
@@ -462,22 +456,13 @@ fn links_stay_inside(
         )));
     }
     let listing = dir.list_upto(*budget)?;
-    if listing.odd > 0 {
-        return Err(Gather::Failed(Refusal::new(
-            Code::SourceUntrusted,
-            format!("source {shown} holds an entry whose name is not UTF-8"),
-        )));
-    }
-    if listing.names.len() > *budget {
-        return Err(Gather::Failed(Refusal::new(
-            Code::LimitExceeded,
-            format!("source {shown} holds more than {MAX_LINK_WALK_ENTRIES} entries"),
-        )));
-    }
+    listing_refusal(&listing, *budget, shown).map_or(Ok(()), |r| Err(Gather::Failed(r)))?;
     *budget -= listing.names.len();
     for name in listing.names {
         match dir.peek(sys, &name)? {
-            Peek::Link { target, .. } if !target_stays_inside(&target, depth) => {
+            Peek::Link { target, .. }
+                if !dfm_model::resolve::target_stays_inside(&target, depth) =>
+            {
                 return Err(Gather::Failed(Refusal::new(
                     Code::SourceEscape,
                     format!("source link {name} in {shown} leaves the source directory"),
@@ -602,30 +587,6 @@ mod tests {
     }
 
     #[test]
-    fn a_target_may_only_climb_with_leading_parents_and_not_past_the_directory() {
-        for (target, depth, ok) in [
-            ("keep", 0, true),
-            ("./a/b", 0, true),
-            ("", 0, true),
-            ("..", 0, false),
-            ("..", 1, true),
-            ("../..", 1, false),
-            ("../../x", 2, true),
-            ("../../../x", 2, false),
-            // A `..` after a name starts from wherever that name leads, which may be a link.
-            ("a/../b", 3, false),
-            ("../a/..", 3, false),
-            ("/etc", 3, false),
-        ] {
-            assert_eq!(
-                target_stays_inside(target, depth),
-                ok,
-                "{target} at {depth}"
-            );
-        }
-    }
-
-    #[test]
     fn a_link_two_levels_down_may_climb_two_levels_and_not_three() {
         let s = Scratch::new("climb");
         fs::create_dir_all(s.0.join("d/a/b")).unwrap();
@@ -674,6 +635,19 @@ mod tests {
         if symlink("/etc", s.0.join("d").join(odd)).is_ok() {
             assert_eq!(walk_code(&s, 100), Some(Code::SourceUntrusted));
         }
+    }
+
+    #[test]
+    fn a_listing_with_an_odd_name_or_too_many_entries_is_refused_on_every_volume() {
+        // The same decision as the walk makes, on a listing built by hand, so it does not need a
+        // volume that accepts a name which is not UTF-8.
+        let names = |n: usize| (0..n).map(|i| i.to_string()).collect::<Vec<_>>();
+        let listing = |names: Vec<String>, odd| Listing { names, odd };
+        let code = |l: Listing, budget| listing_refusal(&l, budget, "d").map(|r| r.code);
+        assert_eq!(code(listing(names(1), 1), 10), Some(Code::SourceUntrusted));
+        assert_eq!(code(listing(names(4), 0), 3), Some(Code::LimitExceeded));
+        assert_eq!(code(listing(names(3), 0), 3), None);
+        assert_eq!(code(listing(Vec::new(), 0), 0), None);
     }
 
     #[test]

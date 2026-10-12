@@ -406,6 +406,13 @@ fn a_directory_link_with_excluded_content_is_noted_and_counted() {
         1,
         "{out}"
     );
+    // A link inside an excluded entry is not listed, so the plan says that apply still checks it.
+    assert!(
+        out.contains(
+            "note: apply refuses a link inside an excluded entry that is absolute or leaves the directory"
+        ),
+        "{out}"
+    );
     let o = fx.run(&["plan", "--root", fx.root_arg(), "--json"]);
     let s = Saved::parse(&o.stdout).unwrap();
     let ops: Vec<_> = s
@@ -637,6 +644,26 @@ fn a_link_to_a_directory_inside_a_linked_tree_must_not_lead_out_of_the_root() {
 }
 
 #[test]
+fn a_link_to_a_sibling_directory_with_excluded_content_is_refused_at_plan() {
+    // plugdir/ln -> ../x, and x/.venv/esc -> /etc. x/.venv is excluded, so the loader never lists
+    // it, and plugdir has no excluded entry that would make apply walk it. The plan refuses.
+    let fx = scoped(r#""base", "profiles""#, r#""**/.venv""#);
+    add_plugs_module(&fx);
+    fx.put(&format!("{PLUGDIR}/keep"), "k");
+    fx.put("base/modules/extra/files/x/inside", "i");
+    fx.put("base/modules/extra/files/x/.venv/lib", "l");
+    let x = fx.root.join("base/modules/extra/files/x");
+    symlink("../x", fx.root.join(PLUGDIR).join("ln")).unwrap();
+    symlink("/etc", x.join(".venv/esc")).unwrap();
+    let err = plan_refused(&fx, "E_SOURCE_ESCAPE");
+    assert!(err.contains("holds an excluded directory"), "{err}");
+    // Control: without the excluded directory the same layout plans.
+    fs::remove_dir_all(x.join(".venv")).unwrap();
+    let o = plan(&fx);
+    assert_eq!(code(&o), 0, "{}", text(&o.stderr));
+}
+
+#[test]
 fn an_excluded_link_that_leaves_the_root_is_still_refused_in_a_directory_source() {
     let fx = scoped(r#""base", "profiles""#, r#""**/esc""#);
     add_plugs_module(&fx);
@@ -709,20 +736,14 @@ fn home_state(fx: &Fx) -> (Vec<PathBuf>, String, String) {
     )
 }
 
-/// Applies the plan and expects a refusal that names `want`. The first refusal may create the
-/// state store. A second one must then leave HOME and the whole store as they were, and no link
-/// may have been published.
+/// Applies the plan and expects a refusal that names `want`: exit 3 (blocked before mutation),
+/// HOME and the whole state store as they were before the first call, and no link published.
 fn apply_refused(fx: &Fx, digest: &str, want: &str) -> String {
-    let apply = || {
-        let o = fx.run(&["apply", "--root", fx.root_arg(), "--yes-plan", digest]);
-        let all = format!("{}{}", text(&o.stdout), text(&o.stderr));
-        assert_ne!(code(&o), 0, "{all}");
-        assert!(all.contains(want), "{want} not in: {all}");
-        all
-    };
-    apply();
     let before = home_state(fx);
-    let all = apply();
+    let o = fx.run(&["apply", "--root", fx.root_arg(), "--yes-plan", digest]);
+    let all = format!("{}{}", text(&o.stdout), text(&o.stderr));
+    assert_eq!(code(&o), 3, "{all}");
+    assert!(all.contains(want), "{want} not in: {all}");
     assert_eq!(home_state(fx), before, "HOME or the state store changed");
     assert!(
         fs::symlink_metadata(fx.h(".config/plugs")).is_err(),
