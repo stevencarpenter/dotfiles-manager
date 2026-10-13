@@ -484,7 +484,7 @@ pub fn check_journal_capacity(
         return Err(Refusal::new(
             Code::LimitExceeded,
             format!(
-                "the journal ({journal_len} bytes) cannot take the entries of {journaled} operations and {settling} entries of earlier work to settle without passing {} bytes. Nothing was changed. Journal rotation is not built (DFM-19)",
+                "the journal ({journal_len} bytes) cannot take the entries of {journaled} operations and {settling} entries of earlier work to settle without passing {} bytes. Nothing was changed. Journal rotation is not built (DFM-19). Fix: compact the journal by hand (docs/state.md, Recovery by hand, journal at its cap)",
                 dfm_model::state::MAX_JOURNAL_BYTES
             ),
         ));

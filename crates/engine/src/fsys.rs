@@ -848,7 +848,7 @@ impl Dir {
             return Err(Refusal::new(
                 Code::LimitExceeded,
                 format!(
-                    "{} would pass {max_total} bytes; it is not appended",
+                    "{} would pass {max_total} bytes; it is not appended. Fix: compact it by hand (docs/state.md, Recovery by hand, journal at its cap)",
                     self.at(name).display()
                 ),
             ));
@@ -1270,6 +1270,32 @@ impl Lock {
             .and_then(|()| f.write_all(note.as_bytes()))
             .map_err(|e| io("write lock note", &e))?;
         Ok(lock)
+    }
+
+    /// Reports whether a writer holds the lock, without creating the file and without waiting.
+    /// A missing file means no writer. The shared try-lock is dropped at once. A writer that
+    /// starts in that instant gets `E_LOCKED` and can retry.
+    pub fn probe(parent: &Dir, name: &str) -> Result<(), Refusal> {
+        check_name(name)?;
+        let bad = |d: String| storage(format!("{}: {d}", parent.at(name).display()));
+        let flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC;
+        let fd = match rfs::openat(&parent.fd, name, flags, Mode::empty()) {
+            Ok(fd) => fd,
+            Err(Errno::NOENT) => return Ok(()),
+            Err(Errno::LOOP) => return Err(bad("is a symlink".into())),
+            Err(e) => return Err(bad(io_kind(e))),
+        };
+        if kind(&rfs::fstat(&fd).map_err(|e| sys_err("stat lock", e))?) != FileType::RegularFile {
+            return Err(bad("must be a regular file".into()));
+        }
+        match File::from(fd).try_lock_shared() {
+            Ok(()) => Ok(()),
+            Err(TryLockError::WouldBlock) => Err(Refusal::new(
+                Code::Locked,
+                "a writer is running and holds the manager lock",
+            )),
+            Err(TryLockError::Error(e)) => Err(io("probe lock", &e)),
+        }
     }
 
     /// Fails unless the entry still names the file this lock holds. Called before every write.

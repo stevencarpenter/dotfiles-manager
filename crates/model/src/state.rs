@@ -182,7 +182,7 @@ impl Stamp {
     }
 
     pub fn matches(&self, b: &Binding) -> bool {
-        self.profile == b.profile() && self.machine_id == b.machine_id()
+        self.same_identity(&Stamp::of(b))
     }
 
     pub fn same_identity(&self, other: &Stamp) -> bool {

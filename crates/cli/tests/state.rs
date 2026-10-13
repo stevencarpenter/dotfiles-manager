@@ -505,12 +505,60 @@ fn a_second_writer_gets_exit_3_and_writes_nothing() {
         before,
         "the refused writer changed nothing"
     );
-    // Read-only commands still run while the lock is held.
-    assert!(matches!(check(h.path()).status.code(), Some(0 | 1)));
 
     fs::write(&release, "go").unwrap();
     assert_eq!(slow.wait().unwrap().code(), Some(0));
     assert_eq!(journal_phases(h.path()), ["intent", "done"]);
+    assert_eq!(check(h.path()).status.code(), Some(0));
+}
+
+#[test]
+fn state_check_while_a_writer_runs_reports_the_lock_and_no_findings() {
+    let h = bound_home("check-locked");
+    let out = out_file(h.path(), "slow");
+    let release = h.path().join("release-holder");
+    let mut slow = cmd(
+        h.path(),
+        &[
+            "__record-op",
+            "--resource",
+            "core.slow",
+            "--output",
+            &out,
+            "--content",
+            "s",
+        ],
+    )
+    .env(
+        "DFM_FAILPOINT",
+        format!("after-intent:wait-{}", release.display()),
+    )
+    .stdout(Stdio::null())
+    .stderr(Stdio::null())
+    .spawn()
+    .unwrap();
+    let journal = state(h.path()).join("journal.jsonl");
+    wait_for("the first intent", || {
+        fs::metadata(&journal).is_ok_and(|m| m.len() > 0)
+    });
+    // A stray temp file is what a running apply leaves, and it must not be reported.
+    fs::write(state(h.path()).join("receipts/.x.json.1.2.tmp"), "half").unwrap();
+
+    let before = snapshot(&state(h.path()));
+    let o = check(h.path());
+    let (so, se) = (text(&o.stdout), text(&o.stderr));
+    assert_eq!(o.status.code(), Some(3), "{so}{se}");
+    assert!(se.contains("E_LOCKED"), "{se}");
+    assert!(so.contains("writer is running"), "{so}");
+    assert!(
+        !so.contains("E_STATE_INVALID") && !so.contains("stray"),
+        "{so}"
+    );
+    assert_eq!(snapshot(&state(h.path())), before, "check wrote nothing");
+
+    fs::write(&release, "go").unwrap();
+    assert_eq!(slow.wait().unwrap().code(), Some(0));
+    fs::remove_file(state(h.path()).join("receipts/.x.json.1.2.tmp")).unwrap();
     assert_eq!(check(h.path()).status.code(), Some(0));
 }
 
@@ -1417,6 +1465,42 @@ fn recover_repairs_one_torn_final_journal_line_and_refuses_a_torn_middle_line() 
         text(&r.stderr)
     );
     assert_eq!(fs::read(&j).unwrap(), bad);
+}
+
+#[test]
+fn an_abort_after_the_cut_leaves_the_cut_text_and_the_next_run_reports_it() {
+    let h = bound_home("torn-abort");
+    assert_eq!(
+        record(h.path(), "core.victim", "victim", "v").status.code(),
+        Some(0)
+    );
+    let j = state(h.path()).join("journal.jsonl");
+    let mut torn = fs::read(&j).unwrap();
+    let sound = torn.len();
+    torn.extend_from_slice(b"{\"schema\":1,\"op_");
+    fs::write(&j, &torn).unwrap();
+    // The process dies after the cut, before the repair record is written.
+    let r = with_fail(
+        h.path(),
+        "journal-before-write:abort",
+        &["state", "recover"],
+    );
+    assert_ne!(r.status.code(), Some(0));
+    assert_eq!(fs::read(&j).unwrap().len(), sound, "the torn line was cut");
+    let kept = state(h.path()).join("journal.torn");
+    assert_eq!(fs::read(&kept).unwrap(), b"{\"schema\":1,\"op_");
+
+    // The next run finds nothing torn. It must not lose the cut text, and the check must say so.
+    let r = run(h.path(), &["state", "recover"]);
+    assert_eq!(r.status.code(), Some(0), "{}", text(&r.stderr));
+    assert_eq!(fs::read(&kept).unwrap(), b"{\"schema\":1,\"op_");
+    let c = check(h.path());
+    assert_eq!(c.status.code(), Some(1), "{}", text(&c.stdout));
+    assert!(
+        text(&c.stdout).contains("journal.torn"),
+        "{}",
+        text(&c.stdout)
+    );
 }
 
 #[test]
