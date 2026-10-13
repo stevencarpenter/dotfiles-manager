@@ -9,8 +9,8 @@
 
 use crate::fail::Fail;
 use crate::fsys::{
-    Dir, Ident, Peek, Stamp, Sys, check_name, ident_of, kind, mode_bits, publish_err, rename_new,
-    sys_err, temp_name, unconfirmed,
+    Dir, Ident, Peek, Stamp, Sys, check_name, ident_of, kind, mode_bits, sys_err, temp_name,
+    unconfirmed,
 };
 use dfm_model::plan::{file_fingerprint, link_fingerprint};
 use dfm_model::{Code, Refusal};
@@ -301,19 +301,22 @@ impl Dir {
         if mode > 0o777 {
             return Err(conflict("a file mode above 0777 is not published"));
         }
+        if matches!(how, Publish::Create) {
+            return if self.publish_new_mode(name, bytes, mode, fail, "file")? {
+                Ok(())
+            } else {
+                Err(conflict(format!(
+                    "{} appeared while applying; it is left alone",
+                    self.at(name).display()
+                )))
+            };
+        }
         fail.hit("file-before-write")?;
         let tmp = self.write_temp_mode(name, bytes, mode)?;
         let commit = || -> Result<(), Refusal> {
             fail.hit("file-after-tmp")?;
             match how {
-                Publish::Create => match rename_new(&self.fd, &tmp, name) {
-                    Ok(()) => Ok(()),
-                    Err(Errno::EXIST) => Err(conflict(format!(
-                        "{} appeared while applying; it is left alone",
-                        self.at(name).display()
-                    ))),
-                    Err(e) => Err(publish_err(&self.at(name), e)),
-                },
+                Publish::Create => unreachable!("handled above"),
                 Publish::Replace {
                     expected_sha256,
                     uid,
