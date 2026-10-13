@@ -9,8 +9,9 @@
 #
 # POSIX sh plus system tools from a fixed PATH. No cargo, rustc or rustup process
 # starts before the toolchain tree digest and the build controls pass.
-# Exit: 0 ok, 1 failed (build, or a check after the first mutation, which is the binary copy), 2 usage,
-# 3 refused before any mutation.
+# Exit: 0 ok, 1 failed (build, or a check after the first mutation), 2 usage, 3 refused before any
+# mutation. The first mutation is the reset of cargo-home, rustup-home and build-home in the data
+# directory. Before it, only the scratch build directory exists, and the exit trap removes it.
 # Scrub the caller's environment before anything else runs: exported shell functions of any
 # name (BASH_FUNC_*, including ones named like `[` or `test`), PERL5LIB or PERL5OPT (shasum
 # is perl), CDPATH, ENV and the like must not influence the checks. Before the scrub this
@@ -64,7 +65,7 @@ TAB=$(printf '\t')
 NL='
 '
 
-# Exit 3 means nothing was changed. install sets refuse_code=1 once it has copied into versions/.
+# Exit 3 means nothing was changed. install sets refuse_code=1 at its first change to the data directory.
 refuse_code=3
 refuse() { printf 'error: %s %s\n' "$1" "$2" >&2; exit "$refuse_code"; }
 usage() { printf 'error: E_USAGE %s\n' "$1" >&2; exit 2; }
@@ -668,6 +669,7 @@ cmd_install() {
   chmod -R a-w "$build/stage" # same-uid writers can still undo this; see docs/bootstrap.md
   # Controls passed. From here the pinned toolchain runs under a constructed environment.
   check_cache_tree; check_data_tree # again: the window since the first check was the staging and the controls
+  refuse_code=1 # the first change outside the scratch build directory is next; refusals after it are failures
   for d in cargo-home rustup-home build-home; do rm -rf "${DATA:?}/$d"; mkdir -p "$DATA/$d"; done
   cd "$build"
   tcrun() { /usr/bin/env -i PATH="$TC/bin:$SYSPATH" HOME="$DATA/build-home" CARGO_HOME="$DATA/cargo-home" \
@@ -696,7 +698,6 @@ cmd_install() {
   # to a file that mktemp creates exclusively (never through a link), then renamed into place.
   check_private_path "$DATA_REL/versions/$name"
   mkdir -p "$DATA/versions/$name" "$HOME_DIR/.local/bin"
-  refuse_code=1 # the first mutation happened; later refusals are failures, not "before any change"
   check_private_path "$DATA_REL/versions/$name"
   [ ! -d "$DATA/versions/$name/dotfiles-manager" ] ||
     refuse E_PREREQ_MISSING "$DATA/versions/$name/dotfiles-manager is a directory; move it away first"
