@@ -265,6 +265,9 @@ fn run_inner(
         .map_err(|r| store.stamp(dfm_engine::signal::requested().unwrap_or(r)))?;
     let finished = now_unix().unwrap_or(started);
 
+    for warning in &report.warnings {
+        writeln!(out, "warning: {}", crate::bounded(warning)).map_err(w)?;
+    }
     if report.repaired > 0 {
         writeln!(
             out,

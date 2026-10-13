@@ -119,8 +119,39 @@ pub(crate) const NAME_MAX: usize = 255;
 /// unit test builds the longest name and compares its length with this value.
 pub(crate) const TEMP_NAME_EXTRA: usize = 1 + 1 + 10 + 1 + 10 + 1 + 9 + 1 + 5;
 
-/// A hidden same-directory name for a staged file or link: unique per process and call.
+thread_local! {
+    static STAGE_TAG: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
+
+/// The tag in the staged names of the attempt `op_id`: 16 hex digits of its SHA-256. Recovery
+/// derives the same tag from the intent entry, so it can remove exactly the names this attempt
+/// made and no other file.
+pub(crate) fn stage_tag(op_id: &str) -> String {
+    let mut hex = dfm_model::digest::sha256_hex(op_id.as_bytes());
+    hex.truncate(16);
+    hex
+}
+
+/// Runs `f` with every staged name on this thread tagged for the attempt `op_id`.
+pub(crate) fn staged_as<T>(op_id: &str, f: impl FnOnce() -> T) -> T {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            STAGE_TAG.with(|t| *t.borrow_mut() = None);
+        }
+    }
+    STAGE_TAG.with(|t| *t.borrow_mut() = Some(stage_tag(op_id)));
+    let _reset = Reset;
+    f()
+}
+
+/// A hidden same-directory name for a staged file or link. Inside [`staged_as`] it is
+/// `.<name>.<tag>.<suffix>`, which recovery can name exactly. Otherwise it is unique per process
+/// and call.
 pub(crate) fn temp_name(name: &str, suffix: &str) -> String {
+    if let Some(tag) = STAGE_TAG.with(|t| t.borrow().clone()) {
+        return format!(".{name}.{tag}.{suffix}");
+    }
     static N: AtomicU32 = AtomicU32::new(0);
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -136,24 +167,6 @@ pub(crate) fn temp_name(name: &str, suffix: &str) -> String {
 
 fn temp_name_of(name: &str, pid: u32, n: u32, nanos: u32, suffix: &str) -> String {
     format!(".{name}.{pid}.{n}.{nanos}.{suffix}")
-}
-
-/// Whether `candidate` has the exact shape [`temp_name_of`] makes for `name`.
-fn is_temp_of(name: &str, candidate: &str) -> bool {
-    let Some(rest) = candidate
-        .strip_prefix('.')
-        .and_then(|c| c.strip_prefix(name))
-        .and_then(|c| c.strip_prefix('.'))
-    else {
-        return false;
-    };
-    let mut parts = rest.split('.');
-    let numbers = (0..3).all(|_| {
-        parts
-            .next()
-            .is_some_and(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
-    });
-    numbers && matches!(parts.next(), Some("tmp" | "stage")) && parts.next().is_none()
 }
 
 /// The refusal for a failed exclusive rename that is not `EEXIST`. `ENOTSUP` and `EINVAL` mean
@@ -624,20 +637,30 @@ impl Dir {
         self.write_temp_mode(name, bytes, 0o600)
     }
 
-    /// Removes the staged names ([`temp_name`]) that an interrupted publish of `name` left in
-    /// this directory. Only a regular file or a link of `uid` goes, without following a link.
-    /// The caller holds the writer lock, so no live publish owns such a name. Best effort: a
-    /// name that cannot be removed stays, and the next settling tries again.
-    pub(crate) fn sweep_stages(&self, sys: &Sys, name: &str) {
-        let Ok(listing) = self.list() else { return };
-        for n in listing.names.iter().filter(|n| is_temp_of(name, n)) {
-            if matches!(
-                self.peek(sys, n),
-                Ok(Peek::File { own: true, .. } | Peek::Link { own: true, .. })
-            ) {
-                self.drop_temp(n);
+    /// Removes the names an interrupted attempt `op_id` staged for `name` (see [`staged_as`]),
+    /// and only those. Only a regular file or a link of the current user goes, without following
+    /// a link. The caller holds the writer lock, so no live publish owns such a name. Returns one
+    /// message for each name that exists and could not be removed.
+    pub(crate) fn sweep_stages(&self, sys: &Sys, name: &str, op_id: &str) -> Vec<String> {
+        let tag = stage_tag(op_id);
+        let mut left = Vec::new();
+        for suffix in ["tmp", "stage"] {
+            let staged = format!(".{name}.{tag}.{suffix}");
+            let shown = self.at(&staged).display().to_string();
+            match self.peek(sys, &staged) {
+                Ok(Peek::Missing) => {}
+                Ok(Peek::File { own: true, .. } | Peek::Link { own: true, .. }) => {
+                    if let Err(e) = rfs::unlinkat(&self.fd, &staged, AtFlags::empty()) {
+                        left.push(format!("could not remove the staged copy {shown}: {e}"));
+                    }
+                }
+                Ok(_) => left.push(format!(
+                    "the staged name {shown} is not a file or link of the current user; it is left alone"
+                )),
+                Err(e) => left.push(format!("could not inspect {shown}: {}", e.detail)),
             }
         }
+        left
     }
 
     /// As [`Dir::write_temp`], with the mode the published file will have. The mode is set
