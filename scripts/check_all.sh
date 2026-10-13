@@ -20,8 +20,11 @@ step_scripts() {
     sh -n scripts/bootstrap.sh
     if command -v shellcheck >/dev/null 2>&1; then
         shellcheck -s sh -S warning scripts/bootstrap.sh
+    elif [ "${DFM_SKIP_SHELLCHECK:-}" = 1 ]; then
+        echo "SKIPPED: shellcheck (DFM_SKIP_SHELLCHECK=1)"
     else
-        echo "SKIPPED: shellcheck is not installed"
+        echo "error: shellcheck is not installed; install it or set DFM_SKIP_SHELLCHECK=1" >&2
+        return 1
     fi
     uv run --python 3.14 scripts/test_check_staged.py
 }
