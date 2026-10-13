@@ -508,7 +508,7 @@ struct Exec<'a, 'r> {
     /// Resources with an `unknown` entry that has no intent record, so no path is known. Every
     /// operation of the resource is blocked. Resource name to journal id.
     unknown_resources: BTreeMap<String, String>,
-    /// The last good clock reading (unix seconds). A clock that fails later in the run reuses
+    /// The last good clock reading (nanoseconds since the epoch). A clock that fails later in the run reuses
     /// it, so no stamp is ever invented.
     clock: Cell<u64>,
 }
