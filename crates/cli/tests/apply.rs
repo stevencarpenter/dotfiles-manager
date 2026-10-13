@@ -2911,3 +2911,42 @@ fn a_ledger_link_entry_that_is_now_a_directory_is_cleared_by_moving_it_aside() {
     assert!(!fx.owned_paths().contains(&".config/nvim".to_string()));
     assert!(fx.h(".config/nvim.mine/mine.lua").is_file());
 }
+
+#[test]
+fn a_renamed_resource_over_the_old_owners_present_output_writes_nothing() {
+    let fx = Fx::new();
+    assert_eq!(code(&fx.apply(&[])), 0);
+    let module = fs::read_to_string(fx.root.join("base/modules/core/module.toml")).unwrap();
+    fx.put(
+        "base/modules/core/module.toml",
+        &module.replace("id = \"git\"", "id = \"gitcfg\""),
+    );
+    let ledger_before = fs::read(fx.state().join("ledger.json")).unwrap();
+    // The old link still holds: current, and apply changes nothing.
+    let before = fingerprint(fx.home.path());
+    let plan = fx.saved().plan;
+    assert!(plan.blockers.is_empty(), "{:?}", plan.blockers);
+    let leaf = plan
+        .operations
+        .iter()
+        .find(|o| o.id == "core.gitcfg@.config/git/config")
+        .unwrap();
+    assert_eq!(leaf.status, dfm_model::plan::Status::Current);
+    let o = fx.apply(&[]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    assert_eq!(fingerprint(fx.home.path()), before);
+    // The user retargeted the old link: blocked, and apply writes nothing.
+    fs::remove_file(fx.h(".config/git/config")).unwrap();
+    symlink("/my/own/gitconfig", fx.h(".config/git/config")).unwrap();
+    let before = fingerprint(fx.home.path());
+    let ledger_before2 = fs::read(fx.state().join("ledger.json")).unwrap();
+    assert_eq!(ledger_before, ledger_before2);
+    let o = fx.apply(&[]);
+    assert_eq!(code(&o), 3, "{}", stderr(&o));
+    assert!(stderr(&o).contains("E_CONFLICT"), "{}", stderr(&o));
+    assert_eq!(fingerprint(fx.home.path()), before);
+    assert_eq!(
+        fs::read(fx.state().join("ledger.json")).unwrap(),
+        ledger_before
+    );
+}

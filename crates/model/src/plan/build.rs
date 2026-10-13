@@ -724,15 +724,14 @@ impl Planner<'_> {
         // The ledger gives one path one owner. When another resource owns this path and the path
         // is missing, the plan retires that entry first, so apply never records two owners.
         let mut owner_state = self.ledger_state(claim, r.sensitive);
-        if matches!(seen.node, Node::Missing {})
-            && let Some(old) = self
-                .ledger_entry(claim)
+        let stale = if matches!(seen.node, Node::Missing {}) {
+            self.ledger_entry(claim)
                 .filter(|e| e.resource != r.id)
                 .cloned()
-        {
-            self.remove(&old);
-            op.after
-                .push(format!("remove@{}@{}", old.resource, old.path));
+        } else {
+            None
+        };
+        if stale.is_some() {
             owner_state = ledger_state(None, r.sensitive);
         }
         op.preconditions.push(Precondition {
@@ -745,6 +744,13 @@ impl Planner<'_> {
         } else {
             decide(r, claim, &seen, link, op.ownership, unowned)?
         };
+        // The decision succeeded, so the old owner's entry is retired first. A merge resource
+        // never gets here with another owner: the CLI blocks it before this (merge_plan.rs).
+        if let Some(old) = stale {
+            self.remove(&old);
+            op.after
+                .push(format!("remove@{}@{}", old.resource, old.path));
+        }
         op.action = action;
         op.status = status;
         op.ownership = ownership;
@@ -823,15 +829,6 @@ impl Planner<'_> {
         }) = fact.map(|f| &f.verdict)
         {
             return Err(fail(*code, "target", detail.clone(), correction.clone()));
-        }
-        // A takeover records this resource as owner, and the ledger allows one owner per path.
-        if !matches!(seen.node, Node::Missing {})
-            && let Some(e) = self.ledger_entry(path).filter(|e| e.resource != r.id)
-        {
-            return Err(conflict(
-                format!("{path} is recorded as owned by {}", e.resource),
-                "move the file aside, then plan again: the plan retires the old entry and merges into a new file",
-            ));
         }
         if matches!(seen.node, Node::Missing {}) {
             return Ok((
