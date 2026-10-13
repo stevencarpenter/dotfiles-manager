@@ -23,7 +23,6 @@ pub const MIN_WIDTH: usize = 40;
 pub enum DoctorCode {
     Ok,
     NaSensitive,
-    NaGenerated,
     OutputMissing,
     PlanPending,
     PlanRemoval,
@@ -38,10 +37,9 @@ pub enum DoctorCode {
 }
 
 impl DoctorCode {
-    pub const ALL: [DoctorCode; 14] = [
+    pub const ALL: [DoctorCode; 13] = [
         DoctorCode::Ok,
         DoctorCode::NaSensitive,
-        DoctorCode::NaGenerated,
         DoctorCode::OutputMissing,
         DoctorCode::PlanPending,
         DoctorCode::PlanRemoval,
@@ -59,7 +57,6 @@ impl DoctorCode {
         match self {
             DoctorCode::Ok => "D_OK",
             DoctorCode::NaSensitive => "D_NA_SENSITIVE",
-            DoctorCode::NaGenerated => "D_NA_GENERATED",
             DoctorCode::OutputMissing => "D_OUTPUT_MISSING",
             DoctorCode::PlanPending => "D_PLAN_PENDING",
             DoctorCode::PlanRemoval => "D_PLAN_REMOVAL",
@@ -78,9 +75,6 @@ impl DoctorCode {
         match self {
             DoctorCode::Ok => "The check passed.",
             DoctorCode::NaSensitive => "A sensitive output. Its content is never read or hashed.",
-            DoctorCode::NaGenerated => {
-                "A generated file. Doctor does not compare generated content."
-            }
             DoctorCode::OutputMissing => {
                 "An owned output no longer exists. Apply publishes it again."
             }
@@ -418,18 +412,17 @@ mod tests {
         match c {
             DoctorCode::Ok => 0,
             DoctorCode::NaSensitive => 1,
-            DoctorCode::NaGenerated => 2,
-            DoctorCode::OutputMissing => 3,
-            DoctorCode::PlanPending => 4,
-            DoctorCode::PlanRemoval => 5,
-            DoctorCode::Unrecorded => 6,
-            DoctorCode::StatePartial => 7,
-            DoctorCode::LastRun => 8,
-            DoctorCode::NoReceipt => 9,
-            DoctorCode::StateAbsent => 10,
-            DoctorCode::LockNote => 11,
-            DoctorCode::DependsUnknown => 12,
-            DoctorCode::ProbingNotBuilt => 13,
+            DoctorCode::OutputMissing => 2,
+            DoctorCode::PlanPending => 3,
+            DoctorCode::PlanRemoval => 4,
+            DoctorCode::Unrecorded => 5,
+            DoctorCode::StatePartial => 6,
+            DoctorCode::LastRun => 7,
+            DoctorCode::NoReceipt => 8,
+            DoctorCode::StateAbsent => 9,
+            DoctorCode::LockNote => 10,
+            DoctorCode::DependsUnknown => 11,
+            DoctorCode::ProbingNotBuilt => 12,
         }
     }
 
@@ -437,7 +430,7 @@ mod tests {
     fn all_lists_every_variant_once() {
         let mut idx: Vec<usize> = DoctorCode::ALL.iter().map(|c| index(*c)).collect();
         idx.sort_unstable();
-        assert_eq!(idx, (0..=13).collect::<Vec<_>>());
+        assert_eq!(idx, (0..=12).collect::<Vec<_>>());
     }
 
     #[test]

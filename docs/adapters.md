@@ -96,6 +96,8 @@ The fixture shows only scalar values under a section. These rules are the minimu
 
 **Order.** A TOML table has no order (the `toml` crate is used without its order-preserving feature, and the gate allows no new dependency). So sections, keys and subsections are written in byte order of their names, and only the elements of an array keep the author's order. Output is deterministic. A setting whose meaning depends on the order of two different keys cannot be expressed in one render resource. Use the include order instead: two `git-config/v1` files that a core `[include]` lists in the order Git must read them (docs/resolver.md, native precedence).
 
+**Case.** Git reads section names and key names without regard to ASCII case. Two section names, or two keys in one section or subsection, that differ only in ASCII case are refused (`E_MANIFEST_INVALID`). Subsection names are case-sensitive and may differ only in case.
+
 **Secrets.** The adapter does not read a vault. A resource with `secret_values` has another adapter. Values are written as given, so put no credential in a `git-config/v1` value.
 
 Errors are `E_MANIFEST_INVALID` with the section or key name. The value is not repeated, except for the code point of a refused control character.
@@ -334,5 +336,5 @@ The unmodified example profile now plans and applies in an isolated HOME. The te
 - **SSH and shell assemblies.** Only the two fixtures' adapters exist. A tmux, SSH or shell assembly with its own ordering rule needs its own adapter (code), or can use `text-fragments/v1` when "body plus sorted fragments" is the rule.
 - **A `ports` crate.** See Layering.
 - **Reload.** A published file is not reloaded (docs/apply.md). Dependents of a failed generation are blocked in the run. No reload exists to block.
-- **Doctor.** `doctor` reports a generated file as `D_NA_GENERATED`. It does not compare generated content.
+- **Doctor.** `doctor` compares a generated file by its recorded fingerprint, like any owned file. It does not regenerate the content to compare it.
 - **Mode drift without a declared mode.** `current` compares the mode only when the resource declares one. A file with no declared mode is judged by content alone, although apply publishes it with mode 0600.

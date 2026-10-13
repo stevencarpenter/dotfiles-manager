@@ -390,18 +390,13 @@ fn an_unbound_machine_reports_the_binding_and_exits_1() {
 // ---- not applicable -----------------------------------------------------------------------
 
 #[test]
-fn sensitive_and_generated_resources_are_not_applicable_and_read_no_content() {
+fn sensitive_resources_are_not_applicable_and_read_no_content() {
     let fx = personal();
     let (_, rows) = fx.rows();
     let na = |c: &str| rows.iter().filter(|r| r["code"] == c).collect::<Vec<_>>();
     assert!(!na("D_NA_SENSITIVE").is_empty(), "{rows:#?}");
-    assert!(!na("D_NA_GENERATED").is_empty(), "{rows:#?}");
     assert!(na("D_NA_SENSITIVE").iter().all(|r| r["status"] == "N/A"));
-    assert!(
-        na("D_NA_GENERATED")
-            .iter()
-            .all(|r| r["status"] == "N/A" && r["detail"].as_str().unwrap().contains("no generator"))
-    );
+    assert!(na("D_NA_GENERATED").is_empty(), "{rows:#?}");
     // Tools and applications are not probed: UNKNOWN, and not required.
     let probe = na("D_PROBING_NOT_BUILT");
     assert!(!probe.is_empty());
@@ -409,6 +404,28 @@ fn sensitive_and_generated_resources_are_not_applicable_and_read_no_content() {
         probe
             .iter()
             .all(|r| r["status"] == "UNKNOWN" && r["required"] == false)
+    );
+}
+
+#[test]
+fn a_generated_output_reaches_the_pending_and_missing_rows() {
+    let fx = personal();
+    let (_, rows) = fx.rows();
+    assert_eq!(
+        status(&rows, ".codex/AGENTS.md"),
+        ("WARN", "D_PLAN_PENDING")
+    );
+    let o = fx.run(&["plan", "--root", fx.root_arg(), "--json"]);
+    let digest = dfm_model::plan::Saved::parse(&o.stdout)
+        .unwrap()
+        .plan_digest;
+    let o = fx.run(&["apply", "--root", fx.root_arg(), "--yes-plan", &digest]);
+    assert_eq!(code(&o), 0, "{}\n{}", text(&o.stderr), text(&o.stdout));
+    fs::remove_file(fx.h(".codex/AGENTS.md")).unwrap();
+    let (_, rows) = fx.rows();
+    assert_eq!(
+        status(&rows, ".codex/AGENTS.md"),
+        ("WARN", "D_OUTPUT_MISSING")
     );
 }
 
