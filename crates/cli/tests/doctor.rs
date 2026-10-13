@@ -849,6 +849,49 @@ fn a_stray_state_entry_is_a_partial_warning() {
 }
 
 #[test]
+fn a_staged_copy_of_an_older_format_beside_an_owned_output_is_a_warning_and_is_kept() {
+    let fx = applied();
+    let (_, rows) = fx.rows();
+    let owned = rows
+        .iter()
+        .find(|r| r["kind"] == "output" && r["status"] == "OK")
+        .unwrap()["subject"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let (dir, name) = owned.rsplit_once('/').unwrap_or(("", &owned));
+    let parent = if dir.is_empty() { fx.h("") } else { fx.h(dir) };
+    let decoy = parent.join(format!(".{name}.1.2.3.tmp"));
+    let current = parent.join(format!(".{name}.0123456789abcdef.tmp"));
+    fs::write(&decoy, "mine\n").unwrap();
+    fs::write(&current, "tagged\n").unwrap();
+    let (c, rows) = fx.rows();
+    assert_eq!(c, 0, "{rows:#?}");
+    let staged: Vec<&Value> = rows
+        .iter()
+        .filter(|r| r["code"] == "D_STAGED_COPY")
+        .collect();
+    assert_eq!(staged.len(), 1, "{rows:#?}");
+    assert_eq!(staged[0]["status"], "WARN");
+    assert!(
+        staged[0]["subject"]
+            .as_str()
+            .unwrap()
+            .ends_with(&format!(".{name}.1.2.3.tmp"))
+    );
+    assert_eq!(
+        staged[0]["fix"],
+        "A staged copy from an interrupted run; check it, then remove it by hand."
+    );
+    assert_eq!(
+        fs::read_to_string(&decoy).unwrap(),
+        "mine\n",
+        "doctor deletes nothing"
+    );
+    assert_eq!(fs::read_to_string(&current).unwrap(), "tagged\n");
+}
+
+#[test]
 fn no_receipt_is_not_applicable_and_a_failed_last_run_is_a_warning() {
     let fx = Fx::new();
     let (_, rows) = fx.rows();

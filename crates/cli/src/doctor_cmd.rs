@@ -22,6 +22,9 @@ use std::io::{Read, Write};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::Path;
 
+/// The most names doctor reads from one directory when it looks for staged copies.
+const STRAY_SCAN_MAX: usize = 100_000;
+
 const DEFAULT_WIDTH: usize = 80;
 const LOCK_NOTE_BYTES: u64 = 256;
 const SHOWN_STRAYS: usize = 5;
@@ -255,7 +258,17 @@ fn state_rows(
     }
     // The lenient reads: one output with an unsafe parent must not hide the rest of the ledger.
     let owned = ledger_rows(&store, layout, rows);
-    journal_rows(&store, rows);
+    let open = journal_rows(&store, rows);
+    let paths = owned
+        .iter()
+        .flatten()
+        .map(|o| o.path.clone())
+        .chain(open.iter().filter_map(|p| {
+            let rel = Path::new(p).strip_prefix(&layout.home).ok()?;
+            Some(rel.to_str()?.to_string())
+        }))
+        .collect();
+    staged_copy_rows(sys, layout, &paths, rows);
     let bad = evidence_rows(&l, &findings, rows);
     receipt_row(&l, bad, rows);
     owned
@@ -307,20 +320,29 @@ fn ledger_rows(store: &Store, layout: &Layout, rows: &mut Vec<Row>) -> Option<Ve
     Some(owned)
 }
 
-fn journal_rows(store: &Store, rows: &mut Vec<Row>) {
+/// Adds the journal rows. Returns the paths of the intents and unknown entries that are not
+/// settled.
+fn journal_rows(store: &Store, rows: &mut Vec<Row>) -> Vec<String> {
     let entries = match store.read_journal_lenient() {
         Ok(e) => e,
         Err(r) => {
             rows.push(refusal_row("state", "journal.jsonl", &r));
-            return;
+            return Vec::new();
         }
     };
+    let mut open = Vec::new();
     rows.push(ok_row(
         "state",
         "journal.jsonl",
         &format!("{} entries", entries.len()),
     ));
     for e in unfinished(&entries) {
+        open.extend(
+            e.recovery
+                .iter()
+                .flat_map(|r| &r.outputs)
+                .map(|o| o.path.clone()),
+        );
         let subject = e
             .recovery
             .iter()
@@ -341,6 +363,7 @@ fn journal_rows(store: &Store, rows: &mut Vec<Row>) {
         ));
     }
     for u in unresolved(&entries) {
+        open.extend(u.paths().map(str::to_string));
         let id = &u.unknown.op_id;
         let subject = u.paths().next().unwrap_or(&u.unknown.op);
         let blocks = if u.paths().next().is_some() {
@@ -367,6 +390,72 @@ fn journal_rows(store: &Store, rows: &mut Vec<Row>) {
                 }
             ),
         ));
+    }
+    open
+}
+
+/// Whether `entry` has the staged-name shape of an older build: `.<name>.<pid>.<n>.<nanos>.tmp`
+/// or `.stage`. Current builds tag the name with a hash, which this does not match.
+fn is_old_stage(entry: &str, name: &str) -> bool {
+    let Some(rest) = entry
+        .strip_prefix('.')
+        .and_then(|e| e.strip_prefix(name))
+        .and_then(|e| e.strip_prefix('.'))
+    else {
+        return false;
+    };
+    let Some((nums, suffix)) = rest.rsplit_once('.') else {
+        return false;
+    };
+    let digits = |d: &str| !d.is_empty() && d.bytes().all(|b| b.is_ascii_digit());
+    matches!(suffix, "tmp" | "stage") && nums.split('.').count() == 3 && nums.split('.').all(digits)
+}
+
+/// A WARN row for each name beside an owned output or an open-intent path that looks like a
+/// staged copy of an older build. Such a name is never swept, because a user file can have the
+/// same shape. Doctor lists the directory and reads no content. `rels` are HOME-relative.
+fn staged_copy_rows(sys: Sys, layout: &Layout, rels: &BTreeSet<String>, rows: &mut Vec<Row>) {
+    let Ok(home) = Dir::open_home(&sys, &layout.home) else {
+        return;
+    };
+    let mut seen = BTreeSet::new();
+    for rel in rels {
+        let mut parts: Vec<&str> = rel.split('/').collect();
+        let Some(name) = parts.pop() else { continue };
+        let mut dir: Option<Dir> = None;
+        let mut reachable = true;
+        for part in &parts {
+            match dir.as_ref().unwrap_or(&home).peek_dir(part) {
+                Ok(Some(d)) => dir = Some(d),
+                _ => {
+                    reachable = false;
+                    break;
+                }
+            }
+        }
+        if !reachable {
+            continue;
+        }
+        let dir = dir.as_ref().unwrap_or(&home);
+        let Ok(listing) = dir.list_upto(STRAY_SCAN_MAX) else {
+            continue;
+        };
+        for entry in listing.names.iter().filter(|e| is_old_stage(e, name)) {
+            let staged = match rel.rsplit_once('/') {
+                Some((parent, _)) => format!("{parent}/{entry}"),
+                None => entry.clone(),
+            };
+            if seen.insert(staged.clone()) {
+                rows.push(Row::new(
+                    "output",
+                    D::StagedCopy,
+                    Level::Warn,
+                    &staged,
+                    &format!("a name of an older staged-copy format beside {}", clip(rel)),
+                    "A staged copy from an interrupted run; check it, then remove it by hand.",
+                ));
+            }
+        }
     }
 }
 
@@ -752,7 +841,11 @@ fn output_rows(
             .as_deref()
             .filter(|_| op.action != Action::CreateDir)
         {
-            by_path.entry(path).or_default().1 = Some(op);
+            let slot = by_path.entry(path).or_default();
+            let held = slot.1.map(|h| h.resource.as_str());
+            if takes_slot(slot.0.map(|o| o.resource.as_str()), held, &op.resource) {
+                slot.1 = Some(op);
+            }
         }
     }
     let sensitive = sensitive_paths(loaded.map(|l| &l.resolved), owned);
@@ -764,6 +857,17 @@ fn output_rows(
         if let Some(row) = classify(path, o, op, &sensitive, &obs) {
             rows.push(if plan.is_none() { row.partial() } else { row });
         }
+    }
+}
+
+/// Whether an operation of `resource` replaces the one held for a path. A rename gives the path
+/// two operations: the old owner's removal and the new owner's write. The row needs the new
+/// owner's, whatever the plan order, so an operation of the ledger owner never displaces one of
+/// another resource.
+fn takes_slot(owner: Option<&str>, held: Option<&str>, resource: &str) -> bool {
+    match held {
+        None => true,
+        Some(h) => owner != Some(resource) || owner == Some(h),
     }
 }
 
@@ -910,5 +1014,23 @@ fn owned_row(path: &str, who: &str, op: Option<&Operation>, live: Live) -> Row {
                 &format!("owned by {who}; matches the ledger fingerprint"),
             ),
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::takes_slot;
+
+    #[test]
+    fn the_new_owner_wins_a_shared_path_in_either_plan_order() {
+        let owner = Some("old");
+        // Removal first, then the new owner's write.
+        assert!(takes_slot(owner, None, "old"));
+        assert!(takes_slot(owner, Some("old"), "new"));
+        // The new owner's write first, then the removal: the removal does not displace it.
+        assert!(takes_slot(owner, None, "new"));
+        assert!(!takes_slot(owner, Some("new"), "old"));
+        // No ledger owner: the last operation wins, as before.
+        assert!(takes_slot(None, Some("a"), "b"));
     }
 }

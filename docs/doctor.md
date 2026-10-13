@@ -66,6 +66,7 @@ All text passes through `dfm_model::display::visible`. Neither format has an ANS
 | `resource` | A resource that is not a file output (package, application and similar) | UNKNOWN `D_PROBING_NOT_BUILT`, not required. N/A `D_NA_SENSITIVE` when it is sensitive. |
 | `plan` | The plan could not be made | ERROR with the planner's code. UNKNOWN `E_OBSERVATION_UNKNOWN`. UNKNOWN `D_DEPENDS_UNKNOWN` after a profile failure. |
 | `output` | A planner blocker | ERROR with the blocker's code (`E_CONFLICT`, `E_PARENT_UNSAFE`, `E_TARGET_RESERVED`, and so on). The blocker's correction is the fix. |
+| `output` | A name beside an owned output or an open-intent path that has the older staged-copy shape `.<name>.<digits>.<digits>.<digits>.tmp` or `.stage` | WARN `D_STAGED_COPY`. The fix is "A staged copy from an interrupted run; check it, then remove it by hand." Doctor lists the directory and reads no content. Nothing sweeps such a name, because a user file can have the same shape. |
 | `output` | An owned output (ledger) or a claimed output (plan) | See the next table. |
 
 ### Output rows
@@ -106,6 +107,7 @@ An owned output is compared by fingerprint: `file_fingerprint` of the file conte
 | `D_LOCK_NOTE` | The lock file holds a note from an earlier holder. |
 | `D_DEPENDS_UNKNOWN` | A check cannot run because an earlier check failed. |
 | `D_PROBING_NOT_BUILT` | Tools, versions and PATH are not probed in this build. |
+| `D_STAGED_COPY` | A name beside an owned output has the shape of a staged copy of an older build. Nothing removes it. |
 
 `E_*` codes keep the meaning given in [architecture.md](architecture.md), [state.md](state.md), [resolver.md](resolver.md) and [planner.md](planner.md).
 

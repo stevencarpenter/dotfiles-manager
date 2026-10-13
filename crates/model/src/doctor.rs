@@ -34,10 +34,11 @@ pub enum DoctorCode {
     LockNote,
     DependsUnknown,
     ProbingNotBuilt,
+    StagedCopy,
 }
 
 impl DoctorCode {
-    pub const ALL: [DoctorCode; 13] = [
+    pub const ALL: [DoctorCode; 14] = [
         DoctorCode::Ok,
         DoctorCode::NaSensitive,
         DoctorCode::OutputMissing,
@@ -51,6 +52,7 @@ impl DoctorCode {
         DoctorCode::LockNote,
         DoctorCode::DependsUnknown,
         DoctorCode::ProbingNotBuilt,
+        DoctorCode::StagedCopy,
     ];
 
     pub const fn as_str(self) -> &'static str {
@@ -68,6 +70,7 @@ impl DoctorCode {
             DoctorCode::LockNote => "D_LOCK_NOTE",
             DoctorCode::DependsUnknown => "D_DEPENDS_UNKNOWN",
             DoctorCode::ProbingNotBuilt => "D_PROBING_NOT_BUILT",
+            DoctorCode::StagedCopy => "D_STAGED_COPY",
         }
     }
 
@@ -96,6 +99,9 @@ impl DoctorCode {
             DoctorCode::LockNote => "The lock file holds a note from an earlier holder.",
             DoctorCode::DependsUnknown => "A check cannot run because an earlier check failed.",
             DoctorCode::ProbingNotBuilt => "Tools, versions and PATH are not probed in this build.",
+            DoctorCode::StagedCopy => {
+                "A name beside an owned output has the shape of a staged copy of an older build. Nothing removes it."
+            }
         }
     }
 }
@@ -423,6 +429,7 @@ mod tests {
             DoctorCode::LockNote => 10,
             DoctorCode::DependsUnknown => 11,
             DoctorCode::ProbingNotBuilt => 12,
+            DoctorCode::StagedCopy => 13,
         }
     }
 
@@ -430,7 +437,7 @@ mod tests {
     fn all_lists_every_variant_once() {
         let mut idx: Vec<usize> = DoctorCode::ALL.iter().map(|c| index(*c)).collect();
         idx.sort_unstable();
-        assert_eq!(idx, (0..=12).collect::<Vec<_>>());
+        assert_eq!(idx, (0..=13).collect::<Vec<_>>());
     }
 
     #[test]
