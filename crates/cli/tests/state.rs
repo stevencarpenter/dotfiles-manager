@@ -602,6 +602,40 @@ fn state_check_holds_the_lock_across_its_whole_read() {
     );
 }
 
+#[test]
+fn state_check_refuses_when_the_lock_file_is_replaced_during_the_read() {
+    let h = bound_home("check-lock-replaced");
+    let release = h.path().join("release-replaced");
+    let reached = h.path().join("release-replaced.reached");
+    let c = cmd(h.path(), &["state", "check"])
+        .env(
+            "DFM_FAILPOINT",
+            format!("check-after-probe:wait-{}", release.display()),
+        )
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    wait_for("check to reach its read", || reached.exists());
+    let lock = h.path().join(".local/state/dotfiles-manager.lock");
+    assert!(lock.exists(), "the lock path moved; fix this test");
+    let fresh = lock.with_extension("fresh");
+    fs::write(&fresh, "").unwrap();
+    fs::rename(&fresh, &lock).unwrap();
+    fs::write(&release, "go").unwrap();
+    let o = c.wait_with_output().unwrap();
+    let (so, se) = (text(&o.stdout), text(&o.stderr));
+    assert_eq!(o.status.code(), Some(3), "{so}{se}");
+    assert!(
+        se.contains("E_LOCKED") && se.contains("run the command again"),
+        "{se}"
+    );
+    assert!(
+        !so.contains("binding:") && !so.contains("E_STATE_INVALID"),
+        "no findings: {so}"
+    );
+}
+
 // ---- C06: identity against loaded receipts and trials --------------------------------------------
 
 fn seeded(label: &str) -> TempDir {

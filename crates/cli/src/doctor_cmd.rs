@@ -411,20 +411,40 @@ fn is_old_stage(entry: &str, name: &str) -> bool {
     matches!(suffix, "tmp" | "stage") && nums.split('.').count() == 3 && nums.split('.').all(digits)
 }
 
+/// The most names doctor reads from one directory when it looks for staged copies. Only a
+/// `test-isolation` build reads `DFM_STRAY_SCAN_MAX`.
+#[cfg(feature = "test-isolation")]
+fn stray_scan_max() -> usize {
+    std::env::var("DFM_STRAY_SCAN_MAX")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(STRAY_SCAN_MAX)
+}
+
+#[cfg(not(feature = "test-isolation"))]
+fn stray_scan_max() -> usize {
+    STRAY_SCAN_MAX
+}
+
 /// A WARN row for each name beside an owned output or an open-intent path that looks like a
 /// staged copy of an older build. Such a name is never swept, because a user file can have the
-/// same shape. Doctor lists the directory and reads no content. `rels` are HOME-relative.
+/// same shape. Doctor lists each directory once and reads no content. A listing that was cut
+/// gets its own WARN row, because the scan of that directory is then partial. `rels` are
+/// HOME-relative.
 fn staged_copy_rows(sys: Sys, layout: &Layout, rels: &BTreeSet<String>, rows: &mut Vec<Row>) {
     let Ok(home) = Dir::open_home(&sys, &layout.home) else {
         return;
     };
-    let mut seen = BTreeSet::new();
+    let mut by_dir: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
     for rel in rels {
-        let mut parts: Vec<&str> = rel.split('/').collect();
-        let Some(name) = parts.pop() else { continue };
+        let (parent, name) = rel.rsplit_once('/').unwrap_or(("", rel));
+        by_dir.entry(parent).or_default().push(name);
+    }
+    let max = stray_scan_max();
+    for (parent, names) in by_dir {
         let mut dir: Option<Dir> = None;
         let mut reachable = true;
-        for part in &parts {
+        for part in parent.split('/').filter(|p| !p.is_empty()) {
             match dir.as_ref().unwrap_or(&home).peek_dir(part) {
                 Ok(Some(d)) => dir = Some(d),
                 _ => {
@@ -436,27 +456,56 @@ fn staged_copy_rows(sys: Sys, layout: &Layout, rels: &BTreeSet<String>, rows: &m
         if !reachable {
             continue;
         }
-        let dir = dir.as_ref().unwrap_or(&home);
-        let Ok(listing) = dir.list_upto(STRAY_SCAN_MAX) else {
+        let Ok(listing) = dir.as_ref().unwrap_or(&home).list_upto(max) else {
             continue;
         };
-        for entry in listing.names.iter().filter(|e| is_old_stage(e, name)) {
-            let staged = match rel.rsplit_once('/') {
-                Some((parent, _)) => format!("{parent}/{entry}"),
-                None => entry.clone(),
-            };
-            if seen.insert(staged.clone()) {
-                rows.push(Row::new(
-                    "output",
-                    D::StagedCopy,
-                    Level::Warn,
-                    &staged,
-                    &format!("a name of an older staged-copy format beside {}", clip(rel)),
-                    "A staged copy from an interrupted run; check it, then remove it by hand.",
-                ));
-            }
+        rows.extend(scan_listing(parent, &names, &listing.names, max));
+    }
+}
+
+/// The rows for one directory: a staged copy of an older build for each entry that matches any
+/// of the owned `names` in it, and one row if `entries` is longer than `max` (the listing was
+/// cut). `parent` is HOME-relative and empty for HOME itself.
+fn scan_listing(parent: &str, names: &[&str], entries: &[String], max: usize) -> Vec<Row> {
+    let shown = |entry: &str| {
+        if parent.is_empty() {
+            entry.to_string()
+        } else {
+            format!("{parent}/{entry}")
+        }
+    };
+    let mut rows = Vec::new();
+    if entries.len() > max {
+        rows.push(
+            Row::new(
+                "output",
+                D::StagedCopy,
+                Level::Warn,
+                if parent.is_empty() { "." } else { parent },
+                &format!(
+                    "the directory has more than {max} entries; the scan for staged copies was cut"
+                ),
+                "Check the directory for names like .<name>.<digits>.<digits>.<digits>.tmp by hand.",
+            )
+            .partial(),
+        );
+    }
+    for entry in entries.iter().take(max) {
+        if let Some(name) = names.iter().find(|n| is_old_stage(entry, n)) {
+            rows.push(Row::new(
+                "output",
+                D::StagedCopy,
+                Level::Warn,
+                &shown(entry),
+                &format!(
+                    "a name of an older staged-copy format beside {}",
+                    clip(&shown(name))
+                ),
+                "A staged copy from an interrupted run; check it, then remove it by hand.",
+            ));
         }
     }
+    rows
 }
 
 /// Receipts, trials and stray files are audit evidence. Their failures are WARN rows and leave
@@ -1019,7 +1068,25 @@ fn owned_row(path: &str, who: &str, op: Option<&Operation>, live: Live) -> Row {
 
 #[cfg(test)]
 mod tests {
-    use super::takes_slot;
+    use super::{scan_listing, takes_slot};
+
+    #[test]
+    fn one_listing_is_tested_against_every_owned_name_in_the_directory() {
+        let entries: Vec<String> = [".a.1.2.3.tmp", ".b.4.5.6.stage", ".c.1.2.3.tmp", "a", "b"]
+            .map(String::from)
+            .into();
+        let rows = scan_listing("d", &["a", "b"], &entries, 100);
+        let subjects: Vec<&str> = rows.iter().map(|r| r.subject.as_str()).collect();
+        assert_eq!(subjects, ["d/.a.1.2.3.tmp", "d/.b.4.5.6.stage"]);
+    }
+
+    #[test]
+    fn a_listing_longer_than_the_cap_adds_one_cut_row() {
+        let entries: Vec<String> = ["x", "y", "z"].map(String::from).into();
+        let rows = scan_listing("", &["x"], &entries, 2);
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].detail.contains("was cut") && rows[0].partial);
+    }
 
     #[test]
     fn the_new_owner_wins_a_shared_path_in_either_plan_order() {

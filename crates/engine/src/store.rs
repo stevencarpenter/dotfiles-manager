@@ -238,6 +238,24 @@ impl Store {
         }
     }
 
+    /// `E_LOCKED` unless the lock file still is the file `guard` (from [`Store::probe_writer`])
+    /// holds. A reader calls it after its read, so a lock file replaced meanwhile is not taken
+    /// for a held lock.
+    pub fn recheck_probe(sys: &Sys, layout: &Layout, guard: &std::fs::File) -> Result<(), Refusal> {
+        let home = Dir::open_home(sys, &layout.home)?;
+        let mut rel = below(&layout.home, &layout.lock_file)?;
+        let Some(name) = rel.pop() else {
+            return Err(storage("the lock file is HOME itself"));
+        };
+        match home.walk(sys, &rel, rel.len(), false)? {
+            Some(dir) => Lock::still_current(&dir, &name, guard),
+            None => Err(Refusal::new(
+                Code::Locked,
+                "the lock directory was removed while it was held; run the command again",
+            )),
+        }
+    }
+
     /// Opens for writing and may create the state root: see [`Store::open_write_with`].
     pub fn open_write(sys: Sys, layout: &Layout, fail: Fail) -> Result<Store, Refusal> {
         Self::open_write_with(sys, layout, fail, true)

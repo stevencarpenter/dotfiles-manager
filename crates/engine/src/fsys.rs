@@ -1326,26 +1326,33 @@ impl Lock {
         if kind(&st) != FileType::RegularFile {
             return Err(bad("must be a regular file".into()));
         }
-        let held = ident_of(&st)?;
         after_open();
         let file = File::from(fd);
         match file.try_lock_shared() {
-            // A shared lock on a replaced or removed file excludes no writer, which locks the
-            // entry now at this name. The writer fences the same way ([`Lock::verify`]).
-            Ok(()) if parent.entry_ident(name)? == Some(held) => Ok(Some(file)),
-            Ok(()) => Err(Refusal::new(
-                Code::Locked,
-                format!(
-                    "{}: the lock file was replaced or removed while it was opened; run the command again",
-                    parent.at(name).display()
-                ),
-            )),
+            Ok(()) => Self::still_current(parent, name, &file).map(|()| Some(file)),
             Err(TryLockError::WouldBlock) => Err(Refusal::new(
                 Code::Locked,
                 "a writer is running and holds the manager lock",
             )),
             Err(TryLockError::Error(e)) => Err(io("probe lock", &e)),
         }
+    }
+
+    /// Fails with `E_LOCKED` unless the entry `name` still is the file `file`. A shared lock on a
+    /// replaced or removed file excludes no writer, which locks the entry now at this name. The
+    /// writer fences the same way ([`Lock::verify`]).
+    pub fn still_current(parent: &Dir, name: &str, file: &File) -> Result<(), Refusal> {
+        let held = ident_of(&rfs::fstat(file).map_err(|e| sys_err("stat lock", e))?)?;
+        if parent.entry_ident(name)? == Some(held) {
+            return Ok(());
+        }
+        Err(Refusal::new(
+            Code::Locked,
+            format!(
+                "{}: the lock file was replaced or removed while it was held; run the command again",
+                parent.at(name).display()
+            ),
+        ))
     }
 
     /// Fails unless the entry still names the file this lock holds. Called before every write.
@@ -1391,6 +1398,7 @@ mod tests {
         .unwrap_err();
         assert_eq!(e.code, Code::Locked);
         assert!(e.detail.contains("replaced or removed"), "{}", e.detail);
+        assert!(e.detail.contains("run the command again"), "{}", e.detail);
         // Removed between the open and the lock: refused.
         std::fs::write(root.join("lock"), "").unwrap();
         let e = Lock::probe_after_open(&dir, "lock", || {
@@ -1398,6 +1406,7 @@ mod tests {
         })
         .unwrap_err();
         assert_eq!(e.code, Code::Locked);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     /// A writer that accepts a few bytes and then fails, like a full disk.

@@ -56,7 +56,7 @@ pub fn check(ctx: &Ctx, out: &mut dyn Write) -> Result<(), Refusal> {
         writeln!(out, "{} {}", r.code.as_str(), bounded(&r.detail)).map_err(w)?;
         Err(Refusal::new(Code::Diagnosed, "1 finding"))
     };
-    let _shared = match ctx
+    let shared = match ctx
         .sys()
         .and_then(|sys| Store::probe_writer(&sys, &ctx.layout()))
     {
@@ -100,6 +100,11 @@ pub fn check(ctx: &Ctx, out: &mut dyn Write) -> Result<(), Refusal> {
         }
     };
     let l = store.load();
+    // Nothing is reported yet, so a lock file replaced during the read leaves no findings.
+    if let Some(guard) = &shared {
+        ctx.sys()
+            .and_then(|sys| Store::recheck_probe(&sys, &ctx.layout(), guard))?;
+    }
     let mut findings = verify_identity(&l, &binding);
     // An interrupted write leaves evidence on disk, so a stray entry fails the check.
     findings.extend(l.strays.iter().map(|s| Finding {

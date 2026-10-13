@@ -892,6 +892,43 @@ fn a_staged_copy_of_an_older_format_beside_an_owned_output_is_a_warning_and_is_k
 }
 
 #[test]
+fn a_cut_directory_listing_gets_its_own_partial_warning() {
+    let fx = applied();
+    let (_, rows) = fx.rows();
+    let owned = rows
+        .iter()
+        .find(|r| r["kind"] == "output" && r["status"] == "OK")
+        .unwrap()["subject"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let (dir, name) = owned.rsplit_once('/').unwrap_or(("", &owned));
+    let parent = if dir.is_empty() { fx.h("") } else { fx.h(dir) };
+    fs::write(parent.join(format!(".{name}.7.8.9.tmp")), "x").unwrap();
+    let o = fx.run_env(
+        &[("DFM_STRAY_SCAN_MAX", "1")],
+        &["doctor", "--root", fx.root_arg(), "--json"],
+    );
+    let v: Value = serde_json::from_slice(&o.stdout).unwrap();
+    let cut: Vec<&Value> = v["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|r| {
+            r["code"] == "D_STAGED_COPY" && r["detail"].as_str().unwrap().contains("was cut")
+        })
+        .collect();
+    let mine: Vec<&&Value> = cut.iter().filter(|r| r["subject"] == dir).collect();
+    assert_eq!(mine.len(), 1, "{v:#}");
+    let cut = mine;
+    assert_eq!(
+        (cut[0]["status"].as_str(), cut[0]["partial"].as_bool()),
+        (Some("WARN"), Some(true))
+    );
+    assert_eq!(code(&o), 0, "a WARN row does not change the exit");
+}
+
+#[test]
 fn no_receipt_is_not_applicable_and_a_failed_last_run_is_a_warning() {
     let fx = Fx::new();
     let (_, rows) = fx.rows();
