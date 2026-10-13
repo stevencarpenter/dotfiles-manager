@@ -138,6 +138,24 @@ fn temp_name_of(name: &str, pid: u32, n: u32, nanos: u32, suffix: &str) -> Strin
     format!(".{name}.{pid}.{n}.{nanos}.{suffix}")
 }
 
+/// Whether `candidate` has the exact shape [`temp_name_of`] makes for `name`.
+fn is_temp_of(name: &str, candidate: &str) -> bool {
+    let Some(rest) = candidate
+        .strip_prefix('.')
+        .and_then(|c| c.strip_prefix(name))
+        .and_then(|c| c.strip_prefix('.'))
+    else {
+        return false;
+    };
+    let mut parts = rest.split('.');
+    let numbers = (0..3).all(|_| {
+        parts
+            .next()
+            .is_some_and(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
+    });
+    numbers && matches!(parts.next(), Some("tmp" | "stage")) && parts.next().is_none()
+}
+
 /// The refusal for a failed exclusive rename that is not `EEXIST`. `ENOTSUP` and `EINVAL` mean
 /// that the file system does not take `RENAME_EXCL`: there is no fallback, so the text names
 /// the path and the requirement (docs/state.md, "Known limits").
@@ -606,6 +624,22 @@ impl Dir {
         self.write_temp_mode(name, bytes, 0o600)
     }
 
+    /// Removes the staged names ([`temp_name`]) that an interrupted publish of `name` left in
+    /// this directory. Only a regular file or a link of `uid` goes, without following a link.
+    /// The caller holds the writer lock, so no live publish owns such a name. Best effort: a
+    /// name that cannot be removed stays, and the next settling tries again.
+    pub(crate) fn sweep_stages(&self, sys: &Sys, name: &str) {
+        let Ok(listing) = self.list() else { return };
+        for n in listing.names.iter().filter(|n| is_temp_of(name, n)) {
+            if matches!(
+                self.peek(sys, n),
+                Ok(Peek::File { own: true, .. } | Peek::Link { own: true, .. })
+            ) {
+                self.drop_temp(n);
+            }
+        }
+    }
+
     /// As [`Dir::write_temp`], with the mode the published file will have. The mode is set
     /// before any content is written, so the file is never wider than `mode`.
     pub(crate) fn write_temp_mode(
@@ -697,9 +731,21 @@ impl Dir {
         fail: &Fail,
         label: &str,
     ) -> Result<bool, Refusal> {
+        self.publish_new_mode(name, bytes, 0o600, fail, label)
+    }
+
+    /// As [`Dir::publish_new`], with the mode the published file will have.
+    pub(crate) fn publish_new_mode(
+        &self,
+        name: &str,
+        bytes: &[u8],
+        mode: u32,
+        fail: &Fail,
+        label: &str,
+    ) -> Result<bool, Refusal> {
         check_name(name)?;
         fail.hit(&format!("{label}-before-write"))?;
-        let tmp = self.write_temp(name, bytes)?;
+        let tmp = self.write_temp_mode(name, bytes, mode)?;
         let step = || -> Result<bool, Refusal> {
             fail.hit(&format!("{label}-after-tmp"))?;
             match rename_new(&self.fd, &tmp, name) {

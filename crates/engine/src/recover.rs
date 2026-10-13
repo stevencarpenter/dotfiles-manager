@@ -62,7 +62,7 @@ pub(crate) fn observe_live(
 /// ownership. The manager writes one output per intent, so an intent with none or with more
 /// than one is not probed (probing only the first would settle the others unseen): it stays
 /// open for the operator.
-pub(crate) fn inspect(w: Where<'_>, e: &JournalEntry) -> (Probe, Option<Live>) {
+pub(crate) fn inspect(store: &Store, w: Where<'_>, e: &JournalEntry) -> (Probe, Option<Live>) {
     let Some([out]) = e.recovery.as_ref().map(|r| r.outputs.as_slice()) else {
         return (Probe::Unknown, None);
     };
@@ -79,9 +79,30 @@ pub(crate) fn inspect(w: Where<'_>, e: &JournalEntry) -> (Probe, Option<Live>) {
         ("create-link" | "replace-link" | "create-file" | "update-file" | "adopt", _) if same => {
             Probe::Done
         }
+        // Still the content the ledger records: the replace did not happen.
+        ("replace-link" | "update-file", _)
+            if fp.is_some() && fp == ledger_fp(store, e, &out.path).as_ref() =>
+        {
+            Probe::NotDone
+        }
         _ => Probe::Unknown,
     };
     (probe, Some(live))
+}
+
+/// The fingerprint the ledger records for `abs` under the entry's resource. `None` when there
+/// is none or the ledger cannot be read.
+fn ledger_fp(store: &Store, e: &JournalEntry, abs: &str) -> Option<String> {
+    let key = fold(abs);
+    store
+        .read_ledger_lenient()
+        .ok()?
+        .resources
+        .into_iter()
+        .filter(|r| r.resource == e.resource)
+        .flat_map(|r| r.owned_outputs)
+        .find(|o| fold(&o.path) == key)?
+        .fingerprint
 }
 
 /// An `unknown` entry that stays open after settling.
@@ -134,10 +155,29 @@ pub(crate) fn settle_all(
 ) -> Result<Settled, Refusal> {
     let mut out = Settled::default();
     let mut fresh = BTreeSet::new();
-    // A torn final line (a crash or failed write mid-append) is repaired and journaled first.
-    out.repaired = store.repair_torn_journal()?;
+    sweep_stages(store, w)?;
     if !unfinished(&store.read_journal_lenient()?).is_empty() {
-        for (id, op, phase) in store.reconcile(&|e| inspect(w, e).0)? {
+        // The ledger of an update or replace that finished is repaired before its `done` entry
+        // is written. A repair that fails leaves the entry `unknown` for `state resolve`.
+        let repair_error = std::cell::RefCell::new(None);
+        let probe = |e: &JournalEntry| {
+            let (probe, live) = inspect(store, w, e);
+            match (probe, live) {
+                (Probe::Done, Some(live)) => match refresh_fingerprint(store, e, &live) {
+                    Ok(()) => Probe::Done,
+                    Err(r) => {
+                        *repair_error.borrow_mut() = Some(r);
+                        Probe::Unknown
+                    }
+                },
+                (probe, _) => probe,
+            }
+        };
+        let reconciled = store.reconcile(&probe)?;
+        if let Some(r) = repair_error.into_inner() {
+            return Err(r);
+        }
+        for (id, op, phase) in reconciled {
             if phase != Phase::Unknown {
                 out.closed.push((id.clone(), phase));
             }
@@ -156,7 +196,9 @@ pub(crate) fn settle_all(
     for u in unresolved(&entries) {
         let e = u.unknown;
         let decided = match u.intent {
-            Some(i) if !fresh.contains(&(e.op_id.clone(), e.op.clone())) => Some(inspect(w, i)),
+            Some(i) if !fresh.contains(&(e.op_id.clone(), e.op.clone())) => {
+                Some(inspect(store, w, i))
+            }
             _ => None,
         };
         match decided {
@@ -193,6 +235,37 @@ pub(crate) fn settle_all(
     Ok(out)
 }
 
+/// Removes the staged copies that an interrupted publish left beside the paths of open
+/// intents and unknown entries. A staged copy of a sensitive file holds its content, and
+/// nothing else would ever remove it.
+fn sweep_stages(store: &Store, (sys, home, home_path): Where<'_>) -> Result<(), Refusal> {
+    let entries = store.read_journal_lenient()?;
+    let mut paths: Vec<&str> = unfinished(&entries)
+        .into_iter()
+        .filter_map(|i| i.recovery.as_ref())
+        .flat_map(|r| r.outputs.iter().map(|o| o.path.as_str()))
+        .collect();
+    let open = unresolved(&entries);
+    paths.extend(open.iter().flat_map(Unresolved::paths));
+    for abs in paths {
+        let Some(rel) = Path::new(abs)
+            .strip_prefix(home_path)
+            .ok()
+            .and_then(Path::to_str)
+        else {
+            continue;
+        };
+        let Ok(comps) = components(rel) else { continue };
+        let Some((name, parents)) = comps.split_last() else {
+            continue;
+        };
+        if let Ok(parent) = home.open_below(sys, parents) {
+            parent.sweep_stages(sys, name);
+        }
+    }
+    Ok(())
+}
+
 fn marked(e: &JournalEntry) -> bool {
     e.reason
         .as_deref()
@@ -217,7 +290,11 @@ pub fn recover(
     store: &Store,
     (sys, home, home_path): (&Sys, &Dir, &Path),
 ) -> Result<Settled, Refusal> {
-    settle_all(store, (sys, home, home_path), &|_, _| false)
+    // A torn final line (a crash or failed write mid-append) is repaired and journaled first.
+    let repaired = store.repair_torn_journal()?;
+    let mut settled = settle_all(store, (sys, home, home_path), &|_, _| false)?;
+    settled.repaired = repaired;
+    Ok(settled)
 }
 
 fn closing(u: &Unresolved<'_>, phase: Phase, reason: &str) -> Result<JournalEntry, Refusal> {
@@ -295,13 +372,28 @@ pub(crate) fn close_done(
     if (creates && out.existed_before) || live.fingerprint.as_deref() != Some(want) {
         return Ok(());
     }
-    let mode = match (e.op.as_str(), &live.peek) {
+    let Some(mode) = owned_mode(&e.op, &live.peek) else {
+        return Ok(());
+    };
+    let owned = OwnedOutput {
+        path: out.path.clone(),
+        mode,
+        fingerprint: Some(want.into()),
+        coowned: None,
+    };
+    record_output(store, (&e.resource, &e.adapter, e.class), &e.op_id, owned)
+}
+
+/// The ledger mode of a finished output: the live mode of a file, 0777 for a link to a file.
+/// `None` when the leaf is not the kind the operation makes or belongs to another user.
+fn owned_mode(op: &str, peek: &Peek) -> Option<u32> {
+    match (op, peek) {
         (
             "create-file" | "update-file",
             Peek::File {
                 mode, own: true, ..
             },
-        ) => *mode,
+        ) => Some(*mode),
         (
             "create-link" | "replace-link" | "adopt",
             Peek::Link {
@@ -309,17 +401,47 @@ pub(crate) fn close_done(
                 own: true,
                 ..
             },
-        ) => 0o777,
-        _ => return Ok(()),
+        ) => Some(0o777),
+        _ => None,
+    }
+}
+
+/// An update or replace that took effect but whose ledger write was lost: the resource still
+/// owns the path with the old fingerprint. The entry moves to the fingerprint that is live and
+/// expected. It creates no ownership: a path the resource does not own is left alone.
+fn refresh_fingerprint(store: &Store, e: &JournalEntry, live: &Live) -> Result<(), Refusal> {
+    if !matches!(e.op.as_str(), "update-file" | "replace-link") || e.class != Class::Normal {
+        return Ok(());
+    }
+    let Some(out) = e.recovery.as_ref().and_then(|r| r.outputs.first()) else {
+        return Ok(());
     };
-    record_output(
-        store,
-        (&e.resource, &e.adapter, e.class),
-        &e.op_id,
-        &out.path,
-        want,
+    let Some(want) = out.expected_sha256.as_deref() else {
+        return Ok(());
+    };
+    let Some(mode) = owned_mode(&e.op, &live.peek) else {
+        return Ok(());
+    };
+    if live.fingerprint.as_deref() != Some(want) {
+        return Ok(());
+    }
+    let key = fold(&out.path);
+    let stale = store.read_ledger_lenient()?.resources.iter().any(|r| {
+        r.resource == e.resource
+            && r.owned_outputs
+                .iter()
+                .any(|o| fold(&o.path) == key && o.fingerprint.as_deref() != Some(want))
+    });
+    if !stale {
+        return Ok(());
+    }
+    let owned = OwnedOutput {
+        path: out.path.clone(),
         mode,
-    )
+        fingerprint: Some(want.into()),
+        coowned: None,
+    };
+    record_output(store, (&e.resource, &e.adapter, e.class), &e.op_id, owned)
 }
 
 /// Adds or replaces one owned output of a resource in the ledger.
@@ -327,9 +449,7 @@ pub(crate) fn record_output(
     store: &Store,
     (resource, adapter, class): (&str, &str, Class),
     id: &str,
-    abs: &str,
-    fp: &str,
-    mode: u32,
+    out: OwnedOutput,
 ) -> Result<(), Refusal> {
     let mut ledger = store.read_ledger_lenient()?;
     let mut outs = ledger
@@ -338,14 +458,9 @@ pub(crate) fn record_output(
         .find(|r| r.resource == resource)
         .map(|r| r.owned_outputs.clone())
         .unwrap_or_default();
-    let want = fold(abs);
+    let want = fold(&out.path);
     outs.retain(|o| fold(&o.path) != want);
-    outs.push(OwnedOutput {
-        path: abs.into(),
-        mode,
-        fingerprint: Some(fp.into()),
-        coowned: None,
-    });
+    outs.push(out);
     outs.sort_by(|a, b| a.path.cmp(&b.path));
     ledger.record(LedgerResource {
         resource: resource.into(),
@@ -442,7 +557,7 @@ pub fn resolve(
             "the intent records more than one path, and only one path can be checked. Use --as failed",
         ));
     }
-    let (probe, live) = inspect(w, intent);
+    let (probe, live) = inspect(store, w, intent);
     if probe != Probe::Done {
         return Err(conflict(
             "the live path does not match the result the operation expected",

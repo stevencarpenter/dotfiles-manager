@@ -1039,8 +1039,9 @@ impl Store {
 
     /// Settles each interrupted operation by asking `probe` (the operation's `already_done`
     /// check) and journaling the answer. It never runs an operation again, never edits the ledger
-    /// and never creates ownership or delete authority: a finished operation becomes owned only
-    /// when a normal run records it. Returns `(op_id, op, phase)` for each entry written.
+    /// itself (the probe may move an owned fingerprint, see `recover`) and never creates
+    /// ownership or delete authority: a finished operation becomes owned only when a normal run
+    /// records it. Returns `(op_id, op, phase)` for each entry written.
     pub fn reconcile(
         &self,
         probe: &dyn Fn(&JournalEntry) -> Probe,
