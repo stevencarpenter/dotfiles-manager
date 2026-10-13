@@ -1148,7 +1148,7 @@ fn the_binding_is_checked_again_immediately_before_the_copy() {
     let cfg = p.home.join(".config/dotfiles-manager");
     let hook = p.tmp.path().join("hook.sh");
     // A valid binding with mode 0644 appears after the first check. Only the check right before
-    // the copy refuses it with exit 3; without it the new binary's self-check fails with exit 1.
+    // the copy refuses it, with exit 1 because the build homes were reset; without it the new binary's self-check fails with exit 1.
     let valid = "schema = 1\nprofile = \"/p\"\nmachine_id = \"m5\"\nplatform = \"macos\"\narch = \"aarch64\"\norigins = []\n";
     fs::write(
         &hook,
@@ -1162,7 +1162,7 @@ fn the_binding_is_checked_again_immediately_before_the_copy() {
     );
     assert_eq!(
         o.status.code(),
-        Some(3),
+        Some(1),
         "{}\n{}",
         String::from_utf8_lossy(&o.stdout),
         err(&o)
@@ -1889,7 +1889,7 @@ fn a_symlinked_version_directory_or_staged_binary_is_not_written_through() {
     // The version directory itself is a link to another tree.
     symlink(outside.join("target"), versions.join(&name)).unwrap();
     let o = install(&p, &p.sha, &[]);
-    assert_eq!(o.status.code(), Some(3), "{}", err(&o));
+    assert_eq!(o.status.code(), Some(1), "{}", err(&o));
     assert!(
         err(&o).contains("E_PREREQ_MISSING") && err(&o).contains("symlink"),
         "{}",
@@ -2454,7 +2454,7 @@ fn a_group_writable_version_directory_stops_install_before_the_binary_is_staged(
     fs::create_dir_all(&vdir).unwrap();
     fs::set_permissions(&vdir, fs::Permissions::from_mode(0o775)).unwrap();
     let o = install(&p, &p.sha, &[]);
-    assert_eq!(o.status.code(), Some(3), "{}", err(&o));
+    assert_eq!(o.status.code(), Some(1), "{}", err(&o));
     assert!(
         err(&o).contains("E_PREREQ_MISSING") && err(&o).contains("writable by group or others"),
         "{}",
@@ -2467,6 +2467,28 @@ fn a_group_writable_version_directory_stops_install_before_the_binary_is_staged(
         "nothing staged"
     );
     assert!(build_dirs_gone(&p));
+}
+
+/// The binding check right before the copy runs after the build homes were reset, so it exits 1.
+#[test]
+fn a_refusal_after_the_build_homes_were_reset_exits_1() {
+    let p = prepare_with("fake-copy-window", fake_toolchain("exit 0".into()));
+    let cfg = p.home.join(".config/dotfiles-manager");
+    let hook = p.tmp.path().join("hook.sh");
+    let valid = "schema = 1\nprofile = \"/p\"\nmachine_id = \"m5\"\nplatform = \"macos\"\narch = \"aarch64\"\norigins = []\n";
+    fs::write(
+        &hook,
+        format!("mkdir -p '{0}' && printf '%s' '{1}' > '{0}/machine.toml' && chmod 644 '{0}/machine.toml'\n", cfg.display(), valid),
+    )
+    .unwrap();
+    let o = install(
+        &p,
+        &p.sha,
+        &[("DFM_TEST_BEFORE_COPY", hook.to_str().unwrap())],
+    );
+    assert_eq!(o.status.code(), Some(1), "{}", err(&o));
+    assert!(err(&o).contains("E_BINDING_INVALID"), "{}", err(&o));
+    assert!(!p.data.join("current").exists());
 }
 
 /// The refusal comes after `mkdir -p versions/<name>`, so it is a failure (exit 1), not exit 3.
