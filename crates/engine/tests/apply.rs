@@ -4067,6 +4067,53 @@ fn a_crash_between_stage_and_rename_leaves_no_staged_copy_and_settles_not_done()
 }
 
 #[test]
+fn a_crash_between_staging_a_link_and_the_rename_leaves_no_staged_link_and_settles_not_done() {
+    const CHILD: &str = "DFM_APPLY_LINK_STAGE_CRASH_HOME";
+    const NAME: &str =
+        "a_crash_between_staging_a_link_and_the_rename_leaves_no_staged_link_and_settles_not_done";
+    if let Some(dir) = std::env::var_os(CHILD) {
+        // The child: stages the new link, then ends at once, as a crash does.
+        let h = Home(dir.into());
+        let store = open(&h);
+        let s = Setup { h, store };
+        let mut l = op(&s.h, &s.store, "x@file", 1, Action::ReplaceLink, "l");
+        l.link = Some(format!("{}/x", real_src(&s)));
+        go_with(
+            &s,
+            &plan_in(&real_src(&s), vec![l]),
+            &gens(),
+            &none(),
+            &Fail::at("link-after-tmp", Inject::Abort),
+        );
+        std::process::exit(9);
+    }
+    let Setup { h, store } = setup();
+    let s = Setup { h, store };
+    symlink("/src/old", s.h.0.join("l")).unwrap();
+    own_fp(&s, "l", &link_fingerprint("/src/old"));
+    let Setup { h, store } = s;
+    drop(store);
+    let status = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", NAME, "--nocapture", "--test-threads=1"])
+        .env(CHILD, &h.0)
+        .status()
+        .unwrap();
+    assert_eq!(status.signal(), Some(6), "the child must abort: {status:?}");
+    let s = Setup { store: open(&h), h };
+    assert_eq!(leftovers(&s.h.0).len(), 1, "the crash left the staged link");
+    assert_eq!(phases(&s), [Phase::Intent]);
+    let settled = recover_now(&s);
+    assert!(settled.open.is_empty(), "{:?}", settled.open);
+    assert_eq!(phases(&s), [Phase::Intent, Phase::Failed]);
+    assert!(leftovers(&s.h.0).is_empty(), "the staged link is removed");
+    // The live link is still the old one: the effect did not happen.
+    assert_eq!(
+        fs::read_link(s.h.0.join("l")).unwrap(),
+        Path::new("/src/old")
+    );
+}
+
+#[test]
 fn a_flag_and_a_ledger_refusal_carry_raw_text_that_the_command_escapes_once() {
     // The command escapes the whole refusal once when it prints it. A flag or a path escaped
     // here as well would print each backslash as four characters, and the pasted id would differ.
