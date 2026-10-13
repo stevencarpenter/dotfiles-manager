@@ -10,7 +10,7 @@ use crate::plan_cmd::{plan_for, render};
 use crate::{Ctx, load_resolved, read_existing_binding, state_cmd, usage};
 use dfm_engine::{
     Approval as Allowance, Dir, Run, Store, apply, check_allowances, check_journal_capacity, gates,
-    now_unix,
+    now_ns,
 };
 use dfm_model::display::{visible, visible_for_paste};
 use dfm_model::state::{
@@ -259,11 +259,11 @@ fn run_inner(
     dfm_engine::signal::install().map_err(|r| store.stamp(r))?;
     fail.hit("apply-after-install")
         .map_err(|r| store.stamp(r))?;
-    let started = now_unix().map_err(|r| store.stamp(r))?;
+    let started = now_ns().map_err(|r| store.stamp(r))?;
     // A signal that came before a pre-run check failed still decides the exit.
     let report = apply(&run, &locked)
         .map_err(|r| store.stamp(dfm_engine::signal::requested().unwrap_or(r)))?;
-    let finished = now_unix().unwrap_or(started);
+    let finished = now_ns().unwrap_or(started);
 
     for warning in &report.warnings {
         writeln!(out, "warning: {}", crate::bounded(warning)).map_err(w)?;

@@ -19,12 +19,19 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
-/// Seconds since the epoch. A clock before 1970 is an error, never a silent zero.
-pub fn now_unix() -> Result<u64, Refusal> {
+/// Nanoseconds since the epoch. A clock before 1970 or after 2554 is an error, never a silent
+/// zero.
+pub fn now_ns() -> Result<u64, Refusal> {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .map_err(|_| Refusal::new(Code::IoFailed, "the system clock is before 1970"))
+        .ok()
+        .and_then(|d| u64::try_from(d.as_nanos()).ok())
+        .ok_or_else(|| {
+            Refusal::new(
+                Code::IoFailed,
+                "the system clock is before 1970 or after 2554",
+            )
+        })
 }
 
 const STATE: &str = "state";
@@ -397,7 +404,7 @@ impl Store {
         for d in SUBDIRS {
             staging.child(&self.sys, d, true, true)?;
         }
-        let doc = StateDoc::new(stamp.clone(), now_unix()?);
+        let doc = StateDoc::new(stamp.clone(), now_ns()?);
         staging.publish_new("state.json", &canonical(&doc)?, &self.fail, "init-state")?;
         staging.publish_new(
             "ledger.json",
@@ -859,7 +866,7 @@ impl Store {
         // The cut cannot be undone. If the record fails, the removed text stays in `TORN` and
         // the error carries the start of it.
         let record = || -> Result<(), Refusal> {
-            let at = now_unix()?;
+            let at = now_ns()?;
             self.append_journal(&JournalEntry {
                 schema: state::SCHEMA,
                 op_id: format!("journal-repair-{at}"),
@@ -1087,7 +1094,7 @@ impl Store {
             };
             let e = JournalEntry {
                 phase,
-                at: state::rfc3339(now_unix()?),
+                at: state::rfc3339(now_ns()?),
                 recovery: None,
                 token: None,
                 reason: Some(why.into()),

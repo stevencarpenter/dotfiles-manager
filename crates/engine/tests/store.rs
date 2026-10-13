@@ -86,7 +86,7 @@ fn receipts_are_immutable_and_must_match_their_name() {
     let (s, stamp) = init(&h);
     let r = receipt(&stamp, "run-1", vec![]);
     let name = s.write_receipt(&r).unwrap();
-    assert_eq!(name, "20261010T000000Z-run-1.json");
+    assert_eq!(name, "20261010T000000.000000000Z-run-1.json");
     assert_eq!(code(s.write_receipt(&r)), Code::StorageInvalid);
     let loaded = s.load();
     assert_eq!(loaded.receipts.len(), 1);
@@ -96,7 +96,11 @@ fn receipts_are_immutable_and_must_match_their_name() {
         h.0.join(".local/state/dotfiles-manager/state/receipts")
             .join(&name);
     assert_eq!(fs::metadata(&path).unwrap().mode() & 0o777, 0o600);
-    fs::rename(&path, path.with_file_name("20261010T000000Z-other.json")).unwrap();
+    fs::rename(
+        &path,
+        path.with_file_name("20261010T000000.000000000Z-other.json"),
+    )
+    .unwrap();
     let l = s.load();
     assert_eq!(
         l.receipts[0].1.as_ref().unwrap_err().code,
@@ -261,7 +265,7 @@ fn identity_mismatches_and_unreadable_documents_are_findings() {
     s.write_receipt(&receipt(&stamp, "run-1", vec![])).unwrap();
     let other = Stamp::of(&binding("/p/other.toml", "m5"));
     let mut foreign = receipt(&other, "run-2", vec![]);
-    foreign.started_at = "2026-10-11T00:00:00Z".into();
+    foreign.started_at = "2026-10-11T00:00:00.000000000Z".into();
     // The store refuses to write a foreign receipt, so put one there by hand.
     let dir = h.0.join(".local/state/dotfiles-manager/state/receipts");
     let fpath = dir.join(foreign.file_name().unwrap());
@@ -936,7 +940,7 @@ fn a_hand_written_trial_with_foreign_paths_is_a_finding_not_a_trial() {
             binding: stamp.clone(),
             trial_id: n.into(),
             tool: "atuin".into(),
-            created_unix: 1,
+            created_unix_ns: 1,
             baseline: dfm_model::state::Baseline {
                 tool_preexisting: false,
                 paths: vec![dfm_model::state::BaselinePath {
@@ -975,7 +979,7 @@ fn a_trial_path_under_a_link_parent_is_a_finding() {
             binding: stamp.clone(),
             trial_id: n.into(),
             tool: "atuin".into(),
-            created_unix: 1,
+            created_unix_ns: 1,
             baseline: dfm_model::state::Baseline {
                 tool_preexisting: false,
                 paths: if baseline {
@@ -1092,7 +1096,7 @@ fn every_write_cap_is_enforced_before_anything_is_written() {
         binding: stamp.clone(),
         trial_id: "big".into(),
         tool: "atuin".into(),
-        created_unix: 1,
+        created_unix_ns: 1,
         baseline: dfm_model::state::Baseline {
             tool_preexisting: false,
             paths: (0..2_000)

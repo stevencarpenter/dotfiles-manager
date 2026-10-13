@@ -127,8 +127,9 @@ thread_local! {
 /// hex digits of the SHA-256 of both. Op ids restart when a journal is archived by hand, so the
 /// time keeps a leftover name of an old attempt from blocking a new one. Recovery derives the
 /// same tag from the intent entry, so it can remove exactly the names this attempt made and no
-/// other file. shortcut: the time has a resolution of one second, so a repeated id in the same
-/// second still collides; add a nonce to the intent if that ever matters.
+/// other file. shortcut: the time has the resolution of the system clock (one microsecond on
+/// macOS), so a repeated id at the same clock reading still collides; add a nonce to the intent if
+/// that ever matters.
 pub(crate) fn stage_tag(op_id: &str, at: &str) -> String {
     let mut hex = dfm_model::digest::sha256_hex(format!("{op_id}\0{at}").as_bytes());
     hex.truncate(16);
@@ -1290,7 +1291,7 @@ impl Lock {
         };
         lock.verify()?;
         // Informational only: the lock is the flock, not these bytes.
-        let since = crate::store::now_unix().map_or_else(|_| "unknown".into(), |t| t.to_string());
+        let since = crate::store::now_ns().map_or_else(|_| "unknown".into(), |t| t.to_string());
         let note = format!("pid {} since {since}\n", std::process::id());
         let mut f = &lock.file;
         f.set_len(0)

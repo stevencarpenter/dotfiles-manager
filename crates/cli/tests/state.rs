@@ -702,15 +702,19 @@ fn receipts_and_trials_for_another_identity_are_reported_by_file() {
         fs::write(path, original).unwrap();
     }
     // An unreadable receipt is its own finding and hides nothing else.
-    fs::write(dir.join("receipts/20260101T000000Z-broken.json"), "{").unwrap();
+    fs::write(
+        dir.join("receipts/20260101T000000.000000000Z-broken.json"),
+        "{",
+    )
+    .unwrap();
     fs::set_permissions(
-        dir.join("receipts/20260101T000000Z-broken.json"),
+        dir.join("receipts/20260101T000000.000000000Z-broken.json"),
         fs::Permissions::from_mode(0o600),
     )
     .unwrap();
     let report = text(&check(h.path()).stdout);
     assert!(
-        report.contains("E_STATE_INVALID receipts/20260101T000000Z-broken.json"),
+        report.contains("E_STATE_INVALID receipts/20260101T000000.000000000Z-broken.json"),
         "{report}"
     );
     assert!(
@@ -905,7 +909,7 @@ fn state_check_counts_stray_entries_as_findings() {
     assert_eq!(check(h.path()).status.code(), Some(0));
     for f in [
         root(h.path()).join("state.next"),
-        state(h.path()).join("receipts/.20261010T000000Z-run.json.1.2.tmp"),
+        state(h.path()).join("receipts/.20261010T000000.000000000Z-run.json.1.2.tmp"),
         state(h.path()).join("trials/.t.json.1.2.tmp"),
     ] {
         fs::write(&f, "half").unwrap();
@@ -1316,7 +1320,7 @@ fn a_refusal_after_the_effect_exits_1_not_3() {
                 "--op-id",
                 "dup",
                 "--at",
-                "1791590400",
+                "1791590400000000000",
             ],
         )
     };

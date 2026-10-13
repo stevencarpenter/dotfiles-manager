@@ -6,7 +6,7 @@
 
 use crate::apply::components;
 use crate::fsys::{Dir, Peek, PeekTo, Sys};
-use crate::store::{Probe, Store, now_unix};
+use crate::store::{Probe, Store, now_ns};
 use dfm_model::fold;
 use dfm_model::plan::{MAX_HASHED_BYTES, link_fingerprint};
 use dfm_model::state::{
@@ -315,7 +315,7 @@ pub fn recover(
 fn closing(u: &Unresolved<'_>, phase: Phase, reason: &str) -> Result<JournalEntry, Refusal> {
     Ok(JournalEntry {
         phase,
-        at: rfc3339(now_unix()?),
+        at: rfc3339(now_ns()?),
         recovery: None,
         token: None,
         reason: Some(reason.into()),

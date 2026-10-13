@@ -17,7 +17,7 @@ use crate::generate::{Gather, Generator, GeneratorInputs, gather, link_source};
 use crate::observe::observe;
 use crate::publish::Publish;
 use crate::recover;
-use crate::store::{Store, now_unix};
+use crate::store::{Store, now_ns};
 use dfm_model::digest::sha256_hex;
 use dfm_model::fold;
 use dfm_model::merge::{Merged, check_foreign, leaf_hashes, salted};
@@ -586,7 +586,7 @@ struct Facts {
 impl Exec<'_, '_> {
     /// The current time as a stamp, or the last good reading when the clock fails.
     fn now(&self) -> String {
-        if let Ok(t) = now_unix() {
+        if let Ok(t) = now_ns() {
             self.clock.set(t);
         }
         rfc3339(self.clock.get())
@@ -1688,7 +1688,7 @@ pub fn apply(run: &Run<'_>, plan: &Plan) -> Result<Report, Refusal> {
 
 fn execute(run: &Run<'_>, plan: &Plan) -> Report {
     // Without a clock no time stamp is invented: the run does not start.
-    let clock = now_unix();
+    let clock = now_ns();
     let mut ex = Exec {
         run,
         plan,
