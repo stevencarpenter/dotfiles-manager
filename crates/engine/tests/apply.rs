@@ -4010,6 +4010,51 @@ fn a_merge_that_crashed_with_only_its_intent_blocks_its_path_until_resolved_fail
 }
 
 #[test]
+fn a_recovery_whose_ledger_write_fails_leaves_the_intent_open_and_the_next_one_repairs_it() {
+    // The apply leaves an open intent: the new content is live, the ledger holds the old
+    // fingerprint.
+    let s = rearmed(
+        |s| {
+            fs::write(s.h.0.join("t"), "old\n").unwrap();
+            own(s, "t", "old\n");
+        },
+        Fail::at("ledger-before-write", Inject::Error),
+    );
+    let p = plan(vec![op(
+        &s.h,
+        &s.store,
+        "x@file",
+        1,
+        Action::UpdateFile,
+        "t",
+    )]);
+    go(&s, &p, &gens(), &none());
+    assert_eq!(phases(&s), [Phase::Intent]);
+    let new_fp = file_fingerprint(b"new\n");
+    let fingerprint = |s: &Setup| {
+        s.store.read_ledger().unwrap().resources[0].owned_outputs[0]
+            .fingerprint
+            .clone()
+    };
+    // The first recovery cannot write the ledger. It fails and leaves the intent open.
+    let Setup { h, store } = s;
+    drop(store);
+    let store = open_write_after_drop(&h, Fail::at("ledger-before-write", Inject::Error));
+    let s = Setup { h, store };
+    let home = Dir::open_home(&sys(&s.h), &s.h.0).unwrap();
+    let err = dfm_engine::recover(&s.store, (&sys(&s.h), &home, s.h.0.as_path())).unwrap_err();
+    assert_eq!(err.code, Code::IoFailed, "{err}");
+    assert_eq!(phases(&s), [Phase::Intent], "the intent stays open");
+    assert_ne!(fingerprint(&s).as_deref(), Some(new_fp.as_str()));
+    // The next recovery repairs the fingerprint and closes the intent.
+    let s = reopened(s);
+    let settled = recover_now(&s);
+    assert!(settled.open.is_empty(), "{:?}", settled.open);
+    assert_eq!(phases(&s), [Phase::Intent, Phase::Done]);
+    assert_eq!(fingerprint(&s).as_deref(), Some(new_fp.as_str()));
+}
+
+#[test]
 fn a_crash_between_stage_and_rename_leaves_no_staged_copy_and_settles_not_done() {
     const CHILD: &str = "DFM_APPLY_STAGE_CRASH_HOME";
     let seed = |s: &Setup| {
@@ -4057,11 +4102,22 @@ fn a_crash_between_stage_and_rename_leaves_no_staged_copy_and_settles_not_done()
     let s = Setup { store: open(&h), h };
     assert_eq!(leftovers(&s.h.0).len(), 1, "the crash left the staged copy");
     assert_eq!(phases(&s), [Phase::Intent]);
+    // A file of the user that only looks like a staged name is not touched.
+    fs::write(s.h.0.join(".f.2024.10.12.tmp"), "mine\n").unwrap();
     let settled = recover_now(&s);
     // The live file still holds the ledger content: the effect did not happen.
     assert!(settled.open.is_empty(), "{:?}", settled.open);
+    assert!(settled.warnings.is_empty(), "{:?}", settled.warnings);
     assert_eq!(phases(&s), [Phase::Intent, Phase::Failed]);
-    assert!(leftovers(&s.h.0).is_empty(), "the staged copy is removed");
+    assert_eq!(
+        leftovers(&s.h.0),
+        [".f.2024.10.12.tmp"],
+        "only the decoy is left"
+    );
+    assert_eq!(
+        fs::read_to_string(s.h.0.join(".f.2024.10.12.tmp")).unwrap(),
+        "mine\n"
+    );
     assert_eq!(fs::read_to_string(s.h.0.join("f")).unwrap(), "old\n");
 }
 

@@ -71,6 +71,8 @@ pub struct Report {
     pub stopped: Option<Refusal>,
     /// Bytes of a torn final journal line that were cut off before settling (0 when none).
     pub repaired: usize,
+    /// Staged copies of an interrupted publish that settling could not remove.
+    pub warnings: Vec<String>,
 }
 
 /// The result of the gates that need no write.
@@ -497,6 +499,7 @@ struct Exec<'a, 'r> {
     plan: &'a Plan,
     /// Bytes cut off a torn final journal line by this run's repair.
     repaired: usize,
+    warnings: Vec<String>,
     /// Journal intents per planner journal id, so an id is never reused after a partial apply.
     attempts: BTreeMap<String, u32>,
     /// Paths whose state is unknown (an interrupted or unconfirmed operation). Nothing more is
@@ -931,17 +934,19 @@ impl Exec<'_, '_> {
         self.journal(op, &id, Phase::Intent, Some(recovery), None)
             .map_err(|e| Ended::Failed(e, Some(id.clone())))?;
         // From here on the effect may have happened.
-        let effect = self.effect(
-            op,
-            rel,
-            &abs,
-            &parent,
-            name,
-            &live,
-            facts.ledger_fp.as_deref(),
-            bytes.as_deref(),
-            new_fp.as_deref(),
-        );
+        let effect = crate::fsys::staged_as(&id, || {
+            self.effect(
+                op,
+                rel,
+                &abs,
+                &parent,
+                name,
+                &live,
+                facts.ledger_fp.as_deref(),
+                bytes.as_deref(),
+                new_fp.as_deref(),
+            )
+        });
         let removed_fp = match effect {
             Ok(fp) => fp,
             Err(e) => return Err(self.fail_after_intent(op, &id, &abs, e)),
@@ -1165,7 +1170,9 @@ impl Exec<'_, '_> {
         };
         self.journal(op, &id, Phase::Intent, Some(recovery), None)
             .map_err(|e| Ended::Failed(e, Some(id.clone())))?;
-        let effect = self.merge_effect(rel, parent, name, read, &merged.bytes, merged.changed);
+        let effect = crate::fsys::staged_as(&id, || {
+            self.merge_effect(rel, parent, name, read, &merged.bytes, merged.changed)
+        });
         if let Err(e) = effect {
             return Err(self.fail_after_intent(op, &id, abs, e));
         }
@@ -1582,6 +1589,7 @@ fn settle(ex: &mut Exec<'_, '_>) -> Result<(), Refusal> {
         let w = (&ex.run.sys, ex.run.home, ex.run.home_path);
         recover::settle_all(ex.run.store, w, &planned)?
     };
+    ex.warnings = settled.warnings;
     for o in settled.open {
         if o.has_paths {
             for p in o.paths {
@@ -1671,6 +1679,7 @@ fn execute(run: &Run<'_>, plan: &Plan) -> Report {
         run,
         plan,
         repaired: 0,
+        warnings: Vec::new(),
         attempts: BTreeMap::new(),
         unknown_paths: BTreeMap::new(),
         unknown_resources: BTreeMap::new(),
@@ -1774,5 +1783,6 @@ fn execute(run: &Run<'_>, plan: &Plan) -> Report {
         operations: records,
         stopped: crate::signal::requested().or(stopped),
         repaired: ex.repaired,
+        warnings: ex.warnings,
     }
 }

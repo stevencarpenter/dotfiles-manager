@@ -301,56 +301,70 @@ impl Dir {
         if mode > 0o777 {
             return Err(conflict("a file mode above 0777 is not published"));
         }
-        if matches!(how, Publish::Create) {
-            return if self.publish_new_mode(name, bytes, mode, fail, "file")? {
-                Ok(())
-            } else {
-                Err(conflict(format!(
-                    "{} appeared while applying; it is left alone",
-                    self.at(name).display()
-                )))
-            };
-        }
-        fail.hit("file-before-write")?;
-        let tmp = self.write_temp_mode(name, bytes, mode)?;
-        let commit = || -> Result<(), Refusal> {
-            fail.hit("file-after-tmp")?;
-            match how {
-                Publish::Create => unreachable!("handled above"),
-                Publish::Replace {
-                    expected_sha256,
-                    uid,
-                } => {
-                    let live = self.hash_file(name, limit)?;
-                    fail.hit("file-after-hash")?;
-                    let hashed = match &live {
-                        Some((h, ident)) if h == expected_sha256 => *ident,
-                        _ => {
-                            return Err(conflict(format!(
-                                "{} changed while applying; it is left alone",
-                                self.at(name).display()
-                            )));
-                        }
-                    };
-                    // The owner check must see the inode that was hashed.
-                    if self.require_owner(name, uid)? != hashed {
-                        return Err(conflict(format!(
-                            "{} was replaced while applying; it is left alone",
-                            self.at(name).display()
-                        )));
-                    }
-                    rfs::renameat(&self.fd, &tmp, &self.fd, name).map_err(|e| sys_err("rename", e))
+        match how {
+            Publish::Create => {
+                if self.publish_new_mode(name, bytes, mode, fail, "file")? {
+                    Ok(())
+                } else {
+                    Err(conflict(format!(
+                        "{} appeared while applying; it is left alone",
+                        self.at(name).display()
+                    )))
                 }
-                Publish::ReplaceStamp(want) => {
-                    if self.entry_stamp(name)? != Some(want) {
+            }
+            Publish::Replace {
+                expected_sha256,
+                uid,
+            } => self.publish_over(name, bytes, mode, fail, || {
+                let live = self.hash_file(name, limit)?;
+                fail.hit("file-after-hash")?;
+                let hashed = match &live {
+                    Some((h, ident)) if h == expected_sha256 => *ident,
+                    _ => {
                         return Err(conflict(format!(
                             "{} changed while applying; it is left alone",
                             self.at(name).display()
                         )));
                     }
-                    rfs::renameat(&self.fd, &tmp, &self.fd, name).map_err(|e| sys_err("rename", e))
+                };
+                // The owner check must see the inode that was hashed.
+                if self.require_owner(name, uid)? != hashed {
+                    return Err(conflict(format!(
+                        "{} was replaced while applying; it is left alone",
+                        self.at(name).display()
+                    )));
                 }
-            }
+                Ok(())
+            }),
+            Publish::ReplaceStamp(want) => self.publish_over(name, bytes, mode, fail, || {
+                if self.entry_stamp(name)? == Some(want) {
+                    Ok(())
+                } else {
+                    Err(conflict(format!(
+                        "{} changed while applying; it is left alone",
+                        self.at(name).display()
+                    )))
+                }
+            }),
+        }
+    }
+
+    /// Stages `bytes`, runs `guard` just before the commit, then moves the staged file over
+    /// `name` with `renameat`. A failure before the commit removes the staged file.
+    fn publish_over(
+        &self,
+        name: &str,
+        bytes: &[u8],
+        mode: u32,
+        fail: &Fail,
+        guard: impl FnOnce() -> Result<(), Refusal>,
+    ) -> Result<(), Refusal> {
+        fail.hit("file-before-write")?;
+        let tmp = self.write_temp_mode(name, bytes, mode)?;
+        let commit = || -> Result<(), Refusal> {
+            fail.hit("file-after-tmp")?;
+            guard()?;
+            rfs::renameat(&self.fd, &tmp, &self.fd, name).map_err(|e| sys_err("rename", e))
         };
         if let Err(e) = commit() {
             self.drop_temp(&tmp);

@@ -221,6 +221,9 @@ pub fn recover_cmd(ctx: &Ctx, out: &mut dyn Write) -> Result<(), Refusal> {
         )
         .map_err(out_err)?;
     }
+    for warning in &s.warnings {
+        writeln!(out, "warning: {}", bounded(warning)).map_err(out_err)?;
+    }
     for (id, phase) in &s.closed {
         let what = if *phase == Phase::Done {
             "done"
@@ -244,7 +247,7 @@ pub fn recover_cmd(ctx: &Ctx, out: &mut dyn Write) -> Result<(), Refusal> {
         )
         .map_err(out_err)?;
     }
-    if s.closed.is_empty() && s.open.is_empty() && s.repaired == 0 {
+    if s.closed.is_empty() && s.open.is_empty() && s.repaired == 0 && s.warnings.is_empty() {
         return writeln!(out, "nothing to recover").map_err(out_err);
     }
     // An open entry is a result to report, not a failure of this command: exit 3 even when
