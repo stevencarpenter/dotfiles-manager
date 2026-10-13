@@ -224,8 +224,9 @@ impl Store {
         Ok(s.attach_state(false, false)?.then_some(s))
     }
 
-    /// `E_LOCKED` when a writer holds the manager lock. Creates nothing and does not wait.
-    pub fn probe_writer(sys: &Sys, layout: &Layout) -> Result<(), Refusal> {
+    /// `E_LOCKED` when a writer holds the manager lock. Creates nothing and does not wait. The
+    /// returned shared lock (none when no lock file exists) stays held until it is dropped.
+    pub fn probe_writer(sys: &Sys, layout: &Layout) -> Result<Option<std::fs::File>, Refusal> {
         let home = Dir::open_home(sys, &layout.home)?;
         let mut rel = below(&layout.home, &layout.lock_file)?;
         let Some(name) = rel.pop() else {
@@ -233,7 +234,7 @@ impl Store {
         };
         match home.walk(sys, &rel, rel.len(), false)? {
             Some(dir) => Lock::probe(&dir, &name),
-            None => Ok(()),
+            None => Ok(None),
         }
     }
 

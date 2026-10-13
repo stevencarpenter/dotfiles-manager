@@ -562,6 +562,46 @@ fn state_check_while_a_writer_runs_reports_the_lock_and_no_findings() {
     assert_eq!(check(h.path()).status.code(), Some(0));
 }
 
+#[test]
+fn state_check_holds_the_lock_across_its_whole_read() {
+    let h = bound_home("check-holds");
+    let release = h.path().join("release-check");
+    let reached = h.path().join("release-check.reached");
+    let mut c = cmd(h.path(), &["state", "check"])
+        .env(
+            "DFM_FAILPOINT",
+            format!("check-after-probe:wait-{}", release.display()),
+        )
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    wait_for("check to reach its read", || reached.exists());
+    let out = out_file(h.path(), "late");
+    let o = run(
+        h.path(),
+        &[
+            "__record-op",
+            "--resource",
+            "core.late",
+            "--output",
+            &out,
+            "--content",
+            "l",
+        ],
+    );
+    assert_eq!(o.status.code(), Some(3), "{}", text(&o.stderr));
+    assert!(text(&o.stderr).contains("E_LOCKED"), "{}", text(&o.stderr));
+    assert!(!Path::new(&out).exists());
+    fs::write(&release, "go").unwrap();
+    assert_eq!(c.wait().unwrap().code(), Some(0));
+    // The lock is free again after check ends.
+    assert_eq!(
+        record(h.path(), "core.after", "after", "a").status.code(),
+        Some(0)
+    );
+}
+
 // ---- C06: identity against loaded receipts and trials --------------------------------------------
 
 fn seeded(label: &str) -> TempDir {

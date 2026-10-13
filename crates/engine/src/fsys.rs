@@ -1273,23 +1273,24 @@ impl Lock {
     }
 
     /// Reports whether a writer holds the lock, without creating the file and without waiting.
-    /// A missing file means no writer. The shared try-lock is dropped at once. A writer that
-    /// starts in that instant gets `E_LOCKED` and can retry.
-    pub fn probe(parent: &Dir, name: &str) -> Result<(), Refusal> {
+    /// A missing file means no writer and no guard. Otherwise the caller keeps the returned
+    /// shared lock for as long as it reads, so a writer that starts meanwhile gets `E_LOCKED`.
+    pub fn probe(parent: &Dir, name: &str) -> Result<Option<File>, Refusal> {
         check_name(name)?;
         let bad = |d: String| storage(format!("{}: {d}", parent.at(name).display()));
         let flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC;
         let fd = match rfs::openat(&parent.fd, name, flags, Mode::empty()) {
             Ok(fd) => fd,
-            Err(Errno::NOENT) => return Ok(()),
+            Err(Errno::NOENT) => return Ok(None),
             Err(Errno::LOOP) => return Err(bad("is a symlink".into())),
             Err(e) => return Err(bad(io_kind(e))),
         };
         if kind(&rfs::fstat(&fd).map_err(|e| sys_err("stat lock", e))?) != FileType::RegularFile {
             return Err(bad("must be a regular file".into()));
         }
-        match File::from(fd).try_lock_shared() {
-            Ok(()) => Ok(()),
+        let file = File::from(fd);
+        match file.try_lock_shared() {
+            Ok(()) => Ok(Some(file)),
             Err(TryLockError::WouldBlock) => Err(Refusal::new(
                 Code::Locked,
                 "a writer is running and holds the manager lock",
