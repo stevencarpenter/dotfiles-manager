@@ -100,7 +100,6 @@ impl Generator for Generators<'_> {
             let (bytes, changed) = retire(live, &inputs.owned_entries, &inputs.owned_appended)?;
             return Ok(Merged {
                 bytes,
-                live_view: Vec::new(),
                 rendered_view: Vec::new(),
                 live_leaves: Default::default(),
                 rendered_leaves: Default::default(),

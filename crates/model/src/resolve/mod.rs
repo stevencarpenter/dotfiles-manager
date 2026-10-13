@@ -4,7 +4,7 @@
 mod docs;
 mod error;
 mod explain;
-mod pointer;
+pub(crate) mod pointer;
 mod schema;
 mod scope;
 mod source;

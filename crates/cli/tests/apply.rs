@@ -2752,3 +2752,162 @@ fn apply_refuses_a_state_store_that_lacks_a_subdirectory_before_any_change() {
         assert!(!fx.h(".zshrc").exists(), "{missing}");
     }
 }
+
+#[test]
+fn a_renamed_resource_over_a_missing_output_retires_the_old_entry_before_it_writes() {
+    let fx = Fx::new();
+    assert_eq!(code(&fx.apply(&[])), 0);
+    let module = fs::read_to_string(fx.root.join("base/modules/core/module.toml")).unwrap();
+    fx.put(
+        "base/modules/core/module.toml",
+        &module.replace("id = \"git\"", "id = \"gitcfg\""),
+    );
+    // The old output is moved aside, so the new resource's target is missing but the ledger
+    // still names the old resource as owner.
+    fs::rename(fx.h(".config/git/config"), fx.h(".config/git/mine")).unwrap();
+    let plan = fx.saved().plan;
+    assert!(plan.blockers.is_empty(), "{:?}", plan.blockers);
+    let pos = |id: &str| plan.operations.iter().position(|o| o.id == id).unwrap();
+    let retire = pos("remove@core.git@.config/git/config");
+    let create = pos("core.gitcfg@.config/git/config");
+    assert!(retire < create, "the old entry is retired first");
+    let o = fx.apply(&[]);
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+    assert!(is_link_to(
+        &fx.h(".config/git/config"),
+        &fx.root.join("base/modules/core/files/gitconfig")
+    ));
+    let owners: Vec<_> = fx.ledger()["resources"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|r| {
+            r["owned_outputs"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|o| o["path"].as_str().unwrap().ends_with(".config/git/config"))
+        })
+        .map(|r| r["resource"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(owners, ["core.gitcfg"]);
+    assert_eq!(
+        fs::read_to_string(fx.h(".config/git/mine")).unwrap(),
+        "[user]\n"
+    );
+}
+
+const NVIM_MODULE: &str = r#"schema = 1
+id = "nv"
+platforms = ["macos", "linux"]
+requires = []
+
+[[resources]]
+id = "nvim"
+kind = "link"
+adapter = "fs-link/v1"
+target = ".config/nvim"
+[resources.value]
+source = "files/nvim"
+directory = true
+"#;
+
+const NVIM_INIT_MODULE: &str = r#"schema = 1
+id = "nvinit"
+platforms = ["macos", "linux"]
+requires = []
+
+[[resources]]
+id = "init"
+kind = "link"
+adapter = "fs-link/v1"
+target = ".config/nvim/init.lua"
+[resources.value]
+source = "files/init.lua"
+"#;
+
+/// A machine that selects the directory link `.config/nvim -> nv/files/nvim`, applied.
+fn nvim_linked() -> Fx {
+    let fx = Fx::new();
+    fx.put(
+        "base/bundle.toml",
+        &format!(
+            "{BUNDLE}nv = \"modules/nv/module.toml\"\nnvinit = \"modules/nvinit/module.toml\"\n"
+        ),
+    );
+    fx.put("base/modules/nv/module.toml", NVIM_MODULE);
+    fx.put("base/modules/nv/files/nvim/init.lua", "-- old\n");
+    fx.put("base/modules/nvinit/module.toml", NVIM_INIT_MODULE);
+    fx.put("base/modules/nvinit/files/init.lua", "-- new\n");
+    fx.set_profile("\"extra\", \"nv\"");
+    assert_eq!(code(&fx.apply(&[])), 0);
+    assert!(fx.h(".config/nvim").is_symlink());
+    fx
+}
+
+fn removal_flags(fx: &Fx) -> Vec<String> {
+    fx.saved()
+        .plan
+        .operations
+        .iter()
+        .filter(|o| o.id.starts_with("remove@") && o.status == dfm_model::plan::Status::Planned)
+        .flat_map(|o| ["--allow-disruptive".to_string(), o.id.clone()])
+        .collect()
+}
+
+#[test]
+fn a_leaf_under_a_directory_link_the_plan_removes_follows_the_removal() {
+    let fx = nvim_linked();
+    fx.set_profile("\"extra\", \"nvinit\"");
+    let plan = fx.saved().plan;
+    assert!(plan.blockers.is_empty(), "{:?}", plan.blockers);
+    let pos = |id: &str| plan.operations.iter().position(|o| o.id == id).unwrap();
+    let (removed, made, leaf) = (
+        pos("remove@nv.nvim@.config/nvim"),
+        pos("mkdir@.config/nvim"),
+        pos("nvinit.init@.config/nvim/init.lua"),
+    );
+    assert!(removed < made && made < leaf, "{removed} {made} {leaf}");
+    let flags = removal_flags(&fx);
+    let flags: Vec<&str> = flags.iter().map(String::as_str).collect();
+    let o = fx.apply(&flags);
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+    assert!(fx.h(".config/nvim").is_dir() && !fx.h(".config/nvim").is_symlink());
+    assert!(is_link_to(
+        &fx.h(".config/nvim/init.lua"),
+        &fx.root.join("base/modules/nvinit/files/init.lua")
+    ));
+    assert!(
+        fx.root
+            .join("base/modules/nv/files/nvim/init.lua")
+            .is_file()
+    );
+    assert!(!fx.owned_paths().contains(&".config/nvim".to_string()));
+}
+
+#[test]
+fn a_ledger_link_entry_that_is_now_a_directory_is_cleared_by_moving_it_aside() {
+    let fx = nvim_linked();
+    // The user replaced the link with their own directory.
+    fs::remove_file(fx.h(".config/nvim")).unwrap();
+    fs::create_dir(fx.h(".config/nvim")).unwrap();
+    fs::write(fx.h(".config/nvim/mine.lua"), "-- mine\n").unwrap();
+    fx.set_profile("\"extra\"");
+    let plan = fx.saved().plan;
+    assert_eq!(plan.blockers.len(), 1, "{:?}", plan.blockers);
+    let b = &plan.blockers[0];
+    assert_eq!(b.code.as_str(), "E_CONFLICT");
+    assert!(
+        b.correction.contains("stale ledger entry"),
+        "{}",
+        b.correction
+    );
+    // The fix works: after the move, the next plan has no blocker and apply drops the entry.
+    fs::rename(fx.h(".config/nvim"), fx.h(".config/nvim.mine")).unwrap();
+    let flags = removal_flags(&fx);
+    let flags: Vec<&str> = flags.iter().map(String::as_str).collect();
+    let o = fx.apply(&flags);
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+    assert!(!fx.owned_paths().contains(&".config/nvim".to_string()));
+    assert!(fx.h(".config/nvim.mine/mine.lua").is_file());
+}
