@@ -239,20 +239,27 @@ pub fn merge_facts(
             }
         };
         // Another resource's ledger entry on this path decides before anything is read.
-        // Another resource's entry blocks. A stale owner (a renamed or removed resource) blocks
-        // only while the file exists: the planner retires the entry when the file is missing.
+        // Another resource's entry blocks. A stale owner (a renamed or removed resource, or a
+        // selected one that no longer claims the path) blocks only while the file exists: the
+        // planner retires the entry when the file is missing.
         // The check peeks and never reads, because the file can hold credentials.
         let other = ledger
             .iter()
             .find(|o| dfm_model::fold(&o.path) == dfm_model::fold(claim) && o.resource != r.id);
-        let stale = other.is_some_and(|o| !resolved.resources.contains_key(&o.resource));
+        let stale = other.is_some_and(|o| {
+            !resolved.resources.get(&o.resource).is_some_and(|x| {
+                x.claims
+                    .iter()
+                    .any(|c| dfm_model::fold(c) == dfm_model::fold(claim))
+            })
+        });
         let other = other.filter(|_| !stale || !known_absent(sys, home, claim));
         let verdict = match (&layered, other) {
             (_, Some(o)) => blocked(
                 Code::Conflict,
                 &if stale {
                     format!(
-                        "{claim} is recorded in the ledger as an output of {}, which is no longer selected. Fix: move the file aside, then plan again; the plan retires the old entry and merges into a new file. Merge the old settings back by hand",
+                        "{claim} is recorded in the ledger as an output of {}, which no longer claims it. Fix: move the file aside, then plan again; the plan retires the old entry and merges into a new file. Merge the old settings back by hand",
                         o.resource
                     )
                 } else {

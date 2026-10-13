@@ -3303,3 +3303,32 @@ fn a_merge_over_a_stale_owner_retires_it_or_blocks_with_a_fix_that_works() {
         fs::read_to_string(e.h(".local/state/dotfiles-manager/state/ledger.json")).unwrap();
     assert!(!ledger.contains("gone.res"), "{ledger}");
 }
+
+#[test]
+fn a_merge_retires_a_missing_output_of_a_selected_owner_that_moved_its_claim() {
+    let e = Env::personal();
+    e.mkdirs(".claude");
+    let out = e.h(".claude/settings.json");
+    // A still selected resource once owned this path and now claims another one. The file is gone.
+    record(&e, "core.git-defaults", &out, "{}");
+    fs::remove_file(&out).unwrap();
+    let (o, s) = e.saved();
+    assert_eq!(code(&o), 0, "{}", text(&o.stderr));
+    let pos = |pre: &str| {
+        s.plan
+            .operations
+            .iter()
+            .position(|o| o.id.starts_with(pre))
+            .unwrap()
+    };
+    assert!(pos("remove@core.git-defaults@.claude/settings.json") < pos("agents.claude-settings@"));
+    let o = e.run(&[
+        "apply",
+        "--root",
+        e.root.to_str().unwrap(),
+        "--yes-plan",
+        &s.plan_digest,
+    ]);
+    assert_eq!(code(&o), 0, "{}\n{}", text(&o.stdout), text(&o.stderr));
+    assert!(out.is_file());
+}
