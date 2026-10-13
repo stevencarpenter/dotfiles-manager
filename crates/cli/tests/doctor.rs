@@ -1228,3 +1228,19 @@ fn an_unusable_root_is_a_row_and_exit_1_whether_or_not_home_is_usable() {
     assert!(text(&o.stderr).contains("E_DIAGNOSED"));
     assert!(text(&o.stdout).contains("ERROR   E_HOME_MISMATCH binding"));
 }
+
+#[test]
+fn a_path_handed_to_a_new_owner_is_pending_not_gone() {
+    let fx = personal();
+    own(&fx, "old-owner", "normal", ".codex/AGENTS.md");
+    let (_, rows) = fx.rows();
+    assert_eq!(
+        status(&rows, ".codex/AGENTS.md"),
+        ("WARN", "D_PLAN_PENDING")
+    );
+    let detail = at(&rows, ".codex/AGENTS.md")["detail"].as_str().unwrap();
+    assert!(
+        detail.contains("owned by old-owner") && detail.contains("takes the path over"),
+        "{detail}"
+    );
+}

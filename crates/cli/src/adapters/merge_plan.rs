@@ -311,8 +311,6 @@ fn read_target(sys: &Sys, home: &Dir, parents: &[&str], name: &str) -> Result<Li
     }
 }
 
-/// The live bytes of the claimed file (`None` when it or a parent directory is absent), or the
-/// blocked verdict for a target that must not be merged into.
 /// Whether the claimed path is known to be absent, without reading it. Any doubt is "not absent".
 fn known_absent(sys: &Sys, home: &Dir, claim: &str) -> bool {
     let comps: Vec<&str> = claim.split('/').collect();
@@ -328,6 +326,8 @@ fn known_absent(sys: &Sys, home: &Dir, claim: &str) -> bool {
     }
 }
 
+/// The live bytes of the claimed file (`None` when it or a parent directory is absent), or the
+/// blocked verdict for a target that must not be merged into.
 fn live_bytes(sys: &Sys, home: &Dir, claim: &str) -> Result<Option<Vec<u8>>, MergeVerdict> {
     let comps: Vec<&str> = claim.split('/').collect();
     let Some((name, parents)) = comps.split_last() else {

@@ -2950,3 +2950,38 @@ fn a_renamed_resource_over_the_old_owners_present_output_writes_nothing() {
         ledger_before
     );
 }
+
+#[test]
+fn a_changed_owned_link_names_state_recover_in_its_fix() {
+    let fx = Fx::new();
+    assert_eq!(code(&fx.apply(&[])), 0);
+    fs::remove_file(fx.h(".zshrc")).unwrap();
+    symlink("/my/own/zshrc", fx.h(".zshrc")).unwrap();
+    let b = fx.saved().plan.blockers;
+    assert_eq!(b.len(), 1, "{b:?}");
+    assert!(
+        b[0].correction.contains("state recover"),
+        "{}",
+        b[0].correction
+    );
+}
+
+#[test]
+fn a_renamed_resource_whose_parent_directory_is_also_gone_retires_the_old_entry() {
+    let fx = Fx::new();
+    assert_eq!(code(&fx.apply(&[])), 0);
+    let module = fs::read_to_string(fx.root.join("base/modules/core/module.toml")).unwrap();
+    fx.put(
+        "base/modules/core/module.toml",
+        &module.replace("id = \"git\"", "id = \"gitcfg\""),
+    );
+    fs::remove_file(fx.h(".config/git/config")).unwrap();
+    fs::remove_dir(fx.h(".config/git")).unwrap();
+    let o = fx.apply(&[]);
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+    assert!(is_link_to(
+        &fx.h(".config/git/config"),
+        &fx.root.join("base/modules/core/files/gitconfig")
+    ));
+    assert!(!fx.ledger().to_string().contains("core.git\""));
+}

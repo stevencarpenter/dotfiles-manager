@@ -860,14 +860,28 @@ fn owned_row(path: &str, who: &str, op: Option<&Operation>, live: Live) -> Row {
             Level::Error,
             &format!("resource {who}: {}", clip(&why)),
         ),
-        Live::Missing => Row::new(
-            "output",
-            D::OutputMissing,
-            Level::Warn,
-            path,
-            &format!("owned by {who}; the output is gone"),
-            "Run apply to publish it again.",
-        ),
+        Live::Missing => match op.filter(|op| op.status == Status::Planned && op.resource != who) {
+            // A rename: the plan hands the path to another resource and retires this entry first.
+            Some(op) => Row::new(
+                "output",
+                D::PlanPending,
+                Level::Warn,
+                path,
+                &format!(
+                    "owned by {who}; the output is gone and resource {} takes the path over: {}",
+                    op.resource, op.effect
+                ),
+                "Review plan, then run apply.",
+            ),
+            None => Row::new(
+                "output",
+                D::OutputMissing,
+                Level::Warn,
+                path,
+                &format!("owned by {who}; the output is gone"),
+                "Run apply to publish it again.",
+            ),
+        },
         Live::Differs(why) => row(
             Code::Conflict,
             Level::Error,
