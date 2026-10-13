@@ -123,24 +123,28 @@ thread_local! {
     static STAGE_TAG: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
 }
 
-/// The tag in the staged names of the attempt `op_id`: 16 hex digits of its SHA-256. Recovery
-/// derives the same tag from the intent entry, so it can remove exactly the names this attempt
-/// made and no other file.
-pub(crate) fn stage_tag(op_id: &str) -> String {
-    let mut hex = dfm_model::digest::sha256_hex(op_id.as_bytes());
+/// The tag in the staged names of the attempt `op_id` whose intent entry has the time `at`: 16
+/// hex digits of the SHA-256 of both. Op ids restart when a journal is archived by hand, so the
+/// time keeps a leftover name of an old attempt from blocking a new one. Recovery derives the
+/// same tag from the intent entry, so it can remove exactly the names this attempt made and no
+/// other file. shortcut: the time has a resolution of one second, so a repeated id in the same
+/// second still collides; add a nonce to the intent if that ever matters.
+pub(crate) fn stage_tag(op_id: &str, at: &str) -> String {
+    let mut hex = dfm_model::digest::sha256_hex(format!("{op_id}\0{at}").as_bytes());
     hex.truncate(16);
     hex
 }
 
-/// Runs `f` with every staged name on this thread tagged for the attempt `op_id`.
-pub(crate) fn staged_as<T>(op_id: &str, f: impl FnOnce() -> T) -> T {
+/// Runs `f` with every staged name on this thread tagged for the attempt `op_id` (see
+/// [`stage_tag`]).
+pub(crate) fn staged_as<T>(op_id: &str, at: &str, f: impl FnOnce() -> T) -> T {
     struct Reset;
     impl Drop for Reset {
         fn drop(&mut self) {
             STAGE_TAG.with(|t| *t.borrow_mut() = None);
         }
     }
-    STAGE_TAG.with(|t| *t.borrow_mut() = Some(stage_tag(op_id)));
+    STAGE_TAG.with(|t| *t.borrow_mut() = Some(stage_tag(op_id, at)));
     let _reset = Reset;
     f()
 }
@@ -641,8 +645,8 @@ impl Dir {
     /// and only those. Only a regular file or a link of the current user goes, without following
     /// a link. The caller holds the writer lock, so no live publish owns such a name. Returns one
     /// message for each name that exists and could not be removed.
-    pub(crate) fn sweep_stages(&self, sys: &Sys, name: &str, op_id: &str) -> Vec<String> {
-        let tag = stage_tag(op_id);
+    pub(crate) fn sweep_stages(&self, sys: &Sys, name: &str, op_id: &str, at: &str) -> Vec<String> {
+        let tag = stage_tag(op_id, at);
         let mut left = Vec::new();
         for suffix in ["tmp", "stage"] {
             let staged = format!(".{name}.{tag}.{suffix}");
@@ -1299,6 +1303,16 @@ impl Lock {
     /// A missing file means no writer and no guard. Otherwise the caller keeps the returned
     /// shared lock for as long as it reads, so a writer that starts meanwhile gets `E_LOCKED`.
     pub fn probe(parent: &Dir, name: &str) -> Result<Option<File>, Refusal> {
+        Self::probe_after_open(parent, name, || {})
+    }
+
+    /// As [`Lock::probe`]. `after_open` runs between the open and the lock, so a test can replace
+    /// the file there.
+    fn probe_after_open(
+        parent: &Dir,
+        name: &str,
+        after_open: impl FnOnce(),
+    ) -> Result<Option<File>, Refusal> {
         check_name(name)?;
         let bad = |d: String| storage(format!("{}: {d}", parent.at(name).display()));
         let flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC;
@@ -1308,12 +1322,24 @@ impl Lock {
             Err(Errno::LOOP) => return Err(bad("is a symlink".into())),
             Err(e) => return Err(bad(io_kind(e))),
         };
-        if kind(&rfs::fstat(&fd).map_err(|e| sys_err("stat lock", e))?) != FileType::RegularFile {
+        let st = rfs::fstat(&fd).map_err(|e| sys_err("stat lock", e))?;
+        if kind(&st) != FileType::RegularFile {
             return Err(bad("must be a regular file".into()));
         }
+        let held = ident_of(&st)?;
+        after_open();
         let file = File::from(fd);
         match file.try_lock_shared() {
-            Ok(()) => Ok(Some(file)),
+            // A shared lock on a replaced or removed file excludes no writer, which locks the
+            // entry now at this name. The writer fences the same way ([`Lock::verify`]).
+            Ok(()) if parent.entry_ident(name)? == Some(held) => Ok(Some(file)),
+            Ok(()) => Err(Refusal::new(
+                Code::Locked,
+                format!(
+                    "{}: the lock file was replaced or removed while it was opened; run the command again",
+                    parent.at(name).display()
+                ),
+            )),
             Err(TryLockError::WouldBlock) => Err(Refusal::new(
                 Code::Locked,
                 "a writer is running and holds the manager lock",
@@ -1344,6 +1370,35 @@ impl Lock {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn probe_refuses_a_lock_file_replaced_after_the_open() {
+        let root = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .join(format!("dfm-probe-replaced-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let root = root.as_path();
+        std::fs::write(root.join("lock"), "").unwrap();
+        let dir = Dir::open_plain(root).unwrap();
+        // Unchanged: the probe returns the shared lock.
+        assert!(Lock::probe(&dir, "lock").unwrap().is_some());
+        // Replaced between the open and the lock: refused.
+        let e = Lock::probe_after_open(&dir, "lock", || {
+            std::fs::remove_file(root.join("lock")).unwrap();
+            std::fs::write(root.join("lock"), "").unwrap();
+        })
+        .unwrap_err();
+        assert_eq!(e.code, Code::Locked);
+        assert!(e.detail.contains("replaced or removed"), "{}", e.detail);
+        // Removed between the open and the lock: refused.
+        std::fs::write(root.join("lock"), "").unwrap();
+        let e = Lock::probe_after_open(&dir, "lock", || {
+            std::fs::remove_file(root.join("lock")).unwrap()
+        })
+        .unwrap_err();
+        assert_eq!(e.code, Code::Locked);
+    }
 
     /// A writer that accepts a few bytes and then fails, like a full disk.
     struct Partial(Vec<u8>);

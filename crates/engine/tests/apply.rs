@@ -4122,6 +4122,32 @@ fn a_crash_between_stage_and_rename_leaves_no_staged_copy_and_settles_not_done()
 }
 
 #[test]
+fn a_leftover_stage_of_a_repeated_op_id_does_not_block_the_next_publish() {
+    // The journal was archived by hand, so the op id restarts. An old stage under the tag of the
+    // bare op id must not make the next publish fail with EEXIST.
+    let s = setup();
+    let o = op(
+        &s.h,
+        &s.store,
+        "x@app.conf",
+        1,
+        Action::CreateFile,
+        "app.conf",
+    );
+    let old = {
+        let mut hex = dfm_model::digest::sha256_hex(format!("{}-1", o.journal_id).as_bytes());
+        hex.truncate(16);
+        hex
+    };
+    let mine = s.h.0.join(format!(".app.conf.{old}.tmp"));
+    fs::write(&mine, "old\n").unwrap();
+    let r = go(&s, &plan(vec![o]), &gen_for("x@app.conf", "a=1\n"), &none());
+    assert_eq!(r.operations[0].status, Status::Updated, "{:?}", r.stopped);
+    assert_eq!(fs::read_to_string(s.h.0.join("app.conf")).unwrap(), "a=1\n");
+    assert_eq!(fs::read_to_string(&mine).unwrap(), "old\n", "left alone");
+}
+
+#[test]
 fn a_crash_between_staging_a_link_and_the_rename_leaves_no_staged_link_and_settles_not_done() {
     const CHILD: &str = "DFM_APPLY_LINK_STAGE_CRASH_HOME";
     const NAME: &str =

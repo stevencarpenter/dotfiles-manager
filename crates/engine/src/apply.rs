@@ -623,12 +623,24 @@ impl Exec<'_, '_> {
         recovery: Option<Recovery>,
         reason: Option<String>,
     ) -> Result<(), Refusal> {
+        self.journal_at(op, id, phase, recovery, reason, self.now())
+    }
+
+    fn journal_at(
+        &self,
+        op: &Operation,
+        id: &str,
+        phase: Phase,
+        recovery: Option<Recovery>,
+        reason: Option<String>,
+        at: String,
+    ) -> Result<(), Refusal> {
         self.run.store.append_journal(&JournalEntry {
             schema: 1,
             op_id: id.into(),
             op: step_name(op).into(),
             phase,
-            at: self.now(),
+            at,
             resource: op.resource.clone(),
             adapter: op.adapter.clone(),
             class: op.class,
@@ -931,10 +943,11 @@ impl Exec<'_, '_> {
             }],
             snapshot: None,
         };
-        self.journal(op, &id, Phase::Intent, Some(recovery), None)
+        let at = self.now();
+        self.journal_at(op, &id, Phase::Intent, Some(recovery), None, at.clone())
             .map_err(|e| Ended::Failed(e, Some(id.clone())))?;
         // From here on the effect may have happened.
-        let effect = crate::fsys::staged_as(&id, || {
+        let effect = crate::fsys::staged_as(&id, &at, || {
             self.effect(
                 op,
                 rel,
@@ -1168,9 +1181,10 @@ impl Exec<'_, '_> {
             }],
             snapshot: None,
         };
-        self.journal(op, &id, Phase::Intent, Some(recovery), None)
+        let at = self.now();
+        self.journal_at(op, &id, Phase::Intent, Some(recovery), None, at.clone())
             .map_err(|e| Ended::Failed(e, Some(id.clone())))?;
-        let effect = crate::fsys::staged_as(&id, || {
+        let effect = crate::fsys::staged_as(&id, &at, || {
             self.merge_effect(rel, parent, name, read, &merged.bytes, merged.changed)
         });
         if let Err(e) = effect {

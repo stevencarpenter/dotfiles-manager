@@ -247,22 +247,22 @@ pub(crate) fn settle_all(
 /// `fsys::staged_as`). Returns a message for each one that could not be removed.
 fn sweep_stages(store: &Store, (sys, home, home_path): Where<'_>) -> Result<Vec<String>, Refusal> {
     let entries = store.read_journal_lenient()?;
-    let mut targets: Vec<(&str, &str)> = unfinished(&entries)
+    let mut targets: Vec<(&str, &str, &str)> = unfinished(&entries)
         .into_iter()
         .flat_map(|i| {
             i.recovery
                 .iter()
                 .flat_map(|r| &r.outputs)
-                .map(|o| (i.op_id.as_str(), o.path.as_str()))
+                .map(|o| (i.op_id.as_str(), i.at.as_str(), o.path.as_str()))
         })
         .collect();
     let open = unresolved(&entries);
-    targets.extend(
-        open.iter()
-            .flat_map(|u| u.paths().map(|p| (u.unknown.op_id.as_str(), p))),
-    );
+    targets.extend(open.iter().flat_map(|u| {
+        let at = u.intent.map_or("", |i| i.at.as_str());
+        u.paths().map(move |p| (u.unknown.op_id.as_str(), at, p))
+    }));
     let mut left = Vec::new();
-    for (id, abs) in targets {
+    for (id, at, abs) in targets {
         let Some(rel) = Path::new(abs)
             .strip_prefix(home_path)
             .ok()
@@ -275,7 +275,7 @@ fn sweep_stages(store: &Store, (sys, home, home_path): Where<'_>) -> Result<Vec<
             continue;
         };
         if let Ok(parent) = home.open_below(sys, parents) {
-            left.extend(parent.sweep_stages(sys, name, id));
+            left.extend(parent.sweep_stages(sys, name, id, at));
         }
     }
     Ok(left)
