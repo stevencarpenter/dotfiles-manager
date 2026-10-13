@@ -13,7 +13,7 @@ use dfm_model::plan::{
 use dfm_model::resolve::{Resolved, Table, Value};
 use dfm_model::state::Class;
 use dfm_model::{Code, Refusal};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write;
 
 /// What an adapter that produces file content provides, besides its catalog entry.
@@ -242,8 +242,10 @@ fn scalar(v: &Value) -> Result<String, Refusal> {
 /// `key = value` lines. An array writes the key once per element, in array order. Git reads a
 /// repeated key in file order, so the array order is the order Git sees.
 fn entries(out: &mut String, table: &Table) -> Result<(), Refusal> {
+    let mut seen = BTreeSet::new();
     for (key, v) in table.iter().filter(|(_, v)| !v.is_table()) {
         git_name("key", key)?;
+        distinct(&mut seen, "key", key)?;
         let values: Vec<&Value> = match v {
             Value::Array(a) => a.iter().collect(),
             single => vec![single],
@@ -253,6 +255,18 @@ fn entries(out: &mut String, table: &Table) -> Result<(), Refusal> {
         }
     }
     Ok(())
+}
+
+/// Git reads section and key names without regard to ASCII case, so two that differ only in
+/// case would be one setting written twice. Subsection names are case-sensitive and skip this.
+fn distinct(seen: &mut BTreeSet<String>, what: &str, name: &str) -> Result<(), Refusal> {
+    if seen.insert(name.to_ascii_lowercase()) {
+        Ok(())
+    } else {
+        Err(invalid(format!(
+            "git-config {what} {name:?} repeats another {what} that differs only in ASCII case"
+        )))
+    }
 }
 
 /// Renders the Git config text for `value` (docs/adapters.md, `git-config/v1`).
@@ -267,8 +281,10 @@ fn git_config(value: &Value) -> Result<Vec<u8>, Refusal> {
         .as_table()
         .ok_or_else(|| invalid("git-config value must be a table of sections"))?;
     let mut out = String::new();
+    let mut seen = BTreeSet::new();
     for (name, section) in sections {
         git_name("section", name)?;
+        distinct(&mut seen, "section", name)?;
         let table = section
             .as_table()
             .ok_or_else(|| invalid(format!("git-config section {name:?} must be a table")))?;
@@ -619,6 +635,22 @@ mod tests {
             assert_eq!(e.code, Code::ManifestInvalid, "{bad}");
             assert!(e.detail.contains("subsection"), "{}", e.detail);
         }
+    }
+
+    #[test]
+    fn names_that_differ_only_in_ascii_case_are_refused_but_subsections_are_case_sensitive() {
+        for bad in [
+            "[core]\neditor = \"a\"\nEditor = \"b\"\n",
+            "[core]\neditor = \"a\"\n[Core]\neditor = \"b\"\n",
+            "[url.\"x\"]\ninsteadOf = \"a\"\ninsteadof = \"b\"\n",
+        ] {
+            let e = cfg(bad).expect_err(bad);
+            assert_eq!(e.code, Code::ManifestInvalid, "{bad}");
+            assert!(e.detail.contains("ASCII case"), "{}", e.detail);
+        }
+        let t = cfg("[url.\"X\"]\nk = 1\n[url.\"x\"]\nk = 2\n[core]\nk = 1\n[core.sub]\nK = 2\n")
+            .expect("renders");
+        assert!(t.contains("[url \"X\"]") && t.contains("[url \"x\"]"));
     }
 
     #[test]

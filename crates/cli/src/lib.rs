@@ -8,6 +8,7 @@ mod apply_cmd;
 mod controls_fs;
 mod doctor_cmd;
 mod plan_cmd;
+mod read_fs;
 mod source_fs;
 mod state_cmd;
 
@@ -351,6 +352,9 @@ fn dispatch(args: &[String], out: &mut dyn Write) -> Result<(), Refusal> {
                     "self-check needs exactly one of --build-controls or --fixture-dir",
                 )),
             }
+        }
+        "--help" | "-h" | "help" | "--version" | "-V" | "version" | "binding" => {
+            Err(usage(format!("{cmd} takes no arguments")))
         }
         other => Err(usage(format!(
             "unknown command or argument {other}; try --help"

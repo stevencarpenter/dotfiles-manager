@@ -4,6 +4,7 @@
 //! local state of the claimed paths. It writes nothing, fetches nothing, authenticates nothing
 //! and starts no process.
 
+use crate::read_fs::{read_regular_bounded, sha256_file};
 use crate::{Ctx, Loaded, load_resolved, read_existing_binding, usage};
 use dfm_engine::{Dir, Fail, Store, merge, observe};
 use dfm_model::display::visible;
@@ -11,11 +12,8 @@ use dfm_model::plan::{
     self, Binary, Context, MAX_PLAN_BYTES, Owned, Plan, Saved, Stale, Status, source_identity,
 };
 use dfm_model::{Code, Refusal};
-use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
-use std::fs;
-use std::io::{Read, Write};
-use std::os::unix::fs::OpenOptionsExt;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 pub struct Args {
@@ -59,47 +57,31 @@ pub fn parse_args(args: &[String]) -> Result<Args, Refusal> {
 fn binary_identity() -> Result<Binary, Refusal> {
     let io = |e: std::io::Error| Refusal::new(Code::IoFailed, format!("binary identity: {e}"));
     let exe = std::env::current_exe().map_err(io)?;
-    let mut f = fs::File::open(exe).map_err(io)?;
-    let mut h = Sha256::new();
-    let mut buf = vec![0u8; 1 << 16];
-    loop {
-        let n = f.read(&mut buf).map_err(io)?;
-        if n == 0 {
-            break;
-        }
-        h.update(&buf[..n]);
-    }
     Ok(Binary {
         version: env!("CARGO_PKG_VERSION").into(),
-        sha256: dfm_model::digest::hex(h.finalize().as_slice()),
+        sha256: sha256_file(&exe).map_err(io)?,
     })
 }
 
 /// Reads a saved plan: a regular file, not a link, at most 16 MiB.
 fn read_saved(path: &Path) -> Result<Vec<u8>, Refusal> {
     let shown = path.display().to_string();
-    let io = |e: std::io::Error| {
-        Refusal::new(
-            Code::ReportUnavailable,
-            format!("cannot read the saved plan {shown}: {}", e.kind()),
-        )
-    };
-    let f = fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(dfm_platform_macos::O_NOFOLLOW | dfm_platform_macos::O_NONBLOCK)
-        .open(path)
-        .map_err(io)?;
-    if !f.metadata().map_err(io)?.is_file() {
-        return Err(Refusal::new(
-            Code::ReportUnavailable,
-            format!("{shown} is not a regular file"),
-        ));
-    }
-    let mut buf = Vec::new();
-    f.take(MAX_PLAN_BYTES as u64 + 1)
-        .read_to_end(&mut buf)
-        .map_err(io)?;
-    Ok(buf)
+    read_regular_bounded(
+        path,
+        MAX_PLAN_BYTES as u64,
+        |e| {
+            Refusal::new(
+                Code::ReportUnavailable,
+                format!("cannot read the saved plan {shown}: {}", e.kind()),
+            )
+        },
+        || {
+            Refusal::new(
+                Code::ReportUnavailable,
+                format!("{shown} is not a regular file"),
+            )
+        },
+    )
 }
 
 /// Ledger outputs as paths relative to HOME.

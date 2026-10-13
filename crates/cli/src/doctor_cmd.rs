@@ -793,16 +793,6 @@ fn classify(
             "",
         ));
     }
-    if op.is_some_and(|op| matches!(op.action, Action::CreateFile | Action::UpdateFile)) {
-        return Some(Row::new(
-            "output",
-            D::NaGenerated,
-            Level::NotApplicable,
-            path,
-            &format!("resource {who}: not applicable in this build (no generator)"),
-            "",
-        ));
-    }
     if let Some(o) = o {
         return Some(match obs {
             Err(r) => Row::new(

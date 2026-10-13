@@ -3,11 +3,11 @@
 //! Read-only. Starts no process except `id -u`, which names the user that must own the toolchain
 //! and every directory above it below HOME.
 
+use crate::read_fs::sha256_file;
 use dfm_model::controls::{self, MAX_FILE_BYTES};
-use dfm_model::digest::{EntryKind, TreeEntry, hex, tree_digest};
+use dfm_model::digest::{EntryKind, TreeEntry, tree_digest};
 use dfm_model::{Code, Refusal};
 use dfm_platform_macos::Platform;
-use sha2::{Digest, Sha256};
 use std::fs;
 use std::io::{ErrorKind, Read};
 use std::path::{Path, PathBuf};
@@ -147,18 +147,6 @@ fn staged_tree(stage: &Path) -> Result<(String, String), Refusal> {
     Ok((pin, tree))
 }
 
-fn file_sha256(path: &Path) -> std::io::Result<String> {
-    let mut f = fs::File::open(path)?;
-    let (mut h, mut buf) = (Sha256::new(), vec![0u8; 1 << 16]);
-    loop {
-        let n = f.read(&mut buf)?;
-        if n == 0 {
-            return Ok(hex(h.finalize().as_slice()));
-        }
-        h.update(&buf[..n]);
-    }
-}
-
 /// One toolchain entry must belong to `uid` and, unless it is a symlink (whose mode is not used),
 /// must not be writable by group or others.
 fn closed_entry(md: &fs::Metadata, name: &str, uid: u32) -> Result<(), String> {
@@ -242,7 +230,7 @@ fn toolchain_tree_digest_as(dir: &Path, uid: u32) -> Result<String, String> {
                     != 0;
                 EntryKind::File {
                     exec,
-                    sha256: file_sha256(&p).map_err(|e| format!("{rel}: {}", e.kind()))?,
+                    sha256: sha256_file(&p).map_err(|e| format!("{rel}: {}", e.kind()))?,
                 }
             }
             Node::Link(target) => {
