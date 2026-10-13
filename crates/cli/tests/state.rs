@@ -636,6 +636,38 @@ fn state_check_refuses_when_the_lock_file_is_replaced_during_the_read() {
     );
 }
 
+#[test]
+fn state_check_refuses_when_a_first_bind_creates_the_lock_during_the_read() {
+    // No lock file at the probe, so check holds no lock while it reads.
+    let h = TempDir::new("check-lock-appears");
+    let release = h.path().join("release-appears");
+    let reached = h.path().join("release-appears.reached");
+    let c = cmd(h.path(), &["state", "check"])
+        .env(
+            "DFM_FAILPOINT",
+            format!("check-after-probe:wait-{}", release.display()),
+        )
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    wait_for("check to reach its read", || reached.exists());
+    let o = bind(h.path());
+    assert_eq!(o.status.code(), Some(0), "{}", text(&o.stderr));
+    fs::write(&release, "go").unwrap();
+    let o = c.wait_with_output().unwrap();
+    let (so, se) = (text(&o.stdout), text(&o.stderr));
+    assert_eq!(o.status.code(), Some(3), "{so}{se}");
+    assert!(
+        se.contains("E_LOCKED") && se.contains("run state check again"),
+        "{se}"
+    );
+    assert!(
+        !so.contains("binding:") && !so.contains("E_STATE_INVALID") && !so.contains("unbound"),
+        "no findings: {so}"
+    );
+}
+
 // ---- C06: identity against loaded receipts and trials --------------------------------------------
 
 fn seeded(label: &str) -> TempDir {

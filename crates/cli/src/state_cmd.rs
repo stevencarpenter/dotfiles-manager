@@ -45,7 +45,8 @@ pub fn fail_from_env() -> Result<Fail, Refusal> {
 /// bound identity. It lists every problem and repairs nothing. A running writer makes the open
 /// intents and temporary files it leaves look like damage, so check refuses (`E_LOCKED`, no
 /// findings) while one holds the lock. It holds the lock shared until it returns, so a writer
-/// that starts during the read gets `E_LOCKED` instead of being reported as damage.
+/// that starts during the read gets `E_LOCKED` instead of being reported as damage. Without a
+/// lock file it holds no lock, so a lock file that appears during the read is `E_LOCKED` too.
 pub fn check(ctx: &Ctx, out: &mut dyn Write) -> Result<(), Refusal> {
     let w =
         |e: std::io::Error| Refusal::new(Code::IoFailed, format!("output failed: {}", e.kind()));
@@ -72,17 +73,41 @@ pub fn check(ctx: &Ctx, out: &mut dyn Write) -> Result<(), Refusal> {
         Err(r) => return finding(r, out),
     };
     fail_from_env()?.hit("check-after-probe")?;
+    // Called after the read and before anything is reported, so a lock file replaced during the
+    // read, or one that a first `bind` created during it, leaves no findings.
+    let recheck = || -> Result<(), Refusal> {
+        let sys = ctx.sys()?;
+        match &shared {
+            Some(guard) => Store::recheck_probe(&sys, &ctx.layout(), guard),
+            None => match Store::probe_writer(&sys, &ctx.layout())? {
+                None => Ok(()),
+                Some(_) => Err(Refusal::new(
+                    Code::Locked,
+                    "a writer started during the read; run state check again",
+                )),
+            },
+        }
+    };
     let binding = match super::read_existing_binding(ctx) {
         Ok(b) => b,
-        Err(r) => return finding(r, out),
+        Err(r) => {
+            recheck()?;
+            return finding(r, out);
+        }
     };
     let store = match ctx
         .sys()
         .and_then(|sys| Store::open_read(sys, &ctx.layout(), Fail::none()))
     {
         Ok(s) => s,
-        Err(r) => return finding(r, out),
+        Err(r) => {
+            recheck()?;
+            return finding(r, out);
+        }
     };
+    if !matches!((&binding, &store), (Some(_), Some(_))) {
+        recheck()?;
+    }
     let (binding, store) = match (binding, store) {
         (Some(b), Some(s)) => (b, s),
         (None, None) => return writeln!(out, "unbound; no state").map_err(w),
@@ -100,11 +125,7 @@ pub fn check(ctx: &Ctx, out: &mut dyn Write) -> Result<(), Refusal> {
         }
     };
     let l = store.load();
-    // Nothing is reported yet, so a lock file replaced during the read leaves no findings.
-    if let Some(guard) = &shared {
-        ctx.sys()
-            .and_then(|sys| Store::recheck_probe(&sys, &ctx.layout(), guard))?;
-    }
+    recheck()?;
     let mut findings = verify_identity(&l, &binding);
     // An interrupted write leaves evidence on disk, so a stray entry fails the check.
     findings.extend(l.strays.iter().map(|s| Finding {
