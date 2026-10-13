@@ -296,7 +296,7 @@ pub fn build(resolved: &Resolved, cx: &Context<'_>, obs: &Observations) -> Resul
         mkdirs: BTreeMap::new(),
         retiring: removals(resolved, &cx.ledger)
             .into_iter()
-            .map(|o| (fold(&o.path), format!("remove@{}@{}", o.resource, o.path)))
+            .map(|o| (fold(&o.path), removal_id(o)))
             .collect(),
     };
     for r in resolved.resources.values() {
@@ -744,12 +744,11 @@ impl Planner<'_> {
         } else {
             decide(r, claim, &seen, link, op.ownership, unowned)?
         };
-        // The decision succeeded, so the old owner's entry is retired first. A merge resource
-        // never gets here with another owner: the CLI blocks it before this (merge_plan.rs).
+        // The decision succeeded, so the old owner's entry is retired first. The file is missing
+        // here: a merge over a present file with another owner was refused in `decide_merge`.
         if let Some(old) = stale {
             self.remove(&old);
-            op.after
-                .push(format!("remove@{}@{}", old.resource, old.path));
+            op.after.push(removal_id(&old));
         }
         op.action = action;
         op.status = status;
@@ -830,6 +829,21 @@ impl Planner<'_> {
         {
             return Err(fail(*code, "target", detail.clone(), correction.clone()));
         }
+        // A merge into an existing file records this resource as owner, and the ledger allows one
+        // owner per path, so the file is not written while another resource owns it. The CLI
+        // blocks this earlier, but its peek can lose a race with a file that appears after it.
+        // A missing file is fine: the leaf retires a stale owner's entry first.
+        if !matches!(seen.node, Node::Missing {})
+            && let Some(e) = self.ledger_entry(path).filter(|e| e.resource != r.id)
+        {
+            return Err(conflict(
+                format!(
+                    "{path} is recorded in the ledger as an output of {}",
+                    e.resource
+                ),
+                "move the file aside, then plan again: the plan retires a stale entry and merges into a new file; if that resource is still selected, remove its claim on the path first",
+            ));
+        }
         if matches!(seen.node, Node::Missing {}) {
             return Ok((
                 Action::CreateFile,
@@ -881,7 +895,7 @@ impl Planner<'_> {
     /// A ledger output that nothing selects any more. It is removed only when the ledger proves
     /// the live output is the one the manager wrote. Anything else is a conflict.
     fn remove(&mut self, o: &Owned) {
-        let id = format!("remove@{}@{}", o.resource, o.path);
+        let id = removal_id(o);
         self.removal_ids.insert(id.clone());
         let mut op = blank(
             id.clone(),
@@ -981,11 +995,16 @@ impl Planner<'_> {
             _ => Some("is not owned by this resource according to the ledger"),
         };
         if let Some(why) = why {
+            let fix = if op.ownership == Ownership::Modified {
+                "if an apply was interrupted, run `dotfiles-manager state recover` first. Otherwise review the file and remove it yourself; the manager removes only what it can prove it wrote"
+            } else {
+                "review the file and remove it yourself; the manager removes only what it can prove it wrote"
+            };
             return Err(fail(
                 Code::Conflict,
                 field,
                 format!("{path} is no longer selected but {why}"),
-                "review the file and remove it yourself; the manager removes only what it can prove it wrote",
+                fix,
             ));
         }
         op.action = Action::Remove;
@@ -1358,6 +1377,11 @@ impl Planner<'_> {
     }
 }
 
+/// The id of the operation that removes one ledger output.
+fn removal_id(o: &Owned) -> String {
+    format!("remove@{}@{}", o.resource, o.path)
+}
+
 /// An operation with nothing decided: blocked, no action. `who` is the resource, module and
 /// adapter ids.
 fn blank(id: String, who: (&str, &str, &str), class: Class, path: Option<String>) -> Operation {
@@ -1414,6 +1438,14 @@ fn decide(
             "target",
             format!("{path} {what}"),
             "review the file, then move it aside or adopt it; the manager does not overwrite content it does not own",
+        )
+    };
+    let modified = || {
+        fail(
+            Code::Conflict,
+            "target",
+            format!("{path} was changed after the manager wrote it"),
+            "if an apply was interrupted, run `dotfiles-manager state recover` first. Otherwise review the file, then move it aside or adopt it; the manager does not overwrite content it does not own",
         )
     };
     if let Node::Unknown { reason } = &seen.node {
@@ -1502,7 +1534,7 @@ fn decide(
                     ),
                     "remove the file yourself, then plan again to create the link",
                 )),
-                (_, Ownership::Modified) => Err(conflict("was changed after the manager wrote it")),
+                (_, Ownership::Modified) => Err(modified()),
                 (_, Ownership::Unverifiable) => {
                     Err(conflict("has an owner the manager cannot verify"))
                 }
@@ -1546,7 +1578,7 @@ fn decide(
                     ),
                     "remove the link yourself, then plan again to create the file",
                 )),
-                (_, Ownership::Modified) => Err(conflict("was changed after the manager wrote it")),
+                (_, Ownership::Modified) => Err(modified()),
                 (_, Ownership::Unverifiable) => Err(conflict(
                     "exists and its ownership cannot be verified: no comparable fingerprint is recorded for it",
                 )),

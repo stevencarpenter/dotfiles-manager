@@ -1698,6 +1698,37 @@ mod synthetic {
     }
 
     #[test]
+    fn a_merge_over_a_present_file_owned_by_another_resource_is_blocked_by_the_planner() {
+        use dfm_model::plan::{MergeFact, MergeVerdict};
+        const T: &str = ".claude/settings.json";
+        let (r, mut obs) = observed();
+        put(&mut obs, ".claude", dir(true), None);
+        put(&mut obs, T, file(true, 0o600), None);
+        let merge = BTreeMap::from([(
+            "agents.claude-settings".to_string(),
+            MergeFact {
+                managed_sha256: "0".repeat(64),
+                sets: vec![],
+                handlers: 0,
+                fragments: vec![],
+                verdict: MergeVerdict::Write,
+            },
+        )]);
+        let ledger = vec![owned("gone.res", T, None)];
+        let p = plan_full(&r, &obs, ledger, BTreeMap::new(), merge);
+        let (code, got) = blocker_at(&p, "agents.claude-settings", "target");
+        assert_eq!(code, Code::Conflict);
+        assert_eq!(
+            got,
+            ".claude/settings.json is recorded in the ledger as an output of gone.res"
+        );
+        assert_eq!(
+            action_of(&p, &format!("agents.claude-settings@{T}")),
+            (Action::None, Status::Blocked)
+        );
+    }
+
+    #[test]
     fn an_incomplete_listing_says_why() {
         use dfm_model::plan::{Incomplete, Listing};
         for (why, text) in [
