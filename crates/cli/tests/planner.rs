@@ -3230,3 +3230,45 @@ fn a_link_parent_that_leaves_home_is_a_parent_refusal_not_an_overlap() {
     let b = &s.plan.blockers[0];
     assert_eq!(b.code.as_str(), "E_PARENT_UNSAFE", "{b:?}");
 }
+
+#[test]
+fn a_merge_over_a_stale_owner_retires_it_or_blocks_with_a_fix_that_works() {
+    let e = Env::personal();
+    e.mkdirs(".claude");
+    let out = e.h(".claude/settings.json");
+    record(&e, "gone.res", &out, "{}");
+    // The old owner's file is present: blocked, and the fix text is "move the file aside".
+    let o = e.plan(&[]);
+    assert_eq!(code(&o), 3, "{}", text(&o.stderr));
+    assert!(
+        text(&o.stderr).contains("move the file aside"),
+        "{}",
+        text(&o.stderr)
+    );
+    // Following the text: the next plan retires the stale entry before the merge, and apply
+    // writes the file with the new owner only.
+    fs::rename(&out, e.h(".claude/settings.old")).unwrap();
+    let (o, s) = e.saved();
+    assert_eq!(code(&o), 0, "{}", text(&o.stderr));
+    let pos = |pre: &str| {
+        s.plan
+            .operations
+            .iter()
+            .position(|o| o.id.starts_with(pre))
+            .unwrap()
+    };
+    assert!(pos("remove@gone.res@") < pos("agents.claude-settings@"));
+    let d = s.plan_digest;
+    let o = e.run(&[
+        "apply",
+        "--root",
+        e.root.to_str().unwrap(),
+        "--yes-plan",
+        &d,
+    ]);
+    assert_eq!(code(&o), 0, "{}\n{}", text(&o.stdout), text(&o.stderr));
+    assert!(out.is_file());
+    let ledger =
+        fs::read_to_string(e.h(".local/state/dotfiles-manager/state/ledger.json")).unwrap();
+    assert!(!ledger.contains("gone.res"), "{ledger}");
+}

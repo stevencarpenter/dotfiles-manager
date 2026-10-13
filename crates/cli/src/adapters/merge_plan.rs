@@ -5,7 +5,7 @@
 //! names of the settings, and whether the merge may write. No live content, no hash of the live
 //! file and no salted hash leaves this function.
 
-use dfm_engine::{Dir, Got, Live, Store, Sys};
+use dfm_engine::{Dir, Got, Live, Peek, Store, Sys};
 use dfm_model::merge::{self, Desired};
 use dfm_model::plan::{
     MAX_HASHED_BYTES, MAX_LISTING, MergeFact, MergeVerdict, Owned, in_scope, matches_pattern,
@@ -239,16 +239,28 @@ pub fn merge_facts(
             }
         };
         // Another resource's ledger entry on this path decides before anything is read.
+        // Another resource's entry blocks. A stale owner (a renamed or removed resource) blocks
+        // only while the file exists: the planner retires the entry when the file is missing.
+        // The check peeks and never reads, because the file can hold credentials.
         let other = ledger
             .iter()
             .find(|o| dfm_model::fold(&o.path) == dfm_model::fold(claim) && o.resource != r.id);
+        let stale = other.is_some_and(|o| !resolved.resources.contains_key(&o.resource));
+        let other = other.filter(|_| !stale || !known_absent(sys, home, claim));
         let verdict = match (&layered, other) {
             (_, Some(o)) => blocked(
                 Code::Conflict,
-                &format!(
-                    "{claim} is recorded in the ledger as an output of {}. Fix: remove that resource's claim on the path first; the manager does not merge into another resource's output",
-                    o.resource
-                ),
+                &if stale {
+                    format!(
+                        "{claim} is recorded in the ledger as an output of {}, which is no longer selected. Fix: move the file aside, then plan again; the plan retires the old entry and merges into a new file. Merge the old settings back by hand",
+                        o.resource
+                    )
+                } else {
+                    format!(
+                        "{claim} is recorded in the ledger as an output of {}. Fix: remove that resource's claim on the path first; the manager does not merge into another resource's output",
+                        o.resource
+                    )
+                },
             ),
             (Err(e), None) => refused(e),
             (Ok(desired), None) => {
@@ -301,6 +313,21 @@ fn read_target(sys: &Sys, home: &Dir, parents: &[&str], name: &str) -> Result<Li
 
 /// The live bytes of the claimed file (`None` when it or a parent directory is absent), or the
 /// blocked verdict for a target that must not be merged into.
+/// Whether the claimed path is known to be absent, without reading it. Any doubt is "not absent".
+fn known_absent(sys: &Sys, home: &Dir, claim: &str) -> bool {
+    let comps: Vec<&str> = claim.split('/').collect();
+    let Some((name, parents)) = comps.split_last() else {
+        return false;
+    };
+    match home.open_below_opt(sys, parents) {
+        Ok(None) => true,
+        Ok(Some(dir)) => dir
+            .peek(sys, name)
+            .is_ok_and(|p| matches!(p, Peek::Missing)),
+        Err(_) => false,
+    }
+}
+
 fn live_bytes(sys: &Sys, home: &Dir, claim: &str) -> Result<Option<Vec<u8>>, MergeVerdict> {
     let comps: Vec<&str> = claim.split('/').collect();
     let Some((name, parents)) = comps.split_last() else {

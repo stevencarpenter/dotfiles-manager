@@ -1474,6 +1474,22 @@ fn m1_a_fragment_directory_accepts_only_matching_files_from_other_resources() {
 }
 
 #[test]
+fn m1_a_secret_resource_may_not_be_a_fragment() {
+    // A secret output is never observed, so the assembler could never read it as a fragment.
+    let mut set = examples();
+    let secret = "{ id = \"frag-secret\", kind = \"secret\", adapter = \"op-template/v1\", target = \".codex/AGENTS.d/50-secret.md\", value = { template = \"files/personal.env.tpl\", account = \"a\", mode = 0o600 } }";
+    edit(&mut set, PERSONAL_MOD, "add", "/resources/-", Some(secret));
+    refused(
+        &set,
+        PERSONAL,
+        Code::TargetCollision,
+        PERSONAL_MOD,
+        Some("personal-dev.frag-secret"),
+        "holds secret values, so it cannot be a fragment",
+    );
+}
+
+#[test]
 fn m1_fragment_directories_may_not_alias_or_nest() {
     // (dir, resource reported, source, other). The reported side is the later one in sorted order.
     for (dir, resource, source, other) in [

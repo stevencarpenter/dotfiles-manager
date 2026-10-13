@@ -2793,7 +2793,6 @@ impl Generator for Unchanged {
     fn merge(&self, _: &Operation, i: &GeneratorInputs) -> Result<Merged, Refusal> {
         Ok(Merged {
             bytes: i.live.clone().unwrap_or_default(),
-            live_view: b"{}".to_vec(),
             rendered_view: b"{}".to_vec(),
             live_leaves: BTreeMap::new(),
             rendered_leaves: BTreeMap::new(),

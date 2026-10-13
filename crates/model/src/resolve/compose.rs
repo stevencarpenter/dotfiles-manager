@@ -1580,6 +1580,16 @@ fn check_claims(resolved: &BTreeMap<String, ResolvedResource>) -> Result<(), Res
                     let as_fragment = owner != gid.as_str()
                         && rest.len() == 1
                         && glob(&crate::fold::fold(&d.pattern), rest[0]);
+                    if as_fragment && r.secret_values {
+                        return Err(collision(
+                            r,
+                            gid,
+                            claim,
+                            owner,
+                            &d.dir,
+                            "this resource holds secret values, so it cannot be a fragment: the manager never reads a secret output",
+                        ));
+                    }
                     if !as_fragment {
                         return Err(collision(
                             r,
