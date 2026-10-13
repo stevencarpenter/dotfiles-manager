@@ -42,7 +42,9 @@ pub fn fail_from_env() -> Result<Fail, Refusal> {
 }
 
 /// Read-only: loads the binding and every state document and checks that each one belongs to the
-/// bound identity. It lists every problem, repairs nothing and takes no lock.
+/// bound identity. It lists every problem and repairs nothing. A running writer makes the open
+/// intents and temporary files it leaves look like damage, so check refuses (`E_LOCKED`, no
+/// findings) while one holds the lock. It only probes the lock and never holds it.
 pub fn check(ctx: &Ctx, out: &mut dyn Write) -> Result<(), Refusal> {
     let w =
         |e: std::io::Error| Refusal::new(Code::IoFailed, format!("output failed: {}", e.kind()));
@@ -53,6 +55,20 @@ pub fn check(ctx: &Ctx, out: &mut dyn Write) -> Result<(), Refusal> {
         writeln!(out, "{} {}", r.code.as_str(), bounded(&r.detail)).map_err(w)?;
         Err(Refusal::new(Code::Diagnosed, "1 finding"))
     };
+    if let Err(r) = ctx
+        .sys()
+        .and_then(|sys| Store::probe_writer(&sys, &ctx.layout()))
+    {
+        if r.code == Code::Locked {
+            writeln!(
+                out,
+                "a writer is running; run state check again when it ends"
+            )
+            .map_err(w)?;
+            return Err(r);
+        }
+        return finding(r, out);
+    }
     let binding = match super::read_existing_binding(ctx) {
         Ok(b) => b,
         Err(r) => return finding(r, out),
@@ -86,7 +102,7 @@ pub fn check(ctx: &Ctx, out: &mut dyn Write) -> Result<(), Refusal> {
     findings.extend(l.strays.iter().map(|s| Finding {
         code: Code::StateInvalid,
         file: s.clone(),
-        detail: "stray entry from an interrupted write or an unexpected file. Fix: remove the temporary file after you confirm that no apply is running; `state recover` does not delete it".into(),
+        detail: "stray entry from an interrupted write or an unexpected file. Fix: read it, then remove it by hand; `state recover` does not delete it".into(),
     }));
     let count = |n: usize, bad: usize| format!("{n} ({bad} unreadable)");
     let (r_bad, t_bad) = (
@@ -142,15 +158,6 @@ struct Locked {
     home_path: std::path::PathBuf,
 }
 
-/// A refusal after the store wrote anything exits 1, not 3 (architecture section 10).
-fn stamped(store: &Store, r: Refusal) -> Refusal {
-    if store.mutated() {
-        r.after_mutation()
-    } else {
-        r
-    }
-}
-
 fn open_locked(ctx: &Ctx) -> Result<Locked, Refusal> {
     let binding = super::read_existing_binding(ctx)?.ok_or_else(|| {
         Refusal::new(
@@ -161,12 +168,12 @@ fn open_locked(ctx: &Ctx) -> Result<Locked, Refusal> {
     let (layout, sys) = (ctx.layout(), ctx.sys()?);
     let store = Store::open_write_with(sys, &layout, fail_from_env()?, false)?;
     if !store.is_initialized() {
-        return Err(stamped(&store, super::state_lost_refusal()));
+        return Err(store.stamp(super::state_lost_refusal()));
     }
     store
         .require_identity(&binding)
-        .map_err(|r| stamped(&store, r))?;
-    let home = Dir::open_home(&sys, &layout.home).map_err(|r| stamped(&store, r))?;
+        .map_err(|r| store.stamp(r))?;
+    let home = Dir::open_home(&sys, &layout.home).map_err(|r| store.stamp(r))?;
     Ok(Locked {
         store,
         home,
@@ -187,7 +194,7 @@ fn out_err(e: std::io::Error) -> Refusal {
 pub fn resolve_cmd(ctx: &Ctx, id: &str, as_done: bool, out: &mut dyn Write) -> Result<(), Refusal> {
     let l = open_locked(ctx)?;
     resolve(&l.store, (&l.sys, &l.home, &l.home_path), id, as_done)
-        .map_err(|r| stamped(&l.store, r))?;
+        .map_err(|r| l.store.stamp(r))?;
     header(out, ctx).map_err(out_err)?;
     writeln!(
         out,
@@ -204,7 +211,7 @@ pub fn resolve_cmd(ctx: &Ctx, id: &str, as_done: bool, out: &mut dyn Write) -> R
 /// `E_OP_INTERRUPTED` naming each journal id.
 pub fn recover_cmd(ctx: &Ctx, out: &mut dyn Write) -> Result<(), Refusal> {
     let l = open_locked(ctx)?;
-    let s = recover(&l.store, (&l.sys, &l.home, &l.home_path)).map_err(|r| stamped(&l.store, r))?;
+    let s = recover(&l.store, (&l.sys, &l.home, &l.home_path)).map_err(|r| l.store.stamp(r))?;
     header(out, ctx).map_err(out_err)?;
     if s.repaired > 0 {
         writeln!(

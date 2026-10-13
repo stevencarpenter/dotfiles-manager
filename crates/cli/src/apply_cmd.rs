@@ -231,26 +231,19 @@ fn run_inner(
     // sources since the first look.
     let fail = state_cmd::fail_from_env()?;
     let store = Store::open_write_with(sys, &layout, fail.clone(), false)?;
-    let stamped = |store: &Store, r: Refusal| {
-        if store.mutated() {
-            r.after_mutation()
-        } else {
-            r
-        }
-    };
     if !store.is_initialized() {
-        return Err(stamped(&store, crate::state_lost_refusal()));
+        return Err(store.stamp(crate::state_lost_refusal()));
     }
     store
         .require_identity(&binding)
-        .map_err(|r| stamped(&store, r))?;
-    let second = load_resolved(ctx, root).map_err(|r| stamped(&store, r))?;
-    let locked = plan_for(ctx, &second).map_err(|r| stamped(&store, r))?;
-    let locked_digest = locked.digest().map_err(|r| stamped(&store, r))?;
+        .map_err(|r| store.stamp(r))?;
+    let second = load_resolved(ctx, root).map_err(|r| store.stamp(r))?;
+    let locked = plan_for(ctx, &second).map_err(|r| store.stamp(r))?;
+    let locked_digest = locked.digest().map_err(|r| store.stamp(r))?;
     if locked_digest != digest {
-        return Err(stamped(&store, stale(approved, &locked_digest)));
+        return Err(store.stamp(stale(approved, &locked_digest)));
     }
-    let home = Dir::open_home(&sys, &layout.home).map_err(|r| stamped(&store, r))?;
+    let home = Dir::open_home(&sys, &layout.home).map_err(|r| store.stamp(r))?;
     let run = Run {
         store: &store,
         sys,
@@ -263,13 +256,13 @@ fn run_inner(
     };
     // Handlers go in after the lock and the second plan, and before the first mutation (settling
     // writes the journal). The second plan ran `id -u`, so no child process starts after this.
-    dfm_engine::signal::install().map_err(|r| stamped(&store, r))?;
+    dfm_engine::signal::install().map_err(|r| store.stamp(r))?;
     fail.hit("apply-after-install")
-        .map_err(|r| stamped(&store, r))?;
-    let started = now_unix().map_err(|r| stamped(&store, r))?;
+        .map_err(|r| store.stamp(r))?;
+    let started = now_unix().map_err(|r| store.stamp(r))?;
     // A signal that came before a pre-run check failed still decides the exit.
     let report = apply(&run, &locked)
-        .map_err(|r| stamped(&store, dfm_engine::signal::requested().unwrap_or(r)))?;
+        .map_err(|r| store.stamp(dfm_engine::signal::requested().unwrap_or(r)))?;
     let finished = now_unix().unwrap_or(started);
 
     if report.repaired > 0 {
