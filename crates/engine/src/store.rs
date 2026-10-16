@@ -240,7 +240,7 @@ impl Store {
             return Err(storage("the lock file is HOME itself"));
         };
         match home.walk(sys, &rel, rel.len(), false)? {
-            Some(dir) => Lock::probe(&dir, &name),
+            Some(dir) => Lock::probe(sys, &dir, &name),
             None => Ok(None),
         }
     }

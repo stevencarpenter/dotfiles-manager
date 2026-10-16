@@ -2119,3 +2119,33 @@ fn recover_warns_when_the_parent_of_a_staged_copy_cannot_be_opened() {
     let lines = fs::read_to_string(&journal).unwrap();
     assert_eq!(lines.lines().count(), 2, "{lines}");
 }
+
+#[test]
+fn state_check_refuses_a_lock_file_the_writer_would_refuse() {
+    let h = bound_home("check-lock-shape");
+    let lock = h.path().join(".local/state/dotfiles-manager.lock");
+    assert!(lock.exists(), "the lock path moved; fix this test");
+    assert_eq!(check(h.path()).status.code(), Some(0));
+    // A mode looser than 0600: the writer refuses it, so the check reports it as a finding.
+    fs::set_permissions(&lock, fs::Permissions::from_mode(0o644)).unwrap();
+    let o = check(h.path());
+    let (so, se) = (text(&o.stdout), text(&o.stderr));
+    assert_ne!(o.status.code(), Some(0), "{so}{se}");
+    assert!(
+        so.contains("E_STORAGE_INVALID") && so.contains("mode is 644, expected 0600"),
+        "{so}{se}"
+    );
+    fs::set_permissions(&lock, fs::Permissions::from_mode(0o600)).unwrap();
+    // A second hard link.
+    let twin = lock.with_extension("twin");
+    fs::hard_link(&lock, &twin).unwrap();
+    let o = check(h.path());
+    let (so, se) = (text(&o.stdout), text(&o.stderr));
+    assert_ne!(o.status.code(), Some(0), "{so}{se}");
+    assert!(
+        so.contains("E_STORAGE_INVALID") && so.contains("more than one hard link"),
+        "{so}{se}"
+    );
+    fs::remove_file(&twin).unwrap();
+    assert_eq!(check(h.path()).status.code(), Some(0));
+}

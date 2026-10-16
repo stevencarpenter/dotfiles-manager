@@ -682,6 +682,15 @@ impl Dir {
                 Err(e) => left.push(format!("could not inspect {shown}: {}", e.detail)),
             }
         }
+        // As after a publish: the removal is not durable until the directory is synced. A sync
+        // that fails is reported, because settling still closes the attempt.
+        if removed && let Err(e) = self.sync() {
+            left.push(format!(
+                "could not sync {} after removing the staged copies of {op_id}; the removal is unconfirmed: {}",
+                self.at("").display(),
+                e.detail
+            ));
+        }
         (removed, left)
     }
 
@@ -1321,13 +1330,17 @@ impl Lock {
     /// Reports whether a writer holds the lock, without creating the file and without waiting.
     /// A missing file means no writer and no guard. Otherwise the caller keeps the returned
     /// shared lock for as long as it reads, so a writer that starts meanwhile gets `E_LOCKED`.
-    pub fn probe(parent: &Dir, name: &str) -> Result<Option<File>, Refusal> {
-        Self::probe_after_open(parent, name, || {})
+    /// A file that [`Lock::acquire`] would refuse (another owner, more than one hard link, a
+    /// mode looser than 0600) is refused here too, so a reader never reports a store healthy
+    /// while every writer is blocked.
+    pub fn probe(sys: &Sys, parent: &Dir, name: &str) -> Result<Option<File>, Refusal> {
+        Self::probe_after_open(sys, parent, name, || {})
     }
 
     /// As [`Lock::probe`]. `after_open` runs between the open and the lock, so a test can replace
     /// the file there.
     fn probe_after_open(
+        sys: &Sys,
         parent: &Dir,
         name: &str,
         after_open: impl FnOnce(),
@@ -1342,8 +1355,17 @@ impl Lock {
             Err(e) => return Err(bad(io_kind(e))),
         };
         let st = rfs::fstat(&fd).map_err(|e| sys_err("stat lock", e))?;
-        if kind(&st) != FileType::RegularFile {
-            return Err(bad("must be a regular file".into()));
+        if kind(&st) != FileType::RegularFile || st.st_uid != sys.uid {
+            return Err(bad(
+                "must be a regular file owned by the current user".into()
+            ));
+        }
+        if u64::from(st.st_nlink) != 1 {
+            return Err(bad("has more than one hard link".into()));
+        }
+        let mode = mode_bits(&st);
+        if mode & !0o600 != 0 {
+            return Err(bad(format!("mode is {mode:o}, expected 0600")));
         }
         after_open();
         let file = File::from(fd);
@@ -1396,6 +1418,7 @@ impl Lock {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
     #[test]
     fn probe_refuses_a_lock_file_replaced_after_the_open() {
@@ -1405,22 +1428,46 @@ mod tests {
             .join(format!("dfm-probe-replaced-{}", std::process::id()));
         std::fs::create_dir_all(&root).unwrap();
         let root = root.as_path();
-        std::fs::write(root.join("lock"), "").unwrap();
+        let put = || {
+            std::fs::write(root.join("lock"), "").unwrap();
+            let mode = std::fs::Permissions::from_mode(0o600);
+            std::fs::set_permissions(root.join("lock"), mode).unwrap();
+        };
+        put();
+        let sys = Sys {
+            uid: std::fs::metadata(root.join("lock")).unwrap().uid(),
+        };
         let dir = Dir::open_plain(root).unwrap();
         // Unchanged: the probe returns the shared lock.
-        assert!(Lock::probe(&dir, "lock").unwrap().is_some());
+        assert!(Lock::probe(&sys, &dir, "lock").unwrap().is_some());
+        // The writer's checks apply: a looser mode or a second link is a storage refusal.
+        std::fs::set_permissions(root.join("lock"), std::fs::Permissions::from_mode(0o644))
+            .unwrap();
+        let e = Lock::probe(&sys, &dir, "lock").unwrap_err();
+        assert_eq!(e.code, Code::StorageInvalid);
+        assert!(
+            e.detail.contains("mode is 644, expected 0600"),
+            "{}",
+            e.detail
+        );
+        put();
+        std::fs::hard_link(root.join("lock"), root.join("twin")).unwrap();
+        let e = Lock::probe(&sys, &dir, "lock").unwrap_err();
+        assert_eq!(e.code, Code::StorageInvalid);
+        assert!(e.detail.contains("more than one hard link"), "{}", e.detail);
+        std::fs::remove_file(root.join("twin")).unwrap();
         // Replaced between the open and the lock: refused.
-        let e = Lock::probe_after_open(&dir, "lock", || {
+        let e = Lock::probe_after_open(&sys, &dir, "lock", || {
             std::fs::remove_file(root.join("lock")).unwrap();
-            std::fs::write(root.join("lock"), "").unwrap();
+            put();
         })
         .unwrap_err();
         assert_eq!(e.code, Code::Locked);
         assert!(e.detail.contains("replaced or removed"), "{}", e.detail);
         assert!(e.detail.contains("run the command again"), "{}", e.detail);
         // Removed between the open and the lock: refused.
-        std::fs::write(root.join("lock"), "").unwrap();
-        let e = Lock::probe_after_open(&dir, "lock", || {
+        put();
+        let e = Lock::probe_after_open(&sys, &dir, "lock", || {
             std::fs::remove_file(root.join("lock")).unwrap()
         })
         .unwrap_err();
