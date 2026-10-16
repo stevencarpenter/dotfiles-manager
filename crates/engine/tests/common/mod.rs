@@ -125,11 +125,11 @@ pub fn ledger_with(stamp: &Stamp, home: &Home, resource: &str, file: &str, fp: c
 
 pub fn intent(op: &str, path: &str) -> JournalEntry {
     JournalEntry {
-        schema: 1,
+        schema: dfm_model::state::SCHEMA,
         op_id: "run-1".into(),
         op: op.into(),
         phase: Phase::Intent,
-        at: "2026-10-10T00:00:00Z".into(),
+        at: "2026-10-10T00:00:00.000000000Z".into(),
         resource: "core.x".into(),
         adapter: "fs-link/v1".into(),
         class: Class::Normal,
@@ -153,8 +153,8 @@ pub fn receipt(stamp: &Stamp, op_id: &str, outputs: Vec<String>) -> Receipt {
         adapter: "fs-link/v1".into(),
         class: Class::Normal,
         status: Status::Updated,
-        started_at: Some("2026-10-10T00:00:00Z".into()),
-        finished_at: Some("2026-10-10T00:00:01Z".into()),
+        started_at: Some("2026-10-10T00:00:00.000000000Z".into()),
+        finished_at: Some("2026-10-10T00:00:01.000000000Z".into()),
         before: None,
         after: None,
         owned_outputs: outputs,
@@ -162,11 +162,11 @@ pub fn receipt(stamp: &Stamp, op_id: &str, outputs: Vec<String>) -> Receipt {
         reload: None,
     }];
     Receipt {
-        schema: 1,
+        schema: dfm_model::state::SCHEMA,
         op_id: op_id.into(),
         command: "sync".into(),
-        started_at: "2026-10-10T00:00:00Z".into(),
-        finished_at: "2026-10-10T00:00:02Z".into(),
+        started_at: "2026-10-10T00:00:00.000000000Z".into(),
+        finished_at: "2026-10-10T00:00:02.000000000Z".into(),
         binary: BinaryId {
             version: "0.1.0".into(),
             commit: "unknown".into(),

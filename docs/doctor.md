@@ -66,6 +66,7 @@ All text passes through `dfm_model::display::visible`. Neither format has an ANS
 | `resource` | A resource that is not a file output (package, application and similar) | UNKNOWN `D_PROBING_NOT_BUILT`, not required. N/A `D_NA_SENSITIVE` when it is sensitive. |
 | `plan` | The plan could not be made | ERROR with the planner's code. UNKNOWN `E_OBSERVATION_UNKNOWN`. UNKNOWN `D_DEPENDS_UNKNOWN` after a profile failure. |
 | `output` | A planner blocker | ERROR with the blocker's code (`E_CONFLICT`, `E_PARENT_UNSAFE`, `E_TARGET_RESERVED`, and so on). The blocker's correction is the fix. |
+| `output` | A name beside an owned output or an open-intent path that has the older staged-copy shape `.<name>.<digits>.<digits>.<digits>.tmp` or `.stage` | WARN `D_STAGED_COPY`. The fix is "A staged copy from an interrupted run; check it, then remove it by hand." Doctor lists each directory once and reads no content. A directory with more than 100000 entries (names that are not UTF-8 count too) is read only in part, and doctor adds one partial WARN `D_STAGED_COPY` row for that directory. Nothing sweeps such a name, because a user file can have the same shape. |
 | `output` | An owned output (ledger) or a claimed output (plan) | See the next table. |
 
 ### Output rows
@@ -84,7 +85,6 @@ An output row joins three facts: the ledger entry (who owns it), the live entry 
 | Claimed by the plan, not owned, plan would create it | WARN `D_PLAN_PENDING` |
 | Claimed, not owned, already the wanted result | WARN `D_PLAN_PENDING` when the plan adopts it (an exact link that no ledger entry mentions; the fix names `--allow-adopt`), else WARN `D_UNRECORDED` |
 | Sensitive output: a ledger entry of the sensitive class (compared with case folded), a path a selected sensitive resource claims, or a sensitive plan operation | N/A `D_NA_SENSITIVE`. Doctor's own inspection reads and hashes no content, whoever owns the path. A planner blocker for the path is shown instead, because it needs no content. For the `claude-settings/v1` merge output (DFM-21) the plan it reuses reads the live file in memory to compare the managed fields by salted hash (docs/adapters.md). So a healthy merge output is N/A, a lost or unusable salt is the plan's `E_STATE_INVALID` or `E_STORAGE_INVALID` blocker, `state check` reports the salt file itself (docs/state.md), and a foreign edit of a managed field, a malformed file or a file open to group or others is `ERROR` with the plan's `E_CONFLICT` and fix text. Doctor prints no content, no hash and no value for it. |
-| Operation that needs generated content | N/A `D_NA_GENERATED`: doctor does not compare generated content. Apply checks it against the planned output hash (docs/adapters.md). |
 
 An owned output is compared by fingerprint: `file_fingerprint` of the file content (SHA-256 of `file\0` and the bytes), or `link_fingerprint` of the target text for a link. The comparison reads the file (a read, never a write).
 
@@ -96,7 +96,6 @@ An owned output is compared by fingerprint: `file_fingerprint` of the file conte
 | --- | --- |
 | `D_OK` | The check passed. |
 | `D_NA_SENSITIVE` | A sensitive output. Its content is never read or hashed. |
-| `D_NA_GENERATED` | A generated file. Doctor does not compare generated content. |
 | `D_OUTPUT_MISSING` | An owned output no longer exists. Apply publishes it again. |
 | `D_PLAN_PENDING` | The plan would create or update this output. Nothing owned was edited. |
 | `D_PLAN_REMOVAL` | The plan would remove this owned output. Nothing selects it any more. |
@@ -108,6 +107,7 @@ An owned output is compared by fingerprint: `file_fingerprint` of the file conte
 | `D_LOCK_NOTE` | The lock file holds a note from an earlier holder. |
 | `D_DEPENDS_UNKNOWN` | A check cannot run because an earlier check failed. |
 | `D_PROBING_NOT_BUILT` | Tools, versions and PATH are not probed in this build. |
+| `D_STAGED_COPY` | A name beside an owned output has the shape of a staged copy of an older build. Nothing removes it. |
 
 `E_*` codes keep the meaning given in [architecture.md](architecture.md), [state.md](state.md), [resolver.md](resolver.md) and [planner.md](planner.md).
 

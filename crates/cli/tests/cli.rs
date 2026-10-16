@@ -619,3 +619,19 @@ fn bind_binding_and_state_escape_an_invisible_profile_path() {
     }
     assert!(text(&run(home.path(), &["binding"]).stdout).contains("p\\u{202e}q"));
 }
+
+#[test]
+fn extra_arguments_to_a_no_argument_command_say_so() {
+    let home = TempDir::new("cli-noargs");
+    for args in [["binding", "--json"], ["help", "x"], ["version", "x"]] {
+        let o = run(home.path(), &args);
+        assert_eq!(o.status.code(), Some(2), "{args:?}");
+        let err = text(&o.stderr);
+        assert!(
+            err.contains(&format!("{} takes no arguments", args[0])),
+            "{err}"
+        );
+    }
+    let o = run(home.path(), &["nonesuch"]);
+    assert!(text(&o.stderr).contains("unknown command or argument nonesuch"));
+}

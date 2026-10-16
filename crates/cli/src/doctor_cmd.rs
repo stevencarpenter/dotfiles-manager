@@ -6,7 +6,8 @@
 
 use crate::{Ctx, Loaded, clip, header, load_resolved, plan_cmd, read_existing_binding, usage};
 use dfm_engine::{
-    Dir, Fail, Layout, Loaded as StateLoaded, Store, Sys, merge, observe, verify_identity,
+    Dir, Fail, Layout, Loaded as StateLoaded, Store, Sys, fsys::Listing, merge, observe,
+    verify_identity,
 };
 use dfm_model::binding::Binding;
 use dfm_model::doctor::{DoctorCode as D, Level, Report, Row};
@@ -21,6 +22,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Write};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::Path;
+
+/// The most names doctor reads from one directory when it looks for staged copies.
+const STRAY_SCAN_MAX: usize = 100_000;
 
 const DEFAULT_WIDTH: usize = 80;
 const LOCK_NOTE_BYTES: u64 = 256;
@@ -255,7 +259,17 @@ fn state_rows(
     }
     // The lenient reads: one output with an unsafe parent must not hide the rest of the ledger.
     let owned = ledger_rows(&store, layout, rows);
-    journal_rows(&store, rows);
+    let open = journal_rows(&store, rows);
+    let paths = owned
+        .iter()
+        .flatten()
+        .map(|o| o.path.clone())
+        .chain(open.iter().filter_map(|p| {
+            let rel = Path::new(p).strip_prefix(&layout.home).ok()?;
+            Some(rel.to_str()?.to_string())
+        }))
+        .collect();
+    staged_copy_rows(sys, layout, &paths, rows);
     let bad = evidence_rows(&l, &findings, rows);
     receipt_row(&l, bad, rows);
     owned
@@ -307,20 +321,29 @@ fn ledger_rows(store: &Store, layout: &Layout, rows: &mut Vec<Row>) -> Option<Ve
     Some(owned)
 }
 
-fn journal_rows(store: &Store, rows: &mut Vec<Row>) {
+/// Adds the journal rows. Returns the paths of the intents and unknown entries that are not
+/// settled.
+fn journal_rows(store: &Store, rows: &mut Vec<Row>) -> Vec<String> {
     let entries = match store.read_journal_lenient() {
         Ok(e) => e,
         Err(r) => {
             rows.push(refusal_row("state", "journal.jsonl", &r));
-            return;
+            return Vec::new();
         }
     };
+    let mut open = Vec::new();
     rows.push(ok_row(
         "state",
         "journal.jsonl",
         &format!("{} entries", entries.len()),
     ));
     for e in unfinished(&entries) {
+        open.extend(
+            e.recovery
+                .iter()
+                .flat_map(|r| &r.outputs)
+                .map(|o| o.path.clone()),
+        );
         let subject = e
             .recovery
             .iter()
@@ -341,6 +364,7 @@ fn journal_rows(store: &Store, rows: &mut Vec<Row>) {
         ));
     }
     for u in unresolved(&entries) {
+        open.extend(u.paths().map(str::to_string));
         let id = &u.unknown.op_id;
         let subject = u.paths().next().unwrap_or(&u.unknown.op);
         let blocks = if u.paths().next().is_some() {
@@ -368,6 +392,121 @@ fn journal_rows(store: &Store, rows: &mut Vec<Row>) {
             ),
         ));
     }
+    open
+}
+
+/// Whether `entry` has the staged-name shape of an older build: `.<name>.<pid>.<n>.<nanos>.tmp`
+/// or `.stage`. Current builds tag the name with a hash, which this does not match.
+fn is_old_stage(entry: &str, name: &str) -> bool {
+    let Some(rest) = entry
+        .strip_prefix('.')
+        .and_then(|e| e.strip_prefix(name))
+        .and_then(|e| e.strip_prefix('.'))
+    else {
+        return false;
+    };
+    let Some((nums, suffix)) = rest.rsplit_once('.') else {
+        return false;
+    };
+    let digits = |d: &str| !d.is_empty() && d.bytes().all(|b| b.is_ascii_digit());
+    matches!(suffix, "tmp" | "stage") && nums.split('.').count() == 3 && nums.split('.').all(digits)
+}
+
+/// The most names doctor reads from one directory when it looks for staged copies. Only a
+/// `test-isolation` build reads `DFM_STRAY_SCAN_MAX`.
+#[cfg(feature = "test-isolation")]
+fn stray_scan_max() -> usize {
+    std::env::var("DFM_STRAY_SCAN_MAX")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(STRAY_SCAN_MAX)
+}
+
+#[cfg(not(feature = "test-isolation"))]
+fn stray_scan_max() -> usize {
+    STRAY_SCAN_MAX
+}
+
+/// A WARN row for each name beside an owned output or an open-intent path that looks like a
+/// staged copy of an older build. Such a name is never swept, because a user file can have the
+/// same shape. Doctor lists each directory once and reads no content. A listing that was cut
+/// gets its own WARN row, because the scan of that directory is then partial. `rels` are
+/// HOME-relative.
+fn staged_copy_rows(sys: Sys, layout: &Layout, rels: &BTreeSet<String>, rows: &mut Vec<Row>) {
+    let Ok(home) = Dir::open_home(&sys, &layout.home) else {
+        return;
+    };
+    let mut by_dir: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+    for rel in rels {
+        let (parent, name) = rel.rsplit_once('/').unwrap_or(("", rel));
+        by_dir.entry(parent).or_default().push(name);
+    }
+    let max = stray_scan_max();
+    for (parent, names) in by_dir {
+        let mut dir: Option<Dir> = None;
+        let mut reachable = true;
+        for part in parent.split('/').filter(|p| !p.is_empty()) {
+            match dir.as_ref().unwrap_or(&home).peek_dir(part) {
+                Ok(Some(d)) => dir = Some(d),
+                _ => {
+                    reachable = false;
+                    break;
+                }
+            }
+        }
+        if !reachable {
+            continue;
+        }
+        let Ok(listing) = dir.as_ref().unwrap_or(&home).list_upto(max) else {
+            continue;
+        };
+        rows.extend(scan_listing(parent, &names, &listing, max));
+    }
+}
+
+/// The rows for one directory: a staged copy of an older build for each entry that matches any
+/// of the owned `names` in it, and one row if the listing saw more than `max` entries (it was
+/// cut). `parent` is HOME-relative and empty for HOME itself.
+fn scan_listing(parent: &str, names: &[&str], listing: &Listing, max: usize) -> Vec<Row> {
+    let shown = |entry: &str| {
+        if parent.is_empty() {
+            entry.to_string()
+        } else {
+            format!("{parent}/{entry}")
+        }
+    };
+    let mut rows = Vec::new();
+    if listing.seen() > max {
+        rows.push(
+            Row::new(
+                "output",
+                D::StagedCopy,
+                Level::Warn,
+                if parent.is_empty() { "." } else { parent },
+                &format!(
+                    "the directory has more than {max} entries; the scan for staged copies was cut"
+                ),
+                "Check the directory for names like .<name>.<digits>.<digits>.<digits>.tmp by hand.",
+            )
+            .partial(),
+        );
+    }
+    for entry in listing.names.iter().take(max) {
+        if let Some(name) = names.iter().find(|n| is_old_stage(entry, n)) {
+            rows.push(Row::new(
+                "output",
+                D::StagedCopy,
+                Level::Warn,
+                &shown(entry),
+                &format!(
+                    "a name of an older staged-copy format beside {}",
+                    clip(&shown(name))
+                ),
+                "A staged copy from an interrupted run; check it, then remove it by hand.",
+            ));
+        }
+    }
+    rows
 }
 
 /// Receipts, trials and stray files are audit evidence. Their failures are WARN rows and leave
@@ -752,7 +891,11 @@ fn output_rows(
             .as_deref()
             .filter(|_| op.action != Action::CreateDir)
         {
-            by_path.entry(path).or_default().1 = Some(op);
+            let slot = by_path.entry(path).or_default();
+            let held = slot.1.map(|h| h.resource.as_str());
+            if takes_slot(slot.0.map(|o| o.resource.as_str()), held, &op.resource) {
+                slot.1 = Some(op);
+            }
         }
     }
     let sensitive = sensitive_paths(loaded.map(|l| &l.resolved), owned);
@@ -764,6 +907,17 @@ fn output_rows(
         if let Some(row) = classify(path, o, op, &sensitive, &obs) {
             rows.push(if plan.is_none() { row.partial() } else { row });
         }
+    }
+}
+
+/// Whether an operation of `resource` replaces the one held for a path. A rename gives the path
+/// two operations: the old owner's removal and the new owner's write. The row needs the new
+/// owner's, whatever the plan order, so an operation of the ledger owner never displaces one of
+/// another resource.
+fn takes_slot(owner: Option<&str>, held: Option<&str>, resource: &str) -> bool {
+    match held {
+        None => true,
+        Some(h) => owner != Some(resource) || owner == Some(h),
     }
 }
 
@@ -790,16 +944,6 @@ fn classify(
             Level::NotApplicable,
             path,
             &format!("resource {who}: sensitive output, content is not read"),
-            "",
-        ));
-    }
-    if op.is_some_and(|op| matches!(op.action, Action::CreateFile | Action::UpdateFile)) {
-        return Some(Row::new(
-            "output",
-            D::NaGenerated,
-            Level::NotApplicable,
-            path,
-            &format!("resource {who}: not applicable in this build (no generator)"),
             "",
         ));
     }
@@ -870,14 +1014,28 @@ fn owned_row(path: &str, who: &str, op: Option<&Operation>, live: Live) -> Row {
             Level::Error,
             &format!("resource {who}: {}", clip(&why)),
         ),
-        Live::Missing => Row::new(
-            "output",
-            D::OutputMissing,
-            Level::Warn,
-            path,
-            &format!("owned by {who}; the output is gone"),
-            "Run apply to publish it again.",
-        ),
+        Live::Missing => match op.filter(|op| op.status == Status::Planned && op.resource != who) {
+            // A rename: the plan hands the path to another resource and retires this entry first.
+            Some(op) => Row::new(
+                "output",
+                D::PlanPending,
+                Level::Warn,
+                path,
+                &format!(
+                    "owned by {who}; the output is gone and resource {} takes the path over: {}",
+                    op.resource, op.effect
+                ),
+                "Review plan, then run apply.",
+            ),
+            None => Row::new(
+                "output",
+                D::OutputMissing,
+                Level::Warn,
+                path,
+                &format!("owned by {who}; the output is gone"),
+                "Run apply to publish it again.",
+            ),
+        },
         Live::Differs(why) => row(
             Code::Conflict,
             Level::Error,
@@ -906,5 +1064,59 @@ fn owned_row(path: &str, who: &str, op: Option<&Operation>, live: Live) -> Row {
                 &format!("owned by {who}; matches the ledger fingerprint"),
             ),
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Listing, scan_listing, takes_slot};
+
+    fn listing(names: &[&str], odd: usize) -> Listing {
+        Listing {
+            names: names.iter().map(|n| n.to_string()).collect(),
+            odd,
+        }
+    }
+
+    #[test]
+    fn one_listing_is_tested_against_every_owned_name_in_the_directory() {
+        let entries = listing(
+            &[".a.1.2.3.tmp", ".b.4.5.6.stage", ".c.1.2.3.tmp", "a", "b"],
+            0,
+        );
+        let rows = scan_listing("d", &["a", "b"], &entries, 100);
+        let subjects: Vec<&str> = rows.iter().map(|r| r.subject.as_str()).collect();
+        assert_eq!(subjects, ["d/.a.1.2.3.tmp", "d/.b.4.5.6.stage"]);
+    }
+
+    #[test]
+    fn a_listing_longer_than_the_cap_adds_one_cut_row() {
+        let rows = scan_listing("", &["x"], &listing(&["x", "y", "z"], 0), 2);
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].detail.contains("was cut") && rows[0].partial);
+    }
+
+    #[test]
+    fn names_that_are_not_utf8_count_toward_the_cap() {
+        // `list_upto` stops on the same count, so a cut made by such names is reported too.
+        let cut = listing(&["y"], 2);
+        assert_eq!(cut.seen(), 3);
+        let rows = scan_listing("", &["x"], &cut, 2);
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].detail.contains("was cut") && rows[0].partial);
+        assert!(scan_listing("", &["x"], &listing(&["y"], 1), 2).is_empty());
+    }
+
+    #[test]
+    fn the_new_owner_wins_a_shared_path_in_either_plan_order() {
+        let owner = Some("old");
+        // Removal first, then the new owner's write.
+        assert!(takes_slot(owner, None, "old"));
+        assert!(takes_slot(owner, Some("old"), "new"));
+        // The new owner's write first, then the removal: the removal does not displace it.
+        assert!(takes_slot(owner, None, "new"));
+        assert!(!takes_slot(owner, Some("new"), "old"));
+        // No ledger owner: the last operation wins, as before.
+        assert!(takes_slot(None, Some("a"), "b"));
     }
 }

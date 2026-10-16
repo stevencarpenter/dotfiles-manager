@@ -505,13 +505,167 @@ fn a_second_writer_gets_exit_3_and_writes_nothing() {
         before,
         "the refused writer changed nothing"
     );
-    // Read-only commands still run while the lock is held.
-    assert!(matches!(check(h.path()).status.code(), Some(0 | 1)));
 
     fs::write(&release, "go").unwrap();
     assert_eq!(slow.wait().unwrap().code(), Some(0));
     assert_eq!(journal_phases(h.path()), ["intent", "done"]);
     assert_eq!(check(h.path()).status.code(), Some(0));
+}
+
+#[test]
+fn state_check_while_a_writer_runs_reports_the_lock_and_no_findings() {
+    let h = bound_home("check-locked");
+    let out = out_file(h.path(), "slow");
+    let release = h.path().join("release-holder");
+    let mut slow = cmd(
+        h.path(),
+        &[
+            "__record-op",
+            "--resource",
+            "core.slow",
+            "--output",
+            &out,
+            "--content",
+            "s",
+        ],
+    )
+    .env(
+        "DFM_FAILPOINT",
+        format!("after-intent:wait-{}", release.display()),
+    )
+    .stdout(Stdio::null())
+    .stderr(Stdio::null())
+    .spawn()
+    .unwrap();
+    let journal = state(h.path()).join("journal.jsonl");
+    wait_for("the first intent", || {
+        fs::metadata(&journal).is_ok_and(|m| m.len() > 0)
+    });
+    // A stray temp file is what a running apply leaves, and it must not be reported.
+    fs::write(state(h.path()).join("receipts/.x.json.1.2.tmp"), "half").unwrap();
+
+    let before = snapshot(&state(h.path()));
+    let o = check(h.path());
+    let (so, se) = (text(&o.stdout), text(&o.stderr));
+    assert_eq!(o.status.code(), Some(3), "{so}{se}");
+    assert!(se.contains("E_LOCKED"), "{se}");
+    assert!(so.contains("writer is running"), "{so}");
+    assert!(
+        !so.contains("E_STATE_INVALID") && !so.contains("stray"),
+        "{so}"
+    );
+    assert_eq!(snapshot(&state(h.path())), before, "check wrote nothing");
+
+    fs::write(&release, "go").unwrap();
+    assert_eq!(slow.wait().unwrap().code(), Some(0));
+    fs::remove_file(state(h.path()).join("receipts/.x.json.1.2.tmp")).unwrap();
+    assert_eq!(check(h.path()).status.code(), Some(0));
+}
+
+#[test]
+fn state_check_holds_the_lock_across_its_whole_read() {
+    let h = bound_home("check-holds");
+    let release = h.path().join("release-check");
+    let reached = h.path().join("release-check.reached");
+    let mut c = cmd(h.path(), &["state", "check"])
+        .env(
+            "DFM_FAILPOINT",
+            format!("check-after-probe:wait-{}", release.display()),
+        )
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    wait_for("check to reach its read", || reached.exists());
+    let out = out_file(h.path(), "late");
+    let o = run(
+        h.path(),
+        &[
+            "__record-op",
+            "--resource",
+            "core.late",
+            "--output",
+            &out,
+            "--content",
+            "l",
+        ],
+    );
+    assert_eq!(o.status.code(), Some(3), "{}", text(&o.stderr));
+    assert!(text(&o.stderr).contains("E_LOCKED"), "{}", text(&o.stderr));
+    assert!(!Path::new(&out).exists());
+    fs::write(&release, "go").unwrap();
+    assert_eq!(c.wait().unwrap().code(), Some(0));
+    // The lock is free again after check ends.
+    assert_eq!(
+        record(h.path(), "core.after", "after", "a").status.code(),
+        Some(0)
+    );
+}
+
+#[test]
+fn state_check_refuses_when_the_lock_file_is_replaced_during_the_read() {
+    let h = bound_home("check-lock-replaced");
+    let release = h.path().join("release-replaced");
+    let reached = h.path().join("release-replaced.reached");
+    let c = cmd(h.path(), &["state", "check"])
+        .env(
+            "DFM_FAILPOINT",
+            format!("check-after-probe:wait-{}", release.display()),
+        )
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    wait_for("check to reach its read", || reached.exists());
+    let lock = h.path().join(".local/state/dotfiles-manager.lock");
+    assert!(lock.exists(), "the lock path moved; fix this test");
+    let fresh = lock.with_extension("fresh");
+    fs::write(&fresh, "").unwrap();
+    fs::rename(&fresh, &lock).unwrap();
+    fs::write(&release, "go").unwrap();
+    let o = c.wait_with_output().unwrap();
+    let (so, se) = (text(&o.stdout), text(&o.stderr));
+    assert_eq!(o.status.code(), Some(3), "{so}{se}");
+    assert!(
+        se.contains("E_LOCKED") && se.contains("run the command again"),
+        "{se}"
+    );
+    assert!(
+        !so.contains("binding:") && !so.contains("E_STATE_INVALID"),
+        "no findings: {so}"
+    );
+}
+
+#[test]
+fn state_check_refuses_when_a_first_bind_creates_the_lock_during_the_read() {
+    // No lock file at the probe, so check holds no lock while it reads.
+    let h = TempDir::new("check-lock-appears");
+    let release = h.path().join("release-appears");
+    let reached = h.path().join("release-appears.reached");
+    let c = cmd(h.path(), &["state", "check"])
+        .env(
+            "DFM_FAILPOINT",
+            format!("check-after-probe:wait-{}", release.display()),
+        )
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    wait_for("check to reach its read", || reached.exists());
+    let o = bind(h.path());
+    assert_eq!(o.status.code(), Some(0), "{}", text(&o.stderr));
+    fs::write(&release, "go").unwrap();
+    let o = c.wait_with_output().unwrap();
+    let (so, se) = (text(&o.stdout), text(&o.stderr));
+    assert_eq!(o.status.code(), Some(3), "{so}{se}");
+    assert!(
+        se.contains("E_LOCKED") && se.contains("run state check again"),
+        "{se}"
+    );
+    assert!(
+        !so.contains("binding:") && !so.contains("E_STATE_INVALID") && !so.contains("unbound"),
+        "no findings: {so}"
+    );
 }
 
 // ---- C06: identity against loaded receipts and trials --------------------------------------------
@@ -580,15 +734,19 @@ fn receipts_and_trials_for_another_identity_are_reported_by_file() {
         fs::write(path, original).unwrap();
     }
     // An unreadable receipt is its own finding and hides nothing else.
-    fs::write(dir.join("receipts/20260101T000000Z-broken.json"), "{").unwrap();
+    fs::write(
+        dir.join("receipts/20260101T000000.000000000Z-broken.json"),
+        "{",
+    )
+    .unwrap();
     fs::set_permissions(
-        dir.join("receipts/20260101T000000Z-broken.json"),
+        dir.join("receipts/20260101T000000.000000000Z-broken.json"),
         fs::Permissions::from_mode(0o600),
     )
     .unwrap();
     let report = text(&check(h.path()).stdout);
     assert!(
-        report.contains("E_STATE_INVALID receipts/20260101T000000Z-broken.json"),
+        report.contains("E_STATE_INVALID receipts/20260101T000000.000000000Z-broken.json"),
         "{report}"
     );
     assert!(
@@ -783,7 +941,7 @@ fn state_check_counts_stray_entries_as_findings() {
     assert_eq!(check(h.path()).status.code(), Some(0));
     for f in [
         root(h.path()).join("state.next"),
-        state(h.path()).join("receipts/.20261010T000000Z-run.json.1.2.tmp"),
+        state(h.path()).join("receipts/.20261010T000000.000000000Z-run.json.1.2.tmp"),
         state(h.path()).join("trials/.t.json.1.2.tmp"),
     ] {
         fs::write(&f, "half").unwrap();
@@ -982,8 +1140,8 @@ fn missing_corrupt_or_unsupported_state_grants_no_authority_and_is_not_rewritten
     let corrupt: [(&str, Option<&str>, &str); 4] = [
         ("missing", None, "E_STATE_INVALID"),
         ("garbage", Some("not json"), "E_STATE_INVALID"),
-        ("newer", Some("{\"schema\":2}"), "E_STATE_NEWER"),
-        ("old", Some("{\"schema\":0}"), "E_SCHEMA_UNSUPPORTED"),
+        ("newer", Some("{\"schema\":3}"), "E_STATE_NEWER"),
+        ("old", Some("{\"schema\":1}"), "E_SCHEMA_UNSUPPORTED"),
     ];
     for (label, content, code) in corrupt {
         let h = seeded(label);
@@ -1194,7 +1352,7 @@ fn a_refusal_after_the_effect_exits_1_not_3() {
                 "--op-id",
                 "dup",
                 "--at",
-                "1791590400",
+                "1791590400000000000",
             ],
         )
     };
@@ -1380,6 +1538,76 @@ fn a_torn_journal_is_reported_and_reconcile_leaves_it_alone() {
 }
 
 #[test]
+fn recovery_counts_staged_copy_removals_before_a_journal_refusal() {
+    use dfm_model::state::{
+        Class, JournalEntry, MAX_JOURNAL_BYTES, Phase, Recovery, RecoveryOutput,
+    };
+
+    let h = bound_home("recovery-sweep-refusal");
+    let intent = JournalEntry {
+        schema: dfm_model::state::SCHEMA,
+        op_id: "sweep-1".into(),
+        op: "create-file".into(),
+        phase: Phase::Intent,
+        at: "2026-10-10T00:00:00.000000000Z".into(),
+        resource: "core.x".into(),
+        adapter: "git-config/v1".into(),
+        class: Class::Normal,
+        recovery: Some(Recovery {
+            outputs: vec![RecoveryOutput {
+                path: out_file(h.path(), "file"),
+                existed_before: false,
+                expected_sha256: Some(fp_hex("staged")),
+            }],
+            snapshot: None,
+        }),
+        token: None,
+        reason: None,
+    };
+    let tail = intent.to_line().unwrap();
+    let mut done = JournalEntry {
+        op_id: "closed-1".into(),
+        phase: Phase::Done,
+        recovery: None,
+        reason: Some("x".repeat(1024)),
+        ..intent.clone()
+    };
+    let line = done.to_line().unwrap();
+    let room = MAX_JOURNAL_BYTES as usize - tail.len();
+    let mut journal = line.repeat(room / line.len() - 1);
+    done.reason = Some("x".repeat(1024 + room % line.len()));
+    journal.extend(done.to_line().unwrap());
+    journal.extend(tail);
+    assert_eq!(journal.len(), MAX_JOURNAL_BYTES as usize);
+    let path = state(h.path()).join("journal.jsonl");
+    fs::write(&path, &journal).unwrap();
+
+    let tag = sha_hex(&format!("{}\0{}", intent.op_id, intent.at));
+    let tmp = h.path().join(format!(".file.{}.tmp", &tag[..16]));
+    let stage = tmp.with_extension("stage");
+    for (entry, exit) in [(None, 3), (Some(&tmp), 1), (Some(&stage), 1)] {
+        if let Some(entry) = entry {
+            if entry == &stage {
+                symlink("file", entry).unwrap();
+            } else {
+                fs::write(entry, "staged").unwrap();
+            }
+        }
+        let r = run(h.path(), &["state", "recover"]);
+        assert_eq!(r.status.code(), Some(exit), "{}", text(&r.stderr));
+        assert!(text(&r.stderr).contains("E_LIMIT_EXCEEDED"));
+        assert!(fs::symlink_metadata(&tmp).is_err());
+        assert!(fs::symlink_metadata(&stage).is_err());
+        assert_eq!(fs::read(&path).unwrap(), journal);
+    }
+    // A staged name that cannot be removed does not count as a mutation.
+    fs::create_dir(&tmp).unwrap();
+    let r = run(h.path(), &["state", "recover"]);
+    assert_eq!(r.status.code(), Some(3), "{}", text(&r.stderr));
+    assert!(tmp.is_dir());
+}
+
+#[test]
 fn recover_repairs_one_torn_final_journal_line_and_refuses_a_torn_middle_line() {
     let h = bound_home("torn-repair");
     let o = record(h.path(), "core.victim", "victim", "v");
@@ -1387,7 +1615,7 @@ fn recover_repairs_one_torn_final_journal_line_and_refuses_a_torn_middle_line() 
     let j = state(h.path()).join("journal.jsonl");
     let sound = fs::read(&j).unwrap();
     let mut torn = sound.clone();
-    torn.extend_from_slice(b"{\"schema\":1,\"op_");
+    torn.extend_from_slice(b"{\"schema\":2,\"op_");
     fs::write(&j, &torn).unwrap();
     assert_ne!(check(h.path()).status.code(), Some(0));
     let r = run(h.path(), &["state", "recover"]);
@@ -1420,6 +1648,42 @@ fn recover_repairs_one_torn_final_journal_line_and_refuses_a_torn_middle_line() 
 }
 
 #[test]
+fn an_abort_after_the_cut_leaves_the_cut_text_and_the_next_run_reports_it() {
+    let h = bound_home("torn-abort");
+    assert_eq!(
+        record(h.path(), "core.victim", "victim", "v").status.code(),
+        Some(0)
+    );
+    let j = state(h.path()).join("journal.jsonl");
+    let mut torn = fs::read(&j).unwrap();
+    let sound = torn.len();
+    torn.extend_from_slice(b"{\"schema\":2,\"op_");
+    fs::write(&j, &torn).unwrap();
+    // The process dies after the cut, before the repair record is written.
+    let r = with_fail(
+        h.path(),
+        "journal-before-write:abort",
+        &["state", "recover"],
+    );
+    assert_ne!(r.status.code(), Some(0));
+    assert_eq!(fs::read(&j).unwrap().len(), sound, "the torn line was cut");
+    let kept = state(h.path()).join("journal.torn");
+    assert_eq!(fs::read(&kept).unwrap(), b"{\"schema\":2,\"op_");
+
+    // The next run finds nothing torn. It must not lose the cut text, and the check must say so.
+    let r = run(h.path(), &["state", "recover"]);
+    assert_eq!(r.status.code(), Some(0), "{}", text(&r.stderr));
+    assert_eq!(fs::read(&kept).unwrap(), b"{\"schema\":2,\"op_");
+    let c = check(h.path());
+    assert_eq!(c.status.code(), Some(1), "{}", text(&c.stdout));
+    assert!(
+        text(&c.stdout).contains("journal.torn"),
+        "{}",
+        text(&c.stdout)
+    );
+}
+
+#[test]
 fn a_failed_repair_after_the_cut_exits_1_because_the_journal_changed() {
     let h = bound_home("torn-cut");
     assert_eq!(
@@ -1429,7 +1693,7 @@ fn a_failed_repair_after_the_cut_exits_1_because_the_journal_changed() {
     let j = state(h.path()).join("journal.jsonl");
     let mut torn = fs::read(&j).unwrap();
     let sound = torn.len();
-    torn.extend_from_slice(b"{\"schema\":1,\"op_");
+    torn.extend_from_slice(b"{\"schema\":2,\"op_");
     fs::write(&j, &torn).unwrap();
     let r = with_fail(
         h.path(),
@@ -1799,4 +2063,89 @@ fn recover_does_not_advise_resolving_a_multi_path_entry_as_done() {
         "{}",
         text(&d.stderr)
     );
+}
+
+#[test]
+fn recover_warns_when_the_parent_of_a_staged_copy_cannot_be_opened() {
+    use dfm_model::state::{Class, JournalEntry, Phase, Recovery, RecoveryOutput};
+
+    let h = bound_home("recovery-sweep-parent");
+    let real = h.path().join("real");
+    fs::create_dir(&real).unwrap();
+    // By the time recovery runs, the parent named by the intent is a link, which the sweep
+    // does not follow.
+    symlink("real", h.path().join("dir")).unwrap();
+    let intent = JournalEntry {
+        schema: dfm_model::state::SCHEMA,
+        op_id: "sweep-2".into(),
+        op: "create-file".into(),
+        phase: Phase::Intent,
+        at: "2026-10-10T00:00:00.000000000Z".into(),
+        resource: "core.x".into(),
+        adapter: "git-config/v1".into(),
+        class: Class::Normal,
+        recovery: Some(Recovery {
+            outputs: vec![RecoveryOutput {
+                path: out_file(h.path(), "dir/file"),
+                existed_before: false,
+                expected_sha256: Some(fp_hex("staged")),
+            }],
+            snapshot: None,
+        }),
+        token: None,
+        reason: None,
+    };
+    let journal = state(h.path()).join("journal.jsonl");
+    fs::write(&journal, intent.to_line().unwrap()).unwrap();
+    let tag = sha_hex(&format!("{}\0{}", intent.op_id, intent.at));
+    let tmp = real.join(format!(".file.{}.tmp", &tag[..16]));
+    fs::write(&tmp, "staged").unwrap();
+
+    let r = run(h.path(), &["state", "recover"]);
+    let out = text(&r.stdout);
+    assert!(
+        out.contains("warning: could not open the parent of")
+            && out.contains("to remove the staged copies of sweep-2:")
+            && out.contains("is not a real directory"),
+        "{out}\n{}",
+        text(&r.stderr)
+    );
+    assert_eq!(
+        fs::read(&tmp).unwrap(),
+        b"staged",
+        "the staged copy is left where it is"
+    );
+    // The intent is closed, so this run's message was the one report of that copy.
+    let lines = fs::read_to_string(&journal).unwrap();
+    assert_eq!(lines.lines().count(), 2, "{lines}");
+}
+
+#[test]
+fn state_check_refuses_a_lock_file_the_writer_would_refuse() {
+    let h = bound_home("check-lock-shape");
+    let lock = h.path().join(".local/state/dotfiles-manager.lock");
+    assert!(lock.exists(), "the lock path moved; fix this test");
+    assert_eq!(check(h.path()).status.code(), Some(0));
+    // A mode looser than 0600: the writer refuses it, so the check reports it as a finding.
+    fs::set_permissions(&lock, fs::Permissions::from_mode(0o644)).unwrap();
+    let o = check(h.path());
+    let (so, se) = (text(&o.stdout), text(&o.stderr));
+    assert_ne!(o.status.code(), Some(0), "{so}{se}");
+    assert!(
+        so.contains("E_STORAGE_INVALID") && so.contains("mode is 644, expected 0600"),
+        "{so}{se}"
+    );
+    fs::set_permissions(&lock, fs::Permissions::from_mode(0o600)).unwrap();
+    // A second hard link.
+    let twin = lock.with_extension("twin");
+    fs::hard_link(&lock, &twin).unwrap();
+    let o = check(h.path());
+    let (so, se) = (text(&o.stdout), text(&o.stderr));
+    assert_ne!(o.status.code(), Some(0), "{so}{se}");
+    assert!(
+        so.contains("E_STORAGE_INVALID") && so.contains("more than one hard link"),
+        "{so}{se}"
+    );
+    fs::remove_file(&twin).unwrap();
+    assert_eq!(check(h.path()).status.code(), Some(0));
 }

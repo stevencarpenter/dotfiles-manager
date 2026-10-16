@@ -14,9 +14,9 @@ check-style:
 check-tests:
     bash scripts/check_all.sh rust-tests
 
-# Every named check above, in order.
-check: check-fixtures check-scripts check-style check-tests
-
 # Full local validation, the same script as the commit hook. Hosted CI runs scripts/check_all.sh once per step, not this recipe.
-check-all:
+check:
     bash scripts/check_all.sh
+
+# Same as `check`.
+check-all: check

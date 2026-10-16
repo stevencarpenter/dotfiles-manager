@@ -31,4 +31,4 @@ pub use fsys::{
 pub use generate::{Generator, GeneratorInputs, NoGenerator};
 pub use observe::{merge, observe};
 pub use recover::{Open, Settled, recover, resolve};
-pub use store::{Finding, Loaded, Probe, Store, now_unix, verify_identity};
+pub use store::{Finding, Loaded, Probe, Store, now_ns, verify_identity};

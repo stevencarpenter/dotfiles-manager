@@ -140,7 +140,7 @@ fn plan(ops: Vec<Operation>) -> Plan {
 
 fn plan_in(root: &str, ops: Vec<Operation>) -> Plan {
     Plan {
-        schema: 1,
+        schema: dfm_model::state::SCHEMA,
         command: "plan".into(),
         scope: "config".into(),
         binary: Binary {
@@ -1285,7 +1285,7 @@ fn the_journal_gate_reserves_room_for_settling_earlier_work() {
     };
     // An `unknown` entry settling can close has its intent record before it.
     let paired = [open(Phase::Intent), open(Phase::Unknown)].concat();
-    let torn = b"{\"schema\":1,\"op_id\":\"tor".to_vec();
+    let torn = b"{\"schema\":2,\"op_id\":\"tor".to_vec();
     let cases: [(&str, Vec<u8>); 3] = [
         ("an open intent", open(Phase::Intent)),
         ("an open unknown entry with its intent", paired),
@@ -2137,11 +2137,11 @@ fn an_interrupted_intent_the_probe_cannot_decide_stays_blocked_across_runs() {
     fs::create_dir(s.h.0.join("l")).unwrap();
     s.store
         .append_journal(&JournalEntry {
-            schema: 1,
+            schema: dfm_model::state::SCHEMA,
             op_id: format!("{}-1", jid(1)),
             op: "create-link".into(),
             phase: Phase::Intent,
-            at: "2026-10-10T00:00:00Z".into(),
+            at: "2026-10-10T00:00:00.000000000Z".into(),
             resource: "core.x".into(),
             adapter: "git-config/v1".into(),
             class: Class::Normal,
@@ -2300,11 +2300,11 @@ fn forge(
 ) {
     use dfm_model::state::{Recovery, RecoveryOutput};
     let entry = |phase, recovery| JournalEntry {
-        schema: 1,
+        schema: dfm_model::state::SCHEMA,
         op_id: id.into(),
         op: op.into(),
         phase,
-        at: "2026-10-10T00:00:00Z".into(),
+        at: "2026-10-10T00:00:00.000000000Z".into(),
         resource: resource.into(),
         adapter: "git-config/v1".into(),
         class: Class::Normal,
@@ -2588,11 +2588,11 @@ fn an_intent_with_no_recorded_path_blocks_its_whole_resource() {
     use dfm_model::state::Recovery;
     let s = setup();
     let entry = |phase, recovery| JournalEntry {
-        schema: 1,
+        schema: dfm_model::state::SCHEMA,
         op_id: "empty-1".into(),
         op: "create-link".into(),
         phase,
-        at: "2026-10-10T00:00:00Z".into(),
+        at: "2026-10-10T00:00:00.000000000Z".into(),
         resource: "core.x".into(),
         adapter: "git-config/v1".into(),
         class: Class::Normal,
@@ -2793,7 +2793,6 @@ impl Generator for Unchanged {
     fn merge(&self, _: &Operation, i: &GeneratorInputs) -> Result<Merged, Refusal> {
         Ok(Merged {
             bytes: i.live.clone().unwrap_or_default(),
-            live_view: b"{}".to_vec(),
             rendered_view: b"{}".to_vec(),
             live_leaves: BTreeMap::new(),
             rendered_leaves: BTreeMap::new(),
@@ -3504,6 +3503,65 @@ fn an_outcome_that_cannot_be_settled_after_a_good_effect_blocks_the_path_in_the_
 }
 
 #[test]
+fn an_update_or_replace_whose_ledger_write_is_lost_gets_the_new_fingerprint_from_recovery() {
+    // The new content is live and the ledger still holds the old fingerprint. Without a repair
+    // the planner reports the path as modified and blocks it for good.
+    for link in [false, true] {
+        for point in ["ledger-before-write", "ledger-after-rename"] {
+            let s = rearmed(
+                |s| {
+                    if link {
+                        symlink("/src/old", s.h.0.join("t")).unwrap();
+                        own_fp(s, "t", &link_fingerprint("/src/old"));
+                    } else {
+                        fs::write(s.h.0.join("t"), "old\n").unwrap();
+                        own(s, "t", "old\n");
+                    }
+                },
+                Fail::at(point, Inject::Error),
+            );
+            let what = format!("{point}, link={link}");
+            // A link must resolve to a regular file to be owned.
+            let target = format!("{}/x", real_src(&s));
+            let p = if link {
+                let mut l = op(&s.h, &s.store, "x@file", 1, Action::ReplaceLink, "t");
+                l.link = Some(target.clone());
+                plan_in(&real_src(&s), vec![l])
+            } else {
+                plan(vec![op(
+                    &s.h,
+                    &s.store,
+                    "x@file",
+                    1,
+                    Action::UpdateFile,
+                    "t",
+                )])
+            };
+            let rep = go(&s, &p, &gens(), &none());
+            assert!(rep.stopped.is_some(), "{what}");
+            let new_fp = if link {
+                link_fingerprint(&target)
+            } else {
+                file_fingerprint(b"new\n")
+            };
+            let s = reopened(s);
+            recover_now(&s);
+            let ledger = s.store.read_ledger().unwrap();
+            assert_eq!(
+                ledger.resources[0].owned_outputs[0].fingerprint.as_deref(),
+                Some(new_fp.as_str()),
+                "{what}"
+            );
+            assert!(unfinished_none(&s), "{what}");
+        }
+    }
+}
+
+fn unfinished_none(s: &Setup) -> bool {
+    dfm_model::state::unfinished(&s.store.read_journal().unwrap()).is_empty()
+}
+
+#[test]
 fn a_merge_whose_outcome_cannot_be_settled_is_reported_and_the_next_run_records_it() {
     // (tag, store failpoint, run failpoint, status, ledger entry written)
     type Case = (
@@ -3948,6 +4006,191 @@ fn a_merge_that_crashed_with_only_its_intent_blocks_its_path_until_resolved_fail
         Status::Updated,
         "{:?}",
         rep.stopped
+    );
+}
+
+#[test]
+fn a_recovery_whose_ledger_write_fails_leaves_the_intent_open_and_the_next_one_repairs_it() {
+    // The apply leaves an open intent: the new content is live, the ledger holds the old
+    // fingerprint.
+    let s = rearmed(
+        |s| {
+            fs::write(s.h.0.join("t"), "old\n").unwrap();
+            own(s, "t", "old\n");
+        },
+        Fail::at("ledger-before-write", Inject::Error),
+    );
+    let p = plan(vec![op(
+        &s.h,
+        &s.store,
+        "x@file",
+        1,
+        Action::UpdateFile,
+        "t",
+    )]);
+    go(&s, &p, &gens(), &none());
+    assert_eq!(phases(&s), [Phase::Intent]);
+    let new_fp = file_fingerprint(b"new\n");
+    let fingerprint = |s: &Setup| {
+        s.store.read_ledger().unwrap().resources[0].owned_outputs[0]
+            .fingerprint
+            .clone()
+    };
+    // The first recovery cannot write the ledger. It fails and leaves the intent open.
+    let Setup { h, store } = s;
+    drop(store);
+    let store = open_write_after_drop(&h, Fail::at("ledger-before-write", Inject::Error));
+    let s = Setup { h, store };
+    let home = Dir::open_home(&sys(&s.h), &s.h.0).unwrap();
+    let err = dfm_engine::recover(&s.store, (&sys(&s.h), &home, s.h.0.as_path())).unwrap_err();
+    assert_eq!(err.code, Code::IoFailed, "{err}");
+    assert_eq!(phases(&s), [Phase::Intent], "the intent stays open");
+    assert_ne!(fingerprint(&s).as_deref(), Some(new_fp.as_str()));
+    // The next recovery repairs the fingerprint and closes the intent.
+    let s = reopened(s);
+    let settled = recover_now(&s);
+    assert!(settled.open.is_empty(), "{:?}", settled.open);
+    assert_eq!(phases(&s), [Phase::Intent, Phase::Done]);
+    assert_eq!(fingerprint(&s).as_deref(), Some(new_fp.as_str()));
+}
+
+#[test]
+fn a_crash_between_stage_and_rename_leaves_no_staged_copy_and_settles_not_done() {
+    const CHILD: &str = "DFM_APPLY_STAGE_CRASH_HOME";
+    let seed = |s: &Setup| {
+        fs::write(s.h.0.join("f"), "old\n").unwrap();
+        own(s, "f", "old\n");
+    };
+    if let Some(dir) = std::env::var_os(CHILD) {
+        // The child: stages the new content, then ends at once, as a crash does.
+        let h = Home(dir.into());
+        let store = open(&h);
+        let s = Setup { h, store };
+        let p = plan(vec![op(
+            &s.h,
+            &s.store,
+            "x@file",
+            1,
+            Action::UpdateFile,
+            "f",
+        )]);
+        go_with(
+            &s,
+            &p,
+            &gens(),
+            &none(),
+            &Fail::at("file-after-tmp", Inject::Abort),
+        );
+        std::process::exit(9);
+    }
+    let Setup { h, store } = setup();
+    let s = Setup { h, store };
+    seed(&s);
+    let Setup { h, store } = s;
+    drop(store);
+    let status = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "a_crash_between_stage_and_rename_leaves_no_staged_copy_and_settles_not_done",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env(CHILD, &h.0)
+        .status()
+        .unwrap();
+    assert_eq!(status.signal(), Some(6), "the child must abort: {status:?}");
+    let s = Setup { store: open(&h), h };
+    assert_eq!(leftovers(&s.h.0).len(), 1, "the crash left the staged copy");
+    assert_eq!(phases(&s), [Phase::Intent]);
+    // A file of the user that only looks like a staged name is not touched.
+    fs::write(s.h.0.join(".f.2024.10.12.tmp"), "mine\n").unwrap();
+    let settled = recover_now(&s);
+    // The live file still holds the ledger content: the effect did not happen.
+    assert!(settled.open.is_empty(), "{:?}", settled.open);
+    assert!(settled.warnings.is_empty(), "{:?}", settled.warnings);
+    assert_eq!(phases(&s), [Phase::Intent, Phase::Failed]);
+    assert_eq!(
+        leftovers(&s.h.0),
+        [".f.2024.10.12.tmp"],
+        "only the decoy is left"
+    );
+    assert_eq!(
+        fs::read_to_string(s.h.0.join(".f.2024.10.12.tmp")).unwrap(),
+        "mine\n"
+    );
+    assert_eq!(fs::read_to_string(s.h.0.join("f")).unwrap(), "old\n");
+}
+
+#[test]
+fn a_leftover_stage_of_a_repeated_op_id_does_not_block_the_next_publish() {
+    // The journal was archived by hand, so the op id restarts. An old stage under the tag of the
+    // bare op id must not make the next publish fail with EEXIST.
+    let s = setup();
+    let o = op(
+        &s.h,
+        &s.store,
+        "x@app.conf",
+        1,
+        Action::CreateFile,
+        "app.conf",
+    );
+    let old = {
+        let mut hex = dfm_model::digest::sha256_hex(format!("{}-1", o.journal_id).as_bytes());
+        hex.truncate(16);
+        hex
+    };
+    let mine = s.h.0.join(format!(".app.conf.{old}.tmp"));
+    fs::write(&mine, "old\n").unwrap();
+    let r = go(&s, &plan(vec![o]), &gen_for("x@app.conf", "a=1\n"), &none());
+    assert_eq!(r.operations[0].status, Status::Updated, "{:?}", r.stopped);
+    assert_eq!(fs::read_to_string(s.h.0.join("app.conf")).unwrap(), "a=1\n");
+    assert_eq!(fs::read_to_string(&mine).unwrap(), "old\n", "left alone");
+}
+
+#[test]
+fn a_crash_between_staging_a_link_and_the_rename_leaves_no_staged_link_and_settles_not_done() {
+    const CHILD: &str = "DFM_APPLY_LINK_STAGE_CRASH_HOME";
+    const NAME: &str =
+        "a_crash_between_staging_a_link_and_the_rename_leaves_no_staged_link_and_settles_not_done";
+    if let Some(dir) = std::env::var_os(CHILD) {
+        // The child: stages the new link, then ends at once, as a crash does.
+        let h = Home(dir.into());
+        let store = open(&h);
+        let s = Setup { h, store };
+        let mut l = op(&s.h, &s.store, "x@file", 1, Action::ReplaceLink, "l");
+        l.link = Some(format!("{}/x", real_src(&s)));
+        go_with(
+            &s,
+            &plan_in(&real_src(&s), vec![l]),
+            &gens(),
+            &none(),
+            &Fail::at("link-after-tmp", Inject::Abort),
+        );
+        std::process::exit(9);
+    }
+    let Setup { h, store } = setup();
+    let s = Setup { h, store };
+    symlink("/src/old", s.h.0.join("l")).unwrap();
+    own_fp(&s, "l", &link_fingerprint("/src/old"));
+    let Setup { h, store } = s;
+    drop(store);
+    let status = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", NAME, "--nocapture", "--test-threads=1"])
+        .env(CHILD, &h.0)
+        .status()
+        .unwrap();
+    assert_eq!(status.signal(), Some(6), "the child must abort: {status:?}");
+    let s = Setup { store: open(&h), h };
+    assert_eq!(leftovers(&s.h.0).len(), 1, "the crash left the staged link");
+    assert_eq!(phases(&s), [Phase::Intent]);
+    let settled = recover_now(&s);
+    assert!(settled.open.is_empty(), "{:?}", settled.open);
+    assert_eq!(phases(&s), [Phase::Intent, Phase::Failed]);
+    assert!(leftovers(&s.h.0).is_empty(), "the staged link is removed");
+    // The live link is still the old one: the effect did not happen.
+    assert_eq!(
+        fs::read_link(s.h.0.join("l")).unwrap(),
+        Path::new("/src/old")
     );
 }
 

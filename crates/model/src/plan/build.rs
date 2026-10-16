@@ -257,6 +257,9 @@ struct Parents {
     missing_from: Option<usize>,
     /// Preconditions for the existing parents.
     states: Vec<Precondition>,
+    /// The removal this plan runs for a link at `missing_from`: the directories below it are
+    /// created after that removal, so the link is not written through.
+    retired_by: Option<String>,
 }
 
 struct Planner<'a> {
@@ -273,6 +276,8 @@ struct Planner<'a> {
     /// Directories the plan creates, by folded path: the spelling the first claim used. A second
     /// spelling that differs only by case would be one directory on a case-insensitive volume.
     mkdirs: BTreeMap<String, String>,
+    /// Ledger entries this plan removes, by folded path: the removal operation id.
+    retiring: BTreeMap<String, String>,
 }
 
 pub fn build(resolved: &Resolved, cx: &Context<'_>, obs: &Observations) -> Result<Plan, Refusal> {
@@ -289,6 +294,10 @@ pub fn build(resolved: &Resolved, cx: &Context<'_>, obs: &Observations) -> Resul
         leaf_ids: BTreeSet::new(),
         removal_ids: BTreeSet::new(),
         mkdirs: BTreeMap::new(),
+        retiring: removals(resolved, &cx.ledger)
+            .into_iter()
+            .map(|o| (fold(&o.path), removal_id(o)))
+            .collect(),
     };
     for r in resolved.resources.values() {
         p.resource(r);
@@ -381,10 +390,6 @@ fn model_digest(resolved: &Resolved) -> Result<String, Refusal> {
         "profile": resolved.profile, "modules": resolved.modules, "resources": doc,
     });
     Ok(sha256_hex(&serde_json::to_vec(&all).map_err(ser)?))
-}
-
-fn pointer_escape(s: &str) -> String {
-    s.replace('~', "~0").replace('/', "~1")
 }
 
 /// The mode a resource declares for its output. Only the permission bits are allowed: a value
@@ -486,6 +491,7 @@ impl Planner<'_> {
                     return Ok(Parents {
                         missing_from: Some(i),
                         states,
+                        retired_by: None,
                     });
                 }
                 Node::Dir { mode, own } => {
@@ -498,7 +504,18 @@ impl Planner<'_> {
                     });
                     deepest = Some((p, *mode));
                 }
-                Node::Link { to, target, .. } => return Err(link_fail(field, &p, target, *to)),
+                Node::Link { to, target, .. } => {
+                    // A link the manager owns and this plan removes is not written through:
+                    // what is below it is planned as missing, after that removal.
+                    if write && let Some(id) = self.retiring.get(&fold(&p)) {
+                        return Ok(Parents {
+                            missing_from: Some(i),
+                            states,
+                            retired_by: Some(id.clone()),
+                        });
+                    }
+                    return Err(link_fail(field, &p, target, *to));
+                }
                 Node::File { .. } | Node::Other { .. } => {
                     return Err(fail(
                         Code::Conflict,
@@ -519,6 +536,7 @@ impl Planner<'_> {
         Ok(Parents {
             missing_from: None,
             states,
+            retired_by: None,
         })
     }
 
@@ -536,38 +554,12 @@ impl Planner<'_> {
     }
 
     fn skeleton(&self, r: &ResolvedResource, id: String, path: Option<String>) -> Operation {
-        Operation {
-            id,
-            journal_id: String::new(),
-            resource: r.id.clone(),
-            module: r.module.clone(),
-            adapter: r.adapter.clone(),
-            class: if r.sensitive {
-                Class::Sensitive
-            } else {
-                Class::Normal
-            },
-            action: Action::None,
-            status: Status::Blocked,
-            path,
-            mode: None,
-            link: None,
-            privilege: "user".into(),
-            effect: String::new(),
-            ownership: Ownership::Absent,
-            inputs: Vec::new(),
-            fragments: Vec::new(),
-            fragment_dir: None,
-            output_sha256: None,
-            managed_sha256: None,
-            takeover: false,
-            output_bytes: None,
-            excluded: None,
-            sets: Vec::new(),
-            after: Vec::new(),
-            preconditions: Vec::new(),
-            postcondition: "none".into(),
-        }
+        let class = if r.sensitive {
+            Class::Sensitive
+        } else {
+            Class::Normal
+        };
+        blank(id, (&r.id, &r.module, &r.adapter), class, path)
     }
 
     fn out_of_scope(&mut self, r: &ResolvedResource) {
@@ -601,7 +593,7 @@ impl Planner<'_> {
         let wanted = |ptr: &str| match r.kind.as_str() {
             "distribution" => {
                 let name = claim.rsplit('/').next().unwrap_or(claim);
-                ptr == format!("/entries/{}/source", pointer_escape(name))
+                ptr == format!("/entries/{}/source", crate::resolve::pointer::escape(name))
             }
             _ => true,
         };
@@ -697,10 +689,14 @@ impl Planner<'_> {
         self.claim_checks(claim, field)?;
         op.mode = declared_mode(r)?;
         let parents = self.parents(claim, field, true)?;
-        self.unchecked(claim, field)?;
+        // The own-path check followed the parent link that this plan removes first, so it says
+        // nothing about the directory that takes its place. The text scope check still ran.
+        if parents.retired_by.is_none() {
+            self.unchecked(claim, field)?;
+        }
         op.preconditions.extend(parents.states.clone());
         let comps = parts(claim);
-        let mut prev: Option<String> = None;
+        let mut prev: Option<String> = parents.retired_by.clone();
         if let Some(from) = parents.missing_from {
             for i in from..comps.len() - 1 {
                 prev = Some(self.mkdir(r, &comps[..=i].join("/"), prev.take(), field)?);
@@ -725,9 +721,22 @@ impl Planner<'_> {
             state: node_state(&seen, r.sensitive),
         });
         op.ownership = self.ownership(&r.id, r.sensitive, claim, &seen);
+        // The ledger gives one path one owner. When another resource owns this path and the path
+        // is missing, the plan retires that entry first, so apply never records two owners.
+        let mut owner_state = self.ledger_state(claim, r.sensitive);
+        let stale = if matches!(seen.node, Node::Missing {}) {
+            self.ledger_entry(claim)
+                .filter(|e| e.resource != r.id)
+                .cloned()
+        } else {
+            None
+        };
+        if stale.is_some() {
+            owner_state = ledger_state(None, r.sensitive);
+        }
         op.preconditions.push(Precondition {
             subject: format!("ledger:{claim}"),
-            state: self.ledger_state(claim, r.sensitive),
+            state: owner_state,
         });
         let unowned = self.ledger_entry(claim).is_none();
         let (action, status, ownership, effect, post) = if r.kind == "merge" {
@@ -735,6 +744,12 @@ impl Planner<'_> {
         } else {
             decide(r, claim, &seen, link, op.ownership, unowned)?
         };
+        // The decision succeeded, so the old owner's entry is retired first. The file is missing
+        // here: a merge over a present file with another owner was refused in `decide_merge`.
+        if let Some(old) = stale {
+            self.remove(&old);
+            op.after.push(removal_id(&old));
+        }
         op.action = action;
         op.status = status;
         op.ownership = ownership;
@@ -814,6 +829,21 @@ impl Planner<'_> {
         {
             return Err(fail(*code, "target", detail.clone(), correction.clone()));
         }
+        // A merge into an existing file records this resource as owner, and the ledger allows one
+        // owner per path, so the file is not written while another resource owns it. The CLI
+        // blocks this earlier, but its peek can lose a race with a file that appears after it.
+        // A missing file is fine: the leaf retires a stale owner's entry first.
+        if !matches!(seen.node, Node::Missing {})
+            && let Some(e) = self.ledger_entry(path).filter(|e| e.resource != r.id)
+        {
+            return Err(conflict(
+                format!(
+                    "{path} is recorded in the ledger as an output of {}",
+                    e.resource
+                ),
+                "move the file aside, then plan again: the plan retires a stale entry and merges into a new file; if that resource is still selected, remove its claim on the path first",
+            ));
+        }
         if matches!(seen.node, Node::Missing {}) {
             return Ok((
                 Action::CreateFile,
@@ -865,36 +895,14 @@ impl Planner<'_> {
     /// A ledger output that nothing selects any more. It is removed only when the ledger proves
     /// the live output is the one the manager wrote. Anything else is a conflict.
     fn remove(&mut self, o: &Owned) {
-        let id = format!("remove@{}@{}", o.resource, o.path);
+        let id = removal_id(o);
         self.removal_ids.insert(id.clone());
-        let mut op = Operation {
-            id: id.clone(),
-            journal_id: String::new(),
-            resource: o.resource.clone(),
-            module: String::new(),
-            adapter: o.adapter.clone(),
-            class: o.class,
-            action: Action::None,
-            status: Status::Blocked,
-            path: Some(o.path.clone()),
-            mode: None,
-            link: None,
-            privilege: "user".into(),
-            effect: String::new(),
-            ownership: Ownership::Absent,
-            inputs: Vec::new(),
-            fragments: Vec::new(),
-            fragment_dir: None,
-            output_sha256: None,
-            managed_sha256: None,
-            takeover: false,
-            output_bytes: None,
-            excluded: None,
-            sets: Vec::new(),
-            after: Vec::new(),
-            preconditions: Vec::new(),
-            postcondition: "none".into(),
-        };
+        let mut op = blank(
+            id.clone(),
+            (&o.resource, "", &o.adapter),
+            o.class,
+            Some(o.path.clone()),
+        );
         if let Err(f) = self.remove_checks(o, &mut op) {
             op.effect = format!("blocked: {}", f.detail);
             op.status = Status::Blocked;
@@ -961,7 +969,7 @@ impl Planner<'_> {
                     Code::Conflict,
                     field,
                     format!("{path} is a directory; the manager never removes a directory"),
-                    "remove it yourself if it is no longer wanted",
+                    "move the directory aside; the next plan sees the path absent and drops the stale ledger entry",
                 ));
             }
             _ => {}
@@ -987,11 +995,16 @@ impl Planner<'_> {
             _ => Some("is not owned by this resource according to the ledger"),
         };
         if let Some(why) = why {
+            let fix = if op.ownership == Ownership::Modified {
+                "if an apply was interrupted, run `dotfiles-manager state recover` first. Otherwise review the file and remove it yourself; the manager removes only what it can prove it wrote"
+            } else {
+                "review the file and remove it yourself; the manager removes only what it can prove it wrote"
+            };
             return Err(fail(
                 Code::Conflict,
                 field,
                 format!("{path} is no longer selected but {why}"),
-                "review the file and remove it yourself; the manager removes only what it can prove it wrote",
+                fix,
             ));
         }
         op.action = Action::Remove;
@@ -1364,6 +1377,44 @@ impl Planner<'_> {
     }
 }
 
+/// The id of the operation that removes one ledger output.
+fn removal_id(o: &Owned) -> String {
+    format!("remove@{}@{}", o.resource, o.path)
+}
+
+/// An operation with nothing decided: blocked, no action. `who` is the resource, module and
+/// adapter ids.
+fn blank(id: String, who: (&str, &str, &str), class: Class, path: Option<String>) -> Operation {
+    Operation {
+        id,
+        journal_id: String::new(),
+        resource: who.0.into(),
+        module: who.1.into(),
+        adapter: who.2.into(),
+        class,
+        action: Action::None,
+        status: Status::Blocked,
+        path,
+        mode: None,
+        link: None,
+        privilege: "user".into(),
+        effect: String::new(),
+        ownership: Ownership::Absent,
+        inputs: Vec::new(),
+        fragments: Vec::new(),
+        fragment_dir: None,
+        output_sha256: None,
+        managed_sha256: None,
+        takeover: false,
+        output_bytes: None,
+        excluded: None,
+        sets: Vec::new(),
+        after: Vec::new(),
+        preconditions: Vec::new(),
+        postcondition: "none".into(),
+    }
+}
+
 type Decision = (Action, Status, Ownership, String, String);
 
 fn decide(
@@ -1387,6 +1438,14 @@ fn decide(
             "target",
             format!("{path} {what}"),
             "review the file, then move it aside or adopt it; the manager does not overwrite content it does not own",
+        )
+    };
+    let modified = || {
+        fail(
+            Code::Conflict,
+            "target",
+            format!("{path} was changed after the manager wrote it"),
+            "if an apply was interrupted, run `dotfiles-manager state recover` first. Otherwise review the file, then move it aside or adopt it; the manager does not overwrite content it does not own",
         )
     };
     if let Node::Unknown { reason } = &seen.node {
@@ -1475,7 +1534,7 @@ fn decide(
                     ),
                     "remove the file yourself, then plan again to create the link",
                 )),
-                (_, Ownership::Modified) => Err(conflict("was changed after the manager wrote it")),
+                (_, Ownership::Modified) => Err(modified()),
                 (_, Ownership::Unverifiable) => {
                     Err(conflict("has an owner the manager cannot verify"))
                 }
@@ -1519,7 +1578,7 @@ fn decide(
                     ),
                     "remove the link yourself, then plan again to create the file",
                 )),
-                (_, Ownership::Modified) => Err(conflict("was changed after the manager wrote it")),
+                (_, Ownership::Modified) => Err(modified()),
                 (_, Ownership::Unverifiable) => Err(conflict(
                     "exists and its ownership cannot be verified: no comparable fingerprint is recorded for it",
                 )),

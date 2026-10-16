@@ -71,12 +71,9 @@ pub struct Desired {
 pub struct Merged {
     /// The new file content.
     pub bytes: Vec<u8>,
-    /// Canonical JSON of the managed keys as the live file holds them (absent keys are left
-    /// out). Only a salted hash of it may be stored.
-    pub live_view: Vec<u8>,
     /// Canonical JSON of the managed keys as declared.
     pub rendered_view: Vec<u8>,
-    /// The leaves of `live_view` and `rendered_view` by JSON pointer, as canonical JSON. A leaf
+    /// The leaves of the live and the rendered managed view by JSON pointer, as canonical JSON. A leaf
     /// is a value that is not an object. The conflict check compares leaf by leaf, so a changed
     /// key set (a dropped key or fragment) is not an edit.
     pub live_leaves: BTreeMap<String, Vec<u8>>,
@@ -93,7 +90,6 @@ impl std::fmt::Debug for Merged {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Merged")
             .field("bytes", &format_args!("{} bytes", self.bytes.len()))
-            .field("live_view", &format_args!("{} bytes", self.live_view.len()))
             .field(
                 "rendered_view",
                 &format_args!("{} bytes", self.rendered_view.len()),
@@ -498,7 +494,7 @@ fn overlay(
     append: &BTreeSet<String>,
 ) {
     for (k, v) in src {
-        let here = format!("{at}/{}", escape_token(k));
+        let here = format!("{at}/{}", crate::resolve::pointer::escape(k));
         match (dst.get_mut(k), v) {
             (Some(Json::Object(d)), Json::Object(s)) => overlay(d, s, &here, append),
             (Some(Json::Array(d)), Json::Array(s)) if append.contains(&here) => {
@@ -516,10 +512,6 @@ fn overlay(
     }
 }
 
-fn escape_token(t: &str) -> String {
-    t.replace('~', "~0").replace('/', "~1")
-}
-
 /// A JSON pointer that names at least one key, in its canonical spelling. `None` when the text
 /// is not a pointer (RFC 6901) or names the whole document.
 pub(crate) fn normal_pointer(p: &str) -> Option<String> {
@@ -534,7 +526,7 @@ pub(crate) fn normal_pointer(p: &str) -> Option<String> {
     Some(
         tokens
             .iter()
-            .map(|t| format!("/{}", escape_token(t)))
+            .map(|t| format!("/{}", crate::resolve::pointer::escape(t)))
             .collect(),
     )
 }
@@ -570,6 +562,9 @@ fn parse_live(live: Option<&[u8]>) -> Result<Map<String, Json>, Refusal> {
     };
     let fix = "Fix: repair or move the file; the manager writes nothing until it is a JSON object";
     match serde_json::from_slice::<Json>(bytes) {
+        Ok(Json::Object(_)) if has_wide_integer(bytes) => Err(conflict(format!(
+            "the live settings file holds an integer outside the 64-bit range, which would be rewritten as a float. {fix}"
+        ))),
         Ok(Json::Object(m)) => Ok(m),
         Ok(_) => Err(conflict(format!(
             "the live settings file is JSON but not an object. {fix}"
@@ -581,6 +576,43 @@ fn parse_live(live: Option<&[u8]>) -> Result<Map<String, Json>, Refusal> {
             e.column()
         ))),
     }
+}
+
+/// Whether valid JSON text holds an integer literal that fits neither `i64` nor `u64`.
+/// `serde_json` reads such a number as `f64` and writes it back in another spelling, so the
+/// merge would change a value it does not own. Strings are skipped.
+fn has_wide_integer(bytes: &[u8]) -> bool {
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'"' => {
+                i += 1;
+                while i < bytes.len() && bytes[i] != b'"' {
+                    i += if bytes[i] == b'\\' { 2 } else { 1 };
+                }
+                i += 1;
+            }
+            b'-' | b'0'..=b'9' => {
+                let start = i;
+                while i < bytes.len()
+                    && matches!(bytes[i], b'0'..=b'9' | b'+' | b'-' | b'.' | b'e' | b'E')
+                {
+                    i += 1;
+                }
+                let tok = &bytes[start..i];
+                let integer = tok.iter().all(|b| b.is_ascii_digit() || *b == b'-');
+                if integer
+                    && let Ok(t) = std::str::from_utf8(tok)
+                    && t.parse::<i64>().is_err()
+                    && t.parse::<u64>().is_err()
+                {
+                    return true;
+                }
+            }
+            _ => i += 1,
+        }
+    }
+    false
 }
 
 /// The managed view of `doc`: the leaves of `managed` as `doc` holds them, at the same paths.
@@ -595,7 +627,7 @@ fn view_of(
 ) -> Map<String, Json> {
     let mut out = Map::new();
     for (k, mv) in managed {
-        let here = format!("{at}/{}", escape_token(k));
+        let here = format!("{at}/{}", crate::resolve::pointer::escape(k));
         if append.contains(&here) {
             continue;
         }
@@ -624,7 +656,7 @@ fn leaves_of(view: &Map<String, Json>) -> BTreeMap<String, Vec<u8>> {
             if unspellable(k) {
                 continue;
             }
-            let here = format!("{at}/{}", escape_token(k));
+            let here = format!("{at}/{}", crate::resolve::pointer::escape(k));
             match v {
                 Json::Object(o) => walk(o, &here, out),
                 leaf => {
@@ -794,7 +826,7 @@ fn apply_managed(
         path.push(k.clone());
         let ptr: String = path
             .iter()
-            .map(|t| format!("/{}", escape_token(t)))
+            .map(|t| format!("/{}", crate::resolve::pointer::escape(t)))
             .collect();
         if w.desired.append.contains(&ptr) {
             append_items(live, k, mv, &ptr, w)?;
@@ -914,7 +946,6 @@ pub fn merge_with(
 ) -> Result<Merged, Refusal> {
     let mut doc = parse_live(live)?;
     let live_map = view_of(&doc, &desired.effective, "", &desired.append);
-    let live_view = canonical(&Json::Object(live_map.clone()));
     // An appended item the module no longer declares goes first, matched by hash.
     for a in appended {
         let declared = desired.append.contains(&a.pointer)
@@ -1011,7 +1042,6 @@ pub fn merge_with(
     let changed = live != Some(bytes.as_slice());
     Ok(Merged {
         bytes,
-        live_view,
         rendered_view: desired.rendered_view(),
         live_leaves: leaves_of(&live_map),
         rendered_leaves,
@@ -1209,16 +1239,6 @@ pub fn retire(
     Ok((bytes, changed))
 }
 
-/// Checks that the live document parses, and returns its managed view, without building a merge.
-pub fn live_view(live: Option<&[u8]>, desired: &Desired) -> Result<Vec<u8>, Refusal> {
-    Ok(canonical(&Json::Object(view_of(
-        &parse_live(live)?,
-        &desired.effective,
-        "",
-        &desired.append,
-    ))))
-}
-
 /// The text for a lost or unusable salt while the ledger records a salted hash. It is a hard
 /// state error: no command recovers it.
 pub const SALT_LOST: &str = "state/salt is missing or unusable, but the ledger records a salted hash of managed fields. This is a hard state error, so the foreign-edit check cannot run. Fix: restore state/salt from a copy (32 bytes, mode 0600). If no copy exists, edit state/ledger.json by hand and delete the `coowned` object (the key under resources[].owned_outputs[]) of each co-owned output; the next apply then needs --allow-adopt for that file";
@@ -1368,6 +1388,18 @@ argv = ["audit", "--quiet", "two words"]
     }
 
     #[test]
+    fn an_integer_outside_64_bits_blocks_the_merge_and_a_string_with_digits_does_not() {
+        for wide in ["12345678901234567890123", "-9223372036854775809"] {
+            let live = format!(r#"{{"mine":{wide}}}"#);
+            let e = merge(Some(live.as_bytes()), &desired(BASE), &[]).unwrap_err();
+            assert_eq!(e.code, Code::Conflict, "{wide}");
+            assert!(e.detail.contains("64-bit"), "{}", e.detail);
+        }
+        let ok = br#"{"a":18446744073709551615,"b":-9223372036854775808,"c":1.5e300,"d":"12345678901234567890123 \" 99999999999999999999999"}"#;
+        assert!(merge(Some(ok), &desired(BASE), &[]).is_ok());
+    }
+
+    #[test]
     fn a_second_merge_of_its_own_output_changes_nothing() {
         let first = merge(None, &desired(BASE), &[]).unwrap();
         let second = merge(Some(&first.bytes), &desired(BASE), &first.entries).unwrap();
@@ -1380,7 +1412,7 @@ argv = ["audit", "--quiet", "two words"]
         let d = desired("[managed]\nenableAll = false\n");
         let m = merge(Some(br#"{"enableAll":true}"#), &d, &[]).unwrap();
         assert_eq!(json(&m.bytes)["enableAll"], false);
-        assert_eq!(m.live_view, br#"{"enableAll":true}"#);
+        assert_eq!(m.live_leaves["/enableAll"], b"true");
         assert_eq!(m.rendered_view, br#"{"enableAll":false}"#);
     }
 
@@ -1726,8 +1758,8 @@ defaultMode = "auto"
         let (merged, _) = classify(Some(live), &d, Some(&rec), Some(&salt)).unwrap();
         // The view holds the managed leaves and nothing the user added.
         assert_eq!(
-            merged.live_view,
-            br#"{"enabledPlugins":{"a@m":true},"env":{"MANAGED":"1"}}"#
+            merged.live_leaves.keys().collect::<Vec<_>>(),
+            ["/enabledPlugins/a@m", "/env/MANAGED"]
         );
         assert_eq!(
             merged.appended.len(),

@@ -153,8 +153,9 @@ fn package(id: &str) -> AdapterSpec {
 }
 
 /// One adapter: what the resolver validates against, and the generator if the adapter produces
-/// file content. This table is the only place that names an adapter, so the catalog and the
-/// generators cannot disagree.
+/// file content. This table is the only place in the Rust code that names an adapter, so the
+/// catalog and the generators cannot disagree. `scripts/check_examples.py` keeps its own list
+/// for the example check.
 pub struct Adapter {
     pub spec: AdapterSpec,
     pub generator: Option<Gen>,

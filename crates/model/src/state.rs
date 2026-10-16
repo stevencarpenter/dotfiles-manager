@@ -9,7 +9,7 @@ use crate::{Code, Refusal};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::collections::{BTreeMap, BTreeSet};
 
-pub const SCHEMA: i64 = 1;
+pub const SCHEMA: i64 = 2;
 /// Largest JSON state file (section 5, parser and read limits).
 pub const MAX_BYTES: usize = 16 << 20;
 /// Longest journal line. A longer line is a journal error, not a skipped line.
@@ -89,7 +89,7 @@ pub fn parse<T: DeserializeOwned>(kind: &str, bytes: &[u8]) -> Result<T, Refusal
         Some(n) => {
             return Err(Refusal::new(
                 Code::SchemaUnsupported,
-                format!("{kind} schema {n} is not supported (supported: 1)"),
+                format!("{kind} schema {n} is not supported (supported: {SCHEMA})"),
             ));
         }
         // An integer above `i64::MAX` is a schema this binary has never heard of: newer.
@@ -147,7 +147,7 @@ fn deep_schema(b: &[u8]) -> Option<u64> {
 fn newer(kind: &str, n: &str) -> Refusal {
     Refusal::new(
         Code::StateNewer,
-        format!("{kind} schema {n} is newer than this binary supports (supported: 1)"),
+        format!("{kind} schema {n} is newer than this binary supports (supported: {SCHEMA})"),
     )
 }
 
@@ -204,15 +204,15 @@ impl Stamp {
 pub struct StateDoc {
     pub schema: i64,
     pub binding: Stamp,
-    pub created_unix: u64,
+    pub created_unix_ns: u64,
 }
 
 impl StateDoc {
-    pub fn new(binding: Stamp, created_unix: u64) -> StateDoc {
+    pub fn new(binding: Stamp, created_unix_ns: u64) -> StateDoc {
         StateDoc {
             schema: SCHEMA,
             binding,
-            created_unix,
+            created_unix_ns,
         }
     }
 
@@ -1011,7 +1011,7 @@ pub struct TrialRecord {
     pub binding: Stamp,
     pub trial_id: String,
     pub tool: String,
-    pub created_unix: u64,
+    pub created_unix_ns: u64,
     pub baseline: Baseline,
     pub owned_outputs: Vec<String>,
 }
@@ -1337,44 +1337,51 @@ fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
     era * 146_097 + doe - 719_468
 }
 
-pub fn rfc3339(unix: u64) -> String {
+const NS: u64 = 1_000_000_000;
+
+/// `2026-10-10T12:00:00.123456789Z` for nanoseconds since the epoch. The fraction always has nine
+/// digits, so the stamps sort as text.
+pub fn rfc3339(ns: u64) -> String {
+    let (unix, frac) = (ns / NS, ns % NS);
     let (days, secs) = ((unix / 86_400) as i64, unix % 86_400);
     let (y, m, d) = civil(days);
     format!(
-        "{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}Z",
+        "{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}.{frac:09}Z",
         secs / 3600,
         secs % 3600 / 60,
         secs % 60
     )
 }
 
-/// `20261010T120000Z`, used in receipt file names.
-pub fn compact_utc(unix: u64) -> String {
-    rfc3339(unix).replace(['-', ':'], "")
+/// `20261010T120000.123456789Z`, used in receipt file names.
+pub fn compact_utc(ns: u64) -> String {
+    rfc3339(ns).replace(['-', ':'], "")
 }
 
-/// Parses exactly `YYYY-MM-DDTHH:MM:SSZ`.
+/// Parses exactly `YYYY-MM-DDTHH:MM:SS.nnnnnnnnnZ` to nanoseconds since the epoch.
 pub fn parse_rfc3339(s: &str) -> Option<u64> {
     let b = s.as_bytes();
-    let shape = b.len() == 20
+    let shape = b.len() == 30
         && b[4] == b'-'
         && b[7] == b'-'
         && b[10] == b'T'
         && b[13] == b':'
         && b[16] == b':'
-        && b[19] == b'Z';
+        && b[19] == b'.'
+        && b[29] == b'Z';
     let num = |r: std::ops::Range<usize>| s.get(r)?.parse::<i64>().ok();
     if !shape {
         return None;
     }
     let (y, mo, d) = (num(0..4)?, num(5..7)?, num(8..10)?);
     let (h, mi, se) = (num(11..13)?, num(14..16)?, num(17..19)?);
+    let frac = u64::try_from(num(20..29)?).ok()?;
     if !(1..=12).contains(&mo) || !(1..=31).contains(&d) || h > 23 || mi > 59 || se > 60 {
         return None;
     }
     let t = days_from_civil(y, mo, d) * 86_400 + h * 3600 + mi * 60 + se;
-    // Reject dates that do not round-trip (for example February 30).
-    let t = u64::try_from(t).ok()?;
+    // Reject dates that do not round-trip (for example February 30), and signs in the fraction.
+    let t = u64::try_from(t).ok()?.checked_mul(NS)?.checked_add(frac)?;
     (rfc3339(t) == s).then_some(t)
 }
 
@@ -1393,8 +1400,8 @@ mod tests {
             adapter: "fs-link/v1".into(),
             class,
             status,
-            started_at: Some("2026-10-10T00:00:00Z".into()),
-            finished_at: Some("2026-10-10T00:00:01Z".into()),
+            started_at: Some("2026-10-10T00:00:00.000000000Z".into()),
+            finished_at: Some("2026-10-10T00:00:01.000000000Z".into()),
             before: None,
             after: None,
             owned_outputs: vec!["/h/.gitconfig".into()],
@@ -1409,8 +1416,8 @@ mod tests {
             schema: SCHEMA,
             op_id: "run-1".into(),
             command: "sync".into(),
-            started_at: "2026-10-10T00:00:00Z".into(),
-            finished_at: "2026-10-10T00:00:02Z".into(),
+            started_at: "2026-10-10T00:00:00.000000000Z".into(),
+            finished_at: "2026-10-10T00:00:02.000000000Z".into(),
             binary: BinaryId {
                 version: "0.1.0".into(),
                 commit: "unknown".into(),
@@ -1436,24 +1443,39 @@ mod tests {
 
     #[test]
     fn time_round_trips_and_rejects_impossible_dates() {
-        assert_eq!(rfc3339(0), "1970-01-01T00:00:00Z");
-        assert_eq!(rfc3339(1_791_590_400), "2026-10-10T00:00:00Z");
-        assert_eq!(parse_rfc3339("2026-10-10T00:00:00Z"), Some(1_791_590_400));
-        assert_eq!(parse_rfc3339("2026-02-30T00:00:00Z"), None);
-        assert_eq!(parse_rfc3339("2026-10-10 00:00:00Z"), None);
-        assert_eq!(compact_utc(1_791_590_400), "20261010T000000Z");
+        let t = 1_791_590_400 * NS + 123_456_789;
+        assert_eq!(rfc3339(0), "1970-01-01T00:00:00.000000000Z");
+        assert_eq!(rfc3339(t), "2026-10-10T00:00:00.123456789Z");
+        assert_eq!(parse_rfc3339("2026-10-10T00:00:00.123456789Z"), Some(t));
+        assert_eq!(parse_rfc3339("2026-02-30T00:00:00.000000000Z"), None);
+        assert_eq!(parse_rfc3339("2026-10-10 00:00:00.000000000Z"), None);
+        // The old whole-second form and a signed fraction are refused.
+        assert_eq!(parse_rfc3339("2026-10-10T00:00:00Z"), None);
+        assert_eq!(parse_rfc3339("2026-10-10T00:00:00.+12345678Z"), None);
+        assert_eq!(compact_utc(t), "20261010T000000.123456789Z");
     }
 
     #[test]
     fn schema_is_checked_before_any_other_field() {
         let code = |s: &str| StateDoc::parse(s.as_bytes()).unwrap_err().code;
-        assert_eq!(code("{\"schema\":2,\"junk\":1}"), Code::StateNewer);
+        assert_eq!(code("{\"schema\":3,\"junk\":1}"), Code::StateNewer);
         assert_eq!(code("{\"schema\":0}"), Code::SchemaUnsupported);
         assert_eq!(code("{\"junk\":1}"), Code::StateInvalid);
         assert_eq!(code("not json"), Code::StateInvalid);
-        assert_eq!(code("{\"schema\":1,\"junk\":1}"), Code::StateInvalid);
+        assert_eq!(code("{\"schema\":2,\"junk\":1}"), Code::StateInvalid);
+        // Schema 1 (whole-second stamps, `created_unix`) was written only by pre-release builds.
+        // It is refused as unsupported before its fields are read, never as invalid.
+        let old = "{\"schema\":1,\"binding\":{},\"created_unix\":1}";
+        let e = StateDoc::parse(old.as_bytes()).unwrap_err();
+        assert_eq!(e.code, Code::SchemaUnsupported);
+        assert!(
+            e.detail
+                .contains("schema 1 is not supported (supported: 2)"),
+            "{}",
+            e.detail
+        );
         let deep = format!(
-            "{{\"schema\":1,\"x\":{}1{}}}",
+            "{{\"schema\":2,\"x\":{}1{}}}",
             "[".repeat(40),
             "]".repeat(40)
         );
@@ -1469,8 +1491,8 @@ mod tests {
         assert_eq!(StateDoc::parse(&bytes).unwrap(), doc);
         let text = String::from_utf8(bytes).unwrap();
         assert!(!text.contains(' ') && !text.contains('\n'));
-        assert!(text.find("\"binding\"").unwrap() < text.find("\"created_unix\"").unwrap());
-        assert!(text.find("\"created_unix\"").unwrap() < text.find("\"schema\"").unwrap());
+        assert!(text.find("\"binding\"").unwrap() < text.find("\"created_unix_ns\"").unwrap());
+        assert!(text.find("\"created_unix_ns\"").unwrap() < text.find("\"schema\"").unwrap());
     }
 
     #[test]
@@ -1726,7 +1748,10 @@ mod tests {
         let back = Receipt::parse(&canonical(&ok).unwrap()).unwrap();
         assert_eq!(back, ok);
         assert_eq!(back.result.counts.values().sum::<u32>(), 2);
-        assert_eq!(back.file_name().unwrap(), "20261010T000000Z-run-1.json");
+        assert_eq!(
+            back.file_name().unwrap(),
+            "20261010T000000.000000000Z-run-1.json"
+        );
 
         let mut skew = ok.clone();
         skew.result.counts.insert(Status::Failed, 1);
@@ -1745,7 +1770,7 @@ mod tests {
             op_id: id.into(),
             op: op.into(),
             phase,
-            at: "2026-10-10T00:00:00Z".into(),
+            at: "2026-10-10T00:00:00.000000000Z".into(),
             resource: "r".into(),
             adapter: "a".into(),
             class: Class::Normal,
@@ -1839,7 +1864,7 @@ mod tests {
             op_id: "run-1".into(),
             op: op.into(),
             phase: Phase::Intent,
-            at: "2026-10-10T00:00:00Z".into(),
+            at: "2026-10-10T00:00:00.000000000Z".into(),
             resource: "r".into(),
             adapter: "a".into(),
             class: Class::Normal,
@@ -1907,7 +1932,7 @@ mod tests {
             binding: stamp(),
             trial_id: "t1".into(),
             tool: "atuin".into(),
-            created_unix: 1,
+            created_unix_ns: 1,
             baseline: Baseline {
                 tool_preexisting: false,
                 paths: vec![BaselinePath {
@@ -1974,7 +1999,7 @@ mod tests {
         assert!(receipt(vec![o.clone()]).validate().is_ok());
         o.status = Status::NotInScope;
         assert!(receipt(vec![o.clone()]).validate().is_ok());
-        let at = "2026-10-10T00:00:00Z".to_string();
+        let at = "2026-10-10T00:00:00.000000000Z".to_string();
         for never in [Status::NotStarted, Status::NotInScope] {
             o.status = never;
             for (start, finish) in [
@@ -2062,7 +2087,7 @@ mod tests {
         r.approvals = vec![DisruptiveApproval {
             operation_id: "op1".into(),
             how: "allow_disruptive".into(),
-            at: "2026-10-10T00:00:00Z".into(),
+            at: "2026-10-10T00:00:00.000000000Z".into(),
         }];
         r.validate().unwrap();
         let again = Receipt::parse(&canonical(&r).unwrap()).unwrap();
@@ -2079,7 +2104,7 @@ mod tests {
             r.approvals = vec![DisruptiveApproval {
                 operation_id: "op1".into(),
                 how: "allow_adopt".into(),
-                at: "2026-10-10T00:00:00Z".into(),
+                at: "2026-10-10T00:00:00.000000000Z".into(),
             }];
             r
         };
@@ -2128,7 +2153,7 @@ mod tests {
         r.approval = Some(Approval {
             kind: "hunter2".into(),
             plan_digest: "a".repeat(64),
-            at: "2026-10-10T00:00:00Z".into(),
+            at: "2026-10-10T00:00:00.000000000Z".into(),
         });
         cases.push(("approval", r));
         let mut r = good.clone();
@@ -2142,14 +2167,14 @@ mod tests {
         r.approvals = vec![DisruptiveApproval {
             operation_id: "no-such-op".into(),
             how: "allow_disruptive".into(),
-            at: "2026-10-10T00:00:00Z".into(),
+            at: "2026-10-10T00:00:00.000000000Z".into(),
         }];
         cases.push(("approval for an unknown operation", r));
         let mut r = good.clone();
         r.approvals = vec![DisruptiveApproval {
             operation_id: "op1".into(),
             how: "interactive".into(),
-            at: "2026-10-10T00:00:00Z".into(),
+            at: "2026-10-10T00:00:00.000000000Z".into(),
         }];
         cases.push(("approval kind with no prompt behind it", r));
         let mut r = good.clone();
@@ -2197,9 +2222,9 @@ mod tests {
             )
         };
         // Deeper than 32: a newer document is still reported as newer, an own-schema one is not.
-        assert_eq!(code(&deep("2")), Code::StateNewer);
-        assert_eq!(code(&deep("0")), Code::SchemaUnsupported);
-        assert_eq!(code(&deep("1")), Code::StateInvalid);
+        assert_eq!(code(&deep("3")), Code::StateNewer);
+        assert_eq!(code(&deep("1")), Code::SchemaUnsupported);
+        assert_eq!(code(&deep("2")), Code::StateInvalid);
         // Past the JSON parser's own recursion limit the schema is still read first.
         let very_deep = |schema: &str, extra: &str| {
             format!(
@@ -2208,12 +2233,12 @@ mod tests {
                 "]".repeat(200)
             )
         };
-        assert_eq!(code(&very_deep("2", "")), Code::StateNewer);
+        assert_eq!(code(&very_deep("3", "")), Code::StateNewer);
         assert_eq!(
-            code(&very_deep(" 3 ", "\"y\":\"a\\\"b\",")),
+            code(&very_deep(" 4 ", "\"y\":\"a\\\"b\",")),
             Code::StateNewer
         );
-        assert_eq!(code(&very_deep("1", "")), Code::StateInvalid);
+        assert_eq!(code(&very_deep("2", "")), Code::StateInvalid);
         assert_eq!(code(&very_deep("2.5", "")), Code::StateInvalid);
         // Only the top-level member counts: a nested `schema` is not the document's.
         let nested = format!(
@@ -2238,12 +2263,12 @@ mod tests {
     fn every_document_validator_checks_the_schema() {
         let mut l = ledger_entry();
         l.validate().unwrap();
-        l.schema = 2;
+        l.schema = 3;
         assert!(l.validate().is_err());
 
         let mut r = receipt(vec![op(Status::Updated, Class::Normal)]);
         r.validate().unwrap();
-        r.schema = 2;
+        r.schema = 3;
         assert!(r.validate().is_err());
 
         let mut t = TrialRecord {
@@ -2251,7 +2276,7 @@ mod tests {
             binding: stamp(),
             trial_id: "t1".into(),
             tool: "atuin".into(),
-            created_unix: 1,
+            created_unix_ns: 1,
             baseline: Baseline {
                 tool_preexisting: false,
                 paths: vec![],
@@ -2259,7 +2284,7 @@ mod tests {
             owned_outputs: vec![],
         };
         t.validate().unwrap();
-        t.schema = 2;
+        t.schema = 3;
         assert!(t.validate().is_err());
     }
 
@@ -2306,11 +2331,13 @@ mod tests {
     fn the_journal_entry_validator_refuses_each_malformed_field() {
         journal_entry().validate().unwrap();
         let cases: [(&str, EntryEdit); 11] = [
-            ("schema", |e| e.schema = 2),
+            ("schema", |e| e.schema = SCHEMA + 1),
             ("op id", |e| e.op_id = "Run 1".into()),
             ("op", |e| e.op = String::new()),
             ("time", |e| e.at = "yesterday".into()),
-            ("impossible time", |e| e.at = "2026-02-30T00:00:00Z".into()),
+            ("impossible time", |e| {
+                e.at = "2026-02-30T00:00:00.000000000Z".into()
+            }),
             ("relative recovery path", |e| {
                 e.recovery.as_mut().unwrap().outputs[0].path = "x".into()
             }),

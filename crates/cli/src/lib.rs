@@ -8,6 +8,7 @@ mod apply_cmd;
 mod controls_fs;
 mod doctor_cmd;
 mod plan_cmd;
+mod read_fs;
 mod source_fs;
 mod state_cmd;
 
@@ -352,6 +353,9 @@ fn dispatch(args: &[String], out: &mut dyn Write) -> Result<(), Refusal> {
                 )),
             }
         }
+        "--help" | "-h" | "help" | "--version" | "-V" | "version" | "binding" => {
+            Err(usage(format!("{cmd} takes no arguments")))
+        }
         other => Err(usage(format!(
             "unknown command or argument {other}; try --help"
         ))),
@@ -623,31 +627,24 @@ fn bind(ctx: &Ctx, profile: String, machine_id: String) -> Result<String, Refusa
     fail.hit("bind-after-lock")?;
     // Whatever this call created (directories, the lock file, the staging directory) makes a
     // later refusal a post-mutation one (exit 1). The store tracks that.
-    let stamped = |store: &Store, r: Refusal| {
-        if store.mutated() {
-            r.after_mutation()
-        } else {
-            r
-        }
-    };
-    let have = read_existing_binding(ctx).map_err(|r| stamped(&store, r))?;
+    let have = read_existing_binding(ctx).map_err(|r| store.stamp(r))?;
     if let Some(h) = &have
         && !h.same_identity(&want)
     {
-        return Err(stamped(&store, rebind_refusal(h)));
+        return Err(store.stamp(rebind_refusal(h)));
     }
     if have.is_some() && !store.is_initialized() {
-        return Err(stamped(&store, state_lost_refusal()));
+        return Err(store.stamp(state_lost_refusal()));
     }
     if store.is_initialized() {
-        let doc = store.read_state().map_err(|r| stamped(&store, r))?;
+        let doc = store.read_state().map_err(|r| store.stamp(r))?;
         if !doc.binding.same_identity(&stamp) {
-            return Err(stamped(&store, state_owner_refusal(&doc.binding)));
+            return Err(store.stamp(state_owner_refusal(&doc.binding)));
         }
     } else {
         store.init(&stamp)?;
     }
-    let after = |r: Refusal| stamped(&store, r);
+    let after = |r: Refusal| store.stamp(r);
     if store.salt().map_err(after)?.is_none() {
         if ledger_has_coowned(&store).map_err(after)? {
             return Err(after(Refusal::new(

@@ -35,12 +35,12 @@ Read-only resolution can be built first internally, but does not satisfy this fi
 
 Install Git hooks once per clone with `lefthook install`. Git, Bash, Lefthook and uv must be available on PATH.
 
-The pre-commit hook runs the full local gate against a temporary copy of the staged files. It checks fixtures, pinned Ruff lint/format, shell syntax, the staged-gate regression test, `cargo fmt --check`, `cargo clippy -D warnings` and `cargo test`. It does not modify or restage files. Run `just check-all` to check the working tree manually.
+The pre-commit hook runs the full local gate against a temporary copy of the staged files. It checks fixtures, pinned Ruff lint/format, shell syntax, the staged-gate regression test, `cargo fmt --check`, `cargo clippy -D warnings` and `cargo test`. It does not modify or restage files. Run `just check` to check the working tree manually.
 
 Passing local validation is the gate for GitHub publication and merge. Hosted CI is informational; account billing and unavailable runners do not block delivery. Keep evidence for the exact source revision. Merge and publication still require authorization.
 
 ```sh
-just check            # runs the four named checks below, in order
+just check            # the full gate; just check-all is the same
 just check-fixtures   # documentation fixtures only
 just check-scripts    # Ruff, shell syntax, staged-gate regression test
 just check-style      # cargo fmt --check, cargo clippy -D warnings
@@ -49,7 +49,7 @@ just check-tests      # cargo test: implementation, CLI, bootstrap and build-con
 uv run scripts/check_examples.py
 ```
 
-`scripts/check_all.sh` is the single shared gate and accepts the step names `fixtures`, `scripts`, `rust-style` and `rust-tests`. The CLI and differential tests need the isolated build, so the gate runs `cargo test --workspace --locked --features dfm-cli/test-isolation`; a plain `cargo test` skips those test targets. The install test needs crates.io, so it is `#[ignore]`d and the gate runs it explicitly with `-- --ignored`. Set `DFM_SKIP_NETWORK_TESTS=1` to skip it; the gate then prints `SKIPPED: network install test`.
+`scripts/check_all.sh` is the single shared gate and accepts the step names `fixtures`, `scripts`, `rust-style` and `rust-tests`. The CLI and differential tests need the isolated build, so the gate runs `cargo test --workspace --locked --features dfm-cli/test-isolation`; a plain `cargo test` skips those test targets. The install test needs crates.io, so it is `#[ignore]`d and the gate runs it explicitly with `-- --ignored`. Set `DFM_SKIP_NETWORK_TESTS=1` to skip it; the gate then prints `SKIPPED: network install test`. The `scripts` step fails when `shellcheck` is missing. Set `DFM_SKIP_SHELLCHECK=1` to skip it; the gate then prints `SKIPPED: shellcheck`.
 
 The fixture checker below is unchanged and still checks documentation fixtures only.
 

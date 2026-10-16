@@ -15,13 +15,12 @@
 //! snapshot. A source that cannot be read is `E_REPORT_UNAVAILABLE`, exit 2, which is
 //! docs/architecture.md section 10: "inability to produce the requested report".
 
+use crate::read_fs::read_regular_bounded;
 use dfm_model::fold::fold;
 use dfm_model::resolve::{SourceScope, SourceSet, bundle_scope, profile_bundle_path};
 use dfm_model::{Code, Refusal};
 use std::collections::BTreeMap;
 use std::fs;
-use std::io::Read;
-use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
 use dfm_model::plan::{
@@ -33,28 +32,22 @@ use dfm_model::plan::{
 /// symlink and does not block on a FIFO, and fstat then confirms the type, so an entry that
 /// changed type after the directory listing is refused instead of read.
 fn read_regular(path: &Path, shown: &str) -> Result<Vec<u8>, Refusal> {
-    let io = |e: std::io::Error| {
-        refusal(
-            Code::ReportUnavailable,
-            format!("cannot read source {shown}: {}", e.kind()),
-        )
-    };
-    let file = fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(dfm_platform_macos::O_NOFOLLOW | dfm_platform_macos::O_NONBLOCK)
-        .open(path)
-        .map_err(io)?;
-    if !file.metadata().map_err(io)?.is_file() {
-        return Err(refusal(
-            Code::SourceUntrusted,
-            format!("{shown} changed type while reading"),
-        ));
-    }
-    let mut buf = Vec::new();
-    file.take(MAX_FILE_BYTES + 1)
-        .read_to_end(&mut buf)
-        .map_err(io)?;
-    Ok(buf)
+    read_regular_bounded(
+        path,
+        MAX_FILE_BYTES,
+        |e| {
+            refusal(
+                Code::ReportUnavailable,
+                format!("cannot read source {shown}: {}", e.kind()),
+            )
+        },
+        || {
+            refusal(
+                Code::SourceUntrusted,
+                format!("{shown} changed type while reading"),
+            )
+        },
+    )
 }
 
 /// A refusal whose detail may hold control, bidirectional or zero-width characters from the tree

@@ -83,8 +83,8 @@ Each kind has three compiled-in lists. Initial values:
 | Kind | Writes | Reads | Upgrades from |
 | --- | --- | --- | --- |
 | `bundle`, `module`, `profile`, `lock`, `binding` (authored or reviewed) | 1 | 1 | none (never auto-upgraded) |
-| `state`, `ledger`, `grants` (machine owned) | 1 | 1 | none yet |
-| `receipt`, `journal-entry` | 1 | 1 | none yet (read-only readers per old version) |
+| `state`, `ledger`, `grants` (machine owned) | 2 | 2 | none (schema 1 was pre-release only; refused) |
+| `receipt`, `journal-entry` | 2 | 2 | none (schema 1 was pre-release only; refused) |
 
 ### Rules
 
@@ -367,7 +367,7 @@ DESIGN.md section 7 defines the commands, including `try`, `adopt` and `purge` (
    **Target contract:** First SIGINT or SIGTERM: stop starting new operations, let the current operation finish for up to 30 s, then send SIGTERM to its process group, wait the same 10 s grace period as for a timeout, then send SIGKILL to the group. Write the receipt and exit 130 (SIGINT) or 143 (SIGTERM). Second signal, of either kind: send SIGKILL to the process group immediately, leave the `intent` journal entry as the interruption record, write what receipt state can be written, and exit with the **first** signal's code (130 or 143).
 8. Disruptive set (decision 8). Disruptive: restart or unload of a user launch agent or Homebrew service (for example the window manager, status bar and border helpers), any configuration change that reloads a window manager, and deletion of an owned file. Not disruptive: writing a configuration file that is not yet loaded. Each disruptive operation needs `--allow-disruptive` or interactive confirmation.
 9. No scheduler, daemon, background process or login item is part of this contract.
-10. **Lock (F4, N3, N7).** One manager lock: an advisory `flock` on `~/.local/state/dotfiles-manager.lock`, a file in the parent directory, holding the pid and start time. It is outside `state/`, so state upgrade renames do not move it. Mutating commands, `grants revoke` and `verify --mark` take it exclusively. A second one gets exit 3 `E_LOCKED`. Previews take the lock shared. A preview that cannot get the shared lock exits 3 `E_LOCKED`. Other read-only commands take no lock and never clean staging directories. Read-only commands open the `state` directory by descriptor once at start and read relative to that descriptor, so they see the old or the new directory consistently during an upgrade rename. If no `state/` directory exists at that moment, they retry once after 1 s and then refuse: exit 3, or for `doctor` a finding and exit 1.
+10. **Lock (F4, N3, N7).** One manager lock: an advisory `flock` on `~/.local/state/dotfiles-manager.lock`, a file in the parent directory, holding the pid and start time. It is outside `state/`, so state upgrade renames do not move it. Mutating commands, `grants revoke` and `verify --mark` take it exclusively. A second one gets exit 3 `E_LOCKED`. Previews take the lock shared. A preview that cannot get the shared lock exits 3 `E_LOCKED`. `state check` takes the lock shared and without waiting, on the existing file only (never created), and holds it until it ends. If a writer holds it, `state check` exits 3 `E_LOCKED` with no findings. Other read-only commands take no lock and never clean staging directories. Read-only commands open the `state` directory by descriptor once at start and read relative to that descriptor, so they see the old or the new directory consistently during an upgrade rename. If no `state/` directory exists at that moment, they retry once after 1 s and then refuse: exit 3, or for `doctor` a finding and exit 1.
 
 ## 11. Typed adapter boundary and shared contracts (C01, C09, C10)
 

@@ -9,7 +9,9 @@
 #
 # POSIX sh plus system tools from a fixed PATH. No cargo, rustc or rustup process
 # starts before the toolchain tree digest and the build controls pass.
-# Exit: 0 ok, 1 failed (build, or a check after the swap), 2 usage, 3 refused before the build.
+# Exit: 0 ok, 1 failed (build, or a check after the first mutation), 2 usage, 3 refused before any
+# mutation. The first mutation is the reset of cargo-home, rustup-home and build-home in the data
+# directory. Before it, only the scratch build directory exists, and the exit trap removes it.
 # Scrub the caller's environment before anything else runs: exported shell functions of any
 # name (BASH_FUNC_*, including ones named like `[` or `test`), PERL5LIB or PERL5OPT (shasum
 # is perl), CDPATH, ENV and the like must not influence the checks. Before the scrub this
@@ -63,10 +65,12 @@ TAB=$(printf '\t')
 NL='
 '
 
-refuse() { printf 'error: %s %s\n' "$1" "$2" >&2; exit 3; }
+# Exit 3 means nothing was changed. install sets refuse_code=1 at its first change to the data directory.
+refuse_code=3
+refuse() { printf 'error: %s %s\n' "$1" "$2" >&2; exit "$refuse_code"; }
 usage() { printf 'error: E_USAGE %s\n' "$1" >&2; exit 2; }
 # $1 is awk output that starts with an error code.
-refuse_out() { [ -z "$1" ] || printf 'error: %s\n' "$1" >&2; exit 3; }
+refuse_out() { [ -z "$1" ] || printf 'error: %s\n' "$1" >&2; exit "$refuse_code"; }
 
 # Test hooks exist only when DFM_BOOTSTRAP_TEST=1 and replace the dscl and uname answers.
 test_mode() { [ "${DFM_BOOTSTRAP_TEST:-}" = 1 ]; }
@@ -557,7 +561,7 @@ check_binding() {
   [ "$(/usr/bin/stat -f %u "$b")" = "$(/usr/bin/id -u)" ] || binding_bad "$b" "is not owned by the current user"
   [ "$(/usr/bin/stat -f %l "$b")" = 1 ] || binding_bad "$b" "has more than one hard link"
 }
-binding_bad() { printf 'error: E_BINDING_INVALID %s %s\n' "$1" "$2" >&2; exit 3; }
+binding_bad() { printf 'error: E_BINDING_INVALID %s %s\n' "$1" "$2" >&2; exit "$refuse_code"; }
 
 # $1 is a path below HOME. Refuses when an existing component of it is a symlink, not a
 # directory, not owned by the current user or writable by group or others (mode & 022), so no
@@ -665,6 +669,7 @@ cmd_install() {
   chmod -R a-w "$build/stage" # same-uid writers can still undo this; see docs/bootstrap.md
   # Controls passed. From here the pinned toolchain runs under a constructed environment.
   check_cache_tree; check_data_tree # again: the window since the first check was the staging and the controls
+  refuse_code=1 # the first change outside the scratch build directory is next; refusals after it are failures
   for d in cargo-home rustup-home build-home; do rm -rf "${DATA:?}/$d"; mkdir -p "$DATA/$d"; done
   cd "$build"
   tcrun() { /usr/bin/env -i PATH="$TC/bin:$SYSPATH" HOME="$DATA/build-home" CARGO_HOME="$DATA/cargo-home" \
@@ -744,12 +749,25 @@ cmd_uninstall() {
 }
 
 cmd=${1:-}; [ $# -gt 0 ] && shift
-src='' commit='' dir=''
+src='' commit='' dir='' seen=' '
+# A flag is accepted once, and only by the commands that use it.
+flag() {
+  case $cmd in
+    install) ok=' --source --commit ' ;;
+    check-controls) ok=' --source ' ;;
+    toolchain-digest) ok=' --dir ' ;;
+    uninstall) ok=' ' ;;
+    *) ok=' --source --commit --dir ' ;; # unknown command: the final usage line explains
+  esac
+  case $ok in *" $1 "*) ;; *) usage "$cmd does not use $1" ;; esac
+  case $seen in *" $1 "*) usage "$1 given twice" ;; esac
+  seen="$seen$1 "
+}
 while [ $# -gt 0 ]; do
   case $1 in
-    --source) [ $# -ge 2 ] || usage "--source needs a value"; src=$2; shift 2 ;;
-    --commit) [ $# -ge 2 ] || usage "--commit needs a value"; commit=$2; shift 2 ;;
-    --dir) [ $# -ge 2 ] || usage "--dir needs a value"; dir=$2; shift 2 ;;
+    --source) flag --source; [ $# -ge 2 ] || usage "--source needs a value"; src=$2; shift 2 ;;
+    --commit) flag --commit; [ $# -ge 2 ] || usage "--commit needs a value"; commit=$2; shift 2 ;;
+    --dir) flag --dir; [ $# -ge 2 ] || usage "--dir needs a value"; dir=$2; shift 2 ;;
     *) usage "unknown argument $1" ;;
   esac
 done

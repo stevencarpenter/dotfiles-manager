@@ -119,8 +119,44 @@ pub(crate) const NAME_MAX: usize = 255;
 /// unit test builds the longest name and compares its length with this value.
 pub(crate) const TEMP_NAME_EXTRA: usize = 1 + 1 + 10 + 1 + 10 + 1 + 9 + 1 + 5;
 
-/// A hidden same-directory name for a staged file or link: unique per process and call.
+thread_local! {
+    static STAGE_TAG: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
+
+/// The tag in the staged names of the attempt `op_id` whose intent entry has the time `at`: 16
+/// hex digits of the SHA-256 of both. Op ids restart when a journal is archived by hand, so the
+/// time keeps a leftover name of an old attempt from blocking a new one. Recovery derives the
+/// same tag from the intent entry, so it can remove exactly the names this attempt made and no
+/// other file. shortcut: the time has the resolution of the system clock (one microsecond on
+/// macOS), so a repeated id at the same clock reading still collides; add a nonce to the intent if
+/// that ever matters.
+pub(crate) fn stage_tag(op_id: &str, at: &str) -> String {
+    let mut hex = dfm_model::digest::sha256_hex(format!("{op_id}\0{at}").as_bytes());
+    hex.truncate(16);
+    hex
+}
+
+/// Runs `f` with every staged name on this thread tagged for the attempt `op_id` (see
+/// [`stage_tag`]).
+pub(crate) fn staged_as<T>(op_id: &str, at: &str, f: impl FnOnce() -> T) -> T {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            STAGE_TAG.with(|t| *t.borrow_mut() = None);
+        }
+    }
+    STAGE_TAG.with(|t| *t.borrow_mut() = Some(stage_tag(op_id, at)));
+    let _reset = Reset;
+    f()
+}
+
+/// A hidden same-directory name for a staged file or link. Inside [`staged_as`] it is
+/// `.<name>.<tag>.<suffix>`, which recovery can name exactly. Otherwise it is unique per process
+/// and call.
 pub(crate) fn temp_name(name: &str, suffix: &str) -> String {
+    if let Some(tag) = STAGE_TAG.with(|t| t.borrow().clone()) {
+        return format!(".{name}.{tag}.{suffix}");
+    }
     static N: AtomicU32 = AtomicU32::new(0);
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -269,6 +305,13 @@ pub fn path_ident(path: &Path, follow: bool) -> Result<Option<Ident>, Refusal> {
 pub struct Listing {
     pub names: Vec<String>,
     pub odd: usize,
+}
+
+impl Listing {
+    /// Every entry read, with a UTF-8 name or not. The cap of [`Dir::list_upto`] counts these.
+    pub fn seen(&self) -> usize {
+        self.names.len() + self.odd
+    }
 }
 
 /// What `fstatat` found at one entry, without following it.
@@ -606,6 +649,51 @@ impl Dir {
         self.write_temp_mode(name, bytes, 0o600)
     }
 
+    /// Removes the names an interrupted attempt `op_id` staged for `name` (see [`staged_as`]),
+    /// and only those. Only a regular file or a link of the current user goes, without following
+    /// a link. The caller holds the writer lock, so no live publish owns such a name. Returns
+    /// whether anything was removed and a message for each name that could not be removed.
+    pub(crate) fn sweep_stages(
+        &self,
+        sys: &Sys,
+        name: &str,
+        op_id: &str,
+        at: &str,
+    ) -> (bool, Vec<String>) {
+        let tag = stage_tag(op_id, at);
+        let mut removed = false;
+        let mut left = Vec::new();
+        for suffix in ["tmp", "stage"] {
+            let staged = format!(".{name}.{tag}.{suffix}");
+            let shown = self.at(&staged).display().to_string();
+            match self.peek(sys, &staged) {
+                Ok(Peek::Missing) => {}
+                Ok(Peek::File { own: true, .. } | Peek::Link { own: true, .. }) => {
+                    match rfs::unlinkat(&self.fd, &staged, AtFlags::empty()) {
+                        Ok(()) => removed = true,
+                        Err(e) => {
+                            left.push(format!("could not remove the staged copy {shown}: {e}"));
+                        }
+                    }
+                }
+                Ok(_) => left.push(format!(
+                    "the staged name {shown} is not a file or link of the current user; it is left alone"
+                )),
+                Err(e) => left.push(format!("could not inspect {shown}: {}", e.detail)),
+            }
+        }
+        // As after a publish: the removal is not durable until the directory is synced. A sync
+        // that fails is reported, because settling still closes the attempt.
+        if removed && let Err(e) = self.sync() {
+            left.push(format!(
+                "could not sync {} after removing the staged copies of {op_id}; the removal is unconfirmed: {}",
+                self.at("").display(),
+                e.detail
+            ));
+        }
+        (removed, left)
+    }
+
     /// As [`Dir::write_temp`], with the mode the published file will have. The mode is set
     /// before any content is written, so the file is never wider than `mode`.
     pub(crate) fn write_temp_mode(
@@ -697,9 +785,21 @@ impl Dir {
         fail: &Fail,
         label: &str,
     ) -> Result<bool, Refusal> {
+        self.publish_new_mode(name, bytes, 0o600, fail, label)
+    }
+
+    /// As [`Dir::publish_new`], with the mode the published file will have.
+    pub(crate) fn publish_new_mode(
+        &self,
+        name: &str,
+        bytes: &[u8],
+        mode: u32,
+        fail: &Fail,
+        label: &str,
+    ) -> Result<bool, Refusal> {
         check_name(name)?;
         fail.hit(&format!("{label}-before-write"))?;
-        let tmp = self.write_temp(name, bytes)?;
+        let tmp = self.write_temp_mode(name, bytes, mode)?;
         let step = || -> Result<bool, Refusal> {
             fail.hit(&format!("{label}-after-tmp"))?;
             match rename_new(&self.fd, &tmp, name) {
@@ -802,7 +902,7 @@ impl Dir {
             return Err(Refusal::new(
                 Code::LimitExceeded,
                 format!(
-                    "{} would pass {max_total} bytes; it is not appended",
+                    "{} would pass {max_total} bytes; it is not appended. Fix: compact it by hand (docs/state.md, Recovery by hand, journal at its cap)",
                     self.at(name).display()
                 ),
             ));
@@ -1040,8 +1140,9 @@ impl Dir {
         self.list_upto(usize::MAX)
     }
 
-    /// As [`Dir::list`], but stops after `max + 1` names, so a huge directory is not read into
-    /// memory. More than `max` names in the result means the listing was cut.
+    /// As [`Dir::list`], but stops after `max + 1` entries, so a huge directory is not read into
+    /// memory. Entries whose name is not UTF-8 count too. More than `max` entries
+    /// ([`Listing::seen`]) in the result means the listing was cut.
     pub fn list_upto(&self, max: usize) -> Result<Listing, Refusal> {
         LISTED.with(|c| c.set(c.get() + 1));
         let mut rd = rfs::Dir::read_from(&self.fd).map_err(|e| sys_err("list directory", e))?;
@@ -1057,7 +1158,7 @@ impl Dir {
                 Ok(s) => out.names.push(s.to_string()),
                 Err(_) => out.odd += 1,
             }
-            if out.names.len() > max {
+            if out.seen() > max {
                 break;
             }
         }
@@ -1217,13 +1318,82 @@ impl Lock {
         };
         lock.verify()?;
         // Informational only: the lock is the flock, not these bytes.
-        let since = crate::store::now_unix().map_or_else(|_| "unknown".into(), |t| t.to_string());
+        let since = crate::store::now_ns().map_or_else(|_| "unknown".into(), |t| t.to_string());
         let note = format!("pid {} since {since}\n", std::process::id());
         let mut f = &lock.file;
         f.set_len(0)
             .and_then(|()| f.write_all(note.as_bytes()))
             .map_err(|e| io("write lock note", &e))?;
         Ok(lock)
+    }
+
+    /// Reports whether a writer holds the lock, without creating the file and without waiting.
+    /// A missing file means no writer and no guard. Otherwise the caller keeps the returned
+    /// shared lock for as long as it reads, so a writer that starts meanwhile gets `E_LOCKED`.
+    /// A file that [`Lock::acquire`] would refuse (another owner, more than one hard link, a
+    /// mode looser than 0600) is refused here too, so a reader never reports a store healthy
+    /// while every writer is blocked.
+    pub fn probe(sys: &Sys, parent: &Dir, name: &str) -> Result<Option<File>, Refusal> {
+        Self::probe_after_open(sys, parent, name, || {})
+    }
+
+    /// As [`Lock::probe`]. `after_open` runs between the open and the lock, so a test can replace
+    /// the file there.
+    fn probe_after_open(
+        sys: &Sys,
+        parent: &Dir,
+        name: &str,
+        after_open: impl FnOnce(),
+    ) -> Result<Option<File>, Refusal> {
+        check_name(name)?;
+        let bad = |d: String| storage(format!("{}: {d}", parent.at(name).display()));
+        let flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC;
+        let fd = match rfs::openat(&parent.fd, name, flags, Mode::empty()) {
+            Ok(fd) => fd,
+            Err(Errno::NOENT) => return Ok(None),
+            Err(Errno::LOOP) => return Err(bad("is a symlink".into())),
+            Err(e) => return Err(bad(io_kind(e))),
+        };
+        let st = rfs::fstat(&fd).map_err(|e| sys_err("stat lock", e))?;
+        if kind(&st) != FileType::RegularFile || st.st_uid != sys.uid {
+            return Err(bad(
+                "must be a regular file owned by the current user".into()
+            ));
+        }
+        if u64::from(st.st_nlink) != 1 {
+            return Err(bad("has more than one hard link".into()));
+        }
+        let mode = mode_bits(&st);
+        if mode & !0o600 != 0 {
+            return Err(bad(format!("mode is {mode:o}, expected 0600")));
+        }
+        after_open();
+        let file = File::from(fd);
+        match file.try_lock_shared() {
+            Ok(()) => Self::still_current(parent, name, &file).map(|()| Some(file)),
+            Err(TryLockError::WouldBlock) => Err(Refusal::new(
+                Code::Locked,
+                "a writer is running and holds the manager lock",
+            )),
+            Err(TryLockError::Error(e)) => Err(io("probe lock", &e)),
+        }
+    }
+
+    /// Fails with `E_LOCKED` unless the entry `name` still is the file `file`. A shared lock on a
+    /// replaced or removed file excludes no writer, which locks the entry now at this name. The
+    /// writer fences the same way ([`Lock::verify`]).
+    pub fn still_current(parent: &Dir, name: &str, file: &File) -> Result<(), Refusal> {
+        let held = ident_of(&rfs::fstat(file).map_err(|e| sys_err("stat lock", e))?)?;
+        if parent.entry_ident(name)? == Some(held) {
+            return Ok(());
+        }
+        Err(Refusal::new(
+            Code::Locked,
+            format!(
+                "{}: the lock file was replaced or removed while it was held; run the command again",
+                parent.at(name).display()
+            ),
+        ))
     }
 
     /// Fails unless the entry still names the file this lock holds. Called before every write.
@@ -1248,6 +1418,62 @@ impl Lock {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    #[test]
+    fn probe_refuses_a_lock_file_replaced_after_the_open() {
+        let root = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .join(format!("dfm-probe-replaced-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let root = root.as_path();
+        let put = || {
+            std::fs::write(root.join("lock"), "").unwrap();
+            let mode = std::fs::Permissions::from_mode(0o600);
+            std::fs::set_permissions(root.join("lock"), mode).unwrap();
+        };
+        put();
+        let sys = Sys {
+            uid: std::fs::metadata(root.join("lock")).unwrap().uid(),
+        };
+        let dir = Dir::open_plain(root).unwrap();
+        // Unchanged: the probe returns the shared lock.
+        assert!(Lock::probe(&sys, &dir, "lock").unwrap().is_some());
+        // The writer's checks apply: a looser mode or a second link is a storage refusal.
+        std::fs::set_permissions(root.join("lock"), std::fs::Permissions::from_mode(0o644))
+            .unwrap();
+        let e = Lock::probe(&sys, &dir, "lock").unwrap_err();
+        assert_eq!(e.code, Code::StorageInvalid);
+        assert!(
+            e.detail.contains("mode is 644, expected 0600"),
+            "{}",
+            e.detail
+        );
+        put();
+        std::fs::hard_link(root.join("lock"), root.join("twin")).unwrap();
+        let e = Lock::probe(&sys, &dir, "lock").unwrap_err();
+        assert_eq!(e.code, Code::StorageInvalid);
+        assert!(e.detail.contains("more than one hard link"), "{}", e.detail);
+        std::fs::remove_file(root.join("twin")).unwrap();
+        // Replaced between the open and the lock: refused.
+        let e = Lock::probe_after_open(&sys, &dir, "lock", || {
+            std::fs::remove_file(root.join("lock")).unwrap();
+            put();
+        })
+        .unwrap_err();
+        assert_eq!(e.code, Code::Locked);
+        assert!(e.detail.contains("replaced or removed"), "{}", e.detail);
+        assert!(e.detail.contains("run the command again"), "{}", e.detail);
+        // Removed between the open and the lock: refused.
+        put();
+        let e = Lock::probe_after_open(&sys, &dir, "lock", || {
+            std::fs::remove_file(root.join("lock")).unwrap()
+        })
+        .unwrap_err();
+        assert_eq!(e.code, Code::Locked);
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     /// A writer that accepts a few bytes and then fails, like a full disk.
     struct Partial(Vec<u8>);

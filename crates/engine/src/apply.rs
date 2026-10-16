@@ -17,7 +17,7 @@ use crate::generate::{Gather, Generator, GeneratorInputs, gather, link_source};
 use crate::observe::observe;
 use crate::publish::Publish;
 use crate::recover;
-use crate::store::{Store, now_unix};
+use crate::store::{Store, now_ns};
 use dfm_model::digest::sha256_hex;
 use dfm_model::fold;
 use dfm_model::merge::{Merged, check_foreign, leaf_hashes, salted};
@@ -26,8 +26,8 @@ use dfm_model::plan::{
     link_fingerprint, node_state,
 };
 use dfm_model::state::{
-    Class, CoOwned, Fingerprint, JournalEntry, Ledger, LedgerResource, OperationRecord,
-    OwnedOutput, Phase, Recovery, RecoveryOutput, Status, rfc3339, valid_id,
+    Class, CoOwned, Fingerprint, JournalEntry, Ledger, OperationRecord, OwnedOutput, Phase,
+    Recovery, RecoveryOutput, SCHEMA, Status, rfc3339, valid_id,
 };
 use dfm_model::{Code, Refusal};
 use std::cell::Cell;
@@ -62,16 +62,6 @@ pub struct Run<'a> {
     pub fail: &'a Fail,
 }
 
-impl Run<'_> {
-    /// The ids the caller approved for one kind.
-    pub fn allowed(&self, kind: Approval) -> &BTreeSet<String> {
-        match kind {
-            Approval::Disruptive => self.allow,
-            Approval::Adopt => self.allow_adopt,
-        }
-    }
-}
-
 /// What happened to every operation of the plan, in plan order.
 #[derive(Debug)]
 pub struct Report {
@@ -81,6 +71,8 @@ pub struct Report {
     pub stopped: Option<Refusal>,
     /// Bytes of a torn final journal line that were cut off before settling (0 when none).
     pub repaired: usize,
+    /// Staged copies of an interrupted publish that settling could not remove.
+    pub warnings: Vec<String>,
 }
 
 /// The result of the gates that need no write.
@@ -494,7 +486,7 @@ pub fn check_journal_capacity(
         return Err(Refusal::new(
             Code::LimitExceeded,
             format!(
-                "the journal ({journal_len} bytes) cannot take the entries of {journaled} operations and {settling} entries of earlier work to settle without passing {} bytes. Nothing was changed. Journal rotation is not built (DFM-19)",
+                "the journal ({journal_len} bytes) cannot take the entries of {journaled} operations and {settling} entries of earlier work to settle without passing {} bytes. Nothing was changed. Journal rotation is not built (DFM-19). Fix: compact the journal by hand (docs/state.md, Recovery by hand, journal at its cap)",
                 dfm_model::state::MAX_JOURNAL_BYTES
             ),
         ));
@@ -507,6 +499,7 @@ struct Exec<'a, 'r> {
     plan: &'a Plan,
     /// Bytes cut off a torn final journal line by this run's repair.
     repaired: usize,
+    warnings: Vec<String>,
     /// Journal intents per planner journal id, so an id is never reused after a partial apply.
     attempts: BTreeMap<String, u32>,
     /// Paths whose state is unknown (an interrupted or unconfirmed operation). Nothing more is
@@ -515,7 +508,7 @@ struct Exec<'a, 'r> {
     /// Resources with an `unknown` entry that has no intent record, so no path is known. Every
     /// operation of the resource is blocked. Resource name to journal id.
     unknown_resources: BTreeMap<String, String>,
-    /// The last good clock reading (unix seconds). A clock that fails later in the run reuses
+    /// The last good clock reading (nanoseconds since the epoch). A clock that fails later in the run reuses
     /// it, so no stamp is ever invented.
     clock: Cell<u64>,
 }
@@ -593,7 +586,7 @@ struct Facts {
 impl Exec<'_, '_> {
     /// The current time as a stamp, or the last good reading when the clock fails.
     fn now(&self) -> String {
-        if let Ok(t) = now_unix() {
+        if let Ok(t) = now_ns() {
             self.clock.set(t);
         }
         rfc3339(self.clock.get())
@@ -630,12 +623,24 @@ impl Exec<'_, '_> {
         recovery: Option<Recovery>,
         reason: Option<String>,
     ) -> Result<(), Refusal> {
+        self.journal_at(op, id, phase, recovery, reason, self.now())
+    }
+
+    fn journal_at(
+        &self,
+        op: &Operation,
+        id: &str,
+        phase: Phase,
+        recovery: Option<Recovery>,
+        reason: Option<String>,
+        at: String,
+    ) -> Result<(), Refusal> {
         self.run.store.append_journal(&JournalEntry {
-            schema: 1,
+            schema: SCHEMA,
             op_id: id.into(),
             op: step_name(op).into(),
             phase,
-            at: self.now(),
+            at,
             resource: op.resource.clone(),
             adapter: op.adapter.clone(),
             class: op.class,
@@ -812,6 +817,31 @@ impl Exec<'_, '_> {
         }
     }
 
+    /// Journals the failure of an effect after its intent: `failed`, or `unknown` with the
+    /// [`recover::UNCONFIRMED`] prefix when only durability is unconfirmed. A journal write
+    /// that fails too is named in the refusal. A merge keeps its crash block either way: its
+    /// path has no expected hash, so recovery cannot own it.
+    fn fail_after_intent(&mut self, op: &Operation, id: &str, abs: &str, e: Refusal) -> Ended {
+        let unconfirmed = e.code == Code::IoUnconfirmed;
+        // The journal keeps escaped text. The refusal keeps the raw text, which the command
+        // escapes once when it prints it.
+        let raw: String = e.detail.chars().take(1024).collect();
+        let why = dfm_model::display::bounded_visible(&e.detail, 1024);
+        let (phase, reason) = if unconfirmed {
+            (Phase::Unknown, format!("{}{why}", recover::UNCONFIRMED))
+        } else {
+            (Phase::Failed, why)
+        };
+        let e = match self.journal(op, id, phase, None, Some(reason)) {
+            Ok(()) => e,
+            Err(n) => Refusal::new(
+                e.code,
+                format!("{raw}; the outcome could not be journaled: {}", n.detail),
+            ),
+        };
+        self.after_intent(e, id, abs)
+    }
+
     fn try_op(&mut self, op: &Operation) -> Result<Ended, Ended> {
         // The gates admit one sensitive kind, the co-owned merge, which has its own path. Nothing
         // below hashes, fingerprints or journals the content of a sensitive path.
@@ -913,48 +943,26 @@ impl Exec<'_, '_> {
             }],
             snapshot: None,
         };
-        self.journal(op, &id, Phase::Intent, Some(recovery), None)
+        let at = self.now();
+        self.journal_at(op, &id, Phase::Intent, Some(recovery), None, at.clone())
             .map_err(|e| Ended::Failed(e, Some(id.clone())))?;
         // From here on the effect may have happened.
-        let effect = self.effect(
-            op,
-            rel,
-            &abs,
-            &parent,
-            name,
-            &live,
-            facts.ledger_fp.as_deref(),
-            bytes.as_deref(),
-            new_fp.as_deref(),
-        );
+        let effect = crate::fsys::staged_as(&id, &at, || {
+            self.effect(
+                op,
+                rel,
+                &abs,
+                &parent,
+                name,
+                &live,
+                facts.ledger_fp.as_deref(),
+                bytes.as_deref(),
+                new_fp.as_deref(),
+            )
+        });
         let removed_fp = match effect {
             Ok(fp) => fp,
-            Err(e) => {
-                let unconfirmed = e.code == Code::IoUnconfirmed;
-                // The journal keeps escaped text. The refusal keeps the raw text, which the
-                // command escapes once when it prints it.
-                let raw: String = e.detail.chars().take(1024).collect();
-                let why = dfm_model::display::bounded_visible(&e.detail, 1024);
-                let phase = if unconfirmed {
-                    Phase::Unknown
-                } else {
-                    Phase::Failed
-                };
-                let reason = if unconfirmed {
-                    format!("{}{why}", recover::UNCONFIRMED)
-                } else {
-                    why.clone()
-                };
-                let note = self.journal(op, &id, phase, None, Some(reason));
-                let e = match note {
-                    Ok(()) => e,
-                    Err(n) => Refusal::new(
-                        e.code,
-                        format!("{raw}; the outcome could not be journaled: {}", n.detail),
-                    ),
-                };
-                return Err(self.after_intent(e, &id, &abs));
-            }
+            Err(e) => return Err(self.fail_after_intent(op, &id, &abs, e)),
         };
         // The effect is read back. Now the outcome entry, then ownership.
         let published = op.action.publishes();
@@ -1173,27 +1181,14 @@ impl Exec<'_, '_> {
             }],
             snapshot: None,
         };
-        self.journal(op, &id, Phase::Intent, Some(recovery), None)
+        let at = self.now();
+        self.journal_at(op, &id, Phase::Intent, Some(recovery), None, at.clone())
             .map_err(|e| Ended::Failed(e, Some(id.clone())))?;
-        let effect = self.merge_effect(rel, parent, name, read, &merged.bytes, merged.changed);
+        let effect = crate::fsys::staged_as(&id, &at, || {
+            self.merge_effect(rel, parent, name, read, &merged.bytes, merged.changed)
+        });
         if let Err(e) = effect {
-            let unconfirmed = e.code == Code::IoUnconfirmed;
-            let raw: String = e.detail.chars().take(1024).collect();
-            let why = dfm_model::display::bounded_visible(&e.detail, 1024);
-            let phase = if unconfirmed {
-                Phase::Unknown
-            } else {
-                Phase::Failed
-            };
-            let note = self.journal(op, &id, phase, None, Some(why.clone()));
-            let e = match note {
-                Ok(()) => e,
-                Err(n) => Refusal::new(
-                    e.code,
-                    format!("{raw}; the outcome could not be journaled: {}", n.detail),
-                ),
-            };
-            return Err(self.after_intent(e, &id, abs));
+            return Err(self.fail_after_intent(op, &id, abs, e));
         }
         let settled = self
             .journal(op, &id, Phase::Done, None, None)
@@ -1285,33 +1280,20 @@ impl Exec<'_, '_> {
         abs: &str,
         coowned: CoOwned,
     ) -> Result<(), Refusal> {
-        let mut ledger = self.run.store.read_ledger_lenient()?;
-        let mut outs = ledger
-            .resources
-            .iter()
-            .find(|r| r.resource == op.resource)
-            .map(|r| r.owned_outputs.clone())
-            .unwrap_or_default();
-        let want = fold(abs);
-        outs.retain(|o| fold(&o.path) != want);
-        outs.push(OwnedOutput {
+        let out = OwnedOutput {
             path: abs.into(),
             mode: dfm_model::merge::MODE,
             fingerprint: None,
             coowned: Some(coowned),
-        });
-        outs.sort_by(|a, b| a.path.cmp(&b.path));
-        ledger.record(LedgerResource {
-            resource: op.resource.clone(),
-            adapter: op.adapter.clone(),
-            class: Class::Sensitive,
-            op_id: id.into(),
-            owned_outputs: outs,
-        })?;
-        self.run.store.write_ledger(&ledger)
+        };
+        let who = (op.resource.as_str(), op.adapter.as_str(), op.class);
+        recover::record_output(self.run.store, who, id, out)
     }
 
-    /// The outcome entry, then ownership: the ledger changes only after `done`.
+    /// The outcome entry and ownership. A create or remove changes the ledger after `done`. An
+    /// update or replace already has a ledger entry with the old fingerprint, so the ledger
+    /// moves first: a crash or a failed write then leaves an open intent, and recovery repairs
+    /// the fingerprint. The other order would leave `done` with a stale fingerprint.
     fn settle_outcome(
         &self,
         op: &Operation,
@@ -1321,9 +1303,7 @@ impl Exec<'_, '_> {
         generated: bool,
         new_fp: Option<&str>,
     ) -> Result<(), Refusal> {
-        self.journal(op, id, Phase::Done, None, None)?;
-        self.run.fail.hit("apply-after-done")?;
-        match op.action {
+        let own = || match op.action {
             Action::Remove => self.forget_output(op, id, abs),
             _ if records => {
                 let mode = if generated {
@@ -1334,7 +1314,14 @@ impl Exec<'_, '_> {
                 self.record_output(op, id, abs, new_fp.unwrap_or_default(), mode)
             }
             _ => Ok(()),
+        };
+        let ledger_first = matches!(op.action, Action::UpdateFile | Action::ReplaceLink);
+        if ledger_first {
+            own()?;
         }
+        self.journal(op, id, Phase::Done, None, None)?;
+        self.run.fail.hit("apply-after-done")?;
+        if ledger_first { Ok(()) } else { own() }
     }
 
     /// The effect, then its read-back. For a removal it returns the fingerprint of what was
@@ -1498,7 +1485,13 @@ impl Exec<'_, '_> {
         mode: u32,
     ) -> Result<(), Refusal> {
         let who = (op.resource.as_str(), op.adapter.as_str(), op.class);
-        recover::record_output(self.run.store, who, id, abs, fp, mode)
+        let out = OwnedOutput {
+            path: abs.into(),
+            mode,
+            fingerprint: Some(fp.into()),
+            coowned: None,
+        };
+        recover::record_output(self.run.store, who, id, out)
     }
 
     /// Drops one output from the ledger, and the resource when it owns nothing else.
@@ -1610,6 +1603,7 @@ fn settle(ex: &mut Exec<'_, '_>) -> Result<(), Refusal> {
         let w = (&ex.run.sys, ex.run.home, ex.run.home_path);
         recover::settle_all(ex.run.store, w, &planned)?
     };
+    ex.warnings = settled.warnings;
     for o in settled.open {
         if o.has_paths {
             for p in o.paths {
@@ -1694,11 +1688,12 @@ pub fn apply(run: &Run<'_>, plan: &Plan) -> Result<Report, Refusal> {
 
 fn execute(run: &Run<'_>, plan: &Plan) -> Report {
     // Without a clock no time stamp is invented: the run does not start.
-    let clock = now_unix();
+    let clock = now_ns();
     let mut ex = Exec {
         run,
         plan,
         repaired: 0,
+        warnings: Vec::new(),
         attempts: BTreeMap::new(),
         unknown_paths: BTreeMap::new(),
         unknown_resources: BTreeMap::new(),
@@ -1802,5 +1797,6 @@ fn execute(run: &Run<'_>, plan: &Plan) -> Report {
         operations: records,
         stopped: crate::signal::requested().or(stopped),
         repaired: ex.repaired,
+        warnings: ex.warnings,
     }
 }

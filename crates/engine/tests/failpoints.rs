@@ -268,6 +268,29 @@ fn a_refusal_before_anything_was_created_still_exits_3() {
 }
 
 #[test]
+fn a_snapshot_payload_failure_after_its_directory_was_made_is_a_post_mutation_refusal() {
+    let h = Home::new();
+    let (s, _) = init(&h);
+    drop(s);
+    let s = Store::open_write(
+        sys(&h),
+        &h.layout(),
+        Fail::at("snapshot-before-write", Action::Error),
+    )
+    .unwrap();
+    let e = s
+        .write_snapshot("run-1", "core-x", b"old", dfm_model::state::Class::Normal)
+        .unwrap_err();
+    assert!(
+        h.0.join(".local/state/dotfiles-manager/state/snapshots/run-1")
+            .is_dir()
+    );
+    assert!(e.mutated, "the directory was created");
+    assert_eq!(e.exit(), dfm_model::Exit::Failed);
+    assert!(s.mutated());
+}
+
+#[test]
 fn a_new_directory_is_opened_under_a_restrictive_umask() {
     const CHILD: &str = "DFM_UMASK_CHILD";
     const NAME: &str = "a_new_directory_is_opened_under_a_restrictive_umask";

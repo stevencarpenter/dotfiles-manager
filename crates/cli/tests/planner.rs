@@ -1698,6 +1698,37 @@ mod synthetic {
     }
 
     #[test]
+    fn a_merge_over_a_present_file_owned_by_another_resource_is_blocked_by_the_planner() {
+        use dfm_model::plan::{MergeFact, MergeVerdict};
+        const T: &str = ".claude/settings.json";
+        let (r, mut obs) = observed();
+        put(&mut obs, ".claude", dir(true), None);
+        put(&mut obs, T, file(true, 0o600), None);
+        let merge = BTreeMap::from([(
+            "agents.claude-settings".to_string(),
+            MergeFact {
+                managed_sha256: "0".repeat(64),
+                sets: vec![],
+                handlers: 0,
+                fragments: vec![],
+                verdict: MergeVerdict::Write,
+            },
+        )]);
+        let ledger = vec![owned("gone.res", T, None)];
+        let p = plan_full(&r, &obs, ledger, BTreeMap::new(), merge);
+        let (code, got) = blocker_at(&p, "agents.claude-settings", "target");
+        assert_eq!(code, Code::Conflict);
+        assert_eq!(
+            got,
+            ".claude/settings.json is recorded in the ledger as an output of gone.res"
+        );
+        assert_eq!(
+            action_of(&p, &format!("agents.claude-settings@{T}")),
+            (Action::None, Status::Blocked)
+        );
+    }
+
+    #[test]
     fn an_incomplete_listing_says_why() {
         use dfm_model::plan::{Incomplete, Listing};
         for (why, text) in [
@@ -3229,4 +3260,75 @@ fn a_link_parent_that_leaves_home_is_a_parent_refusal_not_an_overlap() {
     assert_eq!(code(&o), 3, "{}{}", text(&o.stdout), text(&o.stderr));
     let b = &s.plan.blockers[0];
     assert_eq!(b.code.as_str(), "E_PARENT_UNSAFE", "{b:?}");
+}
+
+#[test]
+fn a_merge_over_a_stale_owner_retires_it_or_blocks_with_a_fix_that_works() {
+    let e = Env::personal();
+    e.mkdirs(".claude");
+    let out = e.h(".claude/settings.json");
+    record(&e, "gone.res", &out, "{}");
+    // The old owner's file is present: blocked, and the fix text is "move the file aside".
+    let o = e.plan(&[]);
+    assert_eq!(code(&o), 3, "{}", text(&o.stderr));
+    assert!(
+        text(&o.stderr).contains("move the file aside"),
+        "{}",
+        text(&o.stderr)
+    );
+    // Following the text: the next plan retires the stale entry before the merge, and apply
+    // writes the file with the new owner only.
+    fs::rename(&out, e.h(".claude/settings.old")).unwrap();
+    let (o, s) = e.saved();
+    assert_eq!(code(&o), 0, "{}", text(&o.stderr));
+    let pos = |pre: &str| {
+        s.plan
+            .operations
+            .iter()
+            .position(|o| o.id.starts_with(pre))
+            .unwrap()
+    };
+    assert!(pos("remove@gone.res@") < pos("agents.claude-settings@"));
+    let d = s.plan_digest;
+    let o = e.run(&[
+        "apply",
+        "--root",
+        e.root.to_str().unwrap(),
+        "--yes-plan",
+        &d,
+    ]);
+    assert_eq!(code(&o), 0, "{}\n{}", text(&o.stdout), text(&o.stderr));
+    assert!(out.is_file());
+    let ledger =
+        fs::read_to_string(e.h(".local/state/dotfiles-manager/state/ledger.json")).unwrap();
+    assert!(!ledger.contains("gone.res"), "{ledger}");
+}
+
+#[test]
+fn a_merge_retires_a_missing_output_of_a_selected_owner_that_moved_its_claim() {
+    let e = Env::personal();
+    e.mkdirs(".claude");
+    let out = e.h(".claude/settings.json");
+    // A still selected resource once owned this path and now claims another one. The file is gone.
+    record(&e, "core.git-defaults", &out, "{}");
+    fs::remove_file(&out).unwrap();
+    let (o, s) = e.saved();
+    assert_eq!(code(&o), 0, "{}", text(&o.stderr));
+    let pos = |pre: &str| {
+        s.plan
+            .operations
+            .iter()
+            .position(|o| o.id.starts_with(pre))
+            .unwrap()
+    };
+    assert!(pos("remove@core.git-defaults@.claude/settings.json") < pos("agents.claude-settings@"));
+    let o = e.run(&[
+        "apply",
+        "--root",
+        e.root.to_str().unwrap(),
+        "--yes-plan",
+        &s.plan_digest,
+    ]);
+    assert_eq!(code(&o), 0, "{}\n{}", text(&o.stdout), text(&o.stderr));
+    assert!(out.is_file());
 }

@@ -19,12 +19,19 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
-/// Seconds since the epoch. A clock before 1970 is an error, never a silent zero.
-pub fn now_unix() -> Result<u64, Refusal> {
+/// Nanoseconds since the epoch. A clock before 1970 or after 2554 is an error, never a silent
+/// zero.
+pub fn now_ns() -> Result<u64, Refusal> {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .map_err(|_| Refusal::new(Code::IoFailed, "the system clock is before 1970"))
+        .ok()
+        .and_then(|d| u64::try_from(d.as_nanos()).ok())
+        .ok_or_else(|| {
+            Refusal::new(
+                Code::IoFailed,
+                "the system clock is before 1970 or after 2554",
+            )
+        })
 }
 
 const STATE: &str = "state";
@@ -102,10 +109,6 @@ impl Finding {
     }
 }
 
-fn rel_of(layout: &Layout, p: &Path) -> Result<Vec<String>, Refusal> {
-    below(&layout.home, p)
-}
-
 impl Store {
     /// Opens HOME and walks to the state root, creating directories when `create` is set.
     fn locate(
@@ -114,7 +117,7 @@ impl Store {
         home: &Dir,
         create: bool,
     ) -> Result<Option<(Dir, String, Dir)>, Refusal> {
-        let mut rel = rel_of(layout, &layout.state_root)?;
+        let mut rel = below(&layout.home, &layout.state_root)?;
         let Some(name) = rel.pop() else {
             return Err(storage("the state root is HOME itself"));
         };
@@ -138,7 +141,7 @@ impl Store {
         let (root_parent, root_name, root) = located;
         let canon = home.shown().to_path_buf();
         let join = |p: &Path| -> Result<PathBuf, Refusal> {
-            Ok(rel_of(layout, p)?
+            Ok(below(&layout.home, p)?
                 .iter()
                 .fold(canon.clone(), |a, c| a.join(c)))
         };
@@ -228,6 +231,38 @@ impl Store {
         Ok(s.attach_state(false, false)?.then_some(s))
     }
 
+    /// `E_LOCKED` when a writer holds the manager lock. Creates nothing and does not wait. The
+    /// returned shared lock (none when no lock file exists) stays held until it is dropped.
+    pub fn probe_writer(sys: &Sys, layout: &Layout) -> Result<Option<std::fs::File>, Refusal> {
+        let home = Dir::open_home(sys, &layout.home)?;
+        let mut rel = below(&layout.home, &layout.lock_file)?;
+        let Some(name) = rel.pop() else {
+            return Err(storage("the lock file is HOME itself"));
+        };
+        match home.walk(sys, &rel, rel.len(), false)? {
+            Some(dir) => Lock::probe(sys, &dir, &name),
+            None => Ok(None),
+        }
+    }
+
+    /// `E_LOCKED` unless the lock file still is the file `guard` (from [`Store::probe_writer`])
+    /// holds. A reader calls it after its read, so a lock file replaced meanwhile is not taken
+    /// for a held lock.
+    pub fn recheck_probe(sys: &Sys, layout: &Layout, guard: &std::fs::File) -> Result<(), Refusal> {
+        let home = Dir::open_home(sys, &layout.home)?;
+        let mut rel = below(&layout.home, &layout.lock_file)?;
+        let Some(name) = rel.pop() else {
+            return Err(storage("the lock file is HOME itself"));
+        };
+        match home.walk(sys, &rel, rel.len(), false)? {
+            Some(dir) => Lock::still_current(&dir, &name, guard),
+            None => Err(Refusal::new(
+                Code::Locked,
+                "the lock directory was removed while it was held; run the command again",
+            )),
+        }
+    }
+
     /// Opens for writing and may create the state root: see [`Store::open_write_with`].
     pub fn open_write(sys: Sys, layout: &Layout, fail: Fail) -> Result<Store, Refusal> {
         Self::open_write_with(sys, layout, fail, true)
@@ -269,7 +304,7 @@ impl Store {
             )
         };
         let home = Dir::open_home(&sys, &layout.home)?;
-        let mut lock_rel = rel_of(layout, &layout.lock_file)?;
+        let mut lock_rel = below(&layout.home, &layout.lock_file)?;
         let Some(lock_name) = lock_rel.pop() else {
             return Err(storage("the lock file is HOME itself"));
         };
@@ -293,11 +328,6 @@ impl Store {
             .verify()
     }
 
-    /// The held directory still has the owner and mode it was opened with.
-    fn held_ok(&self, d: &Dir, private: bool) -> Result<(), Refusal> {
-        d.recheck(&self.sys, private)
-    }
-
     /// Run immediately before every write. The lock file is still the locked one. The state root
     /// and `state/` that this store holds are still the entries their paths name (a swap is
     /// refused) and still have the right owner and mode. Returns the subdirectory `sub`, opened
@@ -309,12 +339,12 @@ impl Store {
         if self.root_parent.entry_ident(&self.root_name)? != Some(self.root.ident()?) {
             return Err(replaced("the state root"));
         }
-        self.held_ok(&self.root, true)?;
+        self.root.recheck(&self.sys, true)?;
         let state = self.state()?;
         if self.root.entry_ident(STATE)? != Some(state.ident()?) {
             return Err(replaced("the state directory"));
         }
-        self.held_ok(state, true)?;
+        state.recheck(&self.sys, true)?;
         match sub {
             None => Ok(None),
             Some(s) => state
@@ -351,7 +381,7 @@ impl Store {
                 "the state root was replaced or removed; init stops",
             ));
         }
-        self.held_ok(&self.root, true)?;
+        self.root.recheck(&self.sys, true)?;
         if let Some(state) = &self.state
             && !state.list()?.names.is_empty()
         {
@@ -374,7 +404,7 @@ impl Store {
         for d in SUBDIRS {
             staging.child(&self.sys, d, true, true)?;
         }
-        let doc = StateDoc::new(stamp.clone(), now_unix()?);
+        let doc = StateDoc::new(stamp.clone(), now_ns()?);
         staging.publish_new("state.json", &canonical(&doc)?, &self.fail, "init-state")?;
         staging.publish_new(
             "ledger.json",
@@ -669,21 +699,29 @@ impl Store {
         self.mutated.load(Ordering::SeqCst)
     }
 
+    /// Records a mutation outside the state files, such as removing a staged output.
+    pub(crate) fn mark_mutated(&self) {
+        self.mutated.store(true, Ordering::SeqCst);
+    }
+
     /// Wraps a write. The first write that took effect (or whose outcome is unconfirmed) sets the
     /// flag, and every refusal after that is stamped as happening after a mutation (exit 1).
     fn wrote<T>(&self, r: Result<T, Refusal>) -> Result<T, Refusal> {
         match &r {
-            Ok(_) => self.mutated.store(true, Ordering::SeqCst),
-            Err(e) if e.code == Code::IoUnconfirmed => self.mutated.store(true, Ordering::SeqCst),
+            Ok(_) => self.mark_mutated(),
+            Err(e) if e.code == Code::IoUnconfirmed => self.mark_mutated(),
             Err(_) => {}
         }
-        r.map_err(|e| {
-            if self.mutated() {
-                e.after_mutation()
-            } else {
-                e
-            }
-        })
+        r.map_err(|e| self.stamp(e))
+    }
+
+    /// A refusal after this store wrote anything exits 1, not 3 (architecture section 10).
+    pub fn stamp(&self, r: Refusal) -> Refusal {
+        if self.mutated() {
+            r.after_mutation()
+        } else {
+            r
+        }
     }
 
     /// A claim must lie inside HOME and outside the manager's own paths, as written and after the
@@ -833,7 +871,7 @@ impl Store {
         // The cut cannot be undone. If the record fails, the removed text stays in `TORN` and
         // the error carries the start of it.
         let record = || -> Result<(), Refusal> {
-            let at = now_unix()?;
+            let at = now_ns()?;
             self.append_journal(&JournalEntry {
                 schema: state::SCHEMA,
                 op_id: format!("journal-repair-{at}"),
@@ -1027,9 +1065,13 @@ impl Store {
                 "the snapshot is over the write cap",
             ));
         }
-        let dir = snaps
-            .child(&self.sys, op_id, true, true)?
-            .ok_or_else(|| storage("cannot create the snapshot directory"))?;
+        reset_created();
+        let made = snaps.child(&self.sys, op_id, true, true);
+        // A directory made here is a write even if the payload then fails.
+        if created() {
+            self.mutated.store(true, Ordering::SeqCst);
+        }
+        let dir = made?.ok_or_else(|| storage("cannot create the snapshot directory"))?;
         if dir.publish_new(name, bytes, &self.fail, "snapshot")? {
             Ok(())
         } else {
@@ -1039,8 +1081,9 @@ impl Store {
 
     /// Settles each interrupted operation by asking `probe` (the operation's `already_done`
     /// check) and journaling the answer. It never runs an operation again, never edits the ledger
-    /// and never creates ownership or delete authority: a finished operation becomes owned only
-    /// when a normal run records it. Returns `(op_id, op, phase)` for each entry written.
+    /// itself (the probe may move an owned fingerprint, see `recover`) and never creates
+    /// ownership or delete authority: a finished operation becomes owned only when a normal run
+    /// records it. Returns `(op_id, op, phase)` for each entry written.
     pub fn reconcile(
         &self,
         probe: &dyn Fn(&JournalEntry) -> Probe,
@@ -1056,7 +1099,7 @@ impl Store {
             };
             let e = JournalEntry {
                 phase,
-                at: state::rfc3339(now_unix()?),
+                at: state::rfc3339(now_ns()?),
                 recovery: None,
                 token: None,
                 reason: Some(why.into()),

@@ -4,13 +4,13 @@
 //! ledger and the receipt.
 
 use super::super::{Ctx, bounded, flags, header, read_existing_binding, usage};
-use dfm_engine::{Fail, Probe, Store, now_unix};
+use dfm_engine::{Fail, Probe, Store, now_ns};
 use dfm_model::binding::Binding;
 use dfm_model::plan::file_fingerprint;
 use dfm_model::state::{
     Baseline, BaselinePath, BinaryId, Class, JournalEntry, LedgerResource, OperationRecord,
-    OwnedOutput, Phase, ProfileRef, Receipt, Recovery, RecoveryOutput, RunResult, Stamp, Status,
-    TrialRecord, redact, rfc3339,
+    OwnedOutput, Phase, ProfileRef, Receipt, Recovery, RecoveryOutput, RunResult, SCHEMA, Stamp,
+    Status, TrialRecord, redact, rfc3339,
 };
 use dfm_model::{Code, Refusal};
 use std::fs;
@@ -42,7 +42,7 @@ fn io(what: &str, e: &std::io::Error) -> Refusal {
 fn op_id(given: Option<String>) -> Result<String, Refusal> {
     Ok(match given {
         Some(g) => g,
-        None => format!("run-{}-{}", now_unix()?, std::process::id()),
+        None => format!("run-{}-{}", now_ns()?, std::process::id()),
     })
 }
 
@@ -87,8 +87,10 @@ pub fn record_op(ctx: &Ctx, args: &[String], out: &mut dyn Write) -> Result<(), 
     header(out, ctx).map_err(|e| io("output", &e))?;
     // `--at` fixes the start time so a test can make two runs collide on one receipt name.
     let started = match at {
-        Some(t) => t.parse().map_err(|_| usage("--at is a unix time"))?,
-        None => now_unix()?,
+        Some(t) => t
+            .parse()
+            .map_err(|_| usage("--at is a unix time in nanoseconds"))?,
+        None => now_ns()?,
     };
     if Path::new(&output).symlink_metadata().is_ok() {
         return Err(Refusal::new(
@@ -97,10 +99,10 @@ pub fn record_op(ctx: &Ctx, args: &[String], out: &mut dyn Write) -> Result<(), 
         ));
     }
     let digest = file_fingerprint(content.as_bytes());
-    let now = || now_unix().map(rfc3339);
+    let now = || now_ns().map(rfc3339);
     let entry = |phase, recovery, reason| -> Result<JournalEntry, Refusal> {
         Ok(JournalEntry {
-            schema: 1,
+            schema: SCHEMA,
             op_id: id.clone(),
             op: "op1".into(),
             phase,
@@ -186,7 +188,7 @@ pub fn record_op(ctx: &Ctx, args: &[String], out: &mut dyn Write) -> Result<(), 
             reload: None,
         }];
         let receipt = Receipt {
-            schema: 1,
+            schema: SCHEMA,
             op_id: id.clone(),
             command: "record-op".into(),
             started_at: rfc3339(started),
@@ -269,11 +271,11 @@ pub fn record_trial(ctx: &Ctx, args: &[String], out: &mut dyn Write) -> Result<(
     let (store, binding) = open_bound(ctx, super::fail_from_env()?, Vec::new())?;
     let existing = read_regular(&path)?;
     let trial = TrialRecord {
-        schema: 1,
+        schema: SCHEMA,
         binding: Stamp::of(&binding),
         trial_id: id.clone(),
         tool,
-        created_unix: now_unix()?,
+        created_unix_ns: now_ns()?,
         baseline: Baseline {
             tool_preexisting: false,
             paths: vec![BaselinePath {

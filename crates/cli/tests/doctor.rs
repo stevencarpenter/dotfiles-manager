@@ -390,18 +390,13 @@ fn an_unbound_machine_reports_the_binding_and_exits_1() {
 // ---- not applicable -----------------------------------------------------------------------
 
 #[test]
-fn sensitive_and_generated_resources_are_not_applicable_and_read_no_content() {
+fn sensitive_resources_are_not_applicable_and_read_no_content() {
     let fx = personal();
     let (_, rows) = fx.rows();
     let na = |c: &str| rows.iter().filter(|r| r["code"] == c).collect::<Vec<_>>();
     assert!(!na("D_NA_SENSITIVE").is_empty(), "{rows:#?}");
-    assert!(!na("D_NA_GENERATED").is_empty(), "{rows:#?}");
     assert!(na("D_NA_SENSITIVE").iter().all(|r| r["status"] == "N/A"));
-    assert!(
-        na("D_NA_GENERATED")
-            .iter()
-            .all(|r| r["status"] == "N/A" && r["detail"].as_str().unwrap().contains("no generator"))
-    );
+    assert!(na("D_NA_GENERATED").is_empty(), "{rows:#?}");
     // Tools and applications are not probed: UNKNOWN, and not required.
     let probe = na("D_PROBING_NOT_BUILT");
     assert!(!probe.is_empty());
@@ -409,6 +404,28 @@ fn sensitive_and_generated_resources_are_not_applicable_and_read_no_content() {
         probe
             .iter()
             .all(|r| r["status"] == "UNKNOWN" && r["required"] == false)
+    );
+}
+
+#[test]
+fn a_generated_output_reaches_the_pending_and_missing_rows() {
+    let fx = personal();
+    let (_, rows) = fx.rows();
+    assert_eq!(
+        status(&rows, ".codex/AGENTS.md"),
+        ("WARN", "D_PLAN_PENDING")
+    );
+    let o = fx.run(&["plan", "--root", fx.root_arg(), "--json"]);
+    let digest = dfm_model::plan::Saved::parse(&o.stdout)
+        .unwrap()
+        .plan_digest;
+    let o = fx.run(&["apply", "--root", fx.root_arg(), "--yes-plan", &digest]);
+    assert_eq!(code(&o), 0, "{}\n{}", text(&o.stderr), text(&o.stdout));
+    fs::remove_file(fx.h(".codex/AGENTS.md")).unwrap();
+    let (_, rows) = fx.rows();
+    assert_eq!(
+        status(&rows, ".codex/AGENTS.md"),
+        ("WARN", "D_OUTPUT_MISSING")
     );
 }
 
@@ -832,6 +849,86 @@ fn a_stray_state_entry_is_a_partial_warning() {
 }
 
 #[test]
+fn a_staged_copy_of_an_older_format_beside_an_owned_output_is_a_warning_and_is_kept() {
+    let fx = applied();
+    let (_, rows) = fx.rows();
+    let owned = rows
+        .iter()
+        .find(|r| r["kind"] == "output" && r["status"] == "OK")
+        .unwrap()["subject"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let (dir, name) = owned.rsplit_once('/').unwrap_or(("", &owned));
+    let parent = if dir.is_empty() { fx.h("") } else { fx.h(dir) };
+    let decoy = parent.join(format!(".{name}.1.2.3.tmp"));
+    let current = parent.join(format!(".{name}.0123456789abcdef.tmp"));
+    fs::write(&decoy, "mine\n").unwrap();
+    fs::write(&current, "tagged\n").unwrap();
+    let (c, rows) = fx.rows();
+    assert_eq!(c, 0, "{rows:#?}");
+    let staged: Vec<&Value> = rows
+        .iter()
+        .filter(|r| r["code"] == "D_STAGED_COPY")
+        .collect();
+    assert_eq!(staged.len(), 1, "{rows:#?}");
+    assert_eq!(staged[0]["status"], "WARN");
+    assert!(
+        staged[0]["subject"]
+            .as_str()
+            .unwrap()
+            .ends_with(&format!(".{name}.1.2.3.tmp"))
+    );
+    assert_eq!(
+        staged[0]["fix"],
+        "A staged copy from an interrupted run; check it, then remove it by hand."
+    );
+    assert_eq!(
+        fs::read_to_string(&decoy).unwrap(),
+        "mine\n",
+        "doctor deletes nothing"
+    );
+    assert_eq!(fs::read_to_string(&current).unwrap(), "tagged\n");
+}
+
+#[test]
+fn a_cut_directory_listing_gets_its_own_partial_warning() {
+    let fx = applied();
+    let (_, rows) = fx.rows();
+    let owned = rows
+        .iter()
+        .find(|r| r["kind"] == "output" && r["status"] == "OK")
+        .unwrap()["subject"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let (dir, name) = owned.rsplit_once('/').unwrap_or(("", &owned));
+    let parent = if dir.is_empty() { fx.h("") } else { fx.h(dir) };
+    fs::write(parent.join(format!(".{name}.7.8.9.tmp")), "x").unwrap();
+    let o = fx.run_env(
+        &[("DFM_STRAY_SCAN_MAX", "1")],
+        &["doctor", "--root", fx.root_arg(), "--json"],
+    );
+    let v: Value = serde_json::from_slice(&o.stdout).unwrap();
+    let cut: Vec<&Value> = v["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|r| {
+            r["code"] == "D_STAGED_COPY" && r["detail"].as_str().unwrap().contains("was cut")
+        })
+        .collect();
+    let mine: Vec<&&Value> = cut.iter().filter(|r| r["subject"] == dir).collect();
+    assert_eq!(mine.len(), 1, "{v:#}");
+    let cut = mine;
+    assert_eq!(
+        (cut[0]["status"].as_str(), cut[0]["partial"].as_bool()),
+        (Some("WARN"), Some(true))
+    );
+    assert_eq!(code(&o), 0, "a WARN row does not change the exit");
+}
+
+#[test]
 fn no_receipt_is_not_applicable_and_a_failed_last_run_is_a_warning() {
     let fx = Fx::new();
     let (_, rows) = fx.rows();
@@ -1210,4 +1307,20 @@ fn an_unusable_root_is_a_row_and_exit_1_whether_or_not_home_is_usable() {
     assert_eq!(code(&o), 1, "{}", text(&o.stderr));
     assert!(text(&o.stderr).contains("E_DIAGNOSED"));
     assert!(text(&o.stdout).contains("ERROR   E_HOME_MISMATCH binding"));
+}
+
+#[test]
+fn a_path_handed_to_a_new_owner_is_pending_not_gone() {
+    let fx = personal();
+    own(&fx, "old-owner", "normal", ".codex/AGENTS.md");
+    let (_, rows) = fx.rows();
+    assert_eq!(
+        status(&rows, ".codex/AGENTS.md"),
+        ("WARN", "D_PLAN_PENDING")
+    );
+    let detail = at(&rows, ".codex/AGENTS.md")["detail"].as_str().unwrap();
+    assert!(
+        detail.contains("owned by old-owner") && detail.contains("takes the path over"),
+        "{detail}"
+    );
 }
