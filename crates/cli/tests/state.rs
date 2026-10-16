@@ -2064,3 +2064,58 @@ fn recover_does_not_advise_resolving_a_multi_path_entry_as_done() {
         text(&d.stderr)
     );
 }
+
+#[test]
+fn recover_warns_when_the_parent_of_a_staged_copy_cannot_be_opened() {
+    use dfm_model::state::{Class, JournalEntry, Phase, Recovery, RecoveryOutput};
+
+    let h = bound_home("recovery-sweep-parent");
+    let real = h.path().join("real");
+    fs::create_dir(&real).unwrap();
+    // By the time recovery runs, the parent named by the intent is a link, which the sweep
+    // does not follow.
+    symlink("real", h.path().join("dir")).unwrap();
+    let intent = JournalEntry {
+        schema: dfm_model::state::SCHEMA,
+        op_id: "sweep-2".into(),
+        op: "create-file".into(),
+        phase: Phase::Intent,
+        at: "2026-10-10T00:00:00.000000000Z".into(),
+        resource: "core.x".into(),
+        adapter: "git-config/v1".into(),
+        class: Class::Normal,
+        recovery: Some(Recovery {
+            outputs: vec![RecoveryOutput {
+                path: out_file(h.path(), "dir/file"),
+                existed_before: false,
+                expected_sha256: Some(fp_hex("staged")),
+            }],
+            snapshot: None,
+        }),
+        token: None,
+        reason: None,
+    };
+    let journal = state(h.path()).join("journal.jsonl");
+    fs::write(&journal, intent.to_line().unwrap()).unwrap();
+    let tag = sha_hex(&format!("{}\0{}", intent.op_id, intent.at));
+    let tmp = real.join(format!(".file.{}.tmp", &tag[..16]));
+    fs::write(&tmp, "staged").unwrap();
+
+    let r = run(h.path(), &["state", "recover"]);
+    let out = text(&r.stdout);
+    assert!(
+        out.contains("warning: could not open the parent of")
+            && out.contains("to remove the staged copies of sweep-2:")
+            && out.contains("is not a real directory"),
+        "{out}\n{}",
+        text(&r.stderr)
+    );
+    assert_eq!(
+        fs::read(&tmp).unwrap(),
+        b"staged",
+        "the staged copy is left where it is"
+    );
+    // The intent is closed, so this run's message was the one report of that copy.
+    let lines = fs::read_to_string(&journal).unwrap();
+    assert_eq!(lines.lines().count(), 2, "{lines}");
+}

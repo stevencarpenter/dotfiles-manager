@@ -274,12 +274,20 @@ fn sweep_stages(store: &Store, (sys, home, home_path): Where<'_>) -> Result<Vec<
         let Some((name, parents)) = comps.split_last() else {
             continue;
         };
-        if let Ok(parent) = home.open_below(sys, parents) {
-            let (removed, warnings) = parent.sweep_stages(sys, name, id, at);
-            if removed {
-                store.mark_mutated();
+        match home.open_below(sys, parents) {
+            Ok(parent) => {
+                let (removed, warnings) = parent.sweep_stages(sys, name, id, at);
+                if removed {
+                    store.mark_mutated();
+                }
+                left.extend(warnings);
             }
-            left.extend(warnings);
+            // The copy stays where it is. Settling still closes the intent, so this message is
+            // the only report of it: the sweep never looks for it again.
+            Err(e) => left.push(format!(
+                "could not open the parent of {abs} to remove the staged copies of {id}: {}",
+                e.detail
+            )),
         }
     }
     Ok(left)
