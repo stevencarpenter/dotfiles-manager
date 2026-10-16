@@ -307,6 +307,13 @@ pub struct Listing {
     pub odd: usize,
 }
 
+impl Listing {
+    /// Every entry read, with a UTF-8 name or not. The cap of [`Dir::list_upto`] counts these.
+    pub fn seen(&self) -> usize {
+        self.names.len() + self.odd
+    }
+}
+
 /// What `fstatat` found at one entry, without following it.
 #[derive(Debug)]
 pub enum Peek {
@@ -1114,8 +1121,9 @@ impl Dir {
         self.list_upto(usize::MAX)
     }
 
-    /// As [`Dir::list`], but stops after `max + 1` names, so a huge directory is not read into
-    /// memory. More than `max` names in the result means the listing was cut.
+    /// As [`Dir::list`], but stops after `max + 1` entries, so a huge directory is not read into
+    /// memory. Entries whose name is not UTF-8 count too. More than `max` entries
+    /// ([`Listing::seen`]) in the result means the listing was cut.
     pub fn list_upto(&self, max: usize) -> Result<Listing, Refusal> {
         LISTED.with(|c| c.set(c.get() + 1));
         let mut rd = rfs::Dir::read_from(&self.fd).map_err(|e| sys_err("list directory", e))?;
@@ -1131,7 +1139,7 @@ impl Dir {
                 Ok(s) => out.names.push(s.to_string()),
                 Err(_) => out.odd += 1,
             }
-            if out.names.len() > max {
+            if out.seen() > max {
                 break;
             }
         }

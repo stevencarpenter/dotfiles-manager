@@ -6,7 +6,8 @@
 
 use crate::{Ctx, Loaded, clip, header, load_resolved, plan_cmd, read_existing_binding, usage};
 use dfm_engine::{
-    Dir, Fail, Layout, Loaded as StateLoaded, Store, Sys, merge, observe, verify_identity,
+    Dir, Fail, Layout, Loaded as StateLoaded, Store, Sys, fsys::Listing, merge, observe,
+    verify_identity,
 };
 use dfm_model::binding::Binding;
 use dfm_model::doctor::{DoctorCode as D, Level, Report, Row};
@@ -459,14 +460,14 @@ fn staged_copy_rows(sys: Sys, layout: &Layout, rels: &BTreeSet<String>, rows: &m
         let Ok(listing) = dir.as_ref().unwrap_or(&home).list_upto(max) else {
             continue;
         };
-        rows.extend(scan_listing(parent, &names, &listing.names, max));
+        rows.extend(scan_listing(parent, &names, &listing, max));
     }
 }
 
 /// The rows for one directory: a staged copy of an older build for each entry that matches any
-/// of the owned `names` in it, and one row if `entries` is longer than `max` (the listing was
+/// of the owned `names` in it, and one row if the listing saw more than `max` entries (it was
 /// cut). `parent` is HOME-relative and empty for HOME itself.
-fn scan_listing(parent: &str, names: &[&str], entries: &[String], max: usize) -> Vec<Row> {
+fn scan_listing(parent: &str, names: &[&str], listing: &Listing, max: usize) -> Vec<Row> {
     let shown = |entry: &str| {
         if parent.is_empty() {
             entry.to_string()
@@ -475,7 +476,7 @@ fn scan_listing(parent: &str, names: &[&str], entries: &[String], max: usize) ->
         }
     };
     let mut rows = Vec::new();
-    if entries.len() > max {
+    if listing.seen() > max {
         rows.push(
             Row::new(
                 "output",
@@ -490,7 +491,7 @@ fn scan_listing(parent: &str, names: &[&str], entries: &[String], max: usize) ->
             .partial(),
         );
     }
-    for entry in entries.iter().take(max) {
+    for entry in listing.names.iter().take(max) {
         if let Some(name) = names.iter().find(|n| is_old_stage(entry, n)) {
             rows.push(Row::new(
                 "output",
@@ -1068,13 +1069,21 @@ fn owned_row(path: &str, who: &str, op: Option<&Operation>, live: Live) -> Row {
 
 #[cfg(test)]
 mod tests {
-    use super::{scan_listing, takes_slot};
+    use super::{Listing, scan_listing, takes_slot};
+
+    fn listing(names: &[&str], odd: usize) -> Listing {
+        Listing {
+            names: names.iter().map(|n| n.to_string()).collect(),
+            odd,
+        }
+    }
 
     #[test]
     fn one_listing_is_tested_against_every_owned_name_in_the_directory() {
-        let entries: Vec<String> = [".a.1.2.3.tmp", ".b.4.5.6.stage", ".c.1.2.3.tmp", "a", "b"]
-            .map(String::from)
-            .into();
+        let entries = listing(
+            &[".a.1.2.3.tmp", ".b.4.5.6.stage", ".c.1.2.3.tmp", "a", "b"],
+            0,
+        );
         let rows = scan_listing("d", &["a", "b"], &entries, 100);
         let subjects: Vec<&str> = rows.iter().map(|r| r.subject.as_str()).collect();
         assert_eq!(subjects, ["d/.a.1.2.3.tmp", "d/.b.4.5.6.stage"]);
@@ -1082,10 +1091,20 @@ mod tests {
 
     #[test]
     fn a_listing_longer_than_the_cap_adds_one_cut_row() {
-        let entries: Vec<String> = ["x", "y", "z"].map(String::from).into();
-        let rows = scan_listing("", &["x"], &entries, 2);
+        let rows = scan_listing("", &["x"], &listing(&["x", "y", "z"], 0), 2);
         assert_eq!(rows.len(), 1);
         assert!(rows[0].detail.contains("was cut") && rows[0].partial);
+    }
+
+    #[test]
+    fn names_that_are_not_utf8_count_toward_the_cap() {
+        // `list_upto` stops on the same count, so a cut made by such names is reported too.
+        let cut = listing(&["y"], 2);
+        assert_eq!(cut.seen(), 3);
+        let rows = scan_listing("", &["x"], &cut, 2);
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].detail.contains("was cut") && rows[0].partial);
+        assert!(scan_listing("", &["x"], &listing(&["y"], 1), 2).is_empty());
     }
 
     #[test]
