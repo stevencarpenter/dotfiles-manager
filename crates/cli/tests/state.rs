@@ -1538,6 +1538,76 @@ fn a_torn_journal_is_reported_and_reconcile_leaves_it_alone() {
 }
 
 #[test]
+fn recovery_counts_staged_copy_removals_before_a_journal_refusal() {
+    use dfm_model::state::{
+        Class, JournalEntry, MAX_JOURNAL_BYTES, Phase, Recovery, RecoveryOutput,
+    };
+
+    let h = bound_home("recovery-sweep-refusal");
+    let intent = JournalEntry {
+        schema: 1,
+        op_id: "sweep-1".into(),
+        op: "create-file".into(),
+        phase: Phase::Intent,
+        at: "2026-10-10T00:00:00.000000000Z".into(),
+        resource: "core.x".into(),
+        adapter: "git-config/v1".into(),
+        class: Class::Normal,
+        recovery: Some(Recovery {
+            outputs: vec![RecoveryOutput {
+                path: out_file(h.path(), "file"),
+                existed_before: false,
+                expected_sha256: Some(fp_hex("staged")),
+            }],
+            snapshot: None,
+        }),
+        token: None,
+        reason: None,
+    };
+    let tail = intent.to_line().unwrap();
+    let mut done = JournalEntry {
+        op_id: "closed-1".into(),
+        phase: Phase::Done,
+        recovery: None,
+        reason: Some("x".repeat(1024)),
+        ..intent.clone()
+    };
+    let line = done.to_line().unwrap();
+    let room = MAX_JOURNAL_BYTES as usize - tail.len();
+    let mut journal = line.repeat(room / line.len() - 1);
+    done.reason = Some("x".repeat(1024 + room % line.len()));
+    journal.extend(done.to_line().unwrap());
+    journal.extend(tail);
+    assert_eq!(journal.len(), MAX_JOURNAL_BYTES as usize);
+    let path = state(h.path()).join("journal.jsonl");
+    fs::write(&path, &journal).unwrap();
+
+    let tag = sha_hex(&format!("{}\0{}", intent.op_id, intent.at));
+    let tmp = h.path().join(format!(".file.{}.tmp", &tag[..16]));
+    let stage = tmp.with_extension("stage");
+    for (entry, exit) in [(None, 3), (Some(&tmp), 1), (Some(&stage), 1)] {
+        if let Some(entry) = entry {
+            if entry == &stage {
+                symlink("file", entry).unwrap();
+            } else {
+                fs::write(entry, "staged").unwrap();
+            }
+        }
+        let r = run(h.path(), &["state", "recover"]);
+        assert_eq!(r.status.code(), Some(exit), "{}", text(&r.stderr));
+        assert!(text(&r.stderr).contains("E_LIMIT_EXCEEDED"));
+        assert!(fs::symlink_metadata(&tmp).is_err());
+        assert!(fs::symlink_metadata(&stage).is_err());
+        assert_eq!(fs::read(&path).unwrap(), journal);
+    }
+    // A staged name that cannot be removed does not count as a mutation.
+    fs::create_dir(&tmp).unwrap();
+    let r = run(h.path(), &["state", "recover"]);
+    assert_eq!(r.status.code(), Some(3), "{}", text(&r.stderr));
+    assert!(tmp.is_dir());
+}
+
+#[test]
 fn recover_repairs_one_torn_final_journal_line_and_refuses_a_torn_middle_line() {
     let h = bound_home("torn-repair");
     let o = record(h.path(), "core.victim", "victim", "v");

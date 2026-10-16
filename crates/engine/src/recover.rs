@@ -275,7 +275,11 @@ fn sweep_stages(store: &Store, (sys, home, home_path): Where<'_>) -> Result<Vec<
             continue;
         };
         if let Ok(parent) = home.open_below(sys, parents) {
-            left.extend(parent.sweep_stages(sys, name, id, at));
+            let (removed, warnings) = parent.sweep_stages(sys, name, id, at);
+            if removed {
+                store.mark_mutated();
+            }
+            left.extend(warnings);
         }
     }
     Ok(left)

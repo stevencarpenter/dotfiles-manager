@@ -651,10 +651,17 @@ impl Dir {
 
     /// Removes the names an interrupted attempt `op_id` staged for `name` (see [`staged_as`]),
     /// and only those. Only a regular file or a link of the current user goes, without following
-    /// a link. The caller holds the writer lock, so no live publish owns such a name. Returns one
-    /// message for each name that exists and could not be removed.
-    pub(crate) fn sweep_stages(&self, sys: &Sys, name: &str, op_id: &str, at: &str) -> Vec<String> {
+    /// a link. The caller holds the writer lock, so no live publish owns such a name. Returns
+    /// whether anything was removed and a message for each name that could not be removed.
+    pub(crate) fn sweep_stages(
+        &self,
+        sys: &Sys,
+        name: &str,
+        op_id: &str,
+        at: &str,
+    ) -> (bool, Vec<String>) {
         let tag = stage_tag(op_id, at);
+        let mut removed = false;
         let mut left = Vec::new();
         for suffix in ["tmp", "stage"] {
             let staged = format!(".{name}.{tag}.{suffix}");
@@ -662,8 +669,11 @@ impl Dir {
             match self.peek(sys, &staged) {
                 Ok(Peek::Missing) => {}
                 Ok(Peek::File { own: true, .. } | Peek::Link { own: true, .. }) => {
-                    if let Err(e) = rfs::unlinkat(&self.fd, &staged, AtFlags::empty()) {
-                        left.push(format!("could not remove the staged copy {shown}: {e}"));
+                    match rfs::unlinkat(&self.fd, &staged, AtFlags::empty()) {
+                        Ok(()) => removed = true,
+                        Err(e) => {
+                            left.push(format!("could not remove the staged copy {shown}: {e}"));
+                        }
                     }
                 }
                 Ok(_) => left.push(format!(
@@ -672,7 +682,7 @@ impl Dir {
                 Err(e) => left.push(format!("could not inspect {shown}: {}", e.detail)),
             }
         }
-        left
+        (removed, left)
     }
 
     /// As [`Dir::write_temp`], with the mode the published file will have. The mode is set

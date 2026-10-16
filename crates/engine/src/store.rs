@@ -699,12 +699,17 @@ impl Store {
         self.mutated.load(Ordering::SeqCst)
     }
 
+    /// Records a mutation outside the state files, such as removing a staged output.
+    pub(crate) fn mark_mutated(&self) {
+        self.mutated.store(true, Ordering::SeqCst);
+    }
+
     /// Wraps a write. The first write that took effect (or whose outcome is unconfirmed) sets the
     /// flag, and every refusal after that is stamped as happening after a mutation (exit 1).
     fn wrote<T>(&self, r: Result<T, Refusal>) -> Result<T, Refusal> {
         match &r {
-            Ok(_) => self.mutated.store(true, Ordering::SeqCst),
-            Err(e) if e.code == Code::IoUnconfirmed => self.mutated.store(true, Ordering::SeqCst),
+            Ok(_) => self.mark_mutated(),
+            Err(e) if e.code == Code::IoUnconfirmed => self.mark_mutated(),
             Err(_) => {}
         }
         r.map_err(|e| self.stamp(e))
