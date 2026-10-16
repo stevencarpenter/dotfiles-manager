@@ -1140,8 +1140,8 @@ fn missing_corrupt_or_unsupported_state_grants_no_authority_and_is_not_rewritten
     let corrupt: [(&str, Option<&str>, &str); 4] = [
         ("missing", None, "E_STATE_INVALID"),
         ("garbage", Some("not json"), "E_STATE_INVALID"),
-        ("newer", Some("{\"schema\":2}"), "E_STATE_NEWER"),
-        ("old", Some("{\"schema\":0}"), "E_SCHEMA_UNSUPPORTED"),
+        ("newer", Some("{\"schema\":3}"), "E_STATE_NEWER"),
+        ("old", Some("{\"schema\":1}"), "E_SCHEMA_UNSUPPORTED"),
     ];
     for (label, content, code) in corrupt {
         let h = seeded(label);
@@ -1545,7 +1545,7 @@ fn recovery_counts_staged_copy_removals_before_a_journal_refusal() {
 
     let h = bound_home("recovery-sweep-refusal");
     let intent = JournalEntry {
-        schema: 1,
+        schema: dfm_model::state::SCHEMA,
         op_id: "sweep-1".into(),
         op: "create-file".into(),
         phase: Phase::Intent,
@@ -1615,7 +1615,7 @@ fn recover_repairs_one_torn_final_journal_line_and_refuses_a_torn_middle_line() 
     let j = state(h.path()).join("journal.jsonl");
     let sound = fs::read(&j).unwrap();
     let mut torn = sound.clone();
-    torn.extend_from_slice(b"{\"schema\":1,\"op_");
+    torn.extend_from_slice(b"{\"schema\":2,\"op_");
     fs::write(&j, &torn).unwrap();
     assert_ne!(check(h.path()).status.code(), Some(0));
     let r = run(h.path(), &["state", "recover"]);
@@ -1657,7 +1657,7 @@ fn an_abort_after_the_cut_leaves_the_cut_text_and_the_next_run_reports_it() {
     let j = state(h.path()).join("journal.jsonl");
     let mut torn = fs::read(&j).unwrap();
     let sound = torn.len();
-    torn.extend_from_slice(b"{\"schema\":1,\"op_");
+    torn.extend_from_slice(b"{\"schema\":2,\"op_");
     fs::write(&j, &torn).unwrap();
     // The process dies after the cut, before the repair record is written.
     let r = with_fail(
@@ -1668,12 +1668,12 @@ fn an_abort_after_the_cut_leaves_the_cut_text_and_the_next_run_reports_it() {
     assert_ne!(r.status.code(), Some(0));
     assert_eq!(fs::read(&j).unwrap().len(), sound, "the torn line was cut");
     let kept = state(h.path()).join("journal.torn");
-    assert_eq!(fs::read(&kept).unwrap(), b"{\"schema\":1,\"op_");
+    assert_eq!(fs::read(&kept).unwrap(), b"{\"schema\":2,\"op_");
 
     // The next run finds nothing torn. It must not lose the cut text, and the check must say so.
     let r = run(h.path(), &["state", "recover"]);
     assert_eq!(r.status.code(), Some(0), "{}", text(&r.stderr));
-    assert_eq!(fs::read(&kept).unwrap(), b"{\"schema\":1,\"op_");
+    assert_eq!(fs::read(&kept).unwrap(), b"{\"schema\":2,\"op_");
     let c = check(h.path());
     assert_eq!(c.status.code(), Some(1), "{}", text(&c.stdout));
     assert!(
@@ -1693,7 +1693,7 @@ fn a_failed_repair_after_the_cut_exits_1_because_the_journal_changed() {
     let j = state(h.path()).join("journal.jsonl");
     let mut torn = fs::read(&j).unwrap();
     let sound = torn.len();
-    torn.extend_from_slice(b"{\"schema\":1,\"op_");
+    torn.extend_from_slice(b"{\"schema\":2,\"op_");
     fs::write(&j, &torn).unwrap();
     let r = with_fail(
         h.path(),

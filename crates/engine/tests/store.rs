@@ -666,7 +666,7 @@ fn a_torn_final_journal_line_is_repaired_and_a_torn_middle_line_is_not() {
     assert_eq!(fs::read(&j).unwrap(), sound);
     // A partial line after the last newline is cut, and the repair is journaled first.
     let mut torn = sound.clone();
-    torn.extend_from_slice(b"{\"schema\":1,\"op_");
+    torn.extend_from_slice(b"{\"schema\":2,\"op_");
     fs::write(&j, &torn).unwrap();
     assert_eq!(s.read_journal().unwrap_err().code, Code::StateInvalid);
     assert_eq!(s.repair_torn_journal().unwrap(), 16);
@@ -936,7 +936,7 @@ fn a_hand_written_trial_with_foreign_paths_is_a_finding_not_a_trial() {
         ),
     ] {
         let t = dfm_model::state::TrialRecord {
-            schema: 1,
+            schema: dfm_model::state::SCHEMA,
             binding: stamp.clone(),
             trial_id: n.into(),
             tool: "atuin".into(),
@@ -975,7 +975,7 @@ fn a_trial_path_under_a_link_parent_is_a_finding() {
     for (n, baseline, owned) in [("t1", true, false), ("t2", false, true)] {
         let path = h.0.join("away/x").to_str().unwrap().to_string();
         let t = dfm_model::state::TrialRecord {
-            schema: 1,
+            schema: dfm_model::state::SCHEMA,
             binding: stamp.clone(),
             trial_id: n.into(),
             tool: "atuin".into(),
@@ -1092,7 +1092,7 @@ fn every_write_cap_is_enforced_before_anything_is_written() {
     assert_eq!(fs::read(state.join("ledger.json")).unwrap(), before);
     // Trial: a baseline with many long paths.
     let t = dfm_model::state::TrialRecord {
-        schema: 1,
+        schema: dfm_model::state::SCHEMA,
         binding: stamp.clone(),
         trial_id: "big".into(),
         tool: "atuin".into(),
@@ -1218,7 +1218,7 @@ fn a_repair_record_that_cannot_be_written_keeps_the_cut_text_in_the_error() {
     let j = state_dir(&h).join("journal.jsonl");
     let sound = fs::read(&j).unwrap();
     let mut torn = sound.clone();
-    torn.extend_from_slice(b"{\"schema\":1,\"op_id\":\"half-written\\\"\x07");
+    torn.extend_from_slice(b"{\"schema\":2,\"op_id\":\"half-written\\\"\x07");
     fs::write(&j, &torn).unwrap();
 
     let s = Store::open_write(
@@ -1241,7 +1241,7 @@ fn a_repair_record_that_cannot_be_written_keeps_the_cut_text_in_the_error() {
     let kept = state_dir(&h).join("journal.torn");
     assert_eq!(
         fs::read(&kept).unwrap(),
-        b"{\"schema\":1,\"op_id\":\"half-written\\\"\x07"
+        b"{\"schema\":2,\"op_id\":\"half-written\\\"\x07"
     );
     assert!(e.detail.contains("state/journal.torn"), "{}", e.detail);
     assert!(
@@ -1256,7 +1256,7 @@ fn a_repair_record_that_cannot_be_written_keeps_the_cut_text_in_the_error() {
     // refusal wrote nothing, so a fresh store is not marked as mutated by it.
     drop(s);
     let mut other = sound.clone();
-    other.extend_from_slice(b"{\"schema\":1,\"op_id\":\"other");
+    other.extend_from_slice(b"{\"schema\":2,\"op_id\":\"other");
     fs::write(&j, &other).unwrap();
     let s = open(&h);
     let e = s.repair_torn_journal().unwrap_err();
@@ -1267,7 +1267,7 @@ fn a_repair_record_that_cannot_be_written_keeps_the_cut_text_in_the_error() {
     assert_eq!(fs::read(&j).unwrap(), other);
     assert_eq!(
         fs::read(&kept).unwrap(),
-        b"{\"schema\":1,\"op_id\":\"half-written\\\"\x07"
+        b"{\"schema\":2,\"op_id\":\"half-written\\\"\x07"
     );
 }
 
@@ -1282,7 +1282,7 @@ fn a_cut_that_fails_can_be_repaired_by_the_next_run() {
     drop(s);
     let j = state_dir(&h).join("journal.jsonl");
     let mut torn = fs::read(&j).unwrap();
-    torn.extend_from_slice(b"{\"schema\":1,\"op_id\":\"half");
+    torn.extend_from_slice(b"{\"schema\":2,\"op_id\":\"half");
     fs::write(&j, &torn).unwrap();
 
     let s = Store::open_write(sys(&h), &h.layout(), Fail::at("repair-cut", Action::Error)).unwrap();
@@ -1290,7 +1290,7 @@ fn a_cut_that_fails_can_be_repaired_by_the_next_run() {
     assert_eq!(e.code, Code::IoFailed);
     assert_eq!(fs::read(&j).unwrap(), torn, "nothing was cut");
     let kept = state_dir(&h).join("journal.torn");
-    assert_eq!(fs::read(&kept).unwrap(), b"{\"schema\":1,\"op_id\":\"half");
+    assert_eq!(fs::read(&kept).unwrap(), b"{\"schema\":2,\"op_id\":\"half");
     drop(s);
 
     // The leftover copy holds the same text: the next run resumes the cut and clears the copy.
@@ -1312,7 +1312,7 @@ fn a_kept_copy_that_cannot_be_removed_does_not_fail_a_finished_repair() {
     drop(s);
     let j = state_dir(&h).join("journal.jsonl");
     let mut torn = fs::read(&j).unwrap();
-    torn.extend_from_slice(b"{\"schema\":1,\"op_id\":\"half");
+    torn.extend_from_slice(b"{\"schema\":2,\"op_id\":\"half");
     fs::write(&j, &torn).unwrap();
 
     let s = Store::open_write(
@@ -1334,7 +1334,7 @@ fn a_repaired_torn_journal_leaves_no_kept_copy_behind() {
         .unwrap();
     let j = state_dir(&h).join("journal.jsonl");
     let mut torn = fs::read(&j).unwrap();
-    torn.extend_from_slice(b"{\"schema\":1,\"op_id\":\"half");
+    torn.extend_from_slice(b"{\"schema\":2,\"op_id\":\"half");
     fs::write(&j, &torn).unwrap();
     assert_eq!(s.repair_torn_journal().unwrap(), 25);
     assert!(!state_dir(&h).join("journal.torn").exists());
@@ -1434,7 +1434,11 @@ fn every_malformed_ledger_shape_is_refused_on_read_and_load() {
             },
             Code::StateInvalid,
         ),
-        ("newer schema", |l| l.schema = 2, Code::StateNewer),
+        (
+            "newer schema",
+            |l| l.schema = dfm_model::state::SCHEMA + 1,
+            Code::StateNewer,
+        ),
     ];
     for (what, f, want) in cases {
         handwritten_ledger(&h, &stamp, f);

@@ -83,8 +83,8 @@ Each kind has three compiled-in lists. Initial values:
 | Kind | Writes | Reads | Upgrades from |
 | --- | --- | --- | --- |
 | `bundle`, `module`, `profile`, `lock`, `binding` (authored or reviewed) | 1 | 1 | none (never auto-upgraded) |
-| `state`, `ledger`, `grants` (machine owned) | 1 | 1 | none yet |
-| `receipt`, `journal-entry` | 1 | 1 | none yet (read-only readers per old version) |
+| `state`, `ledger`, `grants` (machine owned) | 2 | 2 | none (schema 1 was pre-release only; refused) |
+| `receipt`, `journal-entry` | 2 | 2 | none (schema 1 was pre-release only; refused) |
 
 ### Rules
 

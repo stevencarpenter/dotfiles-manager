@@ -125,7 +125,7 @@ pub fn ledger_with(stamp: &Stamp, home: &Home, resource: &str, file: &str, fp: c
 
 pub fn intent(op: &str, path: &str) -> JournalEntry {
     JournalEntry {
-        schema: 1,
+        schema: dfm_model::state::SCHEMA,
         op_id: "run-1".into(),
         op: op.into(),
         phase: Phase::Intent,
@@ -162,7 +162,7 @@ pub fn receipt(stamp: &Stamp, op_id: &str, outputs: Vec<String>) -> Receipt {
         reload: None,
     }];
     Receipt {
-        schema: 1,
+        schema: dfm_model::state::SCHEMA,
         op_id: op_id.into(),
         command: "sync".into(),
         started_at: "2026-10-10T00:00:00.000000000Z".into(),

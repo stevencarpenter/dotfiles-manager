@@ -27,7 +27,7 @@ use dfm_model::plan::{
 };
 use dfm_model::state::{
     Class, CoOwned, Fingerprint, JournalEntry, Ledger, OperationRecord, OwnedOutput, Phase,
-    Recovery, RecoveryOutput, Status, rfc3339, valid_id,
+    Recovery, RecoveryOutput, SCHEMA, Status, rfc3339, valid_id,
 };
 use dfm_model::{Code, Refusal};
 use std::cell::Cell;
@@ -636,7 +636,7 @@ impl Exec<'_, '_> {
         at: String,
     ) -> Result<(), Refusal> {
         self.run.store.append_journal(&JournalEntry {
-            schema: 1,
+            schema: SCHEMA,
             op_id: id.into(),
             op: step_name(op).into(),
             phase,

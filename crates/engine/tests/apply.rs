@@ -140,7 +140,7 @@ fn plan(ops: Vec<Operation>) -> Plan {
 
 fn plan_in(root: &str, ops: Vec<Operation>) -> Plan {
     Plan {
-        schema: 1,
+        schema: dfm_model::state::SCHEMA,
         command: "plan".into(),
         scope: "config".into(),
         binary: Binary {
@@ -1285,7 +1285,7 @@ fn the_journal_gate_reserves_room_for_settling_earlier_work() {
     };
     // An `unknown` entry settling can close has its intent record before it.
     let paired = [open(Phase::Intent), open(Phase::Unknown)].concat();
-    let torn = b"{\"schema\":1,\"op_id\":\"tor".to_vec();
+    let torn = b"{\"schema\":2,\"op_id\":\"tor".to_vec();
     let cases: [(&str, Vec<u8>); 3] = [
         ("an open intent", open(Phase::Intent)),
         ("an open unknown entry with its intent", paired),
@@ -2137,7 +2137,7 @@ fn an_interrupted_intent_the_probe_cannot_decide_stays_blocked_across_runs() {
     fs::create_dir(s.h.0.join("l")).unwrap();
     s.store
         .append_journal(&JournalEntry {
-            schema: 1,
+            schema: dfm_model::state::SCHEMA,
             op_id: format!("{}-1", jid(1)),
             op: "create-link".into(),
             phase: Phase::Intent,
@@ -2300,7 +2300,7 @@ fn forge(
 ) {
     use dfm_model::state::{Recovery, RecoveryOutput};
     let entry = |phase, recovery| JournalEntry {
-        schema: 1,
+        schema: dfm_model::state::SCHEMA,
         op_id: id.into(),
         op: op.into(),
         phase,
@@ -2588,7 +2588,7 @@ fn an_intent_with_no_recorded_path_blocks_its_whole_resource() {
     use dfm_model::state::Recovery;
     let s = setup();
     let entry = |phase, recovery| JournalEntry {
-        schema: 1,
+        schema: dfm_model::state::SCHEMA,
         op_id: "empty-1".into(),
         op: "create-link".into(),
         phase,

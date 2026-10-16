@@ -14,8 +14,8 @@ use dfm_engine::{
 };
 use dfm_model::display::{visible, visible_for_paste};
 use dfm_model::state::{
-    Approval, BinaryId, DisruptiveApproval, ProfileRef, Receipt, RunResult, SourceId, Stamp,
-    Status, count_statuses, rfc3339,
+    Approval, BinaryId, DisruptiveApproval, ProfileRef, Receipt, RunResult, SCHEMA, SourceId,
+    Stamp, Status, count_statuses, rfc3339,
 };
 use dfm_model::{Code, Exit, Refusal};
 use std::collections::{BTreeMap, BTreeSet};
@@ -327,7 +327,7 @@ fn run_inner(
             })
             .collect();
         let receipt = Receipt {
-            schema: 1,
+            schema: SCHEMA,
             op_id: format!("apply-{}-{}", &digest[..16], std::process::id()),
             command: "apply".into(),
             started_at: rfc3339(started),

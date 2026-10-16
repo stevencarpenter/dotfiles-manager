@@ -1468,7 +1468,7 @@ fn preview_refuses_unapproved_removals_with_pasteable_flags_and_accepts_them_whe
 fn a_full_journal_refuses_a_preview_and_a_run_before_any_write() {
     let fx = Fx::new();
     let e = dfm_model::state::JournalEntry {
-        schema: 1,
+        schema: dfm_model::state::SCHEMA,
         op_id: "p1-1".into(),
         op: "remove".into(),
         phase: dfm_model::state::Phase::Done,
@@ -1516,7 +1516,7 @@ fn a_journal_with_open_work_refuses_a_preview_when_settling_would_not_fit() {
         .filter(|o| o.status == dfm_model::plan::Status::Planned)
         .count();
     let entry = |op_id: &str, phase, recovery| JournalEntry {
-        schema: 1,
+        schema: dfm_model::state::SCHEMA,
         op_id: op_id.into(),
         op: "create-link".into(),
         phase,
@@ -2651,7 +2651,7 @@ fn apply_repairs_a_torn_final_journal_line_before_it_settles() {
     assert_eq!(code(&o), 0, "{}", stderr(&o));
     let j = fx.state().join("journal.jsonl");
     let mut bytes = fs::read(&j).unwrap();
-    bytes.extend_from_slice(b"{\"schema\":1,\"op_");
+    bytes.extend_from_slice(b"{\"schema\":2,\"op_");
     fs::write(&j, &bytes).unwrap();
     fs::remove_file(fx.h(".zshrc")).unwrap();
     let o = fx.apply(&[]);

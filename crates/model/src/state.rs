@@ -9,7 +9,7 @@ use crate::{Code, Refusal};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::collections::{BTreeMap, BTreeSet};
 
-pub const SCHEMA: i64 = 1;
+pub const SCHEMA: i64 = 2;
 /// Largest JSON state file (section 5, parser and read limits).
 pub const MAX_BYTES: usize = 16 << 20;
 /// Longest journal line. A longer line is a journal error, not a skipped line.
@@ -89,7 +89,7 @@ pub fn parse<T: DeserializeOwned>(kind: &str, bytes: &[u8]) -> Result<T, Refusal
         Some(n) => {
             return Err(Refusal::new(
                 Code::SchemaUnsupported,
-                format!("{kind} schema {n} is not supported (supported: 1)"),
+                format!("{kind} schema {n} is not supported (supported: {SCHEMA})"),
             ));
         }
         // An integer above `i64::MAX` is a schema this binary has never heard of: newer.
@@ -147,7 +147,7 @@ fn deep_schema(b: &[u8]) -> Option<u64> {
 fn newer(kind: &str, n: &str) -> Refusal {
     Refusal::new(
         Code::StateNewer,
-        format!("{kind} schema {n} is newer than this binary supports (supported: 1)"),
+        format!("{kind} schema {n} is newer than this binary supports (supported: {SCHEMA})"),
     )
 }
 
@@ -1458,13 +1458,24 @@ mod tests {
     #[test]
     fn schema_is_checked_before_any_other_field() {
         let code = |s: &str| StateDoc::parse(s.as_bytes()).unwrap_err().code;
-        assert_eq!(code("{\"schema\":2,\"junk\":1}"), Code::StateNewer);
+        assert_eq!(code("{\"schema\":3,\"junk\":1}"), Code::StateNewer);
         assert_eq!(code("{\"schema\":0}"), Code::SchemaUnsupported);
         assert_eq!(code("{\"junk\":1}"), Code::StateInvalid);
         assert_eq!(code("not json"), Code::StateInvalid);
-        assert_eq!(code("{\"schema\":1,\"junk\":1}"), Code::StateInvalid);
+        assert_eq!(code("{\"schema\":2,\"junk\":1}"), Code::StateInvalid);
+        // Schema 1 (whole-second stamps, `created_unix`) was written only by pre-release builds.
+        // It is refused as unsupported before its fields are read, never as invalid.
+        let old = "{\"schema\":1,\"binding\":{},\"created_unix\":1}";
+        let e = StateDoc::parse(old.as_bytes()).unwrap_err();
+        assert_eq!(e.code, Code::SchemaUnsupported);
+        assert!(
+            e.detail
+                .contains("schema 1 is not supported (supported: 2)"),
+            "{}",
+            e.detail
+        );
         let deep = format!(
-            "{{\"schema\":1,\"x\":{}1{}}}",
+            "{{\"schema\":2,\"x\":{}1{}}}",
             "[".repeat(40),
             "]".repeat(40)
         );
@@ -2211,9 +2222,9 @@ mod tests {
             )
         };
         // Deeper than 32: a newer document is still reported as newer, an own-schema one is not.
-        assert_eq!(code(&deep("2")), Code::StateNewer);
-        assert_eq!(code(&deep("0")), Code::SchemaUnsupported);
-        assert_eq!(code(&deep("1")), Code::StateInvalid);
+        assert_eq!(code(&deep("3")), Code::StateNewer);
+        assert_eq!(code(&deep("1")), Code::SchemaUnsupported);
+        assert_eq!(code(&deep("2")), Code::StateInvalid);
         // Past the JSON parser's own recursion limit the schema is still read first.
         let very_deep = |schema: &str, extra: &str| {
             format!(
@@ -2222,12 +2233,12 @@ mod tests {
                 "]".repeat(200)
             )
         };
-        assert_eq!(code(&very_deep("2", "")), Code::StateNewer);
+        assert_eq!(code(&very_deep("3", "")), Code::StateNewer);
         assert_eq!(
-            code(&very_deep(" 3 ", "\"y\":\"a\\\"b\",")),
+            code(&very_deep(" 4 ", "\"y\":\"a\\\"b\",")),
             Code::StateNewer
         );
-        assert_eq!(code(&very_deep("1", "")), Code::StateInvalid);
+        assert_eq!(code(&very_deep("2", "")), Code::StateInvalid);
         assert_eq!(code(&very_deep("2.5", "")), Code::StateInvalid);
         // Only the top-level member counts: a nested `schema` is not the document's.
         let nested = format!(
@@ -2252,12 +2263,12 @@ mod tests {
     fn every_document_validator_checks_the_schema() {
         let mut l = ledger_entry();
         l.validate().unwrap();
-        l.schema = 2;
+        l.schema = 3;
         assert!(l.validate().is_err());
 
         let mut r = receipt(vec![op(Status::Updated, Class::Normal)]);
         r.validate().unwrap();
-        r.schema = 2;
+        r.schema = 3;
         assert!(r.validate().is_err());
 
         let mut t = TrialRecord {
@@ -2273,7 +2284,7 @@ mod tests {
             owned_outputs: vec![],
         };
         t.validate().unwrap();
-        t.schema = 2;
+        t.schema = 3;
         assert!(t.validate().is_err());
     }
 
@@ -2320,7 +2331,7 @@ mod tests {
     fn the_journal_entry_validator_refuses_each_malformed_field() {
         journal_entry().validate().unwrap();
         let cases: [(&str, EntryEdit); 11] = [
-            ("schema", |e| e.schema = 2),
+            ("schema", |e| e.schema = SCHEMA + 1),
             ("op id", |e| e.op_id = "Run 1".into()),
             ("op", |e| e.op = String::new()),
             ("time", |e| e.at = "yesterday".into()),
