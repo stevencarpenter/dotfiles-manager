@@ -41,21 +41,24 @@ name = "duckdb"
 update_policy = "rolling"
 "#;
 
-/// `brew list --versions <name>` answers from `installed-brew`; `brew install <name>` appends.
+/// `brew list --versions <name>` answers from `installed-brew` and prints the short name, as
+/// brew does for a tap-qualified name; `brew install <name>` appends, or does nothing with the
+/// `noop` marker, or fails with the `fail` marker.
 const FAKE_BREW: &str = r#"#!/bin/sh
 PATH=/usr/bin:/bin:$PATH
 here=$(dirname "$0")
-printf 'brew %s | auto=%s analytics=%s user=%s\n' "$*" "${HOMEBREW_NO_AUTO_UPDATE:-unset}" "${HOMEBREW_NO_ANALYTICS:-unset}" "${USER:-none}" >> "$here/../log"
+printf 'brew %s | auto=%s analytics=%s hints=%s cleanup=%s upgrade=%s user=%s\n' "$*" "${HOMEBREW_NO_AUTO_UPDATE:-unset}" "${HOMEBREW_NO_ANALYTICS:-unset}" "${HOMEBREW_NO_ENV_HINTS:-unset}" "${HOMEBREW_NO_INSTALL_CLEANUP:-unset}" "${HOMEBREW_NO_INSTALL_UPGRADE:-unset}" "${USER:-none}" >> "$here/../log"
 db="$here/../installed-brew"
 case "$1" in
   list)
-    name=$3
+    name=${3##*/}
     v=$(grep "^$name " "$db" 2>/dev/null | head -1)
     if [ -n "$v" ]; then echo "$v"; exit 0; fi
     exit 1 ;;
   install)
     [ -e "$here/../fail" ] && { echo "Error: PLANTED-STDERR" >&2; exit 1; }
-    echo "$2 1.0.0" >> "$db"; echo "==> Installing $2"; exit 0 ;;
+    [ -e "$here/../noop" ] && exit 0
+    echo "${2##*/} 1.0.0" >> "$db"; echo "==> Installing $2"; exit 0 ;;
   *) exit 64 ;;
 esac
 "#;
@@ -69,11 +72,12 @@ db="$here/../installed-mise"
 case "$1" in
   ls)
     name=$3
+    case "$name" in *@*) echo "mise ERROR $name not found in mise tool registry" >&2; exit 1 ;; esac
     [ "$name" = "zzz-unknown" ] && { echo "mise ERROR $name not found in mise tool registry" >&2; exit 1; }
     grep "^$name " "$db" 2>/dev/null
     exit 0 ;;
   install)
-    echo "$2  2.0.0" >> "$db"; exit 0 ;;
+    echo "${2%%@*}  2.0.0" >> "$db"; exit 0 ;;
   *) exit 64 ;;
 esac
 "#;
@@ -98,8 +102,13 @@ fn digest_of(o: &Output) -> String {
 
 impl Fx {
     fn new() -> Fx {
+        Fx::with_home("packages-home")
+    }
+
+    /// A fixture whose HOME directory name is `label`, for paths that resemble a provider name.
+    fn with_home(label: &str) -> Fx {
         let fx = Fx {
-            home: TempDir::new("packages-home"),
+            home: TempDir::new(label),
             _src: TempDir::new("packages-src"),
             root: PathBuf::new(),
             fake: TempDir::new("packages-providers"),
@@ -152,6 +161,10 @@ impl Fx {
         fs::read_to_string(self.fake.path().join("log")).unwrap_or_default()
     }
 
+    fn provider_ran(&self) -> bool {
+        self.fake.path().join("log").exists()
+    }
+
     fn run(&self, args: &[&str]) -> Output {
         Command::new(BIN)
             .env_clear()
@@ -199,7 +212,11 @@ fn a_configuration_plan_lists_packages_out_of_scope_and_starts_no_provider() {
     assert!(t.contains("not_in_scope extra.duckdb@scope"), "{t}");
     let o = fx.run(&["doctor", "--root", fx.root_arg()]);
     assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
-    assert_eq!(fx.log(), "", "a provider was started by plan or doctor");
+    assert!(
+        !fx.provider_ran(),
+        "a provider was started by plan or doctor: {}",
+        fx.log()
+    );
 }
 
 #[test]
@@ -219,7 +236,9 @@ fn missing_packages_are_installed_once_installed_ones_are_current_and_the_env_is
     // The probes ran read-only, with the provider variables set and nothing of ours leaked.
     let log = fx.log();
     assert!(
-        log.contains("brew list --versions atuin | auto=1 analytics=1 user=none"),
+        log.contains(
+            "brew list --versions atuin | auto=1 analytics=1 hints=1 cleanup=1 upgrade=1 user=none"
+        ),
         "{log}"
     );
     assert!(
@@ -310,6 +329,67 @@ fn another_owner_blocks_and_a_failed_install_is_reported_with_stderr_withheld() 
     let o = fx.packages(&digest_of(&fx.preview()));
     assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
     assert!(text(&o.stdout).contains(&format!("updated {BREW_OP}")));
+}
+
+#[test]
+fn qualified_names_are_probed_by_their_short_name_and_installed_in_full() {
+    let fx = Fx::new();
+    fx.put(
+        "base/modules/extra/module.toml",
+        &EXTRA
+            .replace("name = \"atuin\"", "name = \"homebrew/core/atuin\"")
+            .replace("name = \"duckdb\"", "name = \"duckdb@2\""),
+    );
+    fx.installed("brew", "atuin 18.24.1\n");
+    fx.installed("mise", "duckdb 1.5.6\n");
+    let o = fx.preview();
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+    let t = text(&o.stdout);
+    assert!(t.contains(&format!("current {BREW_OP}")), "{t}");
+    assert!(t.contains("(18.24.1)"), "{t}");
+    // 1.5.6 is installed, but not a 2.x: the declared version is missing.
+    assert!(t.contains(&format!("planned {MISE_OP}")), "{t}");
+    let o = fx.packages(&digest_of(&o));
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+    let log = fx.log();
+    assert!(
+        log.contains("brew list --versions homebrew/core/atuin"),
+        "{log}"
+    );
+    assert!(log.contains("mise ls --installed duckdb |"), "{log}");
+    assert!(log.contains("mise install duckdb@2 |"), "{log}");
+    assert!(text(&o.stdout).contains(&format!("updated {MISE_OP}")));
+}
+
+#[test]
+fn the_owner_check_survives_a_home_that_resembles_a_provider_and_a_noop_install_fails() {
+    // The HOME path holds "mise" and "homebrew": the owner check must still look in it.
+    let fx = Fx::with_home("promise-homebrew-home");
+    fx.installed("brew", "");
+    fx.installed("mise", "duckdb 1\n");
+    let other = fx.home.path().join(".local/bin");
+    fs::create_dir_all(&other).unwrap();
+    fs::write(other.join("atuin"), "#!/bin/sh\n").unwrap();
+    fs::set_permissions(other.join("atuin"), fs::Permissions::from_mode(0o755)).unwrap();
+    let o = fx.preview();
+    assert_eq!(code(&o), 3, "{}\n{}", stderr(&o), text(&o.stdout));
+    assert!(stderr(&o).contains("another owner"), "{}", stderr(&o));
+    fs::remove_file(other.join("atuin")).unwrap();
+    // An install that exits 0 without installing fails its postcondition.
+    fs::write(fx.fake.path().join("noop"), "").unwrap();
+    let o = fx.packages(&digest_of(&fx.preview()));
+    assert_eq!(code(&o), 1, "{}\n{}", stderr(&o), text(&o.stdout));
+    let out = text(&o.stdout);
+    assert!(out.contains(&format!("failed {BREW_OP}")), "{out}");
+    assert!(out.contains("postcondition failed"), "{out}");
+    // A bad name is a manifest error, not a probe failure.
+    fx.put(
+        "base/modules/extra/module.toml",
+        &EXTRA.replace("name = \"atuin\"", "name = \"a b\""),
+    );
+    let o = fx.preview();
+    assert_eq!(code(&o), 3, "{}", stderr(&o));
+    assert!(stderr(&o).contains("E_MANIFEST_INVALID"), "{}", stderr(&o));
 }
 
 #[test]

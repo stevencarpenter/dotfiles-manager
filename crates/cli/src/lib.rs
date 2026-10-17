@@ -81,8 +81,8 @@ not_in_scope. It needs a 1Password session for each account (`op whoami`), else 
 (E_CREDENTIAL_UNAVAILABLE) before anything is written. With --yes-plan it renders each template
 through `op inject` and publishes the result with the declared mode. A render that fails or is
 empty keeps the previous file. An existing destination the ledger does not prove the manager
-wrote needs --allow-adopt <operation-id>. No secret value, hash or provider message is printed or
-stored. See docs/secrets.md.
+wrote needs --allow-adopt <operation-id>. No secret value, unsalted hash or provider message is
+printed or stored; the ledger keeps a per-machine salted hash. See docs/secrets.md.
 
 packages is apply over the package resources only (homebrew/v1, mise/v1, apt/v1): every other
 resource is listed as not_in_scope. Planning probes each provider's own listing read-only (brew
@@ -157,6 +157,7 @@ impl Ctx {
             home: self.platform.home().to_path_buf(),
             cwd: dfm_engine::proc::run_dir(&self.platform.cache_dir()),
             uid: sys.uid,
+            grace: dfm_engine::proc::GRACE,
         }
     }
 

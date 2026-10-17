@@ -4,9 +4,13 @@
 //! A provider never runs through a shell. [`Runner::run`] resolves the program on a fixed search
 //! path (never the caller's `PATH`), checks the executable it found, builds the environment from
 //! empty (`PATH`, `HOME`, `LANG=C` plus the variables the adapter names), starts the child in its
-//! own process group, bounds what it reads from the child, and ends the child when the bound
-//! elapses or a stop request arrives: SIGTERM to the group, a 10 s grace period, then SIGKILL.
-//! The caller decides what the output means. Nothing here prints or persists a byte of it.
+//! own process group once the manager's signal handlers are installed (before that it stays in
+//! the manager's group, so a terminal SIGINT reaches it too), bounds what it reads from the
+//! child, and ends the child when the bound elapses or a stop request arrives: SIGTERM, a grace
+//! period, then SIGKILL. `run` returns within the timeout plus three grace periods whatever the
+//! child and its descendants do: a process that keeps the inherited pipes open after the child
+//! exited gets the same SIGTERM, grace, SIGKILL sequence. The caller decides what the output
+//! means. Nothing here prints or persists a byte of it.
 
 use crate::signal;
 use dfm_model::{Code, Refusal};
@@ -18,11 +22,13 @@ use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-/// Provider standard error is kept to this many bytes (section 8, redaction rule 3).
+/// Provider standard error is kept to this many bytes (section 8, redaction rule 3). The rest is
+/// read in chunks and dropped, so memory stays at this bound.
 pub const MAX_STDERR: usize = 4096;
 /// After SIGTERM the child gets this long before SIGKILL (section 10 item 6).
 pub const GRACE: Duration = Duration::from_secs(10);
 const POLL: Duration = Duration::from_millis(20);
+const CHUNK: usize = 8192;
 
 /// Where providers are found and how their children are started.
 #[derive(Clone, Debug)]
@@ -35,6 +41,8 @@ pub struct Runner {
     pub cwd: PathBuf,
     /// The current user. An executable owned by anyone but root or this user is refused.
     pub uid: u32,
+    /// The grace period between SIGTERM and SIGKILL, [`GRACE`] in production. Tests shorten it.
+    pub grace: Duration,
 }
 
 /// One child to run.
@@ -93,31 +101,43 @@ fn refused(detail: impl Into<String>) -> Refusal {
 impl Runner {
     /// Finds `program` on the search path and checks the executable (section 8, argv[0] rule): a
     /// regular file with an execute bit, owned by root or the current user, not writable by group
-    /// or others, whose resolved path stays under the parent of the search directory that named
-    /// it (a package manager's link into its own prefix stays; a link out of the prefix does not).
+    /// or others, and (when the entry is a link) a link owned by root or the current user. The
+    /// resolved path must stay under the search directory or under its parent prefix (a package
+    /// manager's link into its own prefix stays; a link out of the prefix does not; for a
+    /// directory directly under the root, such as `/bin`, the directory itself is the prefix).
+    /// The first search directory that holds the name decides: a failed check there is refused,
+    /// not shadowed by a later directory. The resolved path is what runs, so a link swapped
+    /// after the check does not redirect the start.
     pub fn resolve(&self, program: &str) -> Result<PathBuf, Refusal> {
         if program.is_empty() || program.contains('/') || program.starts_with('-') {
             return Err(refused(format!("{program:?} is not a plain program name")));
         }
         for dir in &self.search_path {
             let candidate = dir.join(program);
-            let Ok(meta) = std::fs::metadata(&candidate) else {
+            let Ok(entry) = std::fs::symlink_metadata(&candidate) else {
                 continue;
             };
-            let real = std::fs::canonicalize(&candidate)
-                .map_err(|e| refused(format!("{}: {}", candidate.display(), e.kind())))?;
-            let prefix = dir.parent().unwrap_or(dir);
             let shown = candidate.display();
+            let meta = std::fs::metadata(&candidate)
+                .map_err(|e| refused(format!("{shown}: {}", e.kind())))?;
+            let real = std::fs::canonicalize(&candidate)
+                .map_err(|e| refused(format!("{shown}: {}", e.kind())))?;
+            let prefix = match dir.parent() {
+                Some(p) if p != Path::new("/") => p,
+                _ => dir.as_path(),
+            };
             if !meta.is_file() {
                 return Err(refused(format!("{shown} is not a regular file")));
             }
             if meta.mode() & 0o111 == 0 {
                 return Err(refused(format!("{shown} is not executable")));
             }
-            if meta.uid() != 0 && meta.uid() != self.uid {
-                return Err(refused(format!(
-                    "{shown} is owned by another user than root or you"
-                )));
+            for (m, what) in [(&meta, "is"), (&entry, "is a link that is")] {
+                if m.uid() != 0 && m.uid() != self.uid {
+                    return Err(refused(format!(
+                        "{shown} {what} owned by another user than root or you"
+                    )));
+                }
             }
             if meta.mode() & 0o022 != 0 {
                 return Err(refused(format!("{shown} is writable by group or others")));
@@ -129,7 +149,7 @@ impl Runner {
                     prefix.display()
                 )));
             }
-            return Ok(candidate);
+            return Ok(real);
         }
         Err(refused(format!(
             "{program} was not found in {}",
@@ -149,14 +169,30 @@ impl Runner {
             .join(":")
     }
 
+    /// The child's working directory: created with mode 0700 when missing; an existing one must
+    /// be a real directory (not a link) owned by the current user, and is set to 0700 again.
     fn ensure_cwd(&self) -> Result<(), Refusal> {
         let e = |e: std::io::Error| refused(format!("{}: {}", self.cwd.display(), e.kind()));
-        if !self.cwd.is_dir() {
-            std::fs::create_dir_all(&self.cwd).map_err(e)?;
-            std::fs::set_permissions(&self.cwd, std::fs::Permissions::from_mode(0o700))
-                .map_err(e)?;
+        match std::fs::symlink_metadata(&self.cwd) {
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                std::fs::create_dir_all(&self.cwd).map_err(e)?;
+            }
+            Err(err) => return Err(e(err)),
+            Ok(m) if !m.is_dir() => {
+                return Err(refused(format!(
+                    "{} is not a plain directory",
+                    self.cwd.display()
+                )));
+            }
+            Ok(m) if m.uid() != self.uid => {
+                return Err(refused(format!(
+                    "{} is owned by another user",
+                    self.cwd.display()
+                )));
+            }
+            Ok(_) => {}
         }
-        Ok(())
+        std::fs::set_permissions(&self.cwd, std::fs::Permissions::from_mode(0o700)).map_err(e)
     }
 
     /// Runs one child to its end, or ends it. An error here means the child did not run (a
@@ -182,11 +218,22 @@ impl Runner {
                 Stdio::null()
             })
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .process_group(0);
+            .stderr(Stdio::piped());
+        // With the manager's handlers installed, the child gets its own group so the runner can
+        // end it and everything it started. Before that (a credential gate, a plan-time probe), a
+        // terminal SIGINT must reach the child too, so it stays in the manager's group and the
+        // runner signals the child alone.
+        let group = signal::installed();
+        if group {
+            cmd.process_group(0);
+        }
         let mut child = cmd
             .spawn()
             .map_err(|e| refused(format!("cannot start {}: {}", program.display(), e.kind())))?;
+        let target = Target {
+            pid: child.id(),
+            group,
+        };
         let (out_rx, err_rx) = readers(&mut child, req.max_stdout);
         if let (Some(mut pipe), Some(bytes)) = (child.stdin.take(), req.stdin) {
             let bytes = bytes.to_vec();
@@ -195,16 +242,108 @@ impl Runner {
                 let _ = pipe.write_all(&bytes);
             });
         }
-        let end = wait(&mut child, req.timeout);
-        let stdout = out_rx
-            .recv()
-            .map_err(|_| refused("the standard output reader ended early"))??;
-        let stderr = err_rx.recv().unwrap_or_default();
+        let end = wait(&mut child, target, req.timeout);
+        // The pipes close when every process that inherited them is gone. A descendant that
+        // outlives the child gets the same sequence as a timeout: SIGTERM, grace, SIGKILL. The
+        // leader is still unreaped during a timeout, so its id cannot have been recycled.
+        let mut pipes = Pipes::new(out_rx, err_rx);
+        let ended_early = matches!(end, End::TimedOut | End::Stopped(_));
+        if !ended_early && !pipes.wait(self.grace) {
+            target.kill(true);
+        }
+        if !pipes.done() && !pipes.wait(self.grace) {
+            target.kill(false);
+        }
+        if !pipes.done() && !pipes.wait(self.grace) {
+            // Still open after SIGKILL: a process left the group. The reader threads end when it
+            // exits; nothing more can be done from here.
+            let _ = child.try_wait();
+            return Err(refused(format!(
+                "a process started by {} keeps its output open after SIGKILL; it was left running",
+                program.display()
+            )));
+        }
+        let _ = child.wait();
+        let Pipes { stdout, stderr, .. } = pipes;
+        let stdout = stdout
+            .ok_or_else(|| refused("the standard output reader ended early"))?
+            .or_else(|e| match end {
+                // A stop request has precedence over a cap the child ran into at the same time.
+                End::Stopped(_) => Ok(Vec::new()),
+                _ => Err(e),
+            })?;
         Ok(Output {
             end,
             stdout,
-            stderr,
+            stderr: stderr.unwrap_or_default(),
         })
+    }
+}
+
+/// What a signal is sent to: the child's own process group, or the child alone when it shares
+/// the manager's group.
+#[derive(Clone, Copy)]
+struct Target {
+    pid: u32,
+    group: bool,
+}
+
+impl Target {
+    fn kill(self, term: bool) {
+        signal::kill_child(self.pid, self.group, term);
+    }
+}
+
+/// What the two reader threads have delivered so far.
+struct Pipes {
+    out_rx: mpsc::Receiver<Result<Vec<u8>, Refusal>>,
+    err_rx: mpsc::Receiver<Vec<u8>>,
+    stdout: Option<Result<Vec<u8>, Refusal>>,
+    stderr: Option<Vec<u8>>,
+}
+
+impl Pipes {
+    fn new(
+        out_rx: mpsc::Receiver<Result<Vec<u8>, Refusal>>,
+        err_rx: mpsc::Receiver<Vec<u8>>,
+    ) -> Pipes {
+        Pipes {
+            out_rx,
+            err_rx,
+            stdout: None,
+            stderr: None,
+        }
+    }
+
+    fn done(&self) -> bool {
+        self.stdout.is_some() && self.stderr.is_some()
+    }
+
+    /// Waits up to `limit` for both readers to end. A reader that panicked counts as ended.
+    fn wait(&mut self, limit: Duration) -> bool {
+        let until = Instant::now() + limit;
+        while !self.done() {
+            let left = until.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return false;
+            }
+            if self.stdout.is_none() {
+                match self.out_rx.recv_timeout(left) {
+                    Ok(v) => self.stdout = Some(v),
+                    Err(mpsc::RecvTimeoutError::Timeout) => return false,
+                    Err(mpsc::RecvTimeoutError::Disconnected) => {
+                        self.stdout = Some(Err(refused("the standard output reader ended early")));
+                    }
+                }
+            } else if self.stderr.is_none() {
+                match self.err_rx.recv_timeout(left) {
+                    Ok(v) => self.stderr = Some(v),
+                    Err(mpsc::RecvTimeoutError::Timeout) => return false,
+                    Err(mpsc::RecvTimeoutError::Disconnected) => self.stderr = Some(Vec::new()),
+                }
+            }
+        }
+        true
     }
 }
 
@@ -251,21 +390,31 @@ fn readers(
     });
     let mut stderr = child.stderr.take();
     std::thread::spawn(move || {
-        let mut buf = Vec::new();
+        let mut kept = Vec::new();
         if let Some(p) = &mut stderr {
-            // The rest is read and dropped so the child never blocks on a full pipe.
-            let mut all = Vec::new();
-            let _ = p.read_to_end(&mut all);
-            all.truncate(MAX_STDERR);
-            buf = all;
+            // Read in chunks: the first MAX_STDERR bytes are kept, the rest is dropped as it
+            // arrives, so the child never blocks on a full pipe and memory stays bounded.
+            let mut chunk = [0u8; CHUNK];
+            loop {
+                match p.read(&mut chunk) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        let room = MAX_STDERR.saturating_sub(kept.len());
+                        kept.extend_from_slice(&chunk[..n.min(room)]);
+                    }
+                }
+            }
         }
-        let _ = err_tx.send(buf);
+        let _ = err_tx.send(kept);
     });
     (out_rx, err_rx)
 }
 
-/// Waits for the child, polling so a stop request or the timeout is seen within one poll.
-fn wait(child: &mut Child, timeout: Duration) -> End {
+/// Waits for the child, polling so a stop request or the timeout is seen within one poll. On a
+/// timeout or a stop request the target gets SIGTERM here; the caller waits the grace period on
+/// the pipes and sends SIGKILL if they are still open. A `try_wait` error ends the target at
+/// once, because nothing more can be learned about the child.
+fn wait(child: &mut Child, target: Target, timeout: Duration) -> End {
     let started = Instant::now();
     loop {
         match child.try_wait() {
@@ -273,33 +422,21 @@ fn wait(child: &mut Child, timeout: Duration) -> End {
                 return status.code().map_or(End::Signaled, End::Exited);
             }
             Ok(None) => {}
-            Err(_) => return End::Signaled,
+            Err(_) => {
+                target.kill(false);
+                return End::Signaled;
+            }
         }
         if let Some(stop) = signal::requested() {
-            end_group(child);
+            target.kill(true);
             return End::Stopped(stop);
         }
         if started.elapsed() >= timeout {
-            end_group(child);
+            target.kill(true);
             return End::TimedOut;
         }
         std::thread::sleep(POLL);
     }
-}
-
-/// SIGTERM to the child's group, the grace period, then SIGKILL, then reap.
-fn end_group(child: &mut Child) {
-    let pgid = child.id();
-    signal::kill_group(pgid, true);
-    let until = Instant::now() + GRACE;
-    while Instant::now() < until {
-        if matches!(child.try_wait(), Ok(Some(_))) {
-            return;
-        }
-        std::thread::sleep(POLL);
-    }
-    signal::kill_group(pgid, false);
-    let _ = child.wait();
 }
 
 /// Builds the extra environment from the caller's environment: only the variables whose name

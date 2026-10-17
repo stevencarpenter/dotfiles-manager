@@ -309,6 +309,16 @@ fn first_refusal(plan: &Plan, generator: &dyn Generator) -> Result<(), Refusal> 
                     ),
                 ));
             }
+            if !op
+                .preconditions
+                .iter()
+                .any(|p| p.subject.starts_with("probe:"))
+            {
+                return Err(plan_invalid(format!(
+                    "{} installs a package but records no probe precondition",
+                    op.id
+                )));
+            }
             continue;
         }
         let path = op
@@ -1375,12 +1385,9 @@ impl Exec<'_, '_> {
         }
         let template = self.template(op)?;
         self.run.fail.hit("apply-after-prereq").map_err(failed)?;
-        let bytes = match self.run.generator.render(op, &template) {
-            Ok(b) => b,
-            // No session: a gate, not a failure. Nothing ran.
-            Err(r) if r.code == Code::CredentialUnavailable => return Err(Ended::Blocked(r)),
-            Err(r) => return Err(failed(r)),
-        };
+        // A render that fails is a failed operation (E_RENDER_FAILED), also when the cause is a
+        // session that went away after the gate: the provider does not say which it was.
+        let bytes = self.run.generator.render(op, &template).map_err(failed)?;
         if bytes.is_empty() {
             return Err(failed(Refusal::new(
                 Code::RenderFailed,
@@ -1472,11 +1479,21 @@ impl Exec<'_, '_> {
             .iter()
             .find(|p| p.subject.starts_with("probe:"))
             .map(|p| p.state.as_str())
-            .unwrap_or("missing");
+            .ok_or_else(|| failed(plan_invalid("an install needs a probe precondition")))?;
         let now = self.run.generator.probe(op).map_err(failed)?;
         match &now {
             PackageState::Installed(_) => return Ok(Ended::Current),
             s if s.state() == want => {}
+            // The provider could not answer now: that is the probe's failure, not a stale plan.
+            PackageState::Unknown(why) => {
+                return Err(blocked(
+                    Code::ProbeFailed,
+                    format!(
+                        "{}: the provider could not report the installed state now ({why}); nothing was changed",
+                        op.id
+                    ),
+                ));
+            }
             s => {
                 return Err(blocked(
                     Code::PlanStale,

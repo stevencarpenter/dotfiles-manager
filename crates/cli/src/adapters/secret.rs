@@ -9,14 +9,14 @@
 
 use dfm_engine::{Dir, End, Live, ProcRequest, Runner, Store, Sys};
 use dfm_model::merge::salted;
-use dfm_model::plan::{MAX_HASHED_BYTES, Owned, Plan, Scope, SecretVerdict, Status};
+use dfm_model::plan::{MAX_HASHED_BYTES, Plan, Scope, SecretVerdict, Status};
 use dfm_model::resolve::{Resolved, Value};
 use dfm_model::{Code, Refusal};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::time::Duration;
 
-pub const ADAPTER: &str = "op-template/v1";
+pub const ADAPTER: &str = dfm_model::plan::SECRET_ADAPTER;
 /// `op whoami` answers from the local session; this is generous.
 const WHOAMI_TIMEOUT: Duration = Duration::from_secs(30);
 /// `op inject` resolves each reference against the vault.
@@ -69,9 +69,8 @@ fn request<'a>(
 pub fn credential(runner: &Runner, account: &str) -> Result<(), Refusal> {
     let args = ["whoami".to_string(), "--account".into(), account.into()];
     let env = dfm_engine::proc::passthrough(&OP_ENV_PREFIXES);
-    let out = runner
-        .run(&request(&args, &env, None, WHOAMI_TIMEOUT))
-        .map_err(|e| Refusal::new(Code::CredentialUnavailable, e.detail))?;
+    // A runner refusal (op not found, failed its checks) keeps its own code: it is not a session.
+    let out = runner.run(&request(&args, &env, None, WHOAMI_TIMEOUT))?;
     if out.success() {
         return Ok(());
     }
@@ -148,15 +147,15 @@ fn blocked(code: Code, detail: &str, correction: &str) -> SecretVerdict {
 
 /// The verdict on each selected secret resource's destination, by resource id: the destination
 /// is read (in memory, never hashed unsalted) and compared with the salted hash the ledger
-/// records for this resource. Absent, or equal: `Owned`. Present with no entry, another
-/// resource's entry, or a different hash: `Unowned` (a takeover that needs `--allow-adopt`).
+/// records for this resource. Absent, or equal: `Owned`. Present with no entry of this resource
+/// or a different hash: `Unowned` (a takeover that needs `--allow-adopt`). Another resource's
+/// entry is the planner's conflict, decided before this verdict is read.
 pub fn secret_facts(
     resolved: &Resolved,
     store: &Store,
     sys: &Sys,
     home: &Dir,
     home_path: &Path,
-    ledger: &[Owned],
 ) -> BTreeMap<String, SecretVerdict> {
     let mut out = BTreeMap::new();
     for r in resolved
@@ -180,7 +179,7 @@ pub fn secret_facts(
         }
         out.insert(
             r.id.clone(),
-            verdict(&r.id, claim, store, sys, home, home_path, ledger),
+            verdict(&r.id, claim, store, sys, home, home_path),
         );
     }
     out
@@ -193,7 +192,6 @@ fn verdict(
     sys: &Sys,
     home: &Dir,
     home_path: &Path,
-    ledger: &[Owned],
 ) -> SecretVerdict {
     let comps: Vec<&str> = claim.split('/').collect();
     let Some((name, parents)) = comps.split_last() else {
@@ -238,22 +236,20 @@ fn verdict(
         }
         Live::File { bytes, .. } => bytes,
     };
-    // Another resource's entry is the planner's conflict; here it is simply not ours.
-    let abs = home_path.join(claim);
-    let recorded = ledger
-        .iter()
-        .find(|o| o.resource == resource && Path::new(&abs).ends_with(&o.path));
+    // The ledger entry of this resource for this path, compared as the planner and apply do:
+    // case-folded (`Owned.path` is HOME-relative; the ledger spells the absolute path).
+    let abs = home_path.join(claim).to_string_lossy().into_owned();
     let hash = match store.read_ledger_lenient() {
         Ok(l) => l
             .resources
             .iter()
             .filter(|x| x.resource == resource)
             .flat_map(|x| &x.owned_outputs)
-            .find(|o| Path::new(&o.path) == abs)
+            .find(|o| dfm_model::fold::eq(&o.path, &abs))
             .and_then(|o| o.coowned.as_ref().map(|c| c.managed_hash.clone())),
         Err(e) => return blocked(e.code, &e.detail, "repair the state store first"),
     };
-    let (Some(_), Some(hash)) = (recorded, hash) else {
+    let Some(hash) = hash else {
         return SecretVerdict::Unowned;
     };
     match store.salt() {

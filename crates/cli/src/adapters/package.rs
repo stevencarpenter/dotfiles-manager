@@ -108,9 +108,12 @@ fn brew_probe(runner: &Runner, pkg: &str) -> PackageState {
         return PackageState::Unknown(why);
     }
     let text = String::from_utf8_lossy(&out.stdout);
+    // `brew list --versions homebrew/core/atuin` prints `atuin 18.24.1`: the short name, which
+    // keeps a `@version` suffix (`node@20 20.1.0`).
+    let short = pkg.rsplit('/').next().unwrap_or(pkg);
     let line = text.lines().find_map(|l| {
         let mut parts = l.split_whitespace();
-        (parts.next() == Some(pkg)).then(|| parts.collect::<Vec<_>>().join(" "))
+        (parts.next() == Some(short)).then(|| parts.collect::<Vec<_>>().join(" "))
     });
     match (&out.end, line) {
         (End::Exited(0), Some(v)) if !v.is_empty() => PackageState::Installed(v),
@@ -122,10 +125,13 @@ fn brew_probe(runner: &Runner, pkg: &str) -> PackageState {
     }
 }
 
-/// `mise ls --installed <name>`: one line `<tool> <version> ...` per installed version, no line
-/// when none is installed. A tool mise does not know is an error (exit 1).
+/// `mise ls --installed <tool>`: one line `<tool> <version> ...` per installed version, no line
+/// when none is installed. A tool mise does not know is an error (exit 1). A declared
+/// `tool@version` is listed by its tool name and counts as installed when an installed version
+/// starts with the declared one (`node@20` matches `20.20.2`).
 fn mise_probe(runner: &Runner, pkg: &str) -> PackageState {
-    let args = ["ls".to_string(), "--installed".into(), pkg.into()];
+    let (tool, want) = pkg.split_once('@').unwrap_or((pkg, ""));
+    let args = ["ls".to_string(), "--installed".into(), tool.into()];
     let out = match runner.run(&request("mise", &args, &mise_env(), PROBE_TIMEOUT)) {
         Ok(o) => o,
         Err(e) => return PackageState::Unknown(e.detail),
@@ -143,9 +149,10 @@ fn mise_probe(runner: &Runner, pkg: &str) -> PackageState {
         .lines()
         .filter_map(|l| {
             let mut parts = l.split_whitespace();
-            (parts.next() == Some(pkg)).then(|| parts.next()).flatten()
+            (parts.next() == Some(tool)).then(|| parts.next()).flatten()
         })
         .filter(|v| !v.contains("missing"))
+        .filter(|v| want.is_empty() || v.starts_with(want))
         .collect();
     if versions.is_empty() {
         PackageState::Missing
@@ -178,43 +185,55 @@ fn apt_probe(runner: &Runner, pkg: &str) -> PackageState {
     }
 }
 
+/// The executable name a package is looked for under: the last `/` component of a tap or
+/// backend-qualified name, without a `@version` suffix (`homebrew/core/atuin` and `node@20`
+/// give `atuin` and `node`).
+fn leaf(pkg: &str) -> &str {
+    let last = pkg.rsplit('/').next().unwrap_or(pkg);
+    last.split('@').next().unwrap_or(last)
+}
+
 /// Directories where another owner can have put an executable of the package's name: the other
-/// search-path prefixes, Nix profiles, `~/.local/bin`, `~/.cargo/bin` and the mise shims.
+/// search-path prefixes, Nix profiles, `~/.local/bin`, `~/.cargo/bin` and the mise shims. The
+/// declared provider's own directories are skipped by path component (`homebrew` for brew, the
+/// mise shim directory for mise), never by substring. A directory that cannot be examined is an
+/// error, so the check fails closed.
 /// shortcut: the check compares the package name with an executable name, so a package whose
 /// binary is named differently is not caught; upgrade when adapters declare their binaries.
-fn other_owner(runner: &Runner, adapter: &str, pkg: &str) -> Option<String> {
+fn other_owner(runner: &Runner, adapter: &str, pkg: &str) -> Result<Option<String>, String> {
     let home = &runner.home;
+    let shims = home.join(".local/share/mise/shims");
     let mut dirs: Vec<PathBuf> = runner.search_path.clone();
     dirs.extend([
         home.join(".nix-profile/bin"),
         PathBuf::from("/nix/var/nix/profiles/default/bin"),
         home.join(".local/bin"),
         home.join(".cargo/bin"),
-        home.join(".local/share/mise/shims"),
+        shims.clone(),
     ]);
-    let own_prefix = match adapter {
-        HOMEBREW => Some("homebrew"),
-        MISE => Some("mise"),
-        _ => None,
+    let own = |d: &PathBuf| match adapter {
+        HOMEBREW => d.components().any(|c| c.as_os_str() == "homebrew"),
+        MISE => *d == shims,
+        _ => false,
     };
-    let leaf = pkg.rsplit('/').next().unwrap_or(pkg);
-    for d in dirs {
-        let shown = d.display().to_string();
-        if own_prefix.is_some_and(|p| shown.to_lowercase().contains(p)) {
-            continue;
-        }
-        let p = d.join(leaf);
-        if std::fs::symlink_metadata(&p)
-            .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
-            .unwrap_or(false)
-            || std::fs::metadata(&p)
-                .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
-                .unwrap_or(false)
-        {
-            return Some(format!("an executable {} exists", p.display()));
+    let name = leaf(pkg);
+    for d in dirs.iter().filter(|d| !own(d)) {
+        let p = d.join(name);
+        // The entry itself (a link counts), then what a link points to.
+        for meta in [std::fs::symlink_metadata(&p), std::fs::metadata(&p)] {
+            match meta {
+                Ok(m) if m.is_file() && m.permissions().mode() & 0o111 != 0 => {
+                    return Ok(Some(format!("an executable {} exists", p.display())));
+                }
+                Ok(_) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => break,
+                Err(e) => {
+                    return Err(format!("cannot examine {}: {}", p.display(), e.kind()));
+                }
+            }
         }
     }
-    None
+    Ok(None)
 }
 
 /// The installed state of one package by its adapter, with the owner check when the provider
@@ -234,8 +253,9 @@ pub fn probe(runner: &Runner, adapter: &str, value: &Value) -> Result<PackageSta
     };
     Ok(match state {
         PackageState::Missing => match other_owner(runner, adapter, &pkg) {
-            Some(why) => PackageState::OtherOwner(why),
-            None => PackageState::Missing,
+            Ok(Some(why)) => PackageState::OtherOwner(why),
+            Ok(None) => PackageState::Missing,
+            Err(why) => PackageState::Unknown(why),
         },
         s => s,
     })
@@ -285,6 +305,7 @@ pub fn package_facts(resolved: &Resolved, runner: &Runner) -> BTreeMap<String, P
         .map(|r| {
             let state = match probe(runner, &r.adapter, &r.value) {
                 Ok(s) => s,
+                Err(e) if e.code == Code::ManifestInvalid => PackageState::Refused(e.detail),
                 Err(e) => PackageState::Unknown(e.detail),
             };
             (r.id.clone(), state)
@@ -295,6 +316,14 @@ pub fn package_facts(resolved: &Resolved, runner: &Runner) -> BTreeMap<String, P
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_executable_name_drops_tap_and_version() {
+        assert_eq!(leaf("atuin"), "atuin");
+        assert_eq!(leaf("homebrew/core/atuin"), "atuin");
+        assert_eq!(leaf("node@20"), "node");
+        assert_eq!(leaf("npm:left-pad"), "npm:left-pad");
+    }
 
     #[test]
     fn a_package_name_is_a_checked_parameter() {

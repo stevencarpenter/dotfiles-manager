@@ -980,6 +980,11 @@ fn the_planner_code_has_no_process_network_or_write_calls() {
         "crates/cli/src/plan_cmd.rs",
     ];
     let banned = [
+        // The runner and the package probes start processes; they belong to the commands that
+        // own a scope (docs/packages.md), never to the plan builder.
+        "Runner",
+        "runner(",
+        "package_facts",
         "std::net",
         "TcpStream",
         "UdpSocket",

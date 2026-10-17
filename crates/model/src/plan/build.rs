@@ -61,6 +61,10 @@ impl Scope {
     }
 }
 
+/// The one secret adapter (docs/secrets.md). The ledger records an adapter, not a kind, so the
+/// planner names it to tell a deselected secret output (kept) from any other sensitive output.
+pub const SECRET_ADAPTER: &str = "op-template/v1";
+
 /// The kinds a configuration plan covers ([`Scope::Config`]).
 pub fn in_scope(r: &ResolvedResource) -> bool {
     Scope::Config.covers(r)
@@ -135,6 +139,8 @@ pub enum PackageState {
     Unsupported(String),
     /// The probe could not decide. Unknown support fails closed.
     Unknown(String),
+    /// The resource value is not a valid package declaration (a bad name). Not a probe result.
+    Refused(String),
 }
 
 impl PackageState {
@@ -146,6 +152,7 @@ impl PackageState {
             PackageState::OtherOwner(w) => format!("other-owner:{w}"),
             PackageState::Unsupported(w) => format!("unsupported:{w}"),
             PackageState::Unknown(w) => format!("unknown:{w}"),
+            PackageState::Refused(w) => format!("refused:{w}"),
         }
     }
 }
@@ -683,9 +690,13 @@ impl Planner<'_> {
         let mut op = self.skeleton(r, id.clone(), path);
         op.status = Status::NotInScope;
         op.effect = effect;
-        match declared_mode(r) {
-            Ok(m) => op.mode = m,
-            Err(f) => self.blocker(r, op.path.clone().as_deref(), f),
+        // Only a secret declares a mode. A native document (git-config) may hold a `mode` table
+        // of its own, which is not a file mode.
+        if r.kind == "secret" {
+            match declared_mode(r) {
+                Ok(m) => op.mode = m,
+                Err(f) => self.blocker(r, op.path.clone().as_deref(), f),
+            }
         }
         self.ops.insert(id, op);
     }
@@ -1063,6 +1074,16 @@ impl Planner<'_> {
                 op.effect = format!("blocked: {}", f.detail);
                 self.blocker(r, None, f);
             }
+            Some(PackageState::Refused(why)) => {
+                let f = fail(
+                    Code::ManifestInvalid,
+                    "/name",
+                    why,
+                    format!("correct the resource value in {}", r.declared_in),
+                );
+                op.effect = format!("blocked: {}", f.detail);
+                self.blocker(r, None, f);
+            }
             None => {
                 let f = fail(
                     Code::ProbeFailed,
@@ -1256,6 +1277,18 @@ impl Planner<'_> {
                 ));
             }
             _ => {}
+        }
+        // A secret output (docs/secrets.md) is never removed and never retired. The file and its
+        // ledger entry stay until the user deletes them by hand.
+        if o.class == Class::Sensitive && o.adapter == SECRET_ADAPTER {
+            op.action = Action::None;
+            op.status = Status::Current;
+            op.ownership = Ownership::Owned;
+            op.effect = format!(
+                "{path} is a secret output of a deselected resource; kept with its ledger entry. The manager never removes a secret: delete the file by hand if you want it gone"
+            );
+            op.postcondition = format!("{path} is left as it is");
+            return Ok(());
         }
         if let (Some((n, items)), Node::File { .. }) = (o.coowned_entries, &seen.node) {
             // A co-owned file is never deleted. Only the entries the manager added are retired.
@@ -1955,6 +1988,62 @@ mod tests {
             dir_claims: vec![],
             precedence: None,
         }
+    }
+
+    fn of_kind(kind: &str) -> ResolvedResource {
+        ResolvedResource {
+            kind: kind.into(),
+            ..resource(kind == "secret")
+        }
+    }
+
+    #[test]
+    fn each_scope_covers_its_kinds_and_excuses_the_others() {
+        for kind in ["link", "render", "merge", "assemble", "distribution"] {
+            assert!(Scope::Config.covers(&of_kind(kind)), "{kind}");
+            assert!(!Scope::Secrets.covers(&of_kind(kind)), "{kind}");
+            assert!(!Scope::Packages.covers(&of_kind(kind)), "{kind}");
+            assert_eq!(
+                Scope::Secrets.excuse(&of_kind(kind)),
+                format!("{kind} is configuration, outside a secrets plan")
+            );
+        }
+        assert!(Scope::Secrets.covers(&of_kind("secret")));
+        assert!(Scope::Packages.covers(&of_kind("package")));
+        for scope in [Scope::Config, Scope::Secrets, Scope::Packages] {
+            assert!(!scope.covers(&of_kind("application")), "{scope:?}");
+        }
+        // The configuration plan keeps the original secret text; other scopes say which plan.
+        assert_eq!(
+            Scope::Config.excuse(&of_kind("secret")),
+            "secret output: destination and mode only; rendering needs the secrets command"
+        );
+        assert!(
+            Scope::Packages
+                .excuse(&of_kind("secret"))
+                .ends_with(", outside a packages plan")
+        );
+        assert_eq!(
+            Scope::Config.excuse(&of_kind("package")),
+            "package is provisioning, outside a config plan"
+        );
+        assert_eq!(Scope::Packages.as_str(), "packages");
+    }
+
+    #[test]
+    fn a_package_state_has_one_precondition_string_per_variant() {
+        let states = [
+            PackageState::Installed("1.2".into()),
+            PackageState::Missing,
+            PackageState::OtherOwner("x".into()),
+            PackageState::Unsupported("root".into()),
+            PackageState::Unknown("timeout".into()),
+            PackageState::Refused("bad name".into()),
+        ];
+        let strings: BTreeSet<String> = states.iter().map(PackageState::state).collect();
+        assert_eq!(strings.len(), states.len());
+        assert_eq!(PackageState::Missing.state(), "missing");
+        assert_eq!(states[0].state(), "installed:1.2");
     }
 
     fn link(to: LinkTo) -> Seen {

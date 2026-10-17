@@ -9,7 +9,7 @@ use crate::{Ctx, Loaded, load_resolved, read_existing_binding, usage};
 use dfm_engine::{Dir, Fail, Store, merge, observe};
 use dfm_model::display::visible;
 use dfm_model::plan::{
-    self, Binary, Context, MAX_PLAN_BYTES, Owned, Plan, Saved, Scope, Stale, Status,
+    self, Binary, Context, MAX_PLAN_BYTES, Owned, PackageState, Plan, Saved, Scope, Stale, Status,
     source_identity,
 };
 use dfm_model::{Code, Refusal};
@@ -92,14 +92,25 @@ fn owned(store: &Store, home: &Path) -> Result<Vec<Owned>, Refusal> {
 
 /// Builds the configuration plan for the bound profile. Read-only.
 pub fn make_plan(ctx: &Ctx, root: &Path) -> Result<Plan, Refusal> {
-    plan_for(ctx, &load_resolved(ctx, root)?, Scope::Config)
+    plan_for(
+        ctx,
+        &load_resolved(ctx, root)?,
+        Scope::Config,
+        BTreeMap::new(),
+    )
 }
 
 /// As [`make_plan`], for sources that are already resolved (`doctor` resolves once) and for one
 /// scope. A secrets plan reads each secret destination in memory for its verdict and nothing
-/// else; a configuration plan never reads one (docs/secrets.md). A packages plan probes each
-/// provider's listing, read-only (docs/packages.md); every other scope starts no process.
-pub fn plan_for(ctx: &Ctx, loaded: &Loaded, scope: Scope) -> Result<Plan, Refusal> {
+/// else; a configuration plan never reads one (docs/secrets.md). A packages plan takes the
+/// providers' answers in `package` from the caller (`packages` probes before it plans,
+/// docs/packages.md): nothing in this module starts a process.
+pub fn plan_for(
+    ctx: &Ctx,
+    loaded: &Loaded,
+    scope: Scope,
+    package: BTreeMap<String, PackageState>,
+) -> Result<Plan, Refusal> {
     let layout = ctx.layout();
     let sys = ctx.sys()?;
     // Ownership decides what may be replaced. Without state it is unknown, so planning fails
@@ -168,14 +179,7 @@ pub fn plan_for(ctx: &Ctx, loaded: &Loaded, scope: Scope) -> Result<Plan, Refusa
             &sys,
             &home,
             &layout.home,
-            &ledger,
         ),
-        _ => BTreeMap::new(),
-    };
-    let package = match scope {
-        Scope::Packages => {
-            crate::adapters::package::package_facts(&loaded.resolved, &ctx.runner(&sys))
-        }
         _ => BTreeMap::new(),
     };
     let cx = Context {

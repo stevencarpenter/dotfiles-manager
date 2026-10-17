@@ -175,9 +175,31 @@ fn run_inner(
         )
     })?;
     let root = Path::new(&args.root);
+    // The one place the handlers are installed. A scope that starts a provider child (a session
+    // check, a probe) arms them now, before that child, so a stop request ends the child instead
+    // of leaving it running (docs/secrets.md, docs/packages.md). The checks below then turn a
+    // recorded signal into exit 130 or 143 before anything is written.
+    let arm = || dfm_engine::signal::install();
+    let stop = || dfm_engine::signal::requested().map_or(Ok(()), Err);
+    if args.scope != Scope::Config {
+        arm()?;
+    }
     // Read-only look first. A refusal here changes nothing, not even the lock file.
     let first = load_resolved(ctx, root)?;
-    let plan = plan_for(ctx, &first, args.scope)?;
+    // A packages plan needs the providers' answers first (docs/packages.md). The probes are
+    // read-only and run only for this scope.
+    let probes = |resolved: &dfm_model::resolve::Resolved| match args.scope {
+        Scope::Packages => {
+            let sys = ctx.sys()?;
+            Ok(crate::adapters::package::package_facts(
+                resolved,
+                &ctx.runner(&sys),
+            ))
+        }
+        _ => Ok::<_, Refusal>(BTreeMap::new()),
+    };
+    let plan = plan_for(ctx, &first, args.scope, probes(&first.resolved)?)?;
+    stop()?;
     let digest = plan.digest()?;
     if let Some(i) = &ctx.isolated {
         writeln!(out, "isolated: true {i}").map_err(w)?;
@@ -230,6 +252,7 @@ fn run_inner(
     if args.scope == Scope::Secrets {
         crate::adapters::secret::credentials(&plan, &first.resolved, &ctx.runner(&sys))?;
     }
+    stop()?;
     if args.preview {
         return Ok(());
     }
@@ -253,7 +276,9 @@ fn run_inner(
         .require_identity(&binding)
         .map_err(|r| store.stamp(r))?;
     let second = load_resolved(ctx, root).map_err(|r| store.stamp(r))?;
-    let locked = plan_for(ctx, &second, args.scope).map_err(|r| store.stamp(r))?;
+    let facts = probes(&second.resolved).map_err(|r| store.stamp(r))?;
+    let locked = plan_for(ctx, &second, args.scope, facts).map_err(|r| store.stamp(r))?;
+    stop().map_err(|r| store.stamp(r))?;
     let locked_digest = locked.digest().map_err(|r| store.stamp(r))?;
     if locked_digest != digest {
         return Err(store.stamp(stale(approved, &locked_digest)));
@@ -270,10 +295,12 @@ fn run_inner(
         allow_adopt: &args.allow_adopt,
         fail: &fail,
     };
-    // Handlers go in after the lock and the second plan, and before the first mutation (settling
-    // writes the journal). A secrets or packages run starts a provider after this; the runner
-    // ends it on a stop request (docs/architecture.md section 10 item 7).
-    dfm_engine::signal::install().map_err(|r| store.stamp(r))?;
+    // For `apply` the handlers go in here: after the lock and the second plan (which ran `id -u`)
+    // and before the first mutation (settling writes the journal). `secrets` and `packages` armed
+    // them before their first child process, above.
+    if args.scope == Scope::Config {
+        arm().map_err(|r| store.stamp(r))?;
+    }
     fail.hit("apply-after-install")
         .map_err(|r| store.stamp(r))?;
     let started = now_ns().map_err(|r| store.stamp(r))?;

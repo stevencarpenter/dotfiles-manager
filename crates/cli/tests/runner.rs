@@ -10,11 +10,15 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 fn runner(bin: &Path) -> Runner {
+    // The commands that start a provider install the handlers first, so the child gets its own
+    // process group. Installing them in the test process changes nothing else here.
+    dfm_engine::signal::install().unwrap();
     Runner {
         search_path: vec![bin.to_path_buf()],
         home: bin.to_path_buf(),
         cwd: bin.join("run"),
         uid: std::fs::metadata(bin).unwrap().uid(),
+        grace: Duration::from_secs(1),
     }
 }
 
@@ -76,6 +80,29 @@ fn the_environment_is_rebuilt_and_stdin_reaches_the_child() {
 }
 
 #[test]
+fn a_process_that_keeps_the_pipes_open_is_ended_and_run_returns_within_the_bound() {
+    let d = scratch("linger");
+    // The background sleep inherits stdout and would hold it for 20 s.
+    script(&d.join("bin"), "tool", "(sleep 20 &) ; exit 0");
+    let r = runner(&d.join("bin"));
+    let t = Instant::now();
+    let out = r.run(&req(&[], None, 5)).unwrap();
+    assert!(matches!(out.end, End::Exited(0)), "{out:?}");
+    assert!(t.elapsed() < Duration::from_secs(4), "{:?}", t.elapsed());
+    // A member that ignores SIGTERM gets SIGKILL after the grace period.
+    script(
+        &d.join("bin"),
+        "tool",
+        "(trap '' TERM; exec sleep 20) & sleep 20",
+    );
+    let t = Instant::now();
+    let out = r.run(&req(&[], None, 1)).unwrap();
+    assert!(matches!(out.end, End::TimedOut), "{out:?}");
+    assert!(t.elapsed() < Duration::from_secs(6), "{:?}", t.elapsed());
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
 fn a_timeout_ends_the_child_and_reports_it() {
     let d = scratch("timeout");
     script(&d.join("bin"), "tool", "sleep 30; echo late");
@@ -116,7 +143,7 @@ fn output_over_the_cap_is_refused_and_stderr_is_bounded() {
     script(
         &d.join("bin"),
         "tool",
-        "head -c 10000 /dev/zero | tr '\\0' e >&2; head -c 20 /dev/zero",
+        "head -c 40000000 /dev/zero | tr '\\0' e >&2; head -c 20 /dev/zero",
     );
     let r = runner(&d.join("bin"));
     let out = r

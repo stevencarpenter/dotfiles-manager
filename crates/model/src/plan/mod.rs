@@ -11,8 +11,8 @@ mod graph;
 mod stale;
 
 pub use build::{
-    Context, MergeFact, MergeVerdict, Owned, PackageState, Scope, SecretVerdict, build, followups,
-    in_scope, ledger_state, matches_pattern, requests, sensitive_paths,
+    Context, MergeFact, MergeVerdict, Owned, PackageState, SECRET_ADAPTER, Scope, SecretVerdict,
+    build, followups, in_scope, ledger_state, matches_pattern, requests, sensitive_paths,
 };
 pub use stale::{Stale, StaleKind, stale};
 

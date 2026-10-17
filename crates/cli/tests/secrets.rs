@@ -40,7 +40,7 @@ mode = 0o600
 const FAKE_OP: &str = r#"#!/bin/sh
 PATH=/usr/bin:/bin:$PATH
 here=$(dirname "$0")
-printf '%s\n' "$*" >> "$here/../log"
+printf '%s | session=%s user=%s\n' "$*" "${OP_SESSION_planted:-unset}" "${USER:-none}" >> "$here/../log"
 if [ ! -e "$here/../signed-in" ]; then
   echo "[ERROR] no session PLANTED-STDERR-9c4f" >&2
   exit 1
@@ -138,9 +138,21 @@ impl Fx {
         fs::write(self.fake.path().join(name), "").unwrap();
     }
 
-    /// Every `op` invocation so far, one line of arguments each.
+    /// Every `op` invocation so far, one line of arguments each. The file exists only once `op`
+    /// ran; a test that expects no run checks that.
     fn op_log(&self) -> String {
         fs::read_to_string(self.fake.path().join("log")).unwrap_or_default()
+    }
+
+    fn op_ran(&self) -> bool {
+        self.fake.path().join("log").exists()
+    }
+
+    fn set_modules(&self, modules: &str) {
+        self.put(
+            "profiles/t-01.toml",
+            &common::PROFILE.replace("modules = [\"extra\"]", &format!("modules = [{modules}]")),
+        );
     }
 
     fn run(&self, args: &[&str]) -> Output {
@@ -242,7 +254,11 @@ fn a_configuration_plan_lists_the_secret_out_of_scope_and_never_starts_op() {
     assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
     assert!(text(&o.stdout).contains("not_in_scope extra.token@scope"));
     assert!(!fx.h(TARGET).exists());
-    assert_eq!(fx.op_log(), "", "op was started by plan or apply");
+    assert!(
+        !fx.op_ran(),
+        "op was started by plan or apply: {}",
+        fx.op_log()
+    );
 }
 
 #[test]
@@ -271,7 +287,8 @@ fn without_a_session_secrets_exits_3_before_any_write_and_the_preview_still_show
     // Only the session check ran, with the declared account. Nothing was rendered.
     let log = fx.op_log();
     assert!(
-        log.lines().all(|l| l == "whoami --account example-account"),
+        log.lines()
+            .all(|l| l.starts_with("whoami --account example-account |")),
         "{log}"
     );
     assert!(!stderr(&o).contains(STDERR_MARK) && !text(&o.stdout).contains(STDERR_MARK));
@@ -470,5 +487,63 @@ fn secrets_takes_no_removal_flag_and_doctor_still_runs() {
     assert_eq!(code(&o), 2, "{}", stderr(&o));
     let o = fx.run(&["doctor", "--root", fx.root_arg()]);
     assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
-    assert_eq!(fx.op_log(), "", "doctor started op");
+    assert!(!fx.op_ran(), "doctor started op: {}", fx.op_log());
+}
+
+#[test]
+fn a_deselected_secret_keeps_its_file_and_entry_and_apply_still_runs() {
+    let fx = Fx::new();
+    let o = fx.secrets(&digest_of(&fx.preview()), &[]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let before = fx.content();
+    fx.set_modules("");
+    let o = fx.run(&["plan", "--root", fx.root_arg()]);
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+    let t = text(&o.stdout);
+    assert!(t.contains("current remove@extra.token@"), "{t}");
+    assert!(t.contains("kept with its ledger entry"), "{t}");
+    assert!(!t.contains("retire"), "{t}");
+    let d = digest_of(&o);
+    let o = fx.run(&["apply", "--root", fx.root_arg(), "--yes-plan", &d]);
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+    assert!(text(&o.stdout).contains("result: ok"));
+    assert_eq!(fx.content(), before);
+    assert!(fx.secret_entry().is_some(), "the ledger entry was dropped");
+    // The secrets plan of the deselected profile lists nothing for it either.
+    let o = fx.preview();
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    assert!(
+        !text(&o.stdout).contains("extra.token@"),
+        "{}",
+        text(&o.stdout)
+    );
+}
+
+#[test]
+fn a_changed_declared_mode_is_applied_and_the_session_reaches_op() {
+    let fx = Fx::new();
+    let o = fx.secrets(&digest_of(&fx.preview()), &[]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    assert_eq!(fx.mode(), 0o600);
+    // Only the OP_* variables of the caller reach op; USER does not.
+    let log = fx.op_log();
+    assert!(
+        log.lines()
+            .all(|l| l.ends_with("| session=should-pass-through user=none")),
+        "{log}"
+    );
+    // Same bytes, another declared mode: written, not current.
+    fx.put(
+        "base/modules/extra/module.toml",
+        &EXTRA.replace("mode = 0o600", "mode = 0o400"),
+    );
+    let o = fx.secrets(&digest_of(&fx.preview()), &[]);
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+    assert!(
+        text(&o.stdout).contains(&format!("updated {OP_ID}")),
+        "{}",
+        text(&o.stdout)
+    );
+    assert_eq!(fx.mode(), 0o400);
+    assert_eq!(fx.content(), format!("TOKEN={SECRET}\n").as_bytes());
 }

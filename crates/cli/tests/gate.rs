@@ -352,10 +352,10 @@ fn the_unsafe_lint_is_named_only_in_the_crate_roots_and_on_the_two_signal_functi
     assert_eq!(engine.matches(&lint).count(), 1);
     assert!(engine.contains(&format!("#![deny({lint})]")));
     // The signal module: one `expect` each, directly on `pub fn install` (the handlers) and on
-    // `pub(crate) fn kill_group` (ending a provider child, DFM-22), and no `allow`.
+    // `pub(crate) fn kill_child` (ending a provider child, DFM-22), and no `allow`.
     let module = fs::read_to_string(repo_root().join("crates/engine/src/signal.rs")).unwrap();
     let flat: String = module.split_whitespace().collect::<Vec<_>>().join(" ");
-    let functions = ["pub fn install()", "pub(crate) fn kill_group("];
+    let functions = ["pub fn install()", "pub(crate) fn kill_child("];
     assert_eq!(module.matches(&lint).count(), functions.len(), "{module}");
     assert!(
         !flat.contains(&format!("allow({lint}")),
@@ -413,19 +413,30 @@ fn only_the_mutating_path_of_apply_installs_the_signal_handlers() {
     rs_files(&repo_root().join("crates"), &mut files);
     let callers: Vec<_> = files
         .iter()
-        .filter(|f| !f.ends_with("crates/engine/src/signal.rs") && !f.ends_with("tests/gate.rs"))
+        // The runner tests install the handlers to get the process-group mode; they are tests.
+        .filter(|f| {
+            !f.ends_with("crates/engine/src/signal.rs")
+                && !f.ends_with("tests/gate.rs")
+                && !f.ends_with("tests/runner.rs")
+        })
         .filter(|f| fs::read_to_string(f).unwrap().contains("signal::install("))
         .map(|f| f.strip_prefix(repo_root()).unwrap().display().to_string())
         .collect();
     assert_eq!(callers, ["crates/cli/src/apply_cmd.rs"]);
     let t = fs::read_to_string(repo_root().join("crates/cli/src/apply_cmd.rs")).unwrap();
-    let install = t.find("signal::install(").unwrap();
+    // One closure holds the call; it is armed in two places, both guarded by the scope.
     assert_eq!(t.matches("signal::install(").count(), 1);
-    assert!(t.find("if args.preview {").unwrap() < install);
-    assert!(t.find("Store::open_write_with(").unwrap() < install);
-    // After the second plan (which runs `id -u`), so no child process starts after the install.
-    assert!(t.find("let locked = plan_for(").unwrap() < install);
-    assert!(install < t.find("apply(&run, &locked)").unwrap());
+    let arms: Vec<usize> = t.match_indices("arm()").map(|(i, _)| i).collect();
+    assert_eq!(arms.len(), 2, "{arms:?}");
+    // The scopes that start a provider child arm before the first child (the first plan).
+    assert!(t.find("if args.scope != Scope::Config {").unwrap() < arms[0]);
+    assert!(arms[0] < t.find("let first = load_resolved(").unwrap());
+    // `apply` arms after the lock and the second plan (which runs `id -u`), before the first write.
+    assert!(t.find("if args.scope == Scope::Config {").unwrap() < arms[1]);
+    assert!(t.find("if args.preview {").unwrap() < arms[1]);
+    assert!(t.find("Store::open_write_with(").unwrap() < arms[1]);
+    assert!(t.find("let locked = plan_for(").unwrap() < arms[1]);
+    assert!(arms[1] < t.find("apply(&run, &locked)").unwrap());
 }
 
 /// rustix is the one crate allowed to reach the OS, through its safe fs API only. Its resolved
