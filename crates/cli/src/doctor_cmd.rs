@@ -753,7 +753,7 @@ fn profile_rows(
             .optional()
         });
     }
-    let plan = match plan_cmd::plan_for(ctx, &loaded) {
+    let plan = match plan_cmd::plan_for(ctx, &loaded, dfm_model::plan::Scope::Config) {
         Ok(p) => Some(p),
         Err(r) => {
             rows.push(refusal_row("plan", "plan", &r));

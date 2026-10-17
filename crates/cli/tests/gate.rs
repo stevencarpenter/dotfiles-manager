@@ -323,7 +323,7 @@ fn has_keyword(code: &str, word: &str) -> bool {
 /// and in the signal module, and the exception is one `expect` on `install`. This reads raw
 /// text, so a comment, a raw string or a character literal cannot hide an attribute.
 #[test]
-fn the_unsafe_lint_is_named_only_in_the_crate_roots_and_on_the_signal_install_function() {
+fn the_unsafe_lint_is_named_only_in_the_crate_roots_and_on_the_two_signal_functions() {
     let lint = ["un", "safe_code"].concat();
     let roots = [
         "crates/model/src/lib.rs",
@@ -351,26 +351,36 @@ fn the_unsafe_lint_is_named_only_in_the_crate_roots_and_on_the_signal_install_fu
     let engine = fs::read_to_string(repo_root().join("crates/engine/src/lib.rs")).unwrap();
     assert_eq!(engine.matches(&lint).count(), 1);
     assert!(engine.contains(&format!("#![deny({lint})]")));
-    // The signal module: one `expect`, directly on `pub fn install`, and no `allow`.
+    // The signal module: one `expect` each, directly on `pub fn install` (the handlers) and on
+    // `pub(crate) fn kill_group` (ending a provider child, DFM-22), and no `allow`.
     let module = fs::read_to_string(repo_root().join("crates/engine/src/signal.rs")).unwrap();
     let flat: String = module.split_whitespace().collect::<Vec<_>>().join(" ");
-    assert_eq!(module.matches(&lint).count(), 1, "{module}");
+    let functions = ["pub fn install()", "pub(crate) fn kill_group("];
+    assert_eq!(module.matches(&lint).count(), functions.len(), "{module}");
     assert!(
-        flat.contains(&format!("#[expect( {lint}, reason = "))
-            || flat.contains(&format!("#[expect({lint}, reason = ")),
-        "signal.rs lacks the expect attribute"
+        !flat.contains(&format!("allow({lint}")),
+        "signal.rs allows {lint}"
     );
-    let at = flat.find(&format!("{lint},")).unwrap();
-    let after = &flat[at..];
-    let end = after.find("pub fn ").unwrap();
-    assert!(
-        after[end..].starts_with("pub fn install()"),
-        "the expect is not on install"
-    );
-    assert!(
-        !after[..end].contains("fn "),
-        "the expect is not on install"
-    );
+    let mut rest = flat.as_str();
+    for want in functions {
+        let at = rest
+            .find(&format!("#[expect( {lint}, reason = "))
+            .or_else(|| rest.find(&format!("#[expect({lint}, reason = ")))
+            .unwrap_or_else(|| panic!("signal.rs lacks the expect attribute for {want}"));
+        let after = &rest[at..];
+        let end = after.find("fn ").unwrap();
+        // The attribute sits directly on the function: nothing else is declared between them.
+        assert!(
+            after[..end].matches("fn ").count() == 0
+                && after[end..].starts_with(
+                    want.trim_start_matches("pub(crate) ")
+                        .trim_start_matches("pub ")
+                ),
+            "the expect is not on {want}: {}",
+            &after[..end.min(200)]
+        );
+        rest = &after[end..];
+    }
     let manifest = fs::read_to_string(repo_root().join("Cargo.toml")).unwrap();
     assert!(manifest.contains(&format!("{lint} = \"deny\"")));
 }
@@ -470,12 +480,13 @@ fn rustix_is_resolved_with_exactly_the_alloc_fs_and_std_features() {
 }
 
 /// The environment variables only a `test-isolation` build reads.
-const ISOLATION_NAMES: [&str; 5] = [
+const ISOLATION_NAMES: [&str; 6] = [
     "DFM_WIDTH",
     "DFM_FAILPOINT",
     "DFM_HOME",
     "DFM_BINDING",
     "DFM_PLATFORM",
+    "DFM_PROVIDER_PATH",
 ];
 
 #[test]

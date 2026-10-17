@@ -65,5 +65,9 @@ required-features = ["test-isolation"]
 name = "native_config"
 required-features = ["test-isolation"]
 
+[[test]]
+name = "secrets"
+required-features = ["test-isolation"]
+
 [lints]
 workspace = true

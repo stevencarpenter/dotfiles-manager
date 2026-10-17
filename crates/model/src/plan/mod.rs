@@ -11,8 +11,8 @@ mod graph;
 mod stale;
 
 pub use build::{
-    Context, MergeFact, MergeVerdict, Owned, build, followups, in_scope, ledger_state,
-    matches_pattern, requests, sensitive_paths,
+    Context, MergeFact, MergeVerdict, Owned, Scope, SecretVerdict, build, followups, in_scope,
+    ledger_state, matches_pattern, requests, sensitive_paths,
 };
 pub use stale::{Stale, StaleKind, stale};
 
@@ -377,7 +377,8 @@ pub struct Plan {
     pub schema: i64,
     pub command: String,
     /// `config`: links, rendered and merged files, assembled files and distributions.
-    /// Provisioning and secrets are out of scope (DESIGN.md section 7).
+    /// `secrets`: rendered secret outputs. `packages`: package installs. Every other resource
+    /// appears as `not_in_scope` (DESIGN.md section 7; [`Scope`]).
     pub scope: String,
     pub binary: Binary,
     pub profile: String,

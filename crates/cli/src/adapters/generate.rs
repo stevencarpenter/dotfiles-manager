@@ -1,8 +1,8 @@
 //! The `render` and `assemble` adapters (docs/adapters.md). Pure functions of the resource
 //! value and the verified inputs apply or the planner supplies. They open no file.
 
-use super::{Adapter, registry};
-use dfm_engine::{Dir, Generator, GeneratorInputs, Got, Sys};
+use super::{Adapter, registry, secret};
+use dfm_engine::{Dir, Generator, GeneratorInputs, Got, Runner, Sys};
 use dfm_model::digest::sha256_hex;
 use dfm_model::fold;
 use dfm_model::merge::{Desired, Merged, merge_with, retire};
@@ -40,6 +40,8 @@ pub const TEXT_FRAGMENTS: Gen = Gen {
 pub struct Generators<'a> {
     resolved: &'a Resolved,
     table: Vec<Adapter>,
+    /// How a provider child is started. `None` in a build of the plan: nothing renders then.
+    runner: Option<Runner>,
 }
 
 impl<'a> Generators<'a> {
@@ -47,6 +49,15 @@ impl<'a> Generators<'a> {
         Generators {
             resolved,
             table: registry(),
+            runner: None,
+        }
+    }
+
+    /// Generators that can also render a secret through `runner` (the `secrets` command).
+    pub fn with_runner(resolved: &'a Resolved, runner: Runner) -> Self {
+        Generators {
+            runner: Some(runner),
+            ..Generators::new(resolved)
         }
     }
 
@@ -143,6 +154,31 @@ impl Generator for Generators<'_> {
             &inputs.owned_appended,
             inputs.takeover,
         )
+    }
+
+    fn renders(&self, op: &Operation) -> bool {
+        op.class == Class::Sensitive
+            && matches!(op.action, Action::CreateFile | Action::UpdateFile)
+            && self.runner.is_some()
+            && self.resolved.resources.contains_key(&op.resource)
+            && self
+                .table
+                .iter()
+                .any(|a| a.spec.id == op.adapter && a.renders())
+    }
+
+    fn render(&self, op: &Operation, template: &[u8]) -> Result<Vec<u8>, Refusal> {
+        let runner = self
+            .runner
+            .as_ref()
+            .filter(|_| self.renders(op))
+            .ok_or_else(|| {
+                Refusal::new(
+                    Code::GeneratorUnavailable,
+                    format!("no render adapter for {}", op.adapter),
+                )
+            })?;
+        secret::render(runner, self.value(op)?, template)
     }
 
     fn supports(&self, op: &Operation) -> bool {

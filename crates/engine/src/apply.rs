@@ -321,18 +321,33 @@ fn first_refusal(plan: &Plan, generator: &dyn Generator) -> Result<(), Refusal> 
                 ),
             ));
         }
-        // A sensitive output has no content hash. Apply admits one kind of sensitive operation,
-        // the co-owned merge, which has its own conflict detection (docs/apply.md, Merge). Any
-        // other sensitive operation, a directory included, refuses the whole plan.
+        // A sensitive output has no content hash. Apply admits two kinds of sensitive operation:
+        // the co-owned merge, which has its own conflict detection (docs/apply.md, Merge), and a
+        // rendered secret (docs/secrets.md). Any other sensitive operation, a directory included,
+        // refuses the whole plan.
         let merge = op.class == Class::Sensitive && generator.merges(op);
-        if op.class == Class::Sensitive && !merge {
+        let render = op.class == Class::Sensitive && !merge && generator.renders(op);
+        if op.class == Class::Sensitive && !merge && !render {
             return Err(Refusal::new(
                 Code::SensitiveUnsupported,
                 format!(
-                    "{}: this sensitive output is not published or removed by this build (only the claude-settings/v1 merge is)",
+                    "{}: this sensitive output is not published or removed by this build (only the claude-settings/v1 merge and an op-template/v1 secret are)",
                     op.id
                 ),
             ));
+        }
+        if render {
+            if !is_file_action(op.action)
+                || op.output_sha256.is_some()
+                || op.managed_sha256.is_some()
+                || op.inputs.len() != 1
+            {
+                return Err(plan_invalid(format!(
+                    "{} renders a secret but is not a file write with one template and no content hash",
+                    op.id
+                )));
+            }
+            continue;
         }
         if merge {
             if op.action != Action::Retire && op.managed_sha256.is_none() {
@@ -849,6 +864,9 @@ impl Exec<'_, '_> {
             if self.run.generator.merges(op) {
                 return self.try_merge(op);
             }
+            if self.run.generator.renders(op) {
+                return self.try_render(op);
+            }
             return Err(failed(Refusal::new(
                 Code::SensitiveUnsupported,
                 format!("{}: sensitive outputs are not supported", op.id),
@@ -1185,7 +1203,15 @@ impl Exec<'_, '_> {
         self.journal_at(op, &id, Phase::Intent, Some(recovery), None, at.clone())
             .map_err(|e| Ended::Failed(e, Some(id.clone())))?;
         let effect = crate::fsys::staged_as(&id, &at, || {
-            self.merge_effect(rel, parent, name, read, &merged.bytes, merged.changed)
+            self.merge_effect(
+                rel,
+                parent,
+                name,
+                read,
+                &merged.bytes,
+                merged.changed,
+                dfm_model::merge::MODE,
+            )
         });
         if let Err(e) = effect {
             return Err(self.fail_after_intent(op, &id, abs, e));
@@ -1205,6 +1231,7 @@ impl Exec<'_, '_> {
                         appended: merged.appended.clone(),
                         leaves,
                     },
+                    dfm_model::merge::MODE,
                 ),
             });
         if let Err(e) = settled {
@@ -1223,12 +1250,16 @@ impl Exec<'_, '_> {
         })
     }
 
-    /// Publishes the merged bytes when they differ from the live file, then reads the result
-    /// back. The replace is guarded by the identity captured at the re-read, not by a hash of
-    /// the whole file. The read-back always runs, also when nothing was written: the bytes must
-    /// be the merged bytes, and the mode must be the mode this operation left (the merge mode
-    /// after a write, the mode read before for an unchanged file). It compares in memory and
-    /// records nothing.
+    /// Publishes the merged (or rendered) bytes when they differ from the live file, then reads
+    /// the result back. The replace is guarded by the identity captured at the re-read, not by a
+    /// hash of the whole file. The read-back always runs, also when nothing was written: the
+    /// bytes must be the bytes in memory, and the mode must be the mode this operation left
+    /// (`mode` after a write, the mode read before for an unchanged file). It compares in memory
+    /// and records nothing.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "one effect needs the facts read before it"
+    )]
     fn merge_effect(
         &self,
         rel: &str,
@@ -1237,6 +1268,7 @@ impl Exec<'_, '_> {
         read: &MergeRead,
         bytes: &[u8],
         changed: bool,
+        mode: u32,
     ) -> Result<(), Refusal> {
         let fail = self.run.fail;
         fail.hit("apply-before-effect")?;
@@ -1245,7 +1277,7 @@ impl Exec<'_, '_> {
                 Some(s) => Publish::ReplaceStamp(s),
                 None => Publish::Create,
             };
-            parent.publish_file(name, bytes, dfm_model::merge::MODE, how, MAX_FILE, fail)?;
+            parent.publish_file(name, bytes, mode, how, MAX_FILE, fail)?;
         }
         fail.hit("apply-after-effect")?;
         let bad = |what: &str| {
@@ -1260,15 +1292,176 @@ impl Exec<'_, '_> {
         if h != file_fingerprint(bytes) {
             return Err(bad("the content read back differs"));
         }
-        let want_mode = if changed {
-            Some(dfm_model::merge::MODE)
-        } else {
-            read.mode
-        };
+        let want_mode = if changed { Some(mode) } else { read.mode };
         if parent.entry_mode(name)? != want_mode {
             return Err(bad("the mode differs"));
         }
         Ok(())
+    }
+
+    /// A rendered secret (`op-template/v1`, docs/secrets.md). Like a merge, the live file is read
+    /// under the writer lock and compared by a per-machine salted hash only; nothing records or
+    /// prints an unsalted hash or a byte of the content. Order: prerequisites, re-read, ledger
+    /// check (a file the ledger does not prove ours needs the `takeover` approval), the template
+    /// read from the source root, the render, then intent, publish, read-back, outcome, ledger.
+    /// A render that fails or is empty fails the operation before the intent entry, so the
+    /// previous file stays the last good one. Rendered bytes equal to the live file with a
+    /// matching ledger hash are `current`: nothing is journaled or written.
+    fn try_render(&mut self, op: &Operation) -> Result<Ended, Ended> {
+        let rel = op
+            .path
+            .as_deref()
+            .ok_or_else(|| failed(plan_invalid("no path")))?;
+        let comps = components(rel).map_err(failed)?;
+        let abs = self.abs(rel).map_err(failed)?;
+        self.unknown_block(op, rel, &abs)?;
+        self.prerequisites(op, rel)?;
+        let (name, parents) = comps
+            .split_last()
+            .ok_or_else(|| failed(plan_invalid("empty path")))?;
+        let parent = self
+            .run
+            .home
+            .open_below(&self.run.sys, parents)
+            .map_err(Ended::Blocked)?;
+        let read = self.merge_read(op, rel, &parent, name)?;
+        // What the ledger records for this path, if the manager wrote it before.
+        let ledger = self.run.store.read_ledger_lenient().map_err(failed)?;
+        let want = fold(&abs);
+        let recorded: Option<String> = ledger
+            .resources
+            .iter()
+            .filter(|r| r.resource == op.resource)
+            .flat_map(|r| &r.owned_outputs)
+            .find(|o| fold(&o.path) == want)
+            .and_then(|o| o.coowned.as_ref().map(|c| c.managed_hash.clone()));
+        let salt = self.run.store.salt().map_err(Ended::Blocked)?;
+        let salted_live = match (&read.live, &salt) {
+            (Some(live), Some(s)) => Some(salted(s, live)),
+            _ => None,
+        };
+        // A file the plan took for ours must still be ours now. A takeover was approved by id.
+        if read.live.is_some() && !op.takeover && (recorded.is_none() || salted_live != recorded) {
+            return Err(blocked(
+                Code::Conflict,
+                format!(
+                    "{rel} changed since the plan and the ledger no longer proves the manager wrote it; nothing was changed. Fix: plan again and approve the takeover with --allow-adopt"
+                ),
+            ));
+        }
+        let template = self.template(op)?;
+        self.run.fail.hit("apply-after-prereq").map_err(failed)?;
+        let bytes = match self.run.generator.render(op, &template) {
+            Ok(b) => b,
+            // No session: a gate, not a failure. Nothing ran.
+            Err(r) if r.code == Code::CredentialUnavailable => return Err(Ended::Blocked(r)),
+            Err(r) => return Err(failed(r)),
+        };
+        if bytes.is_empty() {
+            return Err(failed(Refusal::new(
+                Code::RenderFailed,
+                format!("{rel}: the provider rendered nothing; the previous file is kept"),
+            )));
+        }
+        if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > MAX_FILE {
+            return Err(failed(Refusal::new(
+                Code::LimitExceeded,
+                format!("{rel}: rendered content exceeds 16 MiB"),
+            )));
+        }
+        let mode = op.mode.unwrap_or(0o600);
+        let changed = read.live.as_deref() != Some(bytes.as_slice()) || read.mode != Some(mode);
+        if !changed && recorded.is_some() && salted_live == recorded {
+            return Ok(Ended::Current);
+        }
+        self.stop_requested()?;
+        let salt = match salt {
+            Some(s) => s,
+            None => self.run.store.salt_or_create().map_err(failed)?,
+        };
+        let new_hash = salted(&salt, &bytes);
+        let id = self.attempt_id(op);
+        let recovery = Recovery {
+            outputs: vec![RecoveryOutput {
+                path: abs.clone(),
+                existed_before: read.live.is_some(),
+                expected_sha256: None,
+            }],
+            snapshot: None,
+        };
+        let at = self.now();
+        self.journal_at(op, &id, Phase::Intent, Some(recovery), None, at.clone())
+            .map_err(|e| Ended::Failed(e, Some(id.clone())))?;
+        let effect = crate::fsys::staged_as(&id, &at, || {
+            self.merge_effect(rel, &parent, name, &read, &bytes, changed, mode)
+        });
+        if let Err(e) = effect {
+            return Err(self.fail_after_intent(op, &id, &abs, e));
+        }
+        let settled = self
+            .journal(op, &id, Phase::Done, None, None)
+            .and_then(|()| self.run.fail.hit("apply-after-done"))
+            .and_then(|()| {
+                self.record_coowned(
+                    op,
+                    &id,
+                    &abs,
+                    CoOwned {
+                        managed_hash: new_hash,
+                        entries: Vec::new(),
+                        appended: Vec::new(),
+                        leaves: Default::default(),
+                    },
+                    mode,
+                )
+            });
+        if let Err(e) = settled {
+            return Err(self.after_intent(e, &id, &abs));
+        }
+        Ok(Ended::Updated {
+            id,
+            before: None,
+            after: None,
+            owned: vec![abs],
+            reload: changed.then(|| RELOAD_NOT_ATTEMPTED.to_string()),
+        })
+    }
+
+    /// The template of a secret operation, read from the plan's source root as apply reads any
+    /// source: below the root without following a link, a regular file of the user with one
+    /// hard link, within the source file bound. The resolver records no content identity for
+    /// it, so presence and shape are what is checked (docs/apply.md, "Link source").
+    fn template(&self, op: &Operation) -> Result<Vec<u8>, Ended> {
+        let [input] = op.inputs.as_slice() else {
+            return Err(failed(plan_invalid("a secret needs exactly one template")));
+        };
+        let [source] = self.plan.sources.as_slice() else {
+            return Err(failed(plan_invalid(
+                "a plan with a secret must have exactly one source",
+            )));
+        };
+        let root = Dir::open_plain(Path::new(&source.root)).map_err(failed)?;
+        match root
+            .read_input_below(
+                &self.run.sys,
+                &input.path,
+                dfm_model::plan::MAX_SOURCE_FILE_BYTES,
+            )
+            .map_err(failed)?
+        {
+            crate::fsys::Got::Bytes(b) => Ok(b),
+            crate::fsys::Got::Absent => Err(blocked(
+                Code::PlanStale,
+                format!(
+                    "template {} changed since the plan: it is gone, not a plain file of yours or linked twice; nothing was changed",
+                    input.path
+                ),
+            )),
+            crate::fsys::Got::TooBig => Err(failed(Refusal::new(
+                Code::LimitExceeded,
+                format!("template {} exceeds 1 MiB", input.path),
+            ))),
+        }
     }
 
     /// Records the co-owned file: no content fingerprint, only the salted managed hash and the
@@ -1279,10 +1472,11 @@ impl Exec<'_, '_> {
         id: &str,
         abs: &str,
         coowned: CoOwned,
+        mode: u32,
     ) -> Result<(), Refusal> {
         let out = OwnedOutput {
             path: abs.into(),
-            mode: dfm_model::merge::MODE,
+            mode,
             fingerprint: None,
             coowned: Some(coowned),
         };

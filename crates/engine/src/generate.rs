@@ -91,6 +91,25 @@ pub trait Generator {
             format!("no merge adapter for {}", op.adapter),
         ))
     }
+
+    /// Whether `op` is a secret output this generator renders (`op-template/v1`): a sensitive
+    /// `create_file` or `update_file` whose content a provider produces at apply time
+    /// (docs/secrets.md). Apply admits it beside the merge and refuses every other sensitive
+    /// operation.
+    fn renders(&self, _op: &Operation) -> bool {
+        false
+    }
+
+    /// Renders `template` through the provider and returns the bytes to publish. Unlike
+    /// `generate`, this starts a child process. `E_CREDENTIAL_UNAVAILABLE` means the provider
+    /// has no session and nothing ran; `E_RENDER_FAILED` means it ran and failed. The bytes are
+    /// a secret: no caller may print, hash unsalted, or persist them outside the destination.
+    fn render(&self, op: &Operation, _template: &[u8]) -> Result<Vec<u8>, Refusal> {
+        Err(Refusal::new(
+            Code::GeneratorUnavailable,
+            format!("no render adapter for {}", op.adapter),
+        ))
+    }
 }
 
 /// The generator of a build with no adapters: every file operation is unsupported.

@@ -5,6 +5,7 @@
 
 mod generate;
 mod merge_plan;
+pub mod secret;
 pub use generate::{Gen, Generators, plan_outputs};
 pub use merge_plan::merge_facts;
 
@@ -168,6 +169,11 @@ impl Adapter {
         self.spec.kind == "merge"
             && self.spec.sensitive
             && self.spec.id == dfm_model::merge::ADAPTER
+    }
+
+    /// Whether the adapter renders a secret output through a provider (`Generator::render`).
+    pub fn renders(&self) -> bool {
+        self.spec.kind == "secret" && self.spec.secret_values && self.spec.id == secret::ADAPTER
     }
 }
 
@@ -371,6 +377,15 @@ mod tests {
                 .all(|a| a.generator.is_none() && a.spec.sensitive && a.merges())
         );
         assert_eq!(table.iter().filter(|a| a.merges()).count(), merge.len());
+        // Every secret adapter renders through a provider and carries secret values.
+        let secrets: Vec<_> = table.iter().filter(|a| a.spec.kind == "secret").collect();
+        assert!(!secrets.is_empty());
+        assert!(
+            secrets
+                .iter()
+                .all(|a| a.generator.is_none() && a.spec.secret_values && a.renders())
+        );
+        assert_eq!(table.iter().filter(|a| a.renders()).count(), secrets.len());
     }
 
     #[test]

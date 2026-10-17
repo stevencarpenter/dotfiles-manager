@@ -1,6 +1,6 @@
 //! Stop requests from SIGINT and SIGTERM (docs/apply.md, "Signals").
 //!
-//! This is the only module of the workspace with `unsafe` code, and only [`install`] has it. A
+//! This is the only module of the workspace with `unsafe` code: [`install`] and [`kill_group`]. A
 //! gate test (`crates/cli/tests/gate.rs`) rejects the keyword and the lint attributes in any
 //! other place. The handler does one thing: it stores a number in a static atomic. The executor
 //! reads the number between operations, and once more inside an operation just before its
@@ -11,8 +11,9 @@
 //! middle of a file system call, and a restarted call keeps `openat`, `renameat`, `unlinkat`
 //! and `fsync` from reporting a spurious `EINTR` as a failed or unknown operation.
 //!
-//! No child process runs after [`install`] today, so there is no 30 s wait and no process-group
-//! escalation. Add them with the first operation that starts a child process.
+//! A provider child (`crate::proc`) runs in its own process group. When a stop request or its
+//! timeout is seen while it runs, [`kill_group`] sends SIGTERM to the group, the runner waits a
+//! 10 s grace period, and then it sends SIGKILL (docs/architecture.md section 10 item 6).
 
 use dfm_model::{Code, Refusal};
 use std::sync::atomic::{AtomicU8, Ordering};
@@ -137,6 +138,23 @@ pub fn install() -> Result<(), Refusal> {
         }
     }
     result
+}
+
+/// Sends SIGTERM (`term`) or SIGKILL to the process group `pgid`. The runner gives each child its
+/// own group (`process_group(0)`), so the group id is the child's pid and the signal reaches the
+/// child and everything it started. A pid that does not fit, or a group that is gone, is ignored.
+#[expect(
+    unsafe_code,
+    reason = "kill has no safe API; the call touches no memory"
+)]
+pub(crate) fn kill_group(pgid: u32, term: bool) {
+    let Ok(pid) = i32::try_from(pgid) else {
+        return;
+    };
+    let sig = if term { libc::SIGTERM } else { libc::SIGKILL };
+    // SAFETY: `kill` takes two plain integers and dereferences nothing. A negative pid names the
+    // process group.
+    let _ = unsafe { libc::kill(-pid, sig) };
 }
 
 /// The stop request, if a signal arrived since [`install`]. The refusal carries the code that

@@ -1,4 +1,6 @@
-//! `apply`: publishes and removes the files of an approved plan (docs/apply.md).
+//! `apply`: publishes and removes the files of an approved plan (docs/apply.md). `secrets` is
+//! the same command over the secrets scope (docs/secrets.md): it renders secret outputs and
+//! nothing else, and its gates add the vault session check.
 //!
 //! The command plans again from the current machine, requires the digest the reviewer approved
 //! (`--yes-plan`), takes the writer lock, plans a second time under the lock and compares again,
@@ -13,6 +15,7 @@ use dfm_engine::{
     now_ns,
 };
 use dfm_model::display::{visible, visible_for_paste};
+use dfm_model::plan::Scope;
 use dfm_model::state::{
     Approval, BinaryId, DisruptiveApproval, ProfileRef, Receipt, RunResult, SCHEMA, SourceId,
     Stamp, Status, count_statuses, rfc3339,
@@ -28,11 +31,13 @@ pub struct Args {
     pub allow: BTreeSet<String>,
     pub allow_adopt: BTreeSet<String>,
     pub preview: bool,
+    /// Which resources the run acts on: `apply` is `Config`, `secrets` is `Secrets`.
+    pub scope: Scope,
 }
 
 /// `apply --root <dir> [--yes-plan <digest>] [--allow-disruptive <operation-id>]...
-/// [--allow-adopt <operation-id>]... [--preview]`.
-pub fn parse_args(args: &[String]) -> Result<Args, Refusal> {
+/// [--allow-adopt <operation-id>]... [--preview]`, and `secrets` with the same flags.
+pub fn parse_args(args: &[String], scope: Scope) -> Result<Args, Refusal> {
     let (mut root, mut yes, mut preview) = (None, None, false);
     let (mut allow, mut allow_adopt) = (BTreeSet::new(), BTreeSet::new());
     let mut it = args.iter();
@@ -85,6 +90,7 @@ pub fn parse_args(args: &[String]) -> Result<Args, Refusal> {
         allow,
         allow_adopt,
         preview,
+        scope,
     })
 }
 
@@ -171,7 +177,7 @@ fn run_inner(
     let root = Path::new(&args.root);
     // Read-only look first. A refusal here changes nothing, not even the lock file.
     let first = load_resolved(ctx, root)?;
-    let plan = plan_for(ctx, &first)?;
+    let plan = plan_for(ctx, &first, args.scope)?;
     let digest = plan.digest()?;
     if let Some(i) = &ctx.isolated {
         writeln!(out, "isolated: true {i}").map_err(w)?;
@@ -191,7 +197,11 @@ fn run_inner(
     // The gates that need no write run before the lock and in a preview, so a plan that apply
     // would refuse is refused here with the same code.
     let (layout, sys) = (ctx.layout(), ctx.sys()?);
-    let g = gates(&plan, &Generators::new(&first.resolved));
+    let generators = |resolved| match args.scope {
+        Scope::Secrets => Generators::with_runner(resolved, ctx.runner(&sys)),
+        _ => Generators::new(resolved),
+    };
+    let g = gates(&plan, &generators(&first.resolved));
     if let Some(r) = g.refusal {
         return Err(r);
     }
@@ -215,6 +225,11 @@ fn run_inner(
         &plan,
     )?;
     drop(readable);
+    // The credential gate (architecture section 10 item 2): a secrets run without a vault
+    // session stops here, exit 3, before the lock and before any write. Nothing is rendered.
+    if args.scope == Scope::Secrets {
+        crate::adapters::secret::credentials(&plan, &first.resolved, &ctx.runner(&sys))?;
+    }
     if args.preview {
         return Ok(());
     }
@@ -238,24 +253,26 @@ fn run_inner(
         .require_identity(&binding)
         .map_err(|r| store.stamp(r))?;
     let second = load_resolved(ctx, root).map_err(|r| store.stamp(r))?;
-    let locked = plan_for(ctx, &second).map_err(|r| store.stamp(r))?;
+    let locked = plan_for(ctx, &second, args.scope).map_err(|r| store.stamp(r))?;
     let locked_digest = locked.digest().map_err(|r| store.stamp(r))?;
     if locked_digest != digest {
         return Err(store.stamp(stale(approved, &locked_digest)));
     }
     let home = Dir::open_home(&sys, &layout.home).map_err(|r| store.stamp(r))?;
+    let generator = generators(&second.resolved);
     let run = Run {
         store: &store,
         sys,
         home: &home,
         home_path: home.shown(),
-        generator: &Generators::new(&second.resolved),
+        generator: &generator,
         allow: &args.allow,
         allow_adopt: &args.allow_adopt,
         fail: &fail,
     };
     // Handlers go in after the lock and the second plan, and before the first mutation (settling
-    // writes the journal). The second plan ran `id -u`, so no child process starts after this.
+    // writes the journal). A secrets run starts `op` after this; the runner ends it on a stop
+    // request (docs/architecture.md section 10 item 7).
     dfm_engine::signal::install().map_err(|r| store.stamp(r))?;
     fail.hit("apply-after-install")
         .map_err(|r| store.stamp(r))?;
@@ -326,10 +343,15 @@ fn run_inner(
                 tree: s.tree.clone(),
             })
             .collect();
+        let command = match args.scope {
+            Scope::Config => "apply",
+            Scope::Secrets => "secrets",
+            Scope::Packages => "packages",
+        };
         let receipt = Receipt {
             schema: SCHEMA,
-            op_id: format!("apply-{}-{}", &digest[..16], std::process::id()),
-            command: "apply".into(),
+            op_id: format!("{command}-{}-{}", &digest[..16], std::process::id()),
+            command: command.into(),
             started_at: rfc3339(started),
             finished_at: rfc3339(finished),
             binary: BinaryId {

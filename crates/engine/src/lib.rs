@@ -13,6 +13,7 @@ pub mod fail;
 pub mod fsys;
 pub mod generate;
 pub mod observe;
+pub mod proc;
 pub mod publish;
 pub mod recover;
 pub mod signal;
@@ -30,5 +31,6 @@ pub use fsys::{
 };
 pub use generate::{Generator, GeneratorInputs, NoGenerator};
 pub use observe::{merge, observe};
+pub use proc::{End, Output as ProcOutput, Request as ProcRequest, Runner};
 pub use recover::{Open, Settled, recover, resolve};
 pub use store::{Finding, Loaded, Probe, Store, now_ns, verify_identity};

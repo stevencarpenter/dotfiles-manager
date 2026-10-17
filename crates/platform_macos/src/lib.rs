@@ -12,6 +12,9 @@ pub const SYSTEM_PATH: [&str; 4] = ["/usr/bin", "/bin", "/usr/sbin", "/sbin"];
 pub const DATA_DIR: &str = ".local/share/dotfiles-manager";
 /// Cache root relative to HOME. `scripts/bootstrap.sh` hard-codes the same literal.
 pub const CACHE_DIR: &str = ".cache/dotfiles-manager";
+/// Where provider programs (`op`, `brew`, `mise`) are looked up: fixed, never the caller's `PATH`
+/// (docs/architecture.md section 8, "Read-only probe allowlist", item 5).
+pub const PROVIDER_PATH: [&str; 4] = ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin"];
 pub const STATE_DIR: &str = ".local/state/dotfiles-manager";
 pub const CONFIG_DIR: &str = ".config/dotfiles-manager";
 /// The writer lock file, a sibling of the state root so a state upgrade rename never moves it.
