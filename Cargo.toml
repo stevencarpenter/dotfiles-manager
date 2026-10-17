@@ -7,6 +7,7 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.98.1"
 publish = false
+license = "MIT"
 
 [workspace.dependencies]
 dfm-model = { path = "crates/model" }
