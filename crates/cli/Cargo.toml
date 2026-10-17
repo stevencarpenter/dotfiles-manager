@@ -69,5 +69,9 @@ required-features = ["test-isolation"]
 name = "secrets"
 required-features = ["test-isolation"]
 
+[[test]]
+name = "packages"
+required-features = ["test-isolation"]
+
 [lints]
 workspace = true

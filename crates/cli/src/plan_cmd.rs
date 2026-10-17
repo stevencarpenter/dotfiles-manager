@@ -97,7 +97,8 @@ pub fn make_plan(ctx: &Ctx, root: &Path) -> Result<Plan, Refusal> {
 
 /// As [`make_plan`], for sources that are already resolved (`doctor` resolves once) and for one
 /// scope. A secrets plan reads each secret destination in memory for its verdict and nothing
-/// else; a configuration plan never reads one (docs/secrets.md).
+/// else; a configuration plan never reads one (docs/secrets.md). A packages plan probes each
+/// provider's listing, read-only (docs/packages.md); every other scope starts no process.
 pub fn plan_for(ctx: &Ctx, loaded: &Loaded, scope: Scope) -> Result<Plan, Refusal> {
     let layout = ctx.layout();
     let sys = ctx.sys()?;
@@ -171,6 +172,12 @@ pub fn plan_for(ctx: &Ctx, loaded: &Loaded, scope: Scope) -> Result<Plan, Refusa
         ),
         _ => BTreeMap::new(),
     };
+    let package = match scope {
+        Scope::Packages => {
+            crate::adapters::package::package_facts(&loaded.resolved, &ctx.runner(&sys))
+        }
+        _ => BTreeMap::new(),
+    };
     let cx = Context {
         scope,
         binary: binary_identity()?,
@@ -183,6 +190,7 @@ pub fn plan_for(ctx: &Ctx, loaded: &Loaded, scope: Scope) -> Result<Plan, Refusa
         unchecked,
         merge,
         secret,
+        package,
     };
     let mut plan = plan::build(&loaded.resolved, &cx, &obs)?;
     // Generated output hashes (architecture section 9 item 1), from the same adapters apply runs.

@@ -29,7 +29,7 @@ Exit codes follow section 10: a blocked plan or a stale plan is 3, an unreadable
 
 ## Scope of a plan
 
-DESIGN.md section 7: "Only configuration work belongs in a normal config plan." A plan has a scope (`Plan.scope`, `plan::Scope`). The configuration plan (`plan`, `apply`) covers `link`, `render`, `merge`, `assemble` and `distribution` resources. A `package` or `application` resource and a `secret` output appear as `not_in_scope` operations. A secret shows destination and mode only. This matches the `sync` walkthrough in architecture section 13 (secrets `not_in_scope`). The `secrets` command plans the `secrets` scope: every `secret` resource is planned and every other resource is `not_in_scope` ([docs/secrets.md](secrets.md)). A scope other than `config` plans no removal.
+DESIGN.md section 7: "Only configuration work belongs in a normal config plan." A plan has a scope (`Plan.scope`, `plan::Scope`). The configuration plan (`plan`, `apply`) covers `link`, `render`, `merge`, `assemble` and `distribution` resources. A `package` or `application` resource and a `secret` output appear as `not_in_scope` operations. A secret shows destination and mode only. This matches the `sync` walkthrough in architecture section 13 (secrets `not_in_scope`). The `secrets` command plans the `secrets` scope: every `secret` resource is planned and every other resource is `not_in_scope` ([docs/secrets.md](secrets.md)). The `packages` command plans the `packages` scope the same way, from the providers' own listings ([docs/packages.md](packages.md)); it is the one plan that starts a process. A scope other than `config` plans no removal.
 
 ## What a plan contains
 

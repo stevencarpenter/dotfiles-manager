@@ -5,6 +5,7 @@
 
 mod generate;
 mod merge_plan;
+pub mod package;
 pub mod secret;
 pub use generate::{Gen, Generators, plan_outputs};
 pub use merge_plan::merge_facts;
@@ -174,6 +175,15 @@ impl Adapter {
     /// Whether the adapter renders a secret output through a provider (`Generator::render`).
     pub fn renders(&self) -> bool {
         self.spec.kind == "secret" && self.spec.secret_values && self.spec.id == secret::ADAPTER
+    }
+
+    /// Whether the adapter installs packages through a provider (`Generator::install`).
+    pub fn installs(&self) -> bool {
+        self.spec.kind == "package"
+            && matches!(
+                self.spec.id.as_str(),
+                package::HOMEBREW | package::MISE | package::APT
+            )
     }
 }
 
@@ -386,6 +396,18 @@ mod tests {
                 .all(|a| a.generator.is_none() && a.spec.secret_values && a.renders())
         );
         assert_eq!(table.iter().filter(|a| a.renders()).count(), secrets.len());
+        // Every package adapter has a provider.
+        let packages: Vec<_> = table.iter().filter(|a| a.spec.kind == "package").collect();
+        assert_eq!(packages.len(), 3);
+        assert!(
+            packages
+                .iter()
+                .all(|a| a.generator.is_none() && a.installs())
+        );
+        assert_eq!(
+            table.iter().filter(|a| a.installs()).count(),
+            packages.len()
+        );
     }
 
     #[test]

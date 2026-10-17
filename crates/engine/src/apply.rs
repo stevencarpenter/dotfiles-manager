@@ -22,8 +22,8 @@ use dfm_model::digest::sha256_hex;
 use dfm_model::fold;
 use dfm_model::merge::{Merged, check_foreign, leaf_hashes, salted};
 use dfm_model::plan::{
-    Action, Operation, Owned, Plan, Request, Status as PlanStatus, file_fingerprint, ledger_state,
-    link_fingerprint, node_state,
+    Action, Operation, Owned, PackageState, Plan, Request, Status as PlanStatus, file_fingerprint,
+    ledger_state, link_fingerprint, node_state,
 };
 use dfm_model::state::{
     Class, CoOwned, Fingerprint, JournalEntry, Ledger, OperationRecord, OwnedOutput, Phase,
@@ -292,6 +292,25 @@ fn first_refusal(plan: &Plan, generator: &dyn Generator) -> Result<(), Refusal> 
         if op.status != PlanStatus::Planned {
             continue;
         }
+        // A package install has no path and no content: it needs a provider in this build.
+        if op.action == Action::Install {
+            if op.path.is_some() || op.class != Class::Normal {
+                return Err(plan_invalid(format!(
+                    "{} installs a package but carries a path or is sensitive",
+                    op.id
+                )));
+            }
+            if !generator.installs(op) {
+                return Err(Refusal::new(
+                    Code::GeneratorUnavailable,
+                    format!(
+                        "{}: no package provider for {} in this build; nothing was changed",
+                        op.id, op.adapter
+                    ),
+                ));
+            }
+            continue;
+        }
         let path = op
             .path
             .as_deref()
@@ -401,6 +420,7 @@ fn first_refusal(plan: &Plan, generator: &dyn Generator) -> Result<(), Refusal> 
                     op.id
                 )));
             }
+            Action::Install => unreachable!("handled above"),
             Action::None => {
                 return Err(plan_invalid(format!("{} is planned with no action", op.id)));
             }
@@ -572,6 +592,7 @@ fn step_name(op: &Operation) -> &'static str {
         Action::Remove => "remove",
         Action::Adopt => "adopt",
         Action::Retire => "retire",
+        Action::Install => "install",
         Action::None => "none",
     }
 }
@@ -858,6 +879,9 @@ impl Exec<'_, '_> {
     }
 
     fn try_op(&mut self, op: &Operation) -> Result<Ended, Ended> {
+        if op.action == Action::Install {
+            return self.try_install(op);
+        }
         // The gates admit one sensitive kind, the co-owned merge, which has its own path. Nothing
         // below hashes, fingerprints or journals the content of a sensitive path.
         if op.class == Class::Sensitive {
@@ -925,7 +949,7 @@ impl Exec<'_, '_> {
                     "is no longer the entry the plan found; it is left alone",
                 ));
             }
-            (Action::None | Action::Retire, _) => {
+            (Action::None | Action::Retire | Action::Install, _) => {
                 return Err(failed(plan_invalid("no action")));
             }
         }
@@ -1427,6 +1451,95 @@ impl Exec<'_, '_> {
         })
     }
 
+    /// A package install (docs/packages.md). The provider is probed again under the lock: a
+    /// package that is installed now is `current`, any other change blocks. Then the intent entry
+    /// (no path: the provider's listing is the record), the install, a third probe as the
+    /// postcondition, and the outcome entry. No ledger entry is written.
+    fn try_install(&mut self, op: &Operation) -> Result<Ended, Ended> {
+        if let Some(id) = self.unknown_resources.get(&op.resource) {
+            return Err(blocked(
+                Code::OpInterrupted,
+                format!(
+                    "{}: resource {} has an unknown outcome (journal id {id}) with no intent record. Nothing was changed. Fix: check the provider's state, then run `dotfiles-manager state resolve {} --as failed`",
+                    op.id,
+                    op.resource,
+                    recover::quoted(id)
+                ),
+            ));
+        }
+        let want = op
+            .preconditions
+            .iter()
+            .find(|p| p.subject.starts_with("probe:"))
+            .map(|p| p.state.as_str())
+            .unwrap_or("missing");
+        let now = self.run.generator.probe(op).map_err(failed)?;
+        match &now {
+            PackageState::Installed(_) => return Ok(Ended::Current),
+            s if s.state() == want => {}
+            s => {
+                return Err(blocked(
+                    Code::PlanStale,
+                    format!(
+                        "{}: the provider reported {want} at plan time and {} now; nothing was changed",
+                        op.id,
+                        s.state()
+                    ),
+                ));
+            }
+        }
+        self.stop_requested()?;
+        let id = self.attempt_id(op);
+        let recovery = Recovery {
+            outputs: Vec::new(),
+            snapshot: None,
+        };
+        self.journal(op, &id, Phase::Intent, Some(recovery), None)
+            .map_err(|e| Ended::Failed(e, Some(id.clone())))?;
+        // From here on the provider may have changed the machine. A failure is journaled.
+        let result = self
+            .run
+            .fail
+            .hit("apply-before-effect")
+            .and_then(|()| self.run.generator.install(op))
+            .and_then(|()| self.run.fail.hit("apply-after-effect"))
+            .and_then(|()| match self.run.generator.probe(op)? {
+                PackageState::Installed(_) => Ok(()),
+                s => Err(Refusal::new(
+                    Code::IoFailed,
+                    format!(
+                        "postcondition failed for {}: the provider reports {} after the install",
+                        op.id,
+                        s.state()
+                    ),
+                )),
+            });
+        if let Err(e) = result {
+            let why = dfm_model::display::bounded_visible(&e.detail, 1024);
+            let e = match self.journal(op, &id, Phase::Failed, None, Some(why)) {
+                Ok(()) => e,
+                Err(n) => Refusal::new(
+                    e.code,
+                    format!(
+                        "{}; the outcome could not be journaled: {}",
+                        e.detail, n.detail
+                    ),
+                ),
+            };
+            return Err(Ended::Failed(e, Some(id)));
+        }
+        if let Err(e) = self.journal(op, &id, Phase::Done, None, None) {
+            return Err(Ended::Failed(e, Some(id)));
+        }
+        Ok(Ended::Updated {
+            id,
+            before: None,
+            after: None,
+            owned: Vec::new(),
+            reload: None,
+        })
+    }
+
     /// The template of a secret operation, read from the plan's source root as apply reads any
     /// source: below the root without following a link, a regular file of the user with one
     /// hard link, within the source file bound. The resolver records no content identity for
@@ -1574,7 +1687,9 @@ impl Exec<'_, '_> {
             Action::Remove => removed = Some(self.remove(op, abs, parent, name, live)?),
             // Nothing is written. The read-back below is the last look at the leaf.
             Action::Adopt => {}
-            Action::None | Action::Retire => return Err(plan_invalid("no action")),
+            Action::None | Action::Retire | Action::Install => {
+                return Err(plan_invalid("no action"));
+            }
         }
         fail.hit("apply-after-effect")?;
         let bad = |what: &str| {

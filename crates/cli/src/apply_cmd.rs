@@ -198,8 +198,8 @@ fn run_inner(
     // would refuse is refused here with the same code.
     let (layout, sys) = (ctx.layout(), ctx.sys()?);
     let generators = |resolved| match args.scope {
-        Scope::Secrets => Generators::with_runner(resolved, ctx.runner(&sys)),
-        _ => Generators::new(resolved),
+        Scope::Secrets | Scope::Packages => Generators::with_runner(resolved, ctx.runner(&sys)),
+        Scope::Config => Generators::new(resolved),
     };
     let g = gates(&plan, &generators(&first.resolved));
     if let Some(r) = g.refusal {
@@ -271,8 +271,8 @@ fn run_inner(
         fail: &fail,
     };
     // Handlers go in after the lock and the second plan, and before the first mutation (settling
-    // writes the journal). A secrets run starts `op` after this; the runner ends it on a stop
-    // request (docs/architecture.md section 10 item 7).
+    // writes the journal). A secrets or packages run starts a provider after this; the runner
+    // ends it on a stop request (docs/architecture.md section 10 item 7).
     dfm_engine::signal::install().map_err(|r| store.stamp(r))?;
     fail.hit("apply-after-install")
         .map_err(|r| store.stamp(r))?;

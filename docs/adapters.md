@@ -2,7 +2,7 @@
 
 Task: DFM-20, render and assemble slice, and DFM-21, the `claude-settings/v1` merge for `.claude/settings.json`. This document records what the three adapters do and where it resolves or differs from [docs/architecture.md](architecture.md) (the contract). The contract wins where this document is silent. Apply is in [docs/apply.md](apply.md) and the planner in [docs/planner.md](planner.md).
 
-Not covered here: native-setting probes (DFM-20.C03) and every other co-owned destination (Codex, MCP configuration files). They are deferred. See "Not built". The `op-template/v1` secret adapter is in [docs/secrets.md](secrets.md).
+Not covered here: native-setting probes (DFM-20.C03) and every other co-owned destination (Codex, MCP configuration files). They are deferred. See "Not built". The `op-template/v1` secret adapter is in [docs/secrets.md](secrets.md) and the package adapters in [docs/packages.md](packages.md).
 
 ## What exists
 

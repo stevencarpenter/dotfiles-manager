@@ -11,8 +11,8 @@ mod graph;
 mod stale;
 
 pub use build::{
-    Context, MergeFact, MergeVerdict, Owned, Scope, SecretVerdict, build, followups, in_scope,
-    ledger_state, matches_pattern, requests, sensitive_paths,
+    Context, MergeFact, MergeVerdict, Owned, PackageState, Scope, SecretVerdict, build, followups,
+    in_scope, ledger_state, matches_pattern, requests, sensitive_paths,
 };
 pub use stale::{Stale, StaleKind, stale};
 
@@ -177,6 +177,9 @@ pub enum Action {
     /// whose resource is no longer selected. The file, its managed and seeded values and every
     /// foreign entry stay (docs/adapters.md, `claude-settings/v1`).
     Retire,
+    /// Install a package with its declared provider (docs/packages.md). No path, no ledger
+    /// entry: the provider's own listing is the record, probed before and after.
+    Install,
     /// Nothing to do, or out of scope.
     None,
 }

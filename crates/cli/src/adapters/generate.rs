@@ -1,14 +1,14 @@
 //! The `render` and `assemble` adapters (docs/adapters.md). Pure functions of the resource
 //! value and the verified inputs apply or the planner supplies. They open no file.
 
-use super::{Adapter, registry, secret};
+use super::{Adapter, package, registry, secret};
 use dfm_engine::{Dir, Generator, GeneratorInputs, Got, Runner, Sys};
 use dfm_model::digest::sha256_hex;
 use dfm_model::fold;
 use dfm_model::merge::{Desired, Merged, merge_with, retire};
 use dfm_model::plan::{
-    Action, Blocker, MAX_HASHED_BYTES, Node, Observations, Operation, Ownership, Plan, Status,
-    file_fingerprint, matches_pattern,
+    Action, Blocker, MAX_HASHED_BYTES, Node, Observations, Operation, Ownership, PackageState,
+    Plan, Status, file_fingerprint, matches_pattern,
 };
 use dfm_model::resolve::{Resolved, Table, Value};
 use dfm_model::state::Class;
@@ -53,7 +53,8 @@ impl<'a> Generators<'a> {
         }
     }
 
-    /// Generators that can also render a secret through `runner` (the `secrets` command).
+    /// Generators that can also render a secret or install a package through `runner` (the
+    /// `secrets` and `packages` commands).
     pub fn with_runner(resolved: &'a Resolved, runner: Runner) -> Self {
         Generators {
             runner: Some(runner),
@@ -179,6 +180,45 @@ impl Generator for Generators<'_> {
                 )
             })?;
         secret::render(runner, self.value(op)?, template)
+    }
+
+    fn installs(&self, op: &Operation) -> bool {
+        op.action == Action::Install
+            && op.class == Class::Normal
+            && self.runner.is_some()
+            && self.resolved.resources.contains_key(&op.resource)
+            && self
+                .table
+                .iter()
+                .any(|a| a.spec.id == op.adapter && a.installs())
+    }
+
+    fn probe(&self, op: &Operation) -> Result<PackageState, Refusal> {
+        let runner = self
+            .runner
+            .as_ref()
+            .filter(|_| self.installs(op))
+            .ok_or_else(|| {
+                Refusal::new(
+                    Code::GeneratorUnavailable,
+                    format!("no package provider for {}", op.adapter),
+                )
+            })?;
+        package::probe(runner, &op.adapter, self.value(op)?)
+    }
+
+    fn install(&self, op: &Operation) -> Result<(), Refusal> {
+        let runner = self
+            .runner
+            .as_ref()
+            .filter(|_| self.installs(op))
+            .ok_or_else(|| {
+                Refusal::new(
+                    Code::GeneratorUnavailable,
+                    format!("no package provider for {}", op.adapter),
+                )
+            })?;
+        package::install(runner, &op.adapter, self.value(op)?)
     }
 
     fn supports(&self, op: &Operation) -> bool {

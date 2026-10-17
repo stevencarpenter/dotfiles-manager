@@ -120,6 +120,36 @@ pub enum SecretVerdict {
     },
 }
 
+/// What the provider's listing said about a package (docs/packages.md). The planner is pure
+/// and starts no process; the caller probes and reports this.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PackageState {
+    /// The declared provider lists it, with the version it reports.
+    Installed(String),
+    /// The declared provider does not list it and no other owner was seen.
+    Missing,
+    /// The declared provider does not list it, but an executable of that name exists elsewhere:
+    /// a declared owner is not permission to replace another owner (DESIGN.md section 8).
+    OtherOwner(String),
+    /// The provider cannot install on this machine (for example it needs privilege).
+    Unsupported(String),
+    /// The probe could not decide. Unknown support fails closed.
+    Unknown(String),
+}
+
+impl PackageState {
+    /// The precondition string apply compares after it probes again.
+    pub fn state(&self) -> String {
+        match self {
+            PackageState::Installed(v) => format!("installed:{v}"),
+            PackageState::Missing => "missing".into(),
+            PackageState::OtherOwner(w) => format!("other-owner:{w}"),
+            PackageState::Unsupported(w) => format!("unsupported:{w}"),
+            PackageState::Unknown(w) => format!("unknown:{w}"),
+        }
+    }
+}
+
 /// The plan-time facts of one merge resource.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MergeFact {
@@ -171,6 +201,9 @@ pub struct Context<'a> {
     /// The verdict on the destination of each selected secret resource, by resource id
     /// (`secrets` scope only).
     pub secret: BTreeMap<String, SecretVerdict>,
+    /// The probed state of each selected package resource, by resource id (`packages` scope
+    /// only).
+    pub package: BTreeMap<String, PackageState>,
 }
 
 /// Ledger outputs of a resource that is no longer selected, at a path no selected resource
@@ -621,6 +654,10 @@ impl Planner<'_> {
             self.out_of_scope(r);
             return;
         }
+        if r.kind == "package" {
+            self.package(r);
+            return;
+        }
         for claim in &r.claims {
             self.leaf(r, claim);
         }
@@ -956,6 +993,88 @@ impl Planner<'_> {
                 "run plan again; if it repeats, report the path",
             )),
         }
+    }
+
+    /// A package (docs/packages.md): no path and no ledger entry. The caller probed the declared
+    /// provider; the plan installs what is missing and never upgrades, downgrades or removes.
+    fn package(&mut self, r: &ResolvedResource) {
+        let id = format!("{}@package", r.id);
+        let mut op = self.skeleton(r, id.clone(), None);
+        let name = r
+            .value
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or(&r.id)
+            .to_string();
+        let shown = format!("{name} with {}", r.adapter);
+        let state = self.cx.package.get(&r.id).cloned();
+        op.postcondition = format!("{} lists {name} as installed", r.adapter);
+        let probe = format!("probe:{}:{name}", r.adapter);
+        match state {
+            Some(PackageState::Installed(v)) => {
+                op.action = Action::None;
+                op.status = Status::Current;
+                op.effect = format!("{name} is installed by {} ({v})", r.adapter);
+            }
+            Some(PackageState::Missing) => {
+                op.action = Action::Install;
+                op.status = Status::Planned;
+                op.effect = format!(
+                    "install {shown}: the provider's current version; nothing is upgraded or downgraded"
+                );
+                op.preconditions.push(Precondition {
+                    subject: probe,
+                    state: PackageState::Missing.state(),
+                });
+            }
+            Some(PackageState::OtherOwner(why)) => {
+                let f = fail(
+                    Code::Conflict,
+                    "/name",
+                    format!(
+                        "{name} is not installed by {} but {why}; a declared owner is not permission to replace another owner",
+                        r.adapter
+                    ),
+                    "remove the other installation, or declare the adapter that owns it",
+                );
+                op.effect = format!("blocked: {}", f.detail);
+                self.blocker(r, None, f);
+            }
+            Some(PackageState::Unsupported(why)) => {
+                let f = fail(
+                    Code::PrivilegeUnsupported,
+                    "/name",
+                    format!(
+                        "{name} is not installed and {} cannot install it here: {why}",
+                        r.adapter
+                    ),
+                    "install it by hand, then run packages again",
+                );
+                op.effect = format!("blocked: {}", f.detail);
+                self.blocker(r, None, f);
+            }
+            Some(PackageState::Unknown(why)) => {
+                let f = fail(
+                    Code::ProbeFailed,
+                    "/name",
+                    format!("the installed state of {shown} is unknown: {why}"),
+                    "make the provider answer its listing command, then run packages again",
+                );
+                op.effect = format!("blocked: {}", f.detail);
+                self.blocker(r, None, f);
+            }
+            None => {
+                let f = fail(
+                    Code::ProbeFailed,
+                    "/name",
+                    format!("{shown} was not probed"),
+                    "run packages again; if it repeats, report the resource",
+                );
+                op.effect = format!("blocked: {}", f.detail);
+                self.blocker(r, None, f);
+            }
+        }
+        self.ops.insert(id, op);
     }
 
     /// A secret output (`op-template/v1`, docs/secrets.md). The content exists only after the

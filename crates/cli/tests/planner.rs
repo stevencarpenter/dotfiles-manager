@@ -1176,6 +1176,7 @@ mod synthetic {
         let cx = Context {
             scope: dfm_model::plan::Scope::Config,
             secret: std::collections::BTreeMap::new(),
+            package: std::collections::BTreeMap::new(),
             binary: Binary {
                 version: "0".into(),
                 sha256: "0".repeat(64),
@@ -2581,6 +2582,7 @@ mod removal {
         let cx = Context {
             scope: dfm_model::plan::Scope::Config,
             secret: std::collections::BTreeMap::new(),
+            package: std::collections::BTreeMap::new(),
             binary: Binary {
                 version: "0".into(),
                 sha256: "0".repeat(64),
@@ -2863,6 +2865,7 @@ mod hardening {
         let cx = Context {
             scope: dfm_model::plan::Scope::Config,
             secret: std::collections::BTreeMap::new(),
+            package: std::collections::BTreeMap::new(),
             binary: Binary {
                 version: "0".into(),
                 sha256: "0".repeat(64),
@@ -3164,6 +3167,7 @@ mod ledger_sensitivity {
         let cx = Context {
             scope: dfm_model::plan::Scope::Config,
             secret: std::collections::BTreeMap::new(),
+            package: std::collections::BTreeMap::new(),
             binary: Binary {
                 version: "0".into(),
                 sha256: "0".repeat(64),

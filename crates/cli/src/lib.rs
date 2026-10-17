@@ -385,6 +385,15 @@ fn dispatch(args: &[String], out: &mut dyn Write) -> Result<(), Refusal> {
             }
             apply_cmd::run(&context(home)?, &args, out)
         }
+        "packages" => {
+            let args = apply_cmd::parse_args(rest, dfm_model::plan::Scope::Packages)?;
+            if !args.allow.is_empty() || !args.allow_adopt.is_empty() {
+                return Err(usage(
+                    "packages removes and adopts nothing; --allow-disruptive and --allow-adopt do not apply",
+                ));
+            }
+            apply_cmd::run(&context(home)?, &args, out)
+        }
         "self-check" => {
             let [controls, fixture] = flags(rest, ["--build-controls", "--fixture-dir"])?;
             match (controls, fixture) {
