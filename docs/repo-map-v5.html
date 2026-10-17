@@ -27,6 +27,15 @@
     color-scheme: light;
   }
 }
+/* an explicit data-theme wins over the OS preference */
+:root[data-theme="light"] {
+    --bg0: #fdf6e3; --bg1: #f4f0d9; --bg2: #efebd4; --bg3: #e6e2cc;
+    --fg: #4a565d; --grey0: #6d7a72; --grey1: #5f6d66; --grey2: #4f5c62;
+    --green: #8da101; --yellow: #dfa000; --blue: #3a94c5; --aqua: #35a77c;
+    --orange: #f57d26; --red: #f85552; --purple: #df69ba;
+    --line: #ddd8be; --shadow: rgba(92, 106, 114, .13);
+    color-scheme: light;
+}
 *, *::before, *::after { box-sizing: border-box; }
 html, body { margin: 0; background: var(--bg0); color: var(--fg); }
 body { font: 16px/1.55 "IBM Plex Sans", system-ui, sans-serif; padding: 28px 20px 72px; }
@@ -112,7 +121,8 @@ svg { display: block; max-width: 100%; height: auto; }
 <header id="intro">
   <h1>dotfiles-manager repo map</h1>
   <p class="lede">A one-profile-per-machine dotfiles manager in Rust. Four crates split the work by what they are allowed to touch: pure logic, filesystem and state, macOS constants, and the command line. Tests and the design contract are larger than the runtime code.</p>
-  <p class="k mono">main @ 7bc1667 · 380 tracked files · 68,754 lines (Cargo.lock excluded) · counted with git ls-files + line count</p>
+  <p class="k mono">b40280b · 380 of 387 tracked files mapped · 68,754 lines · counted with git ls-files + line count</p>
+  <p class="k">Not mapped: <code>Cargo.lock</code>, <code>docs/repo-map-v1.html</code>, <code>docs/repo-map-v2.html</code>, <code>docs/repo-map-v3.html</code>, <code>docs/repo-map-v4.html</code>, <code>docs/repo-map-v5.html</code>, <code>dotfiles-manager.lock</code>. Every other tracked file is counted, including the binary <code>libstd.rlib</code> fixture.</p>
 </header>
 
 
@@ -326,7 +336,7 @@ svg { display: block; max-width: 100%; height: auto; }
 <text x="966" y="645" class="ar-s" text-anchor="start" style="fill:var(--grey0)">never selected, so never written</text>
 </g>
 </svg>
-    <figcaption>Compositions and effective values from <code>examples/cases.toml</code> (personal-composition, external-composition, homelab-composition) and the modules under <code>examples/</code>. The fixture homelab profile is Linux x86_64 to show the schema can express it, but the binary does not run there: <code>dfm-platform-macos</code> builds only on macOS and <code>check_supported</code> accepts only macOS on arm64, so the third column is a resolver-only fixture today. A homelab Mac is the same mechanism with <code>platform = "macos"</code>; the real Intel homelab stays on GNU Stow (<code>DESIGN.md</code> section 1).</figcaption>
+    <figcaption>Compositions and effective values from <code>examples/cases.toml</code> (personal-composition, external-composition, homelab-composition) and the modules under <code>examples/</code>. The fixture homelab profile is Linux x86_64 to show the schema can express it, but the binary does not run there: <code>dfm-platform-macos</code> builds only on macOS and <code>check_supported</code> accepts only macOS on arm64, so the third column is a resolver-only fixture today. Changing the profile to <code>platform = "macos"</code> is not enough for a homelab Mac: <code>homelab</code> and its required <code>server</code> both declare <code>platforms = ["linux"]</code>, so resolution refuses the composition with <code>E_PLATFORM_UNSUPPORTED</code>, and the <code>apt/v1</code> package has no macOS adapter. A homelab Mac needs macOS variants of both modules and a Homebrew package in place of the apt one. The real Intel homelab stays on GNU Stow (<code>DESIGN.md</code> section 1).</figcaption>
   </figure>
 
   <div class="cfg-grid">
@@ -2159,7 +2169,7 @@ source = &quot;files/AGENTS.md&quot;
 </section>
 
 <section id="map">
-  <h2>Every tracked file, sized by lines</h2>
+  <h2>Every mapped file, sized by lines</h2>
   <ul class="legend"><li style="--c:var(--green)"><span class="chip"></span>dfm-model<span class="n">14,480</span></li><li style="--c:var(--blue)"><span class="chip"></span>dfm-engine<span class="n">7,054</span></li><li style="--c:var(--aqua)"><span class="chip"></span>dfm-platform-macos<span class="n">197</span></li><li style="--c:var(--orange)"><span class="chip"></span>dfm-cli<span class="n">5,967</span></li><li style="--c:var(--purple)"><span class="chip"></span>Tests and fixtures<span class="n">31,056</span></li><li style="--c:var(--yellow)"><span class="chip"></span>Docs and contract<span class="n">8,308</span></li><li style="--c:var(--grey0)"><span class="chip"></span>Tooling<span class="n">1,692</span></li></ul>
   <figure>
     <svg id="treemap" viewBox="0 0 1400 800" width="100%" role="img" aria-labelledby="treemap-title" xmlns="http://www.w3.org/2000/svg">
@@ -2685,7 +2695,7 @@ source = &quot;files/AGENTS.md&quot;
 
 <script type="module">
   const files = [{"name": "base/bundle.toml", "contents": "schema = 1\nid = \"my-dotfiles\"\ncore = \"modules/core/module.toml\"\n\n# The catalogue. Nothing here is enabled; the profile selects.\n[modules]\nm5 = \"modules/m5/module.toml\"\nagents = \"modules/agents/module.toml\"\n\n# Only in the bundle the profile names. Paths are relative to --root.\n# Needed when the checkout also holds plugin checkouts, .venv, node_modules.\n[sources]\nroots = [\"base\", \"profiles\"]\nexclude = [\"**/__pycache__\", \"**/.venv\", \"**/node_modules\"]\n"}, {"name": "profiles/m5-01.toml", "contents": "schema = 1\nid = \"m5-01\"\nbundle = \"../base/bundle.toml\"\nplatform = \"macos\"\narchitecture = \"arm64\"\nmodules = [\"m5\", \"agents\"]\n\n# A profile may change only values the owner exposed in policy.defaults.\n[[overrides]]\nresource = \"m5.git-defaults\"\npath = \"/core/editor\"\nvalue = \"vim\"\nreason = \"This machine uses its existing Vim.\"\n"}, {"name": "base/modules/m5/module.toml", "contents": "schema = 1\nid = \"m5\"\nplatforms = [\"macos\"]\nrequires = [\"agents\"]\n\n# link: HOME/.zshrc -> files/zshrc in this module\n[[resources]]\nid = \"zsh\"\nkind = \"link\"\nadapter = \"fs-link/v1\"\ntarget = \".zshrc\"\n[resources.value]\nsource = \"files/zshrc\"\n\n# link to a whole directory: the explicit claim is required\n[[resources]]\nid = \"nvim\"\nkind = \"link\"\nadapter = \"fs-link/v1\"\ntarget = \".config/nvim\"\n[resources.value]\nsource = \"files/nvim\"\ndirectory = true\n\n# render: a typed value becomes the whole file, no template language\n[[resources]]\nid = \"git-defaults\"\nkind = \"render\"\nadapter = \"git-config/v1\"\ntarget = \".config/git/config\"\n[resources.value.core]\neditor = \"nvim\"\n[resources.value.init]\ndefaultBranch = \"main\"\n[resources.policy]\ndefaults = [\"/core/editor\"]\nextensions = []\n\n# package: accepted as data today; the binary has no package adapter yet\n[[resources]]\nid = \"atuin\"\nkind = \"package\"\nadapter = \"homebrew/v1\"\n[resources.value]\nname = \"atuin\"\nupdate_policy = \"rolling\"\ndowngrade = \"forbid\"\n"}, {"name": "base/modules/agents/module.toml", "contents": "schema = 1\nid = \"agents\"\nplatforms = [\"macos\", \"linux\"]\nrequires = []\n\n# assemble: body + every *.md another module drops into .codex/AGENTS.d\n[[resources]]\nid = \"codex-instructions\"\nkind = \"assemble\"\nadapter = \"text-fragments/v1\"\ntarget = \".codex/AGENTS.md\"\n[resources.value]\nbody = \"files/AGENTS.md\"\nfragments_dir = \".codex/AGENTS.d\"\npattern = \"*.md\"\nseparator = \"\\n\"\n\n# merge: the only way to touch .claude/settings.json. Foreign keys survive,\n# seed values apply only when absent, handlers are the hooks this module owns.\n[[resources]]\nid = \"claude-settings\"\nkind = \"merge\"\nadapter = \"claude-settings/v1\"\ntarget = \".claude/settings.json\"\n[resources.value.managed]\noutputStyle = \"STE\"\n[resources.value.seed]\nmodel = \"example-model\"\n[resources.value.handlers.audit]\nevent = \"PreToolUse\"\nmatcher = \"Bash\"\ntype = \"command\"\nargv = [\"${HOME}/.claude/hooks/audit.sh\"]\n[resources.policy]\ndefaults = [\"/managed/outputStyle\"]\nextensions = [\"/handlers\"]\n"}, {"name": "external/modules/work/module.toml", "contents": "schema = 1\nid = \"work\"\nplatforms = [\"macos\"]\nrequires = [\"agents\"]\n\n# contribution: add one owned key under an exposed map. The key must start\n# with this module's id. Nothing else in that map is touched.\n[[contributions]]\nresource = \"agents.claude-settings\"\npath = \"/handlers\"\nkey = \"work.session\"\nreason = \"One SessionStart hook for work machines.\"\n[contributions.value]\nevent = \"SessionStart\"\ntype = \"command\"\nargv = [\"${HOME}/.local/bin/work-session\"]\n\n# a fragment: its name decides its position in .codex/AGENTS.md\n[[resources]]\nid = \"instructions\"\nkind = \"link\"\nadapter = \"fs-link/v1\"\ntarget = \".codex/AGENTS.d/40-work.md\"\n[resources.value]\nsource = \"files/AGENTS.md\"\n"}];
-  const dark = () => window.matchMedia("(prefers-color-scheme: dark)").matches && document.documentElement.getAttribute("data-theme") !== "light";
+  const dark = () => { const t = document.documentElement.getAttribute("data-theme"); return t === "dark" || (t !== "light" && window.matchMedia("(prefers-color-scheme: dark)").matches); };
   const showFallback = () => document.querySelectorAll(".cfg-fallback").forEach((p) => p.hidden = false);
   try {
     const { File } = await import("https://esm.sh/@pierre/diffs@1.2.10?bundle");
@@ -2711,7 +2721,8 @@ source = &quot;files/AGENTS.md&quot;
  { "id": "r4", "label": "Round 4", "timestamp": "2026-10-17T06:10:00Z", "summary": "Added the remove-a-tool flow" },
  { "id": "r5", "label": "Round 5", "timestamp": "2026-10-17T06:30:00Z", "summary": "Added the configure-your-dotfiles-repo section near the top" },
  { "id": "r6", "label": "Round 6", "timestamp": "2026-10-17T07:00:00Z", "summary": "Added the one-repository-three-machines section at the top" },
- { "id": "r7", "label": "Round 7", "timestamp": "2026-10-17T06:40:00Z", "summary": "Review fix: the Linux homelab fixture is marked unsupported; the binary runs only on macOS arm64" }]
+ { "id": "r7", "label": "Round 7", "timestamp": "2026-10-17T06:40:00Z", "summary": "Review fix: the Linux homelab fixture is marked unsupported; the binary runs only on macOS arm64" },
+ { "id": "r8", "label": "Round 8", "timestamp": "2026-10-17T22:05:00Z", "summary": "Review fix: homelab Mac needs macOS module variants, the header lists every unmapped file, an explicit data-theme wins in the code renderer" }]
 </script>
 </body>
 </html>
