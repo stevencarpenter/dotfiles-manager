@@ -29,6 +29,9 @@ jobs:
       - name: Check design fixtures
         run: bash scripts/check_all.sh fixtures
 
+      - name: Install shellcheck
+        run: brew install shellcheck
+
       - name: Check script style and syntax
         run: bash scripts/check_all.sh scripts
 
