@@ -980,6 +980,11 @@ fn the_planner_code_has_no_process_network_or_write_calls() {
         "crates/cli/src/plan_cmd.rs",
     ];
     let banned = [
+        // The runner and the package probes start processes; they belong to the commands that
+        // own a scope (docs/packages.md), never to the plan builder.
+        "Runner",
+        "runner(",
+        "package_facts",
         "std::net",
         "TcpStream",
         "UdpSocket",
@@ -1137,8 +1142,18 @@ mod synthetic {
             uid: dfm_platform_macos::current_uid().unwrap(),
         };
         let dir = dfm_engine::Dir::open_home(&sys, home.path()).unwrap();
-        let mut obs = dfm_engine::observe(&sys, &dir, &requests(&resolved, &[])).unwrap();
-        let more = dfm_engine::observe(&sys, &dir, &followups(&resolved, &obs, &[])).unwrap();
+        let mut obs = dfm_engine::observe(
+            &sys,
+            &dir,
+            &requests(&resolved, &[], dfm_model::plan::Scope::Config),
+        )
+        .unwrap();
+        let more = dfm_engine::observe(
+            &sys,
+            &dir,
+            &followups(&resolved, &obs, &[], dfm_model::plan::Scope::Config),
+        )
+        .unwrap();
         dfm_engine::merge(&mut obs, more);
         (resolved, obs)
     }
@@ -1164,6 +1179,9 @@ mod synthetic {
         merge: BTreeMap<String, dfm_model::plan::MergeFact>,
     ) -> Plan {
         let cx = Context {
+            scope: dfm_model::plan::Scope::Config,
+            secret: std::collections::BTreeMap::new(),
+            package: std::collections::BTreeMap::new(),
             binary: Binary {
                 version: "0".into(),
                 sha256: "0".repeat(64),
@@ -2548,7 +2566,7 @@ mod removal {
             node: Node::Missing {},
             alias: None,
         };
-        for r in requests(&resolved, &ledger) {
+        for r in requests(&resolved, &ledger, dfm_model::plan::Scope::Config) {
             for i in 0..r.path.split('/').count() {
                 let p = r.path.split('/').take(i + 1).collect::<Vec<_>>().join("/");
                 obs.seen.entry(p).or_insert_with(|| missing.clone());
@@ -2567,6 +2585,9 @@ mod removal {
         obs.seen
             .insert("old/link".into(), Seen { node, alias: None });
         let cx = Context {
+            scope: dfm_model::plan::Scope::Config,
+            secret: std::collections::BTreeMap::new(),
+            package: std::collections::BTreeMap::new(),
             binary: Binary {
                 version: "0".into(),
                 sha256: "0".repeat(64),
@@ -2829,7 +2850,7 @@ mod hardening {
 
     fn all_missing(r: &dfm_model::resolve::Resolved, ledger: &[Owned]) -> Observations {
         let mut obs = Observations::default();
-        for q in dfm_model::plan::requests(r, ledger) {
+        for q in dfm_model::plan::requests(r, ledger, dfm_model::plan::Scope::Config) {
             for i in 0..q.path.split('/').count() {
                 let p = q.path.split('/').take(i + 1).collect::<Vec<_>>().join("/");
                 obs.seen.entry(p).or_insert(Seen {
@@ -2847,6 +2868,9 @@ mod hardening {
         ledger: Vec<Owned>,
     ) -> dfm_model::plan::Plan {
         let cx = Context {
+            scope: dfm_model::plan::Scope::Config,
+            secret: std::collections::BTreeMap::new(),
+            package: std::collections::BTreeMap::new(),
             binary: Binary {
                 version: "0".into(),
                 sha256: "0".repeat(64),
@@ -3086,12 +3110,12 @@ mod ledger_sensitivity {
     #[test]
     fn requests_never_hash_a_path_the_ledger_records_as_sensitive() {
         let r = resolved();
-        let plain = requests(&r, &[]);
+        let plain = requests(&r, &[], dfm_model::plan::Scope::Config);
         assert!(plain.iter().any(|q| q.path == ".ssh/config" && q.hash));
-        let with = requests(&r, &[entry(".ssh/config")]);
+        let with = requests(&r, &[entry(".ssh/config")], dfm_model::plan::Scope::Config);
         assert!(with.iter().any(|q| q.path == ".ssh/config" && !q.hash));
         // A spelling that differs only by case is the same path.
-        let with = requests(&r, &[entry(".SSH/Config")]);
+        let with = requests(&r, &[entry(".SSH/Config")], dfm_model::plan::Scope::Config);
         assert!(with.iter().any(|q| q.path == ".ssh/config" && !q.hash));
     }
 
@@ -3111,7 +3135,7 @@ mod ledger_sensitivity {
             alias: None,
         };
         let paths = |l: &[Owned]| {
-            followups(&r, &obs, l)
+            followups(&r, &obs, l, dfm_model::plan::Scope::Config)
                 .into_iter()
                 .map(|q| q.path)
                 .collect::<Vec<_>>()
@@ -3146,6 +3170,9 @@ mod ledger_sensitivity {
             .unwrap()
             .insert("mode".into(), toml::Value::Integer(0o4755));
         let cx = Context {
+            scope: dfm_model::plan::Scope::Config,
+            secret: std::collections::BTreeMap::new(),
+            package: std::collections::BTreeMap::new(),
             binary: Binary {
                 version: "0".into(),
                 sha256: "0".repeat(64),
@@ -3164,7 +3191,7 @@ mod ledger_sensitivity {
             unchecked: Default::default(),
         };
         let mut obs = Observations::default();
-        for q in requests(&r, &[]) {
+        for q in requests(&r, &[], dfm_model::plan::Scope::Config) {
             for i in 0..q.path.split('/').count() {
                 let p = q.path.split('/').take(i + 1).collect::<Vec<_>>().join("/");
                 obs.seen.entry(p).or_insert(Seen {

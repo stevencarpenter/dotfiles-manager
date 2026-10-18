@@ -72,6 +72,14 @@ pub enum Code {
     // Added by DFM-55 (docs/architecture.md section 10, docs/resolver.md). The bound profile
     // targets another platform or architecture than this machine.
     PlatformMismatch,
+    // Added by DFM-22 (docs/secrets.md). The vault credential is not available to a
+    // noninteractive run, so secret rendering stops before any mutation.
+    CredentialUnavailable,
+    // Added by DFM-22 (docs/secrets.md). The provider ran and produced no usable output: the
+    // previous file is kept.
+    RenderFailed,
+    // Added by DFM-23 (docs/packages.md). A package probe could not decide the installed state.
+    ProbeFailed,
 }
 
 impl Code {
@@ -132,6 +140,9 @@ impl Code {
         Code::Interrupted,
         Code::Terminated,
         Code::PlatformMismatch,
+        Code::CredentialUnavailable,
+        Code::RenderFailed,
+        Code::ProbeFailed,
     ];
 
     pub fn parse(s: &str) -> Option<Code> {
@@ -195,6 +206,9 @@ impl Code {
             Code::Interrupted => "E_INTERRUPTED",
             Code::Terminated => "E_TERMINATED",
             Code::PlatformMismatch => "E_PLATFORM_MISMATCH",
+            Code::CredentialUnavailable => "E_CREDENTIAL_UNAVAILABLE",
+            Code::RenderFailed => "E_RENDER_FAILED",
+            Code::ProbeFailed => "E_PROBE_FAILED",
         }
     }
 
@@ -205,6 +219,8 @@ impl Code {
             Code::ReportUnavailable => Exit::Usage,
             // A failure while writing, or findings from a read-only check, are not refusals.
             Code::IoFailed | Code::Diagnosed | Code::IoUnconfirmed => Exit::Failed,
+            // A provider that ran and failed is a failed operation, as an I/O failure is.
+            Code::RenderFailed => Exit::Failed,
             // Section 10: a stop by signal exits 130 or 143, also after a mutation.
             Code::Interrupted => Exit::Interrupted,
             Code::Terminated => Exit::Terminated,

@@ -22,8 +22,8 @@ use dfm_model::digest::sha256_hex;
 use dfm_model::fold;
 use dfm_model::merge::{Merged, check_foreign, leaf_hashes, salted};
 use dfm_model::plan::{
-    Action, Operation, Owned, Plan, Request, Status as PlanStatus, file_fingerprint, ledger_state,
-    link_fingerprint, node_state,
+    Action, Operation, Owned, PackageState, Plan, Request, Status as PlanStatus, file_fingerprint,
+    ledger_state, link_fingerprint, node_state,
 };
 use dfm_model::state::{
     Class, CoOwned, Fingerprint, JournalEntry, Ledger, OperationRecord, OwnedOutput, Phase,
@@ -292,6 +292,35 @@ fn first_refusal(plan: &Plan, generator: &dyn Generator) -> Result<(), Refusal> 
         if op.status != PlanStatus::Planned {
             continue;
         }
+        // A package install has no path and no content: it needs a provider in this build.
+        if op.action == Action::Install {
+            if op.path.is_some() || op.class != Class::Normal {
+                return Err(plan_invalid(format!(
+                    "{} installs a package but carries a path or is sensitive",
+                    op.id
+                )));
+            }
+            if !generator.installs(op) {
+                return Err(Refusal::new(
+                    Code::GeneratorUnavailable,
+                    format!(
+                        "{}: no package provider for {} in this build; nothing was changed",
+                        op.id, op.adapter
+                    ),
+                ));
+            }
+            if !op
+                .preconditions
+                .iter()
+                .any(|p| p.subject.starts_with("probe:"))
+            {
+                return Err(plan_invalid(format!(
+                    "{} installs a package but records no probe precondition",
+                    op.id
+                )));
+            }
+            continue;
+        }
         let path = op
             .path
             .as_deref()
@@ -321,18 +350,33 @@ fn first_refusal(plan: &Plan, generator: &dyn Generator) -> Result<(), Refusal> 
                 ),
             ));
         }
-        // A sensitive output has no content hash. Apply admits one kind of sensitive operation,
-        // the co-owned merge, which has its own conflict detection (docs/apply.md, Merge). Any
-        // other sensitive operation, a directory included, refuses the whole plan.
+        // A sensitive output has no content hash. Apply admits two kinds of sensitive operation:
+        // the co-owned merge, which has its own conflict detection (docs/apply.md, Merge), and a
+        // rendered secret (docs/secrets.md). Any other sensitive operation, a directory included,
+        // refuses the whole plan.
         let merge = op.class == Class::Sensitive && generator.merges(op);
-        if op.class == Class::Sensitive && !merge {
+        let render = op.class == Class::Sensitive && !merge && generator.renders(op);
+        if op.class == Class::Sensitive && !merge && !render {
             return Err(Refusal::new(
                 Code::SensitiveUnsupported,
                 format!(
-                    "{}: this sensitive output is not published or removed by this build (only the claude-settings/v1 merge is)",
+                    "{}: this sensitive output is not published or removed by this build (only the claude-settings/v1 merge and an op-template/v1 secret are)",
                     op.id
                 ),
             ));
+        }
+        if render {
+            if !is_file_action(op.action)
+                || op.output_sha256.is_some()
+                || op.managed_sha256.is_some()
+                || op.inputs.len() != 1
+            {
+                return Err(plan_invalid(format!(
+                    "{} renders a secret but is not a file write with one template and no content hash",
+                    op.id
+                )));
+            }
+            continue;
         }
         if merge {
             if op.action != Action::Retire && op.managed_sha256.is_none() {
@@ -386,6 +430,7 @@ fn first_refusal(plan: &Plan, generator: &dyn Generator) -> Result<(), Refusal> 
                     op.id
                 )));
             }
+            Action::Install => unreachable!("handled above"),
             Action::None => {
                 return Err(plan_invalid(format!("{} is planned with no action", op.id)));
             }
@@ -557,6 +602,7 @@ fn step_name(op: &Operation) -> &'static str {
         Action::Remove => "remove",
         Action::Adopt => "adopt",
         Action::Retire => "retire",
+        Action::Install => "install",
         Action::None => "none",
     }
 }
@@ -843,11 +889,17 @@ impl Exec<'_, '_> {
     }
 
     fn try_op(&mut self, op: &Operation) -> Result<Ended, Ended> {
+        if op.action == Action::Install {
+            return self.try_install(op);
+        }
         // The gates admit one sensitive kind, the co-owned merge, which has its own path. Nothing
         // below hashes, fingerprints or journals the content of a sensitive path.
         if op.class == Class::Sensitive {
             if self.run.generator.merges(op) {
                 return self.try_merge(op);
+            }
+            if self.run.generator.renders(op) {
+                return self.try_render(op);
             }
             return Err(failed(Refusal::new(
                 Code::SensitiveUnsupported,
@@ -907,7 +959,7 @@ impl Exec<'_, '_> {
                     "is no longer the entry the plan found; it is left alone",
                 ));
             }
-            (Action::None | Action::Retire, _) => {
+            (Action::None | Action::Retire | Action::Install, _) => {
                 return Err(failed(plan_invalid("no action")));
             }
         }
@@ -1185,7 +1237,15 @@ impl Exec<'_, '_> {
         self.journal_at(op, &id, Phase::Intent, Some(recovery), None, at.clone())
             .map_err(|e| Ended::Failed(e, Some(id.clone())))?;
         let effect = crate::fsys::staged_as(&id, &at, || {
-            self.merge_effect(rel, parent, name, read, &merged.bytes, merged.changed)
+            self.merge_effect(
+                rel,
+                parent,
+                name,
+                read,
+                &merged.bytes,
+                merged.changed,
+                dfm_model::merge::MODE,
+            )
         });
         if let Err(e) = effect {
             return Err(self.fail_after_intent(op, &id, abs, e));
@@ -1205,6 +1265,7 @@ impl Exec<'_, '_> {
                         appended: merged.appended.clone(),
                         leaves,
                     },
+                    dfm_model::merge::MODE,
                 ),
             });
         if let Err(e) = settled {
@@ -1223,12 +1284,16 @@ impl Exec<'_, '_> {
         })
     }
 
-    /// Publishes the merged bytes when they differ from the live file, then reads the result
-    /// back. The replace is guarded by the identity captured at the re-read, not by a hash of
-    /// the whole file. The read-back always runs, also when nothing was written: the bytes must
-    /// be the merged bytes, and the mode must be the mode this operation left (the merge mode
-    /// after a write, the mode read before for an unchanged file). It compares in memory and
-    /// records nothing.
+    /// Publishes the merged (or rendered) bytes when they differ from the live file, then reads
+    /// the result back. The replace is guarded by the identity captured at the re-read, not by a
+    /// hash of the whole file. The read-back always runs, also when nothing was written: the
+    /// bytes must be the bytes in memory, and the mode must be the mode this operation left
+    /// (`mode` after a write, the mode read before for an unchanged file). It compares in memory
+    /// and records nothing.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "one effect needs the facts read before it"
+    )]
     fn merge_effect(
         &self,
         rel: &str,
@@ -1237,6 +1302,7 @@ impl Exec<'_, '_> {
         read: &MergeRead,
         bytes: &[u8],
         changed: bool,
+        mode: u32,
     ) -> Result<(), Refusal> {
         let fail = self.run.fail;
         fail.hit("apply-before-effect")?;
@@ -1245,7 +1311,7 @@ impl Exec<'_, '_> {
                 Some(s) => Publish::ReplaceStamp(s),
                 None => Publish::Create,
             };
-            parent.publish_file(name, bytes, dfm_model::merge::MODE, how, MAX_FILE, fail)?;
+            parent.publish_file(name, bytes, mode, how, MAX_FILE, fail)?;
         }
         fail.hit("apply-after-effect")?;
         let bad = |what: &str| {
@@ -1260,15 +1326,301 @@ impl Exec<'_, '_> {
         if h != file_fingerprint(bytes) {
             return Err(bad("the content read back differs"));
         }
-        let want_mode = if changed {
-            Some(dfm_model::merge::MODE)
-        } else {
-            read.mode
-        };
+        let want_mode = if changed { Some(mode) } else { read.mode };
         if parent.entry_mode(name)? != want_mode {
             return Err(bad("the mode differs"));
         }
         Ok(())
+    }
+
+    /// A rendered secret (`op-template/v1`, docs/secrets.md). Like a merge, the live file is read
+    /// under the writer lock and compared by a per-machine salted hash only; nothing records or
+    /// prints an unsalted hash or a byte of the content. Order: prerequisites, re-read, ledger
+    /// check (a file the ledger does not prove ours needs the `takeover` approval), the template
+    /// read from the source root, the render, then intent, publish, read-back, outcome, ledger.
+    /// A render that fails or is empty fails the operation before the intent entry, so the
+    /// previous file stays the last good one. Rendered bytes equal to the live file with a
+    /// matching ledger hash are `current`: nothing is journaled or written.
+    fn try_render(&mut self, op: &Operation) -> Result<Ended, Ended> {
+        let rel = op
+            .path
+            .as_deref()
+            .ok_or_else(|| failed(plan_invalid("no path")))?;
+        let comps = components(rel).map_err(failed)?;
+        let abs = self.abs(rel).map_err(failed)?;
+        self.unknown_block(op, rel, &abs)?;
+        self.prerequisites(op, rel)?;
+        let (name, parents) = comps
+            .split_last()
+            .ok_or_else(|| failed(plan_invalid("empty path")))?;
+        let parent = self
+            .run
+            .home
+            .open_below(&self.run.sys, parents)
+            .map_err(Ended::Blocked)?;
+        let read = self.merge_read(op, rel, &parent, name)?;
+        // What the ledger records for this path, if the manager wrote it before.
+        let ledger = self.run.store.read_ledger_lenient().map_err(failed)?;
+        let want = fold(&abs);
+        let recorded: Option<String> = ledger
+            .resources
+            .iter()
+            .filter(|r| r.resource == op.resource)
+            .flat_map(|r| &r.owned_outputs)
+            .find(|o| fold(&o.path) == want)
+            .and_then(|o| o.coowned.as_ref().map(|c| c.managed_hash.clone()));
+        let salt = self.run.store.salt().map_err(Ended::Blocked)?;
+        let salted_live = match (&read.live, &salt) {
+            (Some(live), Some(s)) => Some(salted(s, live)),
+            _ => None,
+        };
+        // A file the plan took for ours must still be ours now. A takeover was approved by id.
+        if read.live.is_some() && !op.takeover && (recorded.is_none() || salted_live != recorded) {
+            return Err(blocked(
+                Code::Conflict,
+                format!(
+                    "{rel} changed since the plan and the ledger no longer proves the manager wrote it; nothing was changed. Fix: plan again and approve the takeover with --allow-adopt"
+                ),
+            ));
+        }
+        self.run.fail.hit("apply-after-prereq").map_err(failed)?;
+        let template = self.template(op)?;
+        // A render that fails is a failed operation (E_RENDER_FAILED), also when the cause is a
+        // session that went away after the gate: the provider does not say which it was. A
+        // template that is not the one the plan was resolved from blocks it (E_PLAN_STALE).
+        let bytes = self
+            .run
+            .generator
+            .render(op, &template)
+            .map_err(|e| match e.code {
+                Code::PlanStale => Ended::Blocked(e),
+                _ => failed(e),
+            })?;
+        if bytes.is_empty() {
+            return Err(failed(Refusal::new(
+                Code::RenderFailed,
+                format!("{rel}: the provider rendered nothing; the previous file is kept"),
+            )));
+        }
+        if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > MAX_FILE {
+            return Err(failed(Refusal::new(
+                Code::LimitExceeded,
+                format!("{rel}: rendered content exceeds 16 MiB"),
+            )));
+        }
+        let mode = op.mode.unwrap_or(0o600);
+        let changed = read.live.as_deref() != Some(bytes.as_slice()) || read.mode != Some(mode);
+        if !changed && recorded.is_some() && salted_live == recorded {
+            return Ok(Ended::Current);
+        }
+        self.stop_requested()?;
+        let salt = match salt {
+            Some(s) => s,
+            None => self.run.store.salt_or_create().map_err(failed)?,
+        };
+        let new_hash = salted(&salt, &bytes);
+        let id = self.attempt_id(op);
+        let recovery = Recovery {
+            outputs: vec![RecoveryOutput {
+                path: abs.clone(),
+                existed_before: read.live.is_some(),
+                expected_sha256: None,
+            }],
+            snapshot: None,
+        };
+        let at = self.now();
+        self.journal_at(op, &id, Phase::Intent, Some(recovery), None, at.clone())
+            .map_err(|e| Ended::Failed(e, Some(id.clone())))?;
+        let effect = crate::fsys::staged_as(&id, &at, || {
+            self.merge_effect(rel, &parent, name, &read, &bytes, changed, mode)
+        });
+        if let Err(e) = effect {
+            return Err(self.fail_after_intent(op, &id, &abs, e));
+        }
+        let settled = self
+            .journal(op, &id, Phase::Done, None, None)
+            .and_then(|()| self.run.fail.hit("apply-after-done"))
+            .and_then(|()| {
+                self.record_coowned(
+                    op,
+                    &id,
+                    &abs,
+                    CoOwned {
+                        managed_hash: new_hash,
+                        entries: Vec::new(),
+                        appended: Vec::new(),
+                        leaves: Default::default(),
+                    },
+                    mode,
+                )
+            });
+        if let Err(e) = settled {
+            return Err(self.after_intent(e, &id, &abs));
+        }
+        Ok(Ended::Updated {
+            id,
+            before: None,
+            after: None,
+            owned: vec![abs],
+            reload: changed.then(|| RELOAD_NOT_ATTEMPTED.to_string()),
+        })
+    }
+
+    /// An unresolved install blocks a package even when the provider now lists it as installed.
+    fn unknown_install(&self, op: &Operation) -> Result<(), Ended> {
+        if let Some(id) = self.unknown_resources.get(&op.resource) {
+            return Err(blocked(
+                Code::OpInterrupted,
+                format!(
+                    "{}: resource {} has an unknown outcome (journal id {id}) with no recorded output path. Nothing was changed. Fix: check the provider's state, then run `dotfiles-manager state resolve {} --as failed`",
+                    op.id,
+                    op.resource,
+                    recover::quoted(id)
+                ),
+            ));
+        }
+        Ok(())
+    }
+
+    /// A package install (docs/packages.md). The provider is probed again under the lock: a
+    /// package that is installed now is `current`, any other change blocks. Then the intent entry
+    /// (no path: the provider's listing is the record), the install, a third probe as the
+    /// postcondition, and the outcome entry. No ledger entry is written.
+    fn try_install(&mut self, op: &Operation) -> Result<Ended, Ended> {
+        self.unknown_install(op)?;
+        let want = op
+            .preconditions
+            .iter()
+            .find(|p| p.subject.starts_with("probe:"))
+            .map(|p| p.state.as_str())
+            .ok_or_else(|| failed(plan_invalid("an install needs a probe precondition")))?;
+        let now = self.run.generator.probe(op).map_err(failed)?;
+        // A stop request that ended the probe is the stop, not a probe failure: nothing started.
+        self.stop_requested()?;
+        match &now {
+            PackageState::Installed(_) => return Ok(Ended::Current),
+            s if s.still_planned(want) => {}
+            // The provider could not answer now: that is the probe's failure, not a stale plan.
+            PackageState::Unknown(why) => {
+                return Err(blocked(
+                    Code::ProbeFailed,
+                    format!(
+                        "{}: the provider could not report the installed state now ({why}); nothing was changed",
+                        op.id
+                    ),
+                ));
+            }
+            s => {
+                return Err(blocked(
+                    Code::PlanStale,
+                    format!(
+                        "{}: the provider reported {want} at plan time and {} now; nothing was changed",
+                        op.id,
+                        s.state()
+                    ),
+                ));
+            }
+        }
+        self.stop_requested()?;
+        let id = self.attempt_id(op);
+        let recovery = Recovery {
+            outputs: Vec::new(),
+            snapshot: None,
+        };
+        self.journal(op, &id, Phase::Intent, Some(recovery), None)
+            .map_err(|e| Ended::Failed(e, Some(id.clone())))?;
+        // From here on the provider may have changed the machine. A failure is journaled.
+        let result = self
+            .run
+            .fail
+            .hit("apply-before-effect")
+            .and_then(|()| self.run.generator.install(op))
+            .and_then(|()| self.run.fail.hit("apply-after-effect"))
+            .and_then(|()| {
+                let now = self.run.generator.probe(op)?;
+                match (now, crate::signal::requested()) {
+                    (PackageState::Installed(_), _) => Ok(()),
+                    // The stop ended the check itself, so the install's outcome is unknown, not
+                    // failed. The next run probes again.
+                    (_, Some(stop)) => Err(Refusal::new(
+                        stop.code,
+                        format!(
+                            "{}: stopped before the postcondition was checked; the install may have completed, and the next run probes again",
+                            op.id
+                        ),
+                    )),
+                    (s, None) => Err(Refusal::new(
+                        Code::IoFailed,
+                        format!(
+                            "postcondition failed for {}: the provider reports {} after the install",
+                            op.id,
+                            s.state()
+                        ),
+                    )),
+                }
+            });
+        if let Err(e) = result {
+            let why = dfm_model::display::bounded_visible(&e.detail, 1024);
+            let e = match self.journal(op, &id, Phase::Failed, None, Some(why)) {
+                Ok(()) => e,
+                Err(n) => Refusal::new(
+                    e.code,
+                    format!(
+                        "{}; the outcome could not be journaled: {}",
+                        e.detail, n.detail
+                    ),
+                ),
+            };
+            return Err(Ended::Failed(e, Some(id)));
+        }
+        if let Err(e) = self.journal(op, &id, Phase::Done, None, None) {
+            return Err(Ended::Failed(e, Some(id)));
+        }
+        Ok(Ended::Updated {
+            id,
+            before: None,
+            after: None,
+            owned: Vec::new(),
+            reload: None,
+        })
+    }
+
+    /// The template of a secret operation, read from the plan's source root as apply reads any
+    /// source: below the root without following a link, a regular file of the user with one
+    /// hard link, within the source file bound. The resolver records no content identity for
+    /// it, so presence and shape are what is checked here (docs/apply.md, "Link source"); the
+    /// generator then compares the bytes with the sources the plan was resolved from.
+    fn template(&self, op: &Operation) -> Result<Vec<u8>, Ended> {
+        let [input] = op.inputs.as_slice() else {
+            return Err(failed(plan_invalid("a secret needs exactly one template")));
+        };
+        let [source] = self.plan.sources.as_slice() else {
+            return Err(failed(plan_invalid(
+                "a plan with a secret must have exactly one source",
+            )));
+        };
+        let root = Dir::open_plain(Path::new(&source.root)).map_err(failed)?;
+        match root
+            .read_input_below(
+                &self.run.sys,
+                &input.path,
+                dfm_model::plan::MAX_SOURCE_FILE_BYTES,
+            )
+            .map_err(failed)?
+        {
+            crate::fsys::Got::Bytes(b) => Ok(b),
+            crate::fsys::Got::Absent => Err(blocked(
+                Code::PlanStale,
+                format!(
+                    "template {} changed since the plan: it is gone, not a plain file of yours or linked twice; nothing was changed",
+                    input.path
+                ),
+            )),
+            crate::fsys::Got::TooBig => Err(failed(Refusal::new(
+                Code::LimitExceeded,
+                format!("template {} exceeds 1 MiB", input.path),
+            ))),
+        }
     }
 
     /// Records the co-owned file: no content fingerprint, only the salted managed hash and the
@@ -1279,10 +1631,11 @@ impl Exec<'_, '_> {
         id: &str,
         abs: &str,
         coowned: CoOwned,
+        mode: u32,
     ) -> Result<(), Refusal> {
         let out = OwnedOutput {
             path: abs.into(),
-            mode: dfm_model::merge::MODE,
+            mode,
             fingerprint: None,
             coowned: Some(coowned),
         };
@@ -1380,7 +1733,9 @@ impl Exec<'_, '_> {
             Action::Remove => removed = Some(self.remove(op, abs, parent, name, live)?),
             // Nothing is written. The read-back below is the last look at the leaf.
             Action::Adopt => {}
-            Action::None | Action::Retire => return Err(plan_invalid("no action")),
+            Action::None | Action::Retire | Action::Install => {
+                return Err(plan_invalid("no action"));
+            }
         }
         fail.hit("apply-after-effect")?;
         let bad = |what: &str| {
@@ -1737,8 +2092,11 @@ fn execute(run: &Run<'_>, plan: &Plan) -> Report {
             _ => {
                 let started = ex.now();
                 let ended = if op.status == PlanStatus::Current {
-                    // A stale ledger entry is dropped only while the run is still going.
-                    if stopped.is_none() && op.action == Action::Remove {
+                    // A provider listing does not settle an interrupted install's journal entry.
+                    if op.path.is_none() {
+                        ex.unknown_install(op).err().unwrap_or(Ended::Current)
+                    } else if stopped.is_none() && op.action == Action::Remove {
+                        // A stale ledger entry is dropped only while the run is still going.
                         ex.prune(op)
                     } else {
                         Ended::Current

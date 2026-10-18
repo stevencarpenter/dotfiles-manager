@@ -13,14 +13,61 @@ use crate::state::Class;
 use std::collections::{BTreeMap, BTreeSet};
 use toml::Value;
 
-/// The kinds a configuration plan covers. Packages and applications are provisioning, and a
-/// secret is rendered only on explicit request (DESIGN.md section 7: "Only configuration work
-/// belongs in a normal config plan").
+/// Which resources one plan acts on. A configuration plan covers the file kinds. A secret is
+/// rendered only by `secrets`, and a package installed only by `packages` (DESIGN.md section 7:
+/// "Only configuration work belongs in a normal config plan"). Everything else in a plan is
+/// `not_in_scope`, so the counts still add up to the number of participants.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Scope {
+    Config,
+    Secrets,
+    Packages,
+}
+
+impl Scope {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Scope::Config => "config",
+            Scope::Secrets => "secrets",
+            Scope::Packages => "packages",
+        }
+    }
+
+    pub fn covers(self, r: &ResolvedResource) -> bool {
+        match self {
+            Scope::Config => matches!(
+                r.kind.as_str(),
+                "link" | "render" | "merge" | "assemble" | "distribution"
+            ),
+            Scope::Secrets => r.kind == "secret",
+            Scope::Packages => r.kind == "package",
+        }
+    }
+
+    /// Why a resource of another scope is listed and not acted on.
+    fn excuse(self, r: &ResolvedResource) -> String {
+        let what = match r.kind.as_str() {
+            "secret" => {
+                "secret output: destination and mode only; rendering needs the secrets command"
+                    .to_string()
+            }
+            "package" | "application" => format!("{} is provisioning", r.kind),
+            k => format!("{k} is configuration"),
+        };
+        if r.kind == "secret" && self == Scope::Config {
+            return what;
+        }
+        format!("{what}, outside a {} plan", self.as_str())
+    }
+}
+
+/// The one secret adapter (docs/secrets.md). The ledger records an adapter, not a kind, so the
+/// planner names it to tell a deselected secret output (kept) from any other sensitive output.
+pub const SECRET_ADAPTER: &str = "op-template/v1";
+
+/// The kinds a configuration plan covers ([`Scope::Config`]).
 pub fn in_scope(r: &ResolvedResource) -> bool {
-    matches!(
-        r.kind.as_str(),
-        "link" | "render" | "merge" | "assemble" | "distribution"
-    )
+    Scope::Config.covers(r)
 }
 
 fn parts(path: &str) -> Vec<&str> {
@@ -58,6 +105,94 @@ pub enum MergeVerdict {
     },
 }
 
+/// What the caller learned from the destination of a secret resource (docs/secrets.md). The
+/// planner never reads a secret output; the caller compares the live file with the salted hash
+/// the ledger records and reports only this.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SecretVerdict {
+    /// The destination is absent, or the ledger proves the manager wrote what is there.
+    Owned,
+    /// The destination exists and the ledger does not prove the manager wrote it (no entry, or
+    /// the content changed). Overwriting it needs `--allow-adopt`.
+    Unowned,
+    /// The destination cannot be rendered into: not a regular file of the user, open to group or
+    /// others, or the ledger hash cannot be checked. The detail carries no content.
+    Blocked {
+        code: Code,
+        detail: String,
+        correction: String,
+    },
+}
+
+/// What the provider's listing said about a package (docs/packages.md). The planner is pure
+/// and starts no process; the caller probes and reports this.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PackageState {
+    /// The declared provider lists it, with the version it reports.
+    Installed(String),
+    /// The declared provider does not list it and no other owner was seen. The names are the
+    /// dependencies the install would add with it (empty when there are none, or when the
+    /// provider has no dependency listing). They are part of the plan, so the reviewer approves
+    /// them too.
+    Missing(Vec<String>),
+    /// The declared provider does not list it, and installing it would upgrade these installed
+    /// dependencies. A package plan upgrades nothing, so this blocks it.
+    Upgrades(Vec<String>),
+    /// The declared provider does not list it, and it does not come from the provider's official
+    /// source: learning what its install would do means running third-party code before
+    /// approval. This blocks it.
+    Unofficial(String),
+    /// The declared provider does not list it, and these (the package or a missing dependency)
+    /// have no prebuilt binary for this machine. A source build adds build-time dependencies the
+    /// listing does not name, so the plan could not show them; this blocks it.
+    SourceBuild(Vec<String>),
+    /// The declared provider does not list it, but an executable of that name exists elsewhere:
+    /// a declared owner is not permission to replace another owner (DESIGN.md section 8).
+    OtherOwner(String),
+    /// The provider cannot install on this machine (for example it needs privilege).
+    Unsupported(String),
+    /// The probe could not decide. Unknown support fails closed.
+    Unknown(String),
+    /// The resource value is not a valid package declaration (a bad name). Not a probe result.
+    Refused(String),
+}
+
+impl PackageState {
+    /// Whether a probe at apply time still matches the planned precondition `want`: the same
+    /// state, or `missing` with a subset of the planned dependencies. An earlier install in the
+    /// same run can add a dependency two packages share; that is not a stale plan.
+    pub fn still_planned(&self, want: &str) -> bool {
+        if self.state() == want {
+            return true;
+        }
+        let PackageState::Missing(now) = self else {
+            return false;
+        };
+        let planned: BTreeSet<&str> = match want.strip_prefix("missing:with=") {
+            Some(list) => list.split(',').collect(),
+            None if want == "missing" => BTreeSet::new(),
+            None => return false,
+        };
+        now.iter().all(|d| planned.contains(d.as_str()))
+    }
+
+    /// The precondition string apply compares after it probes again.
+    pub fn state(&self) -> String {
+        match self {
+            PackageState::Installed(v) => format!("installed:{v}"),
+            PackageState::Missing(d) if d.is_empty() => "missing".into(),
+            PackageState::Missing(d) => format!("missing:with={}", d.join(",")),
+            PackageState::Upgrades(d) => format!("upgrades:{}", d.join(",")),
+            PackageState::SourceBuild(d) => format!("source-build:{}", d.join(",")),
+            PackageState::Unofficial(w) => format!("unofficial:{w}"),
+            PackageState::OtherOwner(w) => format!("other-owner:{w}"),
+            PackageState::Unsupported(w) => format!("unsupported:{w}"),
+            PackageState::Unknown(w) => format!("unknown:{w}"),
+            PackageState::Refused(w) => format!("refused:{w}"),
+        }
+    }
+}
+
 /// The plan-time facts of one merge resource.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MergeFact {
@@ -90,6 +225,8 @@ pub fn ledger_state(entry: Option<&Owned>, sensitive: bool) -> String {
 }
 
 pub struct Context<'a> {
+    /// Which resources this plan acts on. The others are listed as `not_in_scope`.
+    pub scope: Scope,
     pub binary: Binary,
     pub profile: &'a str,
     pub machine_id: &'a str,
@@ -104,12 +241,22 @@ pub struct Context<'a> {
     pub unchecked: BTreeMap<String, String>,
     /// Facts about the live file of each selected merge resource, by resource id.
     pub merge: BTreeMap<String, MergeFact>,
+    /// The verdict on the destination of each selected secret resource, by resource id
+    /// (`secrets` scope only).
+    pub secret: BTreeMap<String, SecretVerdict>,
+    /// The probed state of each selected package resource, by resource id (`packages` scope
+    /// only).
+    pub package: BTreeMap<String, PackageState>,
 }
 
 /// Ledger outputs of a resource that is no longer selected, at a path no selected resource
 /// claims: candidates for removal. A resource that is still selected keeps its outputs even when
 /// it claims nothing now, and a path that another resource claims is that resource's business.
-fn removals<'a>(resolved: &Resolved, ledger: &'a [Owned]) -> Vec<&'a Owned> {
+fn removals<'a>(resolved: &Resolved, ledger: &'a [Owned], scope: Scope) -> Vec<&'a Owned> {
+    // Removal is configuration work: a secrets or packages plan removes nothing.
+    if scope != Scope::Config {
+        return Vec::new();
+    }
     let claimed: BTreeSet<String> = resolved
         .resources
         .values()
@@ -126,9 +273,9 @@ fn removals<'a>(resolved: &Resolved, ledger: &'a [Owned]) -> Vec<&'a Owned> {
 /// The local facts the first observation pass must collect: every claimed path with its
 /// parents, every fragment directory with its listing, and every ledger output that is no
 /// longer claimed. A sensitive path is never hashed.
-pub fn requests(resolved: &Resolved, ledger: &[Owned]) -> Vec<Request> {
+pub fn requests(resolved: &Resolved, ledger: &[Owned], scope: Scope) -> Vec<Request> {
     let mut want: BTreeMap<String, (bool, bool)> = BTreeMap::new();
-    for r in resolved.resources.values().filter(|r| in_scope(r)) {
+    for r in resolved.resources.values().filter(|r| scope.covers(r)) {
         for c in &r.claims {
             want.entry(c.clone()).or_default().0 |= !r.sensitive;
         }
@@ -136,7 +283,7 @@ pub fn requests(resolved: &Resolved, ledger: &[Owned]) -> Vec<Request> {
             want.entry(d.dir.clone()).or_default().1 = true;
         }
     }
-    for o in removals(resolved, ledger) {
+    for o in removals(resolved, ledger, scope) {
         want.entry(o.path.clone()).or_default().0 |= o.class == Class::Normal;
     }
     // Whatever else asked for it, a path that a selected sensitive resource claims, or that the
@@ -195,7 +342,12 @@ fn sensitive_ledger_paths(ledger: &[Owned]) -> BTreeSet<String> {
 /// The second pass: fragments already in a fragment directory that no resource claims. They are
 /// inputs the manager does not produce, so they are hashed. A claimed path is never requested
 /// here: whether it is hashed depends on its sensitivity and was decided in the first pass.
-pub fn followups(resolved: &Resolved, obs: &Observations, ledger: &[Owned]) -> Vec<Request> {
+pub fn followups(
+    resolved: &Resolved,
+    obs: &Observations,
+    ledger: &[Owned],
+    scope: Scope,
+) -> Vec<Request> {
     let sensitive = sensitive_ledger_paths(ledger);
     let claimed: BTreeSet<String> = resolved
         .resources
@@ -203,7 +355,7 @@ pub fn followups(resolved: &Resolved, obs: &Observations, ledger: &[Owned]) -> V
         .flat_map(|r| r.claims.iter().map(|c| fold(c)))
         .collect();
     let mut out = BTreeSet::new();
-    for r in resolved.resources.values().filter(|r| in_scope(r)) {
+    for r in resolved.resources.values().filter(|r| scope.covers(r)) {
         for d in &r.dir_claims {
             let Some(l) = obs.listings.get(&d.dir) else {
                 continue;
@@ -294,7 +446,7 @@ pub fn build(resolved: &Resolved, cx: &Context<'_>, obs: &Observations) -> Resul
         leaf_ids: BTreeSet::new(),
         removal_ids: BTreeSet::new(),
         mkdirs: BTreeMap::new(),
-        retiring: removals(resolved, &cx.ledger)
+        retiring: removals(resolved, &cx.ledger, cx.scope)
             .into_iter()
             .map(|o| (fold(&o.path), removal_id(o)))
             .collect(),
@@ -302,7 +454,7 @@ pub fn build(resolved: &Resolved, cx: &Context<'_>, obs: &Observations) -> Resul
     for r in resolved.resources.values() {
         p.resource(r);
     }
-    for o in removals(resolved, &cx.ledger) {
+    for o in removals(resolved, &cx.ledger, cx.scope) {
         p.remove(o);
     }
     p.edges(resolved);
@@ -339,7 +491,7 @@ pub fn build(resolved: &Resolved, cx: &Context<'_>, obs: &Observations) -> Resul
     Ok(Plan {
         schema: super::SCHEMA,
         command: "plan".into(),
-        scope: "config".into(),
+        scope: cx.scope.as_str().into(),
         binary: cx.binary.clone(),
         profile: cx.profile.into(),
         machine_id: cx.machine_id.into(),
@@ -541,8 +693,12 @@ impl Planner<'_> {
     }
 
     fn resource(&mut self, r: &ResolvedResource) {
-        if !in_scope(r) {
+        if !self.cx.scope.covers(r) {
             self.out_of_scope(r);
+            return;
+        }
+        if r.kind == "package" {
+            self.package(r);
             return;
         }
         for claim in &r.claims {
@@ -563,26 +719,20 @@ impl Planner<'_> {
     }
 
     fn out_of_scope(&mut self, r: &ResolvedResource) {
-        let secret = r.kind == "secret";
-        let (path, effect) = if secret {
-            (
-                r.target.clone(),
-                "secret output: destination and mode only; rendering needs an explicit secrets scope"
-                    .to_string(),
-            )
-        } else {
-            (
-                None,
-                format!("{} is provisioning, outside a configuration plan", r.kind),
-            )
-        };
+        // A secret shows its destination and mode. Nothing else out of scope shows a path.
+        let path = (r.kind == "secret").then(|| r.target.clone()).flatten();
+        let effect = self.cx.scope.excuse(r);
         let id = format!("{}@scope", r.id);
         let mut op = self.skeleton(r, id.clone(), path);
         op.status = Status::NotInScope;
         op.effect = effect;
-        match declared_mode(r) {
-            Ok(m) => op.mode = m,
-            Err(f) => self.blocker(r, op.path.clone().as_deref(), f),
+        // Only a secret declares a mode. A native document (git-config) may hold a `mode` table
+        // of its own, which is not a file mode.
+        if r.kind == "secret" {
+            match declared_mode(r) {
+                Ok(m) => op.mode = m,
+                Err(f) => self.blocker(r, op.path.clone().as_deref(), f),
+            }
         }
         self.ops.insert(id, op);
     }
@@ -739,10 +889,10 @@ impl Planner<'_> {
             state: owner_state,
         });
         let unowned = self.ledger_entry(claim).is_none();
-        let (action, status, ownership, effect, post) = if r.kind == "merge" {
-            self.decide_merge(r, claim, &seen, op)?
-        } else {
-            decide(r, claim, &seen, link, op.ownership, unowned)?
+        let (action, status, ownership, effect, post) = match r.kind.as_str() {
+            "merge" => self.decide_merge(r, claim, &seen, op)?,
+            "secret" => self.decide_secret(r, claim, &seen, op)?,
+            _ => decide(r, claim, &seen, link, op.ownership, unowned)?,
         };
         // The decision succeeded, so the old owner's entry is retired first. The file is missing
         // here: a merge over a present file with another owner was refused in `decide_merge`.
@@ -892,6 +1042,239 @@ impl Planner<'_> {
         }
     }
 
+    /// A package (docs/packages.md): no path and no ledger entry. The caller probed the declared
+    /// provider; the plan installs what is missing and never upgrades, downgrades or removes.
+    fn package(&mut self, r: &ResolvedResource) {
+        let id = format!("{}@package", r.id);
+        let mut op = self.skeleton(r, id.clone(), None);
+        let name = r
+            .value
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or(&r.id)
+            .to_string();
+        let shown = format!("{name} with {}", r.adapter);
+        let state = self.cx.package.get(&r.id).cloned();
+        op.postcondition = format!("{} lists {name} as installed", r.adapter);
+        let probe = format!("probe:{}:{name}", r.adapter);
+        match state {
+            Some(PackageState::Installed(v)) => {
+                op.action = Action::None;
+                op.status = Status::Current;
+                op.effect = format!("{name} is installed by {} ({v})", r.adapter);
+            }
+            Some(PackageState::Missing(deps)) => {
+                op.action = Action::Install;
+                op.status = Status::Planned;
+                let with = if deps.is_empty() {
+                    String::new()
+                } else {
+                    format!(" and its missing dependencies {}", deps.join(", "))
+                };
+                op.effect = format!(
+                    "install {shown}{with}: the provider's current versions; nothing installed is upgraded or downgraded"
+                );
+                op.preconditions.push(Precondition {
+                    subject: probe,
+                    state: PackageState::Missing(deps).state(),
+                });
+            }
+            Some(PackageState::Unofficial(why)) => {
+                let f = fail(
+                    Code::SourceUntrusted,
+                    "/name",
+                    why,
+                    "install it by hand with the provider, then run packages again",
+                );
+                op.effect = format!("blocked: {}", f.detail);
+                self.blocker(r, None, f);
+            }
+            Some(PackageState::SourceBuild(names)) => {
+                let f = fail(
+                    Code::PlatformUnsupported,
+                    "/name",
+                    format!(
+                        "{name} is not installed, and {} has no prebuilt binary for this machine with {}; a source build adds build-time dependencies the plan cannot show",
+                        names.join(", "),
+                        r.adapter
+                    ),
+                    "install it by hand with the provider, then run packages again",
+                );
+                op.effect = format!("blocked: {}", f.detail);
+                self.blocker(r, None, f);
+            }
+            Some(PackageState::Upgrades(deps)) => {
+                let f = fail(
+                    Code::Conflict,
+                    "/name",
+                    format!(
+                        "{name} is not installed, and installing it with {} would upgrade the installed dependencies {}; a package plan upgrades nothing",
+                        r.adapter,
+                        deps.join(", ")
+                    ),
+                    "upgrade those dependencies with the provider yourself, then run packages again",
+                );
+                op.effect = format!("blocked: {}", f.detail);
+                self.blocker(r, None, f);
+            }
+            Some(PackageState::OtherOwner(why)) => {
+                let f = fail(
+                    Code::Conflict,
+                    "/name",
+                    format!(
+                        "{name} is not installed by {} but {why}; a declared owner is not permission to replace another owner",
+                        r.adapter
+                    ),
+                    "remove the other installation, or declare the adapter that owns it",
+                );
+                op.effect = format!("blocked: {}", f.detail);
+                self.blocker(r, None, f);
+            }
+            Some(PackageState::Unsupported(why)) => {
+                let f = fail(
+                    Code::PrivilegeUnsupported,
+                    "/name",
+                    format!(
+                        "{name} is not installed and {} cannot install it here: {why}",
+                        r.adapter
+                    ),
+                    "install it by hand, then run packages again",
+                );
+                op.effect = format!("blocked: {}", f.detail);
+                self.blocker(r, None, f);
+            }
+            Some(PackageState::Unknown(why)) => {
+                let f = fail(
+                    Code::ProbeFailed,
+                    "/name",
+                    format!("the installed state of {shown} is unknown: {why}"),
+                    "make the provider answer its listing command, then run packages again",
+                );
+                op.effect = format!("blocked: {}", f.detail);
+                self.blocker(r, None, f);
+            }
+            Some(PackageState::Refused(why)) => {
+                let f = fail(
+                    Code::ManifestInvalid,
+                    "/name",
+                    why,
+                    format!("correct the resource value in {}", r.declared_in),
+                );
+                op.effect = format!("blocked: {}", f.detail);
+                self.blocker(r, None, f);
+            }
+            None => {
+                let f = fail(
+                    Code::ProbeFailed,
+                    "/name",
+                    format!("{shown} was not probed"),
+                    "run packages again; if it repeats, report the resource",
+                );
+                op.effect = format!("blocked: {}", f.detail);
+                self.blocker(r, None, f);
+            }
+        }
+        self.ops.insert(id, op);
+    }
+
+    /// A secret output (`op-template/v1`, docs/secrets.md). The content exists only after the
+    /// provider renders it at apply time, so the plan never says `current`: every run renders
+    /// and writes only when the result differs. The caller's verdict says whether the ledger
+    /// proves the manager wrote the file that is there; if not, the overwrite is a takeover that
+    /// needs `--allow-adopt`, as for a co-owned file.
+    fn decide_secret(
+        &self,
+        r: &ResolvedResource,
+        path: &str,
+        seen: &Seen,
+        op: &mut Operation,
+    ) -> Result<Decision, Fail> {
+        let conflict = |what: String, fix: &'static str| fail(Code::Conflict, "target", what, fix);
+        match &seen.node {
+            Node::Unknown { reason } => return Err(unknown_fail("target", path, reason)),
+            Node::Dir { .. } => {
+                return Err(conflict(
+                    format!("{path} is a directory where a secret file is needed"),
+                    "move the directory aside; the manager never replaces a directory",
+                ));
+            }
+            Node::Link { .. } | Node::Other { .. } => {
+                return Err(conflict(
+                    format!(
+                        "{path} is a link or special file; a secret is rendered only into a regular file"
+                    ),
+                    "replace it with a regular file, or remove it",
+                ));
+            }
+            Node::File { own: false, .. } => {
+                return Err(privilege("target", path, "is owned by another user"));
+            }
+            Node::File { mode, .. } if mode & 0o077 != 0 => {
+                return Err(conflict(
+                    format!("{path} is mode {mode:o}, open to group or others, and holds a secret"),
+                    "run chmod 600 on the file, then plan again; the manager does not change a mode it did not set",
+                ));
+            }
+            _ => {}
+        }
+        let mode = op.mode.unwrap_or(0o600);
+        let shown = format!("{path} (secret: destination and mode only)");
+        let post = format!(
+            "{path} holds the rendered template of {}, mode {mode:o}",
+            r.adapter
+        );
+        if let Some(e) = self.ledger_entry(path).filter(|e| e.resource != r.id)
+            && !matches!(seen.node, Node::Missing {})
+        {
+            return Err(conflict(
+                format!(
+                    "{path} is recorded in the ledger as an output of {}",
+                    e.resource
+                ),
+                "move the file aside, then plan again; the manager does not render into another resource's output",
+            ));
+        }
+        if matches!(seen.node, Node::Missing {}) {
+            return Ok((
+                Action::CreateFile,
+                Status::Planned,
+                Ownership::Absent,
+                format!("render {shown}, mode {mode:o}; the content is never shown"),
+                post,
+            ));
+        }
+        match self.cx.secret.get(&r.id) {
+            Some(SecretVerdict::Owned) => Ok((
+                Action::UpdateFile,
+                Status::Planned,
+                Ownership::Owned,
+                format!("re-render {shown}; the file is written only when the result differs"),
+                post,
+            )),
+            Some(SecretVerdict::Unowned) => {
+                op.takeover = true;
+                Ok((
+                    Action::UpdateFile,
+                    Status::Planned,
+                    Ownership::Foreign,
+                    format!(
+                        "take over {shown}: the ledger does not prove the manager wrote it; the approval overwrites it with the rendered template"
+                    ),
+                    post,
+                ))
+            }
+            Some(SecretVerdict::Blocked {
+                code,
+                detail,
+                correction,
+            }) => Err(fail(*code, "target", detail.clone(), correction.clone())),
+            None => Err(conflict(
+                format!("{path} exists and its state was not read"),
+                "run plan again; if it repeats, report the path",
+            )),
+        }
+    }
+
     /// A ledger output that nothing selects any more. It is removed only when the ledger proves
     /// the live output is the one the manager wrote. Anything else is a conflict.
     fn remove(&mut self, o: &Owned) {
@@ -973,6 +1356,18 @@ impl Planner<'_> {
                 ));
             }
             _ => {}
+        }
+        // A secret output (docs/secrets.md) is never removed and never retired. The file and its
+        // ledger entry stay until the user deletes them by hand.
+        if o.class == Class::Sensitive && o.adapter == SECRET_ADAPTER {
+            op.action = Action::None;
+            op.status = Status::Current;
+            op.ownership = Ownership::Owned;
+            op.effect = format!(
+                "{path} is a secret output of a deselected resource; kept with its ledger entry. The manager never removes a secret: delete the file by hand if you want it gone"
+            );
+            op.postcondition = format!("{path} is left as it is");
+            return Ok(());
         }
         if let (Some((n, items)), Node::File { .. }) = (o.coowned_entries, &seen.node) {
             // A co-owned file is never deleted. Only the entries the manager added are retired.
@@ -1672,6 +2067,75 @@ mod tests {
             dir_claims: vec![],
             precedence: None,
         }
+    }
+
+    fn of_kind(kind: &str) -> ResolvedResource {
+        ResolvedResource {
+            kind: kind.into(),
+            ..resource(kind == "secret")
+        }
+    }
+
+    #[test]
+    fn each_scope_covers_its_kinds_and_excuses_the_others() {
+        for kind in ["link", "render", "merge", "assemble", "distribution"] {
+            assert!(Scope::Config.covers(&of_kind(kind)), "{kind}");
+            assert!(!Scope::Secrets.covers(&of_kind(kind)), "{kind}");
+            assert!(!Scope::Packages.covers(&of_kind(kind)), "{kind}");
+            assert_eq!(
+                Scope::Secrets.excuse(&of_kind(kind)),
+                format!("{kind} is configuration, outside a secrets plan")
+            );
+        }
+        assert!(Scope::Secrets.covers(&of_kind("secret")));
+        assert!(Scope::Packages.covers(&of_kind("package")));
+        for scope in [Scope::Config, Scope::Secrets, Scope::Packages] {
+            assert!(!scope.covers(&of_kind("application")), "{scope:?}");
+        }
+        // The configuration plan keeps the original secret text; other scopes say which plan.
+        assert_eq!(
+            Scope::Config.excuse(&of_kind("secret")),
+            "secret output: destination and mode only; rendering needs the secrets command"
+        );
+        assert!(
+            Scope::Packages
+                .excuse(&of_kind("secret"))
+                .ends_with(", outside a packages plan")
+        );
+        assert_eq!(
+            Scope::Config.excuse(&of_kind("package")),
+            "package is provisioning, outside a config plan"
+        );
+        assert_eq!(Scope::Packages.as_str(), "packages");
+    }
+
+    #[test]
+    fn a_package_state_has_one_precondition_string_per_variant() {
+        let states = [
+            PackageState::Installed("1.2".into()),
+            PackageState::Missing(Vec::new()),
+            PackageState::Missing(vec!["aom".into(), "libheif".into()]),
+            PackageState::Upgrades(vec!["libpng".into()]),
+            PackageState::SourceBuild(vec!["afuse".into()]),
+            PackageState::Unofficial("tap".into()),
+            PackageState::OtherOwner("x".into()),
+            PackageState::Unsupported("root".into()),
+            PackageState::Unknown("timeout".into()),
+            PackageState::Refused("bad name".into()),
+        ];
+        let strings: BTreeSet<String> = states.iter().map(PackageState::state).collect();
+        assert_eq!(strings.len(), states.len());
+        assert_eq!(PackageState::Missing(Vec::new()).state(), "missing");
+        assert_eq!(states[2].state(), "missing:with=aom,libheif");
+        // A dependency an earlier install added is not a stale plan; a new one is.
+        let want = states[2].state();
+        assert!(PackageState::Missing(vec!["libheif".into()]).still_planned(&want));
+        assert!(PackageState::Missing(Vec::new()).still_planned(&want));
+        assert!(!PackageState::Missing(vec!["x265".into()]).still_planned(&want));
+        assert!(!PackageState::Missing(vec!["aom".into()]).still_planned("missing"));
+        assert!(PackageState::Missing(Vec::new()).still_planned("missing"));
+        assert!(!PackageState::Upgrades(vec!["aom".into()]).still_planned(&want));
+        assert_eq!(states[0].state(), "installed:1.2");
     }
 
     fn link(to: LinkTo) -> Seen {

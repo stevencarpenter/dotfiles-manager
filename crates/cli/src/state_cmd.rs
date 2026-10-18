@@ -24,14 +24,15 @@ pub fn fail_from_env() -> Result<Fail, Refusal> {
     };
     let (point, action) = spec
         .rsplit_once(':')
-        .ok_or_else(|| usage("DFM_FAILPOINT is <point>:<error|abort|wait-file>"))?;
+        .ok_or_else(|| usage("DFM_FAILPOINT is <point>:<error|abort|stop|wait-file>"))?;
     let action = match action {
         "error" => Action::Error,
         "abort" => Action::Abort,
+        "stop" => Action::Stop,
         a => a
             .strip_prefix("wait-")
             .map(|f| Action::Wait(std::path::PathBuf::from(f)))
-            .ok_or_else(|| usage("DFM_FAILPOINT action is error, abort or wait-<file>"))?,
+            .ok_or_else(|| usage("DFM_FAILPOINT action is error, abort, stop or wait-<file>"))?,
     };
     Ok(Fail::at(point, action))
 }

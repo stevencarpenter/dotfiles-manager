@@ -1,6 +1,6 @@
 //! Stop requests from SIGINT and SIGTERM (docs/apply.md, "Signals").
 //!
-//! This is the only module of the workspace with `unsafe` code, and only [`install`] has it. A
+//! This is the only module of the workspace with `unsafe` code: [`install`] and [`kill_child`]. A
 //! gate test (`crates/cli/tests/gate.rs`) rejects the keyword and the lint attributes in any
 //! other place. The handler does one thing: it stores a number in a static atomic. The executor
 //! reads the number between operations, and once more inside an operation just before its
@@ -11,16 +11,16 @@
 //! middle of a file system call, and a restarted call keeps `openat`, `renameat`, `unlinkat`
 //! and `fsync` from reporting a spurious `EINTR` as a failed or unknown operation.
 //!
-//! No child process runs after [`install`] today, so there is no 30 s wait and no process-group
-//! escalation. Add them with the first operation that starts a child process.
+//! A provider child (`crate::proc`) runs in its own process group once the handlers are
+//! installed ([`installed`]). When a stop request or its timeout is seen while it runs,
+//! [`kill_child`] sends SIGTERM to the group, the runner waits a grace period, and then it
+//! sends SIGKILL (docs/architecture.md section 10 item 6).
 
 use dfm_model::{Code, Refusal};
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
 #[cfg(feature = "failpoints")]
 use std::cell::Cell;
-#[cfg(feature = "failpoints")]
-use std::sync::atomic::AtomicBool;
 
 const NONE: u8 = 0;
 const INT: u8 = 1;
@@ -28,6 +28,9 @@ const TERM: u8 = 2;
 
 /// The first signal received. Later signals do not change it, so the first one keeps its code.
 static FIRST: AtomicU8 = AtomicU8::new(NONE);
+/// Whether [`install`] succeeded in this process. The runner puts a child in its own process
+/// group only then: before, a terminal SIGINT must reach the child as it reaches the manager.
+static INSTALLED: AtomicBool = AtomicBool::new(false);
 
 #[cfg(feature = "failpoints")]
 thread_local! {
@@ -120,6 +123,9 @@ pub fn install() -> Result<(), Refusal> {
         }
         Ok(())
     })();
+    if result.is_ok() {
+        INSTALLED.store(true, Ordering::SeqCst);
+    }
     if result.is_err() {
         let mut restored = true;
         for (sig, old) in installed.iter().rev() {
@@ -137,6 +143,29 @@ pub fn install() -> Result<(), Refusal> {
         }
     }
     result
+}
+
+/// Whether the handlers are installed in this process.
+pub fn installed() -> bool {
+    INSTALLED.load(Ordering::SeqCst)
+}
+
+/// Sends SIGTERM (`term`) or SIGKILL to the child `pid`, or to its process group when the runner
+/// gave it one (`group`; the group id is then the child's pid, so the signal reaches the child and
+/// everything it started). A pid that does not fit, or a target that is gone, is ignored.
+#[expect(
+    unsafe_code,
+    reason = "kill has no safe API; the call touches no memory"
+)]
+pub(crate) fn kill_child(pid: u32, group: bool, term: bool) {
+    let Ok(pid) = i32::try_from(pid) else {
+        return;
+    };
+    let sig = if term { libc::SIGTERM } else { libc::SIGKILL };
+    let target = if group { -pid } else { pid };
+    // SAFETY: `kill` takes two plain integers and dereferences nothing. A negative pid names the
+    // process group.
+    let _ = unsafe { libc::kill(target, sig) };
 }
 
 /// The stop request, if a signal arrived since [`install`]. The refusal carries the code that

@@ -1880,10 +1880,12 @@ fn l5_bidi_and_zero_width_characters_are_refused_in_targets_and_escaped_in_messa
 #[test]
 fn l6_secret_file_modes_are_bounded_and_private() {
     // 0o600 and 0o400 are private. -1 and 0o1000 are out of range. 0o666, 0o640 are not private.
+    // 0o200 and 0 keep no owner read, so the manager could not read the file back.
     for (lit, want) in [
         ("384", None),
         ("256", None),
-        ("0", None),
+        ("128", Some("a private file mode must keep owner read")),
+        ("0", Some("a private file mode must keep owner read")),
         ("-1", Some("a file mode is an integer from 0 to 0o777")),
         ("512", Some("a file mode is an integer from 0 to 0o777")),
         ("4096", Some("a file mode is an integer from 0 to 0o777")),

@@ -12,7 +12,7 @@ use dfm_model::fold;
 use dfm_model::merge::{Merged, fragment_token};
 use dfm_model::plan::{
     MAX_HASHED_BYTES, MAX_LISTING, MAX_SOURCE_ENTRIES, MAX_SOURCE_FILE_BYTES,
-    MAX_SOURCE_TOTAL_BYTES, Operation, Plan, file_fingerprint,
+    MAX_SOURCE_TOTAL_BYTES, Operation, PackageState, Plan, file_fingerprint,
 };
 use dfm_model::state::{AppendedItem, Class, OwnedEntry};
 use dfm_model::{Code, Refusal};
@@ -89,6 +89,47 @@ pub trait Generator {
         Err(Refusal::new(
             Code::GeneratorUnavailable,
             format!("no merge adapter for {}", op.adapter),
+        ))
+    }
+
+    /// Whether `op` is a secret output this generator renders (`op-template/v1`): a sensitive
+    /// `create_file` or `update_file` whose content a provider produces at apply time
+    /// (docs/secrets.md). Apply admits it beside the merge and refuses every other sensitive
+    /// operation.
+    fn renders(&self, _op: &Operation) -> bool {
+        false
+    }
+
+    /// Renders `template` through the provider and returns the bytes to publish. Unlike
+    /// `generate`, this starts a child process. `E_CREDENTIAL_UNAVAILABLE` means the provider
+    /// has no session and nothing ran; `E_RENDER_FAILED` means it ran and failed. The bytes are
+    /// a secret: no caller may print, hash unsalted, or persist them outside the destination.
+    fn render(&self, op: &Operation, _template: &[u8]) -> Result<Vec<u8>, Refusal> {
+        Err(Refusal::new(
+            Code::GeneratorUnavailable,
+            format!("no render adapter for {}", op.adapter),
+        ))
+    }
+
+    /// Whether `op` is a package install this generator runs (docs/packages.md): an `install`
+    /// operation of a provider this build has.
+    fn installs(&self, _op: &Operation) -> bool {
+        false
+    }
+
+    /// Asks the declared provider whether the package is installed (a read-only listing).
+    fn probe(&self, op: &Operation) -> Result<PackageState, Refusal> {
+        Err(Refusal::new(
+            Code::GeneratorUnavailable,
+            format!("no package provider for {}", op.adapter),
+        ))
+    }
+
+    /// Installs the package through the declared provider. The caller probes again afterwards.
+    fn install(&self, op: &Operation) -> Result<(), Refusal> {
+        Err(Refusal::new(
+            Code::GeneratorUnavailable,
+            format!("no package provider for {}", op.adapter),
         ))
     }
 }

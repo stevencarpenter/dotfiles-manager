@@ -15,7 +15,7 @@ mod state_cmd;
 pub use adapters::builtin_catalog;
 pub use controls_fs::{check_build_controls, toolchain_tree_digest};
 
-use dfm_engine::{Dir, Fail, Layout, Store, Sys, open_config};
+use dfm_engine::{Dir, Fail, Layout, Runner, Store, Sys, open_config};
 use dfm_model::binding::{Binding, MAX_BYTES, check_profile};
 use dfm_model::resolve::resolve;
 use dfm_model::state::Stamp;
@@ -43,6 +43,8 @@ usage:
   dotfiles-manager status --root <dir> [--json]
   dotfiles-manager apply --root <dir> [--preview] [--yes-plan <digest>] [--allow-disruptive <operation-id>]...
                                [--allow-adopt <operation-id>]...
+  dotfiles-manager secrets --root <dir> [--preview] [--yes-plan <digest>] [--allow-adopt <operation-id>]...
+  dotfiles-manager packages --root <dir> [--preview] [--yes-plan <digest>]
   dotfiles-manager self-check --build-controls <staged tree>
   dotfiles-manager self-check --fixture-dir <dir>
 
@@ -73,6 +75,23 @@ journals each step and writes a receipt. A removal also needs --allow-disruptive
 An existing link that is exactly the planned link is adopted (ownership is recorded, nothing is
 written) only with --allow-adopt <operation-id>.
 --preview prints the plan and its digest and changes nothing.
+
+secrets is apply over the secret resources only (op-template/v1): every other resource is listed as
+not_in_scope. It needs a 1Password session for each account (`op whoami`), else it exits 3
+(E_CREDENTIAL_UNAVAILABLE) before anything is written. With --yes-plan it renders each template
+through `op inject` and publishes the result with the declared mode. A render that fails or is
+empty keeps the previous file. An existing destination the ledger does not prove the manager
+wrote needs --allow-adopt <operation-id>. No secret value, unsalted hash or provider message is
+printed or stored; the ledger keeps a per-machine salted hash. See docs/secrets.md.
+
+packages is apply over the package resources only (homebrew/v1, mise/v1, apt/v1): every other
+resource is listed as not_in_scope. Planning probes each provider read-only (Homebrew's Cellar
+and Caskroom, mise ls, dpkg-query) with auto-update, analytics and mise configuration off, and
+runs no tap code. A package the provider has installed is current; a missing official one is
+installed with --yes-plan (brew install, mise install), with its missing dependencies named in
+the plan. Nothing is upgraded, downgraded or removed. An executable of the same name from another owner, or a
+provider that cannot answer, is a blocker (exit 3). apt is probe-only: installing needs root. See
+docs/packages.md.
 
 An operation that ended unknown (E_OP_INTERRUPTED) blocks its path in every later run. Each apply
 checks the path again and settles the entry when the result is clear. state recover does only that:
@@ -127,6 +146,21 @@ impl Ctx {
         let uid = dfm_platform_macos::current_uid()
             .ok_or_else(|| Refusal::new(Code::StorageInvalid, "cannot read the user id"))?;
         Ok(Sys { uid })
+    }
+
+    /// How provider children (`op`) are started: the fixed search path of the platform (with
+    /// `~/.local/bin` last), HOME, and a manager-owned working directory under the cache
+    /// directory. The isolated build takes the search path from `DFM_PROVIDER_PATH` so tests can
+    /// plant a provider look-alike.
+    fn runner(&self, sys: &Sys) -> Runner {
+        let search_path = provider_path(self.platform.home());
+        Runner {
+            search_path,
+            home: self.platform.home().to_path_buf(),
+            cwd: dfm_engine::proc::run_dir(&self.platform.cache_dir()),
+            uid: sys.uid,
+            grace: dfm_engine::proc::GRACE,
+        }
     }
 
     /// The binding file name inside the config directory.
@@ -208,6 +242,19 @@ fn context(_home: Option<String>) -> Result<Ctx, Refusal> {
         arch: arch.into(),
         isolated: None,
     })
+}
+
+#[cfg(feature = "test-isolation")]
+fn provider_path(home: &Path) -> Vec<PathBuf> {
+    match std::env::var("DFM_PROVIDER_PATH") {
+        Ok(v) if !v.is_empty() => v.split(':').map(PathBuf::from).collect(),
+        _ => dfm_platform_macos::provider_path(home),
+    }
+}
+
+#[cfg(not(feature = "test-isolation"))]
+fn provider_path(home: &Path) -> Vec<PathBuf> {
+    dfm_platform_macos::provider_path(home)
 }
 
 #[cfg(feature = "test-isolation")]
@@ -332,7 +379,25 @@ fn dispatch(args: &[String], out: &mut dyn Write) -> Result<(), Refusal> {
             doctor_cmd::run(context(home), name, rest, out)
         }
         "apply" => {
-            let args = apply_cmd::parse_args(rest)?;
+            let args = apply_cmd::parse_args(rest, dfm_model::plan::Scope::Config)?;
+            apply_cmd::run(&context(home)?, &args, out)
+        }
+        "secrets" => {
+            let args = apply_cmd::parse_args(rest, dfm_model::plan::Scope::Secrets)?;
+            if !args.allow.is_empty() {
+                return Err(usage(
+                    "secrets removes nothing; --allow-disruptive does not apply",
+                ));
+            }
+            apply_cmd::run(&context(home)?, &args, out)
+        }
+        "packages" => {
+            let args = apply_cmd::parse_args(rest, dfm_model::plan::Scope::Packages)?;
+            if !args.allow.is_empty() || !args.allow_adopt.is_empty() {
+                return Err(usage(
+                    "packages removes and adopts nothing; --allow-disruptive and --allow-adopt do not apply",
+                ));
+            }
             apply_cmd::run(&context(home)?, &args, out)
         }
         "self-check" => {

@@ -9,7 +9,8 @@ use crate::{Ctx, Loaded, load_resolved, read_existing_binding, usage};
 use dfm_engine::{Dir, Fail, Store, merge, observe};
 use dfm_model::display::visible;
 use dfm_model::plan::{
-    self, Binary, Context, MAX_PLAN_BYTES, Owned, Plan, Saved, Stale, Status, source_identity,
+    self, Binary, Context, MAX_PLAN_BYTES, Owned, PackageState, Plan, Saved, Scope, Stale, Status,
+    source_identity,
 };
 use dfm_model::{Code, Refusal};
 use std::collections::BTreeMap;
@@ -89,13 +90,27 @@ fn owned(store: &Store, home: &Path) -> Result<Vec<Owned>, Refusal> {
     dfm_engine::owned_outputs(&store.read_ledger_lenient()?, home)
 }
 
-/// Builds the plan for the bound profile. Read-only.
+/// Builds the configuration plan for the bound profile. Read-only.
 pub fn make_plan(ctx: &Ctx, root: &Path) -> Result<Plan, Refusal> {
-    plan_for(ctx, &load_resolved(ctx, root)?)
+    plan_for(
+        ctx,
+        &load_resolved(ctx, root)?,
+        Scope::Config,
+        BTreeMap::new(),
+    )
 }
 
-/// As [`make_plan`], for sources that are already resolved (`doctor` resolves once).
-pub fn plan_for(ctx: &Ctx, loaded: &Loaded) -> Result<Plan, Refusal> {
+/// As [`make_plan`], for sources that are already resolved (`doctor` resolves once) and for one
+/// scope. A secrets plan reads each secret destination in memory for its verdict and nothing
+/// else; a configuration plan never reads one (docs/secrets.md). A packages plan takes the
+/// providers' answers in `package` from the caller (`packages` probes before it plans,
+/// docs/packages.md): nothing in this module starts a process.
+pub fn plan_for(
+    ctx: &Ctx,
+    loaded: &Loaded,
+    scope: Scope,
+    package: BTreeMap<String, PackageState>,
+) -> Result<Plan, Refusal> {
     let layout = ctx.layout();
     let sys = ctx.sys()?;
     // Ownership decides what may be replaced. Without state it is unknown, so planning fails
@@ -106,12 +121,12 @@ pub fn plan_for(ctx: &Ctx, loaded: &Loaded) -> Result<Plan, Refusal> {
     let ledger = owned(&store, &layout.home)?;
 
     let home = Dir::open_home(&sys, &layout.home)?;
-    let reqs = plan::requests(&loaded.resolved, &ledger);
+    let reqs = plan::requests(&loaded.resolved, &ledger, scope);
     let mut obs = observe(&sys, &home, &reqs)?;
     let more = observe(
         &sys,
         &home,
-        &plan::followups(&loaded.resolved, &obs, &ledger),
+        &plan::followups(&loaded.resolved, &obs, &ledger, scope),
     )?;
     merge(&mut obs, more);
 
@@ -145,16 +160,30 @@ pub fn plan_for(ctx: &Ctx, loaded: &Loaded) -> Result<Plan, Refusal> {
         usage("--root resolves to a path that is not UTF-8; point --root at a UTF-8 path")
     })?;
     let source_root = Dir::open_plain(&loaded.root);
-    let merge = crate::adapters::merge_facts(
-        &loaded.resolved,
-        &store,
-        &sys,
-        &home,
-        &layout.home,
-        &source_root,
-        &ledger,
-    );
+    let merge = match scope {
+        Scope::Config => crate::adapters::merge_facts(
+            &loaded.resolved,
+            &store,
+            &sys,
+            &home,
+            &layout.home,
+            &source_root,
+            &ledger,
+        ),
+        _ => BTreeMap::new(),
+    };
+    let secret = match scope {
+        Scope::Secrets => crate::adapters::secret::secret_facts(
+            &loaded.resolved,
+            &store,
+            &sys,
+            &home,
+            &layout.home,
+        ),
+        _ => BTreeMap::new(),
+    };
     let cx = Context {
+        scope,
         binary: binary_identity()?,
         profile: loaded.binding.profile(),
         machine_id: loaded.binding.machine_id(),
@@ -164,6 +193,8 @@ pub fn plan_for(ctx: &Ctx, loaded: &Loaded) -> Result<Plan, Refusal> {
         reserved,
         unchecked,
         merge,
+        secret,
+        package,
     };
     let mut plan = plan::build(&loaded.resolved, &cx, &obs)?;
     // Generated output hashes (architecture section 9 item 1), from the same adapters apply runs.
