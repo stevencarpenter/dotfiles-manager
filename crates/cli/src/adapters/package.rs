@@ -24,8 +24,11 @@ const INSTALL_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 /// A listing or an install log is bounded; its content is not kept.
 const MAX_OUTPUT: usize = 1 << 20;
 
-/// Homebrew probes and installs disable auto-update, analytics, hints, cleanup and the implicit
-/// upgrade of dependents (architecture section 8 item 5).
+/// Homebrew probes and installs disable auto-update, analytics, hints and cleanup
+/// (architecture section 8 item 5), the upgrade of an outdated requested formula, and the
+/// upgrade or reinstall of its installed dependents: a package plan installs what is missing and
+/// changes nothing it did not list (DESIGN.md: a plan contains no implicit upgrades). These
+/// variables reach only the manager's own `brew` child, never the user's shell.
 fn brew_env() -> Vec<(String, String)> {
     [
         "HOMEBREW_NO_AUTO_UPDATE",
@@ -33,6 +36,7 @@ fn brew_env() -> Vec<(String, String)> {
         "HOMEBREW_NO_ENV_HINTS",
         "HOMEBREW_NO_INSTALL_CLEANUP",
         "HOMEBREW_NO_INSTALL_UPGRADE",
+        "HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK",
     ]
     .iter()
     .map(|k| (k.to_string(), "1".to_string()))

@@ -47,7 +47,7 @@ update_policy = "rolling"
 const FAKE_BREW: &str = r#"#!/bin/sh
 PATH=/usr/bin:/bin:$PATH
 here=$(dirname "$0")
-printf 'brew %s | auto=%s analytics=%s hints=%s cleanup=%s upgrade=%s user=%s\n' "$*" "${HOMEBREW_NO_AUTO_UPDATE:-unset}" "${HOMEBREW_NO_ANALYTICS:-unset}" "${HOMEBREW_NO_ENV_HINTS:-unset}" "${HOMEBREW_NO_INSTALL_CLEANUP:-unset}" "${HOMEBREW_NO_INSTALL_UPGRADE:-unset}" "${USER:-none}" >> "$here/../log"
+printf 'brew %s | auto=%s analytics=%s hints=%s cleanup=%s upgrade=%s dependents=%s user=%s\n' "$*" "${HOMEBREW_NO_AUTO_UPDATE:-unset}" "${HOMEBREW_NO_ANALYTICS:-unset}" "${HOMEBREW_NO_ENV_HINTS:-unset}" "${HOMEBREW_NO_INSTALL_CLEANUP:-unset}" "${HOMEBREW_NO_INSTALL_UPGRADE:-unset}" "${HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK:-unset}" "${USER:-none}" >> "$here/../log"
 db="$here/../installed-brew"
 case "$1" in
   list)
@@ -246,7 +246,7 @@ fn missing_packages_are_installed_once_installed_ones_are_current_and_the_env_is
     let log = fx.log();
     assert!(
         log.contains(
-            "brew list --versions atuin | auto=1 analytics=1 hints=1 cleanup=1 upgrade=1 user=none"
+            "brew list --versions atuin | auto=1 analytics=1 hints=1 cleanup=1 upgrade=1 dependents=1 user=none"
         ),
         "{log}"
     );
@@ -442,6 +442,14 @@ fn the_owner_check_survives_a_home_that_resembles_a_provider_and_a_noop_install_
     let out = text(&o.stdout);
     assert!(out.contains(&format!("failed {BREW_OP}")), "{out}");
     assert!(out.contains("postcondition failed"), "{out}");
+    // The install runs with the same variables: no upgrade of the formula or its dependents.
+    assert!(
+        fx.log().contains(
+            "brew install atuin | auto=1 analytics=1 hints=1 cleanup=1 upgrade=1 dependents=1 user=none"
+        ),
+        "{}",
+        fx.log()
+    );
     // A bad name is a manifest error, not a probe failure.
     fx.put(
         "base/modules/extra/module.toml",
