@@ -10,7 +10,7 @@ use dfm_model::plan::{
     Action, Blocker, MAX_HASHED_BYTES, Node, Observations, Operation, Ownership, PackageState,
     Plan, Status, file_fingerprint, matches_pattern,
 };
-use dfm_model::resolve::{Resolved, Table, Value};
+use dfm_model::resolve::{Entry, Resolved, SourceSet, Table, Value};
 use dfm_model::state::Class;
 use dfm_model::{Code, Refusal};
 use std::collections::{BTreeMap, BTreeSet};
@@ -42,6 +42,10 @@ pub struct Generators<'a> {
     table: Vec<Adapter>,
     /// How a provider child is started. `None` in a build of the plan: nothing renders then.
     runner: Option<Runner>,
+    /// The secret templates by source path, as the sources the plan was resolved from hold
+    /// them. The plan records no content identity for a secret template (docs/resolver.md item
+    /// 12), so `render` compares the bytes apply read with these instead.
+    templates: BTreeMap<String, Vec<u8>>,
 }
 
 impl<'a> Generators<'a> {
@@ -50,14 +54,29 @@ impl<'a> Generators<'a> {
             resolved,
             table: registry(),
             runner: None,
+            templates: BTreeMap::new(),
         }
     }
 
     /// Generators that can also render a secret or install a package through `runner` (the
-    /// `secrets` and `packages` commands).
-    pub fn with_runner(resolved: &'a Resolved, runner: Runner) -> Self {
+    /// `secrets` and `packages` commands). `sources` are the ones the plan was resolved from.
+    pub fn with_runner(resolved: &'a Resolved, sources: &SourceSet, runner: Runner) -> Self {
+        let templates = resolved
+            .resources
+            .values()
+            .filter(|r| r.secret_values)
+            .flat_map(|r| r.provenance.values())
+            .filter_map(|p| {
+                let path = p.source_path.clone()?;
+                match sources.get(&path)? {
+                    Entry::File(b) => Some((path, b.clone())),
+                    Entry::Link(_) => None,
+                }
+            })
+            .collect();
         Generators {
             runner: Some(runner),
+            templates,
             ..Generators::new(resolved)
         }
     }
@@ -179,6 +198,17 @@ impl Generator for Generators<'_> {
                     format!("no render adapter for {}", op.adapter),
                 )
             })?;
+        // The bytes apply read must be the bytes the plan was resolved from: a template changed
+        // in between would render under the approved digest.
+        let path = op.inputs.first().map(|i| i.path.as_str()).unwrap_or("");
+        if self.templates.get(path).map(Vec::as_slice) != Some(template) {
+            return Err(Refusal::new(
+                Code::PlanStale,
+                format!(
+                    "template {path} changed since the plan; nothing was changed. Fix: run again"
+                ),
+            ));
+        }
         secret::render(runner, self.value(op)?, template)
     }
 

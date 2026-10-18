@@ -360,6 +360,37 @@ fn qualified_names_are_probed_by_their_short_name_and_installed_in_full() {
     assert!(log.contains("mise ls --installed duckdb |"), "{log}");
     assert!(log.contains("mise install duckdb@2 |"), "{log}");
     assert!(text(&o.stdout).contains(&format!("updated {MISE_OP}")));
+    // A prefix matches whole components: 10.x is not a 1.x. A selector mise resolves online
+    // is a manifest error, not a probe.
+    fx.put(
+        "base/modules/extra/module.toml",
+        &EXTRA.replace("name = \"duckdb\"", "name = \"duckdb@1\""),
+    );
+    fx.installed("mise", "duckdb 10.0.0\n");
+    let o = fx.preview();
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+    assert!(
+        text(&o.stdout).contains(&format!("planned {MISE_OP}")),
+        "{}",
+        text(&o.stdout)
+    );
+    fx.put(
+        "base/modules/extra/module.toml",
+        &EXTRA.replace("name = \"duckdb\"", "name = \"duckdb@latest\""),
+    );
+    let lines = fx.log().lines().count();
+    let o = fx.preview();
+    assert_eq!(code(&o), 3, "{}\n{}", stderr(&o), text(&o.stdout));
+    assert!(stderr(&o).contains("E_MANIFEST_INVALID"), "{}", stderr(&o));
+    assert!(!fx.log().contains("mise ls --installed duckdb@latest"));
+    assert!(
+        !fx.log()[..]
+            .lines()
+            .skip(lines)
+            .any(|l| l.starts_with("mise ")),
+        "{}",
+        fx.log()
+    );
     // A scoped npm tool keeps its `@`: it is listed in full and current when installed.
     fx.put(
         "base/modules/extra/module.toml",

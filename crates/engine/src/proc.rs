@@ -9,8 +9,9 @@
 //! child, and ends the child when the bound elapses or a stop request arrives: SIGTERM, a grace
 //! period, then SIGKILL. `run` returns within the timeout plus three grace periods whatever the
 //! child and its descendants do: a process that keeps the inherited pipes open after the child
-//! exited gets the same SIGTERM, grace, SIGKILL sequence. The caller decides what the output
-//! means. Nothing here prints or persists a byte of it.
+//! exited, or a child that closed them but ignores SIGTERM, gets the same SIGTERM, grace,
+//! SIGKILL sequence. The caller decides what the output means. Nothing here prints or persists
+//! a byte of it.
 
 use crate::signal;
 use dfm_model::{Code, Refusal};
@@ -243,27 +244,27 @@ impl Runner {
             });
         }
         let end = wait(&mut child, target, req.timeout);
-        // The pipes close when every process that inherited them is gone. A descendant that
-        // outlives the child gets the same sequence as a timeout: SIGTERM, grace, SIGKILL. The
-        // leader is still unreaped during a timeout, so its id cannot have been recycled.
+        // Settled means the child is reaped and both pipes are closed, which happens when every
+        // process that inherited them is gone. A descendant that outlives the child, or a child
+        // that closed its pipes but ignores SIGTERM, gets the same sequence as a timeout:
+        // SIGTERM, grace, SIGKILL. The leader is unreaped until the end, so its id cannot have
+        // been recycled.
         let mut pipes = Pipes::new(out_rx, err_rx);
         let ended_early = matches!(end, End::TimedOut | End::Stopped(_));
-        if !ended_early && !pipes.wait(self.grace) {
+        if !ended_early && !settled(&mut child, &mut pipes, self.grace) {
             target.kill(true);
         }
-        if !pipes.done() && !pipes.wait(self.grace) {
+        if !settled(&mut child, &mut pipes, self.grace) {
             target.kill(false);
         }
-        if !pipes.done() && !pipes.wait(self.grace) {
-            // Still open after SIGKILL: a process left the group. The reader threads end when it
-            // exits; nothing more can be done from here.
-            let _ = child.try_wait();
+        if !settled(&mut child, &mut pipes, self.grace) {
+            // Still there after SIGKILL: a process left the group, or the child cannot die. The
+            // reader threads end when the pipes close; nothing more can be done from here.
             return Err(refused(format!(
-                "a process started by {} keeps its output open after SIGKILL; it was left running",
+                "a process started by {} is still running or keeps its output open after SIGKILL; it was left running",
                 program.display()
             )));
         }
-        let _ = child.wait();
         let Pipes { stdout, stderr, .. } = pipes;
         let stdout = stdout
             .ok_or_else(|| refused("the standard output reader ended early"))?
@@ -347,6 +348,27 @@ impl Pipes {
     }
 }
 
+/// Waits up to `limit` for the child to be reaped and both pipes to close. A `try_wait` error
+/// counts as reaped: nothing more can be learned about the child.
+fn settled(child: &mut Child, pipes: &mut Pipes, limit: Duration) -> bool {
+    let until = Instant::now() + limit;
+    loop {
+        let reaped = !matches!(child.try_wait(), Ok(None));
+        if reaped && pipes.done() {
+            return true;
+        }
+        let left = until.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return false;
+        }
+        if pipes.done() {
+            std::thread::sleep(left.min(POLL));
+        } else {
+            pipes.wait(left.min(POLL));
+        }
+    }
+}
+
 /// Reads both pipes on their own threads, so a child that fills one while we wait on the other
 /// cannot stall. Standard output over the cap is `E_LIMIT_EXCEEDED`; standard error is cut.
 #[expect(
@@ -411,8 +433,8 @@ fn readers(
 }
 
 /// Waits for the child, polling so a stop request or the timeout is seen within one poll. On a
-/// timeout or a stop request the target gets SIGTERM here; the caller waits the grace period on
-/// the pipes and sends SIGKILL if they are still open. A `try_wait` error ends the target at
+/// timeout or a stop request the target gets SIGTERM here; the caller waits the grace period for
+/// the child to be reaped and its pipes to close, and sends SIGKILL otherwise. A `try_wait` error ends the target at
 /// once, because nothing more can be learned about the child.
 fn wait(child: &mut Child, target: Target, timeout: Duration) -> End {
     let started = Instant::now();

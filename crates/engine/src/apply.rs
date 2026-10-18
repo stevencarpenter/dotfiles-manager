@@ -1383,11 +1383,19 @@ impl Exec<'_, '_> {
                 ),
             ));
         }
-        let template = self.template(op)?;
         self.run.fail.hit("apply-after-prereq").map_err(failed)?;
+        let template = self.template(op)?;
         // A render that fails is a failed operation (E_RENDER_FAILED), also when the cause is a
-        // session that went away after the gate: the provider does not say which it was.
-        let bytes = self.run.generator.render(op, &template).map_err(failed)?;
+        // session that went away after the gate: the provider does not say which it was. A
+        // template that is not the one the plan was resolved from blocks it (E_PLAN_STALE).
+        let bytes = self
+            .run
+            .generator
+            .render(op, &template)
+            .map_err(|e| match e.code {
+                Code::PlanStale => Ended::Blocked(e),
+                _ => failed(e),
+            })?;
         if bytes.is_empty() {
             return Err(failed(Refusal::new(
                 Code::RenderFailed,
@@ -1560,7 +1568,8 @@ impl Exec<'_, '_> {
     /// The template of a secret operation, read from the plan's source root as apply reads any
     /// source: below the root without following a link, a regular file of the user with one
     /// hard link, within the source file bound. The resolver records no content identity for
-    /// it, so presence and shape are what is checked (docs/apply.md, "Link source").
+    /// it, so presence and shape are what is checked here (docs/apply.md, "Link source"); the
+    /// generator then compares the bytes with the sources the plan was resolved from.
     fn template(&self, op: &Operation) -> Result<Vec<u8>, Ended> {
         let [input] = op.inputs.as_slice() else {
             return Err(failed(plan_invalid("a secret needs exactly one template")));

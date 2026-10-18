@@ -99,6 +99,16 @@ fn a_process_that_keeps_the_pipes_open_is_ended_and_run_returns_within_the_bound
     let out = r.run(&req(&[], None, 1)).unwrap();
     assert!(matches!(out.end, End::TimedOut), "{out:?}");
     assert!(t.elapsed() < Duration::from_secs(6), "{:?}", t.elapsed());
+    // A child that closed its pipes but ignores SIGTERM gets SIGKILL too: run does not wait on it.
+    script(
+        &d.join("bin"),
+        "tool",
+        "trap '' TERM; exec >/dev/null 2>&1; sleep 20",
+    );
+    let t = Instant::now();
+    let out = r.run(&req(&[], None, 1)).unwrap();
+    assert!(matches!(out.end, End::TimedOut), "{out:?}");
+    assert!(t.elapsed() < Duration::from_secs(6), "{:?}", t.elapsed());
     let _ = std::fs::remove_dir_all(&d);
 }
 

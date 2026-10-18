@@ -128,9 +128,15 @@ fn brew_probe(runner: &Runner, pkg: &str) -> PackageState {
 /// `mise ls --installed <tool>`: one line `<tool> <version> ...` per installed version, no line
 /// when none is installed. A tool mise does not know is an error (exit 1). A declared
 /// `tool@version` is listed by its tool name and counts as installed when an installed version
-/// starts with the declared one (`node@20` matches `20.20.2`).
+/// is the declared one or extends it at a component boundary (`node@20` matches `20.20.2`, not
+/// `2.1.0`). A selector only mise can resolve is refused: the probe has no network.
 fn mise_probe(runner: &Runner, pkg: &str) -> PackageState {
     let (tool, want) = tool_and_version(pkg);
+    if symbolic(want) {
+        return PackageState::Refused(format!(
+            "{pkg}: mise/v1 takes an exact version or a version prefix (node@20, node@20.1), not a selector mise resolves online ({want})"
+        ));
+    }
     let args = ["ls".to_string(), "--installed".into(), tool.into()];
     let out = match runner.run(&request("mise", &args, &mise_env(), PROBE_TIMEOUT)) {
         Ok(o) => o,
@@ -152,7 +158,7 @@ fn mise_probe(runner: &Runner, pkg: &str) -> PackageState {
             (parts.next() == Some(tool)).then(|| parts.next()).flatten()
         })
         .filter(|v| !v.contains("missing"))
-        .filter(|v| want.is_empty() || v.starts_with(want))
+        .filter(|v| version_matches(v, want))
         .collect();
     if versions.is_empty() {
         PackageState::Missing
@@ -193,6 +199,24 @@ fn tool_and_version(pkg: &str) -> (&str, &str) {
         Some((tool, version)) if !tool.is_empty() && !version.contains('/') => (tool, version),
         _ => (pkg, ""),
     }
+}
+
+/// Whether an installed version satisfies the declared one: equal, or longer by whole
+/// components (`20.20.2` satisfies `20` and `20.20`; `2.1.0` does not satisfy `20`).
+fn version_matches(have: &str, want: &str) -> bool {
+    want.is_empty()
+        || have
+            .strip_prefix(want)
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with(['.', '-', '+']))
+}
+
+/// A mise selector that names no fixed version: mise resolves it from its remote listing, which
+/// a read-only probe never fetches.
+fn symbolic(want: &str) -> bool {
+    matches!(want, "latest" | "lts" | "system")
+        || ["lts-", "lts/", "sub-", "ref:", "path:", "prefix:"]
+            .iter()
+            .any(|p| want.starts_with(p))
 }
 
 /// The executable name a package is looked for under: the last `/` component of a tap or
@@ -347,6 +371,31 @@ mod tests {
             ("npm:@scope/pkg", "1.2")
         );
         assert_eq!(tool_and_version("@odd"), ("@odd", ""));
+    }
+
+    #[test]
+    fn an_installed_version_matches_the_declared_one_by_whole_components() {
+        assert!(version_matches("20.20.2", ""));
+        assert!(version_matches("20.20.2", "20"));
+        assert!(version_matches("20.20.2", "20.20"));
+        assert!(version_matches("20.20.2", "20.20.2"));
+        assert!(version_matches("openjdk-21.0.2", "openjdk-21"));
+        assert!(!version_matches("20.20.2", "2"));
+        assert!(!version_matches("20.20.2", "20.2"));
+        assert!(!version_matches("2.1.0", "20"));
+        for s in [
+            "latest",
+            "lts",
+            "lts-hydrogen",
+            "sub-1:latest",
+            "ref:main",
+            "system",
+        ] {
+            assert!(symbolic(s), "{s}");
+        }
+        for s in ["", "20", "20.1", "openjdk-21", "2024-01"] {
+            assert!(!symbolic(s), "{s}");
+        }
     }
 
     #[test]

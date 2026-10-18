@@ -155,16 +155,19 @@ impl Fx {
         );
     }
 
-    fn run(&self, args: &[&str]) -> Output {
-        Command::new(BIN)
-            .env_clear()
+    fn cmd(&self, args: &[&str]) -> Command {
+        let mut c = Command::new(BIN);
+        c.env_clear()
             .env("DFM_PROVIDER_PATH", self.bin())
             .env("OP_SESSION_planted", "should-pass-through")
             .arg("--home")
             .arg(self.home.path())
-            .args(args)
-            .output()
-            .unwrap()
+            .args(args);
+        c
+    }
+
+    fn run(&self, args: &[&str]) -> Output {
+        self.cmd(args).output().unwrap()
     }
 
     fn root_arg(&self) -> &str {
@@ -433,6 +436,46 @@ fn a_hand_edited_destination_is_a_takeover_that_needs_allow_adopt() {
     assert_eq!(code(&o), 3, "{}", stderr(&o));
     assert!(stderr(&o).contains("E_CONFLICT"), "{}", stderr(&o));
     assert!(stderr(&o).contains("chmod 600"), "{}", stderr(&o));
+}
+
+#[test]
+fn a_template_changed_after_the_locked_plan_blocks_the_render() {
+    let fx = Fx::new();
+    let d = digest_of(&fx.preview());
+    // The run parks after the lock and the second plan, before it reads the template.
+    let release = fx.fake.path().join("release");
+    let child = fx
+        .cmd(&["secrets", "--root", fx.root_arg(), "--yes-plan", &d])
+        .env(
+            "DFM_FAILPOINT",
+            format!("apply-after-prereq:wait-{}", release.display()),
+        )
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let reached = release.with_extension("reached");
+    let end = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !reached.exists() {
+        assert!(std::time::Instant::now() < end, "the run never parked");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    fx.put(
+        "base/modules/extra/files/personal.env.tpl",
+        "TOKEN={{ op://vault/other-item/field }}\n",
+    );
+    fs::write(&release, "").unwrap();
+    let o = child.wait_with_output().unwrap();
+    // The parent directory was created first, so the run already mutated: exit 1, not 3.
+    assert_eq!(code(&o), 1, "{}\n{}", stderr(&o), text(&o.stdout));
+    assert!(stderr(&o).contains("E_PLAN_STALE"), "{}", stderr(&o));
+    assert!(
+        text(&o.stdout).contains(&format!("blocked {OP_ID}")),
+        "{}",
+        text(&o.stdout)
+    );
+    assert!(!fx.h(TARGET).exists());
+    assert!(!fx.op_log().contains("inject"), "{}", fx.op_log());
 }
 
 #[test]

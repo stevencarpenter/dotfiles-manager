@@ -11,8 +11,8 @@ use crate::adapters::Generators;
 use crate::plan_cmd::{plan_for, render};
 use crate::{Ctx, load_resolved, read_existing_binding, state_cmd, usage};
 use dfm_engine::{
-    Approval as Allowance, Dir, Run, Store, apply, check_allowances, check_journal_capacity, gates,
-    now_ns,
+    Approval as Allowance, Dir, Run, Store, Sys, apply, check_allowances, check_journal_capacity,
+    gates, now_ns,
 };
 use dfm_model::display::{visible, visible_for_paste};
 use dfm_model::plan::Scope;
@@ -147,6 +147,21 @@ struct Progress {
     result_printed: bool,
 }
 
+/// The generators of one scope over the sources the plan was resolved from.
+fn generators_for<'a>(
+    ctx: &Ctx,
+    sys: &Sys,
+    scope: Scope,
+    loaded: &'a crate::Loaded,
+) -> Generators<'a> {
+    match scope {
+        Scope::Secrets | Scope::Packages => {
+            Generators::with_runner(&loaded.resolved, &loaded.sources, ctx.runner(sys))
+        }
+        Scope::Config => Generators::new(&loaded.resolved),
+    }
+}
+
 pub fn run(ctx: &Ctx, args: &Args, out: &mut dyn Write) -> Result<(), Refusal> {
     let mut progress = Progress::default();
     let r = run_inner(ctx, args, out, &mut progress);
@@ -216,11 +231,8 @@ fn run_inner(
     }
     // The gates that need no write run before the lock and in a preview, so a plan that apply
     // would refuse is refused here with the same code.
-    let generators = |resolved| match args.scope {
-        Scope::Secrets | Scope::Packages => Generators::with_runner(resolved, ctx.runner(&sys)),
-        Scope::Config => Generators::new(resolved),
-    };
-    let g = gates(&plan, &generators(&first.resolved));
+    let generators = |loaded| generators_for(ctx, &sys, args.scope, loaded);
+    let g = gates(&plan, &generators(&first));
     if let Some(r) = g.refusal {
         return Err(r);
     }
@@ -281,7 +293,7 @@ fn run_inner(
         return Err(store.stamp(stale(approved, &locked_digest)));
     }
     let home = Dir::open_home(&sys, &layout.home).map_err(|r| store.stamp(r))?;
-    let generator = generators(&second.resolved);
+    let generator = generators(&second);
     let run = Run {
         store: &store,
         sys,
