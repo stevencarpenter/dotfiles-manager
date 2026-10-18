@@ -1489,6 +1489,8 @@ impl Exec<'_, '_> {
             .map(|p| p.state.as_str())
             .ok_or_else(|| failed(plan_invalid("an install needs a probe precondition")))?;
         let now = self.run.generator.probe(op).map_err(failed)?;
+        // A stop request that ended the probe is the stop, not a probe failure: nothing started.
+        self.stop_requested()?;
         match &now {
             PackageState::Installed(_) => return Ok(Ended::Current),
             s if s.still_planned(want) => {}
@@ -1528,16 +1530,28 @@ impl Exec<'_, '_> {
             .hit("apply-before-effect")
             .and_then(|()| self.run.generator.install(op))
             .and_then(|()| self.run.fail.hit("apply-after-effect"))
-            .and_then(|()| match self.run.generator.probe(op)? {
-                PackageState::Installed(_) => Ok(()),
-                s => Err(Refusal::new(
-                    Code::IoFailed,
-                    format!(
-                        "postcondition failed for {}: the provider reports {} after the install",
-                        op.id,
-                        s.state()
-                    ),
-                )),
+            .and_then(|()| {
+                let now = self.run.generator.probe(op)?;
+                match (now, crate::signal::requested()) {
+                    (PackageState::Installed(_), _) => Ok(()),
+                    // The stop ended the check itself, so the install's outcome is unknown, not
+                    // failed. The next run probes again.
+                    (_, Some(stop)) => Err(Refusal::new(
+                        stop.code,
+                        format!(
+                            "{}: stopped before the postcondition was checked; the install may have completed, and the next run probes again",
+                            op.id
+                        ),
+                    )),
+                    (s, None) => Err(Refusal::new(
+                        Code::IoFailed,
+                        format!(
+                            "postcondition failed for {}: the provider reports {} after the install",
+                            op.id,
+                            s.state()
+                        ),
+                    )),
+                }
             });
         if let Err(e) = result {
             let why = dfm_model::display::bounded_visible(&e.detail, 1024);

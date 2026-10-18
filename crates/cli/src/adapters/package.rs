@@ -352,41 +352,29 @@ fn brew_dependencies(runner: &Runner, off: &Official) -> PackageState {
             Err(why) => return PackageState::Unknown(why),
         }
     }
-    // Everything the install would add must come as a bottle brew pours on this machine. A cask
-    // is not built, so only its missing formulae are asked about.
-    let mut args = vec!["info".to_string(), "--json=v2".into()];
+    // Everything the install would add must come as a bottle brew pours on this machine. Brew
+    // decides that itself: `Formula#bottle` falls back to an older macOS bottle and
+    // `pour_bottle?` checks the formula's pour conditions. The names are official and pinned to
+    // the core namespace, so the formulae load from the API and no tap code runs. A cask is not
+    // built, so only its missing formulae are asked about.
+    let mut formulae: Vec<String> = Vec::new();
     if let Official::Formula(n) = off {
-        args.push(core(n));
+        formulae.push(core(n));
     }
-    args.extend(missing.iter().map(|d| core(d)));
-    let bottles = if args.len() == 2 {
-        Ok(Some(Vec::new()))
-    } else {
-        // This machine's bottle tag (`Utils::Bottles.tag`, Homebrew's own code; no formula is
-        // loaded).
-        run(
-            "brew ruby",
-            vec!["ruby".into(), "-e".into(), "puts Utils::Bottles.tag".into()],
-            &[0],
-        )
-        .and_then(|tag| {
-            let tag = tag.trim().to_string();
-            if tag.is_empty() {
-                return Err("brew did not report this machine's bottle tag".into());
+    formulae.extend(missing.iter().map(|d| core(d)));
+    if !formulae.is_empty() {
+        let mut args = vec!["ruby".to_string(), "-e".into(), POURS.into()];
+        args.extend(formulae.iter().cloned());
+        match run("brew ruby", args, &[0]).map(|t| unpoured(&t, &formulae)) {
+            Ok(Some(n)) if n.is_empty() => {}
+            Ok(Some(n)) => return PackageState::SourceBuild(n),
+            Ok(None) => {
+                return PackageState::Unknown(format!(
+                    "brew did not answer for every formula the install of {pkg} would add"
+                ));
             }
-            let cellar = cellar.display().to_string();
-            run("brew info", args, &[0]).map(|t| unbottled(&t, &tag, &cellar))
-        })
-    };
-    match bottles {
-        Ok(Some(n)) if n.is_empty() => {}
-        Ok(Some(n)) => return PackageState::SourceBuild(n),
-        Ok(None) => {
-            return PackageState::Unknown(format!(
-                "brew info --json=v2 for {pkg} is not the answer the adapter reads"
-            ));
+            Err(why) => return PackageState::Unknown(why),
         }
-        Err(why) => return PackageState::Unknown(why),
     }
     if have.is_empty() {
         return PackageState::Missing(missing);
@@ -410,34 +398,29 @@ fn brew_dependencies(runner: &Runner, off: &Official) -> PackageState {
     }
 }
 
-/// The formulae in a `brew info --json=v2` answer that brew would not pour as a bottle on this
-/// machine, or `None` when it is not that shape. A formula is poured when it sets no
-/// `pour_bottle_only_if` condition and has a bottle for `tag` (or for `all`) whose cellar is
-/// relocatable (`:any`, `:any_skip_relocation`) or is `cellar`. Anything else means a source
-/// build. A cask has no source build.
-fn unbottled(text: &str, tag: &str, cellar: &str) -> Option<Vec<String>> {
-    let v: serde_json::Value = serde_json::from_str(text).ok()?;
+/// Ruby for `brew ruby -e`, given pinned formula names as arguments: one line `<name> <1|0>` per
+/// formula, 1 when brew would pour a bottle on this machine. It reads Homebrew's own formula
+/// objects and changes nothing.
+const POURS: &str =
+    r##"ARGV.each { |n| f = Formula[n]; puts "#{f.name} #{f.bottle && f.pour_bottle? ? 1 : 0}" }"##;
+
+/// The formulae in a `POURS` answer that brew would build from source, or `None` when the answer
+/// is not one `<name> <1|0>` line per asked formula, in order.
+fn unpoured(text: &str, asked: &[String]) -> Option<Vec<String>> {
+    let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
+    if lines.len() != asked.len() {
+        return None;
+    }
     let mut out = Vec::new();
-    for f in v.get("formulae")?.as_array()? {
-        let name = f.get("name")?.as_str()?;
-        let bottle = f.get("bottle")?;
-        let conditional = !f
-            .get("pour_bottle_only_if")
-            .is_none_or(serde_json::Value::is_null);
-        let files = bottle
-            .get("stable")
-            .and_then(|s| s.get("files"))
-            .and_then(serde_json::Value::as_object);
-        let fits = files.is_some_and(|m| {
-            [tag, "all"].iter().any(|t| {
-                m.get(*t)
-                    .and_then(|e| e.get("cellar"))
-                    .and_then(serde_json::Value::as_str)
-                    .is_some_and(|c| matches!(c, ":any" | ":any_skip_relocation") || c == cellar)
-            })
-        });
-        if conditional || !fits {
-            out.push(name.to_string());
+    for (line, want) in lines.iter().zip(asked) {
+        let (name, pours) = line.trim().split_once(' ')?;
+        if name != want.rsplit('/').next().unwrap_or(want) {
+            return None;
+        }
+        match pours {
+            "1" => {}
+            "0" => out.push(name.to_string()),
+            _ => return None,
         }
     }
     Some(out)
@@ -576,12 +559,11 @@ fn leaf(pkg: &str) -> &str {
 }
 
 /// Directories where another owner can have put an executable of the package's name: the other
-/// search-path prefixes, Nix profiles, `~/.local/bin`, `~/.cargo/bin` and the mise shims. The
-/// declared provider's own directories are skipped by path component (`homebrew` for brew, the
-/// mise shim directory for mise), never by substring. A directory that cannot be examined is an
-/// error, so the check fails closed.
+/// search-path prefixes, Nix profiles, `~/.local/bin`, `~/.cargo/bin` and the mise shims, less
+/// the ones [`skipped`] names. A directory that cannot be examined is an error, so the check
+/// fails closed.
 /// shortcut: the check compares the package name with an executable name, so a package whose
-/// binary is named differently is not caught; upgrade when adapters declare their binaries.
+/// binary is named differently is not caught, upgrade when adapters declare their binaries.
 fn other_owner(runner: &Runner, adapter: &str, pkg: &str) -> Result<Option<String>, String> {
     let home = &runner.home;
     let shims = home.join(".local/share/mise/shims");
@@ -593,13 +575,8 @@ fn other_owner(runner: &Runner, adapter: &str, pkg: &str) -> Result<Option<Strin
         home.join(".cargo/bin"),
         shims.clone(),
     ]);
-    let own = |d: &PathBuf| match adapter {
-        HOMEBREW => d.components().any(|c| c.as_os_str() == "homebrew"),
-        MISE => *d == shims,
-        _ => false,
-    };
     let name = leaf(pkg);
-    for d in dirs.iter().filter(|d| !own(d)) {
+    for d in dirs.iter().filter(|d| !skipped(adapter, d, &shims)) {
         let p = d.join(name);
         // The entry itself (a link counts), then what a link points to.
         for meta in [std::fs::symlink_metadata(&p), std::fs::metadata(&p)] {
@@ -616,6 +593,21 @@ fn other_owner(runner: &Runner, adapter: &str, pkg: &str) -> Result<Option<Strin
         }
     }
     Ok(None)
+}
+
+/// Whether the owner check skips `d`: the macOS system directories (Apple's tools there are part
+/// of the OS, which no package owns and none can replace; a provider's copy shadows them by
+/// search order) and the declared provider's own directories (`homebrew` path component for
+/// brew, the mise shims for mise), matched by component or exact path, never by substring.
+fn skipped(adapter: &str, d: &Path, shims: &Path) -> bool {
+    dfm_platform_macos::SYSTEM_PATH
+        .iter()
+        .any(|s| d == Path::new(s))
+        || match adapter {
+            HOMEBREW => d.components().any(|c| c.as_os_str() == "homebrew"),
+            MISE => d == shims,
+            _ => false,
+        }
 }
 
 /// The installed state of one package by its adapter, with the owner check when the provider
@@ -752,55 +744,38 @@ mod tests {
     }
 
     #[test]
-    fn a_formula_brew_would_not_pour_here_is_a_source_build() {
-        let (tag, cellar) = ("arm64_golden_gate", "/opt/homebrew/Cellar");
-        let f = |name: &str, files: &str, pour: &str| {
-            format!(
-                r#"{{"name":"{name}","pour_bottle_only_if":{pour},"bottle":{{"stable":{{"files":{files}}}}}}}"#
-            )
-        };
-        let t = format!(
-            r#"{{"formulae":[{},{},{},{},{},{},{}],"casks":[{{"token":"x"}}]}}"#,
-            f(
-                "here",
-                r#"{"arm64_golden_gate":{"cellar":"/opt/homebrew/Cellar"}}"#,
-                "null"
-            ),
-            f("any", r#"{"arm64_golden_gate":{"cellar":":any"}}"#, "null"),
-            f(
-                "all",
-                r#"{"all":{"cellar":":any_skip_relocation"}}"#,
-                "null"
-            ),
-            f("other_tag", r#"{"x86_64_linux":{"cellar":":any"}}"#, "null"),
-            f(
-                "other_cellar",
-                r#"{"arm64_golden_gate":{"cellar":"/usr/local/Cellar"}}"#,
-                "null"
-            ),
-            f(
-                "conditional",
-                r#"{"arm64_golden_gate":{"cellar":":any"}}"#,
-                r#""clt_installed""#
-            ),
-            r#"{"name":"none","bottle":{}}"#,
-        );
-        let want: Vec<String> = ["other_tag", "other_cellar", "conditional", "none"]
+    fn brews_own_pour_answer_is_read_one_line_per_formula() {
+        let asked: Vec<String> = ["homebrew/core/imagemagick", "homebrew/core/afuse"]
             .map(String::from)
             .to_vec();
-        assert_eq!(unbottled(&t, tag, cellar), Some(want));
         assert_eq!(
-            unbottled(r#"{"formulae":[],"casks":[]}"#, tag, cellar),
-            Some(vec![])
+            unpoured("imagemagick 1\nafuse 0\n", &asked),
+            Some(vec!["afuse".to_string()])
         );
+        assert_eq!(unpoured("imagemagick 1\nafuse 1\n", &asked), Some(vec![]));
         for bad in [
             "",
-            "{}",
-            r#"{"formulae":[{"bottle":{}}]}"#,
-            r#"{"formulae":[{"name":"x"}]}"#,
+            "imagemagick 1\n",
+            "afuse 0\nimagemagick 1\n",
+            "imagemagick yes\nafuse 0\n",
+            "imagemagick 1\nafuse 0\nextra 1\n",
         ] {
-            assert_eq!(unbottled(bad, tag, cellar), None, "{bad:?}");
+            assert_eq!(unpoured(bad, &asked), None, "{bad:?}");
         }
+    }
+
+    #[test]
+    fn system_directories_and_the_providers_own_are_not_another_owner() {
+        let shims = PathBuf::from("/Users/a/.local/share/mise/shims");
+        for d in ["/usr/bin", "/bin", "/usr/sbin", "/sbin"] {
+            assert!(skipped(HOMEBREW, Path::new(d), &shims), "{d}");
+            assert!(skipped(MISE, Path::new(d), &shims), "{d}");
+        }
+        assert!(skipped(HOMEBREW, Path::new("/opt/homebrew/bin"), &shims));
+        assert!(!skipped(HOMEBREW, Path::new("/usr/local/bin"), &shims));
+        assert!(!skipped(HOMEBREW, Path::new("/Users/a/.local/bin"), &shims));
+        assert!(skipped(MISE, &shims, &shims));
+        assert!(!skipped(MISE, Path::new("/opt/homebrew/bin"), &shims));
     }
 
     #[test]

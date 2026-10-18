@@ -45,9 +45,9 @@ update_policy = "rolling"
 /// installed package is a `<name>/<version>` directory (the `installed` helper and `brew
 /// install` create them); there is no `brew list`, so a probe that calls it fails. `brew deps
 /// <name>` answers from `deps-<name>`; `brew outdated --json=v2 <name>...` reports the names in
-/// `outdated-brew` and exits 1 when there is one; `brew info --json=v2 <name>...` reports a bottle
-/// for this machine (tag `arm64_test`, which `brew ruby` prints) for every name except those in
-/// `nobottle-brew`, which have a bottle for another platform only. `brew install <name>` adds the
+/// `outdated-brew` and exits 1 when there is one; `brew ruby -e <script> <name>...` answers
+/// `<name> 1` (brew pours a bottle) for every name except those in `nobottle-brew`, which answer
+/// `<name> 0`; there is no `brew info`. `brew install <name>` adds the
 /// name and its missing dependencies, or does nothing with the `noop` marker, or fails with the
 /// `fail` marker. `brew formulae` prints `official-brew` (default: atuin and duckdb) and `brew
 /// casks` prints `official-cask`. Every command takes a name pinned to its namespace
@@ -65,7 +65,13 @@ case "$1" in
     if [ -e "$here/../official-brew" ]; then cat "$here/../official-brew"; else printf 'atuin\nduckdb\n'; fi
     exit 0 ;;
   casks) cat "$here/../official-cask" 2>/dev/null; exit 0 ;;
-  ruby) echo arm64_test; exit 0 ;;
+  ruby)
+    shift 3
+    for n in "$@"; do
+      n=${n##*/}
+      if grep -qx "$n" "$here/../nobottle-brew" 2>/dev/null; then echo "$n 0"; else echo "$n 1"; fi
+    done
+    exit 0 ;;
   deps)
     n=$2; [ "$n" = --cask ] && n=$3
     cat "$here/../deps-${n##*/}" 2>/dev/null; exit 0 ;;
@@ -78,14 +84,6 @@ case "$1" in
       fi
     done
     printf '],"casks":[]}\n'; exit $rc ;;
-  info)
-    shift 2; sep=""; printf '{"formulae":['
-    for n in "$@"; do
-      n=${n##*/}
-      if grep -qx "$n" "$here/../nobottle-brew" 2>/dev/null; then b='{"stable":{"files":{"x86_64_linux":{"cellar":":any"}}}}'; else b='{"stable":{"files":{"arm64_test":{"cellar":":any"}}}}'; fi
-      printf '%s{"name":"%s","bottle":%s}' "$sep" "$n" "$b"; sep=","
-    done
-    printf '],"casks":[]}\n'; exit 0 ;;
   install)
     [ -e "$here/../fail" ] && { echo "Error: PLANTED-STDERR" >&2; exit 1; }
     [ -e "$here/../noop" ] && exit 0
@@ -132,6 +130,17 @@ case "$1" in
 esac
 "#;
 
+/// `dpkg-query -W -f=${Status} <name>` prints `install ok installed` and exits 0 for a name in
+/// `installed-apt`, exits 1 for any other name, and exits 2 with the `broken-apt` marker.
+const FAKE_DPKG: &str = r#"#!/bin/sh
+PATH=/usr/bin:/bin:$PATH
+here=$(dirname "$0")
+printf 'dpkg-query %s\n' "$*" >> "$here/../log"
+[ -e "$here/../broken-apt" ] && exit 2
+if grep -qx "$3" "$here/../installed-apt" 2>/dev/null; then printf 'install ok installed'; exit 0; fi
+echo "dpkg-query: no packages found matching $3" >&2; exit 1
+"#;
+
 struct Fx {
     home: TempDir,
     _src: TempDir,
@@ -172,7 +181,11 @@ impl Fx {
         fx.put("base/modules/extra/module.toml", EXTRA);
         fx.put("profiles/t-01.toml", common::PROFILE);
         fs::create_dir_all(fx.bin()).unwrap();
-        for (name, body) in [("brew", FAKE_BREW), ("mise", FAKE_MISE)] {
+        for (name, body) in [
+            ("brew", FAKE_BREW),
+            ("mise", FAKE_MISE),
+            ("dpkg-query", FAKE_DPKG),
+        ] {
             let p = fx.bin().join(name);
             fs::write(&p, body).unwrap();
             fs::set_permissions(&p, fs::Permissions::from_mode(0o755)).unwrap();
@@ -234,16 +247,19 @@ impl Fx {
         self.fake.path().join("log").exists()
     }
 
-    fn run(&self, args: &[&str]) -> Output {
-        Command::new(BIN)
-            .env_clear()
+    fn cmd(&self, args: &[&str]) -> Command {
+        let mut c = Command::new(BIN);
+        c.env_clear()
             .env("DFM_PROVIDER_PATH", self.bin())
             .env("USER", "leak-check")
             .arg("--home")
             .arg(self.home.path())
-            .args(args)
-            .output()
-            .unwrap()
+            .args(args);
+        c
+    }
+
+    fn run(&self, args: &[&str]) -> Output {
+        self.cmd(args).output().unwrap()
     }
 
     fn root_arg(&self) -> &str {
@@ -578,10 +594,8 @@ fn brew_dependencies_are_planned_when_missing_and_block_when_an_install_would_up
     // A missing dependency without a bottle for this machine would be built from source, with
     // build-time dependencies the listing does not name: the plan is blocked.
     assert!(
-        fx.log().contains("brew ruby -e puts Utils::Bottles.tag |")
-            && fx
-                .log()
-                .contains("brew info --json=v2 homebrew/core/atuin homebrew/core/aom |"),
+        fx.log().contains("brew ruby -e ")
+            && fx.log().contains("homebrew/core/atuin homebrew/core/aom |"),
         "{}",
         fx.log()
     );
@@ -720,6 +734,73 @@ fn two_formulae_that_share_a_missing_dependency_are_both_installed() {
     assert!(out.contains(&format!("updated {BREW_OP}")), "{out}");
     assert!(out.contains(&format!("updated {MISE_OP}")), "{out}");
     assert!(fx.fake.path().join("Cellar/aom/1.0.0").is_dir());
+}
+
+#[test]
+fn an_apt_package_is_probed_with_dpkg_query_and_never_installed() {
+    let fx = Fx::new();
+    fx.installed("mise", "duckdb 1\n");
+    fx.put(
+        "base/modules/extra/module.toml",
+        &EXTRA.replace("adapter = \"homebrew/v1\"", "adapter = \"apt/v1\""),
+    );
+    // Installed: current, from the status dpkg-query reports.
+    fs::write(fx.fake.path().join("installed-apt"), "atuin\n").unwrap();
+    let o = fx.preview();
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+    assert!(
+        text(&o.stdout).contains(&format!("current {BREW_OP}")),
+        "{}",
+        text(&o.stdout)
+    );
+    assert!(
+        fx.log().contains("dpkg-query -W -f=${Status} atuin"),
+        "{}",
+        fx.log()
+    );
+    // Missing: installing needs root, so the plan is blocked with the command to run by hand.
+    fs::write(fx.fake.path().join("installed-apt"), "").unwrap();
+    let o = fx.preview();
+    assert_eq!(code(&o), 3, "{}\n{}", stderr(&o), text(&o.stdout));
+    assert!(
+        stderr(&o).contains("E_PRIVILEGE_UNSUPPORTED"),
+        "{}",
+        stderr(&o)
+    );
+    assert!(
+        stderr(&o).contains("sudo apt-get install atuin"),
+        "{}",
+        stderr(&o)
+    );
+    // Any other exit is a probe that could not answer.
+    fs::write(fx.fake.path().join("broken-apt"), "").unwrap();
+    let o = fx.preview();
+    assert_eq!(code(&o), 3, "{}\n{}", stderr(&o), text(&o.stdout));
+    assert!(stderr(&o).contains("E_PROBE_FAILED"), "{}", stderr(&o));
+    assert!(stderr(&o).contains("dpkg-query exited 2"), "{}", stderr(&o));
+    assert!(!fx.log().contains("apt-get"), "{}", fx.log());
+}
+
+#[test]
+fn a_stop_that_cuts_off_the_postcondition_is_reported_as_the_stop() {
+    let fx = Fx::new();
+    fx.installed("brew", "");
+    fx.installed("mise", "duckdb 1\n");
+    let d = digest_of(&fx.preview());
+    // The stop request arrives right after the install, before the postcondition probe.
+    let o = fx
+        .cmd(&["packages", "--root", fx.root_arg(), "--yes-plan", &d])
+        .env("DFM_FAILPOINT", "apply-after-effect:stop")
+        .output()
+        .unwrap();
+    assert_eq!(code(&o), 143, "{}\n{}", stderr(&o), text(&o.stdout));
+    let out = text(&o.stdout);
+    assert!(out.contains(&format!("failed {BREW_OP}")), "{out}");
+    assert!(
+        out.contains("stopped before the postcondition was checked"),
+        "{out}"
+    );
+    assert!(!out.contains("postcondition failed"), "{out}");
 }
 
 #[test]
