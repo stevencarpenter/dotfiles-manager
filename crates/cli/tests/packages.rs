@@ -58,6 +58,7 @@ here=$(dirname "$0")
 printf 'brew %s | auto=%s analytics=%s hints=%s cleanup=%s upgrade=%s dependents=%s user=%s\n' "$*" "${HOMEBREW_NO_AUTO_UPDATE:-unset}" "${HOMEBREW_NO_ANALYTICS:-unset}" "${HOMEBREW_NO_ENV_HINTS:-unset}" "${HOMEBREW_NO_INSTALL_CLEANUP:-unset}" "${HOMEBREW_NO_INSTALL_UPGRADE:-unset}" "${HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK:-unset}" "${USER:-none}" >> "$here/../log"
 case "$1" in
   --cellar)
+    [ -e "$here/../linger" ] && { (sleep 20 &); (sleep 0.3; kill -TERM $PPID) >/dev/null 2>&1 & }
     [ -e "$here/../stop" ] && kill -TERM $PPID
     echo "$(cd "$here/.." && pwd)/Cellar"; exit 0 ;;
   --caskroom) echo "$(cd "$here/.." && pwd)/Caskroom"; exit 0 ;;
@@ -801,6 +802,24 @@ fn a_stop_that_cuts_off_the_postcondition_is_reported_as_the_stop() {
         "{out}"
     );
     assert!(!out.contains("postcondition failed"), "{out}");
+}
+
+#[test]
+fn a_stop_while_a_descendant_holds_the_output_ends_the_run_without_the_grace_wait() {
+    let fx = Fx::new();
+    fx.installed("brew", "");
+    fx.installed("mise", "duckdb 1\n");
+    // The provider exits at once but leaves a process holding its output, and the manager gets
+    // SIGTERM meanwhile: the holder is ended now, not after the 10 s grace period.
+    fs::write(fx.fake.path().join("linger"), "").unwrap();
+    let t = std::time::Instant::now();
+    let o = fx.preview();
+    assert_eq!(code(&o), 143, "{}\n{}", stderr(&o), text(&o.stdout));
+    assert!(
+        t.elapsed() < std::time::Duration::from_secs(5),
+        "{:?}",
+        t.elapsed()
+    );
 }
 
 #[test]

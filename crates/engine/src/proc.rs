@@ -77,6 +77,9 @@ pub struct Output {
     pub stdout: Vec<u8>,
     /// At most [`MAX_STDERR`] bytes. The caller redacts and bounds it again before it is shown.
     pub stderr: Vec<u8>,
+    /// Whether the whole of [`Request::stdin`] reached the child (true when there was none). A
+    /// child that exits before reading all of it leaves this false.
+    pub stdin_written: bool,
 }
 
 impl std::fmt::Debug for Output {
@@ -85,6 +88,7 @@ impl std::fmt::Debug for Output {
             .field("end", &self.end)
             .field("stdout", &format!("{} bytes", self.stdout.len()))
             .field("stderr", &format!("{} bytes", self.stderr.len()))
+            .field("stdin_written", &self.stdin_written)
             .finish()
     }
 }
@@ -108,8 +112,11 @@ impl Runner {
     /// directory directly under the root, such as `/bin`, the directory itself is the prefix).
     /// The first search directory that holds the name decides: a failed check there is refused,
     /// not shadowed by a later directory, and so is a directory where the name cannot be looked
-    /// up (permission denied, an I/O error): only absence continues the search. The resolved
-    /// path is what runs, so a link swapped after the check does not redirect the start.
+    /// up (permission denied, an I/O error): only absence continues the search. The checks
+    /// apply to the canonical path, examined without following links, and that path is what
+    /// runs: a link swapped during or after the checks does not redirect the start to an
+    /// unchecked file. The prefix is taken from the canonical search directory, so a search
+    /// directory reached through a symlink is compared on the same terms.
     pub fn resolve(&self, program: &str) -> Result<PathBuf, Refusal> {
         if program.is_empty() || program.contains('/') || program.starts_with('-') {
             return Err(refused(format!("{program:?} is not a plain program name")));
@@ -122,13 +129,15 @@ impl Runner {
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
                 Err(e) => return Err(refused(format!("{shown}: {}", e.kind()))),
             };
-            let meta = std::fs::metadata(&candidate)
-                .map_err(|e| refused(format!("{shown}: {}", e.kind())))?;
             let real = std::fs::canonicalize(&candidate)
                 .map_err(|e| refused(format!("{shown}: {}", e.kind())))?;
-            let prefix = match dir.parent() {
+            let meta = std::fs::symlink_metadata(&real)
+                .map_err(|e| refused(format!("{shown}: {}", e.kind())))?;
+            let base = std::fs::canonicalize(dir)
+                .map_err(|e| refused(format!("{}: {}", dir.display(), e.kind())))?;
+            let prefix = match base.parent() {
                 Some(p) if p != Path::new("/") => p,
-                _ => dir.as_path(),
+                _ => base.as_path(),
             };
             if !meta.is_file() {
                 return Err(refused(format!("{shown} is not a regular file")));
@@ -239,35 +248,40 @@ impl Runner {
             group,
         };
         let (out_rx, err_rx) = readers(&mut child, req.max_stdout);
-        // The writer drops `fed_tx` when it is done. A process that keeps standard input open
-        // without reading blocks it; until it is done the run is not settled, so that process
-        // gets the termination sequence below, its pipe closes and the write fails.
-        let (fed_tx, fed) = mpsc::channel::<()>();
+        // The writer sends whether the whole input was written, then drops `fed_tx`. A process
+        // that keeps standard input open without reading blocks it; until it is done the run is
+        // not settled, so that process gets the termination sequence below, its pipe closes and
+        // the write fails. A child that exits before reading everything also fails the write:
+        // the caller decides what a partial input means (`Output::stdin_written`).
+        let (fed_tx, fed) = mpsc::channel::<bool>();
         if let (Some(mut pipe), Some(bytes)) = (child.stdin.take(), req.stdin) {
             let bytes = bytes.to_vec();
-            // A child that exits before it read everything closes the pipe; that is its business.
             std::thread::spawn(move || {
-                let _ = pipe.write_all(&bytes);
-                drop(fed_tx);
+                let _ = fed_tx.send(pipe.write_all(&bytes).is_ok());
             });
         } else {
+            let _ = fed_tx.send(true);
             drop(fed_tx);
         }
+        let mut fed = Fed { rx: fed, ok: None };
         let end = wait(&mut child, target, req.timeout);
         // Settled means the child is reaped, both output pipes are closed (which happens when
-        // every process that inherited them is gone) and the standard input writer is done. A descendant that outlives the child, or a child
-        // that closed its pipes but ignores SIGTERM, gets the same sequence as a timeout:
-        // SIGTERM, grace, SIGKILL. The leader is unreaped until the end, so its id cannot have
-        // been recycled.
+        // every process that inherited them is gone) and the standard input writer is done. A
+        // descendant that outlives the child, or a child that closed its pipes but ignores
+        // SIGTERM, gets the same sequence as a timeout: SIGTERM, grace, SIGKILL. A stop request
+        // that arrives while a normally ended child's descendants linger starts that sequence
+        // at once. The leader is reaped by `try_wait` as soon as it exits; a group signal
+        // afterwards reaches the remaining members, and the group id stays reserved while one
+        // lives.
         let mut pipes = Pipes::new(out_rx, err_rx);
         let ended_early = matches!(end, End::TimedOut | End::Stopped(_));
-        if !ended_early && !settled(&mut child, &mut pipes, &fed, self.grace) {
+        if !ended_early && !settled(&mut child, &mut pipes, &mut fed, self.grace, true) {
             target.kill(true);
         }
-        if !settled(&mut child, &mut pipes, &fed, self.grace) {
+        if !settled(&mut child, &mut pipes, &mut fed, self.grace, false) {
             target.kill(false);
         }
-        if !settled(&mut child, &mut pipes, &fed, self.grace) {
+        if !settled(&mut child, &mut pipes, &mut fed, self.grace, false) {
             // Still there after SIGKILL: a process left the group, or the child cannot die. The
             // reader threads end when the pipes close; nothing more can be done from here.
             return Err(refused(format!(
@@ -287,6 +301,7 @@ impl Runner {
             end,
             stdout,
             stderr: stderr.unwrap_or_default(),
+            stdin_written: fed.ok.unwrap_or(false),
         })
     }
 }
@@ -358,21 +373,45 @@ impl Pipes {
     }
 }
 
+/// The standard input writer's report: `ok` is whether the whole input was written, once the
+/// writer has answered. A writer that panicked counts as done and not written.
+struct Fed {
+    rx: mpsc::Receiver<bool>,
+    ok: Option<bool>,
+}
+
+impl Fed {
+    fn done(&mut self) -> bool {
+        if self.ok.is_none() {
+            match self.rx.try_recv() {
+                Ok(v) => self.ok = Some(v),
+                Err(mpsc::TryRecvError::Disconnected) => self.ok = Some(false),
+                Err(mpsc::TryRecvError::Empty) => {}
+            }
+        }
+        self.ok.is_some()
+    }
+}
+
 /// Waits up to `limit` for the child to be reaped, both output pipes to close and the standard
-/// input writer to finish. A `try_wait` error counts as reaped: nothing more can be learned
+/// input writer to finish. With `stop_ends`, a stop request ends the wait at once, so the caller
+/// starts the termination sequence without waiting out the grace period. A `try_wait` error counts as reaped: nothing more can be learned
 /// about the child.
 fn settled(
     child: &mut Child,
     pipes: &mut Pipes,
-    fed: &mpsc::Receiver<()>,
+    fed: &mut Fed,
     limit: Duration,
+    stop_ends: bool,
 ) -> bool {
     let until = Instant::now() + limit;
     loop {
         let reaped = !matches!(child.try_wait(), Ok(None));
-        let written = matches!(fed.try_recv(), Err(mpsc::TryRecvError::Disconnected));
-        if reaped && written && pipes.done() {
+        if reaped && fed.done() && pipes.done() {
             return true;
+        }
+        if stop_ends && signal::requested().is_some() {
+            return false;
         }
         let left = until.saturating_duration_since(Instant::now());
         if left.is_zero() {

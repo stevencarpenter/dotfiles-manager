@@ -117,6 +117,11 @@ pub fn render(runner: &Runner, value: &Value, template: &[u8]) -> Result<Vec<u8>
     let env = dfm_engine::proc::passthrough(&OP_ENV_PREFIXES);
     let out = runner.run(&request(&args, &env, Some(template), INJECT_TIMEOUT))?;
     match out.end {
+        // A render from part of the template is not the template the plan approved.
+        End::Exited(0) if !out.stdin_written => Err(Refusal::new(
+            Code::RenderFailed,
+            "op inject exited before it read the whole template; the previous file is kept",
+        )),
         End::Exited(0) => Ok(out.stdout),
         End::Exited(c) => Err(Refusal::new(
             Code::RenderFailed,

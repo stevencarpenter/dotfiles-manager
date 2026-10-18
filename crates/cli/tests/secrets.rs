@@ -48,6 +48,7 @@ fi
 case "$1" in
   whoami) echo "me"; exit 0 ;;
   inject)
+    [ -e "$here/../partial" ] && { echo "TOKEN=partial"; exit 0; }
     cat > "$here/../stdin"
     [ -e "$here/../empty" ] && exit 0
     if [ -e "$here/../fail" ]; then echo "[ERROR] boom PLANTED-STDERR-9c4f" >&2; exit 1; fi
@@ -476,6 +477,29 @@ fn a_template_changed_after_the_locked_plan_blocks_the_render() {
     );
     assert!(!fx.h(TARGET).exists());
     assert!(!fx.op_log().contains("inject"), "{}", fx.op_log());
+}
+
+#[test]
+fn a_render_from_part_of_the_template_is_refused() {
+    let fx = Fx::new();
+    // Larger than a pipe buffer, so an op that exits without reading cannot take it all.
+    fx.put(
+        "base/modules/extra/files/personal.env.tpl",
+        &format!(
+            "TOKEN={{{{ op://vault/item/field }}}}\n#{}\n",
+            "x".repeat(200_000)
+        ),
+    );
+    fx.marker("partial");
+    let o = fx.secrets(&digest_of(&fx.preview()), &[]);
+    assert_eq!(code(&o), 1, "{}\n{}", stderr(&o), text(&o.stdout));
+    assert!(stderr(&o).contains("E_RENDER_FAILED"), "{}", stderr(&o));
+    assert!(
+        text(&o.stdout).contains("exited before it read the whole template"),
+        "{}",
+        text(&o.stdout)
+    );
+    assert!(!fx.h(TARGET).exists());
 }
 
 #[test]

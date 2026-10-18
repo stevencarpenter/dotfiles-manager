@@ -75,6 +75,7 @@ fn the_environment_is_rebuilt_and_stdin_reaches_the_child() {
     );
     assert!(text.contains("lang=C"), "{text}");
     assert!(text.ends_with("template"), "{text}");
+    assert!(out.stdin_written);
     assert!(d.join("bin/run").is_dir());
     let _ = std::fs::remove_dir_all(&d);
 }
@@ -224,4 +225,85 @@ fn passthrough_takes_only_the_named_prefixes() {
     assert!(!got.is_empty());
     assert!(got.iter().all(|(k, _)| k.starts_with("PAT")), "{got:?}");
     assert!(passthrough(&["NO_SUCH_PREFIX_"]).is_empty());
+}
+
+#[test]
+fn every_resolve_check_refuses_and_a_symlinked_search_dir_is_compared_canonically() {
+    let d = scratch("resolve");
+    let bin = d.join("bin");
+    let refuses = |r: &Runner, want: &str| {
+        let e = r.resolve("tool").unwrap_err();
+        assert_eq!(e.code, Code::ProbeFailed, "{e}");
+        assert!(e.detail.contains(want), "{want}: {e}");
+    };
+    let r = runner(&bin);
+    // Not executable.
+    let p = script(&bin, "tool", "exit 0");
+    std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o644)).unwrap();
+    refuses(&r, "is not executable");
+    // Owned by another user than root or the runner's user.
+    std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let other = Runner {
+        uid: r.uid + 1,
+        ..r.clone()
+    };
+    refuses(&other, "owned by another user");
+    // Not a regular file.
+    std::fs::remove_file(&p).unwrap();
+    std::fs::create_dir(&p).unwrap();
+    refuses(&r, "is not a regular file");
+    std::fs::remove_dir(&p).unwrap();
+    // A link that leaves the search directory's prefix.
+    let outside = scratch("resolve-outside");
+    let target = script(&outside.join("bin"), "tool", "exit 0");
+    std::os::unix::fs::symlink(&target, &p).unwrap();
+    refuses(&r, "outside");
+    std::fs::remove_file(&p).unwrap();
+    // A search directory reached through a symlink elsewhere is compared by its canonical path.
+    let real = script(&bin, "tool", "exit 0");
+    let alias_root = scratch("resolve-alias");
+    let alias = alias_root.join("alias");
+    std::os::unix::fs::symlink(&bin, &alias).unwrap();
+    let via = Runner {
+        search_path: vec![alias],
+        ..r.clone()
+    };
+    assert_eq!(via.resolve("tool").unwrap(), real.canonicalize().unwrap());
+    for x in [&d, &outside, &alias_root] {
+        let _ = std::fs::remove_dir_all(x);
+    }
+}
+
+#[test]
+fn a_working_directory_that_is_not_a_plain_directory_and_a_nul_argument_are_refused() {
+    let d = scratch("cwd");
+    script(&d.join("bin"), "tool", "echo ran > ran");
+    let r = runner(&d.join("bin"));
+    let elsewhere = d.join("elsewhere");
+    std::fs::create_dir(&elsewhere).unwrap();
+    let link = d.join("cwd-link");
+    std::os::unix::fs::symlink(&elsewhere, &link).unwrap();
+    let file = d.join("cwd-file");
+    std::fs::write(&file, "").unwrap();
+    for cwd in [link, file] {
+        let bad = Runner { cwd, ..r.clone() };
+        let e = bad.run(&req(&[], None, 5)).unwrap_err();
+        assert!(e.detail.contains("not a plain directory"), "{e}");
+    }
+    assert!(!elsewhere.join("ran").exists());
+    let e = r.run(&req(&["a\0b".to_string()], None, 5)).unwrap_err();
+    assert!(e.detail.contains("NUL byte"), "{e}");
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn a_child_that_exits_before_reading_all_its_input_is_reported() {
+    let d = scratch("partial");
+    script(&d.join("bin"), "tool", "exit 0");
+    let r = runner(&d.join("bin"));
+    let big = vec![b'x'; 1 << 20];
+    let out = r.run(&req(&[], Some(&big), 5)).unwrap();
+    assert!(out.success(), "{out:?}");
+    assert!(!out.stdin_written, "{out:?}");
+    let _ = std::fs::remove_dir_all(&d);
 }
