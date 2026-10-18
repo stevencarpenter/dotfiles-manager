@@ -239,28 +239,35 @@ impl Runner {
             group,
         };
         let (out_rx, err_rx) = readers(&mut child, req.max_stdout);
+        // The writer drops `fed_tx` when it is done. A process that keeps standard input open
+        // without reading blocks it; until it is done the run is not settled, so that process
+        // gets the termination sequence below, its pipe closes and the write fails.
+        let (fed_tx, fed) = mpsc::channel::<()>();
         if let (Some(mut pipe), Some(bytes)) = (child.stdin.take(), req.stdin) {
             let bytes = bytes.to_vec();
             // A child that exits before it read everything closes the pipe; that is its business.
             std::thread::spawn(move || {
                 let _ = pipe.write_all(&bytes);
+                drop(fed_tx);
             });
+        } else {
+            drop(fed_tx);
         }
         let end = wait(&mut child, target, req.timeout);
-        // Settled means the child is reaped and both pipes are closed, which happens when every
-        // process that inherited them is gone. A descendant that outlives the child, or a child
+        // Settled means the child is reaped, both output pipes are closed (which happens when
+        // every process that inherited them is gone) and the standard input writer is done. A descendant that outlives the child, or a child
         // that closed its pipes but ignores SIGTERM, gets the same sequence as a timeout:
         // SIGTERM, grace, SIGKILL. The leader is unreaped until the end, so its id cannot have
         // been recycled.
         let mut pipes = Pipes::new(out_rx, err_rx);
         let ended_early = matches!(end, End::TimedOut | End::Stopped(_));
-        if !ended_early && !settled(&mut child, &mut pipes, self.grace) {
+        if !ended_early && !settled(&mut child, &mut pipes, &fed, self.grace) {
             target.kill(true);
         }
-        if !settled(&mut child, &mut pipes, self.grace) {
+        if !settled(&mut child, &mut pipes, &fed, self.grace) {
             target.kill(false);
         }
-        if !settled(&mut child, &mut pipes, self.grace) {
+        if !settled(&mut child, &mut pipes, &fed, self.grace) {
             // Still there after SIGKILL: a process left the group, or the child cannot die. The
             // reader threads end when the pipes close; nothing more can be done from here.
             return Err(refused(format!(
@@ -351,13 +358,20 @@ impl Pipes {
     }
 }
 
-/// Waits up to `limit` for the child to be reaped and both pipes to close. A `try_wait` error
-/// counts as reaped: nothing more can be learned about the child.
-fn settled(child: &mut Child, pipes: &mut Pipes, limit: Duration) -> bool {
+/// Waits up to `limit` for the child to be reaped, both output pipes to close and the standard
+/// input writer to finish. A `try_wait` error counts as reaped: nothing more can be learned
+/// about the child.
+fn settled(
+    child: &mut Child,
+    pipes: &mut Pipes,
+    fed: &mpsc::Receiver<()>,
+    limit: Duration,
+) -> bool {
     let until = Instant::now() + limit;
     loop {
         let reaped = !matches!(child.try_wait(), Ok(None));
-        if reaped && pipes.done() {
+        let written = matches!(fed.try_recv(), Err(mpsc::TryRecvError::Disconnected));
+        if reaped && written && pipes.done() {
             return true;
         }
         let left = until.saturating_duration_since(Instant::now());

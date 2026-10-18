@@ -113,6 +113,38 @@ fn a_process_that_keeps_the_pipes_open_is_ended_and_run_returns_within_the_bound
 }
 
 #[test]
+fn a_process_that_holds_stdin_without_reading_is_ended_before_run_returns() {
+    let d = scratch("stdin");
+    // A descendant keeps standard input and never reads it; the child closes its output and
+    // exits. The writer of a template larger than the pipe buffer stays blocked until the
+    // descendant is gone, so run must end it rather than return around it.
+    let pid = d.join("pid");
+    script(
+        &d.join("bin"),
+        "tool",
+        &format!(
+            "sleep 20 <&0 >/dev/null 2>&1 & echo $! > {}; exit 0",
+            pid.display()
+        ),
+    );
+    let r = runner(&d.join("bin"));
+    let big = vec![b'x'; 1 << 20];
+    let t = Instant::now();
+    let out = r.run(&req(&[], Some(&big), 5)).unwrap();
+    assert!(matches!(out.end, End::Exited(0)), "{out:?}");
+    assert!(t.elapsed() < Duration::from_secs(6), "{:?}", t.elapsed());
+    let pid = std::fs::read_to_string(&pid).unwrap();
+    let alive = std::process::Command::new("/bin/kill")
+        .args(["-0", pid.trim()])
+        .stderr(std::process::Stdio::null())
+        .status()
+        .unwrap()
+        .success();
+    assert!(!alive, "the descendant {} outlived run", pid.trim());
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
 fn a_timeout_ends_the_child_and_reports_it() {
     let d = scratch("timeout");
     script(&d.join("bin"), "tool", "sleep 30; echo late");
