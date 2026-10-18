@@ -107,18 +107,21 @@ impl Runner {
     /// manager's link into its own prefix stays; a link out of the prefix does not; for a
     /// directory directly under the root, such as `/bin`, the directory itself is the prefix).
     /// The first search directory that holds the name decides: a failed check there is refused,
-    /// not shadowed by a later directory. The resolved path is what runs, so a link swapped
-    /// after the check does not redirect the start.
+    /// not shadowed by a later directory, and so is a directory where the name cannot be looked
+    /// up (permission denied, an I/O error): only absence continues the search. The resolved
+    /// path is what runs, so a link swapped after the check does not redirect the start.
     pub fn resolve(&self, program: &str) -> Result<PathBuf, Refusal> {
         if program.is_empty() || program.contains('/') || program.starts_with('-') {
             return Err(refused(format!("{program:?} is not a plain program name")));
         }
         for dir in &self.search_path {
             let candidate = dir.join(program);
-            let Ok(entry) = std::fs::symlink_metadata(&candidate) else {
-                continue;
-            };
             let shown = candidate.display();
+            let entry = match std::fs::symlink_metadata(&candidate) {
+                Ok(m) => m,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(refused(format!("{shown}: {}", e.kind()))),
+            };
             let meta = std::fs::metadata(&candidate)
                 .map_err(|e| refused(format!("{shown}: {}", e.kind())))?;
             let real = std::fs::canonicalize(&candidate)

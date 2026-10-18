@@ -144,6 +144,17 @@ fn a_program_that_fails_its_checks_does_not_run() {
             .detail
             .contains("not found")
     );
+    // An earlier directory where the name cannot be looked up is refused, not skipped: a later
+    // directory must not supply the program.
+    let closed = d.join("closed");
+    std::fs::create_dir(&closed).unwrap();
+    std::fs::set_permissions(&closed, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let mut r2 = runner(&d.join("bin"));
+    r2.search_path.insert(0, closed.clone());
+    let e = r2.resolve("tool").unwrap_err();
+    assert_eq!(e.code, Code::ProbeFailed);
+    assert!(e.detail.contains("closed/tool"), "{e}");
+    std::fs::set_permissions(&closed, std::fs::Permissions::from_mode(0o700)).unwrap();
     let _ = std::fs::remove_dir_all(&d);
 }
 
