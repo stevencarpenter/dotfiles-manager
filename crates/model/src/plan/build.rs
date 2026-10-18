@@ -138,6 +138,10 @@ pub enum PackageState {
     /// The declared provider does not list it, and installing it would upgrade these installed
     /// dependencies. A package plan upgrades nothing, so this blocks it.
     Upgrades(Vec<String>),
+    /// The declared provider does not list it, and it does not come from the provider's official
+    /// source: learning what its install would do means running third-party code before
+    /// approval. This blocks it.
+    Unofficial(String),
     /// The declared provider does not list it, and these (the package or a missing dependency)
     /// have no prebuilt binary for this machine. A source build adds build-time dependencies the
     /// listing does not name, so the plan could not show them; this blocks it.
@@ -180,6 +184,7 @@ impl PackageState {
             PackageState::Missing(d) => format!("missing:with={}", d.join(",")),
             PackageState::Upgrades(d) => format!("upgrades:{}", d.join(",")),
             PackageState::SourceBuild(d) => format!("source-build:{}", d.join(",")),
+            PackageState::Unofficial(w) => format!("unofficial:{w}"),
             PackageState::OtherOwner(w) => format!("other-owner:{w}"),
             PackageState::Unsupported(w) => format!("unsupported:{w}"),
             PackageState::Unknown(w) => format!("unknown:{w}"),
@@ -1073,6 +1078,16 @@ impl Planner<'_> {
                     subject: probe,
                     state: PackageState::Missing(deps).state(),
                 });
+            }
+            Some(PackageState::Unofficial(why)) => {
+                let f = fail(
+                    Code::SourceUntrusted,
+                    "/name",
+                    why,
+                    "install it by hand with the provider, then run packages again",
+                );
+                op.effect = format!("blocked: {}", f.detail);
+                self.blocker(r, None, f);
             }
             Some(PackageState::SourceBuild(names)) => {
                 let f = fail(
@@ -2102,6 +2117,7 @@ mod tests {
             PackageState::Missing(vec!["aom".into(), "libheif".into()]),
             PackageState::Upgrades(vec!["libpng".into()]),
             PackageState::SourceBuild(vec!["afuse".into()]),
+            PackageState::Unofficial("tap".into()),
             PackageState::OtherOwner("x".into()),
             PackageState::Unsupported("root".into()),
             PackageState::Unknown("timeout".into()),

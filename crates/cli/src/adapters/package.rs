@@ -43,22 +43,18 @@ fn brew_env() -> Vec<(String, String)> {
     .collect()
 }
 
-/// mise probes and installs answer no prompt and install nothing a listing asks about.
+/// mise probes and installs answer no prompt, install nothing a listing asks about, and load no
+/// mise configuration file. Config evaluation can run hooks (a `postinstall` hook runs after an
+/// install), env sources and remote includes, none of which the plan shows or the digest covers.
+/// Installed versions are listed from mise's data directory, which needs no config. Without
+/// config, `mise install tool` installs mise's newest version of the tool ("the provider's
+/// current version" of the plan) and `mise install tool@version` that version.
 fn mise_env() -> Vec<(String, String)> {
     vec![
         ("MISE_YES".into(), "1".into()),
         ("MISE_NOT_FOUND_AUTO_INSTALL".into(), "false".into()),
+        ("MISE_NO_CONFIG".into(), "1".into()),
     ]
-}
-
-/// A probe also loads no mise configuration file: config evaluation can run hooks, env
-/// sources and remote includes, and a probe runs before approval. The installed versions are
-/// listed from mise's data directory, which needs no config. An install keeps the config, which
-/// decides the version of an undeclared `tool`.
-fn mise_probe_env() -> Vec<(String, String)> {
-    let mut env = mise_env();
-    env.push(("MISE_NO_CONFIG".into(), "1".into()));
-    env
 }
 
 /// The package name as a checked parameter (architecture section 8 item 3): letters, digits,
@@ -141,6 +137,38 @@ fn brew_probe(runner: &Runner, pkg: &str) -> PackageState {
         )),
         _ => PackageState::Unknown("brew list gave no exit code".into()),
     }
+}
+
+/// Whether `pkg` is an official Homebrew formula or cask, without loading any formula file:
+/// `brew formulae` and `brew casks` print the names Homebrew knows, official ones bare and tap
+/// ones qualified (`user/tap/name`). A tap's formula is Ruby that runs when brew reads it, so the
+/// dependency calls below (`deps`, `info`, `outdated`) are made only for an official name.
+fn brew_official(runner: &Runner, pkg: &str) -> Result<bool, String> {
+    let short = match pkg.rsplit_once('/') {
+        None => pkg,
+        Some(("homebrew/core" | "homebrew/cask", n)) => n,
+        Some(_) => return Ok(false),
+    };
+    let env = brew_env();
+    for list in ["formulae", "casks"] {
+        let args = [list.to_string()];
+        let out = runner
+            .run(&request("brew", &args, &env, PROBE_TIMEOUT))
+            .map_err(|e| e.detail)?;
+        if let Some(why) = ended(&format!("brew {list}"), &out) {
+            return Err(why);
+        }
+        if !matches!(out.end, End::Exited(0)) {
+            return Err(format!("brew {list} exited with an error"));
+        }
+        if String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .any(|l| l.trim() == short)
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// What `brew install <pkg>` would do to the formula's dependencies, from local data only (no
@@ -278,7 +306,7 @@ fn mise_probe(runner: &Runner, pkg: &str) -> PackageState {
         "--json".into(),
         tool.into(),
     ];
-    let out = match runner.run(&request("mise", &args, &mise_probe_env(), PROBE_TIMEOUT)) {
+    let out = match runner.run(&request("mise", &args, &mise_env(), PROBE_TIMEOUT)) {
         Ok(o) => o,
         Err(e) => return PackageState::Unknown(e.detail),
     };
@@ -439,7 +467,13 @@ pub fn probe(runner: &Runner, adapter: &str, value: &Value) -> Result<PackageSta
     Ok(match state {
         PackageState::Missing(_) => match other_owner(runner, adapter, &pkg) {
             Ok(Some(why)) => PackageState::OtherOwner(why),
-            Ok(None) if adapter == HOMEBREW => brew_dependencies(runner, &pkg),
+            Ok(None) if adapter == HOMEBREW => match brew_official(runner, &pkg) {
+                Ok(true) => brew_dependencies(runner, &pkg),
+                Ok(false) => PackageState::Unofficial(format!(
+                    "{pkg} is not an official Homebrew formula or cask; reading its dependencies would load tap code before approval"
+                )),
+                Err(why) => PackageState::Unknown(why),
+            },
             Ok(None) => PackageState::Missing(Vec::new()),
             Err(why) => PackageState::Unknown(why),
         },

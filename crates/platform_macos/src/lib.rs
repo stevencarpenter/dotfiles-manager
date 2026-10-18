@@ -15,6 +15,19 @@ pub const CACHE_DIR: &str = ".cache/dotfiles-manager";
 /// Where provider programs (`op`, `brew`, `mise`) are looked up: fixed, never the caller's `PATH`
 /// (docs/architecture.md section 8, "Read-only probe allowlist", item 5).
 pub const PROVIDER_PATH: [&str; 4] = ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin"];
+/// Searched after [`PROVIDER_PATH`], relative to HOME: where mise's official installer puts
+/// `mise`. The runner checks an executable there like any other (owned by the user, not
+/// writable by group or others).
+pub const PROVIDER_HOME_PATH: &str = ".local/bin";
+
+/// The provider search path for `home`: [`PROVIDER_PATH`], then [`PROVIDER_HOME_PATH`] under it.
+pub fn provider_path(home: &Path) -> Vec<PathBuf> {
+    PROVIDER_PATH
+        .iter()
+        .map(PathBuf::from)
+        .chain(std::iter::once(home.join(PROVIDER_HOME_PATH)))
+        .collect()
+}
 pub const STATE_DIR: &str = ".local/state/dotfiles-manager";
 pub const CONFIG_DIR: &str = ".config/dotfiles-manager";
 /// The writer lock file, a sibling of the state root so a state upgrade rename never moves it.
@@ -169,6 +182,14 @@ mod tests {
                 Code::PlatformUnsupported
             );
         }
+    }
+
+    #[test]
+    fn the_provider_path_ends_with_the_user_local_bin_of_home() {
+        let p = provider_path(Path::new("/Users/a"));
+        assert_eq!(p.first(), Some(&PathBuf::from("/opt/homebrew/bin")));
+        assert_eq!(p.last(), Some(&PathBuf::from("/Users/a/.local/bin")));
+        assert_eq!(p.len(), PROVIDER_PATH.len() + 1);
     }
 
     #[test]

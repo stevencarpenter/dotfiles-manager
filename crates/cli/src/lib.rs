@@ -147,11 +147,12 @@ impl Ctx {
         Ok(Sys { uid })
     }
 
-    /// How provider children (`op`) are started: the fixed search path of the platform, HOME, and
-    /// a manager-owned working directory under the cache directory. The isolated build takes the
-    /// search path from `DFM_PROVIDER_PATH` so tests can plant a provider look-alike.
+    /// How provider children (`op`) are started: the fixed search path of the platform (with
+    /// `~/.local/bin` last), HOME, and a manager-owned working directory under the cache
+    /// directory. The isolated build takes the search path from `DFM_PROVIDER_PATH` so tests can
+    /// plant a provider look-alike.
     fn runner(&self, sys: &Sys) -> Runner {
-        let search_path = provider_path();
+        let search_path = provider_path(self.platform.home());
         Runner {
             search_path,
             home: self.platform.home().to_path_buf(),
@@ -243,22 +244,16 @@ fn context(_home: Option<String>) -> Result<Ctx, Refusal> {
 }
 
 #[cfg(feature = "test-isolation")]
-fn provider_path() -> Vec<PathBuf> {
+fn provider_path(home: &Path) -> Vec<PathBuf> {
     match std::env::var("DFM_PROVIDER_PATH") {
         Ok(v) if !v.is_empty() => v.split(':').map(PathBuf::from).collect(),
-        _ => dfm_platform_macos::PROVIDER_PATH
-            .iter()
-            .map(PathBuf::from)
-            .collect(),
+        _ => dfm_platform_macos::provider_path(home),
     }
 }
 
 #[cfg(not(feature = "test-isolation"))]
-fn provider_path() -> Vec<PathBuf> {
-    dfm_platform_macos::PROVIDER_PATH
-        .iter()
-        .map(PathBuf::from)
-        .collect()
+fn provider_path(home: &Path) -> Vec<PathBuf> {
+    dfm_platform_macos::provider_path(home)
 }
 
 #[cfg(feature = "test-isolation")]

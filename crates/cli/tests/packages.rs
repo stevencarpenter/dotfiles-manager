@@ -47,7 +47,8 @@ update_policy = "rolling"
 /// `outdated-brew` and exits 1 when there is one; `brew info --json=v2 <name>...` reports a
 /// bottle for every name except those in `nobottle-brew`; `brew install <name>` appends the
 /// name and its missing dependencies, or does nothing with the `noop` marker, or fails with the
-/// `fail` marker.
+/// `fail` marker. `brew formulae` prints `official-brew` (default: atuin and duckdb) and `brew
+/// casks` prints nothing.
 const FAKE_BREW: &str = r#"#!/bin/sh
 PATH=/usr/bin:/bin:$PATH
 here=$(dirname "$0")
@@ -62,6 +63,10 @@ case "$1" in
       if [ -n "$v" ]; then echo "$v"; else rc=1; fi
     done
     exit $rc ;;
+  formulae)
+    if [ -e "$here/../official-brew" ]; then cat "$here/../official-brew"; else printf 'atuin\nduckdb\n'; fi
+    exit 0 ;;
+  casks) exit 0 ;;
   deps)
     cat "$here/../deps-${2##*/}" 2>/dev/null; exit 0 ;;
   outdated)
@@ -289,7 +294,7 @@ fn missing_packages_are_installed_once_installed_ones_are_current_and_the_env_is
     assert!(out.contains("result: ok"), "{out}");
     assert!(
         fx.log()
-            .contains("mise install duckdb | yes=1 auto=false noconfig=unset"),
+            .contains("mise install duckdb | yes=1 auto=false noconfig=1"),
         "{}",
         fx.log()
     );
@@ -500,6 +505,7 @@ fn brew_dependencies_are_planned_when_missing_and_block_when_an_install_would_up
     assert!(t.contains("and its missing dependencies aom"), "{t}");
     assert!(!t.contains("dependencies libpng"), "{t}");
     let log = fx.log();
+    assert!(log.contains("brew formulae |"), "{log}");
     assert!(log.contains("brew deps atuin |"), "{log}");
     assert!(log.contains("brew list --versions libpng aom |"), "{log}");
     assert!(log.contains("brew outdated --json=v2 libpng |"), "{log}");
@@ -543,6 +549,35 @@ fn brew_dependencies_are_planned_when_missing_and_block_when_an_install_would_up
         "{}",
         stderr(&o)
     );
+}
+
+#[test]
+fn a_package_that_is_not_official_is_blocked_before_any_tap_code_is_read() {
+    let fx = Fx::new();
+    fx.installed("brew", "");
+    fx.installed("mise", "duckdb 1\n");
+    // A tap-qualified name, then a bare name Homebrew does not list as official.
+    for (name, list) in [("someone/tap/atuin", None), ("atuin", Some("duckdb\n"))] {
+        fx.put(
+            "base/modules/extra/module.toml",
+            &EXTRA.replace("name = \"atuin\"", &format!("name = \"{name}\"")),
+        );
+        if let Some(l) = list {
+            fs::write(fx.fake.path().join("official-brew"), l).unwrap();
+        }
+        let o = fx.preview();
+        assert_eq!(code(&o), 3, "{name}: {}\n{}", stderr(&o), text(&o.stdout));
+        assert!(stderr(&o).contains("E_SOURCE_UNTRUSTED"), "{}", stderr(&o));
+        assert!(
+            stderr(&o).contains("not an official Homebrew"),
+            "{}",
+            stderr(&o)
+        );
+    }
+    let log = fx.log();
+    for call in ["brew deps", "brew info", "brew outdated", "brew install"] {
+        assert!(!log.contains(call), "{call} ran: {log}");
+    }
 }
 
 #[test]
