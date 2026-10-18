@@ -4296,3 +4296,78 @@ fn an_effect_failure_that_cannot_be_journaled_keeps_its_path_unescaped_in_the_re
     );
     assert!(!stopped.detail.contains(r"a\\b"), "{}", stopped.detail);
 }
+
+/// A generator that claims to install packages and render secrets, so the plan-integrity checks
+/// for those operations are reached. It never runs: every plan below is refused first.
+struct Provider;
+
+impl Generator for Provider {
+    fn supports(&self, _: &Operation) -> bool {
+        false
+    }
+    fn generate(&self, _: &Operation, _: &GeneratorInputs) -> Result<Vec<u8>, Refusal> {
+        Err(Refusal::new(Code::GeneratorUnavailable, "none"))
+    }
+    fn installs(&self, _: &Operation) -> bool {
+        true
+    }
+    fn renders(&self, _: &Operation) -> bool {
+        true
+    }
+}
+
+#[test]
+fn an_install_or_render_operation_that_breaks_its_shape_refuses_the_plan() {
+    let s = setup();
+    let install = |path: Option<&str>, probe: bool| {
+        let mut o = op(&s.h, &s.store, "core.x@package", 1, Action::Install, "x");
+        o.path = path.map(str::to_string);
+        o.preconditions = if probe {
+            vec![Precondition {
+                subject: "probe:homebrew/v1:x".into(),
+                state: "missing".into(),
+            }]
+        } else {
+            Vec::new()
+        };
+        o
+    };
+    let e = refused(
+        &s,
+        &plan(vec![install(Some("x"), true)]),
+        &Provider,
+        &none(),
+    );
+    assert_eq!(e.code, Code::PlanInvalid, "{e}");
+    assert!(e.detail.contains("carries a path or is sensitive"), "{e}");
+    let e = refused(&s, &plan(vec![install(None, false)]), &Provider, &none());
+    assert_eq!(e.code, Code::PlanInvalid, "{e}");
+    assert!(e.detail.contains("records no probe precondition"), "{e}");
+    // A build with no package provider refuses before anything starts.
+    let e = refused(
+        &s,
+        &plan(vec![install(None, true)]),
+        &Gen(BTreeMap::new()),
+        &none(),
+    );
+    assert_eq!(e.code, Code::GeneratorUnavailable, "{e}");
+    assert!(e.detail.contains("no package provider"), "{e}");
+    // A secret render must be a file write from exactly one template, with no content hash.
+    let mut r = op(
+        &s.h,
+        &s.store,
+        "core.x@secret",
+        1,
+        Action::CreateFile,
+        "secret.env",
+    );
+    r.class = Class::Sensitive;
+    r.adapter = "op-template/v1".into();
+    let e = refused(&s, &plan(vec![r]), &Provider, &none());
+    assert_eq!(e.code, Code::PlanInvalid, "{e}");
+    assert!(
+        e.detail
+            .contains("renders a secret but is not a file write"),
+        "{e}"
+    );
+}

@@ -161,6 +161,8 @@ impl Fx {
         c.env_clear()
             .env("DFM_PROVIDER_PATH", self.bin())
             .env("OP_SESSION_planted", "should-pass-through")
+            // Set so the look-alike's `user=` check can fail: only OP_* may reach op.
+            .env("USER", "leak-check")
             .arg("--home")
             .arg(self.home.path())
             .args(args);
@@ -477,6 +479,125 @@ fn a_template_changed_after_the_locked_plan_blocks_the_render() {
     );
     assert!(!fx.h(TARGET).exists());
     assert!(!fx.op_log().contains("inject"), "{}", fx.op_log());
+}
+
+/// Starts `secrets --yes-plan <digest>` parked at `point`, waits until it is there, runs
+/// `change`, releases it and returns its output.
+fn parked_secrets(fx: &Fx, d: &str, point: &str, change: impl FnOnce()) -> Output {
+    let release = fx.fake.path().join(format!("release-{point}"));
+    let child = fx
+        .cmd(&["secrets", "--root", fx.root_arg(), "--yes-plan", d])
+        .env(
+            "DFM_FAILPOINT",
+            format!("{point}:wait-{}", release.display()),
+        )
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let reached = release.with_extension("reached");
+    let end = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !reached.exists() {
+        assert!(std::time::Instant::now() < end, "the run never parked");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    change();
+    fs::write(&release, "").unwrap();
+    child.wait_with_output().unwrap()
+}
+
+#[test]
+fn a_destination_changed_after_the_locked_plan_is_not_overwritten() {
+    // Hand-edited after the plan was approved and locked: the ledger no longer proves the
+    // manager wrote it, so it is a conflict, not a silent overwrite.
+    let fx = Fx::new();
+    let o = fx.secrets(&digest_of(&fx.preview()), &[]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let d = digest_of(&fx.preview());
+    let o = parked_secrets(&fx, &d, "merge-before-read", || {
+        fs::write(fx.h(TARGET), "TOKEN=edited-after-approval\n").unwrap();
+    });
+    assert_eq!(code(&o), 3, "{}\n{}", stderr(&o), text(&o.stdout));
+    assert!(stderr(&o).contains("E_CONFLICT"), "{}", stderr(&o));
+    assert!(
+        stderr(&o).contains("the ledger no longer proves the manager wrote it"),
+        "{}",
+        stderr(&o)
+    );
+    assert_eq!(fx.content(), b"TOKEN=edited-after-approval\n");
+    // The salt removed after the locked plan: the recorded hash cannot be checked, same refusal.
+    let fx = Fx::new();
+    let o = fx.secrets(&digest_of(&fx.preview()), &[]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let before = fx.content();
+    let d = digest_of(&fx.preview());
+    let o = parked_secrets(&fx, &d, "merge-before-read", || {
+        fs::remove_file(fx.state().join("salt")).unwrap();
+    });
+    assert_eq!(code(&o), 3, "{}\n{}", stderr(&o), text(&o.stdout));
+    assert!(stderr(&o).contains("E_CONFLICT"), "{}", stderr(&o));
+    assert_eq!(fx.content(), before);
+    // At plan time, a recorded hash with no salt is a state problem with its own fix text.
+    let o = fx.preview();
+    assert_eq!(code(&o), 3, "{}\n{}", stderr(&o), text(&o.stdout));
+    assert!(stderr(&o).contains("E_STATE_INVALID"), "{}", stderr(&o));
+    assert!(
+        stderr(&o).contains("state/salt does not exist"),
+        "{}",
+        stderr(&o)
+    );
+}
+
+#[test]
+fn a_destination_that_is_not_a_plain_file_of_this_secret_is_refused() {
+    let refused = |fx: &Fx, code_name: &str, detail: &str| {
+        let o = fx.preview();
+        assert_eq!(code(&o), 3, "{}\n{}", stderr(&o), text(&o.stdout));
+        assert!(stderr(&o).contains(code_name), "{}", stderr(&o));
+        assert!(stderr(&o).contains(detail), "{}", stderr(&o));
+        assert!(!fx.op_log().contains("inject"), "{}", fx.op_log());
+    };
+    // A directory.
+    let fx = Fx::new();
+    fs::create_dir_all(fx.h(TARGET)).unwrap();
+    refused(
+        &fx,
+        "E_CONFLICT",
+        "is a directory where a secret file is needed",
+    );
+    // A symbolic link, even to a private file.
+    let fx = Fx::new();
+    fs::create_dir_all(fx.h(".config/example")).unwrap();
+    fs::write(fx.h("elsewhere"), "x").unwrap();
+    fs::set_permissions(fx.h("elsewhere"), fs::Permissions::from_mode(0o600)).unwrap();
+    std::os::unix::fs::symlink(fx.h("elsewhere"), fx.h(TARGET)).unwrap();
+    refused(&fx, "E_CONFLICT", "is a link or special file");
+    // Larger than the 16 MiB read bound.
+    let fx = Fx::new();
+    fs::create_dir_all(fx.h(".config/example")).unwrap();
+    fs::write(fx.h(TARGET), vec![b'x'; 17 << 20]).unwrap();
+    fs::set_permissions(fx.h(TARGET), fs::Permissions::from_mode(0o600)).unwrap();
+    refused(&fx, "E_LIMIT_EXCEEDED", "exceeds 16 MiB");
+    // Recorded in the ledger as another resource's output.
+    let fx = Fx::new();
+    let out = fx.h(TARGET);
+    fs::create_dir_all(out.parent().unwrap()).unwrap();
+    let o = fx.run(&[
+        "__record-op",
+        "--resource",
+        "core.git",
+        "--output",
+        out.to_str().unwrap(),
+        "--content",
+        "other",
+    ]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    fs::set_permissions(&out, fs::Permissions::from_mode(0o600)).unwrap();
+    refused(
+        &fx,
+        "E_CONFLICT",
+        "is recorded in the ledger as an output of core.git",
+    );
 }
 
 #[test]
