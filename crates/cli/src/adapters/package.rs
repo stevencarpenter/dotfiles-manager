@@ -256,8 +256,8 @@ fn brew_dependencies(runner: &Runner, off: &Official) -> PackageState {
         deps.into_iter()
             .partition(|d| installed.contains(d.rsplit('/').next().unwrap_or(d)))
     };
-    // Everything the install would add must come as a bottle for this machine. A cask is not
-    // built, so only its missing formulae are asked about.
+    // Everything the install would add must come as a bottle brew pours on this machine. A cask
+    // is not built, so only its missing formulae are asked about.
     let mut args = vec!["info".to_string(), "--json=v2".into()];
     if let Official::Formula(n) = off {
         args.push(core(n));
@@ -266,7 +266,23 @@ fn brew_dependencies(runner: &Runner, off: &Official) -> PackageState {
     let bottles = if args.len() == 2 {
         Ok(Some(Vec::new()))
     } else {
-        run("brew info", args, &[0]).map(|t| unbottled(&t))
+        // This machine's bottle tag (`Utils::Bottles.tag`, Homebrew's own code; no formula is
+        // loaded) and its Cellar.
+        let target = run(
+            "brew ruby",
+            vec!["ruby".into(), "-e".into(), "puts Utils::Bottles.tag".into()],
+            &[0],
+        )
+        .and_then(|tag| {
+            run("brew --cellar", vec!["--cellar".into()], &[0])
+                .map(|cellar| (tag.trim().to_string(), cellar.trim().to_string()))
+        });
+        target.and_then(|(tag, cellar)| {
+            if tag.is_empty() || cellar.is_empty() {
+                return Err("brew did not report this machine's bottle tag and Cellar".into());
+            }
+            run("brew info", args, &[0]).map(|t| unbottled(&t, &tag, &cellar))
+        })
     };
     match bottles {
         Ok(Some(n)) if n.is_empty() => {}
@@ -300,20 +316,33 @@ fn brew_dependencies(runner: &Runner, off: &Official) -> PackageState {
     }
 }
 
-/// The formulae in a `brew info --json=v2` answer that have no bottle for this machine, or
-/// `None` when it is not that shape. Homebrew reports only this machine's bottle tags, so an
-/// empty file list means a source build. A cask has no source build.
-fn unbottled(text: &str) -> Option<Vec<String>> {
+/// The formulae in a `brew info --json=v2` answer that brew would not pour as a bottle on this
+/// machine, or `None` when it is not that shape. A formula is poured when it sets no
+/// `pour_bottle_only_if` condition and has a bottle for `tag` (or for `all`) whose cellar is
+/// relocatable (`:any`, `:any_skip_relocation`) or is `cellar`. Anything else means a source
+/// build. A cask has no source build.
+fn unbottled(text: &str, tag: &str, cellar: &str) -> Option<Vec<String>> {
     let v: serde_json::Value = serde_json::from_str(text).ok()?;
     let mut out = Vec::new();
     for f in v.get("formulae")?.as_array()? {
         let name = f.get("name")?.as_str()?;
-        let files = f
-            .get("bottle")?
+        let bottle = f.get("bottle")?;
+        let conditional = !f
+            .get("pour_bottle_only_if")
+            .is_none_or(serde_json::Value::is_null);
+        let files = bottle
             .get("stable")
             .and_then(|s| s.get("files"))
             .and_then(serde_json::Value::as_object);
-        if files.is_none_or(|m| m.is_empty()) {
+        let fits = files.is_some_and(|m| {
+            [tag, "all"].iter().any(|t| {
+                m.get(*t)
+                    .and_then(|e| e.get("cellar"))
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|c| matches!(c, ":any" | ":any_skip_relocation") || c == cellar)
+            })
+        });
+        if conditional || !fits {
             out.push(name.to_string());
         }
     }
@@ -629,19 +658,54 @@ mod tests {
     }
 
     #[test]
-    fn a_formula_without_a_bottle_for_this_machine_is_a_source_build() {
-        let t = r#"{"formulae":[
-            {"name":"imagemagick","bottle":{"stable":{"files":{"arm64_golden_gate":{}}}}},
-            {"name":"afuse","bottle":{}}],"casks":[{"token":"x"}]}"#;
-        assert_eq!(unbottled(t), Some(vec!["afuse".to_string()]));
-        assert_eq!(unbottled(r#"{"formulae":[],"casks":[]}"#), Some(vec![]));
+    fn a_formula_brew_would_not_pour_here_is_a_source_build() {
+        let (tag, cellar) = ("arm64_golden_gate", "/opt/homebrew/Cellar");
+        let f = |name: &str, files: &str, pour: &str| {
+            format!(
+                r#"{{"name":"{name}","pour_bottle_only_if":{pour},"bottle":{{"stable":{{"files":{files}}}}}}}"#
+            )
+        };
+        let t = format!(
+            r#"{{"formulae":[{},{},{},{},{},{},{}],"casks":[{{"token":"x"}}]}}"#,
+            f(
+                "here",
+                r#"{"arm64_golden_gate":{"cellar":"/opt/homebrew/Cellar"}}"#,
+                "null"
+            ),
+            f("any", r#"{"arm64_golden_gate":{"cellar":":any"}}"#, "null"),
+            f(
+                "all",
+                r#"{"all":{"cellar":":any_skip_relocation"}}"#,
+                "null"
+            ),
+            f("other_tag", r#"{"x86_64_linux":{"cellar":":any"}}"#, "null"),
+            f(
+                "other_cellar",
+                r#"{"arm64_golden_gate":{"cellar":"/usr/local/Cellar"}}"#,
+                "null"
+            ),
+            f(
+                "conditional",
+                r#"{"arm64_golden_gate":{"cellar":":any"}}"#,
+                r#""clt_installed""#
+            ),
+            r#"{"name":"none","bottle":{}}"#,
+        );
+        let want: Vec<String> = ["other_tag", "other_cellar", "conditional", "none"]
+            .map(String::from)
+            .to_vec();
+        assert_eq!(unbottled(&t, tag, cellar), Some(want));
+        assert_eq!(
+            unbottled(r#"{"formulae":[],"casks":[]}"#, tag, cellar),
+            Some(vec![])
+        );
         for bad in [
             "",
             "{}",
             r#"{"formulae":[{"bottle":{}}]}"#,
             r#"{"formulae":[{"name":"x"}]}"#,
         ] {
-            assert_eq!(unbottled(bad), None, "{bad:?}");
+            assert_eq!(unbottled(bad, tag, cellar), None, "{bad:?}");
         }
     }
 

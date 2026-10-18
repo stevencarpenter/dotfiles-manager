@@ -45,7 +45,8 @@ update_policy = "rolling"
 /// brew does for a tap-qualified name, exiting 1 if any is absent; `brew deps <name>` answers
 /// from `deps-<name>`; `brew outdated --json=v2 <name>...` reports the names listed in
 /// `outdated-brew` and exits 1 when there is one; `brew info --json=v2 <name>...` reports a
-/// bottle for every name except those in `nobottle-brew`; `brew install <name>` appends the
+/// bottle for this machine (tag `arm64_test`, which `brew ruby` prints) for every name except those
+/// in `nobottle-brew`, which have a bottle for another platform only; `brew install <name>` appends the
 /// name and its missing dependencies, or does nothing with the `noop` marker, or fails with the
 /// `fail` marker. `brew formulae` prints `official-brew` (default: atuin and duckdb) and `brew
 /// casks` prints `official-cask`. Every command takes a name pinned to its namespace
@@ -68,6 +69,8 @@ case "$1" in
     if [ -e "$here/../official-brew" ]; then cat "$here/../official-brew"; else printf 'atuin\nduckdb\n'; fi
     exit 0 ;;
   casks) cat "$here/../official-cask" 2>/dev/null; exit 0 ;;
+  ruby) echo arm64_test; exit 0 ;;
+  --cellar) echo /opt/homebrew/Cellar; exit 0 ;;
   deps)
     n=$2; [ "$n" = --cask ] && n=$3
     cat "$here/../deps-${n##*/}" 2>/dev/null; exit 0 ;;
@@ -84,7 +87,7 @@ case "$1" in
     shift 2; sep=""; printf '{"formulae":['
     for n in "$@"; do
       n=${n##*/}
-      if grep -qx "$n" "$here/../nobottle-brew" 2>/dev/null; then b='{}'; else b='{"stable":{"files":{"arm64_test":{}}}}'; fi
+      if grep -qx "$n" "$here/../nobottle-brew" 2>/dev/null; then b='{"stable":{"files":{"x86_64_linux":{"cellar":":any"}}}}'; else b='{"stable":{"files":{"arm64_test":{"cellar":":any"}}}}'; fi
       printf '%s{"name":"%s","bottle":%s}' "$sep" "$n" "$b"; sep=","
     done
     printf '],"casks":[]}\n'; exit 0 ;;
@@ -531,8 +534,10 @@ fn brew_dependencies_are_planned_when_missing_and_block_when_an_install_would_up
     // A missing dependency without a bottle for this machine would be built from source, with
     // build-time dependencies the listing does not name: the plan is blocked.
     assert!(
-        fx.log()
-            .contains("brew info --json=v2 homebrew/core/atuin homebrew/core/aom |"),
+        fx.log().contains("brew ruby -e puts Utils::Bottles.tag |")
+            && fx
+                .log()
+                .contains("brew info --json=v2 homebrew/core/atuin homebrew/core/aom |"),
         "{}",
         fx.log()
     );
