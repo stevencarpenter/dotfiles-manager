@@ -139,18 +139,44 @@ fn brew_probe(runner: &Runner, pkg: &str) -> PackageState {
     }
 }
 
+/// An official Homebrew package, pinned to the namespace it was found in. Every later brew call
+/// names it this way, so brew cannot resolve the same short name to a tap's formula instead.
+#[derive(Debug, PartialEq, Eq)]
+enum Official {
+    Formula(String),
+    Cask(String),
+}
+
+impl Official {
+    /// The arguments that name it: `homebrew/core/<name>`, or `--cask <name>`.
+    fn args(&self) -> Vec<String> {
+        match self {
+            Official::Formula(n) => vec![core(n)],
+            Official::Cask(n) => vec!["--cask".into(), n.clone()],
+        }
+    }
+}
+
+/// A formula name pinned to Homebrew's core namespace.
+fn core(name: &str) -> String {
+    format!("homebrew/core/{name}")
+}
+
 /// Whether `pkg` is an official Homebrew formula or cask, without loading any formula file:
 /// `brew formulae` and `brew casks` print the names Homebrew knows, official ones bare and tap
 /// ones qualified (`user/tap/name`). A tap's formula is Ruby that runs when brew reads it, so the
-/// dependency calls below (`deps`, `info`, `outdated`) are made only for an official name.
-fn brew_official(runner: &Runner, pkg: &str) -> Result<bool, String> {
-    let short = match pkg.rsplit_once('/') {
-        None => pkg,
-        Some(("homebrew/core" | "homebrew/cask", n)) => n,
-        Some(_) => return Ok(false),
+/// dependency calls below (`deps`, `info`, `outdated`) and the install run only for an official
+/// package, and name it in the namespace that matched. A name declared as `homebrew/core/<n>` is
+/// looked up as a formula only, `homebrew/cask/<n>` as a cask only.
+fn brew_official(runner: &Runner, pkg: &str) -> Result<Option<Official>, String> {
+    let (short, lists): (&str, &[&str]) = match pkg.rsplit_once('/') {
+        None => (pkg, &["formulae", "casks"]),
+        Some(("homebrew/core", n)) => (n, &["formulae"]),
+        Some(("homebrew/cask", n)) => (n, &["casks"]),
+        Some(_) => return Ok(None),
     };
     let env = brew_env();
-    for list in ["formulae", "casks"] {
+    for &list in lists {
         let args = [list.to_string()];
         let out = runner
             .run(&request("brew", &args, &env, PROBE_TIMEOUT))
@@ -165,10 +191,13 @@ fn brew_official(runner: &Runner, pkg: &str) -> Result<bool, String> {
             .lines()
             .any(|l| l.trim() == short)
         {
-            return Ok(true);
+            return Ok(Some(match list {
+                "formulae" => Official::Formula(short.to_string()),
+                _ => Official::Cask(short.to_string()),
+            }));
         }
     }
-    Ok(false)
+    Ok(None)
 }
 
 /// What `brew install <pkg>` would do to the formula's dependencies, from local data only (no
@@ -177,7 +206,10 @@ fn brew_official(runner: &Runner, pkg: &str) -> Result<bool, String> {
 /// for this machine, and `brew outdated --json=v2` which installed ones the install would
 /// upgrade. The missing ones become part of the plan. A source build blocks it, because its
 /// build-time dependencies are not in the listing; so does an outdated dependency.
-fn brew_dependencies(runner: &Runner, pkg: &str) -> PackageState {
+fn brew_dependencies(runner: &Runner, off: &Official) -> PackageState {
+    let pkg = match off {
+        Official::Formula(n) | Official::Cask(n) => n.as_str(),
+    };
     let env = brew_env();
     let run = |what: &str, args: Vec<String>, ok: &[i32]| -> Result<String, String> {
         let out = runner
@@ -192,7 +224,12 @@ fn brew_dependencies(runner: &Runner, pkg: &str) -> PackageState {
             _ => Err(format!("{what} gave no exit code")),
         }
     };
-    let deps: Vec<String> = match run("brew deps", vec!["deps".into(), pkg.into()], &[0]) {
+    let mut args = vec!["deps".to_string()];
+    args.extend(off.args());
+    // The dependencies of an official package are official formulae, named bare; every later
+    // call pins them to the core namespace too. A cask's cask dependency is not a formula, so
+    // its `brew info` fails and the state is Unknown: the check fails closed.
+    let deps: Vec<String> = match run("brew deps", args, &[0]) {
         Ok(t) => t.split_whitespace().map(str::to_string).collect(),
         Err(why) => return PackageState::Unknown(why),
     };
@@ -207,7 +244,7 @@ fn brew_dependencies(runner: &Runner, pkg: &str) -> PackageState {
         // `brew list --versions` prints the installed ones by short name and exits 1 if any is
         // absent.
         let mut args = vec!["list".to_string(), "--versions".into()];
-        args.extend(deps.iter().cloned());
+        args.extend(deps.iter().map(|d| core(d)));
         let listed = match run("brew list", args, &[0, 1]) {
             Ok(t) => t,
             Err(why) => return PackageState::Unknown(why),
@@ -219,10 +256,19 @@ fn brew_dependencies(runner: &Runner, pkg: &str) -> PackageState {
         deps.into_iter()
             .partition(|d| installed.contains(d.rsplit('/').next().unwrap_or(d)))
     };
-    // Everything the install would add must come as a bottle for this machine.
-    let mut args = vec!["info".to_string(), "--json=v2".into(), pkg.into()];
-    args.extend(missing.iter().cloned());
-    match run("brew info", args, &[0]).map(|t| unbottled(&t)) {
+    // Everything the install would add must come as a bottle for this machine. A cask is not
+    // built, so only its missing formulae are asked about.
+    let mut args = vec!["info".to_string(), "--json=v2".into()];
+    if let Official::Formula(n) = off {
+        args.push(core(n));
+    }
+    args.extend(missing.iter().map(|d| core(d)));
+    let bottles = if args.len() == 2 {
+        Ok(Some(Vec::new()))
+    } else {
+        run("brew info", args, &[0]).map(|t| unbottled(&t))
+    };
+    match bottles {
         Ok(Some(n)) if n.is_empty() => {}
         Ok(Some(n)) => return PackageState::SourceBuild(n),
         Ok(None) => {
@@ -237,7 +283,7 @@ fn brew_dependencies(runner: &Runner, pkg: &str) -> PackageState {
     }
     // `brew outdated` exits 1 when it finds an outdated one; the JSON is the answer either way.
     let mut args = vec!["outdated".to_string(), "--json=v2".into()];
-    args.extend(have.iter().cloned());
+    args.extend(have.iter().map(|d| core(d)));
     let outdated = match run("brew outdated", args, &[0, 1]).map(|t| outdated_names(&t)) {
         Ok(Some(n)) => n,
         Ok(None) => {
@@ -468,8 +514,8 @@ pub fn probe(runner: &Runner, adapter: &str, value: &Value) -> Result<PackageSta
         PackageState::Missing(_) => match other_owner(runner, adapter, &pkg) {
             Ok(Some(why)) => PackageState::OtherOwner(why),
             Ok(None) if adapter == HOMEBREW => match brew_official(runner, &pkg) {
-                Ok(true) => brew_dependencies(runner, &pkg),
-                Ok(false) => PackageState::Unofficial(format!(
+                Ok(Some(off)) => brew_dependencies(runner, &off),
+                Ok(None) => PackageState::Unofficial(format!(
                     "{pkg} is not an official Homebrew formula or cask; reading its dependencies would load tap code before approval"
                 )),
                 Err(why) => PackageState::Unknown(why),
@@ -485,7 +531,21 @@ pub fn probe(runner: &Runner, adapter: &str, value: &Value) -> Result<PackageSta
 pub fn install(runner: &Runner, adapter: &str, value: &Value) -> Result<(), Refusal> {
     let pkg = name(value)?;
     let (program, args, env) = match adapter {
-        HOMEBREW => ("brew", vec!["install".to_string(), pkg.clone()], brew_env()),
+        HOMEBREW => {
+            // The same namespace pin as the probe: the install cannot resolve the short name
+            // to another package than the one the plan named.
+            let off = brew_official(runner, &pkg)
+                .map_err(|why| Refusal::new(Code::ProbeFailed, why))?
+                .ok_or_else(|| {
+                    Refusal::new(
+                        Code::SourceUntrusted,
+                        format!("{pkg} is not an official Homebrew formula or cask"),
+                    )
+                })?;
+            let mut args = vec!["install".to_string()];
+            args.extend(off.args());
+            ("brew", args, brew_env())
+        }
         MISE => ("mise", vec!["install".to_string(), pkg.clone()], mise_env()),
         _ => {
             return Err(Refusal::new(

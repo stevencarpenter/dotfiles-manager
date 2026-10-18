@@ -48,7 +48,8 @@ update_policy = "rolling"
 /// bottle for every name except those in `nobottle-brew`; `brew install <name>` appends the
 /// name and its missing dependencies, or does nothing with the `noop` marker, or fails with the
 /// `fail` marker. `brew formulae` prints `official-brew` (default: atuin and duckdb) and `brew
-/// casks` prints nothing.
+/// casks` prints `official-cask`. Every command takes a name pinned to its namespace
+/// (`homebrew/core/<name>`, or `--cask <name>`) and answers with the short name, as brew does.
 const FAKE_BREW: &str = r#"#!/bin/sh
 PATH=/usr/bin:/bin:$PATH
 here=$(dirname "$0")
@@ -66,12 +67,14 @@ case "$1" in
   formulae)
     if [ -e "$here/../official-brew" ]; then cat "$here/../official-brew"; else printf 'atuin\nduckdb\n'; fi
     exit 0 ;;
-  casks) exit 0 ;;
+  casks) cat "$here/../official-cask" 2>/dev/null; exit 0 ;;
   deps)
-    cat "$here/../deps-${2##*/}" 2>/dev/null; exit 0 ;;
+    n=$2; [ "$n" = --cask ] && n=$3
+    cat "$here/../deps-${n##*/}" 2>/dev/null; exit 0 ;;
   outdated)
     shift 2; rc=0; sep=""; printf '{"formulae":['
     for n in "$@"; do
+      n=${n##*/}
       if grep -qx "$n" "$here/../outdated-brew" 2>/dev/null; then
         printf '%s{"name":"%s"}' "$sep" "$n"; sep=","; rc=1
       fi
@@ -80,6 +83,7 @@ case "$1" in
   info)
     shift 2; sep=""; printf '{"formulae":['
     for n in "$@"; do
+      n=${n##*/}
       if grep -qx "$n" "$here/../nobottle-brew" 2>/dev/null; then b='{}'; else b='{"stable":{"files":{"arm64_test":{}}}}'; fi
       printf '%s{"name":"%s","bottle":%s}' "$sep" "$n" "$b"; sep=","
     done
@@ -87,10 +91,11 @@ case "$1" in
   install)
     [ -e "$here/../fail" ] && { echo "Error: PLANTED-STDERR" >&2; exit 1; }
     [ -e "$here/../noop" ] && exit 0
-    for d in $(cat "$here/../deps-${2##*/}" 2>/dev/null); do
+    n=$2; [ "$n" = --cask ] && n=$3; n=${n##*/}
+    for d in $(cat "$here/../deps-$n" 2>/dev/null); do
       grep -q "^$d " "$db" 2>/dev/null || echo "$d 1.0.0" >> "$db"
     done
-    echo "${2##*/} 1.0.0" >> "$db"; echo "==> Installing $2"; exit 0 ;;
+    echo "$n 1.0.0" >> "$db"; echo "==> Installing $n"; exit 0 ;;
   *) exit 64 ;;
 esac
 "#;
@@ -476,7 +481,7 @@ fn the_owner_check_survives_a_home_that_resembles_a_provider_and_a_noop_install_
     // The install runs with the same variables: no upgrade of the formula or its dependents.
     assert!(
         fx.log().contains(
-            "brew install atuin | auto=1 analytics=1 hints=1 cleanup=1 upgrade=1 dependents=1 user=none"
+            "brew install homebrew/core/atuin | auto=1 analytics=1 hints=1 cleanup=1 upgrade=1 dependents=1 user=none"
         ),
         "{}",
         fx.log()
@@ -506,9 +511,15 @@ fn brew_dependencies_are_planned_when_missing_and_block_when_an_install_would_up
     assert!(!t.contains("dependencies libpng"), "{t}");
     let log = fx.log();
     assert!(log.contains("brew formulae |"), "{log}");
-    assert!(log.contains("brew deps atuin |"), "{log}");
-    assert!(log.contains("brew list --versions libpng aom |"), "{log}");
-    assert!(log.contains("brew outdated --json=v2 libpng |"), "{log}");
+    assert!(log.contains("brew deps homebrew/core/atuin |"), "{log}");
+    assert!(
+        log.contains("brew list --versions homebrew/core/libpng homebrew/core/aom |"),
+        "{log}"
+    );
+    assert!(
+        log.contains("brew outdated --json=v2 homebrew/core/libpng |"),
+        "{log}"
+    );
     assert!(!log.contains("brew install"), "{log}");
     // A dependency that appears after the preview makes the approved plan stale.
     let d = digest_of(&o);
@@ -520,7 +531,8 @@ fn brew_dependencies_are_planned_when_missing_and_block_when_an_install_would_up
     // A missing dependency without a bottle for this machine would be built from source, with
     // build-time dependencies the listing does not name: the plan is blocked.
     assert!(
-        fx.log().contains("brew info --json=v2 atuin aom |"),
+        fx.log()
+            .contains("brew info --json=v2 homebrew/core/atuin homebrew/core/aom |"),
         "{}",
         fx.log()
     );
@@ -578,6 +590,30 @@ fn a_package_that_is_not_official_is_blocked_before_any_tap_code_is_read() {
     for call in ["brew deps", "brew info", "brew outdated", "brew install"] {
         assert!(!log.contains(call), "{call} ran: {log}");
     }
+}
+
+#[test]
+fn an_official_cask_is_probed_and_installed_as_a_cask() {
+    let fx = Fx::new();
+    fx.installed("brew", "");
+    fx.installed("mise", "duckdb 1\n");
+    // The short name is a cask, not a formula: every call names it with --cask, so brew never
+    // resolves it to a formula of that name from a tap.
+    fx.put(
+        "base/modules/extra/module.toml",
+        &EXTRA.replace("name = \"atuin\"", "name = \"zed\""),
+    );
+    fs::write(fx.fake.path().join("official-brew"), "duckdb\n").unwrap();
+    fs::write(fx.fake.path().join("official-cask"), "zed\n").unwrap();
+    let o = fx.preview();
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+    let o = fx.packages(&digest_of(&o));
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+    let log = fx.log();
+    assert!(log.contains("brew deps --cask zed |"), "{log}");
+    assert!(log.contains("brew install --cask zed |"), "{log}");
+    assert!(!log.contains("brew info"), "{log}");
+    assert!(!log.contains("homebrew/core/zed"), "{log}");
 }
 
 #[test]
