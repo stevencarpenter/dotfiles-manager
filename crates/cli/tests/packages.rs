@@ -90,10 +90,17 @@ case "$1" in
     [ -e "$here/../fail" ] && { echo "Error: PLANTED-STDERR" >&2; exit 1; }
     [ -e "$here/../noop" ] && exit 0
     root=Cellar; n=$2; [ "$n" = --cask ] && { root=Caskroom; n=$3; }; n=${n##*/}
+    receipt() { printf '{"source":{"tap":"%s"}}' "$2" > "$1/INSTALL_RECEIPT.json"; }
     for d in $(cat "$here/../deps-$n" 2>/dev/null); do
-      mkdir -p "$here/../Cellar/$d/1.0.0"
+      mkdir -p "$here/../Cellar/$d/1.0.0"; receipt "$here/../Cellar/$d/1.0.0" homebrew/core
     done
-    mkdir -p "$here/../$root/$n/1.0.0"; echo "==> Installing $n"; exit 0 ;;
+    if [ $root = Caskroom ]; then
+      mkdir -p "$here/../Caskroom/$n/1.0.0" "$here/../Caskroom/$n/.metadata"
+      receipt "$here/../Caskroom/$n/.metadata" homebrew/cask
+    else
+      mkdir -p "$here/../Cellar/$n/1.0.0"; receipt "$here/../Cellar/$n/1.0.0" homebrew/core
+    fi
+    echo "==> Installing $n"; exit 0 ;;
   *) exit 64 ;;
 esac
 "#;
@@ -193,7 +200,8 @@ impl Fx {
     }
 
     /// The installed packages of a provider, one `<name> <version>` line each. For brew they
-    /// become `Cellar/<name>/<version>` directories, as Homebrew keeps them.
+    /// become `Cellar/<name>/<version>` kegs with an install receipt naming `homebrew/core`, as
+    /// Homebrew keeps them.
     fn installed(&self, provider: &str, lines: &str) {
         fs::write(
             self.fake.path().join(format!("installed-{provider}")),
@@ -207,7 +215,13 @@ impl Fx {
             for l in lines.lines() {
                 let mut p = l.split_whitespace();
                 let (n, v) = (p.next().unwrap(), p.next().unwrap());
-                fs::create_dir_all(cellar.join(n).join(v)).unwrap();
+                let keg = cellar.join(n).join(v);
+                fs::create_dir_all(&keg).unwrap();
+                fs::write(
+                    keg.join("INSTALL_RECEIPT.json"),
+                    r#"{"source":{"tap":"homebrew/core"}}"#,
+                )
+                .unwrap();
             }
         }
     }
@@ -412,6 +426,35 @@ fn qualified_names_are_probed_by_their_short_name_and_installed_in_full() {
     assert!(log.contains("mise ls --installed --json duckdb |"), "{log}");
     assert!(log.contains("mise install duckdb@2 |"), "{log}");
     assert!(text(&o.stdout).contains(&format!("updated {MISE_OP}")));
+    // A rack is keyed by the short name only: for a tap-qualified name the keg's receipt must
+    // name that tap. A keg from another tap is another owner; no receipt fails closed. A bare
+    // name accepts any tap.
+    let receipt = fx
+        .fake
+        .path()
+        .join("Cellar/atuin/18.24.1/INSTALL_RECEIPT.json");
+    fs::write(&receipt, r#"{"source":{"tap":"someone/tap"}}"#).unwrap();
+    let o = fx.preview();
+    assert_eq!(code(&o), 3, "{}\n{}", stderr(&o), text(&o.stdout));
+    assert!(stderr(&o).contains("E_CONFLICT"), "{}", stderr(&o));
+    assert!(
+        stderr(&o).contains("installed from the tap someone/tap, not from homebrew/core"),
+        "{}",
+        stderr(&o)
+    );
+    fs::remove_file(&receipt).unwrap();
+    let o = fx.preview();
+    assert_eq!(code(&o), 3, "{}\n{}", stderr(&o), text(&o.stdout));
+    assert!(stderr(&o).contains("E_PROBE_FAILED"), "{}", stderr(&o));
+    fs::write(&receipt, r#"{"source":{"tap":"someone/tap"}}"#).unwrap();
+    fx.put("base/modules/extra/module.toml", EXTRA);
+    let o = fx.preview();
+    assert!(
+        text(&o.stdout).contains(&format!("current {BREW_OP}")),
+        "{}\n{}",
+        stderr(&o),
+        text(&o.stdout)
+    );
     // A prefix matches whole components: 10.x is not a 1.x. A selector mise resolves online
     // is a manifest error, not a probe.
     fx.put(

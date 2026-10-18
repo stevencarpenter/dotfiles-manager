@@ -161,31 +161,83 @@ fn rack_versions(root: &Path, name: &str) -> Result<Vec<String>, String> {
 
 /// Whether the declared package is installed by Homebrew: a version directory under its rack in
 /// the Cellar (a formula) or the Caskroom (a cask), as `brew list` itself decides. Reading the
-/// directories loads no formula or cask, so a tap's code never runs here. A tap-qualified name
-/// is looked up by its short name; `homebrew/core/` names a formula, `homebrew/cask/` a cask.
+/// directories loads no formula or cask, so a tap's code never runs here. `homebrew/core/` names
+/// a formula, `homebrew/cask/` a cask. A rack is keyed by the short name only, so for a
+/// tap-qualified name the install receipts must name that tap: a keg from another tap is another
+/// owner, and a receipt that cannot be read fails closed. A bare name accepts any tap.
 fn brew_probe(runner: &Runner, pkg: &str) -> PackageState {
     let (cellar, caskroom) = match brew_roots(runner) {
         Ok(r) => r,
         Err(why) => return PackageState::Unknown(why),
     };
     let short = pkg.rsplit('/').next().unwrap_or(pkg);
-    let roots = match pkg.rsplit_once('/') {
-        Some(("homebrew/core", _)) => vec![cellar],
-        Some(("homebrew/cask", _)) => vec![caskroom],
-        _ => vec![cellar, caskroom],
+    let tap = pkg.rsplit_once('/').map(|(t, _)| t.to_ascii_lowercase());
+    let roots = match tap.as_deref() {
+        Some("homebrew/core") => vec![(cellar, false)],
+        Some("homebrew/cask") => vec![(caskroom, true)],
+        _ => vec![(cellar, false), (caskroom, true)],
     };
-    let mut versions = Vec::new();
-    for root in &roots {
+    let (mut versions, mut receipts) = (Vec::new(), Vec::new());
+    for (root, cask) in &roots {
+        let rack = root.join(short);
         match rack_versions(root, short) {
-            Ok(v) => versions.extend(v),
+            Ok(v) if v.is_empty() => {}
+            // A cask keeps one receipt for the rack, a formula one per keg.
+            Ok(v) if *cask => {
+                receipts.push(rack.join(".metadata/INSTALL_RECEIPT.json"));
+                versions.extend(v);
+            }
+            Ok(v) => {
+                receipts.extend(
+                    v.iter()
+                        .map(|ver| rack.join(ver).join("INSTALL_RECEIPT.json")),
+                );
+                versions.extend(v);
+            }
             Err(why) => return PackageState::Unknown(why),
         }
     }
     if versions.is_empty() {
-        PackageState::Missing(Vec::new())
-    } else {
-        PackageState::Installed(versions.join(" "))
+        return PackageState::Missing(Vec::new());
     }
+    if let Some(want) = &tap {
+        for r in &receipts {
+            match receipt_tap(r) {
+                Ok(t) if t == *want => {}
+                Ok(t) => {
+                    return PackageState::OtherOwner(format!(
+                        "{short} is installed from the tap {t}, not from {want}"
+                    ));
+                }
+                Err(why) => return PackageState::Unknown(why),
+            }
+        }
+    }
+    PackageState::Installed(versions.join(" "))
+}
+
+/// The tap an install receipt names (`source.tap`, lowercase). The file is read without
+/// following a link and within 1 MiB.
+fn receipt_tap(path: &Path) -> Result<String, String> {
+    const LIMIT: u64 = 1 << 20;
+    let shown = path.display().to_string();
+    let bytes = crate::read_fs::read_regular_bounded(
+        path,
+        LIMIT,
+        |e| Refusal::new(Code::IoFailed, format!("cannot read {shown}: {}", e.kind())),
+        || Refusal::new(Code::IoFailed, format!("{shown} is not a regular file")),
+    )
+    .map_err(|r| r.detail)?;
+    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > LIMIT {
+        return Err(format!("{shown} exceeds 1 MiB"));
+    }
+    let v: serde_json::Value =
+        serde_json::from_slice(&bytes).map_err(|_| format!("{shown} is not JSON"))?;
+    v.get("source")
+        .and_then(|s| s.get("tap"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_ascii_lowercase)
+        .ok_or_else(|| format!("{shown} names no source tap"))
 }
 
 /// An official Homebrew package, pinned to the namespace it was found in. Every later brew call
