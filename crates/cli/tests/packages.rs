@@ -41,12 +41,13 @@ name = "duckdb"
 update_policy = "rolling"
 "#;
 
-/// `brew list --versions <name>...` answers from `installed-brew` and prints the short names, as
-/// brew does for a tap-qualified name, exiting 1 if any is absent; `brew deps <name>` answers
-/// from `deps-<name>`; `brew outdated --json=v2 <name>...` reports the names listed in
-/// `outdated-brew` and exits 1 when there is one; `brew info --json=v2 <name>...` reports a
-/// bottle for this machine (tag `arm64_test`, which `brew ruby` prints) for every name except those
-/// in `nobottle-brew`, which have a bottle for another platform only; `brew install <name>` appends the
+/// `brew --cellar` and `brew --caskroom` print the fixture's `Cellar` and `Caskroom`, where an
+/// installed package is a `<name>/<version>` directory (the `installed` helper and `brew
+/// install` create them); there is no `brew list`, so a probe that calls it fails. `brew deps
+/// <name>` answers from `deps-<name>`; `brew outdated --json=v2 <name>...` reports the names in
+/// `outdated-brew` and exits 1 when there is one; `brew info --json=v2 <name>...` reports a bottle
+/// for this machine (tag `arm64_test`, which `brew ruby` prints) for every name except those in
+/// `nobottle-brew`, which have a bottle for another platform only. `brew install <name>` adds the
 /// name and its missing dependencies, or does nothing with the `noop` marker, or fails with the
 /// `fail` marker. `brew formulae` prints `official-brew` (default: atuin and duckdb) and `brew
 /// casks` prints `official-cask`. Every command takes a name pinned to its namespace
@@ -55,22 +56,16 @@ const FAKE_BREW: &str = r#"#!/bin/sh
 PATH=/usr/bin:/bin:$PATH
 here=$(dirname "$0")
 printf 'brew %s | auto=%s analytics=%s hints=%s cleanup=%s upgrade=%s dependents=%s user=%s\n' "$*" "${HOMEBREW_NO_AUTO_UPDATE:-unset}" "${HOMEBREW_NO_ANALYTICS:-unset}" "${HOMEBREW_NO_ENV_HINTS:-unset}" "${HOMEBREW_NO_INSTALL_CLEANUP:-unset}" "${HOMEBREW_NO_INSTALL_UPGRADE:-unset}" "${HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK:-unset}" "${USER:-none}" >> "$here/../log"
-db="$here/../installed-brew"
 case "$1" in
-  list)
+  --cellar)
     [ -e "$here/../stop" ] && kill -TERM $PPID
-    shift 2; rc=0
-    for n in "$@"; do
-      v=$(grep "^${n##*/} " "$db" 2>/dev/null | head -1)
-      if [ -n "$v" ]; then echo "$v"; else rc=1; fi
-    done
-    exit $rc ;;
+    echo "$(cd "$here/.." && pwd)/Cellar"; exit 0 ;;
+  --caskroom) echo "$(cd "$here/.." && pwd)/Caskroom"; exit 0 ;;
   formulae)
     if [ -e "$here/../official-brew" ]; then cat "$here/../official-brew"; else printf 'atuin\nduckdb\n'; fi
     exit 0 ;;
   casks) cat "$here/../official-cask" 2>/dev/null; exit 0 ;;
   ruby) echo arm64_test; exit 0 ;;
-  --cellar) echo /opt/homebrew/Cellar; exit 0 ;;
   deps)
     n=$2; [ "$n" = --cask ] && n=$3
     cat "$here/../deps-${n##*/}" 2>/dev/null; exit 0 ;;
@@ -94,11 +89,11 @@ case "$1" in
   install)
     [ -e "$here/../fail" ] && { echo "Error: PLANTED-STDERR" >&2; exit 1; }
     [ -e "$here/../noop" ] && exit 0
-    n=$2; [ "$n" = --cask ] && n=$3; n=${n##*/}
+    root=Cellar; n=$2; [ "$n" = --cask ] && { root=Caskroom; n=$3; }; n=${n##*/}
     for d in $(cat "$here/../deps-$n" 2>/dev/null); do
-      grep -q "^$d " "$db" 2>/dev/null || echo "$d 1.0.0" >> "$db"
+      mkdir -p "$here/../Cellar/$d/1.0.0"
     done
-    echo "$n 1.0.0" >> "$db"; echo "==> Installing $n"; exit 0 ;;
+    mkdir -p "$here/../$root/$n/1.0.0"; echo "==> Installing $n"; exit 0 ;;
   *) exit 64 ;;
 esac
 "#;
@@ -197,12 +192,24 @@ impl Fx {
         fs::write(p, content).unwrap();
     }
 
+    /// The installed packages of a provider, one `<name> <version>` line each. For brew they
+    /// become `Cellar/<name>/<version>` directories, as Homebrew keeps them.
     fn installed(&self, provider: &str, lines: &str) {
         fs::write(
             self.fake.path().join(format!("installed-{provider}")),
             lines,
         )
         .unwrap();
+        if provider == "brew" {
+            let cellar = self.fake.path().join("Cellar");
+            let _ = fs::remove_dir_all(&cellar);
+            fs::create_dir_all(&cellar).unwrap();
+            for l in lines.lines() {
+                let mut p = l.split_whitespace();
+                let (n, v) = (p.next().unwrap(), p.next().unwrap());
+                fs::create_dir_all(cellar.join(n).join(v)).unwrap();
+            }
+        }
     }
 
     fn log(&self) -> String {
@@ -285,7 +292,7 @@ fn missing_packages_are_installed_once_installed_ones_are_current_and_the_env_is
     let log = fx.log();
     assert!(
         log.contains(
-            "brew list --versions atuin | auto=1 analytics=1 hints=1 cleanup=1 upgrade=1 dependents=1 user=none"
+            "brew --cellar | auto=1 analytics=1 hints=1 cleanup=1 upgrade=1 dependents=1 user=none"
         ),
         "{log}"
     );
@@ -401,10 +408,7 @@ fn qualified_names_are_probed_by_their_short_name_and_installed_in_full() {
     let o = fx.packages(&digest_of(&o));
     assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
     let log = fx.log();
-    assert!(
-        log.contains("brew list --versions homebrew/core/atuin"),
-        "{log}"
-    );
+    assert!(!log.contains("brew list"), "{log}");
     assert!(log.contains("mise ls --installed --json duckdb |"), "{log}");
     assert!(log.contains("mise install duckdb@2 |"), "{log}");
     assert!(text(&o.stdout).contains(&format!("updated {MISE_OP}")));
@@ -515,10 +519,7 @@ fn brew_dependencies_are_planned_when_missing_and_block_when_an_install_would_up
     let log = fx.log();
     assert!(log.contains("brew formulae |"), "{log}");
     assert!(log.contains("brew deps homebrew/core/atuin |"), "{log}");
-    assert!(
-        log.contains("brew list --versions homebrew/core/libpng homebrew/core/aom |"),
-        "{log}"
-    );
+    assert!(!log.contains("brew list"), "{log}");
     assert!(
         log.contains("brew outdated --json=v2 homebrew/core/libpng |"),
         "{log}"
@@ -619,6 +620,33 @@ fn an_official_cask_is_probed_and_installed_as_a_cask() {
     assert!(log.contains("brew install --cask zed |"), "{log}");
     assert!(!log.contains("brew info"), "{log}");
     assert!(!log.contains("homebrew/core/zed"), "{log}");
+    // The installed cask is found in the Caskroom: the rerun is current, nothing is installed.
+    let lines = fx.log().lines().count();
+    let o = fx.preview();
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+    assert!(
+        text(&o.stdout).contains(&format!("current {BREW_OP}")),
+        "{}",
+        text(&o.stdout)
+    );
+    // An installed cask from a tap is current too, and nothing that loads it runs: the probe
+    // reads the Caskroom only.
+    fx.put(
+        "base/modules/extra/module.toml",
+        &EXTRA.replace("name = \"atuin\"", "name = \"tapcask\""),
+    );
+    fs::create_dir_all(fx.fake.path().join("Caskroom/tapcask/2.0")).unwrap();
+    let o = fx.preview();
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+    assert!(text(&o.stdout).contains("(2.0)"), "{}", text(&o.stdout));
+    let later: Vec<String> = fx.log().lines().skip(lines).map(String::from).collect();
+    assert!(
+        later
+            .iter()
+            .filter(|l| l.starts_with("brew "))
+            .all(|l| l.starts_with("brew --cellar") || l.starts_with("brew --caskroom")),
+        "{later:?}"
+    );
 }
 
 #[test]
@@ -648,8 +676,7 @@ fn two_formulae_that_share_a_missing_dependency_are_both_installed() {
     let out = text(&o.stdout);
     assert!(out.contains(&format!("updated {BREW_OP}")), "{out}");
     assert!(out.contains(&format!("updated {MISE_OP}")), "{out}");
-    let db = fs::read_to_string(fx.fake.path().join("installed-brew")).unwrap();
-    assert_eq!(db.matches("aom ").count(), 1, "{db}");
+    assert!(fx.fake.path().join("Cellar/aom/1.0.0").is_dir());
 }
 
 #[test]
@@ -664,7 +691,7 @@ fn a_stop_request_during_a_probe_ends_the_probing_and_exits_143() {
     assert_eq!(code(&o), 143, "{}\n{}", stderr(&o), text(&o.stdout));
     assert!(stderr(&o).contains("E_TERMINATED"), "{}", stderr(&o));
     let log = fx.log();
-    assert!(log.contains("brew list"), "{log}");
+    assert!(log.contains("brew --cellar"), "{log}");
     assert!(!log.contains("mise "), "{log}");
     assert!(fx.receipts().is_empty());
 }

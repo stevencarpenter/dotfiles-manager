@@ -10,9 +10,9 @@ use dfm_engine::{End, ProcOutput, ProcRequest, Runner};
 use dfm_model::plan::{PackageState, Scope};
 use dfm_model::resolve::{Resolved, Value};
 use dfm_model::{Code, Refusal};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::os::unix::fs::PermissionsExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 pub const HOMEBREW: &str = "homebrew/v1";
@@ -79,6 +79,7 @@ fn valid_name(n: &str) -> bool {
     !n.is_empty()
         && n.len() <= 128
         && !n.starts_with('-')
+        && n.split('/').all(|c| !matches!(c, "" | "." | ".."))
         && n.chars().all(|c| {
             c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '+' | '@' | '/' | ':')
         })
@@ -110,32 +111,80 @@ fn ended(what: &str, out: &ProcOutput) -> Option<String> {
     }
 }
 
-/// `brew list --versions <name>`: exit 0 and a line `<name> <version>` means installed; exit 1
-/// with no output means not installed.
-fn brew_probe(runner: &Runner, pkg: &str) -> PackageState {
-    let args = ["list".to_string(), "--versions".into(), pkg.into()];
-    let out = match runner.run(&request("brew", &args, &brew_env(), PROBE_TIMEOUT)) {
-        Ok(o) => o,
-        Err(e) => return PackageState::Unknown(e.detail),
-    };
-    if let Some(why) = ended("brew list", &out) {
-        return PackageState::Unknown(why);
+/// Homebrew's install roots. `brew --cellar` and `brew --caskroom` print a path and load no
+/// formula or cask, so they are safe before approval for any package, a tap's included.
+fn brew_roots(runner: &Runner) -> Result<(PathBuf, PathBuf), String> {
+    let env = brew_env();
+    let mut roots = Vec::new();
+    for flag in ["--cellar", "--caskroom"] {
+        let args = [flag.to_string()];
+        let out = runner
+            .run(&request("brew", &args, &env, PROBE_TIMEOUT))
+            .map_err(|e| e.detail)?;
+        if let Some(why) = ended(&format!("brew {flag}"), &out) {
+            return Err(why);
+        }
+        let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if !matches!(out.end, End::Exited(0)) || !path.starts_with('/') {
+            return Err(format!("brew {flag} did not print an absolute path"));
+        }
+        roots.push(PathBuf::from(path));
     }
-    let text = String::from_utf8_lossy(&out.stdout);
-    // `brew list --versions homebrew/core/atuin` prints `atuin 18.24.1`: the short name, which
-    // keeps a `@version` suffix (`node@20 20.1.0`).
+    let caskroom = roots.pop().unwrap_or_default();
+    let cellar = roots.pop().unwrap_or_default();
+    Ok((cellar, caskroom))
+}
+
+/// The versions installed under `root/<name>`: the names of its version directories, sorted.
+/// Only directory entries are read; no rack is no version. A name is a checked package name, so
+/// it never leaves `root`.
+fn rack_versions(root: &Path, name: &str) -> Result<Vec<String>, String> {
+    let rack = root.join(name);
+    let shown = |e: std::io::Error| format!("cannot read {}: {}", rack.display(), e.kind());
+    let entries = match std::fs::read_dir(&rack) {
+        Ok(e) => e,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(shown(e)),
+    };
+    let mut versions = Vec::new();
+    for e in entries {
+        let e = e.map_err(shown)?;
+        let dir = e.file_type().map_err(shown)?.is_dir();
+        match e.file_name().to_str() {
+            Some(n) if dir && !n.starts_with('.') => versions.push(n.to_string()),
+            _ => {}
+        }
+    }
+    versions.sort();
+    Ok(versions)
+}
+
+/// Whether the declared package is installed by Homebrew: a version directory under its rack in
+/// the Cellar (a formula) or the Caskroom (a cask), as `brew list` itself decides. Reading the
+/// directories loads no formula or cask, so a tap's code never runs here. A tap-qualified name
+/// is looked up by its short name; `homebrew/core/` names a formula, `homebrew/cask/` a cask.
+fn brew_probe(runner: &Runner, pkg: &str) -> PackageState {
+    let (cellar, caskroom) = match brew_roots(runner) {
+        Ok(r) => r,
+        Err(why) => return PackageState::Unknown(why),
+    };
     let short = pkg.rsplit('/').next().unwrap_or(pkg);
-    let line = text.lines().find_map(|l| {
-        let mut parts = l.split_whitespace();
-        (parts.next() == Some(short)).then(|| parts.collect::<Vec<_>>().join(" "))
-    });
-    match (&out.end, line) {
-        (End::Exited(0), Some(v)) if !v.is_empty() => PackageState::Installed(v),
-        (End::Exited(1), None) if text.trim().is_empty() => PackageState::Missing(Vec::new()),
-        (End::Exited(c), _) => PackageState::Unknown(format!(
-            "brew list exited {c} with an answer the adapter does not read"
-        )),
-        _ => PackageState::Unknown("brew list gave no exit code".into()),
+    let roots = match pkg.rsplit_once('/') {
+        Some(("homebrew/core", _)) => vec![cellar],
+        Some(("homebrew/cask", _)) => vec![caskroom],
+        _ => vec![cellar, caskroom],
+    };
+    let mut versions = Vec::new();
+    for root in &roots {
+        match rack_versions(root, short) {
+            Ok(v) => versions.extend(v),
+            Err(why) => return PackageState::Unknown(why),
+        }
+    }
+    if versions.is_empty() {
+        PackageState::Missing(Vec::new())
+    } else {
+        PackageState::Installed(versions.join(" "))
     }
 }
 
@@ -238,24 +287,19 @@ fn brew_dependencies(runner: &Runner, off: &Official) -> PackageState {
             "brew deps named {bad:?}, which is not a package name"
         ));
     }
-    let (have, missing): (Vec<String>, Vec<String>) = if deps.is_empty() {
-        (Vec::new(), Vec::new())
-    } else {
-        // `brew list --versions` prints the installed ones by short name and exits 1 if any is
-        // absent.
-        let mut args = vec!["list".to_string(), "--versions".into()];
-        args.extend(deps.iter().map(|d| core(d)));
-        let listed = match run("brew list", args, &[0, 1]) {
-            Ok(t) => t,
-            Err(why) => return PackageState::Unknown(why),
-        };
-        let installed: BTreeSet<&str> = listed
-            .lines()
-            .filter_map(|l| l.split_whitespace().next())
-            .collect();
-        deps.into_iter()
-            .partition(|d| installed.contains(d.rsplit('/').next().unwrap_or(d)))
+    // A dependency is installed when its rack in the Cellar holds a version, as for the package.
+    let cellar = match brew_roots(runner) {
+        Ok((cellar, _)) => cellar,
+        Err(why) => return PackageState::Unknown(why),
     };
+    let (mut have, mut missing) = (Vec::new(), Vec::new());
+    for d in deps {
+        match rack_versions(&cellar, &d) {
+            Ok(v) if v.is_empty() => missing.push(d),
+            Ok(_) => have.push(d),
+            Err(why) => return PackageState::Unknown(why),
+        }
+    }
     // Everything the install would add must come as a bottle brew pours on this machine. A cask
     // is not built, so only its missing formulae are asked about.
     let mut args = vec!["info".to_string(), "--json=v2".into()];
@@ -267,20 +311,18 @@ fn brew_dependencies(runner: &Runner, off: &Official) -> PackageState {
         Ok(Some(Vec::new()))
     } else {
         // This machine's bottle tag (`Utils::Bottles.tag`, Homebrew's own code; no formula is
-        // loaded) and its Cellar.
-        let target = run(
+        // loaded).
+        run(
             "brew ruby",
             vec!["ruby".into(), "-e".into(), "puts Utils::Bottles.tag".into()],
             &[0],
         )
         .and_then(|tag| {
-            run("brew --cellar", vec!["--cellar".into()], &[0])
-                .map(|cellar| (tag.trim().to_string(), cellar.trim().to_string()))
-        });
-        target.and_then(|(tag, cellar)| {
-            if tag.is_empty() || cellar.is_empty() {
-                return Err("brew did not report this machine's bottle tag and Cellar".into());
+            let tag = tag.trim().to_string();
+            if tag.is_empty() {
+                return Err("brew did not report this machine's bottle tag".into());
             }
+            let cellar = cellar.display().to_string();
             run("brew info", args, &[0]).map(|t| unbottled(&t, &tag, &cellar))
         })
     };
@@ -778,7 +820,16 @@ mod tests {
         ] {
             assert_eq!(name(&v(good)).unwrap(), good, "{good}");
         }
-        for bad in ["", "-x", "a b", "a;b", &"a".repeat(129)] {
+        for bad in [
+            "",
+            "-x",
+            "a b",
+            "a;b",
+            "..",
+            "a/../b",
+            "a//b",
+            &"a".repeat(129),
+        ] {
             assert_eq!(
                 name(&v(bad)).unwrap_err().code,
                 Code::ManifestInvalid,
