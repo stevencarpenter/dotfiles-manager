@@ -138,6 +138,10 @@ pub enum PackageState {
     /// The declared provider does not list it, and installing it would upgrade these installed
     /// dependencies. A package plan upgrades nothing, so this blocks it.
     Upgrades(Vec<String>),
+    /// The declared provider does not list it, and these (the package or a missing dependency)
+    /// have no prebuilt binary for this machine. A source build adds build-time dependencies the
+    /// listing does not name, so the plan could not show them; this blocks it.
+    SourceBuild(Vec<String>),
     /// The declared provider does not list it, but an executable of that name exists elsewhere:
     /// a declared owner is not permission to replace another owner (DESIGN.md section 8).
     OtherOwner(String),
@@ -150,6 +154,24 @@ pub enum PackageState {
 }
 
 impl PackageState {
+    /// Whether a probe at apply time still matches the planned precondition `want`: the same
+    /// state, or `missing` with a subset of the planned dependencies. An earlier install in the
+    /// same run can add a dependency two packages share; that is not a stale plan.
+    pub fn still_planned(&self, want: &str) -> bool {
+        if self.state() == want {
+            return true;
+        }
+        let PackageState::Missing(now) = self else {
+            return false;
+        };
+        let planned: BTreeSet<&str> = match want.strip_prefix("missing:with=") {
+            Some(list) => list.split(',').collect(),
+            None if want == "missing" => BTreeSet::new(),
+            None => return false,
+        };
+        now.iter().all(|d| planned.contains(d.as_str()))
+    }
+
     /// The precondition string apply compares after it probes again.
     pub fn state(&self) -> String {
         match self {
@@ -157,6 +179,7 @@ impl PackageState {
             PackageState::Missing(d) if d.is_empty() => "missing".into(),
             PackageState::Missing(d) => format!("missing:with={}", d.join(",")),
             PackageState::Upgrades(d) => format!("upgrades:{}", d.join(",")),
+            PackageState::SourceBuild(d) => format!("source-build:{}", d.join(",")),
             PackageState::OtherOwner(w) => format!("other-owner:{w}"),
             PackageState::Unsupported(w) => format!("unsupported:{w}"),
             PackageState::Unknown(w) => format!("unknown:{w}"),
@@ -1050,6 +1073,20 @@ impl Planner<'_> {
                     subject: probe,
                     state: PackageState::Missing(deps).state(),
                 });
+            }
+            Some(PackageState::SourceBuild(names)) => {
+                let f = fail(
+                    Code::PlatformUnsupported,
+                    "/name",
+                    format!(
+                        "{name} is not installed, and {} has no prebuilt binary for this machine with {}; a source build adds build-time dependencies the plan cannot show",
+                        names.join(", "),
+                        r.adapter
+                    ),
+                    "install it by hand with the provider, then run packages again",
+                );
+                op.effect = format!("blocked: {}", f.detail);
+                self.blocker(r, None, f);
             }
             Some(PackageState::Upgrades(deps)) => {
                 let f = fail(
@@ -2064,6 +2101,7 @@ mod tests {
             PackageState::Missing(Vec::new()),
             PackageState::Missing(vec!["aom".into(), "libheif".into()]),
             PackageState::Upgrades(vec!["libpng".into()]),
+            PackageState::SourceBuild(vec!["afuse".into()]),
             PackageState::OtherOwner("x".into()),
             PackageState::Unsupported("root".into()),
             PackageState::Unknown("timeout".into()),
@@ -2073,6 +2111,14 @@ mod tests {
         assert_eq!(strings.len(), states.len());
         assert_eq!(PackageState::Missing(Vec::new()).state(), "missing");
         assert_eq!(states[2].state(), "missing:with=aom,libheif");
+        // A dependency an earlier install added is not a stale plan; a new one is.
+        let want = states[2].state();
+        assert!(PackageState::Missing(vec!["libheif".into()]).still_planned(&want));
+        assert!(PackageState::Missing(Vec::new()).still_planned(&want));
+        assert!(!PackageState::Missing(vec!["x265".into()]).still_planned(&want));
+        assert!(!PackageState::Missing(vec!["aom".into()]).still_planned("missing"));
+        assert!(PackageState::Missing(Vec::new()).still_planned("missing"));
+        assert!(!PackageState::Upgrades(vec!["aom".into()]).still_planned(&want));
         assert_eq!(states[0].state(), "installed:1.2");
     }
 

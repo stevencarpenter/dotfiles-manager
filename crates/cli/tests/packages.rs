@@ -44,8 +44,10 @@ update_policy = "rolling"
 /// `brew list --versions <name>...` answers from `installed-brew` and prints the short names, as
 /// brew does for a tap-qualified name, exiting 1 if any is absent; `brew deps <name>` answers
 /// from `deps-<name>`; `brew outdated --json=v2 <name>...` reports the names listed in
-/// `outdated-brew` and exits 1 when there is one; `brew install <name>` appends, or does nothing
-/// with the `noop` marker, or fails with the `fail` marker.
+/// `outdated-brew` and exits 1 when there is one; `brew info --json=v2 <name>...` reports a
+/// bottle for every name except those in `nobottle-brew`; `brew install <name>` appends the
+/// name and its missing dependencies, or does nothing with the `noop` marker, or fails with the
+/// `fail` marker.
 const FAKE_BREW: &str = r#"#!/bin/sh
 PATH=/usr/bin:/bin:$PATH
 here=$(dirname "$0")
@@ -70,9 +72,19 @@ case "$1" in
       fi
     done
     printf '],"casks":[]}\n'; exit $rc ;;
+  info)
+    shift 2; sep=""; printf '{"formulae":['
+    for n in "$@"; do
+      if grep -qx "$n" "$here/../nobottle-brew" 2>/dev/null; then b='{}'; else b='{"stable":{"files":{"arm64_test":{}}}}'; fi
+      printf '%s{"name":"%s","bottle":%s}' "$sep" "$n" "$b"; sep=","
+    done
+    printf '],"casks":[]}\n'; exit 0 ;;
   install)
     [ -e "$here/../fail" ] && { echo "Error: PLANTED-STDERR" >&2; exit 1; }
     [ -e "$here/../noop" ] && exit 0
+    for d in $(cat "$here/../deps-${2##*/}" 2>/dev/null); do
+      grep -q "^$d " "$db" 2>/dev/null || echo "$d 1.0.0" >> "$db"
+    done
     echo "${2##*/} 1.0.0" >> "$db"; echo "==> Installing $2"; exit 0 ;;
   *) exit 64 ;;
 esac
@@ -499,6 +511,28 @@ fn brew_dependencies_are_planned_when_missing_and_block_when_an_install_would_up
     assert_eq!(code(&o), 3, "{}\n{}", stderr(&o), text(&o.stdout));
     assert!(stderr(&o).contains("E_PLAN_STALE"), "{}", stderr(&o));
     assert!(!fx.log().contains("brew install"), "{}", fx.log());
+    // A missing dependency without a bottle for this machine would be built from source, with
+    // build-time dependencies the listing does not name: the plan is blocked.
+    assert!(
+        fx.log().contains("brew info --json=v2 atuin aom |"),
+        "{}",
+        fx.log()
+    );
+    fs::write(fx.fake.path().join("deps-atuin"), "libpng\naom\n").unwrap();
+    fs::write(fx.fake.path().join("nobottle-brew"), "aom\n").unwrap();
+    let o = fx.preview();
+    assert_eq!(code(&o), 3, "{}\n{}", stderr(&o), text(&o.stdout));
+    assert!(
+        stderr(&o).contains("E_PLATFORM_UNSUPPORTED"),
+        "{}",
+        stderr(&o)
+    );
+    assert!(
+        stderr(&o).contains("aom has no prebuilt binary"),
+        "{}",
+        stderr(&o)
+    );
+    fs::remove_file(fx.fake.path().join("nobottle-brew")).unwrap();
     // An installed dependency the install would upgrade blocks the plan.
     fs::write(fx.fake.path().join("outdated-brew"), "libpng\n").unwrap();
     let o = fx.preview();
@@ -509,6 +543,37 @@ fn brew_dependencies_are_planned_when_missing_and_block_when_an_install_would_up
         "{}",
         stderr(&o)
     );
+}
+
+#[test]
+fn two_formulae_that_share_a_missing_dependency_are_both_installed() {
+    let fx = Fx::new();
+    // Both packages are Homebrew formulae that need aom. The first install adds it, so the
+    // second one's probe under the lock no longer lists it: that is not a stale plan.
+    fx.put(
+        "base/modules/extra/module.toml",
+        &EXTRA.replace("adapter = \"mise/v1\"", "adapter = \"homebrew/v1\""),
+    );
+    fx.installed("brew", "");
+    fx.installed("mise", "");
+    for p in ["atuin", "duckdb"] {
+        fs::write(fx.fake.path().join(format!("deps-{p}")), "aom\n").unwrap();
+    }
+    let o = fx.preview();
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+    let t = text(&o.stdout);
+    assert_eq!(
+        t.matches("and its missing dependencies aom").count(),
+        2,
+        "{t}"
+    );
+    let o = fx.packages(&digest_of(&o));
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+    let out = text(&o.stdout);
+    assert!(out.contains(&format!("updated {BREW_OP}")), "{out}");
+    assert!(out.contains(&format!("updated {MISE_OP}")), "{out}");
+    let db = fs::read_to_string(fx.fake.path().join("installed-brew")).unwrap();
+    assert_eq!(db.matches("aom ").count(), 1, "{db}");
 }
 
 #[test]

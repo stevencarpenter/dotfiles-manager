@@ -1491,7 +1491,7 @@ impl Exec<'_, '_> {
         let now = self.run.generator.probe(op).map_err(failed)?;
         match &now {
             PackageState::Installed(_) => return Ok(Ended::Current),
-            s if s.state() == want => {}
+            s if s.still_planned(want) => {}
             // The provider could not answer now: that is the probe's failure, not a stale plan.
             PackageState::Unknown(why) => {
                 return Err(blocked(

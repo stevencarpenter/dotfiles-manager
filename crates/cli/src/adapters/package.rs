@@ -145,8 +145,10 @@ fn brew_probe(runner: &Runner, pkg: &str) -> PackageState {
 
 /// What `brew install <pkg>` would do to the formula's dependencies, from local data only (no
 /// download, auto-update is off): `brew deps <pkg>` lists them, `brew list --versions` says which
-/// are installed, and `brew outdated --json=v2` which installed ones the install would upgrade.
-/// The missing ones become part of the plan; an outdated one blocks it.
+/// are installed, `brew info --json=v2` whether the package and the missing ones have a bottle
+/// for this machine, and `brew outdated --json=v2` which installed ones the install would
+/// upgrade. The missing ones become part of the plan. A source build blocks it, because its
+/// build-time dependencies are not in the listing; so does an outdated dependency.
 fn brew_dependencies(runner: &Runner, pkg: &str) -> PackageState {
     let env = brew_env();
     let run = |what: &str, args: Vec<String>, ok: &[i32]| -> Result<String, String> {
@@ -171,23 +173,37 @@ fn brew_dependencies(runner: &Runner, pkg: &str) -> PackageState {
             "brew deps named {bad:?}, which is not a package name"
         ));
     }
-    if deps.is_empty() {
-        return PackageState::Missing(Vec::new());
-    }
-    // `brew list --versions` prints the installed ones by short name and exits 1 if any is absent.
-    let mut args = vec!["list".to_string(), "--versions".into()];
-    args.extend(deps.iter().cloned());
-    let listed = match run("brew list", args, &[0, 1]) {
-        Ok(t) => t,
-        Err(why) => return PackageState::Unknown(why),
+    let (have, missing): (Vec<String>, Vec<String>) = if deps.is_empty() {
+        (Vec::new(), Vec::new())
+    } else {
+        // `brew list --versions` prints the installed ones by short name and exits 1 if any is
+        // absent.
+        let mut args = vec!["list".to_string(), "--versions".into()];
+        args.extend(deps.iter().cloned());
+        let listed = match run("brew list", args, &[0, 1]) {
+            Ok(t) => t,
+            Err(why) => return PackageState::Unknown(why),
+        };
+        let installed: BTreeSet<&str> = listed
+            .lines()
+            .filter_map(|l| l.split_whitespace().next())
+            .collect();
+        deps.into_iter()
+            .partition(|d| installed.contains(d.rsplit('/').next().unwrap_or(d)))
     };
-    let installed: BTreeSet<&str> = listed
-        .lines()
-        .filter_map(|l| l.split_whitespace().next())
-        .collect();
-    let (have, missing): (Vec<String>, Vec<String>) = deps
-        .into_iter()
-        .partition(|d| installed.contains(d.rsplit('/').next().unwrap_or(d)));
+    // Everything the install would add must come as a bottle for this machine.
+    let mut args = vec!["info".to_string(), "--json=v2".into(), pkg.into()];
+    args.extend(missing.iter().cloned());
+    match run("brew info", args, &[0]).map(|t| unbottled(&t)) {
+        Ok(Some(n)) if n.is_empty() => {}
+        Ok(Some(n)) => return PackageState::SourceBuild(n),
+        Ok(None) => {
+            return PackageState::Unknown(format!(
+                "brew info --json=v2 for {pkg} is not the answer the adapter reads"
+            ));
+        }
+        Err(why) => return PackageState::Unknown(why),
+    }
     if have.is_empty() {
         return PackageState::Missing(missing);
     }
@@ -208,6 +224,26 @@ fn brew_dependencies(runner: &Runner, pkg: &str) -> PackageState {
     } else {
         PackageState::Upgrades(outdated)
     }
+}
+
+/// The formulae in a `brew info --json=v2` answer that have no bottle for this machine, or
+/// `None` when it is not that shape. Homebrew reports only this machine's bottle tags, so an
+/// empty file list means a source build. A cask has no source build.
+fn unbottled(text: &str) -> Option<Vec<String>> {
+    let v: serde_json::Value = serde_json::from_str(text).ok()?;
+    let mut out = Vec::new();
+    for f in v.get("formulae")?.as_array()? {
+        let name = f.get("name")?.as_str()?;
+        let files = f
+            .get("bottle")?
+            .get("stable")
+            .and_then(|s| s.get("files"))
+            .and_then(serde_json::Value::as_object);
+        if files.is_none_or(|m| m.is_empty()) {
+            out.push(name.to_string());
+        }
+    }
+    Some(out)
 }
 
 /// The formula and cask names in a `brew outdated --json=v2` answer, or `None` when it is not
@@ -496,6 +532,23 @@ mod tests {
             ("npm:@scope/pkg", "1.2")
         );
         assert_eq!(tool_and_version("@odd"), ("@odd", ""));
+    }
+
+    #[test]
+    fn a_formula_without_a_bottle_for_this_machine_is_a_source_build() {
+        let t = r#"{"formulae":[
+            {"name":"imagemagick","bottle":{"stable":{"files":{"arm64_golden_gate":{}}}}},
+            {"name":"afuse","bottle":{}}],"casks":[{"token":"x"}]}"#;
+        assert_eq!(unbottled(t), Some(vec!["afuse".to_string()]));
+        assert_eq!(unbottled(r#"{"formulae":[],"casks":[]}"#), Some(vec![]));
+        for bad in [
+            "",
+            "{}",
+            r#"{"formulae":[{"bottle":{}}]}"#,
+            r#"{"formulae":[{"name":"x"}]}"#,
+        ] {
+            assert_eq!(unbottled(bad), None, "{bad:?}");
+        }
     }
 
     #[test]
