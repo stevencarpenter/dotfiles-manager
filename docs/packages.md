@@ -52,7 +52,7 @@ A probe that cannot run (program not found or failed its checks), times out, or 
 | --- | --- |
 | Command shape | A separate `packages` command. DESIGN.md names `sync` as the command that composes provisioning; `sync` is DFM-30, and `packages` is the package part of it. |
 | Versions and pins | Not read and not written. The value schema has no version field and the source lock has no package pin yet (DFM-31). Install means "make present". |
-| Interrupted install | The intent has no path, so recovery cannot probe it: the resource blocks (`E_OP_INTERRUPTED`) until `state resolve <journal-id> --as failed`, then the next `packages` run probes and installs again. |
+| Interrupted install | The intent has no path, so recovery cannot probe it: the resource blocks (`E_OP_INTERRUPTED`) until `state resolve <journal-id> --as failed`, even when the provider lists it as installed. The next `packages` run probes and installs only if missing. |
 | Probes at plan time | The `packages` command runs them before it plans; the read-only commands do not. Architecture section 8 names "a package installed-version listing" as a candidate probe to verify in implementation; the two listings here are verified by their fixture tests against look-alikes, and `brew list --versions` (plain and tap-qualified) and `mise ls --installed` were run by hand against the real tools once. |
 | `apt/v1` | Probe only. No privileged adapter exists (architecture section 15: no Linux provider in this contract). The binary runs only on macOS, where the probe program does not exist, so an apt resource in a plan is `E_PROBE_FAILED`. |
 | Owner check | By executable name only (above). |

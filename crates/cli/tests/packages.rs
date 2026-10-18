@@ -783,6 +783,56 @@ fn an_apt_package_is_probed_with_dpkg_query_and_never_installed() {
 }
 
 #[test]
+fn an_installed_package_with_an_unresolved_install_stays_blocked_until_resolved() {
+    for (provider, op_id) in [("brew", BREW_OP), ("mise", MISE_OP)] {
+        let fx = Fx::new();
+        fx.installed("brew", if provider == "brew" { "" } else { "atuin 1\n" });
+        fx.installed("mise", if provider == "mise" { "" } else { "duckdb 1\n" });
+        let d = digest_of(&fx.preview());
+        // The provider finished, but the manager never recorded the outcome.
+        let crash = fx
+            .cmd(&["packages", "--root", fx.root_arg(), "--yes-plan", &d])
+            .env("DFM_FAILPOINT", "apply-after-effect:abort")
+            .output()
+            .unwrap();
+        assert!(!crash.status.success());
+        let journal = fx.state().join("journal.jsonl");
+        let intent: serde_json::Value = serde_json::from_str(
+            fs::read_to_string(&journal)
+                .unwrap()
+                .lines()
+                .last()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(intent["phase"], "intent");
+        let id = intent["op_id"].as_str().unwrap();
+        let installs = || fx.log().lines().filter(|l| l.contains(" install ")).count();
+        assert_eq!(installs(), 1);
+        let d = digest_of(&fx.preview());
+        for _ in 0..2 {
+            let o = fx.packages(&d);
+            assert_ne!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+            assert!(stderr(&o).contains("E_OP_INTERRUPTED"), "{}", stderr(&o));
+            let out = text(&o.stdout);
+            assert!(out.contains(&format!("blocked {op_id}")), "{out}");
+            assert!(!out.contains("result: ok"), "{out}");
+            assert!(stderr(&o).contains(id), "{}", stderr(&o));
+            assert_eq!(installs(), 1, "the unresolved install must not run again");
+        }
+        let o = fx.run(&["state", "recover"]);
+        assert_eq!(code(&o), 3, "{}\n{}", stderr(&o), text(&o.stdout));
+        assert!(text(&o.stdout).contains(id));
+        let o = fx.run(&["state", "resolve", id, "--as", "failed"]);
+        assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+        let o = fx.packages(&digest_of(&fx.preview()));
+        assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+        assert!(text(&o.stdout).contains(&format!("current {op_id}")));
+        assert_eq!(installs(), 1, "resolution must not reinstall the package");
+    }
+}
+
+#[test]
 fn a_stop_that_cuts_off_the_postcondition_is_reported_as_the_stop() {
     let fx = Fx::new();
     fx.installed("brew", "");

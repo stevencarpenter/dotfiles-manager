@@ -1466,22 +1466,28 @@ impl Exec<'_, '_> {
         })
     }
 
-    /// A package install (docs/packages.md). The provider is probed again under the lock: a
-    /// package that is installed now is `current`, any other change blocks. Then the intent entry
-    /// (no path: the provider's listing is the record), the install, a third probe as the
-    /// postcondition, and the outcome entry. No ledger entry is written.
-    fn try_install(&mut self, op: &Operation) -> Result<Ended, Ended> {
+    /// An unresolved install blocks a package even when the provider now lists it as installed.
+    fn unknown_install(&self, op: &Operation) -> Result<(), Ended> {
         if let Some(id) = self.unknown_resources.get(&op.resource) {
             return Err(blocked(
                 Code::OpInterrupted,
                 format!(
-                    "{}: resource {} has an unknown outcome (journal id {id}) with no intent record. Nothing was changed. Fix: check the provider's state, then run `dotfiles-manager state resolve {} --as failed`",
+                    "{}: resource {} has an unknown outcome (journal id {id}) with no recorded output path. Nothing was changed. Fix: check the provider's state, then run `dotfiles-manager state resolve {} --as failed`",
                     op.id,
                     op.resource,
                     recover::quoted(id)
                 ),
             ));
         }
+        Ok(())
+    }
+
+    /// A package install (docs/packages.md). The provider is probed again under the lock: a
+    /// package that is installed now is `current`, any other change blocks. Then the intent entry
+    /// (no path: the provider's listing is the record), the install, a third probe as the
+    /// postcondition, and the outcome entry. No ledger entry is written.
+    fn try_install(&mut self, op: &Operation) -> Result<Ended, Ended> {
+        self.unknown_install(op)?;
         let want = op
             .preconditions
             .iter()
@@ -2086,8 +2092,11 @@ fn execute(run: &Run<'_>, plan: &Plan) -> Report {
             _ => {
                 let started = ex.now();
                 let ended = if op.status == PlanStatus::Current {
-                    // A stale ledger entry is dropped only while the run is still going.
-                    if stopped.is_none() && op.action == Action::Remove {
+                    // A provider listing does not settle an interrupted install's journal entry.
+                    if op.path.is_none() {
+                        ex.unknown_install(op).err().unwrap_or(Ended::Current)
+                    } else if stopped.is_none() && op.action == Action::Remove {
+                        // A stale ledger entry is dropped only while the run is still going.
                         ex.prune(op)
                     } else {
                         Ended::Current
