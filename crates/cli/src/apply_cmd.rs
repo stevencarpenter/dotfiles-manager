@@ -205,10 +205,7 @@ fn run_inner(
     // A packages plan needs the providers' answers first (docs/packages.md). The probes are
     // read-only and run only for this scope.
     let probes = |resolved: &dfm_model::resolve::Resolved| match args.scope {
-        Scope::Packages => Ok(crate::adapters::package::package_facts(
-            resolved,
-            &ctx.runner(&sys),
-        )),
+        Scope::Packages => crate::adapters::package::package_facts(resolved, &ctx.runner(&sys)),
         _ => Ok::<_, Refusal>(BTreeMap::new()),
     };
     let plan = plan_for(ctx, &first, args.scope, probes(&first.resolved)?)?;

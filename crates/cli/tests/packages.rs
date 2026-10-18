@@ -51,6 +51,7 @@ printf 'brew %s | auto=%s analytics=%s hints=%s cleanup=%s upgrade=%s user=%s\n'
 db="$here/../installed-brew"
 case "$1" in
   list)
+    [ -e "$here/../stop" ] && kill -TERM $PPID
     name=${3##*/}
     v=$(grep "^$name " "$db" 2>/dev/null | head -1)
     if [ -n "$v" ]; then echo "$v"; exit 0; fi
@@ -440,6 +441,23 @@ fn the_owner_check_survives_a_home_that_resembles_a_provider_and_a_noop_install_
     let o = fx.preview();
     assert_eq!(code(&o), 3, "{}", stderr(&o));
     assert!(stderr(&o).contains("E_MANIFEST_INVALID"), "{}", stderr(&o));
+}
+
+#[test]
+fn a_stop_request_during_a_probe_ends_the_probing_and_exits_143() {
+    let fx = Fx::new();
+    fx.installed("brew", "atuin 1\n");
+    fx.installed("mise", "duckdb 1\n");
+    // The brew look-alike (the first probe) sends SIGTERM to the manager. The mise probe must
+    // not start, and the run exits as terminated, before any write.
+    fs::write(fx.fake.path().join("stop"), "").unwrap();
+    let o = fx.preview();
+    assert_eq!(code(&o), 143, "{}\n{}", stderr(&o), text(&o.stdout));
+    assert!(stderr(&o).contains("E_TERMINATED"), "{}", stderr(&o));
+    let log = fx.log();
+    assert!(log.contains("brew list"), "{log}");
+    assert!(!log.contains("mise "), "{log}");
+    assert!(fx.receipts().is_empty());
 }
 
 #[test]

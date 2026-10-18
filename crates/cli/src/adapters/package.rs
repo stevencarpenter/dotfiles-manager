@@ -330,21 +330,30 @@ pub fn install(runner: &Runner, adapter: &str, value: &Value) -> Result<(), Refu
     }
 }
 
-/// Probes every selected package resource for a packages plan, by resource id.
-pub fn package_facts(resolved: &Resolved, runner: &Runner) -> BTreeMap<String, PackageState> {
-    resolved
+/// Probes every selected package resource for a packages plan, by resource id. A stop request
+/// (SIGINT or SIGTERM to the manager) ends the probing: the probe it arrived in is ended by
+/// the runner, no further provider is started, and the request is the error.
+pub fn package_facts(
+    resolved: &Resolved,
+    runner: &Runner,
+) -> Result<BTreeMap<String, PackageState>, Refusal> {
+    let mut out = BTreeMap::new();
+    for r in resolved
         .resources
         .values()
         .filter(|r| Scope::Packages.covers(r))
-        .map(|r| {
-            let state = match probe(runner, &r.adapter, &r.value) {
-                Ok(s) => s,
-                Err(e) if e.code == Code::ManifestInvalid => PackageState::Refused(e.detail),
-                Err(e) => PackageState::Unknown(e.detail),
-            };
-            (r.id.clone(), state)
-        })
-        .collect()
+    {
+        if let Some(stop) = dfm_engine::signal::requested() {
+            return Err(stop);
+        }
+        let state = match probe(runner, &r.adapter, &r.value) {
+            Ok(s) => s,
+            Err(e) if e.code == Code::ManifestInvalid => PackageState::Refused(e.detail),
+            Err(e) => PackageState::Unknown(e.detail),
+        };
+        out.insert(r.id.clone(), state);
+    }
+    Ok(out)
 }
 
 #[cfg(test)]
