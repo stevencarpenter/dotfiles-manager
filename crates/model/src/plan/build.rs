@@ -130,8 +130,14 @@ pub enum SecretVerdict {
 pub enum PackageState {
     /// The declared provider lists it, with the version it reports.
     Installed(String),
-    /// The declared provider does not list it and no other owner was seen.
-    Missing,
+    /// The declared provider does not list it and no other owner was seen. The names are the
+    /// dependencies the install would add with it (empty when there are none, or when the
+    /// provider has no dependency listing). They are part of the plan, so the reviewer approves
+    /// them too.
+    Missing(Vec<String>),
+    /// The declared provider does not list it, and installing it would upgrade these installed
+    /// dependencies. A package plan upgrades nothing, so this blocks it.
+    Upgrades(Vec<String>),
     /// The declared provider does not list it, but an executable of that name exists elsewhere:
     /// a declared owner is not permission to replace another owner (DESIGN.md section 8).
     OtherOwner(String),
@@ -148,7 +154,9 @@ impl PackageState {
     pub fn state(&self) -> String {
         match self {
             PackageState::Installed(v) => format!("installed:{v}"),
-            PackageState::Missing => "missing".into(),
+            PackageState::Missing(d) if d.is_empty() => "missing".into(),
+            PackageState::Missing(d) => format!("missing:with={}", d.join(",")),
+            PackageState::Upgrades(d) => format!("upgrades:{}", d.join(",")),
             PackageState::OtherOwner(w) => format!("other-owner:{w}"),
             PackageState::Unsupported(w) => format!("unsupported:{w}"),
             PackageState::Unknown(w) => format!("unknown:{w}"),
@@ -1027,16 +1035,35 @@ impl Planner<'_> {
                 op.status = Status::Current;
                 op.effect = format!("{name} is installed by {} ({v})", r.adapter);
             }
-            Some(PackageState::Missing) => {
+            Some(PackageState::Missing(deps)) => {
                 op.action = Action::Install;
                 op.status = Status::Planned;
+                let with = if deps.is_empty() {
+                    String::new()
+                } else {
+                    format!(" and its missing dependencies {}", deps.join(", "))
+                };
                 op.effect = format!(
-                    "install {shown}: the provider's current version; nothing is upgraded or downgraded"
+                    "install {shown}{with}: the provider's current versions; nothing installed is upgraded or downgraded"
                 );
                 op.preconditions.push(Precondition {
                     subject: probe,
-                    state: PackageState::Missing.state(),
+                    state: PackageState::Missing(deps).state(),
                 });
+            }
+            Some(PackageState::Upgrades(deps)) => {
+                let f = fail(
+                    Code::Conflict,
+                    "/name",
+                    format!(
+                        "{name} is not installed, and installing it with {} would upgrade the installed dependencies {}; a package plan upgrades nothing",
+                        r.adapter,
+                        deps.join(", ")
+                    ),
+                    "upgrade those dependencies with the provider yourself, then run packages again",
+                );
+                op.effect = format!("blocked: {}", f.detail);
+                self.blocker(r, None, f);
             }
             Some(PackageState::OtherOwner(why)) => {
                 let f = fail(
@@ -2034,7 +2061,9 @@ mod tests {
     fn a_package_state_has_one_precondition_string_per_variant() {
         let states = [
             PackageState::Installed("1.2".into()),
-            PackageState::Missing,
+            PackageState::Missing(Vec::new()),
+            PackageState::Missing(vec!["aom".into(), "libheif".into()]),
+            PackageState::Upgrades(vec!["libpng".into()]),
             PackageState::OtherOwner("x".into()),
             PackageState::Unsupported("root".into()),
             PackageState::Unknown("timeout".into()),
@@ -2042,7 +2071,8 @@ mod tests {
         ];
         let strings: BTreeSet<String> = states.iter().map(PackageState::state).collect();
         assert_eq!(strings.len(), states.len());
-        assert_eq!(PackageState::Missing.state(), "missing");
+        assert_eq!(PackageState::Missing(Vec::new()).state(), "missing");
+        assert_eq!(states[2].state(), "missing:with=aom,libheif");
         assert_eq!(states[0].state(), "installed:1.2");
     }
 

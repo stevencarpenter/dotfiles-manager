@@ -10,7 +10,7 @@ use dfm_engine::{End, ProcOutput, ProcRequest, Runner};
 use dfm_model::plan::{PackageState, Scope};
 use dfm_model::resolve::{Resolved, Value};
 use dfm_model::{Code, Refusal};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -69,19 +69,23 @@ pub fn name(value: &Value) -> Result<String, Refusal> {
         .get("name")
         .and_then(Value::as_str)
         .ok_or_else(|| Refusal::new(Code::ManifestInvalid, "a package needs name"))?;
-    let ok = !n.is_empty()
-        && n.len() <= 128
-        && !n.starts_with('-')
-        && n.chars().all(|c| {
-            c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '+' | '@' | '/' | ':')
-        });
-    if !ok {
+    if !valid_name(n) {
         return Err(Refusal::new(
             Code::ManifestInvalid,
             "a package name must be letters, digits, '.', '_', '-', '+', '@', '/' or ':', not start with '-', and be at most 128 characters",
         ));
     }
     Ok(n.to_string())
+}
+
+/// Whether `n` is a package name the adapters pass to a provider as an argument.
+fn valid_name(n: &str) -> bool {
+    !n.is_empty()
+        && n.len() <= 128
+        && !n.starts_with('-')
+        && n.chars().all(|c| {
+            c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '+' | '@' | '/' | ':')
+        })
 }
 
 fn request<'a>(
@@ -131,12 +135,92 @@ fn brew_probe(runner: &Runner, pkg: &str) -> PackageState {
     });
     match (&out.end, line) {
         (End::Exited(0), Some(v)) if !v.is_empty() => PackageState::Installed(v),
-        (End::Exited(1), None) if text.trim().is_empty() => PackageState::Missing,
+        (End::Exited(1), None) if text.trim().is_empty() => PackageState::Missing(Vec::new()),
         (End::Exited(c), _) => PackageState::Unknown(format!(
             "brew list exited {c} with an answer the adapter does not read"
         )),
         _ => PackageState::Unknown("brew list gave no exit code".into()),
     }
+}
+
+/// What `brew install <pkg>` would do to the formula's dependencies, from local data only (no
+/// download, auto-update is off): `brew deps <pkg>` lists them, `brew list --versions` says which
+/// are installed, and `brew outdated --json=v2` which installed ones the install would upgrade.
+/// The missing ones become part of the plan; an outdated one blocks it.
+fn brew_dependencies(runner: &Runner, pkg: &str) -> PackageState {
+    let env = brew_env();
+    let run = |what: &str, args: Vec<String>, ok: &[i32]| -> Result<String, String> {
+        let out = runner
+            .run(&request("brew", &args, &env, PROBE_TIMEOUT))
+            .map_err(|e| e.detail)?;
+        if let Some(why) = ended(what, &out) {
+            return Err(why);
+        }
+        match out.end {
+            End::Exited(c) if ok.contains(&c) => Ok(String::from_utf8_lossy(&out.stdout).into()),
+            End::Exited(c) => Err(format!("{what} exited {c} for {pkg}")),
+            _ => Err(format!("{what} gave no exit code")),
+        }
+    };
+    let deps: Vec<String> = match run("brew deps", vec!["deps".into(), pkg.into()], &[0]) {
+        Ok(t) => t.split_whitespace().map(str::to_string).collect(),
+        Err(why) => return PackageState::Unknown(why),
+    };
+    if let Some(bad) = deps.iter().find(|d| !valid_name(d)) {
+        return PackageState::Unknown(format!(
+            "brew deps named {bad:?}, which is not a package name"
+        ));
+    }
+    if deps.is_empty() {
+        return PackageState::Missing(Vec::new());
+    }
+    // `brew list --versions` prints the installed ones by short name and exits 1 if any is absent.
+    let mut args = vec!["list".to_string(), "--versions".into()];
+    args.extend(deps.iter().cloned());
+    let listed = match run("brew list", args, &[0, 1]) {
+        Ok(t) => t,
+        Err(why) => return PackageState::Unknown(why),
+    };
+    let installed: BTreeSet<&str> = listed
+        .lines()
+        .filter_map(|l| l.split_whitespace().next())
+        .collect();
+    let (have, missing): (Vec<String>, Vec<String>) = deps
+        .into_iter()
+        .partition(|d| installed.contains(d.rsplit('/').next().unwrap_or(d)));
+    if have.is_empty() {
+        return PackageState::Missing(missing);
+    }
+    // `brew outdated` exits 1 when it finds an outdated one; the JSON is the answer either way.
+    let mut args = vec!["outdated".to_string(), "--json=v2".into()];
+    args.extend(have.iter().cloned());
+    let outdated = match run("brew outdated", args, &[0, 1]).map(|t| outdated_names(&t)) {
+        Ok(Some(n)) => n,
+        Ok(None) => {
+            return PackageState::Unknown(format!(
+                "brew outdated --json=v2 for the dependencies of {pkg} is not the answer the adapter reads"
+            ));
+        }
+        Err(why) => return PackageState::Unknown(why),
+    };
+    if outdated.is_empty() {
+        PackageState::Missing(missing)
+    } else {
+        PackageState::Upgrades(outdated)
+    }
+}
+
+/// The formula and cask names in a `brew outdated --json=v2` answer, or `None` when it is not
+/// that shape.
+fn outdated_names(text: &str) -> Option<Vec<String>> {
+    let v: serde_json::Value = serde_json::from_str(text).ok()?;
+    let mut out = Vec::new();
+    for key in ["formulae", "casks"] {
+        for e in v.get(key)?.as_array()? {
+            out.push(e.get("name")?.as_str()?.to_string());
+        }
+    }
+    Some(out)
 }
 
 /// `mise ls --installed --json <tool>`: a JSON array with one `{"version", "installed"}` object
@@ -181,7 +265,7 @@ fn mise_probe(runner: &Runner, pkg: &str) -> PackageState {
         .filter(|v| version_matches(v, want))
         .collect();
     if versions.is_empty() {
-        PackageState::Missing
+        PackageState::Missing(Vec::new())
     } else {
         PackageState::Installed(versions.join(" "))
     }
@@ -317,9 +401,10 @@ pub fn probe(runner: &Runner, adapter: &str, value: &Value) -> Result<PackageSta
         }
     };
     Ok(match state {
-        PackageState::Missing => match other_owner(runner, adapter, &pkg) {
+        PackageState::Missing(_) => match other_owner(runner, adapter, &pkg) {
             Ok(Some(why)) => PackageState::OtherOwner(why),
-            Ok(None) => PackageState::Missing,
+            Ok(None) if adapter == HOMEBREW => brew_dependencies(runner, &pkg),
+            Ok(None) => PackageState::Missing(Vec::new()),
             Err(why) => PackageState::Unknown(why),
         },
         s => s,
@@ -411,6 +496,19 @@ mod tests {
             ("npm:@scope/pkg", "1.2")
         );
         assert_eq!(tool_and_version("@odd"), ("@odd", ""));
+    }
+
+    #[test]
+    fn the_brew_outdated_answer_is_read_as_json_only() {
+        let ok = r#"{"formulae":[{"name":"libpng","current_version":"1.7"}],"casks":[]}"#;
+        assert_eq!(outdated_names(ok), Some(vec!["libpng".to_string()]));
+        assert_eq!(
+            outdated_names(r#"{"formulae":[],"casks":[]}"#),
+            Some(vec![])
+        );
+        for bad in ["", "libpng", "{}", r#"{"formulae":[{}],"casks":[]}"#] {
+            assert_eq!(outdated_names(bad), None, "{bad:?}");
+        }
     }
 
     #[test]

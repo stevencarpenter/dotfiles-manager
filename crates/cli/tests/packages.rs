@@ -41,9 +41,11 @@ name = "duckdb"
 update_policy = "rolling"
 "#;
 
-/// `brew list --versions <name>` answers from `installed-brew` and prints the short name, as
-/// brew does for a tap-qualified name; `brew install <name>` appends, or does nothing with the
-/// `noop` marker, or fails with the `fail` marker.
+/// `brew list --versions <name>...` answers from `installed-brew` and prints the short names, as
+/// brew does for a tap-qualified name, exiting 1 if any is absent; `brew deps <name>` answers
+/// from `deps-<name>`; `brew outdated --json=v2 <name>...` reports the names listed in
+/// `outdated-brew` and exits 1 when there is one; `brew install <name>` appends, or does nothing
+/// with the `noop` marker, or fails with the `fail` marker.
 const FAKE_BREW: &str = r#"#!/bin/sh
 PATH=/usr/bin:/bin:$PATH
 here=$(dirname "$0")
@@ -52,10 +54,22 @@ db="$here/../installed-brew"
 case "$1" in
   list)
     [ -e "$here/../stop" ] && kill -TERM $PPID
-    name=${3##*/}
-    v=$(grep "^$name " "$db" 2>/dev/null | head -1)
-    if [ -n "$v" ]; then echo "$v"; exit 0; fi
-    exit 1 ;;
+    shift 2; rc=0
+    for n in "$@"; do
+      v=$(grep "^${n##*/} " "$db" 2>/dev/null | head -1)
+      if [ -n "$v" ]; then echo "$v"; else rc=1; fi
+    done
+    exit $rc ;;
+  deps)
+    cat "$here/../deps-${2##*/}" 2>/dev/null; exit 0 ;;
+  outdated)
+    shift 2; rc=0; sep=""; printf '{"formulae":['
+    for n in "$@"; do
+      if grep -qx "$n" "$here/../outdated-brew" 2>/dev/null; then
+        printf '%s{"name":"%s"}' "$sep" "$n"; sep=","; rc=1
+      fi
+    done
+    printf '],"casks":[]}\n'; exit $rc ;;
   install)
     [ -e "$here/../fail" ] && { echo "Error: PLANTED-STDERR" >&2; exit 1; }
     [ -e "$here/../noop" ] && exit 0
@@ -458,6 +472,43 @@ fn the_owner_check_survives_a_home_that_resembles_a_provider_and_a_noop_install_
     let o = fx.preview();
     assert_eq!(code(&o), 3, "{}", stderr(&o));
     assert!(stderr(&o).contains("E_MANIFEST_INVALID"), "{}", stderr(&o));
+}
+
+#[test]
+fn brew_dependencies_are_planned_when_missing_and_block_when_an_install_would_upgrade_them() {
+    let fx = Fx::new();
+    fx.installed("brew", "libpng 1.6.0\n");
+    fx.installed("mise", "duckdb 1\n");
+    fs::write(fx.fake.path().join("deps-atuin"), "libpng\naom\n").unwrap();
+    // aom is missing: it is part of the planned effect and of the probe precondition.
+    let o = fx.preview();
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+    let t = text(&o.stdout);
+    assert!(t.contains(&format!("planned {BREW_OP}")), "{t}");
+    assert!(t.contains("and its missing dependencies aom"), "{t}");
+    assert!(!t.contains("dependencies libpng"), "{t}");
+    let log = fx.log();
+    assert!(log.contains("brew deps atuin |"), "{log}");
+    assert!(log.contains("brew list --versions libpng aom |"), "{log}");
+    assert!(log.contains("brew outdated --json=v2 libpng |"), "{log}");
+    assert!(!log.contains("brew install"), "{log}");
+    // A dependency that appears after the preview makes the approved plan stale.
+    let d = digest_of(&o);
+    fs::write(fx.fake.path().join("deps-atuin"), "libpng\naom\nx265\n").unwrap();
+    let o = fx.packages(&d);
+    assert_eq!(code(&o), 3, "{}\n{}", stderr(&o), text(&o.stdout));
+    assert!(stderr(&o).contains("E_PLAN_STALE"), "{}", stderr(&o));
+    assert!(!fx.log().contains("brew install"), "{}", fx.log());
+    // An installed dependency the install would upgrade blocks the plan.
+    fs::write(fx.fake.path().join("outdated-brew"), "libpng\n").unwrap();
+    let o = fx.preview();
+    assert_eq!(code(&o), 3, "{}\n{}", stderr(&o), text(&o.stdout));
+    assert!(stderr(&o).contains("E_CONFLICT"), "{}", stderr(&o));
+    assert!(
+        stderr(&o).contains("would upgrade the installed dependencies libpng"),
+        "{}",
+        stderr(&o)
+    );
 }
 
 #[test]
