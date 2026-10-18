@@ -186,16 +186,14 @@ fn run_inner(
     }
     // Read-only look first. A refusal here changes nothing, not even the lock file.
     let first = load_resolved(ctx, root)?;
+    let (layout, sys) = (ctx.layout(), ctx.sys()?);
     // A packages plan needs the providers' answers first (docs/packages.md). The probes are
     // read-only and run only for this scope.
     let probes = |resolved: &dfm_model::resolve::Resolved| match args.scope {
-        Scope::Packages => {
-            let sys = ctx.sys()?;
-            Ok(crate::adapters::package::package_facts(
-                resolved,
-                &ctx.runner(&sys),
-            ))
-        }
+        Scope::Packages => Ok(crate::adapters::package::package_facts(
+            resolved,
+            &ctx.runner(&sys),
+        )),
         _ => Ok::<_, Refusal>(BTreeMap::new()),
     };
     let plan = plan_for(ctx, &first, args.scope, probes(&first.resolved)?)?;
@@ -218,7 +216,6 @@ fn run_inner(
     }
     // The gates that need no write run before the lock and in a preview, so a plan that apply
     // would refuse is refused here with the same code.
-    let (layout, sys) = (ctx.layout(), ctx.sys()?);
     let generators = |resolved| match args.scope {
         Scope::Secrets | Scope::Packages => Generators::with_runner(resolved, ctx.runner(&sys)),
         Scope::Config => Generators::new(resolved),

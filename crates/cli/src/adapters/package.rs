@@ -130,7 +130,7 @@ fn brew_probe(runner: &Runner, pkg: &str) -> PackageState {
 /// `tool@version` is listed by its tool name and counts as installed when an installed version
 /// starts with the declared one (`node@20` matches `20.20.2`).
 fn mise_probe(runner: &Runner, pkg: &str) -> PackageState {
-    let (tool, want) = pkg.split_once('@').unwrap_or((pkg, ""));
+    let (tool, want) = tool_and_version(pkg);
     let args = ["ls".to_string(), "--installed".into(), tool.into()];
     let out = match runner.run(&request("mise", &args, &mise_env(), PROBE_TIMEOUT)) {
         Ok(o) => o,
@@ -185,12 +185,22 @@ fn apt_probe(runner: &Runner, pkg: &str) -> PackageState {
     }
 }
 
+/// A declared name split into the tool and the wanted version: the part after the last `@`,
+/// when that part is a version and not a path. A scoped npm tool (`npm:@scope/pkg`) keeps its
+/// `@` and has no version; `npm:@scope/pkg@1.2` has one.
+fn tool_and_version(pkg: &str) -> (&str, &str) {
+    match pkg.rsplit_once('@') {
+        Some((tool, version)) if !tool.is_empty() && !version.contains('/') => (tool, version),
+        _ => (pkg, ""),
+    }
+}
+
 /// The executable name a package is looked for under: the last `/` component of a tap or
-/// backend-qualified name, without a `@version` suffix (`homebrew/core/atuin` and `node@20`
-/// give `atuin` and `node`).
+/// backend-qualified name, without a `@version` suffix (`homebrew/core/atuin`, `node@20` and
+/// `npm:@scope/pkg` give `atuin`, `node` and `pkg`).
 fn leaf(pkg: &str) -> &str {
-    let last = pkg.rsplit('/').next().unwrap_or(pkg);
-    last.split('@').next().unwrap_or(last)
+    let (tool, _) = tool_and_version(pkg);
+    tool.rsplit('/').next().unwrap_or(tool)
 }
 
 /// Directories where another owner can have put an executable of the package's name: the other
@@ -323,6 +333,20 @@ mod tests {
         assert_eq!(leaf("homebrew/core/atuin"), "atuin");
         assert_eq!(leaf("node@20"), "node");
         assert_eq!(leaf("npm:left-pad"), "npm:left-pad");
+        assert_eq!(leaf("npm:@scope/pkg"), "pkg");
+        assert_eq!(leaf("npm:@scope/pkg@1.2"), "pkg");
+    }
+
+    #[test]
+    fn a_version_is_only_what_follows_the_last_at_sign_outside_a_path() {
+        assert_eq!(tool_and_version("node"), ("node", ""));
+        assert_eq!(tool_and_version("node@20"), ("node", "20"));
+        assert_eq!(tool_and_version("npm:@scope/pkg"), ("npm:@scope/pkg", ""));
+        assert_eq!(
+            tool_and_version("npm:@scope/pkg@1.2"),
+            ("npm:@scope/pkg", "1.2")
+        );
+        assert_eq!(tool_and_version("@odd"), ("@odd", ""));
     }
 
     #[test]

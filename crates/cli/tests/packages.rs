@@ -72,7 +72,8 @@ db="$here/../installed-mise"
 case "$1" in
   ls)
     name=$3
-    case "$name" in *@*) echo "mise ERROR $name not found in mise tool registry" >&2; exit 1 ;; esac
+    v=${name##*@}
+    case "$v" in */*) ;; *) [ "$v" != "$name" ] && { echo "mise ERROR $name not found in mise tool registry" >&2; exit 1; } ;; esac
     [ "$name" = "zzz-unknown" ] && { echo "mise ERROR $name not found in mise tool registry" >&2; exit 1; }
     grep "^$name " "$db" 2>/dev/null
     exit 0 ;;
@@ -359,6 +360,24 @@ fn qualified_names_are_probed_by_their_short_name_and_installed_in_full() {
     assert!(log.contains("mise ls --installed duckdb |"), "{log}");
     assert!(log.contains("mise install duckdb@2 |"), "{log}");
     assert!(text(&o.stdout).contains(&format!("updated {MISE_OP}")));
+    // A scoped npm tool keeps its `@`: it is listed in full and current when installed.
+    fx.put(
+        "base/modules/extra/module.toml",
+        &EXTRA.replace("name = \"duckdb\"", "name = \"npm:@scope/acp\""),
+    );
+    fx.installed("mise", "npm:@scope/acp  0.79.0\n");
+    let o = fx.preview();
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+    assert!(
+        text(&o.stdout).contains(&format!("current {MISE_OP}")),
+        "{}",
+        text(&o.stdout)
+    );
+    assert!(
+        fx.log().contains("mise ls --installed npm:@scope/acp |"),
+        "{}",
+        fx.log()
+    );
 }
 
 #[test]
