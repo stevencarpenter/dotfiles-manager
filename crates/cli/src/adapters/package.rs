@@ -250,8 +250,8 @@ fn brew_official(runner: &Runner, pkg: &str) -> Result<Option<Official>, String>
 }
 
 /// What `brew install <pkg>` would do to the formula's dependencies, from local data only (no
-/// download, auto-update is off): `brew deps <pkg>` lists them, `brew list --versions` says which
-/// are installed, `brew info --json=v2` whether the package and the missing ones have a bottle
+/// download, auto-update is off): `brew deps <pkg>` lists them, their Cellar racks say which are
+/// installed, `brew info --json=v2` whether the package and the missing ones have a bottle
 /// for this machine, and `brew outdated --json=v2` which installed ones the install would
 /// upgrade. The missing ones become part of the plan. A source build blocks it, because its
 /// build-time dependencies are not in the listing; so does an outdated dependency.
