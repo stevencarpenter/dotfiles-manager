@@ -8,7 +8,7 @@ Task: DFM-22, the `op-template/v1` adapter and the `secrets` command. This docum
 | --- | --- |
 | `Scope` (`config`, `secrets`, `packages`) and the secret decision (`decide_secret`) | `crates/model/src/plan/build.rs` |
 | Plan-time verdict on the destination (`secret_facts`), the session check (`credentials`) and the render (`render`) | `crates/cli/src/adapters/secret.rs` |
-| The bounded child-process runner (fixed search path, rebuilt environment, process group, timeout, stop request) | `crates/engine/src/proc.rs`, `crates/engine/src/signal.rs` (`kill_group`) |
+| The bounded child-process runner (fixed search path, rebuilt environment, process group, timeout, stop request) | `crates/engine/src/proc.rs`, `crates/engine/src/signal.rs` (`kill_child`) |
 | `Generator::renders` and `Generator::render` | `crates/engine/src/generate.rs` |
 | Execution (`try_render`: re-read, ledger check, template, render, publish, read-back, ledger) | `crates/engine/src/apply.rs` |
 | `secrets` command (the `apply` command over the secrets scope) | `crates/cli/src/apply_cmd.rs`, `crates/cli/src/lib.rs` |
@@ -30,7 +30,7 @@ Order of one run:
 1. Resolve, observe, plan. The plan prints with its digest. A blocked plan exits 3.
 2. The gates that need no write (docs/apply.md), then the credential gate: for each account a planned secret names, `op whoami --account <account>` must exit 0. Otherwise exit 3 with `E_CREDENTIAL_UNAVAILABLE`, before the lock and before any write. An `op` that is missing from the search path or fails its executable checks is `E_PROBE_FAILED`, also exit 3. The preview runs this gate too, so `--preview` exits 0 only when `secrets` would render.
 3. Without `--yes-plan`: exit 3, `E_APPROVAL_REQUIRED`. With a digest that differs: `E_PLAN_STALE`.
-4. The writer lock, the second plan, the signal handlers, settling, then one operation per secret (below). Receipt and report as for `apply`, with `command = secrets`.
+4. The writer lock, the second plan, settling, then one operation per secret (below). The signal handlers are already in: `secrets` installs them before its first child, the credential gate. Receipt and report as for `apply`, with `command = secrets`.
 
 `--allow-disruptive` is a usage error (exit 2): a secrets plan removes nothing. A deselected secret keeps its file and its ledger entry; a sensitive removal is still refused (docs/apply.md, Delete safety).
 

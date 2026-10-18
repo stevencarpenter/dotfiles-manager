@@ -85,10 +85,11 @@ wrote needs --allow-adopt <operation-id>. No secret value, unsalted hash or prov
 printed or stored; the ledger keeps a per-machine salted hash. See docs/secrets.md.
 
 packages is apply over the package resources only (homebrew/v1, mise/v1, apt/v1): every other
-resource is listed as not_in_scope. Planning probes each provider's own listing read-only (brew
-list, mise ls, dpkg-query) with auto-update and analytics off. A package the provider lists is
-current; one it does not list is installed with --yes-plan (brew install, mise install). Nothing
-is upgraded, downgraded or removed. An executable of the same name from another owner, or a
+resource is listed as not_in_scope. Planning probes each provider read-only (Homebrew's Cellar
+and Caskroom, mise ls, dpkg-query) with auto-update, analytics and mise configuration off, and
+runs no tap code. A package the provider has installed is current; a missing official one is
+installed with --yes-plan (brew install, mise install), with its missing dependencies named in
+the plan. Nothing is upgraded, downgraded or removed. An executable of the same name from another owner, or a
 provider that cannot answer, is a blocker (exit 3). apt is probe-only: installing needs root. See
 docs/packages.md.
 
