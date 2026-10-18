@@ -47,6 +47,16 @@ fn mise_env() -> Vec<(String, String)> {
     ]
 }
 
+/// A probe also loads no mise configuration file: config evaluation can run hooks, env
+/// sources and remote includes, and a probe runs before approval. The installed versions are
+/// listed from mise's data directory, which needs no config. An install keeps the config, which
+/// decides the version of an undeclared `tool`.
+fn mise_probe_env() -> Vec<(String, String)> {
+    let mut env = mise_env();
+    env.push(("MISE_NO_CONFIG".into(), "1".into()));
+    env
+}
+
 /// The package name as a checked parameter (architecture section 8 item 3): letters, digits,
 /// `.`, `_`, `-`, `+`, `@`, `/` and `:` (a Homebrew tap, a version suffix or a mise backend
 /// prefix such as `npm:`), not starting with `-`, at most 128 characters.
@@ -125,8 +135,9 @@ fn brew_probe(runner: &Runner, pkg: &str) -> PackageState {
     }
 }
 
-/// `mise ls --installed <tool>`: one line `<tool> <version> ...` per installed version, no line
-/// when none is installed. A tool mise does not know is an error (exit 1). A declared
+/// `mise ls --installed --json <tool>`: a JSON array with one `{"version", "installed"}` object
+/// per installed version, `[]` when none is installed (JSON, because the table truncates a long
+/// tool name). A tool mise does not know is an error (exit 1). A declared
 /// `tool@version` is listed by its tool name and counts as installed when an installed version
 /// is the declared one or extends it at a component boundary (`node@20` matches `20.20.2`, not
 /// `2.1.0`). A selector only mise can resolve is refused: the probe has no network.
@@ -137,8 +148,13 @@ fn mise_probe(runner: &Runner, pkg: &str) -> PackageState {
             "{pkg}: mise/v1 takes an exact version or a version prefix (node@20, node@20.1), not a selector mise resolves online ({want})"
         ));
     }
-    let args = ["ls".to_string(), "--installed".into(), tool.into()];
-    let out = match runner.run(&request("mise", &args, &mise_env(), PROBE_TIMEOUT)) {
+    let args = [
+        "ls".to_string(),
+        "--installed".into(),
+        "--json".into(),
+        tool.into(),
+    ];
+    let out = match runner.run(&request("mise", &args, &mise_probe_env(), PROBE_TIMEOUT)) {
         Ok(o) => o,
         Err(e) => return PackageState::Unknown(e.detail),
     };
@@ -150,14 +166,14 @@ fn mise_probe(runner: &Runner, pkg: &str) -> PackageState {
             "mise ls exited with an error for {pkg} (an unknown tool, or a broken configuration)"
         ));
     }
-    let text = String::from_utf8_lossy(&out.stdout);
-    let versions: Vec<&str> = text
-        .lines()
-        .filter_map(|l| {
-            let mut parts = l.split_whitespace();
-            (parts.next() == Some(tool)).then(|| parts.next()).flatten()
-        })
-        .filter(|v| !v.contains("missing"))
+    let Some(listed) = installed_versions(&out.stdout) else {
+        return PackageState::Unknown(format!(
+            "mise ls --json for {pkg} is not the array of versions the adapter reads"
+        ));
+    };
+    let versions: Vec<&str> = listed
+        .iter()
+        .map(String::as_str)
         .filter(|v| version_matches(v, want))
         .collect();
     if versions.is_empty() {
@@ -199,6 +215,17 @@ fn tool_and_version(pkg: &str) -> (&str, &str) {
         Some((tool, version)) if !tool.is_empty() && !version.contains('/') => (tool, version),
         _ => (pkg, ""),
     }
+}
+
+/// The installed versions in a `mise ls --installed --json <tool>` answer, or `None` when it is
+/// not an array of objects with a string `version`.
+fn installed_versions(stdout: &[u8]) -> Option<Vec<String>> {
+    let v: serde_json::Value = serde_json::from_slice(stdout).ok()?;
+    v.as_array()?
+        .iter()
+        .filter(|e| e.get("installed").and_then(serde_json::Value::as_bool) != Some(false))
+        .map(|e| e.get("version")?.as_str().map(str::to_string))
+        .collect()
 }
 
 /// Whether an installed version satisfies the declared one: equal, or longer by whole
@@ -380,6 +407,21 @@ mod tests {
             ("npm:@scope/pkg", "1.2")
         );
         assert_eq!(tool_and_version("@odd"), ("@odd", ""));
+    }
+
+    #[test]
+    fn the_mise_listing_is_read_as_json_only() {
+        let ok = br#"[{"version":"1.5.6","installed":true},{"version":"2.0.0","installed":false}]"#;
+        assert_eq!(installed_versions(ok), Some(vec!["1.5.6".to_string()]));
+        assert_eq!(installed_versions(b"[]"), Some(vec![]));
+        for bad in [&b"duckdb 1.5.6"[..], b"{}", br#"[{"installed":true}]"#, b""] {
+            assert_eq!(
+                installed_versions(bad),
+                None,
+                "{:?}",
+                String::from_utf8_lossy(bad)
+            );
+        }
     }
 
     #[test]

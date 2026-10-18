@@ -64,19 +64,26 @@ case "$1" in
 esac
 "#;
 
-/// `mise ls --installed <name>` answers from `installed-mise`; `mise install <name>` appends.
+/// `mise ls --installed --json <name>` answers a JSON array from `installed-mise` (one
+/// `<name> <version>` line per installed version); the table form is refused, as a stand-in for
+/// its truncated tool column. `mise install <name>` appends.
 const FAKE_MISE: &str = r#"#!/bin/sh
 PATH=/usr/bin:/bin:$PATH
 here=$(dirname "$0")
-printf 'mise %s | yes=%s auto=%s\n' "$*" "${MISE_YES:-unset}" "${MISE_NOT_FOUND_AUTO_INSTALL:-unset}" >> "$here/../log"
+printf 'mise %s | yes=%s auto=%s noconfig=%s\n' "$*" "${MISE_YES:-unset}" "${MISE_NOT_FOUND_AUTO_INSTALL:-unset}" "${MISE_NO_CONFIG:-unset}" >> "$here/../log"
 db="$here/../installed-mise"
 case "$1" in
   ls)
-    name=$3
+    [ "$2 $3" = "--installed --json" ] || { echo "the table truncates long names" >&2; exit 64; }
+    name=$4
     v=${name##*@}
     case "$v" in */*) ;; *) [ "$v" != "$name" ] && { echo "mise ERROR $name not found in mise tool registry" >&2; exit 1; } ;; esac
     [ "$name" = "zzz-unknown" ] && { echo "mise ERROR $name not found in mise tool registry" >&2; exit 1; }
-    grep "^$name " "$db" 2>/dev/null
+    sep=""; printf '['
+    grep "^$name " "$db" 2>/dev/null | while read -r _ ver _; do
+      printf '%s{"version":"%s","installed":true}' "$sep" "$ver"; sep=","
+    done
+    printf ']\n'
     exit 0 ;;
   install)
     echo "${2%%@*}  2.0.0" >> "$db"; exit 0 ;;
@@ -244,7 +251,7 @@ fn missing_packages_are_installed_once_installed_ones_are_current_and_the_env_is
         "{log}"
     );
     assert!(
-        log.contains("mise ls --installed duckdb | yes=1 auto=false"),
+        log.contains("mise ls --installed --json duckdb | yes=1 auto=false noconfig=1"),
         "{log}"
     );
     assert!(!log.contains(" install "), "{log}");
@@ -255,7 +262,8 @@ fn missing_packages_are_installed_once_installed_ones_are_current_and_the_env_is
     assert!(out.contains(&format!("current {BREW_OP}")), "{out}");
     assert!(out.contains("result: ok"), "{out}");
     assert!(
-        fx.log().contains("mise install duckdb | yes=1 auto=false"),
+        fx.log()
+            .contains("mise install duckdb | yes=1 auto=false noconfig=unset"),
         "{}",
         fx.log()
     );
@@ -358,7 +366,7 @@ fn qualified_names_are_probed_by_their_short_name_and_installed_in_full() {
         log.contains("brew list --versions homebrew/core/atuin"),
         "{log}"
     );
-    assert!(log.contains("mise ls --installed duckdb |"), "{log}");
+    assert!(log.contains("mise ls --installed --json duckdb |"), "{log}");
     assert!(log.contains("mise install duckdb@2 |"), "{log}");
     assert!(text(&o.stdout).contains(&format!("updated {MISE_OP}")));
     // A prefix matches whole components: 10.x is not a 1.x. A selector mise resolves online
@@ -383,7 +391,7 @@ fn qualified_names_are_probed_by_their_short_name_and_installed_in_full() {
     let o = fx.preview();
     assert_eq!(code(&o), 3, "{}\n{}", stderr(&o), text(&o.stdout));
     assert!(stderr(&o).contains("E_MANIFEST_INVALID"), "{}", stderr(&o));
-    assert!(!fx.log().contains("mise ls --installed duckdb@latest"));
+    assert!(!fx.log().contains("duckdb@latest"));
     assert!(
         !fx.log()[..]
             .lines()
@@ -406,7 +414,8 @@ fn qualified_names_are_probed_by_their_short_name_and_installed_in_full() {
         text(&o.stdout)
     );
     assert!(
-        fx.log().contains("mise ls --installed npm:@scope/acp |"),
+        fx.log()
+            .contains("mise ls --installed --json npm:@scope/acp |"),
         "{}",
         fx.log()
     );

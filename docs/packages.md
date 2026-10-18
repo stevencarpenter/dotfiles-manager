@@ -7,7 +7,7 @@ Task: DFM-23, the `homebrew/v1`, `mise/v1` and `apt/v1` package adapters and the
 | Part | Location |
 | --- | --- |
 | `Scope::Packages`, `PackageState`, `Action::Install` and the package decision (`decide_package`) | `crates/model/src/plan/` |
-| Probes (`brew list --versions`, `mise ls --json`, `dpkg-query -W`), the other-owner check, installs (`brew install`, `mise install`) | `crates/cli/src/adapters/package.rs` |
+| Probes (`brew list --versions`, `mise ls --installed --json`, `dpkg-query -W`), the other-owner check, installs (`brew install`, `mise install`) | `crates/cli/src/adapters/package.rs` |
 | `Generator::installs`, `Generator::probe`, `Generator::install` | `crates/engine/src/generate.rs` |
 | Execution (`try_install`: re-probe, intent, install, re-probe, outcome) | `crates/engine/src/apply.rs` |
 | `packages` command (the `apply` command over the packages scope) | `crates/cli/src/apply_cmd.rs`, `crates/cli/src/lib.rs` |
@@ -33,7 +33,7 @@ Value: `name` (the package as the provider names it: letters, digits, `.`, `_`, 
 | Adapter | Probe (read-only) | Installed when | Install |
 | --- | --- | --- | --- |
 | `homebrew/v1` | `brew list --versions <name>` with `HOMEBREW_NO_AUTO_UPDATE=1`, `HOMEBREW_NO_ANALYTICS=1`, `HOMEBREW_NO_ENV_HINTS=1`, `HOMEBREW_NO_INSTALL_CLEANUP=1`, `HOMEBREW_NO_INSTALL_UPGRADE=1`; 60 s | exit 0 and a line `<name> <version>...` | `brew install <name>`, same variables, 30 min |
-| `mise/v1` | `mise ls --installed <tool>` with `MISE_YES=1`, `MISE_NOT_FOUND_AUTO_INSTALL=false`; 60 s | exit 0 and a line `<tool> <version>` (not marked missing; the declared version or a longer one by whole components, if any) | `mise install <name>` (the version the mise configuration requests, or the declared `tool@version`; an unconfigured tool fails), same variables, 30 min |
+| `mise/v1` | `mise ls --installed --json <tool>` with `MISE_YES=1`, `MISE_NOT_FOUND_AUTO_INSTALL=false` and `MISE_NO_CONFIG=1` (no config file is loaded before approval: config evaluation can run hooks, env sources and remote includes; JSON because the table truncates a long tool name); 60 s | exit 0 and a JSON array with an installed `version` (the declared version or a longer one by whole components, if any); `[]` is missing; any other answer is `E_PROBE_FAILED` | `mise install <name>` (the version the mise configuration requests, or the declared `tool@version`; an unconfigured tool fails), `MISE_YES=1` and `MISE_NOT_FOUND_AUTO_INSTALL=false` with the configuration loaded, 30 min |
 | `apt/v1` | `dpkg-query -W -f=${Status} <name>`; 60 s | exit 0 and `install ok installed` | None. Installing needs root, and a HOME adapter never escalates (architecture section 8, privilege). A missing apt package is a blocker, `E_PRIVILEGE_UNSUPPORTED`, with the command to run by hand. |
 
 A probe that cannot run (program not found or failed its checks), times out, or answers in a shape the adapter does not know is `Unknown` with a reason: the plan has a blocker, `E_PROBE_FAILED`, exit 3 (architecture section 8 item 9: unknown support fails closed). The same code is used when the probe under the lock cannot answer. Provider standard error is bounded and never printed or persisted.

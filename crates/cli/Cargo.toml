@@ -18,10 +18,11 @@ test-isolation = ["dfm-engine/failpoints"]
 dfm-model = { workspace = true }
 dfm-engine = { workspace = true }
 dfm-platform-macos = { workspace = true }
+# The mise/v1 probe reads `mise ls --json` (docs/packages.md). Already a direct crate of dfm-model.
+serde_json = { workspace = true }
 sha2 = { workspace = true }
 
 [dev-dependencies]
-serde_json = { workspace = true }
 # Resolver tests parse and patch fixture documents in memory. Already an accepted direct crate.
 toml = { workspace = true }
 

@@ -208,11 +208,11 @@ fn the_direct_dependencies_of_every_member_match_the_allow_list_exactly() {
         (
             "dfm-cli",
             vec![
-                "dev:serde_json:=1.0.149",
                 "dev:toml:=1.1.6",
                 "normal:dfm-engine:*",
                 "normal:dfm-model:*",
                 "normal:dfm-platform-macos:*",
+                "normal:serde_json:=1.0.149",
                 "normal:sha2:=0.10.9",
             ],
         ),
