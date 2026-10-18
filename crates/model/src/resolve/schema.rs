@@ -22,7 +22,8 @@ pub enum Schema {
     /// A closed set of keys. Any other key is refused.
     Table(Vec<Field>),
     /// A POSIX file mode: an integer in `0..=0o777`. With `private`, group and other bits must
-    /// be clear.
+    /// be clear and the owner must keep read: the manager reads the file back after every write
+    /// and at every plan.
     FileMode {
         private: bool,
     },
@@ -202,6 +203,10 @@ pub(crate) fn validate(
                 Err(fault("a file mode is an integer from 0 to 0o777"))
             } else if *private && n & 0o077 != 0 {
                 Err(fault("a private file mode must clear group and other bits"))
+            } else if *private && n & 0o400 == 0 {
+                Err(fault(
+                    "a private file mode must keep owner read: the manager reads the file back",
+                ))
             } else {
                 Ok(())
             }
@@ -357,7 +362,7 @@ mod tests {
     }
 
     #[test]
-    fn file_modes_are_bounded_and_private_ones_clear_group_and_other() {
+    fn file_modes_are_bounded_and_private_ones_clear_group_and_other_and_keep_owner_read() {
         let m = |private| Schema::FileMode { private };
         let ok = |n: i64, private| {
             validate(&Value::Integer(n), &m(private), "/m", &mut Found::default())
@@ -369,6 +374,8 @@ mod tests {
             (0o666, true),
             (0o640, true),
             (0o601, true),
+            (0o200, true),
+            (0o000, true),
         ] {
             assert!(
                 matches!(ok(n, private).unwrap_err().fault, Fault::OutOfRange(_)),
