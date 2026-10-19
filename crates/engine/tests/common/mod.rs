@@ -165,6 +165,7 @@ pub fn receipt(stamp: &Stamp, op_id: &str, outputs: Vec<String>) -> Receipt {
         schema: dfm_model::state::SCHEMA,
         op_id: op_id.into(),
         command: "sync".into(),
+        update: false,
         started_at: "2026-10-10T00:00:00.000000000Z".into(),
         finished_at: "2026-10-10T00:00:02.000000000Z".into(),
         binary: BinaryId {

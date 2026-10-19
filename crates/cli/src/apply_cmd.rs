@@ -33,12 +33,15 @@ pub struct Args {
     pub preview: bool,
     /// Which resources the run acts on: `apply` is `Config`, `secrets` is `Secrets`.
     pub scope: Scope,
+    /// `packages --update`: a rolling update of the installed rolling tools
+    /// (docs/toolchains.md) instead of an install of the missing ones.
+    pub update: bool,
 }
 
 /// `apply --root <dir> [--yes-plan <digest>] [--allow-disruptive <operation-id>]...
 /// [--allow-adopt <operation-id>]... [--preview]`, and `secrets` with the same flags.
 pub fn parse_args(args: &[String], scope: Scope) -> Result<Args, Refusal> {
-    let (mut root, mut yes, mut preview) = (None, None, false);
+    let (mut root, mut yes, mut preview, mut update) = (None, None, false, false);
     let (mut allow, mut allow_adopt) = (BTreeSet::new(), BTreeSet::new());
     let mut it = args.iter();
     while let Some(a) = it.next() {
@@ -69,6 +72,8 @@ pub fn parse_args(args: &[String], scope: Scope) -> Result<Args, Refusal> {
             }
             "--preview" if !preview => preview = true,
             "--preview" => return Err(usage("--preview given twice")),
+            "--update" if scope == Scope::Packages && !update => update = true,
+            "--update" if update => return Err(usage("--update given twice")),
             other => return Err(usage(format!("unknown argument {other}"))),
         }
     }
@@ -91,6 +96,7 @@ pub fn parse_args(args: &[String], scope: Scope) -> Result<Args, Refusal> {
         allow_adopt,
         preview,
         scope,
+        update,
     })
 }
 
@@ -205,6 +211,9 @@ fn run_inner(
     // A packages plan needs the providers' answers first (docs/packages.md). The probes are
     // read-only and run only for this scope.
     let probes = |resolved: &dfm_model::resolve::Resolved| match args.scope {
+        Scope::Packages if args.update => {
+            crate::adapters::package::update_facts(resolved, &ctx.runner(&sys))
+        }
         Scope::Packages => crate::adapters::package::package_facts(resolved, &ctx.runner(&sys)),
         _ => Ok::<_, Refusal>(BTreeMap::new()),
     };
@@ -385,6 +394,7 @@ fn run_inner(
             schema: SCHEMA,
             op_id: format!("{command}-{}-{}", &digest[..16], std::process::id()),
             command: command.into(),
+            update: args.update,
             started_at: rfc3339(started),
             finished_at: rfc3339(finished),
             binary: BinaryId {

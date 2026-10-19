@@ -1000,7 +1000,7 @@ fn classify(
             path,
             &format!("resource {who}: already the wanted result"),
         )),
-        Status::NotInScope | Status::Blocked => None,
+        Status::NotInScope | Status::Blocked | Status::Held => None,
     }
 }
 

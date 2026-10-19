@@ -191,7 +191,7 @@ A primitive that committed its effect but could not confirm durability returns `
 ## Failure and accounting
 
 - The first operation that fails or blocks stops all further mutation. This is the default and there is no `--continue`.
-- An operation that depends on it (through `after`, transitively through results) is `blocked`. Every other operation that has not started is `not_started`. `current` and `not_in_scope` operations are reported as they are.
+- An operation that depends on it (through `after`, transitively through results) is `blocked`. Every other operation that has not started is `not_started`. `current`, `held` and `not_in_scope` operations are reported as they are.
 - Completed operations stay `updated`. There is no rollback.
 - The report lists one line per operation and the counts `updated`, `current`, `failed`, `blocked`, `unknown`, `not_started`, `not_in_scope`, `held`, `pending`, `blocked_pending`, so the counts add up to the number of operations. These are the contract status names, the same as in the receipt.
 - The first problem keeps its own code (`E_IO_FAILED`, `E_PLAN_STALE`, `E_CONFLICT`, `E_IO_UNCONFIRMED`, and so on). There is no umbrella code. When the store wrote anything, the refusal is marked `after_mutation`, which is what turns a block code into exit 1.
@@ -254,7 +254,7 @@ Publishing a file does not reload the program that reads it (architecture sectio
 `apply` (not `--preview`) handles SIGINT and SIGTERM. It installs the handlers after it takes the writer lock and plans again under the lock, and before it settles earlier work. The lock file can exist before the handlers do. No journal, ledger or HOME write happens in that window, and a signal in it ends the process with the default action. The handler stores the number of the first signal in an atomic and does nothing else. The executor looks at the record before it settles, before each operation, and again immediately before it writes the `intent` entry (after the checks, the link source walk and the generation). A signal seen at that last look ends the operation as `not_started` with no `intent` entry:
 
 - The operation in flight finishes: its effect, read-back, outcome entry and ledger write. A staged file is never left half written.
-- No new `intent` entry is written. Every operation that has not started is `not_started`. An operation that needs nothing (`current`, `not_in_scope`) is reported as it is.
+- No new `intent` entry is written. Every operation that has not started is `not_started`. An operation that needs nothing (`current`, `held`, `not_in_scope`) is reported as it is.
 - The receipt has outcome `interrupted` (SIGINT, exit 130) or `terminated` (SIGTERM, exit 143), as for any other run that changed something. A run that changed nothing writes no receipt, and a signal before the first mutation exits 130 or 143 without one.
 - The report prints, then the last line is `result: interrupted` or `result: terminated`. The process returns the code. The handler never exits the process.
 - A signal has precedence over a failure in the exit code. The operations still show what failed.

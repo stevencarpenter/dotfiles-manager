@@ -213,7 +213,7 @@ impl Generator for Generators<'_> {
     }
 
     fn installs(&self, op: &Operation) -> bool {
-        op.action == Action::Install
+        matches!(op.action, Action::Install | Action::Upgrade)
             && op.class == Class::Normal
             && self.runner.is_some()
             && self.resolved.resources.contains_key(&op.resource)
@@ -234,7 +234,11 @@ impl Generator for Generators<'_> {
                     format!("no package provider for {}", op.adapter),
                 )
             })?;
-        package::probe(runner, &op.adapter, self.value(op)?)
+        if op.action == Action::Upgrade {
+            package::maintain(runner, &op.adapter, self.value(op)?)
+        } else {
+            package::probe(runner, &op.adapter, self.value(op)?)
+        }
     }
 
     fn install(&self, op: &Operation) -> Result<(), Refusal> {
@@ -248,7 +252,11 @@ impl Generator for Generators<'_> {
                     format!("no package provider for {}", op.adapter),
                 )
             })?;
-        package::install(runner, &op.adapter, self.value(op)?)
+        if op.action == Action::Upgrade {
+            package::upgrade(runner, &op.adapter, self.value(op)?)
+        } else {
+            package::install(runner, &op.adapter, self.value(op)?)
+        }
     }
 
     fn supports(&self, op: &Operation) -> bool {

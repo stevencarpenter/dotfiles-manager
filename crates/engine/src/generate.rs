@@ -111,8 +111,8 @@ pub trait Generator {
         ))
     }
 
-    /// Whether `op` is a package install this generator runs (docs/packages.md): an `install`
-    /// operation of a provider this build has.
+    /// Whether `op` is a package install or upgrade this generator runs (docs/packages.md,
+    /// docs/toolchains.md): an `install` or `upgrade` operation of a provider this build has.
     fn installs(&self, _op: &Operation) -> bool {
         false
     }
@@ -125,7 +125,8 @@ pub trait Generator {
         ))
     }
 
-    /// Installs the package through the declared provider. The caller probes again afterwards.
+    /// Installs the package through the declared provider, or for an `upgrade` operation asks
+    /// the provider for its newest eligible version. The caller probes again afterwards.
     fn install(&self, op: &Operation) -> Result<(), Refusal> {
         Err(Refusal::new(
             Code::GeneratorUnavailable,

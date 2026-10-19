@@ -191,6 +191,7 @@ pub fn record_op(ctx: &Ctx, args: &[String], out: &mut dyn Write) -> Result<(), 
             schema: SCHEMA,
             op_id: id.clone(),
             command: "record-op".into(),
+            update: false,
             started_at: rfc3339(started),
             finished_at: now()?,
             binary: BinaryId {
