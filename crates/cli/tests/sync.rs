@@ -1055,6 +1055,13 @@ fn a_checkout_configuration_outside_the_allowlist_is_refused_before_any_fetch() 
             "--no-ff".to_string(),
             "branch.*.mergeoptions",
         ),
+        // A remote section named after the origin URL: git matches the fetch argument against
+        // it and would fetch from its url instead.
+        (
+            &format!("remote.{}.url", fx.origin()),
+            "https://u:s3cret@evil.invalid/decoy".to_string(),
+            "remote.*.url",
+        ),
     ] {
         git(&fx.root, &["config", key, &value]);
         let o = without_remote(&fx, || fx.preview());

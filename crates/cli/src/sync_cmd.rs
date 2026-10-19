@@ -481,8 +481,12 @@ fn check_live(git: &Git, live: &str) -> Result<(), Refusal> {
 
 /// A configuration key a checkout may carry (docs/sync.md, "Checkout configuration"): what
 /// `git init` and `git clone` write, plus the identity keys. Every fetch names its URL on the
-/// command line, and a URL is never a remote nickname (a nickname holds no slash), so
-/// `remote.*` and `branch.*` never reach a fetch, a fast-forward or a detached checkout.
+/// command line, and git matches that argument against the configured remote nicknames before
+/// it treats it as a URL (`[remote "https://host/x"] url = elsewhere` redirects a fetch of
+/// `https://host/x`; a nickname beginning with `/` is the one shape git refuses). So a remote
+/// section is allowed only under a plain nickname, with no `/` and no `:`, which no canonical
+/// origin (`scheme://`) and no staging path (`/...`) can equal. `branch.*` reaches no fetch,
+/// fast-forward or detached checkout.
 fn config_key_allowed(key: &str) -> bool {
     const PLAIN: [&str; 8] = [
         "core.repositoryformatversion",
@@ -504,15 +508,16 @@ fn config_key_allowed(key: &str) -> bool {
     if matches!(section, "worktrunk" | "coderabbit") {
         return true;
     }
-    let Some((_, name)) = rest.rsplit_once('.') else {
+    let Some((nick, name)) = rest.rsplit_once('.') else {
         return false;
     };
+    let plain_nick = !nick.contains('/') && !nick.contains(':');
     // Not branch.<name>.mergeOptions or .rebase: mergeOptions reaches `merge`.
-    matches!(
-        (section, name),
-        ("remote", "url" | "fetch" | "pushurl")
-            | ("branch", "remote" | "merge" | "vscode-merge-base")
-    )
+    match (section, name) {
+        ("remote", "url" | "fetch" | "pushurl") => plain_nick,
+        ("branch", "remote" | "merge" | "vscode-merge-base") => true,
+        _ => false,
+    }
 }
 
 /// Every git command in a checkout loads its `.git/config` (and `.git/config.worktree`, and
