@@ -1053,6 +1053,9 @@ impl Planner<'_> {
 
     /// A package (docs/packages.md): no path and no ledger entry. The caller probed the declared
     /// provider; the plan installs what is missing and never upgrades, downgrades or removes.
+    /// Under a rolling update (docs/toolchains.md) the caller's `Rolling` state plans an
+    /// `upgrade` to the newest version the provider resolves at apply time, and `Held` keeps
+    /// the installed versions with the reason in the row.
     fn package(&mut self, r: &ResolvedResource) {
         let id = format!("{}@package", r.id);
         let mut op = self.skeleton(r, id.clone(), None);

@@ -183,6 +183,10 @@ impl Fx {
             "duckdb 1.5.5\nduckdb 1.5.6\ngo 1.27.1\njava 21.0.2\n",
         );
         fx.installed("uv", "nuv 0.5.2\n");
+        fx.uv_receipt(
+            "nuv",
+            "[tool]\nrequirements = [{ name = \"nuv\" }]\nentrypoints = []\n",
+        );
         fx.marker("latest-mise", "duckdb 1.6.0\ngo 1.27.2\njava 22.0.0\n");
         let p = fx.root.join("profiles/t-01.toml");
         let o = fx.run(&[
@@ -286,6 +290,13 @@ impl Fx {
             .collect()
     }
 
+    /// The receipt uv keeps for an installed tool, which `uv tool upgrade` resolves from.
+    fn uv_receipt(&self, name: &str, body: &str) {
+        let dir = self.home.path().join(".local/share/uv/tools").join(name);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("uv-receipt.toml"), body).unwrap();
+    }
+
     /// An executable of `name` another owner put in `~/.local/bin`.
     fn other_copy(&self, name: &str) -> PathBuf {
         let dir = self.home.path().join(".local/bin");
@@ -359,10 +370,21 @@ fn a_rolling_update_upgrades_mise_and_uv_tools_keeps_every_installed_version_and
         log.contains("uv tool upgrade nuv | noconfig=1 offline=unset downloads=never progress=1"),
         "{log}"
     );
-    assert!(
-        !log.contains("prune") && !log.contains("uninstall"),
-        "{log}"
-    );
+    // Only listings, installs and upgrades ever run: nothing prunes, uninstalls, resolves a
+    // version or edits a configuration.
+    for line in log.lines() {
+        assert!(
+            [
+                "mise ls ",
+                "mise install ",
+                "uv tool list",
+                "uv tool upgrade "
+            ]
+            .iter()
+            .any(|p| line.starts_with(p)),
+            "{line}"
+        );
+    }
     // Every version that was installed is still listed; the new ones are beside them.
     assert_eq!(
         fx.listed("mise"),
@@ -372,6 +394,7 @@ fn a_rolling_update_upgrades_mise_and_uv_tools_keeps_every_installed_version_and
     let r = fx.receipts();
     assert_eq!(r.len(), 1);
     assert_eq!(r[0]["command"], "packages");
+    assert_eq!(r[0]["update"], true);
     let ops = r[0]["operations"].as_array().unwrap();
     let status = |res: &str| ops.iter().find(|o| o["resource"] == res).unwrap()["status"].clone();
     assert_eq!(status("extra.duckdb"), "updated");
@@ -412,6 +435,7 @@ fn a_plain_packages_run_never_upgrades_a_rolling_tool_and_a_pin_change_installs_
     assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
     assert!(text(&o.stdout).contains(&format!("updated {GO}")));
     assert_eq!(fx.changes(), ["mise install go@1.28"]);
+    assert_eq!(fx.receipts()[0]["update"], false);
     assert!(fx.listed("mise").contains("go 1.27.1\n"));
     assert!(fx.listed("mise").contains("go 1.28.0\n"));
     // A plain packages digest does not approve an update, and the other way round.
@@ -479,17 +503,105 @@ fn a_copy_from_another_owner_is_reported_under_packages_and_blocks_the_update() 
     );
     assert!(fx.changes().is_empty(), "{}", fx.log());
     fs::remove_file(&other).unwrap();
-    // The providers' own directories are not another owner: a mise shim and uv's entry point.
+    // The providers' own entries are not another owner: a mise shim, and uv's link from
+    // `~/.local/bin` into its tool directory.
     let shims = fx.home.path().join(".local/share/mise/shims");
     fs::create_dir_all(&shims).unwrap();
     fs::write(shims.join("duckdb"), "#!/bin/sh\n").unwrap();
     fs::set_permissions(shims.join("duckdb"), fs::Permissions::from_mode(0o755)).unwrap();
-    fx.other_copy("nuv");
+    let entry = fx.home.path().join(".local/share/uv/tools/nuv/bin/nuv");
+    fs::create_dir_all(entry.parent().unwrap()).unwrap();
+    fs::write(&entry, "#!/bin/sh\n").unwrap();
+    fs::set_permissions(&entry, fs::Permissions::from_mode(0o755)).unwrap();
+    let link = fx.home.path().join(".local/bin/nuv");
+    fs::create_dir_all(link.parent().unwrap()).unwrap();
+    std::os::unix::fs::symlink(&entry, &link).unwrap();
     let o = fx.preview(true);
     assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
     let t = text(&o.stdout);
     assert!(t.contains(&format!("planned {DUCKDB}")), "{t}");
     assert!(t.contains(&format!("planned {NUV}")), "{t}");
+    // A file that replaced uv's link (a hand install, pipx) is another owner: the upgrade
+    // would link over it.
+    fs::remove_file(&link).unwrap();
+    let other = fx.other_copy("nuv");
+    let o = fx.preview(true);
+    assert_eq!(code(&o), 3, "{}\n{}", stderr(&o), text(&o.stdout));
+    let e = stderr(&o);
+    assert!(
+        e.contains(&format!(
+            "nuv is declared for uv-tool/v1 but an executable {} exists",
+            other.display()
+        )),
+        "{e}"
+    );
+}
+
+#[test]
+fn a_uv_tool_installed_from_a_git_or_path_source_is_held_and_an_unreadable_receipt_holds_too() {
+    let fx = Fx::new();
+    for (body, why) in [
+        (
+            "[tool]\nrequirements = [{ name = \"nuv\", git = \"ssh://git@example.invalid/nuv\" }]\nentrypoints = []\n",
+            "installed from a git source, which an upgrade would resolve again outside the plan",
+        ),
+        (
+            "[tool]\nrequirements = [{ name = \"nuv\", path = \"/tmp/nuv\" }]\n",
+            "installed from a path source",
+        ),
+        ("[tool]\nentrypoints = []\n", "lists no tool requirements"),
+        ("not = [toml", "is not TOML"),
+    ] {
+        fx.uv_receipt("nuv", body);
+        let o = fx.preview(true);
+        assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+        let t = text(&o.stdout);
+        assert!(t.contains(&format!("current {NUV}")), "{t}");
+        assert!(
+            t.contains("nuv is installed by uv-tool/v1 and held (0.5.2, "),
+            "{t}"
+        );
+        assert!(t.contains(why), "{why}: {t}");
+    }
+    fs::remove_file(
+        fx.home
+            .path()
+            .join(".local/share/uv/tools/nuv/uv-receipt.toml"),
+    )
+    .unwrap();
+    let o = fx.apply(true);
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+    let t = text(&o.stdout);
+    assert!(t.contains(&format!("current {NUV}")), "{t}");
+    assert!(
+        t.contains("cannot read") && t.contains("uv-receipt.toml: entity not found"),
+        "{t}"
+    );
+    assert!(!fx.log().contains("uv tool upgrade"), "{}", fx.log());
+    // A plain packages run reads no receipt: the tool is listed, so it is current.
+    let o = fx.preview(false);
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+    assert!(text(&o.stdout).contains("nuv is installed by uv-tool/v1 (0.5.2)"));
+}
+
+#[test]
+fn an_update_policy_the_adapters_do_not_know_is_a_manifest_error_in_both_modes() {
+    let fx = Fx::new();
+    fx.put(
+        "base/modules/extra/module.toml",
+        &EXTRA.replace("update_policy = \"hold\"", "update_policy = \"rollng\""),
+    );
+    for update in [false, true] {
+        let o = fx.preview(update);
+        assert_eq!(code(&o), 3, "{}\n{}", stderr(&o), text(&o.stdout));
+        let e = stderr(&o);
+        assert!(e.contains("E_MANIFEST_INVALID"), "{e}");
+        assert!(
+            e.contains("update_policy must be rolling, hold or native-request, not rollng"),
+            "{e}"
+        );
+    }
+    assert!(fx.changes().is_empty(), "{}", fx.log());
 }
 
 #[test]

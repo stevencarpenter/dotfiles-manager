@@ -1484,10 +1484,12 @@ impl Exec<'_, '_> {
         Ok(())
     }
 
-    /// A package install (docs/packages.md). The provider is probed again under the lock: a
-    /// package that is installed now is `current`, any other change blocks. Then the intent entry
-    /// (no path: the provider's listing is the record), the install, a third probe as the
-    /// postcondition, and the outcome entry. No ledger entry is written.
+    /// A package install (docs/packages.md) or upgrade (docs/toolchains.md). The provider is
+    /// probed again under the lock: a package that is installed now is `current`, any other
+    /// change blocks. Then the intent entry (no path: the provider's listing is the record), the
+    /// install or upgrade, a third probe as the postcondition, and the outcome entry. For an
+    /// upgrade the listing before and after decides: unchanged is `current`, changed is
+    /// `updated`. No ledger entry is written.
     fn try_install(&mut self, op: &Operation) -> Result<Ended, Ended> {
         self.unknown_install(op)?;
         let want = op

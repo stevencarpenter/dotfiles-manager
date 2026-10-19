@@ -394,6 +394,7 @@ fn run_inner(
             schema: SCHEMA,
             op_id: format!("{command}-{}-{}", &digest[..16], std::process::id()),
             command: command.into(),
+            update: args.update,
             started_at: rfc3339(started),
             finished_at: rfc3339(finished),
             binary: BinaryId {

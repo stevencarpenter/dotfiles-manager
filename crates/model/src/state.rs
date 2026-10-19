@@ -563,6 +563,10 @@ pub struct Receipt {
     pub schema: i64,
     pub op_id: String,
     pub command: String,
+    /// `true` for a `packages --update` run (docs/toolchains.md). A receipt written before the
+    /// field reads as `false`.
+    #[serde(default)]
+    pub update: bool,
     pub started_at: String,
     pub finished_at: String,
     pub binary: BinaryId,
@@ -1416,6 +1420,7 @@ mod tests {
             schema: SCHEMA,
             op_id: "run-1".into(),
             command: "sync".into(),
+            update: false,
             started_at: "2026-10-10T00:00:00.000000000Z".into(),
             finished_at: "2026-10-10T00:00:02.000000000Z".into(),
             binary: BinaryId {
