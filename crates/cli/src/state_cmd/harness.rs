@@ -284,8 +284,11 @@ pub fn record_trial(ctx: &Ctx, args: &[String], out: &mut dyn Write) -> Result<(
                 existed: existing.is_some(),
                 sha256: existing.map(|b| file_fingerprint(&b)),
             }],
+            owners: vec![],
         },
         owned_outputs: vec![],
+        package: None,
+        unknown: vec![],
     };
     store.write_trial(&trial)?;
     writeln!(out, "recorded trial {id}").map_err(|e| io("output", &e))

@@ -406,7 +406,8 @@ fn the_unsafe_keyword_appears_only_in_the_engine_signal_module() {
 }
 
 /// DFM-47 C03: only the mutating path of `apply` installs the handlers. The call is in one place
-/// and it comes after the preview return, the lock and no earlier.
+/// and it comes after the preview return, the lock and no earlier. `trial` (DFM-32) starts a
+/// provider before it decides anything, so it arms them once, before its first probe.
 #[test]
 fn only_the_mutating_path_of_apply_installs_the_signal_handlers() {
     let mut files = Vec::new();
@@ -422,7 +423,13 @@ fn only_the_mutating_path_of_apply_installs_the_signal_handlers() {
         .filter(|f| fs::read_to_string(f).unwrap().contains("signal::install("))
         .map(|f| f.strip_prefix(repo_root()).unwrap().display().to_string())
         .collect();
-    assert_eq!(callers, ["crates/cli/src/apply_cmd.rs"]);
+    assert_eq!(
+        callers,
+        ["crates/cli/src/apply_cmd.rs", "crates/cli/src/trial_cmd.rs"]
+    );
+    let trial = fs::read_to_string(repo_root().join("crates/cli/src/trial_cmd.rs")).unwrap();
+    assert_eq!(trial.matches("signal::install(").count(), 1);
+    assert!(trial.find("signal::install(").unwrap() < trial.find("find_owner(&runner").unwrap());
     let t = fs::read_to_string(repo_root().join("crates/cli/src/apply_cmd.rs")).unwrap();
     // One closure holds the call; it is armed in two places, both guarded by the scope.
     assert_eq!(t.matches("signal::install(").count(), 1);

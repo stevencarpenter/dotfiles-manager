@@ -78,5 +78,9 @@ required-features = ["test-isolation"]
 name = "toolchains"
 required-features = ["test-isolation"]
 
+[[test]]
+name = "trial"
+required-features = ["test-isolation"]
+
 [lints]
 workspace = true

@@ -55,7 +55,7 @@ pub fn parse_args(args: &[String]) -> Result<Args, Refusal> {
 }
 
 /// SHA-256 of the running executable: the binary identity of section 9. Streamed, not loaded.
-fn binary_identity() -> Result<Binary, Refusal> {
+pub(crate) fn binary_identity() -> Result<Binary, Refusal> {
     let io = |e: std::io::Error| Refusal::new(Code::IoFailed, format!("binary identity: {e}"));
     let exe = std::env::current_exe().map_err(io)?;
     Ok(Binary {

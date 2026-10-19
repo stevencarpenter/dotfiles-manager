@@ -2,6 +2,8 @@
     dead_code,
     reason = "each test binary uses a different subset of these helpers"
 )]
+pub mod providers;
+
 use sha2::{Digest, Sha256};
 use std::fs;
 use std::os::unix::fs::PermissionsExt;

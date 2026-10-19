@@ -1,5 +1,5 @@
 //! `dotfiles-manager` command line: version, help, profile binding, state, explain, plan,
-//! doctor, status, apply and self-check.
+//! doctor, status, apply, trial and self-check.
 
 #![forbid(unsafe_code)]
 
@@ -11,6 +11,7 @@ mod plan_cmd;
 mod read_fs;
 mod source_fs;
 mod state_cmd;
+mod trial_cmd;
 
 pub use adapters::builtin_catalog;
 pub use controls_fs::{check_build_controls, toolchain_tree_digest};
@@ -45,6 +46,8 @@ usage:
                                [--allow-adopt <operation-id>]...
   dotfiles-manager secrets --root <dir> [--preview] [--yes-plan <digest>] [--allow-adopt <operation-id>]...
   dotfiles-manager packages --root <dir> [--preview] [--yes-plan <digest>] [--update]
+  dotfiles-manager trial <package> [--id <trial-id>] [--provider homebrew/v1|mise/v1] [--config <path>]...
+                               [--preview] [--yes-plan <digest>]
   dotfiles-manager self-check --build-controls <staged tree>
   dotfiles-manager self-check --fixture-dir <dir>
 
@@ -95,6 +98,15 @@ docs/packages.md. With --update, each installed mise or uv tool declared rolling
 the newest version its provider resolves (mise install, uv tool upgrade); installed versions
 stay, a held tool or a local build is kept, and a copy from another owner blocks. See
 docs/toolchains.md.
+
+trial tries a tool without a module. It asks homebrew/v1 and mise/v1 which one lists or can
+install the package (read-only probes, as packages runs them), records a baseline of the tool,
+its owners and its configuration candidates (--config paths, or ~/.config/<tool>) before any
+change, and prints the scope, the cleanup limits and a digest. With --yes-plan it writes the
+trial record to state/trials/, installs the package when no provider has it (nothing when it
+pre-exists), journals the install and writes a receipt. More than one capable provider needs
+--provider. A candidate path is observed, never changed. adopt and purge are not built. See
+docs/trial.md.
 
 An operation that ended unknown (E_OP_INTERRUPTED) blocks its path in every later run. Each apply
 checks the path again and settles the entry when the result is clear. state recover does only that:
@@ -402,6 +414,10 @@ fn dispatch(args: &[String], out: &mut dyn Write) -> Result<(), Refusal> {
                 ));
             }
             apply_cmd::run(&context(home)?, &args, out)
+        }
+        "trial" => {
+            let args = trial_cmd::parse_args(rest)?;
+            trial_cmd::run(&context(home)?, &args, out)
         }
         "self-check" => {
             let [controls, fixture] = flags(rest, ["--build-controls", "--fixture-dir"])?;
