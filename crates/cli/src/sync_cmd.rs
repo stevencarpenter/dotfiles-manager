@@ -479,6 +479,31 @@ fn check_live(git: &Git, live: &str) -> Result<(), Refusal> {
             visible(live)
         )));
     }
+    // Grafts and a shallow boundary rewrite the ancestry git reports: a graft can join
+    // unrelated commits so that `merge --ff-only` moves HEAD over local-only history, and
+    // `GIT_NO_REPLACE_OBJECTS` does not cover them. Both must be absent before any ancestry
+    // answer is trusted.
+    for file in ["info/grafts", "shallow"] {
+        let path = git.run(
+            true,
+            Code::SourceUntrusted,
+            "git-path ancestry file",
+            &[
+                "-C",
+                live,
+                "rev-parse",
+                "--path-format=absolute",
+                "--git-path",
+                file,
+            ],
+        )?;
+        if fs::metadata(&path).is_ok_and(|m| m.len() > 0) {
+            return Err(untrusted(format!(
+                "the checkout at {} has .git/{file}, which rewrites ancestry; remove it first",
+                visible(live)
+            )));
+        }
+    }
     Ok(())
 }
 

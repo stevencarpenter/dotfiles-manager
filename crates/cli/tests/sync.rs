@@ -1024,6 +1024,26 @@ fn without_remote(fx: &Fx, f: impl FnOnce() -> Output) -> Output {
 }
 
 #[test]
+fn a_graft_or_shallow_file_in_the_checkout_is_refused_before_any_fetch() {
+    let fx = Fx::new();
+    let old = fx.head();
+    for file in ["info/grafts", "shallow"] {
+        let path = fx.root.join(".git").join(file);
+        fs::write(&path, format!("{old} {old}\n")).unwrap();
+        let o = without_remote(&fx, || fx.preview());
+        fs::remove_file(&path).unwrap();
+        assert_eq!(code(&o), 3, "{file}: {}\n{}", stdout(&o), stderr(&o));
+        let e = stderr(&o);
+        assert!(e.contains("E_SOURCE_UNTRUSTED"), "{file}: {e}");
+        assert!(e.contains(&format!(".git/{file}")), "{file}: {e}");
+        assert!(!e.contains("E_SOURCE_MISSING"), "{file}: a fetch ran: {e}");
+        assert!(!stdout(&o).contains("source: src0"), "{file}: a fetch ran");
+        assert_eq!(fx.head(), old, "{file}");
+        assert!(fx.staging_leftovers().is_empty(), "{file}");
+    }
+}
+
+#[test]
 fn a_checkout_configuration_outside_the_allowlist_is_refused_before_any_fetch() {
     let fx = Fx::new();
     let old = fx.head();
