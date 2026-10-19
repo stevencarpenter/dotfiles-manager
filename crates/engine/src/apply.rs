@@ -1663,13 +1663,18 @@ impl Exec<'_, '_> {
                 ));
             }
         }
+        // The planner recorded a sensitive prerequisite by mode only (no hash): it is observed
+        // and compared the same way, so no hash of it is computed or printed here either.
+        let sensitive = |p: &dfm_model::plan::Precondition| {
+            p.state.starts_with("file:") && !p.state.contains(":sha256:")
+        };
         let reqs: Vec<Request> = op
             .preconditions
             .iter()
-            .filter_map(|p| p.subject.strip_prefix("path:"))
+            .filter(|p| p.subject.starts_with("path:"))
             .map(|p| Request {
-                path: p.to_string(),
-                hash: true,
+                path: p.subject["path:".len()..].to_string(),
+                hash: !sensitive(p),
                 list: false,
             })
             .collect();
@@ -1684,7 +1689,7 @@ impl Exec<'_, '_> {
             let actual = obs
                 .seen
                 .get(path)
-                .map_or_else(|| "missing".to_string(), |s| node_state(s, false));
+                .map_or_else(|| "missing".to_string(), |s| node_state(s, sensitive(p)));
             if actual != p.state {
                 return Err(blocked(
                     Code::PlanStale,

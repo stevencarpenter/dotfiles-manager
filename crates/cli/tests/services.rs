@@ -901,3 +901,78 @@ fn the_definition_must_declare_the_label_and_a_changed_prerequisite_makes_the_pl
         stderr(&o)
     );
 }
+
+#[test]
+fn a_sensitive_prerequisite_is_recorded_by_mode_only() {
+    use sha2::{Digest, Sha256};
+    let fx = Fx::new();
+    // The bar reads a secret output too. A secrets plan renders it; here it is declared as a
+    // prerequisite, so the planner observes it, and nothing may hash or show its content.
+    fx.put(
+        "base/modules/extra/module.toml",
+        &format!(
+            "{}\n[[resources]]\nid = \"bar-secret\"\nkind = \"secret\"\nadapter = \"op-template/v1\"\ntarget = \".config/sketchybar/secret.env\"\n[resources.value]\ntemplate = \"files/secret.tpl\"\naccount = \"my.1password.com\"\nmode = 0o600\n",
+            EXTRA.replace(
+                "config = [\".config/sketchybar/sketchybarrc\"]",
+                "config = [\".config/sketchybar/sketchybarrc\", \".config/sketchybar/secret.env\"]"
+            )
+        ),
+    );
+    fx.put(
+        "base/modules/extra/files/secret.tpl",
+        "TOKEN={{ op://v/i/t }}\n",
+    );
+    fx.publish();
+    let secret = fx.home.path().join(".config/sketchybar/secret.env");
+    let content = "TOKEN=hunter2-rendered-value\n";
+    fs::write(&secret, content).unwrap();
+    fs::set_permissions(&secret, fs::Permissions::from_mode(0o600)).unwrap();
+    let hash = format!("{:x}", Sha256::digest(content.as_bytes()));
+    fx.mark("brew-sketchybar", "none\n");
+    fx.mark(
+        "loaded",
+        &format!("{LABEL} {} stopped\n", fx.home.path().join(PLIST).display()),
+    );
+    let o = fx.preview(&[]);
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+    let t = text(&o.stdout);
+    assert!(t.contains(&format!("planned {BAR_OP}")), "{t}");
+    assert!(
+        t.contains(
+            "after: extra.bar-secret@scope, extra.sketchybar-pkg@scope, extra.sketchybarrc@scope"
+        ),
+        "{t}"
+    );
+    let d = digest_of(&o);
+    let o = fx.services(&d, &[]);
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+    assert!(
+        text(&o.stdout).contains(&format!("updated {BAR_OP} reload=reloaded")),
+        "{}",
+        text(&o.stdout)
+    );
+    // The content changed and the mode did not: the prerequisite still holds, because the
+    // plan recorded the mode only. A mode open to others is a change.
+    fs::write(&secret, "TOKEN=other\n").unwrap();
+    let o = fx.preview(&[]);
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+    assert!(
+        text(&o.stdout).contains(&format!("current {BAR_OP}")),
+        "{}",
+        text(&o.stdout)
+    );
+    fs::set_permissions(&secret, fs::Permissions::from_mode(0o644)).unwrap();
+    let o = fx.services(&d, &[]);
+    assert_eq!(code(&o), 3, "{}\n{}", stderr(&o), text(&o.stdout));
+    assert!(stderr(&o).contains("E_PLAN_STALE"), "{}", stderr(&o));
+    // Nothing printed, journaled or stored holds the content or its plain hash.
+    let mut everything = fx.journal();
+    everything.push_str(&fx.log());
+    for r in fx.receipts() {
+        everything.push_str(&r.to_string());
+    }
+    everything.push_str(&text(&o.stdout));
+    everything.push_str(&stderr(&o));
+    assert!(!everything.contains("hunter2"), "{everything}");
+    assert!(!everything.contains(&hash), "{everything}");
+}

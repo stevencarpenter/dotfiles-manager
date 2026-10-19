@@ -536,6 +536,8 @@ struct Planner<'a> {
     mkdirs: BTreeMap<String, String>,
     /// Ledger entries this plan removes, by folded path: the removal operation id.
     retiring: BTreeMap<String, String>,
+    /// Folded paths whose content is never hashed or shown ([`sensitive_paths`]).
+    sensitive: BTreeSet<String>,
 }
 
 pub fn build(resolved: &Resolved, cx: &Context<'_>, obs: &Observations) -> Result<Plan, Refusal> {
@@ -556,6 +558,7 @@ pub fn build(resolved: &Resolved, cx: &Context<'_>, obs: &Observations) -> Resul
             .into_iter()
             .map(|o| (fold(&o.path), removal_id(o)))
             .collect(),
+        sensitive: sensitive_paths(Some(resolved), &cx.ledger),
     };
     for r in resolved.resources.values() {
         p.resource(r);
@@ -1349,10 +1352,12 @@ impl Planner<'_> {
                 self.ops.insert(id, op);
                 return;
             }
+            // A sensitive prerequisite (a secret output a program reads) is recorded by mode
+            // only, as everywhere else: no hash and no size of it reaches the plan or a message.
             if let Some(seen) = self.obs.seen.get(&p) {
                 op.preconditions.push(Precondition {
                     subject: format!("path:{p}"),
-                    state: node_state(seen, false),
+                    state: node_state(seen, self.sensitive.contains(&fold(&p))),
                 });
             }
         }
