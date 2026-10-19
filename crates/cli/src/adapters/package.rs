@@ -729,7 +729,7 @@ fn symbolic(want: &str) -> bool {
 /// The executable name a package is looked for under: the last `/` component of a tap or
 /// backend-qualified name, without a `@version` suffix (`homebrew/core/atuin`, `node@20` and
 /// `npm:@scope/pkg` give `atuin`, `node` and `pkg`).
-fn leaf(pkg: &str) -> &str {
+pub(crate) fn leaf(pkg: &str) -> &str {
     let (tool, _) = tool_and_version(pkg);
     tool.rsplit('/').next().unwrap_or(tool)
 }

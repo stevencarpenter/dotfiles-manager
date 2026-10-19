@@ -1005,6 +1005,30 @@ pub struct BaselinePath {
 pub struct Baseline {
     pub tool_preexisting: bool,
     pub paths: Vec<BaselinePath>,
+    /// Who had the tool before the trial, when it pre-existed: the provider and the version it
+    /// listed, or the other owner the probe found. Empty when nothing pre-existed (DFM-32).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub owners: Vec<String>,
+}
+
+/// The install a trial made (DFM-32): its journal operation id, which also names the receipt,
+/// and the dependencies the provider added with the package.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TrialInstall {
+    pub op_id: String,
+    pub dependencies: Vec<String>,
+}
+
+/// The provider a trial asked and the package as that provider names it (DFM-32).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TrialPackage {
+    pub adapter: String,
+    pub name: String,
+    /// Absent when the tool pre-existed and the trial installed nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub install: Option<TrialInstall>,
 }
 
 /// `state/trials/<id>.json`: an active trial and its recoverable baseline.
@@ -1018,6 +1042,13 @@ pub struct TrialRecord {
     pub created_unix_ns: u64,
     pub baseline: Baseline,
     pub owned_outputs: Vec<String>,
+    /// Absent in a record written by the test harness, which installs nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub package: Option<TrialPackage>,
+    /// Effects the trial did not instrument, as fixed tokens (docs/trial.md). They are
+    /// candidates for review, never owned cleanup scope.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unknown: Vec<String>,
 }
 
 impl TrialRecord {
@@ -1041,11 +1072,28 @@ impl TrialRecord {
             .iter()
             .all(|p| valid_path(&p.path) && p.sha256.as_deref().is_none_or(valid_sha256))
             && self.owned_outputs.iter().all(|p| valid_path(p));
-        if paths_ok {
-            Ok(())
-        } else {
-            Err(bad("trial paths are malformed"))
+        if !paths_ok {
+            return Err(bad("trial paths are malformed"));
         }
+        // A name reaches a provider as an argument, so it has the shape of a checked parameter.
+        let plain =
+            |t: &str| !t.is_empty() && t.len() <= 128 && t.chars().all(|c| c.is_ascii_graphic());
+        let owners_ok = self.baseline.owners.iter().all(|o| {
+            !o.is_empty() && o.len() <= MAX_ERROR_BYTES && !o.chars().any(char::is_control)
+        });
+        if !owners_ok || !self.unknown.iter().all(|u| valid_id(u)) {
+            return Err(bad("trial owners or unknown effects are malformed"));
+        }
+        if let Some(p) = &self.package {
+            let install_ok = p
+                .install
+                .as_ref()
+                .is_none_or(|i| valid_id(&i.op_id) && i.dependencies.iter().all(|d| plain(d)));
+            if !plain(&p.adapter) || !plain(&p.name) || !install_ok {
+                return Err(bad("trial package is malformed"));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -1190,10 +1238,22 @@ impl TrialRecord {
             .iter()
             .map(|p| &p.path)
             .chain(&self.owned_outputs);
+        let names = self
+            .package
+            .iter()
+            .flat_map(|p| {
+                [&p.adapter, &p.name].into_iter().chain(
+                    p.install
+                        .iter()
+                        .flat_map(|i| std::iter::once(&i.op_id).chain(&i.dependencies)),
+                )
+            })
+            .chain(self.baseline.owners.iter())
+            .chain(self.unknown.iter());
         let hit = [&self.trial_id, &self.tool]
             .iter()
             .any(|t| leaks(t, secrets))
-            || paths.into_iter().any(|p| leaks(p, secrets));
+            || paths.into_iter().chain(names).any(|p| leaks(p, secrets));
         if hit { Err(secret_in_path()) } else { Ok(()) }
     }
 }
@@ -1945,13 +2005,48 @@ mod tests {
                     existed: false,
                     sha256: None,
                 }],
+                owners: vec![],
             },
             owned_outputs: vec![],
+            package: None,
+            unknown: vec![],
         };
         assert_eq!(TrialRecord::parse(&canonical(&t).unwrap()).unwrap(), t);
-        let mut bad = t;
+        let mut bad = t.clone();
         bad.trial_id = "Bad Id".into();
         assert!(bad.validate().is_err());
+        // The optional fields are left out of the canonical form, so the round trip above is
+        // also the read of a record written before DFM-32.
+        assert!(
+            !String::from_utf8(canonical(&t).unwrap())
+                .unwrap()
+                .contains("package")
+        );
+        let mut with = t;
+        with.package = Some(TrialPackage {
+            adapter: "fake/v1".into(),
+            name: "atuin".into(),
+            install: Some(TrialInstall {
+                op_id: "trial-1-2".into(),
+                dependencies: vec!["libsodium".into()],
+            }),
+        });
+        with.unknown = vec!["services".into()];
+        with.baseline.owners = vec!["mise/v1 (1.0)".into()];
+        assert_eq!(
+            TrialRecord::parse(&canonical(&with).unwrap()).unwrap(),
+            with
+        );
+        with.unknown = vec!["Not A Token".into()];
+        assert!(with.validate().is_err());
+        with.unknown = vec![];
+        with.package.as_mut().unwrap().name = "-rf".into();
+        assert!(
+            with.validate().is_ok(),
+            "a leading dash is the adapter's rule, not the record's"
+        );
+        with.package.as_mut().unwrap().name = "a b".into();
+        assert!(with.validate().is_err());
     }
 
     #[test]
@@ -2285,8 +2380,11 @@ mod tests {
             baseline: Baseline {
                 tool_preexisting: false,
                 paths: vec![],
+                owners: vec![],
             },
             owned_outputs: vec![],
+            package: None,
+            unknown: vec![],
         };
         t.validate().unwrap();
         t.schema = 3;

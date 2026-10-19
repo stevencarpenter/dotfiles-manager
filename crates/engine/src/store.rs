@@ -1010,10 +1010,29 @@ impl Store {
 
     /// Replaces an active trial record atomically.
     pub fn write_trial(&self, t: &TrialRecord) -> Result<(), Refusal> {
-        self.wrote(self.write_trial_inner(t))
+        self.wrote(
+            self.checked_trial(t).and_then(|(dir, name, bytes)| {
+                dir.replace_file(&name, &bytes, &self.fail, "trial")
+            }),
+        )
     }
 
-    fn write_trial_inner(&self, t: &TrialRecord) -> Result<(), Refusal> {
+    /// Creates a trial record that must not exist yet (`RENAME_EXCL`). `Ok(false)` means a
+    /// record of that id was there and nothing was written, so two runs that passed the same
+    /// pre-lock check cannot replace each other's record.
+    pub fn create_trial(&self, t: &TrialRecord) -> Result<bool, Refusal> {
+        let r = self
+            .checked_trial(t)
+            .and_then(|(dir, name, bytes)| dir.publish_new(&name, &bytes, &self.fail, "trial"));
+        match r {
+            // Nothing was written, so this is not a mutation: the caller's refusal exits 3.
+            Ok(false) => Ok(false),
+            r => self.wrote(r),
+        }
+    }
+
+    /// The trials directory, the file name and the bytes of a record that passed every check.
+    fn checked_trial(&self, t: &TrialRecord) -> Result<(Dir, String, Vec<u8>), Refusal> {
         let dir = self
             .guard(Some("trials"))?
             .ok_or_else(|| storage("no trials directory"))?;
@@ -1028,7 +1047,7 @@ impl Store {
         {
             self.check_claim(p)?;
         }
-        dir.replace_file(&format!("{}.json", t.trial_id), &bytes, &self.fail, "trial")
+        Ok((dir, format!("{}.json", t.trial_id), bytes))
     }
 
     /// Stores restorable content for an operation. Only the normal class is allowed: a sensitive

@@ -948,8 +948,11 @@ fn a_hand_written_trial_with_foreign_paths_is_a_finding_not_a_trial() {
                     existed: false,
                     sha256: None,
                 }],
+                owners: vec![],
             },
             owned_outputs: vec![],
+            package: None,
+            unknown: vec![],
         };
         let f = dir.join(format!("{n}.json"));
         fs::write(&f, dfm_model::state::canonical(&t).unwrap()).unwrap();
@@ -991,8 +994,11 @@ fn a_trial_path_under_a_link_parent_is_a_finding() {
                 } else {
                     vec![]
                 },
+                owners: vec![],
             },
             owned_outputs: if owned { vec![path] } else { vec![] },
+            package: None,
+            unknown: vec![],
         };
         let f = dir.join(format!("{n}.json"));
         fs::write(&f, dfm_model::state::canonical(&t).unwrap()).unwrap();
@@ -1106,8 +1112,11 @@ fn every_write_cap_is_enforced_before_anything_is_written() {
                     sha256: None,
                 })
                 .collect(),
+            owners: vec![],
         },
         owned_outputs: vec![],
+        package: None,
+        unknown: vec![],
     };
     assert_eq!(code(s.write_trial(&t)), Code::LimitExceeded);
     assert!(!state.join("trials/big.json").exists());
