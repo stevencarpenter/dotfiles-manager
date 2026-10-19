@@ -199,7 +199,9 @@ fn a_new_tool_is_installed_and_the_trial_record_survives_the_process() {
     assert!(t.contains("receipt: "), "{t}");
     assert!(t.ends_with("result: ok\n"), "{t}");
     assert!(
-        fx.log().contains("brew install homebrew/core/atuin"),
+        fx.log().contains(
+            "brew install homebrew/core/atuin | auto=1 analytics=1 hints=1 cleanup=1 upgrade=1 dependents=1 user=none"
+        ),
         "{}",
         fx.log()
     );
@@ -350,6 +352,64 @@ fn a_tool_with_another_owner_pre_exists_and_is_not_replaced() {
         "{t}"
     );
     assert!(t.contains(".local/bin/atuin"), "{t}");
+    assert!(t.contains("provider: none (no provider lists it)"), "{t}");
+    // The record names no provider: none owns anything here.
+    let o = fx.trial(&["atuin", "--provider", BREW, "--yes-plan", &digest_of(&o)]);
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+    let r = fx.json(&fx.entries("trials")[0]);
+    assert_eq!(r["baseline"]["tool_preexisting"], true);
+    assert!(r.get("package").is_none(), "{r}");
+    assert_eq!(
+        fx.json(&fx.entries("receipts")[0])["operations"][0]["adapter"],
+        "other-owner"
+    );
+}
+
+#[test]
+fn a_record_planted_between_the_check_and_the_lock_is_a_conflict_not_replaced() {
+    let fx = Fx::new();
+    // A pre-existing tool, so the second run changes nothing the locked re-probe would see.
+    fx.brew_installed("atuin 18.24.1\n");
+    let o = fx.trial(&["atuin", "--provider", BREW, "--preview"]);
+    let digest = digest_of(&o);
+    // The first run parks after its pre-lock check; a second run completes meanwhile.
+    let gate = fx.fake.path().join("go");
+    let parked = fx
+        .cmd(
+            &[(
+                "DFM_FAILPOINT",
+                &format!("trial-before-lock:wait-{}", gate.display()),
+            )],
+            &["trial", "atuin", "--provider", BREW, "--yes-plan", &digest],
+        )
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let reached = gate.with_extension("reached");
+    let end = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while !reached.exists() {
+        assert!(
+            std::time::Instant::now() < end,
+            "the failpoint was not reached"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let o = fx.trial(&["atuin", "--provider", BREW, "--yes-plan", &digest]);
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+    let first = fx.json(&fx.entries("trials")[0]);
+    fs::write(&gate, "").unwrap();
+    let o = parked.wait_with_output().unwrap();
+    assert_eq!(code(&o), 3, "{}\n{}", stderr(&o), text(&o.stdout));
+    assert!(
+        stderr(&o).contains("E_CONFLICT trial trial-atuin already exists"),
+        "{}",
+        stderr(&o)
+    );
+    // The first record is untouched, and only the run that wrote it left a receipt.
+    assert_eq!(fx.json(&fx.entries("trials")[0]), first);
+    assert_eq!(fx.entries("trials").len(), 1);
+    assert_eq!(fx.entries("receipts").len(), 1);
 }
 
 #[test]
@@ -386,6 +446,7 @@ fn a_baseline_that_cannot_be_read_blocks_before_any_write() {
         "--preview",
     ]);
     assert_eq!(code(&o), 3, "{}", stderr(&o));
+    assert!(stderr(&o).contains("E_STATE_INVALID"), "{}", stderr(&o));
     assert!(fx.entries("trials").is_empty());
     assert!(fx.entries("receipts").is_empty());
     assert!(fx.journal().is_empty());
@@ -484,7 +545,6 @@ fn a_failed_install_is_journaled_and_the_receipt_says_failed() {
         t.contains("  failed trial-atuin trial-") && t.contains("exited 1"),
         "{t}"
     );
-    assert!(t.contains("exited 1"), "{t}");
     assert!(t.ends_with("result: failed\n"), "{t}");
     assert!(!t.contains("PLANTED-STDERR") && !stderr(&o).contains("PLANTED-STDERR"));
     let phases: Vec<String> = fx
@@ -528,7 +588,8 @@ fn an_ambiguous_provider_is_asked_for_and_a_single_capable_one_is_chosen() {
     let o = fx.trial(&["duckdb", "--yes-plan", &digest_of(&o)]);
     assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
     assert!(
-        fx.log().contains("mise install duckdb | yes=1"),
+        fx.log()
+            .contains("mise install duckdb | yes=1 auto=false noconfig=1"),
         "{}",
         fx.log()
     );
@@ -536,7 +597,8 @@ fn an_ambiguous_provider_is_asked_for_and_a_single_capable_one_is_chosen() {
     let o = fx.trial(&["zzz-unknown", "--preview"]);
     assert_eq!(code(&o), 3, "{}", stderr(&o));
     assert!(
-        stderr(&o).contains("no provider can install it here"),
+        stderr(&o).contains("E_PROBE_FAILED")
+            && stderr(&o).contains("no provider can install it here"),
         "{}",
         stderr(&o)
     );

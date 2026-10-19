@@ -1241,8 +1241,15 @@ impl TrialRecord {
         let names = self
             .package
             .iter()
-            .flat_map(|p| [&p.adapter, &p.name])
-            .chain(self.baseline.owners.iter());
+            .flat_map(|p| {
+                [&p.adapter, &p.name].into_iter().chain(
+                    p.install
+                        .iter()
+                        .flat_map(|i| std::iter::once(&i.op_id).chain(&i.dependencies)),
+                )
+            })
+            .chain(self.baseline.owners.iter())
+            .chain(self.unknown.iter());
         let hit = [&self.trial_id, &self.tool]
             .iter()
             .any(|t| leaks(t, secrets))

@@ -6,26 +6,24 @@
 //! changed.
 
 use crate::adapters::package::{self, HOMEBREW, MISE};
+use crate::apply_cmd::{is_digest, label, stale};
 use crate::read_fs::read_regular_bounded;
 use crate::{Ctx, bounded, read_existing_binding, state_cmd, usage};
 use dfm_engine::{Runner, Store, now_ns, signal};
 use dfm_model::digest::sha256_hex;
-use dfm_model::display::visible;
-use dfm_model::plan::{PackageState, file_fingerprint};
+use dfm_model::display::{bounded_visible, visible};
+use dfm_model::plan::{Binary, PackageState, file_fingerprint};
 use dfm_model::resolve::{Table, Value};
 use dfm_model::state::{
-    Approval, Baseline, BaselinePath, BinaryId, Class, JournalEntry, OperationRecord, Phase,
-    ProfileRef, Receipt, Recovery, RunResult, SCHEMA, Stamp, Status, TrialInstall, TrialPackage,
-    TrialRecord, count_statuses, rfc3339, valid_id, valid_path,
+    Approval, Baseline, BaselinePath, BinaryId, Class, JournalEntry, MAX_BYTES, OperationRecord,
+    Phase, ProfileRef, Receipt, Recovery, RunResult, SCHEMA, Stamp, Status, TrialInstall,
+    TrialPackage, TrialRecord, count_statuses, rfc3339, valid_id, valid_path,
 };
 use dfm_model::{Code, Exit, Refusal};
 use serde_json::json;
 use std::fs;
 use std::io::Write;
 use std::path::Path;
-
-/// The most a baseline read takes from a file, as for the manager's own documents.
-const MAX_BASELINE: u64 = 16 << 20;
 
 /// Effects a trial does not instrument. They are recorded so `purge` treats them as candidates
 /// for review and never as owned cleanup scope (DESIGN.md: the manager is not an OS sandbox).
@@ -80,9 +78,7 @@ pub fn parse_args(args: &[String]) -> Result<Args, Refusal> {
         return Err(usage("--preview and --yes-plan cannot be used together"));
     }
     if let Some(d) = &yes
-        && !(d.len() == 64
-            && d.bytes()
-                .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c)))
+        && !is_digest(d)
     {
         return Err(usage(
             "--yes-plan takes the 64 hex characters of a plan digest",
@@ -105,13 +101,6 @@ pub fn parse_args(args: &[String]) -> Result<Args, Refusal> {
     })
 }
 
-/// The executable name a package installs, as the owner check reads it: the last path
-/// component without its version (`homebrew/core/atuin` and `node@20` give `atuin` and `node`).
-fn short_name(pkg: &str) -> &str {
-    let base = pkg.rsplit('/').next().unwrap_or(pkg);
-    base.split('@').next().unwrap_or(base)
-}
-
 fn package_value(name: &str) -> Value {
     let mut t = Table::new();
     t.insert("name".into(), Value::String(name.into()));
@@ -119,17 +108,22 @@ fn package_value(name: &str) -> Value {
 }
 
 /// What the preview shows and the digest covers: the trial, its provider, what it will install
-/// or found installed, and the baseline observed before any change.
+/// or found installed, the baseline observed before any change, and the identity of the binary
+/// and the binding that decided it.
 struct Decision {
     trial_id: String,
     tool: String,
-    adapter: String,
+    /// The provider that lists or will install the package. `None` when only another owner
+    /// has it: no provider owns anything then.
+    adapter: Option<String>,
     package: String,
     /// The dependencies the install adds, when the trial installs; `None` when the tool
     /// pre-exists and nothing is installed.
     install: Option<Vec<String>>,
     owners: Vec<String>,
     baseline: Vec<BaselinePath>,
+    binary: Binary,
+    stamp: Stamp,
 }
 
 impl Decision {
@@ -148,6 +142,12 @@ impl Decision {
             "owners": self.owners,
             "baseline": paths,
             "unknown": UNKNOWN,
+            "binary": {"version": self.binary.version, "sha256": self.binary.sha256},
+            "binding": {
+                "profile": self.stamp.profile,
+                "machine_id": self.stamp.machine_id,
+                "binding_digest": self.stamp.binding_digest,
+            },
         });
         // `serde_json::Value` keeps object keys sorted, so the bytes are canonical.
         serde_json::to_vec(&doc)
@@ -155,15 +155,10 @@ impl Decision {
             .map_err(|e| Refusal::new(Code::IoFailed, format!("cannot digest the trial: {e}")))
     }
 
-    fn record(
-        &self,
-        binding: &dfm_model::binding::Binding,
-        created: u64,
-        op_id: &str,
-    ) -> TrialRecord {
+    fn record(&self, created: u64, op_id: &str) -> TrialRecord {
         TrialRecord {
             schema: SCHEMA,
-            binding: Stamp::of(binding),
+            binding: self.stamp.clone(),
             trial_id: self.trial_id.clone(),
             tool: self.tool.clone(),
             created_unix_ns: created,
@@ -173,8 +168,8 @@ impl Decision {
                 owners: self.owners.clone(),
             },
             owned_outputs: vec![],
-            package: Some(TrialPackage {
-                adapter: self.adapter.clone(),
+            package: self.adapter.as_ref().map(|adapter| TrialPackage {
+                adapter: adapter.clone(),
                 name: self.package.clone(),
                 install: self.install.as_ref().map(|deps| TrialInstall {
                     op_id: op_id.into(),
@@ -185,26 +180,32 @@ impl Decision {
         }
     }
 
+    /// The adapter a journal entry or receipt operation names.
+    fn adapter_name(&self) -> &str {
+        self.adapter.as_deref().unwrap_or("other-owner")
+    }
+
     fn print(&self, out: &mut dyn Write, digest: &str) -> std::io::Result<()> {
         writeln!(out, "trial: {} tool={}", self.trial_id, self.tool)?;
         writeln!(
             out,
             "provider: {} package={}",
-            self.adapter,
+            self.adapter
+                .as_deref()
+                .unwrap_or("none (no provider lists it)"),
             visible(&self.package)
         )?;
-        match &self.install {
-            Some(deps) if deps.is_empty() => {
-                writeln!(out, "action: install {} with {}", self.tool, self.adapter)?;
+        match (&self.install, &self.adapter) {
+            (Some(deps), Some(adapter)) if deps.is_empty() => {
+                writeln!(out, "action: install {} with {adapter}", self.tool)?;
             }
-            Some(deps) => writeln!(
+            (Some(deps), Some(adapter)) => writeln!(
                 out,
-                "action: install {} with {} (adds dependencies: {})",
+                "action: install {} with {adapter} (adds dependencies: {})",
                 self.tool,
-                self.adapter,
                 visible(&deps.join(", "))
             )?,
-            None => writeln!(
+            _ => writeln!(
                 out,
                 "action: nothing to install; {} pre-exists, owned by {}",
                 self.tool,
@@ -221,7 +222,7 @@ impl Decision {
         }
         writeln!(
             out,
-            "cleanup scope: the install above and every baseline path that was absent; a pre-existing path or tool is never removed. purge (DFM-34) is not built"
+            "cleanup scope: the install above; a baseline path that was absent is a purge candidate that needs its own approval, and a pre-existing path or tool is never removed. purge (DFM-34) is not built"
         )?;
         writeln!(
             out,
@@ -246,7 +247,8 @@ fn block_code(s: &PackageState) -> Code {
 
 /// The providers' answer about a package.
 struct Owner {
-    adapter: String,
+    /// The provider that lists it or will install it; `None` when only another owner has it.
+    adapter: Option<String>,
     /// The dependencies the install adds; `None` when the tool pre-exists.
     install: Option<Vec<String>>,
     owners: Vec<String>,
@@ -283,9 +285,9 @@ fn find_owner(runner: &Runner, pkg: &str, provider: Option<&str>) -> Result<Owne
         let adapter = states
             .iter()
             .find(|(_, s)| matches!(s, PackageState::Installed(_)))
-            .map_or(states[0].0, |(a, _)| a);
+            .map(|(a, _)| (*a).into());
         return Ok(Owner {
-            adapter: adapter.into(),
+            adapter,
             install: None,
             owners,
         });
@@ -299,7 +301,7 @@ fn find_owner(runner: &Runner, pkg: &str, provider: Option<&str>) -> Result<Owne
         .collect();
     match missing.as_slice() {
         [(a, deps)] => Ok(Owner {
-            adapter: (*a).into(),
+            adapter: Some((*a).into()),
             install: Some((*deps).clone()),
             owners: vec![],
         }),
@@ -355,13 +357,15 @@ fn observe(path: &str) -> Result<BaselinePath, Refusal> {
     let sha256 = if seen.is_dir() {
         None
     } else if seen.is_file() {
+        // The same cap as the manager's own documents.
+        let limit = u64::try_from(MAX_BYTES).unwrap_or(u64::MAX);
         let bytes = read_regular_bounded(
             Path::new(path),
-            MAX_BASELINE,
+            limit,
             |e| fail(format!("{path}: {}", e.kind())),
             || fail(format!("{path} changed while it was read")),
         )?;
-        if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > MAX_BASELINE {
+        if bytes.len() > MAX_BYTES {
             return Err(fail(format!("{path} is larger than the read limit")));
         }
         Some(file_fingerprint(&bytes))
@@ -380,19 +384,14 @@ fn observe(path: &str) -> Result<BaselinePath, Refusal> {
 /// The configuration candidates: the explicit `--config` paths, or `~/.config/<tool>` when
 /// none is given. A relative path is inside HOME.
 fn candidates(home: &Path, tool: &str, configs: &[String]) -> Result<Vec<String>, Refusal> {
-    let given: Vec<&str> = if configs.is_empty() {
+    if configs.is_empty() {
         // shortcut: one XDG candidate for every tool, upgrade when an adapter can declare paths
-        vec![]
-    } else {
-        configs.iter().map(String::as_str).collect()
-    };
-    let mut out = Vec::new();
-    if given.is_empty() {
-        out.push(home.join(".config").join(tool).display().to_string());
+        return Ok(vec![home.join(".config").join(tool).display().to_string()]);
     }
-    for c in given {
+    let mut out = Vec::new();
+    for c in configs {
         let p = if c.starts_with('/') {
-            c.to_string()
+            c.clone()
         } else {
             home.join(c).display().to_string()
         };
@@ -419,7 +418,7 @@ pub fn run(ctx: &Ctx, args: &Args, out: &mut dyn Write) -> Result<(), Refusal> {
     })?;
     // The adapter's own name check, before any provider sees the name.
     let package = package::name(&package_value(&args.package)).map_err(|e| usage(e.detail))?;
-    let tool = short_name(&package).to_string();
+    let tool = package::leaf(&package).to_string();
     if !valid_id(&tool) {
         return Err(usage(format!(
             "the tool name {} must be lowercase ASCII letters, digits, '.', '_' or '-' (1 to 64 characters)",
@@ -432,6 +431,9 @@ pub fn run(ctx: &Ctx, args: &Args, out: &mut dyn Write) -> Result<(), Refusal> {
             "--id must be lowercase ASCII letters, digits, '.', '_' or '-' (1 to 64 characters)",
         ));
     }
+    // The binary identity is part of the digest and the receipt; read it before anything runs.
+    let binary = crate::plan_cmd::binary_identity()?;
+    let stamp = Stamp::of(&binding);
     // The providers run before anything is decided, so the handlers go in first: a stop request
     // ends the probe instead of leaving it running (docs/packages.md).
     signal::install()?;
@@ -457,6 +459,8 @@ pub fn run(ctx: &Ctx, args: &Args, out: &mut dyn Write) -> Result<(), Refusal> {
             install: owner.install,
             owners: owner.owners,
             baseline,
+            binary: binary.clone(),
+            stamp: stamp.clone(),
         })
     };
     let first = decide()?;
@@ -483,15 +487,19 @@ pub fn run(ctx: &Ctx, args: &Args, out: &mut dyn Write) -> Result<(), Refusal> {
         ));
     };
     let file = format!("{trial_id}.json");
-    if readable.load().trials.iter().any(|(n, _)| *n == file) {
-        return Err(Refusal::new(
+    let conflict = || {
+        Refusal::new(
             Code::Conflict,
             format!(
                 "trial {trial_id} already exists in state/trials/; nothing was changed. Fix: pass another --id, or purge it (DFM-34, not built)"
             ),
-        ));
+        )
+    };
+    if readable.load().trials.iter().any(|(n, _)| *n == file) {
+        return Err(conflict());
     }
     drop(readable);
+    fail.hit("trial-before-lock")?;
 
     // Take the lock, then decide again: the providers or the baseline may have changed.
     let store = Store::open_write_with(sys, &layout, fail.clone(), false)?;
@@ -511,22 +519,28 @@ pub fn run(ctx: &Ctx, args: &Args, out: &mut dyn Write) -> Result<(), Refusal> {
     }
     let started = now_ns().map_err(|r| store.stamp(r))?;
     let op_id = format!("trial-{started}-{}", std::process::id());
-    // The baseline is durable before the provider changes anything (C02).
-    store.write_trial(&locked.record(&binding, started, &op_id))?;
+    // The baseline is durable before the provider changes anything (C02). The create is
+    // exclusive, so a record another run wrote since the check above is a conflict, not
+    // replaced.
+    if !store.create_trial(&locked.record(started, &op_id))? {
+        return Err(store.stamp(conflict()));
+    }
 
+    // From here on the record exists and every outcome, journaled or not, ends in a receipt and
+    // a result line; a refusal is after a mutation (architecture section 10).
     let mut status = Status::Current;
     let mut stopped: Option<Refusal> = None;
     if locked.install.is_some() {
         let value = package_value(&package);
-        let entry = |phase, recovery, reason| -> Result<JournalEntry, Refusal> {
-            Ok(JournalEntry {
+        let journal = |phase, recovery, reason| -> Result<(), Refusal> {
+            store.append_journal(&JournalEntry {
                 schema: SCHEMA,
                 op_id: op_id.clone(),
                 op: "install".into(),
                 phase,
                 at: rfc3339(now_ns()?),
                 resource: trial_id.clone(),
-                adapter: locked.adapter.clone(),
+                adapter: locked.adapter_name().into(),
                 class: Class::Normal,
                 recovery,
                 token: None,
@@ -534,40 +548,66 @@ pub fn run(ctx: &Ctx, args: &Args, out: &mut dyn Write) -> Result<(), Refusal> {
             })
         };
         // The intent has no path: the provider's listing is the record, as for `packages`.
-        let intent = entry(
+        let intent = journal(
             Phase::Intent,
             Some(Recovery {
                 outputs: vec![],
                 snapshot: None,
             }),
             None,
-        )?;
-        store.append_journal(&intent)?;
-        let result = fail
-            .hit("trial-after-intent")
-            .and_then(|()| package::install(&runner, &locked.adapter, &value))
-            .and_then(|()| match (package::probe(&runner, &locked.adapter, &value)?, signal::requested()) {
-                (PackageState::Installed(_), _) => Ok(()),
-                (_, Some(stop)) => Err(Refusal::new(
-                    stop.code,
-                    "stopped before the postcondition was checked; the install may have completed, and the next trial for this tool is refused until this one is purged",
-                )),
-                (s, None) => Err(Refusal::new(
-                    Code::IoFailed,
-                    format!(
-                        "postcondition failed: the provider reports {} after the install",
-                        s.state()
-                    ),
-                )),
-            });
+        );
+        // The install and its postcondition, as `try_install` in the engine runs them for a
+        // package (crates/engine/src/apply.rs).
+        let result = intent.and_then(|()| {
+            fail.hit("trial-after-intent")
+                .and_then(|()| package::install(&runner, locked.adapter_name(), &value))
+                .and_then(|()| {
+                    match (
+                        package::probe(&runner, locked.adapter_name(), &value)?,
+                        signal::requested(),
+                    ) {
+                        (PackageState::Installed(_), _) => Ok(()),
+                        (_, Some(stop)) => Err(Refusal::new(
+                            stop.code,
+                            "stopped before the postcondition was checked; the install may have completed, and the next trial for this tool is refused until this one is purged",
+                        )),
+                        (s, None) => Err(Refusal::new(
+                            Code::IoFailed,
+                            format!(
+                                "postcondition failed: the provider reports {} after the install",
+                                s.state()
+                            ),
+                        )),
+                    }
+                })
+                // An effect whose outcome entry cannot be written is a failed operation, as
+                // the engine records it; the text names both causes.
+                .and_then(|()| {
+                    journal(Phase::Done, None, None).map_err(|n| {
+                        Refusal::new(
+                            n.code,
+                            format!(
+                                "installed, but the outcome could not be journaled: {}",
+                                n.detail
+                            ),
+                        )
+                    })
+                })
+        });
         match result {
-            Ok(()) => {
-                store.append_journal(&entry(Phase::Done, None, None)?)?;
-                status = Status::Updated;
-            }
+            Ok(()) => status = Status::Updated,
             Err(e) => {
-                let why = dfm_model::display::bounded_visible(&e.detail, 1024);
-                store.append_journal(&entry(Phase::Failed, None, Some(why))?)?;
+                let why = bounded_visible(&e.detail, 1024);
+                let e = match journal(Phase::Failed, None, Some(why)) {
+                    Ok(()) => e,
+                    Err(n) => Refusal::new(
+                        e.code,
+                        format!(
+                            "{}; the outcome could not be journaled: {}",
+                            e.detail, n.detail
+                        ),
+                    ),
+                };
                 status = Status::Failed;
                 stopped = Some(e.after_mutation());
             }
@@ -575,15 +615,13 @@ pub fn run(ctx: &Ctx, args: &Args, out: &mut dyn Write) -> Result<(), Refusal> {
     }
     let finished = now_ns().unwrap_or(started);
     let exit = stopped.as_ref().map_or(Exit::Ok, Refusal::exit);
-    let error = stopped
-        .as_ref()
-        .map(|e| dfm_model::display::bounded_visible(&e.detail, 1024));
+    let error = stopped.as_ref().map(|e| bounded_visible(&e.detail, 1024));
     // The one operation carries the journal id, as an apply operation that reached its intent
     // does, so the record, the journal and the receipt are joined by that id.
     let ops = vec![OperationRecord {
         id: op_id.clone(),
         resource: trial_id.clone(),
-        adapter: locked.adapter.clone(),
+        adapter: locked.adapter_name().into(),
         class: Class::Normal,
         status,
         started_at: Some(rfc3339(started)),
@@ -594,8 +632,6 @@ pub fn run(ctx: &Ctx, args: &Args, out: &mut dyn Write) -> Result<(), Refusal> {
         error: error.clone(),
         reload: None,
     }];
-    let stamp = Stamp::of(&binding);
-    let binary = crate::plan_cmd::binary_identity().map_err(|r| store.stamp(r))?;
     let receipt = Receipt {
         schema: SCHEMA,
         op_id: op_id.clone(),
@@ -628,13 +664,8 @@ pub fn run(ctx: &Ctx, args: &Args, out: &mut dyn Write) -> Result<(), Refusal> {
         operations: ops,
     };
     let receipt_name = store.write_receipt(&receipt);
-    let label = match status {
-        Status::Updated => "updated",
-        Status::Current => "current",
-        _ => "failed",
-    };
     let error = error.map_or(String::new(), |e| format!(": {e}"));
-    writeln!(out, "  {label} {trial_id} {op_id}{error}").map_err(w)?;
+    writeln!(out, "  {} {trial_id} {op_id}{error}", label(status)).map_err(w)?;
     writeln!(out, "trial: state/trials/{file}").map_err(w)?;
     let outcome = match (receipt_name, stopped) {
         (Ok(name), stopped) => {
@@ -644,6 +675,7 @@ pub fn run(ctx: &Ctx, args: &Args, out: &mut dyn Write) -> Result<(), Refusal> {
         // The journal and the trial record stay the record; the higher-ranked exit wins and
         // the receipt failure wins a tie.
         (Err(e), stopped) => {
+            let e = e.after_mutation();
             writeln!(out, "receipt: not written ({})", visible(&e.to_string())).map_err(w)?;
             match stopped {
                 Some(r) if e.exit().combine(r.exit()) != e.exit() => Err(r),
@@ -656,25 +688,9 @@ pub fn run(ctx: &Ctx, args: &Args, out: &mut dyn Write) -> Result<(), Refusal> {
     outcome
 }
 
-fn stale(approved: &str, now: &str) -> Refusal {
-    Refusal::new(
-        Code::PlanStale,
-        format!(
-            "the approved plan digest {approved} is not the digest of the trial for this machine now ({now}). Fix: read the new trial with --preview and approve its digest"
-        ),
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn the_short_name_drops_tap_and_version() {
-        assert_eq!(short_name("homebrew/core/atuin"), "atuin");
-        assert_eq!(short_name("node@20"), "node");
-        assert_eq!(short_name("duckdb"), "duckdb");
-    }
 
     #[test]
     fn arguments_take_one_package_and_repeated_config_paths() {
@@ -720,12 +736,12 @@ mod tests {
     }
 
     #[test]
-    fn the_digest_covers_the_baseline_and_the_install() {
-        let d = |install: Option<Vec<String>>, existed: bool| {
+    fn the_digest_covers_the_baseline_the_install_the_binary_and_the_binding() {
+        let d = |install: Option<Vec<String>>, existed: bool, sha: &str, machine: &str| {
             Decision {
                 trial_id: "trial-a".into(),
                 tool: "a".into(),
-                adapter: HOMEBREW.into(),
+                adapter: Some(HOMEBREW.into()),
                 package: "a".into(),
                 install,
                 owners: vec![],
@@ -734,13 +750,25 @@ mod tests {
                     existed,
                     sha256: None,
                 }],
+                binary: Binary {
+                    version: "0".into(),
+                    sha256: sha.into(),
+                },
+                stamp: Stamp {
+                    profile: "p".into(),
+                    machine_id: machine.into(),
+                    binding_digest: "d".into(),
+                },
             }
             .digest()
             .unwrap()
         };
-        assert_eq!(d(Some(vec![]), false), d(Some(vec![]), false));
-        assert_ne!(d(Some(vec![]), false), d(Some(vec!["dep".into()]), false));
-        assert_ne!(d(Some(vec![]), false), d(Some(vec![]), true));
-        assert_ne!(d(Some(vec![]), false), d(None, false));
+        let base = d(Some(vec![]), false, "s1", "m1");
+        assert_eq!(base, d(Some(vec![]), false, "s1", "m1"));
+        assert_ne!(base, d(Some(vec!["dep".into()]), false, "s1", "m1"));
+        assert_ne!(base, d(Some(vec![]), true, "s1", "m1"));
+        assert_ne!(base, d(None, false, "s1", "m1"));
+        assert_ne!(base, d(Some(vec![]), false, "s2", "m1"));
+        assert_ne!(base, d(Some(vec![]), false, "s1", "m2"));
     }
 }

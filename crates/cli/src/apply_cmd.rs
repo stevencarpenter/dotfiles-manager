@@ -81,9 +81,7 @@ pub fn parse_args(args: &[String], scope: Scope) -> Result<Args, Refusal> {
         return Err(usage("--preview and --yes-plan cannot be used together"));
     }
     if let Some(d) = &yes
-        && !(d.len() == 64
-            && d.bytes()
-                .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c)))
+        && !is_digest(d)
     {
         return Err(usage(
             "--yes-plan takes the 64 hex characters of a plan digest",
@@ -100,7 +98,14 @@ pub fn parse_args(args: &[String], scope: Scope) -> Result<Args, Refusal> {
     })
 }
 
-fn stale(approved: &str, now: &str) -> Refusal {
+/// Whether `d` has the shape of a plan digest: 64 lowercase hex characters.
+pub(crate) fn is_digest(d: &str) -> bool {
+    d.len() == 64
+        && d.bytes()
+            .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
+}
+
+pub(crate) fn stale(approved: &str, now: &str) -> Refusal {
     Refusal::new(
         Code::PlanStale,
         format!(
@@ -109,7 +114,7 @@ fn stale(approved: &str, now: &str) -> Refusal {
     )
 }
 
-fn label(s: Status) -> &'static str {
+pub(crate) fn label(s: Status) -> &'static str {
     match s {
         Status::Updated => "updated",
         Status::Current => "current",
