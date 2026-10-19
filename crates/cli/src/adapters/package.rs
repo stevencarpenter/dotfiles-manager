@@ -639,6 +639,16 @@ fn uv_receipt_source(home: &Path, name: &str) -> Result<Option<String>, String> 
                 "installed from a {key} source, which an upgrade would resolve again outside the plan"
             )));
         }
+        // `uv tool upgrade` respects the version constraint the install recorded, so an
+        // `==` or `<` specifier means the upgrade can never advance while the row would read
+        // as rolling. The constraint is held until the plan represents it.
+        if let Some(spec) = r.get("specifier").and_then(Value::as_str)
+            && !spec.trim().is_empty()
+        {
+            return Ok(Some(
+                "installed with a version constraint in the receipt, which an upgrade respects outside the plan".into(),
+            ));
+        }
     }
     let options = tool
         .and_then(|t| t.get("options"))
@@ -1152,6 +1162,18 @@ mod tests {
             uv_receipt_source(&home, "agent-reap"),
             Ok(source("directory"))
         );
+        // A retained version constraint is respected by `uv tool upgrade`, so it holds too; an
+        // empty specifier is the default and rolls.
+        receipt("[tool]\nrequirements = [{ name = \"agent-reap\", specifier = \"==0.5\" }]\n");
+        assert_eq!(
+            uv_receipt_source(&home, "agent-reap"),
+            Ok(Some(
+                "installed with a version constraint in the receipt, which an upgrade respects outside the plan"
+                    .into()
+            ))
+        );
+        receipt("[tool]\nrequirements = [{ name = \"agent-reap\", specifier = \"\" }]\n");
+        assert_eq!(uv_receipt_source(&home, "agent-reap"), Ok(None));
         // A persisted install option is kept by `uv tool upgrade`: an index the plan never
         // showed, or any other setting, holds the tool.
         for (options, keys) in [
