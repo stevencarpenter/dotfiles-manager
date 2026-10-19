@@ -634,7 +634,6 @@ install_unfinished() {
   [ -z "$left" ] || echo "bootstrap: install did not finish; left in place: $left" >&2
 }
 
-# Read-only identity checks of the git repository at $src (a checkout or a bare clone); sets fmt and hint.
 # Read-only checks of a git repository's own configuration at $1. git archive would apply
 # checkout-local attributes (export-ignore, export-subst) and run filter commands from the
 # checkout's config, so the staged tree could differ from the pinned commit. The build reads a
@@ -692,12 +691,21 @@ cmd_install() {
   build=$CACHE/build
   # install resets the build directory, so neither this script nor a local source may live in it.
   # Paths are resolved (cd -P) before the comparison, so `..` segments and symlinked directories
-  # cannot hide the location; only an existing build directory can hold anything.
+  # cannot hide the location, and a symlink leaf is followed (a directory fully, a file one level);
+  # only an existing build directory can hold anything.
   if build_real=$(cd -P "$build" 2>/dev/null && pwd -P); then
     for _p in "$script_path" "${src#file://}"; do
       [ -n "$_p" ] || continue
       _d=$(cd -P "${_p%/*}/" 2>/dev/null && pwd -P) || continue
-      case ${_d%/}/${_p##*/} in "$build_real"|"$build_real/"*) refuse E_PREREQ_MISSING "$_p is inside the build directory $build, which install resets; move it elsewhere first" ;; esac
+      _r=${_d%/}/${_p##*/}
+      if [ -d "$_r" ]; then _r=$(cd -P "$_r" 2>/dev/null && pwd -P) || continue
+      elif [ -L "$_r" ]; then
+        _t=$(readlink "$_r") || continue
+        case $_t in /*) ;; *) _t=${_d%/}/$_t ;; esac
+        _d=$(cd -P "${_t%/*}/" 2>/dev/null && pwd -P) || continue
+        _r=${_d%/}/${_t##*/}
+      fi
+      case $_r in "$build_real"|"$build_real/"*) refuse E_PREREQ_MISSING "$_p is inside the build directory $build, which install resets; move it elsewhere first" ;; esac
     done
   fi
   # Every source is read through a bare clone with transfer.fsckObjects=true: git does not verify a
@@ -710,10 +718,11 @@ cmd_install() {
     "") clone_url=$ORIGIN ;;
     https://*|file://*) clone_url=$src ;;
     *://*) refuse E_SOURCE_UNTRUSTED "--source must be a local path, an https:// URL or a file:// URL" ;;
-    *) check_checkout_config "$src"; clone_url=file://$src ;;
+    # git percent-decodes a file:// URL, so a % in the path is encoded.
+    *) check_checkout_config "$src"; clone_url=file://$(printf '%s' "$src" | sed 's/%/%25/g') ;;
   esac
-  # A URL with userinfo is printed without it.
-  case $clone_url in *@*) shown_url=${clone_url%%://*}://${clone_url#*@} ;; *) shown_url=$clone_url ;; esac
+  # An https:// URL with userinfo is printed without it.
+  case $clone_url in https://*@*) shown_url=https://${clone_url#*@} ;; *) shown_url=$clone_url ;; esac
   check_command_path
   check_config_tree; check_binding
   check_cache_tree; check_data_tree; check_bin_dir

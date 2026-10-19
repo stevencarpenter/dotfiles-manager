@@ -49,7 +49,17 @@ fn git(dir: &Path, args: &[&str]) -> String {
         .env("HOME", "/var/empty")
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .env("GIT_CONFIG_NOSYSTEM", "1")
-        .args(["-c", "user.name=t", "-c", "user.email=t@example.invalid"])
+        // maintenance.auto=false: a commit of the repository copy would otherwise detach
+        // `git maintenance run --auto` (git 2.54 repacks even with gc.auto=0), which removes the
+        // loose objects while a local bare clone is still hardlinking them.
+        .args([
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@example.invalid",
+            "-c",
+            "maintenance.auto=false",
+        ])
         .args(args)
         .output()
         .unwrap();
@@ -2779,6 +2789,12 @@ fn a_url_source_is_cloned_at_the_exact_commit_and_the_clone_is_removed() {
         build_dirs_gone(&p),
         "the staging clone must go with the build directory"
     );
+    // git percent-decodes file:// URLs, so a local path with a % must be encoded by the script.
+    let percent = p.tmp.path().join("src%41");
+    fs::rename(&p.src, &percent).unwrap();
+    let o = install_from(&p, percent.to_str().unwrap(), &p.sha);
+    assert_eq!(o.status.code(), Some(0), "{}", err(&o));
+    fs::rename(&percent, &p.src).unwrap();
     // Without --source the canonical origin would be cloned, after the local checks: the missing
     // tools refusal comes first, so no network is touched here. The source is named up front.
     let o = script_test_mode(
@@ -2885,13 +2901,17 @@ fn a_script_or_source_inside_the_build_directory_is_refused_before_the_reset() {
     assert!(copy.is_file(), "the running script was removed");
     let inside = build.join("src");
     fs::create_dir_all(&inside).unwrap();
-    // The path itself, a `..` route, a symlinked directory and a file:// form all resolve to it.
+    // The path itself, a `..` route, a symlinked directory, a symlink leaf and a file:// form all
+    // resolve to it.
     let link = _tmp.path().join("link");
     std::os::unix::fs::symlink(&build, &link).unwrap();
+    let leaf = _tmp.path().join("leaf");
+    std::os::unix::fs::symlink(&inside, &leaf).unwrap();
     for route in [
         inside.clone(),
         build.join("../build/src"),
         link.join("src"),
+        leaf,
         PathBuf::from(format!("file://{}", inside.display())),
     ] {
         let o = install_tiny(&home, &route, &sha);
@@ -2908,4 +2928,29 @@ fn a_script_or_source_inside_the_build_directory_is_refused_before_the_reset() {
             route.display()
         );
     }
+    // The script reached through a symlink leaf outside the build directory.
+    let script_link = _tmp.path().join("bootstrap.sh");
+    std::os::unix::fs::symlink(&copy, &script_link).unwrap();
+    let o = script_file(
+        &script_link,
+        &home,
+        &[
+            "install",
+            "--source",
+            src.to_str().unwrap(),
+            "--commit",
+            &sha,
+        ],
+        &[
+            ("DFM_BOOTSTRAP_TEST", "1"),
+            ("DFM_TEST_HOME", home.to_str().unwrap()),
+        ],
+    );
+    assert_eq!(o.status.code(), Some(3), "{}", err(&o));
+    assert!(
+        err(&o).contains("inside the build directory"),
+        "{}",
+        err(&o)
+    );
+    assert!(copy.is_file(), "the running script was removed");
 }
