@@ -590,6 +590,37 @@ fn stage_source<'a>(
     })
 }
 
+/// A nested source lands at `base/<path>`. Every component of that path that exists must be a
+/// real directory: a symlink there would carry the checkout (and git's writes) outside `base`.
+/// A component that does not exist yet is fine; git creates it.
+fn check_nested_path(base: &Path, path: &str) -> Result<(), Refusal> {
+    let mut at = base.to_path_buf();
+    for component in path.split('/') {
+        at.push(component);
+        match fs::symlink_metadata(&at) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(io_failed("nested source path", &e)),
+            Ok(m) if m.file_type().is_symlink() => {
+                return Err(Refusal::new(
+                    Code::SourceEscape,
+                    format!(
+                        "{} is a symlink; a nested source path may not pass through one",
+                        visible(&at.display().to_string())
+                    ),
+                ));
+            }
+            Ok(m) if !m.is_dir() => {
+                return Err(conflict(format!(
+                    "{} is not a directory; move it aside",
+                    visible(&at.display().to_string())
+                )));
+            }
+            Ok(_) => {}
+        }
+    }
+    Ok(())
+}
+
 /// Copies the checkout into staging and rehearses every source there: the root first, from the
 /// lock at `root`; then the nested sources that the fetched root's lock declares, each origin
 /// checked against the grants before its fetch. Returns the fetched lock and the staged sources.
@@ -639,6 +670,8 @@ fn stage_all<'a>(
         ..staged_root
     }];
     for src in fetched.sources.iter().skip(1) {
+        check_nested_path(root, &src.path)?;
+        check_nested_path(tree, &src.path)?;
         staged.push(stage_source(
             git,
             src,

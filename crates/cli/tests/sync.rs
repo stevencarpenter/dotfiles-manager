@@ -836,3 +836,27 @@ fn a_lock_without_sources_or_a_root_that_is_no_checkout_is_refused() {
     assert!(stderr(&o).contains("E_SOURCE_UNTRUSTED"), "{}", stderr(&o));
     assert!(stderr(&o).contains("not canonical"), "{}", stderr(&o));
 }
+
+#[test]
+fn a_nested_path_through_a_symlink_is_refused_before_any_checkout_is_created() {
+    let fx = Fx::new();
+    let (ext, _pin) = fx.add_ext();
+    fx.trust(&ext.origin());
+    let old = fx.head();
+    // `base/ext` would land through a link that leaves the checkout.
+    let outside = TempDir::new("sync-outside");
+    std::os::unix::fs::symlink(outside.path(), fx.root.join("base/ext")).unwrap();
+    let o = fx.preview();
+    assert_eq!(code(&o), 3, "{}\n{}", stdout(&o), stderr(&o));
+    assert!(stderr(&o).contains("E_SOURCE_ESCAPE"), "{}", stderr(&o));
+    assert!(stderr(&o).contains("symlink"), "{}", stderr(&o));
+    assert_eq!(fx.head(), old);
+    assert!(
+        fs::read_dir(outside.path()).unwrap().next().is_none(),
+        "something was written outside the checkout"
+    );
+    assert!(
+        fx.root.join("base/ext").is_symlink(),
+        "the link was replaced"
+    );
+}
