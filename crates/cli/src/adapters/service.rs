@@ -313,11 +313,13 @@ fn launchd_state(runner: &Runner, value: &Value) -> Result<ServiceFacts, Refusal
         Err(why) => return Ok(only(ServiceState::Unknown(why))),
     };
     let text = String::from_utf8_lossy(&bytes);
+    // The found label is never repeated: the definition can be a secret output, and a template
+    // error can put a token in the Label slot. The declared label is manifest data.
     match label_in(&text) {
         Some(l) if l == label => {}
-        Some(l) => {
+        Some(_) => {
             return Ok(only(ServiceState::Refused(format!(
-                "{plist} declares the label {l}, not {label}; loading it would load another agent"
+                "{plist} declares another label than {label}; loading it would load another agent"
             ))));
         }
         None => {

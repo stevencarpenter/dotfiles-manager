@@ -62,7 +62,7 @@ The probe answers map to one of:
 | `Foreign(detail)` | loaded from a definition that is not the declared one (launchd) | blocker `E_CONFLICT` with the `launchctl bootout` command to run by hand; `--restart` does not apply |
 | `Missing(why)` | the definition is not published, or the formula is not installed | blocker `E_CONFLICT`: run `apply` or `packages` first |
 | `Unknown(why)` | the launcher did not answer, or not in a known shape | blocker `E_PROBE_FAILED` |
-| `Refused(why)` | the declaration is wrong: bad label or name, a definition that declares another label, a definition that is not an XML property list | blocker `E_MANIFEST_INVALID` |
+| `Refused(why)` | the declaration is wrong: bad label or name, a definition that declares another label (the found label is never repeated: the file can be a secret output), a definition that is not an XML property list | blocker `E_MANIFEST_INVALID` |
 
 The detail strings carry no process id and no time, because the probe state is the precondition apply compares after it probes again under the lock.
 

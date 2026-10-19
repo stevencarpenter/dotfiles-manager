@@ -831,10 +831,11 @@ fn the_definition_must_declare_the_label_and_a_changed_prerequisite_makes_the_pl
     assert_eq!(code(&o), 3, "{}\n{}", stderr(&o), text(&o.stdout));
     assert!(stderr(&o).contains("E_MANIFEST_INVALID"), "{}", stderr(&o));
     assert!(
-        stderr(&o).contains("declares the label org.example.other, not org.example.maxfiles"),
+        stderr(&o).contains("declares another label than org.example.maxfiles"),
         "{}",
         stderr(&o)
     );
+    assert!(!stderr(&o).contains("org.example.other"), "{}", stderr(&o));
     assert!(!fx.log().contains("launchctl"), "{}", fx.log());
     fx.put(
         "base/modules/extra/files/org.example.maxfiles.plist",
@@ -1037,6 +1038,24 @@ fn a_secret_definition_shows_neither_its_hash_nor_its_arguments() {
     assert_eq!(code(&o), 3, "{}\n{}", stderr(&o), text(&o.stdout));
     assert!(stderr(&o).contains("E_PLAN_STALE"), "{}", stderr(&o));
     assert!(!stderr(&o).contains(&hash), "{}", stderr(&o));
+    // A template error that puts a token in the Label slot: the blocker names the declared
+    // label only, never the one found in the file.
+    fs::set_permissions(&plist, fs::Permissions::from_mode(0o600)).unwrap();
+    fs::write(
+        &plist,
+        AGENT_PLIST.replace("org.example.maxfiles", "TOKEN-hunter2-label"),
+    )
+    .unwrap();
+    let o = fx.preview(&[]);
+    assert_eq!(code(&o), 3, "{}\n{}", stderr(&o), text(&o.stdout));
+    assert!(stderr(&o).contains("E_MANIFEST_INVALID"), "{}", stderr(&o));
+    assert!(
+        stderr(&o).contains("declares another label than org.example.maxfiles"),
+        "{}",
+        stderr(&o)
+    );
+    let shown = format!("{}{}", text(&o.stdout), stderr(&o));
+    assert!(!shown.contains("hunter2"), "{shown}");
 }
 
 #[test]
