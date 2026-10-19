@@ -1050,6 +1050,11 @@ fn a_checkout_configuration_outside_the_allowlist_is_refused_before_any_fetch() 
             included.to_str().unwrap().to_string(),
             "include.path",
         ),
+        (
+            "branch.main.mergeOptions",
+            "--no-ff".to_string(),
+            "branch.*.mergeoptions",
+        ),
     ] {
         git(&fx.root, &["config", key, &value]);
         let o = without_remote(&fx, || fx.preview());
@@ -1068,7 +1073,19 @@ fn a_checkout_configuration_outside_the_allowlist_is_refused_before_any_fetch() 
             fx.staging_leftovers()
         );
     }
-    // The configuration a clone writes (core.*, remote.origin.*, branch.main.*) passes.
+    // The configuration a clone writes (core.*, remote.origin.*, branch.main.*) passes, with a
+    // second remote and the keys editor and tool integrations leave in a checkout.
+    for (key, value) in [
+        ("remote.second.url", "/nowhere"),
+        ("remote.second.fetch", "+refs/heads/*:refs/remotes/second/*"),
+        ("branch.main.vscode-merge-base", "origin/main"),
+        ("coderabbit.defaultBranch", "main"),
+        ("worktrunk.default-branch", "main"),
+        ("worktrunk.hints.shell-integration", "false"),
+        ("worktrunk.history", "1"),
+    ] {
+        git(&fx.root, &["config", key, value]);
+    }
     let o = fx.preview();
     assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
 }

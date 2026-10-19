@@ -500,12 +500,18 @@ fn config_key_allowed(key: &str) -> bool {
     let Some((section, rest)) = key.split_once('.') else {
         return false;
     };
+    // Namespaces of tools that write into .git/config; git itself reads no key there.
+    if matches!(section, "worktrunk" | "coderabbit") {
+        return true;
+    }
     let Some((_, name)) = rest.rsplit_once('.') else {
         return false;
     };
+    // Not branch.<name>.mergeOptions or .rebase: mergeOptions reaches `merge`.
     matches!(
         (section, name),
-        ("remote", "url" | "fetch" | "pushurl") | ("branch", "remote" | "merge")
+        ("remote", "url" | "fetch" | "pushurl")
+            | ("branch", "remote" | "merge" | "vscode-merge-base")
     )
 }
 
