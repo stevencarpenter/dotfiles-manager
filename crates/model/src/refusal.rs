@@ -80,6 +80,9 @@ pub enum Code {
     RenderFailed,
     // Added by DFM-23 (docs/packages.md). A package probe could not decide the installed state.
     ProbeFailed,
+    // Added by DFM-26 (docs/lifecycle.md). A launcher accepted a request and the completion was
+    // not observed within the bound: the operation is `pending`, exit 5, never a success.
+    Pending,
 }
 
 impl Code {
@@ -143,6 +146,7 @@ impl Code {
         Code::CredentialUnavailable,
         Code::RenderFailed,
         Code::ProbeFailed,
+        Code::Pending,
     ];
 
     pub fn parse(s: &str) -> Option<Code> {
@@ -209,6 +213,7 @@ impl Code {
             Code::CredentialUnavailable => "E_CREDENTIAL_UNAVAILABLE",
             Code::RenderFailed => "E_RENDER_FAILED",
             Code::ProbeFailed => "E_PROBE_FAILED",
+            Code::Pending => "E_PENDING",
         }
     }
 
@@ -224,6 +229,8 @@ impl Code {
             // Section 10: a stop by signal exits 130 or 143, also after a mutation.
             Code::Interrupted => Exit::Interrupted,
             Code::Terminated => Exit::Terminated,
+            // Section 10: a queued request whose completion was not observed exits 5.
+            Code::Pending => Exit::Pending,
             _ => Exit::Blocked,
         }
     }

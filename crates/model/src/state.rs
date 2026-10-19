@@ -498,10 +498,13 @@ pub struct OperationRecord {
     pub reload: Option<String>,
 }
 
-/// The consumer reload states the manager can record. Only `not_attempted` exists until a
-/// `Reloader` does (architecture section 11 names `requested`, `reloaded`, `unsupported` and
-/// `failed` for it). A state nothing can write is refused, so a receipt cannot claim one.
-pub const RELOADS: [&str; 1] = ["not_attempted"];
+/// The consumer reload states the manager can record. A published file records `not_attempted`:
+/// publishing does not reload the program that reads it. A service operation (docs/lifecycle.md)
+/// records `reloaded` when its launcher reports the consumer loaded as declared after the
+/// action, and `requested` when the launcher accepted the request and the completion was not
+/// observed within the bound (the operation is then `pending`). A state nothing can write is
+/// refused, so a receipt cannot claim one.
+pub const RELOADS: [&str; 3] = ["not_attempted", "requested", "reloaded"];
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -719,11 +722,14 @@ impl Receipt {
             // no `before` and no `reload`. A failed or blocked operation has neither shape, so
             // only its `how` is checked.
             let fits = op.is_some_and(|o| match a.how.as_str() {
-                // A removal that ran records the fingerprint it removed as `before`.
+                // A removal that ran records the fingerprint it removed as `before`; a service
+                // restart that ran records no fingerprint and a reload state (docs/lifecycle.md).
                 "allow_disruptive" => {
                     o.owned_outputs.is_empty()
                         && o.after.is_none()
-                        && (o.status != Status::Updated || o.before.is_some())
+                        && (o.status != Status::Updated
+                            || o.before.is_some()
+                            || o.reload.as_deref() == Some("reloaded"))
                 }
                 // A link adoption publishes nothing. The first write into an existing co-owned
                 // (sensitive) file is also approved this way: it has no fingerprints, owns its

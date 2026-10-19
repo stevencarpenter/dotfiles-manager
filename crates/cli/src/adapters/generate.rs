@@ -1,14 +1,14 @@
 //! The `render` and `assemble` adapters (docs/adapters.md). Pure functions of the resource
 //! value and the verified inputs apply or the planner supplies. They open no file.
 
-use super::{Adapter, package, registry, secret};
-use dfm_engine::{Dir, Generator, GeneratorInputs, Got, Runner, Sys};
+use super::{Adapter, package, registry, secret, service};
+use dfm_engine::{Completion, Dir, Generator, GeneratorInputs, Got, Runner, Sys};
 use dfm_model::digest::sha256_hex;
 use dfm_model::fold;
 use dfm_model::merge::{Desired, Merged, merge_with, retire};
 use dfm_model::plan::{
     Action, Blocker, MAX_HASHED_BYTES, Node, Observations, Operation, Ownership, PackageState,
-    Plan, Status, file_fingerprint, matches_pattern,
+    Plan, ServiceState, Status, file_fingerprint, matches_pattern,
 };
 use dfm_model::resolve::{Entry, Resolved, SourceSet, Table, Value};
 use dfm_model::state::Class;
@@ -79,6 +79,19 @@ impl<'a> Generators<'a> {
             templates,
             ..Generators::new(resolved)
         }
+    }
+
+    /// The runner for a service operation this build acts on.
+    fn launcher(&self, op: &Operation) -> Result<&Runner, Refusal> {
+        self.runner
+            .as_ref()
+            .filter(|_| self.reloads(op))
+            .ok_or_else(|| {
+                Refusal::new(
+                    Code::GeneratorUnavailable,
+                    format!("no service launcher for {}", op.adapter),
+                )
+            })
     }
 
     fn gen_of(&self, op: &Operation) -> Option<&Gen> {
@@ -257,6 +270,27 @@ impl Generator for Generators<'_> {
         } else {
             package::install(runner, &op.adapter, self.value(op)?)
         }
+    }
+
+    fn reloads(&self, op: &Operation) -> bool {
+        matches!(op.action, Action::Start | Action::Restart)
+            && op.class == Class::Normal
+            && self.runner.is_some()
+            && self.resolved.resources.contains_key(&op.resource)
+            && self
+                .table
+                .iter()
+                .any(|a| a.spec.id == op.adapter && a.reloads())
+    }
+
+    fn service_state(&self, op: &Operation) -> Result<ServiceState, Refusal> {
+        let runner = self.launcher(op)?;
+        service::probe(runner, &op.adapter, self.value(op)?).map(|f| f.state)
+    }
+
+    fn service_act(&self, op: &Operation) -> Result<Completion, Refusal> {
+        let runner = self.launcher(op)?;
+        service::act(runner, &op.adapter, self.value(op)?, op.action)
     }
 
     fn supports(&self, op: &Operation) -> bool {

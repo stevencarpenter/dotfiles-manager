@@ -13,7 +13,7 @@
 
 use crate::fail::Fail;
 use crate::fsys::{Dir, Live, Peek, Sys};
-use crate::generate::{Gather, Generator, GeneratorInputs, gather, link_source};
+use crate::generate::{Completion, Gather, Generator, GeneratorInputs, gather, link_source};
 use crate::observe::observe;
 use crate::publish::Publish;
 use crate::recover;
@@ -22,8 +22,8 @@ use dfm_model::digest::sha256_hex;
 use dfm_model::fold;
 use dfm_model::merge::{Merged, check_foreign, leaf_hashes, salted};
 use dfm_model::plan::{
-    Action, Operation, Owned, PackageState, Plan, Request, Status as PlanStatus, file_fingerprint,
-    ledger_state, link_fingerprint, node_state,
+    Action, Operation, Owned, PackageState, Plan, Request, ServiceState, Status as PlanStatus,
+    file_fingerprint, ledger_state, link_fingerprint, node_state,
 };
 use dfm_model::state::{
     Class, CoOwned, Fingerprint, JournalEntry, Ledger, OperationRecord, OwnedOutput, Phase,
@@ -41,9 +41,14 @@ const MAX_FILE: u64 = dfm_model::plan::MAX_HASHED_BYTES;
 /// entry is bounded to 64 KiB, and apply writes reasons of at most 1024 characters.
 const JOURNAL_BYTES_PER_OPERATION: u64 = 4096;
 
-/// The consumer reload state recorded for every published output. No reloader exists yet, so a
-/// published file never implies a reloaded consumer.
+/// The consumer reload state recorded for every published output: a published file never
+/// implies a reloaded consumer. A service operation records [`RELOAD_RELOADED`] or
+/// [`RELOAD_REQUESTED`] instead (docs/lifecycle.md).
 pub const RELOAD_NOT_ATTEMPTED: &str = "not_attempted";
+/// The launcher reports the consumer loaded as declared after the start or restart.
+pub const RELOAD_RELOADED: &str = "reloaded";
+/// The launcher accepted the request; completion was not observed within the bound (`pending`).
+pub const RELOAD_REQUESTED: &str = "requested";
 
 pub struct Run<'a> {
     pub store: &'a Store,
@@ -162,7 +167,8 @@ fn is_file_action(a: Action) -> bool {
 /// The two approvals a plan can need before apply writes: each names its operations by id.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Approval {
-    /// `--allow-disruptive`: deleting an owned output.
+    /// `--allow-disruptive`: deleting an owned output, or restarting a service (architecture
+    /// section 10 item 8).
     Disruptive,
     /// `--allow-adopt`: recording ownership of an existing link (DFM-45).
     Adopt,
@@ -175,13 +181,17 @@ impl Approval {
         Approval::ALL.into_iter().find(|a| a.flag() == flag)
     }
 
-    /// The approval an operation needs: a removal and an adoption by their action, and the
-    /// first write into an existing co-owned file (`takeover`) as an adoption.
+    /// The approval an operation needs: a removal or a service restart is disruptive, an
+    /// adoption and the first write into an existing co-owned file (`takeover`) are adoptions.
     pub fn of(op: &Operation) -> Option<Approval> {
         if op.takeover {
             return Some(Approval::Adopt);
         }
-        Approval::ALL.into_iter().find(|a| a.action() == op.action)
+        match op.action {
+            Action::Remove | Action::Restart => Some(Approval::Disruptive),
+            Action::Adopt => Some(Approval::Adopt),
+            _ => None,
+        }
     }
 
     pub fn flag(self) -> &'static str {
@@ -193,7 +203,7 @@ impl Approval {
 
     pub fn noun(self) -> &'static str {
         match self {
-            Approval::Disruptive => "removal",
+            Approval::Disruptive => "removal or restart",
             Approval::Adopt => "adoption",
         }
     }
@@ -211,13 +221,6 @@ impl Approval {
         match self {
             Approval::Disruptive => "allow_disruptive",
             Approval::Adopt => "allow_adopt",
-        }
-    }
-
-    pub fn action(self) -> Action {
-        match self {
-            Approval::Disruptive => Action::Remove,
-            Approval::Adopt => Action::Adopt,
         }
     }
 }
@@ -292,20 +295,38 @@ fn first_refusal(plan: &Plan, generator: &dyn Generator) -> Result<(), Refusal> 
         if op.status != PlanStatus::Planned {
             continue;
         }
-        // A package install or upgrade has no path and no content: it needs a provider in this
-        // build.
-        if matches!(op.action, Action::Install | Action::Upgrade) {
+        // A package install or upgrade, or a service start or restart, has no path and no
+        // content: it needs a provider in this build, and a probe precondition to compare under
+        // the lock.
+        if matches!(
+            op.action,
+            Action::Install | Action::Upgrade | Action::Start | Action::Restart
+        ) {
+            let (what, provided, missing) =
+                if matches!(op.action, Action::Install | Action::Upgrade) {
+                    (
+                        "installs a package",
+                        generator.installs(op),
+                        "no package provider for",
+                    )
+                } else {
+                    (
+                        "acts on a service",
+                        generator.reloads(op),
+                        "no service launcher for",
+                    )
+                };
             if op.path.is_some() || op.class != Class::Normal {
                 return Err(plan_invalid(format!(
-                    "{} installs a package but carries a path or is sensitive",
+                    "{} {what} but carries a path or is sensitive",
                     op.id
                 )));
             }
-            if !generator.installs(op) {
+            if !provided {
                 return Err(Refusal::new(
                     Code::GeneratorUnavailable,
                     format!(
-                        "{}: no package provider for {} in this build; nothing was changed",
+                        "{}: {missing} {} in this build; nothing was changed",
                         op.id, op.adapter
                     ),
                 ));
@@ -316,7 +337,7 @@ fn first_refusal(plan: &Plan, generator: &dyn Generator) -> Result<(), Refusal> 
                 .any(|p| p.subject.starts_with("probe:"))
             {
                 return Err(plan_invalid(format!(
-                    "{} installs a package but records no probe precondition",
+                    "{} {what} but records no probe precondition",
                     op.id
                 )));
             }
@@ -431,7 +452,9 @@ fn first_refusal(plan: &Plan, generator: &dyn Generator) -> Result<(), Refusal> 
                     op.id
                 )));
             }
-            Action::Install | Action::Upgrade => unreachable!("handled above"),
+            Action::Install | Action::Upgrade | Action::Start | Action::Restart => {
+                unreachable!("handled above")
+            }
             Action::None => {
                 return Err(plan_invalid(format!("{} is planned with no action", op.id)));
             }
@@ -570,6 +593,9 @@ enum Ended {
         reload: Option<String>,
     },
     Current,
+    /// A launcher accepted the request and its completion was not observed within the bound
+    /// (docs/lifecycle.md). The journal has a `pending` entry; the run goes on and exits 5.
+    Pending(Refusal, String),
     /// A stop request (SIGINT or SIGTERM) arrived before the intent entry. Nothing was written.
     NotStarted(Refusal),
     Failed(Refusal, Option<String>),
@@ -605,6 +631,8 @@ fn step_name(op: &Operation) -> &'static str {
         Action::Retire => "retire",
         Action::Install => "install",
         Action::Upgrade => "upgrade",
+        Action::Start => "start",
+        Action::Restart => "restart",
         Action::None => "none",
     }
 }
@@ -894,6 +922,9 @@ impl Exec<'_, '_> {
         if matches!(op.action, Action::Install | Action::Upgrade) {
             return self.try_install(op);
         }
+        if matches!(op.action, Action::Start | Action::Restart) {
+            return self.try_service(op);
+        }
         // The gates admit one sensitive kind, the co-owned merge, which has its own path. Nothing
         // below hashes, fingerprints or journals the content of a sensitive path.
         if op.class == Class::Sensitive {
@@ -961,7 +992,15 @@ impl Exec<'_, '_> {
                     "is no longer the entry the plan found; it is left alone",
                 ));
             }
-            (Action::None | Action::Retire | Action::Install | Action::Upgrade, _) => {
+            (
+                Action::None
+                | Action::Retire
+                | Action::Install
+                | Action::Upgrade
+                | Action::Start
+                | Action::Restart,
+                _,
+            ) => {
                 return Err(failed(plan_invalid("no action")));
             }
         }
@@ -1600,6 +1639,203 @@ impl Exec<'_, '_> {
         })
     }
 
+    /// The declared prerequisite files of a service, observed again under the lock and compared
+    /// with the plan: the `path:` preconditions (the entry as the planner saw it) and the
+    /// `content:` precondition (the bytes of the definition, read through a link, as the adapter
+    /// hashed them at plan time). A file that changed or went away since the plan blocks the
+    /// start or restart, so nothing loads a definition the reviewer did not see.
+    fn service_prerequisites(&self, op: &Operation) -> Result<(), Ended> {
+        for p in &op.preconditions {
+            let Some(path) = p.subject.strip_prefix("content:") else {
+                continue;
+            };
+            let actual = match definition_bytes(&self.run.home_path.join(path)) {
+                Ok(b) => format!("sha256:{}", sha256_hex(&b)),
+                Err(why) => why,
+            };
+            if actual != p.state {
+                return Err(blocked(
+                    Code::PlanStale,
+                    format!(
+                        "{} was {} and is now {actual}; nothing was loaded",
+                        p.subject, p.state
+                    ),
+                ));
+            }
+        }
+        // The planner recorded a sensitive prerequisite (`sensitive-path:`) by mode only, with
+        // no hash: it is observed and compared the same way, so no hash of it is computed or
+        // printed here either. The subject carries the decision; the state's shape does not.
+        fn kind(p: &dfm_model::plan::Precondition) -> Option<(&str, bool)> {
+            if let Some(path) = p.subject.strip_prefix("path:") {
+                Some((path, false))
+            } else {
+                p.subject
+                    .strip_prefix("sensitive-path:")
+                    .map(|path| (path, true))
+            }
+        }
+        let reqs: Vec<Request> = op
+            .preconditions
+            .iter()
+            .filter_map(kind)
+            .map(|(path, sensitive)| Request {
+                path: path.to_string(),
+                hash: !sensitive,
+                list: false,
+            })
+            .collect();
+        if reqs.is_empty() {
+            return Ok(());
+        }
+        let obs = observe(&self.run.sys, self.run.home, &reqs).map_err(failed)?;
+        for p in &op.preconditions {
+            let Some((path, sensitive)) = kind(p) else {
+                continue;
+            };
+            let actual = obs
+                .seen
+                .get(path)
+                .map_or_else(|| "missing".to_string(), |s| node_state(s, sensitive));
+            if actual != p.state {
+                return Err(blocked(
+                    Code::PlanStale,
+                    format!(
+                        "{} was {} and is now {actual}; nothing was changed for it",
+                        p.subject, p.state
+                    ),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// A service start or restart (docs/lifecycle.md). The prerequisite files and the launcher
+    /// are checked again under the lock: a service that is as declared now is `current`, any
+    /// other change blocks. Then the intent entry (no path: the launcher's report is the record),
+    /// the action with its bounded completion wait, a second report as the postcondition, and
+    /// the outcome entry: `done` with `reloaded`, `pending` with `requested` when the launcher
+    /// accepted the request without reporting completion, or `failed`. No ledger entry is written.
+    fn try_service(&mut self, op: &Operation) -> Result<Ended, Ended> {
+        self.unknown_install(op)?;
+        self.service_prerequisites(op)?;
+        let want = op
+            .preconditions
+            .iter()
+            .find(|p| p.subject.starts_with("probe:"))
+            .map(|p| p.state.as_str())
+            .ok_or_else(|| failed(plan_invalid("a service needs a probe precondition")))?;
+        let now = self.run.generator.service_state(op).map_err(failed)?;
+        self.stop_requested()?;
+        match &now {
+            s if s.state() == want => {}
+            // Someone started it meanwhile: the state matches what a start would make.
+            ServiceState::Current(_) if op.action == Action::Start => return Ok(Ended::Current),
+            ServiceState::Unknown(why) => {
+                return Err(blocked(
+                    Code::ProbeFailed,
+                    format!(
+                        "{}: the launcher could not report the service state now ({why}); nothing was changed",
+                        op.id
+                    ),
+                ));
+            }
+            s => {
+                return Err(blocked(
+                    Code::PlanStale,
+                    format!(
+                        "{}: the launcher reported {want} at plan time and {} now; nothing was changed",
+                        op.id,
+                        s.state()
+                    ),
+                ));
+            }
+        }
+        self.stop_requested()?;
+        let id = self.attempt_id(op);
+        let recovery = Recovery {
+            outputs: Vec::new(),
+            snapshot: None,
+        };
+        self.journal(op, &id, Phase::Intent, Some(recovery), None)
+            .map_err(|e| Ended::Failed(e, Some(id.clone())))?;
+        // From here on the launcher may have changed the machine. Every outcome is journaled.
+        let result = self
+            .run
+            .fail
+            .hit("apply-before-effect")
+            .and_then(|()| self.run.generator.service_act(op))
+            .and_then(|c| self.run.fail.hit("apply-after-effect").map(|()| c))
+            .and_then(|completion| match completion {
+                Completion::Queued(detail) => Ok(Some(detail)),
+                Completion::Completed => {
+                    let now = self.run.generator.service_state(op)?;
+                    match (now, crate::signal::requested()) {
+                        (ServiceState::Current(_), _) => Ok(None),
+                        // The stop ended the check itself: the outcome is unknown, not failed.
+                        (_, Some(stop)) => Err(Refusal::new(
+                            stop.code,
+                            format!(
+                                "{}: stopped before the postcondition was checked; the request may have completed, and the next run probes again",
+                                op.id
+                            ),
+                        )),
+                        (s, None) => Err(Refusal::new(
+                            Code::IoFailed,
+                            format!(
+                                "postcondition failed for {}: the launcher reports {} after the {}",
+                                op.id,
+                                s.state(),
+                                step_name(op)
+                            ),
+                        )),
+                    }
+                }
+            });
+        let queued = match result {
+            Ok(q) => q,
+            Err(e) => {
+                let why = dfm_model::display::bounded_visible(&e.detail, 1024);
+                let e = match self.journal(op, &id, Phase::Failed, None, Some(why)) {
+                    Ok(()) => e,
+                    Err(n) => Refusal::new(
+                        e.code,
+                        format!(
+                            "{}; the outcome could not be journaled: {}",
+                            e.detail, n.detail
+                        ),
+                    ),
+                };
+                return Err(Ended::Failed(e, Some(id)));
+            }
+        };
+        if let Some(detail) = queued {
+            let r = Refusal::new(
+                Code::Pending,
+                format!(
+                    "{}: the launcher accepted the {} and did not report completion in time ({detail}); the next run probes again",
+                    op.id,
+                    step_name(op)
+                ),
+            );
+            let why = dfm_model::display::bounded_visible(&r.detail, 1024);
+            if let Err(e) = self.journal(op, &id, Phase::Pending, None, Some(why)) {
+                return Err(Ended::Failed(e, Some(id)));
+            }
+            return Ok(Ended::Pending(r, id));
+        }
+        if let Err(e) = self.journal(op, &id, Phase::Done, None, None) {
+            return Err(Ended::Failed(e, Some(id)));
+        }
+        Ok(Ended::Updated {
+            id,
+            before: None,
+            after: None,
+            owned: Vec::new(),
+            reload: Some(RELOAD_RELOADED.to_string()),
+        })
+    }
+
     /// The template of a secret operation, read from the plan's source root as apply reads any
     /// source: below the root without following a link, a regular file of the user with one
     /// hard link, within the source file bound. The resolver records no content identity for
@@ -1748,7 +1984,12 @@ impl Exec<'_, '_> {
             Action::Remove => removed = Some(self.remove(op, abs, parent, name, live)?),
             // Nothing is written. The read-back below is the last look at the leaf.
             Action::Adopt => {}
-            Action::None | Action::Retire | Action::Install | Action::Upgrade => {
+            Action::None
+            | Action::Retire
+            | Action::Install
+            | Action::Upgrade
+            | Action::Start
+            | Action::Restart => {
                 return Err(plan_invalid("no action"));
             }
         }
@@ -2013,6 +2254,7 @@ fn record(
             reload,
             ..
         }) => (fp(before), fp(after), owned.clone(), reload.clone()),
+        Some(Ended::Pending(..)) => (None, None, Vec::new(), Some(RELOAD_REQUESTED.into())),
         _ => (None, None, Vec::new(), None),
     };
     OperationRecord {
@@ -2032,6 +2274,25 @@ fn record(
         }),
         reload,
     }
+}
+
+/// A service definition the plan hashed, read again through its link within the same bound the
+/// adapter used. The error text is the state string a mismatch reports.
+fn definition_bytes(path: &Path) -> Result<Vec<u8>, String> {
+    use std::io::Read;
+    const LIMIT: u64 = 1 << 20;
+    let shown = path.display().to_string();
+    let io = |e: std::io::Error| format!("unreadable ({}: {})", shown, e.kind());
+    let file = std::fs::File::open(path).map_err(io)?;
+    if !file.metadata().map_err(io)?.is_file() {
+        return Err(format!("not a regular file ({shown})"));
+    }
+    let mut bytes = Vec::new();
+    file.take(LIMIT + 1).read_to_end(&mut bytes).map_err(io)?;
+    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > LIMIT {
+        return Err(format!("over 1 MiB ({shown})"));
+    }
+    Ok(bytes)
 }
 
 /// Checks the gates and then runs the plan. This is the engine's one entry point. A refusal
@@ -2074,6 +2335,12 @@ fn execute(run: &Run<'_>, plan: &Plan) -> Report {
     let mut stopped: Option<Refusal> = crate::signal::requested()
         .or(clock.err())
         .or_else(|| settle(&mut ex).err());
+    // A pending operation does not stop the run (other operations are independent of it); it
+    // decides the exit (5) when nothing else does.
+    // shortcut: a dependent of a pending operation is not marked blocked_pending, upgrade by
+    // mapping `results == Pending` to Status::BlockedPending when DFM-30 adds the first
+    // operation that runs after a service.
+    let mut pending: Option<Refusal> = None;
     let mut results: BTreeMap<&str, Status> = BTreeMap::new();
     let mut records = Vec::new();
     for op in &plan.operations {
@@ -2137,6 +2404,13 @@ fn execute(run: &Run<'_>, plan: &Plan) -> Report {
                         Status::Updated,
                         record(op, id, Status::Updated, times, None, Some(&ended)),
                     ),
+                    Ended::Pending(r, id) => {
+                        pending.get_or_insert_with(|| r.clone());
+                        (
+                            Status::Pending,
+                            record(op, id, Status::Pending, times, Some(r), Some(&ended)),
+                        )
+                    }
                     Ended::NotStarted(r) => {
                         stopped.get_or_insert_with(|| r.clone());
                         (
@@ -2176,7 +2450,7 @@ fn execute(run: &Run<'_>, plan: &Plan) -> Report {
     // A signal after the last operation, or after a failure, still decides the exit (section 10).
     Report {
         operations: records,
-        stopped: crate::signal::requested().or(stopped),
+        stopped: crate::signal::requested().or(stopped).or(pending),
         repaired: ex.repaired,
         warnings: ex.warnings,
     }

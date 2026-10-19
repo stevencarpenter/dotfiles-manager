@@ -46,6 +46,8 @@ usage:
                                [--allow-adopt <operation-id>]...
   dotfiles-manager secrets --root <dir> [--preview] [--yes-plan <digest>] [--allow-adopt <operation-id>]...
   dotfiles-manager packages --root <dir> [--preview] [--yes-plan <digest>] [--update]
+  dotfiles-manager services --root <dir> [--preview] [--yes-plan <digest>] [--allow-disruptive <operation-id>]...
+                               [--restart <resource-id>]...
   dotfiles-manager trial <package> [--id <trial-id>] [--provider homebrew/v1|mise/v1] [--config <path>]...
                                [--preview] [--yes-plan <digest>]
   dotfiles-manager self-check --build-controls <staged tree>
@@ -107,6 +109,18 @@ trial record to state/trials/, installs the package when no provider has it (not
 pre-exists), journals the install and writes a receipt. More than one capable provider needs
 --provider. A candidate path is observed, never changed. adopt and purge are not built. See
 docs/trial.md.
+
+services is apply over the service resources only (launchd-agent/v1, brew-service/v1): every other
+resource is listed as not_in_scope. Planning asks each launcher read-only (launchctl print, brew
+services info) and observes the declared definition and configuration files, which must be
+published first. A service the launcher holds as declared is current. One it does not hold is
+started with --yes-plan (launchctl bootstrap, brew services start). A restart happens only on
+--restart <resource-id>; it is disruptive and needs --allow-disruptive <operation-id> as a
+removal does. A label loaded from a definition the manager does not own, or a daemon that is
+loaded and not running, is a blocker (exit 3): the manager never unloads or replaces a process it
+did not start without a request. A launcher that accepted a request without reporting completion
+in time leaves the operation pending (exit 5), never updated. Nothing is stopped, unloaded for
+good or uninstalled. See docs/lifecycle.md.
 
 An operation that ended unknown (E_OP_INTERRUPTED) blocks its path in every later run. Each apply
 checks the path again and settles the entry when the result is clear. state recover does only that:
@@ -418,6 +432,15 @@ fn dispatch(args: &[String], out: &mut dyn Write) -> Result<(), Refusal> {
         "trial" => {
             let args = trial_cmd::parse_args(rest)?;
             trial_cmd::run(&context(home)?, &args, out)
+        }
+        "services" => {
+            let args = apply_cmd::parse_args(rest, dfm_model::plan::Scope::Services)?;
+            if !args.allow_adopt.is_empty() {
+                return Err(usage(
+                    "services adopts nothing; --allow-adopt does not apply",
+                ));
+            }
+            apply_cmd::run(&context(home)?, &args, out)
         }
         "self-check" => {
             let [controls, fixture] = flags(rest, ["--build-controls", "--fixture-dir"])?;

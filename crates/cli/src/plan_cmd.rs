@@ -9,11 +9,11 @@ use crate::{Ctx, Loaded, load_resolved, read_existing_binding, usage};
 use dfm_engine::{Dir, Fail, Store, merge, observe};
 use dfm_model::display::visible;
 use dfm_model::plan::{
-    self, Binary, Context, MAX_PLAN_BYTES, Owned, PackageState, Plan, Saved, Scope, Stale, Status,
-    source_identity,
+    self, Binary, Context, MAX_PLAN_BYTES, Owned, PackageState, Plan, Saved, Scope, ServiceFacts,
+    Stale, Status, source_identity,
 };
 use dfm_model::{Code, Refusal};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
@@ -100,17 +100,38 @@ pub fn make_plan(ctx: &Ctx, root: &Path) -> Result<Plan, Refusal> {
     )
 }
 
+/// The answers a plan takes from the caller because they come from a process: the package
+/// providers' listings (docs/packages.md), the service launchers' reports and the restarts the
+/// user requested (docs/lifecycle.md). Nothing in this module starts a process.
+#[derive(Default)]
+pub struct Probed {
+    pub package: BTreeMap<String, PackageState>,
+    pub service: BTreeMap<String, ServiceFacts>,
+    pub restart: BTreeSet<String>,
+}
+
+/// The package listings alone, for a caller that probes no launcher.
+impl From<BTreeMap<String, PackageState>> for Probed {
+    fn from(package: BTreeMap<String, PackageState>) -> Self {
+        Probed {
+            package,
+            ..Probed::default()
+        }
+    }
+}
+
 /// As [`make_plan`], for sources that are already resolved (`doctor` resolves once) and for one
 /// scope. A secrets plan reads each secret destination in memory for its verdict and nothing
-/// else; a configuration plan never reads one (docs/secrets.md). A packages plan takes the
-/// providers' answers in `package` from the caller (`packages` probes before it plans,
-/// docs/packages.md): nothing in this module starts a process.
+/// else; a configuration plan never reads one (docs/secrets.md). A packages or services plan
+/// takes the providers' answers in `probed` from the caller (`packages` and `services` probe
+/// before they plan).
 pub fn plan_for(
     ctx: &Ctx,
     loaded: &Loaded,
     scope: Scope,
-    package: BTreeMap<String, PackageState>,
+    probed: impl Into<Probed>,
 ) -> Result<Plan, Refusal> {
+    let probed = probed.into();
     let layout = ctx.layout();
     let sys = ctx.sys()?;
     // Ownership decides what may be replaced. Without state it is unknown, so planning fails
@@ -194,7 +215,9 @@ pub fn plan_for(
         unchecked,
         merge,
         secret,
-        package,
+        package: probed.package,
+        service: probed.service,
+        restart: probed.restart,
     };
     let mut plan = plan::build(&loaded.resolved, &cx, &obs)?;
     // Generated output hashes (architecture section 9 item 1), from the same adapters apply runs.

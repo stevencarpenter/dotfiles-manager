@@ -1182,6 +1182,8 @@ mod synthetic {
             scope: dfm_model::plan::Scope::Config,
             secret: std::collections::BTreeMap::new(),
             package: std::collections::BTreeMap::new(),
+            service: std::collections::BTreeMap::new(),
+            restart: std::collections::BTreeSet::new(),
             binary: Binary {
                 version: "0".into(),
                 sha256: "0".repeat(64),
@@ -2588,6 +2590,8 @@ mod removal {
             scope: dfm_model::plan::Scope::Config,
             secret: std::collections::BTreeMap::new(),
             package: std::collections::BTreeMap::new(),
+            service: std::collections::BTreeMap::new(),
+            restart: std::collections::BTreeSet::new(),
             binary: Binary {
                 version: "0".into(),
                 sha256: "0".repeat(64),
@@ -2871,6 +2875,8 @@ mod hardening {
             scope: dfm_model::plan::Scope::Config,
             secret: std::collections::BTreeMap::new(),
             package: std::collections::BTreeMap::new(),
+            service: std::collections::BTreeMap::new(),
+            restart: std::collections::BTreeSet::new(),
             binary: Binary {
                 version: "0".into(),
                 sha256: "0".repeat(64),
@@ -3173,6 +3179,8 @@ mod ledger_sensitivity {
             scope: dfm_model::plan::Scope::Config,
             secret: std::collections::BTreeMap::new(),
             package: std::collections::BTreeMap::new(),
+            service: std::collections::BTreeMap::new(),
+            restart: std::collections::BTreeSet::new(),
             binary: Binary {
                 version: "0".into(),
                 sha256: "0".repeat(64),

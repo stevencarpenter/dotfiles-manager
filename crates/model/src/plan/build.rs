@@ -14,14 +14,16 @@ use std::collections::{BTreeMap, BTreeSet};
 use toml::Value;
 
 /// Which resources one plan acts on. A configuration plan covers the file kinds. A secret is
-/// rendered only by `secrets`, and a package installed only by `packages` (DESIGN.md section 7:
-/// "Only configuration work belongs in a normal config plan"). Everything else in a plan is
-/// `not_in_scope`, so the counts still add up to the number of participants.
+/// rendered only by `secrets`, a package installed only by `packages`, and a service started or
+/// restarted only by `services` (DESIGN.md section 7: "Only configuration work belongs in a
+/// normal config plan"). Everything else in a plan is `not_in_scope`, so the counts still add up
+/// to the number of participants.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Scope {
     Config,
     Secrets,
     Packages,
+    Services,
 }
 
 impl Scope {
@@ -30,6 +32,7 @@ impl Scope {
             Scope::Config => "config",
             Scope::Secrets => "secrets",
             Scope::Packages => "packages",
+            Scope::Services => "services",
         }
     }
 
@@ -41,6 +44,7 @@ impl Scope {
             ),
             Scope::Secrets => r.kind == "secret",
             Scope::Packages => r.kind == "package",
+            Scope::Services => r.kind == "service",
         }
     }
 
@@ -52,6 +56,7 @@ impl Scope {
                     .to_string()
             }
             "package" | "application" => format!("{} is provisioning", r.kind),
+            "service" => "service is lifecycle".to_string(),
             k => format!("{k} is configuration"),
         };
         if r.kind == "secret" && self == Scope::Config {
@@ -202,6 +207,87 @@ impl PackageState {
     }
 }
 
+/// What the launcher reported about a service (docs/lifecycle.md). The planner is pure and
+/// starts no process; the caller probes and reports this. Each detail is stable text (no
+/// process id, no time), because it becomes the probe precondition apply compares.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ServiceState {
+    /// The launcher holds the declared definition and the consumer is in the state the adapter
+    /// requires (loaded; running too where the adapter requires it).
+    Current(String),
+    /// The launcher does not hold it. A start is planned; nothing is running, so it is not
+    /// disruptive.
+    Stopped(String),
+    /// The launcher holds it, but it is not in the wanted state (loaded and not running). The
+    /// manager did not start that process, so it blocks until the user requests the restart
+    /// (`--restart`), which is disruptive.
+    Stale(String),
+    /// The launcher holds the label from a definition that is not the declared one. The manager
+    /// never unloads what it did not load: a blocker, with the unload left to the user.
+    Foreign(String),
+    /// A prerequisite is not in place (the definition file is not published, the package is not
+    /// installed). The plan is blocked until the prerequisite's own command has run.
+    Missing(String),
+    /// The probe could not decide. Unknown support fails closed.
+    Unknown(String),
+    /// The resource value is not a valid service declaration. Not a probe result.
+    Refused(String),
+}
+
+impl ServiceState {
+    /// The precondition string apply compares after it probes again.
+    pub fn state(&self) -> String {
+        match self {
+            ServiceState::Current(d) => format!("current:{d}"),
+            ServiceState::Stopped(d) => format!("stopped:{d}"),
+            ServiceState::Stale(d) => format!("stale:{d}"),
+            ServiceState::Foreign(d) => format!("foreign:{d}"),
+            ServiceState::Missing(w) => format!("missing:{w}"),
+            ServiceState::Unknown(w) => format!("unknown:{w}"),
+            ServiceState::Refused(w) => format!("refused:{w}"),
+        }
+    }
+}
+
+/// What the caller learned about one service: the launcher's report and, when the adapter read
+/// the definition file, its content identity and the program it runs. The plan shows the program
+/// and records the content as a precondition, so a definition edited behind a stable link
+/// between the preview and the run is refused, not loaded.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ServiceFacts {
+    pub state: ServiceState,
+    pub definition: Option<Definition>,
+}
+
+/// The definition file of a service as the adapter read it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Definition {
+    /// HOME-relative, as declared.
+    pub path: String,
+    /// SHA-256 of the bytes, lowercase hex.
+    pub sha256: String,
+    /// The program and its arguments, as the definition names them.
+    pub program: String,
+}
+
+/// The HOME-relative files a service declares it depends on: its definition (`plist`) and its
+/// configuration files (`config`). The planner observes them, records their state as
+/// preconditions, blocks the service while one is missing, and orders the service after the
+/// operations that publish them (DESIGN.md section 5: "explicit native lifecycle prerequisites
+/// add operation edges"). The resolver validated each as a HOME path.
+pub fn service_prerequisites(r: &ResolvedResource) -> Vec<String> {
+    let mut out = Vec::new();
+    if let Some(p) = r.value.get("plist").and_then(Value::as_str) {
+        out.push(p.to_string());
+    }
+    if let Some(list) = r.value.get("config").and_then(Value::as_array) {
+        out.extend(list.iter().filter_map(Value::as_str).map(str::to_string));
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
 /// The plan-time facts of one merge resource.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MergeFact {
@@ -256,6 +342,12 @@ pub struct Context<'a> {
     /// The probed state of each selected package resource, by resource id (`packages` scope
     /// only).
     pub package: BTreeMap<String, PackageState>,
+    /// The probed state of each selected service resource, by resource id (`services` scope
+    /// only).
+    pub service: BTreeMap<String, ServiceFacts>,
+    /// Service resources whose restart the user requested (`services --restart <resource>`). A
+    /// current service in this set is planned as a disruptive restart.
+    pub restart: BTreeSet<String>,
 }
 
 /// Ledger outputs of a resource that is no longer selected, at a path no selected resource
@@ -290,6 +382,11 @@ pub fn requests(resolved: &Resolved, ledger: &[Owned], scope: Scope) -> Vec<Requ
         }
         for d in &r.dir_claims {
             want.entry(d.dir.clone()).or_default().1 = true;
+        }
+        // A service's definition and configuration files are its prerequisites: their state is
+        // a precondition of the start or restart, so a changed file makes a saved plan stale.
+        for p in service_prerequisites(r) {
+            want.entry(p).or_default().0 = true;
         }
     }
     for o in removals(resolved, ledger, scope) {
@@ -439,6 +536,8 @@ struct Planner<'a> {
     mkdirs: BTreeMap<String, String>,
     /// Ledger entries this plan removes, by folded path: the removal operation id.
     retiring: BTreeMap<String, String>,
+    /// Folded paths whose content is never hashed or shown ([`sensitive_paths`]).
+    sensitive: BTreeSet<String>,
 }
 
 pub fn build(resolved: &Resolved, cx: &Context<'_>, obs: &Observations) -> Result<Plan, Refusal> {
@@ -459,6 +558,7 @@ pub fn build(resolved: &Resolved, cx: &Context<'_>, obs: &Observations) -> Resul
             .into_iter()
             .map(|o| (fold(&o.path), removal_id(o)))
             .collect(),
+        sensitive: sensitive_paths(Some(resolved), &cx.ledger),
     };
     for r in resolved.resources.values() {
         p.resource(r);
@@ -708,6 +808,10 @@ impl Planner<'_> {
         }
         if r.kind == "package" {
             self.package(r);
+            return;
+        }
+        if r.kind == "service" {
+            self.service(r);
             return;
         }
         for claim in &r.claims {
@@ -1208,6 +1312,182 @@ impl Planner<'_> {
         self.ops.insert(id, op);
     }
 
+    /// A service (docs/lifecycle.md): no path and no ledger entry. The caller probed the
+    /// launcher; the plan starts what is not loaded, restarts what is loaded otherwise than
+    /// declared (or on request), and never stops or removes. Each declared prerequisite file
+    /// must exist now and is recorded as a precondition; a missing one blocks the service, since
+    /// a reload depends on the published file.
+    fn service(&mut self, r: &ResolvedResource) {
+        let id = format!("{}@service", r.id);
+        let mut op = self.skeleton(r, id.clone(), None);
+        let (name, field) = match r.value.get("label").and_then(Value::as_str) {
+            Some(l) => (l.to_string(), "/label"),
+            None => (
+                r.value
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or(&r.id)
+                    .to_string(),
+                "/name",
+            ),
+        };
+        let shown = format!("{name} with {}", r.adapter);
+        for p in service_prerequisites(r) {
+            let present = match self.obs.seen.get(&p).map(|s| &s.node) {
+                Some(Node::Link { to, .. }) => !matches!(to, LinkTo::Dangling | LinkTo::Loop),
+                Some(Node::Missing {}) | None => false,
+                Some(_) => true,
+            };
+            if !present {
+                let f = fail(
+                    Code::Conflict,
+                    field,
+                    format!(
+                        "{shown} depends on {p}, which is not published; a reload depends on the published file"
+                    ),
+                    "publish it first (apply), then run services again",
+                );
+                op.effect = format!("blocked: {}", f.detail);
+                self.blocker(r, Some(&p), f);
+                self.ops.insert(id, op);
+                return;
+            }
+            // A sensitive prerequisite (a secret output a program reads) is recorded by mode
+            // only, as everywhere else: no hash and no size of it reaches the plan or a message.
+            // The subject says which it is, so apply observes it the same way.
+            if let Some(seen) = self.obs.seen.get(&p) {
+                let sensitive = self.sensitive.contains(&fold(&p));
+                let subject = if sensitive { "sensitive-path" } else { "path" };
+                op.preconditions.push(Precondition {
+                    subject: format!("{subject}:{p}"),
+                    state: node_state(seen, sensitive),
+                });
+            }
+        }
+        let facts = self.cx.service.get(&r.id).cloned();
+        let mut runs = String::new();
+        // A secret definition (a token among its arguments) shows and records nothing of its
+        // content: its mode-only precondition above is all the plan keeps of it.
+        if let Some(d) = facts
+            .as_ref()
+            .and_then(|f| f.definition.as_ref())
+            .filter(|d| !self.sensitive.contains(&fold(&d.path)))
+        {
+            op.preconditions.push(Precondition {
+                subject: format!("content:{}", d.path),
+                state: format!("sha256:{}", d.sha256),
+            });
+            runs = format!("; the definition runs {}", d.program);
+        }
+        let state = facts.map(|f| f.state);
+        let requested = self.cx.restart.contains(&r.id);
+        op.postcondition = format!("{} reports {name} loaded as declared", r.adapter);
+        let probe = format!("probe:{}:{name}", r.adapter);
+        let planned = |op: &mut Operation, action: Action, effect: String, state: &ServiceState| {
+            op.action = action;
+            op.status = Status::Planned;
+            op.effect = effect;
+            op.preconditions.push(Precondition {
+                subject: probe.clone(),
+                state: state.state(),
+            });
+        };
+        match state {
+            Some(ref s @ (ServiceState::Current(ref d) | ServiceState::Stale(ref d)))
+                if requested =>
+            {
+                planned(
+                    &mut op,
+                    Action::Restart,
+                    format!(
+                        "restart {shown} on request (--restart): disruptive, the loaded instance is replaced; now {d}{runs}"
+                    ),
+                    s,
+                );
+            }
+            Some(ServiceState::Current(d)) => {
+                op.action = Action::None;
+                op.status = Status::Current;
+                op.effect = format!("{name} is {d}{runs}");
+            }
+            Some(ref s @ ServiceState::Stopped(ref d)) => planned(
+                &mut op,
+                Action::Start,
+                format!("start {shown}: {d}; not disruptive, nothing of it is running{runs}"),
+                s,
+            ),
+            // The manager did not start that process: nothing restarts it without a request.
+            Some(ServiceState::Stale(d)) => {
+                let f = fail(
+                    Code::Conflict,
+                    field,
+                    format!(
+                        "{shown} is {d}; a restart would replace a process the manager did not start"
+                    ),
+                    format!(
+                        "request it with `--restart {}` (and its --allow-disruptive flag), or repair the service by hand, then run services again",
+                        r.id
+                    ),
+                );
+                op.effect = format!("blocked: {}", f.detail);
+                self.blocker(r, None, f);
+            }
+            Some(ServiceState::Foreign(d)) => {
+                let f = fail(
+                    Code::Conflict,
+                    field,
+                    format!(
+                        "{shown} is {d}; the manager never unloads a definition it did not load"
+                    ),
+                    "unload it by hand with its launcher, then run services again",
+                );
+                op.effect = format!("blocked: {}", f.detail);
+                self.blocker(r, None, f);
+            }
+            Some(ServiceState::Missing(why)) => {
+                let f = fail(
+                    Code::Conflict,
+                    field,
+                    format!("{shown}: {why}"),
+                    "put the prerequisite in place with its own command (apply, packages), then run services again",
+                );
+                op.effect = format!("blocked: {}", f.detail);
+                self.blocker(r, None, f);
+            }
+            Some(ServiceState::Unknown(why)) => {
+                let f = fail(
+                    Code::ProbeFailed,
+                    field,
+                    format!("the state of {shown} is unknown: {why}"),
+                    "make the launcher answer its report command, then run services again",
+                );
+                op.effect = format!("blocked: {}", f.detail);
+                self.blocker(r, None, f);
+            }
+            Some(ServiceState::Refused(why)) => {
+                let f = fail(
+                    Code::ManifestInvalid,
+                    field,
+                    why,
+                    format!("correct the resource value in {}", r.declared_in),
+                );
+                op.effect = format!("blocked: {}", f.detail);
+                self.blocker(r, None, f);
+            }
+            None => {
+                let f = fail(
+                    Code::ProbeFailed,
+                    field,
+                    format!("{shown} was not probed"),
+                    "run services again; if it repeats, report the resource",
+                );
+                op.effect = format!("blocked: {}", f.detail);
+                self.blocker(r, None, f);
+            }
+        }
+        self.ops.insert(id, op);
+    }
+
     /// A secret output (`op-template/v1`, docs/secrets.md). The content exists only after the
     /// provider renders it at apply time, so the plan never says `current`: every run renders
     /// and writes only when the result differs. The caller's verdict says whether the ledger
@@ -1611,6 +1891,48 @@ impl Planner<'_> {
             for d in &r.dir_claims {
                 self.fragment_edges(r, d);
             }
+        }
+        for r in resolved
+            .resources
+            .values()
+            .filter(|r| r.kind == "service" && self.cx.scope.covers(r))
+        {
+            self.service_edges(resolved, r);
+        }
+    }
+
+    /// A service runs after the operations of the resources that publish its prerequisite files
+    /// and, for a service named like a package, after that package's operation (DESIGN.md
+    /// section 5: lifecycle prerequisites are operation edges, not module barriers). In a plan
+    /// whose scope leaves those resources out, the edge points at their `@scope` entry, so the
+    /// order and the dependency stay visible; in a plan that covers them, a failed or blocked
+    /// prerequisite blocks the service.
+    fn service_edges(&mut self, resolved: &Resolved, r: &ResolvedResource) {
+        let paths: BTreeSet<String> = service_prerequisites(r).iter().map(|p| fold(p)).collect();
+        let name = r.value.get("name").and_then(Value::as_str);
+        let mut after = BTreeSet::new();
+        for x in resolved.resources.values().filter(|x| x.id != r.id) {
+            let mut ids: Vec<String> = x
+                .claims
+                .iter()
+                .filter(|c| paths.contains(&fold(c)))
+                .map(|c| format!("{}@{c}", x.id))
+                .collect();
+            let package = x.kind == "package"
+                && x.value
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .is_some_and(|n| Some(n.rsplit('/').next().unwrap_or(n)) == name);
+            if package {
+                ids.push(format!("{}@package", x.id));
+            }
+            if !ids.is_empty() || package {
+                ids.push(format!("{}@scope", x.id));
+            }
+            after.extend(ids.into_iter().filter(|id| self.ops.contains_key(id)));
+        }
+        if let Some(op) = self.ops.get_mut(&format!("{}@service", r.id)) {
+            op.after = after.into_iter().collect();
         }
     }
 
@@ -2138,6 +2460,42 @@ mod tests {
             "package is provisioning, outside a config plan"
         );
         assert_eq!(Scope::Packages.as_str(), "packages");
+    }
+
+    #[test]
+    fn the_services_scope_covers_services_and_names_their_prerequisites() {
+        assert!(Scope::Services.covers(&of_kind("service")));
+        for scope in [Scope::Config, Scope::Secrets, Scope::Packages] {
+            assert!(!scope.covers(&of_kind("service")), "{scope:?}");
+        }
+        assert!(!Scope::Services.covers(&of_kind("link")));
+        assert_eq!(
+            Scope::Config.excuse(&of_kind("service")),
+            "service is lifecycle, outside a config plan"
+        );
+        assert_eq!(
+            Scope::Services.excuse(&of_kind("link")),
+            "link is configuration, outside a services plan"
+        );
+        assert_eq!(Scope::Services.as_str(), "services");
+        let states = [
+            ServiceState::Current("loaded, running".into()),
+            ServiceState::Stopped("not loaded".into()),
+            ServiceState::Stale("loaded, not running".into()),
+            ServiceState::Foreign("loaded from another definition".into()),
+            ServiceState::Missing("not published".into()),
+            ServiceState::Unknown("timeout".into()),
+            ServiceState::Refused("bad label".into()),
+        ];
+        let strings: BTreeSet<String> = states.iter().map(ServiceState::state).collect();
+        assert_eq!(strings.len(), states.len());
+        assert_eq!(states[0].state(), "current:loaded, running");
+        // The prerequisite files: the definition and each configuration file, once each.
+        let mut r = of_kind("service");
+        assert!(service_prerequisites(&r).is_empty());
+        r.value = toml::from_str("plist = \"la/x.plist\"\nconfig = [\"c/b\", \"c/a\", \"c/b\"]\n")
+            .unwrap();
+        assert_eq!(service_prerequisites(&r), ["c/a", "c/b", "la/x.plist"]);
     }
 
     #[test]
