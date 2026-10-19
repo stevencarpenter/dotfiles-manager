@@ -570,17 +570,27 @@ fn uv_tool_version(text: &str, name: &str) -> Option<String> {
     })
 }
 
-/// A name as uv normalizes it: lowercase, `_` and `.` as `-`. uv names a tool's directory under
-/// `~/.local/share/uv/tools` this way too.
+/// A name as uv normalizes it (PEP 503): lowercase, every run of `_`, `.` and `-` as one `-`.
+/// uv names a tool's directory under `~/.local/share/uv/tools` this way too.
 fn uv_norm(s: &str) -> String {
-    s.to_ascii_lowercase().replace(['_', '.'], "-")
+    s.chars()
+        .fold(String::with_capacity(s.len()), |mut out, c| {
+            match c {
+                '_' | '.' | '-' if out.ends_with('-') => {}
+                '_' | '.' | '-' => out.push('-'),
+                c => out.push(c.to_ascii_lowercase()),
+            }
+            out
+        })
 }
 
-/// The source uv recorded for an installed tool: `[tool].requirements` in
-/// `~/.local/share/uv/tools/<name>/uv-receipt.toml`. `uv tool upgrade` resolves the tool from
-/// that receipt again, so a `git`, `path`, `url` or `editable` requirement is an origin no plan
-/// row shows; `Ok(Some(key))` names it. A receipt that cannot be read or has no requirements
-/// is an error: the update cannot tell what it would resolve.
+/// What in uv's receipt for an installed tool (`~/.local/share/uv/tools/<name>/uv-receipt.toml`)
+/// an upgrade would keep that no plan row shows: a `git`, `path`, `directory`, `url` or
+/// `editable` requirement in `[tool].requirements` (an origin `uv tool upgrade` resolves again),
+/// or any `[tool.options]` entry (`index-url`, `default-index`, `find-links`, `no-index`,
+/// `prerelease` and the other install settings uv persists and reuses); `Ok(Some(reason))`
+/// says which. A receipt that cannot be read or has no requirements is an error: the update
+/// cannot tell what it would resolve.
 fn uv_receipt_source(home: &Path, name: &str) -> Result<Option<String>, String> {
     let path = home
         .join(".local/share/uv/tools")
@@ -596,16 +606,30 @@ fn uv_receipt_source(home: &Path, name: &str) -> Result<Option<String>, String> 
     .map_err(|r| r.detail)?;
     let text = String::from_utf8(bytes).map_err(|_| format!("{shown} is not UTF-8"))?;
     let v: dfm_model::resolve::Table = text.parse().map_err(|_| format!("{shown} is not TOML"))?;
-    let reqs = v
-        .get("tool")
+    let tool = v.get("tool");
+    let reqs = tool
         .and_then(|t| t.get("requirements"))
         .and_then(Value::as_array)
         .ok_or_else(|| format!("{shown} lists no tool requirements"))?;
-    Ok(reqs.iter().find_map(|r| {
-        ["git", "path", "url", "editable"]
+    if let Some(key) = reqs.iter().find_map(|r| {
+        ["git", "path", "directory", "url", "editable"]
             .iter()
             .find(|k| r.get(k).is_some())
-            .map(|k| (*k).to_string())
+    }) {
+        return Ok(Some(format!(
+            "installed from a {key} source, which an upgrade would resolve again outside the plan"
+        )));
+    }
+    let options = tool
+        .and_then(|t| t.get("options"))
+        .and_then(Value::as_table)
+        .filter(|o| !o.is_empty());
+    Ok(options.map(|o| {
+        let keys: Vec<&str> = o.keys().map(String::as_str).collect();
+        format!(
+            "installed with uv options ({}), which an upgrade would keep outside the plan",
+            keys.join(", ")
+        )
     }))
 }
 
@@ -824,7 +848,8 @@ pub fn install(runner: &Runner, adapter: &str, value: &Value) -> Result<(), Refu
 /// `rolling` declaration of a mise or uv tool is `Rolling`; a held or other policy, a provider
 /// with no rolling path, or an installed local build (a mise `ref:` or `path:` version, which
 /// the update would not replace and the manager never removes), or a uv tool whose receipt
-/// names a git, path, url or editable source, is `Held` with the reason. A copy of the tool
+/// names a git, path, url or editable source or keeps install options, is `Held` with the
+/// reason. A copy of the tool
 /// from another owner blocks the update (`OtherOwner`): two owners of one tool is the conflict
 /// the update must not deepen.
 pub fn maintain(runner: &Runner, adapter: &str, value: &Value) -> Result<PackageState, Refusal> {
@@ -846,17 +871,13 @@ pub fn maintain(runner: &Runner, adapter: &str, value: &Value) -> Result<Package
     if let Some(local) = versions.split(' ').find(|v| local_build(v)) {
         return held(format!("{local} is a local build, which is kept"));
     }
-    // `uv tool upgrade` resolves the tool from its receipt again: a git, path or url source
-    // there is an origin the plan never showed, so such a tool is kept.
+    // `uv tool upgrade` resolves the tool from its receipt again: a git, path or url source,
+    // or a persisted option such as an index, is a setting the plan never showed, so such a
+    // tool is kept.
     if adapter == UV_TOOL {
         match uv_receipt_source(&runner.home, &pkg) {
             Ok(None) => {}
-            Ok(Some(src)) => {
-                return held(format!(
-                    "installed from a {src} source, which an upgrade would resolve again outside the plan"
-                ));
-            }
-            Err(why) => return held(why),
+            Ok(Some(why)) | Err(why) => return held(why),
         }
     }
     Ok(match other_owner(runner, adapter, &pkg) {
@@ -877,15 +898,27 @@ fn local_build(v: &str) -> bool {
 }
 
 /// Asks the provider for its newest version of a rolling tool and installs it beside the
-/// installed ones: for mise the install itself (`mise install <tool>[@prefix]` resolves the
-/// newest version that matches, without config a bare tool is mise's newest, and it is a no-op
-/// when that version is installed); `uv tool upgrade <name>` replaces the tool's one version.
-/// The caller probes again and compares the listing to decide `updated` or `current`. Neither
+/// installed ones: `mise install <tool>@latest` for a bare name and `mise install <tool>@<prefix>`
+/// for a declared prefix (each resolves the newest matching version and is a no-op when it is
+/// installed; a bare name would install only what mise's configuration requests, which
+/// `MISE_NO_CONFIG=1` hides); `uv tool upgrade <name>` replaces the tool's one version. The
+/// caller probes again and compares the listing to decide `updated` or `current`. Neither
 /// removes a version.
 pub fn upgrade(runner: &Runner, adapter: &str, value: &Value) -> Result<(), Refusal> {
     let pkg = name(value)?;
     match adapter {
-        MISE => install(runner, adapter, value),
+        MISE => {
+            let (tool, want) = tool_and_version(&pkg);
+            let want = if want.is_empty() { "latest" } else { want };
+            let selector = format!("{tool}@{want}");
+            change(
+                runner,
+                "mise",
+                &["install".to_string(), selector.clone()],
+                &mise_env(),
+                &format!("mise install {selector}"),
+            )
+        }
         UV_TOOL => {
             let args = ["tool".to_string(), "upgrade".into(), pkg.clone()];
             change(
@@ -1051,18 +1084,53 @@ mod tests {
         let receipt = |body: &str| std::fs::write(dir.join("uv-receipt.toml"), body).unwrap();
         receipt("[tool]\nrequirements = [{ name = \"agent-reap\" }]\nentrypoints = []\n");
         assert_eq!(uv_receipt_source(&home, "agent_reap"), Ok(None));
+        assert_eq!(uv_receipt_source(&home, "Agent..Reap"), Ok(None));
+        // An empty options table is the default.
+        receipt("[tool]\nrequirements = [{ name = \"agent-reap\" }]\n[tool.options]\n");
+        assert_eq!(uv_receipt_source(&home, "agent-reap"), Ok(None));
+        let source = |key: &str| {
+            Some(format!(
+                "installed from a {key} source, which an upgrade would resolve again outside the plan"
+            ))
+        };
         receipt(
             "[tool]\nrequirements = [{ name = \"agent-reap\", git = \"ssh://git@example.invalid/x\" }]\n",
         );
-        assert_eq!(
-            uv_receipt_source(&home, "agent-reap"),
-            Ok(Some("git".into()))
-        );
+        assert_eq!(uv_receipt_source(&home, "agent-reap"), Ok(source("git")));
         receipt("[tool]\nrequirements = [{ name = \"agent-reap\", path = \"/tmp/x\" }]\n");
+        assert_eq!(uv_receipt_source(&home, "agent-reap"), Ok(source("path")));
+        receipt("[tool]\nrequirements = [{ name = \"agent-reap\", directory = \"/tmp/x\" }]\n");
         assert_eq!(
             uv_receipt_source(&home, "agent-reap"),
-            Ok(Some("path".into()))
+            Ok(source("directory"))
         );
+        // A persisted install option is kept by `uv tool upgrade`: an index the plan never
+        // showed, or any other setting, holds the tool.
+        for (options, keys) in [
+            (
+                "index-url = \"https://example.invalid/simple\"",
+                "index-url",
+            ),
+            (
+                "default-index = \"https://example.invalid/simple\"",
+                "default-index",
+            ),
+            (
+                "compile-bytecode = true\nprerelease = \"allow\"",
+                "compile-bytecode, prerelease",
+            ),
+        ] {
+            receipt(&format!(
+                "[tool]\nrequirements = [{{ name = \"agent-reap\" }}]\n[tool.options]\n{options}\n"
+            ));
+            assert_eq!(
+                uv_receipt_source(&home, "agent-reap"),
+                Ok(Some(format!(
+                    "installed with uv options ({keys}), which an upgrade would keep outside the plan"
+                ))),
+                "{options}"
+            );
+        }
         receipt("[tool]\nentrypoints = []\n");
         assert!(uv_receipt_source(&home, "agent-reap").is_err());
         receipt("not = [toml");
@@ -1072,10 +1140,26 @@ mod tests {
     }
 
     #[test]
+    fn uv_names_normalize_as_pep_503_does() {
+        for spelled in [
+            "Friendly__Bard",
+            "friendly--bard",
+            "friendly.bard",
+            "friendly-_.bard",
+        ] {
+            assert_eq!(uv_norm(spelled), "friendly-bard", "{spelled}");
+        }
+    }
+
+    #[test]
     fn the_uv_listing_is_read_by_tool_name_and_a_source_is_refused() {
         let listing = "agent-reap v0.1.0\n- agent-reap\nnuv v0.5.2\n- nuv\n";
         assert_eq!(uv_tool_version(listing, "nuv"), Some("0.5.2".into()));
         assert_eq!(uv_tool_version(listing, "agent_reap"), Some("0.1.0".into()));
+        assert_eq!(
+            uv_tool_version(listing, "Agent__Reap"),
+            Some("0.1.0".into())
+        );
         assert_eq!(uv_tool_version(listing, "agent"), None);
         assert_eq!(uv_tool_version("No tools installed\n", "nuv"), None);
         assert_eq!(uv_tool_version("No tools installed\n", "No"), None);

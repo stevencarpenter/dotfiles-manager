@@ -61,9 +61,11 @@ update_policy = "rolling"
 "#;
 
 /// `mise ls --installed --json <tool>` answers from `installed-mise` (one `<tool> <version>`
-/// line per installed version). `mise install <tool>[@prefix]` adds the version `latest-mise`
-/// names for the tool (`<prefix>.0` when the prefix does not match it, `2.0.0` when there is
-/// none) unless that version is listed, as mise does; it never removes one. The `fail` marker
+/// line per installed version). `mise install <tool>@<selector>` adds the version `latest-mise`
+/// names for the tool (`<prefix>.0` when a prefix does not match it, `2.0.0` when there is
+/// none) unless that version is listed, as mise does; it never removes one. A bare tool name
+/// exits 1 as a failed install, because real mise installs only the version its configuration
+/// requests for a bare name, and the manager runs it with `MISE_NO_CONFIG=1`. The `fail` marker
 /// makes an install fail. Any other subcommand (`prune`, `uninstall`, `upgrade`, `latest`)
 /// exits 64, so a call to one fails its run.
 const FAKE_MISE: &str = r#"#!/bin/sh
@@ -83,7 +85,8 @@ case "$1" in
     exit 0 ;;
   install)
     [ -e "$here/../fail" ] && { echo "mise ERROR PLANTED" >&2; exit 1; }
-    tool=${2%%@*}; want=${2#*@}; [ "$want" = "$2" ] && want=""
+    case "$2" in *@*) ;; *) echo "mise ERROR no version requested for $2" >&2; exit 1 ;; esac
+    tool=${2%%@*}; want=${2#*@}; [ "$want" = latest ] && want=""
     new=$(grep "^$tool " "$here/../latest-mise" 2>/dev/null | head -1 | cut -d' ' -f2)
     [ -z "$new" ] && new=2.0.0
     case "$want" in "") ;; *) case "$new" in "$want".*) ;; *) new="$want.0" ;; esac ;; esac
@@ -356,14 +359,14 @@ fn a_rolling_update_upgrades_mise_and_uv_tools_keeps_every_installed_version_and
     assert_eq!(
         fx.changes(),
         [
-            "mise install duckdb",
+            "mise install duckdb@latest",
             "mise install go@1.27",
             "uv tool upgrade nuv"
         ]
     );
     let log = fx.log();
     assert!(
-        log.contains("mise install duckdb | yes=1 auto=false noconfig=1"),
+        log.contains("mise install duckdb@latest | yes=1 auto=false noconfig=1"),
         "{log}"
     );
     assert!(
@@ -549,6 +552,15 @@ fn a_uv_tool_installed_from_a_git_or_path_source_is_held_and_an_unreadable_recei
             "[tool]\nrequirements = [{ name = \"nuv\", path = \"/tmp/nuv\" }]\n",
             "installed from a path source",
         ),
+        // `uv tool upgrade` keeps the index the install was given: the plan never showed it.
+        (
+            "[tool]\nrequirements = [{ name = \"nuv\" }]\n\n[tool.options]\nindex-url = \"https://example.invalid/simple\"\n",
+            "installed with uv options (index-url), which an upgrade would keep outside the plan",
+        ),
+        (
+            "[tool]\nrequirements = [{ name = \"nuv\" }]\n\n[tool.options]\ndefault-index = \"https://example.invalid/simple\"\n",
+            "installed with uv options (default-index)",
+        ),
         ("[tool]\nentrypoints = []\n", "lists no tool requirements"),
         ("not = [toml", "is not TOML"),
     ] {
@@ -707,7 +719,7 @@ fn an_interrupted_upgrade_keeps_the_installed_versions_and_blocks_until_resolved
         .output()
         .unwrap();
     assert!(!crash.status.success());
-    assert_eq!(fx.changes(), ["mise install duckdb"]);
+    assert_eq!(fx.changes(), ["mise install duckdb@latest"]);
     assert!(fx.listed("mise").contains("duckdb 1.5.6\n"));
     assert!(fx.listed("mise").contains("duckdb 1.6.0\n"));
     let journal = fx.state().join("journal.jsonl");
