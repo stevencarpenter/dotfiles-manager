@@ -173,54 +173,243 @@ fn definition_bytes(path: &Path) -> Result<Vec<u8>, String> {
     Ok(bytes)
 }
 
-/// The `<string>` values directly inside the element that follows `<key>name</key>`: one for a
-/// string value, each item for an array. Empty when the key is absent or holds another type.
-fn strings_after(text: &str, name: &str) -> Vec<String> {
-    let Some((_, rest)) = text.split_once(&format!("<key>{name}</key>")) else {
-        return Vec::new();
-    };
-    let rest = rest.trim_start();
-    let (body, array) = if let Some(s) = rest.strip_prefix("<string>") {
-        (s.split_once("</string>").map_or("", |(v, _)| v), false)
-    } else if let Some(a) = rest.strip_prefix("<array>") {
-        (a.split_once("</array>").map_or("", |(v, _)| v), true)
-    } else {
-        return Vec::new();
-    };
-    let items: Vec<&str> = if array {
-        body.split("<string>")
-            .skip(1)
-            .filter_map(|part| part.split_once("</string>").map(|(v, _)| v))
-            .collect()
-    } else {
-        vec![body]
-    };
-    items
-        .into_iter()
-        .map(str::trim)
-        .filter(|v| !v.is_empty() && !v.contains('<'))
-        .map(str::to_string)
-        .collect()
+/// One value of the top-level dictionary of a definition: a string, an array of strings, or
+/// anything else. A nested dictionary is `Other`: its keys are followed as structure and never
+/// read as top-level keys.
+#[derive(Debug, PartialEq)]
+enum Item {
+    Str(String),
+    Strs(Vec<String>),
+    Other,
 }
 
-/// `<key>Label</key>` followed by one `<string>…</string>`, white space between them allowed.
-fn label_in(text: &str) -> Option<String> {
-    match strings_after(text, "Label").as_slice() {
-        [one] => Some(one.clone()),
-        _ => None,
+type Dict = BTreeMap<String, Item>;
+
+/// Why a definition is not an XML property list the adapter reads. Every reason names a shape,
+/// never content: the file can be a secret output.
+type Shape<T> = Result<T, &'static str>;
+
+const MAX_DEPTH: u8 = 32;
+
+/// A strict reader of an XML property list: one `<plist>` holding one `<dict>`. The XML
+/// declaration, the DOCTYPE and comments are skipped; a CDATA section is text; `<key>`,
+/// `<string>`, `<array>` and `<dict>` are followed by structure. Anything else (a binary plist,
+/// an unknown element or entity, an unclosed element, a repeated key, a nesting deeper than
+/// 32) is refused. Option (a), `plutil -extract Label raw`, would add a child process per probe
+/// and a look-alike for the tests; a plist crate would be a dependency for one key.
+struct Reader<'a> {
+    rest: &'a str,
+    depth: u8,
+}
+
+impl<'a> Reader<'a> {
+    fn skip_past(&mut self, end: &str, why: &'static str) -> Shape<()> {
+        let (_, after) = self.rest.split_once(end).ok_or(why)?;
+        self.rest = after;
+        Ok(())
     }
+
+    /// White space, comments, the XML declaration and the DOCTYPE between elements.
+    fn skip_misc(&mut self) -> Shape<()> {
+        loop {
+            self.rest = self.rest.trim_start();
+            let end = if self.rest.starts_with("<!--") {
+                "-->"
+            } else if self.rest.starts_with("<?") {
+                "?>"
+            } else if self.rest.starts_with("<!DOCTYPE") {
+                ">"
+            } else {
+                return Ok(());
+            };
+            self.skip_past(end, "a comment, declaration or doctype is not closed")?;
+        }
+    }
+
+    /// `<name …>`, `<name …/>` or `</name>`: the name, whether it closes, whether it is empty.
+    fn tag(&mut self) -> Shape<(&'a str, bool, bool)> {
+        let s = self
+            .rest
+            .strip_prefix('<')
+            .ok_or("an element was expected")?;
+        let (closing, s) = match s.strip_prefix('/') {
+            Some(s) => (true, s),
+            None => (false, s),
+        };
+        let n = s
+            .find(|c: char| !c.is_ascii_alphanumeric())
+            .unwrap_or(s.len());
+        let (name, s) = s.split_at(n);
+        if name.is_empty() {
+            return Err("an element has no name");
+        }
+        let mut quote = None;
+        let mut end = None;
+        for (i, c) in s.char_indices() {
+            match (quote, c) {
+                (Some(q), c) if c == q => quote = None,
+                (Some(_), _) => {}
+                (None, '"' | '\'') => quote = Some(c),
+                (None, '>') => {
+                    end = Some(i);
+                    break;
+                }
+                (None, '<') => return Err("an element is not closed"),
+                (None, _) => {}
+            }
+        }
+        let end = end.ok_or("an element is not closed")?;
+        let attrs = &s[..end];
+        let empty = attrs.ends_with('/');
+        if closing && !attrs.trim().is_empty() {
+            return Err("a closing tag has attributes");
+        }
+        self.rest = &s[end + 1..];
+        Ok((name, closing, empty))
+    }
+
+    /// The text up to `</name>`: comments skipped, a CDATA section taken as text, the five XML
+    /// entities decoded. An element inside is not understood.
+    fn text(&mut self, name: &str) -> Shape<String> {
+        let mut out = String::new();
+        loop {
+            if let Some(s) = self.rest.strip_prefix("<![CDATA[") {
+                let (t, after) = s.split_once("]]>").ok_or("a CDATA section is not closed")?;
+                out.push_str(t);
+                self.rest = after;
+            } else if self.rest.starts_with("<!--") {
+                self.skip_past("-->", "a comment is not closed")?;
+            } else if self.rest.starts_with('<') {
+                return match self.tag()? {
+                    (n, true, _) if n == name => Ok(out),
+                    _ => Err("an element inside a text value"),
+                };
+            } else if let Some(s) = self.rest.strip_prefix('&') {
+                let (e, after) = s.split_once(';').ok_or("an entity is not closed")?;
+                out.push(match e {
+                    "amp" => '&',
+                    "lt" => '<',
+                    "gt" => '>',
+                    "quot" => '"',
+                    "apos" => '\'',
+                    _ => return Err("an entity the adapter does not read"),
+                });
+                self.rest = after;
+            } else if self.rest.is_empty() {
+                return Err("a text value is not closed");
+            } else {
+                let n = self.rest.find(['<', '&']).unwrap_or(self.rest.len());
+                let (t, after) = self.rest.split_at(n);
+                out.push_str(t);
+                self.rest = after;
+            }
+        }
+    }
+
+    fn nested<T>(&mut self, read: impl FnOnce(&mut Self) -> Shape<T>) -> Shape<T> {
+        if self.depth == MAX_DEPTH {
+            return Err("a nesting deeper than 32");
+        }
+        self.depth += 1;
+        let out = read(self);
+        self.depth -= 1;
+        out
+    }
+
+    /// One value, after its opening tag was read as `(name, empty)`.
+    fn value(&mut self, name: &str, empty: bool) -> Shape<Item> {
+        Ok(match (name, empty) {
+            ("string", true) => Item::Str(String::new()),
+            ("string", false) => Item::Str(self.text("string")?),
+            ("true" | "false" | "array" | "dict", true) => Item::Other,
+            ("integer" | "real" | "date" | "data", false) => {
+                self.text(name)?;
+                Item::Other
+            }
+            ("array", false) => self.nested(|r| {
+                let mut items = Vec::new();
+                loop {
+                    r.skip_misc()?;
+                    match r.tag()? {
+                        ("array", true, _) => break,
+                        (_, true, _) => return Err("a value was expected"),
+                        (n, false, e) => items.push(r.value(n, e)?),
+                    }
+                }
+                Ok(items
+                    .into_iter()
+                    .map(|i| match i {
+                        Item::Str(s) => Some(s),
+                        _ => None,
+                    })
+                    .collect::<Option<Vec<_>>>()
+                    .map_or(Item::Other, Item::Strs))
+            })?,
+            ("dict", false) => {
+                self.dict()?;
+                Item::Other
+            }
+            _ => return Err("an element the adapter does not read"),
+        })
+    }
+
+    /// The key and value pairs of a dictionary, after its `<dict>` was read.
+    fn dict(&mut self) -> Shape<Dict> {
+        self.nested(|r| {
+            let mut d = Dict::new();
+            loop {
+                r.skip_misc()?;
+                match r.tag()? {
+                    ("dict", true, _) => return Ok(d),
+                    ("key", false, false) => {}
+                    _ => return Err("a key was expected"),
+                }
+                let key = r.text("key")?;
+                r.skip_misc()?;
+                let v = match r.tag()? {
+                    (n, false, e) => r.value(n, e)?,
+                    _ => return Err("a value was expected"),
+                };
+                if d.insert(key, v).is_some() {
+                    return Err("a key is repeated");
+                }
+            }
+        })
+    }
+}
+
+/// The top-level dictionary of an XML property list, read by structure.
+fn parse_definition(text: &str) -> Shape<Dict> {
+    let mut r = Reader {
+        rest: text.strip_prefix('\u{feff}').unwrap_or(text),
+        depth: 0,
+    };
+    r.skip_misc()?;
+    if r.tag()? != ("plist", false, false) {
+        return Err("not a <plist> document");
+    }
+    r.skip_misc()?;
+    if r.tag()? != ("dict", false, false) {
+        return Err("the top level is not a dictionary");
+    }
+    let d = r.dict()?;
+    r.skip_misc()?;
+    if r.tag()? != ("plist", true, false) {
+        return Err("content after the dictionary");
+    }
+    r.skip_misc()?;
+    if !r.rest.is_empty() {
+        return Err("content after the document");
+    }
+    Ok(d)
 }
 
 /// What the definition runs, for the plan: `Program`, else `ProgramArguments` joined by spaces.
-fn program_in(text: &str) -> String {
-    let mut words = strings_after(text, "Program");
-    if words.is_empty() {
-        words = strings_after(text, "ProgramArguments");
-    }
-    if words.is_empty() {
-        "(no program)".to_string()
-    } else {
-        words.join(" ")
+fn program_in(d: &Dict) -> String {
+    match (d.get("Program"), d.get("ProgramArguments")) {
+        (Some(Item::Str(p)), _) => p.clone(),
+        (_, Some(Item::Strs(a))) if !a.is_empty() => a.join(" "),
+        _ => "(no program)".to_string(),
     }
 }
 
@@ -314,24 +503,34 @@ fn launchd_state(runner: &Runner, value: &Value) -> Result<ServiceFacts, Refusal
     };
     let text = String::from_utf8_lossy(&bytes);
     // The found label is never repeated: the definition can be a secret output, and a template
-    // error can put a token in the Label slot. The declared label is manifest data.
-    match label_in(&text) {
-        Some(l) if l == label => {}
-        Some(_) => {
+    // error can put a token in the Label slot. The declared label is manifest data. The label
+    // is the parsed top-level Label (review round 2): a text match would take a decoy in a
+    // comment, a CDATA section or a nested dictionary, which launchd would not.
+    let items = match parse_definition(&text) {
+        Ok(d) => d,
+        Err(why) => {
+            return Ok(only(ServiceState::Refused(format!(
+                "{plist} is not an XML property list the adapter reads ({why}); the adapter cannot check which agent it defines"
+            ))));
+        }
+    };
+    match items.get("Label") {
+        Some(Item::Str(l)) if *l == label => {}
+        Some(Item::Str(_)) => {
             return Ok(only(ServiceState::Refused(format!(
                 "{plist} declares another label than {label}; loading it would load another agent"
             ))));
         }
-        None => {
+        _ => {
             return Ok(only(ServiceState::Refused(format!(
-                "{plist} is not an XML property list with a Label string; the adapter cannot check which agent it defines"
+                "{plist} has no Label string; the adapter cannot check which agent it defines"
             ))));
         }
     }
     let definition = Some(Definition {
         path: plist,
         sha256: sha256_hex(&bytes),
-        program: program_in(&text),
+        program: program_in(&items),
     });
     let state = match launchd_report(runner, &label) {
         Err(why) => ServiceState::Unknown(why),
@@ -633,30 +832,122 @@ mod tests {
         assert!(formula(&v("label", "x")).is_err());
     }
 
+    const XML: &str = "<?xml version=\"1.0\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\">\n<dict>\n\t<key>Label</key>\n\t<string>org.example.maxfiles</string>\n\t<key>RunAtLoad</key>\n\t<true/>\n</dict>\n</plist>\n";
+
+    fn label_in(text: &str) -> Shape<Option<String>> {
+        Ok(match parse_definition(text)?.get("Label") {
+            Some(Item::Str(l)) => Some(l.clone()),
+            _ => None,
+        })
+    }
+
+    fn wrap(body: &str) -> String {
+        format!("<plist version=\"1.0\"><dict>{body}</dict></plist>")
+    }
+
     #[test]
-    fn the_label_of_an_xml_definition_is_read_and_a_binary_one_is_not() {
-        let xml = "<?xml version=\"1.0\"?>\n<plist version=\"1.0\">\n<dict>\n\t<key>Label</key>\n\t<string>org.example.maxfiles</string>\n\t<key>RunAtLoad</key>\n\t<true/>\n</dict>\n</plist>\n";
-        assert_eq!(label_in(xml).as_deref(), Some("org.example.maxfiles"));
+    fn the_label_of_an_xml_definition_is_read_by_structure() {
         assert_eq!(
-            label_in("<key>Label</key><string> a.b </string>").as_deref(),
-            Some("a.b")
+            label_in(XML).unwrap().as_deref(),
+            Some("org.example.maxfiles")
         );
-        assert_eq!(program_in(xml), "(no program)");
-        let args = "<key>ProgramArguments</key>\n\t<array>\n\t\t<string>/bin/launchctl</string>\n\t\t<string>limit</string>\n\t</array>\n<key>RunAtLoad</key><true/>";
-        assert_eq!(program_in(args), "/bin/launchctl limit");
+        assert_eq!(program_in(&parse_definition(XML).unwrap()), "(no program)");
+        let args = wrap(
+            "<key>Label</key><string>a</string><key>ProgramArguments</key>\n\t<array>\n\t\t<string>/bin/launchctl</string>\n\t\t<string>limit &amp; more</string>\n\t</array>\n<key>RunAtLoad</key><true/>",
+        );
         assert_eq!(
-            program_in("<key>Program</key><string>/usr/bin/true</string>"),
+            program_in(&parse_definition(&args).unwrap()),
+            "/bin/launchctl limit & more"
+        );
+        let program = wrap("<key>Program</key><string>/usr/bin/true</string>");
+        assert_eq!(
+            program_in(&parse_definition(&program).unwrap()),
             "/usr/bin/true"
         );
-        for bad in [
-            "bplist00\u{0}",
+        // A decoy Label in a comment, a CDATA section or a nested dictionary before the real
+        // one is not the top-level Label; the real one is.
+        for decoy in [
+            "<!-- <key>Label</key><string>org.example.decoy</string> -->",
+            "<key>Note</key><string><![CDATA[<key>Label</key><string>org.example.decoy</string>]]></string>",
+            "<key>Nested</key><dict><key>Label</key><string>org.example.decoy</string></dict>",
+            "<key>List</key><array><dict><key>Label</key><string>org.example.decoy</string></dict><integer>1</integer></array>",
+        ] {
+            let text = wrap(&format!(
+                "{decoy}<key>Label</key><string>org.example.real</string>"
+            ));
+            assert_eq!(
+                label_in(&text).unwrap().as_deref(),
+                Some("org.example.real"),
+                "{decoy}"
+            );
+        }
+        // No trimming: launchd is not known to trim, so a padded label is another label.
+        assert_eq!(
+            label_in(&wrap("<key>Label</key><string> a.b </string>"))
+                .unwrap()
+                .as_deref(),
+            Some(" a.b ")
+        );
+        // A Label that is not a string, or absent, is no label.
+        for body in [
             "<key>Label</key><integer>1</integer>",
-            "<key>Label</key><string></string>",
-            "<key>Label</key><string><x/></string>",
+            "<key>RunAtLoad</key><true/>",
             "",
         ] {
-            assert_eq!(label_in(bad), None, "{bad:?}");
+            assert_eq!(label_in(&wrap(body)).unwrap(), None, "{body:?}");
         }
+    }
+
+    #[test]
+    fn a_definition_the_reader_does_not_understand_is_refused() {
+        for (bad, why) in [
+            ("bplist00\u{0}", "an element was expected"),
+            ("", "an element was expected"),
+            (
+                "<plist><dict><key>Label</key><string>a</string>",
+                "an element was expected",
+            ),
+            (
+                "<plist><dict><key>Label</key><string><x/></string></dict></plist>",
+                "an element inside a text value",
+            ),
+            (
+                "<plist><dict><key>Label</key><string>a</string><key>Label</key><string>b</string></dict></plist>",
+                "a key is repeated",
+            ),
+            (
+                "<plist><dict><key>Label</key><string>a&decoy;</string></dict></plist>",
+                "an entity the adapter does not read",
+            ),
+            (
+                "<plist><dict><key>Label</key><blob>a</blob></dict></plist>",
+                "an element the adapter does not read",
+            ),
+            (
+                "<plist><dict><!-- <key>Label</key><string>a</string></dict></plist>",
+                "a comment, declaration or doctype is not closed",
+            ),
+            (
+                "<plist><array/></plist>",
+                "the top level is not a dictionary",
+            ),
+            (
+                "<plist><dict></dict></plist><dict/>",
+                "content after the document",
+            ),
+            (
+                "<plist><dict><string>a</string></dict></plist>",
+                "a key was expected",
+            ),
+        ] {
+            assert_eq!(parse_definition(bad), Err(why), "{bad:?}");
+        }
+        let deep = format!(
+            "<plist><dict><key>a</key>{}<string>x</string>{}</dict></plist>",
+            "<array>".repeat(40),
+            "</array>".repeat(40)
+        );
+        assert_eq!(parse_definition(&deep), Err("a nesting deeper than 32"));
     }
 
     #[test]

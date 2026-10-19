@@ -818,6 +818,77 @@ fn a_launcher_that_fails_hangs_or_is_interrupted_never_reports_success() {
 }
 
 #[test]
+fn a_decoy_label_in_a_comment_or_a_nested_dictionary_is_not_the_label() {
+    let fx = Fx::new();
+    fx.mark("brew-sketchybar", "started\n");
+    fx.publish();
+    let src = "base/modules/extra/files/org.example.maxfiles.plist";
+    let comment = AGENT_PLIST.replace(
+        "<dict>\n",
+        "<dict>\n\t<!-- <key>Label</key><string>DECOY</string> -->\n",
+    );
+    let nested = AGENT_PLIST.replace(
+        "<dict>\n",
+        "<dict>\n\t<key>Nested</key>\n\t<dict>\n\t\t<key>Label</key>\n\t\t<string>DECOY</string>\n\t</dict>\n",
+    );
+    for shape in [&comment, &nested] {
+        // The real Label matches the declaration: the check passes, the probe runs and the
+        // program comes from the top-level dictionary, not from the decoy's surroundings.
+        fx.unmark("log");
+        fx.put(src, &shape.replace("DECOY", "org.example.decoy"));
+        let o = fx.preview(&[]);
+        assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+        assert!(
+            text(&o.stdout)
+                .contains("the definition runs /bin/launchctl limit maxfiles 65536 2097152"),
+            "{}",
+            text(&o.stdout)
+        );
+        assert!(fx.log().contains("launchctl print"), "{}", fx.log());
+        // The decoy carries the declared label and the real Label is another one: a text match
+        // would accept it and bootstrap another agent. The declaration error names neither
+        // the decoy nor the found label, and no launcher runs.
+        fx.unmark("log");
+        fx.put(
+            src,
+            &shape.replace("DECOY", LABEL).replace(
+                "<string>org.example.maxfiles</string>",
+                "<string>org.example.other</string>",
+            ),
+        );
+        let o = fx.preview(&[]);
+        assert_eq!(code(&o), 3, "{}\n{}", stderr(&o), text(&o.stdout));
+        assert!(stderr(&o).contains("E_MANIFEST_INVALID"), "{}", stderr(&o));
+        assert!(
+            stderr(&o).contains("declares another label than org.example.maxfiles"),
+            "{}",
+            stderr(&o)
+        );
+        assert!(!stderr(&o).contains("org.example.other"), "{}", stderr(&o));
+        assert!(!fx.log().contains("launchctl"), "{}", fx.log());
+    }
+    // A binary or malformed definition is refused before any launcher call.
+    for bad in [
+        "bplist00\u{0}\u{1}\u{2}",
+        "<plist version=\"1.0\"><dict><key>Label</key><string>org.example.maxfiles</string>",
+        "<plist version=\"1.0\"><dict><key>Label</key><string>org.example.maxfiles</string><key>Label</key><string>org.example.other</string></dict></plist>",
+    ] {
+        fx.unmark("log");
+        fx.put(src, bad);
+        let o = fx.preview(&[]);
+        assert_eq!(code(&o), 3, "{}\n{}", stderr(&o), text(&o.stdout));
+        assert!(stderr(&o).contains("E_MANIFEST_INVALID"), "{}", stderr(&o));
+        assert!(
+            stderr(&o).contains("is not an XML property list the adapter reads"),
+            "{}",
+            stderr(&o)
+        );
+        assert!(!stderr(&o).contains("org.example.other"), "{}", stderr(&o));
+        assert!(!fx.log().contains("launchctl"), "{}", fx.log());
+    }
+}
+
+#[test]
 fn the_definition_must_declare_the_label_and_a_changed_prerequisite_makes_the_plan_stale() {
     let fx = Fx::new();
     fx.mark("brew-sketchybar", "started\n");
