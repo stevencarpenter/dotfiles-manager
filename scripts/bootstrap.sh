@@ -2,10 +2,16 @@
 # Bootstrap the dotfiles manager from a verified source checkout.
 # Contract: docs/architecture.md section 12. Procedure and limits: docs/bootstrap.md.
 #
-#   bootstrap.sh install --source <git checkout> --commit <40 hex>
+#   bootstrap.sh install [--source <git checkout | https:// or file:// URL>] --commit <40 hex>
 #   bootstrap.sh check-controls --source <staged tree>   (read-only)
 #   bootstrap.sh uninstall
 #   bootstrap.sh toolchain-digest --dir <installed toolchain>   (value for the lock)
+#   any command: --expect-sha256 <64 hex>   (this file must have that digest, checked first)
+#
+# Without --source, install clones the canonical origin (ORIGIN below) at --commit into the
+# scratch build directory. A URL source is cloned the same way. Network access happens only there.
+# install also refuses to run unless this file is byte-identical to scripts/bootstrap.sh of the
+# pinned commit, so the script that runs is always the script of the commit it builds.
 #
 # POSIX sh plus system tools from a fixed PATH. No cargo, rustc or rustup process
 # starts before the toolchain tree digest and the build controls pass.
@@ -20,9 +26,10 @@
 # cannot export it to skip the re-execution. A caller can still pass the argument itself,
 # so the child checks that its environment holds only the allowed names and refuses
 # otherwise. The DFM_TEST_* hooks are forwarded only when DFM_BOOTSTRAP_TEST=1.
-# Run with /bin/sh (or /usr/bin/env -i /bin/sh), never with bash: in non-POSIX mode an
-# exported function can override the exec builtin before the scrub.
-# Run it as `/usr/bin/env -i /bin/sh scripts/bootstrap.sh ...`. SHELLOPTS and PS4 (xtrace
+# Run it as `/bin/sh scripts/bootstrap.sh ...`, never with bash: in non-POSIX mode an exported
+# function can override the exec builtin before the scrub. Not with `env -i`: that clears HOME,
+# which must equal the password-database home. Not through `curl | sh`: the script re-executes
+# and digests itself by its path ($0), which a pipe does not have. SHELLOPTS and PS4 (xtrace
 # with command substitution, noexec) take effect before the first line of this file and are
 # outside its control; a run that did not print its final line did not finish.
 case ${1:-} in
@@ -50,7 +57,7 @@ env_check=$(/usr/bin/env | /usr/bin/awk -F= -v test="${DFM_BOOTSTRAP_TEST:-}" '
 case $env_check:$PATH in
   clean:/usr/bin:/bin:/usr/sbin:/sbin) ;;
   *)
-    /usr/bin/printf 'error: E_ENV_UNEXPECTED the environment holds more than the script allows (%s); start it as /usr/bin/env -i /bin/sh scripts/bootstrap.sh\n' "${env_check:-unreadable}" >&2
+    /usr/bin/printf 'error: E_ENV_UNEXPECTED the environment holds more than the script allows (%s); start it as /bin/sh scripts/bootstrap.sh\n' "${env_check:-unreadable}" >&2
     exit 3 ;;
 esac
 set -eu
@@ -61,6 +68,7 @@ PATH=$SYSPATH
 export PATH LC_ALL=C
 DATA_REL=.local/share/dotfiles-manager # same literal as dfm_platform_macos::DATA_DIR
 CACHE_REL=.cache/dotfiles-manager      # same literal as dfm_platform_macos::CACHE_DIR
+ORIGIN=https://github.com/stevencarpenter/dotfiles-manager.git # docs/architecture.md section 12, item 3.1
 TAB=$(printf '\t')
 NL='
 '
@@ -622,15 +630,8 @@ install_unfinished() {
   [ -z "$left" ] || echo "bootstrap: install did not finish; left in place: $left" >&2
 }
 
-cmd_install() {
-  [ -n "${src:-}" ] && [ -n "${commit:-}" ] || usage "install needs --source and --commit"
-  # The pin is a full-length lowercase object id and nothing else: no abbreviation, ref, tag,
-  # revision syntax (^, ~, @{}), option-like value or whitespace ever reaches git.
-  case $commit in ""|*[!0-9a-f]*) refuse E_SOURCE_UNTRUSTED "--commit must be a full lowercase hex object id (40 or 64 digits)" ;; esac
-  case ${#commit} in 40) fmt=sha1 ;; 64) fmt=sha256 ;; *) refuse E_SOURCE_UNTRUSTED "--commit must be a full lowercase hex object id (40 or 64 digits)" ;; esac
-  resolve_home; check_platform
-  # /usr/bin/git is the Command Line Tools shim, so the tools are probed before any git call.
-  ensure_clt
+# Read-only identity checks of the git repository at $src (a checkout or a bare clone); sets fmt and hint.
+check_source() {
   [ -d "$src" ] || refuse E_SOURCE_UNTRUSTED "source $src is not a directory"
   # git archive would apply checkout-local attributes (export-ignore, export-subst) and run filter
   # commands from the checkout's config, so the staged tree could differ from the pinned commit.
@@ -647,6 +648,15 @@ cmd_install() {
     refuse E_SOURCE_UNTRUSTED "the source checkout does not use the $fmt object format of the pin"
   resolved=$(git_clean -C "$src" rev-parse --verify --end-of-options "$commit^{commit}" 2>/dev/null) || resolved=
   [ "$resolved" = "$commit" ] || refuse E_SOURCE_UNTRUSTED "$commit is not a commit in the source checkout"
+  # The file that runs must be the script of the pinned commit: a stale, edited or foreign copy
+  # of this script never builds a commit it does not belong to. The digest of $0 was taken
+  # before any command ran. (A hostile script can skip its own checks; the commit id and the
+  # out-of-band --expect-sha256 value are the owner's anchors, see docs/bootstrap.md.)
+  git_clean -C "$src" cat-file -e "$commit:scripts/bootstrap.sh" 2>/dev/null ||
+    refuse E_SOURCE_UNTRUSTED "commit $commit has no scripts/bootstrap.sh"
+  committed=$(git_clean -C "$src" cat-file blob "$commit:scripts/bootstrap.sh" 2>/dev/null | /usr/bin/shasum -a 256) && committed=${committed%% *} || committed=
+  [ -n "$committed" ] && [ "$committed" = "$self_sha" ] ||
+    refuse E_SOURCE_UNTRUSTED "this script ($script_path, sha256 $self_sha) is not scripts/bootstrap.sh of commit $commit (sha256 ${committed:-unreadable})"
   # Early, read-only hint of the pin so a missing toolchain is refused before any mutation.
   # The real parse and every other check run later on the staged copy.
   hint=$(git_clean -C "$src" cat-file blob "$commit:dotfiles-manager.lock" 2>/dev/null |
@@ -654,12 +664,42 @@ cmd_install() {
   [ -n "$hint" ] || refuse E_SOURCE_UNTRUSTED "dotfiles-manager.lock has no toolchain pin"
   [ -d "$DATA/toolchains/$hint" ] ||
     refuse E_TOOLCHAIN_MISMATCH "toolchain $hint is absent at $DATA/toolchains/$hint; install exactly that version there (official Rust release distribution)"
+}
+
+cmd_install() {
+  [ -n "${commit:-}" ] || usage "install needs --commit"
+  # The pin is a full-length lowercase object id and nothing else: no abbreviation, ref, tag,
+  # revision syntax (^, ~, @{}), option-like value or whitespace ever reaches git.
+  case $commit in ""|*[!0-9a-f]*) refuse E_SOURCE_UNTRUSTED "--commit must be a full lowercase hex object id (40 or 64 digits)" ;; esac
+  case ${#commit} in 40) fmt=sha1 ;; 64) fmt=sha256 ;; *) refuse E_SOURCE_UNTRUSTED "--commit must be a full lowercase hex object id (40 or 64 digits)" ;; esac
+  resolve_home; check_platform
+  # /usr/bin/git is the Command Line Tools shim, so the tools are probed before any git call.
+  ensure_clt
+  build=$CACHE/build
+  # install resets the build directory, so neither this script nor a local source may live in it.
+  for _p in "$script_path" "$src"; do
+    case $_p in "$build"|"$build/"*) refuse E_PREREQ_MISSING "$_p is inside the build directory $build, which install resets; move it elsewhere first" ;; esac
+  done
+  # A URL is cloned later, after every local check, so the network is used only when the install
+  # can proceed. A local checkout is checked now, before anything is written.
+  clone_url=
+  case $src in ""|https://*|file://*) clone_url=${src:-$ORIGIN} ;; *) check_source ;; esac
   check_command_path
   check_config_tree; check_binding
   check_cache_tree; check_data_tree; check_bin_dir
-  build=$CACHE/build
   trap install_unfinished EXIT; trap 'exit 130' INT; trap 'exit 143' TERM
   rm_build; mkdir -p "$build/stage"
+  if [ -n "$clone_url" ]; then
+    # A bare clone into the scratch build directory: the pinned commit is read from it with the
+    # same checks as a local checkout, and the exit trap, the cleanup after the build and
+    # uninstall remove it with the rest of the build directory. transfer.fsckObjects checks every
+    # received object (contract section 8). No working tree is written: git archive reads the
+    # commit itself, so there is no checkout head to drift from the pin.
+    git_clean -c transfer.fsckObjects=true clone --bare --quiet -- "$clone_url" "$build/source.git" ||
+      refuse E_SOURCE_UNTRUSTED "cannot clone $clone_url"
+    src=$build/source.git
+    check_source
+  fi
   # Build the verified commit itself, not whatever HEAD is. Both steps are checked: a pipe would hide
   # the status of git archive.
   git_clean -C "$src" archive --format=tar --end-of-options "$commit" >"$build/source.tar" || { echo "error: git archive failed" >&2; exit 1; }
@@ -749,15 +789,15 @@ cmd_uninstall() {
 }
 
 cmd=${1:-}; [ $# -gt 0 ] && shift
-src='' commit='' dir='' seen=' '
+src='' commit='' dir='' expect='' seen=' '
 # A flag is accepted once, and only by the commands that use it.
 flag() {
   case $cmd in
-    install) ok=' --source --commit ' ;;
-    check-controls) ok=' --source ' ;;
-    toolchain-digest) ok=' --dir ' ;;
-    uninstall) ok=' ' ;;
-    *) ok=' --source --commit --dir ' ;; # unknown command: the final usage line explains
+    install) ok=' --source --commit --expect-sha256 ' ;;
+    check-controls) ok=' --source --expect-sha256 ' ;;
+    toolchain-digest) ok=' --dir --expect-sha256 ' ;;
+    uninstall) ok=' --expect-sha256 ' ;;
+    *) ok=' --source --commit --dir --expect-sha256 ' ;; # unknown command: the final usage line explains
   esac
   case $ok in *" $1 "*) ;; *) usage "$cmd does not use $1" ;; esac
   case $seen in *" $1 "*) usage "$1 given twice" ;; esac
@@ -768,12 +808,24 @@ while [ $# -gt 0 ]; do
     --source) flag --source; [ $# -ge 2 ] || usage "--source needs a value"; src=$2; shift 2 ;;
     --commit) flag --commit; [ $# -ge 2 ] || usage "--commit needs a value"; commit=$2; shift 2 ;;
     --dir) flag --dir; [ $# -ge 2 ] || usage "--dir needs a value"; dir=$2; shift 2 ;;
+    --expect-sha256) flag --expect-sha256; [ $# -ge 2 ] || usage "--expect-sha256 needs a value"; expect=$2; shift 2 ;;
     *) usage "unknown argument $1" ;;
   esac
 done
-# Relative arguments become absolute so a later cd cannot be redirected.
-case $src in ""|/*) ;; *) src=$PWD/$src ;; esac
+# Relative arguments become absolute so a later cd cannot be redirected. A URL stays as it is.
+case $src in ""|/*|https://*|file://*) ;; *) src=$PWD/$src ;; esac
 case $dir in ""|/*) ;; *) dir=$PWD/$dir ;; esac
+case $0 in /*) script_path=$0 ;; *) script_path=$PWD/$0 ;; esac
+# The script's own identity, before any command runs: the digest of this file as it executes.
+# --expect-sha256 is the value the owner holds out of band (contract section 12, item 3.1);
+# install also compares the digest with scripts/bootstrap.sh of the pinned commit (check_source).
+self_sha=$(/usr/bin/shasum -a 256 "$script_path") && self_sha=${self_sha%% *} || self_sha=
+[ -n "$self_sha" ] || refuse E_SOURCE_UNTRUSTED "cannot digest this script at $script_path; run it as /bin/sh <path to bootstrap.sh>"
+if [ -n "$expect" ]; then
+  case $expect in *[!0-9a-f]*) usage "--expect-sha256 must be 64 lowercase hex digits" ;; esac
+  [ ${#expect} -eq 64 ] || usage "--expect-sha256 must be 64 lowercase hex digits"
+  [ "$self_sha" = "$expect" ] || refuse E_SOURCE_UNTRUSTED "this script ($script_path) has sha256 $self_sha, expected $expect"
+fi
 case $cmd in
   install) cmd_install ;;
   uninstall) cmd_uninstall ;;
@@ -784,5 +836,5 @@ case $cmd in
   check-controls)
     [ -n "$src" ] || usage "check-controls needs --source"
     resolve_home; controls "$src"; echo "build controls ok" ;;
-  *) usage "usage: bootstrap.sh install --source <git checkout> --commit <sha> | check-controls --source <tree> | uninstall" ;;
+  *) usage "usage: bootstrap.sh install [--source <git checkout or URL>] --commit <sha> | check-controls --source <tree> | uninstall" ;;
 esac

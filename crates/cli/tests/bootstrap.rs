@@ -10,8 +10,13 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 fn script(home: &Path, args: &[&str], env: &[(&str, &str)]) -> Output {
+    script_file(&repo_root().join("scripts/bootstrap.sh"), home, args, env)
+}
+
+/// Runs a copy of the script from another path (the self-identity checks look at `$0`).
+fn script_file(file: &Path, home: &Path, args: &[&str], env: &[(&str, &str)]) -> Output {
     let mut c = Command::new("/bin/sh");
-    c.arg(repo_root().join("scripts/bootstrap.sh"))
+    c.arg(file)
         .args(args)
         .env_clear()
         .env("PATH", "/usr/bin:/bin")
@@ -64,16 +69,26 @@ fn entries_below(dir: &Path) -> Vec<PathBuf> {
     out
 }
 
-/// A tiny committed source with only a lock file. Enough for the refusals before any build.
+/// A tiny committed source with only a lock file and the script. Enough for the refusals before any build.
 fn tiny_source(tmp: &Path, pin: &str) -> (PathBuf, String) {
-    let src = tmp.join("src");
-    fs::create_dir_all(&src).unwrap();
-    fs::write(
-        src.join("dotfiles-manager.lock"),
-        format!(
+    source_with_lock(
+        tmp,
+        &format!(
             "schema = 1\n\n[manager]\ntoolchain = \"{pin}\"\ntoolchain_tree_sha256 = \"{}\"\n",
             "0".repeat(64)
         ),
+    )
+}
+
+/// A tiny committed source with a lock the caller writes. The script under test is committed too:
+/// install refuses to build a commit whose `scripts/bootstrap.sh` differs from the running file.
+fn source_with_lock(tmp: &Path, lock: &str) -> (PathBuf, String) {
+    let src = tmp.join("src");
+    fs::create_dir_all(src.join("scripts")).unwrap();
+    fs::write(src.join("dotfiles-manager.lock"), lock).unwrap();
+    fs::copy(
+        repo_root().join("scripts/bootstrap.sh"),
+        src.join("scripts/bootstrap.sh"),
     )
     .unwrap();
     git(&src, &["init", "-q", "-b", "main"]);
@@ -1554,6 +1569,13 @@ fn uninstall_removes_only_what_the_manager_created() {
     fs::create_dir_all(home.join(".local/bin")).unwrap();
     let foreign = home.join(".local/bin/dotfiles-manager");
     std::os::unix::fs::symlink("/usr/bin/true", &foreign).unwrap();
+    // A staging clone left by an interrupted URL install lives inside the build directory.
+    fs::create_dir_all(cache.join("build/source.git")).unwrap();
+    fs::write(
+        cache.join("build/source.git/HEAD"),
+        "ref: refs/heads/main\n",
+    )
+    .unwrap();
     let o = script_test_mode(&home, &["uninstall"], &[]);
     assert_eq!(o.status.code(), Some(0), "{}", err(&o));
     assert!(!cache.join("build").exists());
@@ -1616,18 +1638,6 @@ fn uninstall_removes_symlinked_current_and_current_new_without_following() {
     assert!(fs::symlink_metadata(data.join("current")).is_err());
     assert!(fs::symlink_metadata(data.join("current.new")).is_err());
     assert_eq!(fs::read_to_string(outside.join("victim")).unwrap(), "keep");
-}
-
-/// A tiny committed source with a lock the caller writes, for the early pin reading.
-fn source_with_lock(tmp: &Path, lock: &str) -> (PathBuf, String) {
-    let src = tmp.join("src");
-    fs::create_dir_all(&src).unwrap();
-    fs::write(src.join("dotfiles-manager.lock"), lock).unwrap();
-    git(&src, &["init", "-q", "-b", "main"]);
-    git(&src, &["add", "-A"]);
-    git(&src, &["commit", "-q", "-m", "lock"]);
-    let sha = git(&src, &["rev-parse", "HEAD"]);
-    (src, sha)
 }
 
 #[test]
@@ -2578,4 +2588,242 @@ fn repeated_flags_and_flags_the_command_does_not_use_are_usage_errors() {
         assert!(err(&o).contains(want), "{args:?}: {}", err(&o));
     }
     assert!(entries_below(&home).is_empty());
+}
+
+fn sha256_hex(file: &Path) -> String {
+    use sha2::Digest;
+    format!("{:x}", sha2::Sha256::digest(fs::read(file).unwrap()))
+}
+
+/// `--expect-sha256` is the digest the owner holds out of band. It is checked before any command
+/// runs, against the file that executes, so an edited copy is refused with nothing written.
+#[test]
+fn expect_sha256_accepts_the_matching_digest_and_refuses_a_modified_script() {
+    let tmp = TempDir::new("self-check");
+    let home = tmp.path().join("home");
+    fs::create_dir(&home).unwrap();
+    let real = repo_root().join("scripts/bootstrap.sh");
+    let digest = sha256_hex(&real);
+    let o = script_test_mode(&home, &["uninstall", "--expect-sha256", &digest], &[]);
+    assert_eq!(o.status.code(), Some(0), "{}", err(&o));
+    // The same digest against an edited copy, run from its own path.
+    let copy = tmp.path().join("copy/bootstrap.sh");
+    fs::create_dir_all(copy.parent().unwrap()).unwrap();
+    let mut text = fs::read(&real).unwrap();
+    text.extend_from_slice(b"\n# edited\n");
+    fs::write(&copy, text).unwrap();
+    let env = [
+        ("DFM_BOOTSTRAP_TEST", "1"),
+        ("DFM_TEST_HOME", home.to_str().unwrap()),
+    ];
+    let o = script_file(
+        &copy,
+        &home,
+        &["uninstall", "--expect-sha256", &digest],
+        &env,
+    );
+    assert_eq!(o.status.code(), Some(3), "{}", err(&o));
+    assert!(
+        err(&o).contains("E_SOURCE_UNTRUSTED")
+            && err(&o).contains(copy.to_str().unwrap())
+            && err(&o).contains(&format!("expected {digest}")),
+        "{}",
+        err(&o)
+    );
+    assert!(!String::from_utf8_lossy(&o.stdout).contains("removed the installed manager"));
+    // The edited copy with its own digest runs: the value, not the path, is what is checked.
+    let o = script_file(
+        &copy,
+        &home,
+        &["uninstall", "--expect-sha256", &sha256_hex(&copy)],
+        &env,
+    );
+    assert_eq!(o.status.code(), Some(0), "{}", err(&o));
+    // A value that is not 64 lowercase hex digits is a usage error, checked before the digest.
+    for bad in [&digest[..63], "G", &digest.to_uppercase()] {
+        let o = script_test_mode(&home, &["uninstall", "--expect-sha256", bad], &[]);
+        assert_eq!(o.status.code(), Some(2), "{bad:?}: {}", err(&o));
+    }
+    // install with a wrong value is refused before the platform, tools or source are looked at.
+    let o = script_test_mode(
+        &home,
+        &[
+            "install",
+            "--source",
+            "/nonexistent",
+            "--commit",
+            &"a".repeat(40),
+            "--expect-sha256",
+            &"0".repeat(64),
+        ],
+        &[("DFM_TEST_OS", "Linux")],
+    );
+    assert_eq!(o.status.code(), Some(3), "{}", err(&o));
+    assert!(
+        err(&o).contains("E_SOURCE_UNTRUSTED") && !err(&o).contains("E_PLATFORM_UNSUPPORTED"),
+        "{}",
+        err(&o)
+    );
+    assert!(entries_below(&home).is_empty());
+}
+
+/// install builds only a commit whose `scripts/bootstrap.sh` is the file that runs: a stale or
+/// edited script cannot build another commit, and a commit without the script is refused.
+#[test]
+fn install_refuses_a_commit_whose_script_differs_from_the_running_one() {
+    let (_tmp, home, src, good) = refusal_setup("committed-script");
+    let before = snapshot(&home);
+    let script = src.join("scripts/bootstrap.sh");
+    let mut text = fs::read(&script).unwrap();
+    text.extend_from_slice(b"\n# edited\n");
+    fs::write(&script, text).unwrap();
+    git(&src, &["commit", "-q", "-a", "-m", "edited"]);
+    let edited = git(&src, &["rev-parse", "HEAD"]);
+    let o = install_tiny(&home, &src, &edited);
+    assert_eq!(o.status.code(), Some(3), "{}", err(&o));
+    assert!(
+        err(&o).contains("E_SOURCE_UNTRUSTED")
+            && err(&o).contains("is not scripts/bootstrap.sh of commit")
+            && err(&o).contains(&edited),
+        "{}",
+        err(&o)
+    );
+    git(&src, &["rm", "-q", "scripts/bootstrap.sh"]);
+    git(&src, &["commit", "-q", "-m", "removed"]);
+    let removed = git(&src, &["rev-parse", "HEAD"]);
+    let o = install_tiny(&home, &src, &removed);
+    assert_eq!(o.status.code(), Some(3), "{}", err(&o));
+    assert!(
+        err(&o).contains("has no scripts/bootstrap.sh"),
+        "{}",
+        err(&o)
+    );
+    assert_eq!(snapshot(&home), before, "refusals must not write");
+    // Control: the commit that carries this exact script passes the check and reaches the staged
+    // controls (the tiny source has no Cargo.lock).
+    let o = install_tiny(&home, &src, &good);
+    assert_eq!(o.status.code(), Some(3), "{}", err(&o));
+    assert!(
+        err(&o).contains("Cargo.lock missing") && !err(&o).contains("scripts/bootstrap.sh"),
+        "{}",
+        err(&o)
+    );
+}
+
+fn install_from(p: &Prepared, source: &str, sha: &str) -> Output {
+    script_test_mode(
+        &p.home,
+        &["install", "--source", source, "--commit", sha],
+        &[],
+    )
+}
+
+/// A URL source is cloned (bare) into the build directory, the pinned commit is built from the
+/// clone, and the clone goes with the build directory: after success, after a refusal, and on
+/// uninstall (`uninstall_removes_only_what_the_manager_created`). No network: a `file://` origin.
+#[test]
+fn a_url_source_is_cloned_at_the_exact_commit_and_the_clone_is_removed() {
+    let p = prepare_with("clone", fake_toolchain("exit 0".into()));
+    let origin = p.tmp.path().join("origin.git");
+    git(
+        p.tmp.path(),
+        &[
+            "clone",
+            "--bare",
+            "-q",
+            p.src.to_str().unwrap(),
+            origin.to_str().unwrap(),
+        ],
+    );
+    let url = format!("file://{}", origin.display());
+    // A commit the origin does not have: refused after the clone, and the clone is removed.
+    let elsewhere = TempDir::new("clone-elsewhere");
+    let (_, foreign) = tiny_source(elsewhere.path(), "9.9.9");
+    let o = install_from(&p, &url, &foreign);
+    assert_eq!(o.status.code(), Some(3), "{}", err(&o));
+    assert!(
+        err(&o).contains("E_SOURCE_UNTRUSTED") && err(&o).contains("is not a commit"),
+        "{}",
+        err(&o)
+    );
+    assert!(
+        build_dirs_gone(&p),
+        "the staging clone must not outlive a refusal"
+    );
+    assert!(!p.data.join("current").exists());
+    // An origin that cannot be cloned.
+    let o = install_from(&p, "file:///nonexistent-dfm-origin.git", &p.sha);
+    assert_eq!(o.status.code(), Some(3), "{}", err(&o));
+    assert!(err(&o).contains("cannot clone"), "{}", err(&o));
+    assert!(build_dirs_gone(&p));
+    // The pinned commit from the origin.
+    let o = install_from(&p, &url, &p.sha);
+    assert_eq!(
+        o.status.code(),
+        Some(0),
+        "{}\n{}",
+        String::from_utf8_lossy(&o.stdout),
+        err(&o)
+    );
+    assert!(String::from_utf8_lossy(&o.stdout).contains(&format!("source commit {}", p.sha)));
+    assert_eq!(
+        fs::read_link(p.data.join("current")).unwrap(),
+        Path::new(&format!("versions/0.1.0-{}", &p.sha[..12]))
+    );
+    assert!(
+        build_dirs_gone(&p),
+        "the staging clone must go with the build directory"
+    );
+    // Without --source the canonical origin would be cloned, after the local checks: the missing
+    // tools refusal comes first, so no network is touched here.
+    let o = script_test_mode(
+        &p.home,
+        &["install", "--commit", &p.sha],
+        &[("DFM_TEST_CLT", "missing")],
+    );
+    assert_eq!(o.status.code(), Some(3), "{}", err(&o));
+    assert!(err(&o).contains("E_PREREQ_MISSING"), "{}", err(&o));
+}
+
+/// install resets the build directory, so a script or a local source that lives inside it would
+/// be removed mid-operation; both are refused before anything is reset.
+#[test]
+fn a_script_or_source_inside_the_build_directory_is_refused_before_the_reset() {
+    let (_tmp, home, src, sha) = refusal_setup("inside-build");
+    let build = home.join(".cache/dotfiles-manager/build");
+    fs::create_dir_all(&build).unwrap();
+    let copy = build.join("bootstrap.sh");
+    fs::copy(repo_root().join("scripts/bootstrap.sh"), &copy).unwrap();
+    let o = script_file(
+        &copy,
+        &home,
+        &[
+            "install",
+            "--source",
+            src.to_str().unwrap(),
+            "--commit",
+            &sha,
+        ],
+        &[
+            ("DFM_BOOTSTRAP_TEST", "1"),
+            ("DFM_TEST_HOME", home.to_str().unwrap()),
+        ],
+    );
+    assert_eq!(o.status.code(), Some(3), "{}", err(&o));
+    assert!(
+        err(&o).contains("E_PREREQ_MISSING") && err(&o).contains("inside the build directory"),
+        "{}",
+        err(&o)
+    );
+    assert!(copy.is_file(), "the running script was removed");
+    let inside = build.join("src");
+    fs::create_dir_all(&inside).unwrap();
+    let o = install_tiny(&home, &inside, &sha);
+    assert_eq!(o.status.code(), Some(3), "{}", err(&o));
+    assert!(
+        err(&o).contains("inside the build directory"),
+        "{}",
+        err(&o)
+    );
+    assert!(inside.is_dir(), "the source was removed");
 }
