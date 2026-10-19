@@ -180,7 +180,7 @@ pub fn plan_for(
     let root_str = loaded.root.to_str().ok_or_else(|| {
         usage("--root resolves to a path that is not UTF-8; point --root at a UTF-8 path")
     })?;
-    let source_root = Dir::open_plain(&loaded.root);
+    let source_root = Dir::open_plain(loaded.read_root());
     let merge = match scope {
         Scope::Config => crate::adapters::merge_facts(
             &loaded.resolved,

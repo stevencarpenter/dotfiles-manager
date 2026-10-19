@@ -11,6 +11,7 @@ mod plan_cmd;
 mod read_fs;
 mod source_fs;
 mod state_cmd;
+mod sync_cmd;
 mod trial_cmd;
 
 pub use adapters::builtin_catalog;
@@ -50,6 +51,8 @@ usage:
                                [--restart <resource-id>]...
   dotfiles-manager trial <package> [--id <trial-id>] [--provider homebrew/v1|mise/v1] [--config <path>]...
                                [--preview] [--yes-plan <digest>]
+  dotfiles-manager sync --root <dir> [--preview] [--yes-plan <digest>] [--allow-disruptive <operation-id>]...
+                               [--allow-adopt <operation-id>]... [--trust-origin <origin>]...
   dotfiles-manager self-check --build-controls <staged tree>
   dotfiles-manager self-check --fixture-dir <dir>
 
@@ -121,6 +124,15 @@ loaded and not running, is a blocker (exit 3): the manager never unloads or repl
 did not start without a request. A launcher that accepted a request without reporting completion
 in time leaves the operation pending (exit 5), never updated. Nothing is stopped, unloaded for
 good or uninstalled. See docs/lifecycle.md.
+
+sync fetches the sources that dotfiles-manager.lock declares ([[sources]]: the root checkout tracks
+its ref, a nested source is pinned to an exact commit) into a staging directory with an isolated git
+environment, resolves and plans the staged composition against this machine, and prints the plan.
+Every origin needs a grant in state/grants.json first (--trust-origin <origin> writes one; no fetch
+happens before that). With --yes-plan it rechecks the sources under the lock, fast-forwards each
+checkout (never reset, clean, stash, rebase, commit or push; divergence and overwritten local
+changes are refused), then runs apply once with the same digest. A pin is never rewritten.
+--preview fetches into staging and changes nothing else. See docs/sync.md.
 
 An operation that ended unknown (E_OP_INTERRUPTED) blocks its path in every later run. Each apply
 checks the path again and settles the entry when the result is clear. state recover does only that:
@@ -442,6 +454,10 @@ fn dispatch(args: &[String], out: &mut dyn Write) -> Result<(), Refusal> {
             }
             apply_cmd::run(&context(home)?, &args, out)
         }
+        "sync" => {
+            let args = sync_cmd::parse_args(rest)?;
+            sync_cmd::run(&context(home)?, &args, out)
+        }
         "self-check" => {
             let [controls, fixture] = flags(rest, ["--build-controls", "--fixture-dir"])?;
             match (controls, fixture) {
@@ -495,20 +511,24 @@ fn explain_args(args: &[String]) -> Result<(String, String), Refusal> {
 /// The bound profile resolved against the trusted sources in `root`.
 struct Loaded {
     binding: Binding,
-    /// The canonical `--root`.
+    /// The canonical `--root`: where the sources live (or will live) and how the plan names them.
     root: PathBuf,
+    /// Where the sources were read from when that is not `root`: `sync` resolves a staged copy
+    /// of the sources and plans it as the tree that `root` will hold after publication.
+    staged: Option<PathBuf>,
     sources: dfm_model::resolve::SourceSet,
     resolved: dfm_model::resolve::Resolved,
 }
 
-/// Resolves the bound profile against `root` without comparing it to this machine. Read-only.
-fn load_resolved_any_machine(ctx: &Ctx, root: &Path) -> Result<Loaded, Refusal> {
-    let binding = read_existing_binding(ctx)?.ok_or_else(|| {
-        Refusal::new(
-            Code::BindingInvalid,
-            "this machine is not bound; run bind first",
-        )
-    })?;
+impl Loaded {
+    /// The directory the source files are read from at plan time.
+    fn read_root(&self) -> &Path {
+        self.staged.as_deref().unwrap_or(&self.root)
+    }
+}
+
+/// The canonical `root` and the bound profile's path relative to it.
+fn canonical_root(binding: &Binding, root: &Path) -> Result<(PathBuf, String), Refusal> {
     let root = fs::canonicalize(root).map_err(|e| {
         Refusal::new(
             Code::ReportUnavailable,
@@ -524,12 +544,26 @@ fn load_resolved_any_machine(ctx: &Ctx, root: &Path) -> Result<Loaded, Refusal> 
                 Code::ProfileInvalid,
                 "the bound profile is not inside --root; point --root at the trusted source tree that contains it",
             )
-        })?;
-    let sources = load_scoped(&root, rel)?;
-    let resolved = resolve(&sources, rel, &builtin_catalog())?;
+        })?
+        .to_string();
+    Ok((root, rel))
+}
+
+/// Resolves the bound profile against `root` without comparing it to this machine. Read-only.
+fn load_resolved_any_machine(ctx: &Ctx, root: &Path) -> Result<Loaded, Refusal> {
+    let binding = read_existing_binding(ctx)?.ok_or_else(|| {
+        Refusal::new(
+            Code::BindingInvalid,
+            "this machine is not bound; run bind first",
+        )
+    })?;
+    let (root, rel) = canonical_root(&binding, root)?;
+    let sources = load_scoped(&root, &rel)?;
+    let resolved = resolve(&sources, &rel, &builtin_catalog())?;
     Ok(Loaded {
         binding,
         root,
+        staged: None,
         sources,
         resolved,
     })
