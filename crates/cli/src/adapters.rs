@@ -182,7 +182,7 @@ impl Adapter {
         self.spec.kind == "package"
             && matches!(
                 self.spec.id.as_str(),
-                package::HOMEBREW | package::MISE | package::APT
+                package::HOMEBREW | package::MISE | package::APT | package::UV_TOOL
             )
     }
 }
@@ -334,6 +334,10 @@ pub fn registry() -> Vec<Adapter> {
             generator: None,
         },
         Adapter {
+            spec: package("uv-tool/v1"),
+            generator: None,
+        },
+        Adapter {
             spec: spec(
                 "firstmate-native/v1",
                 "application",
@@ -398,7 +402,7 @@ mod tests {
         assert_eq!(table.iter().filter(|a| a.renders()).count(), secrets.len());
         // Every package adapter has a provider.
         let packages: Vec<_> = table.iter().filter(|a| a.spec.kind == "package").collect();
-        assert_eq!(packages.len(), 3);
+        assert_eq!(packages.len(), 4);
         assert!(
             packages
                 .iter()

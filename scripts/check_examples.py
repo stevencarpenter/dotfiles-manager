@@ -21,7 +21,7 @@ ADAPTERS = {
     "assemble": {"text-fragments/v1"},
     "distribution": {"skills/v1"},
     "secret": {"op-template/v1"},
-    "package": {"homebrew/v1", "mise/v1", "apt/v1"},
+    "package": {"homebrew/v1", "mise/v1", "apt/v1", "uv-tool/v1"},
     "application": {"firstmate-native/v1"},
 }
 FILE_KINDS = {"link", "render", "merge", "assemble", "secret"}

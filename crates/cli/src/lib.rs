@@ -44,7 +44,7 @@ usage:
   dotfiles-manager apply --root <dir> [--preview] [--yes-plan <digest>] [--allow-disruptive <operation-id>]...
                                [--allow-adopt <operation-id>]...
   dotfiles-manager secrets --root <dir> [--preview] [--yes-plan <digest>] [--allow-adopt <operation-id>]...
-  dotfiles-manager packages --root <dir> [--preview] [--yes-plan <digest>]
+  dotfiles-manager packages --root <dir> [--preview] [--yes-plan <digest>] [--update]
   dotfiles-manager self-check --build-controls <staged tree>
   dotfiles-manager self-check --fixture-dir <dir>
 
@@ -84,14 +84,17 @@ empty keeps the previous file. An existing destination the ledger does not prove
 wrote needs --allow-adopt <operation-id>. No secret value, unsalted hash or provider message is
 printed or stored; the ledger keeps a per-machine salted hash. See docs/secrets.md.
 
-packages is apply over the package resources only (homebrew/v1, mise/v1, apt/v1): every other
+packages is apply over the package resources only (homebrew/v1, mise/v1, apt/v1, uv-tool/v1): every other
 resource is listed as not_in_scope. Planning probes each provider read-only (Homebrew's Cellar
 and Caskroom, mise ls, dpkg-query) with auto-update, analytics and mise configuration off, and
 runs no tap code. A package the provider has installed is current; a missing official one is
 installed with --yes-plan (brew install, mise install), with its missing dependencies named in
 the plan. Nothing is upgraded, downgraded or removed. An executable of the same name from another owner, or a
 provider that cannot answer, is a blocker (exit 3). apt is probe-only: installing needs root. See
-docs/packages.md.
+docs/packages.md. With --update, each installed mise or uv tool declared rolling is upgraded to
+the newest version its provider resolves (mise install, uv tool upgrade); installed versions
+stay, a held tool or a local build is kept, and a copy from another owner blocks. See
+docs/toolchains.md.
 
 An operation that ended unknown (E_OP_INTERRUPTED) blocks its path in every later run. Each apply
 checks the path again and settles the entry when the result is clear. state recover does only that:

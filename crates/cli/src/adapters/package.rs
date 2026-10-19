@@ -1,7 +1,9 @@
-//! The package adapters `homebrew/v1`, `mise/v1` and `apt/v1` (docs/packages.md): a read-only
-//! probe of the declared provider's own listing, an owner check by executable name, and an
-//! install through the same provider. Nothing here reads or writes a version pin: a package
-//! plan makes a declared package present and never upgrades, downgrades or removes.
+//! The package adapters `homebrew/v1`, `mise/v1`, `apt/v1` and `uv-tool/v1` (docs/packages.md,
+//! docs/toolchains.md): a read-only probe of the declared provider's own listing, an owner check
+//! by executable name, and an install through the same provider. Nothing here reads or writes a
+//! version pin: a package plan makes a declared package present and never upgrades, downgrades
+//! or removes. A rolling update ([`maintain`], [`upgrade`]) asks mise or uv for its newest
+//! eligible version of a rolling tool and installs it beside the installed ones.
 //!
 //! Every child runs through the engine runner (fixed search path, rebuilt environment, process
 //! group, timeout). The providers' standard error is bounded and never printed or persisted.
@@ -18,6 +20,7 @@ use std::time::Duration;
 pub const HOMEBREW: &str = "homebrew/v1";
 pub const MISE: &str = "mise/v1";
 pub const APT: &str = "apt/v1";
+pub const UV_TOOL: &str = "uv-tool/v1";
 
 const PROBE_TIMEOUT: Duration = Duration::from_secs(60);
 const INSTALL_TIMEOUT: Duration = Duration::from_secs(30 * 60);
@@ -55,6 +58,22 @@ fn mise_env() -> Vec<(String, String)> {
         ("MISE_NOT_FOUND_AUTO_INSTALL".into(), "false".into()),
         ("MISE_NO_CONFIG".into(), "1".into()),
     ]
+}
+
+/// uv probes and changes read no uv configuration file (an index or a source override there
+/// is not in the plan), show no progress, and never download a Python interpreter: a tool
+/// whose interpreter is missing fails instead of installing a runtime the plan does not show.
+/// The probe (`uv tool list` reads uv's own tool directory) also runs offline.
+fn uv_env(offline: bool) -> Vec<(String, String)> {
+    let mut env = vec![
+        ("UV_NO_CONFIG".to_string(), "1".to_string()),
+        ("UV_NO_PROGRESS".into(), "1".into()),
+        ("UV_PYTHON_DOWNLOADS".into(), "never".into()),
+    ];
+    if offline {
+        env.push(("UV_OFFLINE".into(), "1".into()));
+    }
+    env
 }
 
 /// The package name as a checked parameter (architecture section 8 item 3): letters, digits,
@@ -487,6 +506,53 @@ fn mise_probe(runner: &Runner, pkg: &str) -> PackageState {
     }
 }
 
+/// `uv tool list`: one `<name> v<version>` line per installed tool, each followed by its
+/// `- <entry point>` lines, or `No tools installed`. A tool is installed in one version, which
+/// `uv tool upgrade` replaces. The name is a package-index name: a git, path or URL source, or a
+/// version, is refused, because the plan shows no origin for it and uv has no read-only way to
+/// tell what such a source would install.
+fn uv_probe(runner: &Runner, pkg: &str) -> PackageState {
+    if !uv_name(pkg) {
+        return PackageState::Refused(format!(
+            "{pkg}: uv-tool/v1 takes a package-index name (letters, digits, '.', '_', '-'); a git, path or URL source, or a version, is not supported"
+        ));
+    }
+    let args = ["tool".to_string(), "list".into()];
+    let out = match runner.run(&request("uv", &args, &uv_env(true), PROBE_TIMEOUT)) {
+        Ok(o) => o,
+        Err(e) => return PackageState::Unknown(e.detail),
+    };
+    if let Some(why) = ended("uv tool list", &out) {
+        return PackageState::Unknown(why);
+    }
+    if !matches!(out.end, End::Exited(0)) {
+        return PackageState::Unknown("uv tool list exited with an error".into());
+    }
+    match uv_tool_version(&String::from_utf8_lossy(&out.stdout), pkg) {
+        Some(v) => PackageState::Installed(v),
+        None => PackageState::Missing(Vec::new()),
+    }
+}
+
+/// Whether `n` is a package-index name uv installs by name.
+fn uv_name(n: &str) -> bool {
+    n.starts_with(|c: char| c.is_ascii_alphanumeric())
+        && n.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+}
+
+/// The version `uv tool list` shows for `name`: the `v...` of its `<name> v<version>` line. The
+/// entry-point lines start with `-`. Names compare as uv normalizes them (lowercase, `_` and
+/// `.` as `-`).
+fn uv_tool_version(text: &str, name: &str) -> Option<String> {
+    let norm = |s: &str| s.to_ascii_lowercase().replace(['_', '.'], "-");
+    text.lines().find_map(|l| {
+        let mut words = l.split_whitespace();
+        let (n, v) = (words.next()?, words.next()?);
+        (norm(n) == norm(name)).then(|| v.strip_prefix('v').unwrap_or(v).to_string())
+    })
+}
+
 /// `dpkg-query -W -f=${Status} <name>`: `install ok installed` means installed. A missing
 /// package is exit 1. Installing needs root, which a HOME adapter never has, so a missing apt
 /// package is `Unsupported`.
@@ -567,16 +633,23 @@ fn leaf(pkg: &str) -> &str {
 fn other_owner(runner: &Runner, adapter: &str, pkg: &str) -> Result<Option<String>, String> {
     let home = &runner.home;
     let shims = home.join(".local/share/mise/shims");
+    let local_bin = home.join(".local/bin");
     let mut dirs: Vec<PathBuf> = runner.search_path.clone();
     dirs.extend([
         home.join(".nix-profile/bin"),
         PathBuf::from("/nix/var/nix/profiles/default/bin"),
-        home.join(".local/bin"),
+        local_bin.clone(),
         home.join(".cargo/bin"),
         shims.clone(),
     ]);
+    // The directory the declared provider itself links executables into.
+    let own = match adapter {
+        MISE => shims.as_path(),
+        UV_TOOL => local_bin.as_path(),
+        _ => Path::new(""),
+    };
     let name = leaf(pkg);
-    for d in dirs.iter().filter(|d| !skipped(adapter, d, &shims)) {
+    for d in dirs.iter().filter(|d| !skipped(adapter, d, own)) {
         let p = d.join(name);
         // The entry itself (a link counts), then what a link points to.
         for meta in [std::fs::symlink_metadata(&p), std::fs::metadata(&p)] {
@@ -598,14 +671,15 @@ fn other_owner(runner: &Runner, adapter: &str, pkg: &str) -> Result<Option<Strin
 /// Whether the owner check skips `d`: the macOS system directories (Apple's tools there are part
 /// of the OS, which no package owns and none can replace; a provider's copy shadows them by
 /// search order) and the declared provider's own directories (`homebrew` path component for
-/// brew, the mise shims for mise), matched by component or exact path, never by substring.
-fn skipped(adapter: &str, d: &Path, shims: &Path) -> bool {
+/// brew, `own` for mise's shims or uv's `~/.local/bin`), matched by component or exact path,
+/// never by substring.
+fn skipped(adapter: &str, d: &Path, own: &Path) -> bool {
     dfm_platform_macos::SYSTEM_PATH
         .iter()
         .any(|s| d == Path::new(s))
         || match adapter {
             HOMEBREW => d.components().any(|c| c.as_os_str() == "homebrew"),
-            MISE => d == shims,
+            MISE | UV_TOOL => d == own,
             _ => false,
         }
 }
@@ -618,6 +692,7 @@ pub fn probe(runner: &Runner, adapter: &str, value: &Value) -> Result<PackageSta
         HOMEBREW => brew_probe(runner, &pkg),
         MISE => mise_probe(runner, &pkg),
         APT => apt_probe(runner, &pkg),
+        UV_TOOL => uv_probe(runner, &pkg),
         other => {
             return Err(Refusal::new(
                 Code::GeneratorUnavailable,
@@ -645,7 +720,7 @@ pub fn probe(runner: &Runner, adapter: &str, value: &Value) -> Result<PackageSta
 /// Installs one package through its provider. The caller probes again afterwards.
 pub fn install(runner: &Runner, adapter: &str, value: &Value) -> Result<(), Refusal> {
     let pkg = name(value)?;
-    let (program, args, env) = match adapter {
+    let (program, args, env): (&str, Vec<String>, _) = match adapter {
         HOMEBREW => {
             // The same namespace pin as the probe: the install cannot resolve the short name
             // to another package than the one the plan named.
@@ -662,6 +737,11 @@ pub fn install(runner: &Runner, adapter: &str, value: &Value) -> Result<(), Refu
             ("brew", args, brew_env())
         }
         MISE => ("mise", vec!["install".to_string(), pkg.clone()], mise_env()),
+        UV_TOOL => (
+            "uv",
+            vec!["tool".to_string(), "install".into(), pkg.clone()],
+            uv_env(false),
+        ),
         _ => {
             return Err(Refusal::new(
                 Code::PrivilegeUnsupported,
@@ -669,23 +749,121 @@ pub fn install(runner: &Runner, adapter: &str, value: &Value) -> Result<(), Refu
             ));
         }
     };
-    let out = runner.run(&request(program, &args, &env, INSTALL_TIMEOUT))?;
+    change(
+        runner,
+        program,
+        &args,
+        &env,
+        &format!("{program} install {pkg}"),
+    )
+}
+
+/// The rolling-update view of one installed package (docs/toolchains.md): the probe, then for
+/// a listed package whether the run may ask the provider for a newer version. Only a
+/// `rolling` declaration of a mise or uv tool is `Rolling`; a held or other policy, a provider
+/// with no rolling path, or an installed local build (a mise `ref:` or `path:` version, which
+/// the update would not replace and the manager never removes) is `Held` with the reason. A
+/// copy of the tool from another owner blocks the update (`OtherOwner`): two owners of one
+/// tool is the conflict the update must not deepen.
+pub fn maintain(runner: &Runner, adapter: &str, value: &Value) -> Result<PackageState, Refusal> {
+    let pkg = name(value)?;
+    let policy = value
+        .get("update_policy")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let state = probe(runner, adapter, value)?;
+    let PackageState::Installed(versions) = state else {
+        return Ok(state);
+    };
+    let held = |why: String| Ok(PackageState::Held(format!("{versions}, {why}")));
+    if policy != "rolling" {
+        return held(format!("update_policy = {policy}"));
+    }
+    if !matches!(adapter, MISE | UV_TOOL) {
+        return held(format!(
+            "{adapter} has no rolling update path in this build"
+        ));
+    }
+    if let Some(local) = versions.split(' ').find(|v| local_build(v)) {
+        return held(format!("{local} is a local build, which is kept"));
+    }
+    Ok(match other_owner(runner, adapter, &pkg) {
+        Ok(Some(why)) => PackageState::OtherOwner(why),
+        Ok(None) => PackageState::Rolling(versions),
+        Err(why) => PackageState::Unknown(why),
+    })
+}
+
+/// A mise version that was built from a git ref or taken from a local path, not resolved from
+/// the registry: a rolling update does not replace it.
+/// shortcut: the `ref-` and `path-` spellings are a guess at how mise lists such versions,
+/// upgrade when a live listing of one is available.
+fn local_build(v: &str) -> bool {
+    ["ref:", "ref-", "path:", "path-"]
+        .iter()
+        .any(|p| v.starts_with(p))
+}
+
+/// Asks the provider for its newest version of a rolling tool and installs it beside the
+/// installed ones: `mise install <tool>[@prefix]` resolves the newest version that matches
+/// (without config, a bare tool is mise's newest) and is a no-op when it is installed;
+/// `uv tool upgrade <name>` replaces the tool's one version. The caller probes again and
+/// compares the listing to decide `updated` or `current`. Neither removes a version.
+pub fn upgrade(runner: &Runner, adapter: &str, value: &Value) -> Result<(), Refusal> {
+    let pkg = name(value)?;
+    match adapter {
+        MISE => {
+            let args = ["install".to_string(), pkg.clone()];
+            change(
+                runner,
+                "mise",
+                &args,
+                &mise_env(),
+                &format!("mise install {pkg}"),
+            )
+        }
+        UV_TOOL => {
+            let args = ["tool".to_string(), "upgrade".into(), pkg.clone()];
+            change(
+                runner,
+                "uv",
+                &args,
+                &uv_env(false),
+                &format!("uv tool upgrade {pkg}"),
+            )
+        }
+        _ => Err(Refusal::new(
+            Code::GeneratorUnavailable,
+            format!("{adapter} has no rolling update path for {pkg}"),
+        )),
+    }
+}
+
+/// Runs a provider command that changes the machine, within the install timeout.
+fn change(
+    runner: &Runner,
+    program: &str,
+    args: &[String],
+    env: &[(String, String)],
+    what: &str,
+) -> Result<(), Refusal> {
+    let out = runner.run(&request(program, args, env, INSTALL_TIMEOUT))?;
     match out.end {
         End::Exited(0) => Ok(()),
         End::Exited(c) => Err(Refusal::new(
             Code::IoFailed,
             format!(
-                "{program} install {pkg} exited {c}; its {} bytes of standard error are withheld. Run it by hand to see them",
+                "{what} exited {c}; its {} bytes of standard error are withheld. Run it by hand to see them",
                 out.stderr.len()
             ),
         )),
         End::TimedOut => Err(Refusal::new(
             Code::IoFailed,
-            format!("{program} install {pkg} did not finish within {INSTALL_TIMEOUT:?}"),
+            format!("{what} did not finish within {INSTALL_TIMEOUT:?}"),
         )),
         End::Signaled => Err(Refusal::new(
             Code::IoFailed,
-            format!("{program} install {pkg} was ended by a signal"),
+            format!("{what} was ended by a signal"),
         )),
         End::Stopped(r) => Err(r),
     }
@@ -698,6 +876,24 @@ pub fn package_facts(
     resolved: &Resolved,
     runner: &Runner,
 ) -> Result<BTreeMap<String, PackageState>, Refusal> {
+    facts(resolved, runner, probe)
+}
+
+/// The same for a rolling update (`packages --update`, docs/toolchains.md): each installed
+/// rolling mise or uv tool is `Rolling`, the rest as [`maintain`] decides. The probes are the
+/// same read-only listings.
+pub fn update_facts(
+    resolved: &Resolved,
+    runner: &Runner,
+) -> Result<BTreeMap<String, PackageState>, Refusal> {
+    facts(resolved, runner, maintain)
+}
+
+fn facts(
+    resolved: &Resolved,
+    runner: &Runner,
+    look: fn(&Runner, &str, &Value) -> Result<PackageState, Refusal>,
+) -> Result<BTreeMap<String, PackageState>, Refusal> {
     let mut out = BTreeMap::new();
     for r in resolved
         .resources
@@ -707,7 +903,7 @@ pub fn package_facts(
         if let Some(stop) = dfm_engine::signal::requested() {
             return Err(stop);
         }
-        let state = match probe(runner, &r.adapter, &r.value) {
+        let state = match look(runner, &r.adapter, &r.value) {
             Ok(s) => s,
             Err(e) if e.code == Code::ManifestInvalid => PackageState::Refused(e.detail),
             Err(e) => PackageState::Unknown(e.detail),
@@ -767,15 +963,44 @@ mod tests {
     #[test]
     fn system_directories_and_the_providers_own_are_not_another_owner() {
         let shims = PathBuf::from("/Users/a/.local/share/mise/shims");
+        let local_bin = PathBuf::from("/Users/a/.local/bin");
         for d in ["/usr/bin", "/bin", "/usr/sbin", "/sbin"] {
             assert!(skipped(HOMEBREW, Path::new(d), &shims), "{d}");
             assert!(skipped(MISE, Path::new(d), &shims), "{d}");
         }
         assert!(skipped(HOMEBREW, Path::new("/opt/homebrew/bin"), &shims));
         assert!(!skipped(HOMEBREW, Path::new("/usr/local/bin"), &shims));
-        assert!(!skipped(HOMEBREW, Path::new("/Users/a/.local/bin"), &shims));
+        assert!(!skipped(HOMEBREW, &local_bin, &shims));
         assert!(skipped(MISE, &shims, &shims));
         assert!(!skipped(MISE, Path::new("/opt/homebrew/bin"), &shims));
+        assert!(!skipped(MISE, &local_bin, &shims));
+        assert!(skipped(UV_TOOL, &local_bin, &local_bin));
+        assert!(!skipped(UV_TOOL, &shims, &local_bin));
+    }
+
+    #[test]
+    fn the_uv_listing_is_read_by_tool_name_and_a_source_is_refused() {
+        let listing = "agent-reap v0.1.0\n- agent-reap\nnuv v0.5.2\n- nuv\n";
+        assert_eq!(uv_tool_version(listing, "nuv"), Some("0.5.2".into()));
+        assert_eq!(uv_tool_version(listing, "agent_reap"), Some("0.1.0".into()));
+        assert_eq!(uv_tool_version(listing, "agent"), None);
+        assert_eq!(uv_tool_version("No tools installed\n", "nuv"), None);
+        for good in ["ruff", "agent_reap", "a.b"] {
+            assert!(uv_name(good), "{good}");
+        }
+        for bad in [
+            "git+https://example.invalid/x",
+            "./here",
+            "ruff==0.5",
+            "ruff@0.5",
+            "-x",
+            "",
+        ] {
+            assert!(!uv_name(bad), "{bad}");
+        }
+        assert!(local_build("ref:main"));
+        assert!(local_build("path:/tmp/x"));
+        assert!(!local_build("1.5.6"));
     }
 
     #[test]

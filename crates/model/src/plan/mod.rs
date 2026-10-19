@@ -180,6 +180,10 @@ pub enum Action {
     /// Install a package with its declared provider (docs/packages.md). No path, no ledger
     /// entry: the provider's own listing is the record, probed before and after.
     Install,
+    /// Upgrade an installed rolling package to the newest version its provider resolves at
+    /// apply time (docs/toolchains.md). As `Install`: no path, no ledger entry; the listing
+    /// before and after decides `updated` or `current`. Nothing is removed.
+    Upgrade,
     /// Nothing to do, or out of scope.
     None,
 }

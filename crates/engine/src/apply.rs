@@ -292,8 +292,9 @@ fn first_refusal(plan: &Plan, generator: &dyn Generator) -> Result<(), Refusal> 
         if op.status != PlanStatus::Planned {
             continue;
         }
-        // A package install has no path and no content: it needs a provider in this build.
-        if op.action == Action::Install {
+        // A package install or upgrade has no path and no content: it needs a provider in this
+        // build.
+        if matches!(op.action, Action::Install | Action::Upgrade) {
             if op.path.is_some() || op.class != Class::Normal {
                 return Err(plan_invalid(format!(
                     "{} installs a package but carries a path or is sensitive",
@@ -430,7 +431,7 @@ fn first_refusal(plan: &Plan, generator: &dyn Generator) -> Result<(), Refusal> 
                     op.id
                 )));
             }
-            Action::Install => unreachable!("handled above"),
+            Action::Install | Action::Upgrade => unreachable!("handled above"),
             Action::None => {
                 return Err(plan_invalid(format!("{} is planned with no action", op.id)));
             }
@@ -603,6 +604,7 @@ fn step_name(op: &Operation) -> &'static str {
         Action::Adopt => "adopt",
         Action::Retire => "retire",
         Action::Install => "install",
+        Action::Upgrade => "upgrade",
         Action::None => "none",
     }
 }
@@ -889,7 +891,7 @@ impl Exec<'_, '_> {
     }
 
     fn try_op(&mut self, op: &Operation) -> Result<Ended, Ended> {
-        if op.action == Action::Install {
+        if matches!(op.action, Action::Install | Action::Upgrade) {
             return self.try_install(op);
         }
         // The gates admit one sensitive kind, the co-owned merge, which has its own path. Nothing
@@ -959,7 +961,7 @@ impl Exec<'_, '_> {
                     "is no longer the entry the plan found; it is left alone",
                 ));
             }
-            (Action::None | Action::Retire | Action::Install, _) => {
+            (Action::None | Action::Retire | Action::Install | Action::Upgrade, _) => {
                 return Err(failed(plan_invalid("no action")));
             }
         }
@@ -1522,6 +1524,7 @@ impl Exec<'_, '_> {
             }
         }
         self.stop_requested()?;
+        let before = now.state();
         let id = self.attempt_id(op);
         let recovery = Recovery {
             outputs: Vec::new(),
@@ -1539,7 +1542,9 @@ impl Exec<'_, '_> {
             .and_then(|()| {
                 let now = self.run.generator.probe(op)?;
                 match (now, crate::signal::requested()) {
-                    (PackageState::Installed(_), _) => Ok(()),
+                    (now @ (PackageState::Installed(_) | PackageState::Rolling(_)), _) => {
+                        Ok(now.state())
+                    }
                     // The stop ended the check itself, so the install's outcome is unknown, not
                     // failed. The next run probes again.
                     (_, Some(stop)) => Err(Refusal::new(
@@ -1559,22 +1564,30 @@ impl Exec<'_, '_> {
                     )),
                 }
             });
-        if let Err(e) = result {
-            let why = dfm_model::display::bounded_visible(&e.detail, 1024);
-            let e = match self.journal(op, &id, Phase::Failed, None, Some(why)) {
-                Ok(()) => e,
-                Err(n) => Refusal::new(
-                    e.code,
-                    format!(
-                        "{}; the outcome could not be journaled: {}",
-                        e.detail, n.detail
+        let after = match result {
+            Ok(after) => after,
+            Err(e) => {
+                let why = dfm_model::display::bounded_visible(&e.detail, 1024);
+                let e = match self.journal(op, &id, Phase::Failed, None, Some(why)) {
+                    Ok(()) => e,
+                    Err(n) => Refusal::new(
+                        e.code,
+                        format!(
+                            "{}; the outcome could not be journaled: {}",
+                            e.detail, n.detail
+                        ),
                     ),
-                ),
-            };
-            return Err(Ended::Failed(e, Some(id)));
-        }
+                };
+                return Err(Ended::Failed(e, Some(id)));
+            }
+        };
         if let Err(e) = self.journal(op, &id, Phase::Done, None, None) {
             return Err(Ended::Failed(e, Some(id)));
+        }
+        // An upgrade whose provider already had its newest version changed nothing: the
+        // listing is the same, so the operation is current, with the attempt journaled.
+        if op.action == Action::Upgrade && after == before {
+            return Ok(Ended::Current);
         }
         Ok(Ended::Updated {
             id,
@@ -1733,7 +1746,7 @@ impl Exec<'_, '_> {
             Action::Remove => removed = Some(self.remove(op, abs, parent, name, live)?),
             // Nothing is written. The read-back below is the last look at the leaf.
             Action::Adopt => {}
-            Action::None | Action::Retire | Action::Install => {
+            Action::None | Action::Retire | Action::Install | Action::Upgrade => {
                 return Err(plan_invalid("no action"));
             }
         }

@@ -155,6 +155,13 @@ pub enum PackageState {
     Unknown(String),
     /// The resource value is not a valid package declaration (a bad name). Not a probe result.
     Refused(String),
+    /// A rolling update: the declared provider lists it (the versions) and the declaration is
+    /// rolling, so the provider resolves the newest eligible version at apply time and installs
+    /// it beside the listed ones (docs/toolchains.md). Nothing is removed.
+    Rolling(String),
+    /// A rolling update that keeps it: the declaration holds it, or a version is installed that
+    /// a rolling update would not replace (a local build). The text says which.
+    Held(String),
 }
 
 impl PackageState {
@@ -189,6 +196,8 @@ impl PackageState {
             PackageState::Unsupported(w) => format!("unsupported:{w}"),
             PackageState::Unknown(w) => format!("unknown:{w}"),
             PackageState::Refused(w) => format!("refused:{w}"),
+            PackageState::Rolling(v) => format!("rolling:{v}"),
+            PackageState::Held(w) => format!("held:{w}"),
         }
     }
 }
@@ -1063,6 +1072,25 @@ impl Planner<'_> {
                 op.status = Status::Current;
                 op.effect = format!("{name} is installed by {} ({v})", r.adapter);
             }
+            Some(PackageState::Rolling(v)) => {
+                op.action = Action::Upgrade;
+                op.status = Status::Planned;
+                op.effect = format!(
+                    "upgrade {shown} to the newest version the provider resolves at apply time; the installed {v} stay (nothing is removed or downgraded)"
+                );
+                op.preconditions.push(Precondition {
+                    subject: probe,
+                    state: PackageState::Rolling(v).state(),
+                });
+            }
+            Some(PackageState::Held(w)) => {
+                op.action = Action::None;
+                op.status = Status::Current;
+                op.effect = format!(
+                    "{name} is installed by {} and held ({w}); not upgraded",
+                    r.adapter
+                );
+            }
             Some(PackageState::Missing(deps)) => {
                 op.action = Action::Install;
                 op.status = Status::Planned;
@@ -1122,7 +1150,7 @@ impl Planner<'_> {
                     Code::Conflict,
                     "/name",
                     format!(
-                        "{name} is not installed by {} but {why}; a declared owner is not permission to replace another owner",
+                        "{name} is declared for {} but {why}; a declared owner is not permission to replace another owner",
                         r.adapter
                     ),
                     "remove the other installation, or declare the adapter that owns it",
@@ -2122,6 +2150,8 @@ mod tests {
             PackageState::Unsupported("root".into()),
             PackageState::Unknown("timeout".into()),
             PackageState::Refused("bad name".into()),
+            PackageState::Rolling("1.2 1.3".into()),
+            PackageState::Held("1.2, update_policy = hold".into()),
         ];
         let strings: BTreeSet<String> = states.iter().map(PackageState::state).collect();
         assert_eq!(strings.len(), states.len());
