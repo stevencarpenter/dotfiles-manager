@@ -9,6 +9,7 @@ pub mod display;
 pub mod doctor;
 pub mod exit;
 pub mod fold;
+pub mod lock;
 pub mod merge;
 pub mod plan;
 pub mod refusal;
