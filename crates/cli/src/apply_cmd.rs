@@ -1,6 +1,8 @@
 //! `apply`: publishes and removes the files of an approved plan (docs/apply.md). `secrets` is
 //! the same command over the secrets scope (docs/secrets.md): it renders secret outputs and
-//! nothing else, and its gates add the vault session check.
+//! nothing else, and its gates add the vault session check. `packages` (docs/packages.md) and
+//! `services` (docs/lifecycle.md) are the same command over their scopes, with the providers
+//! probed before the plan.
 //!
 //! The command plans again from the current machine, requires the digest the reviewer approved
 //! (`--yes-plan`), takes the writer lock, plans a second time under the lock and compares again,
@@ -8,7 +10,7 @@
 //! changes nothing.
 
 use crate::adapters::Generators;
-use crate::plan_cmd::{plan_for, render};
+use crate::plan_cmd::{Probed, plan_for, render};
 use crate::{Ctx, load_resolved, read_existing_binding, state_cmd, usage};
 use dfm_engine::{
     Approval as Allowance, Dir, Run, Store, Sys, apply, check_allowances, check_journal_capacity,
@@ -36,6 +38,8 @@ pub struct Args {
     /// `packages --update`: a rolling update of the installed rolling tools
     /// (docs/toolchains.md) instead of an install of the missing ones.
     pub update: bool,
+    /// `services --restart <resource-id>`: current services to plan as a disruptive restart.
+    pub restart: BTreeSet<String>,
 }
 
 /// `apply --root <dir> [--yes-plan <digest>] [--allow-disruptive <operation-id>]...
@@ -43,6 +47,7 @@ pub struct Args {
 pub fn parse_args(args: &[String], scope: Scope) -> Result<Args, Refusal> {
     let (mut root, mut yes, mut preview, mut update) = (None, None, false, false);
     let (mut allow, mut allow_adopt) = (BTreeSet::new(), BTreeSet::new());
+    let mut restart = BTreeSet::new();
     let mut it = args.iter();
     while let Some(a) = it.next() {
         let mut value = |slot: Option<&mut Option<String>>| -> Result<String, Refusal> {
@@ -74,6 +79,9 @@ pub fn parse_args(args: &[String], scope: Scope) -> Result<Args, Refusal> {
             "--preview" => return Err(usage("--preview given twice")),
             "--update" if scope == Scope::Packages && !update => update = true,
             "--update" if update => return Err(usage("--update given twice")),
+            "--restart" if scope == Scope::Services => {
+                restart.insert(value(None)?);
+            }
             other => return Err(usage(format!("unknown argument {other}"))),
         }
     }
@@ -95,6 +103,7 @@ pub fn parse_args(args: &[String], scope: Scope) -> Result<Args, Refusal> {
         preview,
         scope,
         update,
+        restart,
     })
 }
 
@@ -166,7 +175,7 @@ fn generators_for<'a>(
     loaded: &'a crate::Loaded,
 ) -> Generators<'a> {
     match scope {
-        Scope::Secrets | Scope::Packages => {
+        Scope::Secrets | Scope::Packages | Scope::Services => {
             Generators::with_runner(&loaded.resolved, &loaded.sources, ctx.runner(sys))
         }
         Scope::Config => Generators::new(&loaded.resolved),
@@ -213,17 +222,42 @@ fn run_inner(
     // Read-only look first. A refusal here changes nothing, not even the lock file.
     let first = load_resolved(ctx, root)?;
     let (layout, sys) = (ctx.layout(), ctx.sys()?);
-    // A packages plan needs the providers' answers first (docs/packages.md). The probes are
-    // read-only and run only for this scope.
-    let probes = |resolved: &dfm_model::resolve::Resolved| match args.scope {
-        Scope::Packages if args.update => {
-            crate::adapters::package::update_facts(resolved, &ctx.runner(&sys))
+    // A packages or services plan needs the providers' answers first (docs/packages.md,
+    // docs/lifecycle.md). The probes are read-only and run only for their scope.
+    let probes = |resolved: &dfm_model::resolve::Resolved| -> Result<Probed, Refusal> {
+        let mut probed = Probed::default();
+        match args.scope {
+            Scope::Packages if args.update => {
+                probed.package =
+                    crate::adapters::package::update_facts(resolved, &ctx.runner(&sys))?;
+            }
+            Scope::Packages => {
+                probed.package =
+                    crate::adapters::package::package_facts(resolved, &ctx.runner(&sys))?;
+            }
+            Scope::Services => {
+                probed.service =
+                    crate::adapters::service::service_facts(resolved, &ctx.runner(&sys))?;
+                probed.restart = args.restart.clone();
+            }
+            _ => {}
         }
-        Scope::Packages => crate::adapters::package::package_facts(resolved, &ctx.runner(&sys)),
-        _ => Ok::<_, Refusal>(BTreeMap::new()),
+        Ok(probed)
     };
     let plan = plan_for(ctx, &first, args.scope, probes(&first.resolved)?)?;
     stop()?;
+    // A restart request must name a service of this plan, as an approval flag must name an
+    // operation: a misspelled id would otherwise be ignored.
+    if let Some(bad) = args.restart.iter().find(|r| {
+        !plan
+            .operations
+            .iter()
+            .any(|o| o.resource == **r && o.id.ends_with("@service"))
+    }) {
+        return Err(usage(format!(
+            "--restart {bad} names no service in this plan"
+        )));
+    }
     let digest = plan.digest()?;
     if let Some(i) = &ctx.isolated {
         writeln!(out, "isolated: true {i}").map_err(w)?;
@@ -394,6 +428,7 @@ fn run_inner(
             Scope::Config => "apply",
             Scope::Secrets => "secrets",
             Scope::Packages => "packages",
+            Scope::Services => "services",
         };
         let receipt = Receipt {
             schema: SCHEMA,
@@ -465,8 +500,13 @@ fn run_inner(
         .map_err(w)?;
     }
     writeln!(out, "{}", counts_line(&counts)).map_err(w)?;
-    // An adoption publishes nothing, so only a published output earns this note.
-    if report.operations.iter().any(|r| r.reload.is_some()) {
+    // An adoption publishes nothing, so only a published output earns this note. A service
+    // operation records its own reload state (`reloaded` or `requested`) on its line.
+    if report
+        .operations
+        .iter()
+        .any(|r| r.reload.as_deref() == Some(dfm_engine::RELOAD_NOT_ATTEMPTED))
+    {
         writeln!(
             out,
             "reload: not attempted. Publishing a file does not reload the program that reads it"

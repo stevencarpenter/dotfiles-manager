@@ -12,7 +12,8 @@ mod stale;
 
 pub use build::{
     Context, MergeFact, MergeVerdict, Owned, PackageState, SECRET_ADAPTER, Scope, SecretVerdict,
-    build, followups, in_scope, ledger_state, matches_pattern, requests, sensitive_paths,
+    ServiceState, build, followups, in_scope, ledger_state, matches_pattern, requests,
+    sensitive_paths, service_prerequisites,
 };
 pub use stale::{Stale, StaleKind, stale};
 
@@ -184,6 +185,14 @@ pub enum Action {
     /// apply time (docs/toolchains.md). As `Install`: no path, no ledger entry; the listing
     /// before and after decides `updated` or `current`. Nothing is removed.
     Upgrade,
+    /// Load a service that its launcher does not hold (docs/lifecycle.md). Nothing is running,
+    /// so this is not disruptive. No path, no ledger entry: the launcher's own report is the
+    /// record, probed before and after.
+    Start,
+    /// Reload a service its launcher holds: unload, then load the declared definition, or the
+    /// launcher's own restart. Disruptive (architecture section 10 item 8): it needs
+    /// `--allow-disruptive <operation-id>`.
+    Restart,
     /// Nothing to do, or out of scope.
     None,
 }

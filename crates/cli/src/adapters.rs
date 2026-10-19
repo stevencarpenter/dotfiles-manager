@@ -7,6 +7,7 @@ mod generate;
 mod merge_plan;
 pub mod package;
 pub mod secret;
+pub mod service;
 pub use generate::{Gen, Generators, plan_outputs};
 pub use merge_plan::merge_facts;
 
@@ -154,6 +155,18 @@ fn package(id: &str) -> AdapterSpec {
     )
 }
 
+/// A service: no target, no claim. Its prerequisite files are declared in `fields` and observed
+/// by the planner (docs/lifecycle.md).
+fn service(id: &str, fields: Vec<Field>) -> AdapterSpec {
+    spec(
+        id,
+        "service",
+        TargetRule::Forbidden,
+        Claims::None,
+        Schema::Table(fields),
+    )
+}
+
 /// One adapter: what the resolver validates against, and the generator if the adapter produces
 /// file content. This table is the only place in the Rust code that names an adapter, so the
 /// catalog and the generators cannot disagree. `scripts/check_examples.py` keeps its own list
@@ -183,6 +196,16 @@ impl Adapter {
             && matches!(
                 self.spec.id.as_str(),
                 package::HOMEBREW | package::MISE | package::APT | package::UV_TOOL
+            )
+    }
+
+    /// Whether the adapter starts and restarts a service through its launcher
+    /// (`Generator::service_act`).
+    pub fn reloads(&self) -> bool {
+        self.spec.kind == "service"
+            && matches!(
+                self.spec.id.as_str(),
+                service::LAUNCHD | service::BREW_SERVICE
             )
     }
 }
@@ -351,6 +374,26 @@ pub fn registry() -> Vec<Adapter> {
             ),
             generator: None,
         },
+        Adapter {
+            spec: service(
+                service::LAUNCHD,
+                vec![
+                    field("label", Schema::Str, true),
+                    field("plist", Schema::HomePath, true),
+                ],
+            ),
+            generator: None,
+        },
+        Adapter {
+            spec: service(
+                service::BREW_SERVICE,
+                vec![
+                    field("name", Schema::Str, true),
+                    field("config", Schema::Array(Box::new(Schema::HomePath)), false),
+                ],
+            ),
+            generator: None,
+        },
     ]
 }
 
@@ -412,6 +455,20 @@ mod tests {
             table.iter().filter(|a| a.installs()).count(),
             packages.len()
         );
+    }
+
+    #[test]
+    fn every_service_adapter_acts_through_a_launcher_and_claims_nothing() {
+        let table = registry();
+        let services: Vec<_> = table.iter().filter(|a| a.spec.kind == "service").collect();
+        assert_eq!(services.len(), 2);
+        assert!(services.iter().all(|a| {
+            a.generator.is_none()
+                && a.reloads()
+                && a.spec.claims == dfm_model::resolve::Claims::None
+                && a.spec.target == dfm_model::resolve::TargetRule::Forbidden
+        }));
+        assert_eq!(table.iter().filter(|a| a.reloads()).count(), services.len());
     }
 
     #[test]

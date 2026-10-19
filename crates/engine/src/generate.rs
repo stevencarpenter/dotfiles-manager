@@ -12,7 +12,7 @@ use dfm_model::fold;
 use dfm_model::merge::{Merged, fragment_token};
 use dfm_model::plan::{
     MAX_HASHED_BYTES, MAX_LISTING, MAX_SOURCE_ENTRIES, MAX_SOURCE_FILE_BYTES,
-    MAX_SOURCE_TOTAL_BYTES, Operation, PackageState, Plan, file_fingerprint,
+    MAX_SOURCE_TOTAL_BYTES, Operation, PackageState, Plan, ServiceState, file_fingerprint,
 };
 use dfm_model::state::{AppendedItem, Class, OwnedEntry};
 use dfm_model::{Code, Refusal};
@@ -133,6 +133,40 @@ pub trait Generator {
             format!("no package provider for {}", op.adapter),
         ))
     }
+
+    /// Whether `op` is a service start or restart this generator runs (docs/lifecycle.md): a
+    /// `start` or `restart` operation of a launcher this build has.
+    fn reloads(&self, _op: &Operation) -> bool {
+        false
+    }
+
+    /// Asks the launcher what it holds for the service (a read-only report).
+    fn service_state(&self, op: &Operation) -> Result<ServiceState, Refusal> {
+        Err(Refusal::new(
+            Code::GeneratorUnavailable,
+            format!("no service launcher for {}", op.adapter),
+        ))
+    }
+
+    /// Starts or restarts the service through its launcher, as `op.action` says, and waits a
+    /// bounded time for the launcher to report completion. The caller probes again afterwards.
+    fn service_act(&self, op: &Operation) -> Result<Completion, Refusal> {
+        Err(Refusal::new(
+            Code::GeneratorUnavailable,
+            format!("no service launcher for {}", op.adapter),
+        ))
+    }
+}
+
+/// How a launcher answered a start or restart (architecture section 11, `UpdateProvider`:
+/// queued is `pending`, only completed can become `updated`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Completion {
+    /// The launcher finished the request. The caller's postcondition probe decides the outcome.
+    Completed,
+    /// The launcher accepted the request and did not report completion within the bound. The
+    /// operation is `pending`; the detail says what was observed.
+    Queued(String),
 }
 
 /// The generator of a build with no adapters: every file operation is unsupported.
