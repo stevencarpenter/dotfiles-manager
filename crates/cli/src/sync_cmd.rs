@@ -248,7 +248,7 @@ fn ensure_private_dir(dir: &Path, uid: u32) -> Result<(), Refusal> {
 
 /// A per-run staging directory under the cache directory, `<pid>-<start>`, removed on drop. A
 /// lock file inside it is held for the run's lifetime: the kernel releases it when the process
-/// dies, so the next run can tell a dead run's directory from a live one and remove it.
+/// dies, so a later writer can tell a dead run's directory from a live one and remove it.
 struct Staging {
     dir: PathBuf,
     _held: FileLock,
@@ -257,11 +257,16 @@ struct Staging {
 const STAGING_LOCK: &str = "lock";
 
 impl Staging {
-    fn create(ctx: &Ctx, sys: &Sys) -> Result<Staging, Refusal> {
+    /// `sweep` is for the run that holds the writer lock (section 10 item 4): only it removes
+    /// the directories of dead runs, so a review pass, which holds the shared lock, can never
+    /// remove another review's directory between its creation and its lock.
+    fn create(ctx: &Ctx, sys: &Sys, sweep: bool) -> Result<Staging, Refusal> {
         let root = ctx.platform.cache_dir().join("staging");
         ensure_private_dir(&ctx.platform.cache_dir(), sys.uid)?;
         ensure_private_dir(&root, sys.uid)?;
-        Self::sweep(&root, sys);
+        if sweep {
+            Self::sweep(&root, sys);
+        }
         let dir = root.join(format!("{}-{}", std::process::id(), now_ns()?));
         ensure_private_dir(&dir, sys.uid)?;
         let held = FileLock::acquire(sys, &Dir::open_plain(&dir)?, STAGING_LOCK)?;
@@ -955,7 +960,7 @@ fn run_inner(
     // Copy the checkout into staging, rehearse the fetch and fast-forward there, then plan the
     // staged tree as the tree --root will hold.
     let git = Git::new(ctx, &sys);
-    let staging = Staging::create(ctx, &sys)?;
+    let staging = Staging::create(ctx, &sys, false)?;
     let previewed = stage_all(&git, root_src, &grants, &root, &staging.tree())?;
     for s in &previewed {
         writeln!(
@@ -981,17 +986,9 @@ fn run_inner(
     }
     // The checks apply runs before its lock (docs/apply.md), against the sync digest, so a plan
     // that apply would refuse is refused here before any source is published.
-    let before_lock = apply_cmd::Args {
-        root: args.apply.root.clone(),
-        yes_plan: args.apply.yes_plan.clone(),
-        allow: args.apply.allow.clone(),
-        allow_adopt: args.apply.allow_adopt.clone(),
-        preview: args.apply.preview,
-        scope: Scope::Config,
-    };
     apply_cmd::check_before_lock(
         ctx,
-        &before_lock,
+        &args.apply,
         &plan,
         &digest,
         &Generators::new(&loaded.resolved),
@@ -1018,7 +1015,7 @@ fn run_inner(
         return Err(crate::state_lost_refusal());
     }
     store.require_identity(&binding)?;
-    let second = Staging::create(ctx, &sys)?;
+    let second = Staging::create(ctx, &sys, true)?;
     let staged = stage_all(&git, root_src, &grants, &root, &second.tree())?;
     let (_, locked) = plan_staged(ctx, &binding, &root, &rel, &second.tree())?;
     let locked_plan_digest = locked.digest()?;
@@ -1070,7 +1067,7 @@ fn run_inner(
     // (docs/apply.md).
     let apply_args = apply_cmd::Args {
         yes_plan: Some(locked_plan_digest),
-        ..before_lock
+        ..args.apply.clone()
     };
     match apply_cmd::run(ctx, &apply_args, out) {
         Ok(()) => Ok(()),

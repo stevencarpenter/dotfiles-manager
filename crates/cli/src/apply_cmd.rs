@@ -27,6 +27,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
 use std::path::Path;
 
+#[derive(Clone)]
 pub struct Args {
     pub root: String,
     pub yes_plan: Option<String>,

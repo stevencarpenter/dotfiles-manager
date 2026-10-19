@@ -1014,14 +1014,19 @@ fn a_new_commit_over_the_same_tree_between_preview_and_approval_is_stale() {
 }
 
 #[test]
-fn a_dead_run_s_staging_directory_is_removed_by_the_next_run() {
+fn a_dead_run_s_staging_directory_is_removed_by_the_next_writer() {
     let fx = Fx::new();
     let dead = fx.staging().join("4000000-1");
     fs::create_dir_all(dead.join("tree")).unwrap();
     fs::write(dead.join("tree/secret.txt"), "left behind\n").unwrap();
     let foreign = fx.staging().join("notes");
     fs::create_dir_all(&foreign).unwrap();
+    // A review pass holds only the shared lock and removes nothing.
     let o = fx.preview();
+    assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
+    assert!(dead.exists(), "a preview removed a staging directory");
+    // The approved run holds the writer lock and sweeps.
+    let o = fx.sync(&digest_of(&o));
     assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
     assert!(!dead.exists(), "the dead run's staging directory stayed");
     assert!(
