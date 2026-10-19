@@ -860,3 +860,67 @@ fn a_nested_path_through_a_symlink_is_refused_before_any_checkout_is_created() {
         "the link was replaced"
     );
 }
+
+#[test]
+fn a_worktree_checkout_or_a_redirected_work_tree_is_refused() {
+    let fx = Fx::new();
+    let old = fx.head();
+    // core.worktree pointing elsewhere would send the fast-forward there.
+    let elsewhere = TempDir::new("sync-elsewhere");
+    git(
+        &fx.root,
+        &[
+            "config",
+            "core.worktree",
+            elsewhere.path().to_str().unwrap(),
+        ],
+    );
+    let o = fx.preview();
+    git(&fx.root, &["config", "--unset", "core.worktree"]);
+    assert_eq!(code(&o), 3, "{}\n{}", stdout(&o), stderr(&o));
+    assert!(stderr(&o).contains("E_SOURCE_UNTRUSTED"), "{}", stderr(&o));
+    assert!(stderr(&o).contains("plain checkout"), "{}", stderr(&o));
+    assert!(fs::read_dir(elsewhere.path()).unwrap().next().is_none());
+    assert_eq!(fx.head(), old);
+    // A linked worktree keeps a gitfile whose git directory lies in the main checkout. Bind a
+    // fresh machine to its profile so the refusal is the checkout's, not the binding's.
+    let wt = fx.work.path().join("wt");
+    git(
+        &fx.root,
+        &["worktree", "add", "-q", "--detach", wt.to_str().unwrap()],
+    );
+    let other = TempDir::new("sync-home2");
+    let p = wt.join("profiles/t-01.toml");
+    let o = Command::new(BIN)
+        .env_clear()
+        .env("DFM_PROVIDER_PATH", "/usr/bin:/bin")
+        .args([
+            "--home",
+            other.path().to_str().unwrap(),
+            "bind",
+            "--profile",
+            p.to_str().unwrap(),
+            "--machine-id",
+            "m5-test",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let o = Command::new(BIN)
+        .env_clear()
+        .env("DFM_PROVIDER_PATH", "/usr/bin:/bin")
+        .args([
+            "--home",
+            other.path().to_str().unwrap(),
+            "sync",
+            "--root",
+            wt.to_str().unwrap(),
+            "--trust-origin",
+            &fx.origin(),
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(code(&o), 3, "{}\n{}", stdout(&o), stderr(&o));
+    assert!(stderr(&o).contains("E_SOURCE_UNTRUSTED"), "{}", stderr(&o));
+    assert!(stderr(&o).contains("plain checkout"), "{}", stderr(&o));
+}

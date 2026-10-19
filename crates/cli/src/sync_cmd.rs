@@ -354,9 +354,30 @@ fn copy_checkout(from: &Path, to: &Path) -> Result<(), Refusal> {
     go(from, to, false, &mut seen)
 }
 
-/// The live checkout must not configure attribute files or filters: a fast-forward writes files
-/// through them (the same rule as `bootstrap.sh install`).
+/// A checkout the command drives (the staged copy or the live one) must be self-contained: its
+/// git directory inside it and its top level equal to it, so a gitfile (a worktree checkout)
+/// or `core.worktree` cannot send git's writes to another place. It must not configure
+/// attribute files or filters either: a fast-forward writes files through them (the same rule
+/// as `bootstrap.sh install`).
 fn check_live(git: &Git, live: &str) -> Result<(), Refusal> {
+    let where_is = |what: &str, flag: &str| {
+        git.run(
+            true,
+            Code::SourceUntrusted,
+            what,
+            &["-C", live, "rev-parse", flag],
+        )
+    };
+    let git_dir = where_is("find the git directory", "--absolute-git-dir")?;
+    let top = where_is("find the top level", "--show-toplevel")?;
+    if !Path::new(&git_dir).starts_with(live) || top != live {
+        return Err(untrusted(format!(
+            "the checkout at {} keeps its git directory at {} with top level {}; sync needs a plain checkout whose .git is inside it (not a worktree, gitfile or core.worktree)",
+            visible(live),
+            visible(&git_dir),
+            visible(&top)
+        )));
+    }
     let o = git.output(
         true,
         &[
@@ -815,7 +836,7 @@ fn run_inner(
     let git = Git::new(ctx, &sys);
     let staging = Staging::create(ctx)?;
     let mut fetched = None;
-    let staged = stage_all(
+    let previewed = stage_all(
         &git,
         &live_lock,
         &grants,
@@ -823,7 +844,7 @@ fn run_inner(
         &staging.tree(),
         &mut fetched,
     )?;
-    for s in &staged {
+    for s in &previewed {
         writeln!(
             out,
             "source: {} {} {} {} ({})",
@@ -907,6 +928,20 @@ fn run_inner(
     let locked_digest = locked.digest()?;
     if locked_digest != digest {
         return Err(stale(approved, &locked_digest));
+    }
+    // The approval is bound to the commits, not only to the tree they produce: every source
+    // must still move from and to what the reviewed run showed.
+    let moved = |s: &Staged<'_>| (s.src.id.clone(), s.old.clone(), s.new.clone());
+    if staged.len() != previewed.len()
+        || staged
+            .iter()
+            .zip(&previewed)
+            .any(|(a, b)| moved(a) != moved(b))
+    {
+        return Err(Refusal::new(
+            Code::PlanStale,
+            "a source moved since the reviewed run: the commits to publish are not the ones shown with this digest. Fix: read the new plan with --preview and approve its digest",
+        ));
     }
     let mut published = Vec::new();
     for s in &staged {
