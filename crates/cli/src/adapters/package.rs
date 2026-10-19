@@ -482,11 +482,20 @@ fn outdated_names(text: &str) -> Option<Vec<String>> {
 /// is the declared one or extends it at a component boundary (`node@20` matches `20.20.2`, not
 /// `2.1.0`). A selector only mise can resolve is refused: the probe has no network.
 fn mise_probe(runner: &Runner, pkg: &str) -> PackageState {
+    match mise_listing(runner, pkg) {
+        Ok(listed) => mise_state(&listed, pkg),
+        Err(state) => state,
+    }
+}
+
+/// Every installed version of the declared tool, as mise lists them, or the state that stops
+/// the probe.
+fn mise_listing(runner: &Runner, pkg: &str) -> Result<Vec<String>, PackageState> {
     let (tool, want) = tool_and_version(pkg);
     if symbolic(want) {
-        return PackageState::Refused(format!(
+        return Err(PackageState::Refused(format!(
             "{pkg}: mise/v1 takes an exact version or a version prefix (node@20, node@20.1), not a selector mise resolves online ({want})"
-        ));
+        )));
     }
     let args = [
         "ls".to_string(),
@@ -494,23 +503,27 @@ fn mise_probe(runner: &Runner, pkg: &str) -> PackageState {
         "--json".into(),
         tool.into(),
     ];
-    let out = match runner.run(&request("mise", &args, &mise_env(), PROBE_TIMEOUT)) {
-        Ok(o) => o,
-        Err(e) => return PackageState::Unknown(e.detail),
-    };
+    let out = runner
+        .run(&request("mise", &args, &mise_env(), PROBE_TIMEOUT))
+        .map_err(|e| PackageState::Unknown(e.detail))?;
     if let Some(why) = ended("mise ls", &out) {
-        return PackageState::Unknown(why);
+        return Err(PackageState::Unknown(why));
     }
     if !matches!(out.end, End::Exited(0)) {
-        return PackageState::Unknown(format!(
+        return Err(PackageState::Unknown(format!(
             "mise ls exited with an error for {pkg} (an unknown tool, or a broken configuration)"
-        ));
+        )));
     }
-    let Some(listed) = installed_versions(&out.stdout) else {
-        return PackageState::Unknown(format!(
+    installed_versions(&out.stdout).ok_or_else(|| {
+        PackageState::Unknown(format!(
             "mise ls --json for {pkg} is not the array of versions the adapter reads"
-        ));
-    };
+        ))
+    })
+}
+
+/// The probe's answer from a listing: the versions that satisfy the declared one, or `Missing`.
+fn mise_state(listed: &[String], pkg: &str) -> PackageState {
+    let (_, want) = tool_and_version(pkg);
     let versions: Vec<&str> = listed
         .iter()
         .map(String::as_str)
@@ -587,10 +600,11 @@ fn uv_norm(s: &str) -> String {
 /// What in uv's receipt for an installed tool (`~/.local/share/uv/tools/<name>/uv-receipt.toml`)
 /// an upgrade would keep that no plan row shows: a `git`, `path`, `directory`, `url` or
 /// `editable` requirement in `[tool].requirements` (an origin `uv tool upgrade` resolves again),
-/// or any `[tool.options]` entry (`index-url`, `default-index`, `find-links`, `no-index`,
-/// `prerelease` and the other install settings uv persists and reuses); `Ok(Some(reason))`
-/// says which. A receipt that cannot be read or has no requirements is an error: the update
-/// cannot tell what it would resolve.
+/// a requirement written as one PEP 508 string instead of a table (uv's legacy form, whose
+/// source those keys cannot show), or any `[tool.options]` entry (`index-url`,
+/// `default-index`, `find-links`, `no-index`, `prerelease` and the other install settings uv
+/// persists and reuses); `Ok(Some(reason))` says which. A receipt that cannot be read or has
+/// no requirements is an error: the update cannot tell what it would resolve.
 fn uv_receipt_source(home: &Path, name: &str) -> Result<Option<String>, String> {
     let path = home
         .join(".local/share/uv/tools")
@@ -611,14 +625,20 @@ fn uv_receipt_source(home: &Path, name: &str) -> Result<Option<String>, String> 
         .and_then(|t| t.get("requirements"))
         .and_then(Value::as_array)
         .ok_or_else(|| format!("{shown} lists no tool requirements"))?;
-    if let Some(key) = reqs.iter().find_map(|r| {
-        ["git", "path", "directory", "url", "editable"]
+    for r in reqs {
+        let Some(r) = r.as_table() else {
+            return Ok(Some(
+                "installed with a legacy string requirement in the receipt, whose source an upgrade would resolve again outside the plan".into(),
+            ));
+        };
+        if let Some(key) = ["git", "path", "directory", "url", "editable"]
             .iter()
-            .find(|k| r.get(k).is_some())
-    }) {
-        return Ok(Some(format!(
-            "installed from a {key} source, which an upgrade would resolve again outside the plan"
-        )));
+            .find(|k| r.contains_key(**k))
+        {
+            return Ok(Some(format!(
+                "installed from a {key} source, which an upgrade would resolve again outside the plan"
+            )));
+        }
     }
     let options = tool
         .and_then(|t| t.get("options"))
@@ -785,10 +805,15 @@ pub fn probe(runner: &Runner, adapter: &str, value: &Value) -> Result<PackageSta
             ));
         }
     };
-    Ok(match state {
-        PackageState::Missing(_) => match other_owner(runner, adapter, &pkg) {
+    Ok(settled(runner, adapter, &pkg, state))
+}
+
+/// The owner check for a package its provider does not list; any other state is the probe's.
+fn settled(runner: &Runner, adapter: &str, pkg: &str, state: PackageState) -> PackageState {
+    match state {
+        PackageState::Missing(_) => match other_owner(runner, adapter, pkg) {
             Ok(Some(why)) => PackageState::OtherOwner(why),
-            Ok(None) if adapter == HOMEBREW => match brew_official(runner, &pkg) {
+            Ok(None) if adapter == HOMEBREW => match brew_official(runner, pkg) {
                 Ok(Some(off)) => brew_dependencies(runner, &off),
                 Ok(None) => PackageState::Unofficial(format!(
                     "{pkg} is not an official Homebrew formula or cask; reading its dependencies would load tap code before approval"
@@ -799,7 +824,7 @@ pub fn probe(runner: &Runner, adapter: &str, value: &Value) -> Result<PackageSta
             Err(why) => PackageState::Unknown(why),
         },
         s => s,
-    })
+    }
 }
 
 /// Installs one package through its provider. The caller probes again afterwards. A mise tool
@@ -854,16 +879,30 @@ pub fn install(runner: &Runner, adapter: &str, value: &Value) -> Result<(), Refu
 /// The rolling-update view of one installed package (docs/toolchains.md): the probe, then for
 /// a listed package whether the run may ask the provider for a newer version. Only a
 /// `rolling` declaration of a mise or uv tool is `Rolling`; a held or other policy, a provider
-/// with no rolling path, or an installed local build (a mise `ref:` or `path:` version, which
-/// the update would not replace and the manager never removes), or a uv tool whose receipt
-/// names a git, path, url or editable source or keeps install options, is `Held` with the
-/// reason. A copy of the tool
-/// from another owner blocks the update (`OtherOwner`): two owners of one tool is the conflict
-/// the update must not deepen.
+/// with no rolling path, an installed local build (a mise `ref:` or `path:` version of the
+/// tool, inside or outside the declared prefix, which the update would not replace and the
+/// manager never removes), an exact mise pin (a declared version the listing contains as it
+/// is, which `mise install` resolves to itself), or a uv tool whose receipt names a git, path,
+/// url or editable source or keeps install options, is `Held` with the reason. A copy of the
+/// tool from another owner blocks the update (`OtherOwner`): two owners of one tool is the
+/// conflict the update must not deepen.
 pub fn maintain(runner: &Runner, adapter: &str, value: &Value) -> Result<PackageState, Refusal> {
     let pkg = name(value)?;
     let policy = policy(value)?;
-    let state = probe(runner, adapter, value)?;
+    // The mise probe narrows the listing to the declared prefix; a local build outside it
+    // (`go@1.27` declared, `ref:feature` installed) holds the tool too, so the whole listing
+    // is examined before the narrowing.
+    let (state, local) = if adapter == MISE {
+        match mise_listing(runner, &pkg) {
+            Ok(all) => (
+                settled(runner, adapter, &pkg, mise_state(&all, &pkg)),
+                all.iter().find(|v| local_build(v)).cloned(),
+            ),
+            Err(state) => (state, None),
+        }
+    } else {
+        (probe(runner, adapter, value)?, None)
+    };
     let PackageState::Installed(versions) = state else {
         return Ok(state);
     };
@@ -876,8 +915,14 @@ pub fn maintain(runner: &Runner, adapter: &str, value: &Value) -> Result<Package
             "{adapter} has no rolling update path in this build"
         ));
     }
-    if let Some(local) = versions.split(' ').find(|v| local_build(v)) {
+    if let Some(local) = local {
         return held(format!("{local} is a local build, which is kept"));
+    }
+    // `mise install <tool>@<version>` with that version installed is a no-op: the tool cannot
+    // advance until the pin is edited, so it is not planned as an upgrade every run.
+    let (_, want) = tool_and_version(&pkg);
+    if adapter == MISE && !want.is_empty() && versions.split(' ').any(|v| v == want) {
+        return held("an exact pin resolves to itself".into());
     }
     // `uv tool upgrade` resolves the tool from its receipt again: a git, path or url source,
     // or a persisted option such as an index, is a setting the plan never showed, so such a
@@ -1132,6 +1177,23 @@ mod tests {
                     "installed with uv options ({keys}), which an upgrade would keep outside the plan"
                 ))),
                 "{options}"
+            );
+        }
+        // uv's legacy receipt wrote a requirement as one PEP 508 string, whose source the
+        // table keys cannot see: any string requirement, even a bare name, holds.
+        let legacy = Some(
+            "installed with a legacy string requirement in the receipt, whose source an upgrade would resolve again outside the plan".to_string(),
+        );
+        for reqs in [
+            "[\"agent-reap @ git+https://example.invalid/x\"]",
+            "[\"agent-reap\"]",
+            "[{ name = \"agent-reap\" }, \"other>=1\"]",
+        ] {
+            receipt(&format!("[tool]\nrequirements = {reqs}\n"));
+            assert_eq!(
+                uv_receipt_source(&home, "agent-reap"),
+                Ok(legacy.clone()),
+                "{reqs}"
             );
         }
         receipt("[tool]\nentrypoints = []\n");

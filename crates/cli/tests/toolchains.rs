@@ -668,6 +668,65 @@ fn held_policies_local_builds_and_providers_without_a_rolling_path_are_kept() {
 }
 
 #[test]
+fn a_local_build_outside_the_declared_prefix_holds_the_tool() {
+    let fx = Fx::new();
+    // `go@1.27` lists only `1.27.1`; the git-ref build is outside the prefix but is still a
+    // local build of go, which the update must not install beside.
+    fx.installed(
+        "mise",
+        "duckdb 1.5.5\ngo 1.27.1\ngo ref:feature\njava 21.0.2\n",
+    );
+    let o = fx.apply(true);
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+    let out = text(&o.stdout);
+    assert!(
+        out.contains("go@1.27 is installed by mise/v1 and held (1.27.1, ref:feature is a local build, which is kept)"),
+        "{out}"
+    );
+    assert!(out.contains(&format!("current {GO}")), "{out}");
+    assert_eq!(
+        fx.changes(),
+        ["mise install duckdb@latest", "uv tool upgrade nuv"]
+    );
+    assert_eq!(
+        fx.listed("mise"),
+        "duckdb 1.5.5\ngo 1.27.1\ngo ref:feature\njava 21.0.2\nduckdb 1.6.0\n"
+    );
+}
+
+#[test]
+fn an_exact_mise_pin_is_current_under_update_and_a_prefix_still_rolls() {
+    let fx = Fx::new();
+    // `mise install go@1.27.1` with 1.27.1 installed is a no-op: the pin cannot advance, so
+    // the row holds it instead of planning an upgrade every run.
+    let exact = EXTRA.replace("name = \"go@1.27\"", "name = \"go@1.27.1\"");
+    fx.put("base/modules/extra/module.toml", &exact);
+    let o = fx.apply(true);
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+    let out = text(&o.stdout);
+    assert!(
+        out.contains("go@1.27.1 is installed by mise/v1 and held (1.27.1, an exact pin resolves to itself); not upgraded"),
+        "{out}"
+    );
+    assert!(out.contains(&format!("current {GO}")), "{out}");
+    assert_eq!(
+        fx.changes(),
+        ["mise install duckdb@latest", "uv tool upgrade nuv"]
+    );
+    // The prefix form of the same declaration rolls to the newest 1.27.x.
+    fx.put("base/modules/extra/module.toml", EXTRA);
+    let o = fx.apply(true);
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+    assert!(
+        text(&o.stdout).contains(&format!("updated {GO}")),
+        "{}",
+        text(&o.stdout)
+    );
+    assert!(fx.changes().contains(&"mise install go@1.27".to_string()));
+    assert!(fx.listed("mise").contains("go 1.27.2\n"));
+}
+
+#[test]
 fn a_uv_source_that_is_not_an_index_name_is_refused_before_any_provider_runs() {
     let fx = Fx::new();
     // The first two pass the general package-name rule and are refused by the uv rule; the
