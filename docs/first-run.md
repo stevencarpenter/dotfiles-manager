@@ -25,10 +25,10 @@ Board ticket: DFM-46. The agent runs nothing live without written approval that 
 
    The copy must be a real directory, not a symlink, made as your own user and not with `sudo`: the script refuses a toolchain entry that another user owns (`E_TOOLCHAIN_MISMATCH`). The printed digest must equal `toolchain_tree_sha256` in `dotfiles-manager.lock` before `install`. The digest is device-specific. The M3 may need its own lock later.
 2. Choose the commit to install. The integration branch is `going-to-sleep`. Use the full 40-character object id.
-3. Run the bootstrap script with a clean environment:
+3. Run the bootstrap script (not with `env -i`: it clears `HOME` and the script refuses with `E_HOME_MISMATCH`; the script scrubs its own environment):
 
    ```sh
-   /usr/bin/env -i /bin/sh scripts/bootstrap.sh install --source "$PWD" --commit <full sha>
+   /bin/sh scripts/bootstrap.sh install --source "$PWD" --commit <full sha>
    ```
 
    It checks Command Line Tools, the pinned toolchain, the staged tree and the build controls before any `cargo` process starts. It runs `cargo fetch --locked`, which needs network access, then builds offline, runs `self-check`, then installs `~/.local/bin/dotfiles-manager` through a `current` symlink. A failed build leaves no installed binary.
