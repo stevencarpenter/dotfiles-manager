@@ -106,7 +106,9 @@ esac
 
 /// `mise ls --installed --json <name>` answers a JSON array from `installed-mise` (one
 /// `<name> <version>` line per installed version); the table form is refused, as a stand-in for
-/// its truncated tool column. `mise install <name>` appends.
+/// its truncated tool column. `mise install <name>@<version>` appends; a bare name exits 1,
+/// as real mise installs only the configured version for one and none is configured under
+/// `MISE_NO_CONFIG=1`.
 const FAKE_MISE: &str = r#"#!/bin/sh
 PATH=/usr/bin:/bin:$PATH
 here=$(dirname "$0")
@@ -126,6 +128,7 @@ case "$1" in
     printf ']\n'
     exit 0 ;;
   install)
+    case "$2" in *@*) ;; *) echo "mise ERROR no version requested for $2" >&2; exit 1 ;; esac
     echo "${2%%@*}  2.0.0" >> "$db"; exit 0 ;;
   *) exit 64 ;;
 esac
@@ -340,7 +343,7 @@ fn missing_packages_are_installed_once_installed_ones_are_current_and_the_env_is
     assert!(out.contains("result: ok"), "{out}");
     assert!(
         fx.log()
-            .contains("mise install duckdb | yes=1 auto=false noconfig=1"),
+            .contains("mise install duckdb@latest | yes=1 auto=false noconfig=1"),
         "{}",
         fx.log()
     );

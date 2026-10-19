@@ -802,9 +802,17 @@ pub fn probe(runner: &Runner, adapter: &str, value: &Value) -> Result<PackageSta
     })
 }
 
-/// Installs one package through its provider. The caller probes again afterwards.
+/// Installs one package through its provider. The caller probes again afterwards. A mise tool
+/// is always sent with a selector, `<tool>@latest` for a bare name: `mise install <tool>`
+/// installs only the version mise's configuration requests, and `MISE_NO_CONFIG=1` hides that
+/// configuration.
 pub fn install(runner: &Runner, adapter: &str, value: &Value) -> Result<(), Refusal> {
     let pkg = name(value)?;
+    let pkg = if adapter == MISE {
+        mise_selector(&pkg)
+    } else {
+        pkg
+    };
     let (program, args, env) = match adapter {
         HOMEBREW => {
             // The same namespace pin as the probe: the install cannot resolve the short name
@@ -897,28 +905,23 @@ fn local_build(v: &str) -> bool {
         .any(|p| v.starts_with(p))
 }
 
+/// The `TOOL@VERSION` argument mise gets for a declared name: the declared `tool@version` as
+/// it is, `tool@latest` for a bare name.
+fn mise_selector(pkg: &str) -> String {
+    let (tool, want) = tool_and_version(pkg);
+    let want = if want.is_empty() { "latest" } else { want };
+    format!("{tool}@{want}")
+}
+
 /// Asks the provider for its newest version of a rolling tool and installs it beside the
-/// installed ones: `mise install <tool>@latest` for a bare name and `mise install <tool>@<prefix>`
-/// for a declared prefix (each resolves the newest matching version and is a no-op when it is
-/// installed; a bare name would install only what mise's configuration requests, which
-/// `MISE_NO_CONFIG=1` hides); `uv tool upgrade <name>` replaces the tool's one version. The
-/// caller probes again and compares the listing to decide `updated` or `current`. Neither
-/// removes a version.
+/// installed ones: for mise the install itself (`mise install <tool>@latest` or
+/// `<tool>@<prefix>` resolves the newest matching version and is a no-op when it is
+/// installed); `uv tool upgrade <name>` replaces the tool's one version. The caller probes
+/// again and compares the listing to decide `updated` or `current`. Neither removes a version.
 pub fn upgrade(runner: &Runner, adapter: &str, value: &Value) -> Result<(), Refusal> {
     let pkg = name(value)?;
     match adapter {
-        MISE => {
-            let (tool, want) = tool_and_version(&pkg);
-            let want = if want.is_empty() { "latest" } else { want };
-            let selector = format!("{tool}@{want}");
-            change(
-                runner,
-                "mise",
-                &["install".to_string(), selector.clone()],
-                &mise_env(),
-                &format!("mise install {selector}"),
-            )
-        }
+        MISE => install(runner, adapter, value),
         UV_TOOL => {
             let args = ["tool".to_string(), "upgrade".into(), pkg.clone()];
             change(
@@ -1137,6 +1140,14 @@ mod tests {
         assert!(uv_receipt_source(&home, "agent-reap").is_err());
         assert!(uv_receipt_source(&home, "absent").is_err());
         std::fs::remove_dir_all(&home).unwrap();
+    }
+
+    #[test]
+    fn a_mise_install_always_names_a_version() {
+        assert_eq!(mise_selector("duckdb"), "duckdb@latest");
+        assert_eq!(mise_selector("go@1.27"), "go@1.27");
+        assert_eq!(mise_selector("npm:@scope/pkg"), "npm:@scope/pkg@latest");
+        assert_eq!(mise_selector("npm:@scope/pkg@1.2"), "npm:@scope/pkg@1.2");
     }
 
     #[test]
