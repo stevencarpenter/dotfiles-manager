@@ -549,14 +549,19 @@ fn canonical_root(binding: &Binding, root: &Path) -> Result<(PathBuf, String), R
     Ok((root, rel))
 }
 
-/// Resolves the bound profile against `root` without comparing it to this machine. Read-only.
-fn load_resolved_any_machine(ctx: &Ctx, root: &Path) -> Result<Loaded, Refusal> {
-    let binding = read_existing_binding(ctx)?.ok_or_else(|| {
+/// The binding of this machine; an unbound machine is refused.
+fn require_binding(ctx: &Ctx) -> Result<Binding, Refusal> {
+    read_existing_binding(ctx)?.ok_or_else(|| {
         Refusal::new(
             Code::BindingInvalid,
             "this machine is not bound; run bind first",
         )
-    })?;
+    })
+}
+
+/// Resolves the bound profile against `root` without comparing it to this machine. Read-only.
+fn load_resolved_any_machine(ctx: &Ctx, root: &Path) -> Result<Loaded, Refusal> {
+    let binding = require_binding(ctx)?;
     let (root, rel) = canonical_root(&binding, root)?;
     let sources = load_scoped(&root, &rel)?;
     let resolved = resolve(&sources, &rel, &builtin_catalog())?;

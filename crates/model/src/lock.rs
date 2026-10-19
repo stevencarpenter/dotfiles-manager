@@ -66,10 +66,22 @@ impl LockSource {
     }
 }
 
-/// The `[[sources]]` of a lock, root source first, then nested sources by path.
+/// The `[[sources]]` of a lock: the root source, then the nested sources by path.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Lock {
-    pub sources: Vec<LockSource>,
+    sources: Vec<LockSource>,
+}
+
+impl Lock {
+    /// The root (tracking) source, or `None` when the lock declares no source.
+    pub fn root(&self) -> Option<&LockSource> {
+        self.sources.first()
+    }
+
+    /// The nested (exact) sources, by path.
+    pub fn nested(&self) -> &[LockSource] {
+        self.sources.get(1..).unwrap_or_default()
+    }
 }
 
 fn hex40(s: &str) -> bool {
@@ -118,7 +130,14 @@ pub fn valid_path(p: &str) -> bool {
 /// except `git` for `ssh`, an absolute path with no trailing `/`, no `.git` suffix, no query
 /// and no fragment. Anything else is `E_SOURCE_UNTRUSTED`.
 pub fn check_origin(origin: &str, allow_file: bool) -> Result<(), Refusal> {
-    let bad = |why: &str| untrusted(format!("origin {origin:?} is not canonical: {why}"));
+    // A refused origin is printed with its userinfo masked: a lock from a source could carry a
+    // token there, and the message reaches the terminal.
+    let bad = |why: &str| {
+        untrusted(format!(
+            "origin {:?} is not canonical: {why}",
+            mask_userinfo(origin)
+        ))
+    };
     if !origin.bytes().all(|b| b.is_ascii_graphic()) {
         return Err(bad("only printable ASCII is allowed"));
     }
@@ -146,6 +165,7 @@ pub fn check_origin(origin: &str, allow_file: bool) -> Result<(), Refusal> {
         };
         let (name, port) = host.split_once(':').unwrap_or((host, ""));
         if name.is_empty()
+            || name.starts_with('-')
             || !name
                 .bytes()
                 .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'.' || b == b'-')
@@ -169,6 +189,19 @@ pub fn check_origin(origin: &str, allow_file: bool) -> Result<(), Refusal> {
         return Err(bad("no .. component"));
     }
     Ok(())
+}
+
+/// `origin` with any userinfo (the text between `://` and `@` before the first `/`) replaced by
+/// `[redacted]`.
+fn mask_userinfo(origin: &str) -> String {
+    let Some((scheme, rest)) = origin.split_once("://") else {
+        return origin.to_string();
+    };
+    let authority_end = rest.find('/').unwrap_or(rest.len());
+    match rest[..authority_end].rfind('@') {
+        Some(at) => format!("{scheme}://[redacted]{}", &rest[at..]),
+        None => origin.to_string(),
+    }
 }
 
 impl Lock {
@@ -330,7 +363,8 @@ ref = "refs/heads/main"
     #[test]
     fn a_lock_without_sources_is_valid_and_empty() {
         let l = Lock::parse(b"[manager]\ntoolchain = \"1.98.1\"\n", false).unwrap();
-        assert!(l.sources.is_empty());
+        assert!(l.root().is_none());
+        assert!(l.nested().is_empty());
     }
 
     #[test]
@@ -340,9 +374,9 @@ ref = "refs/heads/main"
             "a".repeat(40)
         );
         let l = Lock::parse(text.as_bytes(), false).unwrap();
-        assert_eq!(l.sources[0].id, "root");
-        assert!(l.sources[0].is_root());
-        assert_eq!(l.sources[1].path, "base/ext");
+        assert_eq!(l.root().unwrap().id, "root");
+        assert!(l.root().unwrap().is_root());
+        assert_eq!(l.nested()[0].path, "base/ext");
 
         let pinned_root = format!("{ROOT}commit = \"{}\"\n", "b".repeat(40));
         let e = Lock::parse(pinned_root.as_bytes(), false).unwrap_err();
@@ -364,6 +398,7 @@ ref = "refs/heads/main"
             "https://user@example.invalid/org/repo",
             "https://example.invalid/org/repo?x=1",
             "git@example.invalid:org/repo",
+            "https://-example.invalid/org/repo",
             "http://example.invalid/org/repo",
             "file:///tmp/repo",
         ] {
@@ -373,6 +408,13 @@ ref = "refs/heads/main"
                 "{bad}"
             );
         }
+        let e = check_origin("https://user:token@example.invalid/org/repo", false).unwrap_err();
+        assert!(!e.detail.contains("token"), "{e}");
+        assert!(
+            e.detail
+                .contains("https://[redacted]@example.invalid/org/repo"),
+            "{e}"
+        );
         check_origin("https://example.invalid/org/repo", false).unwrap();
         check_origin("ssh://git@example.invalid:2222/org/repo", false).unwrap();
         check_origin("file:///tmp/repo", true).unwrap();

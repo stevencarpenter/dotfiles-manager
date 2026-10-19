@@ -13,23 +13,21 @@ use crate::plan_cmd::{plan_for, render};
 use crate::read_fs::read_regular_bounded;
 use crate::source_fs::load_scoped;
 use crate::{
-    Ctx, Loaded, apply_cmd, builtin_catalog, canonical_root, read_existing_binding, state_cmd,
-    usage,
+    Ctx, Loaded, apply_cmd, builtin_catalog, canonical_root, require_binding, state_cmd, usage,
 };
-use dfm_engine::{
-    End, ProcRequest, Runner, Store, Sys, check_allowances, check_journal_capacity, gates, now_ns,
-};
+use dfm_engine::{Dir, End, Lock as FileLock, ProcRequest, Runner, Store, Sys, now_ns};
 use dfm_model::binding::Binding;
-use dfm_model::display::{visible, visible_for_paste};
+use dfm_model::digest::sha256_hex;
+use dfm_model::display::visible;
 use dfm_model::lock::{Grants, Lock, LockSource, MAX_BYTES as LOCK_MAX_BYTES, check_origin};
 use dfm_model::plan::{Plan, Scope};
 use dfm_model::resolve::resolve;
-use dfm_model::state::rfc3339;
+use dfm_model::state::{self, Class, JournalEntry, Phase, Recovery, rfc3339};
 use dfm_model::{Code, Refusal};
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::Write;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -81,6 +79,13 @@ pub fn parse_args(args: &[String]) -> Result<Args, Refusal> {
     if apply.preview && !trust.is_empty() {
         return Err(usage(
             "--preview writes nothing, so it cannot grant an origin; run sync --trust-origin without --preview",
+        ));
+    }
+    // One command never both widens trust and publishes: the grant is reviewed first, then the
+    // plan it allows (section 8: --yes-plan can never grant a new origin).
+    if apply.yes_plan.is_some() && !trust.is_empty() {
+        return Err(usage(
+            "--trust-origin cannot be combined with --yes-plan; grant first, review the plan, then approve it",
         ));
     }
     Ok(Args { apply, trust })
@@ -214,36 +219,100 @@ impl Git {
 
 // ---- staging --------------------------------------------------------------------------------
 
-/// A per-run staging directory under the cache directory, `<pid>-<start>`, removed on drop.
-struct Staging(PathBuf);
+/// A directory the manager owns: created with mode 0700 when missing; an existing one must be a
+/// real directory (not a link) owned by the current user, and is set to 0700 again (the rule
+/// of the runner's working directory).
+fn ensure_private_dir(dir: &Path, uid: u32) -> Result<(), Refusal> {
+    let e = |e: std::io::Error| io_failed("staging directory", &e);
+    match fs::symlink_metadata(dir) {
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            fs::create_dir_all(dir).map_err(e)?;
+        }
+        Err(err) => return Err(e(err)),
+        Ok(m) if !m.is_dir() => {
+            return Err(conflict(format!(
+                "{} is not a plain directory",
+                dir.display()
+            )));
+        }
+        Ok(m) if m.uid() != uid => {
+            return Err(conflict(format!(
+                "{} is owned by another user",
+                dir.display()
+            )));
+        }
+        Ok(_) => {}
+    }
+    fs::set_permissions(dir, fs::Permissions::from_mode(0o700)).map_err(e)
+}
+
+/// A per-run staging directory under the cache directory, `<pid>-<start>`, removed on drop. A
+/// lock file inside it is held for the run's lifetime: the kernel releases it when the process
+/// dies, so the next run can tell a dead run's directory from a live one and remove it.
+struct Staging {
+    dir: PathBuf,
+    _held: FileLock,
+}
+
+const STAGING_LOCK: &str = "lock";
 
 impl Staging {
-    fn create(ctx: &Ctx) -> Result<Staging, Refusal> {
+    fn create(ctx: &Ctx, sys: &Sys) -> Result<Staging, Refusal> {
         let root = ctx.platform.cache_dir().join("staging");
-        let e = |e: std::io::Error| io_failed("staging directory", &e);
-        fs::create_dir_all(&root).map_err(e)?;
-        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).map_err(e)?;
+        ensure_private_dir(&ctx.platform.cache_dir(), sys.uid)?;
+        ensure_private_dir(&root, sys.uid)?;
+        Self::sweep(&root, sys);
         let dir = root.join(format!("{}-{}", std::process::id(), now_ns()?));
-        fs::create_dir(&dir).map_err(e)?;
-        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).map_err(e)?;
-        Ok(Staging(dir))
+        ensure_private_dir(&dir, sys.uid)?;
+        let held = FileLock::acquire(sys, &Dir::open_plain(&dir)?, STAGING_LOCK)?;
+        Ok(Staging { dir, _held: held })
+    }
+
+    /// Removes the staging directories of runs that are gone (section 10 item 4): an entry named
+    /// `<pid>-<start>`, a real directory owned by the current user, whose lock file nobody
+    /// holds. An entry that cannot be classified, or whose lock is held, is skipped.
+    fn sweep(root: &Path, sys: &Sys) {
+        let Ok(entries) = fs::read_dir(root) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let stale_name = name.split_once('-').is_some_and(|(p, s)| {
+                !p.is_empty()
+                    && !s.is_empty()
+                    && p.bytes().chain(s.bytes()).all(|b| b.is_ascii_digit())
+            });
+            let Ok(m) = fs::symlink_metadata(entry.path()) else {
+                continue;
+            };
+            if !stale_name || !m.is_dir() || m.uid() != sys.uid {
+                continue;
+            }
+            let Ok(dir) = Dir::open_plain(&entry.path()) else {
+                continue;
+            };
+            // Acquiring the lock proves no live run holds this directory.
+            if FileLock::acquire(sys, &dir, STAGING_LOCK).is_ok() {
+                let _ = fs::remove_dir_all(entry.path());
+            }
+        }
     }
 
     /// The staged root checkout; nested sources are checked out at their path inside it.
     fn tree(&self) -> PathBuf {
-        self.0.join("tree")
+        self.dir.join("tree")
     }
 }
 
 impl Drop for Staging {
     fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
+        let _ = fs::remove_dir_all(&self.dir);
     }
 }
 
 /// One declared source, rehearsed in the staged copy, beside the checkout it is published into.
-struct Staged<'a> {
-    src: &'a LockSource,
+struct Staged {
+    src: LockSource,
     /// The staged copy of the checkout, now at `new`.
     repo: PathBuf,
     /// The checkout under `--root` the source is published into.
@@ -255,7 +324,7 @@ struct Staged<'a> {
     new: String,
 }
 
-impl Staged<'_> {
+impl Staged {
     fn change(&self) -> String {
         match &self.old {
             None => format!("new checkout at {}", self.new),
@@ -289,7 +358,7 @@ fn read_lock(root: &Path) -> Result<Lock, Refusal> {
         },
     )?;
     let lock = Lock::parse(&bytes, cfg!(feature = "test-isolation"))?;
-    if lock.sources.is_empty() {
+    if lock.root().is_none() {
         return Err(Refusal::new(
             Code::ManifestInvalid,
             format!(
@@ -299,7 +368,11 @@ fn read_lock(root: &Path) -> Result<Lock, Refusal> {
     }
     // shortcut: the lock's tree digest is not recomputed from the staged checkout; compare it
     // against a clean export of the pinned commit once update writes locks.
-    if let Some(s) = lock.sources.iter().find(|s| s.tree.is_some()) {
+    if let Some(s) = std::iter::once(lock.root())
+        .flatten()
+        .chain(lock.nested())
+        .find(|s| s.tree.is_some())
+    {
         return Err(Refusal::new(
             Code::ManifestInvalid,
             format!(
@@ -321,7 +394,6 @@ fn copy_checkout(from: &Path, to: &Path) -> Result<(), Refusal> {
     fn go(from: &Path, to: &Path, in_git: bool, seen: &mut usize) -> Result<(), Refusal> {
         let e = |e: std::io::Error| io_failed("copy the checkout into staging", &e);
         fs::create_dir(to).map_err(e)?;
-        fs::set_permissions(to, fs::symlink_metadata(from).map_err(e)?.permissions()).map_err(e)?;
         for entry in fs::read_dir(from).map_err(e)? {
             let entry = entry.map_err(e)?;
             *seen += 1;
@@ -348,7 +420,8 @@ fn copy_checkout(from: &Path, to: &Path) -> Result<(), Refusal> {
                 )));
             }
         }
-        Ok(())
+        // The mode goes on last: a read-only directory must still take its children.
+        fs::set_permissions(to, fs::symlink_metadata(from).map_err(e)?.permissions()).map_err(e)
     }
     let mut seen = 0;
     go(from, to, false, &mut seen)
@@ -517,12 +590,12 @@ fn advance(
 /// Rehearses one source in the staged copy: fetches its ref from the origin, decides the commit
 /// to publish, and fast-forwards the copy to it. The copy holds the user's local state, so what
 /// git accepts here is what it will accept at publication.
-fn stage_source<'a>(
+fn stage_source(
     git: &Git,
-    src: &'a LockSource,
+    src: &LockSource,
     repo: PathBuf,
     live: PathBuf,
-) -> Result<Staged<'a>, Refusal> {
+) -> Result<Staged, Refusal> {
     let id = src.id.as_str();
     let repo_s = path_str(&repo)?.to_string();
     let old = head_of(git, &repo)?;
@@ -603,7 +676,7 @@ fn stage_source<'a>(
         advance(git, id, &repo_s, old.as_deref(), &new, None)?;
     }
     Ok(Staged {
-        src,
+        src: src.clone(),
         repo,
         live,
         old,
@@ -644,15 +717,14 @@ fn check_nested_path(base: &Path, path: &str) -> Result<(), Refusal> {
 
 /// Copies the checkout into staging and rehearses every source there: the root first, from the
 /// lock at `root`; then the nested sources that the fetched root's lock declares, each origin
-/// checked against the grants before its fetch. Returns the fetched lock and the staged sources.
-fn stage_all<'a>(
+/// checked against the grants before its fetch. Returns the staged sources, root first.
+fn stage_all(
     git: &Git,
-    live_lock: &Lock,
+    root_src: &LockSource,
     grants: &Grants,
     root: &Path,
     tree: &Path,
-    locks: &'a mut Option<Lock>,
-) -> Result<Vec<Staged<'a>>, Refusal> {
+) -> Result<Vec<Staged>, Refusal> {
     // A checkout that holds the cache directory (a HOME that is itself the checkout) would be
     // copied into itself.
     if tree.starts_with(root) {
@@ -662,22 +734,19 @@ fn stage_all<'a>(
         )));
     }
     copy_checkout(root, tree)?;
-    let root_src = &live_lock.sources[0];
     let staged_root = stage_source(git, root_src, tree.to_path_buf(), root.to_path_buf())?;
     let fetched = read_lock(tree)?;
-    if fetched.sources[0].origin != root_src.origin
-        || fetched.sources[0].reference != root_src.reference
-    {
+    let fetched_root = fetched
+        .root()
+        .ok_or_else(|| untrusted(format!("the fetched {LOCK_FILE} declares no root source")))?;
+    if fetched_root.origin != root_src.origin || fetched_root.reference != root_src.reference {
         return Err(untrusted(format!(
             "the fetched {LOCK_FILE} names {} {} for the root checkout, not the {} {} this checkout declares; a source may not redirect itself. Fix: change the checkout's lock yourself if the move is intended",
-            fetched.sources[0].origin,
-            fetched.sources[0].reference,
-            root_src.origin,
-            root_src.reference
+            fetched_root.origin, fetched_root.reference, root_src.origin, root_src.reference
         )));
     }
     let untrusted_origins: Vec<&str> = fetched
-        .sources
+        .nested()
         .iter()
         .filter(|s| !grants.trusts(&s.origin))
         .map(|s| s.origin.as_str())
@@ -685,12 +754,11 @@ fn stage_all<'a>(
     if !untrusted_origins.is_empty() {
         return Err(untrusted_refusal(&untrusted_origins));
     }
-    let fetched = locks.insert(fetched);
     let mut staged = vec![Staged {
-        src: &fetched.sources[0],
+        src: fetched_root.clone(),
         ..staged_root
     }];
-    for src in fetched.sources.iter().skip(1) {
+    for src in fetched.nested() {
         check_nested_path(root, &src.path)?;
         check_nested_path(tree, &src.path)?;
         staged.push(stage_source(
@@ -701,6 +769,55 @@ fn stage_all<'a>(
         )?);
     }
     Ok(staged)
+}
+
+/// The digest the owner approves: the configuration plan's digest and, per source, what moves
+/// from where to where. The plan digest covers the loaded source tree, not the commits behind
+/// it, so a commit that changes only files outside the scoped roots would otherwise pass.
+fn sync_digest(plan_digest: &str, staged: &[Staged]) -> String {
+    let mut text = format!("plan {plan_digest}\n");
+    for s in staged {
+        text.push_str(&format!(
+            "source {} {} {} {} {}\n",
+            s.src.id,
+            s.src.origin,
+            s.src.reference,
+            s.old.as_deref().unwrap_or("none"),
+            s.new
+        ));
+    }
+    sha256_hex(text.as_bytes())
+}
+
+/// Records one grant in the journal around its write (section 10, "Mixed results"): a
+/// `grant-origin` intent, the rewrite of `grants.json`, then its `done` entry. A run that dies
+/// in between leaves the intent open, which `doctor` and `state recover` report.
+fn grant_journaled(
+    store: &Store,
+    grants: &Grants,
+    origin: &str,
+    id: &str,
+    at: &str,
+) -> Result<(), Refusal> {
+    let entry = |phase: Phase| JournalEntry {
+        schema: state::SCHEMA,
+        op_id: id.to_string(),
+        op: "grant-origin".into(),
+        phase,
+        at: at.to_string(),
+        resource: origin.to_string(),
+        adapter: "sync".into(),
+        class: Class::Normal,
+        recovery: (phase == Phase::Intent).then(|| Recovery {
+            outputs: Vec::new(),
+            snapshot: None,
+        }),
+        token: None,
+        reason: Some(format!("grant origin {origin}")),
+    };
+    store.append_journal(&entry(Phase::Intent))?;
+    store.write_grants(grants)?;
+    store.append_journal(&entry(Phase::Done))
 }
 
 /// Resolves and plans the staged tree as the tree `root` will hold after publication: the
@@ -730,7 +847,7 @@ fn plan_staged(
 
 /// Publishes one staged source into its checkout exactly as the rehearsal moved the copy, after
 /// rechecking that the checkout is where the copy saw it. `Ok(true)` when the checkout changed.
-fn publish(git: &Git, s: &Staged<'_>) -> Result<bool, Refusal> {
+fn publish(git: &Git, s: &Staged) -> Result<bool, Refusal> {
     let id = s.src.id.as_str();
     let (repo_s, live_s) = (path_str(&s.repo)?, path_str(&s.live)?);
     let now = head_of(git, &s.live)?;
@@ -786,21 +903,19 @@ fn run_inner(
 ) -> Result<(), Refusal> {
     let w =
         |e: std::io::Error| Refusal::new(Code::IoFailed, format!("output failed: {}", e.kind()));
-    let binding = read_existing_binding(ctx)?.ok_or_else(|| {
-        Refusal::new(
-            Code::BindingInvalid,
-            "this machine is not bound; run bind first",
-        )
-    })?;
+    let binding = require_binding(ctx)?;
     let (root, rel) = canonical_root(&binding, Path::new(&args.apply.root))?;
     let (layout, sys) = (ctx.layout(), ctx.sys()?);
     if let Some(i) = &ctx.isolated {
         writeln!(out, "isolated: true {i}").map_err(w)?;
     }
     let live_lock = read_lock(&root)?;
+    let root_src = live_lock
+        .root()
+        .ok_or_else(|| untrusted(format!("{LOCK_FILE} declares no root source")))?;
 
     // Trust first, before any fetch (section 8, "Trust grant"). A grant is written only for an
-    // origin the owner names on the command line, under the writer lock.
+    // origin the owner names on the command line, under the writer lock and journaled.
     let readable = Store::open_read(sys, &layout, state_cmd::fail_from_env()?)?
         .ok_or_else(crate::state_lost_refusal)?;
     readable.require_identity(&binding)?;
@@ -817,33 +932,31 @@ fn run_inner(
         store.require_identity(&binding)?;
         let at = rfc3339(now_ns()?);
         for o in &args.trust {
+            if grants.trusts(o) {
+                writeln!(out, "granted: {o} (already)").map_err(w)?;
+                continue;
+            }
             let id = grants.grant(o, &at);
+            // shortcut: the grant reaches the journal and grants.json, not a receipt field;
+            // origin_grants[] in the receipt waits for the sync receipt of DFM-31.
+            grant_journaled(&store, &grants, o, &id, &at)?;
             writeln!(out, "granted: {o} {id}").map_err(w)?;
         }
-        // shortcut: no grant-intent journal entry or receipt record of the grant, until doctor's
-        // GRANT_UNRECEIPTED finding exists to read them.
-        store.write_grants(&grants)?;
     }
     // The root origin is checked here; the nested origins, which the fetched root's lock
     // declares, are checked after the root fetch and before their own.
-    let root_origin = live_lock.sources[0].origin.as_str();
-    if !grants.trusts(root_origin) {
-        return Err(untrusted_refusal(&[root_origin]));
+    if !grants.trusts(&root_src.origin) {
+        return Err(untrusted_refusal(&[root_src.origin.as_str()]));
     }
 
+    // The review pass holds the shared lock while its staging directory exists (section 10
+    // item 4), so a writer that starts meanwhile is refused and no writer sweeps this run.
+    let shared = Store::probe_writer(&sys, &layout)?;
     // Copy the checkout into staging, rehearse the fetch and fast-forward there, then plan the
     // staged tree as the tree --root will hold.
     let git = Git::new(ctx, &sys);
-    let staging = Staging::create(ctx)?;
-    let mut fetched = None;
-    let previewed = stage_all(
-        &git,
-        &live_lock,
-        &grants,
-        &root,
-        &staging.tree(),
-        &mut fetched,
-    )?;
+    let staging = Staging::create(ctx, &sys)?;
+    let previewed = stage_all(&git, root_src, &grants, &root, &staging.tree())?;
     for s in &previewed {
         writeln!(
             out,
@@ -857,44 +970,33 @@ fn run_inner(
         .map_err(w)?;
     }
     let (loaded, plan) = plan_staged(ctx, &binding, &root, &rel, &staging.tree())?;
-    let digest = plan.digest()?;
+    let plan_digest = plan.digest()?;
+    let digest = sync_digest(&plan_digest, &previewed);
     // With an approval the apply below prints the plan it runs; otherwise this is the review.
+    // The digest shown, and the one --yes-plan takes, is the sync digest.
     let applying = args.apply.yes_plan.is_some() && !args.apply.preview;
     if !applying {
         render(&plan, &digest, out).map_err(w)?;
         *plan_printed = true;
     }
-    if let Some(approved) = &args.apply.yes_plan
-        && *approved != digest
-    {
-        return Err(stale(approved, &digest));
-    }
-    if let Some(b) = plan.blockers.first() {
-        return Err(b.refusal());
-    }
-    // The gates that need no write, as apply runs them (docs/apply.md), so a plan that apply
-    // would refuse is refused here before any source is published.
-    let g = gates(&plan, &Generators::new(&loaded.resolved));
-    if let Some(r) = g.refusal {
-        return Err(r);
-    }
-    if let Err(all) = check_allowances(&g, &args.apply.allow, &args.apply.allow_adopt) {
-        for e in all.iter().filter(|e| e.code != Code::Usage) {
-            writeln!(out, "{}", visible_for_paste(&e.detail)).map_err(w)?;
-        }
-        return Err(all
-            .into_iter()
-            .next()
-            .unwrap_or_else(|| usage("approval check failed")));
-    }
-    let readable = Store::open_read(sys, &layout, state_cmd::fail_from_env()?)?
-        .ok_or_else(crate::state_lost_refusal)?;
-    check_journal_capacity(
-        readable.journal_len()?,
-        readable.settlement_entries()?,
+    // The checks apply runs before its lock (docs/apply.md), against the sync digest, so a plan
+    // that apply would refuse is refused here before any source is published.
+    let before_lock = apply_cmd::Args {
+        root: args.apply.root.clone(),
+        yes_plan: args.apply.yes_plan.clone(),
+        allow: args.apply.allow.clone(),
+        allow_adopt: args.apply.allow_adopt.clone(),
+        preview: args.apply.preview,
+        scope: Scope::Config,
+    };
+    apply_cmd::check_before_lock(
+        ctx,
+        &before_lock,
         &plan,
+        &digest,
+        &Generators::new(&loaded.resolved),
+        out,
     )?;
-    drop(readable);
     if args.apply.preview {
         return Ok(());
     }
@@ -906,6 +1008,8 @@ fn run_inner(
             ),
         ));
     };
+    drop(staging);
+    drop(shared);
 
     // Publication under the lock: fetch and plan again, so the sources and the checkouts are
     // rechecked immediately before anything is published, then fast-forward each checkout.
@@ -914,24 +1018,16 @@ fn run_inner(
         return Err(crate::state_lost_refusal());
     }
     store.require_identity(&binding)?;
-    let second = Staging::create(ctx)?;
-    let mut fetched = None;
-    let staged = stage_all(
-        &git,
-        &live_lock,
-        &grants,
-        &root,
-        &second.tree(),
-        &mut fetched,
-    )?;
+    let second = Staging::create(ctx, &sys)?;
+    let staged = stage_all(&git, root_src, &grants, &root, &second.tree())?;
     let (_, locked) = plan_staged(ctx, &binding, &root, &rel, &second.tree())?;
-    let locked_digest = locked.digest()?;
+    let locked_plan_digest = locked.digest()?;
+    let locked_digest = sync_digest(&locked_plan_digest, &staged);
     if locked_digest != digest {
-        return Err(stale(approved, &locked_digest));
+        return Err(apply_cmd::stale(approved, &locked_digest));
     }
-    // The approval is bound to the commits, not only to the tree they produce: every source
-    // must still move from and to what the reviewed run showed.
-    let moved = |s: &Staged<'_>| (s.src.id.clone(), s.old.clone(), s.new.clone());
+    // The digest already binds the commits; this is the same check in process, as a guard.
+    let moved = |s: &Staged| (s.src.id.clone(), s.old.clone(), s.new.clone());
     if staged.len() != previewed.len()
         || staged
             .iter()
@@ -967,12 +1063,16 @@ fn run_inner(
         }
     }
     drop(second);
-    drop(staging);
     drop(store);
 
-    // Apply once with the approved digest: apply plans --root (now the published tree), compares
-    // it to the approved digest, takes the lock, plans again and runs (docs/apply.md).
-    match apply_cmd::run(ctx, &args.apply, out) {
+    // Apply once with the configuration plan's digest, which the sync digest covers: apply
+    // plans --root (now the published tree), compares, takes the lock, plans again and runs
+    // (docs/apply.md).
+    let apply_args = apply_cmd::Args {
+        yes_plan: Some(locked_plan_digest),
+        ..before_lock
+    };
+    match apply_cmd::run(ctx, &apply_args, out) {
         Ok(()) => Ok(()),
         Err(e) if published.is_empty() => Err(e),
         Err(e) => {
@@ -999,15 +1099,6 @@ fn untrusted_refusal(origins: &[&str]) -> Refusal {
     ))
 }
 
-fn stale(approved: &str, now: &str) -> Refusal {
-    Refusal::new(
-        Code::PlanStale,
-        format!(
-            "the approved plan digest {approved} is not the digest of the plan for the fetched sources now ({now}). Fix: read the new plan with --preview and approve its digest"
-        ),
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1018,6 +1109,18 @@ mod tests {
             .iter()
             .map(|s| s.to_string())
             .collect();
+        assert_eq!(parse_args(&args).err().map(|e| e.code), Some(Code::Usage));
+        let args: Vec<String> = [
+            "--root",
+            "/r",
+            "--yes-plan",
+            &"0".repeat(64),
+            "--trust-origin",
+            "https://h/x",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
         assert_eq!(parse_args(&args).err().map(|e| e.code), Some(Code::Usage));
         let args: Vec<String> = ["--root", "/r", "--trust-origin", "https://h/x"]
             .iter()

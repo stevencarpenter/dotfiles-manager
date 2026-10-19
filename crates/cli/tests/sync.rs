@@ -133,6 +133,27 @@ impl Remote {
     fn head(&self) -> String {
         git(&self.bare, &["rev-parse", "refs/heads/main"])
     }
+
+    /// Rewrites the head commit without changing its tree and force-pushes it: a new commit
+    /// identity over the same content (a new message, since the same second would reproduce
+    /// the same commit).
+    fn amend(&self) -> String {
+        git(
+            &self.seed,
+            &[
+                "commit",
+                "-q",
+                "--amend",
+                "-m",
+                "amended: same tree, new commit",
+            ],
+        );
+        git(
+            &self.seed,
+            &["push", "-q", "-f", "origin", "HEAD:refs/heads/main"],
+        );
+        git(&self.seed, &["rev-parse", "HEAD"])
+    }
 }
 
 struct Fx {
@@ -273,6 +294,11 @@ impl Fx {
             .unwrap_or_default()
     }
 
+    fn journal(&self) -> String {
+        fs::read_to_string(self.h(".local/state/dotfiles-manager/state/journal.jsonl"))
+            .unwrap_or_default()
+    }
+
     /// Adds a nested remote `ext` with the `work` module, pins it in the lock at its head, and
     /// makes the bundle exclude its `.git`. Returns the remote and the pinned commit.
     fn add_ext(&self) -> (Remote, String) {
@@ -351,6 +377,17 @@ fn an_untrusted_origin_is_refused_before_any_fetch_and_a_grant_is_explicit() {
     ]);
     assert_eq!(code(&o), 3, "{}", stderr(&o));
     assert!(stderr(&o).contains("E_SOURCE_UNTRUSTED"), "{}", stderr(&o));
+    let o = fx.run(&[
+        "sync",
+        "--root",
+        fx.root_arg(),
+        "--yes-plan",
+        &"0".repeat(64),
+        "--trust-origin",
+        &fx.origin(),
+    ]);
+    assert_eq!(code(&o), 2, "{}", stderr(&o));
+    assert!(fx.grants().is_empty());
     // An origin that is not canonical cannot be granted.
     let o = fx.run(&[
         "sync",
@@ -362,9 +399,27 @@ fn an_untrusted_origin_is_refused_before_any_fetch_and_a_grant_is_explicit() {
     assert_eq!(code(&o), 3, "{}", stderr(&o));
     assert!(stderr(&o).contains("not canonical"), "{}", stderr(&o));
     assert!(fx.grants().is_empty());
-    // The explicit grant is written under the lock, then the fetch and the plan happen.
+    // The explicit grant is written under the lock and journaled (intent, then done), then the
+    // fetch and the plan happen.
     fx.trust(&fx.origin());
     assert!(fx.grants().contains(&fx.origin()), "{}", fx.grants());
+    let j = fx.journal();
+    assert_eq!(j.matches("\"op\":\"grant-origin\"").count(), 2, "{j}");
+    assert!(
+        j.contains("\"phase\":\"intent\"") && j.contains("\"phase\":\"done\""),
+        "{j}"
+    );
+    assert!(j.contains(&fx.origin()), "{j}");
+    // Granting again writes nothing more.
+    let o = fx.run(&[
+        "sync",
+        "--root",
+        fx.root_arg(),
+        "--trust-origin",
+        &fx.origin(),
+    ]);
+    assert!(stdout(&o).contains("(already)"), "{}", stdout(&o));
+    assert_eq!(fx.journal(), j);
     let o = fx.preview();
     assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
     assert!(
@@ -923,4 +978,55 @@ fn a_worktree_checkout_or_a_redirected_work_tree_is_refused() {
     assert_eq!(code(&o), 3, "{}\n{}", stdout(&o), stderr(&o));
     assert!(stderr(&o).contains("E_SOURCE_UNTRUSTED"), "{}", stderr(&o));
     assert!(stderr(&o).contains("plain checkout"), "{}", stderr(&o));
+}
+
+#[test]
+fn a_new_commit_over_the_same_tree_between_preview_and_approval_is_stale() {
+    let fx = Fx::new();
+    let old = fx.head();
+    put(
+        &fx.upstream.seed,
+        "base/modules/extra/files/zshrc",
+        "export A=3\n",
+    );
+    fx.upstream.push("first");
+    let p = fx.preview();
+    assert_eq!(code(&p), 0, "{}\n{}", stdout(&p), stderr(&p));
+    // Same tree, new commit: the plan is unchanged and the approval still does not cover it.
+    let shown = stdout(&p)
+        .lines()
+        .find(|l| l.starts_with("source: src0 "))
+        .and_then(|l| l.split("..").nth(1))
+        .map(|s| s.split(' ').next().unwrap().to_string())
+        .unwrap();
+    let amended = fx.upstream.amend();
+    assert_ne!(amended, shown, "the amend reproduced the commit");
+    let o = fx.sync(&digest_of(&p));
+    assert_eq!(code(&o), 3, "{}\n{}", stdout(&o), stderr(&o));
+    assert!(stderr(&o).contains("E_PLAN_STALE"), "{}", stderr(&o));
+    assert_eq!(fx.head(), old);
+    assert_ne!(fx.head(), amended);
+    assert!(!fx.h(".zshrc").exists());
+    // A fresh preview carries the new commit and syncs.
+    let o = fx.sync_approved();
+    assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
+    assert_eq!(fx.head(), amended);
+}
+
+#[test]
+fn a_dead_run_s_staging_directory_is_removed_by_the_next_run() {
+    let fx = Fx::new();
+    let dead = fx.staging().join("4000000-1");
+    fs::create_dir_all(dead.join("tree")).unwrap();
+    fs::write(dead.join("tree/secret.txt"), "left behind\n").unwrap();
+    let foreign = fx.staging().join("notes");
+    fs::create_dir_all(&foreign).unwrap();
+    let o = fx.preview();
+    assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
+    assert!(!dead.exists(), "the dead run's staging directory stayed");
+    assert!(
+        foreign.exists(),
+        "an entry that is not a staging directory was removed"
+    );
+    assert_eq!(fx.staging_leftovers(), ["notes"]);
 }
