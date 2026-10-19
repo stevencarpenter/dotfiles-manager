@@ -38,8 +38,11 @@ const FETCH_TIMEOUT: Duration = Duration::from_secs(600);
 const LOCAL_TIMEOUT: Duration = Duration::from_secs(60);
 const MAX_STDOUT: usize = 16 << 20;
 /// Settings every git call carries (section 8): no hooks, no fsmonitor, objects checked on
-/// fetch, no replacement refs, no line-ending rewrite.
-const GIT_SETTINGS: [&str; 12] = [
+/// fetch, no replacement refs, no line-ending rewrite, and no HTTP redirect: a redirect would
+/// send the request to a host the grant never named, so the fetch fails instead.
+const GIT_SETTINGS: [&str; 14] = [
+    "-c",
+    "http.followRedirects=false",
     "-c",
     "core.hooksPath=/dev/null",
     "-c",
