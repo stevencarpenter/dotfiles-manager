@@ -10,6 +10,7 @@ use crate::fsys::{
     Dir, Layout, Lock, Sys, below, created, path_ident, reset_created, storage, unconfirmed,
 };
 use dfm_model::binding::Binding;
+use dfm_model::lock::Grants;
 use dfm_model::state::{
     self, Class, JournalEntry, Ledger, Phase, Receipt, Scope, Stamp, StateDoc, TrialRecord,
     canonical,
@@ -39,6 +40,8 @@ const STAGING: &str = "state.next";
 const SUBDIRS: [&str; 3] = ["receipts", "snapshots", "trials"];
 /// The per-machine salt for the salted hash of a co-owned file's managed fields.
 const SALT: &str = "salt";
+/// The origin grants (docs/architecture.md section 8, "Trust grant"; docs/sync.md).
+const GRANTS: &str = "grants.json";
 const SALT_BYTES: usize = 32;
 /// Characters of a cut journal line echoed in the error when its repair record cannot be written.
 const REPAIR_ECHO_CHARS: usize = 512;
@@ -979,6 +982,30 @@ impl Store {
             .replace_file("ledger.json", &bytes, &self.fail, "ledger")
     }
 
+    /// The origin grants, or none when `state/grants.json` does not exist yet.
+    pub fn read_grants(&self) -> Result<Grants, Refusal> {
+        match self
+            .state()?
+            .read_private(&self.sys, GRANTS, state::MAX_BYTES)?
+        {
+            None => Ok(Grants::default()),
+            Some(b) => Grants::parse(&b),
+        }
+    }
+
+    /// Replaces `state/grants.json` atomically. A grant write is a pre-plan state mutation
+    /// (section 10, mixed results); the caller decides what it means for the exit code.
+    pub fn write_grants(&self, g: &Grants) -> Result<(), Refusal> {
+        self.wrote(self.write_grants_inner(g))
+    }
+
+    fn write_grants_inner(&self, g: &Grants) -> Result<(), Refusal> {
+        self.guard(None)?;
+        let bytes = Self::cap(canonical(g)?)?;
+        self.state()?
+            .replace_file(GRANTS, &bytes, &self.fail, "grants")
+    }
+
     /// Publishes a receipt. Receipts are immutable: an existing name is a refusal, never an
     /// overwrite. Returns the file name.
     pub fn write_receipt(&self, r: &Receipt) -> Result<String, Refusal> {
@@ -1304,7 +1331,7 @@ impl Store {
         }
         if let Ok(state) = self.state() {
             for n in Self::list_dir(state, STATE, &mut problems) {
-                let known = ["state.json", "ledger.json", "journal.jsonl", SALT];
+                let known = ["state.json", "ledger.json", "journal.jsonl", GRANTS, SALT];
                 if !known.contains(&n.as_str()) && !SUBDIRS.contains(&n.as_str()) {
                     strays.push(format!("{n} (unexpected)"));
                 }

@@ -11,10 +11,10 @@
 
 use crate::adapters::Generators;
 use crate::plan_cmd::{Probed, plan_for, render};
-use crate::{Ctx, load_resolved, read_existing_binding, state_cmd, usage};
+use crate::{Ctx, load_resolved, require_binding, state_cmd, usage};
 use dfm_engine::{
-    Approval as Allowance, Dir, Run, Store, Sys, apply, check_allowances, check_journal_capacity,
-    gates, now_ns,
+    Approval as Allowance, Dir, Generator, Run, Store, Sys, apply, check_allowances,
+    check_journal_capacity, gates, now_ns,
 };
 use dfm_model::display::{visible, visible_for_paste};
 use dfm_model::plan::Scope;
@@ -27,6 +27,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
 use std::path::Path;
 
+#[derive(Clone)]
 pub struct Args {
     pub root: String,
     pub yes_plan: Option<String>,
@@ -160,6 +161,58 @@ fn counts_line(counts: &BTreeMap<Status, u32>) -> String {
     line
 }
 
+/// The checks between the printed plan and the writer lock, shared with `sync`: the approved
+/// digest must be the plan's, the plan must have no blocker, the gates that need no write must
+/// pass, the `--allow-*` sets must equal the plan's, and the journal must have room. A refusal
+/// here changes nothing. The missing allowances are printed to paste.
+pub(crate) fn check_before_lock(
+    ctx: &Ctx,
+    args: &Args,
+    plan: &dfm_model::plan::Plan,
+    digest: &str,
+    generator: &dyn Generator,
+    out: &mut dyn Write,
+) -> Result<(), Refusal> {
+    let w =
+        |e: std::io::Error| Refusal::new(Code::IoFailed, format!("output failed: {}", e.kind()));
+    // A digest that no longer matches is the first thing to report: the reviewer approved a
+    // different plan. A blocked plan cannot be approved at all.
+    if let Some(approved) = &args.yes_plan
+        && *approved != digest
+    {
+        return Err(stale(approved, digest));
+    }
+    if let Some(b) = plan.blockers.first() {
+        return Err(b.refusal());
+    }
+    // The gates that need no write run before the lock and in a preview, so a plan that apply
+    // would refuse is refused here with the same code.
+    let g = gates(plan, generator);
+    if let Some(r) = g.refusal {
+        return Err(r);
+    }
+    // An id that names no operation of its kind is a usage error and wins over a missing
+    // approval. A missing approval is refused with every missing flag printed to paste.
+    if let Err(all) = check_allowances(&g, &args.allow, &args.allow_adopt) {
+        for e in all.iter().filter(|e| e.code != Code::Usage) {
+            writeln!(out, "{}", visible_for_paste(&e.detail)).map_err(w)?;
+        }
+        return Err(all
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| usage("approval check failed")));
+    }
+    // The journal size is read without the lock. The lock is taken only for a real run.
+    let (layout, sys) = (ctx.layout(), ctx.sys()?);
+    let readable = Store::open_read(sys, &layout, state_cmd::fail_from_env()?)?
+        .ok_or_else(crate::state_lost_refusal)?;
+    check_journal_capacity(
+        readable.journal_len()?,
+        readable.settlement_entries()?,
+        plan,
+    )
+}
+
 /// What was printed so far, so a refusal prints its `result:` line exactly once.
 #[derive(Default)]
 struct Progress {
@@ -203,12 +256,7 @@ fn run_inner(
 ) -> Result<(), Refusal> {
     let w =
         |e: std::io::Error| Refusal::new(Code::IoFailed, format!("output failed: {}", e.kind()));
-    let binding = read_existing_binding(ctx)?.ok_or_else(|| {
-        Refusal::new(
-            Code::BindingInvalid,
-            "this machine is not bound; run bind first",
-        )
-    })?;
+    let binding = require_binding(ctx)?;
     let root = Path::new(&args.root);
     // The one place the handlers are installed. A scope that starts a provider child (a session
     // check, a probe) arms them now, before that child, so a stop request ends the child instead
@@ -264,43 +312,8 @@ fn run_inner(
     }
     render(&plan, &digest, out).map_err(w)?;
     progress.plan_printed = true;
-    // A digest that no longer matches is the first thing to report: the reviewer approved a
-    // different plan. A blocked plan cannot be approved at all.
-    if let Some(approved) = &args.yes_plan
-        && *approved != digest
-    {
-        return Err(stale(approved, &digest));
-    }
-    if let Some(b) = plan.blockers.first() {
-        return Err(b.refusal());
-    }
-    // The gates that need no write run before the lock and in a preview, so a plan that apply
-    // would refuse is refused here with the same code.
     let generators = |loaded| generators_for(ctx, &sys, args.scope, loaded);
-    let g = gates(&plan, &generators(&first));
-    if let Some(r) = g.refusal {
-        return Err(r);
-    }
-    // An id that names no operation of its kind is a usage error and wins over a missing
-    // approval. A missing approval is refused with every missing flag printed to paste.
-    if let Err(all) = check_allowances(&g, &args.allow, &args.allow_adopt) {
-        for e in all.iter().filter(|e| e.code != Code::Usage) {
-            writeln!(out, "{}", visible_for_paste(&e.detail)).map_err(w)?;
-        }
-        return Err(all
-            .into_iter()
-            .next()
-            .unwrap_or_else(|| usage("approval check failed")));
-    }
-    // The journal size is read without the lock. The lock is taken only for a real run.
-    let readable = Store::open_read(sys, &layout, state_cmd::fail_from_env()?)?
-        .ok_or_else(crate::state_lost_refusal)?;
-    check_journal_capacity(
-        readable.journal_len()?,
-        readable.settlement_entries()?,
-        &plan,
-    )?;
-    drop(readable);
+    check_before_lock(ctx, args, &plan, &digest, &generators(&first), out)?;
     // The credential gate (architecture section 10 item 2): a secrets run without a vault
     // session stops here, exit 3, before the lock and before any write. Nothing is rendered.
     if args.scope == Scope::Secrets {
