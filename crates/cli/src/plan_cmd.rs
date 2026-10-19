@@ -228,6 +228,7 @@ pub(crate) fn render(p: &Plan, digest: &str, out: &mut dyn Write) -> std::io::Re
         let status = match o.status {
             Status::Planned => "planned",
             Status::Current => "current",
+            Status::Held => "held",
             Status::NotInScope => "not_in_scope",
             Status::Blocked => "blocked",
         };

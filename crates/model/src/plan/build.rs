@@ -1088,7 +1088,7 @@ impl Planner<'_> {
             }
             Some(PackageState::Held(w)) => {
                 op.action = Action::None;
-                op.status = Status::Current;
+                op.status = Status::Held;
                 op.effect = format!(
                     "{name} is installed by {} and held ({w}); not upgraded",
                     r.adapter

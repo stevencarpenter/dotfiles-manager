@@ -213,6 +213,10 @@ impl Action {
 pub enum Status {
     Planned,
     Current,
+    /// Installed and kept on purpose under a rolling update (docs/toolchains.md): a policy, a
+    /// local build, an exact pin or a provider without an update path. Apply treats it as
+    /// `Current` and the receipt counts it as `held`.
+    Held,
     NotInScope,
     Blocked,
 }

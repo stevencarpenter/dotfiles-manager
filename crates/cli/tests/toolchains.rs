@@ -325,7 +325,7 @@ fn a_rolling_update_upgrades_mise_and_uv_tools_keeps_every_installed_version_and
     );
     assert!(t.contains(&format!("planned {GO}")), "{t}");
     assert!(t.contains(&format!("planned {NUV}")), "{t}");
-    assert!(t.contains(&format!("current {JAVA}")), "{t}");
+    assert!(t.contains(&format!("held {JAVA}")), "{t}");
     assert!(
         t.contains(
             "java is installed by mise/v1 and held (21.0.2, update_policy = hold); not upgraded"
@@ -354,7 +354,9 @@ fn a_rolling_update_upgrades_mise_and_uv_tools_keeps_every_installed_version_and
     for op in [DUCKDB, GO, NUV] {
         assert!(out.contains(&format!("updated {op}")), "{out}");
     }
-    assert!(out.contains(&format!("current {JAVA}")), "{out}");
+    assert!(out.contains(&format!("held {JAVA}")), "{out}");
+    assert!(out.contains("counts: updated=3 current=0 "), "{out}");
+    assert!(out.contains(" held=1 "), "{out}");
     assert!(out.contains("result: ok"), "{out}");
     assert_eq!(
         fx.changes(),
@@ -401,15 +403,20 @@ fn a_rolling_update_upgrades_mise_and_uv_tools_keeps_every_installed_version_and
     let ops = r[0]["operations"].as_array().unwrap();
     let status = |res: &str| ops.iter().find(|o| o["resource"] == res).unwrap()["status"].clone();
     assert_eq!(status("extra.duckdb"), "updated");
-    assert_eq!(status("extra.java"), "current");
+    assert_eq!(status("extra.java"), "held");
+    assert_eq!(r[0]["result"]["counts"]["held"], 1);
+    assert_eq!(r[0]["result"]["counts"]["current"], 0);
     // Another update with nothing newer changes nothing: the provider is asked, the listing
     // before and after is the same, so each tool is current. The receipt records the attempt.
     let o = fx.apply(true);
     assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
     let out = text(&o.stdout);
-    for op in [DUCKDB, GO, NUV, JAVA] {
+    for op in [DUCKDB, GO, NUV] {
         assert!(out.contains(&format!("current {op}")), "{out}");
     }
+    assert!(out.contains(&format!("held {JAVA}")), "{out}");
+    assert!(out.contains("counts: updated=0 current=3 "), "{out}");
+    assert!(out.contains(" held=1 "), "{out}");
     assert_eq!(fx.changes().len(), 6, "{}", fx.log());
     assert_eq!(fx.receipts().len(), 2);
 }
@@ -568,7 +575,7 @@ fn a_uv_tool_installed_from_a_git_or_path_source_is_held_and_an_unreadable_recei
         let o = fx.preview(true);
         assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
         let t = text(&o.stdout);
-        assert!(t.contains(&format!("current {NUV}")), "{t}");
+        assert!(t.contains(&format!("held {NUV}")), "{t}");
         assert!(
             t.contains("nuv is installed by uv-tool/v1 and held (0.5.2, "),
             "{t}"
@@ -584,7 +591,7 @@ fn a_uv_tool_installed_from_a_git_or_path_source_is_held_and_an_unreadable_recei
     let o = fx.apply(true);
     assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
     let t = text(&o.stdout);
-    assert!(t.contains(&format!("current {NUV}")), "{t}");
+    assert!(t.contains(&format!("held {NUV}")), "{t}");
     assert!(
         t.contains("cannot read") && t.contains("uv-receipt.toml: entity not found"),
         "{t}"
@@ -660,6 +667,15 @@ fn held_policies_local_builds_and_providers_without_a_rolling_path_are_kept() {
         "{out}"
     );
     assert!(out.contains(&format!("updated {NUV}")), "{out}");
+    for op in [DUCKDB, GO, "extra.atuin@package"] {
+        assert!(out.contains(&format!("held {op}")), "{out}");
+    }
+    assert!(out.contains("counts: updated=1 current=0 "), "{out}");
+    assert!(out.contains(" held=4 "), "{out}");
+    let r = fx.receipts();
+    assert_eq!(r.len(), 1);
+    assert_eq!(r[0]["result"]["counts"]["held"], 4);
+    assert_eq!(r[0]["result"]["counts"]["current"], 0);
     assert_eq!(fx.changes(), ["uv tool upgrade nuv"]);
     assert_eq!(
         fx.listed("mise"),
@@ -683,7 +699,10 @@ fn a_local_build_outside_the_declared_prefix_holds_the_tool() {
         out.contains("go@1.27 is installed by mise/v1 and held (1.27.1, ref:feature is a local build, which is kept)"),
         "{out}"
     );
-    assert!(out.contains(&format!("current {GO}")), "{out}");
+    assert!(out.contains(&format!("held {GO}")), "{out}");
+    assert!(out.contains("counts: updated=2 current=0 "), "{out}");
+    assert!(out.contains(" held=2 "), "{out}");
+    assert_eq!(fx.receipts()[0]["result"]["counts"]["held"], 2);
     assert_eq!(
         fx.changes(),
         ["mise install duckdb@latest", "uv tool upgrade nuv"]
@@ -708,7 +727,10 @@ fn an_exact_mise_pin_is_current_under_update_and_a_prefix_still_rolls() {
         out.contains("go@1.27.1 is installed by mise/v1 and held (1.27.1, an exact pin resolves to itself); not upgraded"),
         "{out}"
     );
-    assert!(out.contains(&format!("current {GO}")), "{out}");
+    assert!(out.contains(&format!("held {GO}")), "{out}");
+    assert!(out.contains("counts: updated=2 current=0 "), "{out}");
+    assert!(out.contains(" held=2 "), "{out}");
+    assert_eq!(fx.receipts()[0]["result"]["counts"]["held"], 2);
     assert_eq!(
         fx.changes(),
         ["mise install duckdb@latest", "uv tool upgrade nuv"]

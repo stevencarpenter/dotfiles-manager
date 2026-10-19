@@ -2084,9 +2084,10 @@ fn execute(run: &Run<'_>, plan: &Plan) -> Report {
                 Status::NotInScope,
                 record(op, &op.journal_id, Status::NotInScope, None, None, None),
             ),
-            PlanStatus::Current | PlanStatus::Blocked | PlanStatus::Planned
+            PlanStatus::Current | PlanStatus::Held | PlanStatus::Blocked | PlanStatus::Planned
                 if stopped.is_some()
-                    && (op.status != PlanStatus::Current || ex.clock.get() == 0) =>
+                    && (!matches!(op.status, PlanStatus::Current | PlanStatus::Held)
+                        || ex.clock.get() == 0) =>
             {
                 let dependent = op.after.iter().any(|a| {
                     matches!(
@@ -2106,7 +2107,14 @@ fn execute(run: &Run<'_>, plan: &Plan) -> Report {
             }
             _ => {
                 let started = ex.now();
-                let ended = if op.status == PlanStatus::Current {
+                // A held tool (docs/toolchains.md) needs nothing, like a current one, and keeps
+                // its own status in the receipt.
+                let settled = if op.status == PlanStatus::Held {
+                    Status::Held
+                } else {
+                    Status::Current
+                };
+                let ended = if matches!(op.status, PlanStatus::Current | PlanStatus::Held) {
                     // A provider listing does not settle an interrupted install's journal entry.
                     if op.path.is_none() {
                         ex.unknown_install(op).err().unwrap_or(Ended::Current)
@@ -2122,8 +2130,8 @@ fn execute(run: &Run<'_>, plan: &Plan) -> Report {
                 let times = Some((started, ex.now()));
                 match &ended {
                     Ended::Current => (
-                        Status::Current,
-                        record(op, &op.journal_id, Status::Current, times, None, None),
+                        settled,
+                        record(op, &op.journal_id, settled, times, None, None),
                     ),
                     Ended::Updated { id, .. } => (
                         Status::Updated,
