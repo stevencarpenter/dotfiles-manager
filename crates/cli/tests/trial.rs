@@ -607,9 +607,11 @@ fn an_ambiguous_provider_is_asked_for_and_a_single_capable_one_is_chosen() {
 #[test]
 fn a_tool_name_that_cannot_be_a_trial_id_is_a_usage_error() {
     let fx = Fx::new();
-    let o = fx.trial(&["npm:prettier", "--preview"]);
-    assert_eq!(code(&o), 2, "{}", stderr(&o));
-    assert!(stderr(&o).contains("E_USAGE"), "{}", stderr(&o));
+    for name in ["npm:prettier", "npm:@scope/pkg"] {
+        let o = fx.trial(&[name, "--preview"]);
+        assert_eq!(code(&o), 2, "{}", stderr(&o));
+        assert!(stderr(&o).contains("E_USAGE"), "{}", stderr(&o));
+    }
     let o = fx.trial(&["atuin", "--id", "Bad Id", "--preview"]);
     assert_eq!(code(&o), 2, "{}", stderr(&o));
     assert!(!fx.log().contains("brew"), "no provider ran: {}", fx.log());

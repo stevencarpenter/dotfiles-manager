@@ -91,8 +91,17 @@ pub fn parse_args(args: &[String]) -> Result<Args, Refusal> {
             "--provider is {HOMEBREW} or {MISE}; {p} cannot own a trial"
         )));
     }
+    let package = package.ok_or_else(|| usage("trial needs a package name"))?;
+    // A mise backend name (`npm:prettier`, `npm:@scope/pkg`) has no short name the record can
+    // carry, and `leaf` would turn a scoped one into a plausible tool name.
+    if package.contains(':') {
+        return Err(usage(format!(
+            "the tool name {} must be lowercase ASCII letters, digits, '.', '_' or '-' (1 to 64 characters); a backend-prefixed name cannot own a trial",
+            visible(&package)
+        )));
+    }
     Ok(Args {
-        package: package.ok_or_else(|| usage("trial needs a package name"))?,
+        package,
         id,
         provider,
         configs,
@@ -702,6 +711,8 @@ mod tests {
         );
         assert_eq!(a(&[]).unwrap_err().code, Code::Usage);
         assert_eq!(a(&["a", "b"]).unwrap_err().code, Code::Usage);
+        assert_eq!(a(&["npm:prettier"]).unwrap_err().code, Code::Usage);
+        assert_eq!(a(&["npm:@scope/pkg"]).unwrap_err().code, Code::Usage);
         assert_eq!(
             a(&["a", "--provider", "apt/v1"]).unwrap_err().code,
             Code::Usage
