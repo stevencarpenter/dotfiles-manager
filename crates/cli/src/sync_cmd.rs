@@ -39,7 +39,10 @@ const LOCAL_TIMEOUT: Duration = Duration::from_secs(60);
 const MAX_STDOUT: usize = 16 << 20;
 /// Settings every git call carries (section 8): no hooks, no fsmonitor, objects checked on
 /// fetch, no replacement refs, no line-ending rewrite, and no HTTP redirect: a redirect would
-/// send the request to a host the grant never named, so the fetch fails instead.
+/// send the request to a host the grant never named, so the fetch fails instead. The same pin
+/// drops every `objects/info/http-alternates` and `objects/info/alternates` entry of a dumb-HTTP
+/// server (git's `is_alternate_allowed`, http-walker.c, admits one only under
+/// `followRedirects=true`), so a server without smart HTTP cannot send the fetch elsewhere.
 const GIT_SETTINGS: [&str; 14] = [
     "-c",
     "http.followRedirects=false",
@@ -1191,6 +1194,16 @@ fn untrusted_refusal(origins: &[&str]) -> Refusal {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn redirects_and_http_alternates_stay_disabled() {
+        // Any value but `true` also disables the dumb-HTTP alternates (is_alternate_allowed).
+        let follow: Vec<&&str> = GIT_SETTINGS
+            .iter()
+            .filter(|s| s.starts_with("http.followRedirects="))
+            .collect();
+        assert_eq!(follow, [&"http.followRedirects=false"]);
+    }
 
     #[test]
     fn trust_origin_cannot_be_combined_with_preview() {
