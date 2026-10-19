@@ -8,8 +8,9 @@
 #   bootstrap.sh toolchain-digest --dir <installed toolchain>   (value for the lock)
 #   any command: --expect-sha256 <64 hex>   (this file must have that digest, checked first)
 #
-# Without --source, install clones the canonical origin (ORIGIN below) at --commit into the
-# scratch build directory. A URL source is cloned the same way. Network access happens only there.
+# install reads every source through a bare clone (transfer.fsckObjects) in the scratch build
+# directory: a local checkout as file://<path>, a URL as given, and without --source the canonical
+# origin (ORIGIN below). Network access happens only in that clone.
 # install also refuses to run unless this file is byte-identical to scripts/bootstrap.sh of the
 # pinned commit, so the script that runs is always the script of the commit it builds.
 #
@@ -627,23 +628,33 @@ clean_build() {
 install_unfinished() {
   [ -z "${install_ok:-}" ] || return 0
   clean_build || :
+  for _d in "$CACHE" "$HOME_DIR/.cache"; do
+    case " ${made_dirs:-} " in *" $_d "*) rmdir "$_d" 2>/dev/null || : ;; esac
+  done
   [ -z "$left" ] || echo "bootstrap: install did not finish; left in place: $left" >&2
 }
 
 # Read-only identity checks of the git repository at $src (a checkout or a bare clone); sets fmt and hint.
-check_source() {
-  [ -d "$src" ] || refuse E_SOURCE_UNTRUSTED "source $src is not a directory"
-  # git archive would apply checkout-local attributes (export-ignore, export-subst) and run filter
-  # commands from the checkout's config, so the staged tree could differ from the pinned commit.
-  # Attributes committed in the pinned tree stay part of that commit; no filter can run for them.
-  # A failed git call refuses: an empty answer must never read as "nothing found".
-  rc=0; found=$(git_clean -C "$src" config --get-regexp '^(core\.attributesfile|filter\.)' 2>/dev/null) || rc=$?
+# Read-only checks of a git repository's own configuration at $1. git archive would apply
+# checkout-local attributes (export-ignore, export-subst) and run filter commands from the
+# checkout's config, so the staged tree could differ from the pinned commit. The build reads a
+# fresh bare clone, which has neither, but a local checkout that carries them is still refused
+# before anything is written. Attributes committed in the pinned tree stay part of that commit;
+# no filter can run for them. A failed git call refuses: an empty answer must never read as
+# "nothing found".
+check_checkout_config() {
+  [ -d "$1" ] || refuse E_SOURCE_UNTRUSTED "source $1 is not a directory"
+  rc=0; found=$(git_clean -C "$1" config --get-regexp '^(core\.attributesfile|filter\.)' 2>/dev/null) || rc=$?
   [ "$rc" -le 1 ] || refuse E_SOURCE_UNTRUSTED "cannot read the git configuration of the source checkout (git exit $rc)"
   [ -z "$found" ] || refuse E_SOURCE_UNTRUSTED "the source checkout configures core.attributesFile or a filter; remove it first"
-  attrs=$(git_clean -C "$src" rev-parse --path-format=absolute --git-path info/attributes 2>/dev/null) && [ -n "$attrs" ] ||
+  attrs=$(git_clean -C "$1" rev-parse --path-format=absolute --git-path info/attributes 2>/dev/null) && [ -n "$attrs" ] ||
     refuse E_SOURCE_UNTRUSTED "cannot read the git directory of the source checkout"
   [ ! -s "$attrs" ] || refuse E_SOURCE_UNTRUSTED "the source checkout has .git/info/attributes; remove it first"
-  # Read-only prerequisite and identity checks come first.
+}
+
+# Identity checks of the bare clone at $src: reads fmt and the pin, sets hint (the toolchain pin).
+check_source() {
+  check_checkout_config "$src"
   [ "$(git_clean -C "$src" rev-parse --show-object-format 2>/dev/null)" = "$fmt" ] ||
     refuse E_SOURCE_UNTRUSTED "the source checkout does not use the $fmt object format of the pin"
   resolved=$(git_clean -C "$src" rev-parse --verify --end-of-options "$commit^{commit}" 2>/dev/null) || resolved=
@@ -652,13 +663,15 @@ check_source() {
   # of this script never builds a commit it does not belong to. The digest of $0 was taken
   # before any command ran. (A hostile script can skip its own checks; the commit id and the
   # out-of-band --expect-sha256 value are the owner's anchors, see docs/bootstrap.md.)
-  git_clean -C "$src" cat-file -e "$commit:scripts/bootstrap.sh" 2>/dev/null ||
-    refuse E_SOURCE_UNTRUSTED "commit $commit has no scripts/bootstrap.sh"
+  # The type is checked first: without pipefail a failed cat-file would digest empty input.
+  [ "$(git_clean -C "$src" cat-file -t "$commit:scripts/bootstrap.sh" 2>/dev/null)" = blob ] ||
+    refuse E_SOURCE_UNTRUSTED "commit $commit has no scripts/bootstrap.sh file"
   committed=$(git_clean -C "$src" cat-file blob "$commit:scripts/bootstrap.sh" 2>/dev/null | /usr/bin/shasum -a 256) && committed=${committed%% *} || committed=
-  [ -n "$committed" ] && [ "$committed" = "$self_sha" ] ||
-    refuse E_SOURCE_UNTRUSTED "this script ($script_path, sha256 $self_sha) is not scripts/bootstrap.sh of commit $commit (sha256 ${committed:-unreadable})"
-  # Early, read-only hint of the pin so a missing toolchain is refused before any mutation.
-  # The real parse and every other check run later on the staged copy.
+  [ -n "$committed" ] || refuse E_SOURCE_UNTRUSTED "cannot digest scripts/bootstrap.sh of commit $commit"
+  [ "$committed" = "$self_sha" ] ||
+    refuse E_SOURCE_UNTRUSTED "this script ($script_path, sha256 $self_sha) is not scripts/bootstrap.sh of commit $commit (sha256 $committed)"
+  # Early hint of the pin so a missing toolchain is refused before any change outside the scratch
+  # build directory. The real parse and every other check run later on the staged copy.
   hint=$(git_clean -C "$src" cat-file blob "$commit:dotfiles-manager.lock" 2>/dev/null |
     awk -v FN=dotfiles-manager.lock "$SCAN$PIN_HINT_RULES") || refuse_out "$hint"
   [ -n "$hint" ] || refuse E_SOURCE_UNTRUSTED "dotfiles-manager.lock has no toolchain pin"
@@ -672,34 +685,52 @@ cmd_install() {
   # revision syntax (^, ~, @{}), option-like value or whitespace ever reaches git.
   case $commit in ""|*[!0-9a-f]*) refuse E_SOURCE_UNTRUSTED "--commit must be a full lowercase hex object id (40 or 64 digits)" ;; esac
   case ${#commit} in 40) fmt=sha1 ;; 64) fmt=sha256 ;; *) refuse E_SOURCE_UNTRUSTED "--commit must be a full lowercase hex object id (40 or 64 digits)" ;; esac
+  [ -n "$src" ] || printf 'bootstrap: no --source given; the source is %s\n' "$ORIGIN" >&2
   resolve_home; check_platform
   # /usr/bin/git is the Command Line Tools shim, so the tools are probed before any git call.
   ensure_clt
   build=$CACHE/build
   # install resets the build directory, so neither this script nor a local source may live in it.
-  for _p in "$script_path" "$src"; do
-    case $_p in "$build"|"$build/"*) refuse E_PREREQ_MISSING "$_p is inside the build directory $build, which install resets; move it elsewhere first" ;; esac
-  done
-  # A URL is cloned later, after every local check, so the network is used only when the install
-  # can proceed. A local checkout is checked now, before anything is written.
-  clone_url=
-  case $src in ""|https://*|file://*) clone_url=${src:-$ORIGIN} ;; *) check_source ;; esac
+  # Paths are resolved (cd -P) before the comparison, so `..` segments and symlinked directories
+  # cannot hide the location; only an existing build directory can hold anything.
+  if build_real=$(cd -P "$build" 2>/dev/null && pwd -P); then
+    for _p in "$script_path" "${src#file://}"; do
+      [ -n "$_p" ] || continue
+      _d=$(cd -P "${_p%/*}/" 2>/dev/null && pwd -P) || continue
+      case ${_d%/}/${_p##*/} in "$build_real"|"$build_real/"*) refuse E_PREREQ_MISSING "$_p is inside the build directory $build, which install resets; move it elsewhere first" ;; esac
+    done
+  fi
+  # Every source is read through a bare clone with transfer.fsckObjects=true: git does not verify a
+  # loose object's hash on read, so a replaced object under .git/objects of a local checkout would
+  # otherwise serve another tree for the pinned commit id (git archive, cat-file and rev-parse all
+  # trust it). A local path is cloned as file://, because a plain path copies objects without the
+  # transfer checks. The clone is made after every local check, so the network is used only when
+  # the install can proceed; a local checkout's own configuration is checked before that.
+  case $src in
+    "") clone_url=$ORIGIN ;;
+    https://*|file://*) clone_url=$src ;;
+    *://*) refuse E_SOURCE_UNTRUSTED "--source must be a local path, an https:// URL or a file:// URL" ;;
+    *) check_checkout_config "$src"; clone_url=file://$src ;;
+  esac
+  # A URL with userinfo is printed without it.
+  case $clone_url in *@*) shown_url=${clone_url%%://*}://${clone_url#*@} ;; *) shown_url=$clone_url ;; esac
   check_command_path
   check_config_tree; check_binding
   check_cache_tree; check_data_tree; check_bin_dir
+  # A run that does not finish removes the cache directories it created, so a refusal after this
+  # point leaves nothing behind (rmdir removes only an empty directory).
+  made_dirs=
+  for _d in "$HOME_DIR/.cache" "$CACHE"; do [ -d "$_d" ] || made_dirs="$made_dirs $_d"; done
   trap install_unfinished EXIT; trap 'exit 130' INT; trap 'exit 143' TERM
   rm_build; mkdir -p "$build/stage"
-  if [ -n "$clone_url" ]; then
-    # A bare clone into the scratch build directory: the pinned commit is read from it with the
-    # same checks as a local checkout, and the exit trap, the cleanup after the build and
-    # uninstall remove it with the rest of the build directory. transfer.fsckObjects checks every
-    # received object (contract section 8). No working tree is written: git archive reads the
-    # commit itself, so there is no checkout head to drift from the pin.
-    git_clean -c transfer.fsckObjects=true clone --bare --quiet -- "$clone_url" "$build/source.git" ||
-      refuse E_SOURCE_UNTRUSTED "cannot clone $clone_url"
-    src=$build/source.git
-    check_source
-  fi
+  # A bare clone into the scratch build directory: the pinned commit is read from it, and the exit
+  # trap, the cleanup after the build and uninstall remove it with the rest of the build directory.
+  # No working tree is written: git archive reads the commit itself, so there is no checkout head
+  # to drift from the pin.
+  git_clean -c transfer.fsckObjects=true clone --bare --quiet -- "$clone_url" "$build/source.git" ||
+    refuse E_SOURCE_UNTRUSTED "cannot clone $shown_url (a source whose objects fail git's transfer checks is refused)"
+  src=$build/source.git
+  check_source
   # Build the verified commit itself, not whatever HEAD is. Both steps are checked: a pipe would hide
   # the status of git archive.
   git_clean -C "$src" archive --format=tar --end-of-options "$commit" >"$build/source.tar" || { echo "error: git archive failed" >&2; exit 1; }
@@ -812,8 +843,10 @@ while [ $# -gt 0 ]; do
     *) usage "unknown argument $1" ;;
   esac
 done
+# An empty --source is a usage error; only an absent one means the canonical origin.
+case $seen in *" --source "*) [ -n "$src" ] || usage "--source needs a non-empty value" ;; esac
 # Relative arguments become absolute so a later cd cannot be redirected. A URL stays as it is.
-case $src in ""|/*|https://*|file://*) ;; *) src=$PWD/$src ;; esac
+case $src in ""|/*|*://*) ;; *) src=$PWD/$src ;; esac
 case $dir in ""|/*) ;; *) dir=$PWD/$dir ;; esac
 case $0 in /*) script_path=$0 ;; *) script_path=$PWD/$0 ;; esac
 # The script's own identity, before any command runs: the digest of this file as it executes.

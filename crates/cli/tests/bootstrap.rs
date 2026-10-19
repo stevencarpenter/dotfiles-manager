@@ -2582,6 +2582,11 @@ fn repeated_flags_and_flags_the_command_does_not_use_are_usage_errors() {
             vec!["install", "--commit", "a", "--commit", "b"],
             "given twice",
         ),
+        // An empty --source is not "absent": only a missing flag means the canonical origin.
+        (
+            vec!["install", "--source", "", "--commit", "a"],
+            "--source needs a non-empty value",
+        ),
     ] {
         let o = script_test_mode(&home, &args, &[]);
         assert_eq!(o.status.code(), Some(2), "{args:?}: {}", err(&o));
@@ -2775,14 +2780,76 @@ fn a_url_source_is_cloned_at_the_exact_commit_and_the_clone_is_removed() {
         "the staging clone must go with the build directory"
     );
     // Without --source the canonical origin would be cloned, after the local checks: the missing
-    // tools refusal comes first, so no network is touched here.
+    // tools refusal comes first, so no network is touched here. The source is named up front.
     let o = script_test_mode(
         &p.home,
         &["install", "--commit", &p.sha],
         &[("DFM_TEST_CLT", "missing")],
     );
     assert_eq!(o.status.code(), Some(3), "{}", err(&o));
-    assert!(err(&o).contains("E_PREREQ_MISSING"), "{}", err(&o));
+    assert!(
+        err(&o).contains("E_PREREQ_MISSING")
+            && err(&o)
+                .contains("the source is https://github.com/stevencarpenter/dotfiles-manager.git"),
+        "{}",
+        err(&o)
+    );
+    // Other transports are refused before any clone is attempted.
+    for bad in [
+        "ssh://git@example.invalid/x.git",
+        "git://example.invalid/x.git",
+    ] {
+        let o = install_from(&p, bad, &p.sha);
+        assert_eq!(o.status.code(), Some(3), "{bad}: {}", err(&o));
+        assert!(
+            err(&o).contains("E_SOURCE_UNTRUSTED") && err(&o).contains("https:// URL"),
+            "{bad}: {}",
+            err(&o)
+        );
+        assert!(build_dirs_gone(&p), "{bad}: a clone was attempted");
+    }
+}
+
+/// git does not verify a loose object's hash on read: a replaced object file under `.git/objects`
+/// of a local checkout makes `rev-parse`, `cat-file` and `git archive` serve other content for the
+/// pinned commit id. Every source is therefore read through a `file://` clone with
+/// `transfer.fsckObjects=true`, which refuses the replaced object.
+#[test]
+fn a_local_source_with_a_replaced_loose_object_is_refused() {
+    let (tmp, home, src, sha) = refusal_setup("tampered-object");
+    let path = format!("{sha}:scripts/bootstrap.sh");
+    let blob = git(&src, &["rev-parse", &path]);
+    let other = tmp.path().join("other");
+    fs::write(&other, "# tampered\n").unwrap();
+    let oid = git(&src, &["hash-object", "-w", other.to_str().unwrap()]);
+    let obj = |id: &str| src.join(format!(".git/objects/{}/{}", &id[..2], &id[2..]));
+    fs::set_permissions(obj(&blob), fs::Permissions::from_mode(0o644)).unwrap();
+    fs::copy(obj(&oid), obj(&blob)).unwrap();
+    assert_eq!(
+        git(
+            &src,
+            &["rev-parse", "--verify", &format!("{sha}^{{commit}}")]
+        ),
+        sha
+    );
+    assert_eq!(
+        git(&src, &["cat-file", "blob", &path]),
+        "# tampered",
+        "git must serve the replaced content for this test to mean anything"
+    );
+    let before = snapshot(&home);
+    let o = install_tiny(&home, &src, &sha);
+    assert_eq!(o.status.code(), Some(3), "{}", err(&o));
+    assert!(
+        err(&o).contains("E_SOURCE_UNTRUSTED") && err(&o).contains("cannot clone"),
+        "{}",
+        err(&o)
+    );
+    assert_eq!(
+        snapshot(&home),
+        before,
+        "a refused clone must leave nothing"
+    );
 }
 
 /// install resets the build directory, so a script or a local source that lives inside it would
@@ -2818,12 +2885,27 @@ fn a_script_or_source_inside_the_build_directory_is_refused_before_the_reset() {
     assert!(copy.is_file(), "the running script was removed");
     let inside = build.join("src");
     fs::create_dir_all(&inside).unwrap();
-    let o = install_tiny(&home, &inside, &sha);
-    assert_eq!(o.status.code(), Some(3), "{}", err(&o));
-    assert!(
-        err(&o).contains("inside the build directory"),
-        "{}",
-        err(&o)
-    );
-    assert!(inside.is_dir(), "the source was removed");
+    // The path itself, a `..` route, a symlinked directory and a file:// form all resolve to it.
+    let link = _tmp.path().join("link");
+    std::os::unix::fs::symlink(&build, &link).unwrap();
+    for route in [
+        inside.clone(),
+        build.join("../build/src"),
+        link.join("src"),
+        PathBuf::from(format!("file://{}", inside.display())),
+    ] {
+        let o = install_tiny(&home, &route, &sha);
+        assert_eq!(o.status.code(), Some(3), "{}: {}", route.display(), err(&o));
+        assert!(
+            err(&o).contains("inside the build directory"),
+            "{}: {}",
+            route.display(),
+            err(&o)
+        );
+        assert!(
+            inside.is_dir(),
+            "{}: the source was removed",
+            route.display()
+        );
+    }
 }
