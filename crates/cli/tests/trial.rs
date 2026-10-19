@@ -589,7 +589,7 @@ fn an_ambiguous_provider_is_asked_for_and_a_single_capable_one_is_chosen() {
     assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
     assert!(
         fx.log()
-            .contains("mise install duckdb | yes=1 auto=false noconfig=1"),
+            .contains("mise install duckdb@latest | yes=1 auto=false noconfig=1"),
         "{}",
         fx.log()
     );

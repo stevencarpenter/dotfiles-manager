@@ -113,6 +113,9 @@ pub fn parse_args(args: &[String]) -> Result<Args, Refusal> {
 fn package_value(name: &str) -> Value {
     let mut t = Table::new();
     t.insert("name".into(), Value::String(name.into()));
+    // A trial never rolls: the package adapters require the policy and `hold` is the one a
+    // baseline can stand behind.
+    t.insert("update_policy".into(), Value::String("hold".into()));
     Value::Table(t)
 }
 
@@ -645,6 +648,7 @@ pub fn run(ctx: &Ctx, args: &Args, out: &mut dyn Write) -> Result<(), Refusal> {
         schema: SCHEMA,
         op_id: op_id.clone(),
         command: "trial".into(),
+        update: false,
         started_at: rfc3339(started),
         finished_at: rfc3339(finished),
         binary: BinaryId {
