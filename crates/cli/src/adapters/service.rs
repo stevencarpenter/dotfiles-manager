@@ -7,7 +7,8 @@
 //! group, timeout). The launchers' standard error is bounded and never printed or persisted.
 
 use dfm_engine::{Completion, End, ProcOutput, ProcRequest, Runner};
-use dfm_model::plan::{Action, Scope, ServiceState};
+use dfm_model::digest::sha256_hex;
+use dfm_model::plan::{Action, Definition, Scope, ServiceFacts, ServiceState};
 use dfm_model::resolve::{Resolved, Value};
 use dfm_model::{Code, Refusal};
 use std::collections::BTreeMap;
@@ -154,9 +155,8 @@ fn failed(what: &str, code: i32, out: &ProcOutput, by_hand: &str) -> Refusal {
     )
 }
 
-/// The `Label` string of an XML property list, read within the bound. `None` when the file is
-/// not an XML property list with a `Label` string (a binary property list is not read).
-fn definition_label(path: &Path) -> Result<Option<String>, String> {
+/// The bytes of a definition file, read through its link within the bound.
+fn definition_bytes(path: &Path) -> Result<Vec<u8>, String> {
     let shown = path.display().to_string();
     let io = |e: std::io::Error| format!("cannot read {shown}: {}", e.kind());
     let file = std::fs::File::open(path).map_err(io)?;
@@ -170,16 +170,58 @@ fn definition_label(path: &Path) -> Result<Option<String>, String> {
     if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > MAX_DEFINITION {
         return Err(format!("{shown} exceeds 1 MiB"));
     }
-    Ok(label_in(&String::from_utf8_lossy(&bytes)))
+    Ok(bytes)
 }
 
-/// `<key>Label</key>` followed by `<string>…</string>`, white space between them allowed.
+/// The `<string>` values directly inside the element that follows `<key>name</key>`: one for a
+/// string value, each item for an array. Empty when the key is absent or holds another type.
+fn strings_after(text: &str, name: &str) -> Vec<String> {
+    let Some((_, rest)) = text.split_once(&format!("<key>{name}</key>")) else {
+        return Vec::new();
+    };
+    let rest = rest.trim_start();
+    let (body, array) = if let Some(s) = rest.strip_prefix("<string>") {
+        (s.split_once("</string>").map_or("", |(v, _)| v), false)
+    } else if let Some(a) = rest.strip_prefix("<array>") {
+        (a.split_once("</array>").map_or("", |(v, _)| v), true)
+    } else {
+        return Vec::new();
+    };
+    let items: Vec<&str> = if array {
+        body.split("<string>")
+            .skip(1)
+            .filter_map(|part| part.split_once("</string>").map(|(v, _)| v))
+            .collect()
+    } else {
+        vec![body]
+    };
+    items
+        .into_iter()
+        .map(str::trim)
+        .filter(|v| !v.is_empty() && !v.contains('<'))
+        .map(str::to_string)
+        .collect()
+}
+
+/// `<key>Label</key>` followed by one `<string>…</string>`, white space between them allowed.
 fn label_in(text: &str) -> Option<String> {
-    let (_, rest) = text.split_once("<key>Label</key>")?;
-    let rest = rest.trim_start().strip_prefix("<string>")?;
-    let (label, _) = rest.split_once("</string>")?;
-    let label = label.trim();
-    (!label.is_empty() && !label.contains('<')).then(|| label.to_string())
+    match strings_after(text, "Label").as_slice() {
+        [one] => Some(one.clone()),
+        _ => None,
+    }
+}
+
+/// What the definition runs, for the plan: `Program`, else `ProgramArguments` joined by spaces.
+fn program_in(text: &str) -> String {
+    let mut words = strings_after(text, "Program");
+    if words.is_empty() {
+        words = strings_after(text, "ProgramArguments");
+    }
+    if words.is_empty() {
+        "(no program)".to_string()
+    } else {
+        words.join(" ")
+    }
 }
 
 /// What `launchctl print` reports: the definition the domain loaded and the run state.
@@ -188,20 +230,18 @@ struct Loaded {
     state: String,
 }
 
-/// The `path = ` and `state = ` lines of a `launchctl print` report.
+/// The `path = ` and `state = ` lines of a `launchctl print` report: the top-level fields, which
+/// launchd indents with one tab. A nested block (the resource coalition has a `state` too) is
+/// indented further and skipped.
 fn parse_print(text: &str) -> Option<Loaded> {
     let field = |name: &str| {
         text.lines()
-            .map(str::trim)
+            .filter_map(|l| l.strip_prefix('\t'))
+            .filter(|l| !l.starts_with(['\t', ' ']))
             .find_map(|l| {
-                l.strip_prefix(name)?
-                    .trim_start()
-                    .strip_prefix('=')?
-                    .trim()
-                    .into()
+                let v = l.strip_prefix(name)?.trim_start().strip_prefix('=')?.trim();
+                (!v.is_empty()).then(|| v.to_string())
             })
-            .filter(|v: &&str| !v.is_empty())
-            .map(str::to_string)
     };
     Some(Loaded {
         path: PathBuf::from(field("path")?),
@@ -237,44 +277,61 @@ fn launchd_report(runner: &Runner, label: &str) -> Result<Option<Loaded>, String
     }
 }
 
+fn only(state: ServiceState) -> ServiceFacts {
+    ServiceFacts {
+        state,
+        definition: None,
+    }
+}
+
 /// The state of a launchd user agent: its definition must be published under HOME and declare
 /// the label; the agent is current when the domain loaded that very file (compared after
-/// resolving links, as launchd reports the resolved path). Loaded from another file is stale: a
-/// changed definition applies only after a reload. The run state is reported, not required: a
-/// one-shot agent is not running after it ran.
-fn launchd_state(runner: &Runner, value: &Value) -> Result<ServiceState, Refusal> {
+/// resolving links, as launchd reports the resolved path). Loaded from another file is foreign:
+/// the manager did not load it and never unloads it. The run state is reported, not required: a
+/// one-shot agent is not running after it ran. The definition's content hash and program go to
+/// the plan.
+fn launchd_state(runner: &Runner, value: &Value) -> Result<ServiceFacts, Refusal> {
     let label = label(value)?;
     let plist = definition(value)?;
     let abs = runner.home.join(&plist);
     let canonical = match std::fs::canonicalize(&abs) {
         Ok(p) => p,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(ServiceState::Missing(format!(
+            return Ok(only(ServiceState::Missing(format!(
                 "its definition {plist} is not published"
-            )));
+            ))));
         }
         Err(e) => {
-            return Ok(ServiceState::Unknown(format!(
+            return Ok(only(ServiceState::Unknown(format!(
                 "cannot resolve {plist}: {}",
                 e.kind()
-            )));
+            ))));
         }
     };
-    match definition_label(&canonical) {
-        Ok(Some(l)) if l == label => {}
-        Ok(Some(l)) => {
-            return Ok(ServiceState::Refused(format!(
+    let bytes = match definition_bytes(&canonical) {
+        Ok(b) => b,
+        Err(why) => return Ok(only(ServiceState::Unknown(why))),
+    };
+    let text = String::from_utf8_lossy(&bytes);
+    match label_in(&text) {
+        Some(l) if l == label => {}
+        Some(l) => {
+            return Ok(only(ServiceState::Refused(format!(
                 "{plist} declares the label {l}, not {label}; loading it would load another agent"
-            )));
+            ))));
         }
-        Ok(None) => {
-            return Ok(ServiceState::Refused(format!(
+        None => {
+            return Ok(only(ServiceState::Refused(format!(
                 "{plist} is not an XML property list with a Label string; the adapter cannot check which agent it defines"
-            )));
+            ))));
         }
-        Err(why) => return Ok(ServiceState::Unknown(why)),
     }
-    Ok(match launchd_report(runner, &label) {
+    let definition = Some(Definition {
+        path: plist,
+        sha256: sha256_hex(&bytes),
+        program: program_in(&text),
+    });
+    let state = match launchd_report(runner, &label) {
         Err(why) => ServiceState::Unknown(why),
         Ok(None) => ServiceState::Stopped("definition published, not loaded".into()),
         Ok(Some(l)) => {
@@ -286,13 +343,15 @@ fn launchd_state(runner: &Runner, value: &Value) -> Result<ServiceState, Refusal
             if std::fs::canonicalize(&l.path).is_ok_and(|p| p == canonical) {
                 ServiceState::Current(format!("loaded from the declared definition, {run}"))
             } else {
-                ServiceState::Stale(format!(
-                    "loaded from another definition ({}), {run}",
-                    l.path.display()
+                ServiceState::Foreign(format!(
+                    "loaded from a definition the manager does not own ({}), {run}; unload it with `launchctl bootout {}/{label}`",
+                    l.path.display(),
+                    domain(runner)
                 ))
             }
         }
-    })
+    };
+    Ok(ServiceFacts { state, definition })
 }
 
 /// What `brew services info --json` reports for one formula.
@@ -343,11 +402,12 @@ fn brew_report(runner: &Runner, name: &str) -> Result<Option<BrewInfo>, String> 
 
 /// The state of a Homebrew service: installed (brew knows the formula), loaded (launchd holds
 /// brew's definition) and running (a process). A service is current only when it runs: a
-/// Homebrew service is a daemon. Loaded and not running is stale (it exited or failed), so a
-/// restart is planned.
-fn brew_state(runner: &Runner, value: &Value) -> Result<ServiceState, Refusal> {
+/// Homebrew service is a daemon. Loaded and not running is stale (it exited or failed); the
+/// manager did not start that process, so the planner blocks until the user requests the
+/// restart.
+fn brew_state(runner: &Runner, value: &Value) -> Result<ServiceFacts, Refusal> {
     let name = formula(value)?;
-    Ok(match brew_report(runner, &name) {
+    Ok(only(match brew_report(runner, &name) {
         Err(why) => ServiceState::Unknown(why),
         Ok(None) => ServiceState::Missing(format!(
             "the formula {name} is not installed; packages installs it"
@@ -360,12 +420,12 @@ fn brew_state(runner: &Runner, value: &Value) -> Result<ServiceState, Refusal> {
             i.status
         )),
         Ok(Some(_)) => ServiceState::Stopped("installed, not loaded".into()),
-    })
+    }))
 }
 
-/// The launcher's report for one service by its adapter. A bad declaration is
-/// `E_MANIFEST_INVALID`.
-pub fn probe(runner: &Runner, adapter: &str, value: &Value) -> Result<ServiceState, Refusal> {
+/// The launcher's report for one service by its adapter, with the definition facts when the
+/// adapter read one. A bad declaration is `E_MANIFEST_INVALID`.
+pub fn probe(runner: &Runner, adapter: &str, value: &Value) -> Result<ServiceFacts, Refusal> {
     match adapter {
         LAUNCHD => launchd_state(runner, value),
         BREW_SERVICE => brew_state(runner, value),
@@ -381,19 +441,21 @@ fn stop_requested() -> Result<(), Refusal> {
     dfm_engine::signal::requested().map_or(Ok(()), Err)
 }
 
-/// Runs one launcher action to its end. A nonzero exit is a failure with the error withheld.
+/// Runs one launcher action to its end. An exit outside `ok` is a failure with the error
+/// withheld.
 fn run_action(
     runner: &Runner,
     program: &str,
     args: &[String],
     env: &[(String, String)],
+    ok: &[i32],
     by_hand: &str,
 ) -> Result<(), Refusal> {
     let b = bounds();
     let what = format!("{program} {}", args.join(" "));
     let out = runner.run(&request(program, args, env, b.act))?;
     match out.end {
-        End::Exited(0) => Ok(()),
+        End::Exited(c) if ok.contains(&c) => Ok(()),
         End::Exited(c) => Err(failed(&what, c, &out, by_hand)),
         End::TimedOut => Err(Refusal::new(
             Code::IoFailed,
@@ -422,25 +484,15 @@ fn launchd_act(runner: &Runner, value: &Value, action: Action) -> Result<Complet
     let by_hand = format!("launchctl print {target}");
     if action == Action::Restart {
         let args = ["bootout".to_string(), target.clone()];
+        run_action(
+            runner,
+            "launchctl",
+            &args,
+            &[],
+            &[0, LAUNCHCTL_NOT_FOUND],
+            &by_hand,
+        )?;
         let b = bounds();
-        let out = runner.run(&request("launchctl", &args, &[], b.act))?;
-        match out.end {
-            End::Exited(0 | LAUNCHCTL_NOT_FOUND) => {}
-            End::Exited(c) => return Err(failed("launchctl bootout", c, &out, &by_hand)),
-            End::TimedOut => {
-                return Err(Refusal::new(
-                    Code::IoFailed,
-                    format!("launchctl bootout did not finish within {:?}", b.act),
-                ));
-            }
-            End::Signaled => {
-                return Err(Refusal::new(
-                    Code::IoFailed,
-                    "launchctl bootout was ended by a signal",
-                ));
-            }
-            End::Stopped(r) => return Err(r),
-        }
         let start = Instant::now();
         loop {
             stop_requested()?;
@@ -465,7 +517,7 @@ fn launchd_act(runner: &Runner, value: &Value, action: Action) -> Result<Complet
         dom,
         abs.to_string_lossy().into_owned(),
     ];
-    run_action(runner, "launchctl", &args, &[], &by_hand)?;
+    run_action(runner, "launchctl", &args, &[], &[0], &by_hand)?;
     Ok(Completion::Completed)
 }
 
@@ -483,7 +535,7 @@ fn brew_act(runner: &Runner, value: &Value, action: Action) -> Result<Completion
     };
     let args = ["services".to_string(), verb.into(), name.clone()];
     let by_hand = format!("brew services info {name}");
-    run_action(runner, "brew", &args, &brew_env(), &by_hand)?;
+    run_action(runner, "brew", &args, &brew_env(), &[0], &by_hand)?;
     let b = bounds();
     let start = Instant::now();
     loop {
@@ -531,7 +583,7 @@ pub fn act(
 pub fn service_facts(
     resolved: &Resolved,
     runner: &Runner,
-) -> Result<BTreeMap<String, ServiceState>, Refusal> {
+) -> Result<BTreeMap<String, ServiceFacts>, Refusal> {
     let mut out = BTreeMap::new();
     for r in resolved
         .resources
@@ -541,12 +593,12 @@ pub fn service_facts(
         if let Some(stop) = dfm_engine::signal::requested() {
             return Err(stop);
         }
-        let state = match probe(runner, &r.adapter, &r.value) {
-            Ok(s) => s,
-            Err(e) if e.code == Code::ManifestInvalid => ServiceState::Refused(e.detail),
-            Err(e) => ServiceState::Unknown(e.detail),
+        let facts = match probe(runner, &r.adapter, &r.value) {
+            Ok(f) => f,
+            Err(e) if e.code == Code::ManifestInvalid => only(ServiceState::Refused(e.detail)),
+            Err(e) => only(ServiceState::Unknown(e.detail)),
         };
-        out.insert(r.id.clone(), state);
+        out.insert(r.id.clone(), facts);
     }
     Ok(out)
 }
@@ -587,6 +639,13 @@ mod tests {
             label_in("<key>Label</key><string> a.b </string>").as_deref(),
             Some("a.b")
         );
+        assert_eq!(program_in(xml), "(no program)");
+        let args = "<key>ProgramArguments</key>\n\t<array>\n\t\t<string>/bin/launchctl</string>\n\t\t<string>limit</string>\n\t</array>\n<key>RunAtLoad</key><true/>";
+        assert_eq!(program_in(args), "/bin/launchctl limit");
+        assert_eq!(
+            program_in("<key>Program</key><string>/usr/bin/true</string>"),
+            "/usr/bin/true"
+        );
         for bad in [
             "bplist00\u{0}",
             "<key>Label</key><integer>1</integer>",
@@ -607,8 +666,17 @@ mod tests {
             PathBuf::from("/Users/a/Library/LaunchAgents/org.example.x.plist")
         );
         assert_eq!(l.state, "not running");
+        // A nested block before the top-level state does not stand in for it.
+        let nested = "gui/501/x = {\n\tpath = /p\n\tresource coalition = {\n\t\tstate = active\n\t}\n\tstate = running\n}\n";
+        assert_eq!(parse_print(nested).unwrap().state, "running");
+        assert!(
+            parse_print(
+                "gui/501/x = {\n\tpath = /p\n\tcoalition = {\n\t\tstate = active\n\t}\n}\n"
+            )
+            .is_none()
+        );
         assert!(parse_print("Bad request.\n").is_none());
-        assert!(parse_print("path = /x\n").is_none());
+        assert!(parse_print("path = /x\nstate = running\n").is_none());
     }
 
     #[test]

@@ -1640,10 +1640,29 @@ impl Exec<'_, '_> {
     }
 
     /// The declared prerequisite files of a service, observed again under the lock and compared
-    /// with the plan (`path:` preconditions): a definition or configuration file that changed or
-    /// went away since the plan blocks the start or restart, so nothing reloads a file the
-    /// reviewer did not see.
+    /// with the plan: the `path:` preconditions (the entry as the planner saw it) and the
+    /// `content:` precondition (the bytes of the definition, read through a link, as the adapter
+    /// hashed them at plan time). A file that changed or went away since the plan blocks the
+    /// start or restart, so nothing loads a definition the reviewer did not see.
     fn service_prerequisites(&self, op: &Operation) -> Result<(), Ended> {
+        for p in &op.preconditions {
+            let Some(path) = p.subject.strip_prefix("content:") else {
+                continue;
+            };
+            let actual = match definition_bytes(&self.run.home_path.join(path)) {
+                Ok(b) => format!("sha256:{}", sha256_hex(&b)),
+                Err(why) => why,
+            };
+            if actual != p.state {
+                return Err(blocked(
+                    Code::PlanStale,
+                    format!(
+                        "{} was {} and is now {actual}; nothing was loaded",
+                        p.subject, p.state
+                    ),
+                ));
+            }
+        }
         let reqs: Vec<Request> = op
             .preconditions
             .iter()
@@ -2245,6 +2264,25 @@ fn record(
     }
 }
 
+/// A service definition the plan hashed, read again through its link within the same bound the
+/// adapter used. The error text is the state string a mismatch reports.
+fn definition_bytes(path: &Path) -> Result<Vec<u8>, String> {
+    use std::io::Read;
+    const LIMIT: u64 = 1 << 20;
+    let shown = path.display().to_string();
+    let io = |e: std::io::Error| format!("unreadable ({}: {})", shown, e.kind());
+    let file = std::fs::File::open(path).map_err(io)?;
+    if !file.metadata().map_err(io)?.is_file() {
+        return Err(format!("not a regular file ({shown})"));
+    }
+    let mut bytes = Vec::new();
+    file.take(LIMIT + 1).read_to_end(&mut bytes).map_err(io)?;
+    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > LIMIT {
+        return Err(format!("over 1 MiB ({shown})"));
+    }
+    Ok(bytes)
+}
+
 /// Checks the gates and then runs the plan. This is the engine's one entry point. A refusal
 /// here means nothing was changed. Once the run starts it always returns a [`Report`], also
 /// when the journal cannot be read or a step fails, so the caller can still write a receipt.
@@ -2287,8 +2325,9 @@ fn execute(run: &Run<'_>, plan: &Plan) -> Report {
         .or_else(|| settle(&mut ex).err());
     // A pending operation does not stop the run (other operations are independent of it); it
     // decides the exit (5) when nothing else does.
-    // shortcut: a dependent of a pending operation is not marked blocked_pending, upgrade when
-    // a scope plans an operation after a service.
+    // shortcut: a dependent of a pending operation is not marked blocked_pending, upgrade by
+    // mapping `results == Pending` to Status::BlockedPending when DFM-30 adds the first
+    // operation that runs after a service.
     let mut pending: Option<Refusal> = None;
     let mut results: BTreeMap<&str, Status> = BTreeMap::new();
     let mut records = Vec::new();

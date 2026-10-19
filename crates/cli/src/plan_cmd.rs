@@ -9,7 +9,7 @@ use crate::{Ctx, Loaded, load_resolved, read_existing_binding, usage};
 use dfm_engine::{Dir, Fail, Store, merge, observe};
 use dfm_model::display::visible;
 use dfm_model::plan::{
-    self, Binary, Context, MAX_PLAN_BYTES, Owned, PackageState, Plan, Saved, Scope, ServiceState,
+    self, Binary, Context, MAX_PLAN_BYTES, Owned, PackageState, Plan, Saved, Scope, ServiceFacts,
     Stale, Status, source_identity,
 };
 use dfm_model::{Code, Refusal};
@@ -106,7 +106,7 @@ pub fn make_plan(ctx: &Ctx, root: &Path) -> Result<Plan, Refusal> {
 #[derive(Default)]
 pub struct Probed {
     pub package: BTreeMap<String, PackageState>,
-    pub service: BTreeMap<String, ServiceState>,
+    pub service: BTreeMap<String, ServiceFacts>,
     pub restart: BTreeSet<String>,
 }
 

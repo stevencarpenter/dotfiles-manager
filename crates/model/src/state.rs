@@ -727,7 +727,9 @@ impl Receipt {
                 "allow_disruptive" => {
                     o.owned_outputs.is_empty()
                         && o.after.is_none()
-                        && (o.status != Status::Updated || o.before.is_some() || o.reload.is_some())
+                        && (o.status != Status::Updated
+                            || o.before.is_some()
+                            || o.reload.as_deref() == Some("reloaded"))
                 }
                 // A link adoption publishes nothing. The first write into an existing co-owned
                 // (sensitive) file is also approved this way: it has no fingerprints, owns its

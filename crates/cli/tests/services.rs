@@ -173,6 +173,13 @@ fn stderr(o: &Output) -> String {
     text(&o.stderr)
 }
 
+/// The current user id, as the launchd domain `gui/<uid>` names it.
+fn uid() -> String {
+    text(&Command::new("id").arg("-u").output().unwrap().stdout)
+        .trim()
+        .to_string()
+}
+
 fn digest_of(o: &Output) -> String {
     text(&o.stdout)
         .lines()
@@ -383,13 +390,21 @@ fn a_missing_definition_blocks_and_a_published_one_is_loaded_through_launchd() {
         ),
         "{t}"
     );
+    // The plan shows what the definition would run, so a reviewer sees it before approving.
+    assert!(
+        t.contains("the definition runs /bin/launchctl limit maxfiles 65536 2097152"),
+        "{t}"
+    );
     assert!(t.contains("after: extra.maxfiles-plist@scope"), "{t}");
     assert!(t.contains(&format!("current {BAR_OP}")), "{t}");
     assert!(t.contains("not_in_scope core.git@scope"), "{t}");
     assert!(t.contains("not_in_scope extra.sketchybar-pkg@scope"), "{t}");
     let log = fx.log();
     assert!(
-        log.contains("launchctl print gui/") && log.contains(&format!("/{LABEL} | user=none")),
+        log.contains(&format!(
+            "launchctl print gui/{}/{LABEL} | user=none\n",
+            uid()
+        )),
         "{log}"
     );
     assert!(
@@ -412,10 +427,11 @@ fn a_missing_definition_blocks_and_a_published_one_is_loaded_through_launchd() {
     assert!(!out.contains("reload: not attempted"), "{out}");
     let plist = fx.home.path().join(PLIST);
     assert!(
-        fx.log().contains("launchctl bootstrap gui/")
-            && fx
-                .log()
-                .contains(&format!(" {} | user=none", plist.display())),
+        fx.log().contains(&format!(
+            "launchctl bootstrap gui/{} {} | user=none\n",
+            uid(),
+            plist.display()
+        )),
         "{}",
         fx.log()
     );
@@ -452,62 +468,50 @@ fn a_restart_is_disruptive_and_needs_its_approval() {
     let fx = Fx::new();
     fx.mark("brew-sketchybar", "started\n");
     fx.publish();
-    // launchd holds the label from another definition (an older copy): a reload is needed, and
-    // it is disruptive, so the preview lists the flag and refuses without it.
+    // launchd holds the label from a definition the manager did not load (a hand-installed
+    // agent under the same label): the manager never unloads it, with or without a request.
     fx.mark(
         "loaded",
         &format!("{LABEL} /somewhere/else/{LABEL}.plist running\n"),
     );
+    for flags in [&[][..], &["--restart", "extra.maxfiles"][..]] {
+        let o = fx.preview(flags);
+        assert_eq!(code(&o), 3, "{}\n{}", stderr(&o), text(&o.stdout));
+        assert!(stderr(&o).contains("E_CONFLICT"), "{}", stderr(&o));
+        assert!(
+            stderr(&o).contains(
+                "loaded from a definition the manager does not own (/somewhere/else/org.example.maxfiles.plist), running"
+            ),
+            "{}",
+            stderr(&o)
+        );
+        assert!(
+            stderr(&o).contains(&format!(
+                "unload it with `launchctl bootout gui/{}/{LABEL}`",
+                uid()
+            )),
+            "{}",
+            stderr(&o)
+        );
+        assert!(
+            text(&o.stdout).contains(&format!("blocked {AGENT_OP}")),
+            "{}",
+            text(&o.stdout)
+        );
+    }
+    assert!(
+        !fx.log().contains("bootout") && !fx.log().contains("bootstrap"),
+        "{}",
+        fx.log()
+    );
+    // Loaded from the declared definition: current. A current service restarts only on
+    // request, and the request is disruptive: the preview lists the flag and refuses without it.
+    // A request that names no service is a usage error, and so is an approval that names no
+    // restart.
+    let plist = fx.home.path().join(PLIST);
+    fx.mark("loaded", &format!("{LABEL} {} running\n", plist.display()));
     let o = fx.preview(&[]);
-    assert_eq!(code(&o), 3, "{}\n{}", stderr(&o), text(&o.stdout));
-    assert!(
-        stderr(&o).contains("E_DISRUPTIVE_UNAPPROVED"),
-        "{}",
-        stderr(&o)
-    );
-    let t = text(&o.stdout);
-    assert!(t.contains(&format!("planned {AGENT_OP}")), "{t}");
-    assert!(
-        t.contains("restart org.example.maxfiles with launchd-agent/v1: loaded from another definition (/somewhere/else/org.example.maxfiles.plist), running; disruptive"),
-        "{t}"
-    );
-    assert!(
-        t.contains(&format!("--allow-disruptive '{AGENT_OP}'")),
-        "{t}"
-    );
-    assert!(!fx.log().contains("bootout"), "{}", fx.log());
-    // With the approval: unload, wait until the domain no longer holds it, load the declared one.
-    let o = fx.preview(&["--allow-disruptive", AGENT_OP]);
     assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
-    let o = fx.services(&digest_of(&o), &["--allow-disruptive", AGENT_OP]);
-    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
-    assert!(
-        text(&o.stdout).contains(&format!("updated {AGENT_OP} reload=reloaded")),
-        "{}",
-        text(&o.stdout)
-    );
-    let log = fx.log();
-    let at = |needle: &str| {
-        log.find(needle)
-            .unwrap_or_else(|| panic!("{needle} missing: {log}"))
-    };
-    assert!(
-        at("launchctl bootout gui/") < at("launchctl bootstrap gui/"),
-        "{log}"
-    );
-    assert!(
-        fx.journal().contains("\"op\":\"restart\""),
-        "{}",
-        fx.journal()
-    );
-    let r = fx.receipts();
-    let receipt = r.iter().find(|r| r["command"] == "services").unwrap();
-    let approvals = receipt["approvals"].as_array().unwrap();
-    assert_eq!(approvals.len(), 1, "{receipt}");
-    assert_eq!(approvals[0]["how"], "allow_disruptive");
-    // A current service restarts only on request, and the request is as disruptive. A request
-    // that names no service is a usage error, and so is an approval that names no restart.
-    let o = fx.preview(&[]);
     assert!(
         text(&o.stdout).contains(&format!("current {AGENT_OP}")),
         "{}",
@@ -527,6 +531,11 @@ fn a_restart_is_disruptive_and_needs_its_approval() {
         "{}",
         stderr(&o)
     );
+    assert!(
+        text(&o.stdout).contains(&format!("--allow-disruptive '{AGENT_OP}'")),
+        "{}",
+        text(&o.stdout)
+    );
     let o = fx.preview(&["--restart", "extra.nope"]);
     assert_eq!(code(&o), 2, "{}", stderr(&o));
     assert!(stderr(&o).contains("names no service"), "{}", stderr(&o));
@@ -537,8 +546,8 @@ fn a_restart_is_disruptive_and_needs_its_approval() {
         "{}",
         stderr(&o)
     );
-    let bootstraps = || fx.log().matches("launchctl bootstrap").count();
-    let n = bootstraps();
+    // With the request and the approval: unload, wait until the domain no longer holds it,
+    // load the declared definition again, and record the approval.
     let o = fx.preview(&[
         "--restart",
         "extra.maxfiles",
@@ -561,7 +570,29 @@ fn a_restart_is_disruptive_and_needs_its_approval() {
         "{}",
         text(&o.stdout)
     );
-    assert_eq!(bootstraps(), n + 1);
+    let log = fx.log();
+    let bootout = format!("launchctl bootout gui/{}/{LABEL} | user=none\n", uid());
+    let bootstrap = format!(
+        "launchctl bootstrap gui/{} {} | user=none\n",
+        uid(),
+        plist.display()
+    );
+    let at = |needle: &str| {
+        log.find(needle)
+            .unwrap_or_else(|| panic!("{needle} missing: {log}"))
+    };
+    assert!(at(&bootout) < at(&bootstrap), "{log}");
+    assert_eq!(log.matches(&bootstrap).count(), 1, "{log}");
+    assert!(
+        fx.journal().contains("\"op\":\"restart\""),
+        "{}",
+        fx.journal()
+    );
+    let r = fx.receipts();
+    let receipt = r.iter().find(|r| r["command"] == "services").unwrap();
+    let approvals = receipt["approvals"].as_array().unwrap();
+    assert_eq!(approvals.len(), 1, "{receipt}");
+    assert_eq!(approvals[0]["how"], "allow_disruptive");
 }
 
 #[test]
@@ -629,24 +660,51 @@ fn a_brew_service_is_started_and_a_queued_start_is_pending_not_updated() {
         "{}",
         fx.journal()
     );
-    // The next run probes again: loaded and not running is stale, so a restart is planned, and
-    // it is disruptive. A restart whose daemon comes up after two reports completes.
+    // The next run probes again: loaded and not running is a process the manager did not
+    // start, so nothing restarts it by itself. The plan blocks and names the request to make;
+    // the request is disruptive. A restart whose daemon comes up after one more report completes.
     fx.unmark("queue-after-start");
     fx.unmark("queue-sketchybar");
     fx.mark("brew-sketchybar", "error\n");
     let o = fx.preview(&[]);
     assert_eq!(code(&o), 3, "{}\n{}", stderr(&o), text(&o.stdout));
+    assert!(stderr(&o).contains("E_CONFLICT"), "{}", stderr(&o));
     assert!(
-        text(&o.stdout).contains(
-            "restart sketchybar with brew-service/v1: installed, loaded, not running (status error); disruptive"
+        stderr(&o).contains(
+            "is installed, loaded, not running (status error); a restart would replace a process the manager did not start"
         ),
+        "{}",
+        stderr(&o)
+    );
+    assert!(
+        stderr(&o).contains("request it with `--restart extra.sketchybar`"),
+        "{}",
+        stderr(&o)
+    );
+    assert!(!fx.log().contains("services restart"), "{}", fx.log());
+    let o = fx.preview(&["--restart", "extra.sketchybar"]);
+    assert_eq!(code(&o), 3, "{}\n{}", stderr(&o), text(&o.stdout));
+    assert!(
+        stderr(&o).contains("E_DISRUPTIVE_UNAPPROVED"),
+        "{}",
+        stderr(&o)
+    );
+    assert!(
+        text(&o.stdout)
+            .contains("restart sketchybar with brew-service/v1 on request (--restart): disruptive"),
         "{}",
         text(&o.stdout)
     );
-    fx.mark("queue-after-start", "2\n");
-    let o = fx.preview(&["--allow-disruptive", BAR_OP]);
+    fx.mark("queue-after-start", "1\n");
+    let flags = [
+        "--restart",
+        "extra.sketchybar",
+        "--allow-disruptive",
+        BAR_OP,
+    ];
+    let o = fx.preview(&flags);
     assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
-    let o = fx.services(&digest_of(&o), &["--allow-disruptive", BAR_OP]);
+    let o = fx.services(&digest_of(&o), &flags);
     assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
     assert!(
         text(&o.stdout).contains(&format!("updated {BAR_OP} reload=reloaded")),
@@ -654,7 +712,8 @@ fn a_brew_service_is_started_and_a_queued_start_is_pending_not_updated() {
         text(&o.stdout)
     );
     assert!(
-        fx.log().contains("brew services restart sketchybar |"),
+        fx.log()
+            .contains("brew services restart sketchybar | auto=1 analytics=1 hints=1 user=none\n"),
         "{}",
         fx.log()
     );
@@ -673,9 +732,13 @@ fn a_brew_service_is_started_and_a_queued_start_is_pending_not_updated() {
     );
     for forbidden in [
         "services stop",
+        "services kill",
         "services remove",
         "services cleanup",
         "uninstall",
+        "launchctl unload",
+        "launchctl remove",
+        "kickstart",
     ] {
         assert!(!fx.log().contains(forbidden), "{forbidden}: {}", fx.log());
     }
@@ -797,6 +860,26 @@ fn the_definition_must_declare_the_label_and_a_changed_prerequisite_makes_the_pl
         &plist,
     )
     .unwrap();
+    let o = fx.services(&d, &[]);
+    assert_eq!(code(&o), 3, "{}\n{}", stderr(&o), text(&o.stdout));
+    assert!(stderr(&o).contains("E_PLAN_STALE"), "{}", stderr(&o));
+    assert!(!fx.log().contains("bootstrap"), "{}", fx.log());
+    // The link stays and only the content behind it changes (a file outside the sources, so
+    // the source tree is unchanged too): the definition's content is a precondition, so the
+    // approved plan is stale and nothing is loaded.
+    let copy = fx.fake.path().join("maxfiles.plist");
+    fs::write(&copy, AGENT_PLIST).unwrap();
+    fs::remove_file(&plist).unwrap();
+    std::os::unix::fs::symlink(&copy, &plist).unwrap();
+    let o = fx.preview(&[]);
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+    assert!(
+        text(&o.stdout).contains("the definition runs /bin/launchctl limit maxfiles 65536 2097152"),
+        "{}",
+        text(&o.stdout)
+    );
+    let d = digest_of(&o);
+    fs::write(&copy, AGENT_PLIST.replace("65536", "65537")).unwrap();
     let o = fx.services(&d, &[]);
     assert_eq!(code(&o), 3, "{}\n{}", stderr(&o), text(&o.stdout));
     assert!(stderr(&o).contains("E_PLAN_STALE"), "{}", stderr(&o));

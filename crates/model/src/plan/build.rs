@@ -218,9 +218,13 @@ pub enum ServiceState {
     /// The launcher does not hold it. A start is planned; nothing is running, so it is not
     /// disruptive.
     Stopped(String),
-    /// The launcher holds it, but not as declared: another definition, or loaded and not
-    /// running. A restart is planned, which is disruptive.
+    /// The launcher holds it, but it is not in the wanted state (loaded and not running). The
+    /// manager did not start that process, so it blocks until the user requests the restart
+    /// (`--restart`), which is disruptive.
     Stale(String),
+    /// The launcher holds the label from a definition that is not the declared one. The manager
+    /// never unloads what it did not load: a blocker, with the unload left to the user.
+    Foreign(String),
     /// A prerequisite is not in place (the definition file is not published, the package is not
     /// installed). The plan is blocked until the prerequisite's own command has run.
     Missing(String),
@@ -237,11 +241,33 @@ impl ServiceState {
             ServiceState::Current(d) => format!("current:{d}"),
             ServiceState::Stopped(d) => format!("stopped:{d}"),
             ServiceState::Stale(d) => format!("stale:{d}"),
+            ServiceState::Foreign(d) => format!("foreign:{d}"),
             ServiceState::Missing(w) => format!("missing:{w}"),
             ServiceState::Unknown(w) => format!("unknown:{w}"),
             ServiceState::Refused(w) => format!("refused:{w}"),
         }
     }
+}
+
+/// What the caller learned about one service: the launcher's report and, when the adapter read
+/// the definition file, its content identity and the program it runs. The plan shows the program
+/// and records the content as a precondition, so a definition edited behind a stable link
+/// between the preview and the run is refused, not loaded.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ServiceFacts {
+    pub state: ServiceState,
+    pub definition: Option<Definition>,
+}
+
+/// The definition file of a service as the adapter read it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Definition {
+    /// HOME-relative, as declared.
+    pub path: String,
+    /// SHA-256 of the bytes, lowercase hex.
+    pub sha256: String,
+    /// The program and its arguments, as the definition names them.
+    pub program: String,
 }
 
 /// The HOME-relative files a service declares it depends on: its definition (`plist`) and its
@@ -318,7 +344,7 @@ pub struct Context<'a> {
     pub package: BTreeMap<String, PackageState>,
     /// The probed state of each selected service resource, by resource id (`services` scope
     /// only).
-    pub service: BTreeMap<String, ServiceState>,
+    pub service: BTreeMap<String, ServiceFacts>,
     /// Service resources whose restart the user requested (`services --restart <resource>`). A
     /// current service in this set is planned as a disruptive restart.
     pub restart: BTreeSet<String>,
@@ -1330,7 +1356,16 @@ impl Planner<'_> {
                 });
             }
         }
-        let state = self.cx.service.get(&r.id).cloned();
+        let facts = self.cx.service.get(&r.id).cloned();
+        let mut runs = String::new();
+        if let Some(d) = facts.as_ref().and_then(|f| f.definition.as_ref()) {
+            op.preconditions.push(Precondition {
+                subject: format!("content:{}", d.path),
+                state: format!("sha256:{}", d.sha256),
+            });
+            runs = format!("; the definition runs {}", d.program);
+        }
+        let state = facts.map(|f| f.state);
         let requested = self.cx.restart.contains(&r.id);
         op.postcondition = format!("{} reports {name} loaded as declared", r.adapter);
         let probe = format!("probe:{}:{name}", r.adapter);
@@ -1344,31 +1379,57 @@ impl Planner<'_> {
             });
         };
         match state {
-            Some(ref s @ ServiceState::Current(ref d)) if requested => planned(
-                &mut op,
-                Action::Restart,
-                format!(
-                    "restart {shown} on request (--restart): disruptive, the loaded instance is replaced; now {d}"
-                ),
-                s,
-            ),
+            Some(ref s @ (ServiceState::Current(ref d) | ServiceState::Stale(ref d)))
+                if requested =>
+            {
+                planned(
+                    &mut op,
+                    Action::Restart,
+                    format!(
+                        "restart {shown} on request (--restart): disruptive, the loaded instance is replaced; now {d}{runs}"
+                    ),
+                    s,
+                );
+            }
             Some(ServiceState::Current(d)) => {
                 op.action = Action::None;
                 op.status = Status::Current;
-                op.effect = format!("{name} is {d}");
+                op.effect = format!("{name} is {d}{runs}");
             }
             Some(ref s @ ServiceState::Stopped(ref d)) => planned(
                 &mut op,
                 Action::Start,
-                format!("start {shown}: {d}; not disruptive, nothing of it is running"),
+                format!("start {shown}: {d}; not disruptive, nothing of it is running{runs}"),
                 s,
             ),
-            Some(ref s @ ServiceState::Stale(ref d)) => planned(
-                &mut op,
-                Action::Restart,
-                format!("restart {shown}: {d}; disruptive, the loaded instance is replaced"),
-                s,
-            ),
+            // The manager did not start that process: nothing restarts it without a request.
+            Some(ServiceState::Stale(d)) => {
+                let f = fail(
+                    Code::Conflict,
+                    field,
+                    format!(
+                        "{shown} is {d}; a restart would replace a process the manager did not start"
+                    ),
+                    format!(
+                        "request it with `--restart {}` (and its --allow-disruptive flag), or repair the service by hand, then run services again",
+                        r.id
+                    ),
+                );
+                op.effect = format!("blocked: {}", f.detail);
+                self.blocker(r, None, f);
+            }
+            Some(ServiceState::Foreign(d)) => {
+                let f = fail(
+                    Code::Conflict,
+                    field,
+                    format!(
+                        "{shown} is {d}; the manager never unloads a definition it did not load"
+                    ),
+                    "unload it by hand with its launcher, then run services again",
+                );
+                op.effect = format!("blocked: {}", f.detail);
+                self.blocker(r, None, f);
+            }
             Some(ServiceState::Missing(why)) => {
                 let f = fail(
                     Code::Conflict,
@@ -2406,7 +2467,8 @@ mod tests {
         let states = [
             ServiceState::Current("loaded, running".into()),
             ServiceState::Stopped("not loaded".into()),
-            ServiceState::Stale("loaded from another definition".into()),
+            ServiceState::Stale("loaded, not running".into()),
+            ServiceState::Foreign("loaded from another definition".into()),
             ServiceState::Missing("not published".into()),
             ServiceState::Unknown("timeout".into()),
             ServiceState::Refused("bad label".into()),

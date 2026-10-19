@@ -285,7 +285,7 @@ impl Generator for Generators<'_> {
 
     fn service_state(&self, op: &Operation) -> Result<ServiceState, Refusal> {
         let runner = self.launcher(op)?;
-        service::probe(runner, &op.adapter, self.value(op)?)
+        service::probe(runner, &op.adapter, self.value(op)?).map(|f| f.state)
     }
 
     fn service_act(&self, op: &Operation) -> Result<Completion, Refusal> {
