@@ -456,31 +456,7 @@ fn check_live(git: &Git, live: &str) -> Result<(), Refusal> {
             visible(&top)
         )));
     }
-    let o = git.output(
-        true,
-        &[
-            "-C",
-            live,
-            "config",
-            "--get-regexp",
-            r"^(core\.attributesfile|filter\.)",
-        ],
-    )?;
-    match o.end {
-        End::Exited(1) if o.stdout.is_empty() => {}
-        End::Exited(0) => {
-            return Err(untrusted(format!(
-                "the checkout at {} configures core.attributesFile or a filter; remove it first",
-                visible(live)
-            )));
-        }
-        _ => {
-            return Err(untrusted(format!(
-                "cannot read the git configuration of the checkout at {}",
-                visible(live)
-            )));
-        }
-    }
+    check_config(git, live)?;
     let attrs = git.run(
         true,
         Code::SourceUntrusted,
@@ -498,6 +474,79 @@ fn check_live(git: &Git, live: &str) -> Result<(), Refusal> {
         return Err(untrusted(format!(
             "the checkout at {} has .git/info/attributes; remove it first",
             visible(live)
+        )));
+    }
+    Ok(())
+}
+
+/// A configuration key a checkout may carry (docs/sync.md, "Checkout configuration"): what
+/// `git init` and `git clone` write, plus the identity keys. Every fetch names its URL on the
+/// command line, and a URL is never a remote nickname (a nickname holds no slash), so
+/// `remote.*` and `branch.*` never reach a fetch, a fast-forward or a detached checkout.
+fn config_key_allowed(key: &str) -> bool {
+    const PLAIN: [&str; 8] = [
+        "core.repositoryformatversion",
+        "core.filemode",
+        "core.bare",
+        "core.logallrefupdates",
+        "core.ignorecase",
+        "core.precomposeunicode",
+        "user.name",
+        "user.email",
+    ];
+    if PLAIN.contains(&key) {
+        return true;
+    }
+    let Some((section, rest)) = key.split_once('.') else {
+        return false;
+    };
+    let Some((_, name)) = rest.rsplit_once('.') else {
+        return false;
+    };
+    matches!(
+        (section, name),
+        ("remote", "url" | "fetch" | "pushurl") | ("branch", "remote" | "merge")
+    )
+}
+
+/// Every git command in a checkout loads its `.git/config` (and `.git/config.worktree`, and
+/// whatever `include.path` names), which the scrubbed environment cannot remove. A key there
+/// can send a fetch elsewhere (`url.*.insteadOf`, `remote.*.proxy`, `http.*`), run a command
+/// (`credential.helper`, `core.sshCommand`, `core.gitProxy`, `core.askPass`, `alias.*`), or
+/// rewrite the files a fast-forward writes (`filter.*`, `core.attributesFile`, `core.symlinks`).
+/// So the whole configuration is listed with its origins, the command-line pins are skipped,
+/// and any other key outside [`config_key_allowed`] is refused by name: a value may hold a
+/// credential, so it is never printed.
+fn check_config(git: &Git, live: &str) -> Result<(), Refusal> {
+    let o = git.output(
+        true,
+        &["-C", live, "config", "--list", "--show-origin", "-z"],
+    )?;
+    if !o.success() {
+        return Err(untrusted(format!(
+            "cannot read the git configuration of the checkout at {}",
+            visible(live)
+        )));
+    }
+    // `-z`: `<origin>\0<key>\n<value>\0` per entry; a `-c` pin's origin is `command line:`.
+    let text = String::from_utf8_lossy(&o.stdout);
+    let mut fields = text.split('\0');
+    while let (Some(origin), Some(entry)) = (fields.next(), fields.next()) {
+        let key = entry.split('\n').next().unwrap_or(entry);
+        if origin == "command line:" || config_key_allowed(key) {
+            continue;
+        }
+        // A subsection can hold a credential too (`url.https://user:token@host/.insteadOf`).
+        let shown = match (key.split_once('.'), key.rsplit_once('.')) {
+            (Some((section, rest)), Some((_, name))) if rest.contains('.') => {
+                format!("{section}.*.{name}")
+            }
+            _ => key.to_string(),
+        };
+        return Err(untrusted(format!(
+            "the checkout at {} configures {}, which sync does not allow because git would read it during the fetch or the fast-forward; remove it from the checkout's configuration (a global setting is not read)",
+            visible(live),
+            visible(&shown)
         )));
     }
     Ok(())
@@ -930,11 +979,15 @@ fn run_inner(
         check_origin(o, cfg!(feature = "test-isolation"))?;
     }
     if !args.trust.is_empty() {
+        state_cmd::fail_from_env()?.hit("sync-before-grant-lock")?;
         let store = Store::open_write_with(sys, &layout, state_cmd::fail_from_env()?, false)?;
         if !store.is_initialized() {
             return Err(crate::state_lost_refusal());
         }
         store.require_identity(&binding)?;
+        // Read again under the lock: another sync may have granted since the read above, and a
+        // rewrite from that snapshot would drop its grant.
+        grants = store.read_grants()?;
         let at = rfc3339(now_ns()?);
         for o in &args.trust {
             if grants.trusts(o) {

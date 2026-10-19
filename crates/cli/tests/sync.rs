@@ -1013,6 +1013,124 @@ fn a_new_commit_over_the_same_tree_between_preview_and_approval_is_stale() {
     assert_eq!(fx.head(), amended);
 }
 
+/// Runs `f` while the bare remote is moved away, so any fetch that reaches it fails with
+/// `E_SOURCE_MISSING` instead of the refusal under test.
+fn without_remote(fx: &Fx, f: impl FnOnce() -> Output) -> Output {
+    let away = fx.work.path().join("upstream-away");
+    fs::rename(&fx.upstream.bare, &away).unwrap();
+    let o = f();
+    fs::rename(&away, &fx.upstream.bare).unwrap();
+    o
+}
+
+#[test]
+fn a_checkout_configuration_outside_the_allowlist_is_refused_before_any_fetch() {
+    let fx = Fx::new();
+    let old = fx.head();
+    let included = fx.work.path().join("included.gitconfig");
+    fs::write(&included, "[core]\n\tfsmonitor = /bin/true\n").unwrap();
+    for (key, value, printed) in [
+        (
+            "url.https://u:s3cret@evil.invalid/.insteadOf",
+            fx.origin(),
+            "url.*.insteadof",
+        ),
+        (
+            "credential.helper",
+            "!echo s3cret".to_string(),
+            "credential.helper",
+        ),
+        (
+            "core.sshCommand",
+            "/bin/echo s3cret".to_string(),
+            "core.sshcommand",
+        ),
+        (
+            "include.path",
+            included.to_str().unwrap().to_string(),
+            "include.path",
+        ),
+    ] {
+        git(&fx.root, &["config", key, &value]);
+        let o = without_remote(&fx, || fx.preview());
+        git(&fx.root, &["config", "--unset", key]);
+        assert_eq!(code(&o), 3, "{key}: {}\n{}", stdout(&o), stderr(&o));
+        let e = stderr(&o);
+        assert!(e.contains("E_SOURCE_UNTRUSTED"), "{key}: {e}");
+        assert!(e.contains(printed), "{key}: {e}");
+        assert!(!e.contains("s3cret"), "{key}: a value was printed: {e}");
+        assert!(!e.contains("E_SOURCE_MISSING"), "{key}: a fetch ran: {e}");
+        assert!(!stdout(&o).contains("source: src0"), "{key}: a fetch ran");
+        assert_eq!(fx.head(), old, "{key}");
+        assert!(
+            fx.staging_leftovers().is_empty(),
+            "{key}: {:?}",
+            fx.staging_leftovers()
+        );
+    }
+    // The configuration a clone writes (core.*, remote.origin.*, branch.main.*) passes.
+    let o = fx.preview();
+    assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
+}
+
+#[test]
+fn two_grants_that_race_for_the_writer_lock_both_survive() {
+    let fx = Fx::ungranted();
+    let release = fx.work.path().join("release-grant");
+    // The first run reads grants.json (empty), then parks before it takes the writer lock.
+    let parked = Command::new(BIN)
+        .env_clear()
+        .env("DFM_PROVIDER_PATH", "/usr/bin:/bin")
+        .env(
+            "DFM_FAILPOINT",
+            format!("sync-before-grant-lock:wait-{}", release.display()),
+        )
+        .args([
+            "--home",
+            fx.home.path().to_str().unwrap(),
+            "sync",
+            "--root",
+            fx.root_arg(),
+            "--trust-origin",
+            &fx.origin(),
+        ])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let reached = release.with_extension("reached");
+    let end = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !reached.exists() {
+        assert!(
+            std::time::Instant::now() < end,
+            "the failpoint was not reached"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    // A second run grants another origin meanwhile and writes grants.json.
+    let other = "https://example.invalid/other/repo";
+    let o = fx.run(&["sync", "--root", fx.root_arg(), "--trust-origin", other]);
+    assert!(
+        stdout(&o).contains(&format!("granted: {other} grant-")),
+        "{}\n{}",
+        stdout(&o),
+        stderr(&o)
+    );
+    fs::write(&release, "go").unwrap();
+    let o = parked.wait_with_output().unwrap();
+    assert_eq!(code(&o), 3, "{}\n{}", stdout(&o), stderr(&o));
+    assert!(stderr(&o).contains("E_APPROVAL_REQUIRED"), "{}", stderr(&o));
+    let g = fx.grants();
+    assert!(g.contains(other), "the first grant was dropped: {g}");
+    assert!(g.contains(&fx.origin()), "the second grant is missing: {g}");
+    assert_eq!(
+        fx.journal().matches("\"op\":\"grant-origin\"").count(),
+        4,
+        "{}",
+        fx.journal()
+    );
+}
+
 #[test]
 fn a_dead_run_s_staging_directory_is_removed_by_the_next_writer() {
     let fx = Fx::new();
