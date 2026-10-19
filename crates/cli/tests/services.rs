@@ -943,16 +943,18 @@ fn a_sensitive_prerequisite_is_recorded_by_mode_only() {
         ),
         "{t}"
     );
-    let d = digest_of(&o);
-    let o = fx.services(&d, &[]);
+    let mut everything = t.clone();
+    let o = fx.services(&digest_of(&o), &[]);
     assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
     assert!(
         text(&o.stdout).contains(&format!("updated {BAR_OP} reload=reloaded")),
         "{}",
         text(&o.stdout)
     );
+    everything.push_str(&text(&o.stdout));
     // The content changed and the mode did not: the prerequisite still holds, because the
-    // plan recorded the mode only. A mode open to others is a change.
+    // plan recorded the mode only. A mode open to others is a change: the plan approved with
+    // the old mode is stale, and the only difference between the two runs is the mode.
     fs::write(&secret, "TOKEN=other\n").unwrap();
     let o = fx.preview(&[]);
     assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
@@ -961,12 +963,14 @@ fn a_sensitive_prerequisite_is_recorded_by_mode_only() {
         "{}",
         text(&o.stdout)
     );
+    everything.push_str(&text(&o.stdout));
+    let d = digest_of(&o);
     fs::set_permissions(&secret, fs::Permissions::from_mode(0o644)).unwrap();
     let o = fx.services(&d, &[]);
     assert_eq!(code(&o), 3, "{}\n{}", stderr(&o), text(&o.stdout));
     assert!(stderr(&o).contains("E_PLAN_STALE"), "{}", stderr(&o));
     // Nothing printed, journaled or stored holds the content or its plain hash.
-    let mut everything = fx.journal();
+    everything.push_str(&fx.journal());
     everything.push_str(&fx.log());
     for r in fx.receipts() {
         everything.push_str(&r.to_string());
@@ -975,4 +979,87 @@ fn a_sensitive_prerequisite_is_recorded_by_mode_only() {
     everything.push_str(&stderr(&o));
     assert!(!everything.contains("hunter2"), "{everything}");
     assert!(!everything.contains(&hash), "{everything}");
+}
+
+#[test]
+fn a_secret_definition_shows_neither_its_hash_nor_its_arguments() {
+    use sha2::{Digest, Sha256};
+    let fx = Fx::new();
+    // The agent's definition is itself a secret output (a token among its arguments): the plan
+    // keeps its mode only, shows no program, and records no content hash anywhere.
+    fx.put(
+        "base/modules/extra/module.toml",
+        &EXTRA.replace(
+            "id = \"maxfiles-plist\"\nkind = \"link\"\nadapter = \"fs-link/v1\"\ntarget = \"Library/LaunchAgents/org.example.maxfiles.plist\"\n[resources.value]\nsource = \"files/org.example.maxfiles.plist\"",
+            "id = \"maxfiles-plist\"\nkind = \"secret\"\nadapter = \"op-template/v1\"\ntarget = \"Library/LaunchAgents/org.example.maxfiles.plist\"\n[resources.value]\ntemplate = \"files/org.example.maxfiles.plist\"\naccount = \"my.1password.com\"\nmode = 0o600",
+        ),
+    );
+    fx.mark("brew-sketchybar", "started\n");
+    // The configuration is published without the plist, which `secrets` would render.
+    let o = fx.run(&["apply", "--root", fx.root_arg(), "--preview"]);
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+    let d = digest_of(&o);
+    let o = fx.run(&["apply", "--root", fx.root_arg(), "--yes-plan", &d]);
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+    let plist = fx.home.path().join(PLIST);
+    fs::create_dir_all(plist.parent().unwrap()).unwrap();
+    let content = AGENT_PLIST.replace("2097152", "TOKEN-hunter2-argument");
+    fs::write(&plist, &content).unwrap();
+    fs::set_permissions(&plist, fs::Permissions::from_mode(0o600)).unwrap();
+    let hash = format!("{:x}", Sha256::digest(content.as_bytes()));
+    let o = fx.preview(&[]);
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+    let t = text(&o.stdout);
+    assert!(t.contains(&format!("planned {AGENT_OP}")), "{t}");
+    assert!(!t.contains("the definition runs"), "{t}");
+    let d = digest_of(&o);
+    let o = fx.services(&d, &[]);
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+    assert!(
+        text(&o.stdout).contains(&format!("updated {AGENT_OP} reload=reloaded")),
+        "{}",
+        text(&o.stdout)
+    );
+    let mut everything = t.clone();
+    everything.push_str(&text(&o.stdout));
+    everything.push_str(&stderr(&o));
+    everything.push_str(&fx.journal());
+    for r in fx.receipts() {
+        everything.push_str(&r.to_string());
+    }
+    assert!(!everything.contains("hunter2"), "{everything}");
+    assert!(!everything.contains(&hash), "{everything}");
+    // A mode change is still a stale plan.
+    fx.mark("loaded", "");
+    let d = digest_of(&fx.preview(&[]));
+    fs::set_permissions(&plist, fs::Permissions::from_mode(0o644)).unwrap();
+    let o = fx.services(&d, &[]);
+    assert_eq!(code(&o), 3, "{}\n{}", stderr(&o), text(&o.stdout));
+    assert!(stderr(&o).contains("E_PLAN_STALE"), "{}", stderr(&o));
+    assert!(!stderr(&o).contains(&hash), "{}", stderr(&o));
+}
+
+#[test]
+fn a_large_config_file_is_recorded_by_size_and_still_applies() {
+    let fx = Fx::new();
+    fx.publish();
+    fx.mark("brew-sketchybar", "none\n");
+    fx.mark(
+        "loaded",
+        &format!("{LABEL} {} stopped\n", fx.home.path().join(PLIST).display()),
+    );
+    // A config file over the 16 MiB hash cap is observed by size on both sides: the plan is not
+    // stale against itself, and the start runs.
+    let rc = fx.home.path().join(".config/sketchybar/sketchybarrc");
+    fs::remove_file(&rc).unwrap();
+    fs::write(&rc, vec![b'#'; (16 << 20) + 1]).unwrap();
+    let o = fx.preview(&[]);
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+    let o = fx.services(&digest_of(&o), &[]);
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+    assert!(
+        text(&o.stdout).contains(&format!("updated {BAR_OP} reload=reloaded")),
+        "{}",
+        text(&o.stdout)
+    );
 }

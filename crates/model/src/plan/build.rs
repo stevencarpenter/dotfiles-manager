@@ -1354,16 +1354,25 @@ impl Planner<'_> {
             }
             // A sensitive prerequisite (a secret output a program reads) is recorded by mode
             // only, as everywhere else: no hash and no size of it reaches the plan or a message.
+            // The subject says which it is, so apply observes it the same way.
             if let Some(seen) = self.obs.seen.get(&p) {
+                let sensitive = self.sensitive.contains(&fold(&p));
+                let subject = if sensitive { "sensitive-path" } else { "path" };
                 op.preconditions.push(Precondition {
-                    subject: format!("path:{p}"),
-                    state: node_state(seen, self.sensitive.contains(&fold(&p))),
+                    subject: format!("{subject}:{p}"),
+                    state: node_state(seen, sensitive),
                 });
             }
         }
         let facts = self.cx.service.get(&r.id).cloned();
         let mut runs = String::new();
-        if let Some(d) = facts.as_ref().and_then(|f| f.definition.as_ref()) {
+        // A secret definition (a token among its arguments) shows and records nothing of its
+        // content: its mode-only precondition above is all the plan keeps of it.
+        if let Some(d) = facts
+            .as_ref()
+            .and_then(|f| f.definition.as_ref())
+            .filter(|d| !self.sensitive.contains(&fold(&d.path)))
+        {
             op.preconditions.push(Precondition {
                 subject: format!("content:{}", d.path),
                 state: format!("sha256:{}", d.sha256),

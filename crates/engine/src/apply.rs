@@ -1663,18 +1663,25 @@ impl Exec<'_, '_> {
                 ));
             }
         }
-        // The planner recorded a sensitive prerequisite by mode only (no hash): it is observed
-        // and compared the same way, so no hash of it is computed or printed here either.
-        let sensitive = |p: &dfm_model::plan::Precondition| {
-            p.state.starts_with("file:") && !p.state.contains(":sha256:")
-        };
+        // The planner recorded a sensitive prerequisite (`sensitive-path:`) by mode only, with
+        // no hash: it is observed and compared the same way, so no hash of it is computed or
+        // printed here either. The subject carries the decision; the state's shape does not.
+        fn kind(p: &dfm_model::plan::Precondition) -> Option<(&str, bool)> {
+            if let Some(path) = p.subject.strip_prefix("path:") {
+                Some((path, false))
+            } else {
+                p.subject
+                    .strip_prefix("sensitive-path:")
+                    .map(|path| (path, true))
+            }
+        }
         let reqs: Vec<Request> = op
             .preconditions
             .iter()
-            .filter(|p| p.subject.starts_with("path:"))
-            .map(|p| Request {
-                path: p.subject["path:".len()..].to_string(),
-                hash: !sensitive(p),
+            .filter_map(kind)
+            .map(|(path, sensitive)| Request {
+                path: path.to_string(),
+                hash: !sensitive,
                 list: false,
             })
             .collect();
@@ -1683,13 +1690,13 @@ impl Exec<'_, '_> {
         }
         let obs = observe(&self.run.sys, self.run.home, &reqs).map_err(failed)?;
         for p in &op.preconditions {
-            let Some(path) = p.subject.strip_prefix("path:") else {
+            let Some((path, sensitive)) = kind(p) else {
                 continue;
             };
             let actual = obs
                 .seen
                 .get(path)
-                .map_or_else(|| "missing".to_string(), |s| node_state(s, sensitive(p)));
+                .map_or_else(|| "missing".to_string(), |s| node_state(s, sensitive));
             if actual != p.state {
                 return Err(blocked(
                     Code::PlanStale,
