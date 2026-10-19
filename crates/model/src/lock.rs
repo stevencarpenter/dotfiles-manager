@@ -4,11 +4,12 @@
 //! module reads the `[[sources]]` entries that `sync` fetches (docs/sync.md).
 
 use crate::digest::sha256_hex;
+use crate::fold::fold;
 use crate::state::valid_id;
 use crate::{Code, Refusal};
 use serde::de::IgnoredAny;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// Largest lock file (section 5, parser and read limits).
 pub const MAX_BYTES: usize = 1 << 20;
@@ -226,7 +227,7 @@ impl Lock {
                 format!("lock schema {n} is not supported (supported: {SCHEMA})"),
             ));
         }
-        let (mut ids, mut paths) = (BTreeSet::new(), BTreeSet::new());
+        let (mut ids, mut paths) = (BTreeSet::new(), BTreeMap::new());
         let mut roots = 0;
         for s in &doc.sources {
             let at = |why: String| invalid(format!("[[sources]] {}: {why}", s.id));
@@ -259,7 +260,8 @@ impl Lock {
                     s.path
                 )));
             }
-            if !paths.insert(s.path.as_str()) {
+            // Folded as APFS folds: `base/work` and `base/Work` are one checkout there.
+            if paths.insert(fold(&s.path), s.path.as_str()).is_some() {
                 return Err(at("duplicate path".into()));
             }
             if s.is_root() {
@@ -278,13 +280,14 @@ impl Lock {
                 "[[sources]] needs exactly one root source (path = \".\")",
             ));
         }
-        for a in &paths {
-            if let Some(b) = paths
-                .iter()
-                .find(|b| **b != *a && b.strip_prefix(a).is_some_and(|r| r.starts_with('/')))
-            {
+        for (a, a_path) in &paths {
+            if let Some((_, b_path)) = paths.iter().find(|(b, _)| {
+                *b != a
+                    && b.strip_prefix(a.as_str())
+                        .is_some_and(|r| r.starts_with('/'))
+            }) {
                 return Err(invalid(format!(
-                    "[[sources]] path {b:?} lies inside path {a:?}"
+                    "[[sources]] path {b_path:?} lies inside path {a_path:?}"
                 )));
             }
         }
@@ -438,6 +441,44 @@ ref = "refs/heads/main"
         for bad in ["", "/abs", "a/../b", "a/.git/b", "a/", "a\\b"] {
             assert!(!valid_path(bad), "{bad}");
         }
+    }
+
+    #[test]
+    fn case_aliased_paths_are_one_checkout() {
+        let nested = |id: &str, path: &str| {
+            format!(
+                "\n[[sources]]\nid = \"{id}\"\nkind = \"git\"\norigin = \"https://example.invalid/org/{id}\"\nref = \"refs/heads/main\"\ncommit = \"{}\"\npath = \"{path}\"\n",
+                "a".repeat(40)
+            )
+        };
+        let dup = format!(
+            "{ROOT}{}{}",
+            nested("a", "base/work"),
+            nested("b", "base/Work")
+        );
+        let e = Lock::parse(dup.as_bytes(), false).unwrap_err();
+        assert_eq!(e.code, Code::ManifestInvalid);
+        assert!(e.detail.contains("b: duplicate path"), "{e}");
+
+        let inside = format!(
+            "{ROOT}{}{}",
+            nested("a", "base/work"),
+            nested("b", "base/Work/inner")
+        );
+        let e = Lock::parse(inside.as_bytes(), false).unwrap_err();
+        assert_eq!(e.code, Code::ManifestInvalid);
+        assert!(
+            e.detail
+                .contains("path \"base/Work/inner\" lies inside path \"base/work\""),
+            "{e}"
+        );
+
+        let distinct = format!(
+            "{ROOT}{}{}",
+            nested("a", "base/work"),
+            nested("b", "base/works")
+        );
+        Lock::parse(distinct.as_bytes(), false).unwrap();
     }
 
     #[test]
