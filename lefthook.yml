@@ -7,7 +7,7 @@ pre-commit:
 pre-push:
   jobs:
     # Owner rule (2026-10-20): the tests run locally before any push. Each pushed commit is
-    # exported and tested in its own temporary tree (the commits on no remote-tracking ref).
+    # written out and tested in its own temporary tree ({1} is the remote git names).
     - name: tests
-      run: bash scripts/check_push.sh
+      run: bash scripts/check_push.sh {1}
       use_stdin: true

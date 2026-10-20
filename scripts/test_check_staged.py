@@ -147,17 +147,25 @@ class PushGateTest(unittest.TestCase):
                 "GIT_COMMITTER_NAME": "t",
                 "GIT_COMMITTER_EMAIL": "t@example.com",
             }
-            subprocess.run(["git", "init", "--quiet", folder], check=True, env=env)
+
+            def git(*args: str) -> None:
+                subprocess.run(["git", *args], cwd=root, check=True, env=env)
+
+            git("init", "--quiet", folder)
+            # The hook bounds the range by the destination remote, so it must be configured.
+            git("remote", "add", "origin", "git@example.com:origin.git")
             scripts = root / "scripts"
             scripts.mkdir()
             shutil.copyfile(
                 Path(__file__).with_name("check_push.sh"), scripts / "check_push.sh"
             )
-            # The stub passes only for the committed content "valid"; a commit that carries
-            # the marker `expect-clean` also requires the dotfile of an earlier commit gone.
+            # The stub passes only for the committed content "valid"; the marker
+            # `expect-clean` also requires the dotfile of an earlier commit gone, and
+            # the file `broken` (hidden from archives by export-ignore) must not exist.
             (scripts / "check_all.sh").write_text(
                 'test "$(cat fixture)" = valid || exit 1\n'
-                "[ ! -e expect-clean ] || [ ! -e .hidden ]\n"
+                "[ ! -e expect-clean ] || [ ! -e .hidden ] || exit 1\n"
+                "[ ! -e broken ]\n"
             )
             fixture = root / "fixture"
 
@@ -167,13 +175,8 @@ class PushGateTest(unittest.TestCase):
                         (root / name).unlink()
                     else:
                         (root / name).write_text(text + "\n")
-                subprocess.run(["git", "add", "--all"], cwd=root, check=True, env=env)
-                subprocess.run(
-                    ["git", "commit", "--quiet", "-m", "step"],
-                    cwd=root,
-                    check=True,
-                    env=env,
-                )
+                git("add", "--all")
+                git("commit", "--quiet", "-m", "step")
                 return subprocess.check_output(
                     ["git", "rev-parse", "HEAD"], cwd=root, env=env, text=True
                 ).strip()
@@ -183,41 +186,68 @@ class PushGateTest(unittest.TestCase):
             fixed = commit({"fixture": "valid"})
             commit({".hidden": "stale"})  # the commit below `clean`
             clean = commit({".hidden": None, "expect-clean": ""})
+            attrs = commit({"broken": "", ".gitattributes": "broken export-ignore"})
             zero = "0" * 40
-            tracking = "refs/remotes/origin/main"
-            for tip, remote, working, tested, succeeds in [
+            base = {
+                "remote": "origin",
+                "tracking": {},
+                "over": zero,
+                "working": "valid",
+            }
+            cases = [
                 # The pushed commit is tested, not the working tree.
-                (good, None, "invalid", 1, True),
-                (bad, None, "valid", 2, False),
+                {"tip": good, "working": "invalid", "tested": 1, "ok": True},
+                {"tip": bad, "tested": 2, "ok": False},
                 # Every commit the push introduces, oldest first, stopping at the first
                 # broken one: `bad` sits below the tip `fixed`.
-                (fixed, None, "valid", 2, False),
-                # What a remote-tracking ref already has is not tested again.
-                (fixed, bad, "valid", 1, True),
+                {"tip": fixed, "tested": 2, "ok": False},
+                # What the destination remote has is not tested again: its tracking ref...
+                {"tip": fixed, "tracking": {"origin": bad}, "tested": 1, "ok": True},
+                # ...or the remote sha git reports for the pushed ref.
+                {"tip": fixed, "over": bad, "tested": 1, "ok": True},
+                # Another remote's tracking ref does not bound a push to origin.
+                {"tip": fixed, "tracking": {"backup": bad}, "tested": 2, "ok": False},
+                # A push to a URL has no tracking refs; every remote bounds it then.
+                {
+                    "tip": fixed,
+                    "remote": "git@example.com:other.git",
+                    "tracking": {"backup": bad},
+                    "tested": 1,
+                    "ok": True,
+                },
                 # Each commit gets a new tree: the dotfile below `clean` must not reach it.
-                (clean, fixed, "valid", 2, True),
+                {"tip": clean, "tracking": {"origin": fixed}, "tested": 2, "ok": True},
+                # The commit's tree, not its archive: export-ignore hides nothing.
+                {"tip": attrs, "tracking": {"origin": clean}, "tested": 1, "ok": False},
                 # A deletion-only push tests nothing.
-                (zero, None, "invalid", 0, True),
-            ]:
+                {"tip": zero, "working": "invalid", "tested": 0, "ok": True},
+            ]
+            for case in cases:
+                case = base | case
+                tip, over, working = case["tip"], case["over"], case["working"]
                 with self.subTest(
-                    tip=tip[:7], remote=(remote or "")[:7], working=working
+                    tip=tip[:7],
+                    tracking={k: v[:7] for k, v in case["tracking"].items()},
+                    over=over[:7],
+                    remote=case["remote"],
                 ):
-                    if remote is None:
-                        args = ["git", "update-ref", "-d", tracking]
-                    else:
-                        args = ["git", "update-ref", tracking, remote]
-                    subprocess.run(args, cwd=root, check=True, env=env)
+                    for name in ("origin", "backup"):
+                        git("update-ref", "-d", f"refs/remotes/{name}/main")
+                    for name, sha in case["tracking"].items():
+                        git("update-ref", f"refs/remotes/{name}/main", sha)
                     fixture.write_text(working + "\n")
                     result = subprocess.run(
-                        ["bash", "scripts/check_push.sh"],
+                        ["bash", "scripts/check_push.sh", case["remote"]],
                         cwd=root,
                         capture_output=True,
                         env=env,
-                        input=f"refs/heads/main {tip} refs/heads/main {zero}\n",
+                        input=f"refs/heads/main {tip} refs/heads/main {over}\n",
                         text=True,
                     )
-                    self.assertEqual(result.returncode == 0, succeeds, result.stderr)
-                    self.assertEqual(result.stdout.count("pre-push: testing "), tested)
+                    self.assertEqual(result.returncode == 0, case["ok"], result.stderr)
+                    self.assertEqual(
+                        result.stdout.count("pre-push: testing "), case["tested"]
+                    )
                     self.assertEqual(fixture.read_text(), working + "\n")
 
 
