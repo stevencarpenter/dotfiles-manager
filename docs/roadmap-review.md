@@ -59,3 +59,11 @@ A temporary test-only item verified MCP check, uncheck and persistence through a
 The manager is not implemented. Private work inputs, actual device inventories and native provider behavior remain required gates. Independent review reduces known roadmap gaps but cannot prove the plan has no further gaps. New findings must extend the ownership ledger, bounded tasks, dependencies and affected integration/native proof before completion.
 
 This task authorizes roadmap and board publication. It does not authorize product implementation, live configuration changes, secret rendering, package retirement, merge, release, billing changes or a Git push.
+
+## Realignment 2026-10-20
+
+The owner audited the daily path on 2026-10-19 and realigned the backlog on 2026-10-20. The direction: fast rolling updates with no soak period, no generation or rollback machinery, and the lighter modular approach (mcp_sync, skills sync, the agent registry and aws-config-generator stay external generators run from the `just sync` wrapper). Three new daily-path leaves: DFM-61 (checkout root in the binding), DFM-62 (one prompt on a TTY), DFM-63 (sync composes configuration, packages, secrets and services). DFM-64 carries the authoring walkthrough from DFM-28. Two leaves from the same day's CI and shell policies: DFM-65 (the gate staged for iteration speed, hosted CI gates merge, PR #57) and DFM-66 (the owner decides the interpreter of bootstrap.sh; its `/bin/sh` choice is a documented security decision).
+
+Superseded whole: DFM-9, DFM-11, DFM-27, DFM-28, each with an evidence comment. Superseded criteria: DFM-19.C02 and C03, DFM-37.C01 to C06, DFM-21.C02, DFM-36.C02, C03, C05, C06, C08 to C12 and C14. Rewritten: DFM-31.C03, DFM-37.C07, DFM-18.C06 and C07, DFM-41.C06 and C11, DFM-21.C01 and C05. Added: DFM-31.C12 and C13, DFM-25.C09. A superseded requirement keeps its line, struck through with a dated note, and counts as complete (docs/checklist-state.md, "Supersede requirements"). `docs/roadmap.json` records every change under `completion_contract.realignment_2026_10_20`.
+
+Leaves DFM-44 to DFM-60, filed after the 2026-10-08 publication, are not in the manifest. The 2026-10-08 verification counts above describe that publication, not the current board.
