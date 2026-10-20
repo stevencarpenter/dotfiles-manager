@@ -1,4 +1,4 @@
-"""Prove the commit gate reads the index and preserves local changes."""
+"""Prove the commit gate reads the index, the push gate reads the pushed commit, and both preserve local changes."""
 
 import os
 from pathlib import Path
@@ -133,6 +133,63 @@ class StagedGateTest(unittest.TestCase):
                 ).strip(),
                 "false",
             )
+
+
+class PushGateTest(unittest.TestCase):
+    def test_pushed_commit_not_working_tree(self) -> None:
+        with tempfile.TemporaryDirectory(
+            prefix="dotfiles-manager-push-test-"
+        ) as folder:
+            root = Path(folder)
+            env = clean_env() | {
+                "GIT_AUTHOR_NAME": "t",
+                "GIT_AUTHOR_EMAIL": "t@example.com",
+                "GIT_COMMITTER_NAME": "t",
+                "GIT_COMMITTER_EMAIL": "t@example.com",
+            }
+            subprocess.run(["git", "init", "--quiet", folder], check=True, env=env)
+            scripts = root / "scripts"
+            scripts.mkdir()
+            shutil.copyfile(
+                Path(__file__).with_name("check_push.sh"), scripts / "check_push.sh"
+            )
+            # The stub passes only for the committed content "valid".
+            (scripts / "check_all.sh").write_text('test "$(cat fixture)" = valid\n')
+            fixture = root / "fixture"
+
+            def commit(content: str) -> str:
+                fixture.write_text(content + "\n")
+                subprocess.run(["git", "add", "."], cwd=root, check=True, env=env)
+                subprocess.run(
+                    ["git", "commit", "--quiet", "-m", content],
+                    cwd=root,
+                    check=True,
+                    env=env,
+                )
+                return subprocess.check_output(
+                    ["git", "rev-parse", "HEAD"], cwd=root, env=env, text=True
+                ).strip()
+
+            good = commit("valid")
+            bad = commit("invalid")
+            zero = "0" * 40
+            for sha, working, succeeds in [
+                (good, "invalid", True),
+                (bad, "valid", False),
+                (zero, "invalid", True),
+            ]:
+                with self.subTest(sha=sha[:7], working=working):
+                    fixture.write_text(working + "\n")
+                    result = subprocess.run(
+                        ["bash", "scripts/check_push.sh"],
+                        cwd=root,
+                        capture_output=True,
+                        env=env,
+                        input=f"refs/heads/main {sha} refs/heads/main {zero}\n",
+                        text=True,
+                    )
+                    self.assertEqual(result.returncode == 0, succeeds, result.stderr)
+                    self.assertEqual(fixture.read_text(), working + "\n")
 
 
 if __name__ == "__main__":

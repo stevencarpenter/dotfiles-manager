@@ -1,5 +1,13 @@
 pre-commit:
   jobs:
-    # The fast steps only; hosted CI runs the tests on the pull request (README, "Check the draft").
+    # The fast steps only (README, "Check the draft").
     - name: local-validation
       run: bash scripts/check_staged.sh fixtures scripts rust-style
+
+pre-push:
+  jobs:
+    # Owner rule (2026-10-20): the tests run locally before any push. Each pushed commit is
+    # exported and tested in a temporary tree.
+    - name: tests
+      run: bash scripts/check_push.sh
+      use_stdin: true

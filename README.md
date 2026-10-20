@@ -35,9 +35,9 @@ Read-only resolution can be built first internally, but does not satisfy this fi
 
 Install Git hooks once per clone with `lefthook install`. Git, Bash, Lefthook and uv must be available on PATH.
 
-The pre-commit hook runs the fast steps of the local gate against a temporary copy of the staged files: fixtures, pinned Ruff lint/format, shell syntax, the staged-gate regression test, `cargo fmt --check` and `cargo clippy -D warnings`. It does not run `cargo test`, and it does not modify or restage files. The copy builds into `target/gate`, so a hook never waits for a build in `target`. Run `just check` for the full gate on the working tree.
+The pre-commit hook runs the fast steps of the local gate against a temporary copy of the staged files: fixtures, pinned Ruff lint/format, shell syntax, the staged-gate regression test, `cargo fmt --check` and `cargo clippy -D warnings`. It does not run `cargo test`, and it does not modify or restage files. The copy builds into `target/gate`, so a hook never waits for a build in `target`. The pre-push hook runs the tests (`cargo test`, the network install tests included) on every commit being pushed, exported with `git archive` into a temporary tree with the same `target/gate` build directory; a push that only deletes a branch tests nothing. Run `just check` for the full gate on the working tree.
 
-Hosted CI is the merge gate since 2026-10-20: branch protection on `main` requires the `gate` job of [Contract CI](.github/workflows/contract-check.yml). Run `just check` before publication when a change touches Rust; keep evidence for the exact source revision. Merge and publication still require authorization.
+Hosted CI is the merge gate since 2026-10-20: branch protection on `main` requires the `gate` job of [Contract CI](.github/workflows/contract-check.yml). The tests run locally before any push (the pre-push hook, owner rule of 2026-10-20); keep evidence for the exact source revision. Merge and publication still require authorization.
 
 ```sh
 just check            # the full gate; just check-all is the same
