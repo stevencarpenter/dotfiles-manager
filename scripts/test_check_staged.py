@@ -136,7 +136,7 @@ class StagedGateTest(unittest.TestCase):
 
 
 class PushGateTest(unittest.TestCase):
-    def test_pushed_commit_not_working_tree(self) -> None:
+    def test_every_pushed_commit_not_working_tree(self) -> None:
         with tempfile.TemporaryDirectory(
             prefix="dotfiles-manager-push-test-"
         ) as folder:
@@ -153,15 +153,23 @@ class PushGateTest(unittest.TestCase):
             shutil.copyfile(
                 Path(__file__).with_name("check_push.sh"), scripts / "check_push.sh"
             )
-            # The stub passes only for the committed content "valid".
-            (scripts / "check_all.sh").write_text('test "$(cat fixture)" = valid\n')
+            # The stub passes only for the committed content "valid"; a commit that carries
+            # the marker `expect-clean` also requires the dotfile of an earlier commit gone.
+            (scripts / "check_all.sh").write_text(
+                'test "$(cat fixture)" = valid || exit 1\n'
+                "[ ! -e expect-clean ] || [ ! -e .hidden ]\n"
+            )
             fixture = root / "fixture"
 
-            def commit(content: str) -> str:
-                fixture.write_text(content + "\n")
-                subprocess.run(["git", "add", "."], cwd=root, check=True, env=env)
+            def commit(files: dict[str, str | None]) -> str:
+                for name, text in files.items():
+                    if text is None:
+                        (root / name).unlink()
+                    else:
+                        (root / name).write_text(text + "\n")
+                subprocess.run(["git", "add", "--all"], cwd=root, check=True, env=env)
                 subprocess.run(
-                    ["git", "commit", "--quiet", "-m", content],
+                    ["git", "commit", "--quiet", "-m", "step"],
                     cwd=root,
                     check=True,
                     env=env,
@@ -170,25 +178,46 @@ class PushGateTest(unittest.TestCase):
                     ["git", "rev-parse", "HEAD"], cwd=root, env=env, text=True
                 ).strip()
 
-            good = commit("valid")
-            bad = commit("invalid")
+            good = commit({"fixture": "valid"})
+            bad = commit({"fixture": "invalid"})
+            fixed = commit({"fixture": "valid"})
+            commit({".hidden": "stale"})  # the commit below `clean`
+            clean = commit({".hidden": None, "expect-clean": ""})
             zero = "0" * 40
-            for sha, working, succeeds in [
-                (good, "invalid", True),
-                (bad, "valid", False),
-                (zero, "invalid", True),
+            tracking = "refs/remotes/origin/main"
+            for tip, remote, working, tested, succeeds in [
+                # The pushed commit is tested, not the working tree.
+                (good, None, "invalid", 1, True),
+                (bad, None, "valid", 2, False),
+                # Every commit the push introduces, oldest first, stopping at the first
+                # broken one: `bad` sits below the tip `fixed`.
+                (fixed, None, "valid", 2, False),
+                # What a remote-tracking ref already has is not tested again.
+                (fixed, bad, "valid", 1, True),
+                # Each commit gets a new tree: the dotfile below `clean` must not reach it.
+                (clean, fixed, "valid", 2, True),
+                # A deletion-only push tests nothing.
+                (zero, None, "invalid", 0, True),
             ]:
-                with self.subTest(sha=sha[:7], working=working):
+                with self.subTest(
+                    tip=tip[:7], remote=(remote or "")[:7], working=working
+                ):
+                    if remote is None:
+                        args = ["git", "update-ref", "-d", tracking]
+                    else:
+                        args = ["git", "update-ref", tracking, remote]
+                    subprocess.run(args, cwd=root, check=True, env=env)
                     fixture.write_text(working + "\n")
                     result = subprocess.run(
                         ["bash", "scripts/check_push.sh"],
                         cwd=root,
                         capture_output=True,
                         env=env,
-                        input=f"refs/heads/main {sha} refs/heads/main {zero}\n",
+                        input=f"refs/heads/main {tip} refs/heads/main {zero}\n",
                         text=True,
                     )
                     self.assertEqual(result.returncode == 0, succeeds, result.stderr)
+                    self.assertEqual(result.stdout.count("pre-push: testing "), tested)
                     self.assertEqual(fixture.read_text(), working + "\n")
 
 
