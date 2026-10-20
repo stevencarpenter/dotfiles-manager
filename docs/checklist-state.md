@@ -37,6 +37,8 @@ For source work, record exact source identity, successful full local checks, doc
 
 The owner changed the validation gate on 2026-10-09. Passing local validation is required for GitHub publication and merge. Hosted CI is informational. This policy supersedes hosted-check and account-eligibility requirements in the dated roadmap snapshot and earlier task wording. Preserve criterion IDs and unrelated requirements; do not claim that failed or unstarted hosted checks passed. Local validation does not replace native-device proof, independent review or explicit action approval.
 
+On 2026-10-20 the owner made the repository public and hosted CI the merge gate: a pull request merges when its `gate` job passed, and the commit hook runs only the fast steps. A criterion that asks for "successful full local checks" is satisfied by a passing `gate` job on the exact source revision or by a local `just check` run. Native-device proof, independent review and explicit action approval remain separate.
+
 ## Revise requirements without losing state
 
 Allocate new criterion IDs monotonically. Never renumber surviving criteria or reuse retired IDs. Preserve conditions, prohibitions and evidence qualifications with the outcome they constrain. Keep independent outcomes separately checkable. The roadmap records each original acceptance entry's resulting IDs.

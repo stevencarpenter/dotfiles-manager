@@ -10,11 +10,19 @@ check-scripts:
 check-style:
     bash scripts/check_all.sh rust-style
 
-# Implementation tests for the Rust workspace and the bootstrap script.
+# Implementation tests for the Rust workspace and the bootstrap script, network install tests included.
 check-tests:
     bash scripts/check_all.sh rust-tests
 
-# Full local validation, the same script as the commit hook. Hosted CI runs scripts/check_all.sh once per step, not this recipe.
+# The network install tests alone (crates.io access).
+check-network:
+    bash scripts/check_all.sh network-tests
+
+# The steps the commit hook runs, on the working tree instead of the staged copy.
+check-commit:
+    bash scripts/check_all.sh fixtures scripts rust-style
+
+# Full local validation. The commit hook runs `check-commit`; hosted CI runs each step in its own job.
 check:
     bash scripts/check_all.sh
 
