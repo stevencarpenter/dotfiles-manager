@@ -35,9 +35,9 @@ Read-only resolution can be built first internally, but does not satisfy this fi
 
 Install Git hooks once per clone with `lefthook install`. Git, Bash, Lefthook and uv must be available on PATH.
 
-The pre-commit hook runs the full local gate against a temporary copy of the staged files. It checks fixtures, pinned Ruff lint/format, shell syntax, the staged-gate regression test, `cargo fmt --check`, `cargo clippy -D warnings` and `cargo test`. It does not modify or restage files. Run `just check` to check the working tree manually.
+The pre-commit hook runs the fast steps of the local gate against a temporary copy of the staged files: fixtures, pinned Ruff lint/format, shell syntax, the staged-gate regression test, `cargo fmt --check` and `cargo clippy -D warnings`. It does not run `cargo test`, and it does not modify or restage files. The copy builds into `target/gate`, so a hook never waits for a build in `target`. Run `just check` for the full gate on the working tree.
 
-Passing local validation is the gate for GitHub publication and merge. Hosted CI is informational; account billing and unavailable runners do not block delivery. Keep evidence for the exact source revision. Merge and publication still require authorization.
+Hosted CI is the merge gate since 2026-10-20: branch protection on `main` requires the `gate` job of [Contract CI](.github/workflows/contract-check.yml). Run `just check` before publication when a change touches Rust; keep evidence for the exact source revision. Merge and publication still require authorization.
 
 ```sh
 just check            # the full gate; just check-all is the same
@@ -45,11 +45,13 @@ just check-fixtures   # documentation fixtures only
 just check-scripts    # Ruff, shell syntax, staged-gate regression test
 just check-style      # cargo fmt --check, cargo clippy -D warnings
 just check-tests      # cargo test: implementation, CLI, bootstrap and build-controls tests
+just check-network    # the network install tests alone
+just check-commit     # what the commit hook runs, on the working tree
 # Or, without just, the fixture checker alone:
 uv run scripts/check_examples.py
 ```
 
-`scripts/check_all.sh` is the single shared gate and accepts the step names `fixtures`, `scripts`, `rust-style` and `rust-tests`. The CLI and differential tests need the isolated build, so the gate runs `cargo test --workspace --locked --features dfm-cli/test-isolation`; a plain `cargo test` skips those test targets. The install test needs crates.io, so it is `#[ignore]`d and the gate runs it explicitly with `-- --ignored`. Set `DFM_SKIP_NETWORK_TESTS=1` to skip it; the gate then prints `SKIPPED: network install test`. The `scripts` step fails when `shellcheck` is missing. Set `DFM_SKIP_SHELLCHECK=1` to skip it; the gate then prints `SKIPPED: shellcheck`.
+`scripts/check_all.sh` is the single shared gate and accepts the step names `fixtures`, `scripts`, `rust-style`, `rust-tests` and `network-tests`. The CLI and differential tests need the isolated build, so the gate runs `cargo test --locked --features dfm-cli/test-isolation`; a plain `cargo test` skips those test targets. `DFM_TEST_SELECT` replaces the default `--workspace --features dfm-cli/test-isolation` selection with cargo package, target and feature flags; CI uses it to run one shard of test binaries per job. The install tests need crates.io, so they are `#[ignore]`d and the `network-tests` step runs them explicitly with `-- --ignored`; `rust-tests` runs that step itself. `DFM_NETWORK_TESTS` limits that step to the named tests of `crates/cli/tests/bootstrap.rs`; CI uses it because each of those tests builds the manager in release mode. Set `DFM_SKIP_NETWORK_TESTS=1` to skip it; the gate then prints `SKIPPED: network install test`. The `scripts` step fails when `shellcheck` is missing. Set `DFM_SKIP_SHELLCHECK=1` to skip it; the gate then prints `SKIPPED: shellcheck`.
 
 The fixture checker below is unchanged and still checks documentation fixtures only.
 
@@ -59,6 +61,6 @@ It does **not** implement composition, evaluate the acceptance expectations, con
 
 The checker reports 15 manifests, 8 modules, 16 unexecuted acceptance-case definitions, nine malformed-variant rejections, and one accepted profile without overrides. Earlier draft verification rejected the original five malformed variants. Ruff lint/format, hook shell syntax, and authored-source Gitleaks scans passed. The draft 0.2 review HTML passed layout checks at 1280 and 390 CSS pixels in both themes; those checks predate the doctor table added in draft 0.3. These checks do not establish implementation of the required workflows.
 
-[Contract CI](.github/workflows/contract-check.yml) mirrors the local gate on pushes and pull requests: fixtures, Ruff, hook and bootstrap script syntax, Rust style and Rust tests. Hosted Actions are disabled for this repository, so the local gate is the authority. The checks run no manager workflow (sync, update, try, adopt, purge) and no native-device proof.
+[Contract CI](.github/workflows/contract-check.yml) runs the same script in stages. A pull request runs fixtures and scripts on Linux, and Rust style, four test shards and four install-test shards on macOS in parallel; the Rust jobs run only when a Rust input changed, the install tests only when a bootstrap input changed, and a new push cancels the older run. A push to `main` runs every step. Every macOS job restores the cargo dependency cache and the first to finish saves it. The `gate` job passes when every job passed or was skipped, and branch protection requires it. The checks run no manager workflow (sync, update, try, adopt, purge) and no native-device proof.
 
 All names, account references, and external configuration in the fixtures are synthetic. The examples demonstrate the proposed format; they are not a complete migration of the existing dotfiles inventory and must not be deployed.

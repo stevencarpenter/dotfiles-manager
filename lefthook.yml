@@ -1,4 +1,5 @@
 pre-commit:
   jobs:
+    # The fast steps only; hosted CI runs the tests on the pull request (README, "Check the draft").
     - name: local-validation
-      run: bash scripts/check_staged.sh
+      run: bash scripts/check_staged.sh fixtures scripts rust-style
