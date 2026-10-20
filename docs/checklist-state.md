@@ -13,7 +13,17 @@ Each leaf has one `## Acceptance criteria` section. The section ends at the next
 
 Check a requirement only after its whole outcome has been verified. Record supporting evidence by criterion ID in the ticket or an approved linked artifact. A required failure, unknown or skipped check leaves the requirement unchecked. An approval criterion requires the owner's explicit approval for its named action and scope. A checked box never grants additional authority.
 
-A leaf is complete exactly when its canonical checklist is nonempty, contains every expected criterion once, and every criterion is checked. IDs must use that ticket's prefix. Missing, duplicate, unexpected, malformed or unreadable criteria prevent a completion claim. Read the live description; do not infer completion from a board column or cached count.
+A leaf is complete exactly when its canonical checklist is nonempty, contains every expected criterion once, and every criterion is checked or superseded. IDs must use that ticket's prefix. Missing, duplicate, unexpected, malformed or unreadable criteria prevent a completion claim. Read the live description; do not infer completion from a board column or cached count.
+
+## Supersede requirements
+
+The owner can supersede a requirement instead of delivering it. The line keeps its ID and its unchecked box, its text is struck through, and a note names the date and the reason:
+
+```markdown
+- [ ] ~~DFM-6.C03: Required outcome and its constraints.~~ Superseded 2026-10-20: reason.
+```
+
+A superseded requirement counts as complete for leaf, epic and prerequisite completion. The box stays unchecked, so a superseded line never reads as verified delivery. Only the owner supersedes a requirement; an agent records the owner's instruction in the note and in `docs/roadmap.json` (`completion_contract.realignment_*`). A whole leaf is superseded by striking every open requirement and moving it to done with an evidence comment. Rule added on 2026-10-20 by owner instruction.
 
 ## Complete tasks and epics
 
@@ -21,7 +31,7 @@ Check the leaf's requirements to complete the task. There is no second task comp
 
 An epic is complete exactly when its native child relations match its expected child set, its goal map covers its requirements, and every expected child is complete. Missing, unexpected or unreadable children prevent a completion claim. Project completion is derived from all five epics. Derived completion has no separately stored marker or status.
 
-Before dispatch, read the current prerequisite relations and the canonical checklists of all blocking predecessors. Every prerequisite requirement must be checked. Readiness labels, current evidence and explicit action authorization remain dispatch controls. They are not completion state. Filing tickets does not authorize implementation, merge, live configuration, secrets, retirement, publication or billing changes.
+Before dispatch, read the current prerequisite relations and the canonical checklists of all blocking predecessors. Every prerequisite requirement must be checked or superseded. Readiness labels, current evidence and explicit action authorization remain dispatch controls. They are not completion state. Filing tickets does not authorize implementation, merge, live configuration, secrets, retirement, publication or billing changes.
 
 For source work, record exact source identity, successful full local checks, documentation and a verified commit. Changed-source implementation also requires an authorized merge before the leaf is complete. Its separate merge criterion records that outcome. DFM-13 instead requires its preserved validation evidence, accurate PR metadata and reviewed exact-SHA local checks. It does not require merging PR #1.
 

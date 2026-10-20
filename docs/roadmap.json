@@ -175,7 +175,9 @@
         "DFM-16",
         "DFM-17",
         "DFM-18",
-        "DFM-19"
+        "DFM-19",
+        "DFM-61",
+        "DFM-64"
       ],
       "goal_coverage": [
         {
@@ -276,6 +278,26 @@
             "DFM-15.C01",
             "DFM-15.C05",
             "DFM-15.C06"
+          ]
+        },
+        {
+          "goal": "Daily path (owner realignment 2026-10-20): feat(cli): record the checkout root in the binding and default --root",
+          "criterion_ids": [
+            "DFM-61.C01",
+            "DFM-61.C02",
+            "DFM-61.C03",
+            "DFM-61.C04",
+            "DFM-61.C05",
+            "DFM-61.C06"
+          ]
+        },
+        {
+          "goal": "Daily path (owner realignment 2026-10-20): docs(authoring): executable module authoring walkthrough",
+          "criterion_ids": [
+            "DFM-64.C01",
+            "DFM-64.C02",
+            "DFM-64.C03",
+            "DFM-64.C04"
           ]
         }
       ]
@@ -458,7 +480,9 @@
         "DFM-33",
         "DFM-34",
         "DFM-35",
-        "DFM-36"
+        "DFM-36",
+        "DFM-62",
+        "DFM-63"
       ],
       "goal_coverage": [
         {
@@ -576,6 +600,34 @@
             "DFM-36.C02",
             "DFM-36.C11",
             "DFM-36.C12"
+          ]
+        },
+        {
+          "goal": "Daily path (owner realignment 2026-10-20): feat(cli): approve a plan with one prompt on a TTY",
+          "criterion_ids": [
+            "DFM-62.C01",
+            "DFM-62.C02",
+            "DFM-62.C03",
+            "DFM-62.C04",
+            "DFM-62.C05",
+            "DFM-62.C06",
+            "DFM-62.C07",
+            "DFM-62.C08",
+            "DFM-62.C09"
+          ]
+        },
+        {
+          "goal": "Daily path (owner realignment 2026-10-20): feat(sync): compose configuration, packages, secrets and services under one approval",
+          "criterion_ids": [
+            "DFM-63.C01",
+            "DFM-63.C02",
+            "DFM-63.C03",
+            "DFM-63.C04",
+            "DFM-63.C05",
+            "DFM-63.C06",
+            "DFM-63.C07",
+            "DFM-63.C08",
+            "DFM-63.C09"
           ]
         }
       ]
@@ -946,7 +998,7 @@
       "kaneo": {
         "id": "wsz2tv8cjtvxona3ysqmio56",
         "ticket": "DFM-9",
-        "status": "to-do",
+        "status": "done",
         "priority": "high",
         "labels": [],
         "url": "https://kaneo.snugmarina.org/dashboard/workspace/7tMuvznyx3ZOUb2boKJQbakZi44sT0eU/project/ldzsz08c771hgwkfwwzqjdd5/task/wsz2tv8cjtvxona3ysqmio56"
@@ -990,7 +1042,19 @@
         4,
         5,
         null
-      ]
+      ],
+      "superseded": {
+        "date": "2026-10-20",
+        "reason": "Superseded by the live M5 bundle (DFM-49, DFM-50, DFM-51, DFM-52 done). The selected bundle in ~/.dotfiles plus the side-channel scripts are the inventory. The M3 inventory folds into DFM-8 and DFM-29.",
+        "criterion_ids": [
+          "DFM-9.C01",
+          "DFM-9.C02",
+          "DFM-9.C03",
+          "DFM-9.C04",
+          "DFM-9.C05",
+          "DFM-9.C06"
+        ]
+      }
     },
     {
       "key": "architecture",
@@ -1108,7 +1172,7 @@
       "kaneo": {
         "id": "aoktjvcc1totjjv1axrjm61m",
         "ticket": "DFM-11",
-        "status": "to-do",
+        "status": "done",
         "priority": "high",
         "labels": [
           "needs-human"
@@ -1160,7 +1224,21 @@
         5,
         5,
         null
-      ]
+      ],
+      "superseded": {
+        "date": "2026-10-20",
+        "reason": "Superseded by the live M5 cutover (2026-10-16; main 469fb7f on 2026-10-19, doctor ok). The M3 probes stay in DFM-37.",
+        "criterion_ids": [
+          "DFM-11.C01",
+          "DFM-11.C02",
+          "DFM-11.C03",
+          "DFM-11.C04",
+          "DFM-11.C05",
+          "DFM-11.C06",
+          "DFM-11.C07",
+          "DFM-11.C08"
+        ]
+      }
     },
     {
       "key": "ci-account",
@@ -1237,7 +1315,7 @@
         "Verify real hosted checks for the exact pushed SHA and confirm PR #1 remains private-repository, open and unmerged until separately authorized. Report jobs that cannot start as infrastructure blockers.",
         "Correct the PR's product-validation wording to documentation-checker validation.",
         "Record the off-contract generated commit subject and obtain an approved correction/disposition without silently rewriting preserved history.",
-        "Record the checker\u2019s actual structural/self-test coverage separately from unexecuted resolver and workflow requirements.",
+        "Record the checker’s actual structural/self-test coverage separately from unexecuted resolver and workflow requirements.",
         "Re-run the relevant local gate and reconcile the remote head.",
         "Verify that the preserved validation run, accurate PR metadata and reviewed exact-SHA hosted checks are complete. PR #1 remains open and unmerged until separately authorized; merge is not this leaf's closure condition or a prerequisite for native proof. Attach the run/check URLs and exact SHA; no billing or merge authority is granted.",
         "Record delivery evidence for publication: the preserved validation run, accurate PR metadata, reviewed exact-SHA hosted checks and run/check URLs; PR #1 remains open and unmerged until separately authorized, and merge is not required for this evidence leaf. Identify skips, unknowns and partial failures; unmet required evidence prevents checking this criterion."
@@ -1254,7 +1332,7 @@
         "Resume run 01M4AQBBVXZP1R06N185E4NTCR, preserving its fixes and branch docs/initial-contract at the actual current SHA. Never abort/reset/rewrite merely to bypass the finding.",
         "Verify real hosted checks for the exact pushed SHA and confirm PR #1 remains private-repository, open and unmerged until separately authorized. Report jobs that cannot start as infrastructure blockers.",
         "Correct the PR's product-validation wording to documentation-checker validation. Record the off-contract generated commit subject and obtain an approved correction/disposition without silently rewriting preserved history.",
-        "Record the checker\u2019s actual structural/self-test coverage separately from unexecuted resolver and workflow requirements. Re-run the relevant local gate and reconcile the remote head.",
+        "Record the checker’s actual structural/self-test coverage separately from unexecuted resolver and workflow requirements. Re-run the relevant local gate and reconcile the remote head.",
         "This evidence leaf closes when the preserved validation run, accurate PR metadata and reviewed exact-SHA hosted checks are complete. PR #1 remains open and unmerged until separately authorized; merge is not this leaf's closure condition or a prerequisite for native proof. Attach the run/check URLs and exact SHA; no billing or merge authority is granted."
       ],
       "acceptance_ids": [
@@ -1679,8 +1757,8 @@
         "Remove only approved, previously owned outputs that still match receipts. Module deselection alone does not uninstall packages, erase runtime state or imply ownership of siblings.",
         "Record file publication separately from consumer reload. Required failure stops mutation by default, blocks dependents and reports applied/failed/blocked/not-started work.",
         "Regression checks cover recursive ~/.dotfiles-style links, stale/dangling parents, directory transitions, replaced links, target races, permissions and safe no-op reruns.",
-        "For an explicitly approved legacy file handoff, verify the exact released writer and unchanged output, journal its recoverable baseline and record the new claim before publication. Refuse changed/unattributed outputs.",
-        "Test a legacy symlink and co-owned output, interruption between release/acquisition, concurrent replacement and scoped recovery. Use synthetic approved claims here; integration/rehearsal reconciles actual claims with the ledger.",
+        "For an explicitly approved legacy file handoff on the work M3, verify the exact released writer and unchanged output, journal its recoverable baseline and record the new claim before publication. Refuse changed/unattributed outputs. (The M5 needs none: it adopted its existing links through DFM-45 and no legacy writer remains there.)",
+        "For the M3 handoff, test a legacy symlink and co-owned output, interruption between release/acquisition, concurrent replacement and scoped recovery. Use synthetic approved claims here; integration/rehearsal reconciles actual claims with the ledger.",
         "Record delivery evidence for files: exact source SHA, successful required focused tests and acceptance checks, relevant documentation and actual hosted checks for that SHA. Record commands/results and identify skips, unknowns and partial failures; unmet required checks prevent checking this criterion.",
         "Record separately authorized merge of the verified files implementation source at the exact reviewed SHA. Checkmarks do not authorize merge."
       ],
@@ -1815,6 +1893,18 @@
         5,
         null,
         null
+      ],
+      "superseded_criteria": [
+        {
+          "id": "DFM-19.C02",
+          "date": "2026-10-20",
+          "reason": "Rollback is not a goal (owner, 2026-10-19). Interrupted-operation settlement (state recover, state resolve) stays."
+        },
+        {
+          "id": "DFM-19.C03",
+          "date": "2026-10-20",
+          "reason": "Rollback is not a goal (owner, 2026-10-19). Interrupted-operation settlement (state recover, state resolve) stays."
+        }
       ]
     },
     {
@@ -1898,11 +1988,11 @@
       ],
       "problem": "MCP destinations, hooks and agent settings mix manager-owned fields with application preferences and foreign handlers.",
       "acceptance": [
-        "Adapt existing mcp_sync/activation merge algorithms behind the new owner boundary for every selected destination; do not invoke old activation orchestration as another writer.",
+        "Keep the `claude-settings/v1` merge of `.claude/settings.json` (built, docs/adapters.md) and add one merge adapter for `~/.codex/hooks.json` that inserts declared hook entries and retires only entries the ledger records, replacing the `jq` step `codex_hooks_merge` in `~/.dotfiles/scripts/hooks-sync.sh`. MCP configuration files and skill fan-out stay with `mcp_sync`; the manager neither ports nor invokes it.",
         "Preserve foreign keys/handlers, seed-only preferences, explicit disables and bounded capture semantics. Unsupported reverse transformations, including current Codex capture limits, stay explicit.",
         "Re-read/merge safely or require quiescence for concurrent application writers. A manager lock is not a lock on the application; changed foreign inputs invalidate unsafe publication.",
         "Keep discovery/fetch outside read-only resolution and keep sessions, credentials, approval/trust state and databases outside configuration capture. Respect intentional tracked app-written declarative exceptions.",
-        "Tests preserve foreign hooks/preferences, retire only owned handlers and retain last-good files after missing overlays, malformed settings or concurrent writes. Every inventoried destination is accounted for.",
+        "Tests preserve foreign hooks/preferences, retire only owned handlers and retain last-good files after missing overlays, malformed settings or concurrent writes, for the two destinations `.claude/settings.json` and `.codex/hooks.json`.",
         "Record delivery evidence for agent-config: exact source SHA, successful required focused tests and acceptance checks, relevant documentation and actual hosted checks for that SHA. Record commands/results and identify skips, unknowns and partial failures; unmet required checks prevent checking this criterion.",
         "Record separately authorized merge of the verified agent-config implementation source at the exact reviewed SHA. Checkmarks do not authorize merge."
       ],
@@ -1955,6 +2045,13 @@
         5,
         null,
         null
+      ],
+      "superseded_criteria": [
+        {
+          "id": "DFM-21.C02",
+          "date": "2026-10-20",
+          "reason": "Capture stays in mcp_sync.capture outside the manager (owner, 2026-10-20, lighter modular approach)."
+        }
       ]
     },
     {
@@ -2186,7 +2283,8 @@
         "Place eligible pin/lock edits in their actual owning repository with provenance; missing credentials, read-only sources or unsupported managed versions block preparation instead of shrinking the update set.",
         "Tests exercise disable/substitution, dependency overlap, malicious/escaped source paths, foreign skills, local forks and lock updates without hard-coding model names or cosmetic preferences.",
         "Record delivery evidence for plugins: exact source SHA, successful required focused tests and acceptance checks, relevant documentation and actual hosted checks for that SHA. Record commands/results and identify skips, unknowns and partial failures; unmet required checks prevent checking this criterion.",
-        "Record separately authorized merge of the verified plugins implementation source at the exact reviewed SHA. Checkmarks do not authorize merge."
+        "Record separately authorized merge of the verified plugins implementation source at the exact reviewed SHA. Checkmarks do not authorize merge.",
+        "The agent registry (`stevencarpenter/agents`, installed by `~/.dotfiles/scripts/install-agent-registry.sh`) is a version source. `update` fast-forwards the managed copy at `~/.local/share/agent-registry` and reports its revision. A working copy at `~/projects/agents` is never pulled: `update` reports its revision and dirty state and names it as the copy the installer will use. The install step stays in the script, run by the `just` wrapper after `update`."
       ],
       "kaneo": {
         "id": "xs074zuete91uezwms13fdou",
@@ -2211,7 +2309,8 @@
         "DFM-25.C05",
         "DFM-25.C06",
         "DFM-25.C07",
-        "DFM-25.C08"
+        "DFM-25.C08",
+        "DFM-25.C09"
       ],
       "acceptance_source_map": {
         "1": [
@@ -2340,7 +2439,7 @@
       "kaneo": {
         "id": "gz0jmqgz86oulv4gac9epbb9",
         "ticket": "DFM-27",
-        "status": "to-do",
+        "status": "done",
         "priority": "high",
         "labels": [],
         "url": "https://kaneo.snugmarina.org/dashboard/workspace/7tMuvznyx3ZOUb2boKJQbakZi44sT0eU/project/ldzsz08c771hgwkfwwzqjdd5/task/gz0jmqgz86oulv4gac9epbb9"
@@ -2386,7 +2485,20 @@
         5,
         null,
         null
-      ]
+      ],
+      "superseded": {
+        "date": "2026-10-20",
+        "reason": "Superseded: nix is gone from the M5 (/nix absent 2026-10-20); macOS defaults, the maxfiles agent, EDITOR and the tiling reload run as scripts (DFM-51). Lighter modular approach chosen by the owner. M3 needs go through DFM-40 and DFM-41.",
+        "criterion_ids": [
+          "DFM-27.C01",
+          "DFM-27.C02",
+          "DFM-27.C03",
+          "DFM-27.C04",
+          "DFM-27.C05",
+          "DFM-27.C06",
+          "DFM-27.C07"
+        ]
+      }
     },
     {
       "key": "public-profile",
@@ -2411,7 +2523,7 @@
       "kaneo": {
         "id": "evw1rfdbe6wmdv1tqido8bd5",
         "ticket": "DFM-28",
-        "status": "to-do",
+        "status": "done",
         "priority": "high",
         "labels": [],
         "url": "https://kaneo.snugmarina.org/dashboard/workspace/7tMuvznyx3ZOUb2boKJQbakZi44sT0eU/project/ldzsz08c771hgwkfwwzqjdd5/task/evw1rfdbe6wmdv1tqido8bd5"
@@ -2463,7 +2575,21 @@
         6,
         null,
         null
-      ]
+      ],
+      "superseded": {
+        "date": "2026-10-20",
+        "reason": "Superseded by DFM-49, DFM-50 and DFM-51 (live since DFM-52). C06, the authoring walkthrough, moved to DFM-64.",
+        "criterion_ids": [
+          "DFM-28.C01",
+          "DFM-28.C02",
+          "DFM-28.C03",
+          "DFM-28.C04",
+          "DFM-28.C05",
+          "DFM-28.C06",
+          "DFM-28.C07",
+          "DFM-28.C08"
+        ]
+      }
     },
     {
       "key": "work-profile",
@@ -2632,7 +2758,7 @@
       "acceptance": [
         "Discover candidates across the prospective complete selected graph: core/external Git sources, package/input pins, runtimes, plugins/extensions, skills and native apps.",
         "Report unsupported or unauthenticated participants before deployment.",
-        "Use latest eligible channel/compatibility/soak versions, distinguishing reproducible pins from explicit holds with reasons. Respect forks and native lifecycle owners.",
+        "The default policy is rolling: each participant moves to the newest version its provider resolves, with no soak period and no channel requirement. A hold is an explicit per-tool declaration with a reason and is reported as held. A reproducible pin is advanced by `update`; it is not a hold. Respect forks and native lifecycle owners.",
         "Present one combined source/lock/install/reload diff and approval.",
         "Decline changes no live installation, owning source content or deployed files; staged metadata is not deployment.",
         "Write pin/lock changes only to owning sources, preserve unrelated edits/private boundaries and never auto-commit/push. Read-only source update paths are explicit or block.",
@@ -2640,7 +2766,9 @@
         "Tests prove partial failure, missing provider, pending native updates and self-update sequencing cannot report full success.",
         "Exclude trial-only upgrades. During preparation, block candidate operations whose known indirect provider effects would change an active trial installation or its attributed dependencies. Preserve the trial baseline/attribution and give the action needed to resolve the blocked trial; add no new approval mode that silently bypasses trial protection.",
         "Record delivery evidence for update: exact source SHA, successful required focused tests and acceptance checks, relevant documentation and actual hosted checks for that SHA. Record commands/results and identify skips, unknowns and partial failures; unmet required checks prevent checking this criterion.",
-        "Record separately authorized merge of the verified update implementation source at the exact reviewed SHA. Checkmarks do not authorize merge."
+        "Record separately authorized merge of the verified update implementation source at the exact reviewed SHA. Checkmarks do not authorize merge.",
+        "Native self-updating applications are participants: Claude Code (`claude update`, installed under `~/.local/share/claude/versions/`) and Codex (its standalone updater under `~/.codex/packages/standalone/`). `update` runs each through its own updater, observes the resulting version, and reports `pending` when completion is not observed, never `updated`.",
+        "A second copy of a participant under another owner (for example the Homebrew cask `codex` beside the standalone Codex install) is reported with both paths and owners. It is never silently chosen or removed."
       ],
       "kaneo": {
         "id": "t1md1gh1aeyhnfibos5tbeuo",
@@ -2669,7 +2797,9 @@
         "DFM-31.C08",
         "DFM-31.C09",
         "DFM-31.C10",
-        "DFM-31.C11"
+        "DFM-31.C11",
+        "DFM-31.C12",
+        "DFM-31.C13"
       ],
       "acceptance_source_map": {
         "1": [
@@ -3127,6 +3257,58 @@
         null,
         5,
         null
+      ],
+      "superseded_criteria": [
+        {
+          "id": "DFM-36.C02",
+          "date": "2026-10-20",
+          "reason": "Carried by the tests of the implementing leaves (DFM-22 to DFM-26, DFM-30 to DFM-34, DFM-61 to DFM-63)."
+        },
+        {
+          "id": "DFM-36.C03",
+          "date": "2026-10-20",
+          "reason": "Carried by the tests of the implementing leaves (DFM-22 to DFM-26, DFM-30 to DFM-34, DFM-61 to DFM-63)."
+        },
+        {
+          "id": "DFM-36.C05",
+          "date": "2026-10-20",
+          "reason": "Carried by the tests of the implementing leaves (DFM-22 to DFM-26, DFM-30 to DFM-34, DFM-61 to DFM-63)."
+        },
+        {
+          "id": "DFM-36.C06",
+          "date": "2026-10-20",
+          "reason": "Carried by the tests of the implementing leaves (DFM-22 to DFM-26, DFM-30 to DFM-34, DFM-61 to DFM-63)."
+        },
+        {
+          "id": "DFM-36.C08",
+          "date": "2026-10-20",
+          "reason": "Carried by the tests of the implementing leaves (DFM-22 to DFM-26, DFM-30 to DFM-34, DFM-61 to DFM-63)."
+        },
+        {
+          "id": "DFM-36.C09",
+          "date": "2026-10-20",
+          "reason": "Carried by the tests of the implementing leaves (DFM-22 to DFM-26, DFM-30 to DFM-34, DFM-61 to DFM-63)."
+        },
+        {
+          "id": "DFM-36.C10",
+          "date": "2026-10-20",
+          "reason": "Carried by the tests of the implementing leaves (DFM-22 to DFM-26, DFM-30 to DFM-34, DFM-61 to DFM-63)."
+        },
+        {
+          "id": "DFM-36.C11",
+          "date": "2026-10-20",
+          "reason": "Carried by the tests of the implementing leaves (DFM-22 to DFM-26, DFM-30 to DFM-34, DFM-61 to DFM-63)."
+        },
+        {
+          "id": "DFM-36.C12",
+          "date": "2026-10-20",
+          "reason": "Carried by the tests of the implementing leaves (DFM-22 to DFM-26, DFM-30 to DFM-34, DFM-61 to DFM-63)."
+        },
+        {
+          "id": "DFM-36.C14",
+          "date": "2026-10-20",
+          "reason": "Independent security/recovery review does not match the local-gate policy of 2026-10-09."
+        }
       ]
     },
     {
@@ -3148,7 +3330,7 @@
         "Verify the manager installs/runs through approved distribution paths on M5 without requiring the retiring managed runtime. Native inability is a release blocker, not an optional skip.",
         "Reconcile results with mocks and resource coverage; fix any contradiction and rerun affected review/CI.",
         "Owner approves the evidence; passing this task does not authorize ownership handoff.",
-        "Record delivery evidence for provider-proof: the exact candidate/provider identities, required M5 and M3 native probes and distribution proof, reconciled results and owner-approved evidence. Identify skips, unknowns and partial failures; unmet required evidence prevents checking this criterion.",
+        "Record delivery evidence for provider-proof on the M3: the exact candidate/provider identities, the required M3 native probes and distribution proof, reconciled results and owner-approved evidence. Identify skips, unknowns and partial failures; unmet required evidence prevents checking this criterion.",
         "Run owner-approved native macOS contract probes for actual selected provider versions in the M3 machine context in disposable targets/accounts where supported. Record exact CLI/library versions, architecture and commands. Probes that cannot be safely isolated are explicitly authorized and scoped or remain blockers. No production database migration, package churn, secret export or blind service restart as a test.",
         "Verify the manager installs/runs through approved distribution paths on M3 without requiring the retiring managed runtime. Native inability is a release blocker, not an optional skip."
       ],
@@ -3210,6 +3392,38 @@
         null,
         1,
         4
+      ],
+      "superseded_criteria": [
+        {
+          "id": "DFM-37.C01",
+          "date": "2026-10-20",
+          "reason": "Superseded by the live M5 cutover (DFM-52). The leaf covers the M3 only."
+        },
+        {
+          "id": "DFM-37.C02",
+          "date": "2026-10-20",
+          "reason": "Superseded by the live M5 cutover (DFM-52). The leaf covers the M3 only."
+        },
+        {
+          "id": "DFM-37.C03",
+          "date": "2026-10-20",
+          "reason": "Superseded by the live M5 cutover (DFM-52). The leaf covers the M3 only."
+        },
+        {
+          "id": "DFM-37.C04",
+          "date": "2026-10-20",
+          "reason": "Superseded by the live M5 cutover (DFM-52). The leaf covers the M3 only."
+        },
+        {
+          "id": "DFM-37.C05",
+          "date": "2026-10-20",
+          "reason": "Superseded by the live M5 cutover (DFM-52). The leaf covers the M3 only."
+        },
+        {
+          "id": "DFM-37.C06",
+          "date": "2026-10-20",
+          "reason": "Superseded by the live M5 cutover (DFM-52). The leaf covers the M3 only."
+        }
       ]
     },
     {
@@ -3460,12 +3674,12 @@
         "Release old ownership before each new writer starts, record receipts locally and halt/recover on required failures. Do not import personal-only modules, network access or credentials by convenience.",
         "Verify fresh login/restart as approved, selected work development workflows, identities, PATH/runtimes, private generated settings, secrets and native/system services with actual consumer evidence.",
         "Safely demonstrate complete-graph update across the actual M3 work graph using approved targets, without moving private configuration/evidence to unauthorized locations.",
-        "Observe the declared normal-use window and required cycles. Keep rollback materials and old generations until the separate retirement gate.",
+        "Observe the declared normal-use window and required cycles. Keep the pre-cutover backup until the separate retirement gate.",
         "Record delivery evidence for m3-cutover: the completed personal operational acceptance, separately approved exact M3 candidate/plan and window, local operational receipts, four workflow demonstrations and owner operational acceptance after observation. Identify skips, unknowns and partial failures; unmet required evidence prevents checking this criterion.",
         "Safely demonstrate one-command GitHub sync across the actual M3 work graph using approved targets, without moving private configuration/evidence to unauthorized locations.",
         "Safely demonstrate trial with both adopt and purge across the actual M3 work graph using approved targets, without moving private configuration/evidence to unauthorized locations.",
         "Safely demonstrate read-only doctor across the actual M3 work graph using approved targets, without moving private configuration/evidence to unauthorized locations.",
-        "Owner confirms M3 operational acceptance after the declared normal-use window and required cycles. Keep rollback materials and old generations until the separate retirement gate."
+        "Owner confirms M3 operational acceptance after the declared normal-use window and required cycles. Keep the pre-cutover backup until the separate retirement gate."
       ],
       "kaneo": {
         "id": "azd50kz4612ryw4enrpmxlu9",
@@ -3682,9 +3896,188 @@
         6,
         null
       ]
+    },
+    {
+      "key": "cli-root",
+      "epic": "engine",
+      "title": "feat(cli): record the checkout root in the binding and default --root",
+      "priority": "urgent",
+      "depends": [
+        "bootstrap"
+      ],
+      "problem": "Every command that reads sources requires --root <dir> because no source lock existed when explain was built (docs/resolver.md item 13). The checkout is ~/.dotfiles on every machine and the binding already records the absolute profile path inside it.",
+      "acceptance": [
+        "`bind` accepts an optional `--root <dir>`. The value is canonicalized and must contain the bound profile (the existing `canonical_root` rule in `crates/cli/src/lib.rs`), else `bind` refuses with the same code `plan` gives today. Without `--root`, `bind` records the nearest ancestor of the profile that holds a `.git` entry; when none exists, `bind` exits 2 naming `--root`.",
+        "The binding gains a `root` key under binding schema 2 (`crates/model/src/binding.rs`). A schema 1 binding stays readable by every command with today's behavior (`--root` required). `bind` with the same profile and machine id on a schema 1 binding rewrites it as schema 2 with `root` (an in-place upgrade under the writer lock, journaled). A different profile or machine id stays `E_REBIND_UNSUPPORTED`.",
+        "On every command that takes `--root`, the flag is optional. The default is the binding's `root`. An explicit `--root` wins. With neither, the command exits 2 naming `bind --root`. The plan digest for the same tree is identical whether the root came from the flag or from the binding.",
+        "The help text in `crates/cli/src/lib.rs`, README.md, docs/first-run.md, docs/bootstrap.md and docs/resolver.md item 13 show the default and no longer present `--root` as required.",
+        "CLI tests in the test-isolation build cover: default from the binding, explicit override, schema 1 binding without `root` (flag still required), neither present (exit 2), and the in-place upgrade. `bash scripts/check_all.sh` exits 0 on the exact SHA.",
+        "Record delivery evidence: exact SHA and the merge PR."
+      ],
+      "kaneo": {
+        "id": "nf6xht7sgpwrzah5gai9jorr",
+        "ticket": "DFM-61",
+        "status": "to-do",
+        "priority": "urgent",
+        "labels": [
+          "ready-for-agent"
+        ],
+        "url": "https://kaneo.snugmarina.org/dashboard/workspace/7tMuvznyx3ZOUb2boKJQbakZi44sT0eU/project/ldzsz08c771hgwkfwwzqjdd5/task/nf6xht7sgpwrzah5gai9jorr"
+      },
+      "original_acceptance": [],
+      "acceptance_ids": [
+        "DFM-61.C01",
+        "DFM-61.C02",
+        "DFM-61.C03",
+        "DFM-61.C04",
+        "DFM-61.C05",
+        "DFM-61.C06"
+      ],
+      "acceptance_source_map": {},
+      "acceptance_original_indices": [],
+      "filed": {
+        "date": "2026-10-20",
+        "origin": "owner daily-path audit, 2026-10-19"
+      }
+    },
+    {
+      "key": "cli-prompt",
+      "epic": "workflows",
+      "title": "feat(cli): approve a plan with one prompt on a TTY",
+      "priority": "urgent",
+      "depends": [
+        "files"
+      ],
+      "problem": "docs/architecture.md section 10 defines an interactive mode (TTY prompt, 300 s, decline exits 4) and a noninteractive mode. Only the noninteractive mode is built (\"No prompt exists\", docs/apply.md item 4), so a person runs each mutating command twice and pastes a digest plus per-operation flags.",
+      "acceptance": [
+        "Interactive detection follows the contract: stdin and stderr are terminals (`std::io::IsTerminal`, no new crate) and `--no-input` is absent. `--no-input` is accepted by every mutating command: `apply`, `secrets`, `packages`, `services`, `trial`, `sync`.",
+        "In an interactive run without `--yes-plan`, each of those commands prints the plan and its digest, then asks exactly one question on stderr. The question lists the digest and, by path or resource id, every removal, every adoption and every disruptive restart the answer covers. No other question is asked in the run.",
+        "The exact answer `yes` runs the same path as `--yes-plan <digest>` with `--allow-disruptive` and `--allow-adopt` for exactly the planned set. The second plan under the lock must still match the shown digest (`E_PLAN_STALE` otherwise). The receipt records approval kind `prompt`; `yes_plan` stays for the flag.",
+        "Any other answer, EOF, or 300 s without an answer exits 4 (`declined`) with no mutation, no journal entry and no receipt.",
+        "Noninteractive behavior is unchanged: without `--yes-plan`, exit 3 `E_APPROVAL_REQUIRED` with the gate list; with `--yes-plan`, no prompt even on a terminal. `--preview` is unchanged.",
+        "The prompt waives nothing the contract reserves: a blocked plan, a missing credential (`E_CREDENTIAL_UNAVAILABLE`), an untrusted origin and a held lock still exit 3 before the question. `--trust-origin` keeps its own flag and is out of scope.",
+        "Tests in the test-isolation build cover accept, decline, EOF, timeout and `--no-input` for `apply` and one other scope. The test-isolation build may take terminal state and the timeout from an override (as `DFM_HOME` is taken); the release binary ignores every override, as today.",
+        "docs/apply.md item 4, docs/architecture.md section 10 item 5 (approval kinds), the help text, README.md and docs/first-run.md section 5 describe the prompt. `bash scripts/check_all.sh` exits 0 on the exact SHA.",
+        "Record delivery evidence: exact SHA and the merge PR."
+      ],
+      "kaneo": {
+        "id": "nin3q33biu321nckx3eh4zel",
+        "ticket": "DFM-62",
+        "status": "to-do",
+        "priority": "urgent",
+        "labels": [
+          "ready-for-agent"
+        ],
+        "url": "https://kaneo.snugmarina.org/dashboard/workspace/7tMuvznyx3ZOUb2boKJQbakZi44sT0eU/project/ldzsz08c771hgwkfwwzqjdd5/task/nin3q33biu321nckx3eh4zel"
+      },
+      "original_acceptance": [],
+      "acceptance_ids": [
+        "DFM-62.C01",
+        "DFM-62.C02",
+        "DFM-62.C03",
+        "DFM-62.C04",
+        "DFM-62.C05",
+        "DFM-62.C06",
+        "DFM-62.C07",
+        "DFM-62.C08",
+        "DFM-62.C09"
+      ],
+      "acceptance_source_map": {},
+      "acceptance_original_indices": [],
+      "filed": {
+        "date": "2026-10-20",
+        "origin": "owner daily-path audit, 2026-10-19"
+      }
+    },
+    {
+      "key": "sync-compose",
+      "epic": "workflows",
+      "title": "feat(sync): compose configuration, packages, secrets and services under one approval",
+      "priority": "urgent",
+      "depends": [
+        "sync",
+        "secrets",
+        "brew",
+        "lifecycle"
+      ],
+      "problem": "DESIGN.md section 7 requires one combined preview and approval for the mutating high-level commands. sync (DFM-30) composes apply only; packages, secrets and services each need their own run and digest. sync has never run live: ~/.dotfiles has no dotfiles-manager.lock [[sources]] entry (DOT-28).",
+      "acceptance": [
+        "After the sources are published, `sync` runs in this order: configuration (`apply`), packages (install what is missing, as `packages` without `--update`), secrets, services (start what is not loaded). Each scope plans from the published tree exactly as its standalone command does and writes its own receipt. A scope that fails stops the later scopes, which the summary reports as `not_started`.",
+        "The sync digest covers the four plans and the source lines: a change in any plan changes the digest. One `--yes-plan <sync digest>` (or one prompt, DFM-62) approves the whole run. The combined preview prints the four plans under scope headings and one flag list for removals, adoptions and restarts.",
+        "Secrets scope without a 1Password session: the secret resources are listed `skipped: no session` in the preview and the summary, the other scopes still run, and the exit code is 0 when they succeeded. With a session, a destination that matches the ledger is `current` and only changed templates render. (Decision recorded at filing: the daily sync must not fail because `op` is locked. The owner may reverse this before dispatch.)",
+        "`sync` accepts `--restart <resource-id>` and forwards it to the services scope; the restart is covered by the single approval as a disruptive operation.",
+        "`sync --preview` prints every scope and changes nothing outside staging. `--trust-origin` and the lock, trust, rehearsal and publication rules of docs/sync.md are unchanged.",
+        "A repeat `sync` with nothing new in any scope publishes nothing, writes no receipt and exits 0.",
+        "Tests with temporary remotes and provider fakes cover: the four scopes run in order; a package failure leaves services `not_started`; secrets skipped without a session; the digest changes when only a package plan changes; the repeat no-op. `bash scripts/check_all.sh` exits 0 on the exact SHA.",
+        "docs/sync.md, README.md and the help text describe the composed run. (The `~/.dotfiles` Justfile `sync-dfm-apply` then calls `sync` once; DOT follow-up, out of scope here.)",
+        "Record delivery evidence: exact SHA and the merge PR."
+      ],
+      "kaneo": {
+        "id": "ih0yi62yevmuuaqvk8rrnoj5",
+        "ticket": "DFM-63",
+        "status": "to-do",
+        "priority": "urgent",
+        "labels": [],
+        "url": "https://kaneo.snugmarina.org/dashboard/workspace/7tMuvznyx3ZOUb2boKJQbakZi44sT0eU/project/ldzsz08c771hgwkfwwzqjdd5/task/ih0yi62yevmuuaqvk8rrnoj5"
+      },
+      "original_acceptance": [],
+      "acceptance_ids": [
+        "DFM-63.C01",
+        "DFM-63.C02",
+        "DFM-63.C03",
+        "DFM-63.C04",
+        "DFM-63.C05",
+        "DFM-63.C06",
+        "DFM-63.C07",
+        "DFM-63.C08",
+        "DFM-63.C09"
+      ],
+      "acceptance_source_map": {},
+      "acceptance_original_indices": [],
+      "filed": {
+        "date": "2026-10-20",
+        "origin": "owner daily-path audit, 2026-10-19"
+      }
+    },
+    {
+      "key": "authoring-docs",
+      "epic": "engine",
+      "title": "docs(authoring): executable module authoring walkthrough",
+      "priority": "medium",
+      "depends": [
+        "resolver"
+      ],
+      "problem": "Nothing in the repository walks a reader through authoring a reusable module and selecting it. Carries DFM-28.C06 after DFM-28 was superseded.",
+      "acceptance": [
+        "A document (proposed: `docs/authoring.md`) walks through creating one small reusable module, selecting it in two profiles, exposing one bounded preference (`policy.defaults`) and one contribution (`policy.extensions`), and inspecting declared resource ownership and supplying-source provenance with `explain`. Every command in it runs against the synthetic fixtures under `examples/`, not a live HOME.",
+        "The walkthrough is executed by a test or by `scripts/check_examples.py`, so a resolver change that breaks it fails the local gate. Record the exact command.",
+        "The walkthrough shows the error text for the three common mistakes: a resource source outside the module root (`E_SOURCE_ESCAPE`), an override of an unexposed path, and a duplicate resource id.",
+        "`bash scripts/check_all.sh` exits 0 on the exact SHA; record the SHA and the merge PR."
+      ],
+      "kaneo": {
+        "id": "glv1y25pbmmy4vgjvgdcbzav",
+        "ticket": "DFM-64",
+        "status": "to-do",
+        "priority": "medium",
+        "labels": [],
+        "url": "https://kaneo.snugmarina.org/dashboard/workspace/7tMuvznyx3ZOUb2boKJQbakZi44sT0eU/project/ldzsz08c771hgwkfwwzqjdd5/task/glv1y25pbmmy4vgjvgdcbzav"
+      },
+      "original_acceptance": [],
+      "acceptance_ids": [
+        "DFM-64.C01",
+        "DFM-64.C02",
+        "DFM-64.C03",
+        "DFM-64.C04"
+      ],
+      "acceptance_source_map": {},
+      "acceptance_original_indices": [],
+      "filed": {
+        "date": "2026-10-20",
+        "origin": "owner daily-path audit, 2026-10-19"
+      }
     }
   ],
-  "review_revision": "2026-10-08-checkboxes",
+  "review_revision": "2026-10-20-realignment",
   "project": {
     "id": "ldzsz08c771hgwkfwwzqjdd5",
     "key": "DFM",
@@ -4880,7 +5273,288 @@
           "DFM-13.C07"
         ]
       }
-    ]
+    ],
+    "superseded_marker": "A requirement the owner supersedes keeps its line and ID, unchecked, with its text struck through and a note: `- [ ] ~~DFM-6.C03: text~~ Superseded 2026-10-20: reason`. A struck requirement counts as complete for leaf, epic and prerequisite completion. Only the owner supersedes; the manifest records each superseded ID with its reason.",
+    "realignment_2026_10_20": {
+      "authority": "Owner instruction 2026-10-20 (\"apply\"; \"strike through the open check box lines with a note that they are superseded. Those strike throughs count as completion.\") after the daily-path audit of 2026-10-19.",
+      "direction": "Fast rolling updates with no soak; no generation or rollback machinery; the lighter modular approach: mcp_sync, skills sync, the agent registry and aws-config-generator stay external generators run from the just sync wrapper; root in the binding (DFM-61); one prompt on a TTY (DFM-62); sync composes every scope (DFM-63).",
+      "changes": [
+        {
+          "ticket": "DFM-9",
+          "change": "leaf superseded",
+          "criterion_ids": [
+            "DFM-9.C01",
+            "DFM-9.C02",
+            "DFM-9.C03",
+            "DFM-9.C04",
+            "DFM-9.C05",
+            "DFM-9.C06"
+          ],
+          "reason": "Superseded by the live M5 bundle (DFM-49, DFM-50, DFM-51, DFM-52 done). The selected bundle in ~/.dotfiles plus the side-channel scripts are the inventory. The M3 inventory folds into DFM-8 and DFM-29."
+        },
+        {
+          "ticket": "DFM-11",
+          "change": "leaf superseded",
+          "criterion_ids": [
+            "DFM-11.C01",
+            "DFM-11.C02",
+            "DFM-11.C03",
+            "DFM-11.C04",
+            "DFM-11.C05",
+            "DFM-11.C06",
+            "DFM-11.C07",
+            "DFM-11.C08"
+          ],
+          "reason": "Superseded by the live M5 cutover (2026-10-16; main 469fb7f on 2026-10-19, doctor ok). The M3 probes stay in DFM-37."
+        },
+        {
+          "ticket": "DFM-27",
+          "change": "leaf superseded",
+          "criterion_ids": [
+            "DFM-27.C01",
+            "DFM-27.C02",
+            "DFM-27.C03",
+            "DFM-27.C04",
+            "DFM-27.C05",
+            "DFM-27.C06",
+            "DFM-27.C07"
+          ],
+          "reason": "Superseded: nix is gone from the M5 (/nix absent 2026-10-20); macOS defaults, the maxfiles agent, EDITOR and the tiling reload run as scripts (DFM-51). Lighter modular approach chosen by the owner. M3 needs go through DFM-40 and DFM-41."
+        },
+        {
+          "ticket": "DFM-28",
+          "change": "leaf superseded",
+          "criterion_ids": [
+            "DFM-28.C01",
+            "DFM-28.C02",
+            "DFM-28.C03",
+            "DFM-28.C04",
+            "DFM-28.C05",
+            "DFM-28.C06",
+            "DFM-28.C07",
+            "DFM-28.C08"
+          ],
+          "reason": "Superseded by DFM-49, DFM-50 and DFM-51 (live since DFM-52). C06, the authoring walkthrough, moved to DFM-64."
+        },
+        {
+          "ticket": "DFM-19",
+          "change": "criteria superseded",
+          "criterion_ids": [
+            "DFM-19.C02",
+            "DFM-19.C03"
+          ],
+          "reason": "Rollback is not a goal (owner, 2026-10-19). Interrupted-operation settlement (state recover, state resolve) stays."
+        },
+        {
+          "ticket": "DFM-37",
+          "change": "criteria superseded",
+          "criterion_ids": [
+            "DFM-37.C01",
+            "DFM-37.C02",
+            "DFM-37.C03",
+            "DFM-37.C04",
+            "DFM-37.C05",
+            "DFM-37.C06"
+          ],
+          "reason": "Superseded by the live M5 cutover (DFM-52). The leaf covers the M3 only."
+        },
+        {
+          "ticket": "DFM-21",
+          "change": "criteria superseded",
+          "criterion_ids": [
+            "DFM-21.C02"
+          ],
+          "reason": "Capture stays in mcp_sync.capture outside the manager (owner, 2026-10-20, lighter modular approach)."
+        },
+        {
+          "ticket": "DFM-36",
+          "change": "criteria superseded",
+          "criterion_ids": [
+            "DFM-36.C02",
+            "DFM-36.C03",
+            "DFM-36.C05",
+            "DFM-36.C06",
+            "DFM-36.C08",
+            "DFM-36.C09",
+            "DFM-36.C10",
+            "DFM-36.C11",
+            "DFM-36.C12"
+          ],
+          "reason": "Carried by the tests of the implementing leaves (DFM-22 to DFM-26, DFM-30 to DFM-34, DFM-61 to DFM-63)."
+        },
+        {
+          "ticket": "DFM-36",
+          "change": "criteria superseded",
+          "criterion_ids": [
+            "DFM-36.C14"
+          ],
+          "reason": "Independent security/recovery review does not match the local-gate policy of 2026-10-09."
+        },
+        {
+          "ticket": "DFM-31",
+          "change": "criterion rewritten",
+          "criterion_ids": [
+            "DFM-31.C03"
+          ],
+          "reason": "Owner rejected nix-style channel and soak conservatism.",
+          "old_text": "Use latest eligible channel/compatibility/soak versions, distinguishing reproducible pins from explicit holds with reasons. Respect forks and native lifecycle owners."
+        },
+        {
+          "ticket": "DFM-31",
+          "change": "criterion added",
+          "criterion_ids": [
+            "DFM-31.C12"
+          ],
+          "reason": "Both tools are installed by their own updaters on the M5, not by Homebrew or mise."
+        },
+        {
+          "ticket": "DFM-31",
+          "change": "criterion added",
+          "criterion_ids": [
+            "DFM-31.C13"
+          ],
+          "reason": "A second Codex copy exists as a cask on the M5."
+        },
+        {
+          "ticket": "DFM-37",
+          "change": "criterion rewritten",
+          "criterion_ids": [
+            "DFM-37.C07"
+          ],
+          "reason": "M5 evidence superseded by the live cutover.",
+          "old_text": "Record delivery evidence for provider-proof: the exact candidate/provider identities, required M5 and M3 native probes and distribution proof, reconciled results and owner-approved evidence. Identify skips, unknowns and partial failures; unmet required evidence prevents checking this criterion."
+        },
+        {
+          "ticket": "DFM-18",
+          "change": "criterion rewritten",
+          "criterion_ids": [
+            "DFM-18.C06"
+          ],
+          "reason": "No M5 legacy handoff exists.",
+          "old_text": "For an explicitly approved legacy file handoff, verify the exact released writer and unchanged output, journal its recoverable baseline and record the new claim before publication. Refuse changed/unattributed outputs."
+        },
+        {
+          "ticket": "DFM-18",
+          "change": "criterion rewritten",
+          "criterion_ids": [
+            "DFM-18.C07"
+          ],
+          "reason": "No M5 legacy handoff exists.",
+          "old_text": "Test a legacy symlink and co-owned output, interruption between release/acquisition, concurrent replacement and scoped recovery. Use synthetic approved claims here; integration/rehearsal reconciles actual claims with the ledger."
+        },
+        {
+          "ticket": "DFM-41",
+          "change": "criterion rewritten",
+          "criterion_ids": [
+            "DFM-41.C06"
+          ],
+          "reason": "Old generations are not kept; rollback is not a goal.",
+          "old_text": "Observe the declared normal-use window and required cycles. Keep rollback materials and old generations until the separate retirement gate."
+        },
+        {
+          "ticket": "DFM-41",
+          "change": "criterion rewritten",
+          "criterion_ids": [
+            "DFM-41.C11"
+          ],
+          "reason": "Old generations are not kept; rollback is not a goal.",
+          "old_text": "Owner confirms M3 operational acceptance after the declared normal-use window and required cycles. Keep rollback materials and old generations until the separate retirement gate."
+        },
+        {
+          "ticket": "DFM-21",
+          "change": "criterion rewritten",
+          "criterion_ids": [
+            "DFM-21.C01"
+          ],
+          "reason": "Narrowed to two co-owned documents; mcp_sync stays the external authority.",
+          "old_text": "Adapt existing mcp_sync/activation merge algorithms behind the new owner boundary for every selected destination; do not invoke old activation orchestration as another writer."
+        },
+        {
+          "ticket": "DFM-21",
+          "change": "criterion rewritten",
+          "criterion_ids": [
+            "DFM-21.C05"
+          ],
+          "reason": "Narrowed to two co-owned documents.",
+          "old_text": "Tests preserve foreign hooks/preferences, retire only owned handlers and retain last-good files after missing overlays, malformed settings or concurrent writes. Every inventoried destination is accounted for."
+        },
+        {
+          "ticket": "DFM-25",
+          "change": "criterion added",
+          "criterion_ids": [
+            "DFM-25.C09"
+          ],
+          "reason": "The registry installs from the working copy on the M5 and nothing pulls it."
+        },
+        {
+          "ticket": "DFM-33",
+          "change": "priority",
+          "reason": "Trial adopt/purge is weekly, not daily; the daily path (DFM-61 to DFM-63, DFM-31) is urgent."
+        },
+        {
+          "ticket": "DFM-34",
+          "change": "priority",
+          "reason": "Trial adopt/purge is weekly, not daily; the daily path (DFM-61 to DFM-63, DFM-31) is urgent."
+        },
+        {
+          "ticket": "DFM-61",
+          "change": "leaf added",
+          "criterion_ids": [
+            "DFM-61.C01",
+            "DFM-61.C02",
+            "DFM-61.C03",
+            "DFM-61.C04",
+            "DFM-61.C05",
+            "DFM-61.C06"
+          ],
+          "reason": "Owner daily-path audit."
+        },
+        {
+          "ticket": "DFM-62",
+          "change": "leaf added",
+          "criterion_ids": [
+            "DFM-62.C01",
+            "DFM-62.C02",
+            "DFM-62.C03",
+            "DFM-62.C04",
+            "DFM-62.C05",
+            "DFM-62.C06",
+            "DFM-62.C07",
+            "DFM-62.C08",
+            "DFM-62.C09"
+          ],
+          "reason": "Owner daily-path audit."
+        },
+        {
+          "ticket": "DFM-63",
+          "change": "leaf added",
+          "criterion_ids": [
+            "DFM-63.C01",
+            "DFM-63.C02",
+            "DFM-63.C03",
+            "DFM-63.C04",
+            "DFM-63.C05",
+            "DFM-63.C06",
+            "DFM-63.C07",
+            "DFM-63.C08",
+            "DFM-63.C09"
+          ],
+          "reason": "Owner daily-path audit."
+        },
+        {
+          "ticket": "DFM-64",
+          "change": "leaf added",
+          "criterion_ids": [
+            "DFM-64.C01",
+            "DFM-64.C02",
+            "DFM-64.C03",
+            "DFM-64.C04"
+          ],
+          "reason": "Owner daily-path audit."
+        }
+      ],
+      "not_in_manifest": "Leaves DFM-44 to DFM-60 were filed on the board after the 2026-10-08 publication and are not in this manifest; DFM-60 is a native child of DFM-2. DOT-28 (lock file and origin grant in ~/.dotfiles) lives on the Dotfiles board."
+    }
   },
   "checklist_review": {
     "date": "2026-10-08",
