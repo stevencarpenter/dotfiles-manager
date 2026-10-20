@@ -38,7 +38,9 @@
         "DFM-10",
         "DFM-11",
         "DFM-12",
-        "DFM-13"
+        "DFM-13",
+        "DFM-65",
+        "DFM-66"
       ],
       "goal_coverage": [
         {
@@ -135,7 +137,17 @@
             "DFM-13.C04",
             "DFM-13.C05",
             "DFM-13.C06",
-            "DFM-13.C07"
+            "DFM-13.C07",
+            "DFM-65.C01",
+            "DFM-65.C02",
+            "DFM-65.C03",
+            "DFM-65.C04",
+            "DFM-65.C05",
+            "DFM-65.C06",
+            "DFM-65.C07",
+            "DFM-65.C08",
+            "DFM-65.C09",
+            "DFM-66.C01"
           ]
         },
         {
@@ -4075,6 +4087,78 @@
         "date": "2026-10-20",
         "origin": "owner daily-path audit, 2026-10-19"
       }
+    },
+    {
+      "key": "ci-staged",
+      "epic": "evidence",
+      "title": "ci(gate): stage the gate for iteration speed now that the repository is public",
+      "priority": "high",
+      "status": "in-review",
+      "depends": [
+        "publication"
+      ],
+      "problem": "The hosted run for a docs-only pull request took 1088 s (1043 s of cargo test on one serial macos-latest job, no cache, no cancel) and the commit hook rebuilt the workspace cold on every commit (277 s). The owner made the repository public on 2026-10-20: hosted compute is unlimited, optimize for iteration speed, build and test only what each stage needs.",
+      "acceptance": [
+        "The commit hook runs only fixtures, scripts and Rust style on the staged tree, builds into `target/gate` so it never waits for a build in `target`, and runs no `cargo test`.",
+        "The workflow triggers on `pull_request`, push to `main` and `workflow_dispatch` only; a newer push to the same pull request cancels the older run.",
+        "A pull request runs fixtures and scripts on Linux, and Rust style, four test shards and the network install tests on macOS as parallel jobs with a cargo dependency cache; the Rust jobs run only when a Rust input changed and the install job only when a bootstrap input changed, decided inside the workflow so every required check still reports.",
+        "A push to `main` runs every step and saves the cargo caches.",
+        "One `gate` job is the only required status check; it passes when every job passed or was skipped and fails on any failure or cancellation. Branch protection on `main` requires it.",
+        "`scripts/check_all.sh` stays the single script for hook, `just check` and CI: `DFM_TEST_SELECT` selects a shard, `network-tests` is a named step, and a gate test fails when a cli test binary is missing from every shard.",
+        "README, AGENTS.md, docs/checklist-state.md and docs/roadmap-review.md say that hosted CI gates merge since 2026-10-20 and no longer call it informational.",
+        "Measured on the merged workflow: a docs-only pull request reports `gate` within 2 minutes; a Rust change reports within 6 minutes with a warm cache.",
+        "Authorized merge to `main` of the change, with the hosted run URL and exact SHA recorded here."
+      ],
+      "kaneo": {
+        "id": "pany3molp3izmvhcaqxoju6i",
+        "ticket": "DFM-65",
+        "status": "in-review",
+        "priority": "high",
+        "labels": [],
+        "url": "https://kaneo.snugmarina.org/dashboard/workspace/7tMuvznyx3ZOUb2boKJQbakZi44sT0eU/project/ldzsz08c771hgwkfwwzqjdd5/task/pany3molp3izmvhcaqxoju6i"
+      },
+      "original_acceptance": [],
+      "acceptance_ids": [
+        "DFM-65.C01",
+        "DFM-65.C02",
+        "DFM-65.C03",
+        "DFM-65.C04",
+        "DFM-65.C05",
+        "DFM-65.C06",
+        "DFM-65.C07",
+        "DFM-65.C08",
+        "DFM-65.C09"
+      ]
+    },
+    {
+      "key": "bootstrap-shell",
+      "epic": "evidence",
+      "title": "chore(bootstrap): decide the interpreter for bootstrap.sh (POSIX sh, zsh or bash)",
+      "priority": "medium",
+      "status": "to-do",
+      "depends": [],
+      "problem": "Owner shell policy 2026-10-20: hosts default to the latest zsh, bash is accepted where it fits better, scripts should not default to sh. bootstrap.sh is the one sh script and its /bin/sh choice is a documented security decision (exec cannot be shadowed before the environment scrub), tested through /bin/sh by 70 tests. Changing it is a threat-model decision.",
+      "acceptance": [
+        "The owner records the decision: keep `/bin/sh`, port to `zsh -f`, or port to bash, with the threat-model reasoning in the ticket either accepted or corrected.",
+        "If the decision is a port: the script, its 70 tests, the `scripts` gate step, docs/bootstrap.md, docs/first-run.md and the gate test `bootstrap_script_literals_match_the_platform_crate` follow in one PR, and the environment-scrub tests pass under the new interpreter.",
+        "If the decision is to keep `/bin/sh`: docs/bootstrap.md states the reason in one paragraph next to the invocation line."
+      ],
+      "kaneo": {
+        "id": "ziqpnaouqbzrhc37q0a0q3ps",
+        "ticket": "DFM-66",
+        "status": "to-do",
+        "priority": "medium",
+        "labels": [
+          "needs-human"
+        ],
+        "url": "https://kaneo.snugmarina.org/dashboard/workspace/7tMuvznyx3ZOUb2boKJQbakZi44sT0eU/project/ldzsz08c771hgwkfwwzqjdd5/task/ziqpnaouqbzrhc37q0a0q3ps"
+      },
+      "original_acceptance": [],
+      "acceptance_ids": [
+        "DFM-66.C01",
+        "DFM-66.C02",
+        "DFM-66.C03"
+      ]
     }
   ],
   "review_revision": "2026-10-20-realignment",
@@ -5551,9 +5635,35 @@
             "DFM-64.C04"
           ],
           "reason": "Owner daily-path audit."
+        },
+        {
+          "ticket": "DFM-65",
+          "change": "leaf added",
+          "criterion_ids": [
+            "DFM-65.C01",
+            "DFM-65.C02",
+            "DFM-65.C03",
+            "DFM-65.C04",
+            "DFM-65.C05",
+            "DFM-65.C06",
+            "DFM-65.C07",
+            "DFM-65.C08",
+            "DFM-65.C09"
+          ],
+          "reason": "Owner CI policy 2026-10-20: the repository is public, hosted CI gates merge, the gate is staged for iteration speed (PR #57)."
+        },
+        {
+          "ticket": "DFM-66",
+          "change": "leaf added",
+          "criterion_ids": [
+            "DFM-66.C01",
+            "DFM-66.C02",
+            "DFM-66.C03"
+          ],
+          "reason": "Owner shell policy 2026-10-20 (no sh by default) meets the documented /bin/sh security choice of bootstrap.sh; the owner decides."
         }
       ],
-      "not_in_manifest": "Leaves DFM-44 to DFM-60 were filed on the board after the 2026-10-08 publication and are not in this manifest; DFM-60 is a native child of DFM-2. DOT-28 (lock file and origin grant in ~/.dotfiles) lives on the Dotfiles board."
+      "not_in_manifest": "Leaves DFM-44 to DFM-60 were filed on the board after the 2026-10-08 publication and are not in this manifest; DFM-60 is a native child of DFM-2. DFM-65 and DFM-66 (CI policy and shell policy of 2026-10-20) are in this manifest. DOT-28 (lock file and origin grant in ~/.dotfiles) lives on the Dotfiles board."
     }
   },
   "checklist_review": {
