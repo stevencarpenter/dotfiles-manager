@@ -57,9 +57,17 @@ step_rust_tests() {
     fi
 }
 
-# The install tests need crates.io, so they are #[ignore]d and run explicitly here.
+# The install tests need crates.io, so they are #[ignore]d and run explicitly here. Each one
+# builds the manager in release mode, so hosted CI shards them: DFM_NETWORK_TESTS holds the
+# exact names of one shard (default: every ignored test in the workspace).
 step_network_tests() {
-    cargo test --workspace --locked --features dfm-cli/test-isolation -- --ignored
+    if [ -n "${DFM_NETWORK_TESTS:-}" ]; then
+        local names
+        read -ra names <<<"$DFM_NETWORK_TESTS"
+        cargo test -p dfm-cli --locked --features test-isolation --test bootstrap -- --ignored --exact "${names[@]}"
+    else
+        cargo test --workspace --locked --features dfm-cli/test-isolation -- --ignored
+    fi
 }
 
 steps=("$@")

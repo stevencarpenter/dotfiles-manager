@@ -657,3 +657,51 @@ fn every_cli_test_target_is_in_one_ci_shard() {
         "add each cli test target to exactly one shard in contract-check.yml"
     );
 }
+
+/// Hosted CI runs the #[ignore]d install tests in shards by exact name; a new one must be named
+/// in exactly one shard, and the script's shard path runs only crates/cli/tests/bootstrap.rs.
+#[test]
+fn every_ignored_test_is_in_one_install_shard() {
+    let workflow =
+        fs::read_to_string(repo_root().join(".github/workflows/contract-check.yml")).unwrap();
+    let mut sharded: Vec<&str> = workflow
+        .lines()
+        .filter_map(|l| l.trim_start().strip_prefix("names:"))
+        .flat_map(str::split_whitespace)
+        .collect();
+    sharded.sort_unstable();
+    let mut files = Vec::new();
+    for dir in [
+        "crates/cli/tests",
+        "crates/cli/src",
+        "crates/engine",
+        "crates/model",
+        "crates/platform_macos",
+    ] {
+        rs_files(&repo_root().join(dir), &mut files);
+    }
+    let mut ignored = Vec::new();
+    for f in files {
+        let text = fs::read_to_string(&f).unwrap();
+        let mut lines = text.lines();
+        while let Some(l) = lines.next() {
+            if l.trim_start().starts_with("#[ignore") {
+                let name = lines
+                    .find_map(|n| n.trim_start().strip_prefix("fn "))
+                    .and_then(|n| n.split('(').next())
+                    .unwrap()
+                    .to_string();
+                assert!(
+                    f.ends_with("crates/cli/tests/bootstrap.rs"),
+                    "{name}: the install shards run only tests/bootstrap.rs; move it there or extend step_network_tests"
+                );
+                ignored.push(name);
+            }
+        }
+    }
+    ignored.sort_unstable();
+    assert_eq!(
+        sharded, ignored,
+        "name each #[ignore]d test in exactly one install shard in contract-check.yml"
+    );
+}

@@ -4,7 +4,9 @@ name: Contract checks
 # - commit hook: fixtures, scripts and Rust style on the staged tree (no tests)
 # - pull request: every step in parallel jobs; the Rust jobs run only when a Rust input
 #   changed, the network install tests only when a bootstrap input changed
-# - push to main: the whole gate, which also saves the cargo caches
+# - push to main: the whole gate
+# Every macOS job restores the cargo dependency cache and the first to finish saves it, so a
+# second push to the same pull request builds only the workspace crates.
 # Branch protection requires the `gate` job, which fails when any job failed or was cancelled.
 # Every job runs scripts/check_all.sh so the hook, `just check` and CI stay one script.
 
@@ -96,7 +98,6 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           shared-key: style
-          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Check Rust style (fmt, clippy)
         run: bash scripts/check_all.sh rust-style
@@ -133,7 +134,6 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           shared-key: tests
-          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Run implementation tests
         env:
@@ -142,10 +142,25 @@ jobs:
         run: bash scripts/check_all.sh rust-tests
 
   install:
-    name: network install tests
+    name: network install tests (${{ matrix.shard }})
     needs: changes
     if: needs.changes.outputs.bootstrap == 'true'
     runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Each test builds the manager in release mode (about 3 minutes on the 3-core runner), so
+        # at most three tests per job. The gate test `every_ignored_test_is_in_one_install_shard`
+        # keeps this list complete.
+        include:
+          - shard: 1
+            names: isolated_install_invocation_and_clean_removal a_new_binary_that_cannot_read_the_existing_binding_does_not_become_current a_foreign_dotfiles_manager_new_in_the_bin_directory_is_never_removed
+          - shard: 2
+            names: a_swap_that_did_not_take_effect_is_not_reported_as_done the_binding_is_checked_again_immediately_before_the_copy a_symlinked_version_directory_or_staged_binary_is_not_written_through
+          - shard: 3
+            names: the_binding_is_checked_again_just_before_the_swap the_data_directories_are_checked_again_before_the_late_removals the_command_path_and_current_are_checked_again_just_before_the_swap
+          - shard: 4
+            names: the_command_link_is_staged_before_current_flips upgrade_retries_after_a_stale_current_new_and_rolls_back
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -159,9 +174,10 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           shared-key: tests
-          save-if: false
 
       - name: Run the network install tests
+        env:
+          DFM_NETWORK_TESTS: ${{ matrix.names }}
         run: bash scripts/check_all.sh network-tests
 
   gate:
