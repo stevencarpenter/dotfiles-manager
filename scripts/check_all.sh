@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # The single shared gate: pre-commit hook, `just check` and hosted CI all run this.
-# Usage: check_all.sh [step ...]   steps: fixtures scripts rust-style rust-tests (default: all)
+# Usage: check_all.sh [step ...]
+#   steps: fixtures scripts rust-style rust-tests network-tests (default: the first four;
+#   rust-tests runs network-tests itself unless DFM_SKIP_NETWORK_TESTS=1)
 set -euo pipefail
 
 # Documentation fixtures only: shape and references. The resolver cases run in step rust-tests.
@@ -39,15 +41,23 @@ step_rust_style() {
 
 # Implementation tests: unit, CLI, bootstrap script and build-controls differential tests.
 # The isolated build (feature test-isolation) is needed by the CLI and differential tests.
-# The install test needs crates.io, so it is #[ignore]d and run explicitly here.
-# Set DFM_SKIP_NETWORK_TESTS=1 (exactly 1) to skip it; the skip is printed.
+# DFM_TEST_SELECT holds the cargo package, target and feature selection (default: the whole
+# workspace in the isolated build); hosted CI uses it to run one shard of test binaries per job.
+# Set DFM_SKIP_NETWORK_TESTS=1 (exactly 1) to skip the network-tests step; the skip is printed.
 step_rust_tests() {
-    cargo test --workspace --locked --features dfm-cli/test-isolation
+    local select
+    read -ra select <<<"${DFM_TEST_SELECT:---workspace --features dfm-cli/test-isolation}"
+    cargo test --locked "${select[@]}"
     if [ "${DFM_SKIP_NETWORK_TESTS:-}" = 1 ]; then
         echo "SKIPPED: network install test (DFM_SKIP_NETWORK_TESTS=1)"
     else
-        cargo test --workspace --locked --features dfm-cli/test-isolation -- --ignored
+        step_network_tests
     fi
+}
+
+# The install tests need crates.io, so they are #[ignore]d and run explicitly here.
+step_network_tests() {
+    cargo test --workspace --locked --features dfm-cli/test-isolation -- --ignored
 }
 
 steps=("$@")

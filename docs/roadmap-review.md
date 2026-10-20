@@ -6,7 +6,7 @@ Kaneo DFM is the authoritative backlog. [roadmap.json](roadmap.json) is the revi
 
 Persisted canonical acceptance checkboxes are the sole completion state. Board columns, labels, comments, PR state and snapshot metadata cannot complete work. [The completion contract](checklist-state.md) defines checkoff, prerequisite reads, evidence refresh and safe revisions.
 
-On 2026-10-09, the owner made successful full local validation the publication and merge gate. Hosted CI is informational. This supersedes the historical hosted-check and account-eligibility requirements below and in the roadmap snapshot. Native proof, independent review and action approval remain required. The completion contract records the current policy.
+On 2026-10-09, the owner made successful full local validation the publication and merge gate. Hosted CI is informational. This supersedes the historical hosted-check and account-eligibility requirements below and in the roadmap snapshot. Native proof, independent review and action approval remain required. The completion contract records the current policy. On 2026-10-20 the repository became public and hosted CI became the merge gate (`docs/checklist-state.md`, "Complete tasks and epics").
 
 ## Review coverage
 

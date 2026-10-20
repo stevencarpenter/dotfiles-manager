@@ -1,16 +1,69 @@
 name: Contract checks
 
+# Stages of the gate (README, "Check the draft"):
+# - commit hook: fixtures, scripts and Rust style on the staged tree (no tests)
+# - pull request: every step in parallel jobs; the Rust jobs run only when a Rust input
+#   changed, the network install tests only when a bootstrap input changed
+# - push to main: the whole gate, which also saves the cargo caches
+# Branch protection requires the `gate` job, which fails when any job failed or was cancelled.
+# Every job runs scripts/check_all.sh so the hook, `just check` and CI stay one script.
+
 on:
-  push:
   pull_request:
+  push:
+    branches: [main]
   workflow_dispatch:
 
 permissions:
   contents: read
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  # Incremental artifacts are large and never reused on a fresh checkout.
+  CARGO_INCREMENTAL: 0
+
 jobs:
-  check:
-    runs-on: macos-latest
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      rust: ${{ steps.classify.outputs.rust }}
+      bootstrap: ${{ steps.classify.outputs.bootstrap }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          # The pull request checkout is the merge commit; depth 2 brings both parents.
+          fetch-depth: 2
+
+      - name: Classify the changed paths
+        id: classify
+        env:
+          EVENT: ${{ github.event_name }}
+        run: |
+          rust=true
+          bootstrap=true
+          if [ "$EVENT" = pull_request ]; then
+            # First parent of the merge commit is the base branch tip.
+            changed=$(git diff --name-only HEAD^1 HEAD)
+            printf 'changed:\n%s\n' "$changed"
+            rust=false
+            bootstrap=false
+            rust_inputs='^(crates/|examples/|tests/|Cargo\.(toml|lock)$|rust-toolchain\.toml$|scripts/check_all\.sh$|scripts/bootstrap\.sh$|docs/bootstrap\.md$|\.github/workflows/contract-check\.yml$)'
+            bootstrap_inputs='^(scripts/bootstrap\.sh$|crates/cli/tests/bootstrap\.rs$|crates/cli/tests/common/|crates/[^/]+/Cargo\.toml$|Cargo\.(toml|lock)$|rust-toolchain\.toml$|scripts/check_all\.sh$|\.github/workflows/contract-check\.yml$)'
+            if printf '%s\n' "$changed" | grep -Eq "$rust_inputs"; then rust=true; fi
+            if printf '%s\n' "$changed" | grep -Eq "$bootstrap_inputs"; then bootstrap=true; fi
+          fi
+          echo "rust=$rust" >> "$GITHUB_OUTPUT"
+          echo "bootstrap=$bootstrap" >> "$GITHUB_OUTPUT"
+          echo "rust=$rust bootstrap=$bootstrap"
+
+  fast:
+    name: fixtures and scripts
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -21,22 +74,108 @@ jobs:
         with:
           python-version: "3.14"
 
+      # shellcheck is preinstalled on the Ubuntu runner image.
+      - name: Check design fixtures, script style and syntax
+        run: bash scripts/check_all.sh fixtures scripts
+
+  style:
+    name: rust style
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
       - name: Install the pinned Rust toolchain
         run: |
           pin=$(sed -n 's/^channel = "\(.*\)"$/\1/p' rust-toolchain.toml)
           rustup toolchain install "$pin" --profile minimal --component rustfmt --component clippy
 
-      - name: Check design fixtures
-        run: bash scripts/check_all.sh fixtures
-
-      - name: Install shellcheck
-        run: brew install shellcheck
-
-      - name: Check script style and syntax
-        run: bash scripts/check_all.sh scripts
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: style
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Check Rust style (fmt, clippy)
         run: bash scripts/check_all.sh rust-style
 
+  tests:
+    name: rust tests (${{ matrix.shard }})
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
+    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Balanced by measured run time (about 15 s for libs, 45 s per cli shard).
+        # The gate test `every_cli_test_target_is_in_one_ci_shard` keeps this list complete.
+        include:
+          - shard: libs
+            select: -p dfm-model -p dfm-engine -p dfm-platform-macos --features dfm-engine/failpoints
+          - shard: cli-1
+            select: -p dfm-cli --features test-isolation --lib --bins --test gate --test bootstrap --test doctor --test cli --test explain --test module_doc
+          - shard: cli-2
+            select: -p dfm-cli --features test-isolation --test build_controls --test sync --test planner --test runner --test trial
+          - shard: cli-3
+            select: -p dfm-cli --features test-isolation --test merge --test apply --test source_roots --test state --test packages --test services --test resolver --test toolchains --test secrets --test native_config
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install the pinned Rust toolchain
+        run: |
+          pin=$(sed -n 's/^channel = "\(.*\)"$/\1/p' rust-toolchain.toml)
+          rustup toolchain install "$pin" --profile minimal
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: tests
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
       - name: Run implementation tests
+        env:
+          DFM_TEST_SELECT: ${{ matrix.select }}
+          DFM_SKIP_NETWORK_TESTS: "1"
         run: bash scripts/check_all.sh rust-tests
+
+  install:
+    name: network install tests
+    needs: changes
+    if: needs.changes.outputs.bootstrap == 'true'
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install the pinned Rust toolchain
+        run: |
+          pin=$(sed -n 's/^channel = "\(.*\)"$/\1/p' rust-toolchain.toml)
+          rustup toolchain install "$pin" --profile minimal
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: tests
+          save-if: false
+
+      - name: Run the network install tests
+        run: bash scripts/check_all.sh network-tests
+
+  gate:
+    # The one required status check. Skipped jobs pass; failed or cancelled jobs fail it.
+    needs: [changes, fast, style, tests, install]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require every job to pass or be skipped
+        env:
+          RESULTS: ${{ toJSON(needs) }}
+        run: |
+          echo "$RESULTS"
+          if echo "$RESULTS" | grep -Eq '"result": *"(failure|cancelled)"'; then
+            echo "a required job failed or was cancelled" >&2
+            exit 1
+          fi

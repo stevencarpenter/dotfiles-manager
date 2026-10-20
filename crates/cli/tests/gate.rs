@@ -617,3 +617,43 @@ fn a_plain_release_build_of_every_target_has_no_test_isolation() {
         "nothing was created"
     );
 }
+
+/// Hosted CI runs the cli test binaries in shards (.github/workflows/contract-check.yml). A
+/// binary missing from every shard would run only on a push to main.
+#[test]
+fn every_cli_test_target_is_in_one_ci_shard() {
+    let workflow =
+        fs::read_to_string(repo_root().join(".github/workflows/contract-check.yml")).unwrap();
+    let mut sharded: Vec<&str> = workflow
+        .lines()
+        .filter(|l| l.trim_start().starts_with("select:"))
+        .flat_map(|l| {
+            l.split_whitespace()
+                .collect::<Vec<_>>()
+                .windows(2)
+                .map(|w| w.to_vec())
+                .collect::<Vec<_>>()
+        })
+        .filter(|w| w[0] == "--test")
+        .map(|w| w[1])
+        .collect();
+    sharded.sort_unstable();
+    let m = metadata();
+    let mut targets: Vec<&str> = m["packages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["name"] == "dfm-cli")
+        .unwrap()["targets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|t| t["kind"].as_array().unwrap().iter().any(|k| k == "test"))
+        .map(|t| t["name"].as_str().unwrap())
+        .collect();
+    targets.sort_unstable();
+    assert_eq!(
+        sharded, targets,
+        "add each cli test target to exactly one shard in contract-check.yml"
+    );
+}
