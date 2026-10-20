@@ -415,7 +415,7 @@ trait Adapter {
 
 ## 12. Distribution and bootstrap (C01, C06)
 
-1. Layout: `~/.local/share/dotfiles-manager/versions/<semver>-<short-commit>/dotfiles-manager`. The active version is the symlink `~/.local/share/dotfiles-manager/current`. The command on PATH is a symlink to `current/dfm`. Locations come from the `Platform` port.
+1. Layout: `~/.local/share/dotfiles-manager/versions/<semver>-<short-commit>/dfm`. The active version is the symlink `~/.local/share/dotfiles-manager/current`. The command on PATH is a symlink to `current/dfm`. Locations come from the `Platform` port.
 2. Build: `cargo build --release --locked --offline` from the staged tree after `cargo fetch --locked`, under the build containment rules and limits in section 8. Whether the linker's ad-hoc signature is accepted under each device's security policy is **unverified** (device policy unknown). It is a device-gate item.
 3. **Bootstrap provenance (S4).**
    1. The owner supplies, out of band, the bootstrap script's pinned commit and its SHA-256. The script is obtained by cloning that commit over `https` from the canonical origin, using the same scrubbed Git environment as section 8 (not inherited Git configuration), and verifying the checksum before it runs. No `curl | sh`.

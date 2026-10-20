@@ -1536,6 +1536,13 @@ fn a_foreign_file_at_the_command_path_is_never_replaced() {
     fs::create_dir_all(home.join(".local/bin")).unwrap();
     let target = home.join(".local/bin/dfm");
     fs::write(&target, "mine").unwrap();
+    // The old command link is retired only after a swap; a refused install leaves it.
+    let old = home.join(".local/bin/dotfiles-manager");
+    std::os::unix::fs::symlink(
+        home.join(".local/share/dotfiles-manager/current/dotfiles-manager"),
+        &old,
+    )
+    .unwrap();
     let (src, sha) = tiny_source(tmp.path(), "9.9.9");
     let o = script_test_mode(
         &home,
@@ -1555,6 +1562,7 @@ fn a_foreign_file_at_the_command_path_is_never_replaced() {
         err(&o)
     );
     assert_eq!(fs::read_to_string(&target).unwrap(), "mine");
+    assert!(old.is_symlink(), "a refused install retires nothing");
     assert!(!home.join(".cache").exists());
 }
 
@@ -1603,6 +1611,19 @@ fn uninstall_removes_only_what_the_manager_created() {
         Path::new("/usr/bin/false"),
         "an old-name link that is not ours must stay"
     );
+    assert!(String::from_utf8_lossy(&o.stdout).contains("left alone"));
+
+    // An owner-made alias to the new binary and a regular file are left alone too.
+    fs::remove_file(&old).unwrap();
+    std::os::unix::fs::symlink(data.join("current/dfm"), &old).unwrap();
+    let o = script_test_mode(&home, &["uninstall"], &[]);
+    assert_eq!(o.status.code(), Some(0), "{}", err(&o));
+    assert_eq!(fs::read_link(&old).unwrap(), data.join("current/dfm"));
+    fs::remove_file(&old).unwrap();
+    fs::write(&old, "mine").unwrap();
+    let o = script_test_mode(&home, &["uninstall"], &[]);
+    assert_eq!(o.status.code(), Some(0), "{}", err(&o));
+    assert_eq!(fs::read_to_string(&old).unwrap(), "mine");
     assert!(String::from_utf8_lossy(&o.stdout).contains("left alone"));
 }
 

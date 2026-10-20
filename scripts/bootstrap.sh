@@ -815,16 +815,18 @@ cmd_install() {
   printf 'installed %s\nsource commit %s\nbinary sha256 %s (record only)\nbootstrap: done\n' "$DATA/versions/$name" "$commit" "$sha"
 }
 
-# The command was `dotfiles-manager` before DFM-67. A link of that name that points into this
-# manager's `current` is removed after the swap and by uninstall; anything else there is named
-# and left alone. A later release may drop this rule.
+# The command was `dotfiles-manager` before DFM-67. The link of that name that the old installer
+# created (exactly `current/dotfiles-manager`) is removed after the swap and by uninstall, best
+# effort; anything else there, an owner-made alias included, is named and left alone. A later
+# release may drop this rule.
 retire_old_command_link() {
   old=$HOME_DIR/.local/bin/dotfiles-manager
   if [ -L "$old" ]; then
-    case $(readlink "$old") in
-      "$DATA/current/"*) rm -f "$old" && echo "removed the old command link $old" ;;
-      *) echo "note: $old is a symlink that is not this manager's; left alone" ;;
-    esac
+    if [ "$(readlink "$old")" = "$DATA/current/dotfiles-manager" ]; then
+      if rm -f "$old"; then echo "removed the old command link $old"; else echo "note: cannot remove $old; remove it yourself" >&2; fi
+    else
+      echo "note: $old is a symlink that is not this manager's; left alone"
+    fi
   elif [ -e "$old" ]; then
     echo "note: $old exists and is not this manager's link; left alone"
   fi
