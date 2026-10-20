@@ -13,7 +13,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
-const BIN: &str = env!("CARGO_BIN_EXE_dotfiles-manager");
+const BIN: &str = env!("CARGO_BIN_EXE_dfm");
 /// The value the fake vault renders. It must appear in the destination and nowhere else.
 const SECRET: &str = "PLANTED-SECRET-5b1e2d";
 /// A marker the fake writes on standard error. It must never reach the manager's output.

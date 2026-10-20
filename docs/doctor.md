@@ -15,8 +15,8 @@ Task: DFM-35. This document records what `doctor` and `status` do in this build 
 ## The commands
 
 ```
-dotfiles-manager doctor --root <dir> [--json]
-dotfiles-manager status --root <dir> [--json]
+dfm doctor --root <dir> [--json]
+dfm status --root <dir> [--json]
 ```
 
 Both run one inspection and show the same rows. `doctor` prints `detail` and `fix` for each row. `status` prints the status line and the subject only. `--json` prints one document (`schema: 1`) with the same rows for both commands.

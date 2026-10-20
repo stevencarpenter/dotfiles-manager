@@ -7,7 +7,7 @@ publish = { workspace = true }
 license = { workspace = true }
 
 [[bin]]
-name = "dotfiles-manager"
+name = "dfm"
 path = "src/main.rs"
 
 [features]

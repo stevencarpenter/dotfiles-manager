@@ -16,7 +16,7 @@ Layering follows architecture section 3. `model` takes already-observed facts an
 ## The command
 
 ```
-dotfiles-manager plan --root <dir> [--json] [--against <saved plan>]
+dfm plan --root <dir> [--json] [--against <saved plan>]
 ```
 
 `plan` resolves the bound profile against the trusted sources in `--root` (as `explain` does), reads the ownership ledger, observes every claimed path and its parents under HOME, and prints the plan and its digest. It writes nothing. It starts no process, makes no network call, calls no vault and fetches no source. A test starts provider look-alikes on `PATH` and asserts none runs, and another test asserts that the planner code contains no process, network or write API.

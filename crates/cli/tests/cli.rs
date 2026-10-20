@@ -8,7 +8,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
-const BIN: &str = env!("CARGO_BIN_EXE_dotfiles-manager");
+const BIN: &str = env!("CARGO_BIN_EXE_dfm");
 
 fn cmd(home: &Path, args: &[&str]) -> Command {
     let mut c = Command::new(BIN);
@@ -53,10 +53,7 @@ fn version_and_help_need_no_home() {
         let o = Command::new(BIN).env_clear().arg(flag).output().unwrap();
         assert_eq!(o.status.code(), Some(0));
         let out = text(&o.stdout);
-        assert!(
-            out.starts_with("dotfiles-manager 0.1.0 (commit unknown)"),
-            "{out}"
-        );
+        assert!(out.starts_with("dfm 0.1.0 (commit unknown)"), "{out}");
     }
     for flag in ["--help", "help", "-h"] {
         let o = Command::new(BIN).env_clear().arg(flag).output().unwrap();

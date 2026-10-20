@@ -107,7 +107,7 @@ impl Run {
 
 fn run_manager(home: &Path, stage: &Path) -> Run {
     Run::from(
-        Command::new(env!("CARGO_BIN_EXE_dotfiles-manager"))
+        Command::new(env!("CARGO_BIN_EXE_dfm"))
             .env_clear()
             .args([
                 "--home",

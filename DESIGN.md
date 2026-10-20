@@ -21,10 +21,10 @@ These are user-required capabilities of the **very first implementation**, not o
 
 | Workflow | Proposed command | Required result |
 | --- | --- | --- |
-| Update all managed versions | `dotfiles-manager update` | Discover, preview, approve, and apply eligible version updates across every managed source in the bound profile's complete module graph, including external modules. |
-| Pull and apply configuration | `dotfiles-manager sync` | Fetch the latest dotfiles from the configured GitHub tracking ref, resolve the required module revisions, and apply the resulting configuration in one invocation. |
-| Try, then keep or remove a tool | `dotfiles-manager try <tool>`; then `adopt <trial> --module <id>` or `purge <trial>` | Start a tracked trial without hand-authoring a module, preserve its baseline, and either promote its tuned configuration and installation into a module or remove its attributable trial changes. |
-| Diagnose the machine | `dotfiles-manager doctor` | Produce a read-only diagnostic table of tools/resources, health, versions, executable/config locations, ownership, and evidence-backed findings with suggested actions. |
+| Update all managed versions | `dfm update` | Discover, preview, approve, and apply eligible version updates across every managed source in the bound profile's complete module graph, including external modules. |
+| Pull and apply configuration | `dfm sync` | Fetch the latest dotfiles from the configured GitHub tracking ref, resolve the required module revisions, and apply the resulting configuration in one invocation. |
+| Try, then keep or remove a tool | `dfm try <tool>`; then `adopt <trial> --module <id>` or `purge <trial>` | Start a tracked trial without hand-authoring a module, preserve its baseline, and either promote its tuned configuration and installation into a module or remove its attributable trial changes. |
+| Diagnose the machine | `dfm doctor` | Produce a read-only diagnostic table of tools/resources, health, versions, executable/config locations, ownership, and evidence-backed findings with suggested actions. |
 
 For each mutating workflow, one command includes discovery, planning, approval, execution, and verification. It must not require a separate manual pull, per-provider update loop, or plan/apply invocation. Authentication, conflict resolution, and confirmation of destructive effects may still require interaction within that workflow. An internal read-only resolver is an implementation step, not fulfillment of this scope.
 

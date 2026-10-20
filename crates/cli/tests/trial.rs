@@ -10,7 +10,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::process::{Command, Output};
 
-const BIN: &str = env!("CARGO_BIN_EXE_dotfiles-manager");
+const BIN: &str = env!("CARGO_BIN_EXE_dfm");
 const BREW: &str = "homebrew/v1";
 
 struct Fx {

@@ -12,7 +12,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
-const BIN: &str = env!("CARGO_BIN_EXE_dotfiles-manager");
+const BIN: &str = env!("CARGO_BIN_EXE_dfm");
 const TOKEN: &str = "PLANTED-TOKEN-7f3a9c";
 
 const CORE: &str = r#"schema = 1

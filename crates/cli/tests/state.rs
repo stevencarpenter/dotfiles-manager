@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
-const BIN: &str = env!("CARGO_BIN_EXE_dotfiles-manager");
+const BIN: &str = env!("CARGO_BIN_EXE_dfm");
 const M5: &str = "m5-personal";
 
 fn cmd(home: &Path, args: &[&str]) -> Command {

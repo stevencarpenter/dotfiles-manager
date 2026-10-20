@@ -497,9 +497,9 @@ check_current_leaves() {
 # may only be replaced when it is absent or a symlink. Checked early and again before the swap.
 check_command_path() {
   check_current_leaves
-  link=$HOME_DIR/.local/bin/dotfiles-manager
+  link=$HOME_DIR/.local/bin/dfm
   if [ -L "$link" ]; then
-    [ "$(readlink "$link")" = "$DATA/current/dotfiles-manager" ] ||
+    [ "$(readlink "$link")" = "$DATA/current/dfm" ] ||
       refuse E_PREREQ_MISSING "$link is a symlink that points elsewhere; move it away first"
   elif [ -e "$link" ]; then
     refuse E_PREREQ_MISSING "$link exists and is not a symlink; move it away first"
@@ -511,10 +511,10 @@ check_command_path() {
 # link inside a directory that mktemp -d just made, so no name that existed before is touched,
 # and is renamed into place. A link that exists before `current` does is harmless: it dangles.
 ensure_command_link() {
-  link=$HOME_DIR/.local/bin/dotfiles-manager; want=$DATA/current/dotfiles-manager
+  link=$HOME_DIR/.local/bin/dfm; want=$DATA/current/dfm
   [ ! -L "$link" ] || return 0
   check_bin_dir
-  link_dir=$(mktemp -d "$HOME_DIR/.local/bin/.dotfiles-manager-link.XXXXXX") || { echo "error: cannot stage the command link" >&2; exit 1; }
+  link_dir=$(mktemp -d "$HOME_DIR/.local/bin/.dfm-link.XXXXXX") || { echo "error: cannot stage the command link" >&2; exit 1; }
   ln -s "$want" "$link_dir/link" || { rm -rf "$link_dir"; echo "error: cannot stage the command link" >&2; exit 1; }
   # Test the destination again right before the rename: mv would move the link into a directory
   # that appeared since the first check, or replace a link that is not ours.
@@ -760,7 +760,7 @@ cmd_install() {
   tcrun "$TC/bin/cargo" fetch --locked --manifest-path "$build/stage/Cargo.toml" || { echo "error: cargo fetch failed" >&2; exit 1; }
   tcrun "$TC/bin/cargo" build --release --locked --offline --manifest-path "$build/stage/Cargo.toml" \
     --target-dir "$build/target" -p dfm-cli || { echo "error: cargo build failed" >&2; exit 1; }
-  bin=$build/target/release/dotfiles-manager
+  bin=$build/target/release/dfm
   # The new binary must be able to read the binding that already exists, so it checks a copy.
   mkdir -p "$build/fixture"
   if test_mode && [ -n "${DFM_TEST_BEFORE_COPY:-}" ]; then /bin/sh "$DFM_TEST_BEFORE_COPY"; fi
@@ -770,8 +770,8 @@ cmd_install() {
   fi
   tcrun "$bin" self-check --fixture-dir "$build/fixture" >/dev/null || { echo "error: self-check failed" >&2; exit 1; }
   ver=$(tcrun "$bin" --version) || { echo "error: the built binary did not run" >&2; exit 1; }
-  case $ver in "dotfiles-manager "*" (commit $commit)") ;; *) echo "error: the built binary reports a different identity: $ver" >&2; exit 1 ;; esac
-  semver=${ver#dotfiles-manager }; semver=${semver%% *}
+  case $ver in "dfm "*" (commit $commit)") ;; *) echo "error: the built binary reports a different identity: $ver" >&2; exit 1 ;; esac
+  semver=${ver#dfm }; semver=${semver%% *}
   case $semver in ""|*[!0-9.]*) echo "error: unexpected version $semver" >&2; exit 1 ;; esac
   name=$semver-$(printf '%s' "$commit" | cut -c1-12)
   # Every existing component of versions/<name> must be a real directory. The binary is copied
@@ -779,10 +779,10 @@ cmd_install() {
   check_private_path "$DATA_REL/versions/$name"
   mkdir -p "$DATA/versions/$name" "$HOME_DIR/.local/bin"
   check_private_path "$DATA_REL/versions/$name"
-  [ ! -d "$DATA/versions/$name/dotfiles-manager" ] ||
-    refuse E_PREREQ_MISSING "$DATA/versions/$name/dotfiles-manager is a directory; move it away first"
-  staged_bin=$(mktemp "$DATA/versions/$name/dotfiles-manager.new.XXXXXX") || { echo "error: cannot create the staged binary" >&2; exit 1; }
-  { cp "$bin" "$staged_bin" && chmod 755 "$staged_bin" && mv -f "$staged_bin" "$DATA/versions/$name/dotfiles-manager"; } ||
+  [ ! -d "$DATA/versions/$name/dfm" ] ||
+    refuse E_PREREQ_MISSING "$DATA/versions/$name/dfm is a directory; move it away first"
+  staged_bin=$(mktemp "$DATA/versions/$name/dfm.new.XXXXXX") || { echo "error: cannot create the staged binary" >&2; exit 1; }
+  { cp "$bin" "$staged_bin" && chmod 755 "$staged_bin" && mv -f "$staged_bin" "$DATA/versions/$name/dfm"; } ||
     { rm -f "$staged_bin"; echo "error: cannot stage the binary" >&2; exit 1; }
   if test_mode && [ -n "${DFM_TEST_BEFORE_SWAP:-}" ]; then /bin/sh "$DFM_TEST_BEFORE_SWAP"; fi
   check_command_path
@@ -795,13 +795,14 @@ cmd_install() {
   if test_mode && [ -n "${DFM_TEST_AFTER_SWAP:-}" ]; then /bin/sh "$DFM_TEST_AFTER_SWAP"; fi
   # Read both links back: a swap that did not take effect must not be reported as done.
   got_current=$(readlink "$DATA/current") || got_current=
-  got_link=$(readlink "$HOME_DIR/.local/bin/dotfiles-manager") || got_link=
+  got_link=$(readlink "$HOME_DIR/.local/bin/dfm") || got_link=
   if [ "$got_current" != "versions/$name" ]; then
     echo "error: swap did not take effect: $DATA/current is '$got_current', expected 'versions/$name'" >&2; exit 1
   fi
-  if [ "$got_link" != "$DATA/current/dotfiles-manager" ]; then
-    echo "error: swap did not take effect: the command path is '$got_link', expected '$DATA/current/dotfiles-manager'" >&2; exit 1
+  if [ "$got_link" != "$DATA/current/dfm" ]; then
+    echo "error: swap did not take effect: the command path is '$got_link', expected '$DATA/current/dfm'" >&2; exit 1
   fi
+  retire_old_command_link
   # Again: the window since the last check was the whole build. The swap is done, so a failed
   # check is an exit 1 after cleaning what is safe to clean, never a refusal with exit 3.
   clean_build
@@ -810,8 +811,23 @@ cmd_install() {
     echo "error: the swap took effect and $DATA/current is the new version, but a directory check failed afterwards; not removed: $left. Fix the directory and remove it yourself" >&2; exit 1
   fi
   install_ok=1
-  sha=$(/usr/bin/shasum -a 256 "$DATA/versions/$name/dotfiles-manager" | cut -d' ' -f1)
+  sha=$(/usr/bin/shasum -a 256 "$DATA/versions/$name/dfm" | cut -d' ' -f1)
   printf 'installed %s\nsource commit %s\nbinary sha256 %s (record only)\nbootstrap: done\n' "$DATA/versions/$name" "$commit" "$sha"
+}
+
+# The command was `dotfiles-manager` before DFM-67. A link of that name that points into this
+# manager's `current` is removed after the swap and by uninstall; anything else there is named
+# and left alone. A later release may drop this rule.
+retire_old_command_link() {
+  old=$HOME_DIR/.local/bin/dotfiles-manager
+  if [ -L "$old" ]; then
+    case $(readlink "$old") in
+      "$DATA/current/"*) rm -f "$old" && echo "removed the old command link $old" ;;
+      *) echo "note: $old is a symlink that is not this manager's; left alone" ;;
+    esac
+  elif [ -e "$old" ]; then
+    echo "note: $old exists and is not this manager's link; left alone"
+  fi
 }
 
 # Removes what install created. The toolchain, state, binding and anything else in the cache
@@ -819,8 +835,9 @@ cmd_install() {
 cmd_uninstall() {
   resolve_home
   check_home_dir; check_cache_tree; check_data_tree; check_current_leaves; check_bin_dir
-  link=$HOME_DIR/.local/bin/dotfiles-manager
-  if [ -L "$link" ] && [ "$(readlink "$link")" = "$DATA/current/dotfiles-manager" ]; then rm -f "$link"; fi
+  link=$HOME_DIR/.local/bin/dfm
+  if [ -L "$link" ] && [ "$(readlink "$link")" = "$DATA/current/dfm" ]; then rm -f "$link"; fi
+  retire_old_command_link
   build=$CACHE/build; rm_build
   rm -f "$DATA/current" "$DATA/current.new"
   rm -rf "${DATA:?}/versions" "$DATA/cargo-home" "$DATA/rustup-home" "$DATA/build-home"

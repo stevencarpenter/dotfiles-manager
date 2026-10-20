@@ -934,15 +934,10 @@ fn isolated_install_invocation_and_clean_removal() {
         fs::read_link(data.join("current")).unwrap(),
         Path::new(&format!("versions/{name}"))
     );
-    assert!(
-        data.join("versions")
-            .join(&name)
-            .join("dotfiles-manager")
-            .is_file()
-    );
+    assert!(data.join("versions").join(&name).join("dfm").is_file());
     assert_eq!(
-        fs::read_link(home.join(".local/bin/dotfiles-manager")).unwrap(),
-        data.join("current/dotfiles-manager")
+        fs::read_link(home.join(".local/bin/dfm")).unwrap(),
+        data.join("current/dfm")
     );
     for gone in ["cargo-home", "rustup-home", "build-home"] {
         assert!(
@@ -953,7 +948,7 @@ fn isolated_install_invocation_and_clean_removal() {
     assert!(!home.join(".cache/dotfiles-manager/build").exists());
 
     // Invocation of the installed release binary, which has no test-isolation overrides.
-    let bin = home.join(".local/bin/dotfiles-manager");
+    let bin = home.join(".local/bin/dfm");
     let run = |args: &[&str], env: &[(&str, &str)]| {
         let mut c = Command::new(&bin);
         c.env_clear().args(args);
@@ -963,7 +958,7 @@ fn isolated_install_invocation_and_clean_removal() {
         c.output().unwrap()
     };
     let v = String::from_utf8_lossy(&run(&["--version"], &[]).stdout).into_owned();
-    assert_eq!(v.trim(), format!("dotfiles-manager 0.1.0 (commit {sha})"));
+    assert_eq!(v.trim(), format!("dfm 0.1.0 (commit {sha})"));
     assert_eq!(
         run(&["--home", home.to_str().unwrap(), "binding"], &[])
             .status
@@ -1029,10 +1024,7 @@ fn upgrade_retries_after_a_stale_current_new_and_rolls_back() {
         Path::new(&format!("versions/{n2}"))
     );
     assert!(
-        data.join("versions")
-            .join(&n1)
-            .join("dotfiles-manager")
-            .is_file(),
+        data.join("versions").join(&n1).join("dfm").is_file(),
         "the previous version must be kept"
     );
     assert!(!data.join("current.new").exists());
@@ -1052,7 +1044,7 @@ fn upgrade_retries_after_a_stale_current_new_and_rolls_back() {
             .unwrap()
             .success()
     );
-    let v = Command::new(p.home.join(".local/bin/dotfiles-manager"))
+    let v = Command::new(p.home.join(".local/bin/dfm"))
         .env_clear()
         .arg("--version")
         .output()
@@ -1077,9 +1069,7 @@ fn a_new_binary_that_cannot_read_the_existing_binding_does_not_become_current() 
         String::from_utf8_lossy(&o.stdout),
         err(&o)
     );
-    assert!(
-        !p.data.join("current").exists() && !p.home.join(".local/bin/dotfiles-manager").exists()
-    );
+    assert!(!p.data.join("current").exists() && !p.home.join(".local/bin/dfm").exists());
     assert_eq!(
         fs::read_to_string(cfg.join("machine.toml")).unwrap(),
         "schema = 2\n",
@@ -1093,7 +1083,7 @@ fn the_command_path_and_current_are_checked_again_just_before_the_swap() {
     let p = prepare("swap-recheck");
     // Runs after the build and before the swap; the real race is another process doing this.
     let hook = p.tmp.path().join("hook.sh");
-    let link = p.home.join(".local/bin/dotfiles-manager");
+    let link = p.home.join(".local/bin/dfm");
     fs::write(
         &hook,
         format!(
@@ -1544,7 +1534,7 @@ fn a_foreign_file_at_the_command_path_is_never_replaced() {
     let home = tmp.path().join("home");
     fs::create_dir_all(home.join(".local/share/dotfiles-manager/toolchains/9.9.9")).unwrap();
     fs::create_dir_all(home.join(".local/bin")).unwrap();
-    let target = home.join(".local/bin/dotfiles-manager");
+    let target = home.join(".local/bin/dfm");
     fs::write(&target, "mine").unwrap();
     let (src, sha) = tiny_source(tmp.path(), "9.9.9");
     let o = script_test_mode(
@@ -1577,7 +1567,7 @@ fn uninstall_removes_only_what_the_manager_created() {
     fs::write(cache.join("build/x"), "x").unwrap();
     fs::write(cache.join("keep.txt"), "mine").unwrap();
     fs::create_dir_all(home.join(".local/bin")).unwrap();
-    let foreign = home.join(".local/bin/dotfiles-manager");
+    let foreign = home.join(".local/bin/dfm");
     std::os::unix::fs::symlink("/usr/bin/true", &foreign).unwrap();
     // A staging clone left by an interrupted URL install lives inside the build directory.
     fs::create_dir_all(cache.join("build/source.git")).unwrap();
@@ -1586,6 +1576,10 @@ fn uninstall_removes_only_what_the_manager_created() {
         "ref: refs/heads/main\n",
     )
     .unwrap();
+    // The pre-DFM-67 command name: ours when it points into `current`, foreign otherwise.
+    let data = home.join(".local/share/dotfiles-manager");
+    let old = home.join(".local/bin/dotfiles-manager");
+    std::os::unix::fs::symlink(data.join("current/dotfiles-manager"), &old).unwrap();
     let o = script_test_mode(&home, &["uninstall"], &[]);
     assert_eq!(o.status.code(), Some(0), "{}", err(&o));
     assert!(!cache.join("build").exists());
@@ -1595,6 +1589,21 @@ fn uninstall_removes_only_what_the_manager_created() {
         Path::new("/usr/bin/true"),
         "a link that is not ours must stay"
     );
+    assert!(
+        !old.exists() && !old.is_symlink(),
+        "the old command link is ours and goes"
+    );
+    assert!(String::from_utf8_lossy(&o.stdout).contains("removed the old command link"));
+
+    std::os::unix::fs::symlink("/usr/bin/false", &old).unwrap();
+    let o = script_test_mode(&home, &["uninstall"], &[]);
+    assert_eq!(o.status.code(), Some(0), "{}", err(&o));
+    assert_eq!(
+        fs::read_link(&old).unwrap(),
+        Path::new("/usr/bin/false"),
+        "an old-name link that is not ours must stay"
+    );
+    assert!(String::from_utf8_lossy(&o.stdout).contains("left alone"));
 }
 
 /// Sets up a data tree whose `leaf` is a directory holding a victim file, then uninstalls.
@@ -1869,11 +1878,42 @@ fn a_symlinked_data_hierarchy_is_refused_before_any_recursive_removal() {
 
 #[test]
 #[ignore = "needs crates.io"]
+fn install_retires_the_old_command_link_and_keeps_a_foreign_one() {
+    let p = prepare("old-link");
+    let bin = p.home.join(".local/bin");
+    fs::create_dir_all(&bin).unwrap();
+    let old = bin.join("dotfiles-manager");
+    std::os::unix::fs::symlink(p.data.join("current/dotfiles-manager"), &old).unwrap();
+    let o = install(&p, &p.sha, &[]);
+    assert_eq!(o.status.code(), Some(0), "{}", err(&o));
+    assert!(
+        !old.exists() && !old.is_symlink(),
+        "the old command link is retired"
+    );
+    assert!(String::from_utf8_lossy(&o.stdout).contains("removed the old command link"));
+    assert_eq!(
+        fs::read_link(bin.join("dfm")).unwrap(),
+        p.data.join("current/dfm")
+    );
+
+    std::os::unix::fs::symlink("/usr/bin/true", &old).unwrap();
+    let o = install(&p, &p.sha, &[]);
+    assert_eq!(o.status.code(), Some(0), "{}", err(&o));
+    assert_eq!(
+        fs::read_link(&old).unwrap(),
+        Path::new("/usr/bin/true"),
+        "an old-name link that is not ours must stay"
+    );
+    assert!(String::from_utf8_lossy(&o.stdout).contains("left alone"));
+}
+
+#[test]
+#[ignore = "needs crates.io"]
 fn a_foreign_dotfiles_manager_new_in_the_bin_directory_is_never_removed() {
     let p = prepare("foreign-new");
     let bin = p.home.join(".local/bin");
-    fs::create_dir_all(bin.join("dotfiles-manager.new/inner")).unwrap();
-    fs::write(bin.join("dotfiles-manager.new/inner/keep"), "mine").unwrap();
+    fs::create_dir_all(bin.join("dfm.new/inner")).unwrap();
+    fs::write(bin.join("dfm.new/inner/keep"), "mine").unwrap();
     let o = install(&p, &p.sha, &[]);
     assert_eq!(
         o.status.code(),
@@ -1883,12 +1923,12 @@ fn a_foreign_dotfiles_manager_new_in_the_bin_directory_is_never_removed() {
         err(&o)
     );
     assert_eq!(
-        fs::read_to_string(bin.join("dotfiles-manager.new/inner/keep")).unwrap(),
+        fs::read_to_string(bin.join("dfm.new/inner/keep")).unwrap(),
         "mine"
     );
     assert_eq!(
-        fs::read_link(bin.join("dotfiles-manager")).unwrap(),
-        p.data.join("current/dotfiles-manager")
+        fs::read_link(bin.join("dfm")).unwrap(),
+        p.data.join("current/dfm")
     );
     let left: Vec<_> = fs::read_dir(&bin)
         .unwrap()
@@ -1915,21 +1955,17 @@ fn a_symlinked_version_directory_or_staged_binary_is_not_written_through() {
         "{}",
         err(&o)
     );
-    assert!(!outside.join("target/dotfiles-manager").exists());
+    assert!(!outside.join("target/dfm").exists());
     assert!(!p.data.join("current").exists(), "current must not flip");
     // A planted staging name inside a real version directory is a link to a file elsewhere.
     fs::remove_file(versions.join(&name)).unwrap();
     fs::create_dir(versions.join(&name)).unwrap();
     let elsewhere = outside.join("target/keep");
-    symlink(
-        &elsewhere,
-        versions.join(&name).join("dotfiles-manager.new"),
-    )
-    .unwrap();
+    symlink(&elsewhere, versions.join(&name).join("dfm.new")).unwrap();
     let o = install(&p, &p.sha, &[]);
     assert_eq!(o.status.code(), Some(0), "{}", err(&o));
     assert_eq!(fs::read_to_string(&elsewhere).unwrap(), "mine");
-    let installed = versions.join(&name).join("dotfiles-manager");
+    let installed = versions.join(&name).join("dfm");
     assert!(installed.is_file() && !installed.is_symlink());
 }
 
@@ -2307,8 +2343,8 @@ fn uninstall_refuses_a_home_owned_by_another_user_and_removes_nothing() {
 fn a_symlinked_bin_directory_is_refused_by_uninstall_and_nothing_is_removed() {
     let (tmp, home, _src, _sha) = refusal_setup("bin-link-uninstall");
     let outside = victim(tmp.path(), &["bin"]);
-    let ours = home.join(".local/share/dotfiles-manager/current/dotfiles-manager");
-    let planted = outside.join("bin/dotfiles-manager");
+    let ours = home.join(".local/share/dotfiles-manager/current/dfm");
+    let planted = outside.join("bin/dfm");
     std::os::unix::fs::symlink(&ours, &planted).unwrap();
     std::os::unix::fs::symlink(outside.join("bin"), home.join(".local/bin")).unwrap();
     let before = snapshot(&home);
@@ -2407,8 +2443,8 @@ case $1 in
   build)
     while [ $# -gt 0 ]; do [ "$1" = --target-dir ] && t=$2; shift; done
     mkdir -p "$t/release"
-    printf '#!/bin/sh\ncase $1 in --version) echo "dotfiles-manager 0.1.0 (commit %s)" ;; esac\n' "$DFM_BUILD_COMMIT" >"$t/release/dotfiles-manager"
-    chmod 755 "$t/release/dotfiles-manager" ;;
+    printf '#!/bin/sh\ncase $1 in --version) echo "dfm 0.1.0 (commit %s)" ;; esac\n' "$DFM_BUILD_COMMIT" >"$t/release/dfm"
+    chmod 755 "$t/release/dfm" ;;
 esac
 "#
         );
@@ -2481,7 +2517,7 @@ fn a_group_writable_version_directory_stops_install_before_the_binary_is_staged(
         err(&o)
     );
     assert!(!p.data.join("current").exists());
-    assert!(!p.home.join(".local/bin/dotfiles-manager").exists());
+    assert!(!p.home.join(".local/bin/dfm").exists());
     assert!(
         fs::read_dir(&vdir).unwrap().next().is_none(),
         "nothing staged"
@@ -2517,7 +2553,7 @@ fn a_refusal_after_the_first_mutation_exits_1() {
     let p = prepare_with("fake-binary-dir", fake_toolchain("exit 0".into()));
     let name = format!("0.1.0-{}", &p.sha[..12]);
     let vdir = p.data.join("versions").join(&name);
-    fs::create_dir_all(vdir.join("dotfiles-manager")).unwrap();
+    fs::create_dir_all(vdir.join("dfm")).unwrap();
     let o = install(&p, &p.sha, &[]);
     assert_eq!(o.status.code(), Some(1), "{}", err(&o));
     assert!(
