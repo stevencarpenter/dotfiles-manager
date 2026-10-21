@@ -1611,7 +1611,10 @@ fn uninstall_removes_only_what_the_manager_created() {
         Path::new("/usr/bin/false"),
         "an old-name link that is not ours must stay"
     );
-    assert!(String::from_utf8_lossy(&o.stdout).contains("left alone"));
+    assert!(
+        String::from_utf8_lossy(&o.stdout)
+            .contains("is a symlink that is not this manager's; left alone")
+    );
 
     // An owner-made alias to the new binary and a regular file are left alone too.
     fs::remove_file(&old).unwrap();
@@ -1619,12 +1622,19 @@ fn uninstall_removes_only_what_the_manager_created() {
     let o = script_test_mode(&home, &["uninstall"], &[]);
     assert_eq!(o.status.code(), Some(0), "{}", err(&o));
     assert_eq!(fs::read_link(&old).unwrap(), data.join("current/dfm"));
+    assert!(
+        String::from_utf8_lossy(&o.stdout)
+            .contains("is a symlink that is not this manager's; left alone")
+    );
     fs::remove_file(&old).unwrap();
     fs::write(&old, "mine").unwrap();
     let o = script_test_mode(&home, &["uninstall"], &[]);
     assert_eq!(o.status.code(), Some(0), "{}", err(&o));
     assert_eq!(fs::read_to_string(&old).unwrap(), "mine");
-    assert!(String::from_utf8_lossy(&o.stdout).contains("left alone"));
+    assert!(
+        String::from_utf8_lossy(&o.stdout)
+            .contains("exists and is not this manager's link; left alone")
+    );
 }
 
 /// Sets up a data tree whose `leaf` is a directory holding a victim file, then uninstalls.
@@ -2454,6 +2464,12 @@ fn a_nested_toolchain_copy_is_named_and_a_refused_install_removes_its_build_dire
 /// `fetch` runs `on_fetch` (shell text); `build` writes a stand-in binary that reports the
 /// identity the script requires and passes `self-check`.
 fn fake_toolchain(on_fetch: String) -> impl FnOnce(&Path) -> String {
+    fake_toolchain_named(on_fetch, "dfm")
+}
+
+/// As `fake_toolchain`, with the name the stand-in reports in `--version` (the script requires
+/// `dfm`; another name must be refused as a different identity).
+fn fake_toolchain_named(on_fetch: String, name: &'static str) -> impl FnOnce(&Path) -> String {
     move |dest| {
         let bin = dest.join("bin");
         fs::create_dir_all(&bin).unwrap();
@@ -2464,7 +2480,7 @@ case $1 in
   build)
     while [ $# -gt 0 ]; do [ "$1" = --target-dir ] && t=$2; shift; done
     mkdir -p "$t/release"
-    printf '#!/bin/sh\ncase $1 in --version) echo "dfm 0.1.0 (commit %s)" ;; esac\n' "$DFM_BUILD_COMMIT" >"$t/release/dfm"
+    printf '#!/bin/sh\ncase $1 in --version) echo "{name} 0.1.0 (commit %s)" ;; esac\n' "$DFM_BUILD_COMMIT" >"$t/release/dfm"
     chmod 755 "$t/release/dfm" ;;
 esac
 "#
@@ -2492,6 +2508,95 @@ fn a_successful_install_with_a_stand_in_cargo_leaves_no_build_directories() {
     assert_eq!(o.status.code(), Some(0), "{}", err(&o));
     assert!(build_dirs_gone(&p));
     assert!(p.data.join("current").is_symlink());
+}
+
+/// The install path of the old-link rule, without network: ours is removed with a message; a
+/// foreign link and a regular file are kept and each named by its own message.
+#[test]
+fn install_with_a_stand_in_cargo_retires_the_old_link_and_keeps_others() {
+    let p = prepare_with("fake-old-link", fake_toolchain("exit 0".into()));
+    let bin = p.home.join(".local/bin");
+    fs::create_dir_all(&bin).unwrap();
+    let old = bin.join("dotfiles-manager");
+    std::os::unix::fs::symlink(p.data.join("current/dotfiles-manager"), &old).unwrap();
+    let o = install(&p, &p.sha, &[]);
+    assert_eq!(o.status.code(), Some(0), "{}", err(&o));
+    let out = String::from_utf8_lossy(&o.stdout);
+    assert!(!old.exists() && !old.is_symlink(), "ours is retired");
+    assert!(out.contains("removed the old command link") && out.contains("bootstrap: done"));
+    assert_eq!(
+        fs::read_link(bin.join("dfm")).unwrap(),
+        p.data.join("current/dfm")
+    );
+
+    std::os::unix::fs::symlink("/usr/bin/true", &old).unwrap();
+    let o = install(&p, &p.sha, &[]);
+    assert_eq!(o.status.code(), Some(0), "{}", err(&o));
+    let out = String::from_utf8_lossy(&o.stdout);
+    assert_eq!(fs::read_link(&old).unwrap(), Path::new("/usr/bin/true"));
+    assert!(out.contains("is a symlink that is not this manager's; left alone"));
+    assert!(out.contains("bootstrap: done"));
+
+    fs::remove_file(&old).unwrap();
+    fs::write(&old, "mine").unwrap();
+    let o = install(&p, &p.sha, &[]);
+    assert_eq!(o.status.code(), Some(0), "{}", err(&o));
+    let out = String::from_utf8_lossy(&o.stdout);
+    assert_eq!(fs::read_to_string(&old).unwrap(), "mine");
+    assert!(out.contains("exists and is not this manager's link; left alone"));
+    assert!(out.contains("bootstrap: done"));
+}
+
+/// A removal that fails prints a note; the install still finishes and reports done.
+#[test]
+fn install_notes_an_old_link_it_cannot_remove_and_still_finishes() {
+    use std::os::unix::fs::MetadataExt;
+    let p = prepare_with("fake-old-link-stuck", fake_toolchain("exit 0".into()));
+    if fs::metadata(&p.home).unwrap().uid() == 0 {
+        eprintln!("skipped: root can always unlink");
+        return;
+    }
+    let bin = p.home.join(".local/bin");
+    fs::create_dir_all(&bin).unwrap();
+    let old = bin.join("dotfiles-manager");
+    std::os::unix::fs::symlink(p.data.join("current/dotfiles-manager"), &old).unwrap();
+    // After the swap, before the retirement: the bin directory refuses unlink.
+    let hook = p.tmp.path().join("hook.sh");
+    fs::write(&hook, format!("chmod 500 '{}'\n", bin.display())).unwrap();
+    let o = install(
+        &p,
+        &p.sha,
+        &[("DFM_TEST_AFTER_SWAP", hook.to_str().unwrap())],
+    );
+    fs::set_permissions(&bin, fs::Permissions::from_mode(0o700)).unwrap();
+    assert_eq!(o.status.code(), Some(0), "{}", err(&o));
+    assert!(err(&o).contains("cannot remove") && err(&o).contains("remove it yourself"));
+    assert!(String::from_utf8_lossy(&o.stdout).contains("bootstrap: done"));
+    assert!(old.is_symlink(), "left in place when it cannot be removed");
+    assert_eq!(
+        fs::read_link(bin.join("dfm")).unwrap(),
+        p.data.join("current/dfm")
+    );
+}
+
+/// A built binary that reports another name is refused as a different identity, after the
+/// build and before anything is installed.
+#[test]
+fn a_stand_in_binary_with_the_old_name_is_refused() {
+    let p = prepare_with(
+        "fake-old-name",
+        fake_toolchain_named("exit 0".into(), "dotfiles-manager"),
+    );
+    let o = install(&p, &p.sha, &[]);
+    assert_eq!(o.status.code(), Some(1), "{}", err(&o));
+    assert!(
+        err(&o).contains("reports a different identity")
+            && err(&o).contains("dotfiles-manager 0.1.0"),
+        "{}",
+        err(&o)
+    );
+    assert!(!p.data.join("current").exists() && !p.data.join("versions").exists());
+    assert!(!p.home.join(".local/bin/dfm").exists());
 }
 
 #[test]

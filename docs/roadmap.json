@@ -5739,7 +5739,7 @@
           "reason": "Owner decision 2026-10-20: the command is `dfm`; the project and repository keep their name."
         }
       ],
-      "not_in_manifest": "Leaves DFM-44 to DFM-60 were filed on the board after the 2026-10-08 publication and are not in this manifest; DFM-60 is a native child of DFM-2. DFM-65, DFM-66 and DFM-67 (CI policy and shell policy of 2026-10-20) are in this manifest. DOT-28 (lock file and origin grant in ~/.dotfiles) lives on the Dotfiles board."
+      "not_in_manifest": "Leaves DFM-44 to DFM-60 were filed on the board after the 2026-10-08 publication and are not in this manifest; DFM-60 is a native child of DFM-2. DFM-65 and DFM-66 (CI policy and shell policy of 2026-10-20) and DFM-67 (the command-name decision of the same day) are in this manifest. DOT-28 (lock file and origin grant in ~/.dotfiles) lives on the Dotfiles board."
     }
   },
   "checklist_review": {
