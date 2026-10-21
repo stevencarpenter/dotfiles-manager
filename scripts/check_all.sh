@@ -14,7 +14,7 @@ step_fixtures() {
 step_scripts() {
     uvx --python 3.14 ruff@0.14.14 check scripts
     uvx --python 3.14 ruff@0.14.14 format --check scripts
-    bash_scripts=(scripts/check_all.sh scripts/check_staged.sh examples/external/modules/work/files/session-hook.sh)
+    bash_scripts=(scripts/check_all.sh scripts/check_staged.sh scripts/check_push.sh examples/external/modules/work/files/session-hook.sh)
     # `bash -n a b c` parses only the first file, so each file gets its own run.
     for f in "${bash_scripts[@]}"; do
         bash -n "$f"
