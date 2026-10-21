@@ -415,7 +415,7 @@ trait Adapter {
 
 ## 12. Distribution and bootstrap (C01, C06)
 
-1. Layout: `~/.local/share/dotfiles-manager/versions/<semver>-<short-commit>/dotfiles-manager`. The active version is the symlink `~/.local/share/dotfiles-manager/current`. The command on PATH is a symlink to `current/dotfiles-manager`. Locations come from the `Platform` port.
+1. Layout: `~/.local/share/dotfiles-manager/versions/<semver>-<short-commit>/dfm`. The active version is the symlink `~/.local/share/dotfiles-manager/current`. The command on PATH is a symlink to `current/dfm`. Locations come from the `Platform` port.
 2. Build: `cargo build --release --locked --offline` from the staged tree after `cargo fetch --locked`, under the build containment rules and limits in section 8. Whether the linker's ad-hoc signature is accepted under each device's security policy is **unverified** (device policy unknown). It is a device-gate item.
 3. **Bootstrap provenance (S4).**
    1. The owner supplies, out of band, the bootstrap script's pinned commit and its SHA-256. The script is obtained by cloning that commit over `https` from the canonical origin, using the same scrubbed Git environment as section 8 (not inherited Git configuration), and verifying the checksum before it runs. No `curl | sh`.
@@ -482,7 +482,7 @@ Other unknowns: Command Line Tools and the exact pinned Rust toolchain on each d
 3. **Crates.** `serde`, `toml`, `serde_json` and `sha2` are accepted as direct crates, with exact version pins and locked transitives. `rustix` is the fifth (owner-delegated decision during DFM-17, 2026-10-10): pinned `=1.1.5`, default features off, only `std` and `fs`, used by `dfm-engine` for descriptor-relative file operations through its safe API, so `unsafe_code` stays forbidden for that crate. `libc` is the sixth (owner decision, DFM-47, 2026-10-11): pinned `=0.2.190`, default features off, used only by `dfm-engine` to install the SIGINT and SIGTERM handlers with `sigaction`. It is already in `Cargo.lock` as the dependency of `rustix`, so the supply chain gains no package. The one exception to `unsafe_code`: the workspace lint is `deny`, every other crate root has `#![forbid(unsafe_code)]`, and `crates/engine/src/signal.rs` allows it for itself, with a `// SAFETY:` comment on every block. The handler stores to an atomic only. A gate test fails if the `unsafe` keyword appears in any other file, if a crate root loses its forbid, or if the dependency list changes. A `cargo-deny` gate is planned and not yet wired in. Rationale: the standard library has no TOML parser, SHA-256, `openat` or signal API.
 4. **Commit signatures.** Not required now. Trust is origin plus the recomputed tree digest. Signed commits can come later. Rationale: no signing infrastructure exists, and the digest binds content.
 5. **Exit codes.** 3, 4, 5 and 130 accepted, with 143 for SIGTERM.
-6. **Names.** Keep `dotfiles-manager` and `~/.local/state/dotfiles-manager/`.
+6. **Names.** The project is `dotfiles-manager`; the command is `dfm` (owner decision 2026-10-20, DFM-67). The state, config, cache and data directories and `dotfiles-manager.lock` keep the project name.
 7. **Prompt timeout.** 300 s accepted.
 8. **Disruptive set.** The set in section 10 is proposed and accepted as the working definition.
 9. **Firstmate scope.** `firstmate` applies to the personal M5 only. The work M3 profile does not include it. M3 is deferred and not a first-delivery requirement.

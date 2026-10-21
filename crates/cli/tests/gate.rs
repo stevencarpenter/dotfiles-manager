@@ -526,20 +526,20 @@ fn a_plain_release_build_of_every_target_has_no_test_isolation() {
         .output()
         .unwrap();
     assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
-    let v = Command::new(target.path().join("release/dotfiles-manager"))
+    let v = Command::new(target.path().join("release/dfm"))
         .arg("--version")
         .output()
         .unwrap();
     let v = String::from_utf8_lossy(&v.stdout);
     assert!(
-        v.starts_with("dotfiles-manager ") && !v.contains("test-isolation"),
+        v.starts_with("dfm ") && !v.contains("test-isolation"),
         "{v}"
     );
     // The isolation variables are compiled out: `width()` and `fail_from_env()` have no name to
     // read. The scan has a positive control, the isolated test binary, which must name all of
     // them, so a renamed or run-time-built variable cannot make the release scan pass vacuously.
-    let release = fs::read(target.path().join("release/dotfiles-manager")).unwrap();
-    let isolated = fs::read(env!("CARGO_BIN_EXE_dotfiles-manager")).unwrap();
+    let release = fs::read(target.path().join("release/dfm")).unwrap();
+    let isolated = fs::read(env!("CARGO_BIN_EXE_dfm")).unwrap();
     let names_in = |bin: &[u8]| {
         ISOLATION_NAMES
             .into_iter()
@@ -563,7 +563,7 @@ fn a_plain_release_build_of_every_target_has_no_test_isolation() {
             .output()
             .unwrap()
     };
-    let release_bin = target.path().join("release/dotfiles-manager");
+    let release_bin = target.path().join("release/dfm");
     let (plain, narrow) = (doctor(&release_bin, None), doctor(&release_bin, Some("20")));
     assert_eq!(plain.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&plain.stdout).contains("E_HOME_MISMATCH"));
@@ -577,7 +577,7 @@ fn a_plain_release_build_of_every_target_has_no_test_isolation() {
         "nothing was created"
     );
     let isolated_doctor = |width: Option<&str>| {
-        let mut c = Command::new(env!("CARGO_BIN_EXE_dotfiles-manager"));
+        let mut c = Command::new(env!("CARGO_BIN_EXE_dfm"));
         c.env_clear().args(["--home", "/a b"]);
         if let Some(w) = width {
             c.env("DFM_WIDTH", w);
@@ -596,7 +596,7 @@ fn a_plain_release_build_of_every_target_has_no_test_isolation() {
     // The release binary has no `--home` flag, so it is a usage error before anything is read
     // or written. This does not run `apply`: it proves only that the flag is absent.
     let scratch = common::TempDir::new("release-apply");
-    let o = Command::new(target.path().join("release/dotfiles-manager"))
+    let o = Command::new(target.path().join("release/dfm"))
         .env_clear()
         .env("DFM_HOME", scratch.path())
         .arg("--home")

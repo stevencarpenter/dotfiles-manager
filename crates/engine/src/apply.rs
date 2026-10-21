@@ -861,7 +861,7 @@ impl Exec<'_, '_> {
             return Err(blocked(
                 Code::OpInterrupted,
                 format!(
-                    "{rel}: resource {} has an unknown outcome (journal id {id}) with no intent record, so no path can be checked. Nothing was changed. Fix: check the machine, then run `dotfiles-manager state resolve {} --as failed`. Only `--as failed` clears it",
+                    "{rel}: resource {} has an unknown outcome (journal id {id}) with no intent record, so no path can be checked. Nothing was changed. Fix: check the machine, then run `dfm state resolve {} --as failed`. Only `--as failed` clears it",
                     op.resource,
                     recover::quoted(id)
                 ),
@@ -1513,7 +1513,7 @@ impl Exec<'_, '_> {
             return Err(blocked(
                 Code::OpInterrupted,
                 format!(
-                    "{}: resource {} has an unknown outcome (journal id {id}) with no recorded output path. Nothing was changed. Fix: check the provider's state, then run `dotfiles-manager state resolve {} --as failed`",
+                    "{}: resource {} has an unknown outcome (journal id {id}) with no recorded output path. Nothing was changed. Fix: check the provider's state, then run `dfm state resolve {} --as failed`",
                     op.id,
                     op.resource,
                     recover::quoted(id)

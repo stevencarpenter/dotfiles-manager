@@ -15,7 +15,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::process::{Command, Output};
 
-const BIN: &str = env!("CARGO_BIN_EXE_dotfiles-manager");
+const BIN: &str = env!("CARGO_BIN_EXE_dfm");
 const DUCKDB: &str = "extra.duckdb@package";
 const GO: &str = "extra.go@package";
 const JAVA: &str = "extra.java@package";

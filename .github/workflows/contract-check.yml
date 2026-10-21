@@ -160,7 +160,7 @@ jobs:
           - shard: 3
             names: the_binding_is_checked_again_just_before_the_swap the_data_directories_are_checked_again_before_the_late_removals the_command_path_and_current_are_checked_again_just_before_the_swap
           - shard: 4
-            names: the_command_link_is_staged_before_current_flips upgrade_retries_after_a_stale_current_new_and_rolls_back
+            names: the_command_link_is_staged_before_current_flips upgrade_retries_after_a_stale_current_new_and_rolls_back install_retires_the_old_command_link_and_keeps_a_foreign_one
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:

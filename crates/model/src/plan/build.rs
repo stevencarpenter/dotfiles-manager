@@ -1702,7 +1702,7 @@ impl Planner<'_> {
         };
         if let Some(why) = why {
             let fix = if op.ownership == Ownership::Modified {
-                "if an apply was interrupted, run `dotfiles-manager state recover` first. Otherwise review the file and remove it yourself; the manager removes only what it can prove it wrote"
+                "if an apply was interrupted, run `dfm state recover` first. Otherwise review the file and remove it yourself; the manager removes only what it can prove it wrote"
             } else {
                 "review the file and remove it yourself; the manager removes only what it can prove it wrote"
             };
@@ -2193,7 +2193,7 @@ fn decide(
             Code::Conflict,
             "target",
             format!("{path} was changed after the manager wrote it"),
-            "if an apply was interrupted, run `dotfiles-manager state recover` first. Otherwise review the file, then move it aside or adopt it; the manager does not overwrite content it does not own",
+            "if an apply was interrupted, run `dfm state recover` first. Otherwise review the file, then move it aside or adopt it; the manager does not overwrite content it does not own",
         )
     };
     if let Node::Unknown { reason } = &seen.node {

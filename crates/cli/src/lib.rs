@@ -1,4 +1,4 @@
-//! `dotfiles-manager` command line: version, help, profile binding, state, explain, plan,
+//! `dfm` command line (the dotfiles-manager binary): version, help, profile binding, state, explain, plan,
 //! doctor, status, apply, trial and self-check.
 
 #![forbid(unsafe_code)]
@@ -29,32 +29,32 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 const HELP: &str = "\
-dotfiles-manager: bind this machine to one dotfiles profile.
+dfm: bind this machine to one dotfiles profile.
 
 usage:
-  dotfiles-manager --version | version
-  dotfiles-manager --help | help
-  dotfiles-manager bind --profile <file> --machine-id <id>
-  dotfiles-manager binding
-  dotfiles-manager state check
-  dotfiles-manager state recover
-  dotfiles-manager state resolve <journal-id> --as done|failed
-  dotfiles-manager explain <resource-or-target> --root <dir>
-  dotfiles-manager plan --root <dir> [--json] [--against <saved plan>]
-  dotfiles-manager doctor --root <dir> [--json]
-  dotfiles-manager status --root <dir> [--json]
-  dotfiles-manager apply --root <dir> [--preview] [--yes-plan <digest>] [--allow-disruptive <operation-id>]...
+  dfm --version | version
+  dfm --help | help
+  dfm bind --profile <file> --machine-id <id>
+  dfm binding
+  dfm state check
+  dfm state recover
+  dfm state resolve <journal-id> --as done|failed
+  dfm explain <resource-or-target> --root <dir>
+  dfm plan --root <dir> [--json] [--against <saved plan>]
+  dfm doctor --root <dir> [--json]
+  dfm status --root <dir> [--json]
+  dfm apply --root <dir> [--preview] [--yes-plan <digest>] [--allow-disruptive <operation-id>]...
                                [--allow-adopt <operation-id>]...
-  dotfiles-manager secrets --root <dir> [--preview] [--yes-plan <digest>] [--allow-adopt <operation-id>]...
-  dotfiles-manager packages --root <dir> [--preview] [--yes-plan <digest>] [--update]
-  dotfiles-manager services --root <dir> [--preview] [--yes-plan <digest>] [--allow-disruptive <operation-id>]...
+  dfm secrets --root <dir> [--preview] [--yes-plan <digest>] [--allow-adopt <operation-id>]...
+  dfm packages --root <dir> [--preview] [--yes-plan <digest>] [--update]
+  dfm services --root <dir> [--preview] [--yes-plan <digest>] [--allow-disruptive <operation-id>]...
                                [--restart <resource-id>]...
-  dotfiles-manager trial <package> [--id <trial-id>] [--provider homebrew/v1|mise/v1] [--config <path>]...
+  dfm trial <package> [--id <trial-id>] [--provider homebrew/v1|mise/v1] [--config <path>]...
                                [--preview] [--yes-plan <digest>]
-  dotfiles-manager sync --root <dir> [--preview] [--yes-plan <digest>] [--allow-disruptive <operation-id>]...
+  dfm sync --root <dir> [--preview] [--yes-plan <digest>] [--allow-disruptive <operation-id>]...
                                [--allow-adopt <operation-id>]... [--trust-origin <origin>]...
-  dotfiles-manager self-check --build-controls <staged tree>
-  dotfiles-manager self-check --fixture-dir <dir>
+  dfm self-check --build-controls <staged tree>
+  dfm self-check --fixture-dir <dir>
 
 bind records the profile and machine identity once. A second bind with a
 different profile or machine is refused (E_REBIND_UNSUPPORTED). No command
@@ -367,7 +367,7 @@ fn dispatch(args: &[String], out: &mut dyn Write) -> Result<(), Refusal> {
             };
             writeln!(
                 out,
-                "dotfiles-manager {} (commit {commit}){iso}",
+                "dfm {} (commit {commit}){iso}",
                 env!("CARGO_PKG_VERSION")
             )
             .map_err(w)

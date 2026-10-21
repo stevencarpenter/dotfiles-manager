@@ -189,7 +189,8 @@
         "DFM-18",
         "DFM-19",
         "DFM-61",
-        "DFM-64"
+        "DFM-64",
+        "DFM-67"
       ],
       "goal_coverage": [
         {
@@ -310,6 +311,19 @@
             "DFM-64.C02",
             "DFM-64.C03",
             "DFM-64.C04"
+          ]
+        },
+        {
+          "goal": "Daily path (owner decision 2026-10-20): feat(cli): install and invoke the manager as `dfm`",
+          "criterion_ids": [
+            "DFM-67.C01",
+            "DFM-67.C02",
+            "DFM-67.C03",
+            "DFM-67.C04",
+            "DFM-67.C05",
+            "DFM-67.C06",
+            "DFM-67.C07",
+            "DFM-67.C08"
           ]
         }
       ]
@@ -4159,6 +4173,53 @@
         "DFM-66.C02",
         "DFM-66.C03"
       ]
+    },
+    {
+      "key": "cli-name",
+      "epic": "engine",
+      "title": "feat(cli): install and invoke the manager as `dfm`",
+      "priority": "high",
+      "depends": [
+        "bootstrap"
+      ],
+      "problem": "The owner wants `dfm sync`, not `dotfiles-manager sync` (2026-10-20). Only the executable and its install path change; the project, repository, crates, lock file and state directories keep the dotfiles-manager name.",
+      "acceptance": [
+        "`crates/cli/Cargo.toml` names the binary `dfm`; `cargo build --release` produces `target/release/dfm`; the test harness uses `CARGO_BIN_EXE_dfm`.",
+        "`dfm --version` prints `dfm <version> (commit <sha>)`; the help text, every usage line and every error \"Fix:\" hint say `dfm`.",
+        "`scripts/bootstrap.sh install` stages `target/release/dfm`, installs it as `versions/<name>/dfm`, points `current` at it and links `~/.local/bin/dfm`. The self-check and the swap use the new name. `uninstall` removes `~/.local/bin/dfm` under the existing \"only if it points at this manager\" rule.",
+        "Transition: when `~/.local/bin/dotfiles-manager` is a symlink to exactly `$DATA/current/dotfiles-manager` (the pre-rename installer's link), `install` removes it after the swap and prints one line saying so; a failed removal prints a note and does not fail the install; any other file or link at that path is left alone and named. `uninstall` applies the same rule. A later release may drop this rule.",
+        "Every bootstrap, build-controls and CLI test that names the executable follows; the differential test still runs both checkers. `bash scripts/check_all.sh` exits 0 on the exact SHA and the hosted `gate` passes.",
+        "README.md, DESIGN.md, docs/bootstrap.md, docs/first-run.md, docs/state.md, docs/architecture.md and the other docs that show invocations say `dfm`; the directory names stay as they are and docs/bootstrap.md states that in one sentence. The repo-map HTML files are generated artifacts and are not edited.",
+        "`docs/roadmap.json` gains this leaf under the engine epic with its criterion IDs.",
+        "Record delivery evidence: exact SHA and the merge PR. The live M5 reinstall and the `~/.dotfiles` wrapper change are DOT-31."
+      ],
+      "kaneo": {
+        "id": "wksa1dncqj2l19tyu3oylmbq",
+        "ticket": "DFM-67",
+        "status": "to-do",
+        "priority": "high",
+        "labels": [
+          "ready-for-agent"
+        ],
+        "url": "https://kaneo.snugmarina.org/dashboard/workspace/7tMuvznyx3ZOUb2boKJQbakZi44sT0eU/project/ldzsz08c771hgwkfwwzqjdd5/task/wksa1dncqj2l19tyu3oylmbq"
+      },
+      "original_acceptance": [],
+      "acceptance_ids": [
+        "DFM-67.C01",
+        "DFM-67.C02",
+        "DFM-67.C03",
+        "DFM-67.C04",
+        "DFM-67.C05",
+        "DFM-67.C06",
+        "DFM-67.C07",
+        "DFM-67.C08"
+      ],
+      "acceptance_source_map": {},
+      "acceptance_original_indices": [],
+      "filed": {
+        "date": "2026-10-20",
+        "origin": "owner command-name decision, 2026-10-20"
+      }
     }
   ],
   "review_revision": "2026-10-20-realignment",
@@ -5661,9 +5722,24 @@
             "DFM-66.C03"
           ],
           "reason": "Owner shell policy 2026-10-20 (no sh by default) meets the documented /bin/sh security choice of bootstrap.sh; the owner decides."
+        },
+        {
+          "ticket": "DFM-67",
+          "change": "leaf added",
+          "criterion_ids": [
+            "DFM-67.C01",
+            "DFM-67.C02",
+            "DFM-67.C03",
+            "DFM-67.C04",
+            "DFM-67.C05",
+            "DFM-67.C06",
+            "DFM-67.C07",
+            "DFM-67.C08"
+          ],
+          "reason": "Owner decision 2026-10-20: the command is `dfm`; the project and repository keep their name."
         }
       ],
-      "not_in_manifest": "Leaves DFM-44 to DFM-60 were filed on the board after the 2026-10-08 publication and are not in this manifest; DFM-60 is a native child of DFM-2. DFM-65 and DFM-66 (CI policy and shell policy of 2026-10-20) are in this manifest. DOT-28 (lock file and origin grant in ~/.dotfiles) lives on the Dotfiles board."
+      "not_in_manifest": "Leaves DFM-44 to DFM-60 were filed on the board after the 2026-10-08 publication and are not in this manifest; DFM-60 is a native child of DFM-2. DFM-65 and DFM-66 (CI policy and shell policy of 2026-10-20) and DFM-67 (the command-name decision of the same day) are in this manifest. DOT-28 (lock file and origin grant in ~/.dotfiles) lives on the Dotfiles board."
     }
   },
   "checklist_review": {

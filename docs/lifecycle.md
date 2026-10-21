@@ -21,7 +21,7 @@ The child-process runner is the one `secrets` and `packages` use (docs/secrets.m
 ## The command
 
 ```
-dotfiles-manager services --root <dir> [--preview] [--yes-plan <digest>] [--allow-disruptive <operation-id>]... [--restart <resource-id>]...
+dfm services --root <dir> [--preview] [--yes-plan <digest>] [--allow-disruptive <operation-id>]... [--restart <resource-id>]...
 ```
 
 `services` is `apply` over the services scope: every `service` resource is planned, every other resource is `not_in_scope` ("link is configuration, outside a services plan"), and nothing is removed or adopted (`--allow-adopt` is a usage error). Planning needs each launcher's report, so **`services` probes the launchers before it plans**, read-only, and hands the answers to the plan builder (nothing in `plan_cmd.rs` starts a process; the gate test keeps it so). The signal handlers go in before the first probe. `plan`, `apply`, `packages`, `secrets` and `doctor` start no launcher and list a service as `not_in_scope`.

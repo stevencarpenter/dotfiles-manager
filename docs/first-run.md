@@ -31,8 +31,8 @@ Board ticket: DFM-46. The agent runs nothing live without written approval that 
    /bin/sh scripts/bootstrap.sh install --source "$PWD" --commit <full sha>
    ```
 
-   It checks Command Line Tools, the pinned toolchain, the staged tree and the build controls before any `cargo` process starts. It runs `cargo fetch --locked`, which needs network access, then builds offline, runs `self-check`, then installs `~/.local/bin/dotfiles-manager` through a `current` symlink. A failed build leaves no installed binary.
-4. Check: `dotfiles-manager --version` prints the semver and the commit. The output must not contain `test-isolation`; the release binary ignores every isolation override.
+   It checks Command Line Tools, the pinned toolchain, the staged tree and the build controls before any `cargo` process starts. It runs `cargo fetch --locked`, which needs network access, then builds offline, runs `self-check`, then installs `~/.local/bin/dfm` through a `current` symlink. A failed build leaves no installed binary.
+4. Check: `dfm --version` prints the semver and the commit. The output must not contain `test-isolation`; the release binary ignores every isolation override.
 
 ## 2. Author a bundle in the configuration repository
 
@@ -124,10 +124,10 @@ exclude = [
 ## 3. Bind, then look without writing
 
 ```sh
-dotfiles-manager bind --profile <checkout>/profiles/m5-01.toml --machine-id <id>
-dotfiles-manager plan --root <checkout>
-dotfiles-manager doctor --root <checkout>
-dotfiles-manager apply --root <checkout> --preview
+dfm bind --profile <checkout>/profiles/m5-01.toml --machine-id <id>
+dfm plan --root <checkout>
+dfm doctor --root <checkout>
+dfm apply --root <checkout> --preview
 ```
 
 `bind` writes only the binding file, the empty state store under `~/.local/state/dotfiles-manager` and the lock file `~/.local/state/dotfiles-manager.lock`. `plan`, `doctor` and `--preview` write nothing.
@@ -152,7 +152,7 @@ Read the plan. Each line is one operation:
 1. Make the list of targets from the plan:
 
    ```sh
-   dotfiles-manager plan --root <checkout> --json > /tmp/plan.json
+   dfm plan --root <checkout> --json > /tmp/plan.json
    python3 -c 'import json;[print(o["path"]) for o in json.load(open("/tmp/plan.json"))["plan"]["operations"] if o.get("path")]' > /tmp/targets.txt
    ```
 
@@ -167,7 +167,7 @@ Read the plan. Each line is one operation:
 ## 5. Apply
 
 ```sh
-dotfiles-manager apply --root <checkout> --yes-plan <digest> [--allow-adopt '<id>']... [--allow-disruptive '<id>']...
+dfm apply --root <checkout> --yes-plan <digest> [--allow-adopt '<id>']... [--allow-disruptive '<id>']...
 ```
 
 - A digest that no longer matches exits 3 with `E_PLAN_STALE` and writes nothing. Run `plan` again and approve the new digest.
@@ -177,8 +177,8 @@ dotfiles-manager apply --root <checkout> --yes-plan <digest> [--allow-adopt '<id
 Check afterwards:
 
 ```sh
-dotfiles-manager state check
-dotfiles-manager doctor --root <checkout>
+dfm state check
+dfm doctor --root <checkout>
 exec zsh
 ```
 
@@ -189,6 +189,6 @@ Deselect the module in the profile (`modules = []`), run `plan`, then `apply --p
 ## Known limits on the first run
 
 - Links, rendered and assembled files, and the one `claude-settings/v1` merge. No secrets, no packages, no reloads of running programs.
-- `Ctrl-C` during `apply` stops cleanly. The operation in flight finishes, the receipt has outcome `interrupted`, and the exit code is 130. SIGTERM gives `terminated` and 143. After SIGKILL, a signal with no handler (SIGHUP, SIGQUIT, ...) or a crash, the next run settles the interrupted operation from the journal before it does anything else. A merge that was interrupted after its rename cannot be settled that way: its path stays blocked with `E_OP_INTERRUPTED` in every run until `dotfiles-manager state resolve <journal-id> --as failed` (docs/apply.md, "Known limits").
+- `Ctrl-C` during `apply` stops cleanly. The operation in flight finishes, the receipt has outcome `interrupted`, and the exit code is 130. SIGTERM gives `terminated` and 143. After SIGKILL, a signal with no handler (SIGHUP, SIGQUIT, ...) or a crash, the next run settles the interrupted operation from the journal before it does anything else. A merge that was interrupted after its rename cannot be settled that way: its path stays blocked with `E_OP_INTERRUPTED` in every run until `dfm state resolve <journal-id> --as failed` (docs/apply.md, "Known limits").
 - A removal or link replacement checks the leaf and then acts in a second step. A concurrent same-user process could change the leaf in between.
 - Config edits in the checkout never require rebuilding the manager. Only a new manager commit does, through `bootstrap.sh install`.

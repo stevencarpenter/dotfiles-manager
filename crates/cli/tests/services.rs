@@ -15,7 +15,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::process::{Command, Output};
 
-const BIN: &str = env!("CARGO_BIN_EXE_dotfiles-manager");
+const BIN: &str = env!("CARGO_BIN_EXE_dfm");
 const AGENT_OP: &str = "extra.maxfiles@service";
 const BAR_OP: &str = "extra.sketchybar@service";
 const LABEL: &str = "org.example.maxfiles";

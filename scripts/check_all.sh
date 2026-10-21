@@ -59,14 +59,17 @@ step_rust_tests() {
 
 # The install tests need crates.io, so they are #[ignore]d and run explicitly here. Each one
 # builds the manager in release mode, so hosted CI shards them: DFM_NETWORK_TESTS holds the
-# exact names of one shard (default: every ignored test in the workspace).
+# exact names of one shard (default: every ignored test in the workspace). At most four run at
+# once (DFM_NETWORK_THREADS): with twelve at once on an 18-core machine, five failed the
+# toolchain digest check and a rerun died (2026-10-20); the cause was not isolated.
 step_network_tests() {
+    local threads=${DFM_NETWORK_THREADS:-4}
     if [ -n "${DFM_NETWORK_TESTS:-}" ]; then
         local names
         read -ra names <<<"$DFM_NETWORK_TESTS"
-        cargo test -p dfm-cli --locked --features test-isolation --test bootstrap -- --ignored --exact "${names[@]}"
+        cargo test -p dfm-cli --locked --features test-isolation --test bootstrap -- --ignored --test-threads "$threads" --exact "${names[@]}"
     else
-        cargo test --workspace --locked --features dfm-cli/test-isolation -- --ignored
+        cargo test --workspace --locked --features dfm-cli/test-isolation -- --ignored --test-threads "$threads"
     fi
 }
 

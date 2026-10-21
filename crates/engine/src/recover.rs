@@ -532,7 +532,7 @@ pub(crate) fn fix_text(id: &str, multi: bool) -> String {
         "(the path holds the result the operation expected)"
     };
     format!(
-        "Fix: run `dotfiles-manager state recover` (it settles what the machine shows clearly) or apply. If the entry stays open, check the path, then run `dotfiles-manager state resolve {q} --as done` {done} or `--as failed`"
+        "Fix: run `dfm state recover` (it settles what the machine shows clearly) or apply. If the entry stays open, check the path, then run `dfm state resolve {q} --as done` {done} or `--as failed`"
     )
 }
 

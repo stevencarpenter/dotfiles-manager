@@ -62,7 +62,7 @@ pub fn copy_tree(from: &Path, to: &Path) {
     }
 }
 
-pub const BIN: &str = env!("CARGO_BIN_EXE_dotfiles-manager");
+pub const BIN: &str = env!("CARGO_BIN_EXE_dfm");
 
 pub fn text(b: &[u8]) -> String {
     String::from_utf8_lossy(b).into_owned()
