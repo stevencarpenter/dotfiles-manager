@@ -113,6 +113,8 @@ impl Fx {
             p.to_str().unwrap(),
             "--machine-id",
             "m5-test",
+            "--root",
+            fx.root.to_str().unwrap(),
         ]);
         assert_eq!(code(&o), 0, "{}", stderr(&o));
         fx
@@ -842,6 +844,8 @@ fn the_example_personal_profile_plans_and_applies_unmodified() {
         p.to_str().unwrap(),
         "--machine-id",
         "m5",
+        "--root",
+        fx.root.to_str().unwrap(),
     ]);
     assert_eq!(code(&o), 0, "{}", stderr(&o));
     let o = fx.plan();
@@ -2130,6 +2134,8 @@ fn a_store_without_a_salt_blocks_a_merge_that_has_fragments_until_bind_creates_i
         p.to_str().unwrap(),
         "--machine-id",
         "m5-test",
+        "--root",
+        fx.root.to_str().unwrap(),
     ]);
     assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
     assert_eq!(fs::read(&salt).unwrap().len(), 32);
@@ -2213,6 +2219,8 @@ fn bind_does_not_recreate_a_lost_salt_when_the_ledger_records_salted_hashes() {
         p.to_str().unwrap(),
         "--machine-id",
         "m5-test",
+        "--root",
+        fx.root.to_str().unwrap(),
     ]);
     assert_eq!(code(&o), 3, "{}\n{}", stderr(&o), text(&o.stdout));
     assert!(stderr(&o).contains("E_STATE_INVALID"), "{}", stderr(&o));
@@ -2286,6 +2294,8 @@ fn bind_with_a_missing_salt_and_an_unreadable_ledger_refuses_and_creates_no_salt
         p.to_str().unwrap(),
         "--machine-id",
         "m5-test",
+        "--root",
+        fx.root.to_str().unwrap(),
     ];
     let o = fx.run(&args);
     assert_eq!(code(&o), 3, "{}\n{}", stderr(&o), text(&o.stdout));
@@ -2331,6 +2341,8 @@ fn bind_with_an_unusable_salt_refuses_instead_of_reporting_already_bound() {
             p.to_str().unwrap(),
             "--machine-id",
             "m5-test",
+            "--root",
+            fx.root.to_str().unwrap(),
         ]);
         assert_eq!(code(&o), 3, "{what}: {}\n{}", stderr(&o), text(&o.stdout));
         assert!(
@@ -2368,6 +2380,8 @@ fn bind_with_an_unusable_salt_and_no_binding_file_publishes_no_binding() {
         p.to_str().unwrap(),
         "--machine-id",
         "m5-test",
+        "--root",
+        fx.root.to_str().unwrap(),
     ]);
     assert_eq!(code(&o), 3, "{}\n{}", stderr(&o), text(&o.stdout));
     assert!(
@@ -2401,6 +2415,8 @@ fn bind_refuses_a_salt_damaged_between_its_two_phases_and_publishes_no_binding()
             p.to_str().unwrap(),
             "--machine-id",
             "m5-test",
+            "--root",
+            fx.root_arg(),
         ],
         |_| fs::set_permissions(&salt, fs::Permissions::from_mode(0o644)).unwrap(),
     );
@@ -2412,6 +2428,47 @@ fn bind_refuses_a_salt_damaged_between_its_two_phases_and_publishes_no_binding()
         0o644,
         "the salt is unchanged"
     );
+}
+
+#[test]
+fn bind_keeps_a_root_recorded_between_its_two_phases() {
+    let fx = Fx::base();
+    let binding = fx.h(".config/dotfiles-manager/machine.toml");
+    let two = fs::read_to_string(&binding).unwrap();
+    let one: String = two
+        .lines()
+        .filter(|l| !l.starts_with("root = "))
+        .map(|l| format!("{l}\n"))
+        .collect::<String>()
+        .replace("schema = 2", "schema = 1");
+    fs::write(&binding, &one).unwrap();
+    let other = fs::canonicalize(fx.root.join("profiles")).unwrap();
+    let raced =
+        format!("{one}root = \"{}\"\n", other.display()).replace("schema = 1", "schema = 2");
+    let p = fx.root.join("profiles/t-01.toml");
+    // Phase 1 sees schema 1 and decides to upgrade. Another bind records another root while
+    // phase 2 waits for the lock.
+    let o = parked_command(
+        &fx,
+        "bind-after-lock",
+        &[
+            "bind",
+            "--profile",
+            p.to_str().unwrap(),
+            "--machine-id",
+            "m5-test",
+            "--root",
+            fx.root_arg(),
+        ],
+        |_| fs::write(&binding, &raced).unwrap(),
+    );
+    assert!(
+        stderr(&o).contains("E_REBIND_UNSUPPORTED"),
+        "{}",
+        stderr(&o)
+    );
+    assert_ne!(code(&o), 0);
+    assert_eq!(fs::read_to_string(&binding).unwrap(), raced);
 }
 
 // ---- review fixes (DFM-57) ---------------------------------------------------------------

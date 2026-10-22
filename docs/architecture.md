@@ -210,7 +210,7 @@ Read-only commands (`plan`, `explain`, `doctor`, `status`, `self-check`, and any
 
 ### Binding
 
-`~/.config/dotfiles-manager/machine.toml` (DESIGN.md section 3): `schema`, canonical profile path, machine identity, expected platform and architecture, and the declared origins (section 8). Declaring an origin in the binding does not trust it. One binding per machine.
+`~/.config/dotfiles-manager/machine.toml` (DESIGN.md section 3): `schema`, canonical profile path, the checkout root that commands use when `--root` is absent (schema 2), machine identity, expected platform and architecture, and the declared origins (section 8). Declaring an origin in the binding does not trust it. One binding per machine.
 
 ## 6. Authority model in code (C02)
 

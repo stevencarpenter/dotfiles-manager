@@ -98,7 +98,7 @@ Rules that matter on the first run:
 
 ### Declare the source roots
 
-Without `[sources]` the loader reads every file under `--root`. A live checkout often holds content the loader refuses: files over 1 MiB, a nested `.git`, more than 20,000 entries. Declare in the bundle which parts are sources. Example for a checkout with `home/` and `dfm/` at the top and the bundle in `dfm/`:
+Without `[sources]` the loader reads every file under the root. A live checkout often holds content the loader refuses: files over 1 MiB, a nested `.git`, more than 20,000 entries. Declare in the bundle which parts are sources. Example for a checkout with `home/` and `dfm/` at the top and the bundle in `dfm/`:
 
 ```toml
 [sources]
@@ -112,7 +112,7 @@ exclude = [
 ]
 ```
 
-- Roots and patterns are relative to `--root`. A pattern is anchored there, so `**/.venv` is the way to match a `.venv` at any depth.
+- Roots and patterns are relative to the root (`--root`, or the root the binding records). A pattern is anchored there, so `**/.venv` is the way to match a `.venv` at any depth.
 - The profile, the bundle and every module must lie inside a root, or be a file or link directly beside the bundle file. A subdirectory beside the bundle is read only when a root holds it. Otherwise `plan` fails with `E_SOURCE_ESCAPE` and names the file.
 - A resource source inside an excluded path fails with `E_SOURCE_ESCAPE` and names the pattern.
 - A change to `[sources]` changes the source digest, so a saved plan goes stale.
@@ -124,11 +124,13 @@ exclude = [
 ## 3. Bind, then look without writing
 
 ```sh
-dfm bind --profile <checkout>/profiles/m5-01.toml --machine-id <id>
-dfm plan --root <checkout>
-dfm doctor --root <checkout>
-dfm apply --root <checkout> --preview
+dfm bind --profile <checkout>/profiles/m5-01.toml --machine-id <id> [--root <checkout>]
+dfm plan
+dfm doctor
+dfm apply --preview
 ```
+
+`bind` records the checkout root: `--root`, else the nearest directory above the profile that holds `.git`. Every later command uses that root when `--root` is not given; an explicit `--root` wins. A binding written before the root was recorded (schema 1) still works with `--root` on each command. To record the root, run the same `bind` again (same `--profile` and `--machine-id`): it rewrites the binding in place and journals the change.
 
 `bind` writes only the binding file, the empty state store under `~/.local/state/dotfiles-manager` and the lock file `~/.local/state/dotfiles-manager.lock`. `plan`, `doctor` and `--preview` write nothing.
 
@@ -152,7 +154,7 @@ Read the plan. Each line is one operation:
 1. Make the list of targets from the plan:
 
    ```sh
-   dfm plan --root <checkout> --json > /tmp/plan.json
+   dfm plan --json > /tmp/plan.json
    python3 -c 'import json;[print(o["path"]) for o in json.load(open("/tmp/plan.json"))["plan"]["operations"] if o.get("path")]' > /tmp/targets.txt
    ```
 
@@ -167,7 +169,7 @@ Read the plan. Each line is one operation:
 ## 5. Apply
 
 ```sh
-dfm apply --root <checkout> --yes-plan <digest> [--allow-adopt '<id>']... [--allow-disruptive '<id>']...
+dfm apply --yes-plan <digest> [--allow-adopt '<id>']... [--allow-disruptive '<id>']...
 ```
 
 - A digest that no longer matches exits 3 with `E_PLAN_STALE` and writes nothing. Run `plan` again and approve the new digest.
@@ -178,7 +180,7 @@ Check afterwards:
 
 ```sh
 dfm state check
-dfm doctor --root <checkout>
+dfm doctor
 exec zsh
 ```
 

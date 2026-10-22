@@ -48,6 +48,12 @@ fn profile(name: &str) -> String {
         .to_string()
 }
 
+// The checkout that holds examples/profiles. A pushed commit is tested in a tree without .git,
+// so a bind of those profiles names it rather than relying on the .git default.
+fn checkout() -> String {
+    repo_root().to_str().unwrap().to_string()
+}
+
 fn bind(home: &Path) -> Output {
     run(
         home,
@@ -57,6 +63,8 @@ fn bind(home: &Path) -> Output {
             &profile("personal-dev-01.toml"),
             "--machine-id",
             M5,
+            "--root",
+            &checkout(),
         ],
     )
 }
@@ -874,12 +882,22 @@ fn state_left_by_a_crashed_bind_can_only_be_completed_by_the_same_identity() {
 #[test]
 fn concurrent_initial_binds_create_one_owner_in_the_binding_and_in_the_state() {
     let (a, b) = (profile("personal-dev-01.toml"), profile("work-01.toml"));
+    let repo = checkout();
     for round in 0..4 {
         let h = TempDir::new("race");
         let kids: Vec<_> = (0..8)
             .map(|i| {
                 let p = if i % 2 == 0 { &a } else { &b };
-                cmd(h.path(), &["bind", "--profile", p, "--machine-id", "m5"])
+                let args = [
+                    "bind",
+                    "--profile",
+                    p,
+                    "--machine-id",
+                    "m5",
+                    "--root",
+                    &repo,
+                ];
+                cmd(h.path(), &args)
                     .stdout(Stdio::null())
                     .stderr(Stdio::piped())
                     .spawn()
@@ -984,9 +1002,17 @@ fn redirected_manager_paths_are_refused_with_zero_writes_to_the_destination() {
             fs::remove_dir_all(&link).unwrap();
         }
         symlink(foreign.path(), &link).unwrap();
-        let pr = profile("personal-dev-01.toml");
+        let (pr, repo) = (profile("personal-dev-01.toml"), checkout());
         let args: Vec<&str> = if then == ["bind"] {
-            vec!["bind", "--profile", &pr, "--machine-id", M5]
+            vec![
+                "bind",
+                "--profile",
+                &pr,
+                "--machine-id",
+                M5,
+                "--root",
+                &repo,
+            ]
         } else {
             then.to_vec()
         };

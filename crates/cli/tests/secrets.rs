@@ -111,6 +111,8 @@ impl Fx {
             p.to_str().unwrap(),
             "--machine-id",
             "m5-test",
+            "--root",
+            fx.root.to_str().unwrap(),
         ]);
         assert_eq!(code(&o), 0, "{}", stderr(&o));
         fx

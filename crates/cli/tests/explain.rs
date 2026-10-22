@@ -63,6 +63,8 @@ fn bound(profile: &str) -> (TempDir, TempDir, PathBuf) {
             p.to_str().unwrap(),
             "--machine-id",
             "m5-personal",
+            "--root",
+            root.to_str().unwrap(),
         ],
     );
     assert_eq!(o.status.code(), Some(0), "{}", text(&o.stderr));
@@ -309,7 +311,6 @@ fn explain_refusals_have_a_stable_code_and_exit() {
     // Usage errors.
     for args in [
         vec!["explain"],
-        vec!["explain", "core.git"],
         vec!["explain", "--root", r],
         vec!["explain", "a", "b", "--root", r],
         vec!["explain", "core.git", "--root"],
@@ -387,7 +388,7 @@ fn help_lists_explain() {
         .arg("--help")
         .output()
         .unwrap();
-    assert!(text(&o.stdout).contains("explain <resource-or-target> --root <dir>"));
+    assert!(text(&o.stdout).contains("explain <resource-or-target> [--root <dir>]"));
 }
 
 #[test]
@@ -468,6 +469,8 @@ fn a_profile_for_another_architecture_is_refused_except_by_explain() {
             p.to_str().unwrap(),
             "--machine-id",
             "m5-personal",
+            "--root",
+            root.to_str().unwrap(),
         ],
     );
     assert_eq!(bind.status.code(), Some(0), "{}", text(&bind.stderr));

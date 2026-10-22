@@ -20,7 +20,7 @@ pub use controls_fs::{check_build_controls, toolchain_tree_digest};
 use dfm_engine::{Dir, Fail, Layout, Runner, Store, Sys, open_config};
 use dfm_model::binding::{Binding, MAX_BYTES, check_profile};
 use dfm_model::resolve::resolve;
-use dfm_model::state::Stamp;
+use dfm_model::state::{Class, JournalEntry, Phase, Recovery, Stamp};
 use dfm_model::{Code, Exit, Refusal};
 use dfm_platform_macos::{Platform, check_supported, current_platform};
 use source_fs::load_scoped;
@@ -34,37 +34,40 @@ dfm: bind this machine to one dotfiles profile.
 usage:
   dfm --version | version
   dfm --help | help
-  dfm bind --profile <file> --machine-id <id>
+  dfm bind --profile <file> --machine-id <id> [--root <dir>]
   dfm binding
   dfm state check
   dfm state recover
   dfm state resolve <journal-id> --as done|failed
-  dfm explain <resource-or-target> --root <dir>
-  dfm plan --root <dir> [--json] [--against <saved plan>]
-  dfm doctor --root <dir> [--json]
-  dfm status --root <dir> [--json]
-  dfm apply --root <dir> [--preview] [--yes-plan <digest>] [--allow-disruptive <operation-id>]...
+  dfm explain <resource-or-target> [--root <dir>]
+  dfm plan [--root <dir>] [--json] [--against <saved plan>]
+  dfm doctor [--root <dir>] [--json]
+  dfm status [--root <dir>] [--json]
+  dfm apply [--root <dir>] [--preview] [--yes-plan <digest>] [--allow-disruptive <operation-id>]...
                                [--allow-adopt <operation-id>]...
-  dfm secrets --root <dir> [--preview] [--yes-plan <digest>] [--allow-adopt <operation-id>]...
-  dfm packages --root <dir> [--preview] [--yes-plan <digest>] [--update]
-  dfm services --root <dir> [--preview] [--yes-plan <digest>] [--allow-disruptive <operation-id>]...
+  dfm secrets [--root <dir>] [--preview] [--yes-plan <digest>] [--allow-adopt <operation-id>]...
+  dfm packages [--root <dir>] [--preview] [--yes-plan <digest>] [--update]
+  dfm services [--root <dir>] [--preview] [--yes-plan <digest>] [--allow-disruptive <operation-id>]...
                                [--restart <resource-id>]...
   dfm trial <package> [--id <trial-id>] [--provider homebrew/v1|mise/v1] [--config <path>]...
                                [--preview] [--yes-plan <digest>]
-  dfm sync --root <dir> [--preview] [--yes-plan <digest>] [--allow-disruptive <operation-id>]...
+  dfm sync [--root <dir>] [--preview] [--yes-plan <digest>] [--allow-disruptive <operation-id>]...
                                [--allow-adopt <operation-id>]... [--trust-origin <origin>]...
   dfm self-check --build-controls <staged tree>
   dfm self-check --fixture-dir <dir>
 
-bind records the profile and machine identity once. A second bind with a
-different profile or machine is refused (E_REBIND_UNSUPPORTED). No command
-infers a profile. Only apply changes configuration files.
+bind records the profile and machine identity once, with the checkout root: --root, else the
+nearest directory above the profile that holds .git. Every command that reads sources takes
+that root when --root is not given; an explicit --root wins. A second bind with a different
+profile or machine is refused (E_REBIND_UNSUPPORTED). On a binding from before the root was
+recorded (schema 1), the same bind records the root in place; until then every command needs
+--root. No command infers a profile. Only apply changes configuration files.
 
-explain resolves the bound profile against the trusted sources in --root and prints
+explain resolves the bound profile against the trusted sources in the root and prints
 ownership, permitted changes, provenance and native precedence for one resource or
-output path. It reads only --root and the binding, and writes nothing.
+output path. It reads only the root and the binding, and writes nothing.
 
-plan resolves the bound profile against --root, observes the claimed paths under HOME
+plan resolves the bound profile against the root, observes the claimed paths under HOME
 read-only, and prints the typed plan with its digest. It writes nothing, fetches nothing and
 authenticates nothing. --json prints the plan for review. --against compares a saved --json
 plan with a fresh one and exits 3 (E_PLAN_STALE) when any input changed.
@@ -373,13 +376,14 @@ fn dispatch(args: &[String], out: &mut dyn Write) -> Result<(), Refusal> {
             .map_err(w)
         }
         "bind" => {
-            let [profile, id] = flags(rest, ["--profile", "--machine-id"])?;
+            let [profile, id, root] = flags(rest, ["--profile", "--machine-id", "--root"])?;
             let ctx = context(home)?;
             header(out, &ctx).map_err(w)?;
             let msg = bind(
                 &ctx,
                 profile.ok_or_else(|| usage("--profile is required"))?,
                 id.ok_or_else(|| usage("--machine-id is required"))?,
+                root,
             )?;
             writeln!(out, "{msg}").map_err(w)
         }
@@ -390,9 +394,12 @@ fn dispatch(args: &[String], out: &mut dyn Write) -> Result<(), Refusal> {
                 None => writeln!(out, "unbound"),
                 Some(b) => writeln!(
                     out,
-                    "bound profile={} machine_id={}",
+                    "bound profile={} machine_id={}{}",
                     dfm_model::display::visible(b.profile()),
-                    b.machine_id()
+                    b.machine_id(),
+                    b.root()
+                        .map(|r| format!(" root={}", dfm_model::display::visible(r)))
+                        .unwrap_or_default()
                 ),
             }
             .map_err(w)
@@ -408,7 +415,7 @@ fn dispatch(args: &[String], out: &mut dyn Write) -> Result<(), Refusal> {
             let (query, root) = explain_args(rest)?;
             let ctx = context(home)?;
             header(out, &ctx).map_err(w)?;
-            let text = explain(&ctx, &query, Path::new(&root))?;
+            let text = explain(&ctx, &query, root.as_deref().map(Path::new))?;
             write!(out, "{text}").map_err(w)
         }
         "plan" => {
@@ -485,8 +492,8 @@ fn dispatch(args: &[String], out: &mut dyn Write) -> Result<(), Refusal> {
     }
 }
 
-/// `explain <query> --root <dir>`, in either order.
-fn explain_args(args: &[String]) -> Result<(String, String), Refusal> {
+/// `explain <query> [--root <dir>]`, in either order.
+fn explain_args(args: &[String]) -> Result<(String, Option<String>), Refusal> {
     let mut query = None;
     let mut root = None;
     let mut it = args.iter();
@@ -504,7 +511,7 @@ fn explain_args(args: &[String]) -> Result<(String, String), Refusal> {
     }
     Ok((
         query.ok_or_else(|| usage("explain needs a resource or output path"))?,
-        root.ok_or_else(|| usage("--root is required"))?,
+        root,
     ))
 }
 
@@ -527,8 +534,19 @@ impl Loaded {
     }
 }
 
-/// The canonical `root` and the bound profile's path relative to it.
-fn canonical_root(binding: &Binding, root: &Path) -> Result<(PathBuf, String), Refusal> {
+/// No `--root` and no root in the binding: a schema 1 binding (DFM-61).
+fn no_root() -> Refusal {
+    usage(
+        "--root is required: the binding records no root. Pass --root <dir>, or record it once with dfm bind --root <dir> --profile <file> --machine-id <id> (the bound profile and machine id; --root may be left out when the checkout holds .git)",
+    )
+}
+
+/// The canonical root (`--root`, else the root the binding records) and the bound profile's
+/// path relative to it.
+fn canonical_root(binding: &Binding, root: Option<&Path>) -> Result<(PathBuf, String), Refusal> {
+    let root = root
+        .or_else(|| binding.root().map(Path::new))
+        .ok_or_else(no_root)?;
     let root = fs::canonicalize(root).map_err(|e| {
         Refusal::new(
             Code::ReportUnavailable,
@@ -542,7 +560,7 @@ fn canonical_root(binding: &Binding, root: &Path) -> Result<(PathBuf, String), R
         .ok_or_else(|| {
             Refusal::new(
                 Code::ProfileInvalid,
-                "the bound profile is not inside --root; point --root at the trusted source tree that contains it",
+                "the bound profile is not inside the root; point --root at the trusted source tree that contains it",
             )
         })?
         .to_string();
@@ -559,8 +577,9 @@ fn require_binding(ctx: &Ctx) -> Result<Binding, Refusal> {
     })
 }
 
-/// Resolves the bound profile against `root` without comparing it to this machine. Read-only.
-fn load_resolved_any_machine(ctx: &Ctx, root: &Path) -> Result<Loaded, Refusal> {
+/// Resolves the bound profile against `root` (default: the binding's root) without comparing it
+/// to this machine. Read-only.
+fn load_resolved_any_machine(ctx: &Ctx, root: Option<&Path>) -> Result<Loaded, Refusal> {
     let binding = require_binding(ctx)?;
     let (root, rel) = canonical_root(&binding, root)?;
     let sources = load_scoped(&root, &rel)?;
@@ -601,7 +620,7 @@ fn target_mismatch(ctx: &Ctx, platform: &str, arch: &str) -> Option<String> {
 
 /// Resolves the bound profile against `root` and refuses a profile that targets another
 /// platform or architecture than this machine (`E_PLATFORM_MISMATCH`). Read-only.
-fn load_resolved(ctx: &Ctx, root: &Path) -> Result<Loaded, Refusal> {
+fn load_resolved(ctx: &Ctx, root: Option<&Path>) -> Result<Loaded, Refusal> {
     let loaded = load_resolved_any_machine(ctx, root)?;
     match machine_mismatch(ctx, &loaded) {
         Some(d) => Err(Refusal::new(Code::PlatformMismatch, d)),
@@ -610,7 +629,7 @@ fn load_resolved(ctx: &Ctx, root: &Path) -> Result<Loaded, Refusal> {
 }
 
 /// Resolves the bound profile against `root` and explains one resource. Read-only.
-fn explain(ctx: &Ctx, query: &str, root: &Path) -> Result<String, Refusal> {
+fn explain(ctx: &Ctx, query: &str, root: Option<&Path>) -> Result<String, Refusal> {
     // Explaining a profile for another machine is allowed; the mismatch is a note.
     let loaded = load_resolved_any_machine(ctx, root)?;
     let note = machine_mismatch(ctx, &loaded)
@@ -642,6 +661,40 @@ fn read_binding(sys: &Sys, dir: &Dir, name: &str) -> Result<Option<Binding>, Ref
         }
         Err(r) => Err(r),
     }
+}
+
+/// An explicit `bind --root` that differs from the root the binding records.
+fn root_refusal(have: &str) -> Refusal {
+    Refusal::new(
+        Code::RebindUnsupported,
+        format!(
+            "already bound with root {}; changing the recorded root is not supported. Pass --root on each command instead",
+            dfm_model::display::visible(have)
+        ),
+    )
+}
+
+/// A recorded root is kept: `bind --root` with another directory is refused.
+fn keep_root(have: &Binding, flag: Option<&Path>) -> Result<(), Refusal> {
+    match (have.root(), flag) {
+        (Some(r), Some(f)) if f != Path::new(r) => Err(root_refusal(r)),
+        _ => Ok(()),
+    }
+}
+
+/// The nearest ancestor of `profile` that holds a `.git` entry (a directory, or a worktree's
+/// file): the checkout `bind` records when no `--root` is given.
+fn git_root(profile: &Path) -> Result<PathBuf, Refusal> {
+    profile
+        .ancestors()
+        .skip(1)
+        .find(|d| fs::symlink_metadata(d.join(".git")).is_ok())
+        .map(Path::to_path_buf)
+        .ok_or_else(|| {
+            usage(
+                "no directory above the profile holds .git; pass --root <dir> to name the checkout that holds it",
+            )
+        })
 }
 
 fn rebind_refusal(have: &Binding) -> Refusal {
@@ -695,7 +748,12 @@ fn ledger_has_coowned(store: &Store) -> Result<bool, Refusal> {
         .any(|r| r.owned_outputs.iter().any(|o| o.coowned.is_some())))
 }
 
-fn bind(ctx: &Ctx, profile: String, machine_id: String) -> Result<String, Refusal> {
+fn bind(
+    ctx: &Ctx,
+    profile: String,
+    machine_id: String,
+    root: Option<String>,
+) -> Result<String, Refusal> {
     check_supported(&ctx.os, &ctx.arch)?;
     let invalid = |d: String| Refusal::new(Code::ProfileInvalid, d);
     let real =
@@ -722,7 +780,17 @@ fn bind(ctx: &Ctx, profile: String, machine_id: String) -> Result<String, Refusa
         return Err(Refusal::new(Code::PlatformMismatch, d));
     }
     let want = Binding::new(real, &machine_id)?;
-    let stamp = Stamp::of(&want);
+    // An explicit --root is checked as plan checks it, before anything else is decided.
+    let flag = match root {
+        Some(r) => {
+            let (r, _) = canonical_root(&want, Some(Path::new(&r)))?;
+            if !r.is_dir() {
+                return Err(invalid(format!("{} is not a directory", r.display())));
+            }
+            Some(r)
+        }
+        None => None,
+    };
     let (layout, sys) = (ctx.layout(), ctx.sys()?);
 
     // Phase 1 decides from a read-only look and refuses before any write. A different identity,
@@ -733,11 +801,16 @@ fn bind(ctx: &Ctx, profile: String, machine_id: String) -> Result<String, Refusa
     {
         return Err(rebind_refusal(h));
     }
+    if let Some(h) = &have {
+        keep_root(h, flag.as_deref())?;
+    }
+    let upgrade = have.as_ref().is_some_and(|h| h.root().is_none());
+    let identity = Stamp::of(&want);
     let mut missing_salt = false;
     let owned = match Store::open_read(sys, &layout, Fail::none())? {
         Some(s) => {
             let doc = s.read_state()?;
-            if !doc.binding.same_identity(&stamp) {
+            if !doc.binding.same_identity(&identity) {
                 return Err(state_owner_refusal(&doc.binding));
             }
             // A store made before the salt was created at init gets it now (docs/state.md).
@@ -754,21 +827,36 @@ fn bind(ctx: &Ctx, profile: String, machine_id: String) -> Result<String, Refusa
         }
         None => false,
     };
-    if have.is_some() && !(owned && missing_salt) {
+    if have.is_some() && !(owned && (missing_salt || upgrade)) {
         return if owned {
             Ok("already bound".into())
         } else {
             Err(state_lost_refusal())
         };
     }
+    // A new binding, or a schema 1 one upgraded in place, records --root, else the checkout
+    // that holds the profile.
+    let want = if have.is_none() || upgrade {
+        let r = match &flag {
+            Some(r) => r.clone(),
+            None => git_root(Path::new(real))?,
+        };
+        let r = r
+            .to_str()
+            .ok_or_else(|| invalid("root path is not UTF-8".into()))?;
+        want.with_root(r)?
+    } else {
+        want
+    };
+    let stamp = Stamp::of(&want);
 
     // Phase 2 writes under the manager lock and decides again, because another command may have
     // bound in between. The state records the identity first, so a crash between the two writes
     // can only be retried by the same identity.
-    // Phase 1 returned for an existing binding, so only an unbound machine gets here and may
-    // create the state root.
+    // Only a machine that phase 1 found unbound may create the state root; a salt repair or a
+    // schema 1 upgrade needs the existing one.
     let fail = state_cmd::fail_from_env()?;
-    let mut store = Store::open_write_with(sys, &layout, fail.clone(), true)?;
+    let mut store = Store::open_write_with(sys, &layout, fail.clone(), have.is_none())?;
     // A test parks here, holding the lock, to damage the state between the two phases.
     fail.hit("bind-after-lock")?;
     // Whatever this call created (directories, the lock file, the staging directory) makes a
@@ -800,8 +888,12 @@ fn bind(ctx: &Ctx, profile: String, machine_id: String) -> Result<String, Refusa
         }
         store.salt_or_create().map_err(after)?;
     }
-    if have.is_some() {
-        return Ok("already bound".into());
+    if let Some(h) = &have {
+        keep_root(h, flag.as_deref()).map_err(after)?;
+        return match h.root() {
+            Some(_) => Ok("already bound".into()),
+            None => upgrade_binding(ctx, &store, &want, &fail).map_err(after),
+        };
     }
     let dir = open_config(&sys, &layout, true)
         .map_err(after)?
@@ -814,8 +906,9 @@ fn bind(ctx: &Ctx, profile: String, machine_id: String) -> Result<String, Refusa
     let name = ctx.binding_name().map_err(after)?;
     if publish(&dir, &name, &want).map_err(after)? {
         return Ok(format!(
-            "bound {} as {machine_id}",
-            dfm_model::display::visible(real)
+            "bound {} as {machine_id} with root {}",
+            dfm_model::display::visible(real),
+            dfm_model::display::visible(want.root().unwrap_or_default())
         ));
     }
     match read_binding(&sys, &dir, &name).map_err(after)? {
@@ -826,6 +919,62 @@ fn bind(ctx: &Ctx, profile: String, machine_id: String) -> Result<String, Refusa
             "binding vanished during bind",
         ))),
     }
+}
+
+/// Rewrites a schema 1 binding as `want` (schema 2, same identity) under the writer lock,
+/// between an `upgrade` intent and its outcome, as `grant-origin` is journaled. The replacement
+/// is atomic: the old binding or the new one, never part. A run that dies in between leaves the
+/// intent open, which `doctor` and `state recover` report.
+fn upgrade_binding(
+    ctx: &Ctx,
+    store: &Store,
+    want: &Binding,
+    fail: &Fail,
+) -> Result<String, Refusal> {
+    // Phase 1 saw a binding with a root, and phase 2 a schema 1 one: it changed in between.
+    let root = want.root().ok_or_else(|| {
+        Refusal::new(
+            Code::Conflict,
+            "the binding changed during bind; run bind again",
+        )
+    })?;
+    let sys = ctx.sys()?;
+    let dir = open_config(&sys, &ctx.layout(), false)?
+        .ok_or_else(|| Refusal::new(Code::StorageInvalid, "the config directory vanished"))?;
+    let name = ctx.binding_name()?;
+    let at = dfm_engine::now_ns()?;
+    let what = format!("binding schema 1 rewritten as schema 2 with root {root}");
+    let entry = |phase: Phase, reason: String| JournalEntry {
+        schema: dfm_model::state::SCHEMA,
+        op_id: format!("binding-upgrade-{at}"),
+        op: "upgrade".into(),
+        phase,
+        at: dfm_model::state::rfc3339(at),
+        resource: "binding".into(),
+        adapter: "manager".into(),
+        class: Class::Normal,
+        recovery: (phase == Phase::Intent).then(|| Recovery {
+            outputs: Vec::new(),
+            snapshot: None,
+        }),
+        token: None,
+        reason: Some(reason),
+    };
+    store.append_journal(&entry(Phase::Intent, what.clone()))?;
+    let wrote = dir.replace_file(&name, want.to_toml().as_bytes(), fail, "binding");
+    // Before the rename the schema 1 binding stays; after it the new one is in place, even
+    // when its durability is unconfirmed.
+    let phase = match &wrote {
+        Err(e) if e.code != Code::IoUnconfirmed => Phase::Failed,
+        _ => Phase::Done,
+    };
+    let reason = wrote.as_ref().err().map_or(what, |e| clip(&e.detail));
+    store.append_journal(&entry(phase, reason))?;
+    wrote?;
+    Ok(format!(
+        "recorded root {} in the binding",
+        dfm_model::display::visible(root)
+    ))
 }
 
 /// Writes the binding with create-new semantics. `Ok(false)` means the file already existed.

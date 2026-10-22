@@ -66,7 +66,7 @@ pub struct Args {
     trust: Vec<String>,
 }
 
-/// `sync --root <dir> [--preview] [--yes-plan <digest>] [--allow-disruptive <id>]...
+/// `sync [--root <dir>] [--preview] [--yes-plan <digest>] [--allow-disruptive <id>]...
 /// [--allow-adopt <id>]... [--trust-origin <origin>]...`
 pub fn parse_args(args: &[String]) -> Result<Args, Refusal> {
     let (mut trust, mut rest) = (Vec::new(), Vec::new());
@@ -1000,7 +1000,7 @@ fn run_inner(
     let w =
         |e: std::io::Error| Refusal::new(Code::IoFailed, format!("output failed: {}", e.kind()));
     let binding = require_binding(ctx)?;
-    let (root, rel) = canonical_root(&binding, Path::new(&args.apply.root))?;
+    let (root, rel) = canonical_root(&binding, args.apply.root.as_deref().map(Path::new))?;
     let (layout, sys) = (ctx.layout(), ctx.sys()?);
     if let Some(i) = &ctx.isolated {
         writeln!(out, "isolated: true {i}").map_err(w)?;

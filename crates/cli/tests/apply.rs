@@ -118,6 +118,8 @@ impl Fx {
             p.to_str().unwrap(),
             "--machine-id",
             "m5-test",
+            "--root",
+            fx.root.to_str().unwrap(),
         ]);
         assert_eq!(code(&o), 0, "{}", text(&o.stderr));
         fx
@@ -357,7 +359,6 @@ fn bad_flags_are_usage_errors() {
             "--yes-plan",
             &d,
         ],
-        vec!["apply", "--yes-plan", &d],
         vec!["apply", "--root", fx.root_arg(), "--force"],
     ] {
         let o = fx.run(&args);

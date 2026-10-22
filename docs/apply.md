@@ -16,7 +16,7 @@ Task: DFM-18, and DFM-21 for the co-owned merge. This document records what the 
 ## The command
 
 ```
-dfm apply --root <dir> [--preview] [--yes-plan <digest>] [--allow-disruptive <operation-id>]... [--allow-adopt <operation-id>]...
+dfm apply [--root <dir>] [--preview] [--yes-plan <digest>] [--allow-disruptive <operation-id>]... [--allow-adopt <operation-id>]...
 ```
 
 There is no `--plan <file>` flag. The manager stores no plan (architecture section 10), so apply plans again from the current machine and compares the digest the reviewer approved.

@@ -21,7 +21,7 @@ Two provider paths are built: mise (runtimes and tools from mise's registry and 
 ## The command
 
 ```
-dfm packages --root <dir> --update [--preview] [--yes-plan <digest>]
+dfm packages [--root <dir>] --update [--preview] [--yes-plan <digest>]
 ```
 
 `packages --update` is `packages` with a rolling update as the decision for each installed tool. Everything else is as in docs/packages.md: the providers are probed read-only before the plan, the signal handlers go in before the first probe, the plan prints with its digest, `--yes-plan` approves it, the probes run again under the lock, and each operation is journaled. A plain `packages` digest does not approve an update: the plan rows and their preconditions differ, so the digest differs, and the mismatch is `E_PLAN_STALE`. `--update` with `secrets` or `apply` is a usage error.

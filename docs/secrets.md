@@ -20,7 +20,7 @@ Task: DFM-22, the `op-template/v1` adapter and the `secrets` command. This docum
 ## The command
 
 ```
-dfm secrets --root <dir> [--preview] [--yes-plan <digest>] [--allow-adopt <operation-id>]...
+dfm secrets [--root <dir>] [--preview] [--yes-plan <digest>] [--allow-adopt <operation-id>]...
 ```
 
 `secrets` is `apply` over the secrets scope. It resolves, observes and plans like `apply`, with one difference in what the plan covers: every `secret` resource is planned, and every other resource is listed as `not_in_scope` ("link is configuration, outside a secrets plan"). The counts still add up to the number of participants. A configuration plan (`plan`, `apply`) keeps listing a secret as `not_in_scope` with destination and mode only, and never reads the destination or starts `op`.
