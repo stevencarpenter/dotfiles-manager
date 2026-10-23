@@ -1641,8 +1641,29 @@ argv = ["audit", "--quiet", "two words"]
         // A retire that removes nothing keeps the live bytes too.
         assert_eq!(retire(&live, &[], &[]).unwrap(), (live.clone(), false));
         let (bytes, changed) = retire(&live, &first.entries, &first.appended).unwrap();
-        assert!(changed, "the owned hook goes");
-        assert_ne!(json(&bytes), json(&live));
+        assert!(changed);
+        let out = json(&bytes);
+        assert!(out.get("hooks").is_none(), "the owned hook goes: {out}");
+        assert_eq!(
+            (&out["foreign"], &out["outputStyle"]),
+            (&Json::from("kept"), &Json::from("STE"))
+        );
+        assert!(
+            String::from_utf8(bytes)
+                .unwrap()
+                .starts_with("{\n  \"foreign\": \"kept\",\n"),
+            "a changed result is normalized"
+        );
+        // A duplicate key keeps its last value. With no change both copies stay in the bytes; a
+        // change writes one.
+        let plain = desired("[managed]\noutputStyle = \"STE\"\n");
+        let dup = br#"{"outputStyle":"other","outputStyle":"STE"}"#;
+        let m = merge(Some(dup), &plain, &[]).unwrap();
+        assert_eq!((m.changed, m.bytes.as_slice()), (false, &dup[..]));
+        let dup = br#"{"outputStyle":"STE","outputStyle":"other"}"#;
+        let m = merge(Some(dup), &plain, &[]).unwrap();
+        assert!(m.changed);
+        assert_eq!(m.bytes, b"{\n  \"outputStyle\": \"STE\"\n}\n");
     }
 
     #[test]

@@ -415,7 +415,23 @@ fn a_take_over_of_a_file_that_already_holds_the_values_records_ownership_and_wri
         fs::metadata(fresh.settings()).unwrap().modified().unwrap(),
         mtime
     );
-    assert!(fresh.coowned().is_some(), "the approval records ownership");
+    // The approval records the hook entries already in place, so a later retire removes them.
+    let (had, got) = (fx.coowned().unwrap(), fresh.coowned().unwrap());
+    assert!(
+        !got["coowned"]["entries"].as_array().unwrap().is_empty(),
+        "{got}"
+    );
+    assert_eq!(got["coowned"]["entries"], had["coowned"]["entries"]);
+    let leaves = |c: &serde_json::Value| -> Vec<String> {
+        c["coowned"]["leaves"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect()
+    };
+    assert!(!leaves(&got).is_empty());
+    assert_eq!(leaves(&got), leaves(&had));
     let receipts: Vec<serde_json::Value> = fs::read_dir(fresh.state().join("receipts"))
         .unwrap()
         .map(|e| serde_json::from_slice(&fs::read(e.unwrap().path()).unwrap()).unwrap())
@@ -761,6 +777,24 @@ fn deselecting_the_resource_retires_only_the_owned_handlers() {
     let o = fx.apply();
     assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
     assert!(text(&o.stdout).contains("updated=0"), "{}", text(&o.stdout));
+}
+
+#[test]
+fn deselecting_after_the_application_reordered_the_file_retires_the_owned_handlers() {
+    let fx = Fx::new();
+    fx.live(LIVE);
+    assert_eq!(code(&fx.apply()), 0);
+    fx.live(&reversed(&fx.live_json()));
+    fx.set_profile("");
+    let o = fx.apply();
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+    let j = fx.live_json();
+    assert_eq!(j["outputStyle"], "STE", "managed values stay");
+    assert_eq!(j["apiKeyHelper"], TOKEN);
+    let pre = j["hooks"]["PreToolUse"].as_array().unwrap();
+    assert_eq!(pre.len(), 1, "{j}");
+    assert_eq!(pre[0]["hooks"][0]["command"], "foreign-hook");
+    assert!(fx.coowned().is_none(), "the resource left the ledger");
 }
 
 #[test]
