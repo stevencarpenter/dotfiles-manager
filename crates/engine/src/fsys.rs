@@ -749,7 +749,7 @@ impl Dir {
     /// the rename leaves the previous file, which is the last good state. A failure after it is
     /// `E_IO_UNCONFIRMED`: the new file is in place and only its durability is unknown.
     /// Failure points are `<label>-before-write`, `-after-tmp` and `-after-rename`.
-    pub(crate) fn replace_file(
+    pub fn replace_file(
         &self,
         name: &str,
         bytes: &[u8],

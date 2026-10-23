@@ -438,6 +438,19 @@ fn an_untrusted_origin_is_refused_before_any_fetch_and_a_grant_is_explicit() {
 }
 
 #[test]
+fn sync_without_root_uses_the_checkout_bind_recorded() {
+    // Fx binds without --root, so the binding records the clone, which holds .git.
+    let fx = Fx::new();
+    let p = fx.run(&["sync", "--preview"]);
+    assert_eq!(code(&p), 0, "{}\n{}", stdout(&p), stderr(&p));
+    assert_eq!(digest_of(&p), digest_of(&fx.preview()));
+    let o = fx.run(&["sync", "--yes-plan", &digest_of(&p)]);
+    assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
+    assert!(stdout(&o).contains("result: ok"), "{}", stdout(&o));
+    assert!(fx.h(".zshrc").is_symlink());
+}
+
+#[test]
 fn already_linked_sources_apply_once_and_a_repeat_sync_is_a_no_op() {
     let fx = Fx::new();
     let head = fx.upstream.head();

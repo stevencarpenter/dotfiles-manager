@@ -570,7 +570,6 @@ fn bad_arguments_are_usage_errors() {
     let fx = Fx::new();
     for cmd in ["doctor", "status"] {
         for args in [
-            vec![cmd],
             vec![cmd, "--root"],
             vec![cmd, "--root", fx.root_arg(), "--nope"],
             vec![cmd, "--root", fx.root_arg(), "--json", "--json"],
@@ -707,6 +706,8 @@ fn personal() -> Fx {
         p.to_str().unwrap(),
         "--machine-id",
         "m5",
+        "--root",
+        fx.root.to_str().unwrap(),
     ]);
     assert_eq!(code(&o), 0, "{}", text(&o.stderr));
     fx
@@ -1291,9 +1292,9 @@ fn doctor_and_status_report_an_unusable_home_as_rows_and_exit_1() {
 
 #[test]
 fn a_usage_error_wins_over_an_unusable_home() {
-    let o = bad_home(&["doctor"]);
+    let o = bad_home(&["doctor", "--nope"]);
     assert_eq!(code(&o), 2, "{}", text(&o.stderr));
-    assert!(text(&o.stderr).contains("--root is required"));
+    assert!(text(&o.stderr).contains("unknown argument --nope"));
     assert!(o.stdout.is_empty());
 }
 

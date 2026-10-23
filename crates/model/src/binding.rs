@@ -1,10 +1,13 @@
-//! The machine binding document (`machine.toml`, schema 1).
+//! The machine binding document (`machine.toml`). Schema 2 records the checkout root that
+//! commands default `--root` to; schema 1 has no root and stays readable.
 
 use crate::resolve::PROFILE_SCHEMA;
 use crate::{Code, Refusal};
 use serde::{Deserialize, Serialize};
 
-pub const SCHEMA: i64 = 1;
+pub const SCHEMA: i64 = 2;
+/// A binding written before the root was recorded. Every command still reads it.
+pub const SCHEMA_NO_ROOT: i64 = 1;
 pub const MAX_BYTES: usize = 1 << 20;
 pub const PLATFORM: &str = "macos";
 pub const ARCH: &str = "aarch64";
@@ -14,6 +17,8 @@ pub const ARCH: &str = "aarch64";
 pub struct Binding {
     schema: i64,
     profile: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    root: Option<String>,
     machine_id: String,
     platform: String,
     arch: String,
@@ -67,10 +72,16 @@ pub fn check_profile(bytes: &[u8]) -> Result<ProfileTarget, Refusal> {
     })
 }
 
+/// A canonical absolute path: the form `bind` records for the profile and the root.
+fn absolute(path: &str) -> bool {
+    path.starts_with('/') && !path.chars().any(char::is_control)
+}
+
 impl Binding {
-    /// Builds a binding for this platform. The profile must be a canonical absolute path.
+    /// Builds a schema 1 binding (no root) for this platform. The profile must be a canonical
+    /// absolute path. [`Binding::with_root`] makes it the schema 2 binding that `bind` writes.
     pub fn new(profile: &str, machine_id: &str) -> Result<Binding, Refusal> {
-        if !profile.starts_with('/') || profile.chars().any(char::is_control) {
+        if !absolute(profile) {
             return Err(Refusal::new(
                 Code::ProfileInvalid,
                 "profile must be a canonical absolute path",
@@ -83,8 +94,9 @@ impl Binding {
             ));
         }
         Ok(Binding {
-            schema: SCHEMA,
+            schema: SCHEMA_NO_ROOT,
             profile: profile.into(),
+            root: None,
             machine_id: machine_id.into(),
             platform: PLATFORM.into(),
             arch: ARCH.into(),
@@ -92,8 +104,29 @@ impl Binding {
         })
     }
 
+    /// The schema 2 binding with `root`, a canonical absolute directory that holds the profile.
+    pub fn with_root(self, root: &str) -> Result<Binding, Refusal> {
+        let inside = std::path::Path::new(&self.profile).strip_prefix(root);
+        if !absolute(root) || !inside.is_ok_and(|rest| !rest.as_os_str().is_empty()) {
+            return Err(Refusal::new(
+                Code::ProfileInvalid,
+                "the root must be a canonical absolute path that contains the profile",
+            ));
+        }
+        Ok(Binding {
+            schema: SCHEMA,
+            root: Some(root.into()),
+            ..self
+        })
+    }
+
     pub fn profile(&self) -> &str {
         &self.profile
+    }
+
+    /// The checkout root `bind` recorded; `None` for a schema 1 binding.
+    pub fn root(&self) -> Option<&str> {
+        self.root.as_deref()
     }
 
     pub fn machine_id(&self) -> &str {
@@ -114,7 +147,7 @@ impl Binding {
         toml::to_string(self).expect("a flat struct of strings always serializes")
     }
 
-    /// Strict parse. A schema other than 1 is refused before any other field is read.
+    /// Strict parse. A schema other than 1 or 2 is refused before any other field is read.
     pub fn parse(bytes: &[u8]) -> Result<Binding, Refusal> {
         let bad = |d: String| Refusal::new(Code::BindingInvalid, d);
         if bytes.len() > MAX_BYTES {
@@ -127,16 +160,16 @@ impl Binding {
         let table: toml::Table = text
             .parse()
             .map_err(|e: toml::de::Error| bad(format!("not valid TOML: {}", e.message())))?;
-        match table.get("schema").and_then(toml::Value::as_integer) {
-            Some(SCHEMA) => {}
+        let schema = match table.get("schema").and_then(toml::Value::as_integer) {
+            Some(n @ (SCHEMA_NO_ROOT | SCHEMA)) => n,
             Some(n) => {
                 return Err(Refusal::new(
                     Code::SchemaUnsupported,
-                    format!("binding schema {n} is not supported (supported: 1)"),
+                    format!("binding schema {n} is not supported (supported: 1, 2)"),
                 ));
             }
             None => return Err(bad("missing integer schema".into())),
-        }
+        };
         let b: Binding = table
             .try_into()
             .map_err(|e: toml::de::Error| bad(e.message().to_string()))?;
@@ -146,7 +179,15 @@ impl Binding {
                 format!("binding targets {}/{}", b.platform, b.arch),
             ));
         }
-        Binding::new(&b.profile, &b.machine_id).map_err(|r| bad(r.detail))?;
+        let base = Binding::new(&b.profile, &b.machine_id).map_err(|r| bad(r.detail))?;
+        match (schema, &b.root) {
+            (SCHEMA_NO_ROOT, None) => {}
+            (SCHEMA, Some(root)) => {
+                base.with_root(root).map_err(|r| bad(r.detail))?;
+            }
+            (SCHEMA_NO_ROOT, Some(_)) => return Err(bad("schema 1 has no root".into())),
+            _ => return Err(bad("schema 2 needs a root".into())),
+        }
         if !b.origins.is_empty() {
             return Err(bad("origins are not supported yet".into()));
         }
@@ -162,6 +203,30 @@ mod tests {
     fn round_trip() {
         let b = Binding::new("/p/profile.toml", "m5-personal").unwrap();
         assert_eq!(Binding::parse(b.to_toml().as_bytes()).unwrap(), b);
+        let b = b.with_root("/p").unwrap();
+        assert_eq!(b.root(), Some("/p"));
+        assert!(b.to_toml().starts_with("schema = 2\n"));
+        assert_eq!(Binding::parse(b.to_toml().as_bytes()).unwrap(), b);
+    }
+
+    #[test]
+    fn the_root_holds_the_profile_and_matches_the_schema() {
+        let b = || Binding::new("/r/dfm/p.toml", "m5").unwrap();
+        for bad in ["/other", "/r/dfm/p", "/r/dfm/p.toml", "r", "/r\n"] {
+            assert_eq!(b().with_root(bad).unwrap_err().code, Code::ProfileInvalid);
+        }
+        let one = b().to_toml();
+        let two = b().with_root("/r").unwrap().to_toml();
+        let code = |s: &str| Binding::parse(s.as_bytes()).unwrap_err().code;
+        assert_eq!(
+            code(&two.replace("schema = 2", "schema = 1")),
+            Code::BindingInvalid
+        );
+        assert_eq!(
+            code(&one.replace("schema = 1", "schema = 2")),
+            Code::BindingInvalid
+        );
+        assert_eq!(code(&two.replace("\"/r\"", "\"/x\"")), Code::BindingInvalid);
     }
 
     #[test]
@@ -207,7 +272,7 @@ mod tests {
         let ok = Binding::new("/p/x.toml", "m5").unwrap().to_toml();
         let code = |s: &str| Binding::parse(s.as_bytes()).unwrap_err().code;
         assert_eq!(
-            code(&ok.replace("schema = 1", "schema = 2")),
+            code(&ok.replace("schema = 1", "schema = 3")),
             Code::SchemaUnsupported
         );
         assert_eq!(code(&format!("{ok}extra = 1\n")), Code::BindingInvalid);

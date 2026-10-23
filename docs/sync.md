@@ -17,11 +17,11 @@ No dependency was added. Git is the git binary found on the runner's fixed searc
 ## The command
 
 ```
-dfm sync --root <dir> [--preview] [--yes-plan <digest>] [--allow-disruptive <operation-id>]...
+dfm sync [--root <dir>] [--preview] [--yes-plan <digest>] [--allow-disruptive <operation-id>]...
                       [--allow-adopt <operation-id>]... [--trust-origin <origin>]...
 ```
 
-`--root` is the user's checkout: the git working tree that holds the bound profile and `dotfiles-manager.lock`. The flags of `apply` keep their meaning (docs/apply.md), except that the digest `sync` prints and `--yes-plan` takes is the **sync digest** (below), not the configuration plan's. `--trust-origin` grants one canonical origin and cannot be combined with `--preview` (a preview writes nothing) or with `--yes-plan` (one command never both widens trust and publishes); both are usage errors.
+`--root` (default: the root the binding records, docs/bootstrap.md) is the user's checkout: the git working tree that holds the bound profile and `dotfiles-manager.lock`. The flags of `apply` keep their meaning (docs/apply.md), except that the digest `sync` prints and `--yes-plan` takes is the **sync digest** (below), not the configuration plan's. `--trust-origin` grants one canonical origin and cannot be combined with `--preview` (a preview writes nothing) or with `--yes-plan` (one command never both widens trust and publishes); both are usage errors.
 
 ### What the lock declares
 

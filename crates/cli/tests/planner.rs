@@ -37,6 +37,8 @@ impl Env {
             p.to_str().unwrap(),
             "--machine-id",
             "m5-personal",
+            "--root",
+            e.root.to_str().unwrap(),
         ]);
         assert_eq!(o.status.code(), Some(0), "{}", text(&o.stderr));
         e
@@ -1040,7 +1042,6 @@ fn plan_follows_the_exit_table_for_resolver_and_report_failures() {
 
     // Usage errors.
     for args in [
-        &["plan"][..],
         &["plan", "--root"][..],
         &["plan", "--root", "x", "--root", "y"][..],
         &["plan", "--root", "x", "--bogus"][..],

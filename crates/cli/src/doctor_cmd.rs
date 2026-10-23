@@ -4,7 +4,9 @@
 //! the plan and the owned outputs. It runs no program, probes no tool, fetches nothing, takes no
 //! lock and writes nothing. A failing source gives its own row and the other rows still appear.
 
-use crate::{Ctx, Loaded, clip, header, load_resolved, plan_cmd, read_existing_binding, usage};
+use crate::{
+    Ctx, Loaded, clip, header, load_resolved, no_root, plan_cmd, read_existing_binding, usage,
+};
 use dfm_engine::{
     Dir, Fail, Layout, Loaded as StateLoaded, Store, Sys, fsys::Listing, merge, observe,
     verify_identity,
@@ -59,7 +61,10 @@ pub fn run(
         return Err(usage(format!("{command} does not take --against")));
     }
     let (report, ctx) = match ctx {
-        Ok(ctx) => (inspect(&ctx, command, Path::new(&args.root))?, Some(ctx)),
+        Ok(ctx) => (
+            inspect(&ctx, command, args.root.as_deref().map(Path::new))?,
+            Some(ctx),
+        ),
         Err(r) => (no_context_report(command, &r), None),
     };
     if args.json {
@@ -111,13 +116,17 @@ fn no_context_report(command: &'static str, r: &Refusal) -> Report {
 }
 
 /// The shared inspection. Fails only when no report can be made at all (exit 2).
-fn inspect(ctx: &Ctx, command: &'static str, root: &Path) -> Result<Report, Refusal> {
+fn inspect(ctx: &Ctx, command: &'static str, root: Option<&Path>) -> Result<Report, Refusal> {
     let sys = ctx
         .sys()
         .map_err(|r| Refusal::new(Code::ReportUnavailable, r.detail))?;
     let layout = ctx.layout();
     let mut rows = Vec::new();
     let binding = binding_row(ctx, &mut rows);
+    // A schema 1 binding without --root is a usage error, as it was before the default.
+    if root.is_none() && binding.as_ref().is_some_and(|b| b.root().is_none()) {
+        return Err(no_root());
+    }
     let owned = state_rows(sys, &layout, binding.as_ref(), &mut rows);
     lock_row(ctx, sys.uid, &mut rows);
     let (loaded, plan) = profile_rows(ctx, binding.as_ref(), root, &mut rows);
@@ -680,7 +689,7 @@ fn lock_row(ctx: &Ctx, uid: u32, rows: &mut Vec<Row>) {
 fn profile_rows(
     ctx: &Ctx,
     binding: Option<&Binding>,
-    root: &Path,
+    root: Option<&Path>,
     rows: &mut Vec<Row>,
 ) -> (Option<Loaded>, Option<Plan>) {
     let depends = |kind: &'static str, subject: &str, why: &str| {

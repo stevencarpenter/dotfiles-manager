@@ -33,6 +33,12 @@ fn profile(name: &str) -> String {
         .to_string()
 }
 
+// The checkout that holds examples/profiles. A pushed commit is tested in a tree without .git,
+// so a bind of those profiles names it rather than relying on the .git default.
+fn checkout() -> String {
+    repo_root().to_str().unwrap().to_string()
+}
+
 fn files_below(dir: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
     if let Ok(rd) = fs::read_dir(dir) {
@@ -102,10 +108,18 @@ fn no_implicit_profile_inference() {
 #[test]
 fn bind_persists_with_private_modes_and_is_idempotent() {
     let home = TempDir::new("bind");
-    let p = profile("personal-dev-01.toml");
+    let (p, root) = (profile("personal-dev-01.toml"), checkout());
     let o = run(
         home.path(),
-        &["bind", "--profile", &p, "--machine-id", "m5-personal"],
+        &[
+            "bind",
+            "--profile",
+            &p,
+            "--machine-id",
+            "m5-personal",
+            "--root",
+            &root,
+        ],
     );
     assert_eq!(o.status.code(), Some(0), "{}", text(&o.stderr));
     assert!(text(&o.stdout).contains("isolated: true"));
@@ -123,12 +137,20 @@ fn bind_persists_with_private_modes_and_is_idempotent() {
         0o700
     );
     let before = fs::read(&file).unwrap();
-    assert!(text(&before).contains("schema = 1"));
+    assert!(text(&before).contains("schema = 2"));
     let o = run(home.path(), &["binding"]);
     assert!(text(&o.stdout).contains(&format!("bound profile={p} machine_id=m5-personal")));
     let o = run(
         home.path(),
-        &["bind", "--profile", &p, "--machine-id", "m5-personal"],
+        &[
+            "bind",
+            "--profile",
+            &p,
+            "--machine-id",
+            "m5-personal",
+            "--root",
+            &root,
+        ],
     );
     assert_eq!(o.status.code(), Some(0));
     assert!(text(&o.stdout).contains("already bound"));
@@ -147,10 +169,19 @@ fn bind_persists_with_private_modes_and_is_idempotent() {
 fn deliberate_rebinding_is_refused_and_binding_is_unchanged() {
     let home = TempDir::new("rebind");
     let (a, b) = (profile("personal-dev-01.toml"), profile("work-01.toml"));
+    let root = checkout();
     assert_eq!(
         run(
             home.path(),
-            &["bind", "--profile", &a, "--machine-id", "m5-personal"]
+            &[
+                "bind",
+                "--profile",
+                &a,
+                "--machine-id",
+                "m5-personal",
+                "--root",
+                &root
+            ]
         )
         .status
         .code(),
@@ -273,7 +304,7 @@ fn damaged_or_newer_binding_is_never_overwritten() {
     fs::create_dir_all(file.parent().unwrap()).unwrap();
     let p = profile("work-01.toml");
     for (content, code) in [
-        ("schema = 2\n", "E_SCHEMA_UNSUPPORTED"),
+        ("schema = 3\n", "E_SCHEMA_UNSUPPORTED"),
         ("garbage [", "E_BINDING_INVALID"),
         ("schema = 1\nextra = 1\n", "E_BINDING_INVALID"),
     ] {
@@ -294,12 +325,22 @@ fn damaged_or_newer_binding_is_never_overwritten() {
 #[test]
 fn concurrent_binds_leave_exactly_one_identity() {
     let (a, b) = (profile("personal-dev-01.toml"), profile("work-01.toml"));
+    let root = checkout();
     for round in 0..3 {
         let home = TempDir::new("race");
         let kids: Vec<_> = (0..8)
             .map(|i| {
                 let p = if i % 2 == 0 { &a } else { &b };
-                let c = cmd(home.path(), &["bind", "--profile", p, "--machine-id", "m5"])
+                let args = [
+                    "bind",
+                    "--profile",
+                    p,
+                    "--machine-id",
+                    "m5",
+                    "--root",
+                    &root,
+                ];
+                let c = cmd(home.path(), &args)
                     .stdout(Stdio::null())
                     .stderr(Stdio::piped())
                     .spawn()
@@ -460,11 +501,19 @@ fn a_profile_must_be_a_toml_file_with_a_schema_key() {
 #[test]
 fn a_binding_that_is_a_symlink_or_not_private_is_refused() {
     let home = TempDir::new("binding-kind");
-    let p = profile("work-01.toml");
+    let (p, root) = (profile("work-01.toml"), checkout());
     assert_eq!(
         run(
             home.path(),
-            &["bind", "--profile", &p, "--machine-id", "m3"]
+            &[
+                "bind",
+                "--profile",
+                &p,
+                "--machine-id",
+                "m3",
+                "--root",
+                &root
+            ]
         )
         .status
         .code(),
@@ -514,6 +563,8 @@ fn an_io_failure_while_writing_the_binding_exits_1() {
             &profile("work-01.toml"),
             "--machine-id",
             "m3",
+            "--root",
+            &checkout(),
         ],
     );
     fs::set_permissions(&cfg, fs::Permissions::from_mode(0o700)).unwrap();
@@ -582,7 +633,8 @@ fn a_restrictive_umask_still_produces_a_binding_the_reader_accepts() {
     let o = Command::new("/bin/sh")
         .args(["-c", "umask 277; exec \"$0\" \"$@\"", BIN, "--home"])
         .arg(home.path())
-        .args(["bind", "--profile", &p, "--machine-id", "m3"])
+        .args(["bind", "--profile", &p, "--machine-id", "m3", "--root"])
+        .arg(checkout())
         .env_clear()
         .output()
         .unwrap();
@@ -604,8 +656,12 @@ fn bind_binding_and_state_escape_an_invisible_profile_path() {
     let p = dir.join("profile.toml");
     fs::write(&p, "schema = 1\n").unwrap();
     let p = p.to_str().unwrap();
+    let r = dir.to_str().unwrap();
     let outputs = [
-        run(home.path(), &["bind", "--profile", p, "--machine-id", "m5"]),
+        run(
+            home.path(),
+            &["bind", "--profile", p, "--machine-id", "m5", "--root", r],
+        ),
         run(home.path(), &["binding"]),
         run(home.path(), &["state", "check"]),
     ];
@@ -631,4 +687,226 @@ fn extra_arguments_to_a_no_argument_command_say_so() {
     }
     let o = run(home.path(), &["nonesuch"]);
     assert!(text(&o.stderr).contains("unknown command or argument nonesuch"));
+}
+
+// ---- DFM-61: the checkout root in the binding ---------------------------------------------
+
+fn binding_file(fx: &common::Fx) -> PathBuf {
+    fx.h(".config/dotfiles-manager/machine.toml")
+}
+
+/// Rewrites the binding in the schema 1 form, written before the root was recorded.
+fn as_schema_1(fx: &common::Fx) {
+    let f = binding_file(fx);
+    let body = fs::read_to_string(&f).unwrap();
+    let old: String = body
+        .lines()
+        .filter(|l| !l.starts_with("root = "))
+        .map(|l| format!("{l}\n"))
+        .collect();
+    fs::write(&f, old.replace("schema = 2", "schema = 1")).unwrap();
+}
+
+#[test]
+fn every_command_defaults_to_the_recorded_root_and_an_explicit_root_wins() {
+    let fx = common::Fx::new();
+    let real = fs::canonicalize(&fx.root).unwrap();
+    let body = fs::read_to_string(binding_file(&fx)).unwrap();
+    assert!(
+        body.contains(&format!("root = \"{}\"", real.display())),
+        "{body}"
+    );
+    // The same tree gives the same plan and digest from the flag or from the binding.
+    let with = fx.run(&["plan", "--root", fx.root_arg()]);
+    let without = fx.run(&["plan"]);
+    assert_eq!(common::code(&without), 0, "{}", text(&without.stderr));
+    assert!(text(&without.stdout).contains("plan digest: "));
+    assert_eq!(text(&with.stdout), text(&without.stdout));
+    for args in [
+        vec!["explain", "extra.zsh"],
+        vec!["doctor"],
+        vec!["status"],
+        vec!["apply", "--preview"],
+        vec!["secrets", "--preview"],
+    ] {
+        let o = fx.run(&args);
+        assert_eq!(common::code(&o), 0, "{args:?}: {}", text(&o.stderr));
+    }
+    let o = fx.run(&["plan", "--root", "/nonexistent-dfm-root"]);
+    assert_eq!(common::code(&o), 2);
+    assert!(text(&o.stderr).contains("E_REPORT_UNAVAILABLE"));
+}
+
+#[test]
+fn a_schema_1_binding_needs_root_until_the_same_bind_records_it_in_place() {
+    let fx = common::Fx::new();
+    as_schema_1(&fx);
+    for args in [
+        vec!["plan"],
+        vec!["explain", "extra.zsh"],
+        vec!["doctor"],
+        vec!["apply", "--preview"],
+        vec!["sync", "--preview"],
+    ] {
+        let o = fx.run(&args);
+        assert_eq!(common::code(&o), 2, "{args:?}: {}", text(&o.stderr));
+        assert!(
+            text(&o.stderr).contains("the binding records no root"),
+            "{args:?}: {}",
+            text(&o.stderr)
+        );
+    }
+    let o = fx.run(&["plan", "--root", fx.root_arg()]);
+    assert_eq!(common::code(&o), 0, "{}", text(&o.stderr));
+    // No .git above the profile and no --root: bind names --root and writes nothing.
+    let p = fx.root.join("profiles/t-01.toml");
+    let p = p.to_str().unwrap();
+    let file = binding_file(&fx);
+    let before = fs::read(&file).unwrap();
+    let o = fx.run(&["bind", "--profile", p, "--machine-id", "m5-test"]);
+    assert_eq!(common::code(&o), 2, "{}", text(&o.stderr));
+    assert!(text(&o.stderr).contains("--root"), "{}", text(&o.stderr));
+    assert_eq!(fs::read(&file).unwrap(), before);
+    // A --root that does not hold the profile is refused before anything is written.
+    let o = fx.run(&[
+        "bind",
+        "--profile",
+        p,
+        "--machine-id",
+        "m5-test",
+        "--root",
+        fx.home.path().to_str().unwrap(),
+    ]);
+    assert!(
+        text(&o.stderr).contains("E_PROFILE_INVALID"),
+        "{}",
+        text(&o.stderr)
+    );
+    assert_eq!(fs::read(&file).unwrap(), before);
+    let up = [
+        "bind",
+        "--profile",
+        p,
+        "--machine-id",
+        "m5-test",
+        "--root",
+        fx.root_arg(),
+    ];
+    let journal =
+        || fs::read_to_string(fx.h(".local/state/dotfiles-manager/state/journal.jsonl")).unwrap();
+    // A failure before the rename keeps the schema 1 binding and closes the intent as failed.
+    let o = fx.run_env(&[("DFM_FAILPOINT", "binding-after-tmp:error")], &up);
+    assert_eq!(common::code(&o), 1, "{}", text(&o.stderr));
+    assert_eq!(fs::read(&file).unwrap(), before);
+    assert!(journal().contains(r#""phase":"failed""#), "{}", journal());
+    let o = fx.run(&["state", "check"]);
+    assert_eq!(common::code(&o), 0, "{}", text(&o.stdout));
+    // The same identity with --root upgrades the binding in place and journals it.
+    let o = fx.run(&up);
+    assert_eq!(common::code(&o), 0, "{}", text(&o.stderr));
+    assert!(
+        text(&o.stdout).contains("recorded root"),
+        "{}",
+        text(&o.stdout)
+    );
+    let body = fs::read_to_string(&file).unwrap();
+    assert!(
+        body.contains("schema = 2") && body.contains("root = "),
+        "{body}"
+    );
+    assert_eq!(
+        fs::metadata(&file).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    assert!(journal().contains("binding-upgrade-"), "{}", journal());
+    // The journal entries are settled outcomes: nothing reads them as open work.
+    for args in [vec!["plan"], vec!["state", "check"], vec!["doctor"]] {
+        let o = fx.run(&args);
+        assert_eq!(common::code(&o), 0, "{args:?}: {}", text(&o.stderr));
+    }
+    let o = fx.run(&up);
+    assert!(
+        text(&o.stdout).contains("already bound"),
+        "{}",
+        text(&o.stdout)
+    );
+    // After the rename the new binding is in place even when its durability is unconfirmed: the
+    // run fails (exit 1) and the journal records the upgrade as done.
+    as_schema_1(&fx);
+    let o = fx.run_env(&[("DFM_FAILPOINT", "binding-after-rename:error")], &up);
+    assert_eq!(common::code(&o), 1, "{}", text(&o.stderr));
+    assert!(
+        text(&o.stderr).contains("E_IO_UNCONFIRMED"),
+        "{}",
+        text(&o.stderr)
+    );
+    assert!(fs::read_to_string(&file).unwrap().contains("schema = 2"));
+    assert!(
+        journal().matches(r#""phase":"done""#).count() >= 2,
+        "{}",
+        journal()
+    );
+    let o = fx.run(&["binding"]);
+    assert!(text(&o.stdout).contains(" root="), "{}", text(&o.stdout));
+    // A different identity is still a rebind.
+    let o = fx.run(&[
+        "bind",
+        "--profile",
+        p,
+        "--machine-id",
+        "m3",
+        "--root",
+        fx.root_arg(),
+    ]);
+    assert!(text(&o.stderr).contains("E_REBIND_UNSUPPORTED"));
+}
+
+#[test]
+fn bind_records_the_checkout_above_the_profile_and_keeps_it() {
+    let fx = common::Fx::unbound();
+    let p = fx.root.join("profiles/t-01.toml");
+    let p = p.to_str().unwrap();
+    // A root that does not hold the profile is refused before anything is written.
+    let o = fx.run(&[
+        "bind",
+        "--profile",
+        p,
+        "--machine-id",
+        "m5-test",
+        "--root",
+        fx.home.path().to_str().unwrap(),
+    ]);
+    assert!(
+        text(&o.stderr).contains("E_PROFILE_INVALID"),
+        "{}",
+        text(&o.stderr)
+    );
+    assert!(!binding_file(&fx).exists());
+    // A worktree's .git is a file; it marks the checkout as a directory does.
+    fs::write(fx.root.join(".git"), "gitdir: /elsewhere\n").unwrap();
+    let o = fx.run(&["bind", "--profile", p, "--machine-id", "m5-test"]);
+    assert_eq!(common::code(&o), 0, "{}", text(&o.stderr));
+    let real = fs::canonicalize(&fx.root).unwrap();
+    let body = fs::read_to_string(binding_file(&fx)).unwrap();
+    assert!(
+        body.contains(&format!("root = \"{}\"", real.display())),
+        "{body}"
+    );
+    // The recorded root is kept: another --root for the same identity is refused.
+    let other = fx.root.join("profiles");
+    let o = fx.run(&[
+        "bind",
+        "--profile",
+        p,
+        "--machine-id",
+        "m5-test",
+        "--root",
+        other.to_str().unwrap(),
+    ]);
+    assert!(
+        text(&o.stderr).contains("E_REBIND_UNSUPPORTED"),
+        "{}",
+        text(&o.stderr)
+    );
+    assert_eq!(fs::read_to_string(binding_file(&fx)).unwrap(), body);
 }

@@ -29,7 +29,8 @@ use std::path::Path;
 
 #[derive(Clone)]
 pub struct Args {
-    pub root: String,
+    /// `--root`; `None` takes the root the binding records.
+    pub root: Option<String>,
     pub yes_plan: Option<String>,
     pub allow: BTreeSet<String>,
     pub allow_adopt: BTreeSet<String>,
@@ -43,7 +44,7 @@ pub struct Args {
     pub restart: BTreeSet<String>,
 }
 
-/// `apply --root <dir> [--yes-plan <digest>] [--allow-disruptive <operation-id>]...
+/// `apply [--root <dir>] [--yes-plan <digest>] [--allow-disruptive <operation-id>]...
 /// [--allow-adopt <operation-id>]... [--preview]`, and `secrets` with the same flags.
 pub fn parse_args(args: &[String], scope: Scope) -> Result<Args, Refusal> {
     let (mut root, mut yes, mut preview, mut update) = (None, None, false, false);
@@ -97,7 +98,7 @@ pub fn parse_args(args: &[String], scope: Scope) -> Result<Args, Refusal> {
         ));
     }
     Ok(Args {
-        root: root.ok_or_else(|| usage("--root is required"))?,
+        root,
         yes_plan: yes,
         allow,
         allow_adopt,
@@ -257,7 +258,7 @@ fn run_inner(
     let w =
         |e: std::io::Error| Refusal::new(Code::IoFailed, format!("output failed: {}", e.kind()));
     let binding = require_binding(ctx)?;
-    let root = Path::new(&args.root);
+    let root = args.root.as_deref().map(Path::new);
     // The one place the handlers are installed. A scope that starts a provider child (a session
     // check, a probe) arms them now, before that child, so a stop request ends the child instead
     // of leaving it running (docs/secrets.md, docs/packages.md). The checks below then turn a

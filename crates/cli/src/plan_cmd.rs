@@ -18,12 +18,13 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 pub struct Args {
-    pub root: String,
+    /// `--root`; `None` takes the root the binding records.
+    pub root: Option<String>,
     pub json: bool,
     pub against: Option<String>,
 }
 
-/// `plan --root <dir> [--json] [--against <saved plan>]`, flags in any order.
+/// `plan [--root <dir>] [--json] [--against <saved plan>]`, flags in any order.
 pub fn parse_args(args: &[String]) -> Result<Args, Refusal> {
     let (mut root, mut against, mut json) = (None, None, false);
     let mut it = args.iter();
@@ -48,7 +49,7 @@ pub fn parse_args(args: &[String]) -> Result<Args, Refusal> {
         }
     }
     Ok(Args {
-        root: root.ok_or_else(|| usage("--root is required"))?,
+        root,
         json,
         against,
     })
@@ -91,7 +92,7 @@ fn owned(store: &Store, home: &Path) -> Result<Vec<Owned>, Refusal> {
 }
 
 /// Builds the configuration plan for the bound profile. Read-only.
-pub fn make_plan(ctx: &Ctx, root: &Path) -> Result<Plan, Refusal> {
+pub fn make_plan(ctx: &Ctx, root: Option<&Path>) -> Result<Plan, Refusal> {
     plan_for(
         ctx,
         &load_resolved(ctx, root)?,
@@ -331,7 +332,7 @@ pub fn run(ctx: &Ctx, args: &Args, out: &mut dyn Write) -> Result<(), Refusal> {
         Some(f) => Some(Saved::parse(&read_saved(&PathBuf::from(f))?)?),
         None => None,
     };
-    let fresh = make_plan(ctx, Path::new(&args.root))?;
+    let fresh = make_plan(ctx, args.root.as_deref().map(Path::new))?;
     let digest = fresh.digest()?;
     let diffs = match &old {
         Some(old) => plan::stale(&old.plan, &fresh)?,

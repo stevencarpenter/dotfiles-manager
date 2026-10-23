@@ -15,8 +15,8 @@ Task: DFM-35. This document records what `doctor` and `status` do in this build 
 ## The commands
 
 ```
-dfm doctor --root <dir> [--json]
-dfm status --root <dir> [--json]
+dfm doctor [--root <dir>] [--json]
+dfm status [--root <dir>] [--json]
 ```
 
 Both run one inspection and show the same rows. `doctor` prints `detail` and `fix` for each row. `status` prints the status line and the subject only. `--json` prints one document (`schema: 1`) with the same rows for both commands.
@@ -29,7 +29,7 @@ Both commands are read-only. They run no program, probe no tool, version or PATH
 | --- | --- |
 | 0 | No row is ERROR and no required row is UNKNOWN. A WARN row is listed and does not change the exit. |
 | 1 | Any ERROR row, or any UNKNOWN row of a required check. The process prints `E_DIAGNOSED` on standard error. |
-| 2 | Usage error (missing `--root`, unknown flag, repeated flag, `--against`), or no report can be made at all. Arguments are parsed before HOME is resolved. |
+| 2 | Usage error (no `--root` with a schema 1 binding, unknown flag, repeated flag, `--against`), or no report can be made at all. Arguments are parsed before HOME is resolved. |
 
 `doctor` never exits 3 or 4 (architecture section 10). A malformed manifest, a missing profile, an unreadable state file or an unusable HOME is a row, and exit 1. An unusable HOME gives an ERROR `binding` row and UNKNOWN `state` and `profile` rows.
 

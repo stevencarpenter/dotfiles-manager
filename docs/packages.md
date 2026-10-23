@@ -19,7 +19,7 @@ The child-process runner is the one `secrets` uses (docs/secrets.md, "How `op` i
 ## The command
 
 ```
-dfm packages --root <dir> [--preview] [--yes-plan <digest>]
+dfm packages [--root <dir>] [--preview] [--yes-plan <digest>]
 ```
 
 `packages` is `apply` over the packages scope: every `package` resource is planned, every other resource is `not_in_scope` ("link is configuration, outside a packages plan"), and nothing is removed. Planning a package needs the provider's installed-state listing, so **`packages` probes the providers before it plans**, read-only, and hands the answers to the plan builder (nothing in `plan_cmd.rs` starts a process; a gate test keeps it so). The manager's signal handlers are installed before the first probe, so a stop request ends the probe instead of leaving it running, starts no further provider, and exits 130 or 143 before anything is written. `plan`, `apply` and `doctor` start no package provider and list a package as `not_in_scope` (or, for `doctor`, `D_PROBING_NOT_BUILT`); `secrets` starts only `op`.
