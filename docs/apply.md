@@ -16,7 +16,7 @@ Task: DFM-18, and DFM-21 for the co-owned merge. This document records what the 
 ## The command
 
 ```
-dfm apply [--root <dir>] [--preview] [--yes-plan <digest>] [--allow-disruptive <operation-id>]... [--allow-adopt <operation-id>]...
+dfm apply [--root <dir>] [--preview] [-y|--yes-plan <digest>] [--allow-disruptive <operation-id>]... [--allow-adopt <operation-id>]...
 ```
 
 There is no `--plan <file>` flag. The manager stores no plan (architecture section 10), so apply plans again from the current machine and compares the digest the reviewer approved.
@@ -24,7 +24,7 @@ There is no `--plan <file>` flag. The manager stores no plan (architecture secti
 1. Apply resolves, observes and plans exactly as `plan` does. It prints the plan and its digest.
 2. `--preview` runs the gates that need no write (below), including the journal size, lists every removal that lacks its flag as a pasteable `--allow-disruptive '<id>'` flag, and exits 0 only when apply would not refuse on those gates. A removal without its flag exits 3 with `E_DISRUPTIVE_UNAPPROVED`, as apply does. An adoption without its flag is listed the same way, as `--allow-adopt '<id>'`, and exits 3 with `E_ADOPT_UNAPPROVED`. When both kinds are missing, both lists print and the first error is the one returned. A refusal exits 3 with the same code that apply gives. A preview never writes. It cannot be combined with `--yes-plan` (exit 2).
 3. A blocked plan (any blocker) exits 3 with the first blocker. A blocked plan cannot be approved.
-4. Without `--yes-plan`, apply exits 3 with `E_APPROVAL_REQUIRED` and changes nothing. No prompt exists, so every run is noninteractive (architecture section 10, "Bounded noninteractive behavior").
+4. Without `--yes-plan` (short form `-y`, DFM-69), apply exits 3 with `E_APPROVAL_REQUIRED` and changes nothing. No prompt exists, so every run is noninteractive (architecture section 10, "Bounded noninteractive behavior").
 5. A `--yes-plan` digest that differs from the current digest exits 3 with `E_PLAN_STALE`. This check is read-only. It does not take the lock and does not create the lock file.
 6. Apply takes the writer lock, plans a second time and compares the digest again. A change between the first look and the lock is also `E_PLAN_STALE`.
 7. Apply runs the pre-mutation gates (below), settles interrupted work, executes, writes a receipt and prints the report. The last line is `result: <name>`. It is the exit name of the exit code the process returns, from the same value.
@@ -224,7 +224,7 @@ Publishing a file does not reload the program that reads it (architecture sectio
 | Question | Choice |
 | --- | --- |
 | Preview | Runs every read-only gate that apply runs before the lock: blockers, generator and sensitive refusals, link containment, the allow set and the journal size. A removal without its `--allow-disruptive` id exits 3 with `E_DISRUPTIVE_UNAPPROVED` and prints every missing flag. Exit 0 only when apply would not refuse on those gates. Pass the flags to the preview to get exit 0. |
-| Flag shape | `--root`, `--yes-plan`, `--allow-disruptive` (repeatable), `--preview`. No `--plan <file>`: the digest is the contract. |
+| Flag shape | `--root`, `--yes-plan` (or `-y`), `--allow-disruptive` (repeatable), `--preview`. No `--plan <file>`: the digest is the contract. |
 | Is a removal approved by `--yes-plan` alone? | No. Architecture section 10 item 8 calls deletion of an owned file disruptive, so each removal needs `--allow-disruptive <operation-id>`. This also bounds mass deletion: N removals need N explicit ids. The planner still has no mass-removal guard (docs/planner.md). |
 | Mode of a directory apply creates | 0700, the XDG default. The planner has no mode for `mkdir`. |
 | File mode | The declared mode, else 0600. |

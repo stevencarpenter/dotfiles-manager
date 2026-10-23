@@ -1224,6 +1224,11 @@ mod tests {
         .map(|s| s.to_string())
         .collect();
         assert_eq!(parse_args(&args).err().map(|e| e.code), Some(Code::Usage));
+        let args: Vec<String> = ["-y", &"0".repeat(64), "--trust-origin", "https://h/x"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(parse_args(&args).err().map(|e| e.code), Some(Code::Usage));
         let args: Vec<String> = ["--root", "/r", "--trust-origin", "https://h/x"]
             .iter()
             .map(|s| s.to_string())

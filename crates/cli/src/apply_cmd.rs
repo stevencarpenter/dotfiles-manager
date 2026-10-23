@@ -44,7 +44,7 @@ pub struct Args {
     pub restart: BTreeSet<String>,
 }
 
-/// `apply [--root <dir>] [--yes-plan <digest>] [--allow-disruptive <operation-id>]...
+/// `apply [--root <dir>] [-y|--yes-plan <digest>] [--allow-disruptive <operation-id>]...
 /// [--allow-adopt <operation-id>]... [--preview]`, and `secrets` with the same flags.
 pub fn parse_args(args: &[String], scope: Scope) -> Result<Args, Refusal> {
     let (mut root, mut yes, mut preview, mut update) = (None, None, false, false);
@@ -67,7 +67,7 @@ pub fn parse_args(args: &[String], scope: Scope) -> Result<Args, Refusal> {
             "--root" => {
                 value(Some(&mut root))?;
             }
-            "--yes-plan" => {
+            "--yes-plan" | "-y" => {
                 value(Some(&mut yes))?;
             }
             flag if Allowance::from_flag(flag).is_some() => {
