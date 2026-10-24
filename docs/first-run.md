@@ -33,6 +33,7 @@ Board ticket: DFM-46. The agent runs nothing live without written approval that 
 
    It checks Command Line Tools, the pinned toolchain, the staged tree and the build controls before any `cargo` process starts. It runs `cargo fetch --locked`, which needs network access, then builds offline, runs `self-check`, then installs `~/.local/bin/dfm` through a `current` symlink. A failed build leaves no installed binary.
 4. Check: `dfm --version` prints the semver and the commit. The output must not contain `test-isolation`; the release binary ignores every isolation override.
+5. Later reinstalls: `git pull --ff-only` in the checkout, then `dfm self-update --source "$PWD"` once; after that `dfm self-update` from any directory builds the recorded checkout's HEAD (`--commit <full sha>` picks another commit). See docs/bootstrap.md, "Self-update".
 
 ## 2. Author a bundle in the configuration repository
 

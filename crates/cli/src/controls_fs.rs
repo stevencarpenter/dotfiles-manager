@@ -149,7 +149,7 @@ fn staged_tree(stage: &Path) -> Result<(String, String), Refusal> {
 
 /// One toolchain entry must belong to `uid` and, unless it is a symlink (whose mode is not used),
 /// must not be writable by group or others.
-fn closed_entry(md: &fs::Metadata, name: &str, uid: u32) -> Result<(), String> {
+pub(crate) fn closed_entry(md: &fs::Metadata, name: &str, uid: u32) -> Result<(), String> {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
     if md.uid() != uid {
         return Err(format!("{name} is not owned by the current user"));
@@ -183,7 +183,7 @@ fn closed_tree(dir: &Path, rel: &str, uid: u32) -> Result<(), String> {
 /// owned by another user or open to group or others: such a user could swap an ancestor for a
 /// link after the digest. The rules of `check_private_path` in the script. A missing ancestor is
 /// fine here (the caller refuses an absent toolchain on its own).
-fn closed_ancestors(home: &Path, dir: &Path, uid: u32) -> Result<(), String> {
+pub(crate) fn closed_ancestors(home: &Path, dir: &Path, uid: u32) -> Result<(), String> {
     let rel = dir
         .parent()
         .and_then(|p| p.strip_prefix(home).ok())
