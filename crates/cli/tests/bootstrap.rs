@@ -2558,6 +2558,23 @@ mod self_update {
         assert!(err(&o).contains("E_STORAGE_INVALID"), "{}", err(&o));
         fs::remove_file(&record).unwrap();
 
+        // A checkout inside the staging directory would be removed with it: refused, kept.
+        let inner = p.home.join(".cache/dotfiles-manager/self-update/inner");
+        git(p.tmp.path(), &["clone", "-q", src, inner.to_str().unwrap()]);
+        fs::write(inner.join("WORK"), "uncommitted\n").unwrap();
+        let o = dfm(
+            &p.home,
+            &["self-update", "--source", inner.to_str().unwrap()],
+        );
+        assert_eq!(o.status.code(), Some(3), "{}", err(&o));
+        assert!(
+            err(&o).contains("E_CONFLICT") && err(&o).contains("which self-update replaces"),
+            "{}",
+            err(&o)
+        );
+        assert!(inner.join("WORK").exists(), "the checkout was removed");
+        fs::remove_dir_all(p.home.join(".cache/dotfiles-manager/self-update")).unwrap();
+
         // The script refuses (no toolchain): exit 3, both codes named, nothing recorded.
         let away = p.tmp.path().join("tc-away");
         fs::rename(&p.tc, &away).unwrap();

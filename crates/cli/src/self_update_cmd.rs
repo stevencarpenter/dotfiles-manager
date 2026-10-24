@@ -116,6 +116,18 @@ pub(crate) fn run(ctx: &Ctx, args: &Args, out: &mut dyn Write) -> Result<(), Ref
         ));
     }
     let dir = cache.join("self-update");
+    // Staging replaces `dir`; a checkout in it would go with it, uncommitted work included. The
+    // cache path passed `closed` (no symlink), so the comparison of the spellings is enough.
+    if source.starts_with(&dir) {
+        return Err(Refusal::new(
+            Code::Conflict,
+            format!(
+                "the checkout {} is inside {}, which self-update replaces; move the checkout elsewhere",
+                visible(src),
+                dir.display()
+            ),
+        ));
+    }
     let file = stage_script(&dir, &script.stdout)?;
     if let Err(e) = closed(home, &file, sys.uid) {
         let _ = fs::remove_dir_all(&dir);
