@@ -11,8 +11,9 @@
 //! records them as its own. Fragments (`settings.d`) merge over the declared values first. The
 //! declared `seed` values are set only where the live file has nothing, at any depth, and the
 //! declared handlers are added to `hooks.<event>` as owned entries. Every other key and every
-//! foreign hook entry is carried over by value. The output is re-serialized with sorted keys and
-//! a 2-space indent, so formatting is normalized.
+//! foreign hook entry is carried over by value. A result equal to the live document as JSON keeps
+//! the live bytes, so key order and spacing alone are never a change. Any other result is
+//! re-serialized with sorted keys and a 2-space indent, so formatting is normalized.
 //!
 //! Nothing in an error message repeats a byte of the live file: a parse error names a category,
 //! a line and a column only.
@@ -82,7 +83,7 @@ pub struct Merged {
     pub entries: Vec<OwnedEntry>,
     /// The array items the manager owns after this merge (`append`). The ledger records them.
     pub appended: Vec<AppendedItem>,
-    /// Whether `bytes` differ from the live bytes.
+    /// Whether the merge changes the live document. When it does not, `bytes` are the live bytes.
     pub changed: bool,
 }
 
@@ -694,8 +695,24 @@ pub fn leaf_hashes(salt: &[u8], m: &Merged) -> BTreeMap<String, String> {
         .collect()
 }
 
-fn serialize(doc: Map<String, Json>) -> Vec<u8> {
-    let mut out = serde_json::to_vec_pretty(&Json::Object(doc))
+/// The bytes to publish and whether they change the file. A document equal to the live one as JSON
+/// keeps the live bytes: an application that rewrites the file in its own key order changes no
+/// value, so the merge is not planned again. A whole number counts as one value whether it is
+/// spelled `1` or `1.0`, as in the leaf check.
+fn output(
+    live: Option<&[u8]>,
+    before: Map<String, Json>,
+    doc: Map<String, Json>,
+) -> (Vec<u8>, bool) {
+    let (before, doc) = (Json::Object(before), Json::Object(doc));
+    match live {
+        Some(l) if integral(&doc) == integral(&before) => (l.to_vec(), false),
+        _ => (serialize(&doc), true),
+    }
+}
+
+fn serialize(doc: &Json) -> Vec<u8> {
+    let mut out = serde_json::to_vec_pretty(doc)
         .expect("a serde_json::Value always serializes: its keys are strings");
     out.push(b'\n');
     out
@@ -944,7 +961,8 @@ pub fn merge_with(
     appended: &[AppendedItem],
     takeover: bool,
 ) -> Result<Merged, Refusal> {
-    let mut doc = parse_live(live)?;
+    let before = parse_live(live)?;
+    let mut doc = before.clone();
     let live_map = view_of(&doc, &desired.effective, "", &desired.append);
     // An appended item the module no longer declares goes first, matched by hash.
     for a in appended {
@@ -1038,8 +1056,7 @@ pub fn merge_with(
             ),
         ));
     }
-    let bytes = serialize(doc);
-    let changed = live != Some(bytes.as_slice());
+    let (bytes, changed) = output(live, before, doc);
     Ok(Merged {
         bytes,
         rendered_view: desired.rendered_view(),
@@ -1219,13 +1236,14 @@ fn pointer_get<'a>(m: &'a Map<String, Json>, pointer: &str) -> Option<&'a Json> 
 
 /// Removes only the handler entries and appended items the ledger recorded as owned. Managed
 /// values, seeded values and every foreign key, hook and array item stay. Returns the new bytes
-/// and whether they differ.
+/// and whether they change the file (the live bytes when nothing was removed).
 pub fn retire(
     live: &[u8],
     owned: &[OwnedEntry],
     appended: &[AppendedItem],
 ) -> Result<(Vec<u8>, bool), Refusal> {
-    let mut doc = parse_live(Some(live))?;
+    let before = parse_live(Some(live))?;
+    let mut doc = before.clone();
     let mut touched = BTreeSet::new();
     for o in owned {
         remove_owned(&mut doc, &o.key, &o.sha256, &mut touched)?;
@@ -1234,9 +1252,7 @@ pub fn retire(
     for a in appended {
         remove_item(&mut doc, &pointer_tokens(&a.pointer), &a.sha256);
     }
-    let bytes = serialize(doc);
-    let changed = live != bytes.as_slice();
-    Ok((bytes, changed))
+    Ok(output(Some(live), before, doc))
 }
 
 /// The text for a lost or unusable salt while the ledger records a salted hash. It is a hard
@@ -1290,7 +1306,8 @@ pub fn check_foreign(
 pub enum Outcome {
     /// Write the file, or record ownership of one that is already correct.
     Write,
-    /// The result equals the live bytes and the ledger records the same hash and entries.
+    /// The result equals the live document as JSON and the ledger records the same hash and
+    /// entries.
     Current,
 }
 
@@ -1565,6 +1582,88 @@ argv = ["audit", "--quiet", "two words"]
             "nested keys too"
         );
         assert!(t.find("\"PreToolUse\"").unwrap() < t.find("\"Stop\"").unwrap());
+    }
+
+    /// `v` as JSON text with every object's keys in reverse order and no spaces, the way an
+    /// application with its own key order might write it.
+    fn reversed(v: &Json) -> String {
+        match v {
+            Json::Object(m) => {
+                let items: Vec<_> = m
+                    .iter()
+                    .rev()
+                    .map(|(k, v)| format!("{}:{}", Json::String(k.clone()), reversed(v)))
+                    .collect();
+                format!("{{{}}}", items.join(","))
+            }
+            Json::Array(a) => {
+                let items: Vec<_> = a.iter().map(reversed).collect();
+                format!("[{}]", items.join(","))
+            }
+            other => other.to_string(),
+        }
+    }
+
+    #[test]
+    fn a_live_file_equal_as_json_keeps_its_bytes_and_is_current() {
+        let d = desired(BASE);
+        let salt = [9u8; 32];
+        let first = merge(None, &d, &[]).unwrap();
+        let rec = CoOwned {
+            managed_hash: salted(&salt, &first.rendered_view),
+            entries: first.entries.clone(),
+            appended: first.appended.clone(),
+            leaves: leaf_hashes(&salt, &first),
+        };
+        let mut doc = json(&first.bytes);
+        doc["foreign"] = Json::from("kept");
+        let live = reversed(&doc).into_bytes();
+        let (m, o) = classify(Some(&live), &d, Some(&rec), Some(&salt)).unwrap();
+        assert_eq!((o, m.changed), (Outcome::Current, false));
+        assert_eq!(
+            m.bytes, live,
+            "the live bytes stay, key order and spacing included"
+        );
+        // A missing managed value is a change: the output is normalized again.
+        doc.as_object_mut().unwrap().remove("outputStyle");
+        let m = merge(Some(reversed(&doc).as_bytes()), &d, &first.entries).unwrap();
+        assert!(m.changed);
+        assert!(
+            String::from_utf8(m.bytes)
+                .unwrap()
+                .starts_with("{\n  \"foreign\": \"kept\",\n")
+        );
+        // `1` and `1.0` are one value: a whole number the application respells is no change.
+        let float = desired("[managed]\nratio = 1.0\n");
+        let spelled = br#"{"ratio":1}"#;
+        let m = merge(Some(spelled), &float, &[]).unwrap();
+        assert_eq!((m.changed, m.bytes.as_slice()), (false, &spelled[..]));
+        // A retire that removes nothing keeps the live bytes too.
+        assert_eq!(retire(&live, &[], &[]).unwrap(), (live.clone(), false));
+        let (bytes, changed) = retire(&live, &first.entries, &first.appended).unwrap();
+        assert!(changed);
+        let out = json(&bytes);
+        assert!(out.get("hooks").is_none(), "the owned hook goes: {out}");
+        assert_eq!(
+            (&out["foreign"], &out["outputStyle"]),
+            (&Json::from("kept"), &Json::from("STE"))
+        );
+        assert!(
+            String::from_utf8(bytes)
+                .unwrap()
+                .starts_with("{\n  \"foreign\": \"kept\",\n"),
+            "a changed result is normalized"
+        );
+        // A duplicate key keeps its last value. With no change both copies stay in the bytes; a
+        // change writes one.
+        let plain = desired("[managed]\noutputStyle = \"STE\"\n");
+        let dup = br#"{"outputStyle":"other","outputStyle":"STE"}"#;
+        let m = merge(Some(dup), &plain, &[]).unwrap();
+        assert_eq!((m.changed, m.bytes.as_slice()), (false, &dup[..]));
+        let dup = br#"{"outputStyle":"STE","outputStyle":"other"}"#;
+        let m = merge(Some(dup), &plain, &[]).unwrap();
+        assert!(m.changed);
+        assert_eq!(m.bytes, b"{\n  \"outputStyle\": \"STE\"\n}\n");
     }
 
     #[test]
@@ -2185,7 +2284,8 @@ defaultMode = "auto"
             appended: vec![],
             leaves: leaf_hashes(&salt, &first),
         };
-        // The same value spelled `1.0` is no foreign edit. A real change still is one.
+        // The same value spelled `1.0` is no foreign edit and no change: the file stays as it
+        // is. A real change still is an edit.
         let (_, o) = classify(
             Some(br#"{"retries":1.0,"big":1e20}"#),
             &d,
@@ -2193,7 +2293,7 @@ defaultMode = "auto"
             Some(&salt),
         )
         .unwrap();
-        assert_eq!(o, Outcome::Write);
+        assert_eq!(o, Outcome::Current);
         let e = classify(
             Some(br#"{"retries":1.5,"big":1e20}"#),
             &d,

@@ -346,6 +346,115 @@ fn a_rerun_changes_nothing_and_writes_no_receipt() {
     assert_eq!(fs::read(fx.state().join("ledger.json")).unwrap(), ledger);
 }
 
+/// `v` as JSON text with every object's keys in reverse order and no spaces, the way an
+/// application with its own key order might write it.
+fn reversed(v: &serde_json::Value) -> String {
+    match v {
+        serde_json::Value::Object(m) => {
+            let items: Vec<_> = m
+                .iter()
+                .rev()
+                .map(|(k, v)| format!("{}:{}", serde_json::Value::from(k.as_str()), reversed(v)))
+                .collect();
+            format!("{{{}}}", items.join(","))
+        }
+        serde_json::Value::Array(a) => {
+            let items: Vec<_> = a.iter().map(reversed).collect();
+            format!("[{}]", items.join(","))
+        }
+        other => other.to_string(),
+    }
+}
+
+#[test]
+fn a_file_the_application_rewrote_in_its_own_key_order_is_current_and_left_alone() {
+    let fx = Fx::new();
+    fx.live(LIVE);
+    assert_eq!(code(&fx.apply()), 0);
+    let rewritten = reversed(&fx.live_json());
+    fx.live(&rewritten);
+    let mtime = fs::metadata(fx.settings()).unwrap().modified().unwrap();
+    let (receipts, ledger) = (
+        fx.receipts(),
+        fs::read(fx.state().join("ledger.json")).unwrap(),
+    );
+    let o = fx.plan();
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let row = text(&o.stdout)
+        .lines()
+        .find(|l| l.contains("@.claude/settings.json"))
+        .map(str::to_owned)
+        .unwrap();
+    assert!(row.trim_start().starts_with("current "), "{row}");
+    let o = fx.apply();
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    assert!(text(&o.stdout).contains("updated=0"), "{}", text(&o.stdout));
+    assert_eq!(fs::read(fx.settings()).unwrap(), rewritten.as_bytes());
+    assert_eq!(
+        fs::metadata(fx.settings()).unwrap().modified().unwrap(),
+        mtime
+    );
+    assert_eq!(fx.receipts(), receipts);
+    assert_eq!(fs::read(fx.state().join("ledger.json")).unwrap(), ledger);
+}
+
+#[test]
+fn a_take_over_of_a_file_that_already_holds_the_values_records_ownership_and_writes_nothing() {
+    let fx = Fx::new();
+    fx.live(LIVE);
+    assert_eq!(code(&fx.apply()), 0);
+    let rewritten = reversed(&fx.live_json());
+    // Another home with the same file in another key order and no ledger entry for it.
+    let fresh = Fx::new();
+    fresh.live(&rewritten);
+    let mtime = fs::metadata(fresh.settings()).unwrap().modified().unwrap();
+    let o = fresh.apply();
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+    assert_eq!(fs::read(fresh.settings()).unwrap(), rewritten.as_bytes());
+    assert_eq!(
+        fs::metadata(fresh.settings()).unwrap().modified().unwrap(),
+        mtime
+    );
+    // The approval records the hook entries already in place, so a later retire removes them.
+    let (had, got) = (fx.coowned().unwrap(), fresh.coowned().unwrap());
+    assert!(
+        !got["coowned"]["entries"].as_array().unwrap().is_empty(),
+        "{got}"
+    );
+    assert_eq!(got["coowned"]["entries"], had["coowned"]["entries"]);
+    let leaves = |c: &serde_json::Value| -> Vec<String> {
+        c["coowned"]["leaves"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect()
+    };
+    assert!(!leaves(&got).is_empty());
+    assert_eq!(leaves(&got), leaves(&had));
+    let receipts: Vec<serde_json::Value> = fs::read_dir(fresh.state().join("receipts"))
+        .unwrap()
+        .map(|e| serde_json::from_slice(&fs::read(e.unwrap().path()).unwrap()).unwrap())
+        .collect();
+    assert_eq!(receipts.len(), 1);
+    let op = receipts[0]["operations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|o| o["adapter"] == "claude-settings/v1")
+        .unwrap();
+    assert_eq!(op["status"], "updated");
+    assert!(op.get("reload").is_none(), "no reload note: {op}");
+    let o = fresh.plan();
+    assert!(
+        text(&o.stdout)
+            .lines()
+            .any(|l| l.contains("@.claude/settings.json") && l.trim_start().starts_with("current ")),
+        "{}",
+        text(&o.stdout)
+    );
+}
+
 #[test]
 fn an_explicit_disable_is_written_as_declared() {
     let fx = Fx::new();
@@ -668,6 +777,24 @@ fn deselecting_the_resource_retires_only_the_owned_handlers() {
     let o = fx.apply();
     assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
     assert!(text(&o.stdout).contains("updated=0"), "{}", text(&o.stdout));
+}
+
+#[test]
+fn deselecting_after_the_application_reordered_the_file_retires_the_owned_handlers() {
+    let fx = Fx::new();
+    fx.live(LIVE);
+    assert_eq!(code(&fx.apply()), 0);
+    fx.live(&reversed(&fx.live_json()));
+    fx.set_profile("");
+    let o = fx.apply();
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+    let j = fx.live_json();
+    assert_eq!(j["outputStyle"], "STE", "managed values stay");
+    assert_eq!(j["apiKeyHelper"], TOKEN);
+    let pre = j["hooks"]["PreToolUse"].as_array().unwrap();
+    assert_eq!(pre.len(), 1, "{j}");
+    assert_eq!(pre[0]["hooks"][0]["command"], "foreign-hook");
+    assert!(fx.coowned().is_none(), "the resource left the ledger");
 }
 
 #[test]
