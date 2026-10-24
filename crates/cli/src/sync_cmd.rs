@@ -333,14 +333,18 @@ struct Staged {
     old: Option<String>,
     /// The commit to publish: the fetched head of the root's ref, the pin of a nested source.
     new: String,
+    /// That head or pin when the checkout already holds it under local commits; `new` is then
+    /// the checkout's HEAD, which stays where it is.
+    ahead_of: Option<String>,
 }
 
 impl Staged {
     fn change(&self) -> String {
-        match &self.old {
-            None => format!("new checkout at {}", self.new),
-            Some(o) if *o == self.new => format!("current at {}", self.new),
-            Some(o) => format!("{o}..{}", self.new),
+        match (&self.old, &self.ahead_of) {
+            (None, _) => format!("new checkout at {}", self.new),
+            (Some(_), Some(a)) => format!("current at {} (ahead of {a})", self.new),
+            (Some(o), None) if *o == self.new => format!("current at {}", self.new),
+            (Some(o), None) => format!("{o}..{}", self.new),
         }
     }
 
@@ -683,6 +687,23 @@ fn advance(
     .map(|_| ())
 }
 
+/// Whether `a` is an ancestor of `b` (or `b` itself) in the repository at `repo`, both commits
+/// known to it. git answers with exit 0 or 1; any other end is a refusal, not a "no".
+fn is_ancestor(git: &Git, repo: &str, a: &str, b: &str) -> Result<bool, Refusal> {
+    match git
+        .output(true, &["-C", repo, "merge-base", "--is-ancestor", a, b])?
+        .end
+    {
+        End::Exited(0) => Ok(true),
+        End::Exited(1) => Ok(false),
+        End::Stopped(r) => Err(r),
+        _ => Err(Refusal::new(
+            Code::SourceMissing,
+            format!("git cannot tell whether {a} is an ancestor of {b} in the staged copy"),
+        )),
+    }
+}
+
 /// Rehearses one source in the staged copy: fetches its ref from the origin, decides the commit
 /// to publish, and fast-forwards the copy to it. The copy holds the user's local state, so what
 /// git accepts here is what it will accept at publication.
@@ -742,6 +763,8 @@ fn stage_source(
     let new = match &src.commit {
         None => head,
         Some(pin) => {
+            // Not `is_ancestor`: a pin the copy has never seen makes git exit 128, which is
+            // this same answer.
             let reachable = git
                 .output(
                     true,
@@ -767,6 +790,12 @@ fn stage_source(
             pin.clone()
         }
     };
+    // A checkout that already holds `new` under local commits stays at its HEAD: sync never
+    // moves a checkout back, and `merge --ff-only` would only answer "Already up to date".
+    let (new, ahead_of) = match old.as_deref() {
+        Some(o) if o != new && is_ancestor(git, &repo_s, &new, o)? => (o.to_string(), Some(new)),
+        _ => (new, None),
+    };
     if old.as_deref() != Some(new.as_str()) {
         // The objects are already in the copy (the fetch above), so the fast-forward is local.
         advance(git, id, &repo_s, old.as_deref(), &new, None)?;
@@ -777,6 +806,7 @@ fn stage_source(
         live,
         old,
         new,
+        ahead_of,
     })
 }
 
