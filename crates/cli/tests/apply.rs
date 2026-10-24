@@ -314,6 +314,18 @@ fn is_link_to(p: &Path, target: &Path) -> bool {
 // ---- approval ---------------------------------------------------------------------------
 
 #[test]
+fn dash_y_approves_the_plan_as_yes_plan_does() {
+    let fx = Fx::new();
+    let d = fx.digest();
+    let o = fx.run(&["apply", "--root", fx.root_arg(), "-y", &d]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let rs = fx.receipts();
+    assert_eq!(rs.len(), 1);
+    assert_eq!(rs[0]["approval"]["kind"], "yes_plan");
+    assert_eq!(rs[0]["approval"]["plan_digest"], d.as_str());
+}
+
+#[test]
 fn apply_without_an_approved_digest_prints_the_plan_and_writes_nothing() {
     let fx = Fx::new();
     let before = fingerprint(fx.home.path());
@@ -360,6 +372,10 @@ fn bad_flags_are_usage_errors() {
             &d,
         ],
         vec!["apply", "--root", fx.root_arg(), "--force"],
+        vec!["apply", "--root", fx.root_arg(), "--preview", "-y", &d],
+        vec!["apply", "--root", fx.root_arg(), "-y", "abc"],
+        vec!["apply", "--root", fx.root_arg(), "-y"],
+        vec!["apply", "--root", fx.root_arg(), "-y", &d, "--yes-plan", &d],
     ] {
         let o = fx.run(&args);
         assert_eq!(code(&o), 2, "{args:?}: {}", stderr(&o));

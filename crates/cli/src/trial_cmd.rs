@@ -41,7 +41,7 @@ pub struct Args {
 }
 
 /// `trial <package> [--id <trial-id>] [--provider homebrew/v1|mise/v1] [--config <path>]...
-/// [--preview] [--yes-plan <digest>]`.
+/// [--preview] [-y|--yes-plan <digest>]`.
 pub fn parse_args(args: &[String]) -> Result<Args, Refusal> {
     let (mut package, mut id, mut provider, mut yes, mut preview) = (None, None, None, None, false);
     let mut configs = Vec::new();
@@ -59,7 +59,7 @@ pub fn parse_args(args: &[String]) -> Result<Args, Refusal> {
         match a.as_str() {
             "--id" => value(&mut id)?,
             "--provider" => value(&mut provider)?,
-            "--yes-plan" => value(&mut yes)?,
+            "--yes-plan" | "-y" => value(&mut yes)?,
             "--config" => configs.push(
                 it.next()
                     .cloned()
@@ -728,6 +728,20 @@ mod tests {
             Code::Usage
         );
         assert_eq!(a(&["a", "--yes-plan", "zz"]).unwrap_err().code, Code::Usage);
+        // `-y` is the short form: the same value check, and one approval per run.
+        let d = "0".repeat(64);
+        assert_eq!(
+            a(&["a", "-y", &d]).unwrap().yes_plan.as_deref(),
+            Some(d.as_str())
+        );
+        for bad in [
+            vec!["a", "-y", "zz"],
+            vec!["a", "-y"],
+            vec!["a", "--preview", "-y", &d],
+            vec!["a", "-y", &d, "--yes-plan", &d],
+        ] {
+            assert_eq!(a(&bad).unwrap_err().code, Code::Usage, "{bad:?}");
+        }
     }
 
     #[test]

@@ -172,6 +172,7 @@ Read the plan. Each line is one operation:
 dfm apply --yes-plan <digest> [--allow-adopt '<id>']... [--allow-disruptive '<id>']...
 ```
 
+- `-y <digest>` is the short form of `--yes-plan <digest>` on every command that takes it.
 - A digest that no longer matches exits 3 with `E_PLAN_STALE` and writes nothing. Run `plan` again and approve the new digest.
 - The last line is `result: <name>`. `ok` means every operation ended `updated` or `current`. Anything else: read the per-operation lines; the first failure stops further changes, and the receipt records what happened.
 - A second run of the same plan changes nothing and exits 0.

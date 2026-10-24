@@ -15,7 +15,7 @@ Task: DFM-32, the `trial` command (`try <tool>` in DESIGN.md section 7). This do
 ## The command
 
 ```
-dfm trial <package> [--id <trial-id>] [--provider homebrew/v1|mise/v1] [--config <path>]... [--preview] [--yes-plan <digest>]
+dfm trial <package> [--id <trial-id>] [--provider homebrew/v1|mise/v1] [--config <path>]... [--preview] [-y|--yes-plan <digest>]
 ```
 
 `<package>` is the package as the provider names it (`atuin`, `homebrew/core/atuin`, `node@20`), checked by the package adapter's name rule. The tool is its short name (`atuin`, `node`), which must be a valid id (lowercase ASCII letters, digits, `.`, `_`, `-`); a mise backend name such as `npm:prettier` is a usage error (known limit). The trial id is `trial-<tool>` unless `--id` names another.
