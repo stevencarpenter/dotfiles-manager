@@ -124,14 +124,14 @@ fn path_str(p: &Path) -> Result<&str, Refusal> {
 /// environment of section 8. `remote` allows `https` and `ssh` (and `file` in the isolated
 /// build, for the tests' local remotes); `local` allows only the `file` transport, which the
 /// fetches between the staging checkout and the user's checkout use.
-struct Git {
+pub(crate) struct Git {
     runner: Runner,
     remote: Vec<(String, String)>,
     local: Vec<(String, String)>,
 }
 
 impl Git {
-    fn new(ctx: &Ctx, sys: &Sys) -> Git {
+    pub(crate) fn new(ctx: &Ctx, sys: &Sys) -> Git {
         let mut runner = ctx.runner(sys);
         // Section 8: a manager-owned empty directory as HOME. `ssh` still reads `~/.ssh` through
         // the password database, which the contract records.
@@ -161,7 +161,11 @@ impl Git {
         }
     }
 
-    fn output(&self, local: bool, args: &[&str]) -> Result<dfm_engine::ProcOutput, Refusal> {
+    pub(crate) fn output(
+        &self,
+        local: bool,
+        args: &[&str],
+    ) -> Result<dfm_engine::ProcOutput, Refusal> {
         let argv: Vec<String> = GIT_SETTINGS
             .iter()
             .chain(args.iter())
@@ -184,7 +188,13 @@ impl Git {
 
     /// Runs git and returns its trimmed standard output, or a refusal with `code` that names
     /// `what` and the first line git wrote to standard error (bounded, made visible).
-    fn run(&self, local: bool, code: Code, what: &str, args: &[&str]) -> Result<String, Refusal> {
+    pub(crate) fn run(
+        &self,
+        local: bool,
+        code: Code,
+        what: &str,
+        args: &[&str],
+    ) -> Result<String, Refusal> {
         let out = self.output(local, args)?;
         if out.success() {
             return Ok(String::from_utf8_lossy(&out.stdout).trim_end().to_string());

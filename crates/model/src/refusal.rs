@@ -83,6 +83,9 @@ pub enum Code {
     // Added by DFM-26 (docs/lifecycle.md). A launcher accepted a request and the completion was
     // not observed within the bound: the operation is `pending`, exit 5, never a success.
     Pending,
+    // Added by DFM-72 (docs/bootstrap.md, self-update). The bootstrap script that self-update
+    // ran did not finish: exit 3 when it refused before any change, else exit 1.
+    BootstrapFailed,
 }
 
 impl Code {
@@ -147,6 +150,7 @@ impl Code {
         Code::RenderFailed,
         Code::ProbeFailed,
         Code::Pending,
+        Code::BootstrapFailed,
     ];
 
     pub fn parse(s: &str) -> Option<Code> {
@@ -214,6 +218,7 @@ impl Code {
             Code::RenderFailed => "E_RENDER_FAILED",
             Code::ProbeFailed => "E_PROBE_FAILED",
             Code::Pending => "E_PENDING",
+            Code::BootstrapFailed => "E_BOOTSTRAP_FAILED",
         }
     }
 
