@@ -67,6 +67,7 @@ pub(crate) fn run(ctx: &Ctx, args: &Args, out: &mut dyn Write) -> Result<(), Ref
         .to_str()
         .filter(|s| !s.chars().any(char::is_control))
         .ok_or_else(|| usage("--source must be a UTF-8 path without control characters"))?;
+    ensure_clt()?;
     let git = Git::new(ctx, &sys);
     let rev = format!("{}^{{commit}}", args.commit.as_deref().unwrap_or("HEAD"));
     let commit = git.run(
@@ -175,6 +176,42 @@ pub(crate) fn run(ctx: &Ctx, args: &Args, out: &mut dyn Write) -> Result<(), Ref
             ),
         )
         .after_mutation()),
+    }
+}
+
+/// The script's `ensure_clt`: `/usr/bin/git` is the Command Line Tools shim, which offers to
+/// install the tools instead of running when they are missing, so they are probed before the
+/// first git call. `xcode-select -p` is not a shim; a `clang` under the path it prints counts.
+fn ensure_clt() -> Result<(), Refusal> {
+    let missing = || {
+        Refusal::new(
+            Code::PrereqMissing,
+            "Command Line Tools are missing. Run 'xcode-select --install', wait for it to finish, then run dfm self-update again",
+        )
+    };
+    #[cfg(feature = "test-isolation")]
+    if std::env::var("DFM_TEST_CLT").as_deref() == Ok("missing") {
+        return Err(missing());
+    }
+    let out = Command::new("/usr/bin/xcode-select")
+        .arg("-p")
+        .env_clear()
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .map_err(|_| missing())?;
+    let dir = String::from_utf8_lossy(&out.stdout).trim_end().to_string();
+    let clang = |rel: &str| {
+        fs::metadata(Path::new(&dir).join(rel))
+            .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+    };
+    if out.status.success()
+        && !dir.is_empty()
+        && (clang("usr/bin/clang") || clang("Toolchains/XcodeDefault.xctoolchain/usr/bin/clang"))
+    {
+        Ok(())
+    } else {
+        Err(missing())
     }
 }
 

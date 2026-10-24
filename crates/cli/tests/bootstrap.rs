@@ -2585,6 +2585,22 @@ mod self_update {
         assert!(err(&o).contains("E_BOOTSTRAP_FAILED"), "{}", err(&o));
         assert!(!record.exists() && !p.data.join("current").exists());
 
+        // Without Command Line Tools, dfm itself refuses before its first git call (the git
+        // shim would offer an install): no script runs, so no E_BOOTSTRAP_FAILED.
+        let o = dfm_env(
+            &p.home,
+            &["self-update", "--source", src],
+            &[("DFM_TEST_CLT", "missing")],
+        );
+        assert_eq!(o.status.code(), Some(3), "{}", err(&o));
+        assert!(
+            err(&o).contains("E_PREREQ_MISSING") && err(&o).contains("xcode-select --install"),
+            "{}",
+            err(&o)
+        );
+        assert!(!err(&o).contains("E_BOOTSTRAP_FAILED"), "{}", err(&o));
+        assert!(!String::from_utf8_lossy(&o.stdout).contains("self-update:"));
+
         let o = dfm(&p.home, &["self-update", "--source", src]);
         assert_eq!(o.status.code(), Some(0), "{}", err(&o));
         let out = String::from_utf8_lossy(&o.stdout);
