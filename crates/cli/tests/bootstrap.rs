@@ -2510,177 +2510,200 @@ fn a_successful_install_with_a_stand_in_cargo_leaves_no_build_directories() {
     assert!(p.data.join("current").is_symlink());
 }
 
-/// The isolated `dfm` with `--home`: self-update runs the bootstrap script in its test mode.
-fn dfm(home: &Path, args: &[&str]) -> Output {
-    dfm_env(home, args, &[])
-}
+/// `dfm self-update` drives the isolated build (`--home`), so these tests need `test-isolation`.
+#[cfg(feature = "test-isolation")]
+mod self_update {
+    use super::*;
 
-/// As [`dfm`], with the script's DFM_TEST_* hooks in the environment.
-fn dfm_env(home: &Path, args: &[&str], env: &[(&str, &str)]) -> Output {
-    Command::new(common::BIN)
-        .env_clear()
-        .env("DFM_PROVIDER_PATH", "/usr/bin:/bin")
-        .envs(env.iter().copied())
-        .arg("--home")
-        .arg(home)
-        .args(args)
-        .output()
-        .unwrap()
-}
-
-fn installed(p: &Prepared) -> String {
-    fs::read_link(p.data.join("current"))
-        .unwrap()
-        .to_string_lossy()
-        .into_owned()
-}
-
-/// `dfm self-update` runs the target commit's own bootstrap.sh: a refusal there changes nothing
-/// and records nothing; a run with --source installs the checkout's HEAD and records the
-/// checkout; a repeat finds that commit installed and builds nothing; a new commit is installed
-/// without --source.
-#[test]
-fn self_update_installs_the_checkout_head_and_reuses_the_recorded_checkout() {
-    let p = prepare_with("self-update", fake_toolchain("exit 0".into()));
-    let src = p.src.to_str().unwrap();
-    let record = p.data.join("source");
-    let o = dfm(&p.home, &["self-update"]);
-    assert_eq!(o.status.code(), Some(2), "{}", err(&o));
-    assert!(err(&o).contains("--source"), "{}", err(&o));
-    fs::write(&record, "relative/path\n").unwrap();
-    let o = dfm(&p.home, &["self-update"]);
-    assert_eq!(o.status.code(), Some(3), "{}", err(&o));
-    assert!(err(&o).contains("E_STORAGE_INVALID"), "{}", err(&o));
-    fs::remove_file(&record).unwrap();
-
-    // The script refuses (no toolchain): exit 3, both codes named, nothing recorded.
-    let away = p.tmp.path().join("tc-away");
-    fs::rename(&p.tc, &away).unwrap();
-    let o = dfm(&p.home, &["self-update", "--source", src]);
-    fs::rename(&away, &p.tc).unwrap();
-    assert_eq!(o.status.code(), Some(3), "{}", err(&o));
-    assert!(err(&o).contains("E_TOOLCHAIN_MISMATCH"), "{}", err(&o));
-    assert!(err(&o).contains("E_BOOTSTRAP_FAILED"), "{}", err(&o));
-    assert!(!record.exists() && !p.data.join("current").exists());
-
-    let o = dfm(&p.home, &["self-update", "--source", src]);
-    assert_eq!(o.status.code(), Some(0), "{}", err(&o));
-    let out = String::from_utf8_lossy(&o.stdout);
-    assert!(
-        out.contains(&format!("self-update: installing {}", p.sha)),
-        "{out}"
-    );
-    assert!(out.contains("bootstrap: done"), "{out}");
-    assert!(installed(&p).ends_with(&p.sha[..12]));
-    assert_eq!(
-        fs::read_to_string(&record).unwrap().trim_end(),
-        fs::canonicalize(&p.src).unwrap().to_str().unwrap()
-    );
-
-    let o = dfm(&p.home, &["self-update"]);
-    assert_eq!(o.status.code(), Some(0), "{}", err(&o));
-    let out = String::from_utf8_lossy(&o.stdout);
-    assert!(out.contains("is already installed"), "{out}");
-    assert!(!out.contains("bootstrap: done"), "{out}");
-    // A dangling `current` holds nothing: the same commit is built again.
-    fs::remove_file(p.data.join("current/dfm")).unwrap();
-    let o = dfm(&p.home, &["self-update"]);
-    assert_eq!(o.status.code(), Some(0), "{}", err(&o));
-    assert!(
-        String::from_utf8_lossy(&o.stdout).contains("bootstrap: done"),
-        "{}",
-        String::from_utf8_lossy(&o.stdout)
-    );
-
-    let next = next_commit(&p, "second");
-    let o = dfm(&p.home, &["self-update"]);
-    assert_eq!(o.status.code(), Some(0), "{}", err(&o));
-    assert!(
-        String::from_utf8_lossy(&o.stdout).contains(&format!("self-update: installing {next}")),
-        "{}",
-        String::from_utf8_lossy(&o.stdout)
-    );
-    assert!(installed(&p).ends_with(&next[..12]));
-    assert!(!p.home.join(".cache/dotfiles-manager/self-update").exists());
-}
-
-/// A failed run says which version is active: the script exits 1 before the flip (the previous
-/// version stays) and also after it (current is already the new version). Neither records.
-#[test]
-fn self_update_names_the_active_version_after_a_failure() {
-    let p = prepare_with("self-update-fail", fake_toolchain("exit 0".into()));
-    let src = p.src.to_str().unwrap();
-    let o = dfm(&p.home, &["self-update", "--source", src]);
-    assert_eq!(o.status.code(), Some(0), "{}", err(&o));
-    let record = p.data.join("source");
-    fs::remove_file(&record).unwrap();
-    let next = next_commit(&p, "second");
-    let fail = p.tmp.path().join("fail.sh");
-    fs::write(&fail, "exit 1\n").unwrap();
-    let o = dfm_env(
-        &p.home,
-        &["self-update", "--source", src],
-        &[("DFM_TEST_BEFORE_SWAP", fail.to_str().unwrap())],
-    );
-    assert_eq!(o.status.code(), Some(1), "{}", err(&o));
-    assert!(
-        err(&o).contains("E_BOOTSTRAP_FAILED")
-            && err(&o).contains("the previous version stays active"),
-        "{}",
-        err(&o)
-    );
-    assert!(installed(&p).ends_with(&p.sha[..12]));
-    assert!(!record.exists());
-
-    // After the flip, the command link is replaced: the read-back fails with exit 1.
-    let link = p.home.join(".local/bin/dfm");
-    let relink = p.tmp.path().join("relink.sh");
-    fs::write(
-        &relink,
-        format!("ln -sfn /usr/bin/true '{}'\n", link.display()),
-    )
-    .unwrap();
-    let o = dfm_env(
-        &p.home,
-        &["self-update", "--source", src],
-        &[("DFM_TEST_AFTER_SWAP", relink.to_str().unwrap())],
-    );
-    assert_eq!(o.status.code(), Some(1), "{}", err(&o));
-    assert!(err(&o).contains("swap did not take effect"), "{}", err(&o));
-    assert!(
-        err(&o).contains("current already points at the new version"),
-        "{}",
-        err(&o)
-    );
-    assert!(installed(&p).ends_with(&next[..12]));
-    assert!(!record.exists());
-}
-
-#[test]
-fn self_update_flags_are_checked_before_anything_runs() {
-    let tmp = TempDir::new("self-update-flags");
-    let home = tmp.path().join("home");
-    fs::create_dir_all(&home).unwrap();
-    for (args, want) in [
-        (
-            vec!["self-update", "--source", "https://github.com/x/y"],
-            "local dotfiles-manager checkout",
-        ),
-        (
-            vec!["self-update", "--source", "/x", "--commit", "abc"],
-            "full lowercase hex",
-        ),
-        (
-            vec!["self-update", "--source", "a", "--source", "b"],
-            "given twice",
-        ),
-        (vec!["self-update", "--nope"], "unknown argument"),
-    ] {
-        let o = dfm(&home, &args);
-        assert_eq!(o.status.code(), Some(2), "{args:?}: {}", err(&o));
-        assert!(err(&o).contains(want), "{args:?}: {}", err(&o));
+    /// The isolated `dfm` with `--home`: self-update runs the bootstrap script in its test mode.
+    fn dfm(home: &Path, args: &[&str]) -> Output {
+        dfm_env(home, args, &[])
     }
-    assert!(entries_below(&home).is_empty());
+
+    /// As [`dfm`], with the script's DFM_TEST_* hooks in the environment.
+    fn dfm_env(home: &Path, args: &[&str], env: &[(&str, &str)]) -> Output {
+        Command::new(common::BIN)
+            .env_clear()
+            .env("DFM_PROVIDER_PATH", "/usr/bin:/bin")
+            .envs(env.iter().copied())
+            .arg("--home")
+            .arg(home)
+            .args(args)
+            .output()
+            .unwrap()
+    }
+
+    fn installed(p: &Prepared) -> String {
+        fs::read_link(p.data.join("current"))
+            .unwrap()
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    /// `dfm self-update` runs the target commit's own bootstrap.sh: a refusal there changes nothing
+    /// and records nothing; a run with --source installs the checkout's HEAD and records the
+    /// checkout; a repeat finds that commit installed and builds nothing; a new commit is installed
+    /// without --source.
+    #[test]
+    fn self_update_installs_the_checkout_head_and_reuses_the_recorded_checkout() {
+        let p = prepare_with("self-update", fake_toolchain("exit 0".into()));
+        let src = p.src.to_str().unwrap();
+        let record = p.data.join("source");
+        let o = dfm(&p.home, &["self-update"]);
+        assert_eq!(o.status.code(), Some(2), "{}", err(&o));
+        assert!(err(&o).contains("--source"), "{}", err(&o));
+        fs::write(&record, "relative/path\n").unwrap();
+        let o = dfm(&p.home, &["self-update"]);
+        assert_eq!(o.status.code(), Some(3), "{}", err(&o));
+        assert!(err(&o).contains("E_STORAGE_INVALID"), "{}", err(&o));
+        fs::remove_file(&record).unwrap();
+
+        // The script refuses (no toolchain): exit 3, both codes named, nothing recorded.
+        let away = p.tmp.path().join("tc-away");
+        fs::rename(&p.tc, &away).unwrap();
+        let o = dfm(&p.home, &["self-update", "--source", src]);
+        fs::rename(&away, &p.tc).unwrap();
+        assert_eq!(o.status.code(), Some(3), "{}", err(&o));
+        assert!(err(&o).contains("E_TOOLCHAIN_MISMATCH"), "{}", err(&o));
+        assert!(err(&o).contains("E_BOOTSTRAP_FAILED"), "{}", err(&o));
+        assert!(!record.exists() && !p.data.join("current").exists());
+
+        let o = dfm(&p.home, &["self-update", "--source", src]);
+        assert_eq!(o.status.code(), Some(0), "{}", err(&o));
+        let out = String::from_utf8_lossy(&o.stdout);
+        assert!(
+            out.contains(&format!("self-update: installing {}", p.sha)),
+            "{out}"
+        );
+        assert!(out.contains("bootstrap: done"), "{out}");
+        assert!(installed(&p).ends_with(&p.sha[..12]));
+        assert_eq!(
+            fs::read_to_string(&record).unwrap().trim_end(),
+            fs::canonicalize(&p.src).unwrap().to_str().unwrap()
+        );
+
+        let o = dfm(&p.home, &["self-update"]);
+        assert_eq!(o.status.code(), Some(0), "{}", err(&o));
+        let out = String::from_utf8_lossy(&o.stdout);
+        assert!(out.contains("is already installed"), "{out}");
+        assert!(!out.contains("bootstrap: done"), "{out}");
+        // Another user able to write the cache directory or the record could swap the staged
+        // script or the checkout it names: refused before anything is read or run.
+        let cache = p.home.join(".cache/dotfiles-manager");
+        let record_mode = fs::metadata(&record).unwrap().permissions().mode();
+        for (path, open, closed) in [(&cache, 0o775, 0o755), (&record, 0o620, record_mode)] {
+            fs::set_permissions(path, fs::Permissions::from_mode(open)).unwrap();
+            let o = dfm(&p.home, &["self-update"]);
+            fs::set_permissions(path, fs::Permissions::from_mode(closed)).unwrap();
+            assert_eq!(o.status.code(), Some(3), "{}", err(&o));
+            assert!(
+                err(&o).contains("E_STORAGE_INVALID")
+                    && err(&o).contains("writable by group or others"),
+                "{}",
+                err(&o)
+            );
+            assert!(!String::from_utf8_lossy(&o.stdout).contains("self-update:"));
+        }
+        // A dangling `current` holds nothing: the same commit is built again.
+        fs::remove_file(p.data.join("current/dfm")).unwrap();
+        let o = dfm(&p.home, &["self-update"]);
+        assert_eq!(o.status.code(), Some(0), "{}", err(&o));
+        assert!(
+            String::from_utf8_lossy(&o.stdout).contains("bootstrap: done"),
+            "{}",
+            String::from_utf8_lossy(&o.stdout)
+        );
+
+        let next = next_commit(&p, "second");
+        let o = dfm(&p.home, &["self-update"]);
+        assert_eq!(o.status.code(), Some(0), "{}", err(&o));
+        assert!(
+            String::from_utf8_lossy(&o.stdout).contains(&format!("self-update: installing {next}")),
+            "{}",
+            String::from_utf8_lossy(&o.stdout)
+        );
+        assert!(installed(&p).ends_with(&next[..12]));
+        assert!(!p.home.join(".cache/dotfiles-manager/self-update").exists());
+    }
+
+    /// A failed run says which version is active: the script exits 1 before the flip (the previous
+    /// version stays) and also after it (current is already the new version). Neither records.
+    #[test]
+    fn self_update_names_the_active_version_after_a_failure() {
+        let p = prepare_with("self-update-fail", fake_toolchain("exit 0".into()));
+        let src = p.src.to_str().unwrap();
+        let o = dfm(&p.home, &["self-update", "--source", src]);
+        assert_eq!(o.status.code(), Some(0), "{}", err(&o));
+        let record = p.data.join("source");
+        fs::remove_file(&record).unwrap();
+        let next = next_commit(&p, "second");
+        let fail = p.tmp.path().join("fail.sh");
+        fs::write(&fail, "exit 1\n").unwrap();
+        let o = dfm_env(
+            &p.home,
+            &["self-update", "--source", src],
+            &[("DFM_TEST_BEFORE_SWAP", fail.to_str().unwrap())],
+        );
+        assert_eq!(o.status.code(), Some(1), "{}", err(&o));
+        assert!(
+            err(&o).contains("E_BOOTSTRAP_FAILED")
+                && err(&o).contains("the previous version stays active"),
+            "{}",
+            err(&o)
+        );
+        assert!(installed(&p).ends_with(&p.sha[..12]));
+        assert!(!record.exists());
+
+        // After the flip, the command link is replaced: the read-back fails with exit 1.
+        let link = p.home.join(".local/bin/dfm");
+        let relink = p.tmp.path().join("relink.sh");
+        fs::write(
+            &relink,
+            format!("ln -sfn /usr/bin/true '{}'\n", link.display()),
+        )
+        .unwrap();
+        let o = dfm_env(
+            &p.home,
+            &["self-update", "--source", src],
+            &[("DFM_TEST_AFTER_SWAP", relink.to_str().unwrap())],
+        );
+        assert_eq!(o.status.code(), Some(1), "{}", err(&o));
+        assert!(err(&o).contains("swap did not take effect"), "{}", err(&o));
+        assert!(
+            err(&o).contains("current already points at the new version"),
+            "{}",
+            err(&o)
+        );
+        assert!(installed(&p).ends_with(&next[..12]));
+        assert!(!record.exists());
+    }
+
+    #[test]
+    fn self_update_flags_are_checked_before_anything_runs() {
+        let tmp = TempDir::new("self-update-flags");
+        let home = tmp.path().join("home");
+        fs::create_dir_all(&home).unwrap();
+        for (args, want) in [
+            (
+                vec!["self-update", "--source", "https://github.com/x/y"],
+                "local dotfiles-manager checkout",
+            ),
+            (
+                vec!["self-update", "--source", "/x", "--commit", "abc"],
+                "full lowercase hex",
+            ),
+            (
+                vec!["self-update", "--source", "a", "--source", "b"],
+                "given twice",
+            ),
+            (vec!["self-update", "--nope"], "unknown argument"),
+        ] {
+            let o = dfm(&home, &args);
+            assert_eq!(o.status.code(), Some(2), "{args:?}: {}", err(&o));
+            assert!(err(&o).contains(want), "{args:?}: {}", err(&o));
+        }
+        assert!(entries_below(&home).is_empty());
+    }
 }
 
 /// The install path of the old-link rule, without network: ours is removed with a message; a

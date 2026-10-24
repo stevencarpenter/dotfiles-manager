@@ -52,11 +52,12 @@ pub(crate) fn run(ctx: &Ctx, args: &Args, out: &mut dyn Write) -> Result<(), Ref
     let w =
         |e: std::io::Error| Refusal::new(Code::IoFailed, format!("output failed: {}", e.kind()));
     header(out, ctx).map_err(w)?;
-    let data = ctx.platform.data_dir();
+    let (home, data) = (ctx.platform.home(), ctx.platform.data_dir());
+    let sys = ctx.sys()?;
     let source = match &args.source {
         Some(s) => fs::canonicalize(s)
             .map_err(|e| usage(format!("--source {}: {}", visible(s), e.kind())))?,
-        None => recorded(&data)?.ok_or_else(|| {
+        None => recorded(home, &data, sys.uid)?.ok_or_else(|| {
             usage(
                 "self-update needs --source <dotfiles-manager checkout> once; later runs reuse it",
             )
@@ -66,7 +67,6 @@ pub(crate) fn run(ctx: &Ctx, args: &Args, out: &mut dyn Write) -> Result<(), Ref
         .to_str()
         .filter(|s| !s.chars().any(char::is_control))
         .ok_or_else(|| usage("--source must be a UTF-8 path without control characters"))?;
-    let sys = ctx.sys()?;
     let git = Git::new(ctx, &sys);
     let rev = format!("{}^{{commit}}", args.commit.as_deref().unwrap_or("HEAD"));
     let commit = git.run(
@@ -89,6 +89,7 @@ pub(crate) fn run(ctx: &Ctx, args: &Args, out: &mut dyn Write) -> Result<(), Ref
     let cache = ctx.platform.cache_dir();
     fs::create_dir_all(&cache)
         .map_err(|e| dfm_engine::fsys::io(&cache.display().to_string(), &e))?;
+    closed(home, &cache.join(LOCK), sys.uid)?;
     let _held = Lock::acquire(&sys, &Dir::open_plain(&cache)?, LOCK)?;
     if holds(&data, &commit) {
         writeln!(
@@ -116,6 +117,10 @@ pub(crate) fn run(ctx: &Ctx, args: &Args, out: &mut dyn Write) -> Result<(), Ref
     }
     let dir = cache.join("self-update");
     let file = stage_script(&dir, &script.stdout)?;
+    if let Err(e) = closed(home, &file, sys.uid) {
+        let _ = fs::remove_dir_all(&dir);
+        return Err(e);
+    }
     writeln!(out, "self-update: installing {shown}").map_err(w)?;
     out.flush().map_err(w)?;
     let status = bootstrap(ctx, &file, src, &commit);
@@ -232,14 +237,43 @@ fn holds(data: &Path, commit: &str) -> bool {
         })
 }
 
-/// The recorded checkout, or `None` when no self-update has recorded one.
-fn recorded(data: &Path) -> Result<Option<PathBuf>, Refusal> {
+/// The rule of the script's `check_private_path`: HOME and every existing ancestor of `path`
+/// below it are real directories of the current user closed to group and others, so no other
+/// user can swap what self-update reads or runs there.
+fn closed(home: &Path, path: &Path, uid: u32) -> Result<(), Refusal> {
+    let shown = home.display().to_string();
+    let md = fs::metadata(home).map_err(|e| dfm_engine::fsys::io(&shown, &e))?;
+    crate::controls_fs::closed_entry(&md, &shown, uid)
+        .and_then(|()| crate::controls_fs::closed_ancestors(home, path, uid))
+        .map_err(|why| {
+            Refusal::new(
+                Code::StorageInvalid,
+                format!("{why}; self-update reads and runs code below it. Fix the ownership or mode (chmod go-w)"),
+            )
+        })
+}
+
+/// The recorded checkout, or `None` when no self-update has recorded one. The record names the
+/// code that self-update builds, so it gets the rule of [`closed`] and must be a regular file of
+/// the current user closed to group and others.
+fn recorded(home: &Path, data: &Path, uid: u32) -> Result<Option<PathBuf>, Refusal> {
     let path = data.join(RECORD);
-    let text = match fs::read_to_string(&path) {
-        Ok(t) => t,
+    let md = match fs::symlink_metadata(&path) {
+        Ok(md) => md,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(dfm_engine::fsys::io(&path.display().to_string(), &e)),
     };
+    closed(home, &path, uid)?;
+    let shown = path.display().to_string();
+    if !md.is_file() {
+        return Err(Refusal::new(
+            Code::StorageInvalid,
+            format!("{shown} is not a regular file"),
+        ));
+    }
+    crate::controls_fs::closed_entry(&md, &shown, uid)
+        .map_err(|why| Refusal::new(Code::StorageInvalid, why))?;
+    let text = fs::read_to_string(&path).map_err(|e| dfm_engine::fsys::io(&shown, &e))?;
     let line = text.strip_suffix('\n').unwrap_or(&text);
     if !line.starts_with('/') || line.chars().any(char::is_control) {
         return Err(Refusal::new(
@@ -257,7 +291,13 @@ fn recorded(data: &Path) -> Result<Option<PathBuf>, Refusal> {
 fn record(data: &Path, src: &str) -> Result<(), Refusal> {
     let path = data.join(RECORD);
     let tmp = data.join(format!("{RECORD}.tmp-{}", std::process::id()));
-    fs::write(&tmp, format!("{src}\n"))
+    let _ = fs::remove_file(&tmp);
+    fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&tmp)
+        .and_then(|mut f| f.write_all(format!("{src}\n").as_bytes()))
         .and_then(|()| fs::rename(&tmp, &path))
         .map_err(|e| {
             let _ = fs::remove_file(&tmp);
