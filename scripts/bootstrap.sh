@@ -2,7 +2,7 @@
 # Bootstrap the dotfiles manager from a verified source checkout.
 # Contract: docs/architecture.md section 12. Procedure and limits: docs/bootstrap.md.
 #
-#   bootstrap.sh install [--source <git checkout | https:// or file:// URL>] --commit <40 hex>
+#   bootstrap.sh install [--source <git checkout | https:// or file:// URL>] [--commit <40 hex>]   (default: the source's HEAD)
 #   bootstrap.sh check-controls --source <staged tree>   (read-only)
 #   bootstrap.sh uninstall
 #   bootstrap.sh toolchain-digest --dir <installed toolchain>   (value for the lock)
@@ -679,11 +679,13 @@ check_source() {
 }
 
 cmd_install() {
-  [ -n "${commit:-}" ] || usage "install needs --commit"
   # The pin is a full-length lowercase object id and nothing else: no abbreviation, ref, tag,
-  # revision syntax (^, ~, @{}), option-like value or whitespace ever reaches git.
-  case $commit in ""|*[!0-9a-f]*) refuse E_SOURCE_UNTRUSTED "--commit must be a full lowercase hex object id (40 or 64 digits)" ;; esac
-  case ${#commit} in 40) fmt=sha1 ;; 64) fmt=sha256 ;; *) refuse E_SOURCE_UNTRUSTED "--commit must be a full lowercase hex object id (40 or 64 digits)" ;; esac
+  # revision syntax (^, ~, @{}), option-like value or whitespace ever reaches git. Without
+  # --commit it is the HEAD of the source's bare clone, resolved after the clone (DFM-71).
+  if [ -n "$commit" ]; then
+    case $commit in *[!0-9a-f]*) refuse E_SOURCE_UNTRUSTED "--commit must be a full lowercase hex object id (40 or 64 digits)" ;; esac
+    case ${#commit} in 40) fmt=sha1 ;; 64) fmt=sha256 ;; *) refuse E_SOURCE_UNTRUSTED "--commit must be a full lowercase hex object id (40 or 64 digits)" ;; esac
+  fi
   [ -n "$src" ] || printf 'bootstrap: no --source given; the source is %s\n' "$ORIGIN" >&2
   resolve_home; check_platform
   # /usr/bin/git is the Command Line Tools shim, so the tools are probed before any git call.
@@ -739,6 +741,15 @@ cmd_install() {
   git_clean -c transfer.fsckObjects=true clone --bare --quiet -- "$clone_url" "$build/source.git" ||
     refuse E_SOURCE_UNTRUSTED "cannot clone $shown_url (a source whose objects fail git's transfer checks is refused)"
   src=$build/source.git
+  if [ -z "$commit" ]; then
+    # The commit the source has checked out (a local checkout) or its default branch (a URL).
+    commit=$(git_clean -C "$src" rev-parse --verify --end-of-options 'HEAD^{commit}' 2>/dev/null) || commit=
+    case $commit in *[!0-9a-f]*) commit= ;; esac
+    case ${#commit} in 40) fmt=sha1 ;; 64) fmt=sha256 ;; *) refuse E_SOURCE_UNTRUSTED "$shown_url has no HEAD commit to install; give --commit <full sha>" ;; esac
+    # A remote's default branch is decided by whoever controls the remote, not by the owner.
+    case $clone_url in https://*) unpinned=' (not pinned: the remote decides what is built; give --commit to pin it)' ;; *) unpinned= ;; esac
+    printf 'bootstrap: no --commit given; installing %s, the HEAD of %s%s\n' "$commit" "$shown_url" "$unpinned" >&2
+  fi
   check_source
   # Build the verified commit itself, not whatever HEAD is. Both steps are checked: a pipe would hide
   # the status of git archive.
@@ -873,6 +884,8 @@ while [ $# -gt 0 ]; do
 done
 # An empty --source is a usage error; only an absent one means the canonical origin.
 case $seen in *" --source "*) [ -n "$src" ] || usage "--source needs a non-empty value" ;; esac
+# Likewise an empty --commit; only an absent one means the source's HEAD.
+case $seen in *" --commit "*) [ -n "$commit" ] || usage "--commit needs a non-empty value" ;; esac
 # Relative arguments become absolute so a later cd cannot be redirected. A URL stays as it is.
 case $src in ""|/*|*://*) ;; *) src=$PWD/$src ;; esac
 case $dir in ""|/*) ;; *) dir=$PWD/$dir ;; esac
@@ -897,5 +910,5 @@ case $cmd in
   check-controls)
     [ -n "$src" ] || usage "check-controls needs --source"
     resolve_home; controls "$src"; echo "build controls ok" ;;
-  *) usage "usage: bootstrap.sh install [--source <git checkout or URL>] --commit <sha> | check-controls --source <tree> | uninstall" ;;
+  *) usage "usage: bootstrap.sh install [--source <git checkout or URL>] [--commit <sha>] | check-controls --source <tree> | uninstall" ;;
 esac
