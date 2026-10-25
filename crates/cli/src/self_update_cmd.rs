@@ -2,7 +2,7 @@
 //! target commit's own `scripts/bootstrap.sh install` (DFM-72, docs/bootstrap.md "Self-update").
 //! The build, the controls, `self-check` and the `current` flip stay in the script; this command
 //! picks the source and the commit. The script is the committed blob, read from a bare clone with
-//! `transfer.fsckObjects`, so a replaced object in the checkout is refused before anything runs.
+//! `transfer.fsckObjects`, so a replaced object in the checkout is refused or never served.
 
 use crate::sync_cmd::Git;
 use crate::{Ctx, flags, header, usage};
