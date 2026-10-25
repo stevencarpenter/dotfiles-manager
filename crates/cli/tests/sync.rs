@@ -581,6 +581,47 @@ fn local_commits_that_upstream_lacks_are_refused_and_kept() {
 }
 
 #[test]
+fn a_checkout_ahead_of_its_ref_is_current_and_applies_as_it_is() {
+    let fx = Fx::new();
+    let upstream = fx.upstream.head();
+    // Local work on a branch, one commit on top of the ref, and nothing new upstream.
+    git(&fx.root, &["checkout", "-q", "-b", "topic"]);
+    put(
+        &fx.root,
+        "base/modules/extra/files/zshrc",
+        "export A=local\n",
+    );
+    git(&fx.root, &["commit", "-q", "-am", "local work"]);
+    let mine = fx.head();
+    let p = fx.preview();
+    assert_eq!(code(&p), 0, "{}\n{}", stdout(&p), stderr(&p));
+    let current = format!("current at {mine} (ahead of {upstream})");
+    assert!(
+        stdout(&p).contains(&format!(
+            "source: src0 {} refs/heads/main {current} (tracking)",
+            fx.origin()
+        )),
+        "{}",
+        stdout(&p)
+    );
+    let o = fx.sync(&digest_of(&p));
+    assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
+    let s = stdout(&o);
+    assert!(s.contains(&format!("published: src0 {current}")), "{s}");
+    assert!(s.contains("result: ok"), "{s}");
+    assert_eq!(fx.head(), mine);
+    assert_eq!(
+        git(&fx.root, &["rev-parse", "--abbrev-ref", "HEAD"]),
+        "topic"
+    );
+    assert!(fx.h(".zshrc").is_symlink());
+    assert_eq!(
+        fs::read_to_string(fx.h(".zshrc")).unwrap(),
+        "export A=local\n"
+    );
+}
+
+#[test]
 fn a_local_edit_the_update_would_overwrite_is_refused_and_kept() {
     let fx = Fx::new();
     let old = fx.head();
@@ -765,6 +806,24 @@ fn an_exact_nested_pin_stays_exact_while_the_root_tracks() {
     );
     assert_eq!(git(&nested, &["rev-parse", "HEAD"]), pin);
     assert_eq!(fx.receipts(), 1);
+    // A local commit on top of the pin is kept: the source is current at it, not moved back.
+    put(&nested, "modules/work/files/profile", "work=local\n");
+    git(&nested, &["commit", "-q", "-am", "local work"]);
+    let mine = git(&nested, &["rev-parse", "HEAD"]);
+    let o = fx.sync_approved();
+    assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
+    assert!(
+        stdout(&o).contains(&format!(
+            "published: src1 current at {mine} (ahead of {pin})"
+        )),
+        "{}",
+        stdout(&o)
+    );
+    assert_eq!(git(&nested, &["rev-parse", "HEAD"]), mine);
+    assert_eq!(
+        fs::read_to_string(fx.h(".config/work/profile")).unwrap(),
+        "work=local\n"
+    );
 }
 
 #[test]
