@@ -9,6 +9,7 @@ mod controls_fs;
 mod doctor_cmd;
 mod plan_cmd;
 mod read_fs;
+mod self_update_cmd;
 mod source_fs;
 mod state_cmd;
 mod sync_cmd;
@@ -53,6 +54,7 @@ usage:
                                [--preview] [-y|--yes-plan <digest>]
   dfm sync [--root <dir>] [--preview] [-y|--yes-plan <digest>] [--allow-disruptive <operation-id>]...
                                [--allow-adopt <operation-id>]... [--trust-origin <origin>]...
+  dfm self-update [--source <checkout>] [--commit <sha>]
   dfm self-check --build-controls <staged tree>
   dfm self-check --fixture-dir <dir>
 
@@ -136,6 +138,12 @@ happens before that). With --yes-plan it rechecks the sources under the lock, fa
 checkout (never reset, clean, stash, rebase, commit or push; divergence and overwritten local
 changes are refused), then runs apply once with the same digest. A pin is never rewritten.
 --preview fetches into staging and changes nothing else. See docs/sync.md.
+
+self-update rebuilds and installs the manager from a local dotfiles-manager checkout: it reads
+scripts/bootstrap.sh of the commit (--commit, else the checkout's HEAD) and runs its install with
+that commit, so the build and every check are the script's. --source names the checkout once;
+later runs reuse it. A commit that current already points at is not built again. It never pulls:
+run git pull in the checkout first. See docs/bootstrap.md.
 
 An operation that ended unknown (E_OP_INTERRUPTED) blocks its path in every later run. Each apply
 checks the path again and settles the entry when the result is clear. state recover does only that:
@@ -464,6 +472,10 @@ fn dispatch(args: &[String], out: &mut dyn Write) -> Result<(), Refusal> {
         "sync" => {
             let args = sync_cmd::parse_args(rest)?;
             sync_cmd::run(&context(home)?, &args, out)
+        }
+        "self-update" => {
+            let args = self_update_cmd::parse_args(rest)?;
+            self_update_cmd::run(&context(home)?, &args, out)
         }
         "self-check" => {
             let [controls, fixture] = flags(rest, ["--build-controls", "--fixture-dir"])?;
