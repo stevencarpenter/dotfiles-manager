@@ -2731,6 +2731,38 @@ mod self_update {
         assert!(!record.exists());
     }
 
+    /// `cat-file` in the checkout serves a replaced loose object as is; the script is read from a
+    /// verified clone instead, so the substitute never runs and nothing is recorded.
+    #[test]
+    fn self_update_refuses_a_replaced_loose_object_before_running_it() {
+        let p = prepare_with("self-update-tampered", fake_toolchain("exit 0".into()));
+        let path = format!("{}:scripts/bootstrap.sh", p.sha);
+        let blob = git(&p.src, &["rev-parse", &path]);
+        let other = p.tmp.path().join("other");
+        fs::write(&other, "echo ran >&2\n").unwrap();
+        let oid = git(&p.src, &["hash-object", "-w", other.to_str().unwrap()]);
+        let obj = |id: &str| {
+            p.src
+                .join(format!(".git/objects/{}/{}", &id[..2], &id[2..]))
+        };
+        fs::set_permissions(obj(&blob), fs::Permissions::from_mode(0o644)).unwrap();
+        fs::copy(obj(&oid), obj(&blob)).unwrap();
+        assert_eq!(git(&p.src, &["cat-file", "blob", &path]), "echo ran >&2");
+        let o = dfm(
+            &p.home,
+            &["self-update", "--source", p.src.to_str().unwrap()],
+        );
+        assert_eq!(o.status.code(), Some(3), "{}", err(&o));
+        assert!(
+            err(&o).contains("E_SOURCE_UNTRUSTED") && !err(&o).lines().any(|l| l == "ran"),
+            "{}",
+            err(&o)
+        );
+        assert!(!String::from_utf8_lossy(&o.stdout).contains("self-update: installing"));
+        assert!(!p.data.join("source").exists() && !p.data.join("current").exists());
+        assert!(!p.home.join(".cache/dotfiles-manager/self-update").exists());
+    }
+
     #[test]
     fn self_update_flags_are_checked_before_anything_runs() {
         let tmp = TempDir::new("self-update-flags");

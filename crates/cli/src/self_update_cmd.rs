@@ -1,8 +1,8 @@
 //! `dfm self-update`: rebuilds and installs the manager from a local checkout by running the
 //! target commit's own `scripts/bootstrap.sh install` (DFM-72, docs/bootstrap.md "Self-update").
 //! The build, the controls, `self-check` and the `current` flip stay in the script; this command
-//! picks the source and the commit. The script is the committed blob, read from the checkout's
-//! objects, so for honest objects its identity check against the commit passes.
+//! picks the source and the commit. The script is the committed blob, read from a bare clone with
+//! `transfer.fsckObjects`, so a replaced object in the checkout is refused before anything runs.
 
 use crate::sync_cmd::Git;
 use crate::{Ctx, flags, header, usage};
@@ -100,22 +100,6 @@ pub(crate) fn run(ctx: &Ctx, args: &Args, out: &mut dyn Write) -> Result<(), Ref
         .map_err(w)?;
         return record(&data, src);
     }
-    let script = git.output(
-        true,
-        &[
-            "-C",
-            src,
-            "cat-file",
-            "blob",
-            &format!("{commit}:scripts/bootstrap.sh"),
-        ],
-    )?;
-    if !script.success() || script.stdout.is_empty() {
-        return Err(Refusal::new(
-            Code::SourceMissing,
-            format!("commit {commit} has no scripts/bootstrap.sh"),
-        ));
-    }
     let dir = cache.join("self-update");
     // Staging replaces `dir`; a checkout in it would go with it, uncommitted work included. The
     // cache path passed `closed` (no symlink), so the comparison of the spellings is enough.
@@ -129,11 +113,15 @@ pub(crate) fn run(ctx: &Ctx, args: &Args, out: &mut dyn Write) -> Result<(), Ref
             ),
         ));
     }
-    let file = stage_script(&dir, &script.stdout)?;
-    if let Err(e) = closed(home, &file, sys.uid) {
-        let _ = fs::remove_dir_all(&dir);
-        return Err(e);
-    }
+    let file = stage_script(&git, &dir, src, &commit)
+        .and_then(|file| closed(home, &file, sys.uid).map(|()| file));
+    let file = match file {
+        Ok(file) => file,
+        Err(e) => {
+            let _ = fs::remove_dir_all(&dir);
+            return Err(e);
+        }
+    };
     writeln!(out, "self-update: installing {shown}").map_err(w)?;
     out.flush().map_err(w)?;
     let status = bootstrap(ctx, &file, src, &commit);
@@ -226,19 +214,62 @@ fn active(data: &Path, commit: &str) -> &'static str {
 }
 
 /// Writes the script into a fresh private directory under the cache directory, outside the build
-/// directory that `install` resets. Only the holder of [`LOCK`] gets here.
-fn stage_script(dir: &Path, script: &[u8]) -> Result<PathBuf, Refusal> {
+/// directory that `install` resets. Only the holder of [`LOCK`] gets here. The blob is read from a
+/// bare `file://` clone there: `cat-file` in the checkout serves a replaced loose object as is,
+/// while the clone checks every object (`transfer.fsckObjects`), as the script's own clone does.
+fn stage_script(git: &Git, dir: &Path, src: &str, commit: &str) -> Result<PathBuf, Refusal> {
     let io = |e: std::io::Error| dfm_engine::fsys::io(&dir.display().to_string(), &e);
     let _ = fs::remove_dir_all(dir);
     fs::create_dir_all(dir).map_err(io)?;
     fs::set_permissions(dir, fs::Permissions::from_mode(0o700)).map_err(io)?;
+    let clone = dir.join("source.git");
+    let clone = clone.to_str().ok_or_else(|| {
+        Refusal::new(
+            Code::StorageInvalid,
+            format!("{} is not a UTF-8 path", dir.display()),
+        )
+    })?;
+    git.run(
+        true,
+        Code::SourceUntrusted,
+        &format!(
+            "clone {} (a source whose objects fail git's transfer checks is refused)",
+            visible(src)
+        ),
+        &[
+            "clone",
+            "--bare",
+            "--quiet",
+            "--",
+            &format!("file://{}", src.replace('%', "%25")),
+            clone,
+        ],
+    )?;
+    let script = git.output(
+        true,
+        &[
+            "-C",
+            clone,
+            "cat-file",
+            "blob",
+            &format!("{commit}:scripts/bootstrap.sh"),
+        ],
+    )?;
+    if !script.success() || script.stdout.is_empty() {
+        return Err(Refusal::new(
+            Code::SourceMissing,
+            format!(
+                "commit {commit} has no scripts/bootstrap.sh, or no ref of the checkout reaches it"
+            ),
+        ));
+    }
     let file = dir.join("bootstrap.sh");
     fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .mode(0o600)
         .open(&file)
-        .and_then(|mut f| f.write_all(script))
+        .and_then(|mut f| f.write_all(&script.stdout))
         .map_err(io)?;
     Ok(file)
 }
