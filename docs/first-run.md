@@ -24,12 +24,14 @@ Board ticket: DFM-46. The agent runs nothing live without written approval that 
    The block runs in a subshell. If it prints `stopped` or any error, or the status is not 0, do not go on to step 3.
 
    The copy must be a real directory, not a symlink, made as your own user and not with `sudo`: the script refuses a toolchain entry that another user owns (`E_TOOLCHAIN_MISMATCH`). The printed digest must equal `toolchain_tree_sha256` in `dotfiles-manager.lock` before `install`. The digest is device-specific. The M3 may need its own lock later.
-2. Choose the commit to install. The integration branch is `going-to-sleep`. Use the full 40-character object id.
+2. Check out the commit to install, usually `main` after `git pull --ff-only`. The script builds the commit the checkout has checked out (its HEAD), not uncommitted files.
 3. Run the bootstrap script (not with `env -i`: it clears `HOME` and the script refuses with `E_HOME_MISMATCH`; the script scrubs its own environment):
 
    ```sh
-   /bin/sh scripts/bootstrap.sh install --source "$PWD" --commit <full sha>
+   /bin/sh scripts/bootstrap.sh install --source "$PWD"
    ```
+
+   It names the commit on stderr (`bootstrap: no --commit given; installing <full sha>, ...`). To install another commit, add `--commit <full 40-character sha>`.
 
    It checks Command Line Tools, the pinned toolchain, the staged tree and the build controls before any `cargo` process starts. It runs `cargo fetch --locked`, which needs network access, then builds offline, runs `self-check`, then installs `~/.local/bin/dfm` through a `current` symlink. A failed build leaves no installed binary.
 4. Check: `dfm --version` prints the semver and the commit. The output must not contain `test-isolation`; the release binary ignores every isolation override.

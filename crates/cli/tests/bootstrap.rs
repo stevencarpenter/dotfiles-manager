@@ -316,7 +316,27 @@ fn missing_toolchain_wrong_commit_and_hostile_repo_config_are_refused_before_mut
         err(&o)
     );
 
-    for bad in [vec!["install"], vec!["bogus"], vec!["install", "--nope"]] {
+    // Without --commit, a source with no HEAD commit has nothing to install.
+    let empty = tmp.path().join("empty");
+    git(tmp.path(), &["init", "-q", empty.to_str().unwrap()]);
+    let o = script_test_mode(
+        &home,
+        &["install", "--source", empty.to_str().unwrap()],
+        &[],
+    );
+    assert_eq!(o.status.code(), Some(3), "{}", err(&o));
+    assert!(
+        err(&o).contains("has no HEAD commit to install; give --commit"),
+        "{}",
+        err(&o)
+    );
+
+    // Not `install` alone: without --commit and --source it clones the canonical origin.
+    for bad in [
+        vec!["install", "--commit"],
+        vec!["bogus"],
+        vec!["install", "--nope"],
+    ] {
         assert_eq!(
             script_test_mode(&home, &bad, &[]).status.code(),
             Some(2),
@@ -2739,6 +2759,38 @@ mod self_update {
     }
 }
 
+/// Without --commit the pin is the HEAD of the source, named on stderr; the next commit is the
+/// next default.
+#[test]
+fn install_without_commit_builds_the_head_of_the_source() {
+    let p = prepare_with("fake-head", fake_toolchain("exit 0".into()));
+    let src = p.src.to_str().unwrap();
+    for round in 0..2 {
+        let sha = match round {
+            0 => p.sha.clone(),
+            _ => next_commit(&p, "second"),
+        };
+        let o = script_test_mode(&p.home, &["install", "--source", src], &[]);
+        assert_eq!(o.status.code(), Some(0), "{}", err(&o));
+        assert!(
+            err(&o).contains(&format!("no --commit given; installing {sha}")),
+            "{}",
+            err(&o)
+        );
+        assert!(
+            String::from_utf8_lossy(&o.stdout).contains(&format!("source commit {sha}")),
+            "{}",
+            String::from_utf8_lossy(&o.stdout)
+        );
+        assert!(
+            fs::read_link(p.data.join("current"))
+                .unwrap()
+                .to_string_lossy()
+                .ends_with(&sha[..12])
+        );
+    }
+}
+
 /// The install path of the old-link rule, without network: ours is removed with a message; a
 /// foreign link and a regular file are kept and each named by its own message.
 #[test]
@@ -2987,6 +3039,11 @@ fn repeated_flags_and_flags_the_command_does_not_use_are_usage_errors() {
         (
             vec!["install", "--source", "", "--commit", "a"],
             "--source needs a non-empty value",
+        ),
+        // Likewise --commit: only a missing flag means the source's HEAD.
+        (
+            vec!["install", "--source", "x", "--commit", ""],
+            "--commit needs a non-empty value",
         ),
     ] {
         let o = script_test_mode(&home, &args, &[]);
