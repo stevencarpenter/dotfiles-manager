@@ -2731,6 +2731,32 @@ mod self_update {
         assert!(!record.exists());
     }
 
+    /// The recorded checkout is resolved like --source: moved into the staging directory behind a
+    /// symlink at its recorded path, it is refused and kept, never removed with the staging.
+    #[test]
+    fn self_update_resolves_the_recorded_checkout_before_the_staging_check() {
+        let p = prepare_with("self-update-moved", fake_toolchain("exit 0".into()));
+        let o = dfm(
+            &p.home,
+            &["self-update", "--source", p.src.to_str().unwrap()],
+        );
+        assert_eq!(o.status.code(), Some(0), "{}", err(&o));
+        next_commit(&p, "second");
+        fs::write(p.src.join("WORK"), "uncommitted\n").unwrap();
+        let inner = p.home.join(".cache/dotfiles-manager/self-update/inner");
+        fs::create_dir_all(inner.parent().unwrap()).unwrap();
+        fs::rename(&p.src, &inner).unwrap();
+        std::os::unix::fs::symlink(&inner, &p.src).unwrap();
+        let o = dfm(&p.home, &["self-update"]);
+        assert_eq!(o.status.code(), Some(3), "{}", err(&o));
+        assert!(
+            err(&o).contains("E_CONFLICT") && err(&o).contains("which self-update replaces"),
+            "{}",
+            err(&o)
+        );
+        assert!(inner.join("WORK").exists(), "the checkout was removed");
+    }
+
     /// `cat-file` in the checkout serves a replaced loose object as is; the script is read from a
     /// verified clone instead, so the substitute never runs and nothing is recorded.
     #[test]

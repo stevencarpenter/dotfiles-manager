@@ -57,11 +57,24 @@ pub(crate) fn run(ctx: &Ctx, args: &Args, out: &mut dyn Write) -> Result<(), Ref
     let source = match &args.source {
         Some(s) => fs::canonicalize(s)
             .map_err(|e| usage(format!("--source {}: {}", visible(s), e.kind())))?,
-        None => recorded(home, &data, sys.uid)?.ok_or_else(|| {
-            usage(
-                "self-update needs --source <dotfiles-manager checkout> once; later runs reuse it",
-            )
-        })?,
+        None => {
+            let path = recorded(home, &data, sys.uid)?.ok_or_else(|| {
+                usage(
+                    "self-update needs --source <dotfiles-manager checkout> once; later runs reuse it",
+                )
+            })?;
+            // The record keeps one spelling; a symlink on it may now lead into the staging dir.
+            fs::canonicalize(&path).map_err(|e| {
+                Refusal::new(
+                    Code::SourceMissing,
+                    format!(
+                        "the recorded checkout {}: {}; run dfm self-update --source <checkout>",
+                        path.display(),
+                        e.kind()
+                    ),
+                )
+            })?
+        }
     };
     let src = source
         .to_str()
