@@ -763,8 +763,11 @@ cmd_install() {
   refuse_code=1 # the first change outside the scratch build directory is next; refusals after it are failures
   for d in cargo-home rustup-home build-home; do rm -rf "${DATA:?}/$d"; mkdir -p "$DATA/$d"; done
   cd "$build"
+  # rust-objcopy (the release strip step) has only the rpath @loader_path/../lib, which misses
+  # $TC/lib/libLLVM.dylib; rustup sets this fallback for the same reason.
   tcrun() { /usr/bin/env -i PATH="$TC/bin:$SYSPATH" HOME="$DATA/build-home" CARGO_HOME="$DATA/cargo-home" \
-    RUSTUP_HOME="$DATA/rustup-home" RUSTC="$TC/bin/rustc" LANG=C DFM_BUILD_COMMIT="$commit" "$@"; }
+    RUSTUP_HOME="$DATA/rustup-home" RUSTC="$TC/bin/rustc" DYLD_FALLBACK_LIBRARY_PATH="$TC/lib" \
+    LANG=C DFM_BUILD_COMMIT="$commit" "$@"; }
   # Check the toolchain again immediately before it first runs.
   got=$(toolchain_digest "$TC") || got=
   [ -n "$got" ] && [ "$got" = "$TREE" ] || refuse E_TOOLCHAIN_MISMATCH "toolchain $PIN changed after the check"
