@@ -13,7 +13,8 @@ use crate::plan_cmd::{plan_for, render};
 use crate::read_fs::read_regular_bounded;
 use crate::source_fs::load_scoped;
 use crate::{
-    Ctx, Loaded, apply_cmd, builtin_catalog, canonical_root, require_binding, state_cmd, usage,
+    Ctx, Loaded, apply_cmd, builtin_catalog, canonical_root, paint, require_binding, state_cmd,
+    usage,
 };
 use dfm_engine::{Dir, End, Lock as FileLock, ProcRequest, Runner, Store, Sys, now_ns};
 use dfm_model::binding::Binding;
@@ -1026,7 +1027,12 @@ pub fn run(ctx: &Ctx, args: &Args, out: &mut dyn Write) -> Result<(), Refusal> {
     if let Err(e) = &r
         && plan_printed
     {
-        let _ = writeln!(out, "result: {}", e.exit().name());
+        let _ = writeln!(
+            out,
+            "{} {}",
+            paint::label(ctx.color, "result:"),
+            paint::status(ctx.color, e.exit().name())
+        );
     }
     r
 }
@@ -1100,7 +1106,8 @@ fn run_inner(
     for s in &previewed {
         writeln!(
             out,
-            "source: {} {} {} {} ({})",
+            "{} {} {} {} {} ({})",
+            paint::label(ctx.color, "source:"),
             s.src.id,
             s.src.origin,
             s.src.reference,
@@ -1116,12 +1123,12 @@ fn run_inner(
     // The digest shown, and the one --yes-plan takes, is the sync digest.
     let applying = args.apply.yes_plan.is_some() && !args.apply.preview;
     if !applying {
-        render(&plan, &digest, out).map_err(w)?;
+        render(&plan, &digest, ctx.color, out).map_err(w)?;
         *plan_printed = true;
     }
     // The checks apply runs before its lock (docs/apply.md), against the sync digest, so a plan
     // that apply would refuse is refused here before any source is published.
-    apply_cmd::check_before_lock(
+    let journal_open = apply_cmd::check_before_lock(
         ctx,
         &args.apply,
         &plan,
@@ -1130,6 +1137,13 @@ fn run_inner(
         out,
     )?;
     if args.apply.preview {
+        return Ok(());
+    }
+    // A source that moves is a publication, so only a run with every source current can end here.
+    if previewed.iter().all(|s| s.old.as_ref() == Some(&s.new))
+        && apply_cmd::end_without_change(&args.apply, &plan, journal_open, ctx.color, out)
+            .map_err(w)?
+    {
         return Ok(());
     }
     let Some(approved) = &args.apply.yes_plan else {

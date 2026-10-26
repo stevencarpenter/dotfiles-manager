@@ -7,6 +7,7 @@ mod adapters;
 mod apply_cmd;
 mod controls_fs;
 mod doctor_cmd;
+mod paint;
 mod plan_cmd;
 mod read_fs;
 mod self_update_cmd;
@@ -83,10 +84,11 @@ for every row, status prints one block per row. --json prints the same rows as o
 See docs/doctor.md.
 
 apply plans again, prints the plan and exits 3 (E_APPROVAL_REQUIRED) unless --yes-plan carries the
-digest of that exact plan. Then it publishes file links and removes previously owned outputs,
-journals each step and writes a receipt. A removal also needs --allow-disruptive <operation-id>.
-An existing link that is exactly the planned link is adopted (ownership is recorded, nothing is
-written) only with --allow-adopt <operation-id>.
+digest of that exact plan. A plan that changes nothing needs no digest: it exits 0. Otherwise it
+publishes file links and removes previously owned outputs, journals each step and writes a receipt.
+A removal also needs --allow-disruptive <operation-id>. An existing link that is exactly the
+planned link is adopted (ownership is recorded, nothing is written) only with --allow-adopt
+<operation-id>.
 --preview prints the plan and its digest and changes nothing.
 
 secrets is apply over the secret resources only (op-template/v1): every other resource is listed as
@@ -177,6 +179,8 @@ struct Ctx {
     os: String,
     arch: String,
     isolated: Option<String>,
+    /// Color the text output: stdout is a terminal (`paint::enabled`).
+    color: bool,
 }
 
 impl Ctx {
@@ -280,6 +284,7 @@ fn context(home: Option<String>) -> Result<Ctx, Refusal> {
         os,
         arch,
         isolated,
+        color: paint::enabled(&std::io::stdout()),
     })
 }
 
@@ -293,6 +298,7 @@ fn context(_home: Option<String>) -> Result<Ctx, Refusal> {
         os: os.into(),
         arch: arch.into(),
         isolated: None,
+        color: paint::enabled(&std::io::stdout()),
     })
 }
 
@@ -354,7 +360,8 @@ pub fn run(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> Exit {
     match dispatch(args, out) {
         Ok(()) => Exit::Ok,
         Err(r) => {
-            let _ = writeln!(err, "error: {}", bounded(&r.to_string()));
+            let tag = paint::style(paint::enabled(&std::io::stderr()), "1;31", "error:");
+            let _ = writeln!(err, "{tag} {}", bounded(&r.to_string()));
             r.exit()
         }
     }

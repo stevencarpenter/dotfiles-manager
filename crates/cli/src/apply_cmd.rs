@@ -11,7 +11,7 @@
 
 use crate::adapters::Generators;
 use crate::plan_cmd::{Probed, plan_for, render};
-use crate::{Ctx, load_resolved, require_binding, state_cmd, usage};
+use crate::{Ctx, load_resolved, paint, require_binding, state_cmd, usage};
 use dfm_engine::{
     Approval as Allowance, Dir, Generator, Run, Store, Sys, apply, check_allowances,
     check_journal_capacity, gates, now_ns,
@@ -165,7 +165,8 @@ fn counts_line(counts: &BTreeMap<Status, u32>) -> String {
 /// The checks between the printed plan and the writer lock, shared with `sync`: the approved
 /// digest must be the plan's, the plan must have no blocker, the gates that need no write must
 /// pass, the `--allow-*` sets must equal the plan's, and the journal must have room. A refusal
-/// here changes nothing. The missing allowances are printed to paste.
+/// here changes nothing. The missing allowances are printed to paste. Returns whether the
+/// journal holds earlier work that is unfinished or has an unknown outcome.
 pub(crate) fn check_before_lock(
     ctx: &Ctx,
     args: &Args,
@@ -173,7 +174,7 @@ pub(crate) fn check_before_lock(
     digest: &str,
     generator: &dyn Generator,
     out: &mut dyn Write,
-) -> Result<(), Refusal> {
+) -> Result<bool, Refusal> {
     let w =
         |e: std::io::Error| Refusal::new(Code::IoFailed, format!("output failed: {}", e.kind()));
     // A digest that no longer matches is the first thing to report: the reviewer approved a
@@ -207,11 +208,37 @@ pub(crate) fn check_before_lock(
     let (layout, sys) = (ctx.layout(), ctx.sys()?);
     let readable = Store::open_read(sys, &layout, state_cmd::fail_from_env()?)?
         .ok_or_else(crate::state_lost_refusal)?;
-    check_journal_capacity(
-        readable.journal_len()?,
-        readable.settlement_entries()?,
-        plan,
-    )
+    let settling = readable.settlement_entries()?;
+    check_journal_capacity(readable.journal_len()?, settling, plan)?;
+    // An unknown outcome with no intent is not settled, yet apply blocks the operation it names.
+    Ok(settling > 0 || !dfm_model::state::unresolved(&readable.read_journal_lenient()?).is_empty())
+}
+
+/// A run without `--yes-plan` whose plan writes nothing, with no open journal entry, has nothing
+/// to approve: it ends here, exit 0, without the lock and without a receipt, as the approved run
+/// would. Returns whether it ended.
+pub(crate) fn end_without_change(
+    args: &Args,
+    plan: &dfm_model::plan::Plan,
+    journal_open: bool,
+    color: bool,
+    out: &mut dyn Write,
+) -> std::io::Result<bool> {
+    if args.yes_plan.is_some() || journal_open || !plan.changes_nothing() {
+        return Ok(false);
+    }
+    writeln!(
+        out,
+        "{}",
+        paint::style(color, "1;32", "nothing to change: no approval needed")
+    )?;
+    writeln!(
+        out,
+        "{} {}",
+        paint::label(color, "result:"),
+        paint::status(color, "ok")
+    )?;
+    Ok(true)
 }
 
 /// What was printed so far, so a refusal prints its `result:` line exactly once.
@@ -244,7 +271,12 @@ pub fn run(ctx: &Ctx, args: &Args, out: &mut dyn Write) -> Result<(), Refusal> {
         && !progress.result_printed
     {
         // The printed result is the exit the process returns, from the same refusal.
-        let _ = writeln!(out, "result: {}", e.exit().name());
+        let _ = writeln!(
+            out,
+            "{} {}",
+            paint::label(ctx.color, "result:"),
+            paint::status(ctx.color, e.exit().name())
+        );
     }
     r
 }
@@ -311,10 +343,10 @@ fn run_inner(
     if let Some(i) = &ctx.isolated {
         writeln!(out, "isolated: true {i}").map_err(w)?;
     }
-    render(&plan, &digest, out).map_err(w)?;
+    render(&plan, &digest, ctx.color, out).map_err(w)?;
     progress.plan_printed = true;
     let generators = |loaded| generators_for(ctx, &sys, args.scope, loaded);
-    check_before_lock(ctx, args, &plan, &digest, &generators(&first), out)?;
+    let journal_open = check_before_lock(ctx, args, &plan, &digest, &generators(&first), out)?;
     // The credential gate (architecture section 10 item 2): a secrets run without a vault
     // session stops here, exit 3, before the lock and before any write. Nothing is rendered.
     if args.scope == Scope::Secrets {
@@ -322,6 +354,10 @@ fn run_inner(
     }
     stop()?;
     if args.preview {
+        return Ok(());
+    }
+    if end_without_change(args, &plan, journal_open, ctx.color, out).map_err(w)? {
+        progress.result_printed = true;
         return Ok(());
     }
     let Some(approved) = &args.yes_plan else {
@@ -508,7 +544,7 @@ fn run_inner(
         writeln!(
             out,
             "  {} {}{reload}{error}",
-            label(rec.status),
+            paint::status(ctx.color, label(rec.status)),
             visible(&op.id)
         )
         .map_err(w)?;
@@ -549,7 +585,13 @@ fn run_inner(
         (None, None) => Ok(()),
     };
     let final_exit = outcome.as_ref().err().map_or(Exit::Ok, Refusal::exit);
-    writeln!(out, "result: {}", final_exit.name()).map_err(w)?;
+    writeln!(
+        out,
+        "{} {}",
+        paint::label(ctx.color, "result:"),
+        paint::status(ctx.color, final_exit.name())
+    )
+    .map_err(w)?;
     progress.result_printed = true;
     outcome
 }

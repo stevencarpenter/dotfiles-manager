@@ -5,12 +5,12 @@
 //! and starts no process.
 
 use crate::read_fs::{read_regular_bounded, sha256_file};
-use crate::{Ctx, Loaded, load_resolved, read_existing_binding, usage};
+use crate::{Ctx, Loaded, load_resolved, paint, read_existing_binding, usage};
 use dfm_engine::{Dir, Fail, Store, merge, observe};
 use dfm_model::display::visible;
 use dfm_model::plan::{
-    self, Binary, Context, MAX_PLAN_BYTES, Owned, PackageState, Plan, Saved, Scope, ServiceFacts,
-    Stale, Status, source_identity,
+    self, Binary, Context, MAX_PLAN_BYTES, Operation, Owned, PackageState, Plan, Saved, Scope,
+    ServiceFacts, Stale, Status, source_identity,
 };
 use dfm_model::{Code, Refusal};
 use std::collections::{BTreeMap, BTreeSet};
@@ -236,33 +236,27 @@ fn mark_excluded(plan: &mut Plan, sources: &dfm_model::resolve::SourceSet) {
     }
 }
 
-pub(crate) fn render(p: &Plan, digest: &str, out: &mut dyn Write) -> std::io::Result<()> {
+pub(crate) fn render(
+    p: &Plan,
+    digest: &str,
+    color: bool,
+    out: &mut dyn Write,
+) -> std::io::Result<()> {
+    let label = |s: &str| paint::label(color, s);
     writeln!(
         out,
-        "plan: profile={} machine={} scope={}",
+        "{} profile={} machine={} scope={}",
+        label("plan:"),
         visible(&p.profile),
         p.machine_id,
         p.scope
     )?;
     for s in &p.sources {
-        writeln!(out, "source: {} {}", visible(&s.root), s.tree)?;
+        writeln!(out, "{} {} {}", label("source:"), visible(&s.root), s.tree)?;
     }
-    writeln!(out, "operations: {}", p.operations.len())?;
+    writeln!(out, "{} {}", label("operations:"), p.operations.len())?;
     for o in &p.operations {
-        let status = match o.status {
-            Status::Planned => "planned",
-            Status::Current => "current",
-            Status::Held => "held",
-            Status::NotInScope => "not_in_scope",
-            Status::Blocked => "blocked",
-        };
-        writeln!(
-            out,
-            "  {status} {} [{}] {}",
-            visible(&o.id),
-            visible(&o.module),
-            visible(&o.effect)
-        )?;
+        head_line(o, color, out)?;
         if !o.after.is_empty() {
             writeln!(out, "    after: {}", visible(&o.after.join(", ")))?;
         }
@@ -280,10 +274,11 @@ pub(crate) fn render(p: &Plan, digest: &str, out: &mut dyn Write) -> std::io::Re
             writeln!(out, "    sets: {}", visible(&o.sets.join(", ")))?;
         }
         if let Some(n) = o.excluded {
-            writeln!(out, "    note: contains {n} excluded entries, not hashed")?;
+            let note = paint::style(color, "33", "note:");
+            writeln!(out, "    {note} contains {n} excluded entries, not hashed")?;
             writeln!(
                 out,
-                "    note: apply refuses a link inside an excluded entry that is absolute or leaves the directory"
+                "    {note} apply refuses a link inside an excluded entry that is absolute or leaves the directory"
             )?;
         }
         // The fragments a merge layers over its declared values, by name, in merge order. The
@@ -293,10 +288,98 @@ pub(crate) fn render(p: &Plan, digest: &str, out: &mut dyn Write) -> std::io::Re
             writeln!(out, "    fragments: {}", visible(&names.join(", ")))?;
         }
     }
+    summary(p, color, out)?;
     for b in &p.blockers {
-        writeln!(out, "blocked: {}", visible(&b.refusal().to_string()))?;
+        writeln!(
+            out,
+            "{} {}",
+            paint::style(color, "1;31", "blocked:"),
+            visible(&b.refusal().to_string())
+        )?;
     }
-    writeln!(out, "plan digest: {digest}")
+    writeln!(
+        out,
+        "{} {}",
+        label("plan digest:"),
+        paint::style(color, "35", digest)
+    )
+}
+
+fn status_name(s: Status) -> &'static str {
+    match s {
+        Status::Planned => "planned",
+        Status::Current => "current",
+        Status::Held => "held",
+        Status::NotInScope => "not_in_scope",
+        Status::Blocked => "blocked",
+    }
+}
+
+fn head_line(o: &Operation, color: bool, out: &mut dyn Write) -> std::io::Result<()> {
+    writeln!(
+        out,
+        "  {} {} {} {}",
+        paint::status(color, status_name(o.status)),
+        visible(&o.id),
+        paint::style(color, "36", &format!("[{}]", visible(&o.module))),
+        visible(&o.effect)
+    )
+}
+
+const SUMMARY_SHOWN: usize = 20;
+
+/// The counts, then the id of each `blocked` and `planned` operation, blocked first, so the end
+/// of a long plan shows what needs attention. `not_in_scope` is only counted: in a packages or
+/// services plan every configuration operation has it.
+fn summary(p: &Plan, color: bool, out: &mut dyn Write) -> std::io::Result<()> {
+    let rank = |s: Status| match s {
+        Status::Blocked => 0,
+        Status::Planned => 1,
+        Status::Current | Status::Held | Status::NotInScope => 2,
+    };
+    let mut line = paint::label(color, "summary:");
+    for s in [
+        Status::Blocked,
+        Status::Planned,
+        Status::Current,
+        Status::Held,
+        Status::NotInScope,
+    ] {
+        let n = p.operations.iter().filter(|o| o.status == s).count();
+        if n > 0 {
+            let name = status_name(s);
+            let count = paint::style(color, paint::status_code(name), &format!("{name}={n}"));
+            line.push_str(&format!(" {count}"));
+        }
+    }
+    if p.operations.is_empty() {
+        line.push_str(" no operations");
+    }
+    if p.changes_nothing() {
+        line.push_str(&format!(
+            "; {}",
+            paint::style(color, "1;32", "nothing to change")
+        ));
+    }
+    writeln!(out, "{line}")?;
+    let mut listed: Vec<&Operation> = p.operations.iter().filter(|o| rank(o.status) < 2).collect();
+    listed.sort_by_key(|o| rank(o.status));
+    for o in listed.iter().take(SUMMARY_SHOWN) {
+        writeln!(
+            out,
+            "  {} {}",
+            paint::status(color, status_name(o.status)),
+            visible(&o.id)
+        )?;
+    }
+    if listed.len() > SUMMARY_SHOWN {
+        writeln!(
+            out,
+            "  {} more not shown here (see the operations above)",
+            listed.len() - SUMMARY_SHOWN
+        )?;
+    }
+    Ok(())
 }
 
 const STALE_SHOWN: usize = 20;
@@ -349,7 +432,7 @@ pub fn run(ctx: &Ctx, args: &Args, out: &mut dyn Write) -> Result<(), Refusal> {
         if let Some(i) = &ctx.isolated {
             writeln!(out, "isolated: true {i}").map_err(w)?;
         }
-        render(&fresh, &digest, out).map_err(w)?;
+        render(&fresh, &digest, ctx.color, out).map_err(w)?;
         print_stale(&diffs, out).map_err(w)?;
     }
     if let Some(first) = diffs.first() {

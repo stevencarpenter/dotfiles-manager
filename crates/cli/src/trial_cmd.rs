@@ -8,7 +8,7 @@
 use crate::adapters::package::{self, HOMEBREW, MISE};
 use crate::apply_cmd::{is_digest, label, stale};
 use crate::read_fs::read_regular_bounded;
-use crate::{Ctx, bounded, read_existing_binding, state_cmd, usage};
+use crate::{Ctx, bounded, paint, read_existing_binding, state_cmd, usage};
 use dfm_engine::{Runner, Store, now_ns, signal};
 use dfm_model::digest::sha256_hex;
 use dfm_model::display::{bounded_visible, visible};
@@ -697,7 +697,13 @@ pub fn run(ctx: &Ctx, args: &Args, out: &mut dyn Write) -> Result<(), Refusal> {
         }
     };
     let final_exit = outcome.as_ref().err().map_or(Exit::Ok, Refusal::exit);
-    writeln!(out, "result: {}", final_exit.name()).map_err(w)?;
+    writeln!(
+        out,
+        "{} {}",
+        paint::label(ctx.color, "result:"),
+        paint::status(ctx.color, final_exit.name())
+    )
+    .map_err(w)?;
     outcome
 }
 

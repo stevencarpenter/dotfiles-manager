@@ -334,8 +334,47 @@ fn apply_without_an_approved_digest_prints_the_plan_and_writes_nothing() {
     assert!(stderr(&o).contains("E_APPROVAL_REQUIRED"), "{}", stderr(&o));
     assert!(text(&o.stdout).contains("plan digest: "));
     assert!(text(&o.stdout).contains("--yes-plan") || stderr(&o).contains("--yes-plan"));
+    let t = text(&o.stdout);
+    assert!(t.contains("summary: planned=7\n  planned "), "{t}");
     assert_eq!(fingerprint(fx.home.path()), before);
     assert!(!fx.h(".zshrc").exists() && !fx.h(".ssh").exists());
+}
+
+#[test]
+fn a_terminal_gets_colored_statuses_and_no_color_turns_them_off() {
+    let fx = Fx::new();
+    let run = |env: &[(&str, &str)]| {
+        let mut c = Command::new(BIN);
+        c.env_clear().envs(env.iter().copied());
+        c.arg("--home").arg(fx.home.path());
+        c.args(["apply", "--root", fx.root_arg()]).output().unwrap()
+    };
+    // DFM_COLOR stands in for a terminal in a test-isolation build.
+    let o = run(&[("DFM_COLOR", "1")]);
+    assert_eq!(code(&o), 3, "{}", stderr(&o));
+    let t = text(&o.stdout);
+    assert!(
+        t.contains("  \x1b[1;33mplanned\x1b[0m extra.zsh@.zshrc \x1b[36m[extra]\x1b[0m "),
+        "{t}"
+    );
+    assert!(
+        t.contains("\x1b[1;34msummary:\x1b[0m \x1b[1;33mplanned=7\x1b[0m\n"),
+        "{t}"
+    );
+    assert!(t.contains("\x1b[1;34mplan digest:\x1b[0m \x1b[35m"), "{t}");
+    assert!(
+        t.ends_with("\x1b[1;34mresult:\x1b[0m \x1b[1;31mblocked\x1b[0m\n"),
+        "{t}"
+    );
+    for env in [
+        &[("DFM_COLOR", "1"), ("NO_COLOR", "1")][..],
+        &[("DFM_COLOR", "1"), ("TERM", "dumb")][..],
+        &[][..],
+    ] {
+        let o = run(env);
+        assert!(!text(&o.stdout).contains('\u{1b}'), "{env:?}");
+        assert!(!stderr(&o).contains('\u{1b}'), "{env:?}");
+    }
 }
 
 #[test]
@@ -519,6 +558,25 @@ fn a_second_apply_of_an_applied_plan_changes_nothing_and_exits_0() {
         before,
         "a rerun writes no state"
     );
+    assert_eq!(
+        fx.receipts().len(),
+        1,
+        "a run that changed nothing writes no receipt"
+    );
+}
+
+#[test]
+fn an_applied_plan_needs_no_approval_to_run_again() {
+    let fx = Fx::new();
+    assert_eq!(code(&fx.apply(&[])), 0);
+    let before = fingerprint(fx.home.path());
+    let o = fx.run(&["apply", "--root", fx.root_arg()]);
+    let t = text(&o.stdout);
+    assert_eq!(code(&o), 0, "{}\n{t}", stderr(&o));
+    assert!(t.contains("summary: current=4; nothing to change"), "{t}");
+    assert!(t.contains("nothing to change: no approval needed"), "{t}");
+    assert!(t.ends_with("result: ok\n"), "{t}");
+    assert_eq!(fingerprint(fx.home.path()), before);
     assert_eq!(
         fx.receipts().len(),
         1,

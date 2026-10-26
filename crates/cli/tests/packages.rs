@@ -825,6 +825,10 @@ fn an_installed_package_with_an_unresolved_install_stays_blocked_until_resolved(
             assert!(stderr(&o).contains(id), "{}", stderr(&o));
             assert_eq!(installs(), 1, "the unresolved install must not run again");
         }
+        // Every operation is current, yet the open entry still needs the approved run.
+        let o = fx.run(&["packages", "--root", fx.root_arg()]);
+        assert_eq!(code(&o), 3, "{}\n{}", stderr(&o), text(&o.stdout));
+        assert!(stderr(&o).contains("E_APPROVAL_REQUIRED"), "{}", stderr(&o));
         let o = fx.run(&["state", "recover"]);
         assert_eq!(code(&o), 3, "{}\n{}", stderr(&o), text(&o.stdout));
         assert!(text(&o.stdout).contains(id));
@@ -834,6 +838,9 @@ fn an_installed_package_with_an_unresolved_install_stays_blocked_until_resolved(
         assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
         assert!(text(&o.stdout).contains(&format!("current {op_id}")));
         assert_eq!(installs(), 1, "resolution must not reinstall the package");
+        let o = fx.run(&["packages", "--root", fx.root_arg()]);
+        assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+        assert!(text(&o.stdout).contains("nothing to change: no approval needed"));
     }
 }
 
