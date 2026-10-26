@@ -1722,6 +1722,23 @@ fn sync_runs_configuration_packages_secrets_and_services_in_order_under_one_appr
 }
 
 #[test]
+fn a_packages_scope_after_the_configuration_scope_probes_once_per_plan() {
+    let l = Life::new();
+    l.push_link();
+    let p = l.preview(&[]);
+    assert_eq!(code(&p), 0, "{}\n{}", stdout(&p), stderr(&p));
+    let log = l.log();
+    let o = l.sync(&digest_of(&p), &[]);
+    assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
+    // One package probe runs `brew ruby` once. The review, the plan under the sync lock, the
+    // recheck after the configuration scope and the plan under the packages scope's lock each
+    // probe, and the engine probes once before the install; the scope's first look reuses the
+    // recheck.
+    let probes = l.log()[log.len()..].matches("\nbrew ruby ").count();
+    assert_eq!(probes, 5, "{}", l.log());
+}
+
+#[test]
 fn a_package_failure_leaves_the_later_scopes_not_started() {
     let l = Life::new();
     l.mark("fail");

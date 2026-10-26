@@ -45,6 +45,10 @@ pub struct Args {
     /// A scope of `sync` (docs/sync.md): sync printed the plan and prints the result line, so
     /// this run prints neither, and its report omits the `not_in_scope` operations.
     pub(crate) composed: bool,
+    /// A later scope of `sync`: the plan sync made of this scope after the earlier scopes, from
+    /// the sources this run reads. The first look uses it instead of probing again; the plan
+    /// under the lock is still made and compared with the approved digest.
+    pub(crate) planned: Option<dfm_model::plan::Plan>,
 }
 
 /// `apply [--root <dir>] [-y|--yes-plan <digest>] [--allow-disruptive <operation-id>]...
@@ -110,6 +114,7 @@ pub fn parse_args(args: &[String], scope: Scope) -> Result<Args, Refusal> {
         update,
         restart,
         composed: false,
+        planned: None,
     })
 }
 
@@ -366,29 +371,36 @@ fn run_inner(
     let (layout, sys) = (ctx.layout(), ctx.sys()?);
     // A packages or services plan needs the providers' answers first.
     let probes = |loaded| probe(ctx, &sys, args, loaded);
-    let plan = plan_for(ctx, &first, args.scope, probes(&first)?)?;
+    let fresh;
+    let plan = match &args.planned {
+        Some(p) => p,
+        None => {
+            fresh = plan_for(ctx, &first, args.scope, probes(&first)?)?;
+            &fresh
+        }
+    };
     stop()?;
-    check_restart(&args.restart, &plan)?;
+    check_restart(&args.restart, plan)?;
     let digest = plan.digest()?;
     if !args.composed {
         if let Some(i) = &ctx.isolated {
             writeln!(out, "isolated: true {i}").map_err(w)?;
         }
-        render(&plan, &digest, ctx.color, out).map_err(w)?;
+        render(plan, &digest, ctx.color, out).map_err(w)?;
         progress.plan_printed = true;
     }
     let generators = |loaded| generators_for(ctx, &sys, args.scope, loaded);
-    let journal_open = check_before_lock(ctx, args, &plan, &digest, &generators(&first), out)?;
+    let journal_open = check_before_lock(ctx, args, plan, &digest, &generators(&first), out)?;
     // The credential gate (docs/secrets.md): a secrets run without a vault
     // session stops here, exit 3, before the lock and before any write. Nothing is rendered.
     if args.scope == Scope::Secrets {
-        crate::adapters::secret::credentials(&plan, &first.resolved, &ctx.runner(&sys))?;
+        crate::adapters::secret::credentials(plan, &first.resolved, &ctx.runner(&sys))?;
     }
     stop()?;
     if args.preview {
         return Ok(());
     }
-    if end_without_change(args, &plan, journal_open, ctx.color, out).map_err(w)? {
+    if end_without_change(args, plan, journal_open, ctx.color, out).map_err(w)? {
         progress.result_printed = true;
         return Ok(());
     }

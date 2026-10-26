@@ -2003,6 +2003,12 @@ fn run_scope(
         }),
         ..scope_args(args, p.scope, Some(approvals))
     };
+    // The scope's first look is the recheck just made: the plan under its lock is compared
+    // with that digest.
+    let scoped = apply_cmd::Args {
+        planned: fresh,
+        ..scoped
+    };
     apply_cmd::run(ctx, &scoped, out).map(|()| None)
 }
 
