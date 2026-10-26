@@ -1,4 +1,4 @@
-//! The 16 resolver definitions in examples/cases.toml (docs/architecture.md section 13).
+//! The 16 resolver definitions in examples/cases.toml.
 
 use crate::harness;
 use dfm_cli::builtin_catalog;

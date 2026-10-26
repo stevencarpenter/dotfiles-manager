@@ -1,5 +1,4 @@
-//! Bounded child processes for providers (docs/architecture.md section 8, "Read-only probe
-//! allowlist", and section 10 item 6; docs/secrets.md).
+//! Bounded child processes for providers (docs/secrets.md, "How `op` is run").
 //!
 //! A provider never runs through a shell. [`Runner::run`] resolves the program on a fixed search
 //! path (never the caller's `PATH`), checks the executable it found, builds the environment from
@@ -23,10 +22,10 @@ use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-/// Provider standard error is kept to this many bytes (section 8, redaction rule 3). The rest is
+/// Provider standard error is kept to this many bytes (docs/secrets.md). The rest is
 /// read in chunks and dropped, so memory stays at this bound.
 pub const MAX_STDERR: usize = 4096;
-/// After SIGTERM the child gets this long before SIGKILL (section 10 item 6).
+/// After SIGTERM the child gets this long before SIGKILL (docs/secrets.md).
 pub const GRACE: Duration = Duration::from_secs(10);
 const POLL: Duration = Duration::from_millis(20);
 const CHUNK: usize = 8192;
@@ -104,7 +103,7 @@ fn refused(detail: impl Into<String>) -> Refusal {
 }
 
 impl Runner {
-    /// Finds `program` on the search path and checks the executable (section 8, argv[0] rule): a
+    /// Finds `program` on the search path and checks the executable: a
     /// regular file with an execute bit, owned by root or the current user, not writable by group
     /// or others, and (when the entry is a link) a link owned by root or the current user. The
     /// resolved path must stay under the search directory or under its parent prefix (a package

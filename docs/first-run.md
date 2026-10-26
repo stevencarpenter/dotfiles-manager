@@ -1,10 +1,12 @@
 # First live run (owner runbook)
 
-This is the shortest safe path from the current integration branch to a first `apply` on a real machine. It covers links and the generated files that the release binary has adapters for. Nothing in this document runs by itself. Every step is a command the owner runs and can stop before.
+Use this runbook to install `dfm` on a new Mac and run its first `apply`. The M5 ran it on 2026-10-16. Every step is a command the owner runs and can stop before.
 
-Board ticket: DFM-46. The agent runs nothing live without written approval that names the plan digest. The rule is step 3 of section 4 below.
+Board ticket: DFM-46. The agent runs nothing live without written approval that names the plan digest (section 4, step 3).
 
 ## 1. Build and install the manager
+
+Prerequisites: Command Line Tools (`xcode-select --install`), the rustup toolchain `1.98.1-aarch64-apple-darwin`, and a clone of this repository (`git clone https://github.com/stevencarpenter/dotfiles-manager.git`). Run the commands below from that clone.
 
 1. Place the pinned toolchain. `~/.local/share/dotfiles-manager` must be a real directory that you own and that group and others cannot write. Then run:
 
@@ -21,9 +23,9 @@ Board ticket: DFM-46. The agent runs nothing live without written approval that 
    )
    ```
 
-   The block runs in a subshell. If it prints `stopped` or any error, or the status is not 0, do not go on to step 3.
+   The block runs in a subshell. If it prints `stopped` or any error, or the status is not 0, stop.
 
-   The copy must be a real directory, not a symlink, made as your own user and not with `sudo`: the script refuses a toolchain entry that another user owns (`E_TOOLCHAIN_MISMATCH`). The printed digest must equal `toolchain_tree_sha256` in `dotfiles-manager.lock` before `install`. The digest is device-specific. The M3 may need its own lock later.
+   The copy must be a real directory, not a symlink, made as your own user and not with `sudo`: the script refuses a toolchain entry that another user owns (`E_TOOLCHAIN_MISMATCH`). The printed digest must equal `toolchain_tree_sha256` in `dotfiles-manager.lock` before `install`. The digest was recorded on the M5 and can differ on another device. If it differs, stop: the lock holds one digest for every device, and `install` refuses with `E_TOOLCHAIN_MISMATCH`.
 2. Check out the commit to install, usually `main` after `git pull --ff-only`. The script builds the commit the checkout has checked out (its HEAD), not uncommitted files.
 3. Run the bootstrap script (not with `env -i`: it clears `HOME` and the script refuses with `E_HOME_MISMATCH`; the script scrubs its own environment):
 
@@ -94,7 +96,7 @@ overrides = []
 Rules that matter on the first run:
 
 - `target` is relative to HOME and must be ASCII. The source file must exist inside the checkout.
-- Know every file class the first apply writes. `link` resources (`fs-link/v1`) create symlinks. `render` resources (`git-config/v1`) write a whole file. `assemble` resources (`text-fragments/v1`) write a file built from fragments. A `merge` resource (`claude-settings/v1`, `.claude/settings.json` only) writes into a file that the application also owns: it sets the declared values and keeps foreign keys, and its first write into an existing file needs `--allow-adopt` because hand edits of managed fields are overwritten (docs/adapters.md). Apply also creates missing parent directories (mode 0700). A resource whose adapter is not registered in the release binary makes `apply` refuse the whole plan with `E_GENERATOR_UNAVAILABLE` (exit 3, nothing written).
+- Know every file class the first apply writes. `link` resources (`fs-link/v1`) create symlinks. `distribution` resources (`skills/v1`) create one symlink per enabled entry under each target root. `render` resources (`git-config/v1`) write a whole file. `assemble` resources (`text-fragments/v1`) write a file built from fragments. A `merge` resource (`claude-settings/v1`, `.claude/settings.json` only) writes into a file that the application also owns: it sets the declared values and keeps foreign keys, and its first write into an existing file needs `--allow-adopt` because hand edits of managed fields are overwritten (docs/adapters.md). Apply also creates missing parent directories (mode 0700). A resource whose adapter is not registered in the release binary makes `apply` refuse the whole plan with `E_GENERATOR_UNAVAILABLE` (exit 3, nothing written).
 - Do not list files under `.ssh` other than `config`, or any file that holds a secret. List `.claude/settings.json` only as a `claude-settings/v1` merge resource, never as a link, a render or an assemble resource; the planner refuses a sensitive link or removal.
 - A checkout that holds ignored or runtime content (plugin checkouts, `.venv`, `node_modules`, caches) needs `[sources]` in the bundle. See the next section.
 - A `link` resource may point at a file or a directory. A directory source needs `directory = true` in the resource value (`[resources.value]`); without it the resolver refuses with `E_MANIFEST_INVALID`. A directory link is one operation; the manager never writes through it and never deletes it recursively.
@@ -133,7 +135,7 @@ dfm doctor
 dfm apply --preview
 ```
 
-`bind` records the checkout root: `--root`, else the nearest directory above the profile that holds `.git`. Every later command uses that root when `--root` is not given; an explicit `--root` wins. A binding written before the root was recorded (schema 1) still works with `--root` on each command. To record the root, run the same `bind` again (same `--profile` and `--machine-id`): it rewrites the binding in place and journals the change.
+`bind` records the checkout root: `--root`, else the nearest directory above the profile that holds `.git`. Every later command uses that root when `--root` is not given; an explicit `--root` wins. For an older binding without a root, see docs/bootstrap.md, "CLI".
 
 `bind` writes only the binding file, the empty state store under `~/.local/state/dotfiles-manager` and the lock file `~/.local/state/dotfiles-manager.lock`. `plan`, `doctor` and `--preview` write nothing.
 
@@ -149,6 +151,7 @@ Read the plan. Each line is one operation:
 | `planned remove@...` | an owned output will be deleted. Needs `--allow-disruptive '<id>'` |
 | `blocked ... E_CONFLICT` | a file exists at the target and the manager does not own it. Move it aside by hand, or change the profile |
 | `current ...` | already correct |
+| `summary: <status>=<count> ...` | the count of each status, then the status and id of each `blocked` and `planned` operation (at most 20 lines). `; nothing to change` means apply writes nothing |
 
 `--preview` prints every flag the real run needs, ready to paste. A plan with any `blocked` line cannot be applied.
 
@@ -178,7 +181,7 @@ dfm apply --yes-plan <digest> [--allow-adopt '<id>']... [--allow-disruptive '<id
 - `-y <digest>` is the short form of `--yes-plan <digest>` on every command that takes it.
 - A digest that no longer matches exits 3 with `E_PLAN_STALE` and writes nothing. Run `plan` again and approve the new digest.
 - The last line is `result: <name>`. `ok` means every operation ended `updated` or `current`. Anything else: read the per-operation lines; the first failure stops further changes, and the receipt records what happened.
-- A second run of the same plan changes nothing and exits 0.
+- When nothing is left to change, a second `apply` without `--yes-plan` prints `nothing to change: no approval needed` and `result: ok`, and exits 0.
 
 Check afterwards:
 
@@ -192,9 +195,15 @@ exec zsh
 
 Deselect the module in the profile (`modules = []`), run `plan`, then `apply --preview`. It lists one `--allow-disruptive` flag per owned output. Apply with those flags removes the links the manager created or adopted and the rendered or assembled files it wrote that still match the ledger; the source files are untouched. A `claude-settings/v1` merge is retired without a flag: it removes only the hook entries the manager added, and the managed values stay in `.claude/settings.json`, which is never deleted. Files that existed before and were not adopted are never deleted. The backup from step 4 restores anything else.
 
+## 7. After the first run
+
+- Reinstall the manager: section 1, step 5.
+- Daily path: `dfm sync` fetches the sources that `dotfiles-manager.lock` in the configuration checkout declares, then applies once. The first run needs `dfm sync --trust-origin <origin>` to grant the origin. Approve with `dfm sync -y <sync digest>` (docs/sync.md).
+- Secrets, packages and services are not part of `apply`. Each has its own command with the same preview and approval flags: `dfm secrets` (docs/secrets.md), `dfm packages` (docs/packages.md), `dfm services` (docs/lifecycle.md).
+
 ## Known limits on the first run
 
-- Links, rendered and assembled files, and the one `claude-settings/v1` merge. No secrets, no packages, no reloads of running programs.
+- `apply` covers links, distributions, rendered and assembled files and the `claude-settings/v1` merge. It does not render secrets, install packages or reload running programs.
 - `Ctrl-C` during `apply` stops cleanly. The operation in flight finishes, the receipt has outcome `interrupted`, and the exit code is 130. SIGTERM gives `terminated` and 143. After SIGKILL, a signal with no handler (SIGHUP, SIGQUIT, ...) or a crash, the next run settles the interrupted operation from the journal before it does anything else. A merge that was interrupted after its rename cannot be settled that way: its path stays blocked with `E_OP_INTERRUPTED` in every run until `dfm state resolve <journal-id> --as failed` (docs/apply.md, "Known limits").
 - A removal or link replacement checks the leaf and then acts in a second step. A concurrent same-user process could change the leaf in between.
-- Config edits in the checkout never require rebuilding the manager. Only a new manager commit does, through `bootstrap.sh install`.
+- Config edits in the checkout never require rebuilding the manager. Only a new manager commit does, through `dfm self-update`.

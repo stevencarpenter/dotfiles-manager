@@ -1,6 +1,6 @@
-//! RFC 6901 JSON Pointers into a resource `value` tree (docs/architecture.md section 6,
-//! DESIGN.md section 5). Only tables are addressable: arrays are atomic, so a token never
-//! indexes an array. The root pointer, wildcards and empty tokens are refused.
+//! RFC 6901 JSON Pointers into a resource `value` tree (DESIGN.md section 5). Only tables are
+//! addressable: arrays are atomic, so a token never indexes an array. The root pointer,
+//! wildcards and empty tokens are refused.
 
 use toml::Value;
 

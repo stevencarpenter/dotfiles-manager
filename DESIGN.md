@@ -1,8 +1,8 @@
-# Machine configuration contract, draft 0.3
+# Machine configuration contract
 
 **The manager resolves one machine profile into an owned configuration and an explicit change plan. A mandatory core defines shared invariants and overridable defaults; selected modules contribute through declared extension points.**
 
-Status: proposed replacement specification, not an implemented manager. The ownership boundary below is user-approved. Manifest syntax, command names, adapter contracts, and storage choices are proposals for review.
+Status: requirements contract for the `dfm` manager. The owner approved the requirements in section 1 and the ownership boundary in section 2. Sections 3 to 9 specify the design. The manager implements part of it: section 7 maps each proposed command to the shipped command, and section 11 lists what is built and what stays open.
 
 ## 1. Agreed requirements
 
@@ -17,7 +17,7 @@ Status: proposed replacement specification, not an implemented manager. The owne
 
 ### Mandatory first-implementation workflows
 
-These are user-required capabilities of the **very first implementation**, not optional additions after a read-only release. Command names remain proposed.
+These are user-required capabilities of the **very first implementation**, not optional additions after a read-only release. The command names below are the proposed names. Section 7 shows where the shipped commands differ.
 
 | Workflow | Proposed command | Required result |
 | --- | --- | --- |
@@ -56,7 +56,7 @@ A path or field is owned only when declared. Nothing implicitly owns HOME, a who
 
 ## 3. Bundle, module, and profile documents
 
-TOML is the proposed human-authored format. It permits comments and maps to a bounded data model. Schema version 1 accepts known keys only. There is no embedded expression language or shell interpolation engine.
+TOML is the human-authored format. It permits comments and maps to a bounded data model. Schema version 1 accepts known keys only. There is no embedded expression language or shell interpolation engine.
 
 ### Bundle
 
@@ -78,7 +78,7 @@ Module dependencies determine availability, not execution barriers. For example,
 
 A profile declares `schema`, an individual machine `id`, `bundle`, expected `platform` and `architecture`, selected `modules`, and optional `overrides`. It cannot declare another core, suppress the core, or introduce arbitrary resource kinds.
 
-The machine is bound explicitly to one profile at `~/.config/dotfiles-manager/machine.toml`. Binding records the canonical profile path and machine identity; it is not inferred from hostname alone. A platform mismatch fails before mutation. A deliberate rebinding is an ownership migration, not `apply --profile other`.
+The machine is bound explicitly to one profile at `~/.config/dotfiles-manager/machine.toml`. Binding records the canonical profile path, the checkout root, and the machine identity; it is not inferred from hostname alone. A platform mismatch fails before mutation. A deliberate rebinding is an ownership migration, not `apply --profile other`.
 
 Multiple fixture profiles in this repository are alternative machine examples. A deployed machine has one binding and no stack of active profiles.
 
@@ -112,7 +112,7 @@ The manager does not interpolate arbitrary strings. Adapters may support documen
 | `package` | `homebrew/v1`, `mise/v1`, `apt/v1` | One owner for a package; installation, update policy, and observed version remain distinct. |
 | `application` | `firstmate-native/v1` | Delegate lifecycle to the native updater and distinguish queued requests from completed updates. |
 
-These identifiers specify contracts, not available implementations, and are not an exhaustive first-implementation provider list. The first implementation must cover every managed version source in its supported target profiles, including module Git sources, package/input pins, runtimes, application plugins/extensions, and skills. An unsupported managed source is a coverage failure, not a silent exclusion from `update`.
+These identifiers specify contracts and are not an exhaustive first-implementation provider list. The registry of shipped adapters is `crates/cli/src/adapters.rs`; [docs/adapters.md](docs/adapters.md) and the per-feature documents describe each one. The first implementation must cover every managed version source in its supported target profiles, including module Git sources, package/input pins, runtimes, application plugins/extensions, and skills. An unsupported managed source is a coverage failure, not a silent exclusion from `update`.
 
 Reuse existing domain algorithms behind these boundaries where their behavior fits. Application plugin configuration is ordinary module content, not evidence that a manager-plugin marketplace is needed.
 
@@ -166,21 +166,23 @@ On failure, dependent operations are blocked. Stop mutation by default and repor
 
 ## 7. Commands and state
 
-The following names describe the intended CLI, not commands installed by this draft:
+The executable is `dfm` (owner decision 2026-10-20, DFM-67). The "Shipped" column records the command at the current revision. `dfm --help` is the authoritative usage text.
 
-| Operation | Contract |
-| --- | --- |
-| `plan` | Read-only resolution/inspection and an inspectable proposed change set. No automatic fetching or authentication. |
-| `explain <resource-or-path>` | Show declaration ownership, permitted overrides, provenance, native precedence, and runtime-verification status. |
-| `doctor [tool-or-resource]` | Read-only diagnostic table and findings, including versions, executable/config locations, ownership, drift, and probe failures. Support full-detail selection and `--json`. |
-| `status` | Compact view of the same inspection results used by `doctor`, comparing desired, last-applied, current, and consumer-loaded state where observable. |
-| `apply <plan>` | Apply an explicitly reviewed plan. A local configuration plan cannot contain implicit upgrades or secret refreshes. |
-| `update` | One-command source refresh and version maintenance across the complete selected composition, followed by applying and verifying the approved result. |
-| `sync` | One-command GitHub pull-and-apply of published configuration and its required module revisions, without independently bumping every tool version. |
-| `try <tool>` | Discover its installation owner and configuration candidates, record a baseline, and start a tracked trial. |
-| `adopt <trial-or-path> --module <id>` | Review and promote selected configuration plus installation/update declarations into the chosen module, then verify the ownership handoff. |
-| `purge <trial>` | Preview and confirm removal of trial-owned installation/configuration/state and safe restoration of the recorded baseline. |
-| `secrets` | Explicitly authenticate/render declared secrets. Preserve last-good outputs on failure. |
+| Operation | Contract | Shipped |
+| --- | --- | --- |
+| `plan` | Read-only resolution/inspection and an inspectable proposed change set. No automatic fetching or authentication. | `dfm plan` ([docs/planner.md](docs/planner.md)). |
+| `explain <resource-or-path>` | Show declaration ownership, permitted overrides, provenance, native precedence, and runtime-verification status. | `dfm explain <resource-or-target>` ([docs/resolver.md](docs/resolver.md)). |
+| `doctor [tool-or-resource]` | Read-only diagnostic table and findings, including versions, executable/config locations, ownership, drift, and probe failures. Support full-detail selection and `--json`. | `dfm doctor [--json]`: binding, state and owned files only. No tool, version or PATH probe and no per-component selection ([docs/doctor.md](docs/doctor.md)). |
+| `status` | Compact view of the same inspection results used by `doctor`, comparing desired, last-applied, current, and consumer-loaded state where observable. | `dfm status [--json]`, the same rows as `doctor`. |
+| `apply <plan>` | Apply an explicitly reviewed plan. A local configuration plan cannot contain implicit upgrades or secret refreshes. | `dfm apply`: plans again and applies only with `--yes-plan <digest>` of that plan ([docs/apply.md](docs/apply.md)). |
+| `update` | One-command source refresh and version maintenance across the complete selected composition, followed by applying and verifying the approved result. | Not built (DFM-31). `dfm packages --update` advances rolling mise and uv tools only ([docs/toolchains.md](docs/toolchains.md)). `dfm self-update` rebuilds the manager (DFM-72, [docs/bootstrap.md](docs/bootstrap.md)). |
+| `sync` | One-command GitHub pull-and-apply of published configuration and its required module revisions, without independently bumping every tool version. | `dfm sync`: configuration scope only. Packages and secrets are `not_in_scope` until DFM-63 ([docs/sync.md](docs/sync.md)). |
+| `try <tool>` | Discover its installation owner and configuration candidates, record a baseline, and start a tracked trial. | `dfm trial <package>` (DFM-32, [docs/trial.md](docs/trial.md)). |
+| `adopt <trial-or-path> --module <id>` | Review and promote selected configuration plus installation/update declarations into the chosen module, then verify the ownership handoff. | Not built (DFM-33). `--allow-adopt` on `apply` and `secrets` is a different operation: it records ownership of an existing output. |
+| `purge <trial>` | Preview and confirm removal of trial-owned installation/configuration/state and safe restoration of the recorded baseline. | Not built (DFM-34). |
+| `secrets` | Explicitly authenticate/render declared secrets. Preserve last-good outputs on failure. | `dfm secrets` ([docs/secrets.md](docs/secrets.md)). |
+
+The shipped CLI also has `bind`, `binding`, `state`, `packages`, `services`, `self-update` and `self-check`. [README.md](README.md) lists the exit codes and links the document for each command.
 
 Only configuration work belongs in a normal config plan. The mutating high-level commands compose source acquisition, configuration, provisioning, updates, and necessary reload scopes internally, with one combined preview and approval rather than separate user invocations. Secret authentication/rendering remains an explicit opt-in scope; a missing required secret blocks dependent work instead of being silently ignored.
 
@@ -193,6 +195,8 @@ Only configuration work belongs in a normal config plan. The mutating high-level
 3. “Latest” means the latest eligible version under the declared release channel, compatibility range, and soak policy. An exact resolved pin makes application reproducible; it is not automatically a permanent hold. `update` must be able to advance managed pins and lockfiles. An intentional hold is separately declared and reported with its reason.
 4. Present one combined diff and approval. Store changed declarations in their owning source, never private module details in the public core. Pin changes remain reviewable local edits; no automatic commit or push. Read-only sources must expose a supported update path or block the operation, not be rewritten elsewhere without provenance.
 5. Apply in dependency order and verify actual outcomes. Account for every participant as updated, already current, explicitly held, pending, failed, or blocked. A queued native update is not completion. Wait through its supported completion protocol or report pending without claiming full success. Resume from receipts after failure; do not claim a transaction or universal rollback across providers.
+
+**Superseded in part (owner, 2026-10-20).** The default policy is rolling: each participant moves to the newest version its provider resolves, with no soak period and no channel requirement. A hold stays an explicit declaration with a reason. This replaces the "soak policy" in item 3, section 8 and section 9 (DFM-31.C03, [docs/roadmap-review.md](docs/roadmap-review.md)).
 
 This extends the existing unified `just update` intent to **all managed sources and modules**, not only a fixed list of package managers. Existing version policies remain deliberate; the CLI cannot report everything updated while omitting a provider or external module.
 
@@ -237,7 +241,7 @@ The report header identifies the machine/profile, platform/architecture, inspect
 
 The default terminal table shows **Tool / owner**, **Status**, **Versions**, **Executable**, and **Config**. Put actionable findings immediately below the relevant row or in a keyed findings list. Wrap long paths or use labelled multiline rows on narrow terminals; do not hide the decisive path through irreversible truncation. Detailed selection and versioned `--json` output retain all fields and provenance without ANSI formatting.
 
-Illustrative rows only, with invented tools, versions, and paths. This is not a scan of the current machine:
+Illustrative rows only, with invented tools, versions, paths, and codes. This is not a scan of the current machine. The shipped codes use the `D_` prefix ([docs/doctor.md](docs/doctor.md)).
 
 | Tool / owner | Status | Versions | Executable | Config |
 | --- | --- | --- | --- | --- |
@@ -281,19 +285,19 @@ Raw edits through a supported link remain ordinary Git changes. A replaced link 
 | `homelab-01` | Homelab | Core, server, homelab; server dependency does not install the personal development stack. |
 | `server-01` | Server | Core and server; explicit alternate editor default, no agent or desktop modules. |
 
-The homelab and server profiles are illustrative schema fixtures, not supported targets or migration promises.
+The homelab and server profiles are illustrative schema fixtures (section 1, items 7 and 8).
 
 Fixture values illustrate mechanisms, not final decisions about which real settings belong in core. The source files are intentionally small. The examples do not reproduce the complete current dotfiles inventory, provider dependencies, or private wrapper.
 
 `examples/cases.toml` contains expected resolved module lists, selected effective values, and negative scenarios. Mutations use RFC 6902 operations on parsed fixture documents in memory. They must never be applied to the checked-in examples or live files. The first error follows validation order: document/bundle schema, selection/dependency validity, composition authority/conflicts, resolved adapter schema/source containment, then output claims/observations.
 
-The included checker validates fixture syntax and references, not these resolver outcomes. The implemented resolver must pass all resolver cases; passing those alone does not satisfy the required first-implementation workflows.
+`scripts/check_examples.py` validates fixture syntax and references, not these resolver outcomes. `cargo test -p dfm-cli --test resolver` executes all resolver cases against in-memory copies. Passing those alone does not satisfy the required first-implementation workflows.
 
 Additional apply acceptance requirements are already determined by existing failures: an isolated HOME, stale/dangling parent rejection, directory-to-file migration, replaced-link preservation, foreign-hook preservation, malformed-input last-good preservation, failed/empty secret injection, state-loss refusal to delete, source/target changes after planning, no network from read-only scopes, and explicit queued-versus-completed native updates.
 
 ### First-implementation workflow acceptance
 
-These are required end-to-end tests, not outcomes established by the current fixture checker. Run them with isolated HOME directories, temporary Git remotes, and fake provider/vault/native-update processes before any approved live migration. The 16 existing resolver cases do not substitute for these workflows.
+These are required end-to-end tests, not outcomes established by the fixture checker or the resolver cases. Run them with isolated HOME directories, temporary Git remotes, and fake provider/vault/native-update processes before any approved live migration.
 
 | Requirement | Required evidence |
 | --- | --- |
@@ -310,6 +314,8 @@ These are required end-to-end tests, not outcomes established by the current fix
 ## 10. Existing behavior that constrains migration
 
 Source baseline: public dotfiles revision `1dbd12d3a563120a77aa3e27f68ad903a6d47d9e`. Current source takes precedence over historical memory.
+
+Status (2026-10-20, `docs/roadmap.json`): the live M5 cutover ran on 2026-10-16, and Nix is no longer on the M5 (DFM-27 superseded). For the M5, the Nix rows and the Nix API rule below are a record. For the M3, DFM-40 and DFM-41 own the handoff.
 
 | Existing implementation | Requirement retained or intentionally separated |
 | --- | --- |
@@ -328,14 +334,24 @@ Keep the public Nix API working during migration. Release each old writer before
 
 The current private wrapper has not been inspected in this workspace. Synthetic external examples exercise the known public contract; they are not a compatibility certification. Its current declarative inputs and live ownership must be checked before migration.
 
-## 11. Decisions still proposed
+## 11. Decisions and implementation status
 
-The [minimum implementation contract](docs/architecture.md) proposes answers for the language, source lock, receipt format, adapter packaging and CLI exit semantics below. Its status is proposed, with owner review pending. Until the owner accepts it, the items below stay open.
+### Decided
+
+- Names (owner, 2026-10-20, DFM-67): the command is `dfm`. The project, crates, `dotfiles-manager.lock`, and the state, config, cache and data directories keep the name `dotfiles-manager`.
+- The owner decisions of 2026-10-09 settle the implementation language (Rust), the build-from-source distribution, the direct crates, and the exit codes.
+
+### Still open
+
+These items stay open for owner review:
 
 - TOML schema and the exact catalogue/override syntax.
-- The CLI and state-directory working name.
 - Which real configurations are universal core, exposed defaults, or optional modules.
-- Production adapter packaging and the implementation language.
+- Production adapter packaging.
 - Source-lock representation, native-provider coverage, and compatibility details for the current private wrapper.
 
-These are review questions, not implicit permission to modify deployed configuration. Unified updates, GitHub pull-and-apply, trial/adopt/purge, and read-only doctor diagnostics are fixed first-implementation requirements. Read-only resolution and provenance can be built first internally, but are not an acceptable standalone first implementation. This draft is implemented in part: `bind`, `binding`, `explain`, `plan`, `doctor`, `status`, `apply` (links, rendered and assembled files, and the `claude-settings/v1` merge), and `state` exist (README and docs/apply.md). The `update`, `sync`, `try`, `adopt <trial>` and `purge` workflows are not built.
+These are review questions, not implicit permission to modify deployed configuration. They do not change the four workflows in section 1, which are fixed first-implementation requirements.
+
+### Built
+
+The section 7 table maps each workflow to its shipped command. Built: `bind`, `binding`, `state`, `explain`, `plan`, `doctor` and `status` (files and state only), `apply`, `secrets`, `packages` (with `--update` for rolling mise and uv tools), `services`, `trial`, `sync` (configuration scope), `self-update` and `self-check`. Not built: `update`, `adopt` and `purge`. [README.md](README.md) links the notes for each command.

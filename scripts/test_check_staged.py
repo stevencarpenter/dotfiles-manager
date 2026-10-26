@@ -197,26 +197,25 @@ class PushGateTest(unittest.TestCase):
             cases = [
                 # The pushed commit is tested, not the working tree.
                 {"tip": good, "working": "invalid", "tested": 1, "ok": True},
-                {"tip": bad, "tested": 2, "ok": False},
-                # Every commit the push introduces, oldest first, stopping at the first
-                # broken one: `bad` sits below the tip `fixed`.
-                {"tip": fixed, "tested": 2, "ok": False},
-                # What the destination remote has is not tested again: its tracking ref...
-                {"tip": fixed, "tracking": {"origin": bad}, "tested": 1, "ok": True},
+                {"tip": bad, "tested": 1, "ok": False},
+                # Only the tip is tested: `bad` sits below `fixed`, which supersedes it.
+                {"tip": fixed, "tested": 1, "ok": True},
+                # A tip the destination remote has is not tested again: its tracking ref...
+                {"tip": fixed, "tracking": {"origin": fixed}, "tested": 0, "ok": True},
                 # ...or the remote sha git reports for the pushed ref.
-                {"tip": fixed, "over": bad, "tested": 1, "ok": True},
-                # Another remote's tracking ref does not bound a push to origin.
-                {"tip": fixed, "tracking": {"backup": bad}, "tested": 2, "ok": False},
-                # A push to a URL has no tracking refs; every remote bounds it then.
+                {"tip": fixed, "over": fixed, "tested": 0, "ok": True},
+                # Another remote's tracking ref does not count for a push to origin.
+                {"tip": bad, "tracking": {"backup": bad}, "tested": 1, "ok": False},
+                # A push to a URL has no tracking refs; every remote counts then.
                 {
-                    "tip": fixed,
+                    "tip": bad,
                     "remote": "git@example.com:other.git",
                     "tracking": {"backup": bad},
-                    "tested": 1,
+                    "tested": 0,
                     "ok": True,
                 },
-                # Each commit gets a new tree: the dotfile below `clean` must not reach it.
-                {"tip": clean, "tracking": {"origin": fixed}, "tested": 2, "ok": True},
+                # The tip's own tree: the dotfile of the commit below `clean` must not reach it.
+                {"tip": clean, "tracking": {"origin": fixed}, "tested": 1, "ok": True},
                 # The commit's tree, not its archive: export-ignore hides nothing.
                 {"tip": attrs, "tracking": {"origin": clean}, "tested": 1, "ok": False},
                 # A deletion-only push tests nothing.

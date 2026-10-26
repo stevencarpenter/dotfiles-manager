@@ -6,14 +6,14 @@
 //! from the containment check.
 //! A top-level `.git` (any letter case) is repository metadata, not source content, and is
 //! skipped. A `.git` anywhere deeper is a submodule or gitlink, which the tree rules refuse
-//! (E_SOURCE_UNTRUSTED, docs/architecture.md section 8).
+//! (E_SOURCE_UNTRUSTED, docs/resolver.md).
 //!
 //! Each file is opened with `O_NOFOLLOW` and `O_NONBLOCK` and checked with fstat. `O_NOFOLLOW`
 //! covers only the last path component: an entry swapped for a link or FIFO after listing is
 //! refused, but a parent directory swapped for a link would still be followed. The loader
 //! assumes nobody rewrites the tree while it runs; containment decisions are made later, on the
-//! snapshot. A source that cannot be read is `E_REPORT_UNAVAILABLE`, exit 2, which is
-//! docs/architecture.md section 10: "inability to produce the requested report".
+//! snapshot. A source that cannot be read is `E_REPORT_UNAVAILABLE`, exit 2: the inability to
+//! produce the requested report (docs/resolver.md).
 
 use crate::read_fs::read_regular_bounded;
 use dfm_model::fold::fold;

@@ -28,7 +28,7 @@ const LAUNCHCTL_NOT_FOUND: i32 = 113;
 const POLL: Duration = Duration::from_millis(500);
 
 /// The time bounds of one adapter call: a report, an action, and the wait for the launcher to
-/// finish what it accepted (architecture section 10 item 6: an adapter may lower the default).
+/// finish what it accepted (an adapter may lower the default bound).
 struct Bounds {
     probe: Duration,
     act: Duration,
@@ -57,8 +57,8 @@ fn bounds() -> Bounds {
     }
 }
 
-/// Homebrew's service commands run with auto-update, analytics and hints off (architecture
-/// section 8 item 5). The variables reach only the manager's own `brew` child.
+/// Homebrew's service commands run with auto-update, analytics and hints off (docs/packages.md).
+/// The variables reach only the manager's own `brew` child.
 fn brew_env() -> Vec<(String, String)> {
     [
         "HOMEBREW_NO_AUTO_UPDATE",
@@ -70,7 +70,7 @@ fn brew_env() -> Vec<(String, String)> {
     .collect()
 }
 
-/// A checked name parameter (architecture section 8 item 3): `allowed` punctuation beside
+/// A checked name parameter: `allowed` punctuation beside
 /// letters and digits, not starting with `-`, at most 128 characters.
 fn checked(value: &Value, key: &str, allowed: &[char], what: &str) -> Result<String, Refusal> {
     let n = value

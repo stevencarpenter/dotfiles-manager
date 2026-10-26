@@ -1,6 +1,6 @@
 //! What the resolver needs to know about an adapter: its kind, whether it owns a target, how
 //! its `value` tree is typed, and which outputs it claims. The registry that maps identifiers to
-//! implementations is built by the CLI (docs/architecture.md section 3); `model` only defines the
+//! implementations is built by the CLI (docs/adapters.md); `model` only defines the
 //! shape, so it names no OS-bound provider.
 
 use super::error::category;
@@ -76,7 +76,7 @@ pub struct AdapterSpec {
     pub target: TargetRule,
     /// Values hold references to secrets. They are shown as `[redacted]` and never hashed.
     pub secret_values: bool,
-    /// The output can hold credentials (architecture section 8, "Secrets and sensitive paths"):
+    /// The output can hold credentials (class `sensitive`, docs/adapters.md):
     /// the planner stores no content hash for it. Implied by `secret_values`.
     pub sensitive: bool,
     /// The adapter writes into a native document with its own precedence rules.

@@ -1,4 +1,4 @@
-//! Build-controls rules for a staged source tree (docs/architecture.md section 8).
+//! Build-controls rules for a staged source tree (docs/bootstrap.md).
 //!
 //! These functions take already-read text. They implement a restricted TOML
 //! grammar that fails closed: any construct they do not recognise is refused.

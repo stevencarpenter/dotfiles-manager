@@ -2043,7 +2043,7 @@ fn send(signal: &str, pid: u32) {
 }
 
 /// Parks `apply` before the effect of its first operation, signals it (twice when `twice`), and
-/// checks everything the contract promises: the parked operation finished, the rest did not
+/// checks every rule of docs/apply.md, "Signals": the parked operation finished, the rest did not
 /// start, the receipt and the exit code name the signal.
 fn signal_during_apply(signal: &str, twice: bool, exit: i32, name: &str) {
     let fx = Fx::new();

@@ -1,6 +1,6 @@
 #!/bin/sh
 # Bootstrap the dotfiles manager from a verified source checkout.
-# Contract: docs/architecture.md section 12. Procedure and limits: docs/bootstrap.md.
+# Procedure and limits: docs/bootstrap.md.
 #
 #   bootstrap.sh install [--source <git checkout | https:// or file:// URL>] [--commit <40 hex>]   (default: the source's HEAD)
 #   bootstrap.sh check-controls --source <staged tree>   (read-only)
@@ -69,7 +69,7 @@ PATH=$SYSPATH
 export PATH LC_ALL=C
 DATA_REL=.local/share/dotfiles-manager # same literal as dfm_platform_macos::DATA_DIR
 CACHE_REL=.cache/dotfiles-manager      # same literal as dfm_platform_macos::CACHE_DIR
-ORIGIN=https://github.com/stevencarpenter/dotfiles-manager.git # docs/architecture.md section 12, item 3.1
+ORIGIN=https://github.com/stevencarpenter/dotfiles-manager.git # canonical origin, docs/bootstrap.md
 TAB=$(printf '\t')
 NL='
 '
@@ -393,7 +393,7 @@ EOF
   [ "$root_ws" -eq 1 ] || refuse E_SOURCE_UNTRUSTED "the root Cargo.toml must declare [workspace]"
 }
 
-# Prints the toolchain tree digest of $1 (docs/architecture.md section 8, item 4a).
+# Prints the toolchain tree digest of $1 (docs/bootstrap.md).
 # Fails closed: any unreadable entry, failed hash, bad symlink or empty tree is an error,
 # never a digest of the entries that happened to be readable.
 toolchain_digest() (
@@ -894,7 +894,7 @@ case $src in ""|/*|*://*) ;; *) src=$PWD/$src ;; esac
 case $dir in ""|/*) ;; *) dir=$PWD/$dir ;; esac
 case $0 in /*) script_path=$0 ;; *) script_path=$PWD/$0 ;; esac
 # The script's own identity, before any command runs: the digest of this file as it executes.
-# --expect-sha256 is the value the owner holds out of band (contract section 12, item 3.1);
+# --expect-sha256 is the value the owner holds out of band (docs/bootstrap.md);
 # install also compares the digest with scripts/bootstrap.sh of the pinned commit (check_source).
 self_sha=$(/usr/bin/shasum -a 256 "$script_path") && self_sha=${self_sha%% *} || self_sha=
 [ -n "$self_sha" ] || refuse E_SOURCE_UNTRUSTED "cannot digest this script at $script_path; run it as /bin/sh <path to bootstrap.sh>"

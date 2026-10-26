@@ -1,4 +1,4 @@
-//! The typed plan (docs/architecture.md sections 6, 9 and 10; docs/planner.md).
+//! The typed plan (docs/planner.md).
 //!
 //! Pure: [`requests`] says which local facts the planner needs, the caller observes them
 //! (read-only), and [`build`] turns the resolved model, the observations, the ownership ledger
@@ -24,7 +24,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 pub const SCHEMA: i64 = 1;
-/// A saved plan is at most this large (the state document read limit, section 5).
+/// A saved plan is at most this large (the state document read limit, docs/state.md).
 pub const MAX_PLAN_BYTES: usize = 16 << 20;
 /// A directory listing or a regular file hash is bounded. A larger one is `Unknown`.
 pub const MAX_LISTING: usize = 50_000;
@@ -150,7 +150,7 @@ pub struct Binary {
     pub sha256: String,
 }
 
-/// A source tree the plan was made from: `kind = "path"` identity (section 9): the canonical
+/// A source tree the plan was made from: `kind = "path"` identity: the canonical
 /// absolute root plus the tree digest.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -190,7 +190,7 @@ pub enum Action {
     /// record, probed before and after.
     Start,
     /// Reload a service its launcher holds: unload, then load the declared definition, or the
-    /// launcher's own restart. Disruptive (architecture section 10 item 8): it needs
+    /// launcher's own restart. Disruptive (docs/lifecycle.md): it needs
     /// `--allow-disruptive <operation-id>`.
     Restart,
     /// Nothing to do, or out of scope.
@@ -230,7 +230,7 @@ pub enum Status {
     Blocked,
 }
 
-/// Who owns the output, from the ledger (the only source of delete authority, section 4).
+/// Who owns the output, from the ledger (the only source of delete authority, docs/state.md).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Ownership {
@@ -300,7 +300,7 @@ pub struct Operation {
     /// The absolute link target for a link or distribution leaf. Apply reads this field and
     /// never parses `effect` or `postcondition`, which are prose for people.
     pub link: Option<String>,
-    /// Always `user`: a HOME adapter never escalates (section 8).
+    /// Always `user`: a HOME adapter never escalates.
     pub privilege: String,
     /// What the operation does, without content or secret values.
     pub effect: String,
@@ -446,7 +446,7 @@ impl Plan {
 pub struct Saved {
     pub plan_digest: String,
     pub plan: Plan,
-    /// Set by a `test-isolation` build to show the overrides in force (section 7, item 3). It is
+    /// Set by a `test-isolation` build to show the overrides in force. It is
     /// outside the plan, so it is not part of the digest.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub isolated: Option<String>,
@@ -547,7 +547,7 @@ pub fn file_fingerprint(content: &[u8]) -> String {
     crate::digest::hex(h.finalize().as_slice())
 }
 
-/// The identity of a source tree read from `root` (section 9, "Path-source identity"): the
+/// The identity of a source tree read from `root`: the
 /// canonical absolute root and the tree digest. Regular files and links only; the loader does
 /// not record the executable bit, so a mode-only edit is not detected (docs/planner.md).
 pub fn source_identity(root: &str, set: &crate::resolve::SourceSet) -> Source {

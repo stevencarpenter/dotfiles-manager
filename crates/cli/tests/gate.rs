@@ -1,4 +1,4 @@
-//! Structural gate tests named by docs/architecture.md sections 3, 7 and 12.
+//! Structural gate tests: crate layout, OS separation and distribution.
 
 mod common;
 
@@ -58,7 +58,7 @@ fn os_bound_names_stay_in_platform_macos() {
         "homebrew",
         "xcode",
     ];
-    // docs/architecture.md section 3: no OS-bound name in `model` or `engine`.
+    // No OS-bound name in `model` or `engine`.
     let mut files = Vec::new();
     for krate in ["model", "engine"] {
         let before = files.len();

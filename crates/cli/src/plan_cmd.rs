@@ -55,7 +55,7 @@ pub fn parse_args(args: &[String]) -> Result<Args, Refusal> {
     })
 }
 
-/// SHA-256 of the running executable: the binary identity of section 9. Streamed, not loaded.
+/// SHA-256 of the running executable: the binary identity in the plan. Streamed, not loaded.
 pub(crate) fn binary_identity() -> Result<Binary, Refusal> {
     let io = |e: std::io::Error| Refusal::new(Code::IoFailed, format!("binary identity: {e}"));
     let exe = std::env::current_exe().map_err(io)?;
@@ -166,8 +166,8 @@ pub fn plan_for(
         // An overlap is a reserved path (E_STATE_INVALID from the store). Any other failure
         // (a parent link out of HOME is E_PARENT_UNSAFE, and the topology walk reports it with
         // that code) means the path could not be checked, so the plan reports an unknown fact
-        // (E_OBSERVATION_UNKNOWN, exit 3: "a required prerequisite that is UNKNOWN",
-        // architecture section 10). The planner reports a link loop or an unreadable parent
+        // (E_OBSERVATION_UNKNOWN, exit 3: a required prerequisite that is UNKNOWN,
+        // docs/planner.md). The planner reports a link loop or an unreadable parent
         // first, with its own code.
         if let Err(e) = store.check_claim_for_plan(&abs.to_string_lossy()) {
             if e.code == Code::StateInvalid {
@@ -221,7 +221,7 @@ pub fn plan_for(
         restart: probed.restart,
     };
     let mut plan = plan::build(&loaded.resolved, &cx, &obs)?;
-    // Generated output hashes (architecture section 9 item 1), from the same adapters apply runs.
+    // Generated output hashes, from the same adapters apply runs.
     crate::adapters::plan_outputs(&mut plan, &loaded.resolved, &sys, &home);
     mark_excluded(&mut plan, &loaded.sources);
     Ok(plan)

@@ -1,4 +1,4 @@
-//! Stale-plan detection (docs/architecture.md section 10: "A mismatch exits 3 as stale").
+//! Stale-plan detection (docs/planner.md: a mismatch is `E_PLAN_STALE`, exit 3).
 //! A saved plan is compared with a fresh one built from the same command. Every difference is
 //! named, so the reviewer sees which source, observation, ownership or topology changed. The
 //! comparison is complete: if the digests differ, at least one entry says so.

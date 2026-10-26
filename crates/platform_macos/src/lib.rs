@@ -13,7 +13,7 @@ pub const DATA_DIR: &str = ".local/share/dotfiles-manager";
 /// Cache root relative to HOME. `scripts/bootstrap.sh` hard-codes the same literal.
 pub const CACHE_DIR: &str = ".cache/dotfiles-manager";
 /// Where provider programs (`op`, `brew`, `mise`) are looked up: fixed, never the caller's `PATH`
-/// (docs/architecture.md section 8, "Read-only probe allowlist", item 5).
+/// (docs/secrets.md, "How `op` is run").
 pub const PROVIDER_PATH: [&str; 4] = ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin"];
 /// Searched after [`PROVIDER_PATH`], relative to HOME: where mise's official installer puts
 /// `mise`. The runner checks an executable there like any other (owned by the user, not

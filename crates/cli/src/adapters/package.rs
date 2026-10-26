@@ -28,7 +28,7 @@ const INSTALL_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const MAX_OUTPUT: usize = 1 << 20;
 
 /// Homebrew probes and installs disable auto-update, analytics, hints and cleanup
-/// (architecture section 8 item 5), the upgrade of an outdated requested formula, and the
+/// (docs/packages.md), the upgrade of an outdated requested formula, and the
 /// upgrade or reinstall of its installed dependents: a package plan installs what is missing and
 /// changes nothing it did not list (DESIGN.md: a plan contains no implicit upgrades). These
 /// variables reach only the manager's own `brew` child, never the user's shell.
@@ -76,7 +76,7 @@ fn uv_env(offline: bool) -> Vec<(String, String)> {
     env
 }
 
-/// The package name as a checked parameter (architecture section 8 item 3): letters, digits,
+/// The package name as a checked parameter: letters, digits,
 /// `.`, `_`, `-`, `+`, `@`, `/` and `:` (a Homebrew tap, a version suffix or a mise backend
 /// prefix such as `npm:`), not starting with `-`, at most 128 characters.
 pub fn name(value: &Value) -> Result<String, Refusal> {

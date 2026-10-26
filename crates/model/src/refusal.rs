@@ -1,7 +1,7 @@
 use crate::Exit;
 use std::fmt;
 
-/// Stable error codes. The first group is defined by docs/architecture.md; the
+/// Stable error codes. The first group is the original set; the
 /// second group is added by the bootstrap task (docs/bootstrap.md) and the third by the
 /// state task (docs/state.md).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -29,7 +29,7 @@ pub enum Code {
     /// The requested report cannot be produced because a source cannot be read.
     ReportUnavailable,
     // Resolver codes. The `expected_error` values in examples/cases.toml and E_ADAPTER_UNKNOWN
-    // (docs/architecture.md section 11) are fixed by the docs. The others are added by DFM-15
+    // (docs/resolver.md) are fixed by the docs. The others are added by DFM-15
     // and listed in docs/resolver.md.
     OverrideForbidden,
     OverrideConflict,
@@ -49,8 +49,7 @@ pub enum Code {
     ManifestInvalid,
     ReferenceInvalid,
     TypeMismatch,
-    // Planner codes added by DFM-16 (docs/planner.md). E_CONFLICT is named by docs/architecture.md
-    // section 8; the others are new.
+    // Planner codes added by DFM-16 (docs/planner.md). E_CONFLICT is older; the others are new.
     Conflict,
     ParentUnsafe,
     PlanCycle,
@@ -69,7 +68,7 @@ pub enum Code {
     // Added by DFM-47 (docs/apply.md, signals). The stop was requested by SIGINT or SIGTERM.
     Interrupted,
     Terminated,
-    // Added by DFM-55 (docs/architecture.md section 10, docs/resolver.md). The bound profile
+    // Added by DFM-55 (docs/resolver.md). The bound profile
     // targets another platform or architecture than this machine.
     PlatformMismatch,
     // Added by DFM-22 (docs/secrets.md). The vault credential is not available to a
@@ -230,16 +229,16 @@ impl Code {
     pub const fn exit(self) -> Exit {
         match self {
             Code::Usage => Exit::Usage,
-            // docs/architecture.md section 10, exit 2: "inability to produce the requested report".
+            // Exit 2: inability to produce the requested report (docs/resolver.md).
             Code::ReportUnavailable => Exit::Usage,
             // A failure while writing, or findings from a read-only check, are not refusals.
             Code::IoFailed | Code::Diagnosed | Code::IoUnconfirmed => Exit::Failed,
             // A provider that ran and failed is a failed operation, as an I/O failure is.
             Code::RenderFailed => Exit::Failed,
-            // Section 10: a stop by signal exits 130 or 143, also after a mutation.
+            // A stop by signal exits 130 or 143, also after a mutation.
             Code::Interrupted => Exit::Interrupted,
             Code::Terminated => Exit::Terminated,
-            // Section 10: a queued request whose completion was not observed exits 5.
+            // A queued request whose completion was not observed exits 5.
             Code::Pending => Exit::Pending,
             _ => Exit::Blocked,
         }
@@ -251,8 +250,8 @@ impl Code {
 pub struct Refusal {
     pub code: Code,
     pub detail: String,
-    /// True when state was already changed before this refusal. Section 10: a gate that fails
-    /// after a mutation began exits 1, not 3.
+    /// True when state was already changed before this refusal. A gate that fails after a
+    /// mutation began exits 1, not 3.
     pub mutated: bool,
 }
 

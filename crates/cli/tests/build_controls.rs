@@ -1,6 +1,5 @@
 //! Differential test: `scripts/bootstrap.sh check-controls` and `self-check --build-controls`
-//! must give the same result on every shared fixture (docs/architecture.md section 14, open
-//! risk "Bootstrap checker ... matches self-check --build-controls").
+//! must give the same result on every shared fixture (docs/bootstrap.md).
 
 mod common;
 
