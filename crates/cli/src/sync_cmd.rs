@@ -22,13 +22,13 @@ use dfm_engine::{
 };
 use dfm_model::binding::Binding;
 use dfm_model::digest::sha256_hex;
-use dfm_model::display::visible;
+use dfm_model::display::{visible, visible_for_paste};
 use dfm_model::lock::{Grants, Lock, LockSource, MAX_BYTES as LOCK_MAX_BYTES, check_origin};
 use dfm_model::plan::{Action, Blocker, Ownership, Plan, Scope, Status as PlanStatus};
 use dfm_model::resolve::resolve;
 use dfm_model::state::{self, Class, JournalEntry, Phase, Recovery, rfc3339};
 use dfm_model::{Code, Refusal};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::Write;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -998,13 +998,15 @@ struct ScopePlan {
     /// scope does not run and the other scopes do. A blocked configuration plan refuses the run.
     blocked: bool,
     /// Services blocked only because their definition or configuration file is not published
-    /// yet, while the configuration plan publishes it: they are planned after that scope.
-    deferred: BTreeSet<String>,
+    /// yet, while the configuration plan publishes it: they are planned after that scope. Each
+    /// is reviewed as a start, or as a restart when `--restart` names it.
+    deferred: BTreeMap<String, Action>,
 }
 
 impl ScopePlan {
     /// The plan as the owner reviews it: the scope's own operations (a `not_in_scope` one
-    /// belongs to another scope), and each deferred service shown as the start it becomes.
+    /// belongs to another scope), and each deferred service shown as the start or the requested
+    /// restart it becomes.
     fn reviewed(&self, config: &Plan) -> Plan {
         let mut own = self.plan.clone();
         own.operations
@@ -1012,7 +1014,7 @@ impl ScopePlan {
         for o in own
             .operations
             .iter_mut()
-            .filter(|o| self.deferred.contains(&o.id))
+            .filter(|o| self.deferred.contains_key(&o.id))
         {
             let by: Vec<String> = self
                 .plan
@@ -1022,12 +1024,19 @@ impl ScopePlan {
                 .filter_map(|b| Some(format!("{} ({})", b.path.as_ref()?, publisher(config, b)?)))
                 .collect();
             o.status = PlanStatus::Planned;
-            o.action = Action::Start;
-            o.effect = format!(
-                "start {} after the configuration scope publishes {}; planned again from the published files before it starts",
-                o.resource,
-                by.join(", ")
-            );
+            o.action = self.deferred[&o.id];
+            o.effect = match o.action {
+                Action::Restart => format!(
+                    "restart {} on request (--restart) after the configuration scope publishes {}; disruptive; planned again from the published files before it restarts",
+                    o.resource,
+                    by.join(", ")
+                ),
+                _ => format!(
+                    "start {} after the configuration scope publishes {}; planned again from the published files before it starts",
+                    o.resource,
+                    by.join(", ")
+                ),
+            };
         }
         own.blockers.retain(|b| publisher(config, b).is_none());
         own
@@ -1175,10 +1184,11 @@ fn plan_staged(
 ) -> Result<(Loaded, Vec<ScopePlan>), Refusal> {
     let sources = load_scoped(tree, rel)?;
     let resolved = resolve(&sources, rel, &builtin_catalog())?;
-    let loaded = Loaded {
+    let mut loaded = Loaded {
         binding: binding.clone(),
         root: root.to_path_buf(),
         staged: Some(tree.to_path_buf()),
+        links: BTreeMap::new(),
         sources,
         resolved,
     };
@@ -1189,6 +1199,14 @@ fn plan_staged(
     let mut plans: Vec<ScopePlan> = Vec::new();
     for scope in SCOPES {
         let plan = plan_scope(ctx, &sys, args, scope, &loaded)?;
+        if scope == Scope::Config {
+            loaded.links = plan
+                .operations
+                .iter()
+                .filter(|o| o.status == PlanStatus::Planned)
+                .filter_map(|o| Some((o.path.clone()?, o.link.clone()?)))
+                .collect();
+        }
         // Re-renders alone are not worth a vault contact on a run that changes nothing else.
         let no_session = match scope {
             Scope::Secrets if !rerenders_only(&plan) => {
@@ -1200,14 +1218,18 @@ fn plan_staged(
             true => Vec::new(),
             false => planned_secrets(&plan),
         };
-        let (mut blocked, mut deferred) = (false, BTreeSet::new());
+        let (mut blocked, mut deferred) = (false, BTreeMap::new());
         if let (Scope::Packages | Scope::Secrets | Scope::Services, Some(config)) =
             (scope, plans.first())
         {
             for b in &plan.blockers {
                 match publisher(&config.plan, b) {
                     Some(_) if scope == Scope::Services => {
-                        deferred.insert(format!("{}@service", b.resource));
+                        let action = match args.restart.contains(&b.resource) {
+                            true => Action::Restart,
+                            false => Action::Start,
+                        };
+                        deferred.insert(format!("{}@service", b.resource), action);
                     }
                     _ => blocked = true,
                 }
@@ -1302,7 +1324,8 @@ fn show(
 
 /// The checks `apply` runs before its lock (`apply_cmd::check_before_lock`), per scope with that
 /// scope's approvals, for the scopes that will run (a deferred service is checked when its scope
-/// plans it again). An approval id that names no operation of any plan is a usage error. Missing
+/// plans it again; only the approval of a deferred restart is checked here, before publication).
+/// An approval id that names no operation of any reviewed plan is a usage error. Missing
 /// approvals of every scope are printed as one list before the refusal. Returns whether the
 /// journal holds open work.
 fn check_scopes(
@@ -1317,10 +1340,11 @@ fn check_scopes(
             Allowance::Disruptive => &args.apply.allow,
             Allowance::Adopt => &args.apply.allow_adopt,
         };
-        if let Some(bad) = given
-            .iter()
-            .find(|id| !plans.iter().any(|p| needs(&p.plan, kind, id)))
-        {
+        if let Some(bad) = given.iter().find(|id| {
+            !plans
+                .iter()
+                .any(|p| needs(&p.reviewed(&plans[0].plan), kind, id))
+        }) {
             return Err(usage(format!(
                 "{} {bad} names no planned {} in any scope of this sync",
                 kind.flag(),
@@ -1332,12 +1356,25 @@ fn check_scopes(
     let (mut open, mut missing) = (false, None);
     for p in plans.iter().filter(|p| !p.blocked && p.skipped.is_empty()) {
         let mut plan = p.plan.clone();
-        plan.operations.retain(|o| !p.deferred.contains(&o.id));
+        plan.operations.retain(|o| !p.deferred.contains_key(&o.id));
         if !p.deferred.is_empty() {
             plan.blockers.clear();
         }
         let generator = apply_cmd::generators_for(ctx, &sys, p.scope, loaded);
         let scoped = scope_args(args, p.scope, Some(&p.plan));
+        let restarts: Vec<String> = p
+            .deferred
+            .iter()
+            .filter(|(_, a)| **a == Action::Restart)
+            .map(|(id, _)| id.clone())
+            .collect();
+        let approved: BTreeSet<String> = args
+            .apply
+            .allow
+            .iter()
+            .filter(|id| restarts.contains(id))
+            .cloned()
+            .collect();
         match apply_cmd::check_before_lock(ctx, &scoped, &plan, &p.digest, &generator, out) {
             Ok(o) => open |= o,
             Err(e) if matches!(e.code, Code::DisruptiveUnapproved | Code::AdoptUnapproved) => {
@@ -1345,23 +1382,31 @@ fn check_scopes(
             }
             Err(e) => return Err(e),
         }
+        if let Err(e) = dfm_engine::check_allow(Allowance::Disruptive, &restarts, &approved) {
+            writeln!(out, "{}", visible_for_paste(&e.detail)).map_err(|e| {
+                Refusal::new(Code::IoFailed, format!("output failed: {}", e.kind()))
+            })?;
+            missing.get_or_insert(e);
+        }
     }
     missing.map_or(Ok(open), Err)
 }
 
 /// Whether `fresh`, a services plan of the published tree, is the reviewed plan `p` up to what
 /// the configuration scope of this run changed: its deferred services are now planned as starts
-/// (or current, when the launcher already holds them),
+/// (or current, when the launcher already holds them; or restarts, when the owner requested and
+/// approved the restart before publication),
 /// and a `path:`, `sensitive-path:` or `content:` precondition on a path in `written` (the paths
 /// the reviewed configuration plan wrote) may differ. Every other operation and precondition,
 /// the sources and the model are unchanged, and nothing blocks. The observations are left out:
 /// each operation's preconditions carry the states it depends on.
 fn as_reviewed(p: &ScopePlan, fresh: &Plan, written: &BTreeSet<String>) -> bool {
-    let started = p.deferred.iter().all(|id| {
+    let started = p.deferred.iter().all(|(id, reviewed)| {
         fresh.operations.iter().any(|o| {
             o.id == *id
                 && (o.status == PlanStatus::Current
-                    || (o.status == PlanStatus::Planned && o.action == Action::Start))
+                    || (o.status == PlanStatus::Planned
+                        && (o.action == Action::Start || o.action == *reviewed)))
         })
     });
     let on_written = |subject: &str| {
@@ -1372,7 +1417,7 @@ fn as_reviewed(p: &ScopePlan, fresh: &Plan, written: &BTreeSet<String>) -> bool 
     };
     let rest = |plan: &Plan| {
         let mut c = plan.clone();
-        c.operations.retain(|o| !p.deferred.contains(&o.id));
+        c.operations.retain(|o| !p.deferred.contains_key(&o.id));
         for o in &mut c.operations {
             o.preconditions.retain(|pc| !on_written(&pc.subject));
         }
@@ -1786,6 +1831,8 @@ fn run_scope(
     written: &BTreeSet<String>,
     out: &mut dyn Write,
 ) -> Result<Option<Vec<(String, String)>>, Refusal> {
+    let mut approvals = &p.plan;
+    let fresh;
     let digest = match p.scope {
         Scope::Secrets => {
             let no_session = secret::missing_sessions(&p.plan, &loaded.resolved, &ctx.runner(sys))?;
@@ -1796,20 +1843,22 @@ fn run_scope(
         }
         Scope::Services => {
             let now = crate::load_resolved(ctx, args.apply.root.as_deref().map(Path::new))?;
-            let fresh = plan_scope(ctx, sys, args, p.scope, &now)?;
+            fresh = plan_scope(ctx, sys, args, p.scope, &now)?;
             if !as_reviewed(p, &fresh, written) {
                 return Err(Refusal::new(
                     Code::PlanStale,
                     "the services plan after the configuration scope is not the reviewed one. Fix: run dfm sync again and approve the new plan",
                 ));
             }
+            // A deferred restart is an operation of this plan only: its approval goes with it.
+            approvals = &fresh;
             fresh.digest()?
         }
         Scope::Config | Scope::Packages => p.digest.clone(),
     };
     let scoped = apply_cmd::Args {
         yes_plan: Some(digest),
-        ..scope_args(args, p.scope, Some(&p.plan))
+        ..scope_args(args, p.scope, Some(approvals))
     };
     apply_cmd::run(ctx, &scoped, out).map(|()| None)
 }
@@ -1895,7 +1944,7 @@ mod tests {
             skipped: vec![],
             no_session: vec![],
             blocked: false,
-            deferred: BTreeSet::new(),
+            deferred: BTreeMap::new(),
         }
     }
 
@@ -1942,6 +1991,13 @@ mod tests {
             .preconditions
             .push(pre(&format!("path:{PLIST}.d"), "missing"));
         assert!(!as_reviewed(&review, &extra, &written));
+        // 4. A deferred service may come back as a restart only when it was reviewed as one.
+        let mut deferred = reviewed(services_plan(before()));
+        let id = deferred.plan.operations[0].id.clone();
+        deferred.deferred.insert(id.clone(), Action::Start);
+        assert!(!as_reviewed(&deferred, &action, &written));
+        deferred.deferred.insert(id, Action::Restart);
+        assert!(as_reviewed(&deferred, &action, &written));
     }
 
     #[test]

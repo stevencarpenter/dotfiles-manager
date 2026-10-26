@@ -263,7 +263,10 @@ pub(crate) fn probe(
             probed.package = crate::adapters::package::package_facts(resolved, &ctx.runner(sys))?;
         }
         Scope::Services => {
-            let staged = loaded.staged.as_deref().map(|t| (loaded.root.as_path(), t));
+            let staged = loaded
+                .staged
+                .as_deref()
+                .map(|t| (loaded.root.as_path(), t, &loaded.links));
             probed.service =
                 crate::adapters::service::service_facts(resolved, &ctx.runner(sys), staged)?;
             probed.restart = args.restart.clone();

@@ -2075,6 +2075,94 @@ fn a_service_precondition_on_a_path_the_configuration_did_not_write_stays_stale(
 }
 
 #[test]
+fn a_deferred_service_named_by_restart_is_reviewed_and_run_as_a_restart() {
+    let l = Life::new();
+    l.with_bar();
+    // The running bar now also reads a file that only this run publishes: its operation is
+    // deferred, and the owner asks for the restart that makes bar read it.
+    let module = format!(
+        "{}\n[[resources]]\nid = \"barextra\"\nkind = \"link\"\nadapter = \"fs-link/v1\"\ntarget = \".config/bar/extra\"\n[resources.value]\nsource = \"files/barextra\"\n",
+        bar_module("barrc").replace(
+            "config = [\".config/bar/barrc\"]",
+            "config = [\".config/bar/barrc\", \".config/bar/extra\"]"
+        )
+    );
+    l.push_module(&module, &[("barextra", "width=1\n")], "bar reads extra");
+    const BAR_OP: &str = "life.bar@service";
+    // The restart is disruptive: the preview asks for its flag before anything is published.
+    let o = l.preview(&["--restart", "life.bar"]);
+    assert_eq!(code(&o), 3, "{}\n{}", stdout(&o), stderr(&o));
+    assert!(
+        stdout(&o).contains(&format!("--allow-disruptive '{BAR_OP}'")),
+        "{}",
+        stdout(&o)
+    );
+    let o = l.sync(&digest_of(&o), &["--restart", "life.bar"]);
+    assert_eq!(code(&o), 3, "{}\n{}", stdout(&o), stderr(&o));
+    assert!(!l.fx.h(".config/bar/extra").exists());
+    let flags = ["--restart", "life.bar", "--allow-disruptive", BAR_OP];
+    let p = l.preview(&flags);
+    assert_eq!(code(&p), 0, "{}\n{}", stdout(&p), stderr(&p));
+    in_order(
+        &stdout(&p),
+        &[
+            "planned life.barextra@.config/bar/extra",
+            "planned life.bar@service [life] restart life.bar on request (--restart) after the configuration scope publishes .config/bar/extra",
+        ],
+    );
+    let log = l.log();
+    let o = l.sync(&digest_of(&p), &flags);
+    assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
+    in_order(
+        &stdout(&o),
+        &["  config: ok", "  services: ok", "result: ok"],
+    );
+    assert!(
+        l.log()[log.len()..].contains("brew services restart bar"),
+        "{}",
+        l.log()
+    );
+}
+
+#[test]
+fn a_definition_link_the_configuration_retargets_is_reviewed_from_its_new_target() {
+    let l = Life::new();
+    let o = l.approved(&[]);
+    assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
+    // Upstream points the loaded agent's definition link at another source file, which runs
+    // another program. Both source files stay present.
+    let seed = &l.fx.upstream.seed;
+    put(
+        seed,
+        "base/modules/life/module.toml",
+        &LIFE.replace(
+            "source = \"files/org.example.agent.plist\"",
+            "source = \"files/agent2.plist\"",
+        ),
+    );
+    put(
+        seed,
+        "base/modules/life/files/agent2.plist",
+        &AGENT_PLIST.replace("/usr/bin/true", "/usr/bin/false"),
+    );
+    l.fx.upstream
+        .push("the agent link points at another definition");
+    let flags = ["--restart", "life.agent", "--allow-disruptive", AGENT_OP];
+    let p = l.preview(&flags);
+    assert_eq!(code(&p), 0, "{}\n{}", stdout(&p), stderr(&p));
+    let s = stdout(&p);
+    assert!(s.contains("the definition runs /usr/bin/false"), "{s}");
+    assert!(!s.contains("the definition runs /usr/bin/true"), "{s}");
+    let o = l.sync(&digest_of(&p), &flags);
+    assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
+    in_order(
+        &stdout(&o),
+        &["  config: ok", "  services: ok", "result: ok"],
+    );
+    in_order(&l.log(), &["launchctl bootout", "launchctl bootstrap"]);
+}
+
+#[test]
 fn a_session_that_ends_before_the_secrets_scope_names_dfm_secrets_as_the_fix() {
     let l = Life::new();
     let o = l.approved(&[]);

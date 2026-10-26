@@ -473,17 +473,22 @@ fn only(state: ServiceState) -> ServiceFacts {
     }
 }
 
+/// `sync`'s live root, its staged copy, and the absolute target of each link the configuration
+/// scope will publish, by its HOME-relative path.
+type Staged<'a> = (&'a Path, &'a Path, &'a BTreeMap<String, String>);
+
 /// The state of a launchd user agent: its definition must be published under HOME and declare
 /// the label; the agent is current when the domain loaded that very file (compared after
 /// resolving links, as launchd reports the resolved path). Loaded from another file is foreign:
 /// the manager did not load it and never unloads it. The run state is reported, not required: a
 /// one-shot agent is not running after it ran. The definition's content hash and program go to
-/// the plan. With `staged` (`sync`'s live root and its staged copy), a definition that resolves
-/// into the root is read from the copy: the plan shows what publication will put there.
+/// the plan. With `staged` (see [`Staged`]), a definition that resolves
+/// into the root is read from the copy, at the new target when the configuration scope retargets
+/// its link: the plan shows what publication will put there.
 fn launchd_state(
     runner: &Runner,
     value: &Value,
-    staged: Option<(&Path, &Path)>,
+    staged: Option<Staged<'_>>,
 ) -> Result<ServiceFacts, Refusal> {
     let label = label(value)?;
     let plist = definition(value)?;
@@ -502,11 +507,16 @@ fn launchd_state(
             ))));
         }
     };
-    let read_from =
-        match staged.and_then(|(root, tree)| Some(tree.join(canonical.strip_prefix(root).ok()?))) {
-            Some(copy) => copy,
-            None => canonical.clone(),
-        };
+    let read_from = match staged {
+        Some((root, tree, links)) => {
+            let target = links.get(&plist).map_or(canonical.as_path(), Path::new);
+            match target.strip_prefix(root) {
+                Ok(rel) => tree.join(rel),
+                Err(_) => target.to_path_buf(),
+            }
+        }
+        None => canonical.clone(),
+    };
     let bytes = match definition_bytes(&read_from) {
         Ok(b) => b,
         Err(why) => return Ok(only(ServiceState::Unknown(why))),
@@ -645,7 +655,7 @@ fn probe_from(
     runner: &Runner,
     adapter: &str,
     value: &Value,
-    staged: Option<(&Path, &Path)>,
+    staged: Option<Staged<'_>>,
 ) -> Result<ServiceFacts, Refusal> {
     match adapter {
         LAUNCHD => launchd_state(runner, value, staged),
@@ -800,11 +810,11 @@ pub fn act(
 
 /// Probes every selected service resource for a services plan, by resource id. A stop request
 /// ends the probing: the probe it arrived in is ended by the runner, no further launcher is
-/// started, and the request is the error. `staged` is `sync`'s live root and staged copy.
+/// started, and the request is the error. `staged` is [`Staged`].
 pub fn service_facts(
     resolved: &Resolved,
     runner: &Runner,
-    staged: Option<(&Path, &Path)>,
+    staged: Option<Staged<'_>>,
 ) -> Result<BTreeMap<String, ServiceFacts>, Refusal> {
     let mut out = BTreeMap::new();
     for r in resolved
