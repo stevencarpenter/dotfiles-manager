@@ -2088,6 +2088,49 @@ fn bar_module(source: &str) -> String {
 }
 
 #[test]
+fn a_service_with_a_second_missing_config_file_the_configuration_does_not_publish_is_blocked() {
+    let l = Life::new();
+    fs::write(l.fake.path().join("brew-bar"), "stopped").unwrap();
+    // bar reads two config files; the configuration scope publishes only the first, and
+    // nothing publishes the second.
+    let module = bar_module("barrc").replace(
+        "config = [\".config/bar/barrc\"]",
+        "config = [\".config/bar/barrc\", \".config/bar/barrc2\"]",
+    );
+    l.push_module(&module, &[("barrc", "height=1\n")], "bar reads two files");
+    let p = l.preview(&[]);
+    assert_eq!(code(&p), 0, "{}\n{}", stdout(&p), stderr(&p));
+    in_order(
+        &stdout(&p),
+        &[
+            "planned life.barrc@.config/bar/barrc",
+            "scope: services",
+            "blocked: this scope does not run: ",
+            "warning: services blocked: ",
+        ],
+    );
+    let s = stdout(&p);
+    assert!(
+        s.contains(".config/bar/barrc2, which is not published"),
+        "{s}"
+    );
+    let o = l.sync(&digest_of(&p), &[]);
+    assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
+    let s = stdout(&o);
+    in_order(
+        &s,
+        &[
+            "  config: ok",
+            "  services: blocked (",
+            "result: ok\nwarning: services blocked: ",
+        ],
+    );
+    assert!(!s.contains("E_PLAN_STALE"), "{s}");
+    assert!(l.fx.h(".config/bar/barrc").is_symlink());
+    assert!(!l.log().contains("brew services start"), "{}", l.log());
+}
+
+#[test]
 fn a_service_config_file_the_configuration_scope_rewrites_does_not_make_services_stale() {
     let l = Life::new();
     l.with_bar();

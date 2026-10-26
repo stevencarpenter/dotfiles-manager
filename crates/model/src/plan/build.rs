@@ -1316,7 +1316,8 @@ impl Planner<'_> {
     /// launcher; the plan starts what is not loaded, restarts what is loaded otherwise than
     /// declared (or on request), and never stops or removes. Each declared prerequisite file
     /// must exist now and is recorded as a precondition; a missing one blocks the service, since
-    /// a reload depends on the published file.
+    /// a reload depends on the published file. Every missing one is a blocker, so a caller sees
+    /// all the files the service waits for, not only the first.
     fn service(&mut self, r: &ResolvedResource) {
         let id = format!("{}@service", r.id);
         let mut op = self.skeleton(r, id.clone(), None);
@@ -1332,6 +1333,7 @@ impl Planner<'_> {
             ),
         };
         let shown = format!("{name} with {}", r.adapter);
+        let mut missing = false;
         for p in service_prerequisites(r) {
             let present = match self.obs.seen.get(&p).map(|s| &s.node) {
                 Some(Node::Link { to, .. }) => !matches!(to, LinkTo::Dangling | LinkTo::Loop),
@@ -1347,10 +1349,15 @@ impl Planner<'_> {
                     ),
                     "publish it first (apply), then run services again",
                 );
-                op.effect = format!("blocked: {}", f.detail);
+                if !missing {
+                    op.effect = format!("blocked: {}", f.detail);
+                }
+                missing = true;
                 self.blocker(r, Some(&p), f);
-                self.ops.insert(id, op);
-                return;
+                continue;
+            }
+            if missing {
+                continue;
             }
             // A sensitive prerequisite (a secret output a program reads) is recorded by mode
             // only, as everywhere else: no hash and no size of it reaches the plan or a message.
@@ -1363,6 +1370,10 @@ impl Planner<'_> {
                     state: node_state(seen, sensitive),
                 });
             }
+        }
+        if missing {
+            self.ops.insert(id, op);
+            return;
         }
         let facts = self.cx.service.get(&r.id).cloned();
         let mut runs = String::new();
