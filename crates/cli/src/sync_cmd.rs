@@ -992,6 +992,8 @@ struct ScopePlan {
     digest: String,
     /// The planned secret resources, when no 1Password session exists: this run skips them.
     skipped: Vec<String>,
+    /// The accounts without a session, each with what `op whoami` answered.
+    no_session: Vec<(String, String)>,
     /// A packages, secrets or services plan with a blocker that this run cannot clear: the
     /// scope does not run and the other scopes do. A blocked configuration plan refuses the run.
     blocked: bool,
@@ -1057,7 +1059,11 @@ impl ScopePlan {
     /// The end-of-output warning of a skipped or blocked scope, if any (docs/sync.md).
     fn warning(&self) -> Option<String> {
         if !self.skipped.is_empty() {
-            return Some(skipped_warning(&self.skipped));
+            return Some(skipped_warning(
+                &self.skipped,
+                &self.no_session,
+                "run dfm sync or dfm secrets again",
+            ));
         }
         if !self.blocked {
             return None;
@@ -1078,9 +1084,16 @@ impl ScopePlan {
     }
 }
 
-fn skipped_warning(names: &[String]) -> String {
+/// The warning of skipped secrets: the resources, each account with what `op whoami` answered,
+/// and the command that renders them once 1Password is unlocked.
+fn skipped_warning(names: &[String], no_session: &[(String, String)], then: &str) -> String {
+    let accounts: Vec<String> = no_session
+        .iter()
+        .map(|(a, why)| format!("{a} ({why})"))
+        .collect();
     format!(
-        "secrets skipped, no 1Password session: {}. Fix: unlock 1Password, then run dfm sync or dfm secrets again",
+        "secrets skipped, no 1Password session for {}: {}. Fix: unlock 1Password, then {then}",
+        visible(&accounts.join(", ")),
         visible(&names.join(", "))
     )
 }
@@ -1141,7 +1154,7 @@ fn plan_scope(
     scope: Scope,
     loaded: &Loaded,
 ) -> Result<Plan, Refusal> {
-    let probed = apply_cmd::probe(ctx, sys, &scope_args(args, scope, None), &loaded.resolved)?;
+    let probed = apply_cmd::probe(ctx, sys, &scope_args(args, scope, None), loaded)?;
     let plan = plan_for(ctx, loaded, scope, probed)?;
     if scope == Scope::Services {
         apply_cmd::check_restart(&args.restart, &plan)?;
@@ -1176,17 +1189,16 @@ fn plan_staged(
     let mut plans: Vec<ScopePlan> = Vec::new();
     for scope in SCOPES {
         let plan = plan_scope(ctx, &sys, args, scope, &loaded)?;
-        let skipped = match scope {
-            // Re-renders alone are not worth a vault contact on a run that changes nothing else.
-            Scope::Secrets if rerenders_only(&plan) => Vec::new(),
-            Scope::Secrets => {
-                match secret::credentials(&plan, &loaded.resolved, &ctx.runner(&sys)) {
-                    Ok(()) => Vec::new(),
-                    Err(e) if e.code == Code::CredentialUnavailable => planned_secrets(&plan),
-                    Err(e) => return Err(e),
-                }
+        // Re-renders alone are not worth a vault contact on a run that changes nothing else.
+        let no_session = match scope {
+            Scope::Secrets if !rerenders_only(&plan) => {
+                secret::missing_sessions(&plan, &loaded.resolved, &ctx.runner(&sys))?
             }
             _ => Vec::new(),
+        };
+        let skipped = match no_session.is_empty() {
+            true => Vec::new(),
+            false => planned_secrets(&plan),
         };
         let (mut blocked, mut deferred) = (false, BTreeSet::new());
         if let (Scope::Packages | Scope::Secrets | Scope::Services, Some(config)) =
@@ -1209,6 +1221,7 @@ fn plan_staged(
             digest: plan.digest()?,
             plan,
             skipped,
+            no_session,
             blocked,
             deferred,
         });
@@ -1336,20 +1349,33 @@ fn check_scopes(
     missing.map_or(Ok(open), Err)
 }
 
-/// Whether `fresh`, a services plan of the published tree, is the reviewed plan `p` with its
-/// deferred services now planned as starts: every other operation, the sources and the model
-/// are unchanged, and nothing blocks. The observations are left out: the configuration scope
-/// changed them, and each operation's preconditions carry the states it depends on.
-fn as_reviewed(p: &ScopePlan, fresh: &Plan) -> bool {
+/// Whether `fresh`, a services plan of the published tree, is the reviewed plan `p` up to what
+/// the configuration scope of this run changed: its deferred services are now planned as starts
+/// (or current, when the launcher already holds them),
+/// and a `path:`, `sensitive-path:` or `content:` precondition on a path in `written` (the paths
+/// the reviewed configuration plan wrote) may differ. Every other operation and precondition,
+/// the sources and the model are unchanged, and nothing blocks. The observations are left out:
+/// each operation's preconditions carry the states it depends on.
+fn as_reviewed(p: &ScopePlan, fresh: &Plan, written: &BTreeSet<String>) -> bool {
     let started = p.deferred.iter().all(|id| {
-        fresh
-            .operations
-            .iter()
-            .any(|o| o.id == *id && o.status == PlanStatus::Planned && o.action == Action::Start)
+        fresh.operations.iter().any(|o| {
+            o.id == *id
+                && (o.status == PlanStatus::Current
+                    || (o.status == PlanStatus::Planned && o.action == Action::Start))
+        })
     });
+    let on_written = |subject: &str| {
+        subject.split_once(':').is_some_and(|(kind, path)| {
+            matches!(kind, "path" | "sensitive-path" | "content")
+                && written.contains(&dfm_model::fold::fold(path))
+        })
+    };
     let rest = |plan: &Plan| {
         let mut c = plan.clone();
         c.operations.retain(|o| !p.deferred.contains(&o.id));
+        for o in &mut c.operations {
+            o.preconditions.retain(|pc| !on_written(&pc.subject));
+        }
         c.blockers.clear();
         c.observations = Default::default();
         c
@@ -1419,8 +1445,9 @@ pub fn run(ctx: &Ctx, args: &Args, out: &mut dyn Write) -> Result<(), Refusal> {
             paint::status(ctx.color, e.exit().name())
         );
     }
-    // Last, so the owner sees them without scrolling (docs/sync.md, "Skipped and blocked scopes").
-    for warning in &printed.warnings {
+    // Last, so the owner sees them without scrolling (docs/sync.md, "The four scopes"). A
+    // refused run ends with its refusal instead.
+    for warning in printed.warnings.iter().filter(|_| r.is_ok()) {
         let _ = writeln!(
             out,
             "{} {warning}",
@@ -1618,7 +1645,7 @@ fn run_inner(
     store.require_identity(&binding)?;
     let second = Staging::create(ctx, &sys, true)?;
     let staged = stage_all(&git, root_src, &grants, &root, &second.tree())?;
-    let (_, locked) = plan_staged(ctx, &binding, &root, &rel, &second.tree(), args)?;
+    let (locked_loaded, locked) = plan_staged(ctx, &binding, &root, &rel, &second.tree(), args)?;
     let locked_digest = sync_digest(&locked, &staged);
     if locked_digest != digest {
         return Err(apply_cmd::stale(approved, &locked_digest));
@@ -1668,8 +1695,17 @@ fn run_inner(
     // it. A skipped or blocked scope does not run and stops nothing.
     let mut failure: Option<Refusal> = None;
     let mut changed = !published.is_empty();
-    let mut lines = Vec::new();
+    let mut lines: Vec<(Scope, String)> = Vec::new();
+    // The paths the configuration scope wrote, once it ran with its reviewed digest.
+    let mut written = BTreeSet::new();
+    let fail = state_cmd::fail_from_env()?;
     for p in &locked {
+        // A stop request between two scopes ends the run: no later scope starts.
+        if failure.is_none()
+            && let Some(r) = dfm_engine::signal::requested()
+        {
+            failure = Some(r);
+        }
         let status = if failure.is_some() {
             "not_started".to_string()
         } else if let Some(s) = not_run(p) {
@@ -1684,25 +1720,50 @@ fn run_inner(
                 p.scope.as_str()
             )
             .map_err(w)?;
-            match run_scope(ctx, &sys, args, p, out) {
-                Ok(()) => {
+            let ran = run_scope(ctx, &sys, args, p, &locked_loaded, &written, out)
+                .and_then(|ran| fail.hit("sync-after-scope").map(|()| ran));
+            match ran {
+                Ok(None) => {
                     changed = true;
+                    if p.scope == Scope::Config {
+                        written = p
+                            .plan
+                            .operations
+                            .iter()
+                            .filter(|o| o.status == PlanStatus::Planned)
+                            .filter_map(|o| o.path.as_deref().map(dfm_model::fold::fold))
+                            .collect();
+                    }
                     "ok".into()
                 }
-                // The session ended after the review: the secrets wait, as without one.
-                Err(e) if p.scope == Scope::Secrets && e.code == Code::CredentialUnavailable => {
+                // The session ended after the review. A plain sync would not render these again
+                // (`rerenders_only`), so the fix names `secrets`.
+                Ok(Some(no_session)) => {
                     let names = planned_secrets(&p.plan);
-                    printed.warnings.push(skipped_warning(&names));
+                    printed.warnings.push(skipped_warning(
+                        &names,
+                        &no_session,
+                        "run dfm secrets, which renders them",
+                    ));
                     format!("skipped: no session ({})", visible(&names.join(", ")))
                 }
                 Err(e) => {
-                    let status = format!("{} ({})", e.exit().name(), e.code.as_str());
+                    // `blocked` is the word for a scope that did not run (C10), not a failure.
+                    let word = match e.exit() {
+                        dfm_model::Exit::Blocked => "failed",
+                        exit => exit.name(),
+                    };
+                    let status = format!("{word} ({})", e.code.as_str());
                     failure = Some(e);
                     status
                 }
             }
         };
         lines.push((p.scope, status));
+    }
+    // A stop request decides the exit, also one that came during the last scope's report.
+    if let Some(r) = dfm_engine::signal::requested() {
+        failure = Some(r);
     }
     let result = match failure {
         Some(e) if changed => Err(e.after_mutation()),
@@ -1712,37 +1773,45 @@ fn run_inner(
     finish(ctx, &lines, result, out, printed)
 }
 
-/// Runs one approved scope through its own command (`apply_cmd::run`) with its plan digest. A
-/// services plan with deferred services is planned again first, from the published tree: it
-/// runs only when it is the reviewed plan with those services now planned as starts.
+/// Runs one approved scope through its own command (`apply_cmd::run`) with its plan digest.
+/// Returns the accounts without a session when the secrets scope finds none now: it is skipped.
+/// The services scope is planned again first, from the published tree: it runs only when that
+/// plan is the reviewed one up to what the configuration scope changed (`as_reviewed`).
 fn run_scope(
     ctx: &Ctx,
     sys: &Sys,
     args: &Args,
     p: &ScopePlan,
+    loaded: &Loaded,
+    written: &BTreeSet<String>,
     out: &mut dyn Write,
-) -> Result<(), Refusal> {
-    let digest = if p.deferred.is_empty() {
-        p.digest.clone()
-    } else {
-        let loaded = crate::load_resolved(ctx, args.apply.root.as_deref().map(Path::new))?;
-        let fresh = plan_scope(ctx, sys, args, p.scope, &loaded)?;
-        if !as_reviewed(p, &fresh) {
-            return Err(Refusal::new(
-                Code::PlanStale,
-                format!(
-                    "the services plan after the configuration scope is not the reviewed one with {} started. Fix: run dfm sync again and approve the new plan",
-                    p.deferred.iter().cloned().collect::<Vec<_>>().join(", ")
-                ),
-            ));
+) -> Result<Option<Vec<(String, String)>>, Refusal> {
+    let digest = match p.scope {
+        Scope::Secrets => {
+            let no_session = secret::missing_sessions(&p.plan, &loaded.resolved, &ctx.runner(sys))?;
+            if !no_session.is_empty() {
+                return Ok(Some(no_session));
+            }
+            p.digest.clone()
         }
-        fresh.digest()?
+        Scope::Services => {
+            let now = crate::load_resolved(ctx, args.apply.root.as_deref().map(Path::new))?;
+            let fresh = plan_scope(ctx, sys, args, p.scope, &now)?;
+            if !as_reviewed(p, &fresh, written) {
+                return Err(Refusal::new(
+                    Code::PlanStale,
+                    "the services plan after the configuration scope is not the reviewed one. Fix: run dfm sync again and approve the new plan",
+                ));
+            }
+            fresh.digest()?
+        }
+        Scope::Config | Scope::Packages => p.digest.clone(),
     };
     let scoped = apply_cmd::Args {
         yes_plan: Some(digest),
         ..scope_args(args, p.scope, Some(&p.plan))
     };
-    apply_cmd::run(ctx, &scoped, out)
+    apply_cmd::run(ctx, &scoped, out).map(|()| None)
 }
 
 fn untrusted_refusal(origins: &[&str]) -> Refusal {

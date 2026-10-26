@@ -251,8 +251,9 @@ pub(crate) fn probe(
     ctx: &Ctx,
     sys: &Sys,
     args: &Args,
-    resolved: &dfm_model::resolve::Resolved,
+    loaded: &crate::Loaded,
 ) -> Result<Probed, Refusal> {
+    let resolved = &loaded.resolved;
     let mut probed = Probed::default();
     match args.scope {
         Scope::Packages if args.update => {
@@ -262,7 +263,9 @@ pub(crate) fn probe(
             probed.package = crate::adapters::package::package_facts(resolved, &ctx.runner(sys))?;
         }
         Scope::Services => {
-            probed.service = crate::adapters::service::service_facts(resolved, &ctx.runner(sys))?;
+            let staged = loaded.staged.as_deref().map(|t| (loaded.root.as_path(), t));
+            probed.service =
+                crate::adapters::service::service_facts(resolved, &ctx.runner(sys), staged)?;
             probed.restart = args.restart.clone();
         }
         _ => {}
@@ -352,8 +355,8 @@ fn run_inner(
     let first = load_resolved(ctx, root)?;
     let (layout, sys) = (ctx.layout(), ctx.sys()?);
     // A packages or services plan needs the providers' answers first.
-    let probes = |resolved| probe(ctx, &sys, args, resolved);
-    let plan = plan_for(ctx, &first, args.scope, probes(&first.resolved)?)?;
+    let probes = |loaded| probe(ctx, &sys, args, loaded);
+    let plan = plan_for(ctx, &first, args.scope, probes(&first)?)?;
     stop()?;
     check_restart(&args.restart, &plan)?;
     let digest = plan.digest()?;
@@ -399,7 +402,7 @@ fn run_inner(
         .require_identity(&binding)
         .map_err(|r| store.stamp(r))?;
     let second = load_resolved(ctx, root).map_err(|r| store.stamp(r))?;
-    let facts = probes(&second.resolved).map_err(|r| store.stamp(r))?;
+    let facts = probes(&second).map_err(|r| store.stamp(r))?;
     let locked = plan_for(ctx, &second, args.scope, facts).map_err(|r| store.stamp(r))?;
     stop().map_err(|r| store.stamp(r))?;
     let locked_digest = locked.digest().map_err(|r| store.stamp(r))?;

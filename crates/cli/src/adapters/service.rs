@@ -478,8 +478,13 @@ fn only(state: ServiceState) -> ServiceFacts {
 /// resolving links, as launchd reports the resolved path). Loaded from another file is foreign:
 /// the manager did not load it and never unloads it. The run state is reported, not required: a
 /// one-shot agent is not running after it ran. The definition's content hash and program go to
-/// the plan.
-fn launchd_state(runner: &Runner, value: &Value) -> Result<ServiceFacts, Refusal> {
+/// the plan. With `staged` (`sync`'s live root and its staged copy), a definition that resolves
+/// into the root is read from the copy: the plan shows what publication will put there.
+fn launchd_state(
+    runner: &Runner,
+    value: &Value,
+    staged: Option<(&Path, &Path)>,
+) -> Result<ServiceFacts, Refusal> {
     let label = label(value)?;
     let plist = definition(value)?;
     let abs = runner.home.join(&plist);
@@ -497,7 +502,12 @@ fn launchd_state(runner: &Runner, value: &Value) -> Result<ServiceFacts, Refusal
             ))));
         }
     };
-    let bytes = match definition_bytes(&canonical) {
+    let read_from =
+        match staged.and_then(|(root, tree)| Some(tree.join(canonical.strip_prefix(root).ok()?))) {
+            Some(copy) => copy,
+            None => canonical.clone(),
+        };
+    let bytes = match definition_bytes(&read_from) {
         Ok(b) => b,
         Err(why) => return Ok(only(ServiceState::Unknown(why))),
     };
@@ -627,8 +637,18 @@ fn brew_state(runner: &Runner, value: &Value) -> Result<ServiceFacts, Refusal> {
 /// The launcher's report for one service by its adapter, with the definition facts when the
 /// adapter read one. A bad declaration is `E_MANIFEST_INVALID`.
 pub fn probe(runner: &Runner, adapter: &str, value: &Value) -> Result<ServiceFacts, Refusal> {
+    probe_from(runner, adapter, value, None)
+}
+
+/// As [`probe`], with a definition under `staged.0` read from `staged.1` (see `launchd_state`).
+fn probe_from(
+    runner: &Runner,
+    adapter: &str,
+    value: &Value,
+    staged: Option<(&Path, &Path)>,
+) -> Result<ServiceFacts, Refusal> {
     match adapter {
-        LAUNCHD => launchd_state(runner, value),
+        LAUNCHD => launchd_state(runner, value, staged),
         BREW_SERVICE => brew_state(runner, value),
         other => Err(Refusal::new(
             Code::GeneratorUnavailable,
@@ -780,10 +800,11 @@ pub fn act(
 
 /// Probes every selected service resource for a services plan, by resource id. A stop request
 /// ends the probing: the probe it arrived in is ended by the runner, no further launcher is
-/// started, and the request is the error.
+/// started, and the request is the error. `staged` is `sync`'s live root and staged copy.
 pub fn service_facts(
     resolved: &Resolved,
     runner: &Runner,
+    staged: Option<(&Path, &Path)>,
 ) -> Result<BTreeMap<String, ServiceFacts>, Refusal> {
     let mut out = BTreeMap::new();
     for r in resolved
@@ -794,7 +815,7 @@ pub fn service_facts(
         if let Some(stop) = dfm_engine::signal::requested() {
             return Err(stop);
         }
-        let facts = match probe(runner, &r.adapter, &r.value) {
+        let facts = match probe_from(runner, &r.adapter, &r.value, staged) {
             Ok(f) => f,
             Err(e) if e.code == Code::ManifestInvalid => only(ServiceState::Refused(e.detail)),
             Err(e) => only(ServiceState::Unknown(e.detail)),

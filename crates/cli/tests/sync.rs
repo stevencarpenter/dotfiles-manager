@@ -1364,11 +1364,13 @@ const AGENT_PLIST: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
 
 const AGENT_OP: &str = "life.agent@service";
 
-/// `op whoami` exits 0 only with the `signed-in` marker; `op inject` fills the one reference.
+/// `op whoami` exits 0 only with the `signed-in` marker, and kills itself with the
+/// `whoami-killed` marker; `op inject` fills the one reference.
 const FAKE_OP: &str = r#"#!/bin/sh
 PATH=/usr/bin:/bin:$PATH
 here=$(dirname "$0")
 printf 'op %s\n' "$*" >> "$here/../log"
+[ -e "$here/../whoami-killed" ] && kill -KILL $$
 [ -e "$here/../signed-in" ] || { echo "[ERROR] no session" >&2; exit 1; }
 case "$1" in
   whoami) echo me; exit 0 ;;
@@ -1406,6 +1408,28 @@ case "$1" in
 esac
 "#;
 
+/// `brew services info|start|restart <name>` answers from `brew-<name>` (`started`: loaded and
+/// running; anything else: installed, not loaded; no file: not installed), as
+/// crates/cli/tests/services.rs keeps it. Every other command goes to the package look-alike.
+const FAKE_BREW_WRAPPER: &str = r#"#!/bin/sh
+PATH=/usr/bin:/bin:$PATH
+here=$(dirname "$0")
+[ "$1" = services ] || exec "$here/brew-packages" "$@"
+printf 'brew %s\n' "$*" >> "$here/../log"
+name=$3
+st="$here/../brew-$name"
+case "$2" in
+  info)
+    [ -e "$st" ] || { echo "Error: No available formula with the name \"$name\"." >&2; exit 1; }
+    s=$(cat "$st")
+    if [ "$s" = started ]; then b=true; else b=false; fi
+    printf '[{"name":"%s","service_name":"sh.brew.%s","running":%s,"loaded":%s,"pid":null,"status":"%s"}]\n' "$name" "$name" "$b" "$b" "$s"
+    exit 0 ;;
+  start|restart) echo started > "$st"; exit 0 ;;
+  *) exit 64 ;;
+esac
+"#;
+
 /// A synced checkout whose profile also selects `life`, with `brew`, `op` and `launchctl`
 /// look-alikes first on the provider path (git still comes from `/usr/bin`).
 struct Life {
@@ -1436,7 +1460,8 @@ impl Life {
         let bin = fake.path().join("bin");
         fs::create_dir_all(&bin).unwrap();
         for (name, body) in [
-            ("brew", common::providers::FAKE_BREW),
+            ("brew", FAKE_BREW_WRAPPER),
+            ("brew-packages", common::providers::FAKE_BREW),
             ("op", FAKE_OP),
             ("launchctl", FAKE_LAUNCHCTL),
         ] {
@@ -1470,9 +1495,14 @@ impl Life {
     }
 
     fn run(&self, args: &[&str]) -> Output {
+        self.run_env(&[], args)
+    }
+
+    fn run_env(&self, env: &[(&str, &str)], args: &[&str]) -> Output {
         let path = format!("{}:/usr/bin:/bin", self.fake.path().join("bin").display());
         Command::new(BIN)
             .env_clear()
+            .envs(env.iter().copied())
             .env("DFM_PROVIDER_PATH", path)
             .env("DFM_SERVICE_TIMEOUT_SECS", "1")
             .arg("--home")
@@ -1516,6 +1546,20 @@ impl Life {
 
     fn log(&self) -> String {
         fs::read_to_string(self.fake.path().join("log")).unwrap_or_default()
+    }
+
+    /// Replaces `life`'s module upstream with `LIFE` plus `extra` resources, and adds `files`.
+    fn push_module(&self, extra: &str, files: &[(&str, &str)], message: &str) {
+        let seed = &self.fx.upstream.seed;
+        put(
+            seed,
+            "base/modules/life/module.toml",
+            &format!("{LIFE}{extra}"),
+        );
+        for (f, c) in files {
+            put(seed, &format!("base/modules/life/files/{f}"), c);
+        }
+        self.fx.upstream.push(message);
     }
 
     /// A configuration change upstream: one more link.
@@ -1651,7 +1695,7 @@ fn a_package_failure_leaves_the_later_scopes_not_started() {
 fn secrets_without_a_session_are_skipped_and_the_warning_ends_stdout() {
     let l = Life::new();
     l.sign_in(false);
-    let warning = "warning: secrets skipped, no 1Password session: life.token. Fix: unlock 1Password, then run dfm sync or dfm secrets again";
+    let warning = "warning: secrets skipped, no 1Password session for example-account (op whoami exited 1): life.token. Fix: unlock 1Password, then run dfm sync or dfm secrets again";
     let p = l.preview(&[]);
     assert_eq!(code(&p), 0, "{}\n{}", stdout(&p), stderr(&p));
     let s = stdout(&p);
@@ -1886,4 +1930,167 @@ fn a_blocked_services_plan_does_not_stop_the_other_scopes_and_is_warned_last() {
     );
     assert!(l.fx.h(".config/life/notes").is_symlink());
     assert!(!l.log().contains("launchctl bootstrap"), "{}", l.log());
+}
+
+#[test]
+fn an_edited_definition_is_reviewed_from_staging_and_its_restart_runs() {
+    let l = Life::new();
+    let o = l.approved(&[]);
+    assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
+    // Upstream changes the program of the loaded agent; the owner asks for the restart that
+    // loads it.
+    put(
+        &l.fx.upstream.seed,
+        "base/modules/life/files/org.example.agent.plist",
+        &AGENT_PLIST.replace("/usr/bin/true", "/usr/bin/false"),
+    );
+    l.fx.upstream.push("the agent runs another program");
+    let flags = ["--restart", "life.agent", "--allow-disruptive", AGENT_OP];
+    let p = l.preview(&flags);
+    assert_eq!(code(&p), 0, "{}\n{}", stdout(&p), stderr(&p));
+    let s = stdout(&p);
+    assert!(s.contains("the definition runs /usr/bin/false"), "{s}");
+    assert!(!s.contains("the definition runs /usr/bin/true"), "{s}");
+    let o = l.sync(&digest_of(&p), &flags);
+    assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
+    assert!(stdout(&o).contains("  services: ok"), "{}", stdout(&o));
+    in_order(&l.log(), &["launchctl bootout", "launchctl bootstrap"]);
+}
+
+#[test]
+fn a_service_config_file_the_configuration_scope_rewrites_does_not_make_services_stale() {
+    let l = Life::new();
+    let bar = |source: &str| {
+        format!(
+            "\n[[resources]]\nid = \"barrc\"\nkind = \"link\"\nadapter = \"fs-link/v1\"\ntarget = \".config/bar/barrc\"\n[resources.value]\nsource = \"files/{source}\"\n\n[[resources]]\nid = \"bar\"\nkind = \"service\"\nadapter = \"brew-service/v1\"\n[resources.value]\nname = \"bar\"\nconfig = [\".config/bar/barrc\"]\n"
+        )
+    };
+    fs::write(l.fake.path().join("brew-bar"), "started").unwrap();
+    l.push_module(
+        &bar("barrc"),
+        &[("barrc", "height=1\n"), ("barrc2", "height=2\n")],
+        "add bar",
+    );
+    let o = l.approved(&[]);
+    assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
+    assert!(l.fx.h(".config/bar/barrc").is_symlink());
+    // The configuration scope now points bar's config file elsewhere, and the agent is not
+    // loaded: the services scope runs with a changed `path:` precondition of another service.
+    l.push_module(&bar("barrc2"), &[], "bar reads barrc2");
+    fs::write(l.fake.path().join("loaded"), "").unwrap();
+    let p = l.preview(&[]);
+    assert_eq!(code(&p), 0, "{}\n{}", stdout(&p), stderr(&p));
+    in_order(
+        &stdout(&p),
+        &[
+            "planned life.barrc@.config/bar/barrc",
+            "planned life.agent@service",
+        ],
+    );
+    let o = l.sync(&digest_of(&p), &[]);
+    assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
+    in_order(
+        &stdout(&o),
+        &["  config: ok", "  services: ok", "result: ok"],
+    );
+    assert!(
+        fs::read_link(l.fx.h(".config/bar/barrc"))
+            .unwrap()
+            .ends_with("barrc2")
+    );
+    assert!(l.log().contains("launchctl bootstrap"), "{}", l.log());
+}
+
+#[test]
+fn a_session_that_ends_before_the_secrets_scope_names_dfm_secrets_as_the_fix() {
+    let l = Life::new();
+    let o = l.approved(&[]);
+    assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
+    // A template change is a re-render: the review does not ask the vault, the scope does.
+    put(
+        &l.fx.upstream.seed,
+        "base/modules/life/files/personal.env.tpl",
+        "TOKEN={{ op://vault/item/field }}\nMORE=1\n",
+    );
+    l.fx.upstream.push("the template changes");
+    l.sign_in(false);
+    let o = l.approved(&[]);
+    assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
+    let s = stdout(&o);
+    assert!(
+        s.contains("  secrets: skipped: no session (life.token)"),
+        "{s}"
+    );
+    assert!(
+        s.ends_with("result: ok\nwarning: secrets skipped, no 1Password session for example-account (op whoami exited 1): life.token. Fix: unlock 1Password, then run dfm secrets, which renders them\n"),
+        "{s}"
+    );
+    assert_eq!(
+        fs::read_to_string(l.fx.h(".config/example/personal.env")).unwrap(),
+        "TOKEN=planted-value\n"
+    );
+    // A plain sync now has nothing to approve; `dfm secrets` renders the change.
+    l.sign_in(true);
+    let p = l.run(&["secrets", "--root", l.fx.root_arg(), "--preview"]);
+    assert_eq!(code(&p), 0, "{}\n{}", stdout(&p), stderr(&p));
+    let o = l.run(&["secrets", "--root", l.fx.root_arg(), "-y", &digest_of(&p)]);
+    assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
+    assert_eq!(
+        fs::read_to_string(l.fx.h(".config/example/personal.env")).unwrap(),
+        "TOKEN=planted-value\nMORE=1\n"
+    );
+}
+
+#[test]
+fn a_session_check_that_does_not_answer_fails_instead_of_skipping() {
+    let l = Life::new();
+    l.mark("whoami-killed");
+    let o = l.preview(&[]);
+    assert_eq!(code(&o), 3, "{}\n{}", stdout(&o), stderr(&o));
+    assert!(
+        stderr(&o).contains("E_CREDENTIAL_UNAVAILABLE"),
+        "{}",
+        stderr(&o)
+    );
+    assert!(stderr(&o).contains("ended by a signal"), "{}", stderr(&o));
+    assert!(!stdout(&o).contains("skipped"), "{}", stdout(&o));
+}
+
+#[test]
+fn a_stop_request_between_scopes_starts_no_later_scope() {
+    let l = Life::new();
+    l.push_link();
+    let p = l.preview(&[]);
+    assert_eq!(code(&p), 0, "{}\n{}", stdout(&p), stderr(&p));
+    let o = l.run_env(
+        &[("DFM_FAILPOINT", "sync-after-scope:stop")],
+        &["sync", "--root", l.fx.root_arg(), "-y", &digest_of(&p)],
+    );
+    assert_eq!(code(&o), 143, "{}\n{}", stdout(&o), stderr(&o));
+    in_order(
+        &stdout(&o),
+        &[
+            "  config: ok",
+            "  packages: not_started",
+            "  secrets: not_started",
+            "  services: not_started",
+            "result: terminated",
+        ],
+    );
+    assert!(!l.log().contains("brew install"), "{}", l.log());
+}
+
+#[test]
+fn a_refused_sync_ends_with_its_refusal_not_the_warnings() {
+    let l = Life::new();
+    l.sign_in(false);
+    l.push_link();
+    // Approval is required: the plans list the skipped secrets, and no warning follows.
+    let o = l.run(&["sync", "--root", l.fx.root_arg()]);
+    assert_eq!(code(&o), 3, "{}\n{}", stdout(&o), stderr(&o));
+    let s = stdout(&o);
+    assert!(s.contains("skipped: no session life.token"), "{s}");
+    assert!(s.ends_with("result: blocked\n"), "{s}");
+    assert!(!s.contains("warning:"), "{s}");
+    assert!(stderr(&o).contains("E_APPROVAL_REQUIRED"), "{}", stderr(&o));
 }
