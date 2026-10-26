@@ -354,12 +354,18 @@ fn a_terminal_gets_colored_statuses_and_no_color_turns_them_off() {
     assert_eq!(code(&o), 3, "{}", stderr(&o));
     let t = text(&o.stdout);
     assert!(
-        t.contains("  \x1b[33mplanned\x1b[0m extra.zsh@.zshrc"),
+        t.contains("  \x1b[1;33mplanned\x1b[0m extra.zsh@.zshrc \x1b[36m[extra]\x1b[0m "),
         "{t}"
     );
-    assert!(t.contains("\x1b[1msummary: planned=7\x1b[0m"), "{t}");
-    assert!(t.ends_with("result: \x1b[1;31mblocked\x1b[0m\n"), "{t}");
-    assert!(t.contains("plan digest: "), "{t}");
+    assert!(
+        t.contains("\x1b[1;34msummary:\x1b[0m \x1b[1;33mplanned=7\x1b[0m\n"),
+        "{t}"
+    );
+    assert!(t.contains("\x1b[1;34mplan digest:\x1b[0m \x1b[35m"), "{t}");
+    assert!(
+        t.ends_with("\x1b[1;34mresult:\x1b[0m \x1b[1;31mblocked\x1b[0m\n"),
+        "{t}"
+    );
     for env in [
         &[("DFM_COLOR", "1"), ("NO_COLOR", "1")][..],
         &[("DFM_COLOR", "1"), ("TERM", "dumb")][..],

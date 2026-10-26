@@ -1027,7 +1027,12 @@ pub fn run(ctx: &Ctx, args: &Args, out: &mut dyn Write) -> Result<(), Refusal> {
     if let Err(e) = &r
         && plan_printed
     {
-        let _ = writeln!(out, "result: {}", paint::status(ctx.color, e.exit().name()));
+        let _ = writeln!(
+            out,
+            "{} {}",
+            paint::label(ctx.color, "result:"),
+            paint::status(ctx.color, e.exit().name())
+        );
     }
     r
 }
@@ -1101,7 +1106,8 @@ fn run_inner(
     for s in &previewed {
         writeln!(
             out,
-            "source: {} {} {} {} ({})",
+            "{} {} {} {} {} ({})",
+            paint::label(ctx.color, "source:"),
             s.src.id,
             s.src.origin,
             s.src.reference,

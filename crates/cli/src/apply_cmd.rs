@@ -227,8 +227,17 @@ pub(crate) fn end_without_change(
     if args.yes_plan.is_some() || journal_open || !plan.changes_nothing() {
         return Ok(false);
     }
-    writeln!(out, "nothing to change: no approval needed")?;
-    writeln!(out, "result: {}", paint::status(color, "ok"))?;
+    writeln!(
+        out,
+        "{}",
+        paint::style(color, "1;32", "nothing to change: no approval needed")
+    )?;
+    writeln!(
+        out,
+        "{} {}",
+        paint::label(color, "result:"),
+        paint::status(color, "ok")
+    )?;
     Ok(true)
 }
 
@@ -262,7 +271,12 @@ pub fn run(ctx: &Ctx, args: &Args, out: &mut dyn Write) -> Result<(), Refusal> {
         && !progress.result_printed
     {
         // The printed result is the exit the process returns, from the same refusal.
-        let _ = writeln!(out, "result: {}", paint::status(ctx.color, e.exit().name()));
+        let _ = writeln!(
+            out,
+            "{} {}",
+            paint::label(ctx.color, "result:"),
+            paint::status(ctx.color, e.exit().name())
+        );
     }
     r
 }
@@ -573,7 +587,8 @@ fn run_inner(
     let final_exit = outcome.as_ref().err().map_or(Exit::Ok, Refusal::exit);
     writeln!(
         out,
-        "result: {}",
+        "{} {}",
+        paint::label(ctx.color, "result:"),
         paint::status(ctx.color, final_exit.name())
     )
     .map_err(w)?;

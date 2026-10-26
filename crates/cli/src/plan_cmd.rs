@@ -242,17 +242,19 @@ pub(crate) fn render(
     color: bool,
     out: &mut dyn Write,
 ) -> std::io::Result<()> {
+    let label = |s: &str| paint::label(color, s);
     writeln!(
         out,
-        "plan: profile={} machine={} scope={}",
+        "{} profile={} machine={} scope={}",
+        label("plan:"),
         visible(&p.profile),
         p.machine_id,
         p.scope
     )?;
     for s in &p.sources {
-        writeln!(out, "source: {} {}", visible(&s.root), s.tree)?;
+        writeln!(out, "{} {} {}", label("source:"), visible(&s.root), s.tree)?;
     }
-    writeln!(out, "operations: {}", p.operations.len())?;
+    writeln!(out, "{} {}", label("operations:"), p.operations.len())?;
     for o in &p.operations {
         head_line(o, color, out)?;
         if !o.after.is_empty() {
@@ -272,10 +274,11 @@ pub(crate) fn render(
             writeln!(out, "    sets: {}", visible(&o.sets.join(", ")))?;
         }
         if let Some(n) = o.excluded {
-            writeln!(out, "    note: contains {n} excluded entries, not hashed")?;
+            let note = paint::style(color, "33", "note:");
+            writeln!(out, "    {note} contains {n} excluded entries, not hashed")?;
             writeln!(
                 out,
-                "    note: apply refuses a link inside an excluded entry that is absolute or leaves the directory"
+                "    {note} apply refuses a link inside an excluded entry that is absolute or leaves the directory"
             )?;
         }
         // The fragments a merge layers over its declared values, by name, in merge order. The
@@ -294,7 +297,12 @@ pub(crate) fn render(
             visible(&b.refusal().to_string())
         )?;
     }
-    writeln!(out, "plan digest: {digest}")
+    writeln!(
+        out,
+        "{} {}",
+        label("plan digest:"),
+        paint::style(color, "35", digest)
+    )
 }
 
 fn status_name(s: Status) -> &'static str {
@@ -310,10 +318,10 @@ fn status_name(s: Status) -> &'static str {
 fn head_line(o: &Operation, color: bool, out: &mut dyn Write) -> std::io::Result<()> {
     writeln!(
         out,
-        "  {} {} [{}] {}",
+        "  {} {} {} {}",
         paint::status(color, status_name(o.status)),
         visible(&o.id),
-        visible(&o.module),
+        paint::style(color, "36", &format!("[{}]", visible(&o.module))),
         visible(&o.effect)
     )
 }
@@ -329,7 +337,7 @@ fn summary(p: &Plan, color: bool, out: &mut dyn Write) -> std::io::Result<()> {
         Status::Planned => 1,
         Status::Current | Status::Held | Status::NotInScope => 2,
     };
-    let mut line = String::from("summary:");
+    let mut line = paint::label(color, "summary:");
     for s in [
         Status::Blocked,
         Status::Planned,
@@ -339,16 +347,21 @@ fn summary(p: &Plan, color: bool, out: &mut dyn Write) -> std::io::Result<()> {
     ] {
         let n = p.operations.iter().filter(|o| o.status == s).count();
         if n > 0 {
-            line.push_str(&format!(" {}={n}", status_name(s)));
+            let name = status_name(s);
+            let count = paint::style(color, paint::status_code(name), &format!("{name}={n}"));
+            line.push_str(&format!(" {count}"));
         }
     }
     if p.operations.is_empty() {
         line.push_str(" no operations");
     }
     if p.changes_nothing() {
-        line.push_str("; nothing to change");
+        line.push_str(&format!(
+            "; {}",
+            paint::style(color, "1;32", "nothing to change")
+        ));
     }
-    writeln!(out, "{}", paint::style(color, "1", &line))?;
+    writeln!(out, "{line}")?;
     let mut listed: Vec<&Operation> = p.operations.iter().filter(|o| rank(o.status) < 2).collect();
     listed.sort_by_key(|o| rank(o.status));
     for o in listed.iter().take(SUMMARY_SHOWN) {
