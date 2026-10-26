@@ -111,7 +111,7 @@ These calls load the formula's Ruby file, which for a non-official tap is third-
 
 | Question | Choice |
 | --- | --- |
-| Command shape | A separate `packages` command. `sync` does not compose it (docs/sync.md): run `packages` after a sync when the plan lists packages. |
+| Command shape | A separate `packages` command. `sync` runs it without `--update` as its second scope (docs/sync.md). |
 | Versions and pins | Not read and not written. The value schema has no version field and the source lock has no package pin. Install means "make present". |
 | Probes at plan time | `packages` runs them before it plans. The read-only commands do not. Fixture tests against look-alikes verify the listings. `brew list --versions` (plain and tap-qualified) and `mise ls --installed` were run by hand against the real tools once. |
 | `apt/v1` | Probe only. No privileged adapter exists. The binary runs only on macOS, where `dpkg-query` does not exist, so an apt resource in a plan is `E_PROBE_FAILED`. |

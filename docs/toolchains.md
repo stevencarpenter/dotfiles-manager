@@ -52,7 +52,7 @@ The manager does not upgrade either. Both come from Homebrew on the inventoried 
 
 | Question | Choice |
 | --- | --- |
-| Command shape | A `--update` flag on `packages`. `update` (DFM-31, not built) is to compose sources, locks and every kind. `sync` does not compose packages (docs/sync.md). |
+| Command shape | A `--update` flag on `packages`. `update` (DFM-31, not built) is to compose sources, locks and every kind. `sync` runs `packages` without `--update` (docs/sync.md). |
 | Candidate version | Not shown in the plan. Discovering it needs the provider's registry (`mise latest`, uv's index), which is the network, and a plan is read-only. The provider resolves it at apply time after approval. DESIGN.md section 7 item 1 asks for the eligible candidate before mutation. This gap stays open until `update` gets a network phase from trusted origins. |
 | What `rolling` means for a pin | A declared `tool@version` is a prefix: `mise install tool@1.27` resolves the newest `1.27.x`. A declared version the listing contains as it is, is an exact pin, and the row holds it, because `mise install node@20.20.2` cannot advance. The rule reads the listing, not the number of components, because the listing format differs by backend. Advancing a pin is a manifest edit. |
 | Policy values | Only `rolling` rolls. `hold` and `native-request` hold with the value in the row. A typo is refused, not held silently. |

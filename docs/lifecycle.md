@@ -101,7 +101,7 @@ An interrupted action follows the packages rule (docs/packages.md, "Interrupted 
 
 | Question | Choice |
 | --- | --- |
-| Command shape | A separate `services` command, as `packages` and `secrets` are separate. `sync` does not compose it (docs/sync.md). The `after` edges already name the publishing operations, so a combined plan would order and block correctly. |
+| Command shape | A separate `services` command, as `packages` and `secrets` are separate. `sync` runs it as its last scope (docs/sync.md). There a service whose definition or configuration file the configuration scope publishes in the same run is not blocked: it is planned after that scope. |
 | What "current" means for launchd | The domain holds the label from the declared definition file. Paths are compared with links resolved, because launchd reports the resolved path. Whether launchd's cached definition equals the file now is not observable, so an edited definition is reloaded only on request (`--restart`). |
 | A label loaded from another definition | A blocker, not a restart. The manager never unloads what it did not load. A hand-installed agent under the same label stays until the owner runs the `launchctl bootout` command the blocker names. An approval alone is not enough, because the approval text would not say whose definition goes away. |
 | A loaded daemon that is not running | A blocker, not an automatic restart. The manager keeps no record of which process it started, so it cannot tell its own exited daemon from another owner's. Only `--restart` (disruptive, approved) restarts it. A service ledger of manager-started processes was not built: a process id is not a durable identity across reboots. |

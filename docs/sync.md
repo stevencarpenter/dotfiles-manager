@@ -1,14 +1,15 @@
 # Sync
 
-The `sync` command: pull the latest configuration and apply it. This document describes the behavior at HEAD. Apply is in [docs/apply.md](apply.md), the source loader in [docs/resolver.md](resolver.md).
+The `sync` command: pull the latest configuration and bring the machine to it: configuration, packages, secrets and services, under one approval. This document describes the behavior at HEAD. Apply is in [docs/apply.md](apply.md), the source loader in [docs/resolver.md](resolver.md).
 
 | Part | Location |
 | --- | --- |
 | The lock `[[sources]]` entries, their validation, the canonical origin check and the origin grants document | `crates/model/src/lock.rs` |
 | `state/grants.json` read and write | `crates/engine/src/store.rs` (`read_grants`, `write_grants`) |
-| The command: lock, trust, git through the runner, staging, rehearsal, plan, publication, then `apply` | `crates/cli/src/sync_cmd.rs` |
+| The command: lock, trust, git through the runner, staging, rehearsal, the four scope plans, publication, then each scope | `crates/cli/src/sync_cmd.rs` |
+| One scope's run, its probes and its pre-lock checks (`run`, `probe`, `check_before_lock`) | `crates/cli/src/apply_cmd.rs` |
 | A plan built from a staged copy that names the live root | `crates/cli/src/lib.rs` (`Loaded`, field `staged`), `crates/cli/src/plan_cmd.rs` |
-| Tests with temporary local remotes | `crates/cli/tests/sync.rs` |
+| Tests with temporary local remotes and `brew`, `op` and `launchctl` look-alikes | `crates/cli/tests/sync.rs` |
 
 Git is the `git` binary on the runner's fixed search path (docs/secrets.md, "How `op` is run"). A Homebrew git in `/opt/homebrew/bin` wins over `/usr/bin/git`. Git never runs through a shell or with the caller's environment.
 
@@ -16,14 +17,35 @@ Git is the `git` binary on the runner's fixed search path (docs/secrets.md, "How
 
 ```
 dfm sync [--root <dir>] [--preview] [-y|--yes-plan <digest>] [--allow-disruptive <operation-id>]...
-         [--allow-adopt <operation-id>]... [--trust-origin <origin>]...
+         [--allow-adopt <operation-id>]... [--restart <resource-id>]... [--trust-origin <origin>]...
 ```
 
 - `--root` is the user's checkout: the git working tree that holds the bound profile and `dotfiles-manager.lock`. It defaults to the root the binding records (docs/bootstrap.md).
-- The flags of `apply` keep their meaning (docs/apply.md). The digest that `sync` prints and `--yes-plan` takes is the **sync digest** (step 3), not the configuration plan's.
+- The flags of `apply` keep their meaning (docs/apply.md). Each `--allow-disruptive` and `--allow-adopt` id goes to the scope whose plan has that operation. An id that names no planned operation of that kind in any scope is a usage error. The digest that `sync` prints and `--yes-plan` takes is the **sync digest** (step 3), not a scope plan's.
+- `--restart <resource-id>` goes to the services scope, as for `services` (docs/lifecycle.md). The restart is disruptive and needs its `--allow-disruptive` flag. An id that names no service is a usage error.
 - `--trust-origin <origin>` grants one canonical origin. It is a usage error with `--preview` (a preview writes nothing) or with `--yes-plan` (one command never both widens trust and publishes).
 
-`sync` is the configuration scope only. A package, secret or service resource is `not_in_scope` in its plan. Run `packages`, `secrets` or `services` after a sync when the plan lists them.
+## The four scopes
+
+After publication, `sync` runs four scopes in this order. Each is its own command's run, with the same plan, gates, lock, journal and receipt:
+
+1. **config**: `apply` (docs/apply.md).
+2. **packages**: `packages` without `--update`: install what is missing (docs/packages.md).
+3. **secrets**: `secrets` (docs/secrets.md).
+4. **services**: `services`: start what is not loaded, and restart on `--restart` (docs/lifecycle.md).
+
+Each scope plans from the published tree exactly as its standalone command does, and writes its own receipt (`command` = `apply`, `packages`, `secrets` or `services`) when it changed something. A scope whose plan changes nothing does not run. A scope that fails stops the scopes after it: the summary reports them `not_started`, and the run exits with the failure (exit 1 when an earlier scope or a publication changed something).
+
+Two kinds of scope do not run and stop nothing:
+
+- **Secrets without a session.** In the review, the secrets scope runs the credential check of `secrets` (`op whoami` per account). When it fails with `E_CREDENTIAL_UNAVAILABLE`, the planned secret resources are listed `skipped: no session` in the preview and in the summary, and the other scopes run. A session that ends between the review and the secrets scope gives the same result. `dfm secrets` on its own still refuses a locked vault (docs/secrets.md). An `op` that is missing or fails its executable checks is `E_PROBE_FAILED` and refuses the run.
+- **A blocked packages, secrets or services plan.** The scope is listed `blocked` with each blocked operation and its code, in the preview and in the summary, and the other scopes run. A blocked configuration plan still refuses the whole run before publication.
+
+In both cases the last lines of standard output, after the `result:` line, are one `warning:` line per such scope. It names the skipped resources or the blocked operations and the fix: unlock 1Password, then run `dfm sync` or `dfm secrets` again, or the blocker's own fix text and the standalone command. The exit is 0 when every scope that ran succeeded. A preview ends with the same lines after the digest.
+
+A service whose definition or configuration file is not published yet, while the configuration plan of the same run publishes it, is not blocked. The preview shows it as a start "after the configuration scope publishes" the file. After the configuration scope, `sync` plans the services scope again from the published files. That plan must be the reviewed one with those services now planned as starts: the other operations, the sources and the model are equal, and nothing blocks. Then it runs with that plan's digest. Otherwise the scope fails with `E_PLAN_STALE`, and the next `sync` plans it.
+
+A secrets plan never says `current` for an existing destination: the content exists only after the render (docs/secrets.md). A secrets plan whose planned operations only render again destinations the ledger proves (no new file, no takeover) is therefore treated as no change: it needs no approval on its own, the review runs no `op whoami` for it, and the summary says `current, not rendered again`. An approved run renders them, and a result equal to the file writes nothing.
 
 ## What the lock declares
 
@@ -64,15 +86,15 @@ path = "base/work"                                # a nested checkout inside the
    - The fetched lock is read from the copy. Every nested origin is checked against the grants (exit 3 before any nested fetch when one is missing). Each nested source is fetched and fast-forwarded to its pin, or checked out fresh when the checkout does not exist yet.
    - **A checkout ahead of its ref is current.** When a checkout's HEAD already holds the fetched head or the pin under local commits (a branch with unpushed work), sync does not move it. Sync never moves a checkout back. Its digest line has old = new = HEAD, publication leaves it where it is, and the configuration is applied from the checkout as it is.
    - What git refuses in the copy, it would refuse in the user's checkout: divergence (`Not possible to fast-forward`), a local change to a file the update changes, an untracked file the update would create. The refusal is `E_CONFLICT`, exit 3, with git's own lines. The user's checkout is not touched.
-3. **Plan and the sync digest.** The staged copy is resolved and planned as the tree `--root` will hold after publication. The sources are read from the copy, and link targets and the plan's `source:` line name `--root`. The **sync digest** is the SHA-256 of the configuration plan's digest plus one line per source (`id origin ref old new`). It covers the commits that publication moves between, not only the tree they produce: a commit that changes only files outside the scoped roots leaves the plan digest unchanged. Then the machine check, the plan blockers, the gates that need no write, `--allow-disruptive`, `--allow-adopt` and the journal capacity are checked with the code `apply` uses before its lock (`apply_cmd::check_before_lock`). `--preview` ends here with exit 0 and the sync digest.
-4. **Approval.** Without `--yes-plan`: the plan is printed, exit 3 `E_APPROVAL_REQUIRED`, nothing published. Exception: when every source is `current` and the plan writes nothing (docs/apply.md, step 4), the run prints `nothing to change: no approval needed` and `result: ok` and exits 0. A digest that is not the sync digest is `E_PLAN_STALE`, exit 3.
-5. **Publication, under the writer lock.** A second copy, a second rehearsal and a second plan. The sync digest must still match, else `E_PLAN_STALE`, exit 3, nothing published. This rechecks the sources immediately before publication, and catches an upstream that moved between preview and approval, also a new commit over the same tree. Then, for each source in order, root first:
+3. **Plans and the sync digest.** The staged copy is resolved and planned as the tree `--root` will hold after publication, once per scope: config, packages, secrets, services. The packages and services plans probe their providers read-only first, as their commands do. Then the secrets session check runs (see "The four scopes"). The sources are read from the copy, and link targets and each plan's `source:` line name `--root`. The **sync digest** is the SHA-256 of one line per scope plan (`plan <scope> <plan digest>`), one line per skipped secret resource (`skip secrets <resource>`) and one line per source (`id origin ref old new`). A change in any plan changes it. It covers the commits that publication moves between, not only the tree they produce: a commit that changes only files outside the scoped roots leaves the plan digests unchanged. The preview prints each scope under a `scope:` heading with its own operations (the `not_in_scope` ones belong to another scope), then the one `plan digest:` line. Then, per scope that will run, the machine check, the plan blockers, the gates that need no write, the scope's `--allow-disruptive` and `--allow-adopt` ids and the journal capacity are checked with the code `apply` uses before its lock (`apply_cmd::check_before_lock`). The missing approvals of every scope are printed as one list of flags to paste (removals, restarts, adoptions), then the run exits 3. `--preview` ends here with exit 0 and the sync digest.
+4. **Approval.** Without `--yes-plan`: the plans are printed, exit 3 `E_APPROVAL_REQUIRED`, nothing published. Exception: when every source is `current` and no scope that would run changes anything (docs/apply.md, step 4), the run prints `nothing to change: no approval needed`, the summary and `result: ok`, and exits 0. A digest that is not the sync digest is `E_PLAN_STALE`, exit 3.
+5. **Publication, under the writer lock.** A second copy, a second rehearsal and a second plan of each scope. The sync digest must still match, else `E_PLAN_STALE`, exit 3, nothing published. This rechecks the sources immediately before publication, and catches an upstream that moved between preview and approval, also a new commit over the same tree. Then, for each source in order, root first:
    - The checkout's HEAD must still be what the copy saw (`E_PLAN_STALE`).
    - The new commit is fetched from the staged copy into the checkout, and the checkout is fast-forwarded (`git merge --ff-only`). A nested checkout that does not exist is created with `git init` and `git checkout --detach`.
    - HEAD is read back as the postcondition. A checkout that is already at its commit prints `current` and is left alone.
-6. **Apply.** The lock is released, and `apply` runs in process with the same allow flags and `--yes-plan <plan digest>`, the configuration plan digest the sync digest was built from. It plans `--root` (now the published tree), compares to the approved digest, takes the lock, plans again and applies (docs/apply.md). The receipt has `command = apply`.
+6. **Scopes.** The lock is released, and each scope runs in process, in order, with its own allow flags and `--yes-plan <plan digest>`, the scope plan digest the sync digest was built from. It plans `--root` (now the published tree), compares to the approved digest, takes the lock, plans again and runs (docs/apply.md). A deferred service is planned again first (see "The four scopes").
 
-Output: one `source:` line per source, then the plan when the run does not go on to apply, `published:` lines, then apply's own plan, report and `result:` line. The change in a `source:` line is one of:
+Output: one `source:` line per source, the scope plans and the digest, `published:` lines, then for each scope that runs a `scope:` line and its report (the operations of other scopes left out) without a `result:` line of its own. Then `scopes:` with one line per scope (`ok`, `current`, `skipped: no session (...)`, `blocked (...)`, `not_started`, or the exit and code of a failure), the `result:` line and the `warning:` lines. The change in a `source:` line is one of:
 
 - `<old>..<new>`
 - `current at <commit>`
@@ -85,11 +107,12 @@ followed by `(tracking)` or `(exact)`.
 
 | Code | When |
 | --- | --- |
-| 0 | Published (or nothing to publish) and applied, or nothing to change. A repeat sync with nothing new publishes nothing, applies nothing and writes no receipt. |
-| 1 | After some publication: a later source failed to publish (`sync: published a; b was not published`), or apply refused or failed after the sources were published (`sync: published ...; the configuration was not applied`). Also apply's own exit 1 cases. |
+| 0 | Published (or nothing to publish) and every scope that ran succeeded, or nothing to change. Skipped and blocked scopes (other than config) do not change the exit. A repeat sync with nothing new publishes nothing and writes no receipt. |
+| 1 | After some publication or an earlier scope: a later source failed to publish (`sync: published a; b was not published; no scope was run`), or a scope refused or failed. Also each scope's own exit 1 cases. |
 | 2 | Usage, `--trust-origin` with `--preview` or with `--yes-plan`, a non-UTF-8 path. |
-| 3 | Before any publication: untrusted origin, a fetch that failed (`E_SOURCE_MISSING`), a pin not in its ref (`E_SOURCE_MISSING`), a conflict in the rehearsal (`E_CONFLICT`), an invalid lock or composition, a blocked plan, a stale digest, a missing approval, the lock held. |
-| 130, 143 | A signal during apply (docs/apply.md). The fetch and publication phases install no handler (see Known limits). |
+| 3 | Before any publication: untrusted origin, a fetch that failed (`E_SOURCE_MISSING`), a pin not in its ref (`E_SOURCE_MISSING`), a conflict in the rehearsal (`E_CONFLICT`), an invalid lock or composition, a blocked configuration plan, a gate refusal of a scope that would run, a provider probe that failed, a stale digest, a missing approval, the lock held. |
+| 5 | The services scope ended `pending` (docs/lifecycle.md), and nothing failed. |
+| 130, 143 | A signal during a scope (docs/apply.md). The fetch, probe and publication phases install no handler (see Known limits). |
 
 ## Git isolation
 
@@ -143,17 +166,24 @@ A non-empty `.git/info/attributes`, `.git/info/grafts` or `.git/shallow` is also
 | Staging is a copy of the checkout | The plan digest covers the loaded source tree, which holds the user's dirty and untracked files. A staging tree built from the fetched commit alone would never match the tree after publication. The copy keeps them, so the rehearsal and the plan see exactly what publication produces, and git's own fast-forward rules decide conflicts the same way in both places. A socket or FIFO inside `.git` (a file monitor) is skipped; elsewhere it is `E_SOURCE_UNTRUSTED`. At most 1,000,000 entries. |
 | Approval bound to commits | The sync digest covers each source's `(id, origin, ref, old, new)`, so a `--yes-plan` from a preview is stale after any new upstream commit. The second rehearsal under the lock recomputes it and also compares the per-source commits with the review pass. |
 | A checkout ahead of its ref | Current, not moved back (DFM-70). The digest line has old = new = HEAD. |
-| Two locks, one approval | The writer lock is held for the rehearsal and the publication, released, then taken again by `apply`. Another manager command can run between the two. `apply`'s digest comparison refuses a changed plan, and sync reports the published sources and exits 1. |
+| Two locks, one approval | The writer lock is held for the rehearsal and the publication, released, then taken again by each scope. Another manager command can run between them. Each scope's digest comparison refuses a changed plan, and sync reports it in the summary and exits 1. |
+| One run for four scopes (DFM-63) | DESIGN.md section 7 asks for one combined preview and approval. Each scope keeps its own command path, plan, receipt and failure rules, so no second planner or executor exists. The order (config, packages, secrets, services) follows the prerequisites: a service needs its published definition and its installed formula. |
+| A locked vault | Skipped in `sync`, refused in `secrets`. The daily run should not stop for a locked 1Password app. The warning at the end of standard output names what waits (owner decision 2026-10-26). |
+| A blocked later scope | It does not run, the others do, and the warning names it (owner decision 2026-10-26). One exited daemon or one unknown package probe then does not hold back the configuration. A blocked configuration plan still refuses the run, because publication without the configuration would leave the checkout ahead of HOME. |
+| Re-renders on a run with nothing else new | Not approved and not rendered. The plan cannot tell a re-render that writes nothing from one that writes. A rotated vault value reaches the file at the next approved sync or `dfm secrets`. |
 | Partial publication | Sources publish in lock order, root first. A failure after one source published is reported by name and exits 1. The checkouts already moved stay moved: a fast-forward is not undone. |
 | Failed fetch, missing pin | `E_SOURCE_MISSING`, exit 3, before any plan. No fallback to the checkout's current content, and no digest is printed. A pin absent from its ref is refused with the head named and never substituted. |
 | Read-only commands | `plan`, `doctor`, `status`, `explain` and `state check` read `--root` as it is and never fetch. A test keeps it so. |
 
 ## Known limits
 
-- **Signals.** The gate test allows `signal::install` only in `apply_cmd.rs` and `trial_cmd.rs`, so sync's fetch, rehearsal and publication phases run with no handler. A SIGINT ends the manager and its git child together, because the child shares the manager's process group before the handlers exist. A stop during a fast-forward leaves what git left. Git updates refs last, so the checkout is at the old or the new commit, and the next sync rehearses again. The staging directory of a stopped run stays until the next approved run removes it. The kernel releases its lock.
+- **Signals.** The gate test allows `signal::install` only in `apply_cmd.rs` and `trial_cmd.rs`, so sync's fetch, rehearsal, probe and publication phases run with no handler. The first scope that runs installs them. A SIGINT ends the manager and its git child together, because the child shares the manager's process group before the handlers exist. A stop during a fast-forward leaves what git left. Git updates refs last, so the checkout is at the old or the new commit, and the next sync rehearses again. The staging directory of a stopped run stays until the next approved run removes it. The kernel releases its lock.
 - **Tree digest.** The lock's `tree` is not recomputed or compared (refused when present). Commit identity rests on git's object hashing with `transfer.fsckObjects=true`.
 - **Copy cost.** Each approved run copies the whole checkout twice (review, then under the lock). A checkout with large ignored trees (`node_modules`, virtual environments) is slow to copy.
 - **Credentials.** No credential helper from the binding (the binding's `origins` and helper fields are not implemented). `ssh` origins use the user's `~/.ssh` through the password database. The host-key policy is a device-gate item.
-- **Receipt.** The receipt is apply's: `command = apply`, and `sources` lists the path-kind identity only. Sync prints the git commits that publication moved between, but state does not record them. The grant is in the journal and `grants.json`, not in a receipt (`origin_grants[]` waits for the sync receipt of DFM-31, a `shortcut` in `sync_cmd.rs`). `doctor` has no row for an unreceipted grant.
+- **A later scope can go stale.** A scope plans from the published tree after the earlier scopes ran. When an earlier scope changed one of its inputs, its plan differs from the approved one and it fails with `E_PLAN_STALE` (exit 1). For example, a configuration change to a launchd definition that is already loaded changes the services plan's `content:` precondition. Run `dfm sync` again. A deferred service is the one case planned across this boundary.
+- **A brew service whose formula the same run installs.** It is blocked (`Missing`) in the review and starts at the next sync. Only a definition or configuration file that the configuration scope publishes defers a service.
+- **Probe cost.** A run probes the packages and services providers twice in the review and under the lock, and each scope that runs probes twice more.
+- **Receipts.** Each scope writes its own receipt, and `sources` lists the path-kind identity only. Sync prints the git commits that publication moved between, but state does not record them. The grant is in the journal and `grants.json`, not in a receipt (`origin_grants[]` waits for the sync receipt of DFM-31, a `shortcut` in `sync_cmd.rs`). `doctor` has no row for an unreceipted grant.
 - **Nested checkout branches.** A new nested checkout is created detached at its pin. An existing one is fast-forwarded on whatever HEAD it has, so a branch moves with it.
 - **Evidence scope.** Tests use the `test-isolation` build, a temporary HOME, `file://` bare remotes and `/usr/bin/git`. No test runs an `https` or `ssh` fetch or a GitHub origin. The DFM-70 commit message records a `dfm sync` run against the live `~/.dotfiles` on the personal M5 on 2026-10-24.

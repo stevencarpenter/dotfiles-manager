@@ -14,7 +14,7 @@ This page describes `apply` at HEAD. The plan it executes is in [docs/planner.md
 
 `model` stays pure. `engine` does all file input and output through the safe `rustix` API. `unsafe_code` stays forbidden everywhere except `crates/engine/src/signal.rs`, which is also the only user of the direct `libc` dependency (see Signals).
 
-`secrets`, `packages` and `services` run this same command path with another plan scope ([docs/planner.md](planner.md), "Scope of a plan"). `sync` calls it once after it publishes the sources ([docs/sync.md](sync.md)).
+`secrets`, `packages` and `services` run this same command path with another plan scope ([docs/planner.md](planner.md), "Scope of a plan"). `sync` calls it once per scope after it publishes the sources ([docs/sync.md](sync.md)).
 
 ## The command
 

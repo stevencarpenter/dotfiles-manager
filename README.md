@@ -18,14 +18,15 @@ The Rust CLI builds, installs in isolation with `scripts/bootstrap.sh`, and runs
 | `dfm packages --update` | Upgrade each installed mise or uv tool declared rolling to the newest version its provider resolves. Installed versions stay. A held tool or a local build is kept. | [toolchains](docs/toolchains.md) |
 | `dfm services` | Start declared `launchd-agent/v1` and `brew-service/v1` services that the launcher does not hold. Restart only on `--restart` with `--allow-disruptive`. An unconfirmed request is `pending` (exit 5). | [lifecycle](docs/lifecycle.md) |
 | `dfm trial <package>` | Try a tool without a module. Ask `homebrew/v1` and `mise/v1` which one can install it, record a baseline in `state/trials/`, then install it when no provider has it. | [trial](docs/trial.md) |
-| `dfm sync` | Fetch the sources that `dotfiles-manager.lock` declares into staging and plan the result. With one approval, fast-forward the checkouts and run `apply` once. A new origin needs `--trust-origin` before any fetch. | [sync](docs/sync.md) |
+| `dfm sync` | The daily command. Fetch the sources that `dotfiles-manager.lock` declares into staging and plan four scopes: configuration, packages, secrets and services. With one approval, fast-forward the checkouts, then run the scopes in that order, each with its own receipt. A failed scope stops the later ones. Without a 1Password session the secrets are skipped, and a blocked packages, secrets or services plan does not run; both are warned at the end of the output. `--restart` goes to the services scope. A new origin needs `--trust-origin` before any fetch. | [sync](docs/sync.md) |
 | `dfm state check`, `recover`, `resolve` | Check the state store and settle journal entries that ended unknown. | [state](docs/state.md) |
 | `dfm self-update` | Rebuild and install the manager from the HEAD (or `--commit`) of a local checkout through that commit's `scripts/bootstrap.sh`. It never pulls. | [bootstrap](docs/bootstrap.md#self-update) |
 
 Approval rules shared by `apply`, `secrets`, `packages`, `services`, `trial` and `sync`:
 
 - A run prints the plan and its digest. It changes nothing without `-y <digest>` (long form `--yes-plan`), and exits 3 (`E_APPROVAL_REQUIRED`).
-- A plan that changes nothing needs no digest: `apply`, `sync`, `secrets`, `packages` and `services` exit 0.
+- A plan that changes nothing needs no digest: `apply`, `sync`, `secrets`, `packages` and `services` exit 0. For `sync`, every source must be current and no scope may change anything; a secrets plan of re-renders alone counts as no change.
+- `sync` prints one digest for the sources and the four scope plans. One `-y <sync digest>` approves the whole run. Its preview lists the missing `--allow-disruptive` and `--allow-adopt` flags of every scope as one list.
 - `--preview` prints the plan and changes nothing.
 - A removal or a restart also needs `--allow-disruptive <operation-id>`. Adopting an existing file needs `--allow-adopt <operation-id>`.
 - Exit codes: 0 ok, 1 failed, 2 usage, 3 blocked before mutation, 4 declined, 5 pending, 130 interrupted, 143 terminated.
