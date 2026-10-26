@@ -25,7 +25,8 @@ use dfm_model::digest::sha256_hex;
 use dfm_model::display::{visible, visible_for_paste};
 use dfm_model::lock::{Grants, Lock, LockSource, MAX_BYTES as LOCK_MAX_BYTES, check_origin};
 use dfm_model::plan::{
-    Action, Blocker, Node, Operation, Ownership, Plan, Scope, Status as PlanStatus,
+    Action, Blocker, LinkTo, Node, Operation, Ownership, Plan, Scope, Seen, Status as PlanStatus,
+    node_state,
 };
 use dfm_model::resolve::resolve;
 use dfm_model::state::{self, Class, JournalEntry, Phase, Recovery, rfc3339};
@@ -1471,44 +1472,72 @@ fn as_reviewed(
 }
 
 /// Whether `state`, a precondition of kind `kind` (`path`, `sensitive-path` or `content`) on
-/// the path of `op`, is what the approved operation `op` of an earlier scope leaves there: a
-/// directory it created, the absence it removed to, the link it published, or the file it
-/// rendered (the declared mode, and the approved content, which is read again from `home`
-/// because a precondition records a different hash of it). Anything else is not.
+/// the path of `op`, is what the approved operation `op` of an earlier scope leaves there: the
+/// node apply makes (a directory of mode 700 or the declared mode, the absence it removed to,
+/// the link it published, the file it rendered with the declared mode or 600), formatted by
+/// `node_state` as observe records it. The rendered content is read again from `home`, because
+/// a precondition records a different hash of it, and must be the approved content.
 fn left_by(op: &Operation, kind: &str, state: &str, home: &Path) -> bool {
     let writes = matches!(op.action, Action::CreateFile | Action::UpdateFile);
-    match (kind, op.action, op.link.as_deref()) {
-        (_, Action::CreateDir, _) if kind != "content" => state.starts_with("dir:"),
-        (_, Action::Remove, _) if kind != "content" => state == "missing",
-        ("content", _, _) => {
-            writes
-                && op
-                    .output_sha256
-                    .as_ref()
-                    .is_some_and(|h| state == format!("sha256:{h}"))
-        }
-        (_, _, Some(link)) => state
-            .strip_prefix("link:")
-            .and_then(|r| r.strip_prefix(link))
-            .is_some_and(|r| r.starts_with(':')),
-        ("sensitive-path", _, None) => {
-            writes && op.mode.is_some_and(|m| state == format!("file:{m:o}"))
-        }
-        (_, _, None) if writes => {
-            let Some(rest) = state.strip_prefix("file:") else {
-                return false;
-            };
-            let (mode, hash) = rest.split_once(":sha256:").unwrap_or((rest, ""));
-            op.mode.is_none_or(|m| mode == format!("{m:o}"))
-                && rendered(op, home).is_some_and(|fp| hash == fp)
-        }
-        _ => false,
+    if kind == "content" {
+        return writes
+            && op
+                .output_sha256
+                .as_ref()
+                .is_some_and(|h| state == format!("sha256:{h}"));
+    }
+    let is = |node| state == node_state(&Seen { node, alias: None }, kind == "sensitive-path");
+    let file = |sha256, size| Node::File {
+        mode: op.mode.unwrap_or(0o600),
+        own: true,
+        size,
+        sha256,
+    };
+    match (op.action, op.link.as_deref()) {
+        (Action::CreateDir, _) => is(Node::Dir {
+            mode: op.mode.unwrap_or(0o700),
+            own: true,
+        }),
+        (Action::Remove, _) => is(Node::Missing {}),
+        (_, Some(link)) => link_to(Path::new(link)).is_some_and(|to| {
+            is(Node::Link {
+                target: link.into(),
+                to,
+                own: true,
+            })
+        }),
+        _ if !writes => false,
+        // A sensitive path is recorded by mode only: its content is never read.
+        _ if kind == "sensitive-path" => is(file(None, 0)),
+        // Hashed, or by size when observe was not asked for a hash.
+        _ => rendered(op, home)
+            .is_some_and(|(fp, size)| is(file(Some(fp), size)) || is(file(None, size))),
     }
 }
 
-/// The fingerprint (`file_fingerprint`) of the file at the path of `op` under `home`, if its
-/// content is the approved content: the SHA-256 the plan recorded for it.
-fn rendered(op: &Operation, home: &Path) -> Option<String> {
+/// What observe records a link to the absolute `target` points at (`fsys::Peek`).
+/// shortcut: a link loop is not told apart from another error and never matches, upgrade when
+/// a published link to a loop must count as the approved effect.
+fn link_to(target: &Path) -> Option<LinkTo> {
+    match fs::metadata(target) {
+        Ok(m) if m.is_dir() => Some(LinkTo::Dir),
+        Ok(m) if m.is_file() => Some(LinkTo::File),
+        Ok(_) => Some(LinkTo::Other),
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+            ) =>
+        {
+            Some(LinkTo::Dangling)
+        }
+        Err(_) => None,
+    }
+}
+
+/// The fingerprint (`file_fingerprint`) and size of the file at the path of `op` under `home`,
+/// if its content is the approved content: the SHA-256 the plan recorded for it.
+fn rendered(op: &Operation, home: &Path) -> Option<(String, u64)> {
     let (path, sha, limit) = (
         op.path.as_ref()?,
         op.output_sha256.as_ref()?,
@@ -1521,7 +1550,10 @@ fn rendered(op: &Operation, home: &Path) -> Option<String> {
         || conflict("not a regular file"),
     )
     .ok()?;
-    (sha256_hex(&bytes) == *sha).then(|| dfm_model::plan::file_fingerprint(&bytes))
+    (sha256_hex(&bytes) == *sha).then(|| {
+        let size = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+        (dfm_model::plan::file_fingerprint(&bytes), size)
+    })
 }
 
 /// The definition links of `config`, an approved configuration plan, that it retargets, each
@@ -2120,10 +2152,14 @@ mod tests {
         let done: BTreeMap<String, Operation> =
             [earlier(PLIST, Action::ReplaceLink, Some("/r/new.plist"))].into();
         let mut after = before();
-        after[0].state = "link:/r/new.plist:file".into();
+        // `/r/new.plist` does not exist here, so observe records the link as dangling.
+        after[0].state = "link:/r/new.plist:dangling".into();
         let fresh = services_plan(after.clone());
         // 1. The definition link is the one the configuration scope published: accepted.
         assert!(as_reviewed(&review, &fresh, &done, home));
+        let mut kind = after.clone();
+        kind[0].state = "link:/r/new.plist:file".into();
+        assert!(!as_reviewed(&review, &services_plan(kind), &done, home));
         // 2. Another target than the approved one, or no earlier write of the path: refused.
         let mut other = after.clone();
         other[0].state = "link:/r/other.plist:file".into();
@@ -2185,14 +2221,17 @@ mod tests {
                 pre(&format!("path:{dir}"), state),
             ])
         };
-        assert!(as_reviewed(&review, &fresh("dir:755"), &done, home));
-        // The directory is not there now: the earlier effect did not hold.
+        // apply creates a directory with mode 700.
+        assert!(as_reviewed(&review, &fresh("dir:700"), &done, home));
+        // The directory is not there now, or not as apply made it: the earlier effect did not
+        // hold.
         assert!(!as_reviewed(&review, &fresh("missing"), &done, home));
         assert!(!as_reviewed(&review, &fresh("link:/x:dir"), &done, home));
+        assert!(!as_reviewed(&review, &fresh("dir:755"), &done, home));
         // Without the earlier mkdir, the reviewed mkdir is still expected.
         assert!(!as_reviewed(
             &review,
-            &fresh("dir:755"),
+            &fresh("dir:700"),
             &BTreeMap::new(),
             home
         ));
@@ -2228,6 +2267,10 @@ mod tests {
         assert!(!left_by(&op, "content", "sha256:00", &home.0));
         assert!(left_by(&op, "sensitive-path", "file:644", &home.0));
         assert!(!left_by(&op, "sensitive-path", "file:600", &home.0));
+        // A path observed without a hash records the size: the size of the approved content.
+        assert!(left_by(&op, "path", "file:644:size:9", &home.0));
+        assert!(!left_by(&op, "path", "file:644:size:10", &home.0));
+        assert!(!left_by(&op, "path", "file:600:size:9", &home.0));
         // Another hand rewrote the file after the scope: the precondition is not the approved one.
         fs::write(home.0.join(path), b"height=2\n").unwrap();
         assert!(!left_by(&op, "path", &ok, &home.0));
