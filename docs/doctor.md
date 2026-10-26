@@ -1,6 +1,6 @@
 # Doctor and status
 
-`doctor` and `status` in this build. [docs/architecture.md](architecture.md) is the contract and wins where this document is silent.
+`doctor` and `status` in this build. This document describes the behavior at HEAD.
 
 | Part | Location |
 | --- | --- |
@@ -27,7 +27,7 @@ Both commands are read-only. They run no program and probe no tool, version or P
 | 1 | Any ERROR row, or any UNKNOWN row of a required check. Standard error shows `E_DIAGNOSED`. |
 | 2 | Usage error (no `--root` with a schema 1 binding, unknown flag, repeated flag, `--against`), or no report can be made at all. Arguments are parsed before HOME is resolved. |
 
-`doctor` never exits 3 or 4 (architecture section 10). A malformed manifest, a missing profile, an unreadable state file or an unusable HOME is a row and exit 1. An unusable HOME gives an ERROR `binding` row and UNKNOWN `state` and `profile` rows.
+`doctor` never exits 3 or 4. A malformed manifest, a missing profile, an unreadable state file or an unusable HOME is a row and exit 1. An unusable HOME gives an ERROR `binding` row and UNKNOWN `state` and `profile` rows.
 
 ## Row fields
 
@@ -107,7 +107,7 @@ Doctor's own inspection reads and hashes no content of a sensitive output, whoev
 | `D_PROBING_NOT_BUILT` | Tools, versions and PATH are not probed in this build. |
 | `D_STAGED_COPY` | A name beside an owned output has the shape of a staged copy of an older build. Nothing removes it. |
 
-`E_*` codes keep the meaning given in [architecture.md](architecture.md), [state.md](state.md), [resolver.md](resolver.md) and [planner.md](planner.md).
+`E_*` codes keep the meaning given in [state.md](state.md), [resolver.md](resolver.md), [planner.md](planner.md) and [apply.md](apply.md).
 
 ## Independent rows
 

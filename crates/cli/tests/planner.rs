@@ -1020,7 +1020,7 @@ fn the_planner_code_has_no_process_network_or_write_calls() {
     }
 }
 
-// ---- exit mapping (section 10) ----------------------------------------------------------
+// ---- exit mapping ----------------------------------------------------------------------
 
 #[test]
 fn plan_follows_the_exit_table_for_resolver_and_report_failures() {

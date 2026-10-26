@@ -43,7 +43,13 @@ The owner requires four workflows for first delivery on both machines, plus full
 | Try, adopt, purge | Test a tool without a module, keep a recoverable baseline, then promote its declarations or clean up only what the trial added. | `dfm trial` is built. `adopt` (DFM-33) and `purge` (DFM-34) are not built. |
 | Doctor | A read-only table of tool and resource health: wanted, installed and selected versions, executable and config paths, ownership, drift and findings, with per-tool detail and `--json`. See the [doctor contract](DESIGN.md#doctor-read-only-machine-diagnostics). | `dfm doctor` reports the binding, state, plan and owned outputs. It runs no program and does not probe tools, versions or PATH. |
 
-`claude-settings/v1` is the only merge adapter. No merge has run on a native device.
+`claude-settings/v1` is the only merge adapter.
+
+Native evidence on the personal M5 (receipts in `~/.local/state/dotfiles-manager/state/receipts/`):
+
+- `apply` ended `ok` on 2026-10-16, 10-17, 10-18, 10-22 (three runs) and 10-23. The runs published `fs-link/v1` and `text-fragments/v1` outputs and ran the `claude-settings/v1` merge of `~/.claude/settings.json`. The ledger holds the co-owned record of that file.
+- `secrets` ended `ok` on 2026-10-18 and rendered one `op-template/v1` output.
+- No receipt on the M5 exists for `packages`, `services` or `trial`, and no receipt contains a `git-config/v1` operation. A run that changes nothing writes no receipt, so this does not prove that those commands never ran.
 
 ### Scope limits
 
@@ -101,7 +107,7 @@ Environment variables of the gate:
 ## Documentation
 
 - [Design contract](DESIGN.md): requirements, manifest semantics, lifecycle and migration boundaries.
-- [Minimum implementation contract](docs/architecture.md): language, formats, CLI exit semantics, adapter boundary, trust and bootstrap.
+- [Repo map](docs/repo-map-v7.html): a generated HTML page of the crates, the command flows, the recovery flows and what is built. Open the file in a browser.
 - [Delivery roadmap](docs/roadmap.json) and [review record](docs/roadmap-review.md): M5 and M3 task contracts and evidence gates. Kaneo DFM is the authoritative backlog.
 - [Checklist completion contract](docs/checklist-state.md): live Kaneo acceptance checkboxes are the sole completion state.
 - [Inventory classification](INVENTORY.md) and [generated-dotfiles audit](docs/generated-dotfiles-audit.md): the existing dotfiles sorted into invariants, defaults, modules and unmanaged state.

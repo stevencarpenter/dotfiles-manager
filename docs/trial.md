@@ -1,6 +1,6 @@
 # Trial
 
-The `trial` command (`try <tool>` in DESIGN.md section 7): try a tool without authoring a module. [docs/architecture.md](architecture.md) is the contract and wins where this document is silent. The package providers it reuses are in [docs/packages.md](packages.md), the state store in [docs/state.md](state.md). `adopt` (DFM-33) and `purge` (DFM-34) are not built. The last section lists what they inherit.
+The `trial` command (`try <tool>` in DESIGN.md section 7): try a tool without authoring a module. This document describes the behavior at HEAD. The package providers it reuses are in [docs/packages.md](packages.md), the state store in [docs/state.md](state.md). `adopt` (DFM-33) and `purge` (DFM-34) are not built. The last section lists what they inherit.
 
 | Part | Location |
 | --- | --- |
@@ -62,12 +62,12 @@ The optional fields need no schema bump: a record without them (for example, one
 
 The record is a private file under `state/trials/`. `state check` validates it with the other documents and counts it (`trials: N (M unreadable)`). `doctor` and `status` show an unreadable or foreign-identity record as a WARN row. They do not list or count readable records. An interrupted install follows the packages rule (docs/packages.md, "Interrupted install"): `state check` reports `E_OP_INTERRUPTED`, `state recover` leaves it `unknown`, and `state resolve <op_id> --as failed` settles it.
 
-## Decisions where the contract was silent
+## Decisions
 
 | Question | Choice |
 | --- | --- |
 | Command name | `trial`, the noun the state store uses for the record. DESIGN.md section 7 proposes `try`. |
-| Ambiguous choices without a prompt | No command has a prompt (architecture section 10). An ambiguous provider is `E_APPROVAL_REQUIRED` with `--provider` as the fix. A path choice is never ambiguous: the candidates are explicit, or one default. |
+| Ambiguous choices without a prompt | No command has a prompt. An ambiguous provider is `E_APPROVAL_REQUIRED` with `--provider` as the fix. A path choice is never ambiguous: the candidates are explicit, or one default. |
 | Decline | The absence of `--yes-plan`: exit 3 `E_APPROVAL_REQUIRED`, as for `apply`. Exit 4 (`declined`) is reserved for an interactive prompt, which does not exist. |
 | Existing configuration | The trial changes no configuration. A pre-existing candidate is recorded with its hash (`existed: true`), and the cleanup scope line says it is never removed. The tool's own first run may change it. The baseline hash attributes that change. |
 | Configuration discovery | The providers do not know configuration paths. Without `--config`, the one candidate is `~/.config/<tool>` (a `shortcut:` in `candidates()`). |

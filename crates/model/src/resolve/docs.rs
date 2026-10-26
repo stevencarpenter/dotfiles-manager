@@ -1,5 +1,5 @@
 //! Parsing and structural validation of the three authored documents (schema 1). Unknown keys
-//! are refused (docs/architecture.md section 4, rule 3). Nothing here reads outside the bytes it
+//! are refused. Nothing here reads outside the bytes it
 //! is given.
 
 use super::error::{ResolveError, category};
@@ -8,7 +8,7 @@ use crate::Code;
 use std::collections::{BTreeMap, BTreeSet};
 use toml::{Table, Value};
 
-/// Limits from docs/architecture.md section 5 (S10).
+/// Limits from docs/resolver.md (S10).
 pub const MAX_FILE_BYTES: usize = 1 << 20;
 pub const MAX_DEPTH: usize = 32;
 pub const MAX_STRING_BYTES: usize = 64 * 1024;

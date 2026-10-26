@@ -1,6 +1,6 @@
 # Adapters
 
-This page lists the adapter registry and records what the configuration adapters (`fs-link/v1`, `git-config/v1`, `text-fragments/v1`, `claude-settings/v1`) do where [docs/architecture.md](architecture.md) (the contract) leaves a choice open. The contract wins where this page is silent. Apply is in [docs/apply.md](apply.md) and the planner in [docs/planner.md](planner.md).
+This page lists the adapter registry and records what the configuration adapters (`fs-link/v1`, `git-config/v1`, `text-fragments/v1`, `claude-settings/v1`) do at HEAD. Apply is in [docs/apply.md](apply.md) and the planner in [docs/planner.md](planner.md).
 
 ## Registry
 
@@ -32,7 +32,7 @@ This page lists the adapter registry and records what the configuration adapters
 
 `unsafe_code` stays forbidden. The merge algorithm is a pure function of bytes in `dfm-model`, so the layering rule holds.
 
-## The contract
+## The `Generator` trait
 
 An adapter that produces file content is a `Generator`:
 
@@ -54,7 +54,7 @@ The trait has more methods with refusing defaults: `merges`/`merge` (the co-owne
 
 ### Layering
 
-Architecture section 3 says adapters must not depend on `dfm-engine`. This build has no `ports` crate, and creating one needs a new crate and a changed dependency gate. So the `Generator` trait stays in `dfm-engine` and the adapters are in the CLI crate. `git_config` takes a model value. `text_fragments` takes `GeneratorInputs`, which is an engine type. The other engine types (`Dir`, `Sys`, `Got`) appear only in `plan_outputs`. The `toml` types `Value` and `Table` are re-exported by `dfm_model::resolve` on purpose, so the CLI can name them without a new dependency entry (architecture section 3). Moving the trait to a `ports` crate later changes imports only.
+Adapters should not depend on `dfm-engine`. This build has no `ports` crate, and creating one needs a new crate and a changed dependency gate. So the `Generator` trait stays in `dfm-engine` and the adapters are in the CLI crate. `git_config` takes a model value. `text_fragments` takes `GeneratorInputs`, which is an engine type. The other engine types (`Dir`, `Sys`, `Got`) appear only in `plan_outputs`. The `toml` types `Value` and `Table` are re-exported by `dfm_model::resolve` on purpose, so the CLI can name them without a new dependency entry. Moving the trait to a `ports` crate later changes imports only.
 
 ## Data and code
 
@@ -145,7 +145,7 @@ Fragment content is data. The manager does not interpret, order by priority or v
 
 ## `claude-settings/v1` (merge)
 
-Output: `.claude/settings.json`, as a JSON object. The file is co-owned: the application and the user write it too, and it can hold credentials in keys the manager does not know. Its class is `sensitive` (architecture section 8, item 5).
+Output: `.claude/settings.json`, as a JSON object. The file is co-owned: the application and the user write it too, and it can hold credentials in keys the manager does not know. Its class is `sensitive`.
 
 Value fields, as in `examples/base/modules/agents` (that example declares no handler; `audit` here shows the handler shape):
 
@@ -210,7 +210,7 @@ The base is the live document. The merge changes only what the module declares.
 
 - The plan, the receipt, the journal, `--json`, the table and `doctor` hold no live content, no hash of the live file and no salted hash.
 - The plan holds, for this operation: the path, the mode (0600), the setting names (`sets`, names only), the fragments (`fragments`, names and origin) and `managed_sha256`. That is the SHA-256 of the canonical JSON of the declared `managed` values. The module declares them, so the digest is not secret. It shows a reviewer that the declared set changed. It says nothing about the live file. A setting name is the dotted path from the top of the file to a leaf, such as `env.EXAMPLE_FEATURE_FLAG`. The names include the keys of the fragments.
-- A fragment can hold credentials, so the fragments of a sensitive merge are sensitive themselves (architecture section 8, item 7): no plain hash of a fragment is printed or stored. The `fragments:` precondition of the operation carries a salted content token for each fragment (the salted SHA-256 of the name and the content, with `state/salt`). The token lands in the plan JSON (`preconditions[].state`) and so in the plan digest, which makes a changed fragment stale. It is never printed by the text plan, a stale report (which says `fragment content changed`), the receipt, the journal, `doctor` or `status`, and it is not stored in the ledger. A merge that has fragments needs `state/salt` at plan time: without it the plan blocks with `E_STATE_INVALID` and the fix "run bind again with the same profile and machine id", which creates the salt ([docs/state.md](state.md), "Documents"). A merge without fragments needs no salt at plan time. Assembly fragments (`text-fragments/v1`, normal class) keep their plain hashes.
+- A fragment can hold credentials, so the fragments of a sensitive merge are sensitive themselves: no plain hash of a fragment is printed or stored. The `fragments:` precondition of the operation carries a salted content token for each fragment (the salted SHA-256 of the name and the content, with `state/salt`). The token lands in the plan JSON (`preconditions[].state`) and so in the plan digest, which makes a changed fragment stale. It is never printed by the text plan, a stale report (which says `fragment content changed`), the receipt, the journal, `doctor` or `status`, and it is not stored in the ledger. A merge that has fragments needs `state/salt` at plan time: without it the plan blocks with `E_STATE_INVALID` and the fix "run bind again with the same profile and machine id", which creates the salt ([docs/state.md](state.md), "Documents"). A merge without fragments needs no salt at plan time. Assembly fragments (`text-fragments/v1`, normal class) keep their plain hashes.
 - `output_sha256` stays unset: a sensitive output has no content hash. No hash of the live settings file exists anywhere.
 - `ledger.json` holds a per-machine salted hash of the managed fields as the manager last wrote them (`coowned.managed_hash`, per leaf in `coowned.leaves`), and the owned handler entries. The salt is 32 random bytes in `state/salt`. No other file holds the salted hash.
 - A parse error, a conflict and a stale-input message never repeat a byte of the live file.
@@ -242,7 +242,7 @@ An entry of another resource in the ledger for the same path blocks before the f
 
 ### Take over an existing file
 
-Owner-delegated decision (2026-10-11), recorded in architecture section 8 item 7. The first write into an existing settings file that has no `coowned` ledger entry for this resource is the operation `update_file` with `takeover = true`. Its effect text reads `take over managed fields of an existing file <path> (sensitive: destination and mode only); foreign keys are kept; hand edits of managed fields are overwritten`. Apply refuses it without `--allow-adopt '<operation-id>'` (`E_ADOPT_UNAPPROVED`, exit 3, nothing written). The contract asks for an interactive confirmation naming the destination. No prompt exists, so the per-operation flag stands in, as for link adoption. The approval is recorded in the receipt as `how = allow_adopt`. An absent file is a create and needs no flag. After the first write the ledger has the entry, and later runs need no flag. A deleted file with a ledger entry is a create too.
+Owner-delegated decision (2026-10-11). The first write into an existing settings file that has no `coowned` ledger entry for this resource is the operation `update_file` with `takeover = true`. Its effect text reads `take over managed fields of an existing file <path> (sensitive: destination and mode only); foreign keys are kept; hand edits of managed fields are overwritten`. Apply refuses it without `--allow-adopt '<operation-id>'` (`E_ADOPT_UNAPPROVED`, exit 3, nothing written). No prompt exists, so the per-operation flag stands in for a confirmation that names the destination, as for link adoption. The approval is recorded in the receipt as `how = allow_adopt`. An absent file is a create and needs no flag. After the first write the ledger has the entry, and later runs need no flag. A deleted file with a ledger entry is a create too.
 
 ### What the plan shows for a merge
 

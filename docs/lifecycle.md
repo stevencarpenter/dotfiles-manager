@@ -1,6 +1,6 @@
 # Lifecycle
 
-The `launchd-agent/v1` and `brew-service/v1` service adapters and the `services` command. [docs/architecture.md](architecture.md) is the contract and wins where this document is silent.
+The `launchd-agent/v1` and `brew-service/v1` service adapters and the `services` command. This document describes the behavior at HEAD.
 
 A published file or an accepted launcher request is not proof that the program uses it. `services` asks each service's own launcher what it holds, acts through that launcher only, asks again, and records what it observed.
 
@@ -44,7 +44,7 @@ Order of one run:
 | `launchd-agent/v1` | `label` (letters, digits, `.`, `_`, `-`, not starting with `-`, at most 128 characters), `plist` (the HOME-relative path of the definition, a published file or link) | The definition is resolved and read (1 MiB bound) as an XML property list. The top-level `Label` string must be the declared label. Its SHA-256 becomes the `content:<plist>` precondition, and its `Program` or `ProgramArguments` goes into the effect text ("the definition runs …"). Then `launchctl print gui/<uid>/<label>`: exit 0 gives the top-level `path` and `state` (one-tab lines only), exit 113 ("Could not find service") means not loaded. | launchd holds the label, and its `path` (links resolved) is the declared definition. The run state is reported, not required: a one-shot agent (`RunAtLoad`, exits) is not running after it ran. A label loaded from any other file is foreign: a blocker, never a restart. | `launchctl bootstrap gui/<uid> <HOME>/<plist>` | Only on `--restart`: `launchctl bootout gui/<uid>/<label>` (a label the domain does not hold is accepted), a wait of at most 10 s until `launchctl print` no longer finds it, then the bootstrap. |
 | `brew-service/v1` | `name` (the formula: letters, digits, `.`, `_`, `-`, `+`, `@`), `config` (optional, HOME-relative files the program reads) | `brew services info <name> --json` with `HOMEBREW_NO_AUTO_UPDATE=1`, `HOMEBREW_NO_ANALYTICS=1`, `HOMEBREW_NO_ENV_HINTS=1`: `loaded`, `running`, `status`. Exit 1 with "No available formula" or "is not installed" means the formula is not installed. | `loaded` and `running`. Loaded and not running is stale: a blocker until `--restart`. | `brew services start <name>`, then at most 10 s of `info` reports until `running` | Only on `--restart`: `brew services restart <name>`, the same wait. |
 
-Actions have 120 s. A probe that cannot run, times out, or answers in a shape the adapter does not know is `Unknown`: the plan has a blocker, `E_PROBE_FAILED`, exit 3 (architecture section 8 item 9). Launcher standard error is bounded and never printed or persisted. The message names its size and the command to run by hand.
+Actions have 120 s. A probe that cannot run, times out, or answers in a shape the adapter does not know is `Unknown`: the plan has a blocker, `E_PROBE_FAILED`, exit 3: unknown support fails closed. Launcher standard error is bounded and never printed or persisted. The message names its size and the command to run by hand.
 
 **Never run:** `launchctl unload`, `launchctl remove`, `launchctl kickstart`, `brew services stop`, `brew services kill`, `brew services remove`, `brew services cleanup`, `brew uninstall`, `brew services run`, anything under `sudo` or in the `system` domain. A bootout happens only inside a restart, with its bootstrap in the same operation.
 
@@ -82,7 +82,7 @@ The detail strings carry no process id and no time, because apply compares the p
    - A stop request that cuts off the postcondition is reported as the stop, and the journal says the request may have completed.
 4. **Receipt.** Class `normal`, no fingerprints, no owned outputs, the reload state above, and an `approvals[]` entry with `how = allow_disruptive` for a restart that ran.
 
-A `pending` entry closes the intent (architecture section 5: `pending` is a terminal phase). The next `services` run probes again. A brew service that is still loaded and not running is `Stale`, a blocker until `--restart` is requested and approved. One that came up meanwhile is `current`.
+A `pending` entry closes the intent: `pending` is a terminal journal phase. The next `services` run probes again. A brew service that is still loaded and not running is `Stale`, a blocker until `--restart` is requested and approved. One that came up meanwhile is `current`.
 
 An interrupted action follows the packages rule (docs/packages.md, "Interrupted install"): the resource blocks with `E_OP_INTERRUPTED` until `state resolve <journal-id> --as failed`, even when the launcher reports it loaded.
 
@@ -97,7 +97,7 @@ An interrupted action follows the packages rule (docs/packages.md, "Interrupted 
 | 5 | `E_PENDING`: a request the launcher accepted without observed completion, and no failure. |
 | 130, 143 | A stop request. A probe in flight is ended, and no further launcher starts. |
 
-## Decisions where the contract was silent
+## Decisions
 
 | Question | Choice |
 | --- | --- |
@@ -109,8 +109,8 @@ An interrupted action follows the packages rule (docs/packages.md, "Interrupted 
 | Definition content behind a link | The planner's `path:` precondition of a link covers the link target only. So the adapter reads the definition at plan time (the `content:` precondition and the effect text), and apply reads and hashes it again before the action. |
 | Reloading after a configuration change | Not inferred. The manager cannot observe what a running process read. `--restart <resource>` is the explicit, approved request. Nothing restarts without a request or a stale state. |
 | `kickstart` | Not used. It restarts the process under the definition launchd already holds, which does not reload an edited definition. A restart is bootout, wait, bootstrap. |
-| Disruptive set | A restart (bootout, `brew services restart`) is disruptive and needs `--allow-disruptive <operation-id>` (section 10 item 8). A start of something that is not loaded is not disruptive. |
-| Pending | `E_PENDING` (exit 5) was added: the contract names exit 5 and status `pending` but no code. The run continues past a pending operation. No operation in this scope depends on a service, so `blocked_pending` is never produced here. |
+| Disruptive set | A restart (bootout, `brew services restart`) is disruptive and needs `--allow-disruptive <operation-id>`, as a removal does ([docs/apply.md](apply.md)). A start of something that is not loaded is not disruptive. |
+| Pending | `E_PENDING` (exit 5) is the code for exit 5 and status `pending`. The run continues past a pending operation. No operation in this scope depends on a service, so `blocked_pending` is never produced here. |
 | Reload states | `reloaded` and `requested` join `not_attempted` in `RELOADS`. A published file still records `not_attempted`. The receipt validator accepts `reloaded` on an updated `allow_disruptive` operation (a restart). |
 | Deselected service | Nothing. Nothing is stopped, unloaded or removed (DESIGN.md section 8: no removal by inference). A deselected agent keeps running until the owner unloads it by hand. |
 | Reading the definition's label | A strict XML plist reader in the adapter. The XML declaration, DOCTYPE and comments are skipped, a CDATA section is text, and only the top-level `<dict>` key and value pairs are read. A text search for `<key>Label</key>` would take a decoy in a comment, a CDATA section or a nested dictionary as the label, which launchd would not. Anything the reader does not understand is refused. A shape is named, never content. |

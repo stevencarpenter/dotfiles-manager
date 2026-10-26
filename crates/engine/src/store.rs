@@ -40,7 +40,7 @@ const STAGING: &str = "state.next";
 const SUBDIRS: [&str; 3] = ["receipts", "snapshots", "trials"];
 /// The per-machine salt for the salted hash of a co-owned file's managed fields.
 const SALT: &str = "salt";
-/// The origin grants (docs/architecture.md section 8, "Trust grant"; docs/sync.md).
+/// The origin grants (docs/sync.md).
 const GRANTS: &str = "grants.json";
 const SALT_BYTES: usize = 32;
 /// Characters of a cut journal line echoed in the error when its repair record cannot be written.
@@ -502,9 +502,9 @@ impl Store {
         Ok(l)
     }
 
-    /// The per-machine salt for conflict detection on co-owned files (docs/architecture.md
-    /// section 8 item 7), or `None` when `state/salt` does not exist yet. It must be exactly 32
-    /// bytes in a private regular file. The salt never leaves `state` and is never printed.
+    /// The per-machine salt for conflict detection on co-owned files (docs/state.md), or `None`
+    /// when `state/salt` does not exist yet. It must be exactly 32 bytes in a private regular
+    /// file. The salt never leaves `state` and is never printed.
     pub fn salt(&self) -> Result<Option<Vec<u8>>, Refusal> {
         // A symlink, a wrong owner or mode, or a wrong size is an error that is never repaired.
         let bad = |e: Refusal| {
@@ -718,7 +718,7 @@ impl Store {
         r.map_err(|e| self.stamp(e))
     }
 
-    /// A refusal after this store wrote anything exits 1, not 3 (architecture section 10).
+    /// A refusal after this store wrote anything exits 1, not 3 (docs/apply.md).
     pub fn stamp(&self, r: Refusal) -> Refusal {
         if self.mutated() {
             r.after_mutation()
@@ -994,7 +994,7 @@ impl Store {
     }
 
     /// Replaces `state/grants.json` atomically. A grant write is a pre-plan state mutation
-    /// (section 10, mixed results); the caller decides what it means for the exit code.
+    /// (docs/sync.md); the caller decides what it means for the exit code.
     pub fn write_grants(&self, g: &Grants) -> Result<(), Refusal> {
         self.wrote(self.write_grants_inner(g))
     }

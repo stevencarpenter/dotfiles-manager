@@ -1,6 +1,6 @@
 # Sync
 
-The `sync` command: pull the latest configuration and apply it. [docs/architecture.md](architecture.md) (sections 5, 8 and 10) is the contract and wins where this document is silent. Apply is in [docs/apply.md](apply.md), the source loader in [docs/resolver.md](resolver.md).
+The `sync` command: pull the latest configuration and apply it. This document describes the behavior at HEAD. Apply is in [docs/apply.md](apply.md), the source loader in [docs/resolver.md](resolver.md).
 
 | Part | Location |
 | --- | --- |
@@ -27,13 +27,13 @@ dfm sync [--root <dir>] [--preview] [-y|--yes-plan <digest>] [--allow-disruptive
 
 ## What the lock declares
 
-`dotfiles-manager.lock` at `--root` carries `[[sources]]` entries in the contract's shape (section 5, "Source lock"):
+`dotfiles-manager.lock` at `--root` carries `[[sources]]` entries:
 
 ```toml
 [[sources]]
 id = "dotfiles"
 kind = "git"
-origin = "https://github.com/example/dotfiles"   # canonical form, section 8
+origin = "https://github.com/example/dotfiles"   # canonical form, see below
 ref = "refs/heads/main"                           # the tracking ref; no commit: the root tracks
                                                   # path defaults to "." (the root checkout)
 
@@ -56,7 +56,7 @@ path = "base/work"                                # a nested checkout inside the
 
 ## Order of one run
 
-1. **Binding, lock, trust.** The binding names the profile, and `--root` must contain it. The live lock is read. Every `--trust-origin` value must be canonical (section 8, S2: `https` or `ssh`, lowercase host, no userinfo except `git` for `ssh`, no trailing `/`, no `.git`, no query or fragment), else `E_SOURCE_UNTRUSTED`. A new grant is written under the writer lock, before any fetch, between a `grant-origin` journal `intent` entry and its `done` entry. An origin already granted writes nothing. The root origin must have a grant, else exit 3 `E_SOURCE_UNTRUSTED` with the `--trust-origin` command to run, and nothing is fetched.
+1. **Binding, lock, trust.** The binding names the profile, and `--root` must contain it. The live lock is read. Every `--trust-origin` value must be canonical (S2: `https` or `ssh`, lowercase host, no userinfo except `git` for `ssh`, no trailing `/`, no `.git`, no query or fragment), else `E_SOURCE_UNTRUSTED`. A new grant is written under the writer lock, before any fetch, between a `grant-origin` journal `intent` entry and its `done` entry. An origin already granted writes nothing. The root origin must have a grant, else exit 3 `E_SOURCE_UNTRUSTED` with the `--trust-origin` command to run, and nothing is fetched.
 2. **Copy and rehearse.** The review pass takes the shared manager lock (`E_LOCKED` when a writer holds it) and keeps it while its staging directory exists.
    - The checkout at `--root` is copied as it is (dirty, untracked and ignored files, nested checkouts, `.git`) into `<cache dir>/staging/<pid>-<start>`. The directory is a real directory owned by the user, mode 0700, and is removed when the run ends. The run holds a lock file inside it.
    - Only the run that holds the writer lock (step 5) removes sibling `<pid>-<start>` directories whose lock nobody holds. A review pass removes only its own.
@@ -131,11 +131,11 @@ To keep an unlisted key, move it out of the checkout: `git config --unset <key>`
 
 A non-empty `.git/info/attributes`, `.git/info/grafts` or `.git/shallow` is also `E_SOURCE_UNTRUSTED` (`bootstrap.sh install` has the same rule for attributes). Grafts and a shallow file rewrite the ancestry that `merge-base --is-ancestor` and `merge --ff-only` report, so a graft could move HEAD over local-only history. `GIT_NO_REPLACE_OBJECTS` does not cover them.
 
-## Decisions where the contract was silent
+## Decisions
 
 | Question | Choice |
 | --- | --- |
-| Where sources are declared | The `[[sources]]` of `dotfiles-manager.lock` at `--root`, in the contract's lock shape, plus `path` (where a nested checkout lives, default `.`). The binding's `origins` field stays unsupported. |
+| Where sources are declared | The `[[sources]]` of `dotfiles-manager.lock` at `--root`, plus `path` (where a nested checkout lives, default `.`). The binding's `origins` field stays unsupported. |
 | Tracking versus exact | By position: the root source tracks (no `commit`), every nested source is exact (`commit` required). |
 | Which lock names the nested sources | The fetched root revision's lock. The live lock's nested entries are ignored. The root entry must match between the two. |
 | Trust without an interactive prompt | No prompt exists. `--trust-origin <origin>` is the explicit grant: it names the origin, is refused with `--preview`, and `--yes-plan` never grants. A grant may be written for an origin that no lock names yet. It has no effect until a lock names it. |

@@ -1,4 +1,4 @@
-//! Tree digest (docs/architecture.md section 8, "Tree digest").
+//! Tree digest (docs/bootstrap.md).
 //!
 //! SHA-256 over entries sorted by path bytes. Each entry is
 //! `<path> NUL <class> NUL <value> LF`, where class is `file`, `exec` or

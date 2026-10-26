@@ -27,7 +27,7 @@ const MAX_RENDERED: usize = 16 << 20;
 /// available, and the Connect settings. Nothing else of the environment does.
 const OP_ENV_PREFIXES: [&str; 3] = ["OP_SESSION_", "OP_SERVICE_ACCOUNT_TOKEN", "OP_CONNECT_"];
 
-/// The account a resource names, checked as a parameter (docs/architecture.md section 8 item 3):
+/// The account a resource names, checked as a parameter:
 /// letters, digits, `.`, `_`, `-` and `@`, not starting with `-`, at most 128 characters.
 fn account(value: &Value) -> Result<String, Refusal> {
     let a = value

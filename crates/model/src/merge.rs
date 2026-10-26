@@ -2,8 +2,8 @@
 //! live bytes, the declared value and the handler entries the ledger records as owned, and
 //! returns the new bytes. It opens no file.
 //!
-//! This code lives in `dfm-model` because `serde_json` is allowed there only (docs/architecture.md
-//! section 1). The adapter glue (registry entry, `Generator` impl) is in the CLI crate.
+//! This code lives in `dfm-model`, which depends on `serde_json` (docs/state.md). The adapter
+//! glue (registry entry, `Generator` impl) is in the CLI crate.
 //!
 //! The live document is the base. The declared `managed` values merge into it: an object merges
 //! recursively (managed leaves win, foreign leaves survive), an array replaces, except at a
@@ -1342,7 +1342,7 @@ pub fn classify(
 }
 
 /// The salted hash of a managed view. The salt is a per-machine secret in `state/salt`. The
-/// result may be stored in `ledger.json` and nowhere else (docs/architecture.md section 8).
+/// result may be stored in `ledger.json` and nowhere else (docs/state.md).
 pub fn salted(salt: &[u8], view: &[u8]) -> String {
     let mut buf = Vec::with_capacity(salt.len() + view.len() + 32);
     buf.extend_from_slice(salt);

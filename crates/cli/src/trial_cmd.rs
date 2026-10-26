@@ -539,7 +539,7 @@ pub fn run(ctx: &Ctx, args: &Args, out: &mut dyn Write) -> Result<(), Refusal> {
     }
 
     // From here on the record exists and every outcome, journaled or not, ends in a receipt and
-    // a result line; a refusal is after a mutation (architecture section 10).
+    // a result line; a refusal is after a mutation, so it exits 1.
     let mut status = Status::Current;
     let mut stopped: Option<Refusal> = None;
     if locked.install.is_some() {

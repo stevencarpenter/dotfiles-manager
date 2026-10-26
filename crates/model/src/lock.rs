@@ -1,5 +1,5 @@
-//! The source lock (`dotfiles-manager.lock`, docs/architecture.md section 5, "Source lock") and
-//! the origin grants (`state/grants.json`, section 8, "Trust grant"). Pure data: parsing takes
+//! The source lock (`dotfiles-manager.lock`) and the origin grants (`state/grants.json`), both
+//! in docs/sync.md. Pure data: parsing takes
 //! already-read bytes. The `[manager]` table is parsed by `controls::parse_source_lock`; this
 //! module reads the `[[sources]]` entries that `sync` fetches (docs/sync.md).
 
@@ -11,7 +11,7 @@ use serde::de::IgnoredAny;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
-/// Largest lock file (section 5, parser and read limits).
+/// Largest lock file.
 pub const MAX_BYTES: usize = 1 << 20;
 pub const SCHEMA: i64 = 1;
 /// The `path` of the source that holds the profile and the lock: the checkout `--root` names.
@@ -126,7 +126,7 @@ pub fn valid_path(p: &str) -> bool {
             }))
 }
 
-/// The canonical origin form (section 8, S2): scheme `https` or `ssh` (and `file` only when
+/// The canonical origin form: scheme `https` or `ssh` (and `file` only when
 /// `allow_file`, for the isolated build's local remotes), a lowercase ASCII host, no userinfo
 /// except `git` for `ssh`, an absolute path with no trailing `/`, no `.git` suffix, no query
 /// and no fragment. Anything else is `E_SOURCE_UNTRUSTED`.
@@ -297,7 +297,7 @@ impl Lock {
     }
 }
 
-/// One trusted origin (section 8, "Trust grant").
+/// One trusted origin (docs/sync.md).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Grant {

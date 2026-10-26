@@ -1,4 +1,4 @@
-//! Exit codes and mixed-result precedence (docs/architecture.md section 10).
+//! Exit codes and mixed-result precedence (docs/apply.md, "Failure and accounting").
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Exit {

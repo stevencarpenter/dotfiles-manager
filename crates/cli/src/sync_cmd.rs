@@ -2,8 +2,8 @@
 //! composition they produce against this machine, takes one approval, publishes the sources into
 //! the user's checkouts and applies the configuration once (docs/sync.md).
 //!
-//! Git runs through the bounded runner with an environment built from empty (docs/architecture.md
-//! section 8, "Fetch environment"). The staging directory is the only thing a preview writes.
+//! Git runs through the bounded runner with an environment built from empty (docs/sync.md,
+//! "Fetch environment"). The staging directory is the only thing a preview writes.
 //! Publication is a fast-forward of each checkout and nothing else: never a reset, clean, stash,
 //! rebase, commit or push. A nested source is pinned to an exact commit, and the lock that holds
 //! the pin is never rewritten.
@@ -33,12 +33,12 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 const LOCK_FILE: &str = "dotfiles-manager.lock";
-/// Section 10 item 6: the default bound of one external process. A fetch gets the whole bound.
+/// The default bound of one external process. A fetch gets the whole bound.
 const FETCH_TIMEOUT: Duration = Duration::from_secs(600);
 /// A git command that touches no network.
 const LOCAL_TIMEOUT: Duration = Duration::from_secs(60);
 const MAX_STDOUT: usize = 16 << 20;
-/// Settings every git call carries (section 8): no hooks, no fsmonitor, objects checked on
+/// Settings every git call carries (docs/sync.md): no hooks, no fsmonitor, objects checked on
 /// fetch, no replacement refs, no line-ending rewrite, and no HTTP redirect: a redirect would
 /// send the request to a host the grant never named, so the fetch fails instead. The same pin
 /// drops every `objects/info/http-alternates` and `objects/info/alternates` entry of a dumb-HTTP
@@ -89,7 +89,7 @@ pub fn parse_args(args: &[String]) -> Result<Args, Refusal> {
         ));
     }
     // One command never both widens trust and publishes: the grant is reviewed first, then the
-    // plan it allows (section 8: --yes-plan can never grant a new origin).
+    // plan it allows (--yes-plan can never grant a new origin).
     if apply.yes_plan.is_some() && !trust.is_empty() {
         return Err(usage(
             "--trust-origin cannot be combined with --yes-plan; grant first, review the plan, then approve it",
@@ -122,7 +122,7 @@ fn path_str(p: &Path) -> Result<&str, Refusal> {
 // ---- git ------------------------------------------------------------------------------------
 
 /// Git through the runner: a fixed search path, a manager-owned empty HOME, and the fetch
-/// environment of section 8. `remote` allows `https` and `ssh` (and `file` in the isolated
+/// environment of docs/sync.md. `remote` allows `https` and `ssh` (and `file` in the isolated
 /// build, for the tests' local remotes); `local` allows only the `file` transport, which the
 /// fetches between the staging checkout and the user's checkout use.
 pub(crate) struct Git {
@@ -134,8 +134,8 @@ pub(crate) struct Git {
 impl Git {
     pub(crate) fn new(ctx: &Ctx, sys: &Sys) -> Git {
         let mut runner = ctx.runner(sys);
-        // Section 8: a manager-owned empty directory as HOME. `ssh` still reads `~/.ssh` through
-        // the password database, which the contract records.
+        // A manager-owned empty directory as HOME. `ssh` still reads `~/.ssh` through the
+        // password database (docs/sync.md, "Known limits").
         runner.home = ctx.platform.cache_dir().join("sync-home");
         let env = |protocols: &str| {
             [
@@ -274,7 +274,7 @@ struct Staging {
 const STAGING_LOCK: &str = "lock";
 
 impl Staging {
-    /// `sweep` is for the run that holds the writer lock (section 10 item 4): only it removes
+    /// `sweep` is for the run that holds the writer lock: only it removes
     /// the directories of dead runs, so a review pass, which holds the shared lock, can never
     /// remove another review's directory between its creation and its lock.
     fn create(ctx: &Ctx, sys: &Sys, sweep: bool) -> Result<Staging, Refusal> {
@@ -290,7 +290,7 @@ impl Staging {
         Ok(Staging { dir, _held: held })
     }
 
-    /// Removes the staging directories of runs that are gone (section 10 item 4): an entry named
+    /// Removes the staging directories of runs that are gone: an entry named
     /// `<pid>-<start>`, a real directory owned by the current user, whose lock file nobody
     /// holds. An entry that cannot be classified, or whose lock is held, is skipped.
     fn sweep(root: &Path, sys: &Sys) {
@@ -926,7 +926,7 @@ fn sync_digest(plan_digest: &str, staged: &[Staged]) -> String {
     sha256_hex(text.as_bytes())
 }
 
-/// Records one grant in the journal around its write (section 10, "Mixed results"): a
+/// Records one grant in the journal around its write: a
 /// `grant-origin` intent, the rewrite of `grants.json`, then its `done` entry. A run that dies
 /// in between leaves the intent open, which `doctor` and `state recover` report.
 fn grant_journaled(
@@ -1056,7 +1056,7 @@ fn run_inner(
         .root()
         .ok_or_else(|| untrusted(format!("{LOCK_FILE} declares no root source")))?;
 
-    // Trust first, before any fetch (section 8, "Trust grant"). A grant is written only for an
+    // Trust first, before any fetch (docs/sync.md). A grant is written only for an
     // origin the owner names on the command line, under the writer lock and journaled.
     let readable = Store::open_read(sys, &layout, state_cmd::fail_from_env()?)?
         .ok_or_else(crate::state_lost_refusal)?;
@@ -1095,8 +1095,8 @@ fn run_inner(
         return Err(untrusted_refusal(&[root_src.origin.as_str()]));
     }
 
-    // The review pass holds the shared lock while its staging directory exists (section 10
-    // item 4), so a writer that starts meanwhile is refused and no writer sweeps this run.
+    // The review pass holds the shared lock while its staging directory exists, so
+    // a writer that starts meanwhile is refused and no writer sweeps this run.
     let shared = Store::probe_writer(&sys, &layout)?;
     // Copy the checkout into staging, rehearse the fetch and fast-forward there, then plan the
     // staged tree as the tree --root will hold.

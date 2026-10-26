@@ -167,8 +167,8 @@ fn is_file_action(a: Action) -> bool {
 /// The two approvals a plan can need before apply writes: each names its operations by id.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Approval {
-    /// `--allow-disruptive`: deleting an owned output, or restarting a service (architecture
-    /// section 10 item 8).
+    /// `--allow-disruptive`: deleting an owned output, or restarting a service
+    /// (docs/apply.md, docs/lifecycle.md).
     Disruptive,
     /// `--allow-adopt`: recording ownership of an existing link (DFM-45).
     Adopt,
@@ -2189,7 +2189,7 @@ impl Exec<'_, '_> {
     }
 }
 
-/// Journal entries of earlier runs are settled first (architecture section 5, DFM-19).
+/// Journal entries of earlier runs are settled first (docs/apply.md, "Interrupted runs"; DFM-19).
 ///
 /// 1. An `intent` with no terminal entry is probed with the operation's `already_done` check
 ///    and journaled `done`, `failed` or `unknown`. Nothing is run again and no ownership is
@@ -2447,7 +2447,8 @@ fn execute(run: &Run<'_>, plan: &Plan) -> Report {
         results.insert(&op.id, status);
         records.push(rec);
     }
-    // A signal after the last operation, or after a failure, still decides the exit (section 10).
+    // A signal after the last operation, or after a failure, still decides the exit
+    // (docs/apply.md).
     Report {
         operations: records,
         stopped: crate::signal::requested().or(stopped).or(pending),

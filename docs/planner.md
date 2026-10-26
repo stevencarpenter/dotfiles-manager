@@ -1,6 +1,6 @@
 # Planner
 
-This page records what the planner does where [docs/architecture.md](architecture.md) (the contract) leaves a choice open. The contract wins where this page is silent.
+This page describes the planner at HEAD.
 
 ## What exists
 
@@ -11,7 +11,7 @@ This page records what the planner does where [docs/architecture.md](architectur
 | `plan` command, text summary | `crates/cli/src/plan_cmd.rs`, colors in `crates/cli/src/paint.rs` |
 | Sensitivity flag on adapters and resolved resources | `AdapterSpec::sensitive`, `ResolvedResource::sensitive` |
 
-Layering follows architecture section 3. `model` takes already-observed facts and returns a plan. `engine` observes. `cli` joins them, then runs the `render` and `assemble` adapters to fill the output hashes ([docs/adapters.md](adapters.md)). No `ports` or `adapters` crate exists. Apply is in [docs/apply.md](apply.md).
+`model` takes already-observed facts and returns a plan. `engine` observes. `cli` joins them, then runs the `render` and `assemble` adapters to fill the output hashes ([docs/adapters.md](adapters.md)). No `ports` or `adapters` crate exists. Apply is in [docs/apply.md](apply.md).
 
 ## The command
 
@@ -25,9 +25,9 @@ dfm plan [--root <dir>] [--json] [--against <saved plan>]
 - `--against <file>` parses a saved `--json` output, checks that its digest matches its content (an edited file is `E_PLAN_INVALID`), builds a fresh plan and compares. Any difference is `E_PLAN_STALE`, exit 3. See "The `stale` array" below.
 - The text mode ends with a `summary:` line, then the `blocked:` lines, then the digest. The summary gives the count of each status that occurs, and `; nothing to change` when apply would write nothing (`Plan::changes_nothing`). The status and id of each `blocked` operation, then of each `planned` one, follow on their own lines, at most 20, then a line says how many more exist. A `not_in_scope` operation is only counted. `apply`, `sync` and the scoped commands print the same plan.
 - **Color.** On a terminal the status words, the `summary:` counts, `blocked:` lines and the `result:` line of `apply`, `sync` and `trial` are colored, and so is `error:` on a terminal stderr. Bold red marks what stopped, bold yellow what will change, yellow what waits, green what needs nothing, bold green what changed or ended well, magenta what another scope acts on and cyan what is held. Labels are bold blue, module tags cyan, the digest magenta and `note:` yellow. `NO_COLOR` (any non-empty value) or `TERM=dumb` turns color off. A pipe or file gets no color, and `--json` is never colored. `doctor`, `status` and the apply `counts:` line are not colored.
-- The manager stores no plan and no digest (architecture section 10, item 4). The digest is computed on every run.
+- The manager stores no plan and no digest. The digest is computed on every run.
 
-Exit codes follow section 10: a blocked or stale plan is 3, an unreadable root or saved plan is 2 (`E_REPORT_UNAVAILABLE`), and a usage error is 2. A malformed manifest is exit 3 for `plan`; `doctor` reports it as a finding instead ([docs/resolver.md](resolver.md), "Error codes added by the resolver").
+Exit codes: a blocked or stale plan is 3, an unreadable root or saved plan is 2 (`E_REPORT_UNAVAILABLE`), and a usage error is 2. A malformed manifest is exit 3 for `plan`; `doctor` reports it as a finding instead ([docs/resolver.md](resolver.md), "Error codes added by the resolver").
 
 ## Scope of a plan
 
@@ -44,14 +44,12 @@ An `application` resource is in no scope. The `packages` and `services` plans fi
 
 ## What a plan contains
 
-Architecture section 9 lists the plan content. This is how each item is met.
-
-| Contract item | In the plan |
+| Item | In the plan |
 | --- | --- |
 | binary identity | `binary{version, sha256}` of the running executable |
 | binding, machine | `profile`, `machine_id` (the binding digest is audit evidence and is not compared, [docs/state.md](state.md)) |
 | resolved model digest | `model_digest`: SHA-256 over resources, values, claims. Values of secret-bearing resources are left out. |
-| source identities | `sources[{kind: "path", root, tree}]`: canonical root and tree digest of the loaded source set (section 9, "Path-source identity"). With `[sources]` the loaded set is the declared roots minus the excludes plus the files beside the bundle ([docs/resolver.md](resolver.md), "Source roots and excludes"). |
+| source identities | `sources[{kind: "path", root, tree}]`: canonical root and tree digest of the loaded source set. With `[sources]` the loaded set is the declared roots minus the excludes plus the files beside the bundle ([docs/resolver.md](resolver.md), "Source roots and excludes"). |
 | observation fingerprints | `observations`: one `Seen` per observed path and one listing per fragment directory. Each operation also lists `preconditions`. |
 | managed fingerprint | `managed_sha256` on a merge operation: SHA-256 of the canonical JSON of the declared managed values. |
 | ordered operations, prerequisites, privilege | `operations`, in dependency order, each with `after`, `preconditions`, `privilege` (always `user`) and `postcondition` |
@@ -110,7 +108,7 @@ A rejected plan still prints. Its `blockers` list gives for each: code, resource
 
 | Code | Meaning | Exit |
 | --- | --- | --- |
-| `E_CONFLICT` | Named by architecture section 8. An existing output is not owned, was edited, or cannot be verified. | 3 |
+| `E_CONFLICT` | An existing output is not owned, was edited, or cannot be verified. | 3 |
 | `E_PARENT_UNSAFE` | A parent directory is a link. | 3 |
 | `E_PLAN_CYCLE` | Operations depend on each other in a loop. | 3 |
 | `E_PLAN_STALE` | A saved plan differs from a fresh one. | 3 |
@@ -121,14 +119,14 @@ A rejected plan still prints. Its `blockers` list gives for each: code, resource
 
 `E_TARGET_INVALID` (a resolver code) also covers non-ASCII names in the planner. An unsupported saved-plan schema is `E_SCHEMA_UNSUPPORTED`. A missing state directory is `E_STATE_INVALID`, because ownership would be unknown. A plan or model that cannot be serialized (impossible for these types) is `E_STATE_INVALID`, exit 3, the class `state::canonical` uses for the same case.
 
-## Architecture ambiguities resolved
+## Decisions
 
-| Contract text | Reading used |
+| Question | Choice |
 | --- | --- |
-| Section 10, exit 3: "a required prerequisite that is `UNKNOWN`", and section 8 "An untested probe stays disabled and returns `UNKNOWN`" | A configuration plan has no probe, so no prerequisite is `UNKNOWN` for it. A path that cannot be observed is `E_OBSERVATION_UNKNOWN`, exit 3. |
-| Section 9, item 1: "content hashes of generated outputs for `normal` class outputs" | The CLI runs the `git-config/v1` and `text-fragments/v1` generators at plan time and records `output_sha256` on each planned `create_file` or `update_file` of those adapters (`plan_outputs`). `dfm-model` stays pure: the model builds the plan, then the CLI fills the hash. The hash is inside the plan digest. |
-| Section 10: `--yes-plan <digest>` "recomputes the plan digest and compares" | `plan --against <saved plan>` is the read-only form. `--yes-plan` belongs to the mutating commands ([docs/apply.md](apply.md)). |
-| Section 5, ledger: "exact `owned_outputs` ... with fingerprints" | A link output's fingerprint is `link_fingerprint` (above). |
+| A required prerequisite that is `UNKNOWN` (exit 3) | A configuration plan has no probe, so no prerequisite is `UNKNOWN` for it. A path that cannot be observed is `E_OBSERVATION_UNKNOWN`, exit 3. |
+| Content hashes of generated `normal` class outputs | The CLI runs the `git-config/v1` and `text-fragments/v1` generators at plan time and records `output_sha256` on each planned `create_file` or `update_file` of those adapters (`plan_outputs`). `dfm-model` stays pure: the model builds the plan, then the CLI fills the hash. The hash is inside the plan digest. |
+| Where the digest is compared | `plan --against <saved plan>` is the read-only form. `--yes-plan` belongs to the mutating commands ([docs/apply.md](apply.md)). |
+| Ledger fingerprint of a link output | A link output's fingerprint is `link_fingerprint` (above). |
 | DESIGN.md section 4: "A directory link conflicts with every independently claimed descendant" | The resolver checks claims against each other. The planner adds the machine side: a link parent on disk is `E_PARENT_UNSAFE`. |
 
 ## Known limits
@@ -139,7 +137,7 @@ A rejected plan still prints. Its `blockers` list gives for each: code, resource
 - **Mode on out-of-scope resources.** A bad `mode` on an out-of-scope resource (for example a secret) still raises a blocker. A mode a resource declares outside `0..=0o777` is `E_MANIFEST_INVALID`, not dropped.
 - **Sensitive ledger entries.** A path the ledger records as sensitive is never hashed and its ledger text is never printed, whoever claims it now, and a fragment-directory name that matches it in another case is not hashed.
 - **Sensitive conflicts.** A sensitive destination of the merge adapter is compared by the salted hash of its managed fields ([docs/adapters.md](adapters.md), "Conflict detection"). Any other existing sensitive destination still blocks the plan, owned or not. `plan` and `doctor` read a merge file and keep the result in memory only. A ledger entry of another resource on the path blocks before the read.
-- **Unchecked claims.** A claim that cannot be checked against the manager's own paths (an I/O error, not an overlap) is `E_OBSERVATION_UNKNOWN`, exit 3 (architecture section 10, an unknown required fact). The topology walk reports a link loop or unreadable parent first. The reserved-path and unchecked maps are computed for ledger outputs too, so removal candidates get the same checks.
+- **Unchecked claims.** A claim that cannot be checked against the manager's own paths (an I/O error, not an overlap) is `E_OBSERVATION_UNKNOWN`, exit 3, as for any unknown required fact. The topology walk reports a link loop or unreadable parent first. The reserved-path and unchecked maps are computed for ledger outputs too, so removal candidates get the same checks.
 - **Field claims.** The resolver models path claims only. Claims on fields inside a co-owned document (for example one key of `settings.json`) are not modelled, so two resources writing different fields of one file collide as a path.
 - **Source mode.** The source loader records no executable bit, so a mode-only edit of a source file does not change the tree digest.
 - **Scoped sources.** With `[sources]`, the digest says nothing about content under an excluded path or outside the roots. A directory link that points at a tree containing excluded content publishes that content on apply, and the plan does not hash it. The `excluded` count covers entries below the directory only; the rules that make a sibling link or a link to a directory with an excluded directory `E_SOURCE_ESCAPE` are in [docs/resolver.md](resolver.md), "Source roots and excludes", item 6. A new excluded entry in that directory makes a saved plan stale.

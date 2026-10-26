@@ -1,6 +1,6 @@
 # Toolchains
 
-`packages --update`: the rolling update of runtime and CLI tools that `mise/v1` and `uv-tool/v1` own. The install path of the same adapters, their probes and provider variables are in [docs/packages.md](packages.md). [docs/architecture.md](architecture.md) is the contract and wins where this document is silent.
+`packages --update`: the rolling update of runtime and CLI tools that `mise/v1` and `uv-tool/v1` own. The install path of the same adapters, their probes and provider variables are in [docs/packages.md](packages.md). This document describes the behavior at HEAD.
 
 | Part | Location |
 | --- | --- |
@@ -10,7 +10,7 @@
 | `packages --update` | `crates/cli/src/apply_cmd.rs`, `crates/cli/src/lib.rs` |
 | Tests with `mise`, `uv` and `brew` look-alikes | `crates/cli/tests/toolchains.rs` |
 
-Two provider paths are built: mise (runtimes and tools from mise's registry and backends, by the name mise takes) and uv tools by package-index name. A uv tool from a Git origin or a local path is not built. It needs origin trust (architecture section 8) and a source identity the manager can record. Declared, it is `E_MANIFEST_INVALID`. Installed that way by hand, it is held under `--update`.
+Two provider paths are built: mise (runtimes and tools from mise's registry and backends, by the name mise takes) and uv tools by package-index name. A uv tool from a Git origin or a local path is not built. It needs origin trust ([docs/sync.md](sync.md)) and a source identity the manager can record. Declared, it is `E_MANIFEST_INVALID`. Installed that way by hand, it is held under `--update`.
 
 ## The command
 
@@ -46,9 +46,9 @@ A tool the provider does not list is planned as docs/packages.md plans it: `inst
 
 ## Upgrading mise or uv themselves
 
-The manager does not upgrade either. Both come from Homebrew on the inventoried machines, and `homebrew/v1` has no rolling update path. The manager is a static binary that needs neither at run time (architecture section 2), so `state recover`, `state resolve` and `doctor` do not depend on a provider.
+The manager does not upgrade either. Both come from Homebrew on the inventoried machines, and `homebrew/v1` has no rolling update path. The manager is a static binary that needs neither at run time, so `state recover`, `state resolve` and `doctor` do not depend on a provider.
 
-## Decisions where the contract was silent
+## Decisions
 
 | Question | Choice |
 | --- | --- |

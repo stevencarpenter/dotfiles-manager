@@ -2,7 +2,7 @@
 
 **The manager resolves one machine profile into an owned configuration and an explicit change plan. A mandatory core defines shared invariants and overridable defaults; selected modules contribute through declared extension points.**
 
-Status: requirements contract for the `dfm` manager. The owner approved the requirements in section 1 and the ownership boundary in section 2. Sections 3 to 9 specify the design. The manager implements part of it: section 7 maps each proposed command to the shipped command, and section 11 lists what is built and what stays open. [docs/architecture.md](docs/architecture.md) is the implementation contract.
+Status: requirements contract for the `dfm` manager. The owner approved the requirements in section 1 and the ownership boundary in section 2. Sections 3 to 9 specify the design. The manager implements part of it: section 7 maps each proposed command to the shipped command, and section 11 lists what is built and what stays open.
 
 ## 1. Agreed requirements
 
@@ -182,7 +182,7 @@ The executable is `dfm` (owner decision 2026-10-20, DFM-67). The "Shipped" colum
 | `purge <trial>` | Preview and confirm removal of trial-owned installation/configuration/state and safe restoration of the recorded baseline. | Not built (DFM-34). |
 | `secrets` | Explicitly authenticate/render declared secrets. Preserve last-good outputs on failure. | `dfm secrets` ([docs/secrets.md](docs/secrets.md)). |
 
-The shipped CLI also has `bind`, `binding`, `state`, `packages`, `services`, `self-update` and `self-check`. [docs/architecture.md](docs/architecture.md) section 10 defines their flags and exit codes.
+The shipped CLI also has `bind`, `binding`, `state`, `packages`, `services`, `self-update` and `self-check`. [README.md](README.md) lists the exit codes and links the document for each command.
 
 Only configuration work belongs in a normal config plan. The mutating high-level commands compose source acquisition, configuration, provisioning, updates, and necessary reload scopes internally, with one combined preview and approval rather than separate user invocations. Secret authentication/rendering remains an explicit opt-in scope; a missing required secret blocks dependent work instead of being silently ignored.
 
@@ -339,11 +339,11 @@ The current private wrapper has not been inspected in this workspace. Synthetic 
 ### Decided
 
 - Names (owner, 2026-10-20, DFM-67): the command is `dfm`. The project, crates, `dotfiles-manager.lock`, and the state, config, cache and data directories keep the name `dotfiles-manager`.
-- The owner decisions of 2026-10-09 in [docs/architecture.md](docs/architecture.md) section 14 settle the implementation language (Rust), the build-from-source distribution, the direct crates, and the exit codes.
+- The owner decisions of 2026-10-09 settle the implementation language (Rust), the build-from-source distribution, the direct crates, and the exit codes.
 
 ### Still open
 
-[docs/architecture.md](docs/architecture.md) also specifies the source lock, receipt format, adapter packaging and CLI exit semantics. No repository record shows that the owner accepted that whole document, so these items stay open for owner review:
+These items stay open for owner review:
 
 - TOML schema and the exact catalogue/override syntax.
 - Which real configurations are universal core, exposed defaults, or optional modules.

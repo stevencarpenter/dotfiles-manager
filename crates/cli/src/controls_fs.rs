@@ -1,5 +1,5 @@
 //! Reads a staged tree and the toolchain tree from disk and applies the build
-//! controls in `dfm_model::controls` (docs/architecture.md section 8, item 3a).
+//! controls in `dfm_model::controls` (docs/bootstrap.md).
 //! Read-only. Starts no process except `id -u`, which names the user that must own the toolchain
 //! and every directory above it below HOME.
 
@@ -207,7 +207,7 @@ pub(crate) fn closed_ancestors(home: &Path, dir: &Path, uid: u32) -> Result<(), 
     Ok(())
 }
 
-/// Digest of an installed toolchain tree (docs/architecture.md section 8, item 4a).
+/// Digest of an installed toolchain tree (docs/bootstrap.md).
 pub fn toolchain_tree_digest(dir: &Path) -> Result<String, String> {
     let uid = dfm_platform_macos::current_uid()
         .ok_or_else(|| "cannot determine the current user".to_string())?;

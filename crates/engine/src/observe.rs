@@ -1,6 +1,5 @@
-//! Read-only observation of HOME for the planner (docs/architecture.md section 8, probe
-//! allowlist item 1: `lstat`, `readlink`, directory listing and bounded reads of declared
-//! paths, all through descriptor-relative operations).
+//! Read-only observation of HOME for the planner: `lstat`, `readlink`, directory listing and
+//! bounded reads of declared paths, all through descriptor-relative operations.
 //!
 //! The walk starts at the opened HOME and goes one component at a time with `O_NOFOLLOW`, so a
 //! link in a parent is reported, never followed. Nothing is created, written, repaired or run.

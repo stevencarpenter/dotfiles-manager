@@ -1,5 +1,5 @@
-//! Safe display of untrusted text (docs/architecture.md section 9, item 5: every untrusted string
-//! rendered to a terminal has control characters and escape sequences replaced by visible escapes).
+//! Safe display of untrusted text: every untrusted string rendered to a terminal has control
+//! characters and escape sequences replaced by visible escapes.
 
 /// Characters that change how text is laid out or hide in it: zero-width and joining controls,
 /// the byte order mark, line and paragraph separators, bidirectional embedding, override and

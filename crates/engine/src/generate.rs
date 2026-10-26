@@ -65,7 +65,7 @@ impl std::fmt::Debug for GeneratorInputs {
 }
 
 /// Produces the bytes of a generated file. Adapters implement it (docs/adapters.md). The trait
-/// lives in `engine` until a `ports` crate exists (docs/architecture.md section 3); adapters
+/// lives in `engine` until a `ports` crate exists; adapters
 /// are in the CLI crate and do not depend on `engine` internals.
 ///
 /// `generate` is a pure function of the operation and the verified inputs. It must not open
@@ -158,8 +158,8 @@ pub trait Generator {
     }
 }
 
-/// How a launcher answered a start or restart (architecture section 11, `UpdateProvider`:
-/// queued is `pending`, only completed can become `updated`).
+/// How a launcher answered a start or restart: queued is `pending`, only completed can become
+/// `updated` (docs/lifecycle.md).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Completion {
     /// The launcher finished the request. The caller's postcondition probe decides the outcome.

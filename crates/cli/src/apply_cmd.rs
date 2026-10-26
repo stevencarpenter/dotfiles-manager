@@ -347,7 +347,7 @@ fn run_inner(
     progress.plan_printed = true;
     let generators = |loaded| generators_for(ctx, &sys, args.scope, loaded);
     let journal_open = check_before_lock(ctx, args, &plan, &digest, &generators(&first), out)?;
-    // The credential gate (architecture section 10 item 2): a secrets run without a vault
+    // The credential gate (docs/secrets.md): a secrets run without a vault
     // session stops here, exit 3, before the lock and before any write. Nothing is rendered.
     if args.scope == Scope::Secrets {
         crate::adapters::secret::credentials(&plan, &first.resolved, &ctx.runner(&sys))?;
@@ -428,7 +428,7 @@ fn run_inner(
     let mutated = store.mutated();
     // One exit, derived from the first problem, is both printed and returned.
     let is_signal = |r: &Refusal| matches!(r.code, Code::Interrupted | Code::Terminated);
-    // A signal that came during the run wins over any other stop (section 10 precedence).
+    // A signal that came during the run wins over any other stop (exit precedence, docs/apply.md).
     let mut stopped = dfm_engine::signal::requested()
         .or(report.stopped)
         .map(|r| if mutated { r.after_mutation() } else { r });
@@ -577,7 +577,7 @@ fn run_inner(
         .map_err(w)?;
     }
     // One value is both printed and returned. The higher-ranked of the stop and the receipt
-    // failure wins, and the receipt failure wins a tie (section 10 precedence).
+    // failure wins, and the receipt failure wins a tie (exit precedence, docs/apply.md).
     let outcome = match (receipt_error, stopped) {
         (Some(e), Some(r)) if e.exit().combine(r.exit()) != e.exit() => Err(r),
         (Some(e), _) => Err(e),

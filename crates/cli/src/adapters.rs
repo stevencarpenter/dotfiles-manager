@@ -1,5 +1,5 @@
-//! The adapter registry the resolver validates against (docs/architecture.md section 3: the CLI
-//! builds the registry). Each entry states what the resolver needs to know about an adapter: its
+//! The adapter registry the resolver validates against (docs/adapters.md: the CLI builds the
+//! registry). Each entry states what the resolver needs to know about an adapter: its
 //! kind, whether it owns a target, how its `value` is typed, and which outputs it claims. No
 //! adapter is run here.
 

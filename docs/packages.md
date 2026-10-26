@@ -1,6 +1,6 @@
 # Packages
 
-The `homebrew/v1`, `mise/v1`, `uv-tool/v1` and `apt/v1` package adapters and the `packages` command. The rolling update (`packages --update`) is in [docs/toolchains.md](toolchains.md). [docs/architecture.md](architecture.md) is the contract and wins where this document is silent.
+The `homebrew/v1`, `mise/v1`, `uv-tool/v1` and `apt/v1` package adapters and the `packages` command. The rolling update (`packages --update`) is in [docs/toolchains.md](toolchains.md). This document describes the behavior at HEAD.
 
 | Part | Location |
 | --- | --- |
@@ -54,7 +54,7 @@ Nothing else reads a version. A package plan installs what is missing and never 
 | `homebrew/v1` | `brew --cellar` and `brew --caskroom`, then the version directories under `<Cellar or Caskroom>/<short name>`. No formula or cask file is loaded, so a tap's code never runs before approval, and a cask is found as a cask. | A version directory under the rack (`.metadata` and other dot entries skipped). For a tap-qualified name, every install receipt (`<keg>/INSTALL_RECEIPT.json`, or the cask's `.metadata/INSTALL_RECEIPT.json`) must name that tap in `source.tap`, else another owner (`E_CONFLICT`). An unreadable receipt is `E_PROBE_FAILED`. A bare name accepts any tap. | `brew install homebrew/core/<name>` for a formula, `brew install --cask <name>` for a cask. Official packages only. |
 | `mise/v1` | `mise ls --installed --json <tool>`. JSON, because the table truncates a long tool name. | Exit 0 and a JSON array with an installed `version` that matches. `[]` is missing. Any other answer is `E_PROBE_FAILED`. | `mise install <tool>@latest` for a bare name, `mise install <tool>@<version>` for a declared `tool@version`. The selector is always sent, because `mise install <tool>` installs only the version mise's configuration requests, and that configuration is hidden. |
 | `uv-tool/v1` | `uv tool list` | A `<name> v<version>` line for the name, compared as uv normalizes names. `No tools installed` or no line is missing. | `uv tool install <name>` |
-| `apt/v1` | `dpkg-query -W -f=${Status} <name>` | Exit 0 and `install ok installed` | None. Installing needs root, and a HOME adapter never escalates (architecture section 8, privilege). A missing apt package is a blocker, `E_PRIVILEGE_UNSUPPORTED`, with the command to run by hand. |
+| `apt/v1` | `dpkg-query -W -f=${Status} <name>` | Exit 0 and `install ok installed` | None. Installing needs root, and a HOME adapter never escalates. A missing apt package is a blocker, `E_PRIVILEGE_UNSUPPORTED`, with the command to run by hand. |
 
 Provider environment (the variables reach only the manager's child):
 
@@ -62,7 +62,7 @@ Provider environment (the variables reach only the manager's child):
 - `mise`: `MISE_YES=1`, `MISE_NOT_FOUND_AUTO_INSTALL=false`, `MISE_NO_CONFIG=1`. No config file is loaded, because config evaluation can run hooks, env sources and remote includes. The install uses the same variables, so no config hook (`postinstall`) runs.
 - `uv`: `UV_NO_CONFIG=1`, `UV_NO_PROGRESS=1`, `UV_PYTHON_DOWNLOADS=never`, and `UV_OFFLINE=1` for the probe only. No interpreter is downloaded.
 
-A probe that cannot run (program not found or failed its checks), times out, or answers in a shape the adapter does not know is `Unknown` with a reason. The plan gets a blocker, `E_PROBE_FAILED`, exit 3 (architecture section 8 item 9: unknown support fails closed). The same code applies when the probe under the lock cannot answer.
+A probe that cannot run (program not found or failed its checks), times out, or answers in a shape the adapter does not know is `Unknown` with a reason. The plan gets a blocker, `E_PROBE_FAILED`, exit 3: unknown support fails closed. The same code applies when the probe under the lock cannot answer.
 
 ### One owner
 
@@ -107,7 +107,7 @@ These calls load the formula's Ruby file, which for a non-official tap is third-
 
 **Interrupted install.** The intent has no path, so recovery cannot probe it. The resource blocks with `E_OP_INTERRUPTED` until `state resolve <journal-id> --as failed`, even when the provider lists it as installed. The next `packages` run probes and installs only if the package is missing. The same rule applies to a rolling upgrade (docs/toolchains.md), a trial install (docs/trial.md) and a service action (docs/lifecycle.md).
 
-## Decisions where the contract was silent
+## Decisions
 
 | Question | Choice |
 | --- | --- |

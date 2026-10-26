@@ -1,6 +1,6 @@
 # Apply
 
-This page records what `apply` does where [docs/architecture.md](architecture.md) (the contract) leaves a choice open. The contract wins where this page is silent. The plan it executes is in [docs/planner.md](planner.md) and the store in [docs/state.md](state.md). The co-owned merge rules are in [docs/adapters.md](adapters.md).
+This page describes `apply` at HEAD. The plan it executes is in [docs/planner.md](planner.md) and the store in [docs/state.md](state.md). The co-owned merge rules are in [docs/adapters.md](adapters.md).
 
 ## What exists
 
@@ -22,19 +22,19 @@ This page records what `apply` does where [docs/architecture.md](architecture.md
 dfm apply [--root <dir>] [--preview] [-y|--yes-plan <digest>] [--allow-disruptive <operation-id>]... [--allow-adopt <operation-id>]...
 ```
 
-There is no `--plan <file>` flag. The manager stores no plan (architecture section 10), so apply plans again from the current machine and compares the digest the reviewer approved. `--root` defaults to the root the binding records.
+There is no `--plan <file>` flag. The manager stores no plan, so apply plans again from the current machine and compares the digest the reviewer approved. `--root` defaults to the root the binding records.
 
 1. Apply resolves, observes and plans exactly as `plan` does. It prints the plan and its digest.
 2. `--preview` runs the gates that need no write (below), including the journal size, and exits 0 only when apply would not refuse on those gates. It lists every removal that lacks its flag as a pasteable `--allow-disruptive '<id>'` flag and exits 3 with `E_DISRUPTIVE_UNAPPROVED`, as apply does. It lists an adoption without its flag the same way, as `--allow-adopt '<id>'`, and exits 3 with `E_ADOPT_UNAPPROVED`. When both kinds are missing, both lists print and the first error is the one returned. Pass the flags to the preview to get exit 0. A preview never writes. It cannot be combined with `--yes-plan` (exit 2).
 3. A blocked plan (any blocker) exits 3 with the first blocker. A blocked plan cannot be approved.
-4. Without `--yes-plan` (short form `-y`), apply exits 3 with `E_APPROVAL_REQUIRED` and changes nothing. No prompt exists, so every run is noninteractive (architecture section 10, "Bounded noninteractive behavior"). Exception (owner decision, 2026-10-25): a plan that writes nothing needs no approval. Every operation is `current`, `held` or `not_in_scope`, no `current` operation is a removal (apply would prune its ledger entry), and the journal holds no unfinished entry and no unknown outcome. Apply then prints `nothing to change: no approval needed` and `result: ok`, exits 0, takes no lock and writes no receipt.
+4. Without `--yes-plan` (short form `-y`), apply exits 3 with `E_APPROVAL_REQUIRED` and changes nothing. No prompt exists, so every run is noninteractive. Exception (owner decision, 2026-10-25): a plan that writes nothing needs no approval. Every operation is `current`, `held` or `not_in_scope`, no `current` operation is a removal (apply would prune its ledger entry), and the journal holds no unfinished entry and no unknown outcome. Apply then prints `nothing to change: no approval needed` and `result: ok`, exits 0, takes no lock and writes no receipt.
 5. A `--yes-plan` digest that differs from the current digest exits 3 with `E_PLAN_STALE`. This check is read-only. It does not take the lock and does not create the lock file.
 6. Apply takes the writer lock, plans a second time and compares the digest again. A change between the first look and the lock is also `E_PLAN_STALE`.
 7. Apply runs the pre-mutation gates (below), settles interrupted work, executes, writes a receipt and prints the report. The last line is `result: <name>`. It is the exit name of the exit code the process returns, from the same value.
 
 An `--allow-disruptive` id that names no removal in the first plan, and an `--allow-adopt` id that names no adoption, is a usage error (exit 2). This check runs before the lock is taken and before the state store is opened for writing.
 
-The approval kind in the receipt is `yes_plan`. The engine cannot check that a person read the plan (architecture section 14, recorded limit).
+The approval kind in the receipt is `yes_plan`. The engine cannot check that a person read the plan. That limit is recorded.
 
 ## Gates before the first write
 
@@ -47,7 +47,7 @@ All of these exit 3 and change nothing:
 - Any planned operation on a sensitive output is refused with `E_SENSITIVE_UNSUPPORTED`, unless the generator runs it as a merge (`Generator::merges`) or renders it as a secret (`Generator::renders`, [docs/secrets.md](secrets.md)). Today that is exactly the `create_file`, `update_file` and `retire` operations of `claude-settings/v1`, and the `create_file` and `update_file` operations of `op-template/v1` in a `secrets` run. A sensitive link, a sensitive directory and a sensitive removal stay refused, so the executor never meets one. One refused operation refuses the whole plan. A merge operation must carry `managed_sha256` (`retire` must carry none), otherwise the plan is `E_PLAN_INVALID`.
 - A link target must lie in the root of the operation's own source: the plan source whose `<root>/<first input path>` is the target. A target outside every source root, or one that names another file than the operation's input, is `E_PLAN_INVALID`.
 - The journal must be able to take this run's entries. The check assumes 4096 bytes for the two entries of each journaled operation. It also reserves 4096 bytes for each entry that settling earlier work will append: one per open intent, one per open `unknown` entry that has an intent record, and one for the repair of a torn final line. An `unknown` entry with no intent record is never closed and reserves nothing. If the journal would pass 8 MiB, apply refuses with `E_LIMIT_EXCEEDED`. Journal rotation is not built ([docs/state.md](state.md), "Recovery by hand").
-- Each planned `remove` operation (and each service `restart`, [docs/lifecycle.md](lifecycle.md)) needs its own `--allow-disruptive <operation-id>` (`E_DISRUPTIVE_UNAPPROVED`). The allow set must equal the set of planned removals, so the plan determines it. The refusal lists every missing id as a pasteable flag, with no cap. Architecture section 10 item 8 lists deletion of an owned file as disruptive, so `--yes-plan` alone never approves one, and N removals need N explicit ids.
+- Each planned `remove` operation (and each service `restart`, [docs/lifecycle.md](lifecycle.md)) needs its own `--allow-disruptive <operation-id>` (`E_DISRUPTIVE_UNAPPROVED`). The allow set must equal the set of planned removals, so the plan determines it. The refusal lists every missing id as a pasteable flag, with no cap. Deletion of an owned file is disruptive, so `--yes-plan` alone never approves one, and N removals need N explicit ids.
 - Each planned `adopt` operation, and each merge `takeover`, needs its own `--allow-adopt <operation-id>` (`E_ADOPT_UNAPPROVED`). The allow set must equal the set of planned adoptions, as for removals. An adoption changes what the manager may later delete, so `--yes-plan` alone does not approve it. The two allow sets are separate, so one kind of approval never satisfies the other. A link target of an adoption is checked against its source root like any other link.
 
 ## Generator
@@ -93,7 +93,7 @@ For one operation, apply does these steps in this order:
 8. **Outcome.** The journal gets `done`. If the effect or the read-back failed, it gets `failed` with a redacted reason.
 9. **Ownership.** The ledger is rewritten atomically with the new output (or without the removed one). Ownership of a new output is recorded after `done`. For `update_file` and `replace_link` the output is already owned, so the ledger moves to the new fingerprint before `done`. A crash or a failed ledger write then leaves an open intent, and `state recover` records the fingerprint that is live (see Interrupted runs). `apply` plans before it settles, so until then the plan reports the output as changed (`E_CONFLICT`) and its fix text names `state recover`.
 
-The receipt is written once, after the last operation (architecture section 9 item 4).
+The receipt is written once, after the last operation.
 
 ## Effects and what each one verifies
 
@@ -188,7 +188,7 @@ A primitive that committed its effect but could not confirm durability returns `
 - The first operation that fails or blocks stops all further mutation. There is no `--continue`.
 - An operation that depends on it (through `after`, transitively through results) is `blocked`. Every other operation that has not started is `not_started`. `current`, `held` and `not_in_scope` operations are reported as they are.
 - Completed operations stay `updated`. There is no rollback.
-- The report lists one line per operation and the counts `updated`, `current`, `failed`, `blocked`, `unknown`, `not_started`, `not_in_scope`, `held`, `pending`, `blocked_pending`, so the counts add up to the number of operations. These are the contract status names, the same as in the receipt.
+- The report lists one line per operation and the counts `updated`, `current`, `failed`, `blocked`, `unknown`, `not_started`, `not_in_scope`, `held`, `pending`, `blocked_pending`, so the counts add up to the number of operations. These are the status names of the receipt.
 - The first problem keeps its own code (`E_IO_FAILED`, `E_PLAN_STALE`, `E_CONFLICT`, `E_IO_UNCONFIRMED`, and so on). There is no umbrella code. When the store wrote anything, the refusal is marked `after_mutation`, which turns a block code into exit 1.
 
 | Result | Exit |
@@ -201,18 +201,20 @@ A primitive that committed its effect but could not confirm durability returns `
 
 An I/O failure before the first write therefore prints `result: failed`, not `blocked`. The printed result and the exit come from one value.
 
-A receipt is written whenever the run wrote anything, also after a failure. If settling earlier work fails, or a clock or receipt step fails after a write, the run still prints its report and writes the receipt as far as it can. The exit stays 1. Its `result.outcome` and `exit_code` follow architecture section 5. A run that wrote nothing writes no receipt. A rerun of an applied plan without `--yes-plan` ends at step 4 of "The command". With `--yes-plan` it writes no journal entry, ledger or receipt and exits 0, but it takes and releases the lock, which rewrites the lock holder note.
+**Mixed results.** A run returns the code with the highest precedence: a signal first (130 or 143; the first signal received keeps its code), then 2, 1, 5, 3, 4 and 0 (`crates/model/src/exit.rs`). Codes 3 and 4 mean that nothing was written.
+
+A receipt is written whenever the run wrote anything, also after a failure. If settling earlier work fails, or a clock or receipt step fails after a write, the run still prints its report and writes the receipt as far as it can. The exit stays 1. Its `result.outcome` and `exit_code` follow [docs/state.md](state.md), "Documents". A run that wrote nothing writes no receipt. A rerun of an applied plan without `--yes-plan` ends at step 4 of "The command". With `--yes-plan` it writes no journal entry, ledger or receipt and exits 0, but it takes and releases the lock, which rewrites the lock holder note.
 
 ## Receipt fields apply adds
 
-- `operations[].reload`: see Publication and reload. The contract's receipt shape does not have it. No schema bump was made for it.
+- `operations[].reload`: see Publication and reload. No schema bump was made for it.
 - `approvals[{operation_id, how, at}]`: one entry per `--allow-disruptive` operation that ran (`how = allow_disruptive`) and per `--allow-adopt` operation that reached its intent (`how = allow_adopt`). `operation_id` is the id of the receipt operation (the journal attempt id). The validator checks that `how` fits the operation ([docs/state.md](state.md), "Documents"). Absent when there is none.
 - `sources[{id, tree}]`: a path source has no `commit`, and a source with no commit is a path source. `id` is `path-` and the first 12 hex characters of the tree digest. The tree digest is the one the planner computes, so the plan digest covers it.
 - Every operation that ran has the journal attempt id as its receipt `id`, also when it failed, was unknown or was blocked after its intent. An operation that did not reach its intent has the planner's journal id.
 
 ## Publication and reload
 
-Publishing a file does not reload the program that reads it (architecture section 8, "A correct file, an installed executable and a reloaded consumer are three separate postconditions"). Each link or file `apply` publishes has `reload = not_attempted` in its receipt operation, and the report prints a line that says no reload happened. A test asserts that no published file claims a reload. The receipt validator also accepts `requested` and `reloaded`, which only a service operation writes ([docs/lifecycle.md](lifecycle.md)). The contract names `unsupported` and `failed` are refused, because nothing can write them.
+Publishing a file does not reload the program that reads it. A correct file, an installed executable and a reloaded consumer are three separate postconditions. Each link or file `apply` publishes has `reload = not_attempted` in its receipt operation, and the report prints a line that says no reload happened. A test asserts that no published file claims a reload. The receipt validator also accepts `requested` and `reloaded`, which only a service operation writes ([docs/lifecycle.md](lifecycle.md)). The names `unsupported` and `failed` are refused, because nothing can write them.
 
 ## Decisions where the documents were silent
 
@@ -224,7 +226,7 @@ Publishing a file does not reload the program that reads it (architecture sectio
 
 ## Not built
 
-- A stored plan and a `--plan <file>` flag. The digest is the contract.
+- A stored plan and a `--plan <file>` flag. The approved digest stands in for a stored plan.
 - `--json`, `--no-input`, `--timeout`, an interactive approval and a run limit. Every run is noninteractive, so exit 4 does not occur.
 - A configurable directory mode policy. Directories apply creates are 0700.
 - `Fs` and `Clock` traits, adopting a regular file or a directory link, and rename-aside hardening for the check-then-act windows below.
@@ -246,7 +248,7 @@ Publishing a file does not reload the program that reads it (architecture sectio
 - If the parent set a signal to ignore (`nohup`, a background job), the handler for that signal is not installed and it stays ignored.
 - `plan`, `doctor`, `explain`, `state` and `apply --preview` install no handler, so a signal ends them as before: the kernel kills the process and no receipt exists.
 
-The handlers are installed with `SA_RESTART`. A blocking call restarts, and the executor sees the record at the next check, so a file system call never reports a spurious `EINTR` as a failed operation. `apply` starts no child process after the handlers are installed. `secrets`, `packages`, `services` and `trial` install the handlers before their first child (also with `--preview`), so the runner can poll the stop record while a child runs and end the child's process group with SIGTERM, a 10 s grace period and SIGKILL ([docs/secrets.md](secrets.md), [docs/packages.md](packages.md)). A signal recorded before the lock ends those runs with exit 130 or 143 and no write. The 30 s wait of the target contract (architecture section 10) is not built.
+The handlers are installed with `SA_RESTART`. A blocking call restarts, and the executor sees the record at the next check, so a file system call never reports a spurious `EINTR` as a failed operation. `apply` starts no child process after the handlers are installed. `secrets`, `packages`, `services` and `trial` install the handlers before their first child (also with `--preview`), so the runner can poll the stop record while a child runs and end the child's process group with SIGTERM, a 10 s grace period and SIGKILL ([docs/secrets.md](secrets.md), [docs/packages.md](packages.md)). A signal recorded before the lock ends those runs with exit 130 or 143 and no write. No 30 s wait for the operation in flight is built.
 
 SIGKILL, any signal with no handler (SIGHUP, SIGQUIT, ...), a crash or a power loss ends the process with no cleanup. It can leave an `intent` entry, and the next run settles it (Interrupted runs), except an `intent` for a sensitive merge (see Known limits, "Merge crash recovery").
 

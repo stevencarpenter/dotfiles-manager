@@ -26,7 +26,7 @@ libc = { version = "=0.2.190", default-features = false }
 
 [workspace.lints.rust]
 # Not "forbid": forbid cannot be relaxed, and crates/engine/src/signal.rs must. Every other crate
-# root says #![forbid(unsafe_code)] itself and a gate test checks it (docs/architecture.md section 14).
+# root says #![forbid(unsafe_code)] itself and a gate test checks it.
 unsafe_code = "deny"
 
 [workspace.lints.clippy]

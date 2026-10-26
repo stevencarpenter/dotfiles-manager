@@ -14,7 +14,7 @@
 //! A provider child (`crate::proc`) runs in its own process group once the handlers are
 //! installed ([`installed`]). When a stop request or its timeout is seen while it runs,
 //! [`kill_child`] sends SIGTERM to the group, the runner waits a grace period, and then it
-//! sends SIGKILL (docs/architecture.md section 10 item 6).
+//! sends SIGKILL (docs/secrets.md, "How `op` is run").
 
 use dfm_model::{Code, Refusal};
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};

@@ -1,4 +1,4 @@
-//! Versioned machine-written state documents (docs/architecture.md sections 4 and 5, docs/state.md).
+//! Versioned machine-written state documents (docs/state.md).
 //!
 //! Pure data: parsing takes already-read bytes. Every document has an integer `schema` that is
 //! checked before any other field, and unknown keys are refused.
@@ -10,12 +10,12 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::collections::{BTreeMap, BTreeSet};
 
 pub const SCHEMA: i64 = 2;
-/// Largest JSON state file (section 5, parser and read limits).
+/// Largest JSON state file (docs/state.md).
 pub const MAX_BYTES: usize = 16 << 20;
 /// Longest journal line. A longer line is a journal error, not a skipped line.
 pub const MAX_JOURNAL_LINE: usize = 64 << 10;
 const MAX_DEPTH: usize = 32;
-/// Provider text kept in a receipt or journal entry (section 8, secrets item 3).
+/// Provider text kept in a receipt or journal entry (docs/state.md).
 pub const MAX_ERROR_BYTES: usize = 4096;
 /// Largest ledger, receipt or trial document the manager writes. The read cap is larger, so a
 /// document the manager wrote is always readable and a hand-made huge one is still refused.
@@ -245,7 +245,7 @@ pub struct OwnedOutput {
     pub coowned: Option<CoOwned>,
 }
 
-/// What the manager records about a co-owned file (docs/architecture.md section 8 item 7).
+/// What the manager records about a co-owned file (docs/state.md).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CoOwned {
@@ -297,7 +297,7 @@ pub struct LedgerResource {
     pub owned_outputs: Vec<OwnedOutput>,
 }
 
-/// `state/ledger.json`: the only source of delete authority (section 4).
+/// `state/ledger.json`: the only source of delete authority (docs/state.md).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Ledger {
@@ -492,7 +492,7 @@ pub struct OperationRecord {
     pub owned_outputs: Vec<String>,
     pub error: Option<String>,
     /// What happened to the consumer of a published file, recorded apart from the publication
-    /// (architecture section 8: a correct file and a reloaded consumer are separate
+    /// (docs/apply.md: a correct file and a reloaded consumer are separate
     /// postconditions). One of [`RELOADS`]. Absent when the operation published nothing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reload: Option<String>,
@@ -539,14 +539,14 @@ pub struct SourceId {
     pub tree: String,
 }
 
-/// One approved disruptive operation or adoption (architecture section 5, `approvals[]`).
+/// One approved disruptive operation or adoption (receipt `approvals[]`, docs/state.md).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DisruptiveApproval {
     /// The `id` of the receipt operation that ran with this approval.
     pub operation_id: String,
-    /// `allow_disruptive` or `allow_adopt` (DFM-45). The contract also names `interactive`,
-    /// which needs a prompt that does not exist yet.
+    /// `allow_disruptive` or `allow_adopt` (DFM-45). `interactive` is refused, because it needs
+    /// a prompt that does not exist yet.
     pub how: String,
     pub at: String,
 }
