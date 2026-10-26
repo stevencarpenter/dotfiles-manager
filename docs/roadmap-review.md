@@ -1,6 +1,8 @@
 # Delivery roadmap review, 2026-10-08
 
-The delivery roadmap targets the personal M5 and work M3 Apple Silicon MacBooks. It requires all four workflows and full replacement ownership. Intel i9 remains in homelab with GNU Stow. Future Linux and desktop Macs are architecture considerations, not delivery gates.
+Status: dated record. It describes the 2026-10-08 review and board publication, with the 2026-10-20 realignment appended at the end. Statements such as "the manager is not implemented" are true for that date only. Kaneo DFM holds the current backlog and completion state.
+
+The delivery roadmap targets the personal M5 and work M3 Apple Silicon MacBooks. It requires all four workflows and full replacement ownership.
 
 Kaneo DFM is the authoritative backlog. [roadmap.json](roadmap.json) is the reviewed contract and publication snapshot. A populated board does not establish implemented features or machine stability.
 
@@ -66,4 +68,4 @@ The owner audited the daily path on 2026-10-19 and realigned the backlog on 2026
 
 Superseded whole: DFM-9, DFM-11, DFM-27, DFM-28, each with an evidence comment. Superseded criteria: DFM-19.C02 and C03, DFM-37.C01 to C06, DFM-21.C02, DFM-36.C02, C03, C05, C06, C08 to C12 and C14. Rewritten: DFM-31.C03, DFM-37.C07, DFM-18.C06 and C07, DFM-41.C06 and C11, DFM-21.C01 and C05. Added: DFM-31.C12 and C13, DFM-25.C09. A superseded requirement keeps its line, struck through with a dated note, and counts as complete (docs/checklist-state.md, "Supersede requirements"). `docs/roadmap.json` records every change under `completion_contract.realignment_2026_10_20`.
 
-Leaves DFM-44 to DFM-60, filed after the 2026-10-08 publication, are not in the manifest. The 2026-10-08 verification counts above describe that publication, not the current board.
+Leaves DFM-44 to DFM-60, filed after the 2026-10-08 publication, are not in the manifest. The manifest ends at DFM-67, so later leaves (DFM-68 to DFM-72) are not in it either. The 2026-10-08 verification counts above describe that publication, not the current board.

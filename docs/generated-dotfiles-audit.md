@@ -1,5 +1,7 @@
 # Generated dotfiles audit
 
+Status: dated record (2026-10-05) of `~/.dotfiles` before the manager existed. It was an input to the design. It describes that source revision, not the current configuration or the manager.
+
 **Stow can replace the linking layer, but it cannot replace this repository's configuration generation and merge behavior by itself.** Most of that behavior already exists in standalone Python and shell tools. The Nix-specific user-configuration work is four activation-time emitters and one small capability-dependent file, not a large general-purpose template library.
 
 Audit date: 2026-10-05. Current source revision: `1dbd12d3a563`.

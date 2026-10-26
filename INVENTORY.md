@@ -1,10 +1,12 @@
 # Initial ownership classification
 
+Status: dated record (2026-10-09), a source of the reviewed roadmap (`docs/roadmap.json`, `sources`). On 2026-10-20 the owner superseded the inventory task DFM-9: the live M5 bundle in `~/.dotfiles` and its side-channel scripts are the inventory. Do not update this file to match the current bundle.
+
 **Keep safety and ownership rules in core; move role-specific content into selected modules; expose preference changes explicitly.** These are proposed classifications of the existing public configuration, not a completed manifest conversion.
 
 Source baseline: `~/.dotfiles` at `1dbd12d3a563120a77aa3e27f68ad903a6d47d9e`. The generated-dotfiles audit provides evaluated counts: 126 Home Manager path entries, including 115 source links; 11 MCP destinations; four activation-written settings/instruction outputs; two secret-render targets. These scopes overlap and must not be added together. The counts are prior verified audit results, not a new evaluation performed for this draft.
 
-First delivery targets only the personal M5 and work M3 (native Apple Silicon macOS). The Intel i9 remains independently owned by homelab and GNU Stow. Linux and homelab entries below are illustrative schema fixtures, not supported-target or migration promises. Future platforms constrain only the avoidance of OS-bound core semantics, mandatory GUI assumptions, and hard-coded model or prefix paths.
+Delivery scope is in README.md. Linux and homelab entries below are illustrative schema fixtures, not supported-target or migration promises. Future platforms constrain only the avoidance of OS-bound core semantics, mandatory GUI assumptions, and hard-coded model or prefix paths.
 
 “Linked on every current machine” is evidence about the current configuration, not proof that a setting belongs on every future server. The public repository declares one host. The current private consumer has not been inspected; no actual work-machine configuration is inferred below.
 
