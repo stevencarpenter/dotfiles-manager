@@ -925,7 +925,8 @@ fn stage_all(
 }
 
 /// The digest the owner approves: each scope's plan digest, the secrets the run skips for want
-/// of a session and, per source, what moves from where to where. A plan digest covers the
+/// of a session, each deferred service with the action it is reviewed as (its plan stays
+/// blocked whatever `--restart` names) and, per source, what moves from where to where. A plan digest covers the
 /// loaded source tree, not the commits behind it, so a commit that changes only files outside
 /// the scoped roots would otherwise pass.
 fn sync_digest(plans: &[ScopePlan], staged: &[Staged]) -> String {
@@ -934,6 +935,9 @@ fn sync_digest(plans: &[ScopePlan], staged: &[Staged]) -> String {
         text.push_str(&format!("plan {} {}\n", p.scope.as_str(), p.digest));
         for r in &p.skipped {
             text.push_str(&format!("skip {} {r}\n", p.scope.as_str()));
+        }
+        for (id, action) in &p.deferred {
+            text.push_str(&format!("defer {} {id} {action:?}\n", p.scope.as_str()));
         }
     }
     for s in staged {
@@ -1113,13 +1117,15 @@ fn skipped_warning(names: &[String], no_session: &[(String, String)], then: &str
 /// The planned configuration operation that publishes the path of a service's "not published"
 /// blocker, if one does.
 fn publisher<'a>(config: &'a Plan, b: &Blocker) -> Option<&'a str> {
-    let path = b.path.as_deref()?;
+    let path = dfm_model::fold::fold(b.path.as_deref()?);
     (b.code == Code::Conflict)
         .then(|| {
-            config
-                .operations
-                .iter()
-                .find(|o| o.status == PlanStatus::Planned && o.path.as_deref() == Some(path))
+            config.operations.iter().find(|o| {
+                o.status == PlanStatus::Planned
+                    && o.path
+                        .as_deref()
+                        .is_some_and(|q| dfm_model::fold::fold(q) == path)
+            })
         })
         .flatten()
         .map(|o| o.id.as_str())

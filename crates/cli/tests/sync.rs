@@ -2260,6 +2260,67 @@ fn a_deferred_service_named_by_restart_is_reviewed_and_run_as_a_restart() {
 }
 
 #[test]
+fn a_deferred_start_preview_does_not_approve_a_restart_of_that_service() {
+    let l = Life::new();
+    l.with_bar();
+    let module = format!(
+        "{}\n[[resources]]\nid = \"barextra\"\nkind = \"link\"\nadapter = \"fs-link/v1\"\ntarget = \".config/bar/extra\"\n[resources.value]\nsource = \"files/barextra\"\n",
+        bar_module("barrc").replace(
+            "config = [\".config/bar/barrc\"]",
+            "config = [\".config/bar/barrc\", \".config/bar/extra\"]"
+        )
+    );
+    l.push_module(&module, &[("barextra", "width=1\n")], "bar reads extra");
+    // The preview reviews bar's deferred operation as a start: its digest does not approve
+    // the restart that the same flags plus `--restart` would review.
+    let p = l.preview(&[]);
+    assert_eq!(code(&p), 0, "{}\n{}", stdout(&p), stderr(&p));
+    let log = l.log();
+    let flags = [
+        "--restart",
+        "life.bar",
+        "--allow-disruptive",
+        "life.bar@service",
+    ];
+    let o = l.sync(&digest_of(&p), &flags);
+    assert_eq!(code(&o), 3, "{}\n{}", stdout(&o), stderr(&o));
+    assert!(stderr(&o).contains("E_PLAN_STALE"), "{}", stderr(&o));
+    assert!(!l.fx.h(".config/bar/extra").exists());
+    assert!(
+        !l.log()[log.len()..].contains("brew services restart bar"),
+        "{}",
+        l.log()
+    );
+}
+
+#[test]
+fn a_new_agent_declared_in_another_case_than_its_link_starts_in_the_same_sync() {
+    // The agent declares its definition in another case than the link that publishes it,
+    // which the case-insensitive file system resolves to the same file.
+    let l = Life::unpublished();
+    let seed = &l.fx.upstream.seed;
+    put(
+        seed,
+        "base/modules/life/module.toml",
+        &LIFE.replace(
+            "plist = \"Library/LaunchAgents/org.example.agent.plist\"",
+            "plist = \"Library/LaunchAgents/Org.Example.Agent.plist\"",
+        ),
+    );
+    l.fx.upstream.push("declare the definition in another case");
+    let p = l.preview(&[]);
+    assert_eq!(code(&p), 0, "{}\n{}", stdout(&p), stderr(&p));
+    assert!(!stdout(&p).contains("blocked"), "{}", stdout(&p));
+    let o = l.sync(&digest_of(&p), &[]);
+    assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
+    in_order(
+        &stdout(&o),
+        &["  config: ok", "  services: ok", "result: ok"],
+    );
+    assert!(l.log().contains("launchctl bootstrap"), "{}", l.log());
+}
+
+#[test]
 fn a_definition_link_the_configuration_retargets_is_reviewed_from_its_new_target() {
     let l = Life::new();
     let o = l.approved(&[]);
