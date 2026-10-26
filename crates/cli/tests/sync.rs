@@ -482,6 +482,30 @@ fn already_linked_sources_apply_once_and_a_repeat_sync_is_a_no_op() {
 }
 
 #[test]
+fn a_sync_that_changes_nothing_needs_no_approval() {
+    let fx = Fx::new();
+    let o = fx.sync_approved();
+    assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
+    // Sources current and every operation current: no digest is asked for.
+    let o = fx.run(&["sync", "--root", fx.root_arg()]);
+    assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
+    let s = stdout(&o);
+    assert!(s.contains("summary: current=4; nothing to change"), "{s}");
+    assert!(s.contains("nothing to change: no approval needed"), "{s}");
+    assert!(s.ends_with("result: ok\n"), "{s}");
+    assert_eq!(fx.receipts(), 1, "a no-op sync wrote a receipt");
+    // A new upstream commit is a publication, so it needs the digest even when no
+    // operation changes.
+    let seed = &fx.upstream.seed;
+    put(seed, "README.md", "notes\n");
+    let head = fx.upstream.push("docs only");
+    let o = fx.run(&["sync", "--root", fx.root_arg()]);
+    assert_eq!(code(&o), 3, "{}\n{}", stdout(&o), stderr(&o));
+    assert!(stderr(&o).contains("E_APPROVAL_REQUIRED"), "{}", stderr(&o));
+    assert_ne!(fx.head(), head, "the checkout moved without approval");
+}
+
+#[test]
 fn an_advanced_upstream_branch_fast_forwards_the_checkout_and_applies_it() {
     let fx = Fx::new();
     let old = fx.head();

@@ -1121,7 +1121,7 @@ fn run_inner(
     }
     // The checks apply runs before its lock (docs/apply.md), against the sync digest, so a plan
     // that apply would refuse is refused here before any source is published.
-    apply_cmd::check_before_lock(
+    let journal_open = apply_cmd::check_before_lock(
         ctx,
         &args.apply,
         &plan,
@@ -1130,6 +1130,12 @@ fn run_inner(
         out,
     )?;
     if args.apply.preview {
+        return Ok(());
+    }
+    // A source that moves is a publication, so only a run with every source current can end here.
+    if previewed.iter().all(|s| s.old.as_ref() == Some(&s.new))
+        && apply_cmd::end_without_change(&args.apply, &plan, journal_open, out).map_err(w)?
+    {
         return Ok(());
     }
     let Some(approved) = &args.apply.yes_plan else {

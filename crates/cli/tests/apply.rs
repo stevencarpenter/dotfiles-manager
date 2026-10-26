@@ -334,6 +334,8 @@ fn apply_without_an_approved_digest_prints_the_plan_and_writes_nothing() {
     assert!(stderr(&o).contains("E_APPROVAL_REQUIRED"), "{}", stderr(&o));
     assert!(text(&o.stdout).contains("plan digest: "));
     assert!(text(&o.stdout).contains("--yes-plan") || stderr(&o).contains("--yes-plan"));
+    let t = text(&o.stdout);
+    assert!(t.contains("summary: planned=7\n  planned "), "{t}");
     assert_eq!(fingerprint(fx.home.path()), before);
     assert!(!fx.h(".zshrc").exists() && !fx.h(".ssh").exists());
 }
@@ -519,6 +521,25 @@ fn a_second_apply_of_an_applied_plan_changes_nothing_and_exits_0() {
         before,
         "a rerun writes no state"
     );
+    assert_eq!(
+        fx.receipts().len(),
+        1,
+        "a run that changed nothing writes no receipt"
+    );
+}
+
+#[test]
+fn an_applied_plan_needs_no_approval_to_run_again() {
+    let fx = Fx::new();
+    assert_eq!(code(&fx.apply(&[])), 0);
+    let before = fingerprint(fx.home.path());
+    let o = fx.run(&["apply", "--root", fx.root_arg()]);
+    let t = text(&o.stdout);
+    assert_eq!(code(&o), 0, "{}\n{t}", stderr(&o));
+    assert!(t.contains("summary: current=4; nothing to change"), "{t}");
+    assert!(t.contains("nothing to change: no approval needed"), "{t}");
+    assert!(t.ends_with("result: ok\n"), "{t}");
+    assert_eq!(fingerprint(fx.home.path()), before);
     assert_eq!(
         fx.receipts().len(),
         1,

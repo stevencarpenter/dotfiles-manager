@@ -412,6 +412,18 @@ pub struct Plan {
 }
 
 impl Plan {
+    /// Whether applying this plan would write nothing: no blocker, and every operation is
+    /// `current`, `held` or `not_in_scope`. A `current` removal is excluded, because apply prunes
+    /// its stale ledger entry.
+    pub fn changes_nothing(&self) -> bool {
+        self.blockers.is_empty()
+            && self.operations.iter().all(|o| match o.status {
+                Status::Current => o.action != Action::Remove,
+                Status::Held | Status::NotInScope => true,
+                Status::Planned | Status::Blocked => false,
+            })
+    }
+
     /// SHA-256 of the canonical JSON of the plan (sorted keys, no insignificant whitespace).
     pub fn digest(&self) -> Result<String, Refusal> {
         // `canonical` reports an impossible serialization failure as E_STATE_INVALID; it is passed on.
@@ -663,6 +675,33 @@ mod tests {
             after: vec![],
             preconditions: vec![],
             postcondition: String::new(),
+        }
+    }
+
+    #[test]
+    fn a_plan_changes_nothing_only_without_planned_blocked_or_pruning_operations() {
+        let op = |status, action| Operation {
+            status,
+            action,
+            ..operation(Class::Normal, "x", None)
+        };
+        let mut p = empty();
+        assert!(p.changes_nothing());
+        p.operations = vec![
+            op(Status::Current, Action::CreateLink),
+            op(Status::Held, Action::Install),
+            op(Status::NotInScope, Action::CreateFile),
+        ];
+        assert!(p.changes_nothing());
+        for (status, action) in [
+            (Status::Planned, Action::CreateLink),
+            (Status::Blocked, Action::CreateLink),
+            // apply prunes the stale ledger entry of a current removal
+            (Status::Current, Action::Remove),
+        ] {
+            let mut q = p.clone();
+            q.operations.push(op(status, action));
+            assert!(!q.changes_nothing(), "{status:?} {action:?}");
         }
     }
 

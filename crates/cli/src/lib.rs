@@ -83,10 +83,11 @@ for every row, status prints one block per row. --json prints the same rows as o
 See docs/doctor.md.
 
 apply plans again, prints the plan and exits 3 (E_APPROVAL_REQUIRED) unless --yes-plan carries the
-digest of that exact plan. Then it publishes file links and removes previously owned outputs,
-journals each step and writes a receipt. A removal also needs --allow-disruptive <operation-id>.
-An existing link that is exactly the planned link is adopted (ownership is recorded, nothing is
-written) only with --allow-adopt <operation-id>.
+digest of that exact plan. A plan that changes nothing needs no digest: it exits 0. Otherwise it
+publishes file links and removes previously owned outputs, journals each step and writes a receipt.
+A removal also needs --allow-disruptive <operation-id>. An existing link that is exactly the
+planned link is adopted (ownership is recorded, nothing is written) only with --allow-adopt
+<operation-id>.
 --preview prints the plan and its digest and changes nothing.
 
 secrets is apply over the secret resources only (op-template/v1): every other resource is listed as
