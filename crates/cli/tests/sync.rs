@@ -1499,17 +1499,34 @@ impl Life {
     }
 
     fn run_env(&self, env: &[(&str, &str)], args: &[&str]) -> Output {
+        self.command(env, args).output().unwrap()
+    }
+
+    fn command(&self, env: &[(&str, &str)], args: &[&str]) -> Command {
         let path = format!("{}:/usr/bin:/bin", self.fake.path().join("bin").display());
-        Command::new(BIN)
-            .env_clear()
+        let mut c = Command::new(BIN);
+        c.env_clear()
             .envs(env.iter().copied())
             .env("DFM_PROVIDER_PATH", path)
             .env("DFM_SERVICE_TIMEOUT_SECS", "1")
             .arg("--home")
             .arg(self.fx.home.path())
-            .args(args)
-            .output()
-            .unwrap()
+            .args(args);
+        c
+    }
+
+    /// Adds a running brew service `bar` whose configuration file links to `files/barrc`, and
+    /// syncs it, so every scope is current except the agent the caller unloads.
+    fn with_bar(&self) {
+        fs::write(self.fake.path().join("brew-bar"), "started").unwrap();
+        self.push_module(
+            &bar_module("barrc"),
+            &[("barrc", "height=1\n"), ("barrc2", "height=2\n")],
+            "add bar",
+        );
+        let o = self.approved(&[]);
+        assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
+        assert!(self.fx.h(".config/bar/barrc").is_symlink());
     }
 
     fn preview(&self, flags: &[&str]) -> Output {
@@ -1957,26 +1974,20 @@ fn an_edited_definition_is_reviewed_from_staging_and_its_restart_runs() {
     in_order(&l.log(), &["launchctl bootout", "launchctl bootstrap"]);
 }
 
+/// A brew service `bar` and the link of its configuration file to `files/<source>`.
+fn bar_module(source: &str) -> String {
+    format!(
+        "\n[[resources]]\nid = \"barrc\"\nkind = \"link\"\nadapter = \"fs-link/v1\"\ntarget = \".config/bar/barrc\"\n[resources.value]\nsource = \"files/{source}\"\n\n[[resources]]\nid = \"bar\"\nkind = \"service\"\nadapter = \"brew-service/v1\"\n[resources.value]\nname = \"bar\"\nconfig = [\".config/bar/barrc\"]\n"
+    )
+}
+
 #[test]
 fn a_service_config_file_the_configuration_scope_rewrites_does_not_make_services_stale() {
     let l = Life::new();
-    let bar = |source: &str| {
-        format!(
-            "\n[[resources]]\nid = \"barrc\"\nkind = \"link\"\nadapter = \"fs-link/v1\"\ntarget = \".config/bar/barrc\"\n[resources.value]\nsource = \"files/{source}\"\n\n[[resources]]\nid = \"bar\"\nkind = \"service\"\nadapter = \"brew-service/v1\"\n[resources.value]\nname = \"bar\"\nconfig = [\".config/bar/barrc\"]\n"
-        )
-    };
-    fs::write(l.fake.path().join("brew-bar"), "started").unwrap();
-    l.push_module(
-        &bar("barrc"),
-        &[("barrc", "height=1\n"), ("barrc2", "height=2\n")],
-        "add bar",
-    );
-    let o = l.approved(&[]);
-    assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
-    assert!(l.fx.h(".config/bar/barrc").is_symlink());
+    l.with_bar();
     // The configuration scope now points bar's config file elsewhere, and the agent is not
     // loaded: the services scope runs with a changed `path:` precondition of another service.
-    l.push_module(&bar("barrc2"), &[], "bar reads barrc2");
+    l.push_module(&bar_module("barrc2"), &[], "bar reads barrc2");
     fs::write(l.fake.path().join("loaded"), "").unwrap();
     let p = l.preview(&[]);
     assert_eq!(code(&p), 0, "{}\n{}", stdout(&p), stderr(&p));
@@ -1999,6 +2010,68 @@ fn a_service_config_file_the_configuration_scope_rewrites_does_not_make_services
             .ends_with("barrc2")
     );
     assert!(l.log().contains("launchctl bootstrap"), "{}", l.log());
+}
+
+#[test]
+fn a_service_precondition_on_a_path_the_configuration_did_not_write_stays_stale() {
+    let l = Life::new();
+    l.with_bar();
+    // The configuration scope writes another file; bar's config file is not in its plan.
+    l.push_module(
+        &format!(
+            "{}\n[[resources]]\nid = \"notes\"\nkind = \"link\"\nadapter = \"fs-link/v1\"\ntarget = \".config/life/notes\"\n[resources.value]\nsource = \"files/notes\"\n",
+            bar_module("barrc")
+        ),
+        &[("notes", "notes\n")],
+        "add a link",
+    );
+    fs::write(l.fake.path().join("loaded"), "").unwrap();
+    let p = l.preview(&[]);
+    assert_eq!(code(&p), 0, "{}\n{}", stdout(&p), stderr(&p));
+    assert!(
+        stdout(&p).contains("current life.barrc@.config/bar/barrc"),
+        "{}",
+        stdout(&p)
+    );
+    let log = l.log();
+    let release = l.fake.path().join("release");
+    let fp = format!("sync-after-scope:wait-{}", release.display());
+    let run = l
+        .command(
+            &[("DFM_FAILPOINT", fp.as_str())],
+            &["sync", "--root", l.fx.root_arg(), "-y", &digest_of(&p)],
+        )
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let reached = release.with_extension("reached");
+    let end = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while !reached.exists() {
+        assert!(
+            std::time::Instant::now() < end,
+            "the failpoint was not reached"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    // After the configuration scope, bar's config file changes by another hand.
+    let link = l.fx.h(".config/bar/barrc");
+    let target = fs::read_link(&link).unwrap();
+    fs::remove_file(&link).unwrap();
+    std::os::unix::fs::symlink(target.with_file_name("barrc2"), &link).unwrap();
+    fs::write(&release, "").unwrap();
+    let o = run.wait_with_output().unwrap();
+    assert_eq!(code(&o), 1, "{}\n{}", stdout(&o), stderr(&o));
+    in_order(
+        &stdout(&o),
+        &[
+            "  config: ok",
+            "  services: failed (E_PLAN_STALE)",
+            "result: failed",
+        ],
+    );
+    let new = &l.log()[log.len()..];
+    assert!(!new.contains("launchctl bootstrap"), "{new}");
 }
 
 #[test]
