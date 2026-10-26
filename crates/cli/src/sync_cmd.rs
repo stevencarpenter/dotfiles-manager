@@ -1829,6 +1829,120 @@ fn untrusted_refusal(origins: &[&str]) -> Refusal {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use dfm_model::plan::{Binary, Observations, Operation, Precondition};
+
+    fn pre(subject: &str, state: &str) -> Precondition {
+        Precondition {
+            subject: subject.into(),
+            state: state.into(),
+        }
+    }
+
+    /// A services plan with one start of `life.agent`, whose definition is `PLIST`.
+    fn services_plan(preconditions: Vec<Precondition>) -> Plan {
+        Plan {
+            schema: 1,
+            command: "plan".into(),
+            scope: "services".into(),
+            binary: Binary {
+                version: "0".into(),
+                sha256: "0".repeat(64),
+            },
+            profile: "/p".into(),
+            machine_id: "m".into(),
+            model_digest: "0".repeat(64),
+            sources: vec![],
+            observations: Observations::default(),
+            operations: vec![Operation {
+                id: "life.agent@service".into(),
+                journal_id: "j".into(),
+                resource: "life.agent".into(),
+                module: "life".into(),
+                adapter: "launchd-agent/v1".into(),
+                class: dfm_model::state::Class::Normal,
+                action: Action::Start,
+                status: PlanStatus::Planned,
+                path: None,
+                mode: None,
+                link: None,
+                privilege: "user".into(),
+                effect: "start org.example.agent".into(),
+                ownership: Ownership::Absent,
+                inputs: vec![],
+                fragments: vec![],
+                fragment_dir: None,
+                output_sha256: None,
+                managed_sha256: None,
+                takeover: false,
+                output_bytes: None,
+                excluded: None,
+                sets: vec![],
+                after: vec![],
+                preconditions,
+                postcondition: String::new(),
+            }],
+            blockers: vec![],
+        }
+    }
+
+    const PLIST: &str = "Library/LaunchAgents/org.example.agent.plist";
+
+    fn reviewed(plan: Plan) -> ScopePlan {
+        ScopePlan {
+            scope: Scope::Services,
+            digest: plan.digest().unwrap(),
+            plan,
+            skipped: vec![],
+            no_session: vec![],
+            blocked: false,
+            deferred: BTreeSet::new(),
+        }
+    }
+
+    fn before() -> Vec<Precondition> {
+        vec![
+            pre(&format!("path:{PLIST}"), "link:/r/old.plist"),
+            pre(&format!("content:{PLIST}"), "sha256:aa"),
+            pre(
+                "probe:launchd-agent/v1:org.example.agent",
+                "stopped:not loaded",
+            ),
+        ]
+    }
+
+    #[test]
+    fn the_services_recheck_ignores_only_path_and_content_preconditions_on_written_paths() {
+        let review = reviewed(services_plan(before()));
+        let written: BTreeSet<String> = [dfm_model::fold::fold(PLIST)].into();
+        let mut after = before();
+        after[0].state = "link:/r/new.plist".into();
+        after[1].state = "sha256:bb".into();
+        let fresh = services_plan(after);
+        // 1. The configuration scope wrote the definition: accepted.
+        assert!(as_reviewed(&review, &fresh, &written));
+        // 2. The same difference on a path it did not write: refused.
+        assert!(!as_reviewed(&review, &fresh, &BTreeSet::new()));
+        let other: BTreeSet<String> = [dfm_model::fold::fold(".config/other")].into();
+        assert!(!as_reviewed(&review, &fresh, &other));
+        // 3. Any other difference is refused, even with the definition written.
+        let mut probe = before();
+        probe[2].state = "current:loaded".into();
+        assert!(!as_reviewed(&review, &services_plan(probe), &written));
+        let mut status = services_plan(before());
+        status.operations[0].status = PlanStatus::Current;
+        assert!(!as_reviewed(&review, &status, &written));
+        let mut action = services_plan(before());
+        action.operations[0].action = Action::Restart;
+        assert!(!as_reviewed(&review, &action, &written));
+        let mut effect = services_plan(before());
+        effect.operations[0].effect = "start another program".into();
+        assert!(!as_reviewed(&review, &effect, &written));
+        let mut extra = services_plan(before());
+        extra.operations[0]
+            .preconditions
+            .push(pre(&format!("path:{PLIST}.d"), "missing"));
+        assert!(!as_reviewed(&review, &extra, &written));
+    }
 
     #[test]
     fn redirects_and_http_alternates_stay_disabled() {
