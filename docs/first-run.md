@@ -198,7 +198,7 @@ Deselect the module in the profile (`modules = []`), run `plan`, then `apply --p
 ## 7. After the first run
 
 - Reinstall the manager: section 1, step 5.
-- Daily path: `dfm sync` fetches the sources that `dotfiles-manager.lock` in the configuration checkout declares, then runs the configuration, packages, secrets and services scopes under one approval. The first run needs `dfm sync --trust-origin <origin>` to grant the origin. Approve with `dfm sync -y <sync digest>` (docs/sync.md).
+- Daily path: `dfm sync` is the one daily command, and it runs without a digest. It fetches the sources that `dotfiles-manager.lock` in the configuration checkout declares, prints the plans, then runs the configuration, packages, secrets and services scopes. The first run needs `dfm sync --trust-origin <origin>`: it grants the origin, prints the plan and stops. Read the plan, then run `dfm sync`. An adoption or takeover runs only with `--allow-adopt <id>` and a restart only with `--restart <id>`; the warning at the end of the output names a held adoption's flag. `dfm sync -y <sync digest>` pins a run to a plan that `--preview` printed (docs/sync.md).
 - Secrets, packages and services are not part of `apply`. Each has its own command with the same preview and approval flags: `dfm secrets` (docs/secrets.md), `dfm packages` (docs/packages.md), `dfm services` (docs/lifecycle.md).
 
 ## Known limits on the first run
