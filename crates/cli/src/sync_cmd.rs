@@ -1207,7 +1207,7 @@ fn plan_staged(
                 .operations
                 .iter()
                 .filter(|o| o.status == PlanStatus::Planned)
-                .filter_map(|o| Some((o.path.clone()?, o.link.clone()?)))
+                .filter_map(|o| Some((dfm_model::fold::fold(o.path.as_ref()?), o.link.clone()?)))
                 .collect();
         }
         // Re-renders alone are not worth a vault contact on a run that changes nothing else.
@@ -1412,14 +1412,6 @@ fn as_reviewed(
     done: &BTreeMap<String, Operation>,
     home: &Path,
 ) -> bool {
-    let started = p.deferred.iter().all(|(id, reviewed)| {
-        fresh.operations.iter().any(|o| {
-            o.id == *id
-                && (o.status == PlanStatus::Current
-                    || (o.status == PlanStatus::Planned
-                        && (o.action == Action::Start || o.action == *reviewed)))
-        })
-    });
     // The earlier operation that changed the subject of this precondition, if one did. The
     // content of a link is the file it points at, which the review already read at the new
     // target (`Staged`), so a `content:` precondition through a link stays as reviewed.
@@ -1435,6 +1427,58 @@ fn as_reviewed(
             _ => None,
         }
     }
+    // A deferred service: the review stopped at the prerequisite that was not published, so
+    // it recorded no content and no launcher state. Each precondition of the fresh operation
+    // must be what an earlier operation left (`left_by`), the content of the source a published
+    // link points at (`content_id`), a reviewed precondition or observation, or the launcher
+    // state that the status and action rule checks.
+    let deferred = |id: &String, action: &Action| {
+        let find = |plan: &Plan| plan.operations.iter().find(|o| o.id == *id).cloned();
+        let (Some(mut r), Some(mut f)) = (find(&p.plan), find(fresh)) else {
+            return false;
+        };
+        let started = f.status == PlanStatus::Current
+            || (f.status == PlanStatus::Planned
+                && (f.action == Action::Start || f.action == *action));
+        let held = |pc: &dfm_model::plan::Precondition| {
+            if let Some((kind, op)) = changed_by(done, &pc.subject) {
+                return left_by(op, kind, &pc.state, home);
+            }
+            let (kind, path) = pc.subject.split_once(':').unwrap_or_default();
+            let linked = done
+                .get(&dfm_model::fold::fold(path))
+                .filter(|op| op.link.is_some());
+            match (kind, linked) {
+                ("content", Some(op)) => op
+                    .inputs
+                    .first()
+                    .is_some_and(|i| i.content_id.as_deref() == Some(pc.state.as_str())),
+                ("probe", _) => true,
+                ("path" | "sensitive-path", _) if !r.preconditions.contains(pc) => p
+                    .plan
+                    .observations
+                    .seen
+                    .get(path)
+                    .is_some_and(|seen| node_state(seen, kind == "sensitive-path") == pc.state),
+                _ => r.preconditions.contains(pc),
+            }
+        };
+        let kept = r
+            .preconditions
+            .iter()
+            .filter(|pc| changed_by(done, &pc.subject).is_none())
+            .all(|pc| f.preconditions.contains(pc));
+        let checked = started && kept && f.preconditions.iter().all(held);
+        // What remains (the resource, its module and adapter) is as reviewed.
+        for o in [&mut r, &mut f] {
+            o.status = PlanStatus::Planned;
+            o.action = *action;
+            o.effect.clear();
+            o.postcondition.clear();
+            o.preconditions.clear();
+        }
+        checked && r == f
+    };
     let created = |o: &Operation| {
         o.action == Action::CreateDir
             && o.path.as_deref().is_some_and(|path| {
@@ -1468,15 +1512,19 @@ fn as_reviewed(
         c.observations = Default::default();
         c
     };
-    started && fresh.blockers.is_empty() && rest(&p.plan, false) == rest(fresh, true)
+    p.deferred.iter().all(|(id, action)| deferred(id, action))
+        && fresh.blockers.is_empty()
+        && rest(&p.plan, false) == rest(fresh, true)
 }
 
 /// Whether `state`, a precondition of kind `kind` (`path`, `sensitive-path` or `content`) on
 /// the path of `op`, is what the approved operation `op` of an earlier scope leaves there: the
 /// node apply makes (a directory of mode 700 or the declared mode, the absence it removed to,
 /// the link it published, the file it rendered with the declared mode or 600), formatted by
-/// `node_state` as observe records it. The rendered content is read again from `home`, because
-/// a precondition records a different hash of it, and must be the approved content.
+/// `node_state` as observe records it, with the name apply gave it as the alias when the
+/// precondition spells the path in another case. The rendered content is read again from
+/// `home`, because a precondition records a different hash of it, and must be the approved
+/// content.
 fn left_by(op: &Operation, kind: &str, state: &str, home: &Path) -> bool {
     let writes = matches!(op.action, Action::CreateFile | Action::UpdateFile);
     if kind == "content" {
@@ -1486,7 +1534,21 @@ fn left_by(op: &Operation, kind: &str, state: &str, home: &Path) -> bool {
                 .as_ref()
                 .is_some_and(|h| state == format!("sha256:{h}"));
     }
-    let is = |node| state == node_state(&Seen { node, alias: None }, kind == "sensitive-path");
+    // A precondition that names the path in another case than `op` records the entry apply
+    // made under the spelling of `op` as its alias.
+    let made = op.path.as_deref().and_then(|p| p.rsplit('/').next());
+    let is = |node: Node| {
+        [None, made.map(String::from)].into_iter().any(|alias| {
+            state
+                == node_state(
+                    &Seen {
+                        node: node.clone(),
+                        alias,
+                    },
+                    kind == "sensitive-path",
+                )
+        })
+    };
     let file = |sha256, size| Node::File {
         mode: op.mode.unwrap_or(0o600),
         own: true,
@@ -2027,7 +2089,7 @@ fn untrusted_refusal(origins: &[&str]) -> Refusal {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use dfm_model::plan::{Binary, Observations, Operation, Precondition};
+    use dfm_model::plan::{Binary, Input, Observations, Operation, Precondition};
 
     fn pre(subject: &str, state: &str) -> Precondition {
         Precondition {
@@ -2168,12 +2230,34 @@ mod tests {
             .push(pre(&format!("path:{PLIST}.d"), "missing"));
         assert!(!as_reviewed(&review, &extra, &done, home));
         // 5. A deferred service may come back as a restart only when it was reviewed as one.
-        let mut deferred = reviewed(services_plan(before()));
+        // The review stopped at the definition that was not published: no precondition, and the
+        // definition must be the source of the published link.
+        let mut blocked = services_plan(vec![]);
+        blocked.operations[0].status = PlanStatus::Blocked;
+        blocked.operations[0].effect = format!("blocked: depends on {PLIST}");
+        let mut deferred = reviewed(blocked);
         let id = deferred.plan.operations[0].id.clone();
+        let mut link = done.clone();
+        link.get_mut(&dfm_model::fold::fold(PLIST)).unwrap().inputs = vec![Input {
+            path: "files/new.plist".into(),
+            content_id: Some("sha256:aa".into()),
+        }];
         deferred.deferred.insert(id.clone(), Action::Start);
-        assert!(!as_reviewed(&deferred, &action, &done, home));
+        assert!(!as_reviewed(&deferred, &action, &link, home));
         deferred.deferred.insert(id, Action::Restart);
-        assert!(as_reviewed(&deferred, &action, &done, home));
+        assert!(as_reviewed(&deferred, &action, &link, home));
+        // 6. A deferred definition with other content than that source, through another link
+        // than the published one, or with another resource: refused.
+        assert!(!as_reviewed(&deferred, &action, &done, home));
+        let mut content = action.clone();
+        content.operations[0].preconditions[1].state = "sha256:bb".into();
+        assert!(!as_reviewed(&deferred, &content, &link, home));
+        let mut other = action.clone();
+        other.operations[0].preconditions[0].state = "link:/r/other.plist:file".into();
+        assert!(!as_reviewed(&deferred, &other, &link, home));
+        let mut resource = action.clone();
+        resource.operations[0].resource = "life.other".into();
+        assert!(!as_reviewed(&deferred, &resource, &link, home));
     }
 
     #[test]
@@ -2224,6 +2308,9 @@ mod tests {
         let fp = dfm_model::plan::file_fingerprint(bytes);
         let ok = format!("file:644:sha256:{fp}");
         assert!(left_by(&op, "path", &ok, &home.0));
+        // Named in another case, observe records the name apply gave the file as the alias.
+        assert!(left_by(&op, "path", &format!("{ok} alias=barrc"), &home.0));
+        assert!(!left_by(&op, "path", &format!("{ok} alias=BARRC"), &home.0));
         assert!(!left_by(
             &op,
             "path",

@@ -1958,6 +1958,36 @@ fn a_service_whose_definition_the_same_run_publishes_is_planned_not_blocked() {
 }
 
 #[test]
+fn a_deferred_definition_another_program_retargets_after_the_configuration_scope_is_stale() {
+    let l = Life::unpublished();
+    let p = l.preview(&[]);
+    assert_eq!(code(&p), 0, "{}\n{}", stdout(&p), stderr(&p));
+    // Another program points the published definition link at a plist that runs another
+    // program, before the services scope plans again.
+    let other = l.fake.path().join("other.plist");
+    fs::write(
+        &other,
+        AGENT_PLIST.replace("/usr/bin/true", "/usr/bin/false"),
+    )
+    .unwrap();
+    let rel = "Library/LaunchAgents/org.example.agent.plist";
+    let o = l.sync_pausing(&digest_of(&p), &[], || {
+        fs::remove_file(l.fx.h(rel)).unwrap();
+        std::os::unix::fs::symlink(&other, l.fx.h(rel)).unwrap();
+    });
+    assert_eq!(code(&o), 1, "{}\n{}", stdout(&o), stderr(&o));
+    in_order(
+        &stdout(&o),
+        &[
+            "  config: ok",
+            "  services: failed (E_PLAN_STALE)",
+            "result: failed",
+        ],
+    );
+    assert!(!l.log().contains("launchctl bootstrap"), "{}", l.log());
+}
+
+#[test]
 fn a_blocked_services_plan_does_not_stop_the_other_scopes_and_is_warned_last() {
     let l = Life::new();
     // launchd holds the label from another definition: a blocker the run cannot clear.
@@ -2271,6 +2301,51 @@ fn a_definition_link_the_configuration_retargets_is_reviewed_from_its_new_target
     let o = l.run(&["sync", "--root", l.fx.root_arg(), "--preview"]);
     assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
     assert!(!stdout(&o).contains("blocked"), "{}", stdout(&o));
+}
+
+#[test]
+fn a_retargeted_definition_declared_in_another_case_is_reviewed_from_its_new_target() {
+    let l = Life::new();
+    let o = l.approved(&[]);
+    assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
+    // The service declares its definition in another case than the link's target, which the
+    // case-insensitive file system resolves to the same file.
+    let seed = &l.fx.upstream.seed;
+    put(
+        seed,
+        "base/modules/life/module.toml",
+        &LIFE
+            .replace(
+                "source = \"files/org.example.agent.plist\"",
+                "source = \"files/agent2.plist\"",
+            )
+            .replace(
+                "plist = \"Library/LaunchAgents/org.example.agent.plist\"",
+                "plist = \"Library/LaunchAgents/Org.Example.Agent.plist\"",
+            ),
+    );
+    put(
+        seed,
+        "base/modules/life/files/agent2.plist",
+        &AGENT_PLIST.replace("/usr/bin/true", "/usr/bin/false"),
+    );
+    l.fx.upstream
+        .push("the agent link points at another definition");
+    let flags = ["--restart", "life.agent", "--allow-disruptive", AGENT_OP];
+    let p = l.preview(&flags);
+    assert_eq!(code(&p), 0, "{}\n{}", stdout(&p), stderr(&p));
+    let s = stdout(&p);
+    assert!(s.contains("the definition runs /usr/bin/false"), "{s}");
+    assert!(!s.contains("the definition runs /usr/bin/true"), "{s}");
+    let o = l.sync(&digest_of(&p), &flags);
+    assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
+    in_order(
+        &stdout(&o),
+        &["  config: ok", "  services: ok", "result: ok"],
+    );
+    in_order(&l.log(), &["launchctl bootout", "launchctl bootstrap"]);
+    let loaded = fs::read_to_string(l.fake.path().join("loaded")).unwrap();
+    assert!(loaded.ends_with("/agent2.plist\n"), "{loaded}");
 }
 
 #[test]

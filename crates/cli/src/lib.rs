@@ -550,7 +550,8 @@ struct Loaded {
     /// Where the sources were read from when that is not `root`: `sync` resolves a staged copy
     /// of the sources and plans it as the tree that `root` will hold after publication.
     staged: Option<PathBuf>,
-    /// With `staged`: the absolute target of each planned configuration link, by its path. The
+    /// With `staged`: the absolute target of each planned configuration link, by its folded
+    /// path (`dfm_model::fold`), as the file system compares paths. The
     /// services scope reads a definition at the target the configuration scope will publish.
     links: std::collections::BTreeMap<String, String>,
     sources: dfm_model::resolve::SourceSet,

@@ -474,7 +474,7 @@ fn only(state: ServiceState) -> ServiceFacts {
 }
 
 /// `sync`'s live root, its staged copy, and the absolute target of each link the configuration
-/// scope will publish, by its HOME-relative path.
+/// scope will publish, by its folded HOME-relative path (`dfm_model::fold`).
 type Staged<'a> = (&'a Path, &'a Path, &'a BTreeMap<String, String>);
 
 /// The state of a launchd user agent: its definition must be published under HOME and declare
@@ -514,7 +514,7 @@ fn launchd_state(
     // The declared definition: the file the link resolves to, or will resolve to after
     // publication.
     let declared = staged
-        .and_then(|(_, _, links)| links.get(&plist))
+        .and_then(|(_, _, links)| links.get(&dfm_model::fold::fold(&plist)))
         .map_or(canonical, PathBuf::from);
     let read_from = match staged {
         Some((root, tree, _)) => match declared.strip_prefix(root) {
