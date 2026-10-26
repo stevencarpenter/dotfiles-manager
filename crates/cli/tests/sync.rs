@@ -1892,6 +1892,28 @@ fn a_repeat_sync_with_nothing_new_in_any_scope_is_a_no_op() {
 }
 
 #[test]
+fn a_changed_secret_mode_is_not_a_no_op() {
+    let l = Life::new();
+    let o = l.approved(&[]);
+    assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
+    // A local commit declares a stricter mode; the sources stay current (ahead of the ref).
+    git(&l.fx.root, &["checkout", "-q", "-b", "topic"]);
+    put(
+        &l.fx.root,
+        "base/modules/life/module.toml",
+        &LIFE.replace("mode = 0o600", "mode = 0o400"),
+    );
+    git(&l.fx.root, &["commit", "-q", "-am", "stricter secret mode"]);
+    // The observed mode (0600) is not the declared one (0400): the plan can see the change,
+    // so a plain sync asks for its approval instead of ending as a no-op.
+    let o = l.run(&["sync", "--root", l.fx.root_arg()]);
+    let s = stdout(&o);
+    assert_eq!(code(&o), 3, "{s}\n{}", stderr(&o));
+    assert!(!s.contains("nothing to change: no approval needed"), "{s}");
+    assert!(stderr(&o).contains("E_APPROVAL_REQUIRED"), "{}", stderr(&o));
+}
+
+#[test]
 fn restart_is_forwarded_to_the_services_scope_and_needs_its_approval() {
     let l = Life::new();
     let o = l.approved(&[]);

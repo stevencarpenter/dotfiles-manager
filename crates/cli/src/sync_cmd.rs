@@ -1262,7 +1262,8 @@ fn plan_staged(
 
 /// Whether every planned operation of a secrets plan only renders again a destination the
 /// ledger proves the manager wrote: the plan cannot tell an unchanged result from a changed one
-/// before the render (docs/secrets.md). `sync` approves nothing for such a plan alone.
+/// before the render (docs/secrets.md). `sync` approves nothing for such a plan alone. A
+/// destination whose observed mode is not the declared mode is a change the plan can see.
 fn rerenders_only(plan: &Plan) -> bool {
     plan.blockers.is_empty()
         && plan.operations.iter().all(|o| {
@@ -1270,7 +1271,13 @@ fn rerenders_only(plan: &Plan) -> bool {
                 || (o.adapter == secret::ADAPTER
                     && o.action == Action::UpdateFile
                     && o.ownership == Ownership::Owned
-                    && !o.takeover)
+                    && !o.takeover
+                    && o.path.as_ref().is_some_and(|path| {
+                        let want = format!("file:{:o}", o.mode.unwrap_or(0o600));
+                        o.preconditions
+                            .iter()
+                            .any(|pc| pc.subject == format!("path:{path}") && pc.state == want)
+                    }))
         })
 }
 
