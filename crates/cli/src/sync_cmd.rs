@@ -1,6 +1,7 @@
 //! `sync`: one invocation that fetches the declared sources into staging, validates the
 //! composition they produce against this machine, takes one approval, publishes the sources into
-//! the user's checkouts and applies the configuration once (docs/sync.md).
+//! the user's checkouts and then runs the four scopes in order: configuration, packages, secrets
+//! and services (docs/sync.md).
 //!
 //! Git runs through the bounded runner with an environment built from empty (docs/sync.md,
 //! "Fetch environment"). The staging directory is the only thing a preview writes.
@@ -8,24 +9,26 @@
 //! rebase, commit or push. A nested source is pinned to an exact commit, and the lock that holds
 //! the pin is never rewritten.
 
-use crate::adapters::Generators;
-use crate::plan_cmd::{plan_for, render};
+use crate::adapters::secret;
+use crate::plan_cmd::{plan_for, render_body};
 use crate::read_fs::read_regular_bounded;
 use crate::source_fs::load_scoped;
 use crate::{
     Ctx, Loaded, apply_cmd, builtin_catalog, canonical_root, paint, require_binding, state_cmd,
     usage,
 };
-use dfm_engine::{Dir, End, Lock as FileLock, ProcRequest, Runner, Store, Sys, now_ns};
+use dfm_engine::{
+    Approval as Allowance, Dir, End, Lock as FileLock, ProcRequest, Runner, Store, Sys, now_ns,
+};
 use dfm_model::binding::Binding;
 use dfm_model::digest::sha256_hex;
 use dfm_model::display::visible;
 use dfm_model::lock::{Grants, Lock, LockSource, MAX_BYTES as LOCK_MAX_BYTES, check_origin};
-use dfm_model::plan::{Plan, Scope};
+use dfm_model::plan::{Action, Blocker, Ownership, Plan, Scope, Status as PlanStatus};
 use dfm_model::resolve::resolve;
 use dfm_model::state::{self, Class, JournalEntry, Phase, Recovery, rfc3339};
 use dfm_model::{Code, Refusal};
-use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::fs;
 use std::io::Write;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -65,19 +68,25 @@ pub struct Args {
     apply: apply_cmd::Args,
     /// Origins to grant before the fetch (`--trust-origin`), each named in the lock.
     trust: Vec<String>,
+    /// `--restart <resource-id>`, for the services scope.
+    restart: BTreeSet<String>,
 }
 
 /// `sync [--root <dir>] [--preview] [--yes-plan <digest>] [--allow-disruptive <id>]...
-/// [--allow-adopt <id>]... [--trust-origin <origin>]...`
+/// [--allow-adopt <id>]... [--restart <resource-id>]... [--trust-origin <origin>]...`
 pub fn parse_args(args: &[String]) -> Result<Args, Refusal> {
-    let (mut trust, mut rest) = (Vec::new(), Vec::new());
+    let (mut trust, mut restart, mut rest) = (Vec::new(), BTreeSet::new(), Vec::new());
     let mut it = args.iter();
     while let Some(a) = it.next() {
-        if a == "--trust-origin" {
+        if a == "--trust-origin" || a == "--restart" {
             let v = it
                 .next()
-                .ok_or_else(|| usage("--trust-origin needs a value"))?;
-            trust.push(v.clone());
+                .ok_or_else(|| usage(format!("{a} needs a value")))?;
+            if a == "--restart" {
+                restart.insert(v.clone());
+            } else {
+                trust.push(v.clone());
+            }
         } else {
             rest.push(a.clone());
         }
@@ -95,7 +104,11 @@ pub fn parse_args(args: &[String]) -> Result<Args, Refusal> {
             "--trust-origin cannot be combined with --yes-plan; grant first, review the plan, then approve it",
         ));
     }
-    Ok(Args { apply, trust })
+    Ok(Args {
+        apply,
+        trust,
+        restart,
+    })
 }
 
 fn untrusted(d: impl Into<String>) -> Refusal {
@@ -908,11 +921,18 @@ fn stage_all(
     Ok(staged)
 }
 
-/// The digest the owner approves: the configuration plan's digest and, per source, what moves
-/// from where to where. The plan digest covers the loaded source tree, not the commits behind
-/// it, so a commit that changes only files outside the scoped roots would otherwise pass.
-fn sync_digest(plan_digest: &str, staged: &[Staged]) -> String {
-    let mut text = format!("plan {plan_digest}\n");
+/// The digest the owner approves: each scope's plan digest, the secrets the run skips for want
+/// of a session and, per source, what moves from where to where. A plan digest covers the
+/// loaded source tree, not the commits behind it, so a commit that changes only files outside
+/// the scoped roots would otherwise pass.
+fn sync_digest(plans: &[ScopePlan], staged: &[Staged]) -> String {
+    let mut text = String::new();
+    for p in plans {
+        text.push_str(&format!("plan {} {}\n", p.scope.as_str(), p.digest));
+        for r in &p.skipped {
+            text.push_str(&format!("skip {} {r}\n", p.scope.as_str()));
+        }
+    }
     for s in staged {
         text.push_str(&format!(
             "source {} {} {} {} {}\n",
@@ -957,15 +977,189 @@ fn grant_journaled(
     store.append_journal(&entry(Phase::Done))
 }
 
+/// The scopes of one run, in run order (docs/sync.md).
+const SCOPES: [Scope; 4] = [
+    Scope::Config,
+    Scope::Packages,
+    Scope::Secrets,
+    Scope::Services,
+];
+
+/// One scope's plan of the staged tree.
+struct ScopePlan {
+    scope: Scope,
+    plan: Plan,
+    digest: String,
+    /// The planned secret resources, when no 1Password session exists: this run skips them.
+    skipped: Vec<String>,
+    /// A packages, secrets or services plan with a blocker that this run cannot clear: the
+    /// scope does not run and the other scopes do. A blocked configuration plan refuses the run.
+    blocked: bool,
+    /// Services blocked only because their definition or configuration file is not published
+    /// yet, while the configuration plan publishes it: they are planned after that scope.
+    deferred: BTreeSet<String>,
+}
+
+impl ScopePlan {
+    /// The plan as the owner reviews it: the scope's own operations (a `not_in_scope` one
+    /// belongs to another scope), and each deferred service shown as the start it becomes.
+    fn reviewed(&self, config: &Plan) -> Plan {
+        let mut own = self.plan.clone();
+        own.operations
+            .retain(|o| o.status != PlanStatus::NotInScope);
+        for o in own
+            .operations
+            .iter_mut()
+            .filter(|o| self.deferred.contains(&o.id))
+        {
+            let by: Vec<String> = self
+                .plan
+                .blockers
+                .iter()
+                .filter(|b| b.resource == o.resource)
+                .filter_map(|b| Some(format!("{} ({})", b.path.as_ref()?, publisher(config, b)?)))
+                .collect();
+            o.status = PlanStatus::Planned;
+            o.action = Action::Start;
+            o.effect = format!(
+                "start {} after the configuration scope publishes {}; planned again from the published files before it starts",
+                o.resource,
+                by.join(", ")
+            );
+        }
+        own.blockers.retain(|b| publisher(config, b).is_none());
+        own
+    }
+
+    /// Each blocked operation with its code, or the resource when a blocker names no operation.
+    fn blocked_ops(&self) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        for b in &self.plan.blockers {
+            let mut ids: Vec<String> = self
+                .plan
+                .operations
+                .iter()
+                .filter(|o| o.resource == b.resource && o.status == PlanStatus::Blocked)
+                .map(|o| format!("{} {}", o.id, b.code.as_str()))
+                .collect();
+            if ids.is_empty() {
+                ids.push(format!("{} {}", b.resource, b.code.as_str()));
+            }
+            for id in ids {
+                if !out.contains(&id) {
+                    out.push(id);
+                }
+            }
+        }
+        out
+    }
+
+    /// The end-of-output warning of a skipped or blocked scope, if any (docs/sync.md).
+    fn warning(&self) -> Option<String> {
+        if !self.skipped.is_empty() {
+            return Some(skipped_warning(&self.skipped));
+        }
+        if !self.blocked {
+            return None;
+        }
+        let mut fixes: Vec<&str> = Vec::new();
+        for b in &self.plan.blockers {
+            if !fixes.contains(&b.correction.as_str()) {
+                fixes.push(&b.correction);
+            }
+        }
+        Some(format!(
+            "{} blocked: {}. Fix: {}, or run dfm {} on its own",
+            self.scope.as_str(),
+            visible(&self.blocked_ops().join(", ")),
+            visible(&fixes.join("; ")),
+            self.scope.as_str()
+        ))
+    }
+}
+
+fn skipped_warning(names: &[String]) -> String {
+    format!(
+        "secrets skipped, no 1Password session: {}. Fix: unlock 1Password, then run dfm sync or dfm secrets again",
+        visible(&names.join(", "))
+    )
+}
+
+/// The planned configuration operation that publishes the path of a service's "not published"
+/// blocker, if one does.
+fn publisher<'a>(config: &'a Plan, b: &Blocker) -> Option<&'a str> {
+    let path = b.path.as_deref()?;
+    (b.code == Code::Conflict)
+        .then(|| {
+            config
+                .operations
+                .iter()
+                .find(|o| o.status == PlanStatus::Planned && o.path.as_deref() == Some(path))
+        })
+        .flatten()
+        .map(|o| o.id.as_str())
+}
+
+/// The arguments of one scope's run: the sync flags, with only the approvals that name an
+/// operation of this scope's plan (an id outside it is a usage error there), and `--restart`
+/// for services only.
+fn scope_args(args: &Args, scope: Scope, plan: Option<&Plan>) -> apply_cmd::Args {
+    let own = |given: &BTreeSet<String>, kind| {
+        given
+            .iter()
+            .filter(|id| plan.is_some_and(|p| needs(p, kind, id)))
+            .cloned()
+            .collect()
+    };
+    apply_cmd::Args {
+        yes_plan: None,
+        allow: own(&args.apply.allow, Allowance::Disruptive),
+        allow_adopt: own(&args.apply.allow_adopt, Allowance::Adopt),
+        scope,
+        restart: match scope {
+            Scope::Services => args.restart.clone(),
+            _ => BTreeSet::new(),
+        },
+        composed: true,
+        ..args.apply.clone()
+    }
+}
+
+/// Whether `id` is a planned operation of `plan` that needs this kind of approval.
+fn needs(plan: &Plan, kind: Allowance, id: &str) -> bool {
+    plan.operations
+        .iter()
+        .any(|o| o.id == id && o.status == PlanStatus::Planned && Allowance::of(o) == Some(kind))
+}
+
+/// Plans one scope of the tree `loaded` holds as its own command plans it, with the providers
+/// probed read-only.
+fn plan_scope(
+    ctx: &Ctx,
+    sys: &Sys,
+    args: &Args,
+    scope: Scope,
+    loaded: &Loaded,
+) -> Result<Plan, Refusal> {
+    let probed = apply_cmd::probe(ctx, sys, &scope_args(args, scope, None), &loaded.resolved)?;
+    let plan = plan_for(ctx, loaded, scope, probed)?;
+    if scope == Scope::Services {
+        apply_cmd::check_restart(&args.restart, &plan)?;
+    }
+    Ok(plan)
+}
+
 /// Resolves and plans the staged tree as the tree `root` will hold after publication: the
-/// sources are read from `tree`, the plan names `root`.
+/// sources are read from `tree`, the plans name `root`. The secrets scope then runs the session
+/// check of `secrets`: without a session its planned resources are skipped, not refused.
 fn plan_staged(
     ctx: &Ctx,
     binding: &Binding,
     root: &Path,
     rel: &str,
     tree: &Path,
-) -> Result<(Loaded, Plan), Refusal> {
+    args: &Args,
+) -> Result<(Loaded, Vec<ScopePlan>), Refusal> {
     let sources = load_scoped(tree, rel)?;
     let resolved = resolve(&sources, rel, &builtin_catalog())?;
     let loaded = Loaded {
@@ -978,8 +1172,189 @@ fn plan_staged(
     if let Some(d) = crate::machine_mismatch(ctx, &loaded) {
         return Err(Refusal::new(Code::PlatformMismatch, d));
     }
-    let plan = plan_for(ctx, &loaded, Scope::Config, BTreeMap::new())?;
-    Ok((loaded, plan))
+    let sys = ctx.sys()?;
+    let mut plans: Vec<ScopePlan> = Vec::new();
+    for scope in SCOPES {
+        let plan = plan_scope(ctx, &sys, args, scope, &loaded)?;
+        let skipped = match scope {
+            // Re-renders alone are not worth a vault contact on a run that changes nothing else.
+            Scope::Secrets if rerenders_only(&plan) => Vec::new(),
+            Scope::Secrets => {
+                match secret::credentials(&plan, &loaded.resolved, &ctx.runner(&sys)) {
+                    Ok(()) => Vec::new(),
+                    Err(e) if e.code == Code::CredentialUnavailable => planned_secrets(&plan),
+                    Err(e) => return Err(e),
+                }
+            }
+            _ => Vec::new(),
+        };
+        let (mut blocked, mut deferred) = (false, BTreeSet::new());
+        if let (Scope::Packages | Scope::Secrets | Scope::Services, Some(config)) =
+            (scope, plans.first())
+        {
+            for b in &plan.blockers {
+                match publisher(&config.plan, b) {
+                    Some(_) if scope == Scope::Services => {
+                        deferred.insert(format!("{}@service", b.resource));
+                    }
+                    _ => blocked = true,
+                }
+            }
+            if blocked {
+                deferred.clear();
+            }
+        }
+        plans.push(ScopePlan {
+            scope,
+            digest: plan.digest()?,
+            plan,
+            skipped,
+            blocked,
+            deferred,
+        });
+    }
+    Ok((loaded, plans))
+}
+
+/// Whether every planned operation of a secrets plan only renders again a destination the
+/// ledger proves the manager wrote: the plan cannot tell an unchanged result from a changed one
+/// before the render (docs/secrets.md). `sync` approves nothing for such a plan alone.
+fn rerenders_only(plan: &Plan) -> bool {
+    plan.blockers.is_empty()
+        && plan.operations.iter().all(|o| {
+            o.status != PlanStatus::Planned
+                || (o.adapter == secret::ADAPTER
+                    && o.action == Action::UpdateFile
+                    && o.ownership == Ownership::Owned
+                    && !o.takeover)
+        })
+}
+
+/// The planned secret resources of a secrets plan, each once.
+fn planned_secrets(plan: &Plan) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for o in plan
+        .operations
+        .iter()
+        .filter(|o| o.status == PlanStatus::Planned && o.adapter == secret::ADAPTER)
+    {
+        if !out.contains(&o.resource) {
+            out.push(o.resource.clone());
+        }
+    }
+    out
+}
+
+/// The combined preview: each scope's reviewed plan under its heading, the secrets this run
+/// skips and the scopes it does not run, then the one digest that approves the whole run.
+fn show(
+    plans: &[ScopePlan],
+    digest: &str,
+    color: bool,
+    out: &mut dyn Write,
+) -> std::io::Result<()> {
+    let config = &plans[0].plan;
+    for p in plans {
+        writeln!(
+            out,
+            "{} {}",
+            paint::label(color, "scope:"),
+            p.scope.as_str()
+        )?;
+        render_body(&p.reviewed(config), color, out)?;
+        for r in &p.skipped {
+            writeln!(
+                out,
+                "{} {}",
+                paint::style(color, "33", "skipped: no session"),
+                visible(r)
+            )?;
+        }
+        if p.blocked {
+            writeln!(
+                out,
+                "{} this scope does not run: {}",
+                paint::style(color, "1;31", "blocked:"),
+                visible(&p.blocked_ops().join(", "))
+            )?;
+        }
+    }
+    writeln!(
+        out,
+        "{} {}",
+        paint::label(color, "plan digest:"),
+        paint::style(color, "35", digest)
+    )
+}
+
+/// The checks `apply` runs before its lock (`apply_cmd::check_before_lock`), per scope with that
+/// scope's approvals, for the scopes that will run (a deferred service is checked when its scope
+/// plans it again). An approval id that names no operation of any plan is a usage error. Missing
+/// approvals of every scope are printed as one list before the refusal. Returns whether the
+/// journal holds open work.
+fn check_scopes(
+    ctx: &Ctx,
+    args: &Args,
+    plans: &[ScopePlan],
+    loaded: &Loaded,
+    out: &mut dyn Write,
+) -> Result<bool, Refusal> {
+    for kind in Allowance::ALL {
+        let given = match kind {
+            Allowance::Disruptive => &args.apply.allow,
+            Allowance::Adopt => &args.apply.allow_adopt,
+        };
+        if let Some(bad) = given
+            .iter()
+            .find(|id| !plans.iter().any(|p| needs(&p.plan, kind, id)))
+        {
+            return Err(usage(format!(
+                "{} {bad} names no planned {} in any scope of this sync",
+                kind.flag(),
+                kind.noun()
+            )));
+        }
+    }
+    let sys = ctx.sys()?;
+    let (mut open, mut missing) = (false, None);
+    for p in plans.iter().filter(|p| !p.blocked && p.skipped.is_empty()) {
+        let mut plan = p.plan.clone();
+        plan.operations.retain(|o| !p.deferred.contains(&o.id));
+        if !p.deferred.is_empty() {
+            plan.blockers.clear();
+        }
+        let generator = apply_cmd::generators_for(ctx, &sys, p.scope, loaded);
+        let scoped = scope_args(args, p.scope, Some(&p.plan));
+        match apply_cmd::check_before_lock(ctx, &scoped, &plan, &p.digest, &generator, out) {
+            Ok(o) => open |= o,
+            Err(e) if matches!(e.code, Code::DisruptiveUnapproved | Code::AdoptUnapproved) => {
+                missing.get_or_insert(e);
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    missing.map_or(Ok(open), Err)
+}
+
+/// Whether `fresh`, a services plan of the published tree, is the reviewed plan `p` with its
+/// deferred services now planned as starts: every other operation, the sources and the model
+/// are unchanged, and nothing blocks. The observations are left out: the configuration scope
+/// changed them, and each operation's preconditions carry the states it depends on.
+fn as_reviewed(p: &ScopePlan, fresh: &Plan) -> bool {
+    let started = p.deferred.iter().all(|id| {
+        fresh
+            .operations
+            .iter()
+            .any(|o| o.id == *id && o.status == PlanStatus::Planned && o.action == Action::Start)
+    });
+    let rest = |plan: &Plan| {
+        let mut c = plan.clone();
+        c.operations.retain(|o| !p.deferred.contains(&o.id));
+        c.blockers.clear();
+        c.observations = Default::default();
+        c
+    };
+    started && fresh.blockers.is_empty() && rest(&p.plan) == rest(fresh)
 }
 
 /// Publishes one staged source into its checkout exactly as the rehearsal moved the copy, after
@@ -1021,11 +1396,21 @@ fn publish(git: &Git, s: &Staged) -> Result<bool, Refusal> {
 
 // ---- the command ----------------------------------------------------------------------------
 
+/// What was printed so far, so a refusal prints its `result:` line exactly once, and the
+/// warnings of the scopes the run skipped or did not run, which end the output.
+#[derive(Default)]
+struct Printed {
+    plan: bool,
+    result: bool,
+    warnings: Vec<String>,
+}
+
 pub fn run(ctx: &Ctx, args: &Args, out: &mut dyn Write) -> Result<(), Refusal> {
-    let mut plan_printed = false;
-    let r = run_inner(ctx, args, out, &mut plan_printed);
+    let mut printed = Printed::default();
+    let r = run_inner(ctx, args, out, &mut printed);
     if let Err(e) = &r
-        && plan_printed
+        && printed.plan
+        && !printed.result
     {
         let _ = writeln!(
             out,
@@ -1034,14 +1419,63 @@ pub fn run(ctx: &Ctx, args: &Args, out: &mut dyn Write) -> Result<(), Refusal> {
             paint::status(ctx.color, e.exit().name())
         );
     }
+    // Last, so the owner sees them without scrolling (docs/sync.md, "Skipped and blocked scopes").
+    for warning in &printed.warnings {
+        let _ = writeln!(
+            out,
+            "{} {warning}",
+            paint::style(ctx.color, "1;33", "warning:")
+        );
+    }
     r
+}
+
+/// The per-scope lines and the `result:` line that end a run.
+fn finish(
+    ctx: &Ctx,
+    lines: &[(Scope, String)],
+    result: Result<(), Refusal>,
+    out: &mut dyn Write,
+    printed: &mut Printed,
+) -> Result<(), Refusal> {
+    let w =
+        |e: std::io::Error| Refusal::new(Code::IoFailed, format!("output failed: {}", e.kind()));
+    writeln!(out, "{}", paint::label(ctx.color, "scopes:")).map_err(w)?;
+    for (scope, status) in lines {
+        writeln!(out, "  {}: {status}", scope.as_str()).map_err(w)?;
+    }
+    let exit = result
+        .as_ref()
+        .err()
+        .map_or(dfm_model::Exit::Ok, Refusal::exit);
+    writeln!(
+        out,
+        "{} {}",
+        paint::label(ctx.color, "result:"),
+        paint::status(ctx.color, exit.name())
+    )
+    .map_err(w)?;
+    printed.result = true;
+    result
+}
+
+/// The summary status of a scope that does not run, if it does not.
+fn not_run(p: &ScopePlan) -> Option<String> {
+    if p.blocked {
+        return Some(format!(
+            "blocked ({})",
+            visible(&p.blocked_ops().join(", "))
+        ));
+    }
+    (!p.skipped.is_empty())
+        .then(|| format!("skipped: no session ({})", visible(&p.skipped.join(", "))))
 }
 
 fn run_inner(
     ctx: &Ctx,
     args: &Args,
     out: &mut dyn Write,
-    plan_printed: &mut bool,
+    printed: &mut Printed,
 ) -> Result<(), Refusal> {
     let w =
         |e: std::io::Error| Refusal::new(Code::IoFailed, format!("output failed: {}", e.kind()));
@@ -1116,35 +1550,53 @@ fn run_inner(
         )
         .map_err(w)?;
     }
-    let (loaded, plan) = plan_staged(ctx, &binding, &root, &rel, &staging.tree())?;
-    let plan_digest = plan.digest()?;
-    let digest = sync_digest(&plan_digest, &previewed);
-    // With an approval the apply below prints the plan it runs; otherwise this is the review.
-    // The digest shown, and the one --yes-plan takes, is the sync digest.
-    let applying = args.apply.yes_plan.is_some() && !args.apply.preview;
-    if !applying {
-        render(&plan, &digest, ctx.color, out).map_err(w)?;
-        *plan_printed = true;
+    let (loaded, plans) = plan_staged(ctx, &binding, &root, &rel, &staging.tree(), args)?;
+    let digest = sync_digest(&plans, &previewed);
+    printed.warnings = plans.iter().filter_map(ScopePlan::warning).collect();
+    show(&plans, &digest, ctx.color, out).map_err(w)?;
+    printed.plan = true;
+    // A digest that no longer matches is the first thing to report: the reviewer approved a
+    // different run.
+    if let Some(approved) = &args.apply.yes_plan
+        && *approved != digest
+    {
+        return Err(apply_cmd::stale(approved, &digest));
     }
-    // The checks apply runs before its lock (docs/apply.md), against the sync digest, so a plan
-    // that apply would refuse is refused here before any source is published.
-    let journal_open = apply_cmd::check_before_lock(
-        ctx,
-        &args.apply,
-        &plan,
-        &digest,
-        &Generators::new(&loaded.resolved),
-        out,
-    )?;
+    // The checks apply runs before its lock (docs/apply.md), per scope, so a plan that a scope
+    // would refuse is refused here before any source is published.
+    let journal_open = check_scopes(ctx, args, &plans, &loaded, out)?;
     if args.apply.preview {
         return Ok(());
     }
-    // A source that moves is a publication, so only a run with every source current can end here.
-    if previewed.iter().all(|s| s.old.as_ref() == Some(&s.new))
-        && apply_cmd::end_without_change(&args.apply, &plan, journal_open, ctx.color, out)
-            .map_err(w)?
+    // A source that moves is a publication, so only a run with every source current, and no
+    // scope that would run with a change, can end here (docs/apply.md, step 4).
+    if args.apply.yes_plan.is_none()
+        && !journal_open
+        && previewed.iter().all(|s| s.old.as_ref() == Some(&s.new))
+        && plans.iter().all(|p| {
+            not_run(p).is_some()
+                || p.plan.changes_nothing()
+                || (p.scope == Scope::Secrets && rerenders_only(&p.plan))
+        })
     {
-        return Ok(());
+        writeln!(
+            out,
+            "{}",
+            paint::style(ctx.color, "1;32", "nothing to change: no approval needed")
+        )
+        .map_err(w)?;
+        let lines: Vec<(Scope, String)> = plans
+            .iter()
+            .map(|p| {
+                let status = match not_run(p) {
+                    Some(s) => s,
+                    None if p.plan.changes_nothing() => "current".into(),
+                    None => "current, not rendered again (dfm secrets renders them)".into(),
+                };
+                (p.scope, status)
+            })
+            .collect();
+        return finish(ctx, &lines, Ok(()), out, printed);
     }
     let Some(approved) = &args.apply.yes_plan else {
         return Err(Refusal::new(
@@ -1166,9 +1618,8 @@ fn run_inner(
     store.require_identity(&binding)?;
     let second = Staging::create(ctx, &sys, true)?;
     let staged = stage_all(&git, root_src, &grants, &root, &second.tree())?;
-    let (_, locked) = plan_staged(ctx, &binding, &root, &rel, &second.tree())?;
-    let locked_plan_digest = locked.digest()?;
-    let locked_digest = sync_digest(&locked_plan_digest, &staged);
+    let (_, locked) = plan_staged(ctx, &binding, &root, &rel, &second.tree(), args)?;
+    let locked_digest = sync_digest(&locked, &staged);
     if locked_digest != digest {
         return Err(apply_cmd::stale(approved, &locked_digest));
     }
@@ -1199,7 +1650,7 @@ fn run_inner(
                 // Honest partial publication: what changed is named, and the exit is 1.
                 writeln!(
                     out,
-                    "sync: published {}; {} was not published; the configuration was not applied",
+                    "sync: published {}; {} was not published; no scope was run",
                     published.join(", "),
                     s.src.id
                 )
@@ -1211,26 +1662,87 @@ fn run_inner(
     drop(second);
     drop(store);
 
-    // Apply once with the configuration plan's digest, which the sync digest covers: apply
-    // plans --root (now the published tree), compares, takes the lock, plans again and runs
-    // (docs/apply.md).
-    let apply_args = apply_cmd::Args {
-        yes_plan: Some(locked_plan_digest),
-        ..args.apply.clone()
-    };
-    match apply_cmd::run(ctx, &apply_args, out) {
-        Ok(()) => Ok(()),
-        Err(e) if published.is_empty() => Err(e),
-        Err(e) => {
+    // Each scope runs as its own command would, with its plan digest, which the sync digest
+    // covers: it plans --root (now the published tree), compares, takes the lock, plans again,
+    // runs and writes its own receipt (docs/apply.md). A scope that fails stops the scopes after
+    // it. A skipped or blocked scope does not run and stops nothing.
+    let mut failure: Option<Refusal> = None;
+    let mut changed = !published.is_empty();
+    let mut lines = Vec::new();
+    for p in &locked {
+        let status = if failure.is_some() {
+            "not_started".to_string()
+        } else if let Some(s) = not_run(p) {
+            s
+        } else if p.plan.changes_nothing() && !journal_open {
+            "current".into()
+        } else {
             writeln!(
                 out,
-                "sync: published {}; the configuration was not applied (see the result above)",
-                published.join(", ")
+                "{} {}",
+                paint::label(ctx.color, "scope:"),
+                p.scope.as_str()
             )
             .map_err(w)?;
-            Err(e.after_mutation())
-        }
+            match run_scope(ctx, &sys, args, p, out) {
+                Ok(()) => {
+                    changed = true;
+                    "ok".into()
+                }
+                // The session ended after the review: the secrets wait, as without one.
+                Err(e) if p.scope == Scope::Secrets && e.code == Code::CredentialUnavailable => {
+                    let names = planned_secrets(&p.plan);
+                    printed.warnings.push(skipped_warning(&names));
+                    format!("skipped: no session ({})", visible(&names.join(", ")))
+                }
+                Err(e) => {
+                    let status = format!("{} ({})", e.exit().name(), e.code.as_str());
+                    failure = Some(e);
+                    status
+                }
+            }
+        };
+        lines.push((p.scope, status));
     }
+    let result = match failure {
+        Some(e) if changed => Err(e.after_mutation()),
+        Some(e) => Err(e),
+        None => Ok(()),
+    };
+    finish(ctx, &lines, result, out, printed)
+}
+
+/// Runs one approved scope through its own command (`apply_cmd::run`) with its plan digest. A
+/// services plan with deferred services is planned again first, from the published tree: it
+/// runs only when it is the reviewed plan with those services now planned as starts.
+fn run_scope(
+    ctx: &Ctx,
+    sys: &Sys,
+    args: &Args,
+    p: &ScopePlan,
+    out: &mut dyn Write,
+) -> Result<(), Refusal> {
+    let digest = if p.deferred.is_empty() {
+        p.digest.clone()
+    } else {
+        let loaded = crate::load_resolved(ctx, args.apply.root.as_deref().map(Path::new))?;
+        let fresh = plan_scope(ctx, sys, args, p.scope, &loaded)?;
+        if !as_reviewed(p, &fresh) {
+            return Err(Refusal::new(
+                Code::PlanStale,
+                format!(
+                    "the services plan after the configuration scope is not the reviewed one with {} started. Fix: run dfm sync again and approve the new plan",
+                    p.deferred.iter().cloned().collect::<Vec<_>>().join(", ")
+                ),
+            ));
+        }
+        fresh.digest()?
+    };
+    let scoped = apply_cmd::Args {
+        yes_plan: Some(digest),
+        ..scope_args(args, p.scope, Some(&p.plan))
+    };
+    apply_cmd::run(ctx, &scoped, out)
 }
 
 fn untrusted_refusal(origins: &[&str]) -> Refusal {

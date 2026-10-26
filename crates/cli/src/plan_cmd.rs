@@ -242,6 +242,17 @@ pub(crate) fn render(
     color: bool,
     out: &mut dyn Write,
 ) -> std::io::Result<()> {
+    render_body(p, color, out)?;
+    writeln!(
+        out,
+        "{} {}",
+        paint::label(color, "plan digest:"),
+        paint::style(color, "35", digest)
+    )
+}
+
+/// The plan without its digest line: `sync` prints four plans and one digest for all of them.
+pub(crate) fn render_body(p: &Plan, color: bool, out: &mut dyn Write) -> std::io::Result<()> {
     let label = |s: &str| paint::label(color, s);
     writeln!(
         out,
@@ -297,12 +308,7 @@ pub(crate) fn render(
             visible(&b.refusal().to_string())
         )?;
     }
-    writeln!(
-        out,
-        "{} {}",
-        label("plan digest:"),
-        paint::style(color, "35", digest)
-    )
+    Ok(())
 }
 
 fn status_name(s: Status) -> &'static str {

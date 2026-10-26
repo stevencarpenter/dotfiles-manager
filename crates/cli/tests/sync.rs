@@ -1293,3 +1293,592 @@ fn a_dead_run_s_staging_directory_is_removed_by_the_next_writer() {
     );
     assert_eq!(fx.staging_leftovers(), ["notes"]);
 }
+
+// ---- the composed run (DFM-63): configuration, packages, secrets, services -----------------
+
+/// A module with one resource of each scope: a launch agent and the link that publishes its
+/// definition, a Homebrew package and a 1Password secret.
+const LIFE: &str = r#"schema = 1
+id = "life"
+platforms = ["macos", "linux"]
+requires = []
+
+[[resources]]
+id = "agent-plist"
+kind = "link"
+adapter = "fs-link/v1"
+target = "Library/LaunchAgents/org.example.agent.plist"
+[resources.value]
+source = "files/org.example.agent.plist"
+
+[[resources]]
+id = "agent"
+kind = "service"
+adapter = "launchd-agent/v1"
+[resources.value]
+label = "org.example.agent"
+plist = "Library/LaunchAgents/org.example.agent.plist"
+
+[[resources]]
+id = "atuin"
+kind = "package"
+adapter = "homebrew/v1"
+[resources.value]
+name = "atuin"
+update_policy = "rolling"
+downgrade = "forbid"
+
+[[resources]]
+id = "token"
+kind = "secret"
+adapter = "op-template/v1"
+target = ".config/example/personal.env"
+[resources.value]
+template = "files/personal.env.tpl"
+account = "example-account"
+mode = 0o600
+"#;
+
+const BUNDLE_LIFE: &str = r#"schema = 1
+id = "t-base"
+core = "modules/core/module.toml"
+
+[modules]
+extra = "modules/extra/module.toml"
+life = "modules/life/module.toml"
+"#;
+
+const AGENT_PLIST: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>org.example.agent</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/usr/bin/true</string>
+	</array>
+</dict>
+</plist>
+"#;
+
+const AGENT_OP: &str = "life.agent@service";
+
+/// `op whoami` exits 0 only with the `signed-in` marker; `op inject` fills the one reference.
+const FAKE_OP: &str = r#"#!/bin/sh
+PATH=/usr/bin:/bin:$PATH
+here=$(dirname "$0")
+printf 'op %s\n' "$*" >> "$here/../log"
+[ -e "$here/../signed-in" ] || { echo "[ERROR] no session" >&2; exit 1; }
+case "$1" in
+  whoami) echo me; exit 0 ;;
+  inject) sed 's|{{ op://vault/item/field }}|planted-value|' ;;
+  *) exit 64 ;;
+esac
+"#;
+
+/// `launchctl print` answers from `loaded` in launchd's report shape or exits 113;
+/// `bootstrap` adds the plist's label, `bootout` removes it (crates/cli/tests/services.rs keeps
+/// the full look-alike).
+const FAKE_LAUNCHCTL: &str = r#"#!/bin/sh
+PATH=/usr/bin:/bin:$PATH
+here=$(dirname "$0")
+printf 'launchctl %s\n' "$*" >> "$here/../log"
+db="$here/../loaded"
+case "$1" in
+  print)
+    label=${2##*/}
+    line=$(grep "^$label " "$db" 2>/dev/null | head -1)
+    if [ -z "$line" ]; then
+      echo "Could not find service \"$label\" in domain for user gui: 501" >&2
+      exit 113
+    fi
+    set -- $line
+    printf 'gui/501/%s = {\n\tactive count = 0\n\tpath = %s\n\ttype = LaunchAgent\n\tstate = not running\n\n\tprogram = /usr/bin/true\n}\n' "$1" "$2"
+    exit 0 ;;
+  bootstrap)
+    label=$(tr -d '\n\t' < "$3" | sed -n 's/.*<key>Label<\/key> *<string>\([^<]*\)<\/string>.*/\1/p')
+    echo "$label $3" >> "$db"; exit 0 ;;
+  bootout)
+    label=${2##*/}
+    grep -v "^$label " "$db" > "$db.tmp" 2>/dev/null; mv "$db.tmp" "$db"; exit 0 ;;
+  *) exit 64 ;;
+esac
+"#;
+
+/// A synced checkout whose profile also selects `life`, with `brew`, `op` and `launchctl`
+/// look-alikes first on the provider path (git still comes from `/usr/bin`).
+struct Life {
+    fx: Fx,
+    fake: TempDir,
+}
+
+impl Life {
+    /// The `life` module is in the checkout and its configuration is published, so the agent's
+    /// definition exists: every scope has work and none is blocked.
+    fn new() -> Life {
+        let l = Life::unpublished();
+        let p = l.run(&["apply", "--root", l.fx.root_arg(), "--preview"]);
+        assert_eq!(code(&p), 0, "{}\n{}", stdout(&p), stderr(&p));
+        let o = l.run(&["apply", "--root", l.fx.root_arg(), "-y", &digest_of(&p)]);
+        assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
+        assert!(
+            l.fx.h("Library/LaunchAgents/org.example.agent.plist")
+                .is_symlink()
+        );
+        l
+    }
+
+    /// The `life` module pushed upstream and pulled into the checkout, nothing published.
+    fn unpublished() -> Life {
+        let fx = Fx::new();
+        let fake = TempDir::new("sync-providers");
+        let bin = fake.path().join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        for (name, body) in [
+            ("brew", common::providers::FAKE_BREW),
+            ("op", FAKE_OP),
+            ("launchctl", FAKE_LAUNCHCTL),
+        ] {
+            let p = bin.join(name);
+            fs::write(&p, body).unwrap();
+            fs::set_permissions(&p, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let l = Life { fx, fake };
+        l.sign_in(true);
+        let seed = &l.fx.upstream.seed;
+        put(seed, "base/bundle.toml", BUNDLE_LIFE);
+        put(seed, "base/modules/life/module.toml", LIFE);
+        put(
+            seed,
+            "base/modules/life/files/org.example.agent.plist",
+            AGENT_PLIST,
+        );
+        put(
+            seed,
+            "base/modules/life/files/personal.env.tpl",
+            "TOKEN={{ op://vault/item/field }}\n",
+        );
+        put(
+            seed,
+            "profiles/t-01.toml",
+            &common::PROFILE.replace("modules = [\"extra\"]", "modules = [\"extra\", \"life\"]"),
+        );
+        l.fx.upstream.push("add the life module");
+        git(&l.fx.root, &["pull", "-q", "--ff-only", "origin", "main"]);
+        l
+    }
+
+    fn run(&self, args: &[&str]) -> Output {
+        let path = format!("{}:/usr/bin:/bin", self.fake.path().join("bin").display());
+        Command::new(BIN)
+            .env_clear()
+            .env("DFM_PROVIDER_PATH", path)
+            .env("DFM_SERVICE_TIMEOUT_SECS", "1")
+            .arg("--home")
+            .arg(self.fx.home.path())
+            .args(args)
+            .output()
+            .unwrap()
+    }
+
+    fn preview(&self, flags: &[&str]) -> Output {
+        let mut a = vec!["sync", "--root", self.fx.root_arg(), "--preview"];
+        a.extend_from_slice(flags);
+        self.run(&a)
+    }
+
+    fn sync(&self, digest: &str, flags: &[&str]) -> Output {
+        let mut a = vec!["sync", "--root", self.fx.root_arg(), "-y", digest];
+        a.extend_from_slice(flags);
+        self.run(&a)
+    }
+
+    /// Preview, then sync with the previewed digest.
+    fn approved(&self, flags: &[&str]) -> Output {
+        let p = self.preview(flags);
+        assert_eq!(code(&p), 0, "{}\n{}", stdout(&p), stderr(&p));
+        self.sync(&digest_of(&p), flags)
+    }
+
+    fn sign_in(&self, on: bool) {
+        let m = self.fake.path().join("signed-in");
+        if on {
+            fs::write(m, "").unwrap();
+        } else {
+            let _ = fs::remove_file(m);
+        }
+    }
+
+    fn mark(&self, name: &str) {
+        fs::write(self.fake.path().join(name), "").unwrap();
+    }
+
+    fn log(&self) -> String {
+        fs::read_to_string(self.fake.path().join("log")).unwrap_or_default()
+    }
+
+    /// A configuration change upstream: one more link.
+    fn push_link(&self) {
+        let seed = &self.fx.upstream.seed;
+        put(
+            seed,
+            "base/modules/life/module.toml",
+            &format!(
+                "{LIFE}\n[[resources]]\nid = \"notes\"\nkind = \"link\"\nadapter = \"fs-link/v1\"\ntarget = \".config/life/notes\"\n[resources.value]\nsource = \"files/notes\"\n"
+            ),
+        );
+        put(seed, "base/modules/life/files/notes", "notes\n");
+        self.fx.upstream.push("add a link");
+    }
+
+    /// The `command` of each receipt, oldest first.
+    fn receipt_commands(&self) -> Vec<String> {
+        let Ok(dir) = fs::read_dir(self.fx.h(".local/state/dotfiles-manager/state/receipts"))
+        else {
+            return Vec::new();
+        };
+        let mut v: Vec<(String, String)> = dir
+            .map(|e| {
+                let r: serde_json::Value =
+                    serde_json::from_slice(&fs::read(e.unwrap().path()).unwrap()).unwrap();
+                (
+                    r["started_at"].as_str().unwrap().to_string(),
+                    r["command"].as_str().unwrap().to_string(),
+                )
+            })
+            .collect();
+        v.sort();
+        v.into_iter().map(|(_, c)| c).collect()
+    }
+}
+
+/// The byte offset of each needle in `hay`, which must hold all of them in this order.
+fn in_order(hay: &str, needles: &[&str]) {
+    let mut at = 0;
+    for n in needles {
+        match hay[at..].find(n) {
+            Some(i) => at += i + n.len(),
+            None => panic!("{n:?} is missing or out of order in\n{hay}"),
+        }
+    }
+}
+
+#[test]
+fn sync_runs_configuration_packages_secrets_and_services_in_order_under_one_approval() {
+    let l = Life::new();
+    l.push_link();
+    let before = l.receipt_commands();
+    let p = l.preview(&[]);
+    assert_eq!(code(&p), 0, "{}\n{}", stdout(&p), stderr(&p));
+    let s = stdout(&p);
+    in_order(
+        &s,
+        &[
+            "scope: config",
+            "planned life.notes@.config/life/notes",
+            "scope: packages",
+            "planned life.atuin@package",
+            "scope: secrets",
+            "planned life.token@.config/example/personal.env",
+            "scope: services",
+            "planned life.agent@service",
+            "plan digest: ",
+        ],
+    );
+    // The preview lists each scope's own operations only, and writes nothing.
+    assert!(!s.contains("not_in_scope"), "{s}");
+    for effect in ["brew install", "op inject", "launchctl bootstrap"] {
+        assert!(!l.log().contains(effect), "the preview ran {effect}");
+    }
+    assert!(!l.fx.h(".config/life/notes").exists());
+    let o = l.sync(&digest_of(&p), &[]);
+    assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
+    let s = stdout(&o);
+    in_order(
+        &s,
+        &[
+            "published: src0 ",
+            "  config: ok",
+            "  packages: ok",
+            "  secrets: ok",
+            "  services: ok",
+        ],
+    );
+    assert!(s.ends_with("result: ok\n"), "{s}");
+    in_order(
+        &l.log(),
+        &["brew install", "op inject", "launchctl bootstrap"],
+    );
+    assert!(l.fx.h(".config/life/notes").is_symlink());
+    assert_eq!(
+        fs::read_to_string(l.fx.h(".config/example/personal.env")).unwrap(),
+        "TOKEN=planted-value\n"
+    );
+    // Each scope wrote its own receipt, in run order.
+    let after = l.receipt_commands();
+    assert_eq!(
+        after[before.len()..],
+        ["apply", "packages", "secrets", "services"]
+    );
+}
+
+#[test]
+fn a_package_failure_leaves_the_later_scopes_not_started() {
+    let l = Life::new();
+    l.mark("fail");
+    let o = l.approved(&[]);
+    assert_eq!(code(&o), 1, "{}\n{}", stdout(&o), stderr(&o));
+    let s = stdout(&o);
+    in_order(
+        &s,
+        &[
+            "  config: current",
+            "  packages: failed",
+            "  secrets: not_started",
+            "  services: not_started",
+            "result: failed",
+        ],
+    );
+    assert!(l.log().contains("brew install"), "{}", l.log());
+    for effect in ["op inject", "launchctl bootstrap"] {
+        assert!(!l.log().contains(effect), "a later scope ran {effect}");
+    }
+    assert!(!l.fx.h(".config/example/personal.env").exists());
+}
+
+#[test]
+fn secrets_without_a_session_are_skipped_and_the_warning_ends_stdout() {
+    let l = Life::new();
+    l.sign_in(false);
+    let warning = "warning: secrets skipped, no 1Password session: life.token. Fix: unlock 1Password, then run dfm sync or dfm secrets again";
+    let p = l.preview(&[]);
+    assert_eq!(code(&p), 0, "{}\n{}", stdout(&p), stderr(&p));
+    let s = stdout(&p);
+    in_order(
+        &s,
+        &[
+            "scope: secrets",
+            "skipped: no session life.token",
+            "scope: services",
+        ],
+    );
+    assert!(s.ends_with(&format!("{warning}\n")), "{s}");
+    let o = l.sync(&digest_of(&p), &[]);
+    assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
+    let s = stdout(&o);
+    in_order(
+        &s,
+        &[
+            "  packages: ok",
+            "  secrets: skipped: no session (life.token)",
+            "  services: ok",
+            "result: ok\n",
+        ],
+    );
+    assert!(s.ends_with(&format!("result: ok\n{warning}\n")), "{s}");
+    assert!(!l.log().contains("op inject"), "{}", l.log());
+    assert!(l.log().contains("launchctl bootstrap"), "{}", l.log());
+    assert!(!l.fx.h(".config/example/personal.env").exists());
+    // With a session the skipped secret renders. Afterwards its destination matches the
+    // ledger: a run with nothing else new needs no approval and does not contact the vault.
+    l.sign_in(true);
+    let o = l.approved(&[]);
+    assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
+    assert!(stdout(&o).contains("  secrets: ok"), "{}", stdout(&o));
+    l.sign_in(false);
+    let log = l.log();
+    let o = l.run(&["sync", "--root", l.fx.root_arg()]);
+    assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
+    let s = stdout(&o);
+    assert!(s.contains("  secrets: current, not rendered again"), "{s}");
+    assert!(s.ends_with("result: ok\n"), "{s}");
+    assert!(!l.log()[log.len()..].contains("op "), "{}", l.log());
+}
+
+#[test]
+fn the_sync_digest_changes_when_only_the_package_plan_changes() {
+    let l = Life::new();
+    let p = l.preview(&[]);
+    assert_eq!(code(&p), 0, "{}\n{}", stdout(&p), stderr(&p));
+    let first = digest_of(&p);
+    // Install the package behind the manager's back: the sources, the configuration, the
+    // secrets and the services are as they were.
+    let keg = l.fake.path().join("Cellar/atuin/1.0.0");
+    fs::create_dir_all(&keg).unwrap();
+    fs::write(
+        keg.join("INSTALL_RECEIPT.json"),
+        r#"{"source":{"tap":"homebrew/core"}}"#,
+    )
+    .unwrap();
+    let p = l.preview(&[]);
+    assert_eq!(code(&p), 0, "{}\n{}", stdout(&p), stderr(&p));
+    assert!(
+        stdout(&p).contains("current life.atuin@package"),
+        "{}",
+        stdout(&p)
+    );
+    assert_ne!(digest_of(&p), first);
+    let o = l.sync(&first, &[]);
+    assert_eq!(code(&o), 3, "{}\n{}", stdout(&o), stderr(&o));
+    assert!(stderr(&o).contains("E_PLAN_STALE"), "{}", stderr(&o));
+    assert!(!l.log().contains("op inject"), "{}", l.log());
+}
+
+#[test]
+fn a_repeat_sync_with_nothing_new_in_any_scope_is_a_no_op() {
+    let l = Life::new();
+    let o = l.approved(&[]);
+    assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
+    let (receipts, log) = (l.receipt_commands(), l.log());
+    let o = l.run(&["sync", "--root", l.fx.root_arg()]);
+    assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
+    let s = stdout(&o);
+    assert!(s.contains("nothing to change: no approval needed"), "{s}");
+    assert!(s.ends_with("result: ok\n"), "{s}");
+    let new = &l.log()[log.len()..];
+    for effect in ["brew install", "op ", "launchctl bootstrap"] {
+        assert!(!new.contains(effect), "a no-op sync ran {effect}:\n{new}");
+    }
+    // An approved repeat publishes nothing and writes nothing. Only the secret is rendered
+    // again, because the plan cannot tell its result before the render; the result is equal.
+    let log = l.log();
+    let o = l.approved(&[]);
+    assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
+    let s = stdout(&o);
+    assert!(s.contains("published: src0 current at"), "{s}");
+    in_order(
+        &s,
+        &[
+            "  config: current",
+            "  packages: current",
+            "  secrets: ok",
+            "  services: current",
+        ],
+    );
+    assert!(
+        s.contains("current life.token@.config/example/personal.env"),
+        "{s}"
+    );
+    assert_eq!(
+        l.receipt_commands(),
+        receipts,
+        "a no-op sync wrote a receipt"
+    );
+    let new = &l.log()[log.len()..];
+    for effect in ["brew install", "launchctl bootstrap"] {
+        assert!(!new.contains(effect), "a no-op sync ran {effect}:\n{new}");
+    }
+}
+
+#[test]
+fn restart_is_forwarded_to_the_services_scope_and_needs_its_approval() {
+    let l = Life::new();
+    let o = l.approved(&[]);
+    assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
+    let o = l.preview(&["--restart", "nope"]);
+    assert_eq!(code(&o), 2, "{}\n{}", stdout(&o), stderr(&o));
+    // The restart is disruptive: the flag to paste is listed and nothing runs.
+    let o = l.preview(&["--restart", "life.agent"]);
+    assert_eq!(code(&o), 3, "{}\n{}", stdout(&o), stderr(&o));
+    assert!(
+        stdout(&o).contains(&format!("--allow-disruptive '{AGENT_OP}'")),
+        "{}",
+        stdout(&o)
+    );
+    let flags = ["--restart", "life.agent", "--allow-disruptive", AGENT_OP];
+    let p = l.preview(&flags);
+    assert_eq!(code(&p), 0, "{}\n{}", stdout(&p), stderr(&p));
+    // The digest covers the restart: without it the approval is stale.
+    let o = l.sync(&digest_of(&p), &[]);
+    assert_eq!(code(&o), 3, "{}\n{}", stdout(&o), stderr(&o));
+    assert!(stderr(&o).contains("E_PLAN_STALE"), "{}", stderr(&o));
+    assert!(!l.log().contains("launchctl bootout"), "{}", l.log());
+    let o = l.sync(&digest_of(&p), &flags);
+    assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
+    in_order(&l.log(), &["launchctl bootout", "launchctl bootstrap"]);
+    assert!(stdout(&o).contains("  services: ok"), "{}", stdout(&o));
+}
+
+#[test]
+fn a_service_whose_definition_the_same_run_publishes_is_planned_not_blocked() {
+    // The agent's definition is not published yet: the configuration scope publishes it, and
+    // the services scope starts the agent in the same run.
+    let l = Life::unpublished();
+    let p = l.preview(&[]);
+    assert_eq!(code(&p), 0, "{}\n{}", stdout(&p), stderr(&p));
+    let s = stdout(&p);
+    in_order(
+        &s,
+        &[
+            "scope: config",
+            "planned life.agent-plist@Library/LaunchAgents/org.example.agent.plist",
+            "scope: services",
+            "planned life.agent@service [life] start life.agent after the configuration scope publishes Library/LaunchAgents/org.example.agent.plist (life.agent-plist@Library/LaunchAgents/org.example.agent.plist)",
+        ],
+    );
+    assert!(!s.contains("blocked"), "{s}");
+    let o = l.sync(&digest_of(&p), &[]);
+    assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
+    in_order(
+        &stdout(&o),
+        &[
+            "  config: ok",
+            "  packages: ok",
+            "  secrets: ok",
+            "  services: ok",
+            "result: ok",
+        ],
+    );
+    assert!(l.log().contains("launchctl bootstrap"), "{}", l.log());
+    assert_eq!(
+        l.receipt_commands(),
+        ["apply", "packages", "secrets", "services"]
+    );
+}
+
+#[test]
+fn a_blocked_services_plan_does_not_stop_the_other_scopes_and_is_warned_last() {
+    let l = Life::new();
+    // launchd holds the label from another definition: a blocker the run cannot clear.
+    fs::write(
+        l.fake.path().join("loaded"),
+        "org.example.agent /tmp/elsewhere.plist\n",
+    )
+    .unwrap();
+    l.push_link();
+    let p = l.preview(&[]);
+    assert_eq!(code(&p), 0, "{}\n{}", stdout(&p), stderr(&p));
+    in_order(
+        &stdout(&p),
+        &[
+            "scope: services",
+            "blocked life.agent@service",
+            "blocked: this scope does not run: life.agent@service E_CONFLICT",
+            "plan digest: ",
+            "warning: services blocked: life.agent@service E_CONFLICT. Fix: ",
+        ],
+    );
+    let o = l.sync(&digest_of(&p), &[]);
+    assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
+    let s = stdout(&o);
+    in_order(
+        &s,
+        &[
+            "  config: ok",
+            "  packages: ok",
+            "  secrets: ok",
+            "  services: blocked (life.agent@service E_CONFLICT)",
+            "result: ok\nwarning: services blocked: life.agent@service E_CONFLICT. Fix: unload it by hand",
+        ],
+    );
+    assert_eq!(
+        s.lines().last().unwrap(),
+        s.lines()
+            .find(|l| l.starts_with("warning: services"))
+            .unwrap(),
+        "{s}"
+    );
+    assert!(l.fx.h(".config/life/notes").is_symlink());
+    assert!(!l.log().contains("launchctl bootstrap"), "{}", l.log());
+}
