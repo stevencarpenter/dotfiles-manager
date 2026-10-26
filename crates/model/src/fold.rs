@@ -1,4 +1,4 @@
-//! One case fold for every path comparison (docs/state.md, "Ledger").
+//! One case fold for every path comparison (docs/state.md, "Ledger entries" and "Ledger paths").
 
 /// Case folding close to what APFS applies: upper then lower case maps the long s (U+017F) to
 /// `s`, the Kelvin sign to `k` and the sharp s to `ss`, which a plain lowercase does not.
