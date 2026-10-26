@@ -45,7 +45,7 @@ pub struct Args {
     /// A scope of `sync` (docs/sync.md): sync printed the plan and prints the result line, so
     /// this run prints neither, and its report omits the `not_in_scope` operations. A removal of
     /// an owned output and a restart that `--restart` names need no flag, and an adoption or
-    /// takeover without its `--allow-adopt` id is held back (`by_rule`, `held`).
+    /// takeover without its `--allow-adopt` id is withheld (`by_rule`, `withheld`).
     pub(crate) composed: bool,
     /// A later scope of `sync`: the plan sync made of this scope after the earlier scopes, from
     /// the sources this run reads. The first look uses it instead of probing again; the plan
@@ -195,8 +195,8 @@ fn by_rule(args: &Args, plan: &Plan) -> BTreeSet<String> {
 /// The operations a `sync` scope does not run (docs/sync.md): each planned adoption or takeover
 /// without its `--allow-adopt` id, and every operation that runs after one. Empty for every
 /// other command, which refuses such a plan instead.
-pub(crate) fn held(args: &Args, plan: &Plan) -> BTreeSet<String> {
-    let mut held: BTreeSet<String> = plan
+pub(crate) fn withheld(args: &Args, plan: &Plan) -> BTreeSet<String> {
+    let mut withheld: BTreeSet<String> = plan
         .operations
         .iter()
         .filter(|o| args.composed && o.status == PlanStatus::Planned)
@@ -205,11 +205,11 @@ pub(crate) fn held(args: &Args, plan: &Plan) -> BTreeSet<String> {
         .collect();
     // The plan lists an operation after the ones it runs after, so one pass takes the chains.
     for o in &plan.operations {
-        if o.after.iter().any(|a| held.contains(a)) {
-            held.insert(o.id.clone());
+        if o.after.iter().any(|a| withheld.contains(a)) {
+            withheld.insert(o.id.clone());
         }
     }
-    held
+    withheld
 }
 
 /// `plan` without the operations `ids` names.
@@ -244,8 +244,8 @@ pub(crate) fn check_before_lock(
     if let Some(b) = plan.blockers.first() {
         return Err(b.refusal());
     }
-    // The gates check the operations that will run: a held one does not.
-    let plan = &without(plan, &held(args, plan));
+    // The gates check the operations that will run: a withheld one does not.
+    let plan = &without(plan, &withheld(args, plan));
     // The gates that need no write run before the lock and in a preview, so a plan that apply
     // would refuse is refused here with the same code.
     let g = gates(plan, generator);
@@ -441,8 +441,10 @@ fn run_inner(
     let journal_open = check_before_lock(ctx, args, plan, &digest, &generators(&first), out)?;
     // The credential gate (docs/secrets.md): a secrets run without a vault
     // session stops here, exit 3, before the lock and before any write. Nothing is rendered.
+    // A withheld secret is not rendered, so its account needs no session.
     if args.scope == Scope::Secrets {
-        crate::adapters::secret::credentials(plan, &first.resolved, &ctx.runner(&sys))?;
+        let runnable = without(plan, &withheld(args, plan));
+        crate::adapters::secret::credentials(&runnable, &first.resolved, &ctx.runner(&sys))?;
     }
     stop()?;
     if args.preview {
@@ -479,8 +481,8 @@ fn run_inner(
     if locked_digest != digest {
         return Err(store.stamp(stale(approved, &locked_digest)));
     }
-    // The digest covers the whole plan, held operations included; only the rest runs.
-    let locked = without(&locked, &held(args, &locked));
+    // The digest covers the whole plan, withheld operations included; only the rest runs.
+    let locked = without(&locked, &withheld(args, &locked));
     let allow: BTreeSet<String> = args.allow.union(&by_rule(args, &locked)).cloned().collect();
     let home = Dir::open_home(&sys, &layout.home).map_err(|r| store.stamp(r))?;
     let generator = generators(&second);

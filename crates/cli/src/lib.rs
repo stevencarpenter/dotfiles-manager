@@ -145,7 +145,7 @@ to a plan --preview printed. Every origin needs a grant in state/grants.json fir
 fast-forwards each checkout (never reset, clean, stash, rebase, commit or push; divergence and
 overwritten local changes are refused), then runs apply, packages, secrets and services in that
 order, each with its own plan digest and receipt. A removal of an owned output needs no flag. An
-adoption or takeover runs only with --allow-adopt <operation-id>, else it is held back and the rest
+adoption or takeover runs only with --allow-adopt <operation-id>, else it is withheld and the rest
 runs; a restart runs only with --restart <resource-id>. A scope that fails stops the later ones
 (not_started). Without a 1Password session the secrets are skipped; a blocked packages, secrets or
 services plan does not run; the other scopes run, and the last lines of the output warn what waits

@@ -797,7 +797,7 @@ fn an_unowned_link_in_the_way_is_not_adopted_and_the_warning_names_its_flag() {
         fx.h(".zshrc"),
     )
     .unwrap();
-    let warning = "warning: config held back: extra.zsh@.zshrc. Fix: review each, then run dfm sync --allow-adopt 'extra.zsh@.zshrc'";
+    let warning = "warning: config withheld: extra.zsh@.zshrc. Fix: review each, then run dfm sync --allow-adopt 'extra.zsh@.zshrc'";
     let o = fx.plain(&[]);
     assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
     let s = stdout(&o);
@@ -805,7 +805,7 @@ fn an_unowned_link_in_the_way_is_not_adopted_and_the_warning_names_its_flag() {
         &s,
         &[
             "planned extra.zsh@.zshrc",
-            "held back: extra.zsh@.zshrc (needs --allow-adopt)",
+            "withheld: extra.zsh@.zshrc (needs --allow-adopt)",
             "plan digest: ",
             "  config: ok",
             "result: ok\n",
@@ -822,12 +822,12 @@ fn an_unowned_link_in_the_way_is_not_adopted_and_the_warning_names_its_flag() {
         "{}",
         r[0]
     );
-    // The next plain run has only the held adoption: it changes nothing and warns again.
+    // The next plain run has only the withheld adoption: it changes nothing and warns again.
     let o = fx.plain(&[]);
     assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
     let s = stdout(&o);
     assert!(s.contains("nothing to change: no approval needed"), "{s}");
-    assert!(s.contains("  config: held back (extra.zsh@.zshrc)"), "{s}");
+    assert!(s.contains("  config: withheld (extra.zsh@.zshrc)"), "{s}");
     assert!(s.ends_with(&format!("result: ok\n{warning}\n")), "{s}");
     assert_eq!(fx.receipts(), 1);
     // The flag the warning names adopts it.
@@ -1545,14 +1545,15 @@ const AGENT_PLIST: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
 
 const AGENT_OP: &str = "life.agent@service";
 
-/// `op whoami` exits 0 only with the `signed-in` marker, and kills itself with the
-/// `whoami-killed` marker; `op inject` fills the one reference.
+/// `op whoami` exits 0 only with the `signed-in` marker and without a `signed-out-<account>`
+/// marker, and kills itself with the `whoami-killed` marker; `op inject` fills the one reference.
 const FAKE_OP: &str = r#"#!/bin/sh
 PATH=/usr/bin:/bin:$PATH
 here=$(dirname "$0")
 printf 'op %s\n' "$*" >> "$here/../log"
 [ -e "$here/../whoami-killed" ] && kill -KILL $$
 [ -e "$here/../signed-in" ] || { echo "[ERROR] no session" >&2; exit 1; }
+for a in "$@"; do [ -e "$here/../signed-out-$a" ] && { echo "[ERROR] no session" >&2; exit 1; }; done
 case "$1" in
   whoami) echo me; exit 0 ;;
   inject) sed 's|{{ op://vault/item/field }}|planted-value|' ;;
@@ -1950,6 +1951,108 @@ fn a_packages_scope_after_the_configuration_scope_probes_once_per_plan() {
     // recheck.
     let probes = l.log()[log.len()..].matches("\nbrew ruby ").count();
     assert_eq!(probes, 5, "{}", l.log());
+}
+
+#[test]
+fn a_secret_takeover_is_withheld_while_the_rest_of_the_run_continues() {
+    let l = Life::new();
+    // A second secret, new, for another account.
+    l.push_module(
+        "\n[[resources]]\nid = \"other\"\nkind = \"secret\"\nadapter = \"op-template/v1\"\ntarget = \".config/example/other.env\"\n[resources.value]\ntemplate = \"files/personal.env.tpl\"\naccount = \"other-account\"\nmode = 0o600\n",
+        &[],
+        "add a second secret",
+    );
+    // The first secret's destination exists and the ledger does not record it: a takeover.
+    let env = l.fx.h(".config/example/personal.env");
+    fs::create_dir_all(env.parent().unwrap()).unwrap();
+    fs::write(&env, "TOKEN=mine\n").unwrap();
+    fs::set_permissions(&env, fs::Permissions::from_mode(0o600)).unwrap();
+    // The takeover's account has no session; the new secret's account has one. The withheld
+    // takeover is not rendered, so its account does not make the run skip the other secret.
+    l.mark("signed-out-example-account");
+    let id = "life.token@.config/example/personal.env";
+    let warning = format!(
+        "warning: secrets withheld: {id}. Fix: review each, then run dfm sync --allow-adopt '{id}'"
+    );
+    let o = l.plain(&[]);
+    assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
+    let s = stdout(&o);
+    in_order(
+        &s,
+        &[
+            &format!("withheld: {id} (needs --allow-adopt)"),
+            "plan digest: ",
+            "  packages: ok",
+            "  secrets: ok",
+            "  services: ok",
+        ],
+    );
+    assert!(s.ends_with(&format!("result: ok\n{warning}\n")), "{s}");
+    assert!(!s.contains("skipped"), "{s}");
+    assert!(
+        !l.log().contains("whoami --account example-account"),
+        "{}",
+        l.log()
+    );
+    assert_eq!(fs::read_to_string(&env).unwrap(), "TOKEN=mine\n");
+    assert_eq!(
+        fs::read_to_string(l.fx.h(".config/example/other.env")).unwrap(),
+        "TOKEN=planted-value\n"
+    );
+    assert!(l.log().contains("launchctl bootstrap"), "{}", l.log());
+    // With the flag and a session the takeover renders.
+    fs::remove_file(l.fake.path().join("signed-out-example-account")).unwrap();
+    let o = l.plain(&["--allow-adopt", id]);
+    assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
+    assert!(stdout(&o).contains("  secrets: ok"), "{}", stdout(&o));
+    assert!(!stdout(&o).contains("warning:"), "{}", stdout(&o));
+    assert_eq!(fs::read_to_string(&env).unwrap(), "TOKEN=planted-value\n");
+}
+
+#[test]
+fn a_change_inside_a_withheld_operation_alone_is_stale() {
+    let l = Life::new();
+    // A secret takeover: withheld, and the only operation the change below touches.
+    let env = l.fx.h(".config/example/personal.env");
+    fs::create_dir_all(env.parent().unwrap()).unwrap();
+    fs::write(&env, "TOKEN=mine\n").unwrap();
+    fs::set_permissions(&env, fs::Permissions::from_mode(0o600)).unwrap();
+    let release = l.fake.path().join("release-withheld");
+    let point = format!("sync-before-lock:wait-{}", release.display());
+    let parked = l
+        .command(
+            &[("DFM_FAILPOINT", &point)],
+            &["sync", "--root", l.fx.root_arg()],
+        )
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let reached = release.with_extension("reached");
+    let end = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while !reached.exists() {
+        assert!(
+            std::time::Instant::now() < end,
+            "the failpoint was not reached"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    // The takeover's `path:` precondition records the mode; it stays a withheld takeover, and
+    // no operation that would run changes.
+    fs::set_permissions(&env, fs::Permissions::from_mode(0o640)).unwrap();
+    fs::write(&release, "go").unwrap();
+    let o = parked.wait_with_output().unwrap();
+    assert_eq!(code(&o), 3, "{}\n{}", stdout(&o), stderr(&o));
+    assert!(
+        stdout(&o).contains("withheld: life.token@.config/example/personal.env"),
+        "{}",
+        stdout(&o)
+    );
+    assert!(stderr(&o).contains("E_PLAN_STALE"), "{}", stderr(&o));
+    for effect in ["brew install", "launchctl bootstrap", "op inject"] {
+        assert!(!l.log().contains(effect), "the stale run ran {effect}");
+    }
+    assert_eq!(fs::read_to_string(&env).unwrap(), "TOKEN=mine\n");
 }
 
 #[test]
