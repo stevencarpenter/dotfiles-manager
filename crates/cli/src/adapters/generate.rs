@@ -569,13 +569,21 @@ fn link_producers(
 /// will write. Operations are in dependency order, so a producer comes before its consumer. A
 /// generation failure blocks the operation with a blocker that names the field and carries no
 /// content. A consumer of a blocked producer reports the producer's blocker as the cause.
-pub fn plan_outputs(plan: &mut Plan, resolved: &Resolved, sys: &Sys, home: &Dir) {
+/// Source files are read below `read_root` (`sync` plans a staged copy). Returns each generated
+/// output by folded path, so `sync` can review a service from the definition it will write.
+pub fn plan_outputs(
+    plan: &mut Plan,
+    resolved: &Resolved,
+    sys: &Sys,
+    home: &Dir,
+    read_root: &Path,
+) -> BTreeMap<String, Vec<u8>> {
     let generators = Generators::new(resolved);
     // Source files are read as apply reads them: below the opened source root, without
     // following a link, regular, owned by the user, one hard link (`Dir::read_input`). A source
     // that apply would refuse is refused here, as a blocker, not as a surprise at apply.
     let root = match plan.sources.as_slice() {
-        [one] => Dir::open_plain(std::path::Path::new(&one.root)).ok(),
+        [_] => Dir::open_plain(read_root).ok(),
         _ => None,
     };
     let source = |path: &str| -> Option<Vec<u8>> {
@@ -592,6 +600,7 @@ pub fn plan_outputs(plan: &mut Plan, resolved: &Resolved, sys: &Sys, home: &Dir)
         .filter_map(|b| Some((fold(b.path.as_deref()?), (b.code, b.detail.clone()))))
         .collect();
     let mut blockers = Vec::new();
+    let mut generated = BTreeMap::new();
     for i in 0..plan.operations.len() {
         let op = plan.operations[i].clone();
         if op.class != Class::Normal
@@ -621,6 +630,7 @@ pub fn plan_outputs(plan: &mut Plan, resolved: &Resolved, sys: &Sys, home: &Dir)
                     out.sets = (g.sets)(v);
                 }
                 if let Some(p) = &op.path {
+                    generated.insert(fold(p), bytes.clone());
                     made.insert(fold(p), bytes);
                 }
             }
@@ -632,6 +642,7 @@ pub fn plan_outputs(plan: &mut Plan, resolved: &Resolved, sys: &Sys, home: &Dir)
         }
     }
     plan.blockers.extend(blockers);
+    generated
 }
 
 fn live_equals(obs: &Observations, op: &Operation, hash: &str) -> bool {

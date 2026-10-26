@@ -271,7 +271,7 @@ pub(crate) fn probe(
             let staged = loaded
                 .staged
                 .as_deref()
-                .map(|t| (loaded.root.as_path(), t, &loaded.links));
+                .map(|t| (loaded.root.as_path(), t, &loaded.links, &loaded.generated));
             probed.service = crate::adapters::service::service_facts(
                 resolved,
                 &ctx.runner(sys),

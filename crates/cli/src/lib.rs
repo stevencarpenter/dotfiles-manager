@@ -554,6 +554,9 @@ struct Loaded {
     /// path (`dfm_model::fold`), as the file system compares paths. The
     /// services scope reads a definition at the target the configuration scope will publish.
     links: std::collections::BTreeMap<String, String>,
+    /// With `staged`: the bytes of each file the configuration plan generates, by its folded
+    /// path. The services scope reads a generated definition from these, not from HOME.
+    generated: std::collections::BTreeMap<String, Vec<u8>>,
     sources: dfm_model::resolve::SourceSet,
     resolved: dfm_model::resolve::Resolved,
 }
@@ -620,6 +623,7 @@ fn load_resolved_any_machine(ctx: &Ctx, root: Option<&Path>) -> Result<Loaded, R
         root,
         staged: None,
         links: Default::default(),
+        generated: Default::default(),
         sources,
         resolved,
     })

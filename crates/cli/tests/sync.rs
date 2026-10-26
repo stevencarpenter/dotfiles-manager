@@ -2080,6 +2080,54 @@ fn an_edited_definition_is_reviewed_from_staging_and_its_restart_runs() {
     in_order(&l.log(), &["launchctl bootout", "launchctl bootstrap"]);
 }
 
+#[test]
+fn a_generated_definition_the_configuration_changes_is_reviewed_from_its_new_bytes() {
+    // The agent's definition is a generated file (`text-fragments/v1`), not a link: the review
+    // reads the bytes the configuration scope will write, not the old HOME file.
+    let l = Life::unpublished();
+    let generated = LIFE.replace(
+        "kind = \"link\"\nadapter = \"fs-link/v1\"\ntarget = \"Library/LaunchAgents/org.example.agent.plist\"\n[resources.value]\nsource = \"files/org.example.agent.plist\"",
+        "kind = \"assemble\"\nadapter = \"text-fragments/v1\"\ntarget = \"Library/LaunchAgents/org.example.agent.plist\"\n[resources.value]\nbody = \"files/org.example.agent.plist\"\nfragments_dir = \".config/agent\"\npattern = \"*.frag\"\nseparator = \"\\n\"",
+    );
+    assert_ne!(generated, LIFE);
+    let seed = &l.fx.upstream.seed;
+    put(seed, "base/modules/life/module.toml", &generated);
+    l.fx.upstream.push("generate the agent definition");
+    let o = l.approved(&[]);
+    assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
+    let plist = l.fx.h("Library/LaunchAgents/org.example.agent.plist");
+    assert!(plist.is_file() && !plist.is_symlink());
+    assert!(l.log().contains("launchctl bootstrap"), "{}", l.log());
+    // Upstream changes the program; the owner asks for the restart that loads it.
+    put(
+        seed,
+        "base/modules/life/files/org.example.agent.plist",
+        &AGENT_PLIST.replace("/usr/bin/true", "/usr/bin/false"),
+    );
+    l.fx.upstream.push("the agent runs another program");
+    let flags = ["--restart", "life.agent", "--allow-disruptive", AGENT_OP];
+    let p = l.preview(&flags);
+    assert_eq!(code(&p), 0, "{}\n{}", stdout(&p), stderr(&p));
+    let s = stdout(&p);
+    assert!(s.contains("the definition runs /usr/bin/false"), "{s}");
+    assert!(!s.contains("the definition runs /usr/bin/true"), "{s}");
+    let log = l.log();
+    let o = l.sync(&digest_of(&p), &flags);
+    assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
+    let s = stdout(&o);
+    assert!(!s.contains("E_PLAN_STALE"), "{s}");
+    in_order(&s, &["  config: ok", "  services: ok", "result: ok"]);
+    assert!(
+        fs::read_to_string(&plist)
+            .unwrap()
+            .contains("/usr/bin/false")
+    );
+    in_order(
+        &l.log()[log.len()..],
+        &["launchctl bootout", "launchctl bootstrap"],
+    );
+}
+
 /// A brew service `bar` and the link of its configuration file to `files/<source>`.
 fn bar_module(source: &str) -> String {
     format!(

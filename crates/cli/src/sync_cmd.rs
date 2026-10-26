@@ -10,7 +10,7 @@
 //! the pin is never rewritten.
 
 use crate::adapters::secret;
-use crate::plan_cmd::{plan_for, render_body};
+use crate::plan_cmd::{plan_for, plan_with_outputs, render_body};
 use crate::read_fs::read_regular_bounded;
 use crate::source_fs::load_scoped;
 use crate::{
@@ -1164,20 +1164,20 @@ fn needs(plan: &Plan, kind: Allowance, id: &str) -> bool {
 }
 
 /// Plans one scope of the tree `loaded` holds as its own command plans it, with the providers
-/// probed read-only.
+/// probed read-only, and the bytes of each file the plan generates (`plan_with_outputs`).
 fn plan_scope(
     ctx: &Ctx,
     sys: &Sys,
     args: &Args,
     scope: Scope,
     loaded: &Loaded,
-) -> Result<Plan, Refusal> {
+) -> Result<(Plan, BTreeMap<String, Vec<u8>>), Refusal> {
     let probed = apply_cmd::probe(ctx, sys, &scope_args(args, scope, None), loaded)?;
-    let plan = plan_for(ctx, loaded, scope, probed)?;
+    let (plan, generated) = plan_with_outputs(ctx, loaded, scope, probed)?;
     if scope == Scope::Services {
         apply_cmd::check_restart(&args.restart, &plan)?;
     }
-    Ok(plan)
+    Ok((plan, generated))
 }
 
 /// Resolves and plans the staged tree as the tree `root` will hold after publication: the
@@ -1198,6 +1198,7 @@ fn plan_staged(
         root: root.to_path_buf(),
         staged: Some(tree.to_path_buf()),
         links: BTreeMap::new(),
+        generated: BTreeMap::new(),
         sources,
         resolved,
     };
@@ -1207,8 +1208,9 @@ fn plan_staged(
     let sys = ctx.sys()?;
     let mut plans: Vec<ScopePlan> = Vec::new();
     for scope in SCOPES {
-        let plan = plan_scope(ctx, &sys, args, scope, &loaded)?;
+        let (plan, generated) = plan_scope(ctx, &sys, args, scope, &loaded)?;
         if scope == Scope::Config {
+            loaded.generated = generated;
             loaded.links = plan
                 .operations
                 .iter()

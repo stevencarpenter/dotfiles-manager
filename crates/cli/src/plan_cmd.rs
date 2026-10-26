@@ -132,7 +132,17 @@ pub fn plan_for(
     scope: Scope,
     probed: impl Into<Probed>,
 ) -> Result<Plan, Refusal> {
-    let probed = probed.into();
+    plan_with_outputs(ctx, loaded, scope, probed.into()).map(|(plan, _)| plan)
+}
+
+/// As [`plan_for`], with the generated output of each planned file by folded path
+/// (`adapters::plan_outputs`).
+pub(crate) fn plan_with_outputs(
+    ctx: &Ctx,
+    loaded: &Loaded,
+    scope: Scope,
+    probed: Probed,
+) -> Result<(Plan, BTreeMap<String, Vec<u8>>), Refusal> {
     let layout = ctx.layout();
     let sys = ctx.sys()?;
     // Ownership decides what may be replaced. Without state it is unknown, so planning fails
@@ -222,9 +232,10 @@ pub fn plan_for(
     };
     let mut plan = plan::build(&loaded.resolved, &cx, &obs)?;
     // Generated output hashes, from the same adapters apply runs.
-    crate::adapters::plan_outputs(&mut plan, &loaded.resolved, &sys, &home);
+    let generated =
+        crate::adapters::plan_outputs(&mut plan, &loaded.resolved, &sys, &home, loaded.read_root());
     mark_excluded(&mut plan, &loaded.sources);
-    Ok(plan)
+    Ok((plan, generated))
 }
 
 /// Marks each operation whose directory source holds entries that `[sources].exclude` left
