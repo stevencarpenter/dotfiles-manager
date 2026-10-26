@@ -258,6 +258,13 @@ impl Fx {
         self.run(&["sync", "--root", self.root_arg(), "--yes-plan", digest])
     }
 
+    /// `sync` without a digest: the daily run (DFM-76).
+    fn plain(&self, flags: &[&str]) -> Output {
+        let mut a = vec!["sync", "--root", self.root_arg()];
+        a.extend_from_slice(flags);
+        self.run(&a)
+    }
+
     /// Preview, then sync with the previewed digest. Returns the sync output.
     fn sync_approved(&self) -> Output {
         let p = self.preview();
@@ -287,6 +294,18 @@ impl Fx {
         fs::read_dir(self.h(".local/state/dotfiles-manager/state/receipts"))
             .map(|d| d.count())
             .unwrap_or(0)
+    }
+
+    /// Every receipt, oldest first.
+    fn receipt_docs(&self) -> Vec<serde_json::Value> {
+        let Ok(dir) = fs::read_dir(self.h(".local/state/dotfiles-manager/state/receipts")) else {
+            return Vec::new();
+        };
+        let mut v: Vec<serde_json::Value> = dir
+            .map(|e| serde_json::from_slice(&fs::read(e.unwrap().path()).unwrap()).unwrap())
+            .collect();
+        v.sort_by_key(|r| r["started_at"].as_str().unwrap().to_string());
+        v
     }
 
     fn grants(&self) -> String {
@@ -352,10 +371,17 @@ fn lock_for(sources: &[(&str, Option<&str>, &str)]) -> String {
 #[test]
 fn an_untrusted_origin_is_refused_before_any_fetch_and_a_grant_is_explicit() {
     let fx = Fx::ungranted();
-    let o = fx.preview();
-    assert_eq!(code(&o), 3, "{}", stderr(&o));
-    assert!(stderr(&o).contains("E_SOURCE_UNTRUSTED"), "{}", stderr(&o));
-    assert!(stderr(&o).contains("nothing was fetched"), "{}", stderr(&o));
+    // The daily run without a digest refuses the same way and names the command to run.
+    for o in [fx.preview(), fx.plain(&[])] {
+        assert_eq!(code(&o), 3, "{}", stderr(&o));
+        assert!(stderr(&o).contains("E_SOURCE_UNTRUSTED"), "{}", stderr(&o));
+        assert!(stderr(&o).contains("nothing was fetched"), "{}", stderr(&o));
+        assert!(
+            stderr(&o).contains(&format!("run sync --trust-origin {}", fx.origin())),
+            "{}",
+            stderr(&o)
+        );
+    }
     assert!(!fx.staging().exists(), "a staging directory was created");
     assert!(fx.grants().is_empty());
     // --preview cannot grant, and --yes-plan cannot grant.
@@ -494,15 +520,18 @@ fn a_sync_that_changes_nothing_needs_no_approval() {
     assert!(s.contains("nothing to change: no approval needed"), "{s}");
     assert!(s.ends_with("result: ok\n"), "{s}");
     assert_eq!(fx.receipts(), 1, "a no-op sync wrote a receipt");
-    // A new upstream commit is a publication, so it needs the digest even when no
-    // operation changes.
+    // A new upstream commit is a publication: a plain sync publishes it, and no scope has
+    // anything to do, so no receipt is written.
     let seed = &fx.upstream.seed;
     put(seed, "README.md", "notes\n");
     let head = fx.upstream.push("docs only");
-    let o = fx.run(&["sync", "--root", fx.root_arg()]);
-    assert_eq!(code(&o), 3, "{}\n{}", stdout(&o), stderr(&o));
-    assert!(stderr(&o).contains("E_APPROVAL_REQUIRED"), "{}", stderr(&o));
-    assert_ne!(fx.head(), head, "the checkout moved without approval");
+    let o = fx.plain(&[]);
+    assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
+    let s = stdout(&o);
+    assert!(!s.contains("no approval needed"), "{s}");
+    in_order(&s, &["published: src0 ", "  config: current", "result: ok"]);
+    assert_eq!(fx.head(), head);
+    assert_eq!(fx.receipts(), 1);
 }
 
 #[test]
@@ -697,7 +726,124 @@ fn a_local_edit_the_update_would_overwrite_is_refused_and_kept() {
 }
 
 #[test]
-fn declined_approval_changes_nothing() {
+fn a_plain_sync_publishes_and_applies_without_a_digest() {
+    let fx = Fx::new();
+    put(
+        &fx.upstream.seed,
+        "base/modules/extra/files/zshrc",
+        "export A=3\n",
+    );
+    let head = fx.upstream.push("upstream zshrc");
+    let o = fx.plain(&[]);
+    assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
+    let s = stdout(&o);
+    in_order(
+        &s,
+        &[
+            "plan digest: ",
+            "published: src0 ",
+            "  config: ok",
+            "result: ok\n",
+        ],
+    );
+    assert!(!s.contains("warning:"), "{s}");
+    assert_eq!(fx.head(), head);
+    assert!(fx.h(".zshrc").is_symlink());
+    let r = fx.receipt_docs();
+    assert_eq!(r.len(), 1);
+    assert_eq!(r[0]["approval"]["kind"], "unattended", "{}", r[0]);
+    assert!(
+        fx.staging_leftovers().is_empty(),
+        "{:?}",
+        fx.staging_leftovers()
+    );
+}
+
+#[test]
+fn a_deselected_module_s_owned_outputs_are_removed_without_a_flag() {
+    let fx = Fx::new();
+    let o = fx.plain(&[]);
+    assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
+    assert!(fx.h(".zshrc").is_symlink());
+    put(
+        &fx.upstream.seed,
+        "profiles/t-01.toml",
+        &common::PROFILE.replace("modules = [\"extra\"]", "modules = []"),
+    );
+    fx.upstream.push("drop extra");
+    let o = fx.plain(&[]);
+    assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
+    let s = stdout(&o);
+    assert!(s.contains("  config: ok"), "{s}");
+    for gone in [".zshrc", ".config/tmux/tmux.conf"] {
+        assert!(fs::symlink_metadata(fx.h(gone)).is_err(), "{gone} stayed");
+    }
+    assert!(fx.h(".config/git/config").is_symlink());
+    // The removal ran under the run's own approval: no per-operation flag is recorded.
+    let r = fx.receipt_docs();
+    let last = r.last().unwrap();
+    assert_eq!(last["approval"]["kind"], "unattended", "{last}");
+    assert!(
+        last["approvals"].as_array().is_none_or(Vec::is_empty),
+        "{last}"
+    );
+}
+
+#[test]
+fn an_unowned_link_in_the_way_is_not_adopted_and_the_warning_names_its_flag() {
+    let fx = Fx::new();
+    std::os::unix::fs::symlink(
+        fx.root.join("base/modules/extra/files/zshrc"),
+        fx.h(".zshrc"),
+    )
+    .unwrap();
+    let warning = "warning: config held back: extra.zsh@.zshrc. Fix: review each, then run dfm sync --allow-adopt 'extra.zsh@.zshrc'";
+    let o = fx.plain(&[]);
+    assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
+    let s = stdout(&o);
+    in_order(
+        &s,
+        &[
+            "planned extra.zsh@.zshrc",
+            "held back: extra.zsh@.zshrc (needs --allow-adopt)",
+            "plan digest: ",
+            "  config: ok",
+            "result: ok\n",
+        ],
+    );
+    assert!(s.ends_with(&format!("result: ok\n{warning}\n")), "{s}");
+    // The rest ran; the adoption did not, so the ledger still does not own the link.
+    assert!(fx.h(".config/tmux/tmux.conf").is_symlink());
+    let r = fx.receipt_docs();
+    assert_eq!(r.len(), 1);
+    let ops = r[0]["operations"].as_array().unwrap();
+    assert!(
+        ops.iter().all(|op| op["id"] != "extra.zsh@.zshrc"),
+        "{}",
+        r[0]
+    );
+    // The next plain run has only the held adoption: it changes nothing and warns again.
+    let o = fx.plain(&[]);
+    assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
+    let s = stdout(&o);
+    assert!(s.contains("nothing to change: no approval needed"), "{s}");
+    assert!(s.contains("  config: held back (extra.zsh@.zshrc)"), "{s}");
+    assert!(s.ends_with(&format!("result: ok\n{warning}\n")), "{s}");
+    assert_eq!(fx.receipts(), 1);
+    // The flag the warning names adopts it.
+    let o = fx.plain(&["--allow-adopt", "extra.zsh@.zshrc"]);
+    assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
+    assert!(!stdout(&o).contains("warning:"), "{}", stdout(&o));
+    let r = fx.receipt_docs();
+    let last = r.last().unwrap();
+    assert_eq!(last["approvals"][0]["how"], "allow_adopt", "{last}");
+    let o = fx.plain(&[]);
+    assert!(stdout(&o).contains("  config: current"), "{}", stdout(&o));
+    assert!(!stdout(&o).contains("warning:"), "{}", stdout(&o));
+}
+
+#[test]
+fn a_change_between_the_printed_plan_and_the_locked_plan_is_stale() {
     let fx = Fx::new();
     let old = fx.head();
     put(
@@ -705,20 +851,55 @@ fn declined_approval_changes_nothing() {
         "base/modules/extra/files/zshrc",
         "export A=3\n",
     );
-    fx.upstream.push("upstream zshrc");
-    let o = fx.run(&["sync", "--root", fx.root_arg()]);
+    fx.upstream.push("first");
+    let release = fx.work.path().join("release-lock");
+    // The run prints its plan, then parks before it takes the writer lock.
+    let parked = Command::new(BIN)
+        .env_clear()
+        .env("DFM_PROVIDER_PATH", "/usr/bin:/bin")
+        .env(
+            "DFM_FAILPOINT",
+            format!("sync-before-lock:wait-{}", release.display()),
+        )
+        .args([
+            "--home",
+            fx.home.path().to_str().unwrap(),
+            "sync",
+            "--root",
+            fx.root_arg(),
+        ])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let reached = release.with_extension("reached");
+    let end = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while !reached.exists() {
+        assert!(
+            std::time::Instant::now() < end,
+            "the failpoint was not reached"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    put(
+        &fx.upstream.seed,
+        "base/modules/extra/files/zshrc",
+        "export A=4\n",
+    );
+    fx.upstream.push("second");
+    fs::write(&release, "go").unwrap();
+    let o = parked.wait_with_output().unwrap();
     assert_eq!(code(&o), 3, "{}\n{}", stdout(&o), stderr(&o));
-    assert!(stderr(&o).contains("E_APPROVAL_REQUIRED"), "{}", stderr(&o));
-    assert!(stdout(&o).contains("plan digest: "), "{}", stdout(&o));
-    assert!(stdout(&o).contains("result: blocked"), "{}", stdout(&o));
+    assert!(stderr(&o).contains("E_PLAN_STALE"), "{}", stderr(&o));
+    assert!(
+        stderr(&o).contains("the plan changed after it was printed"),
+        "{}",
+        stderr(&o)
+    );
+    assert!(stderr(&o).contains("run dfm sync again"), "{}", stderr(&o));
     assert_eq!(fx.head(), old);
     assert!(!fx.h(".zshrc").exists());
     assert_eq!(fx.receipts(), 0);
-    assert!(
-        fx.staging_leftovers().is_empty(),
-        "{:?}",
-        fx.staging_leftovers()
-    );
 }
 
 #[test]
@@ -1542,6 +1723,13 @@ impl Life {
         self.run(&a)
     }
 
+    /// `sync` without a digest, with the look-alikes.
+    fn plain(&self, flags: &[&str]) -> Output {
+        let mut a = vec!["sync", "--root", self.fx.root_arg()];
+        a.extend_from_slice(flags);
+        self.run(&a)
+    }
+
     /// Preview, then sync with the previewed digest.
     fn approved(&self, flags: &[&str]) -> Output {
         let p = self.preview(flags);
@@ -1632,22 +1820,11 @@ impl Life {
 
     /// The `command` of each receipt, oldest first.
     fn receipt_commands(&self) -> Vec<String> {
-        let Ok(dir) = fs::read_dir(self.fx.h(".local/state/dotfiles-manager/state/receipts"))
-        else {
-            return Vec::new();
-        };
-        let mut v: Vec<(String, String)> = dir
-            .map(|e| {
-                let r: serde_json::Value =
-                    serde_json::from_slice(&fs::read(e.unwrap().path()).unwrap()).unwrap();
-                (
-                    r["started_at"].as_str().unwrap().to_string(),
-                    r["command"].as_str().unwrap().to_string(),
-                )
-            })
-            .collect();
-        v.sort();
-        v.into_iter().map(|(_, c)| c).collect()
+        self.fx
+            .receipt_docs()
+            .iter()
+            .map(|r| r["command"].as_str().unwrap().to_string())
+            .collect()
     }
 }
 
@@ -1713,12 +1890,49 @@ fn sync_runs_configuration_packages_secrets_and_services_in_order_under_one_appr
         fs::read_to_string(l.fx.h(".config/example/personal.env")).unwrap(),
         "TOKEN=planted-value\n"
     );
-    // Each scope wrote its own receipt, in run order.
+    // Each scope wrote its own receipt, in run order, approved by the digest.
     let after = l.receipt_commands();
     assert_eq!(
         after[before.len()..],
         ["apply", "packages", "secrets", "services"]
     );
+    for r in &l.fx.receipt_docs()[before.len()..] {
+        assert_eq!(r["approval"]["kind"], "yes_plan", "{r}");
+    }
+}
+
+#[test]
+fn a_plain_sync_runs_every_scope_without_a_digest() {
+    let l = Life::new();
+    l.push_link();
+    let before = l.receipt_commands();
+    let o = l.plain(&[]);
+    assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
+    let s = stdout(&o);
+    in_order(
+        &s,
+        &[
+            "plan digest: ",
+            "published: src0 ",
+            "  config: ok",
+            "  packages: ok",
+            "  secrets: ok",
+            "  services: ok",
+        ],
+    );
+    assert!(s.ends_with("result: ok\n"), "{s}");
+    in_order(
+        &l.log(),
+        &["brew install", "op inject", "launchctl bootstrap"],
+    );
+    assert!(l.fx.h(".config/life/notes").is_symlink());
+    assert_eq!(
+        l.receipt_commands()[before.len()..],
+        ["apply", "packages", "secrets", "services"]
+    );
+    for r in &l.fx.receipt_docs()[before.len()..] {
+        assert_eq!(r["approval"]["kind"], "unattended", "{r}");
+    }
 }
 
 #[test]
@@ -1914,21 +2128,18 @@ fn a_changed_secret_mode_is_not_a_no_op() {
 }
 
 #[test]
-fn restart_is_forwarded_to_the_services_scope_and_needs_its_approval() {
+fn restart_is_forwarded_to_the_services_scope_and_runs_only_when_named() {
     let l = Life::new();
     let o = l.approved(&[]);
     assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
     let o = l.preview(&["--restart", "nope"]);
     assert_eq!(code(&o), 2, "{}\n{}", stdout(&o), stderr(&o));
-    // The restart is disruptive: the flag to paste is listed and nothing runs.
-    let o = l.preview(&["--restart", "life.agent"]);
-    assert_eq!(code(&o), 3, "{}\n{}", stdout(&o), stderr(&o));
-    assert!(
-        stdout(&o).contains(&format!("--allow-disruptive '{AGENT_OP}'")),
-        "{}",
-        stdout(&o)
-    );
-    let flags = ["--restart", "life.agent", "--allow-disruptive", AGENT_OP];
+    // A plain run never restarts a running service on its own.
+    let o = l.plain(&[]);
+    assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
+    assert!(!l.log().contains("launchctl bootout"), "{}", l.log());
+    // --restart is the approval: no --allow-disruptive flag is needed.
+    let flags = ["--restart", "life.agent"];
     let p = l.preview(&flags);
     assert_eq!(code(&p), 0, "{}\n{}", stdout(&p), stderr(&p));
     // The digest covers the restart: without it the approval is stale.
@@ -1936,7 +2147,7 @@ fn restart_is_forwarded_to_the_services_scope_and_needs_its_approval() {
     assert_eq!(code(&o), 3, "{}\n{}", stdout(&o), stderr(&o));
     assert!(stderr(&o).contains("E_PLAN_STALE"), "{}", stderr(&o));
     assert!(!l.log().contains("launchctl bootout"), "{}", l.log());
-    let o = l.sync(&digest_of(&p), &flags);
+    let o = l.plain(&flags);
     assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
     in_order(&l.log(), &["launchctl bootout", "launchctl bootstrap"]);
     assert!(stdout(&o).contains("  services: ok"), "{}", stdout(&o));
@@ -2763,14 +2974,15 @@ fn a_refused_sync_ends_with_its_refusal_not_the_warnings() {
     let l = Life::new();
     l.sign_in(false);
     l.push_link();
-    // Approval is required: the plans list the skipped secrets, and no warning follows.
-    let o = l.run(&["sync", "--root", l.fx.root_arg()]);
+    // A digest that is not this run's is refused: the plans list the skipped secrets, and no
+    // warning follows.
+    let o = l.sync(&"0".repeat(64), &[]);
     assert_eq!(code(&o), 3, "{}\n{}", stdout(&o), stderr(&o));
     let s = stdout(&o);
     assert!(s.contains("skipped: no session life.token"), "{s}");
     assert!(s.ends_with("result: blocked\n"), "{s}");
     assert!(!s.contains("warning:"), "{s}");
-    assert!(stderr(&o).contains("E_APPROVAL_REQUIRED"), "{}", stderr(&o));
+    assert!(stderr(&o).contains("E_PLAN_STALE"), "{}", stderr(&o));
 }
 
 #[test]

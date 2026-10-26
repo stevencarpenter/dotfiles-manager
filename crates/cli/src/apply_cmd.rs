@@ -17,7 +17,7 @@ use dfm_engine::{
     check_journal_capacity, gates, now_ns,
 };
 use dfm_model::display::{visible, visible_for_paste};
-use dfm_model::plan::Scope;
+use dfm_model::plan::{Action, Ownership, Plan, Scope, Status as PlanStatus};
 use dfm_model::state::{
     Approval, BinaryId, DisruptiveApproval, ProfileRef, Receipt, RunResult, SCHEMA, SourceId,
     Stamp, Status, count_statuses, rfc3339,
@@ -43,12 +43,16 @@ pub struct Args {
     /// `services --restart <resource-id>`: current services to plan as a disruptive restart.
     pub restart: BTreeSet<String>,
     /// A scope of `sync` (docs/sync.md): sync printed the plan and prints the result line, so
-    /// this run prints neither, and its report omits the `not_in_scope` operations.
+    /// this run prints neither, and its report omits the `not_in_scope` operations. A removal of
+    /// an owned output and a restart that `--restart` names need no flag, and an adoption or
+    /// takeover without its `--allow-adopt` id is held back (`by_rule`, `held`).
     pub(crate) composed: bool,
     /// A later scope of `sync`: the plan sync made of this scope after the earlier scopes, from
     /// the sources this run reads. The first look uses it instead of probing again; the plan
     /// under the lock is still made and compared with the approved digest.
     pub(crate) planned: Option<dfm_model::plan::Plan>,
+    /// A `sync` scope of a run without `--yes-plan`: the receipt approval kind is `unattended`.
+    pub(crate) unattended: bool,
 }
 
 /// `apply [--root <dir>] [-y|--yes-plan <digest>] [--allow-disruptive <operation-id>]...
@@ -115,6 +119,7 @@ pub fn parse_args(args: &[String], scope: Scope) -> Result<Args, Refusal> {
         restart,
         composed: false,
         planned: None,
+        unattended: false,
     })
 }
 
@@ -171,6 +176,49 @@ fn counts_line(counts: &BTreeMap<Status, u32>) -> String {
     line
 }
 
+/// The operations a `sync` scope runs without a flag (docs/sync.md): a removal of an output the
+/// ledger proves the manager owns, and a restart that `--restart` names. Empty for every other
+/// command.
+fn by_rule(args: &Args, plan: &Plan) -> BTreeSet<String> {
+    plan.operations
+        .iter()
+        .filter(|o| args.composed && o.status == PlanStatus::Planned)
+        .filter(|o| match o.action {
+            Action::Remove => o.ownership == Ownership::Owned,
+            Action::Restart => args.restart.contains(&o.resource),
+            _ => false,
+        })
+        .map(|o| o.id.clone())
+        .collect()
+}
+
+/// The operations a `sync` scope does not run (docs/sync.md): each planned adoption or takeover
+/// without its `--allow-adopt` id, and every operation that runs after one. Empty for every
+/// other command, which refuses such a plan instead.
+pub(crate) fn held(args: &Args, plan: &Plan) -> BTreeSet<String> {
+    let mut held: BTreeSet<String> = plan
+        .operations
+        .iter()
+        .filter(|o| args.composed && o.status == PlanStatus::Planned)
+        .filter(|o| Allowance::of(o) == Some(Allowance::Adopt) && !args.allow_adopt.contains(&o.id))
+        .map(|o| o.id.clone())
+        .collect();
+    // The plan lists an operation after the ones it runs after, so one pass takes the chains.
+    for o in &plan.operations {
+        if o.after.iter().any(|a| held.contains(a)) {
+            held.insert(o.id.clone());
+        }
+    }
+    held
+}
+
+/// `plan` without the operations `ids` names.
+pub(crate) fn without(plan: &Plan, ids: &BTreeSet<String>) -> Plan {
+    let mut p = plan.clone();
+    p.operations.retain(|o| !ids.contains(&o.id));
+    p
+}
+
 /// The checks between the printed plan and the writer lock, shared with `sync`: the approved
 /// digest must be the plan's, the plan must have no blocker, the gates that need no write must
 /// pass, the `--allow-*` sets must equal the plan's, and the journal must have room. A refusal
@@ -179,7 +227,7 @@ fn counts_line(counts: &BTreeMap<Status, u32>) -> String {
 pub(crate) fn check_before_lock(
     ctx: &Ctx,
     args: &Args,
-    plan: &dfm_model::plan::Plan,
+    plan: &Plan,
     digest: &str,
     generator: &dyn Generator,
     out: &mut dyn Write,
@@ -196,6 +244,8 @@ pub(crate) fn check_before_lock(
     if let Some(b) = plan.blockers.first() {
         return Err(b.refusal());
     }
+    // The gates check the operations that will run: a held one does not.
+    let plan = &without(plan, &held(args, plan));
     // The gates that need no write run before the lock and in a preview, so a plan that apply
     // would refuse is refused here with the same code.
     let g = gates(plan, generator);
@@ -204,7 +254,8 @@ pub(crate) fn check_before_lock(
     }
     // An id that names no operation of its kind is a usage error and wins over a missing
     // approval. A missing approval is refused with every missing flag printed to paste.
-    if let Err(all) = check_allowances(&g, &args.allow, &args.allow_adopt) {
+    let allow: BTreeSet<String> = args.allow.union(&by_rule(args, plan)).cloned().collect();
+    if let Err(all) = check_allowances(&g, &allow, &args.allow_adopt) {
         for e in all.iter().filter(|e| e.code != Code::Usage) {
             writeln!(out, "{}", visible_for_paste(&e.detail)).map_err(w)?;
         }
@@ -228,7 +279,7 @@ pub(crate) fn check_before_lock(
 /// would. Returns whether it ended.
 pub(crate) fn end_without_change(
     args: &Args,
-    plan: &dfm_model::plan::Plan,
+    plan: &Plan,
     journal_open: bool,
     color: bool,
     out: &mut dyn Write,
@@ -287,10 +338,7 @@ pub(crate) fn probe(
 
 /// A restart request must name a service of the plan, as an approval flag must name an
 /// operation: a misspelled id would otherwise be ignored.
-pub(crate) fn check_restart(
-    restart: &BTreeSet<String>,
-    plan: &dfm_model::plan::Plan,
-) -> Result<(), Refusal> {
+pub(crate) fn check_restart(restart: &BTreeSet<String>, plan: &Plan) -> Result<(), Refusal> {
     match restart.iter().find(|r| {
         !plan
             .operations
@@ -431,6 +479,9 @@ fn run_inner(
     if locked_digest != digest {
         return Err(store.stamp(stale(approved, &locked_digest)));
     }
+    // The digest covers the whole plan, held operations included; only the rest runs.
+    let locked = without(&locked, &held(args, &locked));
+    let allow: BTreeSet<String> = args.allow.union(&by_rule(args, &locked)).cloned().collect();
     let home = Dir::open_home(&sys, &layout.home).map_err(|r| store.stamp(r))?;
     let generator = generators(&second);
     let run = Run {
@@ -439,7 +490,7 @@ fn run_inner(
         home: &home,
         home_path: home.shown(),
         generator: &generator,
-        allow: &args.allow,
+        allow: &allow,
         allow_adopt: &args.allow_adopt,
         fail: &fail,
     };
@@ -543,7 +594,12 @@ fn run_inner(
             machine_id: stamp.machine_id,
             plan_digest: Some(digest.clone()),
             approval: Some(Approval {
-                kind: "yes_plan".into(),
+                kind: if args.unattended {
+                    "unattended"
+                } else {
+                    "yes_plan"
+                }
+                .into(),
                 plan_digest: digest.clone(),
                 at: rfc3339(started),
             }),

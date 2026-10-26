@@ -1008,6 +1008,9 @@ struct ScopePlan {
     /// yet, while the configuration plan publishes it: they are planned after that scope. Each
     /// is reviewed as a start, or as a restart when `--restart` names it.
     deferred: BTreeMap<String, Action>,
+    /// The adoptions and takeovers without their `--allow-adopt` id, and what runs after them:
+    /// the scope runs without them (`apply_cmd::held`).
+    held: BTreeSet<String>,
 }
 
 impl ScopePlan {
@@ -1072,11 +1075,41 @@ impl ScopePlan {
         out
     }
 
-    /// The end-of-output warnings of a skipped or blocked scope (docs/sync.md). A secrets scope
-    /// can be both: the blocked resources, with their corrections, and the secrets skipped for
-    /// want of a session each get a warning, since unlocking clears only the second.
+    /// The plan without the held operations: what the scope runs.
+    fn runnable(&self) -> Plan {
+        apply_cmd::without(&self.plan, &self.held)
+    }
+
+    /// Whether the scope has nothing to run, held operations aside.
+    fn changes_nothing(&self) -> bool {
+        self.runnable().changes_nothing()
+    }
+
+    /// The summary status of a scope with nothing to run.
+    fn idle(&self) -> String {
+        match self.held.is_empty() {
+            true => "current".into(),
+            false => format!("held back ({})", visible(&self.held_ids().join(", "))),
+        }
+    }
+
+    /// The held operations in plan order.
+    fn held_ids(&self) -> Vec<String> {
+        self.plan
+            .operations
+            .iter()
+            .filter(|o| self.held.contains(&o.id))
+            .map(|o| o.id.clone())
+            .collect()
+    }
+
+    /// The end-of-output warnings of a skipped, blocked or held back scope (docs/sync.md). A
+    /// secrets scope can be both blocked and skipped: the blocked resources, with their
+    /// corrections, and the secrets skipped for want of a session each get a warning, since
+    /// unlocking clears only the second.
     fn warnings(&self) -> Vec<String> {
         let mut out: Vec<String> = self.blocked_warning().into_iter().collect();
+        out.extend(self.held_warning());
         if !self.skipped.is_empty() {
             out.push(skipped_warning(
                 &self.skipped,
@@ -1085,6 +1118,26 @@ impl ScopePlan {
             ));
         }
         out
+    }
+
+    /// The warning of a scope that runs without its held operations, if any.
+    fn held_warning(&self) -> Option<String> {
+        if self.blocked || self.held.is_empty() {
+            return None;
+        }
+        let flags: Vec<String> = self
+            .plan
+            .operations
+            .iter()
+            .filter(|o| self.held.contains(&o.id) && Allowance::of(o) == Some(Allowance::Adopt))
+            .map(|o| dfm_engine::flag(Allowance::Adopt, &o.id))
+            .collect();
+        Some(format!(
+            "{} held back: {}. Fix: review each, then run dfm sync {}",
+            self.scope.as_str(),
+            visible(&self.held_ids().join(", ")),
+            visible_for_paste(&flags.join(" "))
+        ))
     }
 
     fn blocked_warning(&self) -> Option<String> {
@@ -1160,6 +1213,7 @@ fn scope_args(args: &Args, scope: Scope, plan: Option<&Plan>) -> apply_cmd::Args
             _ => BTreeSet::new(),
         },
         composed: true,
+        unattended: args.apply.yes_plan.is_none(),
         ..args.apply.clone()
     }
 }
@@ -1216,10 +1270,20 @@ fn plan_staged(
     let sys = ctx.sys()?;
     let mut plans: Vec<ScopePlan> = Vec::new();
     for scope in SCOPES {
-        let (plan, generated) = plan_scope(ctx, &sys, args, scope, &loaded)?;
+        let (plan, mut generated) = plan_scope(ctx, &sys, args, scope, &loaded)?;
+        let held = apply_cmd::held(&scope_args(args, scope, Some(&plan)), &plan);
         if scope == Scope::Config {
+            // A held operation publishes nothing: the services scope reads HOME at its path.
+            let runnable = apply_cmd::without(&plan, &held);
+            let unwritten: BTreeSet<String> = plan
+                .operations
+                .iter()
+                .filter(|o| held.contains(&o.id))
+                .filter_map(|o| o.path.as_deref().map(dfm_model::fold::fold))
+                .collect();
+            generated.retain(|path, _| !unwritten.contains(path));
             loaded.generated = generated;
-            loaded.links = plan
+            loaded.links = runnable
                 .operations
                 .iter()
                 .filter(|o| o.status == PlanStatus::Planned)
@@ -1228,7 +1292,7 @@ fn plan_staged(
         }
         // Re-renders alone are not worth a vault contact on a run that changes nothing else.
         let no_session = match scope {
-            Scope::Secrets if !rerenders_only(&plan) => {
+            Scope::Secrets if !rerenders_only(&apply_cmd::without(&plan, &held)) => {
                 secret::missing_sessions(&plan, &loaded.resolved, &ctx.runner(&sys))?
             }
             _ => Vec::new(),
@@ -1265,6 +1329,7 @@ fn plan_staged(
             no_session,
             blocked,
             deferred,
+            held,
         });
     }
     Ok((loaded, plans))
@@ -1337,6 +1402,18 @@ fn show(
                 "{} this scope does not run: {}",
                 paint::style(color, "1;31", "blocked:"),
                 visible(&p.blocked_ops().join(", "))
+            )?;
+        }
+        for o in p.plan.operations.iter().filter(|o| p.held.contains(&o.id)) {
+            let why = match Allowance::of(o) {
+                Some(Allowance::Adopt) => "needs --allow-adopt",
+                _ => "runs after a held operation",
+            };
+            writeln!(
+                out,
+                "{} {} ({why})",
+                paint::style(color, "33", "held back:"),
+                visible(&o.id)
             )?;
         }
     }
@@ -1876,8 +1953,8 @@ fn run_inner(
         && previewed.iter().all(|s| s.old.as_ref() == Some(&s.new))
         && plans.iter().all(|p| {
             not_run(p).is_some()
-                || p.plan.changes_nothing()
-                || (p.scope == Scope::Secrets && rerenders_only(&p.plan))
+                || p.changes_nothing()
+                || (p.scope == Scope::Secrets && rerenders_only(&p.runnable()))
         })
     {
         writeln!(
@@ -1891,7 +1968,7 @@ fn run_inner(
             .map(|p| {
                 let status = match not_run(p) {
                     Some(s) => s,
-                    None if p.plan.changes_nothing() => "current".into(),
+                    None if p.changes_nothing() => p.idle(),
                     None => "current, not rendered again (dfm secrets renders them)".into(),
                 };
                 (p.scope, status)
@@ -1899,16 +1976,17 @@ fn run_inner(
             .collect();
         return finish(ctx, &lines, Ok(()), out, printed);
     }
-    let Some(approved) = &args.apply.yes_plan else {
+    // Without a digest the run approves the plan it printed (DFM-76). A run that grants an
+    // origin stops here: the owner reviews what the new origin brings first.
+    if args.apply.yes_plan.is_none() && !args.trust.is_empty() {
         return Err(Refusal::new(
             Code::ApprovalRequired,
-            format!(
-                "nothing was changed. Fix: read the plan above, then run again with --yes-plan {digest}"
-            ),
+            "nothing was published. Fix: read the plan above, then run dfm sync",
         ));
-    };
+    }
     drop(staging);
     drop(shared);
+    state_cmd::fail_from_env()?.hit("sync-before-lock")?;
 
     // Publication under the lock: fetch and plan again, so the sources and the checkouts are
     // rechecked immediately before anything is published, then fast-forward each checkout.
@@ -1922,7 +2000,15 @@ fn run_inner(
     let (locked_loaded, locked) = plan_staged(ctx, &binding, &root, &rel, &second.tree(), args)?;
     let locked_digest = sync_digest(&locked, &staged);
     if locked_digest != digest {
-        return Err(apply_cmd::stale(approved, &locked_digest));
+        return Err(match &args.apply.yes_plan {
+            Some(approved) => apply_cmd::stale(approved, &locked_digest),
+            None => Refusal::new(
+                Code::PlanStale,
+                format!(
+                    "the plan changed after it was printed: its digest was {digest} and is {locked_digest} now; nothing was published. Fix: run dfm sync again"
+                ),
+            ),
+        });
     }
     // The digest already binds the commits; this is the same check in process, as a guard.
     let moved = |s: &Staged| (s.src.id.clone(), s.old.clone(), s.new.clone());
@@ -1985,8 +2071,8 @@ fn run_inner(
             "not_started".to_string()
         } else if let Some(s) = not_run(p) {
             s
-        } else if p.plan.changes_nothing() && !journal_open {
-            "current".into()
+        } else if p.changes_nothing() && !journal_open {
+            p.idle()
         } else {
             writeln!(
                 out,
@@ -2004,7 +2090,8 @@ fn run_inner(
             match ran {
                 Ok(None) => {
                     changed = true;
-                    for o in p.plan.operations.iter() {
+                    // A held operation wrote nothing.
+                    for o in p.runnable().operations {
                         if let (PlanStatus::Planned, Some(path)) = (o.status, &o.path) {
                             done.insert(dfm_model::fold::fold(path), o.clone());
                         }
@@ -2195,7 +2282,38 @@ mod tests {
             no_session: vec![],
             blocked: false,
             deferred: BTreeMap::new(),
+            held: BTreeSet::new(),
         }
+    }
+
+    #[test]
+    fn a_sync_scope_holds_back_an_unapproved_adoption_and_what_runs_after_it() {
+        let mut plan = services_plan(vec![]);
+        let base = plan.operations.remove(0);
+        let op = |id: &str, action, takeover, after: &[&str]| Operation {
+            id: id.into(),
+            action,
+            takeover,
+            after: after.iter().map(|a| a.to_string()).collect(),
+            ..base.clone()
+        };
+        plan.operations = vec![
+            op("adopt", Action::Adopt, false, &[]),
+            op("takeover", Action::UpdateFile, true, &[]),
+            op("child", Action::CreateLink, false, &["adopt"]),
+            op("grandchild", Action::CreateLink, false, &["child"]),
+            op("free", Action::CreateLink, false, &[]),
+        ];
+        let mut args = apply_cmd::parse_args(&[], Scope::Config).unwrap();
+        assert!(
+            apply_cmd::held(&args, &plan).is_empty(),
+            "a standalone command holds nothing back"
+        );
+        args.composed = true;
+        let held = |args: &apply_cmd::Args| Vec::from_iter(apply_cmd::held(args, &plan));
+        assert_eq!(held(&args), ["adopt", "child", "grandchild", "takeover"]);
+        args.allow_adopt.insert("adopt".into());
+        assert_eq!(held(&args), ["takeover"]);
     }
 
     fn before() -> Vec<Precondition> {
