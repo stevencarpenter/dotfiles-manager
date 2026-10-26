@@ -11,7 +11,7 @@
 
 use crate::adapters::Generators;
 use crate::plan_cmd::{Probed, plan_for, render};
-use crate::{Ctx, load_resolved, require_binding, state_cmd, usage};
+use crate::{Ctx, load_resolved, paint, require_binding, state_cmd, usage};
 use dfm_engine::{
     Approval as Allowance, Dir, Generator, Run, Store, Sys, apply, check_allowances,
     check_journal_capacity, gates, now_ns,
@@ -221,13 +221,14 @@ pub(crate) fn end_without_change(
     args: &Args,
     plan: &dfm_model::plan::Plan,
     journal_open: bool,
+    color: bool,
     out: &mut dyn Write,
 ) -> std::io::Result<bool> {
     if args.yes_plan.is_some() || journal_open || !plan.changes_nothing() {
         return Ok(false);
     }
     writeln!(out, "nothing to change: no approval needed")?;
-    writeln!(out, "result: ok")?;
+    writeln!(out, "result: {}", paint::status(color, "ok"))?;
     Ok(true)
 }
 
@@ -261,7 +262,7 @@ pub fn run(ctx: &Ctx, args: &Args, out: &mut dyn Write) -> Result<(), Refusal> {
         && !progress.result_printed
     {
         // The printed result is the exit the process returns, from the same refusal.
-        let _ = writeln!(out, "result: {}", e.exit().name());
+        let _ = writeln!(out, "result: {}", paint::status(ctx.color, e.exit().name()));
     }
     r
 }
@@ -328,7 +329,7 @@ fn run_inner(
     if let Some(i) = &ctx.isolated {
         writeln!(out, "isolated: true {i}").map_err(w)?;
     }
-    render(&plan, &digest, out).map_err(w)?;
+    render(&plan, &digest, ctx.color, out).map_err(w)?;
     progress.plan_printed = true;
     let generators = |loaded| generators_for(ctx, &sys, args.scope, loaded);
     let journal_open = check_before_lock(ctx, args, &plan, &digest, &generators(&first), out)?;
@@ -341,7 +342,7 @@ fn run_inner(
     if args.preview {
         return Ok(());
     }
-    if end_without_change(args, &plan, journal_open, out).map_err(w)? {
+    if end_without_change(args, &plan, journal_open, ctx.color, out).map_err(w)? {
         progress.result_printed = true;
         return Ok(());
     }
@@ -529,7 +530,7 @@ fn run_inner(
         writeln!(
             out,
             "  {} {}{reload}{error}",
-            label(rec.status),
+            paint::status(ctx.color, label(rec.status)),
             visible(&op.id)
         )
         .map_err(w)?;
@@ -570,7 +571,12 @@ fn run_inner(
         (None, None) => Ok(()),
     };
     let final_exit = outcome.as_ref().err().map_or(Exit::Ok, Refusal::exit);
-    writeln!(out, "result: {}", final_exit.name()).map_err(w)?;
+    writeln!(
+        out,
+        "result: {}",
+        paint::status(ctx.color, final_exit.name())
+    )
+    .map_err(w)?;
     progress.result_printed = true;
     outcome
 }

@@ -5,7 +5,7 @@
 //! and starts no process.
 
 use crate::read_fs::{read_regular_bounded, sha256_file};
-use crate::{Ctx, Loaded, load_resolved, read_existing_binding, usage};
+use crate::{Ctx, Loaded, load_resolved, paint, read_existing_binding, usage};
 use dfm_engine::{Dir, Fail, Store, merge, observe};
 use dfm_model::display::visible;
 use dfm_model::plan::{
@@ -236,7 +236,12 @@ fn mark_excluded(plan: &mut Plan, sources: &dfm_model::resolve::SourceSet) {
     }
 }
 
-pub(crate) fn render(p: &Plan, digest: &str, out: &mut dyn Write) -> std::io::Result<()> {
+pub(crate) fn render(
+    p: &Plan,
+    digest: &str,
+    color: bool,
+    out: &mut dyn Write,
+) -> std::io::Result<()> {
     writeln!(
         out,
         "plan: profile={} machine={} scope={}",
@@ -249,7 +254,7 @@ pub(crate) fn render(p: &Plan, digest: &str, out: &mut dyn Write) -> std::io::Re
     }
     writeln!(out, "operations: {}", p.operations.len())?;
     for o in &p.operations {
-        head_line(o, out)?;
+        head_line(o, color, out)?;
         if !o.after.is_empty() {
             writeln!(out, "    after: {}", visible(&o.after.join(", ")))?;
         }
@@ -280,9 +285,14 @@ pub(crate) fn render(p: &Plan, digest: &str, out: &mut dyn Write) -> std::io::Re
             writeln!(out, "    fragments: {}", visible(&names.join(", ")))?;
         }
     }
-    summary(p, out)?;
+    summary(p, color, out)?;
     for b in &p.blockers {
-        writeln!(out, "blocked: {}", visible(&b.refusal().to_string()))?;
+        writeln!(
+            out,
+            "{} {}",
+            paint::style(color, "1;31", "blocked:"),
+            visible(&b.refusal().to_string())
+        )?;
     }
     writeln!(out, "plan digest: {digest}")
 }
@@ -297,11 +307,11 @@ fn status_name(s: Status) -> &'static str {
     }
 }
 
-fn head_line(o: &Operation, out: &mut dyn Write) -> std::io::Result<()> {
+fn head_line(o: &Operation, color: bool, out: &mut dyn Write) -> std::io::Result<()> {
     writeln!(
         out,
         "  {} {} [{}] {}",
-        status_name(o.status),
+        paint::status(color, status_name(o.status)),
         visible(&o.id),
         visible(&o.module),
         visible(&o.effect)
@@ -313,7 +323,7 @@ const SUMMARY_SHOWN: usize = 20;
 /// The counts, then the id of each `blocked` and `planned` operation, blocked first, so the end
 /// of a long plan shows what needs attention. `not_in_scope` is only counted: in a packages or
 /// services plan every configuration operation has it.
-fn summary(p: &Plan, out: &mut dyn Write) -> std::io::Result<()> {
+fn summary(p: &Plan, color: bool, out: &mut dyn Write) -> std::io::Result<()> {
     let rank = |s: Status| match s {
         Status::Blocked => 0,
         Status::Planned => 1,
@@ -338,11 +348,16 @@ fn summary(p: &Plan, out: &mut dyn Write) -> std::io::Result<()> {
     if p.changes_nothing() {
         line.push_str("; nothing to change");
     }
-    writeln!(out, "{line}")?;
+    writeln!(out, "{}", paint::style(color, "1", &line))?;
     let mut listed: Vec<&Operation> = p.operations.iter().filter(|o| rank(o.status) < 2).collect();
     listed.sort_by_key(|o| rank(o.status));
     for o in listed.iter().take(SUMMARY_SHOWN) {
-        writeln!(out, "  {} {}", status_name(o.status), visible(&o.id))?;
+        writeln!(
+            out,
+            "  {} {}",
+            paint::status(color, status_name(o.status)),
+            visible(&o.id)
+        )?;
     }
     if listed.len() > SUMMARY_SHOWN {
         writeln!(
@@ -404,7 +419,7 @@ pub fn run(ctx: &Ctx, args: &Args, out: &mut dyn Write) -> Result<(), Refusal> {
         if let Some(i) = &ctx.isolated {
             writeln!(out, "isolated: true {i}").map_err(w)?;
         }
-        render(&fresh, &digest, out).map_err(w)?;
+        render(&fresh, &digest, ctx.color, out).map_err(w)?;
         print_stale(&diffs, out).map_err(w)?;
     }
     if let Some(first) = diffs.first() {

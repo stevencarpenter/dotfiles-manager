@@ -341,6 +341,37 @@ fn apply_without_an_approved_digest_prints_the_plan_and_writes_nothing() {
 }
 
 #[test]
+fn a_terminal_gets_colored_statuses_and_no_color_turns_them_off() {
+    let fx = Fx::new();
+    let run = |env: &[(&str, &str)]| {
+        let mut c = Command::new(BIN);
+        c.env_clear().envs(env.iter().copied());
+        c.arg("--home").arg(fx.home.path());
+        c.args(["apply", "--root", fx.root_arg()]).output().unwrap()
+    };
+    // DFM_COLOR stands in for a terminal in a test-isolation build.
+    let o = run(&[("DFM_COLOR", "1")]);
+    assert_eq!(code(&o), 3, "{}", stderr(&o));
+    let t = text(&o.stdout);
+    assert!(
+        t.contains("  \x1b[33mplanned\x1b[0m extra.zsh@.zshrc"),
+        "{t}"
+    );
+    assert!(t.contains("\x1b[1msummary: planned=7\x1b[0m"), "{t}");
+    assert!(t.ends_with("result: \x1b[1;31mblocked\x1b[0m\n"), "{t}");
+    assert!(t.contains("plan digest: "), "{t}");
+    for env in [
+        &[("DFM_COLOR", "1"), ("NO_COLOR", "1")][..],
+        &[("DFM_COLOR", "1"), ("TERM", "dumb")][..],
+        &[][..],
+    ] {
+        let o = run(env);
+        assert!(!text(&o.stdout).contains('\u{1b}'), "{env:?}");
+        assert!(!stderr(&o).contains('\u{1b}'), "{env:?}");
+    }
+}
+
+#[test]
 fn preview_prints_the_plan_digest_and_changes_nothing() {
     let fx = Fx::new();
     let before = fingerprint(fx.home.path());

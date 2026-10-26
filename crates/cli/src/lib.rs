@@ -7,6 +7,7 @@ mod adapters;
 mod apply_cmd;
 mod controls_fs;
 mod doctor_cmd;
+mod paint;
 mod plan_cmd;
 mod read_fs;
 mod self_update_cmd;
@@ -178,6 +179,8 @@ struct Ctx {
     os: String,
     arch: String,
     isolated: Option<String>,
+    /// Color the text output: stdout is a terminal (`paint::enabled`).
+    color: bool,
 }
 
 impl Ctx {
@@ -281,6 +284,7 @@ fn context(home: Option<String>) -> Result<Ctx, Refusal> {
         os,
         arch,
         isolated,
+        color: paint::enabled(&std::io::stdout()),
     })
 }
 
@@ -294,6 +298,7 @@ fn context(_home: Option<String>) -> Result<Ctx, Refusal> {
         os: os.into(),
         arch: arch.into(),
         isolated: None,
+        color: paint::enabled(&std::io::stdout()),
     })
 }
 
@@ -355,7 +360,8 @@ pub fn run(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> Exit {
     match dispatch(args, out) {
         Ok(()) => Exit::Ok,
         Err(r) => {
-            let _ = writeln!(err, "error: {}", bounded(&r.to_string()));
+            let tag = paint::style(paint::enabled(&std::io::stderr()), "1;31", "error:");
+            let _ = writeln!(err, "{tag} {}", bounded(&r.to_string()));
             r.exit()
         }
     }
