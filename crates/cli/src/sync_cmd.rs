@@ -1556,26 +1556,6 @@ fn rendered(op: &Operation, home: &Path) -> Option<(String, u64)> {
     })
 }
 
-/// The definition links of `config`, an approved configuration plan, that it retargets, each
-/// with the file its link resolved to before (the reviewed observation), for the services scope
-/// (`service::Retargeted`).
-fn retargeted(config: &Plan, home: &Path) -> crate::adapters::service::Retargeted {
-    config
-        .operations
-        .iter()
-        .filter(|o| o.status == PlanStatus::Planned && o.action == Action::ReplaceLink)
-        .filter_map(|o| {
-            let path = o.path.as_ref()?;
-            let Node::Link { target, .. } = &config.observations.seen.get(path)?.node else {
-                return None;
-            };
-            let at = home.join(path);
-            let before = at.parent()?.join(target);
-            Some((path.clone(), fs::canonicalize(&before).unwrap_or(before)))
-        })
-        .collect()
-}
-
 /// Publishes one staged source into its checkout exactly as the rehearsal moved the copy, after
 /// rechecking that the checkout is where the copy saw it. `Ok(true)` when the checkout changed.
 fn publish(git: &Git, s: &Staged) -> Result<bool, Refusal> {
@@ -1889,9 +1869,9 @@ fn run_inner(
     let mut failure: Option<Refusal> = None;
     let mut changed = !published.is_empty();
     let mut lines: Vec<(Scope, String)> = Vec::new();
-    // The approved operations of the scopes that ran, by folded path, and the definition links
-    // the configuration scope retargeted: a later scope is checked against their effects.
-    let (mut done, mut moved) = (BTreeMap::new(), BTreeMap::new());
+    // The approved operations of the scopes that ran, by folded path: a later scope is checked
+    // against their effects.
+    let mut done = BTreeMap::new();
     let fail = state_cmd::fail_from_env()?;
     for p in &locked {
         // A stop request between two scopes ends the run: no later scope starts.
@@ -1916,7 +1896,6 @@ fn run_inner(
             .map_err(w)?;
             let earlier = Earlier {
                 done: &done,
-                retargeted: &moved,
                 home: &layout.home,
             };
             let ran = run_scope(ctx, &sys, args, p, &locked_loaded, &earlier, out)
@@ -1924,9 +1903,6 @@ fn run_inner(
             match ran {
                 Ok(None) => {
                     changed = true;
-                    if p.scope == Scope::Config {
-                        moved = retargeted(&p.plan, &layout.home);
-                    }
                     for o in p.plan.operations.iter() {
                         if let (PlanStatus::Planned, Some(path)) = (o.status, &o.path) {
                             done.insert(dfm_model::fold::fold(path), o.clone());
@@ -1974,7 +1950,6 @@ fn run_inner(
 /// What the scopes that already ran in this sync did (see `run_inner`).
 struct Earlier<'a> {
     done: &'a BTreeMap<String, Operation>,
-    retargeted: &'a crate::adapters::service::Retargeted,
     home: &'a Path,
 }
 
@@ -1998,20 +1973,13 @@ fn run_scope(
             return Ok(Some(no_session));
         }
     }
-    let retargeted = match p.scope {
-        Scope::Services => earlier.retargeted.clone(),
-        _ => BTreeMap::new(),
-    };
     // A service deferred to this point always follows a configuration scope that ran.
     let fresh = match p.scope {
         Scope::Config => None,
         _ if earlier.done.is_empty() => None,
         _ => {
             let now = crate::load_resolved(ctx, args.apply.root.as_deref().map(Path::new))?;
-            let scoped = apply_cmd::Args {
-                retargeted: retargeted.clone(),
-                ..scope_args(args, p.scope, None)
-            };
+            let scoped = scope_args(args, p.scope, None);
             let probed = apply_cmd::probe(ctx, sys, &scoped, &now)?;
             let fresh = plan_for(ctx, &now, p.scope, probed)?;
             if !as_reviewed(p, &fresh, earlier.done, earlier.home) {
@@ -2033,7 +2001,6 @@ fn run_scope(
             Some(f) => f.digest()?,
             None => p.digest.clone(),
         }),
-        retargeted,
         ..scope_args(args, p.scope, Some(approvals))
     };
     apply_cmd::run(ctx, &scoped, out).map(|()| None)

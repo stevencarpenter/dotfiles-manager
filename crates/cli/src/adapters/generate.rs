@@ -15,6 +15,7 @@ use dfm_model::state::Class;
 use dfm_model::{Code, Refusal};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write;
+use std::path::Path;
 
 /// What an adapter that produces file content provides, besides its catalog entry.
 pub struct Gen {
@@ -46,8 +47,9 @@ pub struct Generators<'a> {
     /// them. The plan records no content identity for a secret template (docs/resolver.md item
     /// 12), so `render` compares the bytes apply read with these instead.
     templates: BTreeMap<String, Vec<u8>>,
-    /// See [`service::Retargeted`].
-    retargeted: service::Retargeted,
+    /// The canonical checkout root the sources were loaded from, with a runner: a service probe
+    /// reads it (`service::probe`).
+    root: Option<&'a Path>,
 }
 
 impl<'a> Generators<'a> {
@@ -57,19 +59,19 @@ impl<'a> Generators<'a> {
             table: registry(),
             runner: None,
             templates: BTreeMap::new(),
-            retargeted: BTreeMap::new(),
+            root: None,
         }
     }
 
-    /// These generators, with the definition links `sync` retargeted (see
-    /// [`service::Retargeted`]).
-    pub fn retargeted(self, retargeted: service::Retargeted) -> Self {
-        Generators { retargeted, ..self }
-    }
-
     /// Generators that can also render a secret or install a package through `runner` (the
-    /// `secrets` and `packages` commands). `sources` are the ones the plan was resolved from.
-    pub fn with_runner(resolved: &'a Resolved, sources: &SourceSet, runner: Runner) -> Self {
+    /// `secrets` and `packages` commands). `sources` are the ones the plan was resolved from,
+    /// under the canonical checkout root `root`.
+    pub fn with_runner(
+        resolved: &'a Resolved,
+        sources: &SourceSet,
+        root: &'a Path,
+        runner: Runner,
+    ) -> Self {
         let templates = resolved
             .resources
             .values()
@@ -85,6 +87,7 @@ impl<'a> Generators<'a> {
             .collect();
         Generators {
             runner: Some(runner),
+            root: Some(root),
             templates,
             ..Generators::new(resolved)
         }
@@ -294,7 +297,14 @@ impl Generator for Generators<'_> {
 
     fn service_state(&self, op: &Operation) -> Result<ServiceState, Refusal> {
         let runner = self.launcher(op)?;
-        service::probe(runner, &op.adapter, self.value(op)?, &self.retargeted).map(|f| f.state)
+        // `with_runner` sets the root with the runner `launcher` requires.
+        let root = self.root.ok_or_else(|| {
+            Refusal::new(
+                Code::GeneratorUnavailable,
+                format!("no service launcher for {}", op.adapter),
+            )
+        })?;
+        service::probe(runner, &op.adapter, self.value(op)?, root).map(|f| f.state)
     }
 
     fn service_act(&self, op: &Operation) -> Result<Completion, Refusal> {

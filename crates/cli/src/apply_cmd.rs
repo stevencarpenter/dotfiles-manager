@@ -45,9 +45,6 @@ pub struct Args {
     /// A scope of `sync` (docs/sync.md): sync printed the plan and prints the result line, so
     /// this run prints neither, and its report omits the `not_in_scope` operations.
     pub(crate) composed: bool,
-    /// The services scope of `sync`: the definition links its configuration scope retargeted
-    /// (`service::Retargeted`). Empty otherwise.
-    pub(crate) retargeted: crate::adapters::service::Retargeted,
 }
 
 /// `apply [--root <dir>] [-y|--yes-plan <digest>] [--allow-disruptive <operation-id>]...
@@ -113,7 +110,6 @@ pub fn parse_args(args: &[String], scope: Scope) -> Result<Args, Refusal> {
         update,
         restart,
         composed: false,
-        retargeted: BTreeMap::new(),
     })
 }
 
@@ -275,7 +271,7 @@ pub(crate) fn probe(
                 resolved,
                 &ctx.runner(sys),
                 staged,
-                &args.retargeted,
+                &loaded.root,
             )?;
             probed.restart = args.restart.clone();
         }
@@ -318,9 +314,12 @@ pub(crate) fn generators_for<'a>(
     loaded: &'a crate::Loaded,
 ) -> Generators<'a> {
     match scope {
-        Scope::Secrets | Scope::Packages | Scope::Services => {
-            Generators::with_runner(&loaded.resolved, &loaded.sources, ctx.runner(sys))
-        }
+        Scope::Secrets | Scope::Packages | Scope::Services => Generators::with_runner(
+            &loaded.resolved,
+            &loaded.sources,
+            &loaded.root,
+            ctx.runner(sys),
+        ),
         Scope::Config => Generators::new(&loaded.resolved),
     }
 }
@@ -378,8 +377,7 @@ fn run_inner(
         render(&plan, &digest, ctx.color, out).map_err(w)?;
         progress.plan_printed = true;
     }
-    let generators =
-        |loaded| generators_for(ctx, &sys, args.scope, loaded).retargeted(args.retargeted.clone());
+    let generators = |loaded| generators_for(ctx, &sys, args.scope, loaded);
     let journal_open = check_before_lock(ctx, args, &plan, &digest, &generators(&first), out)?;
     // The credential gate (docs/secrets.md): a secrets run without a vault
     // session stops here, exit 3, before the lock and before any write. Nothing is rendered.

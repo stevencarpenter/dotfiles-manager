@@ -477,26 +477,22 @@ fn only(state: ServiceState) -> ServiceFacts {
 /// scope will publish, by its HOME-relative path.
 type Staged<'a> = (&'a Path, &'a Path, &'a BTreeMap<String, String>);
 
-/// The definition links that `sync`'s configuration scope retargeted, by HOME-relative path,
-/// each with the absolute file it resolved to before. An agent loaded from that file was loaded
-/// from the declared definition before the retarget, so it stays the manager's (docs/sync.md).
-/// Empty outside `sync`.
-pub type Retargeted = BTreeMap<String, PathBuf>;
-
 /// The state of a launchd user agent: its definition must be published under HOME and declare
 /// the label; the agent is current when the domain loaded that very file (compared after
-/// resolving links, as launchd reports the resolved path). Loaded from another file is foreign:
-/// the manager did not load it and never unloads it. The run state is reported, not required: a
+/// resolving links, as launchd reports the resolved path). Loaded from another file inside
+/// `root`, the canonical checkout root, is also current: an earlier definition of the manager's
+/// sources, loaded before a link was retargeted (docs/lifecycle.md); a requested restart loads
+/// the declared one. Loaded from a file outside `root` is foreign: the manager did not load it
+/// and never unloads it. The run state is reported, not required: a
 /// one-shot agent is not running after it ran. The definition's content hash and program go to
-/// the plan. With `staged` (see [`Staged`]), a definition that resolves
-/// into the root is read from the copy, at the new target when the configuration scope retargets
-/// its link: the plan shows what publication will put there. An agent loaded from the file a
-/// [`Retargeted`] link resolved to before is loaded from the declared definition.
+/// the plan. With `staged` (see [`Staged`]), the declared definition is the new target when the
+/// configuration scope retargets its link, and one that resolves into the root is read from the
+/// copy: the plan shows what publication will put there.
 fn launchd_state(
     runner: &Runner,
     value: &Value,
     staged: Option<Staged<'_>>,
-    retargeted: &Retargeted,
+    root: &Path,
 ) -> Result<ServiceFacts, Refusal> {
     let label = label(value)?;
     let plist = definition(value)?;
@@ -515,15 +511,17 @@ fn launchd_state(
             ))));
         }
     };
+    // The declared definition: the file the link resolves to, or will resolve to after
+    // publication.
+    let declared = staged
+        .and_then(|(_, _, links)| links.get(&plist))
+        .map_or(canonical, PathBuf::from);
     let read_from = match staged {
-        Some((root, tree, links)) => {
-            let target = links.get(&plist).map_or(canonical.as_path(), Path::new);
-            match target.strip_prefix(root) {
-                Ok(rel) => tree.join(rel),
-                Err(_) => target.to_path_buf(),
-            }
-        }
-        None => canonical.clone(),
+        Some((root, tree, _)) => match declared.strip_prefix(root) {
+            Ok(rel) => tree.join(rel),
+            Err(_) => declared.clone(),
+        },
+        None => declared.clone(),
     };
     let bytes = match definition_bytes(&read_from) {
         Ok(b) => b,
@@ -555,7 +553,6 @@ fn launchd_state(
             ))));
         }
     }
-    let before = retargeted.get(&plist);
     let definition = Some(Definition {
         path: plist,
         sha256: sha256_hex(&bytes),
@@ -570,11 +567,13 @@ fn launchd_state(
             } else {
                 "not running"
             };
-            let from = std::fs::canonicalize(&l.path).ok();
-            if from.as_ref() == Some(&canonical)
-                || before.is_some_and(|b| from.as_ref() == Some(b) || l.path == *b)
-            {
+            let from = std::fs::canonicalize(&l.path).unwrap_or(l.path.clone());
+            if from == declared {
                 ServiceState::Current(format!("loaded from the declared definition, {run}"))
+            } else if from.starts_with(root) {
+                ServiceState::Current(format!(
+                    "loaded from an earlier definition in the checkout, {run}; --restart loads the declared one"
+                ))
             } else {
                 ServiceState::Foreign(format!(
                     "loaded from a definition the manager does not own ({}), {run}; unload it with `launchctl bootout {}/{label}`",
@@ -662,9 +661,9 @@ pub fn probe(
     runner: &Runner,
     adapter: &str,
     value: &Value,
-    retargeted: &Retargeted,
+    root: &Path,
 ) -> Result<ServiceFacts, Refusal> {
-    probe_from(runner, adapter, value, None, retargeted)
+    probe_from(runner, adapter, value, None, root)
 }
 
 /// As [`probe`], with a definition under `staged.0` read from `staged.1` (see `launchd_state`).
@@ -673,10 +672,10 @@ fn probe_from(
     adapter: &str,
     value: &Value,
     staged: Option<Staged<'_>>,
-    retargeted: &Retargeted,
+    root: &Path,
 ) -> Result<ServiceFacts, Refusal> {
     match adapter {
-        LAUNCHD => launchd_state(runner, value, staged, retargeted),
+        LAUNCHD => launchd_state(runner, value, staged, root),
         BREW_SERVICE => brew_state(runner, value),
         other => Err(Refusal::new(
             Code::GeneratorUnavailable,
@@ -828,12 +827,13 @@ pub fn act(
 
 /// Probes every selected service resource for a services plan, by resource id. A stop request
 /// ends the probing: the probe it arrived in is ended by the runner, no further launcher is
-/// started, and the request is the error. `staged` is [`Staged`].
+/// started, and the request is the error. `staged` is [`Staged`]; `root` is the canonical
+/// checkout root.
 pub fn service_facts(
     resolved: &Resolved,
     runner: &Runner,
     staged: Option<Staged<'_>>,
-    retargeted: &Retargeted,
+    root: &Path,
 ) -> Result<BTreeMap<String, ServiceFacts>, Refusal> {
     let mut out = BTreeMap::new();
     for r in resolved
@@ -844,7 +844,7 @@ pub fn service_facts(
         if let Some(stop) = dfm_engine::signal::requested() {
             return Err(stop);
         }
-        let facts = match probe_from(runner, &r.adapter, &r.value, staged, retargeted) {
+        let facts = match probe_from(runner, &r.adapter, &r.value, staged, root) {
             Ok(f) => f,
             Err(e) if e.code == Code::ManifestInvalid => only(ServiceState::Refused(e.detail)),
             Err(e) => only(ServiceState::Unknown(e.detail)),

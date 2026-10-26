@@ -2257,6 +2257,60 @@ fn a_definition_link_the_configuration_retargets_is_reviewed_from_its_new_target
 }
 
 #[test]
+fn an_agent_loaded_from_the_definition_before_a_retarget_stays_the_managers() {
+    let l = Life::new();
+    let o = l.approved(&[]);
+    assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
+    let db = l.fake.path().join("loaded");
+    let old = fs::read_to_string(&db).unwrap();
+    // Upstream points the definition link at another source file; the owner does not restart.
+    let seed = &l.fx.upstream.seed;
+    put(
+        seed,
+        "base/modules/life/module.toml",
+        &LIFE.replace(
+            "source = \"files/org.example.agent.plist\"",
+            "source = \"files/agent2.plist\"",
+        ),
+    );
+    put(
+        seed,
+        "base/modules/life/files/agent2.plist",
+        &AGENT_PLIST.replace("/usr/bin/true", "/usr/bin/false"),
+    );
+    l.fx.upstream
+        .push("the agent link points at another definition");
+    let o = l.approved(&[]);
+    assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
+    // launchd still reports the file the link resolved to before.
+    assert_eq!(fs::read_to_string(&db).unwrap(), old);
+    // The next sync and a standalone services run are not blocked by that load.
+    let p = l.preview(&[]);
+    assert_eq!(code(&p), 0, "{}\n{}", stdout(&p), stderr(&p));
+    assert!(!stdout(&p).contains("blocked"), "{}", stdout(&p));
+    let s = l.run(&["services", "--root", l.fx.root_arg(), "--preview"]);
+    assert_eq!(code(&s), 0, "{}\n{}", stdout(&s), stderr(&s));
+    assert!(!stdout(&s).contains("blocked"), "{}", stdout(&s));
+    // A requested restart loads the new definition.
+    let o = l.approved(&["--restart", "life.agent", "--allow-disruptive", AGENT_OP]);
+    assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
+    let loaded = fs::read_to_string(&db).unwrap();
+    assert!(loaded.ends_with("/agent2.plist\n"), "{loaded}");
+    // A load from a file outside the checkout root stays foreign.
+    let copy = l.fake.path().join("agent2.plist");
+    fs::write(&copy, AGENT_PLIST).unwrap();
+    let copy = fs::canonicalize(copy).unwrap();
+    fs::write(&db, format!("org.example.agent {}\n", copy.display())).unwrap();
+    let p = l.preview(&[]);
+    assert_eq!(code(&p), 0, "{}\n{}", stdout(&p), stderr(&p));
+    assert!(
+        stdout(&p).contains("blocked life.agent@service"),
+        "{}",
+        stdout(&p)
+    );
+}
+
+#[test]
 fn a_session_that_ends_before_the_secrets_scope_names_dfm_secrets_as_the_fix() {
     let l = Life::new();
     let o = l.approved(&[]);

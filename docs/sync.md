@@ -47,7 +47,7 @@ The services scope is planned against the tree as it will be after publication a
 
 - A launchd definition that resolves into `--root` is read from the staged copy, so the preview, its `content:` precondition and "the definition runs ..." show what publication puts there. When the configuration plan of the same run changes the definition's link to another target, the definition is read at that new target.
 - A service whose definition or configuration file is not published yet, while the configuration plan of the same run publishes it, is not blocked. The preview shows it as a start "after the configuration scope publishes" the file. When `--restart` names it, the preview shows it as a restart, and its `--allow-disruptive` flag is checked before publication: without the flag the run is refused before anything is published.
-- A launchd agent that is loaded from the file its definition link resolved to before the configuration scope retargeted that link stays the manager's agent after the retarget (launchd reports the resolved path). It is not foreign, so a requested restart loads the new definition.
+- A launchd agent that is loaded from the file its definition link resolved to before the configuration plan retargets that link is loaded from an earlier definition inside `--root`. It is current, not foreign (docs/lifecycle.md), in the review, after the configuration scope, and in every later run. A requested restart loads the new definition.
 
 After an earlier scope of the same run ended `ok` with its approved digest, `sync` plans each later scope (packages, secrets, services) again from the published files. That plan must be the reviewed one with the effects of the earlier scopes' approved operations applied:
 
