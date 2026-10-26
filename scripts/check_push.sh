@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
-# The pre-push gate: runs scripts/check_all.sh rust-tests on every commit being pushed.
+# The pre-push gate: runs scripts/check_all.sh rust-tests on each pushed tip.
 # Usage: check_push.sh [remote]. git pre-push names the remote in $1 and feeds "<local ref>
 # <local sha> <remote ref> <remote sha>" lines on stdin; with no stdin lines, HEAD stands in
-# for the pushed tip. Every commit reachable from a pushed tip and not yet on the remote is
-# written out with `git checkout-index` and tested in its own temporary tree, so unstaged or
-# uncommitted files cannot change the result.
+# for the pushed tip. Each pushed tip the remote does not have yet is written out with
+# `git checkout-index` and tested in its own temporary tree, so unstaged or uncommitted files
+# cannot change the result. Commits below a tip are not tested: the tip supersedes them
+# (owner rule, 2026-10-25).
 set -euo pipefail
 
 remote=${1:-}
@@ -31,19 +32,25 @@ if [ ${#tips[@]} -eq 0 ]; then
     fi
     tips=(HEAD)
 fi
-# Git gives one line per updated ref, not one per commit, so the remote's tracking refs bound
-# the range as well: a commit the remote has went through this hook when it was pushed there.
-# A push to a URL has no tracking refs; every remote's refs bound it then. Oldest first, so a
-# broken commit is reported before the commit that fixes it.
+# The remote's tracking refs also mark what it has: a tip the remote has went through this
+# hook when it was pushed there. A push to a URL has no tracking refs; every remote's refs
+# mark it then.
 if [ -n "$remote" ] && git remote get-url "$remote" >/dev/null 2>&1; then
     known+=(--remotes="$remote")
 else
     known+=(--remotes)
 fi
-# shellcheck disable=SC2207 # object ids hold no whitespace
-shas=($(git rev-list --reverse "${tips[@]}" --not "${known[@]}"))
+shas=()
+for tip in "${tips[@]}"; do
+    sha=$(git rev-parse --verify "$tip^{commit}")
+    case " ${shas[*]-} " in *" $sha "*) continue ;; esac
+    # A tip that the remote's refs reach is on the remote already.
+    if [ -n "$(git rev-list -n 1 "$sha" --not "${known[@]}")" ]; then
+        shas+=("$sha")
+    fi
+done
 if [ ${#shas[@]} -eq 0 ]; then
-    echo "==> pre-push: every commit is on the remote already; nothing to test"
+    echo "==> pre-push: the remote has every pushed tip; nothing to test"
     exit 0
 fi
 
@@ -54,8 +61,8 @@ trap 'rm -rf "$gate_root"' EXIT
 
 for sha in "${shas[@]}"; do
     echo "==> pre-push: testing $sha"
-    # A new tree per commit: clearing a shared tree with `rm -rf dir/*` would keep a dotfile
-    # of the previous commit (a .cargo/config.toml, for example) in this one's tree.
+    # A new tree per tip: clearing a shared tree with `rm -rf dir/*` would keep a dotfile of
+    # the previous tip (a .cargo/config.toml, for example) in this one's tree.
     gate_tree=$gate_root/$sha
     mkdir "$gate_tree"
     # The commit's own tree through a scratch index, not `git archive`: an archive drops the

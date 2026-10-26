@@ -86,7 +86,7 @@ uv run scripts/check_examples.py   # the fixture checker without just
 `scripts/check_all.sh` is the single gate for the hooks, `just` and CI. Its steps are `fixtures`, `scripts`, `rust-style`, `rust-tests` and `network-tests`; `rust-tests` runs `network-tests` itself.
 
 - **Commit hook:** runs `fixtures`, `scripts` and `rust-style` on a temporary copy of the staged files. It does not run `cargo test` and does not modify or restage files.
-- **Push hook:** runs `rust-tests` on every commit the push introduces, oldest first, each in its own tree written with `git checkout-index`. A push of commits the remote already has, or a branch deletion, tests nothing.
+- **Push hook:** runs `rust-tests` on each pushed tip that the remote does not have, in its own tree written with `git checkout-index`. Commits below a tip are not tested, because the tip supersedes them. A push of tips the remote already has, or a branch deletion, tests nothing.
 - Both hooks build into `target/gate`, so a hook never waits for a build in `target`.
 
 Environment variables of the gate:
