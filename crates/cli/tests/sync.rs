@@ -1380,7 +1380,8 @@ esac
 "#;
 
 /// `launchctl print` answers from `loaded` in launchd's report shape or exits 113;
-/// `bootstrap` adds the plist's label, `bootout` removes it (crates/cli/tests/services.rs keeps
+/// `bootstrap` adds the plist's label with the resolved path of the plist, as launchd reports it,
+/// `bootout` removes it (crates/cli/tests/services.rs keeps
 /// the full look-alike).
 const FAKE_LAUNCHCTL: &str = r#"#!/bin/sh
 PATH=/usr/bin:/bin:$PATH
@@ -1400,7 +1401,7 @@ case "$1" in
     exit 0 ;;
   bootstrap)
     label=$(tr -d '\n\t' < "$3" | sed -n 's/.*<key>Label<\/key> *<string>\([^<]*\)<\/string>.*/\1/p')
-    echo "$label $3" >> "$db"; exit 0 ;;
+    echo "$label $(readlink -f "$3")" >> "$db"; exit 0 ;;
   bootout)
     label=${2##*/}
     grep -v "^$label " "$db" > "$db.tmp" 2>/dev/null; mv "$db.tmp" "$db"; exit 0 ;;
@@ -1548,6 +1549,33 @@ impl Life {
         self.sync(&digest_of(&p), flags)
     }
 
+    /// Sync with `digest`, and run `between` after the configuration scope and before the
+    /// next scope starts (the `sync-after-scope` failpoint waits for it).
+    fn sync_pausing(&self, digest: &str, flags: &[&str], between: impl FnOnce()) -> Output {
+        let release = self.fake.path().join("release");
+        let fp = format!("sync-after-scope:wait-{}", release.display());
+        let mut a = vec!["sync", "--root", self.fx.root_arg(), "-y", digest];
+        a.extend_from_slice(flags);
+        let run = self
+            .command(&[("DFM_FAILPOINT", fp.as_str())], &a)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let reached = release.with_extension("reached");
+        let end = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while !reached.exists() {
+            assert!(
+                std::time::Instant::now() < end,
+                "the failpoint was not reached"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        between();
+        fs::write(&release, "").unwrap();
+        run.wait_with_output().unwrap()
+    }
+
     fn sign_in(&self, on: bool) {
         let m = self.fake.path().join("signed-in");
         if on {
@@ -1591,6 +1619,15 @@ impl Life {
         );
         put(seed, "base/modules/life/files/notes", "notes\n");
         self.fx.upstream.push("add a link");
+    }
+
+    /// Points the HOME link `rel` at `name`, next to its current target, as another program
+    /// would.
+    fn relink(&self, rel: &str, name: &str) {
+        let link = self.fx.h(rel);
+        let target = fs::read_link(&link).unwrap();
+        fs::remove_file(&link).unwrap();
+        std::os::unix::fs::symlink(target.with_file_name(name), &link).unwrap();
     }
 
     /// The `command` of each receipt, oldest first.
@@ -2034,33 +2071,10 @@ fn a_service_precondition_on_a_path_the_configuration_did_not_write_stays_stale(
         stdout(&p)
     );
     let log = l.log();
-    let release = l.fake.path().join("release");
-    let fp = format!("sync-after-scope:wait-{}", release.display());
-    let run = l
-        .command(
-            &[("DFM_FAILPOINT", fp.as_str())],
-            &["sync", "--root", l.fx.root_arg(), "-y", &digest_of(&p)],
-        )
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .unwrap();
-    let reached = release.with_extension("reached");
-    let end = std::time::Instant::now() + std::time::Duration::from_secs(30);
-    while !reached.exists() {
-        assert!(
-            std::time::Instant::now() < end,
-            "the failpoint was not reached"
-        );
-        std::thread::sleep(std::time::Duration::from_millis(20));
-    }
     // After the configuration scope, bar's config file changes by another hand.
-    let link = l.fx.h(".config/bar/barrc");
-    let target = fs::read_link(&link).unwrap();
-    fs::remove_file(&link).unwrap();
-    std::os::unix::fs::symlink(target.with_file_name("barrc2"), &link).unwrap();
-    fs::write(&release, "").unwrap();
-    let o = run.wait_with_output().unwrap();
+    let o = l.sync_pausing(&digest_of(&p), &[], || {
+        l.relink(".config/bar/barrc", "barrc2")
+    });
     assert_eq!(code(&o), 1, "{}\n{}", stdout(&o), stderr(&o));
     in_order(
         &stdout(&o),
@@ -2072,6 +2086,80 @@ fn a_service_precondition_on_a_path_the_configuration_did_not_write_stays_stale(
     );
     let new = &l.log()[log.len()..];
     assert!(!new.contains("launchctl bootstrap"), "{new}");
+}
+
+#[test]
+fn a_service_config_link_another_program_retargets_after_the_configuration_scope_is_stale() {
+    let l = Life::new();
+    l.with_bar();
+    // The configuration scope points bar's config file at barrc2; then another program points
+    // it at barrc3, before the services scope plans again.
+    l.push_module(
+        &bar_module("barrc2"),
+        &[("barrc3", "height=3\n")],
+        "bar reads barrc2",
+    );
+    fs::write(l.fake.path().join("loaded"), "").unwrap();
+    let p = l.preview(&[]);
+    assert_eq!(code(&p), 0, "{}\n{}", stdout(&p), stderr(&p));
+    let log = l.log();
+    let o = l.sync_pausing(&digest_of(&p), &[], || {
+        l.relink(".config/bar/barrc", "barrc3")
+    });
+    assert_eq!(code(&o), 1, "{}\n{}", stdout(&o), stderr(&o));
+    in_order(
+        &stdout(&o),
+        &[
+            "  config: ok",
+            "  services: failed (E_PLAN_STALE)",
+            "result: failed",
+        ],
+    );
+    let new = &l.log()[log.len()..];
+    assert!(!new.contains("brew services restart"), "{new}");
+    assert!(!new.contains("brew services start"), "{new}");
+    assert!(!new.contains("launchctl bootstrap"), "{new}");
+}
+
+#[test]
+fn a_directory_the_configuration_scope_creates_for_a_new_secret_does_not_make_secrets_stale() {
+    let l = Life::new();
+    assert!(!l.fx.h(".config/example").exists());
+    // A new link in the directory of the secret that was never rendered: the configuration and
+    // the secrets plans both create .config/example.
+    l.push_module(
+        "\n[[resources]]\nid = \"exconf\"\nkind = \"link\"\nadapter = \"fs-link/v1\"\ntarget = \".config/example/config\"\n[resources.value]\nsource = \"files/exconf\"\n",
+        &[("exconf", "conf\n")],
+        "add a link next to the secret",
+    );
+    let p = l.preview(&[]);
+    assert_eq!(code(&p), 0, "{}\n{}", stdout(&p), stderr(&p));
+    in_order(
+        &stdout(&p),
+        &[
+            "scope: config",
+            "planned mkdir@.config/example",
+            "scope: secrets",
+            "planned mkdir@.config/example",
+            "scope: services",
+        ],
+    );
+    let o = l.sync(&digest_of(&p), &[]);
+    assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
+    in_order(
+        &stdout(&o),
+        &[
+            "  config: ok",
+            "  packages: ok",
+            "  secrets: ok",
+            "  services: ok",
+            "result: ok",
+        ],
+    );
+    assert_eq!(
+        fs::read_to_string(l.fx.h(".config/example/personal.env")).unwrap(),
+        "TOKEN=planted-value\n"
+    );
 }
 
 #[test]
@@ -2160,6 +2248,12 @@ fn a_definition_link_the_configuration_retargets_is_reviewed_from_its_new_target
         &["  config: ok", "  services: ok", "result: ok"],
     );
     in_order(&l.log(), &["launchctl bootout", "launchctl bootstrap"]);
+    // The launcher now holds the new definition, so the next sync has nothing to do.
+    let loaded = fs::read_to_string(l.fake.path().join("loaded")).unwrap();
+    assert!(loaded.ends_with("/agent2.plist\n"), "{loaded}");
+    let o = l.run(&["sync", "--root", l.fx.root_arg(), "--preview"]);
+    assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
+    assert!(!stdout(&o).contains("blocked"), "{}", stdout(&o));
 }
 
 #[test]

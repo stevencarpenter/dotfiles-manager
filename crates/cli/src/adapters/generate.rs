@@ -46,6 +46,8 @@ pub struct Generators<'a> {
     /// them. The plan records no content identity for a secret template (docs/resolver.md item
     /// 12), so `render` compares the bytes apply read with these instead.
     templates: BTreeMap<String, Vec<u8>>,
+    /// See [`service::Retargeted`].
+    retargeted: service::Retargeted,
 }
 
 impl<'a> Generators<'a> {
@@ -55,7 +57,14 @@ impl<'a> Generators<'a> {
             table: registry(),
             runner: None,
             templates: BTreeMap::new(),
+            retargeted: BTreeMap::new(),
         }
+    }
+
+    /// These generators, with the definition links `sync` retargeted (see
+    /// [`service::Retargeted`]).
+    pub fn retargeted(self, retargeted: service::Retargeted) -> Self {
+        Generators { retargeted, ..self }
     }
 
     /// Generators that can also render a secret or install a package through `runner` (the
@@ -285,7 +294,7 @@ impl Generator for Generators<'_> {
 
     fn service_state(&self, op: &Operation) -> Result<ServiceState, Refusal> {
         let runner = self.launcher(op)?;
-        service::probe(runner, &op.adapter, self.value(op)?).map(|f| f.state)
+        service::probe(runner, &op.adapter, self.value(op)?, &self.retargeted).map(|f| f.state)
     }
 
     fn service_act(&self, op: &Operation) -> Result<Completion, Refusal> {

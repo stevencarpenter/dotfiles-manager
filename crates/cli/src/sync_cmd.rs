@@ -24,7 +24,9 @@ use dfm_model::binding::Binding;
 use dfm_model::digest::sha256_hex;
 use dfm_model::display::{visible, visible_for_paste};
 use dfm_model::lock::{Grants, Lock, LockSource, MAX_BYTES as LOCK_MAX_BYTES, check_origin};
-use dfm_model::plan::{Action, Blocker, Ownership, Plan, Scope, Status as PlanStatus};
+use dfm_model::plan::{
+    Action, Blocker, Node, Operation, Ownership, Plan, Scope, Status as PlanStatus,
+};
 use dfm_model::resolve::resolve;
 use dfm_model::state::{self, Class, JournalEntry, Phase, Recovery, rfc3339};
 use dfm_model::{Code, Refusal};
@@ -1392,15 +1394,23 @@ fn check_scopes(
     missing.map_or(Ok(open), Err)
 }
 
-/// Whether `fresh`, a services plan of the published tree, is the reviewed plan `p` up to what
-/// the configuration scope of this run changed: its deferred services are now planned as starts
-/// (or current, when the launcher already holds them; or restarts, when the owner requested and
-/// approved the restart before publication),
-/// and a `path:`, `sensitive-path:` or `content:` precondition on a path in `written` (the paths
-/// the reviewed configuration plan wrote) may differ. Every other operation and precondition,
-/// the sources and the model are unchanged, and nothing blocks. The observations are left out:
-/// each operation's preconditions carry the states it depends on.
-fn as_reviewed(p: &ScopePlan, fresh: &Plan, written: &BTreeSet<String>) -> bool {
+/// Whether `fresh`, the plan of scope `p` after the earlier scopes of this run, is the reviewed
+/// plan with the effects of those scopes' approved operations (`done`, by folded path) applied:
+/// a directory an earlier scope created drops out of the reviewed plan, and a `path:` or
+/// `sensitive-path:` precondition on a path an earlier scope wrote must state what that
+/// operation leaves there (`left_by`); so must a `content:` precondition on a file it rendered.
+/// The reviewed preconditions on those paths described them before the earlier scopes. Each
+/// deferred service is now planned as a start (or current, when the launcher already holds it;
+/// or a restart, when the owner requested and approved the restart before publication). Every
+/// other operation and precondition, the sources and the model are unchanged, and nothing
+/// blocks. The observations are left out: each operation's preconditions carry the states it
+/// depends on.
+fn as_reviewed(
+    p: &ScopePlan,
+    fresh: &Plan,
+    done: &BTreeMap<String, Operation>,
+    home: &Path,
+) -> bool {
     let started = p.deferred.iter().all(|(id, reviewed)| {
         fresh.operations.iter().any(|o| {
             o.id == *id
@@ -1409,23 +1419,129 @@ fn as_reviewed(p: &ScopePlan, fresh: &Plan, written: &BTreeSet<String>) -> bool 
                         && (o.action == Action::Start || o.action == *reviewed)))
         })
     });
-    let on_written = |subject: &str| {
-        subject.split_once(':').is_some_and(|(kind, path)| {
-            matches!(kind, "path" | "sensitive-path" | "content")
-                && written.contains(&dfm_model::fold::fold(path))
-        })
+    // The earlier operation that changed the subject of this precondition, if one did. The
+    // content of a link is the file it points at, which the review already read at the new
+    // target (`Staged`), so a `content:` precondition through a link stays as reviewed.
+    fn changed_by<'a>(
+        done: &'a BTreeMap<String, Operation>,
+        subject: &'a str,
+    ) -> Option<(&'a str, &'a Operation)> {
+        let (kind, path) = subject.split_once(':')?;
+        let op = done.get(&dfm_model::fold::fold(path))?;
+        match kind {
+            "path" | "sensitive-path" => Some((kind, op)),
+            "content" if op.link.is_none() => Some((kind, op)),
+            _ => None,
+        }
+    }
+    let created = |o: &Operation| {
+        o.action == Action::CreateDir
+            && o.path.as_deref().is_some_and(|path| {
+                done.get(&dfm_model::fold::fold(path))
+                    .is_some_and(|d| d.action == Action::CreateDir)
+            })
     };
-    let rest = |plan: &Plan| {
+    let rest = |plan: &Plan, fresh: bool| {
         let mut c = plan.clone();
-        c.operations.retain(|o| !p.deferred.contains_key(&o.id));
+        let gone: BTreeSet<String> = match fresh {
+            true => BTreeSet::new(),
+            false => c
+                .operations
+                .iter()
+                .filter(|o| created(o))
+                .map(|o| o.id.clone())
+                .collect(),
+        };
+        c.operations
+            .retain(|o| !p.deferred.contains_key(&o.id) && !gone.contains(&o.id));
         for o in &mut c.operations {
-            o.preconditions.retain(|pc| !on_written(&pc.subject));
+            o.after.retain(|id| !gone.contains(id));
+            o.preconditions
+                .retain(|pc| match changed_by(done, &pc.subject) {
+                    None => true,
+                    Some(_) if !fresh => false,
+                    Some((kind, op)) => !left_by(op, kind, &pc.state, home),
+                });
         }
         c.blockers.clear();
         c.observations = Default::default();
         c
     };
-    started && fresh.blockers.is_empty() && rest(&p.plan) == rest(fresh)
+    started && fresh.blockers.is_empty() && rest(&p.plan, false) == rest(fresh, true)
+}
+
+/// Whether `state`, a precondition of kind `kind` (`path`, `sensitive-path` or `content`) on
+/// the path of `op`, is what the approved operation `op` of an earlier scope leaves there: a
+/// directory it created, the absence it removed to, the link it published, or the file it
+/// rendered (the declared mode, and the approved content, which is read again from `home`
+/// because a precondition records a different hash of it). Anything else is not.
+fn left_by(op: &Operation, kind: &str, state: &str, home: &Path) -> bool {
+    let writes = matches!(op.action, Action::CreateFile | Action::UpdateFile);
+    match (kind, op.action, op.link.as_deref()) {
+        (_, Action::CreateDir, _) if kind != "content" => state.starts_with("dir:"),
+        (_, Action::Remove, _) if kind != "content" => state == "missing",
+        ("content", _, _) => {
+            writes
+                && op
+                    .output_sha256
+                    .as_ref()
+                    .is_some_and(|h| state == format!("sha256:{h}"))
+        }
+        (_, _, Some(link)) => state
+            .strip_prefix("link:")
+            .and_then(|r| r.strip_prefix(link))
+            .is_some_and(|r| r.starts_with(':')),
+        ("sensitive-path", _, None) => {
+            writes && op.mode.is_some_and(|m| state == format!("file:{m:o}"))
+        }
+        (_, _, None) if writes => {
+            let Some(rest) = state.strip_prefix("file:") else {
+                return false;
+            };
+            let (mode, hash) = rest.split_once(":sha256:").unwrap_or((rest, ""));
+            op.mode.is_none_or(|m| mode == format!("{m:o}"))
+                && rendered(op, home).is_some_and(|fp| hash == fp)
+        }
+        _ => false,
+    }
+}
+
+/// The fingerprint (`file_fingerprint`) of the file at the path of `op` under `home`, if its
+/// content is the approved content: the SHA-256 the plan recorded for it.
+fn rendered(op: &Operation, home: &Path) -> Option<String> {
+    let (path, sha, limit) = (
+        op.path.as_ref()?,
+        op.output_sha256.as_ref()?,
+        op.output_bytes?,
+    );
+    let bytes = read_regular_bounded(
+        &home.join(path),
+        limit,
+        |e| io_failed("read", &e),
+        || conflict("not a regular file"),
+    )
+    .ok()?;
+    (sha256_hex(&bytes) == *sha).then(|| dfm_model::plan::file_fingerprint(&bytes))
+}
+
+/// The definition links of `config`, an approved configuration plan, that it retargets, each
+/// with the file its link resolved to before (the reviewed observation), for the services scope
+/// (`service::Retargeted`).
+fn retargeted(config: &Plan, home: &Path) -> crate::adapters::service::Retargeted {
+    config
+        .operations
+        .iter()
+        .filter(|o| o.status == PlanStatus::Planned && o.action == Action::ReplaceLink)
+        .filter_map(|o| {
+            let path = o.path.as_ref()?;
+            let Node::Link { target, .. } = &config.observations.seen.get(path)?.node else {
+                return None;
+            };
+            let at = home.join(path);
+            let before = at.parent()?.join(target);
+            Some((path.clone(), fs::canonicalize(&before).unwrap_or(before)))
+        })
+        .collect()
 }
 
 /// Publishes one staged source into its checkout exactly as the rehearsal moved the copy, after
@@ -1741,8 +1857,9 @@ fn run_inner(
     let mut failure: Option<Refusal> = None;
     let mut changed = !published.is_empty();
     let mut lines: Vec<(Scope, String)> = Vec::new();
-    // The paths the configuration scope wrote, once it ran with its reviewed digest.
-    let mut written = BTreeSet::new();
+    // The approved operations of the scopes that ran, by folded path, and the definition links
+    // the configuration scope retargeted: a later scope is checked against their effects.
+    let (mut done, mut moved) = (BTreeMap::new(), BTreeMap::new());
     let fail = state_cmd::fail_from_env()?;
     for p in &locked {
         // A stop request between two scopes ends the run: no later scope starts.
@@ -1765,19 +1882,23 @@ fn run_inner(
                 p.scope.as_str()
             )
             .map_err(w)?;
-            let ran = run_scope(ctx, &sys, args, p, &locked_loaded, &written, out)
+            let earlier = Earlier {
+                done: &done,
+                retargeted: &moved,
+                home: &layout.home,
+            };
+            let ran = run_scope(ctx, &sys, args, p, &locked_loaded, &earlier, out)
                 .and_then(|ran| fail.hit("sync-after-scope").map(|()| ran));
             match ran {
                 Ok(None) => {
                     changed = true;
                     if p.scope == Scope::Config {
-                        written = p
-                            .plan
-                            .operations
-                            .iter()
-                            .filter(|o| o.status == PlanStatus::Planned)
-                            .filter_map(|o| o.path.as_deref().map(dfm_model::fold::fold))
-                            .collect();
+                        moved = retargeted(&p.plan, &layout.home);
+                    }
+                    for o in p.plan.operations.iter() {
+                        if let (PlanStatus::Planned, Some(path)) = (o.status, &o.path) {
+                            done.insert(dfm_model::fold::fold(path), o.clone());
+                        }
                     }
                     "ok".into()
                 }
@@ -1818,46 +1939,69 @@ fn run_inner(
     finish(ctx, &lines, result, out, printed)
 }
 
+/// What the scopes that already ran in this sync did (see `run_inner`).
+struct Earlier<'a> {
+    done: &'a BTreeMap<String, Operation>,
+    retargeted: &'a crate::adapters::service::Retargeted,
+    home: &'a Path,
+}
+
 /// Runs one approved scope through its own command (`apply_cmd::run`) with its plan digest.
 /// Returns the accounts without a session when the secrets scope finds none now: it is skipped.
-/// The services scope is planned again first, from the published tree: it runs only when that
-/// plan is the reviewed one up to what the configuration scope changed (`as_reviewed`).
+/// A scope after an earlier scope that changed something is planned again first, from the
+/// published tree: it runs only when that plan is the reviewed one with the earlier scopes'
+/// effects applied (`as_reviewed`), with the digest of that plan.
 fn run_scope(
     ctx: &Ctx,
     sys: &Sys,
     args: &Args,
     p: &ScopePlan,
     loaded: &Loaded,
-    written: &BTreeSet<String>,
+    earlier: &Earlier<'_>,
     out: &mut dyn Write,
 ) -> Result<Option<Vec<(String, String)>>, Refusal> {
-    let mut approvals = &p.plan;
-    let fresh;
-    let digest = match p.scope {
-        Scope::Secrets => {
-            let no_session = secret::missing_sessions(&p.plan, &loaded.resolved, &ctx.runner(sys))?;
-            if !no_session.is_empty() {
-                return Ok(Some(no_session));
-            }
-            p.digest.clone()
+    if p.scope == Scope::Secrets {
+        let no_session = secret::missing_sessions(&p.plan, &loaded.resolved, &ctx.runner(sys))?;
+        if !no_session.is_empty() {
+            return Ok(Some(no_session));
         }
-        Scope::Services => {
+    }
+    let retargeted = match p.scope {
+        Scope::Services => earlier.retargeted.clone(),
+        _ => BTreeMap::new(),
+    };
+    // A service deferred to this point always follows a configuration scope that ran.
+    let fresh = match p.scope {
+        Scope::Config => None,
+        _ if earlier.done.is_empty() => None,
+        _ => {
             let now = crate::load_resolved(ctx, args.apply.root.as_deref().map(Path::new))?;
-            fresh = plan_scope(ctx, sys, args, p.scope, &now)?;
-            if !as_reviewed(p, &fresh, written) {
+            let scoped = apply_cmd::Args {
+                retargeted: retargeted.clone(),
+                ..scope_args(args, p.scope, None)
+            };
+            let probed = apply_cmd::probe(ctx, sys, &scoped, &now)?;
+            let fresh = plan_for(ctx, &now, p.scope, probed)?;
+            if !as_reviewed(p, &fresh, earlier.done, earlier.home) {
                 return Err(Refusal::new(
                     Code::PlanStale,
-                    "the services plan after the configuration scope is not the reviewed one. Fix: run dfm sync again and approve the new plan",
+                    format!(
+                        "the {} plan after the earlier scopes of this sync is not the reviewed one. Fix: run dfm sync again and approve the new plan",
+                        p.scope.as_str()
+                    ),
                 ));
             }
-            // A deferred restart is an operation of this plan only: its approval goes with it.
-            approvals = &fresh;
-            fresh.digest()?
+            Some(fresh)
         }
-        Scope::Config | Scope::Packages => p.digest.clone(),
     };
+    // A deferred restart is an operation of the new plan only: its approval goes with it.
+    let approvals = fresh.as_ref().unwrap_or(&p.plan);
     let scoped = apply_cmd::Args {
-        yes_plan: Some(digest),
+        yes_plan: Some(match &fresh {
+            Some(f) => f.digest()?,
+            None => p.digest.clone(),
+        }),
+        retargeted,
         ..scope_args(args, p.scope, Some(approvals))
     };
     apply_cmd::run(ctx, &scoped, out).map(|()| None)
@@ -1959,45 +2103,155 @@ mod tests {
         ]
     }
 
+    /// An approved operation of an earlier scope at `path`.
+    fn earlier(path: &str, action: Action, link: Option<&str>) -> (String, Operation) {
+        let mut o = services_plan(vec![]).operations.remove(0);
+        o.id = format!("x@{path}");
+        o.action = action;
+        o.path = Some(path.into());
+        o.link = link.map(String::from);
+        (dfm_model::fold::fold(path), o)
+    }
+
     #[test]
-    fn the_services_recheck_ignores_only_path_and_content_preconditions_on_written_paths() {
+    fn a_later_scope_is_checked_against_the_approved_effects_of_the_earlier_scopes() {
+        let home = Path::new("/nonexistent-home");
         let review = reviewed(services_plan(before()));
-        let written: BTreeSet<String> = [dfm_model::fold::fold(PLIST)].into();
+        let done: BTreeMap<String, Operation> =
+            [earlier(PLIST, Action::ReplaceLink, Some("/r/new.plist"))].into();
         let mut after = before();
-        after[0].state = "link:/r/new.plist".into();
-        after[1].state = "sha256:bb".into();
-        let fresh = services_plan(after);
-        // 1. The configuration scope wrote the definition: accepted.
-        assert!(as_reviewed(&review, &fresh, &written));
-        // 2. The same difference on a path it did not write: refused.
-        assert!(!as_reviewed(&review, &fresh, &BTreeSet::new()));
-        let other: BTreeSet<String> = [dfm_model::fold::fold(".config/other")].into();
-        assert!(!as_reviewed(&review, &fresh, &other));
-        // 3. Any other difference is refused, even with the definition written.
-        let mut probe = before();
+        after[0].state = "link:/r/new.plist:file".into();
+        let fresh = services_plan(after.clone());
+        // 1. The definition link is the one the configuration scope published: accepted.
+        assert!(as_reviewed(&review, &fresh, &done, home));
+        // 2. Another target than the approved one, or no earlier write of the path: refused.
+        let mut other = after.clone();
+        other[0].state = "link:/r/other.plist:file".into();
+        assert!(!as_reviewed(&review, &services_plan(other), &done, home));
+        assert!(!as_reviewed(&review, &fresh, &BTreeMap::new(), home));
+        let elsewhere: BTreeMap<String, Operation> = [earlier(
+            ".config/other",
+            Action::ReplaceLink,
+            Some("/r/new.plist"),
+        )]
+        .into();
+        assert!(!as_reviewed(&review, &fresh, &elsewhere, home));
+        // 3. The content through a link stays as reviewed (read at the new target).
+        let mut content = after.clone();
+        content[1].state = "sha256:bb".into();
+        assert!(!as_reviewed(&review, &services_plan(content), &done, home));
+        // 4. Any other difference is refused, even with the definition written.
+        let mut probe = after.clone();
         probe[2].state = "current:loaded".into();
-        assert!(!as_reviewed(&review, &services_plan(probe), &written));
-        let mut status = services_plan(before());
+        assert!(!as_reviewed(&review, &services_plan(probe), &done, home));
+        let mut status = services_plan(after.clone());
         status.operations[0].status = PlanStatus::Current;
-        assert!(!as_reviewed(&review, &status, &written));
-        let mut action = services_plan(before());
+        assert!(!as_reviewed(&review, &status, &done, home));
+        let mut action = services_plan(after.clone());
         action.operations[0].action = Action::Restart;
-        assert!(!as_reviewed(&review, &action, &written));
-        let mut effect = services_plan(before());
+        assert!(!as_reviewed(&review, &action, &done, home));
+        let mut effect = services_plan(after.clone());
         effect.operations[0].effect = "start another program".into();
-        assert!(!as_reviewed(&review, &effect, &written));
-        let mut extra = services_plan(before());
+        assert!(!as_reviewed(&review, &effect, &done, home));
+        let mut extra = services_plan(after.clone());
         extra.operations[0]
             .preconditions
             .push(pre(&format!("path:{PLIST}.d"), "missing"));
-        assert!(!as_reviewed(&review, &extra, &written));
-        // 4. A deferred service may come back as a restart only when it was reviewed as one.
+        assert!(!as_reviewed(&review, &extra, &done, home));
+        // 5. A deferred service may come back as a restart only when it was reviewed as one.
         let mut deferred = reviewed(services_plan(before()));
         let id = deferred.plan.operations[0].id.clone();
         deferred.deferred.insert(id.clone(), Action::Start);
-        assert!(!as_reviewed(&deferred, &action, &written));
+        assert!(!as_reviewed(&deferred, &action, &done, home));
         deferred.deferred.insert(id, Action::Restart);
-        assert!(as_reviewed(&deferred, &action, &written));
+        assert!(as_reviewed(&deferred, &action, &done, home));
+    }
+
+    #[test]
+    fn a_directory_an_earlier_scope_created_drops_out_of_the_reviewed_plan() {
+        let home = Path::new("/nonexistent-home");
+        let dir = ".config/example";
+        let mut review = services_plan(vec![pre(".config", "dir:755")]);
+        let mut mkdir = earlier(dir, Action::CreateDir, None).1;
+        mkdir.id = format!("mkdir@{dir}");
+        mkdir.preconditions = vec![pre(&format!("path:{dir}"), "missing")];
+        review.operations[0].after = vec![mkdir.id.clone()];
+        review.operations.insert(0, mkdir.clone());
+        let review = reviewed(review);
+        let done: BTreeMap<String, Operation> = [(dfm_model::fold::fold(dir), mkdir)].into();
+        let fresh = |state: &str| {
+            services_plan(vec![
+                pre(".config", "dir:755"),
+                pre(&format!("path:{dir}"), state),
+            ])
+        };
+        assert!(as_reviewed(&review, &fresh("dir:755"), &done, home));
+        // The directory is not there now: the earlier effect did not hold.
+        assert!(!as_reviewed(&review, &fresh("missing"), &done, home));
+        assert!(!as_reviewed(&review, &fresh("link:/x:dir"), &done, home));
+        // Without the earlier mkdir, the reviewed mkdir is still expected.
+        assert!(!as_reviewed(
+            &review,
+            &fresh("dir:755"),
+            &BTreeMap::new(),
+            home
+        ));
+    }
+
+    #[test]
+    fn a_file_an_earlier_scope_rendered_must_hold_the_approved_content_and_mode() {
+        let home = TempDirLite::new();
+        let path = ".config/bar/barrc";
+        let bytes = b"height=1\n";
+        fs::create_dir_all(home.0.join(".config/bar")).unwrap();
+        fs::write(home.0.join(path), bytes).unwrap();
+        let (_, mut op) = earlier(path, Action::UpdateFile, None);
+        op.mode = Some(0o644);
+        op.output_sha256 = Some(sha256_hex(bytes));
+        op.output_bytes = Some(bytes.len() as u64);
+        let fp = dfm_model::plan::file_fingerprint(bytes);
+        let ok = format!("file:644:sha256:{fp}");
+        assert!(left_by(&op, "path", &ok, &home.0));
+        assert!(!left_by(
+            &op,
+            "path",
+            &format!("file:600:sha256:{fp}"),
+            &home.0
+        ));
+        assert!(!left_by(&op, "path", "file:644:sha256:00", &home.0));
+        assert!(left_by(
+            &op,
+            "content",
+            &format!("sha256:{}", sha256_hex(bytes)),
+            &home.0
+        ));
+        assert!(!left_by(&op, "content", "sha256:00", &home.0));
+        assert!(left_by(&op, "sensitive-path", "file:644", &home.0));
+        assert!(!left_by(&op, "sensitive-path", "file:600", &home.0));
+        // Another hand rewrote the file after the scope: the precondition is not the approved one.
+        fs::write(home.0.join(path), b"height=2\n").unwrap();
+        assert!(!left_by(&op, "path", &ok, &home.0));
+    }
+
+    /// A scratch directory removed on drop.
+    struct TempDirLite(PathBuf);
+
+    impl TempDirLite {
+        fn new() -> Self {
+            let d = std::env::temp_dir().join(format!(
+                "dfm-sync-unit-{}-{}",
+                std::process::id(),
+                now_ns().unwrap()
+            ));
+            fs::create_dir_all(&d).unwrap();
+            TempDirLite(d)
+        }
+    }
+
+    impl Drop for TempDirLite {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
     }
 
     #[test]
