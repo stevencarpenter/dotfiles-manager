@@ -92,6 +92,7 @@ The receipt operation has class `sensitive`, no `before` and no `after`, and the
 - **Locked vault.** A locked 1Password app or a signed-out account stops the whole `secrets` run at the credential gate (exit 3, nothing rendered). No secret is skipped. In `sync` the secrets scope is skipped instead, with a warning at the end of the output (docs/sync.md).
 - **Unlock prompts.** `op whoami` with the desktop app integration can make the app show an unlock prompt. The manager cannot tell a prompt from a slow answer. The 30 s bound ends the call and reports `E_CREDENTIAL_UNAVAILABLE`.
 - **Rerun cost.** Every `secrets` run renders every planned secret, so each run talks to the vault once per secret.
+- **Rotation under `sync`.** A `dfm sync` with nothing else to change does not contact the vault, so a rotated secret is rendered by the next approved sync or by `dfm secrets` (docs/sync.md).
 - **Crash recovery.** As for a merge: a crash after the rename and before the outcome entry leaves an `intent` with no expected hash. Recovery answers `unknown`, and the path blocks until `state resolve <journal-id> --as failed` (docs/apply.md, "Merge crash recovery").
 - **Signals.** A stop request during `op inject` ends the child, the operation is `failed`, and nothing is journaled or written.
 - **Check-then-act.** A write by another process between the identity check and `renameat` is replaced (docs/apply.md, "Merge check-then-act").

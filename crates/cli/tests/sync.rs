@@ -1735,7 +1735,12 @@ fn a_repeat_sync_with_nothing_new_in_any_scope_is_a_no_op() {
     assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
     let s = stdout(&o);
     assert!(s.contains("nothing to change: no approval needed"), "{s}");
-    assert!(s.ends_with("result: ok\n"), "{s}");
+    assert!(s.contains("  secrets: current, not rendered again"), "{s}");
+    // Nothing was skipped, so no warning.
+    assert!(
+        s.ends_with("result: ok\n") && !s.contains("warning:"),
+        "{s}"
+    );
     let new = &l.log()[log.len()..];
     for effect in ["brew install", "op ", "launchctl bootstrap"] {
         assert!(!new.contains(effect), "a no-op sync ran {effect}:\n{new}");
