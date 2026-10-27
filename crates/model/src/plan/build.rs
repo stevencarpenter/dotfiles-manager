@@ -1317,7 +1317,9 @@ impl Planner<'_> {
     /// declared (or on request), and never stops or removes. Each declared prerequisite file
     /// must exist now and is recorded as a precondition; a missing one blocks the service, since
     /// a reload depends on the published file. Every missing one is a blocker, so a caller sees
-    /// all the files the service waits for, not only the first.
+    /// all the files the service waits for, not only the first. A missing file never hides the
+    /// probe's own blocker: both are listed, so `sync` defers only a service whose probe plans a
+    /// start, a restart or `current` once the files are published.
     fn service(&mut self, r: &ResolvedResource) {
         let id = format!("{}@service", r.id);
         let mut op = self.skeleton(r, id.clone(), None);
@@ -1372,24 +1374,13 @@ impl Planner<'_> {
             }
         }
         let facts = self.cx.service.get(&r.id).cloned();
-        // A definition the probe already read and could not accept (`sync` reads the one the
-        // configuration scope will generate) is reported too: publishing the missing files
-        // does not clear it, so the caller must not wait for them.
-        let refused = matches!(
-            facts.as_ref().map(|f| &f.state),
-            Some(ServiceState::Unknown(_) | ServiceState::Refused(_))
-        );
-        if missing && !refused {
-            self.ops.insert(id, op);
-            return;
-        }
         let mut runs = String::new();
         // A secret definition (a token among its arguments) shows and records nothing of its
         // content: its mode-only precondition above is all the plan keeps of it.
         if let Some(d) = facts
             .as_ref()
             .and_then(|f| f.definition.as_ref())
-            .filter(|d| !self.sensitive.contains(&fold(&d.path)))
+            .filter(|d| !self.sensitive.contains(&fold(&d.path)) && !missing)
         {
             op.preconditions.push(Precondition {
                 subject: format!("content:{}", d.path),
@@ -1401,106 +1392,98 @@ impl Planner<'_> {
         let requested = self.cx.restart.contains(&r.id);
         op.postcondition = format!("{} reports {name} loaded as declared", r.adapter);
         let probe = format!("probe:{}:{name}", r.adapter);
-        let planned = |op: &mut Operation, action: Action, effect: String, state: &ServiceState| {
-            op.action = action;
-            op.status = Status::Planned;
-            op.effect = effect;
-            op.preconditions.push(Precondition {
-                subject: probe.clone(),
-                state: state.state(),
-            });
-        };
-        match state {
+        // The verdict of the probe alone: the action, status, effect and probe precondition it
+        // plans, or its own blocker. A blocker is recorded even while a prerequisite file is
+        // missing: only a service whose probe plans a start, a restart or `current` once the
+        // files are published waits for them (`sync` defers it); any other state blocks it now,
+        // and the caller sees every blocker of the service, not only the files.
+        let verdict = match state {
             Some(ref s @ (ServiceState::Current(ref d) | ServiceState::Stale(ref d)))
                 if requested =>
             {
-                planned(
-                    &mut op,
+                Ok((
                     Action::Restart,
+                    Status::Planned,
                     format!(
                         "restart {shown} on request (--restart): disruptive, the loaded instance is replaced; now {d}{runs}"
                     ),
-                    s,
-                );
+                    Some(s.state()),
+                ))
             }
-            Some(ServiceState::Current(d)) => {
-                op.action = Action::None;
-                op.status = Status::Current;
-                op.effect = format!("{name} is {d}{runs}");
-            }
-            Some(ref s @ ServiceState::Stopped(ref d)) => planned(
-                &mut op,
+            Some(ServiceState::Current(d)) => Ok((
+                Action::None,
+                Status::Current,
+                format!("{name} is {d}{runs}"),
+                None,
+            )),
+            Some(ref s @ ServiceState::Stopped(ref d)) => Ok((
                 Action::Start,
+                Status::Planned,
                 format!("start {shown}: {d}; not disruptive, nothing of it is running{runs}"),
-                s,
-            ),
+                Some(s.state()),
+            )),
             // The manager did not start that process: nothing restarts it without a request.
-            Some(ServiceState::Stale(d)) => {
-                let f = fail(
-                    Code::Conflict,
-                    field,
-                    format!(
-                        "{shown} is {d}; a restart would replace a process the manager did not start"
-                    ),
-                    format!(
-                        "request it with `--restart {}` (and its --allow-disruptive flag), or repair the service by hand, then run services again",
-                        r.id
-                    ),
-                );
-                op.effect = format!("blocked: {}", f.detail);
+            Some(ServiceState::Stale(d)) => Err(fail(
+                Code::Conflict,
+                field,
+                format!(
+                    "{shown} is {d}; a restart would replace a process the manager did not start"
+                ),
+                format!(
+                    "request it with `--restart {}` (and its --allow-disruptive flag), or repair the service by hand, then run services again",
+                    r.id
+                ),
+            )),
+            Some(ServiceState::Foreign(d)) => Err(fail(
+                Code::Conflict,
+                field,
+                format!("{shown} is {d}; the manager never unloads a definition it did not load"),
+                "unload it by hand with its launcher, then run services again",
+            )),
+            Some(ServiceState::Missing(why)) => Err(fail(
+                Code::Conflict,
+                field,
+                format!("{shown}: {why}"),
+                "put the prerequisite in place with its own command (apply, packages), then run services again",
+            )),
+            Some(ServiceState::Unknown(why)) => Err(fail(
+                Code::ProbeFailed,
+                field,
+                format!("the state of {shown} is unknown: {why}"),
+                "make the launcher answer its report command, then run services again",
+            )),
+            Some(ServiceState::Refused(why)) => Err(fail(
+                Code::ManifestInvalid,
+                field,
+                why,
+                format!("correct the resource value in {}", r.declared_in),
+            )),
+            None => Err(fail(
+                Code::ProbeFailed,
+                field,
+                format!("{shown} was not probed"),
+                "run services again; if it repeats, report the resource",
+            )),
+        };
+        match verdict {
+            Err(f) => {
+                if !missing {
+                    op.effect = format!("blocked: {}", f.detail);
+                }
                 self.blocker(r, None, f);
             }
-            Some(ServiceState::Foreign(d)) => {
-                let f = fail(
-                    Code::Conflict,
-                    field,
-                    format!(
-                        "{shown} is {d}; the manager never unloads a definition it did not load"
-                    ),
-                    "unload it by hand with its launcher, then run services again",
-                );
-                op.effect = format!("blocked: {}", f.detail);
-                self.blocker(r, None, f);
-            }
-            Some(ServiceState::Missing(why)) => {
-                let f = fail(
-                    Code::Conflict,
-                    field,
-                    format!("{shown}: {why}"),
-                    "put the prerequisite in place with its own command (apply, packages), then run services again",
-                );
-                op.effect = format!("blocked: {}", f.detail);
-                self.blocker(r, None, f);
-            }
-            Some(ServiceState::Unknown(why)) => {
-                let f = fail(
-                    Code::ProbeFailed,
-                    field,
-                    format!("the state of {shown} is unknown: {why}"),
-                    "make the launcher answer its report command, then run services again",
-                );
-                op.effect = format!("blocked: {}", f.detail);
-                self.blocker(r, None, f);
-            }
-            Some(ServiceState::Refused(why)) => {
-                let f = fail(
-                    Code::ManifestInvalid,
-                    field,
-                    why,
-                    format!("correct the resource value in {}", r.declared_in),
-                );
-                op.effect = format!("blocked: {}", f.detail);
-                self.blocker(r, None, f);
-            }
-            None => {
-                let f = fail(
-                    Code::ProbeFailed,
-                    field,
-                    format!("{shown} was not probed"),
-                    "run services again; if it repeats, report the resource",
-                );
-                op.effect = format!("blocked: {}", f.detail);
-                self.blocker(r, None, f);
+            // Blocked by the missing files alone: their blockers and effect stand.
+            Ok(_) if missing => {}
+            Ok((action, status, effect, probed)) => {
+                op.action = action;
+                op.status = status;
+                op.effect = effect;
+                if let Some(state) = probed {
+                    op.preconditions.push(Precondition {
+                        subject: probe,
+                        state,
+                    });
+                }
             }
         }
         self.ops.insert(id, op);
@@ -2514,6 +2497,125 @@ mod tests {
         r.value = toml::from_str("plist = \"la/x.plist\"\nconfig = [\"c/b\", \"c/a\", \"c/b\"]\n")
             .unwrap();
         assert_eq!(service_prerequisites(&r), ["c/a", "c/b", "la/x.plist"]);
+    }
+
+    /// The plan of one launchd service `core.ssh` declaring the definition `la/x.plist`, with
+    /// that file published or not, the probe reporting `state` and the restart `requested`.
+    fn service_plan(published: bool, state: Option<ServiceState>, requested: bool) -> Plan {
+        let mut r = of_kind("service");
+        r.adapter = "launchd-agent/v1".into();
+        r.target = None;
+        r.claims = vec![];
+        r.value = toml::from_str("label = \"x\"\nplist = \"la/x.plist\"\n").unwrap();
+        let resolved = Resolved {
+            profile: "p".into(),
+            platform: "p".into(),
+            architecture: "a".into(),
+            modules: vec!["core".into()],
+            resources: BTreeMap::from([(r.id.clone(), r.clone())]),
+            includes: vec![],
+        };
+        let node = match published {
+            true => Node::File {
+                mode: 0o644,
+                own: true,
+                size: 1,
+                sha256: None,
+            },
+            false => Node::Missing {},
+        };
+        let obs = Observations {
+            seen: BTreeMap::from([("la/x.plist".into(), Seen { node, alias: None })]),
+            listings: BTreeMap::new(),
+        };
+        let cx = Context {
+            scope: Scope::Services,
+            binary: Binary {
+                version: "0".into(),
+                sha256: "0".repeat(64),
+            },
+            profile: "p",
+            machine_id: "m",
+            sources: vec![],
+            root: "/r",
+            ledger: vec![],
+            reserved: BTreeMap::new(),
+            unchecked: BTreeMap::new(),
+            merge: BTreeMap::new(),
+            secret: BTreeMap::new(),
+            package: BTreeMap::new(),
+            service: state
+                .map(|state| {
+                    let facts = ServiceFacts {
+                        state,
+                        definition: None,
+                    };
+                    BTreeMap::from([(r.id.clone(), facts)])
+                })
+                .unwrap_or_default(),
+            restart: match requested {
+                true => BTreeSet::from([r.id.clone()]),
+                false => BTreeSet::new(),
+            },
+        };
+        build(&resolved, &cx, &obs).unwrap()
+    }
+
+    #[test]
+    fn a_service_waits_for_its_files_only_when_their_publication_plans_it() {
+        // `sync` defers a blocked service when every blocker is a missing file that the
+        // configuration scope publishes (a path blocker of E_CONFLICT). For every probe state
+        // and restart request, that holds exactly when the same service, its files published,
+        // plans a start, a restart or `current`; otherwise the probe's own blocker is listed
+        // next to the file's.
+        let states = [
+            Some(ServiceState::Current("loaded".into())),
+            Some(ServiceState::Stopped("not loaded".into())),
+            Some(ServiceState::Stale("loaded, not running".into())),
+            Some(ServiceState::Foreign("loaded elsewhere".into())),
+            Some(ServiceState::Missing("the formula is not installed".into())),
+            Some(ServiceState::Unknown("timeout".into())),
+            Some(ServiceState::Refused("another label".into())),
+            None,
+        ];
+        let mut deferred = 0;
+        for state in states {
+            for requested in [false, true] {
+                let what = format!("{state:?} requested={requested}");
+                let waiting = service_plan(false, state.clone(), requested);
+                let defers = !waiting.blockers.is_empty()
+                    && waiting
+                        .blockers
+                        .iter()
+                        .all(|b| b.path.is_some() && b.code == Code::Conflict);
+                let after = service_plan(true, state.clone(), requested);
+                let op = &after.operations[0];
+                let runs = after.blockers.is_empty()
+                    && matches!(
+                        (op.action, op.status),
+                        (Action::Start | Action::Restart, Status::Planned)
+                            | (Action::None, Status::Current)
+                    );
+                assert_eq!(defers, runs, "{what}: {waiting:?}");
+                // The file's blocker is always listed; a blocking probe adds its own.
+                assert!(
+                    waiting
+                        .blockers
+                        .iter()
+                        .any(|b| b.path.as_deref() == Some("la/x.plist")),
+                    "{what}"
+                );
+                assert_eq!(
+                    waiting.blockers.len(),
+                    1 + after.blockers.len(),
+                    "{what}: {waiting:?}"
+                );
+                assert_eq!(waiting.operations[0].status, Status::Blocked, "{what}");
+                deferred += usize::from(defers);
+            }
+        }
+        // Current and Stopped either way, and Stale on request.
+        assert_eq!(deferred, 5);
     }
 
     #[test]

@@ -2178,6 +2178,109 @@ fn a_service_with_a_second_missing_config_file_the_configuration_does_not_publis
     assert!(!l.log().contains("brew services start"), "{}", l.log());
 }
 
+/// A new agent whose staged definition `plist` the review must refuse: the preview blocks the
+/// services scope with `why`, and the sync publishes the configuration and ends with a warning,
+/// not with a stale services plan after publication.
+fn a_new_agent_with_a_bad_staged_definition_is_blocked_in_the_review(plist: &str, why: &str) {
+    let l = Life::unpublished();
+    put(
+        &l.fx.upstream.seed,
+        "base/modules/life/files/org.example.agent.plist",
+        plist,
+    );
+    l.fx.upstream.push("a bad agent definition");
+    let p = l.preview(&[]);
+    assert_eq!(code(&p), 0, "{}\n{}", stdout(&p), stderr(&p));
+    let s = stdout(&p);
+    in_order(
+        &s,
+        &[
+            "planned life.agent-plist@Library/LaunchAgents/org.example.agent.plist",
+            "scope: services",
+            "blocked life.agent@service",
+            "blocked: this scope does not run: life.agent@service E_CONFLICT, life.agent@service E_MANIFEST_INVALID",
+            "warning: services blocked: ",
+        ],
+    );
+    assert!(s.contains(why), "{s}");
+    let o = l.sync(&digest_of(&p), &[]);
+    assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
+    let s = stdout(&o);
+    in_order(
+        &s,
+        &[
+            "  config: ok",
+            "  services: blocked (",
+            "result: ok\nwarning: services blocked: ",
+        ],
+    );
+    assert!(!s.contains("E_PLAN_STALE"), "{s}");
+    assert!(
+        l.fx.h("Library/LaunchAgents/org.example.agent.plist")
+            .is_symlink()
+    );
+    assert!(!l.log().contains("launchctl bootstrap"), "{}", l.log());
+}
+
+#[test]
+fn a_new_agent_whose_staged_definition_declares_another_label_is_blocked_in_the_review() {
+    a_new_agent_with_a_bad_staged_definition_is_blocked_in_the_review(
+        &AGENT_PLIST.replace(
+            "<string>org.example.agent</string>",
+            "<string>org.example.other</string>",
+        ),
+        "declares another label than org.example.agent",
+    );
+}
+
+#[test]
+fn a_new_agent_whose_staged_definition_is_not_xml_is_blocked_in_the_review() {
+    a_new_agent_with_a_bad_staged_definition_is_blocked_in_the_review(
+        &AGENT_PLIST.replace("</dict>", "</dct>"),
+        "is not an XML property list the adapter reads",
+    );
+}
+
+#[test]
+fn a_brew_service_without_its_formula_is_blocked_even_when_the_configuration_publishes_its_file() {
+    // The formula bar is not installed and no package operation installs it; the configuration
+    // scope publishes bar's config file. Publishing the file does not unblock bar.
+    let l = Life::new();
+    l.push_module(&bar_module("barrc"), &[("barrc", "height=1\n")], "add bar");
+    let p = l.preview(&[]);
+    assert_eq!(code(&p), 0, "{}\n{}", stdout(&p), stderr(&p));
+    let s = stdout(&p);
+    in_order(
+        &s,
+        &[
+            "planned life.barrc@.config/bar/barrc",
+            "scope: services",
+            "blocked life.bar@service",
+            "blocked: this scope does not run: ",
+            "warning: services blocked: ",
+        ],
+    );
+    assert!(
+        s.contains(".config/bar/barrc, which is not published"),
+        "{s}"
+    );
+    assert!(s.contains("the formula bar is not installed"), "{s}");
+    let o = l.sync(&digest_of(&p), &[]);
+    assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
+    let s = stdout(&o);
+    in_order(
+        &s,
+        &[
+            "  config: ok",
+            "  services: blocked (",
+            "result: ok\nwarning: services blocked: ",
+        ],
+    );
+    assert!(!s.contains("E_PLAN_STALE"), "{s}");
+    assert!(l.fx.h(".config/bar/barrc").is_symlink());
+    assert!(!l.log().contains("brew services start"), "{}", l.log());
+}
+
 #[test]
 fn a_service_config_file_the_configuration_scope_rewrites_does_not_make_services_stale() {
     let l = Life::new();
