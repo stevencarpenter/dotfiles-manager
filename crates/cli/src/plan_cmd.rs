@@ -232,8 +232,14 @@ pub(crate) fn plan_with_outputs(
     };
     let mut plan = plan::build(&loaded.resolved, &cx, &obs)?;
     // Generated output hashes, from the same adapters apply runs.
-    let generated =
-        crate::adapters::plan_outputs(&mut plan, &loaded.resolved, &sys, &home, loaded.read_root());
+    let generated = crate::adapters::plan_outputs(
+        &mut plan,
+        &loaded.resolved,
+        &sys,
+        &home,
+        &loaded.root,
+        loaded.read_root(),
+    );
     mark_excluded(&mut plan, &loaded.sources);
     Ok((plan, generated))
 }

@@ -3011,3 +3011,78 @@ fn a_published_generated_definition_that_grows_past_1_mib_is_refused_in_the_revi
     let new = &l.log()[log.len()..];
     assert!(!new.contains("launchctl bootout"), "{new}");
 }
+
+#[test]
+fn a_hardlinked_generator_input_the_update_keeps_is_refused_at_preview_as_apply_refuses_it() {
+    let l = Life::unpublished();
+    let seed = &l.fx.upstream.seed;
+    put(seed, "base/modules/life/module.toml", &generated_life());
+    l.fx.upstream.push("generate the agent definition");
+    let o = l.approved(&[]);
+    assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
+    // A second hard link to the body in the live checkout. The update does not change the body,
+    // so publication keeps the file and its links, while the staged copy has one link.
+    let body = "base/modules/life/files/org.example.agent.plist";
+    fs::hard_link(l.fx.root.join(body), l.fake.path().join("body-link")).unwrap();
+    put(
+        seed,
+        "base/modules/life/module.toml",
+        &format!(
+            "{}\n[[resources]]\nid = \"notes\"\nkind = \"link\"\nadapter = \"fs-link/v1\"\ntarget = \".config/life/notes\"\n[resources.value]\nsource = \"files/notes\"\n",
+            generated_life()
+        ),
+    );
+    put(seed, "base/modules/life/files/notes", "notes\n");
+    l.fx.upstream.push("add a link");
+    let refused = format!(
+        "E_SOURCE_UNTRUSTED life.agent-plist (Library/LaunchAgents/org.example.agent.plist, value) in base/modules/life/module.toml: source {body} is not a regular file owned by you with one hard link"
+    );
+    let p = l.preview(&[]);
+    assert_eq!(code(&p), 3, "{}\n{}", stdout(&p), stderr(&p));
+    in_order(&stdout(&p), &["scope: config", &refused, "result: blocked"]);
+    let o = l.sync(&digest_of(&p), &[]);
+    assert_ne!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
+    assert!(!stdout(&o).contains("E_PLAN_STALE"), "{}", stdout(&o));
+    assert!(!stderr(&o).contains("E_PLAN_STALE"), "{}", stderr(&o));
+    assert!(!l.fx.h(".config/life/notes").exists());
+    // Live apply on the checkout as publication would leave it refuses the same source.
+    git(&l.fx.root, &["pull", "-q", "--ff-only", "origin", "main"]);
+    let a = l.run(&["apply", "--root", l.fx.root_arg(), "--preview"]);
+    assert!(
+        stdout(&a).contains(&refused),
+        "{}\n{}",
+        stdout(&a),
+        stderr(&a)
+    );
+}
+
+#[test]
+fn a_hardlinked_generator_input_the_update_rewrites_is_accepted() {
+    let l = Life::unpublished();
+    let seed = &l.fx.upstream.seed;
+    put(seed, "base/modules/life/module.toml", &generated_life());
+    l.fx.upstream.push("generate the agent definition");
+    let o = l.approved(&[]);
+    assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
+    let body = "base/modules/life/files/org.example.agent.plist";
+    fs::hard_link(l.fx.root.join(body), l.fake.path().join("body-link")).unwrap();
+    // The fast-forward writes the changed body as a new file with one link.
+    put(
+        seed,
+        body,
+        &AGENT_PLIST.replace("/usr/bin/true", "/usr/bin/false"),
+    );
+    l.fx.upstream.push("the agent runs another program");
+    let flags = ["--restart", "life.agent", "--allow-disruptive", AGENT_OP];
+    let o = l.approved(&flags);
+    assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
+    in_order(
+        &stdout(&o),
+        &["  config: ok", "  services: ok", "result: ok"],
+    );
+    assert!(
+        fs::read_to_string(l.fx.h("Library/LaunchAgents/org.example.agent.plist"))
+            .unwrap()
+            .contains("/usr/bin/false")
+    );
+}

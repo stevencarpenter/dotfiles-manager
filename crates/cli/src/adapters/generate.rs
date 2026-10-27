@@ -569,27 +569,32 @@ fn link_producers(
 /// will write. Operations are in dependency order, so a producer comes before its consumer. A
 /// generation failure blocks the operation with a blocker that names the field and carries no
 /// content. A consumer of a blocked producer reports the producer's blocker as the cause.
-/// Source files are read below `read_root` (`sync` plans a staged copy). Returns each generated
-/// output by folded path, so `sync` can review a service from the definition it will write.
+/// Source files are read below `read_root` (`sync` plans a staged copy of `root`). Returns each
+/// generated output by folded path, so `sync` can review a service from the definition it will
+/// write.
 pub fn plan_outputs(
     plan: &mut Plan,
     resolved: &Resolved,
     sys: &Sys,
     home: &Dir,
+    root: &Path,
     read_root: &Path,
 ) -> BTreeMap<String, Vec<u8>> {
     let generators = Generators::new(resolved);
     // Source files are read as apply reads them: below the opened source root, without
     // following a link, regular, owned by the user, one hard link (`Dir::read_input`). A source
     // that apply would refuse is refused here, as a blocker, not as a surprise at apply.
-    let root = match plan.sources.as_slice() {
-        [_] => Dir::open_plain(read_root).ok(),
-        _ => None,
-    };
+    // `sync` reads a staged copy, so the live source a publication keeps is checked too.
+    let read = root_dir(plan, read_root);
+    let live = (read_root != root).then(|| root_dir(plan, root)).flatten();
     let source = |path: &str| -> Option<Vec<u8>> {
-        match root.as_ref()?.read_input_below(sys, path, MAX_HASHED_BYTES) {
-            Ok(Got::Bytes(b)) => Some(b),
-            _ => None,
+        let bytes = match read.as_ref()?.read_input_below(sys, path, MAX_HASHED_BYTES) {
+            Ok(Got::Bytes(b)) => b,
+            _ => return None,
+        };
+        match &live {
+            Some(dir) if kept_and_refused(dir, sys, &root.join(path), path, &bytes) => None,
+            _ => Some(bytes),
         }
     };
     let mut made = link_producers(&plan.operations, &source);
@@ -643,6 +648,32 @@ pub fn plan_outputs(
     }
     plan.blockers.extend(blockers);
     generated
+}
+
+/// The opened source root, when the plan has one source.
+fn root_dir(plan: &Plan, at: &Path) -> Option<Dir> {
+    match plan.sources.as_slice() {
+        [_] => Dir::open_plain(at).ok(),
+        _ => None,
+    }
+}
+
+/// Whether apply would refuse the live source `rel` (at `abs` below the opened live root `live`)
+/// that publication keeps. The staged copy holds a fresh file with one link, while a file that
+/// the fast-forward does not change keeps its links and owner, which `Dir::read_input` checks.
+/// A live file with other content is rewritten by the fast-forward, and a missing one is created.
+fn kept_and_refused(live: &Dir, sys: &Sys, abs: &Path, rel: &str, staged: &[u8]) -> bool {
+    if !matches!(
+        live.read_input_below(sys, rel, MAX_HASHED_BYTES),
+        Ok(Got::Absent)
+    ) {
+        return false;
+    }
+    std::fs::symlink_metadata(abs).is_ok_and(|m| {
+        m.is_file()
+            && m.len() == u64::try_from(staged.len()).unwrap_or(u64::MAX)
+            && std::fs::read(abs).is_ok_and(|b| b == staged)
+    })
 }
 
 fn live_equals(obs: &Observations, op: &Operation, hash: &str) -> bool {
