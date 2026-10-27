@@ -4337,5 +4337,6 @@ fn the_upgrade_step_reads_the_updaters_again_under_its_lock() {
     let log = u.log();
     assert!(!log.contains("claude update"), "{log}");
     assert!(log.contains("codex update"), "{log}");
-    assert!(!log.contains("brew"), "{log}");
+    // The codex row's second-copy check asks `brew list`; the brew updater never ran.
+    assert!(!log.contains("brew update"), "{log}");
 }
