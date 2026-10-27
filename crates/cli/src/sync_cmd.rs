@@ -1072,15 +1072,22 @@ impl ScopePlan {
         out
     }
 
-    /// The end-of-output warning of a skipped or blocked scope, if any (docs/sync.md).
-    fn warning(&self) -> Option<String> {
+    /// The end-of-output warnings of a skipped or blocked scope (docs/sync.md). A secrets scope
+    /// can be both: the blocked resources, with their corrections, and the secrets skipped for
+    /// want of a session each get a warning, since unlocking clears only the second.
+    fn warnings(&self) -> Vec<String> {
+        let mut out: Vec<String> = self.blocked_warning().into_iter().collect();
         if !self.skipped.is_empty() {
-            return Some(skipped_warning(
+            out.push(skipped_warning(
                 &self.skipped,
                 &self.no_session,
                 "run dfm sync or dfm secrets again",
             ));
         }
+        out
+    }
+
+    fn blocked_warning(&self) -> Option<String> {
         if !self.blocked {
             return None;
         }
@@ -1115,13 +1122,14 @@ fn skipped_warning(names: &[String], no_session: &[(String, String)], then: &str
 }
 
 /// The planned configuration operation that publishes the path of a service's "not published"
-/// blocker, if one does.
+/// blocker, if one does: it leaves a link or file there. A removal clears nothing.
 fn publisher<'a>(config: &'a Plan, b: &Blocker) -> Option<&'a str> {
     let path = dfm_model::fold::fold(b.path.as_deref()?);
     (b.code == Code::Conflict)
         .then(|| {
             config.operations.iter().find(|o| {
                 o.status == PlanStatus::Planned
+                    && o.action.publishes()
                     && o.path
                         .as_deref()
                         .is_some_and(|q| dfm_model::fold::fold(q) == path)
@@ -1407,6 +1415,22 @@ fn check_scopes(
             missing.get_or_insert(e);
         }
     }
+    // Each scope fits the journal alone, but the run appends the entries of every scope: they
+    // must fit together, the deferred services included, before anything is published.
+    let mut all = plans[0].plan.clone();
+    all.blockers.clear();
+    all.operations = plans
+        .iter()
+        .filter(|p| !p.blocked && p.skipped.is_empty())
+        .flat_map(|p| p.reviewed(&plans[0].plan).operations)
+        .collect();
+    let readable = Store::open_read(sys, &ctx.layout(), state_cmd::fail_from_env()?)?
+        .ok_or_else(crate::state_lost_refusal)?;
+    dfm_engine::check_journal_capacity(
+        readable.journal_len()?,
+        readable.settlement_entries()?,
+        &all,
+    )?;
     missing.map_or(Ok(open), Err)
 }
 
@@ -1829,7 +1853,7 @@ fn run_inner(
     }
     let (loaded, plans) = plan_staged(ctx, &binding, &root, &rel, &staging.tree(), args)?;
     let digest = sync_digest(&plans, &previewed);
-    printed.warnings = plans.iter().filter_map(ScopePlan::warning).collect();
+    printed.warnings = plans.iter().flat_map(ScopePlan::warnings).collect();
     show(&plans, &digest, ctx.color, out).map_err(w)?;
     printed.plan = true;
     // A digest that no longer matches is the first thing to report: the reviewer approved a

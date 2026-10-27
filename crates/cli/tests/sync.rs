@@ -2669,3 +2669,166 @@ fn a_refused_sync_ends_with_its_refusal_not_the_warnings() {
     assert!(!s.contains("warning:"), "{s}");
     assert!(stderr(&o).contains("E_APPROVAL_REQUIRED"), "{}", stderr(&o));
 }
+
+#[test]
+fn a_dangling_service_config_link_the_configuration_removes_leaves_services_blocked() {
+    let l = Life::new();
+    l.with_bar();
+    // Upstream drops bar's config link and its source, while bar still declares the file. The
+    // published link now dangles, and the configuration plan removes it: nothing publishes the
+    // file again, so the services scope stays blocked.
+    let seed = &l.fx.upstream.seed;
+    fs::remove_file(seed.join("base/modules/life/files/barrc")).unwrap();
+    let service = bar_module("barrc");
+    let service = &service[service.find("\n[[resources]]\nid = \"bar\"").unwrap()..];
+    put(
+        seed,
+        "base/modules/life/module.toml",
+        &format!("{LIFE}{service}"),
+    );
+    l.fx.upstream.push("drop bar's config link");
+    git(&l.fx.root, &["pull", "-q", "--ff-only", "origin", "main"]);
+    assert!(fs::metadata(l.fx.h(".config/bar/barrc")).is_err());
+    let allow = ["--allow-disruptive", "remove@life.barrc@.config/bar/barrc"];
+    let p = l.preview(&allow);
+    assert_eq!(code(&p), 0, "{}\n{}", stdout(&p), stderr(&p));
+    let s = stdout(&p);
+    in_order(
+        &s,
+        &[
+            "scope: config",
+            "planned remove@life.barrc@.config/bar/barrc",
+            "scope: services",
+            "blocked: this scope does not run: life.bar@service E_CONFLICT",
+            "warning: services blocked: life.bar@service E_CONFLICT",
+        ],
+    );
+    assert!(
+        !s.contains("after the configuration scope publishes"),
+        "{s}"
+    );
+    let log = l.log();
+    let o = l.sync(&digest_of(&p), &allow);
+    assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
+    let s = stdout(&o);
+    in_order(
+        &s,
+        &[
+            "  config: ok",
+            "  services: blocked (life.bar@service E_CONFLICT)",
+            "result: ok\nwarning: services blocked: life.bar@service E_CONFLICT",
+        ],
+    );
+    assert!(!s.contains("E_PLAN_STALE"), "{s}");
+    assert!(!l.fx.h(".config/bar/barrc").is_symlink());
+    // Read-only `brew services info` probes run; nothing starts or restarts the service.
+    let new = &l.log()[log.len()..];
+    for effect in ["brew services start", "brew services restart"] {
+        assert!(!new.contains(effect), "{new}");
+    }
+}
+
+#[test]
+fn a_sync_whose_scopes_fit_the_journal_alone_but_not_together_is_refused_before_publication() {
+    use dfm_model::state::{Class, JournalEntry, MAX_JOURNAL_BYTES, Phase};
+
+    let l = Life::unpublished();
+    let p = l.preview(&[]);
+    assert_eq!(code(&p), 0, "{}\n{}", stdout(&p), stderr(&p));
+    // The journaled operations of each scope, from its summary list of planned ids, the
+    // deferred service start included.
+    let mut per_scope: Vec<u64> = Vec::new();
+    for line in stdout(&p).lines() {
+        if line.starts_with("scope: ") {
+            per_scope.push(0);
+        } else if line
+            .strip_prefix("  planned ")
+            .is_some_and(|id| !id.contains(' '))
+        {
+            *per_scope.last_mut().unwrap() += 1;
+        }
+    }
+    let (most, total) = (
+        *per_scope.iter().max().unwrap(),
+        per_scope.iter().sum::<u64>(),
+    );
+    assert!(total > most, "{per_scope:?}");
+    // Room for the largest scope alone (4096 bytes per operation), less than one more.
+    let free = most * 4096 + 100;
+    let journal = l.fx.h(".local/state/dotfiles-manager/state/journal.jsonl");
+    let len = fs::metadata(&journal).map_or(0, |m| m.len());
+    let line = JournalEntry {
+        schema: dfm_model::state::SCHEMA,
+        op_id: "closed-1".into(),
+        op: "create-file".into(),
+        phase: Phase::Done,
+        at: "2026-10-10T00:00:00.000000000Z".into(),
+        resource: "core.x".into(),
+        adapter: "git-config/v1".into(),
+        class: Class::Normal,
+        recovery: None,
+        token: None,
+        reason: Some("x".repeat(1024)),
+    }
+    .to_line()
+    .unwrap();
+    let room = MAX_JOURNAL_BYTES - free - len;
+    let mut bytes = fs::read(&journal).unwrap_or_default();
+    bytes.extend(line.repeat(usize::try_from(room).unwrap() / line.len()));
+    fs::write(&journal, &bytes).unwrap();
+    let before = l.receipt_commands();
+    for o in [l.preview(&[]), l.sync(&digest_of(&p), &[])] {
+        assert_ne!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
+        assert!(stderr(&o).contains("E_LIMIT_EXCEEDED"), "{}", stderr(&o));
+    }
+    assert_eq!(l.receipt_commands(), before);
+    assert!(
+        !l.fx
+            .h("Library/LaunchAgents/org.example.agent.plist")
+            .is_symlink()
+    );
+    assert!(!l.log().contains("launchctl bootstrap"), "{}", l.log());
+}
+
+#[test]
+fn a_blocked_secret_and_a_secret_without_a_session_are_both_warned() {
+    let l = Life::new();
+    l.push_module(
+        "\n[[resources]]\nid = \"token2\"\nkind = \"secret\"\nadapter = \"op-template/v1\"\ntarget = \".config/example2/second.env\"\n[resources.value]\ntemplate = \"files/personal.env.tpl\"\naccount = \"example-account\"\nmode = 0o600\n",
+        &[],
+        "add a second secret",
+    );
+    // A directory at the first secret's target blocks it; no session skips the second.
+    fs::create_dir_all(l.fx.h(".config/example/personal.env")).unwrap();
+    l.sign_in(false);
+    let p = l.preview(&[]);
+    assert_eq!(code(&p), 0, "{}\n{}", stdout(&p), stderr(&p));
+    let s = stdout(&p);
+    let warnings: Vec<&str> = s
+        .lines()
+        .filter(|l| l.starts_with("warning: secrets"))
+        .collect();
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w.contains("secrets blocked: life.token")),
+        "{s}"
+    );
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w.contains("secrets skipped, no 1Password session")
+                && w.contains("life.token2")),
+        "{s}"
+    );
+    let o = l.sync(&digest_of(&p), &[]);
+    assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
+    let s = stdout(&o);
+    let tail = &s[s.find("result: ok\n").unwrap()..];
+    assert!(tail.contains("warning: secrets blocked: life.token"), "{s}");
+    assert!(
+        tail.contains("warning: secrets skipped, no 1Password session for example-account (op whoami exited 1): life.token2"),
+        "{s}"
+    );
+    assert!(!l.log().contains("op inject"), "{}", l.log());
+}
