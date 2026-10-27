@@ -2897,3 +2897,117 @@ fn a_definition_source_removed_upstream_gives_one_digest_and_blocks_only_service
     );
     assert!(l.fx.h(".config/life/notes").is_symlink());
 }
+
+/// `LIFE` with the agent's definition generated (`text-fragments/v1`) from its body and the
+/// fragments in `.config/agent`.
+fn generated_life() -> String {
+    let generated = LIFE.replace(
+        "kind = \"link\"\nadapter = \"fs-link/v1\"\ntarget = \"Library/LaunchAgents/org.example.agent.plist\"\n[resources.value]\nsource = \"files/org.example.agent.plist\"",
+        "kind = \"assemble\"\nadapter = \"text-fragments/v1\"\ntarget = \"Library/LaunchAgents/org.example.agent.plist\"\n[resources.value]\nbody = \"files/org.example.agent.plist\"\nfragments_dir = \".config/agent\"\npattern = \"*.frag\"\nseparator = \"\\n\"",
+    );
+    assert_ne!(generated, LIFE);
+    generated
+}
+
+/// Pushes a generated definition of about 1.2 MiB: each part fits the source read limit, and
+/// together they pass the 1 MiB definition limit.
+fn push_large_definition(l: &Life) {
+    let padding = |n: usize| format!("<!-- {} -->\n", "x".repeat(n));
+    let seed = &l.fx.upstream.seed;
+    put(seed, "base/modules/life/module.toml", &generated_life());
+    put(
+        seed,
+        "base/modules/life/files/org.example.agent.plist",
+        &AGENT_PLIST.replacen("<plist", &format!("{}<plist", padding(600 << 10)), 1),
+    );
+    l.fx.upstream.push("generate a large agent definition");
+    let frag = l.fx.h(".config/agent/pad.frag");
+    fs::create_dir_all(frag.parent().unwrap()).unwrap();
+    fs::write(&frag, padding(600 << 10)).unwrap();
+}
+
+#[test]
+fn a_generated_definition_over_1_mib_is_reviewed_as_the_published_file_is() {
+    // The generated definition is larger than the adapter reads. The review must refuse it as
+    // the services scope refuses the published file, not plan a start that goes stale after
+    // the configuration scope wrote it.
+    let l = Life::unpublished();
+    push_large_definition(&l);
+    let p = l.preview(&[]);
+    assert_eq!(code(&p), 0, "{}\n{}", stdout(&p), stderr(&p));
+    let s = stdout(&p);
+    in_order(
+        &s,
+        &[
+            "scope: services",
+            "Library/LaunchAgents/org.example.agent.plist exceeds 1 MiB",
+            // The definition is not published yet; its size blocks the start all the same.
+            "warning: services blocked: life.agent@service E_CONFLICT, life.agent@service E_PROBE_FAILED",
+        ],
+    );
+    let o = l.sync(&digest_of(&p), &[]);
+    assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
+    let s = stdout(&o);
+    assert!(!s.contains("E_PLAN_STALE"), "{s}");
+    in_order(
+        &s,
+        &[
+            "  config: ok",
+            "  services: blocked (life.agent@service E_CONFLICT, life.agent@service E_PROBE_FAILED)",
+            "result: ok",
+        ],
+    );
+    let plist = l.fx.h("Library/LaunchAgents/org.example.agent.plist");
+    assert!(fs::metadata(&plist).unwrap().len() > 1 << 20);
+    assert!(!l.log().contains("launchctl bootstrap"), "{}", l.log());
+    // The services scope on its own gives the same result for the published file.
+    let s = l.run(&["services", "--root", l.fx.root_arg(), "--preview"]);
+    assert!(
+        stdout(&s).contains(
+            "blocked: E_PROBE_FAILED life.agent in base/modules/life/module.toml: the state of org.example.agent with launchd-agent/v1 is unknown: Library/LaunchAgents/org.example.agent.plist exceeds 1 MiB"
+        ),
+        "{}\n{}",
+        stdout(&s),
+        stderr(&s)
+    );
+}
+
+#[test]
+fn a_published_generated_definition_that_grows_past_1_mib_is_refused_in_the_review() {
+    let l = Life::unpublished();
+    put(
+        &l.fx.upstream.seed,
+        "base/modules/life/module.toml",
+        &generated_life(),
+    );
+    l.fx.upstream.push("generate the agent definition");
+    let o = l.approved(&[]);
+    assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
+    assert!(l.log().contains("launchctl bootstrap"), "{}", l.log());
+    push_large_definition(&l);
+    let p = l.preview(&[]);
+    assert_eq!(code(&p), 0, "{}\n{}", stdout(&p), stderr(&p));
+    in_order(
+        &stdout(&p),
+        &[
+            "scope: services",
+            "Library/LaunchAgents/org.example.agent.plist exceeds 1 MiB",
+            "warning: services blocked: life.agent@service E_PROBE_FAILED.",
+        ],
+    );
+    let log = l.log();
+    let o = l.sync(&digest_of(&p), &[]);
+    assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
+    let s = stdout(&o);
+    assert!(!s.contains("E_PLAN_STALE"), "{s}");
+    in_order(
+        &s,
+        &[
+            "  config: ok",
+            "  services: blocked (life.agent@service E_PROBE_FAILED)",
+            "result: ok",
+        ],
+    );
+    let new = &l.log()[log.len()..];
+    assert!(!new.contains("launchctl bootout"), "{new}");
+}

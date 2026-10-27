@@ -1371,11 +1371,18 @@ impl Planner<'_> {
                 });
             }
         }
-        if missing {
+        let facts = self.cx.service.get(&r.id).cloned();
+        // A definition the probe already read and could not accept (`sync` reads the one the
+        // configuration scope will generate) is reported too: publishing the missing files
+        // does not clear it, so the caller must not wait for them.
+        let refused = matches!(
+            facts.as_ref().map(|f| &f.state),
+            Some(ServiceState::Unknown(_) | ServiceState::Refused(_))
+        );
+        if missing && !refused {
             self.ops.insert(id, op);
             return;
         }
-        let facts = self.cx.service.get(&r.id).cloned();
         let mut runs = String::new();
         // A secret definition (a token among its arguments) shows and records nothing of its
         // content: its mode-only precondition above is all the plan keeps of it.
