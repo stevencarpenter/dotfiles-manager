@@ -3601,6 +3601,49 @@ fn a_hardlinked_merge_fragment_source_the_update_keeps_is_refused_at_preview_as_
 }
 
 #[test]
+fn approving_a_takeover_whose_fragment_adoption_is_withheld_is_no_usage_error() {
+    let l = Life::new();
+    let o = l.approved(&[]);
+    assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
+    // The owner already holds a settings file and the exact fragment link, made by hand: the
+    // merge is a takeover and the fragment link an adoption, and the takeover runs after it.
+    fs::create_dir_all(l.fx.h(".claude/settings.d")).unwrap();
+    fs::write(l.fx.h(".claude/settings.json"), "{\"theme\":\"dark\"}\n").unwrap();
+    fs::set_permissions(
+        l.fx.h(".claude/settings.json"),
+        std::os::unix::fs::PermissionsExt::from_mode(0o600),
+    )
+    .unwrap();
+    l.push_module(
+        MERGE_FRAGMENT,
+        &[("frag.json", r#"{"fromFragment":true}"#)],
+        "merge a fragment",
+    );
+    std::os::unix::fs::symlink(
+        l.fx.root.join("base/modules/life/files/frag.json"),
+        l.fx.h(".claude/settings.d/10-local.json"),
+    )
+    .unwrap();
+    let takeover = "life.settings@.claude/settings.json";
+    let p = l.preview(&[]);
+    assert!(
+        stdout(&p).contains(&format!("withheld: {takeover}")),
+        "{}",
+        stdout(&p)
+    );
+    // Approving only the takeover leaves it withheld after the unapproved adoption it runs
+    // after. The flag names an operation of the plan: no usage error, the rest runs.
+    let o = l.plain(&["--allow-adopt", takeover]);
+    assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
+    assert!(!stderr(&o).contains("E_USAGE"), "{}", stderr(&o));
+    assert!(stdout(&o).contains("result: ok"), "{}", stdout(&o));
+    assert_eq!(
+        fs::read_to_string(l.fx.h(".claude/settings.json")).unwrap(),
+        "{\"theme\":\"dark\"}\n"
+    );
+}
+
+#[test]
 fn a_service_whose_definition_link_adoption_is_withheld_is_reviewed_from_the_existing_link() {
     let l = Life::new();
     let o = l.approved(&[]);

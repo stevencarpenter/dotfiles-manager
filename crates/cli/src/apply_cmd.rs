@@ -212,6 +212,12 @@ pub(crate) fn withheld(args: &Args, plan: &Plan) -> BTreeSet<String> {
     withheld
 }
 
+/// The approval ids for the operations that run: `ids` without the withheld ones. A flag that
+/// names a withheld operation still names an operation of the plan, so it is no usage error.
+fn running(ids: &BTreeSet<String>, held: &BTreeSet<String>) -> BTreeSet<String> {
+    ids.difference(held).cloned().collect()
+}
+
 /// `plan` without the operations `ids` names.
 pub(crate) fn without(plan: &Plan, ids: &BTreeSet<String>) -> Plan {
     let mut p = plan.clone();
@@ -245,7 +251,8 @@ pub(crate) fn check_before_lock(
         return Err(b.refusal());
     }
     // The gates check the operations that will run: a withheld one does not.
-    let plan = &without(plan, &withheld(args, plan));
+    let held = withheld(args, plan);
+    let plan = &without(plan, &held);
     // The gates that need no write run before the lock and in a preview, so a plan that apply
     // would refuse is refused here with the same code.
     let g = gates(plan, generator);
@@ -254,8 +261,11 @@ pub(crate) fn check_before_lock(
     }
     // An id that names no operation of its kind is a usage error and wins over a missing
     // approval. A missing approval is refused with every missing flag printed to paste.
-    let allow: BTreeSet<String> = args.allow.union(&by_rule(args, plan)).cloned().collect();
-    if let Err(all) = check_allowances(&g, &allow, &args.allow_adopt) {
+    let allow: BTreeSet<String> = running(&args.allow, &held)
+        .union(&by_rule(args, plan))
+        .cloned()
+        .collect();
+    if let Err(all) = check_allowances(&g, &allow, &running(&args.allow_adopt, &held)) {
         for e in all.iter().filter(|e| e.code != Code::Usage) {
             writeln!(out, "{}", visible_for_paste(&e.detail)).map_err(w)?;
         }
@@ -482,8 +492,13 @@ fn run_inner(
         return Err(store.stamp(stale(approved, &locked_digest)));
     }
     // The digest covers the whole plan, withheld operations included; only the rest runs.
-    let locked = without(&locked, &withheld(args, &locked));
-    let allow: BTreeSet<String> = args.allow.union(&by_rule(args, &locked)).cloned().collect();
+    let held = withheld(args, &locked);
+    let locked = without(&locked, &held);
+    let allow: BTreeSet<String> = running(&args.allow, &held)
+        .union(&by_rule(args, &locked))
+        .cloned()
+        .collect();
+    let allow_adopt = running(&args.allow_adopt, &held);
     let home = Dir::open_home(&sys, &layout.home).map_err(|r| store.stamp(r))?;
     let generator = generators(&second);
     let run = Run {
@@ -493,7 +508,7 @@ fn run_inner(
         home_path: home.shown(),
         generator: &generator,
         allow: &allow,
-        allow_adopt: &args.allow_adopt,
+        allow_adopt: &allow_adopt,
         fail: &fail,
     };
     // For `apply` the handlers go in here: after the lock and the second plan (which ran `id -u`)
