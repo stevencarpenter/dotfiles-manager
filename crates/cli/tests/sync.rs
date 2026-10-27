@@ -2222,12 +2222,17 @@ fn a_changed_secret_mode_is_not_a_no_op() {
     );
     git(&l.fx.root, &["commit", "-q", "-am", "stricter secret mode"]);
     // The observed mode (0600) is not the declared one (0400): the plan can see the change,
-    // so a plain sync asks for its approval instead of ending as a no-op.
-    let o = l.run(&["sync", "--root", l.fx.root_arg()]);
+    // so a plain sync renders the secret instead of ending as a no-op.
+    let o = l.plain(&[]);
     let s = stdout(&o);
-    assert_eq!(code(&o), 3, "{s}\n{}", stderr(&o));
+    assert_eq!(code(&o), 0, "{s}\n{}", stderr(&o));
     assert!(!s.contains("nothing to change: no approval needed"), "{s}");
-    assert!(stderr(&o).contains("E_APPROVAL_REQUIRED"), "{}", stderr(&o));
+    assert!(s.contains("  secrets: ok"), "{s}");
+    let mode = fs::metadata(l.fx.h(".config/example/personal.env"))
+        .unwrap()
+        .permissions()
+        .mode();
+    assert_eq!(mode & 0o777, 0o400);
 }
 
 #[test]
@@ -2754,20 +2759,10 @@ fn a_deferred_service_named_by_restart_is_reviewed_and_run_as_a_restart() {
     );
     l.push_module(&module, &[("barextra", "width=1\n")], "bar reads extra");
     const BAR_OP: &str = "life.bar@service";
-    // The restart is disruptive: the preview asks for its flag before anything is published.
-    let o = l.preview(&["--restart", "life.bar"]);
-    assert_eq!(code(&o), 3, "{}\n{}", stdout(&o), stderr(&o));
-    assert!(
-        stdout(&o).contains(&format!("--allow-disruptive '{BAR_OP}'")),
-        "{}",
-        stdout(&o)
-    );
-    let o = l.sync(&digest_of(&o), &["--restart", "life.bar"]);
-    assert_eq!(code(&o), 3, "{}\n{}", stdout(&o), stderr(&o));
-    assert!(!l.fx.h(".config/bar/extra").exists());
-    let flags = ["--restart", "life.bar", "--allow-disruptive", BAR_OP];
-    let p = l.preview(&flags);
+    // The `--restart` id approves the deferred restart: the preview asks for no other flag.
+    let p = l.preview(&["--restart", "life.bar"]);
     assert_eq!(code(&p), 0, "{}\n{}", stdout(&p), stderr(&p));
+    assert!(!stdout(&p).contains("--allow-disruptive"), "{}", stdout(&p));
     in_order(
         &stdout(&p),
         &[
@@ -2775,13 +2770,20 @@ fn a_deferred_service_named_by_restart_is_reviewed_and_run_as_a_restart() {
             "planned life.bar@service [life] restart life.bar on request (--restart) after the configuration scope publishes .config/bar/extra",
         ],
     );
+    // An explicit approval of the deferred restart is still accepted.
+    let flags = ["--restart", "life.bar", "--allow-disruptive", BAR_OP];
+    let e = l.preview(&flags);
+    assert_eq!(code(&e), 0, "{}\n{}", stdout(&e), stderr(&e));
+    assert_eq!(digest_of(&e), digest_of(&p));
+    assert!(!l.fx.h(".config/bar/extra").exists());
     let log = l.log();
-    let o = l.sync(&digest_of(&p), &flags);
+    let o = l.plain(&["--restart", "life.bar"]);
     assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
     in_order(
         &stdout(&o),
         &["  config: ok", "  services: ok", "result: ok"],
     );
+    assert!(l.fx.h(".config/bar/extra").is_symlink());
     assert!(
         l.log()[log.len()..].contains("brew services restart bar"),
         "{}",

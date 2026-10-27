@@ -1446,7 +1446,7 @@ fn show(
 
 /// The checks `apply` runs before its lock (`apply_cmd::check_before_lock`), per scope with that
 /// scope's approvals, for the scopes that will run (a deferred service is checked when its scope
-/// plans it again; only the approval of a deferred restart is checked here, before publication).
+/// plans it again; a deferred restart needs no flag, since `--restart` names it).
 /// An approval id that names no operation of any reviewed plan is a usage error. Missing
 /// approvals of every scope are printed as one list before the refusal. Returns whether the
 /// journal holds open work.
@@ -1457,16 +1457,16 @@ fn check_scopes(
     loaded: &Loaded,
     out: &mut dyn Write,
 ) -> Result<bool, Refusal> {
+    let config = plans[0].runnable();
     for kind in Allowance::ALL {
         let given = match kind {
             Allowance::Disruptive => &args.apply.allow,
             Allowance::Adopt => &args.apply.allow_adopt,
         };
-        if let Some(bad) = given.iter().find(|id| {
-            !plans
-                .iter()
-                .any(|p| needs(&p.reviewed(&plans[0].plan), kind, id))
-        }) {
+        if let Some(bad) = given
+            .iter()
+            .find(|id| !plans.iter().any(|p| needs(&p.reviewed(&config), kind, id)))
+        {
             return Err(usage(format!(
                 "{} {bad} names no planned {} in any scope of this sync",
                 kind.flag(),
@@ -1484,19 +1484,6 @@ fn check_scopes(
         }
         let generator = apply_cmd::generators_for(ctx, &sys, p.scope, loaded);
         let scoped = scope_args(args, p.scope, Some(&p.plan));
-        let restarts: Vec<String> = p
-            .deferred
-            .iter()
-            .filter(|(_, a)| **a == Action::Restart)
-            .map(|(id, _)| id.clone())
-            .collect();
-        let approved: BTreeSet<String> = args
-            .apply
-            .allow
-            .iter()
-            .filter(|id| restarts.contains(id))
-            .cloned()
-            .collect();
         match apply_cmd::check_before_lock(ctx, &scoped, &plan, &p.digest, &generator, out) {
             Ok(o) => open |= o,
             Err(e) if matches!(e.code, Code::DisruptiveUnapproved | Code::AdoptUnapproved) => {
@@ -1504,21 +1491,20 @@ fn check_scopes(
             }
             Err(e) => return Err(e),
         }
-        if let Err(e) = dfm_engine::check_allow(Allowance::Disruptive, &restarts, &approved) {
-            writeln!(out, "{}", visible_for_paste(&e.detail)).map_err(|e| {
-                Refusal::new(Code::IoFailed, format!("output failed: {}", e.kind()))
-            })?;
-            missing.get_or_insert(e);
-        }
     }
     // Each scope fits the journal alone, but the run appends the entries of every scope: they
-    // must fit together, the deferred services included, before anything is published.
+    // must fit together, the deferred services included and the withheld operations left out,
+    // before anything is published.
     let mut all = plans[0].plan.clone();
     all.blockers.clear();
     all.operations = plans
         .iter()
         .filter(|p| !p.blocked && p.skipped.is_empty())
-        .flat_map(|p| p.reviewed(&plans[0].plan).operations)
+        .flat_map(|p| {
+            let mut ops = p.reviewed(&config).operations;
+            ops.retain(|o| !p.withheld.contains(&o.id));
+            ops
+        })
         .collect();
     let readable = Store::open_read(sys, &ctx.layout(), state_cmd::fail_from_env()?)?
         .ok_or_else(crate::state_lost_refusal)?;
