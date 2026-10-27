@@ -8,6 +8,7 @@ mod merge_plan;
 pub mod package;
 pub mod secret;
 pub mod service;
+pub mod updater;
 pub use generate::{Gen, Generators, plan_outputs};
 pub use merge_plan::{MergeSources, merge_facts};
 

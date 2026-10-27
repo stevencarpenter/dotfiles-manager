@@ -35,10 +35,11 @@ pub enum DoctorCode {
     DependsUnknown,
     ProbingNotBuilt,
     StagedCopy,
+    Upgrade,
 }
 
 impl DoctorCode {
-    pub const ALL: [DoctorCode; 14] = [
+    pub const ALL: [DoctorCode; 15] = [
         DoctorCode::Ok,
         DoctorCode::NaSensitive,
         DoctorCode::OutputMissing,
@@ -53,6 +54,7 @@ impl DoctorCode {
         DoctorCode::DependsUnknown,
         DoctorCode::ProbingNotBuilt,
         DoctorCode::StagedCopy,
+        DoctorCode::Upgrade,
     ];
 
     pub const fn as_str(self) -> &'static str {
@@ -71,6 +73,7 @@ impl DoctorCode {
             DoctorCode::DependsUnknown => "D_DEPENDS_UNKNOWN",
             DoctorCode::ProbingNotBuilt => "D_PROBING_NOT_BUILT",
             DoctorCode::StagedCopy => "D_STAGED_COPY",
+            DoctorCode::Upgrade => "D_UPGRADE",
         }
     }
 
@@ -102,6 +105,7 @@ impl DoctorCode {
             DoctorCode::StagedCopy => {
                 "A name beside an owned output has the shape of a staged copy of an older build. Nothing removes it."
             }
+            DoctorCode::Upgrade => "The last upgrade did not end with `ok`.",
         }
     }
 }
@@ -430,6 +434,7 @@ mod tests {
             DoctorCode::DependsUnknown => 11,
             DoctorCode::ProbingNotBuilt => 12,
             DoctorCode::StagedCopy => 13,
+            DoctorCode::Upgrade => 14,
         }
     }
 
@@ -437,7 +442,7 @@ mod tests {
     fn all_lists_every_variant_once() {
         let mut idx: Vec<usize> = DoctorCode::ALL.iter().map(|c| index(*c)).collect();
         idx.sort_unstable();
-        assert_eq!(idx, (0..=13).collect::<Vec<_>>());
+        assert_eq!(idx, (0..=14).collect::<Vec<_>>());
     }
 
     #[test]

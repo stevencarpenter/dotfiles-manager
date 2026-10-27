@@ -1325,3 +1325,61 @@ fn a_path_handed_to_a_new_owner_is_pending_not_gone() {
         "{detail}"
     );
 }
+
+/// Writes a copy of the applied run's receipt as a later `upgrade` receipt with `outcome`.
+fn upgrade_receipt(fx: &Fx, outcome: &str) {
+    let dir = fx.state().join("receipts");
+    let f = fs::read_dir(&dir).unwrap().next().unwrap().unwrap().path();
+    let mut r: Value = serde_json::from_slice(&fs::read(&f).unwrap()).unwrap();
+    r["command"] = "upgrade".into();
+    r["op_id"] = "upgrade-1".into();
+    r["started_at"] = "2099-01-01T00:00:00.000000000Z".into();
+    r["finished_at"] = "2099-01-01T00:00:01.000000000Z".into();
+    r["plan_digest"] = Value::Null;
+    r["approval"] = Value::Null;
+    r["result"]["outcome"] = outcome.into();
+    r["result"]["exit_code"] = u8::from(outcome != "ok").into();
+    let to = dir.join("20990101T000000.000000000Z-upgrade-1.json");
+    fs::write(&to, serde_json::to_vec(&r).unwrap()).unwrap();
+    fs::set_permissions(&to, fs::metadata(&f).unwrap().permissions()).unwrap();
+}
+
+#[test]
+fn last_run_skips_upgrade_receipts() {
+    let fx = applied();
+    upgrade_receipt(&fx, "failed");
+    let (_, rows) = fx.rows();
+    let r = rows.iter().find(|r| r["kind"] == "receipt").unwrap();
+    // The upgrade receipt is readable, so the row is not partial.
+    assert_eq!(r["partial"], false, "{r:#?}");
+    assert_eq!(code_of(&rows, "receipt"), ("OK".into(), "D_OK".into()));
+}
+
+#[test]
+fn a_failed_upgrade_is_a_warning_row() {
+    let fx = applied();
+    upgrade_receipt(&fx, "failed");
+    let (c, rows) = fx.rows();
+    assert_eq!(c, 0, "WARN alone exits 0: {rows:#?}");
+    assert_eq!(
+        code_of(&rows, "upgrade"),
+        ("WARN".into(), "D_UPGRADE".into())
+    );
+    let r = rows.iter().find(|r| r["kind"] == "upgrade").unwrap();
+    assert_eq!(r["fix"], "Run dfm sync.", "{r:#?}");
+}
+
+#[test]
+fn an_ok_upgrade_is_an_ok_row() {
+    let fx = applied();
+    upgrade_receipt(&fx, "ok");
+    let (_, rows) = fx.rows();
+    assert_eq!(code_of(&rows, "upgrade"), ("OK".into(), "D_OK".into()));
+}
+
+#[test]
+fn no_upgrade_receipt_means_no_upgrade_row() {
+    let fx = applied();
+    let (_, rows) = fx.rows();
+    assert!(!rows.iter().any(|r| r["kind"] == "upgrade"), "{rows:#?}");
+}

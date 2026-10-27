@@ -323,7 +323,7 @@ fn has_keyword(code: &str, word: &str) -> bool {
 /// and in the signal module, and the exception is one `expect` on `install`. This reads raw
 /// text, so a comment, a raw string or a character literal cannot hide an attribute.
 #[test]
-fn the_unsafe_lint_is_named_only_in_the_crate_roots_and_on_the_two_signal_functions() {
+fn the_unsafe_lint_is_named_only_in_the_crate_roots_and_on_the_three_signal_functions() {
     let lint = ["un", "safe_code"].concat();
     let roots = [
         "crates/model/src/lib.rs",
@@ -351,11 +351,16 @@ fn the_unsafe_lint_is_named_only_in_the_crate_roots_and_on_the_two_signal_functi
     let engine = fs::read_to_string(repo_root().join("crates/engine/src/lib.rs")).unwrap();
     assert_eq!(engine.matches(&lint).count(), 1);
     assert!(engine.contains(&format!("#![deny({lint})]")));
-    // The signal module: one `expect` each, directly on `pub fn install` (the handlers) and on
-    // `pub(crate) fn kill_child` (ending a provider child, DFM-22), and no `allow`.
+    // The signal module: one `expect` each, directly on `pub fn install` (the handlers), on
+    // `pub(crate) fn kill_child` (ending a provider child, DFM-22) and on
+    // `pub(crate) fn new_session` (an updater child without a terminal, DFM-31), and no `allow`.
     let module = fs::read_to_string(repo_root().join("crates/engine/src/signal.rs")).unwrap();
     let flat: String = module.split_whitespace().collect::<Vec<_>>().join(" ");
-    let functions = ["pub fn install()", "pub(crate) fn kill_child("];
+    let functions = [
+        "pub fn install()",
+        "pub(crate) fn kill_child(",
+        "pub(crate) fn new_session(",
+    ];
     assert_eq!(module.matches(&lint).count(), functions.len(), "{module}");
     assert!(
         !flat.contains(&format!("allow({lint}")),
@@ -423,10 +428,18 @@ fn only_the_mutating_path_of_apply_installs_the_signal_handlers() {
         .filter(|f| fs::read_to_string(f).unwrap().contains("signal::install("))
         .map(|f| f.strip_prefix(repo_root()).unwrap().display().to_string())
         .collect();
+    // sync arms them before its first updater when no scope ran (docs/upgrade.md).
     assert_eq!(
         callers,
-        ["crates/cli/src/apply_cmd.rs", "crates/cli/src/trial_cmd.rs"]
+        [
+            "crates/cli/src/apply_cmd.rs",
+            "crates/cli/src/sync_cmd.rs",
+            "crates/cli/src/trial_cmd.rs"
+        ]
     );
+    let sync = fs::read_to_string(repo_root().join("crates/cli/src/sync_cmd.rs")).unwrap();
+    assert_eq!(sync.matches("signal::install(").count(), 1);
+    assert!(sync.find("signal::install(").unwrap() < sync.find("updater::run(").unwrap());
     let trial = fs::read_to_string(repo_root().join("crates/cli/src/trial_cmd.rs")).unwrap();
     assert_eq!(trial.matches("signal::install(").count(), 1);
     assert!(trial.find("signal::install(").unwrap() < trial.find("find_owner(&runner").unwrap());

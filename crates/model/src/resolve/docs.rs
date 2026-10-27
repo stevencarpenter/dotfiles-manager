@@ -5,6 +5,7 @@
 use super::error::{ResolveError, category};
 use super::pointer;
 use crate::Code;
+use crate::updater::Updater;
 use std::collections::{BTreeMap, BTreeSet};
 use toml::{Table, Value};
 
@@ -73,6 +74,7 @@ pub(crate) struct ProfileDoc {
     pub architecture: String,
     pub modules: Vec<String>,
     pub overrides: Vec<OverrideDecl>,
+    pub updaters: Vec<Updater>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -223,7 +225,7 @@ fn only_keys(file: &str, t: &Table, allowed: &[&str], at: &str) -> Result<(), Re
             Code::FieldUnknown,
             file,
             format!("unknown key `{k}` in {at}; schema 1 accepts known keys only"),
-            "remove the key; a new key needs a new schema version",
+            "remove the key; a new required key needs a new schema version, an optional key needs a manager that knows it",
         )
         .field(format!("{at}/{k}"))
         .rejected(category(&t[k]))),
@@ -406,6 +408,7 @@ pub(crate) fn profile(file: &str, bytes: &[u8]) -> Result<ProfileDoc, ResolveErr
             "architecture",
             "modules",
             "overrides",
+            "updaters",
         ],
         "",
     )?;
@@ -451,7 +454,39 @@ pub(crate) fn profile(file: &str, bytes: &[u8]) -> Result<ProfileDoc, ResolveErr
         architecture,
         modules: id_list(file, &t, "modules")?,
         overrides: overrides(file, &t)?,
+        updaters: updaters(file, &t)?,
     })
+}
+
+/// The optional `updaters` list: names from the fixed set, each once, in the declared order.
+fn updaters(file: &str, t: &Table) -> Result<Vec<Updater>, ResolveError> {
+    let Some(v) = t.get("updaters") else {
+        return Ok(vec![]);
+    };
+    let mut out = Vec::new();
+    for (i, name) in string_list(file, v, "/updaters")?.iter().enumerate() {
+        let at = format!("/updaters/{i}");
+        let u = Updater::parse(name).ok_or_else(|| {
+            invalid(
+                file,
+                format!("unknown updater `{name}`"),
+                "use one of: brew, claude, codex, opencode, skills",
+            )
+            .field(at.clone())
+            .rejected("string")
+        })?;
+        if out.contains(&u) {
+            return Err(invalid(
+                file,
+                format!("updater `{name}` is declared twice"),
+                "declare each updater once",
+            )
+            .field(at)
+            .rejected("string"));
+        }
+        out.push(u);
+    }
+    Ok(out)
 }
 
 pub(crate) fn bundle(file: &str, bytes: &[u8]) -> Result<BundleDoc, ResolveError> {
@@ -772,6 +807,55 @@ mod tests {
         assert_eq!(e.rejected, Some("string"));
         assert_eq!(e.source, "m/module.toml");
         assert!(!e.to_string().contains("\"x\""));
+    }
+
+    const PROFILE: &str = "schema = 1\nid = \"p\"\nbundle = \"b.toml\"\nplatform = \"macos\"\narchitecture = \"arm64\"\nmodules = []\noverrides = []\n";
+
+    fn profile_with(extra: &str) -> Result<ProfileDoc, ResolveError> {
+        profile("p.toml", format!("{PROFILE}{extra}").as_bytes())
+    }
+
+    #[test]
+    fn profile_updaters_keep_the_declared_order() {
+        let p = profile_with("updaters = [\"codex\", \"brew\"]\n").unwrap();
+        assert_eq!(p.updaters, vec![Updater::Codex, Updater::Brew]);
+    }
+
+    #[test]
+    fn profile_without_updaters_has_none() {
+        assert!(profile_with("").unwrap().updaters.is_empty());
+    }
+
+    #[test]
+    fn profile_unknown_updater_is_manifest_invalid() {
+        let e = profile_with("updaters = [\"npm\"]\n").unwrap_err();
+        assert_eq!(e.code, Code::ManifestInvalid);
+        assert_eq!(e.field.as_deref(), Some("/updaters/0"));
+    }
+
+    #[test]
+    fn profile_duplicate_updater_is_manifest_invalid() {
+        let e = profile_with("updaters = [\"brew\", \"brew\"]\n").unwrap_err();
+        assert_eq!(e.code, Code::ManifestInvalid);
+        assert_eq!(e.field.as_deref(), Some("/updaters/1"));
+    }
+
+    #[test]
+    fn profile_updaters_must_be_strings() {
+        let e = profile_with("updaters = [1]\n").unwrap_err();
+        assert_eq!(e.code, Code::ManifestInvalid);
+        assert_eq!(e.field.as_deref(), Some("/updaters"));
+        assert_eq!(e.rejected, Some("integer"));
+    }
+
+    #[test]
+    fn unknown_key_hint_names_optional_keys() {
+        let e = profile_with("bogus = 1\n").unwrap_err();
+        assert_eq!(e.code, Code::FieldUnknown);
+        assert_eq!(
+            e.action,
+            "remove the key; a new required key needs a new schema version, an optional key needs a manager that knows it"
+        );
     }
 
     #[test]

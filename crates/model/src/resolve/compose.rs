@@ -242,6 +242,7 @@ pub(crate) fn resolve(
         profile: profile.id,
         platform: profile.platform,
         architecture: profile.architecture,
+        updaters: profile.updaters,
         modules: order,
         resources: resolved,
         includes,

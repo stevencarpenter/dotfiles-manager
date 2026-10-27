@@ -55,7 +55,8 @@ All text passes through `dfm_model::display::visible`. Neither format has an ANS
 | `state` | Stray entries (interrupted writes, staging directories) | WARN `D_STATE_PARTIAL`, labeled partial. |
 | `intent` | A journal intent with no outcome | ERROR `E_OP_INTERRUPTED`. A running apply also leaves an intent until it ends, and doctor cannot tell the two apart. Fix: wait for a running apply, then run `apply`, which settles it. |
 | `intent` | A journal `unknown` entry that no later entry settled | ERROR `E_OP_INTERRUPTED`, required. The detail names the operation and its journal id, and says whether it blocks one path or, with no intent record, a whole resource. Fix: `state recover` or `apply`, which probe it again, or `state resolve '<journal-id>' --as done|failed` (`done` is refused for an entry with more than one path). Doctor never settles. The row stays until a later entry settles the operation. |
-| `receipt` | The newest readable receipt | OK `D_OK`, WARN `D_LAST_RUN` when its outcome is not `ok`, N/A `D_NO_RECEIPT`. |
+| `receipt` | The newest readable receipt that is not an upgrade receipt | OK `D_OK`, WARN `D_LAST_RUN` when its outcome is not `ok`, N/A `D_NO_RECEIPT`. |
+| `upgrade` | The newest readable `upgrade` receipt (docs/upgrade.md); no row before the first one | OK `D_OK`, WARN `D_UPGRADE` when its outcome is not `ok`. Fix: "Run dfm sync." |
 | `lock` | The lock file | OK `D_OK` (no file, or an empty file with no note) or OK `D_LOCK_NOTE`. WARN `E_STORAGE_INVALID` when the file is a link, a directory or a FIFO, is owned by another user, has a mode other than 0600, has more than one hard link, or cannot be opened or read. The writer lock opens the file read-write, so it cannot use 0400, 0200 or 0000, and it refuses group or other bits. The file is opened without following a link and checked on the descriptor. |
 | `profile` | The resolved profile | OK `D_OK`. ERROR with the resolver's code (`E_MANIFEST_INVALID`, `E_SOURCE_MISSING`, `E_PROFILE_INVALID`, and so on). UNKNOWN `D_DEPENDS_UNKNOWN` without a readable binding. |
 | `module` | Each selected module | OK `D_OK`. |
@@ -106,6 +107,7 @@ Doctor's own inspection reads and hashes no content of a sensitive output, whoev
 | `D_DEPENDS_UNKNOWN` | A check cannot run because an earlier check failed. |
 | `D_PROBING_NOT_BUILT` | Tools, versions and PATH are not probed in this build. |
 | `D_STAGED_COPY` | A name beside an owned output has the shape of a staged copy of an older build. Nothing removes it. |
+| `D_UPGRADE` | The last upgrade did not end with `ok`. |
 
 `E_*` codes keep the meaning given in [state.md](state.md), [resolver.md](resolver.md), [planner.md](planner.md) and [apply.md](apply.md).
 

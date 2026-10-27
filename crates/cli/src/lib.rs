@@ -55,7 +55,7 @@ usage:
                                [--preview] [-y|--yes-plan <digest>]
   dfm sync [--root <dir>] [--preview] [-y|--yes-plan <digest>] [--allow-disruptive <operation-id>]...
                                [--allow-adopt <operation-id>]... [--restart <resource-id>]...
-                               [--trust-origin <origin>]...
+                               [--trust-origin <origin>]... [--no-upgrade]
   dfm self-update [--source <checkout>] [--commit <sha>]
   dfm self-check --build-controls <staged tree>
   dfm self-check --fixture-dir <dir>
@@ -150,7 +150,10 @@ runs; a restart runs only with --restart <resource-id>. A scope that fails stops
 (not_started). Without a 1Password session the secrets are skipped; a blocked packages, secrets or
 services plan does not run; the other scopes run, and the last lines of the output warn what waits
 and how to fix it. A blocked configuration plan refuses the run. A pin is never rewritten.
---preview fetches into staging and changes nothing else. See docs/sync.md.
+Then the updaters the profile declares (updaters = [...], from brew, claude, codex, opencode,
+skills) run in order, detached, each reported updated, current, held, pending, failed or blocked,
+with one upgrade receipt; a failure warns and the exit stays 0. --no-upgrade skips them.
+--preview fetches into staging and changes nothing else. See docs/sync.md and docs/upgrade.md.
 
 self-update rebuilds and installs the manager from a local dotfiles-manager checkout: it reads
 scripts/bootstrap.sh of the commit (--commit, else the checkout's HEAD) and runs its install with
@@ -227,6 +230,7 @@ impl Ctx {
             cwd: dfm_engine::proc::run_dir(&self.platform.cache_dir()),
             uid: sys.uid,
             grace: dfm_engine::proc::GRACE,
+            detach: false,
         }
     }
 

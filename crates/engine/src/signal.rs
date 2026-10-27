@@ -168,6 +168,29 @@ pub(crate) fn kill_child(pid: u32, group: bool, term: bool) {
     let _ = unsafe { libc::kill(target, sig) };
 }
 
+/// Starts the child of `cmd` in a new session, with no controlling terminal: a program it runs
+/// that opens `/dev/tty` (a `sudo` password prompt) fails at once instead of stopping in a
+/// background group (docs/upgrade.md). The session leader's pid is its process group id, so
+/// [`kill_child`] with `group` still reaches everything it started.
+#[expect(
+    unsafe_code,
+    reason = "setsid has no safe API; the hook calls only that async-signal-safe function"
+)]
+pub(crate) fn new_session(cmd: &mut std::process::Command) {
+    use std::os::unix::process::CommandExt;
+    // SAFETY: the hook runs in the child between fork and exec. It calls only `setsid`, which is
+    // async-signal-safe, allocates nothing and touches no memory of the parent.
+    unsafe {
+        cmd.pre_exec(|| {
+            if libc::setsid() == -1 {
+                Err(std::io::Error::last_os_error())
+            } else {
+                Ok(())
+            }
+        });
+    }
+}
+
 /// The stop request, if a signal arrived since [`install`]. The refusal carries the code that
 /// maps to exit 130 (SIGINT) or 143 (SIGTERM).
 pub fn requested() -> Option<Refusal> {

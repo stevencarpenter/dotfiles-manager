@@ -18,7 +18,7 @@ use dfm_model::plan::{
     Action, Node, Observations, Operation, Owned, Ownership, Plan, Request, Status, in_scope,
     link_fingerprint, sensitive_paths,
 };
-use dfm_model::state::{Class, Ledger, unfinished, unresolved};
+use dfm_model::state::{Class, Ledger, Receipt, unfinished, unresolved};
 use dfm_model::{Code, Refusal};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Write};
@@ -281,6 +281,7 @@ fn state_rows(
     staged_copy_rows(sys, layout, &paths, rows);
     let bad = evidence_rows(&l, &findings, rows);
     receipt_row(&l, bad, rows);
+    upgrade_row(&l, rows);
     owned
 }
 
@@ -562,12 +563,42 @@ fn evidence_rows(l: &StateLoaded, findings: &[dfm_engine::Finding], rows: &mut V
     bad
 }
 
-fn receipt_row(l: &StateLoaded, bad: usize, rows: &mut Vec<Row>) {
-    let latest = l
-        .receipts
+/// The newest readable receipt whose command is (`upgrade`) or is not (`!upgrade`) the upgrade
+/// step's.
+fn latest_receipt(l: &StateLoaded, upgrade: bool) -> Option<(&String, &Receipt)> {
+    l.receipts
         .iter()
         .filter_map(|(n, r)| r.as_ref().ok().map(|r| (n, r)))
-        .max_by(|a, b| a.0.cmp(b.0));
+        .filter(|(_, r)| (r.command == "upgrade") == upgrade)
+        .max_by(|a, b| a.0.cmp(b.0))
+}
+
+/// The last upgrade, apart from the last run, so a failed updater does not hide the result of
+/// the last configuration run (docs/upgrade.md). No row before the first upgrade.
+fn upgrade_row(l: &StateLoaded, rows: &mut Vec<Row>) {
+    let Some((name, r)) = latest_receipt(l, true) else {
+        return;
+    };
+    let detail = format!(
+        "upgrade {} (exit {}) finished {}",
+        r.result.outcome, r.result.exit_code, r.finished_at
+    );
+    rows.push(if r.result.outcome == "ok" {
+        ok_row("upgrade", name, &detail)
+    } else {
+        Row::new(
+            "upgrade",
+            D::Upgrade,
+            Level::Warn,
+            name,
+            &detail,
+            "Run dfm sync.",
+        )
+    });
+}
+
+fn receipt_row(l: &StateLoaded, bad: usize, rows: &mut Vec<Row>) {
+    let latest = latest_receipt(l, false);
     let unreadable = l.receipts.iter().filter(|r| r.1.is_err()).count();
     let row = match latest {
         None => Row::new(

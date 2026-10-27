@@ -19,6 +19,7 @@ fn runner(bin: &Path) -> Runner {
         cwd: bin.join("run"),
         uid: std::fs::metadata(bin).unwrap().uid(),
         grace: Duration::from_secs(1),
+        detach: false,
     }
 }
 

@@ -43,6 +43,9 @@ pub struct Runner {
     pub uid: u32,
     /// The grace period between SIGTERM and SIGKILL, [`GRACE`] in production. Tests shorten it.
     pub grace: Duration,
+    /// Start each child in a new session with no controlling terminal, so a prompt fails instead
+    /// of waiting (the updaters, docs/upgrade.md). Its group is then its own.
+    pub detach: bool,
 }
 
 /// One child to run.
@@ -235,8 +238,10 @@ impl Runner {
         // end it and everything it started. Before that (a credential gate, a plan-time probe), a
         // terminal SIGINT must reach the child too, so it stays in the manager's group and the
         // runner signals the child alone.
-        let group = signal::installed();
-        if group {
+        let group = self.detach || signal::installed();
+        if self.detach {
+            signal::new_session(&mut cmd);
+        } else if group {
             cmd.process_group(0);
         }
         let mut child = cmd

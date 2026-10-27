@@ -15,6 +15,7 @@ pub mod plan;
 pub mod refusal;
 pub mod resolve;
 pub mod state;
+pub mod updater;
 
 pub use exit::Exit;
 pub use fold::fold;

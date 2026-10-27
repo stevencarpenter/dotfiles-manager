@@ -9,7 +9,7 @@
 //! rebase, commit or push. A nested source is pinned to an exact commit, and the lock that holds
 //! the pin is never rewritten.
 
-use crate::adapters::secret;
+use crate::adapters::{secret, updater};
 use crate::plan_cmd::{plan_for, plan_with_outputs, render_body};
 use crate::read_fs::read_regular_bounded;
 use crate::source_fs::load_scoped;
@@ -30,6 +30,7 @@ use dfm_model::plan::{
 };
 use dfm_model::resolve::resolve;
 use dfm_model::state::{self, Class, JournalEntry, Phase, Recovery, rfc3339};
+use dfm_model::updater::Updater;
 use dfm_model::{Code, Refusal};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -73,15 +74,23 @@ pub struct Args {
     trust: Vec<String>,
     /// `--restart <resource-id>`, for the services scope.
     restart: BTreeSet<String>,
+    /// False with `--no-upgrade`: the profile's updaters do not run (docs/upgrade.md).
+    upgrade: bool,
 }
 
 /// `sync [--root <dir>] [--preview] [--yes-plan <digest>] [--allow-disruptive <id>]...
 /// [--allow-adopt <id>]... [--restart <resource-id>]... [--trust-origin <origin>]...`
 pub fn parse_args(args: &[String]) -> Result<Args, Refusal> {
     let (mut trust, mut restart, mut rest) = (Vec::new(), BTreeSet::new(), Vec::new());
+    let mut upgrade = true;
     let mut it = args.iter();
     while let Some(a) = it.next() {
-        if a == "--trust-origin" || a == "--restart" {
+        if a == "--no-upgrade" {
+            if !upgrade {
+                return Err(usage("--no-upgrade given twice"));
+            }
+            upgrade = false;
+        } else if a == "--trust-origin" || a == "--restart" {
             let v = it
                 .next()
                 .ok_or_else(|| usage(format!("{a} needs a value")))?;
@@ -111,6 +120,7 @@ pub fn parse_args(args: &[String]) -> Result<Args, Refusal> {
         apply,
         trust,
         restart,
+        upgrade,
     })
 }
 
@@ -1804,8 +1814,14 @@ pub fn run(ctx: &Ctx, args: &Args, out: &mut dyn Write) -> Result<(), Refusal> {
         );
     }
     // Last, so the owner sees them without scrolling (docs/sync.md, "The four scopes"). A
-    // refused run ends with its refusal instead.
-    for warning in printed.warnings.iter().filter(|_| r.is_ok()) {
+    // refused run ends with its refusal instead. A stopped run still names what did not finish.
+    let stopped = r.as_ref().err().is_some_and(|e| {
+        matches!(
+            e.exit(),
+            dfm_model::Exit::Interrupted | dfm_model::Exit::Terminated
+        )
+    });
+    for warning in printed.warnings.iter().filter(|_| r.is_ok() || stopped) {
         let _ = writeln!(
             out,
             "{} {warning}",
@@ -1819,6 +1835,7 @@ pub fn run(ctx: &Ctx, args: &Args, out: &mut dyn Write) -> Result<(), Refusal> {
 fn finish(
     ctx: &Ctx,
     lines: &[(Scope, String)],
+    upgrade: Option<&str>,
     result: Result<(), Refusal>,
     out: &mut dyn Write,
     printed: &mut Printed,
@@ -1828,6 +1845,9 @@ fn finish(
     writeln!(out, "{}", paint::label(ctx.color, "scopes:")).map_err(w)?;
     for (scope, status) in lines {
         writeln!(out, "  {}: {status}", scope.as_str()).map_err(w)?;
+    }
+    if let Some(u) = upgrade {
+        writeln!(out, "  upgrade: {u}").map_err(w)?;
     }
     let exit = result
         .as_ref()
@@ -1951,7 +1971,7 @@ fn run_inner(
     // would refuse is refused here before any source is published.
     let journal_open = check_scopes(ctx, args, &plans, &loaded, out)?;
     if args.apply.preview {
-        return Ok(());
+        return upgrade_preview(ctx, &sys, args, &loaded.resolved.updaters, out);
     }
     // A source that moves is a publication, so only a run with every source current, and no
     // scope that would run with a change, can end here (docs/apply.md, step 4).
@@ -1981,7 +2001,24 @@ fn run_inner(
                 (p.scope, status)
             })
             .collect();
-        return finish(ctx, &lines, Ok(()), out, printed);
+        // The review's shared lock and staging end here: the upgrade step takes the writer lock.
+        drop(staging);
+        drop(shared);
+        let (up, result) = match upgrade(
+            ctx,
+            &sys,
+            &binding,
+            (&root, &rel),
+            args,
+            &loaded.resolved.updaters,
+            out,
+            printed,
+        ) {
+            // A stop request during the updaters decides the exit (docs/upgrade.md).
+            Ok(up) => (up, dfm_engine::signal::requested().map_or(Ok(()), Err)),
+            Err(e) => (Some(format!("failed ({})", e.code.as_str())), Err(e)),
+        };
+        return finish(ctx, &lines, up.as_deref(), result, out, printed);
     }
     // Without a digest the run approves the plan it printed (DFM-76). A run that grants an
     // origin stops here: the owner reviews what the new origin brings first.
@@ -2134,12 +2171,266 @@ fn run_inner(
     if let Some(r) = dfm_engine::signal::requested() {
         failure = Some(r);
     }
+    // The updaters run after every scope that ran, and not after a refusal (docs/upgrade.md).
+    let up = match failure {
+        Some(_) => None,
+        None => match upgrade(
+            ctx,
+            &sys,
+            &binding,
+            (&root, &rel),
+            args,
+            &locked_loaded.resolved.updaters,
+            out,
+            printed,
+        ) {
+            Ok(up) => {
+                failure = dfm_engine::signal::requested();
+                up
+            }
+            // The scopes already ran: the summary still prints, and the exit is the error's.
+            Err(e) => {
+                let up = format!("failed ({})", e.code.as_str());
+                failure = Some(e);
+                Some(up)
+            }
+        },
+    };
     let result = match failure {
         Some(e) if changed => Err(e.after_mutation()),
         Some(e) => Err(e),
         None => Ok(()),
     };
-    finish(ctx, &lines, result, out, printed)
+    finish(ctx, &lines, up.as_deref(), result, out, printed)
+}
+
+// ---- the upgrade step (docs/upgrade.md) ------------------------------------------------------
+
+fn status_name(s: state::Status) -> String {
+    serde_json::to_value(s)
+        .ok()
+        .and_then(|v| v.as_str().map(str::to_string))
+        .unwrap_or_default()
+}
+
+/// The updater environment: the provider runner and why `brew` must wait for the trials.
+fn updater_env<'a>(
+    ctx: &'a Ctx,
+    runner: &'a Runner,
+    trials: &'a BTreeSet<String>,
+) -> updater::Env<'a> {
+    updater::Env {
+        provider: runner,
+        home: ctx.platform.home(),
+        trials,
+        timeouts: updater::Timeouts::DEFAULT,
+    }
+}
+
+/// `--preview`: what the upgrade step would run. Nothing runs and nothing is written.
+fn upgrade_preview(
+    ctx: &Ctx,
+    sys: &Sys,
+    args: &Args,
+    updaters: &[Updater],
+    out: &mut dyn Write,
+) -> Result<(), Refusal> {
+    let w =
+        |e: std::io::Error| Refusal::new(Code::IoFailed, format!("output failed: {}", e.kind()));
+    if !args.upgrade {
+        return writeln!(out, "upgrade: skipped (--no-upgrade)").map_err(w);
+    }
+    if updaters.is_empty() {
+        return writeln!(out, "upgrade: none declared in the profile").map_err(w);
+    }
+    let (runner, held) = (ctx.runner(sys), BTreeSet::new());
+    let env = updater_env(ctx, &runner, &held);
+    writeln!(out, "{}", paint::label(ctx.color, "upgrade:")).map_err(w)?;
+    for u in updaters {
+        writeln!(
+            out,
+            "  {}: {}",
+            u.name(),
+            visible(&updater::preview(*u, &env))
+        )
+        .map_err(w)?;
+    }
+    Ok(())
+}
+
+/// Runs the profile's updaters in order under the writer lock, prints one row each, writes one
+/// receipt and adds a warning per updater that did not succeed. `reviewed` is the list the
+/// review resolved. Another sync may change the profile before the lock, so under the lock the
+/// profile in `root` is resolved again, and an updater runs only when the review listed it and
+/// the profile still declares it: one added meanwhile runs in the next sync, after its review.
+/// Returns the summary for the `scopes:` block, or `None` when the step printed only why it did
+/// not run.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the step needs the binding, the root to read the profile again, and the run's output"
+)]
+fn upgrade(
+    ctx: &Ctx,
+    sys: &Sys,
+    binding: &Binding,
+    (root, rel): (&Path, &str),
+    args: &Args,
+    reviewed: &[Updater],
+    out: &mut dyn Write,
+    printed: &mut Printed,
+) -> Result<Option<String>, Refusal> {
+    let w =
+        |e: std::io::Error| Refusal::new(Code::IoFailed, format!("output failed: {}", e.kind()));
+    if !args.upgrade {
+        writeln!(out, "upgrade: skipped (--no-upgrade)").map_err(w)?;
+        return Ok(Some("skipped (--no-upgrade)".into()));
+    }
+    // A profile that declares none takes no lock.
+    if reviewed.is_empty() {
+        writeln!(out, "upgrade: none declared in the profile").map_err(w)?;
+        return Ok(None);
+    }
+    state_cmd::fail_from_env()?.hit("sync-before-upgrade-lock")?;
+    // A sync with nothing to change ran no scope, so nothing armed the handlers yet.
+    if !dfm_engine::signal::installed() {
+        dfm_engine::signal::install()?;
+    }
+    let layout = ctx.layout();
+    let store = Store::open_write_with(*sys, &layout, state_cmd::fail_from_env()?, false)?;
+    if !store.is_initialized() {
+        return Err(crate::state_lost_refusal());
+    }
+    store.require_identity(binding)?;
+    let declared = resolve(&load_scoped(root, rel)?, rel, &builtin_catalog())?.updaters;
+    let updaters: Vec<Updater> = reviewed
+        .iter()
+        .filter(|u| declared.contains(u))
+        .copied()
+        .collect();
+    if updaters.is_empty() {
+        writeln!(out, "upgrade: none declared in the profile").map_err(w)?;
+        return Ok(None);
+    }
+    // An unreadable record, or a trials directory that cannot be listed, may hide a Homebrew
+    // trial, so it holds brew too.
+    let loaded = store.load();
+    let unread = loaded
+        .problems
+        .iter()
+        .filter(|f| f.file == "trials")
+        .map(|f| format!("{}: {}", f.file, f.detail))
+        .chain(
+            loaded
+                .strays
+                .iter()
+                .filter(|s| s.starts_with("trials/"))
+                .map(|s| format!("unfinished trial record {s}")),
+        );
+    let held: BTreeSet<String> = loaded
+        .trials
+        .into_iter()
+        .filter_map(|(name, t)| match t {
+            Err(_) => Some(format!("unreadable trial record {name}")),
+            Ok(t) => t
+                .package
+                .filter(|p| p.adapter == "homebrew/v1")
+                .map(|p| format!("active trial {} (homebrew/v1 {})", t.trial_id, p.name)),
+        })
+        .chain(unread)
+        .collect();
+    let started = now_ns()?;
+    let mut runner = ctx.runner(sys);
+    runner.detach = true;
+    let env = updater_env(ctx, &runner, &held);
+    writeln!(out, "{}", paint::label(ctx.color, "upgrade:")).map_err(w)?;
+    let mut ops = Vec::new();
+    for u in &updaters {
+        let row = updater::run(*u, &env);
+        let status = status_name(row.status);
+        let versions = match (&row.before, &row.after) {
+            (Some(b), Some(a)) if a != b => format!(" {} -> {}", visible(b), visible(a)),
+            (Some(b), _) => format!(" {}", visible(b)),
+            _ => String::new(),
+        };
+        writeln!(
+            out,
+            "  {} {}{versions}",
+            paint::status(ctx.color, &status),
+            u.name()
+        )
+        .map_err(w)?;
+        for n in &row.notes {
+            writeln!(out, "    note: {}", visible(n)).map_err(w)?;
+        }
+        let problem = row.status.is_problem();
+        if problem {
+            printed.warnings.push(format!(
+                "upgrade {} {status}: {}",
+                u.name(),
+                visible(&row.notes.join("; "))
+            ));
+        }
+        let mut error = problem.then(|| row.notes.join("; "));
+        if let Some(e) = &mut error
+            && e.len() > state::MAX_ERROR_BYTES
+        {
+            let mut cut = state::MAX_ERROR_BYTES;
+            while !e.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            e.truncate(cut);
+        }
+        ops.push(state::OperationRecord {
+            id: format!("updater-{}", u.name()),
+            resource: format!("updater:{}", u.name()),
+            adapter: "updater/v1".into(),
+            class: Class::Normal,
+            status: row.status,
+            started_at: Some(row.started_at),
+            finished_at: Some(row.finished_at),
+            before: None,
+            after: None,
+            owned_outputs: vec![],
+            error,
+            reload: None,
+        });
+    }
+    let binary = crate::plan_cmd::binary_identity()?;
+    let stamp = state::Stamp::of(binding);
+    let receipt = state::Receipt {
+        schema: state::SCHEMA,
+        op_id: format!("upgrade-{started}"),
+        command: "upgrade".into(),
+        update: false,
+        started_at: rfc3339(started),
+        finished_at: rfc3339(now_ns()?),
+        binary: state::BinaryId {
+            version: binary.version,
+            commit: option_env!("DFM_BUILD_COMMIT").unwrap_or("unknown").into(),
+            sha256: binary.sha256,
+        },
+        profile: state::ProfileRef {
+            id: stamp.profile,
+            binding_digest: stamp.binding_digest,
+        },
+        machine_id: stamp.machine_id,
+        plan_digest: None,
+        approval: None,
+        sources: vec![],
+        approvals: vec![],
+        result: state::RunResult::from_operations(&ops),
+        operations: ops,
+    };
+    let name = store.write_receipt(&receipt)?;
+    writeln!(out, "receipt: {}", visible(&name)).map_err(w)?;
+    let counts: Vec<String> = receipt
+        .result
+        .counts
+        .iter()
+        .filter(|(_, n)| **n > 0)
+        .map(|(s, n)| format!("{}={n}", status_name(*s)))
+        .collect();
+    Ok(Some(counts.join(" ")))
 }
 
 /// What the scopes that already ran in this sync did (see `run_inner`).
