@@ -2832,3 +2832,68 @@ fn a_blocked_secret_and_a_secret_without_a_session_are_both_warned() {
     );
     assert!(!l.log().contains("op inject"), "{}", l.log());
 }
+
+#[test]
+fn a_definition_source_removed_upstream_gives_one_digest_and_blocks_only_services() {
+    // The agent's definition is the owner's own HOME link into the checkout, not a resource.
+    let l = Life::unpublished();
+    let seed = &l.fx.upstream.seed;
+    let link = LIFE.find("\n[[resources]]\nid = \"agent-plist\"").unwrap();
+    let agent = LIFE.find("\n[[resources]]\nid = \"agent\"\n").unwrap();
+    let unlinked = format!("{}{}", &LIFE[..link], &LIFE[agent..]);
+    put(seed, "base/modules/life/module.toml", &unlinked);
+    l.fx.upstream.push("the owner links the agent's definition");
+    git(&l.fx.root, &["pull", "-q", "--ff-only", "origin", "main"]);
+    let plist = l.fx.h("Library/LaunchAgents/org.example.agent.plist");
+    fs::create_dir_all(plist.parent().unwrap()).unwrap();
+    std::os::unix::fs::symlink(
+        l.fx.root
+            .join("base/modules/life/files/org.example.agent.plist"),
+        &plist,
+    )
+    .unwrap();
+    let o = l.approved(&[]);
+    assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
+    // Upstream drops the definition's source while the agent stays declared, and adds a link.
+    // The staged copy has no definition: the review must name the HOME path, not the run's
+    // staging directory, or each preview gets another digest.
+    fs::remove_file(seed.join("base/modules/life/files/org.example.agent.plist")).unwrap();
+    put(
+        seed,
+        "base/modules/life/module.toml",
+        &format!(
+            "{unlinked}\n[[resources]]\nid = \"notes\"\nkind = \"link\"\nadapter = \"fs-link/v1\"\ntarget = \".config/life/notes\"\n[resources.value]\nsource = \"files/notes\"\n"
+        ),
+    );
+    put(seed, "base/modules/life/files/notes", "notes\n");
+    l.fx.upstream.push("drop the agent's definition");
+    let p = l.preview(&[]);
+    assert_eq!(code(&p), 0, "{}\n{}", stdout(&p), stderr(&p));
+    let again = l.preview(&[]);
+    assert_eq!(code(&again), 0, "{}\n{}", stdout(&again), stderr(&again));
+    assert_eq!(digest_of(&p), digest_of(&again), "{}", stdout(&p));
+    let s = stdout(&p);
+    assert!(!s.contains("staging"), "{s}");
+    in_order(
+        &s,
+        &[
+            "scope: services",
+            "cannot read Library/LaunchAgents/org.example.agent.plist",
+            "blocked: this scope does not run: life.agent@service E_PROBE_FAILED",
+            "warning: services blocked: life.agent@service E_PROBE_FAILED",
+        ],
+    );
+    let o = l.sync(&digest_of(&p), &[]);
+    assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
+    let s = stdout(&o);
+    assert!(!s.contains("E_PLAN_STALE"), "{s}");
+    in_order(
+        &s,
+        &[
+            "  config: ok",
+            "  services: blocked (life.agent@service E_PROBE_FAILED)",
+            "result: ok\nwarning: services blocked: life.agent@service E_PROBE_FAILED",
+        ],
+    );
+    assert!(l.fx.h(".config/life/notes").is_symlink());
+}

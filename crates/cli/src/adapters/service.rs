@@ -155,9 +155,10 @@ fn failed(what: &str, code: i32, out: &ProcOutput, by_hand: &str) -> Refusal {
     )
 }
 
-/// The bytes of a definition file, read through its link within the bound.
-fn definition_bytes(path: &Path) -> Result<Vec<u8>, String> {
-    let shown = path.display().to_string();
+/// The definition at `path`, at most 1 MiB. An error names `shown`, the HOME-relative definition
+/// path, never `path`: `sync` reads from a staging directory whose name changes with each run,
+/// and the error enters the plan and its digest.
+fn definition_bytes(path: &Path, shown: &str) -> Result<Vec<u8>, String> {
     let io = |e: std::io::Error| format!("cannot read {shown}: {}", e.kind());
     let file = std::fs::File::open(path).map_err(io)?;
     if !file.metadata().map_err(io)?.is_file() {
@@ -531,10 +532,11 @@ fn launchd_state(
         None => declared.clone(),
     };
     let generated = staged.and_then(|(_, _, _, g)| g.get(&dfm_model::fold::fold(&plist)));
-    let bytes = match generated.map_or_else(|| definition_bytes(&read_from), |b| Ok(b.clone())) {
-        Ok(b) => b,
-        Err(why) => return Ok(only(ServiceState::Unknown(why))),
-    };
+    let bytes =
+        match generated.map_or_else(|| definition_bytes(&read_from, &plist), |b| Ok(b.clone())) {
+            Ok(b) => b,
+            Err(why) => return Ok(only(ServiceState::Unknown(why))),
+        };
     let text = String::from_utf8_lossy(&bytes);
     // The found label is never repeated: the definition can be a secret output, and a template
     // error can put a token in the Label slot. The declared label is manifest data. The label
