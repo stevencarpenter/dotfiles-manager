@@ -32,6 +32,14 @@ fn refused(r: &Refusal) -> MergeVerdict {
     blocked(r.code, &r.detail)
 }
 
+/// Where a merge reads the source files of its fragments: the opened source root (or why it
+/// could not be opened) and, with `sync`, the opened live root and its path
+/// (`generate::read_source`).
+pub struct MergeSources<'a> {
+    pub read: &'a Result<Dir, Refusal>,
+    pub live: Option<(&'a Dir, &'a Path)>,
+}
+
 /// What the plan-time reads share.
 #[derive(Clone, Copy)]
 struct Cx<'a> {
@@ -40,6 +48,8 @@ struct Cx<'a> {
     home: &'a Dir,
     /// The opened source root, or why it could not be opened.
     source: &'a Result<Dir, Refusal>,
+    /// With `sync`: the opened live root and its path, as `generate::read_source` takes them.
+    live: Option<(&'a Dir, &'a Path)>,
     ledger: &'a [Owned],
 }
 
@@ -74,6 +84,7 @@ fn read_fragments(
         sys,
         home,
         source,
+        live,
         ledger,
     } = *cx;
     let too_much = || Refusal::new(Code::LimitExceeded, "the fragments together exceed 16 MiB");
@@ -111,18 +122,20 @@ fn read_fragments(
             })
             .flatten();
         let bytes = match (src, source) {
-            (Some(src), Ok(root)) => match root.read_input_below(sys, &src, MAX_HASHED_BYTES)? {
-                Got::Bytes(b) => b,
-                Got::TooBig => return Err(too_much()),
-                Got::Absent => {
-                    return Err(Refusal::new(
-                        Code::SourceUntrusted,
-                        format!(
-                            "the source of fragment {path} is not a regular file owned by you with one hard link"
-                        ),
-                    ));
+            (Some(src), Ok(root)) => {
+                match super::generate::read_source(root, live, sys, &src, MAX_HASHED_BYTES)? {
+                    Got::Bytes(b) => b,
+                    Got::TooBig => return Err(too_much()),
+                    Got::Absent => {
+                        return Err(Refusal::new(
+                            Code::SourceUntrusted,
+                            format!(
+                                "the source of fragment {path} is not a regular file owned by you with one hard link"
+                            ),
+                        ));
+                    }
                 }
-            },
+            }
             // The source root could not be opened: that is the cause, not the fragment.
             (Some(_), Err(e)) => return Err(e.clone()),
             _ => {
@@ -184,14 +197,16 @@ pub fn merge_facts(
     sys: &Sys,
     home: &Dir,
     home_path: &Path,
-    source: &Result<Dir, Refusal>,
+    source: MergeSources<'_>,
     ledger: &[Owned],
 ) -> BTreeMap<String, MergeFact> {
+    let MergeSources { read: source, live } = source;
     let cx = Cx {
         resolved,
         sys,
         home,
         source,
+        live,
         ledger,
     };
     let mut out = BTreeMap::new();

@@ -588,13 +588,10 @@ pub fn plan_outputs(
     let read = root_dir(plan, read_root);
     let live = (read_root != root).then(|| root_dir(plan, root)).flatten();
     let source = |path: &str| -> Option<Vec<u8>> {
-        let bytes = match read.as_ref()?.read_input_below(sys, path, MAX_HASHED_BYTES) {
-            Ok(Got::Bytes(b)) => b,
-            _ => return None,
-        };
-        match &live {
-            Some(dir) if kept_and_refused(dir, sys, &root.join(path), path, &bytes) => None,
-            _ => Some(bytes),
+        let live = live.as_ref().map(|d| (d, root));
+        match read_source(read.as_ref()?, live, sys, path, MAX_HASHED_BYTES) {
+            Ok(Got::Bytes(b)) => Some(b),
+            _ => None,
         }
     };
     let mut made = link_producers(&plan.operations, &source);
@@ -658,21 +655,47 @@ fn root_dir(plan: &Plan, at: &Path) -> Option<Dir> {
     }
 }
 
-/// Whether apply would refuse the live source `rel` (at `abs` below the opened live root `live`)
-/// that publication keeps. The staged copy holds a fresh file with one link, while a file that
-/// the fast-forward does not change keeps its links and owner, which `Dir::read_input` checks.
-/// A live file with other content is rewritten by the fast-forward, and a missing one is created.
-fn kept_and_refused(live: &Dir, sys: &Sys, abs: &Path, rel: &str, staged: &[u8]) -> bool {
-    if !matches!(
-        live.read_input_below(sys, rel, MAX_HASHED_BYTES),
-        Ok(Got::Absent)
-    ) {
+/// Reads the source file `rel` below the opened source root `read` as apply reads it
+/// (`Dir::read_input_below`). With `live`, `read` is `sync`'s staged copy of the opened live root
+/// at the given path: a source that publication keeps is `Absent` when apply would refuse the
+/// live file.
+pub(crate) fn read_source(
+    read: &Dir,
+    live: Option<(&Dir, &Path)>,
+    sys: &Sys,
+    rel: &str,
+    limit: u64,
+) -> Result<Got, Refusal> {
+    let got = read.read_input_below(sys, rel, limit)?;
+    match (&got, live) {
+        (Got::Bytes(b), Some((dir, root))) if kept_and_refused(dir, sys, root, rel, b, limit) => {
+            Ok(Got::Absent)
+        }
+        _ => Ok(got),
+    }
+}
+
+/// Whether apply would refuse the live source `rel` below the opened live root `live` (at path
+/// `root`) that publication keeps. The staged copy holds a fresh file with one link, while a
+/// file that the fast-forward does not change keeps its links and owner, which
+/// `Dir::read_input` checks. A live file with other content is rewritten by the fast-forward,
+/// and a missing one is created.
+fn kept_and_refused(
+    live: &Dir,
+    sys: &Sys,
+    root: &Path,
+    rel: &str,
+    staged: &[u8],
+    limit: u64,
+) -> bool {
+    if !matches!(live.read_input_below(sys, rel, limit), Ok(Got::Absent)) {
         return false;
     }
-    std::fs::symlink_metadata(abs).is_ok_and(|m| {
+    let abs = root.join(rel);
+    std::fs::symlink_metadata(&abs).is_ok_and(|m| {
         m.is_file()
             && m.len() == u64::try_from(staged.len()).unwrap_or(u64::MAX)
-            && std::fs::read(abs).is_ok_and(|b| b == staged)
+            && std::fs::read(&abs).is_ok_and(|b| b == staged)
     })
 }
 

@@ -3109,3 +3109,73 @@ fn a_link_and_its_source_removed_upstream_are_removed_by_a_plain_sync() {
     in_order(&s, &["  config: ok", "result: ok"]);
     assert!(fs::symlink_metadata(l.fx.h(".config/life/notes")).is_err());
 }
+
+/// A settings merge whose fragment directory holds the file a link resource publishes.
+const MERGE_FRAGMENT: &str = r#"
+[[resources]]
+id = "settings"
+kind = "merge"
+adapter = "claude-settings/v1"
+target = ".claude/settings.json"
+[resources.value]
+fragments_dir = ".claude/settings.d"
+pattern = "*.json"
+[resources.value.managed]
+outputStyle = "STE"
+
+[[resources]]
+id = "frag"
+kind = "link"
+adapter = "fs-link/v1"
+target = ".claude/settings.d/10-local.json"
+[resources.value]
+source = "files/frag.json"
+"#;
+
+#[test]
+fn a_hardlinked_merge_fragment_source_the_update_keeps_is_refused_at_preview_as_apply_refuses_it() {
+    let l = Life::new();
+    l.push_module(
+        MERGE_FRAGMENT,
+        &[("frag.json", r#"{"fromFragment":true}"#)],
+        "merge a fragment",
+    );
+    let o = l.approved(&[]);
+    assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
+    assert!(
+        fs::read_to_string(l.fx.h(".claude/settings.json"))
+            .unwrap()
+            .contains("fromFragment")
+    );
+    // A second hard link to the fragment's source in the live checkout, which the update keeps.
+    let src = "base/modules/life/files/frag.json";
+    fs::hard_link(l.fx.root.join(src), l.fake.path().join("frag-link")).unwrap();
+    l.push_module(
+        &format!(
+            "{MERGE_FRAGMENT}\n[[resources]]\nid = \"notes\"\nkind = \"link\"\nadapter = \"fs-link/v1\"\ntarget = \".config/life/notes\"\n[resources.value]\nsource = \"files/notes\"\n"
+        ),
+        &[("notes", "notes\n")],
+        "add a link",
+    );
+    let refused = "the source of fragment .claude/settings.d/10-local.json is not a regular file owned by you with one hard link";
+    let p = l.preview(&[]);
+    assert_eq!(code(&p), 3, "{}\n{}", stdout(&p), stderr(&p));
+    in_order(
+        &stdout(&p),
+        &[
+            "scope: config",
+            "E_SOURCE_UNTRUSTED life.settings",
+            refused,
+            "result: blocked",
+        ],
+    );
+    let o = l.sync(&digest_of(&p), &[]);
+    assert_ne!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
+    assert!(!stdout(&o).contains("E_PLAN_STALE"), "{}", stdout(&o));
+    assert!(!stderr(&o).contains("E_PLAN_STALE"), "{}", stderr(&o));
+    assert!(!l.fx.h(".config/life/notes").exists());
+    // Live apply on the checkout as publication would leave it refuses the same source.
+    git(&l.fx.root, &["pull", "-q", "--ff-only", "origin", "main"]);
+    let a = l.run(&["apply", "--root", l.fx.root_arg(), "--preview"]);
+    in_order(&stdout(&a), &["E_SOURCE_UNTRUSTED life.settings", refused]);
+}

@@ -195,6 +195,11 @@ pub(crate) fn plan_with_outputs(
         usage("--root resolves to a path that is not UTF-8; point --root at a UTF-8 path")
     })?;
     let source_root = Dir::open_plain(loaded.read_root());
+    // `sync` plans a staged copy; a source publication keeps is also read in the live root.
+    let live_root = loaded
+        .staged
+        .as_ref()
+        .and_then(|_| Dir::open_plain(&loaded.root).ok());
     let merge = match scope {
         Scope::Config => crate::adapters::merge_facts(
             &loaded.resolved,
@@ -202,7 +207,10 @@ pub(crate) fn plan_with_outputs(
             &sys,
             &home,
             &layout.home,
-            &source_root,
+            crate::adapters::MergeSources {
+                read: &source_root,
+                live: live_root.as_ref().map(|d| (d, loaded.root.as_path())),
+            },
             &ledger,
         ),
         _ => BTreeMap::new(),
