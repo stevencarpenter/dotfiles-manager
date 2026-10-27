@@ -2513,6 +2513,7 @@ mod tests {
             architecture: "a".into(),
             modules: vec!["core".into()],
             resources: BTreeMap::from([(r.id.clone(), r.clone())]),
+            updaters: vec![],
             includes: vec![],
         };
         let node = match published {

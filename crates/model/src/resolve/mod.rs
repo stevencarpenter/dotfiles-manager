@@ -104,6 +104,8 @@ pub struct Resolved {
     /// Core first, then each module after its prerequisites, lexically among the ready ones.
     pub modules: Vec<String>,
     pub resources: BTreeMap<String, ResolvedResource>,
+    /// The profile's updaters, in declared order (docs/upgrade.md).
+    pub updaters: Vec<crate::updater::Updater>,
     /// Native documents whose include order is declared by an authored source file.
     pub includes: Vec<IncludeGroup>,
 }
