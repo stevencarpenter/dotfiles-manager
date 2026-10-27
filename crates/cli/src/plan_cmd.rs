@@ -9,8 +9,8 @@ use crate::{Ctx, Loaded, load_resolved, paint, read_existing_binding, usage};
 use dfm_engine::{Dir, Fail, Store, merge, observe};
 use dfm_model::display::visible;
 use dfm_model::plan::{
-    self, Binary, Context, MAX_PLAN_BYTES, Operation, Owned, PackageState, Plan, Saved, Scope,
-    ServiceFacts, Stale, Status, source_identity,
+    self, Binary, Context, LinkTo, MAX_PLAN_BYTES, Node, Observations, Operation, Owned,
+    PackageState, Plan, Saved, Scope, ServiceFacts, Stale, Status, source_identity,
 };
 use dfm_model::{Code, Refusal};
 use std::collections::{BTreeMap, BTreeSet};
@@ -161,6 +161,9 @@ pub(crate) fn plan_with_outputs(
         &plan::followups(&loaded.resolved, &obs, &ledger, scope),
     )?;
     merge(&mut obs, more);
+    if let Some(tree) = &loaded.staged {
+        staged_link_kinds(&mut obs, &loaded.root, tree);
+    }
 
     // Claims that overlap the manager's own paths, by the store's rules: the text scope (case
     // folded, so it holds for directories that do not exist yet) and filesystem identity.
@@ -242,6 +245,37 @@ pub(crate) fn plan_with_outputs(
     );
     mark_excluded(&mut plan, &loaded.sources);
     Ok((plan, generated))
+}
+
+/// `sync` plans the staged copy `tree` as the tree `root` will hold after publication. A HOME link
+/// into `root` resolves after publication to what the copy holds at that place, so its kind is
+/// read there: the review and the plan after publication then see the same link state (a link
+/// whose source the update deletes is dangling in both). A kind that cannot be read keeps the
+/// live observation. shortcut: only absolute link targets are mapped, upgrade when a relative
+/// link into the root is supported.
+fn staged_link_kinds(obs: &mut Observations, root: &Path, tree: &Path) {
+    for seen in obs.seen.values_mut() {
+        let Node::Link { target, to, .. } = &mut seen.node else {
+            continue;
+        };
+        let Ok(rel) = Path::new(target.as_str()).strip_prefix(root) else {
+            continue;
+        };
+        *to = match std::fs::metadata(tree.join(rel)) {
+            Ok(m) if m.is_dir() => LinkTo::Dir,
+            Ok(m) if m.is_file() => LinkTo::File,
+            Ok(_) => LinkTo::Other,
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                ) =>
+            {
+                LinkTo::Dangling
+            }
+            Err(_) => continue,
+        };
+    }
 }
 
 /// Marks each operation whose directory source holds entries that `[sources].exclude` left

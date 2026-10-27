@@ -2879,8 +2879,9 @@ fn a_definition_source_removed_upstream_gives_one_digest_and_blocks_only_service
         &[
             "scope: services",
             "cannot read Library/LaunchAgents/org.example.agent.plist",
-            "blocked: this scope does not run: life.agent@service E_PROBE_FAILED",
-            "warning: services blocked: life.agent@service E_PROBE_FAILED",
+            // After publication the link dangles: the review sees it so too.
+            "blocked: this scope does not run: life.agent@service E_CONFLICT, life.agent@service E_PROBE_FAILED",
+            "warning: services blocked: life.agent@service E_CONFLICT, life.agent@service E_PROBE_FAILED",
         ],
     );
     let o = l.sync(&digest_of(&p), &[]);
@@ -2891,8 +2892,8 @@ fn a_definition_source_removed_upstream_gives_one_digest_and_blocks_only_service
         &s,
         &[
             "  config: ok",
-            "  services: blocked (life.agent@service E_PROBE_FAILED)",
-            "result: ok\nwarning: services blocked: life.agent@service E_PROBE_FAILED",
+            "  services: blocked (life.agent@service E_CONFLICT, life.agent@service E_PROBE_FAILED)",
+            "result: ok\nwarning: services blocked: life.agent@service E_CONFLICT, life.agent@service E_PROBE_FAILED",
         ],
     );
     assert!(l.fx.h(".config/life/notes").is_symlink());
@@ -3085,4 +3086,26 @@ fn a_hardlinked_generator_input_the_update_rewrites_is_accepted() {
             .unwrap()
             .contains("/usr/bin/false")
     );
+}
+
+#[test]
+fn a_link_and_its_source_removed_upstream_are_removed_by_a_plain_sync() {
+    let l = Life::new();
+    l.push_link();
+    let o = l.approved(&[]);
+    assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
+    assert!(l.fx.h(".config/life/notes").is_symlink());
+    // Upstream deletes the link resource and its source file. The review sees the source in
+    // --root, which publication then deletes: the removal must not go stale on that.
+    let seed = &l.fx.upstream.seed;
+    fs::remove_file(seed.join("base/modules/life/files/notes")).unwrap();
+    put(seed, "base/modules/life/module.toml", LIFE);
+    l.fx.upstream.push("drop the notes link");
+    let allow = ["--allow-disruptive", "remove@life.notes@.config/life/notes"];
+    let o = l.approved(&allow);
+    assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
+    let s = stdout(&o);
+    assert!(!s.contains("E_PLAN_STALE"), "{s}");
+    in_order(&s, &["  config: ok", "result: ok"]);
+    assert!(fs::symlink_metadata(l.fx.h(".config/life/notes")).is_err());
 }
