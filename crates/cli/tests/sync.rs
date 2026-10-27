@@ -3843,6 +3843,7 @@ case "$1" in
   --version) cat "$st/{name}" ;;
   {update})
     [ -e "$st/hang-{name}" ] && {{ touch "$st/started-{name}"; exec sleep 30; }}
+    [ -e "$st/tty-{name}" ] && {{ read x < /dev/tty || exit 9; }}
     [ -e "$st/fail-{name}" ] && {{ echo boom >&2; exit 1; }}
     [ -e "$st/next-{name}" ] && cp "$st/next-{name}" "$st/{name}"
     exit 0 ;;
@@ -3922,8 +3923,13 @@ impl Up {
     }
 
     fn command(&self, args: &[&str]) -> Command {
+        self.command_env(&[], args)
+    }
+
+    fn command_env(&self, env: &[(&str, &str)], args: &[&str]) -> Command {
         let mut c = Command::new(BIN);
         c.env_clear()
+            .envs(env.iter().copied())
             .env(
                 "DFM_PROVIDER_PATH",
                 format!("{}:/usr/bin:/bin", self.fake.path().join("bin").display()),
@@ -4073,9 +4079,8 @@ fn the_upgrade_receipt_records_each_updater() {
     assert_eq!(r[0]["result"]["exit_code"], 1);
 }
 
-#[test]
-fn an_interrupted_upgrade_does_not_block_the_next_sync() {
-    let u = Up::new(r#"["claude", "codex"]"#);
+/// Starts a plain sync, waits until `claude update` started, sends SIGINT and returns the run.
+fn interrupted(u: &Up) -> Output {
     fs::write(u.st("hang-claude"), "").unwrap();
     let child = u
         .command(&[])
@@ -4094,11 +4099,28 @@ fn an_interrupted_upgrade_does_not_block_the_next_sync() {
         .unwrap();
     assert!(kill.success());
     let o = child.wait_with_output().unwrap();
-    let s = stdout(&o);
+    fs::remove_file(u.st("hang-claude")).unwrap();
+    fs::remove_file(started).unwrap();
+    o
+}
+
+/// The stop's exit, the pending rows, their warnings and the receipt.
+fn assert_stopped(u: &Up, o: &Output) {
+    let s = stdout(o);
+    assert_eq!(code(o), 130, "{s}\n{}", stderr(o));
     assert!(s.contains("  pending claude"), "{s}");
     assert!(s.contains("  pending codex"), "{s}");
+    assert!(s.contains("\nwarning: upgrade claude pending"), "{s}");
+    assert!(s.contains("\nwarning: upgrade codex pending"), "{s}");
     assert!(!u.log().contains("codex update"), "{}", u.log());
-    fs::remove_file(u.st("hang-claude")).unwrap();
+    assert_eq!(u.upgrade_receipts().len(), 1);
+}
+
+#[test]
+fn an_interrupted_upgrade_does_not_block_the_next_sync() {
+    let u = Up::new(r#"["claude", "codex"]"#);
+    let o = interrupted(&u);
+    assert_stopped(&u, &o);
     u.clear_log();
     let o = u.sync(&[]);
     assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
@@ -4107,6 +4129,74 @@ fn an_interrupted_upgrade_does_not_block_the_next_sync() {
         log.contains("claude update") && log.contains("codex update"),
         "{log}"
     );
+}
+
+#[test]
+fn an_interrupted_upgrade_after_nothing_to_change_exits_with_the_stop() {
+    let u = Up::new(r#"["claude", "codex"]"#);
+    let o = u.sync(&["--no-upgrade"]);
+    assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
+    let o = interrupted(&u);
+    assert!(stdout(&o).contains("nothing to change"), "{}", stdout(&o));
+    assert_stopped(&u, &o);
+}
+
+#[test]
+fn an_updater_that_asks_the_terminal_fails_instead_of_waiting() {
+    let u = Up::new(r#"["claude"]"#);
+    fs::write(u.st("tty-claude"), "").unwrap();
+    // `script` gives the run a controlling terminal, as an owner's shell does.
+    let cmd = u.command(&[]);
+    let mut c = Command::new("/usr/bin/script");
+    c.arg("-q").arg("/dev/null").arg(cmd.get_program());
+    c.args(cmd.get_args());
+    c.env_clear();
+    for (k, v) in cmd.get_envs() {
+        if let Some(v) = v {
+            c.env(k, v);
+        }
+    }
+    use std::os::unix::process::CommandExt;
+    let mut child = c
+        .process_group(0)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let pid = child.id();
+    let t0 = std::time::Instant::now();
+    let done = loop {
+        if child.try_wait().unwrap().is_some() {
+            break true;
+        }
+        if t0.elapsed().as_secs() >= 30 {
+            break false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    };
+    if !done {
+        let _ = Command::new("/bin/kill")
+            .args(["-KILL", &format!("-{pid}")])
+            .status();
+    }
+    let o = child.wait_with_output().unwrap();
+    assert!(done, "sync waited at the terminal: {}", stdout(&o));
+    // Output on a terminal is colored, so read the summary line.
+    assert!(stdout(&o).contains("upgrade: failed=1"), "{}", stdout(&o));
+}
+
+#[test]
+fn an_upgrade_step_error_keeps_the_scope_summary() {
+    let u = Up::new(r#"["claude"]"#);
+    let o = u
+        .command_env(&[("DFM_FAILPOINT", "sync-before-upgrade-lock:error")], &[])
+        .output()
+        .unwrap();
+    let s = stdout(&o);
+    assert_ne!(code(&o), 0, "{s}");
+    assert!(s.contains("scopes:\n  config: ok"), "{s}");
+    assert!(s.contains("  upgrade: failed ("), "{s}");
+    assert_eq!(u.log(), "");
 }
 
 #[test]

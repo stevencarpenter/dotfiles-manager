@@ -230,6 +230,7 @@ impl Ctx {
             cwd: dfm_engine::proc::run_dir(&self.platform.cache_dir()),
             uid: sys.uid,
             grace: dfm_engine::proc::GRACE,
+            detach: false,
         }
     }
 

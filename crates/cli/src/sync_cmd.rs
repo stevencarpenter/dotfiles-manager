@@ -1814,8 +1814,14 @@ pub fn run(ctx: &Ctx, args: &Args, out: &mut dyn Write) -> Result<(), Refusal> {
         );
     }
     // Last, so the owner sees them without scrolling (docs/sync.md, "The four scopes"). A
-    // refused run ends with its refusal instead.
-    for warning in printed.warnings.iter().filter(|_| r.is_ok()) {
+    // refused run ends with its refusal instead. A stopped run still names what did not finish.
+    let stopped = r.as_ref().err().is_some_and(|e| {
+        matches!(
+            e.exit(),
+            dfm_model::Exit::Interrupted | dfm_model::Exit::Terminated
+        )
+    });
+    for warning in printed.warnings.iter().filter(|_| r.is_ok() || stopped) {
         let _ = writeln!(
             out,
             "{} {warning}",
@@ -1998,7 +2004,7 @@ fn run_inner(
         // The review's shared lock and staging end here: the upgrade step takes the writer lock.
         drop(staging);
         drop(shared);
-        let up = upgrade(
+        let (up, result) = match upgrade(
             ctx,
             &sys,
             &binding,
@@ -2006,8 +2012,12 @@ fn run_inner(
             &loaded.resolved.updaters,
             out,
             printed,
-        )?;
-        return finish(ctx, &lines, up.as_deref(), Ok(()), out, printed);
+        ) {
+            // A stop request during the updaters decides the exit (docs/upgrade.md).
+            Ok(up) => (up, dfm_engine::signal::requested().map_or(Ok(()), Err)),
+            Err(e) => (Some(format!("failed ({})", e.code.as_str())), Err(e)),
+        };
+        return finish(ctx, &lines, up.as_deref(), result, out, printed);
     }
     // Without a digest the run approves the plan it printed (DFM-76). A run that grants an
     // origin stops here: the owner reviews what the new origin brings first.
@@ -2163,19 +2173,26 @@ fn run_inner(
     // The updaters run after every scope that ran, and not after a refusal (docs/upgrade.md).
     let up = match failure {
         Some(_) => None,
-        None => {
-            let up = upgrade(
-                ctx,
-                &sys,
-                &binding,
-                args,
-                &locked_loaded.resolved.updaters,
-                out,
-                printed,
-            )?;
-            failure = dfm_engine::signal::requested();
-            up
-        }
+        None => match upgrade(
+            ctx,
+            &sys,
+            &binding,
+            args,
+            &locked_loaded.resolved.updaters,
+            out,
+            printed,
+        ) {
+            Ok(up) => {
+                failure = dfm_engine::signal::requested();
+                up
+            }
+            // The scopes already ran: the summary still prints, and the exit is the error's.
+            Err(e) => {
+                let up = format!("failed ({})", e.code.as_str());
+                failure = Some(e);
+                Some(up)
+            }
+        },
     };
     let result = match failure {
         Some(e) if changed => Err(e.after_mutation()),
@@ -2261,6 +2278,7 @@ fn upgrade(
         writeln!(out, "upgrade: none declared in the profile").map_err(w)?;
         return Ok(None);
     }
+    state_cmd::fail_from_env()?.hit("sync-before-upgrade-lock")?;
     // A sync with nothing to change ran no scope, so nothing armed the handlers yet.
     if !dfm_engine::signal::installed() {
         dfm_engine::signal::install()?;
@@ -2280,7 +2298,8 @@ fn upgrade(
         .map(|p| p.name)
         .collect();
     let started = now_ns()?;
-    let runner = ctx.runner(sys);
+    let mut runner = ctx.runner(sys);
+    runner.detach = true;
     let env = updater_env(ctx, &runner, &held);
     writeln!(out, "{}", paint::label(ctx.color, "upgrade:")).map_err(w)?;
     let mut ops = Vec::new();

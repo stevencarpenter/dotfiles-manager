@@ -34,7 +34,7 @@ A manager built before this key refuses a profile that has it (`E_FIELD_UNKNOWN`
 
 - **brew** upgrades every outdated formula and cask, not only declared ones. Version-sensitive tools are pinned with mise, per project or globally. `brew upgrade` gets the outdated names, so each one is accounted for, and an active trial's package can be left out. An empty list is `current` and runs no upgrade. Homebrew runs with its defaults (the dependents check and cleanup stay on). The manager sets `HOMEBREW_NO_ANALYTICS=1` and `HOMEBREW_NO_ENV_HINTS=1`, and `HOMEBREW_NO_AUTO_UPDATE=1` for every command after `brew update`.
 - **A native tool** (`claude`, `codex`, `opencode`) must exist at its owner path. If it does not, it is `blocked` with that path, and no other copy (for example the Homebrew cask) is used. The runner's executable checks apply: a link that leaves the owner's prefix is `blocked`.
-- **A second copy.** For each native tool, `brew list --versions <name>` and `brew list --cask --versions <name>` look for a Homebrew copy. A copy found is a note on the row (`second copy: Homebrew cask codex 0.164.0`). It is never removed or chosen.
+- **A second copy.** For each native tool, `brew list --versions` and `brew list --cask --versions` look for a Homebrew copy under Homebrew's name for it: the cask `claude-code` (the `claude` cask is the desktop app), the formula and cask `codex`, the formula `opencode`. A copy found is a note on the row (`second copy: Homebrew cask codex 0.164.0`). It is never removed or chosen.
 - **skills** reports no version. Exit 0 is `current` with the note `skills update ran; it reports no version`.
 
 ## Statuses
@@ -59,11 +59,12 @@ A failure note gives the command, its exit code and the size of its standard err
 5. Under the writer lock, each updater runs and prints one row: `  <status> <name> <before> -> <after>`, then its notes.
 6. One receipt is written (`command = "upgrade"`, no plan digest, no approval), with one operation per updater (`resource = "updater:<name>"`, `adapter = "updater/v1"`). An updater that is not `updated`, `current` or `held` makes the receipt `failed`, exit 1, while sync itself exits 0.
 7. The `scopes:` block ends with `  upgrade: <status>=<count>...`, and each `failed`, `blocked` or `pending` updater adds a `warning:` line at the end of standard output.
-8. A stop request during the step ends that updater, reports the rest `pending`, writes the receipt and ends the run with the stop's exit code. No journal entry is written, so the next sync runs every updater again.
+8. A stop request during the step ends that updater, reports the rest `pending`, writes the receipt and ends the run with the stop's exit code (130 or 143). The warnings still print. No journal entry is written, so the next sync runs every updater again.
+9. An error of the step itself (the writer lock is held by another command, the state cannot be read, the receipt cannot be written) keeps the scope summary, reports `upgrade: failed (<code>)` and exits with that error.
 
 `--preview` lists each updater with what it would run and its resolved path, and runs nothing.
 
-Updaters run detached: standard input is closed and no terminal is attached. A step that needs a password or a prompt, such as a cask whose installer runs `sudo`, fails. The `brew` row names the package that stayed outdated. Upgrade it by hand.
+Updaters run detached: each starts in a new session (`setsid`, `Runner::detach`), with no controlling terminal and standard input closed. A step that needs a password or a prompt, such as a cask whose installer runs `sudo`, fails at once instead of waiting at the terminal. The `brew` row names the package that stayed outdated. Upgrade it by hand.
 
 Timeouts: 30 minutes for `brew upgrade`, 10 minutes for every other command.
 

@@ -269,10 +269,18 @@ fn second_copies(u: Updater, env: &Env, notes: &mut Vec<String>) {
     if env.provider.resolve("brew").is_err() {
         return;
     }
-    for (kind, a) in [
-        ("formula", args(&["list", "--versions", u.name()])),
-        ("cask", args(&["list", "--cask", "--versions", u.name()])),
-    ] {
+    // Homebrew's names for the same tool. The `claude` cask is the desktop app, not Claude Code.
+    let (formula, cask) = match u {
+        Updater::Claude => (None, Some("claude-code")),
+        Updater::Codex => (Some("codex"), Some("codex")),
+        Updater::Opencode => (Some("opencode"), None),
+        Updater::Brew | Updater::Skills => (None, None),
+    };
+    let checks = formula
+        .map(|n| ("formula", args(&["list", "--versions", n])))
+        .into_iter()
+        .chain(cask.map(|n| ("cask", args(&["list", "--cask", "--versions", n]))));
+    for (kind, a) in checks {
         if let Ok(out) = call(
             env.provider,
             "brew",
@@ -470,6 +478,7 @@ mod tests {
                 cwd: root.join("run"),
                 uid,
                 grace: Duration::from_millis(200),
+                detach: false,
             };
             T {
                 root,
@@ -773,6 +782,25 @@ mod tests {
         assert!(
             r.notes
                 .contains(&"second copy: Homebrew cask codex 0.164.0".to_string()),
+            "{r:?}"
+        );
+    }
+
+    #[test]
+    fn claude_second_copy_is_the_claude_code_cask() {
+        let t = T::new();
+        t.native(".local/bin/claude", "update", "2.1.311", "2.1.311");
+        t.brew(NONE, NONE);
+        // The `claude` cask is the desktop app, not a copy of Claude Code.
+        fs::write(t.root.join("st/list-claude"), "claude 1.0\n").unwrap();
+        let held = BTreeSet::new();
+        let r = run(Updater::Claude, &t.env(&held));
+        assert!(!r.notes.iter().any(|n| n.contains("second copy")), "{r:?}");
+        fs::write(t.root.join("st/list-claude-code"), "claude-code 2.1.300\n").unwrap();
+        let r = run(Updater::Claude, &t.env(&held));
+        assert!(
+            r.notes
+                .contains(&"second copy: Homebrew cask claude-code 2.1.300".to_string()),
             "{r:?}"
         );
     }
