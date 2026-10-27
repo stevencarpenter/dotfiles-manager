@@ -9,7 +9,7 @@ pub mod package;
 pub mod secret;
 pub mod service;
 pub use generate::{Gen, Generators, plan_outputs};
-pub use merge_plan::merge_facts;
+pub use merge_plan::{MergeSources, merge_facts};
 
 use dfm_model::resolve::{AdapterCatalog, AdapterSpec, Claims, Field, Include, Schema, TargetRule};
 

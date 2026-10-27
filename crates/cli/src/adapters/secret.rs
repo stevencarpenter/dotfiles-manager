@@ -67,25 +67,38 @@ fn request<'a>(
 /// Whether `op` has a session for `account`: `op whoami --account <account>` exits 0. Nothing
 /// else is read from it. A failure is `E_CREDENTIAL_UNAVAILABLE` (exit 3, before mutation).
 pub fn credential(runner: &Runner, account: &str) -> Result<(), Refusal> {
+    match whoami(runner, account)? {
+        None => Ok(()),
+        Some(why) => Err(no_session(account, &why)),
+    }
+}
+
+/// `op whoami --account <account>`: `None` with a session, `Some(why)` when `op` answered that
+/// it has none (a nonzero exit). A timeout or a signal is `E_CREDENTIAL_UNAVAILABLE` here: it
+/// says nothing about the session. A runner refusal (op not found, failed its checks) keeps
+/// its own code.
+fn whoami(runner: &Runner, account: &str) -> Result<Option<String>, Refusal> {
     let args = ["whoami".to_string(), "--account".into(), account.into()];
     let env = dfm_engine::proc::passthrough(&OP_ENV_PREFIXES);
-    // A runner refusal (op not found, failed its checks) keeps its own code: it is not a session.
     let out = runner.run(&request(&args, &env, None, WHOAMI_TIMEOUT))?;
     if out.success() {
-        return Ok(());
+        return Ok(None);
     }
-    let why = match out.end {
-        End::Exited(c) => format!("op whoami exited {c}"),
-        End::TimedOut => "op whoami did not answer in time".to_string(),
-        End::Signaled => "op whoami was ended by a signal".to_string(),
-        End::Stopped(r) => return Err(r),
-    };
-    Err(Refusal::new(
+    match out.end {
+        End::Exited(c) => Ok(Some(format!("op whoami exited {c}"))),
+        End::TimedOut => Err(no_session(account, "op whoami did not answer in time")),
+        End::Signaled => Err(no_session(account, "op whoami was ended by a signal")),
+        End::Stopped(r) => Err(r),
+    }
+}
+
+fn no_session(account: &str, why: &str) -> Refusal {
+    Refusal::new(
         Code::CredentialUnavailable,
         format!(
             "no 1Password session for account {account} ({why}); nothing was changed. Fix: run `op signin --account {account}` (or unlock the 1Password app), then run secrets again"
         ),
-    ))
+    )
 }
 
 /// The credential gate for a secrets plan: every planned secret's account must have a session.
@@ -106,6 +119,33 @@ pub fn credentials(plan: &Plan, resolved: &Resolved, runner: &Runner) -> Result<
         }
     }
     Ok(())
+}
+
+/// The accounts of the planned secrets that `op` says have no session, once each in order,
+/// with what `op whoami` answered. `sync` skips its secrets scope for them (docs/sync.md); any
+/// other failure of the check is an error, as for `secrets`.
+pub fn missing_sessions(
+    plan: &Plan,
+    resolved: &Resolved,
+    runner: &Runner,
+) -> Result<Vec<(String, String)>, Refusal> {
+    let (mut seen, mut missing) = (BTreeSet::new(), Vec::new());
+    for op in plan
+        .operations
+        .iter()
+        .filter(|o| o.status == Status::Planned && o.adapter == ADAPTER)
+    {
+        let Some(r) = resolved.resources.get(&op.resource) else {
+            continue;
+        };
+        let a = account(&r.value)?;
+        if seen.insert(a.clone())
+            && let Some(why) = whoami(runner, &a)?
+        {
+            missing.push((a, why));
+        }
+    }
+    Ok(missing)
 }
 
 /// Renders `template` for `account`: `op inject --account <account>` with the template on

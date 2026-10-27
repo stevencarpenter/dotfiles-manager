@@ -9,8 +9,8 @@ use crate::{Ctx, Loaded, load_resolved, paint, read_existing_binding, usage};
 use dfm_engine::{Dir, Fail, Store, merge, observe};
 use dfm_model::display::visible;
 use dfm_model::plan::{
-    self, Binary, Context, MAX_PLAN_BYTES, Operation, Owned, PackageState, Plan, Saved, Scope,
-    ServiceFacts, Stale, Status, source_identity,
+    self, Binary, Context, LinkTo, MAX_PLAN_BYTES, Node, Observations, Operation, Owned,
+    PackageState, Plan, Saved, Scope, ServiceFacts, Stale, Status, source_identity,
 };
 use dfm_model::{Code, Refusal};
 use std::collections::{BTreeMap, BTreeSet};
@@ -132,7 +132,17 @@ pub fn plan_for(
     scope: Scope,
     probed: impl Into<Probed>,
 ) -> Result<Plan, Refusal> {
-    let probed = probed.into();
+    plan_with_outputs(ctx, loaded, scope, probed.into()).map(|(plan, _)| plan)
+}
+
+/// As [`plan_for`], with the generated output of each planned file by folded path
+/// (`adapters::plan_outputs`).
+pub(crate) fn plan_with_outputs(
+    ctx: &Ctx,
+    loaded: &Loaded,
+    scope: Scope,
+    probed: Probed,
+) -> Result<(Plan, BTreeMap<String, Vec<u8>>), Refusal> {
     let layout = ctx.layout();
     let sys = ctx.sys()?;
     // Ownership decides what may be replaced. Without state it is unknown, so planning fails
@@ -151,6 +161,9 @@ pub fn plan_for(
         &plan::followups(&loaded.resolved, &obs, &ledger, scope),
     )?;
     merge(&mut obs, more);
+    if let Some(tree) = &loaded.staged {
+        staged_link_kinds(&mut obs, &loaded.root, tree);
+    }
 
     // Claims that overlap the manager's own paths, by the store's rules: the text scope (case
     // folded, so it holds for directories that do not exist yet) and filesystem identity.
@@ -182,6 +195,11 @@ pub fn plan_for(
         usage("--root resolves to a path that is not UTF-8; point --root at a UTF-8 path")
     })?;
     let source_root = Dir::open_plain(loaded.read_root());
+    // `sync` plans a staged copy; a source publication keeps is also read in the live root.
+    let live_root = loaded
+        .staged
+        .as_ref()
+        .and_then(|_| Dir::open_plain(&loaded.root).ok());
     let merge = match scope {
         Scope::Config => crate::adapters::merge_facts(
             &loaded.resolved,
@@ -189,7 +207,10 @@ pub fn plan_for(
             &sys,
             &home,
             &layout.home,
-            &source_root,
+            crate::adapters::MergeSources {
+                read: &source_root,
+                live: live_root.as_ref().map(|d| (d, loaded.root.as_path())),
+            },
             &ledger,
         ),
         _ => BTreeMap::new(),
@@ -222,9 +243,47 @@ pub fn plan_for(
     };
     let mut plan = plan::build(&loaded.resolved, &cx, &obs)?;
     // Generated output hashes, from the same adapters apply runs.
-    crate::adapters::plan_outputs(&mut plan, &loaded.resolved, &sys, &home);
+    let generated = crate::adapters::plan_outputs(
+        &mut plan,
+        &loaded.resolved,
+        &sys,
+        &home,
+        &loaded.root,
+        loaded.read_root(),
+    );
     mark_excluded(&mut plan, &loaded.sources);
-    Ok(plan)
+    Ok((plan, generated))
+}
+
+/// `sync` plans the staged copy `tree` as the tree `root` will hold after publication. A HOME link
+/// into `root` resolves after publication to what the copy holds at that place, so its kind is
+/// read there: the review and the plan after publication then see the same link state (a link
+/// whose source the update deletes is dangling in both). A kind that cannot be read keeps the
+/// live observation. shortcut: only absolute link targets are mapped, upgrade when a relative
+/// link into the root is supported.
+fn staged_link_kinds(obs: &mut Observations, root: &Path, tree: &Path) {
+    for seen in obs.seen.values_mut() {
+        let Node::Link { target, to, .. } = &mut seen.node else {
+            continue;
+        };
+        let Ok(rel) = Path::new(target.as_str()).strip_prefix(root) else {
+            continue;
+        };
+        *to = match std::fs::metadata(tree.join(rel)) {
+            Ok(m) if m.is_dir() => LinkTo::Dir,
+            Ok(m) if m.is_file() => LinkTo::File,
+            Ok(_) => LinkTo::Other,
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                ) =>
+            {
+                LinkTo::Dangling
+            }
+            Err(_) => continue,
+        };
+    }
 }
 
 /// Marks each operation whose directory source holds entries that `[sources].exclude` left
@@ -242,6 +301,17 @@ pub(crate) fn render(
     color: bool,
     out: &mut dyn Write,
 ) -> std::io::Result<()> {
+    render_body(p, color, out)?;
+    writeln!(
+        out,
+        "{} {}",
+        paint::label(color, "plan digest:"),
+        paint::style(color, "35", digest)
+    )
+}
+
+/// The plan without its digest line: `sync` prints four plans and one digest for all of them.
+pub(crate) fn render_body(p: &Plan, color: bool, out: &mut dyn Write) -> std::io::Result<()> {
     let label = |s: &str| paint::label(color, s);
     writeln!(
         out,
@@ -297,12 +367,7 @@ pub(crate) fn render(
             visible(&b.refusal().to_string())
         )?;
     }
-    writeln!(
-        out,
-        "{} {}",
-        label("plan digest:"),
-        paint::style(color, "35", digest)
-    )
+    Ok(())
 }
 
 fn status_name(s: Status) -> &'static str {

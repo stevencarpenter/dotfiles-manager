@@ -54,7 +54,8 @@ usage:
   dfm trial <package> [--id <trial-id>] [--provider homebrew/v1|mise/v1] [--config <path>]...
                                [--preview] [-y|--yes-plan <digest>]
   dfm sync [--root <dir>] [--preview] [-y|--yes-plan <digest>] [--allow-disruptive <operation-id>]...
-                               [--allow-adopt <operation-id>]... [--trust-origin <origin>]...
+                               [--allow-adopt <operation-id>]... [--restart <resource-id>]...
+                               [--trust-origin <origin>]...
   dfm self-update [--source <checkout>] [--commit <sha>]
   dfm self-check --build-controls <staged tree>
   dfm self-check --fixture-dir <dir>
@@ -134,12 +135,19 @@ good or uninstalled. See docs/lifecycle.md.
 
 sync fetches the sources that dotfiles-manager.lock declares ([[sources]]: the root checkout tracks
 its ref, a nested source is pinned to an exact commit) into a staging directory with an isolated git
-environment, resolves and plans the staged composition against this machine, and prints the plan.
-Every origin needs a grant in state/grants.json first (--trust-origin <origin> writes one; no fetch
-happens before that). With --yes-plan it rechecks the sources under the lock, fast-forwards each
-checkout (never reset, clean, stash, rebase, commit or push; divergence and overwritten local
-changes are refused), then runs apply once with the same digest. A pin is never rewritten.
---preview fetches into staging and changes nothing else. See docs/sync.md.
+environment, and plans the staged composition against this machine in four scopes: configuration,
+packages (install what is missing), secrets and services (start what is not loaded). It prints the
+four plans and one sync digest that covers them and the sources. Every origin needs a grant in
+state/grants.json first (--trust-origin <origin> writes one; no fetch happens before that). With
+--yes-plan it rechecks the sources under the lock, fast-forwards each checkout (never reset, clean,
+stash, rebase, commit or push; divergence and overwritten local changes are refused), then runs
+apply, packages, secrets and services in that order, each with its own plan digest and receipt. A
+scope that fails stops the later ones (not_started). Without a 1Password session the secrets are
+skipped; a blocked packages, secrets or services plan does not run; the other scopes run, and the
+last lines of the output warn what waits and how to fix it. A blocked configuration plan refuses
+the run. --restart <resource-id> goes to the services scope and needs its --allow-disruptive
+flag. A pin is never rewritten. --preview fetches into staging and changes nothing else. See
+docs/sync.md.
 
 self-update rebuilds and installs the manager from a local dotfiles-manager checkout: it reads
 scripts/bootstrap.sh of the commit (--commit, else the checkout's HEAD) and runs its install with
@@ -542,6 +550,13 @@ struct Loaded {
     /// Where the sources were read from when that is not `root`: `sync` resolves a staged copy
     /// of the sources and plans it as the tree that `root` will hold after publication.
     staged: Option<PathBuf>,
+    /// With `staged`: the absolute target of each planned configuration link, by its folded
+    /// path (`dfm_model::fold`), as the file system compares paths. The
+    /// services scope reads a definition at the target the configuration scope will publish.
+    links: std::collections::BTreeMap<String, String>,
+    /// With `staged`: the bytes of each file the configuration plan generates, by its folded
+    /// path. The services scope reads a generated definition from these, not from HOME.
+    generated: std::collections::BTreeMap<String, Vec<u8>>,
     sources: dfm_model::resolve::SourceSet,
     resolved: dfm_model::resolve::Resolved,
 }
@@ -607,6 +622,8 @@ fn load_resolved_any_machine(ctx: &Ctx, root: Option<&Path>) -> Result<Loaded, R
         binding,
         root,
         staged: None,
+        links: Default::default(),
+        generated: Default::default(),
         sources,
         resolved,
     })

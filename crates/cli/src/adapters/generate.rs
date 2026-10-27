@@ -15,6 +15,7 @@ use dfm_model::state::Class;
 use dfm_model::{Code, Refusal};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write;
+use std::path::Path;
 
 /// What an adapter that produces file content provides, besides its catalog entry.
 pub struct Gen {
@@ -46,6 +47,9 @@ pub struct Generators<'a> {
     /// them. The plan records no content identity for a secret template (docs/resolver.md item
     /// 12), so `render` compares the bytes apply read with these instead.
     templates: BTreeMap<String, Vec<u8>>,
+    /// The canonical checkout root the sources were loaded from, with a runner: a service probe
+    /// reads it (`service::probe`).
+    root: Option<&'a Path>,
 }
 
 impl<'a> Generators<'a> {
@@ -55,12 +59,19 @@ impl<'a> Generators<'a> {
             table: registry(),
             runner: None,
             templates: BTreeMap::new(),
+            root: None,
         }
     }
 
     /// Generators that can also render a secret or install a package through `runner` (the
-    /// `secrets` and `packages` commands). `sources` are the ones the plan was resolved from.
-    pub fn with_runner(resolved: &'a Resolved, sources: &SourceSet, runner: Runner) -> Self {
+    /// `secrets` and `packages` commands). `sources` are the ones the plan was resolved from,
+    /// under the canonical checkout root `root`.
+    pub fn with_runner(
+        resolved: &'a Resolved,
+        sources: &SourceSet,
+        root: &'a Path,
+        runner: Runner,
+    ) -> Self {
         let templates = resolved
             .resources
             .values()
@@ -76,6 +87,7 @@ impl<'a> Generators<'a> {
             .collect();
         Generators {
             runner: Some(runner),
+            root: Some(root),
             templates,
             ..Generators::new(resolved)
         }
@@ -285,7 +297,14 @@ impl Generator for Generators<'_> {
 
     fn service_state(&self, op: &Operation) -> Result<ServiceState, Refusal> {
         let runner = self.launcher(op)?;
-        service::probe(runner, &op.adapter, self.value(op)?).map(|f| f.state)
+        // `with_runner` sets the root with the runner `launcher` requires.
+        let root = self.root.ok_or_else(|| {
+            Refusal::new(
+                Code::GeneratorUnavailable,
+                format!("no service launcher for {}", op.adapter),
+            )
+        })?;
+        service::probe(runner, &op.adapter, self.value(op)?, root).map(|f| f.state)
     }
 
     fn service_act(&self, op: &Operation) -> Result<Completion, Refusal> {
@@ -550,17 +569,27 @@ fn link_producers(
 /// will write. Operations are in dependency order, so a producer comes before its consumer. A
 /// generation failure blocks the operation with a blocker that names the field and carries no
 /// content. A consumer of a blocked producer reports the producer's blocker as the cause.
-pub fn plan_outputs(plan: &mut Plan, resolved: &Resolved, sys: &Sys, home: &Dir) {
+/// Source files are read below `read_root` (`sync` plans a staged copy of `root`). Returns each
+/// generated output by folded path, so `sync` can review a service from the definition it will
+/// write.
+pub fn plan_outputs(
+    plan: &mut Plan,
+    resolved: &Resolved,
+    sys: &Sys,
+    home: &Dir,
+    root: &Path,
+    read_root: &Path,
+) -> BTreeMap<String, Vec<u8>> {
     let generators = Generators::new(resolved);
     // Source files are read as apply reads them: below the opened source root, without
     // following a link, regular, owned by the user, one hard link (`Dir::read_input`). A source
     // that apply would refuse is refused here, as a blocker, not as a surprise at apply.
-    let root = match plan.sources.as_slice() {
-        [one] => Dir::open_plain(std::path::Path::new(&one.root)).ok(),
-        _ => None,
-    };
+    // `sync` reads a staged copy, so the live source a publication keeps is checked too.
+    let read = root_dir(plan, read_root);
+    let live = (read_root != root).then(|| root_dir(plan, root)).flatten();
     let source = |path: &str| -> Option<Vec<u8>> {
-        match root.as_ref()?.read_input_below(sys, path, MAX_HASHED_BYTES) {
+        let live = live.as_ref().map(|d| (d, root));
+        match read_source(read.as_ref()?, live, sys, path, MAX_HASHED_BYTES) {
             Ok(Got::Bytes(b)) => Some(b),
             _ => None,
         }
@@ -573,6 +602,7 @@ pub fn plan_outputs(plan: &mut Plan, resolved: &Resolved, sys: &Sys, home: &Dir)
         .filter_map(|b| Some((fold(b.path.as_deref()?), (b.code, b.detail.clone()))))
         .collect();
     let mut blockers = Vec::new();
+    let mut generated = BTreeMap::new();
     for i in 0..plan.operations.len() {
         let op = plan.operations[i].clone();
         if op.class != Class::Normal
@@ -602,6 +632,7 @@ pub fn plan_outputs(plan: &mut Plan, resolved: &Resolved, sys: &Sys, home: &Dir)
                     out.sets = (g.sets)(v);
                 }
                 if let Some(p) = &op.path {
+                    generated.insert(fold(p), bytes.clone());
                     made.insert(fold(p), bytes);
                 }
             }
@@ -613,6 +644,59 @@ pub fn plan_outputs(plan: &mut Plan, resolved: &Resolved, sys: &Sys, home: &Dir)
         }
     }
     plan.blockers.extend(blockers);
+    generated
+}
+
+/// The opened source root, when the plan has one source.
+fn root_dir(plan: &Plan, at: &Path) -> Option<Dir> {
+    match plan.sources.as_slice() {
+        [_] => Dir::open_plain(at).ok(),
+        _ => None,
+    }
+}
+
+/// Reads the source file `rel` below the opened source root `read` as apply reads it
+/// (`Dir::read_input_below`). With `live`, `read` is `sync`'s staged copy of the opened live root
+/// at the given path: a source that publication keeps is `Absent` when apply would refuse the
+/// live file.
+pub(crate) fn read_source(
+    read: &Dir,
+    live: Option<(&Dir, &Path)>,
+    sys: &Sys,
+    rel: &str,
+    limit: u64,
+) -> Result<Got, Refusal> {
+    let got = read.read_input_below(sys, rel, limit)?;
+    match (&got, live) {
+        (Got::Bytes(b), Some((dir, root))) if kept_and_refused(dir, sys, root, rel, b, limit) => {
+            Ok(Got::Absent)
+        }
+        _ => Ok(got),
+    }
+}
+
+/// Whether apply would refuse the live source `rel` below the opened live root `live` (at path
+/// `root`) that publication keeps. The staged copy holds a fresh file with one link, while a
+/// file that the fast-forward does not change keeps its links and owner, which
+/// `Dir::read_input` checks. A live file with other content is rewritten by the fast-forward,
+/// and a missing one is created.
+fn kept_and_refused(
+    live: &Dir,
+    sys: &Sys,
+    root: &Path,
+    rel: &str,
+    staged: &[u8],
+    limit: u64,
+) -> bool {
+    if !matches!(live.read_input_below(sys, rel, limit), Ok(Got::Absent)) {
+        return false;
+    }
+    let abs = root.join(rel);
+    std::fs::symlink_metadata(&abs).is_ok_and(|m| {
+        m.is_file()
+            && m.len() == u64::try_from(staged.len()).unwrap_or(u64::MAX)
+            && std::fs::read(&abs).is_ok_and(|b| b == staged)
+    })
 }
 
 fn live_equals(obs: &Observations, op: &Operation, hash: &str) -> bool {

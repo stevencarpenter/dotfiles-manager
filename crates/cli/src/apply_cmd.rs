@@ -42,6 +42,13 @@ pub struct Args {
     pub update: bool,
     /// `services --restart <resource-id>`: current services to plan as a disruptive restart.
     pub restart: BTreeSet<String>,
+    /// A scope of `sync` (docs/sync.md): sync printed the plan and prints the result line, so
+    /// this run prints neither, and its report omits the `not_in_scope` operations.
+    pub(crate) composed: bool,
+    /// A later scope of `sync`: the plan sync made of this scope after the earlier scopes, from
+    /// the sources this run reads. The first look uses it instead of probing again; the plan
+    /// under the lock is still made and compared with the approved digest.
+    pub(crate) planned: Option<dfm_model::plan::Plan>,
 }
 
 /// `apply [--root <dir>] [-y|--yes-plan <digest>] [--allow-disruptive <operation-id>]...
@@ -106,6 +113,8 @@ pub fn parse_args(args: &[String], scope: Scope) -> Result<Args, Refusal> {
         scope,
         update,
         restart,
+        composed: false,
+        planned: None,
     })
 }
 
@@ -241,6 +250,60 @@ pub(crate) fn end_without_change(
     Ok(true)
 }
 
+/// The providers' answers a plan of `scope` needs (docs/packages.md, docs/lifecycle.md). The
+/// probes are read-only and run only for their scope.
+pub(crate) fn probe(
+    ctx: &Ctx,
+    sys: &Sys,
+    args: &Args,
+    loaded: &crate::Loaded,
+) -> Result<Probed, Refusal> {
+    let resolved = &loaded.resolved;
+    let mut probed = Probed::default();
+    match args.scope {
+        Scope::Packages if args.update => {
+            probed.package = crate::adapters::package::update_facts(resolved, &ctx.runner(sys))?;
+        }
+        Scope::Packages => {
+            probed.package = crate::adapters::package::package_facts(resolved, &ctx.runner(sys))?;
+        }
+        Scope::Services => {
+            let staged = loaded
+                .staged
+                .as_deref()
+                .map(|t| (loaded.root.as_path(), t, &loaded.links, &loaded.generated));
+            probed.service = crate::adapters::service::service_facts(
+                resolved,
+                &ctx.runner(sys),
+                staged,
+                &loaded.root,
+            )?;
+            probed.restart = args.restart.clone();
+        }
+        _ => {}
+    }
+    Ok(probed)
+}
+
+/// A restart request must name a service of the plan, as an approval flag must name an
+/// operation: a misspelled id would otherwise be ignored.
+pub(crate) fn check_restart(
+    restart: &BTreeSet<String>,
+    plan: &dfm_model::plan::Plan,
+) -> Result<(), Refusal> {
+    match restart.iter().find(|r| {
+        !plan
+            .operations
+            .iter()
+            .any(|o| o.resource == **r && o.id.ends_with("@service"))
+    }) {
+        Some(bad) => Err(usage(format!(
+            "--restart {bad} names no service in this plan"
+        ))),
+        None => Ok(()),
+    }
+}
+
 /// What was printed so far, so a refusal prints its `result:` line exactly once.
 #[derive(Default)]
 struct Progress {
@@ -249,16 +312,19 @@ struct Progress {
 }
 
 /// The generators of one scope over the sources the plan was resolved from.
-fn generators_for<'a>(
+pub(crate) fn generators_for<'a>(
     ctx: &Ctx,
     sys: &Sys,
     scope: Scope,
     loaded: &'a crate::Loaded,
 ) -> Generators<'a> {
     match scope {
-        Scope::Secrets | Scope::Packages | Scope::Services => {
-            Generators::with_runner(&loaded.resolved, &loaded.sources, ctx.runner(sys))
-        }
+        Scope::Secrets | Scope::Packages | Scope::Services => Generators::with_runner(
+            &loaded.resolved,
+            &loaded.sources,
+            &loaded.root,
+            ctx.runner(sys),
+        ),
         Scope::Config => Generators::new(&loaded.resolved),
     }
 }
@@ -303,60 +369,38 @@ fn run_inner(
     // Read-only look first. A refusal here changes nothing, not even the lock file.
     let first = load_resolved(ctx, root)?;
     let (layout, sys) = (ctx.layout(), ctx.sys()?);
-    // A packages or services plan needs the providers' answers first (docs/packages.md,
-    // docs/lifecycle.md). The probes are read-only and run only for their scope.
-    let probes = |resolved: &dfm_model::resolve::Resolved| -> Result<Probed, Refusal> {
-        let mut probed = Probed::default();
-        match args.scope {
-            Scope::Packages if args.update => {
-                probed.package =
-                    crate::adapters::package::update_facts(resolved, &ctx.runner(&sys))?;
-            }
-            Scope::Packages => {
-                probed.package =
-                    crate::adapters::package::package_facts(resolved, &ctx.runner(&sys))?;
-            }
-            Scope::Services => {
-                probed.service =
-                    crate::adapters::service::service_facts(resolved, &ctx.runner(&sys))?;
-                probed.restart = args.restart.clone();
-            }
-            _ => {}
+    // A packages or services plan needs the providers' answers first.
+    let probes = |loaded| probe(ctx, &sys, args, loaded);
+    let fresh;
+    let plan = match &args.planned {
+        Some(p) => p,
+        None => {
+            fresh = plan_for(ctx, &first, args.scope, probes(&first)?)?;
+            &fresh
         }
-        Ok(probed)
     };
-    let plan = plan_for(ctx, &first, args.scope, probes(&first.resolved)?)?;
     stop()?;
-    // A restart request must name a service of this plan, as an approval flag must name an
-    // operation: a misspelled id would otherwise be ignored.
-    if let Some(bad) = args.restart.iter().find(|r| {
-        !plan
-            .operations
-            .iter()
-            .any(|o| o.resource == **r && o.id.ends_with("@service"))
-    }) {
-        return Err(usage(format!(
-            "--restart {bad} names no service in this plan"
-        )));
-    }
+    check_restart(&args.restart, plan)?;
     let digest = plan.digest()?;
-    if let Some(i) = &ctx.isolated {
-        writeln!(out, "isolated: true {i}").map_err(w)?;
+    if !args.composed {
+        if let Some(i) = &ctx.isolated {
+            writeln!(out, "isolated: true {i}").map_err(w)?;
+        }
+        render(plan, &digest, ctx.color, out).map_err(w)?;
+        progress.plan_printed = true;
     }
-    render(&plan, &digest, ctx.color, out).map_err(w)?;
-    progress.plan_printed = true;
     let generators = |loaded| generators_for(ctx, &sys, args.scope, loaded);
-    let journal_open = check_before_lock(ctx, args, &plan, &digest, &generators(&first), out)?;
+    let journal_open = check_before_lock(ctx, args, plan, &digest, &generators(&first), out)?;
     // The credential gate (docs/secrets.md): a secrets run without a vault
     // session stops here, exit 3, before the lock and before any write. Nothing is rendered.
     if args.scope == Scope::Secrets {
-        crate::adapters::secret::credentials(&plan, &first.resolved, &ctx.runner(&sys))?;
+        crate::adapters::secret::credentials(plan, &first.resolved, &ctx.runner(&sys))?;
     }
     stop()?;
     if args.preview {
         return Ok(());
     }
-    if end_without_change(args, &plan, journal_open, ctx.color, out).map_err(w)? {
+    if end_without_change(args, plan, journal_open, ctx.color, out).map_err(w)? {
         progress.result_printed = true;
         return Ok(());
     }
@@ -380,7 +424,7 @@ fn run_inner(
         .require_identity(&binding)
         .map_err(|r| store.stamp(r))?;
     let second = load_resolved(ctx, root).map_err(|r| store.stamp(r))?;
-    let facts = probes(&second.resolved).map_err(|r| store.stamp(r))?;
+    let facts = probes(&second).map_err(|r| store.stamp(r))?;
     let locked = plan_for(ctx, &second, args.scope, facts).map_err(|r| store.stamp(r))?;
     stop().map_err(|r| store.stamp(r))?;
     let locked_digest = locked.digest().map_err(|r| store.stamp(r))?;
@@ -533,6 +577,9 @@ fn run_inner(
     }
 
     for (op, rec) in locked.operations.iter().zip(&report.operations) {
+        if args.composed && rec.status == Status::NotInScope {
+            continue;
+        }
         let reload = rec
             .reload
             .as_deref()
@@ -584,15 +631,17 @@ fn run_inner(
         (None, Some(r)) => Err(r),
         (None, None) => Ok(()),
     };
-    let final_exit = outcome.as_ref().err().map_or(Exit::Ok, Refusal::exit);
-    writeln!(
-        out,
-        "{} {}",
-        paint::label(ctx.color, "result:"),
-        paint::status(ctx.color, final_exit.name())
-    )
-    .map_err(w)?;
-    progress.result_printed = true;
+    if !args.composed {
+        let final_exit = outcome.as_ref().err().map_or(Exit::Ok, Refusal::exit);
+        writeln!(
+            out,
+            "{} {}",
+            paint::label(ctx.color, "result:"),
+            paint::status(ctx.color, final_exit.name())
+        )
+        .map_err(w)?;
+        progress.result_printed = true;
+    }
     outcome
 }
 
