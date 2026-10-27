@@ -3599,3 +3599,188 @@ fn a_hardlinked_merge_fragment_source_the_update_keeps_is_refused_at_preview_as_
     let a = l.run(&["apply", "--root", l.fx.root_arg(), "--preview"]);
     in_order(&stdout(&a), &["E_SOURCE_UNTRUSTED life.settings", refused]);
 }
+
+#[test]
+fn a_service_whose_definition_link_adoption_is_withheld_is_reviewed_from_the_existing_link() {
+    let l = Life::new();
+    let o = l.approved(&[]);
+    assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
+    // A second agent whose definition is new upstream. The owner already made the exact link
+    // by hand: the configuration plan adopts it, and the adoption is withheld.
+    let plist = "Library/LaunchAgents/org.example.agent2.plist";
+    l.push_module(
+        &format!(
+            "\n[[resources]]\nid = \"agent2-plist\"\nkind = \"link\"\nadapter = \"fs-link/v1\"\ntarget = \"{plist}\"\n[resources.value]\nsource = \"files/org.example.agent2.plist\"\n\n[[resources]]\nid = \"agent2\"\nkind = \"service\"\nadapter = \"launchd-agent/v1\"\n[resources.value]\nlabel = \"org.example.agent2\"\nplist = \"{plist}\"\n"
+        ),
+        &[(
+            "org.example.agent2.plist",
+            &AGENT_PLIST.replace("org.example.agent<", "org.example.agent2<"),
+        )],
+        "add a second agent",
+    );
+    std::os::unix::fs::symlink(
+        l.fx.root
+            .join("base/modules/life/files/org.example.agent2.plist"),
+        l.fx.h(plist),
+    )
+    .unwrap();
+    let adopt = format!("life.agent2-plist@{plist}");
+    // The withheld adoption writes nothing, so the link stays and the definition it resolves
+    // to after publication is the one the services review reads: the agent starts.
+    let o = l.plain(&[]);
+    assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
+    let s = stdout(&o);
+    in_order(
+        &s,
+        &[
+            &format!("withheld: {adopt} (needs --allow-adopt)"),
+            "plan digest: ",
+            &format!("  config: withheld ({adopt})"),
+            "  services: ok",
+            "result: ok",
+        ],
+    );
+    assert!(!s.contains("services blocked"), "{s}");
+    assert!(
+        l.fx.receipt_docs()
+            .iter()
+            .all(|r| !r.to_string().contains(&adopt)),
+        "the withheld adoption ran"
+    );
+    assert!(
+        fs::read_to_string(l.fake.path().join("loaded"))
+            .unwrap()
+            .contains("org.example.agent2 "),
+        "{}",
+        l.log()
+    );
+}
+
+#[test]
+fn a_generated_definition_whose_operation_is_withheld_is_reviewed_from_the_home_file() {
+    let l = Life::unpublished();
+    let seed = &l.fx.upstream.seed;
+    put(seed, "base/modules/life/module.toml", &generated_life());
+    l.fx.upstream.push("generate the agent definition");
+    let o = l.approved(&[]);
+    assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
+    let plist = l.fx.h("Library/LaunchAgents/org.example.agent.plist");
+    assert!(plist.is_file() && !plist.is_symlink());
+    // Upstream changes the program and adds a fragment link that the owner already made by
+    // hand: the adoption is withheld, and so is the generated definition that runs after it.
+    put(
+        seed,
+        "base/modules/life/module.toml",
+        &format!(
+            "{}\n[[resources]]\nid = \"afrag\"\nkind = \"link\"\nadapter = \"fs-link/v1\"\ntarget = \".config/agent/a.frag\"\n[resources.value]\nsource = \"files/a.frag\"\n",
+            generated_life()
+        ),
+    );
+    put(seed, "base/modules/life/files/a.frag", "<!-- a -->\n");
+    put(
+        seed,
+        "base/modules/life/files/org.example.agent.plist",
+        &AGENT_PLIST.replace("/usr/bin/true", "/usr/bin/false"),
+    );
+    l.fx.upstream.push("the agent runs another program");
+    let frag = l.fx.h(".config/agent/a.frag");
+    fs::create_dir_all(frag.parent().unwrap()).unwrap();
+    std::os::unix::fs::symlink(l.fx.root.join("base/modules/life/files/a.frag"), &frag).unwrap();
+    // The restart loads the HOME file, which keeps the old program: the review must read that
+    // file, not the bytes the withheld operation would write.
+    let flags = ["--restart", "life.agent"];
+    let p = l.preview(&flags);
+    assert_eq!(code(&p), 0, "{}\n{}", stdout(&p), stderr(&p));
+    let s = stdout(&p);
+    in_order(
+        &s,
+        &[
+            "withheld: life.afrag@.config/agent/a.frag (needs --allow-adopt)",
+            "withheld: life.agent-plist@Library/LaunchAgents/org.example.agent.plist (runs after a withheld operation)",
+        ],
+    );
+    assert!(s.contains("the definition runs /usr/bin/true"), "{s}");
+    assert!(!s.contains("the definition runs /usr/bin/false"), "{s}");
+    let log = l.log();
+    let o = l.plain(&flags);
+    assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
+    let s = stdout(&o);
+    assert!(!s.contains("E_PLAN_STALE"), "{s}");
+    in_order(&s, &["  services: ok", "result: ok"]);
+    assert!(
+        fs::read_to_string(&plist)
+            .unwrap()
+            .contains("/usr/bin/true")
+    );
+    in_order(
+        &l.log()[log.len()..],
+        &["launchctl bootout", "launchctl bootstrap"],
+    );
+}
+
+#[test]
+fn a_withheld_operation_does_not_count_in_the_combined_journal_check() {
+    use dfm_model::state::{Class, JournalEntry, MAX_JOURNAL_BYTES, Phase};
+
+    let l = Life::unpublished();
+    // The secret's destination exists and the ledger does not record it: a withheld takeover.
+    let env = l.fx.h(".config/example/personal.env");
+    fs::create_dir_all(env.parent().unwrap()).unwrap();
+    fs::write(&env, "TOKEN=mine\n").unwrap();
+    fs::set_permissions(&env, fs::Permissions::from_mode(0o600)).unwrap();
+    let id = "life.token@.config/example/personal.env";
+    let p = l.preview(&[]);
+    assert_eq!(code(&p), 0, "{}\n{}", stdout(&p), stderr(&p));
+    let s = stdout(&p);
+    assert!(
+        s.contains(&format!("withheld: {id} (needs --allow-adopt)")),
+        "{s}"
+    );
+    // The journaled operations of the run, from each scope's summary list of planned ids.
+    let planned: Vec<&str> = s
+        .lines()
+        .filter_map(|line| line.strip_prefix("  planned "))
+        .filter(|id| !id.contains(' '))
+        .collect();
+    assert!(planned.contains(&id), "{s}");
+    let runnable = u64::try_from(planned.len() - 1).unwrap();
+    // Room for every operation that runs (4096 bytes each), less than one more.
+    let free = runnable * 4096 + 100;
+    let journal = l.fx.h(".local/state/dotfiles-manager/state/journal.jsonl");
+    let len = fs::metadata(&journal).map_or(0, |m| m.len());
+    let line = JournalEntry {
+        schema: dfm_model::state::SCHEMA,
+        op_id: "closed-1".into(),
+        op: "create-file".into(),
+        phase: Phase::Done,
+        at: "2026-10-10T00:00:00.000000000Z".into(),
+        resource: "core.x".into(),
+        adapter: "git-config/v1".into(),
+        class: Class::Normal,
+        recovery: None,
+        token: None,
+        reason: Some("x".repeat(1024)),
+    }
+    .to_line()
+    .unwrap();
+    let room = MAX_JOURNAL_BYTES - free - len;
+    let mut bytes = fs::read(&journal).unwrap_or_default();
+    bytes.extend(line.repeat(usize::try_from(room).unwrap() / line.len()));
+    fs::write(&journal, &bytes).unwrap();
+    let o = l.plain(&[]);
+    assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
+    let s = stdout(&o);
+    in_order(
+        &s,
+        &[
+            "  config: ok",
+            "  packages: ok",
+            "  secrets: withheld (",
+            "  services: ok",
+            "result: ok",
+        ],
+    );
+    assert!(!stderr(&o).contains("E_LIMIT_EXCEEDED"), "{}", stderr(&o));
+    assert_eq!(fs::read_to_string(&env).unwrap(), "TOKEN=mine\n");
+    assert!(!l.log().contains("op inject"), "{}", l.log());
+}

@@ -1274,7 +1274,9 @@ fn plan_staged(
         let withheld = apply_cmd::withheld(&scope_args(args, scope, Some(&plan)), &plan);
         let runnable = apply_cmd::without(&plan, &withheld);
         if scope == Scope::Config {
-            // A withheld operation publishes nothing: the services scope reads HOME at its path.
+            // A withheld file operation writes nothing: the services scope reads HOME at its
+            // path. A withheld link is an adoption of the exact link that HOME already holds,
+            // so its target stays in `links`.
             let unwritten: BTreeSet<String> = plan
                 .operations
                 .iter()
@@ -1283,7 +1285,7 @@ fn plan_staged(
                 .collect();
             generated.retain(|path, _| !unwritten.contains(path));
             loaded.generated = generated;
-            loaded.links = runnable
+            loaded.links = plan
                 .operations
                 .iter()
                 .filter(|o| o.status == PlanStatus::Planned)
