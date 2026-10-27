@@ -2,9 +2,6 @@
 //! updater, detached, and ends in exactly one status. Nothing here returns an error: a missing
 //! tool, a failed command or a stop request is a row.
 
-// shortcut: sync wires these in the next commit (DFM-31 plan Task 3); remove the allow then.
-#![allow(dead_code)]
-
 use dfm_engine::proc::{End, Output, Request, Runner};
 use dfm_model::state::Status;
 use dfm_model::updater::Updater;

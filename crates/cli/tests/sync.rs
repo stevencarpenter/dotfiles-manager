@@ -3827,3 +3827,347 @@ fn a_withheld_operation_does_not_count_in_the_combined_journal_check() {
     assert_eq!(fs::read_to_string(&env).unwrap(), "TOKEN=mine\n");
     assert!(!l.log().contains("op inject"), "{}", l.log());
 }
+
+// ---- the upgrade step (DFM-31, docs/upgrade.md) ----------------------------------------------
+
+/// A native tool look-alike: `--version` prints `st/<name>`, the update command writes the
+/// `next-<name>` marker's content there (or exits 1 with the `fail-<name>` marker, or touches
+/// `started-<name>` and sleeps with the `hang-<name>` marker). Every call is logged.
+fn native_tool(name: &str, update: &str, st: &Path) -> String {
+    format!(
+        r#"#!/bin/sh
+PATH=/usr/bin:/bin
+st={st}
+printf '{name} %s\n' "$*" >> "$st/log"
+case "$1" in
+  --version) cat "$st/{name}" ;;
+  {update})
+    [ -e "$st/hang-{name}" ] && {{ touch "$st/started-{name}"; exec sleep 30; }}
+    [ -e "$st/fail-{name}" ] && {{ echo boom >&2; exit 1; }}
+    [ -e "$st/next-{name}" ] && cp "$st/next-{name}" "$st/{name}"
+    exit 0 ;;
+  *) exit 64 ;;
+esac
+"#,
+        st = st.display()
+    )
+}
+
+/// `brew` for the upgrade step: nothing outdated, and `list` finds nothing.
+const UPGRADE_BREW: &str = r#"#!/bin/sh
+PATH=/usr/bin:/bin
+here=$(dirname "$0")
+printf 'brew %s\n' "$*" >> "$here/../st/log"
+case "$1" in
+  update) exit 0 ;;
+  outdated) echo '{"formulae":[],"casks":[]}' ;;
+  list) exit 1 ;;
+  *) exit 64 ;;
+esac
+"#;
+
+/// The link-only fixture with updater look-alikes: `claude` in `~/.local/bin`, `codex` in its
+/// standalone directory, and `brew` on the provider path.
+struct Up {
+    fx: Fx,
+    fake: TempDir,
+}
+
+impl Up {
+    /// The profile declares `updaters`, pushed upstream; the first sync publishes it.
+    fn new(updaters: &str) -> Up {
+        let fx = Fx::new();
+        let fake = TempDir::new("sync-updaters");
+        let st = fake.path().join("st");
+        fs::create_dir_all(fake.path().join("bin")).unwrap();
+        fs::create_dir_all(&st).unwrap();
+        let up = Up { fx, fake };
+        let exe = |p: &Path, body: &str| {
+            fs::create_dir_all(p.parent().unwrap()).unwrap();
+            fs::write(p, body).unwrap();
+            fs::set_permissions(p, fs::Permissions::from_mode(0o755)).unwrap();
+        };
+        exe(
+            &up.fx.h(".local/bin/claude"),
+            &native_tool("claude", "update", &st),
+        );
+        exe(
+            &up.fx.h(".codex/packages/standalone/current/bin/codex"),
+            &native_tool("codex", "update", &st),
+        );
+        exe(&up.fake.path().join("bin/brew"), UPGRADE_BREW);
+        fs::write(st.join("claude"), "2.1.311 (Claude Code)\n").unwrap();
+        fs::write(st.join("codex"), "codex-cli 0.164.0\n").unwrap();
+        if !updaters.is_empty() {
+            put(
+                &up.fx.upstream.seed,
+                "profiles/t-01.toml",
+                &format!("{}updaters = {updaters}\n", common::PROFILE),
+            );
+            up.fx.upstream.push("declare the updaters");
+        }
+        up
+    }
+
+    fn st(&self, name: &str) -> PathBuf {
+        self.fake.path().join("st").join(name)
+    }
+
+    fn log(&self) -> String {
+        fs::read_to_string(self.st("log")).unwrap_or_default()
+    }
+
+    fn clear_log(&self) {
+        let _ = fs::remove_file(self.st("log"));
+    }
+
+    fn command(&self, args: &[&str]) -> Command {
+        let mut c = Command::new(BIN);
+        c.env_clear()
+            .env(
+                "DFM_PROVIDER_PATH",
+                format!("{}:/usr/bin:/bin", self.fake.path().join("bin").display()),
+            )
+            .arg("--home")
+            .arg(self.fx.home.path())
+            .args(["sync", "--root", self.fx.root_arg()])
+            .args(args);
+        c
+    }
+
+    fn sync(&self, args: &[&str]) -> Output {
+        self.command(args).output().unwrap()
+    }
+
+    fn upgrade_receipts(&self) -> Vec<serde_json::Value> {
+        self.fx
+            .receipt_docs()
+            .into_iter()
+            .filter(|r| r["command"] == "upgrade")
+            .collect()
+    }
+}
+
+#[test]
+fn sync_runs_the_declared_updaters_in_order() {
+    let u = Up::new(r#"["claude", "brew"]"#);
+    fs::write(u.st("next-claude"), "2.1.312 (Claude Code)\n").unwrap();
+    let o = u.sync(&[]);
+    assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
+    let log = u.log();
+    let first_brew = log.find("brew update").expect(&log);
+    assert!(log.find("claude update").expect(&log) < first_brew, "{log}");
+    let s = stdout(&o);
+    assert!(
+        s.contains("  updated claude 2.1.311 (Claude Code) -> 2.1.312 (Claude Code)"),
+        "{s}"
+    );
+    assert!(s.contains("  current brew"), "{s}");
+    assert!(s.contains("  upgrade: updated=1 current=1"), "{s}");
+}
+
+#[test]
+fn sync_runs_updaters_when_nothing_changes() {
+    let u = Up::new(r#"["claude"]"#);
+    let o = u.sync(&[]);
+    assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
+    u.clear_log();
+    let o = u.sync(&[]);
+    assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
+    let s = stdout(&o);
+    assert!(s.contains("nothing to change: no approval needed"), "{s}");
+    assert!(s.contains("  current claude"), "{s}");
+    assert!(u.log().contains("claude update"), "{}", u.log());
+}
+
+#[test]
+fn no_upgrade_skips_every_updater() {
+    let u = Up::new(r#"["claude", "brew"]"#);
+    let o = u.sync(&["--no-upgrade"]);
+    assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
+    assert_eq!(u.log(), "");
+    let s = stdout(&o);
+    assert!(s.contains("upgrade: skipped (--no-upgrade)"), "{s}");
+    assert!(u.upgrade_receipts().is_empty());
+}
+
+#[test]
+fn preview_lists_updaters_and_runs_none() {
+    let u = Up::new(r#"["claude", "brew"]"#);
+    let o = u.sync(&["--preview"]);
+    assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
+    let s = stdout(&o);
+    assert!(s.contains("  claude: would run claude update"), "{s}");
+    assert!(s.contains("  brew: would run brew update"), "{s}");
+    assert_eq!(u.log(), "");
+    assert!(u.upgrade_receipts().is_empty());
+}
+
+#[test]
+fn profile_without_updaters_says_so() {
+    let u = Up::new("");
+    let o = u.sync(&[]);
+    assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
+    assert!(
+        stdout(&o).contains("upgrade: none declared in the profile"),
+        "{}",
+        stdout(&o)
+    );
+    assert_eq!(u.log(), "");
+    assert!(u.upgrade_receipts().is_empty());
+}
+
+#[test]
+fn a_failed_updater_warns_and_exits_0() {
+    let u = Up::new(r#"["codex", "claude"]"#);
+    fs::write(u.st("fail-codex"), "").unwrap();
+    let o = u.sync(&[]);
+    assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
+    let s = stdout(&o);
+    assert!(s.contains("  failed codex"), "{s}");
+    assert!(u.log().contains("claude update"), "{}", u.log());
+    let last = s.lines().last().unwrap();
+    assert!(
+        last.starts_with("warning: upgrade codex failed: codex update exited 1"),
+        "{s}"
+    );
+}
+
+#[test]
+fn a_refused_sync_runs_no_updater() {
+    let u = Up::new(r#"["claude"]"#);
+    // An origin the grants do not hold is refused before any fetch.
+    fs::remove_file(u.fx.h(".local/state/dotfiles-manager/state/grants.json")).unwrap();
+    let o = u.sync(&[]);
+    assert_ne!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
+    assert_eq!(u.log(), "");
+}
+
+#[test]
+fn the_upgrade_receipt_records_each_updater() {
+    let u = Up::new(r#"["codex", "claude"]"#);
+    fs::write(u.st("fail-codex"), "").unwrap();
+    let o = u.sync(&[]);
+    assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
+    let r = u.upgrade_receipts();
+    assert_eq!(r.len(), 1, "{r:?}");
+    let ops = r[0]["operations"].as_array().unwrap();
+    let rows: Vec<(&str, &str, &str)> = ops
+        .iter()
+        .map(|o| {
+            (
+                o["resource"].as_str().unwrap(),
+                o["adapter"].as_str().unwrap(),
+                o["status"].as_str().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        rows,
+        [
+            ("updater:codex", "updater/v1", "failed"),
+            ("updater:claude", "updater/v1", "current")
+        ]
+    );
+    assert_eq!(r[0]["result"]["outcome"], "failed");
+    assert_eq!(r[0]["result"]["exit_code"], 1);
+}
+
+#[test]
+fn an_interrupted_upgrade_does_not_block_the_next_sync() {
+    let u = Up::new(r#"["claude", "codex"]"#);
+    fs::write(u.st("hang-claude"), "").unwrap();
+    let child = u
+        .command(&[])
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let started = u.st("started-claude");
+    let t0 = std::time::Instant::now();
+    while !started.exists() {
+        assert!(t0.elapsed().as_secs() < 60, "claude update never started");
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let kill = Command::new("/bin/kill")
+        .args(["-INT", &child.id().to_string()])
+        .status()
+        .unwrap();
+    assert!(kill.success());
+    let o = child.wait_with_output().unwrap();
+    let s = stdout(&o);
+    assert!(s.contains("  pending claude"), "{s}");
+    assert!(s.contains("  pending codex"), "{s}");
+    assert!(!u.log().contains("codex update"), "{}", u.log());
+    fs::remove_file(u.st("hang-claude")).unwrap();
+    u.clear_log();
+    let o = u.sync(&[]);
+    assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
+    let log = u.log();
+    assert!(
+        log.contains("claude update") && log.contains("codex update"),
+        "{log}"
+    );
+}
+
+#[test]
+fn no_upgrade_with_preview_is_allowed() {
+    let u = Up::new(r#"["claude"]"#);
+    let o = u.sync(&["--preview", "--no-upgrade"]);
+    assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
+    assert!(
+        stdout(&o).contains("upgrade: skipped (--no-upgrade)"),
+        "{}",
+        stdout(&o)
+    );
+}
+
+#[test]
+fn no_upgrade_twice_is_a_usage_error() {
+    let u = Up::new("");
+    let o = u.sync(&["--no-upgrade", "--no-upgrade"]);
+    assert_eq!(code(&o), 2, "{}\n{}", stdout(&o), stderr(&o));
+    assert!(
+        stderr(&o).contains("--no-upgrade given twice"),
+        "{}",
+        stderr(&o)
+    );
+}
+
+#[test]
+fn a_blocked_scope_still_runs_the_upgrade() {
+    let l = Life::new();
+    let st = l.fake.path().join("st");
+    fs::create_dir_all(&st).unwrap();
+    fs::write(st.join("claude"), "2.1.311 (Claude Code)\n").unwrap();
+    let claude = l.fx.h(".local/bin/claude");
+    fs::create_dir_all(claude.parent().unwrap()).unwrap();
+    fs::write(&claude, native_tool("claude", "update", &st)).unwrap();
+    fs::set_permissions(&claude, fs::Permissions::from_mode(0o755)).unwrap();
+    let seed = &l.fx.upstream.seed;
+    put(
+        seed,
+        "profiles/t-01.toml",
+        &format!(
+            "{}updaters = [\"claude\"]\n",
+            common::PROFILE.replace("modules = [\"extra\"]", "modules = [\"extra\", \"life\"]")
+        ),
+    );
+    // A template change is a re-render that the secrets scope skips without a session.
+    put(
+        seed,
+        "base/modules/life/files/personal.env.tpl",
+        "TOKEN={{ op://vault/item/field }}\nMORE=1\n",
+    );
+    l.fx.upstream.push("declare claude; the template changes");
+    l.sign_in(false);
+    let o = l.approved(&[]);
+    assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
+    let s = stdout(&o);
+    assert!(
+        s.contains("  secrets: skipped: no session (life.token)"),
+        "{s}"
+    );
+    assert!(s.contains("  current claude 2.1.311 (Claude Code)"), "{s}");
+    assert!(s.contains("  upgrade: current=1"), "{s}");
+    assert!(s.contains("\nwarning: secrets skipped"), "{s}");
+}

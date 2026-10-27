@@ -423,10 +423,18 @@ fn only_the_mutating_path_of_apply_installs_the_signal_handlers() {
         .filter(|f| fs::read_to_string(f).unwrap().contains("signal::install("))
         .map(|f| f.strip_prefix(repo_root()).unwrap().display().to_string())
         .collect();
+    // sync arms them before its first updater when no scope ran (docs/upgrade.md).
     assert_eq!(
         callers,
-        ["crates/cli/src/apply_cmd.rs", "crates/cli/src/trial_cmd.rs"]
+        [
+            "crates/cli/src/apply_cmd.rs",
+            "crates/cli/src/sync_cmd.rs",
+            "crates/cli/src/trial_cmd.rs"
+        ]
     );
+    let sync = fs::read_to_string(repo_root().join("crates/cli/src/sync_cmd.rs")).unwrap();
+    assert_eq!(sync.matches("signal::install(").count(), 1);
+    assert!(sync.find("signal::install(").unwrap() < sync.find("updater::run(").unwrap());
     let trial = fs::read_to_string(repo_root().join("crates/cli/src/trial_cmd.rs")).unwrap();
     assert_eq!(trial.matches("signal::install(").count(), 1);
     assert!(trial.find("signal::install(").unwrap() < trial.find("find_owner(&runner").unwrap());

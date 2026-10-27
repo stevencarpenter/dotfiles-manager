@@ -18,12 +18,14 @@ Git is the `git` binary on the runner's fixed search path (docs/secrets.md, "How
 ```
 dfm sync [--root <dir>] [--preview] [-y|--yes-plan <digest>] [--allow-disruptive <operation-id>]...
          [--allow-adopt <operation-id>]... [--restart <resource-id>]... [--trust-origin <origin>]...
+         [--no-upgrade]
 ```
 
 - `--root` is the user's checkout: the git working tree that holds the bound profile and `dotfiles-manager.lock`. It defaults to the root the binding records (docs/bootstrap.md).
 - `--yes-plan <digest>` is optional. Without it the run approves the plan it prints (see "Approval"). The digest that `sync` prints and `--yes-plan` takes is the **sync digest** (step 3), not a scope plan's.
 - Each `--allow-adopt` id goes to the scope whose plan has that operation. `--allow-disruptive` is accepted as in `apply` (docs/apply.md), but `sync` needs it for nothing. An id that names no planned operation of that kind in any scope is a usage error.
 - `--restart <resource-id>` goes to the services scope, as for `services` (docs/lifecycle.md). It is the restart's approval: no `--allow-disruptive` flag is needed. An id that names no service is a usage error.
+- `--no-upgrade` skips the upgrade step (see "The upgrade step").
 - `--trust-origin <origin>` grants one canonical origin. It is a usage error with `--preview` (a preview writes nothing) or with `--yes-plan`. A run with it and without `--yes-plan` grants, prints the plan and stops (step 4): one command never both widens trust and publishes.
 
 ## Approval
@@ -74,6 +76,10 @@ After an earlier scope of the same run ended `ok` with its approved digest, `syn
 Then the scope runs with that plan's digest, and its first look uses that plan instead of probing again. The plan under the scope's lock is still made and compared with the digest. Otherwise it fails with `E_PLAN_STALE`, and the next `sync` plans it. When no earlier scope ran, a scope runs with its reviewed digest, so the comparison covers every precondition and observation.
 
 A secrets plan never says `current` for an existing destination: the content exists only after the render (docs/secrets.md). A secrets plan whose planned operations only render again destinations the ledger proves (no new file, no takeover) is therefore treated as no change: the review runs no `op whoami` for it, and the summary says `current, not rendered again`. A run with something else to change renders them, and a result equal to the file writes nothing. So a `dfm sync` with nothing else to change does not contact the vault, and a rotated secret is rendered by the next sync that changes something else or by `dfm secrets`. Nothing is skipped on that path, so it prints no warning.
+
+## The upgrade step
+
+After the scopes, also after "nothing to change", `sync` runs the updaters the profile declares (`updaters`, a fixed set: `brew`, `claude`, `codex`, `opencode`, `skills`) and writes one `upgrade` receipt. A refused run runs none, and a skipped or blocked scope stops none. An updater that fails, is blocked or is stopped adds a warning at the end of standard output, and the exit stays 0. `--no-upgrade` skips the step, and `--preview` lists what it would run. See docs/upgrade.md.
 
 ## What the lock declares
 
