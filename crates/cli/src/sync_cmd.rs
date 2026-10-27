@@ -2211,16 +2211,16 @@ fn status_name(s: state::Status) -> String {
         .unwrap_or_default()
 }
 
-/// The updater environment: the provider runner and the Homebrew names of the trials.
+/// The updater environment: the provider runner and why `brew` must wait for the trials.
 fn updater_env<'a>(
     ctx: &'a Ctx,
     runner: &'a Runner,
-    held: &'a BTreeSet<String>,
+    trials: &'a BTreeSet<String>,
 ) -> updater::Env<'a> {
     updater::Env {
         provider: runner,
         home: ctx.platform.home(),
-        held,
+        trials,
         timeouts: updater::Timeouts::DEFAULT,
     }
 }
@@ -2289,13 +2289,18 @@ fn upgrade(
         return Err(crate::state_lost_refusal());
     }
     store.require_identity(binding)?;
+    // An unreadable record may be a Homebrew trial, so it holds brew too.
     let held: BTreeSet<String> = store
         .load()
         .trials
         .into_iter()
-        .filter_map(|(_, t)| t.ok()?.package)
-        .filter(|p| p.adapter == "homebrew/v1")
-        .map(|p| p.name)
+        .filter_map(|(name, t)| match t {
+            Err(_) => Some(format!("unreadable trial record {name}")),
+            Ok(t) => t
+                .package
+                .filter(|p| p.adapter == "homebrew/v1")
+                .map(|p| format!("active trial {} (homebrew/v1 {})", t.trial_id, p.name)),
+        })
         .collect();
     let started = now_ns()?;
     let mut runner = ctx.runner(sys);

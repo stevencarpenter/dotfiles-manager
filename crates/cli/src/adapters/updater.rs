@@ -29,8 +29,10 @@ pub struct Env<'a> {
     /// The provider runner (`brew`, `mise`).
     pub provider: &'a Runner,
     pub home: &'a Path,
-    /// Homebrew names of active trials: left out of `brew upgrade`.
-    pub held: &'a BTreeSet<String>,
+    /// Why `brew` must wait: each active Homebrew trial, and each trial record that cannot be
+    /// read. Homebrew upgrades the dependencies and dependents of the names it is given, so no
+    /// name can be left out safely (DFM-31.C09).
+    pub trials: &'a BTreeSet<String>,
     pub timeouts: Timeouts,
 }
 
@@ -349,6 +351,14 @@ fn brew(mut d: Draft, env: &Env) -> Row {
         d.notes.push(e.detail);
         return d.end(Status::Blocked);
     }
+    if !env.trials.is_empty() {
+        for why in env.trials {
+            d.notes.push(format!(
+                "brew waits for {why}: end the trial, then run dfm sync, or upgrade by hand"
+            ));
+        }
+        return d.end(Status::Blocked);
+    }
     if let Err(e) = call(
         env.provider,
         "brew",
@@ -362,18 +372,10 @@ fn brew(mut d: Draft, env: &Env) -> Row {
         Ok(l) => l,
         Err(e) => return d.stop(e),
     };
-    let (held, names): (Vec<&Outdated>, Vec<&Outdated>) =
-        before.iter().partition(|o| env.held.contains(&o.name));
-    for o in &held {
-        d.notes.push(format!("{} held (active trial)", o.name));
+    if before.is_empty() {
+        return d.end(Status::Current);
     }
-    if names.is_empty() {
-        return d.end(if held.is_empty() {
-            Status::Current
-        } else {
-            Status::Held
-        });
-    }
+    let names: Vec<&Outdated> = before.iter().collect();
     let mut a = args(&["upgrade"]);
     a.extend(names.iter().map(|o| o.name.clone()));
     let upgrade = call(
@@ -511,11 +513,11 @@ mod tests {
             fs::read_to_string(self.root.join("log")).unwrap_or_default()
         }
 
-        fn env<'a>(&'a self, held: &'a BTreeSet<String>) -> Env<'a> {
+        fn env<'a>(&'a self, trials: &'a BTreeSet<String>) -> Env<'a> {
             Env {
                 provider: &self.runner,
                 home: &self.home,
-                held,
+                trials,
                 timeouts: Timeouts::DEFAULT,
             }
         }
@@ -708,17 +710,20 @@ mod tests {
     }
 
     #[test]
-    fn brew_leaves_an_active_trial_out() {
+    fn brew_waits_for_an_active_trial() {
         let t = T::new();
-        t.brew(UV_CODEX, UV_ONLY);
-        let held = BTreeSet::from(["uv".to_string()]);
-        let r = run(Updater::Brew, &t.env(&held));
-        assert!(t.log().contains("brew upgrade codex |"), "{}", t.log());
+        t.brew(UV_CODEX, NONE);
+        // An upgrade of any name can upgrade a trial's package as a dependency or a dependent.
+        let trials = BTreeSet::from(["active trial t1 (homebrew/v1 uv)".to_string()]);
+        let r = run(Updater::Brew, &t.env(&trials));
+        assert_eq!(r.status, Status::Blocked, "{r:?}");
+        assert_eq!(t.log(), "");
         assert!(
-            r.notes.contains(&"uv held (active trial)".to_string()),
+            r.notes.contains(
+                &"brew waits for active trial t1 (homebrew/v1 uv): end the trial, then run dfm sync, or upgrade by hand".to_string()
+            ),
             "{r:?}"
         );
-        assert_eq!(r.status, Status::Updated, "{r:?}");
     }
 
     #[test]

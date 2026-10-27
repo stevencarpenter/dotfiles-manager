@@ -4261,3 +4261,20 @@ fn a_blocked_scope_still_runs_the_upgrade() {
     assert!(s.contains("  upgrade: current=1"), "{s}");
     assert!(s.contains("\nwarning: secrets skipped"), "{s}");
 }
+
+#[test]
+fn an_unreadable_trial_record_blocks_brew_and_not_the_others() {
+    let u = Up::new(r#"["brew", "claude"]"#);
+    let trials = u.fx.h(".local/state/dotfiles-manager/state/trials");
+    fs::create_dir_all(&trials).unwrap();
+    fs::write(trials.join("t-bad.json"), "not json").unwrap();
+    let o = u.sync(&[]);
+    assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
+    let s = stdout(&o);
+    assert!(s.contains("  blocked brew"), "{s}");
+    assert!(s.contains("unreadable trial record t-bad.json"), "{s}");
+    assert!(s.contains("\nwarning: upgrade brew blocked"), "{s}");
+    let log = u.log();
+    assert!(!log.contains("brew update"), "{log}");
+    assert!(log.contains("claude update"), "{log}");
+}

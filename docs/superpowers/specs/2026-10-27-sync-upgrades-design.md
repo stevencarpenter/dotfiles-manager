@@ -95,6 +95,9 @@ The upgrade step writes one receipt (`command = upgrade`) with each updater's ro
 
 ## Trials (DFM-31.C09)
 
+Revised 2026-10-27 after review: the exclusion below does not protect a trial, because `brew upgrade` also upgrades dependencies and dependents of the names it gets. The built rule: while a Homebrew trial is active or a trial record cannot be read, `brew` is `blocked` and runs no command (docs/upgrade.md, "Trials"). The original text follows.
+
+
 If an active trial record under `state/trials/` names a Homebrew package, the `brew` updater leaves that name out of `brew upgrade` and reports it as `held (active trial <id>)`. No other updater reads the trial records. None are active on the M5 today.
 
 ## Acceptance for this slice
