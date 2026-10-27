@@ -4278,3 +4278,21 @@ fn an_unreadable_trial_record_blocks_brew_and_not_the_others() {
     assert!(!log.contains("brew update"), "{log}");
     assert!(log.contains("claude update"), "{log}");
 }
+
+#[test]
+fn an_unfinished_trial_record_blocks_brew() {
+    let u = Up::new(r#"["brew"]"#);
+    // A missing or unlistable trials directory refuses the run before any scope
+    // (E_STORAGE_INVALID); an interrupted trial write reaches the upgrade step.
+    let trials = u.fx.h(".local/state/dotfiles-manager/state/trials");
+    fs::write(trials.join(".t-new.json.1.tmp"), "{").unwrap();
+    let o = u.sync(&[]);
+    let s = stdout(&o);
+    assert_eq!(code(&o), 0, "{s}\n{}", stderr(&o));
+    assert!(!u.log().contains("brew update"), "{}", u.log());
+    assert!(s.contains("  blocked brew"), "{s}");
+    assert!(
+        s.contains("unfinished trial record trials/.t-new.json.1.tmp (interrupted write)"),
+        "{s}"
+    );
+}

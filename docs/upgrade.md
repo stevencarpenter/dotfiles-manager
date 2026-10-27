@@ -26,13 +26,13 @@ A manager built before this key refuses a profile that has it (`E_FIELD_UNKNOWN`
 
 | Name | Commands | Version before and after | Owner path |
 | --- | --- | --- | --- |
-| `brew` | `brew update`; `brew outdated --json=v2`; `brew upgrade <names>`; `brew outdated --json=v2` | each outdated name's installed and newest version | `brew` on the provider path (`/opt/homebrew/bin`) |
+| `brew` | `brew update`; `brew outdated --json=v2`; `brew upgrade --formula <names>`; `brew upgrade --cask <names>`; `brew outdated --json=v2` | each outdated name's installed and newest version | `brew` on the provider path (`/opt/homebrew/bin`) |
 | `claude` | `claude update` | `claude --version` | `~/.local/bin/claude` |
 | `codex` | `codex update` | `codex --version` | `~/.codex/packages/standalone/current/bin/codex` |
 | `opencode` | `opencode upgrade` | `opencode --version` | `~/.opencode/bin/opencode` |
 | `skills` | `mise exec -- npx skills update` | none | `mise` on the provider path |
 
-- **brew** upgrades every outdated formula and cask, not only declared ones. Version-sensitive tools are pinned with mise, per project or globally. `brew upgrade` gets the outdated names, so each one is accounted for. An empty list is `current` and runs no upgrade. Homebrew runs with its defaults (the dependents check and cleanup stay on). The manager sets `HOMEBREW_NO_ANALYTICS=1` and `HOMEBREW_NO_ENV_HINTS=1`, and `HOMEBREW_NO_AUTO_UPDATE=1` for every command after `brew update`.
+- **brew** upgrades every outdated formula and cask, not only declared ones. Version-sensitive tools are pinned with mise, per project or globally. `brew upgrade` gets the outdated names, one call per kind, so each formula and each cask is accounted for as itself, also when a formula and a cask share a name. Notes read `formula uv 0.13.5 -> 0.13.6 upgraded` or `cask codex 0.164.0 still outdated (0.165.0)`. An empty list is `current` and runs no upgrade. Homebrew runs with its defaults (the dependents check and cleanup stay on). The manager sets `HOMEBREW_NO_ANALYTICS=1` and `HOMEBREW_NO_ENV_HINTS=1`, and `HOMEBREW_NO_AUTO_UPDATE=1` for every command after `brew update`.
 - **A native tool** (`claude`, `codex`, `opencode`) must exist at its owner path. If it does not, it is `blocked` with that path, and no other copy (for example the Homebrew cask) is used. The runner's executable checks apply: a link that leaves the owner's prefix is `blocked`.
 - **A second copy.** For each native tool, `brew list --versions` and `brew list --cask --versions` look for a Homebrew copy under Homebrew's name for it: the cask `claude-code` (the `claude` cask is the desktop app), the formula and cask `codex`, the formula `opencode`. A copy found is a note on the row (`second copy: Homebrew cask codex 0.164.0`). It is never removed or chosen.
 - **skills** reports no version. Exit 0 is `current` with the note `skills update ran; it reports no version`.
@@ -51,7 +51,7 @@ A failure note gives the command, its exit code and the size of its standard err
 
 ## Trials
 
-While a Homebrew trial is active (a record under `state/trials/` whose package is `homebrew/v1`), or while any trial record cannot be read, `brew` is `blocked` and runs no command. Each reason is a note: `brew waits for active trial <id> (homebrew/v1 <name>): end the trial, then run dfm sync, or upgrade by hand`. Leaving the trial's name out of `brew upgrade` would not protect it: Homebrew upgrades the outdated dependencies of the names it is given and the installed dependents that need it, so an upgrade of any name can change the trial's package (DFM-31.C09). The other updaters still run.
+While a Homebrew trial is active (a record under `state/trials/` whose package is `homebrew/v1`), or while any trial record cannot be read or was left by an interrupted write, `brew` is `blocked` and runs no command. A missing or unlistable trials directory refuses the whole run earlier, as state loss (`E_STORAGE_INVALID`). Each reason is a note: `brew waits for active trial <id> (homebrew/v1 <name>): end the trial, then run dfm sync, or upgrade by hand`. Leaving the trial's name out of `brew upgrade` would not protect it: Homebrew upgrades the outdated dependencies of the names it is given and the installed dependents that need it, so an upgrade of any name can change the trial's package (DFM-31.C09). The other updaters still run.
 
 ## In sync
 

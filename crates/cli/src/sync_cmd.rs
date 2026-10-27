@@ -2289,9 +2289,22 @@ fn upgrade(
         return Err(crate::state_lost_refusal());
     }
     store.require_identity(binding)?;
-    // An unreadable record may be a Homebrew trial, so it holds brew too.
-    let held: BTreeSet<String> = store
-        .load()
+    // An unreadable record, or a trials directory that cannot be listed, may hide a Homebrew
+    // trial, so it holds brew too.
+    let loaded = store.load();
+    let unread = loaded
+        .problems
+        .iter()
+        .filter(|f| f.file == "trials")
+        .map(|f| format!("{}: {}", f.file, f.detail))
+        .chain(
+            loaded
+                .strays
+                .iter()
+                .filter(|s| s.starts_with("trials/"))
+                .map(|s| format!("unfinished trial record {s}")),
+        );
+    let held: BTreeSet<String> = loaded
         .trials
         .into_iter()
         .filter_map(|(name, t)| match t {
@@ -2301,6 +2314,7 @@ fn upgrade(
                 .filter(|p| p.adapter == "homebrew/v1")
                 .map(|p| format!("active trial {} (homebrew/v1 {})", t.trial_id, p.name)),
         })
+        .chain(unread)
         .collect();
     let started = now_ns()?;
     let mut runner = ctx.runner(sys);

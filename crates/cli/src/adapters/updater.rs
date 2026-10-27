@@ -298,9 +298,11 @@ fn second_copies(u: Updater, env: &Env, notes: &mut Vec<String>) {
     }
 }
 
-/// One outdated formula or cask: name, installed versions, newest version.
+/// One outdated formula or cask: kind, name, installed versions, newest version. A formula and a
+/// cask can share a name, so the kind is part of the identity.
 #[derive(Debug, PartialEq, Eq)]
 struct Outdated {
+    kind: &'static str,
     name: String,
     installed: String,
     current: String,
@@ -318,7 +320,7 @@ fn outdated(env: &Env) -> Result<Vec<Outdated>, (String, bool)> {
     let v: serde_json::Value =
         serde_json::from_slice(&out.stdout).map_err(|e| bad(format!("not JSON ({e})")))?;
     let mut list = Vec::new();
-    for key in ["formulae", "casks"] {
+    for (key, kind) in [("formulae", "formula"), ("casks", "cask")] {
         let items = v
             .get(key)
             .and_then(|x| x.as_array())
@@ -337,6 +339,7 @@ fn outdated(env: &Env) -> Result<Vec<Outdated>, (String, bool)> {
                 })
                 .unwrap_or_default();
             list.push(Outdated {
+                kind,
                 name,
                 installed,
                 current: s("current_version").unwrap_or_default(),
@@ -375,33 +378,45 @@ fn brew(mut d: Draft, env: &Env) -> Row {
     if before.is_empty() {
         return d.end(Status::Current);
     }
-    let names: Vec<&Outdated> = before.iter().collect();
-    let mut a = args(&["upgrade"]);
-    a.extend(names.iter().map(|o| o.name.clone()));
-    let upgrade = call(
-        env.provider,
-        "brew",
-        &a,
-        &brew_env(false),
-        env.timeouts.long,
-    );
+    // One call per kind, so a formula and a cask of one name are each upgraded as themselves.
+    let mut upgrade = Ok(());
+    for kind in ["formula", "cask"] {
+        let names: Vec<String> = before
+            .iter()
+            .filter(|o| o.kind == kind)
+            .map(|o| o.name.clone())
+            .collect();
+        if names.is_empty() || upgrade.is_err() {
+            continue;
+        }
+        let mut a = args(&["upgrade", &format!("--{kind}")]);
+        a.extend(names);
+        upgrade = call(
+            env.provider,
+            "brew",
+            &a,
+            &brew_env(false),
+            env.timeouts.long,
+        )
+        .map(|_| ());
+    }
     let after = match outdated(env) {
         Ok(l) => l,
         Err(e) => return d.stop(e),
     };
     let mut left = false;
-    for o in &names {
-        match after.iter().find(|x| x.name == o.name) {
+    for o in &before {
+        match after.iter().find(|x| x.kind == o.kind && x.name == o.name) {
             Some(x) => {
                 left = true;
                 d.notes.push(format!(
-                    "{} {} still outdated ({})",
-                    o.name, x.installed, x.current
+                    "{} {} {} still outdated ({})",
+                    o.kind, o.name, x.installed, x.current
                 ));
             }
             None => d.notes.push(format!(
-                "{} {} -> {} upgraded",
-                o.name, o.installed, o.current
+                "{} {} {} -> {} upgraded",
+                o.kind, o.name, o.installed, o.current
             )),
         }
     }
@@ -662,19 +677,20 @@ mod tests {
             [
                 "brew update",
                 "brew outdated --json=v2",
-                "brew upgrade uv codex",
+                "brew upgrade --formula uv",
+                "brew upgrade --cask codex",
                 "brew outdated --json=v2"
             ],
             "{log}"
         );
         assert!(
             r.notes
-                .contains(&"uv 0.13.5 -> 0.13.6 upgraded".to_string()),
+                .contains(&"formula uv 0.13.5 -> 0.13.6 upgraded".to_string()),
             "{r:?}"
         );
         assert!(
             r.notes
-                .contains(&"codex 0.164.0 -> 0.165.0 upgraded".to_string()),
+                .contains(&"cask codex 0.164.0 -> 0.165.0 upgraded".to_string()),
             "{r:?}"
         );
     }
@@ -699,12 +715,12 @@ mod tests {
         assert_eq!(r.status, Status::Failed, "{r:?}");
         assert!(
             r.notes
-                .contains(&"uv 0.13.5 still outdated (0.13.6)".to_string()),
+                .contains(&"formula uv 0.13.5 still outdated (0.13.6)".to_string()),
             "{r:?}"
         );
         assert!(
             r.notes
-                .contains(&"codex 0.164.0 -> 0.165.0 upgraded".to_string()),
+                .contains(&"cask codex 0.164.0 -> 0.165.0 upgraded".to_string()),
             "{r:?}"
         );
     }
@@ -722,6 +738,28 @@ mod tests {
             r.notes.contains(
                 &"brew waits for active trial t1 (homebrew/v1 uv): end the trial, then run dfm sync, or upgrade by hand".to_string()
             ),
+            "{r:?}"
+        );
+    }
+
+    #[test]
+    fn brew_keeps_a_formula_and_a_cask_of_one_name_apart() {
+        let t = T::new();
+        let both = r#"{"formulae":[{"name":"codex","installed_versions":["0.1"],"current_version":"0.2"}],"casks":[{"name":"codex","installed_versions":["0.164.0"],"current_version":"0.165.0"}]}"#;
+        let formula_left = r#"{"formulae":[{"name":"codex","installed_versions":["0.1"],"current_version":"0.2"}],"casks":[]}"#;
+        t.brew(both, formula_left);
+        fs::write(t.root.join("st/upgrade-exit"), "1").unwrap();
+        let held = BTreeSet::new();
+        let r = run(Updater::Brew, &t.env(&held));
+        assert_eq!(r.status, Status::Failed, "{r:?}");
+        assert!(
+            r.notes
+                .contains(&"formula codex 0.1 still outdated (0.2)".to_string()),
+            "{r:?}"
+        );
+        assert!(
+            r.notes
+                .contains(&"cask codex 0.164.0 -> 0.165.0 upgraded".to_string()),
             "{r:?}"
         );
     }
