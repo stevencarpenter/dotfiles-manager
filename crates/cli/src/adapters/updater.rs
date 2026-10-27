@@ -383,7 +383,8 @@ fn brew(mut d: Draft, env: &Env) -> Row {
     if before.is_empty() {
         return d.end(Status::Current);
     }
-    // One call per kind, so a formula and a cask of one name are each upgraded as themselves.
+    // One call per kind, so a formula and a cask of one name are each upgraded as themselves. A
+    // failed kind does not keep the other from its upgrade; the first failure is kept.
     let mut upgrade = Ok(());
     for kind in ["formula", "cask"] {
         let names: Vec<String> = before
@@ -391,19 +392,30 @@ fn brew(mut d: Draft, env: &Env) -> Row {
             .filter(|o| o.kind == kind)
             .map(|o| o.name.clone())
             .collect();
-        if names.is_empty() || upgrade.is_err() {
+        if names.is_empty() {
             continue;
         }
         let mut a = args(&["upgrade", &format!("--{kind}")]);
         a.extend(names);
-        upgrade = call(
+        let done = call(
             env.provider,
             "brew",
             &a,
             &brew_env(false),
             env.timeouts.long,
-        )
-        .map(|_| ());
+        );
+        match done {
+            // A stop ends the updater here: no other brew command starts.
+            Err(e) if e.1 => return d.stop(e),
+            Err(e) => {
+                if upgrade.is_ok() {
+                    upgrade = Err(e);
+                } else {
+                    d.notes.push(e.0);
+                }
+            }
+            Ok(_) => {}
+        }
     }
     let after = match outdated(env) {
         Ok(l) => l,
@@ -564,7 +576,7 @@ mod tests {
             fs::write(self.root.join("st/after"), after).unwrap();
             self.script(
                 &self.bin.join("brew"),
-                "case \"$1\" in\n  update) exit 0 ;;\n  outdated) cat \"$st/outdated\" ;;\n  upgrade) cp \"$st/after\" \"$st/outdated\"; exit $(cat \"$st/upgrade-exit\" 2>/dev/null || echo 0) ;;\n  list) [ -f \"$st/list-$4\" ] && cat \"$st/list-$4\" || exit 1 ;;\n  *) exit 64 ;;\nesac",
+                "case \"$1\" in\n  update) exit 0 ;;\n  outdated) cat \"$st/outdated\" ;;\n  upgrade) cp \"$st/after\" \"$st/outdated\"; exit $(cat \"$st/upgrade-exit$2\" 2>/dev/null || cat \"$st/upgrade-exit\" 2>/dev/null || echo 0) ;;\n  list) [ -f \"$st/list-$4\" ] && cat \"$st/list-$4\" || exit 1 ;;\n  *) exit 64 ;;\nesac",
             );
         }
     }
@@ -760,6 +772,32 @@ mod tests {
         assert!(
             r.notes
                 .contains(&"formula codex 0.1 still outdated (0.2)".to_string()),
+            "{r:?}"
+        );
+        assert!(
+            r.notes
+                .contains(&"cask codex 0.164.0 -> 0.165.0 upgraded".to_string()),
+            "{r:?}"
+        );
+    }
+
+    #[test]
+    fn a_failed_formula_upgrade_still_upgrades_the_casks() {
+        let t = T::new();
+        t.brew(UV_CODEX, UV_ONLY);
+        fs::write(t.root.join("st/upgrade-exit--formula"), "1").unwrap();
+        let held = BTreeSet::new();
+        let r = run(Updater::Brew, &t.env(&held));
+        assert!(
+            t.log().contains("brew upgrade --cask codex |"),
+            "{}",
+            t.log()
+        );
+        assert_eq!(r.status, Status::Failed, "{r:?}");
+        assert!(
+            r.notes
+                .iter()
+                .any(|n| n.contains("brew upgrade --formula uv exited 1")),
             "{r:?}"
         );
         assert!(

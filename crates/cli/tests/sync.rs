@@ -3861,7 +3861,13 @@ here=$(dirname "$0")
 printf 'brew %s\n' "$*" >> "$here/../st/log"
 case "$1" in
   update) exit 0 ;;
-  outdated) echo '{"formulae":[],"casks":[]}' ;;
+  outdated)
+    if [ -e "$here/../st/outdated-uv" ]; then
+      echo '{"formulae":[{"name":"uv","installed_versions":["0.1"],"current_version":"0.2"}],"casks":[]}'
+    else
+      echo '{"formulae":[],"casks":[]}'
+    fi ;;
+  upgrade) touch "$here/../st/started-brew"; exec sleep 30 ;;
   list) exit 1 ;;
   *) exit 64 ;;
 esac
@@ -4339,4 +4345,35 @@ fn the_upgrade_step_reads_the_updaters_again_under_its_lock() {
     assert!(log.contains("codex update"), "{log}");
     // The codex row's second-copy check asks `brew list`; the brew updater never ran.
     assert!(!log.contains("brew update"), "{log}");
+}
+
+#[test]
+fn a_stop_during_brew_upgrade_starts_no_other_brew_command() {
+    let u = Up::new(r#"["brew"]"#);
+    fs::write(u.st("outdated-uv"), "").unwrap();
+    let child = u
+        .command(&[])
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let started = u.st("started-brew");
+    let t0 = std::time::Instant::now();
+    while !started.exists() {
+        assert!(t0.elapsed().as_secs() < 60, "brew upgrade never started");
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let kill = Command::new("/bin/kill")
+        .args(["-INT", &child.id().to_string()])
+        .status()
+        .unwrap();
+    assert!(kill.success());
+    let o = child.wait_with_output().unwrap();
+    assert_eq!(code(&o), 130, "{}", stdout(&o));
+    assert!(stdout(&o).contains("  pending brew"), "{}", stdout(&o));
+    let log = u.log();
+    assert_eq!(
+        log.lines().last(),
+        Some("brew upgrade --formula uv"),
+        "{log}"
+    );
 }
