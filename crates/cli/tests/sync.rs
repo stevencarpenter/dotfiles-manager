@@ -4325,11 +4325,11 @@ fn the_upgrade_step_reads_the_updaters_again_under_its_lock() {
         );
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
-    // Meanwhile the published profile drops claude.
+    // Meanwhile the published profile drops claude and adds brew, which the review did not list.
     put(
         &u.fx.root,
         "profiles/t-01.toml",
-        &format!("{}updaters = [\"codex\"]\n", common::PROFILE),
+        &format!("{}updaters = [\"codex\", \"brew\"]\n", common::PROFILE),
     );
     fs::write(&release, "go").unwrap();
     let o = parked.wait_with_output().unwrap();
@@ -4337,4 +4337,5 @@ fn the_upgrade_step_reads_the_updaters_again_under_its_lock() {
     let log = u.log();
     assert!(!log.contains("claude update"), "{log}");
     assert!(log.contains("codex update"), "{log}");
+    assert!(!log.contains("brew"), "{log}");
 }

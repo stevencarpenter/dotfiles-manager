@@ -2260,9 +2260,11 @@ fn upgrade_preview(
 
 /// Runs the profile's updaters in order under the writer lock, prints one row each, writes one
 /// receipt and adds a warning per updater that did not succeed. `reviewed` is the list the
-/// review resolved; under the lock the profile in `root` is resolved again, because another
-/// sync may have changed it since, and that list runs. Returns the summary for the `scopes:`
-/// block, or `None` when the step printed only why it did not run.
+/// review resolved. Another sync may change the profile before the lock, so under the lock the
+/// profile in `root` is resolved again, and an updater runs only when the review listed it and
+/// the profile still declares it: one added meanwhile runs in the next sync, after its review.
+/// Returns the summary for the `scopes:` block, or `None` when the step printed only why it did
+/// not run.
 #[expect(
     clippy::too_many_arguments,
     reason = "the step needs the binding, the root to read the profile again, and the run's output"
@@ -2299,7 +2301,12 @@ fn upgrade(
         return Err(crate::state_lost_refusal());
     }
     store.require_identity(binding)?;
-    let updaters = resolve(&load_scoped(root, rel)?, rel, &builtin_catalog())?.updaters;
+    let declared = resolve(&load_scoped(root, rel)?, rel, &builtin_catalog())?.updaters;
+    let updaters: Vec<Updater> = reviewed
+        .iter()
+        .filter(|u| declared.contains(u))
+        .copied()
+        .collect();
     if updaters.is_empty() {
         writeln!(out, "upgrade: none declared in the profile").map_err(w)?;
         return Ok(None);
