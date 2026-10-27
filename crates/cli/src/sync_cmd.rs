@@ -2008,6 +2008,7 @@ fn run_inner(
             ctx,
             &sys,
             &binding,
+            (&root, &rel),
             args,
             &loaded.resolved.updaters,
             out,
@@ -2177,6 +2178,7 @@ fn run_inner(
             ctx,
             &sys,
             &binding,
+            (&root, &rel),
             args,
             &locked_loaded.resolved.updaters,
             out,
@@ -2257,14 +2259,21 @@ fn upgrade_preview(
 }
 
 /// Runs the profile's updaters in order under the writer lock, prints one row each, writes one
-/// receipt and adds a warning per updater that did not succeed. Returns the summary for the
-/// `scopes:` block, or `None` when the step printed only why it did not run.
+/// receipt and adds a warning per updater that did not succeed. `reviewed` is the list the
+/// review resolved; under the lock the profile in `root` is resolved again, because another
+/// sync may have changed it since, and that list runs. Returns the summary for the `scopes:`
+/// block, or `None` when the step printed only why it did not run.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the step needs the binding, the root to read the profile again, and the run's output"
+)]
 fn upgrade(
     ctx: &Ctx,
     sys: &Sys,
     binding: &Binding,
+    (root, rel): (&Path, &str),
     args: &Args,
-    updaters: &[Updater],
+    reviewed: &[Updater],
     out: &mut dyn Write,
     printed: &mut Printed,
 ) -> Result<Option<String>, Refusal> {
@@ -2274,7 +2283,8 @@ fn upgrade(
         writeln!(out, "upgrade: skipped (--no-upgrade)").map_err(w)?;
         return Ok(Some("skipped (--no-upgrade)".into()));
     }
-    if updaters.is_empty() {
+    // A profile that declares none takes no lock.
+    if reviewed.is_empty() {
         writeln!(out, "upgrade: none declared in the profile").map_err(w)?;
         return Ok(None);
     }
@@ -2289,6 +2299,11 @@ fn upgrade(
         return Err(crate::state_lost_refusal());
     }
     store.require_identity(binding)?;
+    let updaters = resolve(&load_scoped(root, rel)?, rel, &builtin_catalog())?.updaters;
+    if updaters.is_empty() {
+        writeln!(out, "upgrade: none declared in the profile").map_err(w)?;
+        return Ok(None);
+    }
     // An unreadable record, or a trials directory that cannot be listed, may hide a Homebrew
     // trial, so it holds brew too.
     let loaded = store.load();
@@ -2322,7 +2337,7 @@ fn upgrade(
     let env = updater_env(ctx, &runner, &held);
     writeln!(out, "{}", paint::label(ctx.color, "upgrade:")).map_err(w)?;
     let mut ops = Vec::new();
-    for u in updaters {
+    for u in &updaters {
         let row = updater::run(*u, &env);
         let status = status_name(row.status);
         let versions = match (&row.before, &row.after) {

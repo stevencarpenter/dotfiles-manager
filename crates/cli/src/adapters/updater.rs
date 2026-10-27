@@ -213,7 +213,12 @@ fn native_runner(u: Updater, env: &Env) -> Result<Runner, String> {
 
 fn version(r: &Runner, u: Updater, env: &Env) -> Result<String, (String, bool)> {
     let out = call(r, u.name(), &args(&["--version"]), &[], env.timeouts.short)?;
-    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+    let v = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if v.is_empty() {
+        // No evidence of a version: neither `current` nor `updated` could be shown.
+        return Err((format!("{} --version printed no version", u.name()), false));
+    }
+    Ok(v)
 }
 
 fn native(mut d: Draft, env: &Env) -> Row {
@@ -844,6 +849,20 @@ mod tests {
         assert!(
             r.notes
                 .contains(&"second copy: Homebrew cask claude-code 2.1.300".to_string()),
+            "{r:?}"
+        );
+    }
+
+    #[test]
+    fn an_empty_version_is_blocked_before_the_update() {
+        let t = T::new();
+        t.native(".local/bin/claude", "update", "\n", "2.1.312");
+        let held = BTreeSet::new();
+        let r = run(Updater::Claude, &t.env(&held));
+        assert_eq!(r.status, Status::Blocked, "{r:?}");
+        assert!(!t.log().contains("claude update"), "{}", t.log());
+        assert!(
+            r.notes.iter().any(|n| n.contains("printed no version")),
             "{r:?}"
         );
     }

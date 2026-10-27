@@ -45,7 +45,7 @@ A manager built before this key refuses a profile that has it (`E_FIELD_UNKNOWN`
 | `current` | exit 0 and the same version (brew: nothing outdated) |
 | `pending` | a stop request (SIGINT, SIGTERM) ended or prevented it, or the update ran and the new version could not be read |
 | `failed` | a command exited nonzero, timed out or was ended by a signal; brew: a name stayed outdated or the list was not valid JSON |
-| `blocked` | the tool is missing from its owner path, fails the executable checks, or its version cannot be read before the update; brew: a Homebrew trial is active or a trial record cannot be read |
+| `blocked` | the tool is missing from its owner path, fails the executable checks, or its version cannot be read (or is empty) before the update; brew: a Homebrew trial is active or a trial record cannot be read |
 
 A failure note gives the command, its exit code and the size of its standard error. The text is withheld (docs/secrets.md); run the command by hand to see it. A partial `brew upgrade` is `failed`, and the notes list each name as upgraded or still outdated.
 
@@ -59,7 +59,7 @@ While a Homebrew trial is active (a record under `state/trials/` whose package i
 2. A refused run (an error exit) runs no updater. A skipped or blocked scope does not stop them.
 3. `--no-upgrade` prints `upgrade: skipped (--no-upgrade)` and runs none.
 4. The step also runs after "nothing to change".
-5. Under the writer lock, each updater runs and prints one row: `  <status> <name> <before> -> <after>`, then its notes.
+5. Under the writer lock, the profile is resolved again from `--root` (another sync may have changed it since the review), and each updater of that list runs and prints one row: `  <status> <name> <before> -> <after>`, then its notes.
 6. One receipt is written (`command = "upgrade"`, no plan digest, no approval), with one operation per updater (`resource = "updater:<name>"`, `adapter = "updater/v1"`). An updater that is not `updated` or `current` makes the receipt `failed`, exit 1, while sync itself exits 0.
 7. The `scopes:` block ends with `  upgrade: <status>=<count>...`, and each `failed`, `blocked` or `pending` updater adds a `warning:` line at the end of standard output.
 8. A stop request during the step ends that updater, reports the rest `pending`, writes the receipt and ends the run with the stop's exit code (130 or 143). The warnings still print. No journal entry is written, so the next sync runs every updater again.

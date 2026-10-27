@@ -4296,3 +4296,45 @@ fn an_unfinished_trial_record_blocks_brew() {
         "{s}"
     );
 }
+
+#[test]
+fn the_upgrade_step_reads_the_updaters_again_under_its_lock() {
+    let u = Up::new(r#"["claude", "codex"]"#);
+    let o = u.sync(&["--no-upgrade"]);
+    assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
+    // The next run has nothing to change and parks before the upgrade lock.
+    let release = u.fake.path().join("release-upgrade");
+    let parked = u
+        .command_env(
+            &[(
+                "DFM_FAILPOINT",
+                &format!("sync-before-upgrade-lock:wait-{}", release.display()),
+            )],
+            &[],
+        )
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let reached = release.with_extension("reached");
+    let end = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while !reached.exists() {
+        assert!(
+            std::time::Instant::now() < end,
+            "the failpoint was not reached"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    // Meanwhile the published profile drops claude.
+    put(
+        &u.fx.root,
+        "profiles/t-01.toml",
+        &format!("{}updaters = [\"codex\"]\n", common::PROFILE),
+    );
+    fs::write(&release, "go").unwrap();
+    let o = parked.wait_with_output().unwrap();
+    assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
+    let log = u.log();
+    assert!(!log.contains("claude update"), "{log}");
+    assert!(log.contains("codex update"), "{log}");
+}
