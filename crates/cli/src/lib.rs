@@ -137,17 +137,20 @@ sync fetches the sources that dotfiles-manager.lock declares ([[sources]]: the r
 its ref, a nested source is pinned to an exact commit) into a staging directory with an isolated git
 environment, and plans the staged composition against this machine in four scopes: configuration,
 packages (install what is missing), secrets and services (start what is not loaded). It prints the
-four plans and one sync digest that covers them and the sources. Every origin needs a grant in
-state/grants.json first (--trust-origin <origin> writes one; no fetch happens before that). With
---yes-plan it rechecks the sources under the lock, fast-forwards each checkout (never reset, clean,
-stash, rebase, commit or push; divergence and overwritten local changes are refused), then runs
-apply, packages, secrets and services in that order, each with its own plan digest and receipt. A
-scope that fails stops the later ones (not_started). Without a 1Password session the secrets are
-skipped; a blocked packages, secrets or services plan does not run; the other scopes run, and the
-last lines of the output warn what waits and how to fix it. A blocked configuration plan refuses
-the run. --restart <resource-id> goes to the services scope and needs its --allow-disruptive
-flag. A pin is never rewritten. --preview fetches into staging and changes nothing else. See
-docs/sync.md.
+four plans and one sync digest that covers them and the sources. sync is the one daily command and
+the only one that runs without a digest: it then plans again under the lock and refuses
+(E_PLAN_STALE) when that plan is not the printed one. -y <sync digest> is optional and pins the run
+to a plan --preview printed. Every origin needs a grant in state/grants.json first (--trust-origin
+<origin> writes one, prints the plan and stops; no fetch happens before the grant). The run
+fast-forwards each checkout (never reset, clean, stash, rebase, commit or push; divergence and
+overwritten local changes are refused), then runs apply, packages, secrets and services in that
+order, each with its own plan digest and receipt. A removal of an owned output needs no flag. An
+adoption or takeover runs only with --allow-adopt <operation-id>, else it is withheld and the rest
+runs; a restart runs only with --restart <resource-id>. A scope that fails stops the later ones
+(not_started). Without a 1Password session the secrets are skipped; a blocked packages, secrets or
+services plan does not run; the other scopes run, and the last lines of the output warn what waits
+and how to fix it. A blocked configuration plan refuses the run. A pin is never rewritten.
+--preview fetches into staging and changes nothing else. See docs/sync.md.
 
 self-update rebuilds and installs the manager from a local dotfiles-manager checkout: it reads
 scripts/bootstrap.sh of the commit (--commit, else the checkout's HEAD) and runs its install with

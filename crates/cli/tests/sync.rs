@@ -258,6 +258,13 @@ impl Fx {
         self.run(&["sync", "--root", self.root_arg(), "--yes-plan", digest])
     }
 
+    /// `sync` without a digest: the daily run (DFM-76).
+    fn plain(&self, flags: &[&str]) -> Output {
+        let mut a = vec!["sync", "--root", self.root_arg()];
+        a.extend_from_slice(flags);
+        self.run(&a)
+    }
+
     /// Preview, then sync with the previewed digest. Returns the sync output.
     fn sync_approved(&self) -> Output {
         let p = self.preview();
@@ -287,6 +294,18 @@ impl Fx {
         fs::read_dir(self.h(".local/state/dotfiles-manager/state/receipts"))
             .map(|d| d.count())
             .unwrap_or(0)
+    }
+
+    /// Every receipt, oldest first.
+    fn receipt_docs(&self) -> Vec<serde_json::Value> {
+        let Ok(dir) = fs::read_dir(self.h(".local/state/dotfiles-manager/state/receipts")) else {
+            return Vec::new();
+        };
+        let mut v: Vec<serde_json::Value> = dir
+            .map(|e| serde_json::from_slice(&fs::read(e.unwrap().path()).unwrap()).unwrap())
+            .collect();
+        v.sort_by_key(|r| r["started_at"].as_str().unwrap().to_string());
+        v
     }
 
     fn grants(&self) -> String {
@@ -352,10 +371,17 @@ fn lock_for(sources: &[(&str, Option<&str>, &str)]) -> String {
 #[test]
 fn an_untrusted_origin_is_refused_before_any_fetch_and_a_grant_is_explicit() {
     let fx = Fx::ungranted();
-    let o = fx.preview();
-    assert_eq!(code(&o), 3, "{}", stderr(&o));
-    assert!(stderr(&o).contains("E_SOURCE_UNTRUSTED"), "{}", stderr(&o));
-    assert!(stderr(&o).contains("nothing was fetched"), "{}", stderr(&o));
+    // The daily run without a digest refuses the same way and names the command to run.
+    for o in [fx.preview(), fx.plain(&[])] {
+        assert_eq!(code(&o), 3, "{}", stderr(&o));
+        assert!(stderr(&o).contains("E_SOURCE_UNTRUSTED"), "{}", stderr(&o));
+        assert!(stderr(&o).contains("nothing was fetched"), "{}", stderr(&o));
+        assert!(
+            stderr(&o).contains(&format!("run sync --trust-origin {}", fx.origin())),
+            "{}",
+            stderr(&o)
+        );
+    }
     assert!(!fx.staging().exists(), "a staging directory was created");
     assert!(fx.grants().is_empty());
     // --preview cannot grant, and --yes-plan cannot grant.
@@ -494,15 +520,18 @@ fn a_sync_that_changes_nothing_needs_no_approval() {
     assert!(s.contains("nothing to change: no approval needed"), "{s}");
     assert!(s.ends_with("result: ok\n"), "{s}");
     assert_eq!(fx.receipts(), 1, "a no-op sync wrote a receipt");
-    // A new upstream commit is a publication, so it needs the digest even when no
-    // operation changes.
+    // A new upstream commit is a publication: a plain sync publishes it, and no scope has
+    // anything to do, so no receipt is written.
     let seed = &fx.upstream.seed;
     put(seed, "README.md", "notes\n");
     let head = fx.upstream.push("docs only");
-    let o = fx.run(&["sync", "--root", fx.root_arg()]);
-    assert_eq!(code(&o), 3, "{}\n{}", stdout(&o), stderr(&o));
-    assert!(stderr(&o).contains("E_APPROVAL_REQUIRED"), "{}", stderr(&o));
-    assert_ne!(fx.head(), head, "the checkout moved without approval");
+    let o = fx.plain(&[]);
+    assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
+    let s = stdout(&o);
+    assert!(!s.contains("no approval needed"), "{s}");
+    in_order(&s, &["published: src0 ", "  config: current", "result: ok"]);
+    assert_eq!(fx.head(), head);
+    assert_eq!(fx.receipts(), 1);
 }
 
 #[test]
@@ -697,7 +726,124 @@ fn a_local_edit_the_update_would_overwrite_is_refused_and_kept() {
 }
 
 #[test]
-fn declined_approval_changes_nothing() {
+fn a_plain_sync_publishes_and_applies_without_a_digest() {
+    let fx = Fx::new();
+    put(
+        &fx.upstream.seed,
+        "base/modules/extra/files/zshrc",
+        "export A=3\n",
+    );
+    let head = fx.upstream.push("upstream zshrc");
+    let o = fx.plain(&[]);
+    assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
+    let s = stdout(&o);
+    in_order(
+        &s,
+        &[
+            "plan digest: ",
+            "published: src0 ",
+            "  config: ok",
+            "result: ok\n",
+        ],
+    );
+    assert!(!s.contains("warning:"), "{s}");
+    assert_eq!(fx.head(), head);
+    assert!(fx.h(".zshrc").is_symlink());
+    let r = fx.receipt_docs();
+    assert_eq!(r.len(), 1);
+    assert_eq!(r[0]["approval"]["kind"], "unattended", "{}", r[0]);
+    assert!(
+        fx.staging_leftovers().is_empty(),
+        "{:?}",
+        fx.staging_leftovers()
+    );
+}
+
+#[test]
+fn a_deselected_module_s_owned_outputs_are_removed_without_a_flag() {
+    let fx = Fx::new();
+    let o = fx.plain(&[]);
+    assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
+    assert!(fx.h(".zshrc").is_symlink());
+    put(
+        &fx.upstream.seed,
+        "profiles/t-01.toml",
+        &common::PROFILE.replace("modules = [\"extra\"]", "modules = []"),
+    );
+    fx.upstream.push("drop extra");
+    let o = fx.plain(&[]);
+    assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
+    let s = stdout(&o);
+    assert!(s.contains("  config: ok"), "{s}");
+    for gone in [".zshrc", ".config/tmux/tmux.conf"] {
+        assert!(fs::symlink_metadata(fx.h(gone)).is_err(), "{gone} stayed");
+    }
+    assert!(fx.h(".config/git/config").is_symlink());
+    // The removal ran under the run's own approval: no per-operation flag is recorded.
+    let r = fx.receipt_docs();
+    let last = r.last().unwrap();
+    assert_eq!(last["approval"]["kind"], "unattended", "{last}");
+    assert!(
+        last["approvals"].as_array().is_none_or(Vec::is_empty),
+        "{last}"
+    );
+}
+
+#[test]
+fn an_unowned_link_in_the_way_is_not_adopted_and_the_warning_names_its_flag() {
+    let fx = Fx::new();
+    std::os::unix::fs::symlink(
+        fx.root.join("base/modules/extra/files/zshrc"),
+        fx.h(".zshrc"),
+    )
+    .unwrap();
+    let warning = "warning: config withheld: extra.zsh@.zshrc. Fix: review each, then run dfm sync --allow-adopt 'extra.zsh@.zshrc'";
+    let o = fx.plain(&[]);
+    assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
+    let s = stdout(&o);
+    in_order(
+        &s,
+        &[
+            "planned extra.zsh@.zshrc",
+            "withheld: extra.zsh@.zshrc (needs --allow-adopt)",
+            "plan digest: ",
+            "  config: ok",
+            "result: ok\n",
+        ],
+    );
+    assert!(s.ends_with(&format!("result: ok\n{warning}\n")), "{s}");
+    // The rest ran; the adoption did not, so the ledger still does not own the link.
+    assert!(fx.h(".config/tmux/tmux.conf").is_symlink());
+    let r = fx.receipt_docs();
+    assert_eq!(r.len(), 1);
+    let ops = r[0]["operations"].as_array().unwrap();
+    assert!(
+        ops.iter().all(|op| op["id"] != "extra.zsh@.zshrc"),
+        "{}",
+        r[0]
+    );
+    // The next plain run has only the withheld adoption: it changes nothing and warns again.
+    let o = fx.plain(&[]);
+    assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
+    let s = stdout(&o);
+    assert!(s.contains("nothing to change: no approval needed"), "{s}");
+    assert!(s.contains("  config: withheld (extra.zsh@.zshrc)"), "{s}");
+    assert!(s.ends_with(&format!("result: ok\n{warning}\n")), "{s}");
+    assert_eq!(fx.receipts(), 1);
+    // The flag the warning names adopts it.
+    let o = fx.plain(&["--allow-adopt", "extra.zsh@.zshrc"]);
+    assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
+    assert!(!stdout(&o).contains("warning:"), "{}", stdout(&o));
+    let r = fx.receipt_docs();
+    let last = r.last().unwrap();
+    assert_eq!(last["approvals"][0]["how"], "allow_adopt", "{last}");
+    let o = fx.plain(&[]);
+    assert!(stdout(&o).contains("  config: current"), "{}", stdout(&o));
+    assert!(!stdout(&o).contains("warning:"), "{}", stdout(&o));
+}
+
+#[test]
+fn a_change_between_the_printed_plan_and_the_locked_plan_is_stale() {
     let fx = Fx::new();
     let old = fx.head();
     put(
@@ -705,20 +851,55 @@ fn declined_approval_changes_nothing() {
         "base/modules/extra/files/zshrc",
         "export A=3\n",
     );
-    fx.upstream.push("upstream zshrc");
-    let o = fx.run(&["sync", "--root", fx.root_arg()]);
+    fx.upstream.push("first");
+    let release = fx.work.path().join("release-lock");
+    // The run prints its plan, then parks before it takes the writer lock.
+    let parked = Command::new(BIN)
+        .env_clear()
+        .env("DFM_PROVIDER_PATH", "/usr/bin:/bin")
+        .env(
+            "DFM_FAILPOINT",
+            format!("sync-before-lock:wait-{}", release.display()),
+        )
+        .args([
+            "--home",
+            fx.home.path().to_str().unwrap(),
+            "sync",
+            "--root",
+            fx.root_arg(),
+        ])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let reached = release.with_extension("reached");
+    let end = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while !reached.exists() {
+        assert!(
+            std::time::Instant::now() < end,
+            "the failpoint was not reached"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    put(
+        &fx.upstream.seed,
+        "base/modules/extra/files/zshrc",
+        "export A=4\n",
+    );
+    fx.upstream.push("second");
+    fs::write(&release, "go").unwrap();
+    let o = parked.wait_with_output().unwrap();
     assert_eq!(code(&o), 3, "{}\n{}", stdout(&o), stderr(&o));
-    assert!(stderr(&o).contains("E_APPROVAL_REQUIRED"), "{}", stderr(&o));
-    assert!(stdout(&o).contains("plan digest: "), "{}", stdout(&o));
-    assert!(stdout(&o).contains("result: blocked"), "{}", stdout(&o));
+    assert!(stderr(&o).contains("E_PLAN_STALE"), "{}", stderr(&o));
+    assert!(
+        stderr(&o).contains("the plan changed after it was printed"),
+        "{}",
+        stderr(&o)
+    );
+    assert!(stderr(&o).contains("run dfm sync again"), "{}", stderr(&o));
     assert_eq!(fx.head(), old);
     assert!(!fx.h(".zshrc").exists());
     assert_eq!(fx.receipts(), 0);
-    assert!(
-        fx.staging_leftovers().is_empty(),
-        "{:?}",
-        fx.staging_leftovers()
-    );
 }
 
 #[test]
@@ -1364,14 +1545,15 @@ const AGENT_PLIST: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
 
 const AGENT_OP: &str = "life.agent@service";
 
-/// `op whoami` exits 0 only with the `signed-in` marker, and kills itself with the
-/// `whoami-killed` marker; `op inject` fills the one reference.
+/// `op whoami` exits 0 only with the `signed-in` marker and without a `signed-out-<account>`
+/// marker, and kills itself with the `whoami-killed` marker; `op inject` fills the one reference.
 const FAKE_OP: &str = r#"#!/bin/sh
 PATH=/usr/bin:/bin:$PATH
 here=$(dirname "$0")
 printf 'op %s\n' "$*" >> "$here/../log"
 [ -e "$here/../whoami-killed" ] && kill -KILL $$
 [ -e "$here/../signed-in" ] || { echo "[ERROR] no session" >&2; exit 1; }
+for a in "$@"; do [ -e "$here/../signed-out-$a" ] && { echo "[ERROR] no session" >&2; exit 1; }; done
 case "$1" in
   whoami) echo me; exit 0 ;;
   inject) sed 's|{{ op://vault/item/field }}|planted-value|' ;;
@@ -1542,6 +1724,13 @@ impl Life {
         self.run(&a)
     }
 
+    /// `sync` without a digest, with the look-alikes.
+    fn plain(&self, flags: &[&str]) -> Output {
+        let mut a = vec!["sync", "--root", self.fx.root_arg()];
+        a.extend_from_slice(flags);
+        self.run(&a)
+    }
+
     /// Preview, then sync with the previewed digest.
     fn approved(&self, flags: &[&str]) -> Output {
         let p = self.preview(flags);
@@ -1632,22 +1821,11 @@ impl Life {
 
     /// The `command` of each receipt, oldest first.
     fn receipt_commands(&self) -> Vec<String> {
-        let Ok(dir) = fs::read_dir(self.fx.h(".local/state/dotfiles-manager/state/receipts"))
-        else {
-            return Vec::new();
-        };
-        let mut v: Vec<(String, String)> = dir
-            .map(|e| {
-                let r: serde_json::Value =
-                    serde_json::from_slice(&fs::read(e.unwrap().path()).unwrap()).unwrap();
-                (
-                    r["started_at"].as_str().unwrap().to_string(),
-                    r["command"].as_str().unwrap().to_string(),
-                )
-            })
-            .collect();
-        v.sort();
-        v.into_iter().map(|(_, c)| c).collect()
+        self.fx
+            .receipt_docs()
+            .iter()
+            .map(|r| r["command"].as_str().unwrap().to_string())
+            .collect()
     }
 }
 
@@ -1713,12 +1891,49 @@ fn sync_runs_configuration_packages_secrets_and_services_in_order_under_one_appr
         fs::read_to_string(l.fx.h(".config/example/personal.env")).unwrap(),
         "TOKEN=planted-value\n"
     );
-    // Each scope wrote its own receipt, in run order.
+    // Each scope wrote its own receipt, in run order, approved by the digest.
     let after = l.receipt_commands();
     assert_eq!(
         after[before.len()..],
         ["apply", "packages", "secrets", "services"]
     );
+    for r in &l.fx.receipt_docs()[before.len()..] {
+        assert_eq!(r["approval"]["kind"], "yes_plan", "{r}");
+    }
+}
+
+#[test]
+fn a_plain_sync_runs_every_scope_without_a_digest() {
+    let l = Life::new();
+    l.push_link();
+    let before = l.receipt_commands();
+    let o = l.plain(&[]);
+    assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
+    let s = stdout(&o);
+    in_order(
+        &s,
+        &[
+            "plan digest: ",
+            "published: src0 ",
+            "  config: ok",
+            "  packages: ok",
+            "  secrets: ok",
+            "  services: ok",
+        ],
+    );
+    assert!(s.ends_with("result: ok\n"), "{s}");
+    in_order(
+        &l.log(),
+        &["brew install", "op inject", "launchctl bootstrap"],
+    );
+    assert!(l.fx.h(".config/life/notes").is_symlink());
+    assert_eq!(
+        l.receipt_commands()[before.len()..],
+        ["apply", "packages", "secrets", "services"]
+    );
+    for r in &l.fx.receipt_docs()[before.len()..] {
+        assert_eq!(r["approval"]["kind"], "unattended", "{r}");
+    }
 }
 
 #[test]
@@ -1736,6 +1951,108 @@ fn a_packages_scope_after_the_configuration_scope_probes_once_per_plan() {
     // recheck.
     let probes = l.log()[log.len()..].matches("\nbrew ruby ").count();
     assert_eq!(probes, 5, "{}", l.log());
+}
+
+#[test]
+fn a_secret_takeover_is_withheld_while_the_rest_of_the_run_continues() {
+    let l = Life::new();
+    // A second secret, new, for another account.
+    l.push_module(
+        "\n[[resources]]\nid = \"other\"\nkind = \"secret\"\nadapter = \"op-template/v1\"\ntarget = \".config/example/other.env\"\n[resources.value]\ntemplate = \"files/personal.env.tpl\"\naccount = \"other-account\"\nmode = 0o600\n",
+        &[],
+        "add a second secret",
+    );
+    // The first secret's destination exists and the ledger does not record it: a takeover.
+    let env = l.fx.h(".config/example/personal.env");
+    fs::create_dir_all(env.parent().unwrap()).unwrap();
+    fs::write(&env, "TOKEN=mine\n").unwrap();
+    fs::set_permissions(&env, fs::Permissions::from_mode(0o600)).unwrap();
+    // The takeover's account has no session; the new secret's account has one. The withheld
+    // takeover is not rendered, so its account does not make the run skip the other secret.
+    l.mark("signed-out-example-account");
+    let id = "life.token@.config/example/personal.env";
+    let warning = format!(
+        "warning: secrets withheld: {id}. Fix: review each, then run dfm sync --allow-adopt '{id}'"
+    );
+    let o = l.plain(&[]);
+    assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
+    let s = stdout(&o);
+    in_order(
+        &s,
+        &[
+            &format!("withheld: {id} (needs --allow-adopt)"),
+            "plan digest: ",
+            "  packages: ok",
+            "  secrets: ok",
+            "  services: ok",
+        ],
+    );
+    assert!(s.ends_with(&format!("result: ok\n{warning}\n")), "{s}");
+    assert!(!s.contains("skipped"), "{s}");
+    assert!(
+        !l.log().contains("whoami --account example-account"),
+        "{}",
+        l.log()
+    );
+    assert_eq!(fs::read_to_string(&env).unwrap(), "TOKEN=mine\n");
+    assert_eq!(
+        fs::read_to_string(l.fx.h(".config/example/other.env")).unwrap(),
+        "TOKEN=planted-value\n"
+    );
+    assert!(l.log().contains("launchctl bootstrap"), "{}", l.log());
+    // With the flag and a session the takeover renders.
+    fs::remove_file(l.fake.path().join("signed-out-example-account")).unwrap();
+    let o = l.plain(&["--allow-adopt", id]);
+    assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
+    assert!(stdout(&o).contains("  secrets: ok"), "{}", stdout(&o));
+    assert!(!stdout(&o).contains("warning:"), "{}", stdout(&o));
+    assert_eq!(fs::read_to_string(&env).unwrap(), "TOKEN=planted-value\n");
+}
+
+#[test]
+fn a_change_inside_a_withheld_operation_alone_is_stale() {
+    let l = Life::new();
+    // A secret takeover: withheld, and the only operation the change below touches.
+    let env = l.fx.h(".config/example/personal.env");
+    fs::create_dir_all(env.parent().unwrap()).unwrap();
+    fs::write(&env, "TOKEN=mine\n").unwrap();
+    fs::set_permissions(&env, fs::Permissions::from_mode(0o600)).unwrap();
+    let release = l.fake.path().join("release-withheld");
+    let point = format!("sync-before-lock:wait-{}", release.display());
+    let parked = l
+        .command(
+            &[("DFM_FAILPOINT", &point)],
+            &["sync", "--root", l.fx.root_arg()],
+        )
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let reached = release.with_extension("reached");
+    let end = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while !reached.exists() {
+        assert!(
+            std::time::Instant::now() < end,
+            "the failpoint was not reached"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    // The takeover's `path:` precondition records the mode; it stays a withheld takeover, and
+    // no operation that would run changes.
+    fs::set_permissions(&env, fs::Permissions::from_mode(0o640)).unwrap();
+    fs::write(&release, "go").unwrap();
+    let o = parked.wait_with_output().unwrap();
+    assert_eq!(code(&o), 3, "{}\n{}", stdout(&o), stderr(&o));
+    assert!(
+        stdout(&o).contains("withheld: life.token@.config/example/personal.env"),
+        "{}",
+        stdout(&o)
+    );
+    assert!(stderr(&o).contains("E_PLAN_STALE"), "{}", stderr(&o));
+    for effect in ["brew install", "launchctl bootstrap", "op inject"] {
+        assert!(!l.log().contains(effect), "the stale run ran {effect}");
+    }
+    assert_eq!(fs::read_to_string(&env).unwrap(), "TOKEN=mine\n");
 }
 
 #[test]
@@ -1905,30 +2222,32 @@ fn a_changed_secret_mode_is_not_a_no_op() {
     );
     git(&l.fx.root, &["commit", "-q", "-am", "stricter secret mode"]);
     // The observed mode (0600) is not the declared one (0400): the plan can see the change,
-    // so a plain sync asks for its approval instead of ending as a no-op.
-    let o = l.run(&["sync", "--root", l.fx.root_arg()]);
+    // so a plain sync renders the secret instead of ending as a no-op.
+    let o = l.plain(&[]);
     let s = stdout(&o);
-    assert_eq!(code(&o), 3, "{s}\n{}", stderr(&o));
+    assert_eq!(code(&o), 0, "{s}\n{}", stderr(&o));
     assert!(!s.contains("nothing to change: no approval needed"), "{s}");
-    assert!(stderr(&o).contains("E_APPROVAL_REQUIRED"), "{}", stderr(&o));
+    assert!(s.contains("  secrets: ok"), "{s}");
+    let mode = fs::metadata(l.fx.h(".config/example/personal.env"))
+        .unwrap()
+        .permissions()
+        .mode();
+    assert_eq!(mode & 0o777, 0o400);
 }
 
 #[test]
-fn restart_is_forwarded_to_the_services_scope_and_needs_its_approval() {
+fn restart_is_forwarded_to_the_services_scope_and_runs_only_when_named() {
     let l = Life::new();
     let o = l.approved(&[]);
     assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
     let o = l.preview(&["--restart", "nope"]);
     assert_eq!(code(&o), 2, "{}\n{}", stdout(&o), stderr(&o));
-    // The restart is disruptive: the flag to paste is listed and nothing runs.
-    let o = l.preview(&["--restart", "life.agent"]);
-    assert_eq!(code(&o), 3, "{}\n{}", stdout(&o), stderr(&o));
-    assert!(
-        stdout(&o).contains(&format!("--allow-disruptive '{AGENT_OP}'")),
-        "{}",
-        stdout(&o)
-    );
-    let flags = ["--restart", "life.agent", "--allow-disruptive", AGENT_OP];
+    // A plain run never restarts a running service on its own.
+    let o = l.plain(&[]);
+    assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
+    assert!(!l.log().contains("launchctl bootout"), "{}", l.log());
+    // --restart is the approval: no --allow-disruptive flag is needed.
+    let flags = ["--restart", "life.agent"];
     let p = l.preview(&flags);
     assert_eq!(code(&p), 0, "{}\n{}", stdout(&p), stderr(&p));
     // The digest covers the restart: without it the approval is stale.
@@ -1936,7 +2255,7 @@ fn restart_is_forwarded_to_the_services_scope_and_needs_its_approval() {
     assert_eq!(code(&o), 3, "{}\n{}", stdout(&o), stderr(&o));
     assert!(stderr(&o).contains("E_PLAN_STALE"), "{}", stderr(&o));
     assert!(!l.log().contains("launchctl bootout"), "{}", l.log());
-    let o = l.sync(&digest_of(&p), &flags);
+    let o = l.plain(&flags);
     assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
     in_order(&l.log(), &["launchctl bootout", "launchctl bootstrap"]);
     assert!(stdout(&o).contains("  services: ok"), "{}", stdout(&o));
@@ -2440,20 +2759,10 @@ fn a_deferred_service_named_by_restart_is_reviewed_and_run_as_a_restart() {
     );
     l.push_module(&module, &[("barextra", "width=1\n")], "bar reads extra");
     const BAR_OP: &str = "life.bar@service";
-    // The restart is disruptive: the preview asks for its flag before anything is published.
-    let o = l.preview(&["--restart", "life.bar"]);
-    assert_eq!(code(&o), 3, "{}\n{}", stdout(&o), stderr(&o));
-    assert!(
-        stdout(&o).contains(&format!("--allow-disruptive '{BAR_OP}'")),
-        "{}",
-        stdout(&o)
-    );
-    let o = l.sync(&digest_of(&o), &["--restart", "life.bar"]);
-    assert_eq!(code(&o), 3, "{}\n{}", stdout(&o), stderr(&o));
-    assert!(!l.fx.h(".config/bar/extra").exists());
-    let flags = ["--restart", "life.bar", "--allow-disruptive", BAR_OP];
-    let p = l.preview(&flags);
+    // The `--restart` id approves the deferred restart: the preview asks for no other flag.
+    let p = l.preview(&["--restart", "life.bar"]);
     assert_eq!(code(&p), 0, "{}\n{}", stdout(&p), stderr(&p));
+    assert!(!stdout(&p).contains("--allow-disruptive"), "{}", stdout(&p));
     in_order(
         &stdout(&p),
         &[
@@ -2461,13 +2770,20 @@ fn a_deferred_service_named_by_restart_is_reviewed_and_run_as_a_restart() {
             "planned life.bar@service [life] restart life.bar on request (--restart) after the configuration scope publishes .config/bar/extra",
         ],
     );
+    // An explicit approval of the deferred restart is still accepted.
+    let flags = ["--restart", "life.bar", "--allow-disruptive", BAR_OP];
+    let e = l.preview(&flags);
+    assert_eq!(code(&e), 0, "{}\n{}", stdout(&e), stderr(&e));
+    assert_eq!(digest_of(&e), digest_of(&p));
+    assert!(!l.fx.h(".config/bar/extra").exists());
     let log = l.log();
-    let o = l.sync(&digest_of(&p), &flags);
+    let o = l.plain(&["--restart", "life.bar"]);
     assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
     in_order(
         &stdout(&o),
         &["  config: ok", "  services: ok", "result: ok"],
     );
+    assert!(l.fx.h(".config/bar/extra").is_symlink());
     assert!(
         l.log()[log.len()..].contains("brew services restart bar"),
         "{}",
@@ -2763,14 +3079,15 @@ fn a_refused_sync_ends_with_its_refusal_not_the_warnings() {
     let l = Life::new();
     l.sign_in(false);
     l.push_link();
-    // Approval is required: the plans list the skipped secrets, and no warning follows.
-    let o = l.run(&["sync", "--root", l.fx.root_arg()]);
+    // A digest that is not this run's is refused: the plans list the skipped secrets, and no
+    // warning follows.
+    let o = l.sync(&"0".repeat(64), &[]);
     assert_eq!(code(&o), 3, "{}\n{}", stdout(&o), stderr(&o));
     let s = stdout(&o);
     assert!(s.contains("skipped: no session life.token"), "{s}");
     assert!(s.ends_with("result: blocked\n"), "{s}");
     assert!(!s.contains("warning:"), "{s}");
-    assert!(stderr(&o).contains("E_APPROVAL_REQUIRED"), "{}", stderr(&o));
+    assert!(stderr(&o).contains("E_PLAN_STALE"), "{}", stderr(&o));
 }
 
 #[test]
@@ -3281,4 +3598,232 @@ fn a_hardlinked_merge_fragment_source_the_update_keeps_is_refused_at_preview_as_
     git(&l.fx.root, &["pull", "-q", "--ff-only", "origin", "main"]);
     let a = l.run(&["apply", "--root", l.fx.root_arg(), "--preview"]);
     in_order(&stdout(&a), &["E_SOURCE_UNTRUSTED life.settings", refused]);
+}
+
+#[test]
+fn approving_a_takeover_whose_fragment_adoption_is_withheld_is_no_usage_error() {
+    let l = Life::new();
+    let o = l.approved(&[]);
+    assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
+    // The owner already holds a settings file and the exact fragment link, made by hand: the
+    // merge is a takeover and the fragment link an adoption, and the takeover runs after it.
+    fs::create_dir_all(l.fx.h(".claude/settings.d")).unwrap();
+    fs::write(l.fx.h(".claude/settings.json"), "{\"theme\":\"dark\"}\n").unwrap();
+    fs::set_permissions(
+        l.fx.h(".claude/settings.json"),
+        std::os::unix::fs::PermissionsExt::from_mode(0o600),
+    )
+    .unwrap();
+    l.push_module(
+        MERGE_FRAGMENT,
+        &[("frag.json", r#"{"fromFragment":true}"#)],
+        "merge a fragment",
+    );
+    std::os::unix::fs::symlink(
+        l.fx.root.join("base/modules/life/files/frag.json"),
+        l.fx.h(".claude/settings.d/10-local.json"),
+    )
+    .unwrap();
+    let takeover = "life.settings@.claude/settings.json";
+    let p = l.preview(&[]);
+    assert!(
+        stdout(&p).contains(&format!("withheld: {takeover}")),
+        "{}",
+        stdout(&p)
+    );
+    // Approving only the takeover leaves it withheld after the unapproved adoption it runs
+    // after. The flag names an operation of the plan: no usage error, the rest runs.
+    let o = l.plain(&["--allow-adopt", takeover]);
+    assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
+    assert!(!stderr(&o).contains("E_USAGE"), "{}", stderr(&o));
+    assert!(stdout(&o).contains("result: ok"), "{}", stdout(&o));
+    assert_eq!(
+        fs::read_to_string(l.fx.h(".claude/settings.json")).unwrap(),
+        "{\"theme\":\"dark\"}\n"
+    );
+}
+
+#[test]
+fn a_service_whose_definition_link_adoption_is_withheld_is_reviewed_from_the_existing_link() {
+    let l = Life::new();
+    let o = l.approved(&[]);
+    assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
+    // A second agent whose definition is new upstream. The owner already made the exact link
+    // by hand: the configuration plan adopts it, and the adoption is withheld.
+    let plist = "Library/LaunchAgents/org.example.agent2.plist";
+    l.push_module(
+        &format!(
+            "\n[[resources]]\nid = \"agent2-plist\"\nkind = \"link\"\nadapter = \"fs-link/v1\"\ntarget = \"{plist}\"\n[resources.value]\nsource = \"files/org.example.agent2.plist\"\n\n[[resources]]\nid = \"agent2\"\nkind = \"service\"\nadapter = \"launchd-agent/v1\"\n[resources.value]\nlabel = \"org.example.agent2\"\nplist = \"{plist}\"\n"
+        ),
+        &[(
+            "org.example.agent2.plist",
+            &AGENT_PLIST.replace("org.example.agent<", "org.example.agent2<"),
+        )],
+        "add a second agent",
+    );
+    std::os::unix::fs::symlink(
+        l.fx.root
+            .join("base/modules/life/files/org.example.agent2.plist"),
+        l.fx.h(plist),
+    )
+    .unwrap();
+    let adopt = format!("life.agent2-plist@{plist}");
+    // The withheld adoption writes nothing, so the link stays and the definition it resolves
+    // to after publication is the one the services review reads: the agent starts.
+    let o = l.plain(&[]);
+    assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
+    let s = stdout(&o);
+    in_order(
+        &s,
+        &[
+            &format!("withheld: {adopt} (needs --allow-adopt)"),
+            "plan digest: ",
+            &format!("  config: withheld ({adopt})"),
+            "  services: ok",
+            "result: ok",
+        ],
+    );
+    assert!(!s.contains("services blocked"), "{s}");
+    assert!(
+        l.fx.receipt_docs()
+            .iter()
+            .all(|r| !r.to_string().contains(&adopt)),
+        "the withheld adoption ran"
+    );
+    assert!(
+        fs::read_to_string(l.fake.path().join("loaded"))
+            .unwrap()
+            .contains("org.example.agent2 "),
+        "{}",
+        l.log()
+    );
+}
+
+#[test]
+fn a_generated_definition_whose_operation_is_withheld_is_reviewed_from_the_home_file() {
+    let l = Life::unpublished();
+    let seed = &l.fx.upstream.seed;
+    put(seed, "base/modules/life/module.toml", &generated_life());
+    l.fx.upstream.push("generate the agent definition");
+    let o = l.approved(&[]);
+    assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
+    let plist = l.fx.h("Library/LaunchAgents/org.example.agent.plist");
+    assert!(plist.is_file() && !plist.is_symlink());
+    // Upstream changes the program and adds a fragment link that the owner already made by
+    // hand: the adoption is withheld, and so is the generated definition that runs after it.
+    put(
+        seed,
+        "base/modules/life/module.toml",
+        &format!(
+            "{}\n[[resources]]\nid = \"afrag\"\nkind = \"link\"\nadapter = \"fs-link/v1\"\ntarget = \".config/agent/a.frag\"\n[resources.value]\nsource = \"files/a.frag\"\n",
+            generated_life()
+        ),
+    );
+    put(seed, "base/modules/life/files/a.frag", "<!-- a -->\n");
+    put(
+        seed,
+        "base/modules/life/files/org.example.agent.plist",
+        &AGENT_PLIST.replace("/usr/bin/true", "/usr/bin/false"),
+    );
+    l.fx.upstream.push("the agent runs another program");
+    let frag = l.fx.h(".config/agent/a.frag");
+    fs::create_dir_all(frag.parent().unwrap()).unwrap();
+    std::os::unix::fs::symlink(l.fx.root.join("base/modules/life/files/a.frag"), &frag).unwrap();
+    // The restart loads the HOME file, which keeps the old program: the review must read that
+    // file, not the bytes the withheld operation would write.
+    let flags = ["--restart", "life.agent"];
+    let p = l.preview(&flags);
+    assert_eq!(code(&p), 0, "{}\n{}", stdout(&p), stderr(&p));
+    let s = stdout(&p);
+    in_order(
+        &s,
+        &[
+            "withheld: life.afrag@.config/agent/a.frag (needs --allow-adopt)",
+            "withheld: life.agent-plist@Library/LaunchAgents/org.example.agent.plist (runs after a withheld operation)",
+        ],
+    );
+    assert!(s.contains("the definition runs /usr/bin/true"), "{s}");
+    assert!(!s.contains("the definition runs /usr/bin/false"), "{s}");
+    let log = l.log();
+    let o = l.plain(&flags);
+    assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
+    let s = stdout(&o);
+    assert!(!s.contains("E_PLAN_STALE"), "{s}");
+    in_order(&s, &["  services: ok", "result: ok"]);
+    assert!(
+        fs::read_to_string(&plist)
+            .unwrap()
+            .contains("/usr/bin/true")
+    );
+    in_order(
+        &l.log()[log.len()..],
+        &["launchctl bootout", "launchctl bootstrap"],
+    );
+}
+
+#[test]
+fn a_withheld_operation_does_not_count_in_the_combined_journal_check() {
+    use dfm_model::state::{Class, JournalEntry, MAX_JOURNAL_BYTES, Phase};
+
+    let l = Life::unpublished();
+    // The secret's destination exists and the ledger does not record it: a withheld takeover.
+    let env = l.fx.h(".config/example/personal.env");
+    fs::create_dir_all(env.parent().unwrap()).unwrap();
+    fs::write(&env, "TOKEN=mine\n").unwrap();
+    fs::set_permissions(&env, fs::Permissions::from_mode(0o600)).unwrap();
+    let id = "life.token@.config/example/personal.env";
+    let p = l.preview(&[]);
+    assert_eq!(code(&p), 0, "{}\n{}", stdout(&p), stderr(&p));
+    let s = stdout(&p);
+    assert!(
+        s.contains(&format!("withheld: {id} (needs --allow-adopt)")),
+        "{s}"
+    );
+    // The journaled operations of the run, from each scope's summary list of planned ids.
+    let planned: Vec<&str> = s
+        .lines()
+        .filter_map(|line| line.strip_prefix("  planned "))
+        .filter(|id| !id.contains(' '))
+        .collect();
+    assert!(planned.contains(&id), "{s}");
+    let runnable = u64::try_from(planned.len() - 1).unwrap();
+    // Room for every operation that runs (4096 bytes each), less than one more.
+    let free = runnable * 4096 + 100;
+    let journal = l.fx.h(".local/state/dotfiles-manager/state/journal.jsonl");
+    let len = fs::metadata(&journal).map_or(0, |m| m.len());
+    let line = JournalEntry {
+        schema: dfm_model::state::SCHEMA,
+        op_id: "closed-1".into(),
+        op: "create-file".into(),
+        phase: Phase::Done,
+        at: "2026-10-10T00:00:00.000000000Z".into(),
+        resource: "core.x".into(),
+        adapter: "git-config/v1".into(),
+        class: Class::Normal,
+        recovery: None,
+        token: None,
+        reason: Some("x".repeat(1024)),
+    }
+    .to_line()
+    .unwrap();
+    let room = MAX_JOURNAL_BYTES - free - len;
+    let mut bytes = fs::read(&journal).unwrap_or_default();
+    bytes.extend(line.repeat(usize::try_from(room).unwrap() / line.len()));
+    fs::write(&journal, &bytes).unwrap();
+    let o = l.plain(&[]);
+    assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
+    let s = stdout(&o);
+    in_order(
+        &s,
+        &[
+            "  config: ok",
+            "  packages: ok",
+            "  secrets: withheld (",
+            "  services: ok",
+            "result: ok",
+        ],
+    );
+    assert!(!stderr(&o).contains("E_LIMIT_EXCEEDED"), "{}", stderr(&o));
+    assert_eq!(fs::read_to_string(&env).unwrap(), "TOKEN=mine\n");
+    assert!(!l.log().contains("op inject"), "{}", l.log());
 }

@@ -524,6 +524,8 @@ pub struct ProfileRef {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Approval {
+    /// `yes_plan` (the digest was given), `unattended` (a `sync` scope run without one, DFM-76)
+    /// or `interactive`.
     pub kind: String,
     pub plan_digest: String,
     pub at: String,
@@ -702,7 +704,7 @@ impl Receipt {
             return Err(bad("receipt plan_digest is malformed"));
         }
         if let Some(a) = &self.approval
-            && (!matches!(a.kind.as_str(), "interactive" | "yes_plan")
+            && (!matches!(a.kind.as_str(), "interactive" | "yes_plan" | "unattended")
                 || !valid_sha256(&a.plan_digest)
                 || parse_rfc3339(&a.at).is_none())
         {
@@ -2262,6 +2264,14 @@ mod tests {
             at: "2026-10-10T00:00:00.000000000Z".into(),
         });
         cases.push(("approval", r));
+        // A plain `dfm sync` (DFM-76) records its own kind.
+        let mut r = good.clone();
+        r.approval = Some(Approval {
+            kind: "unattended".into(),
+            plan_digest: "a".repeat(64),
+            at: "2026-10-10T00:00:00.000000000Z".into(),
+        });
+        assert!(r.validate().is_ok());
         let mut r = good.clone();
         r.sources = vec![SourceId {
             id: "s".into(),
