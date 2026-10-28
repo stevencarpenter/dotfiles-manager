@@ -373,6 +373,9 @@ struct Staged {
     /// That head or pin when the checkout already holds it under local commits; `new` is then
     /// the checkout's HEAD, which stays where it is.
     ahead_of: Option<String>,
+    /// The branch the root checkout has out (`refs/heads/...`), `None` when its HEAD is detached
+    /// or the source is nested. Shown on the `source:` line only, not in the digest.
+    branch: Option<String>,
 }
 
 impl Staged {
@@ -837,6 +840,17 @@ fn stage_source(
         // The objects are already in the copy (the fetch above), so the fast-forward is local.
         advance(git, id, &repo_s, old.as_deref(), &new, None)?;
     }
+    let branch = if src.is_root() {
+        let out = git.output(true, &["-C", &repo_s, "symbolic-ref", "-q", "HEAD"])?;
+        match out.end {
+            End::Exited(0) => Some(String::from_utf8_lossy(&out.stdout).trim().to_string()),
+            End::Exited(1) => None,
+            End::Stopped(r) => return Err(r),
+            _ => return Err(untrusted(format!("{id}: git symbolic-ref HEAD failed"))),
+        }
+    } else {
+        None
+    };
     Ok(Staged {
         src: src.clone(),
         repo,
@@ -844,6 +858,7 @@ fn stage_source(
         old,
         new,
         ahead_of,
+        branch,
     })
 }
 
@@ -1943,9 +1958,16 @@ fn run_inner(
     let staging = Staging::create(ctx, &sys, false)?;
     let previewed = stage_all(&git, root_src, &grants, &root, &staging.tree())?;
     for s in &previewed {
+        // A root checkout on another branch is fast-forwarded where it is; say so.
+        let checkout = match &s.branch {
+            _ if !s.src.is_root() => String::new(),
+            Some(b) if *b == s.src.reference => String::new(),
+            Some(b) => format!("; checkout on {}", visible(b)),
+            None => "; detached".into(),
+        };
         writeln!(
             out,
-            "{} {} {} {} {} ({})",
+            "{} {} {} {} {} ({}{checkout})",
             paint::label(ctx.color, "source:"),
             s.src.id,
             s.src.origin,

@@ -135,7 +135,7 @@ Output: one `source:` line per source, the scope plans and the digest, `publishe
 - `current at <head> (ahead of <commit>)` for a checkout ahead of its ref or pin
 - `new checkout at <commit>`
 
-followed by `(tracking)` or `(exact)`.
+followed by `(tracking)` or `(exact)`. When the root checkout has another branch out than the lock's ref, the parentheses add `; checkout on <branch>` (for example `(tracking; checkout on refs/heads/topic)`), or `; detached` for a detached HEAD. The branch is not part of the sync digest.
 
 ## Exit codes
 

@@ -651,7 +651,7 @@ fn a_checkout_ahead_of_its_ref_is_current_and_applies_as_it_is() {
     let current = format!("current at {mine} (ahead of {upstream})");
     assert!(
         stdout(&p).contains(&format!(
-            "source: src0 {} refs/heads/main {current} (tracking)",
+            "source: src0 {} refs/heads/main {current} (tracking; checkout on refs/heads/topic)",
             fx.origin()
         )),
         "{}",
@@ -671,6 +671,13 @@ fn a_checkout_ahead_of_its_ref_is_current_and_applies_as_it_is() {
     assert_eq!(
         fs::read_to_string(fx.h(".zshrc")).unwrap(),
         "export A=local\n"
+    );
+    git(&fx.root, &["checkout", "-q", "--detach"]);
+    let p = fx.preview();
+    assert!(
+        stdout(&p).contains(&format!("{current} (tracking; detached)")),
+        "{}",
+        stdout(&p)
     );
 }
 
