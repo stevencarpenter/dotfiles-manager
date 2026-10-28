@@ -79,7 +79,7 @@ A secrets plan never says `current` for an existing destination: the content exi
 
 ## The upgrade step
 
-After the scopes, also after "nothing to change", `sync` runs the updaters the profile declares (`updaters`, a fixed set: `brew`, `claude`, `codex`, `opencode`, `skills`) and writes one `upgrade` receipt. A refused run runs none, and a skipped or blocked scope stops none. An updater that fails or is blocked adds a warning at the end of standard output, and the exit stays 0. A stop request during the step ends the run with the stop's exit code, and the warnings still print. An error of the step itself (for example `E_LOCKED`) keeps the scope summary, reports `upgrade: failed (<code>)` and exits with that error. `--no-upgrade` skips the step, and `--preview` lists what it would run. See docs/upgrade.md.
+After the scopes, also after "nothing to change", `sync` runs the updaters the profile declares (`updaters`, a fixed set: `brew`, `claude`, `codex`, `opencode`, `skills`) and writes one `upgrade` receipt. A refused run runs none, and a skipped or blocked scope stops none. An updater that fails or is blocked adds a warning at the end of standard output, and the exit stays 0. A stop request during the step ends the run with the stop's exit code, and the warnings still print. An error of the step itself (for example `E_LOCKED`) keeps the scope summary, reports `upgrade: failed (<code>)` and exits with that error. `--no-upgrade` skips the step. The updaters and what each would run, a blocked one included, are listed after the plan and before publication; `--preview` ends after that list. See docs/upgrade.md.
 
 ## What the lock declares
 

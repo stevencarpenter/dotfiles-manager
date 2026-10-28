@@ -3854,7 +3854,9 @@ esac
     )
 }
 
-/// `brew` for the upgrade step: nothing outdated, and `list` finds nothing.
+/// `brew` for the upgrade step: nothing outdated unless a marker says so, and `list` prints the
+/// `list-<name>` marker. With `outdated-codex`, the cask codex is outdated and its upgrade
+/// writes `codex 0.165.0` to `list-codex`; any other upgrade hangs.
 const UPGRADE_BREW: &str = r#"#!/bin/sh
 PATH=/usr/bin:/bin
 here=$(dirname "$0")
@@ -3864,11 +3866,17 @@ case "$1" in
   outdated)
     if [ -e "$here/../st/outdated-uv" ]; then
       echo '{"formulae":[{"name":"uv","installed_versions":["0.1"],"current_version":"0.2"}],"casks":[]}'
+    elif [ -e "$here/../st/outdated-codex" ]; then
+      echo '{"formulae":[],"casks":[{"name":"codex","installed_versions":["0.164.0"],"current_version":"0.165.0"}]}'
     else
       echo '{"formulae":[],"casks":[]}'
     fi ;;
-  upgrade) touch "$here/../st/started-brew"; exec sleep 30 ;;
-  list) exit 1 ;;
+  upgrade)
+    if [ -e "$here/../st/outdated-codex" ]; then
+      rm "$here/../st/outdated-codex"; echo 'codex 0.165.0' > "$here/../st/list-codex"; exit 0
+    fi
+    touch "$here/../st/started-brew"; exec sleep 30 ;;
+  list) [ -n "$4" ] && [ -f "$here/../st/list-$4" ] && cat "$here/../st/list-$4" || exit 1 ;;
   *) exit 64 ;;
 esac
 "#;
@@ -3976,6 +3984,28 @@ fn sync_runs_the_declared_updaters_in_order() {
     );
     assert!(s.contains("  current brew"), "{s}");
     assert!(s.contains("  upgrade: updated=1 current=1"), "{s}");
+    // The updaters are listed before publication and the scopes, then run after them.
+    let listed = s.find("  claude: would run claude update").expect(&s);
+    let published = s.find("\npublished:").expect(&s);
+    assert!(listed < published, "{s}");
+    assert!(published < s.find("  updated claude").expect(&s), "{s}");
+}
+
+#[test]
+fn a_second_copy_shows_the_version_brew_left() {
+    // codex runs before brew; the note is read after both.
+    let u = Up::new(r#"["codex", "brew"]"#);
+    fs::write(u.st("list-codex"), "codex 0.164.0\n").unwrap();
+    fs::write(u.st("outdated-codex"), "").unwrap();
+    let o = u.sync(&[]);
+    assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
+    let s = stdout(&o);
+    assert!(s.contains("  updated brew"), "{s}");
+    assert!(
+        s.contains("  note: codex second copy: Homebrew cask codex 0.165.0"),
+        "{s}"
+    );
+    assert!(!s.contains("Homebrew cask codex 0.164.0"), "{s}");
 }
 
 #[test]
@@ -4053,6 +4083,26 @@ fn a_refused_sync_runs_no_updater() {
     let o = u.sync(&[]);
     assert_ne!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
     assert_eq!(u.log(), "");
+}
+
+#[test]
+fn a_stale_digest_runs_no_updater() {
+    let u = Up::new(r#"["claude"]"#);
+    let o = u.sync(&["--yes-plan", &"0".repeat(64)]);
+    assert_eq!(code(&o), 3, "{}\n{}", stdout(&o), stderr(&o));
+    assert!(stderr(&o).contains("E_PLAN_STALE"), "{}", stderr(&o));
+    assert_eq!(u.log(), "");
+    assert!(u.upgrade_receipts().is_empty());
+}
+
+#[test]
+fn a_grant_without_a_digest_runs_no_updater() {
+    let u = Up::new(r#"["claude"]"#);
+    let o = u.sync(&["--trust-origin", &u.fx.origin()]);
+    assert_eq!(code(&o), 3, "{}\n{}", stdout(&o), stderr(&o));
+    assert!(stderr(&o).contains("E_APPROVAL_REQUIRED"), "{}", stderr(&o));
+    assert_eq!(u.log(), "");
+    assert!(u.upgrade_receipts().is_empty());
 }
 
 #[test]

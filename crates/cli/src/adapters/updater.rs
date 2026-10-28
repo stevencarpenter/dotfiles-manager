@@ -176,9 +176,13 @@ pub fn run(u: Updater, env: &Env) -> Row {
     match u {
         Updater::Brew => brew(d, env),
         Updater::Skills => {
-            let mise = env.provider;
+            // As the preview says: a missing `mise` is blocked, not a failed command.
+            if let Err(e) = env.provider.resolve("mise") {
+                d.notes.push(e.detail);
+                return d.end(Status::Blocked);
+            }
             match call(
-                mise,
+                env.provider,
                 "mise",
                 &args(&["exec", "--", "npx", "skills", "update"]),
                 &[],
@@ -230,7 +234,6 @@ fn native(mut d: Draft, env: &Env) -> Row {
             return d.end(Status::Blocked);
         }
     };
-    second_copies(u, env, &mut d.notes);
     match version(&r, u, env) {
         Ok(v) => d.before = Some(v),
         Err((note, stopped)) => {
@@ -270,11 +273,13 @@ fn native(mut d: Draft, env: &Env) -> Row {
     }
 }
 
-/// Notes for a Homebrew formula or cask of the same name as a native tool. The check never
-/// changes the row's status, and finds nothing when brew is absent.
-fn second_copies(u: Updater, env: &Env, notes: &mut Vec<String>) {
+/// Notes for a Homebrew formula or cask of the same name as a native tool, read after every
+/// updater ran so the versions are the ones brew left. The check never changes a row's status,
+/// and finds nothing when brew is absent.
+pub fn second_copies(u: Updater, env: &Env) -> Vec<String> {
+    let mut notes = Vec::new();
     if env.provider.resolve("brew").is_err() {
-        return;
+        return notes;
     }
     // Homebrew's names for the same tool. The `claude` cask is the desktop app, not Claude Code.
     let (formula, cask) = match u {
@@ -301,6 +306,7 @@ fn second_copies(u: Updater, env: &Env, notes: &mut Vec<String>) {
             }
         }
     }
+    notes
 }
 
 /// One outdated formula or cask: kind, name, installed versions, newest version. A formula and a
@@ -311,6 +317,8 @@ struct Outdated {
     name: String,
     installed: String,
     current: String,
+    /// Held by `brew pin`: left out of the upgrade.
+    pinned: bool,
 }
 
 fn outdated(env: &Env) -> Result<Vec<Outdated>, (String, bool)> {
@@ -348,6 +356,7 @@ fn outdated(env: &Env) -> Result<Vec<Outdated>, (String, bool)> {
                 name,
                 installed,
                 current: s("current_version").unwrap_or_default(),
+                pinned: i.get("pinned").and_then(|x| x.as_bool()).unwrap_or(false),
             });
         }
     }
@@ -376,10 +385,14 @@ fn brew(mut d: Draft, env: &Env) -> Row {
     ) {
         return d.stop(e);
     }
-    let before = match outdated(env) {
-        Ok(l) => l,
+    let (held, before): (Vec<_>, Vec<_>) = match outdated(env) {
+        Ok(l) => l.into_iter().partition(|o| o.pinned),
         Err(e) => return d.stop(e),
     };
+    for o in &held {
+        d.notes
+            .push(format!("{} {} held (brew pin)", o.kind, o.name));
+    }
     if before.is_empty() {
         return d.end(Status::Current);
     }
@@ -864,11 +877,12 @@ mod tests {
         t.brew(NONE, NONE);
         fs::write(t.root.join("st/list-codex"), "codex 0.164.0\n").unwrap();
         let held = BTreeSet::new();
+        // The row itself does not look: sync reads the copies after every updater ran.
         let r = run(Updater::Codex, &t.env(&held));
-        assert!(
-            r.notes
-                .contains(&"second copy: Homebrew cask codex 0.164.0".to_string()),
-            "{r:?}"
+        assert!(!r.notes.iter().any(|n| n.contains("second copy")), "{r:?}");
+        assert_eq!(
+            second_copies(Updater::Codex, &t.env(&held)),
+            ["second copy: Homebrew cask codex 0.164.0"]
         );
     }
 
@@ -880,13 +894,65 @@ mod tests {
         // The `claude` cask is the desktop app, not a copy of Claude Code.
         fs::write(t.root.join("st/list-claude"), "claude 1.0\n").unwrap();
         let held = BTreeSet::new();
-        let r = run(Updater::Claude, &t.env(&held));
-        assert!(!r.notes.iter().any(|n| n.contains("second copy")), "{r:?}");
+        assert!(second_copies(Updater::Claude, &t.env(&held)).is_empty());
         fs::write(t.root.join("st/list-claude-code"), "claude-code 2.1.300\n").unwrap();
+        assert_eq!(
+            second_copies(Updater::Claude, &t.env(&held)),
+            ["second copy: Homebrew cask claude-code 2.1.300"]
+        );
+    }
+
+    #[test]
+    fn an_update_with_an_unreadable_new_version_is_pending() {
+        let t = T::new();
+        t.native(".local/bin/claude", "update", "2.1.311", "");
+        let held = BTreeSet::new();
         let r = run(Updater::Claude, &t.env(&held));
+        assert_eq!(r.status, Status::Pending, "{r:?}");
         assert!(
             r.notes
-                .contains(&"second copy: Homebrew cask claude-code 2.1.300".to_string()),
+                .iter()
+                .any(|n| n.starts_with("the update ran, but the new version is unknown")),
+            "{r:?}"
+        );
+    }
+
+    #[test]
+    fn brew_missing_is_blocked() {
+        let t = T::new();
+        let held = BTreeSet::new();
+        let r = run(Updater::Brew, &t.env(&held));
+        assert_eq!(r.status, Status::Blocked, "{r:?}");
+        assert!(!r.notes.is_empty(), "{r:?}");
+    }
+
+    #[test]
+    fn skills_without_mise_is_blocked_as_the_preview_says() {
+        let t = T::new();
+        let held = BTreeSet::new();
+        let r = run(Updater::Skills, &t.env(&held));
+        assert_eq!(r.status, Status::Blocked, "{r:?}");
+        assert!(preview(Updater::Skills, &t.env(&held)).starts_with("blocked: "));
+    }
+
+    #[test]
+    fn brew_leaves_a_pinned_formula_out() {
+        let t = T::new();
+        let pinned = r#"{"formulae":[{"name":"uv","installed_versions":["0.13.5"],"current_version":"0.13.6","pinned":false},{"name":"node","installed_versions":["22.1.0"],"current_version":"24.0.0","pinned":true,"pinned_version":"22.1.0"}],"casks":[]}"#;
+        let left = r#"{"formulae":[{"name":"node","installed_versions":["22.1.0"],"current_version":"24.0.0","pinned":true,"pinned_version":"22.1.0"}],"casks":[]}"#;
+        t.brew(pinned, left);
+        let held = BTreeSet::new();
+        let r = run(Updater::Brew, &t.env(&held));
+        assert_eq!(r.status, Status::Updated, "{r:?}");
+        assert!(
+            t.log().contains("brew upgrade --formula uv |"),
+            "{}",
+            t.log()
+        );
+        assert!(!t.log().contains("node"), "{}", t.log());
+        assert!(
+            r.notes
+                .contains(&"formula node held (brew pin)".to_string()),
             "{r:?}"
         );
     }

@@ -32,9 +32,9 @@ A manager built before this key refuses a profile that has it (`E_FIELD_UNKNOWN`
 | `opencode` | `opencode upgrade` | `opencode --version` | `~/.opencode/bin/opencode` |
 | `skills` | `mise exec -- npx skills update` | none | `mise` on the provider path |
 
-- **brew** upgrades every outdated formula and cask, not only declared ones. Version-sensitive tools are pinned with mise, per project or globally. `brew upgrade` gets the outdated names, one call per kind, so each formula and each cask is accounted for as itself, also when a formula and a cask share a name. Notes read `formula uv 0.13.5 -> 0.13.6 upgraded` or `cask codex 0.164.0 still outdated (0.165.0)`. An empty list is `current` and runs no upgrade. Homebrew runs with its defaults (the dependents check and cleanup stay on). The manager sets `HOMEBREW_NO_ANALYTICS=1` and `HOMEBREW_NO_ENV_HINTS=1`, and `HOMEBREW_NO_AUTO_UPDATE=1` for every command after `brew update`.
+- **brew** upgrades every outdated formula and cask, not only declared ones. A name that `brew outdated --json=v2` marks `"pinned": true` (`brew pin`) is left out of the upgrade and its check, with the note `formula node held (brew pin)`. Version-sensitive tools are pinned with mise, per project or globally. `brew upgrade` gets the outdated names, one call per kind, so each formula and each cask is accounted for as itself, also when a formula and a cask share a name. Notes read `formula uv 0.13.5 -> 0.13.6 upgraded` or `cask codex 0.164.0 still outdated (0.165.0)`. An empty list is `current` and runs no upgrade. Homebrew runs with its defaults (the dependents check and cleanup stay on). The manager sets `HOMEBREW_NO_ANALYTICS=1` and `HOMEBREW_NO_ENV_HINTS=1`, and `HOMEBREW_NO_AUTO_UPDATE=1` for every command after `brew update`.
 - **A native tool** (`claude`, `codex`, `opencode`) must exist at its owner path. If it does not, it is `blocked` with that path, and no other copy (for example the Homebrew cask) is used. The runner's executable checks apply: a link that leaves the owner's prefix is `blocked`.
-- **A second copy.** For each native tool, `brew list --versions` and `brew list --cask --versions` look for a Homebrew copy under Homebrew's name for it: the cask `claude-code` (the `claude` cask is the desktop app), the formula and cask `codex`, the formula `opencode`. A copy found is a note on the row (`second copy: Homebrew cask codex 0.164.0`). It is never removed or chosen.
+- **A second copy.** For each native tool, `brew list --versions` and `brew list --cask --versions` look for a Homebrew copy under Homebrew's name for it: the cask `claude-code` (the `claude` cask is the desktop app), the formula and cask `codex`, the formula `opencode`. The check runs after every updater ran, so the version is the one `brew` left, and each copy found is a line after the rows (`  note: codex second copy: Homebrew cask codex 0.165.0`). It is never removed or chosen.
 - **skills** reports no version. Exit 0 is `current` with the note `skills update ran; it reports no version`.
 
 ## Statuses
@@ -45,7 +45,7 @@ A manager built before this key refuses a profile that has it (`E_FIELD_UNKNOWN`
 | `current` | exit 0 and the same version (brew: nothing outdated) |
 | `pending` | a stop request (SIGINT, SIGTERM) ended or prevented it, or the update ran and the new version could not be read |
 | `failed` | a command exited nonzero, timed out or was ended by a signal; brew: a name stayed outdated or the list was not valid JSON |
-| `blocked` | the tool is missing from its owner path, fails the executable checks, or its version cannot be read (or is empty) before the update; brew: a Homebrew trial is active or a trial record cannot be read |
+| `blocked` | the tool, or `mise` for skills, is missing from its owner path, fails the executable checks, or its version cannot be read (or is empty) before the update; brew: a Homebrew trial is active or a trial record cannot be read |
 
 A failure note gives the command, its exit code and the size of its standard error. The text is withheld (docs/secrets.md); run the command by hand to see it. A partial `brew upgrade` is `failed`, and the notes list each name as upgraded or still outdated.
 
@@ -55,15 +55,16 @@ While a Homebrew trial is active (a record under `state/trials/` whose package i
 
 ## In sync
 
-1. The four scopes run as docs/sync.md describes.
-2. A refused run (an error exit) runs no updater. A skipped or blocked scope does not stop them.
-3. `--no-upgrade` prints `upgrade: skipped (--no-upgrade)` and runs none.
-4. The step also runs after "nothing to change".
-5. Under the writer lock, the profile is resolved again from `--root`, because another sync may have changed it since the review. An updater runs only when the review listed it and the profile still declares it; one added meanwhile runs in the next sync, after its review. A profile that declared none in the review takes no lock. Each updater that runs prints one row: `  <status> <name> <before> -> <after>`, then its notes.
-6. One receipt is written (`command = "upgrade"`, no plan digest, no approval), with one operation per updater (`resource = "updater:<name>"`, `adapter = "updater/v1"`). An updater that is not `updated` or `current` makes the receipt `failed`, exit 1, while sync itself exits 0.
-7. The `scopes:` block ends with `  upgrade: <status>=<count>...`, and each `failed`, `blocked` or `pending` updater adds a `warning:` line at the end of standard output.
-8. A stop request during the step ends that updater, reports the rest `pending`, writes the receipt and ends the run with the stop's exit code (130 or 143). The warnings still print. No journal entry is written, so the next sync runs every updater again.
-9. An error of the step itself (the writer lock is held by another command, the state cannot be read, the receipt cannot be written) keeps the scope summary, reports `upgrade: failed (<code>)` and exits with that error.
+1. After the plan, before publication and the scopes, each updater is listed with what it would run and its resolved path, or `blocked: <why>` (DFM-31.C02). Nothing runs yet.
+2. The four scopes run as docs/sync.md describes.
+3. A refused run (an error exit) runs no updater. A skipped or blocked scope does not stop them.
+4. `--no-upgrade` prints `upgrade: skipped (--no-upgrade)` and runs none.
+5. The step also runs after "nothing to change".
+6. Under the writer lock, the profile is resolved again from `--root`, because another sync may have changed it since the review. An updater runs only when the review listed it and the profile still declares it; one added meanwhile runs in the next sync, after its review. A profile that declared none in the review takes no lock. Each updater that runs prints one row: `  <status> <name> <before> -> <after>`, then its notes. After the last row, the second copies of the native tools are read (see "The fixed set").
+7. One receipt is written (`command = "upgrade"`, no plan digest, no approval), with one operation per updater (`resource = "updater:<name>"`, `adapter = "updater/v1"`). An updater that is not `updated` or `current` makes the receipt `failed`, exit 1, while sync itself exits 0.
+8. The `scopes:` block ends with `  upgrade: <status>=<count>...`, and each `failed`, `blocked` or `pending` updater adds a `warning:` line at the end of standard output.
+9. A stop request during the step ends that updater, reports the rest `pending`, writes the receipt and ends the run with the stop's exit code (130 or 143). The warnings still print. No journal entry is written, so the next sync runs every updater again.
+10. An error of the step itself (the writer lock is held by another command, the state cannot be read, the receipt cannot be written) keeps the scope summary, reports `upgrade: failed (<code>)` and exits with that error.
 
 `--preview` lists each updater with what it would run and its resolved path, and runs nothing.
 

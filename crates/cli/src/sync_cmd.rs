@@ -1970,8 +1970,13 @@ fn run_inner(
     // The checks apply runs before its lock (docs/apply.md), per scope, so a plan that a scope
     // would refuse is refused here before any source is published.
     let journal_open = check_scopes(ctx, args, &plans, &loaded, out)?;
+    // The updaters, a blocked one included, are listed before any scope runs (DFM-31.C02).
+    let updaters = &loaded.resolved.updaters;
+    if args.apply.preview || (args.upgrade && !updaters.is_empty()) {
+        upgrade_preview(ctx, &sys, args, updaters, out)?;
+    }
     if args.apply.preview {
-        return upgrade_preview(ctx, &sys, args, &loaded.resolved.updaters, out);
+        return Ok(());
     }
     // A source that moves is a publication, so only a run with every source current, and no
     // scope that would run with a change, can end here (docs/apply.md, step 4).
@@ -2394,6 +2399,14 @@ fn upgrade(
             error,
             reload: None,
         });
+    }
+    // After the loop, so a copy that brew upgraded shows the version brew left. A stopped run
+    // starts no more commands.
+    let stopped = dfm_engine::signal::requested().is_some();
+    for u in updaters.iter().filter(|_| !stopped) {
+        for n in updater::second_copies(*u, &env) {
+            writeln!(out, "  note: {} {}", u.name(), visible(&n)).map_err(w)?;
+        }
     }
     let binary = crate::plan_cmd::binary_identity()?;
     let stamp = state::Stamp::of(binding);
