@@ -1,8 +1,10 @@
 //! `doctor` and `status`: one read-only inspection, two views (docs/doctor.md).
 //!
 //! The inspection reads the binding, the state store, the lock file note, the resolved profile,
-//! the plan and the owned outputs. It runs no program, probes no tool, fetches nothing, takes no
-//! lock and writes nothing. A failing source gives its own row and the other rows still appear.
+//! the plan and the owned outputs. The only programs it starts are the read-only package and
+//! service probes of `packages` and `services`. It executes nothing found on PATH, fetches
+//! nothing, takes no lock and writes nothing. A failing source gives its own row and the other
+//! rows still appear.
 
 use crate::{
     Ctx, Loaded, clip, header, load_resolved, no_root, plan_cmd, read_existing_binding, usage,
@@ -12,17 +14,19 @@ use dfm_engine::{
     verify_identity,
 };
 use dfm_model::binding::Binding;
-use dfm_model::doctor::{DoctorCode as D, Level, Report, Row};
+use dfm_model::doctor::{DoctorCode as D, Level, Report, Row, RowCode};
 use dfm_model::fold;
 use dfm_model::plan::{
-    Action, Node, Observations, Operation, Owned, Ownership, Plan, Request, Status, in_scope,
-    link_fingerprint, sensitive_paths,
+    Action, Node, Observations, Operation, Owned, Ownership, PackageState, Plan, Request, Scope,
+    ServiceFacts, ServiceState, Status, in_scope, link_fingerprint, sensitive_paths,
 };
+use dfm_model::resolve::ResolvedResource;
 use dfm_model::state::{Class, Ledger, Receipt, unfinished, unresolved};
 use dfm_model::{Code, Refusal};
 use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::OsStr;
 use std::io::{Read, Write};
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::Path;
 
 /// The most names doctor reads from one directory when it looks for staged copies.
@@ -31,6 +35,8 @@ const STRAY_SCAN_MAX: usize = 100_000;
 const DEFAULT_WIDTH: usize = 80;
 const LOCK_NOTE_BYTES: u64 = 256;
 const SHOWN_STRAYS: usize = 5;
+/// The most links doctor follows from the executable PATH selects.
+const LINK_HOPS: usize = 16;
 
 /// The table width. Only a `test-isolation` build reads `DFM_WIDTH`.
 #[cfg(feature = "test-isolation")]
@@ -127,9 +133,13 @@ fn inspect(ctx: &Ctx, command: &'static str, root: Option<&Path>) -> Result<Repo
     if root.is_none() && binding.as_ref().is_some_and(|b| b.root().is_none()) {
         return Err(no_root());
     }
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    let observed = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
     let owned = state_rows(sys, &layout, binding.as_ref(), &mut rows);
     lock_row(ctx, sys.uid, &mut rows);
-    let (loaded, plan) = profile_rows(ctx, binding.as_ref(), root, &mut rows);
+    let (loaded, plan) = profile_rows(ctx, &sys, &path, binding.as_ref(), root, &mut rows);
     output_rows(
         sys,
         &layout,
@@ -138,7 +148,10 @@ fn inspect(ctx: &Ctx, command: &'static str, root: Option<&Path>) -> Result<Repo
         plan.as_ref(),
         &mut rows,
     );
-    Ok(Report::new(command, ctx.isolated.clone(), rows))
+    Ok(
+        Report::new(command, ctx.isolated.clone(), rows)
+            .observed(observed, &path.to_string_lossy()),
+    )
 }
 
 fn fix_for(code: Code) -> &'static str {
@@ -280,6 +293,7 @@ fn state_rows(
         .collect();
     staged_copy_rows(sys, layout, &paths, rows);
     let bad = evidence_rows(&l, &findings, rows);
+    trial_rows(&l, &findings, rows);
     receipt_row(&l, bad, rows);
     upgrade_row(&l, rows);
     owned
@@ -563,6 +577,42 @@ fn evidence_rows(l: &StateLoaded, findings: &[dfm_engine::Finding], rows: &mut V
     bad
 }
 
+/// One row per active trial. A record that is unreadable or written for another identity already
+/// has its WARN row among the evidence rows.
+fn trial_rows(l: &StateLoaded, findings: &[dfm_engine::Finding], rows: &mut Vec<Row>) {
+    for (n, t) in &l.trials {
+        let Ok(t) = t else { continue };
+        let file = format!("trials/{n}");
+        if findings.iter().any(|f| f.file == file) {
+            continue;
+        }
+        let how = match &t.package {
+            Some(p) if p.install.is_some() => {
+                format!("{} installed by the trial with {}", p.name, p.adapter)
+            }
+            Some(p) => format!(
+                "{} with {}, which existed before the trial",
+                p.name, p.adapter
+            ),
+            None => "no install recorded".to_string(),
+        };
+        rows.push(Row::new(
+            "trial",
+            D::Trial,
+            Level::Ok,
+            &file,
+            &format!(
+                "trial {} of {} since unix {}: {how}; {} owned outputs",
+                t.trial_id,
+                t.tool,
+                t.created_unix_ns / 1_000_000_000,
+                t.owned_outputs.len()
+            ),
+            "",
+        ));
+    }
+}
+
 /// The newest readable receipt whose command is (`upgrade`) or is not (`!upgrade`) the upgrade
 /// step's.
 fn latest_receipt(l: &StateLoaded, upgrade: bool) -> Option<(&String, &Receipt)> {
@@ -719,6 +769,8 @@ fn lock_row(ctx: &Ctx, uid: u32, rows: &mut Vec<Row>) {
 /// Profile, module, resource and plan rows. Returns what could be resolved and planned.
 fn profile_rows(
     ctx: &Ctx,
+    sys: &Sys,
+    path: &OsStr,
     binding: Option<&Binding>,
     root: Option<&Path>,
     rows: &mut Vec<Row>,
@@ -768,7 +820,55 @@ fn profile_rows(
     for m in &res.modules {
         rows.push(ok_row("module", m, "selected"));
     }
+    // The read-only probes of `packages` and `services`; neither installs, loads or starts.
+    // Only a stop request fails one, and then its resources keep the fallback row. The runner
+    // creates its working directory on first use, and doctor creates nothing, so without that
+    // directory no provider starts and each package and service is unknown.
+    let runner = ctx.runner(sys);
+    let (packages, services) = if runner.cwd.is_dir() {
+        let packages = crate::adapters::package::package_facts(res, &runner).unwrap_or_else(|r| {
+            rows.push(refusal_row("resource", "package probes", &r));
+            BTreeMap::new()
+        });
+        let services = crate::adapters::service::service_facts(res, &runner, None, &loaded.root)
+            .unwrap_or_else(|r| {
+                rows.push(refusal_row("resource", "service probes", &r));
+                BTreeMap::new()
+            });
+        (packages, services)
+    } else {
+        let why = format!(
+            "the provider working directory {} does not exist yet, and doctor creates nothing",
+            runner.cwd.display()
+        );
+        let of = |s: Scope| res.resources.values().filter(move |r| s.covers(r));
+        (
+            of(Scope::Packages)
+                .map(|r| (r.id.clone(), PackageState::Unknown(why.clone())))
+                .collect(),
+            of(Scope::Services)
+                .map(|r| {
+                    let state = ServiceState::Unknown(why.clone());
+                    (
+                        r.id.clone(),
+                        ServiceFacts {
+                            state,
+                            definition: None,
+                        },
+                    )
+                })
+                .collect(),
+        )
+    };
     for r in res.resources.values().filter(|r| !in_scope(r)) {
+        if let (false, Some(s)) = (r.sensitive, packages.get(&r.id)) {
+            rows.push(package_row(r, s, path));
+            continue;
+        }
+        if let (false, Some(f)) = (r.sensitive, services.get(&r.id)) {
+            rows.push(service_row(r, f));
+            continue;
+        }
         rows.push(if r.sensitive {
             Row::new(
                 "resource",
@@ -806,6 +906,167 @@ fn profile_rows(
         }
     };
     (Some(loaded), plan)
+}
+
+/// A package row from the provider's read-only listing, with the executable PATH selects.
+/// Another owner's copy is reported and never adopted.
+fn package_row(r: &ResolvedResource, s: &PackageState, path: &OsStr) -> Row {
+    let pkg = crate::adapters::package::name(&r.value).unwrap_or_else(|_| r.id.clone());
+    let by = &r.adapter;
+    let blocked = "Install it by hand with the provider, then run doctor.";
+    let (status, code, detail, fix): (Level, RowCode, String, String) = match s {
+        PackageState::Installed(v) | PackageState::Rolling(v) | PackageState::Held(v) => (
+            Level::Ok,
+            D::Ok.into(),
+            format!("{pkg} is installed by {by} ({v})"),
+            String::new(),
+        ),
+        PackageState::Missing(_) => (
+            Level::Warn,
+            D::PlanPending.into(),
+            format!("{pkg} is not installed by {by}"),
+            "Run dfm sync, which installs it.".into(),
+        ),
+        PackageState::OtherOwner(why) => (
+            Level::Warn,
+            Code::Conflict.into(),
+            format!(
+                "{pkg} is not installed by {by}, but {why}: an interfering installation, not adopted"
+            ),
+            "Remove the other installation, or declare the adapter that owns it.".into(),
+        ),
+        PackageState::Upgrades(d) => (
+            Level::Warn,
+            Code::Conflict.into(),
+            format!(
+                "{pkg} is not installed; installing it with {by} would upgrade {}",
+                d.join(", ")
+            ),
+            blocked.into(),
+        ),
+        PackageState::Unofficial(why) => (
+            Level::Warn,
+            Code::SourceUntrusted.into(),
+            why.clone(),
+            blocked.into(),
+        ),
+        PackageState::SourceBuild(d) => (
+            Level::Warn,
+            Code::PlatformUnsupported.into(),
+            format!(
+                "{pkg} is not installed and {} has no prebuilt binary for this machine",
+                d.join(", ")
+            ),
+            blocked.into(),
+        ),
+        PackageState::Unsupported(why) => (
+            Level::Warn,
+            Code::PrivilegeUnsupported.into(),
+            format!("{pkg} is not installed and {by} cannot install it here: {why}"),
+            blocked.into(),
+        ),
+        PackageState::Unknown(why) => (
+            Level::Unknown,
+            Code::ProbeFailed.into(),
+            format!("the installed state of {pkg} with {by} is unknown: {why}"),
+            "Make the provider answer its listing command, then run doctor.".into(),
+        ),
+        PackageState::Refused(why) => (
+            Level::Error,
+            Code::ManifestInvalid.into(),
+            why.clone(),
+            format!("Correct the resource value in {}.", r.declared_in),
+        ),
+    };
+    let detail = format!(
+        "{detail}; {}",
+        selected(path, crate::adapters::package::leaf(&pkg))
+    );
+    Row::new("resource", code, status, &r.id, &clip(&detail), &fix).optional()
+}
+
+/// The executable `name` that the invoking process's PATH selects, and the links it resolves
+/// through, at most [`LINK_HOPS`]. Nothing is executed, so a shim or stub is never run. A
+/// relative PATH entry is skipped.
+/// shortcut: the executable is taken to share the package's short name, as the owner check
+/// does; upgrade when a resource declares its executables.
+fn selected(path: &OsStr, name: &str) -> String {
+    for dir in std::env::split_paths(path).filter(|d| d.is_absolute()) {
+        let mut cur = dir.join(name);
+        match std::fs::metadata(&cur) {
+            Ok(m) if m.is_file() && m.permissions().mode() & 0o111 != 0 => {}
+            _ => continue,
+        }
+        let mut chain = vec![cur.display().to_string()];
+        for _ in 0..LINK_HOPS {
+            let Ok(t) = std::fs::read_link(&cur) else {
+                break;
+            };
+            cur = cur.parent().map_or_else(|| t.clone(), |p| p.join(&t));
+            chain.push(cur.display().to_string());
+        }
+        return format!("PATH selects {}", chain.join(" -> "));
+    }
+    format!("PATH selects no executable named {name}")
+}
+
+/// A service row from the launcher's read-only report. A label loaded from another definition
+/// is reported and never adopted.
+fn service_row(r: &ResolvedResource, f: &ServiceFacts) -> Row {
+    let by = &r.adapter;
+    let runs = f
+        .definition
+        .as_ref()
+        .map(|d| format!("; the definition runs {}", d.program))
+        .unwrap_or_default();
+    let (status, code, detail, fix): (Level, RowCode, String, String) = match &f.state {
+        ServiceState::Current(d) => (Level::Ok, D::Ok.into(), format!("{by}: {d}"), String::new()),
+        ServiceState::Stopped(d) => (
+            Level::Warn,
+            D::PlanPending.into(),
+            format!("{by}: {d}"),
+            "Run dfm sync, which starts it.".into(),
+        ),
+        ServiceState::Stale(d) => (
+            Level::Warn,
+            Code::Conflict.into(),
+            format!("{by}: {d}"),
+            format!("Run dfm sync --restart {} to restart it.", r.id),
+        ),
+        ServiceState::Foreign(d) => (
+            Level::Warn,
+            Code::Conflict.into(),
+            format!("{by}: {d}: an interfering definition, not adopted"),
+            "Unload it by hand with its launcher.".into(),
+        ),
+        ServiceState::Missing(why) => (
+            Level::Warn,
+            Code::Conflict.into(),
+            format!("{by}: {why}"),
+            "Put the prerequisite in place with dfm sync.".into(),
+        ),
+        ServiceState::Unknown(why) => (
+            Level::Unknown,
+            Code::ProbeFailed.into(),
+            format!("the state of {by} is unknown: {why}"),
+            "Make the launcher answer its report command, then run doctor.".into(),
+        ),
+        ServiceState::Refused(why) => (
+            Level::Error,
+            Code::ManifestInvalid.into(),
+            why.clone(),
+            format!("Correct the resource value in {}.", r.declared_in),
+        ),
+    };
+    Row::new(
+        "resource",
+        code,
+        status,
+        &r.id,
+        &clip(&format!("{detail}{runs}")),
+        &fix,
+    )
+    .optional()
 }
 
 // ---- outputs ------------------------------------------------------------------------------

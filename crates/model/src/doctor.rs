@@ -36,10 +36,11 @@ pub enum DoctorCode {
     ProbingNotBuilt,
     StagedCopy,
     Upgrade,
+    Trial,
 }
 
 impl DoctorCode {
-    pub const ALL: [DoctorCode; 15] = [
+    pub const ALL: [DoctorCode; 16] = [
         DoctorCode::Ok,
         DoctorCode::NaSensitive,
         DoctorCode::OutputMissing,
@@ -55,6 +56,7 @@ impl DoctorCode {
         DoctorCode::ProbingNotBuilt,
         DoctorCode::StagedCopy,
         DoctorCode::Upgrade,
+        DoctorCode::Trial,
     ];
 
     pub const fn as_str(self) -> &'static str {
@@ -74,6 +76,7 @@ impl DoctorCode {
             DoctorCode::ProbingNotBuilt => "D_PROBING_NOT_BUILT",
             DoctorCode::StagedCopy => "D_STAGED_COPY",
             DoctorCode::Upgrade => "D_UPGRADE",
+            DoctorCode::Trial => "D_TRIAL",
         }
     }
 
@@ -85,7 +88,7 @@ impl DoctorCode {
                 "An owned output no longer exists. Apply publishes it again."
             }
             DoctorCode::PlanPending => {
-                "The plan would create or update this output. Nothing owned was edited."
+                "The plan would create or update this output, or install or start this resource. Nothing owned was edited."
             }
             DoctorCode::PlanRemoval => {
                 "The plan would remove this owned output. Nothing selects it any more."
@@ -101,11 +104,14 @@ impl DoctorCode {
             DoctorCode::StateAbsent => "No binding and no state exist yet.",
             DoctorCode::LockNote => "The lock file holds a note from an earlier holder.",
             DoctorCode::DependsUnknown => "A check cannot run because an earlier check failed.",
-            DoctorCode::ProbingNotBuilt => "Tools, versions and PATH are not probed in this build.",
+            DoctorCode::ProbingNotBuilt => "This build does not probe resources of this kind.",
             DoctorCode::StagedCopy => {
                 "A name beside an owned output has the shape of a staged copy of an older build. Nothing removes it."
             }
             DoctorCode::Upgrade => "The last upgrade did not end with `ok`.",
+            DoctorCode::Trial => {
+                "An active trial: a tool installed to try it, outside the profile."
+            }
         }
     }
 }
@@ -175,7 +181,7 @@ impl Level {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct Row {
     /// What was checked: `binding`, `state`, `lock`, `profile`, `module`, `resource`, `output`,
-    /// `intent`, `receipt` or `plan`.
+    /// `intent`, `receipt`, `upgrade`, `trial` or `plan`.
     pub kind: &'static str,
     pub code: RowCode,
     pub status: Level,
@@ -229,6 +235,12 @@ pub struct Report {
     /// Set by a `test-isolation` build, as for `plan --json`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub isolated: Option<String>,
+    /// When the inspection ran, in seconds since the Unix epoch. Absent when no inspection ran.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub observed_unix: Option<u64>,
+    /// The search path of the invoking process, which the executable rows were resolved against.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
     /// `ok`, `warn` or `error`. `error` is exit 1.
     pub result: &'static str,
     pub rows: Vec<Row>,
@@ -240,6 +252,8 @@ impl Report {
             schema: SCHEMA,
             command,
             isolated,
+            observed_unix: None,
+            path: None,
             result: "ok",
             rows,
         };
@@ -255,6 +269,13 @@ impl Report {
             "ok"
         };
         r
+    }
+
+    /// Adds the header facts of an inspection. The search path is made visible, as row text is.
+    pub fn observed(mut self, unix: u64, path: &str) -> Report {
+        self.observed_unix = Some(unix);
+        self.path = Some(visible(path));
+        self
     }
 
     /// Exit 1: any ERROR row, or an UNKNOWN row of a required check. A WARN row alone is exit 0.
@@ -286,6 +307,12 @@ impl Report {
     pub fn render(&self, width: usize, verbose: bool) -> String {
         let width = width.max(MIN_WIDTH);
         let mut out = String::new();
+        if let Some(t) = self.observed_unix {
+            out.push_str(&format!("observed_unix: {t}\n"));
+        }
+        if let Some(p) = &self.path {
+            wrap_into(&mut out, "path: ", p, width);
+        }
         for r in &self.rows {
             out.push_str(&format!(
                 "{:<7} {} {}\n",
@@ -435,6 +462,7 @@ mod tests {
             DoctorCode::ProbingNotBuilt => 12,
             DoctorCode::StagedCopy => 13,
             DoctorCode::Upgrade => 14,
+            DoctorCode::Trial => 15,
         }
     }
 
@@ -442,7 +470,7 @@ mod tests {
     fn all_lists_every_variant_once() {
         let mut idx: Vec<usize> = DoctorCode::ALL.iter().map(|c| index(*c)).collect();
         idx.sort_unstable();
-        assert_eq!(idx, (0..=14).collect::<Vec<_>>());
+        assert_eq!(idx, (0..=15).collect::<Vec<_>>());
     }
 
     #[test]

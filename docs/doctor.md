@@ -17,7 +17,7 @@ dfm status [--root <dir>] [--json]
 
 Both run one inspection and show the same rows. `doctor` prints `detail` and `fix` for each row. `status` prints the status line and the subject only. `--json` prints one document (`schema: 1`) with the same rows for both commands. `--root` defaults to the root the binding records (docs/bootstrap.md).
 
-Both commands are read-only. They run no program and probe no tool, version or PATH entry. They fetch nothing, authenticate nothing, reload nothing, write nothing and take no lock. State is opened with the read-only store open, so the lock file is never created.
+Both commands are read-only. The only programs they start are the read-only package and service probes that `packages` and `services` use (docs/packages.md, docs/lifecycle.md), with the same fixed provider search path, variables and timeouts. A probe lists or reports and never installs, loads, starts or reaches the network. The provider runner creates its working directory (`run` under the cache directory) on first use. Doctor creates nothing, so while that directory does not exist no provider starts and each package and service row is UNKNOWN `E_PROBE_FAILED`. No executable found on PATH is run: the PATH selection is read with `stat` and `readlink` only, so a shim or a stub that would open an installer dialog never starts. They fetch nothing, authenticate nothing, reload nothing, write nothing and take no lock. State is opened with the read-only store open, so the lock file is never created.
 
 ## Exit codes
 
@@ -33,7 +33,7 @@ Both commands are read-only. They run no program and probe no tool, version or P
 
 | Field | Meaning |
 | --- | --- |
-| `kind` | `binding`, `state`, `lock`, `profile`, `module`, `resource`, `output`, `intent`, `receipt` or `plan`. |
+| `kind` | `binding`, `state`, `lock`, `profile`, `module`, `resource`, `output`, `intent`, `receipt`, `upgrade`, `trial` or `plan`. |
 | `code` | A stable code: an existing `E_*` code, or a `D_*` code from the table below. |
 | `status` | `OK`, `WARN`, `ERROR`, `UNKNOWN` or `N/A`. |
 | `subject` | The path, file or resource. Output paths and stray state entries are relative to HOME or to the state directory. The `binding`, `profile` and `lock` subjects are absolute paths. A subject is cut at 4096 visible characters, after control and invisible characters became escapes, and never inside one escape. |
@@ -44,6 +44,8 @@ Both commands are read-only. They run no program and probe no tool, version or P
 
 All text passes through `dfm_model::display::visible`. Neither format has an ANSI escape or a raw control character.
 
+The report also carries two header facts of the inspection: `observed_unix`, the time it ran in seconds since the Unix epoch, and `path`, the PATH of the invoking process that the package rows were resolved against (empty when PATH is unset). The table prints them as the first lines, `observed_unix:` and `path:`. A report made without a usable HOME has neither.
+
 ## Row catalogue
 
 | Kind | When | Status and code |
@@ -51,7 +53,8 @@ All text passes through `dfm_model::display::visible`. Neither format has an ANS
 | `binding` | The binding file | OK `D_OK`. ERROR `E_BINDING_INVALID` (unbound, unreadable or unsafe). |
 | `state` | `state.json`, `ledger.json`, `journal.jsonl` | OK `D_OK`. ERROR with the document's own code (`E_STATE_INVALID`, `E_IDENTITY_MISMATCH`, `E_SCHEMA_UNSUPPORTED`, and so on). |
 | `state` | The state directory | ERROR `E_STATE_INVALID` for state loss (binding without state) or state without a binding. ERROR `E_STORAGE_INVALID` for a redirected or badly owned directory. N/A `D_STATE_ABSENT` when neither exists. |
-| `state` | A receipt or trial record that cannot be read, or belongs to another identity | WARN with the file's code, labeled partial. Receipts and trial records are audit evidence, never authority. A readable trial record gets no row. |
+| `state` | A receipt or trial record that cannot be read, or belongs to another identity | WARN with the file's code, labeled partial. Receipts and trial records are audit evidence, never authority. |
+| `trial` | Each readable trial record of the bound identity (docs/trial.md) | OK `D_TRIAL`. The subject is `trials/<file>`. The detail names the trial, the tool, its start time, the provider and package and whether the trial installed it, and the number of owned outputs. |
 | `state` | Stray entries (interrupted writes, staging directories) | WARN `D_STATE_PARTIAL`, labeled partial. |
 | `intent` | A journal intent with no outcome | ERROR `E_OP_INTERRUPTED`. A running apply also leaves an intent until it ends, and doctor cannot tell the two apart. Fix: wait for a running apply, then run `apply`, which settles it. |
 | `intent` | A journal `unknown` entry that no later entry settled | ERROR `E_OP_INTERRUPTED`, required. The detail names the operation and its journal id, and says whether it blocks one path or, with no intent record, a whole resource. Fix: `state recover` or `apply`, which probe it again, or `state resolve '<journal-id>' --as done|failed` (`done` is refused for an entry with more than one path). Doctor never settles. The row stays until a later entry settles the operation. |
@@ -60,11 +63,17 @@ All text passes through `dfm_model::display::visible`. Neither format has an ANS
 | `lock` | The lock file | OK `D_OK` (no file, or an empty file with no note) or OK `D_LOCK_NOTE`. WARN `E_STORAGE_INVALID` when the file is a link, a directory or a FIFO, is owned by another user, has a mode other than 0600, has more than one hard link, or cannot be opened or read. The writer lock opens the file read-write, so it cannot use 0400, 0200 or 0000, and it refuses group or other bits. The file is opened without following a link and checked on the descriptor. |
 | `profile` | The resolved profile | OK `D_OK`. ERROR with the resolver's code (`E_MANIFEST_INVALID`, `E_SOURCE_MISSING`, `E_PROFILE_INVALID`, and so on). UNKNOWN `D_DEPENDS_UNKNOWN` without a readable binding. |
 | `module` | Each selected module | OK `D_OK`. |
-| `resource` | A resource that is not a file output (package, service, application and similar) | UNKNOWN `D_PROBING_NOT_BUILT`, not required. N/A `D_NA_SENSITIVE` when it is sensitive. |
+| `resource` | A package, from the provider's read-only listing | Not required. OK `D_OK` with the provider and the installed version. WARN `D_PLAN_PENDING` when the provider does not list it. WARN `E_CONFLICT` when an executable of its name has another owner: an interfering installation, reported and never adopted. WARN `E_CONFLICT`, `E_SOURCE_UNTRUSTED`, `E_PLATFORM_UNSUPPORTED` or `E_PRIVILEGE_UNSUPPORTED` when `packages` would block it. UNKNOWN `E_PROBE_FAILED` when the probe cannot decide. ERROR `E_MANIFEST_INVALID` for a bad declaration. The detail ends with the executable PATH selects (see the next paragraph). |
+| `resource` | A service, from the launcher's read-only report | Not required. OK `D_OK` when the launcher holds the declared definition in the wanted state. WARN `D_PLAN_PENDING` when it is not loaded. WARN `E_CONFLICT` when it is loaded and not running, loaded from another definition (reported, never adopted), or a prerequisite is missing. UNKNOWN `E_PROBE_FAILED` and ERROR `E_MANIFEST_INVALID` as for a package. The detail names the program the definition runs when it was read. |
+| `resource` | Any other resource that is not a file output (application and similar) | UNKNOWN `D_PROBING_NOT_BUILT`, not required. N/A `D_NA_SENSITIVE` when it is sensitive, and a sensitive package or service gets this row too. |
 | `plan` | The plan could not be made | ERROR with the planner's code. UNKNOWN `E_OBSERVATION_UNKNOWN`. UNKNOWN `D_DEPENDS_UNKNOWN` after a profile failure. |
 | `output` | A planner blocker | ERROR with the blocker's code (`E_CONFLICT`, `E_PARENT_UNSAFE`, `E_TARGET_RESERVED`, and so on). The blocker's correction is the fix. |
 | `output` | A name beside an owned output or an open-intent path with the older staged-copy shape `.<name>.<digits>.<digits>.<digits>.tmp` or `.stage` | WARN `D_STAGED_COPY`. Fix: "A staged copy from an interrupted run; check it, then remove it by hand." Doctor lists each directory once and reads no content. A directory with more than 100000 entries (names that are not UTF-8 count too) is read only in part, and doctor adds one partial WARN `D_STAGED_COPY` row for it. Nothing sweeps such a name, because a user file can have the same shape. |
 | `output` | An owned output (ledger) or a claimed output (plan) | See the next table. |
+
+### PATH selection
+
+For a package row, doctor walks the PATH of the invoking process in order for an executable file with the package's short name (`atuin` for `homebrew/core/atuin`, `node` for `node@20`). It follows the links of the first match with `readlink`, at most 16, and shows the chain: `PATH selects <dir>/<name> -> <target>`, or `PATH selects no executable named <name>`. A relative PATH entry is skipped. Nothing is executed, so a version-manager shim shows as the shim, not as the version it would pick. The selection holds for the invoking process only, not for another shell's aliases, hash table or environment. A package whose executable has another name shows no selection.
 
 ### Output rows
 
@@ -96,7 +105,7 @@ Doctor's own inspection reads and hashes no content of a sensitive output, whoev
 | `D_OK` | The check passed. |
 | `D_NA_SENSITIVE` | A sensitive output. Its content is never read or hashed. |
 | `D_OUTPUT_MISSING` | An owned output no longer exists. Apply publishes it again. |
-| `D_PLAN_PENDING` | The plan would create or update this output. Nothing owned was edited. |
+| `D_PLAN_PENDING` | The plan would create or update this output, or install or start this resource. Nothing owned was edited. |
 | `D_PLAN_REMOVAL` | The plan would remove this owned output. Nothing selects it any more. |
 | `D_UNRECORDED` | The output already is the wanted result, but the ledger does not record it. |
 | `D_STATE_PARTIAL` | A state file that is only audit evidence is unreadable or stray. The inventory is partial. |
@@ -105,9 +114,10 @@ Doctor's own inspection reads and hashes no content of a sensitive output, whoev
 | `D_STATE_ABSENT` | No binding and no state exist yet. |
 | `D_LOCK_NOTE` | The lock file holds a note from an earlier holder. |
 | `D_DEPENDS_UNKNOWN` | A check cannot run because an earlier check failed. |
-| `D_PROBING_NOT_BUILT` | Tools, versions and PATH are not probed in this build. |
+| `D_PROBING_NOT_BUILT` | This build does not probe resources of this kind. |
 | `D_STAGED_COPY` | A name beside an owned output has the shape of a staged copy of an older build. Nothing removes it. |
 | `D_UPGRADE` | The last upgrade did not end with `ok`. |
+| `D_TRIAL` | An active trial: a tool installed to try it, outside the profile. |
 
 `E_*` codes keep the meaning given in [state.md](state.md), [resolver.md](resolver.md), [planner.md](planner.md) and [apply.md](apply.md).
 
@@ -129,10 +139,11 @@ Each row starts a line with `STATUS CODE kind`. Indented lines follow: `subject:
 
 A row for these is UNKNOWN `D_PROBING_NOT_BUILT` and not required, or it is absent.
 
-- Tool presence, tool versions and the wanted, installed, selected and running versions. `packages` and `services` probe their providers; `doctor` does not.
-- PATH context, shims and link resolution outside the owned outputs.
+- Applications and the other resource kinds that are not packages, services or file outputs.
+- The version a shim would select: doctor does not parse version-manager configuration and runs no shim. The wanted version is not compared, and no running version is read beyond the service report's state.
+- `explain` does not use the inspection.
 - Remote eligibility and update freshness.
-- Active trials (no per-trial row) and interfering unmanaged installations.
+- Unmanaged installations that no declared package names.
 - Whether the process that wrote a lock note still runs. Doctor does not take the lock.
 
 ## Known limits
