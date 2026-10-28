@@ -1,4 +1,4 @@
-//! The service adapters `launchd-agent/v1` and `brew-service/v1` (docs/lifecycle.md): a
+//! The service adapters `launchd-agent/v1`, `brew-service/v1` and `omlx-app/v1` (docs/lifecycle.md): a
 //! read-only report from the service's own launcher, then a start or restart through that same
 //! launcher, never through a competing one. Nothing here stops, unloads for good, uninstalls or
 //! removes a service, and nothing reads or writes application data.
@@ -18,6 +18,14 @@ use std::time::{Duration, Instant};
 
 pub const LAUNCHD: &str = "launchd-agent/v1";
 pub const BREW_SERVICE: &str = "brew-service/v1";
+pub const OMLX_APP: &str = "omlx-app/v1";
+
+/// The oMLX app's control socket below HOME. It answers one JSON line per request line.
+const OMLX_SOCKET: &str = "Library/Application Support/oMLX/control.sock";
+/// The app's own launcher, which opens the app and sends it a command over the socket.
+const OMLX_CLI: &str = "omlx-cli";
+/// Where the app bundle keeps [`OMLX_CLI`]. Searched after the provider path.
+const OMLX_BUNDLE_BIN: &str = "/Applications/oMLX.app/Contents/MacOS";
 
 /// A report or an action log is bounded; its content is not kept.
 const MAX_OUTPUT: usize = 1 << 20;
@@ -682,6 +690,105 @@ fn brew_state(runner: &Runner, value: &Value) -> Result<ServiceFacts, Refusal> {
     }))
 }
 
+/// The runner for [`OMLX_CLI`]: the provider path, then the app bundle. The isolated build
+/// never reaches the installed app: its tests put a look-alike on the provider path.
+fn omlx_runner(runner: &Runner) -> Runner {
+    let mut r = runner.clone();
+    if !cfg!(feature = "test-isolation") {
+        r.search_path.push(PathBuf::from(OMLX_BUNDLE_BIN));
+    }
+    r
+}
+
+/// `{"command":"status"}` on the control socket: the server state the app reports, or `None`
+/// when no app listens (no socket, or nobody accepts on it).
+fn omlx_report(runner: &Runner) -> Result<Option<String>, String> {
+    use std::io::{BufRead, BufReader, ErrorKind, Write};
+    let io = |e: std::io::Error| format!("the oMLX control socket: {}", e.kind());
+    let mut sock = match std::os::unix::net::UnixStream::connect(runner.home.join(OMLX_SOCKET)) {
+        Ok(s) => s,
+        Err(e) if matches!(e.kind(), ErrorKind::NotFound | ErrorKind::ConnectionRefused) => {
+            return Ok(None);
+        }
+        Err(e) => return Err(io(e)),
+    };
+    let b = bounds();
+    sock.set_read_timeout(Some(b.probe)).map_err(io)?;
+    sock.set_write_timeout(Some(b.probe)).map_err(io)?;
+    sock.write_all(b"{\"command\":\"status\"}\n").map_err(io)?;
+    let mut line = Vec::new();
+    BufReader::new(sock.take(u64::try_from(MAX_OUTPUT).unwrap_or(u64::MAX)))
+        .read_until(b'\n', &mut line)
+        .map_err(io)?;
+    serde_json::from_slice::<serde_json::Value>(&line)
+        .ok()
+        .and_then(|v| v.get("state")?.as_str().map(str::to_string))
+        .map(Some)
+        .ok_or_else(|| "the oMLX control socket did not answer with a state".to_string())
+}
+
+/// The state of the oMLX app: installed (its launcher is on the search path), the app running
+/// (the control socket answers) and its server running. Only a running server is current. A
+/// server in `starting`, `stopping`, `unresponsive` or `error` is stale: the planner blocks until
+/// the user requests the restart. A state the adapter does not know is unknown.
+fn omlx_state(runner: &Runner) -> ServiceFacts {
+    let installed = omlx_runner(runner)
+        .search_path
+        .iter()
+        .any(|d| std::fs::symlink_metadata(d.join(OMLX_CLI)).is_ok());
+    if !installed {
+        return only(ServiceState::Missing(format!(
+            "the oMLX app is not installed ({OMLX_CLI} not found)"
+        )));
+    }
+    only(match omlx_report(runner) {
+        Err(why) => ServiceState::Unknown(why),
+        Ok(None) => ServiceState::Stopped("the app is not running".into()),
+        Ok(Some(s)) => match s.as_str() {
+            "running" => ServiceState::Current("app running, server running".into()),
+            "stopped" => ServiceState::Stopped("app running, server stopped".into()),
+            "starting" | "stopping" | "unresponsive" | "error" => {
+                ServiceState::Stale(format!("app running, server {s}"))
+            }
+            _ => ServiceState::Unknown(
+                "the oMLX control socket reported a state the adapter does not know".into(),
+            ),
+        },
+    })
+}
+
+/// `omlx-cli start|restart --no-wait`: the app's launcher opens the app when needed and sends the
+/// command over the socket. Then a bounded wait for the socket to report the server running,
+/// as for brew: still not running when the bound elapses is `Queued`. The app reads
+/// `.omlx/model_settings.json` only at start, so a restart is how a merged setting takes effect.
+fn omlx_act(runner: &Runner, action: Action) -> Result<Completion, Refusal> {
+    let verb = if action == Action::Restart {
+        "restart"
+    } else {
+        "start"
+    };
+    let args = [verb.to_string(), "--no-wait".into()];
+    let by_hand = format!("{OMLX_CLI} {verb}");
+    run_action(&omlx_runner(runner), OMLX_CLI, &args, &[], &[0], &by_hand)?;
+    let b = bounds();
+    let start = Instant::now();
+    loop {
+        stop_requested()?;
+        match omlx_report(runner) {
+            Ok(Some(s)) if s == "running" => return Ok(Completion::Completed),
+            Ok(s) if start.elapsed() >= b.settle => {
+                return Ok(Completion::Queued(format!(
+                    "server {} {:?} after the {verb}",
+                    s.as_deref().unwrap_or("not reachable"),
+                    b.settle
+                )));
+            }
+            Ok(_) => std::thread::sleep(POLL),
+            Err(why) => return Err(Refusal::new(Code::ProbeFailed, why)),
+        }
+    }
+}
+
 /// The launcher's report for one service by its adapter, with the definition facts when the
 /// adapter read one. A bad declaration is `E_MANIFEST_INVALID`.
 pub fn probe(
@@ -704,6 +811,7 @@ fn probe_from(
     match adapter {
         LAUNCHD => launchd_state(runner, value, staged, root),
         BREW_SERVICE => brew_state(runner, value),
+        OMLX_APP => Ok(omlx_state(runner)),
         other => Err(Refusal::new(
             Code::GeneratorUnavailable,
             format!("no service launcher for {other}"),
@@ -845,6 +953,7 @@ pub fn act(
     match adapter {
         LAUNCHD => launchd_act(runner, value, action),
         BREW_SERVICE => brew_act(runner, value, action),
+        OMLX_APP => omlx_act(runner, action),
         other => Err(Refusal::new(
             Code::GeneratorUnavailable,
             format!("no service launcher for {other}"),

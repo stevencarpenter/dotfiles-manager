@@ -1,6 +1,6 @@
 # Lifecycle
 
-The `launchd-agent/v1` and `brew-service/v1` service adapters and the `services` command. This document describes the behavior at HEAD.
+The `launchd-agent/v1`, `brew-service/v1` and `omlx-app/v1` service adapters and the `services` command. This document describes the behavior at HEAD.
 
 A published file or an accepted launcher request is not proof that the program uses it. `services` asks each service's own launcher what it holds, acts through that launcher only, asks again, and records what it observed.
 
@@ -13,6 +13,7 @@ A published file or an accepted launcher request is not proof that the program u
 | `services` command (`apply` over the services scope) and `--restart` | `crates/cli/src/apply_cmd.rs`, `crates/cli/src/lib.rs` |
 | Code `E_PENDING` (exit 5); receipt reload states `reloaded` and `requested` (`RELOADS`) | `crates/model/src/refusal.rs`, `crates/model/src/state.rs` |
 | Tests with `launchctl` and `brew` look-alikes | `crates/cli/tests/services.rs` |
+| Tests with an `omlx-cli` look-alike and a control socket served by the test | `crates/cli/tests/omlx.rs` |
 
 Launchers run through the bounded runner (docs/secrets.md, "How `op` is run"). `firstmate-native/v1` has a catalog entry and no adapter.
 
@@ -35,7 +36,7 @@ Order of one run:
 5. The writer lock and the second plan. The probes run again.
 6. One operation per service, then the receipt (`command = services`) and the report.
 
-`--restart <resource-id>` plans a restart of a service that is current, or of a Homebrew service that is loaded and not running. It is the only way a restart is planned. Use it for a configuration the program reads only at start, or for a daemon that exited. The manager cannot see what a running process loaded, so it does not guess. The request is part of the plan (the operation's action and effect), so the digest covers it. The restart also needs `--allow-disruptive`. An id that names no service in the plan is a usage error.
+`--restart <resource-id>` plans a restart of a service that is current, or of a Homebrew service that is loaded and not running, or of an oMLX server that is not running in an open app. It is the only way a restart is planned. Use it for a configuration the program reads only at start, or for a daemon that exited. The manager cannot see what a running process loaded, so it does not guess. The request is part of the plan (the operation's action and effect), so the digest covers it. The restart also needs `--allow-disruptive`. An id that names no service in the plan is a usage error.
 
 ## The adapters
 
@@ -43,10 +44,11 @@ Order of one run:
 | --- | --- | --- | --- | --- | --- |
 | `launchd-agent/v1` | `label` (letters, digits, `.`, `_`, `-`, not starting with `-`, at most 128 characters), `plist` (the HOME-relative path of the definition, a published file or link) | The definition is resolved and read (1 MiB bound) as an XML property list. The top-level `Label` string must be the declared label. Its SHA-256 becomes the `content:<plist>` precondition, and its `Program` or `ProgramArguments` goes into the effect text ("the definition runs …"). Then `launchctl print gui/<uid>/<label>`: exit 0 gives the top-level `path` and `state` (one-tab lines only), exit 113 ("Could not find service") means not loaded. | launchd holds the label, and its `path` (links resolved) is the declared definition, or another file inside the checkout root: an earlier definition of the manager's sources, loaded before the definition link was retargeted. `--restart` loads the declared one. The run state is reported, not required: a one-shot agent (`RunAtLoad`, exits) is not running after it ran. A label loaded from a file outside the checkout root is foreign: a blocker, never a restart. | `launchctl bootstrap gui/<uid> <HOME>/<plist>` | Only on `--restart`: `launchctl bootout gui/<uid>/<label>` (a label the domain does not hold is accepted), a wait of at most 10 s until `launchctl print` no longer finds it, then the bootstrap. |
 | `brew-service/v1` | `name` (the formula: letters, digits, `.`, `_`, `-`, `+`, `@`), `config` (optional, HOME-relative files the program reads) | `brew services info <name> --json` with `HOMEBREW_NO_AUTO_UPDATE=1`, `HOMEBREW_NO_ANALYTICS=1`, `HOMEBREW_NO_ENV_HINTS=1`: `loaded`, `running`, `status`. Exit 1 with "No available formula" or "is not installed" means the formula is not installed. | `loaded` and `running`. Loaded and not running is stale: a blocker until `--restart`. | `brew services start <name>`, then at most 10 s of `info` reports until `running` | Only on `--restart`: `brew services restart <name>`, the same wait. |
+| `omlx-app/v1` | `config` (optional, HOME-relative files the app reads at start; declare `[".omlx/model_settings.json"]` so the service is ordered after that merge) | The launcher `omlx-cli` must be on the search path: the provider path, then `/Applications/oMLX.app/Contents/MacOS` (the isolated build omits the bundle). None found is `Missing`. Then one `{"command":"status"}` line on the Unix socket `~/Library/Application Support/oMLX/control.sock`, the protocol of the app's own `omlx/cli.py` (`_send_app_control`). No socket, or a refused connection, means the app is not running. The answer is one JSON line; only its `state` is read. | `state` is `running`. `stopped`, or no app, is `Stopped`. `starting`, `stopping`, `unresponsive` and `error` are stale: a blocker until `--restart`. Any other answer is `Unknown`. | `omlx-cli start --no-wait` (the launcher opens the app when needed and sends `start`), then at most 10 s of socket reports until `running` | Only on `--restart`: `omlx-cli restart --no-wait`, then the same wait. oMLX reads `.omlx/model_settings.json` only at start, so this is how a merged model setting takes effect. |
 
 Actions have 120 s. A probe that cannot run, times out, or answers in a shape the adapter does not know is `Unknown`: the plan has a blocker, `E_PROBE_FAILED`, exit 3: unknown support fails closed. Launcher standard error is bounded and never printed or persisted. The message names its size and the command to run by hand.
 
-**Never run:** `launchctl unload`, `launchctl remove`, `launchctl kickstart`, `brew services stop`, `brew services kill`, `brew services remove`, `brew services cleanup`, `brew uninstall`, `brew services run`, anything under `sudo` or in the `system` domain. A bootout happens only inside a restart, with its bootstrap in the same operation.
+**Never run:** `omlx-cli stop`, `brew services stop omlx` (a Homebrew route for the app failed with exit 1 on the M5), `launchctl unload`, `launchctl remove`, `launchctl kickstart`, `brew services stop`, `brew services kill`, `brew services remove`, `brew services cleanup`, `brew uninstall`, `brew services run`, anything under `sudo` or in the `system` domain. A bootout happens only inside a restart, with its bootstrap in the same operation.
 
 ## State model
 

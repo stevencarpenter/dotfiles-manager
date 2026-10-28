@@ -1,4 +1,5 @@
-//! The co-owned JSON merges (docs/adapters.md, "claude-settings/v1" and "codex-hooks/v1"). Pure:
+//! The co-owned JSON merges (docs/adapters.md: "claude-settings/v1", "codex-hooks/v1" and
+//! "omlx-model-settings/v1"). Pure:
 //! it takes the live bytes, the declared value and the handler entries the ledger records as
 //! owned, and returns the new bytes. It opens no file.
 //!
@@ -31,12 +32,28 @@ pub const ADAPTER: &str = "claude-settings/v1";
 /// object of the Claude settings, so the same merge serves it with handlers only.
 pub const CODEX_HOOKS: &str = "codex-hooks/v1";
 
+/// The adapter id of the oMLX per-model settings merge (`{"version":1,"models":{...}}`), with
+/// `managed` only. The application saves the file with mode 0644 and holds no credential in it.
+pub const OMLX_MODEL_SETTINGS: &str = "omlx-model-settings/v1";
+
 /// Whether `adapter` is a co-owned merge this module implements.
 pub fn is_merge(adapter: &str) -> bool {
-    matches!(adapter, ADAPTER | CODEX_HOOKS)
+    matches!(adapter, ADAPTER | CODEX_HOOKS | OMLX_MODEL_SETTINGS)
 }
-/// The mode of the published file. A live file open to group or others is refused.
+
+/// The mode of a published merge file. A live file with a group or other bit outside it is
+/// refused.
 pub const MODE: u32 = 0o600;
+
+/// The mode `adapter` publishes its file with: 0644 for the oMLX model settings, which the
+/// application itself writes with that mode, and [`MODE`] for every other adapter.
+pub fn mode_for(adapter: &str) -> u32 {
+    if adapter == OMLX_MODEL_SETTINGS {
+        0o644
+    } else {
+        MODE
+    }
+}
 
 /// The most managed leaves, hook entries and appended items one merge output may record. The
 /// ledger holds a salted hash for each, so the bound keeps the ledger inside its size limit.

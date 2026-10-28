@@ -221,7 +221,7 @@ impl Adapter {
         self.spec.kind == "service"
             && matches!(
                 self.spec.id.as_str(),
-                service::LAUNCHD | service::BREW_SERVICE
+                service::LAUNCHD | service::BREW_SERVICE | service::OMLX_APP
             )
     }
 }
@@ -297,6 +297,21 @@ pub fn registry() -> Vec<Adapter> {
                     TargetRule::Fixed(".codex/hooks.json"),
                     Claims::Target,
                     Schema::Table(vec![handlers()]),
+                )
+            },
+            generator: None,
+        },
+        // Per-model leaves only. The fixed target keeps the merge away from `.omlx/settings.json`,
+        // which holds the server's credentials.
+        Adapter {
+            spec: AdapterSpec {
+                sensitive: true,
+                ..spec(
+                    dfm_model::merge::OMLX_MODEL_SETTINGS,
+                    "merge",
+                    TargetRule::Fixed(".omlx/model_settings.json"),
+                    Claims::Target,
+                    Schema::Table(vec![field("managed", Schema::Native, true)]),
                 )
             },
             generator: None,
@@ -414,6 +429,17 @@ pub fn registry() -> Vec<Adapter> {
             ),
             generator: None,
         },
+        Adapter {
+            spec: service(
+                service::OMLX_APP,
+                vec![field(
+                    "config",
+                    Schema::Array(Box::new(Schema::HomePath)),
+                    false,
+                )],
+            ),
+            generator: None,
+        },
     ]
 }
 
@@ -481,7 +507,7 @@ mod tests {
     fn every_service_adapter_acts_through_a_launcher_and_claims_nothing() {
         let table = registry();
         let services: Vec<_> = table.iter().filter(|a| a.spec.kind == "service").collect();
-        assert_eq!(services.len(), 2);
+        assert_eq!(services.len(), 3);
         assert!(services.iter().all(|a| {
             a.generator.is_none()
                 && a.reloads()
