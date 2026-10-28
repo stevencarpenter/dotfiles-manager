@@ -1,4 +1,5 @@
-//! Plan-time facts about the live file of a co-owned merge (docs/adapters.md, `claude-settings/v1`).
+//! Plan-time facts about the live file of a co-owned merge (docs/adapters.md, `claude-settings/v1`
+//! and `codex-hooks/v1`).
 //!
 //! The planner is pure and never reads a sensitive file. This module reads it, read-only, and
 //! gives the planner a verdict and nothing else: the digest of the declared managed values, the
@@ -213,7 +214,7 @@ pub fn merge_facts(
     for r in resolved
         .resources
         .values()
-        .filter(|r| in_scope(r) && r.adapter == merge::ADAPTER)
+        .filter(|r| in_scope(r) && merge::is_merge(&r.adapter))
     {
         let [claim] = r.claims.as_slice() else {
             continue;

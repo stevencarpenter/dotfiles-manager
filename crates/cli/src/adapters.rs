@@ -168,6 +168,21 @@ fn service(id: &str, fields: Vec<Field>) -> AdapterSpec {
     )
 }
 
+/// The declared hook commands of a co-owned merge (`merge::Desired`).
+fn handlers() -> Field {
+    field(
+        "handlers",
+        Schema::Map(Box::new(Schema::Table(vec![
+            field("event", Schema::Str, true),
+            field("type", Schema::Str, true),
+            field("argv", Schema::Array(Box::new(Schema::Str)), true),
+            field("matcher", Schema::Str, false),
+            field("timeout", Schema::Int, false),
+        ]))),
+        false,
+    )
+}
+
 /// One adapter: what the resolver validates against, and the generator if the adapter produces
 /// file content. This table is the only place in the Rust code that names an adapter, so the
 /// catalog and the generators cannot disagree. `scripts/check_examples.py` keeps its own list
@@ -178,12 +193,12 @@ pub struct Adapter {
 }
 
 impl Adapter {
-    /// Whether the adapter is the sensitive co-owned merge. It has no `Generator::generate`
+    /// Whether the adapter is a sensitive co-owned merge. It has no `Generator::generate`
     /// output: apply runs `Generator::merge` for it.
     pub fn merges(&self) -> bool {
         self.spec.kind == "merge"
             && self.spec.sensitive
-            && self.spec.id == dfm_model::merge::ADAPTER
+            && dfm_model::merge::is_merge(&self.spec.id)
     }
 
     /// Whether the adapter renders a secret output through a provider (`Generator::render`).
@@ -266,20 +281,24 @@ pub fn registry() -> Vec<Adapter> {
                         field("append", Schema::Array(Box::new(Schema::Str)), false),
                         field("fragments_dir", Schema::HomePath, false),
                         field("pattern", Schema::Str, false),
-                        field(
-                            "handlers",
-                            Schema::Map(Box::new(Schema::Table(vec![
-                                field("event", Schema::Str, true),
-                                field("type", Schema::Str, true),
-                                field("argv", Schema::Array(Box::new(Schema::Str)), true),
-                                field("matcher", Schema::Str, false),
-                                field("timeout", Schema::Int, false),
-                            ]))),
-                            false,
-                        ),
+                        handlers(),
                     ]),
                 )
             }),
+            generator: None,
+        },
+        // Foreign hook entries of any type, and their extra keys, are carried over by value.
+        Adapter {
+            spec: AdapterSpec {
+                sensitive: true,
+                ..spec(
+                    dfm_model::merge::CODEX_HOOKS,
+                    "merge",
+                    TargetRule::Fixed(".codex/hooks.json"),
+                    Claims::Target,
+                    Schema::Table(vec![handlers()]),
+                )
+            },
             generator: None,
         },
         Adapter {

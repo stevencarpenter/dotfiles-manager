@@ -17,7 +17,7 @@ from typing import Any
 ADAPTERS = {
     "link": {"fs-link/v1"},
     "render": {"git-config/v1"},
-    "merge": {"claude-settings/v1"},
+    "merge": {"claude-settings/v1", "codex-hooks/v1"},
     "assemble": {"text-fragments/v1"},
     "distribution": {"skills/v1"},
     "secret": {"op-template/v1"},

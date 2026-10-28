@@ -382,7 +382,7 @@ fn first_refusal(plan: &Plan, generator: &dyn Generator) -> Result<(), Refusal> 
             return Err(Refusal::new(
                 Code::SensitiveUnsupported,
                 format!(
-                    "{}: this sensitive output is not published or removed by this build (only the claude-settings/v1 merge and an op-template/v1 secret are)",
+                    "{}: this sensitive output is not published or removed by this build (only a co-owned merge and an op-template/v1 secret are)",
                     op.id
                 ),
             ));

@@ -120,7 +120,7 @@ jobs:
           - shard: cli-2
             select: -p dfm-cli --features test-isolation --test build_controls --test sync --test planner --test runner --test trial
           - shard: cli-3
-            select: -p dfm-cli --features test-isolation --test merge --test apply --test source_roots --test state --test packages --test services --test resolver --test toolchains --test secrets --test native_config
+            select: -p dfm-cli --features test-isolation --test merge --test codex_hooks --test apply --test source_roots --test state --test packages --test services --test resolver --test toolchains --test secrets --test native_config
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:

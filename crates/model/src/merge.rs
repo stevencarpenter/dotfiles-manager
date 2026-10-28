@@ -1,6 +1,6 @@
-//! The `claude-settings/v1` merge (docs/adapters.md, "claude-settings/v1"). Pure: it takes the
-//! live bytes, the declared value and the handler entries the ledger records as owned, and
-//! returns the new bytes. It opens no file.
+//! The co-owned JSON merges (docs/adapters.md, "claude-settings/v1" and "codex-hooks/v1"). Pure:
+//! it takes the live bytes, the declared value and the handler entries the ledger records as
+//! owned, and returns the new bytes. It opens no file.
 //!
 //! This code lives in `dfm-model`, which depends on `serde_json` (docs/state.md). The adapter
 //! glue (registry entry, `Generator` impl) is in the CLI crate.
@@ -25,8 +25,16 @@ use serde_json::{Map, Value as Json};
 use std::collections::{BTreeMap, BTreeSet};
 use toml::Value as Toml;
 
-/// The adapter id this module implements.
+/// The adapter id of the Claude settings merge.
 pub const ADAPTER: &str = "claude-settings/v1";
+/// The adapter id of the Codex hooks merge. `~/.codex/hooks.json` has the shape of the `hooks`
+/// object of the Claude settings, so the same merge serves it with handlers only.
+pub const CODEX_HOOKS: &str = "codex-hooks/v1";
+
+/// Whether `adapter` is a co-owned merge this module implements.
+pub fn is_merge(adapter: &str) -> bool {
+    matches!(adapter, ADAPTER | CODEX_HOOKS)
+}
 /// The mode of the published file. A live file open to group or others is refused.
 pub const MODE: u32 = 0o600;
 
@@ -229,7 +237,7 @@ fn handler(id: &str, v: &Toml) -> Result<Handler, Refusal> {
     let (event, kind) = (text("event")?, text("type")?);
     if kind != "command" {
         return Err(invalid(format!(
-            "{at}.type is `{kind}`; claude-settings/v1 builds only `command` hooks. Fix: use type = \"command\", or add the hook by hand (the manager cannot reverse any other hook type safely)"
+            "{at}.type is `{kind}`; a merge handler builds only `command` hooks. Fix: use type = \"command\", or add the hook by hand (the manager cannot reverse any other hook type safely)"
         )));
     }
     let argv: Vec<&str> = t
@@ -304,21 +312,21 @@ fn managed_keys_usable(m: &Map<String, Json>, at: &str) -> Result<(), Refusal> {
 }
 
 impl Desired {
-    /// Converts the resolved resource value. `managed` is required. `hooks` is reserved for
-    /// handlers, so a managed or seed key named `hooks` is refused.
+    /// Converts the resolved resource value. Every section is optional here; the registry schema
+    /// of each adapter says which it requires. `hooks` is reserved for handlers, so a managed or
+    /// seed key named `hooks` is refused.
     pub fn from_value(value: &Toml) -> Result<Desired, Refusal> {
         let root = value
             .as_table()
             .ok_or_else(|| invalid("the claude-settings value must be a table"))?;
-        let section = |name: &str, required: bool| -> Result<Map<String, Json>, Refusal> {
+        let section = |name: &str| -> Result<Map<String, Json>, Refusal> {
             match root.get(name) {
                 Some(Toml::Table(t)) => table(t, name),
                 Some(_) => Err(invalid(format!("{name} must be a table"))),
-                None if required => Err(invalid(format!("{name} is required"))),
                 None => Ok(Map::new()),
             }
         };
-        let (managed, seed) = (section("managed", true)?, section("seed", false)?);
+        let (managed, seed) = (section("managed")?, section("seed")?);
         managed_keys_usable(&managed, "managed")?;
         for (name, m) in [("managed", &managed), ("seed", &seed)] {
             if m.contains_key("hooks") {
