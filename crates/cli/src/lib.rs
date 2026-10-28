@@ -59,6 +59,7 @@ usage:
   dfm self-update [--source <checkout>] [--commit <sha>]
   dfm self-check --build-controls <staged tree>
   dfm self-check --fixture-dir <dir>
+  dfm self-check --state-home <home>
 
 bind records the profile and machine identity once, with the checkout root: --root, else the
 nearest directory above the profile that holds .git. Every command that reads sources takes
@@ -500,20 +501,25 @@ fn dispatch(args: &[String], out: &mut dyn Write) -> Result<(), Refusal> {
             self_update_cmd::run(&context(home)?, &args, out)
         }
         "self-check" => {
-            let [controls, fixture] = flags(rest, ["--build-controls", "--fixture-dir"])?;
-            match (controls, fixture) {
-                (Some(tree), None) => {
+            let [controls, fixture, state] =
+                flags(rest, ["--build-controls", "--fixture-dir", "--state-home"])?;
+            match (controls, fixture, state) {
+                (Some(tree), None, None) => {
                     let ctx = context(home)?;
                     header(out, &ctx).map_err(w)?;
                     check_build_controls(&ctx.platform, Path::new(&tree))?;
                     writeln!(out, "build controls ok").map_err(w)
                 }
-                (None, Some(dir)) => {
+                (None, Some(dir), None) => {
                     fixture_check(Path::new(&dir))?;
                     writeln!(out, "self-check ok").map_err(w)
                 }
+                (None, None, Some(home)) => {
+                    let note = state_check(PathBuf::from(home))?;
+                    writeln!(out, "self-check ok{note}").map_err(w)
+                }
                 _ => Err(usage(
-                    "self-check needs exactly one of --build-controls or --fixture-dir",
+                    "self-check needs exactly one of --build-controls, --fixture-dir or --state-home",
                 )),
             }
         }
@@ -1025,6 +1031,48 @@ fn upgrade_binding(
 /// rename (which never replaces an existing file), all relative to the verified directory.
 fn publish(dir: &Dir, name: &str, b: &Binding) -> Result<bool, Refusal> {
     dir.publish_new(name, b.to_toml().as_bytes(), &Fail::none(), "binding")
+}
+
+/// `self-check --state-home`: the state under `home` must parse with this binary, read-only and
+/// without the lock. Only a newer, unsupported or unparsable document fails: a new binary that
+/// refuses it must not become current. Open journal entries are not a failure, and neither is a
+/// refusal that does not depend on the binary (storage or identity); the note names it.
+fn state_check(home: PathBuf) -> Result<String, Refusal> {
+    let platform = canonical_home(Platform::with_home(home))?;
+    let layout = Layout {
+        home: platform.home().to_path_buf(),
+        config_dir: platform.config_dir(),
+        state_root: platform.state_dir(),
+        lock_file: platform.lock_path(),
+        data_dir: platform.data_dir(),
+        cache_dir: platform.cache_dir(),
+    };
+    let uid = dfm_platform_macos::current_uid()
+        .ok_or_else(|| Refusal::new(Code::StorageInvalid, "cannot read the user id"))?;
+    let read = Store::open_read(Sys { uid }, &layout, Fail::none()).and_then(|s| match s {
+        Some(s) => {
+            s.read_state()?;
+            s.read_ledger_lenient()?;
+            s.read_journal_lenient().map(|_| "")
+        }
+        None => Ok(": no state"),
+    });
+    match read {
+        Ok(note) => Ok(note.to_string()),
+        Err(e)
+            if matches!(
+                e.code,
+                Code::StateNewer | Code::SchemaUnsupported | Code::StateInvalid
+            ) =>
+        {
+            Err(e)
+        }
+        Err(e) => Ok(format!(
+            ": state not checked: {} {}",
+            e.code.as_str(),
+            e.detail
+        )),
+    }
 }
 
 /// `self-check --fixture-dir`: reads only that directory and makes no network call.
