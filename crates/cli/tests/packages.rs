@@ -793,6 +793,26 @@ fn an_installed_package_with_an_unresolved_install_stays_blocked_until_resolved(
         let fx = Fx::new();
         fx.installed("brew", if provider == "brew" { "" } else { "atuin 1\n" });
         fx.installed("mise", if provider == "mise" { "" } else { "duckdb 1\n" });
+        let installs = || fx.log().lines().filter(|l| l.contains(" install ")).count();
+        // A failure before the effect is journaled as failed, and the provider never ran.
+        let o = fx
+            .cmd(&[
+                "packages",
+                "--root",
+                fx.root_arg(),
+                "--yes-plan",
+                &digest_of(&fx.preview()),
+            ])
+            .env("DFM_FAILPOINT", "apply-before-effect:error")
+            .output()
+            .unwrap();
+        assert_eq!(code(&o), 1, "{}\n{}", stderr(&o), text(&o.stdout));
+        let all = format!("{}{}", stderr(&o), text(&o.stdout));
+        assert!(
+            all.contains("injected failure at apply-before-effect"),
+            "{all}"
+        );
+        assert_eq!(installs(), 0);
         let d = digest_of(&fx.preview());
         // The provider finished, but the manager never recorded the outcome.
         let crash = fx
@@ -812,7 +832,6 @@ fn an_installed_package_with_an_unresolved_install_stays_blocked_until_resolved(
         .unwrap();
         assert_eq!(intent["phase"], "intent");
         let id = intent["op_id"].as_str().unwrap();
-        let installs = || fx.log().lines().filter(|l| l.contains(" install ")).count();
         assert_eq!(installs(), 1);
         let d = digest_of(&fx.preview());
         for _ in 0..2 {
@@ -842,6 +861,40 @@ fn an_installed_package_with_an_unresolved_install_stays_blocked_until_resolved(
         assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
         assert!(text(&o.stdout).contains("nothing to change: no approval needed"));
     }
+}
+
+#[test]
+fn a_receipt_write_failure_after_the_install_does_not_install_again() {
+    let fx = Fx::new();
+    fx.installed("brew", "");
+    fx.installed("mise", "duckdb 1\n");
+    let installs = || fx.log().lines().filter(|l| l.contains(" install ")).count();
+    let o = fx
+        .cmd(&[
+            "packages",
+            "--root",
+            fx.root_arg(),
+            "--yes-plan",
+            &digest_of(&fx.preview()),
+        ])
+        .env("DFM_FAILPOINT", "receipt-after-tmp:error")
+        .output()
+        .unwrap();
+    assert_eq!(code(&o), 1, "{}\n{}", stderr(&o), text(&o.stdout));
+    let all = format!("{}{}", stderr(&o), text(&o.stdout));
+    assert!(
+        all.contains("injected failure at receipt-after-tmp"),
+        "{all}"
+    );
+    assert_eq!(installs(), 1);
+    let o = fx.packages(&digest_of(&fx.preview()));
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+    assert!(text(&o.stdout).contains(&format!("current {BREW_OP}")));
+    assert_eq!(
+        installs(),
+        1,
+        "a lost receipt must not reinstall the package"
+    );
 }
 
 #[test]
