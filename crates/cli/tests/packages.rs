@@ -314,7 +314,27 @@ fn a_configuration_plan_lists_packages_out_of_scope_and_starts_no_provider() {
         "doctor started a provider: {}",
         fx.log()
     );
-    assert!(!fx.home.path().join(".cache/dotfiles-manager/run").exists());
+    let run = fx.home.path().join(".cache/dotfiles-manager/run");
+    assert!(!run.exists());
+    // A runner directory with another mode is left as it is, and no provider starts.
+    fs::create_dir_all(&run).unwrap();
+    fs::set_permissions(&run, fs::Permissions::from_mode(0o755)).unwrap();
+    let o = fx.run(&["doctor", "--root", fx.root_arg()]);
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+    assert!(
+        text(&o.stdout).contains("UNKNOWN E_PROBE_FAILED resource"),
+        "{}",
+        text(&o.stdout)
+    );
+    assert!(
+        !fx.provider_ran(),
+        "doctor started a provider: {}",
+        fx.log()
+    );
+    assert_eq!(
+        fs::metadata(&run).unwrap().permissions().mode() & 0o7777,
+        0o755
+    );
 }
 
 /// The JSON row of `resource` in `doctor --json` run with `PATH`, and the document.

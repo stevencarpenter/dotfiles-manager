@@ -185,7 +185,8 @@ impl Runner {
     }
 
     /// The child's working directory: created with mode 0700 when missing; an existing one must
-    /// be a real directory (not a link) owned by the current user, and is set to 0700 again.
+    /// be a real directory (not a link) owned by the current user, and is set to 0700 again unless
+    /// it already has that mode (so a run over a 0700 directory writes nothing).
     fn ensure_cwd(&self) -> Result<(), Refusal> {
         let e = |e: std::io::Error| refused(format!("{}: {}", self.cwd.display(), e.kind()));
         match std::fs::symlink_metadata(&self.cwd) {
@@ -205,6 +206,7 @@ impl Runner {
                     self.cwd.display()
                 )));
             }
+            Ok(m) if m.mode() & 0o7777 == 0o700 => return Ok(()),
             Ok(_) => {}
         }
         std::fs::set_permissions(&self.cwd, std::fs::Permissions::from_mode(0o700)).map_err(e)

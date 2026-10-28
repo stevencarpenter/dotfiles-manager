@@ -822,10 +822,13 @@ fn profile_rows(
     }
     // The read-only probes of `packages` and `services`; neither installs, loads or starts.
     // Only a stop request fails one, and then its resources keep the fallback row. The runner
-    // creates its working directory on first use, and doctor creates nothing, so without that
-    // directory no provider starts and each package and service is unknown.
+    // creates its working directory on first use and resets its mode, and doctor writes nothing,
+    // so unless that directory already exists with mode 0700 no provider starts and each package
+    // and service is unknown.
     let runner = ctx.runner(sys);
-    let (packages, services) = if runner.cwd.is_dir() {
+    let private = std::fs::symlink_metadata(&runner.cwd)
+        .is_ok_and(|m| m.is_dir() && m.permissions().mode() & 0o7777 == 0o700);
+    let (packages, services) = if private {
         let packages = crate::adapters::package::package_facts(res, &runner).unwrap_or_else(|r| {
             rows.push(refusal_row("resource", "package probes", &r));
             BTreeMap::new()
@@ -838,7 +841,7 @@ fn profile_rows(
         (packages, services)
     } else {
         let why = format!(
-            "the provider working directory {} does not exist yet, and doctor creates nothing",
+            "the provider working directory {} does not exist yet or is not mode 0700, and doctor changes nothing",
             runner.cwd.display()
         );
         let of = |s: Scope| res.resources.values().filter(move |r| s.covers(r));
