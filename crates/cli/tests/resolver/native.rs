@@ -41,6 +41,8 @@ fn a_fragment_shows_its_position_condition_siblings_and_the_rule() {
     ] {
         assert!(out.contains(line), "missing {line:?} in:\n{out}");
     }
+    // DFM-20.C03: an invariant the manager cannot validate natively is reported as such.
+    assert!(out.contains("cannot enforce a protected setting"), "{out}");
     // The shared value names the other fragment and its position.
     let editor = block(&out, "/core/editor = \"ed\"");
     assert!(
