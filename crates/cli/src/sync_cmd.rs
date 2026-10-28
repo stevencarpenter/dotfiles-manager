@@ -2094,9 +2094,13 @@ fn run_inner(
             "a source moved since the reviewed run: the commits to publish are not the ones shown with this digest. Fix: read the new plan with --preview and approve its digest",
         ));
     }
+    let fail = state_cmd::fail_from_env()?;
     let mut published = Vec::new();
     for s in &staged {
-        match publish(&git, s) {
+        match fail
+            .hit(&format!("sync-before-publish-{}", s.src.id))
+            .and_then(|()| publish(&git, s))
+        {
             Ok(changed) => {
                 writeln!(out, "published: {} {}", s.src.id, s.change()).map_err(w)?;
                 if changed {
@@ -2130,7 +2134,6 @@ fn run_inner(
     // The approved operations of the scopes that ran, by folded path: a later scope is checked
     // against their effects.
     let mut done = BTreeMap::new();
-    let fail = state_cmd::fail_from_env()?;
     for p in &locked {
         // A stop request between two scopes ends the run: no later scope starts.
         if failure.is_none()

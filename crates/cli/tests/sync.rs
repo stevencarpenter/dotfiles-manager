@@ -1039,6 +1039,56 @@ fn an_exact_nested_pin_stays_exact_while_the_root_tracks() {
 }
 
 #[test]
+fn a_failed_second_publication_names_the_first_and_runs_no_scope() {
+    let fx = Fx::new();
+    let (ext, pin) = fx.add_ext();
+    let root_new = fx.upstream.head();
+    fx.trust(&ext.origin());
+    let p = fx.preview();
+    assert_eq!(code(&p), 0, "{}\n{}", stdout(&p), stderr(&p));
+    let o = Command::new(BIN)
+        .env_clear()
+        .env("DFM_PROVIDER_PATH", "/usr/bin:/bin")
+        .env("DFM_FAILPOINT", "sync-before-publish-src1:error")
+        .arg("--home")
+        .arg(fx.home.path())
+        .args([
+            "sync",
+            "--root",
+            fx.root_arg(),
+            "--yes-plan",
+            &digest_of(&p),
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(code(&o), 1, "{}\n{}", stdout(&o), stderr(&o));
+    assert!(
+        stdout(&o).contains("sync: published src0; src1 was not published; no scope was run"),
+        "{}",
+        stdout(&o)
+    );
+    assert_eq!(fx.head(), root_new);
+    assert!(!fx.root.join("base/ext").exists());
+    assert!(!fx.h(".config/work/profile").exists());
+    assert_eq!(fx.receipts(), 0);
+    // The next run publishes only the missing source, once, and then runs the scopes.
+    let o = fx.sync_approved();
+    assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
+    let s = stdout(&o);
+    assert!(
+        s.contains(&format!("published: src0 current at {root_new}")),
+        "{s}"
+    );
+    assert_eq!(s.matches("published: src1 new checkout").count(), 1, "{s}");
+    assert_eq!(git(&fx.root.join("base/ext"), &["rev-parse", "HEAD"]), pin);
+    assert_eq!(
+        fs::read_to_string(fx.h(".config/work/profile")).unwrap(),
+        "work=1\n"
+    );
+    assert_eq!(fx.receipts(), 1);
+}
+
+#[test]
 fn a_pin_the_fetched_ref_does_not_hold_is_refused_without_substitution() {
     let fx = Fx::new();
     let (ext, _pin) = fx.add_ext();
