@@ -337,8 +337,16 @@ fn a_configuration_plan_lists_services_out_of_scope_and_starts_no_launcher() {
         t.contains("service is lifecycle, outside a config plan"),
         "{t}"
     );
+    // No provider has run, so the runner's working directory does not exist. Doctor creates
+    // nothing: it asks no launcher and reports each service unknown.
     let o = fx.run(&["doctor", "--root", fx.root_arg()]);
     assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+    assert!(
+        text(&o.stdout).contains("does not exist yet"),
+        "{}",
+        text(&o.stdout)
+    );
+    assert!(!fx.launcher_ran(), "{}", fx.log());
     // The other scopes do not act on a service either, and none of them asks a launcher.
     fx.mark("brew-sketchybar", "none\n");
     let o = fx.run(&["packages", "--root", fx.root_arg(), "--preview"]);
@@ -360,6 +368,31 @@ fn a_configuration_plan_lists_services_out_of_scope_and_starts_no_launcher() {
     );
     assert_eq!(code(&fx.preview(&["--restart"])), 2);
     assert!(!fx.launcher_ran() || !fx.log().contains("launchctl"));
+    // Once the directory exists, doctor asks the launchers with their read-only reports and
+    // starts nothing: an installed formula that is not loaded is a pending start.
+    fx.mark("brew-sketchybar", "none\n");
+    fx.unmark("log");
+    let o = fx.run(&["doctor", "--root", fx.root_arg(), "--json"]);
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+    let log = fx.log();
+    assert!(log.contains("brew services info sketchybar"), "{log}");
+    assert!(
+        !log.contains("bootstrap") && !log.contains(" start"),
+        "{log}"
+    );
+    let v: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
+    let row = v["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["subject"] == "extra.sketchybar")
+        .unwrap_or_else(|| panic!("{v:#}"));
+    assert_eq!(row["status"], "WARN", "{row}");
+    assert_eq!(row["code"], "D_PLAN_PENDING", "{row}");
+    assert!(
+        row["detail"].as_str().unwrap().contains("brew-service/v1"),
+        "{row}"
+    );
 }
 
 #[test]

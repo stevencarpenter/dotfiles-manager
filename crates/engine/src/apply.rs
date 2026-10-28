@@ -382,7 +382,7 @@ fn first_refusal(plan: &Plan, generator: &dyn Generator) -> Result<(), Refusal> 
             return Err(Refusal::new(
                 Code::SensitiveUnsupported,
                 format!(
-                    "{}: this sensitive output is not published or removed by this build (only the claude-settings/v1 merge and an op-template/v1 secret are)",
+                    "{}: this sensitive output is not published or removed by this build (only a co-owned merge and an op-template/v1 secret are)",
                     op.id
                 ),
             ));
@@ -1130,11 +1130,14 @@ impl Exec<'_, '_> {
                 format!("{rel} appeared before it could be created; it is left alone"),
             )),
             (Ok(Live::File { bytes, mode, stamp }), _) => {
-                if mode & 0o077 != 0 {
+                // The adapter's own mode: 0600 for every sensitive output except the oMLX
+                // model settings, which the application writes with 0644.
+                let allowed = dfm_model::merge::mode_for(&op.adapter);
+                if mode & 0o077 & !allowed != 0 {
                     return Err(blocked(
                         Code::Conflict,
                         format!(
-                            "{rel} is mode {mode:o}, open to group or others, and can hold credentials. Fix: run chmod 600 on it; nothing was changed"
+                            "{rel} is mode {mode:o}, open to group or others beyond {allowed:o}, and can hold credentials. Fix: run chmod {allowed:o} on it; nothing was changed"
                         ),
                     ));
                 }
@@ -1285,7 +1288,7 @@ impl Exec<'_, '_> {
                 read,
                 &merged.bytes,
                 merged.changed,
-                dfm_model::merge::MODE,
+                dfm_model::merge::mode_for(&op.adapter),
             )
         });
         if let Err(e) = effect {
@@ -1306,7 +1309,7 @@ impl Exec<'_, '_> {
                         appended: merged.appended.clone(),
                         leaves,
                     },
-                    dfm_model::merge::MODE,
+                    dfm_model::merge::mode_for(&op.adapter),
                 ),
             });
         if let Err(e) = settled {

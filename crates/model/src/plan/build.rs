@@ -1022,7 +1022,7 @@ impl Planner<'_> {
         Ok(())
     }
 
-    /// A co-owned merge file (`claude-settings/v1`). The manager never owns the whole file, so
+    /// A co-owned merge file (`merge::is_merge`). The manager never owns the whole file, so
     /// the ledger fingerprint does not decide: the caller's verdict does. It read the live file
     /// and compared only the managed fields with the salted hash in the ledger. No live content
     /// reaches the plan, only the declared values' digest, the setting names and the verdict.
@@ -1034,6 +1034,7 @@ impl Planner<'_> {
         op: &mut Operation,
     ) -> Result<Decision, Fail> {
         let conflict = |what: String, fix: &'static str| fail(Code::Conflict, "target", what, fix);
+        let allowed = crate::merge::mode_for(&r.adapter);
         match &seen.node {
             Node::Unknown { reason } => return Err(unknown_fail("target", path, reason)),
             Node::Dir { .. } => {
@@ -1053,12 +1054,16 @@ impl Planner<'_> {
             Node::File { own: false, .. } => {
                 return Err(privilege("target", path, "is owned by another user"));
             }
-            Node::File { mode, .. } if mode & 0o077 != 0 => {
-                return Err(conflict(
+            Node::File { mode, .. } if mode & 0o077 & !allowed != 0 => {
+                return Err(fail(
+                    Code::Conflict,
+                    "target",
                     format!(
-                        "{path} is mode {mode:o}, open to group or others, and can hold credentials"
+                        "{path} is mode {mode:o}, open to group or others beyond {allowed:o}, and can hold credentials"
                     ),
-                    "run chmod 600 on the file, then plan again; the manager does not change a mode it did not set",
+                    format!(
+                        "run chmod {allowed:o} on the file, then plan again; the manager does not change a mode it did not set"
+                    ),
                 ));
             }
             _ => {}
@@ -1068,7 +1073,7 @@ impl Planner<'_> {
             op.managed_sha256 = Some(f.managed_sha256.clone());
             op.sets = f.sets.clone();
         }
-        op.mode = Some(0o600);
+        op.mode = Some(allowed);
         let what = fact.map_or_else(String::new, |f| {
             format!(
                 ": {} setting(s), {} handler(s); live content is not shown",
@@ -1112,7 +1117,7 @@ impl Planner<'_> {
                 Action::CreateFile,
                 Status::Planned,
                 Ownership::Absent,
-                format!("create {shown} by merge, mode 600{what}"),
+                format!("create {shown} by merge, mode {allowed:o}{what}"),
                 post,
             ));
         }
@@ -1686,7 +1691,7 @@ impl Planner<'_> {
             op.action = Action::Retire;
             op.status = Status::Planned;
             op.ownership = Ownership::Owned;
-            op.mode = Some(0o600);
+            op.mode = Some(crate::merge::mode_for(&o.adapter));
             op.effect = format!(
                 "retire {n} owned handler(s) and remove {items} appended array item(s) in {path} (sensitive: destination and mode only); the file, its managed and seeded values and all foreign entries and array items stay"
             );

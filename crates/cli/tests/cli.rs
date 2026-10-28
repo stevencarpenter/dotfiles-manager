@@ -540,13 +540,19 @@ fn a_binding_that_is_a_symlink_or_not_private_is_refused() {
     fs::set_permissions(&elsewhere, fs::Permissions::from_mode(0o600)).unwrap();
     fs::remove_file(&file).unwrap();
     std::os::unix::fs::symlink(&elsewhere, &file).unwrap();
-    let o = run(home.path(), &["binding"]);
-    assert_eq!(o.status.code(), Some(3));
-    assert!(
-        text(&o.stderr).contains("E_BINDING_INVALID"),
-        "{}",
-        text(&o.stderr)
-    );
+    for args in [
+        vec!["binding"],
+        vec!["bind", "--profile", &p, "--machine-id", "m3"],
+    ] {
+        let o = run(home.path(), &args);
+        assert_eq!(o.status.code(), Some(3), "{args:?}");
+        assert!(
+            text(&o.stderr).contains("E_BINDING_INVALID"),
+            "{args:?}: {}",
+            text(&o.stderr)
+        );
+    }
+    assert_eq!(fs::read(&elsewhere).unwrap(), good);
 }
 
 #[test]

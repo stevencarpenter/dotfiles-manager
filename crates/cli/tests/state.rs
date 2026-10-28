@@ -2175,3 +2175,69 @@ fn state_check_refuses_a_lock_file_the_writer_would_refuse() {
     fs::remove_file(&twin).unwrap();
     assert_eq!(check(h.path()).status.code(), Some(0));
 }
+
+// ---- DFM-19.C04: the pre-flip state check of a new binary ------------------------------------
+
+#[test]
+fn the_state_check_fails_only_on_state_this_binary_cannot_read() {
+    let h = bound_home("state-check");
+    let home = h.path().to_str().unwrap();
+    let check = || run(h.path(), &["self-check", "--state-home", home]);
+    let o = check();
+    assert_eq!(o.status.code(), Some(0), "{}", text(&o.stderr));
+    assert_eq!(text(&o.stdout), "self-check ok\n");
+    // An interrupted operation leaves an open journal entry; that is recovery work, not a failure.
+    let out = out_file(h.path(), "open");
+    let o = with_fail(
+        h.path(),
+        "after-intent:abort",
+        &[
+            "__record-op",
+            "--resource",
+            "core.open",
+            "--output",
+            &out,
+            "--content",
+            "o",
+        ],
+    );
+    assert_eq!(o.status.signal(), Some(6));
+    let o = check();
+    assert_eq!(o.status.code(), Some(0), "{}", text(&o.stderr));
+    let ledger = state(h.path()).join("ledger.json");
+    let good = fs::read(&ledger).unwrap();
+    for (bytes, code) in [
+        (&b"{\"schema\":0}"[..], "E_SCHEMA_UNSUPPORTED"),
+        (b"{\"schema\":99}", "E_STATE_NEWER"),
+        (b"{\"schema\":", "E_STATE_INVALID"),
+    ] {
+        fs::write(&ledger, bytes).unwrap();
+        let o = check();
+        assert_eq!(o.status.code(), Some(3), "{code}: {}", text(&o.stderr));
+        assert!(text(&o.stderr).contains(code), "{}", text(&o.stderr));
+        assert_eq!(
+            fs::read(&ledger).unwrap(),
+            bytes,
+            "the check rewrote the ledger"
+        );
+    }
+    fs::write(&ledger, &good).unwrap();
+    // A refusal that does not depend on the binary is named, not a failure.
+    let st = state(h.path());
+    fs::set_permissions(&st, fs::Permissions::from_mode(0o770)).unwrap();
+    let o = check();
+    fs::set_permissions(&st, fs::Permissions::from_mode(0o700)).unwrap();
+    assert_eq!(o.status.code(), Some(0), "{}", text(&o.stderr));
+    assert!(
+        text(&o.stdout).starts_with("self-check ok: state not checked: E_"),
+        "{}",
+        text(&o.stdout)
+    );
+    let empty = TempDir::new("state-check-empty");
+    let o = run(
+        empty.path(),
+        &["self-check", "--state-home", empty.path().to_str().unwrap()],
+    );
+    assert_eq!(o.status.code(), Some(0), "{}", text(&o.stderr));
+    assert_eq!(text(&o.stdout), "self-check ok: no state\n");
+}

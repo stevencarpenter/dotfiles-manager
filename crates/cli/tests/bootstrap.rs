@@ -1099,6 +1099,48 @@ fn a_new_binary_that_cannot_read_the_existing_binding_does_not_become_current() 
 
 #[test]
 #[ignore = "needs crates.io"]
+fn a_new_binary_that_cannot_read_the_existing_state_does_not_become_current() {
+    let p = prepare("state-gate");
+    let profile = repo_root().join("examples/profiles/personal-dev-01.toml");
+    let o = Command::new(env!("CARGO_BIN_EXE_dfm"))
+        .env_clear()
+        .arg("--home")
+        .arg(&p.home)
+        .args(["bind", "--profile", profile.to_str().unwrap()])
+        .args([
+            "--machine-id",
+            "m5",
+            "--root",
+            repo_root().to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(o.status.code(), Some(0), "{}", err(&o));
+    // State the new binary reads lets it go live.
+    let o = install(&p, &p.sha, &[]);
+    assert_eq!(o.status.code(), Some(0), "{}", err(&o));
+    let live = fs::read_link(p.data.join("current")).unwrap();
+    // A ledger schema no binary supports: the new binary refuses it, so it must not go live.
+    let ledger = p
+        .home
+        .join(".local/state/dotfiles-manager/state/ledger.json");
+    fs::write(&ledger, "{\"schema\":0}").unwrap();
+    let second = next_commit(&p, "state gate");
+    let o = install(&p, &second, &[]);
+    assert_eq!(
+        o.status.code(),
+        Some(1),
+        "{}\n{}",
+        String::from_utf8_lossy(&o.stdout),
+        err(&o)
+    );
+    assert!(err(&o).contains("E_SCHEMA_UNSUPPORTED"), "{}", err(&o));
+    assert_eq!(fs::read_link(p.data.join("current")).unwrap(), live);
+    assert_eq!(fs::read_to_string(&ledger).unwrap(), "{\"schema\":0}");
+}
+
+#[test]
+#[ignore = "needs crates.io"]
 fn the_command_path_and_current_are_checked_again_just_before_the_swap() {
     let p = prepare("swap-recheck");
     // Runs after the build and before the swap; the real race is another process doing this.

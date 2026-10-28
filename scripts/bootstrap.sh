@@ -783,6 +783,8 @@ cmd_install() {
     cp -p "$HOME_DIR/.config/dotfiles-manager/machine.toml" "$build/fixture/machine.toml"
   fi
   tcrun "$bin" self-check --fixture-dir "$build/fixture" >/dev/null || { echo "error: self-check failed" >&2; exit 1; }
+  # It must also read the existing state; no state passes, and open journal entries do not fail it.
+  tcrun "$bin" self-check --state-home "$HOME_DIR" >/dev/null || { echo "error: state self-check failed" >&2; exit 1; }
   ver=$(tcrun "$bin" --version) || { echo "error: the built binary did not run" >&2; exit 1; }
   case $ver in "dfm "*" (commit $commit)") ;; *) echo "error: the built binary reports a different identity: $ver" >&2; exit 1 ;; esac
   semver=${ver#dfm }; semver=${semver%% *}

@@ -651,7 +651,7 @@ fn a_checkout_ahead_of_its_ref_is_current_and_applies_as_it_is() {
     let current = format!("current at {mine} (ahead of {upstream})");
     assert!(
         stdout(&p).contains(&format!(
-            "source: src0 {} refs/heads/main {current} (tracking)",
+            "source: src0 {} refs/heads/main {current} (tracking; checkout on refs/heads/topic)",
             fx.origin()
         )),
         "{}",
@@ -671,6 +671,13 @@ fn a_checkout_ahead_of_its_ref_is_current_and_applies_as_it_is() {
     assert_eq!(
         fs::read_to_string(fx.h(".zshrc")).unwrap(),
         "export A=local\n"
+    );
+    git(&fx.root, &["checkout", "-q", "--detach"]);
+    let p = fx.preview();
+    assert!(
+        stdout(&p).contains(&format!("{current} (tracking; detached)")),
+        "{}",
+        stdout(&p)
     );
 }
 
@@ -1029,6 +1036,56 @@ fn an_exact_nested_pin_stays_exact_while_the_root_tracks() {
         fs::read_to_string(fx.h(".config/work/profile")).unwrap(),
         "work=local\n"
     );
+}
+
+#[test]
+fn a_failed_second_publication_names_the_first_and_runs_no_scope() {
+    let fx = Fx::new();
+    let (ext, pin) = fx.add_ext();
+    let root_new = fx.upstream.head();
+    fx.trust(&ext.origin());
+    let p = fx.preview();
+    assert_eq!(code(&p), 0, "{}\n{}", stdout(&p), stderr(&p));
+    let o = Command::new(BIN)
+        .env_clear()
+        .env("DFM_PROVIDER_PATH", "/usr/bin:/bin")
+        .env("DFM_FAILPOINT", "sync-before-publish-src1:error")
+        .arg("--home")
+        .arg(fx.home.path())
+        .args([
+            "sync",
+            "--root",
+            fx.root_arg(),
+            "--yes-plan",
+            &digest_of(&p),
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(code(&o), 1, "{}\n{}", stdout(&o), stderr(&o));
+    assert!(
+        stdout(&o).contains("sync: published src0; src1 was not published; no scope was run"),
+        "{}",
+        stdout(&o)
+    );
+    assert_eq!(fx.head(), root_new);
+    assert!(!fx.root.join("base/ext").exists());
+    assert!(!fx.h(".config/work/profile").exists());
+    assert_eq!(fx.receipts(), 0);
+    // The next run publishes only the missing source, once, and then runs the scopes.
+    let o = fx.sync_approved();
+    assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
+    let s = stdout(&o);
+    assert!(
+        s.contains(&format!("published: src0 current at {root_new}")),
+        "{s}"
+    );
+    assert_eq!(s.matches("published: src1 new checkout").count(), 1, "{s}");
+    assert_eq!(git(&fx.root.join("base/ext"), &["rev-parse", "HEAD"]), pin);
+    assert_eq!(
+        fs::read_to_string(fx.h(".config/work/profile")).unwrap(),
+        "work=1\n"
+    );
+    assert_eq!(fx.receipts(), 1);
 }
 
 #[test]
@@ -3854,7 +3911,9 @@ esac
     )
 }
 
-/// `brew` for the upgrade step: nothing outdated, and `list` finds nothing.
+/// `brew` for the upgrade step: nothing outdated unless a marker says so, and `list` prints the
+/// `list-<name>` marker. With `outdated-codex`, the cask codex is outdated and its upgrade
+/// writes `codex 0.165.0` to `list-codex`; any other upgrade hangs.
 const UPGRADE_BREW: &str = r#"#!/bin/sh
 PATH=/usr/bin:/bin
 here=$(dirname "$0")
@@ -3864,11 +3923,17 @@ case "$1" in
   outdated)
     if [ -e "$here/../st/outdated-uv" ]; then
       echo '{"formulae":[{"name":"uv","installed_versions":["0.1"],"current_version":"0.2"}],"casks":[]}'
+    elif [ -e "$here/../st/outdated-codex" ]; then
+      echo '{"formulae":[],"casks":[{"name":"codex","installed_versions":["0.164.0"],"current_version":"0.165.0"}]}'
     else
       echo '{"formulae":[],"casks":[]}'
     fi ;;
-  upgrade) touch "$here/../st/started-brew"; exec sleep 30 ;;
-  list) exit 1 ;;
+  upgrade)
+    if [ -e "$here/../st/outdated-codex" ]; then
+      rm "$here/../st/outdated-codex"; echo 'codex 0.165.0' > "$here/../st/list-codex"; exit 0
+    fi
+    touch "$here/../st/started-brew"; exec sleep 30 ;;
+  list) [ -n "$4" ] && [ -f "$here/../st/list-$4" ] && cat "$here/../st/list-$4" || exit 1 ;;
   *) exit 64 ;;
 esac
 "#;
@@ -3976,6 +4041,28 @@ fn sync_runs_the_declared_updaters_in_order() {
     );
     assert!(s.contains("  current brew"), "{s}");
     assert!(s.contains("  upgrade: updated=1 current=1"), "{s}");
+    // The updaters are listed before publication and the scopes, then run after them.
+    let listed = s.find("  claude: would run claude update").expect(&s);
+    let published = s.find("\npublished:").expect(&s);
+    assert!(listed < published, "{s}");
+    assert!(published < s.find("  updated claude").expect(&s), "{s}");
+}
+
+#[test]
+fn a_second_copy_shows_the_version_brew_left() {
+    // codex runs before brew; the note is read after both.
+    let u = Up::new(r#"["codex", "brew"]"#);
+    fs::write(u.st("list-codex"), "codex 0.164.0\n").unwrap();
+    fs::write(u.st("outdated-codex"), "").unwrap();
+    let o = u.sync(&[]);
+    assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
+    let s = stdout(&o);
+    assert!(s.contains("  updated brew"), "{s}");
+    assert!(
+        s.contains("  note: codex second copy: Homebrew cask codex 0.165.0"),
+        "{s}"
+    );
+    assert!(!s.contains("Homebrew cask codex 0.164.0"), "{s}");
 }
 
 #[test]
@@ -4053,6 +4140,26 @@ fn a_refused_sync_runs_no_updater() {
     let o = u.sync(&[]);
     assert_ne!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
     assert_eq!(u.log(), "");
+}
+
+#[test]
+fn a_stale_digest_runs_no_updater() {
+    let u = Up::new(r#"["claude"]"#);
+    let o = u.sync(&["--yes-plan", &"0".repeat(64)]);
+    assert_eq!(code(&o), 3, "{}\n{}", stdout(&o), stderr(&o));
+    assert!(stderr(&o).contains("E_PLAN_STALE"), "{}", stderr(&o));
+    assert_eq!(u.log(), "");
+    assert!(u.upgrade_receipts().is_empty());
+}
+
+#[test]
+fn a_grant_without_a_digest_runs_no_updater() {
+    let u = Up::new(r#"["claude"]"#);
+    let o = u.sync(&["--trust-origin", &u.fx.origin()]);
+    assert_eq!(code(&o), 3, "{}\n{}", stdout(&o), stderr(&o));
+    assert!(stderr(&o).contains("E_APPROVAL_REQUIRED"), "{}", stderr(&o));
+    assert_eq!(u.log(), "");
+    assert!(u.upgrade_receipts().is_empty());
 }
 
 #[test]

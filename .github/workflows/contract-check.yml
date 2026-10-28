@@ -120,7 +120,7 @@ jobs:
           - shard: cli-2
             select: -p dfm-cli --features test-isolation --test build_controls --test sync --test planner --test runner --test trial
           - shard: cli-3
-            select: -p dfm-cli --features test-isolation --test merge --test apply --test source_roots --test state --test packages --test services --test resolver --test toolchains --test secrets --test native_config
+            select: -p dfm-cli --features test-isolation --test merge --test codex_hooks --test omlx --test apply --test source_roots --test state --test packages --test services --test resolver --test toolchains --test secrets --test native_config
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -161,6 +161,8 @@ jobs:
             names: the_binding_is_checked_again_just_before_the_swap the_data_directories_are_checked_again_before_the_late_removals the_command_path_and_current_are_checked_again_just_before_the_swap
           - shard: 4
             names: the_command_link_is_staged_before_current_flips upgrade_retries_after_a_stale_current_new_and_rolls_back install_retires_the_old_command_link_and_keeps_a_foreign_one
+          - shard: 5
+            names: a_new_binary_that_cannot_read_the_existing_state_does_not_become_current
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:

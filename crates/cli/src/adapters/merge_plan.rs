@@ -1,4 +1,5 @@
-//! Plan-time facts about the live file of a co-owned merge (docs/adapters.md, `claude-settings/v1`).
+//! Plan-time facts about the live file of a co-owned merge (docs/adapters.md, `claude-settings/v1`
+//! and `codex-hooks/v1`).
 //!
 //! The planner is pure and never reads a sensitive file. This module reads it, read-only, and
 //! gives the planner a verdict and nothing else: the digest of the declared managed values, the
@@ -10,7 +11,7 @@ use dfm_model::merge::{self, Desired};
 use dfm_model::plan::{
     MAX_HASHED_BYTES, MAX_LISTING, MergeFact, MergeVerdict, Owned, in_scope, matches_pattern,
 };
-use dfm_model::resolve::Resolved;
+use dfm_model::resolve::{Resolved, ResolvedResource};
 use dfm_model::state::CoOwned;
 use dfm_model::{Code, Refusal};
 use std::collections::BTreeMap;
@@ -213,7 +214,7 @@ pub fn merge_facts(
     for r in resolved
         .resources
         .values()
-        .filter(|r| in_scope(r) && r.adapter == merge::ADAPTER)
+        .filter(|r| in_scope(r) && merge::is_merge(&r.adapter))
     {
         let [claim] = r.claims.as_slice() else {
             continue;
@@ -290,7 +291,7 @@ pub fn merge_facts(
                     Some(h) => desired.clone().with_home(h),
                     None => desired.clone(),
                 };
-                verdict_for(&r.id, claim, &desired, store, sys, home, home_path)
+                verdict_for(r, claim, &desired, store, sys, home, home_path)
             }
         };
         // Fragments are tracked by a salted content token, so the salt must exist. `bind` creates
@@ -349,8 +350,14 @@ fn known_absent(sys: &Sys, home: &Dir, claim: &str) -> bool {
 }
 
 /// The live bytes of the claimed file (`None` when it or a parent directory is absent), or the
-/// blocked verdict for a target that must not be merged into.
-fn live_bytes(sys: &Sys, home: &Dir, claim: &str) -> Result<Option<Vec<u8>>, MergeVerdict> {
+/// blocked verdict for a target that must not be merged into. `allowed` is the adapter's mode
+/// (`merge::mode_for`): a group or other bit outside it blocks.
+fn live_bytes(
+    sys: &Sys,
+    home: &Dir,
+    claim: &str,
+    allowed: u32,
+) -> Result<Option<Vec<u8>>, MergeVerdict> {
     let comps: Vec<&str> = claim.split('/').collect();
     let Some((name, parents)) = comps.split_last() else {
         return Err(blocked(Code::TargetInvalid, "the target is empty"));
@@ -365,10 +372,10 @@ fn live_bytes(sys: &Sys, home: &Dir, claim: &str) -> Result<Option<Vec<u8>>, Mer
             Code::LimitExceeded,
             &format!("{claim} exceeds 16 MiB"),
         )),
-        Live::File { mode, .. } if mode & 0o077 != 0 => Err(blocked(
+        Live::File { mode, .. } if mode & 0o077 & !allowed != 0 => Err(blocked(
             Code::Conflict,
             &format!(
-                "{claim} is mode {mode:o}, open to group or others, and can hold credentials. Fix: run chmod 600 on it, then plan again"
+                "{claim} is mode {mode:o}, open to group or others beyond {allowed:o}, and can hold credentials. Fix: run chmod {allowed:o} on it, then plan again"
             ),
         )),
         Live::File { bytes, .. } => Ok(Some(bytes)),
@@ -376,7 +383,7 @@ fn live_bytes(sys: &Sys, home: &Dir, claim: &str) -> Result<Option<Vec<u8>>, Mer
 }
 
 fn verdict_for(
-    resource: &str,
+    r: &ResolvedResource,
     claim: &str,
     desired: &Desired,
     store: &Store,
@@ -384,7 +391,7 @@ fn verdict_for(
     home: &Dir,
     home_path: &Path,
 ) -> MergeVerdict {
-    let bytes = match live_bytes(sys, home, claim) {
+    let bytes = match live_bytes(sys, home, claim, merge::mode_for(&r.adapter)) {
         Ok(b) => b,
         Err(v) => return v,
     };
@@ -393,7 +400,7 @@ fn verdict_for(
         Ok(l) => l
             .resources
             .iter()
-            .filter(|x| x.resource == resource)
+            .filter(|x| x.resource == r.id)
             .flat_map(|x| &x.owned_outputs)
             .find(|o| Path::new(&o.path) == abs)
             .and_then(|o| o.coowned.clone()),
@@ -450,7 +457,7 @@ mod tests {
         let got = |parents: &[&str]| read_target(&sys, &home, parents, "settings.json");
         assert!(matches!(got(&["absent"]), Ok(Live::Missing)));
         assert!(got(&["file"]).is_err(), "a file is not a parent directory");
-        let verdict = |claim: &str| live_bytes(&sys, &home, claim);
+        let verdict = |claim: &str| live_bytes(&sys, &home, claim, merge::MODE);
         assert!(matches!(verdict("absent/settings.json"), Ok(None)));
         assert!(matches!(
             verdict("file/settings.json"),

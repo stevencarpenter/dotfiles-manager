@@ -373,6 +373,9 @@ struct Staged {
     /// That head or pin when the checkout already holds it under local commits; `new` is then
     /// the checkout's HEAD, which stays where it is.
     ahead_of: Option<String>,
+    /// The branch the root checkout has out (`refs/heads/...`), `None` when its HEAD is detached
+    /// or the source is nested. Shown on the `source:` line only, not in the digest.
+    branch: Option<String>,
 }
 
 impl Staged {
@@ -837,6 +840,17 @@ fn stage_source(
         // The objects are already in the copy (the fetch above), so the fast-forward is local.
         advance(git, id, &repo_s, old.as_deref(), &new, None)?;
     }
+    let branch = if src.is_root() {
+        let out = git.output(true, &["-C", &repo_s, "symbolic-ref", "-q", "HEAD"])?;
+        match out.end {
+            End::Exited(0) => Some(String::from_utf8_lossy(&out.stdout).trim().to_string()),
+            End::Exited(1) => None,
+            End::Stopped(r) => return Err(r),
+            _ => return Err(untrusted(format!("{id}: git symbolic-ref HEAD failed"))),
+        }
+    } else {
+        None
+    };
     Ok(Staged {
         src: src.clone(),
         repo,
@@ -844,6 +858,7 @@ fn stage_source(
         old,
         new,
         ahead_of,
+        branch,
     })
 }
 
@@ -1943,9 +1958,16 @@ fn run_inner(
     let staging = Staging::create(ctx, &sys, false)?;
     let previewed = stage_all(&git, root_src, &grants, &root, &staging.tree())?;
     for s in &previewed {
+        // A root checkout on another branch is fast-forwarded where it is; say so.
+        let checkout = match &s.branch {
+            _ if !s.src.is_root() => String::new(),
+            Some(b) if *b == s.src.reference => String::new(),
+            Some(b) => format!("; checkout on {}", visible(b)),
+            None => "; detached".into(),
+        };
         writeln!(
             out,
-            "{} {} {} {} {} ({})",
+            "{} {} {} {} {} ({}{checkout})",
             paint::label(ctx.color, "source:"),
             s.src.id,
             s.src.origin,
@@ -1970,8 +1992,13 @@ fn run_inner(
     // The checks apply runs before its lock (docs/apply.md), per scope, so a plan that a scope
     // would refuse is refused here before any source is published.
     let journal_open = check_scopes(ctx, args, &plans, &loaded, out)?;
+    // The updaters, a blocked one included, are listed before any scope runs (DFM-31.C02).
+    let updaters = &loaded.resolved.updaters;
+    if args.apply.preview || (args.upgrade && !updaters.is_empty()) {
+        upgrade_preview(ctx, &sys, args, updaters, out)?;
+    }
     if args.apply.preview {
-        return upgrade_preview(ctx, &sys, args, &loaded.resolved.updaters, out);
+        return Ok(());
     }
     // A source that moves is a publication, so only a run with every source current, and no
     // scope that would run with a change, can end here (docs/apply.md, step 4).
@@ -2067,9 +2094,13 @@ fn run_inner(
             "a source moved since the reviewed run: the commits to publish are not the ones shown with this digest. Fix: read the new plan with --preview and approve its digest",
         ));
     }
+    let fail = state_cmd::fail_from_env()?;
     let mut published = Vec::new();
     for s in &staged {
-        match publish(&git, s) {
+        match fail
+            .hit(&format!("sync-before-publish-{}", s.src.id))
+            .and_then(|()| publish(&git, s))
+        {
             Ok(changed) => {
                 writeln!(out, "published: {} {}", s.src.id, s.change()).map_err(w)?;
                 if changed {
@@ -2103,7 +2134,6 @@ fn run_inner(
     // The approved operations of the scopes that ran, by folded path: a later scope is checked
     // against their effects.
     let mut done = BTreeMap::new();
-    let fail = state_cmd::fail_from_env()?;
     for p in &locked {
         // A stop request between two scopes ends the run: no later scope starts.
         if failure.is_none()
@@ -2394,6 +2424,14 @@ fn upgrade(
             error,
             reload: None,
         });
+    }
+    // After the loop, so a copy that brew upgraded shows the version brew left. A stopped run
+    // starts no more commands.
+    let stopped = dfm_engine::signal::requested().is_some();
+    for u in updaters.iter().filter(|_| !stopped) {
+        for n in updater::second_copies(*u, &env) {
+            writeln!(out, "  note: {} {}", u.name(), visible(&n)).map_err(w)?;
+        }
     }
     let binary = crate::plan_cmd::binary_identity()?;
     let stamp = state::Stamp::of(binding);

@@ -32,10 +32,13 @@ impl Fx {
         self.h(".local/state/dotfiles-manager/state")
     }
 
+    /// The provider path names a directory with no provider, so a fixture that declares a
+    /// package (the examples do) can never start the real one.
     fn doctor(&self, extra: &[&str]) -> std::process::Output {
         let mut a = vec!["doctor", "--root", self.root_arg()];
         a.extend_from_slice(extra);
-        self.run(&a)
+        let none = self.h("no-providers");
+        self.run_env(&[("DFM_PROVIDER_PATH", none.to_str().unwrap())], &a)
     }
 
     /// The rows of `doctor --json`, and the exit code.

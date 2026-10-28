@@ -44,5 +44,7 @@ mod tests {
             assert_eq!(Updater::parse(u.name()), Some(u));
         }
         assert_eq!(Updater::parse("Brew"), None);
+        // Sync never replaces the running manager.
+        assert_eq!(Updater::parse("dfm"), None);
     }
 }

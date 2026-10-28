@@ -260,6 +260,10 @@ fn a_new_tool_is_installed_and_the_trial_record_survives_the_process() {
     );
     let o = fx.run(&["status", "--root", fx.root.to_str().unwrap()]);
     assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+    // The active trial has its own row.
+    let t = text(&o.stdout);
+    assert!(t.contains("OK      D_TRIAL trial"), "{t}");
+    assert!(t.contains("trials/trial-atuin"), "{t}");
     // A second trial of the same tool is refused before any write.
     let o = fx.trial(&["atuin", "--provider", BREW, "--preview"]);
     let d2 = digest_of(&o);

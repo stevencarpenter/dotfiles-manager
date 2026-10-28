@@ -301,13 +301,144 @@ fn a_configuration_plan_lists_packages_out_of_scope_and_starts_no_provider() {
     let t = text(&o.stdout);
     assert!(t.contains("not_in_scope extra.atuin@scope"), "{t}");
     assert!(t.contains("not_in_scope extra.duckdb@scope"), "{t}");
+    assert!(!fx.provider_ran(), "plan started a provider: {}", fx.log());
+    // No provider has run, so the runner's working directory does not exist. Doctor creates
+    // nothing, so it starts no provider and reports each package unknown.
+    let o = fx.run(&["doctor", "--root", fx.root_arg()]);
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+    let t = text(&o.stdout);
+    assert!(t.contains("UNKNOWN E_PROBE_FAILED resource"), "{t}");
+    assert!(t.contains("does not exist yet"), "{t}");
+    assert!(
+        !fx.provider_ran(),
+        "doctor started a provider: {}",
+        fx.log()
+    );
+    let run = fx.home.path().join(".cache/dotfiles-manager/run");
+    assert!(!run.exists());
+    // A runner directory with another mode is left as it is, and no provider starts.
+    fs::create_dir_all(&run).unwrap();
+    fs::set_permissions(&run, fs::Permissions::from_mode(0o755)).unwrap();
     let o = fx.run(&["doctor", "--root", fx.root_arg()]);
     assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
     assert!(
+        text(&o.stdout).contains("UNKNOWN E_PROBE_FAILED resource"),
+        "{}",
+        text(&o.stdout)
+    );
+    assert!(
         !fx.provider_ran(),
-        "a provider was started by plan or doctor: {}",
+        "doctor started a provider: {}",
         fx.log()
     );
+    assert_eq!(
+        fs::metadata(&run).unwrap().permissions().mode() & 0o7777,
+        0o755
+    );
+}
+
+/// The JSON row of `resource` in `doctor --json` run with `PATH`, and the document.
+fn doctor_row(
+    fx: &Fx,
+    path: &std::path::Path,
+    resource: &str,
+) -> (serde_json::Value, serde_json::Value) {
+    let o = fx
+        .cmd(&["doctor", "--root", fx.root_arg(), "--json"])
+        .env("PATH", path)
+        .output()
+        .unwrap();
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+    let v: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
+    let row = v["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["subject"] == resource)
+        .unwrap_or_else(|| panic!("no {resource} row in {v:#}"))
+        .clone();
+    (row, v)
+}
+
+#[test]
+fn doctor_shows_provider_version_and_path_selection_and_reports_another_owner_unadopted() {
+    let fx = Fx::new();
+    fx.installed("brew", "atuin 18.24.1\n");
+    fx.installed("mise", "");
+    // A preview runs the providers once, which makes the runner's working directory.
+    assert_eq!(code(&fx.preview()), 0);
+    // PATH selects `atuin` through a link. Doctor reads the link and never runs its target.
+    let real = fx.fake.path().join("real");
+    let path = fx.fake.path().join("pathbin");
+    fs::create_dir_all(&real).unwrap();
+    fs::create_dir_all(&path).unwrap();
+    let ran = fx.fake.path().join("atuin-ran");
+    fs::write(
+        real.join("atuin"),
+        format!("#!/bin/sh\ntouch {}\n", ran.display()),
+    )
+    .unwrap();
+    fs::set_permissions(real.join("atuin"), fs::Permissions::from_mode(0o755)).unwrap();
+    std::os::unix::fs::symlink("../real/atuin", path.join("atuin")).unwrap();
+    fs::remove_file(fx.fake.path().join("log")).unwrap();
+
+    let (row, v) = doctor_row(&fx, &path, "extra.atuin");
+    assert_eq!(
+        (row["status"].as_str(), row["code"].as_str()),
+        (Some("OK"), Some("D_OK")),
+        "{row}"
+    );
+    let d = row["detail"].as_str().unwrap();
+    assert!(
+        d.contains("atuin is installed by homebrew/v1 (18.24.1)"),
+        "{d}"
+    );
+    let link = path.join("atuin");
+    assert!(
+        d.contains(&format!(
+            "PATH selects {} -> {}",
+            link.display(),
+            path.join("../real/atuin").display()
+        )),
+        "{d}"
+    );
+    assert_eq!(v["path"], path.to_str().unwrap());
+    assert!(v["observed_unix"].as_u64().unwrap() > 0, "{v}");
+    let (row, _) = doctor_row(&fx, &path, "extra.duckdb");
+    assert_eq!(
+        (row["status"].as_str(), row["code"].as_str()),
+        (Some("WARN"), Some("D_PLAN_PENDING")),
+        "{row}"
+    );
+    assert!(
+        row["detail"]
+            .as_str()
+            .unwrap()
+            .contains("PATH selects no executable named duckdb"),
+        "{row}"
+    );
+
+    // An executable of the name beside the providers is another owner: a warning, not adopted.
+    let other = fx.bin().join("duckdb");
+    fs::write(&other, "#!/bin/sh\nexit 0\n").unwrap();
+    fs::set_permissions(&other, fs::Permissions::from_mode(0o755)).unwrap();
+    let (row, _) = doctor_row(&fx, &path, "extra.duckdb");
+    assert_eq!(
+        (row["status"].as_str(), row["code"].as_str()),
+        (Some("WARN"), Some("E_CONFLICT")),
+        "{row}"
+    );
+    assert!(
+        row["detail"].as_str().unwrap().contains("not adopted"),
+        "{row}"
+    );
+
+    // The probes were the read-only listings; nothing was installed or executed from PATH.
+    let log = fx.log();
+    assert!(log.contains("brew --cellar"), "{log}");
+    assert!(log.contains("mise ls --installed --json duckdb"), "{log}");
+    assert!(!log.contains(" install "), "{log}");
+    assert!(!ran.exists(), "doctor ran the executable PATH selects");
 }
 
 #[test]
@@ -793,6 +924,26 @@ fn an_installed_package_with_an_unresolved_install_stays_blocked_until_resolved(
         let fx = Fx::new();
         fx.installed("brew", if provider == "brew" { "" } else { "atuin 1\n" });
         fx.installed("mise", if provider == "mise" { "" } else { "duckdb 1\n" });
+        let installs = || fx.log().lines().filter(|l| l.contains(" install ")).count();
+        // A failure before the effect is journaled as failed, and the provider never ran.
+        let o = fx
+            .cmd(&[
+                "packages",
+                "--root",
+                fx.root_arg(),
+                "--yes-plan",
+                &digest_of(&fx.preview()),
+            ])
+            .env("DFM_FAILPOINT", "apply-before-effect:error")
+            .output()
+            .unwrap();
+        assert_eq!(code(&o), 1, "{}\n{}", stderr(&o), text(&o.stdout));
+        let all = format!("{}{}", stderr(&o), text(&o.stdout));
+        assert!(
+            all.contains("injected failure at apply-before-effect"),
+            "{all}"
+        );
+        assert_eq!(installs(), 0);
         let d = digest_of(&fx.preview());
         // The provider finished, but the manager never recorded the outcome.
         let crash = fx
@@ -812,7 +963,6 @@ fn an_installed_package_with_an_unresolved_install_stays_blocked_until_resolved(
         .unwrap();
         assert_eq!(intent["phase"], "intent");
         let id = intent["op_id"].as_str().unwrap();
-        let installs = || fx.log().lines().filter(|l| l.contains(" install ")).count();
         assert_eq!(installs(), 1);
         let d = digest_of(&fx.preview());
         for _ in 0..2 {
@@ -842,6 +992,40 @@ fn an_installed_package_with_an_unresolved_install_stays_blocked_until_resolved(
         assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
         assert!(text(&o.stdout).contains("nothing to change: no approval needed"));
     }
+}
+
+#[test]
+fn a_receipt_write_failure_after_the_install_does_not_install_again() {
+    let fx = Fx::new();
+    fx.installed("brew", "");
+    fx.installed("mise", "duckdb 1\n");
+    let installs = || fx.log().lines().filter(|l| l.contains(" install ")).count();
+    let o = fx
+        .cmd(&[
+            "packages",
+            "--root",
+            fx.root_arg(),
+            "--yes-plan",
+            &digest_of(&fx.preview()),
+        ])
+        .env("DFM_FAILPOINT", "receipt-after-tmp:error")
+        .output()
+        .unwrap();
+    assert_eq!(code(&o), 1, "{}\n{}", stderr(&o), text(&o.stdout));
+    let all = format!("{}{}", stderr(&o), text(&o.stdout));
+    assert!(
+        all.contains("injected failure at receipt-after-tmp"),
+        "{all}"
+    );
+    assert_eq!(installs(), 1);
+    let o = fx.packages(&digest_of(&fx.preview()));
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+    assert!(text(&o.stdout).contains(&format!("current {BREW_OP}")));
+    assert_eq!(
+        installs(),
+        1,
+        "a lost receipt must not reinstall the package"
+    );
 }
 
 #[test]

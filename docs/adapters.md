@@ -1,6 +1,6 @@
 # Adapters
 
-This page lists the adapter registry and records what the configuration adapters (`fs-link/v1`, `git-config/v1`, `text-fragments/v1`, `claude-settings/v1`) do at HEAD. Apply is in [docs/apply.md](apply.md) and the planner in [docs/planner.md](planner.md).
+This page lists the adapter registry and records what the configuration adapters (`fs-link/v1`, `git-config/v1`, `text-fragments/v1`, `claude-settings/v1`, `codex-hooks/v1`, `omlx-model-settings/v1`) do at HEAD. Apply is in [docs/apply.md](apply.md) and the planner in [docs/planner.md](planner.md).
 
 ## Registry
 
@@ -12,10 +12,12 @@ This page lists the adapter registry and records what the configuration adapters
 | `git-config/v1` | `render` | `config` | this page |
 | `text-fragments/v1` | `assemble` | `config` | this page |
 | `claude-settings/v1` | `merge` (sensitive) | `config` | this page |
+| `codex-hooks/v1` | `merge` (sensitive) | `config` | this page |
+| `omlx-model-settings/v1` | `merge` (sensitive) | `config` | this page |
 | `skills/v1` | `distribution` | `config` | [docs/resolver.md](resolver.md), rule 8 |
 | `op-template/v1` | `secret` | `secrets` | [docs/secrets.md](secrets.md) |
 | `homebrew/v1`, `mise/v1`, `apt/v1`, `uv-tool/v1` | `package` | `packages` | [docs/packages.md](packages.md), [docs/toolchains.md](toolchains.md) |
-| `launchd-agent/v1`, `brew-service/v1` | `service` | `services` | [docs/lifecycle.md](lifecycle.md) |
+| `launchd-agent/v1`, `brew-service/v1`, `omlx-app/v1` | `service` | `services` | [docs/lifecycle.md](lifecycle.md) |
 | `firstmate-native/v1` | `application` | none (always `not_in_scope`) | DESIGN.md. A catalog entry only, with no adapter code ([docs/lifecycle.md](lifecycle.md)). |
 
 ## What exists
@@ -25,7 +27,7 @@ This page lists the adapter registry and records what the configuration adapters
 | `Generator` trait, `GeneratorInputs`, input collection | `crates/engine/src/generate.rs` |
 | Executor calls (inputs, generate, output hash) | `crates/engine/src/apply.rs`, `generated` |
 | `git-config/v1` and `text-fragments/v1`, plan-time output hashes (`plan_outputs`) | `crates/cli/src/adapters/generate.rs` |
-| `claude-settings/v1` merge algorithm (pure JSON merge, retire, salted hash) | `crates/model/src/merge.rs` |
+| `claude-settings/v1`, `codex-hooks/v1` and `omlx-model-settings/v1` merge algorithm (pure JSON merge, retire, salted hash; `merge::is_merge`, `merge::mode_for`) | `crates/model/src/merge.rs` |
 | `claude-settings/v1` glue (`Generator::merge`) and plan-time facts about the live file (`merge_facts`) | `crates/cli/src/adapters/generate.rs`, `crates/cli/src/adapters/merge_plan.rs` |
 | Merge execution (re-read, conflict check, guarded publish) | `crates/engine/src/apply.rs`, `try_merge` |
 | `Operation.output_sha256`, `output_bytes`, `sets`, `fragment_dir`, `Fragment.sha256` | `crates/model/src/plan/mod.rs` |
@@ -209,7 +211,7 @@ The base is the live document. The merge changes only what the module declares.
 ### Sensitive policy
 
 - The plan, the receipt, the journal, `--json`, the table and `doctor` hold no live content, no hash of the live file and no salted hash.
-- The plan holds, for this operation: the path, the mode (0600), the setting names (`sets`, names only), the fragments (`fragments`, names and origin) and `managed_sha256`. That is the SHA-256 of the canonical JSON of the declared `managed` values. The module declares them, so the digest is not secret. It shows a reviewer that the declared set changed. It says nothing about the live file. A setting name is the dotted path from the top of the file to a leaf, such as `env.EXAMPLE_FEATURE_FLAG`. The names include the keys of the fragments.
+- The plan holds, for this operation: the path, the mode (0600, or 0644 for `omlx-model-settings/v1`), the setting names (`sets`, names only), the fragments (`fragments`, names and origin) and `managed_sha256`. That is the SHA-256 of the canonical JSON of the declared `managed` values. The module declares them, so the digest is not secret. It shows a reviewer that the declared set changed. It says nothing about the live file. A setting name is the dotted path from the top of the file to a leaf, such as `env.EXAMPLE_FEATURE_FLAG`. The names include the keys of the fragments.
 - A fragment can hold credentials, so the fragments of a sensitive merge are sensitive themselves: no plain hash of a fragment is printed or stored. The `fragments:` precondition of the operation carries a salted content token for each fragment (the salted SHA-256 of the name and the content, with `state/salt`). The token lands in the plan JSON (`preconditions[].state`) and so in the plan digest, which makes a changed fragment stale. It is never printed by the text plan, a stale report (which says `fragment content changed`), the receipt, the journal, `doctor` or `status`, and it is not stored in the ledger. A merge that has fragments needs `state/salt` at plan time: without it the plan blocks with `E_STATE_INVALID` and the fix "run bind again with the same profile and machine id", which creates the salt ([docs/state.md](state.md), "Documents"). A merge without fragments needs no salt at plan time. Assembly fragments (`text-fragments/v1`, normal class) keep their plain hashes.
 - `output_sha256` stays unset: a sensitive output has no content hash. No hash of the live settings file exists anywhere.
 - `ledger.json` holds a per-machine salted hash of the managed fields as the manager last wrote them (`coowned.managed_hash`, per leaf in `coowned.leaves`), and the owned handler entries. The salt is 32 random bytes in `state/salt`. No other file holds the salted hash.
@@ -263,6 +265,56 @@ Apply reads the live file again under the writer lock and builds the result from
 
 The check and the rename are two system calls. A write by another process between them is not detected, and the rename then replaces that write with a merge of the older content. This is the same check-then-act limit as `replace_link` and `update_file` ([docs/apply.md](apply.md)). A manager lock is not a lock on the application. Close the application, or run apply when it is idle, to remove the window.
 
+## `codex-hooks/v1` (merge)
+
+Output: `.codex/hooks.json`. Codex reads its hooks from this file in the shape of the `hooks` object of the Claude settings: `{"hooks": {<event>: [{"matcher"?, "hooks": [{"type", "command", ...}]}]}}`. Other tools (plugins, `codebase-memory-mcp`, `impeccable`) add their own groups to it. The adapter replaces the `jq` step `codex_hooks_merge` of `~/.dotfiles/scripts/hooks-sync.sh`.
+
+It is the `claude-settings/v1` merge with handlers only. The value has one field, `handlers`, with the handler shape above:
+
+```toml
+[[resources]]
+id = "codex-hooks"
+kind = "merge"
+adapter = "codex-hooks/v1"
+target = ".codex/hooks.json"
+[resources.value.handlers.hippo]
+event = "SessionStart"
+type = "command"
+argv = ["${HOME}/.local/share/hippo-brain/shell/claude-session-hook.sh"]
+[resources.policy]
+extensions = ["/handlers"]
+```
+
+Everything in the `claude-settings/v1` section applies except `managed`, `seed`, `append` and fragments, which the schema does not accept: the fixed destination (any other target is `E_MANIFEST_INVALID`), class `sensitive`, mode 0600, the ledger records (`coowned.entries`), the take-over with `--allow-adopt`, the re-read under the lock, the identity-guarded rename, the retire of owned entries only, and malformed JSON as `E_CONFLICT` with the last good file kept. A foreign hook entry of any type or shape is carried over by value, with every key it holds (`command_windows`, `commandWindows`, `statusMessage`, `timeout`, `prompt`, `url`). A hook that runs the declared command with another home spelling (`/Users/<you>/...` for `${HOME}/...`) is the user's: it is not duplicated and not owned, so a retire never removes it. Tests: `crates/cli/tests/codex_hooks.rs`.
+
+MCP configuration and skill fan-out stay with `mcp_sync` (DFM-21, revision 2026-10-20). The manager neither ports nor invokes it.
+
+## `omlx-model-settings/v1` (merge)
+
+Output: `.omlx/model_settings.json`, the per-model settings of the oMLX app: `{"version": 1, "models": {<model id>: {...}}}`. The app's admin UI, profiles and context benchmark rewrite the whole file from memory through an atomic rename, so a link or a one-shot script does not hold. The adapter merges the declared per-model leaves and keeps every other model and key.
+
+It is the `claude-settings/v1` merge with `managed` only (required). The value declares leaves under `models`:
+
+```toml
+[[resources]]
+id = "omlx-models"
+kind = "merge"
+adapter = "omlx-model-settings/v1"
+target = ".omlx/model_settings.json"
+[resources.value.managed.models."Qwen3.6-35B-A3B-Abliterated-Heretic-MLX-4bit"]
+enable_thinking = false
+forced_ct_kwargs = ["enable_thinking"]
+trust_remote_code = false
+```
+
+What differs from `claude-settings/v1`:
+
+- **Mode 0644.** The app writes the file with mode 0644 (its umask), so the adapter publishes 0644 and accepts a live file whose group and other bits stay within 0644 (`merge::mode_for`). A file writable by group or others is `E_CONFLICT` with `chmod 644` as the fix. Every other merge keeps 0600.
+- **The server settings stay out.** `.omlx/settings.json` holds the server's credentials. The fixed target keeps the merge away from it: no adapter reads or writes it, and a module that names it is `E_MANIFEST_INVALID`. The test `the_server_settings_file_never_reaches_any_output_or_state_file` plants a token there and checks every output and state file.
+- **Restart.** oMLX reads the file only at start, and each save rewrites it from memory. A write while the app runs is therefore lost at its next save unless the app restarts first. Declare the `omlx-app/v1` service with `config = [".omlx/model_settings.json"]` ([docs/lifecycle.md](lifecycle.md)) and run `dfm sync --restart <resource-id>` (or `dfm services --restart <resource-id> --allow-disruptive <operation-id>`) after a change. The restart is never inferred.
+
+The class stays `sensitive` (no content hash, salted managed-field hash in the ledger), the destination is fixed, and the rules for take-over, conflicts, key order (a JSON-equal file is `current`, DFM-68) and malformed JSON are those of `claude-settings/v1`. Tests: `crates/cli/tests/omlx.rs`.
+
 ## What the plan shows for a generated file
 
 `plan` prints, under each generated file, its size and, for `git-config/v1`, the names it sets, never the values:
@@ -296,7 +348,7 @@ The test `the_example_personal_profile_plans_and_applies_unmodified` (`crates/cl
 
 ## Not built
 
-- **Other co-owned destinations** (DFM-21.C01, C02, C05): Codex configuration, MCP server configuration files and any reverse transformation of them. An unsupported reverse transformation stays an explicit blocker with fix text, as for a handler of another type.
+- **Other co-owned destinations**: MCP server configuration files, Codex `config.toml` and any reverse transformation of them. `mcp_sync` keeps them (DFM-21). An unsupported reverse transformation stays an explicit blocker with fix text, as for a handler of another type.
 - **A JSON `null` disable.** TOML cannot express it. Only `false` and other TOML values are declarable.
 - **Forged ledger.** The ledger is not authenticated. A same-user edit of `coowned.entries` can make `retire` remove a hook entry whose hash it names. The same holds for `coowned.appended`: the validator accepts only canonical pointers outside `hooks`, but a deselected resource has no declared pointers to check against, so a forged pair can remove an array item with the hash it names. The validator refuses a repeated record, so a forged ledger cannot remove more copies than it names distinct hashes. This is the same limit as for removals ([docs/apply.md](apply.md), "Known limits").
 - **Hand edit on the first merge.** A hand edit of a managed field is overwritten by the first write into an existing file. The `--allow-adopt` flag and the plan text say so before it happens.
