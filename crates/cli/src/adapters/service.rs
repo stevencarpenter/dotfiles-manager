@@ -744,7 +744,9 @@ fn omlx_report(runner: &Runner) -> Result<Option<OmlxStatus>, String> {
 /// The state of the oMLX app: installed (its bundle exists), the app running (the control
 /// socket answers) and its server running. Only a running server is current. A server in
 /// `starting`, `stopping`, `unresponsive` or `error` is stale: the planner blocks until the user
-/// requests the restart. A state the adapter does not know is unknown.
+/// requests the restart. A stopped server under a running app is stale too: opening the app
+/// does not start it, and the socket `start` makes oMLX 0.7.0 exit, so the user starts it from
+/// the app's menu. A state the adapter does not know is unknown.
 fn omlx_state(runner: &Runner) -> ServiceFacts {
     let bundle = omlx_bundle(runner);
     if std::fs::symlink_metadata(&bundle).is_err() {
@@ -758,7 +760,9 @@ fn omlx_state(runner: &Runner) -> ServiceFacts {
         Ok(None) => ServiceState::Stopped("the app is not running".into()),
         Ok(Some(s)) => match s.state.as_str() {
             "running" => ServiceState::Current("app running, server running".into()),
-            "stopped" => ServiceState::Stopped("app running, server stopped".into()),
+            "stopped" => ServiceState::Stale(
+                "app running, server stopped; start the server from the oMLX menu".into(),
+            ),
             "starting" | "stopping" | "unresponsive" | "error" => {
                 ServiceState::Stale(format!("app running, server {}", s.state))
             }
@@ -847,15 +851,16 @@ fn omlx_act(runner: &Runner, action: Action) -> Result<Completion, Refusal> {
     loop {
         stop_requested()?;
         let last = match omlx_report(runner) {
-            Ok(Some(s)) if s.state == "running" && (old.is_none() || s.pid != old) => {
+            Ok(Some(s))
+                if s.state == "running"
+                    && (old.is_none() || s.pid.is_some_and(|p| Some(p) != old)) =>
+            {
                 return Ok(Completion::Completed);
             }
-            Ok(Some(s)) if s.state == "running" => {
-                format!(
-                    "running under the old server pid {}",
-                    s.pid.unwrap_or_default()
-                )
-            }
+            Ok(Some(s)) if s.state == "running" => match s.pid {
+                Some(p) => format!("running under the old server pid {p}"),
+                None => "running without a server pid".into(),
+            },
             Ok(Some(s)) => s.state,
             Ok(None) => "the app is not running".into(),
             Err(why) => {

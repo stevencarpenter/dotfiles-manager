@@ -598,6 +598,23 @@ fn a_server_that_never_runs_again_after_the_restart_fails_with_the_last_state() 
     fx.mark("next-pid", "1001");
     let o = restart(&fx);
     failed_with(&o, "last state: running under the old server pid 1001");
+    // A running reply that names no pid is no evidence of a new server.
+    let fx = restartable();
+    fx.mark("next-pid", "");
+    let o = restart(&fx);
+    failed_with(&o, "last state: running without a server pid");
+}
+
+#[test]
+fn a_stopped_server_under_a_running_app_blocks_with_the_menu_fix() {
+    let fx = Fx::new();
+    fx.live(LIVE, 0o644);
+    ok(&fx.apply());
+    fx.app("stopped", false);
+    let o = fx.services(&[]);
+    let all = format!("{}\n{}", text(&o.stderr), text(&o.stdout));
+    assert!(all.contains("start the server from the oMLX menu"), "{all}");
+    assert!(!fx.log().contains("open "), "{}", fx.log());
 }
 
 #[test]
