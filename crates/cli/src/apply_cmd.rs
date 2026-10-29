@@ -53,6 +53,10 @@ pub struct Args {
     pub(crate) planned: Option<dfm_model::plan::Plan>,
     /// A `sync` scope of a run without `--yes-plan`: the receipt approval kind is `unattended`.
     pub(crate) unattended: bool,
+    /// A later scope of `sync`: ids that an earlier scope withheld, as this plan names them (the
+    /// `<resource>@scope` entry), or this scope's operations sync already withholds. A planned
+    /// operation with such an id, or that runs after one, is withheld too (`withheld`).
+    pub(crate) held: BTreeSet<String>,
 }
 
 /// `apply [--root <dir>] [-y|--yes-plan <digest>] [--allow-disruptive <operation-id>]...
@@ -120,6 +124,7 @@ pub fn parse_args(args: &[String], scope: Scope) -> Result<Args, Refusal> {
         composed: false,
         planned: None,
         unattended: false,
+        held: BTreeSet::new(),
     })
 }
 
@@ -193,8 +198,9 @@ fn by_rule(args: &Args, plan: &Plan) -> BTreeSet<String> {
 }
 
 /// The operations a `sync` scope does not run (docs/sync.md): each planned adoption or takeover
-/// without its `--allow-adopt` id, and every operation that runs after one. Empty for every
-/// other command, which refuses such a plan instead.
+/// without its `--allow-adopt` id, each planned operation that `held` names or that runs after
+/// an id in `held`, and every operation that runs after one of these. Empty for every other
+/// command, which refuses such a plan instead.
 pub(crate) fn withheld(args: &Args, plan: &Plan) -> BTreeSet<String> {
     let mut withheld: BTreeSet<String> = plan
         .operations
@@ -205,7 +211,10 @@ pub(crate) fn withheld(args: &Args, plan: &Plan) -> BTreeSet<String> {
         .collect();
     // The plan lists an operation after the ones it runs after, so one pass takes the chains.
     for o in &plan.operations {
-        if o.after.iter().any(|a| withheld.contains(a)) {
+        let held = args.composed
+            && o.status == PlanStatus::Planned
+            && (args.held.contains(&o.id) || o.after.iter().any(|a| args.held.contains(a)));
+        if held || o.after.iter().any(|a| withheld.contains(a)) {
             withheld.insert(o.id.clone());
         }
     }

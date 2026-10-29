@@ -1157,12 +1157,20 @@ impl ScopePlan {
             .filter(|o| self.withheld.contains(&o.id) && Allowance::of(o) == Some(Allowance::Adopt))
             .map(|o| dfm_engine::flag(Allowance::Adopt, &o.id))
             .collect();
-        Some(format!(
-            "{} withheld: {}. Fix: review each, then run dfm sync {}",
-            self.scope.as_str(),
-            visible(&self.withheld_ids().join(", ")),
-            visible_for_paste(&flags.join(" "))
-        ))
+        let ids = visible(&self.withheld_ids().join(", "));
+        Some(match flags.is_empty() {
+            // Each runs after an operation an earlier scope withheld; that scope's warning
+            // names its flag.
+            true => format!(
+                "{} withheld: {ids}, after a withheld operation of an earlier scope. Fix: approve that operation, then run dfm sync again",
+                self.scope.as_str()
+            ),
+            false => format!(
+                "{} withheld: {ids}. Fix: review each, then run dfm sync {}",
+                self.scope.as_str(),
+                visible_for_paste(&flags.join(" "))
+            ),
+        })
     }
 
     fn blocked_warning(&self) -> Option<String> {
@@ -1296,7 +1304,11 @@ fn plan_staged(
     let mut plans: Vec<ScopePlan> = Vec::new();
     for scope in SCOPES {
         let (plan, mut generated) = plan_scope(ctx, &sys, args, scope, &loaded)?;
-        let withheld = apply_cmd::withheld(&scope_args(args, scope, Some(&plan)), &plan);
+        let held = apply_cmd::Args {
+            held: held_by(&plans).into_keys().collect(),
+            ..scope_args(args, scope, Some(&plan))
+        };
+        let withheld = apply_cmd::withheld(&held, &plan);
         let runnable = apply_cmd::without(&plan, &withheld);
         if scope == Scope::Config {
             // A withheld file operation writes nothing: the services scope reads HOME at its
@@ -1343,6 +1355,29 @@ fn plan_staged(
         });
     }
     Ok((loaded, plans))
+}
+
+/// The withheld operations of `earlier` scopes that leave HOME other than the plan declares, by
+/// the `<resource>@scope` id a later plan names them with. A later operation that runs after one
+/// is withheld too: a service would start or restart on a file the run did not write. A
+/// withheld adoption is not listed: HOME already holds exactly what it would record.
+fn held_by(earlier: &[ScopePlan]) -> BTreeMap<String, Vec<String>> {
+    let mut out: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for p in earlier {
+        for o in p
+            .plan
+            .operations
+            .iter()
+            .filter(|o| p.withheld.contains(&o.id))
+        {
+            if o.action != Action::Adopt {
+                out.entry(format!("{}@scope", o.resource))
+                    .or_default()
+                    .push(o.id.clone());
+            }
+        }
+    }
+    out
 }
 
 /// Whether a packages, secrets or services plan is blocked, else the services it defers, each
@@ -1421,7 +1456,8 @@ fn show(
     out: &mut dyn Write,
 ) -> std::io::Result<()> {
     let config = &plans[0].runnable();
-    for p in plans {
+    for (i, p) in plans.iter().enumerate() {
+        let held = held_by(&plans[..i]);
         writeln!(
             out,
             "{} {}",
@@ -1451,9 +1487,17 @@ fn show(
             .iter()
             .filter(|o| p.withheld.contains(&o.id))
         {
+            let by: Vec<&str> = o
+                .after
+                .iter()
+                .filter_map(|a| held.get(a))
+                .flatten()
+                .map(String::as_str)
+                .collect();
             let why = match Allowance::of(o) {
-                Some(Allowance::Adopt) => "needs --allow-adopt",
-                _ => "runs after a withheld operation",
+                Some(Allowance::Adopt) => "needs --allow-adopt".to_string(),
+                _ if !by.is_empty() => format!("runs after withheld {}", by.join(", ")),
+                _ => "runs after a withheld operation".to_string(),
             };
             writeln!(
                 out,
@@ -1510,7 +1554,10 @@ fn check_scopes(
             plan.blockers.clear();
         }
         let generator = apply_cmd::generators_for(ctx, &sys, p.scope, loaded);
-        let scoped = scope_args(args, p.scope, Some(&p.plan));
+        let scoped = apply_cmd::Args {
+            held: p.withheld.clone(),
+            ..scope_args(args, p.scope, Some(&p.plan))
+        };
         match apply_cmd::check_before_lock(ctx, &scoped, &plan, &p.digest, &generator, out) {
             Ok(o) => open |= o,
             Err(e) if matches!(e.code, Code::DisruptiveUnapproved | Code::AdoptUnapproved) => {
@@ -2532,6 +2579,7 @@ fn run_scope(
     // with that digest.
     let scoped = apply_cmd::Args {
         planned: fresh,
+        held: p.withheld.clone(),
         ..scoped
     };
     apply_cmd::run(ctx, &scoped, out).map(|()| None)
