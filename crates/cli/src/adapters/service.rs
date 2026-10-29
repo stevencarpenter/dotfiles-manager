@@ -1,6 +1,7 @@
 //! The service adapters `launchd-agent/v1`, `brew-service/v1` and `omlx-app/v1` (docs/lifecycle.md): a
 //! read-only report from the service's own launcher, then a start or restart through that same
-//! launcher, never through a competing one. Nothing here stops, unloads for good, uninstalls or
+//! launcher, never through a competing one (oMLX: the app's control socket, `open` and a SIGTERM
+//! to the server the socket names). Nothing here stops, unloads for good, uninstalls or
 //! removes a service, and nothing reads or writes application data.
 //!
 //! Every child runs through the engine runner (fixed search path, rebuilt environment, process
@@ -22,10 +23,10 @@ pub const OMLX_APP: &str = "omlx-app/v1";
 
 /// The oMLX app's control socket below HOME. It answers one JSON line per request line.
 const OMLX_SOCKET: &str = "Library/Application Support/oMLX/control.sock";
-/// The app's own launcher, which opens the app and sends it a command over the socket.
-const OMLX_CLI: &str = "omlx-cli";
-/// Where the app bundle keeps [`OMLX_CLI`]. Searched after the provider path.
-const OMLX_BUNDLE_BIN: &str = "/Applications/oMLX.app/Contents/MacOS";
+/// The app bundle, which `open -a` starts. The isolated build looks below HOME instead.
+const OMLX_BUNDLE: &str = "/Applications/oMLX.app";
+/// The process name of the app's server. A restart signals only a process of this name.
+const OMLX_SERVER: &str = "omlx-server";
 
 /// A report or an action log is bounded; its content is not kept.
 const MAX_OUTPUT: usize = 1 << 20;
@@ -690,19 +691,24 @@ fn brew_state(runner: &Runner, value: &Value) -> Result<ServiceFacts, Refusal> {
     }))
 }
 
-/// The runner for [`OMLX_CLI`]: the provider path, then the app bundle. The isolated build
-/// never reaches the installed app: its tests put a look-alike on the provider path.
-fn omlx_runner(runner: &Runner) -> Runner {
-    let mut r = runner.clone();
-    if !cfg!(feature = "test-isolation") {
-        r.search_path.push(PathBuf::from(OMLX_BUNDLE_BIN));
+/// The app bundle. The isolated build never reaches the installed app: its tests put a bundle
+/// directory below HOME.
+fn omlx_bundle(runner: &Runner) -> PathBuf {
+    match cfg!(feature = "test-isolation") {
+        true => runner.home.join(OMLX_BUNDLE.trim_start_matches('/')),
+        false => PathBuf::from(OMLX_BUNDLE),
     }
-    r
+}
+
+/// What the oMLX control socket reports: the server state and the server's pid, if it names one.
+struct OmlxStatus {
+    state: String,
+    pid: Option<u32>,
 }
 
 /// `{"command":"status"}` on the control socket: the server state the app reports, or `None`
 /// when no app listens (no socket, or nobody accepts on it).
-fn omlx_report(runner: &Runner) -> Result<Option<String>, String> {
+fn omlx_report(runner: &Runner) -> Result<Option<OmlxStatus>, String> {
     use std::io::{BufRead, BufReader, ErrorKind, Write};
     let io = |e: std::io::Error| format!("the oMLX control socket: {}", e.kind());
     let mut sock = match std::os::unix::net::UnixStream::connect(runner.home.join(OMLX_SOCKET)) {
@@ -720,35 +726,45 @@ fn omlx_report(runner: &Runner) -> Result<Option<String>, String> {
     BufReader::new(sock.take(u64::try_from(MAX_OUTPUT).unwrap_or(u64::MAX)))
         .read_until(b'\n', &mut line)
         .map_err(io)?;
-    serde_json::from_slice::<serde_json::Value>(&line)
-        .ok()
-        .and_then(|v| v.get("state")?.as_str().map(str::to_string))
-        .map(Some)
+    let v = serde_json::from_slice::<serde_json::Value>(&line).ok();
+    let state = v.as_ref().and_then(|v| v.get("state")?.as_str());
+    let pid = v
+        .as_ref()
+        .and_then(|v| u32::try_from(v.get("pid")?.as_u64()?).ok());
+    state
+        .map(|s| {
+            Some(OmlxStatus {
+                state: s.to_string(),
+                pid,
+            })
+        })
         .ok_or_else(|| "the oMLX control socket did not answer with a state".to_string())
 }
 
-/// The state of the oMLX app: installed (its launcher is on the search path), the app running
-/// (the control socket answers) and its server running. Only a running server is current. A
-/// server in `starting`, `stopping`, `unresponsive` or `error` is stale: the planner blocks until
-/// the user requests the restart. A state the adapter does not know is unknown.
+/// The state of the oMLX app: installed (its bundle exists), the app running (the control
+/// socket answers) and its server running. Only a running server is current. A server in
+/// `starting`, `stopping`, `unresponsive` or `error` is stale: the planner blocks until the user
+/// requests the restart. A stopped server under a running app is stale too: opening the app
+/// does not start it, and the socket `start` makes oMLX 0.7.0 exit, so the user starts it from
+/// the app's menu. A state the adapter does not know is unknown.
 fn omlx_state(runner: &Runner) -> ServiceFacts {
-    let installed = omlx_runner(runner)
-        .search_path
-        .iter()
-        .any(|d| std::fs::symlink_metadata(d.join(OMLX_CLI)).is_ok());
-    if !installed {
+    let bundle = omlx_bundle(runner);
+    if std::fs::symlink_metadata(&bundle).is_err() {
         return only(ServiceState::Missing(format!(
-            "the oMLX app is not installed ({OMLX_CLI} not found)"
+            "the oMLX app is not installed ({} not found)",
+            bundle.display()
         )));
     }
     only(match omlx_report(runner) {
         Err(why) => ServiceState::Unknown(why),
         Ok(None) => ServiceState::Stopped("the app is not running".into()),
-        Ok(Some(s)) => match s.as_str() {
+        Ok(Some(s)) => match s.state.as_str() {
             "running" => ServiceState::Current("app running, server running".into()),
-            "stopped" => ServiceState::Stopped("app running, server stopped".into()),
+            "stopped" => ServiceState::Stale(
+                "app running, server stopped; start the server from the oMLX menu".into(),
+            ),
             "starting" | "stopping" | "unresponsive" | "error" => {
-                ServiceState::Stale(format!("app running, server {s}"))
+                ServiceState::Stale(format!("app running, server {}", s.state))
             }
             _ => ServiceState::Unknown(
                 "the oMLX control socket reported a state the adapter does not know".into(),
@@ -757,35 +773,113 @@ fn omlx_state(runner: &Runner) -> ServiceFacts {
     })
 }
 
-/// `omlx-cli start|restart --no-wait`: the app's launcher opens the app when needed and sends the
-/// command over the socket. Then a bounded wait for the socket to report the server running,
-/// as for brew: still not running when the bound elapses is `Queued`. The app reads
-/// `.omlx/model_settings.json` only at start, so a restart is how a merged setting takes effect.
-fn omlx_act(runner: &Runner, action: Action) -> Result<Completion, Refusal> {
-    let verb = if action == Action::Restart {
-        "restart"
-    } else {
-        "start"
+/// Sends SIGTERM to the server pid the control socket names, after `ps` shows that the pid is a
+/// process of this user named [`OMLX_SERVER`]. The app starts a new server when its server
+/// exits. Returns the signalled pid. A pid the status did not name is never signalled.
+fn omlx_term_server(runner: &Runner) -> Result<u32, Refusal> {
+    let refuse =
+        |why: String| Refusal::new(Code::ProbeFailed, format!("{why}; nothing was signalled"));
+    let pid = match omlx_report(runner) {
+        Ok(Some(OmlxStatus { pid: Some(p), .. })) => p,
+        Ok(Some(_)) => return Err(refuse("the oMLX control socket named no server pid".into())),
+        Ok(None) => return Err(refuse("the oMLX app is not running".into())),
+        Err(why) => return Err(refuse(why)),
     };
-    let args = [verb.to_string(), "--no-wait".into()];
-    let by_hand = format!("{OMLX_CLI} {verb}");
-    run_action(&omlx_runner(runner), OMLX_CLI, &args, &[], &[0], &by_hand)?;
+    let b = bounds();
+    let p = pid.to_string();
+    let args = [
+        "-o".to_string(),
+        "uid=,comm=".into(),
+        "-p".into(),
+        p.clone(),
+    ];
+    let out = runner.run(&request("ps", &args, &[], b.probe))?;
+    match ended("ps", &out, b.probe).map_err(refuse)? {
+        0 => {}
+        _ => {
+            return Err(refuse(format!(
+                "ps finds no process {pid}, the server pid the oMLX app named"
+            )));
+        }
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let (uid, comm) = text
+        .trim()
+        .split_once(char::is_whitespace)
+        .unwrap_or_default();
+    let ours = uid.parse::<u32>().ok() == Some(runner.uid)
+        && Path::new(comm.trim()).file_name() == Some(OMLX_SERVER.as_ref());
+    if !ours {
+        return Err(refuse(format!(
+            "process {pid}, the server pid the oMLX app named, is not an {OMLX_SERVER} of this user"
+        )));
+    }
+    // shortcut: the pid can be reused between ps and kill (milliseconds); a pidfd-style handle
+    // would close that gap, upgrade if macOS offers one without unsafe code.
+    let args = ["-TERM".to_string(), p];
+    run_action(
+        runner,
+        "kill",
+        &args,
+        &[],
+        &[0],
+        &format!("kill -TERM {pid}"),
+    )?;
+    Ok(pid)
+}
+
+/// The oMLX restart and start. A restart sends SIGTERM to the server the app runs
+/// (`omlx_term_server`); the app starts a new one, which reads `.omlx/model_settings.json`. A
+/// start opens the app (`open -gj -a <bundle>`: in the background, hidden), which starts its
+/// server. `omlx-cli start|restart` is not used: with oMLX 0.7.0 both make the app exit without
+/// an answer, and a restart left an orphaned server. Then a wait of at most the action bound
+/// until the socket reports the server running (after a restart, under another pid). A server
+/// still not running then, or a socket that fails, is a failure that names the last state.
+fn omlx_act(runner: &Runner, action: Action) -> Result<Completion, Refusal> {
+    let (verb, old) = match action {
+        Action::Restart => ("restart", Some(omlx_term_server(runner)?)),
+        _ => {
+            let bundle = omlx_bundle(runner).to_string_lossy().into_owned();
+            let by_hand = format!("open -a {bundle}");
+            let args = ["-gj".to_string(), "-a".into(), bundle];
+            run_action(runner, "open", &args, &[], &[0], &by_hand)?;
+            ("start", None)
+        }
+    };
     let b = bounds();
     let start = Instant::now();
     loop {
         stop_requested()?;
-        match omlx_report(runner) {
-            Ok(Some(s)) if s == "running" => return Ok(Completion::Completed),
-            Ok(s) if start.elapsed() >= b.settle => {
-                return Ok(Completion::Queued(format!(
-                    "server {} {:?} after the {verb}",
-                    s.as_deref().unwrap_or("not reachable"),
-                    b.settle
-                )));
+        let last = match omlx_report(runner) {
+            Ok(Some(s))
+                if s.state == "running"
+                    && (old.is_none() || s.pid.is_some_and(|p| Some(p) != old)) =>
+            {
+                return Ok(Completion::Completed);
             }
-            Ok(_) => std::thread::sleep(POLL),
-            Err(why) => return Err(Refusal::new(Code::ProbeFailed, why)),
+            Ok(Some(s)) if s.state == "running" => match s.pid {
+                Some(p) => format!("running under the old server pid {p}"),
+                None => "running without a server pid".into(),
+            },
+            Ok(Some(s)) => s.state,
+            Ok(None) => "the app is not running".into(),
+            Err(why) => {
+                return Err(Refusal::new(
+                    Code::ProbeFailed,
+                    format!("{why} during the oMLX {verb}"),
+                ));
+            }
+        };
+        if start.elapsed() >= b.act {
+            return Err(Refusal::new(
+                Code::IoFailed,
+                format!(
+                    "the oMLX server was not running {:?} after the {verb}; last state: {last}",
+                    b.act
+                ),
+            ));
         }
+        std::thread::sleep(POLL);
     }
 }
 

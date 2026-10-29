@@ -2,8 +2,9 @@
 //! (DFM-21 C08, docs/adapters.md, docs/lifecycle.md).
 //!
 //! Every run passes `--home <temp dir>` and an empty environment, plus `DFM_PROVIDER_PATH`
-//! pointing at a directory with an `omlx-cli` look-alike. The app's control socket is served by
-//! a thread of the test. HOME is a short directory below `/tmp`, because a Unix socket path
+//! pointing at a directory with `open`, `ps` and `kill` look-alikes. The app bundle is a
+//! directory below HOME (the isolated build never looks in `/Applications`). The app's control
+//! socket is served by a thread of the test. HOME is a short directory below `/tmp`, because a Unix socket path
 //! holds at most 104 bytes on macOS and the system temporary directory is too deep for it.
 
 mod common;
@@ -43,15 +44,38 @@ adapter = "omlx-app/v1"
 config = [".omlx/model_settings.json"]
 "#;
 
-/// Logs its arguments, fails with the `fail` marker, and otherwise reports the server running
-/// and marks the app launched, as `omlx-cli start|restart` does once the app accepted it.
-const FAKE_CLI: &str = r#"#!/bin/sh
+/// `open -gj -a <bundle>`: logs, reports the server running under pid 1001 and marks the app
+/// launched, as the app does once it started its server.
+const FAKE_OPEN: &str = r#"#!/bin/sh
 PATH=/usr/bin:/bin
 here=$(dirname "$0")
-printf 'omlx-cli %s\n' "$*" >> "$here/../log"
-[ -e "$here/../fail" ] && { echo "PLANTED-STDERR" >&2; exit 1; }
+printf 'open %s\n' "$*" >> "$here/../log"
 echo running > "$here/../state"
+echo 1001 > "$here/../pid"
 : > "$here/../launched"
+exit 0
+"#;
+
+/// `ps -o uid=,comm= -p <pid>`: the uid in `owner` (default: the current user) and the name in
+/// `comm` (default: `omlx-server`); exits 1 with the `gone` marker, as for a pid with no process.
+const FAKE_PS: &str = r#"#!/bin/sh
+PATH=/usr/bin:/bin
+here=$(dirname "$0")
+printf 'ps %s\n' "$*" >> "$here/../log"
+[ -e "$here/../gone" ] && exit 1
+printf '%5s %s\n' "$(cat "$here/../owner" 2>/dev/null || id -u)" "$(cat "$here/../comm" 2>/dev/null || echo omlx-server)"
+"#;
+
+/// `kill -TERM <pid>`: logs, fails with the `fail` marker, and otherwise does what the app does
+/// when its server exits: the socket then reports `next-state` (default `running`) under
+/// `next-pid` (default 2002).
+const FAKE_KILL: &str = r#"#!/bin/sh
+PATH=/usr/bin:/bin
+here=$(dirname "$0")
+printf 'kill %s\n' "$*" >> "$here/../log"
+[ -e "$here/../fail" ] && { echo "PLANTED-STDERR" >&2; exit 1; }
+cat "$here/../next-state" 2>/dev/null > "$here/../state" || echo running > "$here/../state"
+cat "$here/../next-pid" 2>/dev/null > "$here/../pid" || echo 2002 > "$here/../pid"
 exit 0
 "#;
 
@@ -117,8 +141,11 @@ impl Fx {
         );
         let bin = fx.fake.path().join("bin");
         fs::create_dir_all(&bin).unwrap();
-        fs::write(bin.join("omlx-cli"), FAKE_CLI).unwrap();
-        fs::set_permissions(bin.join("omlx-cli"), fs::Permissions::from_mode(0o755)).unwrap();
+        for (name, body) in [("open", FAKE_OPEN), ("ps", FAKE_PS), ("kill", FAKE_KILL)] {
+            fs::write(bin.join(name), body).unwrap();
+            fs::set_permissions(bin.join(name), fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        fs::create_dir_all(fx.bundle()).unwrap();
         let p = fx.root.join("profiles/t-01.toml");
         let o = fx.run(&[
             "bind",
@@ -149,6 +176,14 @@ impl Fx {
             .args(args)
             .output()
             .unwrap()
+    }
+
+    fn bundle(&self) -> PathBuf {
+        self.home.0.join("Applications/oMLX.app")
+    }
+
+    fn mark(&self, name: &str, content: &str) {
+        fs::write(self.fake.path().join(name), content).unwrap();
     }
 
     fn root_arg(&self) -> &str {
@@ -225,9 +260,10 @@ impl Fx {
     }
 
     /// Serves the control socket from a thread: each request line gets the state in the `state`
-    /// file. With `after_launch`, the socket appears only once the look-alike launched the app.
+    /// file and the server pid in the `pid` file (1001 at first). With `after_launch`, the socket appears only once the look-alike launched the app.
     fn app(&self, state: &str, after_launch: bool) {
         fs::write(self.fake.path().join("state"), state).unwrap();
+        fs::write(self.fake.path().join("pid"), "1001").unwrap();
         let sock = self
             .home
             .0
@@ -254,9 +290,14 @@ impl Fx {
                 let _ = BufReader::new(&c).read_line(&mut line);
                 assert_eq!(line, "{\"command\":\"status\"}\n");
                 let st = fs::read_to_string(fake.join("state")).unwrap_or_default();
+                let pid = fs::read_to_string(fake.join("pid")).unwrap_or_default();
+                let pid = match pid.trim() {
+                    "" => "null".to_string(),
+                    p => p.to_string(),
+                };
                 let _ = writeln!(
                     c,
-                    "{{\"state\":\"{}\",\"status\":\"ok\",\"ok\":true,\"port\":8000}}",
+                    "{{\"status\":\"ok\",\"pid\":{pid},\"port\":8000,\"host\":\"127.0.0.1\",\"state\":\"{}\",\"ok\":true}}",
                     st.trim()
                 );
             }
@@ -463,7 +504,8 @@ fn an_app_that_is_not_running_is_started_and_a_running_one_restarts_only_on_requ
         "{}",
         text(&o.stdout)
     );
-    assert_eq!(fx.log(), "omlx-cli start --no-wait\n");
+    let opened = format!("open -gj -a {}\n", fx.bundle().display());
+    assert_eq!(fx.log(), opened);
     // Running: current, and nothing is restarted without the request.
     let o = fx.services(&[]);
     ok(&o);
@@ -472,7 +514,7 @@ fn an_app_that_is_not_running_is_started_and_a_running_one_restarts_only_on_requ
         "{}",
         text(&o.stdout)
     );
-    assert_eq!(fx.log(), "omlx-cli start --no-wait\n");
+    assert_eq!(fx.log(), opened);
     // A restart needs the request and its approval.
     let o = fx.preview(&["--restart", "llm.omlx"]);
     assert_eq!(code(&o), 3, "{}", text(&o.stderr));
@@ -488,10 +530,11 @@ fn an_app_that_is_not_running_is_started_and_a_running_one_restarts_only_on_requ
         "{}",
         text(&o.stdout)
     );
-    assert!(
-        fx.log().ends_with("omlx-cli restart --no-wait\n"),
-        "{}",
-        fx.log()
+    // The restart signals exactly the pid the socket named, after ps showed it is this user's
+    // omlx-server, and waits for the server under its new pid.
+    assert_eq!(
+        fx.log(),
+        format!("{opened}ps -o uid=,comm= -p 1001\nkill -TERM 1001\n")
     );
 }
 
@@ -513,13 +556,97 @@ fn a_server_in_error_is_stale_and_a_failed_launcher_is_never_a_success() {
         "{}",
         text(&o.stderr)
     );
-    // Without the launcher the app is not installed: a blocker, and nothing runs.
-    fs::remove_file(fx.fake.path().join("bin/omlx-cli")).unwrap();
+    // Without the bundle the app is not installed: a blocker, and nothing runs.
+    fs::remove_dir(fx.bundle()).unwrap();
     let o = fx.preview(&[]);
     assert_eq!(code(&o), 3, "{}", text(&o.stderr));
     assert!(
         text(&o.stderr).contains("not installed"),
         "{}",
         text(&o.stderr)
+    );
+}
+
+/// A running server, its settings applied, ready for `--restart`.
+fn restartable() -> Fx {
+    let fx = Fx::new();
+    fx.live(LIVE, 0o644);
+    ok(&fx.apply());
+    fx.app("running", false);
+    fx
+}
+
+fn restart(fx: &Fx) -> Output {
+    fx.services(&["--restart", "llm.omlx", "--allow-disruptive", OP])
+}
+
+fn failed_with(o: &Output, detail: &str) {
+    let all = format!("{}\n{}", text(&o.stderr), text(&o.stdout));
+    assert_eq!(code(o), 1, "{all}");
+    assert!(all.contains(detail), "{all}");
+}
+
+#[test]
+fn a_server_that_never_runs_again_after_the_restart_fails_with_the_last_state() {
+    let fx = restartable();
+    fx.mark("next-state", "starting");
+    let o = restart(&fx);
+    failed_with(&o, "last state: starting");
+    assert!(fx.log().ends_with("kill -TERM 1001\n"), "{}", fx.log());
+    // A server still running under the pid that was signalled is not a restarted one.
+    let fx = restartable();
+    fx.mark("next-pid", "1001");
+    let o = restart(&fx);
+    failed_with(&o, "last state: running under the old server pid 1001");
+    // A running reply that names no pid is no evidence of a new server.
+    let fx = restartable();
+    fx.mark("next-pid", "");
+    let o = restart(&fx);
+    failed_with(&o, "last state: running without a server pid");
+}
+
+#[test]
+fn a_stopped_server_under_a_running_app_blocks_with_the_menu_fix() {
+    let fx = Fx::new();
+    fx.live(LIVE, 0o644);
+    ok(&fx.apply());
+    fx.app("stopped", false);
+    let o = fx.services(&[]);
+    let all = format!("{}\n{}", text(&o.stderr), text(&o.stdout));
+    assert!(all.contains("start the server from the oMLX menu"), "{all}");
+    assert!(!fx.log().contains("open "), "{}", fx.log());
+}
+
+#[test]
+fn a_pid_that_is_not_this_users_omlx_server_is_never_signalled() {
+    for (marker, content, detail) in [
+        ("owner", "0", "is not an omlx-server of this user"),
+        (
+            "comm",
+            "/usr/bin/python3",
+            "is not an omlx-server of this user",
+        ),
+        ("gone", "", "ps finds no process 1001"),
+    ] {
+        let fx = restartable();
+        fx.mark(marker, content);
+        let o = restart(&fx);
+        failed_with(&o, detail);
+        assert!(
+            text(&o.stderr).contains("nothing was signalled"),
+            "{}",
+            text(&o.stderr)
+        );
+        assert!(!fx.log().contains("kill"), "{marker}: {}", fx.log());
+    }
+    // A status that names no pid: nothing to check, nothing is signalled.
+    let fx = restartable();
+    fx.mark("pid", "");
+    let o = restart(&fx);
+    failed_with(&o, "named no server pid");
+    assert!(
+        !fx.log().contains("ps ") && !fx.log().contains("kill"),
+        "{}",
+        fx.log()
     );
 }

@@ -3801,20 +3801,30 @@ fn a_generated_definition_whose_operation_is_withheld_is_reviewed_from_the_home_
     );
     assert!(s.contains("the definition runs /usr/bin/true"), "{s}");
     assert!(!s.contains("the definition runs /usr/bin/false"), "{s}");
+    // The restart runs after the withheld definition, so it is withheld too: it would load the
+    // old program the run did not replace.
+    assert!(
+        s.contains("withheld: life.agent@service (runs after withheld life.agent-plist@"),
+        "{s}"
+    );
     let log = l.log();
     let o = l.plain(&flags);
     assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
     let s = stdout(&o);
     assert!(!s.contains("E_PLAN_STALE"), "{s}");
-    in_order(&s, &["  services: ok", "result: ok"]);
+    in_order(
+        &s,
+        &["  services: withheld (life.agent@service)", "result: ok"],
+    );
     assert!(
         fs::read_to_string(&plist)
             .unwrap()
             .contains("/usr/bin/true")
     );
-    in_order(
-        &l.log()[log.len()..],
-        &["launchctl bootout", "launchctl bootstrap"],
+    assert!(
+        !l.log()[log.len()..].contains("launchctl boot"),
+        "{}",
+        l.log()
     );
 }
 
@@ -4483,4 +4493,54 @@ fn a_stop_during_brew_upgrade_starts_no_other_brew_command() {
         Some("brew upgrade --formula uv"),
         "{log}"
     );
+}
+
+#[test]
+fn a_service_restart_after_a_withheld_configuration_takeover_is_withheld_too() {
+    let l = Life::new();
+    let o = l.approved(&[]);
+    assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
+    // bar reads a settings file the owner already holds and the ledger does not record: its
+    // merge is a takeover, withheld without --allow-adopt. The restart bar was asked for must
+    // not run on the file the run did not write.
+    fs::write(l.fake.path().join("brew-bar"), "started").unwrap();
+    fs::create_dir_all(l.fx.h(".claude")).unwrap();
+    fs::write(l.fx.h(".claude/settings.json"), "{\"theme\":\"dark\"}\n").unwrap();
+    fs::set_permissions(
+        l.fx.h(".claude/settings.json"),
+        fs::Permissions::from_mode(0o600),
+    )
+    .unwrap();
+    l.push_module(
+        "\n[[resources]]\nid = \"settings\"\nkind = \"merge\"\nadapter = \"claude-settings/v1\"\ntarget = \".claude/settings.json\"\n[resources.value.managed]\noutputStyle = \"STE\"\n\n[[resources]]\nid = \"bar\"\nkind = \"service\"\nadapter = \"brew-service/v1\"\n[resources.value]\nname = \"bar\"\nconfig = [\".claude/settings.json\"]\n",
+        &[],
+        "bar reads the merged settings",
+    );
+    let takeover = "life.settings@.claude/settings.json";
+    let restart = ["--restart", "life.bar"];
+    let o = l.plain(&restart);
+    assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
+    let s = stdout(&o);
+    in_order(
+        &s,
+        &[
+            &format!("withheld: {takeover} (needs --allow-adopt)"),
+            &format!("withheld: life.bar@service (runs after withheld {takeover})"),
+            "plan digest: ",
+            &format!("  config: withheld ({takeover})"),
+            "  services: withheld (life.bar@service)",
+            "result: ok",
+            "warning: services withheld: life.bar@service, after a withheld operation of an earlier scope",
+        ],
+    );
+    assert!(!l.log().contains("brew services restart"), "{}", l.log());
+    assert_eq!(
+        fs::read_to_string(l.fx.h(".claude/settings.json")).unwrap(),
+        "{\"theme\":\"dark\"}\n"
+    );
+    // With the takeover approved, the merge runs first and the restart after it.
+    let o = l.plain(&["--restart", "life.bar", "--allow-adopt", takeover]);
+    assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
+    in_order(&stdout(&o), &["  config: ok", "  services: ok"]);
+    assert!(l.log().contains("brew services restart bar"), "{}", l.log());
 }
