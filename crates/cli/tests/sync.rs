@@ -4544,3 +4544,62 @@ fn a_service_restart_after_a_withheld_configuration_takeover_is_withheld_too() {
     in_order(&stdout(&o), &["  config: ok", "  services: ok"]);
     assert!(l.log().contains("brew services restart bar"), "{}", l.log());
 }
+
+/// DFM-33: `sync` before the owner commits an adoption copies the dirty checkout into staging,
+/// so the adopted link is current, not a removal or a conflict.
+#[test]
+fn sync_after_adopt_before_the_commit_keeps_the_link_current() {
+    let fx = Fx::new();
+    let bin = fx.work.path().join("bin");
+    fs::create_dir_all(&bin).unwrap();
+    let scanner = bin.join("gitleaks");
+    fs::write(&scanner, common::providers::FAKE_GITLEAKS).unwrap();
+    fs::set_permissions(&scanner, fs::Permissions::from_mode(0o755)).unwrap();
+    let path = format!("{}:/usr/bin:/bin", bin.display());
+    let run = |args: &[&str]| {
+        Command::new(BIN)
+            .env_clear()
+            .env("DFM_PROVIDER_PATH", &path)
+            .arg("--home")
+            .arg(fx.home.path())
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    // A trial with no provider package (the harness record), so no Brewfile line is needed.
+    let dir = fx.h(".config/tuicr");
+    let o = run(&[
+        "__record-trial",
+        "--id",
+        "trial-tuicr",
+        "--tool",
+        "tuicr",
+        "--baseline-path",
+        dir.to_str().unwrap(),
+    ]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(dir.join("config.toml"), "theme = 1\n").unwrap();
+    let adopt = [
+        "adopt",
+        "trial-tuicr",
+        "--module",
+        "core",
+        "--root",
+        fx.root_arg(),
+    ];
+    let p = run(&[&adopt[..], &["--preview"]].concat());
+    assert_eq!(code(&p), 0, "{}\n{}", stdout(&p), stderr(&p));
+    let o = run(&[&adopt[..], &["--yes-plan", &digest_of(&p)]].concat());
+    assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
+    let o = fx.preview();
+    assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
+    let t = stdout(&o);
+    assert!(
+        t.lines()
+            .any(|l| l.contains("current") && l.contains("core.config-tuicr-config-toml@")),
+        "{t}"
+    );
+    assert!(!t.contains("remove@core.config-tuicr"), "{t}");
+    assert!(!t.contains("blocked"), "{t}");
+}

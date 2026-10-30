@@ -89,4 +89,4 @@ The dotfiles commit hook (`gitleaks git --staged`) stays as the second check.
 - **Writable check.** Only the owner bits (for the owner) and the other bits are read; group permissions are not.
 - **Record size.** The intent token is at most 4096 bytes. A run whose record is larger is refused before any write (`E_LIMIT_EXCEEDED`).
 - **Interruption.** A second run after a stop does not yet recognise its own partial work (DFM-33 Task 6): a repo copy or a dirty manifest from the first run refuses it.
-- **Evidence scope.** Tests use the `test-isolation` build, a `gitleaks` look-alike and the `brew` look-alike. The real `gitleaks` is tested only by the scan unit test, and only where it is on `PATH`. No test runs `sync` after adopt.
+- **Evidence scope.** Tests use the `test-isolation` build, a `gitleaks` look-alike and the `brew` look-alike. The real `gitleaks` is tested only by the scan unit test, and only where it is on `PATH`. `crates/cli/tests/sync.rs` runs `sync --preview` after adopt and before the commit; no test runs `sync` with a refused equal regular file.

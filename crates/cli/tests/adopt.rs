@@ -686,3 +686,62 @@ fn an_official_package_listed_with_its_tap_gets_no_second_line() {
         out(&o)
     );
 }
+
+#[test]
+fn a_manifest_edited_after_the_preview_is_stale() {
+    let fx = Fx::new();
+    fx.live(LIVE, TUICR);
+    let d = digest_of(&fx.adopt(&["--module", "core", "--preview"]));
+    // Committed, so the clean-checkout check passes and only the digest can catch it.
+    let manifest = fs::read_to_string(fx.root.join(MANIFEST)).unwrap();
+    fx.put(MANIFEST, &format!("{manifest}# reviewed\n"));
+    git(&fx.root, &["commit", "-q", "-am", "edit"]);
+    let before = fx.snapshot();
+    refused(
+        &fx.adopt(&["--module", "core", "--yes-plan", &d]),
+        "E_PLAN_STALE",
+    );
+    assert_eq!(fx.snapshot(), before);
+}
+
+#[test]
+fn a_change_between_the_check_and_the_lock_is_caught_under_the_lock() {
+    let fx = Fx::new();
+    fx.live(LIVE, TUICR);
+    let d = digest_of(&fx.adopt(&["--module", "core", "--preview"]));
+    // The run parks after its pre-lock check; the live file changes meanwhile.
+    let gate = fx.fake.path().join("go");
+    let parked = Command::new(BIN)
+        .env_clear()
+        .env(
+            "DFM_PROVIDER_PATH",
+            format!("{}:/usr/bin:/bin", fx.bin().display()),
+        )
+        .env(
+            "DFM_FAILPOINT",
+            format!("adopt-before-lock:wait-{}", gate.display()),
+        )
+        .arg("--home")
+        .arg(fx.home.path())
+        .args(["adopt", "trial-tuicr", "--module", "core", "--yes-plan", &d])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let reached = gate.with_extension("reached");
+    let end = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while !reached.exists() {
+        assert!(
+            std::time::Instant::now() < end,
+            "the failpoint was not reached"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    fx.live(LIVE, "theme = \"light\"\n");
+    let before = fx.snapshot();
+    fs::write(&gate, "").unwrap();
+    let o = parked.wait_with_output().unwrap();
+    refused(&o, "E_PLAN_STALE");
+    assert_eq!(fx.snapshot(), before);
+    assert!(!fx.root.join(REPO_FILE).exists());
+}
