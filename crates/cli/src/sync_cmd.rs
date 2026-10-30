@@ -2290,6 +2290,22 @@ fn status_name(s: state::Status) -> String {
         .unwrap_or_default()
 }
 
+/// Why `brew` waits for each trial record: an unreadable record, or an active trial that
+/// installed with Homebrew. An adopted trial has ended, so it holds nothing.
+fn trial_holds(
+    trials: Vec<(String, Result<state::TrialRecord, Refusal>)>,
+) -> impl Iterator<Item = String> {
+    trials.into_iter().filter_map(|(name, t)| match t {
+        Err(_) => Some(format!("unreadable trial record {name}")),
+        Ok(t) => t
+            .is_active()
+            .then_some(t.package)
+            .flatten()
+            .filter(|p| p.adapter == "homebrew/v1")
+            .map(|p| format!("active trial {} (homebrew/v1 {})", t.trial_id, p.name)),
+    })
+}
+
 /// The updater environment: the provider runner and why `brew` must wait for the trials.
 fn updater_env<'a>(
     ctx: &'a Ctx,
@@ -2403,18 +2419,7 @@ fn upgrade(
                 .filter(|s| s.starts_with("trials/"))
                 .map(|s| format!("unfinished trial record {s}")),
         );
-    let held: BTreeSet<String> = loaded
-        .trials
-        .into_iter()
-        .filter_map(|(name, t)| match t {
-            Err(_) => Some(format!("unreadable trial record {name}")),
-            Ok(t) => t
-                .package
-                .filter(|p| p.adapter == "homebrew/v1")
-                .map(|p| format!("active trial {} (homebrew/v1 {})", t.trial_id, p.name)),
-        })
-        .chain(unread)
-        .collect();
+    let held: BTreeSet<String> = trial_holds(loaded.trials).chain(unread).collect();
     let started = now_ns()?;
     let mut runner = ctx.runner(sys);
     runner.detach = true;
@@ -2669,6 +2674,52 @@ mod tests {
             deferred: BTreeMap::new(),
             withheld: BTreeSet::new(),
         }
+    }
+
+    #[test]
+    fn brew_does_not_wait_for_an_adopted_trial() {
+        use dfm_model::state::{
+            Baseline, SCHEMA, Stamp, TRIAL_SCHEMA_ADOPTED, TrialAdopted, TrialPackage, TrialRecord,
+        };
+        let record = |id: &str, adopted: bool| {
+            let t = TrialRecord {
+                schema: if adopted {
+                    TRIAL_SCHEMA_ADOPTED
+                } else {
+                    SCHEMA
+                },
+                binding: Stamp {
+                    profile: "/p".into(),
+                    machine_id: "m".into(),
+                    binding_digest: "0".repeat(64),
+                },
+                trial_id: id.into(),
+                tool: "uv".into(),
+                created_unix_ns: 1,
+                baseline: Baseline {
+                    tool_preexisting: false,
+                    paths: vec![],
+                    owners: vec![],
+                },
+                owned_outputs: vec![],
+                package: Some(TrialPackage {
+                    adapter: "homebrew/v1".into(),
+                    name: "uv".into(),
+                    install: None,
+                }),
+                unknown: vec![],
+                adopted: adopted.then(|| TrialAdopted {
+                    op_id: "adopt-1-2".into(),
+                    module: "shell".into(),
+                    at_unix_ns: 9,
+                }),
+            };
+            (format!("{id}.json"), Ok(t))
+        };
+        assert_eq!(trial_holds(vec![record("done", true)]).count(), 0);
+        let held: Vec<String> =
+            trial_holds(vec![record("done", true), record("live", false)]).collect();
+        assert_eq!(held, ["active trial live (homebrew/v1 uv)"]);
     }
 
     #[test]

@@ -289,6 +289,7 @@ pub fn record_trial(ctx: &Ctx, args: &[String], out: &mut dyn Write) -> Result<(
         owned_outputs: vec![],
         package: None,
         unknown: vec![],
+        adopted: None,
     };
     store.write_trial(&trial)?;
     writeln!(out, "recorded trial {id}").map_err(|e| io("output", &e))

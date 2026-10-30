@@ -577,11 +577,14 @@ fn evidence_rows(l: &StateLoaded, findings: &[dfm_engine::Finding], rows: &mut V
     bad
 }
 
-/// One row per active trial. A record that is unreadable or written for another identity already
-/// has its WARN row among the evidence rows.
+/// One row per active trial. An adopted trial has ended and has no row. A record that is
+/// unreadable or written for another identity already has its WARN row among the evidence rows.
 fn trial_rows(l: &StateLoaded, findings: &[dfm_engine::Finding], rows: &mut Vec<Row>) {
     for (n, t) in &l.trials {
         let Ok(t) = t else { continue };
+        if !t.is_active() {
+            continue;
+        }
         let file = format!("trials/{n}");
         if findings.iter().any(|f| f.file == file) {
             continue;

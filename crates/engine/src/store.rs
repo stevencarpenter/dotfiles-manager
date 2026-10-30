@@ -12,8 +12,8 @@ use crate::fsys::{
 use dfm_model::binding::Binding;
 use dfm_model::lock::Grants;
 use dfm_model::state::{
-    self, Class, JournalEntry, Ledger, Phase, Receipt, Scope, Stamp, StateDoc, TrialRecord,
-    canonical,
+    self, Class, JournalEntry, Ledger, Phase, Receipt, Scope, Stamp, StateDoc, TrialAdopted,
+    TrialRecord, canonical,
 };
 use dfm_model::{Code, Refusal};
 use std::fs;
@@ -1056,6 +1056,50 @@ impl Store {
             Ok(false) => Ok(false),
             r => self.wrote(r),
         }
+    }
+
+    /// Ends a trial: replaces its record with the same record carrying `adopted`, through the
+    /// same atomic replacement as [`Store::write_trial`]. The record is read under the writer
+    /// lock this store holds. An id with no readable record is `E_STATE_INVALID`; a record that
+    /// is already adopted is `E_CONFLICT` and stays as it was.
+    pub fn mark_trial_adopted(&self, trial_id: &str, adopted: TrialAdopted) -> Result<(), Refusal> {
+        self.wrote(self.mark_trial_adopted_inner(trial_id, adopted))
+    }
+
+    fn mark_trial_adopted_inner(
+        &self,
+        trial_id: &str,
+        adopted: TrialAdopted,
+    ) -> Result<(), Refusal> {
+        let missing = || {
+            Refusal::new(
+                Code::StateInvalid,
+                format!("trial {trial_id} has no record in state/trials/"),
+            )
+        };
+        if !state::valid_id(trial_id) {
+            return Err(missing());
+        }
+        let dir = self
+            .guard(Some("trials"))?
+            .ok_or_else(|| storage("no trials directory"))?;
+        let bytes = dir
+            .read_private(&self.sys, &format!("{trial_id}.json"), state::MAX_BYTES)?
+            .ok_or_else(missing)?;
+        let mut t = TrialRecord::parse(&bytes)?;
+        if t.trial_id != trial_id {
+            return Err(missing());
+        }
+        if !t.is_active() {
+            return Err(Refusal::new(
+                Code::Conflict,
+                format!("trial {trial_id} is already adopted"),
+            ));
+        }
+        t.schema = state::TRIAL_SCHEMA_ADOPTED;
+        t.adopted = Some(adopted);
+        let (dir, name, bytes) = self.checked_trial(&t)?;
+        dir.replace_file(&name, &bytes, &self.fail, "trial")
     }
 
     /// The trials directory, the file name and the bytes of a record that passed every check.
