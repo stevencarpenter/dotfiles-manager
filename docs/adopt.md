@@ -31,7 +31,7 @@ Order of one run:
    - `existed: false`: every regular file now under the path (or the path itself, when it is a file).
    - `existed: true` with a `sha256`: the file, only when its `file_fingerprint` changed. An unchanged pre-existing file is not the trial's work.
    - `existed: true` without a hash (a directory that existed before): every regular file under it, marked `(pre-existing directory)` in the preview.
-   A link, a special file, an unreadable file or a file over 16 MiB refuses the run (`E_CONFLICT`). More than 64 files is `E_LIMIT_EXCEEDED`. No candidate is `E_CONFLICT` (`nothing to adopt`). Each file is read once: its bytes, mode, SHA-256 and fingerprint all come from that read.
+   A link, a special file, an unreadable file or a file over 16 MiB refuses the run (`E_CONFLICT`). More than 64 files is `E_LIMIT_EXCEEDED`. No candidate is `E_CONFLICT` (`nothing to adopt`). Each file is read once: the read that decides whether a pre-existing file changed also supplies its bytes, and its mode, SHA-256 and fingerprint come from that read. The run under the lock reads each file once more, and the digest compare proves the bytes are the approved ones.
 4. **Ownership and the checkout.** Each candidate gets the repo path `<manifest dir>/home/<HOME-relative path>`, the link source `home/<HOME-relative path>` and the resource id `resource_id(<HOME-relative path>)`. The run is refused (`E_CONFLICT`) when:
    - two candidates give the same resource id (`a.b` and `a/b`);
    - a resolved resource of any module claims the target, or a directory above or below it;

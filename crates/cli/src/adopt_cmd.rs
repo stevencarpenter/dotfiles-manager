@@ -600,9 +600,13 @@ fn files_below(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), Refusal> {
     Ok(())
 }
 
-/// The live files the trial created or changed (docs/adopt.md, "Candidates"), each with
-/// whether it came from a directory that existed before the trial.
-fn live_candidates(t: &TrialRecord) -> Result<Vec<(PathBuf, bool)>, Refusal> {
+/// One live file as adopt read it: path, bytes, permission bits, and whether it came from a
+/// directory that existed before the trial.
+type LiveFile = (PathBuf, Vec<u8>, u32, bool);
+
+/// The live files the trial created or changed (docs/adopt.md, "Candidates"). Each file is read
+/// once: the read that decides whether a pre-existing file changed also supplies its bytes.
+fn live_candidates(t: &TrialRecord) -> Result<Vec<LiveFile>, Refusal> {
     let mut out = Vec::new();
     for b in &t.baseline.paths {
         let p = Path::new(&b.path);
@@ -618,22 +622,27 @@ fn live_candidates(t: &TrialRecord) -> Result<Vec<(PathBuf, bool)>, Refusal> {
             }
         };
         let Some(now) = now else { continue };
-        let mut found = Vec::new();
+        let pre = b.existed && b.sha256.is_none();
         match (b.existed, &b.sha256) {
             (true, Some(was)) => {
-                let (bytes, _) = read_candidate(p)?;
+                let (bytes, mode) = read_candidate(p)?;
                 if file_fingerprint(&bytes) != *was {
-                    found.push(p.to_path_buf());
+                    out.push((p.to_path_buf(), bytes, mode, pre));
                 }
             }
-            _ if now.is_dir() => files_below(p, &mut found)?,
+            _ if now.is_dir() => {
+                let mut found = Vec::new();
+                files_below(p, &mut found)?;
+                for f in found {
+                    let (bytes, mode) = read_candidate(&f)?;
+                    out.push((f, bytes, mode, pre));
+                }
+            }
             _ => {
-                read_candidate(p)?;
-                found.push(p.to_path_buf());
+                let (bytes, mode) = read_candidate(p)?;
+                out.push((p.to_path_buf(), bytes, mode, pre));
             }
         }
-        let pre = b.existed && b.sha256.is_none();
-        out.extend(found.into_iter().map(|f| (f, pre)));
     }
     Ok(out)
 }
@@ -765,10 +774,9 @@ fn decide(
     let home = ctx.layout().home;
     let module_dir = dir_of(&manifest);
     let mut candidates: Vec<Candidate> = Vec::new();
-    for (path, preexisting_dir) in live_candidates(&trial)? {
+    for (path, bytes, mode, preexisting_dir) in live_candidates(&trial)? {
         let rel = rel_text(&path, &home)
             .ok_or_else(|| conflict(format!("{} is outside HOME", path.display())))?;
-        let (bytes, mode) = read_candidate(&path)?;
         let source = format!("home/{rel}");
         let repo = if module_dir.is_empty() {
             source.clone()
