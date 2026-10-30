@@ -37,13 +37,13 @@ Order of one run:
    - a resolved resource of any module claims the target, or a directory above or below it;
    - the id already exists in any module;
    - an active trial other than this one claims the live path in its `owned_outputs`;
-   - the repo path exists, tracked or not;
-   - the manifest or the Brewfile has uncommitted changes (`git status`);
+   - the repo path exists, tracked or not, unless it is the copy of an interrupted run (see "Interruption");
+   - the manifest or the Brewfile has uncommitted changes (`git status`), unless an interrupted run already appended to it;
    - a component on the way to a repo path, the manifest or the Brewfile is a link, or the deepest existing one is not writable.
 5. **The Brewfile.** Only for a `homebrew/v1` trial. The file is `<root>/Brewfile.<module>` when it exists, else `<root>/Brewfile`. A missing file is `E_CONFLICT` with its path. It must be inside the checkout and not ignored. The line is `brew "<name>"`, or `cask "<name>"` when brew holds the package as a cask (Caskroom rack and no Cellar rack, or a `homebrew/cask/` name). The name is the recorded package without an official `homebrew/core/` or `homebrew/cask/` prefix. A third-party tap keeps `owner/tap/name`, because its short name would install another formula, or none, on a fresh machine. A version suffix (`node@20`) is kept. A line of either kind for any spelling of the same package (`tuicr`, `homebrew/core/tuicr`) means nothing is appended. A `mise/v1` trial, or a trial with no provider package, gets no line, and the preview says why.
 6. **The scan.** `gitleaks dir` over a manager-owned copy of the candidates (see "The secret scan"). A finding is `E_CONFLICT` and names the live path, never the value. A missing `gitleaks` or a scan that does not complete is `E_PROBE_FAILED`.
 7. **The edited composition.** The manifest with the appended blocks and the repo copies are put into the loaded sources in memory. The profile is resolved again: a resolve error refuses the run. Each new resource must resolve as `<module>.<id>`, declared in that manifest, with the candidate as its target. The configuration plan of that composition, with the candidates approved for takeover, must hold exactly one planned `adopt-file` operation per new resource, with no blocker naming one.
-8. **Preview.** `adopt:`, `manifest:`, one `candidate:` line per file (live path, repo path, id), `brewfile:`, `takeover:`, the record's `unknown:` tokens and `plan digest:`. `--preview` stops here, exit 0 (3 when refused). Without `--yes-plan`, the run stops with `E_APPROVAL_REQUIRED` (exit 3) and the digest to pass. The digest is the SHA-256 of the canonical JSON of: trial id, the SHA-256 of the trial record's canonical JSON, module, profile path, manifest path and SHA-256, Brewfile path and SHA-256 (or none), the Brewfile line (or none), each candidate (live path, size, mode, SHA-256, repo path, id), the binary identity and the binding stamp.
+8. **Preview.** `adopt:`, `resume:` after an interruption, `manifest:`, one `candidate:` line per file (live path, repo path, id), `brewfile:`, `takeover:`, the record's `unknown:` tokens and `plan digest:`. `--preview` stops here, exit 0 (3 when refused). Without `--yes-plan`, the run stops with `E_APPROVAL_REQUIRED` (exit 3) and the digest to pass. The digest is the SHA-256 of the canonical JSON of: trial id, the SHA-256 of the trial record's canonical JSON, module, profile path, manifest path and SHA-256, Brewfile path and SHA-256 (or none), the Brewfile line (or none), each candidate (live path, size, mode, SHA-256, repo path, id, and whether its copy and its link are kept from an interrupted run), whether each append is kept, the interrupted run's op id (or none), the binary identity and the binding stamp. The SHA-256 of an appended file is the one before the append.
 9. **Under the lock.** The writer lock is taken, the identity and the ledger are checked, and steps 1 to 5 and 7 run again. The scan does not run again: the digest covers the hash of every scanned byte. A different digest is `E_PLAN_STALE` (exit 3, nothing written).
 10. **The intent.** The journal gets a `trial-adopt` intent (resource: the trial id). The name is not `adopt`, which is the engine's link adoption that recovery probes by content. Its recovery list is empty. Its `token` is a JSON record of the run: the module, the manifest and the Brewfile, each with its path and SHA-256 before and after the append, and each file with its target, repo path and SHA-256. A later run uses it to recognise its own partial work by content.
 11. **The repo writes.** In order, each followed by a failure point:
@@ -61,6 +61,21 @@ Order of one run:
 | 2 | Usage. A `--root` that does not exist (`E_REPORT_UNAVAILABLE`, as for `plan` and `apply`). |
 | 3 | Refused before any write: approval missing, stale digest, a refusal in steps 1 to 7, lock held, not bound. |
 | 130, 143 | A stop request. A child (`gitleaks`, `git`, `brew`) is ended. |
+
+## Interruption
+
+The owner runs the same command again after a stop (exit 1, 130, 143, or a killed process). The run completes the adoption; it never deletes a path and never writes one twice.
+
+- **The record.** The latest `trial-adopt` intent of the trial, in any phase (open, `done`, `failed`, `unknown`), while the trial record is active. An intent older than the trial record, or for another module, is ignored. A token that cannot be read is `E_STATE_INVALID`.
+- **What counts as its own work.** Each check is by content against the token:
+  - a repo copy whose bytes hash to the recorded SHA-256, which is also the candidate's SHA-256 now;
+  - a manifest or Brewfile whose bytes hash to the recorded `post`, and are bytes hashing to the recorded `pre` followed by exactly the planned append;
+  - a live path that is a link to the recorded repo copy. Its candidate bytes and mode are read from that copy.
+- **Anything else** is `E_CONFLICT` with the path: a changed or foreign repo copy, a hand-edited manifest or Brewfile, a link elsewhere. Nothing is written.
+- **The checks of a fresh run.** They run against the composition before the kept manifest append, so the planned resources do not collide with themselves. A kept file is not checked for uncommitted changes and not walked for writability, because it is not written.
+- **The takeover.** A kept link that the ledger owns is planned `current` and needs no approval. A kept link without an owner (for example after `dfm state recover` closed the engine's `adopt-file` intent) is a planned `adopt`; its id is approved only because the live link equals the recorded one. The engine then records the owner.
+- **The preview and the digest.** `resume:` names the interrupted op id, and each kept item says `kept from the interrupted run`. The digest covers what is kept, so the approval matches what is left to do.
+- **Concurrent runs.** The second run's preview reads the first run's partial work. Its approval needs the writer lock and is refused with `E_LOCKED` while the first run holds it, before any write.
 
 ## The secret scan
 
@@ -88,5 +103,5 @@ The dotfiles commit hook (`gitleaks git --staged`) stays as the second check.
 - **Parent links between the check and the write.** The walk that refuses a link on the way to a repo path, the manifest or the Brewfile runs under the lock, before the writes. A directory swapped for a link after that walk is not detected; only the final component is opened without following a link.
 - **Writable check.** Only the owner bits (for the owner) and the other bits are read; group permissions are not.
 - **Record size.** The intent token is at most 4096 bytes. A run whose record is larger is refused before any write (`E_LIMIT_EXCEEDED`).
-- **Interruption.** A second run after a stop does not yet recognise its own partial work (DFM-33 Task 6): a repo copy or a dirty manifest from the first run refuses it.
+- **Interruption.** A kept manifest or Brewfile append is matched to the bytes the interrupted run found, not to the committed file. A commit made after the interruption that leaves those bytes unchanged is not detected.
 - **Evidence scope.** Tests use the `test-isolation` build, a `gitleaks` look-alike and the `brew` look-alike. The real `gitleaks` is tested only by the scan unit test, and only where it is on `PATH`. `crates/cli/tests/sync.rs` runs `sync --preview` after adopt and before the commit; no test runs `sync` with a refused equal regular file.

@@ -367,6 +367,10 @@ struct Candidate {
     id: String,
     /// The baseline entry was a directory that existed before the trial.
     preexisting_dir: bool,
+    /// An interrupted run of this adoption already wrote the repo copy.
+    copied: bool,
+    /// The live path already is the planned link to the repo copy; `bytes` were read from it.
+    linked: bool,
 }
 
 impl Candidate {
@@ -378,13 +382,110 @@ impl Candidate {
     }
 }
 
-/// A repo file adopt appends to: its path relative to the root, the hash of its bytes now, and
-/// the text it appends (empty: none).
+/// A repo file adopt appends to: its path relative to the root, the hash of its bytes before the
+/// append, and the text it appends (empty: none). `done`: an interrupted run already appended it.
 struct Edit {
     path: String,
     pre: String,
     post: String,
     addition: String,
+    done: bool,
+}
+
+/// An appended file as the `trial-adopt` token records it.
+struct PriorEdit {
+    path: String,
+    pre: String,
+    post: String,
+}
+
+/// The token of the latest `trial-adopt` intent of this trial and module, in any phase: what an
+/// interrupted run planned, so this run can recognise that run's work by content.
+struct Prior {
+    op_id: String,
+    manifest: PriorEdit,
+    brewfile: Option<PriorEdit>,
+    /// `(target, repo path)` to the SHA-256 of the copy.
+    files: BTreeMap<(String, String), String>,
+}
+
+/// The latest `trial-adopt` intent of `trial` into `module`. An intent from before the trial
+/// began belongs to an earlier trial of the same id, and one for another module is not this
+/// adoption; both are ignored. A token that cannot be read refuses the run: recovery never
+/// guesses.
+fn prior_run(store: &Store, trial: &TrialRecord, module: &str) -> Result<Option<Prior>, Refusal> {
+    let entries = store.read_journal_lenient()?;
+    let Some(e) = entries.iter().rev().find(|e| {
+        e.op == "trial-adopt" && e.resource == trial.trial_id && e.phase == Phase::Intent
+    }) else {
+        return Ok(None);
+    };
+    // The op id is `adopt-<start ns>-<pid>`.
+    let started = e
+        .op_id
+        .strip_prefix("adopt-")
+        .and_then(|r| r.split_once('-'))
+        .and_then(|(ns, _)| ns.parse::<u64>().ok());
+    if started.is_none_or(|ns| ns < trial.created_unix_ns) {
+        return Ok(None);
+    }
+    let bad = || {
+        Refusal::new(
+            Code::StateInvalid,
+            format!(
+                "the journal intent {} of trial {} cannot be read; nothing was changed",
+                e.op_id, trial.trial_id
+            ),
+        )
+    };
+    let v: serde_json::Value =
+        serde_json::from_str(e.token.as_deref().ok_or_else(bad)?).map_err(|_| bad())?;
+    if v["module"].as_str() != Some(module) {
+        return Ok(None);
+    }
+    let s = |v: &serde_json::Value| v.as_str().map(str::to_string).ok_or_else(bad);
+    let edit = |v: &serde_json::Value| -> Result<PriorEdit, Refusal> {
+        Ok(PriorEdit {
+            path: s(&v["path"])?,
+            pre: s(&v["pre"])?,
+            post: s(&v["post"])?,
+        })
+    };
+    let brewfile = match &v["brewfile"] {
+        serde_json::Value::Null => None,
+        b => Some(edit(b)?),
+    };
+    let mut files = BTreeMap::new();
+    for f in v["files"].as_array().ok_or_else(bad)? {
+        files.insert((s(&f["target"])?, s(&f["repo"])?), s(&f["sha256"])?);
+    }
+    Ok(Some(Prior {
+        op_id: e.op_id.clone(),
+        manifest: edit(&v["manifest"])?,
+        brewfile,
+        files,
+    }))
+}
+
+/// `current` without the interrupted run's append: `Some` only when `current` hashes to the
+/// recorded `post` and is exactly bytes hashing to the recorded `pre` plus `addition`, as
+/// `append` writes it (with the newline it adds to a file that lacks one).
+fn prior_base<'a>(current: &'a [u8], addition: &str, prior: &PriorEdit) -> Option<&'a [u8]> {
+    if addition.is_empty() || sha256_hex(current) != prior.post {
+        return None;
+    }
+    let base = current.strip_suffix(addition.as_bytes())?;
+    [base, base.strip_suffix(b"\n").unwrap_or(base)]
+        .into_iter()
+        .find(|b| sha256_hex(b) == prior.pre && append(b, addition) == current)
+}
+
+/// The refusal for a repo file that is neither as the interrupted run found it nor that plus
+/// its planned append.
+fn not_prior(path: &str, op_id: &str) -> Refusal {
+    conflict(format!(
+        "{path} is neither as the interrupted adopt {op_id} found it nor that plus its planned append; nothing was changed. Fix: restore it with git, then run adopt again"
+    ))
 }
 
 /// What the preview shows and the digest covers.
@@ -405,6 +506,8 @@ struct Decision {
     unknown: Vec<String>,
     binary: Binary,
     stamp: Stamp,
+    /// The op id of the interrupted run whose work this run completes.
+    resume: Option<String>,
 }
 
 impl Decision {
@@ -414,7 +517,7 @@ impl Decision {
             .iter()
             .map(|c| {
                 json!({"path": c.live, "size": c.bytes.len(), "mode": c.mode, "sha256": c.sha256,
-                    "repo": c.repo, "id": c.id})
+                    "repo": c.repo, "id": c.id, "copied": c.copied, "linked": c.linked})
             })
             .collect();
         let doc = json!({
@@ -422,8 +525,11 @@ impl Decision {
             "record": self.record,
             "module": self.module,
             "profile": self.profile,
-            "manifest": {"path": self.manifest.path, "sha256": self.manifest.pre},
-            "brewfile": self.brewfile.as_ref().map(|b| json!({"path": b.path, "sha256": b.pre})),
+            "manifest": {"path": self.manifest.path, "sha256": self.manifest.pre,
+                "done": self.manifest.done},
+            "brewfile": self.brewfile.as_ref()
+                .map(|b| json!({"path": b.path, "sha256": b.pre, "done": b.done})),
+            "resume": self.resume,
             "brew_line": self.brewfile.as_ref().map(|b| &b.addition),
             "candidates": files,
             "binary": {"version": self.binary.version, "sha256": self.binary.sha256},
@@ -470,19 +576,37 @@ impl Decision {
     }
 
     fn print(&self, out: &mut dyn Write, digest: &str) -> std::io::Result<()> {
-        writeln!(out, "adopt: {} module={}", self.trial_id, self.module)?;
-        writeln!(
-            out,
-            "manifest: {} (+{} fs-link/v1 resources, appended)",
-            visible(&self.manifest.path),
-            self.candidates.len()
-        )?;
-        for c in &self.candidates {
-            let note = if c.preexisting_dir {
-                " (pre-existing directory)"
+        let kept = |done: bool| {
+            if done {
+                " (kept from the interrupted run)"
             } else {
                 ""
-            };
+            }
+        };
+        writeln!(out, "adopt: {} module={}", self.trial_id, self.module)?;
+        if let Some(op) = &self.resume {
+            writeln!(
+                out,
+                "resume: {op} was interrupted; its own work below is kept, the rest runs now"
+            )?;
+        }
+        writeln!(
+            out,
+            "manifest: {} (+{} fs-link/v1 resources, appended){}",
+            visible(&self.manifest.path),
+            self.candidates.len(),
+            kept(self.manifest.done)
+        )?;
+        for c in &self.candidates {
+            let mut note = String::new();
+            if c.preexisting_dir {
+                note.push_str(" (pre-existing directory)");
+            }
+            if c.linked {
+                note.push_str(" (link kept from the interrupted run)");
+            } else if c.copied {
+                note.push_str(" (repo copy kept from the interrupted run)");
+            }
             writeln!(
                 out,
                 "candidate: {} -> {} id={}{note}",
@@ -494,9 +618,10 @@ impl Decision {
         match (&self.brewfile, &self.brew_note) {
             (Some(b), _) if !b.addition.is_empty() => writeln!(
                 out,
-                "brewfile: {} += {}",
+                "brewfile: {} += {}{}",
                 visible(&b.path),
-                visible(b.addition.trim_end())
+                visible(b.addition.trim_end()),
+                kept(b.done)
             )?,
             (_, Some(n)) => writeln!(out, "brewfile: none ({n})")?,
             _ => writeln!(out, "brewfile: none")?,
@@ -573,8 +698,24 @@ fn read_candidate(path: &Path) -> Result<(Vec<u8>, u32), Refusal> {
     Ok((bytes, meta.mode() & 0o777))
 }
 
-/// Every regular file below `dir`, sorted; a link or a special file refuses the run.
-fn files_below(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), Refusal> {
+/// Live paths an interrupted run of this adoption planned to link, to their repo copies.
+type Linked = BTreeMap<PathBuf, PathBuf>;
+
+/// Reads one candidate. A live path that already is the link an interrupted run planned is
+/// read through its repo copy (`true`); any other link refuses the run, as in `read_candidate`.
+fn read_live(path: &Path, linked: &Linked) -> Result<(Vec<u8>, u32, bool), Refusal> {
+    if let Some(repo) = linked.get(path)
+        && fs::read_link(path).is_ok_and(|t| t == *repo)
+    {
+        let (bytes, mode) = read_candidate(repo)?;
+        return Ok((bytes, mode, true));
+    }
+    read_candidate(path).map(|(bytes, mode)| (bytes, mode, false))
+}
+
+/// Every regular file below `dir`, sorted; a link or a special file refuses the run, except a
+/// link in `linked`, which `read_live` checks.
+fn files_below(dir: &Path, linked: &Linked, out: &mut Vec<PathBuf>) -> Result<(), Refusal> {
     let shown = dir.display().to_string();
     let mut entries: Vec<PathBuf> = fs::read_dir(dir)
         .and_then(|d| d.map(|e| e.map(|e| e.path())).collect())
@@ -584,8 +725,8 @@ fn files_below(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), Refusal> {
         let m = fs::symlink_metadata(&p)
             .map_err(|e| conflict(format!("{} cannot be read ({})", p.display(), e.kind())))?;
         if m.is_dir() {
-            files_below(&p, out)?;
-        } else if m.is_file() {
+            files_below(&p, linked, out)?;
+        } else if m.is_file() || linked.contains_key(&p) {
             out.push(p);
         } else {
             return Err(conflict(format!(
@@ -603,13 +744,13 @@ fn files_below(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), Refusal> {
     Ok(())
 }
 
-/// One live file as adopt read it: path, bytes, permission bits, and whether it came from a
-/// directory that existed before the trial.
-type LiveFile = (PathBuf, Vec<u8>, u32, bool);
+/// One live file as adopt read it: path, bytes, permission bits, whether it came from a
+/// directory that existed before the trial, and whether it already is the planned link.
+type LiveFile = (PathBuf, Vec<u8>, u32, bool, bool);
 
 /// The live files the trial created or changed (docs/adopt.md, "Candidates"). Each file is read
 /// once: the read that decides whether a pre-existing file changed also supplies its bytes.
-fn live_candidates(t: &TrialRecord) -> Result<Vec<LiveFile>, Refusal> {
+fn live_candidates(t: &TrialRecord, linked: &Linked) -> Result<Vec<LiveFile>, Refusal> {
     let mut out = Vec::new();
     for b in &t.baseline.paths {
         let p = Path::new(&b.path);
@@ -628,22 +769,22 @@ fn live_candidates(t: &TrialRecord) -> Result<Vec<LiveFile>, Refusal> {
         let pre = b.existed && b.sha256.is_none();
         match (b.existed, &b.sha256) {
             (true, Some(was)) => {
-                let (bytes, mode) = read_candidate(p)?;
+                let (bytes, mode, link) = read_live(p, linked)?;
                 if file_fingerprint(&bytes) != *was {
-                    out.push((p.to_path_buf(), bytes, mode, pre));
+                    out.push((p.to_path_buf(), bytes, mode, pre, link));
                 }
             }
             _ if now.is_dir() => {
                 let mut found = Vec::new();
-                files_below(p, &mut found)?;
+                files_below(p, linked, &mut found)?;
                 for f in found {
-                    let (bytes, mode) = read_candidate(&f)?;
-                    out.push((f, bytes, mode, pre));
+                    let (bytes, mode, link) = read_live(&f, linked)?;
+                    out.push((f, bytes, mode, pre, link));
                 }
             }
             _ => {
-                let (bytes, mode) = read_candidate(p)?;
-                out.push((p.to_path_buf(), bytes, mode, pre));
+                let (bytes, mode, link) = read_live(p, linked)?;
+                out.push((p.to_path_buf(), bytes, mode, pre, link));
             }
         }
     }
@@ -782,11 +923,20 @@ fn decide(
         )));
     }
 
-    // The candidates, each read once.
+    // An interrupted run of this adoption (docs/adopt.md, "Interruption"): its own work is
+    // recognised by content against its token, and anything else is refused.
+    let prior = prior_run(store, &trial, module)?;
     let home = ctx.layout().home;
+    let linked: Linked = prior
+        .iter()
+        .flat_map(|p| p.files.keys())
+        .map(|(target, repo)| (home.join(target), root.join(repo)))
+        .collect();
+
+    // The candidates, each read once.
     let module_dir = dir_of(&manifest);
     let mut candidates: Vec<Candidate> = Vec::new();
-    for (path, bytes, mode, preexisting_dir) in live_candidates(&trial)? {
+    for (path, bytes, mode, preexisting_dir, linked) in live_candidates(&trial, &linked)? {
         let rel = rel_text(&path, &home)
             .ok_or_else(|| conflict(format!("{} is outside HOME", path.display())))?;
         let source = format!("home/{rel}");
@@ -805,6 +955,8 @@ fn decide(
             repo,
             source,
             preexisting_dir,
+            copied: false,
+            linked,
         });
     }
     if candidates.is_empty() {
@@ -813,6 +965,54 @@ fn decide(
             args.trial
         )));
     }
+
+    // A repo path that exists is refused, unless it is the interrupted run's copy: it holds the
+    // bytes that run recorded, and those are still the candidate's bytes.
+    for c in &mut candidates {
+        let full = root.join(&c.repo);
+        match fs::symlink_metadata(&full) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            _ => {}
+        }
+        let recorded = prior
+            .as_ref()
+            .and_then(|p| p.files.get(&(c.rel.clone(), c.repo.clone())));
+        let own = recorded.is_some_and(|sha| {
+            *sha == c.sha256 && read_candidate(&full).is_ok_and(|(b, _)| sha256_hex(&b) == *sha)
+        });
+        if !own {
+            return Err(conflict(format!(
+                "{} already exists in the root; adopt never overwrites a repo file",
+                c.repo
+            )));
+        }
+        c.copied = true;
+    }
+
+    // The manifest: as found, or as the interrupted run left it after its append. In that case
+    // the checks below run against the composition before the append.
+    let blocks: String = candidates
+        .iter()
+        .map(|c| link_block(&c.id, &c.rel, &c.source))
+        .collect();
+    let mut manifest_base: &[u8] = manifest_bytes;
+    let mut manifest_done = false;
+    if let Some(p) = prior.as_ref().filter(|p| p.manifest.path == manifest)
+        && sha256_hex(manifest_bytes) != p.manifest.pre
+    {
+        manifest_base = prior_base(manifest_bytes, &blocks, &p.manifest)
+            .ok_or_else(|| not_prior(&manifest, &p.op_id))?;
+        manifest_done = true;
+    }
+    let base_resolved;
+    let resolved_now = if manifest_done {
+        let mut s = loaded.sources.clone();
+        s.insert_file(manifest.clone(), manifest_base.to_vec());
+        base_resolved = resolve(&s, &profile, &crate::builtin_catalog()).map_err(Refusal::from)?;
+        &base_resolved
+    } else {
+        &loaded.resolved
+    };
 
     // Ownership and collisions.
     let mut ids: BTreeMap<&str, &str> = BTreeMap::new();
@@ -823,7 +1023,7 @@ fn decide(
                 c.rel, c.id
             )));
         }
-        for r in loaded.resolved.resources.values() {
+        for r in resolved_now.resources.values() {
             let dirs = r.dir_claims.iter().map(|d| &d.dir);
             if r.claims.iter().chain(dirs).any(|p| overlaps(p, &c.rel)) {
                 return Err(conflict(format!(
@@ -838,12 +1038,6 @@ fn decide(
                     c.id, r.module
                 )));
             }
-        }
-        if fs::symlink_metadata(root.join(&c.repo)).is_ok() {
-            return Err(conflict(format!(
-                "{} already exists in the root; adopt never overwrites a repo file",
-                c.repo
-            )));
         }
     }
     for (_, t) in store.load().trials {
@@ -899,6 +1093,7 @@ fn decide(
                 pre: sha256_hex(&brew_bytes),
                 post: String::new(),
                 addition: String::new(),
+                done: false,
                 path,
             });
         }
@@ -911,9 +1106,55 @@ fn decide(
         None => brew_note = Some("the trial recorded no provider package".into()),
     }
 
-    // The checkout: clean edits, writable paths, no link on the way.
-    let mut edited: Vec<&str> = vec![&manifest];
-    edited.extend(brewfile.as_ref().map(|b| b.path.as_str()));
+    // The Brewfile line: the package as a formula, or as a cask when brew holds it as one. A
+    // line for any spelling of the same package counts as present, unless the interrupted run
+    // appended it: then the file must be its recorded bytes plus that line.
+    if let (Some(b), Some(p)) = (brewfile.as_mut(), &trial.package) {
+        let (name, spellings) = package::brewfile_names(&p.name);
+        let kind = || -> Result<BrewKind, Refusal> {
+            Ok(if package::brew_is_cask(runner, &p.name)? {
+                BrewKind::Cask
+            } else {
+                BrewKind::Formula
+            })
+        };
+        let resumed = prior.as_ref().and_then(|r| {
+            r.brewfile
+                .as_ref()
+                .filter(|e| e.path == b.path && e.pre != b.pre)
+                .map(|e| (e, &r.op_id))
+        });
+        if let Some((e, op_id)) = resumed {
+            let line = brewfile_line(kind()?, &name);
+            brew_bytes = prior_base(&brew_bytes, &line, e)
+                .ok_or_else(|| not_prior(&b.path, op_id))?
+                .to_vec();
+            b.pre.clone_from(&e.pre);
+            b.addition = line;
+            b.done = true;
+        } else if spellings
+            .iter()
+            .any(|n| brewfile_has(&String::from_utf8_lossy(&brew_bytes), n))
+        {
+            brew_note = Some(format!("{} already lists {name}", b.path));
+        } else {
+            b.addition = brewfile_line(kind()?, &name);
+        }
+        b.post = sha256_hex(&append(&brew_bytes, &b.addition));
+    }
+
+    // The checkout: clean edits, writable paths, no link on the way. A file the interrupted run
+    // already wrote is not written again, so it is neither checked for changes nor walked.
+    let mut edited: Vec<&str> = Vec::new();
+    if !manifest_done {
+        edited.push(&manifest);
+    }
+    edited.extend(
+        brewfile
+            .as_ref()
+            .filter(|b| !b.done)
+            .map(|b| b.path.as_str()),
+    );
     let dirty_paths = dirty(git, &root, &edited)?;
     if !dirty_paths.is_empty() {
         return Err(conflict(format!(
@@ -921,11 +1162,12 @@ fn decide(
             dirty_paths.join(", ")
         )));
     }
-    for rel in edited
-        .iter()
-        .copied()
-        .chain(candidates.iter().map(|c| c.repo.as_str()))
-    {
+    for rel in edited.iter().copied().chain(
+        candidates
+            .iter()
+            .filter(|c| !c.copied)
+            .map(|c| c.repo.as_str()),
+    ) {
         check_path(&root, rel, uid)?;
     }
 
@@ -943,30 +1185,8 @@ fn decide(
         }
     }
 
-    // The Brewfile line: the package as a formula, or as a cask when brew holds it as one. A
-    // line for any spelling of the same package counts as present.
-    if let (Some(b), Some(p)) = (brewfile.as_mut(), &trial.package) {
-        let (name, spellings) = package::brewfile_names(&p.name);
-        let text = String::from_utf8_lossy(&brew_bytes);
-        if spellings.iter().any(|n| brewfile_has(&text, n)) {
-            brew_note = Some(format!("{} already lists {name}", b.path));
-        } else {
-            let kind = if package::brew_is_cask(runner, &p.name)? {
-                BrewKind::Cask
-            } else {
-                BrewKind::Formula
-            };
-            b.addition = brewfile_line(kind, &name);
-        }
-        b.post = sha256_hex(&append(&brew_bytes, &b.addition));
-    }
-
     // The edited composition must resolve, and plan each new link as an approved takeover.
-    let blocks: String = candidates
-        .iter()
-        .map(|c| link_block(&c.id, &c.rel, &c.source))
-        .collect();
-    let new_manifest = append(manifest_bytes, &blocks);
+    let new_manifest = append(manifest_base, &blocks);
     let mut sources = loaded.sources.clone();
     sources.insert_file(manifest.clone(), new_manifest.clone());
     for c in &candidates {
@@ -1012,9 +1232,10 @@ fn decide(
         profile,
         manifest: Edit {
             path: manifest.clone(),
-            pre: sha256_hex(manifest_bytes),
+            pre: sha256_hex(manifest_base),
             post: sha256_hex(&new_manifest),
             addition: blocks,
+            done: manifest_done,
         },
         brewfile,
         brew_note,
@@ -1022,12 +1243,15 @@ fn decide(
         unknown: trial.unknown.clone(),
         binary: binary.clone(),
         stamp: stamp.clone(),
+        resume: prior.map(|p| p.op_id),
     })
 }
 
 /// The configuration plan of `loaded` with the candidates approved for takeover, cut to the
 /// operations of the new resources. Each must be a planned `adopt-file` with nothing to run
-/// first, and no blocker may name one; the rest of the composition is not touched.
+/// first, and no blocker may name one; the rest of the composition is not touched. A candidate
+/// whose live path already is its link (an interrupted run) is `current`, or a planned `adopt`
+/// that records the owner when recovery closed the engine's intent without one.
 fn takeover_plan(
     ctx: &Ctx,
     loaded: &Loaded,
@@ -1057,9 +1281,13 @@ fn takeover_plan(
             .iter()
             .filter(|o| o.resource == gid(c))
             .all(|o| {
-                o.action == Action::AdoptFile
-                    && o.status == PlanStatus::Planned
-                    && o.after.is_empty()
+                o.after.is_empty()
+                    && match (o.action, o.status) {
+                        (Action::AdoptFile, PlanStatus::Planned) => !c.linked,
+                        (Action::Adopt, PlanStatus::Planned)
+                        | (Action::None, PlanStatus::Current) => c.linked,
+                        _ => false,
+                    }
             });
         let n = plan
             .operations
@@ -1253,10 +1481,13 @@ pub fn run(ctx: &Ctx, args: &Args, out: &mut dyn Write) -> Result<(), Refusal> {
     let mut changed: Vec<String> = Vec::new();
     let edits = (|| -> Result<(), Refusal> {
         for c in &locked.candidates {
+            changed.push(c.repo.clone());
+            if c.copied {
+                continue;
+            }
             let at = now_ns()?;
             create_repo_file(root, &c.repo, &c.bytes, c.mode)?;
             ops.push(written(&op_id, ops.len(), &c.repo, None, &c.sha256, at));
-            changed.push(c.repo.clone());
         }
         fail.hit("adopt-after-copy")?;
         let edits = [Some(&locked.manifest), locked.brewfile.as_ref()];
@@ -1265,6 +1496,11 @@ pub fn run(ctx: &Ctx, args: &Args, out: &mut dyn Write) -> Result<(), Refusal> {
             .zip(["adopt-after-manifest", "adopt-after-brewfile"])
         {
             if let Some(e) = e.filter(|e| !e.addition.is_empty()) {
+                changed.push(e.path.clone());
+                if e.done {
+                    fail.hit(point)?;
+                    continue;
+                }
                 let at = now_ns()?;
                 append_checked(root, &e.path, &e.pre, &e.addition)?;
                 ops.push(written(
@@ -1275,7 +1511,6 @@ pub fn run(ctx: &Ctx, args: &Args, out: &mut dyn Write) -> Result<(), Refusal> {
                     &e.post,
                     at,
                 ));
-                changed.push(e.path.clone());
             }
             fail.hit(point)?;
         }
@@ -1308,8 +1543,13 @@ pub fn run(ctx: &Ctx, args: &Args, out: &mut dyn Write) -> Result<(), Refusal> {
         let mut takeover = || -> Result<(), Refusal> {
             let loaded = load_resolved(ctx, Some(root))?;
             let plan = takeover_plan(ctx, &loaded, &args.module, &locked.candidates)?;
-            let allow_adopt: BTreeSet<String> =
-                plan.operations.iter().map(|o| o.id.clone()).collect();
+            // A link an interrupted run already owns plans `current` and needs no approval.
+            let allow_adopt: BTreeSet<String> = plan
+                .operations
+                .iter()
+                .filter(|o| o.status == PlanStatus::Planned)
+                .map(|o| o.id.clone())
+                .collect();
             let home = Dir::open_home(&sys, &layout.home)?;
             let generator = crate::adapters::Generators::new(&loaded.resolved);
             let run = Run {
@@ -1588,6 +1828,7 @@ mod tests {
             pre: pre.into(),
             post: "p".into(),
             addition: "a".into(),
+            done: false,
         };
         let cand = |sha: &str, mode: u32| Candidate {
             live: "/h/.config/t/c".into(),
@@ -1599,8 +1840,10 @@ mod tests {
             source: "home/.config/t/c".into(),
             id: "config-t-c".into(),
             preexisting_dir: false,
+            copied: false,
+            linked: false,
         };
-        let dr =
+        let decision =
             |pre: &str, brew: Option<&str>, sha: &str, mode: u32, machine: &str, record: &str| {
                 Decision {
                     root: PathBuf::from("/r"),
@@ -1614,6 +1857,7 @@ mod tests {
                         pre: "b".into(),
                         post: "b2".into(),
                         addition: line.into(),
+                        done: false,
                     }),
                     brew_note: None,
                     candidates: vec![cand(sha, mode)],
@@ -1627,9 +1871,14 @@ mod tests {
                         machine_id: machine.into(),
                         binding_digest: "d".into(),
                     },
+                    resume: None,
                 }
-                .digest()
-                .unwrap()
+            };
+        let dr =
+            |pre: &str, brew: Option<&str>, sha: &str, mode: u32, machine: &str, record: &str| {
+                decision(pre, brew, sha, mode, machine, record)
+                    .digest()
+                    .unwrap()
             };
         let d = |pre: &str, brew: Option<&str>, sha: &str, mode: u32, machine: &str| {
             dr(pre, brew, sha, mode, machine, "t1")
@@ -1644,6 +1893,40 @@ mod tests {
         assert_ne!(base, d("m1", Some("brew \"t\"\n"), "c1", 0o644, "n"));
         // A changed trial record changes the digest.
         assert_ne!(base, dr("m1", Some("brew \"t\"\n"), "c1", 0o644, "m", "t2"));
+        // What an interrupted run left, and which run it was, change the digest.
+        let changed = |f: &dyn Fn(&mut Decision)| {
+            let mut x = decision("m1", Some("brew \"t\"\n"), "c1", 0o644, "m", "t1");
+            f(&mut x);
+            x.digest().unwrap()
+        };
+        assert_eq!(base, changed(&|_| {}));
+        assert_ne!(base, changed(&|x| x.resume = Some("adopt-1-2".into())));
+        assert_ne!(base, changed(&|x| x.manifest.done = true));
+        assert_ne!(base, changed(&|x| x.brewfile.as_mut().unwrap().done = true));
+        assert_ne!(base, changed(&|x| x.candidates[0].copied = true));
+        assert_ne!(base, changed(&|x| x.candidates[0].linked = true));
+    }
+
+    #[test]
+    fn prior_base_accepts_only_the_recorded_bytes_plus_the_planned_append() {
+        let rec = |pre: &[u8], add: &str| PriorEdit {
+            path: "m".into(),
+            pre: sha256_hex(pre),
+            post: sha256_hex(&append(pre, add)),
+        };
+        let add = "[[resources]]\nid = \"x\"\n";
+        for pre in [&b"a = 1\n"[..], b"a = 1", b""] {
+            let r = rec(pre, add);
+            let now = append(pre, add);
+            assert_eq!(prior_base(&now, add, &r), Some(pre), "{pre:?}");
+            // Not yet appended, edited after the append, or another append: not its work.
+            assert_eq!(prior_base(pre, add, &r), None);
+            let mut edited = now.clone();
+            edited.extend_from_slice(b"# hand edit\n");
+            assert_eq!(prior_base(&edited, add, &r), None);
+            assert_eq!(prior_base(&now, "[[resources]]\nid = \"y\"\n", &r), None);
+            assert_eq!(prior_base(&now, "", &r), None);
+        }
     }
 
     #[test]

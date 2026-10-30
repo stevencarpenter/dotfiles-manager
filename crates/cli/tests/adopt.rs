@@ -6,7 +6,7 @@ mod common;
 
 use common::providers::{FAKE_BREW, FAKE_GITLEAKS, FAKE_MISE};
 use common::{TempDir, code, is_root, skip, text};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -744,4 +744,201 @@ fn a_change_between_the_check_and_the_lock_is_caught_under_the_lock() {
     refused(&o, "E_PLAN_STALE");
     assert_eq!(fx.snapshot(), before);
     assert!(!fx.root.join(REPO_FILE).exists());
+}
+
+impl Fx {
+    /// The repo, the live tuicr paths and the ledger owner after a complete adoption, as
+    /// `adopts_the_tuicr_shape` leaves them.
+    fn assert_adopted(&self, reference: &Files) {
+        assert_eq!(&tree(&self.root), reference);
+        assert_eq!(
+            fs::read_link(self.h(LIVE)).unwrap(),
+            self.root.join(REPO_FILE)
+        );
+        let ledger = self.json(&self.state().join("ledger.json"));
+        let owner = ledger["resources"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| {
+                r["owned_outputs"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|o| o["path"].as_str().unwrap().ends_with(LIVE))
+            })
+            .unwrap_or_else(|| panic!("no ledger owner of {LIVE}: {ledger}"));
+        assert_eq!(owner["resource"], "core.config-tuicr-config-toml");
+        let r = self.record();
+        assert_eq!(
+            (r["schema"].as_i64(), r["adopted"]["module"].as_str()),
+            (Some(3), Some("core"))
+        );
+        let status = git(&self.root, &["status", "--porcelain=v1", "-uall"]);
+        let mut lines: Vec<&str> = status.lines().collect();
+        lines.sort_unstable();
+        assert_eq!(
+            lines,
+            [
+                " M Brewfile".to_string(),
+                format!(" M {MANIFEST}"),
+                format!("?? {REPO_FILE}")
+            ],
+            "{status}"
+        );
+    }
+
+    /// Every path below the root (less `.git`) and the live tuicr directory.
+    fn paths(&self) -> BTreeSet<String> {
+        let (repo, live, _) = self.snapshot();
+        repo.into_keys()
+            .chain(live.into_keys().map(|k| format!("~/{k}")))
+            .collect()
+    }
+}
+
+/// The repo tree of a complete, uninterrupted adoption.
+fn reference_tree() -> Files {
+    let fx = Fx::new();
+    fx.live(LIVE, TUICR);
+    let o = fx.adopt_approved("core");
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), out(&o));
+    tree(&fx.root)
+}
+
+/// Runs the approved adoption with `DFM_FAILPOINT=<spec>` and checks it did not complete.
+fn interrupted(fx: &Fx, spec: &str) {
+    let d = digest_of(&fx.adopt(&["--module", "core", "--preview"]));
+    let o = fx.run_env(
+        &[("DFM_FAILPOINT", spec)],
+        &["adopt", "trial-tuicr", "--module", "core", "--yes-plan", &d],
+    );
+    // An abort ends the process by a signal, with no exit code.
+    if let Some(c) = o.status.code() {
+        assert!(
+            matches!(c, 1 | 3),
+            "{spec}: exit {c}\n{}\n{}",
+            stderr(&o),
+            out(&o)
+        );
+    }
+    assert_eq!(fx.record()["schema"], 2, "{spec}");
+}
+
+#[test]
+fn a_second_run_completes_after_a_stop_at_each_boundary() {
+    let reference = reference_tree();
+    for point in [
+        "adopt-after-copy",
+        "adopt-after-manifest",
+        "adopt-after-brewfile",
+        "adopt-after-link",
+    ] {
+        for action in ["error", "abort"] {
+            let spec = format!("{point}:{action}");
+            let fx = Fx::new();
+            fx.live(LIVE, TUICR);
+            let start = fx.paths();
+            interrupted(&fx, &spec);
+            let mid = fx.paths();
+            assert!(mid.is_superset(&start), "{spec}: {start:?} -> {mid:?}");
+            let o = fx.adopt(&["--module", "core", "--preview"]);
+            assert_eq!(code(&o), 0, "{spec}\n{}\n{}", stderr(&o), out(&o));
+            assert!(out(&o).contains("resume: "), "{spec}\n{}", out(&o));
+            let o = fx.adopt(&["--module", "core", "--yes-plan", &digest_of(&o)]);
+            assert_eq!(code(&o), 0, "{spec}\n{}\n{}", stderr(&o), out(&o));
+            assert!(fx.paths().is_superset(&mid), "{spec}");
+            fx.assert_adopted(&reference);
+        }
+    }
+}
+
+#[test]
+fn a_second_run_completes_after_state_recover_left_the_link_unowned() {
+    let reference = reference_tree();
+    let fx = Fx::new();
+    fx.live(LIVE, TUICR);
+    interrupted(&fx, "link-after-rename:abort");
+    // Recovery alone closes the engine's intent without recording the owner.
+    let o = fx.run(&["state", "recover"]);
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), out(&o));
+    assert!(fs::read_link(fx.h(LIVE)).is_ok());
+    let ledger = fs::read_to_string(fx.state().join("ledger.json")).unwrap_or_default();
+    assert!(!ledger.contains("config-tuicr-config-toml"), "{ledger}");
+    let o = fx.adopt(&["--module", "core", "--preview"]);
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), out(&o));
+    let o = fx.adopt(&["--module", "core", "--yes-plan", &digest_of(&o)]);
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), out(&o));
+    fx.assert_adopted(&reference);
+}
+
+#[test]
+fn a_foreign_edit_during_recovery_is_a_conflict() {
+    let fx = Fx::new();
+    fx.live(LIVE, TUICR);
+    interrupted(&fx, "adopt-after-manifest:error");
+    let manifest = fs::read_to_string(fx.root.join(MANIFEST)).unwrap();
+    fx.put(MANIFEST, &format!("{manifest}# hand edit\n"));
+    let before = fx.snapshot();
+    let o = fx.adopt(&["--module", "core", "--preview"]);
+    refused(&o, "E_CONFLICT");
+    assert!(stderr(&o).contains(MANIFEST), "{}", stderr(&o));
+    assert_eq!(fx.snapshot(), before);
+}
+
+#[test]
+fn a_changed_repo_copy_during_recovery_is_a_conflict() {
+    let fx = Fx::new();
+    fx.live(LIVE, TUICR);
+    interrupted(&fx, "adopt-after-copy:abort");
+    fx.put(REPO_FILE, "theme = \"other\"\n");
+    let before = fx.snapshot();
+    let o = fx.adopt(&["--module", "core", "--preview"]);
+    refused(&o, REPO_FILE);
+    assert_eq!(fx.snapshot(), before);
+}
+
+#[test]
+fn two_adopts_at_once_one_waits_or_is_locked() {
+    let fx = Fx::new();
+    fx.live(LIVE, TUICR);
+    let d = digest_of(&fx.adopt(&["--module", "core", "--preview"]));
+    let gate = fx.fake.path().join("go");
+    let parked = Command::new(BIN)
+        .env_clear()
+        .env(
+            "DFM_PROVIDER_PATH",
+            format!("{}:/usr/bin:/bin", fx.bin().display()),
+        )
+        .env(
+            "DFM_FAILPOINT",
+            format!("adopt-after-copy:wait-{}", gate.display()),
+        )
+        .arg("--home")
+        .arg(fx.home.path())
+        .args(["adopt", "trial-tuicr", "--module", "core", "--yes-plan", &d])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let reached = gate.with_extension("reached");
+    let end = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while !reached.exists() {
+        assert!(
+            std::time::Instant::now() < end,
+            "the failpoint was not reached"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    // The first run holds the writer lock with its repo copy written. The second run's preview
+    // reads that partial work; its approval then needs the lock.
+    let before = fx.snapshot();
+    let d2 = digest_of(&fx.adopt(&["--module", "core", "--preview"]));
+    let o = fx.adopt(&["--module", "core", "--yes-plan", &d2]);
+    refused(&o, "E_LOCKED");
+    assert_eq!(fx.snapshot(), before);
+    fs::write(&gate, "").unwrap();
+    let o = parked.wait_with_output().unwrap();
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), out(&o));
+    assert_eq!(fs::read_link(fx.h(LIVE)).unwrap(), fx.root.join(REPO_FILE));
 }
