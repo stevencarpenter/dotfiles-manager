@@ -88,20 +88,28 @@ pub(crate) fn scan(
     let (copy, ignore) = (run.join("files"), run.join("ignore"));
     private(&copy, false)?;
     private(&ignore, false)?;
-    // `files/<i>/<base name>`: the base name keeps the rules that match on a file name or
-    // extension (`cert.p12`); the numbered directory maps a finding back to its candidate.
+    // Two copies of each candidate in `files/<i>/`. The numbered copy carries no file name, so
+    // the default path allowlist (`*.svg`, lock files, a file named `.gitleaks.toml`) cannot
+    // skip it. The copy with the original base name keeps the rules that match on a name or
+    // extension (`cert.p12`). A finding in either maps back by the number.
     for (i, (original, bytes)) in files.iter().enumerate() {
         let dir = copy.join(i.to_string());
         private(&dir, false)?;
         let base = Path::new(original).file_name().unwrap_or("file".as_ref());
-        let path = dir.join(base);
-        OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&path)
-            .and_then(|mut f| f.write_all(bytes))
-            .map_err(|e| io_failed(&format!("copy a candidate to {}", path.display()), &e))?;
+        let mut names = vec![PathBuf::from(i.to_string())];
+        if base != i.to_string().as_str() {
+            names.push(PathBuf::from(base));
+        }
+        for name in names {
+            let path = dir.join(name);
+            OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&path)
+                .and_then(|mut f| f.write_all(bytes))
+                .map_err(|e| io_failed(&format!("copy a candidate to {}", path.display()), &e))?;
+        }
     }
     let args: Vec<String> = [
         "dir",
@@ -408,6 +416,10 @@ mod tests {
                 "aws_access_key_id = AKIAIOSFODNN7EXAMPLQ # gitleaks:allow\n",
             ),
             ("/h/.config/tool/cert.p12", "not really a key store"),
+            // Names the default path allowlist skips: the content must still be scanned.
+            ("/h/.config/tool/x.svg", key),
+            ("/h/package-lock.json", key),
+            ("/h/other/.gitleaks.toml", key),
         ]);
         let hits = scan(&r, &parent, &input).unwrap();
         assert_eq!(
@@ -415,7 +427,10 @@ mod tests {
             [
                 "/h/.config/tool/cert.p12",
                 "/h/.config/tool/commented",
-                "/h/.config/tool/credentials"
+                "/h/.config/tool/credentials",
+                "/h/.config/tool/x.svg",
+                "/h/other/.gitleaks.toml",
+                "/h/package-lock.json"
             ]
         );
         assert_eq!(leftovers(&parent), 0);
