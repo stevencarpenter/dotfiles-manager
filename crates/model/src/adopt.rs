@@ -74,8 +74,9 @@ pub fn brewfile_line(kind: BrewKind, name: &str) -> String {
 
 /// True when a non-comment line is `brew` or `cask` followed by the quoted `name`, then the end
 /// of the line, a `,` (options) or a `#` comment. The match is on the whole quoted string: a
-/// tap-qualified `homebrew/core/tuicr` does not match `tuicr`, because another tap can ship a
-/// different formula of that short name. Adopt may then add a bare line, which is harmless.
+/// tap-qualified `owner/tap/tuicr` does not match `tuicr`, because another tap can ship a
+/// different formula of that short name. A caller that treats several spellings as one package
+/// asks for each spelling.
 pub fn brewfile_has(text: &str, name: &str) -> bool {
     text.lines().any(|line| {
         let line = line.trim_start();
@@ -205,10 +206,10 @@ mod tests {
         assert!(brewfile_has("brew \"tuicr\"", "tuicr"));
         assert!(!brewfile_has("tap \"tuicr\"\n", "tuicr"));
         assert!(!brewfile_has("brewx \"tuicr\"\n", "tuicr"));
-        assert!(!brewfile_has("brew \"homebrew/core/tuicr\"\n", "tuicr"));
+        assert!(!brewfile_has("brew \"owner/tap/tuicr\"\n", "tuicr"));
         assert!(brewfile_has(
-            "brew \"homebrew/core/tuicr\"\n",
-            "homebrew/core/tuicr"
+            "brew \"owner/tap/tuicr\"\n",
+            "owner/tap/tuicr"
         ));
     }
 }
