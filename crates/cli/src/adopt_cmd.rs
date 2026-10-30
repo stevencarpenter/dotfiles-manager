@@ -392,6 +392,8 @@ struct Decision {
     /// The canonical root. Not in the digest: the paths below are relative to it.
     root: PathBuf,
     trial_id: String,
+    /// SHA-256 of the trial record's canonical JSON: a changed record makes the approval stale.
+    record: String,
     module: String,
     profile: String,
     manifest: Edit,
@@ -417,6 +419,7 @@ impl Decision {
             .collect();
         let doc = json!({
             "trial_id": self.trial_id,
+            "record": self.record,
             "module": self.module,
             "profile": self.profile,
             "manifest": {"path": self.manifest.path, "sha256": self.manifest.pre},
@@ -722,6 +725,15 @@ fn decide(
     scan_now: bool,
 ) -> Result<Decision, Refusal> {
     let trial = trial_record(store, &args.trial)?;
+    // The record is canonical JSON on disk; its serialization here is the same document.
+    let record = serde_json::to_vec(&trial)
+        .map(|b| sha256_hex(&b))
+        .map_err(|e| {
+            Refusal::new(
+                Code::IoFailed,
+                format!("cannot digest the trial record: {e}"),
+            )
+        })?;
     let loaded = load_resolved(ctx, args.root.as_deref())?;
     let root = loaded.root.clone();
     let profile = rel_text(Path::new(loaded.binding.profile()), &root).ok_or_else(|| {
@@ -995,6 +1007,7 @@ fn decide(
     Ok(Decision {
         root,
         trial_id: args.trial.clone(),
+        record,
         module: module.to_string(),
         profile,
         manifest: Edit {
@@ -1587,34 +1600,39 @@ mod tests {
             id: "config-t-c".into(),
             preexisting_dir: false,
         };
+        let dr =
+            |pre: &str, brew: Option<&str>, sha: &str, mode: u32, machine: &str, record: &str| {
+                Decision {
+                    root: PathBuf::from("/r"),
+                    trial_id: "trial-t".into(),
+                    record: record.into(),
+                    module: "core".into(),
+                    profile: "p.toml".into(),
+                    manifest: edit(pre),
+                    brewfile: brew.map(|line| Edit {
+                        path: "Brewfile".into(),
+                        pre: "b".into(),
+                        post: "b2".into(),
+                        addition: line.into(),
+                    }),
+                    brew_note: None,
+                    candidates: vec![cand(sha, mode)],
+                    unknown: vec![],
+                    binary: Binary {
+                        version: "0".into(),
+                        sha256: "s".into(),
+                    },
+                    stamp: Stamp {
+                        profile: "p".into(),
+                        machine_id: machine.into(),
+                        binding_digest: "d".into(),
+                    },
+                }
+                .digest()
+                .unwrap()
+            };
         let d = |pre: &str, brew: Option<&str>, sha: &str, mode: u32, machine: &str| {
-            Decision {
-                root: PathBuf::from("/r"),
-                trial_id: "trial-t".into(),
-                module: "core".into(),
-                profile: "p.toml".into(),
-                manifest: edit(pre),
-                brewfile: brew.map(|line| Edit {
-                    path: "Brewfile".into(),
-                    pre: "b".into(),
-                    post: "b2".into(),
-                    addition: line.into(),
-                }),
-                brew_note: None,
-                candidates: vec![cand(sha, mode)],
-                unknown: vec![],
-                binary: Binary {
-                    version: "0".into(),
-                    sha256: "s".into(),
-                },
-                stamp: Stamp {
-                    profile: "p".into(),
-                    machine_id: machine.into(),
-                    binding_digest: "d".into(),
-                },
-            }
-            .digest()
-            .unwrap()
+            dr(pre, brew, sha, mode, machine, "t1")
         };
         let base = d("m1", Some("brew \"t\"\n"), "c1", 0o644, "m");
         assert_eq!(base, d("m1", Some("brew \"t\"\n"), "c1", 0o644, "m"));
@@ -1624,6 +1642,8 @@ mod tests {
         assert_ne!(base, d("m1", Some("brew \"t\"\n"), "c2", 0o644, "m"));
         assert_ne!(base, d("m1", Some("brew \"t\"\n"), "c1", 0o600, "m"));
         assert_ne!(base, d("m1", Some("brew \"t\"\n"), "c1", 0o644, "n"));
+        // A changed trial record changes the digest.
+        assert_ne!(base, dr("m1", Some("brew \"t\"\n"), "c1", 0o644, "m", "t2"));
     }
 
     #[test]
