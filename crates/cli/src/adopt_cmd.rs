@@ -1210,7 +1210,8 @@ pub fn run(ctx: &Ctx, args: &Args, out: &mut dyn Write) -> Result<(), Refusal> {
         store.append_journal(&JournalEntry {
             schema: SCHEMA,
             op_id: op_id.clone(),
-            op: "adopt".into(),
+            // Not `adopt`: that name is the engine's link adoption, which recovery probes.
+            op: "trial-adopt".into(),
             phase,
             at: rfc3339(now_ns()?),
             resource: args.trial.clone(),

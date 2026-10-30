@@ -337,7 +337,7 @@ fn adopts_the_tuicr_shape() {
     let adopt: Vec<serde_json::Value> = journal
         .lines()
         .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap())
-        .filter(|e| e["op"] == "adopt")
+        .filter(|e| e["op"] == "trial-adopt")
         .collect();
     assert_eq!(adopt.len(), 2, "{journal}");
     assert_eq!(
