@@ -9,8 +9,8 @@ use crate::{Ctx, Loaded, load_resolved, paint, read_existing_binding, usage};
 use dfm_engine::{Dir, Fail, Store, merge, observe};
 use dfm_model::display::visible;
 use dfm_model::plan::{
-    self, Binary, Context, LinkTo, MAX_PLAN_BYTES, Node, Observations, Operation, Owned,
-    PackageState, Plan, Saved, Scope, ServiceFacts, Stale, Status, source_identity,
+    self, ApprovedFile, Binary, Context, LinkTo, MAX_PLAN_BYTES, Node, Observations, Operation,
+    Owned, PackageState, Plan, Saved, Scope, ServiceFacts, Stale, Status, source_identity,
 };
 use dfm_model::{Code, Refusal};
 use std::collections::{BTreeMap, BTreeSet};
@@ -109,6 +109,9 @@ pub struct Probed {
     pub package: BTreeMap<String, PackageState>,
     pub service: BTreeMap<String, ServiceFacts>,
     pub restart: BTreeSet<String>,
+    /// The live files `adopt` read and approved for replacement by their link (DFM-33). Empty
+    /// for every other caller, so `apply` and `sync` keep refusing a regular file.
+    pub adopt_files: BTreeMap<String, ApprovedFile>,
 }
 
 /// The package listings alone, for a caller that probes no launcher.
@@ -240,7 +243,7 @@ pub(crate) fn plan_with_outputs(
         package: probed.package,
         service: probed.service,
         restart: probed.restart,
-        adopt_files: BTreeMap::new(),
+        adopt_files: probed.adopt_files,
     };
     let mut plan = plan::build(&loaded.resolved, &cx, &obs)?;
     // Generated output hashes, from the same adapters apply runs.

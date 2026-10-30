@@ -252,6 +252,29 @@ fn brew_probe(runner: &Runner, pkg: &str) -> PackageState {
     PackageState::Installed(versions.join(" "))
 }
 
+/// Whether brew holds `pkg` as a cask: a name pinned to `homebrew/cask/`, or a rack in the
+/// Caskroom and none in the Cellar. Reads the directories only, as [`brew_probe`] does.
+pub(crate) fn brew_is_cask(runner: &Runner, pkg: &str) -> Result<bool, Refusal> {
+    match pkg
+        .rsplit_once('/')
+        .map(|(t, _)| t.to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("homebrew/cask") => return Ok(true),
+        Some("homebrew/core") => return Ok(false),
+        _ => {}
+    }
+    let failed = |why: String| Refusal::new(Code::ProbeFailed, why);
+    let (cellar, caskroom) = brew_roots(runner).map_err(failed)?;
+    let short = pkg.rsplit('/').next().unwrap_or(pkg);
+    let has = |root: &Path| {
+        rack_versions(root, short)
+            .map(|v| !v.is_empty())
+            .map_err(failed)
+    };
+    Ok(!has(&cellar)? && has(&caskroom)?)
+}
+
 /// The tap an install receipt names (`source.tap`, lowercase). The file is read without
 /// following a link and within 1 MiB.
 fn receipt_tap(path: &Path) -> Result<String, String> {

@@ -83,6 +83,10 @@ name = "trial"
 required-features = ["test-isolation"]
 
 [[test]]
+name = "adopt"
+required-features = ["test-isolation"]
+
+[[test]]
 name = "services"
 required-features = ["test-isolation"]
 

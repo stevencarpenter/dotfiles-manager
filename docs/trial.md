@@ -1,6 +1,6 @@
 # Trial
 
-The `trial` command (`try <tool>` in DESIGN.md section 7): try a tool without authoring a module. This document describes the behavior at HEAD. The package providers it reuses are in [docs/packages.md](packages.md), the state store in [docs/state.md](state.md). `adopt` (DFM-33) and `purge` (DFM-34) are not built. The last section lists what they inherit.
+The `trial` command (`try <tool>` in DESIGN.md section 7): try a tool without authoring a module. This document describes the behavior at HEAD. The package providers it reuses are in [docs/packages.md](packages.md), the state store in [docs/state.md](state.md). `adopt` (DFM-33) is in [docs/adopt.md](adopt.md). `purge` (DFM-34) is not built. The last section lists what they inherit.
 
 | Part | Location |
 | --- | --- |
@@ -87,7 +87,7 @@ The record is a private file under `state/trials/`. `state check` validates it w
 - **One candidate by default.** A tool that keeps its configuration elsewhere needs `--config`. The record cannot be extended after the fact without a new baseline, so pass every candidate on the first run.
 - **The baseline is one observation.** A hard-linked file is hashed like any other. `purge` must check again before it deletes.
 - **No trial row in `doctor`.** A per-trial row with its owner and age is not built.
-- **No end of a trial.** `purge` and `adopt` are not built, so a trial record stays until it is removed by hand.
+- **One end of a trial.** `adopt` ends a trial ([docs/adopt.md](adopt.md)). `purge` is not built, so a trial that is not adopted stays until it is removed by hand.
 - **Rerun cost.** Two probe rounds (before and under the lock), plus the postcondition probe after an install.
 - **Evidence scope.** Tests use the `test-isolation` build and the `brew` and `mise` look-alikes. No test runs a real install. Whether `sync` keeps active trials intact is not tested.
 

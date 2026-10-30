@@ -1,5 +1,5 @@
 //! `dfm` command line (the dotfiles-manager binary): version, help, profile binding, state, explain, plan,
-//! doctor, status, apply, trial and self-check.
+//! doctor, status, apply, trial, adopt and self-check.
 
 #![forbid(unsafe_code)]
 
@@ -54,6 +54,7 @@ usage:
                                [--restart <resource-id>]...
   dfm trial <package> [--id <trial-id>] [--provider homebrew/v1|mise/v1] [--config <path>]...
                                [--preview] [-y|--yes-plan <digest>]
+  dfm adopt <trial-id> --module <module> [--root <dir>] [--preview] [-y|--yes-plan <digest>]
   dfm sync [--root <dir>] [--preview] [-y|--yes-plan <digest>] [--allow-disruptive <operation-id>]...
                                [--allow-adopt <operation-id>]... [--restart <resource-id>]...
                                [--trust-origin <origin>]... [--no-upgrade]
@@ -120,8 +121,14 @@ its owners and its configuration candidates (--config paths, or ~/.config/<tool>
 change, and prints the scope, the cleanup limits and a digest. With --yes-plan it writes the
 trial record to state/trials/, installs the package when no provider has it (nothing when it
 pre-exists), journals the install and writes a receipt. More than one capable provider needs
---provider. A candidate path is observed, never changed. adopt and purge are not built. See
+--provider. A candidate path is observed, never changed. purge is not built. See
 docs/trial.md.
+
+adopt promotes a trial into a module: each regular file under the trial's baseline paths that
+the trial created or changed is copied to <module dir>/home/<path>, gets an fs-link/v1 block
+appended to the module manifest, and its live file becomes a dfm link. A homebrew/v1 trial also
+gets a brew or cask line appended to Brewfile.<module> or Brewfile. The candidates are scanned
+with gitleaks first. Nothing is committed. See docs/adopt.md.
 
 services is apply over the service resources only (launchd-agent/v1, brew-service/v1): every other
 resource is listed as not_in_scope. Planning asks each launcher read-only (launchctl print, brew
@@ -483,6 +490,10 @@ fn dispatch(args: &[String], out: &mut dyn Write) -> Result<(), Refusal> {
         "trial" => {
             let args = trial_cmd::parse_args(rest)?;
             trial_cmd::run(&context(home)?, &args, out)
+        }
+        "adopt" => {
+            let args = adopt_cmd::parse_args(rest)?;
+            adopt_cmd::run(&context(home)?, &args, out)
         }
         "services" => {
             let args = apply_cmd::parse_args(rest, dfm_model::plan::Scope::Services)?;

@@ -118,7 +118,7 @@ jobs:
           - shard: cli-1
             select: -p dfm-cli --features test-isolation --lib --bins --test gate --test bootstrap --test doctor --test cli --test explain --test module_doc
           - shard: cli-2
-            select: -p dfm-cli --features test-isolation --test build_controls --test sync --test planner --test runner --test trial
+            select: -p dfm-cli --features test-isolation --test build_controls --test sync --test planner --test runner --test trial --test adopt
           - shard: cli-3
             select: -p dfm-cli --features test-isolation --test merge --test codex_hooks --test omlx --test apply --test source_roots --test state --test packages --test services --test resolver --test toolchains --test secrets --test native_config
     steps:

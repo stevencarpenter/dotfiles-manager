@@ -412,12 +412,13 @@ fn the_unsafe_keyword_appears_only_in_the_engine_signal_module() {
 
 /// DFM-47 C03: only the mutating path of `apply` installs the handlers. The call is in one place
 /// and it comes after the preview return, the lock and no earlier. `trial` (DFM-32) starts a
-/// provider before it decides anything, so it arms them once, before its first probe.
+/// provider before it decides anything, so it arms them once, before its first probe; `adopt`
+/// (DFM-33) does the same before its first scan.
 #[test]
 fn only_the_mutating_path_of_apply_installs_the_signal_handlers() {
     let mut files = Vec::new();
     rs_files(&repo_root().join("crates"), &mut files);
-    let callers: Vec<_> = files
+    let mut callers: Vec<_> = files
         .iter()
         // The runner tests install the handlers to get the process-group mode; they are tests.
         .filter(|f| {
@@ -428,15 +429,22 @@ fn only_the_mutating_path_of_apply_installs_the_signal_handlers() {
         .filter(|f| fs::read_to_string(f).unwrap().contains("signal::install("))
         .map(|f| f.strip_prefix(repo_root()).unwrap().display().to_string())
         .collect();
+    // Directory order is not sorted.
+    callers.sort();
     // sync arms them before its first updater when no scope ran (docs/upgrade.md).
     assert_eq!(
         callers,
         [
+            "crates/cli/src/adopt_cmd.rs",
             "crates/cli/src/apply_cmd.rs",
             "crates/cli/src/sync_cmd.rs",
             "crates/cli/src/trial_cmd.rs"
         ]
     );
+    // `adopt` (DFM-33) runs gitleaks, git and brew before it decides, so it arms them once first.
+    let adopt = fs::read_to_string(repo_root().join("crates/cli/src/adopt_cmd.rs")).unwrap();
+    assert_eq!(adopt.matches("signal::install(").count(), 1);
+    assert!(adopt.find("signal::install(").unwrap() < adopt.find("let first = decide(").unwrap());
     let sync = fs::read_to_string(repo_root().join("crates/cli/src/sync_cmd.rs")).unwrap();
     assert_eq!(sync.matches("signal::install(").count(), 1);
     assert!(sync.find("signal::install(").unwrap() < sync.find("updater::run(").unwrap());

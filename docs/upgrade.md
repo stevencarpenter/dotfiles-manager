@@ -51,7 +51,7 @@ A failure note gives the command, its exit code and the size of its standard err
 
 ## Trials
 
-While a Homebrew trial is active (a record under `state/trials/` whose package is `homebrew/v1`), or while any trial record cannot be read or was left by an interrupted write, `brew` is `blocked` and runs no command. A missing or unlistable trials directory refuses the whole run earlier, as state loss (`E_STORAGE_INVALID`). Each reason is a note: `brew waits for active trial <id> (homebrew/v1 <name>): end the trial, then run dfm sync, or upgrade by hand`. Leaving the trial's name out of `brew upgrade` would not protect it: Homebrew upgrades the outdated dependencies of the names it is given and the installed dependents that need it, so an upgrade of any name can change the trial's package (DFM-31.C09). The other updaters still run.
+While a Homebrew trial is active (a record under `state/trials/` whose package is `homebrew/v1` and that `adopt` has not ended; an adopted trial does not hold `brew`, docs/adopt.md), or while any trial record cannot be read or was left by an interrupted write, `brew` is `blocked` and runs no command. A missing or unlistable trials directory refuses the whole run earlier, as state loss (`E_STORAGE_INVALID`). Each reason is a note: `brew waits for active trial <id> (homebrew/v1 <name>): end the trial, then run dfm sync, or upgrade by hand`. Leaving the trial's name out of `brew upgrade` would not protect it: Homebrew upgrades the outdated dependencies of the names it is given and the installed dependents that need it, so an upgrade of any name can change the trial's package (DFM-31.C09). The other updaters still run.
 
 ## In sync
 
