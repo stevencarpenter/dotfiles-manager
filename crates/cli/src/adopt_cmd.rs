@@ -379,13 +379,15 @@ mod tests {
 
     #[test]
     fn a_gitleaks_config_in_the_candidate_directory_is_not_used() {
-        let real = Path::new("/opt/homebrew/bin");
-        if !real.join("gitleaks").exists() {
-            eprintln!("skipped: no gitleaks in /opt/homebrew/bin");
+        // Local proof only: hosted CI does not install gitleaks, so this test skips there.
+        let found = std::env::var_os("PATH")
+            .and_then(|p| std::env::split_paths(&p).find(|d| d.join("gitleaks").is_file()));
+        let Some(real) = found else {
+            eprintln!("skipped: no gitleaks on PATH");
             return;
-        }
+        };
         let base = scratch("real");
-        let r = runner(vec![real.to_path_buf()], &base);
+        let r = runner(vec![real], &base);
         let parent = base.join("adopt-scan");
         // The key is the AWS documentation example with its last character changed, so the
         // default `aws-access-token` rule matches it and a repository scanner does not flag it.
