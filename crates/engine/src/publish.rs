@@ -197,9 +197,11 @@ impl Dir {
     /// and `uid` owns it. A link, a directory, another hash or another owner is a conflict and
     /// the entry is left alone. The link is staged under a hidden name, then the file is hashed
     /// from a descriptor opened without following a link, the owner check must see that same
-    /// inode, and `renameat` moves the link over it. As for [`Publish::Replace`], a write between
-    /// that last check and the rename is not detected (docs/apply.md, limits). Failure points:
-    /// `link-after-tmp` (before the checks), `link-after-rename`.
+    /// inode, `source_unchanged` re-reads the link's source, and `renameat` moves the link over
+    /// it. So the only copy of the bytes is replaced only while the source still holds them. As
+    /// for [`Publish::Replace`], a write between those last checks and the rename is not detected
+    /// (docs/apply.md, limits). Failure points: `link-after-tmp` (before the checks),
+    /// `link-after-rename`.
     #[doc(hidden)]
     pub fn replace_file_with_link(
         &self,
@@ -207,6 +209,7 @@ impl Dir {
         target: &str,
         expected_sha256: &str,
         uid: u32,
+        source_unchanged: impl FnOnce() -> Result<(), Refusal>,
         fail: &Fail,
     ) -> Result<(), Refusal> {
         check_name(name)?;
@@ -234,6 +237,7 @@ impl Dir {
                 if self.require_owner(name, uid)? != hashed {
                     return Err(changed());
                 }
+                source_unchanged()?;
                 rfs::renameat(&self.fd, &tmp, &self.fd, name).map_err(|e| sys_err("rename", e))
             });
         if let Err(e) = moved {

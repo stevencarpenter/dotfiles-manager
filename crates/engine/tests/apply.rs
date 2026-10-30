@@ -959,7 +959,7 @@ fn replace_file_with_link_checks_hash_and_owner() {
     let fp = file_fingerprint(b"old\n");
     let refuse = |name: &str, hash: &str, uid: u32, fail: &Fail| {
         let e = home
-            .replace_file_with_link(name, "/src/new", hash, uid, fail)
+            .replace_file_with_link(name, "/src/new", hash, uid, || Ok(()), fail)
             .unwrap_err();
         assert_eq!(e.code, Code::Conflict, "{name}: {e:?}");
         assert!(
@@ -987,6 +987,7 @@ fn replace_file_with_link_checks_hash_and_owner() {
             "/src/new",
             &fp,
             uid,
+            || Ok(()),
             &Fail::at("link-after-tmp", Inject::Error),
         )
         .unwrap_err();
@@ -994,7 +995,7 @@ fn replace_file_with_link_checks_hash_and_owner() {
     assert!(leftovers(&s.h.0).is_empty(), "{:?}", leftovers(&s.h.0));
     assert_eq!(fs::read_to_string(s.h.0.join("f")).unwrap(), "old\n");
     // The matching file is replaced with the link.
-    home.replace_file_with_link("f", "/src/new", &fp, uid, &Fail::none())
+    home.replace_file_with_link("f", "/src/new", &fp, uid, || Ok(()), &Fail::none())
         .unwrap();
     assert_eq!(
         fs::read_link(s.h.0.join("f")).unwrap(),
@@ -1022,7 +1023,14 @@ fn a_file_edited_after_the_link_is_staged_is_not_replaced() {
         }
     });
     let e = home
-        .replace_file_with_link("f", "/src/new", &file_fingerprint(b"old\n"), uid, &fail)
+        .replace_file_with_link(
+            "f",
+            "/src/new",
+            &file_fingerprint(b"old\n"),
+            uid,
+            || Ok(()),
+            &fail,
+        )
         .unwrap_err();
     t.join().unwrap();
     assert_eq!(e.code, Code::Conflict, "{e:?}");
@@ -1738,6 +1746,41 @@ fn an_adopt_file_operation_blocks_when_the_file_changed_since_the_plan() {
     assert_eq!(rep.operations[0].status, Status::Blocked);
     assert_eq!(rep.stopped.as_ref().unwrap().code, Code::PlanStale);
     assert_eq!(fs::read_to_string(s.h.0.join("l")).unwrap(), "edited\n");
+    assert!(s.store.read_ledger().unwrap().resources.is_empty());
+}
+
+#[test]
+fn an_adopt_file_operation_keeps_the_file_when_the_source_changes_before_the_rename() {
+    let s = setup();
+    let (o, root) = adopt_file_op(&s);
+    let p = plan_in(&root, vec![o]);
+    let gate = s.h.0.with_extension("gate-adopt-source");
+    let reached = gate.with_extension("reached");
+    let fail = Fail::at("link-after-tmp", Inject::Wait(gate.clone()));
+    let t = std::thread::spawn({
+        let (gate, reached, src) = (gate.clone(), reached.clone(), format!("{root}/x"));
+        move || {
+            wait_reached(&reached, &gate, "link-after-tmp");
+            // A checkout after the source check that ran before the intent.
+            fs::write(&src, "checked out\n").unwrap();
+            fs::write(&gate, "").unwrap();
+        }
+    });
+    let rep = go_adopt(&s, &p, &ids(&["x@l"]), &fail);
+    t.join().unwrap();
+    assert_eq!(
+        rep.operations[0].status,
+        Status::Failed,
+        "{:?}",
+        rep.stopped
+    );
+    let stopped = rep.stopped.as_ref().unwrap();
+    assert_eq!(stopped.code, Code::Conflict, "{stopped:?}");
+    // The only copy of the bytes is still a regular file at the path.
+    let meta = fs::symlink_metadata(s.h.0.join("l")).unwrap();
+    assert!(meta.file_type().is_file());
+    assert_eq!(fs::read_to_string(s.h.0.join("l")).unwrap(), "x\n");
+    assert!(leftovers(&s.h.0).is_empty(), "{:?}", leftovers(&s.h.0));
     assert!(s.store.read_ledger().unwrap().resources.is_empty());
 }
 

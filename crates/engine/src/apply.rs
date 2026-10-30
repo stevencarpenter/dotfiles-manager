@@ -444,7 +444,8 @@ fn first_refusal(plan: &Plan, generator: &dyn Generator) -> Result<(), Refusal> 
                     )));
                 }
                 // The file is replaced only while it and the source still hold the bytes adopt
-                // compared: both hashes must be in the plan for apply to check them again.
+                // compared: both hashes must be in the plan, because the publisher checks both
+                // again right before the rename.
                 if op.action == Action::AdoptFile {
                     let hashed_source = op.inputs.first().is_some_and(|i| {
                         op.preconditions.iter().any(|p| {
@@ -2030,6 +2031,17 @@ impl Exec<'_, '_> {
                 op.link.as_deref().unwrap_or_default(),
                 adopted_fingerprint(op, rel).unwrap_or_default(),
                 sys.uid,
+                // The source was checked before the intent. A checkout since then must not
+                // leave a link to other bytes where the only copy of the file was.
+                || {
+                    link_source(sys, self.plan, op).map_err(|g| match g {
+                        Gather::Stale(d) => Refusal::new(
+                            Code::Conflict,
+                            format!("{rel}: {d}; the file is left alone"),
+                        ),
+                        Gather::Failed(r) => r,
+                    })
+                },
                 fail,
             )?,
             Action::CreateFile | Action::UpdateFile => {
