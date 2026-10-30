@@ -4,6 +4,7 @@
 #![forbid(unsafe_code)]
 
 mod adapters;
+mod adopt_cmd;
 mod apply_cmd;
 mod controls_fs;
 mod doctor_cmd;
