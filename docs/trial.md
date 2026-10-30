@@ -63,7 +63,7 @@ The optional fields `package` and `unknown` need no schema bump: a record withou
 
 A trial is **active** until its record has `adopted`. An adopted record stays as evidence and keeps its id taken (a second trial of that id is `E_CONFLICT`). Readers that mean "in progress" skip it: `sync` does not hold `brew` for it, and `doctor` lists no row for it. `state check` still validates and counts it.
 
-The record is a private file under `state/trials/`. `state check` validates it with the other documents and counts it (`trials: N (M unreadable)`). `doctor` and `status` show an unreadable or foreign-identity record as a WARN row. They do not list or count readable records. An interrupted install follows the packages rule (docs/packages.md, "Interrupted install"): `state check` reports `E_OP_INTERRUPTED`, `state recover` leaves it `unknown`, and `state resolve <op_id> --as failed` settles it.
+The record is a private file under `state/trials/`. `state check` validates it with the other documents and counts it (`trials: N (M unreadable)`). `doctor` and `status` show an unreadable or foreign-identity record as a WARN row. An interrupted install follows the packages rule (docs/packages.md, "Interrupted install"): `state check` reports `E_OP_INTERRUPTED`, `state recover` leaves it `unknown`, and `state resolve <op_id> --as failed` settles it.
 
 ## Decisions
 
@@ -86,7 +86,6 @@ The record is a private file under `state/trials/`. `state check` validates it w
 - **Not an OS sandbox.** Services, caches, logs and any path outside the baseline are declared `unknown`. A path the tool creates there is a candidate for review at purge time, never an owned cleanup scope, and never gets a retroactive baseline.
 - **One candidate by default.** A tool that keeps its configuration elsewhere needs `--config`. The record cannot be extended after the fact without a new baseline, so pass every candidate on the first run.
 - **The baseline is one observation.** A hard-linked file is hashed like any other. `purge` must check again before it deletes.
-- **No trial row in `doctor`.** A per-trial row with its owner and age is not built.
 - **One end of a trial.** `adopt` ends a trial ([docs/adopt.md](adopt.md)). `purge` is not built, so a trial that is not adopted stays until it is removed by hand.
 - **Rerun cost.** Two probe rounds (before and under the lock), plus the postcondition probe after an install.
 - **Evidence scope.** Tests use the `test-isolation` build and the `brew` and `mise` look-alikes. No test runs a real install. Whether `sync` keeps active trials intact is not tested.
