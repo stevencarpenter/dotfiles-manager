@@ -306,6 +306,15 @@ pub struct MergeFact {
     pub verdict: MergeVerdict,
 }
 
+/// A live regular file that `dfm adopt` read and approved for replacement by its link. Both
+/// hashes are of the bytes adopt read once: `fingerprint` is their `file_fingerprint` (the hash
+/// an observation records) and `content_id` is `sha256:<hex>` (the form a resolved source has).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ApprovedFile {
+    pub fingerprint: String,
+    pub content_id: String,
+}
+
 /// The ledger entry for a path as a precondition string. For a sensitive path the fingerprint
 /// is left out, whoever owns the entry: it can be a hash of credentials. Apply builds the same
 /// string from a fresh ledger read, so both sides must use this function.
@@ -348,6 +357,9 @@ pub struct Context<'a> {
     /// Service resources whose restart the user requested (`services --restart <resource>`). A
     /// current service in this set is planned as a disruptive restart.
     pub restart: BTreeSet<String>,
+    /// HOME-relative paths of regular files that `dfm adopt` approved for replacement by their
+    /// link. Empty for every other caller, so `apply` and `sync` keep refusing such a file.
+    pub adopt_files: BTreeMap<String, ApprovedFile>,
 }
 
 /// Ledger outputs of a resource that is no longer selected, at a path no selected resource
@@ -1002,11 +1014,14 @@ impl Planner<'_> {
             state: owner_state,
         });
         let unowned = self.ledger_entry(claim).is_none();
+        let approved = self.adopt_approved(claim, &seen, &op.inputs);
         let (action, status, ownership, effect, post) = match r.kind.as_str() {
             "merge" => self.decide_merge(r, claim, &seen, op)?,
             "secret" => self.decide_secret(r, claim, &seen, op)?,
-            _ => decide(r, claim, &seen, link, op.ownership, unowned)?,
+            _ => decide(r, claim, &seen, link, op.ownership, unowned, approved)?,
         };
+        // Replacing a file the ledger does not record is approved by id (`--allow-adopt`).
+        op.takeover |= action == Action::AdoptFile;
         // The decision succeeded, so the old owner's entry is retired first. The file is missing
         // here: a merge over a present file with another owner was refused in `decide_merge`.
         if let Some(old) = stale {
@@ -1020,6 +1035,20 @@ impl Planner<'_> {
         op.postcondition = post;
         op.link = link.map(String::from);
         Ok(())
+    }
+
+    /// Whether `dfm adopt` approved the regular file at `claim` for replacement by its link: the
+    /// live fingerprint is the one adopt read, and the link's source holds those same bytes.
+    fn adopt_approved(&self, claim: &str, seen: &Seen, inputs: &[Input]) -> bool {
+        let Some(a) = self.cx.adopt_files.get(claim) else {
+            return false;
+        };
+        let live = match &seen.node {
+            Node::File { sha256, .. } => sha256.as_deref(),
+            _ => None,
+        };
+        live == Some(a.fingerprint.as_str())
+            && matches!(inputs, [i] if i.content_id.as_deref() == Some(a.content_id.as_str()))
     }
 
     /// A co-owned merge file (`merge::is_merge`). The manager never owns the whole file, so
@@ -2178,6 +2207,7 @@ fn decide(
     link: Option<&str>,
     ownership: Ownership,
     unowned: bool,
+    adopt_approved: bool,
 ) -> Result<Decision, Fail> {
     // Only a normal-class output that no ledger entry mentions can be adopted.
     let adoptable = unowned && !r.sensitive;
@@ -2292,6 +2322,14 @@ fn decide(
                 (_, Ownership::Unverifiable) => {
                     Err(conflict("has an owner the manager cannot verify"))
                 }
+                // Only `dfm adopt` approves a file, after it read the same bytes as the source.
+                (Node::File { .. }, _) if adopt_approved && adoptable => Ok((
+                    Action::AdoptFile,
+                    Status::Planned,
+                    Ownership::Absent,
+                    format!("replace {shown} with a link -> {want}; same content"),
+                    post,
+                )),
                 (Node::File { .. }, _) => Err(fail(
                     Code::Conflict,
                     "target",
@@ -2406,6 +2444,8 @@ fn unknown_fail(field: &'static str, path: &str, reason: &str) -> Fail {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::plan::file_fingerprint;
+    use crate::resolve::Provenance;
 
     fn resource(sensitive: bool) -> ResolvedResource {
         ResolvedResource {
@@ -2563,6 +2603,7 @@ mod tests {
                 true => BTreeSet::from([r.id.clone()]),
                 false => BTreeSet::new(),
             },
+            adopt_files: BTreeMap::new(),
         };
         build(&resolved, &cx, &obs).unwrap()
     }
@@ -2674,6 +2715,7 @@ mod tests {
             Some("/r/x"),
             ownership,
             unowned,
+            false,
         )
         .unwrap_or_else(|f| panic!("{}", f.detail))
     }
@@ -2734,5 +2776,153 @@ mod tests {
         let d = run(false, &link(LinkTo::File), Ownership::Owned, false);
         assert_eq!((d.0, d.2), (Action::None, Ownership::Owned));
         assert!(!d.3.contains("not adopted"), "{}", d.3);
+    }
+
+    /// The plan of the link resource `core.ssh` (`.ssh/config` -> `/r/ssh_config`) whose source
+    /// holds `source` while a regular file holding `live` is at the target, with `approved` in
+    /// `adopt_files` for that path.
+    fn adopt_plan(live: &[u8], source: &[u8], approved: Option<ApprovedFile>) -> Plan {
+        let mut r = resource(false);
+        r.provenance = BTreeMap::from([(
+            "/source".to_string(),
+            Provenance {
+                owner: "core".into(),
+                original: None,
+                change: None,
+                changer: None,
+                reason: None,
+                source_file: "m.toml".into(),
+                source_path: Some("ssh_config".into()),
+                content_id: Some(format!("sha256:{}", sha256_hex(source))),
+            },
+        )]);
+        let resolved = Resolved {
+            profile: "p".into(),
+            platform: "p".into(),
+            architecture: "a".into(),
+            modules: vec!["core".into()],
+            resources: BTreeMap::from([(r.id.clone(), r)]),
+            updaters: vec![],
+            includes: vec![],
+        };
+        let size = u64::try_from(live.len()).unwrap();
+        let obs = Observations {
+            seen: BTreeMap::from([
+                (
+                    ".ssh".into(),
+                    Seen {
+                        node: Node::Dir {
+                            mode: 0o700,
+                            own: true,
+                        },
+                        alias: None,
+                    },
+                ),
+                (
+                    ".ssh/config".into(),
+                    Seen {
+                        node: Node::File {
+                            mode: 0o644,
+                            own: true,
+                            size,
+                            sha256: Some(file_fingerprint(live)),
+                        },
+                        alias: None,
+                    },
+                ),
+            ]),
+            listings: BTreeMap::new(),
+        };
+        let cx = Context {
+            scope: Scope::Config,
+            binary: Binary {
+                version: "0".into(),
+                sha256: "0".repeat(64),
+            },
+            profile: "p",
+            machine_id: "m",
+            sources: vec![],
+            root: "/r",
+            ledger: vec![],
+            reserved: BTreeMap::new(),
+            unchecked: BTreeMap::new(),
+            merge: BTreeMap::new(),
+            secret: BTreeMap::new(),
+            package: BTreeMap::new(),
+            service: BTreeMap::new(),
+            restart: BTreeSet::new(),
+            adopt_files: approved
+                .map(|a| BTreeMap::from([(".ssh/config".to_string(), a)]))
+                .unwrap_or_default(),
+        };
+        build(&resolved, &cx, &obs).unwrap()
+    }
+
+    fn approved(bytes: &[u8]) -> ApprovedFile {
+        ApprovedFile {
+            fingerprint: file_fingerprint(bytes),
+            content_id: format!("sha256:{}", sha256_hex(bytes)),
+        }
+    }
+
+    #[test]
+    fn a_regular_file_is_adopted_only_when_adopt_names_it_with_its_hash() {
+        let body = b"Host *\n";
+        let refused = |p: &Plan, what: &str| {
+            assert_eq!(p.blockers.len(), 1, "{what}: {p:?}");
+            assert_eq!(p.blockers[0].code, Code::Conflict, "{what}");
+            assert!(
+                p.blockers[0]
+                    .detail
+                    .contains("is a regular file, not the link"),
+                "{what}: {}",
+                p.blockers[0].detail
+            );
+            assert_eq!(p.operations[0].status, Status::Blocked, "{what}");
+            assert!(!p.operations[0].takeover, "{what}");
+        };
+        // `apply` and `sync` pass no approval: today's conflict.
+        refused(&adopt_plan(body, body, None), "no approval");
+        // The approval names this path with this file's hashes.
+        let p = adopt_plan(body, body, Some(approved(body)));
+        assert!(p.blockers.is_empty(), "{:?}", p.blockers);
+        assert_eq!(p.operations.len(), 1);
+        let op = &p.operations[0];
+        assert_eq!(
+            (op.action, op.status, op.ownership),
+            (Action::AdoptFile, Status::Planned, Ownership::Absent)
+        );
+        assert!(op.takeover);
+        assert_eq!(op.link.as_deref(), Some("/r/ssh_config"));
+        let fp = file_fingerprint(body);
+        assert!(
+            op.preconditions
+                .iter()
+                .any(|c| c.subject == "path:.ssh/config"
+                    && c.state.ends_with(&format!(":sha256:{fp}"))),
+            "{:?}",
+            op.preconditions
+        );
+        assert_eq!(
+            op.effect,
+            "replace .ssh/config with a link -> /r/ssh_config; same content"
+        );
+        // An approval of other bytes: the live file is not what adopt approved.
+        refused(
+            &adopt_plan(body, body, Some(approved(b"other\n"))),
+            "other fingerprint",
+        );
+        // The source holds other content than the live file: adopt never links to it.
+        refused(
+            &adopt_plan(body, b"other\n", Some(approved(body))),
+            "other source",
+        );
+        // Each hash alone is not enough.
+        let mut half = approved(body);
+        half.content_id = approved(b"other\n").content_id;
+        refused(&adopt_plan(body, body, Some(half)), "content id differs");
+        let mut half = approved(body);
+        half.fingerprint = approved(b"other\n").fingerprint;
+        refused(&adopt_plan(body, body, Some(half)), "fingerprint differs");
     }
 }

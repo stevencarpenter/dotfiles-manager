@@ -174,6 +174,11 @@ pub enum Action {
     /// Record ownership of an existing link that is exactly the link the resource would create.
     /// Apply writes nothing to HOME for it and needs `--allow-adopt <operation-id>`.
     Adopt,
+    /// Replace a regular file that no ledger entry mentions with the link the resource would
+    /// create, when the file holds the source's content. Only `dfm adopt` plans it, for a file it
+    /// read and approved (`Context.adopt_files`); `apply` and `sync` refuse such a file. Apply
+    /// re-checks the file fingerprint before the rename and needs `--allow-adopt <operation-id>`.
+    AdoptFile,
     /// Retire only the handler entries the ledger says the manager added to a co-owned file
     /// whose resource is no longer selected. The file, its managed and seeded values and every
     /// foreign entry stay (docs/adapters.md, `claude-settings/v1`).
@@ -203,7 +208,7 @@ impl Action {
     pub fn carries_link(self) -> bool {
         matches!(
             self,
-            Action::CreateLink | Action::ReplaceLink | Action::Adopt
+            Action::CreateLink | Action::ReplaceLink | Action::Adopt | Action::AdoptFile
         )
     }
 
@@ -212,7 +217,11 @@ impl Action {
     pub fn publishes(self) -> bool {
         matches!(
             self,
-            Action::CreateLink | Action::ReplaceLink | Action::CreateFile | Action::UpdateFile
+            Action::CreateLink
+                | Action::ReplaceLink
+                | Action::AdoptFile
+                | Action::CreateFile
+                | Action::UpdateFile
         )
     }
 }

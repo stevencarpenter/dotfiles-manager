@@ -240,6 +240,7 @@ pub(crate) fn plan_with_outputs(
         package: probed.package,
         service: probed.service,
         restart: probed.restart,
+        adopt_files: BTreeMap::new(),
     };
     let mut plan = plan::build(&loaded.resolved, &cx, &obs)?;
     // Generated output hashes, from the same adapters apply runs.

@@ -12,7 +12,7 @@ use crate::fsys::{
     Dir, Ident, Peek, Stamp, Sys, check_name, ident_of, kind, mode_bits, sys_err, temp_name,
     unconfirmed,
 };
-use dfm_model::plan::{file_fingerprint, link_fingerprint};
+use dfm_model::plan::{MAX_HASHED_BYTES, file_fingerprint, link_fingerprint};
 use dfm_model::{Code, Refusal};
 use rustix::fs::{self as rfs, AtFlags, FileType, Mode, OFlags};
 use rustix::io::Errno;
@@ -183,6 +183,57 @@ impl Dir {
         let moved = normalize_link_mode(self, &tmp)
             .and_then(|()| fail.hit("link-after-tmp"))
             .and_then(|()| {
+                rfs::renameat(&self.fd, &tmp, &self.fd, name).map_err(|e| sys_err("rename", e))
+            });
+        if let Err(e) = moved {
+            self.drop_temp(&tmp);
+            return Err(e);
+        }
+        unconfirmed(fail.hit("link-after-rename").and_then(|()| self.sync()))
+    }
+
+    /// Replaces the regular file `name` with the link `name -> target` (`dfm adopt`), only while
+    /// the file still has the fingerprint `expected_sha256` (`file_fingerprint` of its content)
+    /// and `uid` owns it. A link, a directory, another hash or another owner is a conflict and
+    /// the entry is left alone. The link is staged under a hidden name, then the file is hashed
+    /// from a descriptor opened without following a link, the owner check must see that same
+    /// inode, and `renameat` moves the link over it. As for [`Publish::Replace`], a write between
+    /// that last check and the rename is not detected (docs/apply.md, limits). Failure points:
+    /// `link-after-tmp` (before the checks), `link-after-rename`.
+    #[doc(hidden)]
+    pub fn replace_file_with_link(
+        &self,
+        name: &str,
+        target: &str,
+        expected_sha256: &str,
+        uid: u32,
+        fail: &Fail,
+    ) -> Result<(), Refusal> {
+        check_name(name)?;
+        let changed = || {
+            conflict(format!(
+                "{} is no longer the file adopt approved; it is left alone",
+                self.at(name).display()
+            ))
+        };
+        // A first look, so a plain mismatch stages nothing.
+        match self.hash_file(name, MAX_HASHED_BYTES)? {
+            Some((h, _)) if h == expected_sha256 => {}
+            _ => return Err(changed()),
+        }
+        let tmp = temp_name(name, "stage");
+        rfs::symlinkat(target, &self.fd, &tmp).map_err(|e| sys_err("stage link", e))?;
+        let moved = normalize_link_mode(self, &tmp)
+            .and_then(|()| fail.hit("link-after-tmp"))
+            .and_then(|()| {
+                let hashed = match self.hash_file(name, MAX_HASHED_BYTES)? {
+                    Some((h, ident)) if h == expected_sha256 => ident,
+                    _ => return Err(changed()),
+                };
+                // The owner check must see the inode that was hashed.
+                if self.require_owner(name, uid)? != hashed {
+                    return Err(changed());
+                }
                 rfs::renameat(&self.fd, &tmp, &self.fd, name).map_err(|e| sys_err("rename", e))
             });
         if let Err(e) = moved {
