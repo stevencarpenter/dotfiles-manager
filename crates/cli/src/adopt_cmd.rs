@@ -88,8 +88,13 @@ pub(crate) fn scan(
     let (copy, ignore) = (run.join("files"), run.join("ignore"));
     private(&copy, false)?;
     private(&ignore, false)?;
-    for (i, (_, bytes)) in files.iter().enumerate() {
-        let path = copy.join(i.to_string());
+    // `files/<i>/<base name>`: the base name keeps the rules that match on a file name or
+    // extension (`cert.p12`); the numbered directory maps a finding back to its candidate.
+    for (i, (original, bytes)) in files.iter().enumerate() {
+        let dir = copy.join(i.to_string());
+        private(&dir, false)?;
+        let base = Path::new(original).file_name().unwrap_or("file".as_ref());
+        let path = dir.join(base);
         OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -103,6 +108,7 @@ pub(crate) fn scan(
         text(&copy)?,
         "--no-banner",
         "--redact",
+        "--ignore-gitleaks-allow",
         "--exit-code",
         "3",
         "--gitleaks-ignore-path",
@@ -154,7 +160,8 @@ fn findings(report: &[u8], dir: &Path, names: &[String]) -> Result<Vec<String>, 
         let name = Path::new(file)
             .strip_prefix(dir)
             .ok()
-            .and_then(|p| p.to_str())
+            .and_then(|p| p.components().next())
+            .and_then(|c| c.as_os_str().to_str())
             .and_then(|n| n.parse::<usize>().ok())
             .and_then(|i| names.get(i))
             .ok_or_else(unreadable)?;
@@ -224,10 +231,15 @@ pub(crate) fn inside_git_tree(git: &Git, root: &Path, rel: &str) -> Result<bool,
     let Some(root_top) = top(root)? else {
         return Ok(false);
     };
-    let Some(parent) = root.join(rel_path).parent().map(Path::to_path_buf) else {
+    // A link at the path may point outside the tree, whatever git tracks.
+    let full = root.join(rel_path);
+    if fs::symlink_metadata(&full).is_ok_and(|m| m.file_type().is_symlink()) {
+        return Ok(false);
+    }
+    let Some(parent) = full.parent() else {
         return Ok(false);
     };
-    if top(&parent)?.as_deref() != Some(root_top.as_str()) {
+    if top(parent)?.as_deref() != Some(root_top.as_str()) {
         return Ok(false);
     }
     // `check-ignore -q`: 0 ignored, 1 not ignored; a tracked path is never reported as ignored.
@@ -351,7 +363,7 @@ mod tests {
     fn a_report_that_cannot_be_mapped_is_a_failed_scan() {
         let names = ["/h/a".to_string()];
         let ok = |j: &str| findings(j.as_bytes(), Path::new("/s/files"), &names);
-        assert_eq!(ok(r#"[{"File":"/s/files/0"}]"#).unwrap(), ["/h/a"]);
+        assert_eq!(ok(r#"[{"File":"/s/files/0/a"}]"#).unwrap(), ["/h/a"]);
         for bad in [
             "",
             "not json",
@@ -388,9 +400,22 @@ mod tests {
                 "0:aws-access-token:1\n1:aws-access-token:1\n",
             ),
             ("/h/.config/tool/credentials", key),
+            // An inline allow comment and a path-only rule (pkcs12-file) must still report.
+            (
+                "/h/.config/tool/commented",
+                "aws_access_key_id = AKIAIOSFODNN7EXAMPLQ # gitleaks:allow\n",
+            ),
+            ("/h/.config/tool/cert.p12", "not really a key store"),
         ]);
         let hits = scan(&r, &parent, &input).unwrap();
-        assert_eq!(hits, ["/h/.config/tool/credentials"]);
+        assert_eq!(
+            hits,
+            [
+                "/h/.config/tool/cert.p12",
+                "/h/.config/tool/commented",
+                "/h/.config/tool/credentials"
+            ]
+        );
         assert_eq!(leftovers(&parent), 0);
     }
 
@@ -473,6 +498,11 @@ mod tests {
         assert!(!inside_git_tree(&git, &root, "nowhere/module.toml").unwrap());
         assert!(!inside_git_tree(&git, &root, "../repo/modules/a/module.toml").unwrap());
         assert!(!inside_git_tree(&git, &root, "/etc/hosts").unwrap());
+        // A tracked link to a file outside the tree is not inside it.
+        std::os::unix::fs::symlink("/etc/hosts", root.join("modules/a/link.toml")).unwrap();
+        git_in(&root, &["add", "."]);
+        git_in(&root, &["commit", "-q", "-m", "link"]);
+        assert!(!inside_git_tree(&git, &root, "modules/a/link.toml").unwrap());
         let nested = root.join("vendor/inner");
         fs::create_dir_all(&nested).unwrap();
         git_in(&nested, &["init", "-q", "."]);

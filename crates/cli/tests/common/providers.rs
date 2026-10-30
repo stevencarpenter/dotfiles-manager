@@ -95,7 +95,7 @@ esac
 
 /// `gitleaks dir <path> ...` logs its arguments and the mode of the scanned directory to
 /// `../log`. It exits 1 with the `gitleaks-fail` marker beside `bin`. Otherwise it reports every
-/// file of the directory that holds `FAKE_SECRET` as a JSON finding (the `File` is the path it was
+/// file one level below the directory (`<i>/<name>`) that holds `FAKE_SECRET` as a JSON finding (the `File` is the path it was
 /// given, as the real tool prints it) and exits 3, or prints `[]` and exits 0.
 pub const FAKE_GITLEAKS: &str = r#"#!/bin/sh
 PATH=/usr/bin:/bin:$PATH
@@ -104,7 +104,7 @@ printf 'gitleaks %s\n' "$*" >> "$here/../log"
 ls -ld "$2" | cut -c1-10 >> "$here/../log"
 [ -e "$here/../gitleaks-fail" ] && { echo "PLANTED-STDERR" >&2; exit 1; }
 rc=0; sep=""; printf '['
-for f in "$2"/*; do
+for f in "$2"/*/*; do
   [ -f "$f" ] || continue
   if grep -q FAKE_SECRET "$f"; then
     printf '%s{"RuleID":"fake","Match":"REDACTED","Secret":"REDACTED","File":"%s"}' "$sep" "$f"; sep=","; rc=3
