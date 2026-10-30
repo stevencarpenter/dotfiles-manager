@@ -71,8 +71,13 @@ The owner runs the same command again after a stop (exit 1, 130, 143, or a kille
   - a repo copy whose bytes hash to the recorded SHA-256, which is also the candidate's SHA-256 now;
   - a manifest or Brewfile whose bytes hash to the recorded `post`, and are bytes hashing to the recorded `pre` followed by exactly the planned append;
   - a live path that is a link to the recorded repo copy. Its candidate bytes and mode are read from that copy.
-- **Anything else** is `E_CONFLICT` with the path: a changed or foreign repo copy, a hand-edited manifest or Brewfile, a link elsewhere. Nothing is written.
-- **The checks of a fresh run.** They run against the composition before the kept manifest append, so the planned resources do not collide with themselves. A kept file is not checked for uncommitted changes and not walked for writability, because it is not written.
+- **Anything else** is `E_CONFLICT` with the path, and nothing is written:
+  - a repo copy that is not the recorded one, a torn copy included (fix: compare it with the live file, and remove a partial copy);
+  - a live file changed after the copy (fix: restore the copied bytes, or remove the copy to adopt the new bytes);
+  - a repo copy changed through the live link after the takeover; the message says so (fix: commit or revert that change in the copy);
+  - a manifest or Brewfile changed after the stop, a torn append included (fix: revert only what changed after the stop, then run again). A torn manifest append that no longer parses is refused by the resolver first, with `E_MANIFEST_INVALID` and the manifest path;
+  - a live link to anything but the recorded repo copy.
+- **The checks of a fresh run.** They run against the composition before the kept manifest append, so the planned resources do not collide with themselves. A kept file is not checked for uncommitted changes or for writability, because it is not written. The walk that refuses a link on the way runs for every repo path, kept ones included, before a kept copy is accepted.
 - **The takeover.** A kept link that the ledger owns is planned `current` and needs no approval. A kept link without an owner (for example after `dfm state recover` closed the engine's `adopt-file` intent) is a planned `adopt`; its id is approved only because the live link equals the recorded one. The engine then records the owner.
 - **The preview and the digest.** `resume:` names the interrupted op id, and each kept item says `kept from the interrupted run`. The digest covers what is kept, so the approval matches what is left to do.
 - **Concurrent runs.** The second run's preview reads the first run's partial work. Its approval needs the writer lock and is refused with `E_LOCKED` while the first run holds it, before any write.
@@ -94,7 +99,7 @@ The dotfiles commit hook (`gitleaks git --staged`) stays as the second check.
 | Files or directories | Files only. A directory link would also capture what the tool writes later. |
 | Where the journal record lives | In the intent's `token`. A recovery output path must be inside HOME, and the repo may not be; an output path would also let recovery probe the entry by content. The op name is `trial-adopt`, distinct from the engine's `adopt` and `adopt-file` arms in recovery. |
 | When the `trial-adopt` entry closes | After the repo writes, before the takeover. The engine settles every open intent before it applies, so an open `trial-adopt` intent would be reconciled (as `unknown`) in the middle of the run. The takeover is journaled per link by the engine. |
-| How the appends are written | Through one `O_NOFOLLOW` descriptor that is read, checked against the digest's SHA-256 and appended to. The engine's atomic replace writes mode 0600 and opens its directory by a resolved path, so it is not used for a file the owner keeps at its own mode. An interrupted append leaves the old bytes followed by a prefix of the planned text, which the token describes. |
+| How the appends are written | Through one `O_NOFOLLOW` descriptor that is read, checked against the digest's SHA-256 and appended to. The engine's atomic replace writes mode 0600 and opens its directory by a resolved path, so it is not used for a file the owner keeps at its own mode. A stop inside an append leaves the old bytes followed by a prefix of the planned text. That prefix is not the recorded append, so a later run refuses it (see "Interruption"). |
 | Which part of the plan runs | Only the new resources' `adopt-file` operations. Unrelated drift and blockers elsewhere in the composition are left for `apply` and `sync`. |
 | `apply` and `sync` | Unchanged. Without `adopt`'s approval a regular file at a link target stays `E_CONFLICT` (docs/planner.md, docs/apply.md). After adopt, before the commit, `apply --preview` plans the link `current`. |
 

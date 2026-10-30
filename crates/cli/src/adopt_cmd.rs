@@ -484,7 +484,7 @@ fn prior_base<'a>(current: &'a [u8], addition: &str, prior: &PriorEdit) -> Optio
 /// its planned append.
 fn not_prior(path: &str, op_id: &str) -> Refusal {
     conflict(format!(
-        "{path} is neither as the interrupted adopt {op_id} found it nor that plus its planned append; nothing was changed. Fix: restore it with git, then run adopt again"
+        "{path} is neither as the interrupted adopt {op_id} found it nor that plus its full planned append; nothing was changed. Fix: revert only what changed in it after the stop (a partial append at its end is such a change), then run adopt again"
     ))
 }
 
@@ -801,10 +801,10 @@ fn writable(m: &fs::Metadata, uid: u32) -> bool {
     }
 }
 
-/// Walks `rel` below `root` without following a link: no existing component may be a link, and
-/// the deepest existing one (the file itself, or the directory the write creates entries in)
-/// must be writable.
-fn check_path(root: &Path, rel: &str, uid: u32) -> Result<(), Refusal> {
+/// Walks `rel` below `root` without following a link: no existing component may be a link. With
+/// `writes`, the deepest existing one (the file itself, or the directory the write creates
+/// entries in) must also be writable; a file kept from an interrupted run is only read.
+fn check_path(root: &Path, rel: &str, uid: u32, writes: bool) -> Result<(), Refusal> {
     let mut cur = root.to_path_buf();
     let mut deepest = fs::symlink_metadata(&cur)
         .map_err(|e| conflict(format!("{} cannot be read ({})", cur.display(), e.kind())))?;
@@ -835,7 +835,7 @@ fn check_path(root: &Path, rel: &str, uid: u32) -> Result<(), Refusal> {
             }
         }
     }
-    if !writable(&deepest, uid) {
+    if writes && !writable(&deepest, uid) {
         return Err(conflict(format!(
             "{} is not writable; nothing was changed",
             at.display()
@@ -968,23 +968,47 @@ fn decide(
 
     // A repo path that exists is refused, unless it is the interrupted run's copy: it holds the
     // bytes that run recorded, and those are still the candidate's bytes.
+    // The walk refuses a link anywhere on the way, so a kept copy (or the copy a kept link was
+    // read through) is never accepted when it is reached through a directory swapped for a link.
     for c in &mut candidates {
+        check_path(&root, &c.repo, uid, false)?;
         let full = root.join(&c.repo);
         match fs::symlink_metadata(&full) {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
             _ => {}
         }
-        let recorded = prior
-            .as_ref()
-            .and_then(|p| p.files.get(&(c.rel.clone(), c.repo.clone())));
-        let own = recorded.is_some_and(|sha| {
-            *sha == c.sha256 && read_candidate(&full).is_ok_and(|(b, _)| sha256_hex(&b) == *sha)
-        });
-        if !own {
+        let (Some(p), Some(sha)) = (
+            prior.as_ref(),
+            prior
+                .as_ref()
+                .and_then(|p| p.files.get(&(c.rel.clone(), c.repo.clone()))),
+        ) else {
             return Err(conflict(format!(
                 "{} already exists in the root; adopt never overwrites a repo file",
                 c.repo
             )));
+        };
+        let copy_ok = read_candidate(&full).is_ok_and(|(b, _)| sha256_hex(&b) == *sha);
+        let why = if c.linked && *sha != c.sha256 {
+            Some(format!(
+                "the repo copy {} changed after the takeover (a write through the link {}); nothing was changed. Fix: review the change; commit it or revert it in the copy, then run adopt again",
+                c.repo, c.live
+            ))
+        } else if !copy_ok {
+            Some(format!(
+                "{} is not the copy the interrupted adopt {} wrote (changed, or cut short by the stop); nothing was changed. Fix: compare it with {}; if it is a partial copy, remove it, then run adopt again",
+                c.repo, p.op_id, c.live
+            ))
+        } else if *sha != c.sha256 {
+            Some(format!(
+                "{} changed after the interrupted adopt {} copied it to {}; nothing was changed. Fix: restore the live file to the copied bytes, or remove the copy to adopt the new bytes, then run adopt again",
+                c.live, p.op_id, c.repo
+            ))
+        } else {
+            None
+        };
+        if let Some(why) = why {
+            return Err(conflict(why));
         }
         c.copied = true;
     }
@@ -1144,7 +1168,8 @@ fn decide(
     }
 
     // The checkout: clean edits, writable paths, no link on the way. A file the interrupted run
-    // already wrote is not written again, so it is neither checked for changes nor walked.
+    // already wrote is not written again, so it is not checked for changes or for writability;
+    // the walk for links still covers it.
     let mut edited: Vec<&str> = Vec::new();
     if !manifest_done {
         edited.push(&manifest);
@@ -1168,7 +1193,17 @@ fn decide(
             .filter(|c| !c.copied)
             .map(|c| c.repo.as_str()),
     ) {
-        check_path(&root, rel, uid)?;
+        check_path(&root, rel, uid, true)?;
+    }
+    let kept_edits = [
+        manifest_done.then_some(manifest.as_str()),
+        brewfile
+            .as_ref()
+            .filter(|b| b.done)
+            .map(|b| b.path.as_str()),
+    ];
+    for rel in kept_edits.into_iter().flatten() {
+        check_path(&root, rel, uid, false)?;
     }
 
     if scan_now {
