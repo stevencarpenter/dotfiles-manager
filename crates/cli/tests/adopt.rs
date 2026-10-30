@@ -639,3 +639,50 @@ fn nothing_found_is_refused() {
         "nothing to adopt",
     );
 }
+
+#[test]
+fn a_third_party_tap_keeps_its_name_in_the_brewfile() {
+    let fx = Fx::bare();
+    // tuicr is installed from a third-party tap, so the trial finds it and installs nothing.
+    let keg = fx.fake.path().join("Cellar/tuicr/1.0.0");
+    fs::create_dir_all(&keg).unwrap();
+    fs::write(
+        keg.join("INSTALL_RECEIPT.json"),
+        r#"{"source":{"tap":"owner/tap"}}"#,
+    )
+    .unwrap();
+    let o = fx.run(&["trial", "owner/tap/tuicr", "--provider", BREW, "--preview"]);
+    let d = digest_of(&o);
+    let o = fx.run(&[
+        "trial",
+        "owner/tap/tuicr",
+        "--provider",
+        BREW,
+        "--yes-plan",
+        &d,
+    ]);
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), out(&o));
+    fx.live(LIVE, TUICR);
+    let o = fx.adopt(&["--module", "core", "--preview"]);
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), out(&o));
+    assert!(
+        out(&o).contains("brewfile: Brewfile += brew \"owner/tap/tuicr\""),
+        "{}",
+        out(&o)
+    );
+}
+
+#[test]
+fn an_official_package_listed_with_its_tap_gets_no_second_line() {
+    let fx = Fx::new();
+    fx.put("Brewfile", "brew \"homebrew/core/tuicr\"\n");
+    git(&fx.root, &["commit", "-q", "-am", "tap spelling"]);
+    fx.live(LIVE, TUICR);
+    let o = fx.adopt(&["--module", "core", "--preview"]);
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), out(&o));
+    assert!(
+        out(&o).contains("brewfile: none (Brewfile already lists tuicr)"),
+        "{}",
+        out(&o)
+    );
+}

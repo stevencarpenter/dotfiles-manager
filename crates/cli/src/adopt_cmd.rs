@@ -923,10 +923,12 @@ fn decide(
         }
     }
 
-    // The Brewfile line: the package as a formula, or as a cask when brew holds it as one.
+    // The Brewfile line: the package as a formula, or as a cask when brew holds it as one. A
+    // line for any spelling of the same package counts as present.
     if let (Some(b), Some(p)) = (brewfile.as_mut(), &trial.package) {
-        let name = package::leaf(&p.name).to_string();
-        if brewfile_has(&String::from_utf8_lossy(&brew_bytes), &name) {
+        let (name, spellings) = package::brewfile_names(&p.name);
+        let text = String::from_utf8_lossy(&brew_bytes);
+        if spellings.iter().any(|n| brewfile_has(&text, n)) {
             brew_note = Some(format!("{} already lists {name}", b.path));
         } else {
             let kind = if package::brew_is_cask(runner, &p.name)? {

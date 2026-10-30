@@ -252,6 +252,28 @@ fn brew_probe(runner: &Runner, pkg: &str) -> PackageState {
     PackageState::Installed(versions.join(" "))
 }
 
+/// The official taps: a package named in one is written by its short name in a Brewfile.
+const OFFICIAL_TAPS: [&str; 2] = ["homebrew/core", "homebrew/cask"];
+
+/// The name a Brewfile line gives the recorded brew package, and every spelling of that package
+/// a Brewfile can already hold. An official package is written by its short name (`tuicr`, from
+/// `homebrew/core/tuicr` too). A third-party tap package keeps `owner/tap/name`: its short name
+/// would install another formula, or none, on a fresh machine. A version suffix (`node@20`) is
+/// part of the formula name and is kept.
+pub(crate) fn brewfile_names(pkg: &str) -> (String, Vec<String>) {
+    match pkg.rsplit_once('/') {
+        Some((tap, _)) if !OFFICIAL_TAPS.contains(&tap.to_ascii_lowercase().as_str()) => {
+            (pkg.to_string(), vec![pkg.to_string()])
+        }
+        found => {
+            let short = found.map_or(pkg, |(_, s)| s);
+            let mut all = vec![short.to_string()];
+            all.extend(OFFICIAL_TAPS.iter().map(|t| format!("{t}/{short}")));
+            (short.to_string(), all)
+        }
+    }
+}
+
 /// Whether brew holds `pkg` as a cask: a name pinned to `homebrew/cask/`, or a rack in the
 /// Caskroom and none in the Cellar. Reads the directories only, as [`brew_probe`] does.
 pub(crate) fn brew_is_cask(runner: &Runner, pkg: &str) -> Result<bool, Refusal> {
@@ -1094,6 +1116,21 @@ fn facts(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_brewfile_keeps_a_third_party_tap_and_shortens_an_official_one() {
+        let (name, all) = brewfile_names("tuicr");
+        assert_eq!(name, "tuicr");
+        assert_eq!(all, ["tuicr", "homebrew/core/tuicr", "homebrew/cask/tuicr"]);
+        assert_eq!(brewfile_names("homebrew/core/tuicr").0, "tuicr");
+        assert_eq!(brewfile_names("Homebrew/Cask/x").0, "x");
+        assert_eq!(brewfile_names("node@20").0, "node@20");
+        let (name, all) = brewfile_names("owner/tap/x");
+        assert_eq!(
+            (name.as_str(), all),
+            ("owner/tap/x", vec!["owner/tap/x".to_string()])
+        );
+    }
 
     #[test]
     fn the_executable_name_drops_tap_and_version() {
