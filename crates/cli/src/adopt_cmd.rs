@@ -30,7 +30,7 @@ use dfm_model::resolve::{Entry, module_manifest, resolve};
 use dfm_model::state::{
     Approval, BinaryId, Class, DisruptiveApproval, Fingerprint, JournalEntry, MAX_BYTES,
     OperationRecord, Phase, ProfileRef, Receipt, Recovery, RunResult, SCHEMA, Stamp, Status,
-    TrialAdopted, TrialRecord, count_statuses, rfc3339, valid_id,
+    TrialAdopted, TrialRecord, count_statuses, rfc3339, unfinished, unresolved, valid_id,
 };
 use dfm_model::{Code, Exit, Refusal, fold};
 use dfm_platform_macos::{O_NOFOLLOW, O_NONBLOCK};
@@ -420,13 +420,7 @@ fn prior_run(store: &Store, trial: &TrialRecord, module: &str) -> Result<Option<
     }) else {
         return Ok(None);
     };
-    // The op id is `adopt-<start ns>-<pid>`.
-    let started = e
-        .op_id
-        .strip_prefix("adopt-")
-        .and_then(|r| r.split_once('-'))
-        .and_then(|(ns, _)| ns.parse::<u64>().ok());
-    if started.is_none_or(|ns| ns < trial.created_unix_ns) {
+    if !began_in(e, trial) {
         return Ok(None);
     }
     let bad = || {
@@ -465,6 +459,55 @@ fn prior_run(store: &Store, trial: &TrialRecord, module: &str) -> Result<Option<
         brewfile,
         files,
     }))
+}
+
+/// Whether `e` started after `trial` was created. The op id is `adopt-<start ns>-<pid>`.
+fn began_in(e: &JournalEntry, trial: &TrialRecord) -> bool {
+    e.op_id
+        .strip_prefix("adopt-")
+        .and_then(|r| r.split_once('-'))
+        .and_then(|(ns, _)| ns.parse::<u64>().ok())
+        .is_some_and(|ns| ns >= trial.created_unix_ns)
+}
+
+/// Closes the open `trial-adopt` intents of earlier runs of this adoption (`trial` into
+/// `module`) as `failed`, because the run `op_id` completes their work (docs/adopt.md,
+/// "Interruption"). They name no output path, so settling could never decide them. The close
+/// claims nothing and runs nothing again. An intent for another module or with an unreadable
+/// token stays open for the operator.
+fn close_superseded(
+    store: &Store,
+    trial: &TrialRecord,
+    module: &str,
+    op_id: &str,
+) -> Result<(), Refusal> {
+    let entries = store.read_journal_lenient()?;
+    let module_of = |e: &JournalEntry| {
+        serde_json::from_str::<serde_json::Value>(e.token.as_deref()?).ok()?["module"]
+            .as_str()
+            .map(str::to_string)
+    };
+    let open = unfinished(&entries)
+        .into_iter()
+        .chain(unresolved(&entries).into_iter().filter_map(|u| u.intent))
+        .filter(|e| {
+            e.op == "trial-adopt"
+                && e.resource == trial.trial_id
+                && e.op_id != op_id
+                && began_in(e, trial)
+                && module_of(e).as_deref() == Some(module)
+        });
+    for e in open {
+        store.append_journal(&JournalEntry {
+            phase: Phase::Failed,
+            at: rfc3339(now_ns()?),
+            recovery: None,
+            token: None,
+            reason: Some(format!("superseded by {op_id}")),
+            ..e.clone()
+        })?;
+    }
+    Ok(())
 }
 
 /// `current` without the interrupted run's append: `Some` only when `current` hashes to the
@@ -1550,7 +1593,13 @@ pub fn run(ctx: &Ctx, args: &Args, out: &mut dyn Write) -> Result<(), Refusal> {
             fail.hit(point)?;
         }
         // The repo edits are done; the takeover below is journaled by the engine per link, so
-        // this entry closes before `apply` settles the journal.
+        // these entries close before `apply` settles the journal.
+        close_superseded(
+            &store,
+            &trial_record(&store, &args.trial)?,
+            &args.module,
+            &op_id,
+        )?;
         journal(Phase::Done, None, None, None)
     })();
     let mut stopped: Option<Refusal> = None;

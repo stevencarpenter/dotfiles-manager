@@ -827,6 +827,11 @@ impl Fx {
             .rfind(|e| e["phase"] == "intent")
             .unwrap();
         assert_eq!(r["adopted"]["op_id"], last["op_id"]);
+        // Every interrupted run's intent is closed: state and doctor report nothing open.
+        let o = self.run(&["state", "check"]);
+        assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), out(&o));
+        let o = self.run(&["doctor", "--root", self.root.to_str().unwrap()]);
+        assert!(!out(&o).contains("trial-adopt"), "{}", out(&o));
         let status = git(&self.root, &["status", "--porcelain=v1", "-uall"]);
         let mut lines: Vec<&str> = status.lines().collect();
         lines.sort_unstable();
@@ -960,6 +965,45 @@ fn a_second_run_completes_after_a_stop_at_each_boundary() {
                 assert_eq!(fx.receipt_writes(), want, "{spec}");
             }
         }
+    }
+}
+
+#[test]
+fn a_third_run_completes_after_two_stops_in_a_row() {
+    let reference = reference_tree();
+    let fx = Fx::new();
+    fx.live(LIVE, TUICR);
+    interrupted(&fx, "adopt-after-copy:abort");
+    interrupted(&fx, "adopt-after-manifest:abort");
+    let o = fx.adopt(&["--module", "core", "--preview"]);
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), out(&o));
+    let o = fx.adopt(&["--module", "core", "--yes-plan", &digest_of(&o)]);
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), out(&o));
+    fx.assert_adopted(&reference);
+    // Both stopped runs are closed as superseded by the run that completed.
+    let done = fx.record()["adopted"]["op_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let journal = fx.adopt_journal();
+    let intents: Vec<&str> = journal
+        .iter()
+        .filter(|e| e["phase"] == "intent")
+        .map(|e| e["op_id"].as_str().unwrap())
+        .collect();
+    assert_eq!(intents.len(), 3, "{journal:?}");
+    for id in &intents[..2] {
+        let closed: Vec<_> = journal
+            .iter()
+            .filter(|e| e["op_id"] == *id && e["phase"] != "intent")
+            .collect();
+        assert_eq!(closed.len(), 1, "{id}: {journal:?}");
+        assert_eq!(closed[0]["phase"], "failed", "{id}");
+        assert_eq!(
+            closed[0]["reason"].as_str().unwrap(),
+            format!("superseded by {done}"),
+            "{id}"
+        );
     }
 }
 
