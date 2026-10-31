@@ -688,6 +688,61 @@ fn a_candidate_name_with_a_control_character_is_refused_with_zero_writes() {
 }
 
 #[test]
+fn a_repo_path_the_users_default_global_excludes_ignore_is_refused() {
+    let fx = Fx::new();
+    fx.live(LIVE, TUICR);
+    fx.live(".config/git/ignore", "home/\n");
+    let before = fx.snapshot();
+    let o = fx.adopt(&["--module", "core", "--preview"]);
+    conflict_on(&o, REPO_FILE);
+    assert!(stderr(&o).contains("git ignores"), "{}", stderr(&o));
+    assert_eq!(fx.snapshot(), before);
+}
+
+#[test]
+fn a_repo_path_the_users_configured_excludes_file_ignores_is_refused() {
+    let fx = Fx::new();
+    fx.live(LIVE, TUICR);
+    // ~/.gitconfig wins over the XDG config, as in git; `~/` is expanded to the home.
+    fx.live(".config/git/config", "[core]\n\texcludesFile = ~/unused\n");
+    fx.live(".gitconfig", "[core]\n\texcludesFile = ~/my-ignore\n");
+    fx.live("my-ignore", "home/\n");
+    let before = fx.snapshot();
+    let o = fx.adopt(&["--module", "core", "--preview"]);
+    conflict_on(&o, REPO_FILE);
+    assert_eq!(fx.snapshot(), before);
+}
+
+#[test]
+fn a_repo_path_that_differs_only_by_case_from_a_source_is_refused() {
+    let fx = Fx::new();
+    fx.live(LIVE, TUICR);
+    fx.put("base/modules/core/home/.Config/other", "x\n");
+    git(&fx.root, &["add", "."]);
+    git(&fx.root, &["commit", "-q", "-m", "case"]);
+    let before = fx.snapshot();
+    let o = fx.adopt(&["--module", "core", "--preview"]);
+    refused(&o, "E_SOURCE_UNTRUSTED");
+    assert!(stderr(&o).contains("differ only by case"), "{}", stderr(&o));
+    assert_eq!(fx.snapshot(), before);
+}
+
+#[test]
+fn a_brewfile_the_append_puts_over_the_source_file_limit_is_refused() {
+    let fx = Fx::new();
+    fx.live(LIVE, TUICR);
+    let head = "brew \"git\"\n";
+    let pad = SOURCE_FILE_LIMIT - head.len() - 1;
+    fx.put("Brewfile", &format!("{head}{}\n", "#".repeat(pad)));
+    git(&fx.root, &["commit", "-q", "-am", "full"]);
+    let before = fx.snapshot();
+    let o = fx.adopt(&["--module", "core", "--preview"]);
+    refused(&o, "E_LIMIT_EXCEEDED");
+    assert!(stderr(&o).contains("Brewfile"), "{}", stderr(&o));
+    assert_eq!(fx.snapshot(), before);
+}
+
+#[test]
 fn an_existing_repo_file_is_refused() {
     let fx = Fx::new();
     fx.live(LIVE, TUICR);

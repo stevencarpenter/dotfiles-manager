@@ -27,7 +27,7 @@ use dfm_model::plan::{
     Action, ApprovedFile, Binary, MAX_SOURCE_ENTRIES, MAX_SOURCE_FILE_BYTES,
     MAX_SOURCE_TOTAL_BYTES, Plan, Scope, Status as PlanStatus, file_fingerprint,
 };
-use dfm_model::resolve::{Entry, SourceSet, module_manifest, resolve};
+use dfm_model::resolve::{Entry, SourceSet, is_git_name, module_manifest, resolve};
 use dfm_model::state::{
     Approval, BinaryId, Class, DisruptiveApproval, Fingerprint, JournalEntry, MAX_BYTES,
     OperationRecord, Phase, ProfileRef, Receipt, Recovery, RunResult, SCHEMA, Stamp, Status,
@@ -350,7 +350,13 @@ pub(crate) fn dirty(git: &Git, root: &Path, rels: &[&str]) -> Result<Vec<String>
 /// Whether `rel` under `root` belongs to the same git checkout as `root`, tracked or not: a path
 /// that leaves the root, one in a directory that does not exist, one in a nested repository
 /// (another top level), one that git ignores, and a `root` that is no repository are outside.
-pub(crate) fn inside_git_tree(git: &Git, root: &Path, rel: &str) -> Result<bool, Refusal> {
+/// `excludes` is the user's global excludes file (`user_excludes`).
+pub(crate) fn inside_git_tree(
+    git: &Git,
+    root: &Path,
+    rel: &str,
+    excludes: &str,
+) -> Result<bool, Refusal> {
     let rel_path = Path::new(rel);
     if rel.is_empty()
         || rel_path.is_absolute()
@@ -378,7 +384,7 @@ pub(crate) fn inside_git_tree(git: &Git, root: &Path, rel: &str) -> Result<bool,
     if top(parent)?.as_deref() != Some(root_top.as_str()) {
         return Ok(false);
     }
-    Ok(check_ignore(git, root, rel)? == 1)
+    Ok(check_ignore(git, root, rel, excludes)? == 1)
 }
 
 /// Runs git with `args`: the exit code and the trimmed standard output when git ended normally.
@@ -397,9 +403,65 @@ fn git_exit(git: &Git, args: &[&str]) -> Result<(i32, String), Refusal> {
 }
 
 /// `git check-ignore -q` for `rel` under `root`: 0 ignored, 1 not ignored, anything else a git
-/// error. A tracked path is never reported as ignored; the path need not exist.
-fn check_ignore(git: &Git, root: &Path, rel: &str) -> Result<i32, Refusal> {
-    git_exit(git, &["-C", text(root)?, "check-ignore", "-q", "--", rel]).map(|(code, _)| code)
+/// error. A tracked path is never reported as ignored; the path need not exist. The scrubbed
+/// environment reads no global config, so the user's global excludes file comes as `excludes`.
+fn check_ignore(git: &Git, root: &Path, rel: &str, excludes: &str) -> Result<i32, Refusal> {
+    let setting = format!("core.excludesFile={excludes}");
+    git_exit(
+        git,
+        &[
+            "-C",
+            text(root)?,
+            "-c",
+            &setting,
+            "check-ignore",
+            "-q",
+            "--",
+            rel,
+        ],
+    )
+    .map(|(code, _)| code)
+}
+
+/// The user's global excludes file, found without loading the user's git config:
+/// `core.excludesFile` from `~/.gitconfig`, else from the XDG `git/config` (git reads both and
+/// the later `~/.gitconfig` wins), else the XDG default `git/ignore`. A leading `~/` is expanded
+/// to `home`, as git does. An `[include]` is not followed, and `~user/` is not expanded. A missing
+/// file is returned as is; git ignores a missing excludes file.
+fn user_excludes(git: &Git, home: &Path) -> Result<String, Refusal> {
+    let xdg = std::env::var_os("XDG_CONFIG_HOME")
+        .filter(|v| !v.is_empty())
+        .map_or_else(|| home.join(".config"), PathBuf::from)
+        .join("git");
+    for file in [home.join(".gitconfig"), xdg.join("config")] {
+        if !file.is_file() {
+            continue;
+        }
+        let args = [
+            "config",
+            "--file",
+            text(&file)?,
+            "--get",
+            "core.excludesFile",
+        ];
+        match git_exit(git, &args)? {
+            (0, v) if v == "~" => return Ok(text(home)?.to_string()),
+            (0, v) => {
+                return Ok(match v.strip_prefix("~/") {
+                    Some(rest) => text(&home.join(rest))?.to_string(),
+                    None => v,
+                });
+            }
+            (1, _) => {}
+            (n, _) => {
+                return Err(failed(format!(
+                    "git config could not read core.excludesFile from {} (exit {n})",
+                    file.display()
+                )));
+            }
+        }
+    }
+    Ok(text(&xdg.join("ignore"))?.to_string())
 }
 
 // ---- the command ------------------------------------------------------------------------------
@@ -1014,9 +1076,15 @@ fn check_path(root: &Path, rel: &str, uid: u32, writes: bool) -> Result<(), Refu
 
 /// The source loader's tree limits (`source_fs`) for the edited composition: entries (files,
 /// links and walked directories, the new parent directories of the repo copies included) and
-/// bytes in total, and the per-file limit for the appended manifest. A directory the loader
-/// walks only to reach a `[sources]` root is not counted there; counting it here is stricter.
-fn within_source_limits(sources: &SourceSet, candidates: &[Candidate]) -> Result<(), Refusal> {
+/// bytes in total, and the per-file limit for the appended manifest and Brewfile. `brewfile` is
+/// the Brewfile's path and its length after the append; it counts only when the loader read it.
+/// A directory the loader walks only to reach a `[sources]` root is not counted there; counting
+/// it here is stricter.
+fn within_source_limits(
+    sources: &SourceSet,
+    candidates: &[Candidate],
+    brewfile: Option<(&str, usize)>,
+) -> Result<(), Refusal> {
     let limit = |what: String| {
         Refusal::new(
             Code::LimitExceeded,
@@ -1044,7 +1112,11 @@ fn within_source_limits(sources: &SourceSet, candidates: &[Candidate]) -> Result
         let Some(Entry::File(b)) = sources.get(p) else {
             continue;
         };
-        let n = u64::try_from(b.len()).unwrap_or(u64::MAX);
+        let len = match brewfile {
+            Some((path, post)) if path == p => post,
+            _ => b.len(),
+        };
+        let n = u64::try_from(len).unwrap_or(u64::MAX);
         if n > MAX_SOURCE_FILE_BYTES {
             return Err(limit(format!(
                 "{p} would be {n} bytes, more than {MAX_SOURCE_FILE_BYTES}"
@@ -1056,6 +1128,39 @@ fn within_source_limits(sources: &SourceSet, candidates: &[Candidate]) -> Result
         return Err(limit(format!(
             "the checkout with the adopted files holds {total} source bytes, more than {MAX_SOURCE_TOTAL_BYTES}"
         )));
+    }
+    Ok(())
+}
+
+/// The source loader refuses two names in one directory that differ only by case. A repo path
+/// (or a directory on its way) is checked against every loaded source path and directory, and
+/// against the other candidates. A kept copy has the same spelling as its loaded entry.
+fn case_aliases(sources: &SourceSet, candidates: &[Candidate]) -> Result<(), Refusal> {
+    fn prefixes(p: &str) -> impl Iterator<Item = &str> {
+        p.match_indices('/').map(|(i, _)| &p[..i]).chain([p])
+    }
+    let mut seen: BTreeMap<String, &str> = BTreeMap::new();
+    for p in sources.paths().chain(sources.dirs()).flat_map(prefixes) {
+        seen.entry(fold::fold(p)).or_insert(p);
+    }
+    for c in candidates {
+        for p in prefixes(&c.repo) {
+            match seen.get(&fold::fold(p)) {
+                Some(other) if *other != p => {
+                    return Err(Refusal::new(
+                        Code::SourceUntrusted,
+                        format!(
+                            "{} would be copied to {}, but {other} and {p} differ only by case, which the source loader refuses; nothing was changed. Fix: rename one of them",
+                            c.live, c.repo
+                        ),
+                    ));
+                }
+                Some(_) => {}
+                None => {
+                    seen.insert(fold::fold(p), p);
+                }
+            }
+        }
     }
     Ok(())
 }
@@ -1132,7 +1237,8 @@ fn decide(
             "the manifest {manifest} of module {module} is not a regular file in the sources"
         )));
     };
-    if !inside_git_tree(git, &root, &manifest)? {
+    let excludes = user_excludes(git, &ctx.layout().home)?;
+    if !inside_git_tree(git, &root, &manifest, &excludes)? {
         return Err(conflict(format!(
             "{manifest} is not inside the git checkout at {}; adopt edits only that checkout",
             root.display()
@@ -1193,7 +1299,7 @@ fn decide(
                 ),
             ));
         }
-        if c.repo.split('/').any(|n| n.to_lowercase() == ".git") {
+        if c.repo.split('/').any(is_git_name) {
             return Err(Refusal::new(
                 Code::SourceUntrusted,
                 format!(
@@ -1204,6 +1310,8 @@ fn decide(
         }
     }
 
+    case_aliases(&loaded.sources, &candidates)?;
+
     // A repo path that exists is refused, unless it is the interrupted run's copy: it holds the
     // bytes that run recorded, and those are still the candidate's bytes.
     // The walk refuses a link anywhere on the way, so a kept copy (or the copy a kept link was
@@ -1211,7 +1319,7 @@ fn decide(
     for c in &mut candidates {
         check_path(&root, &c.repo, uid, false)?;
         // `git add` skips an ignored path, so a fresh checkout would miss the link source.
-        match check_ignore(git, &root, &c.repo)? {
+        match check_ignore(git, &root, &c.repo, &excludes)? {
             1 => {}
             0 => {
                 return Err(conflict(format!(
@@ -1376,7 +1484,7 @@ fn decide(
             if brew_bytes.len() > MAX_BYTES {
                 return Err(conflict(format!("{path} is larger than 16 MiB")));
             }
-            if !inside_git_tree(git, &root, &path)? {
+            if !inside_git_tree(git, &root, &path, &excludes)? {
                 return Err(conflict(format!(
                     "{path} is not inside the git checkout at {}, or git ignores it",
                     root.display()
@@ -1520,7 +1628,10 @@ fn decide(
     for c in &candidates {
         sources.insert_file(c.repo.clone(), c.bytes.clone());
     }
-    within_source_limits(&sources, &candidates)?;
+    let brew_post = brewfile
+        .as_ref()
+        .map(|b| (b.path.as_str(), append(&brew_bytes, &b.addition).len()));
+    within_source_limits(&sources, &candidates, brew_post)?;
     let resolved = resolve(&sources, &profile, &crate::builtin_catalog()).map_err(|e| {
         let r = Refusal::from(e);
         Refusal::new(
@@ -2362,7 +2473,7 @@ mod tests {
         let git = git_for(&base.join("home"));
         let e = dirty(&git, &odd, &["x"]).unwrap_err();
         assert_eq!(e.code.exit(), Exit::Blocked, "{e:?}");
-        let e = inside_git_tree(&git, &odd, "x").unwrap_err();
+        let e = inside_git_tree(&git, &odd, "x", "/dev/null").unwrap_err();
         assert_eq!(e.code.exit(), Exit::Blocked, "{e:?}");
     }
 
@@ -2599,27 +2710,29 @@ mod tests {
         let base = scratch("inside");
         let root = repo(&base);
         let git = git_for(&base.join("home"));
-        assert!(inside_git_tree(&git, &root, "modules/a/module.toml").unwrap());
+        assert!(inside_git_tree(&git, &root, "modules/a/module.toml", "/dev/null").unwrap());
         // Untracked, in a directory of the same checkout.
         fs::create_dir_all(root.join("modules/new")).unwrap();
-        assert!(inside_git_tree(&git, &root, "modules/new/module.toml").unwrap());
+        assert!(inside_git_tree(&git, &root, "modules/new/module.toml", "/dev/null").unwrap());
         // A directory that does not exist yet, a path that leaves the root, a path of a nested
         // repository, and a root that is no repository are all outside.
-        assert!(!inside_git_tree(&git, &root, "nowhere/module.toml").unwrap());
-        assert!(!inside_git_tree(&git, &root, "../repo/modules/a/module.toml").unwrap());
-        assert!(!inside_git_tree(&git, &root, "/etc/hosts").unwrap());
+        assert!(!inside_git_tree(&git, &root, "nowhere/module.toml", "/dev/null").unwrap());
+        assert!(
+            !inside_git_tree(&git, &root, "../repo/modules/a/module.toml", "/dev/null").unwrap()
+        );
+        assert!(!inside_git_tree(&git, &root, "/etc/hosts", "/dev/null").unwrap());
         // A tracked link to a file outside the tree is not inside it.
         std::os::unix::fs::symlink("/etc/hosts", root.join("modules/a/link.toml")).unwrap();
         git_in(&root, &["add", "."]);
         git_in(&root, &["commit", "-q", "-m", "link"]);
-        assert!(!inside_git_tree(&git, &root, "modules/a/link.toml").unwrap());
+        assert!(!inside_git_tree(&git, &root, "modules/a/link.toml", "/dev/null").unwrap());
         let nested = root.join("vendor/inner");
         fs::create_dir_all(&nested).unwrap();
         git_in(&nested, &["init", "-q", "."]);
         fs::write(nested.join("module.toml"), "n\n").unwrap();
-        assert!(!inside_git_tree(&git, &root, "vendor/inner/module.toml").unwrap());
+        assert!(!inside_git_tree(&git, &root, "vendor/inner/module.toml", "/dev/null").unwrap());
         let plain = base.join("plain");
         fs::create_dir_all(&plain).unwrap();
-        assert!(!inside_git_tree(&git, &plain, "module.toml").unwrap());
+        assert!(!inside_git_tree(&git, &plain, "module.toml", "/dev/null").unwrap());
     }
 }
