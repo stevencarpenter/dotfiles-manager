@@ -434,7 +434,7 @@ fn probe_with_trials(
             if !t.is_active() || declared.contains(&tool) {
                 continue;
             }
-            let id = format!("trial:{}", t.trial_id);
+            let id = format!("{}{}", dfm_model::plan::TRIAL_PREFIX, t.trial_id);
             // The trial's own install is journaled under the bare trial id.
             if let Some(op) = open.get(&id).or_else(|| open.get(&t.trial_id)) {
                 notes.push(format!(

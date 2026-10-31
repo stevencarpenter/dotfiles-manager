@@ -1110,3 +1110,75 @@ fn an_interrupted_trial_install_is_a_note_and_the_tool_is_not_rolled() {
     assert!(!t.contains(TRIAL_OP), "{t}");
     assert_eq!(fx.mise_installs(), 0, "{}", fx.log());
 }
+
+impl Fx {
+    /// A `work` module whose id sorts after `trial:`, declaring a rolling mise `jq`.
+    fn declare_work_jq(&self) {
+        self.put(
+            "base/modules/work/module.toml",
+            "schema = 1\nid = \"work\"\nplatforms = [\"macos\", \"linux\"]\nrequires = []\n\n[[resources]]\nid = \"jq\"\nkind = \"package\"\nadapter = \"mise/v1\"\n[resources.value]\nname = \"jq\"\nupdate_policy = \"rolling\"\n",
+        );
+        self.put(
+            "base/bundle.toml",
+            &format!("{}work = \"modules/work/module.toml\"\n", common::BUNDLE),
+        );
+        self.put(
+            "profiles/t-01.toml",
+            &common::PROFILE.replace("modules = [\"extra\"]", "modules = [\"extra\", \"work\"]"),
+        );
+    }
+}
+
+/// The package rows of a plan's operation list (the lines with a `[module]` tag), in order.
+fn package_rows(t: &str) -> Vec<String> {
+    t.lines()
+        .filter(|l| l.contains("@package ["))
+        .filter_map(|l| l.split_whitespace().find(|w| w.ends_with("@package")))
+        .map(str::to_string)
+        .collect()
+}
+
+#[test]
+fn a_failed_trial_roll_runs_after_every_declared_update_and_stops_none() {
+    let fx = Fx::new();
+    fx.mise_trial();
+    fx.declare_work_jq();
+    fx.marker("installed-mise", "duckdb 2.0.0\njq 1.7\n");
+    fx.marker("mise-fail-duckdb", "");
+    let o = fx.update(&["--preview"]);
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+    // By id alone `trial:` sorts before `work.`; the trial row still comes last.
+    assert_eq!(
+        package_rows(&text(&o.stdout)),
+        ["work.jq@package", TRIAL_OP],
+        "{}",
+        text(&o.stdout)
+    );
+    let o = fx.update(&["--yes-plan", &digest_of(&o)]);
+    let t = text(&o.stdout);
+    assert_eq!(code(&o), 1, "{}\n{t}", stderr(&o));
+    assert!(t.contains("updated work.jq@package"), "{t}");
+    assert!(t.contains(&format!("failed {TRIAL_OP}")), "{t}");
+    assert!(!t.contains("not_started work.jq"), "{t}");
+    assert!(
+        t.contains(" failed=1 ") && t.contains(" not_started=0 "),
+        "{t}"
+    );
+    assert!(t.ends_with("result: failed\n"), "{t}");
+}
+
+#[test]
+fn a_plan_without_trials_keeps_the_id_order() {
+    let fx = Fx::new();
+    fx.declare_jq();
+    fx.declare_work_jq();
+    fx.marker("installed-mise", "jq 1.7\n");
+    let o = fx.update(&["--preview"]);
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+    assert_eq!(
+        package_rows(&text(&o.stdout)),
+        ["extra.jq@package", "work.jq@package"],
+        "{}",
+        text(&o.stdout)
+    );
+}
