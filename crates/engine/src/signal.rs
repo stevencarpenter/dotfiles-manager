@@ -168,27 +168,6 @@ pub(crate) fn kill_child(pid: u32, group: bool, term: bool) {
     let _ = unsafe { libc::kill(target, sig) };
 }
 
-/// Whether no process has the id `pid`: `kill(pid, 0)` answers `ESRCH`. Signal 0 is a probe; it
-/// sends nothing. A live process of another user (`EPERM`), a pid that does not fit and pid 0
-/// (the caller's own group) all count as present, so a caller that removes what a dead process
-/// left never removes what a live one uses.
-#[expect(
-    unsafe_code,
-    reason = "kill has no safe API; the call touches no memory"
-)]
-pub fn process_gone(pid: u32) -> bool {
-    let Ok(pid) = i32::try_from(pid) else {
-        return false;
-    };
-    if pid <= 0 {
-        return false;
-    }
-    // SAFETY: `kill` takes two plain integers and dereferences nothing. Signal 0 only checks
-    // whether the process exists.
-    let r = unsafe { libc::kill(pid, 0) };
-    r == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
-}
-
 /// Starts the child of `cmd` in a new session, with no controlling terminal: a program it runs
 /// that opens `/dev/tty` (a `sudo` password prompt) fails at once instead of stopping in a
 /// background group (docs/upgrade.md). The session leader's pid is its process group id, so
@@ -277,22 +256,5 @@ mod tests {
             "the child survived SIGINT (exit {:?}): a handler was left installed",
             status.code()
         );
-    }
-}
-
-#[cfg(test)]
-mod probe_tests {
-    use super::process_gone;
-
-    #[test]
-    fn only_a_reaped_pid_is_gone() {
-        assert!(!process_gone(std::process::id()));
-        // pid 1 is launchd, a process of another user: present, not gone.
-        assert!(!process_gone(1));
-        assert!(!process_gone(0));
-        assert!(!process_gone(u32::MAX));
-        let mut child = std::process::Command::new("/usr/bin/true").spawn().unwrap();
-        child.wait().unwrap();
-        assert!(process_gone(child.id()));
     }
 }

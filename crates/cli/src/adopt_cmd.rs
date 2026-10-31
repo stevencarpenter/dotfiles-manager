@@ -68,7 +68,7 @@ fn text(p: &Path) -> Result<&str, Refusal> {
 /// Removes the scan directory on every exit, an error and a stop included. A failure to remove
 /// is dropped: the scan result decides the run. A SIGKILL leaves the directory behind, 0700 with
 /// 0600 files under the manager's cache directory, until the next scan removes it
-/// ([`sweep_dead`]).
+/// ([`sweep_dead`]). The lock file inside it is released by the kernel when the process ends.
 struct Cleanup(PathBuf);
 
 impl Drop for Cleanup {
@@ -77,27 +77,35 @@ impl Drop for Cleanup {
     }
 }
 
-/// Removes the `<pid>-<ns>` scan directories in `scan_dir` whose process is gone, which a
-/// SIGKILL leaves behind (`Cleanup` never ran). Only a real directory of `uid` is removed, never
-/// through a link, and only when `kill(pid, 0)` reports no such process; a live process of
-/// any user keeps its directory. A failure is dropped, as in `Cleanup`.
+/// The lock file a scan holds in its own directory while it runs.
+const SCAN_LOCK: &str = "lock";
+
+/// Removes the `<pid>-<ns>` scan directories in `scan_dir` that no running scan holds, which a
+/// SIGKILL leaves behind (`Cleanup` never ran). The caller holds the lock on `scan_dir`, under
+/// which every scan creates its directory and locks its `lock` file. So a directory whose
+/// `lock` is missing, or can be locked here, belongs to no live process; no signal is sent and
+/// a reused pid does not matter. Only a real directory of `uid` is removed, never through a
+/// link. A failure is dropped, as in `Cleanup`.
 fn sweep_dead(scan_dir: &Path, uid: u32) {
     let Ok(entries) = fs::read_dir(scan_dir) else {
         return;
     };
     for e in entries.flatten() {
-        let name = e.file_name();
-        let Some(pid) = name
+        let named = e
+            .file_name()
             .to_str()
             .and_then(|n| n.split_once('-'))
-            .filter(|(_, ns)| ns.parse::<u64>().is_ok())
-            .and_then(|(pid, _)| pid.parse::<u32>().ok())
-        else {
-            continue;
-        };
+            .is_some_and(|(pid, ns)| pid.parse::<u32>().is_ok() && ns.parse::<u64>().is_ok());
         let path = e.path();
-        let mine = fs::symlink_metadata(&path).is_ok_and(|m| m.is_dir() && m.uid() == uid);
-        if mine && dfm_engine::signal::process_gone(pid) {
+        if !named || !fs::symlink_metadata(&path).is_ok_and(|m| m.is_dir() && m.uid() == uid) {
+            continue;
+        }
+        let held = OpenOptions::new()
+            .read(true)
+            .custom_flags(O_NOFOLLOW | O_NONBLOCK)
+            .open(path.join(SCAN_LOCK))
+            .is_ok_and(|f| f.try_lock().is_err());
+        if !held {
             let _ = fs::remove_dir_all(&path);
         }
     }
@@ -124,22 +132,48 @@ pub(crate) fn scan(
     // Checked before anything is created: every path below is passed to gitleaks as text.
     text(scan_dir)?;
     private(scan_dir, true)?;
-    let parent = fs::symlink_metadata(scan_dir)
-        .map_err(|e| io_failed(&format!("read {}", scan_dir.display()), &e))?;
-    if !parent.is_dir() || parent.uid() != runner.uid {
-        return Err(conflict(format!(
+    // The directory is opened without following a link and checked through that descriptor,
+    // which then holds the lock under which dead scans are swept and this scan's directory is
+    // made and locked.
+    let foreign = || {
+        conflict(format!(
             "{} is not a directory of yours; nothing was changed",
             scan_dir.display()
-        )));
+        ))
+    };
+    if fs::symlink_metadata(scan_dir).is_ok_and(|m| m.file_type().is_symlink()) {
+        return Err(foreign());
+    }
+    let held = OpenOptions::new()
+        .read(true)
+        .custom_flags(O_NOFOLLOW)
+        .open(scan_dir)
+        .map_err(|e| io_failed(&format!("open {}", scan_dir.display()), &e))?;
+    let parent = held
+        .metadata()
+        .map_err(|e| io_failed(&format!("read {}", scan_dir.display()), &e))?;
+    if !parent.is_dir() || parent.uid() != runner.uid {
+        return Err(foreign());
     }
     if parent.mode() & 0o7777 != 0o700 {
         fs::set_permissions(scan_dir, fs::Permissions::from_mode(0o700))
             .map_err(|e| io_failed(&format!("protect {}", scan_dir.display()), &e))?;
     }
+    held.lock()
+        .map_err(|e| io_failed(&format!("lock {}", scan_dir.display()), &e))?;
     sweep_dead(scan_dir, runner.uid);
     let run = scan_dir.join(format!("{}-{}", std::process::id(), now_ns()?));
     private(&run, false)?;
     let _cleanup = Cleanup(run.clone());
+    let lock = run.join(SCAN_LOCK);
+    let _mine = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&lock)
+        .and_then(|f| f.try_lock().map(|()| f).map_err(std::io::Error::other))
+        .map_err(|e| io_failed(&format!("lock {}", lock.display()), &e))?;
+    drop(held);
     let (copy, ignore) = (run.join("files"), run.join("ignore"));
     private(&copy, false)?;
     private(&ignore, false)?;
@@ -2175,42 +2209,52 @@ mod tests {
         let base = scratch("sweep");
         let r = fake(&base);
         let parent = base.join("adopt-scan");
-        // A reaped child: its pid names no process now.
-        let mut child = Command::new("/usr/bin/true").spawn().unwrap();
-        child.wait().unwrap();
-        let dead = child.id();
-        let me = std::process::id();
-        for name in [
-            format!("{dead}-1"),
-            format!("{me}-2"),
-            "1-3".to_string(),
-            "notes".to_string(),
-        ] {
-            fs::create_dir_all(parent.join(&name).join("files")).unwrap();
-            fs::write(parent.join(&name).join("files/x"), "left").unwrap();
-        }
-        // A file and a link with a dead pid's name are not scan directories.
-        fs::write(parent.join(format!("{dead}-4")), "").unwrap();
-        std::os::unix::fs::symlink(base.join("bin"), parent.join(format!("{dead}-5"))).unwrap();
+        let dir = |name: &str| {
+            let d = parent.join(name);
+            fs::create_dir_all(d.join("files")).unwrap();
+            fs::write(d.join("files/x"), "left").unwrap();
+            d
+        };
+        // Dead: a lock nobody holds, and no lock (killed before it was made).
+        fs::write(dir("11-1").join(SCAN_LOCK), "").unwrap();
+        dir("12-2");
+        // Live: a scan that holds its lock.
+        let live = dir("13-3").join(SCAN_LOCK);
+        fs::write(&live, "").unwrap();
+        let held = fs::File::open(&live).unwrap();
+        held.lock().unwrap();
+        // Not scan directories: another name, a file and a link with a scan's name.
+        dir("notes");
+        fs::write(parent.join("14-4"), "").unwrap();
+        std::os::unix::fs::symlink(base.join("bin"), parent.join("15-5")).unwrap();
         scan(&r, &parent, &files(&[("/h/a", "x")])).unwrap();
         let mut left: Vec<String> = fs::read_dir(&parent)
             .unwrap()
             .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
             .collect();
         left.sort();
-        let mut want = vec![
-            format!("{me}-2"),
-            "1-3".to_string(),
-            format!("{dead}-4"),
-            format!("{dead}-5"),
-            "notes".to_string(),
-        ];
-        want.sort();
-        assert_eq!(left, want, "only the dead scan's directory is removed");
+        assert_eq!(left, ["13-3", "14-4", "15-5", "notes"]);
+        assert!(
+            parent.join("13-3/files/x").is_file(),
+            "a live scan keeps its copy"
+        );
         assert!(
             base.join("bin/gitleaks").is_file(),
             "a link is not followed"
         );
+        drop(held);
+    }
+
+    #[test]
+    fn a_scan_directory_that_is_a_link_is_a_conflict() {
+        let base = scratch("link");
+        let r = fake(&base);
+        fs::create_dir_all(base.join("real")).unwrap();
+        let parent = base.join("adopt-scan");
+        std::os::unix::fs::symlink(base.join("real"), &parent).unwrap();
+        let e = scan(&r, &parent, &files(&[("/h/a", "x")])).unwrap_err();
+        assert_eq!(e.code, Code::Conflict, "{e:?}");
+        assert_eq!(fs::read_dir(base.join("real")).unwrap().count(), 0);
     }
 
     #[test]
