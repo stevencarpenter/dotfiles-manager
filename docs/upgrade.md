@@ -45,13 +45,13 @@ A manager built before this key refuses a profile that has it (`E_FIELD_UNKNOWN`
 | `current` | exit 0 and the same version (brew: nothing outdated) |
 | `pending` | a stop request (SIGINT, SIGTERM) ended or prevented it, or the update ran and the new version could not be read |
 | `failed` | a command exited nonzero, timed out or was ended by a signal; brew: a name stayed outdated or the list was not valid JSON |
-| `blocked` | the tool, or `mise` for skills, is missing from its owner path, fails the executable checks, or its version cannot be read (or is empty) before the update; brew: a Homebrew trial is active or a trial record cannot be read |
+| `blocked` | the tool, or `mise` for skills, is missing from its owner path, fails the executable checks, or its version cannot be read (or is empty) before the update; brew: `brew` cannot be resolved on the provider path |
 
 A failure note gives the command, its exit code and the size of its standard error. The text is withheld (docs/secrets.md); run the command by hand to see it. A partial `brew upgrade` is `failed`, and the notes list each name as upgraded or still outdated.
 
 ## Trials
 
-While a Homebrew trial is active (a record under `state/trials/` whose package is `homebrew/v1` and that `adopt` has not ended; an adopted trial does not hold `brew`, docs/adopt.md), or while any trial record cannot be read or was left by an interrupted write, `brew` is `blocked` and runs no command. A missing or unlistable trials directory refuses the whole run earlier, as state loss (`E_STORAGE_INVALID`). Each reason is a note: `brew waits for active trial <id> (homebrew/v1 <name>): end the trial, then run dfm sync, or upgrade by hand`. Leaving the trial's name out of `brew upgrade` would not protect it: Homebrew upgrades the outdated dependencies of the names it is given and the installed dependents that need it, so an upgrade of any name can change the trial's package (DFM-31.C09). The other updaters still run.
+A trial does not hold `brew`. The owner's decision of 2026-10-31 replaces DFM-31.C09: a tool is trialed without an effect on any other update, and it is updated with the other packages as if it were already adopted. `brew` runs as if no trial existed and upgrades a trial's formula or cask with every other outdated package. No updater reads the trial records, so an unreadable record or an interrupted trial write does not change the run. A missing trials directory still refuses the whole run before any scope, as state loss (`E_STORAGE_INVALID`): the store refuses every writer on a missing state directory (docs/state.md).
 
 ## In sync
 

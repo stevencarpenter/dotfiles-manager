@@ -5,7 +5,6 @@
 use dfm_engine::proc::{End, Output, Request, Runner};
 use dfm_model::state::Status;
 use dfm_model::updater::Updater;
-use std::collections::BTreeSet;
 use std::path::Path;
 use std::time::Duration;
 
@@ -29,10 +28,6 @@ pub struct Env<'a> {
     /// The provider runner (`brew`, `mise`).
     pub provider: &'a Runner,
     pub home: &'a Path,
-    /// Why `brew` must wait: each active Homebrew trial, and each trial record that cannot be
-    /// read. Homebrew upgrades the dependencies and dependents of the names it is given, so no
-    /// name can be left out safely (DFM-31.C09).
-    pub trials: &'a BTreeSet<String>,
     pub timeouts: Timeouts,
 }
 
@@ -368,14 +363,6 @@ fn brew(mut d: Draft, env: &Env) -> Row {
         d.notes.push(e.detail);
         return d.end(Status::Blocked);
     }
-    if !env.trials.is_empty() {
-        for why in env.trials {
-            d.notes.push(format!(
-                "brew waits for {why}: end the trial, then run dfm sync, or upgrade by hand"
-            ));
-        }
-        return d.end(Status::Blocked);
-    }
     if let Err(e) = call(
         env.provider,
         "brew",
@@ -558,11 +545,10 @@ mod tests {
             fs::read_to_string(self.root.join("log")).unwrap_or_default()
         }
 
-        fn env<'a>(&'a self, trials: &'a BTreeSet<String>) -> Env<'a> {
+        fn env(&self) -> Env<'_> {
             Env {
                 provider: &self.runner,
                 home: &self.home,
-                trials,
                 timeouts: Timeouts::DEFAULT,
             }
         }
@@ -613,8 +599,7 @@ mod tests {
             "2.1.311 (Claude Code)",
             "2.1.312 (Claude Code)",
         );
-        let held = BTreeSet::new();
-        let r = run(Updater::Claude, &t.env(&held));
+        let r = run(Updater::Claude, &t.env());
         assert_eq!(r.status, Status::Updated, "{r:?}");
         assert_eq!(r.before.as_deref(), Some("2.1.311 (Claude Code)"));
         assert_eq!(r.after.as_deref(), Some("2.1.312 (Claude Code)"));
@@ -629,8 +614,7 @@ mod tests {
             "2.1.311 (Claude Code)",
             "2.1.311 (Claude Code)",
         );
-        let held = BTreeSet::new();
-        let r = run(Updater::Claude, &t.env(&held));
+        let r = run(Updater::Claude, &t.env());
         assert_eq!(r.status, Status::Current, "{r:?}");
     }
 
@@ -639,8 +623,7 @@ mod tests {
         let t = T::new();
         // Another copy on the provider path is never a fallback.
         t.script(&t.bin.join("codex"), "exit 0");
-        let held = BTreeSet::new();
-        let r = run(Updater::Codex, &t.env(&held));
+        let r = run(Updater::Codex, &t.env());
         assert_eq!(r.status, Status::Blocked, "{r:?}");
         let want = t.home.join(".codex/packages/standalone/current/bin/codex");
         assert!(
@@ -659,8 +642,7 @@ mod tests {
             &t.home.join(".opencode/bin/opencode"),
             "case \"$1\" in --version) echo 1.19.4 ;; upgrade) echo 'network down' >&2; exit 1 ;; esac",
         );
-        let held = BTreeSet::new();
-        let r = run(Updater::Opencode, &t.env(&held));
+        let r = run(Updater::Opencode, &t.env());
         assert_eq!(r.status, Status::Failed, "{r:?}");
         let note = r.notes.join("\n");
         assert!(note.contains("exited 1"), "{note}");
@@ -676,8 +658,7 @@ mod tests {
             &t.home.join(".opencode/bin/opencode"),
             "case \"$1\" in --version) echo 1.19.4 ;; upgrade) exec sleep 5 ;; esac",
         );
-        let held = BTreeSet::new();
-        let mut env = t.env(&held);
+        let mut env = t.env();
         env.timeouts = Timeouts {
             long: Duration::from_secs(2),
             short: Duration::from_secs(2),
@@ -694,8 +675,7 @@ mod tests {
     fn brew_upgrades_only_the_outdated_names() {
         let t = T::new();
         t.brew(UV_CODEX, NONE);
-        let held = BTreeSet::new();
-        let r = run(Updater::Brew, &t.env(&held));
+        let r = run(Updater::Brew, &t.env());
         assert_eq!(r.status, Status::Updated, "{r:?}");
         let log = t.log();
         let calls: Vec<&str> = log
@@ -729,8 +709,7 @@ mod tests {
     fn brew_with_nothing_outdated_is_current_and_runs_no_upgrade() {
         let t = T::new();
         t.brew(NONE, NONE);
-        let held = BTreeSet::new();
-        let r = run(Updater::Brew, &t.env(&held));
+        let r = run(Updater::Brew, &t.env());
         assert_eq!(r.status, Status::Current, "{r:?}");
         assert!(!t.log().contains("brew upgrade"), "{}", t.log());
     }
@@ -740,8 +719,7 @@ mod tests {
         let t = T::new();
         t.brew(UV_CODEX, UV_ONLY);
         fs::write(t.root.join("st/upgrade-exit"), "1").unwrap();
-        let held = BTreeSet::new();
-        let r = run(Updater::Brew, &t.env(&held));
+        let r = run(Updater::Brew, &t.env());
         assert_eq!(r.status, Status::Failed, "{r:?}");
         assert!(
             r.notes
@@ -756,31 +734,13 @@ mod tests {
     }
 
     #[test]
-    fn brew_waits_for_an_active_trial() {
-        let t = T::new();
-        t.brew(UV_CODEX, NONE);
-        // An upgrade of any name can upgrade a trial's package as a dependency or a dependent.
-        let trials = BTreeSet::from(["active trial t1 (homebrew/v1 uv)".to_string()]);
-        let r = run(Updater::Brew, &t.env(&trials));
-        assert_eq!(r.status, Status::Blocked, "{r:?}");
-        assert_eq!(t.log(), "");
-        assert!(
-            r.notes.contains(
-                &"brew waits for active trial t1 (homebrew/v1 uv): end the trial, then run dfm sync, or upgrade by hand".to_string()
-            ),
-            "{r:?}"
-        );
-    }
-
-    #[test]
     fn brew_keeps_a_formula_and_a_cask_of_one_name_apart() {
         let t = T::new();
         let both = r#"{"formulae":[{"name":"codex","installed_versions":["0.1"],"current_version":"0.2"}],"casks":[{"name":"codex","installed_versions":["0.164.0"],"current_version":"0.165.0"}]}"#;
         let formula_left = r#"{"formulae":[{"name":"codex","installed_versions":["0.1"],"current_version":"0.2"}],"casks":[]}"#;
         t.brew(both, formula_left);
         fs::write(t.root.join("st/upgrade-exit"), "1").unwrap();
-        let held = BTreeSet::new();
-        let r = run(Updater::Brew, &t.env(&held));
+        let r = run(Updater::Brew, &t.env());
         assert_eq!(r.status, Status::Failed, "{r:?}");
         assert!(
             r.notes
@@ -799,8 +759,7 @@ mod tests {
         let t = T::new();
         t.brew(UV_CODEX, UV_ONLY);
         fs::write(t.root.join("st/upgrade-exit--formula"), "1").unwrap();
-        let held = BTreeSet::new();
-        let r = run(Updater::Brew, &t.env(&held));
+        let r = run(Updater::Brew, &t.env());
         assert!(
             t.log().contains("brew upgrade --cask codex |"),
             "{}",
@@ -824,8 +783,7 @@ mod tests {
     fn brew_env_keeps_homebrew_defaults() {
         let t = T::new();
         t.brew(UV_ONLY, NONE);
-        let held = BTreeSet::new();
-        run(Updater::Brew, &t.env(&held));
+        run(Updater::Brew, &t.env());
         let log = t.log();
         let line = |p: &str| log.lines().find(|l| l.starts_with(p)).unwrap().to_string();
         assert!(line("brew update").contains("auto=unset"), "{log}");
@@ -839,8 +797,7 @@ mod tests {
     fn brew_invalid_outdated_json_is_failed() {
         let t = T::new();
         t.brew("not json", NONE);
-        let held = BTreeSet::new();
-        let r = run(Updater::Brew, &t.env(&held));
+        let r = run(Updater::Brew, &t.env());
         assert_eq!(r.status, Status::Failed, "{r:?}");
         assert!(r.notes.join("\n").contains("brew outdated"), "{r:?}");
         assert!(!t.log().contains("brew upgrade"), "{}", t.log());
@@ -850,8 +807,7 @@ mod tests {
     fn skills_exit_0_is_current_with_a_note() {
         let t = T::new();
         t.script(&t.bin.join("mise"), "exit 0");
-        let held = BTreeSet::new();
-        let r = run(Updater::Skills, &t.env(&held));
+        let r = run(Updater::Skills, &t.env());
         assert_eq!(r.status, Status::Current, "{r:?}");
         assert!(
             r.notes
@@ -876,12 +832,11 @@ mod tests {
         );
         t.brew(NONE, NONE);
         fs::write(t.root.join("st/list-codex"), "codex 0.164.0\n").unwrap();
-        let held = BTreeSet::new();
         // The row itself does not look: sync reads the copies after every updater ran.
-        let r = run(Updater::Codex, &t.env(&held));
+        let r = run(Updater::Codex, &t.env());
         assert!(!r.notes.iter().any(|n| n.contains("second copy")), "{r:?}");
         assert_eq!(
-            second_copies(Updater::Codex, &t.env(&held)),
+            second_copies(Updater::Codex, &t.env()),
             ["second copy: Homebrew cask codex 0.164.0"]
         );
     }
@@ -893,11 +848,10 @@ mod tests {
         t.brew(NONE, NONE);
         // The `claude` cask is the desktop app, not a copy of Claude Code.
         fs::write(t.root.join("st/list-claude"), "claude 1.0\n").unwrap();
-        let held = BTreeSet::new();
-        assert!(second_copies(Updater::Claude, &t.env(&held)).is_empty());
+        assert!(second_copies(Updater::Claude, &t.env()).is_empty());
         fs::write(t.root.join("st/list-claude-code"), "claude-code 2.1.300\n").unwrap();
         assert_eq!(
-            second_copies(Updater::Claude, &t.env(&held)),
+            second_copies(Updater::Claude, &t.env()),
             ["second copy: Homebrew cask claude-code 2.1.300"]
         );
     }
@@ -906,8 +860,7 @@ mod tests {
     fn an_update_with_an_unreadable_new_version_is_pending() {
         let t = T::new();
         t.native(".local/bin/claude", "update", "2.1.311", "");
-        let held = BTreeSet::new();
-        let r = run(Updater::Claude, &t.env(&held));
+        let r = run(Updater::Claude, &t.env());
         assert_eq!(r.status, Status::Pending, "{r:?}");
         assert!(
             r.notes
@@ -920,8 +873,7 @@ mod tests {
     #[test]
     fn brew_missing_is_blocked() {
         let t = T::new();
-        let held = BTreeSet::new();
-        let r = run(Updater::Brew, &t.env(&held));
+        let r = run(Updater::Brew, &t.env());
         assert_eq!(r.status, Status::Blocked, "{r:?}");
         assert!(!r.notes.is_empty(), "{r:?}");
     }
@@ -929,10 +881,9 @@ mod tests {
     #[test]
     fn skills_without_mise_is_blocked_as_the_preview_says() {
         let t = T::new();
-        let held = BTreeSet::new();
-        let r = run(Updater::Skills, &t.env(&held));
+        let r = run(Updater::Skills, &t.env());
         assert_eq!(r.status, Status::Blocked, "{r:?}");
-        assert!(preview(Updater::Skills, &t.env(&held)).starts_with("blocked: "));
+        assert!(preview(Updater::Skills, &t.env()).starts_with("blocked: "));
     }
 
     #[test]
@@ -941,8 +892,7 @@ mod tests {
         let pinned = r#"{"formulae":[{"name":"uv","installed_versions":["0.13.5"],"current_version":"0.13.6","pinned":false},{"name":"node","installed_versions":["22.1.0"],"current_version":"24.0.0","pinned":true,"pinned_version":"22.1.0"}],"casks":[]}"#;
         let left = r#"{"formulae":[{"name":"node","installed_versions":["22.1.0"],"current_version":"24.0.0","pinned":true,"pinned_version":"22.1.0"}],"casks":[]}"#;
         t.brew(pinned, left);
-        let held = BTreeSet::new();
-        let r = run(Updater::Brew, &t.env(&held));
+        let r = run(Updater::Brew, &t.env());
         assert_eq!(r.status, Status::Updated, "{r:?}");
         assert!(
             t.log().contains("brew upgrade --formula uv |"),
@@ -961,8 +911,7 @@ mod tests {
     fn an_empty_version_is_blocked_before_the_update() {
         let t = T::new();
         t.native(".local/bin/claude", "update", "\n", "2.1.312");
-        let held = BTreeSet::new();
-        let r = run(Updater::Claude, &t.env(&held));
+        let r = run(Updater::Claude, &t.env());
         assert_eq!(r.status, Status::Blocked, "{r:?}");
         assert!(!t.log().contains("claude update"), "{}", t.log());
         assert!(
@@ -980,8 +929,7 @@ mod tests {
             "codex-cli 0.164.0\n\n",
             "codex-cli 0.164.0\n",
         );
-        let held = BTreeSet::new();
-        let r = run(Updater::Codex, &t.env(&held));
+        let r = run(Updater::Codex, &t.env());
         assert_eq!(r.status, Status::Current, "{r:?}");
         assert_eq!(r.before.as_deref(), Some("codex-cli 0.164.0"));
     }
@@ -990,11 +938,10 @@ mod tests {
     fn preview_names_the_commands_and_runs_nothing() {
         let t = T::new();
         t.brew(UV_ONLY, NONE);
-        let held = BTreeSet::new();
-        let p = preview(Updater::Brew, &t.env(&held));
+        let p = preview(Updater::Brew, &t.env());
         assert!(p.starts_with("would run brew update, brew upgrade"), "{p}");
         assert_eq!(t.log(), "");
-        let p = preview(Updater::Claude, &t.env(&held));
+        let p = preview(Updater::Claude, &t.env());
         assert!(p.contains("not installed at"), "{p}");
     }
 }
