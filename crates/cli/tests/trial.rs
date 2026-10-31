@@ -922,3 +922,94 @@ fn a_trial_tool_the_provider_cannot_list_is_a_note_and_blocks_no_other_update() 
     fx.set_trial_package_name("zzz-unknown");
     fx.update_rolls_jq_and_notes("note: trial trial-duckdb: zzz-unknown is not rolled (unknown:");
 }
+
+#[test]
+fn a_tool_of_two_trials_rolls_from_the_second_record_when_the_first_drops() {
+    let fx = Fx::new();
+    fx.mise_trial();
+    let o = fx.trial(&[
+        "duckdb",
+        "--id",
+        "duckdb-two",
+        "--provider",
+        MISE,
+        "--preview",
+    ]);
+    let o = fx.trial(&[
+        "duckdb",
+        "--id",
+        "duckdb-two",
+        "--provider",
+        MISE,
+        "--yes-plan",
+        &digest_of(&o),
+    ]);
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+    // `duckdb-two.json` is read first, and the adapter refuses its name.
+    let path = fx.state().join("trials/duckdb-two.json");
+    let mut t = fx.json(&path);
+    t["package"]["name"] = "duckdb@lts".into();
+    fs::write(&path, serde_json::to_vec(&t).unwrap()).unwrap();
+    let o = fx.update(&["--preview"]);
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+    let t = text(&o.stdout);
+    assert!(
+        t.contains("note: trial duckdb-two: duckdb@lts is not rolled (refused:"),
+        "{t}"
+    );
+    assert!(t.contains(&format!("planned {TRIAL_OP}")), "{t}");
+    let o = fx.update(&["--yes-plan", &digest_of(&o)]);
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+    assert!(
+        text(&o.stdout).contains("counts: updated=1 "),
+        "{}",
+        text(&o.stdout)
+    );
+}
+
+#[test]
+fn state_check_accepts_a_trial_roll_and_reports_an_interrupted_one_without_blocking_others() {
+    let fx = Fx::new();
+    fx.mise_trial();
+    let o = fx.update(&["--preview"]);
+    let o = fx.update(&["--yes-plan", &digest_of(&o)]);
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+    let o = fx.run(&["state", "check"]);
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+    // The next roll finishes its install, but the manager never records the outcome.
+    let o = fx.update(&["--preview"]);
+    let crash = fx
+        .cmd(
+            &[("DFM_FAILPOINT", "apply-after-effect:abort")],
+            &["packages", "--update", "--yes-plan", &digest_of(&o)],
+        )
+        .output()
+        .unwrap();
+    assert!(!crash.status.success(), "{}", text(&crash.stdout));
+    let intent = fx.journal().pop().unwrap();
+    assert_eq!(intent["phase"], "intent", "{intent}");
+    assert_eq!(intent["resource"], "trial:trial-duckdb", "{intent}");
+    let id = intent["op_id"].as_str().unwrap().to_string();
+    let o = fx.run(&["state", "check"]);
+    assert_ne!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+    let all = format!("{}{}", text(&o.stdout), stderr(&o));
+    assert!(
+        all.contains("E_OP_INTERRUPTED") && all.contains(&id),
+        "{all}"
+    );
+    // The trial row is not in a plain packages plan or the configuration plan, so neither is
+    // blocked by it. An open intent makes any run ask for the digest, as for a declared tool.
+    let o = fx.run(&["packages", "--preview"]);
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+    let o = fx.run(&["packages", "--yes-plan", &digest_of(&o)]);
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+    let o = fx.run(&["apply", "--preview"]);
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+    // `state recover` cannot observe a package and leaves it unknown; `state resolve` settles it.
+    let o = fx.run(&["state", "recover"]);
+    assert_ne!(code(&o), 2, "{}\n{}", stderr(&o), text(&o.stdout));
+    let o = fx.run(&["state", "resolve", &id, "--as", "failed"]);
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+    let o = fx.run(&["state", "check"]);
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+}

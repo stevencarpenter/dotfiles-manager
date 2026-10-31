@@ -361,7 +361,8 @@ pub(crate) fn probe(
 /// `loaded` as a rolling package whose resource id is `trial:<trial id>` (a manifest id never
 /// holds `:`), and gets the declared tool's probe, plan row, journaled upgrade and accounting.
 /// Each tool rolls once: a tool a declared `mise/v1` resource names is rolled by that resource,
-/// and a tool of two trials by the first record. A record of another binding is never used. A
+/// and a tool of two trials by the first record, in file name order, whose probe rolls or holds
+/// it. A record of another binding is never used. A
 /// tool the provider does not list is left out, so a tool removed by hand is not installed again,
 /// and so is a tool in any other state than rolling or held (another owner, a name the adapter
 /// refuses, a failed probe): a trial never blocks another update. Returns the facts and the
@@ -389,7 +390,7 @@ fn probe_with_trials(
                 .map(|f| format!("trials: {}; no trial tool is rolled", f.detail)),
         );
         let resources = &mut loaded.resolved.resources;
-        let mut tools: BTreeSet<String> = resources
+        let declared: BTreeSet<String> = resources
             .values()
             .filter(|r| r.kind == "package" && r.adapter == package::MISE)
             .filter_map(|r| r.value.get("name")?.as_str())
@@ -416,7 +417,8 @@ fn probe_with_trials(
                 ));
                 continue;
             }
-            if !t.is_active() || !tools.insert(package::tool_and_version(&pkg.name).0.to_string()) {
+            let tool = package::tool_and_version(&pkg.name).0.to_string();
+            if !t.is_active() || declared.contains(&tool) {
                 continue;
             }
             let id = format!("trial:{}", t.trial_id);
@@ -444,15 +446,24 @@ fn probe_with_trials(
                     precedence: None,
                 },
             );
-            added.push((id, t.trial_id, pkg.name.clone()));
+            added.push((id, t.trial_id, pkg.name.clone(), tool));
         }
     }
     let mut probed = probe(ctx, sys, args, loaded)?;
     // A trial must never block another update: only a tool the provider lists and the
     // declared rules roll or hold keeps its row. Any other state is a note.
-    for (id, trial, name) in added {
+    // Every active record of a tool was probed, so a tool whose first record drops still rolls
+    // from the next one; a later record of a tool that already has a row adds none.
+    let mut rows = BTreeSet::new();
+    for (id, trial, name, tool) in added {
         let why = match probed.package.get(&id) {
-            Some(PackageState::Rolling(_) | PackageState::Held(_)) => continue,
+            Some(PackageState::Rolling(_) | PackageState::Held(_)) => {
+                if !rows.insert(tool) {
+                    loaded.resolved.resources.remove(&id);
+                    probed.package.remove(&id);
+                }
+                continue;
+            }
             Some(
                 PackageState::Missing(_)
                 | PackageState::Upgrades(_)
