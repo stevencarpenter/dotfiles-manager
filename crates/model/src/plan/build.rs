@@ -1014,7 +1014,7 @@ impl Planner<'_> {
             state: owner_state,
         });
         let unowned = self.ledger_entry(claim).is_none();
-        let approved = self.adopt_approved(claim, &seen, &op.inputs);
+        let approved = self.adopt_approved(r, claim, &seen, &op.inputs);
         let (action, status, ownership, effect, post) = match r.kind.as_str() {
             "merge" => self.decide_merge(r, claim, &seen, op)?,
             "secret" => self.decide_secret(r, claim, &seen, op)?,
@@ -1038,11 +1038,21 @@ impl Planner<'_> {
     }
 
     /// Whether `dfm adopt` approved the regular file at `claim` for replacement by its link: the
-    /// live fingerprint is the one adopt read, and the link's source holds those same bytes.
-    fn adopt_approved(&self, claim: &str, seen: &Seen, inputs: &[Input]) -> bool {
+    /// live fingerprint is the one adopt read, and the link's source holds those same bytes. A
+    /// directory link (`directory = true`) never replaces a file.
+    fn adopt_approved(
+        &self,
+        r: &ResolvedResource,
+        claim: &str,
+        seen: &Seen,
+        inputs: &[Input],
+    ) -> bool {
         let Some(a) = self.cx.adopt_files.get(claim) else {
             return false;
         };
+        if r.value.get("directory").and_then(Value::as_bool) == Some(true) {
+            return false;
+        }
         let live = match &seen.node {
             Node::File { sha256, .. } => sha256.as_deref(),
             _ => None,
@@ -2323,7 +2333,7 @@ fn decide(
                     Err(conflict("has an owner the manager cannot verify"))
                 }
                 // Only `dfm adopt` approves a file, after it read the same bytes as the source.
-                (Node::File { .. }, _) if adopt_approved && adoptable => Ok((
+                (Node::File { own: true, .. }, _) if adopt_approved && adoptable => Ok((
                     Action::AdoptFile,
                     Status::Planned,
                     Ownership::Absent,
@@ -2782,6 +2792,16 @@ mod tests {
     /// holds `source` while a regular file holding `live` is at the target, with `approved` in
     /// `adopt_files` for that path.
     fn adopt_plan(live: &[u8], source: &[u8], approved: Option<ApprovedFile>) -> Plan {
+        adopt_plan_with(live, source, approved, |_, _, _| {})
+    }
+
+    /// As [`adopt_plan`], after `edit` changed the resource, the observations or the ledger.
+    fn adopt_plan_with(
+        live: &[u8],
+        source: &[u8],
+        approved: Option<ApprovedFile>,
+        edit: impl FnOnce(&mut ResolvedResource, &mut Observations, &mut Vec<Owned>),
+    ) -> Plan {
         let mut r = resource(false);
         r.provenance = BTreeMap::from([(
             "/source".to_string(),
@@ -2806,7 +2826,7 @@ mod tests {
             includes: vec![],
         };
         let size = u64::try_from(live.len()).unwrap();
-        let obs = Observations {
+        let mut obs = Observations {
             seen: BTreeMap::from([
                 (
                     ".ssh".into(),
@@ -2833,6 +2853,10 @@ mod tests {
             ]),
             listings: BTreeMap::new(),
         };
+        let mut resolved = resolved;
+        let mut ledger = vec![];
+        let r = resolved.resources.get_mut("core.ssh").unwrap();
+        edit(r, &mut obs, &mut ledger);
         let cx = Context {
             scope: Scope::Config,
             binary: Binary {
@@ -2843,7 +2867,7 @@ mod tests {
             machine_id: "m",
             sources: vec![],
             root: "/r",
-            ledger: vec![],
+            ledger,
             reserved: BTreeMap::new(),
             unchecked: BTreeMap::new(),
             merge: BTreeMap::new(),
@@ -2924,5 +2948,46 @@ mod tests {
         let mut half = approved(body);
         half.fingerprint = approved(b"other\n").fingerprint;
         refused(&adopt_plan(body, body, Some(half)), "fingerprint differs");
+        // A file of another user keeps today's refusal, even with a matching approval.
+        let foreign = adopt_plan_with(body, body, Some(approved(body)), |_, obs, _| {
+            let seen = obs.seen.get_mut(".ssh/config").unwrap();
+            if let Node::File { own, .. } = &mut seen.node {
+                *own = false;
+            }
+        });
+        assert_eq!(foreign.blockers.len(), 1, "{foreign:?}");
+        assert_eq!(foreign.blockers[0].code, Code::PrivilegeUnsupported);
+        assert!(!foreign.operations[0].takeover);
+        // A directory link is never a takeover of a file.
+        let dir = adopt_plan_with(body, body, Some(approved(body)), |r, _, _| {
+            r.value = toml::toml! { directory = true }.into();
+        });
+        refused(&dir, "directory source");
+        // A sensitive resource is never adopted.
+        let sensitive = adopt_plan_with(body, body, Some(approved(body)), |r, _, _| {
+            r.sensitive = true;
+        });
+        not_adopted(&sensitive, "sensitive");
+        // A path the ledger owns is not a takeover: the manager never replaces its own file.
+        let owned = adopt_plan_with(body, body, Some(approved(body)), |r, _, ledger| {
+            ledger.push(Owned {
+                resource: r.id.clone(),
+                adapter: r.adapter.clone(),
+                class: Class::Normal,
+                path: ".ssh/config".into(),
+                fingerprint: Some(file_fingerprint(body)),
+                coowned_entries: None,
+            });
+        });
+        not_adopted(&owned, "ledger-owned");
+    }
+
+    /// A refusal with any message: blocked, and no takeover.
+    fn not_adopted(p: &Plan, what: &str) {
+        assert_eq!(p.blockers.len(), 1, "{what}: {p:?}");
+        assert_eq!(p.blockers[0].code, Code::Conflict, "{what}");
+        assert_eq!(p.operations[0].status, Status::Blocked, "{what}");
+        assert_ne!(p.operations[0].action, Action::AdoptFile, "{what}");
+        assert!(!p.operations[0].takeover, "{what}");
     }
 }
