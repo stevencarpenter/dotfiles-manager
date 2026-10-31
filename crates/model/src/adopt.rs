@@ -82,8 +82,8 @@ pub fn brewfile_line(kind: BrewKind, name: &str) -> String {
 /// A formula and a cask of the same name are different packages, so `brew "docker"` does not
 /// count for the cask. The match is on the whole quoted string: a tap-qualified
 /// `owner/tap/tuicr` does not match `tuicr`, and a `tap "owner/tap"` line does not make
-/// `brew "tuicr"` count for `owner/tap/tuicr`, because brew resolves a short name to
-/// homebrew/core first. A caller that treats several spellings as one package asks for each
+/// `brew "tuicr"` count for `owner/tap/tuicr`, because brew resolves a short name to its
+/// core tap first. A caller that treats several spellings as one package asks for each
 /// spelling.
 pub fn brewfile_has(text: &str, kind: BrewKind, name: &str) -> bool {
     text.lines().any(|line| {
@@ -260,7 +260,7 @@ mod tests {
 
     #[test]
     fn a_tap_line_does_not_make_a_short_name_count_for_the_tap_package() {
-        // Homebrew resolves an unqualified name to homebrew/core first, so `brew "x"` under
+        // brew resolves an unqualified name to its core tap first, so `brew "x"` under
         // `tap "owner/tap"` can install core's x on a fresh machine. The qualified line is kept.
         let text = "tap \"owner/tap\"\nbrew \"tuicr\"\n";
         assert!(!brewfile_has(text, BrewKind::Formula, "owner/tap/tuicr"));
