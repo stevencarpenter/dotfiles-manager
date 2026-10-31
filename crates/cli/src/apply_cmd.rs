@@ -358,11 +358,13 @@ pub(crate) fn probe(
 
 /// [`probe`], and under `packages --update` each active `mise/v1` trial's tool rolled as if it
 /// were adopted (the owner's decision of 2026-10-31, docs/toolchains.md "Trials"): the tool joins
-/// `loaded` as a rolling package whose resource id is the trial id, and gets the declared tool's
-/// probe, plan row, journaled upgrade and accounting. A tool a declared `mise/v1` resource names
-/// is rolled by that resource alone. A tool the provider does not list is left out, so a tool
-/// removed by hand is not installed again. Returns the facts and the notes to print: one for each
-/// trial record that cannot be read, which blocks nothing, and one for each tool left out.
+/// `loaded` as a rolling package whose resource id is `trial:<trial id>` (a manifest id never
+/// holds `:`), and gets the declared tool's probe, plan row, journaled upgrade and accounting.
+/// Each tool rolls once: a tool a declared `mise/v1` resource names is rolled by that resource,
+/// and a tool of two trials by the first record. A record of another binding is never used. A
+/// tool the provider does not list is left out, so a tool removed by hand is not installed again.
+/// Returns the facts and the notes to print: one for each trial record that cannot be read or
+/// belongs to another binding, which blocks nothing, and one for each tool left out.
 fn probe_with_trials(
     ctx: &Ctx,
     sys: &Sys,
@@ -385,7 +387,7 @@ fn probe_with_trials(
                 .map(|f| format!("trials: {}; no trial tool is rolled", f.detail)),
         );
         let resources = &mut loaded.resolved.resources;
-        let declared: BTreeSet<String> = resources
+        let mut tools: BTreeSet<String> = resources
             .values()
             .filter(|r| r.kind == "package" && r.adapter == package::MISE)
             .filter_map(|r| r.value.get("name")?.as_str())
@@ -405,19 +407,24 @@ fn probe_with_trials(
             let Some(pkg) = t.package.as_ref().filter(|p| p.adapter == package::MISE) else {
                 continue;
             };
-            if !t.is_active()
-                || declared.contains(package::tool_and_version(&pkg.name).0)
-                || resources.contains_key(&t.trial_id)
-            {
+            if !t.binding.matches(&loaded.binding) {
+                notes.push(format!(
+                    "trial record {file} was written for {} as {}; its tool is not rolled",
+                    t.binding.profile, t.binding.machine_id
+                ));
                 continue;
             }
+            if !t.is_active() || !tools.insert(package::tool_and_version(&pkg.name).0.to_string()) {
+                continue;
+            }
+            let id = format!("trial:{}", t.trial_id);
             let mut value = Table::new();
             value.insert("name".into(), pkg.name.clone().into());
             value.insert("update_policy".into(), "rolling".into());
             resources.insert(
-                t.trial_id.clone(),
+                id.clone(),
                 ResolvedResource {
-                    id: t.trial_id.clone(),
+                    id: id.clone(),
                     module: "trial".into(),
                     declared_in: format!("state/trials/{file}"),
                     kind: "package".into(),
@@ -435,11 +442,11 @@ fn probe_with_trials(
                     precedence: None,
                 },
             );
-            added.push((t.trial_id, pkg.name.clone()));
+            added.push((id, t.trial_id, pkg.name.clone()));
         }
     }
     let mut probed = probe(ctx, sys, args, loaded)?;
-    for (id, name) in added {
+    for (id, trial, name) in added {
         if matches!(
             probed.package.get(&id),
             Some(
@@ -452,7 +459,7 @@ fn probe_with_trials(
             loaded.resolved.resources.remove(&id);
             probed.package.remove(&id);
             notes.push(format!(
-                "trial {id}: {name} is not installed by {}; it is not installed again",
+                "trial {trial}: {name} is not installed by {}; it is not installed again",
                 package::MISE
             ));
         }

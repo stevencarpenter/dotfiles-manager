@@ -626,7 +626,7 @@ fn a_tool_name_that_cannot_be_a_trial_id_is_a_usage_error() {
 // ---- `packages --update` rolls an active mise trial (owner decision 2026-10-31) ---------------
 
 const MISE: &str = "mise/v1";
-const TRIAL_OP: &str = "trial-duckdb@package";
+const TRIAL_OP: &str = "trial:trial-duckdb@package";
 
 impl Fx {
     /// `dfm trial duckdb --provider mise/v1`, approved: the look-alike lists `duckdb 2.0.0`.
@@ -672,7 +672,7 @@ fn packages_update_rolls_an_active_mise_trial_as_a_declared_rolling_tool() {
     let phases: Vec<String> = fx
         .journal()
         .iter()
-        .filter(|e| e["resource"] == "trial-duckdb" && e["op"] == "upgrade")
+        .filter(|e| e["resource"] == "trial:trial-duckdb" && e["op"] == "upgrade")
         .map(|e| e["phase"].as_str().unwrap_or_default().to_string())
         .collect();
     assert_eq!(phases, ["intent", "done"], "{:?}", fx.journal());
@@ -758,4 +758,97 @@ fn an_unreadable_trial_record_is_a_note_and_does_not_block_the_update() {
         "{}",
         text(&o.stdout)
     );
+}
+
+#[test]
+fn packages_update_does_not_roll_a_trial_record_of_another_binding() {
+    let fx = Fx::new();
+    fx.mise_trial();
+    let path = fx.state().join("trials/trial-duckdb.json");
+    let mut t = fx.json(&path);
+    t["binding"]["profile"] = "/elsewhere/profiles/other.toml".into();
+    fs::write(&path, serde_json::to_vec(&t).unwrap()).unwrap();
+    let o = fx.update(&[]);
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+    let t = text(&o.stdout);
+    assert!(
+        t.contains("note: trial record trial-duckdb.json was written for /elsewhere/profiles/other.toml as m5-test; its tool is not rolled"),
+        "{t}"
+    );
+    assert!(!t.contains(TRIAL_OP), "{t}");
+    assert_eq!(fx.mise_installs(), 1, "{}", fx.log());
+}
+
+#[test]
+fn packages_update_rolls_a_tool_of_two_trials_once() {
+    let fx = Fx::new();
+    fx.mise_trial();
+    let o = fx.trial(&[
+        "duckdb",
+        "--id",
+        "duckdb-two",
+        "--provider",
+        MISE,
+        "--preview",
+    ]);
+    let o = fx.trial(&[
+        "duckdb",
+        "--id",
+        "duckdb-two",
+        "--provider",
+        MISE,
+        "--yes-plan",
+        &digest_of(&o),
+    ]);
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+    let o = fx.update(&["--preview"]);
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+    let t = text(&o.stdout);
+    // The records are read in file name order, so `duckdb-two` rolls the tool and
+    // `trial-duckdb` adds no second row.
+    assert!(t.contains("planned trial:duckdb-two@package"), "{t}");
+    assert!(!t.contains(TRIAL_OP), "{t}");
+    let o = fx.update(&["--yes-plan", &digest_of(&o)]);
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+    assert!(
+        text(&o.stdout).contains("counts: updated=1 "),
+        "{}",
+        text(&o.stdout)
+    );
+    assert_eq!(fx.mise_installs(), 2, "{}", fx.log());
+}
+
+#[test]
+fn a_trial_id_equal_to_a_manifest_resource_id_still_rolls() {
+    let fx = Fx::new();
+    let o = fx.trial(&[
+        "duckdb",
+        "--id",
+        "extra.tmux",
+        "--provider",
+        MISE,
+        "--preview",
+    ]);
+    let o = fx.trial(&[
+        "duckdb",
+        "--id",
+        "extra.tmux",
+        "--provider",
+        MISE,
+        "--yes-plan",
+        &digest_of(&o),
+    ]);
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+    let o = fx.update(&["--preview"]);
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+    let t = text(&o.stdout);
+    assert!(t.contains("planned trial:extra.tmux@package"), "{t}");
+    let o = fx.update(&["--yes-plan", &digest_of(&o)]);
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+    assert!(
+        text(&o.stdout).contains("updated trial:extra.tmux@package"),
+        "{}",
+        text(&o.stdout)
+    );
+    assert_eq!(fx.mise_installs(), 2, "{}", fx.log());
 }

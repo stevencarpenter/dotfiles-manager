@@ -47,10 +47,12 @@ A tool the provider does not list is planned as docs/packages.md plans it: `inst
 
 ## Trials
 
-By the owner's decision of 2026-10-31, a trial is updated as if it were already adopted. `packages --update` reads the trial records (`state/trials/`) and adds the tool of each active trial whose `package.adapter` is `mise/v1` to the plan as a rolling tool. The resource id is the trial id, so the row is `<trial-id>@package`. The tool is `package.name` from the record. It gets the probe, the plan row, the `mise install <tool>@latest` (or `@<prefix>`), the journaled operation and the `updated` or `current` accounting of a declared rolling tool, and the held and blocked rules of the table above.
+By the owner's decision of 2026-10-31, a trial is updated as if it were already adopted. `packages --update` reads the trial records (`state/trials/`) and adds the tool of each active trial whose `package.adapter` is `mise/v1` to the plan as a rolling tool. The resource id is `trial:<trial-id>`, so the row is `trial:<trial-id>@package`. A manifest id never holds `:`, so a trial id cannot collide with a declared resource. The tool is `package.name` from the record. It gets the probe, the plan row, the `mise install <tool>@latest` (or `@<prefix>`), the journaled operation and the `updated` or `current` accounting of a declared rolling tool, and the held and blocked rules of the table above.
 
 - **Adopted.** A trial whose record has `adopted` is not active. Its tool is not rolled from the record. The module that took it declares it.
 - **Declared too.** A tool that a declared `mise/v1` resource names (the same tool, any version) is rolled once, by the declared resource and its policy.
+- **Two trials of one tool.** The tool is rolled once, by the first record in file name order.
+- **Another binding.** A record whose binding stamp names another profile or machine is never used. The output has the note `trial record <file> was written for <profile> as <machine-id>; its tool is not rolled`.
 - **Not installed.** A trial tool the provider does not list is left out of the plan with the note `trial <id>: <name> is not installed by mise/v1; it is not installed again`. A tool removed by hand stays removed.
 - **Unreadable record.** A record that cannot be read blocks nothing. Its tool is not rolled, and the output has the note `trial record <file> cannot be read (<detail>); its tool is not rolled`. A trials directory that cannot be listed gives one note and rolls no trial tool.
 - **`sync`.** `sync` runs `packages` without `--update` (docs/sync.md), so it rolls no mise tool, declared or trial. A Homebrew trial is upgraded by the `brew` updater (docs/upgrade.md, "Trials").
