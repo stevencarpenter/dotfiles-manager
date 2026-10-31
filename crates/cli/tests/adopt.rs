@@ -731,6 +731,33 @@ fn a_cask_line_of_the_same_name_does_not_hide_the_formula_line() {
 }
 
 #[test]
+fn a_listed_package_needs_no_cask_probe() {
+    // brew cannot say formula or cask, but the Brewfile lists the package either way.
+    for listed in ["brew \"tuicr\"\ncask \"tuicr\"\n", "brew \"tuicr\"\n"] {
+        let fx = Fx::new();
+        fx.put("Brewfile", listed);
+        git(&fx.root, &["commit", "-q", "-am", "listed"]);
+        fs::write(fx.fake.path().join("caskroom-fail"), "").unwrap();
+        fx.live(LIVE, TUICR);
+        let o = fx.adopt(&["--module", "core", "--preview"]);
+        assert_eq!(code(&o), 0, "{listed:?}\n{}\n{}", stderr(&o), out(&o));
+        assert!(
+            out(&o).contains("brewfile: none (Brewfile already lists tuicr"),
+            "{listed:?}\n{}",
+            out(&o)
+        );
+    }
+    // Not listed: the kind decides the line, so the failed probe still refuses.
+    let fx = Fx::new();
+    fs::write(fx.fake.path().join("caskroom-fail"), "").unwrap();
+    fx.live(LIVE, TUICR);
+    refused(
+        &fx.adopt(&["--module", "core", "--preview"]),
+        "E_PROBE_FAILED",
+    );
+}
+
+#[test]
 fn a_manifest_edited_after_the_preview_is_stale() {
     let fx = Fx::new();
     fx.live(LIVE, TUICR);

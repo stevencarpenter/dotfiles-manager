@@ -43,6 +43,8 @@ use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
 const SCAN_TIMEOUT: Duration = Duration::from_secs(120);
+/// The longest wait for the lock on `adopt-scan/`, which a scan holds for milliseconds.
+const SCAN_LOCK_WAIT: Duration = Duration::from_secs(10);
 const MAX_REPORT: usize = 16 << 20;
 /// gitleaks' own "leaks found" status, set with `--exit-code`: no other end can mean a finding.
 const LEAKS: i32 = 3;
@@ -83,30 +85,73 @@ const SCAN_LOCK: &str = "lock";
 /// Removes the `<pid>-<ns>` scan directories in `scan_dir` that no running scan holds, which a
 /// SIGKILL leaves behind (`Cleanup` never ran). The caller holds the lock on `scan_dir`, under
 /// which every scan creates its directory and locks its `lock` file. So a directory whose
-/// `lock` is missing, or can be locked here, belongs to no live process; no signal is sent and
-/// a reused pid does not matter. Only a real directory of `uid` is removed, never through a
+/// `lock` can be locked here belongs to no live process; no signal is sent and a reused pid does
+/// not matter. A directory without a `lock` is a scan killed before it locked, or a scan of an
+/// older binary that makes none (during a self-update), so it is removed only once its `<ns>` is
+/// older than [`SCAN_TIMEOUT`]. Only a real directory of `uid` is removed, never through a
 /// link. A failure is dropped, as in `Cleanup`.
-fn sweep_dead(scan_dir: &Path, uid: u32) {
+fn sweep_dead(scan_dir: &Path, uid: u32, now: u64) {
+    let young = |ns: u64| u128::from(now.saturating_sub(ns)) < SCAN_TIMEOUT.as_nanos();
     let Ok(entries) = fs::read_dir(scan_dir) else {
         return;
     };
     for e in entries.flatten() {
-        let named = e
+        let Some(ns) = e
             .file_name()
             .to_str()
             .and_then(|n| n.split_once('-'))
-            .is_some_and(|(pid, ns)| pid.parse::<u32>().is_ok() && ns.parse::<u64>().is_ok());
+            .filter(|(pid, _)| pid.parse::<u32>().is_ok())
+            .and_then(|(_, ns)| ns.parse::<u64>().ok())
+        else {
+            continue;
+        };
         let path = e.path();
-        if !named || !fs::symlink_metadata(&path).is_ok_and(|m| m.is_dir() && m.uid() == uid) {
+        if !fs::symlink_metadata(&path).is_ok_and(|m| m.is_dir() && m.uid() == uid) {
             continue;
         }
-        let held = OpenOptions::new()
+        let held = match OpenOptions::new()
             .read(true)
             .custom_flags(O_NOFOLLOW | O_NONBLOCK)
             .open(path.join(SCAN_LOCK))
-            .is_ok_and(|f| f.try_lock().is_err());
+        {
+            Ok(f) => f.try_lock().is_err(),
+            Err(_) => young(ns),
+        };
         if !held {
             let _ = fs::remove_dir_all(&path);
+        }
+    }
+}
+
+/// Takes the lock on `scan_dir`, which another scan holds only while it sweeps and makes its
+/// own directory. As for the writer lock, nothing blocks in `flock`: the lock is tried, and
+/// tried again every 10 ms for at most [`SCAN_LOCK_WAIT`]. A stop request ends the wait with
+/// its own refusal (exit 130 or 143), an `EINTR` is tried again, and a lock still held at the
+/// end is `E_LOCKED`.
+fn lock_scan_dir(held: &fs::File, scan_dir: &Path) -> Result<(), Refusal> {
+    let until = std::time::Instant::now() + SCAN_LOCK_WAIT;
+    loop {
+        if let Some(stop) = signal::requested() {
+            return Err(stop);
+        }
+        match held.try_lock() {
+            Ok(()) => return Ok(()),
+            Err(fs::TryLockError::WouldBlock) if std::time::Instant::now() < until => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(fs::TryLockError::WouldBlock) => {
+                return Err(Refusal::new(
+                    Code::Locked,
+                    format!(
+                        "another adopt scan holds {}; nothing was changed",
+                        scan_dir.display()
+                    ),
+                ));
+            }
+            Err(fs::TryLockError::Error(e)) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(fs::TryLockError::Error(e)) => {
+                return Err(io_failed(&format!("lock {}", scan_dir.display()), &e));
+            }
         }
     }
 }
@@ -159,9 +204,8 @@ pub(crate) fn scan(
         fs::set_permissions(scan_dir, fs::Permissions::from_mode(0o700))
             .map_err(|e| io_failed(&format!("protect {}", scan_dir.display()), &e))?;
     }
-    held.lock()
-        .map_err(|e| io_failed(&format!("lock {}", scan_dir.display()), &e))?;
-    sweep_dead(scan_dir, runner.uid);
+    lock_scan_dir(&held, scan_dir)?;
+    sweep_dead(scan_dir, runner.uid, now_ns()?);
     let run = scan_dir.join(format!("{}-{}", std::process::id(), now_ns()?));
     private(&run, false)?;
     let _cleanup = Cleanup(run.clone());
@@ -1269,10 +1313,14 @@ fn decide(
     // appended it: then the file must be its recorded bytes plus that line.
     if let (Some(b), Some(p)) = (brewfile.as_mut(), &trial.package) {
         let (name, spellings) = package::brewfile_names(&p.name);
-        let kind = if package::brew_is_cask(runner, &p.name)? {
-            BrewKind::Cask
-        } else {
-            BrewKind::Formula
+        // The probe runs only when the kind decides something: the line to write, or which of
+        // two kinds an existing line must be.
+        let kind = || -> Result<BrewKind, Refusal> {
+            Ok(if package::brew_is_cask(runner, &p.name)? {
+                BrewKind::Cask
+            } else {
+                BrewKind::Formula
+            })
         };
         let resumed = prior.as_ref().and_then(|r| {
             r.brewfile
@@ -1281,20 +1329,42 @@ fn decide(
                 .map(|e| (e, &r.op_id))
         });
         if let Some((e, op_id)) = resumed {
-            let line = brewfile_line(kind, &name);
+            let line = brewfile_line(kind()?, &name);
             brew_bytes = prior_base(&brew_bytes, &line, e)
                 .ok_or_else(|| not_prior(&b.path, op_id))?
                 .to_vec();
             b.pre.clone_from(&e.pre);
             b.addition = line;
             b.done = true;
-        } else if spellings
-            .iter()
-            .any(|n| brewfile_has(&String::from_utf8_lossy(&brew_bytes), kind, n))
-        {
-            brew_note = Some(format!("{} already lists {name}", b.path));
         } else {
-            b.addition = brewfile_line(kind, &name);
+            let text = String::from_utf8_lossy(&brew_bytes);
+            let listed = |k| spellings.iter().any(|n| brewfile_has(&text, k, n));
+            let listed_as = match (listed(BrewKind::Formula), listed(BrewKind::Cask)) {
+                (false, false) => None,
+                (true, false) => Some(Some(BrewKind::Formula)),
+                (false, true) => Some(Some(BrewKind::Cask)),
+                // Both kinds are listed: whichever brew holds is there, so no probe runs.
+                (true, true) => Some(None),
+            };
+            match listed_as {
+                None => b.addition = brewfile_line(kind()?, &name),
+                Some(None) => brew_note = Some(format!("{} already lists {name}", b.path)),
+                Some(Some(have)) => match kind() {
+                    Ok(k) if k != have => b.addition = brewfile_line(k, &name),
+                    Ok(_) => brew_note = Some(format!("{} already lists {name}", b.path)),
+                    // A stop still ends the run. Any other probe failure leaves the line the
+                    // owner wrote: adopt only skips its own append.
+                    Err(r) if matches!(r.code, Code::Interrupted | Code::Terminated) => {
+                        return Err(r);
+                    }
+                    Err(_) => {
+                        brew_note = Some(format!(
+                            "{} already lists {name}; brew could not say whether it is a formula or a cask",
+                            b.path
+                        ));
+                    }
+                },
+            }
         }
         b.post = sha256_hex(&append(&brew_bytes, &b.addition));
     }
@@ -2215,9 +2285,13 @@ mod tests {
             fs::write(d.join("files/x"), "left").unwrap();
             d
         };
-        // Dead: a lock nobody holds, and no lock (killed before it was made).
+        // Dead: a lock nobody holds, and an old directory with no lock (killed before it was
+        // made, or an older binary's scan long past its timeout).
         fs::write(dir("11-1").join(SCAN_LOCK), "").unwrap();
         dir("12-2");
+        // A fresh directory with no lock may be an older binary's scan that is still running.
+        let fresh = format!("16-{}", now_ns().unwrap());
+        dir(&fresh);
         // Live: a scan that holds its lock.
         let live = dir("13-3").join(SCAN_LOCK);
         fs::write(&live, "").unwrap();
@@ -2233,7 +2307,15 @@ mod tests {
             .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
             .collect();
         left.sort();
-        assert_eq!(left, ["13-3", "14-4", "15-5", "notes"]);
+        let mut want = vec![
+            "13-3".to_string(),
+            "14-4".into(),
+            "15-5".into(),
+            fresh,
+            "notes".into(),
+        ];
+        want.sort();
+        assert_eq!(left, want);
         assert!(
             parent.join("13-3/files/x").is_file(),
             "a live scan keeps its copy"
@@ -2243,6 +2325,28 @@ mod tests {
             "a link is not followed"
         );
         drop(held);
+    }
+
+    #[test]
+    fn a_scan_waits_for_the_lock_another_scan_holds_briefly() {
+        let base = scratch("wait");
+        let r = fake(&base);
+        let parent = base.join("adopt-scan");
+        fs::create_dir_all(&parent).unwrap();
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o700)).unwrap();
+        let other = fs::File::open(&parent).unwrap();
+        other.lock().unwrap();
+        let t = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            drop(other);
+        });
+        assert!(
+            scan(&r, &parent, &files(&[("/h/a", "x")]))
+                .unwrap()
+                .is_empty()
+        );
+        t.join().unwrap();
+        assert_eq!(leftovers(&parent), 0);
     }
 
     #[test]

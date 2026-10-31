@@ -3,7 +3,8 @@
 //! files beside it name, and installs by creating the same entries, so no real provider runs.
 //! `crates/cli/tests/packages.rs` keeps its own copy of these scripts.
 
-/// `brew --cellar` and `brew --caskroom` print the fixture's `Cellar` and `Caskroom`, where an
+/// `brew --cellar` and `brew --caskroom` print the fixture's `Cellar` and `Caskroom` (`--caskroom`
+/// fails with the `caskroom-fail` marker), where an
 /// installed package is a `<name>/<version>` directory (the `installed` helper and `brew
 /// install` create them); there is no `brew list`, so a probe that calls it fails. `brew deps
 /// <name>` answers from `deps-<name>`; `brew outdated --json=v2 <name>...` reports the names in
@@ -23,7 +24,9 @@ case "$1" in
     [ -e "$here/../linger" ] && { (sleep 20 &); (sleep 0.3; kill -TERM $PPID) >/dev/null 2>&1 & }
     [ -e "$here/../stop" ] && kill -TERM $PPID
     echo "$(cd "$here/.." && pwd)/Cellar"; exit 0 ;;
-  --caskroom) echo "$(cd "$here/.." && pwd)/Caskroom"; exit 0 ;;
+  --caskroom)
+    [ -e "$here/../caskroom-fail" ] && exit 1
+    echo "$(cd "$here/.." && pwd)/Caskroom"; exit 0 ;;
   formulae)
     if [ -e "$here/../official-brew" ]; then cat "$here/../official-brew"; else printf 'atuin\nduckdb\n'; fi
     exit 0 ;;
