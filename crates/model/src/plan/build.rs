@@ -2980,6 +2980,18 @@ mod tests {
             });
         });
         not_adopted(&owned, "ledger-owned");
+        // Another resource owns the path in the ledger: still no takeover.
+        let other = adopt_plan_with(body, body, Some(approved(body)), |r, _, ledger| {
+            ledger.push(Owned {
+                resource: "extra.other".into(),
+                adapter: r.adapter.clone(),
+                class: Class::Normal,
+                path: ".ssh/config".into(),
+                fingerprint: Some(file_fingerprint(body)),
+                coowned_entries: None,
+            });
+        });
+        not_adopted(&other, "owned by another resource");
     }
 
     /// A refusal with any message: blocked, and no takeover.
