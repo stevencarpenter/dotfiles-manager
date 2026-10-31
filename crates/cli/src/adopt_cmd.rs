@@ -359,21 +359,8 @@ pub(crate) fn inside_git_tree(git: &Git, root: &Path, rel: &str) -> Result<bool,
     {
         return Ok(false);
     }
-    // `Some(code)` when git ended normally; a stop is an error, a signal or timeout is a failure.
-    let exit = |args: &[&str]| -> Result<(i32, String), Refusal> {
-        let out = git.output(true, args)?;
-        match out.end {
-            End::Exited(n) => Ok((
-                n,
-                String::from_utf8_lossy(&out.stdout).trim_end().to_string(),
-            )),
-            End::Stopped(r) => Err(r),
-            End::Signaled => Err(failed("git was killed")),
-            End::TimedOut => Err(failed("git timed out")),
-        }
-    };
     let top = |dir: &Path| -> Result<Option<String>, Refusal> {
-        let (code, top) = exit(&["-C", text(dir)?, "rev-parse", "--show-toplevel"])?;
+        let (code, top) = git_exit(git, &["-C", text(dir)?, "rev-parse", "--show-toplevel"])?;
         Ok((code == 0).then_some(top))
     };
     let Some(root_top) = top(root)? else {
@@ -390,9 +377,28 @@ pub(crate) fn inside_git_tree(git: &Git, root: &Path, rel: &str) -> Result<bool,
     if top(parent)?.as_deref() != Some(root_top.as_str()) {
         return Ok(false);
     }
-    // `check-ignore -q`: 0 ignored, 1 not ignored; a tracked path is never reported as ignored.
-    let (code, _) = exit(&["-C", text(root)?, "check-ignore", "-q", "--", rel])?;
-    Ok(code == 1)
+    Ok(check_ignore(git, root, rel)? == 1)
+}
+
+/// Runs git with `args`: the exit code and the trimmed standard output when git ended normally.
+/// A stop is an error, a signal or timeout is a failure.
+fn git_exit(git: &Git, args: &[&str]) -> Result<(i32, String), Refusal> {
+    let out = git.output(true, args)?;
+    match out.end {
+        End::Exited(n) => Ok((
+            n,
+            String::from_utf8_lossy(&out.stdout).trim_end().to_string(),
+        )),
+        End::Stopped(r) => Err(r),
+        End::Signaled => Err(failed("git was killed")),
+        End::TimedOut => Err(failed("git timed out")),
+    }
+}
+
+/// `git check-ignore -q` for `rel` under `root`: 0 ignored, 1 not ignored, anything else a git
+/// error. A tracked path is never reported as ignored; the path need not exist.
+fn check_ignore(git: &Git, root: &Path, rel: &str) -> Result<i32, Refusal> {
+    git_exit(git, &["-C", text(root)?, "check-ignore", "-q", "--", rel]).map(|(code, _)| code)
 }
 
 // ---- the command ------------------------------------------------------------------------------
@@ -1133,6 +1139,20 @@ fn decide(
     // read through) is never accepted when it is reached through a directory swapped for a link.
     for c in &mut candidates {
         check_path(&root, &c.repo, uid, false)?;
+        // `git add` skips an ignored path, so a fresh checkout would miss the link source.
+        match check_ignore(git, &root, &c.repo)? {
+            1 => {}
+            0 => {
+                return Err(conflict(format!(
+                    "git ignores the repo path {} in the checkout at {}, so the copy would never be committed and a fresh checkout could not resolve {}; nothing was changed. Fix: remove or narrow the ignore rule (`git check-ignore -v {}` names it), then run adopt again",
+                    c.repo,
+                    root.display(),
+                    c.id,
+                    c.repo
+                )));
+            }
+            n => return Err(failed(format!("git check-ignore {} exited {n}", c.repo))),
+        }
         let full = root.join(&c.repo);
         match fs::symlink_metadata(&full) {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,

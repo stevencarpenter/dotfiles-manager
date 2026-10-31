@@ -5,7 +5,7 @@ The `adopt` command (DFM-33): promote a trial into a module of the dotfiles repo
 | Part | Location |
 | --- | --- |
 | `adopt` command: arguments, candidates, checks, digest, repo writes, takeover, receipt | `crates/cli/src/adopt_cmd.rs` |
-| Secret scan (`gitleaks dir` over a private copy) and the checkout checks (`git status`, same checkout, not ignored) | `crates/cli/src/adopt_cmd.rs` (`scan`, `dirty`, `inside_git_tree`) |
+| Secret scan (`gitleaks dir` over a private copy) and the checkout checks (`git status`, same checkout, not ignored) | `crates/cli/src/adopt_cmd.rs` (`scan`, `dirty`, `inside_git_tree`, `check_ignore`) |
 | Resource id, link block, append, Brewfile line | `crates/model/src/adopt.rs` |
 | Module manifest lookup | `crates/model/src/resolve/scope.rs` (`module_manifest`) |
 | The takeover operation (`adopt-file`), planned only from `adopt`'s approval | `crates/model/src/plan/build.rs` (`Context.adopt_files`), `crates/engine/src/apply.rs` |
@@ -39,6 +39,7 @@ Order of one run:
    - the id already exists in any module;
    - an active trial other than this one claims the live path in its `owned_outputs`;
    - the repo path exists, tracked or not, unless it is the copy of an interrupted run (see "Interruption");
+   - git ignores the repo path (`git check-ignore`), a kept copy of an interrupted run included. `git add` would skip the copy, and a fresh checkout could not resolve the new resource;
    - the manifest or the Brewfile has uncommitted changes (`git status`), unless an interrupted run already appended to it;
    - a component on the way to a repo path, the manifest or the Brewfile is a link, or the deepest existing one is not writable.
 5. **The Brewfile.** Only for a `homebrew/v1` trial. The file is `<root>/Brewfile.<module>` when it exists, else `<root>/Brewfile`. A missing file is `E_CONFLICT` with its path. It must be inside the checkout and not ignored. The line is `brew "<name>"`, or `cask "<name>"` when brew holds the package as a cask (Caskroom rack and no Cellar rack, or a `homebrew/cask/` name). That probe runs only when the kind decides something: no line of either kind exists, or a line of only one kind does. When that probe fails and a line exists, the line stays and nothing is appended; with no line, the failure is `E_PROBE_FAILED`. The name is the recorded package without an official `homebrew/core/` or `homebrew/cask/` prefix. A third-party tap keeps `owner/tap/name`, because its short name would install another formula, or none, on a fresh machine. A version suffix (`node@20`) is kept. A line of the same kind (`brew` for a formula, `cask` for a cask), plain or in the paren form (`brew("tuicr")`), for any spelling of the same package (`tuicr`, `homebrew/core/tuicr`) means nothing is appended. A formula and a cask of one name are different packages: `brew "docker"` does not count for `cask "docker"`, and the reverse. A `brew "x"` line under `tap "owner/tap"` does not count for `owner/tap/x`, because brew resolves a short name to `homebrew/core` first; the qualified line is appended. A `mise/v1` trial, or a trial with no provider package, gets no line, and the preview says why.

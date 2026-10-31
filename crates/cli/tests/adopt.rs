@@ -583,6 +583,43 @@ fn a_gitignored_brewfile_is_refused() {
     assert_eq!(fx.snapshot(), before);
 }
 
+/// Commits a `.gitignore` with `rule` at the root.
+fn ignore(fx: &Fx, rule: &str) {
+    fx.put(".gitignore", rule);
+    git(&fx.root, &["add", ".gitignore"]);
+    git(&fx.root, &["commit", "-q", "-m", "ignore"]);
+}
+
+#[test]
+fn a_gitignored_repo_path_is_refused_with_zero_writes() {
+    let fx = Fx::new();
+    fx.live(LIVE, TUICR);
+    ignore(&fx, "home/\n");
+    let before = fx.snapshot();
+    for args in [
+        vec!["--module", "core", "--preview"],
+        vec!["--module", "core"],
+    ] {
+        let o = fx.adopt(&args);
+        conflict_on(&o, REPO_FILE);
+        assert!(stderr(&o).contains("git ignores"), "{}", stderr(&o));
+    }
+    assert_eq!(fx.snapshot(), before);
+}
+
+#[test]
+fn a_kept_copy_that_git_now_ignores_is_refused_on_resume() {
+    let fx = Fx::new();
+    fx.live(LIVE, TUICR);
+    interrupted(&fx, "adopt-after-copy:error");
+    ignore(&fx, "home/\n");
+    let before = fx.snapshot();
+    let o = fx.adopt(&["--module", "core", "--preview"]);
+    conflict_on(&o, REPO_FILE);
+    assert!(stderr(&o).contains("git ignores"), "{}", stderr(&o));
+    assert_eq!(fx.snapshot(), before);
+}
+
 #[test]
 fn an_existing_repo_file_is_refused() {
     let fx = Fx::new();
