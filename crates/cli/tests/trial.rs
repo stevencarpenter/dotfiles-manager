@@ -1072,3 +1072,41 @@ fn an_interrupted_trial_roll_is_a_note_and_the_declared_tools_still_roll() {
     assert!(t.contains(&note(open["op_id"].as_str().unwrap())), "{t}");
     assert!(!t.contains(TRIAL_OP), "{t}");
 }
+
+#[test]
+fn an_interrupted_trial_install_is_a_note_and_the_tool_is_not_rolled() {
+    let fx = Fx::new();
+    let o = fx.trial(&["duckdb", "--provider", MISE, "--preview"]);
+    let o = fx
+        .cmd(
+            &[("DFM_FAILPOINT", "trial-after-intent:abort")],
+            &[
+                "trial",
+                "duckdb",
+                "--provider",
+                MISE,
+                "--yes-plan",
+                &digest_of(&o),
+            ],
+        )
+        .output()
+        .unwrap();
+    assert!(!o.status.success(), "{}", text(&o.stdout));
+    let op = fx.journal().pop().unwrap()["op_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    // The install may have finished before the stop: the provider lists the tool.
+    fx.marker("installed-mise", "duckdb 2.0.0\n");
+    let o = fx.update(&["--preview"]);
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+    let t = text(&o.stdout);
+    assert!(
+        t.contains(&format!(
+            "note: trial trial-duckdb: duckdb is not rolled (interrupted op {op}; run dfm state resolve)"
+        )),
+        "{t}"
+    );
+    assert!(!t.contains(TRIAL_OP), "{t}");
+    assert_eq!(fx.mise_installs(), 0, "{}", fx.log());
+}

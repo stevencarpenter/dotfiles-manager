@@ -435,7 +435,8 @@ fn probe_with_trials(
                 continue;
             }
             let id = format!("trial:{}", t.trial_id);
-            if let Some(op) = open.get(&id) {
+            // The trial's own install is journaled under the bare trial id.
+            if let Some(op) = open.get(&id).or_else(|| open.get(&t.trial_id)) {
                 notes.push(format!(
                     "trial {}: {} is not rolled (interrupted op {op}; run dfm state resolve)",
                     t.trial_id, pkg.name
