@@ -415,8 +415,12 @@ pub fn module_manifest(
 }
 
 /// `rel` under `base_dir` with `.` and `..` collapsed lexically; `None` when it climbs above
-/// the root.
+/// the root or is absolute.
 fn collapse(base_dir: &str, rel: &str) -> Option<String> {
+    // An absolute path leaves the source root, as in `source::join`.
+    if rel.starts_with('/') {
+        return None;
+    }
     let mut out = components(base_dir);
     for c in rel.split('/') {
         match c {
@@ -615,6 +619,23 @@ exclude = ["home/*", "a/?b", "p/**", "**/**/**/x", "m/**/k/*.o"]"#,
             Some("base/modules/extra/module.toml")
         );
         assert_eq!(m("missing"), None);
+    }
+
+    #[test]
+    fn module_manifest_refuses_an_absolute_path() {
+        let s = tree(&[
+            ("profiles/p.toml", PROFILE),
+            (
+                "base/bundle.toml",
+                "schema = 1\nid = \"b\"\ncore = \"modules/core/module.toml\"\n[modules]\nextra = \"/modules/extra/module.toml\"\n",
+            ),
+        ]);
+        let e = module_manifest(&s, "profiles/p.toml", "extra").unwrap_err();
+        assert_eq!(e.code, Code::SourceEscape);
+        let abs = PROFILE.replace("../base/bundle.toml", "/base/bundle.toml");
+        let s = tree(&[("profiles/p.toml", &abs)]);
+        let e = module_manifest(&s, "profiles/p.toml", "core").unwrap_err();
+        assert_eq!(e.code, Code::SourceEscape);
     }
 
     #[test]
