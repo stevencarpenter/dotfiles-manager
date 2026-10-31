@@ -983,6 +983,65 @@ fn a_second_run_completes_after_a_stop_at_each_boundary() {
     }
 }
 
+/// The rows of `doctor --json`.
+fn doctor_rows(fx: &Fx) -> Vec<serde_json::Value> {
+    let o = fx.run(&["doctor", "--json"]);
+    let v: serde_json::Value = serde_json::from_slice(&o.stdout)
+        .unwrap_or_else(|e| panic!("{e}\n{}\n{}", out(&o), stderr(&o)));
+    v["rows"].as_array().unwrap().clone()
+}
+
+#[test]
+fn doctor_lists_an_active_trial_and_not_an_adopted_one() {
+    let fx = Fx::new();
+    let trials = |fx: &Fx| {
+        doctor_rows(fx)
+            .into_iter()
+            .filter(|r| r["code"] == "D_TRIAL")
+            .count()
+    };
+    assert_eq!(trials(&fx), 1);
+    fx.live(LIVE, TUICR);
+    let o = fx.adopt_approved("core");
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), out(&o));
+    assert_eq!(trials(&fx), 0);
+}
+
+#[test]
+fn doctor_points_an_interrupted_adopt_to_adopt_or_resolve() {
+    let fx = Fx::new();
+    fx.live(LIVE, TUICR);
+    interrupted(&fx, "adopt-after-manifest:abort");
+    let check = |fx: &Fx, what: &str, detail: &str| {
+        let rows = doctor_rows(fx);
+        let row = rows
+            .iter()
+            .find(|r| {
+                r["code"] == "E_OP_INTERRUPTED"
+                    && r["detail"].as_str().unwrap().contains("trial-adopt")
+            })
+            .unwrap_or_else(|| panic!("{what}: no trial-adopt row in {rows:#?}"));
+        assert!(
+            row["detail"].as_str().unwrap().contains(detail),
+            "{what}: {row}"
+        );
+        let fix = row["fix"].as_str().unwrap().to_string();
+        assert!(
+            fix.contains("dfm adopt trial-tuicr --module core"),
+            "{what}: {fix}"
+        );
+        assert!(fix.contains("dfm state resolve '"), "{what}: {fix}");
+        assert!(fix.contains("--as failed"), "{what}: {fix}");
+        assert!(!fix.contains("run apply"), "{what}: {fix}");
+        assert!(!fix.contains("state recover"), "{what}: {fix}");
+    };
+    check(&fx, "open intent", "has an intent and no outcome");
+    // Recovery cannot decide the entry, so it is left unknown: the fix stays the same.
+    let o = fx.run(&["state", "recover"]);
+    assert!(matches!(code(&o), 0 | 1 | 3), "{}\n{}", stderr(&o), out(&o));
+    check(&fx, "unknown entry", "ended unknown");
+}
+
 #[test]
 fn a_third_run_completes_after_two_stops_in_a_row() {
     let reference = reference_tree();
