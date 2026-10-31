@@ -355,7 +355,7 @@ pub(crate) fn inside_git_tree(
     git: &Git,
     root: &Path,
     rel: &str,
-    excludes: &str,
+    excludes: Option<&str>,
 ) -> Result<bool, Refusal> {
     let rel_path = Path::new(rel);
     if rel.is_empty()
@@ -404,31 +404,38 @@ fn git_exit(git: &Git, args: &[&str]) -> Result<(i32, String), Refusal> {
 
 /// `git check-ignore -q` for `rel` under `root`: 0 ignored, 1 not ignored, anything else a git
 /// error. A tracked path is never reported as ignored; the path need not exist. The scrubbed
-/// environment reads no global config, so the user's global excludes file comes as `excludes`.
-fn check_ignore(git: &Git, root: &Path, rel: &str, excludes: &str) -> Result<i32, Refusal> {
-    let setting = format!("core.excludesFile={excludes}");
-    git_exit(
-        git,
-        &[
-            "-C",
-            text(root)?,
-            "-c",
-            &setting,
-            "check-ignore",
-            "-q",
-            "--",
-            rel,
-        ],
-    )
-    .map(|(code, _)| code)
+/// environment reads no global config, so the user's global excludes file comes as `excludes`;
+/// `None` when the repository's own config sets `core.excludesFile`, which git reads itself.
+fn check_ignore(git: &Git, root: &Path, rel: &str, excludes: Option<&str>) -> Result<i32, Refusal> {
+    let setting = excludes.map(|e| format!("core.excludesFile={e}"));
+    let mut args = vec!["-C", text(root)?];
+    if let Some(s) = &setting {
+        args.extend(["-c", s.as_str()]);
+    }
+    args.extend(["check-ignore", "-q", "--", rel]);
+    git_exit(git, &args).map(|(code, _)| code)
 }
 
 /// The user's global excludes file, found without loading the user's git config:
 /// `core.excludesFile` from `~/.gitconfig`, else from the XDG `git/config` (git reads both and
 /// the later `~/.gitconfig` wins), else the XDG default `git/ignore`. A leading `~/` is expanded
 /// to `home`, as git does. An `[include]` is not followed, and `~user/` is not expanded. A missing
-/// file is returned as is; git ignores a missing excludes file.
-fn user_excludes(git: &Git, home: &Path) -> Result<String, Refusal> {
+/// file is returned as is; git ignores a missing excludes file. An empty value is returned as is:
+/// git reads it as no excludes file, not as the XDG default. `None` when the repository at `root`
+/// sets `core.excludesFile` itself: the scrubbed git reads only the repository and worktree
+/// config there, and that value wins over the global one, as in the user's `git add`.
+fn user_excludes(git: &Git, root: &Path, home: &Path) -> Result<Option<String>, Refusal> {
+    let local = ["-C", text(root)?, "config", "--get", "core.excludesFile"];
+    match git_exit(git, &local)? {
+        (0, _) => return Ok(None),
+        (1, _) => {}
+        (n, _) => {
+            return Err(failed(format!(
+                "git config could not read core.excludesFile in {} (exit {n})",
+                root.display()
+            )));
+        }
+    }
     let xdg = std::env::var_os("XDG_CONFIG_HOME")
         .filter(|v| !v.is_empty())
         .map_or_else(|| home.join(".config"), PathBuf::from)
@@ -445,12 +452,12 @@ fn user_excludes(git: &Git, home: &Path) -> Result<String, Refusal> {
             "core.excludesFile",
         ];
         match git_exit(git, &args)? {
-            (0, v) if v == "~" => return Ok(text(home)?.to_string()),
+            (0, v) if v == "~" => return Ok(Some(text(home)?.to_string())),
             (0, v) => {
-                return Ok(match v.strip_prefix("~/") {
+                return Ok(Some(match v.strip_prefix("~/") {
                     Some(rest) => text(&home.join(rest))?.to_string(),
                     None => v,
-                });
+                }));
             }
             (1, _) => {}
             (n, _) => {
@@ -461,7 +468,7 @@ fn user_excludes(git: &Git, home: &Path) -> Result<String, Refusal> {
             }
         }
     }
-    Ok(text(&xdg.join("ignore"))?.to_string())
+    Ok(Some(text(&xdg.join("ignore"))?.to_string()))
 }
 
 // ---- the command ------------------------------------------------------------------------------
@@ -1237,8 +1244,8 @@ fn decide(
             "the manifest {manifest} of module {module} is not a regular file in the sources"
         )));
     };
-    let excludes = user_excludes(git, &ctx.layout().home)?;
-    if !inside_git_tree(git, &root, &manifest, &excludes)? {
+    let excludes = user_excludes(git, &root, &ctx.layout().home)?;
+    if !inside_git_tree(git, &root, &manifest, excludes.as_deref())? {
         return Err(conflict(format!(
             "{manifest} is not inside the git checkout at {}; adopt edits only that checkout",
             root.display()
@@ -1319,7 +1326,7 @@ fn decide(
     for c in &mut candidates {
         check_path(&root, &c.repo, uid, false)?;
         // `git add` skips an ignored path, so a fresh checkout would miss the link source.
-        match check_ignore(git, &root, &c.repo, &excludes)? {
+        match check_ignore(git, &root, &c.repo, excludes.as_deref())? {
             1 => {}
             0 => {
                 return Err(conflict(format!(
@@ -1484,7 +1491,7 @@ fn decide(
             if brew_bytes.len() > MAX_BYTES {
                 return Err(conflict(format!("{path} is larger than 16 MiB")));
             }
-            if !inside_git_tree(git, &root, &path, &excludes)? {
+            if !inside_git_tree(git, &root, &path, excludes.as_deref())? {
                 return Err(conflict(format!(
                     "{path} is not inside the git checkout at {}, or git ignores it",
                     root.display()
@@ -2473,7 +2480,7 @@ mod tests {
         let git = git_for(&base.join("home"));
         let e = dirty(&git, &odd, &["x"]).unwrap_err();
         assert_eq!(e.code.exit(), Exit::Blocked, "{e:?}");
-        let e = inside_git_tree(&git, &odd, "x", "/dev/null").unwrap_err();
+        let e = inside_git_tree(&git, &odd, "x", None).unwrap_err();
         assert_eq!(e.code.exit(), Exit::Blocked, "{e:?}");
     }
 
@@ -2710,29 +2717,27 @@ mod tests {
         let base = scratch("inside");
         let root = repo(&base);
         let git = git_for(&base.join("home"));
-        assert!(inside_git_tree(&git, &root, "modules/a/module.toml", "/dev/null").unwrap());
+        assert!(inside_git_tree(&git, &root, "modules/a/module.toml", None).unwrap());
         // Untracked, in a directory of the same checkout.
         fs::create_dir_all(root.join("modules/new")).unwrap();
-        assert!(inside_git_tree(&git, &root, "modules/new/module.toml", "/dev/null").unwrap());
+        assert!(inside_git_tree(&git, &root, "modules/new/module.toml", None).unwrap());
         // A directory that does not exist yet, a path that leaves the root, a path of a nested
         // repository, and a root that is no repository are all outside.
-        assert!(!inside_git_tree(&git, &root, "nowhere/module.toml", "/dev/null").unwrap());
-        assert!(
-            !inside_git_tree(&git, &root, "../repo/modules/a/module.toml", "/dev/null").unwrap()
-        );
-        assert!(!inside_git_tree(&git, &root, "/etc/hosts", "/dev/null").unwrap());
+        assert!(!inside_git_tree(&git, &root, "nowhere/module.toml", None).unwrap());
+        assert!(!inside_git_tree(&git, &root, "../repo/modules/a/module.toml", None).unwrap());
+        assert!(!inside_git_tree(&git, &root, "/etc/hosts", None).unwrap());
         // A tracked link to a file outside the tree is not inside it.
         std::os::unix::fs::symlink("/etc/hosts", root.join("modules/a/link.toml")).unwrap();
         git_in(&root, &["add", "."]);
         git_in(&root, &["commit", "-q", "-m", "link"]);
-        assert!(!inside_git_tree(&git, &root, "modules/a/link.toml", "/dev/null").unwrap());
+        assert!(!inside_git_tree(&git, &root, "modules/a/link.toml", None).unwrap());
         let nested = root.join("vendor/inner");
         fs::create_dir_all(&nested).unwrap();
         git_in(&nested, &["init", "-q", "."]);
         fs::write(nested.join("module.toml"), "n\n").unwrap();
-        assert!(!inside_git_tree(&git, &root, "vendor/inner/module.toml", "/dev/null").unwrap());
+        assert!(!inside_git_tree(&git, &root, "vendor/inner/module.toml", None).unwrap());
         let plain = base.join("plain");
         fs::create_dir_all(&plain).unwrap();
-        assert!(!inside_git_tree(&git, &plain, "module.toml", "/dev/null").unwrap());
+        assert!(!inside_git_tree(&git, &plain, "module.toml", None).unwrap());
     }
 }

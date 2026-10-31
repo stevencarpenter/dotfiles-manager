@@ -714,6 +714,37 @@ fn a_repo_path_the_users_configured_excludes_file_ignores_is_refused() {
 }
 
 #[test]
+fn a_repo_local_excludes_file_wins_over_the_global_one() {
+    // The repo's file ignores `home/`; the global default file does not exist.
+    let fx = Fx::new();
+    fx.live(LIVE, TUICR);
+    fx.put(".git/local-ignore", "home/\n");
+    git(
+        &fx.root,
+        &["config", "core.excludesFile", ".git/local-ignore"],
+    );
+    let before = fx.snapshot();
+    conflict_on(&fx.adopt(&["--module", "core", "--preview"]), REPO_FILE);
+    assert_eq!(fx.snapshot(), before);
+    // The global default file ignores `home/`; the repo's file does not.
+    fx.put(".git/local-ignore", "other/\n");
+    fx.live(".config/git/ignore", "home/\n");
+    let o = fx.adopt(&["--module", "core", "--preview"]);
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), out(&o));
+}
+
+#[test]
+fn an_empty_global_excludes_file_setting_disables_the_default_file() {
+    // git reads `core.excludesFile =` as no excludes file, not as the XDG default.
+    let fx = Fx::new();
+    fx.live(LIVE, TUICR);
+    fx.live(".gitconfig", "[core]\n\texcludesFile =\n");
+    fx.live(".config/git/ignore", "home/\n");
+    let o = fx.adopt(&["--module", "core", "--preview"]);
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), out(&o));
+}
+
+#[test]
 fn a_repo_path_that_differs_only_by_case_from_a_source_is_refused() {
     let fx = Fx::new();
     fx.live(LIVE, TUICR);
