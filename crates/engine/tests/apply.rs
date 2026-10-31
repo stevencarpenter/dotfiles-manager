@@ -1811,6 +1811,43 @@ fn an_adopt_file_operation_keeps_the_file_when_the_source_changes_before_the_ren
 }
 
 #[test]
+fn a_rerun_of_the_same_plan_after_a_settled_adopt_file_is_current() {
+    let s = setup();
+    let (o, root) = adopt_file_op(&s);
+    let p = plan_in(&root, vec![o]);
+    let rep = go_adopt(
+        &s,
+        &p,
+        &ids(&["x@l"]),
+        &Fail::at("link-after-rename", Inject::Error),
+    );
+    assert_eq!(rep.operations[0].status, Status::Unknown);
+    // The same plan again: settling records the link, and the takeover has nothing left to do.
+    let rep = go_adopt(&s, &p, &ids(&["x@l"]), &Fail::none());
+    assert_eq!(
+        rep.operations[0].status,
+        Status::Current,
+        "{:?}",
+        rep.stopped
+    );
+    assert!(rep.stopped.is_none(), "{:?}", rep.stopped);
+    let link = format!("{root}/x");
+    assert_eq!(fs::read_link(s.h.0.join("l")).unwrap(), Path::new(&link));
+    assert_eq!(owned_paths(&s).len(), 1);
+    // A link to anything else at the path is still stale, not current.
+    fs::remove_file(s.h.0.join("l")).unwrap();
+    symlink("/elsewhere", s.h.0.join("l")).unwrap();
+    let rep = go_adopt(&s, &p, &ids(&["x@l"]), &Fail::none());
+    assert_eq!(
+        rep.operations[0].status,
+        Status::Blocked,
+        "{:?}",
+        rep.stopped
+    );
+    assert_eq!(rep.stopped.as_ref().unwrap().code, Code::PlanStale);
+}
+
+#[test]
 fn recovery_settles_an_interrupted_adopt_file_by_what_is_at_the_path() {
     use dfm_model::state::{Recovery, RecoveryOutput};
     // The rename happened: the link is there, so the intent is done.

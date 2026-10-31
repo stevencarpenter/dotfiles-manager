@@ -22,8 +22,8 @@ use dfm_model::digest::sha256_hex;
 use dfm_model::fold;
 use dfm_model::merge::{Merged, check_foreign, leaf_hashes, salted};
 use dfm_model::plan::{
-    Action, Operation, Owned, PackageState, Plan, Request, ServiceState, Status as PlanStatus,
-    file_fingerprint, ledger_state, link_fingerprint, node_state,
+    Action, Node, Operation, Owned, PackageState, Plan, Request, ServiceState,
+    Status as PlanStatus, file_fingerprint, ledger_state, link_fingerprint, node_state,
 };
 use dfm_model::state::{
     Class, CoOwned, Fingerprint, JournalEntry, Ledger, OperationRecord, OwnedOutput, Phase,
@@ -792,6 +792,19 @@ impl Exec<'_, '_> {
         .map_err(failed)?;
         let owned = self.owned().map_err(failed)?;
         let entry = owned.iter().find(|o| fold::eq(&o.path, rel));
+        // Settling an earlier `unknown` just recorded this very link: adoption has nothing left
+        // to do, and the operation is not stale. A takeover (`adopt-file`) also changed the path
+        // itself, so it is current only while the path is that link.
+        let recorded = matches!(op.action, Action::Adopt | Action::AdoptFile)
+            && entry.is_some_and(|e| {
+                e.resource == op.resource
+                    && op.link.as_deref().map(link_fingerprint).as_deref()
+                        == e.fingerprint.as_deref()
+            })
+            && (op.action == Action::Adopt
+                || obs.seen.get(rel).is_some_and(|s| {
+                    matches!(&s.node, Node::Link { target, .. } if op.link.as_deref() == Some(target.as_str()))
+                }));
         for p in &op.preconditions {
             let actual = if let Some(path) = p.subject.strip_prefix("path:") {
                 match obs.seen.get(path) {
@@ -804,16 +817,9 @@ impl Exec<'_, '_> {
             } else {
                 continue;
             };
-            // Settling an earlier `unknown` just recorded this very link: adoption has nothing
-            // left to do, and the operation is not stale.
-            let recorded = op.action == Action::Adopt
-                && p.subject.starts_with("ledger:")
-                && entry.is_some_and(|e| {
-                    e.resource == op.resource
-                        && op.link.as_deref().map(link_fingerprint).as_deref()
-                            == e.fingerprint.as_deref()
-                });
-            if actual != p.state && recorded {
+            let settled = p.subject.starts_with("ledger:")
+                || (op.action == Action::AdoptFile && p.subject == format!("path:{rel}"));
+            if actual != p.state && recorded && settled {
                 return Err(Ended::Current);
             }
             if actual != p.state {
