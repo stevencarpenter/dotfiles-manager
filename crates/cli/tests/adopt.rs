@@ -620,6 +620,73 @@ fn a_kept_copy_that_git_now_ignores_is_refused_on_resume() {
     assert_eq!(fx.snapshot(), before);
 }
 
+/// `MAX_SOURCE_FILE_BYTES`, the source loader's per-file limit (crates/model/src/plan/mod.rs).
+const SOURCE_FILE_LIMIT: usize = 1 << 20;
+
+#[test]
+fn a_candidate_over_the_source_file_limit_is_refused_with_zero_writes() {
+    let fx = Fx::new();
+    fx.live(LIVE, &"a".repeat(SOURCE_FILE_LIMIT + 1));
+    let before = fx.snapshot();
+    for args in [
+        vec!["--module", "core", "--preview"],
+        vec!["--module", "core"],
+    ] {
+        let o = fx.adopt(&args);
+        refused(&o, "E_LIMIT_EXCEEDED");
+        assert!(stderr(&o).contains(LIVE), "{}", stderr(&o));
+    }
+    assert_eq!(fx.snapshot(), before);
+}
+
+#[test]
+fn a_candidate_at_the_source_file_limit_is_adopted() {
+    let fx = Fx::new();
+    fx.live(LIVE, &"a".repeat(SOURCE_FILE_LIMIT));
+    let o = fx.adopt_approved("core");
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), out(&o));
+    let o = fx.run(&["apply", "--preview"]);
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), out(&o));
+}
+
+#[test]
+fn candidates_over_the_source_total_limit_are_refused_with_zero_writes() {
+    let fx = Fx::new();
+    // 64 files at the per-file limit are 64 MiB, the loader's total, before the repo's own files.
+    for i in 0..64 {
+        fx.live(
+            &format!(".config/tuicr/f{i:02}"),
+            &"a".repeat(SOURCE_FILE_LIMIT),
+        );
+    }
+    let before = fx.snapshot();
+    let o = fx.adopt(&["--module", "core", "--preview"]);
+    refused(&o, "E_LIMIT_EXCEEDED");
+    assert!(stderr(&o).contains("source bytes"), "{}", stderr(&o));
+    assert_eq!(fx.snapshot(), before);
+}
+
+#[test]
+fn a_candidate_under_a_nested_git_directory_is_refused_with_zero_writes() {
+    let fx = Fx::new();
+    fx.live(".config/tuicr/.git/config", "[core]\n");
+    let before = fx.snapshot();
+    let o = fx.adopt(&["--module", "core", "--preview"]);
+    refused(&o, "E_SOURCE_UNTRUSTED");
+    assert!(stderr(&o).contains(".git"), "{}", stderr(&o));
+    assert_eq!(fx.snapshot(), before);
+}
+
+#[test]
+fn a_candidate_name_with_a_control_character_is_refused_with_zero_writes() {
+    let fx = Fx::new();
+    fx.live(".config/tuicr/a\u{7}b", "x\n");
+    let before = fx.snapshot();
+    let o = fx.adopt(&["--module", "core", "--preview"]);
+    refused(&o, "E_TARGET_INVALID");
+    assert_eq!(fx.snapshot(), before);
+}
+
 #[test]
 fn an_existing_repo_file_is_refused() {
     let fx = Fx::new();

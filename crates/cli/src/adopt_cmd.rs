@@ -24,9 +24,10 @@ use dfm_model::adopt::{BrewKind, append, brewfile_has, brewfile_line, link_block
 use dfm_model::digest::sha256_hex;
 use dfm_model::display::{bounded_visible, visible};
 use dfm_model::plan::{
-    Action, ApprovedFile, Binary, Plan, Scope, Status as PlanStatus, file_fingerprint,
+    Action, ApprovedFile, Binary, MAX_SOURCE_ENTRIES, MAX_SOURCE_FILE_BYTES,
+    MAX_SOURCE_TOTAL_BYTES, Plan, Scope, Status as PlanStatus, file_fingerprint,
 };
-use dfm_model::resolve::{Entry, module_manifest, resolve};
+use dfm_model::resolve::{Entry, SourceSet, module_manifest, resolve};
 use dfm_model::state::{
     Approval, BinaryId, Class, DisruptiveApproval, Fingerprint, JournalEntry, MAX_BYTES,
     OperationRecord, Phase, ProfileRef, Receipt, Recovery, RunResult, SCHEMA, Stamp, Status,
@@ -1011,6 +1012,54 @@ fn check_path(root: &Path, rel: &str, uid: u32, writes: bool) -> Result<(), Refu
     Ok(())
 }
 
+/// The source loader's tree limits (`source_fs`) for the edited composition: entries (files,
+/// links and walked directories, the new parent directories of the repo copies included) and
+/// bytes in total, and the per-file limit for the appended manifest. A directory the loader
+/// walks only to reach a `[sources]` root is not counted there; counting it here is stricter.
+fn within_source_limits(sources: &SourceSet, candidates: &[Candidate]) -> Result<(), Refusal> {
+    let limit = |what: String| {
+        Refusal::new(
+            Code::LimitExceeded,
+            format!("{what}, over the source loader's limit; nothing was changed"),
+        )
+    };
+    let dirs: BTreeSet<String> = sources.dirs().map(fold::fold).collect();
+    let new_dirs: BTreeSet<String> = candidates
+        .iter()
+        .flat_map(|c| {
+            c.repo
+                .match_indices('/')
+                .map(|(i, _)| fold::fold(&c.repo[..i]))
+        })
+        .filter(|d| !dirs.contains(d))
+        .collect();
+    let entries = sources.len() + dirs.len() + new_dirs.len();
+    if entries > MAX_SOURCE_ENTRIES {
+        return Err(limit(format!(
+            "the checkout with the adopted files has {entries} source entries, more than {MAX_SOURCE_ENTRIES}"
+        )));
+    }
+    let mut total: u64 = 0;
+    for p in sources.paths() {
+        let Some(Entry::File(b)) = sources.get(p) else {
+            continue;
+        };
+        let n = u64::try_from(b.len()).unwrap_or(u64::MAX);
+        if n > MAX_SOURCE_FILE_BYTES {
+            return Err(limit(format!(
+                "{p} would be {n} bytes, more than {MAX_SOURCE_FILE_BYTES}"
+            )));
+        }
+        total = total.saturating_add(n);
+    }
+    if total > MAX_SOURCE_TOTAL_BYTES {
+        return Err(limit(format!(
+            "the checkout with the adopted files holds {total} source bytes, more than {MAX_SOURCE_TOTAL_BYTES}"
+        )));
+    }
+    Ok(())
+}
+
 /// The relative path of `p` below `base`, as text.
 fn rel_text(p: &Path, base: &Path) -> Option<String> {
     p.strip_prefix(base).ok()?.to_str().map(str::to_string)
@@ -1131,6 +1180,28 @@ fn decide(
             "nothing to adopt: no file was created or changed under the baseline paths of trial {}",
             args.trial
         )));
+    }
+    // The source loader refuses these in the checkout. The edited composition below holds the
+    // bytes in memory and would not, so the adoption would break every later `plan` and `sync`.
+    for c in &candidates {
+        if u64::try_from(c.bytes.len()).unwrap_or(u64::MAX) > MAX_SOURCE_FILE_BYTES {
+            return Err(Refusal::new(
+                Code::LimitExceeded,
+                format!(
+                    "{} is larger than {MAX_SOURCE_FILE_BYTES} bytes, the limit for a source file, so its repo copy {} would not load; nothing was changed. Fix: keep the file out of the module",
+                    c.live, c.repo
+                ),
+            ));
+        }
+        if c.repo.split('/').any(|n| n.to_lowercase() == ".git") {
+            return Err(Refusal::new(
+                Code::SourceUntrusted,
+                format!(
+                    "{} would be copied to {}, under a nested .git, which the source loader refuses (submodules and gitlinks); nothing was changed. Fix: keep the file out of the module",
+                    c.live, c.repo
+                ),
+            ));
+        }
     }
 
     // A repo path that exists is refused, unless it is the interrupted run's copy: it holds the
@@ -1449,6 +1520,7 @@ fn decide(
     for c in &candidates {
         sources.insert_file(c.repo.clone(), c.bytes.clone());
     }
+    within_source_limits(&sources, &candidates)?;
     let resolved = resolve(&sources, &profile, &crate::builtin_catalog()).map_err(|e| {
         let r = Refusal::from(e);
         Refusal::new(
