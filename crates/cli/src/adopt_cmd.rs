@@ -1174,16 +1174,14 @@ fn decide(
     }
 
     // The Brewfile line: the package as a formula, or as a cask when brew holds it as one. A
-    // line for any spelling of the same package counts as present, unless the interrupted run
+    // line of that kind for any spelling of the same package counts as present, unless the interrupted run
     // appended it: then the file must be its recorded bytes plus that line.
     if let (Some(b), Some(p)) = (brewfile.as_mut(), &trial.package) {
         let (name, spellings) = package::brewfile_names(&p.name);
-        let kind = || -> Result<BrewKind, Refusal> {
-            Ok(if package::brew_is_cask(runner, &p.name)? {
-                BrewKind::Cask
-            } else {
-                BrewKind::Formula
-            })
+        let kind = if package::brew_is_cask(runner, &p.name)? {
+            BrewKind::Cask
+        } else {
+            BrewKind::Formula
         };
         let resumed = prior.as_ref().and_then(|r| {
             r.brewfile
@@ -1192,7 +1190,7 @@ fn decide(
                 .map(|e| (e, &r.op_id))
         });
         if let Some((e, op_id)) = resumed {
-            let line = brewfile_line(kind()?, &name);
+            let line = brewfile_line(kind, &name);
             brew_bytes = prior_base(&brew_bytes, &line, e)
                 .ok_or_else(|| not_prior(&b.path, op_id))?
                 .to_vec();
@@ -1201,11 +1199,11 @@ fn decide(
             b.done = true;
         } else if spellings
             .iter()
-            .any(|n| brewfile_has(&String::from_utf8_lossy(&brew_bytes), n))
+            .any(|n| brewfile_has(&String::from_utf8_lossy(&brew_bytes), kind, n))
         {
             brew_note = Some(format!("{} already lists {name}", b.path));
         } else {
-            b.addition = brewfile_line(kind()?, &name);
+            b.addition = brewfile_line(kind, &name);
         }
         b.post = sha256_hex(&append(&brew_bytes, &b.addition));
     }

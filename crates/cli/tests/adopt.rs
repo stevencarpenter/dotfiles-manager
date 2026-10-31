@@ -688,6 +688,21 @@ fn an_official_package_listed_with_its_tap_gets_no_second_line() {
 }
 
 #[test]
+fn a_cask_line_of_the_same_name_does_not_hide_the_formula_line() {
+    let fx = Fx::new();
+    fx.put("Brewfile", "cask \"tuicr\"\n");
+    git(&fx.root, &["commit", "-q", "-am", "cask spelling"]);
+    fx.live(LIVE, TUICR);
+    let o = fx.adopt(&["--module", "core", "--preview"]);
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), out(&o));
+    assert!(
+        out(&o).contains("brewfile: Brewfile += brew \"tuicr\""),
+        "{}",
+        out(&o)
+    );
+}
+
+#[test]
 fn a_manifest_edited_after_the_preview_is_stale() {
     let fx = Fx::new();
     fx.live(LIVE, TUICR);

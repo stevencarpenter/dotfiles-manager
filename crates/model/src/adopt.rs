@@ -63,44 +63,57 @@ pub enum BrewKind {
     Cask,
 }
 
-/// A Brewfile line: `brew "name"` or `cask "name"`, with a final newline.
-pub fn brewfile_line(kind: BrewKind, name: &str) -> String {
-    let word = match kind {
-        BrewKind::Formula => "brew",
-        BrewKind::Cask => "cask",
-    };
-    format!("{word} {}\n", quoted(name))
+impl BrewKind {
+    fn keyword(self) -> &'static str {
+        match self {
+            BrewKind::Formula => "brew",
+            BrewKind::Cask => "cask",
+        }
+    }
 }
 
-/// True when a non-comment line is `brew` or `cask` followed by the quoted `name`, then the end
-/// of the line, a `,` (options) or a `#` comment. The match is on the whole quoted string: a
-/// tap-qualified `owner/tap/tuicr` does not match `tuicr`, because another tap can ship a
-/// different formula of that short name. A caller that treats several spellings as one package
-/// asks for each spelling.
-pub fn brewfile_has(text: &str, name: &str) -> bool {
+/// A Brewfile line: `brew "name"` or `cask "name"`, with a final newline.
+pub fn brewfile_line(kind: BrewKind, name: &str) -> String {
+    format!("{} {}\n", kind.keyword(), quoted(name))
+}
+
+/// True when a non-comment line is the keyword of `kind` followed by the quoted `name`, then the
+/// end of the line, a `,` (options) or a `#` comment. The paren form `brew("name")` counts too.
+/// A formula and a cask of the same name are different packages, so `brew "docker"` does not
+/// count for the cask. The match is on the whole quoted string: a tap-qualified
+/// `owner/tap/tuicr` does not match `tuicr`, and a `tap "owner/tap"` line does not make
+/// `brew "tuicr"` count for `owner/tap/tuicr`, because brew resolves a short name to
+/// homebrew/core first. A caller that treats several spellings as one package asks for each
+/// spelling.
+pub fn brewfile_has(text: &str, kind: BrewKind, name: &str) -> bool {
     text.lines().any(|line| {
-        let line = line.trim_start();
-        let Some(rest) = line
-            .strip_prefix("brew")
-            .or_else(|| line.strip_prefix("cask"))
-        else {
+        let Some(rest) = line.trim_start().strip_prefix(kind.keyword()) else {
             return false;
         };
-        let rest = rest.trim_start();
+        // The keyword must end here (`brewx` is not one).
+        let (paren, rest) = match rest.trim_start().strip_prefix('(') {
+            Some(r) => (true, r.trim_start()),
+            None if rest.starts_with(|c: char| c.is_whitespace() || matches!(c, '"' | '\'')) => {
+                (false, rest.trim_start())
+            }
+            None => return false,
+        };
         let Some(quote) = rest.chars().next().filter(|c| matches!(c, '"' | '\'')) else {
             return false;
         };
-        // The keyword must be followed by whitespace or the quote itself (`brewx` is not one).
-        if line.len() - rest.len() == 4 && !line[4..].starts_with(quote) {
+        let Some(after) = rest[1..]
+            .strip_prefix(name)
+            .and_then(|b| b.strip_prefix(quote))
+        else {
             return false;
+        };
+        let mut after = after.trim_start();
+        if paren {
+            match after.strip_prefix(')') {
+                Some(a) => after = a.trim_start(),
+                None => return after.starts_with(','),
+            }
         }
-        let Some(body) = rest[1..].strip_prefix(name) else {
-            return false;
-        };
-        let Some(after) = body.strip_prefix(quote) else {
-            return false;
-        };
-        let after = after.trim_start();
         after.is_empty() || after.starts_with([',', '#'])
     })
 }
@@ -197,19 +210,59 @@ mod tests {
 
     #[test]
     fn brewfile_has_ignores_comments_and_matches_options() {
-        assert!(!brewfile_has("# brew \"tuicr\"\n", "tuicr"));
-        assert!(brewfile_has("brew \"tuicr\", link: false\n", "tuicr"));
-        assert!(!brewfile_has("brew \"tuicr-x\"\n", "tuicr"));
-        assert!(!brewfile_has("brew \"xtuicr\"\n", "tuicr"));
-        assert!(brewfile_has("  cask \"tuicr\" # note\n", "tuicr"));
-        assert!(brewfile_has("tap \"a/b\"\nbrew 'tuicr'\n", "tuicr"));
-        assert!(brewfile_has("brew \"tuicr\"", "tuicr"));
-        assert!(!brewfile_has("tap \"tuicr\"\n", "tuicr"));
-        assert!(!brewfile_has("brewx \"tuicr\"\n", "tuicr"));
-        assert!(!brewfile_has("brew \"owner/tap/tuicr\"\n", "tuicr"));
+        let f = |text: &str, name: &str| brewfile_has(text, BrewKind::Formula, name);
+        assert!(!f("# brew \"tuicr\"\n", "tuicr"));
+        assert!(f("brew \"tuicr\", link: false\n", "tuicr"));
+        assert!(!f("brew \"tuicr-x\"\n", "tuicr"));
+        assert!(!f("brew \"xtuicr\"\n", "tuicr"));
         assert!(brewfile_has(
-            "brew \"owner/tap/tuicr\"\n",
-            "owner/tap/tuicr"
+            "  cask \"tuicr\" # note\n",
+            BrewKind::Cask,
+            "tuicr"
         ));
+        assert!(f("tap \"a/b\"\nbrew 'tuicr'\n", "tuicr"));
+        assert!(f("brew \"tuicr\"", "tuicr"));
+        assert!(!f("tap \"tuicr\"\n", "tuicr"));
+        assert!(!f("brewx \"tuicr\"\n", "tuicr"));
+        assert!(!f("brew \"owner/tap/tuicr\"\n", "tuicr"));
+        assert!(f("brew \"owner/tap/tuicr\"\n", "owner/tap/tuicr"));
+    }
+
+    #[test]
+    fn brewfile_has_matches_only_the_asked_kind() {
+        // A formula and a cask of the same name are different packages.
+        assert!(!brewfile_has("brew \"docker\"\n", BrewKind::Cask, "docker"));
+        assert!(!brewfile_has(
+            "cask \"docker\"\n",
+            BrewKind::Formula,
+            "docker"
+        ));
+        assert!(brewfile_has(
+            "brew \"docker\"\n",
+            BrewKind::Formula,
+            "docker"
+        ));
+        assert!(brewfile_has("cask \"docker\"\n", BrewKind::Cask, "docker"));
+    }
+
+    #[test]
+    fn brewfile_has_matches_the_paren_form() {
+        let f = |text: &str| brewfile_has(text, BrewKind::Formula, "tuicr");
+        assert!(f("brew(\"tuicr\")\n"));
+        assert!(f("brew ( 'tuicr' )\n"));
+        assert!(f("brew(\"tuicr\", link: false)\n"));
+        assert!(f("brew(\"tuicr\") # note\n"));
+        assert!(brewfile_has("cask(\"tuicr\")\n", BrewKind::Cask, "tuicr"));
+        assert!(!f("brew(\"tuicr-x\")\n"));
+        assert!(!f("brew(\"tuicr\"\n"));
+        assert!(!f("cask(\"tuicr\")\n"));
+    }
+
+    #[test]
+    fn a_tap_line_does_not_make_a_short_name_count_for_the_tap_package() {
+        // Homebrew resolves an unqualified name to homebrew/core first, so `brew "x"` under
+        // `tap "owner/tap"` can install core's x on a fresh machine. The qualified line is kept.
+        let text = "tap \"owner/tap\"\nbrew \"tuicr\"\n";
+        assert!(!brewfile_has(text, BrewKind::Formula, "owner/tap/tuicr"));
     }
 }
