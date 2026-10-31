@@ -365,7 +365,8 @@ pub(crate) fn probe(
 /// it. A record of another binding is never used. A
 /// tool the provider does not list is left out, so a tool removed by hand is not installed again,
 /// and so is a tool in any other state than rolling or held (another owner, a name the adapter
-/// refuses, a failed probe): a trial never blocks another update. Returns the facts and the
+/// refuses, a failed probe), and so is a trial whose earlier operation has an open outcome: a
+/// trial never blocks another update. A declared tool keeps its own interruption rule. Returns the facts and the
 /// notes to print: one for each trial record that cannot be read or belongs to another binding,
 /// and one for each tool left out.
 fn probe_with_trials(
@@ -389,6 +390,18 @@ fn probe_with_trials(
                 .filter(|f| f.file == "trials")
                 .map(|f| format!("trials: {}; no trial tool is rolled", f.detail)),
         );
+        // A trial operation with an open outcome (an intent with no terminal entry, or an
+        // unresolved `unknown`) would block the whole run, so its trial is left out instead.
+        let journal = store.read_journal_lenient()?;
+        let open: BTreeMap<String, String> = dfm_model::state::unfinished(&journal)
+            .into_iter()
+            .chain(
+                dfm_model::state::unresolved(&journal)
+                    .into_iter()
+                    .map(|u| u.unknown),
+            )
+            .map(|e| (e.resource.clone(), e.op_id.clone()))
+            .collect();
         let resources = &mut loaded.resolved.resources;
         let declared: BTreeSet<String> = resources
             .values()
@@ -422,6 +435,13 @@ fn probe_with_trials(
                 continue;
             }
             let id = format!("trial:{}", t.trial_id);
+            if let Some(op) = open.get(&id) {
+                notes.push(format!(
+                    "trial {}: {} is not rolled (interrupted op {op}; run dfm state resolve)",
+                    t.trial_id, pkg.name
+                ));
+                continue;
+            }
             let mut value = Table::new();
             value.insert("name".into(), pkg.name.clone().into());
             value.insert("update_policy".into(), "rolling".into());

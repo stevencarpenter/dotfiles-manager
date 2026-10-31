@@ -1013,3 +1013,62 @@ fn state_check_accepts_a_trial_roll_and_reports_an_interrupted_one_without_block
     let o = fx.run(&["state", "check"]);
     assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
 }
+
+#[test]
+fn an_interrupted_trial_roll_is_a_note_and_the_declared_tools_still_roll() {
+    let fx = Fx::new();
+    fx.mise_trial();
+    // The trial roll finishes its install, but the manager never records the outcome.
+    let o = fx.update(&["--preview"]);
+    let crash = fx
+        .cmd(
+            &[("DFM_FAILPOINT", "apply-after-effect:abort")],
+            &["packages", "--update", "--yes-plan", &digest_of(&o)],
+        )
+        .output()
+        .unwrap();
+    assert!(!crash.status.success(), "{}", text(&crash.stdout));
+    let id = fx.journal().pop().unwrap()["op_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    fx.declare_jq();
+    let listed = fs::read_to_string(fx.fake.path().join("installed-mise")).unwrap();
+    fx.marker("installed-mise", &format!("{listed}jq 1.7\n"));
+    let note = |id: &str| {
+        format!(
+            "note: trial trial-duckdb: duckdb is not rolled (interrupted op {id}; run dfm state resolve)"
+        )
+    };
+    let o = fx.update(&["--preview"]);
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+    let t = text(&o.stdout);
+    assert!(t.contains(&note(&id)), "{t}");
+    assert!(!t.contains(TRIAL_OP), "{t}");
+    let o = fx.update(&["--yes-plan", &digest_of(&o)]);
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+    assert!(
+        text(&o.stdout).contains("updated extra.jq@package"),
+        "{}",
+        text(&o.stdout)
+    );
+    assert_eq!(
+        fx.mise_installs(),
+        2,
+        "the interrupted trial roll ran once only: {}",
+        fx.log()
+    );
+    // That run settled the open intent as `unknown`; it still drops the trial row.
+    let open = fx
+        .journal()
+        .into_iter()
+        .rev()
+        .find(|e| e["resource"] == "trial:trial-duckdb")
+        .unwrap();
+    assert_eq!(open["phase"], "unknown", "{open}");
+    let o = fx.update(&["--preview"]);
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+    let t = text(&o.stdout);
+    assert!(t.contains(&note(open["op_id"].as_str().unwrap())), "{t}");
+    assert!(!t.contains(TRIAL_OP), "{t}");
+}
