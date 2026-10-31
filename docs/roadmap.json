@@ -2862,6 +2862,13 @@
         6,
         null,
         null
+      ],
+      "superseded_criteria": [
+        {
+          "id": "DFM-31.C09",
+          "date": "2026-10-31",
+          "reason": "Owner decision 2026-10-31: \"I want to trial tools without it impacting any other brew update or other package manager update. It is specifically being trialed, and it should also get updated with the other packages like it were already adopted because that's the whole point!\" A trial is updated with the other packages; nothing holds an update for it (docs/trial.md, \"Updates\")."
+        }
       ]
     },
     {
@@ -3308,7 +3315,7 @@
         {
           "id": "DFM-36.C08",
           "date": "2026-10-20",
-          "reason": "Carried by the tests of the implementing leaves (DFM-22 to DFM-26, DFM-30 to DFM-34, DFM-61 to DFM-63)."
+          "reason": "Carried by the tests of the implementing leaves (DFM-22 to DFM-26, DFM-30 to DFM-34, DFM-61 to DFM-63). Its trial clause is also superseded by the owner decision of 2026-10-31: a trial is updated with the other packages, so an implicit trial version change is expected (docs/trial.md, \"Updates\")."
         },
         {
           "id": "DFM-36.C09",
