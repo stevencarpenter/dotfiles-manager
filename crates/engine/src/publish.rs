@@ -195,12 +195,12 @@ impl Dir {
     /// Replaces the regular file `name` with the link `name -> target` (`dfm adopt`), only while
     /// the file still has the fingerprint `expected_sha256` (`file_fingerprint` of its content)
     /// and `uid` owns it. A link, a directory, another hash or another owner is a conflict and
-    /// the entry is left alone. The link is staged under a hidden name, then the file is hashed
-    /// from a descriptor opened without following a link, the owner check must see that same
-    /// inode, `source_unchanged` re-reads the link's source, and `renameat` moves the link over
-    /// it. So the only copy of the bytes is replaced only while the source still holds them. As
-    /// for [`Publish::Replace`], a write between those last checks and the rename is not detected
-    /// (docs/apply.md, limits). Failure points: `link-after-tmp` (before the checks),
+    /// the entry is left alone. The link is staged under a hidden name, `source_unchanged`
+    /// re-reads the link's source, then the file is hashed from a descriptor opened without
+    /// following a link and kept open, the owner check must see that same inode, and `renameat`
+    /// moves the link over it. So the only copy of the bytes is replaced only while the source
+    /// still holds them. As for [`Publish::Replace`], a write between the last file check and the
+    /// rename is not detected (docs/apply.md, limits). Failure points: `link-after-tmp` (before the checks),
     /// `link-after-rename`.
     #[doc(hidden)]
     pub fn replace_file_with_link(
@@ -229,15 +229,18 @@ impl Dir {
         let moved = normalize_link_mode(self, &tmp)
             .and_then(|()| fail.hit("link-after-tmp"))
             .and_then(|()| {
-                let hashed = match self.hash_file(name, MAX_HASHED_BYTES)? {
-                    Some((h, ident)) if h == expected_sha256 => ident,
+                // The source is checked first, so no I/O runs between the file checks and the
+                // rename (as for `Publish::Replace`).
+                source_unchanged()?;
+                // The hashed descriptor stays open until the rename, so its inode number cannot
+                // be freed and reused by another file before the owner check compares it.
+                let (hashed, _held) = match self.hash_open(name, MAX_HASHED_BYTES)? {
+                    Some((h, ident, fd)) if h == expected_sha256 => (ident, fd),
                     _ => return Err(changed()),
                 };
-                // The owner check must see the inode that was hashed.
                 if self.require_owner(name, uid)? != hashed {
                     return Err(changed());
                 }
-                source_unchanged()?;
                 rfs::renameat(&self.fd, &tmp, &self.fd, name).map_err(|e| sys_err("rename", e))
             });
         if let Err(e) = moved {
@@ -311,11 +314,23 @@ impl Dir {
         name: &str,
         limit: u64,
     ) -> Result<Option<(String, crate::fsys::Ident)>, Refusal> {
+        Ok(self
+            .hash_open(name, limit)?
+            .map(|(hash, ident, _)| (hash, ident)))
+    }
+
+    /// As [`Dir::hash_file`], and also returns the open file, so a caller can keep the hashed
+    /// inode alive while it checks that the name still refers to it.
+    fn hash_open(
+        &self,
+        name: &str,
+        limit: u64,
+    ) -> Result<Option<(String, crate::fsys::Ident, File)>, Refusal> {
         check_name(name)?;
         let fd = match rfs::openat(
             &self.fd,
             name,
-            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::NOCTTY | OFlags::CLOEXEC,
             Mode::empty(),
         ) {
             Ok(fd) => fd,
@@ -328,14 +343,15 @@ impl Dir {
         }
         let ident = crate::fsys::ident_of(&st)?;
         let mut buf = Vec::new();
-        File::from(fd)
+        let mut file = File::from(fd);
+        (&mut file)
             .take(limit.saturating_add(1))
             .read_to_end(&mut buf)
             .map_err(|e| crate::fsys::io("read file", &e))?;
         if u64::try_from(buf.len()).unwrap_or(u64::MAX) > limit {
             return Ok(None);
         }
-        Ok(Some((file_fingerprint(&buf), ident)))
+        Ok(Some((file_fingerprint(&buf), ident, file)))
     }
 
     /// Publishes `bytes` as the regular file `name` with `mode`: a same-directory staged file

@@ -1039,6 +1039,32 @@ fn a_file_edited_after_the_link_is_staged_is_not_replaced() {
 }
 
 #[test]
+fn a_file_edited_while_the_source_is_checked_is_not_replaced() {
+    // The source check runs before the last file check, so an edit made during it is seen.
+    let s = setup();
+    let uid = sys(&s.h).uid;
+    fs::write(s.h.0.join("f"), "old\n").unwrap();
+    let home = Dir::open_home(&sys(&s.h), &s.h.0).unwrap();
+    let f = s.h.0.join("f");
+    let e = home
+        .replace_file_with_link(
+            "f",
+            "/src/new",
+            &file_fingerprint(b"old\n"),
+            uid,
+            || {
+                fs::write(&f, "edited\n").unwrap();
+                Ok(())
+            },
+            &Fail::none(),
+        )
+        .unwrap_err();
+    assert_eq!(e.code, Code::Conflict, "{e:?}");
+    assert_eq!(fs::read_to_string(s.h.0.join("f")).unwrap(), "edited\n");
+    assert!(leftovers(&s.h.0).is_empty(), "{:?}", leftovers(&s.h.0));
+}
+
+#[test]
 fn a_directory_is_never_removed_and_nothing_is_deleted_recursively() {
     let s = setup();
     fs::create_dir_all(s.h.0.join("d/inner")).unwrap();
@@ -4461,6 +4487,46 @@ fn a_crash_between_staging_a_link_and_the_rename_leaves_no_staged_link_and_settl
         fs::read_link(s.h.0.join("l")).unwrap(),
         Path::new("/src/old")
     );
+}
+
+#[test]
+fn a_crash_between_staging_an_adopt_link_and_the_rename_keeps_the_file_and_settles_the_stage() {
+    const CHILD: &str = "DFM_APPLY_ADOPT_STAGE_CRASH_HOME";
+    const NAME: &str =
+        "a_crash_between_staging_an_adopt_link_and_the_rename_keeps_the_file_and_settles_the_stage";
+    if let Some(dir) = std::env::var_os(CHILD) {
+        // The child: stages the link over the regular file, then ends at once, as a crash does.
+        let h = Home(dir.into());
+        let store = open(&h);
+        let s = Setup { h, store };
+        let (o, root) = adopt_file_op(&s);
+        go_adopt(
+            &s,
+            &plan_in(&root, vec![o]),
+            &ids(&["x@l"]),
+            &Fail::at("link-after-tmp", Inject::Abort),
+        );
+        std::process::exit(9);
+    }
+    let Setup { h, store } = setup();
+    drop(store);
+    let status = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", NAME, "--nocapture", "--test-threads=1"])
+        .env(CHILD, &h.0)
+        .status()
+        .unwrap();
+    assert_eq!(status.signal(), Some(6), "the child must abort: {status:?}");
+    let s = Setup { store: open(&h), h };
+    assert_eq!(leftovers(&s.h.0).len(), 1, "the crash left the staged link");
+    assert_eq!(phases(&s), [Phase::Intent]);
+    let settled = recover_now(&s);
+    assert!(settled.open.is_empty(), "{:?}", settled.open);
+    assert_eq!(phases(&s), [Phase::Intent, Phase::Failed]);
+    assert!(leftovers(&s.h.0).is_empty(), "the staged link is removed");
+    // The only copy of the bytes is still the regular file.
+    let meta = fs::symlink_metadata(s.h.0.join("l")).unwrap();
+    assert!(meta.file_type().is_file());
+    assert_eq!(fs::read_to_string(s.h.0.join("l")).unwrap(), "x\n");
 }
 
 #[test]
