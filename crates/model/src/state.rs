@@ -75,6 +75,11 @@ fn parse_schemas<T: DeserializeOwned>(
     accepted: &[i64],
 ) -> Result<T, Refusal> {
     let newest = accepted.last().copied().unwrap_or(SCHEMA);
+    let supported = accepted
+        .iter()
+        .map(i64::to_string)
+        .collect::<Vec<_>>()
+        .join(", ");
     if bytes.len() > MAX_BYTES {
         return Err(Refusal::new(
             Code::LimitExceeded,
@@ -89,23 +94,23 @@ fn parse_schemas<T: DeserializeOwned>(
             .flatten()
             .filter(|n| *n > newest.unsigned_abs());
         match newer_n {
-            Some(n) => newer(kind, &n.to_string(), newest),
+            Some(n) => newer(kind, &n.to_string(), &supported),
             None => bad(format!("{kind} is not valid JSON: {e}")),
         }
     })?;
     let schema = v.get("schema");
     match schema.and_then(serde_json::Value::as_i64) {
         Some(n) if accepted.contains(&n) => {}
-        Some(n) if n > newest => return Err(newer(kind, &n.to_string(), newest)),
+        Some(n) if n > newest => return Err(newer(kind, &n.to_string(), &supported)),
         Some(n) => {
             return Err(Refusal::new(
                 Code::SchemaUnsupported,
-                format!("{kind} schema {n} is not supported (supported: {newest})"),
+                format!("{kind} schema {n} is not supported (supported: {supported})"),
             ));
         }
         // An integer above `i64::MAX` is a schema this binary has never heard of: newer.
         None => match schema.and_then(serde_json::Value::as_u64) {
-            Some(n) => return Err(newer(kind, &n.to_string(), newest)),
+            Some(n) => return Err(newer(kind, &n.to_string(), &supported)),
             None => return Err(bad(format!("{kind} has no integer schema"))),
         },
     }
@@ -155,10 +160,10 @@ fn deep_schema(b: &[u8]) -> Option<u64> {
     None
 }
 
-fn newer(kind: &str, n: &str, newest: i64) -> Refusal {
+fn newer(kind: &str, n: &str, supported: &str) -> Refusal {
     Refusal::new(
         Code::StateNewer,
-        format!("{kind} schema {n} is newer than this binary supports (supported: {newest})"),
+        format!("{kind} schema {n} is newer than this binary supports (supported: {supported})"),
     )
 }
 
@@ -2144,6 +2149,13 @@ mod tests {
         assert!(old.validate().is_err(), "schema 2 refuses `adopted`");
         let text = String::from_utf8(canonical(&old).unwrap()).unwrap();
         assert!(TrialRecord::parse(text.as_bytes()).is_err());
+
+        // A schema the binary does not read names both trial schemas it does read.
+        for (n, code) in [(1, Code::SchemaUnsupported), (9, Code::StateNewer)] {
+            let e = TrialRecord::parse(format!("{{\"schema\":{n}}}").as_bytes()).unwrap_err();
+            assert_eq!(e.code, code, "{n}");
+            assert!(e.detail.ends_with("(supported: 2, 3)"), "{n}: {}", e.detail);
+        }
 
         for bad in ["Bad Id", ""] {
             let mut b = t.clone();
