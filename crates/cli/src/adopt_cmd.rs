@@ -55,23 +55,51 @@ fn io_failed(what: &str, e: &std::io::Error) -> Refusal {
     Refusal::new(Code::IoFailed, format!("{what}: {}", e.kind()))
 }
 
+/// A path as text for a tool's arguments. A non-UTF-8 path blocks the run before any write.
 fn text(p: &Path) -> Result<&str, Refusal> {
     p.to_str().ok_or_else(|| {
-        crate::usage(format!(
-            "{} is not a UTF-8 path; adopt passes paths to its tools as text",
+        conflict(format!(
+            "{} is not a UTF-8 path; adopt passes paths to its tools as text, and nothing was changed",
             p.display()
         ))
     })
 }
 
 /// Removes the scan directory on every exit, an error and a stop included. A failure to remove
-/// is dropped: the scan result decides the run. A SIGKILL leaves the directory behind; it stays
-/// 0700 with 0600 files under the manager's cache directory.
+/// is dropped: the scan result decides the run. A SIGKILL leaves the directory behind, 0700 with
+/// 0600 files under the manager's cache directory, until the next scan removes it
+/// ([`sweep_dead`]).
 struct Cleanup(PathBuf);
 
 impl Drop for Cleanup {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
+/// Removes the `<pid>-<ns>` scan directories in `scan_dir` whose process is gone, which a
+/// SIGKILL leaves behind (`Cleanup` never ran). Only a real directory of `uid` is removed, never
+/// through a link, and only when `kill(pid, 0)` reports no such process; a live process of
+/// any user keeps its directory. A failure is dropped, as in `Cleanup`.
+fn sweep_dead(scan_dir: &Path, uid: u32) {
+    let Ok(entries) = fs::read_dir(scan_dir) else {
+        return;
+    };
+    for e in entries.flatten() {
+        let name = e.file_name();
+        let Some(pid) = name
+            .to_str()
+            .and_then(|n| n.split_once('-'))
+            .filter(|(_, ns)| ns.parse::<u64>().is_ok())
+            .and_then(|(pid, _)| pid.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        let path = e.path();
+        let mine = fs::symlink_metadata(&path).is_ok_and(|m| m.is_dir() && m.uid() == uid);
+        if mine && dfm_engine::signal::process_gone(pid) {
+            let _ = fs::remove_dir_all(&path);
+        }
     }
 }
 
@@ -93,12 +121,14 @@ pub(crate) fn scan(
             .create(p)
             .map_err(|e| io_failed(&format!("create {}", p.display()), &e))
     };
+    // Checked before anything is created: every path below is passed to gitleaks as text.
+    text(scan_dir)?;
     private(scan_dir, true)?;
     let parent = fs::symlink_metadata(scan_dir)
         .map_err(|e| io_failed(&format!("read {}", scan_dir.display()), &e))?;
     if !parent.is_dir() || parent.uid() != runner.uid {
-        return Err(failed(format!(
-            "{} is not a directory of yours",
+        return Err(conflict(format!(
+            "{} is not a directory of yours; nothing was changed",
             scan_dir.display()
         )));
     }
@@ -106,6 +136,7 @@ pub(crate) fn scan(
         fs::set_permissions(scan_dir, fs::Permissions::from_mode(0o700))
             .map_err(|e| io_failed(&format!("protect {}", scan_dir.display()), &e))?;
     }
+    sweep_dead(scan_dir, runner.uid);
     let run = scan_dir.join(format!("{}-{}", std::process::id(), now_ns()?));
     private(&run, false)?;
     let _cleanup = Cleanup(run.clone());
@@ -152,14 +183,23 @@ pub(crate) fn scan(
     ]
     .map(String::from)
     .into();
-    let out = runner.run(&ProcRequest {
-        program: "gitleaks",
-        args: &args,
-        env: &[],
-        stdin: None,
-        timeout: SCAN_TIMEOUT,
-        max_stdout: MAX_REPORT,
-    })?;
+    let out = runner
+        .run(&ProcRequest {
+            program: "gitleaks",
+            args: &args,
+            env: &[],
+            stdin: None,
+            timeout: SCAN_TIMEOUT,
+            max_stdout: MAX_REPORT,
+        })
+        .map_err(|e| {
+            // A report that does not fit cannot be read as clean.
+            if e.code == Code::LimitExceeded {
+                failed("the gitleaks report is larger than 16 MiB")
+            } else {
+                e
+            }
+        })?;
     match out.end {
         End::Exited(0) => Ok(Vec::new()),
         End::Exited(LEAKS) => {
@@ -2066,6 +2106,97 @@ mod tests {
     }
 
     #[test]
+    fn a_candidate_named_like_its_number_is_copied_once() {
+        let base = scratch("base-i");
+        let r = fake(&base);
+        let parent = base.join("adopt-scan");
+        let input = files(&[("/h/0", "FAKE_SECRET"), ("/h/x/1", "clean")]);
+        assert_eq!(scan(&r, &parent, &input).unwrap(), ["/h/0"]);
+        assert_eq!(leftovers(&parent), 0);
+    }
+
+    #[test]
+    fn an_oversize_report_is_a_failed_scan() {
+        let base = scratch("huge");
+        let r = fake(&base);
+        let parent = base.join("adopt-scan");
+        fs::write(base.join("gitleaks-huge"), "").unwrap();
+        let e = scan(&r, &parent, &files(&[("/h/a", "x")])).unwrap_err();
+        assert_eq!(e.code, Code::ProbeFailed, "{e:?}");
+        assert_eq!(leftovers(&parent), 0);
+    }
+
+    #[test]
+    fn a_scan_directory_of_another_user_is_a_conflict() {
+        let base = scratch("foreign");
+        let mut r = fake(&base);
+        r.uid += 1;
+        let e = scan(&r, &base.join("adopt-scan"), &files(&[("/h/a", "x")])).unwrap_err();
+        assert_eq!(e.code, Code::Conflict, "{e:?}");
+        assert_eq!(e.code.exit(), Exit::Blocked);
+    }
+
+    #[test]
+    fn a_non_utf8_path_is_blocked_before_any_write() {
+        use std::os::unix::ffi::OsStrExt;
+        let base = scratch("utf8");
+        let r = fake(&base);
+        let odd = base.join(std::ffi::OsStr::from_bytes(b"cache-\xff"));
+        let e = scan(&r, &odd.join("adopt-scan"), &files(&[("/h/a", "x")])).unwrap_err();
+        assert_eq!(e.code.exit(), Exit::Blocked, "{e:?}");
+        assert!(!odd.exists());
+        assert!(!base.join("log").exists(), "gitleaks did not run");
+        let git = git_for(&base.join("home"));
+        let e = dirty(&git, &odd, &["x"]).unwrap_err();
+        assert_eq!(e.code.exit(), Exit::Blocked, "{e:?}");
+        let e = inside_git_tree(&git, &odd, "x").unwrap_err();
+        assert_eq!(e.code.exit(), Exit::Blocked, "{e:?}");
+    }
+
+    #[test]
+    fn a_scan_removes_the_directories_of_dead_scans_only() {
+        let base = scratch("sweep");
+        let r = fake(&base);
+        let parent = base.join("adopt-scan");
+        // A reaped child: its pid names no process now.
+        let mut child = Command::new("/usr/bin/true").spawn().unwrap();
+        child.wait().unwrap();
+        let dead = child.id();
+        let me = std::process::id();
+        for name in [
+            format!("{dead}-1"),
+            format!("{me}-2"),
+            "1-3".to_string(),
+            "notes".to_string(),
+        ] {
+            fs::create_dir_all(parent.join(&name).join("files")).unwrap();
+            fs::write(parent.join(&name).join("files/x"), "left").unwrap();
+        }
+        // A file and a link with a dead pid's name are not scan directories.
+        fs::write(parent.join(format!("{dead}-4")), "").unwrap();
+        std::os::unix::fs::symlink(base.join("bin"), parent.join(format!("{dead}-5"))).unwrap();
+        scan(&r, &parent, &files(&[("/h/a", "x")])).unwrap();
+        let mut left: Vec<String> = fs::read_dir(&parent)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        left.sort();
+        let mut want = vec![
+            format!("{me}-2"),
+            "1-3".to_string(),
+            format!("{dead}-4"),
+            format!("{dead}-5"),
+            "notes".to_string(),
+        ];
+        want.sort();
+        assert_eq!(left, want, "only the dead scan's directory is removed");
+        assert!(
+            base.join("bin/gitleaks").is_file(),
+            "a link is not followed"
+        );
+    }
+
+    #[test]
     fn a_report_that_cannot_be_mapped_is_a_failed_scan() {
         let names = ["/h/a".to_string()];
         let ok = |j: &str| findings(j.as_bytes(), Path::new("/s/files"), &names);
@@ -2118,11 +2249,18 @@ mod tests {
             ("/h/.config/tool/x.svg", key),
             ("/h/package-lock.json", key),
             ("/h/other/.gitleaks.toml", key),
+            // A config beside the key in the same directory allowlists nothing either.
+            (
+                "/h/.config/near/.gitleaks.toml",
+                "[allowlist]\nregexes = [\".*\"]\npaths = [\".*\"]\n",
+            ),
+            ("/h/.config/near/key", key),
         ]);
         let hits = scan(&r, &parent, &input).unwrap();
         assert_eq!(
             hits,
             [
+                "/h/.config/near/key",
                 "/h/.config/tool/cert.p12",
                 "/h/.config/tool/commented",
                 "/h/.config/tool/credentials",

@@ -103,6 +103,7 @@ here=$(dirname "$0")
 printf 'gitleaks %s\n' "$*" >> "$here/../log"
 ls -ld "$2" | cut -c1-10 >> "$here/../log"
 [ -e "$here/../gitleaks-fail" ] && { echo "PLANTED-STDERR" >&2; exit 1; }
+[ -e "$here/../gitleaks-huge" ] && { head -c 17000000 /dev/zero; exit 3; }
 rc=0; sep=""; printf '['
 for f in "$2"/*/*; do
   [ -f "$f" ] || continue

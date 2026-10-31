@@ -59,7 +59,7 @@ Order of one run:
 | 0 | Adopted: the repo files, the links and the ended trial. |
 | 1 | A failure after the first journal entry. The repo writes that happened stay; the receipt lists them. |
 | 2 | Usage. A `--root` that does not exist (`E_REPORT_UNAVAILABLE`, as for `plan` and `apply`). |
-| 3 | Refused before any write: approval missing, stale digest, a refusal in steps 1 to 7, lock held, not bound. |
+| 3 | Refused before any write: approval missing, stale digest, a refusal in steps 1 to 7, lock held, not bound, a cache or root path that is not UTF-8. |
 | 130, 143 | A stop request. A child (`gitleaks`, `git`, `brew`) is ended. |
 
 ## Interruption
@@ -85,7 +85,7 @@ The owner runs the same command again after a stop (exit 1, 130, 143, or a kille
 
 ## The secret scan
 
-`gitleaks dir` reads `.gitleaks.toml` and `.gitleaksignore` from the scanned directory, and a planted config could allowlist everything. Adopt therefore scans a copy under `<cache dir>/adopt-scan/<pid>-<ns>/` (0700, files 0600, removed on every exit but SIGKILL):
+`gitleaks dir` reads `.gitleaks.toml` and `.gitleaksignore` from the scanned directory, and a planted config could allowlist everything. Adopt therefore scans a copy under `<cache dir>/adopt-scan/<pid>-<ns>/` (0700, files 0600, removed on every exit but SIGKILL). Before each scan, a `<pid>-<ns>` directory of the current user whose process is gone (`kill(pid, 0)` answers `ESRCH`; no signal is sent) is removed, so a killed run leaves its copy only until the next scan. A scan directory of another user is `E_CONFLICT`, and a report larger than 16 MiB is `E_PROBE_FAILED`:
 
 - Each candidate is written twice in `files/<i>/`: as `<i>`, so the default path allowlist cannot skip its content, and under its base name, so name rules (`cert.p12`) still apply.
 - No `--config` is passed (an empty one disables the default rules), the runner clears the environment (no `GITLEAKS_CONFIG`), and `--gitleaks-ignore-path` names an empty directory.
