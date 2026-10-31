@@ -362,9 +362,11 @@ pub(crate) fn probe(
 /// holds `:`), and gets the declared tool's probe, plan row, journaled upgrade and accounting.
 /// Each tool rolls once: a tool a declared `mise/v1` resource names is rolled by that resource,
 /// and a tool of two trials by the first record. A record of another binding is never used. A
-/// tool the provider does not list is left out, so a tool removed by hand is not installed again.
-/// Returns the facts and the notes to print: one for each trial record that cannot be read or
-/// belongs to another binding, which blocks nothing, and one for each tool left out.
+/// tool the provider does not list is left out, so a tool removed by hand is not installed again,
+/// and so is a tool in any other state than rolling or held (another owner, a name the adapter
+/// refuses, a failed probe): a trial never blocks another update. Returns the facts and the
+/// notes to print: one for each trial record that cannot be read or belongs to another binding,
+/// and one for each tool left out.
 fn probe_with_trials(
     ctx: &Ctx,
     sys: &Sys,
@@ -446,23 +448,26 @@ fn probe_with_trials(
         }
     }
     let mut probed = probe(ctx, sys, args, loaded)?;
+    // A trial must never block another update: only a tool the provider lists and the
+    // declared rules roll or hold keeps its row. Any other state is a note.
     for (id, trial, name) in added {
-        if matches!(
-            probed.package.get(&id),
+        let why = match probed.package.get(&id) {
+            Some(PackageState::Rolling(_) | PackageState::Held(_)) => continue,
             Some(
                 PackageState::Missing(_)
-                    | PackageState::Upgrades(_)
-                    | PackageState::Unofficial(_)
-                    | PackageState::SourceBuild(_)
-            )
-        ) {
-            loaded.resolved.resources.remove(&id);
-            probed.package.remove(&id);
-            notes.push(format!(
-                "trial {trial}: {name} is not installed by {}; it is not installed again",
+                | PackageState::Upgrades(_)
+                | PackageState::Unofficial(_)
+                | PackageState::SourceBuild(_),
+            ) => format!(
+                "{name} is not installed by {}; it is not installed again",
                 package::MISE
-            ));
-        }
+            ),
+            Some(other) => format!("{name} is not rolled ({})", other.state()),
+            None => format!("{name} is not rolled (not probed)"),
+        };
+        loaded.resolved.resources.remove(&id);
+        probed.package.remove(&id);
+        notes.push(format!("trial {trial}: {why}"));
     }
     Ok((probed, notes))
 }

@@ -852,3 +852,73 @@ fn a_trial_id_equal_to_a_manifest_resource_id_still_rolls() {
     );
     assert_eq!(fx.mise_installs(), 2, "{}", fx.log());
 }
+
+impl Fx {
+    /// A declared rolling mise tool `jq`, installed: the update a trial must never block.
+    fn declare_jq(&self) {
+        self.put(
+            "base/modules/extra/module.toml",
+            &format!(
+                "{}\n[[resources]]\nid = \"jq\"\nkind = \"package\"\nadapter = \"mise/v1\"\n[resources.value]\nname = \"jq\"\nupdate_policy = \"rolling\"\n",
+                common::EXTRA
+            ),
+        );
+    }
+
+    fn set_trial_package_name(&self, name: &str) {
+        let path = self.state().join("trials/trial-duckdb.json");
+        let mut t = self.json(&path);
+        t["package"]["name"] = name.into();
+        fs::write(&path, serde_json::to_vec(&t).unwrap()).unwrap();
+    }
+
+    /// `packages --update` previewed and approved: the declared `jq` is updated, the trial has
+    /// no row and the note names why.
+    fn update_rolls_jq_and_notes(&self, note: &str) {
+        let o = self.update(&["--preview"]);
+        assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+        let t = text(&o.stdout);
+        assert!(t.contains(note), "{t}");
+        assert!(!t.contains("trial:trial-duckdb@package"), "{t}");
+        let o = self.update(&["--yes-plan", &digest_of(&o)]);
+        assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+        let t = text(&o.stdout);
+        assert!(t.contains("updated extra.jq@package"), "{t}");
+        assert!(t.contains("counts: updated=1 "), "{t}");
+    }
+}
+
+#[test]
+fn a_trial_tool_with_another_owner_is_a_note_and_blocks_no_other_update() {
+    let fx = Fx::new();
+    fx.mise_trial();
+    fx.declare_jq();
+    // duckdb removed by hand, and another copy on the way.
+    fx.marker("installed-mise", "jq 1.7\n");
+    let other = fx.home.path().join(".local/bin");
+    fs::create_dir_all(&other).unwrap();
+    fs::write(other.join("duckdb"), "#!/bin/sh\n").unwrap();
+    fs::set_permissions(other.join("duckdb"), fs::Permissions::from_mode(0o755)).unwrap();
+    fx.update_rolls_jq_and_notes("note: trial trial-duckdb: duckdb is not rolled (other-owner:");
+}
+
+#[test]
+fn a_trial_record_with_a_name_the_adapter_refuses_is_a_note_and_blocks_no_other_update() {
+    let fx = Fx::new();
+    fx.mise_trial();
+    fx.declare_jq();
+    fx.marker("installed-mise", "duckdb 2.0.0\njq 1.7\n");
+    fx.set_trial_package_name("duckdb@lts");
+    fx.update_rolls_jq_and_notes("note: trial trial-duckdb: duckdb@lts is not rolled (refused:");
+}
+
+#[test]
+fn a_trial_tool_the_provider_cannot_list_is_a_note_and_blocks_no_other_update() {
+    let fx = Fx::new();
+    fx.mise_trial();
+    fx.declare_jq();
+    fx.marker("installed-mise", "duckdb 2.0.0\njq 1.7\n");
+    // The look-alike's `mise ls` exits 1 for this name, as for a removed plugin.
+    fx.set_trial_package_name("zzz-unknown");
+    fx.update_rolls_jq_and_notes("note: trial trial-duckdb: zzz-unknown is not rolled (unknown:");
+}
