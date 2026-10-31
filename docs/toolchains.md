@@ -8,7 +8,8 @@
 | `maintain` (the update view of a probe), `upgrade`, `update_facts` | `crates/cli/src/adapters/package.rs` |
 | Execution (`try_install` runs an `upgrade` as it runs an `install`) | `crates/engine/src/apply.rs` |
 | `packages --update` | `crates/cli/src/apply_cmd.rs`, `crates/cli/src/lib.rs` |
-| Tests with `mise`, `uv` and `brew` look-alikes | `crates/cli/tests/toolchains.rs` |
+| Tests with `mise`, `uv` and `brew` look-alikes | `crates/cli/tests/toolchains.rs`; trial tools in `crates/cli/tests/trial.rs` |
+| Trial tools under `--update` (`probe_with_trials`) | `crates/cli/src/apply_cmd.rs` |
 
 Two provider paths are built: mise (runtimes and tools from mise's registry and backends, by the name mise takes) and uv tools by package-index name. A uv tool from a Git origin or a local path is not built. It needs origin trust ([docs/sync.md](sync.md)) and a source identity the manager can record. Declared, it is `E_MANIFEST_INVALID`. Installed that way by hand, it is held under `--update`.
 
@@ -43,6 +44,18 @@ A tool the provider does not list is planned as docs/packages.md plans it: `inst
 **Identities.** The plan row reports the declared identity (`name`, `update_policy`, the adapter) and the installed identity (every version the provider lists for the name, in the provider's order; a prefix such as `go@1.27` lists the versions that match). The selected identity is the provider's decision: mise selects per directory from its configuration, which the manager does not evaluate before approval, and uv keeps one version per tool.
 
 **Interruption.** An interrupted upgrade follows the packages rule (docs/packages.md, "Interrupted install"). The installed versions, old and new, stay listed (test `an_interrupted_upgrade_keeps_the_installed_versions_and_blocks_until_resolved`).
+
+## Trials
+
+By the owner's decision of 2026-10-31, a trial is updated as if it were already adopted. `packages --update` reads the trial records (`state/trials/`) and adds the tool of each active trial whose `package.adapter` is `mise/v1` to the plan as a rolling tool. The resource id is the trial id, so the row is `<trial-id>@package`. The tool is `package.name` from the record. It gets the probe, the plan row, the `mise install <tool>@latest` (or `@<prefix>`), the journaled operation and the `updated` or `current` accounting of a declared rolling tool, and the held and blocked rules of the table above.
+
+- **Adopted.** A trial whose record has `adopted` is not active. Its tool is not rolled from the record. The module that took it declares it.
+- **Declared too.** A tool that a declared `mise/v1` resource names (the same tool, any version) is rolled once, by the declared resource and its policy.
+- **Not installed.** A trial tool the provider does not list is left out of the plan with the note `trial <id>: <name> is not installed by mise/v1; it is not installed again`. A tool removed by hand stays removed.
+- **Unreadable record.** A record that cannot be read blocks nothing. Its tool is not rolled, and the output has the note `trial record <file> cannot be read (<detail>); its tool is not rolled`. A trials directory that cannot be listed gives one note and rolls no trial tool.
+- **`sync`.** `sync` runs `packages` without `--update` (docs/sync.md), so it rolls no mise tool, declared or trial. A Homebrew trial is upgraded by the `brew` updater (docs/upgrade.md, "Trials").
+
+The notes print after the plan and are not part of the digest. A trial tool is part of the plan, so a trial started or removed between the preview and the approval changes the digest (`E_PLAN_STALE`).
 
 ## Upgrading mise or uv themselves
 

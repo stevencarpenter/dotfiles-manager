@@ -51,7 +51,7 @@ A failure note gives the command, its exit code and the size of its standard err
 
 ## Trials
 
-A trial does not hold `brew`. The owner's decision of 2026-10-31 replaces DFM-31.C09: a tool is trialed without an effect on any other update, and it is updated with the other packages as if it were already adopted. `brew` runs as if no trial existed and upgrades a trial's formula or cask with every other outdated package. No updater reads the trial records, so an unreadable record or an interrupted trial write does not change the run. A missing trials directory still refuses the whole run before any scope, as state loss (`E_STORAGE_INVALID`): the store refuses every writer on a missing state directory (docs/state.md).
+A trial does not hold `brew`. The owner's decision of 2026-10-31 replaces DFM-31.C09: a tool is trialed without an effect on any other update, and it is updated with the other packages as if it were already adopted. `brew` runs as if no trial existed and upgrades a trial's formula or cask with every other outdated package. No updater reads the trial records, so an unreadable record or an interrupted trial write does not change the run. A missing trials directory still refuses the whole run before any scope, as state loss (`E_STORAGE_INVALID`): the store refuses every writer on a missing state directory (docs/state.md). A `mise/v1` trial is rolled by `dfm packages --update`, not by `sync` (docs/toolchains.md, "Trials").
 
 ## In sync
 

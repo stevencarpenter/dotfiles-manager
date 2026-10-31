@@ -61,9 +61,18 @@ Order of one run:
 
 The optional fields `package` and `unknown` need no schema bump: a record without them (for example, one the test harness `__record-trial` writes) still reads. `adopted` is different: the record type refuses unknown keys, so an adopted record is schema 3 and an unadopted record stays schema 2. The validator accepts 2 and 3, refuses `adopted` on schema 2, and requires it on schema 3. A binary that predates schema 3 reports an adopted record as `E_STATE_NEWER`.
 
-A trial is **active** until its record has `adopted`. An adopted record stays as evidence and keeps its id taken (a second trial of that id is `E_CONFLICT`). Readers that mean "in progress" skip it: `doctor` lists no row for it. `state check` still validates and counts it.
+A trial is **active** until its record has `adopted`. An adopted record stays as evidence and keeps its id taken (a second trial of that id is `E_CONFLICT`). Readers that mean "in progress" skip it: `doctor` lists no row for it, and `packages --update` does not roll its tool from the record. `state check` still validates and counts it.
 
 The record is a private file under `state/trials/`. `state check` validates it with the other documents and counts it (`trials: N (M unreadable)`). `doctor` and `status` show an unreadable or foreign-identity record as a WARN row. An interrupted install follows the packages rule (docs/packages.md, "Interrupted install"): `state check` reports `E_OP_INTERRUPTED`, `state recover` leaves it `unknown`, and `state resolve <op_id> --as failed` settles it.
+
+## Updates
+
+A trial is updated with the other packages as if it were already adopted (the owner's decision of 2026-10-31). Nothing holds an update for a trial.
+
+- **Homebrew.** `sync`'s `brew` updater upgrades a trial's formula or cask with every other outdated package (docs/upgrade.md, "Trials").
+- **mise.** `dfm packages --update` rolls the tool of each active `mise/v1` trial as a declared rolling tool (docs/toolchains.md, "Trials"). `sync` runs `packages` without `--update`, so it rolls no mise tool, declared or trial.
+
+The record is not changed by an update. It keeps what the trial saw at its start.
 
 ## Decisions
 

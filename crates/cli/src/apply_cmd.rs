@@ -9,15 +9,16 @@
 //! and only then hands the plan to the engine. Without an approval it prints the plan and
 //! changes nothing.
 
-use crate::adapters::Generators;
+use crate::adapters::{Generators, package};
 use crate::plan_cmd::{Probed, plan_for, render};
 use crate::{Ctx, load_resolved, paint, require_binding, state_cmd, usage};
 use dfm_engine::{
-    Approval as Allowance, Dir, Generator, Run, Store, Sys, apply, check_allowances,
+    Approval as Allowance, Dir, Fail, Generator, Run, Store, Sys, apply, check_allowances,
     check_journal_capacity, gates, now_ns,
 };
 use dfm_model::display::{visible, visible_for_paste};
-use dfm_model::plan::{Action, Ownership, Plan, Scope, Status as PlanStatus};
+use dfm_model::plan::{Action, Ownership, PackageState, Plan, Scope, Status as PlanStatus};
+use dfm_model::resolve::{ResolvedResource, Table, Value};
 use dfm_model::state::{
     Approval, BinaryId, DisruptiveApproval, ProfileRef, Receipt, RunResult, SCHEMA, SourceId,
     Stamp, Status, count_statuses, rfc3339,
@@ -355,6 +356,110 @@ pub(crate) fn probe(
     Ok(probed)
 }
 
+/// [`probe`], and under `packages --update` each active `mise/v1` trial's tool rolled as if it
+/// were adopted (the owner's decision of 2026-10-31, docs/toolchains.md "Trials"): the tool joins
+/// `loaded` as a rolling package whose resource id is the trial id, and gets the declared tool's
+/// probe, plan row, journaled upgrade and accounting. A tool a declared `mise/v1` resource names
+/// is rolled by that resource alone. A tool the provider does not list is left out, so a tool
+/// removed by hand is not installed again. Returns the facts and the notes to print: one for each
+/// trial record that cannot be read, which blocks nothing, and one for each tool left out.
+fn probe_with_trials(
+    ctx: &Ctx,
+    sys: &Sys,
+    args: &Args,
+    loaded: &mut crate::Loaded,
+) -> Result<(Probed, Vec<String>), Refusal> {
+    if !(args.scope == Scope::Packages && args.update) {
+        return Ok((probe(ctx, sys, args, loaded)?, Vec::new()));
+    }
+    let mut notes = Vec::new();
+    let mut added = Vec::new();
+    // Without state the plan refuses below, as it does without a trial.
+    if let Some(store) = Store::open_read(*sys, &ctx.layout(), Fail::none())? {
+        let state = store.load();
+        notes.extend(
+            state
+                .problems
+                .iter()
+                .filter(|f| f.file == "trials")
+                .map(|f| format!("trials: {}; no trial tool is rolled", f.detail)),
+        );
+        let resources = &mut loaded.resolved.resources;
+        let declared: BTreeSet<String> = resources
+            .values()
+            .filter(|r| r.kind == "package" && r.adapter == package::MISE)
+            .filter_map(|r| r.value.get("name")?.as_str())
+            .map(|n| package::tool_and_version(n).0.to_string())
+            .collect();
+        for (file, t) in state.trials {
+            let t = match t {
+                Ok(t) => t,
+                Err(e) => {
+                    notes.push(format!(
+                        "trial record {file} cannot be read ({}); its tool is not rolled",
+                        e.detail
+                    ));
+                    continue;
+                }
+            };
+            let Some(pkg) = t.package.as_ref().filter(|p| p.adapter == package::MISE) else {
+                continue;
+            };
+            if !t.is_active()
+                || declared.contains(package::tool_and_version(&pkg.name).0)
+                || resources.contains_key(&t.trial_id)
+            {
+                continue;
+            }
+            let mut value = Table::new();
+            value.insert("name".into(), pkg.name.clone().into());
+            value.insert("update_policy".into(), "rolling".into());
+            resources.insert(
+                t.trial_id.clone(),
+                ResolvedResource {
+                    id: t.trial_id.clone(),
+                    module: "trial".into(),
+                    declared_in: format!("state/trials/{file}"),
+                    kind: "package".into(),
+                    adapter: package::MISE.into(),
+                    target: None,
+                    value: Value::Table(value),
+                    defaults: Vec::new(),
+                    extensions: Vec::new(),
+                    secret_values: false,
+                    sensitive: false,
+                    native_document: false,
+                    provenance: BTreeMap::new(),
+                    claims: Vec::new(),
+                    dir_claims: Vec::new(),
+                    precedence: None,
+                },
+            );
+            added.push((t.trial_id, pkg.name.clone()));
+        }
+    }
+    let mut probed = probe(ctx, sys, args, loaded)?;
+    for (id, name) in added {
+        if matches!(
+            probed.package.get(&id),
+            Some(
+                PackageState::Missing(_)
+                    | PackageState::Upgrades(_)
+                    | PackageState::Unofficial(_)
+                    | PackageState::SourceBuild(_)
+            )
+        ) {
+            loaded.resolved.resources.remove(&id);
+            probed.package.remove(&id);
+            notes.push(format!(
+                "trial {id}: {name} is not installed by {}; it is not installed again",
+                package::MISE
+            ));
+        }
+    }
+    Ok((probed, notes))
+}
+
 /// A restart request must name a service of the plan, as an approval flag must name an
 /// operation: a misspelled id would otherwise be ignored.
 pub(crate) fn check_restart(restart: &BTreeSet<String>, plan: &Plan) -> Result<(), Refusal> {
@@ -434,15 +539,18 @@ fn run_inner(
         arm()?;
     }
     // Read-only look first. A refusal here changes nothing, not even the lock file.
-    let first = load_resolved(ctx, root)?;
+    let mut first = load_resolved(ctx, root)?;
     let (layout, sys) = (ctx.layout(), ctx.sys()?);
     // A packages or services plan needs the providers' answers first.
-    let probes = |loaded| probe(ctx, &sys, args, loaded);
+    let probes = |loaded: &mut crate::Loaded| probe_with_trials(ctx, &sys, args, loaded);
     let fresh;
+    let mut notes = Vec::new();
     let plan = match &args.planned {
         Some(p) => p,
         None => {
-            fresh = plan_for(ctx, &first, args.scope, probes(&first)?)?;
+            let probed;
+            (probed, notes) = probes(&mut first)?;
+            fresh = plan_for(ctx, &first, args.scope, probed)?;
             &fresh
         }
     };
@@ -454,6 +562,9 @@ fn run_inner(
             writeln!(out, "isolated: true {i}").map_err(w)?;
         }
         render(plan, &digest, ctx.color, out).map_err(w)?;
+        for n in &notes {
+            writeln!(out, "note: {}", visible(n)).map_err(w)?;
+        }
         progress.plan_printed = true;
     }
     let generators = |loaded| generators_for(ctx, &sys, args.scope, loaded);
@@ -492,8 +603,8 @@ fn run_inner(
     store
         .require_identity(&binding)
         .map_err(|r| store.stamp(r))?;
-    let second = load_resolved(ctx, root).map_err(|r| store.stamp(r))?;
-    let facts = probes(&second).map_err(|r| store.stamp(r))?;
+    let mut second = load_resolved(ctx, root).map_err(|r| store.stamp(r))?;
+    let (facts, _) = probes(&mut second).map_err(|r| store.stamp(r))?;
     let locked = plan_for(ctx, &second, args.scope, facts).map_err(|r| store.stamp(r))?;
     stop().map_err(|r| store.stamp(r))?;
     let locked_digest = locked.digest().map_err(|r| store.stamp(r))?;

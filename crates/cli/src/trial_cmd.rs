@@ -113,8 +113,9 @@ pub fn parse_args(args: &[String]) -> Result<Args, Refusal> {
 fn package_value(name: &str) -> Value {
     let mut t = Table::new();
     t.insert("name".into(), Value::String(name.into()));
-    // A trial never rolls: the package adapters require the policy and `hold` is the one a
-    // baseline can stand behind.
+    // The trial's own plan only installs: the package adapters require a policy, and `hold` is
+    // the one a baseline can stand behind. Updates come later, as for an adopted tool: `brew` in
+    // sync (docs/upgrade.md) and `packages --update` for mise (docs/toolchains.md).
     t.insert("update_policy".into(), Value::String("hold".into()));
     Value::Table(t)
 }

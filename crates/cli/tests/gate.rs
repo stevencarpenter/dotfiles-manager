@@ -458,7 +458,7 @@ fn only_the_mutating_path_of_apply_installs_the_signal_handlers() {
     assert_eq!(arms.len(), 2, "{arms:?}");
     // The scopes that start a provider child arm before the first child (the first plan).
     assert!(t.find("if args.scope != Scope::Config {").unwrap() < arms[0]);
-    assert!(arms[0] < t.find("let first = load_resolved(").unwrap());
+    assert!(arms[0] < t.find("first = load_resolved(").unwrap());
     // `apply` arms after the lock and the second plan (which runs `id -u`), before the first write.
     assert!(t.find("if args.scope == Scope::Config {").unwrap() < arms[1]);
     assert!(t.find("if args.preview {").unwrap() < arms[1]);

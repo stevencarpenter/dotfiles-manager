@@ -622,3 +622,140 @@ fn a_tool_name_that_cannot_be_a_trial_id_is_a_usage_error() {
     assert_eq!(code(&o), 2, "{}", stderr(&o));
     assert!(!fx.log().contains("brew"), "no provider ran: {}", fx.log());
 }
+
+// ---- `packages --update` rolls an active mise trial (owner decision 2026-10-31) ---------------
+
+const MISE: &str = "mise/v1";
+const TRIAL_OP: &str = "trial-duckdb@package";
+
+impl Fx {
+    /// `dfm trial duckdb --provider mise/v1`, approved: the look-alike lists `duckdb 2.0.0`.
+    fn mise_trial(&self) {
+        let o = self.trial(&["duckdb", "--provider", MISE, "--preview"]);
+        let o = self.trial(&["duckdb", "--provider", MISE, "--yes-plan", &digest_of(&o)]);
+        assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+    }
+
+    fn update(&self, more: &[&str]) -> Output {
+        let mut v = vec!["packages", "--update"];
+        v.extend_from_slice(more);
+        self.run(&v)
+    }
+
+    fn mise_installs(&self) -> usize {
+        self.log().matches("mise install duckdb@latest").count()
+    }
+}
+
+#[test]
+fn packages_update_rolls_an_active_mise_trial_as_a_declared_rolling_tool() {
+    let fx = Fx::new();
+    fx.mise_trial();
+    let o = fx.update(&["--preview"]);
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+    let t = text(&o.stdout);
+    assert!(t.contains(&format!("planned {TRIAL_OP}")), "{t}");
+    assert!(
+        t.contains(
+            "upgrade duckdb with mise/v1 to the newest version the provider resolves at apply time"
+        ),
+        "{t}"
+    );
+    assert_eq!(fx.mise_installs(), 1, "the preview installs nothing");
+    let o = fx.update(&["--yes-plan", &digest_of(&o)]);
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+    let t = text(&o.stdout);
+    assert!(t.contains(&format!("updated {TRIAL_OP}")), "{t}");
+    assert!(t.contains("counts: updated=1 "), "{t}");
+    assert_eq!(fx.mise_installs(), 2, "{}", fx.log());
+    // The operation is journaled as a declared tool's upgrade is.
+    let phases: Vec<String> = fx
+        .journal()
+        .iter()
+        .filter(|e| e["resource"] == "trial-duckdb" && e["op"] == "upgrade")
+        .map(|e| e["phase"].as_str().unwrap_or_default().to_string())
+        .collect();
+    assert_eq!(phases, ["intent", "done"], "{:?}", fx.journal());
+}
+
+#[test]
+fn packages_update_does_not_roll_an_adopted_trial_from_its_record() {
+    let fx = Fx::new();
+    fx.mise_trial();
+    let path = fx.state().join("trials/trial-duckdb.json");
+    let mut t = fx.json(&path);
+    t["schema"] = 3.into();
+    t["adopted"] = serde_json::json!({"op_id": "adopt-1-2", "module": "extra", "at_unix_ns": 9});
+    fs::write(&path, serde_json::to_vec(&t).unwrap()).unwrap();
+    let o = fx.update(&[]);
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+    let t = text(&o.stdout);
+    assert!(!t.contains("trial-duckdb"), "{t}");
+    assert!(t.contains("nothing to change"), "{t}");
+    assert_eq!(fx.mise_installs(), 1, "{}", fx.log());
+}
+
+#[test]
+fn packages_update_rolls_a_trial_tool_that_a_module_declares_once() {
+    let fx = Fx::new();
+    fx.put(
+        "base/modules/extra/module.toml",
+        &format!(
+            "{}\n[[resources]]\nid = \"duckdb\"\nkind = \"package\"\nadapter = \"mise/v1\"\n[resources.value]\nname = \"duckdb\"\nupdate_policy = \"rolling\"\n",
+            common::EXTRA
+        ),
+    );
+    fx.mise_trial();
+    let o = fx.update(&["--preview"]);
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+    let t = text(&o.stdout);
+    assert!(t.contains("planned extra.duckdb@package"), "{t}");
+    assert!(!t.contains(TRIAL_OP), "{t}");
+    let o = fx.update(&["--yes-plan", &digest_of(&o)]);
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+    assert!(
+        text(&o.stdout).contains("counts: updated=1 "),
+        "{}",
+        text(&o.stdout)
+    );
+    assert_eq!(fx.mise_installs(), 2, "{}", fx.log());
+}
+
+#[test]
+fn packages_update_does_not_reinstall_a_trial_tool_removed_by_hand() {
+    let fx = Fx::new();
+    fx.mise_trial();
+    fx.marker("installed-mise", "");
+    let o = fx.update(&[]);
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+    let t = text(&o.stdout);
+    assert!(
+        t.contains("note: trial trial-duckdb: duckdb is not installed by mise/v1; it is not installed again"),
+        "{t}"
+    );
+    assert!(!t.contains(TRIAL_OP), "{t}");
+    assert!(t.contains("nothing to change"), "{t}");
+    assert_eq!(fx.mise_installs(), 1, "{}", fx.log());
+}
+
+#[test]
+fn an_unreadable_trial_record_is_a_note_and_does_not_block_the_update() {
+    let fx = Fx::new();
+    fx.mise_trial();
+    fs::write(fx.state().join("trials/t-bad.json"), "not json").unwrap();
+    let o = fx.update(&["--preview"]);
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+    let t = text(&o.stdout);
+    assert!(
+        t.contains("note: trial record t-bad.json cannot be read"),
+        "{t}"
+    );
+    assert!(t.contains(&format!("planned {TRIAL_OP}")), "{t}");
+    let o = fx.update(&["--yes-plan", &digest_of(&o)]);
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+    assert!(
+        text(&o.stdout).contains(&format!("updated {TRIAL_OP}")),
+        "{}",
+        text(&o.stdout)
+    );
+}

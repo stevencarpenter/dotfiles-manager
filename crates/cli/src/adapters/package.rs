@@ -735,7 +735,7 @@ fn apt_probe(runner: &Runner, pkg: &str) -> PackageState {
 /// A declared name split into the tool and the wanted version: the part after the last `@`,
 /// when that part is a version and not a path. A scoped npm tool (`npm:@scope/pkg`) keeps its
 /// `@` and has no version; `npm:@scope/pkg@1.2` has one.
-fn tool_and_version(pkg: &str) -> (&str, &str) {
+pub(crate) fn tool_and_version(pkg: &str) -> (&str, &str) {
     match pkg.rsplit_once('@') {
         Some((tool, version)) if !tool.is_empty() && !version.contains('/') => (tool, version),
         _ => (pkg, ""),

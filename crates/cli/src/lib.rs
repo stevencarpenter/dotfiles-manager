@@ -110,10 +110,10 @@ runs no tap code. A package the provider has installed is current; a missing off
 installed with --yes-plan (brew install, mise install), with its missing dependencies named in
 the plan. Nothing is upgraded, downgraded or removed. An executable of the same name from another owner, or a
 provider that cannot answer, is a blocker (exit 3). apt is probe-only: installing needs root. See
-docs/packages.md. With --update, each installed mise or uv tool declared rolling is upgraded to
-the newest version its provider resolves (mise install, uv tool upgrade); installed versions
-stay, a held tool or a local build is kept, and a copy from another owner blocks. See
-docs/toolchains.md.
+docs/packages.md. With --update, each installed mise or uv tool declared rolling, and the tool
+of each active mise trial, is upgraded to the newest version its provider resolves (mise
+install, uv tool upgrade); installed versions stay, a held tool or a local build is kept, and a
+copy from another owner blocks. See docs/toolchains.md.
 
 trial tries a tool without a module. It asks homebrew/v1 and mise/v1 which one lists or can
 install the package (read-only probes, as packages runs them), records a baseline of the tool,
