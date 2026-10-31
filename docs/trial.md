@@ -61,9 +61,18 @@ Order of one run:
 
 The optional fields `package` and `unknown` need no schema bump: a record without them (for example, one the test harness `__record-trial` writes) still reads. `adopted` is different: the record type refuses unknown keys, so an adopted record is schema 3 and an unadopted record stays schema 2. The validator accepts 2 and 3, refuses `adopted` on schema 2, and requires it on schema 3. A binary that predates schema 3 reports an adopted record as `E_STATE_NEWER`.
 
-A trial is **active** until its record has `adopted`. An adopted record stays as evidence and keeps its id taken (a second trial of that id is `E_CONFLICT`). Readers that mean "in progress" skip it: `sync` does not hold `brew` for it, and `doctor` lists no row for it. `state check` still validates and counts it.
+A trial is **active** until its record has `adopted`. An adopted record stays as evidence and keeps its id taken (a second trial of that id is `E_CONFLICT`). Readers that mean "in progress" skip it: `doctor` lists no row for it, and `packages --update` does not roll its tool from the record. `state check` still validates and counts it.
 
 The record is a private file under `state/trials/`. `state check` validates it with the other documents and counts it (`trials: N (M unreadable)`). `doctor` and `status` show an unreadable or foreign-identity record as a WARN row. An interrupted install follows the packages rule (docs/packages.md, "Interrupted install"): `state check` reports `E_OP_INTERRUPTED`, `state recover` leaves it `unknown`, and `state resolve <op_id> --as failed` settles it.
+
+## Updates
+
+A trial is updated with the other packages as if it were already adopted (the owner's decision of 2026-10-31). Nothing holds an update for a trial. A trial is not saved in the dotfiles configuration: it is a package that dfm manages from its own state. Updating a trial needs no entry for its tool in the dotfiles config. The `brew` updater, when the profile declares it, upgrades a Homebrew trial with the other outdated packages, and `packages --update` reads the trial record to roll a mise trial. No update writes the trial's tool into a dotfiles file (a mise configuration, a Brewfile, a manifest or a profile). Only `adopt` writes it into a module.
+
+- **Homebrew.** `sync`'s `brew` updater upgrades a trial's formula or cask with every other outdated package (docs/upgrade.md, "Trials").
+- **mise.** `dfm packages --update` rolls the tool of each active `mise/v1` trial as a declared rolling tool (docs/toolchains.md, "Trials"). The trial rolls run after every declared operation, so a failed trial roll cannot stop a declared update. `sync` runs `packages` without `--update`, so it rolls no mise tool, declared or trial.
+
+The record is not changed by an update. It keeps what the trial saw at its start.
 
 ## Decisions
 
@@ -94,6 +103,7 @@ The record is a private file under `state/trials/`. `state check` validates it w
 
 - **Attribution by one id.** `package.install.op_id` names the journal `intent` and `done` (or `failed`) entries and the receipt `<start>-<op_id>.json`. A trial without `package.install` installed nothing. An `op_id` with no `intent` entry means the run ended between the record and the intent: nothing was started, and purge treats the package as not trial-installed until the provider's listing says otherwise.
 - **Baseline for restore.** `baseline.paths` with `existed` and `sha256` as observed before the install. `existed: false` is not delete authority: nothing observes the path after the install, so a file created there by anything else is indistinguishable from the tool's. Purge treats such a path as a candidate that needs its own approval (its preview shows the live hash and the approved digest covers it). It restores nothing for a pre-existing path whose hash no longer matches, and never touches a path with `existed: true` and no hash (a directory).
+- **The installed version.** Purge removes the trial's package by name (`package.name`), every installed version, because updates may change it after the trial starts (docs/upgrade.md, "Trials"). A mise roll installs the new version beside the old ones and removes none. The record keeps what it saw at trial start as history and is not updated.
 - **Owners.** `baseline.owners` says who had the tool. A pre-existing tool is never uninstalled. A dependency in `package.install.dependencies` is uninstalled only when no module or other trial needs it.
 - **Unknown effects.** Purge reports the `unknown` entries as retained or unattributed, never as cleaned.
 - **Candidates for adopt.** `baseline.paths` are the files adopt reviews and promotes into a module. `package.adapter` and `package.name` are the install declaration it generates.

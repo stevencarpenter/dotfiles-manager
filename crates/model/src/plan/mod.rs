@@ -24,6 +24,9 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 pub const SCHEMA: i64 = 1;
+/// The resource id prefix of a trial tool rolled from its record (docs/toolchains.md, "Trials").
+/// A manifest id never holds `:`, so no declared resource has it.
+pub const TRIAL_PREFIX: &str = "trial:";
 /// A saved plan is at most this large (the state document read limit, docs/state.md).
 pub const MAX_PLAN_BYTES: usize = 16 << 20;
 /// A directory listing or a regular file hash is bounded. A larger one is `Unknown`.

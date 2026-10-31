@@ -95,6 +95,8 @@ The upgrade step writes one receipt (`command = upgrade`) with each updater's ro
 
 ## Trials (DFM-31.C09)
 
+Superseded 2026-10-31 by the owner's decision: "I want to trial tools without it impacting any other brew update or other package manager update. It is specifically being trialed, and it should also get updated with the other packages like it were already adopted because that's the whole point! We will build purge immediately after this." A trial no longer holds `brew`, and `dfm packages --update` rolls an active `mise/v1` trial's tool (docs/upgrade.md, "Trials"; docs/toolchains.md). The text below is history.
+
 Revised 2026-10-27 after review: the exclusion below does not protect a trial, because `brew upgrade` also upgrades dependencies and dependents of the names it gets. The built rule: while a Homebrew trial is active or a trial record cannot be read, `brew` is `blocked` and runs no command (docs/upgrade.md, "Trials"). The original text follows.
 
 
@@ -105,12 +107,12 @@ If an active trial record under `state/trials/` names a Homebrew package, the `b
 These map to DFM-31 criteria. The rest of DFM-31 stays open.
 
 - C02: a missing tool or an unreadable version is reported before or in place of its run, and does not stop the others.
-- C03: the default is rolling, with no soak and no hold. A hold exists only for an active trial in this slice.
+- C03: the default is rolling, with no soak and no hold. A hold exists only for an active trial in this slice. Superseded 2026-10-31: no trial holds an updater (see "Trials").
 - C07: every declared updater ends in exactly one status.
 - C08: tests prove that a failed updater, a missing tool, a version that does not change after the update (`pending` or `current`), and a stop mid-run cannot produce an all-`updated` summary or a missing warning.
 - C12: `claude` and `codex` run through their own updaters, and `updated` needs a changed `--version`.
 - C13: a second copy is reported with both paths.
-- C09: the trial exclusion above.
+- C09: the trial exclusion above. Superseded 2026-10-31 by the owner's decision quoted in "Trials".
 - Tests use look-alike executables for every updater, as `crates/cli/tests/toolchains.rs` does for mise and uv. No test runs a real updater.
 - The docs: a new `docs/upgrade.md`, and updates to `docs/sync.md` and `README.md`.
 - `just check` passes on the branch head.

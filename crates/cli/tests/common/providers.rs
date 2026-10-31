@@ -71,7 +71,8 @@ esac
 
 /// `mise ls --installed --json <name>` answers a JSON array from `installed-mise` (one
 /// `<name> <version>` line per installed version); the table form is refused, as a stand-in for
-/// its truncated tool column. `mise install <name>` appends.
+/// its truncated tool column. `mise install <name>` appends. A `mise-fail-<name>` marker beside
+/// `bin` makes the install of that tool exit 1, as a failed download does.
 pub const FAKE_MISE: &str = r#"#!/bin/sh
 PATH=/usr/bin:/bin:$PATH
 here=$(dirname "$0")
@@ -91,6 +92,7 @@ case "$1" in
     printf ']\n'
     exit 0 ;;
   install)
+    [ -e "$here/../mise-fail-${2%%@*}" ] && { echo "mise ERROR download failed" >&2; exit 1; }
     echo "${2%%@*}  2.0.0" >> "$db"; exit 0 ;;
   *) exit 64 ;;
 esac

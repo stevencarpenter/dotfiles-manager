@@ -4385,8 +4385,39 @@ fn a_blocked_scope_still_runs_the_upgrade() {
     assert!(s.contains("\nwarning: secrets skipped"), "{s}");
 }
 
+/// The owner's decision of 2026-10-31: a trial does not hold brew. brew upgrades a trial's cask
+/// with everything else, as if the trial were adopted.
 #[test]
-fn an_unreadable_trial_record_blocks_brew_and_not_the_others() {
+fn an_active_homebrew_trial_leaves_the_brew_run_unchanged() {
+    let u = Up::new(r#"["brew"]"#);
+    let o = u.sync(&["--no-upgrade"]);
+    assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
+    let o = Command::new(BIN)
+        .env_clear()
+        .arg("--home")
+        .arg(u.fx.home.path())
+        .args(["__record-trial", "--id", "trial-codex", "--tool", "codex"])
+        .arg("--baseline-path")
+        .arg(u.fx.h(".config/codex"))
+        .output()
+        .unwrap();
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let record =
+        u.fx.h(".local/state/dotfiles-manager/state/trials/trial-codex.json");
+    let mut t: serde_json::Value = serde_json::from_slice(&fs::read(&record).unwrap()).unwrap();
+    t["package"] = serde_json::json!({"adapter": "homebrew/v1", "name": "codex"});
+    fs::write(&record, serde_json::to_vec(&t).unwrap()).unwrap();
+    fs::write(u.st("outdated-codex"), "").unwrap();
+    let o = u.sync(&[]);
+    assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
+    let s = stdout(&o);
+    assert!(s.contains("  updated brew"), "{s}");
+    assert!(!s.contains("trial"), "{s}");
+    assert!(u.log().contains("brew upgrade --cask codex"), "{}", u.log());
+}
+
+#[test]
+fn an_unreadable_trial_record_leaves_the_brew_run_unchanged() {
     let u = Up::new(r#"["brew", "claude"]"#);
     let trials = u.fx.h(".local/state/dotfiles-manager/state/trials");
     fs::create_dir_all(&trials).unwrap();
@@ -4394,30 +4425,26 @@ fn an_unreadable_trial_record_blocks_brew_and_not_the_others() {
     let o = u.sync(&[]);
     assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
     let s = stdout(&o);
-    assert!(s.contains("  blocked brew"), "{s}");
-    assert!(s.contains("unreadable trial record t-bad.json"), "{s}");
-    assert!(s.contains("\nwarning: upgrade brew blocked"), "{s}");
+    assert!(s.contains("  current brew"), "{s}");
+    assert!(!s.contains("trial record"), "{s}");
     let log = u.log();
-    assert!(!log.contains("brew update"), "{log}");
+    assert!(log.contains("brew update"), "{log}");
     assert!(log.contains("claude update"), "{log}");
 }
 
 #[test]
-fn an_unfinished_trial_record_blocks_brew() {
+fn an_unfinished_trial_record_leaves_the_brew_run_unchanged() {
     let u = Up::new(r#"["brew"]"#);
-    // A missing or unlistable trials directory refuses the run before any scope
-    // (E_STORAGE_INVALID); an interrupted trial write reaches the upgrade step.
+    // A missing trials directory refuses the run before any scope (E_STORAGE_INVALID, the
+    // store's rule for every writer); an interrupted trial write reaches the upgrade step.
     let trials = u.fx.h(".local/state/dotfiles-manager/state/trials");
     fs::write(trials.join(".t-new.json.1.tmp"), "{").unwrap();
     let o = u.sync(&[]);
     let s = stdout(&o);
     assert_eq!(code(&o), 0, "{s}\n{}", stderr(&o));
-    assert!(!u.log().contains("brew update"), "{}", u.log());
-    assert!(s.contains("  blocked brew"), "{s}");
-    assert!(
-        s.contains("unfinished trial record trials/.t-new.json.1.tmp (interrupted write)"),
-        "{s}"
-    );
+    assert!(u.log().contains("brew update"), "{}", u.log());
+    assert!(s.contains("  current brew"), "{s}");
+    assert!(!s.contains("trial record"), "{s}");
 }
 
 #[test]

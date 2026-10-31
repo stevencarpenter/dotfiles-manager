@@ -3,7 +3,8 @@
 use super::graph;
 use super::{
     Action, Binary, Blocker, Fragment, Incomplete, Input, LinkTo, Node, Observations, Operation,
-    Ownership, Plan, Precondition, Request, Seen, Source, Status, link_fingerprint, node_state,
+    Ownership, Plan, Precondition, Request, Seen, Source, Status, TRIAL_PREFIX, link_fingerprint,
+    node_state,
 };
 use crate::digest::sha256_hex;
 use crate::fold::fold;
@@ -2141,11 +2142,32 @@ impl Planner<'_> {
     }
 
     /// Orders the operations. On a cycle the members are marked blocked and the cycle returned.
+    ///
+    /// A trial roll (resource [`TRIAL_PREFIX`]) runs after every other operation, so a failed
+    /// roll, which stops all later mutation, can only leave other trial rolls `not_started`
+    /// (docs/toolchains.md, "Trials"). The ordering edges are not written into `after`. A plan
+    /// without a trial row orders as before.
     fn finish(&mut self) -> (Vec<Operation>, Option<Vec<String>>) {
+        let is_trial = |o: &Operation| o.resource.starts_with(TRIAL_PREFIX);
+        let declared: Vec<String> = if self.ops.values().any(is_trial) {
+            self.ops
+                .values()
+                .filter(|o| !is_trial(o))
+                .map(|o| o.id.clone())
+                .collect()
+        } else {
+            Vec::new()
+        };
         let nodes: Vec<(String, Vec<String>)> = self
             .ops
             .values()
-            .map(|o| (o.id.clone(), o.after.clone()))
+            .map(|o| {
+                let mut after = o.after.clone();
+                if is_trial(o) {
+                    after.extend(declared.iter().cloned());
+                }
+                (o.id.clone(), after)
+            })
             .collect();
         match graph::order(&nodes) {
             Ok(order) => (
