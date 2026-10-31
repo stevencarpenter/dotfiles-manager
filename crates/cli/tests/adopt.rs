@@ -458,6 +458,34 @@ fn a_target_owned_by_core_is_refused() {
 }
 
 #[test]
+fn a_target_only_the_ledger_records_is_refused() {
+    let fx = Fx::bare();
+    fx.trial_tuicr(&["--config", ".ssh/config"]);
+    // apply links `.ssh/config` for core.ssh, so the ledger records it.
+    let d = digest_of(&fx.run(&["apply", "--preview"]));
+    let o = fx.run(&["apply", "--yes-plan", &d]);
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), out(&o));
+    // The resource leaves the manifest: the ledger entry is an orphan no module declares.
+    let core = common::CORE
+        .split("\n[[resources]]\nid = \"ssh\"")
+        .next()
+        .unwrap();
+    fx.put(MANIFEST, core);
+    git(&fx.root, &["commit", "-q", "-am", "drop ssh"]);
+    fs::remove_file(fx.h(".ssh/config")).unwrap();
+    fx.live(".ssh/config", "Host other\n");
+    let before = fx.snapshot();
+    let o = fx.adopt(&["--module", "core", "--preview"]);
+    refused(&o, "is recorded in the ledger for resource core.ssh");
+    assert!(
+        stderr(&o).contains(&fx.h(".ssh/config").display().to_string()),
+        "{}",
+        stderr(&o)
+    );
+    assert_eq!(fx.snapshot(), before);
+}
+
+#[test]
 fn a_missing_root_is_refused_before_any_write() {
     let fx = Fx::new();
     fx.live(LIVE, TUICR);

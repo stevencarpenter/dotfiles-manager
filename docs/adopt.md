@@ -35,6 +35,7 @@ Order of one run:
 4. **Ownership and the checkout.** Each candidate gets the repo path `<manifest dir>/home/<HOME-relative path>`, the link source `home/<HOME-relative path>` and the resource id `resource_id(<HOME-relative path>)`. The run is refused (`E_CONFLICT`) when:
    - two candidates give the same resource id (`a.b` and `a/b`);
    - a resolved resource of any module claims the target, or a directory above or below it;
+   - the ledger records the target, or a path above or below it, for any resource, also one that no module declares now (an orphan). The only exception is a kept link of an interrupted run, recorded for its own new resource;
    - the id already exists in any module;
    - an active trial other than this one claims the live path in its `owned_outputs`;
    - the repo path exists, tracked or not, unless it is the copy of an interrupted run (see "Interruption");

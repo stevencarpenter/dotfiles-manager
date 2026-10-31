@@ -1147,6 +1147,23 @@ fn decide(
             }
         }
     }
+    // A ledger entry at the target, or above or below it, is another owner, even when no module
+    // declares its resource now (an orphan). Only a kept link of the interrupted run may already
+    // be recorded, and only for its own new resource.
+    let ledger = store.read_ledger_lenient()?;
+    for c in &candidates {
+        let own = format!("{module}.{}", c.id);
+        let owner = ledger.resources.iter().find(|r| {
+            !(c.linked && r.resource == own)
+                && r.owned_outputs.iter().any(|o| overlaps(&o.path, &c.live))
+        });
+        if let Some(r) = owner {
+            return Err(conflict(format!(
+                "{} is recorded in the ledger for resource {}; adopt never takes over an output the manager records, and nothing was changed",
+                c.live, r.resource
+            )));
+        }
+    }
     for (_, t) in store.load().trials {
         let Ok(t) = t else { continue };
         if !t.is_active() || t.trial_id == args.trial {
