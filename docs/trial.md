@@ -1,6 +1,6 @@
 # Trial
 
-The `trial` command (`try <tool>` in DESIGN.md section 7): try a tool without authoring a module. This document describes the behavior at HEAD. The package providers it reuses are in [docs/packages.md](packages.md), the state store in [docs/state.md](state.md). `adopt` (DFM-33) and `purge` (DFM-34) are not built. The last section lists what they inherit.
+The `trial` command (`try <tool>` in DESIGN.md section 7): try a tool without authoring a module. This document describes the behavior at HEAD. The package providers it reuses are in [docs/packages.md](packages.md), the state store in [docs/state.md](state.md). `adopt` (DFM-33) is in [docs/adopt.md](adopt.md). `purge` (DFM-34) is not built. The last section lists what they inherit.
 
 | Part | Location |
 | --- | --- |
@@ -45,7 +45,7 @@ Order of one run:
 
 ## The record
 
-`state/trials/<trial-id>.json`, schema 2, canonical JSON. The docs/state.md validation applies: identity stamp, valid id, claim check on every path, secrets refused.
+`state/trials/<trial-id>.json`, schema 2 (schema 3 once adopted), canonical JSON. The docs/state.md validation applies: identity stamp, valid id, claim check on every path, secrets refused.
 
 | Field | Meaning |
 | --- | --- |
@@ -57,10 +57,13 @@ Order of one run:
 | `package.adapter`, `package.name` | The provider that lists or installed the tool, and the package as it names it. Left out when only another owner has the tool. The journal and receipt then name the adapter `other-owner`. |
 | `package.install{op_id, dependencies}` | Present only when the trial installed: the journal and receipt id, and the dependencies the provider added. |
 | `unknown` | Fixed tokens `services`, `paths-outside-baseline`, `provider-caches`: effects the trial does not instrument. Candidates for review, never owned cleanup scope. |
+| `adopted{op_id, module, at_unix_ns}` | Set once by `adopt` (DFM-33), with `schema` 3. It names the journal operation and the module that took the configuration. Left out of an active trial. |
 
-The optional fields need no schema bump: a record without them (for example, one the test harness `__record-trial` writes) still reads.
+The optional fields `package` and `unknown` need no schema bump: a record without them (for example, one the test harness `__record-trial` writes) still reads. `adopted` is different: the record type refuses unknown keys, so an adopted record is schema 3 and an unadopted record stays schema 2. The validator accepts 2 and 3, refuses `adopted` on schema 2, and requires it on schema 3. A binary that predates schema 3 reports an adopted record as `E_STATE_NEWER`.
 
-The record is a private file under `state/trials/`. `state check` validates it with the other documents and counts it (`trials: N (M unreadable)`). `doctor` and `status` show an unreadable or foreign-identity record as a WARN row. They do not list or count readable records. An interrupted install follows the packages rule (docs/packages.md, "Interrupted install"): `state check` reports `E_OP_INTERRUPTED`, `state recover` leaves it `unknown`, and `state resolve <op_id> --as failed` settles it.
+A trial is **active** until its record has `adopted`. An adopted record stays as evidence and keeps its id taken (a second trial of that id is `E_CONFLICT`). Readers that mean "in progress" skip it: `sync` does not hold `brew` for it, and `doctor` lists no row for it. `state check` still validates and counts it.
+
+The record is a private file under `state/trials/`. `state check` validates it with the other documents and counts it (`trials: N (M unreadable)`). `doctor` and `status` show an unreadable or foreign-identity record as a WARN row. An interrupted install follows the packages rule (docs/packages.md, "Interrupted install"): `state check` reports `E_OP_INTERRUPTED`, `state recover` leaves it `unknown`, and `state resolve <op_id> --as failed` settles it.
 
 ## Decisions
 
@@ -83,8 +86,7 @@ The record is a private file under `state/trials/`. `state check` validates it w
 - **Not an OS sandbox.** Services, caches, logs and any path outside the baseline are declared `unknown`. A path the tool creates there is a candidate for review at purge time, never an owned cleanup scope, and never gets a retroactive baseline.
 - **One candidate by default.** A tool that keeps its configuration elsewhere needs `--config`. The record cannot be extended after the fact without a new baseline, so pass every candidate on the first run.
 - **The baseline is one observation.** A hard-linked file is hashed like any other. `purge` must check again before it deletes.
-- **No trial row in `doctor`.** A per-trial row with its owner and age is not built.
-- **No end of a trial.** `purge` and `adopt` are not built, so a trial record stays until it is removed by hand.
+- **One end of a trial.** `adopt` ends a trial ([docs/adopt.md](adopt.md)). `purge` is not built, so a trial that is not adopted stays until it is removed by hand.
 - **Rerun cost.** Two probe rounds (before and under the lock), plus the postcondition probe after an install.
 - **Evidence scope.** Tests use the `test-isolation` build and the `brew` and `mise` look-alikes. No test runs a real install. Whether `sync` keeps active trials intact is not tested.
 

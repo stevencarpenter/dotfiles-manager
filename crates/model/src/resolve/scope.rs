@@ -4,13 +4,14 @@
 //! missing (E_SOURCE_ESCAPE against E_SOURCE_MISSING).
 
 use super::error::{ResolveError, category};
-use super::source::parent;
+use super::source::{Entry, SourceSet, parent};
 use crate::Code;
 use crate::fold::fold;
 use toml::Value;
 
 const MAX_ENTRIES: usize = 1_000;
 const MAX_PATTERN_BYTES: usize = 4_096;
+const MAX_BUNDLE_DEPTH: usize = 16;
 
 /// Why a path is outside the loaded sources.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -339,6 +340,100 @@ pub fn bundle_scope(bundle_path: &str, bytes: &[u8]) -> Result<Option<SourceScop
     Ok(super::docs::bundle(bundle_path, bytes)?.sources)
 }
 
+/// The root-relative manifest path of `module`, found through the profile at `profile_path` and
+/// the bundles it extends. `core` is the root bundle's `core` key; any other name is the nearest
+/// bundle's `[modules]` entry. `None` when no bundle in the chain declares it. Paths are joined
+/// and collapsed lexically, as [`profile_bundle_path`] does, so the result is a lookup aid and
+/// not a containment decision. A cycle, a chain over 16 bundles, a missing file and a path that
+/// leaves the root are refused with the resolver's codes.
+pub fn module_manifest(
+    sources: &SourceSet,
+    profile_path: &str,
+    module: &str,
+) -> Result<Option<String>, ResolveError> {
+    let read = |path: &str, from: &str| -> Result<&[u8], ResolveError> {
+        match sources.get(path) {
+            Some(Entry::File(b)) => Ok(b),
+            _ => Err(ResolveError::new(
+                Code::SourceMissing,
+                from,
+                "the file is not in the loaded sources",
+                "check the path and the profile's `bundle` and `extends` keys",
+            )),
+        }
+    };
+    let join = |from: &str, rel: &str| -> Result<String, ResolveError> {
+        collapse(parent(from), rel).ok_or_else(|| {
+            ResolveError::new(
+                Code::SourceEscape,
+                from,
+                "a path leaves the source root",
+                "name a path inside the source root",
+            )
+        })
+    };
+    let profile = super::docs::profile(profile_path, read(profile_path, profile_path)?)?;
+    let mut path = join(profile_path, &profile.bundle)?;
+    let mut from = profile_path.to_string();
+    let mut seen: Vec<String> = Vec::new();
+    loop {
+        if seen.contains(&path) {
+            return Err(ResolveError::new(
+                Code::BundleCycle,
+                &from,
+                "bundles extend each other in a cycle",
+                "remove one `extends` so ancestry is a single chain",
+            ));
+        }
+        if seen.len() >= MAX_BUNDLE_DEPTH {
+            return Err(ResolveError::new(
+                Code::LimitExceeded,
+                &from,
+                "bundle ancestry is deeper than 16",
+                "flatten the bundle chain",
+            ));
+        }
+        seen.push(path.clone());
+        let doc = super::docs::bundle(&path, read(&path, &from)?)?;
+        let rel = if module == "core" {
+            doc.core.as_ref()
+        } else {
+            doc.modules.get(module)
+        };
+        if let Some(rel) = rel {
+            return join(&path, rel).map(Some);
+        }
+        match doc.extends {
+            Some(e) => {
+                let next = join(&path, &e)?;
+                from = path;
+                path = next;
+            }
+            None => return Ok(None),
+        }
+    }
+}
+
+/// `rel` under `base_dir` with `.` and `..` collapsed lexically; `None` when it climbs above
+/// the root or is absolute.
+fn collapse(base_dir: &str, rel: &str) -> Option<String> {
+    // An absolute path leaves the source root, as in `source::join`.
+    if rel.starts_with('/') {
+        return None;
+    }
+    let mut out = components(base_dir);
+    for c in rel.split('/') {
+        match c {
+            "" | "." => {}
+            ".." => {
+                out.pop()?;
+            }
+            c => out.push(c.to_string()),
+        }
+    }
+    (!out.is_empty()).then(|| out.join("/"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -496,5 +591,92 @@ exclude = ["home/*", "a/?b", "p/**", "**/**/**/x", "m/**/k/*.o"]"#,
         }
         // The steps toward a root are still walkable.
         assert!(s.reaches("home"));
+    }
+
+    fn tree(files: &[(&str, &str)]) -> super::super::SourceSet {
+        let mut s = super::super::SourceSet::new();
+        for (p, c) in files {
+            s.insert_file(*p, c.as_bytes().to_vec());
+        }
+        s
+    }
+
+    const PROFILE: &str = "schema = 1\nid = \"p\"\nbundle = \"../base/bundle.toml\"\nplatform = \"macos\"\narchitecture = \"arm64\"\nmodules = []\noverrides = []\n";
+
+    #[test]
+    fn module_manifest_follows_core_and_the_catalogue() {
+        let s = tree(&[
+            ("profiles/p.toml", PROFILE),
+            (
+                "base/bundle.toml",
+                "schema = 1\nid = \"b\"\ncore = \"modules/core/module.toml\"\n[modules]\nextra = \"modules/extra/module.toml\"\n",
+            ),
+        ]);
+        let m = |name| module_manifest(&s, "profiles/p.toml", name).unwrap();
+        assert_eq!(m("core").as_deref(), Some("base/modules/core/module.toml"));
+        assert_eq!(
+            m("extra").as_deref(),
+            Some("base/modules/extra/module.toml")
+        );
+        assert_eq!(m("missing"), None);
+    }
+
+    #[test]
+    fn module_manifest_refuses_an_absolute_path() {
+        let s = tree(&[
+            ("profiles/p.toml", PROFILE),
+            (
+                "base/bundle.toml",
+                "schema = 1\nid = \"b\"\ncore = \"modules/core/module.toml\"\n[modules]\nextra = \"/modules/extra/module.toml\"\n",
+            ),
+        ]);
+        let e = module_manifest(&s, "profiles/p.toml", "extra").unwrap_err();
+        assert_eq!(e.code, Code::SourceEscape);
+        let abs = PROFILE.replace("../base/bundle.toml", "/base/bundle.toml");
+        let s = tree(&[("profiles/p.toml", &abs)]);
+        let e = module_manifest(&s, "profiles/p.toml", "core").unwrap_err();
+        assert_eq!(e.code, Code::SourceEscape);
+    }
+
+    #[test]
+    fn module_manifest_follows_extends_two_levels() {
+        let s = tree(&[
+            ("profiles/p.toml", PROFILE),
+            (
+                "base/bundle.toml",
+                "schema = 1\nid = \"mid\"\nextends = \"../root/bundle.toml\"\n[modules]\nmine = \"m/module.toml\"\n",
+            ),
+            (
+                "root/bundle.toml",
+                "schema = 1\nid = \"root\"\ncore = \"c/module.toml\"\n[modules]\nold = \"o/module.toml\"\n",
+            ),
+        ]);
+        let m = |name| module_manifest(&s, "profiles/p.toml", name).unwrap();
+        assert_eq!(m("mine").as_deref(), Some("base/m/module.toml"));
+        assert_eq!(m("old").as_deref(), Some("root/o/module.toml"));
+        assert_eq!(m("core").as_deref(), Some("root/c/module.toml"));
+        assert_eq!(m("none"), None);
+    }
+
+    #[test]
+    fn module_manifest_refuses_a_cycle_a_missing_file_and_an_escape() {
+        let cyc = tree(&[
+            ("profiles/p.toml", PROFILE),
+            (
+                "base/bundle.toml",
+                "schema = 1\nid = \"a\"\nextends = \"bundle.toml\"\n[modules]\n",
+            ),
+        ]);
+        let e = module_manifest(&cyc, "profiles/p.toml", "x").unwrap_err();
+        assert_eq!(e.code, Code::BundleCycle);
+        let none = tree(&[("profiles/p.toml", PROFILE)]);
+        let e = module_manifest(&none, "profiles/p.toml", "x").unwrap_err();
+        assert_eq!(e.code, Code::SourceMissing);
+        let esc = tree(&[(
+            "p.toml",
+            "schema = 1\nid = \"p\"\nbundle = \"../b.toml\"\nplatform = \"macos\"\narchitecture = \"arm64\"\nmodules = []\noverrides = []\n",
+        )]);
+        let e = module_manifest(&esc, "p.toml", "x").unwrap_err();
+        assert_eq!(e.code, Code::SourceEscape);
     }
 }

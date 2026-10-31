@@ -711,6 +711,23 @@ fn a_trial_baseline_hash_is_the_file_fingerprint() {
 }
 
 #[test]
+fn state_check_reads_an_adopted_trial_record() {
+    let h = seeded("adopted-trial");
+    let f = state(h.path()).join("trials/try-atuin.json");
+    let adopted = text(&fs::read(&f).unwrap())
+        .replace("\"schema\":2", "\"schema\":3")
+        .replacen(
+            '{',
+            "{\"adopted\":{\"at_unix_ns\":9,\"module\":\"shell\",\"op_id\":\"adopt-1-2\"},",
+            1,
+        );
+    fs::write(&f, adopted).unwrap();
+    let c = check(h.path());
+    assert_eq!(c.status.code(), Some(0), "{}", text(&c.stdout));
+    assert!(text(&c.stdout).contains("trials: 1 (0 unreadable)"));
+}
+
+#[test]
 fn receipts_and_trials_for_another_identity_are_reported_by_file() {
     let h = seeded("identity");
     let c = check(h.path());

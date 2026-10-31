@@ -1185,6 +1185,7 @@ mod synthetic {
             package: std::collections::BTreeMap::new(),
             service: std::collections::BTreeMap::new(),
             restart: std::collections::BTreeSet::new(),
+            adopt_files: std::collections::BTreeMap::new(),
             binary: Binary {
                 version: "0".into(),
                 sha256: "0".repeat(64),
@@ -2593,6 +2594,7 @@ mod removal {
             package: std::collections::BTreeMap::new(),
             service: std::collections::BTreeMap::new(),
             restart: std::collections::BTreeSet::new(),
+            adopt_files: std::collections::BTreeMap::new(),
             binary: Binary {
                 version: "0".into(),
                 sha256: "0".repeat(64),
@@ -2878,6 +2880,7 @@ mod hardening {
             package: std::collections::BTreeMap::new(),
             service: std::collections::BTreeMap::new(),
             restart: std::collections::BTreeSet::new(),
+            adopt_files: std::collections::BTreeMap::new(),
             binary: Binary {
                 version: "0".into(),
                 sha256: "0".repeat(64),
@@ -3182,6 +3185,7 @@ mod ledger_sensitivity {
             package: std::collections::BTreeMap::new(),
             service: std::collections::BTreeMap::new(),
             restart: std::collections::BTreeSet::new(),
+            adopt_files: std::collections::BTreeMap::new(),
             binary: Binary {
                 version: "0".into(),
                 sha256: "0".repeat(64),

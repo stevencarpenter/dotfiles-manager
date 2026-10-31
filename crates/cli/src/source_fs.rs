@@ -17,7 +17,7 @@
 
 use crate::read_fs::read_regular_bounded;
 use dfm_model::fold::fold;
-use dfm_model::resolve::{SourceScope, SourceSet, bundle_scope, profile_bundle_path};
+use dfm_model::resolve::{SourceScope, SourceSet, bundle_scope, is_git_name, profile_bundle_path};
 use dfm_model::{Code, Refusal};
 use std::collections::BTreeMap;
 use std::fs;
@@ -213,9 +213,7 @@ fn count_entries(
             } else {
                 format!("{rel}/{name}")
             };
-            if name.to_lowercase() == ".git"
-                || scope.is_some_and(|s| s.excluded_by(&path).is_some())
-            {
+            if is_git_name(&name) || scope.is_some_and(|s| s.excluded_by(&path).is_some()) {
                 continue;
             }
             let is_dir = e.file_type().is_ok_and(|t| t.is_dir());
@@ -368,7 +366,7 @@ fn load(root: &Path, declared: Option<&SourceScope>) -> Result<SourceSet, Refusa
                     format!("{other} and {name} in {rel} differ only by case"),
                 ));
             }
-            if name.to_lowercase() == ".git" {
+            if is_git_name(&name) {
                 // Repository metadata beside the bundle or at the top is not source content.
                 if rel.is_empty() || shallow {
                     continue;

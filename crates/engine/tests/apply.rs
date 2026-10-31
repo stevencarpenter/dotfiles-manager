@@ -949,6 +949,122 @@ fn replacing_a_link_checks_its_owner_where_it_is_replaced() {
 }
 
 #[test]
+fn replace_file_with_link_checks_hash_and_owner() {
+    let s = setup();
+    let uid = sys(&s.h).uid;
+    fs::write(s.h.0.join("f"), "old\n").unwrap();
+    symlink("/src/old", s.h.0.join("l")).unwrap();
+    fs::create_dir(s.h.0.join("d")).unwrap();
+    let home = Dir::open_home(&sys(&s.h), &s.h.0).unwrap();
+    let fp = file_fingerprint(b"old\n");
+    let refuse = |name: &str, hash: &str, uid: u32, fail: &Fail| {
+        let e = home
+            .replace_file_with_link(name, "/src/new", hash, uid, || Ok(()), fail)
+            .unwrap_err();
+        assert_eq!(e.code, Code::Conflict, "{name}: {e:?}");
+        assert!(
+            leftovers(&s.h.0).is_empty(),
+            "{name}: {:?}",
+            leftovers(&s.h.0)
+        );
+        e
+    };
+    // Another hash, another owner, a link, a directory: each is left as it is.
+    refuse("f", &file_fingerprint(b"other\n"), uid, &Fail::none());
+    let e = refuse("f", &fp, uid + 1, &Fail::none());
+    assert!(e.detail.contains("owned by another user"), "{}", e.detail);
+    refuse("l", &link_fingerprint("/src/old"), uid, &Fail::none());
+    assert_eq!(
+        fs::read_link(s.h.0.join("l")).unwrap(),
+        Path::new("/src/old")
+    );
+    refuse("d", &fp, uid, &Fail::none());
+    assert!(s.h.0.join("d").is_dir());
+    // A stop after the link is staged leaves the file and no staged entry.
+    let e = home
+        .replace_file_with_link(
+            "f",
+            "/src/new",
+            &fp,
+            uid,
+            || Ok(()),
+            &Fail::at("link-after-tmp", Inject::Error),
+        )
+        .unwrap_err();
+    assert_ne!(e.code, Code::IoUnconfirmed);
+    assert!(leftovers(&s.h.0).is_empty(), "{:?}", leftovers(&s.h.0));
+    assert_eq!(fs::read_to_string(s.h.0.join("f")).unwrap(), "old\n");
+    // The matching file is replaced with the link.
+    home.replace_file_with_link("f", "/src/new", &fp, uid, || Ok(()), &Fail::none())
+        .unwrap();
+    assert_eq!(
+        fs::read_link(s.h.0.join("f")).unwrap(),
+        Path::new("/src/new")
+    );
+    assert!(leftovers(&s.h.0).is_empty());
+}
+
+#[test]
+fn a_file_edited_after_the_link_is_staged_is_not_replaced() {
+    let s = setup();
+    let uid = sys(&s.h).uid;
+    fs::write(s.h.0.join("f"), "old\n").unwrap();
+    let home = Dir::open_home(&sys(&s.h), &s.h.0).unwrap();
+    let gate = s.h.0.with_extension("gate-adopt");
+    let reached = gate.with_extension("reached");
+    let fail = Fail::at("link-after-tmp", Inject::Wait(gate.clone()));
+    let t = std::thread::spawn({
+        let (gate, reached, f) = (gate.clone(), reached.clone(), s.h.0.join("f"));
+        move || {
+            wait_reached(&reached, &gate, "link-after-tmp");
+            // An edit in place: same inode, new content.
+            fs::write(&f, "edited\n").unwrap();
+            fs::write(&gate, "").unwrap();
+        }
+    });
+    let e = home
+        .replace_file_with_link(
+            "f",
+            "/src/new",
+            &file_fingerprint(b"old\n"),
+            uid,
+            || Ok(()),
+            &fail,
+        )
+        .unwrap_err();
+    t.join().unwrap();
+    assert_eq!(e.code, Code::Conflict, "{e:?}");
+    assert_eq!(fs::read_to_string(s.h.0.join("f")).unwrap(), "edited\n");
+    assert!(leftovers(&s.h.0).is_empty(), "{:?}", leftovers(&s.h.0));
+}
+
+#[test]
+fn a_file_edited_while_the_source_is_checked_is_not_replaced() {
+    // The source check runs before the last file check, so an edit made during it is seen.
+    let s = setup();
+    let uid = sys(&s.h).uid;
+    fs::write(s.h.0.join("f"), "old\n").unwrap();
+    let home = Dir::open_home(&sys(&s.h), &s.h.0).unwrap();
+    let f = s.h.0.join("f");
+    let e = home
+        .replace_file_with_link(
+            "f",
+            "/src/new",
+            &file_fingerprint(b"old\n"),
+            uid,
+            || {
+                fs::write(&f, "edited\n").unwrap();
+                Ok(())
+            },
+            &Fail::none(),
+        )
+        .unwrap_err();
+    assert_eq!(e.code, Code::Conflict, "{e:?}");
+    assert_eq!(fs::read_to_string(s.h.0.join("f")).unwrap(), "edited\n");
+    assert!(leftovers(&s.h.0).is_empty(), "{:?}", leftovers(&s.h.0));
+}
+
+#[test]
 fn a_directory_is_never_removed_and_nothing_is_deleted_recursively() {
     let s = setup();
     fs::create_dir_all(s.h.0.join("d/inner")).unwrap();
@@ -1567,6 +1683,222 @@ fn go_adopt(
 
 fn ids(v: &[&str]) -> BTreeSet<String> {
     v.iter().map(|s| (*s).to_string()).collect()
+}
+
+/// An `adopt_file` operation for the regular file `l` that holds the bytes of the real source
+/// file `x`, as `dfm adopt` plans it. Returns the operation and the source root.
+fn adopt_file_op(s: &Setup) -> (Operation, String) {
+    let root = real_src(s);
+    fs::write(s.h.0.join("l"), "x\n").unwrap();
+    let mut o = op(&s.h, &s.store, "x@l", 1, Action::AdoptFile, "l");
+    o.link = Some(format!("{root}/x"));
+    o.takeover = true;
+    let content_id = format!("sha256:{}", sha256_hex(b"x\n"));
+    o.inputs = vec![Input {
+        path: "x".into(),
+        content_id: Some(content_id.clone()),
+    }];
+    o.preconditions.push(Precondition {
+        subject: "source:x".into(),
+        state: content_id,
+    });
+    (o, root)
+}
+
+#[test]
+fn an_adopt_file_operation_needs_its_allow_adopt_id() {
+    let s = setup();
+    let (o, root) = adopt_file_op(&s);
+    assert_eq!(
+        dfm_engine::Approval::of(&o),
+        Some(dfm_engine::Approval::Adopt)
+    );
+    let p = plan_in(&root, vec![o]);
+    // Without the id: refused before any write.
+    let home = Dir::open_home(&sys(&s.h), &s.h.0).unwrap();
+    let fail = Fail::none();
+    let no = none();
+    let r = run(&s, &NoGenerator, &no, &fail, &home);
+    assert_eq!(apply(&r, &p).unwrap_err().code, Code::AdoptUnapproved);
+    assert!(s.store.read_journal().unwrap().is_empty());
+    assert!(s.store.read_ledger().unwrap().resources.is_empty());
+    assert_eq!(fs::read_to_string(s.h.0.join("l")).unwrap(), "x\n");
+    // With it: the file becomes the link, and the link is owned.
+    let rep = go_adopt(&s, &p, &ids(&["x@l"]), &Fail::none());
+    assert_eq!(
+        rep.operations[0].status,
+        Status::Updated,
+        "{:?}",
+        rep.stopped
+    );
+    let link = format!("{root}/x");
+    assert_eq!(fs::read_link(s.h.0.join("l")).unwrap(), Path::new(&link));
+    // The receipt shape of an `allow_adopt` approval: no `before` and no reload state, since the
+    // path holds the same bytes, and an `after` with the owned output.
+    let rec = &rep.operations[0];
+    assert!(rec.before.is_none());
+    assert_eq!(rec.reload, None);
+    assert_eq!(
+        rec.after.as_ref().map(|f| f.fingerprint.as_str()),
+        Some(link_fingerprint(&link).as_str())
+    );
+    assert_eq!(rec.owned_outputs, [s.h.0.join("l").to_str().unwrap()]);
+    let l = s.store.read_ledger().unwrap();
+    let out = &l.resources[0].owned_outputs[0];
+    assert_eq!(l.resources[0].resource, "core.x");
+    assert_eq!(
+        out.fingerprint.as_deref(),
+        Some(link_fingerprint(&link).as_str())
+    );
+    assert_eq!(out.mode, 0o777);
+    let j = s.store.read_journal().unwrap();
+    assert_eq!(
+        j.iter()
+            .map(|e| (e.op.as_str(), e.phase))
+            .collect::<Vec<_>>(),
+        [("adopt-file", Phase::Intent), ("adopt-file", Phase::Done)]
+    );
+    assert!(j[0].recovery.as_ref().unwrap().outputs[0].existed_before);
+    assert!(leftovers(&s.h.0).is_empty());
+}
+
+#[test]
+fn an_adopt_file_operation_blocks_when_the_file_changed_since_the_plan() {
+    let s = setup();
+    let (o, root) = adopt_file_op(&s);
+    let p = plan_in(&root, vec![o]);
+    fs::write(s.h.0.join("l"), "edited\n").unwrap();
+    let rep = go_adopt(&s, &p, &ids(&["x@l"]), &Fail::none());
+    assert_eq!(rep.operations[0].status, Status::Blocked);
+    assert_eq!(rep.stopped.as_ref().unwrap().code, Code::PlanStale);
+    assert_eq!(fs::read_to_string(s.h.0.join("l")).unwrap(), "edited\n");
+    assert!(s.store.read_ledger().unwrap().resources.is_empty());
+}
+
+#[test]
+fn an_adopt_file_operation_keeps_the_file_when_the_source_changes_before_the_rename() {
+    let s = setup();
+    let (o, root) = adopt_file_op(&s);
+    let p = plan_in(&root, vec![o]);
+    let gate = s.h.0.with_extension("gate-adopt-source");
+    let reached = gate.with_extension("reached");
+    let fail = Fail::at("link-after-tmp", Inject::Wait(gate.clone()));
+    let t = std::thread::spawn({
+        let (gate, reached, src) = (gate.clone(), reached.clone(), format!("{root}/x"));
+        move || {
+            wait_reached(&reached, &gate, "link-after-tmp");
+            // A checkout after the source check that ran before the intent.
+            fs::write(&src, "checked out\n").unwrap();
+            fs::write(&gate, "").unwrap();
+        }
+    });
+    let rep = go_adopt(&s, &p, &ids(&["x@l"]), &fail);
+    t.join().unwrap();
+    assert_eq!(
+        rep.operations[0].status,
+        Status::Failed,
+        "{:?}",
+        rep.stopped
+    );
+    let stopped = rep.stopped.as_ref().unwrap();
+    assert_eq!(stopped.code, Code::Conflict, "{stopped:?}");
+    // The only copy of the bytes is still a regular file at the path.
+    let meta = fs::symlink_metadata(s.h.0.join("l")).unwrap();
+    assert!(meta.file_type().is_file());
+    assert_eq!(fs::read_to_string(s.h.0.join("l")).unwrap(), "x\n");
+    assert!(leftovers(&s.h.0).is_empty(), "{:?}", leftovers(&s.h.0));
+    assert!(s.store.read_ledger().unwrap().resources.is_empty());
+}
+
+#[test]
+fn a_rerun_of_the_same_plan_after_a_settled_adopt_file_is_current() {
+    let s = setup();
+    let (o, root) = adopt_file_op(&s);
+    let p = plan_in(&root, vec![o]);
+    let rep = go_adopt(
+        &s,
+        &p,
+        &ids(&["x@l"]),
+        &Fail::at("link-after-rename", Inject::Error),
+    );
+    assert_eq!(rep.operations[0].status, Status::Unknown);
+    // The same plan again: settling records the link, and the takeover has nothing left to do.
+    let rep = go_adopt(&s, &p, &ids(&["x@l"]), &Fail::none());
+    assert_eq!(
+        rep.operations[0].status,
+        Status::Current,
+        "{:?}",
+        rep.stopped
+    );
+    assert!(rep.stopped.is_none(), "{:?}", rep.stopped);
+    let link = format!("{root}/x");
+    assert_eq!(fs::read_link(s.h.0.join("l")).unwrap(), Path::new(&link));
+    assert_eq!(owned_paths(&s).len(), 1);
+    // A link to anything else at the path is still stale, not current.
+    fs::remove_file(s.h.0.join("l")).unwrap();
+    symlink("/elsewhere", s.h.0.join("l")).unwrap();
+    let rep = go_adopt(&s, &p, &ids(&["x@l"]), &Fail::none());
+    assert_eq!(
+        rep.operations[0].status,
+        Status::Blocked,
+        "{:?}",
+        rep.stopped
+    );
+    assert_eq!(rep.stopped.as_ref().unwrap().code, Code::PlanStale);
+}
+
+#[test]
+fn recovery_settles_an_interrupted_adopt_file_by_what_is_at_the_path() {
+    use dfm_model::state::{Recovery, RecoveryOutput};
+    // The rename happened: the link is there, so the intent is done.
+    let s = setup();
+    let (o, root) = adopt_file_op(&s);
+    let rep = go_adopt(
+        &s,
+        &plan_in(&root, vec![o]),
+        &ids(&["x@l"]),
+        &Fail::at("link-after-rename", Inject::Error),
+    );
+    assert_eq!(
+        rep.operations[0].status,
+        Status::Unknown,
+        "{:?}",
+        rep.stopped
+    );
+    let st = recover_now(&s);
+    assert!(st.open.is_empty(), "{:?}", st.open);
+    assert_eq!(st.closed.len(), 1);
+    assert_eq!(st.closed[0].1, Phase::Done);
+    // The rename did not happen: the regular file is still there, so the intent is not done.
+    let s = setup();
+    let (_, root) = adopt_file_op(&s);
+    s.store
+        .append_journal(&JournalEntry {
+            schema: dfm_model::state::SCHEMA,
+            op_id: format!("{}-1", jid(1)),
+            op: "adopt-file".into(),
+            phase: Phase::Intent,
+            at: "2026-10-10T00:00:00.000000000Z".into(),
+            resource: "core.x".into(),
+            adapter: "git-config/v1".into(),
+            class: Class::Normal,
+            recovery: Some(Recovery {
+                outputs: vec![RecoveryOutput {
+                    path: s.h.0.join("l").to_str().unwrap().into(),
+                    existed_before: true,
+                    expected_sha256: Some(link_fingerprint(&format!("{root}/x"))),
+                }],
+                snapshot: None,
+            }),
+            token: None,
+            reason: None,
+        })
+        .unwrap();
+    let st = recover_now(&s);
+    assert!(st.open.is_empty(), "{:?}", st.open);
+    assert_eq!(st.closed, [(format!("{}-1", jid(1)), Phase::Failed)]);
+    assert_eq!(fs::read_to_string(s.h.0.join("l")).unwrap(), "x\n");
+    assert!(s.store.read_ledger().unwrap().resources.is_empty());
 }
 
 #[test]
@@ -4192,6 +4524,46 @@ fn a_crash_between_staging_a_link_and_the_rename_leaves_no_staged_link_and_settl
         fs::read_link(s.h.0.join("l")).unwrap(),
         Path::new("/src/old")
     );
+}
+
+#[test]
+fn a_crash_between_staging_an_adopt_link_and_the_rename_keeps_the_file_and_settles_the_stage() {
+    const CHILD: &str = "DFM_APPLY_ADOPT_STAGE_CRASH_HOME";
+    const NAME: &str =
+        "a_crash_between_staging_an_adopt_link_and_the_rename_keeps_the_file_and_settles_the_stage";
+    if let Some(dir) = std::env::var_os(CHILD) {
+        // The child: stages the link over the regular file, then ends at once, as a crash does.
+        let h = Home(dir.into());
+        let store = open(&h);
+        let s = Setup { h, store };
+        let (o, root) = adopt_file_op(&s);
+        go_adopt(
+            &s,
+            &plan_in(&root, vec![o]),
+            &ids(&["x@l"]),
+            &Fail::at("link-after-tmp", Inject::Abort),
+        );
+        std::process::exit(9);
+    }
+    let Setup { h, store } = setup();
+    drop(store);
+    let status = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", NAME, "--nocapture", "--test-threads=1"])
+        .env(CHILD, &h.0)
+        .status()
+        .unwrap();
+    assert_eq!(status.signal(), Some(6), "the child must abort: {status:?}");
+    let s = Setup { store: open(&h), h };
+    assert_eq!(leftovers(&s.h.0).len(), 1, "the crash left the staged link");
+    assert_eq!(phases(&s), [Phase::Intent]);
+    let settled = recover_now(&s);
+    assert!(settled.open.is_empty(), "{:?}", settled.open);
+    assert_eq!(phases(&s), [Phase::Intent, Phase::Failed]);
+    assert!(leftovers(&s.h.0).is_empty(), "the staged link is removed");
+    // The only copy of the bytes is still the regular file.
+    let meta = fs::symlink_metadata(s.h.0.join("l")).unwrap();
+    assert!(meta.file_type().is_file());
+    assert_eq!(fs::read_to_string(s.h.0.join("l")).unwrap(), "x\n");
 }
 
 #[test]

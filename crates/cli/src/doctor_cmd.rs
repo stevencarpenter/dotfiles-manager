@@ -21,7 +21,7 @@ use dfm_model::plan::{
     ServiceFacts, ServiceState, Status, in_scope, link_fingerprint, sensitive_paths,
 };
 use dfm_model::resolve::ResolvedResource;
-use dfm_model::state::{Class, Ledger, Receipt, unfinished, unresolved};
+use dfm_model::state::{Class, JournalEntry, Ledger, Receipt, unfinished, unresolved};
 use dfm_model::{Code, Refusal};
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
@@ -384,7 +384,11 @@ fn journal_rows(store: &Store, rows: &mut Vec<Row>) -> Vec<String> {
                 "operation {} of run {} (resource {}, began {}) has an intent and no outcome",
                 e.op, e.op_id, e.resource, e.at
             ),
-            "Wait for a running apply to finish, then run apply. An apply that holds the lock reports E_LOCKED. Doctor never settles or replays.",
+            &if e.op == "trial-adopt" {
+                adopt_fix(e)
+            } else {
+                "Wait for a running apply to finish, then run apply. An apply that holds the lock reports E_LOCKED. Doctor never settles or replays.".to_string()
+            },
         ));
     }
     for u in unresolved(&entries) {
@@ -405,7 +409,10 @@ fn journal_rows(store: &Store, rows: &mut Vec<Row>) -> Vec<String> {
                 "operation {} (journal id {id}, resource {}, since {}) ended unknown and {blocks}",
                 u.unknown.op, u.unknown.resource, u.unknown.at
             ),
-            &format!(
+            &if u.unknown.op == "trial-adopt" {
+                adopt_fix(u.intent.unwrap_or(u.unknown))
+            } else {
+                format!(
                 "Run `dfm state recover` or apply: they settle the entry when the path shows a clear result. Otherwise check the path, then run `dfm state resolve '{}' --as done`{} or `--as failed`. Doctor never settles.",
                 id.replace('\'', "'\\''"),
                 if u.paths().nth(1).is_some() {
@@ -413,10 +420,28 @@ fn journal_rows(store: &Store, rows: &mut Vec<Row>) -> Vec<String> {
                 } else {
                     ""
                 }
-            ),
+            )
+            },
         ));
     }
     open
+}
+
+/// The fix for an open or unknown `trial-adopt` entry (docs/adopt.md, "Interruption"). It names
+/// no path, so neither apply nor recovery settles it: the same adoption run again closes it, or
+/// the operator abandons it as failed. The module comes from the intent's token.
+fn adopt_fix(e: &JournalEntry) -> String {
+    let module = e
+        .token
+        .as_deref()
+        .and_then(|t| serde_json::from_str::<serde_json::Value>(t).ok())
+        .and_then(|v| v["module"].as_str().map(str::to_string))
+        .unwrap_or_else(|| "<module>".into());
+    format!(
+        "Run `dfm adopt {} --module {module}` again: it completes the interrupted adoption and closes this entry. To abandon the adoption, run `dfm state resolve '{}' --as failed`. Doctor never settles.",
+        e.resource,
+        e.op_id.replace('\'', "'\\''")
+    )
 }
 
 /// Whether `entry` has the staged-name shape of an older build: `.<name>.<pid>.<n>.<nanos>.tmp`
@@ -577,11 +602,14 @@ fn evidence_rows(l: &StateLoaded, findings: &[dfm_engine::Finding], rows: &mut V
     bad
 }
 
-/// One row per active trial. A record that is unreadable or written for another identity already
-/// has its WARN row among the evidence rows.
+/// One row per active trial. An adopted trial has ended and has no row. A record that is
+/// unreadable or written for another identity already has its WARN row among the evidence rows.
 fn trial_rows(l: &StateLoaded, findings: &[dfm_engine::Finding], rows: &mut Vec<Row>) {
     for (n, t) in &l.trials {
         let Ok(t) = t else { continue };
+        if !t.is_active() {
+            continue;
+        }
         let file = format!("trials/{n}");
         if findings.iter().any(|f| f.file == file) {
             continue;

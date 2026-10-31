@@ -22,8 +22,8 @@ use dfm_model::digest::sha256_hex;
 use dfm_model::fold;
 use dfm_model::merge::{Merged, check_foreign, leaf_hashes, salted};
 use dfm_model::plan::{
-    Action, Operation, Owned, PackageState, Plan, Request, ServiceState, Status as PlanStatus,
-    file_fingerprint, ledger_state, link_fingerprint, node_state,
+    Action, Node, Operation, Owned, PackageState, Plan, Request, ServiceState,
+    Status as PlanStatus, file_fingerprint, ledger_state, link_fingerprint, node_state,
 };
 use dfm_model::state::{
     Class, CoOwned, Fingerprint, JournalEntry, Ledger, OperationRecord, OwnedOutput, Phase,
@@ -156,8 +156,24 @@ pub(crate) fn components(rel: &str) -> Result<Vec<&str>, Refusal> {
 fn stages(a: Action) -> bool {
     matches!(
         a,
-        Action::CreateFile | Action::UpdateFile | Action::ReplaceLink | Action::Retire
+        Action::CreateFile
+            | Action::UpdateFile
+            | Action::ReplaceLink
+            | Action::AdoptFile
+            | Action::Retire
     )
+}
+
+/// The `file_fingerprint` of the regular file an `adopt_file` operation replaces: the hash its
+/// `path:` precondition recorded when `dfm adopt` planned it.
+fn adopted_fingerprint<'a>(op: &'a Operation, rel: &str) -> Option<&'a str> {
+    op.preconditions
+        .iter()
+        .find(|p| p.subject.strip_prefix("path:") == Some(rel))?
+        .state
+        .strip_prefix("file:")?
+        .split_once(":sha256:")
+        .map(|(_, h)| h)
 }
 
 fn is_file_action(a: Action) -> bool {
@@ -189,7 +205,7 @@ impl Approval {
         }
         match op.action {
             Action::Remove | Action::Restart => Some(Approval::Disruptive),
-            Action::Adopt => Some(Approval::Adopt),
+            Action::Adopt | Action::AdoptFile => Some(Approval::Adopt),
             _ => None,
         }
     }
@@ -416,7 +432,7 @@ fn first_refusal(plan: &Plan, generator: &dyn Generator) -> Result<(), Refusal> 
             continue;
         }
         match op.action {
-            Action::CreateLink | Action::ReplaceLink | Action::Adopt => {
+            Action::CreateLink | Action::ReplaceLink | Action::Adopt | Action::AdoptFile => {
                 let link = op
                     .link
                     .as_deref()
@@ -426,6 +442,28 @@ fn first_refusal(plan: &Plan, generator: &dyn Generator) -> Result<(), Refusal> 
                         "{} links to {link:?}, which is not inside the root of its own source",
                         op.id
                     )));
+                }
+                // The file is replaced only while it and the source still hold the bytes adopt
+                // compared: both hashes must be in the plan, because the publisher checks both
+                // again right before the rename.
+                if op.action == Action::AdoptFile {
+                    let hashed_source = op.inputs.first().is_some_and(|i| {
+                        op.preconditions.iter().any(|p| {
+                            p.subject == format!("source:{}", i.path)
+                                && p.state.starts_with("sha256:")
+                        })
+                    });
+                    let hashed_file = op
+                        .path
+                        .as_deref()
+                        .and_then(|rel| adopted_fingerprint(op, rel))
+                        .is_some();
+                    if !hashed_source || !hashed_file {
+                        return Err(plan_invalid(format!(
+                            "{} replaces a file but the plan records no hash of the file or of its source",
+                            op.id
+                        )));
+                    }
                 }
             }
             Action::CreateFile | Action::UpdateFile => {
@@ -628,6 +666,7 @@ fn step_name(op: &Operation) -> &'static str {
         Action::UpdateFile => "update-file",
         Action::Remove => "remove",
         Action::Adopt => "adopt",
+        Action::AdoptFile => "adopt-file",
         Action::Retire => "retire",
         Action::Install => "install",
         Action::Upgrade => "upgrade",
@@ -753,6 +792,19 @@ impl Exec<'_, '_> {
         .map_err(failed)?;
         let owned = self.owned().map_err(failed)?;
         let entry = owned.iter().find(|o| fold::eq(&o.path, rel));
+        // Settling an earlier `unknown` just recorded this very link: adoption has nothing left
+        // to do, and the operation is not stale. A takeover (`adopt-file`) also changed the path
+        // itself, so it is current only while the path is that link.
+        let recorded = matches!(op.action, Action::Adopt | Action::AdoptFile)
+            && entry.is_some_and(|e| {
+                e.resource == op.resource
+                    && op.link.as_deref().map(link_fingerprint).as_deref()
+                        == e.fingerprint.as_deref()
+            })
+            && (op.action == Action::Adopt
+                || obs.seen.get(rel).is_some_and(|s| {
+                    matches!(&s.node, Node::Link { target, .. } if op.link.as_deref() == Some(target.as_str()))
+                }));
         for p in &op.preconditions {
             let actual = if let Some(path) = p.subject.strip_prefix("path:") {
                 match obs.seen.get(path) {
@@ -765,16 +817,9 @@ impl Exec<'_, '_> {
             } else {
                 continue;
             };
-            // Settling an earlier `unknown` just recorded this very link: adoption has nothing
-            // left to do, and the operation is not stale.
-            let recorded = op.action == Action::Adopt
-                && p.subject.starts_with("ledger:")
-                && entry.is_some_and(|e| {
-                    e.resource == op.resource
-                        && op.link.as_deref().map(link_fingerprint).as_deref()
-                            == e.fingerprint.as_deref()
-                });
-            if actual != p.state && recorded {
+            let settled = p.subject.starts_with("ledger:")
+                || (op.action == Action::AdoptFile && p.subject == format!("path:{rel}"));
+            if actual != p.state && recorded && settled {
                 return Err(Ended::Current);
             }
             if actual != p.state {
@@ -963,7 +1008,11 @@ impl Exec<'_, '_> {
             // The planner blocks a leaf of another user. A leaf swapped in after the plan is
             // caught here, because the prerequisites compare no owner.
             (
-                Action::ReplaceLink | Action::UpdateFile | Action::Remove | Action::Adopt,
+                Action::ReplaceLink
+                | Action::UpdateFile
+                | Action::Remove
+                | Action::Adopt
+                | Action::AdoptFile,
                 Peek::File { own: false, .. }
                 | Peek::Link { own: false, .. }
                 | Peek::Other { own: false, .. },
@@ -987,7 +1036,15 @@ impl Exec<'_, '_> {
             (Action::Remove, Peek::File { .. } | Peek::Link { .. }) => {}
             (Action::Adopt, Peek::Link { target, .. })
                 if Some(target.as_str()) == op.link.as_deref() => {}
-            (Action::ReplaceLink | Action::UpdateFile | Action::Remove | Action::Adopt, _) => {
+            (Action::AdoptFile, Peek::File { .. }) => {}
+            (
+                Action::ReplaceLink
+                | Action::UpdateFile
+                | Action::Remove
+                | Action::Adopt
+                | Action::AdoptFile,
+                _,
+            ) => {
                 return Err(appeared(
                     "is no longer the entry the plan found; it is left alone",
                 ));
@@ -1075,7 +1132,10 @@ impl Exec<'_, '_> {
             },
             after: new_fp,
             owned: if records { vec![abs] } else { Vec::new() },
-            reload: published.then(|| RELOAD_NOT_ATTEMPTED.to_string()),
+            // An adopted file is replaced by a link to the same bytes: a consumer has nothing
+            // new to read, and an `allow_adopt` approval records no reload state.
+            reload: (published && op.action != Action::AdoptFile)
+                .then(|| RELOAD_NOT_ATTEMPTED.to_string()),
         })
     }
 
@@ -1922,7 +1982,12 @@ impl Exec<'_, '_> {
             }
             _ => Ok(()),
         };
-        let ledger_first = matches!(op.action, Action::UpdateFile | Action::ReplaceLink);
+        // An adopted file moves the ledger first too: an interruption then leaves an open intent
+        // that settling closes with ownership, not a link no entry records.
+        let ledger_first = matches!(
+            op.action,
+            Action::UpdateFile | Action::ReplaceLink | Action::AdoptFile
+        );
         if ledger_first {
             own()?;
         }
@@ -1967,6 +2032,24 @@ impl Exec<'_, '_> {
                 sys.uid,
                 fail,
             )?,
+            Action::AdoptFile => parent.replace_file_with_link(
+                name,
+                op.link.as_deref().unwrap_or_default(),
+                adopted_fingerprint(op, rel).unwrap_or_default(),
+                sys.uid,
+                // The source was checked before the intent. A checkout since then must not
+                // leave a link to other bytes where the only copy of the file was.
+                || {
+                    link_source(sys, self.plan, op).map_err(|g| match g {
+                        Gather::Stale(d) => Refusal::new(
+                            Code::Conflict,
+                            format!("{rel}: {d}; the file is left alone"),
+                        ),
+                        Gather::Failed(r) => r,
+                    })
+                },
+                fail,
+            )?,
             Action::CreateFile | Action::UpdateFile => {
                 let how = match ledger_fp {
                     Some(h) if op.action == Action::UpdateFile => Publish::Replace {
@@ -2006,8 +2089,10 @@ impl Exec<'_, '_> {
         match (op.action, parent.peek(sys, name)?) {
             (Action::Adopt, _) => self.still_exact_link(op, abs, parent, name)?,
             (Action::CreateDir, Peek::Dir { .. }) | (Action::Remove, Peek::Missing) => {}
-            (Action::CreateLink | Action::ReplaceLink, Peek::Link { target, .. })
-                if Some(target.as_str()) == op.link.as_deref() => {}
+            (
+                Action::CreateLink | Action::ReplaceLink | Action::AdoptFile,
+                Peek::Link { target, .. },
+            ) if Some(target.as_str()) == op.link.as_deref() => {}
             (Action::CreateFile | Action::UpdateFile, Peek::File { .. }) => {
                 let (h, _) = parent
                     .hash_file(name, MAX_FILE)?

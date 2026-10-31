@@ -10,11 +10,13 @@ mod scope;
 mod source;
 
 pub(crate) use docs::PROFILE_SCHEMA;
+#[cfg(test)]
+pub(crate) use docs::valid_id;
 pub use error::ResolveError;
 pub use explain::explain;
 pub use schema::{AdapterCatalog, AdapterSpec, Claims, Field, Include, Schema, TargetRule};
-pub use scope::{SourceScope, bundle_scope, profile_bundle_path};
-pub use source::{Entry, SourceSet, target_stays_inside};
+pub use scope::{SourceScope, bundle_scope, module_manifest, profile_bundle_path};
+pub use source::{Entry, SourceSet, is_git_name, target_stays_inside};
 mod compose;
 pub(crate) use compose::glob;
 

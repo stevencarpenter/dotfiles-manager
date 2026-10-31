@@ -189,6 +189,7 @@ impl Decision {
                 }),
             }),
             unknown: UNKNOWN.iter().map(|u| u.to_string()).collect(),
+            adopted: None,
         }
     }
 

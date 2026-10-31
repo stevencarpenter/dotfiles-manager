@@ -953,6 +953,7 @@ fn a_hand_written_trial_with_foreign_paths_is_a_finding_not_a_trial() {
             owned_outputs: vec![],
             package: None,
             unknown: vec![],
+            adopted: None,
         };
         let f = dir.join(format!("{n}.json"));
         fs::write(&f, dfm_model::state::canonical(&t).unwrap()).unwrap();
@@ -999,6 +1000,7 @@ fn a_trial_path_under_a_link_parent_is_a_finding() {
             owned_outputs: if owned { vec![path] } else { vec![] },
             package: None,
             unknown: vec![],
+            adopted: None,
         };
         let f = dir.join(format!("{n}.json"));
         fs::write(&f, dfm_model::state::canonical(&t).unwrap()).unwrap();
@@ -1117,6 +1119,7 @@ fn every_write_cap_is_enforced_before_anything_is_written() {
         owned_outputs: vec![],
         package: None,
         unknown: vec![],
+        adopted: None,
     };
     assert_eq!(code(s.write_trial(&t)), Code::LimitExceeded);
     assert!(!state.join("trials/big.json").exists());
@@ -1721,4 +1724,77 @@ fn one_output_under_an_unsafe_link_does_not_hide_a_recorded_salted_hash() {
         "a missing salt over a recorded hash is a definite finding: {:?}",
         s.load().problems
     );
+}
+
+fn plain_trial(stamp: &Stamp, id: &str) -> dfm_model::state::TrialRecord {
+    dfm_model::state::TrialRecord {
+        schema: dfm_model::state::SCHEMA,
+        binding: stamp.clone(),
+        trial_id: id.into(),
+        tool: "atuin".into(),
+        created_unix_ns: 1,
+        baseline: dfm_model::state::Baseline {
+            tool_preexisting: false,
+            paths: vec![],
+            owners: vec![],
+        },
+        owned_outputs: vec![],
+        package: None,
+        unknown: vec![],
+        adopted: None,
+    }
+}
+
+#[test]
+fn marking_a_trial_adopted_replaces_only_that_record() {
+    let h = Home::new();
+    let (s, stamp) = init(&h);
+    assert!(s.create_trial(&plain_trial(&stamp, "t1")).unwrap());
+    assert!(s.create_trial(&plain_trial(&stamp, "t2")).unwrap());
+    let dir = state_dir(&h).join("trials");
+    let other = fs::read(dir.join("t2.json")).unwrap();
+    let adopted = || dfm_model::state::TrialAdopted {
+        op_id: "adopt-1-2".into(),
+        module: "shell".into(),
+        at_unix_ns: 9,
+    };
+
+    s.mark_trial_adopted("t1", adopted()).unwrap();
+    let loaded = s.load();
+    let state_of = |id: &str| {
+        let (_, t) = loaded
+            .trials
+            .iter()
+            .find(|(n, _)| *n == format!("{id}.json"))
+            .unwrap();
+        t.as_ref().unwrap().clone()
+    };
+    assert_eq!(state_of("t1").adopted, Some(adopted()));
+    assert_eq!(
+        state_of("t1").schema,
+        dfm_model::state::TRIAL_SCHEMA_ADOPTED
+    );
+    assert!(state_of("t2").is_active());
+    assert_eq!(fs::read(dir.join("t2.json")).unwrap(), other);
+    assert_eq!(
+        fs::metadata(dir.join("t1.json")).unwrap().mode() & 0o777,
+        0o600
+    );
+
+    let before = fs::read(dir.join("t1.json")).unwrap();
+    let again = dfm_model::state::TrialAdopted {
+        module: "other".into(),
+        ..adopted()
+    };
+    assert_eq!(code(s.mark_trial_adopted("t1", again)), Code::Conflict);
+    assert_eq!(fs::read(dir.join("t1.json")).unwrap(), before);
+    assert_eq!(
+        code(s.mark_trial_adopted("nope", adopted())),
+        Code::StateInvalid
+    );
+    assert_eq!(
+        code(s.mark_trial_adopted("../t2", adopted())),
+        Code::StateInvalid
+    );
+    assert_eq!(fs::read(dir.join("t2.json")).unwrap(), other);
 }

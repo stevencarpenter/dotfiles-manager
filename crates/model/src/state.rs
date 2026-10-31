@@ -64,6 +64,22 @@ fn depth(v: &serde_json::Value) -> usize {
 /// parser's own recursion limit (128) fails to parse, so its top-level `schema` is read by
 /// [`deep_schema`], which does not recurse, and a newer one is still reported as newer.
 pub fn parse<T: DeserializeOwned>(kind: &str, bytes: &[u8]) -> Result<T, Refusal> {
+    parse_schemas(kind, bytes, &[SCHEMA])
+}
+
+/// As [`parse`], for a document kind that accepts more than one schema. `accepted` is ascending:
+/// a schema above its last entry is newer than this binary.
+fn parse_schemas<T: DeserializeOwned>(
+    kind: &str,
+    bytes: &[u8],
+    accepted: &[i64],
+) -> Result<T, Refusal> {
+    let newest = accepted.last().copied().unwrap_or(SCHEMA);
+    let supported = accepted
+        .iter()
+        .map(i64::to_string)
+        .collect::<Vec<_>>()
+        .join(", ");
     if bytes.len() > MAX_BYTES {
         return Err(Refusal::new(
             Code::LimitExceeded,
@@ -76,25 +92,25 @@ pub fn parse<T: DeserializeOwned>(kind: &str, bytes: &[u8]) -> Result<T, Refusal
             .contains("recursion limit exceeded")
             .then(|| deep_schema(bytes))
             .flatten()
-            .filter(|n| *n > SCHEMA.unsigned_abs());
+            .filter(|n| *n > newest.unsigned_abs());
         match newer_n {
-            Some(n) => newer(kind, &n.to_string()),
+            Some(n) => newer(kind, &n.to_string(), &supported),
             None => bad(format!("{kind} is not valid JSON: {e}")),
         }
     })?;
     let schema = v.get("schema");
     match schema.and_then(serde_json::Value::as_i64) {
-        Some(SCHEMA) => {}
-        Some(n) if n > SCHEMA => return Err(newer(kind, &n.to_string())),
+        Some(n) if accepted.contains(&n) => {}
+        Some(n) if n > newest => return Err(newer(kind, &n.to_string(), &supported)),
         Some(n) => {
             return Err(Refusal::new(
                 Code::SchemaUnsupported,
-                format!("{kind} schema {n} is not supported (supported: {SCHEMA})"),
+                format!("{kind} schema {n} is not supported (supported: {supported})"),
             ));
         }
         // An integer above `i64::MAX` is a schema this binary has never heard of: newer.
         None => match schema.and_then(serde_json::Value::as_u64) {
-            Some(n) => return Err(newer(kind, &n.to_string())),
+            Some(n) => return Err(newer(kind, &n.to_string(), &supported)),
             None => return Err(bad(format!("{kind} has no integer schema"))),
         },
     }
@@ -144,10 +160,10 @@ fn deep_schema(b: &[u8]) -> Option<u64> {
     None
 }
 
-fn newer(kind: &str, n: &str) -> Refusal {
+fn newer(kind: &str, n: &str, supported: &str) -> Refusal {
     Refusal::new(
         Code::StateNewer,
-        format!("{kind} schema {n} is newer than this binary supports (supported: {SCHEMA})"),
+        format!("{kind} schema {n} is newer than this binary supports (supported: {supported})"),
     )
 }
 
@@ -1039,7 +1055,23 @@ pub struct TrialPackage {
     pub install: Option<TrialInstall>,
 }
 
-/// `state/trials/<id>.json`: an active trial and its recoverable baseline.
+/// Trial schema of an adopted record. The type refuses unknown keys, so a record that carries
+/// `adopted` has its own schema: a binary built before `adopt` reports it as newer instead of
+/// failing on the key. An unadopted record stays at [`SCHEMA`].
+pub const TRIAL_SCHEMA_ADOPTED: i64 = 3;
+
+/// How `dfm adopt` ended a trial: the journal operation that wrote the adoption and the module
+/// that took the configuration.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TrialAdopted {
+    pub op_id: String,
+    pub module: String,
+    pub at_unix_ns: u64,
+}
+
+/// `state/trials/<id>.json`: a trial and its recoverable baseline. It is active until `adopted`
+/// is set; an adopted record stays as evidence and the id stays taken.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TrialRecord {
@@ -1057,18 +1089,33 @@ pub struct TrialRecord {
     /// candidates for review, never owned cleanup scope.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub unknown: Vec<String>,
+    /// Set once, by `adopt`, together with schema [`TRIAL_SCHEMA_ADOPTED`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub adopted: Option<TrialAdopted>,
 }
 
 impl TrialRecord {
     pub fn parse(bytes: &[u8]) -> Result<TrialRecord, Refusal> {
-        let t: TrialRecord = parse("trial", bytes)?;
+        let t: TrialRecord = parse_schemas("trial", bytes, &[SCHEMA, TRIAL_SCHEMA_ADOPTED])?;
         t.validate()?;
         Ok(t)
     }
 
+    /// False once `adopt` ended the trial. Every reader that means "a trial in progress" asks
+    /// this, not whether the record exists.
+    pub fn is_active(&self) -> bool {
+        self.adopted.is_none()
+    }
+
     pub fn validate(&self) -> Result<(), Refusal> {
-        if self.schema != SCHEMA {
-            return Err(bad("trial schema"));
+        let schema_ok = match &self.adopted {
+            None => self.schema == SCHEMA,
+            Some(a) => {
+                self.schema == TRIAL_SCHEMA_ADOPTED && valid_id(&a.op_id) && valid_id(&a.module)
+            }
+        };
+        if !schema_ok {
+            return Err(bad("trial schema or adoption is malformed"));
         }
         self.binding.validate()?;
         if !valid_id(&self.trial_id) || !valid_id(&self.tool) {
@@ -2018,6 +2065,7 @@ mod tests {
             owned_outputs: vec![],
             package: None,
             unknown: vec![],
+            adopted: None,
         };
         assert_eq!(TrialRecord::parse(&canonical(&t).unwrap()).unwrap(), t);
         let mut bad = t.clone();
@@ -2055,6 +2103,77 @@ mod tests {
         );
         with.package.as_mut().unwrap().name = "a b".into();
         assert!(with.validate().is_err());
+    }
+
+    #[test]
+    fn an_adopted_record_round_trips_and_is_not_active() {
+        let mut t = TrialRecord {
+            schema: SCHEMA,
+            binding: stamp(),
+            trial_id: "t1".into(),
+            tool: "atuin".into(),
+            created_unix_ns: 1,
+            baseline: Baseline {
+                tool_preexisting: false,
+                paths: vec![],
+                owners: vec![],
+            },
+            owned_outputs: vec![],
+            package: None,
+            unknown: vec![],
+            adopted: None,
+        };
+        assert!(t.is_active());
+        let plain = String::from_utf8(canonical(&t).unwrap()).unwrap();
+        assert!(
+            !plain.contains("adopted"),
+            "an unadopted record keeps schema 2"
+        );
+        assert_eq!(TrialRecord::parse(plain.as_bytes()).unwrap(), t);
+
+        t.schema = TRIAL_SCHEMA_ADOPTED;
+        t.adopted = Some(TrialAdopted {
+            op_id: "adopt-1-2".into(),
+            module: "shell".into(),
+            at_unix_ns: 9,
+        });
+        assert!(!t.is_active());
+        assert_eq!(TrialRecord::parse(&canonical(&t).unwrap()).unwrap(), t);
+
+        // `adopted` and the schema go together.
+        let mut no_flag = t.clone();
+        no_flag.adopted = None;
+        assert!(no_flag.validate().is_err(), "schema 3 needs `adopted`");
+        let mut old = t.clone();
+        old.schema = SCHEMA;
+        assert!(old.validate().is_err(), "schema 2 refuses `adopted`");
+        let text = String::from_utf8(canonical(&old).unwrap()).unwrap();
+        assert!(TrialRecord::parse(text.as_bytes()).is_err());
+
+        // A schema the binary does not read names both trial schemas it does read.
+        for (n, code) in [(1, Code::SchemaUnsupported), (9, Code::StateNewer)] {
+            let e = TrialRecord::parse(format!("{{\"schema\":{n}}}").as_bytes()).unwrap_err();
+            assert_eq!(e.code, code, "{n}");
+            assert!(e.detail.ends_with("(supported: 2, 3)"), "{n}: {}", e.detail);
+        }
+
+        for bad in ["Bad Id", ""] {
+            let mut b = t.clone();
+            b.adopted.as_mut().unwrap().op_id = bad.into();
+            assert!(b.validate().is_err(), "op_id {bad:?}");
+            let mut b = t.clone();
+            b.adopted.as_mut().unwrap().module = bad.into();
+            assert!(b.validate().is_err(), "module {bad:?}");
+        }
+
+        // A schema above 3 is newer; 4 is not read as supported.
+        let newer = String::from_utf8(canonical(&t).unwrap())
+            .unwrap()
+            .replace("\"schema\":3", "\"schema\":4");
+        assert_eq!(
+            TrialRecord::parse(newer.as_bytes()).unwrap_err().code,
+            Code::StateNewer
+        );
     }
 
     #[test]
@@ -2401,6 +2520,7 @@ mod tests {
             owned_outputs: vec![],
             package: None,
             unknown: vec![],
+            adopted: None,
         };
         t.validate().unwrap();
         t.schema = 3;

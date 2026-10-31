@@ -2,6 +2,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod adopt;
 pub mod binding;
 pub mod controls;
 pub mod digest;

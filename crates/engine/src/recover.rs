@@ -76,9 +76,12 @@ pub(crate) fn inspect(store: &Store, w: Where<'_>, e: &JournalEntry) -> (Probe, 
         ("remove", _) if same => Probe::NotDone,
         (JournalEntry::CREATE_DIR, Peek::Dir { .. }) => Probe::Done,
         (_, Peek::Missing) => Probe::NotDone,
-        ("create-link" | "replace-link" | "create-file" | "update-file" | "adopt", _) if same => {
-            Probe::Done
-        }
+        (
+            "create-link" | "replace-link" | "create-file" | "update-file" | "adopt" | "adopt-file",
+            _,
+        ) if same => Probe::Done,
+        // The rename puts the link in place at once: a regular file means it did not happen.
+        ("adopt-file", Peek::File { .. }) => Probe::NotDone,
         // Still the content the ledger records: the replace did not happen.
         ("replace-link" | "update-file", _)
             if fp.is_some() && fp == ledger_fp(store, e, &out.path).as_ref() =>
@@ -458,7 +461,7 @@ fn owned_mode(op: &str, peek: &Peek) -> Option<u32> {
             },
         ) => Some(*mode),
         (
-            "create-link" | "replace-link" | "adopt",
+            "create-link" | "replace-link" | "adopt" | "adopt-file",
             Peek::Link {
                 to: PeekTo::File,
                 own: true,

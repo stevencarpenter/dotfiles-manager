@@ -313,6 +313,13 @@ pub(crate) fn join(base_dir: &str, rel: &str, _root: &str) -> Result<String, Pat
     })
 }
 
+/// Whether a path component names git repository metadata (`.git` in any case). The source
+/// loader skips it at the top and refuses it deeper, as a submodule or gitlink; adopt refuses a
+/// repo path through one, which the loader would refuse later.
+pub fn is_git_name(name: &str) -> bool {
+    name.to_lowercase() == ".git"
+}
+
 /// Whether a link whose target is `target` stays inside the directory it is published in, when
 /// the link sits `depth` levels below that directory. The target must be relative and may climb
 /// only with leading `..` components, no more than `depth` of them. A `..` after a name is
@@ -355,6 +362,16 @@ pub(crate) fn parent(path: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_git_name_matches_in_any_case_and_only_whole() {
+        for n in [".git", ".GIT", ".Git"] {
+            assert!(is_git_name(n), "{n}");
+        }
+        for n in ["git", ".gitignore", ".git2", "x.git", ""] {
+            assert!(!is_git_name(n), "{n}");
+        }
+    }
 
     #[test]
     fn a_target_may_only_climb_with_leading_parents_and_not_past_the_directory() {
