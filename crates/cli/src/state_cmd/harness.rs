@@ -278,6 +278,7 @@ pub fn record_trial(ctx: &Ctx, args: &[String], out: &mut dyn Write) -> Result<(
         tool,
         created_unix_ns: now_ns()?,
         baseline: Baseline {
+            data: vec![],
             tool_preexisting: false,
             paths: vec![BaselinePath {
                 path,
