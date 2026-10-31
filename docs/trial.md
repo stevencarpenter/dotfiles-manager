@@ -67,7 +67,7 @@ The record is a private file under `state/trials/`. `state check` validates it w
 
 ## Updates
 
-A trial is updated with the other packages as if it were already adopted (the owner's decision of 2026-10-31). Nothing holds an update for a trial.
+A trial is updated with the other packages as if it were already adopted (the owner's decision of 2026-10-31). Nothing holds an update for a trial. A trial is not saved in the dotfiles configuration: it is a package that dfm manages from its own state. Every trial update reads the trial record under `state/trials/` and needs no dotfiles file. No update writes the trial's tool into a dotfiles file (a mise configuration, a Brewfile, a manifest or a profile). Only `adopt` writes it into a module.
 
 - **Homebrew.** `sync`'s `brew` updater upgrades a trial's formula or cask with every other outdated package (docs/upgrade.md, "Trials").
 - **mise.** `dfm packages --update` rolls the tool of each active `mise/v1` trial as a declared rolling tool (docs/toolchains.md, "Trials"). `sync` runs `packages` without `--update`, so it rolls no mise tool, declared or trial.
