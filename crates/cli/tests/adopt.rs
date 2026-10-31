@@ -1070,6 +1070,139 @@ fn doctor_points_an_interrupted_adopt_to_adopt_or_resolve() {
     check(&fx, "unknown entry", "ended unknown");
 }
 
+/// Rewrites each `trial-adopt` entry of the journal with `edit`.
+fn edit_adopt_journal(fx: &Fx, edit: impl Fn(&mut serde_json::Value)) {
+    let path = fx.state().join("journal.jsonl");
+    let text = fs::read_to_string(&path).unwrap();
+    let mut lines = Vec::new();
+    for l in text.lines() {
+        let mut v: serde_json::Value = serde_json::from_str(l).unwrap();
+        if v["op"] == "trial-adopt" {
+            edit(&mut v);
+        }
+        lines.push(serde_json::to_string(&v).unwrap());
+    }
+    fs::write(&path, lines.join("\n") + "\n").unwrap();
+}
+
+#[test]
+fn an_intent_from_before_the_trial_or_for_another_module_is_ignored() {
+    for (what, edit) in [
+        (
+            "older than the trial record",
+            Box::new(|v: &mut serde_json::Value| {
+                let id = v["op_id"].as_str().unwrap().to_string();
+                let pid = id.rsplit('-').next().unwrap().to_string();
+                v["op_id"] = format!("adopt-1-{pid}").into();
+            }) as Box<dyn Fn(&mut serde_json::Value)>,
+        ),
+        (
+            "another module",
+            Box::new(|v: &mut serde_json::Value| {
+                if let Some(t) = v["token"].as_str() {
+                    let mut t: serde_json::Value = serde_json::from_str(t).unwrap();
+                    t["module"] = "extra".into();
+                    v["token"] = t.to_string().into();
+                }
+            }),
+        ),
+    ] {
+        let fx = Fx::new();
+        fx.live(LIVE, TUICR);
+        interrupted(&fx, "adopt-after-copy:abort");
+        edit_adopt_journal(&fx, edit);
+        // Not this adoption's work: the repo copy is a file adopt did not write.
+        let before = fx.snapshot();
+        let o = fx.adopt(&["--module", "core", "--preview"]);
+        assert!(!out(&o).contains("resume: "), "{what}\n{}", out(&o));
+        refused(&o, "already exists in the root");
+        assert_eq!(fx.snapshot(), before, "{what}");
+    }
+}
+
+#[test]
+fn an_unreadable_intent_token_is_refused_with_zero_writes() {
+    let fx = Fx::new();
+    fx.live(LIVE, TUICR);
+    interrupted(&fx, "adopt-after-copy:abort");
+    edit_adopt_journal(&fx, |v| {
+        if v["token"].is_string() {
+            v["token"] = "not json".into();
+        }
+    });
+    let before = fx.snapshot();
+    refused(
+        &fx.adopt(&["--module", "core", "--preview"]),
+        "E_STATE_INVALID",
+    );
+    assert_eq!(fx.snapshot(), before);
+}
+
+#[test]
+fn a_digest_from_before_the_interruption_is_stale_with_zero_writes() {
+    let fx = Fx::new();
+    fx.live(LIVE, TUICR);
+    let d = digest_of(&fx.adopt(&["--module", "core", "--preview"]));
+    interrupted(&fx, "adopt-after-manifest:abort");
+    let before = fx.snapshot();
+    refused(
+        &fx.adopt(&["--module", "core", "--yes-plan", &d]),
+        "E_PLAN_STALE",
+    );
+    assert_eq!(fx.snapshot(), before);
+}
+
+#[test]
+fn a_second_run_completes_after_a_stop_request() {
+    let reference = reference_tree();
+    let fx = Fx::new();
+    fx.live(LIVE, TUICR);
+    let d = digest_of(&fx.adopt(&["--module", "core", "--preview"]));
+    let o = fx.run_env(
+        &[("DFM_FAILPOINT", "adopt-after-manifest:stop")],
+        &["adopt", "trial-tuicr", "--module", "core", "--yes-plan", &d],
+    );
+    assert_eq!(code(&o), 143, "{}\n{}", stderr(&o), out(&o));
+    assert_eq!(fx.record()["schema"], 2);
+    let o = fx.adopt(&["--module", "core", "--preview"]);
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), out(&o));
+    assert!(out(&o).contains("resume: "), "{}", out(&o));
+    let o = fx.adopt(&["--module", "core", "--yes-plan", &digest_of(&o)]);
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), out(&o));
+    fx.assert_adopted(&reference);
+}
+
+#[test]
+fn a_trial_without_a_brewfile_line_completes_after_a_stop() {
+    // mise/v1: no Brewfile line. The reference is an uninterrupted adoption of the same trial.
+    let mise = || {
+        let fx = Fx::bare();
+        let d = digest_of(&fx.run(&["trial", "tuicr", "--provider", "mise/v1", "--preview"]));
+        let o = fx.run(&["trial", "tuicr", "--provider", "mise/v1", "--yes-plan", &d]);
+        assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), out(&o));
+        fx.live(LIVE, TUICR);
+        fx
+    };
+    let reference = {
+        let fx = mise();
+        let o = fx.adopt_approved("core");
+        assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), out(&o));
+        tree(&fx.root)
+    };
+    let fx = mise();
+    let brewfile = fs::read(fx.root.join("Brewfile")).unwrap();
+    interrupted(&fx, "adopt-after-manifest:abort");
+    let o = fx.adopt(&["--module", "core", "--preview"]);
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), out(&o));
+    assert!(out(&o).contains("resume: "), "{}", out(&o));
+    let o = fx.adopt(&["--module", "core", "--yes-plan", &digest_of(&o)]);
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), out(&o));
+    assert_eq!(tree(&fx.root), reference);
+    assert_eq!(fs::read(fx.root.join("Brewfile")).unwrap(), brewfile);
+    assert_eq!(fs::read_link(fx.h(LIVE)).unwrap(), fx.root.join(REPO_FILE));
+    assert_eq!(fx.record()["schema"], 3);
+}
+
 #[test]
 fn a_third_run_completes_after_two_stops_in_a_row() {
     let reference = reference_tree();
