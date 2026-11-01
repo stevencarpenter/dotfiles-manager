@@ -54,7 +54,7 @@ jobs:
             printf 'changed:\n%s\n' "$changed"
             rust=false
             bootstrap=false
-            rust_inputs='^(crates/|examples/|tests/|Cargo\.(toml|lock)$|rust-toolchain\.toml$|scripts/check_all\.sh$|scripts/bootstrap\.sh$|docs/bootstrap\.md$|\.github/workflows/contract-check\.yml$)'
+            rust_inputs='^(crates/|examples/|tests/|Cargo\.(toml|lock)$|rust-toolchain\.toml$|scripts/check_all\.sh$|scripts/bootstrap\.sh$|docs/bootstrap\.md$|docs/authoring\.md$|\.github/workflows/contract-check\.yml$)'
             bootstrap_inputs='^(scripts/bootstrap\.sh$|crates/cli/tests/bootstrap\.rs$|crates/cli/tests/common/|crates/[^/]+/Cargo\.toml$|Cargo\.(toml|lock)$|rust-toolchain\.toml$|scripts/check_all\.sh$|\.github/workflows/contract-check\.yml$)'
             if printf '%s\n' "$changed" | grep -Eq "$rust_inputs"; then rust=true; fi
             if printf '%s\n' "$changed" | grep -Eq "$bootstrap_inputs"; then bootstrap=true; fi
