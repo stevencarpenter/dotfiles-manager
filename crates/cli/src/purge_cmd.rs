@@ -12,12 +12,13 @@ use dfm_engine::fsys::{Dir, Peek, Sys};
 use dfm_engine::{Runner, Store, now_ns, signal};
 use dfm_model::digest::sha256_hex;
 use dfm_model::display::{bounded_visible, visible};
+use dfm_model::fold::fold;
 use dfm_model::plan::{Binary, PackageState, file_fingerprint};
 use dfm_model::resolve::{Table, Value};
 use dfm_model::state::{
     Approval, BaselinePath, BinaryId, Class, JournalEntry, MAX_BYTES, OperationRecord, Phase,
-    ProfileRef, Receipt, Recovery, RunResult, SCHEMA, Stamp, Status, TrialRecord, count_statuses,
-    rfc3339,
+    ProfileRef, Receipt, Recovery, RecoveryOutput, RunResult, SCHEMA, Stamp, Status, TrialRecord,
+    count_statuses, rfc3339,
 };
 use dfm_model::{Code, Exit, Refusal};
 use serde_json::json;
@@ -191,6 +192,16 @@ fn line(out: &mut dyn Write, what: &str, s: &Step) -> std::io::Result<()> {
         Step::Do => writeln!(out, "action: {what}"),
         Step::Absent => writeln!(out, "nothing: {what} (already absent)"),
         Step::Keep(why) => writeln!(out, "keep: {what}: {}", visible(why)),
+    }
+}
+
+/// Whether two recorded names are one package: brew treats `atuin` and `homebrew/core/atuin`
+/// as the same formula. Other adapters compare the names as written.
+fn same_package(adapter: &str, a: &str, b: &str) -> bool {
+    if adapter == HOMEBREW {
+        package::brewfile_names(a).0 == package::brewfile_names(b).0
+    } else {
+        a == b
     }
 }
 
@@ -502,10 +513,12 @@ pub fn run(ctx: &Ctx, args: &Args, out: &mut dyn Write) -> Result<(), Refusal> {
                 .find(|o| {
                     o.package.as_ref().is_some_and(|p| {
                         p.adapter == adapter
-                            && (p.name == name
-                                || p.install
-                                    .as_ref()
-                                    .is_some_and(|i| i.dependencies.iter().any(|d| d == name)))
+                            && (same_package(adapter, &p.name, name)
+                                || p.install.as_ref().is_some_and(|i| {
+                                    i.dependencies
+                                        .iter()
+                                        .any(|d| same_package(adapter, d, name))
+                                }))
                     })
                 })
                 .map(|o| o.trial_id.clone())
@@ -627,6 +640,7 @@ pub fn run(ctx: &Ctx, args: &Args, out: &mut dyn Write) -> Result<(), Refusal> {
     let mut act = |op: &str,
                    adapter: &str,
                    target: &str,
+                   outputs: Vec<RecoveryOutput>,
                    retain: bool,
                    f: &dyn Fn() -> Result<(), Refusal>|
      -> Result<Option<Code>, Refusal> {
@@ -654,7 +668,7 @@ pub fn run(ctx: &Ctx, args: &Args, out: &mut dyn Write) -> Result<(), Refusal> {
         journal(
             Phase::Intent,
             Some(Recovery {
-                outputs: vec![],
+                outputs,
                 snapshot: None,
             }),
             None,
@@ -703,7 +717,7 @@ pub fn run(ctx: &Ctx, args: &Args, out: &mut dyn Write) -> Result<(), Refusal> {
 
     let journaled = (|| -> Result<(), Refusal> {
         if let Some((adapter, name, Step::Do)) = &locked.package {
-            let failed = act("uninstall", adapter, name, false, &|| {
+            let failed = act("uninstall", adapter, name, vec![], false, &|| {
                 package::uninstall(&runner, adapter, &package_value(name))?;
                 match package::listed(&runner, adapter, &package_value(name))? {
                     PackageState::Missing(_) => Ok(()),
@@ -733,21 +747,36 @@ pub fn run(ctx: &Ctx, args: &Args, out: &mut dyn Write) -> Result<(), Refusal> {
             .collect();
         if !deps.is_empty() {
             let all = deps.join(" ");
-            let failed = act("uninstall", HOMEBREW, &all, true, &|| {
+            let failed = act("uninstall", HOMEBREW, &all, vec![], true, &|| {
                 package::uninstall_formulae(&runner, &deps)
             })?;
             if failed == Some(Code::Conflict) {
                 for n in &deps {
-                    act("uninstall", HOMEBREW, n, true, &|| {
+                    act("uninstall", HOMEBREW, n, vec![], true, &|| {
                         package::uninstall_formulae(&runner, std::slice::from_ref(n))
                     })?;
                 }
             }
         }
+        // A recorded path below a directory this run already removed went with that tree.
+        let mut removed: Vec<&str> = Vec::new();
         for p in locked.paths.iter().filter(|p| p.step == Step::Do) {
-            act("remove", "fs", &p.path, false, &|| {
+            let below = |r: &&str| fold(&p.path).starts_with(&format!("{}/", fold(r)));
+            if removed.iter().any(below) {
+                continue;
+            }
+            // The target lets `state recover` settle an interrupted removal.
+            let target = vec![RecoveryOutput {
+                path: p.path.clone(),
+                existed_before: true,
+                expected_sha256: None,
+            }];
+            let failed = act("remove", "fs", &p.path, target, false, &|| {
                 remove_path(&store, &sys, &layout.home, &p.path, &fail)
             })?;
+            if failed.is_none() {
+                removed.push(&p.path);
+            }
         }
         Ok(())
     })();

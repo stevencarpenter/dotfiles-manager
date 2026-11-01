@@ -1622,3 +1622,72 @@ fn an_old_record_without_data_paths_is_purged_with_a_note() {
     let o = fx.purge_approved("trial-atuin");
     assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
 }
+
+#[test]
+fn purge_keeps_a_package_another_trial_names_by_its_tap() {
+    let fx = Fx::new();
+    fx.brew_trial();
+    let o = fx.trial(&["atuin", "--provider", BREW, "--id", "again", "--preview"]);
+    let o = fx.trial(&[
+        "atuin",
+        "--provider",
+        BREW,
+        "--id",
+        "again",
+        "--yes-plan",
+        &digest_of(&o),
+    ]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    // The other trial spells the same formula with its official tap.
+    let again = fx.state().join("trials/again.json");
+    let mut r = fx.json(&again);
+    r["package"]["name"] = "homebrew/core/atuin".into();
+    fs::write(&again, serde_json::to_vec(&r).unwrap()).unwrap();
+    let o = fx.purge_approved("trial-atuin");
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+    assert!(
+        text(&o.stdout).contains("keep: uninstall homebrew/v1 atuin: trial again also uses it"),
+        "{}",
+        text(&o.stdout)
+    );
+    assert!(fx.cellar("atuin").exists());
+}
+
+#[test]
+fn purge_removes_a_recorded_file_inside_a_recorded_directory_once() {
+    let fx = Fx::new();
+    let args = |tail: &[&str]| {
+        let mut v = vec![
+            "atuin",
+            "--provider",
+            BREW,
+            "--config",
+            ".config/atuin",
+            "--config",
+            ".config/atuin/config.toml",
+        ];
+        v.extend_from_slice(tail);
+        v.into_iter().map(String::from).collect::<Vec<_>>()
+    };
+    let run = |a: Vec<String>| fx.trial(&a.iter().map(String::as_str).collect::<Vec<_>>());
+    let o = run(args(&["--preview"]));
+    let o = run(args(&["--yes-plan", &digest_of(&o)]));
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+    let dir = fx.home_put(".config/atuin/config.toml", "x\n");
+    let o = fx.purge_approved("trial-atuin");
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+    assert!(!dir.parent().unwrap().exists());
+    assert!(!fx.state().join("trials/trial-atuin.json").exists());
+    // Each removal intent names its target, so `state recover` can settle an interrupted one.
+    let home = fx.home.path().display().to_string();
+    let intents: Vec<_> = fx
+        .journal()
+        .into_iter()
+        .filter(|e| e["op"] == "remove" && e["phase"] == "intent")
+        .collect();
+    assert_eq!(intents.len(), 1, "{intents:?}");
+    assert_eq!(
+        intents[0]["recovery"]["outputs"][0]["path"],
+        format!("{home}/.config/atuin").as_str()
+    );
+}
