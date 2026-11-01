@@ -5,7 +5,7 @@
 //! and starts no process.
 
 use crate::read_fs::{read_regular_bounded, sha256_file};
-use crate::{Ctx, Loaded, load_resolved, paint, read_existing_binding, usage};
+use crate::{Ctx, Loaded, cli, load_resolved, paint, read_existing_binding, usage};
 use dfm_engine::{Dir, Fail, Store, merge, observe};
 use dfm_model::display::visible;
 use dfm_model::plan::{
@@ -25,34 +25,12 @@ pub struct Args {
 }
 
 /// `plan [--root <dir>] [--json] [--against <saved plan>]`, flags in any order.
-pub fn parse_args(args: &[String]) -> Result<Args, Refusal> {
-    let (mut root, mut against, mut json) = (None, None, false);
-    let mut it = args.iter();
-    while let Some(a) = it.next() {
-        match a.as_str() {
-            "--json" if !json => json = true,
-            "--json" => return Err(usage("--json given twice")),
-            "--root" | "--against" => {
-                let slot = if a == "--root" {
-                    &mut root
-                } else {
-                    &mut against
-                };
-                let v = it
-                    .next()
-                    .ok_or_else(|| usage(format!("{a} needs a value")))?;
-                if slot.replace(v.clone()).is_some() {
-                    return Err(usage(format!("{a} given twice")));
-                }
-            }
-            other => return Err(usage(format!("unknown argument {other}"))),
-        }
+pub fn parse_args(m: &clap::ArgMatches) -> Args {
+    Args {
+        root: cli::one(m, "root"),
+        json: cli::flag(m, "json"),
+        against: cli::one(m, "against"),
     }
-    Ok(Args {
-        root,
-        json,
-        against,
-    })
 }
 
 /// SHA-256 of the running executable: the binary identity in the plan. Streamed, not loaded.

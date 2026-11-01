@@ -1,6 +1,7 @@
 //! `state check` (all builds) and the recording commands used to test the engine through the
 //! binary (isolated builds only).
 
+use super::cli::one;
 use super::{Ctx, bounded, header, usage};
 use dfm_engine::{Dir, Fail, Finding, Store, Sys, recover, resolve, verify_identity};
 use dfm_model::state::Phase;
@@ -305,14 +306,16 @@ pub fn recover_cmd(ctx: &Ctx, out: &mut dyn Write) -> Result<(), Refusal> {
     }
 }
 
-pub fn dispatch_state(ctx: &Ctx, rest: &[String], out: &mut dyn Write) -> Result<(), Refusal> {
+pub fn dispatch_state(ctx: &Ctx, m: &clap::ArgMatches, out: &mut dyn Write) -> Result<(), Refusal> {
     const USAGE: &str =
         "usage: state check | state recover | state resolve <journal-id> --as done|failed";
-    match rest {
-        [sub] if sub == "check" => check(ctx, out),
-        [sub] if sub == "recover" => recover_cmd(ctx, out),
-        [sub, id, flag, kind] if sub == "resolve" && flag == "--as" => match kind.as_str() {
-            "done" | "failed" => resolve_cmd(ctx, id, kind == "done", out),
+    match m.subcommand() {
+        Some(("check", _)) => check(ctx, out),
+        Some(("recover", _)) => recover_cmd(ctx, out),
+        Some(("resolve", r)) => match (one(r, "journal-id"), one(r, "as").as_deref()) {
+            (Some(id), Some(kind @ ("done" | "failed"))) => {
+                resolve_cmd(ctx, &id, kind == "done", out)
+            }
             _ => Err(usage("state resolve: --as is done or failed")),
         },
         _ => Err(usage(USAGE)),

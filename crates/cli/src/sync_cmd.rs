@@ -14,8 +14,8 @@ use crate::plan_cmd::{plan_for, plan_with_outputs, render_body};
 use crate::read_fs::read_regular_bounded;
 use crate::source_fs::load_scoped;
 use crate::{
-    Ctx, Loaded, apply_cmd, builtin_catalog, canonical_root, paint, require_binding, state_cmd,
-    usage,
+    Ctx, Loaded, apply_cmd, builtin_catalog, canonical_root, cli, paint, require_binding,
+    state_cmd, usage,
 };
 use dfm_engine::{
     Approval as Allowance, Dir, End, Lock as FileLock, ProcRequest, Runner, Store, Sys, now_ns,
@@ -80,30 +80,13 @@ pub struct Args {
 
 /// `sync [--root <dir>] [--preview] [--yes-plan <digest>] [--allow-disruptive <id>]...
 /// [--allow-adopt <id>]... [--restart <resource-id>]... [--trust-origin <origin>]...`
-pub fn parse_args(args: &[String]) -> Result<Args, Refusal> {
-    let (mut trust, mut restart, mut rest) = (Vec::new(), BTreeSet::new(), Vec::new());
-    let mut upgrade = true;
-    let mut it = args.iter();
-    while let Some(a) = it.next() {
-        if a == "--no-upgrade" {
-            if !upgrade {
-                return Err(usage("--no-upgrade given twice"));
-            }
-            upgrade = false;
-        } else if a == "--trust-origin" || a == "--restart" {
-            let v = it
-                .next()
-                .ok_or_else(|| usage(format!("{a} needs a value")))?;
-            if a == "--restart" {
-                restart.insert(v.clone());
-            } else {
-                trust.push(v.clone());
-            }
-        } else {
-            rest.push(a.clone());
-        }
-    }
-    let apply = apply_cmd::parse_args(&rest, Scope::Config)?;
+pub fn parse_args(m: &clap::ArgMatches) -> Result<Args, Refusal> {
+    let (trust, restart) = (
+        cli::all(m, "trust-origin"),
+        cli::all(m, "restart").into_iter().collect(),
+    );
+    let upgrade = !cli::flag(m, "no-upgrade");
+    let apply = apply_cmd::parse_args(m, Scope::Config)?;
     if apply.preview && !trust.is_empty() {
         return Err(usage(
             "--preview writes nothing, so it cannot grant an origin; run sync --trust-origin without --preview",
@@ -2657,7 +2640,9 @@ mod tests {
             op("grandchild", Action::CreateLink, false, &["child"]),
             op("free", Action::CreateLink, false, &[]),
         ];
-        let mut args = apply_cmd::parse_args(&[], Scope::Config).unwrap();
+        let mut args =
+            apply_cmd::parse_args(&crate::cli::parse("apply", &[]).unwrap(), Scope::Config)
+                .unwrap();
         assert!(
             apply_cmd::withheld(&args, &plan).is_empty(),
             "a standalone command holds nothing back"
@@ -2918,32 +2903,23 @@ mod tests {
 
     #[test]
     fn trust_origin_cannot_be_combined_with_preview() {
-        let args: Vec<String> = ["--root", "/r", "--preview", "--trust-origin", "https://h/x"]
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
-        assert_eq!(parse_args(&args).err().map(|e| e.code), Some(Code::Usage));
-        let args: Vec<String> = [
+        let p = |v: &[&str]| crate::cli::parse("sync", v).and_then(|m| parse_args(&m));
+        let d = "0".repeat(64);
+        let usage = Some(Code::Usage);
+        let args = ["--root", "/r", "--preview", "--trust-origin", "https://h/x"];
+        assert_eq!(p(&args).err().map(|e| e.code), usage);
+        let args = [
             "--root",
             "/r",
             "--yes-plan",
-            &"0".repeat(64),
+            &d,
             "--trust-origin",
             "https://h/x",
-        ]
-        .iter()
-        .map(|s| s.to_string())
-        .collect();
-        assert_eq!(parse_args(&args).err().map(|e| e.code), Some(Code::Usage));
-        let args: Vec<String> = ["-y", &"0".repeat(64), "--trust-origin", "https://h/x"]
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
-        assert_eq!(parse_args(&args).err().map(|e| e.code), Some(Code::Usage));
-        let args: Vec<String> = ["--root", "/r", "--trust-origin", "https://h/x"]
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
-        assert_eq!(parse_args(&args).unwrap().trust, ["https://h/x"]);
+        ];
+        assert_eq!(p(&args).err().map(|e| e.code), usage);
+        let args = ["-y", &d, "--trust-origin", "https://h/x"];
+        assert_eq!(p(&args).err().map(|e| e.code), usage);
+        let args = ["--root", "/r", "--trust-origin", "https://h/x"];
+        assert_eq!(p(&args).unwrap().trust, ["https://h/x"]);
     }
 }

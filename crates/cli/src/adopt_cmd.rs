@@ -16,7 +16,7 @@ use crate::apply_cmd::{is_digest, label, stale};
 use crate::plan_cmd::{Probed, binary_identity, plan_with_outputs};
 use crate::read_fs::read_regular_bounded;
 use crate::sync_cmd::Git;
-use crate::{Ctx, Loaded, load_resolved, paint, require_binding, state_cmd, usage};
+use crate::{Ctx, Loaded, cli, load_resolved, paint, require_binding, state_cmd, usage};
 use dfm_engine::{
     Approval as Allowance, Dir, End, ProcRequest, Run, Runner, Store, now_ns, signal,
 };
@@ -488,32 +488,13 @@ pub struct Args {
 }
 
 /// `adopt <trial-id> --module <module> [--root <dir>] [--preview] [-y|--yes-plan <digest>]`.
-pub fn parse_args(args: &[String]) -> Result<Args, Refusal> {
-    let (mut trial, mut module, mut root, mut yes, mut preview) = (None, None, None, None, false);
-    let mut it = args.iter();
-    while let Some(a) = it.next() {
-        let mut value = |slot: &mut Option<String>| -> Result<(), Refusal> {
-            let v = it
-                .next()
-                .ok_or_else(|| usage(format!("{a} needs a value")))?;
-            if slot.replace(v.clone()).is_some() {
-                return Err(usage(format!("{a} given twice")));
-            }
-            Ok(())
-        };
-        match a.as_str() {
-            "--module" => value(&mut module)?,
-            "--root" => value(&mut root)?,
-            "--yes-plan" | "-y" => value(&mut yes)?,
-            "--preview" if !preview => preview = true,
-            "--preview" => return Err(usage("--preview given twice")),
-            other if other.starts_with('-') => {
-                return Err(usage(format!("unknown argument {other}")));
-            }
-            _ if trial.is_some() => return Err(usage("adopt takes one trial id")),
-            _ => trial = Some(a.clone()),
-        }
-    }
+pub fn parse_args(m: &clap::ArgMatches) -> Result<Args, Refusal> {
+    let (trial, module, root) = (
+        cli::one(m, "trial-id"),
+        cli::one(m, "module"),
+        cli::one(m, "root"),
+    );
+    let (yes, preview) = (cli::one(m, "yes-plan"), cli::flag(m, "preview"));
     if preview && yes.is_some() {
         return Err(usage("--preview and --yes-plan cannot be used together"));
     }
@@ -2243,7 +2224,7 @@ mod tests {
 
     #[test]
     fn arguments_take_one_trial_id_and_a_required_module() {
-        let a = |v: &[&str]| parse_args(&v.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+        let a = |v: &[&str]| crate::cli::parse("adopt", v).and_then(|m| parse_args(&m));
         let ok = a(&["trial-x", "--module", "core", "--root", "/r", "--preview"]).unwrap();
         assert_eq!(
             (ok.trial.as_str(), ok.module.as_str(), ok.preview),

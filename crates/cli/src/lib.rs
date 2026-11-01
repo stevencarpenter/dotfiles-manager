@@ -6,6 +6,7 @@
 mod adapters;
 mod adopt_cmd;
 mod apply_cmd;
+mod cli;
 mod controls_fs;
 mod doctor_cmd;
 mod paint;
@@ -349,44 +350,8 @@ fn provider_path(home: &Path) -> Vec<PathBuf> {
     dfm_platform_macos::provider_path(home)
 }
 
-#[cfg(feature = "test-isolation")]
-fn split_home(args: &[String]) -> Result<(Option<String>, &[String]), Refusal> {
-    match args {
-        [flag, home, rest @ ..] if flag == "--home" => Ok((Some(home.clone()), rest)),
-        [flag] if flag == "--home" => Err(usage("--home needs a value")),
-        _ => Ok((None, args)),
-    }
-}
-
-#[cfg(not(feature = "test-isolation"))]
-fn split_home(args: &[String]) -> Result<(Option<String>, &[String]), Refusal> {
-    Ok((None, args))
-}
-
 fn usage(detail: impl Into<String>) -> Refusal {
     Refusal::new(Code::Usage, detail)
-}
-
-/// Parses `--flag value` pairs. Unknown flags, repeats and missing values are usage errors.
-fn flags<const N: usize>(
-    args: &[String],
-    names: [&str; N],
-) -> Result<[Option<String>; N], Refusal> {
-    let mut vals: [Option<String>; N] = std::array::from_fn(|_| None);
-    let mut it = args.iter();
-    while let Some(a) = it.next() {
-        let i = names
-            .iter()
-            .position(|n| n == a)
-            .ok_or_else(|| usage(format!("unknown argument {a}")))?;
-        let v = it
-            .next()
-            .ok_or_else(|| usage(format!("{a} needs a value")))?;
-        if vals[i].replace(v.clone()).is_some() {
-            return Err(usage(format!("{a} given twice")));
-        }
-    }
-    Ok(vals)
 }
 
 /// Runs one invocation. Output goes to `out`; errors go to `err` as one bounded line.
@@ -402,41 +367,62 @@ pub fn run(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> Exit {
 }
 
 fn dispatch(args: &[String], out: &mut dyn Write) -> Result<(), Refusal> {
-    let (home, args) = split_home(args)?;
     let w =
         |e: std::io::Error| Refusal::new(Code::IoFailed, format!("output failed: {}", e.kind()));
-    let Some((cmd, rest)) = args.split_first() else {
-        return write!(out, "{HELP}").map_err(w);
-    };
-    match cmd.as_str() {
-        "--help" | "-h" | "help" if rest.is_empty() => write!(out, "{HELP}").map_err(w),
-        "--version" | "-V" | "version" if rest.is_empty() => {
-            let commit = option_env!("DFM_BUILD_COMMIT").unwrap_or("unknown");
-            let iso = if cfg!(feature = "test-isolation") {
-                " test-isolation"
-            } else {
-                ""
-            };
-            writeln!(
-                out,
-                "dfm {} (commit {commit}){iso}",
-                env!("CARGO_PKG_VERSION")
-            )
-            .map_err(w)
+    // The first command word, after the isolated build's `--home <dir>`.
+    let isolated_home =
+        cfg!(feature = "test-isolation") && args.first().is_some_and(|a| a == "--home");
+    let word = args
+        .get(if isolated_home { 2 } else { 0 })
+        .map(String::as_str);
+    let argv = std::iter::once("dfm").chain(args.iter().map(String::as_str));
+    let m = match cli::command().try_get_matches_from(argv) {
+        Ok(m) => m,
+        // A subcommand's `--help`: clap's text, plain.
+        Err(e) if e.kind() == clap::error::ErrorKind::DisplayHelp => {
+            return write!(out, "{}", e.render()).map_err(w);
         }
+        Err(e) => return Err(cli::usage_error(&e, word)),
+    };
+    let home = cli::one(&m, "home");
+    let (help, version) = (cli::flag(&m, "help"), cli::flag(&m, "version"));
+    // `--help` and `--version` stand alone, as `help` and `version` do.
+    if (help && version) || ((help || version) && m.subcommand().is_some()) {
+        let flag = word.unwrap_or("--help");
+        return Err(usage(format!("{flag} takes no arguments")));
+    }
+    match m.subcommand() {
+        None if version => write_version(out).map_err(w),
+        None => write!(out, "{HELP}").map_err(w),
+        Some((cmd, sub)) => run_command(cmd, sub, home, out),
+    }
+}
+
+/// One subcommand of the tree `cli::command` defines.
+fn run_command(
+    cmd: &str,
+    sub: &clap::ArgMatches,
+    home: Option<String>,
+    out: &mut dyn Write,
+) -> Result<(), Refusal> {
+    let w =
+        |e: std::io::Error| Refusal::new(Code::IoFailed, format!("output failed: {}", e.kind()));
+    match cmd {
+        "help" => write!(out, "{HELP}").map_err(w),
+        "version" => write_version(out).map_err(w),
         "bind" => {
-            let [profile, id, root] = flags(rest, ["--profile", "--machine-id", "--root"])?;
+            let (profile, id) = (cli::one(sub, "profile"), cli::one(sub, "machine-id"));
             let ctx = context(home)?;
             header(out, &ctx).map_err(w)?;
             let msg = bind(
                 &ctx,
                 profile.ok_or_else(|| usage("--profile is required"))?,
                 id.ok_or_else(|| usage("--machine-id is required"))?,
-                root,
+                cli::one(sub, "root"),
             )?;
             writeln!(out, "{msg}").map_err(w)
         }
-        "binding" if rest.is_empty() => {
+        "binding" => {
             let ctx = context(home)?;
             header(out, &ctx).map_err(w)?;
             match read_existing_binding(&ctx)? {
@@ -453,34 +439,36 @@ fn dispatch(args: &[String], out: &mut dyn Write) -> Result<(), Refusal> {
             }
             .map_err(w)
         }
-        "state" => state_cmd::dispatch_state(&context(home)?, rest, out),
+        "state" => state_cmd::dispatch_state(&context(home)?, sub, out),
         #[cfg(feature = "test-isolation")]
-        "__record-op" => state_cmd::record_op(&context(home)?, rest, out),
+        "__record-op" => state_cmd::record_op(&context(home)?, sub, out),
         #[cfg(feature = "test-isolation")]
-        "__record-trial" => state_cmd::record_trial(&context(home)?, rest, out),
+        "__record-trial" => state_cmd::record_trial(&context(home)?, sub, out),
         #[cfg(feature = "test-isolation")]
-        "__reconcile" if rest.is_empty() => state_cmd::reconcile(&context(home)?, out),
+        "__reconcile" => state_cmd::reconcile(&context(home)?, out),
         "explain" => {
-            let (query, root) = explain_args(rest)?;
+            let query = cli::one(sub, "query")
+                .ok_or_else(|| usage("explain needs a resource or output path"))?;
+            let root = cli::one(sub, "root");
             let ctx = context(home)?;
             header(out, &ctx).map_err(w)?;
             let text = explain(&ctx, &query, root.as_deref().map(Path::new))?;
             write!(out, "{text}").map_err(w)
         }
         "plan" => {
-            let args = plan_cmd::parse_args(rest)?;
+            let args = plan_cmd::parse_args(sub);
             plan_cmd::run(&context(home)?, &args, out)
         }
         "doctor" | "status" => {
             let name = if cmd == "doctor" { "doctor" } else { "status" };
-            doctor_cmd::run(context(home), name, rest, out)
+            doctor_cmd::run(context(home), name, &plan_cmd::parse_args(sub), out)
         }
         "apply" => {
-            let args = apply_cmd::parse_args(rest, dfm_model::plan::Scope::Config)?;
+            let args = apply_cmd::parse_args(sub, dfm_model::plan::Scope::Config)?;
             apply_cmd::run(&context(home)?, &args, out)
         }
         "secrets" => {
-            let args = apply_cmd::parse_args(rest, dfm_model::plan::Scope::Secrets)?;
+            let args = apply_cmd::parse_args(sub, dfm_model::plan::Scope::Secrets)?;
             if !args.allow.is_empty() {
                 return Err(usage(
                     "secrets removes nothing; --allow-disruptive does not apply",
@@ -489,7 +477,7 @@ fn dispatch(args: &[String], out: &mut dyn Write) -> Result<(), Refusal> {
             apply_cmd::run(&context(home)?, &args, out)
         }
         "packages" => {
-            let args = apply_cmd::parse_args(rest, dfm_model::plan::Scope::Packages)?;
+            let args = apply_cmd::parse_args(sub, dfm_model::plan::Scope::Packages)?;
             if !args.allow.is_empty() || !args.allow_adopt.is_empty() {
                 return Err(usage(
                     "packages removes and adopts nothing; --allow-disruptive and --allow-adopt do not apply",
@@ -498,19 +486,19 @@ fn dispatch(args: &[String], out: &mut dyn Write) -> Result<(), Refusal> {
             apply_cmd::run(&context(home)?, &args, out)
         }
         "trial" => {
-            let args = trial_cmd::parse_args(rest)?;
+            let args = trial_cmd::parse_args(sub)?;
             trial_cmd::run(&context(home)?, &args, out)
         }
         "adopt" => {
-            let args = adopt_cmd::parse_args(rest)?;
+            let args = adopt_cmd::parse_args(sub)?;
             adopt_cmd::run(&context(home)?, &args, out)
         }
         "purge" => {
-            let args = purge_cmd::parse_args(rest)?;
+            let args = purge_cmd::parse_args(sub)?;
             purge_cmd::run(&context(home)?, &args, out)
         }
         "services" => {
-            let args = apply_cmd::parse_args(rest, dfm_model::plan::Scope::Services)?;
+            let args = apply_cmd::parse_args(sub, dfm_model::plan::Scope::Services)?;
             if !args.allow_adopt.is_empty() {
                 return Err(usage(
                     "services adopts nothing; --allow-adopt does not apply",
@@ -519,17 +507,16 @@ fn dispatch(args: &[String], out: &mut dyn Write) -> Result<(), Refusal> {
             apply_cmd::run(&context(home)?, &args, out)
         }
         "sync" => {
-            let args = sync_cmd::parse_args(rest)?;
+            let args = sync_cmd::parse_args(sub)?;
             sync_cmd::run(&context(home)?, &args, out)
         }
         "self-update" => {
-            let args = self_update_cmd::parse_args(rest)?;
+            let args = self_update_cmd::parse_args(sub)?;
             self_update_cmd::run(&context(home)?, &args, out)
         }
         "self-check" => {
-            let [controls, fixture, state] =
-                flags(rest, ["--build-controls", "--fixture-dir", "--state-home"])?;
-            match (controls, fixture, state) {
+            let one = |id| cli::one(sub, id);
+            match (one("build-controls"), one("fixture-dir"), one("state-home")) {
                 (Some(tree), None, None) => {
                     let ctx = context(home)?;
                     header(out, &ctx).map_err(w)?;
@@ -549,36 +536,22 @@ fn dispatch(args: &[String], out: &mut dyn Write) -> Result<(), Refusal> {
                 )),
             }
         }
-        "--help" | "-h" | "help" | "--version" | "-V" | "version" | "binding" => {
-            Err(usage(format!("{cmd} takes no arguments")))
-        }
-        other => Err(usage(format!(
-            "unknown command or argument {other}; try --help"
-        ))),
+        other => unreachable!("the command tree defines {other} and dispatch does not"),
     }
 }
 
-/// `explain <query> [--root <dir>]`, in either order.
-fn explain_args(args: &[String]) -> Result<(String, Option<String>), Refusal> {
-    let mut query = None;
-    let mut root = None;
-    let mut it = args.iter();
-    while let Some(a) = it.next() {
-        if a == "--root" {
-            let v = it.next().ok_or_else(|| usage("--root needs a value"))?;
-            if root.replace(v.clone()).is_some() {
-                return Err(usage("--root given twice"));
-            }
-        } else if a.starts_with("--") {
-            return Err(usage(format!("unknown argument {a}")));
-        } else if query.replace(a.clone()).is_some() {
-            return Err(usage("explain takes one resource or output path"));
-        }
-    }
-    Ok((
-        query.ok_or_else(|| usage("explain needs a resource or output path"))?,
-        root,
-    ))
+fn write_version(out: &mut dyn Write) -> std::io::Result<()> {
+    let commit = option_env!("DFM_BUILD_COMMIT").unwrap_or("unknown");
+    let iso = if cfg!(feature = "test-isolation") {
+        " test-isolation"
+    } else {
+        ""
+    };
+    writeln!(
+        out,
+        "dfm {} (commit {commit}){iso}",
+        env!("CARGO_PKG_VERSION")
+    )
 }
 
 /// The bound profile resolved against the trusted sources in `root`.

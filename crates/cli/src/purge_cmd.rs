@@ -7,7 +7,7 @@
 use crate::adapters::package::{self, HOMEBREW, MISE};
 use crate::adopt_cmd::overlaps;
 use crate::apply_cmd::{is_digest, label, stale};
-use crate::{Ctx, paint, read_existing_binding, state_cmd, usage};
+use crate::{Ctx, cli, paint, read_existing_binding, state_cmd, usage};
 use dfm_engine::fsys::{Dir, Peek, Sys};
 use dfm_engine::{Runner, Store, now_ns, signal};
 use dfm_model::digest::sha256_hex;
@@ -40,28 +40,12 @@ pub struct Args {
 }
 
 /// `purge <trial-id> [--preview] [-y|--yes-plan <digest>]`.
-pub fn parse_args(args: &[String]) -> Result<Args, Refusal> {
-    let (mut trial, mut yes, mut preview) = (None, None, false);
-    let mut it = args.iter();
-    while let Some(a) = it.next() {
-        match a.as_str() {
-            "--yes-plan" | "-y" => {
-                let v = it
-                    .next()
-                    .ok_or_else(|| usage(format!("{a} needs a value")))?;
-                if yes.replace(v.clone()).is_some() {
-                    return Err(usage(format!("{a} given twice")));
-                }
-            }
-            "--preview" if !preview => preview = true,
-            "--preview" => return Err(usage("--preview given twice")),
-            other if other.starts_with('-') => {
-                return Err(usage(format!("unknown argument {other}")));
-            }
-            _ if trial.is_some() => return Err(usage("purge takes one trial id")),
-            _ => trial = Some(a.clone()),
-        }
-    }
+pub fn parse_args(m: &clap::ArgMatches) -> Result<Args, Refusal> {
+    let (trial, yes, preview) = (
+        cli::one(m, "trial-id"),
+        cli::one(m, "yes-plan"),
+        cli::flag(m, "preview"),
+    );
     if preview && yes.is_some() {
         return Err(usage("--preview and --yes-plan cannot be used together"));
     }

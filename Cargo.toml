@@ -23,6 +23,10 @@ rustix = { version = "=1.1.5", default-features = false, features = ["std", "fs"
 # SIGINT and SIGTERM handlers (sigaction), used only by crates/engine/src/signal.rs. Already in the
 # lock file as rustix's dependency, so no new package. No default features (no std wrapper needed).
 libc = { version = "=0.2.190", default-features = false }
+# Argument parsing (builder API, no derive: no proc-macro crates) and shell completions, used by
+# crates/cli only. No color, suggestions or wrapping: usage errors are one plain line (DFM-79).
+clap = { version = "=4.6.7", default-features = false, features = ["std", "help", "usage", "error-context"] }
+clap_complete = { version = "=4.6.11", default-features = false }
 
 [workspace.lints.rust]
 # Not "forbid": forbid cannot be relaxed, and crates/engine/src/signal.rs must. Every other crate

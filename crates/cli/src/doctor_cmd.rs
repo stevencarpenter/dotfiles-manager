@@ -6,9 +6,7 @@
 //! nothing, takes no lock and writes nothing. A failing source gives its own row and the other
 //! rows still appear.
 
-use crate::{
-    Ctx, Loaded, clip, header, load_resolved, no_root, plan_cmd, read_existing_binding, usage,
-};
+use crate::{Ctx, Loaded, clip, header, load_resolved, no_root, plan_cmd, read_existing_binding};
 use dfm_engine::{
     Dir, Fail, Layout, Loaded as StateLoaded, Store, Sys, fsys::Listing, merge, observe,
     verify_identity,
@@ -57,15 +55,11 @@ fn width() -> usize {
 pub fn run(
     ctx: Result<Ctx, Refusal>,
     command: &'static str,
-    rest: &[String],
+    args: &plan_cmd::Args,
     out: &mut dyn Write,
 ) -> Result<(), Refusal> {
     let w =
         |e: std::io::Error| Refusal::new(Code::IoFailed, format!("output failed: {}", e.kind()));
-    let args = plan_cmd::parse_args(rest)?;
-    if args.against.is_some() {
-        return Err(usage(format!("{command} does not take --against")));
-    }
     let (report, ctx) = match ctx {
         Ok(ctx) => (
             inspect(&ctx, command, args.root.as_deref().map(Path::new))?,

@@ -5,7 +5,7 @@
 //! `transfer.fsckObjects`, so a replaced object in the checkout is refused or never served.
 
 use crate::sync_cmd::Git;
-use crate::{Ctx, flags, header, usage};
+use crate::{Ctx, cli, header, usage};
 use dfm_engine::{Dir, Lock};
 use dfm_model::display::visible;
 use dfm_model::{Code, Refusal};
@@ -26,8 +26,8 @@ pub(crate) struct Args {
     commit: Option<String>,
 }
 
-pub(crate) fn parse_args(rest: &[String]) -> Result<Args, Refusal> {
-    let [source, commit] = flags(rest, ["--source", "--commit"])?;
+pub(crate) fn parse_args(m: &clap::ArgMatches) -> Result<Args, Refusal> {
+    let (source, commit) = (cli::one(m, "source"), cli::one(m, "commit"));
     if source
         .as_deref()
         .is_some_and(|s| s.is_empty() || s.contains("://"))
