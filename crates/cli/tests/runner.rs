@@ -195,10 +195,11 @@ fn a_program_that_fails_its_checks_does_not_run() {
 #[test]
 fn output_over_the_cap_is_refused_and_stderr_is_bounded() {
     let d = scratch("cap");
+    // 1 MiB (16 pipe buffers) proves the drain and the cut, and ends well inside 5 s under load.
     script(
         &d.join("bin"),
         "tool",
-        "head -c 40000000 /dev/zero | tr '\\0' e >&2; head -c 20 /dev/zero",
+        "head -c 1048576 /dev/zero | tr '\\0' e >&2; head -c 20 /dev/zero",
     );
     let r = runner(&d.join("bin"));
     let out = r
