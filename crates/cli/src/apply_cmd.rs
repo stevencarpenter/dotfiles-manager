@@ -590,8 +590,14 @@ fn run_inner(
         }
         progress.plan_printed = true;
     }
-    let generators = |loaded| generators_for(ctx, &sys, args.scope, loaded);
-    let journal_open = check_before_lock(ctx, args, plan, &digest, &generators(&first), out)?;
+    let journal_open = check_before_lock(
+        ctx,
+        args,
+        plan,
+        &digest,
+        &generators_for(ctx, &sys, args.scope, &first),
+        out,
+    )?;
     // The credential gate (docs/secrets.md): a secrets run without a vault
     // session stops here, exit 3, before the lock and before any write. Nothing is rendered.
     // A withheld secret is not rendered, so its account needs no session.
@@ -634,31 +640,94 @@ fn run_inner(
     if locked_digest != digest {
         return Err(store.stamp(stale(approved, &locked_digest)));
     }
+    let ran = execute_locked(
+        ctx,
+        args,
+        &binding,
+        &Locked {
+            store: &store,
+            fail: &fail,
+            loaded: &second,
+            plan: &locked,
+            digest: &digest,
+            parts: None,
+        },
+        out,
+    )?;
+    let outcome = ran.outcome;
+    if !args.composed {
+        let final_exit = outcome.as_ref().err().map_or(Exit::Ok, Refusal::exit);
+        writeln!(
+            out,
+            "{} {}",
+            paint::label(ctx.color, "result:"),
+            paint::status(ctx.color, final_exit.name())
+        )
+        .map_err(w)?;
+        progress.result_printed = true;
+    }
+    outcome
+}
+
+/// The plan a caller made and compared under the writer lock, with what the run needs.
+pub(crate) struct Locked<'a> {
+    pub(crate) store: &'a Store,
+    pub(crate) fail: &'a Fail,
+    /// The sources the plan was resolved from: the generators read them.
+    pub(crate) loaded: &'a crate::Loaded,
+    /// The whole plan the approved digest covers, withheld operations included.
+    pub(crate) plan: &'a Plan,
+    pub(crate) digest: &'a str,
+    /// For `sync`: the part (scope) each operation id belongs to. Its report lists each part
+    /// under a `scope:` line, in run order.
+    pub(crate) parts: Option<&'a dyn Fn(&str) -> Scope>,
+}
+
+/// The run's one exit.
+pub(crate) struct Ran {
+    pub(crate) outcome: Result<(), Refusal>,
+}
+
+/// Runs a plan that the caller compared with the approved digest under the writer lock: the
+/// operations that are not withheld, through the engine, then one receipt when anything changed
+/// and the report lines. A refusal before the engine starts is returned as `Err`; once it
+/// started, the result is `Ran.outcome`.
+pub(crate) fn execute_locked(
+    ctx: &Ctx,
+    args: &Args,
+    binding: &dfm_model::binding::Binding,
+    l: &Locked<'_>,
+    out: &mut dyn Write,
+) -> Result<Ran, Refusal> {
+    let w =
+        |e: std::io::Error| Refusal::new(Code::IoFailed, format!("output failed: {}", e.kind()));
+    let (store, fail, digest) = (l.store, l.fail, l.digest);
+    let (layout, sys) = (ctx.layout(), ctx.sys().map_err(|r| store.stamp(r))?);
     // The digest covers the whole plan, withheld operations included; only the rest runs.
-    let held = withheld(args, &locked);
-    let locked = without(&locked, &held);
+    let held = withheld(args, l.plan);
+    let locked = without(l.plan, &held);
     let allow: BTreeSet<String> = running(&args.allow, &held)
         .union(&by_rule(args, &locked))
         .cloned()
         .collect();
     let allow_adopt = running(&args.allow_adopt, &held);
     let home = Dir::open_home(&sys, &layout.home).map_err(|r| store.stamp(r))?;
-    let generator = generators(&second);
+    let generator = generators_for(ctx, &sys, args.scope, l.loaded);
     let run = Run {
-        store: &store,
+        store,
         sys,
         home: &home,
         home_path: home.shown(),
         generator: &generator,
         allow: &allow,
         allow_adopt: &allow_adopt,
-        fail: &fail,
+        fail,
     };
-    // For `apply` the handlers go in here: after the lock and the second plan (which ran `id -u`)
-    // and before the first mutation (settling writes the journal). `secrets` and `packages` armed
-    // them before their first child process, above.
-    if args.scope == Scope::Config {
-        arm().map_err(|r| store.stamp(r))?;
+    // For `apply` and `sync` the handlers go in here: after the lock and the plan under it
+    // (which ran `id -u`) and before the first mutation (settling writes the journal). `secrets`,
+    // `packages` and `services` armed them before their first child process.
+    if !dfm_engine::signal::installed() {
+        dfm_engine::signal::install().map_err(|r| store.stamp(r))?;
     }
     fail.hit("apply-after-install")
         .map_err(|r| store.stamp(r))?;
@@ -694,7 +763,7 @@ fn run_inner(
     let mut receipt_name = None;
     let mut receipt_error = None;
     if mutated {
-        let stamp = Stamp::of(&binding);
+        let stamp = Stamp::of(binding);
         let approvals = locked
             .operations
             .iter()
@@ -753,7 +822,7 @@ fn run_inner(
                 binding_digest: stamp.binding_digest,
             },
             machine_id: stamp.machine_id,
-            plan_digest: Some(digest.clone()),
+            plan_digest: Some(digest.to_string()),
             approval: Some(Approval {
                 kind: if args.unattended {
                     "unattended"
@@ -761,7 +830,7 @@ fn run_inner(
                     "yes_plan"
                 }
                 .into(),
-                plan_digest: digest.clone(),
+                plan_digest: digest.to_string(),
                 at: rfc3339(started),
             }),
             sources,
@@ -793,9 +862,30 @@ fn run_inner(
         stopped = Some(if mutated { r.after_mutation() } else { r });
     }
 
-    for (op, rec) in locked.operations.iter().zip(&report.operations) {
-        if args.composed && rec.status == Status::NotInScope {
-            continue;
+    // A `sync` report lists each part under its own `scope:` line, in run order.
+    let mut lines: Vec<(
+        Scope,
+        &dfm_model::plan::Operation,
+        &dfm_model::state::OperationRecord,
+    )> = locked
+        .operations
+        .iter()
+        .zip(&report.operations)
+        .filter(|(_, rec)| !(args.composed && rec.status == Status::NotInScope))
+        .map(|(op, rec)| (l.parts.map_or(args.scope, |part| part(&op.id)), op, rec))
+        .collect();
+    lines.sort_by_key(|(scope, ..)| scope.rank());
+    let mut heading = None;
+    for (scope, op, rec) in lines {
+        if l.parts.is_some() && heading != Some(scope) {
+            heading = Some(scope);
+            writeln!(
+                out,
+                "{} {}",
+                paint::label(ctx.color, "scope:"),
+                scope.as_str()
+            )
+            .map_err(w)?;
         }
         let reload = rec
             .reload
@@ -848,18 +938,7 @@ fn run_inner(
         (None, Some(r)) => Err(r),
         (None, None) => Ok(()),
     };
-    if !args.composed {
-        let final_exit = outcome.as_ref().err().map_or(Exit::Ok, Refusal::exit);
-        writeln!(
-            out,
-            "{} {}",
-            paint::label(ctx.color, "result:"),
-            paint::status(ctx.color, final_exit.name())
-        )
-        .map_err(w)?;
-        progress.result_printed = true;
-    }
-    outcome
+    Ok(Ran { outcome })
 }
 
 #[cfg(test)]
