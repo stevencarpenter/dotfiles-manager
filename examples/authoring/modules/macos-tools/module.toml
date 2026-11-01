@@ -1,0 +1,12 @@
+schema = 1
+id = "macos-tools"
+platforms = ["macos"]
+requires = ["git-extras"]
+
+[[contributions]]
+resource = "git-extras.config"
+path = "/diff"
+key = "macos-tools.plist"
+reason = "Show binary property lists as XML in git diff."
+[contributions.value]
+textconv = "plutil -convert xml1 -o -"

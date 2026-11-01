@@ -1,0 +1,12 @@
+schema = 1
+id = "desk-01"
+bundle = "../bundle.toml"
+platform = "macos"
+architecture = "arm64"
+modules = ["git-extras"]
+
+[[overrides]]
+resource = "git-extras.config"
+path = "/pull/rebase"
+value = false
+reason = "This machine merges on pull."
