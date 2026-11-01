@@ -169,89 +169,35 @@ fn metadata() -> serde_json::Value {
     serde_json::from_slice(&o.stdout).unwrap()
 }
 
-/// Every direct dependency of every workspace member, of every kind (normal, dev, build) and
-/// every target, must be in this table, with its exact requirement. Adding a crate, a dev
-/// dependency or a target-specific dependency fails this test until the table is edited.
+/// Every registry dependency of every workspace member, of every kind (normal, dev, build), is
+/// pinned to one exact version (`=`). A target-specific dependency is refused, and nothing but
+/// the binary crate depends on the binary crate. Which crates are direct dependencies is not
+/// restricted: the owner removed that rule on 2026-10-31 (DFM-79, DESIGN.md section 11).
 #[test]
-fn the_direct_dependencies_of_every_member_match_the_allow_list_exactly() {
-    use std::collections::{BTreeMap, BTreeSet};
+fn every_registry_dependency_is_pinned_to_an_exact_version() {
     let m = metadata();
     let packages = m["packages"].as_array().unwrap();
-    let members: BTreeSet<&str> = m["workspace_members"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|id| {
-            let p = packages.iter().find(|p| p["id"] == *id).unwrap();
-            p["name"].as_str().unwrap()
-        })
-        .collect();
-    let expected: BTreeMap<&str, Vec<&str>> = BTreeMap::from([
-        (
-            "dfm-model",
-            vec![
-                "normal:serde:=1.0.229",
-                "normal:serde_json:=1.0.149",
-                "normal:sha2:=0.10.9",
-                "normal:toml:=1.1.6",
-            ],
-        ),
-        (
-            "dfm-engine",
-            vec![
-                "normal:dfm-model:*",
-                "normal:libc:=0.2.190",
-                "normal:rustix:=1.1.5",
-            ],
-        ),
-        ("dfm-platform-macos", vec!["normal:dfm-model:*"]),
-        (
-            "dfm-cli",
-            vec![
-                "dev:toml:=1.1.6",
-                "normal:dfm-engine:*",
-                "normal:dfm-model:*",
-                "normal:dfm-platform-macos:*",
-                "normal:serde_json:=1.0.149",
-                "normal:sha2:=0.10.9",
-            ],
-        ),
-    ]);
-    assert_eq!(
-        members,
-        expected.keys().copied().collect::<BTreeSet<_>>(),
-        "a workspace member was added or removed: update the allow-list"
-    );
-    for p in packages
-        .iter()
-        .filter(|p| members.contains(p["name"].as_str().unwrap()))
-    {
+    for id in m["workspace_members"].as_array().unwrap() {
+        let p = packages.iter().find(|p| p["id"] == *id).unwrap();
         let name = p["name"].as_str().unwrap();
-        let mut got: Vec<String> = p["dependencies"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|d| {
+        for d in p["dependencies"].as_array().unwrap() {
+            let dep = d["name"].as_str().unwrap();
+            assert!(
+                d["target"].is_null(),
+                "{name}: target-specific dependency {dep}"
+            );
+            assert!(
+                name == "dfm-cli" || dep != "dfm-cli",
+                "{name} depends on dfm-cli"
+            );
+            if d["path"].is_null() {
+                let req = d["req"].as_str().unwrap();
                 assert!(
-                    d["target"].is_null(),
-                    "{name}: target-specific dependency {}",
-                    d["name"]
+                    req.starts_with('=') && !req.contains(','),
+                    "{name}: {dep} is not pinned with = (got {req})"
                 );
-                format!(
-                    "{}:{}:{}",
-                    d["kind"].as_str().unwrap_or("normal"),
-                    d["name"].as_str().unwrap(),
-                    d["req"].as_str().unwrap()
-                )
-            })
-            .collect();
-        got.sort();
-        assert_eq!(got, expected[name], "{name}: direct dependencies changed");
-        // Nothing but the binary crate may depend on the binary crate, even for tests.
-        assert!(
-            name == "dfm-cli" || !got.iter().any(|g| g.contains(":dfm-cli:")),
-            "{name} depends on dfm-cli"
-        );
+            }
+        }
     }
 }
 

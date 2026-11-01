@@ -8,7 +8,7 @@
 use crate::adapters::package::{self, HOMEBREW, MISE};
 use crate::apply_cmd::{is_digest, label, stale};
 use crate::read_fs::read_regular_bounded;
-use crate::{Ctx, bounded, paint, read_existing_binding, state_cmd, usage};
+use crate::{Ctx, bounded, cli, paint, read_existing_binding, state_cmd, usage};
 use dfm_engine::{Runner, Store, now_ns, signal};
 use dfm_model::digest::sha256_hex;
 use dfm_model::display::{bounded_visible, visible};
@@ -42,38 +42,17 @@ pub struct Args {
 
 /// `trial <package> [--id <trial-id>] [--provider homebrew/v1|mise/v1] [--config <path>]...
 /// [--preview] [-y|--yes-plan <digest>]`.
-pub fn parse_args(args: &[String]) -> Result<Args, Refusal> {
-    let (mut package, mut id, mut provider, mut yes, mut preview) = (None, None, None, None, false);
-    let mut configs = Vec::new();
-    let mut it = args.iter();
-    while let Some(a) = it.next() {
-        let mut value = |slot: &mut Option<String>| -> Result<(), Refusal> {
-            let v = it
-                .next()
-                .ok_or_else(|| usage(format!("{a} needs a value")))?;
-            if slot.replace(v.clone()).is_some() {
-                return Err(usage(format!("{a} given twice")));
-            }
-            Ok(())
-        };
-        match a.as_str() {
-            "--id" => value(&mut id)?,
-            "--provider" => value(&mut provider)?,
-            "--yes-plan" | "-y" => value(&mut yes)?,
-            "--config" => configs.push(
-                it.next()
-                    .cloned()
-                    .ok_or_else(|| usage("--config needs a value"))?,
-            ),
-            "--preview" if !preview => preview = true,
-            "--preview" => return Err(usage("--preview given twice")),
-            other if other.starts_with('-') => {
-                return Err(usage(format!("unknown argument {other}")));
-            }
-            _ if package.is_some() => return Err(usage("trial takes one package name")),
-            _ => package = Some(a.clone()),
-        }
-    }
+pub fn parse_args(m: &clap::ArgMatches) -> Result<Args, Refusal> {
+    let (package, id, provider) = (
+        cli::one(m, "package"),
+        cli::one(m, "id"),
+        cli::one(m, "provider"),
+    );
+    let (yes, preview, configs) = (
+        cli::one(m, "yes-plan"),
+        cli::flag(m, "preview"),
+        cli::all(m, "config"),
+    );
     if preview && yes.is_some() {
         return Err(usage("--preview and --yes-plan cannot be used together"));
     }
@@ -769,7 +748,7 @@ mod tests {
 
     #[test]
     fn arguments_take_one_package_and_repeated_config_paths() {
-        let a = |v: &[&str]| parse_args(&v.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+        let a = |v: &[&str]| crate::cli::parse("trial", v).and_then(|m| parse_args(&m));
         let ok = a(&["atuin", "--config", "a", "--config", "/b", "--preview"]).unwrap();
         assert_eq!(
             (ok.package.as_str(), ok.configs.len(), ok.preview),

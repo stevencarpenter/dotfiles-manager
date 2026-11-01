@@ -3,7 +3,8 @@
 //! lifecycle can be tested: intent first, the effect, an independent check, completion, then the
 //! ledger and the receipt.
 
-use super::super::{Ctx, bounded, flags, header, read_existing_binding, usage};
+use super::super::cli::one;
+use super::super::{Ctx, bounded, header, read_existing_binding, usage};
 use dfm_engine::{Fail, Probe, Store, now_ns};
 use dfm_model::binding::Binding;
 use dfm_model::plan::file_fingerprint;
@@ -47,7 +48,7 @@ fn op_id(given: Option<String>) -> Result<String, Refusal> {
 }
 
 /// `__record-op`: create `--output` with `--content` as one journaled operation.
-pub fn record_op(ctx: &Ctx, args: &[String], out: &mut dyn Write) -> Result<(), Refusal> {
+pub fn record_op(ctx: &Ctx, m: &clap::ArgMatches, out: &mut dyn Write) -> Result<(), Refusal> {
     let [
         resource,
         adapter,
@@ -58,20 +59,18 @@ pub fn record_op(ctx: &Ctx, args: &[String], out: &mut dyn Write) -> Result<(), 
         note,
         secret,
         at,
-    ] = flags(
-        args,
-        [
-            "--resource",
-            "--adapter",
-            "--output",
-            "--content",
-            "--op-id",
-            "--sensitive",
-            "--note",
-            "--secret",
-            "--at",
-        ],
-    )?;
+    ] = [
+        "resource",
+        "adapter",
+        "output",
+        "content",
+        "op-id",
+        "sensitive",
+        "note",
+        "secret",
+        "at",
+    ]
+    .map(|n| one(m, n));
     let need = |v: Option<String>, n: &str| v.ok_or_else(|| usage(format!("{n} is required")));
     let (resource, output) = (need(resource, "--resource")?, need(output, "--output")?);
     let adapter = adapter.unwrap_or_else(|| "fake/v1".into());
@@ -264,8 +263,8 @@ fn read_regular(path: &str) -> Result<Option<Vec<u8>>, Refusal> {
 }
 
 /// `__record-trial`: write or replace an active trial record with a baseline of one path.
-pub fn record_trial(ctx: &Ctx, args: &[String], out: &mut dyn Write) -> Result<(), Refusal> {
-    let [id, tool, path] = flags(args, ["--id", "--tool", "--baseline-path"])?;
+pub fn record_trial(ctx: &Ctx, m: &clap::ArgMatches, out: &mut dyn Write) -> Result<(), Refusal> {
+    let [id, tool, path] = ["id", "tool", "baseline-path"].map(|n| one(m, n));
     let (Some(id), Some(tool), Some(path)) = (id, tool, path) else {
         return Err(usage("--id, --tool and --baseline-path are required"));
     };

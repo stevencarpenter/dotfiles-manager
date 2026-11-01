@@ -80,6 +80,8 @@ dfm apply -y <digest>
 dfm self-update --source "$PWD"                         # later reinstalls; after the first run, plain dfm self-update
 ```
 
+Shell completions: add `source <(dfm completions zsh)` to `~/.zshrc` after `compinit`. Sourcing at shell start keeps the completions in step with the installed binary after each `self-update`, with no file to refresh. `dfm completions` also prints `bash`, `fish`, `elvish` and `powershell` scripts.
+
 ## Check the repository
 
 Install the Git hooks once per clone with `lefthook install`. The checks need Git, Bash, Lefthook, uv, `shellcheck` and the Rust toolchain pinned in `rust-toolchain.toml`. `just` is optional.

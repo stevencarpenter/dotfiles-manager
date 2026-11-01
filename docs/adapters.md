@@ -56,7 +56,7 @@ The trait has more methods with refusing defaults: `merges`/`merge` (the co-owne
 
 ### Layering
 
-Adapters should not depend on `dfm-engine`. This build has no `ports` crate, and creating one needs a new crate and a changed dependency gate. So the `Generator` trait stays in `dfm-engine` and the adapters are in the CLI crate. `git_config` takes a model value. `text_fragments` takes `GeneratorInputs`, which is an engine type. The other engine types (`Dir`, `Sys`, `Got`) appear only in `plan_outputs`. The `toml` types `Value` and `Table` are re-exported by `dfm_model::resolve` on purpose, so the CLI can name them without a new dependency entry. Moving the trait to a `ports` crate later changes imports only.
+Adapters should not depend on `dfm-engine`. This build has no `ports` crate, and creating one needs a new workspace member. So the `Generator` trait stays in `dfm-engine` and the adapters are in the CLI crate. `git_config` takes a model value. `text_fragments` takes `GeneratorInputs`, which is an engine type. The other engine types (`Dir`, `Sys`, `Got`) appear only in `plan_outputs`. The `toml` types `Value` and `Table` are re-exported by `dfm_model::resolve` on purpose, so the CLI can name them without a new dependency entry. Moving the trait to a `ports` crate later changes imports only.
 
 ## Data and code
 
@@ -112,7 +112,7 @@ The fixture shows only scalar values under a section. These rules are the minimu
 6. A string is always quoted. Backslash and double quote are escaped, newline and tab use `\n` and `\t`. Any other control character is refused.
 7. Each line is `<tab>key = value`. The text ends with a newline unless it is empty.
 
-**Order.** A TOML table has no order (the `toml` crate is used without its order-preserving feature, and the gate allows no new dependency). So sections, keys and subsections are written in byte order of their names, and only the elements of an array keep the author's order. Output is deterministic. A setting whose meaning depends on the order of two different keys cannot be expressed in one render resource. Use the include order instead: two `git-config/v1` files that a core `[include]` lists in the order Git must read them ([docs/resolver.md](resolver.md), "Native precedence").
+**Order.** A TOML table has no order (the `toml` crate is used without its order-preserving feature). So sections, keys and subsections are written in byte order of their names, and only the elements of an array keep the author's order. Output is deterministic. A setting whose meaning depends on the order of two different keys cannot be expressed in one render resource. Use the include order instead: two `git-config/v1` files that a core `[include]` lists in the order Git must read them ([docs/resolver.md](resolver.md), "Native precedence").
 
 **Case.** Git reads section names and key names without regard to ASCII case. Two section names, or two keys in one section or subsection, that differ only in ASCII case are refused (`E_MANIFEST_INVALID`). Subsection names are case-sensitive and may differ only in case.
 

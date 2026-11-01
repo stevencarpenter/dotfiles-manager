@@ -21,6 +21,9 @@ dfm-platform-macos = { workspace = true }
 # The mise/v1 probe reads `mise ls --json` (docs/packages.md). Already a direct crate of dfm-model.
 serde_json = { workspace = true }
 sha2 = { workspace = true }
+# The command tree: parsing, help and `dfm completions` (DFM-79).
+clap = { workspace = true }
+clap_complete = { workspace = true }
 
 [dev-dependencies]
 # Resolver tests parse and patch fixture documents in memory. Already an accepted direct crate.

@@ -340,6 +340,7 @@ The current private wrapper has not been inspected in this workspace. Synthetic 
 
 - Names (owner, 2026-10-20, DFM-67): the command is `dfm`. The project, crates, `dotfiles-manager.lock`, and the state, config, cache and data directories keep the name `dotfiles-manager`.
 - The owner decisions of 2026-10-09 settle the implementation language (Rust), the build-from-source distribution, the direct crates, and the exit codes.
+- Dependencies (owner, 2026-10-31, DFM-79): the rule of 2026-10-09 that allowed a direct crate only where the standard library lacks the capability is removed. A crate is added when it is the simpler complete change. Each registry dependency stays pinned with `=` in `[workspace.dependencies]`, `Cargo.lock` stays committed, and the bootstrap build controls still check the tree that is built. The first crates added under this decision are `clap` and `clap_complete` (argument parsing and shell completions).
 
 ### Still open
 

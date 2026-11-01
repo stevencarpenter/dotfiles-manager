@@ -11,7 +11,7 @@
 
 use crate::adapters::{Generators, package};
 use crate::plan_cmd::{Probed, plan_for, render};
-use crate::{Ctx, load_resolved, paint, require_binding, state_cmd, usage};
+use crate::{Ctx, cli, load_resolved, paint, require_binding, state_cmd, usage};
 use dfm_engine::{
     Approval as Allowance, Dir, Fail, Generator, Run, Store, Sys, apply, check_allowances,
     check_journal_capacity, gates, now_ns,
@@ -62,47 +62,20 @@ pub struct Args {
 
 /// `apply [--root <dir>] [-y|--yes-plan <digest>] [--allow-disruptive <operation-id>]...
 /// [--allow-adopt <operation-id>]... [--preview]`, and `secrets` with the same flags.
-pub fn parse_args(args: &[String], scope: Scope) -> Result<Args, Refusal> {
-    let (mut root, mut yes, mut preview, mut update) = (None, None, false, false);
-    let (mut allow, mut allow_adopt) = (BTreeSet::new(), BTreeSet::new());
-    let mut restart = BTreeSet::new();
-    let mut it = args.iter();
-    while let Some(a) = it.next() {
-        let mut value = |slot: Option<&mut Option<String>>| -> Result<String, Refusal> {
-            let v = it
-                .next()
-                .ok_or_else(|| usage(format!("{a} needs a value")))?;
-            if let Some(slot) = slot
-                && slot.replace(v.clone()).is_some()
-            {
-                return Err(usage(format!("{a} given twice")));
-            }
-            Ok(v.clone())
-        };
-        match a.as_str() {
-            "--root" => {
-                value(Some(&mut root))?;
-            }
-            "--yes-plan" | "-y" => {
-                value(Some(&mut yes))?;
-            }
-            flag if Allowance::from_flag(flag).is_some() => {
-                let v = value(None)?;
-                match Allowance::from_flag(flag) {
-                    Some(Allowance::Adopt) => allow_adopt.insert(v),
-                    _ => allow.insert(v),
-                };
-            }
-            "--preview" if !preview => preview = true,
-            "--preview" => return Err(usage("--preview given twice")),
-            "--update" if scope == Scope::Packages && !update => update = true,
-            "--update" if update => return Err(usage("--update given twice")),
-            "--restart" if scope == Scope::Services => {
-                restart.insert(value(None)?);
-            }
-            other => return Err(usage(format!("unknown argument {other}"))),
-        }
-    }
+pub fn parse_args(m: &clap::ArgMatches, scope: Scope) -> Result<Args, Refusal> {
+    let (root, yes, preview) = (
+        cli::one(m, "root"),
+        cli::one(m, "yes-plan"),
+        cli::flag(m, "preview"),
+    );
+    let allow = cli::all(m, "allow-disruptive").into_iter().collect();
+    let allow_adopt = cli::all(m, "allow-adopt").into_iter().collect();
+    // Only packages defines --update and only services --restart; sync reads its own --restart.
+    let update = scope == Scope::Packages && cli::flag(m, "update");
+    let restart = match scope {
+        Scope::Services => cli::all(m, "restart").into_iter().collect(),
+        _ => BTreeSet::new(),
+    };
     if preview && yes.is_some() {
         return Err(usage("--preview and --yes-plan cannot be used together"));
     }
