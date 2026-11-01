@@ -916,3 +916,34 @@ fn bind_records_the_checkout_above_the_profile_and_keeps_it() {
     );
     assert_eq!(fs::read_to_string(binding_file(&fx)).unwrap(), body);
 }
+
+// ---- DFM-79: shell completions ---------------------------------------------------------------
+
+#[test]
+fn completions_print_a_script_for_each_shell_without_hidden_commands() {
+    let home = TempDir::new("completions");
+    for (shell, marker) in [
+        ("zsh", "#compdef dfm"),
+        ("bash", "complete -F _dfm"),
+        ("fish", "complete -c dfm"),
+    ] {
+        let o = run(home.path(), &["completions", shell]);
+        assert_eq!(o.status.code(), Some(0), "{shell}: {}", text(&o.stderr));
+        let script = text(&o.stdout);
+        assert!(script.contains(marker), "{shell}: {script}");
+        for word in ["self-update", "yes-plan", "trust-origin", "completions"] {
+            assert!(script.contains(word), "{shell} lacks {word}");
+        }
+        for hidden in ["__record-op", "__reconcile", "--home"] {
+            assert!(!script.contains(hidden), "{shell} offers {hidden}");
+        }
+        assert!(!script.contains("isolated: true"), "no header in a script");
+    }
+    for args in [vec!["completions"], vec!["completions", "tcsh"]] {
+        let o = run(home.path(), &args);
+        assert_eq!(o.status.code(), Some(2), "{args:?}");
+        assert!(text(&o.stderr).starts_with("error: E_USAGE "));
+        assert_eq!(text(&o.stderr).lines().count(), 1);
+    }
+    assert!(files_below(home.path()).is_empty());
+}

@@ -46,15 +46,20 @@ fn allow_adopt() -> Arg {
 }
 
 /// `apply` and the scopes that share its flags, with the flags of the one scope in `extra`. A
-/// flag a scope refuses with its own message (`dispatch`) is parsed but hidden from help and
-/// completions.
-fn scope<const N: usize>(name: &'static str, about: &'static str, extra: [Arg; N]) -> Command {
+/// flag a scope refuses with its own message (`dispatch`) is hidden: parsed (`parse`), but left
+/// out of help and of the completion tree.
+fn scope<const N: usize>(
+    parse: bool,
+    name: &'static str,
+    about: &'static str,
+    extra: [Arg; N],
+) -> Command {
     Command::new(name)
         .about(about)
         .arg(root())
         .arg(preview())
         .arg(yes_plan())
-        .args(extra)
+        .args(extra.into_iter().filter(|a| parse || !a.is_hide_set()))
 }
 
 fn report(name: &'static str, about: &'static str) -> Command {
@@ -68,12 +73,22 @@ fn report(name: &'static str, about: &'static str) -> Command {
 /// clap's help and version flags and its `help` subcommand are off there; each subcommand gets
 /// `-h`/`--help` back with the help clap generates.
 pub(crate) fn command() -> Command {
+    tree(true)
+}
+
+/// The tree `dfm completions` prints: `command` without its hidden flags and commands, which
+/// clap_complete would otherwise offer.
+pub(crate) fn completion_command() -> Command {
+    tree(false)
+}
+
+fn tree(parse: bool) -> Command {
     let cmd = Command::new("dfm")
         .disable_help_flag(true)
         .disable_version_flag(true)
         .disable_help_subcommand(true)
-        .arg(switch("help").short('h').hide(true))
-        .arg(switch("version").short('V').hide(true))
+        .arg(switch("help").short('h'))
+        .arg(switch("version").short('V'))
         .subcommand(Command::new("help").about("Print the usage text"))
         .subcommand(Command::new("version").about("Print the version and build commit"))
         .subcommand(
@@ -115,16 +130,19 @@ pub(crate) fn command() -> Command {
         ))
         .subcommand(report("status", "Inspect the machine, one block per row"))
         .subcommand(scope(
+            parse,
             "apply",
             "Publish the configuration of an approved plan",
             [allow_disruptive(), allow_adopt()],
         ))
         .subcommand(scope(
+            parse,
             "secrets",
             "Render the secret resources",
             [allow_disruptive().hide(true), allow_adopt()],
         ))
         .subcommand(scope(
+            parse,
             "packages",
             "Install the missing packages",
             [
@@ -134,6 +152,7 @@ pub(crate) fn command() -> Command {
             ],
         ))
         .subcommand(scope(
+            parse,
             "services",
             "Start the services that are not loaded",
             [
@@ -169,6 +188,7 @@ pub(crate) fn command() -> Command {
                 .arg(yes_plan()),
         )
         .subcommand(scope(
+            parse,
             "sync",
             "Fetch the sources and run every scope",
             [
@@ -186,13 +206,22 @@ pub(crate) fn command() -> Command {
                 .arg(value("commit", "sha")),
         )
         .subcommand(
+            Command::new("completions")
+                .about("Print the shell completion script for dfm")
+                .arg(
+                    Arg::new("shell")
+                        .required(true)
+                        .value_parser(clap::value_parser!(clap_complete::Shell)),
+                ),
+        )
+        .subcommand(
             Command::new("self-check")
                 .about("Check build controls, a fixture directory or a state home")
                 .arg(value("build-controls", "staged tree"))
                 .arg(value("fixture-dir", "dir"))
                 .arg(value("state-home", "home")),
         );
-    let cmd = test_only(cmd);
+    let cmd = if parse { test_only(cmd) } else { cmd };
     let help = Arg::new("help")
         .short('h')
         .long("help")
@@ -364,6 +393,32 @@ mod tests {
         }
         let home = cmd.get_arguments().find(|a| a.get_id() == "home").unwrap();
         assert!(home.is_hide_set());
+    }
+
+    /// Nothing hidden reaches the completion script, in any build.
+    #[test]
+    fn the_completion_tree_has_nothing_hidden() {
+        fn walk(c: &Command) {
+            assert!(!c.is_hide_set(), "{}", c.get_name());
+            for a in c.get_arguments() {
+                assert!(!a.is_hide_set(), "{} {}", c.get_name(), a.get_id());
+            }
+            c.get_subcommands().for_each(walk);
+        }
+        let tree = completion_command();
+        walk(&tree);
+        let names = |c: &Command| {
+            c.get_subcommands()
+                .map(|s| s.get_name().to_string())
+                .collect::<Vec<_>>()
+        };
+        let parsed = command();
+        let visible: Vec<_> = names(&parsed)
+            .into_iter()
+            .filter(|n| !parsed.find_subcommand(n).unwrap().is_hide_set())
+            .collect();
+        assert_eq!(names(&tree), visible);
+        assert!(visible.contains(&"completions".to_string()));
     }
 
     #[test]

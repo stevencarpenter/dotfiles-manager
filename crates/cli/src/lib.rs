@@ -65,6 +65,7 @@ usage:
   dfm self-check --build-controls <staged tree>
   dfm self-check --fixture-dir <dir>
   dfm self-check --state-home <home>
+  dfm completions zsh|bash|fish|elvish|powershell
 
 bind records the profile and machine identity once, with the checkout root: --root, else the
 nearest directory above the profile that holds .git. Every command that reads sources takes
@@ -180,6 +181,9 @@ scripts/bootstrap.sh of the commit (--commit, else the checkout's HEAD) and runs
 that commit, so the build and every check are the script's. --source names the checkout once;
 later runs reuse it. A commit that current already points at is not built again. It never pulls:
 run git pull in the checkout first. See docs/bootstrap.md.
+
+completions prints the shell completion script for dfm to stdout. For zsh, add
+source <(dfm completions zsh) to ~/.zshrc after compinit. A subcommand's --help lists its flags.
 
 An operation that ended unknown (E_OP_INTERRUPTED) blocks its path in every later run. Each apply
 checks the path again and settles the entry when the result is clear. state recover does only that:
@@ -513,6 +517,15 @@ fn run_command(
         "self-update" => {
             let args = self_update_cmd::parse_args(sub)?;
             self_update_cmd::run(&context(home)?, &args, out)
+        }
+        "completions" => {
+            let shell = sub
+                .get_one::<clap_complete::Shell>("shell")
+                .copied()
+                .ok_or_else(|| usage("completions needs a shell"))?;
+            let mut script = Vec::new();
+            clap_complete::generate(shell, &mut cli::completion_command(), "dfm", &mut script);
+            out.write_all(&script).map_err(w)
         }
         "self-check" => {
             let one = |id| cli::one(sub, id);

@@ -37,7 +37,14 @@ Prerequisites: Command Line Tools (`xcode-select --install`), the rustup toolcha
 
    It checks Command Line Tools, the pinned toolchain, the staged tree and the build controls before any `cargo` process starts. It runs `cargo fetch --locked`, which needs network access, then builds offline, runs `self-check`, then installs `~/.local/bin/dfm` through a `current` symlink. A failed build leaves no installed binary.
 4. Check: `dfm --version` prints the semver and the commit. The output must not contain `test-isolation`; the release binary ignores every isolation override.
-5. Later reinstalls: `git pull --ff-only` in the checkout, then `dfm self-update --source "$PWD"` once; after that `dfm self-update` from any directory builds the recorded checkout's HEAD (`--commit <full sha>` picks another commit). See docs/bootstrap.md, "Self-update".
+5. Optional: zsh completions. Add this line to `~/.zshrc` after `compinit`:
+
+   ```sh
+   source <(dfm completions zsh)
+   ```
+
+   The script is generated at each shell start, so it matches the installed binary after every `self-update` and no completion file goes stale. `dfm completions bash` and `dfm completions fish` print the scripts for those shells.
+6. Later reinstalls: `git pull --ff-only` in the checkout, then `dfm self-update --source "$PWD"` once; after that `dfm self-update` from any directory builds the recorded checkout's HEAD (`--commit <full sha>` picks another commit). See docs/bootstrap.md, "Self-update".
 
 ## 2. Author a bundle in the configuration repository
 
