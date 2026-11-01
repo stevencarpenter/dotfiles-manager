@@ -3,10 +3,15 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-/// Orders `nodes` (id, ids it must follow) so each follows its prerequisites, ties broken by id
-/// (Kahn's algorithm with an ordered ready set). Edges to ids outside `nodes` are ignored. On a
-/// cycle returns one cycle as a closed path (`a, b, a`), chosen deterministically.
-pub fn order(nodes: &[(String, Vec<String>)]) -> Result<Vec<String>, Vec<String>> {
+/// Orders `nodes` (id, ids it must follow) so each follows its prerequisites, ties broken by
+/// `rank` and then by id (Kahn's algorithm with an ordered ready set). A combined `sync` plan
+/// ranks each operation by its scope, so configuration runs first; every other plan ranks all
+/// operations alike. Edges to ids outside `nodes` are ignored. On a cycle returns one cycle as
+/// a closed path (`a, b, a`), chosen deterministically.
+pub fn order(
+    nodes: &[(String, Vec<String>)],
+    rank: impl Fn(&str) -> u8,
+) -> Result<Vec<String>, Vec<String>> {
     let deps: BTreeMap<&str, BTreeSet<&str>> = nodes
         .iter()
         .map(|(i, a)| (i.as_str(), a.iter().map(String::as_str).collect()))
@@ -24,19 +29,19 @@ pub fn order(nodes: &[(String, Vec<String>)]) -> Result<Vec<String>, Vec<String>
             followers.entry(d).or_default().push(id);
         }
     }
-    let mut ready: BTreeSet<&str> = waiting
+    let mut ready: BTreeSet<(u8, &str)> = waiting
         .iter()
         .filter(|(_, n)| **n == 0)
-        .map(|(id, _)| *id)
+        .map(|(id, _)| (rank(id), *id))
         .collect();
     let mut out = Vec::with_capacity(nodes.len());
-    while let Some(id) = ready.pop_first() {
+    while let Some((_, id)) = ready.pop_first() {
         out.push(id.to_string());
         for f in followers.get(id).into_iter().flatten() {
             if let Some(n) = waiting.get_mut(f) {
                 *n -= 1;
                 if *n == 0 {
-                    ready.insert(f);
+                    ready.insert((rank(f), f));
                 }
             }
         }
@@ -69,7 +74,11 @@ pub fn order(nodes: &[(String, Vec<String>)]) -> Result<Vec<String>, Vec<String>
 
 #[cfg(test)]
 mod tests {
-    use super::order;
+    use super::order as ranked;
+
+    fn order(nodes: &[(String, Vec<String>)]) -> Result<Vec<String>, Vec<String>> {
+        ranked(nodes, |_| 0)
+    }
 
     fn n(id: &str, after: &[&str]) -> (String, Vec<String>) {
         (id.into(), after.iter().map(|s| s.to_string()).collect())
@@ -86,6 +95,23 @@ mod tests {
         let got = order(&[n("x", &[]), n("a", &["b"]), n("b", &["a"]), n("c", &["b"])]);
         assert_eq!(got.unwrap_err(), ["a", "b", "a"]);
         assert_eq!(order(&[n("s", &["s"])]).unwrap_err(), ["s", "s"]);
+    }
+
+    #[test]
+    fn a_lower_rank_goes_first_among_ready_nodes_and_never_before_its_prerequisite() {
+        let rank = |id: &str| u8::from(id.starts_with('s'));
+        // `a` waits for `s1`, so the higher rank runs first there; `b` and `c` outrank `s0`.
+        let got = ranked(
+            &[
+                n("s0", &[]),
+                n("s1", &[]),
+                n("c", &[]),
+                n("a", &["s1"]),
+                n("b", &[]),
+            ],
+            rank,
+        );
+        assert_eq!(got.unwrap(), ["b", "c", "s0", "s1", "a"]);
     }
 
     #[test]

@@ -2169,7 +2169,7 @@ impl Planner<'_> {
                 (o.id.clone(), after)
             })
             .collect();
-        match graph::order(&nodes) {
+        match graph::order(&nodes, |_| 0) {
             Ok(order) => (
                 order
                     .into_iter()
