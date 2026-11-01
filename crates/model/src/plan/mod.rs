@@ -11,9 +11,10 @@ mod graph;
 mod stale;
 
 pub use build::{
-    ApprovedFile, Context, Definition, MergeFact, MergeVerdict, Owned, PackageState,
+    ApprovedFile, Context, Definition, MergeFact, MergeVerdict, Owned, PRODUCED_BY, PackageState,
     SECRET_ADAPTER, Scope, SecretVerdict, ServiceFacts, ServiceState, build, followups, in_scope,
-    ledger_state, matches_pattern, requests, sensitive_paths, service_prerequisites,
+    ledger_state, matches_pattern, prerequisite_present, requests, sensitive_paths,
+    service_prerequisites,
 };
 pub use stale::{Stale, StaleKind, stale};
 

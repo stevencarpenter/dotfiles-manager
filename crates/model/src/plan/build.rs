@@ -328,6 +328,20 @@ pub fn service_prerequisites(r: &ResolvedResource) -> Vec<String> {
     out
 }
 
+/// The state of a service prerequisite that a planned operation of the same combined plan
+/// publishes: `produced-by:<operation id>`. The engine requires that operation to have ended
+/// updated or current and the file to be present before the service starts.
+pub const PRODUCED_BY: &str = "produced-by:";
+
+/// Whether a prerequisite file is in place: a file, a directory or a link that resolves.
+pub fn prerequisite_present(node: &Node) -> bool {
+    match node {
+        Node::Link { to, .. } => !matches!(to, LinkTo::Dangling | LinkTo::Loop),
+        Node::Missing {} => false,
+        _ => true,
+    }
+}
+
 /// The plan-time facts of one merge resource.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MergeFact {
@@ -1430,6 +1444,22 @@ impl Planner<'_> {
         self.ops.insert(id, op);
     }
 
+    /// The planned operation of a combined plan that leaves a link or a file at `path` (a
+    /// removal publishes nothing), compared after the file system fold. `None` in every other
+    /// plan, whose prerequisites must already be in place.
+    fn producer(&self, path: &str) -> Option<&Operation> {
+        let path = fold(path);
+        (self.cx.scope == Scope::Sync)
+            .then(|| {
+                self.ops.values().find(|o| {
+                    o.status == Status::Planned
+                        && o.action.publishes()
+                        && o.path.as_deref().is_some_and(|q| fold(q) == path)
+                })
+            })
+            .flatten()
+    }
+
     /// A service (docs/lifecycle.md): no path and no ledger entry. The caller probed the
     /// launcher; the plan starts what is not loaded, restarts what is loaded otherwise than
     /// declared (or on request), and never stops or removes. Each declared prerequisite file
@@ -1454,12 +1484,37 @@ impl Planner<'_> {
         };
         let shown = format!("{name} with {}", r.adapter);
         let mut missing = false;
+        // The files a planned operation of this combined plan publishes before the service runs:
+        // each is recorded as produced by that operation (the engine checks its result and the
+        // file at act time), and a file not published yet does not block (docs/sync.md).
+        let mut published: Vec<(String, &'static str)> = Vec::new();
         for p in service_prerequisites(r) {
-            let present = match self.obs.seen.get(&p).map(|s| &s.node) {
-                Some(Node::Link { to, .. }) => !matches!(to, LinkTo::Dangling | LinkTo::Loop),
-                Some(Node::Missing {}) | None => false,
-                Some(_) => true,
-            };
+            let sensitive = self.sensitive.contains(&fold(&p));
+            let subject = if sensitive { "sensitive-path" } else { "path" };
+            if let Some(by) = self.producer(&p) {
+                op.preconditions.push(Precondition {
+                    subject: format!("{subject}:{p}"),
+                    state: format!("{PRODUCED_BY}{}", by.id),
+                });
+                if !self
+                    .obs
+                    .seen
+                    .get(&p)
+                    .is_some_and(|s| prerequisite_present(&s.node))
+                {
+                    let scope = match by.adapter == SECRET_ADAPTER {
+                        true => "secrets",
+                        false => "configuration",
+                    };
+                    published.push((format!("{p} ({})", by.id), scope));
+                }
+                continue;
+            }
+            let present = self
+                .obs
+                .seen
+                .get(&p)
+                .is_some_and(|s| prerequisite_present(&s.node));
             if !present {
                 let f = fail(
                     Code::Conflict,
@@ -1483,8 +1538,6 @@ impl Planner<'_> {
             // only, as everywhere else: no hash and no size of it reaches the plan or a message.
             // The subject says which it is, so apply observes it the same way.
             if let Some(seen) = self.obs.seen.get(&p) {
-                let sensitive = self.sensitive.contains(&fold(&p));
-                let subject = if sensitive { "sensitive-path" } else { "path" };
                 op.preconditions.push(Precondition {
                     subject: format!("{subject}:{p}"),
                     state: node_state(seen, sensitive),
@@ -1596,6 +1649,21 @@ impl Planner<'_> {
                 op.action = action;
                 op.status = status;
                 op.effect = effect;
+                if let (Some((_, scope)), Status::Planned) = (published.first(), status) {
+                    let by: Vec<&str> = published.iter().map(|(p, _)| p.as_str()).collect();
+                    op.effect = match action {
+                        Action::Restart => format!(
+                            "restart {} on request (--restart) after the {scope} scope publishes {}; disruptive{runs}",
+                            r.id,
+                            by.join(", ")
+                        ),
+                        _ => format!(
+                            "start {} after the {scope} scope publishes {}{runs}",
+                            r.id,
+                            by.join(", ")
+                        ),
+                    };
+                }
                 if let Some(state) = probed {
                     op.preconditions.push(Precondition {
                         subject: probe,
