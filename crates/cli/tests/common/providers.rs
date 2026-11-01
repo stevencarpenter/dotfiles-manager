@@ -82,7 +82,7 @@ esac
 
 /// `mise ls --installed --json <name>` answers a JSON array from `installed-mise` (one
 /// `<name> <version>` line per installed version); the table form is refused, as a stand-in for
-/// its truncated tool column. `mise install <name>` appends; `mise uninstall --all <name>` drops every line of the name. A `mise-fail-<name>` marker beside
+/// its truncated tool column. `mise install <name>` appends; `mise uninstall --all <name>` drops every line of the name; `mise uninstall <name>@<v>...` drops those versions. A `mise-fail-<name>` marker beside
 /// `bin` makes the install of that tool exit 1, as a failed download does.
 pub const FAKE_MISE: &str = r#"#!/bin/sh
 PATH=/usr/bin:/bin:$PATH
@@ -106,8 +106,15 @@ case "$1" in
     [ -e "$here/../mise-fail-${2%%@*}" ] && { echo "mise ERROR download failed" >&2; exit 1; }
     echo "${2%%@*}  2.0.0" >> "$db"; exit 0 ;;
   uninstall)
-    [ "$2" = --all ] || exit 64
-    grep -v "^$3 " "$db" > "$db.new" 2>/dev/null; mv "$db.new" "$db"; exit 0 ;;
+    if [ "$2" = --all ]; then
+      grep -v "^$3 " "$db" > "$db.new" 2>/dev/null; mv "$db.new" "$db"; exit 0
+    fi
+    shift
+    for a in "$@"; do
+      case "$a" in *@*) ;; *) exit 64 ;; esac
+      grep -v "^${a%@*} *${a##*@}\$" "$db" > "$db.new" 2>/dev/null; mv "$db.new" "$db"
+    done
+    exit 0 ;;
   *) exit 64 ;;
 esac
 "#;

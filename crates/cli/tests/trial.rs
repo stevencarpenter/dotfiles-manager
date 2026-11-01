@@ -1691,3 +1691,22 @@ fn purge_removes_a_recorded_file_inside_a_recorded_directory_once() {
         format!("{home}/.config/atuin").as_str()
     );
 }
+
+#[test]
+fn purge_of_a_pinned_mise_trial_keeps_another_version_of_the_tool() {
+    let fx = Fx::new();
+    // Version 20 predates the trial; the trial pins 2 (the stand-in installs 2.0.0).
+    fx.marker("installed-mise", "duckdb 20.1.0\n");
+    let o = fx.trial(&["duckdb@2", "--provider", MISE, "--preview"]);
+    let o = fx.trial(&["duckdb@2", "--provider", MISE, "--yes-plan", &digest_of(&o)]);
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+    let o = fx.purge_approved("trial-duckdb");
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+    assert!(
+        fx.log().contains("mise uninstall duckdb@2.0.0 |"),
+        "{}",
+        fx.log()
+    );
+    let db = fs::read_to_string(fx.fake.path().join("installed-mise")).unwrap();
+    assert_eq!(db.trim(), "duckdb 20.1.0");
+}

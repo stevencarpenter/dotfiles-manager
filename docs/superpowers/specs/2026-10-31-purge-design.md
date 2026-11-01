@@ -53,5 +53,5 @@ Order and evidence follow `trial`: preview, `--preview` stop, `E_APPROVAL_REQUIR
 ## Limits (builder's call)
 
 - Purge reads no source tree, so it cannot see a module that declares the same package by hand. `sync` would reinstall it.
-- A mise tool is uninstalled with `mise uninstall --all <tool>`. mise has no dependencies to remove.
+- A mise tool is uninstalled with `mise uninstall --all <tool>`, or for a pinned trial only the installed versions its pin matches. mise has no dependencies to remove.
 - The data candidates are a fixed list by tool name. A tool that writes elsewhere needs `--config` at trial time.

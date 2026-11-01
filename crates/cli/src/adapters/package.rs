@@ -954,12 +954,28 @@ pub fn uninstall(runner: &Runner, adapter: &str, value: &Value) -> Result<(), Re
             ("brew", args, brew_env())
         }
         MISE => {
-            let (tool, _) = tool_and_version(&pkg);
-            (
-                "mise",
-                vec!["uninstall".to_string(), "--all".into(), tool.into()],
-                mise_env(),
-            )
+            let (tool, want) = tool_and_version(&pkg);
+            let args = if want.is_empty() {
+                vec!["uninstall".to_string(), "--all".into(), tool.into()]
+            } else {
+                // A pinned trial removes only the versions its pin matches: another version of
+                // the tool can predate the trial (`node@20` beside a trial of `node@22`).
+                let mut args = vec!["uninstall".to_string()];
+                args.extend(
+                    mise_listing(runner, &pkg)
+                        .map_err(|s| {
+                            Refusal::new(Code::ProbeFailed, format!("{pkg}: {}", s.state()))
+                        })?
+                        .iter()
+                        .filter(|v| version_matches(v, want))
+                        .map(|v| format!("{tool}@{v}")),
+                );
+                if args.len() == 1 {
+                    return Ok(());
+                }
+                args
+            };
+            ("mise", args, mise_env())
         }
         _ => {
             return Err(Refusal::new(
@@ -1029,8 +1045,15 @@ pub fn listed(runner: &Runner, adapter: &str, value: &Value) -> Result<PackageSt
     Ok(match adapter {
         HOMEBREW => brew_probe(runner, &pkg),
         MISE => match mise_listing(runner, &pkg) {
-            Ok(v) if v.is_empty() => PackageState::Missing(Vec::new()),
-            Ok(v) => PackageState::Installed(v.join(", ")),
+            Ok(v) => {
+                let (_, want) = tool_and_version(&pkg);
+                let v: Vec<String> = v.into_iter().filter(|v| version_matches(v, want)).collect();
+                if v.is_empty() {
+                    PackageState::Missing(Vec::new())
+                } else {
+                    PackageState::Installed(v.join(", "))
+                }
+            }
             Err(s) => s,
         },
         other => PackageState::Unknown(format!("{other} has no listing purge can read")),
