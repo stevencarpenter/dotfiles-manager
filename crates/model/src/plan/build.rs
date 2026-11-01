@@ -54,8 +54,10 @@ impl Scope {
 
     /// The run order of the parts of a `sync` plan: configuration, packages, secrets, services.
     /// A service needs its published definition and its installed formula, and a secret may sit
-    /// in a directory the configuration creates.
+    /// in a directory the configuration creates. Only the four part scopes have a rank: `Sync` is
+    /// the whole plan, not one of its parts.
     pub fn rank(self) -> u8 {
+        debug_assert!(self != Scope::Sync, "the sync scope is not a part");
         match self {
             Scope::Config | Scope::Sync => 0,
             Scope::Packages => 1,

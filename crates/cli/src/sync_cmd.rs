@@ -1001,7 +1001,7 @@ struct Review {
 
 impl Review {
     fn part(&self, id: &str) -> Scope {
-        self.parts.get(id).copied().unwrap_or(Scope::Config)
+        apply_cmd::part_of(&self.parts, id)
     }
 
     /// The plan the run approves and executes: without the excluded operations, and without the
@@ -1019,8 +1019,10 @@ impl Review {
         for o in &mut plan.operations {
             o.after.retain(|a| !ids.contains(a));
         }
-        plan.blockers
-            .retain(|b| !ex.blocked.contains(&blocker_part(&self.plan, b, self)));
+        plan.blockers.retain(|b| {
+            !ex.blocked
+                .contains(&blocker_part(&self.plan, &self.parts, b))
+        });
         plan
     }
 
@@ -1033,7 +1035,7 @@ impl Review {
                 plan.scope = scope.as_str().into();
                 plan.operations.retain(|o| self.part(&o.id) == scope);
                 plan.blockers
-                    .retain(|b| blocker_part(&self.plan, b, self) == scope);
+                    .retain(|b| blocker_part(&self.plan, &self.parts, b) == scope);
                 plan.blockers.extend(
                     self.excluded
                         .waiting
@@ -1068,11 +1070,11 @@ impl Review {
 }
 
 /// The part a blocker belongs to: that of its resource's kind, else configuration.
-fn blocker_part(plan: &Plan, b: &Blocker, review: &Review) -> Scope {
+fn blocker_part(plan: &Plan, parts: &BTreeMap<String, Scope>, b: &Blocker) -> Scope {
     plan.operations
         .iter()
         .find(|o| o.resource == b.resource)
-        .map_or(Scope::Config, |o| review.part(&o.id))
+        .map_or(Scope::Config, |o| apply_cmd::part_of(parts, &o.id))
 }
 
 /// The part of each operation of a combined plan: the scope of its resource's kind, and
@@ -1132,7 +1134,7 @@ impl Excluded {
         rerenders: bool,
         sessions: impl FnOnce(&Plan) -> Result<Vec<(String, String)>, Refusal>,
     ) -> Result<Excluded, Refusal> {
-        let part = |id: &str| parts.get(id).copied().unwrap_or(Scope::Config);
+        let part = |id: &str| apply_cmd::part_of(parts, id);
         let action = |id: &str| {
             plan.operations
                 .iter()
@@ -1141,11 +1143,7 @@ impl Excluded {
         };
         let mut ex = Excluded::default();
         for b in &plan.blockers {
-            let p = plan
-                .operations
-                .iter()
-                .find(|o| o.resource == b.resource)
-                .map_or(Scope::Config, |o| part(&o.id));
+            let p = blocker_part(plan, parts, b);
             if p != Scope::Config && !ex.blocked.contains(&p) {
                 ex.blocked.push(p);
             }
@@ -2033,7 +2031,6 @@ fn run_inner(
     }
     let parts = run.split();
     let runnable = run.runnable();
-    let part = |id: &str| run.part(id);
     // A run that changes nothing in any part (an approved repeat) writes no receipt.
     let runs = |p: &ScopePlan| not_run(p).is_none() && (!p.changes_nothing() || journal_open);
     let mut failure: Option<Refusal> = dfm_engine::signal::requested();
@@ -2049,7 +2046,7 @@ fn run_inner(
                 loaded: &now_loaded,
                 plan: &runnable,
                 digest: &run.digest,
-                parts: Some(&part),
+                parts: Some(&run.parts),
             },
             out,
         );
@@ -2066,7 +2063,13 @@ fn run_inner(
     if let Some(r) = dfm_engine::signal::requested() {
         failure = Some(r);
     }
-    let lines = summary(&parts, &statuses, failure.as_ref(), journal_open, &part);
+    let lines = summary(
+        &parts,
+        &statuses,
+        failure.as_ref(),
+        journal_open,
+        &run.parts,
+    );
     let changed = changed || statuses.values().any(|s| *s == state::Status::Updated);
     // The updaters run after every part that ran, and not after a refusal (docs/upgrade.md).
     let up = match failure {
@@ -2102,16 +2105,17 @@ fn run_inner(
 }
 
 /// The `scopes:` lines of a run: per part, why it did not run, or how its operations ended. The
-/// part with the first operation that did not complete reports the run's failure; the parts
-/// after it did not start.
+/// part with the first operation that did not complete reports the run's failure; a part whose
+/// own operations did not all complete did not start. `of` is the part of each operation id.
 fn summary(
     parts: &[ScopePlan],
     statuses: &BTreeMap<String, state::Status>,
     failure: Option<&Refusal>,
     journal_open: bool,
-    part: &dyn Fn(&str) -> Scope,
+    of: &BTreeMap<String, Scope>,
 ) -> Vec<(Scope, String)> {
     use state::Status as S;
+    let part = |id: &str| apply_cmd::part_of(of, id);
     let failed_part = failure.and_then(|_| {
         let first = |want: &dyn Fn(S) -> bool| {
             statuses
@@ -2128,25 +2132,27 @@ fn summary(
         })
         .or_else(|| first(&|s| s == S::NotStarted))
     });
-    let mut started = false;
-    let mut after_failure = false;
+    // The run's failure is reported once, by the part it came from.
+    let mut reported = false;
+    let ran = statuses.values().any(|s| *s != S::NotStarted);
     parts
         .iter()
         .map(|p| {
+            let mine: Vec<S> = statuses
+                .iter()
+                .filter(|(id, _)| part(id) == p.scope)
+                .map(|(_, s)| *s)
+                .collect();
+            let none_started = !mine.is_empty() && mine.iter().all(|s| *s == S::NotStarted);
             let status = if let Some(s) = not_run(p) {
                 s
             } else if p.changes_nothing() && !journal_open {
                 p.idle()
-            } else if after_failure {
-                "not_started".into()
-            } else if let Some(e) = failure.filter(|_| failed_part.is_none_or(|f| f == p.scope)) {
-                after_failure = true;
-                let mine: Vec<S> = statuses
-                    .iter()
-                    .filter(|(id, _)| part(id) == p.scope)
-                    .map(|(_, s)| *s)
-                    .collect();
-                if started && !mine.is_empty() && mine.iter().all(|s| *s == S::NotStarted) {
+            } else if let Some(e) =
+                failure.filter(|_| !reported && failed_part.is_none_or(|f| f == p.scope))
+            {
+                reported = true;
+                if none_started && ran {
                     "not_started".into()
                 } else {
                     // `blocked` is the word for a part that did not run (C10), not a failure.
@@ -2156,8 +2162,14 @@ fn summary(
                     };
                     format!("{word} ({})", e.code.as_str())
                 }
+            } else if failure.is_some()
+                && !mine
+                    .iter()
+                    .all(|s| matches!(s, S::Updated | S::Current | S::Held | S::NotInScope))
+            {
+                // Its operations did not start, or waited for one that did not complete.
+                "not_started".into()
             } else {
-                started = true;
                 "ok".into()
             };
             (p.scope, status)

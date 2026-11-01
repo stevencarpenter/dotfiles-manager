@@ -657,7 +657,13 @@ pub(crate) struct Locked<'a> {
     pub(crate) digest: &'a str,
     /// For `sync`: the part (scope) each operation id belongs to. Its report lists each part
     /// under a `scope:` line, in run order.
-    pub(crate) parts: Option<&'a dyn Fn(&str) -> Scope>,
+    pub(crate) parts: Option<&'a BTreeMap<String, Scope>>,
+}
+
+/// The part (scope) of operation `id` of a combined plan: configuration for an id that `parts`
+/// does not list.
+pub(crate) fn part_of(parts: &BTreeMap<String, Scope>, id: &str) -> Scope {
+    parts.get(id).copied().unwrap_or(Scope::Config)
 }
 
 /// How each operation of a locked run ended, by plan id, and the run's one exit.
@@ -850,9 +856,17 @@ pub(crate) fn execute_locked(
         .iter()
         .zip(&report.operations)
         .filter(|(_, rec)| !(args.composed && rec.status == Status::NotInScope))
-        .map(|(op, rec)| (l.parts.map_or(args.scope, |part| part(&op.id)), op, rec))
+        .map(|(op, rec)| {
+            (
+                l.parts.map_or(args.scope, |parts| part_of(parts, &op.id)),
+                op,
+                rec,
+            )
+        })
         .collect();
-    lines.sort_by_key(|(scope, ..)| scope.rank());
+    if l.parts.is_some() {
+        lines.sort_by_key(|(scope, ..)| scope.rank());
+    }
     let mut heading = None;
     for (scope, op, rec) in lines {
         if l.parts.is_some() && heading != Some(scope) {
