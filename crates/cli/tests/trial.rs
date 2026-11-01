@@ -1240,6 +1240,8 @@ fn purge_removes_the_install_its_dependencies_and_what_the_tool_created() {
     fx.home_put(".local/share/atuin/history.db", "rows\n");
     fx.home_put(".local/share/atuin/sub/deep", "x\n");
     fx.home_put(".cache/atuin/new", "after\n");
+    // An older keg beside the installed one: every version goes.
+    fs::create_dir_all(fx.cellar("atuin").join("0.9.0")).unwrap();
 
     let o = fx.purge(&["atuin", "--preview"]);
     assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
@@ -1294,13 +1296,17 @@ fn purge_removes_the_install_its_dependencies_and_what_the_tool_created() {
     );
     assert!(t.ends_with("result: ok\n"), "{t}");
     let log = fx.log();
-    assert!(log.contains("brew uninstall --formula atuin |"), "{log}");
     assert!(
-        log.contains("brew uninstall --formula libsodium |"),
+        log.contains("brew uninstall --formula --force atuin |"),
+        "{log}"
+    );
+    assert!(log.contains("uninstall autoremove=1"), "{log}");
+    assert!(
+        log.contains("brew uninstall --formula --force libsodium |"),
         "{log}"
     );
     assert!(
-        !log.contains("autoremove") && !log.contains("--zap"),
+        !log.contains("brew autoremove") && !log.contains("--zap"),
         "{log}"
     );
     assert!(!fx.cellar("atuin").exists() && !fx.cellar("libsodium").exists());
@@ -1503,7 +1509,7 @@ fn a_brew_failure_that_is_not_the_dependents_refusal_fails_the_purge() {
         &brew,
         body.replacen(
             "  uninstall)\n",
-            "  uninstall)\n    [ \"$3\" = libsodium ] && { echo 'Error: another brew process is running' >&2; exit 1; }\n",
+            "  uninstall)\n    [ \"$4\" = libsodium ] && { echo 'Error: another brew process is running' >&2; exit 1; }\n",
             1,
         ),
     )
@@ -1741,4 +1747,18 @@ fn purge_keeps_a_mise_tool_another_trial_pins() {
         text(&o.stdout)
     );
     assert!(!fx.log().contains("mise uninstall"), "{}", fx.log());
+}
+
+#[test]
+fn purge_refuses_a_trial_recorded_for_another_machine() {
+    let fx = Fx::new();
+    fx.brew_trial();
+    let path = fx.state().join("trials/trial-atuin.json");
+    let mut r = fx.json(&path);
+    r["binding"]["machine_id"] = "other-machine".into();
+    fs::write(&path, serde_json::to_vec(&r).unwrap()).unwrap();
+    let o = fx.purge(&["atuin", "--preview"]);
+    assert_eq!(code(&o), 3, "{}\n{}", stderr(&o), text(&o.stdout));
+    assert!(stderr(&o).contains("as other-machine"), "{}", stderr(&o));
+    assert!(fx.cellar("atuin").exists());
 }

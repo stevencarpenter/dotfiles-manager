@@ -12,8 +12,10 @@
 /// `<name> 1` (brew pours a bottle) for every name except those in `nobottle-brew`, which answer
 /// `<name> 0`; there is no `brew info`. `brew install <name>` adds the
 /// name and its missing dependencies, or does nothing with the `noop` marker, or fails with the
-/// `fail` marker. `brew uninstall --formula|--cask <name>...` removes the racks, or
-/// refuses the whole call (exit 1) when a `needed-<name>` file names a formula outside the call.
+/// `fail` marker. `brew uninstall --formula|--cask [--force] <name>...` logs
+/// `uninstall autoremove=<HOMEBREW_NO_AUTOREMOVE>` and removes the racks (a formula rack with
+/// more than one version loses only its last one without `--force`), or refuses the whole call
+/// (exit 1) when a `needed-<name>` file names a formula outside the call.
 /// `brew formulae` prints `official-brew` (default: atuin and duckdb) and `brew
 /// casks` prints `official-cask`. Every command takes a name pinned to its namespace
 /// (`homebrew/core/<name>`, or `--cask <name>`) and answers with the short name, as brew does.
@@ -68,13 +70,22 @@ case "$1" in
     fi
     echo "==> Installing $n"; exit 0 ;;
   uninstall)
+    echo "uninstall autoremove=${HOMEBREW_NO_AUTOREMOVE:-unset}" >> "$here/../log"
     root=Cellar; [ "$2" = --cask ] && root=Caskroom; shift 2
+    force=; [ "$1" = --force ] && { force=1; shift; }
     for n in "$@"; do
       for u in $(cat "$here/../needed-$n" 2>/dev/null); do
         case " $* " in *" $u "*) ;; *) echo "Error: Refusing to uninstall $n because it is required by $u" >&2; exit 1 ;; esac
       done
     done
-    for n in "$@"; do rm -rf "$here/../$root/$n"; done
+    for n in "$@"; do
+      d="$here/../$root/$n"
+      if [ -z "$force" ] && [ "$root" = Cellar ] && [ "$(ls "$d" 2>/dev/null | wc -l)" -gt 1 ]; then
+        rm -rf "$d/$(ls "$d" | tail -1)"
+      else
+        rm -rf "$d"
+      fi
+    done
     exit 0 ;;
   *) exit 64 ;;
 esac

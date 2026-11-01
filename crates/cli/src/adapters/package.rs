@@ -40,6 +40,8 @@ fn brew_env() -> Vec<(String, String)> {
         "HOMEBREW_NO_INSTALL_CLEANUP",
         "HOMEBREW_NO_INSTALL_UPGRADE",
         "HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK",
+        // `brew uninstall` runs autoremove unless this is set: purge removes only what it names.
+        "HOMEBREW_NO_AUTOREMOVE",
     ]
     .iter()
     .map(|k| (k.to_string(), "1".to_string()))
@@ -948,7 +950,10 @@ pub fn uninstall(runner: &Runner, adapter: &str, value: &Value) -> Result<(), Re
                     )
                 })?;
             let args = match off {
-                Official::Formula(n) => vec!["uninstall".into(), "--formula".into(), n],
+                // `--force` removes every installed keg, not only the latest one.
+                Official::Formula(n) => {
+                    vec!["uninstall".into(), "--formula".into(), "--force".into(), n]
+                }
                 Official::Cask(n) => vec!["uninstall".into(), "--cask".into(), n],
             };
             ("brew", args, brew_env())
@@ -1004,7 +1009,11 @@ pub fn uninstall_formulae(runner: &Runner, names: &[String]) -> Result<(), Refus
             format!("{n} is not a formula name"),
         ));
     }
-    let mut args = vec!["uninstall".to_string(), "--formula".into()];
+    let mut args = vec![
+        "uninstall".to_string(),
+        "--formula".into(),
+        "--force".into(),
+    ];
     args.extend(names.iter().cloned());
     let what = format!("brew uninstall {}", names.join(" "));
     let out = runner.run(&request("brew", &args, &brew_env(), INSTALL_TIMEOUT))?;

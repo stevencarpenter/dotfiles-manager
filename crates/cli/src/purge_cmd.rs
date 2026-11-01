@@ -480,6 +480,20 @@ pub fn run(ctx: &Ctx, args: &Args, out: &mut dyn Write) -> Result<(), Refusal> {
 
     let decide = |store: &Store| -> Result<(TrialRecord, Decision), Refusal> {
         let t = trial_record(store, &args.trial)?;
+        // A record written for another profile or machine is no authority to remove anything here.
+        if !t.binding.matches(&binding) {
+            return Err(Refusal::new(
+                Code::IdentityMismatch,
+                format!(
+                    "trials/{}.json belongs to {} as {}, not {} as {}. Nothing was changed",
+                    t.trial_id,
+                    t.binding.profile,
+                    t.binding.machine_id,
+                    binding.profile(),
+                    binding.machine_id()
+                ),
+            ));
+        }
         // Another trial's record that cannot be read could name the same package or path, so
         // nothing is decided without it.
         let mut others = Vec::new();
