@@ -54,7 +54,7 @@ jobs:
             printf 'changed:\n%s\n' "$changed"
             rust=false
             bootstrap=false
-            rust_inputs='^(crates/|examples/|tests/|Cargo\.(toml|lock)$|rust-toolchain\.toml$|scripts/check_all\.sh$|scripts/bootstrap\.sh$|docs/bootstrap\.md$|\.github/workflows/contract-check\.yml$)'
+            rust_inputs='^(crates/|examples/|tests/|Cargo\.(toml|lock)$|rust-toolchain\.toml$|scripts/check_all\.sh$|scripts/bootstrap\.sh$|docs/bootstrap\.md$|docs/authoring\.md$|\.github/workflows/contract-check\.yml$)'
             bootstrap_inputs='^(scripts/bootstrap\.sh$|crates/cli/tests/bootstrap\.rs$|crates/cli/tests/common/|crates/[^/]+/Cargo\.toml$|Cargo\.(toml|lock)$|rust-toolchain\.toml$|scripts/check_all\.sh$|\.github/workflows/contract-check\.yml$)'
             if printf '%s\n' "$changed" | grep -Eq "$rust_inputs"; then rust=true; fi
             if printf '%s\n' "$changed" | grep -Eq "$bootstrap_inputs"; then bootstrap=true; fi
@@ -116,7 +116,7 @@ jobs:
           - shard: libs
             select: -p dfm-model -p dfm-engine -p dfm-platform-macos --features dfm-engine/failpoints
           - shard: cli-1
-            select: -p dfm-cli --features test-isolation --lib --bins --test gate --test bootstrap --test doctor --test cli --test explain --test module_doc
+            select: -p dfm-cli --features test-isolation --lib --bins --test gate --test bootstrap --test doctor --test cli --test explain --test module_doc --test authoring
           - shard: cli-2
             select: -p dfm-cli --features test-isolation --test build_controls --test sync --test planner --test runner --test trial --test adopt
           - shard: cli-3

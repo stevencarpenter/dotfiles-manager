@@ -1,0 +1,7 @@
+schema = 1
+id = "laptop-01"
+bundle = "../bundle.toml"
+platform = "macos"
+architecture = "arm64"
+modules = ["git-extras", "macos-tools"]
+overrides = []

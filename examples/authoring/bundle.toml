@@ -1,0 +1,8 @@
+# Synthetic bundle for docs/authoring.md. It adds two modules to the base bundle.
+schema = 1
+id = "example-authoring"
+extends = "../base/bundle.toml"
+
+[modules]
+git-extras = "modules/git-extras/module.toml"
+macos-tools = "modules/macos-tools/module.toml"

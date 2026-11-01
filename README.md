@@ -71,6 +71,8 @@ The Intel i9 stays with the homelab repository and GNU Stow. The Linux, homelab 
 
 The [first-run runbook](docs/first-run.md) is the shortest safe path to a first live `apply`. It starts with placing the pinned toolchain, which `install` requires. [Bootstrap and binding](docs/bootstrap.md) documents every check, upgrade, rollback and removal.
 
+To write a reusable module and select it in profiles, follow the [authoring walkthrough](docs/authoring.md). It runs against the synthetic fixtures in `examples/` and an isolated HOME.
+
 ```sh
 /bin/sh scripts/bootstrap.sh install --source "$PWD"   # builds the checkout's HEAD; --commit <sha> picks another
 dfm bind --profile <profile.toml> --machine-id <id>     # root: the nearest directory above the profile that holds .git

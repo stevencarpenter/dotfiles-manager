@@ -97,5 +97,9 @@ required-features = ["test-isolation"]
 name = "sync"
 required-features = ["test-isolation"]
 
+[[test]]
+name = "authoring"
+required-features = ["test-isolation"]
+
 [lints]
 workspace = true

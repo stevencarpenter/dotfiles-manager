@@ -1,0 +1,18 @@
+schema = 1
+id = "git-extras"
+platforms = ["macos", "linux"]
+requires = []
+
+[[resources]]
+id = "config"
+kind = "render"
+adapter = "git-config/v1"
+target = ".config/git/extras.inc"
+[resources.value.pull]
+rebase = true
+[resources.value.rerere]
+enabled = true
+[resources.value.diff]
+[resources.policy]
+defaults = ["/pull/rebase"]
+extensions = ["/diff"]
