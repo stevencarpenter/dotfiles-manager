@@ -311,7 +311,11 @@ pub(crate) fn probe(
         Scope::Packages => {
             probed.package = crate::adapters::package::package_facts(resolved, &ctx.runner(sys))?;
         }
-        Scope::Services => {
+        Scope::Services | Scope::Sync => {
+            if args.scope == Scope::Sync {
+                probed.package =
+                    crate::adapters::package::package_facts(resolved, &ctx.runner(sys))?;
+            }
             let staged = loaded
                 .staged
                 .as_deref()
@@ -508,12 +512,14 @@ pub(crate) fn generators_for<'a>(
     loaded: &'a crate::Loaded,
 ) -> Generators<'a> {
     match scope {
-        Scope::Secrets | Scope::Packages | Scope::Services => Generators::with_runner(
-            &loaded.resolved,
-            &loaded.sources,
-            &loaded.root,
-            ctx.runner(sys),
-        ),
+        Scope::Secrets | Scope::Packages | Scope::Services | Scope::Sync => {
+            Generators::with_runner(
+                &loaded.resolved,
+                &loaded.sources,
+                &loaded.root,
+                ctx.runner(sys),
+            )
+        }
         Scope::Config => Generators::new(&loaded.resolved),
     }
 }
@@ -728,6 +734,7 @@ fn run_inner(
             Scope::Secrets => "secrets",
             Scope::Packages => "packages",
             Scope::Services => "services",
+            Scope::Sync => "sync",
         };
         let receipt = Receipt {
             schema: SCHEMA,

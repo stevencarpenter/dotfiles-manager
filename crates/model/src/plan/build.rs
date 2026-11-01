@@ -18,13 +18,15 @@ use toml::Value;
 /// rendered only by `secrets`, a package installed only by `packages`, and a service started or
 /// restarted only by `services` (DESIGN.md section 7: "Only configuration work belongs in a
 /// normal config plan"). Everything else in a plan is `not_in_scope`, so the counts still add up
-/// to the number of participants.
+/// to the number of participants. `Sync` is the one combined plan of `sync` (docs/sync.md): it
+/// covers the kinds of the other four, so one digest approves them all.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Scope {
     Config,
     Secrets,
     Packages,
     Services,
+    Sync,
 }
 
 impl Scope {
@@ -34,18 +36,55 @@ impl Scope {
             Scope::Secrets => "secrets",
             Scope::Packages => "packages",
             Scope::Services => "services",
+            Scope::Sync => "sync",
+        }
+    }
+
+    /// The single scope that acts on resources of `kind`, if one does.
+    pub fn of(kind: &str) -> Option<Scope> {
+        [
+            Scope::Config,
+            Scope::Packages,
+            Scope::Secrets,
+            Scope::Services,
+        ]
+        .into_iter()
+        .find(|s| s.covers_kind(kind))
+    }
+
+    /// The run order of the parts of a `sync` plan: configuration, packages, secrets, services.
+    /// A service needs its published definition and its installed formula, and a secret may sit
+    /// in a directory the configuration creates.
+    pub fn rank(self) -> u8 {
+        match self {
+            Scope::Config | Scope::Sync => 0,
+            Scope::Packages => 1,
+            Scope::Secrets => 2,
+            Scope::Services => 3,
         }
     }
 
     pub fn covers(self, r: &ResolvedResource) -> bool {
+        self.covers_kind(&r.kind)
+    }
+
+    fn covers_kind(self, kind: &str) -> bool {
         match self {
             Scope::Config => matches!(
-                r.kind.as_str(),
+                kind,
                 "link" | "render" | "merge" | "assemble" | "distribution"
             ),
-            Scope::Secrets => r.kind == "secret",
-            Scope::Packages => r.kind == "package",
-            Scope::Services => r.kind == "service",
+            Scope::Secrets => kind == "secret",
+            Scope::Packages => kind == "package",
+            Scope::Services => kind == "service",
+            Scope::Sync => [
+                Scope::Config,
+                Scope::Secrets,
+                Scope::Packages,
+                Scope::Services,
+            ]
+            .into_iter()
+            .any(|s| s.covers_kind(kind)),
         }
     }
 
@@ -368,7 +407,7 @@ pub struct Context<'a> {
 /// it claims nothing now, and a path that another resource claims is that resource's business.
 fn removals<'a>(resolved: &Resolved, ledger: &'a [Owned], scope: Scope) -> Vec<&'a Owned> {
     // Removal is configuration work: a secrets or packages plan removes nothing.
-    if scope != Scope::Config {
+    if !scope.covers_kind("link") {
         return Vec::new();
     }
     let claimed: BTreeSet<String> = resolved
@@ -573,14 +612,48 @@ pub fn build(resolved: &Resolved, cx: &Context<'_>, obs: &Observations) -> Resul
             .collect(),
         sensitive: sensitive_paths(Some(resolved), &cx.ledger),
     };
-    for r in resolved.resources.values() {
+    // A combined plan plans the services last, so each finds the operations of this plan that
+    // publish its prerequisite files. Every other plan keeps the resource order.
+    let sync = cx.scope == Scope::Sync;
+    for r in resolved
+        .resources
+        .values()
+        .filter(|r| !sync || r.kind != "service")
+    {
+        p.resource(r);
+    }
+    for r in resolved
+        .resources
+        .values()
+        .filter(|r| sync && r.kind == "service")
+    {
         p.resource(r);
     }
     for o in removals(resolved, &cx.ledger, cx.scope) {
         p.remove(o);
     }
     p.edges(resolved);
-    let (mut operations, cycle) = p.finish();
+    // A combined plan runs its parts in scope order where the edges allow it. A directory or a
+    // removal is configuration work, whichever resource asked for it.
+    let ranks: BTreeMap<String, u8> = match sync {
+        true => p
+            .ops
+            .values()
+            .map(|o| {
+                let rank = match o.action {
+                    Action::CreateDir | Action::Remove => 0,
+                    _ => resolved
+                        .resources
+                        .get(&o.resource)
+                        .and_then(|r| Scope::of(&r.kind))
+                        .map_or(0, Scope::rank),
+                };
+                (o.id.clone(), rank)
+            })
+            .collect(),
+        false => BTreeMap::new(),
+    };
+    let (mut operations, cycle) = p.finish(|id| ranks.get(id).copied().unwrap_or(0));
     let mut blockers = p.blockers;
     if let Some(cycle) = cycle {
         let first = operations
@@ -2147,7 +2220,7 @@ impl Planner<'_> {
     /// roll, which stops all later mutation, can only leave other trial rolls `not_started`
     /// (docs/toolchains.md, "Trials"). The ordering edges are not written into `after`. A plan
     /// without a trial row orders as before.
-    fn finish(&mut self) -> (Vec<Operation>, Option<Vec<String>>) {
+    fn finish(&mut self, rank: impl Fn(&str) -> u8) -> (Vec<Operation>, Option<Vec<String>>) {
         let is_trial = |o: &Operation| o.resource.starts_with(TRIAL_PREFIX);
         let declared: Vec<String> = if self.ops.values().any(is_trial) {
             self.ops
@@ -2169,7 +2242,7 @@ impl Planner<'_> {
                 (o.id.clone(), after)
             })
             .collect();
-        match graph::order(&nodes, |_| 0) {
+        match graph::order(&nodes, rank) {
             Ok(order) => (
                 order
                     .into_iter()
@@ -2538,6 +2611,32 @@ mod tests {
             "package is provisioning, outside a config plan"
         );
         assert_eq!(Scope::Packages.as_str(), "packages");
+    }
+
+    #[test]
+    fn the_sync_scope_covers_the_kinds_of_the_four_scopes_and_ranks_them_in_run_order() {
+        for (kind, scope) in [
+            ("link", Scope::Config),
+            ("merge", Scope::Config),
+            ("package", Scope::Packages),
+            ("secret", Scope::Secrets),
+            ("service", Scope::Services),
+        ] {
+            assert!(Scope::Sync.covers(&of_kind(kind)), "{kind}");
+            assert_eq!(Scope::of(kind), Some(scope), "{kind}");
+        }
+        assert!(!Scope::Sync.covers(&of_kind("application")));
+        assert_eq!(Scope::of("application"), None);
+        let ranks: Vec<u8> = [
+            Scope::Config,
+            Scope::Packages,
+            Scope::Secrets,
+            Scope::Services,
+        ]
+        .map(Scope::rank)
+        .into();
+        assert_eq!(ranks, [0, 1, 2, 3]);
+        assert_eq!(Scope::Sync.as_str(), "sync");
     }
 
     #[test]

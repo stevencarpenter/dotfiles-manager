@@ -182,7 +182,7 @@ pub(crate) fn plan_with_outputs(
         .as_ref()
         .and_then(|_| Dir::open_plain(&loaded.root).ok());
     let merge = match scope {
-        Scope::Config => crate::adapters::merge_facts(
+        Scope::Config | Scope::Sync => crate::adapters::merge_facts(
             &loaded.resolved,
             &store,
             &sys,
@@ -197,7 +197,7 @@ pub(crate) fn plan_with_outputs(
         _ => BTreeMap::new(),
     };
     let secret = match scope {
-        Scope::Secrets => crate::adapters::secret::secret_facts(
+        Scope::Secrets | Scope::Sync => crate::adapters::secret::secret_facts(
             &loaded.resolved,
             &store,
             &sys,
