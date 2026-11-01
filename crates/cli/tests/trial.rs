@@ -1710,3 +1710,35 @@ fn purge_of_a_pinned_mise_trial_keeps_another_version_of_the_tool() {
     let db = fs::read_to_string(fx.fake.path().join("installed-mise")).unwrap();
     assert_eq!(db.trim(), "duckdb 20.1.0");
 }
+
+#[test]
+fn purge_keeps_a_mise_tool_another_trial_pins() {
+    let fx = Fx::new();
+    fx.mise_trial();
+    let o = fx.trial(&[
+        "duckdb@2",
+        "--provider",
+        MISE,
+        "--id",
+        "pinned",
+        "--preview",
+    ]);
+    let o = fx.trial(&[
+        "duckdb@2",
+        "--provider",
+        MISE,
+        "--id",
+        "pinned",
+        "--yes-plan",
+        &digest_of(&o),
+    ]);
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+    let o = fx.purge_approved("trial-duckdb");
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+    assert!(
+        text(&o.stdout).contains("trial pinned also uses it"),
+        "{}",
+        text(&o.stdout)
+    );
+    assert!(!fx.log().contains("mise uninstall"), "{}", fx.log());
+}

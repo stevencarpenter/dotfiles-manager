@@ -4,7 +4,7 @@
 //! trial record. Anything that existed before the trial is kept. The run needs `--yes-plan`
 //! with the digest of the preview, as `trial` and `adopt` do.
 
-use crate::adapters::package::{self, HOMEBREW};
+use crate::adapters::package::{self, HOMEBREW, MISE};
 use crate::adopt_cmd::overlaps;
 use crate::apply_cmd::{is_digest, label, stale};
 use crate::{Ctx, paint, read_existing_binding, state_cmd, usage};
@@ -195,13 +195,14 @@ fn line(out: &mut dyn Write, what: &str, s: &Step) -> std::io::Result<()> {
     }
 }
 
-/// Whether two recorded names are one package: brew treats `atuin` and `homebrew/core/atuin`
-/// as the same formula. Other adapters compare the names as written.
+/// Whether two recorded names can share an install: brew treats `atuin` and
+/// `homebrew/core/atuin` as one formula, and two mise trials of one tool (`node`, `node@22`,
+/// `node@22.1`) can use the same installed version, so mise compares the tool alone.
 fn same_package(adapter: &str, a: &str, b: &str) -> bool {
-    if adapter == HOMEBREW {
-        package::brewfile_names(a).0 == package::brewfile_names(b).0
-    } else {
-        a == b
+    match adapter {
+        HOMEBREW => package::brewfile_names(a).0 == package::brewfile_names(b).0,
+        MISE => package::tool_and_version(a).0 == package::tool_and_version(b).0,
+        _ => a == b,
     }
 }
 
