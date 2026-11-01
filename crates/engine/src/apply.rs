@@ -2514,7 +2514,9 @@ fn execute(run: &Run<'_>, plan: &Plan) -> Report {
     let mut pending: Option<Refusal> = None;
     let mut records = Vec::new();
     for op in &plan.operations {
-        // A test can stop or pause the run before one operation (`sync` between its parts).
+        // A test can stop or pause the run before one operation (`sync` between its parts). The
+        // point name is built only in a build with failpoints.
+        #[cfg(feature = "failpoints")]
         if let Err(r) = run.fail.hit(&format!("apply-before-op-{}", op.id)) {
             stopped.get_or_insert(r);
         }
