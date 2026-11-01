@@ -1795,11 +1795,17 @@ impl Life {
         self.sync(&digest_of(&p), flags)
     }
 
-    /// Sync with `digest`, and run `between` after the configuration scope and before the
-    /// next scope starts (the `sync-after-scope` failpoint waits for it).
-    fn sync_pausing(&self, digest: &str, flags: &[&str], between: impl FnOnce()) -> Output {
+    /// Sync with `digest`, and run `between` right before the operation `before` (the
+    /// `apply-before-op-<id>` failpoint waits for it), after the operations it runs after.
+    fn sync_pausing(
+        &self,
+        digest: &str,
+        flags: &[&str],
+        before: &str,
+        between: impl FnOnce(),
+    ) -> Output {
         let release = self.fake.path().join("release");
-        let fp = format!("sync-after-scope:wait-{}", release.display());
+        let fp = format!("apply-before-op-{before}:wait-{}", release.display());
         let mut a = vec!["sync", "--root", self.fx.root_arg(), "-y", digest];
         a.extend_from_slice(flags);
         let run = self
@@ -1948,12 +1954,9 @@ fn sync_runs_configuration_packages_secrets_and_services_in_order_under_one_appr
         fs::read_to_string(l.fx.h(".config/example/personal.env")).unwrap(),
         "TOKEN=planted-value\n"
     );
-    // Each scope wrote its own receipt, in run order, approved by the digest.
+    // One combined plan ran: one `sync` receipt, approved by the digest.
     let after = l.receipt_commands();
-    assert_eq!(
-        after[before.len()..],
-        ["apply", "packages", "secrets", "services"]
-    );
+    assert_eq!(after[before.len()..], ["sync"]);
     for r in &l.fx.receipt_docs()[before.len()..] {
         assert_eq!(r["approval"]["kind"], "yes_plan", "{r}");
     }
@@ -1984,10 +1987,7 @@ fn a_plain_sync_runs_every_scope_without_a_digest() {
         &["brew install", "op inject", "launchctl bootstrap"],
     );
     assert!(l.fx.h(".config/life/notes").is_symlink());
-    assert_eq!(
-        l.receipt_commands()[before.len()..],
-        ["apply", "packages", "secrets", "services"]
-    );
+    assert_eq!(l.receipt_commands()[before.len()..], ["sync"]);
     for r in &l.fx.receipt_docs()[before.len()..] {
         assert_eq!(r["approval"]["kind"], "unattended", "{r}");
     }
@@ -2002,12 +2002,10 @@ fn a_packages_scope_after_the_configuration_scope_probes_once_per_plan() {
     let log = l.log();
     let o = l.sync(&digest_of(&p), &[]);
     assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
-    // One package probe runs `brew ruby` once. The review, the plan under the sync lock, the
-    // recheck after the configuration scope and the plan under the packages scope's lock each
-    // probe, and the engine probes once before the install; the scope's first look reuses the
-    // recheck.
+    // One package probe runs `brew ruby` once. The review, the plan under the sync lock and the
+    // plan of the published tree each probe, and the engine probes once before the install.
     let probes = l.log()[log.len()..].matches("\nbrew ruby ").count();
-    assert_eq!(probes, 5, "{}", l.log());
+    assert_eq!(probes, 4, "{}", l.log());
 }
 
 #[test]
@@ -2349,10 +2347,7 @@ fn a_service_whose_definition_the_same_run_publishes_is_planned_not_blocked() {
         ],
     );
     assert!(l.log().contains("launchctl bootstrap"), "{}", l.log());
-    assert_eq!(
-        l.receipt_commands(),
-        ["apply", "packages", "secrets", "services"]
-    );
+    assert_eq!(l.receipt_commands(), ["sync"]);
 }
 
 #[test]
@@ -2369,7 +2364,7 @@ fn a_deferred_definition_another_program_retargets_after_the_configuration_scope
     )
     .unwrap();
     let rel = "Library/LaunchAgents/org.example.agent.plist";
-    let o = l.sync_pausing(&digest_of(&p), &[], || {
+    let o = l.sync_pausing(&digest_of(&p), &[], AGENT_OP, || {
         fs::remove_file(l.fx.h(rel)).unwrap();
         std::os::unix::fs::symlink(&other, l.fx.h(rel)).unwrap();
     });
@@ -2505,6 +2500,56 @@ fn a_generated_definition_the_configuration_changes_is_reviewed_from_its_new_byt
 }
 
 /// A brew service `bar` and the link of its configuration file to `files/<source>`.
+/// A file the configuration part writes and a service reads is checked by what that operation
+/// left there, not by an observed state (a hash or a size): the bytes it published. Another
+/// hand that rewrites the file in between stops the service before it loads it.
+#[test]
+fn a_generated_definition_another_hand_rewrites_after_the_configuration_part_is_stale() {
+    let l = Life::unpublished();
+    let seed = &l.fx.upstream.seed;
+    put(seed, "base/modules/life/module.toml", &generated_life());
+    l.fx.upstream.push("generate the agent definition");
+    let o = l.approved(&[]);
+    assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
+    put(
+        seed,
+        "base/modules/life/files/org.example.agent.plist",
+        &AGENT_PLIST.replace("/usr/bin/true", "/usr/bin/false"),
+    );
+    l.fx.upstream.push("the agent runs another program");
+    let flags = ["--restart", "life.agent"];
+    let p = l.preview(&flags);
+    assert_eq!(code(&p), 0, "{}\n{}", stdout(&p), stderr(&p));
+    let plist = l.fx.h("Library/LaunchAgents/org.example.agent.plist");
+    let log = l.log();
+    // Same size, other bytes: only the content tells them apart.
+    let o = l.sync_pausing(&digest_of(&p), &flags, AGENT_OP, || {
+        let now = fs::read_to_string(&plist).unwrap();
+        fs::write(&plist, now.replace("/usr/bin/false", "/usr/bin/fals_")).unwrap();
+    });
+    assert_eq!(code(&o), 1, "{}\n{}", stdout(&o), stderr(&o));
+    in_order(
+        &stdout(&o),
+        &[
+            "  config: ok",
+            "  services: failed (E_PLAN_STALE)",
+            "result: failed",
+        ],
+    );
+    assert!(
+        stdout(&o).contains(
+            "is not what life.agent-plist@Library/LaunchAgents/org.example.agent.plist published"
+        ),
+        "{}",
+        stdout(&o)
+    );
+    assert!(
+        !l.log()[log.len()..].contains("launchctl boot"),
+        "{}",
+        l.log()
+    );
+}
+
 fn bar_module(source: &str) -> String {
     format!(
         "\n[[resources]]\nid = \"barrc\"\nkind = \"link\"\nadapter = \"fs-link/v1\"\ntarget = \".config/bar/barrc\"\n[resources.value]\nsource = \"files/{source}\"\n\n[[resources]]\nid = \"bar\"\nkind = \"service\"\nadapter = \"brew-service/v1\"\n[resources.value]\nname = \"bar\"\nconfig = [\".config/bar/barrc\"]\n"
@@ -2701,8 +2746,9 @@ fn a_service_precondition_on_a_path_the_configuration_did_not_write_stays_stale(
         &[("notes", "notes\n")],
         "add a link",
     );
-    fs::write(l.fake.path().join("loaded"), "").unwrap();
-    let p = l.preview(&[]);
+    // The owner asks for bar's restart: the services part acts on bar.
+    let flags = ["--restart", "life.bar"];
+    let p = l.preview(&flags);
     assert_eq!(code(&p), 0, "{}\n{}", stdout(&p), stderr(&p));
     assert!(
         stdout(&p).contains("current life.barrc@.config/bar/barrc"),
@@ -2710,8 +2756,8 @@ fn a_service_precondition_on_a_path_the_configuration_did_not_write_stays_stale(
         stdout(&p)
     );
     let log = l.log();
-    // After the configuration scope, bar's config file changes by another hand.
-    let o = l.sync_pausing(&digest_of(&p), &[], || {
+    // After the configuration part, bar's config file changes by another hand.
+    let o = l.sync_pausing(&digest_of(&p), &flags, "life.bar@service", || {
         l.relink(".config/bar/barrc", "barrc2")
     });
     assert_eq!(code(&o), 1, "{}\n{}", stdout(&o), stderr(&o));
@@ -2724,7 +2770,7 @@ fn a_service_precondition_on_a_path_the_configuration_did_not_write_stays_stale(
         ],
     );
     let new = &l.log()[log.len()..];
-    assert!(!new.contains("launchctl bootstrap"), "{new}");
+    assert!(!new.contains("brew services restart"), "{new}");
 }
 
 #[test]
@@ -2738,11 +2784,12 @@ fn a_service_config_link_another_program_retargets_after_the_configuration_scope
         &[("barrc3", "height=3\n")],
         "bar reads barrc2",
     );
-    fs::write(l.fake.path().join("loaded"), "").unwrap();
-    let p = l.preview(&[]);
+    // The owner asks for the restart that makes bar read barrc2.
+    let flags = ["--restart", "life.bar"];
+    let p = l.preview(&flags);
     assert_eq!(code(&p), 0, "{}\n{}", stdout(&p), stderr(&p));
     let log = l.log();
-    let o = l.sync_pausing(&digest_of(&p), &[], || {
+    let o = l.sync_pausing(&digest_of(&p), &flags, "life.bar@service", || {
         l.relink(".config/bar/barrc", "barrc3")
     });
     assert_eq!(code(&o), 1, "{}\n{}", stdout(&o), stderr(&o));
@@ -2765,7 +2812,8 @@ fn a_directory_the_configuration_scope_creates_for_a_new_secret_does_not_make_se
     let l = Life::new();
     assert!(!l.fx.h(".config/example").exists());
     // A new link in the directory of the secret that was never rendered: the configuration and
-    // the secrets plans both create .config/example.
+    // the secret both need .config/example, and the one plan creates it once, in the
+    // configuration part, before both.
     l.push_module(
         "\n[[resources]]\nid = \"exconf\"\nkind = \"link\"\nadapter = \"fs-link/v1\"\ntarget = \".config/example/config\"\n[resources.value]\nsource = \"files/exconf\"\n",
         &[("exconf", "conf\n")],
@@ -2779,10 +2827,13 @@ fn a_directory_the_configuration_scope_creates_for_a_new_secret_does_not_make_se
             "scope: config",
             "planned mkdir@.config/example",
             "scope: secrets",
-            "planned mkdir@.config/example",
+            "    after: mkdir@.config/example",
             "scope: services",
         ],
     );
+    let s = stdout(&p);
+    let secrets = &s[s.find("scope: secrets").unwrap()..s.find("scope: services").unwrap()];
+    assert!(!secrets.contains("planned mkdir@"), "{s}");
     let o = l.sync(&digest_of(&p), &[]);
     assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
     in_order(
@@ -3114,7 +3165,7 @@ fn a_stop_request_between_scopes_starts_no_later_scope() {
     let p = l.preview(&[]);
     assert_eq!(code(&p), 0, "{}\n{}", stdout(&p), stderr(&p));
     let o = l.run_env(
-        &[("DFM_FAILPOINT", "sync-after-scope:stop")],
+        &[("DFM_FAILPOINT", "apply-before-op-life.atuin@package:stop")],
         &["sync", "--root", l.fx.root_arg(), "-y", &digest_of(&p)],
     );
     assert_eq!(code(&o), 143, "{}\n{}", stdout(&o), stderr(&o));

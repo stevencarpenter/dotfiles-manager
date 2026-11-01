@@ -1488,6 +1488,18 @@ impl Planner<'_> {
         // each is recorded as produced by that operation (the engine checks its result and the
         // file at act time), and a file not published yet does not block (docs/sync.md).
         let mut published: Vec<(String, &'static str)> = Vec::new();
+        // The files not in place yet: each is a blocker of a service that blocks on its own.
+        let mut waits: Vec<String> = Vec::new();
+        let not_published = |p: &str| {
+            fail(
+                Code::Conflict,
+                field,
+                format!(
+                    "{shown} depends on {p}, which is not published; a reload depends on the published file"
+                ),
+                "publish it first (apply), then run services again",
+            )
+        };
         for p in service_prerequisites(r) {
             let sensitive = self.sensitive.contains(&fold(&p));
             let subject = if sensitive { "sensitive-path" } else { "path" };
@@ -1507,6 +1519,7 @@ impl Planner<'_> {
                         false => "configuration",
                     };
                     published.push((format!("{p} ({})", by.id), scope));
+                    waits.push(p);
                 }
                 continue;
             }
@@ -1516,14 +1529,7 @@ impl Planner<'_> {
                 .get(&p)
                 .is_some_and(|s| prerequisite_present(&s.node));
             if !present {
-                let f = fail(
-                    Code::Conflict,
-                    field,
-                    format!(
-                        "{shown} depends on {p}, which is not published; a reload depends on the published file"
-                    ),
-                    "publish it first (apply), then run services again",
-                );
+                let f = not_published(&p);
                 if !missing {
                     op.effect = format!("blocked: {}", f.detail);
                 }
@@ -1638,6 +1644,15 @@ impl Planner<'_> {
         };
         match verdict {
             Err(f) => {
+                // A service that blocks on its own lists the files it waits for too.
+                for p in &waits {
+                    let w = not_published(p);
+                    if !missing {
+                        op.effect = format!("blocked: {}", w.detail);
+                    }
+                    missing = true;
+                    self.blocker(r, Some(p), w);
+                }
                 if !missing {
                     op.effect = format!("blocked: {}", f.detail);
                 }

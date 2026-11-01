@@ -1711,9 +1711,9 @@ impl Exec<'_, '_> {
     /// hashed them at plan time). A file that changed or went away since the plan blocks the
     /// start or restart, so nothing loads a definition the reviewer did not see.
     fn service_prerequisites(&self, op: &Operation) -> Result<(), Ended> {
-        // A file that an earlier operation of this run publishes (`produced-by:`) was not there
-        // when the plan was made: that operation must have ended updated or current, and the
-        // file must be in place now. Its bytes are the `content:` precondition below.
+        // A file that an earlier operation of this run publishes (`produced-by:`): that operation
+        // must have ended updated or current, and the file must be what it left there (its link,
+        // or its content), so nothing loads a file another program changed in between.
         let mut produced = Vec::new();
         for p in &op.preconditions {
             let Some(by) = p.state.strip_prefix(dfm_model::plan::PRODUCED_BY) else {
@@ -1721,7 +1721,10 @@ impl Exec<'_, '_> {
             };
             let path = p.subject.split_once(':').map_or("", |(_, path)| path);
             let ended = self.results.get(by).copied();
-            if !matches!(ended, Some(Status::Updated | Status::Current)) {
+            let producer = self.plan.operations.iter().find(|o| o.id == by);
+            let Some(producer) =
+                producer.filter(|_| matches!(ended, Some(Status::Updated | Status::Current)))
+            else {
                 return Err(blocked(
                     Code::PlanStale,
                     format!(
@@ -1729,27 +1732,44 @@ impl Exec<'_, '_> {
                         ended.map_or("did not run", |_| "did not complete")
                     ),
                 ));
-            }
-            produced.push(Request {
-                path: path.to_string(),
-                hash: false,
-                list: false,
-            });
+            };
+            produced.push((path, producer));
         }
         if !produced.is_empty() {
-            let obs = observe(&self.run.sys, self.run.home, &produced).map_err(failed)?;
-            if let Some(r) = produced.iter().find(|r| {
-                !obs.seen
-                    .get(&r.path)
-                    .is_some_and(|s| dfm_model::plan::prerequisite_present(&s.node))
-            }) {
-                return Err(blocked(
-                    Code::PlanStale,
-                    format!(
-                        "{} is not in place after its publication; nothing was loaded",
-                        r.path
+            let reqs: Vec<Request> = produced
+                .iter()
+                .map(|(path, _)| Request {
+                    path: path.to_string(),
+                    hash: false,
+                    list: false,
+                })
+                .collect();
+            let obs = observe(&self.run.sys, self.run.home, &reqs).map_err(failed)?;
+            for (path, producer) in &produced {
+                let node = obs.seen.get(*path).map(|s| &s.node);
+                let left = match (&producer.link, &producer.output_sha256) {
+                    (Some(link), _) => matches!(
+                        node,
+                        Some(n @ Node::Link { target, .. })
+                            if target == link && dfm_model::plan::prerequisite_present(n)
                     ),
-                ));
+                    (None, Some(sha)) => {
+                        matches!(node, Some(Node::File { .. }))
+                            && definition_bytes(&self.run.home_path.join(path))
+                                .is_ok_and(|b| sha256_hex(&b) == *sha)
+                    }
+                    // A secret is never read: it must be a file.
+                    (None, None) => matches!(node, Some(Node::File { .. })),
+                };
+                if !left {
+                    return Err(blocked(
+                        Code::PlanStale,
+                        format!(
+                            "{path} is not what {} published; nothing was loaded",
+                            producer.id
+                        ),
+                    ));
+                }
             }
         }
         for p in &op.preconditions {

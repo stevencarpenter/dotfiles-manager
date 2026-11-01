@@ -48,16 +48,8 @@ pub struct Args {
     /// an owned output and a restart that `--restart` names need no flag, and an adoption or
     /// takeover without its `--allow-adopt` id is withheld (`by_rule`, `withheld`).
     pub(crate) composed: bool,
-    /// A later scope of `sync`: the plan sync made of this scope after the earlier scopes, from
-    /// the sources this run reads. The first look uses it instead of probing again; the plan
-    /// under the lock is still made and compared with the approved digest.
-    pub(crate) planned: Option<dfm_model::plan::Plan>,
     /// A `sync` scope of a run without `--yes-plan`: the receipt approval kind is `unattended`.
     pub(crate) unattended: bool,
-    /// A later scope of `sync`: ids that an earlier scope withheld, as this plan names them (the
-    /// `<resource>@scope` entry), or this scope's operations sync already withholds. A planned
-    /// operation with such an id, or that runs after one, is withheld too (`withheld`).
-    pub(crate) held: BTreeSet<String>,
 }
 
 /// `apply [--root <dir>] [-y|--yes-plan <digest>] [--allow-disruptive <operation-id>]...
@@ -96,9 +88,7 @@ pub fn parse_args(m: &clap::ArgMatches, scope: Scope) -> Result<Args, Refusal> {
         update,
         restart,
         composed: false,
-        planned: None,
         unattended: false,
-        held: BTreeSet::new(),
     })
 }
 
@@ -171,10 +161,9 @@ fn by_rule(args: &Args, plan: &Plan) -> BTreeSet<String> {
         .collect()
 }
 
-/// The operations a `sync` scope does not run (docs/sync.md): each planned adoption or takeover
-/// without its `--allow-adopt` id, each planned operation that `held` names or that runs after
-/// an id in `held`, and every operation that runs after one of these. Empty for every other
-/// command, which refuses such a plan instead.
+/// The operations a `sync` run does not run (docs/sync.md): each planned adoption or takeover
+/// without its `--allow-adopt` id, and every operation that runs after one of these. Empty for
+/// every other command, which refuses such a plan instead.
 pub(crate) fn withheld(args: &Args, plan: &Plan) -> BTreeSet<String> {
     let mut withheld: BTreeSet<String> = plan
         .operations
@@ -185,10 +174,7 @@ pub(crate) fn withheld(args: &Args, plan: &Plan) -> BTreeSet<String> {
         .collect();
     // The plan lists an operation after the ones it runs after, so one pass takes the chains.
     for o in &plan.operations {
-        let held = args.composed
-            && o.status == PlanStatus::Planned
-            && (args.held.contains(&o.id) || o.after.iter().any(|a| args.held.contains(a)));
-        if held || o.after.iter().any(|a| withheld.contains(a)) {
+        if o.after.iter().any(|a| withheld.contains(a)) {
             withheld.insert(o.id.clone());
         }
     }
@@ -566,17 +552,8 @@ fn run_inner(
     let (layout, sys) = (ctx.layout(), ctx.sys()?);
     // A packages or services plan needs the providers' answers first.
     let probes = |loaded: &mut crate::Loaded| probe_with_trials(ctx, &sys, args, loaded);
-    let fresh;
-    let mut notes = Vec::new();
-    let plan = match &args.planned {
-        Some(p) => p,
-        None => {
-            let probed;
-            (probed, notes) = probes(&mut first)?;
-            fresh = plan_for(ctx, &first, args.scope, probed)?;
-            &fresh
-        }
-    };
+    let (probed, notes) = probes(&mut first)?;
+    let plan = &plan_for(ctx, &first, args.scope, probed)?;
     stop()?;
     check_restart(&args.restart, plan)?;
     let digest = plan.digest()?;
@@ -683,8 +660,9 @@ pub(crate) struct Locked<'a> {
     pub(crate) parts: Option<&'a dyn Fn(&str) -> Scope>,
 }
 
-/// The run's one exit.
+/// How each operation of a locked run ended, by plan id, and the run's one exit.
 pub(crate) struct Ran {
+    pub(crate) statuses: Vec<(String, Status)>,
     pub(crate) outcome: Result<(), Refusal>,
 }
 
@@ -938,7 +916,15 @@ pub(crate) fn execute_locked(
         (None, Some(r)) => Err(r),
         (None, None) => Ok(()),
     };
-    Ok(Ran { outcome })
+    Ok(Ran {
+        statuses: locked
+            .operations
+            .iter()
+            .zip(&report.operations)
+            .map(|(op, rec)| (op.id.clone(), rec.status))
+            .collect(),
+        outcome,
+    })
 }
 
 #[cfg(test)]
