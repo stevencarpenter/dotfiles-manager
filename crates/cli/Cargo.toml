@@ -101,5 +101,17 @@ required-features = ["test-isolation"]
 name = "authoring"
 required-features = ["test-isolation"]
 
+[[test]]
+name = "codex_hooks"
+required-features = ["test-isolation"]
+
+[[test]]
+name = "source_roots"
+required-features = ["test-isolation"]
+
+[[test]]
+name = "omlx"
+required-features = ["test-isolation"]
+
 [lints]
 workspace = true
