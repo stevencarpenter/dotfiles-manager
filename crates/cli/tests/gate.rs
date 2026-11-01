@@ -403,19 +403,60 @@ fn only_the_mutating_path_of_apply_installs_the_signal_handlers() {
     assert_eq!(trial.matches("signal::install(").count(), 1);
     assert!(trial.find("signal::install(").unwrap() < trial.find("find_owner(&runner").unwrap());
     let t = fs::read_to_string(repo_root().join("crates/cli/src/apply_cmd.rs")).unwrap();
-    // One closure holds the call; it is armed in two places, both guarded by the scope.
-    assert_eq!(t.matches("signal::install(").count(), 1);
+    let at = |needle: &str| {
+        let i = t
+            .find(needle)
+            .unwrap_or_else(|| panic!("{needle:?} is missing"));
+        assert_eq!(t.matches(needle).count(), 1, "{needle:?} is not unique");
+        i
+    };
+    // Two calls install the handlers: the `arm` closure of `run_inner`, for the scopes that start
+    // a provider child before the lock, and the guarded call of `execute_locked`, for the run
+    // under the lock.
+    let installs: Vec<usize> = t
+        .match_indices("signal::install(")
+        .map(|(i, _)| i)
+        .collect();
+    assert_eq!(installs.len(), 2, "{installs:?}");
+    let (inner, locked) = (at("fn run_inner("), at("fn execute_locked("));
+    assert!(inner < installs[0] && installs[0] < locked);
+    // `run_inner` arms once, only for a provider scope, before its first child (the first plan).
     let arms: Vec<usize> = t.match_indices("arm()").map(|(i, _)| i).collect();
-    assert_eq!(arms.len(), 2, "{arms:?}");
-    // The scopes that start a provider child arm before the first child (the first plan).
-    assert!(t.find("if args.scope != Scope::Config {").unwrap() < arms[0]);
-    assert!(arms[0] < t.find("first = load_resolved(").unwrap());
-    // `apply` arms after the lock and the second plan (which runs `id -u`), before the first write.
-    assert!(t.find("if args.scope == Scope::Config {").unwrap() < arms[1]);
-    assert!(t.find("if args.preview {").unwrap() < arms[1]);
-    assert!(t.find("Store::open_write_with(").unwrap() < arms[1]);
-    assert!(t.find("let locked = plan_for(").unwrap() < arms[1]);
-    assert!(arms[1] < t.find("apply(&run, &locked)").unwrap());
+    assert_eq!(arms.len(), 1, "{arms:?}");
+    assert!(at("if args.scope != Scope::Config {") < arms[0]);
+    assert!(arms[0] < at("first = load_resolved("));
+    // `execute_locked` installs them when nothing did yet, before the first write.
+    assert!(locked < installs[1]);
+    let guard = at("if !dfm_engine::signal::installed() {");
+    assert!(guard < installs[1]);
+    assert!(
+        t[guard..installs[1]]
+            .trim_start_matches("if !dfm_engine::signal::installed() {")
+            .trim()
+            .strip_suffix("dfm_engine::")
+            .is_some_and(str::is_empty),
+        "the guard is not directly before the install"
+    );
+    assert!(installs[1] < at("apply(&run, &locked)"));
+    // `run_inner` runs the plan only after the preview returned, the lock and the second plan
+    // (which runs `id -u`).
+    let call = t[inner..locked]
+        .find("execute_locked(")
+        .map(|i| inner + i)
+        .unwrap();
+    assert!(at("if args.preview {") < call);
+    assert!(at("Store::open_write_with(") < call);
+    assert!(at("let locked = plan_for(") < call);
+    // `sync` runs the plan only under its writer lock and after the plan of the published tree.
+    let call = sync.find("apply_cmd::execute_locked(").unwrap();
+    assert_eq!(sync.matches("apply_cmd::execute_locked(").count(), 1);
+    for needle in [
+        "Store::open_write_with(sys, &layout, fail.clone(), false)",
+        "plan_staged(ctx, &binding, (&root, &rel), &root, args)",
+    ] {
+        assert_eq!(sync.matches(needle).count(), 1, "{needle:?}");
+        assert!(sync.find(needle).unwrap() < call, "{needle:?}");
+    }
 }
 
 /// rustix is the one crate allowed to reach the OS, through its safe fs API only. Its resolved
