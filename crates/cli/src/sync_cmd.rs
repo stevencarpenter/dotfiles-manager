@@ -1180,7 +1180,8 @@ impl Excluded {
         if !ex.no_session.is_empty() {
             ex.skipped = planned_secrets(&secrets);
         }
-        // A service whose file only a skipped or blocked operation publishes cannot start.
+        // A planned service whose missing file only a skipped or blocked operation publishes
+        // cannot start.
         let gone: BTreeSet<&str> = plan
             .operations
             .iter()
@@ -1190,11 +1191,13 @@ impl Excluded {
             })
             .map(|o| o.id.as_str())
             .collect();
-        for o in plan
-            .operations
-            .iter()
-            .filter(|o| part(&o.id) == Scope::Services && !ex.blocked.contains(&Scope::Services))
-        {
+        for o in plan.operations.iter().filter(|o| {
+            o.status == PlanStatus::Planned
+                && part(&o.id) == Scope::Services
+                && !ex.blocked.contains(&Scope::Services)
+        }) {
+            // Only a file absent at plan time waits (`produced-by:`); a file in place
+            // (`present-or-produced-by:`) stands when its producer does not run.
             for pc in &o.preconditions {
                 let Some(by) = pc.state.strip_prefix(dfm_model::plan::PRODUCED_BY) else {
                     continue;

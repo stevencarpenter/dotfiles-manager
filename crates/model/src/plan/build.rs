@@ -333,6 +333,25 @@ pub fn service_prerequisites(r: &ResolvedResource) -> Vec<String> {
 /// updated or current and the file to be present before the service starts.
 pub const PRODUCED_BY: &str = "produced-by:";
 
+/// The state of a service prerequisite that is in place at plan time and that a planned
+/// operation of the same combined plan publishes again: `present-or-produced-by:<operation id>`.
+/// When that operation runs, the engine checks it as [`PRODUCED_BY`]. When the run leaves it out
+/// (a skipped or blocked part), the file in place is enough: the service does not wait for it.
+pub const PRESENT_OR_PRODUCED_BY: &str = "present-or-produced-by:";
+
+/// The producer that a service prerequisite's `state` names, and whether a file in place stands
+/// in for it when it does not run (`present-or-produced-by:`). `None` for an observed state.
+pub fn produced_by(state: &str) -> Option<(&str, bool)> {
+    state
+        .strip_prefix(PRODUCED_BY)
+        .map(|by| (by, false))
+        .or_else(|| {
+            state
+                .strip_prefix(PRESENT_OR_PRODUCED_BY)
+                .map(|by| (by, true))
+        })
+}
+
 /// Whether a prerequisite file is in place: a file, a directory or a link that resolves.
 pub fn prerequisite_present(node: &Node) -> bool {
     match node {
@@ -1504,16 +1523,20 @@ impl Planner<'_> {
             let sensitive = self.sensitive.contains(&fold(&p));
             let subject = if sensitive { "sensitive-path" } else { "path" };
             if let Some(by) = self.producer(&p) {
-                op.preconditions.push(Precondition {
-                    subject: format!("{subject}:{p}"),
-                    state: format!("{PRODUCED_BY}{}", by.id),
-                });
-                if !self
+                let present = self
                     .obs
                     .seen
                     .get(&p)
-                    .is_some_and(|s| prerequisite_present(&s.node))
-                {
+                    .is_some_and(|s| prerequisite_present(&s.node));
+                let marker = match present {
+                    true => PRESENT_OR_PRODUCED_BY,
+                    false => PRODUCED_BY,
+                };
+                op.preconditions.push(Precondition {
+                    subject: format!("{subject}:{p}"),
+                    state: format!("{marker}{}", by.id),
+                });
+                if !present {
                     let scope = match by.adapter == SECRET_ADAPTER {
                         true => "secrets",
                         false => "configuration",

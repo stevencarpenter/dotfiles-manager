@@ -13,7 +13,7 @@ mod stale;
 pub use build::{
     ApprovedFile, Context, Definition, MergeFact, MergeVerdict, Owned, PRODUCED_BY, PackageState,
     SECRET_ADAPTER, Scope, SecretVerdict, ServiceFacts, ServiceState, build, followups, in_scope,
-    ledger_state, matches_pattern, prerequisite_present, requests, sensitive_paths,
+    ledger_state, matches_pattern, prerequisite_present, produced_by, requests, sensitive_paths,
     service_prerequisites,
 };
 pub use stale::{Stale, StaleKind, stale};

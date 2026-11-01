@@ -3361,6 +3361,83 @@ fn a_blocked_secret_and_a_secret_without_a_session_are_both_warned() {
     assert!(!l.log().contains("op inject"), "{}", l.log());
 }
 
+/// A stopped brew service `baz` that reads the secret's destination.
+const BAZ: &str = "\n[[resources]]\nid = \"baz\"\nkind = \"service\"\nadapter = \"brew-service/v1\"\n[resources.value]\nname = \"baz\"\nconfig = [\".config/example/personal.env\"]\n";
+
+/// A synced `life` whose secret is rendered, plus `baz` (and `extra`) upstream.
+fn life_with_baz(extra: &str) -> Life {
+    let l = Life::new();
+    let o = l.approved(&[]);
+    assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
+    assert!(l.fx.h(".config/example/personal.env").is_file());
+    fs::write(l.fake.path().join("brew-baz"), "stopped").unwrap();
+    l.push_module(&format!("{BAZ}{extra}"), &[], "baz reads the secret");
+    l
+}
+
+#[test]
+fn a_service_on_a_rendered_secret_starts_while_a_locked_vault_skips_its_re_render() {
+    let l = life_with_baz("");
+    l.sign_in(false);
+    let log = l.log();
+    let o = l.approved(&[]);
+    assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
+    in_order(
+        &stdout(&o),
+        &[
+            "  secrets: skipped: no session (life.token)",
+            "  services: ok",
+            "result: ok\n",
+        ],
+    );
+    let new = &l.log()[log.len()..];
+    assert!(!new.contains("op inject"), "{new}");
+    assert!(new.contains("brew services start baz"), "{new}");
+}
+
+#[test]
+fn a_service_on_a_rendered_secret_starts_while_another_secret_blocks_the_secrets_part() {
+    let l = life_with_baz(
+        "\n[[resources]]\nid = \"token2\"\nkind = \"secret\"\nadapter = \"op-template/v1\"\ntarget = \".config/example2/second.env\"\n[resources.value]\ntemplate = \"files/personal.env.tpl\"\naccount = \"example-account\"\nmode = 0o600\n",
+    );
+    // A directory at the second secret's target blocks the secrets part.
+    fs::create_dir_all(l.fx.h(".config/example2/second.env")).unwrap();
+    let o = l.approved(&[]);
+    assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
+    in_order(
+        &stdout(&o),
+        &["  secrets: blocked (", "  services: ok", "result: ok\n"],
+    );
+    assert!(l.log().contains("brew services start baz"), "{}", l.log());
+}
+
+#[test]
+fn a_service_on_a_secret_not_rendered_yet_is_blocked_while_a_locked_vault_skips_it() {
+    let l = Life::new();
+    fs::write(l.fake.path().join("brew-baz"), "stopped").unwrap();
+    l.push_module(BAZ, &[], "baz reads the secret");
+    assert!(!l.fx.h(".config/example/personal.env").exists());
+    l.sign_in(false);
+    let p = l.preview(&[]);
+    assert_eq!(code(&p), 0, "{}\n{}", stdout(&p), stderr(&p));
+    assert!(
+        stdout(&p).contains("which only life.token@.config/example/personal.env publishes"),
+        "{}",
+        stdout(&p)
+    );
+    let o = l.sync(&digest_of(&p), &[]);
+    assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
+    in_order(
+        &stdout(&o),
+        &[
+            "  secrets: skipped: no session (life.token)",
+            "  services: blocked (",
+            "result: ok\n",
+        ],
+    );
+    assert!(!l.log().contains("brew services start baz"), "{}", l.log());
+}
+
 #[test]
 fn a_definition_source_removed_upstream_gives_one_digest_and_blocks_only_services() {
     // The agent's definition is the owner's own HOME link into the checkout, not a resource.

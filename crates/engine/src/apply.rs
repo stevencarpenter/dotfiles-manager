@@ -1713,15 +1713,21 @@ impl Exec<'_, '_> {
     fn service_prerequisites(&self, op: &Operation) -> Result<(), Ended> {
         // A file that an earlier operation of this run publishes (`produced-by:`): that operation
         // must have ended updated or current, and the file must be what it left there (its link,
-        // or its content), so nothing loads a file another program changed in between.
+        // or its content), so nothing loads a file another program changed in between. A file
+        // in place at plan time (`present-or-produced-by:`) whose producer this run left out
+        // only has to be in place still: the run did not touch it.
         let mut produced = Vec::new();
         for p in &op.preconditions {
-            let Some(by) = p.state.strip_prefix(dfm_model::plan::PRODUCED_BY) else {
+            let Some((by, present)) = dfm_model::plan::produced_by(&p.state) else {
                 continue;
             };
             let path = p.subject.split_once(':').map_or("", |(_, path)| path);
             let ended = self.results.get(by).copied();
             let producer = self.plan.operations.iter().find(|o| o.id == by);
+            if present && producer.is_none() {
+                produced.push((path, None));
+                continue;
+            }
             let Some(producer) =
                 producer.filter(|_| matches!(ended, Some(Status::Updated | Status::Current)))
             else {
@@ -1733,7 +1739,7 @@ impl Exec<'_, '_> {
                     ),
                 ));
             };
-            produced.push((path, producer));
+            produced.push((path, Some(producer)));
         }
         if !produced.is_empty() {
             let reqs: Vec<Request> = produced
@@ -1747,6 +1753,15 @@ impl Exec<'_, '_> {
             let obs = observe(&self.run.sys, self.run.home, &reqs).map_err(failed)?;
             for (path, producer) in &produced {
                 let node = obs.seen.get(*path).map(|s| &s.node);
+                let Some(producer) = producer else {
+                    if !node.is_some_and(dfm_model::plan::prerequisite_present) {
+                        return Err(blocked(
+                            Code::PlanStale,
+                            format!("{path} is no longer in place; nothing was loaded"),
+                        ));
+                    }
+                    continue;
+                };
                 let left = match (&producer.link, &producer.output_sha256) {
                     (Some(link), _) => matches!(
                         node,
@@ -1803,7 +1818,7 @@ impl Exec<'_, '_> {
             }
         }
         let observed =
-            |p: &&dfm_model::plan::Precondition| !p.state.starts_with(dfm_model::plan::PRODUCED_BY);
+            |p: &&dfm_model::plan::Precondition| dfm_model::plan::produced_by(&p.state).is_none();
         let reqs: Vec<Request> = op
             .preconditions
             .iter()
