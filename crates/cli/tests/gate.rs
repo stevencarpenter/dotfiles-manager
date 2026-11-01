@@ -437,10 +437,15 @@ fn only_the_mutating_path_of_apply_installs_the_signal_handlers() {
         [
             "crates/cli/src/adopt_cmd.rs",
             "crates/cli/src/apply_cmd.rs",
+            "crates/cli/src/purge_cmd.rs",
             "crates/cli/src/sync_cmd.rs",
             "crates/cli/src/trial_cmd.rs"
         ]
     );
+    // `purge` (DFM-34) probes the providers before it decides, so it arms them once first.
+    let purge = fs::read_to_string(repo_root().join("crates/cli/src/purge_cmd.rs")).unwrap();
+    assert_eq!(purge.matches("signal::install(").count(), 1);
+    assert!(purge.find("signal::install(").unwrap() < purge.find("decide(&readable)").unwrap());
     // `adopt` (DFM-33) runs gitleaks, git and brew before it decides, so it arms them once first.
     let adopt = fs::read_to_string(repo_root().join("crates/cli/src/adopt_cmd.rs")).unwrap();
     assert_eq!(adopt.matches("signal::install(").count(), 1);

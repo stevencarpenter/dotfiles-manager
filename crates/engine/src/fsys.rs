@@ -1174,7 +1174,8 @@ impl Dir {
     }
 
     /// Removes the directory `name` and everything below it without following any link.
-    pub(crate) fn remove_tree(&self, sys: &Sys, name: &str) -> Result<(), Refusal> {
+    #[doc(hidden)]
+    pub fn remove_tree(&self, sys: &Sys, name: &str) -> Result<(), Refusal> {
         let Some(d) = self.child(sys, name, false, false)? else {
             return Ok(());
         };

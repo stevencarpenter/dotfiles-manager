@@ -16,8 +16,8 @@ use dfm_model::plan::{Binary, PackageState, file_fingerprint};
 use dfm_model::resolve::{Table, Value};
 use dfm_model::state::{
     Approval, Baseline, BaselinePath, BinaryId, Class, JournalEntry, MAX_BYTES, OperationRecord,
-    Phase, ProfileRef, Receipt, Recovery, RunResult, SCHEMA, Stamp, Status, TrialInstall,
-    TrialPackage, TrialRecord, count_statuses, rfc3339, valid_id, valid_path,
+    Phase, ProfileRef, Receipt, Recovery, RunResult, SCHEMA, Stamp, Status, TRIAL_SCHEMA_DATA,
+    TrialInstall, TrialPackage, TrialRecord, count_statuses, rfc3339, valid_id, valid_path,
 };
 use dfm_model::{Code, Exit, Refusal};
 use serde_json::json;
@@ -135,17 +135,23 @@ struct Decision {
     install: Option<Vec<String>>,
     owners: Vec<String>,
     baseline: Vec<BaselinePath>,
+    /// The data candidates ([`data_candidates`]), observed as the baseline is.
+    data: Vec<BaselinePath>,
+    /// Data candidates left out, with the reason: a claim or an observation failed. A path
+    /// that is not recorded is never removed, so it blocks nothing.
+    skipped: Vec<String>,
     binary: Binary,
     stamp: Stamp,
 }
 
 impl Decision {
     fn digest(&self) -> Result<String, Refusal> {
-        let paths: Vec<_> = self
-            .baseline
-            .iter()
-            .map(|p| json!({"path": p.path, "existed": p.existed, "sha256": p.sha256}))
-            .collect();
+        let view = |ps: &[BaselinePath]| -> Vec<serde_json::Value> {
+            ps.iter()
+                .map(|p| json!({"path": p.path, "existed": p.existed, "sha256": p.sha256}))
+                .collect()
+        };
+        let (paths, data) = (view(&self.baseline), view(&self.data));
         let doc = json!({
             "trial_id": self.trial_id,
             "tool": self.tool,
@@ -154,6 +160,8 @@ impl Decision {
             "install": self.install,
             "owners": self.owners,
             "baseline": paths,
+            "data": data,
+            "data_skipped": self.skipped,
             "unknown": UNKNOWN,
             "binary": {"version": self.binary.version, "sha256": self.binary.sha256},
             "binding": {
@@ -170,12 +178,17 @@ impl Decision {
 
     fn record(&self, created: u64, op_id: &str) -> TrialRecord {
         TrialRecord {
-            schema: SCHEMA,
+            schema: if self.data.is_empty() {
+                SCHEMA
+            } else {
+                TRIAL_SCHEMA_DATA
+            },
             binding: self.stamp.clone(),
             trial_id: self.trial_id.clone(),
             tool: self.tool.clone(),
             created_unix_ns: created,
             baseline: Baseline {
+                data: self.data.clone(),
                 tool_preexisting: self.install.is_none(),
                 paths: self.baseline.clone(),
                 owners: self.owners.clone(),
@@ -226,17 +239,22 @@ impl Decision {
                 bounded(&self.owners.join("; "))
             )?,
         }
-        for p in &self.baseline {
-            let seen = match (&p.existed, &p.sha256) {
-                (false, _) => "absent".to_string(),
-                (true, Some(h)) => format!("file sha256:{h}"),
-                (true, None) => "directory".to_string(),
-            };
-            writeln!(out, "baseline: {} {seen}", visible(&p.path))?;
+        for (what, ps) in [("baseline", &self.baseline), ("data", &self.data)] {
+            for p in ps {
+                let seen = match (&p.existed, &p.sha256) {
+                    (false, _) => "absent".to_string(),
+                    (true, Some(h)) => format!("file sha256:{h}"),
+                    (true, None) => "directory".to_string(),
+                };
+                writeln!(out, "{what}: {} {seen}", visible(&p.path))?;
+            }
+        }
+        for s in &self.skipped {
+            writeln!(out, "data: {}", visible(s))?;
         }
         writeln!(
             out,
-            "cleanup scope: the install above; a baseline path that was absent is a purge candidate that needs its own approval, and a pre-existing path or tool is never removed. purge (DFM-34) is not built"
+            "cleanup scope: dfm purge removes the install above and every baseline or data path that was absent; a pre-existing path or tool is never removed"
         )?;
         writeln!(
             out,
@@ -395,6 +413,22 @@ fn observe(path: &str) -> Result<BaselinePath, Refusal> {
     })
 }
 
+/// The data candidates: where a tool keeps its data, state and caches by convention (XDG and
+/// macOS). `purge` removes the ones that were absent before the trial.
+/// shortcut: a fixed list by tool name, upgrade when an adapter can declare its data paths
+fn data_candidates(home: &Path, tool: &str) -> Vec<String> {
+    [
+        ".local/share",
+        ".local/state",
+        ".cache",
+        "Library/Application Support",
+        "Library/Caches",
+    ]
+    .iter()
+    .map(|d| home.join(d).join(tool).display().to_string())
+    .collect()
+}
+
 /// The configuration candidates: the explicit `--config` paths, or `~/.config/<tool>` when
 /// none is given. A relative path is inside HOME.
 fn candidates(home: &Path, tool: &str, configs: &[String]) -> Result<Vec<String>, Refusal> {
@@ -459,12 +493,30 @@ pub fn run(ctx: &Ctx, args: &Args, out: &mut dyn Write) -> Result<(), Refusal> {
         Store::open_read(sys, &layout, fail.clone())?.ok_or_else(crate::state_lost_refusal)?;
     readable.require_identity(&binding)?;
     let paths = candidates(&layout.home, &tool, &args.configs)?;
+    // A data candidate that is also a configuration candidate is observed once, as configuration.
     for p in &paths {
         readable.check_claim(p)?;
+    }
+    let (mut data, mut skipped) = (Vec::new(), Vec::new());
+    for d in data_candidates(&layout.home, &tool) {
+        if paths.contains(&d) {
+            continue;
+        }
+        match readable.check_claim(&d) {
+            Ok(()) => data.push(d),
+            Err(e) => skipped.push(format!("{d} not observed ({})", e.detail)),
+        }
     }
     let decide = || -> Result<Decision, Refusal> {
         let owner = find_owner(&runner, &package, args.provider.as_deref())?;
         let baseline = paths.iter().map(|p| observe(p)).collect::<Result<_, _>>()?;
+        let (mut seen, mut skipped) = (Vec::new(), skipped.clone());
+        for p in &data {
+            match observe(p) {
+                Ok(b) => seen.push(b),
+                Err(e) => skipped.push(format!("{p} not observed ({})", e.detail)),
+            }
+        }
         Ok(Decision {
             trial_id: trial_id.clone(),
             tool: tool.clone(),
@@ -473,6 +525,8 @@ pub fn run(ctx: &Ctx, args: &Args, out: &mut dyn Write) -> Result<(), Refusal> {
             install: owner.install,
             owners: owner.owners,
             baseline,
+            data: seen,
+            skipped,
             binary: binary.clone(),
             stamp: stamp.clone(),
         })
@@ -505,7 +559,7 @@ pub fn run(ctx: &Ctx, args: &Args, out: &mut dyn Write) -> Result<(), Refusal> {
         Refusal::new(
             Code::Conflict,
             format!(
-                "trial {trial_id} already exists in state/trials/; nothing was changed. Fix: pass another --id, or purge it (DFM-34, not built)"
+                "trial {trial_id} already exists in state/trials/; nothing was changed. Fix: pass another --id, or purge it with dfm purge"
             ),
         )
     };
@@ -787,6 +841,8 @@ mod tests {
                     existed,
                     sha256: None,
                 }],
+                data: vec![],
+                skipped: vec![],
                 binary: Binary {
                     version: "0".into(),
                     sha256: sha.into(),

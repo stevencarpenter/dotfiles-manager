@@ -12,7 +12,11 @@
 /// `<name> 1` (brew pours a bottle) for every name except those in `nobottle-brew`, which answer
 /// `<name> 0`; there is no `brew info`. `brew install <name>` adds the
 /// name and its missing dependencies, or does nothing with the `noop` marker, or fails with the
-/// `fail` marker. `brew formulae` prints `official-brew` (default: atuin and duckdb) and `brew
+/// `fail` marker. `brew uninstall --formula|--cask [--force] <name>...` logs
+/// `uninstall autoremove=<HOMEBREW_NO_AUTOREMOVE>` and removes the racks (a formula rack with
+/// more than one version loses only its last one without `--force`), or refuses the whole call
+/// (exit 1) when a `needed-<name>` file names a formula outside the call.
+/// `brew formulae` prints `official-brew` (default: atuin and duckdb) and `brew
 /// casks` prints `official-cask`. Every command takes a name pinned to its namespace
 /// (`homebrew/core/<name>`, or `--cask <name>`) and answers with the short name, as brew does.
 pub const FAKE_BREW: &str = r#"#!/bin/sh
@@ -65,13 +69,31 @@ case "$1" in
       mkdir -p "$here/../Cellar/$n/1.0.0"; receipt "$here/../Cellar/$n/1.0.0" homebrew/core
     fi
     echo "==> Installing $n"; exit 0 ;;
+  uninstall)
+    echo "uninstall autoremove=${HOMEBREW_NO_AUTOREMOVE:-unset}" >> "$here/../log"
+    root=Cellar; [ "$2" = --cask ] && root=Caskroom; shift 2
+    force=; [ "$1" = --force ] && { force=1; shift; }
+    for n in "$@"; do
+      for u in $(cat "$here/../needed-$n" 2>/dev/null); do
+        case " $* " in *" $u "*) ;; *) echo "Error: Refusing to uninstall $n because it is required by $u" >&2; exit 1 ;; esac
+      done
+    done
+    for n in "$@"; do
+      d="$here/../$root/$n"
+      if [ -z "$force" ] && [ "$root" = Cellar ] && [ "$(ls "$d" 2>/dev/null | wc -l)" -gt 1 ]; then
+        rm -rf "$d/$(ls "$d" | tail -1)"
+      else
+        rm -rf "$d"
+      fi
+    done
+    exit 0 ;;
   *) exit 64 ;;
 esac
 "#;
 
 /// `mise ls --installed --json <name>` answers a JSON array from `installed-mise` (one
 /// `<name> <version>` line per installed version); the table form is refused, as a stand-in for
-/// its truncated tool column. `mise install <name>` appends. A `mise-fail-<name>` marker beside
+/// its truncated tool column. `mise install <name>` appends; `mise uninstall --all <name>` drops every line of the name; `mise uninstall <name>@<v>...` drops those versions. A `mise-fail-<name>` marker beside
 /// `bin` makes the install of that tool exit 1, as a failed download does.
 pub const FAKE_MISE: &str = r#"#!/bin/sh
 PATH=/usr/bin:/bin:$PATH
@@ -94,6 +116,16 @@ case "$1" in
   install)
     [ -e "$here/../mise-fail-${2%%@*}" ] && { echo "mise ERROR download failed" >&2; exit 1; }
     echo "${2%%@*}  2.0.0" >> "$db"; exit 0 ;;
+  uninstall)
+    if [ "$2" = --all ]; then
+      grep -v "^$3 " "$db" > "$db.new" 2>/dev/null; mv "$db.new" "$db"; exit 0
+    fi
+    shift
+    for a in "$@"; do
+      case "$a" in *@*) ;; *) exit 64 ;; esac
+      grep -v "^${a%@*} *${a##*@}\$" "$db" > "$db.new" 2>/dev/null; mv "$db.new" "$db"
+    done
+    exit 0 ;;
   *) exit 64 ;;
 esac
 "#;

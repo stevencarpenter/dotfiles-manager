@@ -10,6 +10,7 @@ mod controls_fs;
 mod doctor_cmd;
 mod paint;
 mod plan_cmd;
+mod purge_cmd;
 mod read_fs;
 mod self_update_cmd;
 mod source_fs;
@@ -55,6 +56,7 @@ usage:
   dfm trial <package> [--id <trial-id>] [--provider homebrew/v1|mise/v1] [--config <path>]...
                                [--preview] [-y|--yes-plan <digest>]
   dfm adopt <trial-id> --module <module> [--root <dir>] [--preview] [-y|--yes-plan <digest>]
+  dfm purge <trial-id> [--preview] [-y|--yes-plan <digest>]
   dfm sync [--root <dir>] [--preview] [-y|--yes-plan <digest>] [--allow-disruptive <operation-id>]...
                                [--allow-adopt <operation-id>]... [--restart <resource-id>]...
                                [--trust-origin <origin>]... [--no-upgrade]
@@ -117,18 +119,26 @@ copy from another owner blocks. See docs/toolchains.md.
 
 trial tries a tool without a module. It asks homebrew/v1 and mise/v1 which one lists or can
 install the package (read-only probes, as packages runs them), records a baseline of the tool,
-its owners and its configuration candidates (--config paths, or ~/.config/<tool>) before any
+its owners, its configuration candidates (--config paths, or ~/.config/<tool>) and its data
+candidates (~/.local/share, ~/.local/state, ~/.cache, ~/Library/Application Support and
+~/Library/Caches, each /<tool>) before any
 change, and prints the scope, the cleanup limits and a digest. With --yes-plan it writes the
 trial record to state/trials/, installs the package when no provider has it (nothing when it
 pre-exists), journals the install and writes a receipt. More than one capable provider needs
---provider. A candidate path is observed, never changed. purge is not built. See
-docs/trial.md.
+--provider. A candidate path is observed, never changed. See docs/trial.md.
 
 adopt promotes a trial into a module: each regular file under the trial's baseline paths that
 the trial created or changed is copied to <module dir>/home/<path>, gets an fs-link/v1 block
 appended to the module manifest, and its live file becomes a dfm link. A homebrew/v1 trial also
 gets a brew or cask line appended to Brewfile.<module> or Brewfile. The candidates are scanned
 with gitleaks first. Nothing is committed. See docs/adopt.md.
+
+purge ends a trial that is not adopted (the trial id, or the tool of a trial-<tool> id). It
+uninstalls the package the trial installed (every version) and the Homebrew dependencies that
+install added when no installed formula and no other trial needs them, removes each recorded
+configuration and data path that was absent before the trial (a directory with its tree,
+without following a link), and removes the trial record. A tool or path that existed before the
+trial is kept. With --yes-plan it journals each step and writes a receipt. See docs/purge.md.
 
 services is apply over the service resources only (launchd-agent/v1, brew-service/v1): every other
 resource is listed as not_in_scope. Planning asks each launcher read-only (launchctl print, brew
@@ -494,6 +504,10 @@ fn dispatch(args: &[String], out: &mut dyn Write) -> Result<(), Refusal> {
         "adopt" => {
             let args = adopt_cmd::parse_args(rest)?;
             adopt_cmd::run(&context(home)?, &args, out)
+        }
+        "purge" => {
+            let args = purge_cmd::parse_args(rest)?;
+            purge_cmd::run(&context(home)?, &args, out)
         }
         "services" => {
             let args = apply_cmd::parse_args(rest, dfm_model::plan::Scope::Services)?;

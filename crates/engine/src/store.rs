@@ -1096,10 +1096,30 @@ impl Store {
                 format!("trial {trial_id} is already adopted"),
             ));
         }
-        t.schema = state::TRIAL_SCHEMA_ADOPTED;
+        if t.baseline.data.is_empty() {
+            t.schema = state::TRIAL_SCHEMA_ADOPTED;
+        }
         t.adopted = Some(adopted);
         let (dir, name, bytes) = self.checked_trial(&t)?;
         dir.replace_file(&name, &bytes, &self.fail, "trial")
+    }
+
+    /// Ends a trial by removing its record (`purge`, docs/purge.md). The id must be valid and the
+    /// record must be there; the caller holds the writer lock.
+    pub fn remove_trial(&self, trial_id: &str) -> Result<(), Refusal> {
+        let r = (|| {
+            if !state::valid_id(trial_id) {
+                return Err(Refusal::new(
+                    Code::StateInvalid,
+                    format!("trial {trial_id} is not a valid id"),
+                ));
+            }
+            let dir = self
+                .guard(Some("trials"))?
+                .ok_or_else(|| storage("no trials directory"))?;
+            dir.remove_entry(&format!("{trial_id}.json"), &self.fail)
+        })();
+        self.wrote(r)
     }
 
     /// The trials directory, the file name and the bytes of a record that passed every check.
@@ -1111,11 +1131,13 @@ impl Store {
         t.validate()?;
         t.check_secrets(&self.secret_refs())?;
         let bytes = Self::cap(canonical(t)?)?;
-        for p in t
-            .owned_outputs
-            .iter()
-            .chain(t.baseline.paths.iter().map(|b| &b.path))
-        {
+        for p in t.owned_outputs.iter().chain(
+            t.baseline
+                .paths
+                .iter()
+                .chain(&t.baseline.data)
+                .map(|b| &b.path),
+        ) {
             self.check_claim(p)?;
         }
         Ok((dir, format!("{}.json", t.trial_id), bytes))
@@ -1301,6 +1323,7 @@ impl Store {
                             .baseline
                             .paths
                             .iter()
+                            .chain(&t.baseline.data)
                             .map(|b| &b.path)
                             .chain(&t.owned_outputs)
                         {

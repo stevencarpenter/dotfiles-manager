@@ -40,6 +40,8 @@ fn brew_env() -> Vec<(String, String)> {
         "HOMEBREW_NO_INSTALL_CLEANUP",
         "HOMEBREW_NO_INSTALL_UPGRADE",
         "HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK",
+        // `brew uninstall` runs autoremove unless this is set: purge removes only what it names.
+        "HOMEBREW_NO_AUTOREMOVE",
     ]
     .iter()
     .map(|k| (k.to_string(), "1".to_string()))
@@ -929,6 +931,142 @@ pub fn install(runner: &Runner, adapter: &str, value: &Value) -> Result<(), Refu
         &env,
         &format!("{program} install {pkg}"),
     )
+}
+
+/// Uninstalls one package through its provider (`purge`, docs/purge.md): every installed
+/// version, without `--ignore-dependencies`, `--zap` or `autoremove`. Homebrew refuses a formula
+/// that another installed formula needs; that refusal is an error here and the caller decides.
+/// The caller probes again afterwards.
+pub fn uninstall(runner: &Runner, adapter: &str, value: &Value) -> Result<(), Refusal> {
+    let pkg = name(value)?;
+    let (program, args, env) = match adapter {
+        HOMEBREW => {
+            let off = brew_official(runner, &pkg)
+                .map_err(|why| Refusal::new(Code::ProbeFailed, why))?
+                .ok_or_else(|| {
+                    Refusal::new(
+                        Code::SourceUntrusted,
+                        format!("{pkg} is not an official Homebrew formula or cask"),
+                    )
+                })?;
+            let args = match off {
+                // `--force` removes every installed keg, not only the latest one.
+                Official::Formula(n) => {
+                    vec!["uninstall".into(), "--formula".into(), "--force".into(), n]
+                }
+                Official::Cask(n) => vec!["uninstall".into(), "--cask".into(), n],
+            };
+            ("brew", args, brew_env())
+        }
+        MISE => {
+            let (tool, want) = tool_and_version(&pkg);
+            let args = if want.is_empty() {
+                vec!["uninstall".to_string(), "--all".into(), tool.into()]
+            } else {
+                // A pinned trial removes only the versions its pin matches: another version of
+                // the tool can predate the trial (`node@20` beside a trial of `node@22`).
+                let mut args = vec!["uninstall".to_string()];
+                args.extend(
+                    mise_listing(runner, &pkg)
+                        .map_err(|s| {
+                            Refusal::new(Code::ProbeFailed, format!("{pkg}: {}", s.state()))
+                        })?
+                        .iter()
+                        .filter(|v| version_matches(v, want))
+                        .map(|v| format!("{tool}@{v}")),
+                );
+                if args.len() == 1 {
+                    return Ok(());
+                }
+                args
+            };
+            ("mise", args, mise_env())
+        }
+        _ => {
+            return Err(Refusal::new(
+                Code::PrivilegeUnsupported,
+                format!("{adapter} cannot uninstall {pkg}"),
+            ));
+        }
+    };
+    change(
+        runner,
+        program,
+        &args,
+        &env,
+        &format!("{program} uninstall {pkg}"),
+    )
+}
+
+/// Uninstalls Homebrew formulae by name in one call (`purge`'s dependencies). Brew checks the
+/// remaining installed formulae against the whole set and refuses the call when one of them
+/// still needs a name: that refusal alone is `E_CONFLICT`. Any other failure is
+/// `E_IO_FAILED`. A name that starts with `-` is refused before brew runs.
+pub fn uninstall_formulae(runner: &Runner, names: &[String]) -> Result<(), Refusal> {
+    if let Some(n) = names.iter().find(|n| n.starts_with('-') || n.is_empty()) {
+        return Err(Refusal::new(
+            Code::ManifestInvalid,
+            format!("{n} is not a formula name"),
+        ));
+    }
+    let mut args = vec![
+        "uninstall".to_string(),
+        "--formula".into(),
+        "--force".into(),
+    ];
+    args.extend(names.iter().cloned());
+    let what = format!("brew uninstall {}", names.join(" "));
+    let out = runner.run(&request("brew", &args, &brew_env(), INSTALL_TIMEOUT))?;
+    if matches!(out.end, End::Exited(c) if c != 0)
+        && String::from_utf8_lossy(&out.stderr).contains("because it is required by")
+    {
+        return Err(Refusal::new(
+            Code::Conflict,
+            format!("{what}: an installed formula still needs it"),
+        ));
+    }
+    match out.end {
+        End::Exited(0) => Ok(()),
+        End::Exited(c) => Err(Refusal::new(
+            Code::IoFailed,
+            format!(
+                "{what} exited {c}; its {} bytes of standard error are withheld. Run it by hand to see them",
+                out.stderr.len()
+            ),
+        )),
+        End::TimedOut => Err(Refusal::new(
+            Code::IoFailed,
+            format!("{what} did not finish within {INSTALL_TIMEOUT:?}"),
+        )),
+        End::Signaled => Err(Refusal::new(
+            Code::IoFailed,
+            format!("{what} was ended by a signal"),
+        )),
+        End::Stopped(r) => Err(r),
+    }
+}
+
+/// Whether the provider itself lists the package (`purge`): the provider's listing only, without
+/// the owner check, the official-name check or the dependency listing that plan a missing
+/// install. `Installed`, `Missing` or `Unknown`.
+pub fn listed(runner: &Runner, adapter: &str, value: &Value) -> Result<PackageState, Refusal> {
+    let pkg = name(value)?;
+    Ok(match adapter {
+        HOMEBREW => brew_probe(runner, &pkg),
+        MISE => match mise_listing(runner, &pkg) {
+            Ok(v) => {
+                let (_, want) = tool_and_version(&pkg);
+                let v: Vec<String> = v.into_iter().filter(|v| version_matches(v, want)).collect();
+                if v.is_empty() {
+                    PackageState::Missing(Vec::new())
+                } else {
+                    PackageState::Installed(v.join(", "))
+                }
+            }
+            Err(s) => s,
+        },
+        other => PackageState::Unknown(format!("{other} has no listing purge can read")),
+    })
 }
 
 /// The rolling-update view of one installed package (docs/toolchains.md): the probe, then for

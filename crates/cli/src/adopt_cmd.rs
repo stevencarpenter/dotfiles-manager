@@ -906,7 +906,7 @@ fn trial_record(store: &Store, trial_id: &str) -> Result<TrialRecord, Refusal> {
 }
 
 /// Whether one path equals the other or lies inside it, as the file system compares names.
-fn overlaps(a: &str, b: &str) -> bool {
+pub(crate) fn overlaps(a: &str, b: &str) -> bool {
     let (a, b) = (fold::fold(a), fold::fold(b));
     a == b || a.starts_with(&format!("{b}/")) || b.starts_with(&format!("{a}/"))
 }

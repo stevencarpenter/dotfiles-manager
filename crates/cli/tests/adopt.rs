@@ -311,7 +311,8 @@ fn adopts_the_tuicr_shape() {
     );
     // The trial ended.
     let r = fx.record();
-    assert_eq!(r["schema"], 3);
+    // Schema 4: the record carries data paths (docs/trial.md).
+    assert_eq!(r["schema"], 4);
     assert_eq!(r["adopted"]["module"], "core");
     // The receipt.
     let receipts = fx.entries("receipts");
@@ -1079,7 +1080,7 @@ impl Fx {
         let r = self.record();
         assert_eq!(
             (r["schema"].as_i64(), r["adopted"]["module"].as_str()),
-            (Some(3), Some("core"))
+            (Some(4), Some("core"))
         );
         let last = self
             .adopt_journal()
@@ -1145,7 +1146,7 @@ fn interrupted(fx: &Fx, spec: &str) {
             out(&o)
         );
     }
-    assert_eq!(fx.record()["schema"], 2, "{spec}");
+    assert!(fx.record().get("adopted").is_none(), "{spec}");
 }
 
 /// A refusal with `E_CONFLICT` that names `path`.
@@ -1380,7 +1381,7 @@ fn a_second_run_completes_after_a_stop_request() {
         &["adopt", "trial-tuicr", "--module", "core", "--yes-plan", &d],
     );
     assert_eq!(code(&o), 143, "{}\n{}", stderr(&o), out(&o));
-    assert_eq!(fx.record()["schema"], 2);
+    assert!(fx.record().get("adopted").is_none());
     let o = fx.adopt(&["--module", "core", "--preview"]);
     assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), out(&o));
     assert!(out(&o).contains("resume: "), "{}", out(&o));
@@ -1417,7 +1418,7 @@ fn a_trial_without_a_brewfile_line_completes_after_a_stop() {
     assert_eq!(tree(&fx.root), reference);
     assert_eq!(fs::read(fx.root.join("Brewfile")).unwrap(), brewfile);
     assert_eq!(fs::read_link(fx.h(LIVE)).unwrap(), fx.root.join(REPO_FILE));
-    assert_eq!(fx.record()["schema"], 3);
+    assert!(fx.record().get("adopted").is_some());
 }
 
 #[test]
@@ -1525,7 +1526,7 @@ fn two_candidates_complete_after_a_stop_between_their_links() {
         fs::read_to_string(fx.root.join(KEYS_REPO)).unwrap(),
         "quit = \"q\"\n"
     );
-    assert_eq!(fx.record()["schema"], 3);
+    assert!(fx.record().get("adopted").is_some());
 }
 
 #[test]

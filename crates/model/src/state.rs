@@ -1033,6 +1033,11 @@ pub struct Baseline {
     /// listed, or the other owner the probe found. Empty when nothing pre-existed (DFM-32).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub owners: Vec<String>,
+    /// The tool's data candidates (`~/.local/share/<tool>` and the others in docs/trial.md),
+    /// observed with `paths`. `purge` removes the ones that were absent; `adopt` never promotes
+    /// them. Empty in a record written before they were observed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub data: Vec<BaselinePath>,
 }
 
 /// The install a trial made (DFM-32): its journal operation id, which also names the receipt,
@@ -1059,6 +1064,10 @@ pub struct TrialPackage {
 /// `adopted` has its own schema: a binary built before `adopt` reports it as newer instead of
 /// failing on the key. An unadopted record stays at [`SCHEMA`].
 pub const TRIAL_SCHEMA_ADOPTED: i64 = 3;
+
+/// Trial schema of a record that carries `baseline.data`, adopted or not. A binary built before
+/// the data baseline reports it as newer instead of failing on the key.
+pub const TRIAL_SCHEMA_DATA: i64 = 4;
 
 /// How `dfm adopt` ended a trial: the journal operation that wrote the adoption and the module
 /// that took the configuration.
@@ -1096,7 +1105,11 @@ pub struct TrialRecord {
 
 impl TrialRecord {
     pub fn parse(bytes: &[u8]) -> Result<TrialRecord, Refusal> {
-        let t: TrialRecord = parse_schemas("trial", bytes, &[SCHEMA, TRIAL_SCHEMA_ADOPTED])?;
+        let t: TrialRecord = parse_schemas(
+            "trial",
+            bytes,
+            &[SCHEMA, TRIAL_SCHEMA_ADOPTED, TRIAL_SCHEMA_DATA],
+        )?;
         t.validate()?;
         Ok(t)
     }
@@ -1108,12 +1121,17 @@ impl TrialRecord {
     }
 
     pub fn validate(&self) -> Result<(), Refusal> {
-        let schema_ok = match &self.adopted {
-            None => self.schema == SCHEMA,
-            Some(a) => {
-                self.schema == TRIAL_SCHEMA_ADOPTED && valid_id(&a.op_id) && valid_id(&a.module)
-            }
-        };
+        let adoption_ok = self
+            .adopted
+            .as_ref()
+            .is_none_or(|a| valid_id(&a.op_id) && valid_id(&a.module));
+        let schema_ok = adoption_ok
+            && self.schema
+                == match (self.baseline.data.is_empty(), &self.adopted) {
+                    (false, _) => TRIAL_SCHEMA_DATA,
+                    (true, None) => SCHEMA,
+                    (true, Some(_)) => TRIAL_SCHEMA_ADOPTED,
+                };
         if !schema_ok {
             return Err(bad("trial schema or adoption is malformed"));
         }
@@ -1125,6 +1143,7 @@ impl TrialRecord {
             .baseline
             .paths
             .iter()
+            .chain(&self.baseline.data)
             .all(|p| valid_path(&p.path) && p.sha256.as_deref().is_none_or(valid_sha256))
             && self.owned_outputs.iter().all(|p| valid_path(p));
         if !paths_ok {
@@ -1394,6 +1413,7 @@ impl TrialRecord {
             self.baseline
                 .paths
                 .iter()
+                .chain(&self.baseline.data)
                 .map(|p| &p.path)
                 .chain(&self.owned_outputs),
         )
@@ -2054,6 +2074,7 @@ mod tests {
             tool: "atuin".into(),
             created_unix_ns: 1,
             baseline: Baseline {
+                data: vec![],
                 tool_preexisting: false,
                 paths: vec![BaselinePath {
                     path: "/h/.config/a".into(),
@@ -2068,6 +2089,20 @@ mod tests {
             adopted: None,
         };
         assert_eq!(TrialRecord::parse(&canonical(&t).unwrap()).unwrap(), t);
+        // A record with data paths is schema 4, adopted or not; schema 2 or 3 with data is not.
+        let mut d = t.clone();
+        d.baseline.data = d.baseline.paths.clone();
+        assert!(d.validate().is_err());
+        d.schema = TRIAL_SCHEMA_DATA;
+        assert_eq!(TrialRecord::parse(&canonical(&d).unwrap()).unwrap(), d);
+        d.adopted = Some(TrialAdopted {
+            op_id: "a1".into(),
+            module: "core".into(),
+            at_unix_ns: 2,
+        });
+        assert!(d.validate().is_ok());
+        d.schema = TRIAL_SCHEMA_ADOPTED;
+        assert!(d.validate().is_err());
         let mut bad = t.clone();
         bad.trial_id = "Bad Id".into();
         assert!(bad.validate().is_err());
@@ -2114,6 +2149,7 @@ mod tests {
             tool: "atuin".into(),
             created_unix_ns: 1,
             baseline: Baseline {
+                data: vec![],
                 tool_preexisting: false,
                 paths: vec![],
                 owners: vec![],
@@ -2150,11 +2186,15 @@ mod tests {
         let text = String::from_utf8(canonical(&old).unwrap()).unwrap();
         assert!(TrialRecord::parse(text.as_bytes()).is_err());
 
-        // A schema the binary does not read names both trial schemas it does read.
+        // A schema the binary does not read names every trial schema it does read.
         for (n, code) in [(1, Code::SchemaUnsupported), (9, Code::StateNewer)] {
             let e = TrialRecord::parse(format!("{{\"schema\":{n}}}").as_bytes()).unwrap_err();
             assert_eq!(e.code, code, "{n}");
-            assert!(e.detail.ends_with("(supported: 2, 3)"), "{n}: {}", e.detail);
+            assert!(
+                e.detail.ends_with("(supported: 2, 3, 4)"),
+                "{n}: {}",
+                e.detail
+            );
         }
 
         for bad in ["Bad Id", ""] {
@@ -2166,10 +2206,10 @@ mod tests {
             assert!(b.validate().is_err(), "module {bad:?}");
         }
 
-        // A schema above 3 is newer; 4 is not read as supported.
+        // A schema above 4 is newer.
         let newer = String::from_utf8(canonical(&t).unwrap())
             .unwrap()
-            .replace("\"schema\":3", "\"schema\":4");
+            .replace("\"schema\":3", "\"schema\":5");
         assert_eq!(
             TrialRecord::parse(newer.as_bytes()).unwrap_err().code,
             Code::StateNewer
@@ -2513,6 +2553,7 @@ mod tests {
             tool: "atuin".into(),
             created_unix_ns: 1,
             baseline: Baseline {
+                data: vec![],
                 tool_preexisting: false,
                 paths: vec![],
                 owners: vec![],

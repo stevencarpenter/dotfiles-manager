@@ -942,6 +942,7 @@ fn a_hand_written_trial_with_foreign_paths_is_a_finding_not_a_trial() {
             tool: "atuin".into(),
             created_unix_ns: 1,
             baseline: dfm_model::state::Baseline {
+                data: vec![],
                 tool_preexisting: false,
                 paths: vec![dfm_model::state::BaselinePath {
                     path: bad,
@@ -985,6 +986,7 @@ fn a_trial_path_under_a_link_parent_is_a_finding() {
             tool: "atuin".into(),
             created_unix_ns: 1,
             baseline: dfm_model::state::Baseline {
+                data: vec![],
                 tool_preexisting: false,
                 paths: if baseline {
                     vec![dfm_model::state::BaselinePath {
@@ -1106,6 +1108,7 @@ fn every_write_cap_is_enforced_before_anything_is_written() {
         tool: "atuin".into(),
         created_unix_ns: 1,
         baseline: dfm_model::state::Baseline {
+            data: vec![],
             tool_preexisting: false,
             paths: (0..2_000)
                 .map(|i| dfm_model::state::BaselinePath {
@@ -1734,6 +1737,7 @@ fn plain_trial(stamp: &Stamp, id: &str) -> dfm_model::state::TrialRecord {
         tool: "atuin".into(),
         created_unix_ns: 1,
         baseline: dfm_model::state::Baseline {
+            data: vec![],
             tool_preexisting: false,
             paths: vec![],
             owners: vec![],
