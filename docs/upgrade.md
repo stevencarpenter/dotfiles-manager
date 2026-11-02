@@ -60,8 +60,8 @@ A manager built before this key refuses a profile that has it (`E_FIELD_UNKNOWN`
 
 An updater must not leave a tracked file changed in a source checkout without the owner knowing (DFM-25, C05).
 
-- Before the first updater, sync records `git status --porcelain=v1 -z --untracked-files=no` (with `--no-optional-locks`, through the scrubbed git of docs/sync.md) for the bound checkout and each nested source checkout that the published lock declares. After each updater that ran, it records it again and compares.
-- A tracked file that the updater changed (a new modified, deleted, type-changed or renamed entry) makes that row `failed` with one note per file: `E_CONFLICT: claude changed the tracked file <checkout>/<path> (M); it is left in place, not reverted, staged or committed`. A file that resolves through a dfm link into a checkout shows as the file in the checkout.
+- Before the first updater, sync records a snapshot of the bound checkout and each nested source checkout that the published lock declares: `git status --porcelain=v1 -z --untracked-files=no` (with `--no-optional-locks`, through the scrubbed git of docs/sync.md), plus the type and content of each path it lists: `git hash-object --no-filters` for a file, the target for a symlink. Status alone is not enough, because an updater that rewrites a file that is already modified leaves its status line as it was. After each updater that ran, sync records the snapshot again and compares.
+- A tracked file that the updater changed (a new or changed status line, new content or a new type, or a change back to the committed form, shown as `restored`) makes that row `failed` with one note per file: `E_CONFLICT: claude changed the tracked file <checkout>/<path> (M); it is left in place, not reverted, staged or committed`. A file that resolves through a dfm link into a checkout shows as the file in the checkout.
 - The change stays for the owner. Sync does not revert, stage, commit or push it. The next `dfm sync` refuses an update that would overwrite it (docs/sync.md, step 2).
 - The other updaters still run. A `blocked` updater ran no command and is not compared. A status that cannot be read after an updater fails that row with the cause; one that cannot be read before the first updater is an error of the step (`upgrade: failed (<code>)`).
 
@@ -105,7 +105,7 @@ Timeouts: 30 minutes for `brew upgrade`, 10 minutes for every other command.
 - **No candidate version in the preview.** The newest version is what each provider resolves at run time.
 - **`sudo` casks fail** under the detached run.
 - **skills reports no version**, so it is never `updated`.
-- **Tracked files are compared by status line.** A file that was already changed before an updater and that the updater changes again keeps its status line, so the guard does not see it. A change that another process makes while an updater runs is counted against that updater.
+- **The guard sees changes, not their author.** A change that another process makes to a tracked file while an updater runs is counted against that updater.
 - **The `skills` record** is read in version 3 only.
 - **agents** does not clone a missing managed copy. Clone it by hand. A working copy is installed with its uncommitted changes.
 - **Second copies** are looked for in Homebrew only, not in npm or mise.

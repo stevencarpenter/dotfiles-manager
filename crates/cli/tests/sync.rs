@@ -4505,6 +4505,34 @@ fn an_updater_that_changes_a_tracked_file_fails_its_row_and_leaves_the_change() 
     );
 }
 
+/// DFM-25 (C05, G5): a tracked file that was already modified before the updaters keeps its
+/// status line when an updater rewrites it. The content hash still shows the change.
+#[test]
+fn an_updater_that_rewrites_an_already_modified_file_fails_its_row() {
+    let u = Up::new(r#"["claude"]"#);
+    let o = u.sync(&["--no-upgrade"]);
+    assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
+    let tracked = u.fx.root.join("base/modules/extra/files/zshrc");
+    fs::write(&tracked, "export A=2\n").unwrap();
+    fs::write(u.st("write-claude"), tracked.to_str().unwrap()).unwrap();
+    let o = u.sync(&[]);
+    assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
+    let s = stdout(&o);
+    assert!(s.contains("  failed claude"), "{s}");
+    assert!(
+        s.contains("base/modules/extra/files/zshrc (M); it is left in place"),
+        "{s}"
+    );
+    assert_eq!(
+        fs::read_to_string(&tracked).unwrap(),
+        "export A=2\nchanged\n"
+    );
+    // Without a rewrite the same modified file passes.
+    fs::remove_file(u.st("write-claude")).unwrap();
+    let o = u.sync(&[]);
+    assert!(stdout(&o).contains("  current claude"), "{}", stdout(&o));
+}
+
 /// DFM-25 (G6): a declared updater that cannot run stays in the listing, the rows, the summary
 /// and the receipt as `blocked`; it is never dropped from the update set.
 #[test]

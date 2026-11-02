@@ -2216,14 +2216,21 @@ fn guarded_checkouts(root: &Path) -> Result<Vec<PathBuf>, Refusal> {
         .collect())
 }
 
-/// The tracked changes of each checkout as `(path, XY)`, from `git status --porcelain=v1 -z`
-/// without untracked files. `--no-optional-locks` keeps the index as it is.
-fn tracked_status(git: &Git, dirs: &[PathBuf]) -> Result<BTreeSet<(String, String)>, Refusal> {
-    let mut seen = BTreeSet::new();
+/// The tracked changes of each checkout: for each path that `git status --porcelain=v1 -z`
+/// lists (untracked files left out), its `XY` code and what it holds now: `file <hash>` (`git
+/// hash-object --no-filters`), `link <target>`, `missing` or `other`. The content is part of
+/// the snapshot because an updater that rewrites an already modified file leaves its status
+/// line as it was. `--no-optional-locks` keeps the index as it is.
+fn tracked_status(
+    git: &Git,
+    dirs: &[PathBuf],
+) -> Result<BTreeMap<String, (String, String)>, Refusal> {
+    let mut seen = BTreeMap::new();
     for dir in dirs {
+        let d = path_str(dir)?;
         let a = [
             "-C",
-            path_str(dir)?,
+            d,
             "--no-optional-locks",
             "status",
             "--porcelain=v1",
@@ -2231,6 +2238,7 @@ fn tracked_status(git: &Git, dirs: &[PathBuf]) -> Result<BTreeSet<(String, Strin
             "--untracked-files=no",
         ];
         let out = git.run(true, Code::IoFailed, "git status", &a)?;
+        let mut entries = Vec::new();
         let mut fields = out.split('\0');
         while let Some(entry) = fields.next() {
             let Some((xy, path)) = entry.split_at_checked(3) else {
@@ -2240,7 +2248,35 @@ fn tracked_status(git: &Git, dirs: &[PathBuf]) -> Result<BTreeSet<(String, Strin
             if xy.starts_with(['R', 'C']) {
                 fields.next();
             }
-            seen.insert((dir.join(path).display().to_string(), xy[..2].to_string()));
+            entries.push((path.to_string(), xy[..2].to_string()));
+        }
+        let mut kinds: Vec<String> = Vec::with_capacity(entries.len());
+        let mut files = Vec::new();
+        for (path, _) in &entries {
+            kinds.push(match fs::symlink_metadata(dir.join(path)) {
+                Ok(m) if m.file_type().is_symlink() => match fs::read_link(dir.join(path)) {
+                    Ok(t) => format!("link {}", t.display()),
+                    Err(e) => format!("link unreadable ({})", e.kind()),
+                },
+                Ok(m) if m.is_file() => {
+                    files.push(path.as_str());
+                    String::new()
+                }
+                Ok(_) => "other".into(),
+                Err(_) => "missing".into(),
+            });
+        }
+        if !files.is_empty() {
+            let mut a = vec!["-C", d, "hash-object", "--no-filters", "--"];
+            a.extend(&files);
+            let out = git.run(true, Code::IoFailed, "git hash-object", &a)?;
+            let mut hashes = out.lines();
+            for k in kinds.iter_mut().filter(|k| k.is_empty()) {
+                *k = format!("file {}", hashes.next().unwrap_or_default());
+            }
+        }
+        for ((path, xy), kind) in entries.into_iter().zip(kinds) {
+            seen.insert(dir.join(path).display().to_string(), (xy, kind));
         }
     }
     Ok(seen)
@@ -2351,13 +2387,15 @@ fn upgrade(
         if row.status != state::Status::Blocked && dfm_engine::signal::requested().is_none() {
             match tracked_status(&git, &checkouts) {
                 Ok(now) => {
-                    for (path, xy) in now.difference(&tracked) {
+                    let paths: BTreeSet<&String> = tracked.keys().chain(now.keys()).collect();
+                    for path in paths.into_iter().filter(|p| tracked.get(*p) != now.get(*p)) {
+                        // A path that left the status was changed back to its committed form.
+                        let code = now.get(path).map_or("restored", |(xy, _)| xy.trim());
                         row.status = state::Status::Failed;
                         row.notes.push(format!(
-                            "{}: {} changed the tracked file {path} ({}); it is left in place, not reverted, staged or committed",
+                            "{}: {} changed the tracked file {path} ({code}); it is left in place, not reverted, staged or committed",
                             Code::Conflict.as_str(),
                             u.name(),
-                            xy.trim()
                         ));
                     }
                     tracked = now;
