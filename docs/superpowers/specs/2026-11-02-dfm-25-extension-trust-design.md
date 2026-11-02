@@ -1,6 +1,6 @@
 # DFM-25 C04 and C05: extension source trust and owned pin edits
 
-Status: draft for owner approval, 2026-11-02. Kaneo: DFM-25 (C04, C05). Inputs: the code at main 97c37b8 and `~/.dotfiles` at 79e20c3.
+Status: approved by the owner on 2026-11-02. Kaneo: DFM-25 (C04, C05). Inputs: the code at main 97c37b8 and `~/.dotfiles` at 79e20c3.
 
 ## Intent
 
