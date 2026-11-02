@@ -3,8 +3,11 @@
 //! tool, a failed command or a stop request is a row.
 
 use dfm_engine::proc::{End, Output, Request, Runner};
+use dfm_model::lock::{Grants, NPM, source_identity};
 use dfm_model::state::Status;
 use dfm_model::updater::Updater;
+use dfm_model::{Code, Refusal};
+use std::collections::BTreeSet;
 use std::path::Path;
 use std::time::Duration;
 
@@ -32,6 +35,9 @@ pub struct Env<'a> {
     /// `scripts/install-agent-registry.sh`.
     pub root: &'a Path,
     pub timeouts: Timeouts,
+    /// The grants that the `skills` and `agents` sources must hold (docs/upgrade.md, "Source
+    /// trust").
+    pub grants: &'a Grants,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -178,6 +184,11 @@ pub fn run(u: Updater, env: &Env) -> Row {
             // As the preview says: a missing `mise` is blocked, not a failed command.
             if let Err(e) = env.provider.resolve("mise") {
                 d.notes.push(e.detail);
+                return d.end(Status::Blocked);
+            }
+            let untrusted = trust_notes(Updater::Skills, env);
+            if !untrusted.is_empty() {
+                d.notes.extend(untrusted);
                 return d.end(Status::Blocked);
             }
             match call(
@@ -452,6 +463,143 @@ fn brew(mut d: Draft, env: &Env) -> Row {
     }
 }
 
+// ---- source trust (docs/upgrade.md, "Source trust") ------------------------------------------
+
+/// The `skills` CLI's record of the global skills it updates, relative to HOME. The runner
+/// clears the environment, so `XDG_STATE_HOME`, which would move it, is never set.
+const SKILLS_RECORD: &str = ".agents/.skill-lock.json";
+/// The only record version this manager reads.
+const SKILLS_RECORD_VERSION: u64 = 3;
+/// The installer that `npx` fetches and runs.
+const SKILLS_PACKAGE: &str = "skills";
+/// The largest source record read.
+const RECORD_MAX_BYTES: u64 = 1 << 20;
+
+fn read_record(path: &Path) -> Result<String, String> {
+    let why = |what: String| format!("cannot read {}: {what}; nothing ran", path.display());
+    let bytes = crate::read_fs::read_regular_bounded(
+        path,
+        RECORD_MAX_BYTES,
+        |e| Refusal::new(Code::IoFailed, e.kind().to_string()),
+        || Refusal::new(Code::IoFailed, "not a regular file"),
+    )
+    .map_err(|e| why(e.detail))?;
+    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > RECORD_MAX_BYTES {
+        return Err(why("larger than 1 MiB".into()));
+    }
+    String::from_utf8(bytes).map_err(|_| why("not UTF-8".into()))
+}
+
+/// The sources that `skills update` fetches: `npm:skills` for the installer, then `source` and
+/// `sourceUrl` of each entry of the `skills` CLI's record (version 3:
+/// `{"version": 3, "skills": {<name>: {"source": .., "sourceUrl": .., ..}}}`). `Err` is why
+/// the record cannot be read.
+fn skills_sources(env: &Env) -> Result<Vec<String>, String> {
+    let path = env.home.join(SKILLS_RECORD);
+    let text = read_record(&path)?;
+    let unknown = |what: &str| {
+        format!(
+            "{} is not a skills record this manager reads: {what}; nothing ran",
+            path.display()
+        )
+    };
+    let doc: serde_json::Value =
+        serde_json::from_str(&text).map_err(|_| unknown("not valid JSON"))?;
+    if doc["version"].as_u64() != Some(SKILLS_RECORD_VERSION) {
+        return Err(unknown("version is not 3"));
+    }
+    let skills = doc["skills"]
+        .as_object()
+        .ok_or_else(|| unknown("skills is not an object"))?;
+    let mut values = vec![format!("{NPM}{SKILLS_PACKAGE}")];
+    for (name, entry) in skills {
+        let source = entry["source"]
+            .as_str()
+            .ok_or_else(|| unknown(&format!("skill {name:?} has no source")))?;
+        values.push(source.to_string());
+        match &entry["sourceUrl"] {
+            serde_json::Value::Null => {}
+            serde_json::Value::String(u) => values.push(u.clone()),
+            _ => {
+                return Err(unknown(&format!(
+                    "skill {name:?} has a sourceUrl that is not text"
+                )));
+            }
+        }
+    }
+    Ok(values)
+}
+
+/// The `url` of `[remote "origin"]` in `<copy>/.git/config`, read as a file, so no git command
+/// runs before the check. A config with an `include`, an `includeIf` or a `url` section (an
+/// `insteadOf` rewrite), or without exactly one origin `url`, cannot be read: the file alone
+/// does not say where git fetches from.
+fn agents_origin(copy: &Path) -> Result<String, String> {
+    let path = copy.join(".git/config");
+    let text = read_record(&path)?;
+    let unknown = |what: &str| format!("{}: {what}; nothing ran", path.display());
+    let (mut origin, mut urls) = (false, Vec::new());
+    for line in text.lines().map(str::trim) {
+        if line.is_empty() || line.starts_with(['#', ';']) {
+            continue;
+        }
+        if let Some(header) = line.strip_prefix('[') {
+            let header = header.trim_end_matches(']').trim();
+            let (name, sub) = header.split_once(' ').unwrap_or((header, ""));
+            let name = name.to_ascii_lowercase();
+            if matches!(name.as_str(), "include" | "includeif" | "url") {
+                return Err(unknown(&format!(
+                    "the [{name}] section can change the remote"
+                )));
+            }
+            origin = name == "remote" && sub.trim() == "\"origin\"";
+            continue;
+        }
+        if origin
+            && let Some((key, value)) = line.split_once('=')
+            && key.trim().eq_ignore_ascii_case("url")
+        {
+            urls.push(value.trim().to_string());
+        }
+    }
+    match <[String; 1]>::try_from(urls) {
+        Ok([url]) => Ok(url),
+        Err(_) => Err(unknown("no single url for the remote origin")),
+    }
+}
+
+/// Why the updater must not run because of its sources, one note each, or nothing. `skills`
+/// and `agents` fetch extension sources, and each source needs a grant (DFM-25, C04); the other
+/// updaters update a binary or packages from their owner and are not gated. An unreadable
+/// source record is one note. An updater with a note runs no command.
+pub fn trust_notes(u: Updater, env: &Env) -> Vec<String> {
+    let values = match u {
+        Updater::Skills => skills_sources(env),
+        Updater::Agents => agents_origin(&agents_copy(env).0).map(|o| vec![o]),
+        _ => return vec![],
+    };
+    let values = match values {
+        Ok(v) => v,
+        Err(why) => return vec![why],
+    };
+    let (mut notes, mut ids) = (Vec::new(), BTreeSet::new());
+    for v in values {
+        match source_identity(&v, cfg!(feature = "test-isolation")) {
+            Ok(id) => {
+                ids.insert(id);
+            }
+            Err(e) => notes.push(format!("{}: {}", e.code.as_str(), e.detail)),
+        }
+    }
+    notes.extend(ids.iter().filter(|id| !env.grants.trusts(id)).map(|id| {
+        format!(
+            "{}: no grant for {id}; review it, then run dfm sync --trust-origin {id}",
+            Code::SourceUntrusted.as_str()
+        )
+    }));
+    notes
+}
+
 /// The agent registry's working copy (never pulled) and managed copy (fast-forwarded), relative
 /// to HOME.
 const AGENTS_WORKING: &str = "projects/agents";
@@ -512,6 +660,12 @@ fn agents(mut d: Draft, env: &Env) -> Row {
             "no managed copy at {}; clone it by hand",
             copy.display()
         ));
+        return d.end(Status::Blocked);
+    }
+    // The origin's grant covers the pull and the registry's own install code.
+    let untrusted = trust_notes(Updater::Agents, env);
+    if !untrusted.is_empty() {
+        d.notes.extend(untrusted);
         return d.end(Status::Blocked);
     }
     // Read-only checks first: the revision and the dirty state.
@@ -597,6 +751,17 @@ fn agents(mut d: Draft, env: &Env) -> Row {
 
 /// What `run` would do, without running anything.
 pub fn preview(u: Updater, env: &Env) -> String {
+    let would = preview_command(u, env);
+    if would.starts_with("blocked: ") {
+        return would;
+    }
+    match trust_notes(u, env) {
+        n if n.is_empty() => would,
+        n => format!("blocked: {}", n.join("; ")),
+    }
+}
+
+fn preview_command(u: Updater, env: &Env) -> String {
     match u {
         Updater::Agents => {
             let (copy, working) = agents_copy(env);
@@ -656,7 +821,14 @@ mod tests {
         dots: PathBuf,
         bin: PathBuf,
         runner: Runner,
+        grants: Grants,
     }
+
+    /// The registry remote that [`T::managed`] records, and its identity.
+    const REGISTRY: &str = "git@github.com:o/agents.git";
+    const REGISTRY_ID: &str = "ssh://git@github.com/o/agents";
+    /// A skills record with one GitHub skill, whose identity is `https://github.com/o/skill`.
+    const SKILL_RECORD: &str = r#"{"version":3,"skills":{"one":{"source":"o/skill","sourceType":"github","sourceUrl":"https://github.com/o/skill.git","skillPath":"skills/one/SKILL.md"}}}"#;
 
     impl T {
         fn new() -> T {
@@ -682,12 +854,19 @@ mod tests {
                 grace: Duration::from_millis(200),
                 detach: false,
             };
+            let mut grants = Grants::default();
+            for id in [REGISTRY_ID, "npm:skills", "https://github.com/o/skill"] {
+                grants.grant(id, "2026-11-02T00:00:00Z");
+            }
+            fs::create_dir_all(home.join(".agents")).unwrap();
+            fs::write(home.join(".agents/.skill-lock.json"), SKILL_RECORD).unwrap();
             T {
                 dots: root.join("dots"),
                 root,
                 home,
                 bin,
                 runner,
+                grants,
             }
         }
 
@@ -720,6 +899,7 @@ mod tests {
                 home: &self.home,
                 root: &self.dots,
                 timeouts: Timeouts::DEFAULT,
+                grants: &self.grants,
             }
         }
 
@@ -771,7 +951,7 @@ mod tests {
 
         fn managed(&self) -> PathBuf {
             let copy = self.home.join(".local/share/agent-registry");
-            fs::create_dir_all(copy.join(".git")).unwrap();
+            origin(&copy, REGISTRY);
             copy
         }
 
@@ -784,12 +964,168 @@ mod tests {
         }
     }
 
+    /// `<copy>/.git/config` with `url` as the origin remote.
+    fn origin(copy: &Path, url: &str) {
+        fs::create_dir_all(copy.join(".git")).unwrap();
+        fs::write(
+            copy.join(".git/config"),
+            format!("[core]\n\tbare = false\n[remote \"origin\"]\n\turl = {url}\n\tfetch = +refs/heads/*:refs/remotes/origin/*\n[branch \"main\"]\n\tremote = origin\n"),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn agents_with_an_ungranted_origin_is_blocked_before_any_git() {
+        let mut t = T::new();
+        t.agents("abc1234", "def5678");
+        t.managed();
+        t.grants = Grants::default();
+        let r = run(Updater::Agents, &t.env());
+        assert_eq!(r.status, Status::Blocked, "{r:?}");
+        assert_eq!(
+            r.notes,
+            [format!(
+                "E_SOURCE_UNTRUSTED: no grant for {REGISTRY_ID}; review it, then run dfm sync --trust-origin {REGISTRY_ID}"
+            )]
+        );
+        assert_eq!(t.log(), "");
+        assert_eq!(
+            preview(Updater::Agents, &t.env()),
+            format!("blocked: {}", r.notes[0])
+        );
+    }
+
+    #[test]
+    fn agents_with_a_granted_origin_runs() {
+        let t = T::new();
+        t.agents("abc1234", "def5678");
+        t.managed();
+        assert!(t.grants.trusts(REGISTRY_ID));
+        let r = run(Updater::Agents, &t.env());
+        assert_eq!(r.status, Status::Updated, "{r:?}");
+    }
+
+    #[test]
+    fn agents_with_an_unreadable_origin_is_blocked() {
+        let t = T::new();
+        t.agents("abc1234", "def5678");
+        let copy = t.managed();
+        let config = copy.join(".git/config");
+        // An insteadOf rewrite: the recorded url is not where git fetches from.
+        let mut text = fs::read_to_string(&config).unwrap();
+        text.push_str("[url \"https://evil.invalid/\"]\n\tinsteadOf = git@github.com:\n");
+        fs::write(&config, text).unwrap();
+        let r = run(Updater::Agents, &t.env());
+        assert_eq!(r.status, Status::Blocked, "{r:?}");
+        assert!(
+            r.notes[0].contains("the [url] section can change the remote"),
+            "{r:?}"
+        );
+        assert_eq!(t.log(), "");
+        // No origin at all.
+        fs::write(&config, "[core]\n\tbare = false\n").unwrap();
+        let r = run(Updater::Agents, &t.env());
+        assert_eq!(r.status, Status::Blocked, "{r:?}");
+        assert!(r.notes[0].contains("no single url"), "{r:?}");
+        // A local path is not a source identity.
+        origin(&copy, "/some/local/path");
+        let r = run(Updater::Agents, &t.env());
+        assert_eq!(r.status, Status::Blocked, "{r:?}");
+        assert!(r.notes[0].starts_with("E_SOURCE_UNTRUSTED: "), "{r:?}");
+        assert_eq!(t.log(), "");
+    }
+
+    #[test]
+    fn skills_without_a_grant_for_npm_skills_is_blocked() {
+        let mut t = T::new();
+        t.script(&t.bin.join("mise"), "exit 0");
+        t.grants = Grants::default();
+        t.grants
+            .grant("https://github.com/o/skill", "2026-11-02T00:00:00Z");
+        let r = run(Updater::Skills, &t.env());
+        assert_eq!(r.status, Status::Blocked, "{r:?}");
+        assert_eq!(
+            r.notes,
+            [
+                "E_SOURCE_UNTRUSTED: no grant for npm:skills; review it, then run dfm sync --trust-origin npm:skills"
+            ]
+        );
+        assert_eq!(t.log(), "");
+    }
+
+    #[test]
+    fn skills_lists_every_ungranted_skill_source() {
+        let mut t = T::new();
+        t.script(&t.bin.join("mise"), "exit 0");
+        t.grants = Grants::default();
+        let p = preview(Updater::Skills, &t.env());
+        assert!(p.starts_with("blocked: "), "{p}");
+        for id in ["npm:skills", "https://github.com/o/skill"] {
+            assert!(p.contains(&format!("dfm sync --trust-origin {id}")), "{p}");
+        }
+        // A source that maps to no identity is untrusted, also with every grant held.
+        let t = T::new();
+        t.script(&t.bin.join("mise"), "exit 0");
+        fs::write(
+            t.home.join(".agents/.skill-lock.json"),
+            r#"{"version":3,"skills":{"mine":{"source":"/Users/me/skills","sourceType":"local"}}}"#,
+        )
+        .unwrap();
+        let r = run(Updater::Skills, &t.env());
+        assert_eq!(r.status, Status::Blocked, "{r:?}");
+        assert!(
+            r.notes[0].starts_with("E_SOURCE_UNTRUSTED: source "),
+            "{r:?}"
+        );
+        assert_eq!(t.log(), "");
+    }
+
+    #[test]
+    fn skills_with_an_unreadable_source_record_is_blocked() {
+        let t = T::new();
+        t.script(&t.bin.join("mise"), "exit 0");
+        let record = t.home.join(".agents/.skill-lock.json");
+        for (text, why) in [
+            (None, "cannot read"),
+            (Some("not json"), "not valid JSON"),
+            (Some(r#"{"version":4,"skills":{}}"#), "version is not 3"),
+            (Some(r#"{"version":3,"skills":{"x":{}}}"#), "has no source"),
+        ] {
+            match text {
+                Some(t) => fs::write(&record, t).unwrap(),
+                None => {
+                    let _ = fs::remove_file(&record);
+                }
+            }
+            let r = run(Updater::Skills, &t.env());
+            assert_eq!(r.status, Status::Blocked, "{r:?}");
+            assert!(r.notes[0].contains(why), "{why}: {r:?}");
+            assert!(r.notes[0].ends_with("; nothing ran"), "{r:?}");
+            assert!(preview(Updater::Skills, &t.env()).starts_with("blocked: "));
+        }
+        assert_eq!(t.log(), "");
+    }
+
+    #[test]
+    fn only_skills_and_agents_are_gated() {
+        let mut t = T::new();
+        t.grants = Grants::default();
+        for u in [
+            Updater::Claude,
+            Updater::Codex,
+            Updater::Opencode,
+            Updater::Brew,
+        ] {
+            assert!(trust_notes(u, &t.env()).is_empty(), "{u:?}");
+        }
+    }
+
     #[test]
     fn agents_working_copy_is_not_pulled_and_reports_dirty() {
         let t = T::new();
         t.agents("abc1234", "def5678");
         let working = t.home.join("projects/agents");
-        fs::create_dir_all(&working).unwrap();
+        origin(&working, REGISTRY);
         fs::write(working.join("pyproject.toml"), "").unwrap();
         // A managed copy exists too; the working copy wins.
         t.managed();

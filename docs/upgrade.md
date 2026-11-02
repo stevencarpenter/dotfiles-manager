@@ -6,7 +6,8 @@ The upgrade step of `dfm sync` (DFM-31, first slice): after the four scopes, eac
 | --- | --- |
 | `Updater`, the fixed set | `crates/model/src/updater.rs` |
 | The profile key `updaters` | `crates/model/src/resolve/docs.rs` (docs/resolver.md, rule 16) |
-| One updater: `run`, `preview`, `Row` | `crates/cli/src/adapters/updater.rs` |
+| One updater: `run`, `preview`, `Row`, the source check `trust_notes` | `crates/cli/src/adapters/updater.rs` |
+| Source identities and grants | `crates/model/src/lock.rs` (`source_identity`, `Grants`) |
 | The step in sync: `upgrade`, `upgrade_preview` | `crates/cli/src/sync_cmd.rs` |
 | Doctor's `D_UPGRADE` row | `crates/cli/src/doctor_cmd.rs` |
 | Tests with look-alike updaters | `crates/cli/src/adapters/updater.rs` (unit), `crates/cli/tests/sync.rs` (the upgrade section) |
@@ -39,6 +40,22 @@ A manager built before this key refuses a profile that has it (`E_FIELD_UNKNOWN`
 - **A second copy.** For each native tool, `brew list --versions` and `brew list --cask --versions` look for a Homebrew copy under Homebrew's name for it: the cask `claude-code` (the `claude` cask is the desktop app), the formula and cask `codex`, the formula `opencode`. The check runs after every updater ran, so the version is the one `brew` left, and each copy found is a line after the rows (`  note: codex second copy: Homebrew cask codex 0.165.0`). It is never removed or chosen.
 - **skills** reports no version. Exit 0 is `current` with the note `skills update ran; it reports no version`.
 
+## Source trust
+
+`skills` and `agents` fetch extension sources and run what they fetch. Each source needs a grant in `state/grants.json` before the updater runs (DFM-25, C04; the identities are in docs/sync.md, "Source identities"). `claude`, `codex`, `opencode` and `brew` update a binary or the packages from their owner and are not gated.
+
+| Updater | Sources, read without running a command |
+| --- | --- |
+| `skills` | `npm:skills`, the installer that `npx` runs, and the `source` and `sourceUrl` of every entry of the `skills` CLI's source record |
+| `agents` | the `url` of `[remote "origin"]` in `<copy>/.git/config`, for the copy the updater uses (the working copy or the managed copy) |
+
+- **The `skills` source record** is `~/.agents/.skill-lock.json`, as `skills` 1.7 writes it: `{"version": 3, "skills": {"<name>": {"source": "o/r", "sourceType": "github", "sourceUrl": "https://github.com/o/r.git", ...}}}`. `skills update` reads it for the global skills. The updater's environment is cleared, so `XDG_STATE_HOME`, which would move the record, is not set. The updater runs in the manager's cache directory, which holds no `skills-lock.json` or `.agents/skills`, so `skills update` takes the global scope and not a project's. A missing or unreadable file, invalid JSON, a `version` other than 3, an entry without a text `source`, or a `sourceUrl` that is not text is a record this manager cannot read.
+- **The `agents` origin** is read from the file, so no git command runs before the check. A config with an `[include]`, `[includeIf]` or `[url]` section (an `insteadOf` rewrite), or without exactly one origin `url`, cannot be read: the file alone does not say where git fetches from. A copy whose `.git` is a file (a linked worktree) cannot be read either. The origin's grant covers the pull and the registry's own install code.
+- Each source without a grant, and each source that maps to no identity (a local path, a well-known skill domain), makes the row `blocked`, and the updater runs no command. One note per source: `E_SOURCE_UNTRUSTED: no grant for npm:skills; review it, then run dfm sync --trust-origin npm:skills`.
+- A source record that cannot be read makes the row `blocked` with the cause, for example `cannot read ~/.agents/.skill-lock.json: entity not found; nothing ran`. It is never `current`, and the updater never runs without the check.
+- The check runs in the listing before publication and again under the writer lock just before the updater runs, with the grants read under the lock, because the record or the grants can change between them.
+- One updater fetches all of its sources, so one ungranted source blocks the whole row.
+
 ## Statuses
 
 | Status | When |
@@ -47,7 +64,7 @@ A manager built before this key refuses a profile that has it (`E_FIELD_UNKNOWN`
 | `current` | exit 0 and the same version (brew: nothing outdated) |
 | `pending` | a stop request (SIGINT, SIGTERM) ended or prevented it, or the update ran and the new version could not be read |
 | `failed` | a command exited nonzero, timed out or was ended by a signal; brew: a name stayed outdated or the list was not valid JSON |
-| `blocked` | agents: the install script or `git` is missing, or the managed copy is missing, dirty, without an upstream or diverged (local commits); the tool, or `mise` for skills, is missing from its owner path, fails the executable checks, or its version cannot be read (or is empty) before the update; brew: `brew` cannot be resolved on the provider path |
+| `blocked` | skills, agents: a source has no grant or maps to no identity, or the source record cannot be read (see "Source trust"); agents: the install script or `git` is missing, or the managed copy is missing, dirty, without an upstream or diverged (local commits); the tool, or `mise` for skills, is missing from its owner path, fails the executable checks, or its version cannot be read (or is empty) before the update; brew: `brew` cannot be resolved on the provider path |
 
 A failure note gives the command, its exit code and the size of its standard error. The text is withheld (docs/secrets.md); run the command by hand to see it. A partial `brew upgrade` is `failed`, and the notes list each name as upgraded or still outdated.
 
@@ -57,12 +74,12 @@ A trial does not hold `brew`. The owner's decision of 2026-10-31 replaces DFM-31
 
 ## In sync
 
-1. After the plan, before publication and the scopes, each updater is listed with what it would run and its resolved path, or `blocked: <why>` (DFM-31.C02). Nothing runs yet.
+1. After the plan, before publication and the scopes, each updater is listed with what it would run and its resolved path, or `blocked: <why>` (DFM-31.C02), the source check included. Every declared updater is listed, a blocked one too (DFM-25, G6). Nothing runs yet.
 2. The four scopes run as docs/sync.md describes.
 3. A refused run (an error exit) runs no updater. A skipped or blocked scope does not stop them.
 4. `--no-upgrade` prints `upgrade: skipped (--no-upgrade)` and runs none.
 5. The step also runs after "nothing to change".
-6. Under the writer lock, the profile is resolved again from `--root`, because another sync may have changed it since the review. An updater runs only when the review listed it and the profile still declares it; one added meanwhile runs in the next sync, after its review. A profile that declared none in the review takes no lock. Each updater that runs prints one row: `  <status> <name> <before> -> <after>`, then its notes. After the last row, the second copies of the native tools are read (see "The fixed set").
+6. Under the writer lock, the profile is resolved again from `--root`, because another sync may have changed it since the review. An updater runs only when the review listed it and the profile still declares it; one added meanwhile runs in the next sync, after its review. A profile that declared none in the review takes no lock. Each updater that runs prints one row: `  <status> <name> <before> -> <after>`, then its notes. A blocked updater prints its row too and counts in the summary. After the last row, the second copies of the native tools are read (see "The fixed set").
 7. One receipt is written (`command = "upgrade"`, no plan digest, no approval), with one operation per updater (`resource = "updater:<name>"`, `adapter = "updater/v1"`). An updater that is not `updated` or `current` makes the receipt `failed`, exit 1, while sync itself exits 0.
 8. The `scopes:` block ends with `  upgrade: <status>=<count>...`, and each `failed`, `blocked` or `pending` updater adds a `warning:` line at the end of standard output.
 9. A stop request during the step ends that updater, reports the rest `pending`, writes the receipt and ends the run with the stop's exit code (130 or 143). The warnings still print. No journal entry is written, so the next sync runs every updater again.
@@ -79,6 +96,7 @@ Timeouts: 30 minutes for `brew upgrade`, 10 minutes for every other command.
 - **No candidate version in the preview.** The newest version is what each provider resolves at run time.
 - **`sudo` casks fail** under the detached run.
 - **skills reports no version**, so it is never `updated`.
+- **Source trust reads recorded sources.** A global git `insteadOf` rewrite in `~/.gitconfig` is not applied to the `agents` origin, and the check reads the `skills` record version 3 only.
 - **agents** does not clone a missing managed copy. Clone it by hand. A working copy is installed with its uncommitted changes.
 - **Second copies** are looked for in Homebrew only, not in npm or mise.
 - **Evidence scope.** Tests use look-alike updaters. No test runs a real updater. The `agents` sync test uses real git against a local registry remote and a look-alike install script.

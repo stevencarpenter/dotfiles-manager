@@ -1872,10 +1872,19 @@ fn run_inner(
     // The updaters, a blocked one included, are listed before any part runs (DFM-31.C02).
     let updaters = &loaded.resolved.updaters;
     if args.apply.preview || (args.upgrade && !updaters.is_empty()) {
-        upgrade_preview(ctx, &sys, &root, args, updaters, out)?;
+        upgrade_preview(ctx, &sys, (&root, &grants), args, updaters, out)?;
     }
     if args.apply.preview {
         return Ok(());
+    }
+    // Without a digest the run approves the plan it printed (DFM-76). A run that grants an
+    // identity stops here, also with nothing to change: the owner reviews what the new source
+    // brings first, the plan and the updater listing above, and no updater runs (DFM-25).
+    if args.apply.yes_plan.is_none() && !args.trust.is_empty() {
+        return Err(Refusal::new(
+            Code::ApprovalRequired,
+            "nothing was published and no updater ran. Fix: read the plan above, then run dfm sync",
+        ));
     }
     // A source that moves is a publication, so only a run with every source current, and no
     // part that would run with a change, can end here (docs/apply.md, step 4).
@@ -1923,14 +1932,6 @@ fn run_inner(
             Err(e) => (Some(format!("failed ({})", e.code.as_str())), Err(e)),
         };
         return finish(ctx, &lines, up.as_deref(), result, out, printed);
-    }
-    // Without a digest the run approves the plan it printed (DFM-76). A run that grants an
-    // origin stops here: the owner reviews what the new origin brings first.
-    if args.apply.yes_plan.is_none() && !args.trust.is_empty() {
-        return Err(Refusal::new(
-            Code::ApprovalRequired,
-            "nothing was published. Fix: read the plan above, then run dfm sync",
-        ));
     }
     drop(staging);
     drop(shared);
@@ -2189,13 +2190,19 @@ fn status_name(s: state::Status) -> String {
         .unwrap_or_default()
 }
 
-/// The updater environment: the provider runner, HOME and the bound checkout.
-fn updater_env<'a>(ctx: &'a Ctx, runner: &'a Runner, root: &'a Path) -> updater::Env<'a> {
+/// The updater environment: the provider runner, HOME, the bound checkout and the grants.
+fn updater_env<'a>(
+    ctx: &'a Ctx,
+    runner: &'a Runner,
+    root: &'a Path,
+    grants: &'a Grants,
+) -> updater::Env<'a> {
     updater::Env {
         provider: runner,
         home: ctx.platform.home(),
         root,
         timeouts: updater::Timeouts::DEFAULT,
+        grants,
     }
 }
 
@@ -2203,7 +2210,7 @@ fn updater_env<'a>(ctx: &'a Ctx, runner: &'a Runner, root: &'a Path) -> updater:
 fn upgrade_preview(
     ctx: &Ctx,
     sys: &Sys,
-    root: &Path,
+    (root, grants): (&Path, &Grants),
     args: &Args,
     updaters: &[Updater],
     out: &mut dyn Write,
@@ -2217,7 +2224,7 @@ fn upgrade_preview(
         return writeln!(out, "upgrade: none declared in the profile").map_err(w);
     }
     let runner = ctx.runner(sys);
-    let env = updater_env(ctx, &runner, root);
+    let env = updater_env(ctx, &runner, root, grants);
     writeln!(out, "{}", paint::label(ctx.color, "upgrade:")).map_err(w)?;
     for u in updaters {
         writeln!(
@@ -2284,10 +2291,13 @@ fn upgrade(
         writeln!(out, "upgrade: none declared in the profile").map_err(w)?;
         return Ok(None);
     }
+    // The grants as they are under the lock: the source check runs again just before each
+    // updater, because a grant or the tool's sources may have changed since the review.
+    let grants = store.read_grants()?;
     let started = now_ns()?;
     let mut runner = ctx.runner(sys);
     runner.detach = true;
-    let env = updater_env(ctx, &runner, root);
+    let env = updater_env(ctx, &runner, root, &grants);
     writeln!(out, "{}", paint::label(ctx.color, "upgrade:")).map_err(w)?;
     let mut ops = Vec::new();
     for u in &updaters {

@@ -4243,11 +4243,10 @@ fn sync_runs_the_declared_updaters_in_order() {
     assert!(published < s.find("  updated claude").expect(&s), "{s}");
 }
 
-/// DFM-25.C09: `agents` fast-forwards the managed copy with real git (a local registry remote)
-/// and runs the install script from the bound checkout with the copy's path.
-#[test]
-fn sync_fast_forwards_the_agent_registry_and_installs_from_the_bound_root() {
-    let u = Up::new(r#"["agents"]"#);
+/// An `agents` fixture with real git: the install script in the bound checkout logs its call,
+/// and the managed copy is a clone of a local registry remote at `v1`, which then gets `v2`.
+/// Returns the registry, the copy and its revision before the update.
+fn registry_fixture(u: &Up) -> (Remote, PathBuf, String) {
     let seed = &u.fx.upstream.seed;
     let script = "scripts/install-agent-registry.sh";
     put(
@@ -4264,19 +4263,27 @@ fn sync_fast_forwards_the_agent_registry_and_installs_from_the_bound_root() {
     put(&registry.seed, "pyproject.toml", "");
     registry.push("v1");
     fs::create_dir_all(u.fx.h(".local/share")).unwrap();
+    // Cloned from the `file:` origin, so the copy's origin remote is a source identity.
     git(
         &u.fx.h(".local/share"),
-        &[
-            "clone",
-            "-q",
-            registry.bare.to_str().unwrap(),
-            "agent-registry",
-        ],
+        &["clone", "-q", &registry.origin(), "agent-registry"],
     );
     let copy = u.fx.h(".local/share/agent-registry");
     let before = git(&copy, &["rev-parse", "--short", "HEAD"]);
     put(&registry.seed, "agents/x.md", "x\n");
     registry.push("v2");
+    (registry, copy, before)
+}
+
+/// DFM-25.C09: `agents` fast-forwards the managed copy with real git (a local registry remote)
+/// and runs the install script from the bound checkout with the copy's path. The registry
+/// origin has a grant (DFM-25.C04).
+#[test]
+fn sync_fast_forwards_the_agent_registry_and_installs_from_the_bound_root() {
+    let u = Up::new(r#"["agents"]"#);
+    let script = "scripts/install-agent-registry.sh";
+    let (registry, copy, before) = registry_fixture(&u);
+    u.fx.trust(&registry.origin());
     let after = git(&registry.bare, &["rev-parse", "--short", "refs/heads/main"]);
     let o = u.sync(&[]);
     assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
@@ -4296,6 +4303,106 @@ fn sync_fast_forwards_the_agent_registry_and_installs_from_the_bound_root() {
             copy.display()
         )
     );
+}
+
+/// DFM-25 (C04, G2, G6): without a grant for the registry origin, `agents` is a `blocked` row
+/// in the listing and in the run. Nothing is fetched or installed, and the rest of sync runs.
+#[test]
+fn an_ungranted_registry_remote_blocks_agents_before_any_git_command() {
+    let u = Up::new(r#"["agents", "claude"]"#);
+    let (registry, copy, before) = registry_fixture(&u);
+    let fix = format!("dfm sync --trust-origin {}", registry.origin());
+    // Publish the install script first, so the listing reaches the source check.
+    let o = u.sync(&["--no-upgrade"]);
+    assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
+    let o = u.sync(&["--preview"]);
+    assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
+    let s = stdout(&o);
+    assert!(
+        s.contains("  agents: blocked: E_SOURCE_UNTRUSTED: no grant for "),
+        "{s}"
+    );
+    assert!(s.contains(&fix), "{s}");
+    assert!(s.contains("  claude: would run claude update"), "{s}");
+    let o = u.sync(&[]);
+    assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
+    let s = stdout(&o);
+    assert!(s.contains("  agents: blocked: E_SOURCE_UNTRUSTED"), "{s}");
+    assert!(s.contains("  blocked agents\n"), "{s}");
+    assert!(
+        s.contains(&format!(
+            "    note: E_SOURCE_UNTRUSTED: no grant for {}",
+            registry.origin()
+        )),
+        "{s}"
+    );
+    assert!(s.contains("  current claude"), "{s}");
+    assert!(s.contains("  upgrade: current=1 blocked=1"), "{s}");
+    assert!(
+        s.contains("\nwarning: upgrade agents blocked: E_SOURCE_UNTRUSTED"),
+        "{s}"
+    );
+    // No fetch, no pull and no install.
+    assert!(!copy.join(".git/FETCH_HEAD").exists());
+    assert_eq!(git(&copy, &["rev-parse", "--short", "HEAD"]), before);
+    assert!(!u.log().contains("install"), "{}", u.log());
+}
+
+/// DFM-25 (C04, G2, G6): `skills` needs its source record and a grant for `npm:skills` and
+/// for each skill source. Until then it is a `blocked` row, and `mise` never runs.
+#[test]
+fn skills_is_blocked_until_its_record_and_sources_are_granted() {
+    let u = Up::new(r#"["skills"]"#);
+    let mise = u.fake.path().join("bin/mise");
+    fs::write(
+        &mise,
+        format!(
+            "#!/bin/sh\nprintf 'mise %s\\n' \"$*\" >> {}\n",
+            u.st("log").display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&mise, fs::Permissions::from_mode(0o755)).unwrap();
+    // No record: the source list cannot be read.
+    let o = u.sync(&[]);
+    assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
+    let s = stdout(&o);
+    assert!(s.contains("  skills: blocked: cannot read "), "{s}");
+    assert!(s.contains("  blocked skills\n"), "{s}");
+    assert!(s.contains("  upgrade: blocked=1"), "{s}");
+    // A record with one GitHub skill: neither npm:skills nor the skill source has a grant.
+    fs::create_dir_all(u.fx.h(".agents")).unwrap();
+    fs::write(
+        u.fx.h(".agents/.skill-lock.json"),
+        r#"{"version":3,"skills":{"one":{"source":"o/skill","sourceType":"github","sourceUrl":"https://github.com/o/skill.git"}}}"#,
+    )
+    .unwrap();
+    let o = u.sync(&[]);
+    let s = stdout(&o);
+    assert!(
+        s.contains("    note: E_SOURCE_UNTRUSTED: no grant for npm:skills;"),
+        "{s}"
+    );
+    assert!(
+        s.contains("dfm sync --trust-origin https://github.com/o/skill"),
+        "{s}"
+    );
+    // npm:skills alone is not enough. A grant run with nothing to change still stops for
+    // review and runs no updater.
+    let o = u.sync(&["--trust-origin", "npm:skills"]);
+    assert_eq!(code(&o), 3, "{}\n{}", stdout(&o), stderr(&o));
+    assert!(stderr(&o).contains("E_APPROVAL_REQUIRED"), "{}", stderr(&o));
+    let o = u.sync(&[]);
+    let s = stdout(&o);
+    assert!(!s.contains("no grant for npm:skills"), "{s}");
+    assert!(s.contains("  blocked skills\n"), "{s}");
+    assert_eq!(u.log(), "");
+    let o = u.sync(&["--trust-origin", "https://github.com/o/skill"]);
+    assert_eq!(code(&o), 3, "{}\n{}", stdout(&o), stderr(&o));
+    let o = u.sync(&[]);
+    let s = stdout(&o);
+    assert!(s.contains("  current skills"), "{s}");
+    assert_eq!(u.log(), "mise exec -- npx skills update\n");
 }
 
 #[test]
