@@ -4307,9 +4307,10 @@ fn sync_fast_forwards_the_agent_registry_and_installs_from_the_bound_root() {
 }
 
 /// DFM-25 (C04, G2, G6): without a grant for the registry origin, `agents` is a `blocked` row
-/// in the listing and in the run. Nothing is fetched or installed, and the rest of sync runs.
+/// in the listing and in the run. Only read-only git runs: nothing is fetched or installed, and
+/// the rest of sync runs.
 #[test]
-fn an_ungranted_registry_remote_blocks_agents_before_any_git_command() {
+fn an_ungranted_registry_remote_blocks_agents_before_any_fetch() {
     let u = Up::new(r#"["agents", "claude"]"#);
     let (registry, copy, before) = registry_fixture(&u);
     let fix = format!("dfm sync --trust-origin {}", registry.origin());
@@ -4329,7 +4330,7 @@ fn an_ungranted_registry_remote_blocks_agents_before_any_git_command() {
     assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
     let s = stdout(&o);
     assert!(s.contains("  agents: blocked: E_SOURCE_UNTRUSTED"), "{s}");
-    assert!(s.contains("  blocked agents\n"), "{s}");
+    assert!(s.contains("  blocked agents "), "{s}");
     assert!(
         s.contains(&format!(
             "    note: E_SOURCE_UNTRUSTED: no grant for {}",
@@ -4344,6 +4345,37 @@ fn an_ungranted_registry_remote_blocks_agents_before_any_git_command() {
         "{s}"
     );
     // No fetch, no pull and no install.
+    assert!(!copy.join(".git/FETCH_HEAD").exists());
+    assert_eq!(git(&copy, &["rev-parse", "--short", "HEAD"]), before);
+    assert!(!u.log().contains("install"), "{}", u.log());
+}
+
+/// DFM-25 (C04): the check reads the remote the branch tracks, not `origin`. A granted origin
+/// does not cover an upstream on another remote, and nothing is fetched from either.
+#[test]
+fn a_granted_origin_with_an_ungranted_upstream_remote_blocks_agents() {
+    let u = Up::new(r#"["agents"]"#);
+    let (registry, copy, before) = registry_fixture(&u);
+    u.fx.trust(&registry.origin());
+    let mirror = Remote::new(u.fake.path(), "mirror");
+    git(&copy, &["remote", "add", "mirror", &mirror.origin()]);
+    let branch = git(&copy, &["rev-parse", "--abbrev-ref", "HEAD"]);
+    git(
+        &copy,
+        &["config", &format!("branch.{branch}.remote"), "mirror"],
+    );
+    let o = u.sync(&[]);
+    assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
+    let s = stdout(&o);
+    assert!(s.contains("  blocked agents "), "{s}");
+    assert!(
+        s.contains(&format!(
+            "    note: E_SOURCE_UNTRUSTED: no grant for {}; review it, then run dfm sync --trust-origin {}",
+            mirror.origin(),
+            mirror.origin()
+        )),
+        "{s}"
+    );
     assert!(!copy.join(".git/FETCH_HEAD").exists());
     assert_eq!(git(&copy, &["rev-parse", "--short", "HEAD"]), before);
     assert!(!u.log().contains("install"), "{}", u.log());

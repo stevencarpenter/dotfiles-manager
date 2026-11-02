@@ -530,74 +530,103 @@ fn skills_sources(env: &Env) -> Result<Vec<String>, String> {
     Ok(values)
 }
 
-/// The `url` of `[remote "origin"]` in `<copy>/.git/config`, read as a file, so no git command
-/// runs before the check. A config with an `include`, an `includeIf` or a `url` section (an
-/// `insteadOf` rewrite), or without exactly one origin `url`, cannot be read: the file alone
-/// does not say where git fetches from.
-fn agents_origin(copy: &Path) -> Result<String, String> {
-    let path = copy.join(".git/config");
-    let text = read_record(&path)?;
-    let unknown = |what: &str| format!("{}: {what}; nothing ran", path.display());
-    let (mut origin, mut urls) = (false, Vec::new());
-    for line in text.lines().map(str::trim) {
-        if line.is_empty() || line.starts_with(['#', ';']) {
-            continue;
-        }
-        if let Some(header) = line.strip_prefix('[') {
-            let header = header.trim_end_matches(']').trim();
-            let (name, sub) = header.split_once(' ').unwrap_or((header, ""));
-            let name = name.to_ascii_lowercase();
-            if matches!(name.as_str(), "include" | "includeif" | "url") {
-                return Err(unknown(&format!(
-                    "the [{name}] section can change the remote"
-                )));
-            }
-            origin = name == "remote" && sub.trim() == "\"origin\"";
-            continue;
-        }
-        if origin
-            && let Some((key, value)) = line.split_once('=')
-            && key.trim().eq_ignore_ascii_case("url")
-        {
-            urls.push(value.trim().to_string());
-        }
-    }
-    match <[String; 1]>::try_from(urls) {
-        Ok([url]) => Ok(url),
-        Err(_) => Err(unknown("no single url for the remote origin")),
-    }
-}
-
-/// Why the updater must not run because of its sources, one note each, or nothing. `skills`
-/// and `agents` fetch extension sources, and each source needs a grant (DFM-25, C04); the other
-/// updaters update a binary or packages from their owner and are not gated. An unreadable
-/// source record is one note. An updater with a note runs no command.
-pub fn trust_notes(u: Updater, env: &Env) -> Vec<String> {
-    let values = match u {
-        Updater::Skills => skills_sources(env),
-        Updater::Agents => agents_origin(&agents_copy(env).0).map(|o| vec![o]),
-        _ => return vec![],
-    };
-    let values = match values {
-        Ok(v) => v,
-        Err(why) => return vec![why],
-    };
+/// The notes for `values`, the sources one updater fetches: one per source that maps to no
+/// identity and one per identity without a grant, each with its `--trust-origin` command.
+fn untrusted(values: &[String], grants: &Grants) -> Vec<String> {
     let (mut notes, mut ids) = (Vec::new(), BTreeSet::new());
     for v in values {
-        match source_identity(&v, cfg!(feature = "test-isolation")) {
+        match source_identity(v, cfg!(feature = "test-isolation")) {
             Ok(id) => {
                 ids.insert(id);
             }
             Err(e) => notes.push(format!("{}: {}", e.code.as_str(), e.detail)),
         }
     }
-    notes.extend(ids.iter().filter(|id| !env.grants.trusts(id)).map(|id| {
+    notes.extend(ids.iter().filter(|id| !grants.trusts(id)).map(|id| {
         format!(
             "{}: no grant for {id}; review it, then run dfm sync --trust-origin {id}",
             Code::SourceUntrusted.as_str()
         )
     }));
     notes
+}
+
+/// Why the updater must not run because of its sources, one note each, or nothing. `skills`
+/// and the `agents` managed copy fetch extension sources, and each source needs a grant
+/// (DFM-25, C04). The `agents` working copy is never fetched, and the other updaters update a
+/// binary or packages from their owner: none of them is gated. An unreadable source record is
+/// one note. An updater with a note runs no command that fetches or installs.
+pub fn trust_notes(u: Updater, env: &Env) -> Vec<String> {
+    match u {
+        Updater::Skills => match skills_sources(env) {
+            Ok(v) => untrusted(&v, env.grants),
+            Err(why) => vec![why],
+        },
+        Updater::Agents => {
+            let (copy, working) = agents_copy(env);
+            if working || std::fs::symlink_metadata(copy.join(".git")).is_err() {
+                return vec![];
+            }
+            match agents_upstream(env, &copy) {
+                Ok(Ok(up)) => untrusted(&[up.url], env.grants),
+                Ok(Err(why)) | Err((why, _)) => vec![why],
+            }
+        }
+        _ => vec![],
+    }
+}
+
+/// The managed copy's upstream: the remote and the branch that `branch.<HEAD>.remote` and
+/// `branch.<HEAD>.merge` name, and the remote's url as git fetches from it (`git remote
+/// get-url` applies `url.*.insteadOf`).
+struct Upstream {
+    remote: String,
+    merge: String,
+    url: String,
+}
+
+/// Reads the upstream with local git commands only; nothing is fetched. `Ok(Err)` is the
+/// blocked reason (no upstream branch, or a remote url git cannot give); `Err` is a command
+/// that did not run or was stopped.
+fn agents_upstream(env: &Env, copy: &Path) -> Result<Result<Upstream, String>, (String, bool)> {
+    let none = || {
+        format!(
+            "the managed copy {} has no upstream branch; not pulled",
+            copy.display()
+        )
+    };
+    let branch = git(env, copy, &["rev-parse", "--abbrev-ref", "HEAD"])?;
+    if branch == "HEAD" {
+        return Ok(Err(none()));
+    }
+    let key = |field: &str| match git(
+        env,
+        copy,
+        &["config", "--get", &format!("branch.{branch}.{field}")],
+    ) {
+        Ok(v) if !v.is_empty() => Ok(Ok(v)),
+        Err((n, true)) => Err((n, true)),
+        _ => Ok(Err(none())),
+    };
+    let remote = match key("remote")? {
+        Ok(r) => r,
+        Err(why) => return Ok(Err(why)),
+    };
+    let merge = match key("merge")? {
+        Ok(m) => m,
+        Err(why) => return Ok(Err(why)),
+    };
+    let url = match git(env, copy, &["remote", "get-url", &remote]) {
+        Ok(u) => u,
+        Err((n, true)) => return Err((n, true)),
+        Err((n, false)) => {
+            return Ok(Err(format!(
+                "cannot read the url of the remote {remote} of {}: {n}; nothing ran",
+                copy.display()
+            )));
+        }
+    };
+    Ok(Ok(Upstream { remote, merge, url }))
 }
 
 /// The agent registry's working copy (never pulled) and managed copy (fast-forwarded), relative
@@ -662,12 +691,6 @@ fn agents(mut d: Draft, env: &Env) -> Row {
         ));
         return d.end(Status::Blocked);
     }
-    // The origin's grant covers the pull and the registry's own install code.
-    let untrusted = trust_notes(Updater::Agents, env);
-    if !untrusted.is_empty() {
-        d.notes.extend(untrusted);
-        return d.end(Status::Blocked);
-    }
     // Read-only checks first: the revision and the dirty state.
     match git(env, &copy, &["rev-parse", "--short", "HEAD"]) {
         Ok(v) => d.before = Some(v),
@@ -697,20 +720,24 @@ fn agents(mut d: Draft, env: &Env) -> Row {
             return d.end(Status::Blocked);
         }
         // No upstream is a precondition, like a missing copy: nothing to fast-forward from.
-        match git(env, &copy, &["rev-parse", "--abbrev-ref", "@{u}"]) {
-            Ok(_) => {}
-            Err((note, true)) => return d.stop((note, true)),
-            Err(_) => {
-                d.notes.push(format!(
-                    "the managed copy {} has no upstream branch; not pulled",
-                    copy.display()
-                ));
+        let up = match agents_upstream(env, &copy) {
+            Ok(Ok(up)) => up,
+            Ok(Err(why)) => {
+                d.notes.push(why);
                 return d.end(Status::Blocked);
             }
+            Err(e) => return d.stop(e),
+        };
+        // The upstream's grant covers the pull and the registry's own install code. The
+        // fetch and the pull name the checked remote, so git cannot pick another one.
+        let notes = untrusted(std::slice::from_ref(&up.url), env.grants);
+        if !notes.is_empty() {
+            d.notes.extend(notes);
+            return d.end(Status::Blocked);
         }
         // `fetch` moves only the remote-tracking refs. A local commit that is not on the
         // upstream means the copy diverged: `pull --ff-only` is not tried.
-        if let Err(e) = git(env, &copy, &["fetch", "--quiet"]) {
+        if let Err(e) = git(env, &copy, &["fetch", "--quiet", &up.remote]) {
             return d.stop(e);
         }
         match git(env, &copy, &["rev-list", "--count", "@{u}..HEAD"]) {
@@ -724,7 +751,11 @@ fn agents(mut d: Draft, env: &Env) -> Row {
             }
             Err(e) => return d.stop(e),
         }
-        if let Err(e) = git(env, &copy, &["pull", "--ff-only", "--quiet"]) {
+        if let Err(e) = git(
+            env,
+            &copy,
+            &["pull", "--ff-only", "--quiet", &up.remote, &up.merge],
+        ) {
             return d.stop(e);
         }
         match git(env, &copy, &["rev-parse", "--short", "HEAD"]) {
@@ -931,7 +962,10 @@ mod tests {
     }
 
     impl T {
-        /// `git` whose `rev-parse` prints `st/rev`, `status` prints `st/porcelain`, `rev-list`
+        /// `git` whose `rev-parse` prints `st/rev` (`main` for `--abbrev-ref HEAD`), `config`
+        /// names the remote in `st/remote` (`origin` when absent, nothing with
+        /// `st/no-upstream`) and `refs/heads/main`, `remote get-url <r>` prints `st/url-<r>`,
+        /// `status` prints `st/porcelain`, `rev-list`
         /// prints `st/ahead` (0 when absent) and `pull` copies `st/rev-after` over `st/rev`; the
         /// bound checkout's install script exits with `st/install-exit` (0 when absent).
         fn agents(&self, rev: &str, rev_after: &str) {
@@ -939,9 +973,10 @@ mod tests {
             fs::create_dir_all(&st).unwrap();
             fs::write(st.join("rev"), rev).unwrap();
             fs::write(st.join("rev-after"), rev_after).unwrap();
+            fs::write(st.join("url-origin"), REGISTRY).unwrap();
             self.script(
                 &self.bin.join("git"),
-                "case \"$3\" in\n  rev-parse) if [ \"$4\" = --abbrev-ref ]; then [ -f \"$st/no-upstream\" ] && exit 128; echo origin/main; else cat \"$st/rev\"; fi ;;\n  status) cat \"$st/porcelain\" 2>/dev/null || true ;;\n  fetch) exit 0 ;;\n  rev-list) cat \"$st/ahead\" 2>/dev/null || echo 0 ;;\n  pull) cp \"$st/rev-after\" \"$st/rev\" ;;\n  *) exit 64 ;;\nesac",
+                "case \"$3\" in\n  rev-parse) if [ \"$4\" = --abbrev-ref ]; then echo main; else cat \"$st/rev\"; fi ;;\n  config) [ -f \"$st/no-upstream\" ] && exit 1; case \"$5\" in *.remote) cat \"$st/remote\" 2>/dev/null || echo origin ;; *) echo refs/heads/main ;; esac ;;\n  remote) cat \"$st/url-$5\" ;;\n  status) cat \"$st/porcelain\" 2>/dev/null || true ;;\n  fetch) exit 0 ;;\n  rev-list) cat \"$st/ahead\" 2>/dev/null || echo 0 ;;\n  pull) cp \"$st/rev-after\" \"$st/rev\" ;;\n  *) exit 64 ;;\nesac",
             );
             self.script(
                 &self.dots.join("scripts/install-agent-registry.sh"),
@@ -951,7 +986,7 @@ mod tests {
 
         fn managed(&self) -> PathBuf {
             let copy = self.home.join(".local/share/agent-registry");
-            origin(&copy, REGISTRY);
+            fs::create_dir_all(copy.join(".git")).unwrap();
             copy
         }
 
@@ -964,21 +999,23 @@ mod tests {
         }
     }
 
-    /// `<copy>/.git/config` with `url` as the origin remote.
-    fn origin(copy: &Path, url: &str) {
-        fs::create_dir_all(copy.join(".git")).unwrap();
-        fs::write(
-            copy.join(".git/config"),
-            format!("[core]\n\tbare = false\n[remote \"origin\"]\n\turl = {url}\n\tfetch = +refs/heads/*:refs/remotes/origin/*\n[branch \"main\"]\n\tremote = origin\n"),
-        )
-        .unwrap();
+    /// The read-only calls that find the upstream of the copy at `c`.
+    fn upstream_calls(c: &str, remote: &str) -> Vec<String> {
+        vec![
+            format!("git -C {c} rev-parse --short HEAD"),
+            format!("git -C {c} status --porcelain"),
+            format!("git -C {c} rev-parse --abbrev-ref HEAD"),
+            format!("git -C {c} config --get branch.main.remote"),
+            format!("git -C {c} config --get branch.main.merge"),
+            format!("git -C {c} remote get-url {remote}"),
+        ]
     }
 
     #[test]
-    fn agents_with_an_ungranted_origin_is_blocked_before_any_git() {
+    fn agents_with_an_ungranted_upstream_is_blocked_before_any_fetch() {
         let mut t = T::new();
         t.agents("abc1234", "def5678");
-        t.managed();
+        let copy = t.managed();
         t.grants = Grants::default();
         let r = run(Updater::Agents, &t.env());
         assert_eq!(r.status, Status::Blocked, "{r:?}");
@@ -988,11 +1025,37 @@ mod tests {
                 "E_SOURCE_UNTRUSTED: no grant for {REGISTRY_ID}; review it, then run dfm sync --trust-origin {REGISTRY_ID}"
             )]
         );
-        assert_eq!(t.log(), "");
+        assert_eq!(
+            t.calls(),
+            upstream_calls(&copy.display().to_string(), "origin")
+        );
         assert_eq!(
             preview(Updater::Agents, &t.env()),
             format!("blocked: {}", r.notes[0])
         );
+    }
+
+    #[test]
+    fn agents_checks_the_upstream_remote_not_origin() {
+        let t = T::new();
+        t.agents("abc1234", "def5678");
+        let copy = t.managed();
+        // origin is granted, but the branch tracks the remote `fork`, which is not.
+        fs::write(t.root.join("st/remote"), "fork").unwrap();
+        fs::write(t.root.join("st/url-fork"), "git@github.com:evil/agents.git").unwrap();
+        let r = run(Updater::Agents, &t.env());
+        assert_eq!(r.status, Status::Blocked, "{r:?}");
+        assert_eq!(
+            r.notes,
+            [
+                "E_SOURCE_UNTRUSTED: no grant for ssh://git@github.com/evil/agents; review it, then run dfm sync --trust-origin ssh://git@github.com/evil/agents"
+            ]
+        );
+        assert_eq!(
+            t.calls(),
+            upstream_calls(&copy.display().to_string(), "fork")
+        );
+        assert!(preview(Updater::Agents, &t.env()).starts_with("blocked: E_SOURCE_UNTRUSTED"));
     }
 
     #[test]
@@ -1006,33 +1069,41 @@ mod tests {
     }
 
     #[test]
-    fn agents_with_an_unreadable_origin_is_blocked() {
+    fn agents_with_an_unreadable_or_local_upstream_is_blocked() {
         let t = T::new();
         t.agents("abc1234", "def5678");
         let copy = t.managed();
-        let config = copy.join(".git/config");
-        // An insteadOf rewrite: the recorded url is not where git fetches from.
-        let mut text = fs::read_to_string(&config).unwrap();
-        text.push_str("[url \"https://evil.invalid/\"]\n\tinsteadOf = git@github.com:\n");
-        fs::write(&config, text).unwrap();
+        // `remote get-url` fails: the url git would fetch from is unknown.
+        fs::remove_file(t.root.join("st/url-origin")).unwrap();
         let r = run(Updater::Agents, &t.env());
         assert_eq!(r.status, Status::Blocked, "{r:?}");
         assert!(
-            r.notes[0].contains("the [url] section can change the remote"),
+            r.notes[0].starts_with(&format!(
+                "cannot read the url of the remote origin of {}: ",
+                copy.display()
+            )),
             "{r:?}"
         );
-        assert_eq!(t.log(), "");
-        // No origin at all.
-        fs::write(&config, "[core]\n\tbare = false\n").unwrap();
-        let r = run(Updater::Agents, &t.env());
-        assert_eq!(r.status, Status::Blocked, "{r:?}");
-        assert!(r.notes[0].contains("no single url"), "{r:?}");
         // A local path is not a source identity.
-        origin(&copy, "/some/local/path");
+        fs::write(t.root.join("st/url-origin"), "/some/local/path").unwrap();
         let r = run(Updater::Agents, &t.env());
         assert_eq!(r.status, Status::Blocked, "{r:?}");
         assert!(r.notes[0].starts_with("E_SOURCE_UNTRUSTED: "), "{r:?}");
-        assert_eq!(t.log(), "");
+        assert!(!t.log().contains(" fetch"), "{}", t.log());
+        assert!(!t.log().contains("install-agent-registry"), "{}", t.log());
+    }
+
+    #[test]
+    fn agents_working_copy_is_not_checked() {
+        let mut t = T::new();
+        t.agents("abc1234", "def5678");
+        let working = t.home.join("projects/agents");
+        fs::create_dir_all(&working).unwrap();
+        fs::write(working.join("pyproject.toml"), "").unwrap();
+        t.grants = Grants::default();
+        assert!(trust_notes(Updater::Agents, &t.env()).is_empty());
+        let r = run(Updater::Agents, &t.env());
+        assert_eq!(r.status, Status::Current, "{r:?}");
     }
 
     #[test]
@@ -1125,7 +1196,7 @@ mod tests {
         let t = T::new();
         t.agents("abc1234", "def5678");
         let working = t.home.join("projects/agents");
-        origin(&working, REGISTRY);
+        fs::create_dir_all(&working).unwrap();
         fs::write(working.join("pyproject.toml"), "").unwrap();
         // A managed copy exists too; the working copy wins.
         t.managed();
@@ -1161,19 +1232,15 @@ mod tests {
         assert_eq!(r.before.as_deref(), Some("abc1234"));
         assert_eq!(r.after.as_deref(), Some("def5678"));
         let c = copy.display();
-        assert_eq!(
-            t.calls(),
-            [
-                format!("git -C {c} rev-parse --short HEAD"),
-                format!("git -C {c} status --porcelain"),
-                format!("git -C {c} rev-parse --abbrev-ref @{{u}}"),
-                format!("git -C {c} fetch --quiet"),
-                format!("git -C {c} rev-list --count @{{u}}..HEAD"),
-                format!("git -C {c} pull --ff-only --quiet"),
-                format!("git -C {c} rev-parse --short HEAD"),
-                format!("install-agent-registry.sh {c}"),
-            ]
-        );
+        let mut want = upstream_calls(&c.to_string(), "origin");
+        want.extend([
+            format!("git -C {c} fetch --quiet origin"),
+            format!("git -C {c} rev-list --count @{{u}}..HEAD"),
+            format!("git -C {c} pull --ff-only --quiet origin refs/heads/main"),
+            format!("git -C {c} rev-parse --short HEAD"),
+            format!("install-agent-registry.sh {c}"),
+        ]);
+        assert_eq!(t.calls(), want);
     }
 
     #[test]
@@ -1299,7 +1366,9 @@ mod tests {
             )),
             "{p}"
         );
-        assert_eq!(t.log(), "");
+        // Only the read-only calls that find the upstream for the source check.
+        let c = copy.display().to_string();
+        assert_eq!(t.calls(), upstream_calls(&c, "origin")[2..]);
     }
 
     impl Drop for T {
