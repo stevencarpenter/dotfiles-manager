@@ -4098,6 +4098,7 @@ case "$1" in
     [ -e "$st/tty-{name}" ] && {{ read x < /dev/tty || exit 9; }}
     [ -e "$st/fail-{name}" ] && {{ echo boom >&2; exit 1; }}
     [ -e "$st/next-{name}" ] && cp "$st/next-{name}" "$st/{name}"
+    [ -e "$st/write-{name}" ] && echo changed >> "$(cat "$st/write-{name}")"
     exit 0 ;;
   *) exit 64 ;;
 esac
@@ -4420,6 +4421,93 @@ fn a_second_copy_shows_the_version_brew_left() {
         "{s}"
     );
     assert!(!s.contains("Homebrew cask codex 0.164.0"), "{s}");
+}
+
+/// DFM-25 (C05, G5): an updater that changes a tracked file in the bound checkout fails its
+/// row with the file named. The change stays, unstaged and uncommitted, and the next updater
+/// still runs.
+#[test]
+fn an_updater_that_changes_a_tracked_file_fails_its_row_and_leaves_the_change() {
+    let u = Up::new(r#"["claude", "codex"]"#);
+    let o = u.sync(&["--no-upgrade"]);
+    assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
+    let tracked = u.fx.root.join("profiles/t-01.toml");
+    let before = fs::read_to_string(&tracked).unwrap();
+    fs::write(u.st("write-claude"), tracked.to_str().unwrap()).unwrap();
+    let head = u.fx.head();
+    let o = u.sync(&[]);
+    assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
+    let s = stdout(&o);
+    assert!(s.contains("  failed claude"), "{s}");
+    assert!(
+        s.contains("    note: E_CONFLICT: claude changed the tracked file "),
+        "{s}"
+    );
+    assert!(
+        s.contains(
+            "profiles/t-01.toml (M); it is left in place, not reverted, staged or committed"
+        ),
+        "{s}"
+    );
+    assert!(s.contains("  current codex"), "{s}");
+    assert!(s.contains("  upgrade: current=1 failed=1"), "{s}");
+    assert!(s.contains("\nwarning: upgrade claude failed: "), "{s}");
+    assert_eq!(
+        fs::read_to_string(&tracked).unwrap(),
+        format!("{before}changed\n")
+    );
+    assert_eq!(
+        git(
+            &u.fx.root,
+            &["status", "--porcelain", "--untracked-files=no"]
+        ),
+        " M profiles/t-01.toml"
+    );
+    assert_eq!(u.fx.head(), head);
+    let r = u.upgrade_receipts();
+    let ops = r.last().unwrap()["operations"].as_array().unwrap().clone();
+    assert_eq!(ops[0]["status"], "failed", "{ops:?}");
+    assert!(
+        ops[0]["error"].as_str().unwrap().contains("E_CONFLICT"),
+        "{ops:?}"
+    );
+}
+
+/// DFM-25 (G6): a declared updater that cannot run stays in the listing, the rows, the summary
+/// and the receipt as `blocked`; it is never dropped from the update set.
+#[test]
+fn a_blocked_updater_is_listed_and_counted_not_dropped() {
+    let u = Up::new(r#"["opencode", "claude"]"#);
+    let o = u.sync(&[]);
+    assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
+    let s = stdout(&o);
+    assert!(s.contains("  opencode: blocked: not installed at "), "{s}");
+    assert!(s.contains("  blocked opencode\n"), "{s}");
+    assert!(s.contains("  current claude"), "{s}");
+    assert!(s.contains("  upgrade: current=1 blocked=1"), "{s}");
+    assert!(
+        s.contains("\nwarning: upgrade opencode blocked: not installed at "),
+        "{s}"
+    );
+    let r = u.upgrade_receipts();
+    let ops: Vec<(&str, &str)> = r[0]["operations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|o| {
+            (
+                o["resource"].as_str().unwrap(),
+                o["status"].as_str().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        ops,
+        [
+            ("updater:opencode", "blocked"),
+            ("updater:claude", "current")
+        ]
+    );
 }
 
 #[test]

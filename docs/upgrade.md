@@ -56,6 +56,15 @@ A manager built before this key refuses a profile that has it (`E_FIELD_UNKNOWN`
 - The check runs in the listing before publication and again under the writer lock just before the updater runs, with the grants read under the lock, because the record or the grants can change between them.
 - One updater fetches all of its sources, so one ungranted source blocks the whole row.
 
+## Tracked files
+
+An updater must not leave a tracked file changed in a source checkout without the owner knowing (DFM-25, C05).
+
+- Before the first updater, sync records `git status --porcelain=v1 -z --untracked-files=no` (with `--no-optional-locks`, through the scrubbed git of docs/sync.md) for the bound checkout and each nested source checkout that the published lock declares. After each updater that ran, it records it again and compares.
+- A tracked file that the updater changed (a new modified, deleted, type-changed or renamed entry) makes that row `failed` with one note per file: `E_CONFLICT: claude changed the tracked file <checkout>/<path> (M); it is left in place, not reverted, staged or committed`. A file that resolves through a dfm link into a checkout shows as the file in the checkout.
+- The change stays for the owner. Sync does not revert, stage, commit or push it. The next `dfm sync` refuses an update that would overwrite it (docs/sync.md, step 2).
+- The other updaters still run. A `blocked` updater ran no command and is not compared. A status that cannot be read after an updater fails that row with the cause; one that cannot be read before the first updater is an error of the step (`upgrade: failed (<code>)`).
+
 ## Statuses
 
 | Status | When |
@@ -63,7 +72,7 @@ A manager built before this key refuses a profile that has it (`E_FIELD_UNKNOWN`
 | `updated` | the version changed (brew: every upgraded name left the outdated list) |
 | `current` | exit 0 and the same version (brew: nothing outdated) |
 | `pending` | a stop request (SIGINT, SIGTERM) ended or prevented it, or the update ran and the new version could not be read |
-| `failed` | a command exited nonzero, timed out or was ended by a signal; brew: a name stayed outdated or the list was not valid JSON |
+| `failed` | a command exited nonzero, timed out or was ended by a signal; the updater changed a tracked file in a source checkout (`E_CONFLICT`, see "Tracked files"); brew: a name stayed outdated or the list was not valid JSON |
 | `blocked` | skills, agents: a source has no grant or maps to no identity, or the source record cannot be read (see "Source trust"); agents: the install script or `git` is missing, or the managed copy is missing, dirty, without an upstream or diverged (local commits); the tool, or `mise` for skills, is missing from its owner path, fails the executable checks, or its version cannot be read (or is empty) before the update; brew: `brew` cannot be resolved on the provider path |
 
 A failure note gives the command, its exit code and the size of its standard error. The text is withheld (docs/secrets.md); run the command by hand to see it. A partial `brew upgrade` is `failed`, and the notes list each name as upgraded or still outdated.
@@ -96,6 +105,7 @@ Timeouts: 30 minutes for `brew upgrade`, 10 minutes for every other command.
 - **No candidate version in the preview.** The newest version is what each provider resolves at run time.
 - **`sudo` casks fail** under the detached run.
 - **skills reports no version**, so it is never `updated`.
+- **Tracked files are compared by status line.** A file that was already changed before an updater and that the updater changes again keeps its status line, so the guard does not see it. A change that another process makes while an updater runs is counted against that updater.
 - **Source trust reads recorded sources.** A global git `insteadOf` rewrite in `~/.gitconfig` is not applied to the `agents` origin, and the check reads the `skills` record version 3 only.
 - **agents** does not clone a missing managed copy. Clone it by hand. A working copy is installed with its uncommitted changes.
 - **Second copies** are looked for in Homebrew only, not in npm or mise.

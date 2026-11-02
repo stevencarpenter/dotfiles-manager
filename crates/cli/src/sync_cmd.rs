@@ -2206,6 +2206,46 @@ fn updater_env<'a>(
     }
 }
 
+/// The checkouts the tracked-file guard watches (DFM-25, G5): the bound checkout and each nested
+/// source checkout that the published lock declares and that exists.
+fn guarded_checkouts(root: &Path) -> Result<Vec<PathBuf>, Refusal> {
+    let lock = read_lock(root)?;
+    let nested = lock.nested().iter().map(|s| root.join(&s.path));
+    Ok(std::iter::once(root.to_path_buf())
+        .chain(nested.filter(|d| d.join(".git").exists()))
+        .collect())
+}
+
+/// The tracked changes of each checkout as `(path, XY)`, from `git status --porcelain=v1 -z`
+/// without untracked files. `--no-optional-locks` keeps the index as it is.
+fn tracked_status(git: &Git, dirs: &[PathBuf]) -> Result<BTreeSet<(String, String)>, Refusal> {
+    let mut seen = BTreeSet::new();
+    for dir in dirs {
+        let a = [
+            "-C",
+            path_str(dir)?,
+            "--no-optional-locks",
+            "status",
+            "--porcelain=v1",
+            "-z",
+            "--untracked-files=no",
+        ];
+        let out = git.run(true, Code::IoFailed, "git status", &a)?;
+        let mut fields = out.split('\0');
+        while let Some(entry) = fields.next() {
+            let Some((xy, path)) = entry.split_at_checked(3) else {
+                continue;
+            };
+            // A rename or a copy carries its old path in the next field.
+            if xy.starts_with(['R', 'C']) {
+                fields.next();
+            }
+            seen.insert((dir.join(path).display().to_string(), xy[..2].to_string()));
+        }
+    }
+    Ok(seen)
+}
+
 /// `--preview`: what the upgrade step would run. Nothing runs and nothing is written.
 fn upgrade_preview(
     ctx: &Ctx,
@@ -2298,10 +2338,41 @@ fn upgrade(
     let mut runner = ctx.runner(sys);
     runner.detach = true;
     let env = updater_env(ctx, &runner, root, &grants);
+    // The tracked-file guard (DFM-25, G5): the tracked changes before the updaters, compared
+    // after each one that ran. A change it made fails its row and stays in place.
+    let git = Git::new(ctx, sys);
+    let checkouts = guarded_checkouts(root)?;
+    let mut tracked = tracked_status(&git, &checkouts)?;
     writeln!(out, "{}", paint::label(ctx.color, "upgrade:")).map_err(w)?;
     let mut ops = Vec::new();
     for u in &updaters {
-        let row = updater::run(*u, &env);
+        let mut row = updater::run(*u, &env);
+        // A blocked updater ran no command, and a stopped run starts no more.
+        if row.status != state::Status::Blocked && dfm_engine::signal::requested().is_none() {
+            match tracked_status(&git, &checkouts) {
+                Ok(now) => {
+                    for (path, xy) in now.difference(&tracked) {
+                        row.status = state::Status::Failed;
+                        row.notes.push(format!(
+                            "{}: {} changed the tracked file {path} ({}); it is left in place, not reverted, staged or committed",
+                            Code::Conflict.as_str(),
+                            u.name(),
+                            xy.trim()
+                        ));
+                    }
+                    tracked = now;
+                }
+                Err(e) => {
+                    row.status = state::Status::Failed;
+                    row.notes.push(format!(
+                        "{}: the tracked files could not be checked after {}: {}",
+                        e.code.as_str(),
+                        u.name(),
+                        e.detail
+                    ));
+                }
+            }
+        }
         let status = status_name(row.status);
         let versions = match (&row.before, &row.after) {
             (Some(b), Some(a)) if a != b => format!(" {} -> {}", visible(b), visible(a)),
