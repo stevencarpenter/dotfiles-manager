@@ -23,7 +23,7 @@ use dfm_engine::{
 use dfm_model::binding::Binding;
 use dfm_model::digest::sha256_hex;
 use dfm_model::display::{visible, visible_for_paste};
-use dfm_model::lock::{Grants, Lock, LockSource, MAX_BYTES as LOCK_MAX_BYTES, check_origin};
+use dfm_model::lock::{Grants, Lock, LockSource, MAX_BYTES as LOCK_MAX_BYTES, check_identity};
 use dfm_model::plan::{Action, Blocker, Ownership, Plan, Scope, Status as PlanStatus};
 use dfm_model::resolve::{Resolved, resolve};
 use dfm_model::state::{self, Class, JournalEntry, Phase, Recovery, rfc3339};
@@ -67,7 +67,8 @@ const GIT_SETTINGS: [&str; 14] = [
 
 pub struct Args {
     apply: apply_cmd::Args,
-    /// Origins to grant before the fetch (`--trust-origin`), each named in the lock.
+    /// Identities to grant before the fetch (`--trust-origin`): canonical origins and
+    /// `npm:<package>` identities (docs/sync.md, "Source identities").
     trust: Vec<String>,
     /// `--restart <resource-id>`, for the services scope.
     restart: BTreeSet<String>,
@@ -1793,7 +1794,7 @@ fn run_inner(
     let mut grants = readable.read_grants()?;
     drop(readable);
     for o in &args.trust {
-        check_origin(o, cfg!(feature = "test-isolation"))?;
+        check_identity(o, cfg!(feature = "test-isolation"))?;
     }
     if !args.trust.is_empty() {
         state_cmd::fail_from_env()?.hit("sync-before-grant-lock")?;
@@ -1871,10 +1872,19 @@ fn run_inner(
     // The updaters, a blocked one included, are listed before any part runs (DFM-31.C02).
     let updaters = &loaded.resolved.updaters;
     if args.apply.preview || (args.upgrade && !updaters.is_empty()) {
-        upgrade_preview(ctx, &sys, &root, args, updaters, out)?;
+        upgrade_preview(ctx, &sys, (&root, &grants), args, updaters, out)?;
     }
     if args.apply.preview {
         return Ok(());
+    }
+    // Without a digest the run approves the plan it printed (DFM-76). A run that grants an
+    // identity stops here, also with nothing to change: the owner reviews what the new source
+    // brings first, the plan and the updater listing above, and no updater runs (DFM-25).
+    if args.apply.yes_plan.is_none() && !args.trust.is_empty() {
+        return Err(Refusal::new(
+            Code::ApprovalRequired,
+            "nothing was published and no updater ran. Fix: read the plan above, then run dfm sync",
+        ));
     }
     // A source that moves is a publication, so only a run with every source current, and no
     // part that would run with a change, can end here (docs/apply.md, step 4).
@@ -1922,14 +1932,6 @@ fn run_inner(
             Err(e) => (Some(format!("failed ({})", e.code.as_str())), Err(e)),
         };
         return finish(ctx, &lines, up.as_deref(), result, out, printed);
-    }
-    // Without a digest the run approves the plan it printed (DFM-76). A run that grants an
-    // origin stops here: the owner reviews what the new origin brings first.
-    if args.apply.yes_plan.is_none() && !args.trust.is_empty() {
-        return Err(Refusal::new(
-            Code::ApprovalRequired,
-            "nothing was published. Fix: read the plan above, then run dfm sync",
-        ));
     }
     drop(staging);
     drop(shared);
@@ -2188,21 +2190,103 @@ fn status_name(s: state::Status) -> String {
         .unwrap_or_default()
 }
 
-/// The updater environment: the provider runner, HOME and the bound checkout.
-fn updater_env<'a>(ctx: &'a Ctx, runner: &'a Runner, root: &'a Path) -> updater::Env<'a> {
+/// The updater environment: the provider runner, HOME, the bound checkout and the grants.
+fn updater_env<'a>(
+    ctx: &'a Ctx,
+    runner: &'a Runner,
+    root: &'a Path,
+    grants: &'a Grants,
+) -> updater::Env<'a> {
     updater::Env {
         provider: runner,
         home: ctx.platform.home(),
         root,
         timeouts: updater::Timeouts::DEFAULT,
+        grants,
     }
+}
+
+/// The checkouts the tracked-file guard watches (DFM-25, G5): the bound checkout and each nested
+/// source checkout that the published lock declares and that exists.
+fn guarded_checkouts(root: &Path) -> Result<Vec<PathBuf>, Refusal> {
+    let lock = read_lock(root)?;
+    let nested = lock.nested().iter().map(|s| root.join(&s.path));
+    Ok(std::iter::once(root.to_path_buf())
+        .chain(nested.filter(|d| d.join(".git").exists()))
+        .collect())
+}
+
+/// The tracked changes of each checkout: for each path that `git status --porcelain=v1 -z`
+/// lists (untracked files left out), its `XY` code and what it holds now: `file <hash>` (`git
+/// hash-object --no-filters`), `link <target>`, `missing` or `other`. The content is part of
+/// the snapshot because an updater that rewrites an already modified file leaves its status
+/// line as it was. `--no-optional-locks` keeps the index as it is.
+fn tracked_status(
+    git: &Git,
+    dirs: &[PathBuf],
+) -> Result<BTreeMap<String, (String, String)>, Refusal> {
+    let mut seen = BTreeMap::new();
+    for dir in dirs {
+        let d = path_str(dir)?;
+        let a = [
+            "-C",
+            d,
+            "--no-optional-locks",
+            "status",
+            "--porcelain=v1",
+            "-z",
+            "--untracked-files=no",
+        ];
+        let out = git.run(true, Code::IoFailed, "git status", &a)?;
+        let mut entries = Vec::new();
+        let mut fields = out.split('\0');
+        while let Some(entry) = fields.next() {
+            let Some((xy, path)) = entry.split_at_checked(3) else {
+                continue;
+            };
+            // A rename or a copy carries its old path in the next field.
+            if xy.starts_with(['R', 'C']) {
+                fields.next();
+            }
+            entries.push((path.to_string(), xy[..2].to_string()));
+        }
+        let mut kinds: Vec<String> = Vec::with_capacity(entries.len());
+        let mut files = Vec::new();
+        for (path, _) in &entries {
+            kinds.push(match fs::symlink_metadata(dir.join(path)) {
+                Ok(m) if m.file_type().is_symlink() => match fs::read_link(dir.join(path)) {
+                    Ok(t) => format!("link {}", t.display()),
+                    Err(e) => format!("link unreadable ({})", e.kind()),
+                },
+                Ok(m) if m.is_file() => {
+                    files.push(path.as_str());
+                    String::new()
+                }
+                Ok(_) => "other".into(),
+                Err(_) => "missing".into(),
+            });
+        }
+        if !files.is_empty() {
+            let mut a = vec!["-C", d, "hash-object", "--no-filters", "--"];
+            a.extend(&files);
+            let out = git.run(true, Code::IoFailed, "git hash-object", &a)?;
+            let mut hashes = out.lines();
+            for k in kinds.iter_mut().filter(|k| k.is_empty()) {
+                *k = format!("file {}", hashes.next().unwrap_or_default());
+            }
+        }
+        for ((path, xy), kind) in entries.into_iter().zip(kinds) {
+            seen.insert(dir.join(path).display().to_string(), (xy, kind));
+        }
+    }
+    Ok(seen)
 }
 
 /// `--preview`: what the upgrade step would run. Nothing runs and nothing is written.
 fn upgrade_preview(
     ctx: &Ctx,
     sys: &Sys,
-    root: &Path,
+    (root, grants): (&Path, &Grants),
     args: &Args,
     updaters: &[Updater],
     out: &mut dyn Write,
@@ -2216,7 +2300,7 @@ fn upgrade_preview(
         return writeln!(out, "upgrade: none declared in the profile").map_err(w);
     }
     let runner = ctx.runner(sys);
-    let env = updater_env(ctx, &runner, root);
+    let env = updater_env(ctx, &runner, root, grants);
     writeln!(out, "{}", paint::label(ctx.color, "upgrade:")).map_err(w)?;
     for u in updaters {
         writeln!(
@@ -2283,14 +2367,50 @@ fn upgrade(
         writeln!(out, "upgrade: none declared in the profile").map_err(w)?;
         return Ok(None);
     }
+    // The grants as they are under the lock: the source check runs again just before each
+    // updater, because a grant or the tool's sources may have changed since the review.
+    let grants = store.read_grants()?;
     let started = now_ns()?;
     let mut runner = ctx.runner(sys);
     runner.detach = true;
-    let env = updater_env(ctx, &runner, root);
+    let env = updater_env(ctx, &runner, root, &grants);
+    // The tracked-file guard (DFM-25, G5): the tracked changes before the updaters, compared
+    // after each one that ran. A change it made fails its row and stays in place.
+    let git = Git::new(ctx, sys);
+    let checkouts = guarded_checkouts(root)?;
+    let mut tracked = tracked_status(&git, &checkouts)?;
     writeln!(out, "{}", paint::label(ctx.color, "upgrade:")).map_err(w)?;
     let mut ops = Vec::new();
     for u in &updaters {
-        let row = updater::run(*u, &env);
+        let mut row = updater::run(*u, &env);
+        // A blocked updater ran no command, and a stopped run starts no more.
+        if row.status != state::Status::Blocked && dfm_engine::signal::requested().is_none() {
+            match tracked_status(&git, &checkouts) {
+                Ok(now) => {
+                    let paths: BTreeSet<&String> = tracked.keys().chain(now.keys()).collect();
+                    for path in paths.into_iter().filter(|p| tracked.get(*p) != now.get(*p)) {
+                        // A path that left the status was changed back to its committed form.
+                        let code = now.get(path).map_or("restored", |(xy, _)| xy.trim());
+                        row.status = state::Status::Failed;
+                        row.notes.push(format!(
+                            "{}: {} changed the tracked file {path} ({code}); it is left in place, not reverted, staged or committed",
+                            Code::Conflict.as_str(),
+                            u.name(),
+                        ));
+                    }
+                    tracked = now;
+                }
+                Err(e) => {
+                    row.status = state::Status::Failed;
+                    row.notes.push(format!(
+                        "{}: the tracked files could not be checked after {}: {}",
+                        e.code.as_str(),
+                        u.name(),
+                        e.detail
+                    ));
+                }
+            }
+        }
         let status = status_name(row.status);
         let versions = match (&row.before, &row.after) {
             (Some(b), Some(a)) if a != b => format!(" {} -> {}", visible(b), visible(a)),
