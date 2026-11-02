@@ -76,17 +76,18 @@ Before an updater runs, dfm reads the identities that the tool will fetch from, 
 | Updater | Identities read from |
 | --- | --- |
 | `skills` | the `skills` CLI's own source record, and `npm:skills` for the installer that `npx` runs |
-| `agents` (DFM-25.C09, built in its own PR first) | the `origin` remote of the copy that the updater uses |
+| `agents` (DFM-25.C09, merged as 63ba5b1) | the managed copy's upstream remote: the remote of `@{u}` (`git config branch.<branch>.remote`), resolved with `git remote get-url <remote>` so that `url.*.insteadOf` rewrites apply. Not `origin` unless that is the upstream's remote. The working copy `~/projects/agents` is never fetched, so it has no identity to check: it is the owner's own checkout |
 | `claude`, `codex`, `opencode`, `brew` | none: they update the tool binary or the packages from their owner, not extension sources |
 
 - Each identity without a grant makes the row `blocked` with `E_SOURCE_UNTRUSTED`, and that updater runs no command. The note lists every ungranted identity and the one `--trust-origin` command for each.
 - If the source list cannot be read (the file is missing, unreadable or in an unknown format), the row is `blocked` with that cause. It is not `current`, and it is not run without the check.
 - The check runs in the review listing (docs/upgrade.md, "In sync", item 1) and again under the writer lock just before the updater runs, because the tool state can change in between.
+- The updater fetches only from the identity it checked. The `agents` updater names the checked remote and branch explicitly (`git fetch <remote>`, `git pull --ff-only <remote> <branch>`), so git cannot choose another remote between the check and the fetch.
 
 ### The code execution boundary
 
 - dfm runs only the fixed updater commands and scripts from the bound checkout (for example `scripts/install-agent-registry.sh`). The bound checkout is the granted root source.
-- The agent registry install runs the registry's own code (`uv run ... agent_registry.cli install`). The registry origin's grant covers this. Without the grant, the `agents` row is blocked before `git pull`.
+- The agent registry install runs the registry's own code (`uv run ... agent_registry.cli install`). The grant of the upstream remote covers this. Without the grant, the `agents` row is blocked before `git fetch`.
 
 ## C05: tracked files and pin edits
 
@@ -102,7 +103,7 @@ So no pin edit is eligible yet. The design adds a guard now and defines the rule
 
 ### Guard
 
-- Before the updaters run, dfm records `git status --porcelain=v1 -z` for the bound checkout and each nested source checkout. After each updater, it records it again.
+- Before the updaters run, dfm records a snapshot of the bound checkout and each nested source checkout. After each updater, it records it again. A snapshot is `git status --porcelain=v1 -z`, plus the file type and a content hash (`git hash-object --no-filters`, or the link target for a symlink) of every tracked path that the status already lists as changed. Status alone is not enough: an updater that rewrites a file that is already modified leaves the status line unchanged.
 - A tracked file that the updater changed (modified, deleted or type-changed) makes that row `failed` with `E_CONFLICT`. The note names the file and the updater. A file that resolves through a dfm link counts as the file in the checkout.
 - The change is left in place for the owner. dfm does not revert, stage, commit or push it.
 - The next `dfm sync` refuses the dirty checkout through its existing rule (a local change to a file the update changes, docs/sync.md step 2), so the change cannot be lost silently.
@@ -131,7 +132,7 @@ An updater may be allowed to change a pin only through a change to this design. 
 
 - How an adapter reports its identities (a method on the adapter, or a function next to it) and where the plan-time check sits in the planner.
 - The exact file and format of the `skills` CLI's source record. Read each one on the M5 (read only) and document it in docs/upgrade.md. A format that cannot be read is `blocked`, as specified above.
-- The test layout. Required cases: a new marketplace in planned content blocks the operation; a granted one passes; a marketplace already in the live file does not block a `current` operation; a hand-added foreign marketplace in the live file is kept by the merge; a local marketplace in planned content is refused; an ungranted registry remote blocks `agents` before any git command; an unreadable source list blocks; an updater that changes a tracked file fails its row with the file named; an `npm:` grant round-trips through `grants.json`; a grants file without `packages` still parses.
+- The test layout. Required cases: a new marketplace in planned content blocks the operation; a granted one passes; a marketplace already in the live file does not block a `current` operation; a hand-added foreign marketplace in the live file is kept by the merge; a local marketplace in planned content is refused; an ungranted registry remote blocks `agents` before any git command; an unreadable source list blocks; an updater that changes a tracked file fails its row with the file named; a granted `origin` with an ungranted upstream remote blocks `agents`; an updater that rewrites a tracked file that was already modified fails its row; an `npm:` grant round-trips through `grants.json`; a grants file without `packages` still parses.
 - Documentation updates in docs/sync.md (the trust rule and the flag), docs/upgrade.md (statuses and notes), docs/state.md (the `packages` list) and docs/adapters.md (the `claude-settings/v1` identities).
 
 ## Delivery
