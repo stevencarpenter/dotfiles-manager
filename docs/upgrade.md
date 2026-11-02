@@ -55,6 +55,7 @@ A manager built before this key refuses a profile that has it (`E_FIELD_UNKNOWN`
 - A source record that cannot be read makes the row `blocked` with the cause, for example `cannot read ~/.agents/.skill-lock.json: entity not found; nothing ran`. It is never `current`, and the updater never runs without the check.
 - The check runs in the listing before publication and again under the writer lock just before the updater runs, with the grants read under the lock, because the record or the grants can change between them.
 - One updater fetches all of its sources, so one ungranted source blocks the whole row.
+- `skills update` runs with `npm_config_registry=https://registry.npmjs.org/`, which overrides every npmrc, so `npx` fetches `skills` from the default registry that an `npm:` grant names.
 
 ## Tracked files
 

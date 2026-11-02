@@ -195,6 +195,10 @@ pub fn check_origin(origin: &str, allow_file: bool) -> Result<(), Refusal> {
 /// The prefix of an npm package identity (docs/sync.md, "Source identities").
 pub const NPM: &str = "npm:";
 
+/// The default npm registry: the only registry an `npm:` identity names. A tool that fetches an
+/// `npm:` source runs with `npm_config_registry` set to it, which overrides every npmrc.
+pub const NPM_REGISTRY: &str = "https://registry.npmjs.org/";
+
 /// An npm package name on the default registry: `name` or `@scope/name`, lowercase, of
 /// `[a-z0-9._~-]`, no part that starts with `.` or `_`, at most 214 bytes. A version, a tag or
 /// a registry is not part of it.

@@ -3,7 +3,7 @@
 //! tool, a failed command or a stop request is a row.
 
 use dfm_engine::proc::{End, Output, Request, Runner};
-use dfm_model::lock::{Grants, NPM, source_identity};
+use dfm_model::lock::{Grants, NPM, NPM_REGISTRY, source_identity};
 use dfm_model::state::Status;
 use dfm_model::updater::Updater;
 use dfm_model::{Code, Refusal};
@@ -195,7 +195,7 @@ pub fn run(u: Updater, env: &Env) -> Row {
                 env.provider,
                 "mise",
                 &args(&["exec", "--", "npx", "skills", "update"]),
-                &[],
+                &skills_env(),
                 env.timeouts.short,
             ) {
                 Ok(_) => {
@@ -488,6 +488,12 @@ fn read_record(path: &Path) -> Result<String, String> {
         return Err(why("larger than 1 MiB".into()));
     }
     String::from_utf8(bytes).map_err(|_| why("not UTF-8".into()))
+}
+
+/// The environment of `skills update`: the default npm registry, so a registry that an npmrc
+/// names cannot serve the `skills` package that the `npm:skills` grant covers.
+fn skills_env() -> Vec<(String, String)> {
+    vec![("npm_config_registry".into(), NPM_REGISTRY.into())]
 }
 
 /// The sources that `skills update` fetches: `npm:skills` for the installer, then `source` and
@@ -1592,6 +1598,22 @@ mod tests {
         assert_eq!(r.status, Status::Failed, "{r:?}");
         assert!(r.notes.join("\n").contains("brew outdated"), "{r:?}");
         assert!(!t.log().contains("brew upgrade"), "{}", t.log());
+    }
+
+    #[test]
+    fn skills_runs_against_the_default_npm_registry() {
+        let t = T::new();
+        let seen = t.root.join("registry");
+        t.script(
+            &t.bin.join("mise"),
+            &format!("printf '%s' \"$npm_config_registry\" > {}", seen.display()),
+        );
+        let r = run(Updater::Skills, &t.env());
+        assert_eq!(r.status, Status::Current, "{r:?}");
+        assert_eq!(
+            fs::read_to_string(&seen).unwrap(),
+            "https://registry.npmjs.org/"
+        );
     }
 
     #[test]
