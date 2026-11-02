@@ -269,6 +269,18 @@ pub fn source_identity(value: &str, allow_file: bool) -> Result<String, Refusal>
     Ok(id)
 }
 
+/// The identity of a git remote: [`source_identity`], limited to git origins. Git reads
+/// `npm:skills` as the SCP form (host `npm`), so an `npm:` identity, whose grant covers only an
+/// npm package, is `E_SOURCE_UNTRUSTED` here.
+pub fn git_identity(value: &str, allow_file: bool) -> Result<String, Refusal> {
+    if value.starts_with(NPM) {
+        return Err(untrusted(format!(
+            "git remote {value:?} names an npm: identity; an npm grant does not cover a git fetch"
+        )));
+    }
+    source_identity(value, allow_file)
+}
+
 /// `origin` with any userinfo (the text between `://` and `@` before the first `/`) replaced by
 /// `[redacted]`.
 fn mask_userinfo(origin: &str) -> String {
@@ -680,6 +692,14 @@ ref = "refs/heads/main"
                 "{bad}"
             );
         }
+        assert_eq!(
+            git_identity("npm:skills", false).unwrap_err().code,
+            Code::SourceUntrusted
+        );
+        assert_eq!(
+            git_identity("o/r", false).unwrap(),
+            "https://github.com/o/r"
+        );
         check_identity("npm:skills", false).unwrap();
         check_identity("https://github.com/o/r", false).unwrap();
         // --trust-origin takes the identity itself, not a form that maps to it.

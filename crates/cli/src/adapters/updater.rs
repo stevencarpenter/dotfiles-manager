@@ -3,7 +3,7 @@
 //! tool, a failed command or a stop request is a row.
 
 use dfm_engine::proc::{End, Output, Request, Runner};
-use dfm_model::lock::{Grants, NPM, NPM_REGISTRY, source_identity};
+use dfm_model::lock::{Grants, NPM, NPM_REGISTRY, git_identity};
 use dfm_model::state::Status;
 use dfm_model::updater::Updater;
 use dfm_model::{Code, Refusal};
@@ -496,8 +496,8 @@ fn skills_env() -> Vec<(String, String)> {
     vec![("npm_config_registry".into(), NPM_REGISTRY.into())]
 }
 
-/// The sources that `skills update` fetches: `npm:skills` for the installer, then `source` and
-/// `sourceUrl` of each entry of the `skills` CLI's record (version 3:
+/// The git sources that `skills update` fetches: `source` and `sourceUrl` of each entry of the
+/// `skills` CLI's record (version 3:
 /// `{"version": 3, "skills": {<name>: {"source": .., "sourceUrl": .., ..}}}`). `Err` is why
 /// the record cannot be read.
 fn skills_sources(env: &Env) -> Result<Vec<String>, String> {
@@ -517,7 +517,7 @@ fn skills_sources(env: &Env) -> Result<Vec<String>, String> {
     let skills = doc["skills"]
         .as_object()
         .ok_or_else(|| unknown("skills is not an object"))?;
-    let mut values = vec![format!("{NPM}{SKILLS_PACKAGE}")];
+    let mut values = Vec::new();
     for (name, entry) in skills {
         let source = entry["source"]
             .as_str()
@@ -536,19 +536,67 @@ fn skills_sources(env: &Env) -> Result<Vec<String>, String> {
     Ok(values)
 }
 
-/// The notes for `values`, the sources one updater fetches: one per source that maps to no
-/// identity and one per identity without a grant, each with its `--trust-origin` command.
-fn untrusted(values: &[String], grants: &Grants) -> Vec<String> {
-    let (mut notes, mut ids) = (Vec::new(), BTreeSet::new());
-    for v in values {
-        match source_identity(v, cfg!(feature = "test-isolation")) {
+/// The identity of a git remote url, or its note.
+fn git_id(url: &str) -> Result<String, String> {
+    git_identity(url, cfg!(feature = "test-isolation"))
+        .map_err(|e| format!("{}: {}", e.code.as_str(), e.detail))
+}
+
+/// The url git fetches from for `url`: `git ls-remote --get-url` applies `url.*.insteadOf`
+/// from the user's git config and makes no network call.
+fn fetch_url(env: &Env, url: &str) -> Result<String, String> {
+    let why = |n: String| {
+        format!(
+            "cannot resolve the skill source {url} with git ls-remote --get-url: {n}; nothing ran"
+        )
+    };
+    env.provider.resolve("git").map_err(|e| why(e.detail))?;
+    let out = call(
+        env.provider,
+        "git",
+        &args(&["ls-remote", "--get-url", url]),
+        &[],
+        env.timeouts.short,
+    )
+    .map_err(|(n, _)| why(n))?;
+    match String::from_utf8_lossy(&out.stdout).trim() {
+        "" => Err(why("it printed no url".into())),
+        u => Ok(u.to_string()),
+    }
+}
+
+/// The identities `skills update` fetches: `npm:skills` for the installer, then each record
+/// source as git clones it. A value is mapped before git sees it, so a value that maps to no
+/// git origin never reaches git; then its fetch url is mapped again.
+fn skills_identities(env: &Env, values: &[String]) -> Vec<Result<String, String>> {
+    let mut ids = vec![Ok(format!("{NPM}{SKILLS_PACKAGE}"))];
+    ids.extend(values.iter().map(|v| {
+        let id = git_id(v)?;
+        // The `skills` CLI clones a GitHub shorthand as `https://github.com/<o>/<r>.git`.
+        let clone = if v.contains(':') {
+            v.clone()
+        } else {
+            format!("{id}.git")
+        };
+        git_id(&fetch_url(env, &clone)?)
+    }));
+    ids
+}
+
+/// The notes for the identities one updater fetches: each note as it is, and one per identity
+/// without a grant, with its `--trust-origin` command.
+fn untrusted(ids: Vec<Result<String, String>>, grants: &Grants) -> Vec<String> {
+    let mut notes = Vec::new();
+    let mut seen = BTreeSet::new();
+    for id in ids {
+        match id {
             Ok(id) => {
-                ids.insert(id);
+                seen.insert(id);
             }
-            Err(e) => notes.push(format!("{}: {}", e.code.as_str(), e.detail)),
+            Err(note) => notes.push(note),
         }
     }
-    notes.extend(ids.iter().filter(|id| !grants.trusts(id)).map(|id| {
+    notes.extend(seen.iter().filter(|id| !grants.trusts(id)).map(|id| {
         format!(
             "{}: no grant for {id}; review it, then run dfm sync --trust-origin {id}",
             Code::SourceUntrusted.as_str()
@@ -565,7 +613,7 @@ fn untrusted(values: &[String], grants: &Grants) -> Vec<String> {
 pub fn trust_notes(u: Updater, env: &Env) -> Vec<String> {
     match u {
         Updater::Skills => match skills_sources(env) {
-            Ok(v) => untrusted(&v, env.grants),
+            Ok(v) => untrusted(skills_identities(env, &v), env.grants),
             Err(why) => vec![why],
         },
         Updater::Agents => {
@@ -574,7 +622,7 @@ pub fn trust_notes(u: Updater, env: &Env) -> Vec<String> {
                 return vec![];
             }
             match agents_upstream(env, &copy) {
-                Ok(Ok(up)) => untrusted(&[up.url], env.grants),
+                Ok(Ok(up)) => untrusted(vec![git_id(&up.url)], env.grants),
                 Ok(Err(why)) | Err((why, _)) => vec![why],
             }
         }
@@ -736,7 +784,7 @@ fn agents(mut d: Draft, env: &Env) -> Row {
         };
         // The upstream's grant covers the pull and the registry's own install code. The
         // fetch and the pull name the checked remote, so git cannot pick another one.
-        let notes = untrusted(std::slice::from_ref(&up.url), env.grants);
+        let notes = untrusted(vec![git_id(&up.url)], env.grants);
         if !notes.is_empty() {
             d.notes.extend(notes);
             return d.end(Status::Blocked);
@@ -897,6 +945,20 @@ mod tests {
             }
             fs::create_dir_all(home.join(".agents")).unwrap();
             fs::write(home.join(".agents/.skill-lock.json"), SKILL_RECORD).unwrap();
+            // `git ls-remote --get-url <url>` prints `st/mirror` when it exists (an insteadOf
+            // rewrite), else the url; `st/lsremote-fail` makes it fail. It logs nothing;
+            // `agents` replaces it with its own look-alike.
+            let st = root.join("st");
+            fs::create_dir_all(&st).unwrap();
+            fs::write(
+                bin.join("git"),
+                format!(
+                    "#!/bin/sh\nst={}\n[ \"$1 $2\" = 'ls-remote --get-url' ] || exit 64\n[ -f \"$st/lsremote-fail\" ] && exit 2\nif [ -f \"$st/mirror\" ]; then cat \"$st/mirror\"; else echo \"$3\"; fi\n",
+                    st.display()
+                ),
+            )
+            .unwrap();
+            fs::set_permissions(bin.join("git"), fs::Permissions::from_mode(0o755)).unwrap();
             T {
                 dots: root.join("dots"),
                 root,
@@ -1181,6 +1243,65 @@ mod tests {
             assert!(preview(Updater::Skills, &t.env()).starts_with("blocked: "));
         }
         assert_eq!(t.log(), "");
+    }
+
+    #[test]
+    fn skills_checks_the_url_git_rewrites_to() {
+        let t = T::new();
+        t.script(&t.bin.join("mise"), "exit 0");
+        // The literal source is granted, but insteadOf sends the clone to a mirror.
+        fs::write(
+            t.root.join("st/mirror"),
+            "https://mirror.invalid/o/skill.git\n",
+        )
+        .unwrap();
+        let r = run(Updater::Skills, &t.env());
+        assert_eq!(r.status, Status::Blocked, "{r:?}");
+        assert_eq!(
+            r.notes,
+            [
+                "E_SOURCE_UNTRUSTED: no grant for https://mirror.invalid/o/skill; review it, then run dfm sync --trust-origin https://mirror.invalid/o/skill"
+            ]
+        );
+        assert!(preview(Updater::Skills, &t.env()).starts_with("blocked: E_SOURCE_UNTRUSTED"));
+        assert_eq!(t.log(), "");
+    }
+
+    #[test]
+    fn skills_whose_url_git_cannot_resolve_is_blocked() {
+        let t = T::new();
+        t.script(&t.bin.join("mise"), "exit 0");
+        fs::write(t.root.join("st/lsremote-fail"), "").unwrap();
+        let r = run(Updater::Skills, &t.env());
+        assert_eq!(r.status, Status::Blocked, "{r:?}");
+        assert!(
+            r.notes[0].starts_with("cannot resolve the skill source "),
+            "{r:?}"
+        );
+        assert!(r.notes[0].ends_with("; nothing ran"), "{r:?}");
+        assert_eq!(t.log(), "");
+    }
+
+    #[test]
+    fn agents_with_an_npm_upstream_is_blocked_although_npm_is_granted() {
+        let t = T::new();
+        t.agents("abc1234", "def5678");
+        let copy = t.managed();
+        // Git reads `npm:skills` as host `npm`; the npm:skills grant must not cover it.
+        fs::write(t.root.join("st/url-origin"), "npm:skills").unwrap();
+        assert!(t.grants.trusts("npm:skills"));
+        let r = run(Updater::Agents, &t.env());
+        assert_eq!(r.status, Status::Blocked, "{r:?}");
+        assert!(
+            r.notes[0].starts_with(
+                "E_SOURCE_UNTRUSTED: git remote \"npm:skills\" names an npm: identity"
+            ),
+            "{r:?}"
+        );
+        assert_eq!(
+            t.calls(),
+            upstream_calls(&copy.display().to_string(), "origin")
+        );
     }
 
     #[test]
