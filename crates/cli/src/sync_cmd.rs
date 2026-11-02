@@ -23,7 +23,9 @@ use dfm_engine::{
 use dfm_model::binding::Binding;
 use dfm_model::digest::sha256_hex;
 use dfm_model::display::{visible, visible_for_paste};
-use dfm_model::lock::{Grants, Lock, LockSource, MAX_BYTES as LOCK_MAX_BYTES, check_identity};
+use dfm_model::lock::{
+    Grants, Lock, LockSource, MAX_BYTES as LOCK_MAX_BYTES, check_identity, trust_command,
+};
 use dfm_model::plan::{Action, Blocker, Ownership, Plan, Scope, Status as PlanStatus};
 use dfm_model::resolve::{Resolved, resolve};
 use dfm_model::state::{self, Class, JournalEntry, Phase, Recovery, rfc3339};
@@ -2507,10 +2509,7 @@ fn upgrade(
 }
 
 fn untrusted_refusal(origins: &[&str]) -> Refusal {
-    let fix: Vec<String> = origins
-        .iter()
-        .map(|o| format!("sync --trust-origin {o}"))
-        .collect();
+    let fix: Vec<String> = origins.iter().map(|o| trust_command(o)).collect();
     untrusted(format!(
         "no grant for {}; nothing was fetched. Fix: review each origin, then run {}",
         origins.join(", "),

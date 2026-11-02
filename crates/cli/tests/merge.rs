@@ -2736,7 +2736,7 @@ fn a_new_marketplace_in_planned_content_blocks_the_operation() {
     assert_eq!(code(&o), 3, "{all}");
     assert!(all.contains("E_SOURCE_UNTRUSTED"), "{all}");
     assert!(
-        all.contains(&format!("dfm sync --trust-origin {MARKETPLACE}")),
+        all.contains(&format!("dfm sync --trust-origin '{MARKETPLACE}'")),
         "{all}"
     );
     assert_eq!(code(&fx.apply_bare()), 3);
@@ -2807,4 +2807,38 @@ fn a_local_marketplace_in_planned_content_is_refused() {
         "{all}"
     );
     assert!(!fx.settings().exists());
+}
+
+#[test]
+fn a_marketplace_removed_after_the_plan_is_not_added_back_without_a_grant() {
+    // The module seeds the marketplace, and the first apply writes it under a grant.
+    let fx = Fx::new();
+    fx.module(|m| {
+        format!("{m}[resources.value.seed.extraKnownMarketplaces.m.source]\nsource = \"github\"\nrepo = \"o/r\"\n")
+    });
+    fx.grant(MARKETPLACE);
+    assert_eq!(code(&fx.apply()), 0);
+    fs::remove_file(fx.state().join("grants.json")).unwrap();
+    // A changed managed value makes the next merge a write. The live file still names the
+    // marketplace, so the plan adds nothing.
+    fx.module(|m| m.replace("outputStyle = \"STE\"", "outputStyle = \"Plain\""));
+    let d = fx.saved().plan_digest;
+    // The application removes the marketplace after the locked re-plan, before the read for
+    // publication. The merge would seed it again, which adds an ungranted identity.
+    let mut removed = serde_json::Value::Null;
+    let o = parked_apply(&fx, "merge-before-read", &d, |fx| {
+        let mut j = fx.live_json();
+        j.as_object_mut().unwrap().remove("extraKnownMarketplaces");
+        fx.live(&j.to_string());
+        removed = j;
+    });
+    let all = format!("{}{}", text(&o.stdout), stderr(&o));
+    assert_ne!(code(&o), 0, "{all}");
+    assert!(all.contains("E_SOURCE_UNTRUSTED"), "{all}");
+    assert!(
+        all.contains(&format!("dfm sync --trust-origin '{MARKETPLACE}'")),
+        "{all}"
+    );
+    // Nothing was written: the file is as the application left it.
+    assert_eq!(fx.live_json(), removed);
 }

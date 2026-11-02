@@ -1413,6 +1413,44 @@ pub fn added_sources(
     Ok(added.into_iter().collect())
 }
 
+/// The trust check of a merge write, at plan time and again at publication: each identity that
+/// `planned` adds to `live` ([`added_sources`]) needs a grant. `grants` is read only when an
+/// identity is added. A missing grant is `E_SOURCE_UNTRUSTED` with each `--trust-origin`
+/// command.
+pub fn check_sources(
+    adapter: &str,
+    live: Option<&[u8]>,
+    planned: &[u8],
+    allow_file: bool,
+    grants: impl FnOnce() -> Result<crate::lock::Grants, Refusal>,
+) -> Result<(), Refusal> {
+    let added = added_sources(adapter, live, planned, allow_file)?;
+    if added.is_empty() {
+        return Ok(());
+    }
+    let grants = grants()?;
+    let missing: Vec<&str> = added
+        .iter()
+        .map(String::as_str)
+        .filter(|id| !grants.trusts(id))
+        .collect();
+    if missing.is_empty() {
+        return Ok(());
+    }
+    let commands: Vec<String> = missing
+        .iter()
+        .map(|id| crate::lock::trust_command(id))
+        .collect();
+    Err(Refusal::new(
+        Code::SourceUntrusted,
+        format!(
+            "the merged file adds the source {} without a grant. Fix: review it, then run {}",
+            missing.join(", "),
+            commands.join("; ")
+        ),
+    ))
+}
+
 /// The identity of a Claude marketplace `source`: `github` is `https://github.com/<repo>`, `git`
 /// maps its url as a git remote, and `url` must already be a canonical `https` origin. A local
 /// marketplace (`directory`, `file`) has no identity.

@@ -417,49 +417,19 @@ fn verdict_for(
         salt.as_deref(),
     ) {
         Ok((_, merge::Outcome::Current)) => MergeVerdict::Current,
-        Ok((m, merge::Outcome::Write)) => {
-            ungranted(&r.adapter, bytes.as_deref(), &m.bytes, store).unwrap_or(MergeVerdict::Write)
-        }
+        // The trust check (docs/adapters.md, "Source identities"): a `current` merge adds nothing.
+        Ok((m, merge::Outcome::Write)) => match merge::check_sources(
+            &r.adapter,
+            bytes.as_deref(),
+            &m.bytes,
+            cfg!(feature = "test-isolation"),
+            || store.read_grants(),
+        ) {
+            Ok(()) => MergeVerdict::Write,
+            Err(e) => refused(&e),
+        },
         Err(e) => refused(&e),
     }
-}
-
-/// The plan-time trust check (docs/sync.md, "Source identities"): a write that adds an external
-/// source identity without a grant is blocked with each `--trust-origin` command. An identity
-/// that the live file already names adds nothing, and a `current` merge is never checked.
-fn ungranted(
-    adapter: &str,
-    live: Option<&[u8]>,
-    planned: &[u8],
-    store: &Store,
-) -> Option<MergeVerdict> {
-    let added = match merge::added_sources(adapter, live, planned, cfg!(feature = "test-isolation"))
-    {
-        Ok(a) if a.is_empty() => return None,
-        Ok(a) => a,
-        Err(e) => return Some(refused(&e)),
-    };
-    let grants = match store.read_grants() {
-        Ok(g) => g,
-        Err(e) => return Some(refused(&e)),
-    };
-    let missing: Vec<&String> = added.iter().filter(|id| !grants.trusts(id)).collect();
-    if missing.is_empty() {
-        return None;
-    }
-    let names: Vec<&str> = missing.iter().map(|id| id.as_str()).collect();
-    let commands: Vec<String> = missing
-        .iter()
-        .map(|id| format!("dfm sync --trust-origin {id}"))
-        .collect();
-    Some(blocked(
-        Code::SourceUntrusted,
-        &format!(
-            "the planned file adds the source {} without a grant. Fix: review it, then run {}",
-            names.join(", "),
-            commands.join("; ")
-        ),
-    ))
 }
 
 #[cfg(test)]

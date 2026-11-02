@@ -3,7 +3,7 @@
 //! tool, a failed command or a stop request is a row.
 
 use dfm_engine::proc::{End, Output, Request, Runner};
-use dfm_model::lock::{Grants, NPM, NPM_REGISTRY, git_identity};
+use dfm_model::lock::{Grants, NPM, NPM_REGISTRY, git_identity, trust_command};
 use dfm_model::state::Status;
 use dfm_model::updater::Updater;
 use dfm_model::{Code, Refusal};
@@ -598,8 +598,9 @@ fn untrusted(ids: Vec<Result<String, String>>, grants: &Grants) -> Vec<String> {
     }
     notes.extend(seen.iter().filter(|id| !grants.trusts(id)).map(|id| {
         format!(
-            "{}: no grant for {id}; review it, then run dfm sync --trust-origin {id}",
-            Code::SourceUntrusted.as_str()
+            "{}: no grant for {id}; review it, then run {}",
+            Code::SourceUntrusted.as_str(),
+            trust_command(id)
         )
     }));
     notes
@@ -1090,7 +1091,7 @@ mod tests {
         assert_eq!(
             r.notes,
             [format!(
-                "E_SOURCE_UNTRUSTED: no grant for {REGISTRY_ID}; review it, then run dfm sync --trust-origin {REGISTRY_ID}"
+                "E_SOURCE_UNTRUSTED: no grant for {REGISTRY_ID}; review it, then run dfm sync --trust-origin '{REGISTRY_ID}'"
             )]
         );
         assert_eq!(
@@ -1116,7 +1117,7 @@ mod tests {
         assert_eq!(
             r.notes,
             [
-                "E_SOURCE_UNTRUSTED: no grant for ssh://git@github.com/evil/agents; review it, then run dfm sync --trust-origin ssh://git@github.com/evil/agents"
+                "E_SOURCE_UNTRUSTED: no grant for ssh://git@github.com/evil/agents; review it, then run dfm sync --trust-origin 'ssh://git@github.com/evil/agents'"
             ]
         );
         assert_eq!(
@@ -1186,7 +1187,7 @@ mod tests {
         assert_eq!(
             r.notes,
             [
-                "E_SOURCE_UNTRUSTED: no grant for npm:skills; review it, then run dfm sync --trust-origin npm:skills"
+                "E_SOURCE_UNTRUSTED: no grant for npm:skills; review it, then run dfm sync --trust-origin 'npm:skills'"
             ]
         );
         assert_eq!(t.log(), "");
@@ -1200,7 +1201,7 @@ mod tests {
         let p = preview(Updater::Skills, &t.env());
         assert!(p.starts_with("blocked: "), "{p}");
         for id in ["npm:skills", "https://github.com/o/skill"] {
-            assert!(p.contains(&format!("dfm sync --trust-origin {id}")), "{p}");
+            assert!(p.contains(&trust_command(id)), "{p}");
         }
         // A source that maps to no identity is untrusted, also with every grant held.
         let t = T::new();
@@ -1260,7 +1261,7 @@ mod tests {
         assert_eq!(
             r.notes,
             [
-                "E_SOURCE_UNTRUSTED: no grant for https://mirror.invalid/o/skill; review it, then run dfm sync --trust-origin https://mirror.invalid/o/skill"
+                "E_SOURCE_UNTRUSTED: no grant for https://mirror.invalid/o/skill; review it, then run dfm sync --trust-origin 'https://mirror.invalid/o/skill'"
             ]
         );
         assert!(preview(Updater::Skills, &t.env()).starts_with("blocked: E_SOURCE_UNTRUSTED"));

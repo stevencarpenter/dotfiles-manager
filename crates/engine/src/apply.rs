@@ -20,7 +20,7 @@ use crate::recover;
 use crate::store::{Store, now_ns};
 use dfm_model::digest::sha256_hex;
 use dfm_model::fold;
-use dfm_model::merge::{Merged, check_foreign, leaf_hashes, salted};
+use dfm_model::merge::{Merged, check_foreign, check_sources, leaf_hashes, salted};
 use dfm_model::plan::{
     Action, Node, Operation, Owned, PackageState, Plan, Request, ServiceState,
     Status as PlanStatus, file_fingerprint, ledger_state, link_fingerprint, node_state,
@@ -1295,6 +1295,18 @@ impl Exec<'_, '_> {
                 let e = Refusal::new(e.code, format!("{rel}: {}", e.detail));
                 Ended::Blocked(e)
             })?;
+            // The plan's trust check again, on the bytes this publication merges into: an
+            // application that removed a marketplace after the plan would have it added back
+            // (docs/adapters.md, "Source identities"). The isolated build (failpoints) allows
+            // `file` origins, as its sync does.
+            check_sources(
+                &op.adapter,
+                read.live.as_deref(),
+                &merged.bytes,
+                cfg!(feature = "failpoints"),
+                || self.run.store.read_grants(),
+            )
+            .map_err(|e| Ended::Blocked(Refusal::new(e.code, format!("{rel}: {}", e.detail))))?;
         }
         Ok(MergeDecision { merged, salt })
     }
