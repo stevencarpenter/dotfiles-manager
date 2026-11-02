@@ -4214,6 +4214,61 @@ fn sync_runs_the_declared_updaters_in_order() {
     assert!(published < s.find("  updated claude").expect(&s), "{s}");
 }
 
+/// DFM-25.C09: `agents` fast-forwards the managed copy with real git (a local registry remote)
+/// and runs the install script from the bound checkout with the copy's path.
+#[test]
+fn sync_fast_forwards_the_agent_registry_and_installs_from_the_bound_root() {
+    let u = Up::new(r#"["agents"]"#);
+    let seed = &u.fx.upstream.seed;
+    let script = "scripts/install-agent-registry.sh";
+    put(
+        seed,
+        script,
+        &format!(
+            "#!/bin/sh\nprintf 'install %s %s\\n' \"$0\" \"$*\" >> {}\n",
+            u.st("log").display()
+        ),
+    );
+    fs::set_permissions(seed.join(script), fs::Permissions::from_mode(0o755)).unwrap();
+    u.fx.upstream.push("add the install script");
+    let registry = Remote::new(u.fake.path(), "registry");
+    put(&registry.seed, "pyproject.toml", "");
+    registry.push("v1");
+    fs::create_dir_all(u.fx.h(".local/share")).unwrap();
+    git(
+        &u.fx.h(".local/share"),
+        &[
+            "clone",
+            "-q",
+            registry.bare.to_str().unwrap(),
+            "agent-registry",
+        ],
+    );
+    let copy = u.fx.h(".local/share/agent-registry");
+    let before = git(&copy, &["rev-parse", "--short", "HEAD"]);
+    put(&registry.seed, "agents/x.md", "x\n");
+    registry.push("v2");
+    let after = git(&registry.bare, &["rev-parse", "--short", "refs/heads/main"]);
+    let o = u.sync(&[]);
+    assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
+    let s = stdout(&o);
+    assert!(
+        s.contains(&format!("  updated agents {before} -> {after}")),
+        "{s}"
+    );
+    assert!(s.contains("  upgrade: updated=1"), "{s}");
+    assert_eq!(git(&copy, &["rev-parse", "--short", "HEAD"]), after);
+    let root = fs::canonicalize(&u.fx.root).unwrap();
+    assert_eq!(
+        u.log(),
+        format!(
+            "install {} {}\n",
+            root.join(script).display(),
+            copy.display()
+        )
+    );
+}
+
 #[test]
 fn a_second_copy_shows_the_version_brew_left() {
     // codex runs before brew; the note is read after both.

@@ -542,6 +542,18 @@ fn agents(mut d: Draft, env: &Env) -> Row {
             ));
             return d.end(Status::Blocked);
         }
+        // No upstream is a precondition, like a missing copy: nothing to fast-forward from.
+        match git(env, &copy, &["rev-parse", "--abbrev-ref", "@{u}"]) {
+            Ok(_) => {}
+            Err((note, true)) => return d.stop((note, true)),
+            Err(_) => {
+                d.notes.push(format!(
+                    "the managed copy {} has no upstream branch; not pulled",
+                    copy.display()
+                ));
+                return d.end(Status::Blocked);
+            }
+        }
         // `fetch` moves only the remote-tracking refs. A local commit that is not on the
         // upstream means the copy diverged: `pull --ff-only` is not tried.
         if let Err(e) = git(env, &copy, &["fetch", "--quiet"]) {
@@ -551,7 +563,7 @@ fn agents(mut d: Draft, env: &Env) -> Row {
             Ok(n) if n == "0" => {}
             Ok(n) => {
                 d.notes.push(format!(
-                    "managed copy {} has {n} commits that are not on its upstream; not pulled",
+                    "managed copy {} has {n} local commits that are not on its upstream; not pulled",
                     copy.display()
                 ));
                 return d.end(Status::Blocked);
@@ -749,7 +761,7 @@ mod tests {
             fs::write(st.join("rev-after"), rev_after).unwrap();
             self.script(
                 &self.bin.join("git"),
-                "case \"$3\" in\n  rev-parse) cat \"$st/rev\" ;;\n  status) cat \"$st/porcelain\" 2>/dev/null || true ;;\n  fetch) exit 0 ;;\n  rev-list) cat \"$st/ahead\" 2>/dev/null || echo 0 ;;\n  pull) cp \"$st/rev-after\" \"$st/rev\" ;;\n  *) exit 64 ;;\nesac",
+                "case \"$3\" in\n  rev-parse) if [ \"$4\" = --abbrev-ref ]; then [ -f \"$st/no-upstream\" ] && exit 128; echo origin/main; else cat \"$st/rev\"; fi ;;\n  status) cat \"$st/porcelain\" 2>/dev/null || true ;;\n  fetch) exit 0 ;;\n  rev-list) cat \"$st/ahead\" 2>/dev/null || echo 0 ;;\n  pull) cp \"$st/rev-after\" \"$st/rev\" ;;\n  *) exit 64 ;;\nesac",
             );
             self.script(
                 &self.dots.join("scripts/install-agent-registry.sh"),
@@ -818,6 +830,7 @@ mod tests {
             [
                 format!("git -C {c} rev-parse --short HEAD"),
                 format!("git -C {c} status --porcelain"),
+                format!("git -C {c} rev-parse --abbrev-ref @{{u}}"),
                 format!("git -C {c} fetch --quiet"),
                 format!("git -C {c} rev-list --count @{{u}}..HEAD"),
                 format!("git -C {c} pull --ff-only --quiet"),
@@ -845,12 +858,31 @@ mod tests {
         let r = run(Updater::Agents, &t.env());
         assert_eq!(r.status, Status::Blocked, "{r:?}");
         assert!(
-            r.notes
-                .iter()
-                .any(|n| n.ends_with("has 2 commits that are not on its upstream; not pulled")),
+            r.notes.iter().any(
+                |n| n.ends_with("has 2 local commits that are not on its upstream; not pulled")
+            ),
             "{r:?}"
         );
         assert!(!t.log().contains(" pull "), "{}", t.log());
+        assert!(!t.log().contains("install-agent-registry"), "{}", t.log());
+    }
+
+    #[test]
+    fn agents_copy_without_an_upstream_is_blocked_before_fetch() {
+        let t = T::new();
+        t.agents("abc1234", "def5678");
+        let copy = t.managed();
+        fs::write(t.root.join("st/no-upstream"), "").unwrap();
+        let r = run(Updater::Agents, &t.env());
+        assert_eq!(r.status, Status::Blocked, "{r:?}");
+        assert_eq!(
+            r.notes,
+            [format!(
+                "the managed copy {} has no upstream branch; not pulled",
+                copy.display()
+            )]
+        );
+        assert!(!t.log().contains(" fetch"), "{}", t.log());
         assert!(!t.log().contains("install-agent-registry"), "{}", t.log());
     }
 
