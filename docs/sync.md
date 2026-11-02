@@ -46,6 +46,7 @@ A grant names one source identity, and a source is trusted when its identity is 
 - The `https` and `ssh` forms of one repository are two identities.
 - `--trust-origin` takes the identity itself, not a form that maps to it. An origin grant goes to `origins`, an `npm:` grant to `packages` (docs/state.md). Both are written with the same rules: under the writer lock, between a `grant-origin` journal intent and its `done` entry, and the run then stops with `E_APPROVAL_REQUIRED`.
 - The lock's sources need origin grants (step 1). The `skills` and `agents` updaters need a grant for each source they fetch (docs/upgrade.md, "Source trust"). A grant is never written because a source is already present on the machine.
+- A configuration operation that adds a source identity to a tool's configuration needs a grant at plan time: the identity is in the planned content and not in the live file. Without the grant the operation is `blocked` with `E_SOURCE_UNTRUSTED` and the `dfm sync --trust-origin <identity>` command, so the run is refused before publication as for any blocked configuration plan. An identity that the live file already names is not checked, and a `current` operation is never blocked. `claude-settings/v1` is the only adapter that reports identities (docs/adapters.md, "Source identities").
 
 ## Approval
 
