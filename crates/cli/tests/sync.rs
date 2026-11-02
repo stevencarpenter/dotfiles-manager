@@ -3794,6 +3794,48 @@ target = ".claude/settings.d/10-local.json"
 source = "files/frag.json"
 "#;
 
+/// A settings merge that declares a plugin marketplace.
+const MERGE_MARKETPLACE: &str = r#"
+[[resources]]
+id = "settings"
+kind = "merge"
+adapter = "claude-settings/v1"
+target = ".claude/settings.json"
+[resources.value.managed.extraKnownMarketplaces.m.source]
+source = "github"
+repo = "o/r"
+"#;
+
+#[test]
+fn an_ungranted_marketplace_blocks_the_configuration_part_with_its_trust_origin_line() {
+    let l = Life::new();
+    l.push_module(MERGE_MARKETPLACE, &[], "add a marketplace");
+    let p = l.preview(&[]);
+    assert_eq!(code(&p), 3, "{}\n{}", stdout(&p), stderr(&p));
+    in_order(
+        &stdout(&p),
+        &[
+            "scope: config",
+            "E_SOURCE_UNTRUSTED life.settings",
+            "dfm sync --trust-origin https://github.com/o/r",
+            "result: blocked",
+        ],
+    );
+    // The run is refused before publication: nothing reaches HOME.
+    let o = l.sync(&digest_of(&p), &[]);
+    assert_eq!(code(&o), 3, "{}\n{}", stdout(&o), stderr(&o));
+    assert!(!l.fx.h(".claude/settings.json").exists());
+    // After the grant, the same configuration publishes.
+    l.fx.trust("https://github.com/o/r");
+    let o = l.approved(&[]);
+    assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
+    assert!(
+        fs::read_to_string(l.fx.h(".claude/settings.json"))
+            .unwrap()
+            .contains("\"o/r\"")
+    );
+}
+
 #[test]
 fn a_hardlinked_merge_fragment_source_the_update_keeps_is_refused_at_preview_as_apply_refuses_it() {
     let l = Life::new();

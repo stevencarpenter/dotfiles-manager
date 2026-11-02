@@ -1354,6 +1354,8 @@ fn a_merge_that_ends_unknown_stays_open_is_never_auto_owned_and_clears_only_by_h
 
 const BASE_MODULE: &str = include_str!("../../../examples/base/modules/claude-base/module.toml");
 const BASE_ID: &str = "claude-base.claude-settings";
+/// The identity of the fixture's `example-marketplace` (docs/adapters.md, "Source identities").
+const BASE_MARKETPLACE: &str = "https://github.com/example-org/example-marketplace";
 
 impl Fx {
     /// Selects the `claude-base` fixture instead of `agents`.
@@ -1368,7 +1370,19 @@ impl Fx {
             ),
         );
         fx.set_profile("\"claude-base\"");
+        fx.grant(BASE_MARKETPLACE);
         fx
+    }
+
+    /// Writes `state/grants.json` with a grant for `origin`, as `dfm sync --trust-origin` would.
+    fn grant(&self, origin: &str) {
+        let p = self.state().join("grants.json");
+        let doc = serde_json::json!({
+            "schema": 2,
+            "origins": [{"origin": origin, "grant_id": "grant-test", "granted_at": "2026-11-02T00:00:00Z"}],
+        });
+        fs::write(&p, serde_json::to_vec(&doc).unwrap()).unwrap();
+        fs::set_permissions(&p, fs::Permissions::from_mode(0o600)).unwrap();
     }
 
     fn base_module(&self, f: impl FnOnce(String) -> String) {
@@ -2692,4 +2706,105 @@ fn an_unreadable_parent_blocks_the_merge_and_is_never_a_create() {
         before,
         "HOME and state"
     );
+}
+
+// ---- plan-time source trust (DFM-25 C04, docs/adapters.md "Source identities") -------------
+
+const MARKETPLACE: &str = "https://github.com/o/r";
+
+impl Fx {
+    /// Declares the managed marketplace `m` with `source` (TOML lines) in the `agents` module.
+    fn marketplace(&self, source: &str) {
+        self.module(|m| {
+            format!("{m}[resources.value.managed.extraKnownMarketplaces.m.source]\n{source}\n")
+        });
+    }
+}
+
+fn status_of(fx: &Fx, id: &str) -> dfm_model::plan::Status {
+    let saved = fx.saved();
+    let op = saved.plan.operations.iter().find(|o| o.resource == id);
+    op.unwrap_or_else(|| panic!("no operation for {id}")).status
+}
+
+#[test]
+fn a_new_marketplace_in_planned_content_blocks_the_operation() {
+    let fx = Fx::new();
+    fx.marketplace("source = \"github\"\nrepo = \"o/r\"");
+    let o = fx.plan();
+    let all = format!("{}{}", text(&o.stdout), stderr(&o));
+    assert_eq!(code(&o), 3, "{all}");
+    assert!(all.contains("E_SOURCE_UNTRUSTED"), "{all}");
+    assert!(
+        all.contains(&format!("dfm sync --trust-origin {MARKETPLACE}")),
+        "{all}"
+    );
+    assert_eq!(code(&fx.apply_bare()), 3);
+    assert!(!fx.settings().exists());
+}
+
+#[test]
+fn a_granted_marketplace_passes() {
+    let fx = Fx::new();
+    fx.marketplace("source = \"github\"\nrepo = \"o/r\"");
+    fx.grant(MARKETPLACE);
+    let o = fx.apply();
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+    assert_eq!(
+        fx.live_json()["extraKnownMarketplaces"]["m"]["source"]["repo"],
+        "o/r"
+    );
+}
+
+#[test]
+fn a_marketplace_already_in_the_live_file_does_not_block_a_current_operation() {
+    // A file the manager wrote under a grant stays current after the grant is gone.
+    let fx = Fx::base();
+    assert_eq!(code(&fx.apply()), 0);
+    fs::remove_file(fx.state().join("grants.json")).unwrap();
+    let o = fx.plan();
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+    assert!(matches!(
+        status_of(&fx, BASE_ID),
+        dfm_model::plan::Status::Current
+    ));
+    // A take-over of a file that already names the marketplace adds nothing, so it needs no
+    // grant either.
+    let fx = Fx::new();
+    fx.marketplace("source = \"github\"\nrepo = \"o/r\"");
+    fx.live(r#"{"extraKnownMarketplaces":{"m":{"source":{"source":"github","repo":"o/r"}}}}"#);
+    let o = fx.apply();
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+}
+
+#[test]
+fn a_hand_added_foreign_marketplace_in_the_live_file_is_kept_by_the_merge() {
+    let fx = Fx::new();
+    let foreign = serde_json::json!({
+        "mine": {"source": {"source": "directory", "path": "/opt/mine"}},
+        "hub": {"source": {"source": "github", "repo": "u/hub"}},
+    });
+    fx.live(&serde_json::json!({ "extraKnownMarketplaces": foreign }).to_string());
+    let o = fx.apply();
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+    let j = fx.live_json();
+    assert_eq!(j["extraKnownMarketplaces"], foreign);
+    assert_eq!(j["outputStyle"], "STE");
+    // No grant was written for the foreign entries.
+    assert!(!fx.state().join("grants.json").exists());
+}
+
+#[test]
+fn a_local_marketplace_in_planned_content_is_refused() {
+    let fx = Fx::new();
+    fx.marketplace("source = \"directory\"\npath = \"/opt/m\"");
+    let o = fx.plan();
+    let all = format!("{}{}", text(&o.stdout), stderr(&o));
+    assert_eq!(code(&o), 3, "{all}");
+    assert!(all.contains("E_SOURCE_UNTRUSTED"), "{all}");
+    assert!(
+        all.contains("a managed marketplace must be a git or URL source"),
+        "{all}"
+    );
+    assert!(!fx.settings().exists());
 }
