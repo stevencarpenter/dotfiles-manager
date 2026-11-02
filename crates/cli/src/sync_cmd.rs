@@ -383,6 +383,22 @@ impl Staged {
 /// Reads the lock at `root`. The isolated build accepts `file` origins for the tests' local
 /// remotes. A `tree` digest is accepted by the parser and not compared by this build, so a lock
 /// that carries one is refused rather than half-checked.
+/// Whether `root` has no sync lock: no lock file, or a valid one without `[[sources]]`. Any
+/// other lock that [`read_lock`] refuses keeps its refusal.
+fn no_sync_sources(root: &Path) -> bool {
+    match fs::symlink_metadata(root.join(LOCK_FILE)) {
+        Err(e) => e.kind() == std::io::ErrorKind::NotFound,
+        Ok(m) => {
+            m.is_file()
+                && m.len() <= LOCK_MAX_BYTES as u64
+                && fs::read(root.join(LOCK_FILE))
+                    .ok()
+                    .and_then(|b| Lock::parse(&b, cfg!(feature = "test-isolation")).ok())
+                    .is_some_and(|l| l.root().is_none())
+        }
+    }
+}
+
 fn read_lock(root: &Path) -> Result<Lock, Refusal> {
     let bytes = read_regular_bounded(
         &root.join(LOCK_FILE),
@@ -1783,10 +1799,13 @@ fn run_inner(
     if let Some(i) = &ctx.isolated {
         writeln!(out, "isolated: true {i}").map_err(w)?;
     }
-    let live_lock = read_lock(&root)?;
-    let root_src = live_lock
-        .root()
-        .ok_or_else(|| untrusted(format!("{LOCK_FILE} declares no root source")))?;
+    // A checkout without a sync lock (none, or one with no [[sources]]) can still take a grant:
+    // a configuration plan names identities too, and `dfm apply` runs from it (docs/sync.md).
+    let live_lock = match read_lock(&root) {
+        Ok(l) => Some(l),
+        Err(_) if !args.trust.is_empty() && no_sync_sources(&root) => None,
+        Err(e) => return Err(e),
+    };
 
     // Trust first, before any fetch (docs/sync.md). A grant is written only for an
     // origin the owner names on the command line, under the writer lock and journaled.
@@ -1821,6 +1840,17 @@ fn run_inner(
             writeln!(out, "granted: {o} {id}").map_err(w)?;
         }
     }
+    let Some(live_lock) = live_lock else {
+        return Err(Refusal::new(
+            Code::ApprovalRequired,
+            format!(
+                "the grant is written; {LOCK_FILE} declares no [[sources]], so sync fetches nothing. Fix: run dfm apply"
+            ),
+        ));
+    };
+    let root_src = live_lock
+        .root()
+        .ok_or_else(|| untrusted(format!("{LOCK_FILE} declares no root source")))?;
     // The root origin is checked here; the nested origins, which the fetched root's lock
     // declares, are checked after the root fetch and before their own.
     if !grants.trusts(&root_src.origin) {

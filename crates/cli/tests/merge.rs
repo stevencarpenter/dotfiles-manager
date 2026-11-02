@@ -2842,3 +2842,44 @@ fn a_marketplace_removed_after_the_plan_is_not_added_back_without_a_grant() {
     // Nothing was written: the file is as the application left it.
     assert_eq!(fx.live_json(), removed);
 }
+
+#[test]
+fn trust_origin_grants_on_an_apply_only_checkout_and_apply_then_runs() {
+    // The checkout has no sync lock: sync fetches nothing, but the grant is still written.
+    let fx = Fx::new();
+    assert!(!fx.root.join("dotfiles-manager.lock").exists());
+    fx.marketplace("source = \"github\"\nrepo = \"o/r\"");
+    assert_eq!(code(&fx.plan()), 3);
+    let o = fx.run(&[
+        "sync",
+        "--root",
+        fx.root_arg(),
+        "--trust-origin",
+        MARKETPLACE,
+    ]);
+    assert_eq!(code(&o), 3, "{}\n{}", stderr(&o), text(&o.stdout));
+    assert!(
+        text(&o.stdout).contains(&format!("granted: {MARKETPLACE} grant-")),
+        "{}",
+        text(&o.stdout)
+    );
+    assert!(stderr(&o).contains("E_APPROVAL_REQUIRED"), "{}", stderr(&o));
+    assert!(stderr(&o).contains("run dfm apply"), "{}", stderr(&o));
+    let o = fx.apply();
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+    assert_eq!(
+        fx.live_json()["extraKnownMarketplaces"]["m"]["source"]["repo"],
+        "o/r"
+    );
+    // A lock with no [[sources]] is the same case.
+    fs::write(fx.root.join("dotfiles-manager.lock"), "schema = 1\n").unwrap();
+    let o = fx.run(&[
+        "sync",
+        "--root",
+        fx.root_arg(),
+        "--trust-origin",
+        "npm:skills",
+    ]);
+    assert_eq!(code(&o), 3, "{}", stderr(&o));
+    assert!(stderr(&o).contains("run dfm apply"), "{}", stderr(&o));
+}
