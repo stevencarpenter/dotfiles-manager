@@ -234,6 +234,16 @@ pub fn check_identity(identity: &str, allow_file: bool) -> Result<(), Refusal> {
     }
 }
 
+/// The command that grants `identity`, as the manager prints it: the identity is one shell word
+/// in single quotes. Quote apostrophes without backslashes, which terminal rendering doubles.
+/// Pasting the command must never expand anything that a source record put in the identity.
+pub fn trust_command(identity: &str) -> String {
+    format!(
+        "dfm sync --trust-origin '{}'",
+        identity.replace('\'', r#"'"'"'"#)
+    )
+}
+
 /// The identity of a source as a tool's own record names it (docs/sync.md, "Source
 /// identities"): a GitHub shorthand `o/r` is `https://github.com/o/r`, the SCP form
 /// `git@host:path.git` is `ssh://git@host/path`, a URL loses a `.git` suffix, and an `npm:`
@@ -716,5 +726,14 @@ ref = "refs/heads/main"
         check_identity("https://github.com/o/r", false).unwrap();
         // --trust-origin takes the identity itself, not a form that maps to it.
         assert!(check_identity("o/r", false).is_err());
+    }
+
+    #[test]
+    fn a_trust_command_single_quotes_the_identity() {
+        assert_eq!(
+            trust_command("npm:skills"),
+            "dfm sync --trust-origin 'npm:skills'"
+        );
+        assert_eq!(trust_command("a'b"), r#"dfm sync --trust-origin 'a'"'"'b'"#);
     }
 }

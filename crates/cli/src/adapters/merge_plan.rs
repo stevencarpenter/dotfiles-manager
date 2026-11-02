@@ -417,7 +417,17 @@ fn verdict_for(
         salt.as_deref(),
     ) {
         Ok((_, merge::Outcome::Current)) => MergeVerdict::Current,
-        Ok((_, merge::Outcome::Write)) => MergeVerdict::Write,
+        // The trust check (docs/adapters.md, "Source identities"): a `current` merge adds nothing.
+        Ok((m, merge::Outcome::Write)) => match merge::check_sources(
+            &r.adapter,
+            bytes.as_deref(),
+            &m.bytes,
+            cfg!(feature = "test-isolation"),
+            || store.read_grants(),
+        ) {
+            Ok(()) => MergeVerdict::Write,
+            Err(e) => refused(&e),
+        },
         Err(e) => refused(&e),
     }
 }

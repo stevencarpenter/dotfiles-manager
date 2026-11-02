@@ -28,7 +28,7 @@ dfm sync [--root <dir>] [--preview] [-y|--yes-plan <digest>] [--allow-disruptive
 - Each `--allow-adopt` id goes to the scope whose plan has that operation. `--allow-disruptive` is accepted as in `apply` (docs/apply.md), but `sync` needs it for nothing. An id that names no planned operation of that kind in any scope is a usage error.
 - `--restart <resource-id>` goes to the services scope, as for `services` (docs/lifecycle.md). It is the restart's approval: no `--allow-disruptive` flag is needed. An id that names no service is a usage error.
 - `--no-upgrade` skips the upgrade step (see "The upgrade step").
-- `--trust-origin <origin>` grants one source identity: a canonical origin or an `npm:<package>` identity (see "Source identities"). It is a usage error with `--preview` (a preview writes nothing) or with `--yes-plan`. A run with it and without `--yes-plan` grants, prints the plan and stops (step 4): one command never both widens trust and publishes.
+- `--trust-origin <origin>` grants one source identity: a canonical origin or an `npm:<package>` identity (see "Source identities"). It is a usage error with `--preview` (a preview writes nothing) or with `--yes-plan`. A run with it and without `--yes-plan` grants, prints the plan and stops (step 4): one command never both widens trust and publishes. A checkout without a sync lock (no `dotfiles-manager.lock`, or one without `[[sources]]`) still takes the grant, under the same writer lock and journal rules: the run writes it, fetches nothing and stops with `E_APPROVAL_REQUIRED`, and `dfm apply` can then run the configuration that needed it. Any other lock that sync refuses is refused before a grant is written. Every `--trust-origin` command that the manager prints quotes the identity as one shell word.
 
 ## Source identities
 
@@ -46,6 +46,7 @@ A grant names one source identity, and a source is trusted when its identity is 
 - The `https` and `ssh` forms of one repository are two identities.
 - `--trust-origin` takes the identity itself, not a form that maps to it. An origin grant goes to `origins`, an `npm:` grant to `packages` (docs/state.md). Both are written with the same rules: under the writer lock, between a `grant-origin` journal intent and its `done` entry, and the run then stops with `E_APPROVAL_REQUIRED`.
 - The lock's sources need origin grants (step 1). The `skills` and `agents` updaters need a grant for each source they fetch (docs/upgrade.md, "Source trust"). A grant is never written because a source is already present on the machine.
+- A configuration operation that adds a source identity to a tool's configuration needs a grant at plan time: the identity is in the planned content and not in the live file. Without the grant the operation is `blocked` with `E_SOURCE_UNTRUSTED` and the `dfm sync --trust-origin <identity>` command, so the run is refused before publication as for any blocked configuration plan. An identity that the live file already names is not checked, and a `current` operation is never blocked. `claude-settings/v1` is the only adapter that reports identities (docs/adapters.md, "Source identities").
 
 ## Approval
 

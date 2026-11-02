@@ -1354,6 +1354,8 @@ fn a_merge_that_ends_unknown_stays_open_is_never_auto_owned_and_clears_only_by_h
 
 const BASE_MODULE: &str = include_str!("../../../examples/base/modules/claude-base/module.toml");
 const BASE_ID: &str = "claude-base.claude-settings";
+/// The identity of the fixture's `example-marketplace` (docs/adapters.md, "Source identities").
+const BASE_MARKETPLACE: &str = "https://github.com/example-org/example-marketplace";
 
 impl Fx {
     /// Selects the `claude-base` fixture instead of `agents`.
@@ -1368,7 +1370,19 @@ impl Fx {
             ),
         );
         fx.set_profile("\"claude-base\"");
+        fx.grant(BASE_MARKETPLACE);
         fx
+    }
+
+    /// Writes `state/grants.json` with a grant for `origin`, as `dfm sync --trust-origin` would.
+    fn grant(&self, origin: &str) {
+        let p = self.state().join("grants.json");
+        let doc = serde_json::json!({
+            "schema": 2,
+            "origins": [{"origin": origin, "grant_id": "grant-test", "granted_at": "2026-11-02T00:00:00Z"}],
+        });
+        fs::write(&p, serde_json::to_vec(&doc).unwrap()).unwrap();
+        fs::set_permissions(&p, fs::Permissions::from_mode(0o600)).unwrap();
     }
 
     fn base_module(&self, f: impl FnOnce(String) -> String) {
@@ -2692,4 +2706,207 @@ fn an_unreadable_parent_blocks_the_merge_and_is_never_a_create() {
         before,
         "HOME and state"
     );
+}
+
+// ---- plan-time source trust (DFM-25 C04, docs/adapters.md "Source identities") -------------
+
+const MARKETPLACE: &str = "https://github.com/o/r";
+
+impl Fx {
+    /// Declares the managed marketplace `m` with `source` (TOML lines) in the `agents` module.
+    fn marketplace(&self, source: &str) {
+        self.module(|m| {
+            format!("{m}[resources.value.managed.extraKnownMarketplaces.m.source]\n{source}\n")
+        });
+    }
+}
+
+fn status_of(fx: &Fx, id: &str) -> dfm_model::plan::Status {
+    let saved = fx.saved();
+    let op = saved.plan.operations.iter().find(|o| o.resource == id);
+    op.unwrap_or_else(|| panic!("no operation for {id}")).status
+}
+
+#[test]
+fn a_new_marketplace_in_planned_content_blocks_the_operation() {
+    let fx = Fx::new();
+    fx.marketplace("source = \"github\"\nrepo = \"o/r\"");
+    let o = fx.plan();
+    let all = format!("{}{}", text(&o.stdout), stderr(&o));
+    assert_eq!(code(&o), 3, "{all}");
+    assert!(all.contains("E_SOURCE_UNTRUSTED"), "{all}");
+    assert!(
+        all.contains(&format!("dfm sync --trust-origin '{MARKETPLACE}'")),
+        "{all}"
+    );
+    assert_eq!(code(&fx.apply_bare()), 3);
+    assert!(!fx.settings().exists());
+}
+
+#[test]
+fn the_printed_trust_command_keeps_shell_syntax_literal() {
+    let fx = Fx::new();
+    let identity = "https://example.com/x'$(printf${IFS}SHELL_EXPANDED)'y";
+    fx.marketplace(&format!("source = \"url\"\nurl = {identity:?}"));
+    let plan = fx.plan();
+    let stdout = text(&plan.stdout);
+    assert_eq!(code(&plan), 3, "{stdout}\n{}", stderr(&plan));
+    let command = stdout
+        .lines()
+        .find_map(|line| line.find("dfm sync --trust-origin ").map(|i| &line[i..]))
+        .expect("a printed trust command");
+    // Replace dfm with an argument recorder, so the printed command grants nothing.
+    let output = Command::new("sh")
+        .args([
+            "-c",
+            &format!("dfm() {{ printf '%s\\n' \"$#\" \"$@\"; }}; {command}"),
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(
+        text(&output.stdout),
+        format!("3\nsync\n--trust-origin\n{identity}\n")
+    );
+}
+
+#[test]
+fn a_granted_marketplace_passes() {
+    let fx = Fx::new();
+    fx.marketplace("source = \"github\"\nrepo = \"o/r\"");
+    fx.grant(MARKETPLACE);
+    let o = fx.apply();
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+    assert_eq!(
+        fx.live_json()["extraKnownMarketplaces"]["m"]["source"]["repo"],
+        "o/r"
+    );
+}
+
+#[test]
+fn a_marketplace_already_in_the_live_file_does_not_block_a_current_operation() {
+    // A file the manager wrote under a grant stays current after the grant is gone.
+    let fx = Fx::base();
+    assert_eq!(code(&fx.apply()), 0);
+    fs::remove_file(fx.state().join("grants.json")).unwrap();
+    let o = fx.plan();
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+    assert!(matches!(
+        status_of(&fx, BASE_ID),
+        dfm_model::plan::Status::Current
+    ));
+    // A take-over of a file that already names the marketplace adds nothing, so it needs no
+    // grant either.
+    let fx = Fx::new();
+    fx.marketplace("source = \"github\"\nrepo = \"o/r\"");
+    fx.live(r#"{"extraKnownMarketplaces":{"m":{"source":{"source":"github","repo":"o/r"}}}}"#);
+    let o = fx.apply();
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+}
+
+#[test]
+fn a_hand_added_foreign_marketplace_in_the_live_file_is_kept_by_the_merge() {
+    let fx = Fx::new();
+    let foreign = serde_json::json!({
+        "mine": {"source": {"source": "directory", "path": "/opt/mine"}},
+        "hub": {"source": {"source": "github", "repo": "u/hub"}},
+    });
+    fx.live(&serde_json::json!({ "extraKnownMarketplaces": foreign }).to_string());
+    let o = fx.apply();
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+    let j = fx.live_json();
+    assert_eq!(j["extraKnownMarketplaces"], foreign);
+    assert_eq!(j["outputStyle"], "STE");
+    // No grant was written for the foreign entries.
+    assert!(!fx.state().join("grants.json").exists());
+}
+
+#[test]
+fn a_local_marketplace_in_planned_content_is_refused() {
+    let fx = Fx::new();
+    fx.marketplace("source = \"directory\"\npath = \"/opt/m\"");
+    let o = fx.plan();
+    let all = format!("{}{}", text(&o.stdout), stderr(&o));
+    assert_eq!(code(&o), 3, "{all}");
+    assert!(all.contains("E_SOURCE_UNTRUSTED"), "{all}");
+    assert!(
+        all.contains("a managed marketplace must be a git or URL source"),
+        "{all}"
+    );
+    assert!(!fx.settings().exists());
+}
+
+#[test]
+fn a_marketplace_removed_after_the_plan_is_not_added_back_without_a_grant() {
+    // The module seeds the marketplace, and the first apply writes it under a grant.
+    let fx = Fx::new();
+    fx.module(|m| {
+        format!("{m}[resources.value.seed.extraKnownMarketplaces.m.source]\nsource = \"github\"\nrepo = \"o/r\"\n")
+    });
+    fx.grant(MARKETPLACE);
+    assert_eq!(code(&fx.apply()), 0);
+    fs::remove_file(fx.state().join("grants.json")).unwrap();
+    // A changed managed value makes the next merge a write. The live file still names the
+    // marketplace, so the plan adds nothing.
+    fx.module(|m| m.replace("outputStyle = \"STE\"", "outputStyle = \"Plain\""));
+    let d = fx.saved().plan_digest;
+    // The application removes the marketplace after the locked re-plan, before the read for
+    // publication. The merge would seed it again, which adds an ungranted identity.
+    let mut removed = serde_json::Value::Null;
+    let o = parked_apply(&fx, "merge-before-read", &d, |fx| {
+        let mut j = fx.live_json();
+        j.as_object_mut().unwrap().remove("extraKnownMarketplaces");
+        fx.live(&j.to_string());
+        removed = j;
+    });
+    let all = format!("{}{}", text(&o.stdout), stderr(&o));
+    assert_ne!(code(&o), 0, "{all}");
+    assert!(all.contains("E_SOURCE_UNTRUSTED"), "{all}");
+    assert!(
+        all.contains(&format!("dfm sync --trust-origin '{MARKETPLACE}'")),
+        "{all}"
+    );
+    // Nothing was written: the file is as the application left it.
+    assert_eq!(fx.live_json(), removed);
+}
+
+#[test]
+fn trust_origin_grants_on_an_apply_only_checkout_and_apply_then_runs() {
+    // The checkout has no sync lock: sync fetches nothing, but the grant is still written.
+    let fx = Fx::new();
+    assert!(!fx.root.join("dotfiles-manager.lock").exists());
+    fx.marketplace("source = \"github\"\nrepo = \"o/r\"");
+    assert_eq!(code(&fx.plan()), 3);
+    let o = fx.run(&[
+        "sync",
+        "--root",
+        fx.root_arg(),
+        "--trust-origin",
+        MARKETPLACE,
+    ]);
+    assert_eq!(code(&o), 3, "{}\n{}", stderr(&o), text(&o.stdout));
+    assert!(
+        text(&o.stdout).contains(&format!("granted: {MARKETPLACE} grant-")),
+        "{}",
+        text(&o.stdout)
+    );
+    assert!(stderr(&o).contains("E_APPROVAL_REQUIRED"), "{}", stderr(&o));
+    assert!(stderr(&o).contains("run dfm apply"), "{}", stderr(&o));
+    let o = fx.apply();
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+    assert_eq!(
+        fx.live_json()["extraKnownMarketplaces"]["m"]["source"]["repo"],
+        "o/r"
+    );
+    // A lock with no [[sources]] is the same case.
+    fs::write(fx.root.join("dotfiles-manager.lock"), "schema = 1\n").unwrap();
+    let o = fx.run(&[
+        "sync",
+        "--root",
+        fx.root_arg(),
+        "--trust-origin",
+        "npm:skills",
+    ]);
+    assert_eq!(code(&o), 3, "{}", stderr(&o));
+    assert!(stderr(&o).contains("run dfm apply"), "{}", stderr(&o));
 }

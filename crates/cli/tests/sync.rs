@@ -377,7 +377,7 @@ fn an_untrusted_origin_is_refused_before_any_fetch_and_a_grant_is_explicit() {
         assert!(stderr(&o).contains("E_SOURCE_UNTRUSTED"), "{}", stderr(&o));
         assert!(stderr(&o).contains("nothing was fetched"), "{}", stderr(&o));
         assert!(
-            stderr(&o).contains(&format!("run sync --trust-origin {}", fx.origin())),
+            stderr(&o).contains(&format!("run dfm sync --trust-origin '{}'", fx.origin())),
             "{}",
             stderr(&o)
         );
@@ -3794,6 +3794,48 @@ target = ".claude/settings.d/10-local.json"
 source = "files/frag.json"
 "#;
 
+/// A settings merge that declares a plugin marketplace.
+const MERGE_MARKETPLACE: &str = r#"
+[[resources]]
+id = "settings"
+kind = "merge"
+adapter = "claude-settings/v1"
+target = ".claude/settings.json"
+[resources.value.managed.extraKnownMarketplaces.m.source]
+source = "github"
+repo = "o/r"
+"#;
+
+#[test]
+fn an_ungranted_marketplace_blocks_the_configuration_part_with_its_trust_origin_line() {
+    let l = Life::new();
+    l.push_module(MERGE_MARKETPLACE, &[], "add a marketplace");
+    let p = l.preview(&[]);
+    assert_eq!(code(&p), 3, "{}\n{}", stdout(&p), stderr(&p));
+    in_order(
+        &stdout(&p),
+        &[
+            "scope: config",
+            "E_SOURCE_UNTRUSTED life.settings",
+            "dfm sync --trust-origin 'https://github.com/o/r'",
+            "result: blocked",
+        ],
+    );
+    // The run is refused before publication: nothing reaches HOME.
+    let o = l.sync(&digest_of(&p), &[]);
+    assert_eq!(code(&o), 3, "{}\n{}", stdout(&o), stderr(&o));
+    assert!(!l.fx.h(".claude/settings.json").exists());
+    // After the grant, the same configuration publishes.
+    l.fx.trust("https://github.com/o/r");
+    let o = l.approved(&[]);
+    assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
+    assert!(
+        fs::read_to_string(l.fx.h(".claude/settings.json"))
+            .unwrap()
+            .contains("\"o/r\"")
+    );
+}
+
 #[test]
 fn a_hardlinked_merge_fragment_source_the_update_keeps_is_refused_at_preview_as_apply_refuses_it() {
     let l = Life::new();
@@ -4313,7 +4355,7 @@ fn sync_fast_forwards_the_agent_registry_and_installs_from_the_bound_root() {
 fn an_ungranted_registry_remote_blocks_agents_before_any_fetch() {
     let u = Up::new(r#"["agents", "claude"]"#);
     let (registry, copy, before) = registry_fixture(&u);
-    let fix = format!("dfm sync --trust-origin {}", registry.origin());
+    let fix = format!("dfm sync --trust-origin '{}'", registry.origin());
     // Publish the install script first, so the listing reaches the source check.
     let o = u.sync(&["--no-upgrade"]);
     assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
@@ -4370,7 +4412,7 @@ fn a_granted_origin_with_an_ungranted_upstream_remote_blocks_agents() {
     assert!(s.contains("  blocked agents "), "{s}");
     assert!(
         s.contains(&format!(
-            "    note: E_SOURCE_UNTRUSTED: no grant for {}; review it, then run dfm sync --trust-origin {}",
+            "    note: E_SOURCE_UNTRUSTED: no grant for {}; review it, then run dfm sync --trust-origin '{}'",
             mirror.origin(),
             mirror.origin()
         )),
@@ -4417,7 +4459,7 @@ fn skills_is_blocked_until_its_record_and_sources_are_granted() {
         "{s}"
     );
     assert!(
-        s.contains("dfm sync --trust-origin https://github.com/o/skill"),
+        s.contains("dfm sync --trust-origin 'https://github.com/o/skill'"),
         "{s}"
     );
     // npm:skills alone is not enough. A grant run with nothing to change still stops for

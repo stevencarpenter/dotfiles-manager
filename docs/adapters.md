@@ -259,6 +259,21 @@ The `fragments:` line appears when the resource declares a fragment directory an
 
 `current` means the merged result equals the live document as JSON (rule 7) and the ledger already records the same salted hash and the same owned entries. A file that is already correct but has no ledger entry is `planned`: apply records ownership and publishes nothing. A deselected resource shows `retire N owned handler(s)`. `doctor` shows a healthy merge output as `N/A` (`D_NA_SENSITIVE`). A foreign edit or a malformed file is the plan's `E_CONFLICT`, shown as `ERROR` ([docs/doctor.md](doctor.md)).
 
+### Source identities
+
+The adapter reports the external sources that its planned content names (`dfm_model::merge::added_sources`, DFM-25 C04). Each entry of `extraKnownMarketplaces` is one source, and its `source` table maps to an identity ([docs/sync.md](sync.md), "Source identities"):
+
+| `source` | Identity |
+| --- | --- |
+| `{"source": "github", "repo": "o/r"}` | `https://github.com/o/r` |
+| `{"source": "git", "url": ...}` | the url as a git remote: `git@host:o/r.git` is `ssh://git@host/o/r`, a `.git` suffix is dropped |
+| `{"source": "url", "url": ...}` | the url itself, which must be a canonical `https` origin |
+| `{"source": "directory"}`, `{"source": "file"}` | none: `E_SOURCE_UNTRUSTED` with the fix "a managed marketplace must be a git or URL source" |
+
+`enabledPlugins` keys are not identities. A marketplace grant covers the plugins it lists, and the manager does not read Claude's marketplace manifests.
+
+The check runs when the plan writes the file (`planned`), on the merged result, so managed values, seeds and fragments all count. An identity is added when the merged result names it and the live file does not. An added identity without a grant blocks the operation with `E_SOURCE_UNTRUSTED`, and the fix is `dfm sync --trust-origin <identity>`. An entry that the live file holds with the same value is not checked: a marketplace the user added by hand, local ones included, is kept by the merge and neither granted nor blocked. A `current` operation is never checked. Apply runs the same check (`merge::check_sources`) again on the bytes it reads under the writer lock for publication, so an entry that the application removed after the plan is not added back without a grant: the operation is `E_SOURCE_UNTRUSTED` and nothing is written. Planning reads `state/grants.json` and writes no grant. The printed command quotes the identity as one shell word (`dfm sync --trust-origin 'https://github.com/o/r'`). Another adapter whose file can name sources adds its own case to `added_sources`.
+
 ### Check-then-act limit
 
 Apply reads the live file again under the writer lock and builds the result from those bytes, so an application edit made after `plan` and before apply is merged, not lost. The file is staged in the same directory (0600, `fsync`) and moved with `renameat`. Immediately before the rename, apply compares the file's identity with the identity captured at the re-read: device, inode, size, modification time and change time. A replaced or rewritten file fails the check with `E_CONFLICT`, the staged file is removed and the live file stays as the application left it. No whole-file hash exists to compare.

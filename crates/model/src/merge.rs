@@ -1366,6 +1366,132 @@ pub fn classify(
     ))
 }
 
+/// The external source identities that a merge adds to its file: named in `planned` and absent
+/// from `live` (docs/adapters.md, "Source identities"). This is the plan-time trust hook: an
+/// adapter whose file can name external sources lists them here, and every other adapter adds
+/// none. An entry that the live file already holds with the same value is never checked, so a
+/// foreign entry that the merge carries over adds nothing. A new entry that maps to no identity
+/// is `E_SOURCE_UNTRUSTED`.
+pub fn added_sources(
+    adapter: &str,
+    live: Option<&[u8]>,
+    planned: &[u8],
+    allow_file: bool,
+) -> Result<Vec<String>, Refusal> {
+    if adapter != ADAPTER {
+        return Ok(Vec::new());
+    }
+    let (live, planned) = (parse_live(live)?, parse_live(Some(planned))?);
+    let marketplaces = |doc: &Map<String, Json>| -> Vec<(String, Json)> {
+        doc.get("extraKnownMarketplaces")
+            .and_then(Json::as_object)
+            .into_iter()
+            .flatten()
+            .map(|(name, m)| (name.clone(), m.get("source").cloned().unwrap_or(Json::Null)))
+            .collect()
+    };
+    let before = marketplaces(&live);
+    let known: BTreeSet<String> = before
+        .iter()
+        .filter_map(|(_, s)| marketplace_identity(s, allow_file).ok())
+        .collect();
+    let mut added = BTreeSet::new();
+    for entry in marketplaces(&planned) {
+        if before.contains(&entry) {
+            continue;
+        }
+        let id = marketplace_identity(&entry.1, allow_file).map_err(|e| {
+            Refusal::new(
+                e.code,
+                format!("extraKnownMarketplaces.{}: {}", entry.0, e.detail),
+            )
+        })?;
+        if !known.contains(&id) {
+            added.insert(id);
+        }
+    }
+    Ok(added.into_iter().collect())
+}
+
+/// The trust check of a merge write, at plan time and again at publication: each identity that
+/// `planned` adds to `live` ([`added_sources`]) needs a grant. `grants` is read only when an
+/// identity is added. A missing grant is `E_SOURCE_UNTRUSTED` with each `--trust-origin`
+/// command.
+pub fn check_sources(
+    adapter: &str,
+    live: Option<&[u8]>,
+    planned: &[u8],
+    allow_file: bool,
+    grants: impl FnOnce() -> Result<crate::lock::Grants, Refusal>,
+) -> Result<(), Refusal> {
+    let added = added_sources(adapter, live, planned, allow_file)?;
+    if added.is_empty() {
+        return Ok(());
+    }
+    let grants = grants()?;
+    let missing: Vec<&str> = added
+        .iter()
+        .map(String::as_str)
+        .filter(|id| !grants.trusts(id))
+        .collect();
+    if missing.is_empty() {
+        return Ok(());
+    }
+    let commands: Vec<String> = missing
+        .iter()
+        .map(|id| crate::lock::trust_command(id))
+        .collect();
+    Err(Refusal::new(
+        Code::SourceUntrusted,
+        format!(
+            "the merged file adds the source {} without a grant. Fix: review it, then run {}",
+            missing.join(", "),
+            commands.join("; ")
+        ),
+    ))
+}
+
+/// The identity of a Claude marketplace `source`: `github` is `https://github.com/<repo>`, `git`
+/// maps its url as a git remote, and `url` must already be a canonical `https` origin. A local
+/// marketplace (`directory`, `file`) has no identity.
+fn marketplace_identity(source: &Json, allow_file: bool) -> Result<String, Refusal> {
+    let untrusted = |d: String| Refusal::new(Code::SourceUntrusted, d);
+    let field = |k: &str| {
+        source
+            .get(k)
+            .and_then(Json::as_str)
+            .ok_or_else(|| untrusted(format!("the {k} of the source is missing or not a string")))
+    };
+    match field("source")? {
+        "github" => {
+            let repo = field("repo")?;
+            let id = format!(
+                "https://github.com/{}",
+                repo.strip_suffix(".git").unwrap_or(repo)
+            );
+            crate::lock::check_origin(&id, false)?;
+            Ok(id)
+        }
+        "git" => crate::lock::git_identity(field("url")?, allow_file),
+        "url" => {
+            let url = field("url")?;
+            if !url.starts_with("https://") {
+                return Err(untrusted(
+                    "a url marketplace must use https. Fix: name an https URL".into(),
+                ));
+            }
+            crate::lock::check_origin(url, false)?;
+            Ok(url.to_string())
+        }
+        "directory" | "file" => Err(untrusted(
+            "a local marketplace has no source identity. Fix: a managed marketplace must be a git or URL source".into(),
+        )),
+        _ => Err(untrusted(
+            "the marketplace source type is not github, git or url. Fix: a managed marketplace must be a git or URL source".into(),
+        )),
+    }
+}
+
 /// The salted hash of a managed view. The salt is a per-machine secret in `state/salt`. The
 /// result may be stored in `ledger.json` and nowhere else (docs/state.md).
 pub fn salted(salt: &[u8], view: &[u8]) -> String {
@@ -2351,6 +2477,77 @@ defaultMode = "auto"
         assert_ne!(
             command_identity("run a\u{a0}b", None),
             command_identity("run a b", None)
+        );
+    }
+
+    fn added(live: Option<&str>, planned: &str) -> Result<Vec<String>, Refusal> {
+        added_sources(ADAPTER, live.map(str::as_bytes), planned.as_bytes(), false)
+    }
+
+    fn market(name: &str, source: &str) -> String {
+        format!(r#"{{"extraKnownMarketplaces":{{"{name}":{{"source":{source}}}}}}}"#)
+    }
+
+    #[test]
+    fn a_new_marketplace_is_an_added_identity_in_canonical_form() {
+        let gh = market("m", r#"{"source":"github","repo":"o/r"}"#);
+        assert_eq!(added(None, &gh).unwrap(), ["https://github.com/o/r"]);
+        let git = market("m", r#"{"source":"git","url":"git@github.com:o/r.git"}"#);
+        assert_eq!(added(None, &git).unwrap(), ["ssh://git@github.com/o/r"]);
+        let url = market(
+            "m",
+            r#"{"source":"url","url":"https://example.com/m.json"}"#,
+        );
+        assert_eq!(added(None, &url).unwrap(), ["https://example.com/m.json"]);
+        // enabledPlugins keys are not identities.
+        let plugins = r#"{"enabledPlugins":{"p@m":true}}"#;
+        assert!(added(None, plugins).unwrap().is_empty());
+        // Another adapter names no source.
+        assert!(
+            added_sources(CODEX_HOOKS, None, gh.as_bytes(), false)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn a_marketplace_already_in_the_live_file_adds_nothing() {
+        let gh = market("m", r#"{"source":"github","repo":"o/r"}"#);
+        assert!(added(Some(&gh), &gh).unwrap().is_empty());
+        // The same identity under another name, or spelled as a git url, adds nothing.
+        let other = market(
+            "n",
+            r#"{"source":"git","url":"https://github.com/o/r.git"}"#,
+        );
+        assert!(added(Some(&gh), &other).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_local_or_unknown_marketplace_is_refused_unless_the_live_file_holds_it() {
+        for source in [
+            r#"{"source":"directory","path":"/tmp/m"}"#,
+            r#"{"source":"file","path":"/tmp/m.json"}"#,
+            r#"{"source":"npm","package":"x"}"#,
+            r#"{"source":"url","url":"http://example.com/m.json"}"#,
+            r#"{"source":"github"}"#,
+        ] {
+            let doc = market("m", source);
+            let e = added(None, &doc).unwrap_err();
+            assert_eq!(e.code, Code::SourceUntrusted, "{source}");
+            assert!(
+                e.detail.starts_with("extraKnownMarketplaces.m: "),
+                "{}",
+                e.detail
+            );
+            // A foreign entry the merge carries over unchanged is not checked.
+            assert!(added(Some(&doc), &doc).unwrap().is_empty(), "{source}");
+        }
+        let e = added(None, &market("m", r#"{"source":"directory","path":"/x"}"#)).unwrap_err();
+        assert!(
+            e.detail
+                .ends_with("Fix: a managed marketplace must be a git or URL source"),
+            "{}",
+            e.detail
         );
     }
 }
