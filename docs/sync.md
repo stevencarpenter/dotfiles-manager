@@ -28,7 +28,24 @@ dfm sync [--root <dir>] [--preview] [-y|--yes-plan <digest>] [--allow-disruptive
 - Each `--allow-adopt` id goes to the scope whose plan has that operation. `--allow-disruptive` is accepted as in `apply` (docs/apply.md), but `sync` needs it for nothing. An id that names no planned operation of that kind in any scope is a usage error.
 - `--restart <resource-id>` goes to the services scope, as for `services` (docs/lifecycle.md). It is the restart's approval: no `--allow-disruptive` flag is needed. An id that names no service is a usage error.
 - `--no-upgrade` skips the upgrade step (see "The upgrade step").
-- `--trust-origin <origin>` grants one canonical origin. It is a usage error with `--preview` (a preview writes nothing) or with `--yes-plan`. A run with it and without `--yes-plan` grants, prints the plan and stops (step 4): one command never both widens trust and publishes.
+- `--trust-origin <origin>` grants one source identity: a canonical origin or an `npm:<package>` identity (see "Source identities"). It is a usage error with `--preview` (a preview writes nothing) or with `--yes-plan`. A run with it and without `--yes-plan` grants, prints the plan and stops (step 4): one command never both widens trust and publishes.
+
+## Source identities
+
+A grant names one source identity, and a source is trusted when its identity is in `state/grants.json`, by exact string equality (DFM-25, C04).
+
+| Source | Example | Identity |
+| --- | --- | --- |
+| A canonical origin | `https://github.com/o/r` | the same string |
+| A GitHub shorthand | `o/r` | `https://github.com/o/r` |
+| A URL with a `.git` suffix | `https://github.com/o/r.git` | `https://github.com/o/r` |
+| The SCP form of an SSH remote | `git@github.com:o/r.git` | `ssh://git@github.com/o/r` |
+| An npm package on the default registry | `npm:skills`, `npm:@scope/name` | the same string |
+
+- A mapped value must then pass the canonical check of step 1. A value that maps to nothing (a local path, another scheme, a version or a registry in an npm name) is `E_SOURCE_UNTRUSTED`, and it is never fetched.
+- The `https` and `ssh` forms of one repository are two identities.
+- `--trust-origin` takes the identity itself, not a form that maps to it. An origin grant goes to `origins`, an `npm:` grant to `packages` (docs/state.md). Both are written with the same rules: under the writer lock, between a `grant-origin` journal intent and its `done` entry, and the run then stops with `E_APPROVAL_REQUIRED`.
+- The lock's sources need origin grants (step 1). The `skills` and `agents` updaters need a grant for each source they fetch (docs/upgrade.md, "Source trust"). A grant is never written because a source is already present on the machine.
 
 ## Approval
 
@@ -195,7 +212,7 @@ A non-empty `.git/info/attributes`, `.git/info/grafts` or `.git/shallow` is also
 | Tracking versus exact | By position: the root source tracks (no `commit`), every nested source is exact (`commit` required). |
 | Which lock names the nested sources | The fetched root revision's lock. The live lock's nested entries are ignored. The root entry must match between the two. |
 | Trust without an interactive prompt | No prompt exists. `--trust-origin <origin>` is the explicit grant: it names the origin, is refused with `--preview`, and `--yes-plan` never grants. A grant may be written for an origin that no lock names yet. It has no effect until a lock names it. |
-| Grant record | `state/grants.json` (state schema 2): `{origin, grant_id, granted_at}`, replaced atomically under the writer lock between a `grant-origin` journal `intent` (op id = the grant id, resource = the origin, no recovery outputs) and its `done` entry. The grants are read again under the lock before an origin is tested or added, so two concurrent `--trust-origin` runs cannot overwrite each other's grant (tested with the `sync-before-grant-lock` failpoint). A run that dies in between leaves the intent open, which `doctor`, `status` and `state recover` report. |
+| Grant record | `state/grants.json` (state schema 2): `{origin, grant_id, granted_at}` in `origins`, and `{package, grant_id, granted_at}` in the optional `packages` for an `npm:` identity, replaced atomically under the writer lock between a `grant-origin` journal `intent` (op id = the grant id, resource = the origin, no recovery outputs) and its `done` entry. The grants are read again under the lock before an origin is tested or added, so two concurrent `--trust-origin` runs cannot overwrite each other's grant (tested with the `sync-before-grant-lock` failpoint). A run that dies in between leaves the intent open, which `doctor`, `status` and `state recover` report. |
 | Staging is a copy of the checkout | The plan digest covers the loaded source tree, which holds the user's dirty and untracked files. A staging tree built from the fetched commit alone would never match the tree after publication. The copy keeps them, so the rehearsal and the plan see exactly what publication produces, and git's own fast-forward rules decide conflicts the same way in both places. A socket or FIFO inside `.git` (a file monitor) is skipped; elsewhere it is `E_SOURCE_UNTRUSTED`. At most 1,000,000 entries. |
 | Approval bound to commits | The sync digest covers each source's `(id, origin, ref, old, new)`, so a `--yes-plan` from a preview is stale after any new upstream commit. The second rehearsal under the lock recomputes it and also compares the per-source commits with the review pass. |
 | A checkout ahead of its ref | Current, not moved back (DFM-70). The digest line has old = new = HEAD. |

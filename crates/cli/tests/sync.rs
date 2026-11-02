@@ -463,6 +463,35 @@ fn an_untrusted_origin_is_refused_before_any_fetch_and_a_grant_is_explicit() {
     );
 }
 
+/// DFM-25 (C04): `--trust-origin` takes an `npm:` identity with the rules of an origin grant.
+#[test]
+fn trust_origin_grants_an_npm_package_and_stops_for_review() {
+    let fx = Fx::new();
+    let o = fx.plain(&["--trust-origin", "npm:skills"]);
+    assert_eq!(code(&o), 3, "{}\n{}", stdout(&o), stderr(&o));
+    assert!(stderr(&o).contains("E_APPROVAL_REQUIRED"), "{}", stderr(&o));
+    assert!(
+        stdout(&o).contains("granted: npm:skills grant-"),
+        "{}",
+        stdout(&o)
+    );
+    let g: serde_json::Value = serde_json::from_str(&fx.grants()).unwrap();
+    assert_eq!(g["packages"][0]["package"], "npm:skills", "{g}");
+    assert_eq!(g["origins"][0]["origin"], fx.origin().as_str(), "{g}");
+    let j = fx.journal();
+    assert!(
+        j.contains(r#""op":"grant-origin""#) && j.contains(r#""resource":"npm:skills""#),
+        "{j}"
+    );
+    // A name that is not an npm package on the default registry is refused and not written.
+    for bad in ["npm:Skills", "npm:skills@1.2.0", "npm:"] {
+        let o = fx.plain(&["--trust-origin", bad]);
+        assert_eq!(code(&o), 3, "{bad}: {}", stderr(&o));
+        assert!(stderr(&o).contains("E_SOURCE_UNTRUSTED"), "{}", stderr(&o));
+    }
+    assert_eq!(fx.grants().matches("npm:").count(), 1, "{}", fx.grants());
+}
+
 #[test]
 fn sync_without_root_uses_the_checkout_bind_recorded() {
     // Fx binds without --root, so the binding records the clone, which holds .git.

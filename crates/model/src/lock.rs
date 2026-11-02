@@ -192,6 +192,79 @@ pub fn check_origin(origin: &str, allow_file: bool) -> Result<(), Refusal> {
     Ok(())
 }
 
+/// The prefix of an npm package identity (docs/sync.md, "Source identities").
+pub const NPM: &str = "npm:";
+
+/// An npm package name on the default registry: `name` or `@scope/name`, lowercase, of
+/// `[a-z0-9._~-]`, no part that starts with `.` or `_`, at most 214 bytes. A version, a tag or
+/// a registry is not part of it.
+fn npm_name(p: &str) -> bool {
+    let part = |c: &str| {
+        !c.is_empty()
+            && !c.starts_with(['.', '_'])
+            && c.bytes().all(|b| {
+                b.is_ascii_lowercase()
+                    || b.is_ascii_digit()
+                    || matches!(b, b'-' | b'.' | b'_' | b'~')
+            })
+    };
+    let name = match p.strip_prefix('@') {
+        Some(scoped) => match scoped.split_once('/') {
+            Some((scope, name)) if part(scope) => name,
+            _ => return false,
+        },
+        None => p,
+    };
+    p.len() <= 214 && part(name)
+}
+
+/// A source identity that `--trust-origin` grants: a canonical origin ([`check_origin`]) or
+/// `npm:<package>`. Anything else is `E_SOURCE_UNTRUSTED`.
+pub fn check_identity(identity: &str, allow_file: bool) -> Result<(), Refusal> {
+    match identity.strip_prefix(NPM) {
+        Some(p) if npm_name(p) => Ok(()),
+        Some(_) => Err(untrusted(format!(
+            "{identity:?} is not npm:<package> with a package name on the default registry"
+        ))),
+        None => check_origin(identity, allow_file),
+    }
+}
+
+/// The identity of a source as a tool's own record names it (docs/sync.md, "Source
+/// identities"): a GitHub shorthand `o/r` is `https://github.com/o/r`, the SCP form
+/// `git@host:path.git` is `ssh://git@host/path`, a URL loses a `.git` suffix, and an `npm:`
+/// identity stays as it is. The result must pass [`check_identity`]. A value that maps to
+/// nothing is `E_SOURCE_UNTRUSTED`.
+pub fn source_identity(value: &str, allow_file: bool) -> Result<String, Refusal> {
+    let unsuffixed = |p: &'_ str| p.strip_suffix(".git").unwrap_or(p).to_string();
+    let shorthand = value.split('/').count() == 2
+        && value.split('/').all(|c| {
+            !c.is_empty()
+                && !c.starts_with(['.', '-'])
+                && c.bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+        });
+    let id = if value.starts_with(NPM) {
+        value.to_string()
+    } else if value.contains("://") {
+        unsuffixed(value)
+    } else if let Some((user_host, path)) = value.split_once(':')
+        && user_host.contains('@')
+        && !user_host.contains('/')
+    {
+        format!("ssh://{user_host}/{}", unsuffixed(path))
+    } else if shorthand {
+        format!("https://github.com/{value}")
+    } else {
+        return Err(untrusted(format!(
+            "source {:?} is not a URL, git@host:path, owner/repo or npm:<package>",
+            mask_userinfo(value)
+        )));
+    };
+    check_identity(&id, allow_file)?;
+    Ok(id)
+}
+
 /// `origin` with any userinfo (the text between `://` and `@` before the first `/`) replaced by
 /// `[redacted]`.
 fn mask_userinfo(origin: &str) -> String {
@@ -306,13 +379,25 @@ pub struct Grant {
     pub granted_at: String,
 }
 
-/// `state/grants.json`: the origins the owner trusts, keyed by canonical origin. A state
-/// document, so it carries the state schema.
+/// One trusted npm package: `package` is the whole `npm:<package>` identity (docs/sync.md).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PackageGrant {
+    pub package: String,
+    pub grant_id: String,
+    pub granted_at: String,
+}
+
+/// `state/grants.json`: the origins and the npm packages the owner trusts, keyed by identity. A
+/// state document, so it carries the state schema. `packages` is optional and left out while
+/// empty, so a file without npm grants stays readable by a manager built before it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Grants {
     pub schema: i64,
     pub origins: Vec<Grant>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub packages: Vec<PackageGrant>,
 }
 
 impl Default for Grants {
@@ -320,6 +405,7 @@ impl Default for Grants {
         Grants {
             schema: crate::state::SCHEMA,
             origins: Vec::new(),
+            packages: Vec::new(),
         }
     }
 }
@@ -329,25 +415,47 @@ impl Grants {
         crate::state::parse("grants.json", bytes)
     }
 
-    /// Exact string equality of the canonical form.
-    pub fn trusts(&self, origin: &str) -> bool {
-        self.origins.iter().any(|g| g.origin == origin)
+    fn existing(&self, identity: &str) -> Option<&str> {
+        if identity.starts_with(NPM) {
+            let mut p = self.packages.iter();
+            p.find(|g| g.package == identity)
+                .map(|g| g.grant_id.as_str())
+        } else {
+            let mut o = self.origins.iter();
+            o.find(|g| g.origin == identity)
+                .map(|g| g.grant_id.as_str())
+        }
     }
 
-    /// Adds a grant for `origin` unless one exists. Returns the grant id.
-    pub fn grant(&mut self, origin: &str, at: &str) -> String {
-        if let Some(g) = self.origins.iter().find(|g| g.origin == origin) {
-            return g.grant_id.clone();
+    /// Exact string equality of the identity: a canonical origin, or `npm:<package>`.
+    pub fn trusts(&self, identity: &str) -> bool {
+        self.existing(identity).is_some()
+    }
+
+    /// Adds a grant for `identity` unless one exists: an `npm:` identity to `packages`, an
+    /// origin to `origins`. Returns the grant id.
+    pub fn grant(&mut self, identity: &str, at: &str) -> String {
+        if let Some(id) = self.existing(identity) {
+            return id.to_string();
         }
         let id = format!(
             "grant-{}",
-            &sha256_hex(format!("{origin}\n{at}").as_bytes())[..16]
+            &sha256_hex(format!("{identity}\n{at}").as_bytes())[..16]
         );
-        self.origins.push(Grant {
-            origin: origin.into(),
-            grant_id: id.clone(),
-            granted_at: at.into(),
-        });
+        let (grant_id, granted_at) = (id.clone(), at.to_string());
+        if identity.starts_with(NPM) {
+            self.packages.push(PackageGrant {
+                package: identity.into(),
+                grant_id,
+                granted_at,
+            });
+        } else {
+            self.origins.push(Grant {
+                origin: identity.into(),
+                grant_id,
+                granted_at,
+            });
+        }
         id
     }
 }
@@ -494,5 +602,83 @@ ref = "refs/heads/main"
         assert!(!g.trusts("https://example.invalid/org/Repo"));
         let bytes = crate::state::canonical(&g).unwrap();
         assert_eq!(Grants::parse(&bytes).unwrap(), g);
+        // Without npm grants the file has no `packages` key, as before it existed.
+        assert!(!String::from_utf8(bytes).unwrap().contains("packages"));
+    }
+
+    #[test]
+    fn an_npm_grant_round_trips_in_packages() {
+        let mut g = Grants::default();
+        let id = g.grant("npm:skills", "2026-11-02T00:00:00Z");
+        assert!(g.trusts("npm:skills"));
+        assert!(!g.trusts("npm:skill"));
+        assert!(g.origins.is_empty());
+        assert_eq!(g.packages[0].package, "npm:skills");
+        assert_eq!(g.grant("npm:skills", "2026-11-03T00:00:00Z"), id);
+        let bytes = crate::state::canonical(&g).unwrap();
+        let text = String::from_utf8(bytes.clone()).unwrap();
+        assert!(text.contains(r#""package":"npm:skills""#), "{text}");
+        assert_eq!(Grants::parse(&bytes).unwrap(), g);
+    }
+
+    #[test]
+    fn a_grants_file_without_packages_still_parses() {
+        let old = br#"{"origins":[{"grant_id":"grant-0123456789abcdef","granted_at":"2026-10-19T00:00:00Z","origin":"https://example.invalid/org/repo"}],"schema":2}"#;
+        let g = Grants::parse(old).unwrap();
+        assert!(g.trusts("https://example.invalid/org/repo"));
+        assert!(g.packages.is_empty());
+    }
+
+    #[test]
+    fn sources_map_to_their_identity() {
+        for (value, id) in [
+            ("github/gh-stack", "https://github.com/github/gh-stack"),
+            (
+                "https://github.com/github/gh-stack.git",
+                "https://github.com/github/gh-stack",
+            ),
+            (
+                "https://example.com/marketplace.json",
+                "https://example.com/marketplace.json",
+            ),
+            (
+                "git@github.com:stevencarpenter/agents.git",
+                "ssh://git@github.com/stevencarpenter/agents",
+            ),
+            (
+                "ssh://git@example.invalid:2222/org/repo",
+                "ssh://git@example.invalid:2222/org/repo",
+            ),
+            ("npm:skills", "npm:skills"),
+            (
+                "npm:@dietrichgebert/ponytail",
+                "npm:@dietrichgebert/ponytail",
+            ),
+        ] {
+            assert_eq!(source_identity(value, false).unwrap(), id, "{value}");
+        }
+        for bad in [
+            "./local/path",
+            "/abs/path",
+            "o/r/extra",
+            "skills",
+            "http://example.invalid/org/repo",
+            "me@github.com:org/repo",
+            "git@GitHub.com:org/repo",
+            "npm:Skills",
+            "npm:skills@1.2.0",
+            "npm:@scope",
+            "npm:",
+        ] {
+            assert_eq!(
+                source_identity(bad, false).unwrap_err().code,
+                Code::SourceUntrusted,
+                "{bad}"
+            );
+        }
+        check_identity("npm:skills", false).unwrap();
+        check_identity("https://github.com/o/r", false).unwrap();
+        // --trust-origin takes the identity itself, not a form that maps to it.
+        assert!(check_identity("o/r", false).is_err());
     }
 }

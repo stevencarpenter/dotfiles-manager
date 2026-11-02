@@ -23,7 +23,7 @@ use dfm_engine::{
 use dfm_model::binding::Binding;
 use dfm_model::digest::sha256_hex;
 use dfm_model::display::{visible, visible_for_paste};
-use dfm_model::lock::{Grants, Lock, LockSource, MAX_BYTES as LOCK_MAX_BYTES, check_origin};
+use dfm_model::lock::{Grants, Lock, LockSource, MAX_BYTES as LOCK_MAX_BYTES, check_identity};
 use dfm_model::plan::{Action, Blocker, Ownership, Plan, Scope, Status as PlanStatus};
 use dfm_model::resolve::{Resolved, resolve};
 use dfm_model::state::{self, Class, JournalEntry, Phase, Recovery, rfc3339};
@@ -67,7 +67,8 @@ const GIT_SETTINGS: [&str; 14] = [
 
 pub struct Args {
     apply: apply_cmd::Args,
-    /// Origins to grant before the fetch (`--trust-origin`), each named in the lock.
+    /// Identities to grant before the fetch (`--trust-origin`): canonical origins and
+    /// `npm:<package>` identities (docs/sync.md, "Source identities").
     trust: Vec<String>,
     /// `--restart <resource-id>`, for the services scope.
     restart: BTreeSet<String>,
@@ -1793,7 +1794,7 @@ fn run_inner(
     let mut grants = readable.read_grants()?;
     drop(readable);
     for o in &args.trust {
-        check_origin(o, cfg!(feature = "test-isolation"))?;
+        check_identity(o, cfg!(feature = "test-isolation"))?;
     }
     if !args.trust.is_empty() {
         state_cmd::fail_from_env()?.hit("sync-before-grant-lock")?;
