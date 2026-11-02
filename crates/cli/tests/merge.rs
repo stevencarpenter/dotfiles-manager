@@ -2744,6 +2744,33 @@ fn a_new_marketplace_in_planned_content_blocks_the_operation() {
 }
 
 #[test]
+fn the_printed_trust_command_keeps_shell_syntax_literal() {
+    let fx = Fx::new();
+    let identity = "https://example.com/x'$(printf${IFS}SHELL_EXPANDED)'y";
+    fx.marketplace(&format!("source = \"url\"\nurl = {identity:?}"));
+    let plan = fx.plan();
+    let stdout = text(&plan.stdout);
+    assert_eq!(code(&plan), 3, "{stdout}\n{}", stderr(&plan));
+    let command = stdout
+        .lines()
+        .find_map(|line| line.find("dfm sync --trust-origin ").map(|i| &line[i..]))
+        .expect("a printed trust command");
+    // Replace dfm with an argument recorder, so the printed command grants nothing.
+    let output = Command::new("sh")
+        .args([
+            "-c",
+            &format!("dfm() {{ printf '%s\\n' \"$#\" \"$@\"; }}; {command}"),
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(
+        text(&output.stdout),
+        format!("3\nsync\n--trust-origin\n{identity}\n")
+    );
+}
+
+#[test]
 fn a_granted_marketplace_passes() {
     let fx = Fx::new();
     fx.marketplace("source = \"github\"\nrepo = \"o/r\"");

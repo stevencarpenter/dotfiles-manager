@@ -235,12 +235,12 @@ pub fn check_identity(identity: &str, allow_file: bool) -> Result<(), Refusal> {
 }
 
 /// The command that grants `identity`, as the manager prints it: the identity is one shell word
-/// in single quotes (a `'` inside it is written `'\''`), so pasting the command never expands
-/// anything that a source record put in the identity.
+/// in single quotes. Quote apostrophes without backslashes, which terminal rendering doubles.
+/// Pasting the command must never expand anything that a source record put in the identity.
 pub fn trust_command(identity: &str) -> String {
     format!(
         "dfm sync --trust-origin '{}'",
-        identity.replace('\'', r"'\''")
+        identity.replace('\'', r#"'"'"'"#)
     )
 }
 
@@ -734,6 +734,6 @@ ref = "refs/heads/main"
             trust_command("npm:skills"),
             "dfm sync --trust-origin 'npm:skills'"
         );
-        assert_eq!(trust_command("a'b"), r"dfm sync --trust-origin 'a'\''b'");
+        assert_eq!(trust_command("a'b"), r#"dfm sync --trust-origin 'a'"'"'b'"#);
     }
 }
