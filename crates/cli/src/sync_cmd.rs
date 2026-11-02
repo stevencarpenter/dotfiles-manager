@@ -1871,7 +1871,7 @@ fn run_inner(
     // The updaters, a blocked one included, are listed before any part runs (DFM-31.C02).
     let updaters = &loaded.resolved.updaters;
     if args.apply.preview || (args.upgrade && !updaters.is_empty()) {
-        upgrade_preview(ctx, &sys, args, updaters, out)?;
+        upgrade_preview(ctx, &sys, &root, args, updaters, out)?;
     }
     if args.apply.preview {
         return Ok(());
@@ -2188,11 +2188,12 @@ fn status_name(s: state::Status) -> String {
         .unwrap_or_default()
 }
 
-/// The updater environment: the provider runner and HOME.
-fn updater_env<'a>(ctx: &'a Ctx, runner: &'a Runner) -> updater::Env<'a> {
+/// The updater environment: the provider runner, HOME and the bound checkout.
+fn updater_env<'a>(ctx: &'a Ctx, runner: &'a Runner, root: &'a Path) -> updater::Env<'a> {
     updater::Env {
         provider: runner,
         home: ctx.platform.home(),
+        root,
         timeouts: updater::Timeouts::DEFAULT,
     }
 }
@@ -2201,6 +2202,7 @@ fn updater_env<'a>(ctx: &'a Ctx, runner: &'a Runner) -> updater::Env<'a> {
 fn upgrade_preview(
     ctx: &Ctx,
     sys: &Sys,
+    root: &Path,
     args: &Args,
     updaters: &[Updater],
     out: &mut dyn Write,
@@ -2214,7 +2216,7 @@ fn upgrade_preview(
         return writeln!(out, "upgrade: none declared in the profile").map_err(w);
     }
     let runner = ctx.runner(sys);
-    let env = updater_env(ctx, &runner);
+    let env = updater_env(ctx, &runner, root);
     writeln!(out, "{}", paint::label(ctx.color, "upgrade:")).map_err(w)?;
     for u in updaters {
         writeln!(
@@ -2284,7 +2286,7 @@ fn upgrade(
     let started = now_ns()?;
     let mut runner = ctx.runner(sys);
     runner.detach = true;
-    let env = updater_env(ctx, &runner);
+    let env = updater_env(ctx, &runner, root);
     writeln!(out, "{}", paint::label(ctx.color, "upgrade:")).map_err(w)?;
     let mut ops = Vec::new();
     for u in &updaters {

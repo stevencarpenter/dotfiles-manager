@@ -470,7 +470,7 @@ fn updaters(file: &str, t: &Table) -> Result<Vec<Updater>, ResolveError> {
             invalid(
                 file,
                 format!("unknown updater `{name}`"),
-                "use one of: brew, claude, codex, opencode, skills",
+                "use one of: agents, brew, claude, codex, opencode, skills",
             )
             .field(at.clone())
             .rejected("string")

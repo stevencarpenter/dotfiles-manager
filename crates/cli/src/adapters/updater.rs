@@ -28,6 +28,9 @@ pub struct Env<'a> {
     /// The provider runner (`brew`, `mise`).
     pub provider: &'a Runner,
     pub home: &'a Path,
+    /// The bound checkout (`--root` or the binding's root), which holds
+    /// `scripts/install-agent-registry.sh`.
+    pub root: &'a Path,
     pub timeouts: Timeouts,
 }
 
@@ -48,7 +51,7 @@ fn owner_dir(u: Updater) -> Option<&'static str> {
         Updater::Claude => Some(".local/bin"),
         Updater::Codex => Some(".codex/packages/standalone/current/bin"),
         Updater::Opencode => Some(".opencode/bin"),
-        Updater::Brew | Updater::Skills => None,
+        Updater::Agents | Updater::Brew | Updater::Skills => None,
     }
 }
 
@@ -169,6 +172,7 @@ pub fn run(u: Updater, env: &Env) -> Row {
         return d.end(Status::Pending);
     }
     match u {
+        Updater::Agents => agents(d, env),
         Updater::Brew => brew(d, env),
         Updater::Skills => {
             // As the preview says: a missing `mise` is blocked, not a failed command.
@@ -281,7 +285,7 @@ pub fn second_copies(u: Updater, env: &Env) -> Vec<String> {
         Updater::Claude => (None, Some("claude-code")),
         Updater::Codex => (Some("codex"), Some("codex")),
         Updater::Opencode => (Some("opencode"), None),
-        Updater::Brew | Updater::Skills => (None, None),
+        Updater::Agents | Updater::Brew | Updater::Skills => (None, None),
     };
     let checks = formula
         .map(|n| ("formula", args(&["list", "--versions", n])))
@@ -448,9 +452,159 @@ fn brew(mut d: Draft, env: &Env) -> Row {
     }
 }
 
+/// The agent registry's working copy (never pulled) and managed copy (fast-forwarded), relative
+/// to HOME.
+const AGENTS_WORKING: &str = "projects/agents";
+const AGENTS_MANAGED: &str = ".local/share/agent-registry";
+const AGENTS_INSTALL: &str = "install-agent-registry.sh";
+
+/// The copy to install from: the working copy when it holds `pyproject.toml`, else the managed
+/// copy. `true` marks the working copy.
+fn agents_copy(env: &Env) -> (std::path::PathBuf, bool) {
+    let working = env.home.join(AGENTS_WORKING);
+    if working.join("pyproject.toml").is_file() {
+        (working, true)
+    } else {
+        (env.home.join(AGENTS_MANAGED), false)
+    }
+}
+
+/// The runner for the install script: the bound checkout's `scripts` first, then the provider
+/// path. `Err` is the blocked reason.
+fn agents_runner(env: &Env) -> Result<Runner, String> {
+    let dir = env.root.join("scripts");
+    let path = dir.join(AGENTS_INSTALL);
+    if std::fs::symlink_metadata(&path).is_err() {
+        return Err(format!("no install script at {}", path.display()));
+    }
+    let mut r = env.provider.clone();
+    r.search_path.insert(0, dir);
+    r.resolve(AGENTS_INSTALL).map_err(|e| e.detail)?;
+    Ok(r)
+}
+
+/// `git -C <dir> <a>`; its trimmed standard output.
+fn git(env: &Env, dir: &Path, a: &[&str]) -> Result<String, (String, bool)> {
+    let mut all = args(&["-C", &dir.display().to_string()]);
+    all.extend(args(a));
+    let out = call(env.provider, "git", &all, &[], env.timeouts.short)?;
+    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+/// The agent registry: install from the working copy as it is, or fast-forward the managed copy
+/// and install from it. Nothing here merges, resets or clones: a missing, dirty or diverged
+/// managed copy is `blocked` before any change.
+fn agents(mut d: Draft, env: &Env) -> Row {
+    let (copy, working) = agents_copy(env);
+    let r = match agents_runner(env) {
+        Ok(r) => r,
+        Err(why) => {
+            d.notes.push(why);
+            return d.end(Status::Blocked);
+        }
+    };
+    if let Err(e) = env.provider.resolve("git") {
+        d.notes.push(e.detail);
+        return d.end(Status::Blocked);
+    }
+    if !working && std::fs::symlink_metadata(copy.join(".git")).is_err() {
+        d.notes.push(format!(
+            "no managed copy at {}; clone it by hand",
+            copy.display()
+        ));
+        return d.end(Status::Blocked);
+    }
+    // Read-only checks first: the revision and the dirty state.
+    match git(env, &copy, &["rev-parse", "--short", "HEAD"]) {
+        Ok(v) => d.before = Some(v),
+        Err(e) => return d.stop(e),
+    }
+    let dirty = match git(env, &copy, &["status", "--porcelain"]) {
+        Ok(s) => !s.is_empty(),
+        Err(e) => return d.stop(e),
+    };
+    if working {
+        d.notes.push(format!(
+            "working copy {}{}; not pulled",
+            copy.display(),
+            if dirty {
+                " has uncommitted changes"
+            } else {
+                ""
+            }
+        ));
+        d.after = d.before.clone();
+    } else {
+        if dirty {
+            d.notes.push(format!(
+                "managed copy {} has uncommitted changes; not pulled",
+                copy.display()
+            ));
+            return d.end(Status::Blocked);
+        }
+        // `fetch` moves only the remote-tracking refs. A local commit that is not on the
+        // upstream means the copy diverged: `pull --ff-only` is not tried.
+        if let Err(e) = git(env, &copy, &["fetch", "--quiet"]) {
+            return d.stop(e);
+        }
+        match git(env, &copy, &["rev-list", "--count", "@{u}..HEAD"]) {
+            Ok(n) if n == "0" => {}
+            Ok(n) => {
+                d.notes.push(format!(
+                    "managed copy {} has {n} commits that are not on its upstream; not pulled",
+                    copy.display()
+                ));
+                return d.end(Status::Blocked);
+            }
+            Err(e) => return d.stop(e),
+        }
+        if let Err(e) = git(env, &copy, &["pull", "--ff-only", "--quiet"]) {
+            return d.stop(e);
+        }
+        match git(env, &copy, &["rev-parse", "--short", "HEAD"]) {
+            Ok(v) => d.after = Some(v),
+            Err(e) => return d.stop(e),
+        }
+    }
+    if let Err(e) = call(
+        &r,
+        AGENTS_INSTALL,
+        &[copy.display().to_string()],
+        &[],
+        env.timeouts.short,
+    ) {
+        return d.stop(e);
+    }
+    let changed = d.before != d.after;
+    d.end(if changed {
+        Status::Updated
+    } else {
+        Status::Current
+    })
+}
+
 /// What `run` would do, without running anything.
 pub fn preview(u: Updater, env: &Env) -> String {
     match u {
+        Updater::Agents => {
+            let (copy, working) = agents_copy(env);
+            match agents_runner(env) {
+                Ok(r) => format!(
+                    "would {} {} and run {} ({})",
+                    if working {
+                        "install from the working copy"
+                    } else {
+                        "fast-forward"
+                    },
+                    copy.display(),
+                    AGENTS_INSTALL,
+                    r.resolve(AGENTS_INSTALL)
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_default()
+                ),
+                Err(why) => format!("blocked: {why}"),
+            }
+        }
         Updater::Brew => match env.provider.resolve("brew") {
             Ok(p) => format!(
                 "would run brew update, brew upgrade of every outdated formula and cask ({})",
@@ -486,6 +640,8 @@ mod tests {
     struct T {
         root: PathBuf,
         home: PathBuf,
+        /// The bound checkout.
+        dots: PathBuf,
         bin: PathBuf,
         runner: Runner,
     }
@@ -515,6 +671,7 @@ mod tests {
                 detach: false,
             };
             T {
+                dots: root.join("dots"),
                 root,
                 home,
                 bin,
@@ -549,6 +706,7 @@ mod tests {
             Env {
                 provider: &self.runner,
                 home: &self.home,
+                root: &self.dots,
                 timeouts: Timeouts::DEFAULT,
             }
         }
@@ -578,6 +736,202 @@ mod tests {
                 "case \"$1\" in\n  update) exit 0 ;;\n  outdated) cat \"$st/outdated\" ;;\n  upgrade) cp \"$st/after\" \"$st/outdated\"; exit $(cat \"$st/upgrade-exit$2\" 2>/dev/null || cat \"$st/upgrade-exit\" 2>/dev/null || echo 0) ;;\n  list) [ -f \"$st/list-$4\" ] && cat \"$st/list-$4\" || exit 1 ;;\n  *) exit 64 ;;\nesac",
             );
         }
+    }
+
+    impl T {
+        /// `git` whose `rev-parse` prints `st/rev`, `status` prints `st/porcelain`, `rev-list`
+        /// prints `st/ahead` (0 when absent) and `pull` copies `st/rev-after` over `st/rev`; the
+        /// bound checkout's install script exits with `st/install-exit` (0 when absent).
+        fn agents(&self, rev: &str, rev_after: &str) {
+            let st = self.root.join("st");
+            fs::create_dir_all(&st).unwrap();
+            fs::write(st.join("rev"), rev).unwrap();
+            fs::write(st.join("rev-after"), rev_after).unwrap();
+            self.script(
+                &self.bin.join("git"),
+                "case \"$3\" in\n  rev-parse) cat \"$st/rev\" ;;\n  status) cat \"$st/porcelain\" 2>/dev/null || true ;;\n  fetch) exit 0 ;;\n  rev-list) cat \"$st/ahead\" 2>/dev/null || echo 0 ;;\n  pull) cp \"$st/rev-after\" \"$st/rev\" ;;\n  *) exit 64 ;;\nesac",
+            );
+            self.script(
+                &self.dots.join("scripts/install-agent-registry.sh"),
+                "echo 'secret detail' >&2; exit $(cat \"$st/install-exit\" 2>/dev/null || echo 0)",
+            );
+        }
+
+        fn managed(&self) -> PathBuf {
+            let copy = self.home.join(".local/share/agent-registry");
+            fs::create_dir_all(copy.join(".git")).unwrap();
+            copy
+        }
+
+        /// The logged calls without the environment part.
+        fn calls(&self) -> Vec<String> {
+            self.log()
+                .lines()
+                .map(|l| l.split(" | ").next().unwrap().to_string())
+                .collect()
+        }
+    }
+
+    #[test]
+    fn agents_working_copy_is_not_pulled_and_reports_dirty() {
+        let t = T::new();
+        t.agents("abc1234", "def5678");
+        let working = t.home.join("projects/agents");
+        fs::create_dir_all(&working).unwrap();
+        fs::write(working.join("pyproject.toml"), "").unwrap();
+        // A managed copy exists too; the working copy wins.
+        t.managed();
+        fs::write(t.root.join("st/porcelain"), " M agents/x.md\n").unwrap();
+        let r = run(Updater::Agents, &t.env());
+        assert_eq!(r.status, Status::Current, "{r:?}");
+        assert_eq!(r.before.as_deref(), Some("abc1234"));
+        assert_eq!(r.after.as_deref(), Some("abc1234"));
+        let w = working.display();
+        assert_eq!(
+            r.notes,
+            [format!(
+                "working copy {w} has uncommitted changes; not pulled"
+            )]
+        );
+        assert_eq!(
+            t.calls(),
+            [
+                format!("git -C {w} rev-parse --short HEAD"),
+                format!("git -C {w} status --porcelain"),
+                format!("install-agent-registry.sh {w}"),
+            ]
+        );
+    }
+
+    #[test]
+    fn agents_managed_copy_is_fast_forwarded_and_installed() {
+        let t = T::new();
+        t.agents("abc1234", "def5678");
+        let copy = t.managed();
+        let r = run(Updater::Agents, &t.env());
+        assert_eq!(r.status, Status::Updated, "{r:?}");
+        assert_eq!(r.before.as_deref(), Some("abc1234"));
+        assert_eq!(r.after.as_deref(), Some("def5678"));
+        let c = copy.display();
+        assert_eq!(
+            t.calls(),
+            [
+                format!("git -C {c} rev-parse --short HEAD"),
+                format!("git -C {c} status --porcelain"),
+                format!("git -C {c} fetch --quiet"),
+                format!("git -C {c} rev-list --count @{{u}}..HEAD"),
+                format!("git -C {c} pull --ff-only --quiet"),
+                format!("git -C {c} rev-parse --short HEAD"),
+                format!("install-agent-registry.sh {c}"),
+            ]
+        );
+    }
+
+    #[test]
+    fn agents_managed_copy_without_new_commits_is_current() {
+        let t = T::new();
+        t.agents("abc1234", "abc1234");
+        t.managed();
+        let r = run(Updater::Agents, &t.env());
+        assert_eq!(r.status, Status::Current, "{r:?}");
+    }
+
+    #[test]
+    fn agents_diverged_copy_is_blocked_and_not_pulled() {
+        let t = T::new();
+        t.agents("abc1234", "def5678");
+        t.managed();
+        fs::write(t.root.join("st/ahead"), "2\n").unwrap();
+        let r = run(Updater::Agents, &t.env());
+        assert_eq!(r.status, Status::Blocked, "{r:?}");
+        assert!(
+            r.notes
+                .iter()
+                .any(|n| n.ends_with("has 2 commits that are not on its upstream; not pulled")),
+            "{r:?}"
+        );
+        assert!(!t.log().contains(" pull "), "{}", t.log());
+        assert!(!t.log().contains("install-agent-registry"), "{}", t.log());
+    }
+
+    #[test]
+    fn agents_dirty_managed_copy_is_blocked_and_not_fetched() {
+        let t = T::new();
+        t.agents("abc1234", "def5678");
+        t.managed();
+        fs::write(t.root.join("st/porcelain"), "?? stray\n").unwrap();
+        let r = run(Updater::Agents, &t.env());
+        assert_eq!(r.status, Status::Blocked, "{r:?}");
+        assert!(
+            r.notes
+                .iter()
+                .any(|n| n.ends_with("has uncommitted changes; not pulled")),
+            "{r:?}"
+        );
+        assert!(!t.log().contains(" fetch"), "{}", t.log());
+        assert!(!t.log().contains("install-agent-registry"), "{}", t.log());
+    }
+
+    #[test]
+    fn agents_missing_copy_is_blocked_and_never_cloned() {
+        let t = T::new();
+        t.agents("abc1234", "def5678");
+        let r = run(Updater::Agents, &t.env());
+        assert_eq!(r.status, Status::Blocked, "{r:?}");
+        let want = t.home.join(".local/share/agent-registry");
+        assert_eq!(
+            r.notes,
+            [format!(
+                "no managed copy at {}; clone it by hand",
+                want.display()
+            )]
+        );
+        assert_eq!(t.log(), "");
+    }
+
+    #[test]
+    fn agents_failed_install_is_failed_and_withholds_stderr() {
+        let t = T::new();
+        t.agents("abc1234", "def5678");
+        t.managed();
+        fs::write(t.root.join("st/install-exit"), "3").unwrap();
+        let r = run(Updater::Agents, &t.env());
+        assert_eq!(r.status, Status::Failed, "{r:?}");
+        let note = r.notes.join("\n");
+        assert!(note.contains("install-agent-registry.sh"), "{note}");
+        assert!(note.contains("exited 3"), "{note}");
+        assert!(!note.contains("secret detail"), "{note}");
+        // The pull happened before the install; the row still shows it.
+        assert_eq!(r.after.as_deref(), Some("def5678"));
+    }
+
+    #[test]
+    fn agents_without_the_install_script_is_blocked_before_any_git() {
+        let t = T::new();
+        t.agents("abc1234", "def5678");
+        t.managed();
+        fs::remove_file(t.dots.join("scripts/install-agent-registry.sh")).unwrap();
+        let r = run(Updater::Agents, &t.env());
+        assert_eq!(r.status, Status::Blocked, "{r:?}");
+        assert!(r.notes[0].starts_with("no install script at "), "{r:?}");
+        assert_eq!(t.log(), "");
+        assert!(preview(Updater::Agents, &t.env()).starts_with("blocked: no install script at "));
+    }
+
+    #[test]
+    fn agents_preview_names_the_copy_and_runs_nothing() {
+        let t = T::new();
+        t.agents("abc1234", "def5678");
+        let copy = t.managed();
+        let p = preview(Updater::Agents, &t.env());
+        assert!(
+            p.starts_with(&format!(
+                "would fast-forward {} and run install-agent-registry.sh",
+                copy.display()
+            )),
+            "{p}"
+        );
+        assert_eq!(t.log(), "");
     }
 
     impl Drop for T {

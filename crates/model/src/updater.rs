@@ -3,6 +3,7 @@
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Updater {
+    Agents,
     Brew,
     Claude,
     Codex,
@@ -11,7 +12,8 @@ pub enum Updater {
 }
 
 impl Updater {
-    pub const ALL: [Updater; 5] = [
+    pub const ALL: [Updater; 6] = [
+        Updater::Agents,
         Updater::Brew,
         Updater::Claude,
         Updater::Codex,
@@ -21,6 +23,7 @@ impl Updater {
 
     pub fn name(self) -> &'static str {
         match self {
+            Updater::Agents => "agents",
             Updater::Brew => "brew",
             Updater::Claude => "claude",
             Updater::Codex => "codex",
@@ -44,6 +47,7 @@ mod tests {
             assert_eq!(Updater::parse(u.name()), Some(u));
         }
         assert_eq!(Updater::parse("Brew"), None);
+        assert_eq!(Updater::parse("agents"), Some(Updater::Agents));
         // Sync never replaces the running manager.
         assert_eq!(Updater::parse("dfm"), None);
     }
