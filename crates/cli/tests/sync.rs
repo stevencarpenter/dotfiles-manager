@@ -3438,6 +3438,34 @@ fn a_service_on_a_secret_not_rendered_yet_is_blocked_while_a_locked_vault_skips_
     assert!(!l.log().contains("brew services start baz"), "{}", l.log());
 }
 
+/// Only a planned service waits for a part that does not run: a service that is already
+/// current needs no action, so its missing file does not block the services part.
+#[test]
+fn a_current_service_on_a_secret_not_rendered_yet_does_not_block_the_services_part() {
+    let l = Life::new();
+    fs::write(l.fake.path().join("brew-baz"), "started").unwrap();
+    l.push_module(BAZ, &[], "baz reads the secret");
+    assert!(!l.fx.h(".config/example/personal.env").exists());
+    l.sign_in(false);
+    let p = l.preview(&[]);
+    assert_eq!(code(&p), 0, "{}\n{}", stdout(&p), stderr(&p));
+    let s = stdout(&p);
+    assert!(s.contains("current life.baz@service"), "{s}");
+    assert!(!s.contains("which only"), "{s}");
+    let o = l.sync(&digest_of(&p), &[]);
+    assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
+    in_order(
+        &stdout(&o),
+        &[
+            "  secrets: skipped: no session (life.token)",
+            "  services: ok",
+            "result: ok\n",
+        ],
+    );
+    // The other service of the part still starts.
+    assert!(l.log().contains("launchctl bootstrap"), "{}", l.log());
+}
+
 #[test]
 fn a_definition_source_removed_upstream_gives_one_digest_and_blocks_only_services() {
     // The agent's definition is the owner's own HOME link into the checkout, not a resource.
@@ -4757,4 +4785,104 @@ fn sync_after_adopt_before_the_commit_keeps_the_link_current() {
     );
     assert!(!t.contains("remove@core.config-tuicr"), "{t}");
     assert!(!t.contains("blocked"), "{t}");
+}
+
+/// A blocked configuration part refuses the whole run before publication (docs/sync.md, "A
+/// blocked packages, secrets or services plan", and exit 3): no later part runs.
+#[test]
+fn a_blocked_configuration_part_refuses_the_run_before_publication() {
+    let l = Life::new();
+    let (head, receipts, log) = (l.fx.head(), l.receipt_commands(), l.log());
+    l.push_link();
+    // A directory where the new link goes: the configuration part is blocked.
+    fs::create_dir_all(l.fx.h(".config/life/notes/inner")).unwrap();
+    let blocked = "E_CONFLICT life.notes (.config/life/notes, target) in base/modules/life/module.toml: .config/life/notes is a directory where a link is needed";
+    let p = l.preview(&[]);
+    assert_eq!(code(&p), 3, "{}\n{}", stdout(&p), stderr(&p));
+    assert!(stderr(&p).contains(blocked), "{}", stderr(&p));
+    for o in [l.sync(&digest_of(&p), &[]), l.plain(&[])] {
+        assert_eq!(code(&o), 3, "{}\n{}", stdout(&o), stderr(&o));
+        assert!(
+            stderr(&o).contains(&format!("error: {blocked}")),
+            "{}",
+            stderr(&o)
+        );
+        assert!(stdout(&o).ends_with("result: blocked\n"), "{}", stdout(&o));
+    }
+    // Nothing was published, nothing ran, and no receipt was written.
+    assert_eq!(l.fx.head(), head);
+    assert!(!l.fx.h(".config/life/notes").is_symlink());
+    let new = &l.log()[log.len()..];
+    for effect in ["brew install", "op inject", "launchctl bootstrap"] {
+        assert!(!new.contains(effect), "a blocked sync ran {effect}:\n{new}");
+    }
+    assert_eq!(l.receipt_commands(), receipts);
+}
+
+/// `doctor`, `state check` and recovery read the one `sync` receipt and the journal of a
+/// combined run (docs/state.md, "The `sync` receipt").
+#[test]
+fn doctor_state_check_and_recovery_read_the_state_a_sync_run_leaves() {
+    let l = Life::new();
+    let o = l.approved(&[]);
+    assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
+    assert_eq!(
+        l.receipt_commands().last().map(String::as_str),
+        Some("sync")
+    );
+    let doctor = || l.run(&["doctor", "--root", l.fx.root_arg()]);
+    let check = || l.run(&["state", "check"]);
+    let o = doctor();
+    assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
+    assert!(
+        stdout(&o).contains("detail: sync ok (exit 0) finished"),
+        "{}",
+        stdout(&o)
+    );
+    assert!(!stdout(&o).contains("ERROR"), "{}", stdout(&o));
+    let o = check();
+    assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
+    assert!(stdout(&o).ends_with("state ok\n"), "{}", stdout(&o));
+    // A sync that dies between an operation's intent and its effect leaves an open intent.
+    l.push_link();
+    let p = l.preview(&[]);
+    assert_eq!(code(&p), 0, "{}\n{}", stdout(&p), stderr(&p));
+    let receipts = l.receipt_commands();
+    let o = l.run_env(
+        &[("DFM_FAILPOINT", "apply-before-effect:abort")],
+        &["sync", "--root", l.fx.root_arg(), "-y", &digest_of(&p)],
+    );
+    assert!(!o.status.success(), "{}\n{}", stdout(&o), stderr(&o));
+    assert_eq!(l.receipt_commands(), receipts);
+    let o = check();
+    assert_eq!(code(&o), 1, "{}\n{}", stdout(&o), stderr(&o));
+    assert!(
+        stdout(&o).contains("E_OP_INTERRUPTED journal.jsonl: operation create-dir"),
+        "{}",
+        stdout(&o)
+    );
+    let o = doctor();
+    assert_eq!(code(&o), 1, "{}\n{}", stdout(&o), stderr(&o));
+    assert!(
+        stdout(&o).contains("ERROR   E_OP_INTERRUPTED intent"),
+        "{}",
+        stdout(&o)
+    );
+    let o = l.run(&["state", "recover"]);
+    assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
+    assert!(stdout(&o).contains(" as failed"), "{}", stdout(&o));
+    let o = check();
+    assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
+    // The next sync completes the run and writes its own `sync` receipt.
+    let o = l.plain(&[]);
+    assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
+    assert!(l.fx.h(".config/life/notes").is_symlink());
+    assert_eq!(l.receipt_commands().len(), receipts.len() + 1);
+    assert_eq!(
+        l.receipt_commands().last().map(String::as_str),
+        Some("sync")
+    );
+    let o = doctor();
+    assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
+    assert!(!stdout(&o).contains("ERROR"), "{}", stdout(&o));
 }
