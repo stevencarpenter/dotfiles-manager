@@ -282,10 +282,14 @@ pub fn git_identity(value: &str, allow_file: bool) -> Result<String, Refusal> {
 }
 
 /// `origin` with any userinfo (the text between `://` and `@` before the first `/`) replaced by
-/// `[redacted]`.
+/// `[redacted]`. A value without `://` (an SCP form, or a url that git config rewrote) loses
+/// everything before its last `@`.
 fn mask_userinfo(origin: &str) -> String {
     let Some((scheme, rest)) = origin.split_once("://") else {
-        return origin.to_string();
+        return match origin.rfind('@') {
+            Some(at) => format!("[redacted]{}", &origin[at..]),
+            None => origin.to_string(),
+        };
     };
     let authority_end = rest.find('/').unwrap_or(rest.len());
     match rest[..authority_end].rfind('@') {
@@ -700,6 +704,14 @@ ref = "refs/heads/main"
             git_identity("o/r", false).unwrap(),
             "https://github.com/o/r"
         );
+        // A refused value never prints its userinfo, with or without a scheme.
+        for secret in [
+            "user:tok3n@example.invalid/x",
+            "https://user:tok3n@example.invalid/x",
+        ] {
+            let e = source_identity(secret, false).unwrap_err();
+            assert!(!e.detail.contains("tok3n"), "{e}");
+        }
         check_identity("npm:skills", false).unwrap();
         check_identity("https://github.com/o/r", false).unwrap();
         // --trust-origin takes the identity itself, not a form that maps to it.
