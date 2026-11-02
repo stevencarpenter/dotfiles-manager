@@ -735,7 +735,7 @@ ref = "refs/heads/main"
         let quoted = cmd.strip_prefix("dfm sync --trust-origin '").unwrap();
         assert_eq!(cmd, format!("dfm sync --trust-origin '{}", quoted));
         // The shell reads the quoted identity back as one argument, byte for byte.
-        let out = std::process::Command::new("/bin/sh")
+        let out = std::process::Command::new("sh")
             .arg("-c")
             .arg(format!("set -- '{quoted}; printf '%s|%s' \"$#\" \"$1\""))
             .output()
