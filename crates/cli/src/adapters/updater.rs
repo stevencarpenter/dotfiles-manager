@@ -1879,4 +1879,24 @@ mod tests {
         let p = preview(Updater::Claude, &t.env());
         assert!(p.contains("not installed at"), "{p}");
     }
+
+    #[test]
+    fn a_trust_command_quotes_the_identity_as_one_shell_word() {
+        let id = "https://h/x$(touch /nonexistent/p)'`id`;\" $HOME";
+        let cmd = trust_command(id);
+        let quoted = cmd.strip_prefix("dfm sync --trust-origin '").unwrap();
+        assert_eq!(cmd, format!("dfm sync --trust-origin '{}", quoted));
+        // The shell reads the quoted identity back as one argument, byte for byte.
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(format!("set -- '{quoted}; printf '%s|%s' \"$#\" \"$1\""))
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{out:?}");
+        assert_eq!(String::from_utf8(out.stdout).unwrap(), format!("1|{id}"));
+        assert_eq!(
+            trust_command("npm:skills"),
+            "dfm sync --trust-origin 'npm:skills'"
+        );
+    }
 }
