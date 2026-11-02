@@ -18,13 +18,15 @@ use toml::Value;
 /// rendered only by `secrets`, a package installed only by `packages`, and a service started or
 /// restarted only by `services` (DESIGN.md section 7: "Only configuration work belongs in a
 /// normal config plan"). Everything else in a plan is `not_in_scope`, so the counts still add up
-/// to the number of participants.
+/// to the number of participants. `Sync` is the one combined plan of `sync` (docs/sync.md): it
+/// covers the kinds of the other four, so one digest approves them all.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Scope {
     Config,
     Secrets,
     Packages,
     Services,
+    Sync,
 }
 
 impl Scope {
@@ -34,18 +36,57 @@ impl Scope {
             Scope::Secrets => "secrets",
             Scope::Packages => "packages",
             Scope::Services => "services",
+            Scope::Sync => "sync",
+        }
+    }
+
+    /// The single scope that acts on resources of `kind`, if one does.
+    pub fn of(kind: &str) -> Option<Scope> {
+        [
+            Scope::Config,
+            Scope::Packages,
+            Scope::Secrets,
+            Scope::Services,
+        ]
+        .into_iter()
+        .find(|s| s.covers_kind(kind))
+    }
+
+    /// The run order of the parts of a `sync` plan: configuration, packages, secrets, services.
+    /// A service needs its published definition and its installed formula, and a secret may sit
+    /// in a directory the configuration creates. Only the four part scopes have a rank: `Sync` is
+    /// the whole plan, not one of its parts.
+    pub fn rank(self) -> u8 {
+        debug_assert!(self != Scope::Sync, "the sync scope is not a part");
+        match self {
+            Scope::Config | Scope::Sync => 0,
+            Scope::Packages => 1,
+            Scope::Secrets => 2,
+            Scope::Services => 3,
         }
     }
 
     pub fn covers(self, r: &ResolvedResource) -> bool {
+        self.covers_kind(&r.kind)
+    }
+
+    fn covers_kind(self, kind: &str) -> bool {
         match self {
             Scope::Config => matches!(
-                r.kind.as_str(),
+                kind,
                 "link" | "render" | "merge" | "assemble" | "distribution"
             ),
-            Scope::Secrets => r.kind == "secret",
-            Scope::Packages => r.kind == "package",
-            Scope::Services => r.kind == "service",
+            Scope::Secrets => kind == "secret",
+            Scope::Packages => kind == "package",
+            Scope::Services => kind == "service",
+            Scope::Sync => [
+                Scope::Config,
+                Scope::Secrets,
+                Scope::Packages,
+                Scope::Services,
+            ]
+            .into_iter()
+            .any(|s| s.covers_kind(kind)),
         }
     }
 
@@ -289,6 +330,39 @@ pub fn service_prerequisites(r: &ResolvedResource) -> Vec<String> {
     out
 }
 
+/// The state of a service prerequisite that a planned operation of the same combined plan
+/// publishes: `produced-by:<operation id>`. The engine requires that operation to have ended
+/// updated or current and the file to be present before the service starts.
+pub const PRODUCED_BY: &str = "produced-by:";
+
+/// The state of a service prerequisite that is in place at plan time and that a planned
+/// operation of the same combined plan publishes again: `present-or-produced-by:<operation id>`.
+/// When that operation runs, the engine checks it as [`PRODUCED_BY`]. When the run leaves it out
+/// (a skipped or blocked part), the file in place is enough: the service does not wait for it.
+pub const PRESENT_OR_PRODUCED_BY: &str = "present-or-produced-by:";
+
+/// The producer that a service prerequisite's `state` names, and whether a file in place stands
+/// in for it when it does not run (`present-or-produced-by:`). `None` for an observed state.
+pub fn produced_by(state: &str) -> Option<(&str, bool)> {
+    state
+        .strip_prefix(PRODUCED_BY)
+        .map(|by| (by, false))
+        .or_else(|| {
+            state
+                .strip_prefix(PRESENT_OR_PRODUCED_BY)
+                .map(|by| (by, true))
+        })
+}
+
+/// Whether a prerequisite file is in place: a file, a directory or a link that resolves.
+pub fn prerequisite_present(node: &Node) -> bool {
+    match node {
+        Node::Link { to, .. } => !matches!(to, LinkTo::Dangling | LinkTo::Loop),
+        Node::Missing {} => false,
+        _ => true,
+    }
+}
+
 /// The plan-time facts of one merge resource.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MergeFact {
@@ -368,7 +442,7 @@ pub struct Context<'a> {
 /// it claims nothing now, and a path that another resource claims is that resource's business.
 fn removals<'a>(resolved: &Resolved, ledger: &'a [Owned], scope: Scope) -> Vec<&'a Owned> {
     // Removal is configuration work: a secrets or packages plan removes nothing.
-    if scope != Scope::Config {
+    if !scope.covers_kind("link") {
         return Vec::new();
     }
     let claimed: BTreeSet<String> = resolved
@@ -573,14 +647,48 @@ pub fn build(resolved: &Resolved, cx: &Context<'_>, obs: &Observations) -> Resul
             .collect(),
         sensitive: sensitive_paths(Some(resolved), &cx.ledger),
     };
-    for r in resolved.resources.values() {
+    // A combined plan plans the services last, so each finds the operations of this plan that
+    // publish its prerequisite files. Every other plan keeps the resource order.
+    let sync = cx.scope == Scope::Sync;
+    for r in resolved
+        .resources
+        .values()
+        .filter(|r| !sync || r.kind != "service")
+    {
+        p.resource(r);
+    }
+    for r in resolved
+        .resources
+        .values()
+        .filter(|r| sync && r.kind == "service")
+    {
         p.resource(r);
     }
     for o in removals(resolved, &cx.ledger, cx.scope) {
         p.remove(o);
     }
     p.edges(resolved);
-    let (mut operations, cycle) = p.finish();
+    // A combined plan runs its parts in scope order where the edges allow it. A directory or a
+    // removal is configuration work, whichever resource asked for it.
+    let ranks: BTreeMap<String, u8> = match sync {
+        true => p
+            .ops
+            .values()
+            .map(|o| {
+                let rank = match o.action {
+                    Action::CreateDir | Action::Remove => 0,
+                    _ => resolved
+                        .resources
+                        .get(&o.resource)
+                        .and_then(|r| Scope::of(&r.kind))
+                        .map_or(0, Scope::rank),
+                };
+                (o.id.clone(), rank)
+            })
+            .collect(),
+        false => BTreeMap::new(),
+    };
+    let (mut operations, cycle) = p.finish(|id| ranks.get(id).copied().unwrap_or(0));
     let mut blockers = p.blockers;
     if let Some(cycle) = cycle {
         let first = operations
@@ -1357,14 +1465,30 @@ impl Planner<'_> {
         self.ops.insert(id, op);
     }
 
+    /// The planned operation of a combined plan that leaves a link or a file at `path` (a
+    /// removal publishes nothing), compared after the file system fold. `None` in every other
+    /// plan, whose prerequisites must already be in place.
+    fn producer(&self, path: &str) -> Option<&Operation> {
+        let path = fold(path);
+        (self.cx.scope == Scope::Sync)
+            .then(|| {
+                self.ops.values().find(|o| {
+                    o.status == Status::Planned
+                        && o.action.publishes()
+                        && o.path.as_deref().is_some_and(|q| fold(q) == path)
+                })
+            })
+            .flatten()
+    }
+
     /// A service (docs/lifecycle.md): no path and no ledger entry. The caller probed the
     /// launcher; the plan starts what is not loaded, restarts what is loaded otherwise than
     /// declared (or on request), and never stops or removes. Each declared prerequisite file
     /// must exist now and is recorded as a precondition; a missing one blocks the service, since
     /// a reload depends on the published file. Every missing one is a blocker, so a caller sees
     /// all the files the service waits for, not only the first. A missing file never hides the
-    /// probe's own blocker: both are listed, so `sync` defers only a service whose probe plans a
-    /// start, a restart or `current` once the files are published.
+    /// probe's own blocker: both are listed. In a combined `sync` plan, a missing file that a
+    /// planned operation of the same plan publishes does not block: the service waits for it.
     fn service(&mut self, r: &ResolvedResource) {
         let id = format!("{}@service", r.id);
         let mut op = self.skeleton(r, id.clone(), None);
@@ -1381,21 +1505,56 @@ impl Planner<'_> {
         };
         let shown = format!("{name} with {}", r.adapter);
         let mut missing = false;
+        // The files a planned operation of this combined plan publishes before the service runs:
+        // each is recorded as produced by that operation (the engine checks its result and the
+        // file at act time), and a file not published yet does not block (docs/sync.md).
+        let mut published: Vec<(String, &'static str)> = Vec::new();
+        // The files not in place yet: each is a blocker of a service that blocks on its own.
+        let mut waits: Vec<String> = Vec::new();
+        let not_published = |p: &str| {
+            fail(
+                Code::Conflict,
+                field,
+                format!(
+                    "{shown} depends on {p}, which is not published; a reload depends on the published file"
+                ),
+                "publish it first (apply), then run services again",
+            )
+        };
         for p in service_prerequisites(r) {
-            let present = match self.obs.seen.get(&p).map(|s| &s.node) {
-                Some(Node::Link { to, .. }) => !matches!(to, LinkTo::Dangling | LinkTo::Loop),
-                Some(Node::Missing {}) | None => false,
-                Some(_) => true,
-            };
+            let sensitive = self.sensitive.contains(&fold(&p));
+            let subject = if sensitive { "sensitive-path" } else { "path" };
+            if let Some(by) = self.producer(&p) {
+                let present = self
+                    .obs
+                    .seen
+                    .get(&p)
+                    .is_some_and(|s| prerequisite_present(&s.node));
+                let marker = match present {
+                    true => PRESENT_OR_PRODUCED_BY,
+                    false => PRODUCED_BY,
+                };
+                op.preconditions.push(Precondition {
+                    subject: format!("{subject}:{p}"),
+                    state: format!("{marker}{}", by.id),
+                });
+                if !present {
+                    let scope = match by.adapter == SECRET_ADAPTER {
+                        true => "secrets",
+                        false => "configuration",
+                    };
+                    published.push((format!("{p} ({})", by.id), scope));
+                    waits.push(p);
+                }
+                continue;
+            }
+            let present = self
+                .obs
+                .seen
+                .get(&p)
+                .is_some_and(|s| prerequisite_present(&s.node));
             if !present {
-                let f = fail(
-                    Code::Conflict,
-                    field,
-                    format!(
-                        "{shown} depends on {p}, which is not published; a reload depends on the published file"
-                    ),
-                    "publish it first (apply), then run services again",
-                );
+                let f = not_published(&p);
                 if !missing {
                     op.effect = format!("blocked: {}", f.detail);
                 }
@@ -1410,8 +1569,6 @@ impl Planner<'_> {
             // only, as everywhere else: no hash and no size of it reaches the plan or a message.
             // The subject says which it is, so apply observes it the same way.
             if let Some(seen) = self.obs.seen.get(&p) {
-                let sensitive = self.sensitive.contains(&fold(&p));
-                let subject = if sensitive { "sensitive-path" } else { "path" };
                 op.preconditions.push(Precondition {
                     subject: format!("{subject}:{p}"),
                     state: node_state(seen, sensitive),
@@ -1440,7 +1597,7 @@ impl Planner<'_> {
         // The verdict of the probe alone: the action, status, effect and probe precondition it
         // plans, or its own blocker. A blocker is recorded even while a prerequisite file is
         // missing: only a service whose probe plans a start, a restart or `current` once the
-        // files are published waits for them (`sync` defers it); any other state blocks it now,
+        // files are published waits for them (in a combined plan); any other state blocks it now,
         // and the caller sees every blocker of the service, not only the files.
         let verdict = match state {
             Some(ref s @ (ServiceState::Current(ref d) | ServiceState::Stale(ref d)))
@@ -1512,6 +1669,15 @@ impl Planner<'_> {
         };
         match verdict {
             Err(f) => {
+                // A service that blocks on its own lists the files it waits for too.
+                for p in &waits {
+                    let w = not_published(p);
+                    if !missing {
+                        op.effect = format!("blocked: {}", w.detail);
+                    }
+                    missing = true;
+                    self.blocker(r, Some(p), w);
+                }
                 if !missing {
                     op.effect = format!("blocked: {}", f.detail);
                 }
@@ -1523,6 +1689,21 @@ impl Planner<'_> {
                 op.action = action;
                 op.status = status;
                 op.effect = effect;
+                if let (Some((_, scope)), Status::Planned) = (published.first(), status) {
+                    let by: Vec<&str> = published.iter().map(|(p, _)| p.as_str()).collect();
+                    op.effect = match action {
+                        Action::Restart => format!(
+                            "restart {} on request (--restart) after the {scope} scope publishes {}; disruptive{runs}",
+                            r.id,
+                            by.join(", ")
+                        ),
+                        _ => format!(
+                            "start {} after the {scope} scope publishes {}{runs}",
+                            r.id,
+                            by.join(", ")
+                        ),
+                    };
+                }
                 if let Some(state) = probed {
                     op.preconditions.push(Precondition {
                         subject: probe,
@@ -2147,7 +2328,7 @@ impl Planner<'_> {
     /// roll, which stops all later mutation, can only leave other trial rolls `not_started`
     /// (docs/toolchains.md, "Trials"). The ordering edges are not written into `after`. A plan
     /// without a trial row orders as before.
-    fn finish(&mut self) -> (Vec<Operation>, Option<Vec<String>>) {
+    fn finish(&mut self, rank: impl Fn(&str) -> u8) -> (Vec<Operation>, Option<Vec<String>>) {
         let is_trial = |o: &Operation| o.resource.starts_with(TRIAL_PREFIX);
         let declared: Vec<String> = if self.ops.values().any(is_trial) {
             self.ops
@@ -2169,7 +2350,7 @@ impl Planner<'_> {
                 (o.id.clone(), after)
             })
             .collect();
-        match graph::order(&nodes) {
+        match graph::order(&nodes, rank) {
             Ok(order) => (
                 order
                     .into_iter()
@@ -2541,6 +2722,32 @@ mod tests {
     }
 
     #[test]
+    fn the_sync_scope_covers_the_kinds_of_the_four_scopes_and_ranks_them_in_run_order() {
+        for (kind, scope) in [
+            ("link", Scope::Config),
+            ("merge", Scope::Config),
+            ("package", Scope::Packages),
+            ("secret", Scope::Secrets),
+            ("service", Scope::Services),
+        ] {
+            assert!(Scope::Sync.covers(&of_kind(kind)), "{kind}");
+            assert_eq!(Scope::of(kind), Some(scope), "{kind}");
+        }
+        assert!(!Scope::Sync.covers(&of_kind("application")));
+        assert_eq!(Scope::of("application"), None);
+        let ranks: Vec<u8> = [
+            Scope::Config,
+            Scope::Packages,
+            Scope::Secrets,
+            Scope::Services,
+        ]
+        .map(Scope::rank)
+        .into();
+        assert_eq!(ranks, [0, 1, 2, 3]);
+        assert_eq!(Scope::Sync.as_str(), "sync");
+    }
+
+    #[test]
     fn the_services_scope_covers_services_and_names_their_prerequisites() {
         assert!(Scope::Services.covers(&of_kind("service")));
         for scope in [Scope::Config, Scope::Secrets, Scope::Packages] {
@@ -2642,11 +2849,10 @@ mod tests {
 
     #[test]
     fn a_service_waits_for_its_files_only_when_their_publication_plans_it() {
-        // `sync` defers a blocked service when every blocker is a missing file that the
-        // configuration scope publishes (a path blocker of E_CONFLICT). For every probe state
-        // and restart request, that holds exactly when the same service, its files published,
-        // plans a start, a restart or `current`; otherwise the probe's own blocker is listed
-        // next to the file's.
+        // A service whose only blockers are missing files (path blockers of E_CONFLICT) is one
+        // that, its files published, plans a start, a restart or `current`, for every probe
+        // state and restart request; otherwise the probe's own blocker is listed next to the
+        // file's. A combined plan lets only such a service wait for the files it publishes.
         let states = [
             Some(ServiceState::Current("loaded".into())),
             Some(ServiceState::Stopped("not loaded".into())),
@@ -2657,12 +2863,12 @@ mod tests {
             Some(ServiceState::Refused("another label".into())),
             None,
         ];
-        let mut deferred = 0;
+        let mut waits = 0;
         for state in states {
             for requested in [false, true] {
                 let what = format!("{state:?} requested={requested}");
                 let waiting = service_plan(false, state.clone(), requested);
-                let defers = !waiting.blockers.is_empty()
+                let files_only = !waiting.blockers.is_empty()
                     && waiting
                         .blockers
                         .iter()
@@ -2675,7 +2881,7 @@ mod tests {
                         (Action::Start | Action::Restart, Status::Planned)
                             | (Action::None, Status::Current)
                     );
-                assert_eq!(defers, runs, "{what}: {waiting:?}");
+                assert_eq!(files_only, runs, "{what}: {waiting:?}");
                 // The file's blocker is always listed; a blocking probe adds its own.
                 assert!(
                     waiting
@@ -2690,11 +2896,11 @@ mod tests {
                     "{what}: {waiting:?}"
                 );
                 assert_eq!(waiting.operations[0].status, Status::Blocked, "{what}");
-                deferred += usize::from(defers);
+                waits += usize::from(files_only);
             }
         }
         // Current and Stopped either way, and Stale on request.
-        assert_eq!(deferred, 5);
+        assert_eq!(waits, 5);
     }
 
     #[test]

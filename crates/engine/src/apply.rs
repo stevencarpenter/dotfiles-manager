@@ -618,6 +618,9 @@ struct Exec<'a, 'r> {
     /// The last good clock reading (nanoseconds since the epoch). A clock that fails later in the run reuses
     /// it, so no stamp is ever invented.
     clock: Cell<u64>,
+    /// How each operation that ran so far ended, by plan id: a service checks the operation
+    /// that produces its prerequisite (`produced-by:`).
+    results: BTreeMap<&'a str, Status>,
 }
 
 /// How one operation ended. `Option<String>` is the journal attempt id, present once the
@@ -1708,6 +1711,82 @@ impl Exec<'_, '_> {
     /// hashed them at plan time). A file that changed or went away since the plan blocks the
     /// start or restart, so nothing loads a definition the reviewer did not see.
     fn service_prerequisites(&self, op: &Operation) -> Result<(), Ended> {
+        // A file that an earlier operation of this run publishes (`produced-by:`): that operation
+        // must have ended updated or current, and the file must be what it left there (its link,
+        // or its content), so nothing loads a file another program changed in between. A file
+        // in place at plan time (`present-or-produced-by:`) whose producer this run left out
+        // only has to be in place still: the run did not touch it.
+        let mut produced = Vec::new();
+        for p in &op.preconditions {
+            let Some((by, present)) = dfm_model::plan::produced_by(&p.state) else {
+                continue;
+            };
+            let path = p.subject.split_once(':').map_or("", |(_, path)| path);
+            let ended = self.results.get(by).copied();
+            let producer = self.plan.operations.iter().find(|o| o.id == by);
+            if present && producer.is_none() {
+                produced.push((path, None));
+                continue;
+            }
+            let Some(producer) =
+                producer.filter(|_| matches!(ended, Some(Status::Updated | Status::Current)))
+            else {
+                return Err(blocked(
+                    Code::PlanStale,
+                    format!(
+                        "{path} is published by {by}, which {}; nothing was loaded",
+                        ended.map_or("did not run", |_| "did not complete")
+                    ),
+                ));
+            };
+            produced.push((path, Some(producer)));
+        }
+        if !produced.is_empty() {
+            let reqs: Vec<Request> = produced
+                .iter()
+                .map(|(path, _)| Request {
+                    path: path.to_string(),
+                    hash: false,
+                    list: false,
+                })
+                .collect();
+            let obs = observe(&self.run.sys, self.run.home, &reqs).map_err(failed)?;
+            for (path, producer) in &produced {
+                let node = obs.seen.get(*path).map(|s| &s.node);
+                let Some(producer) = producer else {
+                    if !node.is_some_and(dfm_model::plan::prerequisite_present) {
+                        return Err(blocked(
+                            Code::PlanStale,
+                            format!("{path} is no longer in place; nothing was loaded"),
+                        ));
+                    }
+                    continue;
+                };
+                let left = match (&producer.link, &producer.output_sha256) {
+                    (Some(link), _) => matches!(
+                        node,
+                        Some(n @ Node::Link { target, .. })
+                            if target == link && dfm_model::plan::prerequisite_present(n)
+                    ),
+                    (None, Some(sha)) => {
+                        matches!(node, Some(Node::File { .. }))
+                            && definition_bytes(&self.run.home_path.join(path))
+                                .is_ok_and(|b| sha256_hex(&b) == *sha)
+                    }
+                    // A secret is never read: it must be a file.
+                    (None, None) => matches!(node, Some(Node::File { .. })),
+                };
+                if !left {
+                    return Err(blocked(
+                        Code::PlanStale,
+                        format!(
+                            "{path} is not what {} published; nothing was loaded",
+                            producer.id
+                        ),
+                    ));
+                }
+            }
+        }
         for p in &op.preconditions {
             let Some(path) = p.subject.strip_prefix("content:") else {
                 continue;
@@ -1738,9 +1817,12 @@ impl Exec<'_, '_> {
                     .map(|path| (path, true))
             }
         }
+        let observed =
+            |p: &&dfm_model::plan::Precondition| dfm_model::plan::produced_by(&p.state).is_none();
         let reqs: Vec<Request> = op
             .preconditions
             .iter()
+            .filter(observed)
             .filter_map(kind)
             .map(|(path, sensitive)| Request {
                 path: path.to_string(),
@@ -1752,7 +1834,7 @@ impl Exec<'_, '_> {
             return Ok(());
         }
         let obs = observe(&self.run.sys, self.run.home, &reqs).map_err(failed)?;
-        for p in &op.preconditions {
+        for p in op.preconditions.iter().filter(observed) {
             let Some((path, sensitive)) = kind(p) else {
                 continue;
             };
@@ -2417,6 +2499,7 @@ fn execute(run: &Run<'_>, plan: &Plan) -> Report {
         unknown_paths: BTreeMap::new(),
         unknown_resources: BTreeMap::new(),
         clock: Cell::new(*clock.as_ref().unwrap_or(&0)),
+        results: BTreeMap::new(),
     };
     // A failure to settle earlier work stops the run before its first operation.
     // A signal that came before settling wins, and settling (a journal write) is skipped.
@@ -2429,9 +2512,14 @@ fn execute(run: &Run<'_>, plan: &Plan) -> Report {
     // mapping `results == Pending` to Status::BlockedPending when DFM-30 adds the first
     // operation that runs after a service.
     let mut pending: Option<Refusal> = None;
-    let mut results: BTreeMap<&str, Status> = BTreeMap::new();
     let mut records = Vec::new();
     for op in &plan.operations {
+        // A test can stop or pause the run before one operation (`sync` between its parts). The
+        // point name is built only in a build with failpoints.
+        #[cfg(feature = "failpoints")]
+        if let Err(r) = run.fail.hit(&format!("apply-before-op-{}", op.id)) {
+            stopped.get_or_insert(r);
+        }
         // A signal stops new work before the next intent entry. The operation in flight is done.
         stopped = stopped.or_else(crate::signal::requested);
         let (status, rec) = match op.status {
@@ -2446,7 +2534,7 @@ fn execute(run: &Run<'_>, plan: &Plan) -> Report {
             {
                 let dependent = op.after.iter().any(|a| {
                     matches!(
-                        results.get(a.as_str()),
+                        ex.results.get(a.as_str()),
                         Some(Status::Failed | Status::Blocked | Status::Unknown)
                     )
                 });
@@ -2532,7 +2620,7 @@ fn execute(run: &Run<'_>, plan: &Plan) -> Report {
                 }
             }
         };
-        results.insert(&op.id, status);
+        ex.results.insert(&op.id, status);
         records.push(rec);
     }
     // A signal after the last operation, or after a failure, still decides the exit

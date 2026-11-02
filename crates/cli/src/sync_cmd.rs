@@ -24,11 +24,8 @@ use dfm_model::binding::Binding;
 use dfm_model::digest::sha256_hex;
 use dfm_model::display::{visible, visible_for_paste};
 use dfm_model::lock::{Grants, Lock, LockSource, MAX_BYTES as LOCK_MAX_BYTES, check_origin};
-use dfm_model::plan::{
-    Action, Blocker, LinkTo, Node, Operation, Ownership, Plan, Scope, Seen, Status as PlanStatus,
-    node_state,
-};
-use dfm_model::resolve::resolve;
+use dfm_model::plan::{Action, Blocker, Ownership, Plan, Scope, Status as PlanStatus};
+use dfm_model::resolve::{Resolved, resolve};
 use dfm_model::state::{self, Class, JournalEntry, Phase, Recovery, rfc3339};
 use dfm_model::updater::Updater;
 use dfm_model::{Code, Refusal};
@@ -932,21 +929,14 @@ fn stage_all(
     Ok(staged)
 }
 
-/// The digest the owner approves: each scope's plan digest, the secrets the run skips for want
-/// of a session, each deferred service with the action it is reviewed as (its plan stays
-/// blocked whatever `--restart` names) and, per source, what moves from where to where. A plan digest covers the
-/// loaded source tree, not the commits behind it, so a commit that changes only files outside
-/// the scoped roots would otherwise pass.
-fn sync_digest(plans: &[ScopePlan], staged: &[Staged]) -> String {
-    let mut text = String::new();
-    for p in plans {
-        text.push_str(&format!("plan {} {}\n", p.scope.as_str(), p.digest));
-        for r in &p.skipped {
-            text.push_str(&format!("skip {} {r}\n", p.scope.as_str()));
-        }
-        for (id, action) in &p.deferred {
-            text.push_str(&format!("defer {} {id} {action:?}\n", p.scope.as_str()));
-        }
+/// The digest the owner approves: the combined plan's digest, the secrets the run skips for want
+/// of a session and, per source, what moves from where to where. A plan digest covers the loaded
+/// source tree, not the commits behind it, so a commit that changes only files outside the
+/// scoped roots would otherwise pass.
+fn sync_digest(review: &Review, staged: &[Staged]) -> String {
+    let mut text = format!("plan {} {}\n", Scope::Sync.as_str(), review.digest);
+    for r in &review.excluded.skipped {
+        text.push_str(&format!("skip {} {r}\n", Scope::Secrets.as_str()));
     }
     for s in staged {
         text.push_str(&format!(
@@ -992,7 +982,7 @@ fn grant_journaled(
     store.append_journal(&entry(Phase::Done))
 }
 
-/// The scopes of one run, in run order (docs/sync.md).
+/// The parts of one run, in run order (docs/sync.md).
 const SCOPES: [Scope; 4] = [
     Scope::Config,
     Scope::Packages,
@@ -1000,66 +990,285 @@ const SCOPES: [Scope; 4] = [
     Scope::Services,
 ];
 
-/// One scope's plan of the staged tree.
-struct ScopePlan {
-    scope: Scope,
+/// The combined plan of the staged tree (`Scope::Sync`) and what this run leaves out of it.
+struct Review {
     plan: Plan,
     digest: String,
+    /// The part (scope) of each operation id (`parts`).
+    parts: BTreeMap<String, Scope>,
+    excluded: Excluded,
+}
+
+impl Review {
+    fn part(&self, id: &str) -> Scope {
+        apply_cmd::part_of(&self.parts, id)
+    }
+
+    /// The plan the run approves and executes: without the excluded operations, and without the
+    /// blockers of the parts that do not run. A configuration blocker stays and refuses the run.
+    fn runnable(&self) -> Plan {
+        self.runnable_with(&self.excluded)
+    }
+
+    /// [`Review::runnable`] with the exclusions `ex`.
+    fn runnable_with(&self, ex: &Excluded) -> Plan {
+        let ids = ex.ids(self);
+        let mut plan = apply_cmd::without(&self.plan, &ids);
+        // An operation that runs here after a left-out one does not wait for it: a withheld
+        // adoption leaves HOME as it is, and a part that does not run changes nothing.
+        for o in &mut plan.operations {
+            o.after.retain(|a| !ids.contains(a));
+        }
+        plan.blockers.retain(|b| {
+            !ex.blocked
+                .contains(&blocker_part(&self.plan, &self.parts, b))
+        });
+        plan
+    }
+
+    /// Each part as the owner reviews it, with its own operations and blockers.
+    fn split(&self) -> Vec<ScopePlan> {
+        SCOPES
+            .iter()
+            .map(|&scope| {
+                let mut plan = self.plan.clone();
+                plan.scope = scope.as_str().into();
+                plan.operations.retain(|o| self.part(&o.id) == scope);
+                plan.blockers
+                    .retain(|b| blocker_part(&self.plan, &self.parts, b) == scope);
+                plan.blockers.extend(
+                    self.excluded
+                        .waiting
+                        .iter()
+                        .filter(|_| scope == Scope::Services)
+                        .cloned(),
+                );
+                let ex = &self.excluded;
+                let mine = |ids: &BTreeSet<String>| -> BTreeSet<String> {
+                    ids.iter()
+                        .filter(|id| self.part(id) == scope)
+                        .cloned()
+                        .collect()
+                };
+                ScopePlan {
+                    scope,
+                    withheld: mine(&ex.withheld),
+                    plan,
+                    skipped: match scope {
+                        Scope::Secrets => ex.skipped.clone(),
+                        _ => Vec::new(),
+                    },
+                    no_session: match scope {
+                        Scope::Secrets => ex.no_session.clone(),
+                        _ => Vec::new(),
+                    },
+                    blocked: ex.blocked.contains(&scope),
+                }
+            })
+            .collect()
+    }
+}
+
+/// The part a blocker belongs to: that of its resource's kind, else configuration.
+fn blocker_part(plan: &Plan, parts: &BTreeMap<String, Scope>, b: &Blocker) -> Scope {
+    plan.operations
+        .iter()
+        .find(|o| o.resource == b.resource)
+        .map_or(Scope::Config, |o| apply_cmd::part_of(parts, &o.id))
+}
+
+/// The part of each operation of a combined plan: the scope of its resource's kind, and
+/// configuration for a removal (its resource is no longer declared). A directory belongs to the
+/// earliest part that needs it, so it is left out only with every part that needs it; the plan
+/// lists it before the operations that run after it.
+fn parts(plan: &Plan, resolved: &Resolved) -> BTreeMap<String, Scope> {
+    let mut out: BTreeMap<String, Scope> = BTreeMap::new();
+    for o in plan.operations.iter().rev() {
+        let own = resolved
+            .resources
+            .get(&o.resource)
+            .and_then(|r| Scope::of(&r.kind))
+            .unwrap_or(Scope::Config);
+        let part = match o.action {
+            Action::CreateDir => plan
+                .operations
+                .iter()
+                .filter(|d| d.after.contains(&o.id))
+                .filter_map(|d| out.get(&d.id).copied())
+                .min_by_key(|s| s.rank())
+                .unwrap_or(own),
+            _ => own,
+        };
+        out.insert(o.id.clone(), part);
+    }
+    out
+}
+
+/// What a run of the combined plan leaves out (docs/sync.md, "Approval" and "The four scopes").
+#[derive(Default)]
+struct Excluded {
+    /// The adoptions and takeovers without their `--allow-adopt` id, and what runs after them.
+    /// A later part does not wait for a withheld adoption: HOME already holds exactly what it
+    /// would record.
+    withheld: BTreeSet<String>,
     /// The planned secret resources, when no 1Password session exists: this run skips them.
     skipped: Vec<String>,
     /// The accounts without a session, each with what `op whoami` answered.
     no_session: Vec<(String, String)>,
-    /// A packages, secrets or services plan with a blocker that this run cannot clear: the
-    /// scope does not run and the other scopes do. A blocked configuration plan refuses the run.
+    /// The packages, secrets or services parts with a blocker that this run cannot clear: the
+    /// part does not run and the other parts do. A configuration blocker refuses the run.
+    blocked: Vec<Scope>,
+    /// A service whose prerequisite file only an operation this run leaves out (skipped or
+    /// blocked, not withheld) publishes: it blocks the services part.
+    waiting: Vec<Blocker>,
+}
+
+impl Excluded {
+    /// `sessions` answers the session check for the secrets part without its withheld
+    /// operations (`secret::missing_sessions`). The review asks it only when that part does
+    /// more than render again (`rerenders_only`); the run, which renders them, always asks.
+    fn of(
+        plan: &Plan,
+        parts: &BTreeMap<String, Scope>,
+        allow_adopt: &BTreeSet<String>,
+        rerenders: bool,
+        sessions: impl FnOnce(&Plan) -> Result<Vec<(String, String)>, Refusal>,
+    ) -> Result<Excluded, Refusal> {
+        let part = |id: &str| apply_cmd::part_of(parts, id);
+        let action = |id: &str| {
+            plan.operations
+                .iter()
+                .find(|o| o.id == id)
+                .map(|o| o.action)
+        };
+        let mut ex = Excluded::default();
+        for b in &plan.blockers {
+            let p = blocker_part(plan, parts, b);
+            if p != Scope::Config && !ex.blocked.contains(&p) {
+                ex.blocked.push(p);
+            }
+        }
+        // The plan lists an operation after the ones it runs after, so one pass takes the chains.
+        for o in plan
+            .operations
+            .iter()
+            .filter(|o| o.status == PlanStatus::Planned)
+        {
+            let unapproved =
+                Allowance::of(o) == Some(Allowance::Adopt) && !allow_adopt.contains(&o.id);
+            let after = o.after.iter().any(|a| {
+                ex.withheld.contains(a)
+                    && (part(a) == part(&o.id) || action(a) != Some(Action::Adopt))
+            });
+            if unapproved || after {
+                ex.withheld.insert(o.id.clone());
+            }
+        }
+        let mut secrets = apply_cmd::without(plan, &ex.withheld);
+        secrets.operations.retain(|o| part(&o.id) == Scope::Secrets);
+        secrets.blockers.retain(|b| {
+            plan.operations
+                .iter()
+                .any(|o| o.resource == b.resource && part(&o.id) == Scope::Secrets)
+        });
+        // Re-renders alone are not worth a vault contact on a run that changes nothing else.
+        if rerenders || !rerenders_only(&secrets) {
+            ex.no_session = sessions(&secrets)?;
+        }
+        if !ex.no_session.is_empty() {
+            ex.skipped = planned_secrets(&secrets);
+        }
+        // A planned service whose missing file only a skipped or blocked operation publishes
+        // cannot start.
+        let gone: BTreeSet<&str> = plan
+            .operations
+            .iter()
+            .filter(|o| {
+                (part(&o.id) == Scope::Secrets && !ex.skipped.is_empty())
+                    || ex.blocked.contains(&part(&o.id))
+            })
+            .map(|o| o.id.as_str())
+            .collect();
+        for o in plan.operations.iter().filter(|o| {
+            o.status == PlanStatus::Planned
+                && part(&o.id) == Scope::Services
+                && !ex.blocked.contains(&Scope::Services)
+        }) {
+            // Only a file absent at plan time waits (`produced-by:`); a file in place
+            // (`present-or-produced-by:`) stands when its producer does not run.
+            for pc in &o.preconditions {
+                let Some(by) = pc.state.strip_prefix(dfm_model::plan::PRODUCED_BY) else {
+                    continue;
+                };
+                if gone.contains(by) {
+                    let path = pc.subject.split_once(':').map(|(_, p)| p.to_string());
+                    ex.waiting.push(Blocker {
+                        code: Code::Conflict,
+                        resource: o.resource.clone(),
+                        source: String::new(),
+                        field: None,
+                        detail: format!(
+                            "{} depends on {}, which only {by} publishes, and this run does not run it",
+                            o.resource,
+                            path.as_deref().unwrap_or("a file")
+                        ),
+                        path,
+                        correction: format!(
+                            "let {by} run (dfm sync or dfm {}), then run dfm sync again",
+                            part(by).as_str()
+                        ),
+                    });
+                }
+            }
+        }
+        if !ex.waiting.is_empty() && !ex.blocked.contains(&Scope::Services) {
+            ex.blocked.push(Scope::Services);
+        }
+        Ok(ex)
+    }
+
+    /// Every operation id the run leaves out.
+    fn ids(&self, review: &Review) -> BTreeSet<String> {
+        let mut ids = self.withheld.clone();
+        ids.extend(
+            review
+                .plan
+                .operations
+                .iter()
+                .filter(|o| {
+                    let p = review.part(&o.id);
+                    self.blocked.contains(&p) || (p == Scope::Secrets && !self.skipped.is_empty())
+                })
+                .map(|o| o.id.clone()),
+        );
+        ids
+    }
+}
+
+/// One part of the combined plan as the owner reviews it.
+struct ScopePlan {
+    scope: Scope,
+    /// The part's operations and blockers.
+    plan: Plan,
+    /// The planned secret resources, when no 1Password session exists: this run skips them.
+    skipped: Vec<String>,
+    /// The accounts without a session, each with what `op whoami` answered.
+    no_session: Vec<(String, String)>,
+    /// A packages, secrets or services part with a blocker that this run cannot clear.
     blocked: bool,
-    /// Services blocked only because their definition or configuration file is not published
-    /// yet, while the configuration plan publishes it: they are planned after that scope. Each
-    /// is reviewed as a start, or as a restart when `--restart` names it.
-    deferred: BTreeMap<String, Action>,
-    /// The adoptions and takeovers without their `--allow-adopt` id, and what runs after them:
-    /// the scope runs without them (`apply_cmd::withheld`).
+    /// The part's withheld operations (`Excluded::withheld`).
     withheld: BTreeSet<String>,
 }
 
 impl ScopePlan {
-    /// The plan as the owner reviews it: the scope's own operations (a `not_in_scope` one
-    /// belongs to another scope), and each deferred service shown as the start or the requested
-    /// restart it becomes.
-    fn reviewed(&self, config: &Plan) -> Plan {
+    /// The plan as the owner reviews it: the part's own operations (a `not_in_scope` one is in
+    /// no part's scope).
+    fn reviewed(&self) -> Plan {
         let mut own = self.plan.clone();
         own.operations
             .retain(|o| o.status != PlanStatus::NotInScope);
-        for o in own
-            .operations
-            .iter_mut()
-            .filter(|o| self.deferred.contains_key(&o.id))
-        {
-            let by: Vec<String> = self
-                .plan
-                .blockers
-                .iter()
-                .filter(|b| b.resource == o.resource)
-                .filter_map(|b| Some(format!("{} ({})", b.path.as_ref()?, publisher(config, b)?)))
-                .collect();
-            o.status = PlanStatus::Planned;
-            o.action = self.deferred[&o.id];
-            o.effect = match o.action {
-                Action::Restart => format!(
-                    "restart {} on request (--restart) after the configuration scope publishes {}; disruptive; planned again from the published files before it restarts",
-                    o.resource,
-                    by.join(", ")
-                ),
-                _ => format!(
-                    "start {} after the configuration scope publishes {}; planned again from the published files before it starts",
-                    o.resource,
-                    by.join(", ")
-                ),
-            };
-        }
-        own.blockers.retain(|b| publisher(config, b).is_none());
         own
     }
-
     /// Each blocked operation with its code, or the resource when a blocker names no operation.
     fn blocked_ops(&self) -> Vec<String> {
         let mut out: Vec<String> = Vec::new();
@@ -1083,7 +1292,7 @@ impl ScopePlan {
         out
     }
 
-    /// The plan without the withheld operations: what the scope runs.
+    /// The part without its withheld operations: what it runs.
     fn runnable(&self) -> Plan {
         apply_cmd::without(&self.plan, &self.withheld)
     }
@@ -1190,50 +1399,6 @@ fn skipped_warning(names: &[String], no_session: &[(String, String)], then: &str
     )
 }
 
-/// The planned configuration operation that publishes the path of a service's "not published"
-/// blocker, if one does: it leaves a link or file there. A removal clears nothing.
-fn publisher<'a>(config: &'a Plan, b: &Blocker) -> Option<&'a str> {
-    let path = dfm_model::fold::fold(b.path.as_deref()?);
-    (b.code == Code::Conflict)
-        .then(|| {
-            config.operations.iter().find(|o| {
-                o.status == PlanStatus::Planned
-                    && o.action.publishes()
-                    && o.path
-                        .as_deref()
-                        .is_some_and(|q| dfm_model::fold::fold(q) == path)
-            })
-        })
-        .flatten()
-        .map(|o| o.id.as_str())
-}
-
-/// The arguments of one scope's run: the sync flags, with only the approvals that name an
-/// operation of this scope's plan (an id outside it is a usage error there), and `--restart`
-/// for services only.
-fn scope_args(args: &Args, scope: Scope, plan: Option<&Plan>) -> apply_cmd::Args {
-    let own = |given: &BTreeSet<String>, kind| {
-        given
-            .iter()
-            .filter(|id| plan.is_some_and(|p| needs(p, kind, id)))
-            .cloned()
-            .collect()
-    };
-    apply_cmd::Args {
-        yes_plan: None,
-        allow: own(&args.apply.allow, Allowance::Disruptive),
-        allow_adopt: own(&args.apply.allow_adopt, Allowance::Adopt),
-        scope,
-        restart: match scope {
-            Scope::Services => args.restart.clone(),
-            _ => BTreeSet::new(),
-        },
-        composed: true,
-        unattended: args.apply.yes_plan.is_none(),
-        ..args.apply.clone()
-    }
-}
-
 /// Whether `id` is a planned operation of `plan` that needs this kind of approval.
 fn needs(plan: &Plan, kind: Allowance, id: &str) -> bool {
     plan.operations
@@ -1241,34 +1406,42 @@ fn needs(plan: &Plan, kind: Allowance, id: &str) -> bool {
         .any(|o| o.id == id && o.status == PlanStatus::Planned && Allowance::of(o) == Some(kind))
 }
 
-/// Plans one scope of the tree `loaded` holds as its own command plans it, with the providers
-/// probed read-only, and the bytes of each file the plan generates (`plan_with_outputs`).
-fn plan_scope(
-    ctx: &Ctx,
-    sys: &Sys,
-    args: &Args,
-    scope: Scope,
-    loaded: &Loaded,
-) -> Result<(Plan, BTreeMap<String, Vec<u8>>), Refusal> {
-    let probed = apply_cmd::probe(ctx, sys, &scope_args(args, scope, None), loaded)?;
-    let (plan, generated) = plan_with_outputs(ctx, loaded, scope, probed)?;
-    if scope == Scope::Services {
-        apply_cmd::check_restart(&args.restart, &plan)?;
+/// The arguments of the combined run: the sync flags, with only the approvals that name an
+/// operation of `plan` (an id outside it is a usage error in `check_before_lock`), as a composed
+/// run (`apply_cmd::Args::composed`).
+fn run_args(args: &Args, plan: &Plan) -> apply_cmd::Args {
+    let own = |given: &BTreeSet<String>, kind| {
+        given
+            .iter()
+            .filter(|id| needs(plan, kind, id))
+            .cloned()
+            .collect()
+    };
+    apply_cmd::Args {
+        yes_plan: None,
+        allow: own(&args.apply.allow, Allowance::Disruptive),
+        allow_adopt: own(&args.apply.allow_adopt, Allowance::Adopt),
+        scope: Scope::Sync,
+        restart: args.restart.clone(),
+        composed: true,
+        unattended: args.apply.yes_plan.is_none(),
+        ..args.apply.clone()
     }
-    Ok((plan, generated))
 }
 
-/// Resolves and plans the staged tree as the tree `root` will hold after publication: the
-/// sources are read from `tree`, the plans name `root`. The secrets scope then runs the session
-/// check of `secrets`: without a session its planned resources are skipped, not refused.
+/// Resolves and plans the staged tree `tree` as the tree `root` will hold after publication, as
+/// one combined plan (`Scope::Sync`): the sources are read from `tree`, the plan names `root`. A
+/// service definition is read where the configuration part leaves it: at the target of its
+/// planned link, or from the bytes a planned operation generates, unless that operation is
+/// withheld. Then the secrets part runs the session check of `secrets`: without a session its
+/// planned resources are skipped, not refused. After publication `tree` is `root`.
 fn plan_staged(
     ctx: &Ctx,
     binding: &Binding,
-    root: &Path,
-    rel: &str,
+    (root, rel): (&Path, &str),
     tree: &Path,
     args: &Args,
-) -> Result<(Loaded, Vec<ScopePlan>), Refusal> {
+) -> Result<(Loaded, Review), Refusal> {
     let sources = load_scoped(tree, rel)?;
     let resolved = resolve(&sources, rel, &builtin_catalog())?;
     let mut loaded = Loaded {
@@ -1284,114 +1457,48 @@ fn plan_staged(
         return Err(Refusal::new(Code::PlatformMismatch, d));
     }
     let sys = ctx.sys()?;
-    let mut plans: Vec<ScopePlan> = Vec::new();
-    for scope in SCOPES {
-        let (plan, mut generated) = plan_scope(ctx, &sys, args, scope, &loaded)?;
-        let held = apply_cmd::Args {
-            held: held_by(&plans).into_keys().collect(),
-            ..scope_args(args, scope, Some(&plan))
-        };
-        let withheld = apply_cmd::withheld(&held, &plan);
-        let runnable = apply_cmd::without(&plan, &withheld);
-        if scope == Scope::Config {
-            // A withheld file operation writes nothing: the services scope reads HOME at its
-            // path. A withheld link is an adoption of the exact link that HOME already holds,
-            // so its target stays in `links`.
-            let unwritten: BTreeSet<String> = plan
-                .operations
-                .iter()
-                .filter(|o| withheld.contains(&o.id))
-                .filter_map(|o| o.path.as_deref().map(dfm_model::fold::fold))
-                .collect();
-            generated.retain(|path, _| !unwritten.contains(path));
-            loaded.generated = generated;
-            loaded.links = plan
-                .operations
-                .iter()
-                .filter(|o| o.status == PlanStatus::Planned)
-                .filter_map(|o| Some((dfm_model::fold::fold(o.path.as_ref()?), o.link.clone()?)))
-                .collect();
-        }
-        // Re-renders alone are not worth a vault contact on a run that changes nothing else.
-        // A withheld secret is not rendered, so its account needs no session.
-        let no_session = match scope {
-            Scope::Secrets if !rerenders_only(&runnable) => {
-                secret::missing_sessions(&runnable, &loaded.resolved, &ctx.runner(&sys))?
-            }
-            _ => Vec::new(),
-        };
-        let skipped = match no_session.is_empty() {
-            true => Vec::new(),
-            false => planned_secrets(&runnable),
-        };
-        let config = plans.first().map(ScopePlan::runnable);
-        let (blocked, deferred) = blocked_or_deferred(scope, &plan, config.as_ref(), &args.restart);
-        plans.push(ScopePlan {
-            scope,
-            digest: plan.digest()?,
-            plan,
-            skipped,
-            no_session,
-            blocked,
-            deferred,
-            withheld,
-        });
-    }
-    Ok((loaded, plans))
-}
-
-/// The withheld operations of `earlier` scopes that leave HOME other than the plan declares, by
-/// the `<resource>@scope` id a later plan names them with. A later operation that runs after one
-/// is withheld too: a service would start or restart on a file the run did not write. A
-/// withheld adoption is not listed: HOME already holds exactly what it would record.
-fn held_by(earlier: &[ScopePlan]) -> BTreeMap<String, Vec<String>> {
-    let mut out: BTreeMap<String, Vec<String>> = BTreeMap::new();
-    for p in earlier {
-        for o in p
-            .plan
-            .operations
-            .iter()
-            .filter(|o| p.withheld.contains(&o.id))
-        {
-            if o.action != Action::Adopt {
-                out.entry(format!("{}@scope", o.resource))
-                    .or_default()
-                    .push(o.id.clone());
-            }
-        }
-    }
-    out
-}
-
-/// Whether a packages, secrets or services plan is blocked, else the services it defers, each
-/// with the action it is reviewed as (a restart when `restart` names it, else a start): those
-/// blocked only on a file that `config`, the configuration plan without its withheld operations,
-/// publishes. A withheld operation publishes nothing, so a service that waits for one is blocked.
-fn blocked_or_deferred(
-    scope: Scope,
-    plan: &Plan,
-    config: Option<&Plan>,
-    restart: &BTreeSet<String>,
-) -> (bool, BTreeMap<String, Action>) {
-    let (mut blocked, mut deferred) = (false, BTreeMap::new());
-    if let (Scope::Packages | Scope::Secrets | Scope::Services, Some(config)) = (scope, config) {
-        for b in &plan.blockers {
-            match publisher(config, b) {
-                Some(_) if scope == Scope::Services => {
-                    let action = match restart.contains(&b.resource) {
-                        true => Action::Restart,
-                        false => Action::Start,
-                    };
-                    deferred.insert(format!("{}@service", b.resource), action);
-                }
-                _ => blocked = true,
-            }
-        }
-        if blocked {
-            deferred.clear();
-        }
-    }
-    (blocked, deferred)
+    // What the configuration part leaves in HOME, for the services probe. A withheld file
+    // operation writes nothing: the probe reads HOME at its path. A withheld link is an adoption
+    // of the exact link that HOME already holds, so its target stays in `links`.
+    let (config, mut generated) =
+        plan_with_outputs(ctx, &loaded, Scope::Config, Default::default())?;
+    let withheld = apply_cmd::withheld(&run_args(args, &config), &config);
+    let unwritten: BTreeSet<String> = config
+        .operations
+        .iter()
+        .filter(|o| withheld.contains(&o.id))
+        .filter_map(|o| o.path.as_deref().map(dfm_model::fold::fold))
+        .collect();
+    generated.retain(|path, _| !unwritten.contains(path));
+    loaded.generated = generated;
+    // A planning input, not a post-run retarget: the services probe reads each planned link's
+    // staged target before anything runs.
+    loaded.links = config
+        .operations
+        .iter()
+        .filter(|o| o.status == PlanStatus::Planned)
+        .filter_map(|o| Some((dfm_model::fold::fold(o.path.as_ref()?), o.link.clone()?)))
+        .collect();
+    let probed = apply_cmd::probe(ctx, &sys, &run_args(args, &config), &loaded)?;
+    let plan = plan_for(ctx, &loaded, Scope::Sync, probed)?;
+    apply_cmd::check_restart(&args.restart, &plan)?;
+    let parts = parts(&plan, &loaded.resolved);
+    let runner = ctx.runner(&sys);
+    // After publication `tree` is `root`: the run renders what the review only re-renders.
+    let excluded = Excluded::of(
+        &plan,
+        &parts,
+        &args.apply.allow_adopt,
+        tree == root,
+        |secrets| secret::missing_sessions(secrets, &loaded.resolved, &runner),
+    )?;
+    let review = Review {
+        digest: plan.digest()?,
+        plan,
+        parts,
+        excluded,
+    };
+    Ok((loaded, review))
 }
 
 /// Whether every planned operation of a secrets plan only renders again a destination the
@@ -1430,24 +1537,23 @@ fn planned_secrets(plan: &Plan) -> Vec<String> {
     out
 }
 
-/// The combined preview: each scope's reviewed plan under its heading, the secrets this run
-/// skips and the scopes it does not run, then the one digest that approves the whole run.
+/// The combined preview: each part's plan under its scope heading, the secrets this run skips
+/// and the parts it does not run, then the one digest that approves the whole run.
 fn show(
-    plans: &[ScopePlan],
+    review: &Review,
+    parts: &[ScopePlan],
     digest: &str,
     color: bool,
     out: &mut dyn Write,
 ) -> std::io::Result<()> {
-    let config = &plans[0].runnable();
-    for (i, p) in plans.iter().enumerate() {
-        let held = held_by(&plans[..i]);
+    for p in parts {
         writeln!(
             out,
             "{} {}",
             paint::label(color, "scope:"),
             p.scope.as_str()
         )?;
-        render_body(&p.reviewed(config), color, out)?;
+        render_body(&p.reviewed(), color, out)?;
         for r in &p.skipped {
             writeln!(
                 out,
@@ -1470,11 +1576,11 @@ fn show(
             .iter()
             .filter(|o| p.withheld.contains(&o.id))
         {
+            // The withheld operations of an earlier part that this one runs after.
             let by: Vec<&str> = o
                 .after
                 .iter()
-                .filter_map(|a| held.get(a))
-                .flatten()
+                .filter(|a| review.excluded.withheld.contains(*a) && review.part(a) != p.scope)
                 .map(String::as_str)
                 .collect();
             let why = match Allowance::of(o) {
@@ -1498,29 +1604,23 @@ fn show(
     )
 }
 
-/// The checks `apply` runs before its lock (`apply_cmd::check_before_lock`), per scope with that
-/// scope's approvals, for the scopes that will run (a deferred service is checked when its scope
-/// plans it again; a deferred restart needs no flag, since `--restart` names it).
-/// An approval id that names no operation of any reviewed plan is a usage error. Missing
-/// approvals of every scope are printed as one list before the refusal. Returns whether the
-/// journal holds open work.
-fn check_scopes(
+/// The checks `apply` runs before its lock (`apply_cmd::check_before_lock`) on the operations
+/// this run will run, with their approvals: one plan, so the journal capacity covers them all.
+/// An approval id that names no operation of the combined plan is a usage error. Returns whether
+/// the journal holds open work.
+fn check(
     ctx: &Ctx,
     args: &Args,
-    plans: &[ScopePlan],
+    review: &Review,
     loaded: &Loaded,
     out: &mut dyn Write,
 ) -> Result<bool, Refusal> {
-    let config = plans[0].runnable();
     for kind in Allowance::ALL {
         let given = match kind {
             Allowance::Disruptive => &args.apply.allow,
             Allowance::Adopt => &args.apply.allow_adopt,
         };
-        if let Some(bad) = given
-            .iter()
-            .find(|id| !plans.iter().any(|p| needs(&p.reviewed(&config), kind, id)))
-        {
+        if let Some(bad) = given.iter().find(|id| !needs(&review.plan, kind, id)) {
             return Err(usage(format!(
                 "{} {bad} names no planned {} in any scope of this sync",
                 kind.flag(),
@@ -1529,271 +1629,16 @@ fn check_scopes(
         }
     }
     let sys = ctx.sys()?;
-    let (mut open, mut missing) = (false, None);
-    for p in plans.iter().filter(|p| !p.blocked && p.skipped.is_empty()) {
-        let mut plan = p.plan.clone();
-        plan.operations.retain(|o| !p.deferred.contains_key(&o.id));
-        if !p.deferred.is_empty() {
-            plan.blockers.clear();
-        }
-        let generator = apply_cmd::generators_for(ctx, &sys, p.scope, loaded);
-        let scoped = apply_cmd::Args {
-            held: p.withheld.clone(),
-            ..scope_args(args, p.scope, Some(&p.plan))
-        };
-        match apply_cmd::check_before_lock(ctx, &scoped, &plan, &p.digest, &generator, out) {
-            Ok(o) => open |= o,
-            Err(e) if matches!(e.code, Code::DisruptiveUnapproved | Code::AdoptUnapproved) => {
-                missing.get_or_insert(e);
-            }
-            Err(e) => return Err(e),
-        }
-    }
-    // Each scope fits the journal alone, but the run appends the entries of every scope: they
-    // must fit together, the deferred services included and the withheld operations left out,
-    // before anything is published.
-    let mut all = plans[0].plan.clone();
-    all.blockers.clear();
-    all.operations = plans
-        .iter()
-        .filter(|p| !p.blocked && p.skipped.is_empty())
-        .flat_map(|p| {
-            let mut ops = p.reviewed(&config).operations;
-            ops.retain(|o| !p.withheld.contains(&o.id));
-            ops
-        })
-        .collect();
-    let readable = Store::open_read(sys, &ctx.layout(), state_cmd::fail_from_env()?)?
-        .ok_or_else(crate::state_lost_refusal)?;
-    dfm_engine::check_journal_capacity(
-        readable.journal_len()?,
-        readable.settlement_entries()?,
-        &all,
-    )?;
-    missing.map_or(Ok(open), Err)
-}
-
-/// Whether `fresh`, the plan of scope `p` after the earlier scopes of this run, is the reviewed
-/// plan with the effects of those scopes' approved operations (`done`, by folded path) applied:
-/// a directory an earlier scope created drops out of the reviewed plan, and a `path:` or
-/// `sensitive-path:` precondition on a path an earlier scope wrote must state what that
-/// operation leaves there (`left_by`); so must a `content:` precondition on a file it rendered.
-/// The reviewed preconditions on those paths described them before the earlier scopes. Each
-/// deferred service is now planned as a start (or current, when the launcher already holds it;
-/// or a restart, when the owner requested and approved the restart before publication). Every
-/// other operation and precondition, the sources and the model are unchanged, and nothing
-/// blocks. The observations are left out: each operation's preconditions carry the states it
-/// depends on.
-fn as_reviewed(
-    p: &ScopePlan,
-    fresh: &Plan,
-    done: &BTreeMap<String, Operation>,
-    home: &Path,
-) -> bool {
-    // The earlier operation that changed the subject of this precondition, if one did. The
-    // content of a link is the file it points at, which the review already read at the new
-    // target (`Staged`), so a `content:` precondition through a link stays as reviewed.
-    fn changed_by<'a>(
-        done: &'a BTreeMap<String, Operation>,
-        subject: &'a str,
-    ) -> Option<(&'a str, &'a Operation)> {
-        let (kind, path) = subject.split_once(':')?;
-        let op = done.get(&dfm_model::fold::fold(path))?;
-        match kind {
-            "path" | "sensitive-path" => Some((kind, op)),
-            "content" if op.link.is_none() => Some((kind, op)),
-            _ => None,
-        }
-    }
-    // A deferred service: the review stopped at the prerequisite that was not published, so
-    // it recorded no content and no launcher state. Each precondition of the fresh operation
-    // must be what an earlier operation left (`left_by`), the content of the source a published
-    // link points at (`content_id`), a reviewed precondition or observation, or the launcher
-    // state that the status and action rule checks.
-    let deferred = |id: &String, action: &Action| {
-        let find = |plan: &Plan| plan.operations.iter().find(|o| o.id == *id).cloned();
-        let (Some(mut r), Some(mut f)) = (find(&p.plan), find(fresh)) else {
-            return false;
-        };
-        let started = f.status == PlanStatus::Current
-            || (f.status == PlanStatus::Planned
-                && (f.action == Action::Start || f.action == *action));
-        let held = |pc: &dfm_model::plan::Precondition| {
-            if let Some((kind, op)) = changed_by(done, &pc.subject) {
-                return left_by(op, kind, &pc.state, home);
-            }
-            let (kind, path) = pc.subject.split_once(':').unwrap_or_default();
-            let linked = done
-                .get(&dfm_model::fold::fold(path))
-                .filter(|op| op.link.is_some());
-            match (kind, linked) {
-                ("content", Some(op)) => op
-                    .inputs
-                    .first()
-                    .is_some_and(|i| i.content_id.as_deref() == Some(pc.state.as_str())),
-                ("probe", _) => true,
-                ("path" | "sensitive-path", _) if !r.preconditions.contains(pc) => p
-                    .plan
-                    .observations
-                    .seen
-                    .get(path)
-                    .is_some_and(|seen| node_state(seen, kind == "sensitive-path") == pc.state),
-                _ => r.preconditions.contains(pc),
-            }
-        };
-        let kept = r
-            .preconditions
-            .iter()
-            .filter(|pc| changed_by(done, &pc.subject).is_none())
-            .all(|pc| f.preconditions.contains(pc));
-        let checked = started && kept && f.preconditions.iter().all(held);
-        // What remains (the resource, its module and adapter) is as reviewed.
-        for o in [&mut r, &mut f] {
-            o.status = PlanStatus::Planned;
-            o.action = *action;
-            o.effect.clear();
-            o.postcondition.clear();
-            o.preconditions.clear();
-        }
-        checked && r == f
-    };
-    let created = |o: &Operation| {
-        o.action == Action::CreateDir
-            && o.path.as_deref().is_some_and(|path| {
-                done.get(&dfm_model::fold::fold(path))
-                    .is_some_and(|d| d.action == Action::CreateDir)
-            })
-    };
-    let rest = |plan: &Plan, fresh: bool| {
-        let mut c = plan.clone();
-        let gone: BTreeSet<String> = match fresh {
-            true => BTreeSet::new(),
-            false => c
-                .operations
-                .iter()
-                .filter(|o| created(o))
-                .map(|o| o.id.clone())
-                .collect(),
-        };
-        c.operations
-            .retain(|o| !p.deferred.contains_key(&o.id) && !gone.contains(&o.id));
-        for o in &mut c.operations {
-            o.after.retain(|id| !gone.contains(id));
-            o.preconditions
-                .retain(|pc| match changed_by(done, &pc.subject) {
-                    None => true,
-                    Some(_) if !fresh => false,
-                    Some((kind, op)) => !left_by(op, kind, &pc.state, home),
-                });
-        }
-        c.blockers.clear();
-        c.observations = Default::default();
-        c
-    };
-    p.deferred.iter().all(|(id, action)| deferred(id, action))
-        && fresh.blockers.is_empty()
-        && rest(&p.plan, false) == rest(fresh, true)
-}
-
-/// Whether `state`, a precondition of kind `kind` (`path`, `sensitive-path` or `content`) on
-/// the path of `op`, is what the approved operation `op` of an earlier scope leaves there: the
-/// node apply makes (a directory of mode 700 or the declared mode, the absence it removed to,
-/// the link it published, the file it rendered with the declared mode or 600), formatted by
-/// `node_state` as observe records it, with the name apply gave it as the alias when the
-/// precondition spells the path in another case. The rendered content is read again from
-/// `home`, because a precondition records a different hash of it, and must be the approved
-/// content.
-fn left_by(op: &Operation, kind: &str, state: &str, home: &Path) -> bool {
-    let writes = matches!(op.action, Action::CreateFile | Action::UpdateFile);
-    if kind == "content" {
-        return writes
-            && op
-                .output_sha256
-                .as_ref()
-                .is_some_and(|h| state == format!("sha256:{h}"));
-    }
-    // A precondition that names the path in another case than `op` records the entry apply
-    // made under the spelling of `op` as its alias.
-    let made = op.path.as_deref().and_then(|p| p.rsplit('/').next());
-    let is = |node: Node| {
-        [None, made.map(String::from)].into_iter().any(|alias| {
-            state
-                == node_state(
-                    &Seen {
-                        node: node.clone(),
-                        alias,
-                    },
-                    kind == "sensitive-path",
-                )
-        })
-    };
-    let file = |sha256, size| Node::File {
-        mode: op.mode.unwrap_or(0o600),
-        own: true,
-        size,
-        sha256,
-    };
-    match (op.action, op.link.as_deref()) {
-        (Action::CreateDir, _) => is(Node::Dir {
-            mode: op.mode.unwrap_or(0o700),
-            own: true,
-        }),
-        (Action::Remove, _) => is(Node::Missing {}),
-        (_, Some(link)) => link_to(Path::new(link)).is_some_and(|to| {
-            is(Node::Link {
-                target: link.into(),
-                to,
-                own: true,
-            })
-        }),
-        _ if !writes => false,
-        // A sensitive path is recorded by mode only: its content is never read.
-        _ if kind == "sensitive-path" => is(file(None, 0)),
-        // Hashed, or by size when observe was not asked for a hash.
-        _ => rendered(op, home)
-            .is_some_and(|(fp, size)| is(file(Some(fp), size)) || is(file(None, size))),
-    }
-}
-
-/// What observe records a link to the absolute `target` points at (`fsys::Peek`).
-/// shortcut: a link loop is not told apart from another error and never matches, upgrade when
-/// a published link to a loop must count as the approved effect.
-fn link_to(target: &Path) -> Option<LinkTo> {
-    match fs::metadata(target) {
-        Ok(m) if m.is_dir() => Some(LinkTo::Dir),
-        Ok(m) if m.is_file() => Some(LinkTo::File),
-        Ok(_) => Some(LinkTo::Other),
-        Err(e)
-            if matches!(
-                e.kind(),
-                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
-            ) =>
-        {
-            Some(LinkTo::Dangling)
-        }
-        Err(_) => None,
-    }
-}
-
-/// The fingerprint (`file_fingerprint`) and size of the file at the path of `op` under `home`,
-/// if its content is the approved content: the SHA-256 the plan recorded for it.
-fn rendered(op: &Operation, home: &Path) -> Option<(String, u64)> {
-    let (path, sha, limit) = (
-        op.path.as_ref()?,
-        op.output_sha256.as_ref()?,
-        op.output_bytes?,
-    );
-    let bytes = read_regular_bounded(
-        &home.join(path),
-        limit,
-        |e| io_failed("read", &e),
-        || conflict("not a regular file"),
+    let runnable = review.runnable();
+    let generator = apply_cmd::generators_for(ctx, &sys, Scope::Sync, loaded);
+    apply_cmd::check_before_lock(
+        ctx,
+        &run_args(args, &runnable),
+        &runnable,
+        &review.digest,
+        &generator,
+        out,
     )
-    .ok()?;
-    (sha256_hex(&bytes) == *sha).then(|| {
-        let size = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
-        (dfm_model::plan::file_fingerprint(&bytes), size)
-    })
 }
 
 /// Publishes one staged source into its checkout exactly as the rehearsal moved the copy, after
@@ -2007,10 +1852,11 @@ fn run_inner(
         )
         .map_err(w)?;
     }
-    let (loaded, plans) = plan_staged(ctx, &binding, &root, &rel, &staging.tree(), args)?;
-    let digest = sync_digest(&plans, &previewed);
-    printed.warnings = plans.iter().flat_map(ScopePlan::warnings).collect();
-    show(&plans, &digest, ctx.color, out).map_err(w)?;
+    let (loaded, review) = plan_staged(ctx, &binding, (&root, &rel), &staging.tree(), args)?;
+    let digest = sync_digest(&review, &previewed);
+    let parts = review.split();
+    printed.warnings = parts.iter().flat_map(ScopePlan::warnings).collect();
+    show(&review, &parts, &digest, ctx.color, out).map_err(w)?;
     printed.plan = true;
     // A digest that no longer matches is the first thing to report: the reviewer approved a
     // different run.
@@ -2019,10 +1865,10 @@ fn run_inner(
     {
         return Err(apply_cmd::stale(approved, &digest));
     }
-    // The checks apply runs before its lock (docs/apply.md), per scope, so a plan that a scope
-    // would refuse is refused here before any source is published.
-    let journal_open = check_scopes(ctx, args, &plans, &loaded, out)?;
-    // The updaters, a blocked one included, are listed before any scope runs (DFM-31.C02).
+    // The checks apply runs before its lock (docs/apply.md), so a plan that the run would
+    // refuse is refused here before any source is published.
+    let journal_open = check(ctx, args, &review, &loaded, out)?;
+    // The updaters, a blocked one included, are listed before any part runs (DFM-31.C02).
     let updaters = &loaded.resolved.updaters;
     if args.apply.preview || (args.upgrade && !updaters.is_empty()) {
         upgrade_preview(ctx, &sys, args, updaters, out)?;
@@ -2031,11 +1877,11 @@ fn run_inner(
         return Ok(());
     }
     // A source that moves is a publication, so only a run with every source current, and no
-    // scope that would run with a change, can end here (docs/apply.md, step 4).
+    // part that would run with a change, can end here (docs/apply.md, step 4).
     if args.apply.yes_plan.is_none()
         && !journal_open
         && previewed.iter().all(|s| s.old.as_ref() == Some(&s.new))
-        && plans.iter().all(|p| {
+        && parts.iter().all(|p| {
             not_run(p).is_some()
                 || p.changes_nothing()
                 || (p.scope == Scope::Secrets && rerenders_only(&p.runnable()))
@@ -2047,7 +1893,7 @@ fn run_inner(
             paint::style(ctx.color, "1;32", "nothing to change: no approval needed")
         )
         .map_err(w)?;
-        let lines: Vec<(Scope, String)> = plans
+        let lines: Vec<(Scope, String)> = parts
             .iter()
             .map(|p| {
                 let status = match not_run(p) {
@@ -2089,16 +1935,18 @@ fn run_inner(
     drop(shared);
     state_cmd::fail_from_env()?.hit("sync-before-lock")?;
 
-    // Publication under the lock: fetch and plan again, so the sources and the checkouts are
-    // rechecked immediately before anything is published, then fast-forward each checkout.
-    let store = Store::open_write_with(sys, &layout, state_cmd::fail_from_env()?, false)?;
+    // One writer lock for the rest of the run: fetch and plan again, so the sources and the
+    // checkouts are rechecked immediately before anything is published, fast-forward each
+    // checkout, plan the published tree, and run the plan.
+    let fail = state_cmd::fail_from_env()?;
+    let store = Store::open_write_with(sys, &layout, fail.clone(), false)?;
     if !store.is_initialized() {
         return Err(crate::state_lost_refusal());
     }
     store.require_identity(&binding)?;
     let second = Staging::create(ctx, &sys, true)?;
     let staged = stage_all(&git, root_src, &grants, &root, &second.tree())?;
-    let (locked_loaded, locked) = plan_staged(ctx, &binding, &root, &rel, &second.tree(), args)?;
+    let (_, locked) = plan_staged(ctx, &binding, (&root, &rel), &second.tree(), args)?;
     let locked_digest = sync_digest(&locked, &staged);
     if locked_digest != digest {
         return Err(match &args.apply.yes_plan {
@@ -2124,7 +1972,6 @@ fn run_inner(
             "a source moved since the reviewed run: the commits to publish are not the ones shown with this digest. Fix: read the new plan with --preview and approve its digest",
         ));
     }
-    let fail = state_cmd::fail_from_env()?;
     let mut published = Vec::new();
     for s in &staged {
         match fail
@@ -2152,86 +1999,81 @@ fn run_inner(
         }
     }
     drop(second);
-    drop(store);
+    let changed = !published.is_empty();
+    let after = |e: Refusal| if changed { e.after_mutation() } else { e };
 
-    // Each scope runs as its own command would, with its plan digest, which the sync digest
-    // covers: it plans --root (now the published tree), compares, takes the lock, plans again,
-    // runs and writes its own receipt (docs/apply.md). A scope that fails stops the scopes after
-    // it. A skipped or blocked scope does not run and stops nothing.
-    let mut failure: Option<Refusal> = None;
-    let mut changed = !published.is_empty();
-    let mut lines: Vec<(Scope, String)> = Vec::new();
-    // The approved operations of the scopes that ran, by folded path: a later scope is checked
-    // against their effects.
-    let mut done = BTreeMap::new();
-    for p in &locked {
-        // A stop request between two scopes ends the run: no later scope starts.
-        if failure.is_none()
-            && let Some(r) = dfm_engine::signal::requested()
-        {
-            failure = Some(r);
-        }
-        let status = if failure.is_some() {
-            "not_started".to_string()
-        } else if let Some(s) = not_run(p) {
-            s
-        } else if p.changes_nothing() && !journal_open {
-            p.idle()
-        } else {
-            writeln!(
-                out,
-                "{} {}",
-                paint::label(ctx.color, "scope:"),
-                p.scope.as_str()
-            )
-            .map_err(w)?;
-            let earlier = Earlier {
-                done: &done,
-                home: &layout.home,
-            };
-            let ran = run_scope(ctx, &sys, args, p, &locked_loaded, &earlier, out)
-                .and_then(|ran| fail.hit("sync-after-scope").map(|()| ran));
-            match ran {
-                Ok(None) => {
-                    changed = true;
-                    // A withheld operation wrote nothing.
-                    for o in p.runnable().operations {
-                        if let (PlanStatus::Planned, Some(path)) = (o.status, &o.path) {
-                            done.insert(dfm_model::fold::fold(path), o.clone());
-                        }
-                    }
-                    "ok".into()
-                }
-                // The session ended after the review. A plain sync would not render these again
-                // (`rerenders_only`), so the fix names `secrets`.
-                Ok(Some(no_session)) => {
-                    let names = planned_secrets(&p.runnable());
-                    printed.warnings.push(skipped_warning(
-                        &names,
-                        &no_session,
-                        "run dfm secrets, which renders them",
-                    ));
-                    format!("skipped: no session ({})", visible(&names.join(", ")))
-                }
-                Err(e) => {
-                    // `blocked` is the word for a scope that did not run (C10), not a failure.
-                    let word = match e.exit() {
-                        dfm_model::Exit::Blocked => "failed",
-                        exit => exit.name(),
-                    };
-                    let status = format!("{word} ({})", e.code.as_str());
-                    failure = Some(e);
-                    status
-                }
-            }
-        };
-        lines.push((p.scope, status));
+    // The published tree must give the approved run (docs/sync.md, step 6). Then the session
+    // check runs again: a session that ended since the review skips the secrets now.
+    let (now_loaded, now) =
+        plan_staged(ctx, &binding, (&root, &rel), &root, args).map_err(after)?;
+    // A part that does not run may say why in other words once its files are published (a
+    // definition the copy could not read is not published now): what runs must be equal.
+    let what_runs = now
+        .runnable_with(&locked.excluded)
+        .digest()
+        .map_err(after)?;
+    if what_runs != locked.runnable().digest().map_err(after)? {
+        return Err(after(Refusal::new(
+            Code::PlanStale,
+            "the plan of the published tree is not the approved one; nothing was run. Fix: run dfm sync again",
+        )));
     }
-    // A stop request decides the exit, also one that came during the last scope's report.
+    // The approved run, with the secrets skipped now when the session ended since the review. A
+    // session that started since does not widen it.
+    let mut run = locked;
+    if run.excluded.skipped.is_empty() && !now.excluded.skipped.is_empty() {
+        // A plain sync would not render these again (`rerenders_only`), so the fix names
+        // `secrets`.
+        printed.warnings.push(skipped_warning(
+            &now.excluded.skipped,
+            &now.excluded.no_session,
+            "run dfm secrets, which renders them",
+        ));
+        run.excluded = now.excluded;
+    }
+    let parts = run.split();
+    let runnable = run.runnable();
+    // A run that changes nothing in any part (an approved repeat) writes no receipt.
+    let runs = |p: &ScopePlan| not_run(p).is_none() && (!p.changes_nothing() || journal_open);
+    let mut failure: Option<Refusal> = dfm_engine::signal::requested();
+    let mut statuses: BTreeMap<String, state::Status> = BTreeMap::new();
+    if failure.is_none() && parts.iter().any(runs) {
+        let ran = apply_cmd::execute_locked(
+            ctx,
+            &run_args(args, &runnable),
+            &binding,
+            &apply_cmd::Locked {
+                store: &store,
+                fail: &fail,
+                loaded: &now_loaded,
+                plan: &runnable,
+                digest: &run.digest,
+                parts: Some(&run.parts),
+            },
+            out,
+        );
+        match ran {
+            Ok(r) => {
+                statuses.extend(r.statuses);
+                failure = r.outcome.err();
+            }
+            Err(e) => failure = Some(e),
+        }
+    }
+    drop(store);
+    // A stop request decides the exit, also one that came during the report.
     if let Some(r) = dfm_engine::signal::requested() {
         failure = Some(r);
     }
-    // The updaters run after every scope that ran, and not after a refusal (docs/upgrade.md).
+    let lines = summary(
+        &parts,
+        &statuses,
+        failure.as_ref(),
+        journal_open,
+        &run.parts,
+    );
+    let changed = changed || statuses.values().any(|s| *s == state::Status::Updated);
+    // The updaters run after every part that ran, and not after a refusal (docs/upgrade.md).
     let up = match failure {
         Some(_) => None,
         None => match upgrade(
@@ -2240,7 +2082,7 @@ fn run_inner(
             &binding,
             (&root, &rel),
             args,
-            &locked_loaded.resolved.updaters,
+            &now_loaded.resolved.updaters,
             out,
             printed,
         ) {
@@ -2248,7 +2090,7 @@ fn run_inner(
                 failure = dfm_engine::signal::requested();
                 up
             }
-            // The scopes already ran: the summary still prints, and the exit is the error's.
+            // The parts already ran: the summary still prints, and the exit is the error's.
             Err(e) => {
                 let up = format!("failed ({})", e.code.as_str());
                 failure = Some(e);
@@ -2262,6 +2104,79 @@ fn run_inner(
         None => Ok(()),
     };
     finish(ctx, &lines, up.as_deref(), result, out, printed)
+}
+
+/// The `scopes:` lines of a run: per part, why it did not run, or how its operations ended. The
+/// part with the first operation that did not complete reports the run's failure; a part whose
+/// own operations did not all complete did not start. `of` is the part of each operation id.
+fn summary(
+    parts: &[ScopePlan],
+    statuses: &BTreeMap<String, state::Status>,
+    failure: Option<&Refusal>,
+    journal_open: bool,
+    of: &BTreeMap<String, Scope>,
+) -> Vec<(Scope, String)> {
+    use state::Status as S;
+    let part = |id: &str| apply_cmd::part_of(of, id);
+    let failed_part = failure.and_then(|_| {
+        let first = |want: &dyn Fn(S) -> bool| {
+            statuses
+                .iter()
+                .filter(|(_, s)| want(**s))
+                .map(|(id, _)| part(id))
+                .min_by_key(|s| s.rank())
+        };
+        first(&|s| {
+            matches!(
+                s,
+                S::Failed | S::Blocked | S::Unknown | S::Pending | S::BlockedPending
+            )
+        })
+        .or_else(|| first(&|s| s == S::NotStarted))
+    });
+    // The run's failure is reported once, by the part it came from.
+    let mut reported = false;
+    let ran = statuses.values().any(|s| *s != S::NotStarted);
+    parts
+        .iter()
+        .map(|p| {
+            let mine: Vec<S> = statuses
+                .iter()
+                .filter(|(id, _)| part(id) == p.scope)
+                .map(|(_, s)| *s)
+                .collect();
+            let none_started = !mine.is_empty() && mine.iter().all(|s| *s == S::NotStarted);
+            let status = if let Some(s) = not_run(p) {
+                s
+            } else if p.changes_nothing() && !journal_open {
+                p.idle()
+            } else if let Some(e) =
+                failure.filter(|_| !reported && failed_part.is_none_or(|f| f == p.scope))
+            {
+                reported = true;
+                if none_started && ran {
+                    "not_started".into()
+                } else {
+                    // `blocked` is the word for a part that did not run (C10), not a failure.
+                    let word = match e.exit() {
+                        dfm_model::Exit::Blocked => "failed",
+                        exit => exit.name(),
+                    };
+                    format!("{word} ({})", e.code.as_str())
+                }
+            } else if failure.is_some()
+                && !mine
+                    .iter()
+                    .all(|s| matches!(s, S::Updated | S::Current | S::Held | S::NotInScope))
+            {
+                // Its operations did not start, or waited for one that did not complete.
+                "not_started".into()
+            } else {
+                "ok".into()
+            };
+            (p.scope, status)
+        })
+        .collect()
 }
 
 // ---- the upgrade step (docs/upgrade.md) ------------------------------------------------------
@@ -2469,73 +2384,6 @@ fn upgrade(
     Ok(Some(counts.join(" ")))
 }
 
-/// What the scopes that already ran in this sync did (see `run_inner`).
-struct Earlier<'a> {
-    done: &'a BTreeMap<String, Operation>,
-    home: &'a Path,
-}
-
-/// Runs one approved scope through its own command (`apply_cmd::run`) with its plan digest.
-/// Returns the accounts without a session when the secrets scope finds none now: it is skipped.
-/// A scope after an earlier scope that changed something is planned again first, from the
-/// published tree: it runs only when that plan is the reviewed one with the earlier scopes'
-/// effects applied (`as_reviewed`), with the digest of that plan.
-fn run_scope(
-    ctx: &Ctx,
-    sys: &Sys,
-    args: &Args,
-    p: &ScopePlan,
-    loaded: &Loaded,
-    earlier: &Earlier<'_>,
-    out: &mut dyn Write,
-) -> Result<Option<Vec<(String, String)>>, Refusal> {
-    if p.scope == Scope::Secrets {
-        let no_session =
-            secret::missing_sessions(&p.runnable(), &loaded.resolved, &ctx.runner(sys))?;
-        if !no_session.is_empty() {
-            return Ok(Some(no_session));
-        }
-    }
-    // A service deferred to this point always follows a configuration scope that ran.
-    let fresh = match p.scope {
-        Scope::Config => None,
-        _ if earlier.done.is_empty() => None,
-        _ => {
-            let now = crate::load_resolved(ctx, args.apply.root.as_deref().map(Path::new))?;
-            let scoped = scope_args(args, p.scope, None);
-            let probed = apply_cmd::probe(ctx, sys, &scoped, &now)?;
-            let fresh = plan_for(ctx, &now, p.scope, probed)?;
-            if !as_reviewed(p, &fresh, earlier.done, earlier.home) {
-                return Err(Refusal::new(
-                    Code::PlanStale,
-                    format!(
-                        "the {} plan after the earlier scopes of this sync is not the reviewed one. Fix: run dfm sync again and approve the new plan",
-                        p.scope.as_str()
-                    ),
-                ));
-            }
-            Some(fresh)
-        }
-    };
-    // A deferred restart is an operation of the new plan only: its approval goes with it.
-    let approvals = fresh.as_ref().unwrap_or(&p.plan);
-    let scoped = apply_cmd::Args {
-        yes_plan: Some(match &fresh {
-            Some(f) => f.digest()?,
-            None => p.digest.clone(),
-        }),
-        ..scope_args(args, p.scope, Some(approvals))
-    };
-    // The scope's first look is the recheck just made: the plan under its lock is compared
-    // with that digest.
-    let scoped = apply_cmd::Args {
-        planned: fresh,
-        held: p.withheld.clone(),
-        ..scoped
-    };
-    apply_cmd::run(ctx, &scoped, out).map(|()| None)
-}
-
 fn untrusted_refusal(origins: &[&str]) -> Refusal {
     let fix: Vec<String> = origins
         .iter()
@@ -2551,346 +2399,6 @@ fn untrusted_refusal(origins: &[&str]) -> Refusal {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use dfm_model::plan::{Binary, Input, Observations, Operation, Precondition};
-
-    fn pre(subject: &str, state: &str) -> Precondition {
-        Precondition {
-            subject: subject.into(),
-            state: state.into(),
-        }
-    }
-
-    /// A services plan with one start of `life.agent`, whose definition is `PLIST`.
-    fn services_plan(preconditions: Vec<Precondition>) -> Plan {
-        Plan {
-            schema: 1,
-            command: "plan".into(),
-            scope: "services".into(),
-            binary: Binary {
-                version: "0".into(),
-                sha256: "0".repeat(64),
-            },
-            profile: "/p".into(),
-            machine_id: "m".into(),
-            model_digest: "0".repeat(64),
-            sources: vec![],
-            observations: Observations::default(),
-            operations: vec![Operation {
-                id: "life.agent@service".into(),
-                journal_id: "j".into(),
-                resource: "life.agent".into(),
-                module: "life".into(),
-                adapter: "launchd-agent/v1".into(),
-                class: dfm_model::state::Class::Normal,
-                action: Action::Start,
-                status: PlanStatus::Planned,
-                path: None,
-                mode: None,
-                link: None,
-                privilege: "user".into(),
-                effect: "start org.example.agent".into(),
-                ownership: Ownership::Absent,
-                inputs: vec![],
-                fragments: vec![],
-                fragment_dir: None,
-                output_sha256: None,
-                managed_sha256: None,
-                takeover: false,
-                output_bytes: None,
-                excluded: None,
-                sets: vec![],
-                after: vec![],
-                preconditions,
-                postcondition: String::new(),
-            }],
-            blockers: vec![],
-        }
-    }
-
-    const PLIST: &str = "Library/LaunchAgents/org.example.agent.plist";
-
-    fn reviewed(plan: Plan) -> ScopePlan {
-        ScopePlan {
-            scope: Scope::Services,
-            digest: plan.digest().unwrap(),
-            plan,
-            skipped: vec![],
-            no_session: vec![],
-            blocked: false,
-            deferred: BTreeMap::new(),
-            withheld: BTreeSet::new(),
-        }
-    }
-
-    #[test]
-    fn a_sync_scope_holds_back_an_unapproved_adoption_and_what_runs_after_it() {
-        let mut plan = services_plan(vec![]);
-        let base = plan.operations.remove(0);
-        let op = |id: &str, action, takeover, after: &[&str]| Operation {
-            id: id.into(),
-            action,
-            takeover,
-            after: after.iter().map(|a| a.to_string()).collect(),
-            ..base.clone()
-        };
-        plan.operations = vec![
-            op("adopt", Action::Adopt, false, &[]),
-            op("takeover", Action::UpdateFile, true, &[]),
-            op("child", Action::CreateLink, false, &["adopt"]),
-            op("grandchild", Action::CreateLink, false, &["child"]),
-            op("free", Action::CreateLink, false, &[]),
-        ];
-        let mut args =
-            apply_cmd::parse_args(&crate::cli::parse("apply", &[]).unwrap(), Scope::Config)
-                .unwrap();
-        assert!(
-            apply_cmd::withheld(&args, &plan).is_empty(),
-            "a standalone command holds nothing back"
-        );
-        args.composed = true;
-        let withheld = |args: &apply_cmd::Args| Vec::from_iter(apply_cmd::withheld(args, &plan));
-        assert_eq!(
-            withheld(&args),
-            ["adopt", "child", "grandchild", "takeover"]
-        );
-        args.allow_adopt.insert("adopt".into());
-        assert_eq!(withheld(&args), ["takeover"]);
-    }
-
-    #[test]
-    fn a_service_waiting_for_a_withheld_configuration_operation_is_blocked_not_deferred() {
-        let mut services = services_plan(vec![]);
-        services.blockers = vec![Blocker {
-            code: Code::Conflict,
-            resource: "life.agent".into(),
-            source: "base/modules/life/module.toml".into(),
-            field: Some("/label".into()),
-            path: Some(PLIST.into()),
-            detail: "not published".into(),
-            correction: "publish it first".into(),
-        }];
-        let mut config = services_plan(vec![]);
-        config.operations[0].id = format!("life.agent-plist@{PLIST}");
-        config.operations[0].action = Action::CreateLink;
-        config.operations[0].path = Some(PLIST.into());
-        let none = BTreeSet::new();
-        let deferred = BTreeMap::from([("life.agent@service".to_string(), Action::Start)]);
-        assert_eq!(
-            blocked_or_deferred(Scope::Services, &services, Some(&config), &none),
-            (false, deferred)
-        );
-        let restart = BTreeSet::from(["life.agent".to_string()]);
-        let deferred = BTreeMap::from([("life.agent@service".to_string(), Action::Restart)]);
-        assert_eq!(
-            blocked_or_deferred(Scope::Services, &services, Some(&config), &restart),
-            (false, deferred)
-        );
-        // The configuration operation is withheld: nothing publishes the definition.
-        let empty = apply_cmd::without(&config, &BTreeSet::from([config.operations[0].id.clone()]));
-        assert_eq!(
-            blocked_or_deferred(Scope::Services, &services, Some(&empty), &none),
-            (true, BTreeMap::new())
-        );
-    }
-
-    fn before() -> Vec<Precondition> {
-        vec![
-            pre(&format!("path:{PLIST}"), "link:/r/old.plist"),
-            pre(&format!("content:{PLIST}"), "sha256:aa"),
-            pre(
-                "probe:launchd-agent/v1:org.example.agent",
-                "stopped:not loaded",
-            ),
-        ]
-    }
-
-    /// An approved operation of an earlier scope at `path`.
-    fn earlier(path: &str, action: Action, link: Option<&str>) -> (String, Operation) {
-        let mut o = services_plan(vec![]).operations.remove(0);
-        o.id = format!("x@{path}");
-        o.action = action;
-        o.path = Some(path.into());
-        o.link = link.map(String::from);
-        (dfm_model::fold::fold(path), o)
-    }
-
-    #[test]
-    fn a_later_scope_is_checked_against_the_approved_effects_of_the_earlier_scopes() {
-        let home = Path::new("/nonexistent-home");
-        let review = reviewed(services_plan(before()));
-        let done: BTreeMap<String, Operation> =
-            [earlier(PLIST, Action::ReplaceLink, Some("/r/new.plist"))].into();
-        let mut after = before();
-        // `/r/new.plist` does not exist here, so observe records the link as dangling.
-        after[0].state = "link:/r/new.plist:dangling".into();
-        let fresh = services_plan(after.clone());
-        // 1. The definition link is the one the configuration scope published: accepted.
-        assert!(as_reviewed(&review, &fresh, &done, home));
-        let mut kind = after.clone();
-        kind[0].state = "link:/r/new.plist:file".into();
-        assert!(!as_reviewed(&review, &services_plan(kind), &done, home));
-        // 2. Another target than the approved one, or no earlier write of the path: refused.
-        let mut other = after.clone();
-        other[0].state = "link:/r/other.plist:file".into();
-        assert!(!as_reviewed(&review, &services_plan(other), &done, home));
-        assert!(!as_reviewed(&review, &fresh, &BTreeMap::new(), home));
-        let elsewhere: BTreeMap<String, Operation> = [earlier(
-            ".config/other",
-            Action::ReplaceLink,
-            Some("/r/new.plist"),
-        )]
-        .into();
-        assert!(!as_reviewed(&review, &fresh, &elsewhere, home));
-        // 3. The content through a link stays as reviewed (read at the new target).
-        let mut content = after.clone();
-        content[1].state = "sha256:bb".into();
-        assert!(!as_reviewed(&review, &services_plan(content), &done, home));
-        // 4. Any other difference is refused, even with the definition written.
-        let mut probe = after.clone();
-        probe[2].state = "current:loaded".into();
-        assert!(!as_reviewed(&review, &services_plan(probe), &done, home));
-        let mut status = services_plan(after.clone());
-        status.operations[0].status = PlanStatus::Current;
-        assert!(!as_reviewed(&review, &status, &done, home));
-        let mut action = services_plan(after.clone());
-        action.operations[0].action = Action::Restart;
-        assert!(!as_reviewed(&review, &action, &done, home));
-        let mut effect = services_plan(after.clone());
-        effect.operations[0].effect = "start another program".into();
-        assert!(!as_reviewed(&review, &effect, &done, home));
-        let mut extra = services_plan(after.clone());
-        extra.operations[0]
-            .preconditions
-            .push(pre(&format!("path:{PLIST}.d"), "missing"));
-        assert!(!as_reviewed(&review, &extra, &done, home));
-        // 5. A deferred service may come back as a restart only when it was reviewed as one.
-        // The review stopped at the definition that was not published: no precondition, and the
-        // definition must be the source of the published link.
-        let mut blocked = services_plan(vec![]);
-        blocked.operations[0].status = PlanStatus::Blocked;
-        blocked.operations[0].effect = format!("blocked: depends on {PLIST}");
-        let mut deferred = reviewed(blocked);
-        let id = deferred.plan.operations[0].id.clone();
-        let mut link = done.clone();
-        link.get_mut(&dfm_model::fold::fold(PLIST)).unwrap().inputs = vec![Input {
-            path: "files/new.plist".into(),
-            content_id: Some("sha256:aa".into()),
-        }];
-        deferred.deferred.insert(id.clone(), Action::Start);
-        assert!(!as_reviewed(&deferred, &action, &link, home));
-        deferred.deferred.insert(id, Action::Restart);
-        assert!(as_reviewed(&deferred, &action, &link, home));
-        // 6. A deferred definition with other content than that source, through another link
-        // than the published one, or with another resource: refused.
-        assert!(!as_reviewed(&deferred, &action, &done, home));
-        let mut content = action.clone();
-        content.operations[0].preconditions[1].state = "sha256:bb".into();
-        assert!(!as_reviewed(&deferred, &content, &link, home));
-        let mut other = action.clone();
-        other.operations[0].preconditions[0].state = "link:/r/other.plist:file".into();
-        assert!(!as_reviewed(&deferred, &other, &link, home));
-        let mut resource = action.clone();
-        resource.operations[0].resource = "life.other".into();
-        assert!(!as_reviewed(&deferred, &resource, &link, home));
-    }
-
-    #[test]
-    fn a_directory_an_earlier_scope_created_drops_out_of_the_reviewed_plan() {
-        let home = Path::new("/nonexistent-home");
-        let dir = ".config/example";
-        let mut review = services_plan(vec![pre(".config", "dir:755")]);
-        let mut mkdir = earlier(dir, Action::CreateDir, None).1;
-        mkdir.id = format!("mkdir@{dir}");
-        mkdir.preconditions = vec![pre(&format!("path:{dir}"), "missing")];
-        review.operations[0].after = vec![mkdir.id.clone()];
-        review.operations.insert(0, mkdir.clone());
-        let review = reviewed(review);
-        let done: BTreeMap<String, Operation> = [(dfm_model::fold::fold(dir), mkdir)].into();
-        let fresh = |state: &str| {
-            services_plan(vec![
-                pre(".config", "dir:755"),
-                pre(&format!("path:{dir}"), state),
-            ])
-        };
-        // apply creates a directory with mode 700.
-        assert!(as_reviewed(&review, &fresh("dir:700"), &done, home));
-        // The directory is not there now, or not as apply made it: the earlier effect did not
-        // hold.
-        assert!(!as_reviewed(&review, &fresh("missing"), &done, home));
-        assert!(!as_reviewed(&review, &fresh("link:/x:dir"), &done, home));
-        assert!(!as_reviewed(&review, &fresh("dir:755"), &done, home));
-        // Without the earlier mkdir, the reviewed mkdir is still expected.
-        assert!(!as_reviewed(
-            &review,
-            &fresh("dir:700"),
-            &BTreeMap::new(),
-            home
-        ));
-    }
-
-    #[test]
-    fn a_file_an_earlier_scope_rendered_must_hold_the_approved_content_and_mode() {
-        let home = TempDirLite::new();
-        let path = ".config/bar/barrc";
-        let bytes = b"height=1\n";
-        fs::create_dir_all(home.0.join(".config/bar")).unwrap();
-        fs::write(home.0.join(path), bytes).unwrap();
-        let (_, mut op) = earlier(path, Action::UpdateFile, None);
-        op.mode = Some(0o644);
-        op.output_sha256 = Some(sha256_hex(bytes));
-        op.output_bytes = Some(bytes.len() as u64);
-        let fp = dfm_model::plan::file_fingerprint(bytes);
-        let ok = format!("file:644:sha256:{fp}");
-        assert!(left_by(&op, "path", &ok, &home.0));
-        // Named in another case, observe records the name apply gave the file as the alias.
-        assert!(left_by(&op, "path", &format!("{ok} alias=barrc"), &home.0));
-        assert!(!left_by(&op, "path", &format!("{ok} alias=BARRC"), &home.0));
-        assert!(!left_by(
-            &op,
-            "path",
-            &format!("file:600:sha256:{fp}"),
-            &home.0
-        ));
-        assert!(!left_by(&op, "path", "file:644:sha256:00", &home.0));
-        assert!(left_by(
-            &op,
-            "content",
-            &format!("sha256:{}", sha256_hex(bytes)),
-            &home.0
-        ));
-        assert!(!left_by(&op, "content", "sha256:00", &home.0));
-        assert!(left_by(&op, "sensitive-path", "file:644", &home.0));
-        assert!(!left_by(&op, "sensitive-path", "file:600", &home.0));
-        // A path observed without a hash records the size: the size of the approved content.
-        assert!(left_by(&op, "path", "file:644:size:9", &home.0));
-        assert!(!left_by(&op, "path", "file:644:size:10", &home.0));
-        assert!(!left_by(&op, "path", "file:600:size:9", &home.0));
-        // Another hand rewrote the file after the scope: the precondition is not the approved one.
-        fs::write(home.0.join(path), b"height=2\n").unwrap();
-        assert!(!left_by(&op, "path", &ok, &home.0));
-    }
-
-    /// A scratch directory removed on drop.
-    struct TempDirLite(PathBuf);
-
-    impl TempDirLite {
-        fn new() -> Self {
-            let d = std::env::temp_dir().join(format!(
-                "dfm-sync-unit-{}-{}",
-                std::process::id(),
-                now_ns().unwrap()
-            ));
-            fs::create_dir_all(&d).unwrap();
-            TempDirLite(d)
-        }
-    }
-
-    impl Drop for TempDirLite {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.0);
-        }
-    }
-
     #[test]
     fn redirects_and_http_alternates_stay_disabled() {
         // Any value but `true` also disables the dumb-HTTP alternates (is_alternate_allowed).
