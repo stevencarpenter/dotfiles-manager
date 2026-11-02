@@ -1487,8 +1487,8 @@ impl Planner<'_> {
     /// must exist now and is recorded as a precondition; a missing one blocks the service, since
     /// a reload depends on the published file. Every missing one is a blocker, so a caller sees
     /// all the files the service waits for, not only the first. A missing file never hides the
-    /// probe's own blocker: both are listed, so `sync` defers only a service whose probe plans a
-    /// start, a restart or `current` once the files are published.
+    /// probe's own blocker: both are listed. In a combined `sync` plan, a missing file that a
+    /// planned operation of the same plan publishes does not block: the service waits for it.
     fn service(&mut self, r: &ResolvedResource) {
         let id = format!("{}@service", r.id);
         let mut op = self.skeleton(r, id.clone(), None);
@@ -1597,7 +1597,7 @@ impl Planner<'_> {
         // The verdict of the probe alone: the action, status, effect and probe precondition it
         // plans, or its own blocker. A blocker is recorded even while a prerequisite file is
         // missing: only a service whose probe plans a start, a restart or `current` once the
-        // files are published waits for them (`sync` defers it); any other state blocks it now,
+        // files are published waits for them (in a combined plan); any other state blocks it now,
         // and the caller sees every blocker of the service, not only the files.
         let verdict = match state {
             Some(ref s @ (ServiceState::Current(ref d) | ServiceState::Stale(ref d)))
@@ -2849,11 +2849,10 @@ mod tests {
 
     #[test]
     fn a_service_waits_for_its_files_only_when_their_publication_plans_it() {
-        // `sync` defers a blocked service when every blocker is a missing file that the
-        // configuration scope publishes (a path blocker of E_CONFLICT). For every probe state
-        // and restart request, that holds exactly when the same service, its files published,
-        // plans a start, a restart or `current`; otherwise the probe's own blocker is listed
-        // next to the file's.
+        // A service whose only blockers are missing files (path blockers of E_CONFLICT) is one
+        // that, its files published, plans a start, a restart or `current`, for every probe
+        // state and restart request; otherwise the probe's own blocker is listed next to the
+        // file's. A combined plan lets only such a service wait for the files it publishes.
         let states = [
             Some(ServiceState::Current("loaded".into())),
             Some(ServiceState::Stopped("not loaded".into())),
@@ -2864,12 +2863,12 @@ mod tests {
             Some(ServiceState::Refused("another label".into())),
             None,
         ];
-        let mut deferred = 0;
+        let mut waits = 0;
         for state in states {
             for requested in [false, true] {
                 let what = format!("{state:?} requested={requested}");
                 let waiting = service_plan(false, state.clone(), requested);
-                let defers = !waiting.blockers.is_empty()
+                let files_only = !waiting.blockers.is_empty()
                     && waiting
                         .blockers
                         .iter()
@@ -2882,7 +2881,7 @@ mod tests {
                         (Action::Start | Action::Restart, Status::Planned)
                             | (Action::None, Status::Current)
                     );
-                assert_eq!(defers, runs, "{what}: {waiting:?}");
+                assert_eq!(files_only, runs, "{what}: {waiting:?}");
                 // The file's blocker is always listed; a blocking probe adds its own.
                 assert!(
                     waiting
@@ -2897,11 +2896,11 @@ mod tests {
                     "{what}: {waiting:?}"
                 );
                 assert_eq!(waiting.operations[0].status, Status::Blocked, "{what}");
-                deferred += usize::from(defers);
+                waits += usize::from(files_only);
             }
         }
         // Current and Stopped either way, and Stale on request.
-        assert_eq!(deferred, 5);
+        assert_eq!(waits, 5);
     }
 
     #[test]

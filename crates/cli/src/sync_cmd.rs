@@ -1471,6 +1471,8 @@ fn plan_staged(
         .collect();
     generated.retain(|path, _| !unwritten.contains(path));
     loaded.generated = generated;
+    // A planning input, not a post-run retarget: the services probe reads each planned link's
+    // staged target before anything runs.
     loaded.links = config
         .operations
         .iter()
