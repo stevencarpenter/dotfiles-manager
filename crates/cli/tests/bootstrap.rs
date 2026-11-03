@@ -235,6 +235,60 @@ fn toolchain_digest_refuses_entries_owned_by_another_user() {
     );
 }
 
+/// `--list` prints the entries the digest covers, in digest order, so two machines can be compared
+/// with `diff`. Hashing the listed lines with the digest's encoding gives the printed digest.
+#[test]
+fn toolchain_digest_list_prints_the_entries_the_digest_covers() {
+    use sha2::Digest;
+    let tmp = TempDir::new("list");
+    let home = tmp.path().join("home");
+    let tc = tmp.path().join("tc");
+    fs::create_dir_all(&home).unwrap();
+    fs::create_dir_all(tc.join("bin")).unwrap();
+    fs::create_dir_all(tc.join("lib")).unwrap();
+    fs::write(tc.join("bin/a"), "a").unwrap();
+    fs::set_permissions(tc.join("bin/a"), fs::Permissions::from_mode(0o755)).unwrap();
+    fs::write(tc.join("lib/b"), "b").unwrap();
+    std::os::unix::fs::symlink("a", tc.join("bin/l")).unwrap();
+    let dir = tc.to_str().unwrap();
+    let o = script_test_mode(&home, &["toolchain-digest", "--dir", dir, "--list"], &[]);
+    assert_eq!(o.status.code(), Some(0), "{}", err(&o));
+    let list = String::from_utf8(o.stdout).unwrap();
+    let a = format!("{:x}", sha2::Sha256::digest(b"a"));
+    let b = format!("{:x}", sha2::Sha256::digest(b"b"));
+    assert_eq!(
+        list,
+        format!("bin/a\texec\t{a}\nbin/l\tsymlink\ta\nlib/b\tfile\t{b}\n")
+    );
+    let mut encoded = Vec::new();
+    for line in list.lines() {
+        encoded.extend(line.replace('\t', "\0").bytes());
+        encoded.push(b'\n');
+    }
+    let o = script_test_mode(&home, &["toolchain-digest", "--dir", dir], &[]);
+    assert_eq!(o.status.code(), Some(0), "{}", err(&o));
+    assert_eq!(
+        String::from_utf8(o.stdout).unwrap(),
+        format!("{:x}\n", sha2::Sha256::digest(&encoded))
+    );
+}
+
+#[test]
+fn toolchain_digest_list_refuses_what_the_digest_refuses() {
+    let tmp = TempDir::new("list-refused");
+    let home = tmp.path().join("home");
+    let tc = tmp.path().join("tc");
+    fs::create_dir_all(&home).unwrap();
+    fs::create_dir_all(&tc).unwrap();
+    fs::write(tc.join("a"), "a").unwrap();
+    fs::set_permissions(tc.join("a"), fs::Permissions::from_mode(0o664)).unwrap();
+    let args = ["toolchain-digest", "--dir", tc.to_str().unwrap(), "--list"];
+    let o = script_test_mode(&home, &args, &[]);
+    assert_eq!(o.status.code(), Some(3), "{}", err(&o));
+    assert!(err(&o).contains("E_TOOLCHAIN_MISMATCH"), "{}", err(&o));
+    assert!(o.stdout.is_empty());
+}
+
 #[test]
 fn toolchain_digest_refuses_file_names_with_backslashes() {
     let tmp = TempDir::new("backslash");
@@ -3127,6 +3181,8 @@ fn repeated_flags_and_flags_the_command_does_not_use_are_usage_errors() {
             vec!["toolchain-digest", "--source", "x"],
             "does not use --source",
         ),
+        (vec!["install", "--list"], "does not use --list"),
+        (vec!["toolchain-digest", "--list", "--list"], "given twice"),
         (
             vec!["check-controls", "--source", "a", "--source", "b"],
             "given twice",

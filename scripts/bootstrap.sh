@@ -5,7 +5,7 @@
 #   bootstrap.sh install [--source <git checkout | https:// or file:// URL>] [--commit <40 hex>]   (default: the source's HEAD)
 #   bootstrap.sh check-controls --source <staged tree>   (read-only)
 #   bootstrap.sh uninstall
-#   bootstrap.sh toolchain-digest --dir <installed toolchain>   (value for the lock)
+#   bootstrap.sh toolchain-digest --dir <installed toolchain> [--list]   (value for the lock; --list prints the entries it covers)
 #   any command: --expect-sha256 <64 hex>   (this file must have that digest, checked first)
 #
 # install reads every source through a bare clone (transfer.fsckObjects) in the scratch build
@@ -393,7 +393,8 @@ EOF
   [ "$root_ws" -eq 1 ] || refuse E_SOURCE_UNTRUSTED "the root Cargo.toml must declare [workspace]"
 }
 
-# Prints the toolchain tree digest of $1 (docs/bootstrap.md).
+# Prints the toolchain tree digest of $1 (docs/bootstrap.md), or with $2 = list the entries it
+# covers, one `path<TAB>class<TAB>value` line each, in digest order.
 # Fails closed: any unreadable entry, failed hash, bad symlink or empty tree is an error,
 # never a digest of the entries that happened to be readable.
 toolchain_digest() (
@@ -432,6 +433,7 @@ toolchain_digest() (
         printf "%s\tsymlink\t%s\n", $1, $2 }')
   entries=$(printf '%s\n%s\n%s\n' "$plain" "$execs" "$links" | grep .) || exit 1
   [ "$(printf '%s\n' "$entries" | wc -l | tr -d ' ')" -eq $((nf + nl)) ] || exit 1
+  if [ "${2:-}" = list ]; then printf '%s\n' "$entries" | sort; exit; fi
   printf '%s\n' "$entries" | sort | while IFS=$TAB read -r p c v; do printf '%s\0%s\0%s\n' "$p" "$c" "$v"; done |
     /usr/bin/shasum -a 256 | cut -d' ' -f1
 )
@@ -864,15 +866,15 @@ cmd_uninstall() {
 }
 
 cmd=${1:-}; [ $# -gt 0 ] && shift
-src='' commit='' dir='' expect='' seen=' '
+src='' commit='' dir='' expect='' list='' seen=' '
 # A flag is accepted once, and only by the commands that use it.
 flag() {
   case $cmd in
     install) ok=' --source --commit --expect-sha256 ' ;;
     check-controls) ok=' --source --expect-sha256 ' ;;
-    toolchain-digest) ok=' --dir --expect-sha256 ' ;;
+    toolchain-digest) ok=' --dir --list --expect-sha256 ' ;;
     uninstall) ok=' --expect-sha256 ' ;;
-    *) ok=' --source --commit --dir --expect-sha256 ' ;; # unknown command: the final usage line explains
+    *) ok=' --source --commit --dir --list --expect-sha256 ' ;; # unknown command: the final usage line explains
   esac
   case $ok in *" $1 "*) ;; *) usage "$cmd does not use $1" ;; esac
   case $seen in *" $1 "*) usage "$1 given twice" ;; esac
@@ -883,6 +885,7 @@ while [ $# -gt 0 ]; do
     --source) flag --source; [ $# -ge 2 ] || usage "--source needs a value"; src=$2; shift 2 ;;
     --commit) flag --commit; [ $# -ge 2 ] || usage "--commit needs a value"; commit=$2; shift 2 ;;
     --dir) flag --dir; [ $# -ge 2 ] || usage "--dir needs a value"; dir=$2; shift 2 ;;
+    --list) flag --list; list=1; shift ;;
     --expect-sha256) flag --expect-sha256; [ $# -ge 2 ] || usage "--expect-sha256 needs a value"; expect=$2; shift 2 ;;
     *) usage "unknown argument $1" ;;
   esac
@@ -908,9 +911,10 @@ fi
 case $cmd in
   install) cmd_install ;;
   uninstall) cmd_uninstall ;;
-  toolchain-digest) # prints the value for [manager].toolchain_tree_sha256 in dotfiles-manager.lock
+  toolchain-digest) # prints the value for [manager].toolchain_tree_sha256 in dotfiles-manager.lock,
+    # or with --list the entries it covers, so two trees can be compared with diff
     [ -d "${dir:-}" ] || usage "toolchain-digest needs --dir <installed toolchain>"
-    d=$(toolchain_digest "$dir") && [ -n "$d" ] || refuse E_TOOLCHAIN_MISMATCH "cannot digest $dir"
+    d=$(toolchain_digest "$dir" ${list:+list}) && [ -n "$d" ] || refuse E_TOOLCHAIN_MISMATCH "cannot digest $dir"
     printf '%s\n' "$d" ;;
   check-controls)
     [ -n "$src" ] || usage "check-controls needs --source"
