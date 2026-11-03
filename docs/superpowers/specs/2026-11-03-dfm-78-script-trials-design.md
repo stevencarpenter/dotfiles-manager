@@ -173,7 +173,7 @@ Exit codes follow docs/trial.md. A script that exits nonzero is exit 1 after the
 3. **No terminal by default**, `--tty` to attach one. The alternative is a terminal by default, as when the owner runs `curl | sh` by hand.
 4. **dfm runs the script**, not the owner under observation.
 5. **A pre-existing tool refuses the trial**, unlike provider trials, which record a pre-existing tool.
-6. **Adopt writes a `script/v1` declaration that `sync` installs on a new machine** after a `script:<url>` grant, and a script tool can be adopted with the declaration only. The smaller alternative: no install declaration, adopt prints the command for a new machine, and slice 3 shrinks to the configuration candidates.
+6. **Adopt writes a `script/v1` declaration that `sync` installs on a new machine** after a `script:<url>` grant, and a script tool can be adopted with the declaration only. Owner decision on 2026-11-03. The owner declined the smaller alternative, in which adopt only prints the install command for a new machine.
 7. **Purge removes links it can attribute** (created in a watched bin directory, target unchanged), as an exception to the current link rule.
 8. **The tool owns its upgrades**; dfm reports and does not update.
 9. **The script's output is shown**, not withheld. Command output elsewhere is withheld (docs/secrets.md), but the owner runs a script trial to watch it.
