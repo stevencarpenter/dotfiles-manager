@@ -1,6 +1,6 @@
 # DFM-78: script-based install trials and self-updating tools
 
-Status: draft for owner approval (DFM-78.C08). Kaneo: DFM-78. Inputs: the code at main bc23ea2, `~/.dotfiles` as bound on the personal M5, and the installer scripts fetched (not run) on 2026-11-03. This is a design. Implementation is a separate task.
+Status: approved by the owner on 2026-11-03 (DFM-78.C08). Kaneo: DFM-78. Inputs: the code at main bc23ea2, `~/.dotfiles` as bound on the personal M5, and the installer scripts fetched (not run) on 2026-11-03. This is a design. Implementation is a separate task.
 
 ## Intent
 
