@@ -88,7 +88,7 @@ The script runs under `/usr/bin/sandbox-exec` with a profile that dfm generates 
 - **Allow** by default, then **deny** `file-write*` outside HOME, the user's temporary directory (`getconf DARWIN_USER_TEMP_DIR`), `/private/tmp` and `/dev`.
 - **Deny** `file-write*` below each guarded checkout: the bound checkout and each nested source checkout that the published lock declares (the set of `guarded_checkouts`, `crates/cli/src/sync_cmd.rs`).
 - **Deny** `file-write*` on each target path that the ledger records (the dfm links themselves), so a script can neither write through a link nor replace or remove it.
-- **Deny** `file-write*` below the manager's state, cache and installation directories.
+- **Deny** `file-write*` on the manager's reserved paths (the `reserved` set in `crates/engine/src/store.rs`): below the state root, the configuration directory that holds the machine binding, the data directory and the cache directory, and on the writer lock file itself. The lock file rule also denies its removal, so a second writer cannot take a new lock while the trial holds the old one. Also deny `file-write*` below the manager's installation directory.
 - **Deny** `process-exec` of `/usr/bin/sudo`, `/usr/bin/su` and `/usr/bin/osascript`, so the script cannot ask for administrator rights.
 
 Tested on the M5 (Darwin 27.2.0, 2026-11-03, scratchpad only): an append and a truncate through a link into a denied directory fail with "Operation not permitted"; `mv` over the link and `rm` of the link fail; a child process inherits the denial; `sudo` fails with exit 126; writes in HOME and in the temporary directory succeed; a write to `/private/var/tmp` fails.
@@ -119,8 +119,8 @@ dfm observes the watch set under the lock, just before the script starts and aga
 ## Interactive steps (C05)
 
 - **Default: no terminal.** The script starts in a new session (`setsid`), with standard input from `/dev/null` and standard output and error to dfm's own. `/dev/tty` cannot be opened, so a prompt fails at once instead of waiting. The owner sees the script's output as it runs. It is not withheld, because the owner started this run to watch it.
-- **`--tty`.** The script runs in dfm's foreground process group with dfm's terminal as standard input, so `/dev/tty` prompts work (boat's `boat onboard`, rustup without `-y`). The writer lock is held while the owner answers. The sandbox still denies `sudo`, `su` and `osascript`.
-- A stop request (SIGINT, SIGTERM) ends the script's process group, as for a provider install. The record and the window observed so far stay.
+- **`--tty`.** The script runs with dfm's terminal as standard input, so `/dev/tty` prompts work (boat's `boat onboard`, rustup without `-y`). It runs in its own process group, as a provider install does. dfm makes that group the terminal's foreground group (`tcsetpgrp`) for the run, and takes the terminal back after the script exits, with SIGTTOU blocked while it does so. The writer lock is held while the owner answers. The sandbox still denies `sudo`, `su` and `osascript`.
+- A stop request ends the script's process group, as for a provider install: SIGTERM, the grace period, then SIGKILL (`crates/engine/src/proc.rs`). dfm is not in that group, so it stays alive and writes the record and the window observed so far. With `--tty`, a terminal SIGINT goes to the script's foreground group and not to dfm. dfm records the run when the script exits.
 
 For boat, this means `dfm trial boat --script https://boat.dev/install --tty`. Without `--tty`, `boat onboard` reads `/dev/null`, and the installer exits with onboard's status.
 
@@ -161,8 +161,8 @@ Exit codes follow docs/trial.md. A script that exits nonzero is exit 1 after the
 - **A dfm updater** for a script tool exists only when a manager release adds it to the fixed set, as for `claude`, `codex` and `opencode` (docs/upgrade.md). A document cannot add one.
 - **dfm never runs the tool binary to read a version.** boat checks for updates after any command ends, so `boat --version` could start an update.
 - **`doctor`** gets one row per active script trial and per adopted script declaration:
-  - OK with a note when the file at `script.binary.real_path` (or the declared binary, resolved through links) changed since the trial (`binary changed since trial: sha256 a… -> b…`). A self-update is expected.
-  - WARN when the binary path is missing.
+  - OK with a note when the binary changed since the trial (`binary changed since trial: sha256 a… -> b…`). A self-update is expected. Each `doctor` run resolves `script.binary.path` (or the declared binary path) through its links again and hashes the file that it points to now. It does not hash the recorded `real_path`, because an updater can point the link to a new file and leave the old one in place (Claude Code points `~/.local/bin/claude` to a new `versions/<ver>` file). The note names both real paths when they differ.
+  - WARN when the binary path or its link target is missing.
   - WARN when PATH holds more than one executable named `<tool>` that resolves to different files, listing each path and its owner (`homebrew/v1`, `mise/v1`, `script trial <id>`, or `unknown`).
 - The Homebrew second-copy note for `claude`, `codex` and `opencode` stays as it is.
 
@@ -188,7 +188,7 @@ Exit codes follow docs/trial.md. A script that exits nonzero is exit 1 after the
 - Limits: entries per watched directory, total window entries, script size (1 MiB above).
 - The doctor code name.
 - How the sandbox tests run where `sandbox-exec` is missing (for example a Linux CI runner): they skip with a note, as the real-gitleaks tests do.
-- Tests, with look-alike scripts in the test-isolation build: a write through a link is denied and the repo file is unchanged; a replaced or removed link is denied; `sudo` is denied; a write outside HOME is denied; a created directory, bin file and link are recorded and purged; a modified startup file is retained; a changed cache file is `E_PLAN_STALE`; a redirect to `http` is refused; `--tty` off gives a failing `/dev/tty` read; a pre-existing tool is refused; adopt promotes a created `~/.config` entry and writes the declaration; sync installs a missing declared tool only with the grant.
+- Tests, with look-alike scripts in the test-isolation build: a write through a link is denied and the repo file is unchanged; a replaced or removed link is denied; `sudo` is denied; a write outside HOME is denied; a write to the machine binding and a removal of the lock file are denied; a rename of an ancestor of a protected path (for example `~/.config`) is denied; with `--tty`, a stop request ends the script and dfm still writes the window; `doctor` sees an update that points the binary link to a new file; a created directory, bin file and link are recorded and purged; a modified startup file is retained; a changed cache file is `E_PLAN_STALE`; a redirect to `http` is refused; `--tty` off gives a failing `/dev/tty` read; a pre-existing tool is refused; adopt promotes a created `~/.config` entry and writes the declaration; sync installs a missing declared tool only with the grant.
 
 ## Delivery
 
