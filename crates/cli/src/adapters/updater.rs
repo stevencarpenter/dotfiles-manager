@@ -696,10 +696,24 @@ fn npm_outdated(env: &Env, names: &[String]) -> Result<(Vec<Item>, Vec<String>),
     let v: serde_json::Value =
         serde_json::from_slice(&out.stdout).map_err(|e| bad(format!("not JSON ({e})")))?;
     let packages = v.as_object().ok_or_else(|| bad("not an object".into()))?;
+    // A failed registry request is `{"error": {"code": ..., "summary": ...}}` with exit 1, not
+    // a listing.
+    if let Some(e) = packages.get("error") {
+        return Err(bad(format!(
+            "npm reported an error ({})",
+            e.get("code").and_then(|c| c.as_str()).unwrap_or("no code")
+        )));
+    }
     let (mut items, mut held) = (Vec::new(), Vec::new());
     for (name, p) in packages {
-        let (current, wanted, latest) =
-            (field(p, "current"), field(p, "wanted"), field(p, "latest"));
+        let text = |k: &str| {
+            p.get(k)
+                .and_then(|x| x.as_str())
+                .map(str::to_string)
+                .ok_or_else(|| bad(format!("the entry {name} has no {k}")))
+        };
+        let (current, wanted) = (text("current")?, text("wanted")?);
+        let latest = field(p, "latest");
         if name == "npm" {
             held.push(format!(
                 "npm {current} held (Homebrew's node formula owns it; latest {latest})"
@@ -788,8 +802,8 @@ fn uv_tool_names(env: &Env) -> Result<Vec<String>, String> {
 /// (its `?rev=` query aside) is mapped as it is, so a value that maps to no git origin never
 /// reaches git, and then as git fetches it (`git ls-remote --get-url` applies the user's
 /// `url.*.insteadOf` rewrites, locally); a directory, an editable path or an index name needs
-/// none; any other source (a `url` archive) maps to no identity, and so does an unreadable
-/// receipt.
+/// none; any other source (a `url` archive) maps to no identity, and so does a legacy string
+/// requirement or an unreadable receipt.
 fn uv_identities(env: &Env) -> Vec<Result<String, String>> {
     let names = match uv_tool_names(env) {
         Ok(n) => n,
@@ -818,6 +832,14 @@ fn uv_identities(env: &Env) -> Vec<Result<String, String>> {
             .cloned()
             .unwrap_or_default();
         for r in reqs {
+            // uv's legacy receipt form is one PEP 508 string per requirement, whose source
+            // these keys cannot show (as `package::uv_receipt_source` holds it).
+            if !r.is_table() {
+                ids.push(Err(why(
+                    "a legacy string requirement in the receipt, whose source cannot be checked; reinstall the tool with uv tool install".into(),
+                )));
+                continue;
+            }
             if let Some(git) = r.get("git").and_then(|g| g.as_str()) {
                 let url = git.split(['?', '#']).next().unwrap_or_default();
                 ids.push(
@@ -2767,6 +2789,56 @@ mod tests {
             r.notes[0]
                 .starts_with("uv tool b: cannot resolve the source https://github.com/o/b.git"),
             "{r:?}"
+        );
+    }
+
+    #[test]
+    fn uv_legacy_string_requirement_is_blocked() {
+        let t = T::new();
+        t.uv(&[("a", "directory = \"/x/a\"")], UV_LIST, UV_AFTER);
+        fs::write(
+            t.home.join(UV_TOOLS).join("a/uv-receipt.toml"),
+            "[tool]\nrequirements = [\"a @ git+https://example.invalid/o/a\"]\n",
+        )
+        .unwrap();
+        let r = run(Updater::Uv, &t.env());
+        assert_eq!(r.status, Status::Blocked, "{r:?}");
+        assert!(
+            r.notes[0].starts_with("uv tool a: a legacy string requirement in the receipt"),
+            "{r:?}"
+        );
+        assert_eq!(t.calls(), Vec::<String>::new());
+    }
+
+    #[test]
+    fn npm_error_document_and_bad_entry_are_failed_not_current() {
+        let mut t = T::new();
+        t.grants
+            .grant("npm:@webos-tools/cli", "2026-11-06T00:00:00Z");
+        let error = r#"{"error":{"code":"E403","summary":"forbidden"}}"#;
+        t.npm(NPM_LS, error, error);
+        let r = run(Updater::Npm, &t.env());
+        assert_eq!(r.status, Status::Failed, "{r:?}");
+        assert_eq!(
+            r.notes,
+            vec!["npm outdated -g --json: npm reported an error (E403)".to_string()]
+        );
+        assert!(!t.log().contains("npm update"), "{}", t.log());
+        // An error after the upgrade is a failed row, not evidence of an upgrade.
+        t.npm(NPM_LS, NPM_OUTDATED, error);
+        let r = run(Updater::Npm, &t.env());
+        assert_eq!(r.status, Status::Failed, "{r:?}");
+        assert!(
+            t.log().contains("npm update -g @webos-tools/cli"),
+            "{}",
+            t.log()
+        );
+        t.npm(NPM_LS, r#"{"@webos-tools/cli":{"latest":"3.2.6"}}"#, "{}");
+        let r = run(Updater::Npm, &t.env());
+        assert_eq!(r.status, Status::Failed, "{r:?}");
+        assert_eq!(
+            r.notes,
+            vec!["npm outdated -g --json: the entry @webos-tools/cli has no current".to_string()]
         );
     }
 
