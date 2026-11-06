@@ -215,7 +215,7 @@ pub fn run(u: Updater, env: &Env) -> Row {
                 env.provider,
                 "mise",
                 &args(&["exec", "--", "npx", "skills", "update"]),
-                &npm_env(),
+                &npm_env(&[]),
                 env.timeouts.short,
             ) {
                 Ok(_) => {
@@ -662,7 +662,7 @@ fn npm_names(env: &Env) -> Result<Vec<String>, String> {
         env.provider,
         "npm",
         &args(&["ls", "-g", "--depth=0", "--json"]),
-        &npm_env(),
+        &npm_env(&[]),
         env.timeouts.short,
         &[0, 1],
     )
@@ -680,12 +680,12 @@ fn npm_names(env: &Env) -> Result<Vec<String>, String> {
 /// `latest`. It exits 1 when a package is outdated. The rolling items and the held notes:
 /// `npm` itself is held, because Homebrew's node formula owns it, and a package already at
 /// its `wanted` version is held there, because `npm update` reaches no further.
-fn npm_outdated(env: &Env) -> Result<(Vec<Item>, Vec<String>), (String, bool)> {
+fn npm_outdated(env: &Env, names: &[String]) -> Result<(Vec<Item>, Vec<String>), (String, bool)> {
     let out = call_ok(
         env.provider,
         "npm",
         &args(&["outdated", "-g", "--json"]),
-        &npm_env(),
+        &npm_env(names),
         env.timeouts.short,
         &[0, 1],
     )?;
@@ -724,21 +724,32 @@ fn npm(mut d: Draft, env: &Env) -> Row {
         d.notes.push(e.detail);
         return d.end(Status::Blocked);
     }
-    let untrusted = trust_notes(Updater::Npm, env);
+    // One listing: the names give the grants to check and the scopes to pin.
+    let names = match npm_names(env) {
+        Ok(n) => n,
+        Err(why) => {
+            d.notes.push(why);
+            return d.end(Status::Blocked);
+        }
+    };
+    let untrusted = untrusted(
+        names.iter().map(|n| Ok(format!("{NPM}{n}"))).collect(),
+        env.grants,
+    );
     if !untrusted.is_empty() {
         d.notes.extend(untrusted);
         return d.end(Status::Blocked);
     }
-    let (before, held) = match npm_outdated(env) {
+    let (before, held) = match npm_outdated(env, &names) {
         Ok(l) => l,
         Err(e) => return d.stop(e),
     };
     d.notes.extend(held);
-    let list = || npm_outdated(env).map(|(l, _)| l);
+    let list = || npm_outdated(env, &names).map(|(l, _)| l);
     let upgrade = |items: &[Item]| {
         let mut a = args(&["update", "-g"]);
         a.extend(items.iter().map(|i| i.name.clone()));
-        call(env.provider, "npm", &a, &npm_env(), env.timeouts.long)
+        call(env.provider, "npm", &a, &npm_env(&names), env.timeouts.long)
     };
     roll(d, "npm update -g", before, &upgrade, &list)
 }
@@ -773,10 +784,12 @@ fn uv_tool_names(env: &Env) -> Result<Vec<String>, String> {
     Ok(names)
 }
 
-/// The identities the uv tools are built from, read from each receipt without running a
-/// command: a `git` requirement maps as git fetches it (its `?rev=` query aside); a directory,
-/// an editable path or an index name needs none; any other source (a `url` archive) maps to no
-/// identity, and so does an unreadable receipt.
+/// The identities the uv tools are built from, read from each receipt: a `git` requirement
+/// (its `?rev=` query aside) is mapped as it is, so a value that maps to no git origin never
+/// reaches git, and then as git fetches it (`git ls-remote --get-url` applies the user's
+/// `url.*.insteadOf` rewrites, locally); a directory, an editable path or an index name needs
+/// none; any other source (a `url` archive) maps to no identity, and so does an unreadable
+/// receipt.
 fn uv_identities(env: &Env) -> Vec<Result<String, String>> {
     let names = match uv_tool_names(env) {
         Ok(n) => n,
@@ -807,7 +820,12 @@ fn uv_identities(env: &Env) -> Vec<Result<String, String>> {
         for r in reqs {
             if let Some(git) = r.get("git").and_then(|g| g.as_str()) {
                 let url = git.split(['?', '#']).next().unwrap_or_default();
-                ids.push(git_id(url).map_err(why));
+                ids.push(
+                    git_id(url)
+                        .and_then(|_| fetch_url(env, url))
+                        .and_then(|u| git_id(&u))
+                        .map_err(why),
+                );
             } else if r.get("directory").is_none()
                 && r.get("editable").is_none()
                 && r.get("path").is_none()
@@ -937,9 +955,23 @@ fn read_record(path: &Path) -> Result<String, String> {
 }
 
 /// The environment of `skills update` and of every `npm` command: the default npm registry, so
-/// a registry that an npmrc names cannot serve a package that an `npm:` grant covers.
-fn npm_env() -> Vec<(String, String)> {
-    vec![("npm_config_registry".into(), NPM_REGISTRY.into())]
+/// a registry that an npmrc names cannot serve a package that an `npm:` grant covers. npm
+/// resolves a scoped package through `@<scope>:registry`, which `npm_config_registry` does
+/// not override, so each scope among `names` is pinned to the default registry too.
+fn npm_env(names: &[String]) -> Vec<(String, String)> {
+    let mut v = vec![("npm_config_registry".to_string(), NPM_REGISTRY.to_string())];
+    let scopes: BTreeSet<&str> = names
+        .iter()
+        .filter_map(|n| n.split_once('/').map(|(scope, _)| scope))
+        .filter(|scope| scope.starts_with('@'))
+        .collect();
+    v.extend(scopes.into_iter().map(|scope| {
+        (
+            format!("npm_config_{scope}:registry"),
+            NPM_REGISTRY.to_string(),
+        )
+    }));
+    v
 }
 
 /// The git sources that `skills update` fetches: `source` and `sourceUrl` of each entry of the
@@ -992,9 +1024,7 @@ fn git_id(url: &str) -> Result<String, String> {
 /// from the user's git config and makes no network call.
 fn fetch_url(env: &Env, url: &str) -> Result<String, String> {
     let why = |n: String| {
-        format!(
-            "cannot resolve the skill source {url} with git ls-remote --get-url: {n}; nothing ran"
-        )
+        format!("cannot resolve the source {url} with git ls-remote --get-url: {n}; nothing ran")
     };
     env.provider.resolve("git").map_err(|e| why(e.detail))?;
     let out = call(
@@ -1763,7 +1793,7 @@ mod tests {
         let r = run(Updater::Skills, &t.env());
         assert_eq!(r.status, Status::Blocked, "{r:?}");
         assert!(
-            r.notes[0].starts_with("cannot resolve the skill source "),
+            r.notes[0].starts_with("cannot resolve the source "),
             "{r:?}"
         );
         assert!(r.notes[0].ends_with("; nothing ran"), "{r:?}");
@@ -2424,7 +2454,7 @@ mod tests {
             fs::write(self.root.join("st/npm-after"), after).unwrap();
             self.script(
                 &self.bin.join("npm"),
-                "printf 'registry=%s\\n' \"${npm_config_registry:-unset}\" >> \"$st/npm-env\"\ncase \"$1\" in\n  ls) cat \"$st/npm-ls\" ;;\n  outdated) cat \"$st/npm-outdated\"; grep -q current \"$st/npm-outdated\" && exit 1; exit 0 ;;\n  update) cp \"$st/npm-after\" \"$st/npm-outdated\" ;;\n  *) exit 64 ;;\nesac",
+                "env | grep '^npm_config_' | sort | tr '\\n' ' ' >> \"$st/npm-env\"; echo >> \"$st/npm-env\"\ncase \"$1\" in\n  ls) cat \"$st/npm-ls\" ;;\n  outdated) cat \"$st/npm-outdated\"; grep -q current \"$st/npm-outdated\" && exit 1; exit 0 ;;\n  update) cp \"$st/npm-after\" \"$st/npm-outdated\" ;;\n  *) exit 64 ;;\nesac",
             );
         }
 
@@ -2617,10 +2647,18 @@ mod tests {
                 "npm outdated -g --json".to_string()
             ]
         );
+        // The listing, before the names are known, pins the registry; every later command
+        // pins the scope's registry too.
         let env = fs::read_to_string(t.root.join("st/npm-env")).unwrap();
+        let lines: Vec<&str> = env.lines().collect();
+        assert_eq!(
+            lines[0], "npm_config_registry=https://registry.npmjs.org/ ",
+            "{env}"
+        );
+        assert_eq!(lines.len(), 4, "{env}");
         assert!(
-            env.lines()
-                .all(|l| l == "registry=https://registry.npmjs.org/"),
+            lines[1..].iter().all(|l| *l
+                == "npm_config_@webos-tools:registry=https://registry.npmjs.org/ npm_config_registry=https://registry.npmjs.org/ "),
             "{env}"
         );
     }
@@ -2698,6 +2736,38 @@ mod tests {
         );
         assert_eq!(t.calls(), Vec::<String>::new());
         assert!(preview(Updater::Uv, &t.env()).starts_with("blocked: E_SOURCE_UNTRUSTED"));
+    }
+
+    #[test]
+    fn uv_checks_the_url_git_rewrites_to() {
+        let mut t = T::new();
+        t.grants
+            .grant("https://github.com/o/b", "2026-11-06T00:00:00Z");
+        t.uv(
+            &[("b", "git = \"https://github.com/o/b.git?rev=1\"")],
+            UV_LIST,
+            UV_AFTER,
+        );
+        // The literal source is granted, but insteadOf sends the fetch to a mirror.
+        fs::write(t.root.join("st/mirror"), "https://mirror.invalid/o/b.git\n").unwrap();
+        let r = run(Updater::Uv, &t.env());
+        assert_eq!(r.status, Status::Blocked, "{r:?}");
+        assert_eq!(
+            r.notes,
+            vec![format!(
+                "E_SOURCE_UNTRUSTED: no grant for https://mirror.invalid/o/b; review it, then run {}",
+                trust_command("https://mirror.invalid/o/b")
+            )]
+        );
+        assert_eq!(t.calls(), Vec::<String>::new());
+        fs::write(t.root.join("st/lsremote-fail"), "").unwrap();
+        let r = run(Updater::Uv, &t.env());
+        assert_eq!(r.status, Status::Blocked, "{r:?}");
+        assert!(
+            r.notes[0]
+                .starts_with("uv tool b: cannot resolve the source https://github.com/o/b.git"),
+            "{r:?}"
+        );
     }
 
     #[test]
