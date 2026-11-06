@@ -759,6 +759,19 @@ fn npm(mut d: Draft, env: &Env) -> Row {
         Err(e) => return d.stop(e),
     };
     d.notes.extend(held);
+    // Only a name the checked listing holds is updated: the grants were checked against it.
+    let unlisted: Vec<&str> = before
+        .iter()
+        .filter(|i| !names.contains(&i.name))
+        .map(|i| i.name.as_str())
+        .collect();
+    if !unlisted.is_empty() {
+        d.notes.push(format!(
+            "outdated but not in the global listing, so not checked and not updated: {}",
+            unlisted.join(", ")
+        ));
+        return d.end(Status::Blocked);
+    }
     let list = || npm_outdated(env, &names).map(|(l, _)| l);
     let upgrade = |items: &[Item]| {
         let mut a = args(&["update", "-g"]);
@@ -825,38 +838,44 @@ fn uv_identities(env: &Env) -> Vec<Result<String, String>> {
                 continue;
             }
         };
-        let reqs = doc
+        // Every list under `[tool]` but the entry points is a source list an upgrade resolves
+        // again: `requirements`, `constraints`, `overrides`, and any list a newer uv records.
+        let lists = doc
             .get("tool")
-            .and_then(|t| t.get("requirements"))
-            .and_then(|r| r.as_array())
-            .cloned()
-            .unwrap_or_default();
-        for r in reqs {
-            // uv's legacy receipt form is one PEP 508 string per requirement, whose source
-            // these keys cannot show (as `package::uv_receipt_source` holds it).
-            if !r.is_table() {
-                ids.push(Err(why(
-                    "a legacy string requirement in the receipt, whose source cannot be checked; reinstall the tool with uv tool install".into(),
-                )));
-                continue;
-            }
-            if let Some(git) = r.get("git").and_then(|g| g.as_str()) {
-                let url = git.split(['?', '#']).next().unwrap_or_default();
-                ids.push(
-                    git_id(url)
-                        .and_then(|_| fetch_url(env, url))
-                        .and_then(|u| git_id(&u))
-                        .map_err(why),
-                );
-            } else if r.get("directory").is_none()
-                && r.get("editable").is_none()
-                && r.get("path").is_none()
-                && r.get("url").is_some()
-            {
-                ids.push(Err(why(format!(
-                    "the source {} maps to no identity; upgrade it by hand",
-                    field_toml(&r, "url")
+            .and_then(|t| t.as_table())
+            .into_iter()
+            .flat_map(|t| t.iter())
+            .filter(|(k, _)| k.as_str() != "entrypoints")
+            .filter_map(|(k, v)| v.as_array().map(|a| (k.clone(), a.clone())))
+            .collect::<Vec<_>>();
+        for (list, entries) in lists {
+            for r in entries {
+                // uv's legacy receipt form is one PEP 508 string per requirement, whose source
+                // these keys cannot show (as `package::uv_receipt_source` holds it).
+                if !r.is_table() {
+                    ids.push(Err(why(format!(
+                    "a legacy string entry in the receipt's {list}, whose source cannot be checked; reinstall the tool with uv tool install"
                 ))));
+                    continue;
+                }
+                if let Some(git) = r.get("git").and_then(|g| g.as_str()) {
+                    let url = git.split(['?', '#']).next().unwrap_or_default();
+                    ids.push(
+                        git_id(url)
+                            .and_then(|_| fetch_url(env, url))
+                            .and_then(|u| git_id(&u))
+                            .map_err(why),
+                    );
+                } else if r.get("directory").is_none()
+                    && r.get("editable").is_none()
+                    && r.get("path").is_none()
+                    && r.get("url").is_some()
+                {
+                    ids.push(Err(why(format!(
+                        "the source {} maps to no identity; upgrade it by hand",
+                        field_toml(&r, "url")
+                    ))));
+                }
             }
         }
     }
@@ -981,7 +1000,11 @@ fn read_record(path: &Path) -> Result<String, String> {
 /// resolves a scoped package through `@<scope>:registry`, which `npm_config_registry` does
 /// not override, so each scope among `names` is pinned to the default registry too.
 fn npm_env(names: &[String]) -> Vec<(String, String)> {
-    let mut v = vec![("npm_config_registry".to_string(), NPM_REGISTRY.to_string())];
+    let mut v = vec![
+        ("npm_config_registry".to_string(), NPM_REGISTRY.to_string()),
+        // An npmrc `link=true` limits `npm ls` to linked packages; the listing must be whole.
+        ("npm_config_link".to_string(), "false".to_string()),
+    ];
     let scopes: BTreeSet<&str> = names
         .iter()
         .filter_map(|n| n.split_once('/').map(|(scope, _)| scope))
@@ -2674,13 +2697,13 @@ mod tests {
         let env = fs::read_to_string(t.root.join("st/npm-env")).unwrap();
         let lines: Vec<&str> = env.lines().collect();
         assert_eq!(
-            lines[0], "npm_config_registry=https://registry.npmjs.org/ ",
+            lines[0], "npm_config_link=false npm_config_registry=https://registry.npmjs.org/ ",
             "{env}"
         );
         assert_eq!(lines.len(), 4, "{env}");
         assert!(
             lines[1..].iter().all(|l| *l
-                == "npm_config_@webos-tools:registry=https://registry.npmjs.org/ npm_config_registry=https://registry.npmjs.org/ "),
+                == "npm_config_@webos-tools:registry=https://registry.npmjs.org/ npm_config_link=false npm_config_registry=https://registry.npmjs.org/ "),
             "{env}"
         );
     }
@@ -2804,7 +2827,8 @@ mod tests {
         let r = run(Updater::Uv, &t.env());
         assert_eq!(r.status, Status::Blocked, "{r:?}");
         assert!(
-            r.notes[0].starts_with("uv tool a: a legacy string requirement in the receipt"),
+            r.notes[0]
+                .starts_with("uv tool a: a legacy string entry in the receipt's requirements"),
             "{r:?}"
         );
         assert_eq!(t.calls(), Vec::<String>::new());
@@ -2839,6 +2863,59 @@ mod tests {
         assert_eq!(
             r.notes,
             vec!["npm outdated -g --json: the entry @webos-tools/cli has no current".to_string()]
+        );
+    }
+
+    #[test]
+    fn uv_constraint_sources_need_a_grant_too() {
+        let t = T::new();
+        t.uv(&[("a", "directory = \"/x/a\"")], UV_LIST, UV_AFTER);
+        fs::write(
+            t.home.join(UV_TOOLS).join("a/uv-receipt.toml"),
+            "[tool]\nrequirements = [{ name = \"a\", directory = \"/x/a\" }]\nconstraints = [{ name = \"dep\", git = \"https://github.com/o/dep\" }]\noverrides = [\"x @ git+https://example.invalid/o/x\"]\nentrypoints = [{ name = \"a\", install-path = \"/x/bin/a\", from = \"a\" }]\n",
+        )
+        .unwrap();
+        let r = run(Updater::Uv, &t.env());
+        assert_eq!(r.status, Status::Blocked, "{r:?}");
+        assert!(
+            r.notes
+                .iter()
+                .any(|n| n.contains("no grant for https://github.com/o/dep")),
+            "{r:?}"
+        );
+        assert!(
+            r.notes
+                .iter()
+                .any(|n| n
+                    .starts_with("uv tool a: a legacy string entry in the receipt's overrides")),
+            "{r:?}"
+        );
+        assert_eq!(t.calls(), Vec::<String>::new());
+    }
+
+    #[test]
+    fn npm_updates_only_the_names_the_checked_listing_holds() {
+        let mut t = T::new();
+        t.grants
+            .grant("npm:@webos-tools/cli", "2026-11-06T00:00:00Z");
+        // A filtered listing (an npmrc `link=true`) names no package; outdated still does.
+        t.npm(
+            r#"{"name":"lib","dependencies":{}}"#,
+            NPM_OUTDATED,
+            NPM_ONLY,
+        );
+        let r = run(Updater::Npm, &t.env());
+        assert_eq!(r.status, Status::Blocked, "{r:?}");
+        assert!(
+            r.notes.iter().any(|n| n
+                == "outdated but not in the global listing, so not checked and not updated: @webos-tools/cli"),
+            "{r:?}"
+        );
+        assert!(!t.log().contains("npm update"), "{}", t.log());
+        let env = fs::read_to_string(t.root.join("st/npm-env")).unwrap();
+        assert!(
+            env.lines().all(|l| l.contains("npm_config_link=false ")),
+            "{env}"
         );
     }
 
