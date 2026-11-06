@@ -4286,6 +4286,107 @@ fn sync_runs_the_declared_updaters_in_order() {
     assert!(published < s.find("  updated claude").expect(&s), "{s}");
 }
 
+/// DFM-85: the `mise`, `rustup`, `uv` and `npm` updaters run in the declared order through
+/// look-alikes that exit as the real listings do (`rustup check` 100 and `npm outdated` 1 when
+/// there is work). `npm` needs a grant for each global package; `npm` itself is held.
+#[test]
+fn sync_runs_the_mise_rustup_uv_and_npm_updaters_in_order() {
+    let u = Up::new(r#"["mise", "rustup", "uv", "npm"]"#);
+    let st = u.fake.path().join("st");
+    let exe = |p: &Path, body: &str| {
+        fs::create_dir_all(p.parent().unwrap()).unwrap();
+        fs::write(
+            p,
+            format!(
+                "#!/bin/sh\nPATH=/usr/bin:/bin\nst={}\nprintf '{} %s\\n' \"$*\" >> \"$st/log\"\n{body}\n",
+                st.display(),
+                p.file_name().unwrap().to_str().unwrap()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(p, fs::Permissions::from_mode(0o755)).unwrap();
+    };
+    exe(
+        &u.fake.path().join("bin/mise"),
+        "case \"$1\" in\n  outdated) cat \"$st/mise-outdated\" ;;\n  upgrade) echo '{}' > \"$st/mise-outdated\" ;;\n  *) exit 64 ;;\nesac",
+    );
+    exe(
+        &u.fx.h(".cargo/bin/rustup"),
+        "case \"$1\" in\n  check) cat \"$st/rustup-check\"; grep -q 'update available' \"$st/rustup-check\" && exit 100; exit 0 ;;\n  update) echo 'stable-aarch64-apple-darwin - up to date: 1.99.1' > \"$st/rustup-check\" ;;\n  *) exit 64 ;;\nesac",
+    );
+    exe(
+        &u.fake.path().join("bin/uv"),
+        "case \"$1 $2\" in\n  'tool list') cat \"$st/uv-list\" ;;\n  'tool upgrade') printf 'a v1.1\\n- a\\n' > \"$st/uv-list\" ;;\n  *) exit 64 ;;\nesac",
+    );
+    exe(
+        &u.fake.path().join("bin/npm"),
+        "case \"$1\" in\n  ls) echo '{\"dependencies\":{\"x\":{\"version\":\"1.0\"},\"npm\":{\"version\":\"11.0\"}}}' ;;\n  outdated) cat \"$st/npm-outdated\"; grep -q current \"$st/npm-outdated\" && exit 1; exit 0 ;;\n  update) echo '{}' > \"$st/npm-outdated\" ;;\n  *) exit 64 ;;\nesac",
+    );
+    fs::write(
+        st.join("mise-outdated"),
+        r#"{"go":{"current":"1.27.3","latest":"1.27.4"}}"#,
+    )
+    .unwrap();
+    fs::write(
+        st.join("rustup-check"),
+        "stable-aarch64-apple-darwin - update available: 1.98.1 -> 1.99.1\n",
+    )
+    .unwrap();
+    fs::write(st.join("uv-list"), "a v1.0\n- a\n").unwrap();
+    fs::write(
+        st.join("npm-outdated"),
+        r#"{"x":{"current":"1.0","wanted":"1.1","latest":"1.1"},"npm":{"current":"11.0","wanted":"12.0","latest":"12.0"}}"#,
+    )
+    .unwrap();
+    let tool = u.fx.h(".local/share/uv/tools/a");
+    fs::create_dir_all(&tool).unwrap();
+    fs::write(
+        tool.join("uv-receipt.toml"),
+        "[tool]\nrequirements = [{ name = \"a\", directory = \"/x/a\" }]\n",
+    )
+    .unwrap();
+    // Without the grant, npm is a blocked row and runs nothing but its listing.
+    let o = u.sync(&[]);
+    assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
+    let s = stdout(&o);
+    assert!(s.contains("  blocked npm"), "{s}");
+    assert!(s.contains("no grant for npm:x"), "{s}");
+    assert!(!s.contains("npm:npm"), "{s}");
+    assert!(!u.log().contains("npm outdated"), "{}", u.log());
+    assert!(s.contains("  updated mise"), "{s}");
+    assert!(s.contains("    note: go 1.27.3 -> 1.27.4 upgraded"), "{s}");
+    assert!(s.contains("  updated rustup"), "{s}");
+    assert!(s.contains("  updated uv"), "{s}");
+    assert!(s.contains("    note: a 1.0 -> 1.1 upgraded"), "{s}");
+    let log = u.log();
+    let at = |c: &str| log.find(c).unwrap_or_else(|| panic!("{c}\n{log}"));
+    assert!(at("mise upgrade") < at("rustup update"), "{log}");
+    assert!(at("rustup update") < at("uv tool upgrade a"), "{log}");
+    // The listing before publication ran the npm source check once already; the run's own
+    // `npm ls` is the last one.
+    assert!(
+        at("uv tool upgrade a") < log.rfind("npm ls -g --depth=0 --json").unwrap(),
+        "{log}"
+    );
+    assert!(s.contains("  upgrade: updated=3 blocked=1"), "{s}");
+    // With the grant, npm updates x and holds npm.
+    u.fx.trust("npm:x");
+    u.clear_log();
+    let o = u.sync(&[]);
+    assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
+    let s = stdout(&o);
+    assert!(s.contains("  updated npm"), "{s}");
+    assert!(
+        s.contains("    note: npm 11.0 held (Homebrew's node formula owns it; latest 12.0)"),
+        "{s}"
+    );
+    assert!(s.contains("    note: x 1.0 -> 1.1 upgraded"), "{s}");
+    assert!(u.log().contains("npm update -g x\n"), "{}", u.log());
+    assert!(s.contains("  current mise"), "{s}");
+    assert!(s.contains("  upgrade: updated=1 current=3"), "{s}");
+    assert_eq!(u.upgrade_receipts().len(), 2);
+}
+
 /// An `agents` fixture with real git: the install script in the bound checkout logs its call,
 /// and the managed copy is a clone of a local registry remote at `v1`, which then gets `v2`.
 /// Returns the registry, the copy and its revision before the update.

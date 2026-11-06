@@ -470,7 +470,7 @@ fn updaters(file: &str, t: &Table) -> Result<Vec<Updater>, ResolveError> {
             invalid(
                 file,
                 format!("unknown updater `{name}`"),
-                "use one of: agents, brew, claude, codex, opencode, skills",
+                format!("use one of: {}", Updater::names()),
             )
             .field(at.clone())
             .rejected("string")
@@ -828,7 +828,13 @@ mod tests {
 
     #[test]
     fn profile_unknown_updater_is_manifest_invalid() {
-        let e = profile_with("updaters = [\"npm\"]\n").unwrap_err();
+        let e = profile_with("updaters = [\"cargo\"]\n").unwrap_err();
+        assert!(
+            e.action.contains(
+                "use one of: agents, brew, claude, codex, mise, npm, opencode, rustup, skills, uv"
+            ),
+            "{e:?}"
+        );
         assert_eq!(e.code, Code::ManifestInvalid);
         assert_eq!(e.field.as_deref(), Some("/updaters/0"));
     }

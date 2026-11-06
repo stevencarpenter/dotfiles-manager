@@ -57,7 +57,13 @@ fn owner_dir(u: Updater) -> Option<&'static str> {
         Updater::Claude => Some(".local/bin"),
         Updater::Codex => Some(".codex/packages/standalone/current/bin"),
         Updater::Opencode => Some(".opencode/bin"),
-        Updater::Agents | Updater::Brew | Updater::Skills => None,
+        Updater::Rustup => Some(".cargo/bin"),
+        Updater::Agents
+        | Updater::Brew
+        | Updater::Mise
+        | Updater::Npm
+        | Updater::Skills
+        | Updater::Uv => None,
     }
 }
 
@@ -88,11 +94,13 @@ fn now() -> String {
     dfm_model::state::rfc3339(dfm_engine::store::now_ns().unwrap_or(0))
 }
 
-/// Why a command did not succeed, or `None`. Provider standard error is withheld
-/// (docs/secrets.md); its size is shown.
-fn trouble(what: &str, out: &Output, timeout: Duration) -> Option<String> {
+/// Why a command did not succeed, or `None`. `ok` is the exit codes that are a success: a
+/// listing that exits nonzero when there is something to upgrade (`npm outdated` 1, `rustup
+/// check` 100) is still a list. Provider standard error is withheld (docs/secrets.md); its
+/// size is shown.
+fn trouble(what: &str, out: &Output, timeout: Duration, ok: &[i32]) -> Option<String> {
     match &out.end {
-        End::Exited(0) => None,
+        End::Exited(c) if ok.contains(c) => None,
         End::Exited(c) => Some(format!(
             "{what} exited {c}; its {} bytes of standard error are withheld. Run it by hand to see them",
             out.stderr.len()
@@ -112,6 +120,18 @@ fn call(
     env: &[(String, String)],
     timeout: Duration,
 ) -> Result<Output, (String, bool)> {
+    call_ok(r, program, a, env, timeout, &[0])
+}
+
+/// [`call`] with the exit codes that count as success.
+fn call_ok(
+    r: &Runner,
+    program: &str,
+    a: &[String],
+    env: &[(String, String)],
+    timeout: Duration,
+    ok: &[i32],
+) -> Result<Output, (String, bool)> {
     let what = std::iter::once(program)
         .chain(a.iter().map(String::as_str))
         .collect::<Vec<_>>()
@@ -126,7 +146,7 @@ fn call(
             max_stdout: 16 << 20,
         })
         .map_err(|e| (format!("{what}: {}", e.detail), false))?;
-    match trouble(&what, &out, timeout) {
+    match trouble(&what, &out, timeout, ok) {
         None => Ok(out),
         Some(n) => Err((n, matches!(out.end, End::Stopped(_)))),
     }
@@ -195,7 +215,7 @@ pub fn run(u: Updater, env: &Env) -> Row {
                 env.provider,
                 "mise",
                 &args(&["exec", "--", "npx", "skills", "update"]),
-                &skills_env(),
+                &npm_env(),
                 env.timeouts.short,
             ) {
                 Ok(_) => {
@@ -206,7 +226,11 @@ pub fn run(u: Updater, env: &Env) -> Row {
                 Err(e) => d.stop(e),
             }
         }
-        _ => native(d, env),
+        Updater::Mise => mise(d, env),
+        Updater::Npm => npm(d, env),
+        Updater::Rustup => rustup(d, env),
+        Updater::Uv => uv(d, env),
+        Updater::Claude | Updater::Codex | Updater::Opencode => native(d, env),
     }
 }
 
@@ -296,7 +320,13 @@ pub fn second_copies(u: Updater, env: &Env) -> Vec<String> {
         Updater::Claude => (None, Some("claude-code")),
         Updater::Codex => (Some("codex"), Some("codex")),
         Updater::Opencode => (Some("opencode"), None),
-        Updater::Agents | Updater::Brew | Updater::Skills => (None, None),
+        Updater::Agents
+        | Updater::Brew
+        | Updater::Mise
+        | Updater::Npm
+        | Updater::Rustup
+        | Updater::Skills
+        | Updater::Uv => (None, None),
     };
     let checks = formula
         .map(|n| ("formula", args(&["list", "--versions", n])))
@@ -463,6 +493,422 @@ fn brew(mut d: Draft, env: &Env) -> Row {
     }
 }
 
+// ---- the providers with an outdated list: mise, rustup, npm ---------------------------------
+
+/// One outdated name of a provider: the installed version and the one the upgrade reaches.
+#[derive(Debug, PartialEq, Eq)]
+struct Item {
+    name: String,
+    installed: String,
+    newest: String,
+}
+
+/// A command's output, or the note of one that did not run or did not succeed, with whether a
+/// stop request ended it.
+type Called = Result<Output, (String, bool)>;
+
+/// The brew pattern for a provider that lists what is outdated: `current` on an empty list,
+/// else `upgrade`, then `list` again; `updated` when every name left the list, `failed` when
+/// one stays. `before` is the list before the upgrade, so the caller can hold names first.
+fn roll(
+    mut d: Draft,
+    what: &str,
+    before: Vec<Item>,
+    upgrade: &dyn Fn(&[Item]) -> Called,
+    list: &dyn Fn() -> Result<Vec<Item>, (String, bool)>,
+) -> Row {
+    if before.is_empty() {
+        return d.end(Status::Current);
+    }
+    if let Err(e) = upgrade(&before) {
+        return d.stop(e);
+    }
+    let after = match list() {
+        Ok(l) => l,
+        Err(e) => return d.stop(e),
+    };
+    let mut left = false;
+    for o in &before {
+        match after.iter().find(|x| x.name == o.name) {
+            Some(x) => {
+                left = true;
+                d.notes.push(format!(
+                    "{} {} still outdated ({})",
+                    o.name, x.installed, x.newest
+                ));
+            }
+            None => d.notes.push(format!(
+                "{} {} -> {} upgraded",
+                o.name, o.installed, o.newest
+            )),
+        }
+    }
+    if left {
+        d.notes
+            .push(format!("{what} exited 0 but left names outdated"));
+        d.end(Status::Failed)
+    } else {
+        d.end(Status::Updated)
+    }
+}
+
+/// A string field of a JSON object, or empty.
+fn field(v: &serde_json::Value, k: &str) -> String {
+    v.get(k)
+        .and_then(|x| x.as_str())
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// `mise outdated --json`: an object keyed by tool name, with `current` and `latest`. The
+/// global configuration applies, because the updater runs outside any project directory.
+fn mise_outdated(env: &Env) -> Result<Vec<Item>, (String, bool)> {
+    let out = call(
+        env.provider,
+        "mise",
+        &args(&["outdated", "--json"]),
+        &[],
+        env.timeouts.short,
+    )?;
+    let bad = |why: String| (format!("mise outdated --json: {why}"), false);
+    let v: serde_json::Value =
+        serde_json::from_slice(&out.stdout).map_err(|e| bad(format!("not JSON ({e})")))?;
+    let tools = v.as_object().ok_or_else(|| bad("not an object".into()))?;
+    Ok(tools
+        .iter()
+        .map(|(name, t)| Item {
+            name: name.clone(),
+            installed: field(t, "current"),
+            newest: field(t, "latest"),
+        })
+        .collect())
+}
+
+/// `mise upgrade` without `--bump`: the newest version inside each configured range, so no
+/// configuration file is written. mise removes the replaced version after its own grace period
+/// (`upgrade.prune_after`).
+fn mise(mut d: Draft, env: &Env) -> Row {
+    if let Err(e) = env.provider.resolve("mise") {
+        d.notes.push(e.detail);
+        return d.end(Status::Blocked);
+    }
+    let list = || mise_outdated(env);
+    let before = match list() {
+        Ok(l) => l,
+        Err(e) => return d.stop(e),
+    };
+    let upgrade = |_: &[Item]| {
+        call(
+            env.provider,
+            "mise",
+            &args(&["upgrade"]),
+            &[],
+            env.timeouts.long,
+        )
+    };
+    roll(d, "mise upgrade", before, &upgrade, &list)
+}
+
+/// `rustup check`: one line per toolchain and one for rustup itself, `<name> - update
+/// available: <installed> -> <newest>` or `<name> - up to date: <version>`. It exits 100 when
+/// an update is available, and 0 when none is.
+fn rustup_check(r: &Runner, env: &Env) -> Result<Vec<Item>, (String, bool)> {
+    let out = call_ok(
+        r,
+        "rustup",
+        &args(&["check"]),
+        &[],
+        env.timeouts.short,
+        &[0, 100],
+    )?;
+    Ok(String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|l| {
+            let (name, rest) = l.split_once(" - ")?;
+            let (_, versions) = rest.split_once("update available")?;
+            let (installed, newest) = versions.trim_start_matches([' ', ':']).split_once("->")?;
+            Some(Item {
+                name: name.trim().to_string(),
+                installed: installed.trim().to_string(),
+                newest: newest.trim().to_string(),
+            })
+        })
+        .collect())
+}
+
+/// `rustup update`: every installed toolchain and rustup itself. No toolchain is removed.
+fn rustup(mut d: Draft, env: &Env) -> Row {
+    let r = match native_runner(Updater::Rustup, env) {
+        Ok(r) => r,
+        Err(why) => {
+            d.notes.push(why);
+            return d.end(Status::Blocked);
+        }
+    };
+    let list = || rustup_check(&r, env);
+    let before = match list() {
+        Ok(l) => l,
+        Err(e) => return d.stop(e),
+    };
+    let upgrade = |_: &[Item]| call(&r, "rustup", &args(&["update"]), &[], env.timeouts.long);
+    roll(d, "rustup update", before, &upgrade, &list)
+}
+
+/// The global npm packages except `npm`, from `npm ls -g --depth=0 --json` (`dependencies`
+/// keys). The list exits 1 when npm finds a problem in the tree; the names are still read.
+fn npm_names(env: &Env) -> Result<Vec<String>, String> {
+    let why = |n: String| format!("cannot list the global npm packages: {n}");
+    let out = call_ok(
+        env.provider,
+        "npm",
+        &args(&["ls", "-g", "--depth=0", "--json"]),
+        &npm_env(),
+        env.timeouts.short,
+        &[0, 1],
+    )
+    .map_err(|(n, _)| why(n))?;
+    let v: serde_json::Value =
+        serde_json::from_slice(&out.stdout).map_err(|e| why(format!("not JSON ({e})")))?;
+    // `npm` itself is held (see `npm_outdated`), so it needs no grant.
+    Ok(v.get("dependencies")
+        .and_then(|d| d.as_object())
+        .map(|d| d.keys().filter(|n| *n != "npm").cloned().collect())
+        .unwrap_or_default())
+}
+
+/// `npm outdated -g --json`: an object keyed by package name with `current`, `wanted` and
+/// `latest`. It exits 1 when a package is outdated. The rolling items and the held notes:
+/// `npm` itself is held, because Homebrew's node formula owns it, and a package already at
+/// its `wanted` version is held there, because `npm update` reaches no further.
+fn npm_outdated(env: &Env) -> Result<(Vec<Item>, Vec<String>), (String, bool)> {
+    let out = call_ok(
+        env.provider,
+        "npm",
+        &args(&["outdated", "-g", "--json"]),
+        &npm_env(),
+        env.timeouts.short,
+        &[0, 1],
+    )?;
+    let bad = |why: String| (format!("npm outdated -g --json: {why}"), false);
+    if out.stdout.iter().all(u8::is_ascii_whitespace) {
+        return Ok((vec![], vec![]));
+    }
+    let v: serde_json::Value =
+        serde_json::from_slice(&out.stdout).map_err(|e| bad(format!("not JSON ({e})")))?;
+    let packages = v.as_object().ok_or_else(|| bad("not an object".into()))?;
+    let (mut items, mut held) = (Vec::new(), Vec::new());
+    for (name, p) in packages {
+        let (current, wanted, latest) =
+            (field(p, "current"), field(p, "wanted"), field(p, "latest"));
+        if name == "npm" {
+            held.push(format!(
+                "npm {current} held (Homebrew's node formula owns it; latest {latest})"
+            ));
+        } else if current == wanted {
+            held.push(format!("{name} {current} held at wanted (latest {latest})"));
+        } else {
+            items.push(Item {
+                name: name.clone(),
+                installed: current,
+                newest: wanted,
+            });
+        }
+    }
+    Ok((items, held))
+}
+
+/// `npm update -g <names>` of every outdated global package that is not held, on the default
+/// registry that the `npm:<name>` grants cover.
+fn npm(mut d: Draft, env: &Env) -> Row {
+    if let Err(e) = env.provider.resolve("npm") {
+        d.notes.push(e.detail);
+        return d.end(Status::Blocked);
+    }
+    let untrusted = trust_notes(Updater::Npm, env);
+    if !untrusted.is_empty() {
+        d.notes.extend(untrusted);
+        return d.end(Status::Blocked);
+    }
+    let (before, held) = match npm_outdated(env) {
+        Ok(l) => l,
+        Err(e) => return d.stop(e),
+    };
+    d.notes.extend(held);
+    let list = || npm_outdated(env).map(|(l, _)| l);
+    let upgrade = |items: &[Item]| {
+        let mut a = args(&["update", "-g"]);
+        a.extend(items.iter().map(|i| i.name.clone()));
+        call(env.provider, "npm", &a, &npm_env(), env.timeouts.long)
+    };
+    roll(d, "npm update -g", before, &upgrade, &list)
+}
+
+// ---- uv tools ------------------------------------------------------------------------------
+
+/// Where uv keeps its tools, relative to HOME: `<name>/uv-receipt.toml` records each tool's
+/// source. The runner clears the environment, so `UV_TOOL_DIR` and `XDG_DATA_HOME`, which
+/// would move it, are never set.
+const UV_TOOLS: &str = ".local/share/uv/tools";
+
+fn uv_env() -> Vec<(String, String)> {
+    vec![("UV_PYTHON_DOWNLOADS".into(), "never".into())]
+}
+
+/// The installed uv tools by name, from the tools directory. A missing directory is no tool.
+fn uv_tool_names(env: &Env) -> Result<Vec<String>, String> {
+    let dir = env.home.join(UV_TOOLS);
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(e) => e,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(vec![]),
+        Err(e) => return Err(format!("cannot read {}: {e}", dir.display())),
+    };
+    let mut names = Vec::new();
+    for e in entries {
+        let e = e.map_err(|e| format!("cannot read {}: {e}", dir.display()))?;
+        if e.path().join("uv-receipt.toml").is_file() {
+            names.push(e.file_name().to_string_lossy().into_owned());
+        }
+    }
+    names.sort();
+    Ok(names)
+}
+
+/// The identities the uv tools are built from, read from each receipt without running a
+/// command: a `git` requirement maps as git fetches it (its `?rev=` query aside); a directory,
+/// an editable path or an index name needs none; any other source (a `url` archive) maps to no
+/// identity, and so does an unreadable receipt.
+fn uv_identities(env: &Env) -> Vec<Result<String, String>> {
+    let names = match uv_tool_names(env) {
+        Ok(n) => n,
+        Err(why) => return vec![Err(why)],
+    };
+    let mut ids = Vec::new();
+    for name in names {
+        let receipt = env.home.join(UV_TOOLS).join(&name).join("uv-receipt.toml");
+        let why = |n: String| format!("uv tool {name}: {n}");
+        let doc: toml::Table = match std::fs::read_to_string(&receipt)
+            .map_err(|e| format!("cannot read {}: {e}", receipt.display()))
+            .and_then(|s| {
+                s.parse()
+                    .map_err(|e: toml::de::Error| format!("{}: {e}", receipt.display()))
+            }) {
+            Ok(d) => d,
+            Err(n) => {
+                ids.push(Err(why(n)));
+                continue;
+            }
+        };
+        let reqs = doc
+            .get("tool")
+            .and_then(|t| t.get("requirements"))
+            .and_then(|r| r.as_array())
+            .cloned()
+            .unwrap_or_default();
+        for r in reqs {
+            if let Some(git) = r.get("git").and_then(|g| g.as_str()) {
+                let url = git.split(['?', '#']).next().unwrap_or_default();
+                ids.push(git_id(url).map_err(why));
+            } else if r.get("directory").is_none()
+                && r.get("editable").is_none()
+                && r.get("path").is_none()
+                && r.get("url").is_some()
+            {
+                ids.push(Err(why(format!(
+                    "the source {} maps to no identity; upgrade it by hand",
+                    field_toml(&r, "url")
+                ))));
+            }
+        }
+    }
+    ids
+}
+
+fn field_toml(v: &toml::Value, k: &str) -> String {
+    v.get(k)
+        .and_then(|x| x.as_str())
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// `uv tool list`: `<name> v<version>` lines, each followed by its `- <entrypoint>` lines.
+fn uv_tool_list(env: &Env) -> Result<Vec<(String, String)>, (String, bool)> {
+    let out = call(
+        env.provider,
+        "uv",
+        &args(&["tool", "list"]),
+        &uv_env(),
+        env.timeouts.short,
+    )?;
+    Ok(String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter(|l| !l.starts_with("- ") && !l.trim().is_empty())
+        .filter_map(|l| {
+            let (name, version) = l.rsplit_once(" v")?;
+            Some((name.trim().to_string(), version.trim().to_string()))
+        })
+        .collect())
+}
+
+/// `uv tool upgrade <name>` for each tool, one command each, so one failure leaves the others
+/// their upgrade. The listing decides the status: a changed version is `updated`.
+fn uv(mut d: Draft, env: &Env) -> Row {
+    if let Err(e) = env.provider.resolve("uv") {
+        d.notes.push(e.detail);
+        return d.end(Status::Blocked);
+    }
+    let untrusted = trust_notes(Updater::Uv, env);
+    if !untrusted.is_empty() {
+        d.notes.extend(untrusted);
+        return d.end(Status::Blocked);
+    }
+    let names = match uv_tool_names(env) {
+        Ok(n) => n,
+        Err(why) => return d.stop((why, false)),
+    };
+    if names.is_empty() {
+        d.notes.push("no uv tool is installed".into());
+        return d.end(Status::Current);
+    }
+    let before = match uv_tool_list(env) {
+        Ok(l) => l,
+        Err(e) => return d.stop(e),
+    };
+    let mut failure = None;
+    for name in &names {
+        match call(
+            env.provider,
+            "uv",
+            &args(&["tool", "upgrade", name]),
+            &uv_env(),
+            env.timeouts.long,
+        ) {
+            // A stop ends the updater here: no other uv command starts.
+            Err(e) if e.1 => return d.stop(e),
+            Err(e) if failure.is_none() => failure = Some(e),
+            Err(e) => d.notes.push(e.0),
+            Ok(_) => {}
+        }
+    }
+    let after = match uv_tool_list(env) {
+        Ok(l) => l,
+        Err(e) => return d.stop(e),
+    };
+    let mut changed = false;
+    for (name, v) in &before {
+        if let Some((_, now)) = after.iter().find(|(n, _)| n == name)
+            && now != v
+        {
+            changed = true;
+            d.notes.push(format!("{name} {v} -> {now} upgraded"));
+        }
+    }
+    match failure {
+        Some(e) => d.stop(e),
+        None if changed => d.end(Status::Updated),
+        None => d.end(Status::Current),
+    }
+}
+
 // ---- source trust (docs/upgrade.md, "Source trust") ------------------------------------------
 
 /// The `skills` CLI's record of the global skills it updates, relative to HOME. The runner
@@ -490,9 +936,9 @@ fn read_record(path: &Path) -> Result<String, String> {
     String::from_utf8(bytes).map_err(|_| why("not UTF-8".into()))
 }
 
-/// The environment of `skills update`: the default npm registry, so a registry that an npmrc
-/// names cannot serve the `skills` package that the `npm:skills` grant covers.
-fn skills_env() -> Vec<(String, String)> {
+/// The environment of `skills update` and of every `npm` command: the default npm registry, so
+/// a registry that an npmrc names cannot serve a package that an `npm:` grant covers.
+fn npm_env() -> Vec<(String, String)> {
     vec![("npm_config_registry".into(), NPM_REGISTRY.into())]
 }
 
@@ -607,16 +1053,26 @@ fn untrusted(ids: Vec<Result<String, String>>, grants: &Grants) -> Vec<String> {
 }
 
 /// Why the updater must not run because of its sources, one note each, or nothing. `skills`
-/// and the `agents` managed copy fetch extension sources, and each source needs a grant
-/// (DFM-25, C04). The `agents` working copy is never fetched, and the other updaters update a
-/// binary or packages from their owner: none of them is gated. An unreadable source record is
-/// one note. An updater with a note runs no command that fetches or installs.
+/// and the `agents` managed copy fetch extension sources, each global npm package runs its
+/// install scripts, and a uv tool from a git source is built from what it fetches: each such
+/// source needs a grant (DFM-25, C04). The `agents` working copy is never fetched, and the
+/// other updaters update a binary or packages from their owner: none of them is gated. An
+/// unreadable source record is one note. An updater with a note runs no command that fetches
+/// or installs.
 pub fn trust_notes(u: Updater, env: &Env) -> Vec<String> {
     match u {
         Updater::Skills => match skills_sources(env) {
             Ok(v) => untrusted(skills_identities(env, &v), env.grants),
             Err(why) => vec![why],
         },
+        Updater::Npm => match npm_names(env) {
+            Ok(names) => untrusted(
+                names.iter().map(|n| Ok(format!("{NPM}{n}"))).collect(),
+                env.grants,
+            ),
+            Err(why) => vec![why],
+        },
+        Updater::Uv => untrusted(uv_identities(env), env.grants),
         Updater::Agents => {
             let (copy, working) = agents_copy(env);
             if working || std::fs::symlink_metadata(copy.join(".git")).is_err() {
@@ -879,7 +1335,38 @@ fn preview_command(u: Updater, env: &Env) -> String {
             Ok(p) => format!("would run mise exec -- npx skills update ({})", p.display()),
             Err(e) => format!("blocked: {}", e.detail),
         },
-        _ => match native_runner(u, env) {
+        Updater::Mise => match env.provider.resolve("mise") {
+            Ok(p) => format!(
+                "would run mise outdated --json, mise upgrade ({})",
+                p.display()
+            ),
+            Err(e) => format!("blocked: {}", e.detail),
+        },
+        Updater::Npm => match env.provider.resolve("npm") {
+            Ok(p) => format!(
+                "would run npm outdated -g, npm update -g of every outdated global package except npm ({})",
+                p.display()
+            ),
+            Err(e) => format!("blocked: {}", e.detail),
+        },
+        Updater::Rustup => match native_runner(u, env) {
+            Ok(r) => format!(
+                "would run rustup check, rustup update ({})",
+                r.resolve("rustup")
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_default()
+            ),
+            Err(why) => format!("blocked: {why}"),
+        },
+        Updater::Uv => match env.provider.resolve("uv") {
+            Ok(p) => format!(
+                "would run uv tool upgrade of each tool under {} ({})",
+                env.home.join(UV_TOOLS).display(),
+                p.display()
+            ),
+            Err(e) => format!("blocked: {}", e.detail),
+        },
+        Updater::Claude | Updater::Codex | Updater::Opencode => match native_runner(u, env) {
             Ok(r) => format!(
                 "would run {} {} ({})",
                 u.name(),
@@ -1306,7 +1793,7 @@ mod tests {
     }
 
     #[test]
-    fn only_skills_and_agents_are_gated() {
+    fn binaries_and_package_managers_are_not_gated() {
         let mut t = T::new();
         t.grants = Grants::default();
         for u in [
@@ -1314,6 +1801,8 @@ mod tests {
             Updater::Codex,
             Updater::Opencode,
             Updater::Brew,
+            Updater::Mise,
+            Updater::Rustup,
         ] {
             assert!(trust_notes(u, &t.env()).is_empty(), "{u:?}");
         }
@@ -1897,6 +2386,381 @@ mod tests {
         assert_eq!(
             trust_command("npm:skills"),
             "dfm sync --trust-origin 'npm:skills'"
+        );
+    }
+
+    // ---- mise, rustup, npm, uv (DFM-85) ------------------------------------------------------
+
+    impl T {
+        /// `mise` whose `outdated --json` prints `st/mise-outdated` and whose bare `upgrade`
+        /// replaces it with `st/mise-after`. Any other upgrade form (`--bump`, a name) exits 65.
+        fn mise(&self, outdated: &str, after: &str) {
+            fs::write(self.root.join("st/mise-outdated"), outdated).unwrap();
+            fs::write(self.root.join("st/mise-after"), after).unwrap();
+            self.script(
+                &self.bin.join("mise"),
+                "case \"$1\" in\n  outdated) cat \"$st/mise-outdated\" ;;\n  upgrade) [ -z \"$2\" ] || exit 65; cp \"$st/mise-after\" \"$st/mise-outdated\" ;;\n  *) exit 64 ;;\nesac",
+            );
+        }
+
+        /// `rustup` in `~/.cargo/bin` whose `check` prints `st/rustup-check` and exits 100 when
+        /// a line says `update available`, as the real one does; `update` replaces the text
+        /// with `st/rustup-after`.
+        fn rustup(&self, check: &str, after: &str) {
+            fs::write(self.root.join("st/rustup-check"), check).unwrap();
+            fs::write(self.root.join("st/rustup-after"), after).unwrap();
+            self.script(
+                &self.home.join(".cargo/bin/rustup"),
+                "case \"$1\" in\n  check) cat \"$st/rustup-check\"; grep -q 'update available' \"$st/rustup-check\" && exit 100; exit 0 ;;\n  update) cp \"$st/rustup-after\" \"$st/rustup-check\" ;;\n  *) exit 64 ;;\nesac",
+            );
+        }
+
+        /// `npm` whose `ls` prints `st/npm-ls`, whose `outdated` prints `st/npm-outdated` and
+        /// exits 1 when it names a package, as the real one does, and whose `update` replaces
+        /// it with `st/npm-after`. Each call appends its registry to `st/npm-env`.
+        fn npm(&self, ls: &str, outdated: &str, after: &str) {
+            fs::write(self.root.join("st/npm-ls"), ls).unwrap();
+            fs::write(self.root.join("st/npm-outdated"), outdated).unwrap();
+            fs::write(self.root.join("st/npm-after"), after).unwrap();
+            self.script(
+                &self.bin.join("npm"),
+                "printf 'registry=%s\\n' \"${npm_config_registry:-unset}\" >> \"$st/npm-env\"\ncase \"$1\" in\n  ls) cat \"$st/npm-ls\" ;;\n  outdated) cat \"$st/npm-outdated\"; grep -q current \"$st/npm-outdated\" && exit 1; exit 0 ;;\n  update) cp \"$st/npm-after\" \"$st/npm-outdated\" ;;\n  *) exit 64 ;;\nesac",
+            );
+        }
+
+        /// `uv` whose `tool list` prints `st/uv-list` and whose `tool upgrade <name>` replaces
+        /// it with `st/uv-after`, or exits 1 with the `st/uv-fail-<name>` marker. Each
+        /// `(name, requirement)` is a receipt under the tools directory.
+        fn uv(&self, tools: &[(&str, &str)], list: &str, after: &str) {
+            fs::write(self.root.join("st/uv-list"), list).unwrap();
+            fs::write(self.root.join("st/uv-after"), after).unwrap();
+            for (name, req) in tools {
+                let dir = self.home.join(UV_TOOLS).join(name);
+                fs::create_dir_all(&dir).unwrap();
+                fs::write(
+                    dir.join("uv-receipt.toml"),
+                    format!("[tool]\nrequirements = [{{ name = \"{name}\", {req} }}]\nentrypoints = []\n"),
+                )
+                .unwrap();
+            }
+            self.script(
+                &self.bin.join("uv"),
+                "case \"$1 $2\" in\n  'tool list') cat \"$st/uv-list\" ;;\n  'tool upgrade') [ -f \"$st/uv-fail-$3\" ] && exit 1; cp \"$st/uv-after\" \"$st/uv-list\" ;;\n  *) exit 64 ;;\nesac",
+            );
+        }
+    }
+
+    const MISE_TWO: &str = r#"{"go":{"name":"go","requested":"1.27","current":"1.27.3","latest":"1.27.4"},"usage":{"name":"usage","requested":"latest","current":"2.0.0","latest":"2.1.0"}}"#;
+    const MISE_GO: &str =
+        r#"{"go":{"name":"go","requested":"1.27","current":"1.27.3","latest":"1.27.4"}}"#;
+
+    #[test]
+    fn mise_upgrades_without_bump_and_accounts_each_name() {
+        let t = T::new();
+        t.mise(MISE_TWO, "{}");
+        let r = run(Updater::Mise, &t.env());
+        assert_eq!(r.status, Status::Updated, "{r:?}");
+        assert_eq!(
+            r.notes,
+            vec![
+                "go 1.27.3 -> 1.27.4 upgraded".to_string(),
+                "usage 2.0.0 -> 2.1.0 upgraded".to_string()
+            ]
+        );
+        assert_eq!(
+            t.calls(),
+            vec![
+                "mise outdated --json".to_string(),
+                "mise upgrade".to_string(),
+                "mise outdated --json".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn mise_with_nothing_outdated_is_current_and_runs_no_upgrade() {
+        let t = T::new();
+        t.mise("{}", "{}");
+        let r = run(Updater::Mise, &t.env());
+        assert_eq!(r.status, Status::Current, "{r:?}");
+        assert_eq!(t.calls(), vec!["mise outdated --json".to_string()]);
+    }
+
+    #[test]
+    fn mise_name_that_stays_outdated_is_failed() {
+        let t = T::new();
+        t.mise(MISE_TWO, MISE_GO);
+        let r = run(Updater::Mise, &t.env());
+        assert_eq!(r.status, Status::Failed, "{r:?}");
+        assert!(
+            r.notes
+                .contains(&"go 1.27.3 still outdated (1.27.4)".to_string()),
+            "{r:?}"
+        );
+        assert!(
+            r.notes
+                .contains(&"usage 2.0.0 -> 2.1.0 upgraded".to_string()),
+            "{r:?}"
+        );
+    }
+
+    #[test]
+    fn mise_missing_is_blocked_and_invalid_json_is_failed() {
+        let t = T::new();
+        let r = run(Updater::Mise, &t.env());
+        assert_eq!(r.status, Status::Blocked, "{r:?}");
+        assert!(preview(Updater::Mise, &t.env()).starts_with("blocked: "));
+        t.mise("mise ERROR", "{}");
+        let r = run(Updater::Mise, &t.env());
+        assert_eq!(r.status, Status::Failed, "{r:?}");
+        assert!(
+            r.notes[0].starts_with("mise outdated --json: not JSON"),
+            "{r:?}"
+        );
+    }
+
+    const RUSTUP_TWO: &str = "stable-aarch64-apple-darwin - update available: 1.98.1 (48a229cea 2026-09-01) -> 1.99.1 (58cf8f9c3 2026-10-13)\n1.98-aarch64-apple-darwin - up to date: 1.98.1 (48a229cea 2026-09-01)\nrustup - update available : 1.29.2 -> 1.29.3\n";
+    const RUSTUP_NONE: &str = "stable-aarch64-apple-darwin - up to date: 1.99.1 (58cf8f9c3 2026-10-13)\n1.98-aarch64-apple-darwin - up to date: 1.98.1 (48a229cea 2026-09-01)\nrustup - up to date : 1.29.3\n";
+
+    #[test]
+    fn rustup_reads_exit_100_as_the_list_and_updates() {
+        let t = T::new();
+        t.rustup(RUSTUP_TWO, RUSTUP_NONE);
+        let r = run(Updater::Rustup, &t.env());
+        assert_eq!(r.status, Status::Updated, "{r:?}");
+        assert_eq!(
+            r.notes,
+            vec![
+                "stable-aarch64-apple-darwin 1.98.1 (48a229cea 2026-09-01) -> 1.99.1 (58cf8f9c3 2026-10-13) upgraded".to_string(),
+                "rustup 1.29.2 -> 1.29.3 upgraded".to_string()
+            ]
+        );
+        assert_eq!(
+            t.calls(),
+            vec![
+                "rustup check".to_string(),
+                "rustup update".to_string(),
+                "rustup check".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn rustup_up_to_date_is_current_and_a_stale_toolchain_is_failed() {
+        let t = T::new();
+        t.rustup(RUSTUP_NONE, RUSTUP_NONE);
+        let r = run(Updater::Rustup, &t.env());
+        assert_eq!(r.status, Status::Current, "{r:?}");
+        assert_eq!(t.calls(), vec!["rustup check".to_string()]);
+        t.rustup(RUSTUP_TWO, RUSTUP_TWO);
+        let r = run(Updater::Rustup, &t.env());
+        assert_eq!(r.status, Status::Failed, "{r:?}");
+        assert!(
+            r.notes
+                .contains(&"rustup 1.29.2 still outdated (1.29.3)".to_string()),
+            "{r:?}"
+        );
+    }
+
+    #[test]
+    fn rustup_missing_from_cargo_bin_is_blocked_with_the_path() {
+        let t = T::new();
+        let r = run(Updater::Rustup, &t.env());
+        assert_eq!(r.status, Status::Blocked, "{r:?}");
+        assert!(r.notes[0].contains(".cargo/bin/rustup"), "{r:?}");
+        assert!(preview(Updater::Rustup, &t.env()).contains(".cargo/bin/rustup"));
+    }
+
+    const NPM_LS: &str = r#"{"name":"lib","dependencies":{"@webos-tools/cli":{"version":"3.2.5"},"npm":{"version":"11.20.0"}}}"#;
+    const NPM_OUTDATED: &str = r#"{"@webos-tools/cli":{"current":"3.2.5","wanted":"3.2.6","latest":"3.2.6"},"npm":{"current":"11.20.0","wanted":"12.2.2","latest":"12.2.2"}}"#;
+    const NPM_ONLY: &str = r#"{"npm":{"current":"11.20.0","wanted":"12.2.2","latest":"12.2.2"}}"#;
+
+    #[test]
+    fn npm_without_a_grant_for_each_package_is_blocked_before_any_outdated() {
+        let t = T::new();
+        t.npm(NPM_LS, NPM_OUTDATED, NPM_ONLY);
+        let r = run(Updater::Npm, &t.env());
+        assert_eq!(r.status, Status::Blocked, "{r:?}");
+        assert_eq!(
+            r.notes,
+            vec![format!(
+                "E_SOURCE_UNTRUSTED: no grant for npm:@webos-tools/cli; review it, then run {}",
+                trust_command("npm:@webos-tools/cli")
+            )]
+        );
+        // npm itself is held, so it needs no grant.
+        assert_eq!(t.calls(), vec!["npm ls -g --depth=0 --json".to_string()]);
+        assert!(preview(Updater::Npm, &t.env()).starts_with("blocked: E_SOURCE_UNTRUSTED"));
+    }
+
+    #[test]
+    fn npm_updates_the_granted_packages_and_holds_npm_on_the_default_registry() {
+        let mut t = T::new();
+        t.grants
+            .grant("npm:@webos-tools/cli", "2026-11-06T00:00:00Z");
+        t.npm(NPM_LS, NPM_OUTDATED, NPM_ONLY);
+        let r = run(Updater::Npm, &t.env());
+        assert_eq!(r.status, Status::Updated, "{r:?}");
+        assert_eq!(
+            r.notes,
+            vec![
+                "npm 11.20.0 held (Homebrew's node formula owns it; latest 12.2.2)".to_string(),
+                "@webos-tools/cli 3.2.5 -> 3.2.6 upgraded".to_string()
+            ]
+        );
+        assert_eq!(
+            t.calls(),
+            vec![
+                "npm ls -g --depth=0 --json".to_string(),
+                "npm outdated -g --json".to_string(),
+                "npm update -g @webos-tools/cli".to_string(),
+                "npm outdated -g --json".to_string()
+            ]
+        );
+        let env = fs::read_to_string(t.root.join("st/npm-env")).unwrap();
+        assert!(
+            env.lines()
+                .all(|l| l == "registry=https://registry.npmjs.org/"),
+            "{env}"
+        );
+    }
+
+    #[test]
+    fn npm_package_at_wanted_is_held_and_nothing_outdated_is_current() {
+        let mut t = T::new();
+        t.grants
+            .grant("npm:@webos-tools/cli", "2026-11-06T00:00:00Z");
+        let at_wanted =
+            r#"{"@webos-tools/cli":{"current":"3.2.6","wanted":"3.2.6","latest":"4.0.0"}}"#;
+        t.npm(NPM_LS, at_wanted, at_wanted);
+        let r = run(Updater::Npm, &t.env());
+        assert_eq!(r.status, Status::Current, "{r:?}");
+        assert_eq!(
+            r.notes,
+            vec!["@webos-tools/cli 3.2.6 held at wanted (latest 4.0.0)".to_string()]
+        );
+        assert!(!t.log().contains("npm update"), "{}", t.log());
+        t.npm(NPM_LS, "{}", "{}");
+        let r = run(Updater::Npm, &t.env());
+        assert_eq!(r.status, Status::Current, "{r:?}");
+        assert!(r.notes.is_empty(), "{r:?}");
+    }
+
+    const UV_LIST: &str = "a v1.0\n- a\nb v2.0\n- b\n- b-cli\n";
+    const UV_AFTER: &str = "a v1.0\n- a\nb v3.0\n- b\n- b-cli\n";
+
+    #[test]
+    fn uv_upgrades_each_tool_from_a_local_or_granted_source() {
+        let mut t = T::new();
+        t.grants
+            .grant("https://github.com/o/b", "2026-11-06T00:00:00Z");
+        t.uv(
+            &[
+                ("a", "directory = \"/x/a\""),
+                ("b", "git = \"https://github.com/o/b.git?rev=2026.10.17\""),
+            ],
+            UV_LIST,
+            UV_AFTER,
+        );
+        let r = run(Updater::Uv, &t.env());
+        assert_eq!(r.status, Status::Updated, "{r:?}");
+        assert_eq!(r.notes, vec!["b 2.0 -> 3.0 upgraded".to_string()]);
+        assert_eq!(
+            t.calls(),
+            vec![
+                "uv tool list".to_string(),
+                "uv tool upgrade a".to_string(),
+                "uv tool upgrade b".to_string(),
+                "uv tool list".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn uv_with_an_ungranted_git_source_is_blocked_before_any_command() {
+        let t = T::new();
+        t.uv(
+            &[
+                ("a", "editable = \"/x/a\""),
+                ("b", "git = \"ssh://git@github.com/o/b\""),
+            ],
+            UV_LIST,
+            UV_AFTER,
+        );
+        let r = run(Updater::Uv, &t.env());
+        assert_eq!(r.status, Status::Blocked, "{r:?}");
+        assert_eq!(
+            r.notes,
+            vec![format!(
+                "E_SOURCE_UNTRUSTED: no grant for ssh://git@github.com/o/b; review it, then run {}",
+                trust_command("ssh://git@github.com/o/b")
+            )]
+        );
+        assert_eq!(t.calls(), Vec::<String>::new());
+        assert!(preview(Updater::Uv, &t.env()).starts_with("blocked: E_SOURCE_UNTRUSTED"));
+    }
+
+    #[test]
+    fn uv_url_source_and_unreadable_receipt_are_blocked() {
+        let t = T::new();
+        t.uv(&[("a", "url = \"https://h/a.tar.gz\"")], UV_LIST, UV_AFTER);
+        let r = run(Updater::Uv, &t.env());
+        assert_eq!(r.status, Status::Blocked, "{r:?}");
+        assert_eq!(
+            r.notes,
+            vec![
+                "uv tool a: the source https://h/a.tar.gz maps to no identity; upgrade it by hand"
+                    .to_string()
+            ]
+        );
+        fs::write(t.home.join(UV_TOOLS).join("a/uv-receipt.toml"), "[tool\n").unwrap();
+        let r = run(Updater::Uv, &t.env());
+        assert_eq!(r.status, Status::Blocked, "{r:?}");
+        assert!(r.notes[0].starts_with("uv tool a: "), "{r:?}");
+    }
+
+    #[test]
+    fn uv_failed_tool_still_upgrades_the_others_and_is_failed() {
+        let t = T::new();
+        t.uv(
+            &[("a", "directory = \"/x/a\""), ("b", "directory = \"/x/b\"")],
+            UV_LIST,
+            UV_AFTER,
+        );
+        fs::write(t.root.join("st/uv-fail-a"), "").unwrap();
+        let r = run(Updater::Uv, &t.env());
+        assert_eq!(r.status, Status::Failed, "{r:?}");
+        assert!(t.log().contains("uv tool upgrade b"), "{}", t.log());
+        assert!(
+            r.notes
+                .iter()
+                .any(|n| n.starts_with("uv tool upgrade a exited 1")),
+            "{r:?}"
+        );
+        assert!(
+            r.notes.contains(&"b 2.0 -> 3.0 upgraded".to_string()),
+            "{r:?}"
+        );
+    }
+
+    #[test]
+    fn uv_same_listing_is_current_and_no_tool_is_current() {
+        let t = T::new();
+        t.uv(&[("a", "directory = \"/x/a\"")], UV_LIST, UV_LIST);
+        let r = run(Updater::Uv, &t.env());
+        assert_eq!(r.status, Status::Current, "{r:?}");
+        assert!(t.log().contains("uv tool upgrade a"), "{}", t.log());
+        fs::remove_dir_all(t.home.join(UV_TOOLS)).unwrap();
+        let r = run(Updater::Uv, &t.env());
+        assert_eq!(r.status, Status::Current, "{r:?}");
+        assert_eq!(r.notes, vec!["no uv tool is installed".to_string()]);
+    }
+
+    #[test]
+    fn uv_env_never_downloads_a_python() {
+        assert_eq!(
+            uv_env(),
+            vec![("UV_PYTHON_DOWNLOADS".to_string(), "never".to_string())]
         );
     }
 }

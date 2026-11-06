@@ -1,12 +1,12 @@
 # Upgrade
 
-The upgrade step of `dfm sync` (DFM-31, first slice): after the four scopes, each updater the profile declares runs through its own owner's updater and ends in one status. This document describes the behavior at HEAD.
+The upgrade step of `dfm sync` (DFM-31; the `mise`, `rustup`, `uv` and `npm` updaters are DFM-85): after the four scopes, each updater the profile declares runs through its own owner's updater and ends in one status. This document describes the behavior at HEAD.
 
 | Part | Location |
 | --- | --- |
 | `Updater`, the fixed set | `crates/model/src/updater.rs` |
 | The profile key `updaters` | `crates/model/src/resolve/docs.rs` (docs/resolver.md, rule 16) |
-| One updater: `run`, `preview`, `Row`, the source check `trust_notes` | `crates/cli/src/adapters/updater.rs` |
+| One updater: `run`, `preview`, `Row`, the source check `trust_notes`; the shared outdated-list flow `roll` (mise, rustup, npm) | `crates/cli/src/adapters/updater.rs` |
 | Source identities and grants | `crates/model/src/lock.rs` (`source_identity`, `Grants`) |
 | The step in sync: `upgrade`, `upgrade_preview` | `crates/cli/src/sync_cmd.rs` |
 | Doctor's `D_UPGRADE` row | `crates/cli/src/doctor_cmd.rs` |
@@ -33,21 +33,31 @@ A manager built before this key refuses a profile that has it (`E_FIELD_UNKNOWN`
 | `codex` | `codex update` | `codex --version` | `~/.codex/packages/standalone/current/bin/codex` |
 | `opencode` | `opencode upgrade` | `opencode --version` | `~/.opencode/bin/opencode` |
 | `skills` | `mise exec -- npx skills update` | none | `mise` on the provider path |
+| `mise` | `mise outdated --json`; `mise upgrade`; `mise outdated --json` | each outdated tool's installed and newest version | `mise` on the provider path |
+| `rustup` | `rustup check`; `rustup update`; `rustup check` | each toolchain with an update, and rustup itself | `~/.cargo/bin/rustup` |
+| `uv` | `uv tool list`; `uv tool upgrade <name>` per tool; `uv tool list` | each tool's version in the listing | `uv` on the provider path; the tools under `~/.local/share/uv/tools` |
+| `npm` | `npm ls -g --depth=0 --json`; `npm outdated -g --json`; `npm update -g <names>`; `npm outdated -g --json` | each outdated package's installed and wanted version | `npm` on the provider path |
 
 - **agents** installs the agent registry (`stevencarpenter/agents`, DFM-25.C09). When `~/projects/agents/pyproject.toml` exists, the working copy is used as it is: it is never fetched or pulled, the row shows its revision, and a dirty copy has the note `working copy <path> has uncommitted changes; not pulled`. Otherwise the managed copy `~/.local/share/agent-registry` is fast-forwarded. Before any change, a managed copy that is missing (no `.git`), dirty (`git status --porcelain` prints a line), without an upstream branch (no `branch.<branch>.remote` or `.merge`; checked before the fetch), with an upstream remote that has no grant (see "Source trust") or diverged (after `git fetch`, `git rev-list --count @{u}..HEAD` is not 0) is `blocked` with a note, and nothing is pulled. The updater never merges, resets or clones. Then `scripts/install-agent-registry.sh <copy>` runs from the bound checkout. A missing script is `blocked` before any git command. A changed revision is `updated`; the same revision, and the working copy, is `current`.
 - **brew** upgrades every outdated formula and cask, not only declared ones. A name that `brew outdated --json=v2` marks `"pinned": true` (`brew pin`) is left out of the upgrade and its check, with the note `formula node held (brew pin)`. Version-sensitive tools are pinned with mise, per project or globally. `brew upgrade` gets the outdated names, one call per kind, so each formula and each cask is accounted for as itself, also when a formula and a cask share a name. Notes read `formula uv 0.13.5 -> 0.13.6 upgraded` or `cask codex 0.164.0 still outdated (0.165.0)`. An empty list is `current` and runs no upgrade. Homebrew runs with its defaults (the dependents check and cleanup stay on). The manager sets `HOMEBREW_NO_ANALYTICS=1` and `HOMEBREW_NO_ENV_HINTS=1`, and `HOMEBREW_NO_AUTO_UPDATE=1` for every command after `brew update`.
 - **A native tool** (`claude`, `codex`, `opencode`) must exist at its owner path. If it does not, it is `blocked` with that path, and no other copy (for example the Homebrew cask) is used. The runner's executable checks apply: a link that leaves the owner's prefix is `blocked`.
 - **A second copy.** For each native tool, `brew list --versions` and `brew list --cask --versions` look for a Homebrew copy under Homebrew's name for it: the cask `claude-code` (the `claude` cask is the desktop app), the formula and cask `codex`, the formula `opencode`. The check runs after every updater ran, so the version is the one `brew` left, and each copy found is a line after the rows (`  note: codex second copy: Homebrew cask codex 0.165.0`). It is never removed or chosen.
 - **skills** reports no version. Exit 0 is `current` with the note `skills update ran; it reports no version`.
+- **mise** (DFM-85) upgrades every tool the global configuration requests (`~/.config/mise/config.toml` and `conf.d/`): the updater runs outside any project directory, so no project configuration applies. `mise upgrade` runs without `--bump`, so each tool moves to the newest version inside its configured range (`go = "1.27"` stays on 1.27.x) and no configuration file is written. mise removes the replaced version after its own grace period (the `upgrade.prune_after` setting, 24 h by default) unless a configuration mise has seen still requests it; the "no version is removed" rule of docs/toolchains.md is `packages --update`'s, not this updater's. A declared `mise/v1` package or a mise trial is installed with `mise install <tool>@<selector>` and is not in the configuration, so the mise updater does not touch it: `packages --update` rolls it. Statuses follow brew: `mise outdated --json` before and after, `updated` when every outdated name left the list, `failed` when one stays (`go 1.27.3 still outdated (1.27.4)`), `current` on an empty list without an upgrade.
+- **rustup** (DFM-85) must exist at `~/.cargo/bin/rustup`, the path rustup.rs installs to (the mise shim is not used). `rustup check` lists every installed toolchain and rustup itself; it exits 100 when an update is available and 0 when none is, and both are read as the list. `rustup update` updates every installed toolchain and rustup itself. No toolchain is removed. Statuses follow brew, by toolchain name.
+- **uv** (DFM-85) upgrades each tool under `~/.local/share/uv/tools`, one `uv tool upgrade <name>` each, so one failed tool leaves the others their upgrade; the row is then `failed` with that tool's exit code. A tool from a git source needs a grant (see "Source trust"). `uv` runs with `UV_PYTHON_DOWNLOADS=never`, as under `packages --update`. `uv tool list` before and after decides the status: a changed version is `updated` (`b 2.0 -> 3.0 upgraded`), the same listing is `current`. A tool pinned to a revision (`?rev=`) stays there and is `current`. No tool is `current` with the note `no uv tool is installed`.
+- **npm** (DFM-85) upgrades the global packages. Each package needs an `npm:<name>` grant (see "Source trust"). `npm` itself is held, because Homebrew's node formula owns `/opt/homebrew/lib/node_modules/npm` (`npm 11.20.0 held (Homebrew's node formula owns it; latest 12.2.2)`); a package already at its `wanted` version is held there (`<name> <v> held at wanted (latest <l>)`), because `npm update` reaches no further. `npm outdated -g --json` exits 1 when a package is outdated, and that exit is read as the list. Every npm command runs with `npm_config_registry` set to the default registry, as `skills` does, so a registry an npmrc names cannot serve a package the grant covers. Statuses follow brew: `updated` when every outdated package left the list, `failed` when one stays.
 
 ## Source trust
 
-`skills` and `agents` fetch extension sources and run what they fetch. Each source needs a grant in `state/grants.json` before the updater runs (DFM-25, C04; the identities are in docs/sync.md, "Source identities"). `claude`, `codex`, `opencode` and `brew` update a binary or the packages from their owner and are not gated.
+`skills` and `agents` fetch extension sources and run what they fetch, a global npm package runs its install scripts, and a uv tool from a git source is built from what it fetches. Each such source needs a grant in `state/grants.json` before the updater runs (DFM-25, C04; the identities are in docs/sync.md, "Source identities"). `claude`, `codex`, `opencode`, `brew`, `mise` and `rustup` update a binary or the packages from their owner and are not gated; so is a uv tool from a local directory or an index name.
 
 | Updater | Sources, read without running a command |
 | --- | --- |
 | `skills` | `npm:skills`, the installer that `npx` runs, and the `source` and `sourceUrl` of every entry of the `skills` CLI's source record |
 | `agents` | the managed copy's upstream remote: the remote that `branch.<branch>.remote` names, resolved with `git remote get-url <remote>`, so `url.*.insteadOf` rewrites apply. The working copy is never fetched and is not checked: it is the owner's own checkout |
+| `npm` | `npm:<name>` for each global package that `npm ls -g --depth=0 --json` lists (a local command, no network), except `npm` itself, which is held |
+| `uv` | the `git` requirement of each tool's `~/.local/share/uv/tools/<name>/uv-receipt.toml`, mapped as git fetches it with its `?rev=` query removed. A `directory`, `editable` or index requirement needs none. A `url` archive maps to no identity, and so does a receipt that cannot be read: the row is `blocked` with the tool's name |
 
 - **The `skills` source record** is `~/.agents/.skill-lock.json`, as `skills` 1.7 writes it: `{"version": 3, "skills": {"<name>": {"source": "o/r", "sourceType": "github", "sourceUrl": "https://github.com/o/r.git", ...}}}`. `skills update` reads it for the global skills. The updater's environment is cleared, so `XDG_STATE_HOME`, which would move the record, is not set. The updater runs in the manager's cache directory, which holds no `skills-lock.json` or `.agents/skills`, so `skills update` takes the global scope and not a project's. A missing or unreadable file, invalid JSON, a `version` other than 3, an entry without a text `source`, or a `sourceUrl` that is not text is a record this manager cannot read.
 - **The `agents` upstream** is read with local git commands only (`rev-parse`, `config`, `remote get-url`), before any fetch. A remote whose url git cannot give is `blocked` with the cause. The fetch and the pull name the checked remote and branch (`git fetch <remote>`, `git pull --ff-only <remote> <merge>`), so git cannot choose another remote between the check and the fetch. The upstream's grant covers the pull and the registry's own install code.
@@ -76,7 +86,7 @@ An updater must not leave a tracked file changed in a source checkout without th
 | `current` | exit 0 and the same version (brew: nothing outdated) |
 | `pending` | a stop request (SIGINT, SIGTERM) ended or prevented it, or the update ran and the new version could not be read |
 | `failed` | a command exited nonzero, timed out or was ended by a signal; the updater changed a tracked file in a source checkout (`E_CONFLICT`, see "Tracked files"); brew: a name stayed outdated or the list was not valid JSON |
-| `blocked` | skills, agents: a source has no grant or maps to no identity, or the source record cannot be read (see "Source trust"); agents: the install script or `git` is missing, or the managed copy is missing, dirty, without an upstream or diverged (local commits); the tool, or `mise` for skills, is missing from its owner path, fails the executable checks, or its version cannot be read (or is empty) before the update; brew: `brew` cannot be resolved on the provider path |
+| `blocked` | skills, agents, npm, uv: a source has no grant or maps to no identity, or the source record cannot be read (see "Source trust"); agents: the install script or `git` is missing, or the managed copy is missing, dirty, without an upstream or diverged (local commits); the tool, or `mise` for skills, is missing from its owner path, fails the executable checks, or its version cannot be read (or is empty) before the update; brew, mise, uv, npm: the program cannot be resolved on the provider path; rustup: `~/.cargo/bin/rustup` is missing |
 
 A failure note gives the command, its exit code and the size of its standard error. The text is withheld (docs/secrets.md); run the command by hand to see it. A partial `brew upgrade` is `failed`, and the notes list each name as upgraded or still outdated.
 
@@ -101,7 +111,7 @@ A trial does not hold `brew`. The owner's decision of 2026-10-31 replaces DFM-31
 
 Updaters run detached: each starts in a new session (`setsid`, `Runner::detach`), with no controlling terminal and standard input closed. A step that needs a password or a prompt, such as a cask whose installer runs `sudo`, fails at once instead of waiting at the terminal. The `brew` row names the package that stayed outdated. Upgrade it by hand.
 
-Timeouts: 30 minutes for `brew upgrade`, 10 minutes for every other command.
+Timeouts: 30 minutes for each upgrade command (`brew upgrade`, `mise upgrade`, `rustup update`, each `uv tool upgrade`, `npm update -g`), 10 minutes for every other command (the listings, `brew update`, the native tools).
 
 ## Known limits
 
@@ -111,5 +121,9 @@ Timeouts: 30 minutes for `brew upgrade`, 10 minutes for every other command.
 - **The guard sees changes, not their author.** A change that another process makes to a tracked file while an updater runs is counted against that updater.
 - **The `skills` record** is read in version 3 only.
 - **agents** does not clone a missing managed copy. Clone it by hand. A working copy is installed with its uncommitted changes.
-- **Second copies** are looked for in Homebrew only, not in npm or mise.
+- **Second copies** are looked for in Homebrew only, not in npm or mise, and only for the native tools.
+- **mise prunes.** The version `mise upgrade` replaced is removed after mise's grace period (`upgrade.prune_after`). A project configuration mise has not seen yet (not trusted) does not protect its pinned version.
+- **rustup self-updates.** `rustup update` replaces `~/.cargo/bin/rustup` when rustup itself has an update. A rustup installed by Homebrew is not used; its row is `blocked`.
+- **npm is held**, so the global `npm` is upgraded only by `brew upgrade` of the node formula. A global package whose range stops below `latest` is held at `wanted`.
+- **A uv tool from a `url` archive** is `blocked`; upgrade it by hand. The `uv` row names the tool.
 - **Evidence scope.** Tests use look-alike updaters. No test runs a real updater. The `agents` sync test uses real git against a local registry remote and a look-alike install script.
