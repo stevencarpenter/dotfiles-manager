@@ -7,18 +7,26 @@ pub enum Updater {
     Brew,
     Claude,
     Codex,
+    Mise,
+    Npm,
     Opencode,
+    Rustup,
     Skills,
+    Uv,
 }
 
 impl Updater {
-    pub const ALL: [Updater; 6] = [
+    pub const ALL: [Updater; 10] = [
         Updater::Agents,
         Updater::Brew,
         Updater::Claude,
         Updater::Codex,
+        Updater::Mise,
+        Updater::Npm,
         Updater::Opencode,
+        Updater::Rustup,
         Updater::Skills,
+        Updater::Uv,
     ];
 
     pub fn name(self) -> &'static str {
@@ -27,9 +35,22 @@ impl Updater {
             Updater::Brew => "brew",
             Updater::Claude => "claude",
             Updater::Codex => "codex",
+            Updater::Mise => "mise",
+            Updater::Npm => "npm",
             Updater::Opencode => "opencode",
+            Updater::Rustup => "rustup",
             Updater::Skills => "skills",
+            Updater::Uv => "uv",
         }
+    }
+
+    /// The names, comma-separated, for the resolver's hint.
+    pub fn names() -> String {
+        Updater::ALL
+            .iter()
+            .map(|u| u.name())
+            .collect::<Vec<_>>()
+            .join(", ")
     }
 
     pub fn parse(s: &str) -> Option<Updater> {

@@ -24,11 +24,11 @@ sha2 = { workspace = true }
 # The command tree: parsing, help and `dfm completions` (DFM-79).
 clap = { workspace = true }
 clap_complete = { workspace = true }
-
-[dev-dependencies]
-# Resolver tests parse and patch fixture documents in memory. Already an accepted direct crate.
+# The uv updater reads each tool's `uv-receipt.toml` for its source (docs/upgrade.md). Already a
+# direct crate of dfm-model; the resolver tests use it too.
 toml = { workspace = true }
 
+[dev-dependencies]
 # These tests drive the isolated build through --home, so they need the feature. Run them with
 # `cargo test --features test-isolation` (scripts/check_all.sh does). A plain `cargo test`
 # skips them; there is deliberately no self dev-dependency that would switch the feature on
