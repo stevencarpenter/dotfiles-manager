@@ -47,13 +47,6 @@ pub struct Args {
 
 /// The `--script` flags: an install script fetched from `url` and run by `shell`.
 #[derive(Debug)]
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "script::run reads these fields from DFM-81 task 4"
-    )
-)]
 pub struct ScriptArgs {
     /// An `https://` URL.
     pub url: String,
@@ -335,19 +328,7 @@ impl Decision {
                 bounded(&self.owners.join("; "))
             )?,
         }
-        for (what, ps) in [("baseline", &self.baseline), ("data", &self.data)] {
-            for p in ps {
-                let seen = match (&p.existed, &p.sha256) {
-                    (false, _) => "absent".to_string(),
-                    (true, Some(h)) => format!("file sha256:{h}"),
-                    (true, None) => "directory".to_string(),
-                };
-                writeln!(out, "{what}: {} {seen}", visible(&p.path))?;
-            }
-        }
-        for s in &self.skipped {
-            writeln!(out, "data: {}", visible(s))?;
-        }
+        print_observed(out, &self.baseline, &self.data, &self.skipped)?;
         writeln!(
             out,
             "cleanup scope: dfm purge removes the install above and every baseline or data path that was absent; a pre-existing path or tool is never removed"
@@ -359,6 +340,29 @@ impl Decision {
         )?;
         writeln!(out, "plan digest: {digest}")
     }
+}
+
+/// The `baseline:` and `data:` preview lines, shared by the package and the script trial.
+pub(super) fn print_observed(
+    out: &mut dyn Write,
+    baseline: &[BaselinePath],
+    data: &[BaselinePath],
+    skipped: &[String],
+) -> std::io::Result<()> {
+    for (what, ps) in [("baseline", baseline), ("data", data)] {
+        for p in ps {
+            let seen = match (&p.existed, &p.sha256) {
+                (false, _) => "absent".to_string(),
+                (true, Some(h)) => format!("file sha256:{h}"),
+                (true, None) => "directory".to_string(),
+            };
+            writeln!(out, "{what}: {} {seen}", visible(&p.path))?;
+        }
+    }
+    for s in skipped {
+        writeln!(out, "data: {}", visible(s))?;
+    }
+    Ok(())
 }
 
 /// The code a probe answer blocks with, as the package planner maps it (docs/packages.md).
@@ -556,6 +560,9 @@ pub(super) fn candidates(
 }
 
 pub fn run(ctx: &Ctx, args: &Args, out: &mut dyn Write) -> Result<(), Refusal> {
+    if let Some(s) = &args.script {
+        return script::run(ctx, args, s, out);
+    }
     let w =
         |e: std::io::Error| Refusal::new(Code::IoFailed, format!("output failed: {}", e.kind()));
     let binding = read_existing_binding(ctx)?.ok_or_else(|| {
@@ -564,9 +571,6 @@ pub fn run(ctx: &Ctx, args: &Args, out: &mut dyn Write) -> Result<(), Refusal> {
             "this machine is not bound; run bind first",
         )
     })?;
-    if let Some(s) = &args.script {
-        return script::run(ctx, args, s, out);
-    }
     // The adapter's own name check, before any provider sees the name.
     let package = package::name(&package_value(&args.package)).map_err(|e| usage(e.detail))?;
     let tool = package::leaf(&package).to_string();

@@ -150,3 +150,47 @@ for f in "$2"/*/*; do
 done
 printf ']\n'; exit $rc
 "#;
+
+/// `curl ... -o <tmp> -w %{url_effective} -- <url>` logs `curl <args>` to `../log`, writes
+/// `../curl-body` to the `-o` path and prints `../curl-effective` (default: the URL) as the `-w`
+/// format does. A nonzero `../curl-exit` makes it write and print nothing and exit with that code,
+/// as a failed transfer does.
+pub const FAKE_CURL: &str = r#"#!/bin/sh
+PATH=/usr/bin:/bin:$PATH
+here=$(dirname "$0")
+printf 'curl %s\n' "$*" >> "$here/../log"
+out=; url=
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -o) out=$2; shift ;;
+    --) url=$2; break ;;
+  esac
+  shift
+done
+rc=$(cat "$here/../curl-exit" 2>/dev/null || echo 0)
+[ "$rc" -ne 0 ] && exit "$rc"
+cat "$here/../curl-body" > "$out" || exit 23
+if [ -e "$here/../curl-effective" ]; then cat "$here/../curl-effective"; else printf '%s' "$url"; fi
+"#;
+
+/// `sandbox-exec -p <profile> <command>...` logs `sandbox-exec <profile> | <command>` to `../log`
+/// and runs the real `/usr/bin/sandbox-exec` with the same arguments. The `sandbox-missing`
+/// marker makes it exit 127 instead.
+pub const FAKE_SANDBOX_EXEC: &str = r#"#!/bin/sh
+PATH=/usr/bin:/bin:$PATH
+here=$(dirname "$0")
+[ -e "$here/../sandbox-missing" ] && exit 127
+log() { p=$2; shift 2; printf 'sandbox-exec %s | %s\n' "$p" "$*" >> "$here/../log"; }
+log "$@"
+exec /usr/bin/sandbox-exec "$@"
+"#;
+
+/// `getconf <name>` logs `getconf <args>` to `../log` and prints `../tmpdir` when it exists, else
+/// runs the real `/usr/bin/getconf`.
+pub const FAKE_GETCONF: &str = r#"#!/bin/sh
+PATH=/usr/bin:/bin:$PATH
+here=$(dirname "$0")
+printf 'getconf %s\n' "$*" >> "$here/../log"
+[ -e "$here/../tmpdir" ] && { cat "$here/../tmpdir"; exit 0; }
+exec /usr/bin/getconf "$@"
+"#;
