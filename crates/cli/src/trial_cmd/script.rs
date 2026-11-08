@@ -338,8 +338,9 @@ pub(super) fn script_env(
     Ok(env)
 }
 
-/// Programs the script may not start, so it cannot leave the sandbox through another user or
-/// through Apple Events to an unsandboxed app.
+/// Programs the script may not start, so it cannot ask for administrator rights (the design,
+/// "The run and the sandbox"). This is not containment: launchd jobs and other services stay
+/// `unknown` effects of the trial.
 #[cfg_attr(not(test), expect(dead_code, reason = "wired by the script run"))]
 pub(super) const DENIED_EXEC: [&str; 3] = ["/usr/bin/sudo", "/usr/bin/su", "/usr/bin/osascript"];
 
@@ -352,7 +353,8 @@ pub(super) struct Protected {
     pub temp: Vec<PathBuf>,
     /// Guarded checkouts, the state root, the config, data and cache dirs, dfm's install dir.
     pub denied_trees: Vec<PathBuf>,
-    /// Ledger targets, the lock file and dfm's own executable path.
+    /// Ledger targets, the lock file, dfm's own executable path and each link on the way to a
+    /// denied tree or path; a link is named itself, not its target.
     pub denied_paths: Vec<PathBuf>,
 }
 
@@ -429,8 +431,30 @@ fn canonical(p: &Path) -> PathBuf {
     p.to_path_buf()
 }
 
+/// `p` with its parent canonicalized and its last component kept, so a link at `p` is named
+/// itself: a deny on its target would still let the script remove or replace the link.
+#[cfg_attr(not(test), expect(dead_code, reason = "wired by the script run"))]
+fn spelled(p: &Path) -> PathBuf {
+    match (p.parent(), p.file_name()) {
+        (Some(dir), Some(name)) => canonical(dir).join(name),
+        _ => canonical(p),
+    }
+}
+
+/// Each link strictly below `home` on the way to `p`, `p` included, as [`spelled`] names it.
+/// Replacing one of them redirects `p` without a write to `p` itself.
+#[cfg_attr(not(test), expect(dead_code, reason = "wired by the script run"))]
+fn links_on(home: &Path, p: &Path) -> Vec<PathBuf> {
+    p.ancestors()
+        .filter(|a| a.starts_with(home) && *a != home)
+        .filter(|a| fs::symlink_metadata(a).is_ok_and(|m| m.file_type().is_symlink()))
+        .map(spelled)
+        .collect()
+}
+
 /// The protected set for a run: the binding root's guarded checkouts, dfm's own directories,
-/// install directory and executable, the lock file, and every ledger target.
+/// install directory and executable, the lock file, and every ledger target (the dfm links
+/// themselves, not what they point to).
 #[expect(dead_code, reason = "wired by the script run")]
 pub(super) fn protected(
     layout: &Layout,
@@ -456,11 +480,15 @@ pub(super) fn protected(
         .flat_map(|r| r.owned_outputs.iter().map(|o| PathBuf::from(&o.path)))
         .collect();
     paths.extend([layout.lock_file.clone(), exe]);
+    let mut denied_paths: Vec<PathBuf> = paths.iter().map(|p| spelled(p)).collect();
+    for p in trees.iter().chain(&paths) {
+        denied_paths.extend(links_on(&layout.home, p));
+    }
     Ok(Protected {
         home: canonical(&layout.home),
         temp: vec![canonical(temp)],
         denied_trees: trees.iter().map(|t| canonical(t)).collect(),
-        denied_paths: paths.iter().map(|p| canonical(p)).collect(),
+        denied_paths,
     })
 }
 
@@ -949,6 +977,24 @@ mod tests {
         );
         assert_eq!(canonical(&link), dir);
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_denied_link_is_named_itself_not_its_target() {
+        let h = scratch("spelled");
+        fs::create_dir(h.join("real")).unwrap();
+        fs::write(h.join("target"), b"t").unwrap();
+        std::os::unix::fs::symlink(h.join("target"), h.join("real/f")).unwrap();
+        std::os::unix::fs::symlink(h.join("real"), h.join("l")).unwrap();
+        // A script that removes or replaces the link is what the deny must stop.
+        assert_eq!(spelled(&h.join("l/f")), h.join("real/f"));
+        assert_eq!(spelled(&h.join("l/missing")), h.join("real/missing"));
+        assert_eq!(
+            links_on(&h, &h.join("l/f")),
+            [h.join("real/f"), h.join("l")]
+        );
+        assert!(links_on(&h, &h.join("real")).is_empty());
+        fs::remove_dir_all(&h).unwrap();
     }
 
     #[test]
