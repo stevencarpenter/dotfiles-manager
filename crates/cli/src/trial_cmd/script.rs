@@ -5,13 +5,14 @@ use crate::apply_cmd::stale;
 use crate::read_fs::read_regular_bounded;
 use crate::{Ctx, read_existing_binding, state_cmd, usage};
 use dfm_engine::proc::{End, Request};
-use dfm_engine::{Runner, Store, signal};
+use dfm_engine::{Layout, Runner, Store, signal};
 use dfm_model::digest::sha256_hex;
 use dfm_model::display::{bounded_visible, visible};
 use dfm_model::plan::Binary;
-use dfm_model::state::{BaselinePath, Stamp, valid_id};
+use dfm_model::state::{BaselinePath, Ledger, Stamp, valid_id};
 use dfm_model::{Code, Refusal};
 use serde_json::json;
+use std::ffi::OsStr;
 use std::fs;
 use std::io::Write;
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
@@ -335,6 +336,151 @@ pub(super) fn script_env(
     }
     env.sort();
     Ok(env)
+}
+
+/// Programs the script may not start, so it cannot leave the sandbox through another user or
+/// through Apple Events to an unsandboxed app.
+#[cfg_attr(not(test), expect(dead_code, reason = "wired by the script run"))]
+pub(super) const DENIED_EXEC: [&str; 3] = ["/usr/bin/sudo", "/usr/bin/su", "/usr/bin/osascript"];
+
+/// What the script's sandbox lets it write: `home` and `temp` (canonical, from the caller), less
+/// the denied trees and paths.
+#[derive(Debug)]
+#[cfg_attr(not(test), expect(dead_code, reason = "wired by the script run"))]
+pub(super) struct Protected {
+    pub home: PathBuf,
+    pub temp: Vec<PathBuf>,
+    /// Guarded checkouts, the state root, the config, data and cache dirs, dfm's install dir.
+    pub denied_trees: Vec<PathBuf>,
+    /// Ledger targets, the lock file and dfm's own executable path.
+    pub denied_paths: Vec<PathBuf>,
+}
+
+/// The path as an SBPL string body. `"` and `\` would end or escape the string, and a control
+/// character cannot be shown in a refusal, so those paths are refused instead of escaped.
+fn sbpl_str(p: &Path) -> Result<&str, Refusal> {
+    p.to_str()
+        .filter(|s| !s.contains(['"', '\\']) && !s.contains(char::is_control))
+        .ok_or_else(|| {
+            Refusal::new(
+                Code::TargetInvalid,
+                format!(
+                    "the sandbox profile cannot hold the path {}",
+                    visible(&p.to_string_lossy())
+                ),
+            )
+        })
+}
+
+/// The SBPL text, one rule per line. Later rules win, so every specific deny follows the
+/// home allow. A subpath deny does not stop a rename of an ancestor, so each ancestor strictly
+/// below `home` of a denied tree or path gets a literal deny; a literal still allows new
+/// entries inside it.
+#[cfg_attr(not(test), expect(dead_code, reason = "wired by the script run"))]
+pub(super) fn profile(p: &Protected) -> Result<String, Refusal> {
+    let rules = |kind: &str, paths: &[&Path]| -> Result<String, Refusal> {
+        paths
+            .iter()
+            .map(|d| Ok(format!(" ({kind} \"{}\")", sbpl_str(d)?)))
+            .collect()
+    };
+    let mut allowed = vec![p.home.as_path()];
+    allowed.extend(p.temp.iter().map(PathBuf::as_path));
+    allowed.extend([Path::new("/private/tmp"), Path::new("/dev")]);
+    let mut trees: Vec<&Path> = p.denied_trees.iter().map(PathBuf::as_path).collect();
+    trees.sort_unstable();
+    trees.dedup();
+    let mut literals: Vec<&Path> = p.denied_paths.iter().map(PathBuf::as_path).collect();
+    for d in p.denied_trees.iter().chain(&p.denied_paths) {
+        literals.extend(
+            d.ancestors()
+                .skip(1)
+                .filter(|a| a.starts_with(&p.home) && *a != p.home),
+        );
+    }
+    literals.sort_unstable();
+    literals.dedup();
+    let mut text =
+        String::from("(version 1)\n(allow default)\n(deny file-write* (subpath \"/\"))\n");
+    text += &format!("(allow file-write*{})\n", rules("subpath", &allowed)?);
+    for t in trees {
+        text += &format!("(deny file-write*{})\n", rules("subpath", &[t])?);
+    }
+    if !literals.is_empty() {
+        text += &format!("(deny file-write*{})\n", rules("literal", &literals)?);
+    }
+    let exec: Vec<&Path> = DENIED_EXEC.iter().map(Path::new).collect();
+    text += &format!("(deny process-exec{})\n", rules("literal", &exec)?);
+    Ok(text)
+}
+
+/// `p` with its deepest existing ancestor canonicalized and the rest re-appended, because the
+/// sandbox matches real paths and a denied path may not exist yet.
+#[cfg_attr(not(test), expect(dead_code, reason = "wired by the script run"))]
+fn canonical(p: &Path) -> PathBuf {
+    for a in p.ancestors() {
+        if let Ok(real) = fs::canonicalize(a) {
+            // `a` is an ancestor of `p`, so the prefix always strips.
+            return p
+                .strip_prefix(a)
+                .map_or_else(|_| p.to_path_buf(), |rest| real.join(rest));
+        }
+    }
+    p.to_path_buf()
+}
+
+/// The protected set for a run: the binding root's guarded checkouts, dfm's own directories,
+/// install directory and executable, the lock file, and every ledger target.
+#[expect(dead_code, reason = "wired by the script run")]
+pub(super) fn protected(
+    layout: &Layout,
+    root: &Path,
+    ledger: &Ledger,
+    temp: &Path,
+) -> Result<Protected, Refusal> {
+    let io = |e: std::io::Error| Refusal::new(Code::IoFailed, format!("dfm's own path: {e}"));
+    // The invoked path is a link on an installed machine; its real directory is the install.
+    let exe = std::env::current_exe().map_err(io)?;
+    let install = fs::canonicalize(&exe).map_err(io)?;
+    let mut trees = crate::sync_cmd::guarded_checkouts(root)?;
+    trees.extend([
+        layout.state_root.clone(),
+        layout.config_dir.clone(),
+        layout.data_dir.clone(),
+        layout.cache_dir.clone(),
+    ]);
+    trees.extend(install.parent().map(Path::to_path_buf));
+    let mut paths: Vec<PathBuf> = ledger
+        .resources
+        .iter()
+        .flat_map(|r| r.owned_outputs.iter().map(|o| PathBuf::from(&o.path)))
+        .collect();
+    paths.extend([layout.lock_file.clone(), exe]);
+    Ok(Protected {
+        home: canonical(&layout.home),
+        temp: vec![canonical(temp)],
+        denied_trees: trees.iter().map(|t| canonical(t)).collect(),
+        denied_paths: paths.iter().map(|p| canonical(p)).collect(),
+    })
+}
+
+/// The executables named `tool` in `path_var` and `provider_path(home)`, in search order: a
+/// regular file with an execute bit, or a link to one. An unreadable entry counts as absent;
+/// the sandbox, not this check, is what protects the machine.
+#[cfg_attr(not(test), expect(dead_code, reason = "wired by the script run"))]
+pub(super) fn on_path(home: &Path, path_var: &OsStr, tool: &str) -> Vec<PathBuf> {
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    for d in std::env::split_paths(path_var).chain(dfm_platform_macos::provider_path(home)) {
+        if !dirs.contains(&d) {
+            dirs.push(d);
+        }
+    }
+    dirs.into_iter()
+        .map(|d| d.join(tool))
+        .filter(|p| {
+            fs::metadata(p).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+        })
+        .collect()
 }
 
 /// What the script preview shows and the digest covers.
@@ -693,6 +839,143 @@ mod tests {
         assert_ne!(base, d("s2", &[("HOME", "/h")], false));
         assert_ne!(base, d("s1", &[("HOME", "/g")], false));
         assert_ne!(base, d("s1", &[("HOME", "/h")], true));
+    }
+
+    #[test]
+    fn the_profile_denies_trees_paths_ancestors_and_exec() {
+        let p = Protected {
+            home: "/h".into(),
+            temp: vec!["/private/var/folders/x/T".into()],
+            denied_trees: vec![
+                "/h/.dotfiles".into(),
+                "/h/.local/state/dotfiles-manager".into(),
+            ],
+            denied_paths: vec![
+                "/h/.config/zsh/.zshrc".into(),
+                "/h/.local/state/dotfiles-manager.lock".into(),
+            ],
+        };
+        let text = profile(&p).unwrap();
+        for want in [
+            "(allow default)",
+            "(deny file-write* (subpath \"/\"))",
+            "(subpath \"/h\")",
+            "(subpath \"/h/.dotfiles\")",
+            "(literal \"/h/.config/zsh/.zshrc\")",
+            "(literal \"/h/.config/zsh\")",
+            "(literal \"/h/.config\")",
+            "(literal \"/h/.local\")",
+            "(literal \"/h/.local/state\")",
+            "(literal \"/h/.local/state/dotfiles-manager.lock\")",
+            "(literal \"/usr/bin/sudo\")",
+        ] {
+            assert!(text.contains(want), "{want}\n{text}");
+        }
+        assert!(
+            !text.contains("(literal \"/h\")"),
+            "HOME itself is not denied"
+        );
+        let allow_at = text.find("(allow file-write*").unwrap();
+        assert!(
+            text.rfind("(deny file-write*").unwrap() > allow_at,
+            "denies come after the allow"
+        );
+    }
+
+    #[test]
+    fn the_profile_lines_are_in_rule_order() {
+        let p = Protected {
+            home: "/h".into(),
+            temp: vec!["/t".into()],
+            denied_trees: vec!["/h/b".into(), "/h/a".into(), "/h/a".into()],
+            denied_paths: vec!["/h/c/f".into(), "/outside/g".into()],
+        };
+        let text = profile(&p).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(
+            lines,
+            [
+                "(version 1)",
+                "(allow default)",
+                "(deny file-write* (subpath \"/\"))",
+                "(allow file-write* (subpath \"/h\") (subpath \"/t\") (subpath \"/private/tmp\") (subpath \"/dev\"))",
+                "(deny file-write* (subpath \"/h/a\"))",
+                "(deny file-write* (subpath \"/h/b\"))",
+                "(deny file-write* (literal \"/h/c\") (literal \"/h/c/f\") (literal \"/outside/g\"))",
+                "(deny process-exec (literal \"/usr/bin/sudo\") (literal \"/usr/bin/su\") (literal \"/usr/bin/osascript\"))",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_path_the_profile_cannot_hold_refuses() {
+        for bad in ["/h/a\"b", "/h/a\\b", "/h/a\nb", "/h/a\u{7f}b"] {
+            let p = Protected {
+                home: "/h".into(),
+                temp: vec![],
+                denied_trees: vec![bad.into()],
+                denied_paths: vec![],
+            };
+            assert_eq!(
+                profile(&p).unwrap_err().code,
+                Code::TargetInvalid,
+                "{bad:?}"
+            );
+        }
+        let p = Protected {
+            home: "/h \u{e9}".into(),
+            temp: vec![],
+            denied_trees: vec![],
+            denied_paths: vec!["/h \u{e9}/x y".into()],
+        };
+        assert!(profile(&p).unwrap().contains("(literal \"/h \u{e9}/x y\")"));
+    }
+
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("dfm-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::canonicalize(&dir).unwrap()
+    }
+
+    #[test]
+    fn canonical_keeps_a_missing_leaf_under_the_real_parent() {
+        let dir = scratch("canonical");
+        let link = dir.join("link");
+        std::os::unix::fs::symlink(&dir, &link).unwrap();
+        assert_eq!(
+            canonical(&link.join("missing/leaf")),
+            dir.join("missing/leaf")
+        );
+        assert_eq!(canonical(&link), dir);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn on_path_finds_executables_and_ignores_the_rest() {
+        let dir = scratch("on-path");
+        let mode =
+            |p: &Path, m: u32| fs::set_permissions(p, fs::Permissions::from_mode(m)).unwrap();
+        for (d, m) in [("bin", 0o755), ("bin2", 0o644)] {
+            fs::create_dir(dir.join(d)).unwrap();
+            fs::write(dir.join(d).join("t"), b"#!/bin/sh\n").unwrap();
+            mode(&dir.join(d).join("t"), m);
+        }
+        fs::create_dir(dir.join("bin3")).unwrap();
+        std::os::unix::fs::symlink(dir.join("bin/t"), dir.join("bin3/t")).unwrap();
+        fs::create_dir(dir.join("bin4")).unwrap();
+        std::os::unix::fs::symlink(dir.join("bin2/t"), dir.join("bin4/t")).unwrap();
+        let path = std::env::join_paths(
+            ["bin", "bin2", "bin3", "bin4", "bin", "absent"].map(|d| dir.join(d)),
+        )
+        .unwrap();
+        let home = dir.join("home");
+        assert_eq!(
+            on_path(&home, &path, "t"),
+            [dir.join("bin/t"), dir.join("bin3/t")]
+        );
+        assert!(on_path(&home, &path, "dfm-no-such-tool").is_empty());
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
