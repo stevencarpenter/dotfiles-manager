@@ -402,6 +402,8 @@ pub(super) fn profile(p: &Protected) -> Result<String, Refusal> {
     }
     literals.sort_unstable();
     literals.dedup();
+    // No `file-link` rule: this profile already refuses a hard link from HOME to a denied file
+    // (`ln` fails with EPERM on Darwin 27.2.0).
     let mut text =
         String::from("(version 1)\n(allow default)\n(deny file-write* (subpath \"/\"))\n");
     text += &format!("(allow file-write*{})\n", rules("subpath", &allowed)?);
@@ -421,11 +423,14 @@ pub(super) fn profile(p: &Protected) -> Result<String, Refusal> {
 #[cfg_attr(not(test), expect(dead_code, reason = "wired by the script run"))]
 fn canonical(p: &Path) -> PathBuf {
     for a in p.ancestors() {
-        if let Ok(real) = fs::canonicalize(a) {
-            // `a` is an ancestor of `p`, so the prefix always strips.
-            return p
-                .strip_prefix(a)
-                .map_or_else(|_| p.to_path_buf(), |rest| real.join(rest));
+        if let Ok(mut real) = fs::canonicalize(a) {
+            // Joining an empty rest adds a trailing `/`, which no sandbox rule matches.
+            if let Ok(rest) = p.strip_prefix(a)
+                && !rest.as_os_str().is_empty()
+            {
+                real.push(rest);
+            }
+            return real;
         }
     }
     p.to_path_buf()
@@ -434,27 +439,27 @@ fn canonical(p: &Path) -> PathBuf {
 /// `p` with its parent canonicalized and its last component kept, so a link at `p` is named
 /// itself: a deny on its target would still let the script remove or replace the link.
 #[cfg_attr(not(test), expect(dead_code, reason = "wired by the script run"))]
-fn spelled(p: &Path) -> PathBuf {
+fn canonical_nofollow(p: &Path) -> PathBuf {
     match (p.parent(), p.file_name()) {
         (Some(dir), Some(name)) => canonical(dir).join(name),
         _ => canonical(p),
     }
 }
 
-/// Each link strictly below `home` on the way to `p`, `p` included, as [`spelled`] names it.
+/// Each link strictly below `home` on the way to `p`, `p` included, as [`canonical_nofollow`]
+/// names it.
 /// Replacing one of them redirects `p` without a write to `p` itself.
 #[cfg_attr(not(test), expect(dead_code, reason = "wired by the script run"))]
 fn links_on(home: &Path, p: &Path) -> Vec<PathBuf> {
     p.ancestors()
         .filter(|a| a.starts_with(home) && *a != home)
         .filter(|a| fs::symlink_metadata(a).is_ok_and(|m| m.file_type().is_symlink()))
-        .map(spelled)
+        .map(canonical_nofollow)
         .collect()
 }
 
 /// The protected set for a run: the binding root's guarded checkouts, dfm's own directories,
-/// install directory and executable, the lock file, and every ledger target (the dfm links
-/// themselves, not what they point to).
+/// install directory and executable, the lock file, and every ledger target.
 #[expect(dead_code, reason = "wired by the script run")]
 pub(super) fn protected(
     layout: &Layout,
@@ -462,34 +467,53 @@ pub(super) fn protected(
     ledger: &Ledger,
     temp: &Path,
 ) -> Result<Protected, Refusal> {
-    let io = |e: std::io::Error| Refusal::new(Code::IoFailed, format!("dfm's own path: {e}"));
-    // The invoked path is a link on an installed machine; its real directory is the install.
-    let exe = std::env::current_exe().map_err(io)?;
-    let install = fs::canonicalize(&exe).map_err(io)?;
-    let mut trees = crate::sync_cmd::guarded_checkouts(root)?;
+    let exe = std::env::current_exe()
+        .map_err(|e| Refusal::new(Code::IoFailed, format!("dfm's own path: {e}")))?;
+    let checkouts = crate::sync_cmd::guarded_checkouts(root)?;
+    Ok(protected_set(layout, checkouts, ledger, &exe, temp))
+}
+
+/// [`protected`] from its inputs. `exe` is the invoked path, a link on an installed machine.
+/// A denied path is denied as itself and through its links: the no-follow form stops a rename,
+/// removal or replacement of a link, the followed form stops a write through it when its
+/// target is outside every denied tree. A tree is denied by its real path, and each link on
+/// the way to a tree or path below HOME (the tree itself included) as a literal.
+#[cfg_attr(not(test), expect(dead_code, reason = "wired by the script run"))]
+fn protected_set(
+    layout: &Layout,
+    checkouts: Vec<PathBuf>,
+    ledger: &Ledger,
+    exe: &Path,
+    temp: &Path,
+) -> Protected {
+    let mut trees = checkouts;
     trees.extend([
         layout.state_root.clone(),
         layout.config_dir.clone(),
         layout.data_dir.clone(),
         layout.cache_dir.clone(),
     ]);
-    trees.extend(install.parent().map(Path::to_path_buf));
+    trees.extend(canonical(exe).parent().map(Path::to_path_buf));
     let mut paths: Vec<PathBuf> = ledger
         .resources
         .iter()
         .flat_map(|r| r.owned_outputs.iter().map(|o| PathBuf::from(&o.path)))
         .collect();
-    paths.extend([layout.lock_file.clone(), exe]);
-    let mut denied_paths: Vec<PathBuf> = paths.iter().map(|p| spelled(p)).collect();
+    paths.extend([layout.lock_file.clone(), exe.to_path_buf()]);
+    // `profile` sorts and deduplicates, so a path that is not a link may appear twice here.
+    let mut denied_paths: Vec<PathBuf> = paths
+        .iter()
+        .flat_map(|p| [canonical_nofollow(p), canonical(p)])
+        .collect();
     for p in trees.iter().chain(&paths) {
         denied_paths.extend(links_on(&layout.home, p));
     }
-    Ok(Protected {
+    Protected {
         home: canonical(&layout.home),
         temp: vec![canonical(temp)],
         denied_trees: trees.iter().map(|t| canonical(t)).collect(),
         denied_paths,
-    })
+    }
 }
 
 /// The executables named `tool` in `path_var` and `provider_path(home)`, in search order: a
@@ -967,7 +991,7 @@ mod tests {
     }
 
     #[test]
-    fn canonical_keeps_a_missing_leaf_under_the_real_parent() {
+    fn canonical_follows_a_link_and_canonical_nofollow_keeps_it() {
         let dir = scratch("canonical");
         let link = dir.join("link");
         std::os::unix::fs::symlink(&dir, &link).unwrap();
@@ -975,25 +999,97 @@ mod tests {
             canonical(&link.join("missing/leaf")),
             dir.join("missing/leaf")
         );
-        assert_eq!(canonical(&link), dir);
+        // `Path` equality ignores a trailing `/`; the profile text does not.
+        assert_eq!(canonical(&link).as_os_str(), dir.as_os_str());
+        // A deny on the target alone would let the script remove or replace the link.
+        assert_eq!(canonical_nofollow(&link), link);
+        assert_eq!(canonical_nofollow(&link.join("leaf")), dir.join("leaf"));
+        assert_eq!(
+            links_on(&dir, &link.join("leaf")),
+            [canonical_nofollow(&link)]
+        );
+        assert!(links_on(&dir, &dir.join("leaf")).is_empty());
         fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
-    fn a_denied_link_is_named_itself_not_its_target() {
-        let h = scratch("spelled");
-        fs::create_dir(h.join("real")).unwrap();
-        fs::write(h.join("target"), b"t").unwrap();
-        std::os::unix::fs::symlink(h.join("target"), h.join("real/f")).unwrap();
-        std::os::unix::fs::symlink(h.join("real"), h.join("l")).unwrap();
-        // A script that removes or replaces the link is what the deny must stop.
-        assert_eq!(spelled(&h.join("l/f")), h.join("real/f"));
-        assert_eq!(spelled(&h.join("l/missing")), h.join("real/missing"));
-        assert_eq!(
-            links_on(&h, &h.join("l/f")),
-            [h.join("real/f"), h.join("l")]
+    fn linked_targets_the_dfm_link_and_a_linked_tree_are_denied_in_both_forms() {
+        use dfm_model::state::{Class, LedgerResource, OwnedOutput};
+        let h = scratch("protected");
+        let mkdir = |d: &str| fs::create_dir_all(h.join(d)).unwrap();
+        let link = |to: &str, at: &str| std::os::unix::fs::symlink(h.join(to), h.join(at)).unwrap();
+        for d in [
+            "src/dotfiles",
+            "store/zsh",
+            ".config/zsh",
+            ".local/bin",
+            ".local/share/dfm/bin",
+        ] {
+            mkdir(d);
+        }
+        fs::write(h.join("store/zsh/zshrc"), b"z").unwrap();
+        fs::write(h.join(".local/share/dfm/bin/dfm"), b"x").unwrap();
+        link("src/dotfiles", ".dotfiles");
+        link("store/zsh/zshrc", ".config/zsh/.zshrc");
+        link(".local/share/dfm/bin/dfm", ".local/bin/dfm");
+        let layout = Layout {
+            home: h.clone(),
+            config_dir: h.join(".config/dfm"),
+            state_root: h.join(".local/state/dfm"),
+            lock_file: h.join(".local/state/dfm.lock"),
+            data_dir: h.join(".local/share/dfm"),
+            cache_dir: h.join(".cache/dfm"),
+        };
+        let mut ledger = Ledger::empty(Stamp {
+            profile: "p".into(),
+            machine_id: "m".into(),
+            binding_digest: "d".into(),
+        });
+        ledger.resources.push(LedgerResource {
+            resource: "zsh".into(),
+            adapter: "link".into(),
+            class: Class::Normal,
+            op_id: "op".into(),
+            owned_outputs: vec![OwnedOutput {
+                path: h.join(".config/zsh/.zshrc").display().to_string(),
+                mode: 0o644,
+                fingerprint: None,
+                coowned: None,
+            }],
+        });
+        let p = protected_set(
+            &layout,
+            vec![h.join(".dotfiles")],
+            &ledger,
+            &h.join(".local/bin/dfm"),
+            &h.join("tmp"),
         );
-        assert!(links_on(&h, &h.join("real")).is_empty());
+        let text = profile(&p).unwrap();
+        let lit = |rel: &str| format!("(literal \"{}\")", h.join(rel).display());
+        let sub = |rel: &str| format!("(subpath \"{}\")", h.join(rel).display());
+        let want = [
+            // The ledger link and the file it points to, with the ancestors of both.
+            lit(".config/zsh/.zshrc"),
+            lit(".config/zsh"),
+            lit(".config"),
+            lit("store/zsh/zshrc"),
+            lit("store/zsh"),
+            lit("store"),
+            // The dfm command link and dfm itself; its real directory is the install.
+            lit(".local/bin/dfm"),
+            lit(".local/bin"),
+            lit(".local"),
+            lit(".local/share/dfm/bin/dfm"),
+            sub(".local/share/dfm/bin"),
+            // A linked checkout: the tree by its real path, the link as a literal.
+            sub("src/dotfiles"),
+            lit(".dotfiles"),
+            lit("src"),
+        ];
+        for w in &want {
+            assert!(text.contains(w.as_str()), "{w}\n{text}");
+        }
+        assert!(!text.contains(&sub(".dotfiles")), "{text}");
         fs::remove_dir_all(&h).unwrap();
     }
 
