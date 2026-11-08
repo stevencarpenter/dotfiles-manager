@@ -2580,8 +2580,8 @@ mod tests {
                 "binary sha256",
                 Box::new(|s| {
                     s.binary = Some(ScriptBinary {
-                        path: "/h/.local/bin/x".into(),
-                        real_path: "/h/.local/bin/x".into(),
+                        path: "/h/.local/share/x".into(),
+                        real_path: "/h/.local/share/x".into(),
                         sha256: "xyz".into(),
                     })
                 }),
