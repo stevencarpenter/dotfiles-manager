@@ -169,7 +169,12 @@ fn tree(parse: bool) -> Command {
                 .arg(value("provider", "homebrew/v1|mise/v1"))
                 .arg(many("config", "path"))
                 .arg(preview())
-                .arg(yes_plan()),
+                .arg(yes_plan())
+                .arg(value("script", "url"))
+                .arg(value("shell", "sh|bash|zsh"))
+                .arg(many("arg", "value"))
+                .arg(many("env", "NAME=VALUE"))
+                .arg(switch("tty")),
         )
         .subcommand(
             Command::new("adopt")

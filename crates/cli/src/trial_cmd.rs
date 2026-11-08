@@ -16,8 +16,9 @@ use dfm_model::plan::{Binary, PackageState, file_fingerprint};
 use dfm_model::resolve::{Table, Value};
 use dfm_model::state::{
     Approval, Baseline, BaselinePath, BinaryId, Class, JournalEntry, MAX_BYTES, OperationRecord,
-    Phase, ProfileRef, Receipt, Recovery, RunResult, SCHEMA, Stamp, Status, TRIAL_SCHEMA_DATA,
-    TrialInstall, TrialPackage, TrialRecord, count_statuses, rfc3339, valid_id, valid_path,
+    Phase, ProfileRef, Receipt, Recovery, RunResult, SCHEMA, SHELLS, Stamp, Status,
+    TRIAL_SCHEMA_DATA, TrialInstall, TrialPackage, TrialRecord, count_statuses, rfc3339, valid_id,
+    valid_path,
 };
 use dfm_model::{Code, Exit, Refusal};
 use serde_json::json;
@@ -25,9 +26,12 @@ use std::fs;
 use std::io::Write;
 use std::path::Path;
 
+mod script;
+mod window;
+
 /// Effects a trial does not instrument. They are recorded so `purge` treats them as candidates
 /// for review and never as owned cleanup scope (DESIGN.md: the manager is not an OS sandbox).
-const UNKNOWN: [&str; 3] = ["services", "paths-outside-baseline", "provider-caches"];
+pub(super) const UNKNOWN: [&str; 3] = ["services", "paths-outside-baseline", "provider-caches"];
 
 #[derive(Debug)]
 pub struct Args {
@@ -38,6 +42,74 @@ pub struct Args {
     pub configs: Vec<String>,
     pub preview: bool,
     pub yes_plan: Option<String>,
+    pub script: Option<ScriptArgs>,
+}
+
+/// The `--script` flags: an install script fetched from `url` and run by `shell`.
+#[derive(Debug)]
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "script::run reads these fields from DFM-81 task 4"
+    )
+)]
+pub struct ScriptArgs {
+    /// An `https://` URL.
+    pub url: String,
+    /// One of [`SHELLS`]; `sh` when `--shell` is absent.
+    pub shell: String,
+    pub args: Vec<String>,
+    /// `--env NAME=VALUE` pairs: unique names, none from [`FIXED_ENV`].
+    pub env: Vec<(String, String)>,
+    pub tty: bool,
+}
+
+/// Variables the script run sets itself. `--env` cannot override them.
+pub(super) const FIXED_ENV: [&str; 15] = [
+    "HOME",
+    "USER",
+    "LOGNAME",
+    "TMPDIR",
+    "SHELL",
+    "PATH",
+    "LANG",
+    "LC_ALL",
+    "TERM",
+    "ZDOTDIR",
+    "XDG_CONFIG_HOME",
+    "XDG_DATA_HOME",
+    "XDG_STATE_HOME",
+    "XDG_CACHE_HOME",
+    "XDG_BIN_HOME",
+];
+
+fn parse_env(pairs: Vec<String>) -> Result<Vec<(String, String)>, Refusal> {
+    let mut env: Vec<(String, String)> = Vec::new();
+    for p in pairs {
+        let (name, val) = p
+            .split_once('=')
+            .ok_or_else(|| usage("--env takes NAME=VALUE"))?;
+        let mut chars = name.chars();
+        let plain = chars
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+            && chars.all(|c| c.is_ascii_alphanumeric() || c == '_');
+        if !plain {
+            return Err(usage(format!(
+                "--env name {} must match [A-Za-z_][A-Za-z0-9_]*",
+                visible(name)
+            )));
+        }
+        if FIXED_ENV.contains(&name) {
+            return Err(usage(format!("--env cannot set {name}; the run fixes it")));
+        }
+        if env.iter().any(|(n, _)| n == name) {
+            return Err(usage(format!("--env {name} is given twice")));
+        }
+        env.push((name.to_string(), val.to_string()));
+    }
+    Ok(env)
 }
 
 /// `trial <package> [--id <trial-id>] [--provider homebrew/v1|mise/v1] [--config <path>]...
@@ -79,6 +151,49 @@ pub fn parse_args(m: &clap::ArgMatches) -> Result<Args, Refusal> {
             visible(&package)
         )));
     }
+    let (url, shell, script_args) = (
+        cli::one(m, "script"),
+        cli::one(m, "shell"),
+        cli::all(m, "arg"),
+    );
+    let (env, tty) = (cli::all(m, "env"), cli::flag(m, "tty"));
+    let script = match url {
+        None => {
+            if shell.is_some() || !script_args.is_empty() || !env.is_empty() || tty {
+                return Err(usage("--shell, --arg, --env and --tty need --script"));
+            }
+            None
+        }
+        Some(url) => {
+            if provider.is_some() {
+                return Err(usage("--script and --provider cannot be used together"));
+            }
+            if !url.starts_with("https://") {
+                return Err(usage("--script takes an https:// URL"));
+            }
+            if !valid_id(&package) {
+                return Err(usage(format!(
+                    "the tool name {} must be lowercase ASCII letters, digits, '.', '_' or '-' (1 to 64 characters)",
+                    visible(&package)
+                )));
+            }
+            let shell = shell.unwrap_or_else(|| "sh".to_string());
+            if !SHELLS.contains(&shell.as_str()) {
+                return Err(usage(format!(
+                    "--shell is {}; {} cannot run a script",
+                    SHELLS.join(", "),
+                    visible(&shell)
+                )));
+            }
+            Some(ScriptArgs {
+                url,
+                shell,
+                args: script_args,
+                env: parse_env(env)?,
+                tty,
+            })
+        }
+    };
     Ok(Args {
         package,
         id,
@@ -86,6 +201,7 @@ pub fn parse_args(m: &clap::ArgMatches) -> Result<Args, Refusal> {
         configs,
         preview,
         yes_plan: yes,
+        script,
     })
 }
 
@@ -348,7 +464,7 @@ fn find_owner(runner: &Runner, pkg: &str, provider: Option<&str>) -> Result<Owne
 /// One baseline observation. A file is hashed, a directory and an absent path are recorded as
 /// such, and anything else (a link, a special file, an unreadable entry) is a baseline failure:
 /// recording it as absent would let a later purge delete what was there.
-fn observe(path: &str) -> Result<BaselinePath, Refusal> {
+pub(super) fn observe(path: &str) -> Result<BaselinePath, Refusal> {
     let fail = |what: String| {
         Refusal::new(
             Code::StateInvalid,
@@ -396,7 +512,7 @@ fn observe(path: &str) -> Result<BaselinePath, Refusal> {
 /// The data candidates: where a tool keeps its data, state and caches by convention (XDG and
 /// macOS). `purge` removes the ones that were absent before the trial.
 /// shortcut: a fixed list by tool name, upgrade when an adapter can declare its data paths
-fn data_candidates(home: &Path, tool: &str) -> Vec<String> {
+pub(super) fn data_candidates(home: &Path, tool: &str) -> Vec<String> {
     [
         ".local/share",
         ".local/state",
@@ -411,7 +527,11 @@ fn data_candidates(home: &Path, tool: &str) -> Vec<String> {
 
 /// The configuration candidates: the explicit `--config` paths, or `~/.config/<tool>` when
 /// none is given. A relative path is inside HOME.
-fn candidates(home: &Path, tool: &str, configs: &[String]) -> Result<Vec<String>, Refusal> {
+pub(super) fn candidates(
+    home: &Path,
+    tool: &str,
+    configs: &[String],
+) -> Result<Vec<String>, Refusal> {
     if configs.is_empty() {
         // shortcut: one XDG candidate for every tool, upgrade when an adapter can declare paths
         return Ok(vec![home.join(".config").join(tool).display().to_string()]);
@@ -444,6 +564,9 @@ pub fn run(ctx: &Ctx, args: &Args, out: &mut dyn Write) -> Result<(), Refusal> {
             "this machine is not bound; run bind first",
         )
     })?;
+    if let Some(s) = &args.script {
+        return script::run(ctx, args, s, out);
+    }
     // The adapter's own name check, before any provider sees the name.
     let package = package::name(&package_value(&args.package)).map_err(|e| usage(e.detail))?;
     let tool = package::leaf(&package).to_string();
@@ -781,6 +904,74 @@ mod tests {
             vec!["a", "-y"],
             vec!["a", "--preview", "-y", &d],
             vec!["a", "-y", &d, "--yes-plan", &d],
+        ] {
+            assert_eq!(a(&bad).unwrap_err().code, Code::Usage, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn script_arguments_parse_and_refuse_the_wrong_combinations() {
+        let a = |v: &[&str]| crate::cli::parse("trial", v).and_then(|m| parse_args(&m));
+        let ok = a(&[
+            "boat",
+            "--script",
+            "https://boat.dev/install",
+            "--shell",
+            "bash",
+            "--arg",
+            "--no-modify-path",
+            "--env",
+            "FOO=1",
+            "--tty",
+            "--preview",
+        ])
+        .unwrap();
+        let s = ok.script.unwrap();
+        assert_eq!(
+            (s.url.as_str(), s.shell.as_str(), s.args.as_slice(), s.tty),
+            (
+                "https://boat.dev/install",
+                "bash",
+                &["--no-modify-path".to_string()][..],
+                true
+            )
+        );
+        assert_eq!(s.env, vec![("FOO".to_string(), "1".to_string())]);
+        assert_eq!(
+            a(&["boat", "--script", "https://x/i"])
+                .unwrap()
+                .script
+                .unwrap()
+                .shell,
+            "sh"
+        );
+        for bad in [
+            vec![
+                "boat",
+                "--script",
+                "https://x/i",
+                "--provider",
+                "homebrew/v1",
+            ],
+            vec!["boat", "--script", "http://x/i"],
+            vec!["boat", "--script", "https://x/i", "--shell", "fish"],
+            vec!["boat", "--script", "https://x/i", "--env", "HOME=/x"],
+            vec!["boat", "--script", "https://x/i", "--env", "NOEQUALS"],
+            vec!["boat", "--script", "https://x/i", "--env", "=v"],
+            vec![
+                "boat",
+                "--script",
+                "https://x/i",
+                "--env",
+                "A=1",
+                "--env",
+                "A=2",
+            ],
+            vec!["homebrew/core/boat", "--script", "https://x/i"],
+            vec!["boat", "--shell", "bash"],
+            vec!["boat", "--arg", "x"],
+            vec!["boat", "--env", "A=1"],
+            vec!["boat", "--tty"],
         ] {
             assert_eq!(a(&bad).unwrap_err().code, Code::Usage, "{bad:?}");
         }
