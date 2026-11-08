@@ -65,6 +65,28 @@ fn not_regular(path: &Path) -> Refusal {
     )
 }
 
+fn too_large(url: &str) -> Refusal {
+    Refusal::new(
+        Code::LimitExceeded,
+        format!(
+            "{} is larger than the {MAX_SCRIPT}-byte script cap; nothing was changed",
+            visible(url)
+        ),
+    )
+}
+
+/// The runner with `/usr/bin` first when it is on the search path, so the system's curl,
+/// getconf and id run even when a provider directory such as Homebrew's comes earlier.
+fn system_tools(runner: &Runner) -> Runner {
+    let mut r = runner.clone();
+    let usr_bin = Path::new(dfm_platform_macos::SYSTEM_PATH[0]);
+    if let Some(i) = r.search_path.iter().position(|p| p == usr_bin) {
+        let p = r.search_path.remove(i);
+        r.search_path.insert(0, p);
+    }
+    r
+}
+
 /// Fetches `url` once with curl through the runner and caches the bytes (mode 0600) with a
 /// sidecar. Only `https` is accepted, also after redirects.
 pub(super) fn fetch(runner: &Runner, cache_dir: &Path, url: &str) -> Result<Fetched, Refusal> {
@@ -76,7 +98,14 @@ pub(super) fn fetch(runner: &Runner, cache_dir: &Path, url: &str) -> Result<Fetc
         .create(&dir)
         .map_err(io_failed(&dir))?;
     let tmp = dir.join(format!(".fetch-{}", std::process::id()));
+    // curl follows a link at its `-o` path, so a stale or planted entry goes first.
+    match fs::remove_file(&tmp) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(io_failed(&tmp)(e)),
+        _ => {}
+    }
+    // `-q` first: `~/.curlrc` cannot add `insecure`, `proxy` or `cacert`.
     let args: Vec<String> = [
+        "-q",
         "--proto",
         "=https",
         "--proto-redir",
@@ -92,7 +121,7 @@ pub(super) fn fetch(runner: &Runner, cache_dir: &Path, url: &str) -> Result<Fetc
     .chain([tmp.display().to_string()])
     .chain(["-w", "%{url_effective}", "--", url].map(String::from))
     .collect();
-    let o = runner.run(&Request {
+    let o = system_tools(runner).run(&Request {
         program: "curl",
         args: &args,
         env: &[],
@@ -118,10 +147,20 @@ pub(super) fn fetch(runner: &Runner, cache_dir: &Path, url: &str) -> Result<Fetc
             drop_tmp();
             return Err(r);
         }
+        // curl's exit for `--max-filesize`.
+        End::Exited(63) => {
+            drop_tmp();
+            return Err(too_large(url));
+        }
         end => {
+            let how = match end {
+                End::Exited(n) => format!("curl exited {n}"),
+                End::TimedOut => "curl timed out after 120 seconds".into(),
+                _ => "curl was ended by a signal".into(),
+            };
             let err = String::from_utf8_lossy(&o.stderr);
             return Err(untrusted(format!(
-                "the fetch failed ({end:?}): {}",
+                "the fetch failed ({how}): {}",
                 bounded_visible(err.trim(), 512)
             )));
         }
@@ -138,13 +177,7 @@ pub(super) fn fetch(runner: &Runner, cache_dir: &Path, url: &str) -> Result<Fetc
     let bytes = u64::try_from(body.len()).unwrap_or(u64::MAX);
     if bytes > MAX_SCRIPT {
         drop_tmp();
-        return Err(Refusal::new(
-            Code::LimitExceeded,
-            format!(
-                "{} is larger than {MAX_SCRIPT} bytes; nothing was changed",
-                visible(url)
-            ),
-        ));
+        return Err(too_large(url));
     }
     let sha256 = sha256_hex(&body);
     let private = fs::Permissions::from_mode(0o600);
@@ -219,7 +252,7 @@ pub(super) fn hints(body: &[u8]) -> Vec<&'static str> {
 /// Runs a short read-only probe through the runner and returns its trimmed output.
 fn probe(runner: &Runner, program: &str, args: &[&str]) -> Result<String, Refusal> {
     let args: Vec<String> = args.iter().map(|a| (*a).to_string()).collect();
-    let o = runner.run(&Request {
+    let o = system_tools(runner).run(&Request {
         program,
         args: &args,
         env: &[],
@@ -535,6 +568,16 @@ mod tests {
     fn unknown_is_the_trial_list_then_the_script_list() {
         assert_eq!(UNKNOWN[..3], super::super::UNKNOWN);
         assert_eq!(UNKNOWN[3..], SCRIPT_UNKNOWN);
+    }
+
+    #[test]
+    fn system_tools_puts_usr_bin_first_and_keeps_the_rest() {
+        let mut r = runner();
+        r.search_path = vec!["/opt/homebrew/bin".into(), "/usr/bin".into(), "/bin".into()];
+        let order = |r: &Runner| r.joined_path();
+        assert_eq!(order(&system_tools(&r)), "/usr/bin:/opt/homebrew/bin:/bin");
+        // The test provider path has no /usr/bin, so planted fakes stay first.
+        assert_eq!(order(&system_tools(&runner())), "/x/bin:/y/bin");
     }
 
     #[test]

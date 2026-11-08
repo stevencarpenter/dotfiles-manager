@@ -218,7 +218,7 @@ fn preview_fetches_once_caches_the_script_and_prints_the_path_and_hints() {
     let tmp_prefix = format!("{}/.fetch-", fx.scripts().display());
     assert!(
         curls[0].starts_with(&format!(
-            "curl --proto =https --proto-redir =https --tlsv1.2 -fsSL --max-filesize 1048576 -o {tmp_prefix}"
+            "curl -q --proto =https --proto-redir =https --tlsv1.2 -fsSL --max-filesize 1048576 -o {tmp_prefix}"
         )),
         "{log}"
     );
@@ -280,8 +280,14 @@ fn a_script_over_the_size_cap_is_refused() {
     let fx = Fx::new();
     fx.script(vec![b'a'; 1_048_577]);
     let o = fx.trial_script("boat", &["--preview"]);
-    assert_ne!(code(&o), 0);
+    assert_eq!(code(&o), 3, "{}", stderr(&o));
     assert!(stderr(&o).contains("E_LIMIT_EXCEEDED"), "{}", stderr(&o));
+    assert!(
+        stderr(&o).contains("1048576-byte script cap"),
+        "{}",
+        stderr(&o)
+    );
     assert!(!fx.cached().exists());
+    assert!(!fx.cached().with_extension("json").exists());
     assert_eq!(fs::read_dir(fx.scripts()).unwrap().count(), 0);
 }

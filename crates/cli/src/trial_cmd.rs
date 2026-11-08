@@ -97,6 +97,9 @@ fn parse_env(pairs: Vec<String>) -> Result<Vec<(String, String)>, Refusal> {
         if FIXED_ENV.contains(&name) {
             return Err(usage(format!("--env cannot set {name}; the run fixes it")));
         }
+        if val.contains(['\0', '\n']) {
+            return Err(usage(format!("--env {name} holds a NUL byte or a newline")));
+        }
         if env.iter().any(|(n, _)| n == name) {
             return Err(usage(format!("--env {name} is given twice")));
         }
@@ -962,6 +965,8 @@ mod tests {
             vec!["boat", "--script", "https://x/i", "--env", "HOME=/x"],
             vec!["boat", "--script", "https://x/i", "--env", "NOEQUALS"],
             vec!["boat", "--script", "https://x/i", "--env", "=v"],
+            vec!["boat", "--script", "https://x/i", "--env", "A=a\nb"],
+            vec!["boat", "--script", "https://x/i", "--env", "A=a\0b"],
             vec![
                 "boat",
                 "--script",

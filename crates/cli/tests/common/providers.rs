@@ -154,21 +154,24 @@ printf ']\n'; exit $rc
 /// `curl ... -o <tmp> -w %{url_effective} -- <url>` logs `curl <args>` to `../log`, writes
 /// `../curl-body` to the `-o` path and prints `../curl-effective` (default: the URL) as the `-w`
 /// format does. A nonzero `../curl-exit` makes it write and print nothing and exit with that code,
-/// as a failed transfer does.
+/// as a failed transfer does. A body larger than `--max-filesize` writes nothing and exits 63, as
+/// curl does.
 pub const FAKE_CURL: &str = r#"#!/bin/sh
 PATH=/usr/bin:/bin:$PATH
 here=$(dirname "$0")
 printf 'curl %s\n' "$*" >> "$here/../log"
-out=; url=
+out=; url=; max=
 while [ $# -gt 0 ]; do
   case "$1" in
     -o) out=$2; shift ;;
+    --max-filesize) max=$2; shift ;;
     --) url=$2; break ;;
   esac
   shift
 done
 rc=$(cat "$here/../curl-exit" 2>/dev/null || echo 0)
 [ "$rc" -ne 0 ] && exit "$rc"
+[ -n "$max" ] && [ "$(wc -c < "$here/../curl-body")" -gt "$max" ] && exit 63
 cat "$here/../curl-body" > "$out" || exit 23
 if [ -e "$here/../curl-effective" ]; then cat "$here/../curl-effective"; else printf '%s' "$url"; fi
 "#;
