@@ -446,16 +446,36 @@ fn canonical_nofollow(p: &Path) -> PathBuf {
     }
 }
 
-/// Each link strictly below `home` on the way to `p`, `p` included, as [`canonical_nofollow`]
-/// names it.
-/// Replacing one of them redirects `p` without a write to `p` itself.
+/// Each link strictly below `home` on the way to `p`, `p` included, and on the way to each link
+/// target in turn, as [`canonical_nofollow`] names it. Replacing any of them redirects `p`
+/// without a write to `p` itself. The walk stops after the kernel's own link limit, so a loop
+/// ends; a duplicate is left for `profile` to remove.
 #[cfg_attr(not(test), expect(dead_code, reason = "wired by the script run"))]
 fn links_on(home: &Path, p: &Path) -> Vec<PathBuf> {
-    p.ancestors()
-        .filter(|a| a.starts_with(home) && *a != home)
-        .filter(|a| fs::symlink_metadata(a).is_ok_and(|m| m.file_type().is_symlink()))
-        .map(canonical_nofollow)
-        .collect()
+    // MAXSYMLINKS in <sys/param.h>: a longer chain cannot resolve, so it redirects nothing.
+    const MAX_HOPS: usize = 32;
+    let (mut out, mut todo, mut hops) = (Vec::new(), vec![p.to_path_buf()], 0);
+    while let Some(q) = todo.pop() {
+        for a in q.ancestors().filter(|a| a.starts_with(home) && *a != home) {
+            let Ok(target) = fs::read_link(a) else {
+                continue;
+            };
+            out.push(canonical_nofollow(a));
+            if hops < MAX_HOPS {
+                hops += 1;
+                let dir = a.parent().unwrap_or(a);
+                // `a` is an ancestor of `q`, so the prefix always strips.
+                let rest = q.strip_prefix(a).unwrap_or(Path::new(""));
+                let next = dir.join(target);
+                todo.push(if rest.as_os_str().is_empty() {
+                    next
+                } else {
+                    next.join(rest)
+                });
+            }
+        }
+    }
+    out
 }
 
 /// The protected set for a run: the binding root's guarded checkouts, dfm's own directories,
@@ -1010,6 +1030,36 @@ mod tests {
         );
         assert!(links_on(&dir, &dir.join("leaf")).is_empty());
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn links_on_follows_link_chains_and_stops_on_a_loop() {
+        let h = scratch("chains");
+        let link = |to: &str, at: &str| std::os::unix::fs::symlink(h.join(to), h.join(at)).unwrap();
+        for d in ["a", "c", "n"] {
+            fs::create_dir(h.join(d)).unwrap();
+        }
+        fs::write(h.join("c/zshrc"), b"z").unwrap();
+        fs::write(h.join("n/vimrc"), b"v").unwrap();
+        // Two hops: repointing the middle link redirects the first without writing to it.
+        link("a/zshrc", ".zshrc");
+        link("c/zshrc", "a/zshrc");
+        // A link in the middle of the target's path.
+        link("m/vimrc", ".vimrc");
+        link("n", "m");
+        link("y", "x");
+        link("x", "y");
+        let mut got = links_on(&h, &h.join(".zshrc"));
+        got.sort();
+        assert_eq!(got, [h.join(".zshrc"), h.join("a/zshrc")]);
+        let mut got = links_on(&h, &h.join(".vimrc"));
+        got.sort();
+        assert_eq!(got, [h.join(".vimrc"), h.join("m")]);
+        let mut got = links_on(&h, &h.join("x/f"));
+        got.sort();
+        got.dedup();
+        assert_eq!(got, [h.join("x"), h.join("y")]);
+        fs::remove_dir_all(&h).unwrap();
     }
 
     #[test]
