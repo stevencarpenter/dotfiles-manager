@@ -1,10 +1,10 @@
 //! Stop requests from SIGINT and SIGTERM (docs/apply.md, "Signals").
 //!
-//! This is the only module of the workspace with `unsafe` code: the five functions that carry an
-//! `expect` for the lint ([`install`], [`kill_child`], [`new_session`], [`foreground_group`] and
-//! [`take_terminal`]). A gate test (`crates/cli/tests/gate.rs`) rejects the keyword and the lint
-//! attributes in any other place. The handler does one thing: it stores a number in a static atomic. The executor
-//! reads the number between operations, and once more inside an operation just before its
+//! This is the only module of the workspace with `unsafe` code: the six functions that carry an
+//! `expect` for the lint ([`install`], [`kill_child`], [`new_session`], [`foreground_group`],
+//! [`take_terminal`] and [`terminal_is_ours`]). A gate test (`crates/cli/tests/gate.rs`) rejects
+//! the keyword and the lint attributes in any other place. The handler does one thing: it stores
+//! a number in a static atomic. The executor reads the number between operations, and once more inside an operation just before its
 //! `intent` entry (see docs/apply.md, "Signals"). After that entry it does not read the number
 //! until the operation ends. Nothing here kills a process or exits from a handler.
 //!
@@ -153,10 +153,13 @@ pub fn installed() -> bool {
 
 /// Sends SIGTERM (`term`) or SIGKILL to the child `pid`, or to its process group when the runner
 /// gave it one (`group`; the group id is then the child's pid, so the signal reaches the child and
-/// everything it started). A pid that does not fit, or a target that is gone, is ignored.
+/// everything it started). SIGTERM is followed by SIGCONT: a stopped process (Ctrl-Z in a child
+/// that has the terminal, or a self-sent SIGSTOP) that catches SIGTERM, as a script with a
+/// cleanup `trap` does, keeps it pending until it runs again. A pid that does not fit, or a
+/// target that is gone, is ignored.
 #[expect(
     unsafe_code,
-    reason = "kill has no safe API; the call touches no memory"
+    reason = "kill has no safe API; the calls touch no memory"
 )]
 pub(crate) fn kill_child(pid: u32, group: bool, term: bool) {
     let Ok(pid) = i32::try_from(pid) else {
@@ -166,7 +169,12 @@ pub(crate) fn kill_child(pid: u32, group: bool, term: bool) {
     let target = if group { -pid } else { pid };
     // SAFETY: `kill` takes two plain integers and dereferences nothing. A negative pid names the
     // process group.
-    let _ = unsafe { libc::kill(target, sig) };
+    unsafe {
+        let _ = libc::kill(target, sig);
+        if term {
+            let _ = libc::kill(target, libc::SIGCONT);
+        }
+    }
 }
 
 /// Starts the child of `cmd` in a new session, with no controlling terminal: a program it runs
@@ -266,6 +274,17 @@ pub(crate) fn take_terminal() -> Result<(), Refusal> {
             format!("cannot take the terminal back from the child: {e}"),
         )
     })
+}
+
+/// Whether the manager's process group is the foreground group of the terminal on its standard
+/// input. False when standard input is not a terminal.
+#[expect(
+    unsafe_code,
+    reason = "tcgetpgrp and getpgrp have no safe API; the calls touch no memory"
+)]
+pub fn terminal_is_ours() -> bool {
+    // SAFETY: both calls take or return plain integers and dereference nothing.
+    unsafe { libc::tcgetpgrp(0) == libc::getpgrp() }
 }
 
 /// The stop request, if a signal arrived since [`install`]. The refusal carries the code that

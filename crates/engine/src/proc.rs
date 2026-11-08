@@ -329,9 +329,10 @@ impl Runner {
     /// live; nothing is read or kept. The child runs in the working directory with exactly
     /// [`Shown::env`] as its environment. It leads its own process group: a new session without
     /// a terminal, or, with [`Shown::tty`], the terminal's foreground group with the manager's
-    /// standard input. A stop request or the timeout ends the group (SIGTERM, the grace period,
-    /// then SIGKILL) and is reported as [`End::Stopped`] or [`End::TimedOut`]; descendants that
-    /// outlive a child that ended by itself are not waited for. With `tty`, the manager takes
+    /// standard input. A stop request or the timeout ends the group (SIGTERM and SIGCONT, then
+    /// SIGKILL once the leader is reaped or the grace period ends) and is reported as
+    /// [`End::Stopped`] or [`End::TimedOut`]; descendants that outlive a child that ended by
+    /// itself are not waited for. With `tty`, the manager takes
     /// the terminal back before it returns, whatever happened. An error means the child did not
     /// run (the working directory, a NUL byte in an argument, a spawn failure) or the terminal
     /// could not be taken back after a run that was otherwise `Ok`.
@@ -380,7 +381,12 @@ impl Runner {
             group: true,
         };
         let end = wait(&mut child, target, req.timeout);
-        if matches!(end, End::TimedOut | End::Stopped(_)) && !reaped(&mut child, self.grace) {
+        if matches!(end, End::TimedOut | End::Stopped(_)) {
+            // SIGKILL goes to the group once the leader is reaped or the grace period ends,
+            // whichever is first: a descendant that ignores SIGTERM must not outlive the run.
+            // The group id is not reused while a member lives, so a group that is already
+            // empty only makes `kill` fail.
+            reaped(&mut child, self.grace);
             target.kill(false);
             // A leader that survives SIGKILL is left as it is; the end is reported anyway.
             reaped(&mut child, self.grace);
