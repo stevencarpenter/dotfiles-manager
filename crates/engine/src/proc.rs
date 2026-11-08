@@ -61,6 +61,19 @@ pub struct Request<'a> {
     pub max_stdout: usize,
 }
 
+/// One child to run with its output shown (`dfm trial --script`, DFM-81).
+pub struct Shown<'a> {
+    /// An absolute program path the caller already resolved ([`Runner::resolve`]).
+    pub program: &'a Path,
+    pub args: &'a [String],
+    /// The whole environment; nothing is added.
+    pub env: &'a [(String, String)],
+    /// true: standard input is the manager's and the child is the terminal's foreground process
+    /// group. false: standard input is `/dev/null` and the child starts in a new session.
+    pub tty: bool,
+    pub timeout: Duration,
+}
+
 /// How the child ended.
 #[derive(Debug)]
 pub enum End {
@@ -176,7 +189,8 @@ impl Runner {
         )))
     }
 
-    fn joined_path(&self) -> String {
+    /// The search path in `PATH` form: the directories joined with `:`.
+    pub fn joined_path(&self) -> String {
         self.search_path
             .iter()
             .map(|p| p.display().to_string())
@@ -309,6 +323,84 @@ impl Runner {
             stderr: stderr.unwrap_or_default(),
             stdin_written: fed.ok.unwrap_or(false),
         })
+    }
+
+    /// Runs one child with standard output and standard error inherited, so the user sees them
+    /// live; nothing is read or kept. The child runs in the working directory with exactly
+    /// [`Shown::env`] as its environment. It leads its own process group: a new session without
+    /// a terminal, or, with [`Shown::tty`], the terminal's foreground group with the manager's
+    /// standard input. A stop request or the timeout ends the group (SIGTERM, the grace period,
+    /// then SIGKILL) and is reported as [`End::Stopped`] or [`End::TimedOut`]; descendants that
+    /// outlive a child that ended by itself are not waited for. With `tty`, the manager takes
+    /// the terminal back before it returns, whatever happened. An error means the child did not
+    /// run (the working directory, a NUL byte in an argument, a spawn failure) or the terminal
+    /// could not be taken back after a run that was otherwise `Ok`.
+    pub fn run_shown(&self, req: &Shown<'_>) -> Result<End, Refusal> {
+        self.ensure_cwd()?;
+        if let Some(bad) = req.args.iter().find(|a| a.contains('\0')) {
+            return Err(refused(format!("argument {bad:?} holds a NUL byte")));
+        }
+        let mut cmd = Command::new(req.program);
+        cmd.args(req.args)
+            .env_clear()
+            .envs(req.env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+            .current_dir(&self.cwd)
+            .stdin(if req.tty {
+                Stdio::inherit()
+            } else {
+                Stdio::null()
+            })
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit());
+        if req.tty {
+            signal::foreground_group(&mut cmd);
+        } else {
+            signal::new_session(&mut cmd);
+        }
+        let ended = self.spawn_shown(&mut cmd, req);
+        if !req.tty {
+            return ended;
+        }
+        // Also after a failed spawn: the hook may have handed the terminal over before `exec`
+        // failed.
+        let taken = signal::take_terminal();
+        ended.and_then(|end| taken.map(|()| end))
+    }
+
+    fn spawn_shown(&self, cmd: &mut Command, req: &Shown<'_>) -> Result<End, Refusal> {
+        let mut child = cmd.spawn().map_err(|e| {
+            refused(format!(
+                "cannot start {}: {}",
+                req.program.display(),
+                e.kind()
+            ))
+        })?;
+        let target = Target {
+            pid: child.id(),
+            group: true,
+        };
+        let end = wait(&mut child, target, req.timeout);
+        if matches!(end, End::TimedOut | End::Stopped(_)) && !reaped(&mut child, self.grace) {
+            target.kill(false);
+            // A leader that survives SIGKILL is left as it is; the end is reported anyway.
+            reaped(&mut child, self.grace);
+        }
+        Ok(end)
+    }
+}
+
+/// Polls up to `limit` for the child to be reaped. A `try_wait` error counts as reaped: nothing
+/// more can be learned about the child.
+fn reaped(child: &mut Child, limit: Duration) -> bool {
+    let until = Instant::now() + limit;
+    loop {
+        if !matches!(child.try_wait(), Ok(None)) {
+            return true;
+        }
+        if Instant::now() >= until {
+            return false;
+        }
+        std::thread::sleep(POLL);
     }
 }
 

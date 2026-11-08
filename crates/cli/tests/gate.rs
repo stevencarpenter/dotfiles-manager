@@ -269,7 +269,7 @@ fn has_keyword(code: &str, word: &str) -> bool {
 /// and in the signal module, and the exception is one `expect` on `install`. This reads raw
 /// text, so a comment, a raw string or a character literal cannot hide an attribute.
 #[test]
-fn the_unsafe_lint_is_named_only_in_the_crate_roots_and_on_the_three_signal_functions() {
+fn the_unsafe_lint_is_named_only_in_the_crate_roots_and_on_the_five_signal_functions() {
     let lint = ["un", "safe_code"].concat();
     let roots = [
         "crates/model/src/lib.rs",
@@ -299,13 +299,17 @@ fn the_unsafe_lint_is_named_only_in_the_crate_roots_and_on_the_three_signal_func
     assert!(engine.contains(&format!("#![deny({lint})]")));
     // The signal module: one `expect` each, directly on `pub fn install` (the handlers), on
     // `pub(crate) fn kill_child` (ending a provider child, DFM-22) and on
-    // `pub(crate) fn new_session` (an updater child without a terminal, DFM-31), and no `allow`.
+    // `pub(crate) fn new_session` (an updater child without a terminal, DFM-31), on
+    // `pub(crate) fn foreground_group` and `pub(crate) fn take_terminal` (a script trial child
+    // that reads the terminal, DFM-81), and no `allow`.
     let module = fs::read_to_string(repo_root().join("crates/engine/src/signal.rs")).unwrap();
     let flat: String = module.split_whitespace().collect::<Vec<_>>().join(" ");
     let functions = [
         "pub fn install()",
         "pub(crate) fn kill_child(",
         "pub(crate) fn new_session(",
+        "pub(crate) fn foreground_group(",
+        "pub(crate) fn take_terminal(",
     ];
     assert_eq!(module.matches(&lint).count(), functions.len(), "{module}");
     assert!(

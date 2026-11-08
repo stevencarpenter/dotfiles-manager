@@ -3,7 +3,7 @@
 //! may not (gate test `os_bound_names_stay_in_platform_macos`).
 
 use dfm_engine::proc::{MAX_STDERR, passthrough};
-use dfm_engine::{End, ProcRequest as Request, Runner};
+use dfm_engine::{End, ProcRequest as Request, Runner, Shown};
 use dfm_model::Code;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -307,5 +307,104 @@ fn a_child_that_exits_before_reading_all_its_input_is_reported() {
     let out = r.run(&req(&[], Some(&big), 5)).unwrap();
     assert!(out.success(), "{out:?}");
     assert!(!out.stdin_written, "{out:?}");
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// A runner for [`Runner::run_shown`] with a short grace period, so the timeout test ends fast.
+fn shown_runner(d: &Path) -> Runner {
+    Runner {
+        grace: Duration::from_millis(100),
+        ..runner(&d.join("bin"))
+    }
+}
+
+fn sh(script: &str) -> Vec<String> {
+    vec!["-c".to_string(), script.to_string()]
+}
+
+#[test]
+fn run_shown_without_tty_reads_dev_null_and_reports_the_exit_code() {
+    let d = scratch("shown-dev-null");
+    let r = shown_runner(&d);
+    let args = sh("read x && exit 7; exit 3");
+    let end = r
+        .run_shown(&Shown {
+            program: Path::new("/bin/sh"),
+            args: &args,
+            env: &[("PATH".into(), "/usr/bin:/bin".into())],
+            tty: false,
+            timeout: Duration::from_secs(5),
+        })
+        .unwrap();
+    // `read` fails at once on /dev/null.
+    assert!(matches!(end, End::Exited(3)), "{end:?}");
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn run_shown_passes_only_the_given_environment() {
+    // HOME is set in the test process; the child must not see it.
+    assert!(
+        std::env::var_os("HOME").is_some(),
+        "the test needs HOME set"
+    );
+    let d = scratch("shown-env");
+    let r = shown_runner(&d);
+    let args = sh(r#"test -z "$HOME" && test "$ONLY" = 1"#);
+    let end = r
+        .run_shown(&Shown {
+            program: Path::new("/bin/sh"),
+            args: &args,
+            env: &[("ONLY".into(), "1".into())],
+            tty: false,
+            timeout: Duration::from_secs(5),
+        })
+        .unwrap();
+    assert!(matches!(end, End::Exited(0)), "{end:?}");
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn run_shown_ends_the_group_on_timeout() {
+    let d = scratch("shown-timeout");
+    let r = shown_runner(&d);
+    // The fractional duration is unique to this process, so `pgrep -f` finds these two sleeps
+    // and nothing a parallel test started.
+    let marker = format!("sleep 30.{}", std::process::id());
+    let args = sh(&format!("{marker} & {marker}"));
+    let started = Instant::now();
+    let end = r
+        .run_shown(&Shown {
+            program: Path::new("/bin/sh"),
+            args: &args,
+            env: &[("PATH".into(), "/usr/bin:/bin".into())],
+            tty: false,
+            timeout: Duration::from_millis(200),
+        })
+        .unwrap();
+    assert!(matches!(end, End::TimedOut), "{end:?}");
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "{:?}",
+        started.elapsed()
+    );
+    // The sleeps got SIGTERM with their group. An orphaned one is reaped by launchd, which can
+    // take a moment after the leader is gone.
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        let found = std::process::Command::new("pgrep")
+            .args(["-f", &marker])
+            .output()
+            .unwrap();
+        if !found.status.success() {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "still running: {}",
+            String::from_utf8_lossy(&found.stdout)
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
     let _ = std::fs::remove_dir_all(&d);
 }
