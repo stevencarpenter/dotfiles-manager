@@ -1069,6 +1069,147 @@ pub const TRIAL_SCHEMA_ADOPTED: i64 = 3;
 /// the data baseline reports it as newer instead of failing on the key.
 pub const TRIAL_SCHEMA_DATA: i64 = 4;
 
+/// Trial schema of a record that carries `script`, whatever `baseline.data` and `adopted` hold.
+/// A binary built before script trials reports it as newer instead of failing on the key.
+pub const TRIAL_SCHEMA_SCRIPT: i64 = 5;
+
+/// Shells a script trial can run the downloaded script with.
+pub const SHELLS: [&str; 3] = ["sh", "bash", "zsh"];
+
+/// Effects a script trial does not instrument, as the fixed tokens of `TrialRecord.unknown`.
+pub const SCRIPT_UNKNOWN: [&str; 4] = [
+    "script-downloads",
+    "later-self-updates",
+    "keychain",
+    "remote-effects",
+];
+
+const OBSERVED_KINDS: [&str; 4] = ["file", "dir", "link", "other"];
+const WINDOW_CHANGES: [&str; 4] = ["created", "modified", "removed", "kind-changed"];
+
+/// One path as the trial saw it: `kind` is one of `file`, `dir`, `link` or `other`, `sha256`
+/// is set for a file and `target` for a link.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Observed {
+    pub path: String,
+    pub kind: String,
+    pub sha256: Option<String>,
+    pub target: Option<String>,
+}
+
+impl Observed {
+    fn valid(&self) -> bool {
+        valid_path(&self.path)
+            && OBSERVED_KINDS.contains(&self.kind.as_str())
+            && self.sha256.as_deref().is_none_or(valid_sha256)
+            && self
+                .target
+                .as_deref()
+                .is_none_or(|t| !t.chars().any(char::is_control))
+    }
+}
+
+/// A path that differs after the script ran. `change` is one of `created`, `modified`,
+/// `removed` or `kind-changed`; the other fields describe the path after the change and
+/// `before` describes it when the path was observed earlier.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WindowEntry {
+    pub path: String,
+    pub change: String,
+    pub kind: String,
+    pub sha256: Option<String>,
+    pub target: Option<String>,
+    pub before: Option<Observed>,
+}
+
+/// How the script ended: exactly one of `code` or `signal`. `signal` is a short lowercase
+/// identifier such as `stopped`, `timeout` or `signal`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ScriptExit {
+    pub code: Option<i32>,
+    pub signal: Option<String>,
+}
+
+/// The tool binary the script installed, as found and as resolved.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ScriptBinary {
+    pub path: String,
+    pub real_path: String,
+    pub sha256: String,
+}
+
+/// A script trial (DFM-78): the script as downloaded, how it ran, and what the observation
+/// window saw. `exit`, `window` and `binary` stay unset until the run ends. `env` is a list of
+/// `[name, value]` pairs, sorted by name by the writer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TrialScript {
+    pub url: String,
+    pub effective_url: String,
+    pub sha256: String,
+    pub bytes: u64,
+    pub shell: String,
+    pub args: Vec<String>,
+    pub env: Vec<(String, String)>,
+    pub tty: bool,
+    pub before: Vec<Observed>,
+    pub exit: Option<ScriptExit>,
+    pub window: Option<Vec<WindowEntry>>,
+    pub binary: Option<ScriptBinary>,
+}
+
+impl TrialScript {
+    fn validate(&self) -> Result<(), Refusal> {
+        let https = |u: &str| u.starts_with("https://") && !u.chars().any(char::is_control);
+        let plain = |t: &str| !t.chars().any(char::is_control);
+        let env_ok = self.env.iter().all(|(n, v)| {
+            !n.is_empty()
+                && n.is_ascii()
+                && !n.contains('=')
+                && plain(n)
+                && v.chars().all(|c| c == '\t' || !c.is_control())
+        });
+        let exit_ok = self
+            .exit
+            .as_ref()
+            .is_none_or(|e| match (e.code, &e.signal) {
+                (Some(_), None) => true,
+                (None, Some(s)) => valid_id(s),
+                _ => false,
+            });
+        let window_ok = self.window.iter().flatten().all(|w| {
+            valid_path(&w.path)
+                && WINDOW_CHANGES.contains(&w.change.as_str())
+                && OBSERVED_KINDS.contains(&w.kind.as_str())
+                && w.sha256.as_deref().is_none_or(valid_sha256)
+                && w.target.as_deref().is_none_or(plain)
+                && w.before.as_ref().is_none_or(Observed::valid)
+        });
+        let binary_ok = self.binary.as_ref().is_none_or(|b| {
+            valid_path(&b.path) && valid_path(&b.real_path) && valid_sha256(&b.sha256)
+        });
+        let ok = https(&self.url)
+            && https(&self.effective_url)
+            && valid_sha256(&self.sha256)
+            && SHELLS.contains(&self.shell.as_str())
+            && self.args.iter().all(|a| plain(a))
+            && env_ok
+            && self.before.iter().all(Observed::valid)
+            && exit_ok
+            && window_ok
+            && binary_ok;
+        if ok {
+            Ok(())
+        } else {
+            Err(bad("trial script is malformed"))
+        }
+    }
+}
+
 /// How `dfm adopt` ended a trial: the journal operation that wrote the adoption and the module
 /// that took the configuration.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1101,6 +1242,9 @@ pub struct TrialRecord {
     /// Set once, by `adopt`, together with schema [`TRIAL_SCHEMA_ADOPTED`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub adopted: Option<TrialAdopted>,
+    /// Set by `dfm trial --script`, together with schema [`TRIAL_SCHEMA_SCRIPT`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub script: Option<TrialScript>,
 }
 
 impl TrialRecord {
@@ -1108,7 +1252,12 @@ impl TrialRecord {
         let t: TrialRecord = parse_schemas(
             "trial",
             bytes,
-            &[SCHEMA, TRIAL_SCHEMA_ADOPTED, TRIAL_SCHEMA_DATA],
+            &[
+                SCHEMA,
+                TRIAL_SCHEMA_ADOPTED,
+                TRIAL_SCHEMA_DATA,
+                TRIAL_SCHEMA_SCRIPT,
+            ],
         )?;
         t.validate()?;
         Ok(t)
@@ -1125,13 +1274,13 @@ impl TrialRecord {
             .adopted
             .as_ref()
             .is_none_or(|a| valid_id(&a.op_id) && valid_id(&a.module));
-        let schema_ok = adoption_ok
-            && self.schema
-                == match (self.baseline.data.is_empty(), &self.adopted) {
-                    (false, _) => TRIAL_SCHEMA_DATA,
-                    (true, None) => SCHEMA,
-                    (true, Some(_)) => TRIAL_SCHEMA_ADOPTED,
-                };
+        let expected = match (&self.script, self.baseline.data.is_empty(), &self.adopted) {
+            (Some(_), _, _) => TRIAL_SCHEMA_SCRIPT,
+            (None, false, _) => TRIAL_SCHEMA_DATA,
+            (None, true, None) => SCHEMA,
+            (None, true, Some(_)) => TRIAL_SCHEMA_ADOPTED,
+        };
+        let schema_ok = adoption_ok && self.schema == expected;
         if !schema_ok {
             return Err(bad("trial schema or adoption is malformed"));
         }
@@ -1157,6 +1306,9 @@ impl TrialRecord {
         });
         if !owners_ok || !self.unknown.iter().all(|u| valid_id(u)) {
             return Err(bad("trial owners or unknown effects are malformed"));
+        }
+        if let Some(sc) = &self.script {
+            sc.validate()?;
         }
         if let Some(p) = &self.package {
             let install_ok = p
@@ -2087,6 +2239,7 @@ mod tests {
             package: None,
             unknown: vec![],
             adopted: None,
+            script: None,
         };
         assert_eq!(TrialRecord::parse(&canonical(&t).unwrap()).unwrap(), t);
         // A record with data paths is schema 4, adopted or not; schema 2 or 3 with data is not.
@@ -2158,6 +2311,7 @@ mod tests {
             package: None,
             unknown: vec![],
             adopted: None,
+            script: None,
         };
         assert!(t.is_active());
         let plain = String::from_utf8(canonical(&t).unwrap()).unwrap();
@@ -2191,7 +2345,7 @@ mod tests {
             let e = TrialRecord::parse(format!("{{\"schema\":{n}}}").as_bytes()).unwrap_err();
             assert_eq!(e.code, code, "{n}");
             assert!(
-                e.detail.ends_with("(supported: 2, 3, 4)"),
+                e.detail.ends_with("(supported: 2, 3, 4, 5)"),
                 "{n}: {}",
                 e.detail
             );
@@ -2206,12 +2360,281 @@ mod tests {
             assert!(b.validate().is_err(), "module {bad:?}");
         }
 
-        // A schema above 4 is newer.
+        // A schema above 5 is newer.
         let newer = String::from_utf8(canonical(&t).unwrap())
             .unwrap()
-            .replace("\"schema\":3", "\"schema\":5");
+            .replace("\"schema\":3", "\"schema\":6");
         assert_eq!(
             TrialRecord::parse(newer.as_bytes()).unwrap_err().code,
+            Code::StateNewer
+        );
+    }
+
+    fn sample_trial() -> TrialRecord {
+        TrialRecord {
+            schema: SCHEMA,
+            binding: stamp(),
+            trial_id: "t1".into(),
+            tool: "atuin".into(),
+            created_unix_ns: 1,
+            baseline: Baseline {
+                data: vec![],
+                tool_preexisting: false,
+                paths: vec![],
+                owners: vec![],
+            },
+            owned_outputs: vec![],
+            package: None,
+            unknown: vec![],
+            adopted: None,
+            script: None,
+        }
+    }
+
+    fn minimal_script() -> TrialScript {
+        TrialScript {
+            url: "https://example.test/install".into(),
+            effective_url: "https://example.test/install".into(),
+            sha256: "a".repeat(64),
+            bytes: 10,
+            shell: "sh".into(),
+            args: vec![],
+            env: vec![],
+            tty: false,
+            before: vec![],
+            exit: None,
+            window: None,
+            binary: None,
+        }
+    }
+
+    fn script_trial(script: TrialScript) -> TrialRecord {
+        let mut t = sample_trial();
+        t.schema = TRIAL_SCHEMA_SCRIPT;
+        t.script = Some(script);
+        t
+    }
+
+    #[test]
+    fn a_script_record_is_schema_5_and_round_trips() {
+        let mut t = sample_trial();
+        t.schema = TRIAL_SCHEMA_SCRIPT;
+        t.package = None;
+        t.script = Some(TrialScript {
+            args: vec!["--no-modify-path".into()],
+            env: vec![("HOME".into(), "/h".into())],
+            before: vec![Observed {
+                path: "/h/.zshenv".into(),
+                kind: "link".into(),
+                sha256: None,
+                target: Some("/h/.dotfiles/zshenv".into()),
+            }],
+            ..minimal_script()
+        });
+        t.unknown = SCRIPT_UNKNOWN.iter().map(|s| s.to_string()).collect();
+        let bytes = serde_json::to_vec(&t).unwrap();
+        assert_eq!(TrialRecord::parse(&bytes).unwrap(), t);
+        assert!(
+            String::from_utf8(bytes)
+                .unwrap()
+                .contains(r#""env":[["HOME","/h"]]"#)
+        );
+    }
+
+    #[test]
+    fn a_script_record_needs_schema_5_and_schema_5_needs_a_script() {
+        let mut t = sample_trial();
+        t.script = Some(minimal_script());
+        for s in [SCHEMA, TRIAL_SCHEMA_ADOPTED, TRIAL_SCHEMA_DATA] {
+            t.schema = s;
+            assert!(t.validate().is_err(), "schema {s}");
+        }
+        let mut plain = sample_trial();
+        plain.schema = TRIAL_SCHEMA_SCRIPT;
+        assert!(plain.validate().is_err());
+    }
+
+    #[test]
+    fn a_script_record_with_data_or_adoption_stays_schema_5() {
+        let mut t = script_trial(minimal_script());
+        t.baseline.data = vec![BaselinePath {
+            path: "/h/.cache/x".into(),
+            existed: false,
+            sha256: None,
+        }];
+        assert!(t.validate().is_ok());
+        t.adopted = Some(TrialAdopted {
+            op_id: "op".into(),
+            module: "m".into(),
+            at_unix_ns: 1,
+        });
+        assert!(t.validate().is_ok());
+    }
+
+    #[test]
+    fn script_fields_are_validated() {
+        let observed = |kind: &str, path: &str| Observed {
+            path: path.into(),
+            kind: kind.into(),
+            sha256: None,
+            target: None,
+        };
+        let entry = |change: &str, kind: &str| WindowEntry {
+            path: "/h/x".into(),
+            change: change.into(),
+            kind: kind.into(),
+            sha256: None,
+            target: None,
+            before: None,
+        };
+        let code = |c| ScriptExit {
+            code: c,
+            signal: None,
+        };
+        type ScriptEdit = Box<dyn Fn(&mut TrialScript)>;
+        let cases: Vec<(&str, ScriptEdit)> = vec![
+            (
+                "url not https",
+                Box::new(|s| s.url = "http://x.test/a".into()),
+            ),
+            (
+                "effective url not https",
+                Box::new(|s| s.effective_url = "ftp://x.test/a".into()),
+            ),
+            (
+                "url with control",
+                Box::new(|s| s.url = "https://x.test/\n".into()),
+            ),
+            ("sha256", Box::new(|s| s.sha256 = "A".repeat(64))),
+            ("shell", Box::new(|s| s.shell = "fish".into())),
+            (
+                "arg with control",
+                Box::new(|s| s.args = vec!["a\u{7}".into()]),
+            ),
+            (
+                "empty env name",
+                Box::new(|s| s.env = vec![("".into(), "v".into())]),
+            ),
+            (
+                "env name with =",
+                Box::new(|s| s.env = vec![("A=B".into(), "v".into())]),
+            ),
+            (
+                "env name not ascii",
+                Box::new(|s| s.env = vec![("é".into(), "v".into())]),
+            ),
+            (
+                "env value with newline",
+                Box::new(|s| s.env = vec![("A".into(), "v\n".into())]),
+            ),
+            (
+                "before path relative",
+                Box::new(move |s| s.before = vec![observed("file", "rel")]),
+            ),
+            (
+                "observed kind",
+                Box::new(move |s| s.before = vec![observed("socket", "/h/x")]),
+            ),
+            (
+                "observed sha256",
+                Box::new(|s| {
+                    s.before = vec![Observed {
+                        path: "/h/x".into(),
+                        kind: "file".into(),
+                        sha256: Some("zz".into()),
+                        target: None,
+                    }]
+                }),
+            ),
+            (
+                "window change",
+                Box::new(move |s| s.window = Some(vec![entry("touched", "file")])),
+            ),
+            (
+                "window kind",
+                Box::new(move |s| s.window = Some(vec![entry("created", "pipe")])),
+            ),
+            (
+                "exit with both",
+                Box::new(|s| {
+                    s.exit = Some(ScriptExit {
+                        code: Some(0),
+                        signal: Some("timeout".into()),
+                    })
+                }),
+            ),
+            (
+                "exit with neither",
+                Box::new(move |s| s.exit = Some(code(None))),
+            ),
+            (
+                "exit signal not an id",
+                Box::new(|s| {
+                    s.exit = Some(ScriptExit {
+                        code: None,
+                        signal: Some("Bad Signal".into()),
+                    })
+                }),
+            ),
+            (
+                "binary sha256",
+                Box::new(|s| {
+                    s.binary = Some(ScriptBinary {
+                        path: "/h/.local/bin/x".into(),
+                        real_path: "/h/.local/bin/x".into(),
+                        sha256: "xyz".into(),
+                    })
+                }),
+            ),
+            (
+                "binary path",
+                Box::new(|s| {
+                    s.binary = Some(ScriptBinary {
+                        path: "x".into(),
+                        real_path: "/h/x".into(),
+                        sha256: "a".repeat(64),
+                    })
+                }),
+            ),
+        ];
+        for (name, edit) in &cases {
+            let mut s = minimal_script();
+            edit(&mut s);
+            assert!(script_trial(s).validate().is_err(), "{name}");
+        }
+        let mut t = script_trial(minimal_script());
+        t.unknown = vec!["Not A Token".into()];
+        assert!(t.validate().is_err(), "unknown token");
+
+        // The accepted shapes: tab in a value, a signal exit, a code exit, a full window.
+        let mut ok = minimal_script();
+        ok.env = vec![("A_B".into(), "v\tw".into())];
+        ok.exit = Some(code(Some(3)));
+        ok.window = Some(vec![WindowEntry {
+            before: Some(observed("file", "/h/x")),
+            ..entry("kind-changed", "link")
+        }]);
+        assert!(script_trial(ok.clone()).validate().is_ok());
+        ok.exit = Some(ScriptExit {
+            code: None,
+            signal: Some("timeout".into()),
+        });
+        assert!(script_trial(ok).validate().is_ok());
+        for sh in SHELLS {
+            let mut s = minimal_script();
+            s.shell = sh.into();
+            assert!(script_trial(s).validate().is_ok(), "{sh}");
+        }
+    }
+
+    #[test]
+    fn a_schema_6_record_is_newer() {
+        let mut v: serde_json::Value = serde_json::to_value(sample_trial()).unwrap();
+        v["schema"] = 6.into();
+        assert_eq!(
+            TrialRecord::parse(&serde_json::to_vec(&v).unwrap())
+                .unwrap_err()
+                .code,
             Code::StateNewer
         );
     }
@@ -2562,6 +2985,7 @@ mod tests {
             package: None,
             unknown: vec![],
             adopted: None,
+            script: None,
         };
         t.validate().unwrap();
         t.schema = 3;
