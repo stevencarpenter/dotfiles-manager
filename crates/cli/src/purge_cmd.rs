@@ -500,8 +500,8 @@ fn lexical(p: &Path) -> PathBuf {
 }
 
 /// Why purge keeps the created link `link` whose target text is now `target`, or `None` when it
-/// may unlink it: the target is the `recorded` one, or lies inside (or is) one of
-/// `created_dirs`. A relative target is joined to the link's directory and resolved by text.
+/// may unlink it: the target is the `recorded` one, or resolves (on the file system) inside, or
+/// to, one of `created_dirs`.
 fn link_keep(
     link: &Path,
     recorded: Option<&str>,
@@ -521,15 +521,53 @@ fn link_keep(
 }
 
 /// The `created_dirs` that hold (or are) what `link` with the target text `target` points to.
-/// A relative target is joined to the link's directory and resolved by text.
+/// A relative target is joined to the link's directory. The target is resolved by the file
+/// system, component by component, never by text: `..` after a linked component then moves
+/// from where that link leads. A target that does not resolve vouches for nothing.
 fn vouching<'a>(link: &Path, target: &str, created_dirs: &[&'a Path]) -> Vec<&'a Path> {
-    let to = lexical(&link.parent().unwrap_or(link).join(target));
+    let Some(to) = in_order(&link.parent().unwrap_or(link).join(target)) else {
+        return Vec::new();
+    };
     let to = to.to_string_lossy();
     created_dirs
         .iter()
         .copied()
-        .filter(|d| at_or_below(&to, &d.to_string_lossy()))
+        .filter(|d| in_order(d).is_some_and(|d| at_or_below(&to, &d.to_string_lossy())))
         .collect()
+}
+
+/// `p` resolved in the order the kernel walks it: each existing component is followed through
+/// its links (`canonicalize`), and `..` then leaves where that link led. From the first missing
+/// component on, the rest is joined by text, which is exact there because a missing name is not
+/// a link. `None` when a component cannot be read or a link on the way does not resolve.
+fn in_order(p: &Path) -> Option<PathBuf> {
+    let mut cur = PathBuf::new();
+    let mut missing = false;
+    for c in p.components() {
+        match c {
+            Component::RootDir | Component::Prefix(_) => cur = PathBuf::from("/"),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                cur.pop();
+            }
+            Component::Normal(n) => {
+                let next = cur.join(n);
+                cur = if missing {
+                    next
+                } else {
+                    match fs::symlink_metadata(&next) {
+                        Ok(_) => fs::canonicalize(&next).ok()?,
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                            missing = true;
+                            next
+                        }
+                        Err(_) => return None,
+                    }
+                };
+            }
+        }
+    }
+    Some(cur)
 }
 
 /// Each link item that only the created-directory rule authorizes, with the created directories
@@ -910,6 +948,10 @@ fn hold_dirs(items: &mut Vec<PathItem>, retained: &[(String, String)]) -> Vec<St
 /// `p` with every link on disk resolved: the longest existing ancestor is canonicalized and the
 /// rest is joined after `lexical`. A path that nothing resolves stays as `lexical` gives it.
 fn resolved(p: &Path) -> PathBuf {
+    // The file system resolves `..` after a linked component correctly; text does not.
+    if let Ok(c) = fs::canonicalize(p) {
+        return c;
+    }
     let p = lexical(p);
     let mut base = p.as_path();
     let mut rest = Vec::new();
@@ -1771,6 +1813,32 @@ mod tests {
         ];
         assert_eq!(hold_dirs(&mut items, &[]).len(), 1);
         assert_eq!(items.len(), 1);
+        fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn a_link_target_through_an_alias_is_resolved_by_the_file_system() {
+        let base = std::env::temp_dir().join(format!("dfm-purge-vouch-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        // The created directory, and a look-alike outside it that the alias leads to.
+        fs::create_dir_all(base.join("newdir")).unwrap();
+        fs::write(base.join("newdir/file"), "x").unwrap();
+        fs::create_dir_all(base.join("o/out/sub")).unwrap();
+        fs::create_dir_all(base.join("o/newdir")).unwrap();
+        fs::write(base.join("o/newdir/file"), "y").unwrap();
+        fs::create_dir_all(base.join("bin")).unwrap();
+        std::os::unix::fs::symlink(base.join("o/out"), base.join("alias")).unwrap();
+        let link = base.join("bin/l");
+        let created = base.join("newdir");
+        let dirs = [created.as_path()];
+        // By text this is `newdir/file`; the file system follows `alias` first.
+        assert!(vouching(&link, "../alias/sub/../../newdir/file", &dirs).is_empty());
+        assert_eq!(vouching(&link, "../newdir/file", &dirs), dirs);
+        // A missing name is not a link, so a target not written yet still counts.
+        assert_eq!(vouching(&link, "../newdir/gone", &dirs), dirs);
+        // A dangling link on the way resolves to nothing, so it vouches for nothing.
+        std::os::unix::fs::symlink(base.join("nowhere"), base.join("dangle")).unwrap();
+        assert!(vouching(&link, "../dangle/../newdir/file", &dirs).is_empty());
         fs::remove_dir_all(&base).unwrap();
     }
 
