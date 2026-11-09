@@ -338,12 +338,23 @@ fn script_binary_rows(
         home,
         &spelled_sensitive(loaded, ledger.unwrap_or_default(), sensitive),
     );
+    // A sensitive merge reads fragments from these directories (`dir_claims`); a fragment
+    // there is sensitive although no claim names it, so nothing at or below one is read.
+    let dirs: Vec<String> = loaded
+        .into_iter()
+        .flat_map(|l| l.resolved.resources.values())
+        .filter(|r| r.sensitive)
+        .flat_map(|r| r.dir_claims.iter().map(|d| d.dir.clone()))
+        .collect();
     // Without the ledger the sensitive set may miss a stale output path, so nothing is hashed.
     let hashing = ledger.is_some();
+    let protected = Protected {
+        sensitive,
+        dirs: &dirs,
+        targets: &targets,
+    };
     let row = |who: &str, at: &Path, since, fix| {
-        binary_row(
-            who, at, since, fix, home, path, trials, sensitive, &targets, hashing,
-        )
+        binary_row(who, at, since, fix, home, path, trials, &protected, hashing)
     };
     for t in trials.iter().filter(|t| t.is_active()) {
         let who = format!("script trial {}", t.trial_id);
@@ -430,23 +441,39 @@ fn sensitive_targets(home: &Path, spelled: &[String]) -> Result<Vec<std::fs::Met
     Ok(out)
 }
 
+/// What a binary row must not read: the sensitive output paths (folded), the fragment
+/// directories of sensitive merges (HOME-relative) and the metadata of the sensitive targets.
+struct Protected<'a> {
+    sensitive: &'a BTreeSet<String>,
+    dirs: &'a [String],
+    targets: &'a Result<Vec<std::fs::Metadata>, String>,
+}
+
 /// Whether the binary path or the file it resolves to is a sensitive managed output: by path
-/// (HOME-relative, folded) or by file identity (`dev`, `ino`), so a link or a hard link to a
-/// sensitive file in HOME or in its parents still matches.
-fn is_sensitive(
-    home: &Path,
-    at: &Path,
-    real: &Path,
-    sensitive: &BTreeSet<String>,
-    targets: &[std::fs::Metadata],
-) -> bool {
+/// (HOME-relative, folded), by lying at or below a sensitive fragment directory (as spelled
+/// and resolved through its links), or by file identity (`dev`, `ino`), so a link or a hard
+/// link to a sensitive file in HOME or in its parents still matches.
+fn is_sensitive(home: &Path, at: &Path, real: &Path, p: &Protected) -> bool {
     let real_home = std::fs::canonicalize(home).unwrap_or_else(|_| home.to_path_buf());
-    let hit = |p: &Path, h: &Path| {
-        p.strip_prefix(h)
-            .is_ok_and(|rel| sensitive.contains(&fold(&rel.to_string_lossy())))
+    let hit = |p_: &Path, h: &Path| {
+        p_.strip_prefix(h)
+            .is_ok_and(|rel| p.sensitive.contains(&fold(&rel.to_string_lossy())))
     };
+    let below = |x: &Path, d: &Path| {
+        let (x, d) = (fold(&x.to_string_lossy()), fold(&d.to_string_lossy()));
+        x == d || x.starts_with(&format!("{}/", d.trim_end_matches('/')))
+    };
+    let in_dir = p.dirs.iter().any(|d| {
+        let d = home.join(d);
+        let real_d = std::fs::canonicalize(&d).ok();
+        [at, real]
+            .iter()
+            .any(|x| below(x, &d) || real_d.as_deref().is_some_and(|r| below(x, r)))
+    });
+    let targets = p.targets.as_deref().unwrap_or_default();
     hit(at, home)
         || hit(real, &real_home)
+        || in_dir
         || std::fs::metadata(real).is_ok_and(|m| {
             targets
                 .iter()
@@ -469,10 +496,10 @@ fn binary_row(
     home: &Path,
     path: &OsStr,
     trials: &[TrialRecord],
-    sensitive: &BTreeSet<String>,
-    targets: &Result<Vec<std::fs::Metadata>, String>,
+    protected: &Protected,
     hashing: bool,
 ) -> Row {
+    let targets = protected.targets;
     use crate::trial_cmd::window::{HASH_CAP, hash};
     let mut notes = vec![who.to_string()];
     if !hashing {
@@ -492,15 +519,7 @@ fn binary_row(
             fix = missing_fix;
             notes.push(format!("the binary path cannot be resolved: {}", e.kind()));
         }
-        Ok(real)
-            if is_sensitive(
-                home,
-                at,
-                &real,
-                sensitive,
-                targets.as_deref().unwrap_or_default(),
-            ) =>
-        {
+        Ok(real) if is_sensitive(home, at, &real, protected) => {
             fix = "Point the binary path to the tool's own file, then install the tool again.";
             notes.push(
                 "the binary resolves to a sensitive managed output, which is not read".into(),
@@ -1801,7 +1820,10 @@ fn owned_row(path: &str, who: &str, op: Option<&Operation>, live: Live) -> Row {
 
 #[cfg(test)]
 mod tests {
-    use super::{Listing, executable_name, scan_listing, sensitive_targets, takes_slot};
+    use super::{
+        Listing, Protected, executable_name, is_sensitive, scan_listing, sensitive_targets,
+        takes_slot,
+    };
     use std::os::unix::fs::MetadataExt;
 
     #[test]
@@ -1822,6 +1844,38 @@ mod tests {
         // Any other failure makes the set unknown.
         let err = sensitive_targets(&home, &["Vault/Token/x".into()]).unwrap_err();
         assert!(err.starts_with("Vault/Token/x: "), "{err}");
+        std::fs::remove_dir_all(&home).unwrap();
+    }
+
+    #[test]
+    fn a_binary_in_a_sensitive_fragment_directory_is_sensitive() {
+        let home = std::env::temp_dir().join(format!("dfm-doctor-frag-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(home.join(".claude/settings.d")).unwrap();
+        std::fs::create_dir_all(home.join("bin")).unwrap();
+        let frag = home.join(".claude/settings.d/x.json");
+        std::fs::write(&frag, b"{}").unwrap();
+        std::os::unix::fs::symlink(home.join(".claude"), home.join("alias")).unwrap();
+        let link = home.join("bin/boat");
+        std::os::unix::fs::symlink(home.join("alias/settings.d/x.json"), &link).unwrap();
+        let real = std::fs::canonicalize(&link).unwrap();
+        let none = std::collections::BTreeSet::new();
+        let targets = Ok(Vec::new());
+        let p = |dirs| Protected {
+            sensitive: &none,
+            dirs,
+            targets: &targets,
+        };
+        let dirs = [".claude/settings.d".to_string()];
+        assert!(is_sensitive(&home, &link, &real, &p(&dirs)));
+        assert!(!is_sensitive(&home, &link, &real, &p(&[])));
+        // A sibling directory with the same prefix is not inside.
+        assert!(!is_sensitive(
+            &home,
+            &link,
+            &real,
+            &p(&[".claude/settings".to_string()])
+        ));
         std::fs::remove_dir_all(&home).unwrap();
     }
 
