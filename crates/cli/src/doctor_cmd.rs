@@ -392,7 +392,8 @@ fn binary_row(
                 .ok()
                 .filter(|m| m.is_file())
                 .map(|m| m.len());
-            notes.push(match (len, hash(&real)) {
+            let digest = len.filter(|n| *n <= HASH_CAP).and_then(|_| hash(&real));
+            notes.push(match (len, digest) {
                 (None, _) => {
                     fix = missing_fix;
                     format!(
@@ -469,7 +470,7 @@ fn path_copies(
 ) -> Vec<(std::path::PathBuf, std::path::PathBuf)> {
     let mut seen = BTreeSet::new();
     std::env::split_paths(path)
-        .chain(dfm_platform_macos::provider_path(home))
+        .chain(crate::provider_path(home))
         .filter(|d| d.is_absolute() && seen.insert(d.clone()))
         .map(|d| d.join(tool))
         .filter(|c| {

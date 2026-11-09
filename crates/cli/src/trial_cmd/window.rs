@@ -308,7 +308,7 @@ pub(super) fn shrink_window(record: &mut TrialRecord, budget: usize) -> Result<S
 /// "not on PATH or cannot be hashed". Relative and empty PATH entries are skipped.
 pub(super) fn binary(home: &Path, path_var: &OsStr, tool: &str) -> Option<ScriptBinary> {
     let candidate = std::env::split_paths(path_var)
-        .chain(dfm_platform_macos::provider_path(home))
+        .chain(crate::provider_path(home))
         .filter(|d| d.is_absolute())
         .map(|d| d.join(tool))
         .find(|c| {
