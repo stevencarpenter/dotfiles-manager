@@ -117,5 +117,9 @@ required-features = ["test-isolation"]
 name = "omlx"
 required-features = ["test-isolation"]
 
+[[test]]
+name = "workflows"
+required-features = ["test-isolation"]
+
 [lints]
 workspace = true
