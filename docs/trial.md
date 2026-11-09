@@ -86,7 +86,7 @@ The record is a private file under `state/trials/`. `state check` validates it w
 | --- | --- |
 | `<tool>` | The short name. It must be a valid id (see above). |
 | `--script <url>` | An `https://` URL. It replaces the provider, so `--provider` is a usage error. |
-| `--shell <shell>` | `sh`, `bash` or `zsh`. The interpreter, It runs as `/bin/<shell>`. Default `sh`. Any other value is a usage error. |
+| `--shell <shell>` | `sh`, `bash` or `zsh`. The interpreter. It runs as `/bin/<shell>`. Default `sh`. Any other value is a usage error. |
 | `--arg <value>` | A script argument, passed after the script path. Repeatable, kept in order. |
 | `--env NAME=VALUE` | An added environment variable. Repeatable. The name must match `[A-Za-z_][A-Za-z0-9_]*`, be unique and not be one of the fixed names below. A NUL byte or newline in the value is a usage error. |
 | `--tty` | Gives the script dfm's terminal as standard input, so a prompt on `/dev/tty` works. |
@@ -101,13 +101,13 @@ Without `--tty` the script starts in a new session with standard input from `/de
 3. **Fetch.** A preview (no `--yes-plan`) downloads the script and caches it. With `--yes-plan`, the run uses the cached bytes and never downloads again. A missing cache file, a missing sidecar or a changed file is `E_PLAN_STALE`.
 4. **Preview.** The lines are: `trial:`, `script:` (URL, effective URL, SHA-256, bytes), `script file:`, `run:`, `env:`, the notes below, the `baseline:` and `data:` lines, `watch:`, `cleanup scope:`, `unknown:` and `plan digest:`. `--preview` stops here, exit 0. Without `--yes-plan`, the run stops with `E_APPROVAL_REQUIRED` (exit 3) and the digest to pass.
 5. **Terminal check.** With `--tty`, standard input must be a terminal. This is checked only when the run would start, so a preview works without one. Otherwise it is a usage error.
-6. **Under the lock.** The writer lock is taken. The identity and the ledger are read again, the cached script is read again, and the environment, the profile and the baseline are rebuilt. A digest that differs is `E_PLAN_STALE` (exit 3, nothing written). A trial record of the same id is `E_CONFLICT`.
+6. **Under the lock.** The writer lock is taken. The identity and the ledger are read again, the cached script is read again, and the environment, the profile and the baseline are rebuilt. A digest that differs is `E_PLAN_STALE` (exit 3, nothing written). A trial record of the same id is `E_CONFLICT`. This is checked before the lock and again by the exclusive create in step 8, after the window observation.
 7. **Window before.** The tracked-file snapshot of the guarded checkouts and the window observation are taken. Both come before the record, so the record never claims a window that was not observed.
 8. **The record first.** The record is created (`RENAME_EXCL`) with `script.before` and without `exit`, `window` and `binary`.
 9. **The intent.** A `trial-script` journal intent (adapter `script/v1`, no path) is written.
 10. **The run.** `sandbox-exec -p <profile> /bin/<shell> <cache file> <args>` runs with the environment below and a fixed timeout of one hour (no flag yet). The script leads its own process group.
 11. **The result.** The window is observed again and compared. The tracked-file snapshot is compared. The record is rewritten once with `exit`, `window` and `binary`. The cache files are removed. The journal gets `done` or `failed`.
-12. **The receipt.** The receipt is written before any output line. The output ends with `trial: state/trials/<id>.json`, `receipt: <name>` and `result:`. The `note:` about a missing binary follows the receipt.
+12. **The receipt.** The receipt file is written before any of the closing output lines. The output ends with `trial: state/trials/<id>.json`, the `note:` about a missing binary when it applies, `receipt: <name>` and `result:`.
 
 The preview notes are plain text matches on the script and are not guarantees. `note: the script reads /dev/tty; pass --tty to answer its prompts` appears when the text `/dev/tty` occurs. `note: the script edits shell startup files; ...` appears when `.zshrc`, `.zshenv`, `.bashrc` or `.profile` occurs.
 
@@ -122,7 +122,7 @@ The digest is the SHA-256 of the canonical JSON of: trial id, tool, the script (
 | Directory | `<cache dir>/scripts/`, created with mode 0700 |
 | Size cap | 1 MiB (1 048 576 bytes) |
 
-The cache dir is `~/.cache/dotfiles-manager`. A preview leaves its files in place until a run. A stale `.fetch-<pid>` temporary file is removed before curl runs, because curl follows a link at its `-o` path. A run that rewrote the record removes the script file and the sidecar. The record keeps the script's SHA-256, so a later preview downloads the script again.
+The cache dir is `~/.cache/dotfiles-manager`. A preview leaves its files in place until a run. A stale `.fetch-<pid>` temporary file is removed before curl runs, because curl follows a link at its `-o` path. A run that created the record removes the script file and the sidecar, also when the rewrite failed or the script never started. The record keeps the script's SHA-256, so a later preview downloads the script again.
 
 curl runs through the runner, with `/usr/bin` moved to the front of the search path so that the system's curl runs even when a provider directory comes first. Its arguments are `-q` first, then `--proto =https --proto-redir =https --tlsv1.2 -fsSL --max-filesize 1048576 -o <temporary file> -w %{url_effective} -- <url>`, with a 120 second timeout. `-q` stops `~/.curlrc` from weakening the TLS options.
 
@@ -158,8 +158,8 @@ The profile is SBPL text with one rule per line. A later rule wins over an earli
 1. `(version 1)` and `(allow default)`.
 2. Deny `file-write*` on the subpath `/`.
 3. Allow `file-write*` on the subpaths of HOME, the canonical `TMPDIR`, `/private/tmp` and `/dev`.
-4. Deny `file-write*` on each denied tree as a subpath: the guarded checkouts of the bound root (`guarded_checkouts`, `crates/cli/src/sync_cmd.rs`), the state root, the configuration directory, the data directory, the cache directory, and the directory that holds dfm's own executable.
-5. Deny `file-write*` on each denied path as a literal, in both forms. The denied paths are every ledger target, the lock file and dfm's own executable path. The no-follow form names the link itself, so the script cannot rename, remove or replace it. The resolved form stops a write through the link. Each link on the way to a denied tree or path is also a literal, and so is each ancestor of a denied tree or path that is strictly below HOME. A rename or `chmod` of `~/.config` is denied. A new entry inside `~/.config` is allowed.
+4. Deny `file-write*` on each denied tree as a subpath: the guarded checkouts of the bound root (`guarded_checkouts`, `crates/cli/src/sync_cmd.rs`), the state root, the configuration directory, the data directory, the cache directory, and the real directory of dfm's executable (the parent of the resolved path).
+5. Deny `file-write*` on each denied path as a literal, in both forms. The denied paths are every ledger target, the lock file and dfm's own executable path. The no-follow form names the link itself, so the script cannot rename, remove or replace it. The resolved form stops a write through the link. Each link strictly below HOME on the way to a denied tree or path is also a literal, and so is each ancestor of a denied tree or path that is strictly below HOME. A rename or `chmod` of `~/.config` is denied. A new entry inside `~/.config` is allowed.
 6. Deny `process-exec` of `/usr/bin/sudo`, `/usr/bin/su` and `/usr/bin/osascript`.
 
 A path that holds `"`, `\` or a control character cannot be written into the profile. The run is `E_TARGET_INVALID`. A non-UTF-8 path is refused the same way.
@@ -188,7 +188,7 @@ The first record of a path wins, so a file that a listing also names keeps its d
 
 An entry with a control character in its name is recorded with kind `other` and a visible spelling of the name. Over a cap before the script starts, the run refuses before the record is written. Over a cap after the script, the record is written without `window` and the run exits 1.
 
-`script.binary` is the first executable named `<tool>` in dfm's `PATH` and then in the provider directories: `path` as found, `real_path` through links, and the SHA-256 of the real file. It is absent when no executable is found or the real file cannot be hashed (over 16 MiB or unreadable). The output then ends with `note: the tool <tool> is not on PATH or cannot be hashed`.
+`script.binary` is the first executable named `<tool>` in dfm's `PATH` and then in the provider directories: `path` as found, `real_path` through links, and the SHA-256 of the real file. It is absent when no executable is found or the real file cannot be hashed (over 16 MiB or unreadable). The output then has `note: the tool <tool> is not on PATH or cannot be hashed` after the `trial:` line, before `receipt:` and `result:`.
 
 ### Record fields
 
@@ -206,16 +206,16 @@ An entry with a control character in its name is recorded with kind `other` and 
 
 `unknown` holds the three package tokens and `script-downloads`, `later-self-updates`, `keychain` and `remote-effects`. `package` is absent and `tool_preexisting` is false. `baseline.paths` and `baseline.data` are observed as for a package trial.
 
-A crash, a SIGKILL or a sleep that ends the run leaves a record with `before` and no `window`. `state check` reports the open `trial-script` intent as `E_OP_INTERRUPTED`.
+A crash, a SIGKILL or a system sleep that kills the run leaves a record with `before` and no `window`. When the intent was written, `state check` reports the open `trial-script` intent as `E_OP_INTERRUPTED`. A crash between the record create and the intent leaves the record and no intent, so `state check` reports nothing for it.
 
 ### Result and exits
 
 | Exit | When |
 | --- | --- |
 | 0 | The script exited 0, the window was recorded and no tracked file changed. |
-| 1 | After the record was written: the script exited nonzero, timed out or was ended by a signal; a tracked file changed (`E_CONFLICT`); the window could not be recorded; or an outcome entry could not be written. The record stays. |
+| 1 | After the record was written: the script exited nonzero, timed out or was ended by a signal; a tracked file changed (`E_CONFLICT`); the window could not be recorded; the record rewrite, the cache removal or the tracked-file check failed; or an outcome entry could not be written. The record stays. An `E_IO_FAILED` from the fetch or cache code before any state write also exits 1. |
 | 2 | Usage. |
-| 3 | Blocked before any write: no approval, stale digest or cache, a pre-existing tool, no usable sandbox, a failed fetch, an existing trial, lock held, not bound. |
+| 3 | Blocked before any write: no approval, stale digest or cache, a pre-existing tool, no usable sandbox, a failed fetch, a path the profile cannot hold (`E_TARGET_INVALID`), a failed `id` or `getconf` probe, a window cap reached before the run, an existing trial, lock held, not bound. |
 | 130, 143 | A stop request. The script's process group gets SIGTERM and SIGCONT, then SIGKILL after the grace period or once the leader is reaped. A descendant can get less than the full grace period once the leader is reaped. The record, the window and the receipt are still written. |
 
 When several problems occur in one run, the result carries the highest-ranked code and names every problem. The order is a stop request, then `E_CONFLICT` (a tracked file changed), then the rest. After the script, dfm compares the `tracked_status` snapshot of the guarded checkouts. A change is left in place, not reverted, staged or committed (docs/upgrade.md, "Tracked files"). The sandbox should make such a change impossible, so this is a second check.
@@ -228,8 +228,9 @@ The journal operation is `trial-script`. `doctor` shows an active script trial a
 - curl, `id` and `getconf` run with `/usr/bin` first on the search path.
 - The digest adds `profile_sha256`, so a ledger change between the preview and the run is `E_PLAN_STALE`.
 - The sandbox check runs before the fetch. A system without a working sandbox caches nothing.
-- Each denied path is denied as the link itself and as its resolved form, with every link on the way.
+- Each denied path is denied as the link itself and as its resolved form, with every link strictly below HOME on the way.
 - `SHELL` does not come from the account's login shell. It is dfm's `SHELL` when absolute, else `/bin/sh`.
+- The timeout is a fixed hour with no flag.
 
 ### Tests
 
@@ -239,7 +240,7 @@ The journal operation is `trial-script`. `doctor` shows an active script trial a
 
 - **The sandbox is write containment, not isolation.** Reads, the network and process starts other than the three denied programs are open. A launchd job, a Keychain entry and a remote effect are `unknown`.
 - **`sandbox-exec` is deprecated by Apple.** It works on the macOS this was built on (Darwin 27.2.0). There is no fallback without it.
-- **Writes outside HOME are denied** except in the temporary directories. A script that must write elsewhere fails inside the script.
+- **Writes outside HOME are denied** except in the temporary directories and `/dev`. A script that must write elsewhere fails inside the script.
 - **The window is shallow.** Top-level listings show a new or removed child, not a change inside it.
 - **The script downloads more.** What it fetches after it starts is not pinned (`script-downloads`).
 - **Fixed timeout.** One hour, with no flag.
