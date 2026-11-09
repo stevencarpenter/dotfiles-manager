@@ -168,7 +168,8 @@ impl ScriptCx {
         }
     }
 
-    /// The engine's context under the writer lock: its pre-install probe fetches.
+    /// The engine's context. It is also built before the lock (for the pre-lock gates), but only
+    /// its probe before an install, which the engine runs under the writer lock, fetches.
     pub(crate) fn for_install(ctx: &Ctx, sys: &Sys, root: &Path) -> ScriptCx {
         ScriptCx {
             staged: Some(Mutex::new(BTreeMap::new())),

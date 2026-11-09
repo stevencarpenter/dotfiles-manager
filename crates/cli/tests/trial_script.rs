@@ -1840,8 +1840,15 @@ fn a_redirect_to_another_url_blocks_and_a_prompt_fails_the_install() {
     // The fetch under the lock ends elsewhere: the row is blocked and names both URLs.
     let o = fx.packages(&["--yes-plan", &digest_of(&o)]);
     let t = format!("{}{}", text(&o.stdout), stderr(&o));
-    assert_ne!(code(&o), 0, "{t}");
+    assert_eq!(code(&o), 3, "{t}");
     assert!(t.contains("blocked extra.boat@package"), "{t}");
+    // Blocked before the intent: the journal never shows the install as started.
+    let intents: Vec<serde_json::Value> = fx
+        .journal()
+        .into_iter()
+        .filter(|e| e["resource"] == "extra.boat" && e["phase"] == "intent")
+        .collect();
+    assert!(intents.is_empty(), "{intents:?}");
     assert!(
         t.contains(&format!(
             "the script {URL} now ends at https://mirror.invalid/install, not at the declared effective URL {URL}"
@@ -1865,6 +1872,14 @@ fn a_redirect_to_another_url_blocks_and_a_prompt_fails_the_install() {
     assert!(!fx.h(".local/bin/boat").exists());
     assert_eq!(fx.curls(), 1, "{}", fx.log());
     assert_eq!(fx.cache_entries(), Vec::<String>::new());
+    // This install started, so its intent is journaled under the same resource id.
+    assert!(
+        fx.journal()
+            .iter()
+            .any(|e| e["resource"] == "extra.boat" && e["phase"] == "intent"),
+        "{:?}",
+        fx.journal()
+    );
 }
 
 #[test]
