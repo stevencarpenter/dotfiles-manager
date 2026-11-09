@@ -206,6 +206,7 @@ impl Fx {
         let mut cmd = Command::new(BIN);
         cmd.env_clear()
             .env("DFM_PROVIDER_PATH", self.bin())
+            .env("DFM_LOGIN_SHELL", "/opt/test/login-shell")
             .env("USER", "leak-check")
             .env("TMPDIR", self.tmpdir())
             .env("SECRET_TOKEN", "do-not-pass")
@@ -344,6 +345,10 @@ fn preview_fetches_once_caches_the_script_and_prints_the_path_and_hints() {
     assert!(env.contains(&("HOME", home.as_str())), "{env_line}");
     assert!(env.contains(&("TMPDIR", tmp.as_str())), "{env_line}");
     assert!(env.contains(&("FOO", "bar")), "{env_line}");
+    assert!(
+        env.contains(&("SHELL", "/opt/test/login-shell")),
+        "{env_line}"
+    );
     for (n, _) in &env {
         assert!(
             FIXED_ENV.contains(n) || *n == "FOO",

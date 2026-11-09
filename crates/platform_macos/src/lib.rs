@@ -154,6 +154,26 @@ impl Platform {
     }
 }
 
+/// The login shell of `user` from the directory service (`UserShell`), or `None` when the
+/// record is unreadable or the value is not an absolute path without whitespace or control
+/// characters.
+pub fn login_shell(user: &str) -> Option<String> {
+    let record = run(&[
+        "/usr/bin/dscl",
+        ".",
+        "-read",
+        &format!("/Users/{user}"),
+        "UserShell",
+    ])?;
+    parse_user_shell(&record)
+}
+
+fn parse_user_shell(record: &str) -> Option<String> {
+    let shell = record.strip_prefix("UserShell:")?.trim();
+    (shell.starts_with('/') && !shell.chars().any(|c| c.is_whitespace() || c.is_control()))
+        .then(|| shell.to_string())
+}
+
 fn run(argv: &[&str]) -> Option<String> {
     let out = Command::new(argv[0])
         .args(&argv[1..])
@@ -190,6 +210,24 @@ mod tests {
         assert_eq!(p.first(), Some(&PathBuf::from("/opt/homebrew/bin")));
         assert_eq!(p.last(), Some(&PathBuf::from("/Users/a/.local/bin")));
         assert_eq!(p.len(), PROVIDER_PATH.len() + 1);
+    }
+
+    #[test]
+    fn the_user_shell_is_an_absolute_path_without_whitespace() {
+        assert_eq!(
+            parse_user_shell("UserShell: /bin/zsh").as_deref(),
+            Some("/bin/zsh")
+        );
+        for bad in [
+            "",
+            "UserShell:",
+            "UserShell: zsh",
+            "UserShell: /bin/z sh",
+            "UserShell: /bin/z\x01sh",
+            "NFSHomeDirectory: /Users/a",
+        ] {
+            assert_eq!(parse_user_shell(bad), None, "{bad:?}");
+        }
     }
 
     #[test]

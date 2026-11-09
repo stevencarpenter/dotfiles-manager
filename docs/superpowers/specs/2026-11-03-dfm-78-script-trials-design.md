@@ -208,5 +208,4 @@ DFM-81 (slice 1) built the command. The code differs from the design in these pl
 - The digest adds `profile_sha256`, the SHA-256 of the sandbox profile text, so a ledger change between the preview and the run is `E_PLAN_STALE`.
 - The sandbox check (`sandbox-exec` resolved, and a dry run of the profile with `/usr/bin/true`) runs before the fetch. Nothing is cached or written when it refuses.
 - Each denied path is denied as a literal in both its no-follow form (the link itself) and its resolved form. Every link strictly below HOME on the way, and every ancestor strictly below HOME, is denied as a literal too.
-- `SHELL` is dfm's `SHELL` when absolute, else `/bin/sh`. The account's login shell is not read.
 - The timeout is a fixed hour with no flag.

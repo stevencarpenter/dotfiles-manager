@@ -143,7 +143,7 @@ The script does not get dfm's environment. It gets exactly these variables, sort
 | `USER` | `USER` from dfm's environment, else `LOGNAME`, else the output of `id -un`. |
 | `LOGNAME` | `LOGNAME` from dfm's environment, else the `USER` value. |
 | `TMPDIR` | dfm's `TMPDIR` when it is absolute, else `getconf DARWIN_USER_TEMP_DIR`. Canonicalized, because the sandbox matches real paths. |
-| `SHELL` | dfm's `SHELL` when it is absolute, else `/bin/sh`. The login shell is not read from the directory service. |
+| `SHELL` | The account's login shell (`UserShell` from the directory service) when it is an absolute path without whitespace. Else dfm's `SHELL` when absolute, else `/bin/sh`. |
 | `PATH` | The runner's fixed path. |
 | `LANG`, `LC_ALL`, `ZDOTDIR`, `XDG_CONFIG_HOME`, `XDG_DATA_HOME`, `XDG_STATE_HOME`, `XDG_CACHE_HOME`, `XDG_BIN_HOME` | Copied from dfm's environment when set and not empty. |
 | `TERM` | Copied with `--tty` only. |
@@ -235,7 +235,6 @@ The journal operation is `trial-script`. `doctor` shows an active script trial a
 - The digest adds `profile_sha256`, so a ledger change between the preview and the run is `E_PLAN_STALE`.
 - The sandbox check runs before the fetch. A system without a working sandbox caches nothing.
 - Each denied path is denied as the link itself and as its resolved form, with every link strictly below HOME on the way.
-- `SHELL` does not come from the account's login shell. It is dfm's `SHELL` when absolute, else `/bin/sh`.
 - The timeout is a fixed hour with no flag.
 
 ### Tests
