@@ -334,10 +334,6 @@ fn script_binary_rows(
     ledger: Option<&[Owned]>,
     rows: &mut Vec<Row>,
 ) {
-    let targets = sensitive_targets(
-        home,
-        &spelled_sensitive(loaded, ledger.unwrap_or_default(), sensitive),
-    );
     // A sensitive merge reads fragments from these directories (`dir_claims`); a fragment
     // there is sensitive although no claim names it, so nothing at or below one is read.
     let dirs: Vec<String> = loaded
@@ -346,6 +342,11 @@ fn script_binary_rows(
         .filter(|r| r.sensitive)
         .flat_map(|r| r.dir_claims.iter().map(|d| d.dir.clone()))
         .collect();
+    // Each directory's metadata joins the targets, so a hard link to a fragment there (more
+    // than one link, on the directory's device) is not hashed either.
+    let mut spelled = spelled_sensitive(loaded, ledger.unwrap_or_default(), sensitive);
+    spelled.extend(dirs.iter().cloned());
+    let targets = sensitive_targets(home, &spelled);
     // Without the ledger the sensitive set may miss a stale output path, and without the
     // resolved profile the fragment directories are unknown, so nothing is hashed.
     let unhashed = if ledger.is_none() {
@@ -1832,8 +1833,8 @@ fn owned_row(path: &str, who: &str, op: Option<&Operation>, live: Live) -> Row {
 #[cfg(test)]
 mod tests {
     use super::{
-        Listing, Protected, executable_name, is_sensitive, scan_listing, sensitive_targets,
-        takes_slot,
+        Listing, Protected, binary_row, executable_name, is_sensitive, scan_listing,
+        sensitive_targets, takes_slot,
     };
     use std::os::unix::fs::MetadataExt;
 
@@ -1887,6 +1888,38 @@ mod tests {
             &real,
             &p(&[".claude/settings".to_string()])
         ));
+        std::fs::remove_dir_all(&home).unwrap();
+    }
+
+    #[test]
+    fn a_hard_link_to_a_fragment_outside_its_directory_is_not_hashed() {
+        let home = std::env::temp_dir().join(format!("dfm-doctor-hl-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(home.join(".claude/settings.d")).unwrap();
+        std::fs::create_dir_all(home.join("bin")).unwrap();
+        let frag = home.join(".claude/settings.d/x.json");
+        std::fs::write(&frag, b"#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&frag, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
+        let bin = home.join("bin/boat");
+        std::fs::hard_link(&frag, &bin).unwrap();
+        let none = std::collections::BTreeSet::new();
+        let dirs = [".claude/settings.d".to_string()];
+        let row = |dirs: &[String]| {
+            let targets = sensitive_targets(&home, dirs);
+            let p = Protected {
+                sensitive: &none,
+                dirs,
+                targets: &targets,
+            };
+            let path = home.join("bin").into_os_string();
+            binary_row("t", &bin, None, "", &home, &path, &[], &p, None).detail
+        };
+        let protected = row(&dirs);
+        assert!(!protected.contains("sha256"), "{protected}");
+        assert!(protected.contains("more than one hard link"), "{protected}");
+        // Without the directory the same file is hashed: the check is what keeps it out.
+        assert!(row(&[]).contains("sha256"));
         std::fs::remove_dir_all(&home).unwrap();
     }
 
