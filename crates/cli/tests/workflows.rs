@@ -7,7 +7,7 @@ mod common;
 
 use common::providers::{FAKE_BREW, FAKE_GITLEAKS, FAKE_MISE, FAKE_OP, native_tool};
 use common::remote::{Remote, git, lock_for, put};
-use common::{TempDir, code, text};
+use common::{TempDir, code, fingerprint, is_root, skip, text};
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -221,6 +221,13 @@ impl World {
         w
     }
 
+    /// [`World::granted`] after a first plain sync.
+    fn synced() -> World {
+        let w = World::granted();
+        ok(&w.sync(&[]));
+        w
+    }
+
     fn trust(&self, origin: &str) {
         let o = self.sync(&["--trust-origin", origin]);
         assert!(
@@ -297,6 +304,38 @@ impl World {
     /// What the provider look-alikes logged.
     fn log(&self) -> String {
         fs::read_to_string(self.fake.path().join("log")).unwrap_or_default()
+    }
+
+    fn st_log(&self) -> String {
+        fs::read_to_string(self.fake.path().join("st/log")).unwrap_or_default()
+    }
+
+    /// Fingerprints of the HOME, the checkout (with its nested source), both bare remotes and
+    /// the native tools' state.
+    fn fingerprints(&self) -> [String; 5] {
+        [
+            fingerprint(self.home.path()),
+            fingerprint(&self.root),
+            fingerprint(&self.public.bare),
+            fingerprint(&self.private.bare),
+            fingerprint(&self.fake.path().join("st")),
+        ]
+    }
+
+    fn receipts(&self) -> usize {
+        fs::read_dir(self.state().join("receipts")).map_or(0, Iterator::count)
+    }
+
+    fn journal(&self) -> String {
+        fs::read_to_string(self.state().join("journal.jsonl")).unwrap_or_default()
+    }
+
+    /// The rows of `doctor --root <checkout> --json`, and its exit code.
+    fn doctor_rows(&self, env: &[(&str, &str)]) -> (i32, Vec<serde_json::Value>) {
+        let o = self.run_env(env, &["doctor", "--root", self.root_arg(), "--json"]);
+        let v: serde_json::Value = serde_json::from_slice(&o.stdout)
+            .unwrap_or_else(|e| panic!("{e}\n{}\n{}", out(&o), err(&o)));
+        (code(&o), v["rows"].as_array().unwrap().clone())
     }
 
     fn ext_head(&self) -> String {
@@ -463,4 +502,177 @@ fn the_four_workflows_run_together_in_one_isolated_home() {
         .output()
         .unwrap();
     assert_eq!(code(&o), 1, "{}", err(&o));
+}
+
+/// The programs a read-only command must never start: network clients and installers.
+const TRAPPED: [&str; 7] = ["git", "curl", "ssh", "npm", "uv", "rustup", "npx"];
+
+#[test]
+fn plan_explain_and_doctor_start_no_network_program_and_change_nothing() {
+    let w = World::synced();
+    // An upstream commit waits: a read-only command must not fetch it.
+    put(
+        &w.public.seed,
+        "base/modules/extra/files/zshrc",
+        "export A=3\n",
+    );
+    w.public.push("upstream change");
+    let trap = w.fake.path().join("trap");
+    let trap_log = w.fake.path().join("trap.log");
+    for t in TRAPPED {
+        exe(
+            &trap.join(t),
+            &format!(
+                "#!/bin/sh\nprintf '{t} %s\\n' \"$*\" >> '{}'\nexit 1\n",
+                trap_log.display()
+            ),
+        );
+    }
+    let path = format!("{}:{}", trap.display(), w.bin().display());
+    let ssh = trap.join("ssh").display().to_string();
+    let proxy = "http://127.0.0.1:9";
+    let env = [
+        ("DFM_PROVIDER_PATH", path.as_str()),
+        ("HTTP_PROXY", proxy),
+        ("HTTPS_PROXY", proxy),
+        ("ALL_PROXY", proxy),
+        ("GIT_SSH_COMMAND", ssh.as_str()),
+    ];
+    let head = git(&w.root, &["rev-parse", "HEAD"]);
+    let lock = fs::read(w.root.join("dotfiles-manager.lock")).unwrap();
+    let before = w.fingerprints();
+    let r = w.root_arg();
+    for args in [
+        &["plan", "--root", r][..],
+        &["plan", "--root", r, "--json"],
+        &["explain", "extra.zsh", "--root", r],
+        &["explain", "work.profile", "--root", r],
+        &["doctor", "--root", r],
+        &["doctor", "--root", r, "--json"],
+        &["status", "--root", r, "--json"],
+    ] {
+        let (log, st_log) = (w.log(), w.st_log());
+        let o = w.run_env(&env, args);
+        assert_eq!(code(&o), 0, "{args:?}\n{}\n{}", out(&o), err(&o));
+        assert!(!trap_log.exists(), "{args:?} started a trapped program");
+        assert_eq!(w.fingerprints(), before, "{args:?} changed something");
+        let new = &w.log()[log.len()..];
+        assert_eq!(
+            &w.st_log()[st_log.len()..],
+            "",
+            "{args:?} ran a native tool"
+        );
+        // A look-alike logs `<command> | <the provider variables it saw>`. Plan and explain
+        // start no provider; doctor and status (one report) only list brew's prefixes.
+        let ran: Vec<&str> = new
+            .lines()
+            .map(|l| l.split(" | ").next().unwrap())
+            .collect();
+        let allowed: &[&str] = if matches!(args[0], "doctor" | "status") {
+            &["brew --cellar", "brew --caskroom"]
+        } else {
+            &[]
+        };
+        assert!(
+            ran.iter().all(|c| allowed.contains(c)),
+            "{args:?} ran {ran:?}"
+        );
+    }
+    assert_eq!(git(&w.root, &["rev-parse", "HEAD"]), head);
+    assert_eq!(
+        fs::read(w.root.join("dotfiles-manager.lock")).unwrap(),
+        lock
+    );
+    // The trap is armed: a sync, which does fetch, reaches the trapped git.
+    let o = w.run_env(&env, &["sync", "--root", r]);
+    assert!(trap_log.exists(), "{}\n{}", out(&o), err(&o));
+}
+
+#[test]
+fn an_unknown_required_observation_blocks_plan_and_sync_and_fails_doctor() {
+    if is_root() {
+        skip("root reads a mode 000 directory");
+        return;
+    }
+    let w = World::synced();
+    let dir = w.h(".config/work");
+    let mode = fs::metadata(&dir).unwrap().permissions().mode();
+    let lock = |m: u32| fs::set_permissions(&dir, fs::Permissions::from_mode(m)).unwrap();
+    let before = fingerprint(w.home.path());
+    lock(0o000);
+    let o = w.run(&["plan", "--root", w.root_arg()]);
+    assert_eq!(code(&o), 3, "{}\n{}", out(&o), err(&o));
+    assert!(err(&o).contains("E_OBSERVATION_UNKNOWN"), "{}", err(&o));
+    assert!(err(&o).contains("work.profile"), "{}", err(&o));
+    let (c, rows) = w.doctor_rows(&[]);
+    assert_eq!(c, 1, "{rows:#?}");
+    assert!(
+        rows.iter()
+            .any(|r| r["status"] == "UNKNOWN" && r["required"] == true),
+        "{rows:#?}"
+    );
+    lock(mode);
+    assert_eq!(fingerprint(w.home.path()), before, "plan or doctor wrote");
+    lock(0o000);
+    let (receipts, journal) = (w.receipts(), w.journal());
+    let o = w.sync(&[]);
+    lock(mode);
+    assert_eq!(code(&o), 3, "{}\n{}", out(&o), err(&o));
+    assert!(err(&o).contains("E_OBSERVATION_UNKNOWN"), "{}", err(&o));
+    assert_eq!(w.receipts(), receipts);
+    assert_eq!(w.journal(), journal);
+}
+
+#[test]
+fn a_public_bundle_cannot_reach_a_module_outside_its_directory() {
+    let w = World::new();
+    // The private module sits beside the public tree, outside the bundle's directory.
+    put(&w.root, "private/modules/work/module.toml", WORK);
+    put(&w.root, "private/modules/work/files/profile", "work=1\n");
+    put(
+        &w.root,
+        "base/bundle.toml",
+        &BUNDLE_WITH_EXT.replace(
+            "ext/modules/work/module.toml",
+            "../private/modules/work/module.toml",
+        ),
+    );
+    let before = fingerprint(w.home.path());
+    for args in [
+        &["plan", "--root", w.root_arg()][..],
+        &["explain", "work.profile", "--root", w.root_arg()],
+    ] {
+        let o = w.run(args);
+        assert_eq!(code(&o), 3, "{args:?}\n{}\n{}", out(&o), err(&o));
+        assert!(err(&o).contains("E_SOURCE_ESCAPE"), "{}", err(&o));
+    }
+    let (c, rows) = w.doctor_rows(&[]);
+    assert_eq!(c, 1, "{rows:#?}");
+    assert!(
+        rows.iter()
+            .any(|r| r["status"] == "ERROR" && r["code"] == "E_SOURCE_ESCAPE"),
+        "{rows:#?}"
+    );
+    assert_eq!(fingerprint(w.home.path()), before);
+}
+
+#[test]
+fn a_public_profile_resolves_with_the_private_source_absent() {
+    let w = World::new();
+    assert!(!w.root.join("base/ext").exists());
+    let profile = fs::read_to_string(w.root.join("profiles/t-01.toml")).unwrap();
+    let before = fingerprint(w.home.path());
+    put(
+        &w.root,
+        "profiles/t-01.toml",
+        &profile.replace("[\"extra\", \"work\"]", "[\"extra\"]"),
+    );
+    let o = w.run(&["plan", "--root", w.root_arg()]);
+    ok(&o);
+    assert!(!out(&o).contains("work."), "{}", out(&o));
+    put(&w.root, "profiles/t-01.toml", &profile);
+    let o = w.run(&["plan", "--root", w.root_arg()]);
+    assert_eq!(code(&o), 3, "{}\n{}", out(&o), err(&o));
+    assert!(err(&o).contains("E_SOURCE_MISSING"), "{}", err(&o));
+    assert_eq!(fingerprint(w.home.path()), before);
 }
