@@ -752,11 +752,24 @@ fn a_ledger_change_before_the_lock_makes_the_sandbox_profile_stale() {
     fs::write(&gate, "").unwrap();
     let o = parked.wait_with_output().unwrap();
     assert_eq!(code(&o), 3, "{}\n{}", stderr(&o), text(&o.stdout));
-    assert!(
-        stderr(&o).contains("E_PLAN_STALE the sandbox profile changed since the preview"),
-        "{}",
-        stderr(&o)
-    );
+    assert!(stderr(&o).contains("E_PLAN_STALE"), "{}", stderr(&o));
+    assert!(!fx.state().join("trials/trial-boat.json").exists());
+}
+
+#[test]
+fn a_ledger_change_between_the_preview_and_the_run_makes_the_digest_stale() {
+    if no_sandbox() {
+        return;
+    }
+    let fx = Fx::new();
+    fx.script("#!/bin/sh\nexit 0\n");
+    let o = fx.trial_script("boat", &["--preview"]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    // The four new ledger targets change only the sandbox profile, which the digest covers.
+    fx.apply();
+    let o = fx.trial_script("boat", &["--yes-plan", &digest_of(&o)]);
+    assert_eq!(code(&o), 3, "{}\n{}", stderr(&o), text(&o.stdout));
+    assert!(stderr(&o).contains("E_PLAN_STALE"), "{}", stderr(&o));
     assert!(!fx.state().join("trials/trial-boat.json").exists());
 }
 

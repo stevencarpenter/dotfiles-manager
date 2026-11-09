@@ -576,6 +576,9 @@ struct Decision {
     skipped: Vec<String>,
     binary: Binary,
     stamp: Stamp,
+    /// SHA-256 of the sandbox profile text. The profile follows from the ledger, the layout and
+    /// TMPDIR; a ledger change between the preview and the run makes the digest stale.
+    profile_sha256: String,
 }
 
 impl Decision {
@@ -603,6 +606,7 @@ impl Decision {
             "data": view(&self.data),
             "data_skipped": self.skipped,
             "unknown": UNKNOWN,
+            "profile_sha256": self.profile_sha256,
             "binary": {"version": self.binary.version, "sha256": self.binary.sha256},
             "binding": {
                 "profile": self.stamp.profile,
@@ -877,8 +881,7 @@ pub(super) fn run(
     let dfm_env: Vec<(String, String)> = std::env::vars_os()
         .filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?)))
         .collect();
-    // The decision and the sandbox profile for it; the profile is not in the digest, because
-    // it follows from the ledger and the layout, which the lock and the identity check cover.
+    // The decision and the sandbox profile for it; the digest covers the profile's hash.
     let decide = |fetched: Fetched, ledger: &Ledger| -> Result<(Decision, String), Refusal> {
         let env = script_env(&runner, &dfm_env, s.tty, &s.env)?;
         let temp = env
@@ -908,11 +911,12 @@ pub(super) fn run(
             skipped,
             binary: binary.clone(),
             stamp: stamp.clone(),
+            profile_sha256: sha256_hex(profile.as_bytes()),
         };
         Ok((decision, profile))
     };
-    let (first, previewed_profile) = decide(fetched, &readable.read_ledger_lenient()?)?;
-    let sandbox = sandbox_exec(&runner, &previewed_profile)?;
+    let (first, profile_text) = decide(fetched, &readable.read_ledger_lenient()?)?;
+    let sandbox = sandbox_exec(&runner, &profile_text)?;
     stop()?;
     let digest = first.digest()?;
     if let Some(i) = &ctx.isolated {
@@ -965,14 +969,6 @@ pub(super) fn run(
         let locked_digest = locked.digest()?;
         if locked_digest != digest {
             return Err(stale(approved, &locked_digest));
-        }
-        // The profile is not in the digest, so a ledger target or a reserved path that changed
-        // since the preview is caught here: the run uses only the sandbox the preview checked.
-        if profile != previewed_profile {
-            return Err(Refusal::new(
-                Code::PlanStale,
-                "the sandbox profile changed since the preview (the ledger or the reserved paths changed); run the preview again",
-            ));
         }
         Ok((locked, profile))
     })();
@@ -1261,8 +1257,8 @@ mod tests {
     }
 
     #[test]
-    fn the_digest_covers_the_script_bytes_the_environment_and_tty() {
-        let d = |sha: &str, env: &[(&str, &str)], tty: bool| {
+    fn the_digest_covers_the_script_bytes_the_environment_tty_and_the_profile() {
+        let d = |sha: &str, env: &[(&str, &str)], tty: bool, profile: &str| {
             Decision {
                 trial_id: "trial-boat".into(),
                 tool: "boat".into(),
@@ -1290,15 +1286,18 @@ mod tests {
                     machine_id: "m".into(),
                     binding_digest: "d".into(),
                 },
+                profile_sha256: profile.into(),
             }
             .digest()
             .unwrap()
         };
-        let base = d("s1", &[("HOME", "/h")], false);
-        assert_eq!(base, d("s1", &[("HOME", "/h")], false));
-        assert_ne!(base, d("s2", &[("HOME", "/h")], false));
-        assert_ne!(base, d("s1", &[("HOME", "/g")], false));
-        assert_ne!(base, d("s1", &[("HOME", "/h")], true));
+        let home = [("HOME", "/h")];
+        let base = d("s1", &home, false, "p1");
+        assert_eq!(base, d("s1", &home, false, "p1"));
+        assert_ne!(base, d("s2", &home, false, "p1"));
+        assert_ne!(base, d("s1", &[("HOME", "/g")], false, "p1"));
+        assert_ne!(base, d("s1", &home, true, "p1"));
+        assert_ne!(base, d("s1", &home, false, "p2"));
     }
 
     #[test]
