@@ -146,6 +146,7 @@ fn inspect(ctx: &Ctx, command: &'static str, root: Option<&Path>) -> Result<Repo
         &scripts,
         loaded.as_ref(),
         &sensitive,
+        owned.as_deref().unwrap_or_default(),
         &mut rows,
     );
     output_rows(
@@ -330,10 +331,12 @@ fn script_binary_rows(
     trials: &[TrialRecord],
     loaded: Option<&Loaded>,
     sensitive: &BTreeSet<String>,
+    ledger: &[Owned],
     rows: &mut Vec<Row>,
 ) {
+    let targets = sensitive_targets(home, &spelled_sensitive(loaded, ledger, sensitive));
     let row = |who: &str, at: &Path, since, fix| {
-        binary_row(who, at, since, fix, home, path, trials, sensitive)
+        binary_row(who, at, since, fix, home, path, trials, sensitive, &targets)
     };
     for t in trials.iter().filter(|t| t.is_active()) {
         let who = format!("script trial {}", t.trial_id);
@@ -355,7 +358,7 @@ fn script_binary_rows(
                 Level::Warn,
                 &format!("trials/{}.json", t.trial_id),
                 &format!(
-                    "{who}: no binary was recorded: {} was not on PATH when the run ended",
+                    "{who}: no binary was recorded and PATH finds no executable named {} now",
                     t.tool
                 ),
                 fix,
@@ -384,13 +387,40 @@ fn script_binary_rows(
     }
 }
 
-/// The metadata of each sensitive path's resolved target (HOME-relative, folded). Only
-/// metadata is read, never the content.
-fn sensitive_targets(home: &Path, sensitive: &BTreeSet<String>) -> Vec<std::fs::Metadata> {
-    sensitive
+/// The sensitive paths in the spelling the ledger and the claims use. `sensitive` holds folded
+/// forms, which name no file on a case-sensitive file system.
+fn spelled_sensitive(
+    loaded: Option<&Loaded>,
+    ledger: &[Owned],
+    sensitive: &BTreeSet<String>,
+) -> Vec<String> {
+    let claims = loaded
+        .into_iter()
+        .flat_map(|l| l.resolved.resources.values())
+        .flat_map(|r| r.claims.iter().map(String::as_str));
+    let spelled: BTreeSet<&str> = ledger
         .iter()
-        .filter_map(|s| std::fs::metadata(home.join(s)).ok())
-        .collect()
+        .map(|o| o.path.as_str())
+        .chain(claims)
+        .filter(|p| sensitive.contains(&fold(p)))
+        .collect();
+    spelled.into_iter().map(String::from).collect()
+}
+
+/// The metadata of each sensitive path's resolved target (HOME-relative, original spelling).
+/// Only metadata is read, never the content. A path that does not exist yet has no inode to
+/// share, so it is skipped. Any other failure is returned: the set of inodes is then unknown and
+/// the caller must hash nothing.
+fn sensitive_targets(home: &Path, spelled: &[String]) -> Result<Vec<std::fs::Metadata>, String> {
+    let mut out = Vec::new();
+    for s in spelled {
+        match std::fs::metadata(home.join(s)) {
+            Ok(m) => out.push(m),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(format!("{s}: {}", e.kind())),
+        }
+    }
+    Ok(out)
 }
 
 /// Whether the binary path or the file it resolves to is a sensitive managed output: by path
@@ -433,11 +463,11 @@ fn binary_row(
     path: &OsStr,
     trials: &[TrialRecord],
     sensitive: &BTreeSet<String>,
+    targets: &Result<Vec<std::fs::Metadata>, String>,
 ) -> Row {
     use crate::trial_cmd::window::{HASH_CAP, hash};
     let mut notes = vec![who.to_string()];
     let mut fix = "";
-    let targets = sensitive_targets(home, sensitive);
     match std::fs::canonicalize(at) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             fix = missing_fix;
@@ -451,13 +481,29 @@ fn binary_row(
             fix = missing_fix;
             notes.push(format!("the binary path cannot be resolved: {}", e.kind()));
         }
-        Ok(real) if is_sensitive(home, at, &real, sensitive, &targets) => {
+        Ok(real)
+            if is_sensitive(
+                home,
+                at,
+                &real,
+                sensitive,
+                targets.as_deref().unwrap_or_default(),
+            ) =>
+        {
             fix = "Point the binary path to the tool's own file, then install the tool again.";
             notes.push(
                 "the binary resolves to a sensitive managed output, which is not read".into(),
             );
         }
+        Ok(_) if targets.is_err() => {
+            fix = "Fix the permissions of the named sensitive path, then run doctor again.";
+            notes.push(format!(
+                "no binary is hashed: the metadata of a sensitive managed path could not be read ({})",
+                targets.as_ref().err().map_or("", String::as_str)
+            ));
+        }
         Ok(real) => {
+            let targets = targets.as_deref().unwrap_or_default();
             let meta = std::fs::metadata(&real).ok().filter(|m| m.is_file());
             let len = meta.as_ref().map(|m| m.len());
             // As the trial requires (DFM-83): the owner execute bit.
@@ -1735,7 +1781,29 @@ fn owned_row(path: &str, who: &str, op: Option<&Operation>, live: Live) -> Row {
 
 #[cfg(test)]
 mod tests {
-    use super::{Listing, executable_name, scan_listing, takes_slot};
+    use super::{Listing, executable_name, scan_listing, sensitive_targets, takes_slot};
+    use std::os::unix::fs::MetadataExt;
+
+    #[test]
+    fn a_sensitive_path_is_stat_ed_by_its_original_spelling() {
+        let home = std::env::temp_dir().join(format!("dfm-doctor-{}", std::process::id()));
+        std::fs::create_dir_all(home.join("Vault")).unwrap();
+        let file = home.join("Vault/Token");
+        std::fs::write(&file, b"x").unwrap();
+        let want = std::fs::metadata(&file).unwrap().ino();
+        let got = sensitive_targets(&home, &["Vault/Token".into()]).unwrap();
+        assert_eq!(got.iter().map(MetadataExt::ino).collect::<Vec<_>>(), [want]);
+        // A path that does not exist yet has no inode to share.
+        assert!(
+            sensitive_targets(&home, &["Vault/None".into()])
+                .unwrap()
+                .is_empty()
+        );
+        // Any other failure makes the set unknown.
+        let err = sensitive_targets(&home, &["Vault/Token/x".into()]).unwrap_err();
+        assert!(err.starts_with("Vault/Token/x: "), "{err}");
+        std::fs::remove_dir_all(&home).unwrap();
+    }
 
     #[test]
     fn a_script_package_is_searched_for_by_its_declared_binary() {
