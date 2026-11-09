@@ -154,17 +154,19 @@ jobs:
           compression-level: 0
 
   tests:
-    name: rust tests (${{ matrix.partition }}/4)
+    name: rust tests (${{ matrix.partition }})
     needs: [changes, build]
     if: needs.changes.outputs.rust == 'true'
     runs-on: macos-latest
     strategy:
       fail-fast: false
       matrix:
-        # nextest `count` partitions deal the tests of each binary round-robin, so every
-        # partition gets an equal share of each slow binary. The gate test
-        # `every_cli_test_target_is_in_one_ci_shard` checks that the list is 1 to the total.
-        partition: [1, 2, 3, 4]
+        # `solo` runs the release-graph gate test alone: it builds the workspace in release mode
+        # (228 s) and doubled the run time of the partition that also held it (run 42617574999). nextest `count` partitions deal every other test
+        # of each binary round-robin. scripts/check_all.sh defines the split; the gate test
+        # `every_cli_test_target_is_in_one_ci_shard` checks this list is solo and count:1/N to N/N.
+        # With the build and style jobs this is five macOS jobs, the hosted concurrency cap.
+        partition: [solo, "count:1/4", "count:2/4", "count:3/4", "count:4/4"]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -190,12 +192,12 @@ jobs:
       - name: Run implementation tests
         env:
           DFM_TEST_ARCHIVE: ${{ runner.temp }}/ci/tests.tar.zst
-          DFM_TEST_PARTITION: count:${{ matrix.partition }}/4
+          DFM_TEST_PARTITION: ${{ matrix.partition }}
           DFM_SKIP_NETWORK_TESTS: "1"
         run: bash scripts/check_all.sh rust-tests
 
   install:
-    name: network install tests (${{ matrix.partition }}/5)
+    name: network install tests (${{ matrix.partition }})
     needs: [changes, build]
     if: needs.changes.outputs.bootstrap == 'true'
     runs-on: macos-latest
@@ -204,8 +206,8 @@ jobs:
       matrix:
         # Each test builds the manager in release mode through bootstrap.sh (about 3 minutes on
         # the 3-core runner), so at most three tests per job: 13 tests in 5 partitions. The gate
-        # test `every_ignored_test_is_in_one_install_shard` checks that the list is 1 to the total.
-        partition: [1, 2, 3, 4, 5]
+        # test `every_ignored_test_is_in_one_install_shard` checks the list is count:1/N to N/N.
+        partition: ["count:1/5", "count:2/5", "count:3/5", "count:4/5", "count:5/5"]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -231,7 +233,7 @@ jobs:
       - name: Run the network install tests
         env:
           DFM_TEST_ARCHIVE: ${{ runner.temp }}/ci/tests.tar.zst
-          DFM_TEST_PARTITION: count:${{ matrix.partition }}/5
+          DFM_TEST_PARTITION: ${{ matrix.partition }}
         run: bash scripts/check_all.sh network-tests
 
   gate:

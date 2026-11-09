@@ -647,46 +647,68 @@ fn a_plain_release_build_of_every_target_has_no_test_isolation() {
     );
 }
 
-/// The nextest partitions of the hosted CI jobs (.github/workflows/contract-check.yml), in order:
-/// for each job, the `partition:` matrix list and the total `N` of its
-/// `DFM_TEST_PARTITION: count:${{ matrix.partition }}/N`. The test job comes first, then the
-/// install job.
-fn ci_partitions() -> Vec<(Vec<usize>, usize)> {
+/// The `partition:` matrix lists of the hosted CI jobs (.github/workflows/contract-check.yml),
+/// in order: the test job, then the install job. Each job passes its entry unchanged as
+/// `DFM_TEST_PARTITION`, which scripts/check_all.sh turns into a nextest selection.
+fn ci_partitions() -> Vec<Vec<String>> {
     let workflow =
         fs::read_to_string(repo_root().join(".github/workflows/contract-check.yml")).unwrap();
-    let lists = workflow.lines().filter_map(|l| {
-        let list = l.trim_start().strip_prefix("partition: [")?;
-        Some(
-            list.trim_end()
-                .strip_suffix(']')
-                .unwrap()
-                .split(',')
-                .map(|n| n.trim().parse::<usize>().unwrap())
-                .collect::<Vec<_>>(),
-        )
-    });
-    let totals = workflow.lines().filter_map(|l| {
-        let spec = l
-            .trim_start()
-            .strip_prefix("DFM_TEST_PARTITION: count:${{ matrix.partition }}/")?;
-        Some(spec.trim().parse::<usize>().unwrap())
-    });
-    let pairs: Vec<_> = lists.zip(totals).collect();
-    assert_eq!(pairs.len(), 2, "one test and one install partition matrix");
-    pairs
+    let passed = workflow
+        .lines()
+        .filter(|l| l.trim() == "DFM_TEST_PARTITION: ${{ matrix.partition }}")
+        .count();
+    let lists: Vec<_> = workflow
+        .lines()
+        .filter_map(|l| {
+            let list = l.trim_start().strip_prefix("partition: [")?;
+            Some(
+                list.trim_end()
+                    .strip_suffix(']')
+                    .unwrap()
+                    .split(',')
+                    .map(|n| n.trim().trim_matches('"').to_string())
+                    .collect::<Vec<_>>(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        (lists.len(), passed),
+        (2, 2),
+        "one test and one install partition matrix, each passed as DFM_TEST_PARTITION"
+    );
+    lists
+}
+
+/// `count:1/N` to `count:N/N`, the nextest partitions that together hold every selected test.
+fn count_partitions(total: usize) -> Vec<String> {
+    (1..=total).map(|k| format!("count:{k}/{total}")).collect()
 }
 
 /// Hosted CI builds the whole test set once into a nextest archive (scripts/check_all.sh,
-/// step rust-archive) and runs it in `count` partitions. Every test runs in exactly one job when
-/// the matrix lists each partition 1 to N once, and every workspace test target is in the archive
-/// when it needs no feature but test-isolation and the failpoints feature it switches on.
+/// step rust-archive). One job runs the test the script names in `solo_test` and nothing else;
+/// the other jobs run `count` partitions of every other test. Every test runs in exactly one job
+/// when the matrix lists `solo` and each partition 1 to N once and the solo test exists. Every
+/// workspace test target is in the archive when it needs no feature but test-isolation and the
+/// failpoints feature it switches on.
 #[test]
 fn every_cli_test_target_is_in_one_ci_shard() {
-    let (list, total) = ci_partitions().remove(0);
+    let list = ci_partitions().remove(0);
+    let total = list.len() - 1;
+    let mut want = vec!["solo".to_string()];
+    want.extend(count_partitions(total));
     assert_eq!(
-        list,
-        (1..=total).collect::<Vec<_>>(),
-        "list each test partition 1 to {total} once in contract-check.yml"
+        list, want,
+        "list solo and each test partition 1 to {total} once in contract-check.yml"
+    );
+    let script = fs::read_to_string(repo_root().join("scripts/check_all.sh")).unwrap();
+    let solo = script
+        .lines()
+        .find_map(|l| l.strip_prefix("solo_test="))
+        .expect("scripts/check_all.sh names solo_test");
+    let gate = fs::read_to_string(repo_root().join("crates/cli/tests/gate.rs")).unwrap();
+    assert!(
+        gate.contains(&format!("#[test]\nfn {solo}() {{")),
+        "solo_test={solo} in scripts/check_all.sh names no test in crates/cli/tests/gate.rs"
     );
     let m = metadata();
     let members = m["workspace_members"].as_array().unwrap();
@@ -716,10 +738,11 @@ fn every_cli_test_target_is_in_one_ci_shard() {
 /// crates/cli/tests/bootstrap.rs, where the install jobs expect them.
 #[test]
 fn every_ignored_test_is_in_one_install_shard() {
-    let (list, total) = ci_partitions().remove(1);
+    let list = ci_partitions().remove(1);
+    let total = list.len();
     assert_eq!(
         list,
-        (1..=total).collect::<Vec<_>>(),
+        count_partitions(total),
         "list each install partition 1 to {total} once in contract-check.yml"
     );
     let mut files = Vec::new();
