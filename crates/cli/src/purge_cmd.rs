@@ -2,30 +2,33 @@
 //! package the trial installed and the Homebrew dependencies that install added, removes every
 //! recorded configuration and data path that was absent before the trial, then removes the
 //! trial record. Anything that existed before the trial is kept. The run needs `--yes-plan`
-//! with the digest of the preview, as `trial` and `adopt` do.
+//! with the digest of the preview, as `trial` and `adopt` do. A script trial (DFM-82) also
+//! removes what its observation window saw `created` below HOME, and prints the rest as
+//! `retained:`.
 
 use crate::adapters::package::{self, HOMEBREW, MISE};
 use crate::adopt_cmd::overlaps;
 use crate::apply_cmd::{is_digest, label, stale};
+use crate::trial_cmd::window::{self, Watch};
 use crate::{Ctx, cli, paint, read_existing_binding, state_cmd, usage};
 use dfm_engine::fsys::{Dir, Peek, Sys};
 use dfm_engine::{Runner, Store, now_ns, signal};
 use dfm_model::digest::sha256_hex;
 use dfm_model::display::{bounded_visible, visible};
-use dfm_model::fold::fold;
+use dfm_model::fold::{eq as same_path, fold};
 use dfm_model::plan::{Binary, PackageState, file_fingerprint};
 use dfm_model::resolve::{Table, Value};
 use dfm_model::state::{
     Approval, BaselinePath, BinaryId, Class, JournalEntry, MAX_BYTES, OperationRecord, Phase,
     ProfileRef, Receipt, Recovery, RecoveryOutput, RunResult, SCHEMA, Stamp, Status, TrialRecord,
-    count_statuses, rfc3339,
+    TrialScript, WindowEntry, count_statuses, rfc3339,
 };
 use dfm_model::{Code, Exit, Refusal};
 use serde_json::json;
 use std::fs;
 use std::io::Write;
 use std::os::unix::fs::MetadataExt;
-use std::path::Path;
+use std::path::{Component, Path, PathBuf};
 
 /// The most entries a removed directory may hold. A larger tree is kept: its preview could not
 /// show what the approval covers.
@@ -78,6 +81,8 @@ enum Now {
     File(String),
     /// Entry count, bytes and the fingerprint of the tree (relative path, kind, size).
     Dir(usize, u64, String),
+    /// A link a script trial created, with its target text. Only a script trial removes one.
+    Link(String),
     Other(String),
 }
 
@@ -96,7 +101,14 @@ struct Decision {
     package: Option<(String, String, Step)>,
     deps: Vec<(String, Step)>,
     paths: Vec<PathItem>,
+    /// What a script trial's window saw and purge never removes, one line each.
+    retained: Vec<String>,
     unknown: Vec<String>,
+    /// The script URL of a script trial, which installs no package.
+    script: Option<String>,
+    /// A script trial whose run did not finish: its candidates come from `before` and the
+    /// live state.
+    interrupted: bool,
     binary: Binary,
     stamp: Stamp,
 }
@@ -115,6 +127,7 @@ impl Decision {
             Now::Absent => json!("absent"),
             Now::File(h) => json!({ "file": h }),
             Now::Dir(n, b, f) => json!({ "dir": f, "entries": n, "bytes": b }),
+            Now::Link(t) => json!({ "link": t }),
             Now::Other(w) => json!({ "other": w }),
         };
         let doc = json!({
@@ -123,6 +136,7 @@ impl Decision {
             "package": self.package.as_ref().map(|(a, n, s)| json!({"adapter": a, "name": n, "step": step_json(s)})),
             "deps": self.deps.iter().map(|(n, s)| json!({"name": n, "step": step_json(s)})).collect::<Vec<_>>(),
             "paths": self.paths.iter().map(|p| json!({"path": p.path, "now": now(&p.now), "step": step_json(&p.step)})).collect::<Vec<_>>(),
+            "retained": self.retained,
             "unknown": self.unknown,
             "binary": {"version": self.binary.version, "sha256": self.binary.sha256},
             "binding": {
@@ -138,9 +152,14 @@ impl Decision {
 
     fn print(&self, out: &mut dyn Write, digest: &str) -> std::io::Result<()> {
         writeln!(out, "purge: {} tool={}", self.trial_id, self.tool)?;
-        match &self.package {
-            None => writeln!(out, "package: none recorded; the trial installed nothing")?,
-            Some((a, n, s)) => line(out, &format!("uninstall {a} {}", visible(n)), s)?,
+        match (&self.package, &self.script) {
+            (None, Some(url)) => writeln!(
+                out,
+                "package: none; the trial ran the script {}",
+                visible(url)
+            )?,
+            (None, None) => writeln!(out, "package: none recorded; the trial installed nothing")?,
+            (Some((a, n, s)), _) => line(out, &format!("uninstall {a} {}", visible(n)), s)?,
         }
         for (n, s) in &self.deps {
             line(
@@ -153,14 +172,34 @@ impl Decision {
             )?;
         }
         for p in &self.paths {
+            if let (Now::Link(t), Step::Keep(why)) = (&p.now, &p.step) {
+                writeln!(
+                    out,
+                    "kept: {} -> {} ({})",
+                    visible(&p.path),
+                    visible(t),
+                    visible(why)
+                )?;
+                continue;
+            }
             let what = match &p.now {
                 Now::Absent => String::new(),
                 Now::File(h) if h.starts_with("size:") => format!(" file ({h})"),
                 Now::File(h) => format!(" file sha256:{h}"),
                 Now::Dir(n, b, _) => format!(" directory ({n} entries, {b} bytes)"),
+                Now::Link(t) => format!(" link -> {}", visible(t)),
                 Now::Other(w) => format!(" {w}"),
             };
             line(out, &format!("remove {}{what}", visible(&p.path)), &p.step)?;
+        }
+        for r in &self.retained {
+            writeln!(out, "retained: {r}")?;
+        }
+        if self.interrupted {
+            writeln!(
+                out,
+                "note: the script run of this trial did not finish; each path created since its before observation is a candidate"
+            )?;
         }
         writeln!(
             out,
@@ -281,14 +320,27 @@ fn tree(dir: &Path, uid: u32) -> std::io::Result<Result<(usize, u64, String), St
     )))
 }
 
+/// Given a created link's target text, why purge keeps the link, or `None` to remove it.
+type LinkKeep<'a> = dyn Fn(&str) -> Option<String> + 'a;
+
+/// A path another active script trial changed: its id, the path, and whether its window names
+/// the path (else it is in the `before` of a run that did not finish).
+type Seen = (String, String, bool);
+
 /// One recorded path now, and what purge does with it.
-/// `others` are the paths the other active trials recorded.
+/// `others` are the paths the other active trials recorded; one that overlaps the path keeps
+/// it. `seen` are the paths the other active script trials changed: a window path that overlaps
+/// the path keeps it, and a `before` path keeps it when at or below it. `link_keep` is set for a link a script
+/// trial created: given the link's target text, it answers why purge keeps the link, or `None`
+/// when purge may remove it. Without it a link is kept.
 fn path_item(
     b: &BaselinePath,
     owned: &[String],
     others: &[(String, String)],
+    seen: &[Seen],
     sys: &Sys,
     home: &Path,
+    link_keep: Option<&LinkKeep>,
 ) -> PathItem {
     let item = |now, step| PathItem {
         path: b.path.clone(),
@@ -356,6 +408,22 @@ fn path_item(
                 );
             }
         }
+    } else if let (true, Some(keep)) = (m.is_symlink(), link_keep) {
+        match fs::read_link(&b.path) {
+            Ok(t) => {
+                let t = t.to_string_lossy().into_owned();
+                if let Some(why) = keep(&t) {
+                    return item(Now::Link(t), Step::Keep(why));
+                }
+                Now::Link(t)
+            }
+            Err(e) => {
+                return item(
+                    Now::Other("link".into()),
+                    Step::Keep(format!("cannot be read ({})", e.kind())),
+                );
+            }
+        }
     } else {
         return item(
             Now::Other("link or special file".into()),
@@ -368,19 +436,489 @@ fn path_item(
         Step::Keep("a module owns a path at or below it".into())
     } else if let Some((id, _)) = others.iter().find(|(_, p)| overlaps(p, &b.path)) {
         Step::Keep(format!("trial {id} also records it"))
+    } else if let Some((id, p, _)) = seen.iter().find(|(_, p, window)| {
+        if *window {
+            overlaps(p, &b.path)
+        } else {
+            at_or_below(p, &b.path)
+        }
+    }) {
+        Step::Keep(format!("trial {id} observed {}", visible(p)))
     } else {
         Step::Do
     };
     item(now, step)
 }
 
+/// Whether `p` is `dir` or lies below it, after the case fold.
+fn at_or_below(p: &str, dir: &str) -> bool {
+    let (p, d) = (fold(p), fold(dir));
+    p == d || p.starts_with(&format!("{d}/"))
+}
+
+/// `p` with `.` and `..` resolved by text alone, so a relative link target can be compared with
+/// a directory path. Nothing on disk is read.
+fn lexical(p: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for c in p.components() {
+        match c {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                out.pop();
+            }
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// Why purge keeps the created link `link` whose target text is now `target`, or `None` when it
+/// may unlink it: the target is the `recorded` one, or lies inside (or is) one of
+/// `created_dirs`. A relative target is joined to the link's directory and resolved by text.
+fn link_keep(
+    link: &Path,
+    recorded: Option<&str>,
+    target: &str,
+    created_dirs: &[&Path],
+) -> Option<String> {
+    if recorded == Some(target) {
+        return None;
+    }
+    if !vouching(link, target, created_dirs).is_empty() {
+        return None;
+    }
+    Some(match recorded {
+        None => "no target recorded".into(),
+        Some(_) => "repointed since the trial".into(),
+    })
+}
+
+/// The `created_dirs` that hold (or are) what `link` with the target text `target` points to.
+/// A relative target is joined to the link's directory and resolved by text.
+fn vouching<'a>(link: &Path, target: &str, created_dirs: &[&'a Path]) -> Vec<&'a Path> {
+    let to = lexical(&link.parent().unwrap_or(link).join(target));
+    let to = to.to_string_lossy();
+    created_dirs
+        .iter()
+        .copied()
+        .filter(|d| at_or_below(&to, &d.to_string_lossy()))
+        .collect()
+}
+
+/// Each link item that only the created-directory rule authorizes, with the created directories
+/// that vouch for it.
+type Vouched = Vec<(String, Vec<String>)>;
+
+/// Keeps each link item that only `vouched` authorizes (its created directories, by link path)
+/// once none of those directories is still removed as a tree. Returns whether an item changed.
+fn unvouch(items: &mut [PathItem], vouched: &Vouched) -> bool {
+    let removed: Vec<String> = items
+        .iter()
+        .filter(|i| matches!((&i.now, &i.step), (Now::Dir(..), Step::Do)))
+        .map(|i| i.path.clone())
+        .collect();
+    let mut changed = false;
+    for i in items.iter_mut().filter(|i| i.step == Step::Do) {
+        let Some((_, dirs)) = vouched.iter().find(|(l, _)| same_path(l, &i.path)) else {
+            continue;
+        };
+        if dirs.iter().any(|d| removed.iter().any(|r| same_path(r, d))) {
+            continue;
+        }
+        let dir = dirs.first().map_or_else(String::new, |d| visible(d));
+        i.step = Step::Keep(format!("points into {dir}, which is kept"));
+        changed = true;
+    }
+    changed
+}
+
+/// `p` with its parent resolved through links, so it compares with the canonical protected
+/// paths. `p` itself is not followed.
+fn real_parent(p: &Path) -> PathBuf {
+    match (p.parent(), p.file_name()) {
+        (Some(d), Some(n)) => fs::canonicalize(d).map_or_else(|_| p.to_path_buf(), |d| d.join(n)),
+        _ => p.to_path_buf(),
+    }
+}
+
+/// The trees a script trial's sandbox protected that `check_claim` does not cover: the guarded
+/// `checkouts` and the directory of the dfm executable `exe`, each canonical so it compares with
+/// [`real_parent`]. A path that cannot be resolved is kept as given.
+fn protected_trees(checkouts: Vec<PathBuf>, exe: Option<PathBuf>) -> Vec<PathBuf> {
+    let real = |p: PathBuf| fs::canonicalize(&p).unwrap_or(p);
+    checkouts
+        .into_iter()
+        .map(real)
+        .chain(
+            exe.map(real)
+                .and_then(|e| e.parent().map(Path::to_path_buf)),
+        )
+        .collect()
+}
+
+/// The kind name the observation window uses for `m`.
+fn kind_of(m: &fs::Metadata) -> &'static str {
+    let ft = m.file_type();
+    if ft.is_symlink() {
+        "link"
+    } else if ft.is_dir() {
+        "dir"
+    } else if ft.is_file() {
+        "file"
+    } else {
+        "other"
+    }
+}
+
+/// What purge does with the entries of a script trial's window: each `created` entry below
+/// HOME that the watch set could have seen appear is a path item (a candidate the digest
+/// covers), every other entry is a `retained:` line. The window is evidence, not authority: an
+/// entry `before` already holds, one no watched place could report, one in a place `before`
+/// could not read, and one that overlaps a `protected` tree is never removed. Each `retained:`
+/// line comes with its path, for `hold_dirs`. `skip` are the baseline paths, which the
+/// record's own path items already cover; a window entry is checked against them only after
+/// every retention rule, so a retained baseline path still yields its `retained:` line. A
+/// `truncated` window may omit what a created directory holds, so no created directory of it
+/// is removed. A link repointed into a directory counts as the trial's only when that
+/// directory is itself removed: the third list names, for each link only that rule
+/// authorizes, the directories that vouch for it, for [`unvouch`].
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the inputs of one decision; a struct would only rename them"
+)]
+fn script_items(
+    s: &TrialScript,
+    entries: &[WindowEntry],
+    truncated: bool,
+    skip: &[&str],
+    protected: &[PathBuf],
+    owned: &[String],
+    others: &[(String, String)],
+    seen: &[Seen],
+    store: &Store,
+    sys: &Sys,
+    home: &Path,
+) -> (Vec<PathItem>, Vec<(String, String)>, Vouched) {
+    let agents = home.join("Library/LaunchAgents");
+    let watch = window::watch_set(home, &s.env);
+    // Every path comparison here uses the case fold of the ownership checks: on a
+    // case-insensitive volume `~/bin/Keep` and `~/bin/keep` are one file.
+    let same = |a: &Path, b: &Path| same_path(&a.to_string_lossy(), &b.to_string_lossy());
+    let watched = |p: &Path| {
+        watch.iter().any(|w| match w {
+            Watch::File(f) => same(f, p),
+            Watch::Dir(d) | Watch::Listing(d) => p.parent().is_some_and(|q| same(q, d)),
+        })
+    };
+    let before = |p: &str| s.before.iter().find(|b| same_path(&b.path, p));
+    // The watched parent of `p` when `before` could not read it.
+    let unread = |p: &Path| -> Option<String> {
+        let d = p.parent()?.to_string_lossy().into_owned();
+        before(&d)
+            .is_some_and(|b| b.kind == "unreadable")
+            .then_some(d)
+    };
+    let removed: Vec<&str> = entries
+        .iter()
+        .filter(|e| e.change == "removed")
+        .map(|e| e.path.as_str())
+        .collect();
+    let (mut candidates, mut retained) = (Vec::new(), Vec::new());
+    for e in entries {
+        let (p, shown) = (Path::new(&e.path), visible(&e.path));
+        match e.change.as_str() {
+            "created" => {}
+            "modified" => {
+                // `shrink_window` may have dropped the entry's own `before`.
+                let old = e.before.as_ref().or_else(|| before(&e.path));
+                let now = window::observe(&[Watch::File(p.to_path_buf())])
+                    .ok()
+                    .and_then(|o| o.into_iter().next());
+                let or_none = |h: Option<&String>| h.map_or_else(|| "none".into(), |h| visible(h));
+                let mut what = format!(
+                    "sha256 {} -> {}",
+                    or_none(old.and_then(|o| o.sha256.as_ref())),
+                    or_none(now.as_ref().and_then(|o| o.sha256.as_ref()))
+                );
+                let (t0, t1) = (
+                    old.and_then(|o| o.target.as_ref()),
+                    now.as_ref().and_then(|o| o.target.as_ref()),
+                );
+                if t0.is_some() || t1.is_some() {
+                    what += &format!(", target {} -> {}", or_none(t0), or_none(t1));
+                }
+                retained.push((
+                    &e.path,
+                    format!("{shown} modified during the trial ({what}); edit {shown} by hand"),
+                ));
+                continue;
+            }
+            change => {
+                retained.push((
+                    &e.path,
+                    format!("{shown} {change} during the trial; never restored"),
+                ));
+                continue;
+            }
+        }
+        if e.kind == "unreadable" {
+            retained.push((
+                &e.path,
+                format!("{shown} could not be read after the run; never removed"),
+            ));
+            continue;
+        }
+        if inexact(e) {
+            retained.push((
+                &e.path,
+                format!("{shown} (the name was not recorded exactly)"),
+            ));
+            continue;
+        }
+        if !at_or_below(&e.path, &home.to_string_lossy()) || same(p, home) {
+            retained.push((
+                &e.path,
+                format!("{shown} created outside HOME; never removed"),
+            ));
+            continue;
+        }
+        if before(&e.path).is_some() {
+            retained.push((&e.path, format!(
+                "{shown} is in the observation before the run, so the trial did not create it; never removed"
+            )));
+            continue;
+        }
+        if let Some(r) = renamed_from(p, &removed) {
+            retained.push((&e.path, format!(
+                "{shown} (the same file as {}, which existed before the trial; renamed during the trial)",
+                visible(r)
+            )));
+            continue;
+        }
+        if let Some(d) = unread(p) {
+            retained.push((&e.path, format!(
+                "{shown} is in {}, which could not be read before the run, so the trial may not have created it; never removed",
+                visible(&d)
+            )));
+            continue;
+        }
+        if !watched(p) {
+            retained.push((&e.path, format!(
+                "{shown} is not in a watched place, so the window cannot have seen it appear; never removed"
+            )));
+            continue;
+        }
+        if p.parent().is_some_and(|d| same(d, &agents)) {
+            retained.push((&e.path, format!(
+                "{shown} created during the trial; unload it with launchctl bootout gui/{} {shown}, then remove it by hand",
+                sys.uid
+            )));
+            continue;
+        }
+        let real = real_parent(p).to_string_lossy().into_owned();
+        if store.check_claim(&e.path).is_err()
+            || protected
+                .iter()
+                .any(|t| overlaps(&t.to_string_lossy(), &real))
+        {
+            retained.push((
+                &e.path,
+                format!("{shown} is a path of the manager or a guarded checkout; never removed"),
+            ));
+            continue;
+        }
+        // A created entry that is now another kind is not what the window saw.
+        if let Ok(m) = fs::symlink_metadata(p)
+            && kind_of(&m) != e.kind
+        {
+            retained.push((
+                &e.path,
+                format!(
+                    "{shown} created as a {} during the trial and now a {}; not removed",
+                    e.kind,
+                    kind_of(&m)
+                ),
+            ));
+            continue;
+        }
+        // A cut window may omit children purge must keep, and a directory goes as a tree.
+        if truncated && e.kind == "dir" {
+            retained.push((
+                &e.path,
+                format!("{shown} (the window was truncated; its contents were not all recorded)"),
+            ));
+            continue;
+        }
+        // Only now, after every retention check: a retained baseline path must reach the
+        // merged list so its baseline item is dropped.
+        if skip.iter().any(|k| same_path(k, &e.path)) {
+            continue;
+        }
+        candidates.push(e);
+    }
+    let item = |e: &WindowEntry, created_dirs: &[&Path]| {
+        let keep = |t: &str| link_keep(Path::new(&e.path), e.target.as_deref(), t, created_dirs);
+        let b = BaselinePath {
+            path: e.path.clone(),
+            existed: false,
+            sha256: None,
+        };
+        path_item(&b, owned, others, seen, sys, home, Some(&keep))
+    };
+    // Only a created directory that is itself removed vouches for a link into it, so the links
+    // are decided after every directory.
+    let first: Vec<PathItem> = candidates.iter().map(|e| item(e, &[])).collect();
+    let created_dirs: Vec<&Path> = candidates
+        .iter()
+        .zip(&first)
+        .filter(|(_, i)| matches!((&i.now, &i.step), (Now::Dir(..), Step::Do)))
+        .map(|(e, _)| Path::new(&e.path))
+        .collect();
+    let items: Vec<PathItem> = candidates
+        .iter()
+        .zip(first)
+        .map(|(e, i)| match i.now {
+            Now::Link(_) => item(e, &created_dirs),
+            _ => i,
+        })
+        .collect();
+    let vouched = candidates
+        .iter()
+        .zip(&items)
+        .filter_map(|(e, i)| match (&i.now, &i.step) {
+            (Now::Link(t), Step::Do) if e.target.as_deref() != Some(t.as_str()) => {
+                let dirs = vouching(Path::new(&e.path), t, &created_dirs);
+                Some((
+                    e.path.clone(),
+                    dirs.iter()
+                        .map(|d| d.to_string_lossy().into_owned())
+                        .collect(),
+                ))
+            }
+            _ => None,
+        })
+        .collect();
+    let retained = retained.into_iter().map(|(p, l)| (p.clone(), l)).collect();
+    (items, retained, vouched)
+}
+
+/// Whether the window recorded `e` by a shown form that may name another file: the kind
+/// `other` (the window's mark for a name that is not UTF-8 or holds a control character), or
+/// U+FFFD in the path, which a lossy conversion leaves.
+fn inexact(e: &WindowEntry) -> bool {
+    e.kind == "other" || e.path.contains('\u{FFFD}')
+}
+
+/// The `removed` path that is now the same file as `created` (equal `(dev, ino)` from an
+/// `lstat` of each). It catches a case-only or normalization-only rename on any volume. When
+/// either `lstat` fails the guard does not apply.
+fn renamed_from<'a>(created: &Path, removed: &[&'a str]) -> Option<&'a str> {
+    let id = |p: &Path| fs::symlink_metadata(p).ok().map(|m| (m.dev(), m.ino()));
+    let want = id(created)?;
+    removed
+        .iter()
+        .copied()
+        .find(|r| id(Path::new(r)) == Some(want))
+}
+
+/// A directory item is removed as a tree, so one that holds a kept item or a `retained` path
+/// (strictly below it, case fold) stays: it moves out of `items` and becomes a `retained:`
+/// line. So does one that a kept or retained link points into (or at), with a relative
+/// target resolved by text against the link's directory and again through the links on disk
+/// (`resolved`), so an alias such as `~/.alias -> ~/.config` is seen: removing it would leave
+/// that link dangling. Its other candidates are their own items and are still removed one by
+/// one.
+fn hold_dirs(items: &mut Vec<PathItem>, retained: &[(String, String)]) -> Vec<String> {
+    let kept: Vec<String> = retained
+        .iter()
+        .map(|(p, _)| p.clone())
+        .chain(
+            items
+                .iter()
+                .filter(|i| matches!(i.step, Step::Keep(_)))
+                .map(|i| i.path.clone()),
+        )
+        .collect();
+    let s = |p: PathBuf| p.to_string_lossy().into_owned();
+    let links: Vec<(&String, String, String)> = kept
+        .iter()
+        .filter_map(|k| {
+            let t = fs::read_link(k).ok()?;
+            let p = Path::new(k);
+            let to = p.parent().unwrap_or(p).join(t);
+            Some((k, s(lexical(&to)), s(resolved(&to))))
+        })
+        .collect();
+    let mut held = Vec::new();
+    items.retain(|i| {
+        if !matches!((&i.now, &i.step), (Now::Dir(..), Step::Do)) {
+            return true;
+        }
+        let why = if let Some(k) = kept
+            .iter()
+            .find(|k| !same_path(k, &i.path) && at_or_below(k, &i.path))
+        {
+            format!("holds {}, which is kept", visible(k))
+        } else if let Some((l, ..)) = links.iter().find(|(_, t, r)| {
+            at_or_below(t, &i.path) || at_or_below(r, &s(resolved(Path::new(&i.path))))
+        }) {
+            format!("the kept link {} points into it", visible(l))
+        } else {
+            return true;
+        };
+        held.push(format!("{} ({why})", visible(&i.path)));
+        false
+    });
+    held
+}
+
+/// `p` with every link on disk resolved: the longest existing ancestor is canonicalized and the
+/// rest is joined after `lexical`. A path that nothing resolves stays as `lexical` gives it.
+fn resolved(p: &Path) -> PathBuf {
+    let p = lexical(p);
+    let mut base = p.as_path();
+    let mut rest = Vec::new();
+    loop {
+        if let Ok(c) = fs::canonicalize(base) {
+            return lexical(&rest.iter().rev().fold(c, |a, n| a.join(n)));
+        }
+        match (base.parent(), base.file_name()) {
+            (Some(up), Some(n)) => {
+                rest.push(n.to_os_string());
+                base = up;
+            }
+            _ => return p,
+        }
+    }
+}
+
+/// The fingerprint `path` has now, as the decision computes it, or `None` when it is not a
+/// readable file or a directory whose tree can be listed.
+fn live(path: &Path, uid: u32) -> Option<Now> {
+    let m = fs::symlink_metadata(path).ok()?;
+    if m.is_dir() {
+        let (n, b, f) = tree(path, uid).ok()?.ok()?;
+        Some(Now::Dir(n, b, f))
+    } else if m.is_file() && m.len() > MAX_BYTES as u64 {
+        Some(Now::File(format!("size:{}", m.len())))
+    } else if m.is_file() {
+        fs::read(path).ok().map(|b| Now::File(file_fingerprint(&b)))
+    } else {
+        None
+    }
+}
+
 /// Removes one path below HOME without following a link: every parent is opened as a real
-/// directory owned by this user, then the entry is removed (a directory with its tree).
+/// directory owned by this user, then the entry is removed (a directory with its tree). The
+/// entry must still be what the decision saw (`now`): a file or a tree with the same
+/// fingerprint, a link with the same target text. Anything else is `E_PLAN_STALE` and nothing
+/// is removed.
 fn remove_path(
     store: &Store,
     sys: &Sys,
     home: &Path,
     path: &str,
+    now: &Now,
     fail: &dfm_engine::Fail,
 ) -> Result<(), Refusal> {
     store.check_claim(path)?;
@@ -395,13 +933,20 @@ fn remove_path(
         .ok_or_else(|| Refusal::new(Code::StateInvalid, format!("{path} is HOME itself")))?;
     let home_dir = Dir::open_home(sys, home)?;
     let parent = home_dir.open_below(sys, parents)?;
-    match parent.peek(sys, leaf)? {
-        Peek::Missing => Ok(()),
-        Peek::Dir { .. } => parent.remove_tree(sys, leaf),
-        Peek::File { .. } => parent.remove_entry(leaf, fail),
+    fail.hit("purge-remove")?;
+    let same = || live(Path::new(path), sys.uid).as_ref() == Some(now);
+    match (parent.peek(sys, leaf)?, now) {
+        (Peek::Missing, _) => Ok(()),
+        (Peek::Dir { .. }, Now::Dir(..)) if same() => parent.remove_tree(sys, leaf),
+        (Peek::File { .. }, Now::File(_)) if same() => parent.remove_entry(leaf, fail),
+        (Peek::Link { target, .. }, Now::Link(t)) if target == *t => {
+            parent.remove_entry(leaf, fail)
+        }
         _ => Err(Refusal::new(
-            Code::Conflict,
-            format!("{path} became a link or a special file; it is not removed"),
+            Code::PlanStale,
+            format!(
+                "{path} changed after the decision; it is not removed. Fix: read the purge again with --preview"
+            ),
         )),
     }
 }
@@ -440,12 +985,6 @@ fn trial_record(store: &Store, name: &str) -> Result<TrialRecord, Refusal> {
                 "trial {} is adopted; its files belong to a module now. Nothing was changed",
                 t.trial_id
             ),
-        ));
-    }
-    if t.script.is_some() {
-        return Err(Refusal::new(
-            Code::Conflict,
-            "purge of a script trial is not implemented yet (DFM-82)",
         ));
     }
     Ok(t)
@@ -505,11 +1044,40 @@ pub fn run(ctx: &Ctx, args: &Args, out: &mut dyn Write) -> Result<(), Refusal> {
         let other_paths: Vec<(String, String)> = others
             .iter()
             .flat_map(|o| {
+                let created = o
+                    .script
+                    .iter()
+                    .flat_map(|s| s.window.iter().flatten())
+                    .filter(|e| e.change == "created")
+                    .map(|e| e.path.clone());
                 o.baseline
                     .paths
                     .iter()
                     .chain(&o.baseline.data)
-                    .map(|b| (o.trial_id.clone(), b.path.clone()))
+                    .map(|b| b.path.clone())
+                    .chain(created)
+                    .map(|p| (o.trial_id.clone(), p))
+            })
+            .collect();
+        // What another active script trial changed is never removed: the paths its window
+        // names (`true`: they match in both directions), or, for a run that did not finish
+        // (what it touched is unknown), every path in its `before`. A truncated window may
+        // omit a change, so its `before` counts too.
+        let other_seen: Vec<Seen> = others
+            .iter()
+            .flat_map(|o| {
+                let truncated = o.unknown.iter().any(|u| u == window::WINDOW_TRUNCATED);
+                o.script.iter().flat_map(move |s| {
+                    let window = s.window.iter().flatten().map(|e| (&e.path, true));
+                    let before = (s.window.is_none() || truncated)
+                        .then(|| s.before.iter().map(|b| (&b.path, false)))
+                        .into_iter()
+                        .flatten();
+                    let paths: Vec<(&String, bool)> = window.chain(before).collect();
+                    paths
+                        .into_iter()
+                        .map(move |(p, w)| (o.trial_id.clone(), p.clone(), w))
+                })
             })
             .collect();
         let used_by = |adapter: &str, name: &str| {
@@ -565,20 +1133,129 @@ pub fn run(ctx: &Ctx, args: &Args, out: &mut dyn Write) -> Result<(), Refusal> {
             .iter()
             .flat_map(|r| r.owned_outputs.iter().map(|o| o.path.clone()))
             .collect();
-        let paths = t
+        let mut paths: Vec<PathItem> = t
             .baseline
             .paths
             .iter()
             .chain(&t.baseline.data)
-            .map(|b| path_item(b, &owned, &other_paths, &sys, &layout.home))
+            .map(|b| {
+                path_item(
+                    b,
+                    &owned,
+                    &other_paths,
+                    &other_seen,
+                    &sys,
+                    &layout.home,
+                    None,
+                )
+            })
             .collect();
+        let truncated = t.unknown.iter().any(|u| u == window::WINDOW_TRUNCATED);
+        let (mut retained, mut vouched) = (Vec::new(), Vec::new());
+        if let Some(s) = &t.script {
+            // A run that did not finish has no window: what was created since `before` is. The
+            // live diff's link targets are today's, so no target counts as recorded.
+            let live: Vec<WindowEntry>;
+            let entries = match &s.window {
+                Some(w) => w,
+                None => {
+                    let watch = window::watch_set(&layout.home, &s.env);
+                    live = window::diff(&s.before, &window::observe(&watch)?)
+                        .into_iter()
+                        .map(|e| WindowEntry { target: None, ..e })
+                        .collect();
+                    &live
+                }
+            };
+            // The trees the trial's sandbox protected that `check_claim` does not cover.
+            let (root, _) = crate::canonical_root(&binding, None)?;
+            let protected = protected_trees(
+                crate::sync_cmd::guarded_checkouts(&root)?,
+                std::env::current_exe().ok(),
+            );
+            let skip: Vec<&str> = paths.iter().map(|p| p.path.as_str()).collect();
+            let (items, r, v) = script_items(
+                s,
+                entries,
+                truncated,
+                &skip,
+                &protected,
+                &owned,
+                &other_paths,
+                &other_seen,
+                store,
+                &sys,
+                &layout.home,
+            );
+            retained = r;
+            vouched = v;
+            paths.extend(items);
+        }
+        // Another script trial whose run did not finish, or whose window was cut, may have
+        // created any path again after its `before`, so no candidate is removed: neither a
+        // window candidate nor a baseline path, whatever kind of trial this one is.
+        let incomplete = others.iter().find(|o| {
+            o.script.as_ref().is_some_and(|s| {
+                s.window.is_none() || o.unknown.iter().any(|u| u == window::WINDOW_TRUNCATED)
+            })
+        });
+        if let Some(o) = incomplete {
+            paths.retain(|i| {
+                if i.step != Step::Do {
+                    return true;
+                }
+                let line = format!(
+                    "{} (script trial {} is incomplete; what it changed is not recorded)",
+                    visible(&i.path),
+                    o.trial_id
+                );
+                retained.push((i.path.clone(), line));
+                false
+            });
+        }
+        // A retained path is never removed, whichever list named it: a baseline item for a
+        // path a window rule retains (a LaunchAgents plist given as `--config`) goes.
+        paths
+            .retain(|i| i.step != Step::Do || !retained.iter().any(|(r, _)| same_path(r, &i.path)));
+        // After the merge, so a kept baseline path also holds a created directory.
+        // Holding a directory withdraws its vouch for a link into it, and keeping that link can
+        // hold another directory, so repeat until neither changes. Each round that continues
+        // keeps one more item, so the loop ends.
+        let mut held = Vec::new();
+        loop {
+            held.extend(hold_dirs(&mut paths, &retained));
+            if !unvouch(&mut paths, &vouched) {
+                break;
+            }
+        }
+        // A cut window may omit what any directory holds, a baseline one included, and a
+        // directory goes as a tree: none is removed. That withdraws each one's vouch for a
+        // link; no directory is left for a kept link to hold, so one `unvouch` is enough.
+        if truncated {
+            paths.retain(|i| {
+                let dir = matches!((&i.now, &i.step), (Now::Dir(..), Step::Do));
+                if dir {
+                    held.push(format!(
+                        "{} (the window was truncated; its contents were not all recorded)",
+                        visible(&i.path)
+                    ));
+                }
+                !dir
+            });
+            unvouch(&mut paths, &vouched);
+        }
+        let mut retained: Vec<String> = retained.into_iter().map(|(_, l)| l).collect();
+        retained.extend(held);
         let d = Decision {
             trial_id: t.trial_id.clone(),
             tool: t.tool.clone(),
             package,
             deps,
             paths,
+            retained,
             unknown: t.unknown.clone(),
+            script: t.script.as_ref().map(|s| s.url.clone()),
+            interrupted: t.script.as_ref().is_some_and(|s| s.window.is_none()),
             binary: binary.clone(),
             stamp: stamp.clone(),
         };
@@ -777,7 +1454,7 @@ pub fn run(ctx: &Ctx, args: &Args, out: &mut dyn Write) -> Result<(), Refusal> {
                 expected_sha256: None,
             }];
             let failed = act("remove", "fs", &p.path, target, false, &|| {
-                remove_path(&store, &sys, &layout.home, &p.path, &fail)
+                remove_path(&store, &sys, &layout.home, &p.path, &p.now, &fail)
             })?;
             if failed.is_none() {
                 removed.push(&p.path);
@@ -866,4 +1543,177 @@ pub fn run(ctx: &Ctx, args: &Args, out: &mut dyn Write) -> Result<(), Refusal> {
     )
     .map_err(w)?;
     outcome
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn protected_trees_resolve_a_checkout_reached_through_a_link() {
+        let base = std::env::temp_dir().join(format!("dfm-purge-protected-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(base.join("real/nested")).unwrap();
+        std::os::unix::fs::symlink(base.join("real"), base.join("via")).unwrap();
+        let missing = base.join("gone");
+        let trees = protected_trees(
+            vec![base.join("via/nested"), missing.clone()],
+            Some(base.join("via/nested")),
+        );
+        let real = fs::canonicalize(base.join("real")).unwrap();
+        assert_eq!(trees, [real.join("nested"), missing, real]);
+        // A candidate below the checkout, seen through its real parent, overlaps it.
+        let candidate = real_parent(&base.join("via/nested/x"));
+        assert!(overlaps(
+            &trees[0].to_string_lossy(),
+            &candidate.to_string_lossy()
+        ));
+        fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn renamed_from_matches_a_removed_path_that_is_the_same_file() {
+        let base = std::env::temp_dir().join(format!("dfm-purge-samefile-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+        // Two hard links to one inode stand in for a case- or normalization-only rename.
+        let (old, new, other) = (base.join("old"), base.join("new"), base.join("other"));
+        fs::write(&old, "x").unwrap();
+        fs::hard_link(&old, &new).unwrap();
+        fs::write(&other, "y").unwrap();
+        let (old_s, other_s, gone_s) = (
+            old.to_str().unwrap(),
+            other.to_str().unwrap(),
+            base.join("gone").to_str().unwrap().to_owned(),
+        );
+        assert_eq!(renamed_from(&new, &[other_s, old_s]), Some(old_s));
+        // A different file, a missing removed path and a missing created path do not match.
+        assert_eq!(renamed_from(&new, &[other_s, &gone_s]), None);
+        assert_eq!(renamed_from(&base.join("none"), &[old_s]), None);
+        fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn an_entry_of_kind_other_or_with_a_replacement_character_is_inexact() {
+        let e = |path: &str, kind: &str| WindowEntry {
+            path: path.into(),
+            change: "created".into(),
+            kind: kind.into(),
+            sha256: None,
+            target: None,
+            before: None,
+        };
+        assert!(inexact(&e("/h/bin/x", "other")));
+        assert!(inexact(&e("/h/bin/x\u{FFFD}y", "file")));
+        assert!(!inexact(&e("/h/bin/x", "file")));
+        assert!(!inexact(&e("/h/bin/caf\u{e9}", "dir")));
+    }
+
+    #[test]
+    fn hold_dirs_holds_a_directory_a_kept_link_points_into() {
+        let base = std::env::temp_dir().join(format!("dfm-purge-hold-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(base.join("bin")).unwrap();
+        let (dir, other, link) = (base.join("cfg"), base.join("other"), base.join("bin/x"));
+        // A relative target, resolved against the link's directory.
+        std::os::unix::fs::symlink("../cfg/./v/x", &link).unwrap();
+        let s = |p: &Path| p.to_string_lossy().into_owned();
+        let item = |p: &Path, now: Now, step: Step| PathItem {
+            path: s(p),
+            now,
+            step,
+        };
+        let tree = || Now::Dir(0, 0, String::new());
+        let mut items = vec![
+            item(&dir, tree(), Step::Do),
+            item(&other, tree(), Step::Do),
+            item(
+                &link,
+                Now::Link("../cfg/./v/x".into()),
+                Step::Keep("repointed".into()),
+            ),
+        ];
+        let held = hold_dirs(&mut items, &[]);
+        assert_eq!(
+            held,
+            [format!(
+                "{} (the kept link {} points into it)",
+                s(&dir),
+                s(&link)
+            )]
+        );
+        let left: Vec<&str> = items.iter().map(|i| i.path.as_str()).collect();
+        assert_eq!(left, [s(&other), s(&link)]);
+        // A retained link counts too.
+        let mut items = vec![item(&dir, tree(), Step::Do)];
+        assert_eq!(hold_dirs(&mut items, &[(s(&link), String::new())]).len(), 1);
+        assert!(items.is_empty());
+        fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn hold_dirs_holds_a_directory_a_kept_link_reaches_through_an_alias() {
+        let base = std::env::temp_dir().join(format!("dfm-purge-alias-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(base.join("cfg/boat")).unwrap();
+        fs::create_dir_all(base.join("bin")).unwrap();
+        std::os::unix::fs::symlink(base.join("cfg"), base.join("alias")).unwrap();
+        let (dir, link) = (base.join("cfg/boat"), base.join("bin/x"));
+        std::os::unix::fs::symlink("../alias/boat/bin/x", &link).unwrap();
+        let s = |p: &Path| p.to_string_lossy().into_owned();
+        let mut items = vec![
+            PathItem {
+                path: s(&dir),
+                now: Now::Dir(0, 0, String::new()),
+                step: Step::Do,
+            },
+            PathItem {
+                path: s(&link),
+                now: Now::Link("../alias/boat/bin/x".into()),
+                step: Step::Keep("repointed".into()),
+            },
+        ];
+        assert_eq!(hold_dirs(&mut items, &[]).len(), 1);
+        assert_eq!(items.len(), 1);
+        fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn lexical_resolves_dot_and_dot_dot_by_text() {
+        assert_eq!(
+            lexical(Path::new("/h/.local/bin/../share/./c/v")),
+            Path::new("/h/.local/share/c/v")
+        );
+    }
+
+    #[test]
+    fn link_keep_allows_the_recorded_target_and_targets_inside_a_created_dir() {
+        let link = Path::new("/h/.local/bin/c");
+        let dirs = [Path::new("/h/.local/share/c")];
+        // The recorded target, even outside every created directory.
+        assert_eq!(
+            link_keep(link, Some("/usr/bin/true"), "/usr/bin/true", &dirs),
+            None
+        );
+        // A relative target into the created directory, and the directory itself.
+        assert_eq!(link_keep(link, Some("/x"), "../share/c/v2/c", &dirs), None);
+        assert_eq!(link_keep(link, None, "/h/.local/share/c", &dirs), None);
+        // The created directory in another case, as a case-insensitive volume resolves it.
+        assert_eq!(link_keep(link, None, "/h/.local/Share/C/v2", &dirs), None);
+        // `..` that leaves the created directory.
+        assert_eq!(
+            link_keep(link, Some("/x"), "../share/c/../other", &dirs).as_deref(),
+            Some("repointed since the trial")
+        );
+        // A name that only starts like the directory is not inside it.
+        assert_eq!(
+            link_keep(link, None, "/h/.local/share/cc/v", &dirs).as_deref(),
+            Some("no target recorded")
+        );
+        // An absolute target elsewhere.
+        assert_eq!(
+            link_keep(link, Some("/x"), "/usr/bin/true", &dirs).as_deref(),
+            Some("repointed since the trial")
+        );
+    }
 }

@@ -1100,7 +1100,7 @@ fn a_dev_tty_read_fails_without_tty() {
 }
 
 #[test]
-fn doctor_shows_the_script_trial_and_purge_refuses_it() {
+fn doctor_shows_the_script_trial() {
     if no_sandbox() {
         return;
     }
@@ -1125,10 +1125,6 @@ fn doctor_shows_the_script_trial_and_purge_refuses_it() {
             .contains(&format!("boat installed by the trial through {URL}")),
         "{row:#}"
     );
-    let o = fx.run(&["purge", "trial-boat", "--preview"]);
-    assert_eq!(code(&o), 3, "{}\n{}", stderr(&o), text(&o.stdout));
-    assert!(stderr(&o).contains("E_CONFLICT"), "{}", stderr(&o));
-    assert!(stderr(&o).contains("DFM-82"), "{}", stderr(&o));
 }
 
 /// Runs `body` as an approved script trial and returns `~/result`. The trial must succeed: the
@@ -2312,4 +2308,883 @@ fn a_binary_over_the_hash_cap_is_present_with_no_digest() {
         detail(r).contains("PATH holds 2 different files named boat"),
         "{r:#}"
     );
+}
+
+// ---- purge of a script trial (DFM-82) ----
+
+/// Previews the purge of `trial-boat`, then runs it with the preview's digest. Returns both.
+fn purged(fx: &Fx) -> (Output, Output) {
+    let preview = fx.run(&["purge", "trial-boat", "--preview"]);
+    assert_eq!(
+        code(&preview),
+        0,
+        "{}\n{}",
+        stderr(&preview),
+        text(&preview.stdout)
+    );
+    assert_removed_never_kept(&text(&preview.stdout));
+    let run = fx.run(&["purge", "trial-boat", "--yes-plan", &digest_of(&preview)]);
+    (preview, run)
+}
+
+/// Fails when a purge preview names one path (case fold) both as `action: remove` and as
+/// `keep:`, `kept:` or `retained:`.
+fn assert_removed_never_kept(shown: &str) {
+    let path = |l: &str, p: &str| {
+        l.strip_prefix(p)
+            .and_then(|r| r.split_whitespace().next())
+            .map(str::to_lowercase)
+    };
+    let removed: Vec<String> = shown
+        .lines()
+        .filter_map(|l| path(l, "action: remove "))
+        .collect();
+    for l in shown.lines() {
+        let kept = path(l, "keep: remove ")
+            .or_else(|| path(l, "kept: "))
+            .or_else(|| path(l, "retained: "));
+        if let Some(k) = kept {
+            assert!(!removed.contains(&k), "{k} is removed and kept\n{shown}");
+        }
+    }
+}
+
+fn gone(p: &Path) -> bool {
+    fs::symlink_metadata(p).is_err()
+}
+
+#[test]
+fn purge_removes_a_created_directory_bin_file_and_link_and_retains_the_rest() {
+    if no_sandbox() {
+        return;
+    }
+    let fx = Fx::new();
+    fx.bind_with_links();
+    fs::create_dir_all(fx.h(".local/bin")).unwrap();
+    fs::create_dir_all(fx.h("Library/LaunchAgents")).unwrap();
+    fs::write(fx.h(".profile"), "export A=1\n").unwrap();
+    fs::write(fx.h("real.txt"), "keep me\n").unwrap();
+    let before = sha(b"export A=1\n");
+    sandboxed(
+        &fx,
+        "set -e\nmkdir -p ~/.boat/sub\necho x > ~/.boat/sub/f\n\
+         printf '#!/bin/sh\\n' > ~/.local/bin/boat\nchmod 755 ~/.local/bin/boat\n\
+         ln -s ~/.local/bin/boat ~/.local/bin/b\nln -s ~/real.txt ~/.local/bin/r\n\
+         echo 'export B=1' >> ~/.profile\n\
+         echo plist > ~/Library/LaunchAgents/dev.boat.plist\n",
+    );
+    // As `shrink_window` leaves it: the modified entry without its own `before`. The old hash
+    // then comes from the record's `before` observation.
+    let rec_path = fx.state().join("trials/trial-boat.json");
+    let mut rec = fx.record("trial-boat");
+    let profile_path = fx.h(".profile").display().to_string();
+    for e in rec["script"]["window"].as_array_mut().unwrap() {
+        if e["path"] == profile_path.as_str() {
+            e["before"] = serde_json::Value::Null;
+        }
+    }
+    fs::write(&rec_path, serde_json::to_vec(&rec).unwrap()).unwrap();
+    let (preview, run) = purged(&fx);
+    let shown = text(&preview.stdout);
+    let profile = fx.h(".profile").display().to_string();
+    let plist = fx.h("Library/LaunchAgents/dev.boat.plist");
+    for want in [
+        format!(
+            "action: remove {} directory (2 entries",
+            fx.h(".boat").display()
+        ),
+        format!(
+            "action: remove {} file sha256:",
+            fx.h(".local/bin/boat").display()
+        ),
+        format!(
+            "action: remove {} link -> {}",
+            fx.h(".local/bin/b").display(),
+            fx.h(".local/bin/boat").display()
+        ),
+        format!(
+            "retained: {profile} modified during the trial (sha256 {before} -> {}); edit {profile} by hand",
+            sha(b"export A=1\nexport B=1\n")
+        ),
+        format!(
+            "retained: {} created during the trial; unload it with launchctl bootout gui/",
+            plist.display()
+        ),
+    ] {
+        assert!(shown.contains(&want), "{want}\n{shown}");
+    }
+    let out = text(&run.stdout);
+    assert_eq!(code(&run), 0, "{}\n{out}", stderr(&run));
+    for p in [".boat", ".local/bin/boat", ".local/bin/b", ".local/bin/r"] {
+        assert!(gone(&fx.h(p)), "{p}\n{out}");
+    }
+    assert!(fx.h(".local/bin").is_dir());
+    // The link was unlinked, never followed: the file it named is intact.
+    assert_eq!(fs::read_to_string(fx.h("real.txt")).unwrap(), "keep me\n");
+    assert_eq!(
+        fs::read_to_string(fx.h(".profile")).unwrap(),
+        "export A=1\nexport B=1\n"
+    );
+    assert!(plist.is_file());
+    assert!(
+        out.contains("trial: state/trials/trial-boat.json removed"),
+        "{out}"
+    );
+    assert!(!fx.state().join("trials/trial-boat.json").exists());
+    let removes = fx
+        .journal()
+        .iter()
+        .filter(|e| e["op"] == "remove" && e["phase"] == "done")
+        .count();
+    assert_eq!(removes, 4, "{out}");
+    assert!(fx.receipts().iter().any(|r| r["command"] == "purge"));
+}
+
+#[test]
+fn a_link_repointed_into_a_created_directory_is_removed_and_one_pointed_elsewhere_is_kept() {
+    if no_sandbox() {
+        return;
+    }
+    let fx = Fx::new();
+    fx.bind_with_links();
+    fs::create_dir_all(fx.h(".local/bin")).unwrap();
+    fs::create_dir_all(fx.h(".local/share")).unwrap();
+    sandboxed(
+        &fx,
+        "set -e\nv=~/.local/share/claude/versions\nmkdir -p $v/1\nprintf '#!/bin/sh\\n' > $v/1/claude\n\
+         ln -s $v/1/claude ~/.local/bin/claude\nln -s $v/1/claude ~/.local/bin/other\n",
+    );
+    // An update after the trial: a new version inside the created directory, through a
+    // relative link, and the owner's own repointing of the other link.
+    fs::create_dir_all(fx.h(".local/share/claude/versions/2")).unwrap();
+    fs::remove_file(fx.h(".local/bin/claude")).unwrap();
+    std::os::unix::fs::symlink(
+        "../share/claude/versions/2/claude",
+        fx.h(".local/bin/claude"),
+    )
+    .unwrap();
+    fs::remove_file(fx.h(".local/bin/other")).unwrap();
+    std::os::unix::fs::symlink("/usr/bin/true", fx.h(".local/bin/other")).unwrap();
+    let (preview, run) = purged(&fx);
+    let shown = text(&preview.stdout);
+    let kept = format!(
+        "kept: {} -> /usr/bin/true (repointed since the trial)",
+        fx.h(".local/bin/other").display()
+    );
+    assert!(shown.contains(&kept), "{shown}");
+    let out = text(&run.stdout);
+    assert_eq!(code(&run), 0, "{}\n{out}", stderr(&run));
+    assert!(gone(&fx.h(".local/bin/claude")), "{out}");
+    assert!(gone(&fx.h(".local/share/claude")), "{out}");
+    assert_eq!(
+        fs::read_link(fx.h(".local/bin/other")).unwrap(),
+        Path::new("/usr/bin/true")
+    );
+    assert!(!fx.state().join("trials/trial-boat.json").exists());
+}
+
+#[test]
+fn a_created_directory_of_a_truncated_window_is_retained() {
+    if no_sandbox() {
+        return;
+    }
+    let fx = Fx::new();
+    fx.bind_with_links();
+    fs::create_dir_all(fx.h(".local/share")).unwrap();
+    sandboxed(
+        &fx,
+        "set -e\nmkdir ~/.local/share/c\nln -s /usr/bin/false ~/.local/share/c/l\n",
+    );
+    // As `shrink_window` leaves it: the link inside the directory dropped, the token added.
+    let (dir, link) = (fx.h(".local/share/c"), fx.h(".local/share/c/l"));
+    let p = fx.state().join("trials/trial-boat.json");
+    let mut rec = fx.record("trial-boat");
+    window_entry(&rec, &dir);
+    rec["script"]["window"]
+        .as_array_mut()
+        .unwrap()
+        .retain(|e| e["path"] != link.display().to_string().as_str());
+    rec["unknown"]
+        .as_array_mut()
+        .unwrap()
+        .push("window-truncated".into());
+    fs::write(&p, serde_json::to_vec(&rec).unwrap()).unwrap();
+    // The owner repoints the link the window no longer lists.
+    fs::remove_file(&link).unwrap();
+    std::os::unix::fs::symlink("/usr/bin/true", &link).unwrap();
+    let (preview, run) = purged(&fx);
+    let shown = text(&preview.stdout);
+    let want = format!(
+        "retained: {} (the window was truncated; its contents were not all recorded)",
+        dir.display()
+    );
+    assert!(shown.contains(&want), "{want}\n{shown}");
+    assert!(
+        !shown
+            .lines()
+            .any(|l| l.contains("action: remove") && l.contains(&dir.display().to_string())),
+        "{shown}"
+    );
+    assert_eq!(code(&run), 0, "{}\n{}", stderr(&run), text(&run.stdout));
+    assert_eq!(fs::read_link(&link).unwrap(), Path::new("/usr/bin/true"));
+}
+
+#[test]
+fn a_baseline_directory_of_a_truncated_window_is_retained() {
+    if no_sandbox() {
+        return;
+    }
+    let fx = Fx::new();
+    fx.bind_with_links();
+    let bin = fx.h("bin");
+    let bs = bin.display().to_string();
+    fx.script_trial(
+        "#!/bin/sh\nset -e\nmkdir ~/bin\necho x > ~/bin/mine\n",
+        &["--config", &bs],
+    );
+    // As `shrink_window` may leave it: no window entry under `~/bin`, the token added. Only the
+    // baseline item names the directory.
+    let p = fx.state().join("trials/trial-boat.json");
+    let mut rec = fx.record("trial-boat");
+    rec["script"]["window"]
+        .as_array_mut()
+        .unwrap()
+        .retain(|e| !e["path"].as_str().unwrap().starts_with(bs.as_str()));
+    rec["unknown"]
+        .as_array_mut()
+        .unwrap()
+        .push("window-truncated".into());
+    fs::write(&p, serde_json::to_vec(&rec).unwrap()).unwrap();
+    let (preview, run) = purged(&fx);
+    let shown = text(&preview.stdout);
+    let want =
+        format!("retained: {bs} (the window was truncated; its contents were not all recorded)");
+    assert!(shown.contains(&want), "{want}\n{shown}");
+    assert!(!shown.contains("action: remove"), "{shown}");
+    assert_eq!(code(&run), 0, "{}\n{}", stderr(&run), text(&run.stdout));
+    assert_eq!(fs::read_to_string(bin.join("mine")).unwrap(), "x\n");
+}
+
+#[test]
+fn a_link_into_a_created_directory_before_could_not_read_is_kept() {
+    if no_sandbox() {
+        return;
+    }
+    let fx = Fx::new();
+    fx.bind_with_links();
+    fs::create_dir_all(fx.h(".local/bin")).unwrap();
+    fs::create_dir_all(fx.h(".local/share")).unwrap();
+    sandboxed(
+        &fx,
+        "set -e\nmkdir ~/.local/share/c\nln -s /usr/bin/false ~/.local/bin/l\n",
+    );
+    // `~/.local/share` could not be listed before the run, so `c` may have been there all
+    // along; the owner points the link into it.
+    let (share, dir, link) = (
+        fx.h(".local/share"),
+        fx.h(".local/share/c"),
+        fx.h(".local/bin/l"),
+    );
+    let p = fx.state().join("trials/trial-boat.json");
+    let mut rec = fx.record("trial-boat");
+    window_entry(&rec, &dir);
+    let before = rec["script"]["before"].as_array_mut().unwrap();
+    before.retain(|o| o["path"] != share.display().to_string().as_str());
+    before.push(
+        serde_json::json!({"path": share.display().to_string(), "kind": "unreadable",
+        "sha256": null, "target": null}),
+    );
+    fs::write(&p, serde_json::to_vec(&rec).unwrap()).unwrap();
+    let into = dir.join("v");
+    fs::remove_file(&link).unwrap();
+    std::os::unix::fs::symlink(&into, &link).unwrap();
+    let (preview, run) = purged(&fx);
+    let shown = text(&preview.stdout);
+    let want = format!(
+        "kept: {} -> {} (repointed since the trial)",
+        link.display(),
+        into.display()
+    );
+    assert!(shown.contains(&want), "{want}\n{shown}");
+    assert!(!shown.contains("action: remove"), "{shown}");
+    assert_eq!(code(&run), 0, "{}\n{}", stderr(&run), text(&run.stdout));
+    assert_eq!(fs::read_link(&link).unwrap(), into);
+    assert!(dir.is_dir());
+}
+
+#[test]
+fn a_link_into_a_held_created_directory_is_kept() {
+    if no_sandbox() {
+        return;
+    }
+    let fx = Fx::new();
+    fx.bind_with_links();
+    fs::create_dir_all(fx.h(".local/bin")).unwrap();
+    // `~/.config/fish` appears in a watched listing and `conf.d` is a watched directory, so the
+    // window lists the link inside and `fish` is a created directory candidate.
+    sandboxed(
+        &fx,
+        "set -e\nmkdir -p ~/.config/fish/conf.d\nln -s /usr/bin/false ~/.config/fish/conf.d/l\n\
+         ln -s /usr/bin/false ~/.local/bin/m\n",
+    );
+    // The owner repoints the link inside `fish`, which holds `fish`, and points `m` into it.
+    let (dir, inner, link) = (
+        fx.h(".config/fish"),
+        fx.h(".config/fish/conf.d/l"),
+        fx.h(".local/bin/m"),
+    );
+    fs::remove_file(&inner).unwrap();
+    std::os::unix::fs::symlink("/usr/bin/true", &inner).unwrap();
+    let into = dir.join("v");
+    fs::remove_file(&link).unwrap();
+    std::os::unix::fs::symlink(&into, &link).unwrap();
+    let (preview, run) = purged(&fx);
+    let shown = text(&preview.stdout);
+    for want in [
+        format!(
+            "retained: {} (holds {}, which is kept)",
+            dir.display(),
+            inner.display()
+        ),
+        format!(
+            "kept: {} -> {} (points into {}, which is kept)",
+            link.display(),
+            into.display(),
+            dir.display()
+        ),
+    ] {
+        assert!(shown.contains(&want), "{want}\n{shown}");
+    }
+    assert!(!shown.contains("action: remove"), "{shown}");
+    assert_eq!(code(&run), 0, "{}\n{}", stderr(&run), text(&run.stdout));
+    assert_eq!(fs::read_link(&link).unwrap(), into);
+    assert_eq!(fs::read_link(&inner).unwrap(), Path::new("/usr/bin/true"));
+}
+
+#[test]
+fn an_interrupted_record_is_purged_from_its_before_observation() {
+    if no_sandbox() {
+        return;
+    }
+    let fx = Fx::new();
+    fx.bind_with_links();
+    fs::create_dir_all(fx.h(".local/bin")).unwrap();
+    fs::write(fx.h(".keep"), "mine\n").unwrap();
+    sandboxed(&fx, "set -e\nmkdir ~/.boat\n");
+    // The shape a killed run leaves: `before` and no exit, window or binary.
+    let p = fx.state().join("trials/trial-boat.json");
+    let mut rec = fx.record("trial-boat");
+    for k in ["exit", "window", "binary"] {
+        rec["script"][k] = serde_json::Value::Null;
+    }
+    fs::write(&p, serde_json::to_vec(&rec).unwrap()).unwrap();
+    // Created after the run ended: still a candidate, because the live state is compared.
+    fs::write(fx.h(".later"), "x").unwrap();
+    // A link to a path outside every created directory: the live target is not a recorded one.
+    std::os::unix::fs::symlink(fx.h(".keep"), fx.h(".local/bin/x")).unwrap();
+    let (preview, run) = purged(&fx);
+    let shown = text(&preview.stdout);
+    let note = shown
+        .find("note: the script run of this trial did not finish")
+        .unwrap_or_else(|| panic!("{shown}"));
+    assert!(note < shown.find("plan digest:").unwrap(), "{shown}");
+    let kept = format!(
+        "kept: {} -> {} (no target recorded)",
+        fx.h(".local/bin/x").display(),
+        fx.h(".keep").display()
+    );
+    assert!(shown.contains(&kept), "{shown}");
+    for want in [".boat", ".later"] {
+        let l = format!("action: remove {}", fx.h(want).display());
+        assert!(shown.contains(&l), "{l}\n{shown}");
+    }
+    let out = text(&run.stdout);
+    assert_eq!(code(&run), 0, "{}\n{out}", stderr(&run));
+    assert!(gone(&fx.h(".boat")) && gone(&fx.h(".later")), "{out}");
+    assert_eq!(fs::read_to_string(fx.h(".keep")).unwrap(), "mine\n");
+    assert!(fs::symlink_metadata(fx.h(".local/bin/x")).is_ok());
+    assert!(!p.exists());
+}
+
+#[test]
+fn a_purge_without_approval_or_with_a_stale_digest_changes_nothing() {
+    if no_sandbox() {
+        return;
+    }
+    let fx = Fx::new();
+    fx.bind_with_links();
+    fs::create_dir_all(fx.h(".local/bin")).unwrap();
+    sandboxed(
+        &fx,
+        "set -e\nmkdir ~/.boat\necho x > ~/.boat/f\nln -s ~/.boat/f ~/.local/bin/l\n",
+    );
+    let o = fx.run(&["purge", "trial-boat"]);
+    assert_eq!(code(&o), 3, "{}\n{}", stderr(&o), text(&o.stdout));
+    assert!(stderr(&o).contains("E_APPROVAL_REQUIRED"), "{}", stderr(&o));
+    // The digest covers the live tree, so content added after the preview is stale.
+    let preview = fx.run(&["purge", "trial-boat", "--preview"]);
+    fs::write(fx.h(".boat/g"), "y").unwrap();
+    let o = fx.run(&["purge", "trial-boat", "--yes-plan", &digest_of(&preview)]);
+    assert_eq!(code(&o), 3, "{}\n{}", stderr(&o), text(&o.stdout));
+    assert!(stderr(&o).contains("E_PLAN_STALE"), "{}", stderr(&o));
+    assert!(fx.h(".boat/f").is_file() && fx.h(".boat/g").is_file());
+    // The digest covers a link's target text, so a link repointed after the preview is stale.
+    let preview = fx.run(&["purge", "trial-boat", "--preview"]);
+    fs::remove_file(fx.h(".local/bin/l")).unwrap();
+    std::os::unix::fs::symlink(fx.h(".boat/g"), fx.h(".local/bin/l")).unwrap();
+    let o = fx.run(&["purge", "trial-boat", "--yes-plan", &digest_of(&preview)]);
+    assert_eq!(code(&o), 3, "{}\n{}", stderr(&o), text(&o.stdout));
+    assert!(stderr(&o).contains("E_PLAN_STALE"), "{}", stderr(&o));
+    assert!(fs::symlink_metadata(fx.h(".local/bin/l")).is_ok());
+    assert!(fx.state().join("trials/trial-boat.json").exists());
+}
+
+#[test]
+fn a_file_changed_after_the_locked_decision_is_not_removed() {
+    if no_sandbox() {
+        return;
+    }
+    let fx = Fx::new();
+    fx.bind_with_links();
+    sandboxed(&fx, "set -e\necho x > ~/.boat-rc\n");
+    let preview = fx.run(&["purge", "trial-boat", "--preview"]);
+    assert_eq!(code(&preview), 0, "{}", stderr(&preview));
+    let gate = fx.fake.path().join("go");
+    let child = fx
+        .command(&["purge", "trial-boat", "--yes-plan", &digest_of(&preview)])
+        .env(
+            "DFM_FAILPOINT",
+            format!("purge-remove:wait-{}", gate.display()),
+        )
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let reached = gate.with_extension("reached");
+    let started = Instant::now();
+    while !reached.exists() {
+        assert!(started.elapsed() < Duration::from_secs(30), "not reached");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    fs::write(fx.h(".boat-rc"), "edited\n").unwrap();
+    fs::write(&gate, "").unwrap();
+    let o = child.wait_with_output().unwrap();
+    assert_ne!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+    assert!(stderr(&o).contains("E_PLAN_STALE"), "{}", stderr(&o));
+    assert_eq!(fs::read_to_string(fx.h(".boat-rc")).unwrap(), "edited\n");
+}
+
+#[test]
+fn a_tampered_window_entry_for_a_pre_existing_or_unwatched_path_is_kept() {
+    if no_sandbox() {
+        return;
+    }
+    let fx = Fx::new();
+    fx.bind_with_links();
+    fs::create_dir_all(fx.h("Documents/inner")).unwrap();
+    fs::write(fx.h("Documents/f"), "mine\n").unwrap();
+    sandboxed(&fx, "exit 0\n");
+    // `~/Documents` is in the HOME listing of `before`; `~/Documents/inner` is in no watched
+    // place. A record that marks either as created is not believed.
+    let p = fx.state().join("trials/trial-boat.json");
+    let mut rec = fx.record("trial-boat");
+    let created = |rel: &str| {
+        serde_json::json!({"path": fx.h(rel).display().to_string(), "change": "created",
+            "kind": "dir", "sha256": null, "target": null, "before": null})
+    };
+    rec["script"]["window"] = serde_json::json!([created("Documents"), created("Documents/inner")]);
+    fs::write(&p, serde_json::to_vec(&rec).unwrap()).unwrap();
+    let (preview, run) = purged(&fx);
+    let shown = text(&preview.stdout);
+    for want in [
+        format!(
+            "retained: {} is in the observation before the run",
+            fx.h("Documents").display()
+        ),
+        format!(
+            "retained: {} is not in a watched place",
+            fx.h("Documents/inner").display()
+        ),
+    ] {
+        assert!(shown.contains(&want), "{want}\n{shown}");
+    }
+    assert!(!shown.contains("action: remove"), "{shown}");
+    assert_eq!(code(&run), 0, "{}\n{}", stderr(&run), text(&run.stdout));
+    assert!(fx.h("Documents/inner").is_dir());
+    assert_eq!(fs::read_to_string(fx.h("Documents/f")).unwrap(), "mine\n");
+}
+
+#[test]
+fn a_created_directory_that_holds_a_kept_link_is_retained_and_its_other_entries_removed() {
+    if no_sandbox() {
+        return;
+    }
+    let fx = Fx::new();
+    fx.bind_with_links();
+    sandboxed(
+        &fx,
+        "set -e\nmkdir ~/bin\nprintf '#!/bin/sh\\n' > ~/bin/tool\nln -s ~/bin/tool ~/bin/x\n",
+    );
+    // The owner repoints the link after the trial, so purge keeps it, and so its directory.
+    fs::remove_file(fx.h("bin/x")).unwrap();
+    std::os::unix::fs::symlink("/usr/bin/true", fx.h("bin/x")).unwrap();
+    let (preview, run) = purged(&fx);
+    let shown = text(&preview.stdout);
+    let (bin, x) = (fx.h("bin"), fx.h("bin/x"));
+    for want in [
+        format!(
+            "kept: {} -> /usr/bin/true (repointed since the trial)",
+            x.display()
+        ),
+        format!(
+            "retained: {} (holds {}, which is kept)",
+            bin.display(),
+            x.display()
+        ),
+        format!("action: remove {} file", fx.h("bin/tool").display()),
+    ] {
+        assert!(shown.contains(&want), "{want}\n{shown}");
+    }
+    assert!(
+        !shown.contains(&format!("action: remove {} directory", bin.display())),
+        "{shown}"
+    );
+    let out = text(&run.stdout);
+    assert_eq!(code(&run), 0, "{}\n{out}", stderr(&run));
+    assert!(gone(&fx.h("bin/tool")), "{out}");
+    assert_eq!(fs::read_link(&x).unwrap(), Path::new("/usr/bin/true"));
+    assert!(!fx.state().join("trials/trial-boat.json").exists());
+}
+
+#[test]
+fn a_created_directory_that_holds_a_kept_baseline_path_is_retained() {
+    if no_sandbox() {
+        return;
+    }
+    let fx = Fx::new();
+    fx.bind_with_links();
+    // `~/bin/x` is a declared path: a baseline item, kept because it is a link.
+    let x = fx.h("bin/x");
+    let xs = x.display().to_string();
+    fx.script_trial(
+        "#!/bin/sh\nset -e\nmkdir ~/bin\nln -s /usr/bin/true ~/bin/x\n",
+        &["--config", &xs],
+    );
+    let (preview, run) = purged(&fx);
+    let shown = text(&preview.stdout);
+    let bin = fx.h("bin");
+    for want in [
+        format!("keep: remove {xs} link"),
+        format!("retained: {} (holds {xs}, which is kept)", bin.display()),
+    ] {
+        assert!(shown.contains(&want), "{want}\n{shown}");
+    }
+    assert!(!shown.contains("action: remove"), "{shown}");
+    assert_eq!(code(&run), 0, "{}\n{}", stderr(&run), text(&run.stdout));
+    assert_eq!(fs::read_link(&x).unwrap(), Path::new("/usr/bin/true"));
+}
+
+#[test]
+fn a_baseline_directory_a_kept_link_points_into_is_retained() {
+    if no_sandbox() {
+        return;
+    }
+    let fx = Fx::new();
+    fx.bind_with_links();
+    fs::create_dir_all(fx.h(".local/bin")).unwrap();
+    // `~/.config/boat` is a declared path, so it is a baseline item and no window candidate:
+    // it cannot vouch for the link.
+    let cfg = fx.h(".config/boat");
+    let cs = cfg.display().to_string();
+    fx.script_trial(
+        "#!/bin/sh\nset -e\nmkdir -p ~/.config/boat\nln -s /usr/bin/true ~/.local/bin/boat\n",
+        &["--config", &cs],
+    );
+    // After the trial the link is repointed into the baseline directory.
+    let link = fx.h(".local/bin/boat");
+    fs::write(cfg.join("boat"), "#!/bin/sh\n").unwrap();
+    fs::remove_file(&link).unwrap();
+    std::os::unix::fs::symlink("../../.config/boat/boat", &link).unwrap();
+    let (preview, run) = purged(&fx);
+    let shown = text(&preview.stdout);
+    let ls = link.display().to_string();
+    for want in [
+        format!("kept: {ls} -> ../../.config/boat/boat (repointed since the trial)"),
+        format!("retained: {cs} (the kept link {ls} points into it)"),
+    ] {
+        assert!(shown.contains(&want), "{want}\n{shown}");
+    }
+    assert!(!shown.contains("action: remove"), "{shown}");
+    assert_eq!(code(&run), 0, "{}\n{}", stderr(&run), text(&run.stdout));
+    assert_eq!(fs::read_to_string(cfg.join("boat")).unwrap(), "#!/bin/sh\n");
+    assert!(fs::metadata(&link).is_ok(), "the link must not dangle");
+}
+
+#[test]
+fn a_baseline_path_created_as_a_file_and_now_a_directory_is_retained() {
+    if no_sandbox() {
+        return;
+    }
+    let fx = Fx::new();
+    fx.bind_with_links();
+    fs::create_dir_all(fx.h(".config")).unwrap();
+    // `~/.config/boat` is both a declared path and a created window entry.
+    let boat = fx.h(".config/boat");
+    let bs = boat.display().to_string();
+    fx.script_trial(
+        "#!/bin/sh\nset -e\necho x > ~/.config/boat\n",
+        &["--config", &bs],
+    );
+    fs::remove_file(&boat).unwrap();
+    fs::create_dir(&boat).unwrap();
+    fs::write(boat.join("mine"), "user data").unwrap();
+    let (preview, run) = purged(&fx);
+    let shown = text(&preview.stdout);
+    let want =
+        format!("retained: {bs} created as a file during the trial and now a dir; not removed");
+    assert!(shown.contains(&want), "{want}\n{shown}");
+    assert!(!shown.contains("action: remove"), "{shown}");
+    assert_eq!(code(&run), 0, "{}\n{}", stderr(&run), text(&run.stdout));
+    assert_eq!(fs::read_to_string(boat.join("mine")).unwrap(), "user data");
+}
+
+#[test]
+fn a_created_entry_in_a_place_before_could_not_read_is_retained() {
+    if no_sandbox() {
+        return;
+    }
+    let fx = Fx::new();
+    fx.bind_with_links();
+    fs::create_dir_all(fx.h(".local/bin")).unwrap();
+    sandboxed(&fx, "set -e\necho x > ~/.local/bin/old\nmkdir ~/.ghost\n");
+    // As `observe` records it when `~/.local/bin` cannot be listed: a marker in `before`, so
+    // `old` (there all along) looks created once the directory is readable. A created marker
+    // is never a candidate either.
+    let p = fx.state().join("trials/trial-boat.json");
+    let mut rec = fx.record("trial-boat");
+    let (bin, old, ghost) = (fx.h(".local/bin"), fx.h(".local/bin/old"), fx.h(".ghost"));
+    let before = rec["script"]["before"].as_array_mut().unwrap();
+    before.retain(|o| o["path"] != bin.display().to_string().as_str());
+    before.push(
+        serde_json::json!({"path": bin.display().to_string(), "kind": "unreadable",
+        "sha256": null, "target": null}),
+    );
+    for e in rec["script"]["window"].as_array_mut().unwrap() {
+        if e["path"] == ghost.display().to_string().as_str() {
+            e["kind"] = "unreadable".into();
+        }
+    }
+    fs::write(&p, serde_json::to_vec(&rec).unwrap()).unwrap();
+    let (preview, run) = purged(&fx);
+    let shown = text(&preview.stdout);
+    for want in [
+        format!(
+            "retained: {} is in {}, which could not be read before the run",
+            old.display(),
+            bin.display()
+        ),
+        format!(
+            "retained: {} could not be read after the run; never removed",
+            ghost.display()
+        ),
+    ] {
+        assert!(shown.contains(&want), "{want}\n{shown}");
+    }
+    assert!(!shown.contains("action: remove"), "{shown}");
+    assert_eq!(code(&run), 0, "{}\n{}", stderr(&run), text(&run.stdout));
+    assert!(old.is_file() && ghost.is_dir());
+}
+
+#[test]
+fn a_file_another_active_trial_changed_is_kept_and_one_it_only_observed_is_not() {
+    if no_sandbox() {
+        return;
+    }
+    let fx = Fx::new();
+    fx.bind_with_links();
+    fs::create_dir_all(fx.h(".local/bin")).unwrap();
+    sandboxed(&fx, "set -e\necho a > ~/.local/bin/shared\n");
+    // A second trial modifies the file the first one created.
+    fx.script("#!/bin/sh\necho b >> ~/.local/bin/shared\n");
+    let o = fx.approved("ship");
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+    let shared = fx.h(".local/bin/shared");
+    let name = shared.display().to_string();
+    let ship = fx.state().join("trials/trial-ship.json");
+    let full = fx.record("trial-ship");
+    assert_eq!(window_entry(&full, &shared)["change"], "modified");
+    let without = |rec: &mut serde_json::Value, key: &str| {
+        rec["script"][key]
+            .as_array_mut()
+            .unwrap()
+            .retain(|e| e["path"] != name.as_str());
+    };
+    // The window entry alone keeps the file. Without it, the trial started after boat and
+    // only observed the file in `before`, which does not block the purge. A run that did not
+    // finish has no window, so what it changed is unknown: no window candidate is removed,
+    // even one absent from its `before` (it may have created the file again).
+    let mut window_only = full.clone();
+    without(&mut window_only, "before");
+    let mut untouched = full.clone();
+    without(&mut untouched, "window");
+    let mut interrupted = full.clone();
+    for k in ["exit", "window", "binary"] {
+        interrupted["script"][k] = serde_json::Value::Null;
+    }
+    let mut interrupted_unseen = interrupted.clone();
+    without(&mut interrupted_unseen, "before");
+    // A truncated window may have dropped the change, so it is incomplete too.
+    let mut truncated = untouched.clone();
+    truncated["unknown"]
+        .as_array_mut()
+        .unwrap()
+        .push("window-truncated".into());
+    // A window path above the file keeps it too: here the trial turned `~/.local/bin` from a
+    // file into a directory (a record edit; the file is the same).
+    let bin = fx.h(".local/bin").display().to_string();
+    let mut above = untouched.clone();
+    let mut e = window_entry(&full, &shared).clone();
+    e["path"] = bin.as_str().into();
+    e["change"] = "kind-changed".into();
+    e["kind"] = "dir".into();
+    e["sha256"] = serde_json::Value::Null;
+    e["before"]["path"] = bin.as_str().into();
+    let w = above["script"]["window"].as_array_mut().unwrap();
+    w.push(e);
+    w.sort_by(|a, b| a["path"].as_str().cmp(&b["path"].as_str()));
+    let incomplete = format!(
+        "retained: {name} (script trial trial-ship is incomplete; what it changed is not recorded)"
+    );
+    for (case, rec, kept) in [
+        ("window", window_only, Some(&name)),
+        ("untouched", untouched, None),
+        // Its `before` holds the file, which keeps it by that rule first (here and when
+        // truncated); without it, the incomplete rule keeps it.
+        ("interrupted", interrupted, Some(&name)),
+        ("interrupted, unseen", interrupted_unseen, Some(&incomplete)),
+        ("truncated", truncated, Some(&name)),
+        ("above", above, Some(&bin)),
+    ] {
+        fs::write(&ship, serde_json::to_vec(&rec).unwrap()).unwrap();
+        let o = fx.run(&["purge", "trial-boat", "--preview"]);
+        let shown = text(&o.stdout);
+        assert_eq!(code(&o), 0, "{case}: {}\n{shown}", stderr(&o));
+        assert_removed_never_kept(&shown);
+        match kept {
+            Some(line) if *line == incomplete => {
+                assert!(shown.contains(line), "{case}: {line}\n{shown}");
+                assert!(!shown.contains("action: remove"), "{case}: {shown}");
+            }
+            Some(p) => {
+                let want = format!("keep: remove {name} file sha256:");
+                assert!(shown.contains(&want), "{case}: {want}\n{shown}");
+                let why = format!("trial trial-ship observed {p}");
+                assert!(shown.contains(&why), "{case}: {why}\n{shown}");
+            }
+            None => {
+                let want = format!("action: remove {name} file sha256:");
+                assert!(shown.contains(&want), "{case}: {want}\n{shown}");
+                assert!(
+                    !shown.contains("trial trial-ship observed"),
+                    "{case}: {shown}"
+                );
+            }
+        }
+    }
+    fs::write(&ship, serde_json::to_vec(&full).unwrap()).unwrap();
+    let (_, run) = purged(&fx);
+    assert_eq!(code(&run), 0, "{}\n{}", stderr(&run), text(&run.stdout));
+    assert_eq!(fs::read_to_string(&shared).unwrap(), "a\nb\n");
+    assert!(!fx.state().join("trials/trial-boat.json").exists());
+    assert!(ship.exists());
+}
+
+#[test]
+fn a_file_renamed_only_in_case_during_the_trial_is_retained() {
+    if no_sandbox() {
+        return;
+    }
+    let fx = Fx::new();
+    fx.bind_with_links();
+    fs::create_dir_all(fx.h("bin")).unwrap();
+    fs::write(fx.h("bin/Keep"), "mine\n").unwrap();
+    // Only a case-insensitive volume (the macOS default) shows the defect.
+    if !fx.h("bin/keep").exists() {
+        return;
+    }
+    sandboxed(&fx, "set -e\nmv ~/bin/Keep ~/bin/keep\n");
+    let (keep, upper) = (fx.h("bin/keep"), fx.h("bin/Keep"));
+    let rec = fx.record("trial-boat");
+    assert_eq!(window_entry(&rec, &keep)["change"], "created");
+    assert_eq!(window_entry(&rec, &upper)["change"], "removed");
+    let (preview, run) = purged(&fx);
+    let shown = text(&preview.stdout);
+    let want = format!(
+        "retained: {} is in the observation before the run",
+        keep.display()
+    );
+    assert!(shown.contains(&want), "{want}\n{shown}");
+    assert!(!shown.contains("action: remove"), "{shown}");
+    assert_eq!(code(&run), 0, "{}\n{}", stderr(&run), text(&run.stdout));
+    assert_eq!(fs::read_to_string(&keep).unwrap(), "mine\n");
+}
+
+#[test]
+fn a_baseline_path_is_retained_while_another_script_trial_is_incomplete() {
+    if no_sandbox() {
+        return;
+    }
+    let fx = Fx::new();
+    fx.bind_with_links();
+    let rc = fx.h(".boatrc");
+    let rs = rc.display().to_string();
+    fx.script_trial("#!/bin/sh\necho a > ~/.boatrc\n", &["--config", &rs]);
+    // A second trial that did not finish (no window) and whose `before` does not hold the
+    // file: it may have created the file again after its `before`.
+    fx.script("#!/bin/sh\nexit 0\n");
+    let o = fx.approved("ship");
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+    let ship = fx.state().join("trials/trial-ship.json");
+    let mut rec = fx.record("trial-ship");
+    for k in ["exit", "window", "binary"] {
+        rec["script"][k] = serde_json::Value::Null;
+    }
+    rec["script"]["before"]
+        .as_array_mut()
+        .unwrap()
+        .retain(|e| e["path"] != rs.as_str());
+    fs::write(&ship, serde_json::to_vec(&rec).unwrap()).unwrap();
+    let (preview, run) = purged(&fx);
+    let shown = text(&preview.stdout);
+    let want = format!(
+        "retained: {rs} (script trial trial-ship is incomplete; what it changed is not recorded)"
+    );
+    assert!(shown.contains(&want), "{want}\n{shown}");
+    assert!(!shown.contains("action: remove"), "{shown}");
+    assert_eq!(code(&run), 0, "{}\n{}", stderr(&run), text(&run.stdout));
+    assert!(rc.is_file());
+}
+
+#[test]
+fn a_launch_agent_given_as_config_is_retained_with_the_bootout_hint() {
+    if no_sandbox() {
+        return;
+    }
+    let fx = Fx::new();
+    fx.bind_with_links();
+    fs::create_dir_all(fx.h("Library/LaunchAgents")).unwrap();
+    let plist = fx.h("Library/LaunchAgents/dev.boat.plist");
+    let ps = plist.display().to_string();
+    fx.script_trial(
+        "#!/bin/sh\necho plist > ~/Library/LaunchAgents/dev.boat.plist\n",
+        &["--config", &ps],
+    );
+    let (preview, run) = purged(&fx);
+    let shown = text(&preview.stdout);
+    let want =
+        format!("retained: {ps} created during the trial; unload it with launchctl bootout gui/");
+    assert!(shown.contains(&want), "{want}\n{shown}");
+    assert!(!shown.contains("action: remove"), "{shown}");
+    assert_eq!(code(&run), 0, "{}\n{}", stderr(&run), text(&run.stdout));
+    assert!(plist.is_file());
 }

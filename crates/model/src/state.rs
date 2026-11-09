@@ -1084,11 +1084,12 @@ pub const SCRIPT_UNKNOWN: [&str; 4] = [
     "remote-effects",
 ];
 
-const OBSERVED_KINDS: [&str; 4] = ["file", "dir", "link", "other"];
+const OBSERVED_KINDS: [&str; 5] = ["file", "dir", "link", "other", "unreadable"];
 const WINDOW_CHANGES: [&str; 4] = ["created", "modified", "removed", "kind-changed"];
 
-/// One path as the trial saw it: `kind` is one of `file`, `dir`, `link` or `other`, `sha256`
-/// is set for a file and `target` for a link.
+/// One path as the trial saw it: `kind` is one of `file`, `dir`, `link`, `other` or
+/// `unreadable` (a watched place that exists but could not be read, so its children are not
+/// known), `sha256` is set for a file and `target` for a link.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Observed {
@@ -2615,6 +2616,11 @@ mod tests {
             ..entry("kind-changed", "link")
         }]);
         assert!(script_trial(ok.clone()).validate().is_ok());
+        // A watched place that could not be read, in `before` and in the window.
+        let mut marked = ok.clone();
+        marked.before = vec![observed("unreadable", "/h/bin")];
+        marked.window = Some(vec![entry("created", "unreadable")]);
+        assert!(script_trial(marked).validate().is_ok());
         ok.exit = Some(ScriptExit {
             code: None,
             signal: Some("timeout".into()),
