@@ -1,6 +1,7 @@
 //! The `render` and `assemble` adapters (docs/adapters.md). Pure functions of the resource
 //! value and the verified inputs apply or the planner supplies. They open no file.
 
+use super::script::{self, ScriptCx};
 use super::{Adapter, package, registry, secret, service};
 use dfm_engine::{Completion, Dir, Generator, GeneratorInputs, Got, Runner, Sys};
 use dfm_model::digest::sha256_hex;
@@ -50,6 +51,8 @@ pub struct Generators<'a> {
     /// The canonical checkout root the sources were loaded from, with a runner: a service probe
     /// reads it (`service::probe`).
     root: Option<&'a Path>,
+    /// What a `script/v1` probe and install need; `None` outside the packages and sync scopes.
+    scripts: Option<ScriptCx>,
 }
 
 impl<'a> Generators<'a> {
@@ -60,6 +63,15 @@ impl<'a> Generators<'a> {
             runner: None,
             templates: BTreeMap::new(),
             root: None,
+            scripts: None,
+        }
+    }
+
+    /// The same generators, able to probe and install a `script/v1` tool.
+    pub(crate) fn with_scripts(self, scripts: ScriptCx) -> Self {
+        Generators {
+            scripts: Some(scripts),
+            ..self
         }
     }
 
@@ -259,7 +271,10 @@ impl Generator for Generators<'_> {
                     format!("no package provider for {}", op.adapter),
                 )
             })?;
-        if op.action == Action::Upgrade {
+        if op.adapter == script::ADAPTER {
+            let update = op.action == Action::Upgrade;
+            script::probe(runner, self.value(op)?, self.scripts.as_ref(), update)
+        } else if op.action == Action::Upgrade {
             package::maintain(runner, &op.adapter, self.value(op)?)
         } else {
             package::probe(runner, &op.adapter, self.value(op)?)
@@ -277,7 +292,15 @@ impl Generator for Generators<'_> {
                     format!("no package provider for {}", op.adapter),
                 )
             })?;
-        if op.action == Action::Upgrade {
+        if op.adapter == script::ADAPTER {
+            let cx = self.scripts.as_ref().ok_or_else(|| {
+                Refusal::new(
+                    Code::GeneratorUnavailable,
+                    format!("no script installer for {}", op.adapter),
+                )
+            })?;
+            script::install(runner, self.value(op)?, cx)
+        } else if op.action == Action::Upgrade {
             package::upgrade(runner, &op.adapter, self.value(op)?)
         } else {
             package::install(runner, &op.adapter, self.value(op)?)

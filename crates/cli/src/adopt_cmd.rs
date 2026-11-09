@@ -16,11 +16,15 @@ use crate::apply_cmd::{is_digest, label, stale};
 use crate::plan_cmd::{Probed, binary_identity, plan_with_outputs};
 use crate::read_fs::read_regular_bounded;
 use crate::sync_cmd::Git;
+use crate::trial_cmd::FIXED_ENV;
 use crate::{Ctx, Loaded, cli, load_resolved, paint, require_binding, state_cmd, usage};
 use dfm_engine::{
     Approval as Allowance, Dir, End, ProcRequest, Run, Runner, Store, now_ns, signal,
 };
-use dfm_model::adopt::{BrewKind, append, brewfile_has, brewfile_line, link_block, resource_id};
+use dfm_model::adopt::{
+    BrewKind, ScriptDecl, append, brewfile_has, brewfile_line, link_block, resource_id,
+    script_block,
+};
 use dfm_model::digest::sha256_hex;
 use dfm_model::display::{bounded_visible, visible};
 use dfm_model::plan::{
@@ -29,9 +33,9 @@ use dfm_model::plan::{
 };
 use dfm_model::resolve::{Entry, SourceSet, is_git_name, module_manifest, resolve};
 use dfm_model::state::{
-    Approval, BinaryId, Class, DisruptiveApproval, Fingerprint, JournalEntry, MAX_BYTES,
-    OperationRecord, Phase, ProfileRef, Receipt, Recovery, RunResult, SCHEMA, Stamp, Status,
-    TrialAdopted, TrialRecord, count_statuses, rfc3339, unfinished, unresolved, valid_id,
+    Approval, BaselinePath, BinaryId, Class, DisruptiveApproval, Fingerprint, JournalEntry,
+    MAX_BYTES, OperationRecord, Phase, ProfileRef, Receipt, Recovery, RunResult, SCHEMA, Stamp,
+    Status, TrialAdopted, TrialRecord, count_statuses, rfc3339, unfinished, unresolved, valid_id,
 };
 use dfm_model::{Code, Exit, Refusal, fold};
 use dfm_platform_macos::{O_NOFOLLOW, O_NONBLOCK};
@@ -557,6 +561,60 @@ impl Candidate {
     }
 }
 
+/// The `script/v1` declaration of a script trial (docs/adopt.md, "Script trials").
+struct Declaration {
+    id: String,
+    /// The resource block appended to the manifest.
+    block: String,
+    url: String,
+    /// The tool's binary, relative to HOME.
+    binary: String,
+}
+
+/// The declaration for a script trial, `None` for any other trial. The binary must be below
+/// HOME. The environment keeps the trial's `--env` values only: the run fixes the rest again.
+fn declaration(t: &TrialRecord, home: &Path) -> Result<Option<Declaration>, Refusal> {
+    let Some(sc) = &t.script else {
+        return Ok(None);
+    };
+    let b = sc.binary.as_ref().ok_or_else(|| {
+        conflict(format!(
+            "trial {} cannot be adopted: the tool is not on PATH; nothing was changed. Fix: purge the trial",
+            t.trial_id
+        ))
+    })?;
+    let binary = rel_text(Path::new(&b.path), home).ok_or_else(|| {
+        conflict(format!(
+            "the tool's binary {} is outside HOME, and a script/v1 declaration names a path below HOME; nothing was changed",
+            visible(&b.path)
+        ))
+    })?;
+    let env: Vec<(String, String)> = sc
+        .env
+        .iter()
+        .filter(|(n, _)| !FIXED_ENV.contains(&n.as_str()))
+        .cloned()
+        .collect();
+    let id = resource_id(&t.tool);
+    let block = script_block(
+        &id,
+        &ScriptDecl {
+            url: &sc.url,
+            effective_url: &sc.effective_url,
+            shell: &sc.shell,
+            args: &sc.args,
+            env: &env,
+            binary: &binary,
+        },
+    );
+    Ok(Some(Declaration {
+        id,
+        block,
+        url: sc.url.clone(),
+        binary,
+    }))
+}
+
 /// A repo file adopt appends to: its path relative to the root, the hash of its bytes before the
 /// append, and the text it appends (empty: none). `done`: an interrupted run already appended it.
 struct Edit {
@@ -721,6 +779,8 @@ struct Decision {
     /// Why no Brewfile line is written, for the preview.
     brew_note: Option<String>,
     candidates: Vec<Candidate>,
+    /// The `script/v1` declaration of a script trial.
+    script: Option<Declaration>,
     unknown: Vec<String>,
     binary: Binary,
     stamp: Stamp,
@@ -750,6 +810,7 @@ impl Decision {
             "resume": self.resume,
             "brew_line": self.brewfile.as_ref().map(|b| &b.addition),
             "candidates": files,
+            "declaration": self.script.as_ref().map(|d| &d.block),
             "binary": {"version": self.binary.version, "sha256": self.binary.sha256},
             "binding": {
                 "profile": self.stamp.profile,
@@ -810,11 +871,25 @@ impl Decision {
         }
         writeln!(
             out,
-            "manifest: {} (+{} fs-link/v1 resources, appended){}",
+            "manifest: {} (+{} fs-link/v1 resources{}, appended){}",
             visible(&self.manifest.path),
             self.candidates.len(),
+            if self.script.is_some() {
+                ", +1 script/v1 declaration"
+            } else {
+                ""
+            },
             kept(self.manifest.done)
         )?;
+        if let Some(d) = &self.script {
+            writeln!(
+                out,
+                "declaration: {} adapter=script/v1 url={} binary=~/{} (sync installs the tool from it when the binary is missing, with the grant script:<url>)",
+                d.id,
+                visible(&d.url),
+                visible(&d.binary)
+            )?;
+        }
         for c in &self.candidates {
             let mut note = String::new();
             if c.preexisting_dir {
@@ -844,10 +919,17 @@ impl Decision {
             (_, Some(n)) => writeln!(out, "brewfile: none ({n})")?,
             _ => writeln!(out, "brewfile: none")?,
         }
-        writeln!(
-            out,
-            "takeover: each live file becomes a link to its repo copy; nothing is committed"
-        )?;
+        if self.candidates.is_empty() {
+            writeln!(
+                out,
+                "takeover: none (no configuration file); nothing is committed"
+            )?;
+        } else {
+            writeln!(
+                out,
+                "takeover: each live file becomes a link to its repo copy; nothing is committed"
+            )?;
+        }
         if !self.unknown.is_empty() {
             writeln!(
                 out,
@@ -883,10 +965,10 @@ fn trial_record(store: &Store, trial_id: &str) -> Result<TrialRecord, Refusal> {
             "trial {trial_id} is already adopted; nothing was changed"
         )));
     }
-    if t.script.is_some() {
-        return Err(conflict(
-            "adopt of a script trial is not implemented yet (DFM-83)",
-        ));
+    if t.script.as_ref().is_some_and(|s| s.window.is_none()) {
+        return Err(conflict(format!(
+            "trial {trial_id} has no window: its script run did not finish, so what it changed is unknown and it cannot be adopted; nothing was changed. Fix: purge the trial"
+        )));
     }
     Ok(t)
 }
@@ -971,11 +1053,38 @@ fn files_below(dir: &Path, linked: &Linked, out: &mut Vec<PathBuf>) -> Result<()
 /// directory that existed before the trial, and whether it already is the planned link.
 type LiveFile = (PathBuf, Vec<u8>, u32, bool, bool);
 
+/// The paths whose files are candidates: the record's `baseline.paths`, and for a script trial
+/// each window entry `created` directly in `~/.config` that no baseline path covers, as a path
+/// that did not exist before. No other window entry is promoted (docs/adopt.md).
+fn candidate_roots(t: &TrialRecord, home: &Path) -> Vec<BaselinePath> {
+    let mut roots = t.baseline.paths.clone();
+    let config = home.join(".config");
+    let created = t
+        .script
+        .iter()
+        .flat_map(|s| s.window.iter().flatten())
+        .filter(|w| w.change == "created" && Path::new(&w.path).parent() == Some(config.as_path()));
+    for w in created {
+        if !roots.iter().any(|b| overlaps(&b.path, &w.path)) {
+            roots.push(BaselinePath {
+                path: w.path.clone(),
+                existed: false,
+                sha256: None,
+            });
+        }
+    }
+    roots
+}
+
 /// The live files the trial created or changed (docs/adopt.md, "Candidates"). Each file is read
 /// once: the read that decides whether a pre-existing file changed also supplies its bytes.
-fn live_candidates(t: &TrialRecord, linked: &Linked) -> Result<Vec<LiveFile>, Refusal> {
+fn live_candidates(
+    t: &TrialRecord,
+    home: &Path,
+    linked: &Linked,
+) -> Result<Vec<LiveFile>, Refusal> {
     let mut out = Vec::new();
-    for b in &t.baseline.paths {
+    for b in &candidate_roots(t, home) {
         let p = Path::new(&b.path);
         let now = match fs::symlink_metadata(p) {
             Ok(m) => Some(m),
@@ -1250,8 +1359,9 @@ fn decide(
 
     // The candidates, each read once.
     let module_dir = dir_of(&manifest);
+    let script = declaration(&trial, &home)?;
     let mut candidates: Vec<Candidate> = Vec::new();
-    for (path, bytes, mode, preexisting_dir, linked) in live_candidates(&trial, &linked)? {
+    for (path, bytes, mode, preexisting_dir, linked) in live_candidates(&trial, &home, &linked)? {
         let rel = rel_text(&path, &home)
             .ok_or_else(|| conflict(format!("{} is outside HOME", path.display())))?;
         let source = format!("home/{rel}");
@@ -1274,7 +1384,8 @@ fn decide(
             linked,
         });
     }
-    if candidates.is_empty() {
+    // A script trial with a binary is adopted with its declaration alone.
+    if candidates.is_empty() && script.is_none() {
         return Err(conflict(format!(
             "nothing to adopt: no file was created or changed under the baseline paths of trial {}",
             args.trial
@@ -1368,10 +1479,13 @@ fn decide(
 
     // The manifest: as found, or as the interrupted run left it after its append. In that case
     // the checks below run against the composition before the append.
-    let blocks: String = candidates
+    let mut blocks: String = candidates
         .iter()
         .map(|c| link_block(&c.id, &c.rel, &c.source))
         .collect();
+    if let Some(d) = &script {
+        blocks.push_str(&d.block);
+    }
     let mut manifest_base: &[u8] = manifest_bytes;
     let mut manifest_done = false;
     if let Some(p) = prior.as_ref().filter(|p| p.manifest.path == manifest)
@@ -1393,6 +1507,19 @@ fn decide(
 
     // Ownership and collisions.
     let mut ids: BTreeMap<&str, &str> = BTreeMap::new();
+    if let Some(d) = &script {
+        ids.insert(&d.id, "the script/v1 declaration");
+        if let Some(r) = resolved_now
+            .resources
+            .values()
+            .find(|r| r.id.strip_prefix(&format!("{}.", r.module)) == Some(d.id.as_str()))
+        {
+            return Err(conflict(format!(
+                "the resource id {} of the script/v1 declaration already exists in module {}; nothing was changed",
+                d.id, r.module
+            )));
+        }
+    }
     for c in &candidates {
         if let Some(other) = ids.insert(&c.id, &c.rel) {
             return Err(conflict(format!(
@@ -1496,6 +1623,11 @@ fn decide(
                 "the trial package is {}; only a homebrew/v1 package gets a Brewfile line",
                 p.adapter
             ));
+        }
+        None if script.is_some() => {
+            brew_note = Some(
+                "a script tool has no Brewfile line; its script/v1 declaration installs it".into(),
+            );
         }
         None => brew_note = Some("the trial recorded no provider package".into()),
     }
@@ -1601,9 +1733,16 @@ fn decide(
     }
 
     if scan_now {
+        // The declaration holds the script's arguments and `--env` values: it is scanned too.
         let files: Vec<(String, Vec<u8>)> = candidates
             .iter()
             .map(|c| (c.live.clone(), c.bytes.clone()))
+            .chain(script.as_ref().map(|d| {
+                (
+                    format!("the script/v1 declaration {}", d.id),
+                    d.block.clone().into_bytes(),
+                )
+            }))
             .collect();
         let hits = scan(runner, &ctx.platform.cache_dir().join("adopt-scan"), &files)?;
         if !hits.is_empty() {
@@ -1646,6 +1785,20 @@ fn decide(
             )));
         }
     }
+    if let Some(d) = &script {
+        let ok = resolved.resources.values().any(|r| {
+            r.id == format!("{module}.{}", d.id)
+                && r.module == module
+                && r.declared_in == manifest
+                && r.adapter == crate::adapters::script::ADAPTER
+        });
+        if !ok {
+            return Err(conflict(format!(
+                "the script/v1 declaration {} does not resolve from {manifest} in module {module}",
+                d.id
+            )));
+        }
+    }
     let edited_loaded = Loaded {
         binding: loaded.binding.clone(),
         root: root.clone(),
@@ -1673,6 +1826,7 @@ fn decide(
         brewfile,
         brew_note,
         candidates,
+        script,
         unknown: trial.unknown.clone(),
         binary: binary.clone(),
         stamp: stamp.clone(),
@@ -1980,6 +2134,17 @@ pub fn run(ctx: &Ctx, args: &Args, out: &mut dyn Write) -> Result<(), Refusal> {
     let mut approvals = Vec::new();
     if stopped.is_none() {
         let mut takeover = || -> Result<(), Refusal> {
+            // A declaration-only adoption has no link to take over.
+            if locked.candidates.is_empty() {
+                return store.mark_trial_adopted(
+                    &args.trial,
+                    TrialAdopted {
+                        op_id: op_id.clone(),
+                        module: args.module.clone(),
+                        at_unix_ns: now_ns()?,
+                    },
+                );
+            }
             let loaded = load_resolved(ctx, Some(root))?;
             let plan = takeover_plan(ctx, &loaded, &args.module, &locked.candidates)?;
             // A link an interrupted run already owns plans `current` and needs no approval.
@@ -2300,6 +2465,7 @@ mod tests {
                     }),
                     brew_note: None,
                     candidates: vec![cand(sha, mode)],
+                    script: None,
                     unknown: vec![],
                     binary: Binary {
                         version: "0".into(),

@@ -43,6 +43,41 @@ pub fn link_block(id: &str, target: &str, source: &str) -> String {
     )
 }
 
+/// What a `script/v1` declaration holds (docs/packages.md, "Script declarations").
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ScriptDecl<'a> {
+    pub url: &'a str,
+    pub effective_url: &'a str,
+    pub shell: &'a str,
+    pub args: &'a [String],
+    /// Sorted by name; each name is `[A-Za-z_][A-Za-z0-9_]*`, so it is a bare TOML key.
+    pub env: &'a [(String, String)],
+    /// HOME-relative.
+    pub binary: &'a str,
+}
+
+/// One `script/v1` package resource block, led by a blank line. `args` is always written, and
+/// `env` only when it holds a value.
+pub fn script_block(id: &str, d: &ScriptDecl<'_>) -> String {
+    let args: Vec<String> = d.args.iter().map(|a| quoted(a)).collect();
+    let mut out = format!(
+        "\n[[resources]]\nid = {}\nkind = \"package\"\nadapter = \"script/v1\"\n[resources.value]\nurl = {}\neffective_url = {}\nshell = {}\nargs = [{}]\nbinary = {}\n",
+        quoted(id),
+        quoted(d.url),
+        quoted(d.effective_url),
+        quoted(d.shell),
+        args.join(", "),
+        quoted(d.binary),
+    );
+    if !d.env.is_empty() {
+        out.push_str("[resources.value.env]\n");
+        for (n, v) in d.env {
+            out.push_str(&format!("{n} = {}\n", quoted(v)));
+        }
+    }
+    out
+}
+
 /// `existing` followed by `addition`. The existing bytes are always an exact prefix of the
 /// result. A `\n` is added between them only when `existing` is non-empty and does not end in
 /// one, so the addition starts on its own line. A CRLF file already ends in `\n` and is kept.
@@ -134,6 +169,34 @@ mod tests {
             "pi-agent-agents-d-20-output-policy-md"
         );
         assert_eq!(resource_id(".ssh/config"), "ssh-config");
+    }
+
+    #[test]
+    fn a_script_block_parses_back_to_the_declaration() {
+        let (args, env) = (
+            vec!["--yes".to_string(), "a \"q\"".to_string()],
+            vec![("BOAT_NO_UPDATE".to_string(), "1".to_string())],
+        );
+        let d = ScriptDecl {
+            url: "https://example.invalid/i.sh",
+            effective_url: "https://cdn.example.invalid/i.sh",
+            shell: "sh",
+            args: &args,
+            env: &env,
+            binary: "tools/boat",
+        };
+        let text = script_block("boat", &d);
+        assert!(text.starts_with("\n[[resources]]\n"), "{text}");
+        let doc: toml::Table = toml::from_str(&text).unwrap();
+        let r = &doc["resources"][0];
+        assert_eq!(r["adapter"].as_str(), Some("script/v1"));
+        assert_eq!(r["kind"].as_str(), Some("package"));
+        let v = &r["value"];
+        assert_eq!(v["args"][1].as_str(), Some("a \"q\""));
+        assert_eq!(v["env"]["BOAT_NO_UPDATE"].as_str(), Some("1"));
+        assert_eq!(v["binary"].as_str(), Some("tools/boat"));
+        let bare = script_block("boat", &ScriptDecl { env: &[], ..d });
+        assert!(!bare.contains("env"), "{bare}");
     }
 
     #[test]

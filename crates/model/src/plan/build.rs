@@ -189,6 +189,9 @@ pub enum PackageState {
     /// source: learning what its install would do means running third-party code before
     /// approval. This blocks it.
     Unofficial(String),
+    /// A `script/v1` tool whose binary is missing, and whose script identity (`script:<url>`,
+    /// the text) has no grant: installing it would run a script the owner never trusted.
+    Ungranted(String),
     /// The declared provider does not list it, and these (the package or a missing dependency)
     /// have no prebuilt binary for this machine. A source build adds build-time dependencies the
     /// listing does not name, so the plan could not show them; this blocks it.
@@ -239,6 +242,7 @@ impl PackageState {
             PackageState::Upgrades(d) => format!("upgrades:{}", d.join(",")),
             PackageState::SourceBuild(d) => format!("source-build:{}", d.join(",")),
             PackageState::Unofficial(w) => format!("unofficial:{w}"),
+            PackageState::Ungranted(id) => format!("ungranted:{id}"),
             PackageState::OtherOwner(w) => format!("other-owner:{w}"),
             PackageState::Unsupported(w) => format!("unsupported:{w}"),
             PackageState::Unknown(w) => format!("unknown:{w}"),
@@ -1373,6 +1377,21 @@ impl Planner<'_> {
                     "/name",
                     why,
                     "install it by hand with the provider, then run packages again",
+                );
+                op.effect = format!("blocked: {}", f.detail);
+                self.blocker(r, None, f);
+            }
+            Some(PackageState::Ungranted(identity)) => {
+                let f = fail(
+                    Code::SourceUntrusted,
+                    "/url",
+                    format!(
+                        "{name} is not installed, and its install script has no grant ({identity}); dfm runs only a script the owner trusts"
+                    ),
+                    format!(
+                        "run {} after reading the script, then run sync again",
+                        crate::lock::trust_command(&identity)
+                    ),
                 );
                 op.effect = format!("blocked: {}", f.detail);
                 self.blocker(r, None, f);

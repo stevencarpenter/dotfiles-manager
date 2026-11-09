@@ -3,7 +3,9 @@
 
 mod common;
 
-use common::providers::{FAKE_BREW, FAKE_CURL, FAKE_GETCONF, FAKE_MISE, FAKE_SANDBOX_EXEC};
+use common::providers::{
+    FAKE_BREW, FAKE_CURL, FAKE_GETCONF, FAKE_GITLEAKS, FAKE_MISE, FAKE_SANDBOX_EXEC,
+};
 use common::{TempDir, code, text};
 use sha2::{Digest, Sha256};
 use std::fs;
@@ -140,6 +142,7 @@ impl Fx {
             ("curl", FAKE_CURL),
             ("sandbox-exec", FAKE_SANDBOX_EXEC),
             ("getconf", FAKE_GETCONF),
+            ("gitleaks", FAKE_GITLEAKS),
             // The tracked-file guard runs git through the provider path. /usr/bin stays off it,
             // so the curl look-alike is not shadowed by the real curl.
             ("git", "#!/bin/sh\nexec /usr/bin/git \"$@\"\n"),
@@ -1089,7 +1092,7 @@ fn a_dev_tty_read_fails_without_tty() {
 }
 
 #[test]
-fn doctor_shows_the_script_trial_and_purge_and_adopt_refuse_it() {
+fn doctor_shows_the_script_trial_and_purge_refuses_it() {
     if no_sandbox() {
         return;
     }
@@ -1118,10 +1121,6 @@ fn doctor_shows_the_script_trial_and_purge_and_adopt_refuse_it() {
     assert_eq!(code(&o), 3, "{}\n{}", stderr(&o), text(&o.stdout));
     assert!(stderr(&o).contains("E_CONFLICT"), "{}", stderr(&o));
     assert!(stderr(&o).contains("DFM-82"), "{}", stderr(&o));
-    let o = fx.run(&["adopt", "trial-boat", "--module", "extra", "--preview"]);
-    assert_eq!(code(&o), 3, "{}\n{}", stderr(&o), text(&o.stdout));
-    assert!(stderr(&o).contains("E_CONFLICT"), "{}", stderr(&o));
-    assert!(stderr(&o).contains("DFM-83"), "{}", stderr(&o));
 }
 
 /// Runs `body` as an approved script trial and returns `~/result`. The trial must succeed: the
@@ -1490,4 +1489,330 @@ fn a_stop_request_during_a_tty_run_records_the_window_and_exits_143() {
         .collect();
     assert_eq!(phases, ["intent", "failed"]);
     assert_eq!(pgrep(&["-f", &marker]), Vec::<String>::new());
+}
+
+// ---- adopt of a script trial and the script/v1 install (DFM-83) -----------------------------
+
+/// BOAT, and it records the `--env` value it saw, so the install shows the declared environment.
+const BOAT_ENV: &str = r#"#!/bin/sh
+set -e
+mkdir -p "$HOME/.ascii/bin" "$HOME/.config/ascii" "$HOME/.local/bin"
+printf '#!/bin/sh\necho boat\n' > "$HOME/.ascii/bin/boat"
+chmod 755 "$HOME/.ascii/bin/boat"
+echo x > "$HOME/.config/ascii/config"
+printf '%s' "$BOAT_NO_UPDATE" > "$HOME/.ascii/env"
+ln -s "$HOME/.ascii/bin/boat" "$HOME/.local/bin/boat"
+"#;
+
+/// A tool with no configuration: only the binary and its link.
+const BARE: &str = r#"#!/bin/sh
+set -e
+mkdir -p "$HOME/.bare/bin" "$HOME/.local/bin"
+printf '#!/bin/sh\necho boat\n' > "$HOME/.bare/bin/boat"
+chmod 755 "$HOME/.bare/bin/boat"
+ln -s "$HOME/.bare/bin/boat" "$HOME/.local/bin/boat"
+"#;
+
+const EXTRA_MANIFEST: &str = "base/modules/extra/module.toml";
+
+impl Fx {
+    /// An approved script trial of boat with `extra` trial arguments; it must succeed.
+    fn script_trial(&self, body: &str, extra: &[&str]) {
+        self.script(body);
+        let o = self.trial_script("boat", &[extra, &["--preview"]].concat());
+        assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+        let d = digest_of(&o);
+        let o = self.trial_script("boat", &[extra, &["--yes-plan", &d]].concat());
+        assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+    }
+
+    /// Previews the adoption of trial-boat into `extra`, then runs it with the digest.
+    fn adopt(&self) -> (Output, Output) {
+        let p = self.run(&["adopt", "trial-boat", "--module", "extra", "--preview"]);
+        assert_eq!(code(&p), 0, "{}\n{}", stderr(&p), text(&p.stdout));
+        let o = self.run(&[
+            "adopt",
+            "trial-boat",
+            "--module",
+            "extra",
+            "--yes-plan",
+            &digest_of(&p),
+        ]);
+        (p, o)
+    }
+
+    fn manifest(&self) -> String {
+        fs::read_to_string(self.root.join(EXTRA_MANIFEST)).unwrap()
+    }
+
+    /// Removes the tool as a new machine lacks it; the adopted configuration link stays.
+    fn remove_tool(&self) {
+        let _ = fs::remove_dir_all(self.h(".ascii"));
+        let _ = fs::remove_dir_all(self.h(".bare"));
+        let _ = fs::remove_file(self.h(".local/bin/boat"));
+    }
+
+    fn grant(&self) -> Output {
+        self.run(&["sync", "--trust-origin", &format!("script:{URL}")])
+    }
+
+    fn packages(&self, extra: &[&str]) -> Output {
+        self.run(&[&["packages"], extra].concat())
+    }
+}
+
+#[test]
+fn adopt_promotes_a_created_config_entry_and_writes_the_declaration() {
+    if no_sandbox() {
+        return;
+    }
+    let fx = Fx::new();
+    fx.bind_with_links();
+    fx.script_trial(BOAT_ENV, &["--arg", "--quiet", "--env", "BOAT_NO_UPDATE=1"]);
+    let (p, o) = fx.adopt();
+    let preview = text(&p.stdout);
+    assert!(
+        preview.contains(&format!(
+            "declaration: boat adapter=script/v1 url={URL} binary=~/.local/bin/boat"
+        )),
+        "{preview}"
+    );
+    assert!(
+        preview.contains("+1 fs-link/v1 resources, +1 script/v1 declaration"),
+        "{preview}"
+    );
+    assert!(
+        preview.contains("brewfile: none (a script tool has no Brewfile line"),
+        "{preview}"
+    );
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+    // The created `~/.config/ascii` is promoted; `~/.ascii` and the bin link are not.
+    let copy = fx.root.join("base/modules/extra/home/.config/ascii/config");
+    assert_eq!(fs::read_to_string(&copy).unwrap(), "x\n");
+    assert!(!fx.root.join("base/modules/extra/home/.ascii").exists());
+    assert!(!fx.root.join("base/modules/extra/home/.local").exists());
+    assert!(
+        fs::symlink_metadata(fx.h(".config/ascii/config"))
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    let m = fx.manifest();
+    let decl = m.split("\n[[resources]]\n").last().unwrap();
+    assert_eq!(
+        decl,
+        format!(
+            "id = \"boat\"\nkind = \"package\"\nadapter = \"script/v1\"\n[resources.value]\nurl = \"{URL}\"\neffective_url = \"{URL}\"\nshell = \"sh\"\nargs = [\"--quiet\"]\nbinary = \".local/bin/boat\"\n[resources.value.env]\nBOAT_NO_UPDATE = \"1\"\n"
+        ),
+        "{m}"
+    );
+    assert_eq!(fx.record("trial-boat")["adopted"]["module"], "extra");
+    // The adopted composition plans, and the present binary is current: nothing is fetched.
+    fs::write(fx.fake.path().join("log"), "").unwrap();
+    let o = fx.packages(&["--preview"]);
+    let t = text(&o.stdout);
+    assert_eq!(code(&o), 0, "{}\n{t}", stderr(&o));
+    assert!(t.contains("current extra.boat@package"), "{t}");
+    assert!(
+        t.contains("boat is installed by script/v1 (~/.local/bin/boat)"),
+        "{t}"
+    );
+    let log = fx.log();
+    assert!(
+        !log.contains("curl") && !log.contains("sandbox-exec"),
+        "{log}"
+    );
+}
+
+#[test]
+fn a_script_trial_without_a_config_entry_is_adopted_as_the_declaration_only() {
+    if no_sandbox() {
+        return;
+    }
+    let fx = Fx::new();
+    fx.bind_with_links();
+    fx.script_trial(BARE, &[]);
+    let before = fx.manifest();
+    let (p, o) = fx.adopt();
+    let preview = text(&p.stdout);
+    assert!(
+        preview.contains("+0 fs-link/v1 resources, +1 script/v1 declaration"),
+        "{preview}"
+    );
+    assert!(
+        preview.contains("takeover: none (no configuration file)"),
+        "{preview}"
+    );
+    assert!(!preview.contains("candidate:"), "{preview}");
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+    let after = fx.manifest();
+    let added = after.strip_prefix(before.as_str()).unwrap();
+    assert!(added.contains("adapter = \"script/v1\""), "{added}");
+    assert!(!added.contains("fs-link/v1"), "{added}");
+    assert!(!added.contains("[resources.value.env]"), "{added}");
+    assert!(!fx.root.join("base/modules/extra/home").exists());
+    assert_eq!(fx.record("trial-boat")["adopted"]["module"], "extra");
+}
+
+#[test]
+fn a_script_trial_whose_tool_is_not_on_path_is_refused() {
+    if no_sandbox() {
+        return;
+    }
+    let fx = Fx::new();
+    fx.bind_with_links();
+    fx.script_trial("#!/bin/sh\nmkdir -p \"$HOME/.config/ascii\"\n", &[]);
+    assert!(fx.record("trial-boat")["script"]["binary"].is_null());
+    let o = fx.run(&["adopt", "trial-boat", "--module", "extra", "--preview"]);
+    assert_eq!(code(&o), 3, "{}\n{}", stderr(&o), text(&o.stdout));
+    let e = stderr(&o);
+    assert!(
+        e.contains("E_CONFLICT") && e.contains("the tool is not on PATH"),
+        "{e}"
+    );
+}
+
+#[test]
+fn the_secret_scan_covers_the_declaration() {
+    if no_sandbox() {
+        return;
+    }
+    let fx = Fx::new();
+    fx.bind_with_links();
+    fx.script_trial(BARE, &["--env", "BOAT_TOKEN=FAKE_SECRET"]);
+    let before = fx.manifest();
+    let o = fx.run(&["adopt", "trial-boat", "--module", "extra", "--preview"]);
+    assert_eq!(code(&o), 3, "{}\n{}", stderr(&o), text(&o.stdout));
+    let e = stderr(&o);
+    assert!(
+        e.contains("gitleaks found a possible secret in the script/v1 declaration boat"),
+        "{e}"
+    );
+    assert!(!e.contains("FAKE_SECRET"), "{e}");
+    assert_eq!(fx.manifest(), before);
+}
+
+#[test]
+fn packages_install_a_missing_declared_tool_only_with_the_grant() {
+    if no_sandbox() {
+        return;
+    }
+    let fx = Fx::new();
+    fx.bind_with_links();
+    fx.script_trial(BOAT_ENV, &["--env", "BOAT_NO_UPDATE=1"]);
+    let (_, o) = fx.adopt();
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+    fx.remove_tool();
+    fs::write(fx.fake.path().join("log"), "").unwrap();
+    // No grant: blocked with the command, and nothing is fetched or run.
+    let o = fx.packages(&["--preview"]);
+    let t = format!("{}{}", text(&o.stdout), stderr(&o));
+    assert_eq!(code(&o), 3, "{t}");
+    assert!(t.contains("E_SOURCE_UNTRUSTED"), "{t}");
+    assert!(
+        t.contains(&format!("dfm sync --trust-origin 'script:{URL}'")),
+        "{t}"
+    );
+    assert!(!fx.log().contains("curl"), "{}", fx.log());
+    // The grant goes to the third list.
+    let o = fx.grant();
+    assert!(
+        fx.state().join("grants.json").exists(),
+        "{}\n{}",
+        stderr(&o),
+        text(&o.stdout)
+    );
+    let g: serde_json::Value =
+        serde_json::from_slice(&fs::read(fx.state().join("grants.json")).unwrap()).unwrap();
+    assert_eq!(
+        g["scripts"][0]["script"],
+        format!("script:{URL}").as_str(),
+        "{g:#}"
+    );
+    assert!(g["packages"].is_null(), "{g:#}");
+    // With the grant: the install runs the script under the sandbox, without a terminal. The
+    // adopted `~/.config/ascii/config` is now a dfm link, which the sandbox denies: a script
+    // that writes it fails its row and the repo copy stays as adopted.
+    let o = fx.packages(&["--preview"]);
+    let o = fx.packages(&["--yes-plan", &digest_of(&o)]);
+    let t = text(&o.stdout);
+    assert_eq!(code(&o), 1, "{}\n{t}", stderr(&o));
+    assert!(t.contains("failed extra.boat@package"), "{t}");
+    assert!(
+        stderr(&o).contains("Operation not permitted"),
+        "{}",
+        stderr(&o)
+    );
+    let copy = fx.root.join("base/modules/extra/home/.config/ascii/config");
+    assert_eq!(fs::read_to_string(&copy).unwrap(), "x\n");
+    fx.remove_tool();
+    fx.script(BOAT_ENV.replace("echo x > \"$HOME/.config/ascii/config\"\n", ""));
+    let o = fx.packages(&["--preview"]);
+    let t = text(&o.stdout);
+    assert_eq!(code(&o), 0, "{}\n{t}", stderr(&o));
+    assert!(t.contains("planned extra.boat@package"), "{t}");
+    fs::write(fx.fake.path().join("log"), "").unwrap();
+    let o = fx.packages(&["--yes-plan", &digest_of(&o)]);
+    let t = text(&o.stdout);
+    assert_eq!(code(&o), 0, "{}\n{t}", stderr(&o));
+    assert!(t.contains("updated extra.boat@package"), "{t}");
+    assert!(fx.h(".local/bin/boat").exists());
+    assert_eq!(fs::read_to_string(fx.h(".ascii/env")).unwrap(), "1");
+    let log = fx.log();
+    assert!(
+        log.contains(&format!("/bin/sh {}/run-sync-", fx.scripts().display())),
+        "{log}"
+    );
+    assert!(log.contains("(deny process-exec"), "{log}");
+    assert_eq!(run_files(&fx), Vec::<String>::new());
+    assert!(!fx.cached().exists());
+    // The next run finds the binary: current, and the script does not run again.
+    fs::write(fx.fake.path().join("log"), "").unwrap();
+    let o = fx.packages(&["--preview"]);
+    let t = text(&o.stdout);
+    assert_eq!(code(&o), 0, "{}\n{t}", stderr(&o));
+    assert!(t.contains("current extra.boat@package"), "{t}");
+    let log = fx.log();
+    assert!(
+        !log.contains("curl") && !log.contains("sandbox-exec"),
+        "{log}"
+    );
+}
+
+#[test]
+fn a_redirect_to_another_url_blocks_and_a_prompt_fails_the_install() {
+    if no_sandbox() {
+        return;
+    }
+    let fx = Fx::new();
+    fx.bind_with_links();
+    fx.script_trial(BARE, &[]);
+    let (_, o) = fx.adopt();
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+    fx.remove_tool();
+    fx.grant();
+    fx.marker("curl-effective", "https://mirror.invalid/install");
+    let o = fx.packages(&["--preview"]);
+    let t = format!("{}{}", text(&o.stdout), stderr(&o));
+    assert_eq!(code(&o), 3, "{t}");
+    assert!(t.contains("E_SOURCE_UNTRUSTED"), "{t}");
+    assert!(
+        t.contains(&format!(
+            "the script {URL} now ends at https://mirror.invalid/install, not at the declared effective URL {URL}"
+        )),
+        "{t}"
+    );
+    assert!(!fx.cached().exists());
+    // The declared URL again, but the script now asks a question: the install fails.
+    fs::remove_file(fx.fake.path().join("curl-effective")).unwrap();
+    let rest = BARE.strip_prefix("#!/bin/sh\nset -e\n").unwrap();
+    fx.script(format!("#!/bin/sh\nset -e\nread answer < /dev/tty\n{rest}"));
+    let o = fx.packages(&["--preview"]);
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+    let o = fx.packages(&["--yes-plan", &digest_of(&o)]);
+    let t = text(&o.stdout);
+    assert_eq!(code(&o), 1, "{}\n{t}", stderr(&o));
+    assert!(t.contains("failed extra.boat@package"), "{t}");
+    assert!(!fx.h(".local/bin/boat").exists());
+    assert_eq!(run_files(&fx), Vec::<String>::new());
 }

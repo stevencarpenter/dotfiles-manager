@@ -8,6 +8,7 @@
 //! Every child runs through the engine runner (fixed search path, rebuilt environment, process
 //! group, timeout). The providers' standard error is bounded and never printed or persisted.
 
+use super::script::{self, ScriptCx};
 use dfm_engine::{End, ProcOutput, ProcRequest, Runner};
 use dfm_model::plan::{PackageState, Scope};
 use dfm_model::resolve::{Resolved, Value};
@@ -1210,11 +1211,14 @@ fn change(
 /// Probes every selected package resource for a packages plan, by resource id. A stop request
 /// (SIGINT or SIGTERM to the manager) ends the probing: the probe it arrived in is ended by
 /// the runner, no further provider is started, and the request is the error.
+/// A `script/v1` resource is probed by its adapter with `scripts` (`None` fetches nothing, for
+/// `doctor`).
 pub fn package_facts(
     resolved: &Resolved,
     runner: &Runner,
+    scripts: Option<&ScriptCx>,
 ) -> Result<BTreeMap<String, PackageState>, Refusal> {
-    facts(resolved, runner, probe)
+    facts(resolved, runner, scripts, false)
 }
 
 /// The same for a rolling update (`packages --update`, docs/toolchains.md): each installed
@@ -1223,15 +1227,18 @@ pub fn package_facts(
 pub fn update_facts(
     resolved: &Resolved,
     runner: &Runner,
+    scripts: Option<&ScriptCx>,
 ) -> Result<BTreeMap<String, PackageState>, Refusal> {
-    facts(resolved, runner, maintain)
+    facts(resolved, runner, scripts, true)
 }
 
 fn facts(
     resolved: &Resolved,
     runner: &Runner,
-    look: fn(&Runner, &str, &Value) -> Result<PackageState, Refusal>,
+    scripts: Option<&ScriptCx>,
+    update: bool,
 ) -> Result<BTreeMap<String, PackageState>, Refusal> {
+    let look = if update { maintain } else { probe };
     let mut out = BTreeMap::new();
     for r in resolved
         .resources
@@ -1241,7 +1248,12 @@ fn facts(
         if let Some(stop) = dfm_engine::signal::requested() {
             return Err(stop);
         }
-        let state = match look(runner, &r.adapter, &r.value) {
+        let looked = if r.adapter == script::ADAPTER {
+            script::probe(runner, &r.value, scripts, update)
+        } else {
+            look(runner, &r.adapter, &r.value)
+        };
+        let state = match looked {
             Ok(s) => s,
             Err(e) if e.code == Code::ManifestInvalid => PackageState::Refused(e.detail),
             Err(e) => PackageState::Unknown(e.detail),

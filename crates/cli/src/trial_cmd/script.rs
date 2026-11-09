@@ -44,7 +44,7 @@ pub(super) const HINT_STARTUP: &str = "note: the script edits shell startup file
 
 /// How long the script may run before its process group is ended.
 // shortcut: one fixed hour, upgrade when a flag asks for it
-const SCRIPT_TIMEOUT: Duration = Duration::from_secs(60 * 60);
+pub(crate) const SCRIPT_TIMEOUT: Duration = Duration::from_secs(60 * 60);
 
 /// The adapter a journal entry or receipt operation of a script trial names.
 const ADAPTER: &str = "script/v1";
@@ -54,7 +54,7 @@ const MAX_SCRIPT: u64 = 1_048_576;
 
 /// A script in the cache, as the preview showed it and the run uses it.
 #[derive(Debug)]
-pub(super) struct Fetched {
+pub(crate) struct Fetched {
     pub path: PathBuf,
     pub sha256: String,
     pub bytes: u64,
@@ -64,19 +64,19 @@ pub(super) struct Fetched {
 
 /// `<cache_dir>/scripts/<sha256(url)>` and its sidecar `<...>.json`
 /// `{"url","effective_url","sha256","bytes"}`.
-pub(super) fn cache_paths(cache_dir: &Path, url: &str) -> (PathBuf, PathBuf) {
+pub(crate) fn cache_paths(cache_dir: &Path, url: &str) -> (PathBuf, PathBuf) {
     let file = cache_dir.join("scripts").join(sha256_hex(url.as_bytes()));
     let sidecar = file.with_extension("json");
     (file, sidecar)
 }
 
-fn io_failed(path: &Path) -> impl Fn(std::io::Error) -> Refusal + '_ {
+pub(crate) fn io_failed(path: &Path) -> impl Fn(std::io::Error) -> Refusal + '_ {
     move |e| Refusal::new(Code::IoFailed, format!("{}: {}", path.display(), e.kind()))
 }
 
 /// Creates `path` (mode 0600) with `body`. An existing entry, also a link, is `E_CONFLICT` and
 /// stays as it is; a failed write removes the new file.
-fn write_private(path: &Path, body: &[u8]) -> Result<(), Refusal> {
+pub(crate) fn write_private(path: &Path, body: &[u8]) -> Result<(), Refusal> {
     let mut f = fs::OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -129,7 +129,7 @@ fn system_tools(runner: &Runner) -> Runner {
 
 /// Fetches `url` once with curl through the runner and caches the bytes (mode 0600) with a
 /// sidecar. Only `https` is accepted, also after redirects.
-pub(super) fn fetch(runner: &Runner, cache_dir: &Path, url: &str) -> Result<Fetched, Refusal> {
+pub(crate) fn fetch(runner: &Runner, cache_dir: &Path, url: &str) -> Result<Fetched, Refusal> {
     let (file, sidecar) = cache_paths(cache_dir, url);
     let dir = cache_dir.join("scripts");
     fs::DirBuilder::new()
@@ -240,7 +240,7 @@ pub(super) fn fetch(runner: &Runner, cache_dir: &Path, url: &str) -> Result<Fetc
 }
 
 /// The cached script without a fetch. `None` when the file or the sidecar is missing.
-pub(super) fn cached(cache_dir: &Path, url: &str) -> Result<Option<Fetched>, Refusal> {
+pub(crate) fn cached(cache_dir: &Path, url: &str) -> Result<Option<Fetched>, Refusal> {
     let (file, sidecar) = cache_paths(cache_dir, url);
     let missing =
         |p: &Path| fs::symlink_metadata(p).is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound);
@@ -313,7 +313,7 @@ fn probe(runner: &Runner, program: &str, args: &[&str]) -> Result<String, Refusa
 /// The account's login shell. The isolated build takes it from `DFM_LOGIN_SHELL`, because the
 /// test HOME has no directory-service record.
 #[cfg(feature = "test-isolation")]
-fn account_login_shell(user: &str) -> Option<String> {
+pub(crate) fn account_login_shell(user: &str) -> Option<String> {
     match std::env::var("DFM_LOGIN_SHELL") {
         Ok(v) if !v.is_empty() => Some(v),
         _ => dfm_platform_macos::login_shell(user),
@@ -321,14 +321,14 @@ fn account_login_shell(user: &str) -> Option<String> {
 }
 
 #[cfg(not(feature = "test-isolation"))]
-fn account_login_shell(user: &str) -> Option<String> {
+pub(crate) fn account_login_shell(user: &str) -> Option<String> {
     dfm_platform_macos::login_shell(user)
 }
 
 /// The script's whole environment, sorted by name: a fixed list taken from `dfm_env` (dfm's
 /// own environment) and the runner, so the script picks the same files as a `curl | sh` in the
 /// owner's shell without seeing dfm's other variables. `tty` adds `TERM`; `extra` is `--env`.
-pub(super) fn script_env(
+pub(crate) fn script_env(
     runner: &Runner,
     dfm_env: &[(String, String)],
     tty: bool,
@@ -399,7 +399,7 @@ pub(super) const DENIED_EXEC: [&str; 3] = ["/usr/bin/sudo", "/usr/bin/su", "/usr
 /// What the script's sandbox lets it write: `home` and `temp` (canonical, from the caller), less
 /// the denied trees and paths.
 #[derive(Debug)]
-pub(super) struct Protected {
+pub(crate) struct Protected {
     pub home: PathBuf,
     pub temp: Vec<PathBuf>,
     /// Guarded checkouts, the state root, the config, data and cache dirs, dfm's install dir.
@@ -429,7 +429,7 @@ fn sbpl_str(p: &Path) -> Result<&str, Refusal> {
 /// home allow. A subpath deny does not stop a rename of an ancestor, so each ancestor strictly
 /// below `home` of a denied tree or path gets a literal deny; a literal still allows new
 /// entries inside it.
-pub(super) fn profile(p: &Protected) -> Result<String, Refusal> {
+pub(crate) fn profile(p: &Protected) -> Result<String, Refusal> {
     let rules = |kind: &str, paths: &[&Path]| -> Result<String, Refusal> {
         paths
             .iter()
@@ -527,7 +527,7 @@ fn links_on(home: &Path, p: &Path) -> Vec<PathBuf> {
 
 /// The protected set for a run: the binding root's guarded checkouts, dfm's own directories,
 /// install directory and executable, the lock file, and every ledger target.
-pub(super) fn protected(
+pub(crate) fn protected(
     layout: &Layout,
     root: &Path,
     ledger: &Ledger,
@@ -740,7 +740,7 @@ impl Decision {
 
 /// `sandbox-exec`, resolved with the system tools first, after a dry run of `profile` under it:
 /// a profile the system does not accept refuses before the preview, not after the record.
-fn sandbox_exec(runner: &Runner, profile: &str) -> Result<PathBuf, Refusal> {
+pub(crate) fn sandbox_exec(runner: &Runner, profile: &str) -> Result<PathBuf, Refusal> {
     let unsupported = |why: String| Refusal::new(Code::PlatformUnsupported, why);
     let tools = system_tools(runner);
     let path = tools.resolve("sandbox-exec").map_err(|_| {
@@ -765,8 +765,62 @@ fn sandbox_exec(runner: &Runner, profile: &str) -> Result<PathBuf, Refusal> {
     }
 }
 
+/// One run of approved script bytes under the sandbox: `shell` runs `file` with `args` and
+/// exactly `env`, in the fresh private directory `work`, with a terminal only when `tty`. The
+/// trial (`dfm trial --script`) and the `script/v1` install of the packages scope share it.
+pub(crate) struct Confined<'a> {
+    pub sandbox: &'a Path,
+    pub profile: String,
+    pub shell: &'a str,
+    pub file: &'a Path,
+    pub args: &'a [String],
+    pub env: &'a [(String, String)],
+    pub tty: bool,
+    pub work: &'a Path,
+}
+
+impl Confined<'_> {
+    /// Creates `work` (mode 0700; an existing entry is not dfm's and refuses the run), then runs
+    /// the script there. `made` tells the caller to remove `work` afterwards.
+    pub(crate) fn run(self, runner: &Runner, made: &mut bool) -> Result<End, Refusal> {
+        fs::DirBuilder::new()
+            .mode(0o700)
+            .create(self.work)
+            .map_err(|e| {
+                if e.kind() == std::io::ErrorKind::AlreadyExists {
+                    Refusal::new(
+                        Code::Conflict,
+                        format!(
+                            "{} already exists; the script did not run",
+                            self.work.display()
+                        ),
+                    )
+                } else {
+                    io_failed(self.work)(e)
+                }
+            })?;
+        *made = true;
+        let mut in_work = runner.clone();
+        in_work.cwd = self.work.to_path_buf();
+        let mut argv = vec![
+            "-p".to_string(),
+            self.profile,
+            format!("/bin/{}", self.shell),
+            self.file.display().to_string(),
+        ];
+        argv.extend(self.args.iter().cloned());
+        in_work.run_shown(&Shown {
+            program: self.sandbox,
+            args: &argv,
+            env: self.env,
+            tty: self.tty,
+            timeout: SCRIPT_TIMEOUT,
+        })
+    }
+}
+
 /// How the script ended, for the record, and the refusal a run that did not succeed ends with.
-fn ended(end: Result<End, Refusal>) -> (Option<ScriptExit>, Option<Refusal>) {
+pub(crate) fn ended(end: Result<End, Refusal>) -> (Option<ScriptExit>, Option<Refusal>) {
     let signal = |s: &str| {
         Some(ScriptExit {
             code: None,
@@ -804,7 +858,7 @@ fn ended(end: Result<End, Refusal>) -> (Option<ScriptExit>, Option<Refusal>) {
 /// The problems of one run as one refusal: the most important code wins (a stop request, then
 /// a tracked change, then the rest, such as a nonzero exit), and the text names every problem
 /// in that order.
-fn ranked(mut problems: Vec<Refusal>) -> Option<Refusal> {
+pub(crate) fn ranked(mut problems: Vec<Refusal>) -> Option<Refusal> {
     let rank = |c: Code| match c {
         Code::Interrupted | Code::Terminated => 0,
         Code::Conflict => 1,
@@ -817,7 +871,7 @@ fn ranked(mut problems: Vec<Refusal>) -> Option<Refusal> {
 }
 
 /// The tracked changes between two `tracked_status` snapshots, as the upgrade step reports them.
-fn tracked_changes(
+pub(crate) fn tracked_changes(
     before: &std::collections::BTreeMap<String, (String, String)>,
     now: &std::collections::BTreeMap<String, (String, String)>,
 ) -> Vec<String> {
@@ -1101,36 +1155,17 @@ pub(super) fn run(
         .join(format!("dfm-trial-{trial_id}-{}", std::process::id()));
     let mut work_made = false;
     let end = journal(Phase::Intent, Some(empty), None).and_then(|()| {
-        fs::DirBuilder::new()
-            .mode(0o700)
-            .create(&work)
-            .map_err(|e| {
-                if e.kind() == std::io::ErrorKind::AlreadyExists {
-                    Refusal::new(
-                        Code::Conflict,
-                        format!("{} already exists; the script did not run", work.display()),
-                    )
-                } else {
-                    io_failed(&work)(e)
-                }
-            })?;
-        work_made = true;
-        let mut in_work = runner.clone();
-        in_work.cwd = work.clone();
-        let mut argv = vec![
-            "-p".to_string(),
-            profile_text,
-            format!("/bin/{}", locked.shell),
-            run_file.display().to_string(),
-        ];
-        argv.extend(locked.args.iter().cloned());
-        in_work.run_shown(&Shown {
-            program: &sandbox,
-            args: &argv,
+        Confined {
+            sandbox: &sandbox,
+            profile: profile_text,
+            shell: &locked.shell,
+            file: &run_file,
+            args: &locked.args,
             env: &locked.env,
             tty: locked.tty,
-            timeout: SCRIPT_TIMEOUT,
-        })
+            work: &work,
+        }
+        .run(&runner, &mut work_made)
     });
     let (exit, failed) = ended(end);
     let mut problems: Vec<Refusal> = failed.into_iter().collect();

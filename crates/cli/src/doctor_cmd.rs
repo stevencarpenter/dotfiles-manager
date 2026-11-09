@@ -853,10 +853,11 @@ fn profile_rows(
     let private = std::fs::symlink_metadata(&runner.cwd)
         .is_ok_and(|m| m.is_dir() && m.permissions().mode() & 0o7777 == 0o700);
     let (packages, services) = if private {
-        let packages = crate::adapters::package::package_facts(res, &runner).unwrap_or_else(|r| {
-            rows.push(refusal_row("resource", "package probes", &r));
-            BTreeMap::new()
-        });
+        let packages =
+            crate::adapters::package::package_facts(res, &runner, None).unwrap_or_else(|r| {
+                rows.push(refusal_row("resource", "package probes", &r));
+                BTreeMap::new()
+            });
         let services = crate::adapters::service::service_facts(res, &runner, None, &loaded.root)
             .unwrap_or_else(|r| {
                 rows.push(refusal_row("resource", "service probes", &r));
@@ -976,6 +977,15 @@ fn package_row(r: &ResolvedResource, s: &PackageState, path: &OsStr) -> Row {
             Code::SourceUntrusted.into(),
             why.clone(),
             blocked.into(),
+        ),
+        PackageState::Ungranted(identity) => (
+            Level::Warn,
+            Code::SourceUntrusted.into(),
+            format!("{pkg} is not installed and its install script has no grant ({identity})"),
+            format!(
+                "Read the script, then run {}.",
+                dfm_model::lock::trust_command(identity)
+            ),
         ),
         PackageState::SourceBuild(d) => (
             Level::Warn,

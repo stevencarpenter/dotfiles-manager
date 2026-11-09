@@ -26,7 +26,7 @@ use std::fs;
 use std::io::Write;
 use std::path::Path;
 
-mod script;
+pub(crate) mod script;
 mod window;
 
 /// Effects a trial does not instrument. They are recorded so `purge` treats them as candidates
@@ -59,7 +59,7 @@ pub struct ScriptArgs {
 }
 
 /// Variables the script run sets itself. `--env` cannot override them.
-pub(super) const FIXED_ENV: [&str; 15] = [
+pub(crate) const FIXED_ENV: [&str; 15] = [
     "HOME",
     "USER",
     "LOGNAME",
@@ -383,7 +383,7 @@ pub(super) fn print_observed(
 fn block_code(s: &PackageState) -> Code {
     match s {
         PackageState::Unknown(_) => Code::ProbeFailed,
-        PackageState::Unofficial(_) => Code::SourceUntrusted,
+        PackageState::Unofficial(_) | PackageState::Ungranted(_) => Code::SourceUntrusted,
         PackageState::SourceBuild(_) => Code::PlatformUnsupported,
         PackageState::Unsupported(_) => Code::PrivilegeUnsupported,
         PackageState::Refused(_) => Code::ManifestInvalid,

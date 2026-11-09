@@ -107,7 +107,8 @@ empty keeps the previous file. An existing destination the ledger does not prove
 wrote needs --allow-adopt <operation-id>. No secret value, unsalted hash or provider message is
 printed or stored; the ledger keeps a per-machine salted hash. See docs/secrets.md.
 
-packages is apply over the package resources only (homebrew/v1, mise/v1, apt/v1, uv-tool/v1): every other
+packages is apply over the package resources only (homebrew/v1, mise/v1, apt/v1, uv-tool/v1,
+script/v1): every other
 resource is listed as not_in_scope. Planning probes each provider read-only (Homebrew's Cellar
 and Caskroom, mise ls, dpkg-query) with auto-update, analytics and mise configuration off, and
 runs no tap code. A package the provider has installed is current; a missing official one is
@@ -164,7 +165,8 @@ the only one that runs without a digest: it then plans again under the lock and 
 to a plan --preview printed. Every origin needs a grant in state/grants.json first (--trust-origin
 <origin> writes one, prints the plan and stops; no fetch happens before the grant). The skills,
 agents, npm and uv updaters run only when each source they fetch has a grant (an npm:<package>
-identity is granted with --trust-origin too). The run fast-forwards each checkout (never reset, clean, stash, rebase, commit or push; divergence and
+identity is granted with --trust-origin too). A script/v1 tool whose binary is missing installs
+only with a script:<url> grant. The run fast-forwards each checkout (never reset, clean, stash, rebase, commit or push; divergence and
 overwritten local changes are refused), then runs apply, packages, secrets and services in that
 order, each with its own plan digest and receipt. A removal of an owned output needs no flag. An
 adoption or takeover runs only with --allow-adopt <operation-id>, else it is withheld and the rest
