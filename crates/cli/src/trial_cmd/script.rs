@@ -1200,16 +1200,23 @@ pub(super) fn run(
         }
         e.after_mutation()
     });
+    let has_binary = record.script.as_ref().is_some_and(|sc| sc.binary.is_some());
     let notes: Vec<String> = [
-        record
-            .script
-            .as_ref()
-            .is_some_and(|sc| sc.binary.is_none())
-            .then(|| format!("the tool {tool} is not on PATH or cannot be hashed")),
+        (!has_binary).then(|| format!("the tool {tool} is not on PATH or cannot be hashed")),
         (written && shrunk.any()).then(|| {
             format!(
-                "the window was shrunk to fit the record: {} entries dropped, before-states removed; the exit and the binary are recorded",
-                shrunk.dropped_entries
+                "the window was shrunk to fit the record: {} entries dropped{}; {} recorded",
+                shrunk.dropped_entries,
+                if shrunk.dropped_before {
+                    ", before-states removed"
+                } else {
+                    ""
+                },
+                if has_binary {
+                    "the exit and the binary are"
+                } else {
+                    "the exit is"
+                }
             )
         }),
     ]

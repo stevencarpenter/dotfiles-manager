@@ -624,13 +624,12 @@ fn a_window_over_the_record_budget_is_shrunk_and_the_outcome_kept() {
     }
     let fx = Fx::new();
     fx.bind_with_links();
-    // About 1.5 MB of `before` in the record (the estimate is about 8% low), under the 1.5 MiB
-    // pre-run cap. Modifying every file makes the full record about 4.5 MB, over the store's
-    // 4 MiB write cap.
-    let n = files_for(&fx, 1_400_000);
-    many_files(&fx, n);
+    // The script creates 2 x 5 000 files with 240-byte names in two watched directories. Each
+    // created entry is about 440 bytes, so the window alone is about 4.4 MB: far over the 3 MiB
+    // budget and the 4 MiB write cap, while `before` stays small. The tail cut must run.
+    let name = "f".repeat(240);
     fx.script(format!(
-        "{}for f in \"$HOME\"/.local/bin/f-*; do echo y >> \"$f\"; done\n",
+        "{}mkdir -p \"$HOME/bin\"\ni=0\nwhile [ $i -lt 5000 ]; do\n  : > \"$HOME/.local/bin/{name}-$i\"\n  : > \"$HOME/bin/{name}-$i\"\n  i=$((i + 1))\ndone\n",
         BOAT.trim_end_matches("echo installed boat\n")
     ));
     let o = fx.approved("boat");
@@ -641,18 +640,22 @@ fn a_window_over_the_record_budget_is_shrunk_and_the_outcome_kept() {
         .find(|l| l.starts_with("note: the window was shrunk to fit the record: "))
         .unwrap_or_else(|| panic!("{out}"));
     assert!(
-        note.ends_with(
-            " entries dropped, before-states removed; the exit and the binary are recorded"
-        ),
+        note.ends_with(" entries dropped; the exit and the binary are recorded"),
         "{note}"
     );
+    let file = fx.state().join("trials/trial-boat.json");
+    let bytes = fs::metadata(&file).unwrap().len();
+    assert!(bytes <= 4 << 20, "{bytes}");
     let rec = fx.record("trial-boat");
     let s = &rec["script"];
     assert_eq!(s["exit"], serde_json::json!({"code": 0, "signal": null}));
     assert!(s["binary"]["sha256"].is_string(), "{}", s["binary"]);
     let window = s["window"].as_array().unwrap();
-    assert!(!window.is_empty());
-    assert!(window.iter().all(|e| e["before"].is_null()));
+    assert!(
+        !window.is_empty() && window.len() < 10_000,
+        "{}",
+        window.len()
+    );
     let unknown = rec["unknown"].as_array().unwrap();
     assert!(
         unknown.iter().any(|u| u == "window-truncated"),
