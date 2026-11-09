@@ -1410,7 +1410,35 @@ pub fn run(ctx: &Ctx, args: &Args, out: &mut dyn Write) -> Result<(), Refusal> {
             );
             retained.extend(r);
             vouched = v;
-            paths.extend(items);
+            // No window candidate is removed when the window cannot be trusted as the run's
+            // own effect: a window with no exit means the script never started (a failed
+            // journal append or launch), so what appeared came from elsewhere; and a link with
+            // an inexact name cannot be read back, so whatever it points at, file or directory,
+            // could be left dangling.
+            let keep_all = if s.window.is_some() && s.exit.is_none() {
+                Some(
+                    "the script never started (no exit was recorded); nothing it created is removed",
+                )
+            } else if entries.iter().any(inexact) {
+                Some(
+                    "a window entry has a name that cannot be shown exactly; nothing is removed by the window",
+                )
+            } else {
+                None
+            };
+            match keep_all {
+                Some(why) => {
+                    for i in items {
+                        if i.step == Step::Do {
+                            let line = format!("{} ({why})", visible(&i.path));
+                            retained.push((i.path, line));
+                        } else {
+                            paths.push(i);
+                        }
+                    }
+                }
+                None => paths.extend(items),
+            }
         }
         // Another script trial whose run did not finish, or whose window was cut, may have
         // created any path again after its `before`, so no candidate is removed: neither a

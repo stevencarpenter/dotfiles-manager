@@ -3343,7 +3343,7 @@ fn a_record_without_an_inode_fence_retains_every_window_candidate() {
 }
 
 #[test]
-fn an_inexact_window_name_keeps_every_created_directory() {
+fn an_inexact_window_name_keeps_every_window_candidate() {
     if no_sandbox() {
         return;
     }
@@ -3351,27 +3351,57 @@ fn an_inexact_window_name_keeps_every_created_directory() {
     fx.bind_with_links();
     fs::create_dir_all(fx.h(".local/bin")).unwrap();
     // A link whose name holds a control character: the window records it as kind `other`, and
-    // purge cannot read it back to see where it points.
+    // purge cannot read it back to see where it points, a directory or a file.
     sandboxed(
         &fx,
         "set -e\nmkdir ~/.boat\necho x > ~/.boat/f\n\
-         ln -s ~/.boat/f \"$HOME/.local/bin/b$(printf '\\001')\"\n\
-         printf '#!/bin/sh\\n' > ~/.local/bin/boat\n",
+         printf '#!/bin/sh\\n' > ~/.local/bin/boat\n\
+         ln -s ~/.local/bin/boat \"$HOME/.local/bin/b$(printf '\\001')\"\n",
     );
     let (preview, run) = purged(&fx);
     let shown = text(&preview.stdout);
+    let why =
+        "a window entry has a name that cannot be shown exactly; nothing is removed by the window";
+    // The directory is already held by the tree rule; the file by the rule for any candidate.
     for want in [
         format!(
             "retained: {} (a window entry has a name that cannot be shown exactly; links in it cannot be followed)",
             fx.h(".boat").display()
         ),
-        format!("action: remove {} file", fx.h(".local/bin/boat").display()),
+        format!("retained: {} ({why})", fx.h(".local/bin/boat").display()),
     ] {
         assert!(shown.contains(&want), "{want}\n{shown}");
     }
+    assert!(!shown.contains("action: remove"), "{shown}");
     assert_eq!(code(&run), 0, "{}\n{}", stderr(&run), text(&run.stdout));
     assert_eq!(fs::read_to_string(fx.h(".boat/f")).unwrap(), "x\n");
-    assert!(gone(&fx.h(".local/bin/boat")));
+    assert!(fx.h(".local/bin/boat").is_file());
+}
+
+#[test]
+fn a_window_without_an_exit_removes_no_window_candidate() {
+    if no_sandbox() {
+        return;
+    }
+    let fx = Fx::new();
+    fx.bind_with_links();
+    sandboxed(&fx, "set -e\nmkdir ~/.boat\necho x > ~/.boat/f\n");
+    // As a failed journal append or launch leaves it: the window was observed, no exit.
+    let rec_path = fx.state().join("trials/trial-boat.json");
+    let mut rec = fx.record("trial-boat");
+    assert!(!rec["script"]["window"].is_null());
+    rec["script"]["exit"] = serde_json::Value::Null;
+    fs::write(&rec_path, serde_json::to_vec(&rec).unwrap()).unwrap();
+    let (preview, run) = purged(&fx);
+    let shown = text(&preview.stdout);
+    let want = format!(
+        "retained: {} (the script never started (no exit was recorded); nothing it created is removed)",
+        fx.h(".boat").display()
+    );
+    assert!(shown.contains(&want), "{want}\n{shown}");
+    assert!(!shown.contains("action: remove"), "{shown}");
+    assert_eq!(code(&run), 0, "{}\n{}", stderr(&run), text(&run.stdout));
+    assert!(fx.h(".boat/f").is_file());
 }
 
 #[test]
