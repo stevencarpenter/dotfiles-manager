@@ -19,7 +19,9 @@ use dfm_model::plan::{
     ServiceFacts, ServiceState, Status, in_scope, link_fingerprint, sensitive_paths,
 };
 use dfm_model::resolve::ResolvedResource;
-use dfm_model::state::{Class, JournalEntry, Ledger, Receipt, unfinished, unresolved};
+use dfm_model::state::{
+    Class, JournalEntry, Ledger, Receipt, ScriptBinary, TrialRecord, unfinished, unresolved,
+};
 use dfm_model::{Code, Refusal};
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
@@ -131,9 +133,22 @@ fn inspect(ctx: &Ctx, command: &'static str, root: Option<&Path>) -> Result<Repo
     let observed = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
-    let owned = state_rows(sys, &layout, binding.as_ref(), &mut rows);
+    let (owned, scripts) = state_rows(sys, &layout, binding.as_ref(), &mut rows);
     lock_row(ctx, sys.uid, &mut rows);
     let (loaded, plan) = profile_rows(ctx, &sys, &path, binding.as_ref(), root, &mut rows);
+    let sensitive = sensitive_paths(
+        loaded.as_ref().map(|l| &l.resolved),
+        owned.as_deref().unwrap_or_default(),
+    );
+    script_binary_rows(
+        &layout.home,
+        &path,
+        &scripts,
+        loaded.as_ref(),
+        &sensitive,
+        owned.as_deref(),
+        &mut rows,
+    );
     output_rows(
         sys,
         &layout,
@@ -215,18 +230,19 @@ fn binding_row(ctx: &Ctx, rows: &mut Vec<Row>) -> Option<Binding> {
 
 // ---- state --------------------------------------------------------------------------------
 
-/// State store rows. Returns the owned outputs when the ledger could be read.
+/// State store rows. Returns the owned outputs when the ledger could be read, and the readable
+/// script trial records of the bound identity, active and adopted, for the script binary rows.
 fn state_rows(
     sys: Sys,
     layout: &Layout,
     binding: Option<&Binding>,
     rows: &mut Vec<Row>,
-) -> Option<Vec<Owned>> {
+) -> (Option<Vec<Owned>>, Vec<TrialRecord>) {
     let store = match Store::open_read(sys, layout, Fail::none()) {
         Ok(s) => s,
         Err(r) => {
             rows.push(refusal_row("state", "state directory", &r));
-            return None;
+            return (None, Vec::new());
         }
     };
     let (b, store) = match (binding, store) {
@@ -240,7 +256,7 @@ fn state_rows(
                 "no state exists",
                 "Run bind to create the binding and the state.",
             ));
-            return None;
+            return (None, Vec::new());
         }
         (Some(_), None) => {
             let r = Refusal::new(
@@ -248,7 +264,7 @@ fn state_rows(
                 "the binding exists but its state directory is missing (state loss)",
             );
             rows.push(refusal_row("state", "state directory", &r));
-            return None;
+            return (None, Vec::new());
         }
         (None, Some(_)) => {
             let r = Refusal::new(
@@ -256,7 +272,7 @@ fn state_rows(
                 "state exists but there is no readable binding",
             );
             rows.push(refusal_row("state", "state directory", &r));
-            return None;
+            return (None, Vec::new());
         }
     };
     let l = store.load();
@@ -290,7 +306,390 @@ fn state_rows(
     trial_rows(&l, &findings, rows);
     receipt_row(&l, bad, rows);
     upgrade_row(&l, rows);
-    owned
+    let scripts = l
+        .trials
+        .iter()
+        .filter(|(n, _)| !findings.iter().any(|f| f.file == format!("trials/{n}")))
+        .filter_map(|(_, t)| t.as_ref().ok())
+        .filter(|t| t.script.is_some())
+        .cloned()
+        .collect();
+    (owned, scripts)
+}
+
+/// The binary a script trial recorded when its run ended.
+fn recorded(t: &TrialRecord) -> Option<&ScriptBinary> {
+    t.script.as_ref().and_then(|s| s.binary.as_ref())
+}
+
+/// One `D_SCRIPT_BINARY` row per active script trial and per `script/v1` declaration
+/// (docs/doctor.md, "Script binaries"). A sensitive or invalid declaration has its package row
+/// only.
+fn script_binary_rows(
+    home: &Path,
+    path: &OsStr,
+    trials: &[TrialRecord],
+    loaded: Option<&Loaded>,
+    sensitive: &BTreeSet<String>,
+    ledger: Option<&[Owned]>,
+    rows: &mut Vec<Row>,
+) {
+    // A sensitive merge reads fragments from these directories (`dir_claims`); a fragment
+    // there is sensitive although no claim names it, so nothing at or below one is read.
+    let dirs: Vec<String> = loaded
+        .into_iter()
+        .flat_map(|l| l.resolved.resources.values())
+        .filter(|r| r.sensitive)
+        .flat_map(|r| r.dir_claims.iter().map(|d| d.dir.clone()))
+        .collect();
+    // Each directory's metadata joins the targets, so a hard link to a fragment there (more
+    // than one link, on the directory's device) is not hashed either.
+    let mut spelled = spelled_sensitive(loaded, ledger.unwrap_or_default(), sensitive);
+    spelled.extend(dirs.iter().cloned());
+    let targets = sensitive_targets(home, &spelled);
+    // Without the ledger the sensitive set may miss a stale output path, and without the
+    // resolved profile the fragment directories are unknown, so nothing is hashed.
+    let unhashed = if ledger.is_none() {
+        Some("no digest: the ledger cannot be read, so no binary is hashed")
+    } else if loaded.is_none() {
+        Some(
+            "no digest: the profile is not resolved, so its sensitive fragment directories are \
+             unknown and no binary is hashed",
+        )
+    } else {
+        None
+    };
+    let protected = Protected {
+        sensitive,
+        dirs: &dirs,
+        targets: &targets,
+    };
+    let row = |who: &str, at: &Path, since, fix| {
+        binary_row(
+            who, at, since, fix, home, path, trials, &protected, unhashed,
+        )
+    };
+    for t in trials.iter().filter(|t| t.is_active()) {
+        let who = format!("script trial {}", t.trial_id);
+        let fix = "Install the tool again, or end the trial.";
+        // The trial records no binary it cannot hash (over 16 MiB, unreadable), so an executable
+        // PATH finds now is present with no digest to compare, not missing.
+        let found = || crate::trial_cmd::window::locate(home, path, &t.tool);
+        rows.push(match (recorded(t), found()) {
+            (Some(b), _) => row(&who, Path::new(&b.path), Some(b), fix),
+            (None, Some(at)) => row(
+                &format!("{who}: no digest was recorded; PATH finds the tool"),
+                &at,
+                None,
+                fix,
+            ),
+            (None, None) => Row::new(
+                "binary",
+                D::ScriptBinary,
+                Level::Warn,
+                &format!("trials/{}.json", t.trial_id),
+                &format!(
+                    "{who}: no binary was recorded and PATH finds no executable named {} now",
+                    t.tool
+                ),
+                fix,
+            ),
+        });
+    }
+    let Some(l) = loaded else { return };
+    let declared =
+        l.resolved.resources.values().filter(|r| {
+            r.adapter == crate::adapters::script::ADAPTER && !r.sensitive && !in_scope(r)
+        });
+    for r in declared {
+        let Ok(d) = crate::adapters::script::declared(&r.value) else {
+            continue;
+        };
+        let at = home.join(&d.binary);
+        // The adopted trial that recorded this binary; the newest when there are several.
+        let since = trials
+            .iter()
+            .filter(|t| !t.is_active() && recorded(t).is_some_and(|b| Path::new(&b.path) == at))
+            .max_by_key(|t| t.created_unix_ns)
+            .and_then(recorded);
+        let who = format!("script/v1 declaration {}", r.id);
+        let fix = "Run dfm sync, which installs the declared tool again.";
+        rows.push(row(&who, &at, since, fix));
+    }
+}
+
+/// The sensitive paths in the spelling the ledger and the claims use. `sensitive` holds folded
+/// forms, which name no file on a case-sensitive file system.
+fn spelled_sensitive(
+    loaded: Option<&Loaded>,
+    ledger: &[Owned],
+    sensitive: &BTreeSet<String>,
+) -> Vec<String> {
+    let claims = loaded
+        .into_iter()
+        .flat_map(|l| l.resolved.resources.values())
+        .flat_map(|r| r.claims.iter().map(String::as_str));
+    let spelled: BTreeSet<&str> = ledger
+        .iter()
+        .map(|o| o.path.as_str())
+        .chain(claims)
+        .filter(|p| sensitive.contains(&fold(p)))
+        .collect();
+    spelled.into_iter().map(String::from).collect()
+}
+
+/// The metadata of each sensitive path's resolved target (HOME-relative, original spelling).
+/// Only metadata is read, never the content. A path that does not exist yet has no inode to
+/// share, so it is skipped. Any other failure is returned: the set of inodes is then unknown and
+/// the caller must hash nothing.
+fn sensitive_targets(home: &Path, spelled: &[String]) -> Result<Vec<std::fs::Metadata>, String> {
+    let mut out = Vec::new();
+    for s in spelled {
+        match std::fs::metadata(home.join(s)) {
+            Ok(m) => out.push(m),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(format!("{s}: {}", e.kind())),
+        }
+    }
+    Ok(out)
+}
+
+/// What a binary row must not read: the sensitive output paths (folded), the fragment
+/// directories of sensitive merges (HOME-relative) and the metadata of the sensitive targets.
+struct Protected<'a> {
+    sensitive: &'a BTreeSet<String>,
+    dirs: &'a [String],
+    targets: &'a Result<Vec<std::fs::Metadata>, String>,
+}
+
+/// Whether the binary path or the file it resolves to is a sensitive managed output: by path
+/// (HOME-relative, folded), by lying at or below a sensitive fragment directory (as spelled
+/// and resolved through its links), or by file identity (`dev`, `ino`), so a link or a hard
+/// link to a sensitive file in HOME or in its parents still matches.
+fn is_sensitive(home: &Path, at: &Path, real: &Path, p: &Protected) -> bool {
+    let real_home = std::fs::canonicalize(home).unwrap_or_else(|_| home.to_path_buf());
+    let hit = |p_: &Path, h: &Path| {
+        p_.strip_prefix(h)
+            .is_ok_and(|rel| p.sensitive.contains(&fold(&rel.to_string_lossy())))
+    };
+    let below = |x: &Path, d: &Path| {
+        let (x, d) = (fold(&x.to_string_lossy()), fold(&d.to_string_lossy()));
+        x == d || x.starts_with(&format!("{}/", d.trim_end_matches('/')))
+    };
+    let in_dir = p.dirs.iter().any(|d| {
+        let d = home.join(d);
+        let real_d = std::fs::canonicalize(&d).ok();
+        [at, real]
+            .iter()
+            .any(|x| below(x, &d) || real_d.as_deref().is_some_and(|r| below(x, r)))
+    });
+    let targets = p.targets.as_deref().unwrap_or_default();
+    hit(at, home)
+        || hit(real, &real_home)
+        || in_dir
+        || std::fs::metadata(real).is_ok_and(|m| {
+            targets
+                .iter()
+                .any(|t| (t.dev(), t.ino()) == (m.dev(), m.ino()))
+        })
+}
+
+/// The row of one script binary. The path is resolved through its links again and the file it
+/// points to now is hashed, up to the trial's hash cap. Nothing is executed. A path that is, or
+/// resolves to, a sensitive managed output (`sensitive`, folded) is never hashed.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one row from the shared doctor inputs; a struct would only rename them"
+)]
+fn binary_row(
+    who: &str,
+    at: &Path,
+    since: Option<&ScriptBinary>,
+    missing_fix: &str,
+    home: &Path,
+    path: &OsStr,
+    trials: &[TrialRecord],
+    protected: &Protected,
+    unhashed: Option<&str>,
+) -> Row {
+    let targets = protected.targets;
+    use crate::trial_cmd::window::{HASH_CAP, hash};
+    let mut notes = vec![who.to_string()];
+    let hashing = unhashed.is_none();
+    notes.extend(unhashed.map(String::from));
+    let mut fix = "";
+    match std::fs::canonicalize(at) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            fix = missing_fix;
+            notes.push(if std::fs::symlink_metadata(at).is_ok() {
+                "the link target of the binary path is missing".into()
+            } else {
+                "the binary path is missing".into()
+            });
+        }
+        Err(e) => {
+            fix = missing_fix;
+            notes.push(format!("the binary path cannot be resolved: {}", e.kind()));
+        }
+        Ok(real) if is_sensitive(home, at, &real, protected) => {
+            fix = "Point the binary path to the tool's own file, then install the tool again.";
+            notes.push(
+                "the binary resolves to a sensitive managed output, which is not read".into(),
+            );
+        }
+        Ok(_) if targets.is_err() => {
+            fix = "Fix the permissions of the named sensitive path, then run doctor again.";
+            notes.push(format!(
+                "no binary is hashed: the metadata of a sensitive managed path could not be read ({})",
+                targets.as_ref().err().map_or("", String::as_str)
+            ));
+        }
+        Ok(real) => {
+            let targets = targets.as_deref().unwrap_or_default();
+            let meta = std::fs::metadata(&real).ok().filter(|m| m.is_file());
+            let len = meta.as_ref().map(|m| m.len());
+            // As the trial requires (DFM-83): the owner execute bit.
+            let runnable = meta
+                .as_ref()
+                .is_some_and(|m| m.permissions().mode() & 0o100 != 0);
+            // A second name for the file can be a sensitive output whose path the set does not
+            // name (a hard link made after the ledger entry), so such a file is not read.
+            let shared = meta
+                .as_ref()
+                .is_some_and(|m| m.nlink() > 1 && targets.iter().any(|t| t.dev() == m.dev()));
+            let digest = len
+                .filter(|n| hashing && runnable && !shared && *n <= HASH_CAP)
+                .and_then(|_| hash(&real));
+            notes.push(match (len, digest) {
+                (Some(_), _) if !runnable => {
+                    fix = "Restore the execute bit (chmod u+x <real path>) or reinstall the tool.";
+                    format!(
+                        "resolves to {}, which is not executable by its owner",
+                        real.display()
+                    )
+                }
+                (Some(_), _) if !hashing => format!("resolves to {}", real.display()),
+                (Some(_), _) if shared => format!(
+                    "resolves to {}, which has more than one hard link on the file system of a \
+                     sensitive managed output and is not hashed",
+                    real.display()
+                ),
+                (None, _) => {
+                    fix = missing_fix;
+                    format!(
+                        "the binary path resolves to {}, which is not a file",
+                        real.display()
+                    )
+                }
+                (Some(n), _) if n > HASH_CAP => format!(
+                    "resolves to {}, which is larger than 16 MiB and is not hashed",
+                    real.display()
+                ),
+                (_, None) => format!("resolves to {}, which cannot be read", real.display()),
+                (_, Some(now)) => match since {
+                    None => format!(
+                        "resolves to {} (sha256 {now}); no trial record to compare",
+                        real.display()
+                    ),
+                    Some(b) if b.sha256 == now => {
+                        format!("binary unchanged since trial (sha256 {now})")
+                    }
+                    Some(b) if Path::new(&b.real_path) == real => {
+                        format!("binary changed since trial: sha256 {} -> {now}", b.sha256)
+                    }
+                    Some(b) => format!(
+                        "binary changed since trial: sha256 {} -> {now}; real path {} -> {}",
+                        b.sha256,
+                        b.real_path,
+                        real.display()
+                    ),
+                },
+            });
+        }
+    }
+    let tool = at.file_name().unwrap_or_default();
+    let copies = path_copies(home, path, tool);
+    // File identity, not name: hard links to one file are one copy. The canonical path stands in
+    // when `metadata` fails.
+    let files: BTreeSet<(u64, u64, Option<&Path>)> = copies
+        .iter()
+        .map(|(_, real)| match std::fs::metadata(real) {
+            Ok(m) => (m.dev(), m.ino(), None),
+            Err(_) => (0, 0, Some(real.as_path())),
+        })
+        .collect();
+    if files.len() > 1 {
+        if fix.is_empty() {
+            fix = "Remove the copies you do not use, or put the one you use first on PATH.";
+        }
+        let listed: Vec<String> = copies
+            .iter()
+            .map(|(c, real)| format!("{} ({})", c.display(), owner(c, real, home, trials)))
+            .collect();
+        notes.push(format!(
+            "PATH holds {} different files named {}: {}",
+            files.len(),
+            tool.to_string_lossy(),
+            listed.join(", ")
+        ));
+    }
+    let status = if fix.is_empty() {
+        Level::Ok
+    } else {
+        Level::Warn
+    };
+    Row::new(
+        "binary",
+        D::ScriptBinary,
+        status,
+        &at.display().to_string(),
+        &notes.join("; "),
+        fix,
+    )
+}
+
+/// Each executable named `tool` on the doctor process PATH and then on the provider path, with
+/// the file it resolves to. A directory is looked at once; relative and empty entries are
+/// skipped. `stat` and `realpath` only: nothing is executed.
+fn path_copies(
+    home: &Path,
+    path: &OsStr,
+    tool: &OsStr,
+) -> Vec<(std::path::PathBuf, std::path::PathBuf)> {
+    let mut seen = BTreeSet::new();
+    std::env::split_paths(path)
+        .chain(crate::provider_path(home))
+        .filter(|d| d.is_absolute() && seen.insert(d.clone()))
+        .map(|d| d.join(tool))
+        .filter(|c| {
+            std::fs::metadata(c).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+        })
+        .filter_map(|c| std::fs::canonicalize(&c).ok().map(|real| (c, real)))
+        .collect()
+}
+
+/// Who put a copy there: a script trial whose recorded path or real path is the copy or the file
+/// it resolves to, a `homebrew` path component (the package owner check's rule), the mise shims
+/// or installs directory, else `unknown`.
+fn owner(copy: &Path, real: &Path, home: &Path, trials: &[TrialRecord]) -> String {
+    let trial = trials.iter().find(|t| {
+        recorded(t).is_some_and(|b| {
+            [copy, real]
+                .iter()
+                .any(|p| *p == Path::new(&b.path) || *p == Path::new(&b.real_path))
+        })
+    });
+    if let Some(t) = trial {
+        return format!("script trial {}", t.trial_id);
+    }
+    let mise = home.join(".local/share/mise");
+    if copy.components().any(|c| c.as_os_str() == "homebrew") {
+        crate::adapters::package::HOMEBREW.into()
+    } else if copy.starts_with(mise.join("shims")) || copy.starts_with(mise.join("installs")) {
+        crate::adapters::package::MISE.into()
+    } else {
+        "unknown".into()
+    }
 }
 
 /// The ledger row and the owned outputs. One path outside HOME gets its own ERROR row and does
@@ -1433,7 +1832,96 @@ fn owned_row(path: &str, who: &str, op: Option<&Operation>, live: Live) -> Row {
 
 #[cfg(test)]
 mod tests {
-    use super::{Listing, executable_name, scan_listing, takes_slot};
+    use super::{
+        Listing, Protected, binary_row, executable_name, is_sensitive, scan_listing,
+        sensitive_targets, takes_slot,
+    };
+    use std::os::unix::fs::MetadataExt;
+
+    #[test]
+    fn a_sensitive_path_is_stat_ed_by_its_original_spelling() {
+        let home = std::env::temp_dir().join(format!("dfm-doctor-{}", std::process::id()));
+        std::fs::create_dir_all(home.join("Vault")).unwrap();
+        let file = home.join("Vault/Token");
+        std::fs::write(&file, b"x").unwrap();
+        let want = std::fs::metadata(&file).unwrap().ino();
+        let got = sensitive_targets(&home, &["Vault/Token".into()]).unwrap();
+        assert_eq!(got.iter().map(MetadataExt::ino).collect::<Vec<_>>(), [want]);
+        // A path that does not exist yet has no inode to share.
+        assert!(
+            sensitive_targets(&home, &["Vault/None".into()])
+                .unwrap()
+                .is_empty()
+        );
+        // Any other failure makes the set unknown.
+        let err = sensitive_targets(&home, &["Vault/Token/x".into()]).unwrap_err();
+        assert!(err.starts_with("Vault/Token/x: "), "{err}");
+        std::fs::remove_dir_all(&home).unwrap();
+    }
+
+    #[test]
+    fn a_binary_in_a_sensitive_fragment_directory_is_sensitive() {
+        let home = std::env::temp_dir().join(format!("dfm-doctor-frag-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(home.join(".claude/settings.d")).unwrap();
+        std::fs::create_dir_all(home.join("bin")).unwrap();
+        let frag = home.join(".claude/settings.d/x.json");
+        std::fs::write(&frag, b"{}").unwrap();
+        std::os::unix::fs::symlink(home.join(".claude"), home.join("alias")).unwrap();
+        let link = home.join("bin/boat");
+        std::os::unix::fs::symlink(home.join("alias/settings.d/x.json"), &link).unwrap();
+        let real = std::fs::canonicalize(&link).unwrap();
+        let none = std::collections::BTreeSet::new();
+        let targets = Ok(Vec::new());
+        let p = |dirs| Protected {
+            sensitive: &none,
+            dirs,
+            targets: &targets,
+        };
+        let dirs = [".claude/settings.d".to_string()];
+        assert!(is_sensitive(&home, &link, &real, &p(&dirs)));
+        assert!(!is_sensitive(&home, &link, &real, &p(&[])));
+        // A sibling directory with the same prefix is not inside.
+        assert!(!is_sensitive(
+            &home,
+            &link,
+            &real,
+            &p(&[".claude/settings".to_string()])
+        ));
+        std::fs::remove_dir_all(&home).unwrap();
+    }
+
+    #[test]
+    fn a_hard_link_to_a_fragment_outside_its_directory_is_not_hashed() {
+        let home = std::env::temp_dir().join(format!("dfm-doctor-hl-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(home.join(".claude/settings.d")).unwrap();
+        std::fs::create_dir_all(home.join("bin")).unwrap();
+        let frag = home.join(".claude/settings.d/x.json");
+        std::fs::write(&frag, b"#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&frag, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
+        let bin = home.join("bin/boat");
+        std::fs::hard_link(&frag, &bin).unwrap();
+        let none = std::collections::BTreeSet::new();
+        let dirs = [".claude/settings.d".to_string()];
+        let row = |dirs: &[String]| {
+            let targets = sensitive_targets(&home, dirs);
+            let p = Protected {
+                sensitive: &none,
+                dirs,
+                targets: &targets,
+            };
+            let path = home.join("bin").into_os_string();
+            binary_row("t", &bin, None, "", &home, &path, &[], &p, None).detail
+        };
+        let protected = row(&dirs);
+        assert!(!protected.contains("sha256"), "{protected}");
+        assert!(protected.contains("more than one hard link"), "{protected}");
+        // Without the directory the same file is hashed: the check is what keeps it out.
+        assert!(row(&[]).contains("sha256"));
+        std::fs::remove_dir_all(&home).unwrap();
+    }
 
     #[test]
     fn a_script_package_is_searched_for_by_its_declared_binary() {

@@ -602,7 +602,7 @@ fn protected_set(
 /// are skipped, as [`window::binary`] skips them.
 pub(super) fn on_path(home: &Path, path_var: &OsStr, tool: &str) -> Vec<PathBuf> {
     let mut dirs: Vec<PathBuf> = Vec::new();
-    for d in std::env::split_paths(path_var).chain(dfm_platform_macos::provider_path(home)) {
+    for d in std::env::split_paths(path_var).chain(crate::provider_path(home)) {
         if d.is_absolute() && !dirs.contains(&d) {
             dirs.push(d);
         }

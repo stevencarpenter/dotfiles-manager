@@ -1926,3 +1926,390 @@ fn doctor_names_the_grant_a_declared_missing_tool_needs() {
     assert_eq!(r["code"], "D_PLAN_PENDING", "{r:#}");
     assert_eq!(fx.curls(), 0, "{}", fx.log());
 }
+
+// ---- doctor rows for script-installed binaries (DFM-84) -------------------------------------
+
+/// The binary BARE installs, as bytes.
+const BARE_BINARY: &[u8] = b"#!/bin/sh\necho boat\n";
+
+impl Fx {
+    /// The `D_SCRIPT_BINARY` rows of `doctor --json` run with `path` as PATH.
+    fn binary_rows(&self, path: &str) -> Vec<serde_json::Value> {
+        let o = self
+            .command(&["doctor", "--json"])
+            .env("PATH", path)
+            .output()
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&o.stdout)
+            .unwrap_or_else(|e| panic!("{e}\n{}\n{}", text(&o.stdout), stderr(&o)));
+        v["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|r| r["code"] == "D_SCRIPT_BINARY")
+            .cloned()
+            .collect()
+    }
+
+    /// The one `D_SCRIPT_BINARY` row with the fixture's PATH.
+    fn binary_row(&self) -> serde_json::Value {
+        let rows = self.binary_rows(&self.path_var());
+        assert_eq!(rows.len(), 1, "{rows:#?}");
+        rows[0].clone()
+    }
+
+    /// An executable file at `rel` below HOME with `body`.
+    fn tool_file(&self, rel: &str, body: &[u8]) -> PathBuf {
+        let p = self.h(rel);
+        fs::create_dir_all(p.parent().unwrap()).unwrap();
+        fs::write(&p, body).unwrap();
+        fs::set_permissions(&p, fs::Permissions::from_mode(0o755)).unwrap();
+        p
+    }
+}
+
+fn detail(r: &serde_json::Value) -> &str {
+    r["detail"].as_str().unwrap()
+}
+
+#[test]
+fn doctor_hashes_the_file_the_binary_link_points_to_now() {
+    if no_sandbox() {
+        return;
+    }
+    let fx = Fx::new();
+    fx.bind_with_links();
+    fx.script_trial(BARE, &[]);
+    let link = fx.h(".local/bin/boat");
+    let old_real = fs::canonicalize(fx.h(".bare/bin/boat")).unwrap();
+    let old = sha(BARE_BINARY);
+    let r = fx.binary_row();
+    assert_eq!(r["status"], "OK", "{r:#}");
+    assert_eq!(r["kind"], "binary", "{r:#}");
+    assert_eq!(r["subject"], link.to_str().unwrap(), "{r:#}");
+    assert!(detail(&r).starts_with("script trial trial-boat"), "{r:#}");
+    assert!(
+        detail(&r).contains(&format!("binary unchanged since trial (sha256 {old})")),
+        "{r:#}"
+    );
+    // An updater points the link to a new file and leaves the old file in place. The new file
+    // leaves a marker when it runs: doctor must never run it.
+    let body = b"#!/bin/sh\ntouch \"$HOME/ran\"\n";
+    let new = fx.tool_file(".bare/versions/2/boat", body);
+    fs::remove_file(&link).unwrap();
+    std::os::unix::fs::symlink(&new, &link).unwrap();
+    let new_real = fs::canonicalize(&new).unwrap();
+    let r = fx.binary_row();
+    assert_eq!(r["status"], "OK", "{r:#}");
+    assert!(
+        detail(&r).contains(&format!(
+            "binary changed since trial: sha256 {old} -> {}; real path {} -> {}",
+            sha(body),
+            old_real.display(),
+            new_real.display()
+        )),
+        "{r:#}"
+    );
+    assert_eq!(fs::read(&old_real).unwrap(), BARE_BINARY);
+    assert!(!fx.h("ran").exists());
+}
+
+#[test]
+fn a_missing_link_target_or_binary_path_is_warn() {
+    if no_sandbox() {
+        return;
+    }
+    let fx = Fx::new();
+    fx.bind_with_links();
+    fx.script_trial(BARE, &[]);
+    fs::remove_file(fx.h(".bare/bin/boat")).unwrap();
+    let r = fx.binary_row();
+    assert_eq!(r["status"], "WARN", "{r:#}");
+    assert!(
+        detail(&r).contains("the link target of the binary path is missing"),
+        "{r:#}"
+    );
+    fs::remove_file(fx.h(".local/bin/boat")).unwrap();
+    let r = fx.binary_row();
+    assert_eq!(r["status"], "WARN", "{r:#}");
+    assert!(detail(&r).contains("the binary path is missing"), "{r:#}");
+}
+
+#[test]
+fn a_second_copy_on_path_is_warn_and_names_each_owner() {
+    if no_sandbox() {
+        return;
+    }
+    let fx = Fx::new();
+    fx.bind_with_links();
+    fx.script_trial(BARE, &[]);
+    let brew = fx.tool_file("opt/homebrew/bin/boat", b"#!/bin/sh\necho brew\n");
+    let mise = fx.tool_file(".local/share/mise/shims/boat", b"#!/bin/sh\necho mise\n");
+    let other = fx.tool_file("other/bin/boat", b"#!/bin/sh\necho other\n");
+    // A second link to the trial's file is the same file, not a second copy.
+    let alias = fx.h("alias/boat");
+    fs::create_dir_all(alias.parent().unwrap()).unwrap();
+    std::os::unix::fs::symlink(fx.h(".bare/bin/boat"), &alias).unwrap();
+    let dir = |p: &Path| p.parent().unwrap().display().to_string();
+    let path = [
+        dir(&alias),
+        dir(&brew),
+        dir(&mise),
+        dir(&other),
+        "relative/bin".into(),
+        String::new(),
+        fx.path_var(),
+    ]
+    .join(":");
+    let rows = fx.binary_rows(&path);
+    assert_eq!(rows.len(), 1, "{rows:#?}");
+    let r = &rows[0];
+    assert_eq!(r["status"], "WARN", "{r:#}");
+    let d = detail(r);
+    assert!(
+        d.contains("PATH holds 4 different files named boat:"),
+        "{r:#}"
+    );
+    for (p, owner) in [
+        (&alias, "script trial trial-boat"),
+        (&brew, "homebrew/v1"),
+        (&mise, "mise/v1"),
+        (&other, "unknown"),
+        (&fx.h(".local/bin/boat"), "script trial trial-boat"),
+    ] {
+        assert!(
+            d.contains(&format!("{} ({owner})", p.display())),
+            "{p:?}\n{r:#}"
+        );
+    }
+    // Without the other copies there is no finding.
+    assert_eq!(fx.binary_row()["status"], "OK");
+}
+
+#[test]
+fn an_adopted_declaration_gets_a_binary_row_against_its_trial() {
+    if no_sandbox() {
+        return;
+    }
+    let fx = Fx::new();
+    fx.bind_with_links();
+    fx.script_trial(BARE, &[]);
+    let (_, o) = fx.adopt();
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+    let r = fx.binary_row();
+    assert_eq!(r["status"], "OK", "{r:#}");
+    assert_eq!(r["subject"], fx.h(".local/bin/boat").to_str().unwrap());
+    assert!(
+        detail(&r).starts_with("script/v1 declaration extra.boat"),
+        "{r:#}"
+    );
+    assert!(
+        detail(&r).contains(&format!(
+            "binary unchanged since trial (sha256 {})",
+            sha(BARE_BINARY)
+        )),
+        "{r:#}"
+    );
+    fx.remove_tool();
+    let r = fx.binary_row();
+    assert_eq!(r["status"], "WARN", "{r:#}");
+    assert!(detail(&r).contains("the binary path is missing"), "{r:#}");
+}
+
+#[test]
+fn a_script_trial_that_recorded_no_binary_is_warn() {
+    if no_sandbox() {
+        return;
+    }
+    let fx = Fx::new();
+    fx.bind_with_links();
+    fx.script_trial("#!/bin/sh\nmkdir -p \"$HOME/.config/ascii\"\n", &[]);
+    let r = fx.binary_row();
+    assert_eq!(r["status"], "WARN", "{r:#}");
+    assert_eq!(r["subject"], "trials/trial-boat.json", "{r:#}");
+    assert!(detail(&r).contains("no binary was recorded"), "{r:#}");
+}
+
+#[test]
+fn a_binary_linked_to_a_sensitive_output_is_warn_and_not_hashed() {
+    if no_sandbox() {
+        return;
+    }
+    let fx = Fx::new();
+    fx.bind_with_links();
+    fx.script_trial(BARE, &[]);
+    // A file the ledger records with the sensitive class, owned by another resource.
+    let secret = fx.tool_file(".vault/token", b"hunter2-secret");
+    let f = fx.state().join("ledger.json");
+    let mut l: serde_json::Value = serde_json::from_slice(&fs::read(&f).unwrap()).unwrap();
+    l["resources"]
+        .as_array_mut()
+        .unwrap()
+        .push(serde_json::json!({
+            "resource": "vault", "adapter": "fs-link/v1", "class": "sensitive", "op_id": "x-1",
+            "owned_outputs": [{"path": secret, "mode": 420, "fingerprint": null}],
+        }));
+    fs::write(&f, serde_json::to_vec(&l).unwrap()).unwrap();
+    let link = fx.h(".local/bin/boat");
+    fs::remove_file(&link).unwrap();
+    std::os::unix::fs::symlink(&secret, &link).unwrap();
+    let rows = fx.binary_rows(&fx.path_var());
+    let json = serde_json::to_string(&rows).unwrap();
+    assert!(!json.contains(&sha(b"hunter2-secret")), "{rows:#?}");
+    let r = rows
+        .iter()
+        .find(|r| r["subject"] == link.to_str().unwrap())
+        .unwrap();
+    assert_eq!(r["status"], "WARN", "{r:#}");
+    assert!(
+        detail(r).contains("the binary resolves to a sensitive managed output"),
+        "{r:#}"
+    );
+    assert!(!detail(r).contains("sha256"), "{r:#}");
+}
+
+#[test]
+fn a_binary_without_the_owner_execute_bit_is_warn() {
+    if no_sandbox() {
+        return;
+    }
+    let fx = Fx::new();
+    fx.bind_with_links();
+    fx.script_trial(BARE, &[]);
+    let real = fs::canonicalize(fx.h(".bare/bin/boat")).unwrap();
+    fs::set_permissions(&real, fs::Permissions::from_mode(0o644)).unwrap();
+    let r = fx.binary_row();
+    assert_eq!(r["status"], "WARN", "{r:#}");
+    assert!(detail(&r).contains("not executable by its owner"), "{r:#}");
+    assert!(r["fix"].as_str().unwrap().contains("chmod u+x"), "{r:#}");
+}
+
+#[test]
+fn a_binary_hard_linked_to_a_sensitive_output_is_not_hashed() {
+    if no_sandbox() {
+        return;
+    }
+    let fx = Fx::new();
+    fx.bind_with_links();
+    fx.script_trial(BARE, &[]);
+    let secret = fx.tool_file(".vault/token", b"hunter2-secret");
+    let f = fx.state().join("ledger.json");
+    let mut l: serde_json::Value = serde_json::from_slice(&fs::read(&f).unwrap()).unwrap();
+    l["resources"]
+        .as_array_mut()
+        .unwrap()
+        .push(serde_json::json!({
+            "resource": "vault", "adapter": "fs-link/v1", "class": "sensitive", "op_id": "x-1",
+            "owned_outputs": [{"path": secret, "mode": 420, "fingerprint": null}],
+        }));
+    fs::write(&f, serde_json::to_vec(&l).unwrap()).unwrap();
+    // A second name for the same inode: no path comparison can see it.
+    let link = fx.h(".local/bin/boat");
+    fs::remove_file(&link).unwrap();
+    fs::hard_link(&secret, &link).unwrap();
+    let rows = fx.binary_rows(&fx.path_var());
+    let json = serde_json::to_string(&rows).unwrap();
+    assert!(!json.contains(&sha(b"hunter2-secret")), "{rows:#?}");
+    let r = rows
+        .iter()
+        .find(|r| r["subject"] == link.to_str().unwrap())
+        .unwrap();
+    assert_eq!(r["status"], "WARN", "{r:#}");
+    assert!(
+        detail(r).contains("the binary resolves to a sensitive managed output"),
+        "{r:#}"
+    );
+}
+
+#[test]
+fn an_unreadable_ledger_hashes_no_binary_and_says_so() {
+    if no_sandbox() {
+        return;
+    }
+    let fx = Fx::new();
+    fx.bind_with_links();
+    fx.script_trial(BARE, &[]);
+    let r = fx.binary_row();
+    assert!(detail(&r).contains("sha256"), "{r:#}");
+    fs::write(fx.state().join("ledger.json"), b"not json").unwrap();
+    let rows = fx.binary_rows(&fx.path_var());
+    assert_eq!(rows.len(), 1, "{rows:#?}");
+    let r = &rows[0];
+    assert_eq!(r["status"], "OK", "{r:#}");
+    assert!(detail(r).contains("the ledger cannot be read"), "{r:#}");
+    assert!(!detail(r).contains("sha256"), "{r:#}");
+}
+
+#[test]
+fn an_unresolved_profile_hashes_no_binary_and_says_so() {
+    if no_sandbox() {
+        return;
+    }
+    let fx = Fx::new();
+    fx.bind_with_links();
+    fx.script_trial(BARE, &[]);
+    assert!(detail(&fx.binary_row()).contains("sha256"));
+    fs::write(fx.root.join("profiles/t-01.toml"), b"not [toml").unwrap();
+    let rows = fx.binary_rows(&fx.path_var());
+    assert_eq!(rows.len(), 1, "{rows:#?}");
+    let r = &rows[0];
+    assert_eq!(r["status"], "OK", "{r:#}");
+    assert!(detail(r).contains("the profile is not resolved"), "{r:#}");
+    assert!(!detail(r).contains("sha256"), "{r:#}");
+}
+
+#[test]
+fn hard_links_to_one_file_on_path_are_not_a_second_copy() {
+    if no_sandbox() {
+        return;
+    }
+    let fx = Fx::new();
+    fx.bind_with_links();
+    fx.script_trial(BARE, &[]);
+    let first = fx.tool_file("hl1/boat", b"#!/bin/sh\necho hl\n");
+    let second = fx.h("hl2/boat");
+    fs::create_dir_all(second.parent().unwrap()).unwrap();
+    fs::hard_link(&first, &second).unwrap();
+    let dir = |p: &Path| p.parent().unwrap().display().to_string();
+    // Both entries share one inode: one file, no WARN.
+    let rows = fx.binary_rows(&[dir(&first), dir(&second)].join(":"));
+    assert_eq!(rows.len(), 1, "{rows:#?}");
+    assert_eq!(rows[0]["status"], "OK", "{rows:#?}");
+    assert!(!detail(&rows[0]).contains("PATH holds"), "{rows:#?}");
+}
+
+#[test]
+fn a_binary_over_the_hash_cap_is_present_with_no_digest() {
+    if no_sandbox() {
+        return;
+    }
+    let fx = Fx::new();
+    fx.bind_with_links();
+    // A sparse executable just over 16 MiB: the trial records no binary it cannot hash.
+    fx.script_trial(
+        &BARE.replace(
+            "chmod 755",
+            "dd if=/dev/null of=\"$HOME/.bare/bin/boat\" bs=1 seek=16777217 2>/dev/null\nchmod 755",
+        ),
+        &[],
+    );
+    let r = fx.binary_row();
+    assert_eq!(r["status"], "OK", "{r:#}");
+    assert_eq!(
+        r["subject"],
+        fx.h(".local/bin/boat").to_str().unwrap(),
+        "{r:#}"
+    );
+    assert!(detail(&r).contains("no digest was recorded"), "{r:#}");
+    assert!(detail(&r).contains("larger than 16 MiB"), "{r:#}");
+    assert!(!detail(&r).contains("sha256"), "{r:#}");
+    // The second-copy check still runs.
+    fx.tool_file(".other/boat", b"#!/bin/sh\necho other\n");
+    let rows = fx.binary_rows(&format!("{}:{}", fx.path_var(), fx.h(".other").display()));
+    let r = &rows[0];
+    assert_eq!(r["status"], "WARN", "{r:#}");
+    assert!(
+        detail(r).contains("PATH holds 2 different files named boat"),
+        "{r:#}"
+    );
+}

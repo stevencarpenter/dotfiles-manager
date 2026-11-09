@@ -226,7 +226,7 @@ A crash, a SIGKILL or a system sleep that kills the run leaves a record with `be
 
 When several problems occur in one run, the result carries the highest-ranked code and names every problem. The order is a stop request, then `E_CONFLICT` (a tracked file changed), then the rest. After the script, dfm compares the `tracked_status` snapshot of the guarded checkouts. A change is left in place, not reverted, staged or committed (docs/upgrade.md, "Tracked files"). The sandbox should make such a change impossible, so this is a second check.
 
-The journal operation is `trial-script`. `doctor` shows an active script trial as `<tool> installed by the trial through <url>`. `purge` refuses a script trial with `E_CONFLICT` until DFM-82. `adopt` takes it (docs/adopt.md).
+The journal operation is `trial-script`. `doctor` shows an active script trial as `<tool> installed by the trial through <url>`, and adds a `binary` row that hashes the tool binary again (docs/doctor.md, "Script binaries"). `purge` refuses a script trial with `E_CONFLICT` until DFM-82. `adopt` takes it (docs/adopt.md).
 
 ### Differences from the design
 
