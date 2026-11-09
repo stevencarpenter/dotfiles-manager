@@ -99,8 +99,8 @@ struct PathItem {
     path: String,
     now: Now,
     step: Step,
-    /// The inode fence a window candidate must still pass when it is removed; `None` for a
-    /// baseline path, which the fence does not cover.
+    /// The inode fence a script trial's candidate must still pass when it is removed; `None`
+    /// for a package trial, which has no fence.
     fence: Option<InodeFence>,
 }
 
@@ -1350,6 +1350,17 @@ pub fn run(ctx: &Ctx, args: &Args, out: &mut dyn Write) -> Result<(), Refusal> {
                 )
             })
             .collect();
+        // A script could move a pre-existing file into a baseline path the window does not
+        // watch (`~/Library/Caches/<tool>`), so a script trial's baseline candidates pass the
+        // same inode fence as its window candidates, now and again just before removal.
+        if let Some(s) = &t.script {
+            for i in paths.iter_mut().filter(|i| i.step == Step::Do) {
+                match fence_keep(Path::new(&i.path), s.fence) {
+                    Some(why) => i.step = Step::Keep(why),
+                    None => i.fence = s.fence,
+                }
+            }
+        }
         let mut no_trees = t
             .unknown
             .iter()

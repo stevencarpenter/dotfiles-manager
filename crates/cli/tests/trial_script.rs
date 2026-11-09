@@ -3379,6 +3379,37 @@ fn an_inexact_window_name_keeps_every_window_candidate() {
 }
 
 #[test]
+fn a_baseline_data_path_moved_in_from_elsewhere_is_kept() {
+    if no_sandbox() {
+        return;
+    }
+    let fx = Fx::new();
+    fx.bind_with_links();
+    // `~/Library/Caches/boat` is a data candidate the window does not watch.
+    fs::create_dir_all(fx.h("Documents/old")).unwrap();
+    fs::write(fx.h("Documents/old/keep.txt"), "mine\n").unwrap();
+    fs::create_dir_all(fx.h("Library/Caches")).unwrap();
+    sandboxed(&fx, "set -e\nmv ~/Documents/old ~/Library/Caches/boat\n");
+    let (preview, run) = purged(&fx);
+    let shown = text(&preview.stdout);
+    let cache = fx.h("Library/Caches/boat").display().to_string();
+    assert!(
+        shown.contains(&format!("keep: remove {cache}"))
+            && shown.contains("existed before the trial"),
+        "{shown}"
+    );
+    assert!(
+        !shown.contains(&format!("action: remove {cache}")),
+        "{shown}"
+    );
+    assert_eq!(code(&run), 0, "{}\n{}", stderr(&run), text(&run.stdout));
+    assert_eq!(
+        fs::read_to_string(fx.h("Library/Caches/boat/keep.txt")).unwrap(),
+        "mine\n"
+    );
+}
+
+#[test]
 fn a_window_without_an_exit_removes_no_window_candidate() {
     if no_sandbox() {
         return;
