@@ -7,7 +7,7 @@ mod common;
 
 use common::providers::{FAKE_BREW, FAKE_GITLEAKS, FAKE_MISE, FAKE_OP, native_tool};
 use common::remote::{Remote, git, lock_for, put};
-use common::{TempDir, code, fingerprint, is_root, skip, text};
+use common::{TempDir, code, fingerprint, fingerprint_except, is_root, skip, text};
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -675,4 +675,177 @@ fn a_public_profile_resolves_with_the_private_source_absent() {
     assert_eq!(code(&o), 3, "{}\n{}", out(&o), err(&o));
     assert!(err(&o).contains("E_SOURCE_MISSING"), "{}", err(&o));
     assert_eq!(fingerprint(w.home.path()), before);
+}
+
+/// Runs `cmd` with its standard input an open pipe that never receives a byte, and kills it if
+/// it has not finished in `secs`: a command that waits for an answer fails the test instead of
+/// hanging the gate.
+fn noninteractive(mut cmd: Command, secs: u64) -> Output {
+    use std::process::Stdio;
+    let mut child = cmd
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let _held_open = child.stdin.take();
+    let start = std::time::Instant::now();
+    while child.try_wait().unwrap().is_none() {
+        if start.elapsed().as_secs() >= secs {
+            let _ = child.kill();
+            panic!("command did not finish within {secs} s: {cmd:?}");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    child.wait_with_output().unwrap()
+}
+
+#[test]
+fn without_an_approval_no_command_waits_or_changes_anything() {
+    let w = World::synced();
+    ok(&w.approved(&["trial", "tuicr", "--provider", "homebrew/v1"]));
+    put(
+        w.home.path(),
+        ".config/tuicr/config.toml",
+        "theme = \"dark\"\n",
+    );
+    let token = w.h(".config/work/token.env");
+    // docs/adopt.md: the scan's parent directory `adopt-scan/` persists by design, so the adopt
+    // case leaves it out of the HOME comparison. It exists beforehand, as after any earlier scan.
+    let scan = w.h(".cache/dotfiles-manager/adopt-scan");
+    fs::create_dir_all(&scan).unwrap();
+    fs::set_permissions(&scan, fs::Permissions::from_mode(0o700)).unwrap();
+    let index = w.root.join(".git/index");
+    let index_state = || {
+        (
+            fs::read(&index).unwrap(),
+            fs::metadata(&index).unwrap().modified().unwrap(),
+        )
+    };
+    let cases: [(&[&str], Option<&Path>); 5] = [
+        (&["apply", "--root", w.root_arg()], Some(&w.h(".zshrc"))),
+        (&["secrets", "--root", w.root_arg()], Some(&token)),
+        (&["trial", "duckdb", "--provider", "mise/v1"], None),
+        (&["adopt", "trial-tuicr", "--module", "extra"], None),
+        (&["purge", "trial-tuicr"], None),
+    ];
+    for (args, remove) in cases {
+        if let Some(p) = remove {
+            fs::remove_file(p).unwrap();
+        }
+        let skip: &[&Path] = if args[0] == "adopt" { &[&scan] } else { &[] };
+        let fingerprints = || {
+            let mut f = w.fingerprints();
+            f[0] = fingerprint_except(w.home.path(), skip);
+            f
+        };
+        let before = fingerprints();
+        let index_before = index_state();
+        let log = w.log();
+        let o = noninteractive(w.command(&[], args), 60);
+        assert_eq!(code(&o), 3, "{args:?}\n{}\n{}", out(&o), err(&o));
+        assert!(
+            err(&o).contains("E_APPROVAL_REQUIRED"),
+            "{args:?}\n{}",
+            err(&o)
+        );
+        assert!(out(&o).contains("plan digest: "), "{args:?}\n{}", out(&o));
+        // The regression check for the refused adopt that refreshed the index (DFM-36).
+        assert!(index_state() == index_before, "{args:?} rewrote .git/index");
+        assert_eq!(fingerprints(), before, "{args:?} changed something");
+        let new = &w.log()[log.len()..];
+        for l in new.lines() {
+            for effect in [
+                "brew install",
+                "brew uninstall",
+                "mise install",
+                "mise uninstall",
+                "op inject",
+            ] {
+                assert!(!l.starts_with(effect), "{args:?} ran {l}");
+            }
+        }
+    }
+    // Before any grant, the daily run refuses before it fetches.
+    let w = World::new();
+    let remotes = [fingerprint(&w.public.bare), fingerprint(&w.private.bare)];
+    let o = noninteractive(w.command(&[], &["sync", "--root", w.root_arg()]), 60);
+    assert_eq!(code(&o), 3, "{}\n{}", out(&o), err(&o));
+    assert!(err(&o).contains("E_SOURCE_UNTRUSTED"), "{}", err(&o));
+    assert!(err(&o).contains("nothing was fetched"), "{}", err(&o));
+    assert_eq!(
+        [fingerprint(&w.public.bare), fingerprint(&w.private.bare)],
+        remotes
+    );
+    assert!(!w.h(".cache/dotfiles-manager/staging").exists());
+}
+
+#[test]
+fn a_missing_vault_session_or_provider_is_reported_and_nothing_is_forged() {
+    let warnings = |o: &Output| -> Vec<String> {
+        out(o)
+            .lines()
+            .filter(|l| l.starts_with("warning: "))
+            .map(str::to_string)
+            .collect()
+    };
+    let w = World::granted();
+    fs::remove_file(w.fake.path().join("signed-in")).unwrap();
+    // Without a vault session, sync publishes everything else and says what it skipped.
+    let o = w.sync(&[]);
+    ok(&o);
+    let s = out(&o);
+    assert!(
+        s.contains("  secrets: skipped: no session (work.token)"),
+        "{s}"
+    );
+    // The run ends `ok` and its last lines name what it did not do.
+    assert!(s.contains("\nresult: ok\nwarning: "), "{s}");
+    let found = warnings(&o);
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert!(
+        found[0].starts_with("warning: secrets skipped"),
+        "{found:?}"
+    );
+    assert_eq!(s.lines().last(), Some(found[0].as_str()));
+    assert!(!w.h(".config/work/token.env").exists());
+    assert!(w.h(".zshrc").is_symlink() && w.h(".config/work/profile").is_symlink());
+    assert!(!w.log().contains("op inject"), "{}", w.log());
+    let before = fingerprint(w.home.path());
+    let o = w.run(&["secrets", "--root", w.root_arg()]);
+    assert_eq!(code(&o), 3, "{}\n{}", out(&o), err(&o));
+    assert!(err(&o).contains("E_CREDENTIAL_UNAVAILABLE"), "{}", err(&o));
+    assert!(err(&o).contains("nothing was changed"), "{}", err(&o));
+    assert_eq!(fingerprint(w.home.path()), before);
+    // Without brew, the packages scope is blocked and no trial starts.
+    fs::remove_file(w.bin().join("brew")).unwrap();
+    let o = w.run(&["packages", "--root", w.root_arg()]);
+    assert_eq!(code(&o), 3, "{}\n{}", out(&o), err(&o));
+    assert!(
+        err(&o).contains("E_PROBE_FAILED extra.atuin"),
+        "{}",
+        err(&o)
+    );
+    assert!(err(&o).contains("brew was not found"), "{}", err(&o));
+    let o = w.sync(&[]);
+    ok(&o);
+    assert!(out(&o).contains("  packages: blocked"), "{}", out(&o));
+    assert!(out(&o).contains("\nresult: ok\nwarning: "), "{}", out(&o));
+    // The session is still absent, so the secrets warning follows the packages one.
+    let found = warnings(&o);
+    assert_eq!(found.len(), 2, "{found:?}");
+    assert!(
+        found[0].starts_with("warning: packages blocked"),
+        "{found:?}"
+    );
+    assert!(
+        found[1].starts_with("warning: secrets skipped"),
+        "{found:?}"
+    );
+    assert_eq!(out(&o).lines().last(), Some(found[1].as_str()));
+    let o = w.run(&["trial", "tuicr", "--provider", "homebrew/v1"]);
+    assert_eq!(code(&o), 3, "{}\n{}", out(&o), err(&o));
+    assert!(err(&o).contains("E_PROBE_FAILED"), "{}", err(&o));
+    assert!(err(&o).contains("nothing was changed"), "{}", err(&o));
+    assert!(!w.state().join("trials/trial-tuicr.json").exists());
 }
