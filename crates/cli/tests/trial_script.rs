@@ -2241,6 +2241,24 @@ fn an_unreadable_ledger_hashes_no_binary_and_says_so() {
 }
 
 #[test]
+fn an_unresolved_profile_hashes_no_binary_and_says_so() {
+    if no_sandbox() {
+        return;
+    }
+    let fx = Fx::new();
+    fx.bind_with_links();
+    fx.script_trial(BARE, &[]);
+    assert!(detail(&fx.binary_row()).contains("sha256"));
+    fs::write(fx.root.join("profiles/t-01.toml"), b"not [toml").unwrap();
+    let rows = fx.binary_rows(&fx.path_var());
+    assert_eq!(rows.len(), 1, "{rows:#?}");
+    let r = &rows[0];
+    assert_eq!(r["status"], "OK", "{r:#}");
+    assert!(detail(r).contains("the profile is not resolved"), "{r:#}");
+    assert!(!detail(r).contains("sha256"), "{r:#}");
+}
+
+#[test]
 fn hard_links_to_one_file_on_path_are_not_a_second_copy() {
     if no_sandbox() {
         return;

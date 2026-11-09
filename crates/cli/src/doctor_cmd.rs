@@ -346,15 +346,27 @@ fn script_binary_rows(
         .filter(|r| r.sensitive)
         .flat_map(|r| r.dir_claims.iter().map(|d| d.dir.clone()))
         .collect();
-    // Without the ledger the sensitive set may miss a stale output path, so nothing is hashed.
-    let hashing = ledger.is_some();
+    // Without the ledger the sensitive set may miss a stale output path, and without the
+    // resolved profile the fragment directories are unknown, so nothing is hashed.
+    let unhashed = if ledger.is_none() {
+        Some("no digest: the ledger cannot be read, so no binary is hashed")
+    } else if loaded.is_none() {
+        Some(
+            "no digest: the profile is not resolved, so its sensitive fragment directories are \
+             unknown and no binary is hashed",
+        )
+    } else {
+        None
+    };
     let protected = Protected {
         sensitive,
         dirs: &dirs,
         targets: &targets,
     };
     let row = |who: &str, at: &Path, since, fix| {
-        binary_row(who, at, since, fix, home, path, trials, &protected, hashing)
+        binary_row(
+            who, at, since, fix, home, path, trials, &protected, unhashed,
+        )
     };
     for t in trials.iter().filter(|t| t.is_active()) {
         let who = format!("script trial {}", t.trial_id);
@@ -497,14 +509,13 @@ fn binary_row(
     path: &OsStr,
     trials: &[TrialRecord],
     protected: &Protected,
-    hashing: bool,
+    unhashed: Option<&str>,
 ) -> Row {
     let targets = protected.targets;
     use crate::trial_cmd::window::{HASH_CAP, hash};
     let mut notes = vec![who.to_string()];
-    if !hashing {
-        notes.push("no digest: the ledger cannot be read, so no binary is hashed".into());
-    }
+    let hashing = unhashed.is_none();
+    notes.extend(unhashed.map(String::from));
     let mut fix = "";
     match std::fs::canonicalize(at) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
