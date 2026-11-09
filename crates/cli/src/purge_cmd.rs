@@ -885,7 +885,13 @@ fn hold_dirs(items: &mut Vec<PathItem>, retained: &[(String, String)]) -> Vec<St
         }
         let why = if let Some(k) = kept
             .iter()
-            .find(|k| !same_path(k, &i.path) && at_or_below(k, &i.path))
+            .find(|k| {
+                !same_path(k, &i.path)
+                    && (at_or_below(k, &i.path)
+                        // A kept path reached through a linked parent names the directory by
+                        // another spelling.
+                        || at_or_below(&s(via_parents(Path::new(k))), &s(resolved(Path::new(&i.path)))))
+            })
         {
             format!("holds {}, which is kept", visible(k))
         } else if let Some((l, ..)) = links.iter().find(|(_, t, r)| {
@@ -918,6 +924,15 @@ fn resolved(p: &Path) -> PathBuf {
             }
             _ => return p,
         }
+    }
+}
+
+/// `p` with the links among its parents resolved and its own last component kept as it is, so a
+/// kept link is not followed to its target.
+fn via_parents(p: &Path) -> PathBuf {
+    match (p.parent(), p.file_name()) {
+        (Some(up), Some(n)) => resolved(up).join(n),
+        _ => resolved(p),
     }
 }
 
@@ -1185,8 +1200,22 @@ pub fn run(ctx: &Ctx, args: &Args, out: &mut dyn Write) -> Result<(), Refusal> {
             // A run that did not finish has no window: what was created since `before` is. The
             // live diff's link targets are today's, so no target counts as recorded.
             let live: Vec<WindowEntry>;
+            // A run that ended but has no window failed its after-observation (a cap, for
+            // example): what changed during the run is unknown, and a live diff now would also
+            // count what appeared since. No window candidate is removed.
+            let ended_unobserved = s.window.is_none() && s.exit.is_some();
             let entries = match &s.window {
                 Some(w) => w,
+                None if ended_unobserved => {
+                    retained.push((
+                        String::new(),
+                        "window candidates (the run ended but its after-observation was not \
+                         recorded; nothing it created is removed)"
+                            .into(),
+                    ));
+                    live = Vec::new();
+                    &live
+                }
                 None => {
                     let watch = window::watch_set(&layout.home, &s.env);
                     live = window::diff(&s.before, &window::observe(&watch)?)
@@ -1216,7 +1245,7 @@ pub fn run(ctx: &Ctx, args: &Args, out: &mut dyn Write) -> Result<(), Refusal> {
                 &sys,
                 &layout.home,
             );
-            retained = r;
+            retained.extend(r);
             vouched = v;
             paths.extend(items);
         }
@@ -1717,6 +1746,31 @@ mod tests {
         assert!(tree_capped(&base, uid, 1 << 20).unwrap().is_ok());
         let refused = tree_capped(&base, uid, 8).unwrap().unwrap_err();
         assert!(refused.starts_with("its paths take more than"), "{refused}");
+        fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn hold_dirs_holds_a_directory_a_kept_file_reaches_through_a_linked_parent() {
+        let base = std::env::temp_dir().join(format!("dfm-purge-kept-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(base.join("cfg/boat")).unwrap();
+        fs::write(base.join("cfg/boat/rc"), "x").unwrap();
+        std::os::unix::fs::symlink(base.join("cfg"), base.join("alias")).unwrap();
+        let s = |p: &Path| p.to_string_lossy().into_owned();
+        let mut items = vec![
+            PathItem {
+                path: s(&base.join("cfg/boat")),
+                now: Now::Dir(0, 0, String::new()),
+                step: Step::Do,
+            },
+            PathItem {
+                path: s(&base.join("alias/boat/rc")),
+                now: Now::File(String::new()),
+                step: Step::Keep("a parent is unsafe".into()),
+            },
+        ];
+        assert_eq!(hold_dirs(&mut items, &[]).len(), 1);
+        assert_eq!(items.len(), 1);
         fs::remove_dir_all(&base).unwrap();
     }
 

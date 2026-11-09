@@ -3166,6 +3166,31 @@ fn a_baseline_path_is_retained_while_another_script_trial_is_incomplete() {
 }
 
 #[test]
+fn a_run_that_ended_without_a_window_removes_no_window_candidate() {
+    if no_sandbox() {
+        return;
+    }
+    let fx = Fx::new();
+    fx.bind_with_links();
+    sandboxed(&fx, "set -e\nmkdir ~/.boat\necho x > ~/.boat/f\n");
+    // As a failed after-observation leaves it: the exit is recorded, the window is not.
+    let rec_path = fx.state().join("trials/trial-boat.json");
+    let mut rec = fx.record("trial-boat");
+    assert!(!rec["script"]["exit"].is_null());
+    rec["script"]["window"] = serde_json::Value::Null;
+    fs::write(&rec_path, serde_json::to_vec(&rec).unwrap()).unwrap();
+    let (preview, run) = purged(&fx);
+    let shown = text(&preview.stdout);
+    assert!(
+        shown.contains("the run ended but its after-observation was not recorded"),
+        "{shown}"
+    );
+    assert!(!shown.contains("action: remove"), "{shown}");
+    assert_eq!(code(&run), 0, "{}\n{}", stderr(&run), text(&run.stdout));
+    assert!(fx.h(".boat/f").is_file());
+}
+
+#[test]
 fn a_created_link_whose_target_is_not_utf8_is_kept() {
     if no_sandbox() {
         return;
