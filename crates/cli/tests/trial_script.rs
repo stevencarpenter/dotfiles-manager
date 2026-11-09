@@ -2222,6 +2222,45 @@ fn a_binary_hard_linked_to_a_sensitive_output_is_not_hashed() {
 }
 
 #[test]
+fn an_unreadable_ledger_hashes_no_binary_and_says_so() {
+    if no_sandbox() {
+        return;
+    }
+    let fx = Fx::new();
+    fx.bind_with_links();
+    fx.script_trial(BARE, &[]);
+    let r = fx.binary_row();
+    assert!(detail(&r).contains("sha256"), "{r:#}");
+    fs::write(fx.state().join("ledger.json"), b"not json").unwrap();
+    let rows = fx.binary_rows(&fx.path_var());
+    assert_eq!(rows.len(), 1, "{rows:#?}");
+    let r = &rows[0];
+    assert_eq!(r["status"], "OK", "{r:#}");
+    assert!(detail(r).contains("the ledger cannot be read"), "{r:#}");
+    assert!(!detail(r).contains("sha256"), "{r:#}");
+}
+
+#[test]
+fn hard_links_to_one_file_on_path_are_not_a_second_copy() {
+    if no_sandbox() {
+        return;
+    }
+    let fx = Fx::new();
+    fx.bind_with_links();
+    fx.script_trial(BARE, &[]);
+    let first = fx.tool_file("hl1/boat", b"#!/bin/sh\necho hl\n");
+    let second = fx.h("hl2/boat");
+    fs::create_dir_all(second.parent().unwrap()).unwrap();
+    fs::hard_link(&first, &second).unwrap();
+    let dir = |p: &Path| p.parent().unwrap().display().to_string();
+    // Both entries share one inode: one file, no WARN.
+    let rows = fx.binary_rows(&[dir(&first), dir(&second)].join(":"));
+    assert_eq!(rows.len(), 1, "{rows:#?}");
+    assert_eq!(rows[0]["status"], "OK", "{rows:#?}");
+    assert!(!detail(&rows[0]).contains("PATH holds"), "{rows:#?}");
+}
+
+#[test]
 fn a_binary_over_the_hash_cap_is_present_with_no_digest() {
     if no_sandbox() {
         return;

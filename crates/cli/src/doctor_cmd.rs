@@ -146,7 +146,7 @@ fn inspect(ctx: &Ctx, command: &'static str, root: Option<&Path>) -> Result<Repo
         &scripts,
         loaded.as_ref(),
         &sensitive,
-        owned.as_deref().unwrap_or_default(),
+        owned.as_deref(),
         &mut rows,
     );
     output_rows(
@@ -331,12 +331,19 @@ fn script_binary_rows(
     trials: &[TrialRecord],
     loaded: Option<&Loaded>,
     sensitive: &BTreeSet<String>,
-    ledger: &[Owned],
+    ledger: Option<&[Owned]>,
     rows: &mut Vec<Row>,
 ) {
-    let targets = sensitive_targets(home, &spelled_sensitive(loaded, ledger, sensitive));
+    let targets = sensitive_targets(
+        home,
+        &spelled_sensitive(loaded, ledger.unwrap_or_default(), sensitive),
+    );
+    // Without the ledger the sensitive set may miss a stale output path, so nothing is hashed.
+    let hashing = ledger.is_some();
     let row = |who: &str, at: &Path, since, fix| {
-        binary_row(who, at, since, fix, home, path, trials, sensitive, &targets)
+        binary_row(
+            who, at, since, fix, home, path, trials, sensitive, &targets, hashing,
+        )
     };
     for t in trials.iter().filter(|t| t.is_active()) {
         let who = format!("script trial {}", t.trial_id);
@@ -464,9 +471,13 @@ fn binary_row(
     trials: &[TrialRecord],
     sensitive: &BTreeSet<String>,
     targets: &Result<Vec<std::fs::Metadata>, String>,
+    hashing: bool,
 ) -> Row {
     use crate::trial_cmd::window::{HASH_CAP, hash};
     let mut notes = vec![who.to_string()];
+    if !hashing {
+        notes.push("no digest: the ledger cannot be read, so no binary is hashed".into());
+    }
     let mut fix = "";
     match std::fs::canonicalize(at) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -516,7 +527,7 @@ fn binary_row(
                 .as_ref()
                 .is_some_and(|m| m.nlink() > 1 && targets.iter().any(|t| t.dev() == m.dev()));
             let digest = len
-                .filter(|n| runnable && !shared && *n <= HASH_CAP)
+                .filter(|n| hashing && runnable && !shared && *n <= HASH_CAP)
                 .and_then(|_| hash(&real));
             notes.push(match (len, digest) {
                 (Some(_), _) if !runnable => {
@@ -526,6 +537,7 @@ fn binary_row(
                         real.display()
                     )
                 }
+                (Some(_), _) if !hashing => format!("resolves to {}", real.display()),
                 (Some(_), _) if shared => format!(
                     "resolves to {}, which has more than one hard link on the file system of a \
                      sensitive managed output and is not hashed",
@@ -566,7 +578,15 @@ fn binary_row(
     }
     let tool = at.file_name().unwrap_or_default();
     let copies = path_copies(home, path, tool);
-    let files: BTreeSet<&Path> = copies.iter().map(|(_, real)| real.as_path()).collect();
+    // File identity, not name: hard links to one file are one copy. The canonical path stands in
+    // when `metadata` fails.
+    let files: BTreeSet<(u64, u64, Option<&Path>)> = copies
+        .iter()
+        .map(|(_, real)| match std::fs::metadata(real) {
+            Ok(m) => (m.dev(), m.ino(), None),
+            Err(_) => (0, 0, Some(real.as_path())),
+        })
+        .collect();
     if files.len() > 1 {
         if fix.is_empty() {
             fix = "Remove the copies you do not use, or put the one you use first on PATH.";
