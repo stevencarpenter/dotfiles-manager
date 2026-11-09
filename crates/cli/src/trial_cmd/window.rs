@@ -13,8 +13,9 @@ use std::path::{Path, PathBuf};
 
 /// Children one watched directory may hold before the window refuses to record it.
 pub(super) const MAX_DIR_ENTRIES: usize = 10_000;
-/// Entries one observation pass may hold in total.
-pub(super) const MAX_OBSERVED: usize = 50_000;
+/// Entries one observation pass may hold in total. Kept low enough that a record with a full
+/// `before` and a full window still fits the store's 4 MiB write cap (`MAX_WRITE_BYTES`).
+pub(super) const MAX_OBSERVED: usize = 15_000;
 /// Largest file the window hashes; a bigger file is recorded without a digest.
 pub(super) const HASH_CAP: u64 = 16 * 1024 * 1024;
 

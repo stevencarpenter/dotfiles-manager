@@ -97,8 +97,11 @@ fn parse_env(pairs: Vec<String>) -> Result<Vec<(String, String)>, Refusal> {
         if FIXED_ENV.contains(&name) {
             return Err(usage(format!("--env cannot set {name}; the run fixes it")));
         }
-        if val.contains(['\0', '\n']) {
-            return Err(usage(format!("--env {name} holds a NUL byte or a newline")));
+        // The record's rule (`TrialScript::validate`): a value may hold a tab, no other control.
+        if val.chars().any(|c| c != '\t' && c.is_control()) {
+            return Err(usage(format!(
+                "--env {name} holds a control character other than a tab"
+            )));
         }
         if env.iter().any(|(n, _)| n == name) {
             return Err(usage(format!("--env {name} is given twice")));
@@ -109,7 +112,8 @@ fn parse_env(pairs: Vec<String>) -> Result<Vec<(String, String)>, Refusal> {
 }
 
 /// `trial <package> [--id <trial-id>] [--provider homebrew/v1|mise/v1] [--config <path>]...
-/// [--preview] [-y|--yes-plan <digest>]`.
+/// [--preview] [-y|--yes-plan <digest>]`, or with `--script <https-url> [--shell sh|bash|zsh]
+/// [--arg <value>]... [--env NAME=VALUE]... [--tty]` in place of `--provider`.
 pub fn parse_args(m: &clap::ArgMatches) -> Result<Args, Refusal> {
     let (package, id, provider) = (
         cli::one(m, "package"),
@@ -171,6 +175,13 @@ pub fn parse_args(m: &clap::ArgMatches) -> Result<Args, Refusal> {
                 return Err(usage(format!(
                     "the tool name {} must be lowercase ASCII letters, digits, '.', '_' or '-' (1 to 64 characters)",
                     visible(&package)
+                )));
+            }
+            // The record's rule (`TrialScript::validate`): an argument holds no control character.
+            if let Some(bad) = script_args.iter().find(|a| a.chars().any(char::is_control)) {
+                return Err(usage(format!(
+                    "--arg {} holds a control character",
+                    visible(bad)
                 )));
             }
             let shell = shell.unwrap_or_else(|| "sh".to_string());
@@ -1005,6 +1016,11 @@ mod tests {
             )
         );
         assert_eq!(s.env, vec![("FOO".to_string(), "1".to_string())]);
+        let tab = a(&["boat", "--script", "https://x/i", "--env", "A=a\tb"]).unwrap();
+        assert_eq!(
+            tab.script.unwrap().env,
+            vec![("A".to_string(), "a\tb".to_string())]
+        );
         assert_eq!(
             a(&["boat", "--script", "https://x/i"])
                 .unwrap()
@@ -1028,6 +1044,10 @@ mod tests {
             vec!["boat", "--script", "https://x/i", "--env", "=v"],
             vec!["boat", "--script", "https://x/i", "--env", "A=a\nb"],
             vec!["boat", "--script", "https://x/i", "--env", "A=a\0b"],
+            vec!["boat", "--script", "https://x/i", "--env", "A=a\x1bb"],
+            vec!["boat", "--script", "https://x/i", "--env", "A=a\rb"],
+            vec!["boat", "--script", "https://x/i", "--arg", "a\x1bb"],
+            vec!["boat", "--script", "https://x/i", "--arg", "a\tb"],
             vec![
                 "boat",
                 "--script",

@@ -87,12 +87,12 @@ The record is a private file under `state/trials/`. `state check` validates it w
 | `<tool>` | The short name. It must be a valid id (see above). |
 | `--script <url>` | An `https://` URL. It replaces the provider, so `--provider` is a usage error. |
 | `--shell <shell>` | `sh`, `bash` or `zsh`. The interpreter. It runs as `/bin/<shell>`. Default `sh`. Any other value is a usage error. |
-| `--arg <value>` | A script argument, passed after the script path. Repeatable, kept in order. |
-| `--env NAME=VALUE` | An added environment variable. Repeatable. The name must match `[A-Za-z_][A-Za-z0-9_]*`, be unique and not be one of the fixed names below. A NUL byte or newline in the value is a usage error. |
+| `--arg <value>` | A script argument, passed after the script path. Repeatable, kept in order. A control character in the value, a tab included, is a usage error. |
+| `--env NAME=VALUE` | An added environment variable. Repeatable. The name must match `[A-Za-z_][A-Za-z0-9_]*`, be unique and not be one of the fixed names below. A control character other than a tab in the value is a usage error. |
 | `--tty` | Gives the script dfm's terminal as standard input, so a prompt on `/dev/tty` works. |
 | `--shell`, `--arg`, `--env`, `--tty` | Each needs `--script`. |
 
-Without `--tty` the script starts in a new session with standard input from `/dev/null`. A read of `/dev/tty` fails at once. Standard output and standard error go to dfm's own, so the owner sees the script's output as it runs.
+Without `--tty` the script starts in a new session with standard input from `/dev/null`. A read of `/dev/tty` fails at once. With `--tty`, Ctrl-Z is ignored by the script's group: dfm does not wait for a stopped script, so a stop would block the terminal until the timeout. Standard output and standard error go to dfm's own, so the owner sees the script's output as it runs.
 
 ### Order of one run
 
@@ -105,7 +105,7 @@ Without `--tty` the script starts in a new session with standard input from `/de
 7. **Window before.** The tracked-file snapshot of the guarded checkouts and the window observation are taken. Both come before the record, so the record never claims a window that was not observed.
 8. **The record first.** The verified bytes are copied to a private run copy, `<cache dir>/scripts/run-<id>-<pid>` (mode 0600, exclusive create; an existing entry is `E_CONFLICT`). The run copy is the only write before the record, and every exit path after it removes it. Then the record is created (`RENAME_EXCL`) with `script.before` and without `exit`, `window` and `binary`.
 9. **The intent.** A `trial-script` journal intent (adapter `script/v1`, no path) is written.
-10. **The run.** `sandbox-exec -p <profile> /bin/<shell> <run copy> <args>` runs with the environment below and a fixed timeout of one hour (no flag yet). The script leads its own process group.
+10. **The run.** `sandbox-exec -p <profile> /bin/<shell> <run copy> <args>` runs with the environment below and a fixed timeout of one hour (no flag yet). The script leads its own process group. Its working directory is a new private directory, `<TMPDIR>/dfm-trial-<id>-<pid>` (mode 0700; an existing entry is `E_CONFLICT` and the script does not run), which the run removes afterwards, so an installer that writes to `.` works.
 11. **The result.** The window is observed again and compared. The tracked-file snapshot is compared. The record is rewritten once with `exit`, `window` and `binary`. The cache files and the run copy are removed. The journal gets `done` or `failed`.
 12. **The receipt.** The receipt file is written before any of the closing output lines. The output ends with `trial: state/trials/<id>.json`, the `note:` about a missing binary when it applies, `receipt: <name>` and `result:`.
 
@@ -183,7 +183,7 @@ The first record of a path wins, so a file that a listing also names keeps its d
 | Cap | Value | Over the cap |
 | --- | --- | --- |
 | Children of one watched directory | 10 000 | `E_LIMIT_EXCEEDED` |
-| Observed entries in one pass | 50 000 | `E_LIMIT_EXCEEDED` |
+| Observed entries in one pass | 15 000 (a record with a full `before` and a full window then fits the 4 MiB state write cap) | `E_LIMIT_EXCEEDED` |
 | File size that is hashed | 16 MiB | The entry is recorded without a SHA-256. |
 
 An entry with a control character in its name is recorded with kind `other` and a visible spelling of the name. Over a cap before the script starts, the run refuses before the record is written. Over a cap after the script, the record is written without `window` and the run exits 1.
@@ -206,7 +206,7 @@ An entry with a control character in its name is recorded with kind `other` and 
 
 `unknown` holds the three package tokens and `script-downloads`, `later-self-updates`, `keychain` and `remote-effects`. `package` is absent and `tool_preexisting` is false. `baseline.paths` and `baseline.data` are observed as for a package trial.
 
-A crash, a SIGKILL or a system sleep that kills the run leaves a record with `before` and no `window`. When the intent was written, `state check` reports the open `trial-script` intent as `E_OP_INTERRUPTED`. A crash between the record create and the intent leaves the record and no intent, so `state check` reports nothing for it.
+A crash, a SIGKILL or a system sleep that kills the run leaves a record with `before` and no `window`. When the intent was written, `state check` reports the open `trial-script` intent as `E_OP_INTERRUPTED`. The intent has no path, so `state recover` leaves it `unknown`, and only `dfm state resolve <op_id> --as failed` settles it (docs/packages.md, "Interrupted install"). A crash between the record create and the intent leaves the record and no intent, so `state check` reports nothing for it.
 
 ### Result and exits
 

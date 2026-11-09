@@ -4,9 +4,10 @@
 //! `expect` for the lint ([`install`], [`kill_child`], [`new_session`], [`foreground_group`],
 //! [`take_terminal`] and [`terminal_is_ours`]). A gate test (`crates/cli/tests/gate.rs`) rejects
 //! the keyword and the lint attributes in any other place. The handler does one thing: it stores
-//! a number in a static atomic. The executor reads the number between operations, and once more inside an operation just before its
-//! `intent` entry (see docs/apply.md, "Signals"). After that entry it does not read the number
-//! until the operation ends. Nothing here kills a process or exits from a handler.
+//! a number in a static atomic. The executor reads the number between operations, and once more
+//! inside an operation just before its `intent` entry (see docs/apply.md, "Signals"). After that
+//! entry it does not read the number until the operation ends. Nothing here kills a process or
+//! exits from a handler.
 //!
 //! The handlers are installed with `SA_RESTART`. The executor never acts on the number in the
 //! middle of a file system call, and a restarted call keeps `openat`, `renameat`, `unlinkat`
@@ -204,15 +205,18 @@ pub(crate) fn new_session(cmd: &mut std::process::Command) {
 /// before it starts, so its first read of the terminal does not stop it (`dfm trial --script`
 /// with a terminal). The child leads its own group, so [`kill_child`] with `group` still reaches
 /// everything it started. SIGTTOU is blocked around `tcsetpgrp`, which a background group may
-/// otherwise not call. A failure fails the spawn. [`take_terminal`] gives the terminal back.
+/// otherwise not call. SIGTSTP is set to ignored: the manager does not wait for a stopped child,
+/// so a Ctrl-Z would block the terminal until the timeout. An ignored disposition survives
+/// `exec`, and a non-interactive shell does not reset it. A failure fails the spawn.
+/// [`take_terminal`] gives the terminal back.
 #[expect(
     unsafe_code,
-    reason = "setpgid, tcsetpgrp and sigprocmask have no safe API; the hook calls only async-signal-safe functions"
+    reason = "setpgid, tcsetpgrp, sigprocmask and signal have no safe API; the hook calls only async-signal-safe functions"
 )]
 pub(crate) fn foreground_group(cmd: &mut std::process::Command) {
     use std::os::unix::process::CommandExt;
     // SAFETY: the hook runs in the child between fork and exec. It calls only `sigemptyset`,
-    // `sigaddset`, `sigprocmask`, `setpgid`, `getpid` and `tcsetpgrp`, which are
+    // `sigaddset`, `sigprocmask`, `setpgid`, `getpid`, `tcsetpgrp` and `signal`, which are
     // async-signal-safe, on two `sigset_t` values on its own stack (all-zero bytes are a valid
     // `sigset_t`). It allocates nothing and touches no memory of the parent. errno is read before
     // the mask is restored.
@@ -231,7 +235,11 @@ pub(crate) fn foreground_group(cmd: &mut std::process::Command) {
                 Ok(())
             };
             libc::sigprocmask(libc::SIG_SETMASK, &old, std::ptr::null_mut());
-            result
+            result?;
+            if libc::signal(libc::SIGTSTP, libc::SIG_IGN) == libc::SIG_ERR {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
         });
     }
 }

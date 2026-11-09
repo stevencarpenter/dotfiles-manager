@@ -266,8 +266,9 @@ fn has_keyword(code: &str, word: &str) -> bool {
 }
 
 /// DFM-47: the lint attribute layer. Text that names the lint may appear only in the crate roots
-/// and in the signal module, and the exception is one `expect` on `install`. This reads raw
-/// text, so a comment, a raw string or a character literal cannot hide an attribute.
+/// and in the signal module, and the exceptions are one `expect` each on `install`,
+/// `kill_child`, `new_session`, `foreground_group`, `take_terminal` and `terminal_is_ours`. This
+/// reads raw text, so a comment, a raw string or a character literal cannot hide an attribute.
 #[test]
 fn the_unsafe_lint_is_named_only_in_the_crate_roots_and_on_the_six_signal_functions() {
     let lint = ["un", "safe_code"].concat();

@@ -332,10 +332,11 @@ impl Runner {
     /// standard input. A stop request or the timeout ends the group (SIGTERM and SIGCONT, then
     /// SIGKILL once the leader is reaped or the grace period ends) and is reported as
     /// [`End::Stopped`] or [`End::TimedOut`]; descendants that outlive a child that ended by
-    /// itself are not waited for. With `tty`, the manager takes
-    /// the terminal back before it returns, whatever happened. An error means the child did not
-    /// run (the working directory, a NUL byte in an argument, a spawn failure) or the terminal
-    /// could not be taken back after a run that was otherwise `Ok`.
+    /// itself are not waited for. With `tty`, the manager tries to take the terminal back before
+    /// it returns, whatever happened. A failure of that step is not reported: the child is gone,
+    /// so its [`End`] is the result that matters and the caller has nothing left to do about the
+    /// terminal. An error means the child did not run (the working directory, a NUL byte in an
+    /// argument, a spawn failure).
     pub fn run_shown(&self, req: &Shown<'_>) -> Result<End, Refusal> {
         self.ensure_cwd()?;
         if let Some(bad) = req.args.iter().find(|a| a.contains('\0')) {
@@ -363,9 +364,9 @@ impl Runner {
             return ended;
         }
         // Also after a failed spawn: the hook may have handed the terminal over before `exec`
-        // failed.
-        let taken = signal::take_terminal();
-        ended.and_then(|end| taken.map(|()| end))
+        // failed. The end of a child that ran is never dropped for a failed hand-back.
+        let _ = signal::take_terminal();
+        ended
     }
 
     fn spawn_shown(&self, cmd: &mut Command, req: &Shown<'_>) -> Result<End, Refusal> {

@@ -569,11 +569,12 @@ fn protected_set(
 
 /// The executables named `tool` in `path_var` and `provider_path(home)`, in search order: a
 /// regular file with an execute bit, or a link to one. An unreadable entry counts as absent;
-/// the sandbox, not this check, is what protects the machine.
+/// the sandbox, not this check, is what protects the machine. Relative and empty PATH entries
+/// are skipped, as [`window::binary`] skips them.
 pub(super) fn on_path(home: &Path, path_var: &OsStr, tool: &str) -> Vec<PathBuf> {
     let mut dirs: Vec<PathBuf> = Vec::new();
     for d in std::env::split_paths(path_var).chain(dfm_platform_macos::provider_path(home)) {
-        if !dirs.contains(&d) {
+        if d.is_absolute() && !dirs.contains(&d) {
             dirs.push(d);
         }
     }
@@ -1073,7 +1074,33 @@ pub(super) fn run(
         outputs: vec![],
         snapshot: None,
     };
+    // The script's working directory: a fresh private directory under its TMPDIR, which the
+    // sandbox lets it write (the runner's own directory is in the denied cache dir). It is
+    // removed after the run; an entry that already exists is not dfm's and is left alone.
+    let work = locked
+        .env
+        .iter()
+        .find_map(|(n, v)| (n == "TMPDIR").then(|| PathBuf::from(v)))
+        .unwrap_or_else(std::env::temp_dir)
+        .join(format!("dfm-trial-{trial_id}-{}", std::process::id()));
+    let mut work_made = false;
     let end = journal(Phase::Intent, Some(empty), None).and_then(|()| {
+        fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&work)
+            .map_err(|e| {
+                if e.kind() == std::io::ErrorKind::AlreadyExists {
+                    Refusal::new(
+                        Code::Conflict,
+                        format!("{} already exists; the script did not run", work.display()),
+                    )
+                } else {
+                    io_failed(&work)(e)
+                }
+            })?;
+        work_made = true;
+        let mut in_work = runner.clone();
+        in_work.cwd = work.clone();
         let mut argv = vec![
             "-p".to_string(),
             profile_text,
@@ -1081,7 +1108,7 @@ pub(super) fn run(
             run_file.display().to_string(),
         ];
         argv.extend(locked.args.iter().cloned());
-        runner.run_shown(&Shown {
+        in_work.run_shown(&Shown {
             program: &sandbox,
             args: &argv,
             env: &locked.env,
@@ -1129,6 +1156,12 @@ pub(super) fn run(
         {
             problems.push(io_failed(&p)(e));
         }
+    }
+    if work_made
+        && let Err(e) = fs::remove_dir_all(&work)
+        && e.kind() != std::io::ErrorKind::NotFound
+    {
+        problems.push(io_failed(&work)(e));
     }
     if problems.is_empty()
         && let Err(n) = journal(Phase::Done, None, None)
@@ -1633,6 +1666,14 @@ mod tests {
             on_path(&home, &path, "t"),
             [dir.join("bin/t"), dir.join("bin3/t")]
         );
+        // A relative entry resolves against the working directory and is skipped, also when
+        // it reaches the executable `bin/t`; so is an empty entry.
+        let cwd = std::env::current_dir().unwrap();
+        let up: PathBuf = cwd.components().skip(1).map(|_| "..").collect();
+        let rel_bin = up.join(dir.join("bin").strip_prefix("/").unwrap());
+        assert!(fs::metadata(rel_bin.join("t")).is_ok());
+        let rel = std::env::join_paths([PathBuf::new(), rel_bin]).unwrap();
+        assert!(on_path(&home, &rel, "t").is_empty());
         assert!(on_path(&home, &path, "dfm-no-such-tool").is_empty());
         fs::remove_dir_all(&dir).unwrap();
     }

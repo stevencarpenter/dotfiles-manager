@@ -867,6 +867,110 @@ fn a_tool_that_appears_on_path_before_the_lock_refuses_the_run() {
 }
 
 #[test]
+fn the_script_runs_in_a_private_directory_under_tmpdir_that_is_removed_after() {
+    if no_sandbox() {
+        return;
+    }
+    let fx = Fx::new();
+    fx.bind_with_links();
+    // An installer that downloads and unpacks into `.` (`curl -LO; tar xzf`).
+    fx.script(
+        "#!/bin/sh\necho x > ./rel && mkdir work && { echo \"cwd=$PWD\"; cat ./rel; [ -d work ] && echo work; } > \"$HOME/result\"\n",
+    );
+    let o = fx.approved("boat");
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+    let result = fs::read_to_string(fx.h("result")).unwrap();
+    let lines: Vec<&str> = result.lines().collect();
+    let tmp = fs::canonicalize(fx.tmpdir()).unwrap();
+    let cwd = lines[0].strip_prefix("cwd=").unwrap();
+    assert!(
+        cwd.starts_with(&format!("{}/dfm-trial-trial-boat-", tmp.display())),
+        "{result}"
+    );
+    assert_eq!(lines[1..], ["x", "work"], "{result}");
+    assert!(!Path::new(cwd).exists(), "{cwd}");
+}
+
+/// Ends the leftover sandboxed sleep of a killed run, also when the test fails.
+struct KillMarker(String);
+
+impl Drop for KillMarker {
+    fn drop(&mut self) {
+        let _ = Command::new("/usr/bin/pkill")
+            .args(["-KILL", "-f", &self.0])
+            .status();
+    }
+}
+
+#[test]
+fn a_killed_run_leaves_the_record_without_a_window_and_an_open_intent() {
+    if no_sandbox() {
+        return;
+    }
+    let fx = Fx::new();
+    fx.bind_with_links();
+    // The sleep runs through a link under this test's HOME, so `pgrep -f` finds only its own.
+    let marker = fx.h("marker-sleep").display().to_string();
+    fx.script(
+        "#!/bin/sh\nln -s /bin/sleep \"$HOME/marker-sleep\"\n: > \"$HOME/started\"\n\"$HOME/marker-sleep\" 30\n",
+    );
+    let o = fx.trial_script("boat", &["--preview"]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    // Output goes nowhere: the orphaned sleep would hold a pipe open.
+    let mut child = fx
+        .command(&[
+            "trial",
+            "boat",
+            "--script",
+            URL,
+            "--yes-plan",
+            &digest_of(&o),
+        ])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let _sleep = KillMarker(marker.clone());
+    let started = Instant::now();
+    while !fx.h("started").exists() || pgrep(&["-f", &marker]).is_empty() {
+        assert!(child.try_wait().unwrap().is_none(), "ended before the run");
+        assert!(started.elapsed() < Duration::from_secs(60), "never started");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    child.kill().unwrap();
+    child.wait().unwrap();
+    let rec = fx.record("trial-boat");
+    let s = &rec["script"];
+    assert!(!s["before"].as_array().unwrap().is_empty(), "{rec:#}");
+    assert!(s["window"].is_null() && s["exit"].is_null(), "{rec:#}");
+    let entries: Vec<serde_json::Value> = fx
+        .journal()
+        .into_iter()
+        .filter(|e| e["op"] == "trial-script")
+        .collect();
+    assert_eq!(entries.len(), 1, "{entries:?}");
+    assert_eq!(entries[0]["phase"], "intent");
+    let id = entries[0]["op_id"].as_str().unwrap().to_string();
+    let o = fx.run(&["state", "check"]);
+    let all = format!("{}\n{}", stderr(&o), text(&o.stdout));
+    assert_eq!(code(&o), 1, "{all}");
+    assert!(all.contains("E_OP_INTERRUPTED"), "{all}");
+    assert!(all.contains("trial-script") && all.contains(&id), "{all}");
+    // The intent has no path, so recover cannot settle it.
+    let o = fx.run(&["state", "recover"]);
+    let all = format!("{}\n{}", stderr(&o), text(&o.stdout));
+    assert_eq!(code(&o), 3, "{all}");
+    assert!(
+        all.contains(&format!("open {id} (trial-script of trial-boat)")),
+        "{all}"
+    );
+    let o = fx.run(&["state", "resolve", &id, "--as", "failed"]);
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+    let o = fx.run(&["state", "check"]);
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+}
+
+#[test]
 fn a_ledger_change_between_the_preview_and_the_run_makes_the_digest_stale() {
     if no_sandbox() {
         return;
@@ -1021,23 +1125,30 @@ fn a_write_outside_home_is_denied() {
     let name = fx.fake.path().file_name().unwrap().to_str().unwrap();
     let var_tmp = PathBuf::from(format!("/private/var/tmp/{name}"));
     let user_dir = fx.fake.path().join("outside");
-    let result = sandboxed(
-        &fx,
-        &format!(
-            "echo x > /usr/local/bin/{name} || echo d1 >> ~/result\n\
-             echo x > {} || echo d2 >> ~/result\n\
-             echo x > {} || echo d3 >> ~/result\n\
-             echo x > \"$TMPDIR/inside\" && echo t >> ~/result\n",
-            var_tmp.display(),
-            user_dir.display()
-        ),
+    // The profile allows `/private/tmp`, so a test temp dir there cannot show the deny.
+    let d3 = !user_dir.starts_with("/private/tmp");
+    if !d3 {
+        common::skip("the test temp dir is under /private/tmp; the d3 write is allowed there");
+    }
+    let mut body = format!(
+        "echo x > /usr/local/bin/{name} || echo d1 >> ~/result\n\
+         echo x > {} || echo d2 >> ~/result\n",
+        var_tmp.display()
     );
-    assert_eq!(result, "d1\nd2\nd3\nt\n");
-    for p in [
-        PathBuf::from("/usr/local/bin").join(name),
-        var_tmp,
-        user_dir,
-    ] {
+    if d3 {
+        body.push_str(&format!(
+            "echo x > {} || echo d3 >> ~/result\n",
+            user_dir.display()
+        ));
+    }
+    body.push_str("echo x > \"$TMPDIR/inside\" && echo t >> ~/result\n");
+    let result = sandboxed(&fx, &body);
+    assert_eq!(result, if d3 { "d1\nd2\nd3\nt\n" } else { "d1\nd2\nt\n" });
+    let mut denied = vec![PathBuf::from("/usr/local/bin").join(name), var_tmp];
+    if d3 {
+        denied.push(user_dir);
+    }
+    for p in denied {
         assert!(!p.exists(), "{}", p.display());
     }
     assert_eq!(
