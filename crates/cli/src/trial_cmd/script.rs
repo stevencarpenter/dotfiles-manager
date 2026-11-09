@@ -758,6 +758,21 @@ fn ended(end: Result<End, Refusal>) -> (Option<ScriptExit>, Option<Refusal>) {
     }
 }
 
+/// The problems of one run as one refusal: the most important code wins (a stop request, then
+/// a tracked change, then the rest, such as a nonzero exit), and the text names every problem
+/// in that order.
+fn ranked(mut problems: Vec<Refusal>) -> Option<Refusal> {
+    let rank = |c: Code| match c {
+        Code::Interrupted | Code::Terminated => 0,
+        Code::Conflict => 1,
+        _ => 2,
+    };
+    problems.sort_by_key(|p| rank(p.code));
+    let first = problems.first()?.code;
+    let detail: Vec<&str> = problems.iter().map(|p| p.detail.as_str()).collect();
+    Some(Refusal::new(first, detail.join("; ")))
+}
+
 /// The tracked changes between two `tracked_status` snapshots, as the upgrade step reports them.
 fn tracked_changes(
     before: &std::collections::BTreeMap<String, (String, String)>,
@@ -896,8 +911,8 @@ pub(super) fn run(
         };
         Ok((decision, profile))
     };
-    let (first, profile_text) = decide(fetched, &readable.read_ledger_lenient()?)?;
-    let sandbox = sandbox_exec(&runner, &profile_text)?;
+    let (first, previewed_profile) = decide(fetched, &readable.read_ledger_lenient()?)?;
+    let sandbox = sandbox_exec(&runner, &previewed_profile)?;
     stop()?;
     let digest = first.digest()?;
     if let Some(i) = &ctx.isolated {
@@ -950,6 +965,14 @@ pub(super) fn run(
         let locked_digest = locked.digest()?;
         if locked_digest != digest {
             return Err(stale(approved, &locked_digest));
+        }
+        // The profile is not in the digest, so a ledger target or a reserved path that changed
+        // since the preview is caught here: the run uses only the sandbox the preview checked.
+        if profile != previewed_profile {
+            return Err(Refusal::new(
+                Code::PlanStale,
+                "the sandbox profile changed since the preview (the ledger or the reserved paths changed); run the preview again",
+            ));
         }
         Ok((locked, profile))
     })();
@@ -1064,10 +1087,7 @@ pub(super) fn run(
             ),
         ));
     }
-    let stopped = problems.first().map(|first| {
-        // The first problem keeps its code (a stop request first of all); the text names all.
-        let detail: Vec<&str> = problems.iter().map(|p| p.detail.as_str()).collect();
-        let mut e = Refusal::new(first.code, detail.join("; "));
+    let stopped = ranked(problems).map(|mut e| {
         if let Err(n) = journal(Phase::Failed, None, Some(bounded_visible(&e.detail, 1024))) {
             e = Refusal::new(
                 e.code,
@@ -1079,13 +1099,11 @@ pub(super) fn run(
         }
         e.after_mutation()
     });
-    if record.script.as_ref().is_some_and(|sc| sc.binary.is_none()) {
-        writeln!(
-            out,
-            "note: the tool {tool} is not on PATH or cannot be hashed"
-        )
-        .map_err(w)?;
-    }
+    let note = record
+        .script
+        .as_ref()
+        .is_some_and(|sc| sc.binary.is_none())
+        .then(|| format!("note: the tool {tool} is not on PATH or cannot be hashed"));
     conclude(
         ctx,
         &store,
@@ -1103,6 +1121,7 @@ pub(super) fn run(
             binary,
             stamp,
             digest,
+            note,
         },
         out,
     )
@@ -1128,6 +1147,27 @@ mod tests {
         v.iter()
             .map(|(n, v)| ((*n).to_string(), (*v).to_string()))
             .collect()
+    }
+
+    #[test]
+    fn a_stop_request_then_a_tracked_change_outranks_a_failed_script() {
+        let r = |c: Code, d: &str| Refusal::new(c, d);
+        let exited = r(Code::IoFailed, "the script exited 4");
+        let tracked = r(
+            Code::Conflict,
+            "the script changed the tracked file /r/f ( M)",
+        );
+        let got = ranked(vec![exited.clone(), tracked.clone()]).unwrap();
+        assert_eq!(got.code, Code::Conflict);
+        assert_eq!(got.detail, format!("{}; {}", tracked.detail, exited.detail));
+        let stop = r(Code::Interrupted, "SIGINT received");
+        let got = ranked(vec![exited, tracked, stop]).unwrap();
+        assert_eq!(got.code, Code::Interrupted);
+        assert!(
+            got.detail
+                .starts_with("SIGINT received; the script changed")
+        );
+        assert!(ranked(vec![]).is_none());
     }
 
     #[test]

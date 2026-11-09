@@ -238,10 +238,7 @@ impl Fx {
     /// Applies the profile, so the four dfm links point into the source tree, and makes the
     /// source tree a git checkout with everything committed.
     fn bind_with_links(&self) {
-        let o = self.run(&["apply", "--preview"]);
-        assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
-        let o = self.run(&["apply", "--yes-plan", &digest_of(&o)]);
-        assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+        self.apply();
         for rel in [
             ".config/git/config",
             ".ssh/config",
@@ -254,6 +251,13 @@ impl Fx {
         git(&self.root, &["init", "-q"]);
         git(&self.root, &["add", "-A"]);
         git(&self.root, &["commit", "-q", "-m", "init"]);
+    }
+
+    fn apply(&self) {
+        let o = self.run(&["apply", "--preview"]);
+        assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+        let o = self.run(&["apply", "--yes-plan", &digest_of(&o)]);
+        assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
     }
 
     /// Previews, then runs with the preview's digest.
@@ -443,7 +447,12 @@ fn a_script_trial_records_before_runs_sandboxed_and_rewrites_the_record() {
     let fx = Fx::new();
     fx.bind_with_links();
     fx.script(BOAT);
-    let o = fx.approved("boat");
+    let o = fx.trial_script("boat", &["--arg", "--quiet", "--preview"]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    // The log of the approved run alone: its dry run and the script run.
+    fs::write(fx.fake.path().join("log"), "").unwrap();
+    let cache = fx.cached();
+    let o = fx.trial_script("boat", &["--arg", "--quiet", "--yes-plan", &digest_of(&o)]);
     let out = text(&o.stdout);
     assert_eq!(code(&o), 0, "{}\n{out}", stderr(&o));
     // The script's own output is inherited, between the preview and the result lines.
@@ -506,6 +515,21 @@ fn a_script_trial_records_before_runs_sandboxed_and_rewrites_the_record() {
     assert!(out.contains("trial: state/trials/trial-boat.json"), "{out}");
     assert!(out.contains("result: ok"), "{out}");
     let log = fx.log();
+    // The fake logs `sandbox-exec <profile> | <command>`; the profile spans lines, so each
+    // invocation starts one line with `sandbox-exec (version 1)`.
+    assert_eq!(log.matches("sandbox-exec (version 1)").count(), 2, "{log}");
+    let commands: Vec<&str> = log
+        .lines()
+        .filter_map(|l| l.rsplit_once(" | ").map(|(_, c)| c))
+        .collect();
+    assert_eq!(
+        commands,
+        [
+            "/usr/bin/true".to_string(),
+            format!("/bin/sh {} --quiet", cache.display())
+        ],
+        "{log}"
+    );
     assert!(log.contains("(deny process-exec"), "{log}");
     let state_root = fx.h(".local/state/dotfiles-manager");
     assert!(
@@ -540,6 +564,18 @@ fn a_nonzero_script_exit_is_exit_1_after_the_record() {
         .map(|e| e["phase"].as_str().unwrap().to_string())
         .collect();
     assert_eq!(phases, ["intent", "failed"]);
+    // The note is written by `conclude` after the receipt, so an output error cannot stop the
+    // receipt.
+    let out = text(&o.stdout);
+    let at = |needle: &str| {
+        out.find(needle)
+            .unwrap_or_else(|| panic!("{needle}: {out}"))
+    };
+    assert!(
+        at("trial: state/trials/trial-boat.json")
+            < at("note: the tool boat is not on PATH or cannot be hashed")
+    );
+    assert!(at("note: the tool boat") < at("receipt: "));
     assert!(
         text(&o.stdout).contains("result: failed"),
         "{}",
@@ -616,8 +652,11 @@ fn the_tracked_file_guard_fails_the_trial_when_a_tracked_file_changed() {
     let fx = Fx::new();
     fx.bind_with_links();
     // The sandbox stops the script from writing the checkout, so the test changes a tracked
-    // file from outside while the script runs; the marker says the run has started.
-    fx.script("#!/bin/sh\n: > \"$HOME/started\"\nsleep 2\n");
+    // file from outside while the script runs: `started` says the run is on, `go` that the
+    // change is made. The script then also exits nonzero, which the tracked change outranks.
+    fx.script(
+        "#!/bin/sh\n: > \"$HOME/started\"\ni=0\nwhile [ ! -e \"$HOME/go\" ] && [ $i -lt 100 ]; do sleep 0.1; i=$((i+1)); done\nexit 4\n",
+    );
     let o = fx.trial_script("boat", &["--preview"]);
     assert_eq!(code(&o), 0, "{}", stderr(&o));
     let mut child = fx
@@ -650,10 +689,13 @@ fn the_tracked_file_guard_fails_the_trial_when_a_tracked_file_changed() {
     let mut f = fs::OpenOptions::new().append(true).open(&tracked).unwrap();
     std::io::Write::write_all(&mut f, b"set -g status off\n").unwrap();
     drop(f);
+    fs::write(fx.h("go"), "").unwrap();
     let o = child.wait_with_output().unwrap();
     let all = format!("{}\n{}", stderr(&o), text(&o.stdout));
     assert_eq!(code(&o), 1, "{all}");
-    assert!(all.contains("E_CONFLICT"), "{all}");
+    let err = stderr(&o);
+    assert!(err.starts_with("error: E_CONFLICT "), "{all}");
+    assert!(err.contains("the script exited 4"), "{all}");
     assert!(
         all.contains(&format!(
             "the script changed the tracked file {}",
@@ -668,7 +710,54 @@ fn the_tracked_file_guard_fails_the_trial_when_a_tracked_file_changed() {
     );
     let rec = fx.record("trial-boat");
     assert!(rec["script"]["window"].is_array(), "{rec:#}");
-    assert_eq!(rec["script"]["exit"]["code"], 0);
+    assert_eq!(rec["script"]["exit"]["code"], 4);
+}
+
+#[test]
+fn a_ledger_change_before_the_lock_makes_the_sandbox_profile_stale() {
+    if no_sandbox() {
+        return;
+    }
+    let fx = Fx::new();
+    fx.script("#!/bin/sh\nexit 0\n");
+    let o = fx.trial_script("boat", &["--preview"]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    // The run parks after its pre-lock decision; an apply then adds four ledger targets, which
+    // leaves the digest as it is and changes the profile the run would use.
+    let gate = fx.fake.path().join("go");
+    let parked = fx
+        .command(&[
+            "trial",
+            "boat",
+            "--script",
+            URL,
+            "--yes-plan",
+            &digest_of(&o),
+        ])
+        .env(
+            "DFM_FAILPOINT",
+            format!("trial-before-lock:wait-{}", gate.display()),
+        )
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let reached = gate.with_extension("reached");
+    let started = Instant::now();
+    while !reached.exists() {
+        assert!(started.elapsed() < Duration::from_secs(30), "not reached");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    fx.apply();
+    fs::write(&gate, "").unwrap();
+    let o = parked.wait_with_output().unwrap();
+    assert_eq!(code(&o), 3, "{}\n{}", stderr(&o), text(&o.stdout));
+    assert!(
+        stderr(&o).contains("E_PLAN_STALE the sandbox profile changed since the preview"),
+        "{}",
+        stderr(&o)
+    );
+    assert!(!fx.state().join("trials/trial-boat.json").exists());
 }
 
 #[test]

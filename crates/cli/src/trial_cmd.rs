@@ -804,6 +804,7 @@ pub fn run(ctx: &Ctx, args: &Args, out: &mut dyn Write) -> Result<(), Refusal> {
             binary,
             stamp,
             digest,
+            note: None,
         },
         out,
     )
@@ -821,6 +822,8 @@ pub(super) struct Outcome<'a> {
     pub binary: Binary,
     pub stamp: Stamp,
     pub digest: String,
+    /// One more line, written after the receipt so an output error cannot prevent it.
+    pub note: Option<String>,
 }
 
 /// The receipt and the result lines of a trial whose record exists, shared by the package and
@@ -843,6 +846,7 @@ pub(super) fn conclude(
         binary,
         stamp,
         digest,
+        note,
     } = o;
     let file = format!("{trial_id}.json");
     let finished = now_ns().unwrap_or(started);
@@ -900,6 +904,9 @@ pub(super) fn conclude(
     let error = error.map_or(String::new(), |e| format!(": {e}"));
     writeln!(out, "  {} {trial_id} {op_id}{error}", label(status)).map_err(w)?;
     writeln!(out, "trial: state/trials/{file}").map_err(w)?;
+    if let Some(n) = note {
+        writeln!(out, "{n}").map_err(w)?;
+    }
     let outcome = match (receipt_name, stopped) {
         (Ok(name), stopped) => {
             writeln!(out, "receipt: {}", visible(&name)).map_err(w)?;
