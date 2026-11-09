@@ -3416,3 +3416,41 @@ fn a_same_length_rewrite_in_a_created_directory_is_stale() {
     assert!(stderr(&o).contains("E_PLAN_STALE"), "{}", stderr(&o));
     assert_eq!(fs::read_to_string(fx.h(".boat/f")).unwrap(), "z\n");
 }
+
+#[test]
+fn a_created_file_a_kept_link_was_repointed_at_is_retained() {
+    if no_sandbox() {
+        return;
+    }
+    let fx = Fx::new();
+    fx.bind_with_links();
+    fs::create_dir_all(fx.h(".local/bin")).unwrap();
+    sandboxed(
+        &fx,
+        "set -e\nprintf '#!/bin/sh\\n' > ~/.local/bin/tool\nln -s /usr/bin/true ~/.local/bin/alias\n",
+    );
+    // The owner repoints the alias at the created tool after the trial: by name, and through
+    // a linked parent.
+    let (tool, alias) = (fx.h(".local/bin/tool"), fx.h(".local/bin/alias"));
+    fs::remove_file(&alias).unwrap();
+    std::os::unix::fs::symlink("tool", &alias).unwrap();
+    let (preview, run) = purged(&fx);
+    let shown = text(&preview.stdout);
+    for want in [
+        format!(
+            "kept: {} -> tool (repointed since the trial)",
+            alias.display()
+        ),
+        format!(
+            "retained: {} (the kept link {} points at it)",
+            tool.display(),
+            alias.display()
+        ),
+    ] {
+        assert!(shown.contains(&want), "{want}\n{shown}");
+    }
+    assert!(!shown.contains("action: remove"), "{shown}");
+    assert_eq!(code(&run), 0, "{}\n{}", stderr(&run), text(&run.stdout));
+    assert_eq!(fs::read_to_string(&tool).unwrap(), "#!/bin/sh\n");
+    assert!(fs::metadata(&alias).is_ok(), "the alias must not dangle");
+}

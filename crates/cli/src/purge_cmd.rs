@@ -668,7 +668,7 @@ fn kind_of(m: &fs::Metadata) -> &'static str {
 /// covers), every other entry is a `retained:` line. The window is evidence, not authority: an
 /// entry `before` already holds, one no watched place could report, one in a place `before`
 /// could not read, and one that overlaps a `protected` tree is never removed. Each `retained:`
-/// line comes with its path, for `hold_dirs`. `skip` are the baseline paths, which the
+/// line comes with its path, for `hold`. `skip` are the baseline paths, which the
 /// record's own path items already cover; a window entry is checked against them only after
 /// every retention rule, so a retained baseline path still yields its `retained:` line. A
 /// `truncated` window may omit what a created directory holds, so no created directory of it
@@ -979,13 +979,15 @@ fn renamed_from<'a>(created: &Path, removed: &[&'a str]) -> Option<&'a str> {
 }
 
 /// A directory item is removed as a tree, so one that holds a kept item or a `retained` path
-/// (strictly below it, case fold) stays: it moves out of `items` and becomes a `retained:`
-/// line. So does one that a kept or retained link points into (or at), with a relative
-/// target resolved by text against the link's directory and again through the links on disk
-/// (`resolved`), so an alias such as `~/.alias -> ~/.config` is seen: removing it would leave
-/// that link dangling. Its other candidates are their own items and are still removed one by
-/// one.
-fn hold_dirs(items: &mut Vec<PathItem>, retained: &[(String, String)]) -> Vec<String> {
+/// (strictly below it, case fold) stays: it moves out of `items` and is returned with its
+/// `retained:` line. So does any item (a directory, a file or a link) that a kept or retained
+/// link points into or at, with a relative target resolved by text against the link's
+/// directory and again through the links on disk (`resolved`, and with the target's own last
+/// component kept, `via_parents`), so an alias such as `~/.alias -> ~/.config` is seen:
+/// removing it would leave that link dangling. A directory's other candidates are their own
+/// items and are still removed one by one. The caller adds what is returned to `retained` and
+/// calls again, since a held link can hold another item.
+fn hold(items: &mut Vec<PathItem>, retained: &[(String, String)]) -> Vec<(String, String)> {
     let kept: Vec<String> = retained
         .iter()
         .map(|(p, _)| p.clone())
@@ -997,24 +999,27 @@ fn hold_dirs(items: &mut Vec<PathItem>, retained: &[(String, String)]) -> Vec<St
         )
         .collect();
     let s = |p: PathBuf| p.to_string_lossy().into_owned();
-    let links: Vec<(&String, String, String)> = kept
+    let links: Vec<(&String, [String; 3])> = kept
         .iter()
         .filter_map(|k| {
             let t = fs::read_link(k).ok()?;
             let p = Path::new(k);
             let to = p.parent().unwrap_or(p).join(t);
-            Some((k, s(lexical(&to)), s(resolved(&to))))
+            Some((k, [s(lexical(&to)), s(resolved(&to)), s(via_parents(&to))]))
         })
         .collect();
     let mut held = Vec::new();
     items.retain(|i| {
-        if !matches!((&i.now, &i.step), (Now::Dir(..), Step::Do)) {
+        if i.step != Step::Do {
             return true;
         }
+        let dir = matches!(i.now, Now::Dir(..));
+        // The item itself is not followed: a link item names the link, not its target.
+        let real = s(via_parents(Path::new(&i.path)));
         let why = if let Some(k) = kept
             .iter()
             .find(|k| {
-                !same_path(k, &i.path)
+                dir && !same_path(k, &i.path)
                     && (at_or_below(k, &i.path)
                         // A kept path reached through a linked parent names the directory by
                         // another spelling.
@@ -1022,14 +1027,15 @@ fn hold_dirs(items: &mut Vec<PathItem>, retained: &[(String, String)]) -> Vec<St
             })
         {
             format!("holds {}, which is kept", visible(k))
-        } else if let Some((l, ..)) = links.iter().find(|(_, t, r)| {
-            at_or_below(t, &i.path) || at_or_below(r, &s(resolved(Path::new(&i.path))))
+        } else if let Some((l, _)) = links.iter().find(|(_, [t, r, v])| {
+            at_or_below(t, &i.path) || at_or_below(r, &real) || at_or_below(v, &real)
         }) {
-            format!("the kept link {} points into it", visible(l))
+            let how = if dir { "into" } else { "at" };
+            format!("the kept link {} points {how} it", visible(l))
         } else {
             return true;
         };
-        held.push(format!("{} ({why})", visible(&i.path)));
+        held.push((i.path.clone(), format!("{} ({why})", visible(&i.path))));
         false
     });
     held
@@ -1419,15 +1425,17 @@ pub fn run(ctx: &Ctx, args: &Args, out: &mut dyn Write) -> Result<(), Refusal> {
             .retain(|i| i.step != Step::Do || !retained.iter().any(|(r, _)| same_path(r, &i.path)));
         // After the merge, so a kept baseline path also holds a created directory.
         // Holding a directory withdraws its vouch for a link into it, and keeping that link can
-        // hold another directory, so repeat until neither changes. Each round that continues
-        // keeps one more item, so the loop ends.
-        let mut held = Vec::new();
+        // hold another item, as can a held link; so repeat until neither changes. Each round
+        // that continues holds or keeps one more item, so the loop ends.
         loop {
-            held.extend(hold_dirs(&mut paths, &retained));
-            if !unvouch(&mut paths, &vouched) {
+            let h = hold(&mut paths, &retained);
+            let more = !h.is_empty();
+            retained.extend(h);
+            if !unvouch(&mut paths, &vouched) && !more {
                 break;
             }
         }
+        let mut held = Vec::new();
         // A cut window may omit what any directory holds, a baseline one included, and a link
         // with an inexact name cannot be followed to the directory it holds; a directory goes
         // as a tree: none is removed. That withdraws each one's vouch for a link; no directory
@@ -1832,7 +1840,7 @@ mod tests {
                 Step::Keep("repointed".into()),
             ),
         ];
-        let held = hold_dirs(&mut items, &[]);
+        let held: Vec<String> = hold(&mut items, &[]).into_iter().map(|(_, l)| l).collect();
         assert_eq!(
             held,
             [format!(
@@ -1845,7 +1853,7 @@ mod tests {
         assert_eq!(left, [s(&other), s(&link)]);
         // A retained link counts too.
         let mut items = vec![item(&dir, tree(), Step::Do)];
-        assert_eq!(hold_dirs(&mut items, &[(s(&link), String::new())]).len(), 1);
+        assert_eq!(hold(&mut items, &[(s(&link), String::new())]).len(), 1);
         assert!(items.is_empty());
         fs::remove_dir_all(&base).unwrap();
     }
@@ -1874,7 +1882,7 @@ mod tests {
                 fence: None,
             },
         ];
-        assert_eq!(hold_dirs(&mut items, &[]).len(), 1);
+        assert_eq!(hold(&mut items, &[]).len(), 1);
         assert_eq!(items.len(), 1);
         fs::remove_dir_all(&base).unwrap();
     }
@@ -1914,7 +1922,7 @@ mod tests {
                 fence: None,
             },
         ];
-        assert_eq!(hold_dirs(&mut items, &[]).len(), 1);
+        assert_eq!(hold(&mut items, &[]).len(), 1);
         assert_eq!(items.len(), 1);
         fs::remove_dir_all(&base).unwrap();
     }
@@ -2063,6 +2071,59 @@ mod tests {
             fence_keep(&base.join("new/sub/f"), other).as_deref(),
             Some("not on the APFS volume the fence was taken on")
         );
+        fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn hold_keeps_a_file_or_link_a_kept_link_points_at() {
+        let base = std::env::temp_dir().join(format!("dfm-purge-at-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(base.join("bin")).unwrap();
+        fs::create_dir_all(base.join("real")).unwrap();
+        // `via` is a linked parent: `via/tool` is `real/tool`.
+        std::os::unix::fs::symlink(base.join("real"), base.join("via")).unwrap();
+        let (tool, other, inner) = (
+            base.join("real/tool"),
+            base.join("bin/other"),
+            base.join("bin/inner"),
+        );
+        fs::write(&tool, "x").unwrap();
+        fs::write(&other, "y").unwrap();
+        std::os::unix::fs::symlink("/usr/bin/true", &inner).unwrap();
+        let (alias, alias2) = (base.join("bin/alias"), base.join("bin/alias2"));
+        std::os::unix::fs::symlink("../via/tool", &alias).unwrap();
+        // A kept link at a link item holds the link, not what that link points to.
+        std::os::unix::fs::symlink("inner", &alias2).unwrap();
+        let s = |p: &Path| p.to_string_lossy().into_owned();
+        let item = |p: &Path, now: Now, step: Step| PathItem {
+            path: s(p),
+            now,
+            step,
+            fence: None,
+        };
+        let mut items = vec![
+            item(&tool, Now::File(String::new()), Step::Do),
+            item(&other, Now::File(String::new()), Step::Do),
+            item(&inner, Now::Link("/usr/bin/true".into()), Step::Do),
+            item(
+                &alias,
+                Now::Link("../via/tool".into()),
+                Step::Keep("repointed".into()),
+            ),
+        ];
+        let held: Vec<String> = hold(&mut items, &[(s(&alias2), String::new())])
+            .into_iter()
+            .map(|(_, l)| l)
+            .collect();
+        assert_eq!(
+            held,
+            [
+                format!("{} (the kept link {} points at it)", s(&tool), s(&alias)),
+                format!("{} (the kept link {} points at it)", s(&inner), s(&alias2)),
+            ]
+        );
+        let left: Vec<&str> = items.iter().map(|i| i.path.as_str()).collect();
+        assert_eq!(left, [s(&other), s(&alias)]);
         fs::remove_dir_all(&base).unwrap();
     }
 }
