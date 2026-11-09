@@ -69,8 +69,8 @@ const GIT_SETTINGS: [&str; 14] = [
 
 pub struct Args {
     apply: apply_cmd::Args,
-    /// Identities to grant before the fetch (`--trust-origin`): canonical origins and
-    /// `npm:<package>` identities (docs/sync.md, "Source identities").
+    /// Identities to grant before the fetch (`--trust-origin`): canonical origins,
+    /// `npm:<package>` and `script:<url>` identities (docs/sync.md, "Source identities").
     trust: Vec<String>,
     /// `--restart <resource-id>`, for the services scope.
     restart: BTreeSet<String>,

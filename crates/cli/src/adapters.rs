@@ -6,6 +6,7 @@
 mod generate;
 mod merge_plan;
 pub mod package;
+pub mod script;
 pub mod secret;
 pub mod service;
 pub mod updater;
@@ -211,7 +212,11 @@ impl Adapter {
         self.spec.kind == "package"
             && matches!(
                 self.spec.id.as_str(),
-                package::HOMEBREW | package::MISE | package::APT | package::UV_TOOL
+                package::HOMEBREW
+                    | package::MISE
+                    | package::APT
+                    | package::UV_TOOL
+                    | script::ADAPTER
             )
     }
 
@@ -395,6 +400,25 @@ pub fn registry() -> Vec<Adapter> {
             spec: package("uv-tool/v1"),
             generator: None,
         },
+        // A tool installed by its own script, adopted from a script trial (docs/packages.md,
+        // "Script declarations"). The adapter checks the URLs, the shell and the env names.
+        Adapter {
+            spec: spec(
+                script::ADAPTER,
+                "package",
+                TargetRule::Forbidden,
+                Claims::None,
+                Schema::Table(vec![
+                    field("url", Schema::Str, true),
+                    field("effective_url", Schema::Str, true),
+                    field("shell", Schema::Str, true),
+                    field("args", Schema::Array(Box::new(Schema::Str)), false),
+                    field("env", Schema::Map(Box::new(Schema::Str)), false),
+                    field("binary", Schema::HomePath, true),
+                ]),
+            ),
+            generator: None,
+        },
         Adapter {
             spec: spec(
                 "firstmate-native/v1",
@@ -491,7 +515,7 @@ mod tests {
         assert_eq!(table.iter().filter(|a| a.renders()).count(), secrets.len());
         // Every package adapter has a provider.
         let packages: Vec<_> = table.iter().filter(|a| a.spec.kind == "package").collect();
-        assert_eq!(packages.len(), 4);
+        assert_eq!(packages.len(), 5);
         assert!(
             packages
                 .iter()

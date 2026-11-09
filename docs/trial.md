@@ -78,7 +78,7 @@ The record is a private file under `state/trials/`. `state check` validates it w
 
 ## Script trials
 
-`dfm trial <tool> --script <url>` runs an install script that dfm downloads, under a macOS sandbox, and records what changed. It exists for tools that install only through `curl -fsSL <url> | sh`. The design is `docs/superpowers/specs/2026-11-03-dfm-78-script-trials-design.md`. Where the code differs from it, this section describes the code and "Differences from the design" names the difference. `purge` and `adopt` of a script trial are not built (DFM-82, DFM-83).
+`dfm trial <tool> --script <url>` runs an install script that dfm downloads, under a macOS sandbox, and records what changed. It exists for tools that install only through `curl -fsSL <url> | sh`. The design is `docs/superpowers/specs/2026-11-03-dfm-78-script-trials-design.md`. Where the code differs from it, this section describes the code and "Differences from the design" names the difference. `purge` of a script trial is not built (DFM-82). `adopt` of a script trial is in [docs/adopt.md](adopt.md), "Script trials".
 
 ### Arguments
 
@@ -226,7 +226,7 @@ A crash, a SIGKILL or a system sleep that kills the run leaves a record with `be
 
 When several problems occur in one run, the result carries the highest-ranked code and names every problem. The order is a stop request, then `E_CONFLICT` (a tracked file changed), then the rest. After the script, dfm compares the `tracked_status` snapshot of the guarded checkouts. A change is left in place, not reverted, staged or committed (docs/upgrade.md, "Tracked files"). The sandbox should make such a change impossible, so this is a second check.
 
-The journal operation is `trial-script`. `doctor` shows an active script trial as `<tool> installed by the trial through <url>`. `purge` and `adopt` refuse a script trial with `E_CONFLICT` until DFM-82 and DFM-83.
+The journal operation is `trial-script`. `doctor` shows an active script trial as `<tool> installed by the trial through <url>`. `purge` refuses a script trial with `E_CONFLICT` until DFM-82. `adopt` takes it (docs/adopt.md).
 
 ### Differences from the design
 
@@ -249,7 +249,7 @@ The journal operation is `trial-script`. `doctor` shows an active script trial a
 - **The window is shallow.** Top-level listings show a new or removed child, not a change inside it.
 - **The script downloads more.** What it fetches after it starts is not pinned (`script-downloads`).
 - **Fixed timeout.** One hour, with no flag.
-- **No cleanup yet.** The window lists what changed. `purge` (DFM-82) and `adopt` (DFM-83) do not read it yet.
+- **No cleanup yet.** The window lists what changed. `purge` (DFM-82) does not read it yet. `adopt` reads only its `created` entries at the top level of `~/.config`.
 
 ## Updates
 
@@ -292,4 +292,4 @@ The record is not changed by an update. It keeps what the trial saw at its start
 - **The installed version.** Purge removes the trial's package by name (`package.name`), every installed version, because updates may change it after the trial starts (docs/upgrade.md, "Trials"). A mise roll installs the new version beside the old ones and removes none. The record keeps what it saw at trial start as history and is not updated.
 - **Owners.** `baseline.owners` says who had the tool. A pre-existing tool is never uninstalled. A dependency in `package.install.dependencies` is uninstalled only when no other active trial names it and Homebrew finds no installed formula that needs it. Purge reads no module (docs/purge.md, "Known limits").
 - **Unknown effects.** Purge reports the `unknown` entries as retained or unattributed, never as cleaned.
-- **Candidates for adopt.** `baseline.paths` are the files adopt reviews and promotes into a module. `package.adapter` and `package.name` are the install declaration it generates.
+- **Candidates for adopt.** `baseline.paths` are the files adopt reviews and promotes into a module. `package.adapter` and `package.name` are the install declaration it generates. For a script trial, each window entry `created` at the top level of `~/.config` is a candidate too, and `script` (URL, effective URL, shell, arguments, `--env` values, `binary.path`) is the `script/v1` declaration it generates (docs/adopt.md, "Script trials").

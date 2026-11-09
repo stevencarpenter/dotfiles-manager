@@ -5368,3 +5368,88 @@ fn doctor_state_check_and_recovery_read_the_state_a_sync_run_leaves() {
     assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
     assert!(!stdout(&o).contains("ERROR"), "{}", stdout(&o));
 }
+
+/// A `script/v1` declaration in the published tree: plain `dfm sync` blocks it without a grant
+/// and installs it with one, through the `curl` look-alike and the real `sandbox-exec` (DFM-83).
+#[test]
+fn sync_installs_a_declared_script_tool_only_with_its_grant() {
+    use common::providers::{FAKE_CURL, FAKE_SANDBOX_EXEC};
+    const URL: &str = "https://boat.dev/install";
+    if !Path::new("/usr/bin/sandbox-exec").exists() || common::is_root() {
+        common::skip("needs sandbox-exec and a non-root user");
+        return;
+    }
+    let fx = Fx::new();
+    let providers = fx.work.path().join("providers");
+    let bin = providers.join("bin");
+    fs::create_dir_all(&bin).unwrap();
+    // /usr/bin stays off the provider path, so the curl look-alike is not shadowed.
+    for (name, body) in [
+        ("curl", FAKE_CURL),
+        ("sandbox-exec", FAKE_SANDBOX_EXEC),
+        ("git", "#!/bin/sh\nexec /usr/bin/git \"$@\"\n"),
+    ] {
+        let p = bin.join(name);
+        fs::write(&p, body).unwrap();
+        fs::set_permissions(&p, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    fs::write(
+        providers.join("curl-body"),
+        "#!/bin/sh\nset -e\n/bin/mkdir -p \"$HOME/.boat\" \"$HOME/.local/bin\"\nprintf '#!/bin/sh\\n' > \"$HOME/.boat/boat\"\n/bin/chmod 755 \"$HOME/.boat/boat\"\n/bin/ln -s \"$HOME/.boat/boat\" \"$HOME/.local/bin/boat\"\n",
+    )
+    .unwrap();
+    let tmp = fx.h("tmp");
+    fs::create_dir_all(&tmp).unwrap();
+    let seed = &fx.upstream.seed;
+    let manifest = format!(
+        "{}\n[[resources]]\nid = \"boat\"\nkind = \"package\"\nadapter = \"script/v1\"\n[resources.value]\nurl = \"{URL}\"\neffective_url = \"{URL}\"\nshell = \"sh\"\nbinary = \".local/bin/boat\"\n",
+        common::EXTRA
+    );
+    put(seed, "base/modules/extra/module.toml", &manifest);
+    fx.upstream.push("declare boat");
+    let run = |args: &[&str]| {
+        Command::new(BIN)
+            .env_clear()
+            .env("DFM_PROVIDER_PATH", &bin)
+            .env("DFM_LOGIN_SHELL", "/bin/sh")
+            .env("USER", "t")
+            .env("TMPDIR", &tmp)
+            .arg("--home")
+            .arg(fx.home.path())
+            .args(["sync", "--root", fx.root_arg()])
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    let log = || fs::read_to_string(providers.join("log")).unwrap_or_default();
+    let all = |o: &Output| format!("{}\n{}", stdout(o), stderr(o));
+    // No grant: the packages row is blocked with the command; the rest runs and nothing is
+    // fetched.
+    let o = run(&[]);
+    assert_eq!(code(&o), 0, "{}", all(&o));
+    assert!(
+        all(&o).contains(&format!("dfm sync --trust-origin 'script:{URL}'")),
+        "{}",
+        all(&o)
+    );
+    assert!(!fx.h(".local/bin/boat").exists());
+    assert!(!log().contains("curl "), "{}", log());
+    let o = run(&["--trust-origin", &format!("script:{URL}")]);
+    assert_eq!(code(&o), 3, "{}", all(&o));
+    assert!(
+        fx.grants()
+            .contains(&format!("\"script\":\"script:{URL}\"")),
+        "{}",
+        fx.grants()
+    );
+    // With the grant: one fetch under the lock, the script runs sandboxed, the tool is there.
+    let o = run(&[]);
+    assert_eq!(code(&o), 0, "{}", all(&o));
+    assert!(fx.h(".local/bin/boat").exists(), "{}", all(&o));
+    assert_eq!(log().matches("curl ").count(), 1, "{}", log());
+    assert!(log().contains("/run-sync-"), "{}", log());
+    // The next sync finds it current and runs nothing.
+    let o = run(&[]);
+    assert_eq!(code(&o), 0, "{}", all(&o));
+    assert_eq!(log().matches("curl ").count(), 1, "{}", log());
+}

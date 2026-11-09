@@ -9,6 +9,7 @@
 //! and only then hands the plan to the engine. Without an approval it prints the plan and
 //! changes nothing.
 
+use crate::adapters::script::ScriptCx;
 use crate::adapters::{Generators, package};
 use crate::plan_cmd::{Probed, plan_for, render};
 use crate::{Ctx, cli, load_resolved, paint, require_binding, state_cmd, usage};
@@ -290,17 +291,29 @@ pub(crate) fn probe(
 ) -> Result<Probed, Refusal> {
     let resolved = &loaded.resolved;
     let mut probed = Probed::default();
+    let scripts = || ScriptCx::new(ctx, sys, &loaded.root);
     match args.scope {
         Scope::Packages if args.update => {
-            probed.package = crate::adapters::package::update_facts(resolved, &ctx.runner(sys))?;
+            probed.package = crate::adapters::package::update_facts(
+                resolved,
+                &ctx.runner(sys),
+                Some(&scripts()),
+            )?;
         }
         Scope::Packages => {
-            probed.package = crate::adapters::package::package_facts(resolved, &ctx.runner(sys))?;
+            probed.package = crate::adapters::package::package_facts(
+                resolved,
+                &ctx.runner(sys),
+                Some(&scripts()),
+            )?;
         }
         Scope::Services | Scope::Sync => {
             if args.scope == Scope::Sync {
-                probed.package =
-                    crate::adapters::package::package_facts(resolved, &ctx.runner(sys))?;
+                probed.package = crate::adapters::package::package_facts(
+                    resolved,
+                    &ctx.runner(sys),
+                    Some(&scripts()),
+                )?;
             }
             let staged = loaded
                 .staged
@@ -498,14 +511,19 @@ pub(crate) fn generators_for<'a>(
     loaded: &'a crate::Loaded,
 ) -> Generators<'a> {
     match scope {
-        Scope::Secrets | Scope::Packages | Scope::Services | Scope::Sync => {
-            Generators::with_runner(
-                &loaded.resolved,
-                &loaded.sources,
-                &loaded.root,
-                ctx.runner(sys),
-            )
-        }
+        Scope::Packages | Scope::Sync => Generators::with_runner(
+            &loaded.resolved,
+            &loaded.sources,
+            &loaded.root,
+            ctx.runner(sys),
+        )
+        .with_scripts(ScriptCx::for_install(ctx, sys, &loaded.root)),
+        Scope::Secrets | Scope::Services => Generators::with_runner(
+            &loaded.resolved,
+            &loaded.sources,
+            &loaded.root,
+            ctx.runner(sys),
+        ),
         Scope::Config => Generators::new(&loaded.resolved),
     }
 }

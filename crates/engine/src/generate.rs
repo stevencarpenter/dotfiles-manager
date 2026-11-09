@@ -118,6 +118,8 @@ pub trait Generator {
     }
 
     /// Asks the declared provider whether the package is installed (a read-only listing).
+    /// A generator whose probe fetches (a `script/v1` install context) must be probed only under
+    /// the writer lock.
     fn probe(&self, op: &Operation) -> Result<PackageState, Refusal> {
         Err(Refusal::new(
             Code::GeneratorUnavailable,

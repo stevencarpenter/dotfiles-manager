@@ -222,9 +222,35 @@ fn npm_name(p: &str) -> bool {
     p.len() <= 214 && part(name)
 }
 
-/// A source identity that `--trust-origin` grants: a canonical origin ([`check_origin`]) or
-/// `npm:<package>`. Anything else is `E_SOURCE_UNTRUSTED`.
+/// The prefix of an install script identity: `script:<url>`, the URL a `script/v1` declaration
+/// names (docs/sync.md, "Source identities").
+pub const SCRIPT: &str = "script:";
+
+/// The longest script URL a grant or a declaration holds.
+const MAX_SCRIPT_URL: usize = 2048;
+
+/// An install script URL: `https://`, a host, no whitespace or control character, at most
+/// 2048 bytes. The identity is the URL text exactly as declared.
+pub fn script_url(url: &str) -> bool {
+    url.len() <= MAX_SCRIPT_URL
+        && url
+            .strip_prefix("https://")
+            .is_some_and(|rest| !rest.is_empty() && !rest.starts_with('/'))
+        && !url.chars().any(|c| c.is_whitespace() || c.is_control())
+}
+
+/// A source identity that `--trust-origin` grants: a canonical origin ([`check_origin`]),
+/// `npm:<package>` or `script:<https url>`. Anything else is `E_SOURCE_UNTRUSTED`.
 pub fn check_identity(identity: &str, allow_file: bool) -> Result<(), Refusal> {
+    if let Some(url) = identity.strip_prefix(SCRIPT) {
+        return if script_url(url) {
+            Ok(())
+        } else {
+            Err(untrusted(format!(
+                "{identity:?} is not script:<url> with an https:// URL of at most {MAX_SCRIPT_URL} bytes"
+            )))
+        };
+    }
     match identity.strip_prefix(NPM) {
         Some(p) if npm_name(p) => Ok(()),
         Some(_) => Err(untrusted(format!(
@@ -418,9 +444,19 @@ pub struct PackageGrant {
     pub granted_at: String,
 }
 
-/// `state/grants.json`: the origins and the npm packages the owner trusts, keyed by identity. A
-/// state document, so it carries the state schema. `packages` is optional and left out while
-/// empty, so a file without npm grants stays readable by a manager built before it.
+/// One trusted install script: `script` is the whole `script:<url>` identity (docs/sync.md).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ScriptGrant {
+    pub script: String,
+    pub grant_id: String,
+    pub granted_at: String,
+}
+
+/// `state/grants.json`: the origins, the npm packages and the install scripts the owner trusts,
+/// keyed by identity. A state document, so it carries the state schema. `packages` and
+/// `scripts` are optional and left out while empty, so a file without such grants stays
+/// readable by a manager built before the key.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Grants {
@@ -428,6 +464,8 @@ pub struct Grants {
     pub origins: Vec<Grant>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub packages: Vec<PackageGrant>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub scripts: Vec<ScriptGrant>,
 }
 
 impl Default for Grants {
@@ -436,6 +474,7 @@ impl Default for Grants {
             schema: crate::state::SCHEMA,
             origins: Vec::new(),
             packages: Vec::new(),
+            scripts: Vec::new(),
         }
     }
 }
@@ -446,7 +485,11 @@ impl Grants {
     }
 
     fn existing(&self, identity: &str) -> Option<&str> {
-        if identity.starts_with(NPM) {
+        if identity.starts_with(SCRIPT) {
+            let mut s = self.scripts.iter();
+            s.find(|g| g.script == identity)
+                .map(|g| g.grant_id.as_str())
+        } else if identity.starts_with(NPM) {
             let mut p = self.packages.iter();
             p.find(|g| g.package == identity)
                 .map(|g| g.grant_id.as_str())
@@ -457,13 +500,14 @@ impl Grants {
         }
     }
 
-    /// Exact string equality of the identity: a canonical origin, or `npm:<package>`.
+    /// Exact string equality of the identity: a canonical origin, `npm:<package>` or
+    /// `script:<url>`.
     pub fn trusts(&self, identity: &str) -> bool {
         self.existing(identity).is_some()
     }
 
-    /// Adds a grant for `identity` unless one exists: an `npm:` identity to `packages`, an
-    /// origin to `origins`. Returns the grant id.
+    /// Adds a grant for `identity` unless one exists: a `script:` identity to `scripts`, an
+    /// `npm:` identity to `packages`, an origin to `origins`. Returns the grant id.
     pub fn grant(&mut self, identity: &str, at: &str) -> String {
         if let Some(id) = self.existing(identity) {
             return id.to_string();
@@ -473,7 +517,13 @@ impl Grants {
             &sha256_hex(format!("{identity}\n{at}").as_bytes())[..16]
         );
         let (grant_id, granted_at) = (id.clone(), at.to_string());
-        if identity.starts_with(NPM) {
+        if identity.starts_with(SCRIPT) {
+            self.scripts.push(ScriptGrant {
+                script: identity.into(),
+                grant_id,
+                granted_at,
+            });
+        } else if identity.starts_with(NPM) {
             self.packages.push(PackageGrant {
                 package: identity.into(),
                 grant_id,
@@ -649,6 +699,59 @@ ref = "refs/heads/main"
         let text = String::from_utf8(bytes.clone()).unwrap();
         assert!(text.contains(r#""package":"npm:skills""#), "{text}");
         assert_eq!(Grants::parse(&bytes).unwrap(), g);
+    }
+
+    #[test]
+    fn a_script_grant_round_trips_in_scripts() {
+        let mut g = Grants::default();
+        let id = g.grant(
+            "script:https://example.invalid/i.sh",
+            "2026-11-09T00:00:00Z",
+        );
+        assert!(g.trusts("script:https://example.invalid/i.sh"));
+        assert!(!g.trusts("script:https://example.invalid/i.sh?x"));
+        assert!(!g.trusts("https://example.invalid/i.sh"));
+        assert!(g.origins.is_empty() && g.packages.is_empty());
+        assert_eq!(
+            g.grant(
+                "script:https://example.invalid/i.sh",
+                "2026-11-10T00:00:00Z"
+            ),
+            id
+        );
+        let bytes = crate::state::canonical(&g).unwrap();
+        let text = String::from_utf8(bytes.clone()).unwrap();
+        assert!(
+            text.contains(r#""script":"script:https://example.invalid/i.sh""#),
+            "{text}"
+        );
+        assert_eq!(Grants::parse(&bytes).unwrap(), g);
+        // Without script grants the file has no `scripts` key.
+        let mut plain = Grants::default();
+        plain.grant("npm:skills", "2026-11-09T00:00:00Z");
+        let text = String::from_utf8(crate::state::canonical(&plain).unwrap()).unwrap();
+        assert!(!text.contains("scripts"), "{text}");
+    }
+
+    #[test]
+    fn a_script_identity_needs_an_https_url() {
+        check_identity("script:https://example.invalid/install.sh", false).unwrap();
+        for bad in [
+            "script:http://example.invalid/i.sh",
+            "script:https://",
+            "script:https:///i.sh",
+            "script:https://example.invalid/a b",
+            "script:",
+            "script:file:///tmp/i.sh",
+        ] {
+            assert_eq!(
+                check_identity(bad, false).unwrap_err().code,
+                Code::SourceUntrusted,
+                "{bad}"
+            );
+        }
+        let long = format!("script:https://example.invalid/{}", "a".repeat(2048));
+        assert!(check_identity(&long, false).is_err());
     }
 
     #[test]
