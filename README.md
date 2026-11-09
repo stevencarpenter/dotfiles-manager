@@ -110,8 +110,8 @@ uv run scripts/check_examples.py   # the fixture checker without just
 Environment variables of the gate:
 
 - The gate runs `cargo test --locked --features dfm-cli/test-isolation`. The CLI and differential test targets need that feature; a plain `cargo test` skips them.
-- `DFM_TEST_SELECT` replaces the default `--workspace --features dfm-cli/test-isolation` selection. CI uses it to run one shard per job.
-- The install tests need crates.io, so they are `#[ignore]`d and `network-tests` runs them with `-- --ignored`. `DFM_NETWORK_TESTS` limits that step to named tests of `crates/cli/tests/bootstrap.rs`. `DFM_SKIP_NETWORK_TESTS=1` skips it and prints `SKIPPED: network install test`.
+- The install tests need crates.io, so they are `#[ignore]`d and `network-tests` runs them with `-- --ignored`. `DFM_SKIP_NETWORK_TESTS=1` skips it and prints `SKIPPED: network install test`. `DFM_NETWORK_THREADS` sets how many run at once (default 4).
+- `DFM_TEST_ARCHIVE` and `DFM_TEST_PARTITION` are for hosted CI. The `rust-archive` step builds the test set once into a [cargo-nextest](https://nexte.st) archive and runs the doc tests. With `DFM_TEST_ARCHIVE` set, `rust-tests` and `network-tests` run the nextest partition `DFM_TEST_PARTITION` (for example `count:2/4`) of that archive instead of `cargo test`. Each test then runs in its own process. Local runs do not need nextest.
 - The `scripts` step fails when `shellcheck` is missing. `DFM_SKIP_SHELLCHECK=1` skips it and prints `SKIPPED: shellcheck`.
 
 ### Fixture checker
@@ -120,7 +120,7 @@ Environment variables of the gate:
 
 ### Hosted CI
 
-[Contract CI](.github/workflows/contract-check.yml) runs `scripts/check_all.sh` in stages and gates merge: branch protection on `main` requires its `gate` job. A pull request runs fixtures and scripts on Linux, and Rust style, four test shards and four install-test shards on macOS. The Rust jobs run only when a Rust input changed, and the install tests only when a bootstrap input changed. A new push to a pull request cancels its older run. A push to `main` runs every step. The `gate` job passes when every job passed or was skipped. No check runs a manager workflow against a live HOME or proves behavior on a native device.
+[Contract CI](.github/workflows/contract-check.yml) runs `scripts/check_all.sh` in stages and gates merge: branch protection on `main` requires its `gate` job. A pull request runs fixtures and scripts on Linux, and Rust style and the Rust tests on macOS. The Rust tests compile once: one job builds every test binary into a cargo-nextest archive (pinned version, checked against a recorded SHA-256), and four test jobs and five install-test jobs each run one partition of it without compiling. The install tests still build the manager from source through `bootstrap.sh`, because that build is what they test. The Rust jobs run only when a Rust input changed, and the install tests only when a bootstrap input changed. A new push to a pull request cancels its older run. A push to `main` runs every step. The `gate` job passes when every job passed or was skipped. No check runs a manager workflow against a live HOME or proves behavior on a native device.
 
 ## Documentation
 
