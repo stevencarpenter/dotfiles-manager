@@ -821,8 +821,8 @@ pub(super) fn run(
     }
     let binary = crate::plan_cmd::binary_identity()?;
     let stamp = Stamp::of(&binding);
-    // The fetch runs before anything is decided, so a stop request ends curl instead of
-    // leaving it running.
+    // The sandbox dry run and the fetch run child processes, so a stop request ends them
+    // instead of leaving them running.
     signal::install()?;
     let stop = || signal::requested().map_or(Ok(()), Err);
     let (layout, sys) = (ctx.layout(), ctx.sys()?);
@@ -872,23 +872,33 @@ pub(super) fn run(
             ),
         )
     };
+    let dfm_env: Vec<(String, String)> = std::env::vars_os()
+        .filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?)))
+        .collect();
+    // The script environment and the sandbox profile for `ledger`; neither needs the script.
+    let confine = |ledger: &Ledger| -> Result<(Vec<(String, String)>, String), Refusal> {
+        let env = script_env(&runner, &dfm_env, s.tty, &s.env)?;
+        let temp = env
+            .iter()
+            .find_map(|(n, v)| (n == "TMPDIR").then(|| PathBuf::from(v)))
+            .unwrap_or_else(std::env::temp_dir);
+        Ok((env, profile(&protected(&layout, &root, ledger, &temp)?)?))
+    };
+    // A system without a working sandbox refuses before anything is fetched or cached.
+    let ledger = readable.read_ledger_lenient()?;
+    let confined = confine(&ledger)?;
+    let sandbox = sandbox_exec(&runner, &confined.1)?;
+    stop()?;
     // An approval runs the bytes the preview cached; it never fetches again.
     let fetched = match &args.yes_plan {
         None => fetch(&runner, &layout.cache_dir, &s.url)?,
         Some(_) => cached(&layout.cache_dir, &s.url)?.ok_or_else(missing)?,
     };
     stop()?;
-    let dfm_env: Vec<(String, String)> = std::env::vars_os()
-        .filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?)))
-        .collect();
     // The decision and the sandbox profile for it; the digest covers the profile's hash.
-    let decide = |fetched: Fetched, ledger: &Ledger| -> Result<(Decision, String), Refusal> {
-        let env = script_env(&runner, &dfm_env, s.tty, &s.env)?;
-        let temp = env
-            .iter()
-            .find_map(|(n, v)| (n == "TMPDIR").then(|| PathBuf::from(v)))
-            .unwrap_or_else(std::env::temp_dir);
-        let profile = profile(&protected(&layout, &root, ledger, &temp)?)?;
+    let decide = |fetched: Fetched,
+                  (env, profile): (Vec<(String, String)>, String)|
+     -> Result<(Decision, String), Refusal> {
         let baseline = paths.iter().map(|p| observe(p)).collect::<Result<_, _>>()?;
         let (mut seen, mut skipped) = (Vec::new(), skipped.clone());
         for p in &data {
@@ -915,9 +925,7 @@ pub(super) fn run(
         };
         Ok((decision, profile))
     };
-    let (first, profile_text) = decide(fetched, &readable.read_ledger_lenient()?)?;
-    let sandbox = sandbox_exec(&runner, &profile_text)?;
-    stop()?;
+    let (first, _) = decide(fetched, confined)?;
     let digest = first.digest()?;
     if let Some(i) = &ctx.isolated {
         writeln!(out, "isolated: true {i}").map_err(w)?;
@@ -964,7 +972,7 @@ pub(super) fn run(
         store.require_identity(&binding)?;
         let ledger = store.read_ledger()?;
         let fetched = cached(&layout.cache_dir, &s.url)?.ok_or_else(missing)?;
-        let (locked, profile) = decide(fetched, &ledger)?;
+        let (locked, profile) = decide(fetched, confine(&ledger)?)?;
         stop()?;
         let locked_digest = locked.digest()?;
         if locked_digest != digest {

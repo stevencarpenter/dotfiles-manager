@@ -1071,14 +1071,14 @@ fn a_missing_sandbox_exec_refuses_before_the_preview() {
         "{}",
         text(&o.stdout)
     );
-    // The check needs the profile, which comes after the fetch: the bytes are cached already.
-    assert_eq!(fx.log().matches("curl ").count(), 1, "{}", fx.log());
-    assert!(fx.cached().exists());
+    // Nothing is fetched or cached, and no state is written.
+    assert!(!fx.log().contains("curl "), "{}", fx.log());
+    assert!(!fx.cached().exists() && !fx.cached().with_extension("json").exists());
     assert!(!fx.state().join("trials").join("trial-boat.json").exists());
 }
 
 #[test]
-fn a_profile_the_sandbox_rejects_refuses_the_approved_run_before_the_record() {
+fn a_profile_the_sandbox_rejects_refuses_the_preview_and_the_approved_run() {
     if no_sandbox() {
         return;
     }
@@ -1086,16 +1086,31 @@ fn a_profile_the_sandbox_rejects_refuses_the_approved_run_before_the_record() {
     fx.script("#!/bin/sh\nexit 0\n");
     let o = fx.trial_script("boat", &["--preview"]);
     assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let digest = digest_of(&o);
+    fs::remove_file(fx.cached()).unwrap();
+    fs::remove_file(fx.cached().with_extension("json")).unwrap();
+    fs::write(fx.fake.path().join("log"), "").unwrap();
     // The fake now fails the dry run as a rejected profile would.
     fx.marker("sandbox-missing", "");
-    let o = fx.trial_script("boat", &["--yes-plan", &digest_of(&o)]);
-    assert_eq!(code(&o), 3, "{}\n{}", stderr(&o), text(&o.stdout));
-    let err = stderr(&o);
-    assert!(err.contains("E_PLATFORM_UNSUPPORTED"), "{err}");
-    assert!(
-        err.contains("the sandbox profile was not accepted"),
-        "{err}"
-    );
+    let not_accepted = |o: &Output| {
+        assert_eq!(code(o), 3, "{}\n{}", stderr(o), text(&o.stdout));
+        let err = stderr(o);
+        assert!(err.contains("E_PLATFORM_UNSUPPORTED"), "{err}");
+        assert!(
+            err.contains("the sandbox profile was not accepted"),
+            "{err}"
+        );
+        assert!(
+            !text(&o.stdout).contains("plan digest: "),
+            "{}",
+            text(&o.stdout)
+        );
+    };
+    not_accepted(&fx.trial_script("boat", &["--preview"]));
+    // The approved run refuses on the sandbox before it looks for the cached script.
+    not_accepted(&fx.trial_script("boat", &["--yes-plan", &digest]));
+    assert!(!fx.log().contains("curl "), "{}", fx.log());
+    assert!(!fx.cached().exists() && !fx.cached().with_extension("json").exists());
     assert!(!fx.state().join("trials/trial-boat.json").exists());
     assert!(!fx.journal().iter().any(|e| e["op"] == "trial-script"));
 }
