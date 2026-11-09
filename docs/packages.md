@@ -142,7 +142,7 @@ Only the approved run fetches, once, under the writer lock. The engine's probe b
 
 The install writes no trial record. The journal intent and outcome and the receipt row are the packages scope's own (see "One operation"). The script's output is inherited, as in the trial. A write to a path the sandbox denies (a dfm link, an adopted configuration file, the dotfiles checkout) fails the script, and the row fails.
 
-`doctor` reads `grants.json` and fetches nothing: a missing binary without a grant is an `E_SOURCE_UNTRUSTED` row whose fix is the `--trust-origin` command, and with a grant a `D_PLAN_PENDING` row, "Run dfm sync, which installs it".
+`doctor` reads `grants.json` and fetches nothing: a missing binary without a grant is an `E_SOURCE_UNTRUSTED` row whose fix is the `--trust-origin` command, and with a grant a `D_PLAN_PENDING` row, "Run dfm sync, which installs it". Each declaration also gets a `binary` row (docs/doctor.md, "Script binaries").
 
 ## One operation
 

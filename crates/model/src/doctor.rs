@@ -37,10 +37,11 @@ pub enum DoctorCode {
     StagedCopy,
     Upgrade,
     Trial,
+    ScriptBinary,
 }
 
 impl DoctorCode {
-    pub const ALL: [DoctorCode; 16] = [
+    pub const ALL: [DoctorCode; 17] = [
         DoctorCode::Ok,
         DoctorCode::NaSensitive,
         DoctorCode::OutputMissing,
@@ -57,6 +58,7 @@ impl DoctorCode {
         DoctorCode::StagedCopy,
         DoctorCode::Upgrade,
         DoctorCode::Trial,
+        DoctorCode::ScriptBinary,
     ];
 
     pub const fn as_str(self) -> &'static str {
@@ -77,6 +79,7 @@ impl DoctorCode {
             DoctorCode::StagedCopy => "D_STAGED_COPY",
             DoctorCode::Upgrade => "D_UPGRADE",
             DoctorCode::Trial => "D_TRIAL",
+            DoctorCode::ScriptBinary => "D_SCRIPT_BINARY",
         }
     }
 
@@ -111,6 +114,9 @@ impl DoctorCode {
             DoctorCode::Upgrade => "The last upgrade did not end with `ok`.",
             DoctorCode::Trial => {
                 "An active trial: a tool installed to try it, outside the profile."
+            }
+            DoctorCode::ScriptBinary => {
+                "The binary of a script trial or a `script/v1` declaration, resolved and hashed again."
             }
         }
     }
@@ -463,6 +469,7 @@ mod tests {
             DoctorCode::StagedCopy => 13,
             DoctorCode::Upgrade => 14,
             DoctorCode::Trial => 15,
+            DoctorCode::ScriptBinary => 16,
         }
     }
 
@@ -470,7 +477,7 @@ mod tests {
     fn all_lists_every_variant_once() {
         let mut idx: Vec<usize> = DoctorCode::ALL.iter().map(|c| index(*c)).collect();
         idx.sort_unstable();
-        assert_eq!(idx, (0..=15).collect::<Vec<_>>());
+        assert_eq!(idx, (0..=16).collect::<Vec<_>>());
     }
 
     #[test]

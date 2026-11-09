@@ -23,7 +23,7 @@ pub(super) const MAX_RECORD_BYTES: usize = 3 << 20;
 /// The `TrialRecord.unknown` token of a record whose window `shrink_window` cut.
 pub(super) const WINDOW_TRUNCATED: &str = "window-truncated";
 /// Largest file the window hashes; a bigger file is recorded without a digest.
-pub(super) const HASH_CAP: u64 = 16 * 1024 * 1024;
+pub(crate) const HASH_CAP: u64 = 16 * 1024 * 1024;
 
 const ZSH_FILES: [&str; 5] = [".zshenv", ".zprofile", ".zshrc", ".zlogin", ".zlogout"];
 
@@ -87,7 +87,7 @@ fn plain(s: &str) -> String {
 
 /// SHA-256 of a regular file up to `HASH_CAP`; `None` when it is bigger, unreadable or not
 /// a regular file. The read does not follow a link, so callers pass a resolved path.
-fn hash(path: &Path) -> Option<String> {
+pub(crate) fn hash(path: &Path) -> Option<String> {
     let refuse = || Refusal::new(Code::IoFailed, "unreadable");
     let bytes = read_regular_bounded(path, HASH_CAP, |_| refuse(), refuse).ok()?;
     (bytes.len() as u64 <= HASH_CAP).then(|| sha256_hex(&bytes))

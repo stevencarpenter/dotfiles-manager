@@ -19,7 +19,9 @@ use dfm_model::plan::{
     ServiceFacts, ServiceState, Status, in_scope, link_fingerprint, sensitive_paths,
 };
 use dfm_model::resolve::ResolvedResource;
-use dfm_model::state::{Class, JournalEntry, Ledger, Receipt, unfinished, unresolved};
+use dfm_model::state::{
+    Class, JournalEntry, Ledger, Receipt, ScriptBinary, TrialRecord, unfinished, unresolved,
+};
 use dfm_model::{Code, Refusal};
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
@@ -131,9 +133,10 @@ fn inspect(ctx: &Ctx, command: &'static str, root: Option<&Path>) -> Result<Repo
     let observed = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
-    let owned = state_rows(sys, &layout, binding.as_ref(), &mut rows);
+    let (owned, scripts) = state_rows(sys, &layout, binding.as_ref(), &mut rows);
     lock_row(ctx, sys.uid, &mut rows);
     let (loaded, plan) = profile_rows(ctx, &sys, &path, binding.as_ref(), root, &mut rows);
+    script_binary_rows(&layout.home, &path, &scripts, loaded.as_ref(), &mut rows);
     output_rows(
         sys,
         &layout,
@@ -215,18 +218,19 @@ fn binding_row(ctx: &Ctx, rows: &mut Vec<Row>) -> Option<Binding> {
 
 // ---- state --------------------------------------------------------------------------------
 
-/// State store rows. Returns the owned outputs when the ledger could be read.
+/// State store rows. Returns the owned outputs when the ledger could be read, and the readable
+/// script trial records of the bound identity, active and adopted, for the script binary rows.
 fn state_rows(
     sys: Sys,
     layout: &Layout,
     binding: Option<&Binding>,
     rows: &mut Vec<Row>,
-) -> Option<Vec<Owned>> {
+) -> (Option<Vec<Owned>>, Vec<TrialRecord>) {
     let store = match Store::open_read(sys, layout, Fail::none()) {
         Ok(s) => s,
         Err(r) => {
             rows.push(refusal_row("state", "state directory", &r));
-            return None;
+            return (None, Vec::new());
         }
     };
     let (b, store) = match (binding, store) {
@@ -240,7 +244,7 @@ fn state_rows(
                 "no state exists",
                 "Run bind to create the binding and the state.",
             ));
-            return None;
+            return (None, Vec::new());
         }
         (Some(_), None) => {
             let r = Refusal::new(
@@ -248,7 +252,7 @@ fn state_rows(
                 "the binding exists but its state directory is missing (state loss)",
             );
             rows.push(refusal_row("state", "state directory", &r));
-            return None;
+            return (None, Vec::new());
         }
         (None, Some(_)) => {
             let r = Refusal::new(
@@ -256,7 +260,7 @@ fn state_rows(
                 "state exists but there is no readable binding",
             );
             rows.push(refusal_row("state", "state directory", &r));
-            return None;
+            return (None, Vec::new());
         }
     };
     let l = store.load();
@@ -290,7 +294,213 @@ fn state_rows(
     trial_rows(&l, &findings, rows);
     receipt_row(&l, bad, rows);
     upgrade_row(&l, rows);
-    owned
+    let scripts = l
+        .trials
+        .iter()
+        .filter(|(n, _)| !findings.iter().any(|f| f.file == format!("trials/{n}")))
+        .filter_map(|(_, t)| t.as_ref().ok())
+        .filter(|t| t.script.is_some())
+        .cloned()
+        .collect();
+    (owned, scripts)
+}
+
+/// The binary a script trial recorded when its run ended.
+fn recorded(t: &TrialRecord) -> Option<&ScriptBinary> {
+    t.script.as_ref().and_then(|s| s.binary.as_ref())
+}
+
+/// One `D_SCRIPT_BINARY` row per active script trial and per `script/v1` declaration
+/// (docs/doctor.md, "Script binaries"). A sensitive or invalid declaration has its package row
+/// only.
+fn script_binary_rows(
+    home: &Path,
+    path: &OsStr,
+    trials: &[TrialRecord],
+    loaded: Option<&Loaded>,
+    rows: &mut Vec<Row>,
+) {
+    for t in trials.iter().filter(|t| t.is_active()) {
+        let who = format!("script trial {}", t.trial_id);
+        let fix = "Install the tool again, or end the trial.";
+        rows.push(match recorded(t) {
+            Some(b) => binary_row(&who, Path::new(&b.path), Some(b), fix, home, path, trials),
+            None => Row::new(
+                "binary",
+                D::ScriptBinary,
+                Level::Warn,
+                &format!("trials/{}.json", t.trial_id),
+                &format!(
+                    "{who}: no binary was recorded: {} was not on PATH when the run ended",
+                    t.tool
+                ),
+                fix,
+            ),
+        });
+    }
+    let Some(l) = loaded else { return };
+    let declared =
+        l.resolved.resources.values().filter(|r| {
+            r.adapter == crate::adapters::script::ADAPTER && !r.sensitive && !in_scope(r)
+        });
+    for r in declared {
+        let Ok(d) = crate::adapters::script::declared(&r.value) else {
+            continue;
+        };
+        let at = home.join(&d.binary);
+        // The adopted trial that recorded this binary; the newest when there are several.
+        let since = trials
+            .iter()
+            .filter(|t| !t.is_active() && recorded(t).is_some_and(|b| Path::new(&b.path) == at))
+            .max_by_key(|t| t.created_unix_ns)
+            .and_then(recorded);
+        let who = format!("script/v1 declaration {}", r.id);
+        let fix = "Run dfm sync, which installs the declared tool again.";
+        rows.push(binary_row(&who, &at, since, fix, home, path, trials));
+    }
+}
+
+/// The row of one script binary. The path is resolved through its links again and the file it
+/// points to now is hashed, up to the trial's hash cap. Nothing is executed.
+fn binary_row(
+    who: &str,
+    at: &Path,
+    since: Option<&ScriptBinary>,
+    missing_fix: &str,
+    home: &Path,
+    path: &OsStr,
+    trials: &[TrialRecord],
+) -> Row {
+    use crate::trial_cmd::window::{HASH_CAP, hash};
+    let mut notes = vec![who.to_string()];
+    let mut fix = "";
+    match std::fs::canonicalize(at) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            fix = missing_fix;
+            notes.push(if std::fs::symlink_metadata(at).is_ok() {
+                "the link target of the binary path is missing".into()
+            } else {
+                "the binary path is missing".into()
+            });
+        }
+        Err(e) => {
+            fix = missing_fix;
+            notes.push(format!("the binary path cannot be resolved: {}", e.kind()));
+        }
+        Ok(real) => {
+            let len = std::fs::metadata(&real)
+                .ok()
+                .filter(|m| m.is_file())
+                .map(|m| m.len());
+            notes.push(match (len, hash(&real)) {
+                (None, _) => {
+                    fix = missing_fix;
+                    format!(
+                        "the binary path resolves to {}, which is not a file",
+                        real.display()
+                    )
+                }
+                (Some(n), _) if n > HASH_CAP => format!(
+                    "resolves to {}, which is larger than 16 MiB and is not hashed",
+                    real.display()
+                ),
+                (_, None) => format!("resolves to {}, which cannot be read", real.display()),
+                (_, Some(now)) => match since {
+                    None => format!(
+                        "resolves to {} (sha256 {now}); no trial record to compare",
+                        real.display()
+                    ),
+                    Some(b) if b.sha256 == now => {
+                        format!("binary unchanged since trial (sha256 {now})")
+                    }
+                    Some(b) if Path::new(&b.real_path) == real => {
+                        format!("binary changed since trial: sha256 {} -> {now}", b.sha256)
+                    }
+                    Some(b) => format!(
+                        "binary changed since trial: sha256 {} -> {now}; real path {} -> {}",
+                        b.sha256,
+                        b.real_path,
+                        real.display()
+                    ),
+                },
+            });
+        }
+    }
+    let tool = at.file_name().unwrap_or_default();
+    let copies = path_copies(home, path, tool);
+    let files: BTreeSet<&Path> = copies.iter().map(|(_, real)| real.as_path()).collect();
+    if files.len() > 1 {
+        if fix.is_empty() {
+            fix = "Remove the copies you do not use, or put the one you use first on PATH.";
+        }
+        let listed: Vec<String> = copies
+            .iter()
+            .map(|(c, real)| format!("{} ({})", c.display(), owner(c, real, home, trials)))
+            .collect();
+        notes.push(format!(
+            "PATH holds {} different files named {}: {}",
+            files.len(),
+            tool.to_string_lossy(),
+            listed.join(", ")
+        ));
+    }
+    let status = if fix.is_empty() {
+        Level::Ok
+    } else {
+        Level::Warn
+    };
+    Row::new(
+        "binary",
+        D::ScriptBinary,
+        status,
+        &at.display().to_string(),
+        &notes.join("; "),
+        fix,
+    )
+}
+
+/// Each executable named `tool` on the doctor process PATH and then on the provider path, with
+/// the file it resolves to. A directory is looked at once; relative and empty entries are
+/// skipped. `stat` and `realpath` only: nothing is executed.
+fn path_copies(
+    home: &Path,
+    path: &OsStr,
+    tool: &OsStr,
+) -> Vec<(std::path::PathBuf, std::path::PathBuf)> {
+    let mut seen = BTreeSet::new();
+    std::env::split_paths(path)
+        .chain(dfm_platform_macos::provider_path(home))
+        .filter(|d| d.is_absolute() && seen.insert(d.clone()))
+        .map(|d| d.join(tool))
+        .filter(|c| {
+            std::fs::metadata(c).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+        })
+        .filter_map(|c| std::fs::canonicalize(&c).ok().map(|real| (c, real)))
+        .collect()
+}
+
+/// Who put a copy there: a script trial whose recorded path or real path is the copy or the file
+/// it resolves to, a `homebrew` path component (the package owner check's rule), the mise shims
+/// or installs directory, else `unknown`.
+fn owner(copy: &Path, real: &Path, home: &Path, trials: &[TrialRecord]) -> String {
+    let trial = trials.iter().find(|t| {
+        recorded(t).is_some_and(|b| {
+            [copy, real]
+                .iter()
+                .any(|p| *p == Path::new(&b.path) || *p == Path::new(&b.real_path))
+        })
+    });
+    if let Some(t) = trial {
+        return format!("script trial {}", t.trial_id);
+    }
+    let mise = home.join(".local/share/mise");
+    if copy.components().any(|c| c.as_os_str() == "homebrew") {
+        crate::adapters::package::HOMEBREW.into()
+    } else if copy.starts_with(mise.join("shims")) || copy.starts_with(mise.join("installs")) {
+        crate::adapters::package::MISE.into()
+    } else {
+        "unknown".into()
+    }
 }
 
 /// The ledger row and the owned outputs. One path outside HOME gets its own ERROR row and does

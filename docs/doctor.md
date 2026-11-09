@@ -33,7 +33,7 @@ Both commands are read-only. The only programs they start are the read-only pack
 
 | Field | Meaning |
 | --- | --- |
-| `kind` | `binding`, `state`, `lock`, `profile`, `module`, `resource`, `output`, `intent`, `receipt`, `upgrade`, `trial` or `plan`. |
+| `kind` | `binding`, `state`, `lock`, `profile`, `module`, `resource`, `output`, `intent`, `receipt`, `upgrade`, `trial`, `binary` or `plan`. |
 | `code` | A stable code: an existing `E_*` code, or a `D_*` code from the table below. |
 | `status` | `OK`, `WARN`, `ERROR`, `UNKNOWN` or `N/A`. |
 | `subject` | The path, file or resource. Output paths and stray state entries are relative to HOME or to the state directory. The `binding`, `profile` and `lock` subjects are absolute paths. A subject is cut at 4096 visible characters, after control and invisible characters became escapes, and never inside one escape. |
@@ -55,6 +55,7 @@ The report also carries two header facts of the inspection: `observed_unix`, the
 | `state` | The state directory | ERROR `E_STATE_INVALID` for state loss (binding without state) or state without a binding. ERROR `E_STORAGE_INVALID` for a redirected or badly owned directory. N/A `D_STATE_ABSENT` when neither exists. |
 | `state` | A receipt or trial record that cannot be read, or belongs to another identity | WARN with the file's code, labeled partial. Receipts and trial records are audit evidence, never authority. |
 | `trial` | Each readable, active trial record of the bound identity (docs/trial.md). An adopted record has ended and gets no row. | OK `D_TRIAL`. The subject is `trials/<file>`. The detail names the trial, the tool, its start time, the provider and package and whether the trial installed it, and the number of owned outputs. |
+| `binary` | Each active script trial and each `script/v1` declaration (docs/trial.md, docs/packages.md) | `D_SCRIPT_BINARY`. OK, or WARN when the binary path or its link target is missing, or when PATH holds more than one file named like the tool. See "Script binaries". |
 | `state` | Stray entries (interrupted writes, staging directories) | WARN `D_STATE_PARTIAL`, labeled partial. |
 | `intent` | A journal intent with no outcome | ERROR `E_OP_INTERRUPTED`. A running apply also leaves an intent until it ends, and doctor cannot tell the two apart. Fix: wait for a running apply, then run `apply`, which settles it. |
 | `intent` | A journal `unknown` entry that no later entry settled | ERROR `E_OP_INTERRUPTED`, required. The detail names the operation and its journal id, and says whether it blocks one path or, with no intent record, a whole resource. Fix: `state recover` or `apply`, which probe it again, or `state resolve '<journal-id>' --as done|failed` (`done` is refused for an entry with more than one path). Doctor never settles. The row stays until a later entry settles the operation. |
@@ -74,6 +75,30 @@ The report also carries two header facts of the inspection: `observed_unix`, the
 ### PATH selection
 
 For a package row, doctor walks the PATH of the invoking process in order for an executable file with the package's short name (`atuin` for `homebrew/core/atuin`, `node` for `node@20`). It follows the links of the first match with `readlink`, at most 16, and shows the chain: `PATH selects <dir>/<name> -> <target>`, or `PATH selects no executable named <name>`. A relative PATH entry is skipped. Nothing is executed, so a version-manager shim shows as the shim, not as the version it would pick. The selection holds for the invoking process only, not for another shell's aliases, hash table or environment. A package whose executable has another name shows no selection.
+
+### Script binaries
+
+A `binary` row covers the executable of a tool that a script installed: one row per active script trial and one per `script/v1` declaration. The subject is the binary path: the path the trial recorded (`script.binary.path`), or HOME joined with the declared `binary`. A sensitive declaration, or one the resolver accepts but the adapter refuses, has its package row only. An active trial that recorded no binary (the tool was not on PATH when the run ended) gets a WARN row with the subject `trials/<id>.json`.
+
+Each run resolves the binary path through its links again and hashes the file it points to now, up to 16 MiB. It never hashes the recorded `real_path`, because an updater can point the link to a new file and leave the old one in place. The tool is never executed. The row compares the new digest with the one its trial recorded. For a declaration, that is the adopted trial whose recorded path is the declared one (the newest when there are several).
+
+| Situation | Status and detail |
+| --- | --- |
+| Same digest as the trial | OK, `binary unchanged since trial (sha256 <digest>)` |
+| Another digest (a self-update) | OK, `binary changed since trial: sha256 <old> -> <new>`, then `; real path <old> -> <new>` when the real paths differ |
+| No trial record to compare (a declaration whose trial record is gone) | OK, the real path and the digest |
+| The real file is over 16 MiB, or cannot be read | OK, a note that the file is not hashed |
+| The binary path is missing, its link target is missing, or it resolves to something that is not a file | WARN. Fix: install the tool again (`dfm sync` for a declaration) |
+| PATH holds more than one executable named like the binary, and they resolve to different files | WARN, `PATH holds <n> different files named <tool>:` and each path with its owner |
+
+The PATH for the second-copy check is the doctor process PATH, then the fixed provider directories. Relative and empty entries are skipped, and each directory is read once. Two paths that resolve to the same file are one copy. The owner of each path is the first that matches:
+
+- `script trial <id>`: the path, or the file it resolves to, is a script trial's recorded `binary.path` or `real_path`.
+- `homebrew/v1`: a path component is `homebrew`, the rule of the package owner check.
+- `mise/v1`: the path is below `~/.local/share/mise/shims` or `~/.local/share/mise/installs`.
+- `unknown`: anything else.
+
+The Homebrew second-copy note of the `claude`, `codex` and `opencode` updaters (docs/upgrade.md) is separate and unchanged.
 
 ### Output rows
 
@@ -118,6 +143,7 @@ Doctor's own inspection reads and hashes no content of a sensitive output, whoev
 | `D_STAGED_COPY` | A name beside an owned output has the shape of a staged copy of an older build. Nothing removes it. |
 | `D_UPGRADE` | The last upgrade did not end with `ok`. |
 | `D_TRIAL` | An active trial: a tool installed to try it, outside the profile. |
+| `D_SCRIPT_BINARY` | The binary of a script trial or a `script/v1` declaration, resolved and hashed again. |
 
 `E_*` codes keep the meaning given in [state.md](state.md), [resolver.md](resolver.md), [planner.md](planner.md) and [apply.md](apply.md).
 

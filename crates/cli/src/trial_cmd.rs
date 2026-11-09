@@ -27,7 +27,7 @@ use std::io::Write;
 use std::path::Path;
 
 pub(crate) mod script;
-mod window;
+pub(crate) mod window;
 
 /// Effects a trial does not instrument. They are recorded so `purge` treats them as candidates
 /// for review and never as owned cleanup scope (DESIGN.md: the manager is not an OS sandbox).
