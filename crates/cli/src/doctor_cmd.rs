@@ -1026,9 +1026,21 @@ fn package_row(r: &ResolvedResource, s: &PackageState, path: &OsStr) -> Row {
     };
     let detail = format!(
         "{detail}; {}",
-        selected(path, crate::adapters::package::leaf(&pkg))
+        selected(path, &executable_name(by, &r.value, &pkg))
     );
     Row::new("resource", code, status, &r.id, &clip(&detail), &fix).optional()
+}
+
+/// The executable name PATH is searched for: the file name of a script declaration's `binary`,
+/// else the short name of the package.
+fn executable_name(adapter: &str, value: &toml::Value, pkg: &str) -> String {
+    if adapter == crate::adapters::script::ADAPTER
+        && let Ok(d) = crate::adapters::script::declared(value)
+        && let Some(n) = std::path::Path::new(&d.binary).file_name()
+    {
+        return n.to_string_lossy().into_owned();
+    }
+    crate::adapters::package::leaf(pkg).to_string()
 }
 
 /// The executable `name` that the invoking process's PATH selects, and the links it resolves
@@ -1421,7 +1433,23 @@ fn owned_row(path: &str, who: &str, op: Option<&Operation>, live: Live) -> Row {
 
 #[cfg(test)]
 mod tests {
-    use super::{Listing, scan_listing, takes_slot};
+    use super::{Listing, executable_name, scan_listing, takes_slot};
+
+    #[test]
+    fn a_script_package_is_searched_for_by_its_declared_binary() {
+        let v: toml::Value = toml::from_str(
+            "url = \"https://x.example/i.sh\"\neffective_url = \"https://x.example/i.sh\"\nshell = \"sh\"\nbinary = \".local/bin/boat\"\n",
+        )
+        .unwrap();
+        assert_eq!(executable_name("script/v1", &v, "extra.boat"), "boat");
+        assert_eq!(executable_name("homebrew/v1", &v, "tap/atuin"), "atuin");
+        // An invalid declaration falls back to the package name.
+        let bad: toml::Value = toml::from_str("x = 1").unwrap();
+        assert_eq!(
+            executable_name("script/v1", &bad, "extra.boat"),
+            "extra.boat"
+        );
+    }
 
     fn listing(names: &[&str], odd: usize) -> Listing {
         Listing {
