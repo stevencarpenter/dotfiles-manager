@@ -3360,8 +3360,7 @@ fn an_inexact_window_name_keeps_every_window_candidate() {
     );
     let (preview, run) = purged(&fx);
     let shown = text(&preview.stdout);
-    let why =
-        "a window entry has a name that cannot be shown exactly; nothing is removed by the window";
+    let why = "a window entry has a name that cannot be shown exactly; nothing the trial created is removed";
     // The directory is already held by the tree rule; the file by the rule for any candidate.
     for want in [
         format!(
@@ -3407,6 +3406,32 @@ fn a_baseline_data_path_moved_in_from_elsewhere_is_kept() {
         fs::read_to_string(fx.h("Library/Caches/boat/keep.txt")).unwrap(),
         "mine\n"
     );
+}
+
+#[test]
+fn an_inexact_link_to_a_baseline_file_keeps_that_file() {
+    if no_sandbox() {
+        return;
+    }
+    let fx = Fx::new();
+    fx.bind_with_links();
+    fs::create_dir_all(fx.h(".local/bin")).unwrap();
+    let rc = fx.h(".boatrc");
+    let rs = rc.display().to_string();
+    // `~/.boatrc` is a baseline path; the link to it has a control character in its name.
+    fx.script_trial(
+        "#!/bin/sh\nset -e\necho a > ~/.boatrc\nln -s ~/.boatrc \"$HOME/.local/bin/b$(printf '\\001')\"\n",
+        &["--config", &rs],
+    );
+    let (preview, run) = purged(&fx);
+    let shown = text(&preview.stdout);
+    let want = format!(
+        "retained: {rs} (a window entry has a name that cannot be shown exactly; nothing the trial created is removed)"
+    );
+    assert!(shown.contains(&want), "{want}\n{shown}");
+    assert!(!shown.contains("action: remove"), "{shown}");
+    assert_eq!(code(&run), 0, "{}\n{}", stderr(&run), text(&run.stdout));
+    assert!(rc.is_file());
 }
 
 #[test]

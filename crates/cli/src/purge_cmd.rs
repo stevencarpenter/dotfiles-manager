@@ -306,8 +306,16 @@ fn tree_capped(
     if let Some(why) = unremovable(&fs::symlink_metadata(dir)?, uid) {
         return Ok(Err(why));
     }
-    let mut lines = Vec::new();
-    let mut listed = 0usize;
+    // The root's own inode and ctime: an empty directory swapped for another empty one, or
+    // one whose entries changed and changed back, is then a different tree.
+    let root = fs::symlink_metadata(dir)?;
+    let mut lines = vec![format!(
+        ".\td\t{}\t{}.{}",
+        root.ino(),
+        root.ctime(),
+        root.ctime_nsec()
+    )];
+    let mut listed = lines[0].len();
     let mut bytes = 0u64;
     let mut stack = vec![dir.to_path_buf()];
     while let Some(d) = stack.pop() {
@@ -342,7 +350,8 @@ fn tree_capped(
             );
             listed += line.len();
             lines.push(line);
-            if lines.len() > MAX_ENTRIES {
+            // The root line is not an entry.
+            if lines.len() - 1 > MAX_ENTRIES {
                 return Ok(Err(format!("more than {MAX_ENTRIES} entries")));
             }
             if listed > cap {
@@ -355,7 +364,7 @@ fn tree_capped(
     }
     lines.sort();
     Ok(Ok((
-        lines.len(),
+        lines.len() - 1,
         bytes,
         sha256_hex(lines.join("\n").as_bytes()),
     )))
@@ -560,7 +569,9 @@ fn vouching<'a>(link: &Path, target: &str, created_dirs: &[&'a Path]) -> Vec<&'a
     created_dirs
         .iter()
         .copied()
-        .filter(|d| in_order(d).is_some_and(|d| at_or_below(&to, &d.to_string_lossy())))
+        // Both sides are resolved on disk, so the comparison is exact: a case fold would let
+        // `~/foo/file` count as inside `~/Foo` on a case-sensitive volume.
+        .filter(|d| in_order(d).is_some_and(|d| Path::new(to.as_ref()).starts_with(&d)))
         .collect()
 }
 
@@ -1432,23 +1443,23 @@ pub fn run(ctx: &Ctx, args: &Args, out: &mut dyn Write) -> Result<(), Refusal> {
                 )
             } else if entries.iter().any(inexact) {
                 Some(
-                    "a window entry has a name that cannot be shown exactly; nothing is removed by the window",
+                    "a window entry has a name that cannot be shown exactly; nothing the trial created is removed",
                 )
             } else {
                 None
             };
-            match keep_all {
-                Some(why) => {
-                    for i in items {
-                        if i.step == Step::Do {
-                            let line = format!("{} ({why})", visible(&i.path));
-                            retained.push((i.path, line));
-                        } else {
-                            paths.push(i);
-                        }
+            paths.extend(items);
+            // The trial's own baseline candidates too: an inexact link may point at one, and a
+            // run that never started explains none of them.
+            if let Some(why) = keep_all {
+                paths.retain(|i| {
+                    if i.step != Step::Do {
+                        return true;
                     }
-                }
-                None => paths.extend(items),
+                    let line = format!("{} ({why})", visible(&i.path));
+                    retained.push((i.path.clone(), line));
+                    false
+                });
             }
         }
         // Another script trial whose run did not finish, or whose window was cut, may have
@@ -2018,6 +2029,22 @@ mod tests {
         assert!(before.starts_with("size:4 ") && after.starts_with("size:4 "));
         assert_ne!(before, after);
         fs::remove_file(&p).unwrap();
+    }
+
+    #[test]
+    fn an_empty_directory_swapped_for_another_has_a_new_fingerprint() {
+        let d = std::env::temp_dir().join(format!("dfm-purge-swap-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&d);
+        fs::create_dir(&d).unwrap();
+        let uid = fs::metadata(&d).unwrap().uid();
+        let before = tree(&d, uid).unwrap().unwrap();
+        assert_eq!(before.0, 0, "the root is not an entry");
+        fs::remove_dir(&d).unwrap();
+        fs::create_dir(&d).unwrap();
+        let after = tree(&d, uid).unwrap().unwrap();
+        assert_eq!(after.0, 0);
+        assert_ne!(before.2, after.2);
+        fs::remove_dir(&d).unwrap();
     }
 
     #[test]
