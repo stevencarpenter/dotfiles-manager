@@ -1073,6 +1073,11 @@ pub const TRIAL_SCHEMA_DATA: i64 = 4;
 /// A binary built before script trials reports it as newer instead of failing on the key.
 pub const TRIAL_SCHEMA_SCRIPT: i64 = 5;
 
+/// Trial schema of a script record whose `script` carries `fence` (DFM-82). A binary built
+/// before the fence reports it as newer instead of failing on the key; a script record without
+/// a fence stays at [`TRIAL_SCHEMA_SCRIPT`].
+pub const TRIAL_SCHEMA_FENCE: i64 = 6;
+
 /// Shells a script trial can run the downloaded script with.
 pub const SHELLS: [&str; 3] = ["sh", "bash", "zsh"];
 
@@ -1161,6 +1166,21 @@ pub struct TrialScript {
     pub exit: Option<ScriptExit>,
     pub window: Option<Vec<WindowEntry>>,
     pub binary: Option<ScriptBinary>,
+    /// Set when the run took the fence on an APFS volume; purge removes no window candidate of
+    /// a record without it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fence: Option<InodeFence>,
+}
+
+/// The device and inode number of a file the trial created just before the script ran, on an
+/// APFS volume, where a new file always gets a higher inode number than every older file of the
+/// volume. A path with an older number (or on another device) existed before the run, even
+/// when the script moved it into a watched place, so purge never removes it (DFM-82).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InodeFence {
+    pub dev: u64,
+    pub ino: u64,
 }
 
 impl TrialScript {
@@ -1202,7 +1222,9 @@ impl TrialScript {
             && self.before.iter().all(Observed::valid)
             && exit_ok
             && window_ok
-            && binary_ok;
+            && binary_ok
+            // No file has inode number 0.
+            && self.fence.is_none_or(|f| f.ino > 0);
         if ok {
             Ok(())
         } else {
@@ -1258,6 +1280,7 @@ impl TrialRecord {
                 TRIAL_SCHEMA_ADOPTED,
                 TRIAL_SCHEMA_DATA,
                 TRIAL_SCHEMA_SCRIPT,
+                TRIAL_SCHEMA_FENCE,
             ],
         )?;
         t.validate()?;
@@ -1276,6 +1299,7 @@ impl TrialRecord {
             .as_ref()
             .is_none_or(|a| valid_id(&a.op_id) && valid_id(&a.module));
         let expected = match (&self.script, self.baseline.data.is_empty(), &self.adopted) {
+            (Some(s), _, _) if s.fence.is_some() => TRIAL_SCHEMA_FENCE,
             (Some(_), _, _) => TRIAL_SCHEMA_SCRIPT,
             (None, false, _) => TRIAL_SCHEMA_DATA,
             (None, true, None) => SCHEMA,
@@ -2346,7 +2370,7 @@ mod tests {
             let e = TrialRecord::parse(format!("{{\"schema\":{n}}}").as_bytes()).unwrap_err();
             assert_eq!(e.code, code, "{n}");
             assert!(
-                e.detail.ends_with("(supported: 2, 3, 4, 5)"),
+                e.detail.ends_with("(supported: 2, 3, 4, 5, 6)"),
                 "{n}: {}",
                 e.detail
             );
@@ -2361,10 +2385,10 @@ mod tests {
             assert!(b.validate().is_err(), "module {bad:?}");
         }
 
-        // A schema above 5 is newer.
+        // A schema above 6 is newer.
         let newer = String::from_utf8(canonical(&t).unwrap())
             .unwrap()
-            .replace("\"schema\":3", "\"schema\":6");
+            .replace("\"schema\":3", "\"schema\":7");
         assert_eq!(
             TrialRecord::parse(newer.as_bytes()).unwrap_err().code,
             Code::StateNewer
@@ -2406,6 +2430,7 @@ mod tests {
             exit: None,
             window: None,
             binary: None,
+            fence: None,
         }
     }
 
@@ -2470,6 +2495,35 @@ mod tests {
             at_unix_ns: 1,
         });
         assert!(t.validate().is_ok());
+    }
+
+    #[test]
+    fn a_fenced_script_record_is_schema_6_and_an_unfenced_one_stays_5() {
+        let fenced = TrialScript {
+            fence: Some(InodeFence { dev: 16, ino: 42 }),
+            ..minimal_script()
+        };
+        let mut t = script_trial(fenced.clone());
+        assert!(t.validate().is_err(), "a fence on schema 5");
+        t.schema = TRIAL_SCHEMA_FENCE;
+        let bytes = serde_json::to_vec(&t).unwrap();
+        assert_eq!(TrialRecord::parse(&bytes).unwrap(), t);
+        assert!(
+            String::from_utf8(bytes)
+                .unwrap()
+                .contains(r#""fence":{"dev":16,"ino":42}"#)
+        );
+        // An older record reads: it has no fence and stays schema 5.
+        let mut old = script_trial(minimal_script());
+        assert!(old.validate().is_ok());
+        old.schema = TRIAL_SCHEMA_FENCE;
+        assert!(old.validate().is_err(), "schema 6 without a fence");
+        // A malformed fence is refused.
+        t.script = Some(TrialScript {
+            fence: Some(InodeFence { dev: 16, ino: 0 }),
+            ..fenced
+        });
+        assert!(t.validate().is_err(), "inode 0");
     }
 
     #[test]
@@ -2634,9 +2688,9 @@ mod tests {
     }
 
     #[test]
-    fn a_schema_6_record_is_newer() {
+    fn a_schema_7_record_is_newer() {
         let mut v: serde_json::Value = serde_json::to_value(sample_trial()).unwrap();
-        v["schema"] = 6.into();
+        v["schema"] = 7.into();
         assert_eq!(
             TrialRecord::parse(&serde_json::to_vec(&v).unwrap())
                 .unwrap_err()

@@ -274,6 +274,14 @@ pub(crate) fn kind(st: &Stat) -> FileType {
     FileType::from_raw_mode(st.st_mode)
 }
 
+/// Whether `path` is on an APFS volume (`statfs` `f_fstypename`). False when it cannot be read.
+pub fn is_apfs(path: &Path) -> bool {
+    rfs::statfs(path).is_ok_and(|s| {
+        let name = s.f_fstypename.map(|c| c.to_ne_bytes()[0]);
+        name.split(|b| *b == 0).next() == Some(b"apfs")
+    })
+}
+
 /// The identity of whatever `path` names, by device and inode. `follow` resolves a symlink at
 /// the end. `None` when nothing is there (or the path runs through a file). Used to compare
 /// claims with the manager's own paths by identity instead of by spelling.
@@ -1420,6 +1428,14 @@ impl Lock {
 mod tests {
     use super::*;
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    #[test]
+    fn is_apfs_names_the_volume_type() {
+        // macOS keeps its temporary directory on the APFS data volume; `/dev` is devfs.
+        assert!(is_apfs(&std::env::temp_dir()));
+        assert!(!is_apfs(Path::new("/dev")));
+        assert!(!is_apfs(Path::new("/nonexistent-dfm-path")));
+    }
 
     #[test]
     fn probe_refuses_a_lock_file_replaced_after_the_open() {

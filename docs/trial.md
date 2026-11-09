@@ -54,7 +54,7 @@ A script trial uses the same codes. "Script trials" lists what each means there.
 
 ## The record
 
-`state/trials/<trial-id>.json`, canonical JSON. Schema 2, or 3 once adopted. A record with data paths is schema 4, adopted or not. A record with `script` is schema 5. The docs/state.md validation applies: identity stamp, valid id, claim check on every path, secrets refused.
+`state/trials/<trial-id>.json`, canonical JSON. Schema 2, or 3 once adopted. A record with data paths is schema 4, adopted or not. A record with `script` is schema 5, and schema 6 when `script` carries `fence`. The docs/state.md validation applies: identity stamp, valid id, claim check on every path, secrets refused.
 
 | Field | Meaning |
 | --- | --- |
@@ -70,7 +70,7 @@ A script trial uses the same codes. "Script trials" lists what each means there.
 | `script{...}` | Present only for a script trial. See "Script trials". |
 | `adopted{op_id, module, at_unix_ns}` | Set once by `adopt` (DFM-33), with `schema` 3. It names the journal operation and the module that took the configuration. Left out of an active trial. |
 
-The optional fields `package` and `unknown` need no schema bump: a record without them (for example, one the test harness `__record-trial` writes) still reads. `adopted` is different: the record type refuses unknown keys, so an adopted record is schema 3 and an unadopted record stays schema 2. The validator accepts 2 and 3, refuses `adopted` on schema 2, and requires it on schema 3. A binary that predates schema 3 reports an adopted record as `E_STATE_NEWER`. `baseline.data` follows the same rule: a record that carries it is schema 4, with or without `adopted`, and `adopt` keeps schema 4. The validator refuses data on schema 2 or 3. A binary that predates schema 4 reports such a record as `E_STATE_NEWER`. `script` follows the same rule: a record that carries it is schema 5, with or without `baseline.data` and `adopted`. The validator requires schema 5 when `script` is present and refuses it on any other schema. A binary that predates schema 5 reports the record as `E_STATE_NEWER`.
+The optional fields `package` and `unknown` need no schema bump: a record without them (for example, one the test harness `__record-trial` writes) still reads. `adopted` is different: the record type refuses unknown keys, so an adopted record is schema 3 and an unadopted record stays schema 2. The validator accepts 2 and 3, refuses `adopted` on schema 2, and requires it on schema 3. A binary that predates schema 3 reports an adopted record as `E_STATE_NEWER`. `baseline.data` follows the same rule: a record that carries it is schema 4, with or without `adopted`, and `adopt` keeps schema 4. The validator refuses data on schema 2 or 3. A binary that predates schema 4 reports such a record as `E_STATE_NEWER`. `script` follows the same rule: a record that carries it is schema 5, with or without `baseline.data` and `adopted`. The validator requires schema 5 when `script` is present and refuses it on any other schema. A binary that predates schema 5 reports the record as `E_STATE_NEWER`. `script.fence` follows the same rule: a record whose `script` carries it is schema 6, and a script record without it stays schema 5 and still reads. The validator requires schema 6 when the fence is present, refuses it on any other schema, and refuses a fence with inode number 0. A binary that predates schema 6 reports a fenced record as `E_STATE_NEWER`.
 
 A trial is **active** until its record has `adopted`. An adopted record stays as evidence and keeps its id taken (a second trial of that id is `E_CONFLICT`). Readers that mean "in progress" skip it: `doctor` lists no row for it, and `packages --update` does not roll its tool from the record. `state check` still validates and counts it.
 
@@ -198,7 +198,7 @@ The record also has a size budget of 3 MiB of serialized JSON, below the 4 MiB s
 
 ### Record fields
 
-`script` in `state/trials/<id>.json` (schema 5):
+`script` in `state/trials/<id>.json` (schema 5, or 6 with `fence`):
 
 | Field | Meaning |
 | --- | --- |
@@ -209,6 +209,7 @@ The record also has a size budget of 3 MiB of serialized JSON, below the 4 MiB s
 | `exit{code, signal}` | Exactly one is set. `signal` is `stopped` (a stop request), `timeout` or `signal`. Absent until the run ends, and absent when the script could not be started. |
 | `window[{path, change, kind, sha256, target, before}]` | One entry per difference. `change` is `created`, `modified`, `removed` or `kind-changed`. `before` describes a path observed earlier. Absent until the run ends. |
 | `binary{path, real_path, sha256}` | The installed tool, as above. |
+| `fence{dev, ino}` | The device and inode number of the run file, created after `before` and before the script starts. Set only when that file is on an APFS volume, where a new file gets a higher inode number than every older one. `purge` removes no window candidate older than the fence or on another device, and none at all from a record without it (docs/purge.md, "The inode fence"). |
 
 `unknown` holds the three package tokens and `script-downloads`, `later-self-updates`, `keychain` and `remote-effects`, and `window-truncated` when the window was shrunk. `package` is absent and `tool_preexisting` is false. `baseline.paths` and `baseline.data` are observed as for a package trial.
 

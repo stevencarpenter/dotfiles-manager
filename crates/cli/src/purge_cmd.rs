@@ -19,9 +19,9 @@ use dfm_model::fold::{eq as same_path, fold};
 use dfm_model::plan::{Binary, PackageState, file_fingerprint};
 use dfm_model::resolve::{Table, Value};
 use dfm_model::state::{
-    Approval, BaselinePath, BinaryId, Class, JournalEntry, MAX_BYTES, OperationRecord, Phase,
-    ProfileRef, Receipt, Recovery, RecoveryOutput, RunResult, SCHEMA, Stamp, Status, TrialRecord,
-    TrialScript, WindowEntry, count_statuses, rfc3339,
+    Approval, BaselinePath, BinaryId, Class, InodeFence, JournalEntry, MAX_BYTES, OperationRecord,
+    Phase, ProfileRef, Receipt, Recovery, RecoveryOutput, RunResult, SCHEMA, Stamp, Status,
+    TrialRecord, TrialScript, WindowEntry, count_statuses, rfc3339,
 };
 use dfm_model::{Code, Exit, Refusal};
 use serde_json::json;
@@ -35,6 +35,12 @@ use std::path::{Component, Path, PathBuf};
 const MAX_ENTRIES: usize = 100_000;
 /// The most bytes of relative paths a tree fingerprint holds in memory; a larger tree is kept.
 const MAX_TREE_LIST_BYTES: usize = 16 << 20;
+/// Why no directory of a truncated window is removed as a tree.
+const TRUNCATED_WHY: &str = "the window was truncated; its contents were not all recorded";
+/// Why no directory is removed as a tree when a window entry's name is inexact: a kept link with
+/// such a name cannot be read back, so where it points is unknown.
+const INEXACT_WHY: &str =
+    "a window entry has a name that cannot be shown exactly; links in it cannot be followed";
 
 #[derive(Debug)]
 pub struct Args {
@@ -93,6 +99,9 @@ struct PathItem {
     path: String,
     now: Now,
     step: Step,
+    /// The inode fence a window candidate must still pass when it is removed; `None` for a
+    /// baseline path, which the fence does not cover.
+    fence: Option<InodeFence>,
 }
 
 /// What the preview shows and the digest covers.
@@ -367,6 +376,7 @@ fn path_item(
         path: b.path.clone(),
         now,
         step,
+        fence: None,
     };
     // The parents as `remove_path` opens them: real directories this user owns, no link.
     let parents = Path::new(&b.path)
@@ -508,6 +518,7 @@ fn link_keep(
     target: &str,
     created_dirs: &[&Path],
 ) -> Option<String> {
+    let recorded = lossless(recorded);
     if recorded == Some(target) {
         return None;
     }
@@ -518,6 +529,12 @@ fn link_keep(
         None => "no target recorded".into(),
         Some(_) => "repointed since the trial".into(),
     })
+}
+
+/// `recorded` unless it holds U+FFFD, which a lossy conversion of a target that is not UTF-8
+/// leaves: such a form can equal a different target, so it is never removal authority.
+fn lossless(recorded: Option<&str>) -> Option<&str> {
+    recorded.filter(|t| !t.contains('\u{FFFD}'))
 }
 
 /// The `created_dirs` that hold (or are) what `link` with the target text `target` points to.
@@ -644,9 +661,12 @@ fn kind_of(m: &fs::Metadata) -> &'static str {
 /// record's own path items already cover; a window entry is checked against them only after
 /// every retention rule, so a retained baseline path still yields its `retained:` line. A
 /// `truncated` window may omit what a created directory holds, so no created directory of it
-/// is removed. A link repointed into a directory counts as the trial's only when that
+/// is removed; neither is one when `no_trees` gives another reason. A link repointed into a directory counts as the trial's only when that
 /// directory is itself removed: the third list names, for each link only that rule
-/// authorizes, the directories that vouch for it, for [`unvouch`].
+/// authorizes, the directories that vouch for it, for [`unvouch`]. A candidate is removed only
+/// when it, and every entry of a directory's tree, passes the record's inode fence
+/// ([`fence_keep`]): a path the script moved in from elsewhere keeps its older inode number.
+/// `no_trees`, when set, says why no created directory is removed as a tree.
 #[expect(
     clippy::too_many_arguments,
     reason = "the inputs of one decision; a struct would only rename them"
@@ -654,7 +674,7 @@ fn kind_of(m: &fs::Metadata) -> &'static str {
 fn script_items(
     s: &TrialScript,
     entries: &[WindowEntry],
-    truncated: bool,
+    no_trees: Option<&str>,
     skip: &[&str],
     protected: &[PathBuf],
     owned: &[String],
@@ -808,12 +828,13 @@ fn script_items(
             ));
             continue;
         }
+        if let Some(why) = fence_keep(p, s.fence) {
+            retained.push((&e.path, format!("{shown} ({why})")));
+            continue;
+        }
         // A cut window may omit children purge must keep, and a directory goes as a tree.
-        if truncated && e.kind == "dir" {
-            retained.push((
-                &e.path,
-                format!("{shown} (the window was truncated; its contents were not all recorded)"),
-            ));
+        if let (Some(why), "dir") = (no_trees, e.kind.as_str()) {
+            retained.push((&e.path, format!("{shown} ({why})")));
             continue;
         }
         // Only now, after every retention check: a retained baseline path must reach the
@@ -830,7 +851,10 @@ fn script_items(
             existed: false,
             sha256: None,
         };
-        path_item(&b, owned, others, seen, sys, home, Some(&keep))
+        PathItem {
+            fence: s.fence,
+            ..path_item(&b, owned, others, seen, sys, home, Some(&keep))
+        }
     };
     // Only a created directory that is itself removed vouches for a link into it, so the links
     // are decided after every directory.
@@ -853,7 +877,7 @@ fn script_items(
         .iter()
         .zip(&items)
         .filter_map(|(e, i)| match (&i.now, &i.step) {
-            (Now::Link(t), Step::Do) if e.target.as_deref() != Some(t.as_str()) => {
+            (Now::Link(t), Step::Do) if lossless(e.target.as_deref()) != Some(t.as_str()) => {
                 let dirs = vouching(Path::new(&e.path), t, &created_dirs);
                 Some((
                     e.path.clone(),
@@ -867,6 +891,61 @@ fn script_items(
         .collect();
     let retained = retained.into_iter().map(|(p, l)| (p.clone(), l)).collect();
     (items, retained, vouched)
+}
+
+/// Why the window candidate `p` fails the inode `fence`, or `None` when it passes: `p` and, for
+/// a directory, every entry of its tree (walked without following a link) are on the fence's
+/// device with an inode number at or above the fence's, so the script created them. A missing
+/// `p` passes: there is nothing to remove. The walk keeps the limits of [`tree`].
+fn fence_keep(p: &Path, fence: Option<InodeFence>) -> Option<String> {
+    let Some(f) = fence else {
+        return Some("the record has no inode fence".into());
+    };
+    let unread =
+        |e: std::io::Error| format!("it cannot be read for the inode check ({})", e.kind());
+    let check = |q: &Path, m: &fs::Metadata| -> Result<(), String> {
+        let why = if m.dev() != f.dev {
+            "is not on the APFS volume the fence was taken on"
+        } else if m.ino() < f.ino {
+            "existed before the trial (inode older than the run); it may have been moved in"
+        } else {
+            return Ok(());
+        };
+        Err(if q == p {
+            why.strip_prefix("is ")
+                .unwrap_or(&format!("it {why}"))
+                .to_string()
+        } else {
+            format!("it holds {}, which {why}", visible(&q.to_string_lossy()))
+        })
+    };
+    let walk = || -> Result<(), String> {
+        let m = match fs::symlink_metadata(p) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            m => m.map_err(unread)?,
+        };
+        check(p, &m)?;
+        if !m.is_dir() {
+            return Ok(());
+        }
+        let (mut stack, mut count, mut listed) = (vec![p.to_path_buf()], 0usize, 0usize);
+        while let Some(d) = stack.pop() {
+            for e in fs::read_dir(&d).map_err(unread)? {
+                let q = e.map_err(unread)?.path();
+                let m = fs::symlink_metadata(&q).map_err(unread)?;
+                check(&q, &m)?;
+                (count, listed) = (count + 1, listed + q.as_os_str().len());
+                if count > MAX_ENTRIES || listed > MAX_TREE_LIST_BYTES {
+                    return Err("its tree is too large for the inode check".into());
+                }
+                if m.is_dir() {
+                    stack.push(q);
+                }
+            }
+        }
+        Ok(())
+    };
+    walk().err()
 }
 
 /// Whether the window recorded `e` by a shown form that may name another file: the kind
@@ -997,14 +1076,15 @@ fn live(path: &Path, uid: u32) -> Option<Now> {
 /// Removes one path below HOME without following a link: every parent is opened as a real
 /// directory owned by this user, then the entry is removed (a directory with its tree). The
 /// entry must still be what the decision saw (`now`): a file or a tree with the same
-/// fingerprint, a link with the same target text. Anything else is `E_PLAN_STALE` and nothing
-/// is removed.
+/// fingerprint, a link with the same target text, and a window candidate still passes its
+/// inode `fence` ([`fence_keep`]). Anything else is `E_PLAN_STALE` and nothing is removed.
 fn remove_path(
     store: &Store,
     sys: &Sys,
     home: &Path,
     path: &str,
     now: &Now,
+    fence: Option<InodeFence>,
     fail: &dfm_engine::Fail,
 ) -> Result<(), Refusal> {
     store.check_claim(path)?;
@@ -1020,12 +1100,14 @@ fn remove_path(
     let home_dir = Dir::open_home(sys, home)?;
     let parent = home_dir.open_below(sys, parents)?;
     fail.hit("purge-remove")?;
-    let same = || live(Path::new(path), sys.uid).as_ref() == Some(now);
+    // A window candidate must still pass the inode fence: nothing was moved in since.
+    let fresh = || fence.is_none_or(|f| fence_keep(Path::new(path), Some(f)).is_none());
+    let same = || fresh() && live(Path::new(path), sys.uid).as_ref() == Some(now);
     match (parent.peek(sys, leaf)?, now) {
         (Peek::Missing, _) => Ok(()),
         (Peek::Dir { .. }, Now::Dir(..)) if same() => parent.remove_tree(sys, leaf),
         (Peek::File { .. }, Now::File(_)) if same() => parent.remove_entry(leaf, fail),
-        (Peek::Link { target, .. }, Now::Link(t)) if target == *t => {
+        (Peek::Link { target, .. }, Now::Link(t)) if target == *t && fresh() => {
             parent.remove_entry(leaf, fail)
         }
         _ => Err(Refusal::new(
@@ -1236,7 +1318,11 @@ pub fn run(ctx: &Ctx, args: &Args, out: &mut dyn Write) -> Result<(), Refusal> {
                 )
             })
             .collect();
-        let truncated = t.unknown.iter().any(|u| u == window::WINDOW_TRUNCATED);
+        let mut no_trees = t
+            .unknown
+            .iter()
+            .any(|u| u == window::WINDOW_TRUNCATED)
+            .then_some(TRUNCATED_WHY);
         let (mut retained, mut vouched) = (Vec::new(), Vec::new());
         if let Some(s) = &t.script {
             // A run that did not finish has no window: what was created since `before` is. The
@@ -1274,10 +1360,13 @@ pub fn run(ctx: &Ctx, args: &Args, out: &mut dyn Write) -> Result<(), Refusal> {
                 std::env::current_exe().ok(),
             );
             let skip: Vec<&str> = paths.iter().map(|p| p.path.as_str()).collect();
+            if entries.iter().any(inexact) {
+                no_trees = no_trees.or(Some(INEXACT_WHY));
+            }
             let (items, r, v) = script_items(
                 s,
                 entries,
-                truncated,
+                no_trees,
                 &skip,
                 &protected,
                 &owned,
@@ -1328,17 +1417,15 @@ pub fn run(ctx: &Ctx, args: &Args, out: &mut dyn Write) -> Result<(), Refusal> {
                 break;
             }
         }
-        // A cut window may omit what any directory holds, a baseline one included, and a
-        // directory goes as a tree: none is removed. That withdraws each one's vouch for a
-        // link; no directory is left for a kept link to hold, so one `unvouch` is enough.
-        if truncated {
+        // A cut window may omit what any directory holds, a baseline one included, and a link
+        // with an inexact name cannot be followed to the directory it holds; a directory goes
+        // as a tree: none is removed. That withdraws each one's vouch for a link; no directory
+        // is left for a kept link to hold, so one `unvouch` is enough.
+        if let Some(why) = no_trees {
             paths.retain(|i| {
                 let dir = matches!((&i.now, &i.step), (Now::Dir(..), Step::Do));
                 if dir {
-                    held.push(format!(
-                        "{} (the window was truncated; its contents were not all recorded)",
-                        visible(&i.path)
-                    ));
+                    held.push(format!("{} ({why})", visible(&i.path)));
                 }
                 !dir
             });
@@ -1554,7 +1641,7 @@ pub fn run(ctx: &Ctx, args: &Args, out: &mut dyn Write) -> Result<(), Refusal> {
                 expected_sha256: None,
             }];
             let failed = act("remove", "fs", &p.path, target, false, &|| {
-                remove_path(&store, &sys, &layout.home, &p.path, &p.now, &fail)
+                remove_path(&store, &sys, &layout.home, &p.path, &p.now, p.fence, &fail)
             })?;
             if failed.is_none() {
                 removed.push(&p.path);
@@ -1722,6 +1809,7 @@ mod tests {
             path: s(p),
             now,
             step,
+            fence: None,
         };
         let tree = || Now::Dir(0, 0, String::new());
         let mut items = vec![
@@ -1766,11 +1854,13 @@ mod tests {
                 path: s(&dir),
                 now: Now::Dir(0, 0, String::new()),
                 step: Step::Do,
+                fence: None,
             },
             PathItem {
                 path: s(&link),
                 now: Now::Link("../alias/boat/bin/x".into()),
                 step: Step::Keep("repointed".into()),
+                fence: None,
             },
         ];
         assert_eq!(hold_dirs(&mut items, &[]).len(), 1);
@@ -1804,11 +1894,13 @@ mod tests {
                 path: s(&base.join("cfg/boat")),
                 now: Now::Dir(0, 0, String::new()),
                 step: Step::Do,
+                fence: None,
             },
             PathItem {
                 path: s(&base.join("alias/boat/rc")),
                 now: Now::File(String::new()),
                 step: Step::Keep("a parent is unsafe".into()),
+                fence: None,
             },
         ];
         assert_eq!(hold_dirs(&mut items, &[]).len(), 1);
@@ -1879,5 +1971,66 @@ mod tests {
             link_keep(link, Some("/x"), "/usr/bin/true", &dirs).as_deref(),
             Some("repointed since the trial")
         );
+    }
+
+    #[test]
+    fn a_lossy_recorded_target_is_no_removal_authority() {
+        let link = Path::new("/h/.local/bin/c");
+        // The window wrote U+FFFD for a target byte that is not UTF-8; a live target that holds
+        // the character itself is another file.
+        let lossy = "/opt/c\u{FFFD}";
+        assert_eq!(
+            link_keep(link, Some(lossy), lossy, &[]).as_deref(),
+            Some("no target recorded")
+        );
+        // A created directory still vouches through the live, lossless target.
+        let dirs = [Path::new("/opt")];
+        assert_eq!(link_keep(link, Some(lossy), lossy, &dirs), None);
+        assert_eq!(lossless(Some("/opt/c")), Some("/opt/c"));
+    }
+
+    #[test]
+    fn fence_keep_passes_only_what_is_newer_than_the_fence() {
+        let base = std::env::temp_dir().join(format!("dfm-purge-fence-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(base.join("old")).unwrap();
+        fs::write(base.join("old/f"), "x").unwrap();
+        let probe = base.join("probe");
+        fs::write(&probe, "").unwrap();
+        let m = fs::symlink_metadata(&probe).unwrap();
+        let f = Some(InodeFence {
+            dev: m.dev(),
+            ino: m.ino(),
+        });
+        fs::create_dir_all(base.join("new/sub")).unwrap();
+        fs::write(base.join("new/sub/f"), "y").unwrap();
+        assert_eq!(fence_keep(&base.join("new"), f), None);
+        assert_eq!(fence_keep(&base.join("gone"), f), None);
+        assert_eq!(
+            fence_keep(&base.join("old/f"), f).as_deref(),
+            Some(
+                "it existed before the trial (inode older than the run); it may have been moved in"
+            )
+        );
+        // An old directory moved into a new one holds the new one.
+        fs::rename(base.join("old"), base.join("new/sub/old")).unwrap();
+        let held = fence_keep(&base.join("new"), f).unwrap();
+        assert!(
+            held.starts_with("it holds ") && held.contains("/new/sub/old, which existed"),
+            "{held}"
+        );
+        assert_eq!(
+            fence_keep(&base.join("new/sub/f"), None).as_deref(),
+            Some("the record has no inode fence")
+        );
+        let other = f.map(|f| InodeFence {
+            dev: f.dev + 1,
+            ..f
+        });
+        assert_eq!(
+            fence_keep(&base.join("new/sub/f"), other).as_deref(),
+            Some("not on the APFS volume the fence was taken on")
+        );
+        fs::remove_dir_all(&base).unwrap();
     }
 }

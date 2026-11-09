@@ -665,6 +665,7 @@ mod tests {
                 }),
                 window: Some(window),
                 binary: None,
+                fence: None,
             }),
         }
     }

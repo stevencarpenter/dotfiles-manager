@@ -481,8 +481,10 @@ fn a_script_trial_records_before_runs_sandboxed_and_rewrites_the_record() {
     // The script's own output is inherited, between the preview and the result lines.
     assert!(out.contains("installed boat"), "{out}");
     let rec = fx.record("trial-boat");
-    assert_eq!(rec["schema"], 5, "{rec:#}");
+    // The test HOME is on APFS, so the record carries the inode fence and is schema 6.
+    assert_eq!(rec["schema"], 6, "{rec:#}");
     let s = &rec["script"];
+    assert!(s["fence"]["ino"].as_u64().unwrap() > 0, "{rec:#}");
     assert!(!s["before"].as_array().unwrap().is_empty(), "{rec:#}");
     assert_eq!(s["exit"], serde_json::json!({"code": 0, "signal": null}));
     let link = window_entry(&rec, &fx.h(".local/bin/boat"));
@@ -3242,4 +3244,132 @@ fn a_launch_agent_given_as_config_is_retained_with_the_bootout_hint() {
     assert!(!shown.contains("action: remove"), "{shown}");
     assert_eq!(code(&run), 0, "{}\n{}", stderr(&run), text(&run.stdout));
     assert!(plist.is_file());
+}
+
+#[test]
+fn a_file_or_directory_moved_in_from_an_unwatched_place_is_retained() {
+    if no_sandbox() {
+        return;
+    }
+    let fx = Fx::new();
+    fx.bind_with_links();
+    fs::create_dir_all(fx.h(".local/bin")).unwrap();
+    fs::create_dir_all(fx.h(".config")).unwrap();
+    // The owner's data, in a place the window does not watch, before the trial.
+    fs::create_dir_all(fx.h("Documents/proj/src")).unwrap();
+    fs::create_dir_all(fx.h("Documents/proj2")).unwrap();
+    fs::write(fx.h("Documents/keep.txt"), "mine\n").unwrap();
+    fs::write(fx.h("Documents/proj/src/main.rs"), "fn main() {}\n").unwrap();
+    fs::write(fx.h("Documents/proj2/notes"), "notes\n").unwrap();
+    sandboxed(
+        &fx,
+        "set -e\nmv ~/Documents/keep.txt ~/.local/bin/keep.txt\n\
+         mv ~/Documents/proj ~/.config/proj\n\
+         mkdir ~/.config/newtool\nmv ~/Documents/proj2 ~/.config/newtool/proj2\n\
+         mkdir ~/.boat\necho x > ~/.boat/f\n",
+    );
+    let (preview, run) = purged(&fx);
+    let shown = text(&preview.stdout);
+    let moved = "existed before the trial (inode older than the run); it may have been moved in";
+    for want in [
+        format!(
+            "retained: {} (it {moved})",
+            fx.h(".local/bin/keep.txt").display()
+        ),
+        format!("retained: {} (it {moved})", fx.h(".config/proj").display()),
+        format!(
+            "retained: {} (it holds {}, which {moved})",
+            fx.h(".config/newtool").display(),
+            fx.h(".config/newtool/proj2").display()
+        ),
+        format!("action: remove {} directory", fx.h(".boat").display()),
+    ] {
+        assert!(shown.contains(&want), "{want}\n{shown}");
+    }
+    let out = text(&run.stdout);
+    assert_eq!(code(&run), 0, "{}\n{out}", stderr(&run));
+    assert!(gone(&fx.h(".boat")), "{out}");
+    assert_eq!(
+        fs::read_to_string(fx.h(".local/bin/keep.txt")).unwrap(),
+        "mine\n"
+    );
+    assert_eq!(
+        fs::read_to_string(fx.h(".config/proj/src/main.rs")).unwrap(),
+        "fn main() {}\n"
+    );
+    assert_eq!(
+        fs::read_to_string(fx.h(".config/newtool/proj2/notes")).unwrap(),
+        "notes\n"
+    );
+}
+
+#[test]
+fn a_record_without_an_inode_fence_retains_every_window_candidate() {
+    if no_sandbox() {
+        return;
+    }
+    let fx = Fx::new();
+    fx.bind_with_links();
+    fs::create_dir_all(fx.h(".local/bin")).unwrap();
+    sandboxed(
+        &fx,
+        "set -e\nmkdir ~/.boat\necho x > ~/.boat/f\nprintf '#!/bin/sh\\n' > ~/.local/bin/boat\n\
+         ln -s ~/.local/bin/boat ~/.local/bin/b\n",
+    );
+    // A record written before the fence, or on a volume that is not APFS: schema 5, no fence.
+    let p = fx.state().join("trials/trial-boat.json");
+    let mut rec = fx.record("trial-boat");
+    assert_eq!(rec["schema"], 6, "{rec:#}");
+    assert!(
+        rec["script"]["fence"]["ino"].as_u64().unwrap() > 0,
+        "{rec:#}"
+    );
+    rec["script"].as_object_mut().unwrap().remove("fence");
+    rec["schema"] = 5.into();
+    fs::write(&p, serde_json::to_vec(&rec).unwrap()).unwrap();
+    let (preview, run) = purged(&fx);
+    let shown = text(&preview.stdout);
+    for rel in [".boat", ".local/bin/boat", ".local/bin/b"] {
+        let want = format!(
+            "retained: {} (the record has no inode fence)",
+            fx.h(rel).display()
+        );
+        assert!(shown.contains(&want), "{want}\n{shown}");
+        assert!(fs::symlink_metadata(fx.h(rel)).is_ok(), "{rel}");
+    }
+    assert!(!shown.contains("action: remove"), "{shown}");
+    assert_eq!(code(&run), 0, "{}\n{}", stderr(&run), text(&run.stdout));
+    assert!(fx.h(".boat/f").is_file());
+}
+
+#[test]
+fn an_inexact_window_name_keeps_every_created_directory() {
+    if no_sandbox() {
+        return;
+    }
+    let fx = Fx::new();
+    fx.bind_with_links();
+    fs::create_dir_all(fx.h(".local/bin")).unwrap();
+    // A link whose name holds a control character: the window records it as kind `other`, and
+    // purge cannot read it back to see where it points.
+    sandboxed(
+        &fx,
+        "set -e\nmkdir ~/.boat\necho x > ~/.boat/f\n\
+         ln -s ~/.boat/f \"$HOME/.local/bin/b$(printf '\\001')\"\n\
+         printf '#!/bin/sh\\n' > ~/.local/bin/boat\n",
+    );
+    let (preview, run) = purged(&fx);
+    let shown = text(&preview.stdout);
+    for want in [
+        format!(
+            "retained: {} (a window entry has a name that cannot be shown exactly; links in it cannot be followed)",
+            fx.h(".boat").display()
+        ),
+        format!("action: remove {} file", fx.h(".local/bin/boat").display()),
+    ] {
+        assert!(shown.contains(&want), "{want}\n{shown}");
+    }
+    assert_eq!(code(&run), 0, "{}\n{}", stderr(&run), text(&run.stdout));
+    assert_eq!(fs::read_to_string(fx.h(".boat/f")).unwrap(), "x\n");
+    assert!(gone(&fx.h(".local/bin/boat")));
 }
