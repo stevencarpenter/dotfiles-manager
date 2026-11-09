@@ -3547,6 +3547,55 @@ fn a_file_another_active_trial_links_to_is_kept() {
 }
 
 #[test]
+fn an_inexact_link_of_another_active_trial_keeps_every_candidate() {
+    if no_sandbox() {
+        return;
+    }
+    let fx = Fx::new();
+    fx.bind_with_links();
+    fs::create_dir_all(fx.h(".local/bin")).unwrap();
+    sandboxed(&fx, "set -e\nprintf '#!/bin/sh\\n' > ~/.local/bin/tool\n");
+    // The second trial's link has a control character in its name, so it cannot be read back.
+    fx.script("#!/bin/sh\nln -s tool \"$HOME/.local/bin/a$(printf '\\001')\"\n");
+    let o = fx.approved("ship");
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+    let (preview, run) = purged(&fx);
+    let shown = text(&preview.stdout);
+    let want = format!(
+        "retained: {} (script trial trial-ship has a link name that cannot be read back; nothing the trial created is removed)",
+        fx.h(".local/bin/tool").display()
+    );
+    assert!(shown.contains(&want), "{want}\n{shown}");
+    assert!(!shown.contains("action: remove"), "{shown}");
+    assert_eq!(code(&run), 0, "{}\n{}", stderr(&run), text(&run.stdout));
+    assert!(fx.h(".local/bin/tool").is_file());
+}
+
+#[test]
+fn an_escaped_recorded_target_never_authorizes_removal() {
+    if no_sandbox() {
+        return;
+    }
+    let fx = Fx::new();
+    fx.bind_with_links();
+    fs::create_dir_all(fx.h(".local/bin")).unwrap();
+    // The recorded target holds a newline, which the window stores as the escape `\n`.
+    sandboxed(&fx, "ln -s \"$(printf 'a\\nb')\" ~/.local/bin/l\n");
+    let link = fx.h(".local/bin/l");
+    // The user repoints it to the literal text `a\nb` (backslash, n).
+    fs::remove_file(&link).unwrap();
+    std::os::unix::fs::symlink("a\\nb", &link).unwrap();
+    let (preview, run) = purged(&fx);
+    let shown = text(&preview.stdout);
+    assert!(
+        !shown.contains(&format!("action: remove {}", link.display())),
+        "{shown}"
+    );
+    assert_eq!(code(&run), 0, "{}\n{}", stderr(&run), text(&run.stdout));
+    assert_eq!(fs::read_link(&link).unwrap(), Path::new("a\\nb"));
+}
+
+#[test]
 fn a_window_without_an_exit_removes_no_window_candidate() {
     if no_sandbox() {
         return;

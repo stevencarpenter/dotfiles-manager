@@ -554,7 +554,10 @@ fn link_keep(
 /// `recorded` unless it holds U+FFFD, which a lossy conversion of a target that is not UTF-8
 /// leaves: such a form can equal a different target, so it is never removal authority.
 fn lossless(recorded: Option<&str>) -> Option<&str> {
-    recorded.filter(|t| !t.contains('\u{FFFD}'))
+    // U+FFFD stands for bytes that were not UTF-8; a backslash may be the window's escape of a
+    // control character (`\n` for a newline), which a literal target can equal. Either way the
+    // recorded form may name another target.
+    recorded.filter(|t| !t.contains('\u{FFFD}') && !t.contains('\\'))
 }
 
 /// The `created_dirs` that hold (or are) what `link` with the target text `target` points to.
@@ -1399,6 +1402,20 @@ pub fn run(ctx: &Ctx, args: &Args, out: &mut dyn Write) -> Result<(), Refusal> {
                 }
             }
         }
+        // Another active trial with an inexact name in its window may hold a link this
+        // purge cannot read back, pointing at any of this trial's candidates.
+        let other_inexact = others.iter().find(|o| {
+            o.script
+                .iter()
+                .flat_map(|s| s.window.iter().flatten())
+                .any(inexact)
+        });
+        let other_why = other_inexact.map(|o| {
+            format!(
+                "script trial {} has a link name that cannot be read back; nothing the trial created is removed",
+                o.trial_id
+            )
+        });
         let mut no_trees = t
             .unknown
             .iter()
@@ -1492,6 +1509,17 @@ pub fn run(ctx: &Ctx, args: &Args, out: &mut dyn Write) -> Result<(), Refusal> {
                     false
                 });
             }
+        }
+        // Any trial's candidates, package trials included: that link may point at any of them.
+        if let Some(why) = other_why.as_deref() {
+            paths.retain(|i| {
+                if i.step != Step::Do {
+                    return true;
+                }
+                let line = format!("{} ({why})", visible(&i.path));
+                retained.push((i.path.clone(), line));
+                false
+            });
         }
         // Another script trial whose run did not finish, or whose window was cut, may have
         // created any path again after its `before`, so no candidate is removed: neither a
