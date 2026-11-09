@@ -33,6 +33,8 @@ use std::path::{Component, Path, PathBuf};
 /// The most entries a removed directory may hold. A larger tree is kept: its preview could not
 /// show what the approval covers.
 const MAX_ENTRIES: usize = 100_000;
+/// The most bytes of relative paths a tree fingerprint holds in memory; a larger tree is kept.
+const MAX_TREE_LIST_BYTES: usize = 16 << 20;
 
 #[derive(Debug)]
 pub struct Args {
@@ -279,10 +281,21 @@ fn unremovable(m: &fs::Metadata, uid: u32) -> Option<String> {
 /// without following a link. `Ok(Err(reason))` when the tree cannot be removed whole: more than
 /// [`MAX_ENTRIES`] entries, a name that is not UTF-8, or a directory [`unremovable`] refuses.
 fn tree(dir: &Path, uid: u32) -> std::io::Result<Result<(usize, u64, String), String>> {
+    tree_capped(dir, uid, MAX_TREE_LIST_BYTES)
+}
+
+/// [`tree`] with the path-list budget `cap` (bytes): a tree whose listed paths need more is
+/// refused, so deep trees with long names cannot exhaust memory.
+fn tree_capped(
+    dir: &Path,
+    uid: u32,
+    cap: usize,
+) -> std::io::Result<Result<(usize, u64, String), String>> {
     if let Some(why) = unremovable(&fs::symlink_metadata(dir)?, uid) {
         return Ok(Err(why));
     }
     let mut lines = Vec::new();
+    let mut listed = 0usize;
     let mut bytes = 0u64;
     let mut stack = vec![dir.to_path_buf()];
     while let Some(d) = stack.pop() {
@@ -306,9 +319,17 @@ fn tree(dir: &Path, uid: u32) -> std::io::Result<Result<(usize, u64, String), St
             } else {
                 "o"
             };
-            lines.push(format!("{rel}\t{kind}\t{}", m.len()));
+            let line = format!("{rel}\t{kind}\t{}", m.len());
+            listed += line.len();
+            lines.push(line);
             if lines.len() > MAX_ENTRIES {
                 return Ok(Err(format!("more than {MAX_ENTRIES} entries")));
+            }
+            if listed > cap {
+                return Ok(Err(format!(
+                    "its paths take more than {} MiB to list",
+                    cap >> 20
+                )));
             }
         }
     }
@@ -411,7 +432,13 @@ fn path_item(
     } else if let (true, Some(keep)) = (m.is_symlink(), link_keep) {
         match fs::read_link(&b.path) {
             Ok(t) => {
-                let t = t.to_string_lossy().into_owned();
+                // A lossy form can match a different target, so it is never removal authority.
+                let Some(t) = t.to_str().map(String::from) else {
+                    return item(
+                        Now::Link(t.to_string_lossy().into_owned()),
+                        Step::Keep("its target is not UTF-8, so it cannot be compared".into()),
+                    );
+                };
                 if let Some(why) = keep(&t) {
                     return item(Now::Link(t), Step::Keep(why));
                 }
@@ -709,8 +736,10 @@ fn script_items(
             continue;
         }
         if p.parent().is_some_and(|d| same(d, &agents)) {
+            // Single-quoted, so a pasted command passes the path as one word.
+            let word = shown.replace('\'', "'\\''");
             retained.push((&e.path, format!(
-                "{shown} created during the trial; unload it with launchctl bootout gui/{} {shown}, then remove it by hand",
+                "{shown} created during the trial; unload it with launchctl bootout gui/{} '{word}', then remove it by hand",
                 sys.uid
             )));
             continue;
@@ -1675,6 +1704,19 @@ mod tests {
         ];
         assert_eq!(hold_dirs(&mut items, &[]).len(), 1);
         assert_eq!(items.len(), 1);
+        fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn a_tree_whose_path_list_exceeds_the_budget_is_refused() {
+        let base = std::env::temp_dir().join(format!("dfm-purge-cap-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(base.join("a/b")).unwrap();
+        fs::write(base.join("a/b/long-file-name"), "x").unwrap();
+        let uid = fs::metadata(&base).unwrap().uid();
+        assert!(tree_capped(&base, uid, 1 << 20).unwrap().is_ok());
+        let refused = tree_capped(&base, uid, 8).unwrap().unwrap_err();
+        assert!(refused.starts_with("its paths take more than"), "{refused}");
         fs::remove_dir_all(&base).unwrap();
     }
 

@@ -3166,6 +3166,33 @@ fn a_baseline_path_is_retained_while_another_script_trial_is_incomplete() {
 }
 
 #[test]
+fn a_created_link_whose_target_is_not_utf8_is_kept() {
+    if no_sandbox() {
+        return;
+    }
+    let fx = Fx::new();
+    fx.bind_with_links();
+    fs::create_dir_all(fx.h(".local/bin")).unwrap();
+    sandboxed(&fx, "ln -s \"$(printf 'x\\377')\" ~/.local/bin/odd\n");
+    let link = fx.h(".local/bin/odd");
+    assert!(
+        fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    let (preview, run) = purged(&fx);
+    let shown = text(&preview.stdout);
+    assert!(
+        shown.contains("its target is not UTF-8, so it cannot be compared"),
+        "{shown}"
+    );
+    assert!(!shown.contains("action: remove"), "{shown}");
+    assert_eq!(code(&run), 0, "{}\n{}", stderr(&run), text(&run.stdout));
+    assert!(fs::symlink_metadata(&link).is_ok());
+}
+
+#[test]
 fn a_launch_agent_given_as_config_is_retained_with_the_bootout_hint() {
     if no_sandbox() {
         return;
@@ -3184,6 +3211,9 @@ fn a_launch_agent_given_as_config_is_retained_with_the_bootout_hint() {
     let want =
         format!("retained: {ps} created during the trial; unload it with launchctl bootout gui/");
     assert!(shown.contains(&want), "{want}\n{shown}");
+    // The path in the command is one shell word.
+    let quoted = format!(" '{ps}', then remove it by hand");
+    assert!(shown.contains(&quoted), "{quoted}\n{shown}");
     assert!(!shown.contains("action: remove"), "{shown}");
     assert_eq!(code(&run), 0, "{}\n{}", stderr(&run), text(&run.stdout));
     assert!(plist.is_file());
