@@ -97,10 +97,25 @@ fn sha(b: &[u8]) -> String {
 
 impl Fx {
     fn new() -> Fx {
+        Fx::build(false)
+    }
+
+    /// The source tree at `~/.dotfiles`, as on a machine: a write to it passes the HOME allow,
+    /// so only the checkout deny can stop it.
+    fn in_home() -> Fx {
+        Fx::build(true)
+    }
+
+    fn build(root_in_home: bool) -> Fx {
         let src = TempDir::new("script-src");
+        let home = TempDir::new("script-home");
         let fx = Fx {
-            home: TempDir::new("script-home"),
-            root: src.path().join("root"),
+            root: if root_in_home {
+                home.path().join(".dotfiles")
+            } else {
+                src.path().join("root")
+            },
+            home,
             _src: src,
             fake: TempDir::new("script-providers"),
         };
@@ -820,4 +835,350 @@ fn doctor_shows_the_script_trial_and_purge_and_adopt_refuse_it() {
     assert_eq!(code(&o), 3, "{}\n{}", stderr(&o), text(&o.stdout));
     assert!(stderr(&o).contains("E_CONFLICT"), "{}", stderr(&o));
     assert!(stderr(&o).contains("DFM-83"), "{}", stderr(&o));
+}
+
+/// Runs `body` as an approved script trial and returns `~/result`. The trial must succeed: the
+/// script's own exit is 0 and the tracked-file guard finds nothing, which would be a conflict.
+fn sandboxed(fx: &Fx, body: &str) -> String {
+    fx.script(format!("#!/bin/sh\n{body}"));
+    let o = fx.approved("boat");
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+    assert_eq!(fx.record("trial-boat")["script"]["exit"]["code"], 0);
+    fs::read_to_string(fx.h("result")).unwrap_or_default()
+}
+
+#[test]
+fn a_write_through_a_dfm_link_is_denied_and_the_repo_file_is_unchanged() {
+    if no_sandbox() {
+        return;
+    }
+    let fx = Fx::in_home();
+    fx.bind_with_links();
+    // `zshrc` is a link target; `bundle.toml` and a new file are only inside the checkout.
+    let zshrc = fx.root.join("base/modules/extra/files/zshrc");
+    let bundle = fx.root.join("base/bundle.toml");
+    let before = (fs::read(&zshrc).unwrap(), fs::read(&bundle).unwrap());
+    let result = sandboxed(
+        &fx,
+        "echo x >> ~/.zshrc; echo link=$? >> ~/result\n\
+         echo x >> ~/.dotfiles/base/bundle.toml; echo tracked=$? >> ~/result\n\
+         echo x > ~/.dotfiles/planted; echo new=$? >> ~/result\n",
+    );
+    assert_eq!(result, "link=1\ntracked=1\nnew=1\n");
+    assert_eq!(
+        (fs::read(&zshrc).unwrap(), fs::read(&bundle).unwrap()),
+        before
+    );
+    assert!(!fx.root.join("planted").exists());
+}
+
+#[test]
+fn replacing_or_removing_a_dfm_link_is_denied() {
+    if no_sandbox() {
+        return;
+    }
+    let fx = Fx::in_home();
+    fx.bind_with_links();
+    let links = [".zshrc", ".ssh/config", ".config/git/config"];
+    let targets: Vec<PathBuf> = links
+        .iter()
+        .map(|l| fs::read_link(fx.h(l)).unwrap())
+        .collect();
+    let result = sandboxed(
+        &fx,
+        "mv ~/.zshrc ~/.zshrc.bak; echo mv=$? >> ~/result\n\
+         unlink ~/.ssh/config; echo unlink=$? >> ~/result\n\
+         ln -sf /etc/hosts ~/.config/git/config; echo ln=$? >> ~/result\n",
+    );
+    assert_eq!(result, "mv=1\nunlink=1\nln=1\n");
+    for (l, t) in links.iter().zip(&targets) {
+        assert_eq!(&fs::read_link(fx.h(l)).unwrap(), t, "{l}");
+    }
+    assert!(!fx.h(".zshrc.bak").exists());
+}
+
+#[test]
+fn sudo_su_and_osascript_are_denied() {
+    if no_sandbox() {
+        return;
+    }
+    let fx = Fx::new();
+    fx.bind_with_links();
+    // 126 is the shell's code for an exec the sandbox refused; outside it, sudo -n and su exit 1
+    // and osascript 0.
+    let result = sandboxed(
+        &fx,
+        "/usr/bin/sudo -n true; echo sudo=$? >> ~/result\n\
+         /usr/bin/su root -c true < /dev/null; echo su=$? >> ~/result\n\
+         /usr/bin/osascript -e return; echo osascript=$? >> ~/result\n",
+    );
+    assert_eq!(result, "sudo=126\nsu=126\nosascript=126\n");
+}
+
+#[test]
+fn a_write_outside_home_is_denied() {
+    if no_sandbox() {
+        return;
+    }
+    let fx = Fx::new();
+    fx.bind_with_links();
+    // Both are writable by the test user outside the sandbox, so only the sandbox stops them.
+    let name = fx.fake.path().file_name().unwrap().to_str().unwrap();
+    let var_tmp = PathBuf::from(format!("/private/var/tmp/{name}"));
+    let user_dir = fx.fake.path().join("outside");
+    let result = sandboxed(
+        &fx,
+        &format!(
+            "echo x > /usr/local/bin/{name} || echo d1 >> ~/result\n\
+             echo x > {} || echo d2 >> ~/result\n\
+             echo x > {} || echo d3 >> ~/result\n\
+             echo x > \"$TMPDIR/inside\" && echo t >> ~/result\n",
+            var_tmp.display(),
+            user_dir.display()
+        ),
+    );
+    assert_eq!(result, "d1\nd2\nd3\nt\n");
+    for p in [
+        PathBuf::from("/usr/local/bin").join(name),
+        var_tmp,
+        user_dir,
+    ] {
+        assert!(!p.exists(), "{}", p.display());
+    }
+    assert_eq!(
+        fs::read_to_string(fx.tmpdir().join("inside")).unwrap(),
+        "x\n"
+    );
+}
+
+#[test]
+fn the_binding_and_the_lock_are_protected() {
+    if no_sandbox() {
+        return;
+    }
+    let fx = Fx::new();
+    fx.bind_with_links();
+    let binding = fx.h(".config/dotfiles-manager/machine.toml");
+    let lock = fx.h(".local/state/dotfiles-manager.lock");
+    let bytes = fs::read(&binding).unwrap();
+    assert!(lock.exists());
+    let result = sandboxed(
+        &fx,
+        "echo x > ~/.config/dotfiles-manager/machine.toml || echo d1 >> ~/result\n\
+         unlink ~/.local/state/dotfiles-manager.lock || echo d2 >> ~/result\n\
+         echo x > ~/.local/state/dotfiles-manager/state/planted || echo d3 >> ~/result\n",
+    );
+    assert_eq!(result, "d1\nd2\nd3\n");
+    assert_eq!(fs::read(&binding).unwrap(), bytes);
+    assert!(lock.exists());
+    assert!(!fx.state().join("planted").exists());
+}
+
+#[test]
+fn renaming_an_ancestor_of_a_protected_path_is_denied() {
+    if no_sandbox() {
+        return;
+    }
+    let fx = Fx::in_home();
+    fx.bind_with_links();
+    let result = sandboxed(
+        &fx,
+        "mv ~/.config ~/.config2 || echo d1 >> ~/result\n\
+         mv ~/.local ~/.local2 || echo d2 >> ~/result\n\
+         mv ~/.dotfiles ~/.dotfiles2 || echo d3 >> ~/result\n",
+    );
+    assert_eq!(result, "d1\nd2\nd3\n");
+    for (kept, gone) in [
+        (".config", ".config2"),
+        (".local", ".local2"),
+        (".dotfiles", ".dotfiles2"),
+    ] {
+        assert!(fx.h(kept).is_dir() && !fx.h(gone).exists(), "{kept}");
+    }
+}
+
+#[test]
+fn a_hard_link_to_a_protected_file_is_denied() {
+    if no_sandbox() {
+        return;
+    }
+    let fx = Fx::in_home();
+    fx.bind_with_links();
+    let result = sandboxed(
+        &fx,
+        "ln ~/.dotfiles/base/modules/extra/files/zshrc ~/hl || echo d >> ~/result\n",
+    );
+    assert_eq!(result, "d\n");
+    assert!(fs::symlink_metadata(fx.h("hl")).is_err());
+    let source = fx.root.join("base/modules/extra/files/zshrc");
+    assert_eq!(
+        std::os::unix::fs::MetadataExt::nlink(&fs::metadata(source).unwrap()),
+        1
+    );
+}
+
+#[test]
+fn created_directory_bin_file_and_link_are_recorded() {
+    if no_sandbox() {
+        return;
+    }
+    let fx = Fx::new();
+    fx.bind_with_links();
+    let tool = "#!/bin/sh\necho boat\n";
+    sandboxed(
+        &fx,
+        &format!(
+            "set -e\nmkdir -p ~/.boat ~/.local/bin\nprintf '{}' > ~/.local/bin/boat\n\
+             chmod 755 ~/.local/bin/boat\nln -s ~/.local/bin/boat ~/.local/bin/b\n",
+            tool.replace('\n', "\\n")
+        ),
+    );
+    let rec = fx.record("trial-boat");
+    let dir = window_entry(&rec, &fx.h(".boat"));
+    assert_eq!(
+        (&dir["change"], &dir["kind"]),
+        (&"created".into(), &"dir".into())
+    );
+    let file = window_entry(&rec, &fx.h(".local/bin/boat"));
+    assert_eq!(
+        (&file["change"], &file["kind"]),
+        (&"created".into(), &"file".into())
+    );
+    assert_eq!(file["sha256"], sha(tool.as_bytes()).as_str());
+    let link = window_entry(&rec, &fx.h(".local/bin/b"));
+    assert_eq!(
+        (&link["change"], &link["kind"]),
+        (&"created".into(), &"link".into())
+    );
+    assert_eq!(
+        link["target"],
+        fx.h(".local/bin/boat").display().to_string().as_str()
+    );
+}
+
+#[test]
+fn a_missing_sandbox_exec_refuses_before_the_preview() {
+    let fx = Fx::new();
+    fs::remove_file(fx.bin().join("sandbox-exec")).unwrap();
+    fx.script("#!/bin/sh\nexit 0\n");
+    let o = fx.trial_script("boat", &["--preview"]);
+    assert_eq!(code(&o), 3, "{}\n{}", stderr(&o), text(&o.stdout));
+    let err = stderr(&o);
+    assert!(err.contains("E_PLATFORM_UNSUPPORTED"), "{err}");
+    assert!(err.contains("sandbox-exec is not available"), "{err}");
+    assert!(
+        !text(&o.stdout).contains("plan digest: "),
+        "{}",
+        text(&o.stdout)
+    );
+    // The check needs the profile, which comes after the fetch: the bytes are cached already.
+    assert_eq!(fx.log().matches("curl ").count(), 1, "{}", fx.log());
+    assert!(fx.cached().exists());
+    assert!(!fx.state().join("trials").join("trial-boat.json").exists());
+}
+
+#[test]
+fn a_profile_the_sandbox_rejects_refuses_the_approved_run_before_the_record() {
+    if no_sandbox() {
+        return;
+    }
+    let fx = Fx::new();
+    fx.script("#!/bin/sh\nexit 0\n");
+    let o = fx.trial_script("boat", &["--preview"]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    // The fake now fails the dry run as a rejected profile would.
+    fx.marker("sandbox-missing", "");
+    let o = fx.trial_script("boat", &["--yes-plan", &digest_of(&o)]);
+    assert_eq!(code(&o), 3, "{}\n{}", stderr(&o), text(&o.stdout));
+    let err = stderr(&o);
+    assert!(err.contains("E_PLATFORM_UNSUPPORTED"), "{err}");
+    assert!(
+        err.contains("the sandbox profile was not accepted"),
+        "{err}"
+    );
+    assert!(!fx.state().join("trials/trial-boat.json").exists());
+    assert!(!fx.journal().iter().any(|e| e["op"] == "trial-script"));
+}
+
+/// `pgrep` with `args`: the matching pids, none when it finds nothing.
+fn pgrep(args: &[&str]) -> Vec<String> {
+    let o = Command::new("/usr/bin/pgrep").args(args).output().unwrap();
+    text(&o.stdout).lines().map(str::to_string).collect()
+}
+
+#[test]
+fn a_stop_request_during_a_tty_run_records_the_window_and_exits_143() {
+    if no_sandbox() {
+        return;
+    }
+    if !Path::new("/usr/bin/script").exists() {
+        common::skip("/usr/bin/script missing");
+        return;
+    }
+    let fx = Fx::new();
+    fx.bind_with_links();
+    // The sleep runs through a link under this test's HOME, so `pgrep -f` finds only its own.
+    let sleeper = fx.h("marker-sleep");
+    let marker = sleeper.display().to_string();
+    fx.script(
+        "#!/bin/sh\nln -s /bin/sleep \"$HOME/marker-sleep\"\necho started > \"$HOME/result\"\n\"$HOME/marker-sleep\" 30\n",
+    );
+    let o = fx.trial_script("boat", &["--tty", "--preview"]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let d = digest_of(&o);
+    // `script` gives dfm a pty for standard input and returns dfm's exit code.
+    let base = fx.command(&["trial", "boat", "--script", URL, "--tty", "--yes-plan", &d]);
+    let mut child = Command::new("/usr/bin/script")
+        .env_clear()
+        .envs(base.get_envs().filter_map(|(k, v)| Some((k, v?))))
+        .args(["-q", "/dev/null"])
+        .arg(base.get_program())
+        .args(base.get_args())
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let started = Instant::now();
+    while !fx.h("result").exists() || pgrep(&["-f", &marker]).is_empty() {
+        if child.try_wait().unwrap().is_some() {
+            let o = child.wait_with_output().unwrap();
+            let all = format!("{}\n{}", stderr(&o), text(&o.stdout));
+            if all.contains("openpty") {
+                common::skip("no pty");
+                return;
+            }
+            panic!("ended before the script slept:\n{all}");
+        }
+        assert!(started.elapsed() < Duration::from_secs(60), "never started");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let dfm = pgrep(&["-P", &child.id().to_string()]);
+    assert_eq!(dfm.len(), 1, "{dfm:?}");
+    let k = Command::new("/bin/kill")
+        .args(["-TERM", &dfm[0]])
+        .status()
+        .unwrap();
+    assert!(k.success());
+    let stopped = Instant::now();
+    while child.try_wait().unwrap().is_none() {
+        if stopped.elapsed() > Duration::from_secs(15) {
+            let _ = child.kill();
+            panic!("dfm did not exit within 15 s of SIGTERM");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let o = child.wait_with_output().unwrap();
+    assert_eq!(code(&o), 143, "{}\n{}", stderr(&o), text(&o.stdout));
+    let rec = fx.record("trial-boat");
+    assert!(rec["script"]["window"].is_array(), "{rec:#}");
+    assert_eq!(rec["script"]["exit"]["signal"], "stopped", "{rec:#}");
+    let phases: Vec<String> = fx
+        .journal()
+        .iter()
+        .filter(|e| e["op"] == "trial-script")
+        .map(|e| e["phase"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(phases, ["intent", "failed"]);
+    assert_eq!(pgrep(&["-f", &marker]), Vec::<String>::new());
 }
