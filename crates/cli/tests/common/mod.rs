@@ -3,6 +3,7 @@
     reason = "each test binary uses a different subset of these helpers"
 )]
 pub mod providers;
+pub mod remote;
 
 use sha2::{Digest, Sha256};
 use std::fs;

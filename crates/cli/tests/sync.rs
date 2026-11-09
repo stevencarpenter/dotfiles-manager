@@ -7,6 +7,8 @@
 
 mod common;
 
+use common::providers::{FAKE_OP, native_tool};
+use common::remote::{Remote, git, lock_for, put};
 use common::{TempDir, code, text};
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -57,103 +59,6 @@ fn digest_of(o: &Output) -> String {
         .lines()
         .find_map(|l| l.strip_prefix("plan digest: ").map(str::to_string))
         .unwrap_or_else(|| panic!("no digest in\n{}\n{}", stdout(o), stderr(o)))
-}
-
-/// Git for building fixtures: a bare environment, no user configuration, a fixed identity.
-fn git(dir: &Path, args: &[&str]) -> String {
-    let o = Command::new("/usr/bin/git")
-        .env_clear()
-        .env("PATH", "/usr/bin:/bin")
-        .env("HOME", dir)
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .args([
-            "-c",
-            "user.name=t",
-            "-c",
-            "user.email=t@example.invalid",
-            "-c",
-            "commit.gpgsign=false",
-            "-c",
-            "init.defaultBranch=main",
-            "-C",
-        ])
-        .arg(dir)
-        .args(args)
-        .output()
-        .unwrap();
-    assert!(
-        o.status.success(),
-        "git {args:?} in {}:\n{}",
-        dir.display(),
-        text(&o.stderr)
-    );
-    text(&o.stdout).trim_end().to_string()
-}
-
-fn put(root: &Path, rel: &str, content: &str) {
-    let p = root.join(rel);
-    fs::create_dir_all(p.parent().unwrap()).unwrap();
-    fs::write(p, content).unwrap();
-}
-
-/// A bare remote, a seed working copy that pushes to it, and the id of its head.
-struct Remote {
-    bare: PathBuf,
-    seed: PathBuf,
-}
-
-impl Remote {
-    fn new(work: &Path, name: &str) -> Remote {
-        let bare = work.join(name);
-        let seed = work.join(format!("{name}-seed"));
-        fs::create_dir_all(&bare).unwrap();
-        fs::create_dir_all(&seed).unwrap();
-        git(&bare, &["init", "-q", "--bare"]);
-        git(&seed, &["init", "-q"]);
-        git(&seed, &["remote", "add", "origin", bare.to_str().unwrap()]);
-        Remote { bare, seed }
-    }
-
-    fn origin(&self) -> String {
-        format!("file://{}", self.bare.display())
-    }
-
-    /// Commits everything in the seed copy and pushes `main`. Returns the new head.
-    fn push(&self, message: &str) -> String {
-        git(&self.seed, &["add", "-A"]);
-        git(&self.seed, &["commit", "-q", "-m", message]);
-        git(
-            &self.seed,
-            &["push", "-q", "origin", "HEAD:refs/heads/main"],
-        );
-        git(&self.seed, &["rev-parse", "HEAD"])
-    }
-
-    fn head(&self) -> String {
-        git(&self.bare, &["rev-parse", "refs/heads/main"])
-    }
-
-    /// Rewrites the head commit without changing its tree and force-pushes it: a new commit
-    /// identity over the same content (a new message, since the same second would reproduce
-    /// the same commit).
-    fn amend(&self) -> String {
-        git(
-            &self.seed,
-            &[
-                "commit",
-                "-q",
-                "--amend",
-                "-m",
-                "amended: same tree, new commit",
-            ],
-        );
-        git(
-            &self.seed,
-            &["push", "-q", "-f", "origin", "HEAD:refs/heads/main"],
-        );
-        git(&self.seed, &["rev-parse", "HEAD"])
-    }
 }
 
 struct Fx {
@@ -353,19 +258,6 @@ impl Fx {
             stderr(&o)
         );
     }
-}
-
-fn lock_for(sources: &[(&str, Option<&str>, &str)]) -> String {
-    let mut s = String::from("[manager]\ntoolchain = \"1.98.1\"\n");
-    for (i, (origin, commit, path)) in sources.iter().enumerate() {
-        s.push_str(&format!(
-            "\n[[sources]]\nid = \"src{i}\"\nkind = \"git\"\norigin = \"{origin}\"\nref = \"refs/heads/main\"\npath = \"{path}\"\n"
-        ));
-        if let Some(c) = commit {
-            s.push_str(&format!("commit = \"{c}\"\n"));
-        }
-    }
-    s
 }
 
 #[test]
@@ -1630,22 +1522,6 @@ const AGENT_PLIST: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
 "#;
 
 const AGENT_OP: &str = "life.agent@service";
-
-/// `op whoami` exits 0 only with the `signed-in` marker and without a `signed-out-<account>`
-/// marker, and kills itself with the `whoami-killed` marker; `op inject` fills the one reference.
-const FAKE_OP: &str = r#"#!/bin/sh
-PATH=/usr/bin:/bin:$PATH
-here=$(dirname "$0")
-printf 'op %s\n' "$*" >> "$here/../log"
-[ -e "$here/../whoami-killed" ] && kill -KILL $$
-[ -e "$here/../signed-in" ] || { echo "[ERROR] no session" >&2; exit 1; }
-for a in "$@"; do [ -e "$here/../signed-out-$a" ] && { echo "[ERROR] no session" >&2; exit 1; }; done
-case "$1" in
-  whoami) echo me; exit 0 ;;
-  inject) sed 's|{{ op://vault/item/field }}|planted-value|' ;;
-  *) exit 64 ;;
-esac
-"#;
 
 /// `launchctl print` answers from `loaded` in launchd's report shape or exits 113;
 /// `bootstrap` adds the plist's label with the resolved path of the plist, as launchd reports it,
@@ -4123,31 +3999,6 @@ fn a_withheld_operation_does_not_count_in_the_combined_journal_check() {
 }
 
 // ---- the upgrade step (DFM-31, docs/upgrade.md) ----------------------------------------------
-
-/// A native tool look-alike: `--version` prints `st/<name>`, the update command writes the
-/// `next-<name>` marker's content there (or exits 1 with the `fail-<name>` marker, or touches
-/// `started-<name>` and sleeps with the `hang-<name>` marker). Every call is logged.
-fn native_tool(name: &str, update: &str, st: &Path) -> String {
-    format!(
-        r#"#!/bin/sh
-PATH=/usr/bin:/bin
-st={st}
-printf '{name} %s\n' "$*" >> "$st/log"
-case "$1" in
-  --version) cat "$st/{name}" ;;
-  {update})
-    [ -e "$st/hang-{name}" ] && {{ touch "$st/started-{name}"; exec sleep 30; }}
-    [ -e "$st/tty-{name}" ] && {{ read x < /dev/tty || exit 9; }}
-    [ -e "$st/fail-{name}" ] && {{ echo boom >&2; exit 1; }}
-    [ -e "$st/next-{name}" ] && cp "$st/next-{name}" "$st/{name}"
-    [ -e "$st/write-{name}" ] && echo changed >> "$(cat "$st/write-{name}")"
-    exit 0 ;;
-  *) exit 64 ;;
-esac
-"#,
-        st = st.display()
-    )
-}
 
 /// `brew` for the upgrade step: nothing outdated unless a marker says so, and `list` prints the
 /// `list-<name>` marker. With `outdated-codex`, the cask codex is outdated and its upgrade
