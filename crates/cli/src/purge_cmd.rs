@@ -819,12 +819,20 @@ fn script_items(
             continue;
         }
         if p.parent().is_some_and(|d| same(d, &agents)) {
-            // Single-quoted, so a pasted command passes the path as one word.
-            let word = shown.replace('\'', "'\\''");
-            retained.push((&e.path, format!(
-                "{shown} created during the trial; unload it with launchctl bootout gui/{} '{word}', then remove it by hand",
-                sys.uid
-            )));
+            // The command is built from the exact path, single-quoted so a paste passes it as one
+            // word; a path the terminal form changes (escapes) gets no command to copy.
+            let line = if shown == e.path {
+                let word = e.path.replace('\'', "'\\''");
+                format!(
+                    "{shown} created during the trial; unload it with launchctl bootout gui/{} '{word}', then remove it by hand",
+                    sys.uid
+                )
+            } else {
+                format!(
+                    "{shown} created during the trial; its name cannot be shown exactly, so unload it with launchctl bootout by hand, then remove it"
+                )
+            };
+            retained.push((&e.path, line));
             continue;
         }
         let real = real_parent(p).to_string_lossy().into_owned();
@@ -1437,7 +1445,11 @@ pub fn run(ctx: &Ctx, args: &Args, out: &mut dyn Write) -> Result<(), Refusal> {
             // journal append or launch), so what appeared came from elsewhere; and a link with
             // an inexact name cannot be read back, so whatever it points at, file or directory,
             // could be left dangling.
-            let keep_all = if s.window.is_some() && s.exit.is_none() {
+            let truncated = t.unknown.iter().any(|u| u == window::WINDOW_TRUNCATED);
+            let keep_all = if truncated {
+                // A cut window may have dropped a link to any candidate, so none is removed.
+                Some(TRUNCATED_WHY)
+            } else if s.window.is_some() && s.exit.is_none() {
                 Some(
                     "the script never started (no exit was recorded); nothing it created is removed",
                 )
@@ -1712,8 +1724,13 @@ pub fn run(ctx: &Ctx, args: &Args, out: &mut dyn Write) -> Result<(), Refusal> {
             }
         }
         // A recorded path below a directory this run already removed went with that tree.
+        // Parents go first, so a recorded path inside a tree this run removes goes with that tree
+        // and never changes the tree's fingerprint before its own removal.
+        let mut order: Vec<&PathItem> =
+            locked.paths.iter().filter(|p| p.step == Step::Do).collect();
+        order.sort_by_key(|p| Path::new(&p.path).components().count());
         let mut removed: Vec<&str> = Vec::new();
-        for p in locked.paths.iter().filter(|p| p.step == Step::Do) {
+        for p in order {
             let below = |r: &&str| fold(&p.path).starts_with(&format!("{}/", fold(r)));
             if removed.iter().any(below) {
                 continue;

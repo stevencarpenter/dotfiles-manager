@@ -3435,6 +3435,86 @@ fn an_inexact_link_to_a_baseline_file_keeps_that_file() {
 }
 
 #[test]
+fn a_configured_path_inside_a_created_directory_goes_with_the_tree() {
+    if no_sandbox() {
+        return;
+    }
+    let fx = Fx::new();
+    fx.bind_with_links();
+    let cfg = fx.h(".config/boat/settings.toml");
+    let cs = cfg.display().to_string();
+    fx.script_trial(
+        "#!/bin/sh\nset -e\nmkdir -p ~/.config/boat\necho a=1 > ~/.config/boat/settings.toml\n",
+        &["--config", &cs],
+    );
+    let (preview, run) = purged(&fx);
+    let shown = text(&preview.stdout);
+    assert!(
+        shown.contains(&format!(
+            "action: remove {}",
+            fx.h(".config/boat").display()
+        )),
+        "{shown}"
+    );
+    assert_eq!(code(&run), 0, "{}\n{}", stderr(&run), text(&run.stdout));
+    assert!(gone(&fx.h(".config/boat")));
+}
+
+#[test]
+fn a_truncated_window_removes_no_created_file() {
+    if no_sandbox() {
+        return;
+    }
+    let fx = Fx::new();
+    fx.bind_with_links();
+    fs::create_dir_all(fx.h(".local/bin")).unwrap();
+    sandboxed(&fx, "set -e\nprintf '#!/bin/sh\\n' > ~/.local/bin/tool\n");
+    // As `shrink_window` leaves it: a link to `tool` may have been dropped from the window.
+    let rec_path = fx.state().join("trials/trial-boat.json");
+    let mut rec = fx.record("trial-boat");
+    rec["unknown"]
+        .as_array_mut()
+        .unwrap()
+        .push("window-truncated".into());
+    fs::write(&rec_path, serde_json::to_vec(&rec).unwrap()).unwrap();
+    let (preview, run) = purged(&fx);
+    let shown = text(&preview.stdout);
+    let want = format!(
+        "retained: {} (the window was truncated; its contents were not all recorded)",
+        fx.h(".local/bin/tool").display()
+    );
+    assert!(shown.contains(&want), "{want}\n{shown}");
+    assert!(!shown.contains("action: remove"), "{shown}");
+    assert_eq!(code(&run), 0, "{}\n{}", stderr(&run), text(&run.stdout));
+    assert!(fx.h(".local/bin/tool").is_file());
+}
+
+#[test]
+fn a_launch_agent_name_with_a_backslash_gets_no_command_to_copy() {
+    if no_sandbox() {
+        return;
+    }
+    let fx = Fx::new();
+    fx.bind_with_links();
+    fs::create_dir_all(fx.h("Library/LaunchAgents")).unwrap();
+    sandboxed(
+        &fx,
+        "echo plist > ~/Library/LaunchAgents/dev.bo\\\\at.plist\n",
+    );
+    assert!(fx.h("Library/LaunchAgents/dev.bo\\at.plist").is_file());
+    let (preview, run) = purged(&fx);
+    let shown = text(&preview.stdout);
+    assert!(
+        shown.contains(
+            "its name cannot be shown exactly, so unload it with launchctl bootout by hand"
+        ),
+        "{shown}"
+    );
+    assert!(!shown.contains("launchctl bootout gui/"), "{shown}");
+    assert_eq!(code(&run), 0, "{}\n{}", stderr(&run), text(&run.stdout));
+}
+
+#[test]
 fn a_window_without_an_exit_removes_no_window_candidate() {
     if no_sandbox() {
         return;
