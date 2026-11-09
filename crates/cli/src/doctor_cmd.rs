@@ -136,7 +136,18 @@ fn inspect(ctx: &Ctx, command: &'static str, root: Option<&Path>) -> Result<Repo
     let (owned, scripts) = state_rows(sys, &layout, binding.as_ref(), &mut rows);
     lock_row(ctx, sys.uid, &mut rows);
     let (loaded, plan) = profile_rows(ctx, &sys, &path, binding.as_ref(), root, &mut rows);
-    script_binary_rows(&layout.home, &path, &scripts, loaded.as_ref(), &mut rows);
+    let sensitive = sensitive_paths(
+        loaded.as_ref().map(|l| &l.resolved),
+        owned.as_deref().unwrap_or_default(),
+    );
+    script_binary_rows(
+        &layout.home,
+        &path,
+        &scripts,
+        loaded.as_ref(),
+        &sensitive,
+        &mut rows,
+    );
     output_rows(
         sys,
         &layout,
@@ -318,13 +329,17 @@ fn script_binary_rows(
     path: &OsStr,
     trials: &[TrialRecord],
     loaded: Option<&Loaded>,
+    sensitive: &BTreeSet<String>,
     rows: &mut Vec<Row>,
 ) {
+    let row = |who: &str, at: &Path, since, fix| {
+        binary_row(who, at, since, fix, home, path, trials, sensitive)
+    };
     for t in trials.iter().filter(|t| t.is_active()) {
         let who = format!("script trial {}", t.trial_id);
         let fix = "Install the tool again, or end the trial.";
         rows.push(match recorded(t) {
-            Some(b) => binary_row(&who, Path::new(&b.path), Some(b), fix, home, path, trials),
+            Some(b) => row(&who, Path::new(&b.path), Some(b), fix),
             None => Row::new(
                 "binary",
                 D::ScriptBinary,
@@ -356,12 +371,33 @@ fn script_binary_rows(
             .and_then(recorded);
         let who = format!("script/v1 declaration {}", r.id);
         let fix = "Run dfm sync, which installs the declared tool again.";
-        rows.push(binary_row(&who, &at, since, fix, home, path, trials));
+        rows.push(row(&who, &at, since, fix));
     }
 }
 
+/// Whether the binary path or the file it resolves to is a sensitive managed output. The
+/// sensitive paths are relative to HOME and folded. Each is also resolved, without reading it, so
+/// a link in HOME or in its parents still matches.
+fn is_sensitive(home: &Path, at: &Path, real: &Path, sensitive: &BTreeSet<String>) -> bool {
+    let real_home = std::fs::canonicalize(home).unwrap_or_else(|_| home.to_path_buf());
+    let hit = |p: &Path, h: &Path| {
+        p.strip_prefix(h)
+            .is_ok_and(|rel| sensitive.contains(&fold(&rel.to_string_lossy())))
+    };
+    hit(at, home)
+        || hit(real, &real_home)
+        || sensitive
+            .iter()
+            .any(|s| std::fs::canonicalize(home.join(s)).is_ok_and(|c| c == real))
+}
+
 /// The row of one script binary. The path is resolved through its links again and the file it
-/// points to now is hashed, up to the trial's hash cap. Nothing is executed.
+/// points to now is hashed, up to the trial's hash cap. Nothing is executed. A path that is, or
+/// resolves to, a sensitive managed output (`sensitive`, folded) is never hashed.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one row from the shared doctor inputs; a struct would only rename them"
+)]
 fn binary_row(
     who: &str,
     at: &Path,
@@ -370,6 +406,7 @@ fn binary_row(
     home: &Path,
     path: &OsStr,
     trials: &[TrialRecord],
+    sensitive: &BTreeSet<String>,
 ) -> Row {
     use crate::trial_cmd::window::{HASH_CAP, hash};
     let mut notes = vec![who.to_string()];
@@ -387,13 +424,28 @@ fn binary_row(
             fix = missing_fix;
             notes.push(format!("the binary path cannot be resolved: {}", e.kind()));
         }
+        Ok(real) if is_sensitive(home, at, &real, sensitive) => {
+            fix = "Point the binary path to the tool's own file, then install the tool again.";
+            notes.push(
+                "the binary resolves to a sensitive managed output, which is not read".into(),
+            );
+        }
         Ok(real) => {
-            let len = std::fs::metadata(&real)
-                .ok()
-                .filter(|m| m.is_file())
-                .map(|m| m.len());
-            let digest = len.filter(|n| *n <= HASH_CAP).and_then(|_| hash(&real));
+            let meta = std::fs::metadata(&real).ok().filter(|m| m.is_file());
+            let len = meta.as_ref().map(|m| m.len());
+            // As the trial requires (DFM-83): the owner execute bit.
+            let runnable = meta.is_some_and(|m| m.permissions().mode() & 0o100 != 0);
+            let digest = len
+                .filter(|n| runnable && *n <= HASH_CAP)
+                .and_then(|_| hash(&real));
             notes.push(match (len, digest) {
+                (Some(_), _) if !runnable => {
+                    fix = "Restore the execute bit (chmod u+x <real path>) or reinstall the tool.";
+                    format!(
+                        "resolves to {}, which is not executable by its owner",
+                        real.display()
+                    )
+                }
                 (None, _) => {
                     fix = missing_fix;
                     format!(

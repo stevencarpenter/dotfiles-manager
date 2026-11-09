@@ -2129,3 +2129,57 @@ fn a_script_trial_that_recorded_no_binary_is_warn() {
     assert_eq!(r["subject"], "trials/trial-boat.json", "{r:#}");
     assert!(detail(&r).contains("no binary was recorded"), "{r:#}");
 }
+
+#[test]
+fn a_binary_linked_to_a_sensitive_output_is_warn_and_not_hashed() {
+    if no_sandbox() {
+        return;
+    }
+    let fx = Fx::new();
+    fx.bind_with_links();
+    fx.script_trial(BARE, &[]);
+    // A file the ledger records with the sensitive class, owned by another resource.
+    let secret = fx.tool_file(".vault/token", b"hunter2-secret");
+    let f = fx.state().join("ledger.json");
+    let mut l: serde_json::Value = serde_json::from_slice(&fs::read(&f).unwrap()).unwrap();
+    l["resources"]
+        .as_array_mut()
+        .unwrap()
+        .push(serde_json::json!({
+            "resource": "vault", "adapter": "fs-link/v1", "class": "sensitive", "op_id": "x-1",
+            "owned_outputs": [{"path": secret, "mode": 420, "fingerprint": null}],
+        }));
+    fs::write(&f, serde_json::to_vec(&l).unwrap()).unwrap();
+    let link = fx.h(".local/bin/boat");
+    fs::remove_file(&link).unwrap();
+    std::os::unix::fs::symlink(&secret, &link).unwrap();
+    let rows = fx.binary_rows(&fx.path_var());
+    let json = serde_json::to_string(&rows).unwrap();
+    assert!(!json.contains(&sha(b"hunter2-secret")), "{rows:#?}");
+    let r = rows
+        .iter()
+        .find(|r| r["subject"] == link.to_str().unwrap())
+        .unwrap();
+    assert_eq!(r["status"], "WARN", "{r:#}");
+    assert!(
+        detail(r).contains("the binary resolves to a sensitive managed output"),
+        "{r:#}"
+    );
+    assert!(!detail(r).contains("sha256"), "{r:#}");
+}
+
+#[test]
+fn a_binary_without_the_owner_execute_bit_is_warn() {
+    if no_sandbox() {
+        return;
+    }
+    let fx = Fx::new();
+    fx.bind_with_links();
+    fx.script_trial(BARE, &[]);
+    let real = fs::canonicalize(fx.h(".bare/bin/boat")).unwrap();
+    fs::set_permissions(&real, fs::Permissions::from_mode(0o644)).unwrap();
+    let r = fx.binary_row();
+    assert_eq!(r["status"], "WARN", "{r:#}");
+    assert!(detail(&r).contains("not executable by its owner"), "{r:#}");
+    assert!(r["fix"].as_str().unwrap().contains("chmod u+x"), "{r:#}");
+}
