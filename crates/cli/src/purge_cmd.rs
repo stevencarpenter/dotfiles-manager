@@ -564,7 +564,8 @@ fn vouching<'a>(link: &Path, target: &str, created_dirs: &[&'a Path]) -> Vec<&'a
 /// `p` resolved in the order the kernel walks it: each existing component is followed through
 /// its links (`canonicalize`), and `..` then leaves where that link led. From the first missing
 /// component on, the rest is joined by text, which is exact there because a missing name is not
-/// a link. `None` when a component cannot be read or a link on the way does not resolve.
+/// a link. `None` when a component cannot be read, a link on the way does not resolve, or `..`
+/// follows a missing component (the kernel does not resolve it either).
 fn in_order(p: &Path) -> Option<PathBuf> {
     let mut cur = PathBuf::new();
     let mut missing = false;
@@ -572,6 +573,8 @@ fn in_order(p: &Path) -> Option<PathBuf> {
         match c {
             Component::RootDir | Component::Prefix(_) => cur = PathBuf::from("/"),
             Component::CurDir => {}
+            // The kernel fails `..` after a missing name (ENOENT), so text must not resolve it.
+            Component::ParentDir if missing => return None,
             Component::ParentDir => {
                 cur.pop();
             }
@@ -1952,33 +1955,54 @@ mod tests {
 
     #[test]
     fn link_keep_allows_the_recorded_target_and_targets_inside_a_created_dir() {
-        let link = Path::new("/h/.local/bin/c");
-        let dirs = [Path::new("/h/.local/share/c")];
+        let base = std::env::temp_dir().join(format!("dfm-purge-keep-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        // Real directories, so the targets resolve on the file system as purge resolves them.
+        for d in [".local/bin", ".local/share/c", ".local/share/new"] {
+            fs::create_dir_all(base.join(d)).unwrap();
+        }
+        let h = fs::canonicalize(&base).unwrap();
+        let hs = h.to_string_lossy().into_owned();
+        let link = h.join(".local/bin/c");
+        let (c, new) = (h.join(".local/share/c"), h.join(".local/share/new"));
+        let dirs = [c.as_path(), new.as_path()];
         // The recorded target, even outside every created directory.
         assert_eq!(
-            link_keep(link, Some("/usr/bin/true"), "/usr/bin/true", &dirs),
+            link_keep(&link, Some("/usr/bin/true"), "/usr/bin/true", &dirs),
             None
         );
         // A relative target into the created directory, and the directory itself.
-        assert_eq!(link_keep(link, Some("/x"), "../share/c/v2/c", &dirs), None);
-        assert_eq!(link_keep(link, None, "/h/.local/share/c", &dirs), None);
+        assert_eq!(link_keep(&link, Some("/x"), "../share/c/v2/c", &dirs), None);
+        assert_eq!(
+            link_keep(&link, None, &format!("{hs}/.local/share/c"), &dirs),
+            None
+        );
         // The created directory in another case, as a case-insensitive volume resolves it.
-        assert_eq!(link_keep(link, None, "/h/.local/Share/C/v2", &dirs), None);
+        assert_eq!(
+            link_keep(&link, None, &format!("{hs}/.local/Share/C/v2"), &dirs),
+            None
+        );
         // `..` that leaves the created directory.
         assert_eq!(
-            link_keep(link, Some("/x"), "../share/c/../other", &dirs).as_deref(),
+            link_keep(&link, Some("/x"), "../share/c/../other", &dirs).as_deref(),
+            Some("repointed since the trial")
+        );
+        // `..` after a missing name does not resolve, so by text alone it is not inside `new`.
+        assert_eq!(
+            link_keep(&link, Some("/x"), "../share/new/missing/../bin/tool", &dirs).as_deref(),
             Some("repointed since the trial")
         );
         // A name that only starts like the directory is not inside it.
         assert_eq!(
-            link_keep(link, None, "/h/.local/share/cc/v", &dirs).as_deref(),
+            link_keep(&link, None, &format!("{hs}/.local/share/cc/v"), &dirs).as_deref(),
             Some("no target recorded")
         );
         // An absolute target elsewhere.
         assert_eq!(
-            link_keep(link, Some("/x"), "/usr/bin/true", &dirs).as_deref(),
+            link_keep(&link, Some("/x"), "/usr/bin/true", &dirs).as_deref(),
             Some("repointed since the trial")
         );
+        fs::remove_dir_all(&base).unwrap();
     }
 
     #[test]
