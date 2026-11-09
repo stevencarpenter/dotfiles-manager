@@ -602,6 +602,86 @@ fn a_nonzero_script_exit_is_exit_1_after_the_record() {
     );
 }
 
+/// Creates `n` small files `~/.local/bin/f-<i>`, each with a 64-hex digest in the window.
+fn many_files(fx: &Fx, n: usize) {
+    let bin = fx.h(".local/bin");
+    fs::create_dir_all(&bin).unwrap();
+    for i in 0..n {
+        fs::write(bin.join(format!("f-{i:05}")), "x").unwrap();
+    }
+}
+
+/// How many files make a `before` observation of about `bytes`: one entry is the path plus
+/// about 116 bytes of keys, kind and digest.
+fn files_for(fx: &Fx, bytes: usize) -> usize {
+    bytes / (fx.h(".local/bin/f-00000").display().to_string().len() + 116)
+}
+
+#[test]
+fn a_window_over_the_record_budget_is_shrunk_and_the_outcome_kept() {
+    if no_sandbox() {
+        return;
+    }
+    let fx = Fx::new();
+    fx.bind_with_links();
+    // About 1.5 MB of `before` in the record (the estimate is about 8% low), under the 1.5 MiB
+    // pre-run cap. Modifying every file makes the full record about 4.5 MB, over the store's
+    // 4 MiB write cap.
+    let n = files_for(&fx, 1_400_000);
+    many_files(&fx, n);
+    fx.script(format!(
+        "{}for f in \"$HOME\"/.local/bin/f-*; do echo y >> \"$f\"; done\n",
+        BOAT.trim_end_matches("echo installed boat\n")
+    ));
+    let o = fx.approved("boat");
+    let out = text(&o.stdout);
+    assert_eq!(code(&o), 0, "{}\n{out}", stderr(&o));
+    let note = out
+        .lines()
+        .find(|l| l.starts_with("note: the window was shrunk to fit the record: "))
+        .unwrap_or_else(|| panic!("{out}"));
+    assert!(
+        note.ends_with(
+            " entries dropped, before-states removed; the exit and the binary are recorded"
+        ),
+        "{note}"
+    );
+    let rec = fx.record("trial-boat");
+    let s = &rec["script"];
+    assert_eq!(s["exit"], serde_json::json!({"code": 0, "signal": null}));
+    assert!(s["binary"]["sha256"].is_string(), "{}", s["binary"]);
+    let window = s["window"].as_array().unwrap();
+    assert!(!window.is_empty());
+    assert!(window.iter().all(|e| e["before"].is_null()));
+    let unknown = rec["unknown"].as_array().unwrap();
+    assert!(
+        unknown.iter().any(|u| u == "window-truncated"),
+        "{unknown:?}"
+    );
+}
+
+#[test]
+fn a_before_observation_over_half_the_budget_refuses_before_any_write() {
+    if no_sandbox() {
+        return;
+    }
+    let fx = Fx::new();
+    fx.bind_with_links();
+    many_files(&fx, files_for(&fx, 1_800_000));
+    fx.script(BOAT);
+    let o = fx.approved("boat");
+    assert_eq!(code(&o), 3, "{}", text(&o.stdout));
+    let err = stderr(&o);
+    assert!(err.contains("E_LIMIT_EXCEEDED"), "{err}");
+    assert!(
+        err.contains("the watch set is too large to record"),
+        "{err}"
+    );
+    assert!(!fx.state().join("trials/trial-boat.json").exists());
+    assert_eq!(run_files(&fx), Vec::<String>::new());
+    assert!(!fx.h(".ascii").exists(), "the script must not run");
+}
+
 #[test]
 fn the_run_never_fetches_again_and_a_changed_or_missing_cache_is_stale() {
     if no_sandbox() {

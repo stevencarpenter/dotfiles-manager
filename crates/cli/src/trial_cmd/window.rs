@@ -3,7 +3,7 @@
 use crate::read_fs::read_regular_bounded;
 use dfm_model::digest::sha256_hex;
 use dfm_model::display::visible;
-use dfm_model::state::{Observed, ScriptBinary, WindowEntry};
+use dfm_model::state::{Observed, ScriptBinary, TrialRecord, WindowEntry, canonical};
 use dfm_model::{Code, Refusal};
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
@@ -13,9 +13,15 @@ use std::path::{Path, PathBuf};
 
 /// Children one watched directory may hold before the window refuses to record it.
 pub(super) const MAX_DIR_ENTRIES: usize = 10_000;
-/// Entries one observation pass may hold in total. Kept low enough that a record with a full
-/// `before` and a full window still fits the store's 4 MiB write cap (`MAX_WRITE_BYTES`).
+/// Entries one observation pass may hold in total. The serialized size is bounded separately,
+/// by `MAX_RECORD_BYTES`.
 pub(super) const MAX_OBSERVED: usize = 15_000;
+/// Serialized bytes the trial record may hold: below the store's 4 MiB write cap
+/// (`dfm_model::state::MAX_WRITE_BYTES`), with headroom for the fields around the window. The
+/// record with `before` may use half, so a window shrunk to nothing always fits.
+pub(super) const MAX_RECORD_BYTES: usize = 3 << 20;
+/// The `TrialRecord.unknown` token of a record whose window `shrink_window` cut.
+pub(super) const WINDOW_TRUNCATED: &str = "window-truncated";
 /// Largest file the window hashes; a bigger file is recorded without a digest.
 pub(super) const HASH_CAP: u64 = 16 * 1024 * 1024;
 
@@ -232,6 +238,69 @@ pub(super) fn diff(before: &[Observed], after: &[Observed]) -> Vec<WindowEntry> 
     out
 }
 
+/// Refuses a record whose `before` observation already takes more than half of
+/// `MAX_RECORD_BYTES`. The caller runs it before anything is written.
+pub(super) fn check_before_run(record: &TrialRecord) -> Result<(), Refusal> {
+    let (bytes, cap) = (canonical(record)?.len(), MAX_RECORD_BYTES / 2);
+    if bytes > cap {
+        return Err(limit(format!(
+            "the watch set is too large to record ({bytes} bytes, cap {cap}); nothing was written"
+        )));
+    }
+    Ok(())
+}
+
+/// What `shrink_window` removed from the window.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(super) struct Shrunk {
+    pub dropped_before: bool,
+    pub dropped_entries: usize,
+}
+
+impl Shrunk {
+    pub(super) fn any(&self) -> bool {
+        self.dropped_before || self.dropped_entries > 0
+    }
+}
+
+/// Shrinks the script window until the record serializes to at most `budget` bytes. First the
+/// `before` of every entry goes (it repeats `script.before`), then entries from the end of the
+/// path order. A record that changed gets the `WINDOW_TRUNCATED` token in `unknown`; one under
+/// the budget is untouched. Only the window shrinks, so the result can still be over the budget
+/// when the rest of the record is.
+pub(super) fn shrink_window(record: &mut TrialRecord, budget: usize) -> Result<Shrunk, Refusal> {
+    fn window(r: &mut TrialRecord) -> Option<&mut Vec<WindowEntry>> {
+        r.script.as_mut().and_then(|s| s.window.as_mut())
+    }
+    let mut shrunk = Shrunk::default();
+    let mut over = canonical(record)?.len().saturating_sub(budget);
+    if over == 0 {
+        return Ok(shrunk);
+    }
+    for e in window(record).into_iter().flatten() {
+        shrunk.dropped_before |= e.before.take().is_some();
+    }
+    over = canonical(record)?.len().saturating_sub(budget);
+    while over > 0 {
+        let Some(w) = window(record).filter(|w| !w.is_empty()) else {
+            break;
+        };
+        // An entry frees its own bytes and one separator; the record is measured again after.
+        let mut freed = 0;
+        while freed < over
+            && let Some(e) = w.pop()
+        {
+            freed += canonical(&e)?.len() + 1;
+            shrunk.dropped_entries += 1;
+        }
+        over = canonical(record)?.len().saturating_sub(budget);
+    }
+    if shrunk.any() && !record.unknown.iter().any(|u| u == WINDOW_TRUNCATED) {
+        record.unknown.push(WINDOW_TRUNCATED.into());
+    }
+    Ok(shrunk)
+}
+
 /// The first executable named `tool` on `path_var` and then on the provider path: `path` is
 /// the candidate as found, `real_path` its canonical form, `sha256` the digest of the real
 /// file. `None` when no executable is found, and also when the real file is over `HASH_CAP` or
@@ -393,6 +462,139 @@ mod tests {
         let err = observe(&[Watch::Dir(dir.clone())]).unwrap_err();
         assert_eq!(err.code, Code::LimitExceeded);
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A script record whose `before` holds `n` files under `~/.local/bin` and whose window
+    /// says each was modified, with its old state in `before`.
+    fn record_with(n: usize) -> TrialRecord {
+        let observed = |i: usize, sha: char| Observed {
+            path: format!("/Users/someone/.local/bin/tool-{i:05}"),
+            kind: "file".into(),
+            sha256: Some(sha.to_string().repeat(64)),
+            target: None,
+        };
+        let before: Vec<Observed> = (0..n).map(|i| observed(i, 'a')).collect();
+        let window = (0..n)
+            .map(|i| {
+                let o = observed(i, 'b');
+                WindowEntry {
+                    path: o.path,
+                    change: "modified".into(),
+                    kind: o.kind,
+                    sha256: o.sha256,
+                    target: None,
+                    before: Some(before[i].clone()),
+                }
+            })
+            .collect();
+        TrialRecord {
+            schema: dfm_model::state::TRIAL_SCHEMA_SCRIPT,
+            binding: dfm_model::state::Stamp {
+                profile: "/p/x.toml".into(),
+                machine_id: "m5".into(),
+                binding_digest: "d".repeat(64),
+            },
+            trial_id: "trial-boat".into(),
+            tool: "boat".into(),
+            created_unix_ns: 1,
+            baseline: dfm_model::state::Baseline {
+                tool_preexisting: false,
+                paths: vec![],
+                owners: vec![],
+                data: vec![],
+            },
+            owned_outputs: vec![],
+            package: None,
+            unknown: vec!["keychain".into()],
+            adopted: None,
+            script: Some(dfm_model::state::TrialScript {
+                url: "https://boat.dev/install".into(),
+                effective_url: "https://boat.dev/install".into(),
+                sha256: "c".repeat(64),
+                bytes: 1,
+                shell: "sh".into(),
+                args: vec![],
+                env: vec![],
+                tty: false,
+                before,
+                exit: Some(dfm_model::state::ScriptExit {
+                    code: Some(0),
+                    signal: None,
+                }),
+                window: Some(window),
+                binary: None,
+            }),
+        }
+    }
+
+    fn size(r: &TrialRecord) -> usize {
+        canonical(r).unwrap().len()
+    }
+
+    fn window_of(r: &TrialRecord) -> &[WindowEntry] {
+        r.script.as_ref().unwrap().window.as_deref().unwrap()
+    }
+
+    #[test]
+    fn a_record_under_the_budget_is_untouched() {
+        let mut r = record_with(10);
+        let was = r.clone();
+        let shrunk = shrink_window(&mut r, MAX_RECORD_BYTES).unwrap();
+        assert_eq!(shrunk, Shrunk::default());
+        assert_eq!(r, was);
+    }
+
+    #[test]
+    fn dropping_the_before_states_is_enough_for_9000_modified_files() {
+        let mut r = record_with(9_000);
+        assert!(size(&r) > MAX_RECORD_BYTES, "{}", size(&r));
+        let shrunk = shrink_window(&mut r, MAX_RECORD_BYTES).unwrap();
+        assert_eq!(
+            shrunk,
+            Shrunk {
+                dropped_before: true,
+                dropped_entries: 0
+            }
+        );
+        assert!(size(&r) <= MAX_RECORD_BYTES);
+        let w = window_of(&r);
+        assert_eq!(w.len(), 9_000);
+        assert!(w.iter().all(|e| e.before.is_none()));
+        assert!(r.unknown.iter().any(|u| u == WINDOW_TRUNCATED));
+        assert_eq!(
+            r.script.as_ref().unwrap().exit.as_ref().unwrap().code,
+            Some(0)
+        );
+        r.validate().unwrap();
+    }
+
+    #[test]
+    fn the_window_tail_is_cut_when_the_before_states_are_not_enough() {
+        let mut r = record_with(9_000);
+        let budget = MAX_RECORD_BYTES / 2;
+        let shrunk = shrink_window(&mut r, budget).unwrap();
+        assert!(shrunk.dropped_before);
+        let w = window_of(&r);
+        assert!(shrunk.dropped_entries > 0);
+        assert_eq!(w.len() + shrunk.dropped_entries, 9_000);
+        assert!(size(&r) <= budget, "{}", size(&r));
+        // The entries kept are the head of the path order.
+        assert!(
+            w.last()
+                .unwrap()
+                .path
+                .ends_with(&format!("{:05}", w.len() - 1))
+        );
+        let once = r.unknown.iter().filter(|u| *u == WINDOW_TRUNCATED).count();
+        assert_eq!(once, 1);
+    }
+
+    #[test]
+    fn a_before_observation_over_half_the_budget_refuses_the_run() {
+        assert!(check_before_run(&record_with(10)).is_ok());
+        let err = check_before_run(&record_with(9_000)).unwrap_err();
+        assert_eq!(err.code, Code::LimitExceeded);
+        assert!(err.detail.contains("nothing was written"), "{}", err.detail);
     }
 
     #[test]

@@ -1025,6 +1025,8 @@ pub(super) fn run(
     })()
     .map_err(|r: Refusal| store.stamp(r))?;
     let mut record = locked.record(started, before);
+    // Half the record budget for `before` leaves room for any window `shrink_window` keeps.
+    window::check_before_run(&record).map_err(|r| store.stamp(r))?;
     // The run executes a copy of the verified bytes, not the URL-keyed cache file a concurrent
     // preview (no lock) may replace. It is a manager-private temporary file, the only write
     // before the record, and it is removed on every exit path from here on.
@@ -1145,9 +1147,21 @@ pub(super) fn run(
             ),
         )),
     }
-    if let Err(e) = store.write_trial(&record) {
-        problems.push(e);
-    }
+    // The exit and the binary always fit; the window shrinks to what the write cap allows.
+    let shrunk = match window::shrink_window(&mut record, window::MAX_RECORD_BYTES) {
+        Ok(s) => s,
+        Err(e) => {
+            problems.push(e);
+            window::Shrunk::default()
+        }
+    };
+    let written = match store.write_trial(&record) {
+        Ok(()) => true,
+        Err(e) => {
+            problems.push(e);
+            false
+        }
+    };
     // The record keeps the script's sha256; a later preview fetches it again.
     let (cache_file, sidecar) = cache_paths(&layout.cache_dir, &s.url);
     for p in [cache_file, sidecar, run_file] {
@@ -1186,11 +1200,23 @@ pub(super) fn run(
         }
         e.after_mutation()
     });
-    let note = record
-        .script
-        .as_ref()
-        .is_some_and(|sc| sc.binary.is_none())
-        .then(|| format!("note: the tool {tool} is not on PATH or cannot be hashed"));
+    let notes: Vec<String> = [
+        record
+            .script
+            .as_ref()
+            .is_some_and(|sc| sc.binary.is_none())
+            .then(|| format!("the tool {tool} is not on PATH or cannot be hashed")),
+        (written && shrunk.any()).then(|| {
+            format!(
+                "the window was shrunk to fit the record: {} entries dropped, before-states removed; the exit and the binary are recorded",
+                shrunk.dropped_entries
+            )
+        }),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    let note = (!notes.is_empty()).then(|| format!("note: {}", notes.join("; ")));
     conclude(
         ctx,
         &store,

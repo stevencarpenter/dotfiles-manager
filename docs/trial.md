@@ -183,10 +183,16 @@ The first record of a path wins, so a file that a listing also names keeps its d
 | Cap | Value | Over the cap |
 | --- | --- | --- |
 | Children of one watched directory | 10 000 | `E_LIMIT_EXCEEDED` |
-| Observed entries in one pass | 15 000 (a record with a full `before` and a full window then fits the 4 MiB state write cap) | `E_LIMIT_EXCEEDED` |
+| Observed entries in one pass | 15 000 | `E_LIMIT_EXCEEDED` |
 | File size that is hashed | 16 MiB | The entry is recorded without a SHA-256. |
 
 An entry with a control character in its name is recorded with kind `other` and a visible spelling of the name. Over a cap before the script starts, the run refuses before the record is written. Over a cap after the script, the record is written without `window` and the run exits 1.
+
+The record also has a size budget of 3 MiB of serialized JSON, below the 4 MiB state write cap. The entry caps alone do not bound the size, because a long path makes every entry larger.
+
+- Before the script starts, the record with `before` may use at most half of the budget (1.5 MiB). A larger record refuses with `E_LIMIT_EXCEEDED` (`the watch set is too large to record (<n> bytes, cap <cap>); nothing was written`) and exits 3. The script does not run and nothing is written.
+- After the script, a record over the budget is shrunk until it fits. First the `before` of every window entry is removed, because `script.before` holds the same observation. If the record is still too large, window entries are cut from the end of the path order. `exit` and `binary` are always kept.
+- A shrunk record has the token `window-truncated` in `unknown`, and the output has `note: the window was shrunk to fit the record: <k> entries dropped, before-states removed; the exit and the binary are recorded` after the `trial:` line when the record was written. The shrink alone does not fail the run. When the tool note also applies, the two share one `note:` line, separated by `; `.
 
 `script.binary` is the first executable named `<tool>` in dfm's `PATH` and then in the provider directories: `path` as found, `real_path` through links, and the SHA-256 of the real file. It is absent when no executable is found or the real file cannot be hashed (over 16 MiB or unreadable). The output then has `note: the tool <tool> is not on PATH or cannot be hashed` after the `trial:` line, before `receipt:` and `result:`.
 
@@ -204,7 +210,7 @@ An entry with a control character in its name is recorded with kind `other` and 
 | `window[{path, change, kind, sha256, target, before}]` | One entry per difference. `change` is `created`, `modified`, `removed` or `kind-changed`. `before` describes a path observed earlier. Absent until the run ends. |
 | `binary{path, real_path, sha256}` | The installed tool, as above. |
 
-`unknown` holds the three package tokens and `script-downloads`, `later-self-updates`, `keychain` and `remote-effects`. `package` is absent and `tool_preexisting` is false. `baseline.paths` and `baseline.data` are observed as for a package trial.
+`unknown` holds the three package tokens and `script-downloads`, `later-self-updates`, `keychain` and `remote-effects`, and `window-truncated` when the window was shrunk. `package` is absent and `tool_preexisting` is false. `baseline.paths` and `baseline.data` are observed as for a package trial.
 
 A crash, a SIGKILL or a system sleep that kills the run leaves a record with `before` and no `window`. When the intent was written, `state check` reports the open `trial-script` intent as `E_OP_INTERRUPTED`. The intent has no path, so `state recover` leaves it `unknown`, and only `dfm state resolve <op_id> --as failed` settles it (docs/packages.md, "Interrupted install"). A crash between the record create and the intent leaves the record and no intent, so `state check` reports nothing for it.
 
