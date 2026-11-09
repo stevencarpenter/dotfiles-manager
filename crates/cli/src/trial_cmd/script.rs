@@ -310,6 +310,21 @@ fn probe(runner: &Runner, program: &str, args: &[&str]) -> Result<String, Refusa
     Ok(v)
 }
 
+/// The account's login shell. The isolated build takes it from `DFM_LOGIN_SHELL`, because the
+/// test HOME has no directory-service record.
+#[cfg(feature = "test-isolation")]
+fn account_login_shell(user: &str) -> Option<String> {
+    match std::env::var("DFM_LOGIN_SHELL") {
+        Ok(v) if !v.is_empty() => Some(v),
+        _ => dfm_platform_macos::login_shell(user),
+    }
+}
+
+#[cfg(not(feature = "test-isolation"))]
+fn account_login_shell(user: &str) -> Option<String> {
+    dfm_platform_macos::login_shell(user)
+}
+
 /// The script's whole environment, sorted by name: a fixed list taken from `dfm_env` (dfm's
 /// own environment) and the runner, so the script picks the same files as a `curl | sh` in the
 /// owner's shell without seeing dfm's other variables. `tty` adds `TERM`; `extra` is `--env`.
@@ -318,6 +333,7 @@ pub(super) fn script_env(
     dfm_env: &[(String, String)],
     tty: bool,
     extra: &[(String, String)],
+    login_shell: impl FnOnce(&str) -> Option<String>,
 ) -> Result<Vec<(String, String)>, Refusal> {
     let get = |n: &str| {
         dfm_env
@@ -335,10 +351,8 @@ pub(super) fn script_env(
     };
     // The sandbox matches real paths: `/var/folders/...` is `/private/var/folders/...`.
     let tmp = fs::canonicalize(&tmp).map_or(tmp, |p| p.display().to_string());
-    // shortcut: SHELL falls back to /bin/sh; the login shell from the directory service is not
-    // read. Upgrade when a script picks its startup file from SHELL and dfm runs without one.
-    let shell = get("SHELL")
-        .filter(|s| s.starts_with('/'))
+    let shell = login_shell(&user)
+        .or_else(|| get("SHELL").filter(|s| s.starts_with('/')))
         .unwrap_or_else(|| "/bin/sh".into());
     let mut env = vec![
         ("HOME".to_string(), runner.home.display().to_string()),
@@ -907,7 +921,7 @@ pub(super) fn run(
         .collect();
     // The script environment and the sandbox profile for `ledger`; neither needs the script.
     let confine = |ledger: &Ledger| -> Result<(Vec<(String, String)>, String), Refusal> {
-        let env = script_env(&runner, &dfm_env, s.tty, &s.env)?;
+        let env = script_env(&runner, &dfm_env, s.tty, &s.env, account_login_shell)?;
         let temp = env
             .iter()
             .find_map(|(n, v)| (n == "TMPDIR").then(|| PathBuf::from(v)))
@@ -1340,7 +1354,7 @@ mod tests {
             ("HOME", "/elsewhere"),
         ]);
         let extra = pairs(&[("FOO", "1")]);
-        let env = script_env(&runner(), &dfm, false, &extra).unwrap();
+        let env = script_env(&runner(), &dfm, false, &extra, |_| None).unwrap();
         assert_eq!(
             env,
             pairs(&[
@@ -1355,29 +1369,52 @@ mod tests {
                 ("ZDOTDIR", "/h/.config/zsh"),
             ])
         );
-        let with_tty = script_env(&runner(), &dfm, true, &extra).unwrap();
+        let with_tty = script_env(&runner(), &dfm, true, &extra, |_| None).unwrap();
         let names: Vec<&str> = with_tty.iter().map(|(n, _)| n.as_str()).collect();
         assert!(names.is_sorted() && names.contains(&"TERM"), "{names:?}");
         assert_eq!(with_tty.len(), env.len() + 1);
 
         // LOGNAME stands in for USER; a relative SHELL is replaced.
         let dfm = pairs(&[("LOGNAME", "ln"), ("TMPDIR", "/t"), ("SHELL", "zsh")]);
-        let env = script_env(&runner(), &dfm, false, &[]).unwrap();
+        let env = script_env(&runner(), &dfm, false, &[], |_| None).unwrap();
         assert!(env.contains(&("USER".into(), "ln".into())), "{env:?}");
         assert!(env.contains(&("SHELL".into(), "/bin/sh".into())), "{env:?}");
 
         let bad = pairs(&[("USER", "me"), ("TMPDIR", "/t"), ("LANG", "a\nb")]);
         assert_eq!(
-            script_env(&runner(), &bad, false, &[]).unwrap_err().code,
-            Code::Usage
-        );
-        let bad_extra = pairs(&[("FOO", "a\nb")]);
-        assert_eq!(
-            script_env(&runner(), &dfm, false, &bad_extra)
+            script_env(&runner(), &bad, false, &[], |_| None)
                 .unwrap_err()
                 .code,
             Code::Usage
         );
+        let bad_extra = pairs(&[("FOO", "a\nb")]);
+        assert_eq!(
+            script_env(&runner(), &dfm, false, &bad_extra, |_| None)
+                .unwrap_err()
+                .code,
+            Code::Usage
+        );
+    }
+
+    #[test]
+    fn shell_is_the_login_shell_then_an_absolute_dfm_shell_then_bin_sh() {
+        let shell = |dfm_shell: Option<&str>, lookup: Option<&str>| {
+            let mut dfm = pairs(&[("USER", "me"), ("TMPDIR", "/t")]);
+            if let Some(s) = dfm_shell {
+                dfm.push(("SHELL".into(), s.into()));
+            }
+            let env = script_env(&runner(), &dfm, false, &[], |u| {
+                assert_eq!(u, "me");
+                lookup.map(String::from)
+            })
+            .unwrap();
+            env.into_iter().find(|(n, _)| n == "SHELL").unwrap().1
+        };
+        assert_eq!(shell(Some("/bin/bash"), Some("/bin/zsh")), "/bin/zsh");
+        assert_eq!(shell(Some("/bin/bash"), None), "/bin/bash");
+        assert_eq!(shell(None, Some("/bin/zsh")), "/bin/zsh");
+        assert_eq!(shell(None, None), "/bin/sh");
+        assert_eq!(shell(Some("bash"), None), "/bin/sh");
     }
 
     #[test]
