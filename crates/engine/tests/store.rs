@@ -1754,6 +1754,44 @@ fn plain_trial(stamp: &Stamp, id: &str) -> dfm_model::state::TrialRecord {
 }
 
 #[test]
+fn a_script_record_without_data_keeps_its_schema_when_adopted() {
+    let h = Home::new();
+    let (s, stamp) = init(&h);
+    let mut t = plain_trial(&stamp, "t1");
+    t.schema = dfm_model::state::TRIAL_SCHEMA_FENCE;
+    t.script = Some(dfm_model::state::TrialScript {
+        url: "https://boat.dev/install".into(),
+        effective_url: "https://boat.dev/install".into(),
+        sha256: "c".repeat(64),
+        bytes: 1,
+        shell: "sh".into(),
+        args: vec![],
+        env: vec![],
+        tty: false,
+        before: vec![],
+        exit: None,
+        window: None,
+        binary: None,
+        fence: Some(dfm_model::state::InodeFence { dev: 1, ino: 2 }),
+    });
+    assert!(s.create_trial(&t).unwrap());
+    s.mark_trial_adopted(
+        "t1",
+        dfm_model::state::TrialAdopted {
+            op_id: "adopt-1-2".into(),
+            module: "shell".into(),
+            at_unix_ns: 9,
+        },
+    )
+    .unwrap();
+    let loaded = s.load();
+    let (_, t) = loaded.trials.iter().find(|(n, _)| n == "t1.json").unwrap();
+    let t = t.as_ref().unwrap();
+    assert!(!t.is_active());
+    assert_eq!(t.schema, dfm_model::state::TRIAL_SCHEMA_FENCE);
+}
+
+#[test]
 fn marking_a_trial_adopted_replaces_only_that_record() {
     let h = Home::new();
     let (s, stamp) = init(&h);

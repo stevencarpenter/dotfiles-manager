@@ -21,14 +21,14 @@ pub(super) const MAX_OBSERVED: usize = 15_000;
 /// record with `before` may use half, so a window shrunk to nothing always fits.
 pub(super) const MAX_RECORD_BYTES: usize = 3 << 20;
 /// The `TrialRecord.unknown` token of a record whose window `shrink_window` cut.
-pub(super) const WINDOW_TRUNCATED: &str = "window-truncated";
+pub(crate) const WINDOW_TRUNCATED: &str = "window-truncated";
 /// Largest file the window hashes; a bigger file is recorded without a digest.
 pub(crate) const HASH_CAP: u64 = 16 * 1024 * 1024;
 
 const ZSH_FILES: [&str; 5] = [".zshenv", ".zprofile", ".zshrc", ".zlogin", ".zlogout"];
 
 /// One place the window watches.
-pub(super) enum Watch {
+pub(crate) enum Watch {
     /// A single path, recorded with its content digest.
     File(PathBuf),
     /// The children of a directory, each recorded with a digest or link target.
@@ -39,8 +39,9 @@ pub(super) enum Watch {
 
 /// The watch set of the spec table, from HOME and the script environment (`ZDOTDIR` when set).
 /// Order: files, then directories, then listings. `observe` keeps the first record of a path,
-/// so a file that a listing also names keeps its digest.
-pub(super) fn watch_set(home: &Path, env: &[(String, String)]) -> Vec<Watch> {
+/// so a file that a listing also names keeps its digest; only an `unreadable` marker replaces
+/// an earlier record.
+pub(crate) fn watch_set(home: &Path, env: &[(String, String)]) -> Vec<Watch> {
     let mut files: Vec<PathBuf> = [".profile", ".bash_profile", ".bash_login", ".bashrc"]
         .iter()
         .chain(&ZSH_FILES)
@@ -93,10 +94,18 @@ pub(crate) fn hash(path: &Path) -> Option<String> {
     (bytes.len() as u64 <= HASH_CAP).then(|| sha256_hex(&bytes))
 }
 
-/// One path as the window records it. `detail` adds the digest and link target.
+/// Whether the record of `path` names it exactly: valid UTF-8 without a control character.
+/// Any other path is recorded by a shown form that may name another file.
+fn exact_name(path: &Path) -> bool {
+    path.to_str()
+        .is_some_and(|s| !s.chars().any(char::is_control))
+}
+
+/// One path as the window records it. `detail` adds the digest and link target. A path whose
+/// name is not exact has the kind `other`, so purge never takes its record as exact.
 fn entry(path: &Path, detail: bool) -> Observed {
     let shown = path.to_string_lossy();
-    let name_is_odd = shown.chars().any(char::is_control);
+    let name_is_odd = !exact_name(path);
     let other = |path: String| Observed {
         path,
         kind: "other".into(),
@@ -148,26 +157,55 @@ fn limit(what: String) -> Refusal {
     Refusal::new(Code::LimitExceeded, what)
 }
 
-/// One pass over the watch set, sorted by path. A watched path that is absent, and a watched
-/// directory that cannot be read, yield nothing: the window is evidence, not authority. More
-/// than `MAX_DIR_ENTRIES` children in one directory, or `MAX_OBSERVED` entries in total, is
+/// One pass over the watch set, sorted by path. A watched path that is absent yields nothing.
+/// A watched path that exists but cannot be read (a directory that cannot be listed, or a
+/// file whose parent cannot be searched) yields one `unreadable` entry for that path, so a
+/// later pass can tell that what appears in it was not seen before. More than
+/// `MAX_DIR_ENTRIES` children in one directory, or `MAX_OBSERVED` entries in total, is
 /// `E_LIMIT_EXCEEDED`.
-pub(super) fn observe(watch: &[Watch]) -> Result<Vec<Observed>, Refusal> {
+pub(crate) fn observe(watch: &[Watch]) -> Result<Vec<Observed>, Refusal> {
     let mut seen: BTreeMap<String, Observed> = BTreeMap::new();
+    let absent = |e: &std::io::Error| {
+        matches!(
+            e.kind(),
+            std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+        )
+    };
+    let unreadable = |p: &Path| Observed {
+        path: plain(&p.to_string_lossy()),
+        kind: "unreadable".into(),
+        sha256: None,
+        target: None,
+    };
     for w in watch {
         let (dir, detail) = match w {
             Watch::File(p) => {
-                if fs::symlink_metadata(p).is_ok() {
-                    let o = entry(p, true);
-                    seen.entry(o.path.clone()).or_insert(o);
+                match fs::symlink_metadata(p) {
+                    Ok(_) => {
+                        let o = entry(p, true);
+                        seen.entry(o.path.clone()).or_insert(o);
+                    }
+                    Err(e) if absent(&e) => {}
+                    Err(_) => {
+                        let o = unreadable(p);
+                        seen.insert(o.path.clone(), o);
+                    }
                 }
                 continue;
             }
             Watch::Dir(p) => (p, true),
             Watch::Listing(p) => (p, false),
         };
-        let Ok(children) = fs::read_dir(dir) else {
-            continue;
+        let children = match fs::read_dir(dir) {
+            Ok(c) => c,
+            Err(e) if absent(&e) => continue,
+            Err(_) => {
+                // A listing of the parent may have recorded this place as a `dir` already;
+                // the marker replaces it, or what later appears in it would look created.
+                let o = unreadable(dir);
+                seen.insert(o.path.clone(), o);
+                continue;
+            }
         };
         for (n, child) in children.enumerate() {
             if n >= MAX_DIR_ENTRIES {
@@ -176,7 +214,14 @@ pub(super) fn observe(watch: &[Watch]) -> Result<Vec<Observed>, Refusal> {
                     visible(&dir.to_string_lossy())
                 )));
             }
-            let Ok(child) = child else { continue };
+            // One entry that cannot be read leaves the listing incomplete: a path missing here
+            // and present in the other pass would look created or removed. The marker replaces
+            // the place, so purge keeps everything below it.
+            let Ok(child) = child else {
+                let o = unreadable(dir);
+                seen.insert(o.path.clone(), o);
+                break;
+            };
             let o = entry(&child.path(), detail);
             seen.entry(o.path.clone()).or_insert(o);
             if seen.len() > MAX_OBSERVED {
@@ -192,7 +237,7 @@ pub(super) fn observe(watch: &[Watch]) -> Result<Vec<Observed>, Refusal> {
 /// What changed between two passes, sorted by path. `created`: in `after` only. `removed`: in
 /// `before` only. `kind-changed`: the kinds differ. `modified`: same kind and the digest or
 /// link target differs. Both inputs must be sorted by path, as `observe` returns them.
-pub(super) fn diff(before: &[Observed], after: &[Observed]) -> Vec<WindowEntry> {
+pub(crate) fn diff(before: &[Observed], after: &[Observed]) -> Vec<WindowEntry> {
     let entry = |o: &Observed, change: &str, old: Option<&Observed>| WindowEntry {
         path: o.path.clone(),
         change: change.into(),
@@ -386,6 +431,18 @@ mod tests {
     }
 
     #[test]
+    fn a_name_that_is_not_utf8_or_holds_a_control_character_is_not_exact() {
+        use std::os::unix::ffi::OsStrExt;
+        // APFS refuses such a name, so the predicate is checked without a file.
+        let lossy = Path::new(OsStr::from_bytes(b"/h/bin/x\xffy"));
+        assert!(!exact_name(lossy));
+        assert!(lossy.to_string_lossy().contains('\u{FFFD}'));
+        assert!(!exact_name(Path::new("/h/bin/x\ny")));
+        assert!(exact_name(Path::new("/h/bin/x\u{FFFD}y")));
+        assert!(exact_name(Path::new("/h/bin/caf\u{e9}")));
+    }
+
+    #[test]
     fn observe_and_diff_report_each_change_kind() {
         let home = scratch("diff");
         let bin = home.join(".local/bin");
@@ -442,6 +499,88 @@ mod tests {
         fs::write(home.join(".config/x/inner"), "z").unwrap();
         let after = observe(&watch).unwrap();
         assert!(diff(&before, &after).is_empty());
+        fs::remove_dir_all(&home).unwrap();
+    }
+
+    #[test]
+    fn a_watched_place_that_cannot_be_read_is_recorded_as_unreadable() {
+        let home = scratch("unreadable");
+        let (bin, fish) = (home.join(".local/bin"), home.join(".config/fish"));
+        fs::create_dir_all(&bin).unwrap();
+        fs::create_dir_all(fish.join("conf.d")).unwrap();
+        fs::write(bin.join("old"), "mine").unwrap();
+        fs::write(fish.join("config.fish"), "set x\n").unwrap();
+        let mode = |p: &Path, m: u32| fs::set_permissions(p, fs::Permissions::from_mode(m));
+        mode(&bin, 0o000).unwrap();
+        mode(&fish, 0o000).unwrap();
+        let watch = home_watch(&home);
+        let before = observe(&watch).unwrap();
+        mode(&bin, 0o755).unwrap();
+        mode(&fish, 0o755).unwrap();
+        let kind = |o: &[Observed], rel: &str| {
+            o.iter()
+                .find(|x| x.path == s(&home.join(rel)))
+                .map(|x| x.kind.clone())
+        };
+        // A directory that cannot be listed, a file below an unsearchable parent and a
+        // directory below it are each a marker; what they hold is not observed.
+        for rel in [
+            ".local/bin",
+            ".config/fish/config.fish",
+            ".config/fish/conf.d",
+        ] {
+            assert_eq!(kind(&before, rel).as_deref(), Some("unreadable"), "{rel}");
+        }
+        assert_eq!(kind(&before, ".local/bin/old"), None);
+        // Readable again: a marker now listed as a directory or a file is a kind change, one
+        // no listing names is removed, and the old file looks created. Purge reads the marker
+        // in `before` to keep such a child.
+        let d = diff(&before, &observe(&watch).unwrap());
+        let got: Vec<(&str, &str)> = d
+            .iter()
+            .map(|e| (e.path.as_str(), e.change.as_str()))
+            .collect();
+        let p = |rel: &str| s(&home.join(rel));
+        assert_eq!(
+            got,
+            vec![
+                (p(".config/fish/conf.d").as_str(), "removed"),
+                (p(".config/fish/config.fish").as_str(), "kind-changed"),
+                (p(".local/bin").as_str(), "kind-changed"),
+                (p(".local/bin/old").as_str(), "created"),
+            ]
+        );
+        assert_eq!(d[2].before.as_ref().unwrap().kind, "unreadable");
+        fs::remove_dir_all(&home).unwrap();
+    }
+
+    #[test]
+    fn a_marker_replaces_the_dir_record_of_a_parent_listing() {
+        let home = scratch("listed-unreadable");
+        let (config, share) = (home.join(".config"), home.join(".local/share"));
+        fs::create_dir_all(config.join("x")).unwrap();
+        fs::create_dir_all(share.join("y")).unwrap();
+        let mode = |p: &Path, m: u32| fs::set_permissions(p, fs::Permissions::from_mode(m));
+        mode(&config, 0o000).unwrap();
+        mode(&share, 0o000).unwrap();
+        // Mode 000 does not stop root.
+        if fs::read_dir(&config).is_ok() {
+            mode(&config, 0o755).unwrap();
+            mode(&share, 0o755).unwrap();
+            return fs::remove_dir_all(&home).unwrap();
+        }
+        let watch = home_watch(&home);
+        let before = observe(&watch).unwrap();
+        mode(&config, 0o755).unwrap();
+        mode(&share, 0o755).unwrap();
+        // The HOME and `~/.local` listings name both places as `dir` first; the marker wins.
+        for p in [&config, &share] {
+            let o = before.iter().find(|o| o.path == s(p)).unwrap();
+            assert_eq!(o.kind, "unreadable", "{}", o.path);
+        }
+        let d = diff(&before, &observe(&watch).unwrap());
+        let x = d.iter().find(|e| e.path == s(&config.join("x"))).unwrap();
+        assert_eq!(x.change, "created");
         fs::remove_dir_all(&home).unwrap();
     }
 
@@ -526,6 +665,7 @@ mod tests {
                 }),
                 window: Some(window),
                 binary: None,
+                fence: None,
             }),
         }
     }

@@ -54,7 +54,7 @@ A script trial uses the same codes. "Script trials" lists what each means there.
 
 ## The record
 
-`state/trials/<trial-id>.json`, canonical JSON. Schema 2, or 3 once adopted. A record with data paths is schema 4, adopted or not. A record with `script` is schema 5. The docs/state.md validation applies: identity stamp, valid id, claim check on every path, secrets refused.
+`state/trials/<trial-id>.json`, canonical JSON. Schema 2, or 3 once adopted. A record with data paths is schema 4, adopted or not. A record with `script` is schema 5, and schema 6 when `script` carries `fence`. The docs/state.md validation applies: identity stamp, valid id, claim check on every path, secrets refused.
 
 | Field | Meaning |
 | --- | --- |
@@ -70,7 +70,7 @@ A script trial uses the same codes. "Script trials" lists what each means there.
 | `script{...}` | Present only for a script trial. See "Script trials". |
 | `adopted{op_id, module, at_unix_ns}` | Set once by `adopt` (DFM-33), with `schema` 3. It names the journal operation and the module that took the configuration. Left out of an active trial. |
 
-The optional fields `package` and `unknown` need no schema bump: a record without them (for example, one the test harness `__record-trial` writes) still reads. `adopted` is different: the record type refuses unknown keys, so an adopted record is schema 3 and an unadopted record stays schema 2. The validator accepts 2 and 3, refuses `adopted` on schema 2, and requires it on schema 3. A binary that predates schema 3 reports an adopted record as `E_STATE_NEWER`. `baseline.data` follows the same rule: a record that carries it is schema 4, with or without `adopted`, and `adopt` keeps schema 4. The validator refuses data on schema 2 or 3. A binary that predates schema 4 reports such a record as `E_STATE_NEWER`. `script` follows the same rule: a record that carries it is schema 5, with or without `baseline.data` and `adopted`. The validator requires schema 5 when `script` is present and refuses it on any other schema. A binary that predates schema 5 reports the record as `E_STATE_NEWER`.
+The optional fields `package` and `unknown` need no schema bump: a record without them (for example, one the test harness `__record-trial` writes) still reads. `adopted` is different: the record type refuses unknown keys, so an adopted record is schema 3 and an unadopted record stays schema 2. The validator accepts 2 and 3, refuses `adopted` on schema 2, and requires it on schema 3. A binary that predates schema 3 reports an adopted record as `E_STATE_NEWER`. `baseline.data` follows the same rule: a record that carries it is schema 4, with or without `adopted`, and `adopt` keeps schema 4. The validator refuses data on schema 2 or 3. A binary that predates schema 4 reports such a record as `E_STATE_NEWER`. `script` follows the same rule: a record that carries it is schema 5, with or without `baseline.data` and `adopted`. The validator requires schema 5 when `script` is present and refuses it on any other schema. A binary that predates schema 5 reports the record as `E_STATE_NEWER`. `script.fence` follows the same rule: a record whose `script` carries it is schema 6, and a script record without it stays schema 5 and still reads. The validator requires schema 6 when the fence is present, refuses it on any other schema, and refuses a fence with inode number 0. A binary that predates schema 6 reports a fenced record as `E_STATE_NEWER`.
 
 A trial is **active** until its record has `adopted`. An adopted record stays as evidence and keeps its id taken (a second trial of that id is `E_CONFLICT`). Readers that mean "in progress" skip it: `doctor` lists no row for it, and `packages --update` does not roll its tool from the record. `state check` still validates and counts it.
 
@@ -78,7 +78,7 @@ The record is a private file under `state/trials/`. `state check` validates it w
 
 ## Script trials
 
-`dfm trial <tool> --script <url>` runs an install script that dfm downloads, under a macOS sandbox, and records what changed. It exists for tools that install only through `curl -fsSL <url> | sh`. The design is `docs/superpowers/specs/2026-11-03-dfm-78-script-trials-design.md`. Where the code differs from it, this section describes the code and "Differences from the design" names the difference. `purge` of a script trial is not built (DFM-82). `adopt` of a script trial is in [docs/adopt.md](adopt.md), "Script trials".
+`dfm trial <tool> --script <url>` runs an install script that dfm downloads, under a macOS sandbox, and records what changed. It exists for tools that install only through `curl -fsSL <url> | sh`. The design is `docs/superpowers/specs/2026-11-03-dfm-78-script-trials-design.md`. Where the code differs from it, this section describes the code and "Differences from the design" names the difference. `purge` of a script trial reads the window ([docs/purge.md](purge.md), "Script trials"). `adopt` of a script trial is in [docs/adopt.md](adopt.md), "Script trials".
 
 ### Arguments
 
@@ -170,7 +170,7 @@ The profile text is hashed. `profile_sha256` is in the digest, so a ledger chang
 
 ### The window
 
-The window observes these places before and after the script. A path that is absent, and a directory that cannot be read, add nothing: the window is evidence, not authority.
+The window observes these places before and after the script. A path that is absent adds nothing: the window is evidence, not authority. A watched place that exists but cannot be read (a directory that cannot be listed, or a file whose parent cannot be searched) is recorded with kind `unreadable` and no children. So is a directory whose listing fails part way (one entry cannot be read): the marker replaces it, and the entries listed before the failure do not make its children known. The marker replaces the `dir` record that a parent listing gives the same place (`~/.config`, `~/.local`, `~/.cache`, `~/.local/share`, `~/.local/state`). Its children are then not known, so `dfm purge` never removes what later appears in it (docs/purge.md, "Script trials"). When the place is readable in the later pass, the marker shows as `kind-changed`, or as `removed` when no listing names the place.
 
 | Place | Recorded for each entry |
 | --- | --- |
@@ -186,7 +186,7 @@ The first record of a path wins, so a file that a listing also names keeps its d
 | Observed entries in one pass | 15 000 | `E_LIMIT_EXCEEDED` |
 | File size that is hashed | 16 MiB | The entry is recorded without a SHA-256. |
 
-An entry with a control character in its name is recorded with kind `other` and a visible spelling of the name. Over a cap before the script starts, the run refuses before the record is written. Over a cap after the script, the record is written without `window` and the run exits 1.
+An entry whose name is not UTF-8 or holds a control character is recorded with kind `other` and a shown spelling of the name (a visible escape, or U+FFFD for bytes that are not UTF-8), which can name another file. Over a cap before the script starts, the run refuses before the record is written. Over a cap after the script, the record is written without `window` and the run exits 1.
 
 The record also has a size budget of 3 MiB of serialized JSON, below the 4 MiB state write cap. The entry caps alone do not bound the size, because a long path makes every entry larger.
 
@@ -198,7 +198,7 @@ The record also has a size budget of 3 MiB of serialized JSON, below the 4 MiB s
 
 ### Record fields
 
-`script` in `state/trials/<id>.json` (schema 5):
+`script` in `state/trials/<id>.json` (schema 5, or 6 with `fence`):
 
 | Field | Meaning |
 | --- | --- |
@@ -209,6 +209,7 @@ The record also has a size budget of 3 MiB of serialized JSON, below the 4 MiB s
 | `exit{code, signal}` | Exactly one is set. `signal` is `stopped` (a stop request), `timeout` or `signal`. Absent until the run ends, and absent when the script could not be started. |
 | `window[{path, change, kind, sha256, target, before}]` | One entry per difference. `change` is `created`, `modified`, `removed` or `kind-changed`. `before` describes a path observed earlier. Absent until the run ends. |
 | `binary{path, real_path, sha256}` | The installed tool, as above. |
+| `fence{dev, ino}` | The device and inode number of the run file, created after `before` and before the script starts. Set only when that file is on an APFS volume, where a new file gets a higher inode number than every older one. `purge` removes no window candidate older than the fence or on another device, and none at all from a record without it (docs/purge.md, "The inode fence"). |
 
 `unknown` holds the three package tokens and `script-downloads`, `later-self-updates`, `keychain` and `remote-effects`, and `window-truncated` when the window was shrunk. `package` is absent and `tool_preexisting` is false. `baseline.paths` and `baseline.data` are observed as for a package trial.
 
@@ -226,7 +227,7 @@ A crash, a SIGKILL or a system sleep that kills the run leaves a record with `be
 
 When several problems occur in one run, the result carries the highest-ranked code and names every problem. The order is a stop request, then `E_CONFLICT` (a tracked file changed), then the rest. After the script, dfm compares the `tracked_status` snapshot of the guarded checkouts. A change is left in place, not reverted, staged or committed (docs/upgrade.md, "Tracked files"). The sandbox should make such a change impossible, so this is a second check.
 
-The journal operation is `trial-script`. `doctor` shows an active script trial as `<tool> installed by the trial through <url>`, and adds a `binary` row that hashes the tool binary again (docs/doctor.md, "Script binaries"). `purge` refuses a script trial with `E_CONFLICT` until DFM-82. `adopt` takes it (docs/adopt.md).
+The journal operation is `trial-script`. `doctor` shows an active script trial as `<tool> installed by the trial through <url>`, and adds a `binary` row that hashes the tool binary again (docs/doctor.md, "Script binaries"). `purge` removes what the window recorded as created (docs/purge.md). `adopt` takes it (docs/adopt.md).
 
 ### Differences from the design
 
@@ -249,7 +250,7 @@ The journal operation is `trial-script`. `doctor` shows an active script trial a
 - **The window is shallow.** Top-level listings show a new or removed child, not a change inside it.
 - **The script downloads more.** What it fetches after it starts is not pinned (`script-downloads`).
 - **Fixed timeout.** One hour, with no flag.
-- **No cleanup yet.** The window lists what changed. `purge` (DFM-82) does not read it yet. `adopt` reads only its `created` entries at the top level of `~/.config`.
+- **Partial cleanup.** The window lists what changed. `purge` (DFM-82) reads it and retains what it cannot prove the trial created. `adopt` reads only its `created` entries at the top level of `~/.config`.
 
 ## Updates
 

@@ -8,14 +8,16 @@ use crate::apply_cmd::stale;
 use crate::read_fs::read_regular_bounded;
 use crate::sync_cmd::{Git, guarded_checkouts, tracked_status};
 use crate::{Ctx, read_existing_binding, state_cmd, usage};
+use dfm_engine::fsys::is_apfs;
 use dfm_engine::proc::{End, Request, Shown};
 use dfm_engine::{Layout, Runner, Store, now_ns, signal};
 use dfm_model::digest::sha256_hex;
 use dfm_model::display::{bounded_visible, visible};
 use dfm_model::plan::Binary;
 use dfm_model::state::{
-    Baseline, BaselinePath, Class, JournalEntry, Ledger, Observed, Phase, Recovery, SCHEMA,
-    ScriptExit, Stamp, Status, TRIAL_SCHEMA_SCRIPT, TrialRecord, TrialScript, rfc3339, valid_id,
+    Baseline, BaselinePath, Class, InodeFence, JournalEntry, Ledger, Observed, Phase, Recovery,
+    SCHEMA, ScriptExit, Stamp, Status, TRIAL_SCHEMA_FENCE, TRIAL_SCHEMA_SCRIPT, TrialRecord,
+    TrialScript, rfc3339, valid_id,
 };
 use dfm_model::{Code, Refusal};
 use serde_json::json;
@@ -23,7 +25,7 @@ use std::collections::BTreeSet;
 use std::ffi::OsStr;
 use std::fs;
 use std::io::{IsTerminal, Write};
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -72,6 +74,16 @@ pub(crate) fn cache_paths(cache_dir: &Path, url: &str) -> (PathBuf, PathBuf) {
 
 pub(crate) fn io_failed(path: &Path) -> impl Fn(std::io::Error) -> Refusal + '_ {
     move |e| Refusal::new(Code::IoFailed, format!("{}: {}", path.display(), e.kind()))
+}
+
+/// The inode fence of the new file `probe`, or `None` when it cannot be read or is not on an
+/// APFS volume: only APFS is known to number a new file above every older one.
+fn fence(probe: &Path) -> Option<InodeFence> {
+    let m = fs::symlink_metadata(probe).ok()?;
+    is_apfs(probe).then(|| InodeFence {
+        dev: m.dev(),
+        ino: m.ino(),
+    })
 }
 
 /// Creates `path` (mode 0600) with `body`. An existing entry, also a link, is `E_CONFLICT` and
@@ -706,6 +718,7 @@ impl Decision {
                 exit: None,
                 window: None,
                 binary: None,
+                fence: None,
             }),
         }
     }
@@ -1121,6 +1134,14 @@ pub(super) fn run(
     let drop_run_file = || {
         let _ = fs::remove_file(&run_file);
     };
+    // The run file is new (`write_private` refuses an existing entry) and made after `before`,
+    // so it is the fence probe: whatever the script creates gets a higher inode number.
+    if let Some(sc) = record.script.as_mut() {
+        sc.fence = fence(&run_file);
+        if sc.fence.is_some() {
+            record.schema = TRIAL_SCHEMA_FENCE;
+        }
+    }
     // The exclusive create makes a record another run wrote since the check above a conflict.
     match store.create_trial(&record) {
         Ok(true) => {}
