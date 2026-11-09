@@ -3515,6 +3515,38 @@ fn a_launch_agent_name_with_a_backslash_gets_no_command_to_copy() {
 }
 
 #[test]
+fn a_file_another_active_trial_links_to_is_kept() {
+    if no_sandbox() {
+        return;
+    }
+    let fx = Fx::new();
+    fx.bind_with_links();
+    fs::create_dir_all(fx.h(".local/bin")).unwrap();
+    sandboxed(&fx, "set -e\nprintf '#!/bin/sh\\n' > ~/.local/bin/tool\n");
+    // A second trial links to the first trial's file.
+    fx.script("#!/bin/sh\nln -s tool ~/.local/bin/alias\n");
+    let o = fx.approved("ship");
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+    let (preview, run) = purged(&fx);
+    let shown = text(&preview.stdout);
+    let tool = fx.h(".local/bin/tool").display().to_string();
+    assert!(
+        shown.contains(&format!("keep: remove {tool}")) && shown.contains("trial trial-ship"),
+        "{shown}"
+    );
+    assert!(
+        !shown.contains(&format!("action: remove {tool}")),
+        "{shown}"
+    );
+    assert_eq!(code(&run), 0, "{}\n{}", stderr(&run), text(&run.stdout));
+    assert!(fx.h(".local/bin/tool").is_file());
+    assert!(
+        fs::metadata(fx.h(".local/bin/alias")).is_ok(),
+        "the alias must not dangle"
+    );
+}
+
+#[test]
 fn a_window_without_an_exit_removes_no_window_candidate() {
     if no_sandbox() {
         return;

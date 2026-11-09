@@ -1269,12 +1269,31 @@ pub fn run(ctx: &Ctx, args: &Args, out: &mut dyn Write) -> Result<(), Refusal> {
                     .flat_map(|s| s.window.iter().flatten())
                     .filter(|e| e.change == "created")
                     .map(|e| e.path.clone());
+                // What that trial's links point at, as recorded and as they point now: purging
+                // this trial must not leave another trial's link dangling.
+                let targets: Vec<String> = o
+                    .script
+                    .iter()
+                    .flat_map(|s| s.window.iter().flatten())
+                    .flat_map(|e| {
+                        let link = Path::new(&e.path);
+                        let dir = link.parent().unwrap_or(link);
+                        let live = fs::read_link(link).ok();
+                        let recorded = e.target.as_deref().map(PathBuf::from);
+                        recorded.into_iter().chain(live).flat_map(move |t| {
+                            let to = dir.join(t);
+                            let r = resolved(&to).to_string_lossy().into_owned();
+                            [lexical(&to).to_string_lossy().into_owned(), r]
+                        })
+                    })
+                    .collect();
                 o.baseline
                     .paths
                     .iter()
                     .chain(&o.baseline.data)
                     .map(|b| b.path.clone())
                     .chain(created)
+                    .chain(targets)
                     .map(|p| (o.trial_id.clone(), p))
             })
             .collect();
