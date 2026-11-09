@@ -131,6 +131,39 @@ fn system_tools(runner: &Runner) -> Runner {
 /// sidecar. Only `https` is accepted, also after redirects.
 pub(crate) fn fetch(runner: &Runner, cache_dir: &Path, url: &str) -> Result<Fetched, Refusal> {
     let (file, sidecar) = cache_paths(cache_dir, url);
+    let (tmp, body, effective_url) = download(runner, cache_dir, url)?;
+    let drop_tmp = || {
+        let _ = fs::remove_file(&tmp);
+    };
+    let bytes = u64::try_from(body.len()).unwrap_or(u64::MAX);
+    let sha256 = sha256_hex(&body);
+    let private = fs::Permissions::from_mode(0o600);
+    fs::set_permissions(&tmp, private.clone())
+        .and_then(|()| fs::rename(&tmp, &file))
+        .map_err(io_failed(&file))
+        .inspect_err(|_| drop_tmp())?;
+    let side =
+        json!({"url": url, "effective_url": effective_url, "sha256": sha256, "bytes": bytes});
+    fs::write(&sidecar, side.to_string())
+        .and_then(|()| fs::set_permissions(&sidecar, private))
+        .map_err(io_failed(&sidecar))?;
+    Ok(Fetched {
+        path: file,
+        sha256,
+        bytes,
+        effective_url,
+        body,
+    })
+}
+
+/// Fetches `url` with curl into `<cache_dir>/scripts/.fetch-<pid>` and returns that file, its
+/// bytes and the URL the fetch ended at. The file is left for the caller; every refusal removes
+/// it. Only `https` is accepted, also after redirects, and at most 1 MiB.
+pub(crate) fn download(
+    runner: &Runner,
+    cache_dir: &Path,
+    url: &str,
+) -> Result<(PathBuf, Vec<u8>, String), Refusal> {
     let dir = cache_dir.join("scripts");
     fs::DirBuilder::new()
         .recursive(true)
@@ -214,29 +247,11 @@ pub(crate) fn fetch(runner: &Runner, cache_dir: &Path, url: &str) -> Result<Fetc
     }
     let body = read_regular_bounded(&tmp, MAX_SCRIPT, io_failed(&tmp), || not_regular(&tmp))
         .inspect_err(|_| drop_tmp())?;
-    let bytes = u64::try_from(body.len()).unwrap_or(u64::MAX);
-    if bytes > MAX_SCRIPT {
+    if u64::try_from(body.len()).unwrap_or(u64::MAX) > MAX_SCRIPT {
         drop_tmp();
         return Err(too_large(url));
     }
-    let sha256 = sha256_hex(&body);
-    let private = fs::Permissions::from_mode(0o600);
-    fs::set_permissions(&tmp, private.clone())
-        .and_then(|()| fs::rename(&tmp, &file))
-        .map_err(io_failed(&file))
-        .inspect_err(|_| drop_tmp())?;
-    let side =
-        json!({"url": url, "effective_url": effective_url, "sha256": sha256, "bytes": bytes});
-    fs::write(&sidecar, side.to_string())
-        .and_then(|()| fs::set_permissions(&sidecar, private))
-        .map_err(io_failed(&sidecar))?;
-    Ok(Fetched {
-        path: file,
-        sha256,
-        bytes,
-        effective_url,
-        body,
-    })
+    Ok((tmp, body, effective_url))
 }
 
 /// The cached script without a fetch. `None` when the file or the sidecar is missing.

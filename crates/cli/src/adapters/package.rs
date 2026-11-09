@@ -1249,7 +1249,7 @@ fn facts(
             return Err(stop);
         }
         let looked = if r.adapter == script::ADAPTER {
-            script::probe(runner, &r.value, scripts, update)
+            script::probe(runner, &r.id, &r.value, scripts, update)
         } else {
             look(runner, &r.adapter, &r.value)
         };

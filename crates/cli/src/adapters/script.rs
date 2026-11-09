@@ -7,8 +7,8 @@
 use crate::sync_cmd::{Git, guarded_checkouts, tracked_status};
 use crate::trial_cmd::FIXED_ENV;
 use crate::trial_cmd::script::{
-    Confined, account_login_shell, cache_paths, cached, ended, fetch, io_failed, profile,
-    protected, ranked, sandbox_exec, script_env, tracked_changes, write_private,
+    Confined, account_login_shell, download, ended, io_failed, profile, protected, ranked,
+    sandbox_exec, script_env, tracked_changes, write_private,
 };
 use crate::{Ctx, state_cmd};
 use dfm_engine::{Layout, Runner, Store, Sys};
@@ -19,9 +19,11 @@ use dfm_model::plan::PackageState;
 use dfm_model::resolve::Value;
 use dfm_model::state::{SHELLS, valid_path};
 use dfm_model::{Code, Refusal};
+use std::collections::BTreeMap;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 pub const ADAPTER: &str = "script/v1";
 
@@ -135,22 +137,42 @@ pub(crate) fn declared(value: &Value) -> Result<Declared, Refusal> {
     })
 }
 
-/// What a script install needs besides the runner: the layout, the bound checkout the guard
-/// watches, and git for that guard. The grants and the ledger are read when needed.
+/// What a script probe and install need besides the runner: the layout, the bound checkout the
+/// guard watches, and git for that guard. The grants and the ledger are read when needed.
+/// Only the engine's context (`for_install`) fetches; a plan, a preview and `doctor` stay
+/// offline and write nothing.
 pub(crate) struct ScriptCx {
     layout: Layout,
     sys: Sys,
     git: Git,
     root: PathBuf,
+    /// The fetched scripts of this run by resource id, set by the probe under the writer lock
+    /// and taken by the install. `None` once taken, so the postcondition probe never fetches.
+    staged: Option<Mutex<BTreeMap<String, Option<Staged>>>>,
+}
+
+/// A script the locked probe fetched and checked, held in memory until the install runs it.
+struct Staged {
+    body: Vec<u8>,
 }
 
 impl ScriptCx {
+    /// The context of a plan or of `doctor`: grants are read, nothing is fetched.
     pub(crate) fn new(ctx: &Ctx, sys: &Sys, root: &Path) -> ScriptCx {
         ScriptCx {
             layout: ctx.layout(),
             sys: *sys,
             git: Git::new(ctx, sys),
             root: root.to_path_buf(),
+            staged: None,
+        }
+    }
+
+    /// The engine's context under the writer lock: its pre-install probe fetches.
+    pub(crate) fn for_install(ctx: &Ctx, sys: &Sys, root: &Path) -> ScriptCx {
+        ScriptCx {
+            staged: Some(Mutex::new(BTreeMap::new())),
+            ..ScriptCx::new(ctx, sys, root)
         }
     }
 
@@ -159,11 +181,26 @@ impl ScriptCx {
         Store::open_read(self.sys, &self.layout, state_cmd::fail_from_env()?)?
             .ok_or_else(crate::state_lost_refusal)
     }
+
+    fn staged(
+        &self,
+    ) -> Result<std::sync::MutexGuard<'_, BTreeMap<String, Option<Staged>>>, Refusal> {
+        self.staged
+            .as_ref()
+            .ok_or_else(|| {
+                Refusal::new(
+                    Code::GeneratorUnavailable,
+                    "a script install runs only from the engine under the writer lock",
+                )
+            })?
+            .lock()
+            .map_err(|_| Refusal::new(Code::IoFailed, "the staged script table is poisoned"))
+    }
 }
 
-/// A regular file with an execute bit at `path`, through links.
+/// A regular file with the owner's execute bit at `path`, through links.
 fn executable(path: &Path) -> bool {
-    fs::metadata(path).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+    fs::metadata(path).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o100 != 0)
 }
 
 fn redirected(d: &Declared, got: &str) -> String {
@@ -175,20 +212,22 @@ fn redirected(d: &Declared, got: &str) -> String {
     )
 }
 
-/// The installed state. A present binary is `Installed` (`Held` for `packages --update`: the
-/// tool owns its upgrades) and nothing is fetched. A missing one is `Ungranted` without a
-/// grant, and otherwise the script is fetched into the cache with the trial's curl rule: a fetch
-/// that ends anywhere but at the declared effective URL is `Unofficial`. Without `cx` (doctor)
-/// nothing is fetched and a missing binary is `Missing`.
+/// The installed state of resource `id`. A present binary is `Installed` (`Held` for
+/// `packages --update`: the tool owns its upgrades). A missing one is `Ungranted` without a
+/// grant, else `Missing`. Only the engine's probe before the install (`for_install`, first call
+/// for `id`) fetches: with the trial's curl rule into memory, with no cache entry. A fetch that
+/// fails the `https` check or ends anywhere but at the declared effective URL is `Unofficial`,
+/// which the engine reports as a blocked, stale plan. Without `cx` nothing is read but the
+/// binary.
 pub(crate) fn probe(
     runner: &Runner,
+    id: &str,
     value: &Value,
     cx: Option<&ScriptCx>,
     update: bool,
 ) -> Result<PackageState, Refusal> {
     let d = declared(value)?;
-    let bin = runner.home.join(&d.binary);
-    if executable(&bin) {
+    if executable(&runner.home.join(&d.binary)) {
         return Ok(if update {
             PackageState::Held("the tool owns its upgrades; dfm never runs its script again".into())
         } else {
@@ -201,23 +240,20 @@ pub(crate) fn probe(
     if !cx.store()?.read_grants()?.trusts(&d.identity()) {
         return Ok(PackageState::Ungranted(d.identity()));
     }
-    let f = match fetch(runner, &cx.layout.cache_dir, &d.url) {
-        Ok(f) => f,
+    if cx.staged.is_none() || cx.staged()?.contains_key(id) {
+        return Ok(PackageState::Missing(Vec::new()));
+    }
+    let (tmp, body, effective_url) = match download(runner, &cx.layout.cache_dir, &d.url) {
+        Ok(got) => got,
         Err(e) if e.code == Code::SourceUntrusted => return Ok(PackageState::Unofficial(e.detail)),
         Err(e) => return Err(e),
     };
-    if f.effective_url != d.effective_url {
-        drop_cache(&cx.layout.cache_dir, &d.url);
-        return Ok(PackageState::Unofficial(redirected(&d, &f.effective_url)));
+    fs::remove_file(&tmp).map_err(io_failed(&tmp))?;
+    if effective_url != d.effective_url {
+        return Ok(PackageState::Unofficial(redirected(&d, &effective_url)));
     }
+    cx.staged()?.insert(id.to_string(), Some(Staged { body }));
     Ok(PackageState::Missing(Vec::new()))
-}
-
-fn drop_cache(cache_dir: &Path, url: &str) {
-    let (file, sidecar) = cache_paths(cache_dir, url);
-    for p in [file, sidecar] {
-        let _ = fs::remove_file(p);
-    }
 }
 
 /// Runs the declared script for a missing binary (docs/packages.md, "Script declarations"). It
@@ -226,8 +262,27 @@ fn drop_cache(cache_dir: &Path, url: &str) {
 /// (stdin is `/dev/null`, so a prompt fails), in a fresh work directory. A tracked file the
 /// script changed fails the install and stays in place. The caller probes again: the binary
 /// must then exist and be executable.
-pub(crate) fn install(runner: &Runner, value: &Value, cx: &ScriptCx) -> Result<(), Refusal> {
+pub(crate) fn install(
+    runner: &Runner,
+    id: &str,
+    value: &Value,
+    cx: &ScriptCx,
+) -> Result<(), Refusal> {
     let d = declared(value)?;
+    // Taken, not removed: the postcondition probe then checks the binary without a fetch.
+    let staged = cx
+        .staged()?
+        .get_mut(id)
+        .and_then(Option::take)
+        .ok_or_else(|| {
+            Refusal::new(
+                Code::PlanStale,
+                format!(
+                    "no checked fetch of {} under the lock; nothing was run. Fix: run sync again",
+                    visible(&d.url)
+                ),
+            )
+        })?;
     let store = cx.store()?;
     if !store.read_grants()?.trusts(&d.identity()) {
         return Err(Refusal::new(
@@ -237,23 +292,6 @@ pub(crate) fn install(runner: &Runner, value: &Value, cx: &ScriptCx) -> Result<(
                 visible(&d.url),
                 trust_command(&d.identity())
             ),
-        ));
-    }
-    let cache_dir = &cx.layout.cache_dir;
-    let f = cached(cache_dir, &d.url)?.ok_or_else(|| {
-        Refusal::new(
-            Code::PlanStale,
-            format!(
-                "the script cache for {} is missing; nothing was run. Fix: run sync again",
-                visible(&d.url)
-            ),
-        )
-    })?;
-    if f.effective_url != d.effective_url {
-        drop_cache(cache_dir, &d.url);
-        return Err(Refusal::new(
-            Code::SourceUntrusted,
-            redirected(&d, &f.effective_url),
         ));
     }
     let dfm_env: Vec<(String, String)> = std::env::vars_os()
@@ -275,8 +313,13 @@ pub(crate) fn install(runner: &Runner, value: &Value, cx: &ScriptCx) -> Result<(
         &sha256_hex(d.url.as_bytes())[..16],
         std::process::id()
     );
-    let run_file = cache_dir.join("scripts").join(format!("run-sync-{tag}"));
-    write_private(&run_file, &f.body)?;
+    // A private copy, never the trial's URL-keyed cache entry.
+    let run_file = cx
+        .layout
+        .cache_dir
+        .join("scripts")
+        .join(format!("run-sync-{tag}"));
+    write_private(&run_file, &staged.body)?;
     let work = temp.join(format!("dfm-sync-{tag}"));
     let mut made = false;
     let end = Confined {
@@ -307,13 +350,10 @@ pub(crate) fn install(runner: &Runner, value: &Value, cx: &ScriptCx) -> Result<(
             ),
         )),
     }
-    let (cache_file, sidecar) = cache_paths(cache_dir, &d.url);
-    for p in [cache_file, sidecar, run_file] {
-        if let Err(e) = fs::remove_file(&p)
-            && e.kind() != std::io::ErrorKind::NotFound
-        {
-            problems.push(io_failed(&p)(e));
-        }
+    if let Err(e) = fs::remove_file(&run_file)
+        && e.kind() != std::io::ErrorKind::NotFound
+    {
+        problems.push(io_failed(&run_file)(e));
     }
     if made
         && let Err(e) = fs::remove_dir_all(&work)

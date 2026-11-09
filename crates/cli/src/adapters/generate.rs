@@ -273,7 +273,13 @@ impl Generator for Generators<'_> {
             })?;
         if op.adapter == script::ADAPTER {
             let update = op.action == Action::Upgrade;
-            script::probe(runner, self.value(op)?, self.scripts.as_ref(), update)
+            script::probe(
+                runner,
+                &op.resource,
+                self.value(op)?,
+                self.scripts.as_ref(),
+                update,
+            )
         } else if op.action == Action::Upgrade {
             package::maintain(runner, &op.adapter, self.value(op)?)
         } else {
@@ -299,7 +305,7 @@ impl Generator for Generators<'_> {
                     format!("no script installer for {}", op.adapter),
                 )
             })?;
-            script::install(runner, self.value(op)?, cx)
+            script::install(runner, &op.resource, self.value(op)?, cx)
         } else if op.action == Action::Upgrade {
             package::upgrade(runner, &op.adapter, self.value(op)?)
         } else {

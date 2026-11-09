@@ -517,7 +517,7 @@ pub(crate) fn generators_for<'a>(
             &loaded.root,
             ctx.runner(sys),
         )
-        .with_scripts(ScriptCx::new(ctx, sys, &loaded.root)),
+        .with_scripts(ScriptCx::for_install(ctx, sys, &loaded.root)),
         Scope::Secrets | Scope::Services => Generators::with_runner(
             &loaded.resolved,
             &loaded.sources,

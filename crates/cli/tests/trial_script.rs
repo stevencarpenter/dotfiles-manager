@@ -1034,6 +1034,14 @@ fn a_killed_run_leaves_the_record_without_a_window_and_an_open_intent() {
     let s = &rec["script"];
     assert!(!s["before"].as_array().unwrap().is_empty(), "{rec:#}");
     assert!(s["window"].is_null() && s["exit"].is_null(), "{rec:#}");
+    // Without a window, what the run changed is unknown: adopt refuses the record.
+    let o = fx.run(&["adopt", "trial-boat", "--module", "extra", "--preview"]);
+    assert_eq!(code(&o), 3, "{}\n{}", stderr(&o), text(&o.stdout));
+    let e = stderr(&o);
+    assert!(
+        e.contains("E_CONFLICT") && e.contains("has no window"),
+        "{e}"
+    );
     let entries: Vec<serde_json::Value> = fx
         .journal()
         .into_iter()
@@ -1559,6 +1567,27 @@ impl Fx {
     fn packages(&self, extra: &[&str]) -> Output {
         self.run(&[&["packages"], extra].concat())
     }
+
+    /// Every entry of the script cache directory: an install leaves none behind.
+    fn cache_entries(&self) -> Vec<String> {
+        fs::read_dir(self.scripts())
+            .map(|d| {
+                d.map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn clear_log(&self) {
+        fs::write(self.fake.path().join("log"), "").unwrap();
+    }
+
+    fn curls(&self) -> usize {
+        self.log()
+            .lines()
+            .filter(|l| l.starts_with("curl "))
+            .count()
+    }
 }
 
 #[test]
@@ -1730,14 +1759,24 @@ fn packages_install_a_missing_declared_tool_only_with_the_grant() {
         "{g:#}"
     );
     assert!(g["packages"].is_null(), "{g:#}");
-    // With the grant: the install runs the script under the sandbox, without a terminal. The
-    // adopted `~/.config/ascii/config` is now a dfm link, which the sandbox denies: a script
-    // that writes it fails its row and the repo copy stays as adopted.
+    // With the grant the preview plans the install offline: no fetch, no cache entry.
+    fx.clear_log();
     let o = fx.packages(&["--preview"]);
+    let t = text(&o.stdout);
+    assert_eq!(code(&o), 0, "{}\n{t}", stderr(&o));
+    assert!(t.contains("planned extra.boat@package"), "{t}");
+    assert_eq!(fx.curls(), 0, "{}", fx.log());
+    assert_eq!(fx.cache_entries(), Vec::<String>::new());
+    // The approved run fetches once under the lock and runs the script under the sandbox,
+    // without a terminal. The adopted `~/.config/ascii/config` is now a dfm link, which the
+    // sandbox denies: a script that writes it fails its row and the repo copy stays as adopted.
+    // The failed install fetches nothing more and leaves no cache entry.
     let o = fx.packages(&["--yes-plan", &digest_of(&o)]);
     let t = text(&o.stdout);
     assert_eq!(code(&o), 1, "{}\n{t}", stderr(&o));
     assert!(t.contains("failed extra.boat@package"), "{t}");
+    assert_eq!(fx.curls(), 1, "{}", fx.log());
+    assert_eq!(fx.cache_entries(), Vec::<String>::new());
     assert!(
         stderr(&o).contains("Operation not permitted"),
         "{}",
@@ -1764,8 +1803,8 @@ fn packages_install_a_missing_declared_tool_only_with_the_grant() {
         "{log}"
     );
     assert!(log.contains("(deny process-exec"), "{log}");
-    assert_eq!(run_files(&fx), Vec::<String>::new());
-    assert!(!fx.cached().exists());
+    assert_eq!(fx.curls(), 1, "{log}");
+    assert_eq!(fx.cache_entries(), Vec::<String>::new());
     // The next run finds the binary: current, and the script does not run again.
     fs::write(fx.fake.path().join("log"), "").unwrap();
     let o = fx.packages(&["--preview"]);
@@ -1792,27 +1831,83 @@ fn a_redirect_to_another_url_blocks_and_a_prompt_fails_the_install() {
     fx.remove_tool();
     fx.grant();
     fx.marker("curl-effective", "https://mirror.invalid/install");
+    // The preview is offline: it cannot see the redirect, and it fetches and writes nothing.
+    fx.clear_log();
     let o = fx.packages(&["--preview"]);
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+    assert_eq!(fx.curls(), 0, "{}", fx.log());
+    assert_eq!(fx.cache_entries(), Vec::<String>::new());
+    // The fetch under the lock ends elsewhere: the row is blocked and names both URLs.
+    let o = fx.packages(&["--yes-plan", &digest_of(&o)]);
     let t = format!("{}{}", text(&o.stdout), stderr(&o));
-    assert_eq!(code(&o), 3, "{t}");
-    assert!(t.contains("E_SOURCE_UNTRUSTED"), "{t}");
+    assert_ne!(code(&o), 0, "{t}");
+    assert!(t.contains("blocked extra.boat@package"), "{t}");
     assert!(
         t.contains(&format!(
             "the script {URL} now ends at https://mirror.invalid/install, not at the declared effective URL {URL}"
         )),
         "{t}"
     );
-    assert!(!fx.cached().exists());
+    assert_eq!(fx.curls(), 1, "{}", fx.log());
+    assert!(!fx.log().contains("run-sync-"), "{}", fx.log());
+    assert_eq!(fx.cache_entries(), Vec::<String>::new());
     // The declared URL again, but the script now asks a question: the install fails.
     fs::remove_file(fx.fake.path().join("curl-effective")).unwrap();
     let rest = BARE.strip_prefix("#!/bin/sh\nset -e\n").unwrap();
     fx.script(format!("#!/bin/sh\nset -e\nread answer < /dev/tty\n{rest}"));
     let o = fx.packages(&["--preview"]);
     assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+    fx.clear_log();
     let o = fx.packages(&["--yes-plan", &digest_of(&o)]);
     let t = text(&o.stdout);
     assert_eq!(code(&o), 1, "{}\n{t}", stderr(&o));
     assert!(t.contains("failed extra.boat@package"), "{t}");
     assert!(!fx.h(".local/bin/boat").exists());
-    assert_eq!(run_files(&fx), Vec::<String>::new());
+    assert_eq!(fx.curls(), 1, "{}", fx.log());
+    assert_eq!(fx.cache_entries(), Vec::<String>::new());
+}
+
+#[test]
+fn doctor_names_the_grant_a_declared_missing_tool_needs() {
+    if no_sandbox() {
+        return;
+    }
+    let fx = Fx::new();
+    fx.bind_with_links();
+    fx.script_trial(BARE, &[]);
+    let (_, o) = fx.adopt();
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+    fx.remove_tool();
+    // Doctor probes only from an existing private provider directory; a packages run makes it.
+    let _ = fx.packages(&["--preview"]);
+    fx.clear_log();
+    let row = |fx: &Fx| {
+        let o = fx.run(&["doctor", "--json"]);
+        let v: serde_json::Value = serde_json::from_slice(&o.stdout)
+            .unwrap_or_else(|e| panic!("{e}\n{}\n{}", text(&o.stdout), stderr(&o)));
+        v["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| {
+                r["subject"]
+                    .as_str()
+                    .is_some_and(|s| s.contains("extra.boat"))
+            })
+            .unwrap_or_else(|| panic!("no boat row in {v:#}"))
+            .clone()
+    };
+    let r = row(&fx);
+    assert_eq!(r["code"], "E_SOURCE_UNTRUSTED", "{r:#}");
+    assert!(
+        r["fix"]
+            .as_str()
+            .unwrap()
+            .contains(&format!("dfm sync --trust-origin 'script:{URL}'")),
+        "{r:#}"
+    );
+    fx.grant();
+    let r = row(&fx);
+    assert_eq!(r["code"], "D_PLAN_PENDING", "{r:#}");
+    assert_eq!(fx.curls(), 0, "{}", fx.log());
 }

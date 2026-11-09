@@ -125,25 +125,24 @@ The probe and the install:
 
 | State | When | Plan row |
 | --- | --- | --- |
-| `Installed` | `~/<binary>` is a regular file with an execute bit, through links. Nothing is fetched or run. | `current` |
+| `Installed` | `~/<binary>` is a regular file with the owner's execute bit, through links. Nothing is fetched or run. | `current` |
 | `Held` | The same, under `packages --update`: the tool owns its upgrades. | `held` |
 | `Ungranted` | The binary is missing and `state/grants.json` has no `script:<url>` grant (docs/sync.md, "Source identities"). Nothing is fetched. | `blocked`, `E_SOURCE_UNTRUSTED`, fix `dfm sync --trust-origin 'script:<url>'` |
-| `Unofficial` | The binary is missing, the grant exists, and the fetch (the trial's curl rule: `-q`, `https` only also after redirects, 1 MiB, `/usr/bin` first) ends at another URL than `effective_url`, or fails the `https` check. The fetched bytes are removed. | `blocked`, `E_SOURCE_UNTRUSTED`, naming both URLs |
-| `Missing` | The binary is missing, the grant exists, and the fetch ends at `effective_url`. The bytes stay in the script cache. | `install`, planned |
+| `Missing` | The binary is missing and the grant exists. A plan, a preview and `doctor` fetch nothing and write nothing. | `install`, planned (`doctor`: `D_PLAN_PENDING`) |
 
-The install runs under the writer lock after the engine's probe, which fetched the script again:
+Only the approved run fetches, once, under the writer lock. The engine's probe before the install runs the trial's curl rule (`-q`, `https` only also after redirects, 1 MiB, `/usr/bin` first) and keeps the bytes in memory; the temporary download is removed and the trial's URL-keyed cache entry is never read or written. A fetch that fails the `https` check or ends at another URL than `effective_url` is `Unofficial`: the engine blocks the row as a stale plan (`E_PLAN_STALE`), the detail names both URLs, and nothing runs. Otherwise the install runs:
 
-1. The grant is checked again, and the cached bytes must match their sidecar and end at `effective_url`.
+1. The fetched bytes of this run are taken (the postcondition probe then only checks the binary), and the grant is checked again.
 2. The environment is the trial's rule (docs/trial.md, "The script's environment") with the declared `env`, without `TERM`.
 3. The sandbox profile is the trial's, from the ledger as it is now, and `sandbox-exec` passes its dry run.
 4. The tracked-file guard takes its snapshot of the bound checkout and its nested checkouts.
 5. `/bin/<shell>` runs a private copy of the bytes (`<cache>/scripts/run-sync-<url hash>-<pid>`) with `args`, in a fresh directory under `TMPDIR`, without a terminal: standard input is `/dev/null` in a new session, so a script that reads `/dev/tty` fails. The limit is one hour.
-6. A nonzero exit, a signal or a tracked change fails the row. The run copy, the cache entry and the work directory are removed in every case.
+6. A nonzero exit, a signal or a tracked change fails the row. The run copy and the work directory are removed in every case.
 7. The engine probes again: the binary must exist and be executable, else the row is `failed`.
 
 The install writes no trial record. The journal intent and outcome and the receipt row are the packages scope's own (see "One operation"). The script's output is inherited, as in the trial. A write to a path the sandbox denies (a dfm link, an adopted configuration file, the dotfiles checkout) fails the script, and the row fails.
 
-`doctor` fetches nothing: a missing binary is a `PlanPending` row, "Run dfm sync, which installs it".
+`doctor` reads `grants.json` and fetches nothing: a missing binary without a grant is an `E_SOURCE_UNTRUSTED` row whose fix is the `--trust-origin` command, and with a grant a `D_PLAN_PENDING` row, "Run dfm sync, which installs it".
 
 ## One operation
 
@@ -175,6 +174,6 @@ The install writes no trial record. The journal intent and outcome and the recei
 - **Dependency freshness.** `brew outdated` compares with Homebrew's local formula data. With auto-update off, a dependency is outdated only relative to the last `brew update` the owner ran.
 - **No update here.** The packages scope leaves an installed package at its installed version. `packages --update` (docs/toolchains.md) upgrades rolling mise and uv tools. `dfm sync` runs the profile's declared updaters after the scopes, `brew` among them, which upgrades every outdated formula and cask (docs/upgrade.md).
 - **Signals.** A stop request during an install ends the provider. A half-installed package is the provider's state. The operation is `failed`, and the next run probes again. A stop that cuts off the postcondition probe is reported as the stop (exit 130 or 143), and the journal says the install may have completed. A stop seen right after the pre-install probe starts nothing.
-- **Script fetches.** A missing `script/v1` binary is fetched at each probe: the plan, the plan under the lock and the engine's probe before the install, three fetches in one run. Only a missing binary is fetched. The approved digest does not cover the script bytes: the grant is the trust, and the install runs the bytes the probe under the lock fetched.
+- **Script bytes.** The approved digest does not cover the script bytes, and a preview cannot see a redirect: the grant is the trust, and the redirect check runs on the one fetch under the lock, whose bytes the install runs.
 - **Script ledger snapshot.** The install builds the sandbox profile from the ledger as it reads before the install. A link that the configuration scope of the same `sync` records is in the bound checkout, which the profile denies as a tree.
-- **Evidence scope.** Tests use the `test-isolation` build and `brew`, `mise` and `dpkg-query` look-alikes (`crates/cli/tests/packages.rs`); the `uv` look-alike is in `crates/cli/tests/toolchains.rs`. No test runs a real install.
+- **Evidence scope.** Tests use the `test-isolation` build and `brew`, `mise` and `dpkg-query` look-alikes (`crates/cli/tests/packages.rs`); the `uv` look-alike is in `crates/cli/tests/toolchains.rs`. The `script/v1` tests use the `curl` look-alike and the real `sandbox-exec` (`crates/cli/tests/trial_script.rs` through `packages`, and one `dfm sync` test in `crates/cli/tests/sync.rs`). No test runs a real install.
