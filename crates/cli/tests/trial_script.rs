@@ -3373,3 +3373,46 @@ fn an_inexact_window_name_keeps_every_created_directory() {
     assert_eq!(fs::read_to_string(fx.h(".boat/f")).unwrap(), "x\n");
     assert!(gone(&fx.h(".local/bin/boat")));
 }
+
+#[test]
+fn a_same_length_rewrite_in_a_created_directory_is_stale() {
+    if no_sandbox() {
+        return;
+    }
+    let fx = Fx::new();
+    fx.bind_with_links();
+    sandboxed(&fx, "set -e\nmkdir ~/.boat\necho x > ~/.boat/f\n");
+    // After the preview: same path, kind and size, other bytes.
+    let preview = fx.run(&["purge", "trial-boat", "--preview"]);
+    assert_eq!(code(&preview), 0, "{}", stderr(&preview));
+    fs::write(fx.h(".boat/f"), "y\n").unwrap();
+    let o = fx.run(&["purge", "trial-boat", "--yes-plan", &digest_of(&preview)]);
+    assert_eq!(code(&o), 3, "{}\n{}", stderr(&o), text(&o.stdout));
+    assert!(stderr(&o).contains("E_PLAN_STALE"), "{}", stderr(&o));
+    assert_eq!(fs::read_to_string(fx.h(".boat/f")).unwrap(), "y\n");
+    // The same rewrite after the locked decision, just before the removal.
+    let preview = fx.run(&["purge", "trial-boat", "--preview"]);
+    let gate = fx.fake.path().join("go");
+    let child = fx
+        .command(&["purge", "trial-boat", "--yes-plan", &digest_of(&preview)])
+        .env(
+            "DFM_FAILPOINT",
+            format!("purge-remove:wait-{}", gate.display()),
+        )
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let reached = gate.with_extension("reached");
+    let started = Instant::now();
+    while !reached.exists() {
+        assert!(started.elapsed() < Duration::from_secs(30), "not reached");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    fs::write(fx.h(".boat/f"), "z\n").unwrap();
+    fs::write(&gate, "").unwrap();
+    let o = child.wait_with_output().unwrap();
+    assert_ne!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+    assert!(stderr(&o).contains("E_PLAN_STALE"), "{}", stderr(&o));
+    assert_eq!(fs::read_to_string(fx.h(".boat/f")).unwrap(), "z\n");
+}

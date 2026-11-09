@@ -286,8 +286,8 @@ fn unremovable(m: &fs::Metadata, uid: u32) -> Option<String> {
     }
 }
 
-/// The tree below `dir`: entries, bytes and a fingerprint of every relative path, kind and size,
-/// without following a link. `Ok(Err(reason))` when the tree cannot be removed whole: more than
+/// The tree below `dir`: entries, bytes and a fingerprint of every relative path, kind, size,
+/// inode and ctime, without following a link. `Ok(Err(reason))` when the tree cannot be removed whole: more than
 /// [`MAX_ENTRIES`] entries, a name that is not UTF-8, or a directory [`unremovable`] refuses.
 fn tree(dir: &Path, uid: u32) -> std::io::Result<Result<(usize, u64, String), String>> {
     tree_capped(dir, uid, MAX_TREE_LIST_BYTES)
@@ -328,7 +328,15 @@ fn tree_capped(
             } else {
                 "o"
             };
-            let line = format!("{rel}\t{kind}\t{}", m.len());
+            // The inode and ctime catch a rewrite of the same length: every content write
+            // sets ctime, and no user call can set it back.
+            let line = format!(
+                "{rel}\t{kind}\t{}\t{}\t{}.{}",
+                m.len(),
+                m.ino(),
+                m.ctime(),
+                m.ctime_nsec()
+            );
             listed += line.len();
             lines.push(line);
             if lines.len() > MAX_ENTRIES {
