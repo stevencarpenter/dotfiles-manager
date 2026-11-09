@@ -5,8 +5,9 @@ name: Contract checks
 # - pull request: every step in parallel jobs; the Rust jobs run only when a Rust input
 #   changed, the network install tests only when a bootstrap input changed
 # - push to main: the whole gate
-# Every macOS job restores the cargo dependency cache and the first to finish saves it, so a
-# second push to the same pull request builds only the workspace crates.
+# Compile once: the `build` job compiles every test binary into one cargo-nextest archive with the
+# cargo dependency cache; the test and install jobs download it and run one partition each
+# without compiling. The style job keeps its own cache (clippy builds check metadata only).
 # Branch protection requires the `gate` job, which fails when any job failed or was cancelled.
 # Every job runs scripts/check_all.sh so the hook, `just check` and CI stay one script.
 
@@ -102,25 +103,68 @@ jobs:
       - name: Check Rust style (fmt, clippy)
         run: bash scripts/check_all.sh rust-style
 
-  tests:
-    name: rust tests (${{ matrix.shard }})
+  build:
+    # Compiles every test binary once; the test and install jobs run this archive.
+    name: rust test build
     needs: changes
+    if: needs.changes.outputs.rust == 'true'
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install the pinned Rust toolchain
+        run: |
+          pin=$(sed -n 's/^channel = "\(.*\)"$/\1/p' rust-toolchain.toml)
+          rustup toolchain install "$pin" --profile minimal
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: tests
+
+      # Pinned release binary, checked against the digest recorded here before it runs. It travels
+      # to the test jobs in the artifact, so it is downloaded and checked once per run.
+      - name: Install cargo-nextest 0.9.148
+        env:
+          VERSION: 0.9.148
+          SHA256: 6c23b7fb4ca82c571fc8dfedbab45bfa773d45918f933170c85d21cd7f4b852b
+        run: |
+          mkdir -p "$RUNNER_TEMP/ci"
+          curl -fsSL --proto '=https' -o "$RUNNER_TEMP/nextest.tar.gz" \
+            "https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-$VERSION/cargo-nextest-$VERSION-universal-apple-darwin.tar.gz"
+          echo "$SHA256  $RUNNER_TEMP/nextest.tar.gz" | shasum -a 256 -c -
+          tar -xzf "$RUNNER_TEMP/nextest.tar.gz" -C "$RUNNER_TEMP/ci" cargo-nextest
+          echo "$RUNNER_TEMP/ci" >> "$GITHUB_PATH"
+
+      - name: Build the test archive and run the doc tests
+        env:
+          DFM_TEST_ARCHIVE: ${{ runner.temp }}/ci/tests.tar.zst
+        run: bash scripts/check_all.sh rust-archive
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: test-archive
+          path: |
+            ${{ runner.temp }}/ci/tests.tar.zst
+            ${{ runner.temp }}/ci/cargo-nextest
+          retention-days: 1
+          if-no-files-found: error
+          # The archive is zstd already.
+          compression-level: 0
+
+  tests:
+    name: rust tests (${{ matrix.partition }}/4)
+    needs: [changes, build]
     if: needs.changes.outputs.rust == 'true'
     runs-on: macos-latest
     strategy:
       fail-fast: false
       matrix:
-        # Balanced by measured run time (about 15 s for libs, 45 s per cli shard).
-        # The gate test `every_cli_test_target_is_in_one_ci_shard` keeps this list complete.
-        include:
-          - shard: libs
-            select: -p dfm-model -p dfm-engine -p dfm-platform-macos --features dfm-engine/failpoints
-          - shard: cli-1
-            select: -p dfm-cli --features test-isolation --lib --bins --test gate --test bootstrap --test doctor --test cli --test explain --test module_doc --test authoring --test workflows
-          - shard: cli-2
-            select: -p dfm-cli --features test-isolation --test build_controls --test sync --test planner --test runner --test trial --test trial_script --test adopt
-          - shard: cli-3
-            select: -p dfm-cli --features test-isolation --test merge --test codex_hooks --test omlx --test apply --test source_roots --test state --test packages --test services --test resolver --test toolchains --test secrets --test native_config
+        # nextest `count` partitions deal the tests of each binary round-robin, so every
+        # partition gets an equal share of each slow binary. The gate test
+        # `every_cli_test_target_is_in_one_ci_shard` checks that the list is 1 to the total.
+        partition: [1, 2, 3, 4]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -131,38 +175,37 @@ jobs:
           pin=$(sed -n 's/^channel = "\(.*\)"$/\1/p' rust-toolchain.toml)
           rustup toolchain install "$pin" --profile minimal
 
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
-          shared-key: tests
+          name: test-archive
+          path: ${{ runner.temp }}/ci
+
+      # The gate tests run cargo metadata, tree and a release build offline; they need the sources.
+      - name: Fetch the locked crate sources and put cargo-nextest on PATH
+        run: |
+          cargo fetch --locked
+          chmod +x "$RUNNER_TEMP/ci/cargo-nextest"
+          echo "$RUNNER_TEMP/ci" >> "$GITHUB_PATH"
 
       - name: Run implementation tests
         env:
-          DFM_TEST_SELECT: ${{ matrix.select }}
+          DFM_TEST_ARCHIVE: ${{ runner.temp }}/ci/tests.tar.zst
+          DFM_TEST_PARTITION: count:${{ matrix.partition }}/4
           DFM_SKIP_NETWORK_TESTS: "1"
         run: bash scripts/check_all.sh rust-tests
 
   install:
-    name: network install tests (${{ matrix.shard }})
-    needs: changes
+    name: network install tests (${{ matrix.partition }}/5)
+    needs: [changes, build]
     if: needs.changes.outputs.bootstrap == 'true'
     runs-on: macos-latest
     strategy:
       fail-fast: false
       matrix:
-        # Each test builds the manager in release mode (about 3 minutes on the 3-core runner), so
-        # at most three tests per job. The gate test `every_ignored_test_is_in_one_install_shard`
-        # keeps this list complete.
-        include:
-          - shard: 1
-            names: isolated_install_invocation_and_clean_removal a_new_binary_that_cannot_read_the_existing_binding_does_not_become_current a_foreign_dotfiles_manager_new_in_the_bin_directory_is_never_removed
-          - shard: 2
-            names: a_swap_that_did_not_take_effect_is_not_reported_as_done the_binding_is_checked_again_immediately_before_the_copy a_symlinked_version_directory_or_staged_binary_is_not_written_through
-          - shard: 3
-            names: the_binding_is_checked_again_just_before_the_swap the_data_directories_are_checked_again_before_the_late_removals the_command_path_and_current_are_checked_again_just_before_the_swap
-          - shard: 4
-            names: the_command_link_is_staged_before_current_flips upgrade_retries_after_a_stale_current_new_and_rolls_back install_retires_the_old_command_link_and_keeps_a_foreign_one
-          - shard: 5
-            names: a_new_binary_that_cannot_read_the_existing_state_does_not_become_current
+        # Each test builds the manager in release mode through bootstrap.sh (about 3 minutes on
+        # the 3-core runner), so at most three tests per job: 13 tests in 5 partitions. The gate
+        # test `every_ignored_test_is_in_one_install_shard` checks that the list is 1 to the total.
+        partition: [1, 2, 3, 4, 5]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -173,18 +216,27 @@ jobs:
           pin=$(sed -n 's/^channel = "\(.*\)"$/\1/p' rust-toolchain.toml)
           rustup toolchain install "$pin" --profile minimal
 
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
-          shared-key: tests
+          name: test-archive
+          path: ${{ runner.temp }}/ci
+
+      # The gate tests run cargo metadata, tree and a release build offline; they need the sources.
+      - name: Fetch the locked crate sources and put cargo-nextest on PATH
+        run: |
+          cargo fetch --locked
+          chmod +x "$RUNNER_TEMP/ci/cargo-nextest"
+          echo "$RUNNER_TEMP/ci" >> "$GITHUB_PATH"
 
       - name: Run the network install tests
         env:
-          DFM_NETWORK_TESTS: ${{ matrix.names }}
+          DFM_TEST_ARCHIVE: ${{ runner.temp }}/ci/tests.tar.zst
+          DFM_TEST_PARTITION: count:${{ matrix.partition }}/5
         run: bash scripts/check_all.sh network-tests
 
   gate:
     # The one required status check. Skipped jobs pass; failed or cancelled jobs fail it.
-    needs: [changes, fast, style, tests, install]
+    needs: [changes, fast, style, build, tests, install]
     if: always()
     runs-on: ubuntu-latest
     steps:

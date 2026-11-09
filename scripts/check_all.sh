@@ -2,7 +2,8 @@
 # The single shared gate: pre-commit hook, `just check` and hosted CI all run this.
 # Usage: check_all.sh [step ...]
 #   steps: fixtures scripts rust-style rust-tests network-tests (default: the first four;
-#   rust-tests runs network-tests itself unless DFM_SKIP_NETWORK_TESTS=1)
+#   rust-tests runs network-tests itself unless DFM_SKIP_NETWORK_TESTS=1), and rust-archive,
+#   which only hosted CI runs (it needs cargo-nextest)
 set -euo pipefail
 
 # Documentation fixtures only: shape and references. The resolver cases run in step rust-tests.
@@ -41,15 +42,37 @@ step_rust_style() {
     cargo clippy --workspace --all-targets --locked --features dfm-cli/test-isolation -- -D warnings
 }
 
+# The test set of the gate: the whole workspace in the isolated build. The CLI and differential
+# tests need feature test-isolation, which also switches on dfm-engine/failpoints.
+test_select=(--workspace --locked --features dfm-cli/test-isolation)
+
+# Hosted CI only: build every test binary of the test set once into a cargo-nextest archive
+# (DFM_TEST_ARCHIVE), so each test job runs prebuilt binaries. nextest cannot archive doc tests,
+# so they run here, once, against the libraries the archive build already compiled.
+step_rust_archive() {
+    cargo nextest archive "${test_select[@]}" --archive-file "${DFM_TEST_ARCHIVE:?set DFM_TEST_ARCHIVE}"
+    cargo test --doc "${test_select[@]}"
+}
+
+# Runs a selection of the archive. The archive is extracted into this checkout, so the build
+# paths compiled into the tests (CARGO_BIN_EXE_dfm, CARGO_MANIFEST_DIR) name real files: CI
+# builds and runs in the same checkout path.
+run_archive() {
+    cargo nextest run --archive-file "$DFM_TEST_ARCHIVE" --workspace-remap . \
+        --extract-to . --extract-overwrite --partition "${DFM_TEST_PARTITION:?set DFM_TEST_PARTITION}" "$@"
+}
+
 # Implementation tests: unit, CLI, bootstrap script and build-controls differential tests.
-# The isolated build (feature test-isolation) is needed by the CLI and differential tests.
-# DFM_TEST_SELECT holds the cargo package, target and feature selection (default: the whole
-# workspace in the isolated build); hosted CI uses it to run one shard of test binaries per job.
+# Locally `cargo test` runs the test set. With DFM_TEST_ARCHIVE set (hosted CI), the step runs
+# the nextest partition DFM_TEST_PARTITION (for example count:2/4) of that prebuilt archive
+# instead; each test then runs in its own process.
 # Set DFM_SKIP_NETWORK_TESTS=1 (exactly 1) to skip the network-tests step; the skip is printed.
 step_rust_tests() {
-    local select
-    read -ra select <<<"${DFM_TEST_SELECT:---workspace --features dfm-cli/test-isolation}"
-    cargo test --locked "${select[@]}"
+    if [ -n "${DFM_TEST_ARCHIVE:-}" ]; then
+        run_archive
+    else
+        cargo test "${test_select[@]}"
+    fi
     if [ "${DFM_SKIP_NETWORK_TESTS:-}" = 1 ]; then
         echo "SKIPPED: network install test (DFM_SKIP_NETWORK_TESTS=1)"
     else
@@ -58,18 +81,16 @@ step_rust_tests() {
 }
 
 # The install tests need crates.io, so they are #[ignore]d and run explicitly here. Each one
-# builds the manager in release mode, so hosted CI shards them: DFM_NETWORK_TESTS holds the
-# exact names of one shard (default: every ignored test in the workspace). At most four run at
-# once (DFM_NETWORK_THREADS): with twelve at once on an 18-core machine, five failed the
-# toolchain digest check and a rerun died (2026-10-20); the cause was not isolated.
+# builds the manager in release mode through bootstrap.sh, so hosted CI runs one nextest
+# partition of them per job (DFM_TEST_ARCHIVE and DFM_TEST_PARTITION, as in rust-tests). At most
+# four run at once (DFM_NETWORK_THREADS): with twelve at once on an 18-core machine, five failed
+# the toolchain digest check and a rerun died (2026-10-20); the cause was not isolated.
 step_network_tests() {
     local threads=${DFM_NETWORK_THREADS:-4}
-    if [ -n "${DFM_NETWORK_TESTS:-}" ]; then
-        local names
-        read -ra names <<<"$DFM_NETWORK_TESTS"
-        cargo test -p dfm-cli --locked --features test-isolation --test bootstrap -- --ignored --test-threads "$threads" --exact "${names[@]}"
+    if [ -n "${DFM_TEST_ARCHIVE:-}" ]; then
+        run_archive --run-ignored ignored-only --test-threads "$threads"
     else
-        cargo test --workspace --locked --features dfm-cli/test-isolation -- --ignored --test-threads "$threads"
+        cargo test "${test_select[@]}" -- --ignored --test-threads "$threads"
     fi
 }
 
