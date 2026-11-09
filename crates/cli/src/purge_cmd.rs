@@ -195,7 +195,10 @@ impl Decision {
             }
             let what = match &p.now {
                 Now::Absent => String::new(),
-                Now::File(h) if h.starts_with("size:") => format!(" file ({h})"),
+                // The inode and ctime are for the digest, not for the reader.
+                Now::File(h) if h.starts_with("size:") => {
+                    format!(" file ({})", h.split(' ').next().unwrap_or(h))
+                }
                 Now::File(h) => format!(" file sha256:{h}"),
                 Now::Dir(n, b, _) => format!(" directory ({n} entries, {b} bytes)"),
                 Now::Link(t) => format!(" link -> {}", visible(t)),
@@ -436,7 +439,7 @@ fn path_item(
         }
     } else if m.is_file() && m.len() > MAX_BYTES as u64 {
         // A large file is named by its size; reading it whole only to hash it is not needed.
-        Now::File(format!("size:{}", m.len()))
+        Now::File(big_file(&m))
     } else if m.is_file() {
         match fs::read(&b.path) {
             Ok(bytes) => Now::File(file_fingerprint(&bytes)),
@@ -1065,6 +1068,18 @@ fn resolved(p: &Path) -> PathBuf {
     }
 }
 
+/// The fingerprint of a regular file too large to hash: its size, plus its inode and ctime so a
+/// same-length rewrite after the plan is stale (ctime changes on every write and cannot be set).
+fn big_file(m: &fs::Metadata) -> String {
+    format!(
+        "size:{} ino:{} ctime:{}.{}",
+        m.len(),
+        m.ino(),
+        m.ctime(),
+        m.ctime_nsec()
+    )
+}
+
 /// `p` with the links among its parents resolved and its own last component kept as it is, so a
 /// kept link is not followed to its target.
 fn via_parents(p: &Path) -> PathBuf {
@@ -1082,7 +1097,7 @@ fn live(path: &Path, uid: u32) -> Option<Now> {
         let (n, b, f) = tree(path, uid).ok()?.ok()?;
         Some(Now::Dir(n, b, f))
     } else if m.is_file() && m.len() > MAX_BYTES as u64 {
-        Some(Now::File(format!("size:{}", m.len())))
+        Some(Now::File(big_file(&m)))
     } else if m.is_file() {
         fs::read(path).ok().map(|b| Now::File(file_fingerprint(&b)))
     } else {
@@ -1951,6 +1966,19 @@ mod tests {
         std::os::unix::fs::symlink(base.join("nowhere"), base.join("dangle")).unwrap();
         assert!(vouching(&link, "../dangle/../newdir/file", &dirs).is_empty());
         fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn a_big_file_fingerprint_changes_on_a_same_length_rewrite() {
+        let p = std::env::temp_dir().join(format!("dfm-purge-big-{}", std::process::id()));
+        fs::write(&p, b"aaaa").unwrap();
+        let before = big_file(&fs::symlink_metadata(&p).unwrap());
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        fs::write(&p, b"bbbb").unwrap();
+        let after = big_file(&fs::symlink_metadata(&p).unwrap());
+        assert!(before.starts_with("size:4 ") && after.starts_with("size:4 "));
+        assert_ne!(before, after);
+        fs::remove_file(&p).unwrap();
     }
 
     #[test]
