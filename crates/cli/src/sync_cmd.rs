@@ -2240,7 +2240,7 @@ fn updater_env<'a>(
 
 /// The checkouts the tracked-file guard watches (DFM-25, G5): the bound checkout and each nested
 /// source checkout that the published lock declares and that exists.
-fn guarded_checkouts(root: &Path) -> Result<Vec<PathBuf>, Refusal> {
+pub(crate) fn guarded_checkouts(root: &Path) -> Result<Vec<PathBuf>, Refusal> {
     let lock = read_lock(root)?;
     let nested = lock.nested().iter().map(|s| root.join(&s.path));
     Ok(std::iter::once(root.to_path_buf())
@@ -2253,7 +2253,7 @@ fn guarded_checkouts(root: &Path) -> Result<Vec<PathBuf>, Refusal> {
 /// hash-object --no-filters`), `link <target>`, `missing` or `other`. The content is part of
 /// the snapshot because an updater that rewrites an already modified file leaves its status
 /// line as it was. `--no-optional-locks` keeps the index as it is.
-fn tracked_status(
+pub(crate) fn tracked_status(
     git: &Git,
     dirs: &[PathBuf],
 ) -> Result<BTreeMap<String, (String, String)>, Refusal> {

@@ -2,8 +2,10 @@
 //! tested from the CLI crate because its scripts name system tools, which the engine's sources
 //! may not (gate test `os_bound_names_stay_in_platform_macos`).
 
+mod common;
+
 use dfm_engine::proc::{MAX_STDERR, passthrough};
-use dfm_engine::{End, ProcRequest as Request, Runner};
+use dfm_engine::{End, ProcRequest as Request, Runner, Shown};
 use dfm_model::Code;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -307,5 +309,263 @@ fn a_child_that_exits_before_reading_all_its_input_is_reported() {
     let out = r.run(&req(&[], Some(&big), 5)).unwrap();
     assert!(out.success(), "{out:?}");
     assert!(!out.stdin_written, "{out:?}");
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// A runner for [`Runner::run_shown`] with a short grace period, so the timeout test ends fast.
+fn shown_runner(d: &Path) -> Runner {
+    Runner {
+        grace: Duration::from_millis(100),
+        ..runner(&d.join("bin"))
+    }
+}
+
+fn sh(script: &str) -> Vec<String> {
+    vec!["-c".to_string(), script.to_string()]
+}
+
+/// A `sleep` command line unique to this process: `whole` keeps the tests apart, and the
+/// fractional part keeps parallel test processes apart, so `pgrep -f` finds only this test's.
+fn sleep_marker(whole: u32) -> String {
+    format!("sleep {whole}.{}", std::process::id())
+}
+
+/// Asserts that no process matches `marker` within 2 s. A killed orphan is reaped by launchd,
+/// which can take a moment after the leader is gone.
+fn assert_gone(marker: &str) {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        let found = std::process::Command::new("pgrep")
+            .args(["-f", marker])
+            .output()
+            .unwrap();
+        if !found.status.success() {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "still running: {}",
+            String::from_utf8_lossy(&found.stdout)
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// Set in a re-executed test binary: the test runs its inner part. A test cannot be
+/// `#[ignore]`d for this (gate test `every_ignored_test_is_in_one_install_shard`).
+const INNER: &str = "DFM_RUNNER_TEST_INNER";
+
+/// Runs the test `name` again in a new process of this test binary with [`INNER`] set, through
+/// `wrapper` (a program and its leading arguments) when given, with standard input from
+/// `/dev/null`. Asserts that the inner run passed.
+fn run_inner(wrapper: &[&str], name: &str) {
+    let exe = std::env::current_exe().unwrap();
+    let mut cmd = match wrapper.split_first() {
+        Some((program, rest)) => {
+            let mut c = std::process::Command::new(program);
+            c.args(rest).arg(&exe);
+            c
+        }
+        None => std::process::Command::new(&exe),
+    };
+    let out = cmd
+        .args(["--exact", name, "--nocapture", "--test-threads=1"])
+        .env(INNER, "1")
+        .stdin(std::process::Stdio::null())
+        .output()
+        .unwrap();
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(out.status.success(), "{text}");
+    // An exact name that matched nothing would also succeed.
+    assert!(text.contains("1 passed"), "{text}");
+}
+
+#[test]
+fn run_shown_without_tty_reads_dev_null_and_reports_the_exit_code() {
+    let d = scratch("shown-dev-null");
+    let r = shown_runner(&d);
+    let args = sh("read x && exit 7; exit 3");
+    let end = r
+        .run_shown(&Shown {
+            program: Path::new("/bin/sh"),
+            args: &args,
+            env: &[("PATH".into(), "/usr/bin:/bin".into())],
+            tty: false,
+            timeout: Duration::from_secs(5),
+        })
+        .unwrap();
+    // `read` fails at once on /dev/null.
+    assert!(matches!(end, End::Exited(3)), "{end:?}");
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn run_shown_passes_only_the_given_environment() {
+    // HOME is set in the test process; the child must not see it.
+    assert!(
+        std::env::var_os("HOME").is_some(),
+        "the test needs HOME set"
+    );
+    let d = scratch("shown-env");
+    let r = shown_runner(&d);
+    let args = sh(r#"test -z "$HOME" && test "$ONLY" = 1"#);
+    let end = r
+        .run_shown(&Shown {
+            program: Path::new("/bin/sh"),
+            args: &args,
+            env: &[("ONLY".into(), "1".into())],
+            tty: false,
+            timeout: Duration::from_secs(5),
+        })
+        .unwrap();
+    assert!(matches!(end, End::Exited(0)), "{end:?}");
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn run_shown_ends_the_group_on_timeout() {
+    let d = scratch("shown-timeout");
+    let r = shown_runner(&d);
+    let marker = sleep_marker(30);
+    let args = sh(&format!("{marker} & {marker}"));
+    let started = Instant::now();
+    let end = r
+        .run_shown(&Shown {
+            program: Path::new("/bin/sh"),
+            args: &args,
+            env: &[("PATH".into(), "/usr/bin:/bin".into())],
+            tty: false,
+            timeout: Duration::from_millis(200),
+        })
+        .unwrap();
+    assert!(matches!(end, End::TimedOut), "{end:?}");
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "{:?}",
+        started.elapsed()
+    );
+    assert_gone(&marker);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn run_shown_kills_a_descendant_that_ignores_sigterm() {
+    let d = scratch("shown-ignores-term");
+    let r = shown_runner(&d);
+    let marker = sleep_marker(31);
+    // The leader dies on SIGTERM; the subshell's sleep inherits the ignored SIGTERM.
+    let args = sh(&format!("(trap '' TERM; {marker}) & {marker}"));
+    let end = r
+        .run_shown(&Shown {
+            program: Path::new("/bin/sh"),
+            args: &args,
+            env: &[("PATH".into(), "/usr/bin:/bin".into())],
+            tty: false,
+            timeout: Duration::from_millis(200),
+        })
+        .unwrap();
+    assert!(matches!(end, End::TimedOut), "{end:?}");
+    assert_gone(&marker);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn run_shown_ends_a_stopped_group_without_waiting_for_the_grace_period() {
+    let d = scratch("shown-stopped");
+    // A grace period longer than the bound below. The leader catches SIGTERM, so while it is
+    // stopped the signal stays pending (a default SIGTERM kills even a stopped process): only
+    // SIGCONT lets it run its trap before the grace period ends.
+    let r = Runner {
+        grace: Duration::from_secs(5),
+        ..shown_runner(&d)
+    };
+    let marker = sleep_marker(32);
+    let args = sh(&format!(
+        "trap 'exit 0' TERM; {marker} & kill -STOP $$; wait"
+    ));
+    let started = Instant::now();
+    let end = r
+        .run_shown(&Shown {
+            program: Path::new("/bin/sh"),
+            args: &args,
+            env: &[("PATH".into(), "/usr/bin:/bin".into())],
+            tty: false,
+            timeout: Duration::from_millis(200),
+        })
+        .unwrap();
+    assert!(matches!(end, End::TimedOut), "{end:?}");
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "{:?}",
+        started.elapsed()
+    );
+    assert_gone(&marker);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn run_shown_with_tty_refuses_when_stdin_is_not_a_terminal() {
+    if std::env::var_os(INNER).is_none() {
+        run_inner(
+            &[],
+            "run_shown_with_tty_refuses_when_stdin_is_not_a_terminal",
+        );
+        return;
+    }
+    let d = scratch("shown-no-tty");
+    let r = shown_runner(&d);
+    let marker = format!("shown-no-tty-{}", std::process::id());
+    // `$0` carries the marker, so `pgrep -f` would find a shell that started.
+    let args = vec!["-c".to_string(), "exit 0".to_string(), marker.clone()];
+    let e = r
+        .run_shown(&Shown {
+            program: Path::new("/bin/sh"),
+            args: &args,
+            env: &[],
+            tty: true,
+            timeout: Duration::from_secs(5),
+        })
+        .unwrap_err();
+    assert_eq!(e.code, Code::ProbeFailed, "{e}");
+    assert!(e.detail.contains("cannot start"), "{e}");
+    assert_gone(&marker);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn run_shown_with_tty_gives_the_child_the_terminal_and_takes_it_back() {
+    if std::env::var_os(INNER).is_none() {
+        if !Path::new("/usr/bin/script").exists() {
+            common::skip("/usr/bin/script is needed for a pseudo-terminal");
+            return;
+        }
+        run_inner(
+            &["/usr/bin/script", "-q", "/dev/null"],
+            "run_shown_with_tty_gives_the_child_the_terminal_and_takes_it_back",
+        );
+        return;
+    }
+    assert!(dfm_engine::signal::terminal_is_ours(), "no pty");
+    let d = scratch("shown-pty");
+    let r = shown_runner(&d);
+    // `stty` sets the terminal (SIGTTOU stops a background group) and `read` reads it (SIGTTIN);
+    // `script` sends EOF when its standard input, /dev/null, ends. A child that is not the
+    // foreground group stops and the run times out instead.
+    let args = sh(r#"stty "$(stty -g)" || exit 9; read x; exit 0"#);
+    let end = r
+        .run_shown(&Shown {
+            program: Path::new("/bin/sh"),
+            args: &args,
+            env: &[("PATH".into(), "/usr/bin:/bin".into())],
+            tty: true,
+            timeout: Duration::from_secs(10),
+        })
+        .unwrap();
+    assert!(matches!(end, End::Exited(0)), "{end:?}");
+    assert!(dfm_engine::signal::terminal_is_ours());
     let _ = std::fs::remove_dir_all(&d);
 }

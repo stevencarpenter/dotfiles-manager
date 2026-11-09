@@ -290,6 +290,7 @@ pub fn record_trial(ctx: &Ctx, m: &clap::ArgMatches, out: &mut dyn Write) -> Res
         package: None,
         unknown: vec![],
         adopted: None,
+        script: None,
     };
     store.write_trial(&trial)?;
     writeln!(out, "recorded trial {id}").map_err(|e| io("output", &e))

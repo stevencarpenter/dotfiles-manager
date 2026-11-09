@@ -1,11 +1,13 @@
 //! Stop requests from SIGINT and SIGTERM (docs/apply.md, "Signals").
 //!
-//! This is the only module of the workspace with `unsafe` code: [`install`] and [`kill_child`]. A
-//! gate test (`crates/cli/tests/gate.rs`) rejects the keyword and the lint attributes in any
-//! other place. The handler does one thing: it stores a number in a static atomic. The executor
-//! reads the number between operations, and once more inside an operation just before its
-//! `intent` entry (see docs/apply.md, "Signals"). After that entry it does not read the number
-//! until the operation ends. Nothing here kills a process or exits from a handler.
+//! This is the only module of the workspace with `unsafe` code: the six functions that carry an
+//! `expect` for the lint ([`install`], [`kill_child`], [`new_session`], [`foreground_group`],
+//! [`take_terminal`] and [`terminal_is_ours`]). A gate test (`crates/cli/tests/gate.rs`) rejects
+//! the keyword and the lint attributes in any other place. The handler does one thing: it stores
+//! a number in a static atomic. The executor reads the number between operations, and once more
+//! inside an operation just before its `intent` entry (see docs/apply.md, "Signals"). After that
+//! entry it does not read the number until the operation ends. Nothing here kills a process or
+//! exits from a handler.
 //!
 //! The handlers are installed with `SA_RESTART`. The executor never acts on the number in the
 //! middle of a file system call, and a restarted call keeps `openat`, `renameat`, `unlinkat`
@@ -152,10 +154,13 @@ pub fn installed() -> bool {
 
 /// Sends SIGTERM (`term`) or SIGKILL to the child `pid`, or to its process group when the runner
 /// gave it one (`group`; the group id is then the child's pid, so the signal reaches the child and
-/// everything it started). A pid that does not fit, or a target that is gone, is ignored.
+/// everything it started). SIGTERM is followed by SIGCONT: a stopped process (Ctrl-Z in a child
+/// that has the terminal, or a self-sent SIGSTOP) that catches SIGTERM, as a script with a
+/// cleanup `trap` does, keeps it pending until it runs again. A pid that does not fit, or a
+/// target that is gone, is ignored.
 #[expect(
     unsafe_code,
-    reason = "kill has no safe API; the call touches no memory"
+    reason = "kill has no safe API; the calls touch no memory"
 )]
 pub(crate) fn kill_child(pid: u32, group: bool, term: bool) {
     let Ok(pid) = i32::try_from(pid) else {
@@ -165,7 +170,12 @@ pub(crate) fn kill_child(pid: u32, group: bool, term: bool) {
     let target = if group { -pid } else { pid };
     // SAFETY: `kill` takes two plain integers and dereferences nothing. A negative pid names the
     // process group.
-    let _ = unsafe { libc::kill(target, sig) };
+    unsafe {
+        let _ = libc::kill(target, sig);
+        if term {
+            let _ = libc::kill(target, libc::SIGCONT);
+        }
+    }
 }
 
 /// Starts the child of `cmd` in a new session, with no controlling terminal: a program it runs
@@ -189,6 +199,100 @@ pub(crate) fn new_session(cmd: &mut std::process::Command) {
             }
         });
     }
+}
+
+/// Makes the child of `cmd` the foreground process group of the terminal on its standard input
+/// before it starts, so its first read of the terminal does not stop it (`dfm trial --script`
+/// with a terminal). The child leads its own group, so [`kill_child`] with `group` still reaches
+/// everything it started. SIGTTOU is blocked around `tcsetpgrp`, which a background group may
+/// otherwise not call. SIGTSTP is set to ignored: the manager does not wait for a stopped child,
+/// so a Ctrl-Z would block the terminal until the timeout. An ignored disposition survives
+/// `exec`, and a non-interactive shell does not reset it. A failure fails the spawn.
+/// [`take_terminal`] gives the terminal back.
+#[expect(
+    unsafe_code,
+    reason = "setpgid, tcsetpgrp, sigprocmask and signal have no safe API; the hook calls only async-signal-safe functions"
+)]
+pub(crate) fn foreground_group(cmd: &mut std::process::Command) {
+    use std::os::unix::process::CommandExt;
+    // SAFETY: the hook runs in the child between fork and exec. It calls only `sigemptyset`,
+    // `sigaddset`, `sigprocmask`, `setpgid`, `getpid`, `tcsetpgrp` and `signal`, which are
+    // async-signal-safe, on two `sigset_t` values on its own stack (all-zero bytes are a valid
+    // `sigset_t`). It allocates nothing and touches no memory of the parent. errno is read before
+    // the mask is restored.
+    unsafe {
+        cmd.pre_exec(|| {
+            let mut block: libc::sigset_t = std::mem::zeroed();
+            let mut old: libc::sigset_t = std::mem::zeroed();
+            libc::sigemptyset(&mut block);
+            libc::sigaddset(&mut block, libc::SIGTTOU);
+            if libc::sigprocmask(libc::SIG_BLOCK, &block, &mut old) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            let result = if libc::setpgid(0, 0) != 0 || libc::tcsetpgrp(0, libc::getpid()) != 0 {
+                Err(std::io::Error::last_os_error())
+            } else {
+                Ok(())
+            };
+            libc::sigprocmask(libc::SIG_SETMASK, &old, std::ptr::null_mut());
+            result?;
+            if libc::signal(libc::SIGTSTP, libc::SIG_IGN) == libc::SIG_ERR {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+}
+
+/// Makes the manager's process group the foreground group of the terminal on its standard input
+/// again, after a child started with [`foreground_group`] ended. SIGTTOU is blocked on this
+/// thread for the call: the manager is a background group until it succeeds. The thread's mask
+/// is restored afterwards. A failed `tcsetpgrp` (for example, standard input is not a terminal)
+/// is `E_IO_FAILED`.
+#[expect(
+    unsafe_code,
+    reason = "pthread_sigmask and tcsetpgrp have no safe API; the calls touch only local sigset_t values"
+)]
+pub(crate) fn take_terminal() -> Result<(), Refusal> {
+    // SAFETY: all-zero bytes are a valid `sigset_t`. Every pointer passed is to a local that
+    // outlives the call, or null for an unwanted result. `pthread_sigmask` changes only this
+    // thread's mask (`sigprocmask` is unspecified in a process with more than one thread), and
+    // the old mask is set again before the block ends.
+    let result = unsafe {
+        let mut block: libc::sigset_t = std::mem::zeroed();
+        let mut old: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut block);
+        libc::sigaddset(&mut block, libc::SIGTTOU);
+        let rc = libc::pthread_sigmask(libc::SIG_BLOCK, &block, &mut old);
+        if rc != 0 {
+            Err(std::io::Error::from_raw_os_error(rc))
+        } else {
+            let result = if libc::tcsetpgrp(0, libc::getpgrp()) != 0 {
+                Err(std::io::Error::last_os_error())
+            } else {
+                Ok(())
+            };
+            libc::pthread_sigmask(libc::SIG_SETMASK, &old, std::ptr::null_mut());
+            result
+        }
+    };
+    result.map_err(|e| {
+        Refusal::new(
+            Code::IoFailed,
+            format!("cannot take the terminal back from the child: {e}"),
+        )
+    })
+}
+
+/// Whether the manager's process group is the foreground group of the terminal on its standard
+/// input. False when standard input is not a terminal.
+#[expect(
+    unsafe_code,
+    reason = "tcgetpgrp and getpgrp have no safe API; the calls touch no memory"
+)]
+pub fn terminal_is_ours() -> bool {
+    // SAFETY: both calls take or return plain integers and dereference nothing.
+    unsafe { libc::tcgetpgrp(0) == libc::getpgrp() }
 }
 
 /// The stop request, if a signal arrived since [`install`]. The refusal carries the code that

@@ -19,6 +19,7 @@ dfm adopt <trial-id> --module <module> [--root <dir>] [--preview] [-y|--yes-plan
 ```
 
 - `<trial-id>` names a record in `state/trials/`, for example `trial-tuicr`.
+- A script trial (`dfm trial --script`, docs/trial.md) is refused with `E_CONFLICT` until DFM-83.
 - `--module` is required. Adopt never creates a module, never edits the profile and never merges modules.
 - `--root` defaults to the root the binding records, as for `apply`. The machine must be bound.
 - Adopt never commits or pushes. The output ends with the repo paths it changed, for `git diff` and `git status`.

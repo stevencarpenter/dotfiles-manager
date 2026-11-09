@@ -955,6 +955,7 @@ fn a_hand_written_trial_with_foreign_paths_is_a_finding_not_a_trial() {
             package: None,
             unknown: vec![],
             adopted: None,
+            script: None,
         };
         let f = dir.join(format!("{n}.json"));
         fs::write(&f, dfm_model::state::canonical(&t).unwrap()).unwrap();
@@ -1003,6 +1004,7 @@ fn a_trial_path_under_a_link_parent_is_a_finding() {
             package: None,
             unknown: vec![],
             adopted: None,
+            script: None,
         };
         let f = dir.join(format!("{n}.json"));
         fs::write(&f, dfm_model::state::canonical(&t).unwrap()).unwrap();
@@ -1123,6 +1125,7 @@ fn every_write_cap_is_enforced_before_anything_is_written() {
         package: None,
         unknown: vec![],
         adopted: None,
+        script: None,
     };
     assert_eq!(code(s.write_trial(&t)), Code::LimitExceeded);
     assert!(!state.join("trials/big.json").exists());
@@ -1746,6 +1749,7 @@ fn plain_trial(stamp: &Stamp, id: &str) -> dfm_model::state::TrialRecord {
         package: None,
         unknown: vec![],
         adopted: None,
+        script: None,
     }
 }
 

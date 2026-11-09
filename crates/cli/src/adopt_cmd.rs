@@ -883,6 +883,11 @@ fn trial_record(store: &Store, trial_id: &str) -> Result<TrialRecord, Refusal> {
             "trial {trial_id} is already adopted; nothing was changed"
         )));
     }
+    if t.script.is_some() {
+        return Err(conflict(
+            "adopt of a script trial is not implemented yet (DFM-83)",
+        ));
+    }
     Ok(t)
 }
 

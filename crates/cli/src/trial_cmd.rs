@@ -16,8 +16,9 @@ use dfm_model::plan::{Binary, PackageState, file_fingerprint};
 use dfm_model::resolve::{Table, Value};
 use dfm_model::state::{
     Approval, Baseline, BaselinePath, BinaryId, Class, JournalEntry, MAX_BYTES, OperationRecord,
-    Phase, ProfileRef, Receipt, Recovery, RunResult, SCHEMA, Stamp, Status, TRIAL_SCHEMA_DATA,
-    TrialInstall, TrialPackage, TrialRecord, count_statuses, rfc3339, valid_id, valid_path,
+    Phase, ProfileRef, Receipt, Recovery, RunResult, SCHEMA, SHELLS, Stamp, Status,
+    TRIAL_SCHEMA_DATA, TrialInstall, TrialPackage, TrialRecord, count_statuses, rfc3339, valid_id,
+    valid_path,
 };
 use dfm_model::{Code, Exit, Refusal};
 use serde_json::json;
@@ -25,9 +26,12 @@ use std::fs;
 use std::io::Write;
 use std::path::Path;
 
+mod script;
+mod window;
+
 /// Effects a trial does not instrument. They are recorded so `purge` treats them as candidates
 /// for review and never as owned cleanup scope (DESIGN.md: the manager is not an OS sandbox).
-const UNKNOWN: [&str; 3] = ["services", "paths-outside-baseline", "provider-caches"];
+pub(super) const UNKNOWN: [&str; 3] = ["services", "paths-outside-baseline", "provider-caches"];
 
 #[derive(Debug)]
 pub struct Args {
@@ -38,10 +42,78 @@ pub struct Args {
     pub configs: Vec<String>,
     pub preview: bool,
     pub yes_plan: Option<String>,
+    pub script: Option<ScriptArgs>,
+}
+
+/// The `--script` flags: an install script fetched from `url` and run by `shell`.
+#[derive(Debug)]
+pub struct ScriptArgs {
+    /// An `https://` URL.
+    pub url: String,
+    /// One of [`SHELLS`]; `sh` when `--shell` is absent.
+    pub shell: String,
+    pub args: Vec<String>,
+    /// `--env NAME=VALUE` pairs: unique names, none from [`FIXED_ENV`].
+    pub env: Vec<(String, String)>,
+    pub tty: bool,
+}
+
+/// Variables the script run sets itself. `--env` cannot override them.
+pub(super) const FIXED_ENV: [&str; 15] = [
+    "HOME",
+    "USER",
+    "LOGNAME",
+    "TMPDIR",
+    "SHELL",
+    "PATH",
+    "LANG",
+    "LC_ALL",
+    "TERM",
+    "ZDOTDIR",
+    "XDG_CONFIG_HOME",
+    "XDG_DATA_HOME",
+    "XDG_STATE_HOME",
+    "XDG_CACHE_HOME",
+    "XDG_BIN_HOME",
+];
+
+fn parse_env(pairs: Vec<String>) -> Result<Vec<(String, String)>, Refusal> {
+    let mut env: Vec<(String, String)> = Vec::new();
+    for p in pairs {
+        let (name, val) = p
+            .split_once('=')
+            .ok_or_else(|| usage("--env takes NAME=VALUE"))?;
+        let mut chars = name.chars();
+        let plain = chars
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+            && chars.all(|c| c.is_ascii_alphanumeric() || c == '_');
+        if !plain {
+            return Err(usage(format!(
+                "--env name {} must match [A-Za-z_][A-Za-z0-9_]*",
+                visible(name)
+            )));
+        }
+        if FIXED_ENV.contains(&name) {
+            return Err(usage(format!("--env cannot set {name}; the run fixes it")));
+        }
+        // The record's rule (`TrialScript::validate`): a value may hold a tab, no other control.
+        if val.chars().any(|c| c != '\t' && c.is_control()) {
+            return Err(usage(format!(
+                "--env {name} holds a control character other than a tab"
+            )));
+        }
+        if env.iter().any(|(n, _)| n == name) {
+            return Err(usage(format!("--env {name} is given twice")));
+        }
+        env.push((name.to_string(), val.to_string()));
+    }
+    Ok(env)
 }
 
 /// `trial <package> [--id <trial-id>] [--provider homebrew/v1|mise/v1] [--config <path>]...
-/// [--preview] [-y|--yes-plan <digest>]`.
+/// [--preview] [-y|--yes-plan <digest>]`, or with `--script <https-url> [--shell sh|bash|zsh]
+/// [--arg <value>]... [--env NAME=VALUE]... [--tty]` in place of `--provider`.
 pub fn parse_args(m: &clap::ArgMatches) -> Result<Args, Refusal> {
     let (package, id, provider) = (
         cli::one(m, "package"),
@@ -79,6 +151,56 @@ pub fn parse_args(m: &clap::ArgMatches) -> Result<Args, Refusal> {
             visible(&package)
         )));
     }
+    let (url, shell, script_args) = (
+        cli::one(m, "script"),
+        cli::one(m, "shell"),
+        cli::all(m, "arg"),
+    );
+    let (env, tty) = (cli::all(m, "env"), cli::flag(m, "tty"));
+    let script = match url {
+        None => {
+            if shell.is_some() || !script_args.is_empty() || !env.is_empty() || tty {
+                return Err(usage("--shell, --arg, --env and --tty need --script"));
+            }
+            None
+        }
+        Some(url) => {
+            if provider.is_some() {
+                return Err(usage("--script and --provider cannot be used together"));
+            }
+            if !url.starts_with("https://") {
+                return Err(usage("--script takes an https:// URL"));
+            }
+            if !valid_id(&package) {
+                return Err(usage(format!(
+                    "the tool name {} must be lowercase ASCII letters, digits, '.', '_' or '-' (1 to 64 characters)",
+                    visible(&package)
+                )));
+            }
+            // The record's rule (`TrialScript::validate`): an argument holds no control character.
+            if let Some(bad) = script_args.iter().find(|a| a.chars().any(char::is_control)) {
+                return Err(usage(format!(
+                    "--arg {} holds a control character",
+                    visible(bad)
+                )));
+            }
+            let shell = shell.unwrap_or_else(|| "sh".to_string());
+            if !SHELLS.contains(&shell.as_str()) {
+                return Err(usage(format!(
+                    "--shell is {}; {} cannot run a script",
+                    SHELLS.join(", "),
+                    visible(&shell)
+                )));
+            }
+            Some(ScriptArgs {
+                url,
+                shell,
+                args: script_args,
+                env: parse_env(env)?,
+                tty,
+            })
+        }
+    };
     Ok(Args {
         package,
         id,
@@ -86,6 +208,7 @@ pub fn parse_args(m: &clap::ArgMatches) -> Result<Args, Refusal> {
         configs,
         preview,
         yes_plan: yes,
+        script,
     })
 }
 
@@ -183,6 +306,7 @@ impl Decision {
             }),
             unknown: UNKNOWN.iter().map(|u| u.to_string()).collect(),
             adopted: None,
+            script: None,
         }
     }
 
@@ -218,19 +342,7 @@ impl Decision {
                 bounded(&self.owners.join("; "))
             )?,
         }
-        for (what, ps) in [("baseline", &self.baseline), ("data", &self.data)] {
-            for p in ps {
-                let seen = match (&p.existed, &p.sha256) {
-                    (false, _) => "absent".to_string(),
-                    (true, Some(h)) => format!("file sha256:{h}"),
-                    (true, None) => "directory".to_string(),
-                };
-                writeln!(out, "{what}: {} {seen}", visible(&p.path))?;
-            }
-        }
-        for s in &self.skipped {
-            writeln!(out, "data: {}", visible(s))?;
-        }
+        print_observed(out, &self.baseline, &self.data, &self.skipped)?;
         writeln!(
             out,
             "cleanup scope: dfm purge removes the install above and every baseline or data path that was absent; a pre-existing path or tool is never removed"
@@ -242,6 +354,29 @@ impl Decision {
         )?;
         writeln!(out, "plan digest: {digest}")
     }
+}
+
+/// The `baseline:` and `data:` preview lines, shared by the package and the script trial.
+pub(super) fn print_observed(
+    out: &mut dyn Write,
+    baseline: &[BaselinePath],
+    data: &[BaselinePath],
+    skipped: &[String],
+) -> std::io::Result<()> {
+    for (what, ps) in [("baseline", baseline), ("data", data)] {
+        for p in ps {
+            let seen = match (&p.existed, &p.sha256) {
+                (false, _) => "absent".to_string(),
+                (true, Some(h)) => format!("file sha256:{h}"),
+                (true, None) => "directory".to_string(),
+            };
+            writeln!(out, "{what}: {} {seen}", visible(&p.path))?;
+        }
+    }
+    for s in skipped {
+        writeln!(out, "data: {}", visible(s))?;
+    }
+    Ok(())
 }
 
 /// The code a probe answer blocks with, as the package planner maps it (docs/packages.md).
@@ -347,7 +482,7 @@ fn find_owner(runner: &Runner, pkg: &str, provider: Option<&str>) -> Result<Owne
 /// One baseline observation. A file is hashed, a directory and an absent path are recorded as
 /// such, and anything else (a link, a special file, an unreadable entry) is a baseline failure:
 /// recording it as absent would let a later purge delete what was there.
-fn observe(path: &str) -> Result<BaselinePath, Refusal> {
+pub(super) fn observe(path: &str) -> Result<BaselinePath, Refusal> {
     let fail = |what: String| {
         Refusal::new(
             Code::StateInvalid,
@@ -395,7 +530,7 @@ fn observe(path: &str) -> Result<BaselinePath, Refusal> {
 /// The data candidates: where a tool keeps its data, state and caches by convention (XDG and
 /// macOS). `purge` removes the ones that were absent before the trial.
 /// shortcut: a fixed list by tool name, upgrade when an adapter can declare its data paths
-fn data_candidates(home: &Path, tool: &str) -> Vec<String> {
+pub(super) fn data_candidates(home: &Path, tool: &str) -> Vec<String> {
     [
         ".local/share",
         ".local/state",
@@ -410,7 +545,11 @@ fn data_candidates(home: &Path, tool: &str) -> Vec<String> {
 
 /// The configuration candidates: the explicit `--config` paths, or `~/.config/<tool>` when
 /// none is given. A relative path is inside HOME.
-fn candidates(home: &Path, tool: &str, configs: &[String]) -> Result<Vec<String>, Refusal> {
+pub(super) fn candidates(
+    home: &Path,
+    tool: &str,
+    configs: &[String],
+) -> Result<Vec<String>, Refusal> {
     if configs.is_empty() {
         // shortcut: one XDG candidate for every tool, upgrade when an adapter can declare paths
         return Ok(vec![home.join(".config").join(tool).display().to_string()]);
@@ -435,6 +574,9 @@ fn candidates(home: &Path, tool: &str, configs: &[String]) -> Result<Vec<String>
 }
 
 pub fn run(ctx: &Ctx, args: &Args, out: &mut dyn Write) -> Result<(), Refusal> {
+    if let Some(s) = &args.script {
+        return script::run(ctx, args, s, out);
+    }
     let w =
         |e: std::io::Error| Refusal::new(Code::IoFailed, format!("output failed: {}", e.kind()));
     let binding = read_existing_binding(ctx)?.ok_or_else(|| {
@@ -660,15 +802,73 @@ pub fn run(ctx: &Ctx, args: &Args, out: &mut dyn Write) -> Result<(), Refusal> {
             }
         }
     }
+    conclude(
+        ctx,
+        &store,
+        Outcome {
+            trial_id: &trial_id,
+            op_id: &op_id,
+            adapter: locked.adapter_name(),
+            status,
+            started,
+            stopped,
+            binary,
+            stamp,
+            digest,
+            note: None,
+        },
+        out,
+    )
+}
+
+/// How a trial run that wrote its record ended, for [`conclude`].
+pub(super) struct Outcome<'a> {
+    pub trial_id: &'a str,
+    pub op_id: &'a str,
+    pub adapter: &'a str,
+    pub status: Status,
+    pub started: u64,
+    /// The refusal the run ends with, already marked as after a mutation.
+    pub stopped: Option<Refusal>,
+    pub binary: Binary,
+    pub stamp: Stamp,
+    pub digest: String,
+    /// One more line, written after the receipt so an output error cannot prevent it.
+    pub note: Option<String>,
+}
+
+/// The receipt and the result lines of a trial whose record exists, shared by the package and
+/// the script trial. Every outcome, journaled or not, ends here.
+pub(super) fn conclude(
+    ctx: &Ctx,
+    store: &Store,
+    o: Outcome<'_>,
+    out: &mut dyn Write,
+) -> Result<(), Refusal> {
+    let w =
+        |e: std::io::Error| Refusal::new(Code::IoFailed, format!("output failed: {}", e.kind()));
+    let Outcome {
+        trial_id,
+        op_id,
+        adapter,
+        status,
+        started,
+        stopped,
+        binary,
+        stamp,
+        digest,
+        note,
+    } = o;
+    let file = format!("{trial_id}.json");
     let finished = now_ns().unwrap_or(started);
     let exit = stopped.as_ref().map_or(Exit::Ok, Refusal::exit);
     let error = stopped.as_ref().map(|e| bounded_visible(&e.detail, 1024));
     // The one operation carries the journal id, as an apply operation that reached its intent
     // does, so the record, the journal and the receipt are joined by that id.
     let ops = vec![OperationRecord {
-        id: op_id.clone(),
-        resource: trial_id.clone(),
-        adapter: locked.adapter_name().into(),
+        id: op_id.into(),
+        resource: trial_id.into(),
+        adapter: adapter.into(),
         class: Class::Normal,
         status,
         started_at: Some(rfc3339(started)),
@@ -681,7 +881,7 @@ pub fn run(ctx: &Ctx, args: &Args, out: &mut dyn Write) -> Result<(), Refusal> {
     }];
     let receipt = Receipt {
         schema: SCHEMA,
-        op_id: op_id.clone(),
+        op_id: op_id.into(),
         command: "trial".into(),
         update: false,
         started_at: rfc3339(started),
@@ -715,6 +915,9 @@ pub fn run(ctx: &Ctx, args: &Args, out: &mut dyn Write) -> Result<(), Refusal> {
     let error = error.map_or(String::new(), |e| format!(": {e}"));
     writeln!(out, "  {} {trial_id} {op_id}{error}", label(status)).map_err(w)?;
     writeln!(out, "trial: state/trials/{file}").map_err(w)?;
+    if let Some(n) = note {
+        writeln!(out, "{n}").map_err(w)?;
+    }
     let outcome = match (receipt_name, stopped) {
         (Ok(name), stopped) => {
             writeln!(out, "receipt: {}", visible(&name)).map_err(w)?;
@@ -780,6 +983,85 @@ mod tests {
             vec!["a", "-y"],
             vec!["a", "--preview", "-y", &d],
             vec!["a", "-y", &d, "--yes-plan", &d],
+        ] {
+            assert_eq!(a(&bad).unwrap_err().code, Code::Usage, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn script_arguments_parse_and_refuse_the_wrong_combinations() {
+        let a = |v: &[&str]| crate::cli::parse("trial", v).and_then(|m| parse_args(&m));
+        let ok = a(&[
+            "boat",
+            "--script",
+            "https://boat.dev/install",
+            "--shell",
+            "bash",
+            "--arg",
+            "--no-modify-path",
+            "--env",
+            "FOO=1",
+            "--tty",
+            "--preview",
+        ])
+        .unwrap();
+        let s = ok.script.unwrap();
+        assert_eq!(
+            (s.url.as_str(), s.shell.as_str(), s.args.as_slice(), s.tty),
+            (
+                "https://boat.dev/install",
+                "bash",
+                &["--no-modify-path".to_string()][..],
+                true
+            )
+        );
+        assert_eq!(s.env, vec![("FOO".to_string(), "1".to_string())]);
+        let tab = a(&["boat", "--script", "https://x/i", "--env", "A=a\tb"]).unwrap();
+        assert_eq!(
+            tab.script.unwrap().env,
+            vec![("A".to_string(), "a\tb".to_string())]
+        );
+        assert_eq!(
+            a(&["boat", "--script", "https://x/i"])
+                .unwrap()
+                .script
+                .unwrap()
+                .shell,
+            "sh"
+        );
+        for bad in [
+            vec![
+                "boat",
+                "--script",
+                "https://x/i",
+                "--provider",
+                "homebrew/v1",
+            ],
+            vec!["boat", "--script", "http://x/i"],
+            vec!["boat", "--script", "https://x/i", "--shell", "fish"],
+            vec!["boat", "--script", "https://x/i", "--env", "HOME=/x"],
+            vec!["boat", "--script", "https://x/i", "--env", "NOEQUALS"],
+            vec!["boat", "--script", "https://x/i", "--env", "=v"],
+            vec!["boat", "--script", "https://x/i", "--env", "A=a\nb"],
+            vec!["boat", "--script", "https://x/i", "--env", "A=a\0b"],
+            vec!["boat", "--script", "https://x/i", "--env", "A=a\x1bb"],
+            vec!["boat", "--script", "https://x/i", "--env", "A=a\rb"],
+            vec!["boat", "--script", "https://x/i", "--arg", "a\x1bb"],
+            vec!["boat", "--script", "https://x/i", "--arg", "a\tb"],
+            vec![
+                "boat",
+                "--script",
+                "https://x/i",
+                "--env",
+                "A=1",
+                "--env",
+                "A=2",
+            ],
+            vec!["homebrew/core/boat", "--script", "https://x/i"],
+            vec!["boat", "--shell", "bash"],
+            vec!["boat", "--arg", "x"],
+            vec!["boat", "--env", "A=1"],
+            vec!["boat", "--tty"],
         ] {
             assert_eq!(a(&bad).unwrap_err().code, Code::Usage, "{bad:?}");
         }

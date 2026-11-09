@@ -198,3 +198,15 @@ Four slices, each its own PR:
 2. `purge` of a script trial.
 3. `adopt` of a script trial, the `script/v1` declaration, `script:` grants and the `sync` install.
 4. The `doctor` row.
+
+## Implementation notes (2026-11-09)
+
+DFM-81 (slice 1) built the command. The code differs from the design in these places. docs/trial.md, "Script trials", describes the code.
+
+- curl runs with `-q` as its first argument, so `~/.curlrc` cannot weaken the TLS options. The design omitted `-q`.
+- curl, `id` and `getconf` run with `/usr/bin` first on the search path.
+- The digest adds `profile_sha256`, the SHA-256 of the sandbox profile text, so a ledger change between the preview and the run is `E_PLAN_STALE`.
+- The sandbox check (`sandbox-exec` resolved, and a dry run of the profile with `/usr/bin/true`) runs before the fetch. Nothing is cached or written when it refuses.
+- Each denied path is denied as a literal in both its no-follow form (the link itself) and its resolved form. Every link strictly below HOME on the way, and every ancestor strictly below HOME, is denied as a literal too.
+- `SHELL` is dfm's `SHELL` when absolute, else `/bin/sh`. The account's login shell is not read.
+- The timeout is a fixed hour with no flag.

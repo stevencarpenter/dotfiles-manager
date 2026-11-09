@@ -17,6 +17,8 @@ dfm purge <trial-id> [--preview] [-y|--yes-plan <digest>]
 
 `<trial-id>` is the record's id. A tool name also works when the trial has the default id `trial-<tool>` (`dfm purge atuin`).
 
+Purge of a script trial (`dfm trial --script`, docs/trial.md) is not built yet. It is refused with `E_CONFLICT` until DFM-82.
+
 ## What purge does with each item
 
 | Item | Action | Kept when |
