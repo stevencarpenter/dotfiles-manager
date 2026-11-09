@@ -395,6 +395,74 @@ fn a_configuration_plan_lists_services_out_of_scope_and_starts_no_launcher() {
     );
 }
 
+/// DFM-36 (C04): a pending start stays pending. Doctor does not report it complete, and the
+/// next plan does not count it current; the receipt keeps its outcome.
+#[test]
+fn a_pending_start_is_not_complete_in_doctor_or_the_next_plan() {
+    let fx = Fx::new();
+    fx.publish();
+    fx.mark(
+        "loaded",
+        &format!("{LABEL} {} stopped\n", fx.home.path().join(PLIST).display()),
+    );
+    fx.mark("brew-sketchybar", "none\n");
+    let o = fx.preview(&[]);
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+    fx.mark("queue-after-start", "999\n");
+    let o = fx.services(&digest_of(&o), &[]);
+    assert_eq!(code(&o), 5, "{}\n{}", stderr(&o), text(&o.stdout));
+    let pending = |fx: &Fx| {
+        let r = fx.receipts();
+        let receipt = r.iter().rev().find(|r| r["command"] == "services").unwrap();
+        (
+            receipt["result"]["outcome"].clone(),
+            fx.op(receipt, "extra.sketchybar")["status"].clone(),
+        )
+    };
+    assert_eq!(pending(&fx), ("pending".into(), "pending".into()));
+    let o = fx.run(&["doctor", "--root", fx.root_arg(), "--json"]);
+    // A warning, not a failure: the run was accepted and has not completed.
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+    let v: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
+    assert_eq!(v["result"], "warn", "{v:#}");
+    let rows = v["rows"].as_array().unwrap();
+    let last = rows
+        .iter()
+        .find(|r| r["code"] == "D_LAST_RUN")
+        .unwrap_or_else(|| panic!("{v:#}"));
+    assert_eq!(last["status"], "WARN", "{last}");
+    assert!(
+        last["detail"]
+            .as_str()
+            .unwrap()
+            .contains("services pending (exit 5)"),
+        "{last}"
+    );
+    let bar = rows
+        .iter()
+        .find(|r| r["subject"] == "extra.sketchybar")
+        .unwrap_or_else(|| panic!("{v:#}"));
+    assert_eq!(
+        (&bar["status"], &bar["code"]),
+        (&"WARN".into(), &"E_CONFLICT".into()),
+        "{bar}"
+    );
+    // The next plan probes again and blocks: loaded and not running is not a completed start.
+    let o = fx.preview(&[]);
+    assert_eq!(code(&o), 3, "{}\n{}", stderr(&o), text(&o.stdout));
+    assert!(
+        text(&o.stdout).contains(&format!("blocked {BAR_OP}")),
+        "{}",
+        text(&o.stdout)
+    );
+    assert!(
+        !text(&o.stdout).contains(&format!("current {BAR_OP}")),
+        "{}",
+        text(&o.stdout)
+    );
+    assert_eq!(pending(&fx), ("pending".into(), "pending".into()));
+}
+
 #[test]
 fn a_missing_definition_blocks_and_a_published_one_is_loaded_through_launchd() {
     let fx = Fx::new();

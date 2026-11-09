@@ -116,7 +116,7 @@ jobs:
           - shard: libs
             select: -p dfm-model -p dfm-engine -p dfm-platform-macos --features dfm-engine/failpoints
           - shard: cli-1
-            select: -p dfm-cli --features test-isolation --lib --bins --test gate --test bootstrap --test doctor --test cli --test explain --test module_doc --test authoring
+            select: -p dfm-cli --features test-isolation --lib --bins --test gate --test bootstrap --test doctor --test cli --test explain --test module_doc --test authoring --test workflows
           - shard: cli-2
             select: -p dfm-cli --features test-isolation --test build_controls --test sync --test planner --test runner --test trial --test trial_script --test adopt
           - shard: cli-3

@@ -3,6 +3,8 @@
 //! files beside it name, and installs by creating the same entries, so no real provider runs.
 //! `crates/cli/tests/packages.rs` keeps its own copy of these scripts.
 
+use std::path::Path;
+
 /// `brew --cellar` and `brew --caskroom` print the fixture's `Cellar` and `Caskroom` (`--caskroom`
 /// fails with the `caskroom-fail` marker), where an
 /// installed package is a `<name>/<version>` directory (the `installed` helper and `brew
@@ -197,3 +199,44 @@ printf 'getconf %s\n' "$*" >> "$here/../log"
 [ -e "$here/../tmpdir" ] && { cat "$here/../tmpdir"; exit 0; }
 exec /usr/bin/getconf "$@"
 "#;
+
+/// `op whoami` exits 0 only with the `signed-in` marker and without a `signed-out-<account>`
+/// marker, and kills itself with the `whoami-killed` marker; `op inject` fills the one reference.
+pub const FAKE_OP: &str = r#"#!/bin/sh
+PATH=/usr/bin:/bin:$PATH
+here=$(dirname "$0")
+printf 'op %s\n' "$*" >> "$here/../log"
+[ -e "$here/../whoami-killed" ] && kill -KILL $$
+[ -e "$here/../signed-in" ] || { echo "[ERROR] no session" >&2; exit 1; }
+for a in "$@"; do [ -e "$here/../signed-out-$a" ] && { echo "[ERROR] no session" >&2; exit 1; }; done
+case "$1" in
+  whoami) echo me; exit 0 ;;
+  inject) sed 's|{{ op://vault/item/field }}|planted-value|' ;;
+  *) exit 64 ;;
+esac
+"#;
+
+/// A native tool look-alike: `--version` prints `st/<name>`, the update command writes the
+/// `next-<name>` marker's content there (or exits 1 with the `fail-<name>` marker, or touches
+/// `started-<name>` and sleeps with the `hang-<name>` marker). Every call is logged.
+pub fn native_tool(name: &str, update: &str, st: &Path) -> String {
+    format!(
+        r#"#!/bin/sh
+PATH=/usr/bin:/bin
+st={st}
+printf '{name} %s\n' "$*" >> "$st/log"
+case "$1" in
+  --version) cat "$st/{name}" ;;
+  {update})
+    [ -e "$st/hang-{name}" ] && {{ touch "$st/started-{name}"; exec sleep 30; }}
+    [ -e "$st/tty-{name}" ] && {{ read x < /dev/tty || exit 9; }}
+    [ -e "$st/fail-{name}" ] && {{ echo boom >&2; exit 1; }}
+    [ -e "$st/next-{name}" ] && cp "$st/next-{name}" "$st/{name}"
+    [ -e "$st/write-{name}" ] && echo changed >> "$(cat "$st/write-{name}")"
+    exit 0 ;;
+  *) exit 64 ;;
+esac
+"#,
+        st = st.display()
+    )
+}

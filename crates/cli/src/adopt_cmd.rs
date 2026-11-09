@@ -331,7 +331,16 @@ pub(crate) fn dirty(git: &Git, root: &Path, rels: &[&str]) -> Result<Vec<String>
     if rels.is_empty() {
         return Ok(Vec::new());
     }
-    let mut args = vec!["-C", text(root)?, "status", "--porcelain=v1", "-z", "--"];
+    // `--no-optional-locks`: a read before the approval check must not rewrite `.git/index`.
+    let mut args = vec![
+        "-C",
+        text(root)?,
+        "--no-optional-locks",
+        "status",
+        "--porcelain=v1",
+        "-z",
+        "--",
+    ];
     args.extend(rels);
     let out = git.run(true, Code::ProbeFailed, "git status", &args)?;
     let mut entries = out.split('\0');

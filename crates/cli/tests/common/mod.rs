@@ -3,6 +3,7 @@
     reason = "each test binary uses a different subset of these helpers"
 )]
 pub mod providers;
+pub mod remote;
 
 use sha2::{Digest, Sha256};
 use std::fs;
@@ -89,17 +90,25 @@ pub fn skip(why: &str) {
 /// Names, kinds, modes, modification times and bytes of everything below `root`, links unread.
 /// The lock file is included.
 pub fn fingerprint(root: &Path) -> String {
-    fn go(dir: &Path, h: &mut Sha256) {
+    fingerprint_except(root, &[])
+}
+
+/// [`fingerprint`] without the entries at `skip` (and below them).
+pub fn fingerprint_except(root: &Path, skip: &[&Path]) -> String {
+    fn go(dir: &Path, skip: &[&Path], h: &mut Sha256) {
         let mut v: Vec<_> = fs::read_dir(dir).unwrap().map(|e| e.unwrap()).collect();
         v.sort_by_key(|e| e.file_name());
         for e in v {
+            if skip.contains(&e.path().as_path()) {
+                continue;
+            }
             let m = fs::symlink_metadata(e.path()).unwrap();
             h.update(e.path().to_str().unwrap().as_bytes());
             h.update(
                 format!("{:?} {:o}", m.modified().unwrap(), m.permissions().mode()).as_bytes(),
             );
             if m.is_dir() {
-                go(&e.path(), h);
+                go(&e.path(), skip, h);
             } else if m.is_file() {
                 // A file with no read bit (mode 0200) is covered by its hashed mode alone. Any
                 // other read error is a test failure.
@@ -120,7 +129,7 @@ pub fn fingerprint(root: &Path) -> String {
         }
     }
     let mut h = Sha256::new();
-    go(root, &mut h);
+    go(root, skip, &mut h);
     format!("{:x}", h.finalize())
 }
 
