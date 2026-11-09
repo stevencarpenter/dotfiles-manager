@@ -23,7 +23,7 @@ use std::collections::BTreeSet;
 use std::ffi::OsStr;
 use std::fs;
 use std::io::{IsTerminal, Write};
-use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -72,6 +72,30 @@ pub(super) fn cache_paths(cache_dir: &Path, url: &str) -> (PathBuf, PathBuf) {
 
 fn io_failed(path: &Path) -> impl Fn(std::io::Error) -> Refusal + '_ {
     move |e| Refusal::new(Code::IoFailed, format!("{}: {}", path.display(), e.kind()))
+}
+
+/// Creates `path` (mode 0600) with `body`. An existing entry, also a link, is `E_CONFLICT` and
+/// stays as it is; a failed write removes the new file.
+fn write_private(path: &Path, body: &[u8]) -> Result<(), Refusal> {
+    let mut f = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+        .map_err(|e| {
+            if e.kind() == std::io::ErrorKind::AlreadyExists {
+                Refusal::new(
+                    Code::Conflict,
+                    format!("{} already exists; nothing was changed", path.display()),
+                )
+            } else {
+                io_failed(path)(e)
+            }
+        })?;
+    f.write_all(body).map_err(|e| {
+        let _ = fs::remove_file(path);
+        io_failed(path)(e)
+    })
 }
 
 fn not_regular(path: &Path) -> Refusal {
@@ -828,20 +852,25 @@ pub(super) fn run(
     let (layout, sys) = (ctx.layout(), ctx.sys()?);
     // A tool that is already on PATH would hide what the script installs; nothing is fetched.
     let path_var = std::env::var_os("PATH").unwrap_or_default();
-    let found = on_path(&layout.home, &path_var, &tool);
-    if !found.is_empty() {
+    // Checked here and again under the lock: another installer may add the tool in between.
+    let preexisting = || {
+        let found = on_path(&layout.home, &path_var, &tool);
+        if found.is_empty() {
+            return Ok(());
+        }
         let shown: Vec<String> = found
             .iter()
             .map(|p| visible(&p.display().to_string()))
             .collect();
-        return Err(Refusal::new(
+        Err(Refusal::new(
             Code::Conflict,
             format!(
                 "an executable named {tool} is already on PATH: {}; remove or purge it first",
                 shown.join(", ")
             ),
-        ));
-    }
+        ))
+    };
+    preexisting()?;
     // The checkouts the sandbox protects and the guard watches hang off the bound root.
     let (root, _) = crate::canonical_root(&binding, None)?;
     let runner = ctx.runner(&sys);
@@ -970,6 +999,7 @@ pub(super) fn run(
     }
     let locked = (|| {
         store.require_identity(&binding)?;
+        preexisting()?;
         let ledger = store.read_ledger()?;
         let fetched = cached(&layout.cache_dir, &s.url)?.ok_or_else(missing)?;
         let (locked, profile) = decide(fetched, confine(&ledger)?)?;
@@ -994,11 +1024,31 @@ pub(super) fn run(
     })()
     .map_err(|r: Refusal| store.stamp(r))?;
     let mut record = locked.record(started, before);
+    // The run executes a copy of the verified bytes, not the URL-keyed cache file a concurrent
+    // preview (no lock) may replace. It is a manager-private temporary file, the only write
+    // before the record, and it is removed on every exit path from here on.
+    let run_file = layout
+        .cache_dir
+        .join("scripts")
+        .join(format!("run-{trial_id}-{}", std::process::id()));
+    write_private(&run_file, &locked.fetched.body).map_err(|r| store.stamp(r))?;
+    let drop_run_file = || {
+        let _ = fs::remove_file(&run_file);
+    };
     // The exclusive create makes a record another run wrote since the check above a conflict.
-    if !store.create_trial(&record)? {
-        return Err(store.stamp(conflict()));
+    match store.create_trial(&record) {
+        Ok(true) => {}
+        Ok(false) => {
+            drop_run_file();
+            return Err(store.stamp(conflict()));
+        }
+        Err(e) => {
+            drop_run_file();
+            return Err(e);
+        }
     }
     fail.hit("trial-script-after-record")
+        .inspect_err(|_| drop_run_file())
         .map_err(|r| store.stamp(r))?;
 
     // From here on the record exists and every outcome ends in a receipt and a result line; a
@@ -1028,7 +1078,7 @@ pub(super) fn run(
             "-p".to_string(),
             profile_text,
             format!("/bin/{}", locked.shell),
-            locked.fetched.path.display().to_string(),
+            run_file.display().to_string(),
         ];
         argv.extend(locked.args.iter().cloned());
         runner.run_shown(&Shown {
@@ -1073,7 +1123,7 @@ pub(super) fn run(
     }
     // The record keeps the script's sha256; a later preview fetches it again.
     let (cache_file, sidecar) = cache_paths(&layout.cache_dir, &s.url);
-    for p in [cache_file, sidecar] {
+    for p in [cache_file, sidecar, run_file] {
         if let Err(e) = fs::remove_file(&p)
             && e.kind() != std::io::ErrorKind::NotFound
         {
@@ -1536,6 +1586,28 @@ mod tests {
         }
         assert!(!text.contains(&sub(".dotfiles")), "{text}");
         fs::remove_dir_all(&h).unwrap();
+    }
+
+    #[test]
+    fn write_private_creates_a_0600_file_and_refuses_an_existing_entry() {
+        let dir = scratch("write-private");
+        let p = dir.join("run");
+        write_private(&p, b"approved").unwrap();
+        assert_eq!(fs::read(&p).unwrap(), b"approved");
+        assert_eq!(
+            fs::metadata(&p).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        // A second writer, or a planted link, is a conflict and the entry stays as it was.
+        let e = write_private(&p, b"other").unwrap_err();
+        assert_eq!(e.code, Code::Conflict, "{}", e.detail);
+        assert_eq!(fs::read(&p).unwrap(), b"approved");
+        let link = dir.join("link");
+        std::os::unix::fs::symlink(dir.join("target"), &link).unwrap();
+        let e = write_private(&link, b"other").unwrap_err();
+        assert_eq!(e.code, Code::Conflict, "{}", e.detail);
+        assert!(!dir.join("target").exists());
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

@@ -466,7 +466,7 @@ fn a_script_trial_records_before_runs_sandboxed_and_rewrites_the_record() {
     assert_eq!(code(&o), 0, "{}", stderr(&o));
     // The log of the approved run alone: its dry run and the script run.
     fs::write(fx.fake.path().join("log"), "").unwrap();
-    let cache = fx.cached();
+    let scripts = fx.scripts();
     let o = fx.trial_script("boat", &["--arg", "--quiet", "--yes-plan", &digest_of(&o)]);
     let out = text(&o.stdout);
     assert_eq!(code(&o), 0, "{}\n{out}", stderr(&o));
@@ -537,12 +537,15 @@ fn a_script_trial_records_before_runs_sandboxed_and_rewrites_the_record() {
         .lines()
         .filter_map(|l| l.rsplit_once(" | ").map(|(_, c)| c))
         .collect();
-    assert_eq!(
-        commands,
-        [
-            "/usr/bin/true".to_string(),
-            format!("/bin/sh {} --quiet", cache.display())
-        ],
+    // The script runs from a private copy `run-<trial id>-<pid>`, not from the cache file.
+    let pid = commands
+        .get(1)
+        .and_then(|c| c.strip_prefix(&format!("/bin/sh {}/run-trial-boat-", scripts.display())))
+        .and_then(|c| c.strip_suffix(" --quiet"));
+    assert!(
+        commands.len() == 2
+            && commands[0] == "/usr/bin/true"
+            && pid.is_some_and(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit())),
         "{log}"
     );
     assert!(log.contains("(deny process-exec"), "{log}");
@@ -553,6 +556,7 @@ fn a_script_trial_records_before_runs_sandboxed_and_rewrites_the_record() {
     );
     // The run used the cached bytes and then dropped them; the record keeps the digest.
     assert!(!fx.cached().exists() && !fx.cached().with_extension("json").exists());
+    assert_eq!(run_files(&fx), Vec::<String>::new());
     assert_eq!(s["sha256"], sha(BOAT.as_bytes()).as_str());
 }
 
@@ -769,6 +773,97 @@ fn a_ledger_change_before_the_lock_makes_the_sandbox_profile_stale() {
     assert_eq!(code(&o), 3, "{}\n{}", stderr(&o), text(&o.stdout));
     assert!(stderr(&o).contains("E_PLAN_STALE"), "{}", stderr(&o));
     assert!(!fx.state().join("trials/trial-boat.json").exists());
+}
+
+/// Starts the approved run parked at the failpoint `point` and waits until it is there. The
+/// run continues when the returned gate file exists.
+fn parked(fx: &Fx, point: &str, digest: &str) -> (std::process::Child, PathBuf) {
+    let gate = fx.fake.path().join("go");
+    let child = fx
+        .command(&["trial", "boat", "--script", URL, "--yes-plan", digest])
+        .env("DFM_FAILPOINT", format!("{point}:wait-{}", gate.display()))
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let reached = gate.with_extension("reached");
+    let started = Instant::now();
+    while !reached.exists() {
+        assert!(started.elapsed() < Duration::from_secs(30), "not reached");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    (child, gate)
+}
+
+fn run_files(fx: &Fx) -> Vec<String> {
+    fs::read_dir(fx.scripts())
+        .map(|d| {
+            d.map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                .filter(|n| n.starts_with("run-"))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+#[test]
+fn a_preview_that_replaces_the_cache_after_the_record_does_not_change_what_runs() {
+    if no_sandbox() {
+        return;
+    }
+    let fx = Fx::new();
+    fx.bind_with_links();
+    let approved = "#!/bin/sh\n: > \"$HOME/approved\"\n";
+    fx.script(approved);
+    let o = fx.trial_script("boat", &["--preview"]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let (child, gate) = parked(&fx, "trial-script-after-record", &digest_of(&o));
+    // A concurrent preview takes no lock and may rewrite the URL-keyed cache file.
+    fs::write(fx.cached(), "#!/bin/sh\n: > \"$HOME/replaced\"\n").unwrap();
+    fs::write(&gate, "").unwrap();
+    let o = child.wait_with_output().unwrap();
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+    assert!(fx.h("approved").exists());
+    assert!(!fx.h("replaced").exists());
+    let rec = fx.record("trial-boat");
+    assert_eq!(rec["script"]["sha256"], sha(approved.as_bytes()).as_str());
+    assert_eq!(run_files(&fx), Vec::<String>::new());
+}
+
+#[test]
+fn a_tool_that_appears_on_path_before_the_lock_refuses_the_run() {
+    if no_sandbox() {
+        return;
+    }
+    let fx = Fx::new();
+    fx.bind_with_links();
+    fx.script("#!/bin/sh\nexit 0\n");
+    let o = fx.trial_script("boat", &["--preview"]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let (child, gate) = parked(&fx, "trial-before-lock", &digest_of(&o));
+    // Another installer puts the tool on PATH between the first check and the lock.
+    let p = fx.h(".local/bin/boat");
+    fs::create_dir_all(p.parent().unwrap()).unwrap();
+    fs::write(&p, "#!/bin/sh\n").unwrap();
+    fs::set_permissions(&p, fs::Permissions::from_mode(0o755)).unwrap();
+    fs::write(&gate, "").unwrap();
+    let o = child.wait_with_output().unwrap();
+    let err = stderr(&o);
+    assert_eq!(code(&o), 3, "{err}\n{}", text(&o.stdout));
+    assert!(err.contains("E_CONFLICT"), "{err}");
+    assert!(
+        err.contains(&format!(
+            "an executable named boat is already on PATH: {}",
+            p.display()
+        )),
+        "{err}"
+    );
+    assert!(!fx.state().join("trials/trial-boat.json").exists());
+    assert!(
+        !fx.journal().iter().any(|e| e["op"] == "trial-script"),
+        "{:?}",
+        fx.journal()
+    );
+    assert_eq!(run_files(&fx), Vec::<String>::new());
 }
 
 #[test]
