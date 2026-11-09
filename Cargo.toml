@@ -39,3 +39,17 @@ all = "warn"
 # Tests hash a ~400 MB toolchain tree; unoptimized sha2 is too slow for that.
 [profile.dev.package.sha2]
 opt-level = 3
+
+# Tests and the hooks: line tables keep file and line in panics and backtraces at a fraction of
+# full debug info, so test binaries link faster and the CI test archive is smaller. Debug
+# assertions and overflow checks stay on (the dev defaults). For a debugger session, override it
+# with CARGO_PROFILE_DEV_DEBUG=true.
+[profile.dev]
+debug = "line-tables-only"
+
+# The shipped binary: an integer overflow panics as in the tested dev build instead of wrapping.
+# Unwinding stays (no panic = "abort"): Drop guards remove staging and scratch files on a panic.
+# No LTO and no codegen-units = 1: measured 3 times the build time for every install and
+# self-update for a 19 to 24 percent smaller binary and no measured run-time gain.
+[profile.release]
+overflow-checks = true

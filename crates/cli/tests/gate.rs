@@ -647,58 +647,81 @@ fn a_plain_release_build_of_every_target_has_no_test_isolation() {
     );
 }
 
-/// Hosted CI runs the cli test binaries in shards (.github/workflows/contract-check.yml). A
-/// binary missing from every shard would run only on a push to main.
-#[test]
-fn every_cli_test_target_is_in_one_ci_shard() {
+/// The nextest partitions of the hosted CI jobs (.github/workflows/contract-check.yml), in order:
+/// for each job, the `partition:` matrix list and the total `N` of its
+/// `DFM_TEST_PARTITION: count:${{ matrix.partition }}/N`. The test job comes first, then the
+/// install job.
+fn ci_partitions() -> Vec<(Vec<usize>, usize)> {
     let workflow =
         fs::read_to_string(repo_root().join(".github/workflows/contract-check.yml")).unwrap();
-    let mut sharded: Vec<&str> = workflow
-        .lines()
-        .filter(|l| l.trim_start().starts_with("select:"))
-        .flat_map(|l| {
-            l.split_whitespace()
-                .collect::<Vec<_>>()
-                .windows(2)
-                .map(|w| w.to_vec())
-                .collect::<Vec<_>>()
-        })
-        .filter(|w| w[0] == "--test")
-        .map(|w| w[1])
-        .collect();
-    sharded.sort_unstable();
-    let m = metadata();
-    let mut targets: Vec<&str> = m["packages"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|p| p["name"] == "dfm-cli")
-        .unwrap()["targets"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .filter(|t| t["kind"].as_array().unwrap().iter().any(|k| k == "test"))
-        .map(|t| t["name"].as_str().unwrap())
-        .collect();
-    targets.sort_unstable();
-    assert_eq!(
-        sharded, targets,
-        "add each cli test target to exactly one shard in contract-check.yml"
-    );
+    let lists = workflow.lines().filter_map(|l| {
+        let list = l.trim_start().strip_prefix("partition: [")?;
+        Some(
+            list.trim_end()
+                .strip_suffix(']')
+                .unwrap()
+                .split(',')
+                .map(|n| n.trim().parse::<usize>().unwrap())
+                .collect::<Vec<_>>(),
+        )
+    });
+    let totals = workflow.lines().filter_map(|l| {
+        let spec = l
+            .trim_start()
+            .strip_prefix("DFM_TEST_PARTITION: count:${{ matrix.partition }}/")?;
+        Some(spec.trim().parse::<usize>().unwrap())
+    });
+    let pairs: Vec<_> = lists.zip(totals).collect();
+    assert_eq!(pairs.len(), 2, "one test and one install partition matrix");
+    pairs
 }
 
-/// Hosted CI runs the #[ignore]d install tests in shards by exact name; a new one must be named
-/// in exactly one shard, and the script's shard path runs only crates/cli/tests/bootstrap.rs.
+/// Hosted CI builds the whole test set once into a nextest archive (scripts/check_all.sh,
+/// step rust-archive) and runs it in `count` partitions. Every test runs in exactly one job when
+/// the matrix lists each partition 1 to N once, and every workspace test target is in the archive
+/// when it needs no feature but test-isolation and the failpoints feature it switches on.
+#[test]
+fn every_cli_test_target_is_in_one_ci_shard() {
+    let (list, total) = ci_partitions().remove(0);
+    assert_eq!(
+        list,
+        (1..=total).collect::<Vec<_>>(),
+        "list each test partition 1 to {total} once in contract-check.yml"
+    );
+    let m = metadata();
+    let members = m["workspace_members"].as_array().unwrap();
+    let targets: Vec<_> = m["packages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|p| members.contains(&p["id"]))
+        .flat_map(|p| p["targets"].as_array().unwrap())
+        .filter(|t| t["kind"].as_array().unwrap().iter().any(|k| k == "test"))
+        .collect();
+    assert!(targets.iter().any(|t| t["name"] == "gate"), "{targets:?}");
+    for t in targets {
+        // test-isolation switches on dfm-engine/failpoints.
+        let mut features = t["required-features"].as_array().into_iter().flatten();
+        assert!(
+            features.all(|f| f == "test-isolation" || f == "failpoints"),
+            "{}: the archive enables only test-isolation and failpoints, so it would not build this target",
+            t["name"]
+        );
+    }
+}
+
+/// Hosted CI runs the #[ignore]d install tests from the same archive in `count` partitions of
+/// at most three tests (each builds the manager in release mode). The local path of
+/// step_network_tests runs every ignored test of the workspace, so the tests stay in
+/// crates/cli/tests/bootstrap.rs, where the install jobs expect them.
 #[test]
 fn every_ignored_test_is_in_one_install_shard() {
-    let workflow =
-        fs::read_to_string(repo_root().join(".github/workflows/contract-check.yml")).unwrap();
-    let mut sharded: Vec<&str> = workflow
-        .lines()
-        .filter_map(|l| l.trim_start().strip_prefix("names:"))
-        .flat_map(str::split_whitespace)
-        .collect();
-    sharded.sort_unstable();
+    let (list, total) = ci_partitions().remove(1);
+    assert_eq!(
+        list,
+        (1..=total).collect::<Vec<_>>(),
+        "list each install partition 1 to {total} once in contract-check.yml"
+    );
     let mut files = Vec::new();
     for dir in [
         "crates/cli/tests",
@@ -722,15 +745,17 @@ fn every_ignored_test_is_in_one_install_shard() {
                     .to_string();
                 assert!(
                     f.ends_with("crates/cli/tests/bootstrap.rs"),
-                    "{name}: the install shards run only tests/bootstrap.rs; move it there or extend step_network_tests"
+                    "{name}: the install jobs run only tests/bootstrap.rs; move it there"
                 );
                 ignored.push(name);
             }
         }
     }
-    ignored.sort_unstable();
-    assert_eq!(
-        sharded, ignored,
-        "name each #[ignore]d test in exactly one install shard in contract-check.yml"
+    assert!(!ignored.is_empty());
+    assert!(
+        ignored.len() <= 3 * total,
+        "{} install tests need at least {} partitions in contract-check.yml",
+        ignored.len(),
+        ignored.len().div_ceil(3)
     );
 }
