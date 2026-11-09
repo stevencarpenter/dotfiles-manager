@@ -391,7 +391,8 @@ fn only_the_mutating_path_of_apply_installs_the_signal_handlers() {
             "crates/cli/src/apply_cmd.rs",
             "crates/cli/src/purge_cmd.rs",
             "crates/cli/src/sync_cmd.rs",
-            "crates/cli/src/trial_cmd.rs"
+            "crates/cli/src/trial_cmd.rs",
+            "crates/cli/src/trial_cmd/script.rs"
         ]
     );
     // `purge` (DFM-34) probes the providers before it decides, so it arms them once first.
@@ -408,6 +409,14 @@ fn only_the_mutating_path_of_apply_installs_the_signal_handlers() {
     let trial = fs::read_to_string(repo_root().join("crates/cli/src/trial_cmd.rs")).unwrap();
     assert_eq!(trial.matches("signal::install(").count(), 1);
     assert!(trial.find("signal::install(").unwrap() < trial.find("find_owner(&runner").unwrap());
+    // The script trial (DFM-81) arms them before the PATH check and the fetch. The needles name
+    // the calls in `run`, not the definitions earlier in the file.
+    let script =
+        fs::read_to_string(repo_root().join("crates/cli/src/trial_cmd/script.rs")).unwrap();
+    assert_eq!(script.matches("signal::install(").count(), 1);
+    let install = script.find("signal::install(").unwrap();
+    assert!(install < script.find("on_path(&layout.home").unwrap());
+    assert!(install < script.find("fetch(&runner").unwrap());
     let t = fs::read_to_string(repo_root().join("crates/cli/src/apply_cmd.rs")).unwrap();
     let at = |needle: &str| {
         let i = t

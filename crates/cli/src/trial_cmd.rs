@@ -791,15 +791,69 @@ pub fn run(ctx: &Ctx, args: &Args, out: &mut dyn Write) -> Result<(), Refusal> {
             }
         }
     }
+    conclude(
+        ctx,
+        &store,
+        Outcome {
+            trial_id: &trial_id,
+            op_id: &op_id,
+            adapter: locked.adapter_name(),
+            status,
+            started,
+            stopped,
+            binary,
+            stamp,
+            digest,
+        },
+        out,
+    )
+}
+
+/// How a trial run that wrote its record ended, for [`conclude`].
+pub(super) struct Outcome<'a> {
+    pub trial_id: &'a str,
+    pub op_id: &'a str,
+    pub adapter: &'a str,
+    pub status: Status,
+    pub started: u64,
+    /// The refusal the run ends with, already marked as after a mutation.
+    pub stopped: Option<Refusal>,
+    pub binary: Binary,
+    pub stamp: Stamp,
+    pub digest: String,
+}
+
+/// The receipt and the result lines of a trial whose record exists, shared by the package and
+/// the script trial. Every outcome, journaled or not, ends here.
+pub(super) fn conclude(
+    ctx: &Ctx,
+    store: &Store,
+    o: Outcome<'_>,
+    out: &mut dyn Write,
+) -> Result<(), Refusal> {
+    let w =
+        |e: std::io::Error| Refusal::new(Code::IoFailed, format!("output failed: {}", e.kind()));
+    let Outcome {
+        trial_id,
+        op_id,
+        adapter,
+        status,
+        started,
+        stopped,
+        binary,
+        stamp,
+        digest,
+    } = o;
+    let file = format!("{trial_id}.json");
     let finished = now_ns().unwrap_or(started);
     let exit = stopped.as_ref().map_or(Exit::Ok, Refusal::exit);
     let error = stopped.as_ref().map(|e| bounded_visible(&e.detail, 1024));
     // The one operation carries the journal id, as an apply operation that reached its intent
     // does, so the record, the journal and the receipt are joined by that id.
     let ops = vec![OperationRecord {
-        id: op_id.clone(),
-        resource: trial_id.clone(),
-        adapter: locked.adapter_name().into(),
+        id: op_id.into(),
+        resource: trial_id.into(),
+        adapter: adapter.into(),
         class: Class::Normal,
         status,
         started_at: Some(rfc3339(started)),
@@ -812,7 +866,7 @@ pub fn run(ctx: &Ctx, args: &Args, out: &mut dyn Write) -> Result<(), Refusal> {
     }];
     let receipt = Receipt {
         schema: SCHEMA,
-        op_id: op_id.clone(),
+        op_id: op_id.into(),
         command: "trial".into(),
         update: false,
         started_at: rfc3339(started),

@@ -608,15 +608,17 @@ fn trial_rows(l: &StateLoaded, findings: &[dfm_engine::Finding], rows: &mut Vec<
         if findings.iter().any(|f| f.file == file) {
             continue;
         }
-        let how = match &t.package {
-            Some(p) if p.install.is_some() => {
+        let how = match (&t.script, &t.package) {
+            // The record refuses a URL with a control character, so it prints as it is.
+            (Some(sc), _) => format!("{} installed by the trial through {}", t.tool, sc.url),
+            (_, Some(p)) if p.install.is_some() => {
                 format!("{} installed by the trial with {}", p.name, p.adapter)
             }
-            Some(p) => format!(
+            (_, Some(p)) => format!(
                 "{} with {}, which existed before the trial",
                 p.name, p.adapter
             ),
-            None => "no install recorded".to_string(),
+            (None, None) => "no install recorded".to_string(),
         };
         rows.push(Row::new(
             "trial",

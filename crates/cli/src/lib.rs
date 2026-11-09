@@ -603,7 +603,10 @@ fn no_root() -> Refusal {
 
 /// The canonical root (`--root`, else the root the binding records) and the bound profile's
 /// path relative to it.
-fn canonical_root(binding: &Binding, root: Option<&Path>) -> Result<(PathBuf, String), Refusal> {
+pub(crate) fn canonical_root(
+    binding: &Binding,
+    root: Option<&Path>,
+) -> Result<(PathBuf, String), Refusal> {
     let root = root
         .or_else(|| binding.root().map(Path::new))
         .ok_or_else(no_root)?;

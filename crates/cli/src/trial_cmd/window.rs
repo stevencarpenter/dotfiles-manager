@@ -12,19 +12,15 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 /// Children one watched directory may hold before the window refuses to record it.
-#[cfg_attr(not(test), expect(dead_code, reason = "wired by the script run"))]
 pub(super) const MAX_DIR_ENTRIES: usize = 10_000;
 /// Entries one observation pass may hold in total.
-#[cfg_attr(not(test), expect(dead_code, reason = "wired by the script run"))]
 pub(super) const MAX_OBSERVED: usize = 50_000;
 /// Largest file the window hashes; a bigger file is recorded without a digest.
-#[cfg_attr(not(test), expect(dead_code, reason = "wired by the script run"))]
 pub(super) const HASH_CAP: u64 = 16 * 1024 * 1024;
 
 const ZSH_FILES: [&str; 5] = [".zshenv", ".zprofile", ".zshrc", ".zlogin", ".zlogout"];
 
 /// One place the window watches.
-#[cfg_attr(not(test), expect(dead_code, reason = "wired by the script run"))]
 pub(super) enum Watch {
     /// A single path, recorded with its content digest.
     File(PathBuf),
@@ -37,7 +33,6 @@ pub(super) enum Watch {
 /// The watch set of the spec table, from HOME and the script environment (`ZDOTDIR` when set).
 /// Order: files, then directories, then listings. `observe` keeps the first record of a path,
 /// so a file that a listing also names keeps its digest.
-#[cfg_attr(not(test), expect(dead_code, reason = "wired by the script run"))]
 pub(super) fn watch_set(home: &Path, env: &[(String, String)]) -> Vec<Watch> {
     let mut files: Vec<PathBuf> = [".profile", ".bash_profile", ".bash_login", ".bashrc"]
         .iter()
@@ -150,7 +145,6 @@ fn limit(what: String) -> Refusal {
 /// directory that cannot be read, yield nothing: the window is evidence, not authority. More
 /// than `MAX_DIR_ENTRIES` children in one directory, or `MAX_OBSERVED` entries in total, is
 /// `E_LIMIT_EXCEEDED`.
-#[cfg_attr(not(test), expect(dead_code, reason = "wired by the script run"))]
 pub(super) fn observe(watch: &[Watch]) -> Result<Vec<Observed>, Refusal> {
     let mut seen: BTreeMap<String, Observed> = BTreeMap::new();
     for w in watch {
@@ -191,7 +185,6 @@ pub(super) fn observe(watch: &[Watch]) -> Result<Vec<Observed>, Refusal> {
 /// What changed between two passes, sorted by path. `created`: in `after` only. `removed`: in
 /// `before` only. `kind-changed`: the kinds differ. `modified`: same kind and the digest or
 /// link target differs. Both inputs must be sorted by path, as `observe` returns them.
-#[cfg_attr(not(test), expect(dead_code, reason = "wired by the script run"))]
 pub(super) fn diff(before: &[Observed], after: &[Observed]) -> Vec<WindowEntry> {
     let entry = |o: &Observed, change: &str, old: Option<&Observed>| WindowEntry {
         path: o.path.clone(),
@@ -243,7 +236,6 @@ pub(super) fn diff(before: &[Observed], after: &[Observed]) -> Vec<WindowEntry> 
 /// file. `None` when no executable is found, and also when the real file is over `HASH_CAP` or
 /// unreadable, because a record without a valid digest cannot be saved; the caller reports
 /// "not on PATH or cannot be hashed". Relative and empty PATH entries are skipped.
-#[cfg_attr(not(test), expect(dead_code, reason = "wired by the script run"))]
 pub(super) fn binary(home: &Path, path_var: &OsStr, tool: &str) -> Option<ScriptBinary> {
     let candidate = std::env::split_paths(path_var)
         .chain(dfm_platform_macos::provider_path(home))

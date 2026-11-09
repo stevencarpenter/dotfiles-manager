@@ -442,6 +442,12 @@ fn trial_record(store: &Store, name: &str) -> Result<TrialRecord, Refusal> {
             ),
         ));
     }
+    if t.script.is_some() {
+        return Err(Refusal::new(
+            Code::Conflict,
+            "purge of a script trial is not implemented yet (DFM-82)",
+        ));
+    }
     Ok(t)
 }
 

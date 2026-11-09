@@ -1,20 +1,28 @@
 //! The `--script` trial: fetch an install script over HTTPS and run it in a recorded window.
 
-use super::{Args, ScriptArgs, candidates, data_candidates, observe, print_observed};
+use super::window::{self, Watch};
+use super::{
+    Args, Outcome, ScriptArgs, candidates, conclude, data_candidates, observe, print_observed,
+};
 use crate::apply_cmd::stale;
 use crate::read_fs::read_regular_bounded;
+use crate::sync_cmd::{Git, guarded_checkouts, tracked_status};
 use crate::{Ctx, read_existing_binding, state_cmd, usage};
-use dfm_engine::proc::{End, Request};
-use dfm_engine::{Layout, Runner, Store, signal};
+use dfm_engine::proc::{End, Request, Shown};
+use dfm_engine::{Layout, Runner, Store, now_ns, signal};
 use dfm_model::digest::sha256_hex;
 use dfm_model::display::{bounded_visible, visible};
 use dfm_model::plan::Binary;
-use dfm_model::state::{BaselinePath, Ledger, Stamp, valid_id};
+use dfm_model::state::{
+    Baseline, BaselinePath, Class, JournalEntry, Ledger, Observed, Phase, Recovery, SCHEMA,
+    ScriptExit, Stamp, Status, TRIAL_SCHEMA_SCRIPT, TrialRecord, TrialScript, rfc3339, valid_id,
+};
 use dfm_model::{Code, Refusal};
 use serde_json::json;
+use std::collections::BTreeSet;
 use std::ffi::OsStr;
 use std::fs;
-use std::io::Write;
+use std::io::{IsTerminal, Write};
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -33,6 +41,13 @@ pub(super) const UNKNOWN: [&str; 7] = [
 pub(super) const HINT_TTY: &str =
     "note: the script reads /dev/tty; pass --tty to answer its prompts";
 pub(super) const HINT_STARTUP: &str = "note: the script edits shell startup files; files in the dotfiles repo are write-protected during the run; pass the script's own opt-out if it has one";
+
+/// How long the script may run before its process group is ended.
+// shortcut: one fixed hour, upgrade when a flag asks for it
+const SCRIPT_TIMEOUT: Duration = Duration::from_secs(60 * 60);
+
+/// The adapter a journal entry or receipt operation of a script trial names.
+const ADAPTER: &str = "script/v1";
 
 /// The largest script dfm fetches, as curl's `--max-filesize` enforces it.
 const MAX_SCRIPT: u64 = 1_048_576;
@@ -341,13 +356,11 @@ pub(super) fn script_env(
 /// Programs the script may not start, so it cannot ask for administrator rights (the design,
 /// "The run and the sandbox"). This is not containment: launchd jobs and other services stay
 /// `unknown` effects of the trial.
-#[cfg_attr(not(test), expect(dead_code, reason = "wired by the script run"))]
 pub(super) const DENIED_EXEC: [&str; 3] = ["/usr/bin/sudo", "/usr/bin/su", "/usr/bin/osascript"];
 
 /// What the script's sandbox lets it write: `home` and `temp` (canonical, from the caller), less
 /// the denied trees and paths.
 #[derive(Debug)]
-#[cfg_attr(not(test), expect(dead_code, reason = "wired by the script run"))]
 pub(super) struct Protected {
     pub home: PathBuf,
     pub temp: Vec<PathBuf>,
@@ -378,7 +391,6 @@ fn sbpl_str(p: &Path) -> Result<&str, Refusal> {
 /// home allow. A subpath deny does not stop a rename of an ancestor, so each ancestor strictly
 /// below `home` of a denied tree or path gets a literal deny; a literal still allows new
 /// entries inside it.
-#[cfg_attr(not(test), expect(dead_code, reason = "wired by the script run"))]
 pub(super) fn profile(p: &Protected) -> Result<String, Refusal> {
     let rules = |kind: &str, paths: &[&Path]| -> Result<String, Refusal> {
         paths
@@ -420,7 +432,6 @@ pub(super) fn profile(p: &Protected) -> Result<String, Refusal> {
 
 /// `p` with its deepest existing ancestor canonicalized and the rest re-appended, because the
 /// sandbox matches real paths and a denied path may not exist yet.
-#[cfg_attr(not(test), expect(dead_code, reason = "wired by the script run"))]
 fn canonical(p: &Path) -> PathBuf {
     for a in p.ancestors() {
         if let Ok(mut real) = fs::canonicalize(a) {
@@ -438,7 +449,6 @@ fn canonical(p: &Path) -> PathBuf {
 
 /// `p` with its parent canonicalized and its last component kept, so a link at `p` is named
 /// itself: a deny on its target would still let the script remove or replace the link.
-#[cfg_attr(not(test), expect(dead_code, reason = "wired by the script run"))]
 fn canonical_nofollow(p: &Path) -> PathBuf {
     match (p.parent(), p.file_name()) {
         (Some(dir), Some(name)) => canonical(dir).join(name),
@@ -450,7 +460,6 @@ fn canonical_nofollow(p: &Path) -> PathBuf {
 /// target in turn, as [`canonical_nofollow`] names it. Replacing any of them redirects `p`
 /// without a write to `p` itself. The walk stops after the kernel's own link limit, so a loop
 /// ends; a duplicate is left for `profile` to remove.
-#[cfg_attr(not(test), expect(dead_code, reason = "wired by the script run"))]
 fn links_on(home: &Path, p: &Path) -> Vec<PathBuf> {
     // MAXSYMLINKS in <sys/param.h>: a longer chain cannot resolve, so it redirects nothing.
     const MAX_HOPS: usize = 32;
@@ -480,7 +489,6 @@ fn links_on(home: &Path, p: &Path) -> Vec<PathBuf> {
 
 /// The protected set for a run: the binding root's guarded checkouts, dfm's own directories,
 /// install directory and executable, the lock file, and every ledger target.
-#[expect(dead_code, reason = "wired by the script run")]
 pub(super) fn protected(
     layout: &Layout,
     root: &Path,
@@ -498,7 +506,6 @@ pub(super) fn protected(
 /// removal or replacement of a link, the followed form stops a write through it when its
 /// target is outside every denied tree. A tree is denied by its real path, and each link on
 /// the way to a tree or path below HOME (the tree itself included) as a literal.
-#[cfg_attr(not(test), expect(dead_code, reason = "wired by the script run"))]
 fn protected_set(
     layout: &Layout,
     checkouts: Vec<PathBuf>,
@@ -539,7 +546,6 @@ fn protected_set(
 /// The executables named `tool` in `path_var` and `provider_path(home)`, in search order: a
 /// regular file with an execute bit, or a link to one. An unreadable entry counts as absent;
 /// the sandbox, not this check, is what protects the machine.
-#[cfg_attr(not(test), expect(dead_code, reason = "wired by the script run"))]
 pub(super) fn on_path(home: &Path, path_var: &OsStr, tool: &str) -> Vec<PathBuf> {
     let mut dirs: Vec<PathBuf> = Vec::new();
     for d in std::env::split_paths(path_var).chain(dfm_platform_macos::provider_path(home)) {
@@ -610,6 +616,42 @@ impl Decision {
             .map_err(|e| Refusal::new(Code::IoFailed, format!("cannot digest the trial: {e}")))
     }
 
+    /// The record as `create_trial` writes it before the run: no exit, window or binary yet.
+    /// The tool is never pre-existing: `run` refuses a tool that is already on PATH.
+    fn record(&self, created: u64, before: Vec<Observed>) -> TrialRecord {
+        TrialRecord {
+            schema: TRIAL_SCHEMA_SCRIPT,
+            binding: self.stamp.clone(),
+            trial_id: self.trial_id.clone(),
+            tool: self.tool.clone(),
+            created_unix_ns: created,
+            baseline: Baseline {
+                data: self.data.clone(),
+                tool_preexisting: false,
+                paths: self.baseline.clone(),
+                owners: vec![],
+            },
+            owned_outputs: vec![],
+            package: None,
+            unknown: UNKNOWN.iter().map(|u| u.to_string()).collect(),
+            adopted: None,
+            script: Some(TrialScript {
+                url: self.url.clone(),
+                effective_url: self.fetched.effective_url.clone(),
+                sha256: self.fetched.sha256.clone(),
+                bytes: self.fetched.bytes,
+                shell: self.shell.clone(),
+                args: self.args.clone(),
+                env: self.env.clone(),
+                tty: self.tty,
+                before,
+                exit: None,
+                window: None,
+                binary: None,
+            }),
+        }
+    }
+
     fn print(&self, out: &mut dyn Write, digest: &str) -> std::io::Result<()> {
         let f = &self.fetched;
         let file = visible(&f.path.display().to_string());
@@ -653,6 +695,89 @@ impl Decision {
     }
 }
 
+/// `sandbox-exec`, resolved with the system tools first, after a dry run of `profile` under it:
+/// a profile the system does not accept refuses before the preview, not after the record.
+fn sandbox_exec(runner: &Runner, profile: &str) -> Result<PathBuf, Refusal> {
+    let unsupported = |why: String| Refusal::new(Code::PlatformUnsupported, why);
+    let tools = system_tools(runner);
+    let path = tools.resolve("sandbox-exec").map_err(|_| {
+        unsupported("sandbox-exec is not available; a script trial needs it".into())
+    })?;
+    let args = ["-p", profile, "/usr/bin/true"].map(String::from);
+    let o = tools.run(&Request {
+        program: "sandbox-exec",
+        args: &args,
+        env: &[],
+        stdin: None,
+        timeout: Duration::from_secs(30),
+        max_stdout: 4096,
+    })?;
+    match o.end {
+        End::Exited(0) => Ok(path),
+        End::Stopped(r) => Err(r),
+        _ => Err(unsupported(format!(
+            "the sandbox profile was not accepted: {}",
+            bounded_visible(String::from_utf8_lossy(&o.stderr).trim(), 512)
+        ))),
+    }
+}
+
+/// How the script ended, for the record, and the refusal a run that did not succeed ends with.
+fn ended(end: Result<End, Refusal>) -> (Option<ScriptExit>, Option<Refusal>) {
+    let signal = |s: &str| {
+        Some(ScriptExit {
+            code: None,
+            signal: Some(s.into()),
+        })
+    };
+    let failed = |why: String| Some(Refusal::new(Code::IoFailed, why));
+    match end {
+        Ok(End::Exited(code)) => (
+            Some(ScriptExit {
+                code: Some(code),
+                signal: None,
+            }),
+            (code != 0)
+                .then(|| format!("the script exited {code}"))
+                .and_then(failed),
+        ),
+        // The stop request keeps its own code, so the exit stays 130 or 143.
+        Ok(End::Stopped(r)) => (signal("stopped"), Some(r)),
+        Ok(End::TimedOut) => (
+            signal("timeout"),
+            failed(format!(
+                "the script ran longer than {} seconds; its process group was ended",
+                SCRIPT_TIMEOUT.as_secs()
+            )),
+        ),
+        Ok(End::Signaled) => (
+            signal("signal"),
+            failed("the script was ended by a signal".into()),
+        ),
+        Err(e) => (None, Some(e)),
+    }
+}
+
+/// The tracked changes between two `tracked_status` snapshots, as the upgrade step reports them.
+fn tracked_changes(
+    before: &std::collections::BTreeMap<String, (String, String)>,
+    now: &std::collections::BTreeMap<String, (String, String)>,
+) -> Vec<String> {
+    let paths: BTreeSet<&String> = before.keys().chain(now.keys()).collect();
+    paths
+        .into_iter()
+        .filter(|p| before.get(*p) != now.get(*p))
+        .map(|p| {
+            // A path that left the status was changed back to its committed form.
+            let code = now.get(p).map_or("restored", |(xy, _)| xy.trim());
+            format!(
+                "the script changed the tracked file {} ({code}); it is left in place, not reverted, staged or committed",
+                visible(p)
+            )
+        })
+        .collect()
+}
+
 pub(super) fn run(
     ctx: &Ctx,
     args: &Args,
@@ -680,10 +805,30 @@ pub(super) fn run(
     // The fetch runs before anything is decided, so a stop request ends curl instead of
     // leaving it running.
     signal::install()?;
+    let stop = || signal::requested().map_or(Ok(()), Err);
     let (layout, sys) = (ctx.layout(), ctx.sys()?);
+    // A tool that is already on PATH would hide what the script installs; nothing is fetched.
+    let path_var = std::env::var_os("PATH").unwrap_or_default();
+    let found = on_path(&layout.home, &path_var, &tool);
+    if !found.is_empty() {
+        let shown: Vec<String> = found
+            .iter()
+            .map(|p| visible(&p.display().to_string()))
+            .collect();
+        return Err(Refusal::new(
+            Code::Conflict,
+            format!(
+                "an executable named {tool} is already on PATH: {}; remove or purge it first",
+                shown.join(", ")
+            ),
+        ));
+    }
+    // The checkouts the sandbox protects and the guard watches hang off the bound root.
+    let (root, _) = crate::canonical_root(&binding, None)?;
     let runner = ctx.runner(&sys);
     let fail = state_cmd::fail_from_env()?;
-    let readable = Store::open_read(sys, &layout, fail)?.ok_or_else(crate::state_lost_refusal)?;
+    let readable =
+        Store::open_read(sys, &layout, fail.clone())?.ok_or_else(crate::state_lost_refusal)?;
     readable.require_identity(&binding)?;
     let paths = candidates(&layout.home, &tool, &args.configs)?;
     for p in &paths {
@@ -699,65 +844,268 @@ pub(super) fn run(
             Err(e) => skipped.push(format!("{d} not observed ({})", e.detail)),
         }
     }
+    let missing = || {
+        Refusal::new(
+            Code::PlanStale,
+            format!(
+                "the script cache for {} is missing; run the preview again",
+                visible(&s.url)
+            ),
+        )
+    };
     // An approval runs the bytes the preview cached; it never fetches again.
     let fetched = match &args.yes_plan {
         None => fetch(&runner, &layout.cache_dir, &s.url)?,
-        Some(_) => cached(&layout.cache_dir, &s.url)?.ok_or_else(|| {
-            Refusal::new(
-                Code::PlanStale,
-                format!(
-                    "the script cache for {} is missing; run the preview again",
-                    visible(&s.url)
-                ),
-            )
-        })?,
+        Some(_) => cached(&layout.cache_dir, &s.url)?.ok_or_else(missing)?,
     };
-    if let Some(stop) = signal::requested() {
-        return Err(stop);
-    }
+    stop()?;
     let dfm_env: Vec<(String, String)> = std::env::vars_os()
         .filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?)))
         .collect();
-    let env = script_env(&runner, &dfm_env, s.tty, &s.env)?;
-    let baseline = paths.iter().map(|p| observe(p)).collect::<Result<_, _>>()?;
-    let mut seen = Vec::new();
-    for p in &data {
-        match observe(p) {
-            Ok(b) => seen.push(b),
-            Err(e) => skipped.push(format!("{p} not observed ({})", e.detail)),
+    // The decision and the sandbox profile for it; the profile is not in the digest, because
+    // it follows from the ledger and the layout, which the lock and the identity check cover.
+    let decide = |fetched: Fetched, ledger: &Ledger| -> Result<(Decision, String), Refusal> {
+        let env = script_env(&runner, &dfm_env, s.tty, &s.env)?;
+        let temp = env
+            .iter()
+            .find_map(|(n, v)| (n == "TMPDIR").then(|| PathBuf::from(v)))
+            .unwrap_or_else(std::env::temp_dir);
+        let profile = profile(&protected(&layout, &root, ledger, &temp)?)?;
+        let baseline = paths.iter().map(|p| observe(p)).collect::<Result<_, _>>()?;
+        let (mut seen, mut skipped) = (Vec::new(), skipped.clone());
+        for p in &data {
+            match observe(p) {
+                Ok(b) => seen.push(b),
+                Err(e) => skipped.push(format!("{p} not observed ({})", e.detail)),
+            }
         }
-    }
-    let decision = Decision {
-        trial_id,
-        tool,
-        url: s.url.clone(),
-        fetched,
-        shell: s.shell.clone(),
-        args: s.args.clone(),
-        env,
-        tty: s.tty,
-        baseline,
-        data: seen,
-        skipped,
-        binary,
-        stamp,
+        let decision = Decision {
+            trial_id: trial_id.clone(),
+            tool: tool.clone(),
+            url: s.url.clone(),
+            fetched,
+            shell: s.shell.clone(),
+            args: s.args.clone(),
+            env,
+            tty: s.tty,
+            baseline,
+            data: seen,
+            skipped,
+            binary: binary.clone(),
+            stamp: stamp.clone(),
+        };
+        Ok((decision, profile))
     };
-    let digest = decision.digest()?;
+    let (first, profile_text) = decide(fetched, &readable.read_ledger_lenient()?)?;
+    let sandbox = sandbox_exec(&runner, &profile_text)?;
+    stop()?;
+    let digest = first.digest()?;
     if let Some(i) = &ctx.isolated {
         writeln!(out, "isolated: true {i}").map_err(w)?;
     }
-    decision.print(out, &digest).map_err(w)?;
-    match &args.yes_plan {
-        Some(approved) if *approved != digest => Err(stale(approved, &digest)),
-        Some(_) => Err(usage("the script run is not implemented yet")),
-        None if args.preview => Ok(()),
-        None => Err(Refusal::new(
-            Code::ApprovalRequired,
+    first.print(out, &digest).map_err(w)?;
+    let approved = match &args.yes_plan {
+        Some(approved) if *approved != digest => return Err(stale(approved, &digest)),
+        Some(approved) => approved,
+        None if args.preview => return Ok(()),
+        None => {
+            return Err(Refusal::new(
+                Code::ApprovalRequired,
+                format!(
+                    "nothing was changed. Fix: read the trial above, then run again with --yes-plan {digest}"
+                ),
+            ));
+        }
+    };
+    if s.tty && !std::io::stdin().is_terminal() {
+        return Err(usage("--tty needs a terminal on standard input"));
+    }
+    let conflict = || {
+        Refusal::new(
+            Code::Conflict,
             format!(
-                "nothing was changed. Fix: read the trial above, then run again with --yes-plan {digest}"
+                "trial {trial_id} already exists in state/trials/; nothing was changed. Fix: pass another --id"
+            ),
+        )
+    };
+    let file = format!("{trial_id}.json");
+    if readable.load().trials.iter().any(|(n, _)| *n == file) {
+        return Err(conflict());
+    }
+    drop(readable);
+    fail.hit("trial-before-lock")?;
+
+    // Take the lock, then decide again from the cached bytes: the ledger, the baseline or the
+    // cache may have changed since the preview.
+    let store = Store::open_write_with(sys, &layout, fail.clone(), false)?;
+    if !store.is_initialized() {
+        return Err(store.stamp(crate::state_lost_refusal()));
+    }
+    let locked = (|| {
+        store.require_identity(&binding)?;
+        let ledger = store.read_ledger()?;
+        let fetched = cached(&layout.cache_dir, &s.url)?.ok_or_else(missing)?;
+        let (locked, profile) = decide(fetched, &ledger)?;
+        stop()?;
+        let locked_digest = locked.digest()?;
+        if locked_digest != digest {
+            return Err(stale(approved, &locked_digest));
+        }
+        Ok((locked, profile))
+    })();
+    let (locked, profile_text) = locked.map_err(|r| store.stamp(r))?;
+    let started = now_ns().map_err(|r| store.stamp(r))?;
+    let op_id = format!("trial-{started}-{}", std::process::id());
+    // The guard snapshot and the window baseline come before the record, so the record never
+    // claims a window that was not observed.
+    let git = Git::new(ctx, &sys);
+    let watch: Vec<Watch> = window::watch_set(&layout.home, &locked.env);
+    let (checkouts, tracked, before) = (|| {
+        let checkouts = guarded_checkouts(&root)?;
+        let tracked = tracked_status(&git, &checkouts)?;
+        Ok((checkouts, tracked, window::observe(&watch)?))
+    })()
+    .map_err(|r: Refusal| store.stamp(r))?;
+    let mut record = locked.record(started, before);
+    // The exclusive create makes a record another run wrote since the check above a conflict.
+    if !store.create_trial(&record)? {
+        return Err(store.stamp(conflict()));
+    }
+    fail.hit("trial-script-after-record")
+        .map_err(|r| store.stamp(r))?;
+
+    // From here on the record exists and every outcome ends in a receipt and a result line; a
+    // refusal is after a mutation, so it exits 1 (or the stop request's own exit).
+    let journal = |phase, recovery, reason| -> Result<(), Refusal> {
+        store.append_journal(&JournalEntry {
+            schema: SCHEMA,
+            op_id: op_id.clone(),
+            op: "trial-script".into(),
+            phase,
+            at: rfc3339(now_ns()?),
+            resource: trial_id.clone(),
+            adapter: ADAPTER.into(),
+            class: Class::Normal,
+            recovery,
+            token: None,
+            reason,
+        })
+    };
+    // The intent has no path: the window in the record is what the run changed.
+    let empty = Recovery {
+        outputs: vec![],
+        snapshot: None,
+    };
+    let end = journal(Phase::Intent, Some(empty), None).and_then(|()| {
+        let mut argv = vec![
+            "-p".to_string(),
+            profile_text,
+            format!("/bin/{}", locked.shell),
+            locked.fetched.path.display().to_string(),
+        ];
+        argv.extend(locked.args.iter().cloned());
+        runner.run_shown(&Shown {
+            program: &sandbox,
+            args: &argv,
+            env: &locked.env,
+            tty: locked.tty,
+            timeout: SCRIPT_TIMEOUT,
+        })
+    });
+    let (exit, failed) = ended(end);
+    let mut problems: Vec<Refusal> = failed.into_iter().collect();
+    let found = window::binary(&layout.home, &path_var, &tool);
+    if let Some(sc) = record.script.as_mut() {
+        sc.window = match window::observe(&watch) {
+            Ok(after) => Some(window::diff(&sc.before, &after)),
+            Err(e) => {
+                problems.push(e);
+                None
+            }
+        };
+        sc.exit = exit;
+        sc.binary = found;
+    }
+    match tracked_status(&git, &checkouts) {
+        Ok(now) => {
+            let changed = tracked_changes(&tracked, &now);
+            if !changed.is_empty() {
+                problems.push(Refusal::new(Code::Conflict, changed.join("; ")));
+            }
+        }
+        Err(e) => problems.push(Refusal::new(
+            e.code,
+            format!(
+                "the tracked files could not be checked after the script: {}",
+                e.detail
             ),
         )),
     }
+    if let Err(e) = store.write_trial(&record) {
+        problems.push(e);
+    }
+    // The record keeps the script's sha256; a later preview fetches it again.
+    let (cache_file, sidecar) = cache_paths(&layout.cache_dir, &s.url);
+    for p in [cache_file, sidecar] {
+        if let Err(e) = fs::remove_file(&p)
+            && e.kind() != std::io::ErrorKind::NotFound
+        {
+            problems.push(io_failed(&p)(e));
+        }
+    }
+    if problems.is_empty()
+        && let Err(n) = journal(Phase::Done, None, None)
+    {
+        problems.push(Refusal::new(
+            n.code,
+            format!(
+                "the script ran, but the outcome could not be journaled: {}",
+                n.detail
+            ),
+        ));
+    }
+    let stopped = problems.first().map(|first| {
+        // The first problem keeps its code (a stop request first of all); the text names all.
+        let detail: Vec<&str> = problems.iter().map(|p| p.detail.as_str()).collect();
+        let mut e = Refusal::new(first.code, detail.join("; "));
+        if let Err(n) = journal(Phase::Failed, None, Some(bounded_visible(&e.detail, 1024))) {
+            e = Refusal::new(
+                e.code,
+                format!(
+                    "{}; the outcome could not be journaled: {}",
+                    e.detail, n.detail
+                ),
+            );
+        }
+        e.after_mutation()
+    });
+    if record.script.as_ref().is_some_and(|sc| sc.binary.is_none()) {
+        writeln!(
+            out,
+            "note: the tool {tool} is not on PATH or cannot be hashed"
+        )
+        .map_err(w)?;
+    }
+    conclude(
+        ctx,
+        &store,
+        Outcome {
+            trial_id: &trial_id,
+            op_id: &op_id,
+            adapter: ADAPTER,
+            status: if stopped.is_none() {
+                Status::Updated
+            } else {
+                Status::Failed
+            },
+            started,
+            stopped,
+            binary,
+            stamp,
+            digest,
+        },
+        out,
+    )
 }
 
 #[cfg(test)]
