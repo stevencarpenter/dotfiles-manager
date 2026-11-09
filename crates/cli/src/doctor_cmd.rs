@@ -338,9 +338,18 @@ fn script_binary_rows(
     for t in trials.iter().filter(|t| t.is_active()) {
         let who = format!("script trial {}", t.trial_id);
         let fix = "Install the tool again, or end the trial.";
-        rows.push(match recorded(t) {
-            Some(b) => row(&who, Path::new(&b.path), Some(b), fix),
-            None => Row::new(
+        // The trial records no binary it cannot hash (over 16 MiB, unreadable), so an executable
+        // PATH finds now is present with no digest to compare, not missing.
+        let found = || crate::trial_cmd::window::locate(home, path, &t.tool);
+        rows.push(match (recorded(t), found()) {
+            (Some(b), _) => row(&who, Path::new(&b.path), Some(b), fix),
+            (None, Some(at)) => row(
+                &format!("{who}: no digest was recorded; PATH finds the tool"),
+                &at,
+                None,
+                fix,
+            ),
+            (None, None) => Row::new(
                 "binary",
                 D::ScriptBinary,
                 Level::Warn,
@@ -375,10 +384,25 @@ fn script_binary_rows(
     }
 }
 
-/// Whether the binary path or the file it resolves to is a sensitive managed output. The
-/// sensitive paths are relative to HOME and folded. Each is also resolved, without reading it, so
-/// a link in HOME or in its parents still matches.
-fn is_sensitive(home: &Path, at: &Path, real: &Path, sensitive: &BTreeSet<String>) -> bool {
+/// The metadata of each sensitive path's resolved target (HOME-relative, folded). Only
+/// metadata is read, never the content.
+fn sensitive_targets(home: &Path, sensitive: &BTreeSet<String>) -> Vec<std::fs::Metadata> {
+    sensitive
+        .iter()
+        .filter_map(|s| std::fs::metadata(home.join(s)).ok())
+        .collect()
+}
+
+/// Whether the binary path or the file it resolves to is a sensitive managed output: by path
+/// (HOME-relative, folded) or by file identity (`dev`, `ino`), so a link or a hard link to a
+/// sensitive file in HOME or in its parents still matches.
+fn is_sensitive(
+    home: &Path,
+    at: &Path,
+    real: &Path,
+    sensitive: &BTreeSet<String>,
+    targets: &[std::fs::Metadata],
+) -> bool {
     let real_home = std::fs::canonicalize(home).unwrap_or_else(|_| home.to_path_buf());
     let hit = |p: &Path, h: &Path| {
         p.strip_prefix(h)
@@ -386,9 +410,11 @@ fn is_sensitive(home: &Path, at: &Path, real: &Path, sensitive: &BTreeSet<String
     };
     hit(at, home)
         || hit(real, &real_home)
-        || sensitive
-            .iter()
-            .any(|s| std::fs::canonicalize(home.join(s)).is_ok_and(|c| c == real))
+        || std::fs::metadata(real).is_ok_and(|m| {
+            targets
+                .iter()
+                .any(|t| (t.dev(), t.ino()) == (m.dev(), m.ino()))
+        })
 }
 
 /// The row of one script binary. The path is resolved through its links again and the file it
@@ -411,6 +437,7 @@ fn binary_row(
     use crate::trial_cmd::window::{HASH_CAP, hash};
     let mut notes = vec![who.to_string()];
     let mut fix = "";
+    let targets = sensitive_targets(home, sensitive);
     match std::fs::canonicalize(at) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             fix = missing_fix;
@@ -424,7 +451,7 @@ fn binary_row(
             fix = missing_fix;
             notes.push(format!("the binary path cannot be resolved: {}", e.kind()));
         }
-        Ok(real) if is_sensitive(home, at, &real, sensitive) => {
+        Ok(real) if is_sensitive(home, at, &real, sensitive, &targets) => {
             fix = "Point the binary path to the tool's own file, then install the tool again.";
             notes.push(
                 "the binary resolves to a sensitive managed output, which is not read".into(),
@@ -434,9 +461,16 @@ fn binary_row(
             let meta = std::fs::metadata(&real).ok().filter(|m| m.is_file());
             let len = meta.as_ref().map(|m| m.len());
             // As the trial requires (DFM-83): the owner execute bit.
-            let runnable = meta.is_some_and(|m| m.permissions().mode() & 0o100 != 0);
+            let runnable = meta
+                .as_ref()
+                .is_some_and(|m| m.permissions().mode() & 0o100 != 0);
+            // A second name for the file can be a sensitive output whose path the set does not
+            // name (a hard link made after the ledger entry), so such a file is not read.
+            let shared = meta
+                .as_ref()
+                .is_some_and(|m| m.nlink() > 1 && targets.iter().any(|t| t.dev() == m.dev()));
             let digest = len
-                .filter(|n| runnable && *n <= HASH_CAP)
+                .filter(|n| runnable && !shared && *n <= HASH_CAP)
                 .and_then(|_| hash(&real));
             notes.push(match (len, digest) {
                 (Some(_), _) if !runnable => {
@@ -446,6 +480,11 @@ fn binary_row(
                         real.display()
                     )
                 }
+                (Some(_), _) if shared => format!(
+                    "resolves to {}, which has more than one hard link on the file system of a \
+                     sensitive managed output and is not hashed",
+                    real.display()
+                ),
                 (None, _) => {
                     fix = missing_fix;
                     format!(

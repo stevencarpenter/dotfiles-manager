@@ -2183,3 +2183,76 @@ fn a_binary_without_the_owner_execute_bit_is_warn() {
     assert!(detail(&r).contains("not executable by its owner"), "{r:#}");
     assert!(r["fix"].as_str().unwrap().contains("chmod u+x"), "{r:#}");
 }
+
+#[test]
+fn a_binary_hard_linked_to_a_sensitive_output_is_not_hashed() {
+    if no_sandbox() {
+        return;
+    }
+    let fx = Fx::new();
+    fx.bind_with_links();
+    fx.script_trial(BARE, &[]);
+    let secret = fx.tool_file(".vault/token", b"hunter2-secret");
+    let f = fx.state().join("ledger.json");
+    let mut l: serde_json::Value = serde_json::from_slice(&fs::read(&f).unwrap()).unwrap();
+    l["resources"]
+        .as_array_mut()
+        .unwrap()
+        .push(serde_json::json!({
+            "resource": "vault", "adapter": "fs-link/v1", "class": "sensitive", "op_id": "x-1",
+            "owned_outputs": [{"path": secret, "mode": 420, "fingerprint": null}],
+        }));
+    fs::write(&f, serde_json::to_vec(&l).unwrap()).unwrap();
+    // A second name for the same inode: no path comparison can see it.
+    let link = fx.h(".local/bin/boat");
+    fs::remove_file(&link).unwrap();
+    fs::hard_link(&secret, &link).unwrap();
+    let rows = fx.binary_rows(&fx.path_var());
+    let json = serde_json::to_string(&rows).unwrap();
+    assert!(!json.contains(&sha(b"hunter2-secret")), "{rows:#?}");
+    let r = rows
+        .iter()
+        .find(|r| r["subject"] == link.to_str().unwrap())
+        .unwrap();
+    assert_eq!(r["status"], "WARN", "{r:#}");
+    assert!(
+        detail(r).contains("the binary resolves to a sensitive managed output"),
+        "{r:#}"
+    );
+}
+
+#[test]
+fn a_binary_over_the_hash_cap_is_present_with_no_digest() {
+    if no_sandbox() {
+        return;
+    }
+    let fx = Fx::new();
+    fx.bind_with_links();
+    // A sparse executable just over 16 MiB: the trial records no binary it cannot hash.
+    fx.script_trial(
+        &BARE.replace(
+            "chmod 755",
+            "dd if=/dev/null of=\"$HOME/.bare/bin/boat\" bs=1 seek=16777217 2>/dev/null\nchmod 755",
+        ),
+        &[],
+    );
+    let r = fx.binary_row();
+    assert_eq!(r["status"], "OK", "{r:#}");
+    assert_eq!(
+        r["subject"],
+        fx.h(".local/bin/boat").to_str().unwrap(),
+        "{r:#}"
+    );
+    assert!(detail(&r).contains("no digest was recorded"), "{r:#}");
+    assert!(detail(&r).contains("larger than 16 MiB"), "{r:#}");
+    assert!(!detail(&r).contains("sha256"), "{r:#}");
+    // The second-copy check still runs.
+    fx.tool_file(".other/boat", b"#!/bin/sh\necho other\n");
+    let rows = fx.binary_rows(&format!("{}:{}", fx.path_var(), fx.h(".other").display()));
+    let r = &rows[0];
+    assert_eq!(r["status"], "WARN", "{r:#}");
+    assert!(
+        detail(r).contains("PATH holds 2 different files named boat"),
+        "{r:#}"
+    );
+}

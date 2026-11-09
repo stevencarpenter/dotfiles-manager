@@ -301,19 +301,22 @@ pub(super) fn shrink_window(record: &mut TrialRecord, budget: usize) -> Result<S
     Ok(shrunk)
 }
 
-/// The first executable named `tool` on `path_var` and then on the provider path: `path` is
-/// the candidate as found, `real_path` its canonical form, `sha256` the digest of the real
-/// file. `None` when no executable is found, and also when the real file is over `HASH_CAP` or
-/// unreadable, because a record without a valid digest cannot be saved; the caller reports
-/// "not on PATH or cannot be hashed". Relative and empty PATH entries are skipped.
-pub(super) fn binary(home: &Path, path_var: &OsStr, tool: &str) -> Option<ScriptBinary> {
-    let candidate = std::env::split_paths(path_var)
+/// The first executable file named `tool` on `path_var` and then on the provider path, as
+/// found (not resolved). Nothing is read. Relative and empty PATH entries are skipped.
+pub(crate) fn locate(home: &Path, path_var: &OsStr, tool: &str) -> Option<PathBuf> {
+    std::env::split_paths(path_var)
         .chain(crate::provider_path(home))
         .filter(|d| d.is_absolute())
         .map(|d| d.join(tool))
-        .find(|c| {
-            fs::metadata(c).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
-        })?;
+        .find(|c| fs::metadata(c).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0))
+}
+
+/// The executable `locate` finds: `path` is the candidate as found, `real_path` its canonical
+/// form, `sha256` the digest of the real file. `None` when no executable is found, and also
+/// when the real file is over `HASH_CAP` or unreadable, because a record without a valid digest
+/// cannot be saved; the caller reports "not on PATH or cannot be hashed".
+pub(super) fn binary(home: &Path, path_var: &OsStr, tool: &str) -> Option<ScriptBinary> {
+    let candidate = locate(home, path_var, tool)?;
     let real = fs::canonicalize(&candidate).ok()?;
     Some(ScriptBinary {
         path: candidate.to_string_lossy().into_owned(),
