@@ -1330,6 +1330,13 @@ fn a_checkout_configuration_outside_the_allowlist_is_refused_before_any_fetch() 
             "--no-ff".to_string(),
             "branch.*.mergeoptions",
         ),
+        // A tool namespace that is not on the allowlist: its presence means an unlisted tool
+        // wrote into the checkout.
+        (
+            "sometool.defaultBranch",
+            "main".to_string(),
+            "sometool.defaultbranch",
+        ),
         // A remote section named after the origin URL: git matches the fetch argument against
         // it and would fetch from its url instead.
         (
@@ -1361,7 +1368,6 @@ fn a_checkout_configuration_outside_the_allowlist_is_refused_before_any_fetch() 
         ("remote.second.url", "/nowhere"),
         ("remote.second.fetch", "+refs/heads/*:refs/remotes/second/*"),
         ("branch.main.vscode-merge-base", "origin/main"),
-        ("coderabbit.defaultBranch", "main"),
         ("worktrunk.default-branch", "main"),
         ("worktrunk.hints.shell-integration", "false"),
         ("worktrunk.history", "1"),
