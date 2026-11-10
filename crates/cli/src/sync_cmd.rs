@@ -578,8 +578,8 @@ fn config_key_allowed(key: &str) -> bool {
     let Some((section, rest)) = key.split_once('.') else {
         return false;
     };
-    // Namespaces of tools that write into .git/config; git itself reads no key there.
-    if matches!(section, "worktrunk" | "coderabbit") {
+    // The namespace of a tool that writes into .git/config; git itself reads no key there.
+    if section == "worktrunk" {
         return true;
     }
     let Some((nick, name)) = rest.rsplit_once('.') else {

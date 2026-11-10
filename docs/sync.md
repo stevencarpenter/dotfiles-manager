@@ -199,7 +199,7 @@ The allowlist is what `git init` and `git clone` write, plus the identity keys:
 - `remote.<name>.url`, `remote.<name>.fetch`, `remote.<name>.pushurl`
 - `branch.<name>.remote`, `branch.<name>.merge`, `branch.<name>.vscode-merge-base`
 - `user.name`, `user.email`
-- the whole `worktrunk.*` and `coderabbit.*` sections (tool namespaces git never reads)
+- the whole `worktrunk.*` section (a tool namespace git never reads)
 
 A `remote.<name>.*` key is allowed only under a plain nickname (no `/`, no `:`). Git matches a fetch argument against the configured nicknames before it treats it as a URL, so `[remote "https://host/x"] url = elsewhere` would redirect a fetch of `https://host/x` (tested). A canonical origin always holds `://` and a staging path starts with `/`, so neither can equal a plain nickname. The listed `branch.*` keys are inert, because `merge --ff-only <commit>` and `checkout --detach <commit>` read no remote. `branch.<name>.mergeOptions` and `.rebase` stay refused, because `mergeOptions` reaches `merge`. `user.*` is inert, because sync never commits.
 
