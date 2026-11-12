@@ -11,12 +11,13 @@ pub enum Updater {
     Npm,
     Opencode,
     Rustup,
+    SideChannels,
     Skills,
     Uv,
 }
 
 impl Updater {
-    pub const ALL: [Updater; 10] = [
+    pub const ALL: [Updater; 11] = [
         Updater::Agents,
         Updater::Brew,
         Updater::Claude,
@@ -25,6 +26,7 @@ impl Updater {
         Updater::Npm,
         Updater::Opencode,
         Updater::Rustup,
+        Updater::SideChannels,
         Updater::Skills,
         Updater::Uv,
     ];
@@ -39,6 +41,7 @@ impl Updater {
             Updater::Npm => "npm",
             Updater::Opencode => "opencode",
             Updater::Rustup => "rustup",
+            Updater::SideChannels => "side-channels",
             Updater::Skills => "skills",
             Updater::Uv => "uv",
         }

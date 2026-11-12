@@ -62,6 +62,7 @@ fn owner_dir(u: Updater) -> Option<&'static str> {
         | Updater::Brew
         | Updater::Mise
         | Updater::Npm
+        | Updater::SideChannels
         | Updater::Skills
         | Updater::Uv => None,
     }
@@ -229,6 +230,7 @@ pub fn run(u: Updater, env: &Env) -> Row {
         Updater::Mise => mise(d, env),
         Updater::Npm => npm(d, env),
         Updater::Rustup => rustup(d, env),
+        Updater::SideChannels => side_channels(d, env),
         Updater::Uv => uv(d, env),
         Updater::Claude | Updater::Codex | Updater::Opencode => native(d, env),
     }
@@ -325,6 +327,7 @@ pub fn second_copies(u: Updater, env: &Env) -> Vec<String> {
         | Updater::Mise
         | Updater::Npm
         | Updater::Rustup
+        | Updater::SideChannels
         | Updater::Skills
         | Updater::Uv => (None, None),
     };
@@ -1246,6 +1249,48 @@ fn agents_runner(env: &Env) -> Result<Runner, String> {
     Ok(r)
 }
 
+/// The bound checkout's recipe that the `side-channels` updater runs.
+const SIDE_CHANNELS_RECIPE: &str = "sync-side-channels";
+
+/// The bound checkout's `Justfile`, once `just` resolves on the provider path. `Err` is the
+/// blocked reason.
+fn side_channels_justfile(env: &Env) -> Result<std::path::PathBuf, String> {
+    let j = env.root.join("Justfile");
+    if !j.is_file() {
+        return Err(format!("no Justfile at {}", j.display()));
+    }
+    env.provider.resolve("just").map_err(|e| e.detail)?;
+    Ok(j)
+}
+
+/// The checkout's side channels: `just sync-side-channels` in the bound checkout. The recipe is
+/// fixed here and the checkout is the one sync fetched from a granted origin, as for the
+/// `agents` install script. It reports no version, so a success is `current`.
+fn side_channels(mut d: Draft, env: &Env) -> Row {
+    let j = match side_channels_justfile(env) {
+        Ok(j) => j,
+        Err(why) => {
+            d.notes.push(why);
+            return d.end(Status::Blocked);
+        }
+    };
+    let a = vec![
+        "--justfile".to_string(),
+        j.display().to_string(),
+        "--working-directory".to_string(),
+        env.root.display().to_string(),
+        SIDE_CHANNELS_RECIPE.to_string(),
+    ];
+    match call(env.provider, "just", &a, &[], env.timeouts.long) {
+        Ok(_) => {
+            d.notes
+                .push(format!("{SIDE_CHANNELS_RECIPE} ran; it reports no version"));
+            d.end(Status::Current)
+        }
+        Err(e) => d.stop(e),
+    }
+}
+
 /// `git -C <dir> <a>`; its trimmed standard output.
 fn git(env: &Env, dir: &Path, a: &[&str]) -> Result<String, (String, bool)> {
     let mut all = args(&["-C", &dir.display().to_string()]);
@@ -1430,6 +1475,14 @@ fn preview_command(u: Updater, env: &Env) -> String {
                 r.resolve("rustup")
                     .map(|p| p.display().to_string())
                     .unwrap_or_default()
+            ),
+            Err(why) => format!("blocked: {why}"),
+        },
+        Updater::SideChannels => match side_channels_justfile(env) {
+            Ok(j) => format!(
+                "would run just {SIDE_CHANNELS_RECIPE} in {} ({})",
+                env.root.display(),
+                j.display()
             ),
             Err(why) => format!("blocked: {why}"),
         },
@@ -1752,6 +1805,46 @@ mod tests {
                 "E_SOURCE_UNTRUSTED: no grant for npm:skills; review it, then run dfm sync --trust-origin 'npm:skills'"
             ]
         );
+        assert_eq!(t.log(), "");
+    }
+
+    #[test]
+    fn side_channels_runs_the_checkout_recipe() {
+        let t = T::new();
+        t.script(
+            &t.bin.join("just"),
+            "exit $(cat \"$st/just-exit\" 2>/dev/null || echo 0)",
+        );
+        fs::create_dir_all(&t.dots).unwrap();
+        let j = t.dots.join("Justfile");
+        fs::write(&j, "").unwrap();
+        let want = format!(
+            "just --justfile {} --working-directory {} sync-side-channels",
+            j.display(),
+            t.dots.display()
+        );
+        assert!(
+            preview(Updater::SideChannels, &t.env())
+                .starts_with("would run just sync-side-channels"),
+        );
+        let r = run(Updater::SideChannels, &t.env());
+        assert_eq!(r.status, Status::Current, "{r:?}");
+        assert_eq!(t.calls(), std::slice::from_ref(&want));
+
+        fs::create_dir_all(t.root.join("st")).unwrap();
+        fs::write(t.root.join("st/just-exit"), "3").unwrap();
+        let r = run(Updater::SideChannels, &t.env());
+        assert_eq!(r.status, Status::Failed, "{r:?}");
+        assert_eq!(t.calls(), [want.clone(), want]);
+    }
+
+    #[test]
+    fn side_channels_without_a_justfile_is_blocked() {
+        let t = T::new();
+        t.script(&t.bin.join("just"), "exit 0");
+        assert!(preview(Updater::SideChannels, &t.env()).starts_with("blocked: no Justfile at "));
+        let r = run(Updater::SideChannels, &t.env());
+        assert_eq!(r.status, Status::Blocked, "{r:?}");
         assert_eq!(t.log(), "");
     }
 

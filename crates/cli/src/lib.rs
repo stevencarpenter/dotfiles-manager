@@ -175,7 +175,7 @@ runs; a restart runs only with --restart <resource-id>. A scope that fails stops
 services plan does not run; the other scopes run, and the last lines of the output warn what waits
 and how to fix it. A blocked configuration plan refuses the run. A pin is never rewritten.
 Then the updaters the profile declares (updaters = [...], from agents, brew, claude, codex, mise,
-npm, opencode, rustup, skills, uv) run in order, detached, each reported updated, current, held, pending, failed or blocked,
+npm, opencode, rustup, side-channels, skills, uv) run in order, detached, each reported updated, current, held, pending, failed or blocked,
 with one upgrade receipt; a failure warns and the exit stays 0. --no-upgrade skips them.
 --preview fetches into staging and changes nothing else. See docs/sync.md and docs/upgrade.md.
 
