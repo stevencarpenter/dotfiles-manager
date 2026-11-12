@@ -9,7 +9,7 @@
 //! rebase, commit or push. A nested source is pinned to an exact commit, and the lock that holds
 //! the pin is never rewritten.
 
-use crate::adapters::{secret, updater};
+use crate::adapters::{checkout, secret, updater};
 use crate::plan_cmd::{plan_for, plan_with_outputs, render_body};
 use crate::read_fs::read_regular_bounded;
 use crate::source_fs::load_scoped;
@@ -613,28 +613,36 @@ fn check_config(git: &Git, live: &str) -> Result<(), Refusal> {
             visible(live)
         )));
     }
+    match refused_config_key(&String::from_utf8_lossy(&o.stdout)) {
+        None => Ok(()),
+        Some(shown) => Err(untrusted(format!(
+            "the checkout at {} configures {}, which sync does not allow because git would read it during the fetch or the fast-forward; remove it from the checkout's configuration (a global setting is not read)",
+            visible(live),
+            visible(&shown)
+        ))),
+    }
+}
+
+/// The first key of a `git config --list --show-origin -z` listing outside
+/// [`config_key_allowed`], with its subsection elided, or `None`. The command-line pins are
+/// skipped. A value is never returned: it may hold a credential.
+pub(crate) fn refused_config_key(listing: &str) -> Option<String> {
     // `-z`: `<origin>\0<key>\n<value>\0` per entry; a `-c` pin's origin is `command line:`.
-    let text = String::from_utf8_lossy(&o.stdout);
-    let mut fields = text.split('\0');
+    let mut fields = listing.split('\0');
     while let (Some(origin), Some(entry)) = (fields.next(), fields.next()) {
         let key = entry.split('\n').next().unwrap_or(entry);
         if origin == "command line:" || config_key_allowed(key) {
             continue;
         }
         // A subsection can hold a credential too (`url.https://user:token@host/.insteadOf`).
-        let shown = match (key.split_once('.'), key.rsplit_once('.')) {
+        return Some(match (key.split_once('.'), key.rsplit_once('.')) {
             (Some((section, rest)), Some((_, name))) if rest.contains('.') => {
                 format!("{section}.*.{name}")
             }
             _ => key.to_string(),
-        };
-        return Err(untrusted(format!(
-            "the checkout at {} configures {}, which sync does not allow because git would read it during the fetch or the fast-forward; remove it from the checkout's configuration (a global setting is not read)",
-            visible(live),
-            visible(&shown)
-        )));
+        });
     }
-    Ok(())
+    None
 }
 
 /// The HEAD commit of the checkout at `dir`, or `None` when there is no checkout there.
@@ -1904,7 +1912,7 @@ fn run_inner(
     // The updaters, a blocked one included, are listed before any part runs (DFM-31.C02).
     let updaters = &loaded.resolved.updaters;
     if args.apply.preview || (args.upgrade && !updaters.is_empty()) {
-        upgrade_preview(ctx, &sys, (&root, &grants), args, updaters, out)?;
+        upgrade_preview(ctx, &sys, (&root, &grants), args, &loaded.resolved, out)?;
     }
     if args.apply.preview {
         return Ok(());
@@ -2222,12 +2230,14 @@ fn status_name(s: state::Status) -> String {
         .unwrap_or_default()
 }
 
-/// The updater environment: the provider runner, HOME, the bound checkout and the grants.
+/// The updater environment: the provider runner, HOME, the bound checkout, the grants and the
+/// declared checkouts.
 fn updater_env<'a>(
     ctx: &'a Ctx,
     runner: &'a Runner,
     root: &'a Path,
     grants: &'a Grants,
+    (checkouts, agents_declared): (&'a [Result<updater::Checkout, String>], bool),
 ) -> updater::Env<'a> {
     updater::Env {
         provider: runner,
@@ -2235,7 +2245,109 @@ fn updater_env<'a>(
         root,
         timeouts: updater::Timeouts::DEFAULT,
         grants,
+        checkouts,
+        agents_declared,
+        ssh_agent: updater::ssh_agent(),
     }
+}
+
+/// The `git-checkout/v1` resources of the profile. A declaration that is not valid, or one at,
+/// above or inside a source checkout in `sources` (sync fast-forwards those), is a note of the
+/// `checkouts` row, so the other updaters still run. A path inside a source checkout that its
+/// git ignores (`ignored(root, rel)`, a plugin directory of the dotfiles) is allowed. `nested` holds the nested source paths of
+/// the lock (`nested_paths`), which decide whether the bound checkout declared each one.
+fn declared_checkouts(
+    home: &Path,
+    resolved: &Resolved,
+    sources: &[PathBuf],
+    nested: Option<&[String]>,
+    ignored: &dyn Fn(&Path, &Path) -> bool,
+) -> Vec<Result<updater::Checkout, String>> {
+    resolved
+        .resources
+        .values()
+        .filter(|r| r.adapter == checkout::ADAPTER)
+        .map(|r| {
+            let owner = crate::adapters::package::owner_source(nested, r);
+            declared_checkout(home, &r.id, &r.value, sources, owner, ignored)
+        })
+        .collect()
+}
+
+/// Whether the git of the source checkout at `root` ignores `rel`
+/// (`git check-ignore -q -- <rel>`, exit 0). Any other answer is not ignored.
+pub(crate) fn git_ignores(git: &Git, root: &Path, rel: &Path) -> bool {
+    let (Some(root), Some(rel)) = (root.to_str(), rel.to_str()) else {
+        return false;
+    };
+    git.output(true, &["-C", root, "check-ignore", "-q", "--", rel])
+        .is_ok_and(|o| o.success())
+}
+
+/// Whether a checkout at `path` would overlap a source checkout in `sources`: at or above one,
+/// or inside one whose git does not ignore it (`ignored(root, rel)`, with the canonical root).
+/// Paths are compared through links ([`real_path`]). The `checkouts` step and the
+/// `git-checkout/v1` plan share this rule (docs/upgrade.md).
+pub(crate) fn overlaps_source(
+    path: &Path,
+    sources: &[PathBuf],
+    ignored: &dyn Fn(&Path, &Path) -> bool,
+) -> bool {
+    let real = real_path(path);
+    sources.iter().any(|s| {
+        let root = real_path(s);
+        root.starts_with(&real)
+            || real
+                .strip_prefix(&root)
+                .is_ok_and(|rel| !ignored(&root, rel))
+    })
+}
+
+/// `p` through links: the nearest ancestor that exists, canonicalized, joined with the
+/// components below it that do not exist yet. A link above a path not yet cloned still counts.
+fn real_path(p: &Path) -> PathBuf {
+    p.ancestors()
+        .find_map(|a| {
+            let rest = p.strip_prefix(a).ok()?;
+            fs::canonicalize(a).ok().map(|c| c.join(rest))
+        })
+        .unwrap_or_else(|| p.to_path_buf())
+}
+
+/// One declared checkout at HOME joined with its path, or the note `<id>: <reason>`.
+fn declared_checkout(
+    home: &Path,
+    id: &str,
+    value: &dfm_model::resolve::Value,
+    sources: &[PathBuf],
+    owner_declared: bool,
+    ignored: &dyn Fn(&Path, &Path) -> bool,
+) -> Result<updater::Checkout, String> {
+    let d = checkout::declared(value).map_err(|e| format!("{id}: {}", e.detail))?;
+    let path = home.join(d.path);
+    if overlaps_source(&path, sources, ignored) {
+        return Err(format!(
+            "{id}: {} is a dotfiles source checkout; sync updates it",
+            path.display()
+        ));
+    }
+    Ok(updater::Checkout {
+        id: id.to_string(),
+        url: d.url,
+        path,
+        owner_declared,
+    })
+}
+
+/// The nested source paths of the lock at `root`, relative to it, for
+/// [`dfm_model::resolve::owner_declared`]. A checkout without a sync lock has none. `None` is a
+/// lock that cannot be read: then no declaration counts as the owner's.
+pub(crate) fn nested_paths(root: &Path) -> Option<Vec<String>> {
+    if no_sync_sources(root) {
+        return Some(Vec::new());
+    }
+    let lock = read_lock(root).ok()?;
+    Some(lock.nested().iter().map(|s| s.path.clone()).collect())
 }
 
 /// The checkouts the tracked-file guard watches (DFM-25, G5): the bound checkout and each nested
@@ -2320,9 +2432,10 @@ fn upgrade_preview(
     sys: &Sys,
     (root, grants): (&Path, &Grants),
     args: &Args,
-    updaters: &[Updater],
+    resolved: &Resolved,
     out: &mut dyn Write,
 ) -> Result<(), Refusal> {
+    let updaters = &resolved.updaters;
     let w =
         |e: std::io::Error| Refusal::new(Code::IoFailed, format!("output failed: {}", e.kind()));
     if !args.upgrade {
@@ -2332,7 +2445,17 @@ fn upgrade_preview(
         return writeln!(out, "upgrade: none declared in the profile").map_err(w);
     }
     let runner = ctx.runner(sys);
-    let env = updater_env(ctx, &runner, root, grants);
+    // A declared checkout at a source checkout is left to sync's own fast-forward.
+    let git = Git::new(ctx, sys);
+    let checkouts = declared_checkouts(
+        ctx.platform.home(),
+        resolved,
+        &guarded_checkouts(root)?,
+        nested_paths(root).as_deref(),
+        &|root, rel| git_ignores(&git, root, rel),
+    );
+    let agents = updaters.contains(&Updater::Agents);
+    let env = updater_env(ctx, &runner, root, grants, (&checkouts, agents));
     writeln!(out, "{}", paint::label(ctx.color, "upgrade:")).map_err(w)?;
     for u in updaters {
         writeln!(
@@ -2389,10 +2512,10 @@ fn upgrade(
         return Err(crate::state_lost_refusal());
     }
     store.require_identity(binding)?;
-    let declared = resolve(&load_scoped(root, rel)?, rel, &builtin_catalog())?.updaters;
+    let resolved = resolve(&load_scoped(root, rel)?, rel, &builtin_catalog())?;
     let updaters: Vec<Updater> = reviewed
         .iter()
-        .filter(|u| declared.contains(u))
+        .filter(|u| resolved.updaters.contains(u))
         .copied()
         .collect();
     if updaters.is_empty() {
@@ -2405,11 +2528,19 @@ fn upgrade(
     let started = now_ns()?;
     let mut runner = ctx.runner(sys);
     runner.detach = true;
-    let env = updater_env(ctx, &runner, root, &grants);
+    let checkouts = guarded_checkouts(root)?;
+    let git = Git::new(ctx, sys);
+    let declared = declared_checkouts(
+        ctx.platform.home(),
+        &resolved,
+        &checkouts,
+        nested_paths(root).as_deref(),
+        &|root, rel| git_ignores(&git, root, rel),
+    );
+    let agents = updaters.contains(&Updater::Agents);
+    let env = updater_env(ctx, &runner, root, &grants, (&declared, agents));
     // The tracked-file guard (DFM-25, G5): the tracked changes before the updaters, compared
     // after each one that ran. A change it made fails its row and stays in place.
-    let git = Git::new(ctx, sys);
-    let checkouts = guarded_checkouts(root)?;
     let mut tracked = tracked_status(&git, &checkouts)?;
     writeln!(out, "{}", paint::label(ctx.color, "upgrade:")).map_err(w)?;
     let mut ops = Vec::new();
@@ -2550,6 +2681,133 @@ fn untrusted_refusal(origins: &[&str]) -> Refusal {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_invalid_checkout_value_is_a_note_not_a_refusal() {
+        let home = Path::new("/h");
+        let value = |url: &str| {
+            dfm_model::resolve::Value::Table(
+                toml::from_str(&format!("url = {url:?}\npath = \"x/r\"\n")).unwrap(),
+            )
+        };
+        assert_eq!(
+            declared_checkout(
+                home,
+                "extra.r",
+                &value("https://github.com/o/r.git"),
+                &[],
+                true,
+                &never,
+            ),
+            Ok(updater::Checkout {
+                id: "extra.r".into(),
+                url: "https://github.com/o/r.git".into(),
+                path: home.join("x/r"),
+                owner_declared: true,
+            })
+        );
+        let e = declared_checkout(home, "extra.bad", &value("o/r"), &[], true, &never).unwrap_err();
+        assert!(e.starts_with("extra.bad: url "), "{e}");
+    }
+
+    #[test]
+    fn a_checkout_at_or_inside_a_source_checkout_is_a_note() {
+        let home = Path::new("/h");
+        let at = |path: &str| {
+            let v = dfm_model::resolve::Value::Table(
+                toml::from_str(&format!(
+                    "url = \"https://github.com/o/r.git\"\npath = {path:?}\n"
+                ))
+                .unwrap(),
+            );
+            declared_checkout(
+                home,
+                "extra.r",
+                &v,
+                &[home.join("dots"), home.join("ext/nested")],
+                true,
+                &never,
+            )
+        };
+        // At, inside (not ignored) or containing a source checkout.
+        for path in ["dots", "dots/sub", "ext/nested", "ext"] {
+            assert_eq!(
+                at(path),
+                Err(format!(
+                    "extra.r: /h/{path} is a dotfiles source checkout; sync updates it"
+                ))
+            );
+        }
+        assert!(at("dotsy").is_ok());
+        assert!(at("ext2").is_ok());
+    }
+
+    /// No lock has no nested source; a lock that cannot be read gives `None`, so nothing counts
+    /// as the bound checkout's; a valid lock gives its nested paths.
+    #[test]
+    fn nested_paths_fail_closed_on_an_unreadable_lock() {
+        let root = std::env::temp_dir().join(format!("dfm-sync-lock-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let none = nested_paths(&root);
+        fs::write(root.join(LOCK_FILE), "schema = [").unwrap();
+        let bad = nested_paths(&root);
+        fs::write(
+            root.join(LOCK_FILE),
+            format!(
+                "[[sources]]\nid = \"r\"\nkind = \"git\"\norigin = \"https://github.com/o/d\"\nref = \"refs/heads/main\"\n\n[[sources]]\nid = \"e\"\nkind = \"git\"\norigin = \"https://github.com/o/e\"\nref = \"refs/heads/main\"\ncommit = \"{}\"\npath = \"base/ext\"\n",
+                "a".repeat(40)
+            ),
+        )
+        .unwrap();
+        let good = nested_paths(&root);
+        let _ = fs::remove_dir_all(&root);
+        assert_eq!(none, Some(Vec::new()));
+        assert_eq!(bad, None);
+        assert_eq!(good, Some(vec!["base/ext".to_string()]));
+    }
+
+    /// A source checkout's git never ignores a path in these tests.
+    fn never(_: &Path, _: &Path) -> bool {
+        false
+    }
+
+    /// A path inside a source checkout is allowed only when that checkout's git ignores it,
+    /// directly or through a link above a path not cloned yet (the tmux plugin directory of the
+    /// dotfiles). A path that contains a source checkout is refused whatever git says.
+    #[test]
+    fn a_checkout_inside_a_source_checkout_is_allowed_only_where_git_ignores_it() {
+        let home = std::env::temp_dir().join(format!("dfm-sync-link-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&home);
+        fs::create_dir_all(home.join("dots/plugins")).unwrap();
+        std::os::unix::fs::symlink(home.join("dots"), home.join("alias")).unwrap();
+        let dots = home.join("dots").canonicalize().unwrap();
+        let at = |path: &str, ignored: &dyn Fn(&Path, &Path) -> bool| {
+            let v = dfm_model::resolve::Value::Table(
+                toml::from_str(&format!(
+                    "url = \"https://github.com/o/r.git\"\npath = {path:?}\n"
+                ))
+                .unwrap(),
+            );
+            declared_checkout(&home, "extra.r", &v, &[home.join("dots")], true, ignored)
+        };
+        let plugins = |root: &Path, rel: &Path| root == dots && rel.starts_with("plugins");
+        let all = |_: &Path, _: &Path| true;
+        let refused = |got: Result<updater::Checkout, String>| {
+            got.is_err_and(|e| e.ends_with("is a dotfiles source checkout; sync updates it"))
+        };
+        let results = [
+            at("dots/plugins/tpm", &plugins).is_ok(),
+            at("alias/plugins/tpm", &plugins).is_ok(),
+            refused(at("dots/plugins/tpm", &never)),
+            refused(at("alias/plugins/tpm", &never)),
+            refused(at("alias/new/r", &plugins)),
+            refused(at("dots", &all)),
+        ];
+        let _ = fs::remove_dir_all(&home);
+        assert_eq!(results, [true; 6]);
+    }
+
     #[test]
     fn redirects_and_http_alternates_stay_disabled() {
         // Any value but `true` also disables the dumb-HTTP alternates (is_alternate_allowed).

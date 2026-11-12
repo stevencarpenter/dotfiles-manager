@@ -383,7 +383,7 @@ pub(super) fn print_observed(
 fn block_code(s: &PackageState) -> Code {
     match s {
         PackageState::Unknown(_) => Code::ProbeFailed,
-        PackageState::Unofficial(_) | PackageState::Ungranted(_) => Code::SourceUntrusted,
+        PackageState::Unofficial(_) | PackageState::Ungranted { .. } => Code::SourceUntrusted,
         PackageState::SourceBuild(_) => Code::PlatformUnsupported,
         PackageState::Unsupported(_) => Code::PrivilegeUnsupported,
         PackageState::Refused(_) => Code::ManifestInvalid,

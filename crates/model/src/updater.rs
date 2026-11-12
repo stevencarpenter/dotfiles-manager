@@ -5,6 +5,7 @@
 pub enum Updater {
     Agents,
     Brew,
+    Checkouts,
     Claude,
     Codex,
     Mise,
@@ -17,9 +18,10 @@ pub enum Updater {
 }
 
 impl Updater {
-    pub const ALL: [Updater; 11] = [
+    pub const ALL: [Updater; 12] = [
         Updater::Agents,
         Updater::Brew,
+        Updater::Checkouts,
         Updater::Claude,
         Updater::Codex,
         Updater::Mise,
@@ -35,6 +37,7 @@ impl Updater {
         match self {
             Updater::Agents => "agents",
             Updater::Brew => "brew",
+            Updater::Checkouts => "checkouts",
             Updater::Claude => "claude",
             Updater::Codex => "codex",
             Updater::Mise => "mise",

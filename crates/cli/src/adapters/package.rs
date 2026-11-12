@@ -8,10 +8,11 @@
 //! Every child runs through the engine runner (fixed search path, rebuilt environment, process
 //! group, timeout). The providers' standard error is bounded and never printed or persisted.
 
+use super::checkout;
 use super::script::{self, ScriptCx};
 use dfm_engine::{End, ProcOutput, ProcRequest, Runner};
 use dfm_model::plan::{PackageState, Scope};
-use dfm_model::resolve::{Resolved, Value};
+use dfm_model::resolve::{Resolved, ResolvedResource, Value};
 use dfm_model::{Code, Refusal};
 use std::collections::BTreeMap;
 use std::os::unix::fs::PermissionsExt;
@@ -23,7 +24,7 @@ pub const MISE: &str = "mise/v1";
 pub const APT: &str = "apt/v1";
 pub const UV_TOOL: &str = "uv-tool/v1";
 
-const PROBE_TIMEOUT: Duration = Duration::from_secs(60);
+pub(super) const PROBE_TIMEOUT: Duration = Duration::from_secs(60);
 const INSTALL_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 /// A listing or an install log is bounded; its content is not kept.
 const MAX_OUTPUT: usize = 1 << 20;
@@ -124,7 +125,7 @@ fn valid_name(n: &str) -> bool {
         })
 }
 
-fn request<'a>(
+pub(super) fn request<'a>(
     program: &'a str,
     args: &'a [String],
     env: &'a [(String, String)],
@@ -141,7 +142,7 @@ fn request<'a>(
 }
 
 /// Why a child did not end with an exit code the adapter can read.
-fn ended(what: &str, out: &ProcOutput) -> Option<String> {
+pub(super) fn ended(what: &str, out: &ProcOutput) -> Option<String> {
     match &out.end {
         End::Exited(_) => None,
         End::TimedOut => Some(format!("{what} did not answer within {PROBE_TIMEOUT:?}")),
@@ -718,6 +719,192 @@ fn uv_receipt(home: &Path, name: &str) -> Result<(dfm_model::resolve::Table, Str
     Ok((v, shown))
 }
 
+/// Each package adapter and the pointer of the source it fetches from. That source needs no grant
+/// only when the bound checkout declared it ([`owner_source`], docs/sync.md, "Source
+/// identities"); otherwise its identity needs one. `None`: the adapter installs from its
+/// provider's registry, or its source always needs a grant (`script/v1`). A new package adapter
+/// must be listed here (`every_package_adapter_states_its_source_rule`).
+pub(crate) const SOURCE_ADAPTERS: &[(&str, Option<&str>)] = &[
+    (HOMEBREW, None),
+    (MISE, Some("/name")),
+    (APT, None),
+    (UV_TOOL, Some("/source")),
+    (checkout::ADAPTER, Some("/url")),
+    (script::ADAPTER, None),
+];
+
+/// The [`SOURCE_ADAPTERS`] pointer of `adapter`, or `None`.
+fn source_pointer(adapter: &str) -> Option<&'static str> {
+    SOURCE_ADAPTERS
+        .iter()
+        .find(|(a, _)| *a == adapter)
+        .and_then(|(_, p)| *p)
+}
+
+/// `Ungranted` for `identity`, with the [`SOURCE_ADAPTERS`] pointer of `r` as the plan's field.
+pub(crate) fn ungranted_state(r: &ResolvedResource, identity: String) -> PackageState {
+    PackageState::Ungranted {
+        identity,
+        field: source_pointer(&r.adapter).unwrap_or("/url"),
+    }
+}
+
+/// Whether the bound checkout declared the source of `r` (its [`SOURCE_ADAPTERS`] pointer).
+/// `nested` holds the nested source paths of the lock (`sync_cmd::nested_paths`); `None`, an
+/// unreadable lock, is never the owner's.
+pub(crate) fn owner_source(nested: Option<&[String]>, r: &ResolvedResource) -> bool {
+    match (source_pointer(&r.adapter), nested) {
+        (Some(p), Some(n)) => dfm_model::resolve::owner_declared(r, p, n),
+        _ => false,
+    }
+}
+
+/// The backend tool of a backend-qualified `mise/v1` name and the source identity it fetches
+/// from, or `None` for a registry name (no `<backend>:`). `github:o/r` and `ubi:o/r` are the
+/// repository (`https://github.com/o/r`), `npm:<name>` is `npm:<name>`. A version after the
+/// first `@` past the start must be `latest` or a plain version (`[0-9A-Za-z][0-9A-Za-z.+-]*`):
+/// anything else (an npm alias `npm:y`, a git or URL spec) would make the tool fetch another
+/// source than the identity names. Any other backend, or another version, is
+/// `E_SOURCE_UNTRUSTED`.
+fn mise_identity(name: &str) -> Result<Option<(String, String)>, Refusal> {
+    let Some((backend, rest)) = name.split_once(':') else {
+        return Ok(None);
+    };
+    let untrusted = |why: &str| {
+        Refusal::new(
+            Code::SourceUntrusted,
+            format!("mise/v1 tool {}: {why}", dfm_model::display::visible(name)),
+        )
+    };
+    // `npm:@scope/x` starts with `@`; the first `@` after the start begins the version.
+    let (rest, version) = match rest.char_indices().skip(1).find(|(_, c)| *c == '@') {
+        Some((i, _)) => (&rest[..i], Some(&rest[i + 1..])),
+        None => (rest, None),
+    };
+    let plain = |v: &str| {
+        v == "latest"
+            || v.starts_with(|c: char| c.is_ascii_alphanumeric())
+                && v.chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '+' | '-'))
+    };
+    if let Some(v) = version.filter(|v| !plain(v)) {
+        return Err(untrusted(&format!(
+            "is not declared by the bound checkout, so its version {} must be latest or a plain version such as 1.2.3",
+            dfm_model::display::visible(v)
+        )));
+    }
+    // `github:`/`ubi:` take only the `o/r` shorthand: `source_identity` would read
+    // `github:npm:x` as the npm identity `npm:x`.
+    let shorthand = |r: &str| {
+        !r.contains(':') && r.split('/').count() == 2 && r.split('/').all(|c| !c.is_empty())
+    };
+    let source = match backend {
+        "github" | "ubi" if !shorthand(rest) => {
+            return Err(untrusted(
+                "is not declared by the bound checkout, so a github: or ubi: tool must be the owner/repo shorthand",
+            ));
+        }
+        "github" | "ubi" => rest.to_string(),
+        "npm" => format!("{}{rest}", dfm_model::lock::NPM),
+        _ => {
+            return Err(untrusted(
+                "is not declared by the bound checkout, so it may be only a registry name or a github:, ubi: or npm: tool",
+            ));
+        }
+    };
+    dfm_model::lock::source_identity(&source, cfg!(feature = "test-isolation"))
+        .map(|id| Some((rest.to_string(), id)))
+        .map_err(|e| untrusted(&e.detail))
+}
+
+/// The state of a `mise/v1` tool that the bound checkout did not declare: a backend-qualified
+/// name that would be installed or rolled needs a grant for its source (`Ungranted`), and a
+/// backend without one identity is `Unofficial`. A registry name, the bound checkout's own tool,
+/// and any state without `cx` are kept as they are.
+pub(crate) fn mise_gated(
+    cx: Option<&ScriptCx>,
+    r: &ResolvedResource,
+    state: PackageState,
+) -> Result<PackageState, Refusal> {
+    let gated = matches!(state, PackageState::Missing(_) | PackageState::Rolling(_));
+    let Some(cx) = cx.filter(|_| r.adapter == MISE && gated) else {
+        return Ok(state);
+    };
+    if owner_source(cx.nested(), r) {
+        return Ok(state);
+    }
+    Ok(match mise_identity(&name(&r.value)?) {
+        Ok(None) => state,
+        Ok(Some((_, id))) => ungranted(cx, r, id)?.map_or(state, |id| ungranted_state(r, id)),
+        Err(e) => PackageState::Unofficial(e.detail),
+    })
+}
+
+/// The re-check under the writer lock before `mise install` or an upgrade of a backend-qualified
+/// name that the bound checkout did not declare ([`source_gate`]). Without `cx` such a name is
+/// not installed. The result is the extra provider variables: an `npm:` tool from a nested
+/// source installs from the default registry, with the pins the `npm` updater sets.
+pub(crate) fn mise_gate(
+    cx: Option<&ScriptCx>,
+    r: &ResolvedResource,
+) -> Result<Vec<(String, String)>, Refusal> {
+    if r.adapter != MISE {
+        return Ok(Vec::new());
+    }
+    let n = name(&r.value)?;
+    if !n.contains(':') {
+        return Ok(Vec::new());
+    }
+    let cx = cx.ok_or_else(|| {
+        Refusal::new(
+            Code::GeneratorUnavailable,
+            format!("no source context for the mise/v1 tool {n}"),
+        )
+    })?;
+    if owner_source(cx.nested(), r) {
+        return Ok(Vec::new());
+    }
+    let Some((tool, id)) = mise_identity(&n)? else {
+        return Ok(Vec::new());
+    };
+    source_gate(cx, r, id)?;
+    Ok(if n.starts_with(dfm_model::lock::NPM) {
+        super::updater::npm_env(&[tool])
+    } else {
+        Vec::new()
+    })
+}
+
+/// `identity` when the source of `r` still needs a grant: the bound checkout did not declare it
+/// and `identity` has none.
+pub(crate) fn ungranted(
+    cx: &ScriptCx,
+    r: &ResolvedResource,
+    identity: String,
+) -> Result<Option<String>, Refusal> {
+    Ok((!owner_source(cx.nested(), r) && !cx.trusts(&identity)?).then_some(identity))
+}
+
+/// The re-check under the writer lock before a source is fetched: `E_SOURCE_UNTRUSTED` with the
+/// `--trust-origin` command when [`ungranted`] holds.
+pub(crate) fn source_gate(
+    cx: &ScriptCx,
+    r: &ResolvedResource,
+    identity: String,
+) -> Result<(), Refusal> {
+    match ungranted(cx, r, identity)? {
+        None => Ok(()),
+        Some(id) => Err(Refusal::new(
+            Code::SourceUntrusted,
+            format!(
+                "the source {id} of {} has no grant; nothing was run. Fix: {}",
+                r.id,
+                dfm_model::lock::trust_command(&id)
+            ),
+        )),
+    }
+}
+
 /// A `uv-tool/v1` source other than the package index (docs/packages.md, "uv tools from a
 /// source").
 #[derive(Debug, PartialEq, Eq)]
@@ -766,6 +953,36 @@ pub(crate) fn uv_source(value: &Value, root: &Path) -> Result<Option<UvSource>, 
     } else {
         Err(outside())
     }
+}
+
+/// [`uv_source`] of `r`, which must have one. A path source must come from the bound checkout:
+/// one that a nested source declares or changes is `E_MANIFEST_INVALID`.
+fn checked_source(r: &ResolvedResource, cx: &ScriptCx) -> Result<UvSource, Refusal> {
+    let text = source_text(&r.value).unwrap_or_default();
+    let source = uv_source(&r.value, cx.root())?.ok_or_else(|| bad_source(text, "is missing"))?;
+    if matches!(source, UvSource::Path(_)) && !owner_source(cx.nested(), r) {
+        return Err(bad_source(
+            text,
+            "is not declared by the bound checkout; a path source must be declared in the bound checkout",
+        ));
+    }
+    Ok(source)
+}
+
+/// A git source's state, or `Ungranted` when its repository needs a grant it lacks.
+fn gated(
+    cx: &ScriptCx,
+    r: &ResolvedResource,
+    source: &UvSource,
+    state: PackageState,
+) -> Result<PackageState, Refusal> {
+    if let (PackageState::Missing(_) | PackageState::Rolling(_), UvSource::Git { url, .. }) =
+        (&state, source)
+        && let Some(id) = ungranted(cx, r, git_identity(url)?)?
+    {
+        return Ok(ungranted_state(r, id));
+    }
+    Ok(state)
 }
 
 /// `git+https://<repository>`, or `git+https://<repository>@<rev>` split at the last `@` (an
@@ -818,17 +1035,19 @@ pub(crate) fn uv_sourced(adapter: &str, value: &Value) -> bool {
     adapter == UV_TOOL && source_text(value).is_some()
 }
 
-/// The installed state of a `uv-tool/v1` tool with a `source`. A declared source needs no
-/// grant: the owner wrote it in the owner's own checkout. Without `cx` a source that can be
-/// judged without the checkout is checked and the tool is `Missing`. uv's receipt decides: a
-/// requirement from the declared source ([`uv_receipt_names`]) is `Installed`, anything else
-/// (no receipt, another source, an unreadable receipt, which `--force` replaces) is `Missing`,
-/// with the owner check.
+/// The installed state of a `uv-tool/v1` tool with a `source`. A source the bound checkout
+/// declared needs no grant; a git source from a nested source that is to be installed needs a
+/// grant for its repository, else it is `Ungranted` ([`owner_source`]). Without `cx` a
+/// source that can be judged without the checkout is checked and the tool is `Missing`. uv's
+/// receipt decides: a requirement from the declared source ([`uv_receipt_names`]) is
+/// `Installed`, anything else (no receipt, another source, an unreadable receipt, which
+/// `--force` replaces) is `Missing`, with the owner check.
 pub(crate) fn uv_source_probe(
     runner: &Runner,
-    value: &Value,
+    r: &ResolvedResource,
     cx: Option<&ScriptCx>,
 ) -> Result<PackageState, Refusal> {
+    let value = &r.value;
     let pkg = uv_source_name(value)?;
     policy(value)?;
     let text = source_text(value).unwrap_or_default();
@@ -838,7 +1057,7 @@ pub(crate) fn uv_source_probe(
         }
         return Ok(PackageState::Missing(Vec::new()));
     };
-    let source = uv_source(value, cx.root())?.ok_or_else(|| bad_source(text, "is missing"))?;
+    let source = checked_source(r, cx)?;
     let state = if uv_receipt_names(&runner.home, &pkg, &source) {
         PackageState::Installed(match &source {
             UvSource::Git { rev: Some(rev), .. } => rev.clone(),
@@ -847,7 +1066,7 @@ pub(crate) fn uv_source_probe(
     } else {
         PackageState::Missing(Vec::new())
     };
-    Ok(settled(runner, UV_TOOL, &pkg, state))
+    gated(cx, r, &source, settled(runner, UV_TOOL, &pkg, state))
 }
 
 /// Whether uv's receipt for `pkg` has the requirement of `pkg` itself (its `name` equal as uv
@@ -888,15 +1107,17 @@ fn uv_receipt_names(home: &Path, pkg: &str, source: &UvSource) -> bool {
 }
 
 /// Installs a `uv-tool/v1` tool from its `source` with `uv tool install --force`, which replaces
-/// a copy from another source. The caller probes again afterwards.
+/// a copy from another source. A git source from a nested source is checked for its grant
+/// again first ([`source_gate`]). The caller probes again afterwards.
 pub(crate) fn uv_source_install(
     runner: &Runner,
-    value: &Value,
+    r: &ResolvedResource,
     cx: &ScriptCx,
 ) -> Result<(), Refusal> {
-    let pkg = uv_source_name(value)?;
-    let text = source_text(value).unwrap_or_default();
-    let source = uv_source(value, cx.root())?.ok_or_else(|| bad_source(text, "is missing"))?;
+    let pkg = uv_source_name(&r.value)?;
+    let text = source_text(&r.value).unwrap_or_default();
+    let source = checked_source(r, cx)?;
+    uv_source_gate(r, cx, &source)?;
     let arg = match &source {
         UvSource::Git {
             url,
@@ -922,6 +1143,20 @@ pub(crate) fn uv_source_install(
     })
 }
 
+/// [`source_gate`] for a git source; a path source is checked by [`checked_source`].
+fn uv_source_gate(r: &ResolvedResource, cx: &ScriptCx, source: &UvSource) -> Result<(), Refusal> {
+    match source {
+        UvSource::Git { url, .. } => source_gate(cx, r, git_identity(url)?),
+        UvSource::Path(_) => Ok(()),
+    }
+}
+
+/// The re-check under the writer lock before `uv tool upgrade` of a source tool resolves its
+/// source again.
+pub(crate) fn uv_source_upgrade_gate(r: &ResolvedResource, cx: &ScriptCx) -> Result<(), Refusal> {
+    uv_source_gate(r, cx, &checked_source(r, cx)?)
+}
+
 /// The declared name of a source tool: a package name that is also a package-index name, so
 /// the receipt path takes no `/`.
 fn uv_source_name(value: &Value) -> Result<String, Refusal> {
@@ -944,12 +1179,14 @@ fn uv_source_name(value: &Value) -> Result<String, Refusal> {
 /// it to the default branch's newest commit, with the owner check. A tool installed from
 /// anywhere else (the package index, another rev or repository) is `Missing`, with the owner
 /// check (`OtherOwner` blocks), so it is installed from its source and never upgraded from the
-/// index. Without `cx` (`doctor`) a path source is not resolved.
+/// index. A git source from a nested source that would be installed or rolled needs a grant,
+/// else it is `Ungranted`. Without `cx` (`doctor`) a path source is not resolved.
 pub(crate) fn maintain_sourced(
     runner: &Runner,
-    value: &Value,
+    r: &ResolvedResource,
     cx: Option<&ScriptCx>,
 ) -> Result<PackageState, Refusal> {
+    let value = &r.value;
     let pkg = uv_source_name(value)?;
     let text = source_text(value).unwrap_or_default();
     let Some(cx) = cx else {
@@ -958,7 +1195,7 @@ pub(crate) fn maintain_sourced(
         }
         return maintain(runner, UV_TOOL, value);
     };
-    let source = uv_source(value, cx.root())?.ok_or_else(|| bad_source(text, "is missing"))?;
+    let source = checked_source(r, cx)?;
     let state = match maintain(runner, UV_TOOL, value)? {
         // `maintain` holds some copies before its owner check, so a copy it now treats as
         // missing gets that check here, as the plain probe does.
@@ -983,7 +1220,7 @@ pub(crate) fn maintain_sourced(
         }
         state => state,
     };
-    Ok(state)
+    gated(cx, r, &source, state)
 }
 
 /// `dpkg-query -W -f=${Status} <name>`: `install ok installed` means installed. A missing
@@ -1165,6 +1402,17 @@ fn settled(runner: &Runner, adapter: &str, pkg: &str, state: PackageState) -> Pa
 /// installs only the version mise's configuration requests, and `MISE_NO_CONFIG=1` hides that
 /// configuration.
 pub fn install(runner: &Runner, adapter: &str, value: &Value) -> Result<(), Refusal> {
+    install_env(runner, adapter, value, &[])
+}
+
+/// [`install`] with `extra` variables for the provider (the npm registry pins of
+/// [`mise_gate`]).
+pub(crate) fn install_env(
+    runner: &Runner,
+    adapter: &str,
+    value: &Value,
+    extra: &[(String, String)],
+) -> Result<(), Refusal> {
     let pkg = name(value)?;
     let pkg = if adapter == MISE {
         mise_selector(&pkg)
@@ -1187,7 +1435,14 @@ pub fn install(runner: &Runner, adapter: &str, value: &Value) -> Result<(), Refu
             args.extend(off.args());
             ("brew", args, brew_env())
         }
-        MISE => ("mise", vec!["install".to_string(), pkg.clone()], mise_env()),
+        MISE => (
+            "mise",
+            vec!["install".to_string(), pkg.clone()],
+            mise_env()
+                .into_iter()
+                .chain(extra.iter().cloned())
+                .collect(),
+        ),
         UV_TOOL => (
             "uv",
             vec!["tool".to_string(), "install".into(), pkg.clone()],
@@ -1454,7 +1709,7 @@ pub fn upgrade(runner: &Runner, adapter: &str, value: &Value) -> Result<(), Refu
 }
 
 /// Runs a provider command that changes the machine, within the install timeout.
-fn change(
+pub(super) fn change(
     runner: &Runner,
     program: &str,
     args: &[String],
@@ -1523,16 +1778,18 @@ fn facts(
         if let Some(stop) = dfm_engine::signal::requested() {
             return Err(stop);
         }
-        let looked = if r.adapter == script::ADAPTER {
+        let looked = if r.adapter == checkout::ADAPTER {
+            checkout::probe(runner, r, scripts)
+        } else if r.adapter == script::ADAPTER {
             script::probe(runner, &r.id, &r.value, scripts, update)
         } else if uv_sourced(&r.adapter, &r.value) {
             if update {
-                maintain_sourced(runner, &r.value, scripts)
+                maintain_sourced(runner, r, scripts)
             } else {
-                uv_source_probe(runner, &r.value, scripts)
+                uv_source_probe(runner, r, scripts)
             }
         } else {
-            look(runner, &r.adapter, &r.value)
+            look(runner, &r.adapter, &r.value).and_then(|s| mise_gated(scripts, r, s))
         };
         let state = match looked {
             Ok(s) => s,
@@ -1547,6 +1804,136 @@ fn facts(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_mise_backend_name_maps_to_the_identity_it_fetches_from() {
+        for (n, want) in [
+            ("duckdb", None),
+            ("duckdb@1.2", None),
+            ("github:o/r", Some("https://github.com/o/r")),
+            ("ubi:o/r@v1.2.3", Some("https://github.com/o/r")),
+            ("npm:prettier@3", Some("npm:prettier")),
+            ("npm:@scope/x@1.2", Some("npm:@scope/x")),
+            ("npm:@scope/x", Some("npm:@scope/x")),
+            ("npm:x@latest", Some("npm:x")),
+        ] {
+            let got = mise_identity(n).unwrap().map(|(_, id)| id);
+            assert_eq!(got.as_deref(), want, "{n}");
+        }
+        for n in [
+            "aqua:o/r",
+            "github:npm:x",
+            "ubi:npm:@s/x",
+            "github:o/r/x",
+            "cargo:x",
+            "core:node",
+            "github:o",
+            "npm:x@git+https://e/x",
+            "npm:x@npm:y",
+            "github:o/r@https://e",
+            "npm:x@1@2",
+        ] {
+            let e = mise_identity(n).unwrap_err();
+            assert_eq!(e.code, Code::SourceUntrusted, "{n}: {e}");
+        }
+    }
+
+    /// Under the writer lock, `mise_gate` refuses a backend name from a nested source that maps
+    /// to no single identity before anything is installed, and a backend name needs the
+    /// context at all.
+    #[test]
+    fn mise_gate_refuses_a_nested_backend_name_under_the_lock() {
+        use crate::Ctx;
+        use dfm_engine::Sys;
+        use dfm_model::resolve::Provenance;
+        use dfm_platform_macos::Platform;
+        let home = std::env::temp_dir().join(format!("dfm-mise-gate-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        let root = home.join("root");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            root.join("dotfiles-manager.lock"),
+            format!(
+                "[[sources]]\nid = \"r\"\nkind = \"git\"\norigin = \"https://github.com/o/d\"\nref = \"refs/heads/main\"\n\n[[sources]]\nid = \"e\"\nkind = \"git\"\norigin = \"https://github.com/o/e\"\nref = \"refs/heads/main\"\ncommit = \"{}\"\npath = \"base/ext\"\n",
+                "a".repeat(40)
+            ),
+        )
+        .unwrap();
+        let ctx = Ctx {
+            platform: Platform::with_home(home.clone()),
+            binding_path: home.join("binding.toml"),
+            os: "macos".into(),
+            arch: "aarch64".into(),
+            isolated: None,
+            color: false,
+        };
+        let sys = Sys {
+            uid: dfm_platform_macos::current_uid().unwrap(),
+        };
+        let cx = ScriptCx::for_install(&ctx, &sys, &root);
+        let file = "base/ext/modules/w/module.toml";
+        let resource = |name: &str| ResolvedResource {
+            id: "w.t".into(),
+            module: "w".into(),
+            declared_in: file.into(),
+            kind: "package".into(),
+            adapter: MISE.into(),
+            target: None,
+            value: Value::Table(
+                toml::from_str(&format!("name = {name:?}\nupdate_policy = \"rolling\"\n")).unwrap(),
+            ),
+            defaults: Vec::new(),
+            extensions: Vec::new(),
+            secret_values: false,
+            sensitive: false,
+            native_document: false,
+            provenance: BTreeMap::from([(
+                "/name".to_string(),
+                Provenance {
+                    owner: "w".into(),
+                    original: None,
+                    change: None,
+                    changer: None,
+                    reason: None,
+                    source_file: file.into(),
+                    source_path: None,
+                    content_id: None,
+                },
+            )]),
+            claims: Vec::new(),
+            dir_claims: Vec::new(),
+            precedence: None,
+        };
+        let refused: Vec<Code> = ["aqua:o/r", "npm:x@npm:y", "github:npm:x"]
+            .into_iter()
+            .map(|n| mise_gate(Some(&cx), &resource(n)).unwrap_err().code)
+            .collect();
+        let without_cx = mise_gate(None, &resource("github:o/r")).unwrap_err().code;
+        let registry = mise_gate(Some(&cx), &resource("duckdb")).unwrap();
+        let _ = std::fs::remove_dir_all(&home);
+        assert_eq!(refused, [Code::SourceUntrusted; 3]);
+        assert_eq!(without_cx, Code::GeneratorUnavailable);
+        assert!(registry.is_empty());
+    }
+
+    /// A new package adapter must state its source rule, so it cannot skip the grant of a
+    /// source that a nested source declares (docs/sync.md, "Source identities").
+    #[test]
+    fn every_package_adapter_states_its_source_rule() {
+        let table = super::super::registry();
+        let packages: Vec<&str> = table
+            .iter()
+            .filter(|a| a.spec.kind == "package")
+            .map(|a| a.spec.id.as_str())
+            .collect();
+        for id in &packages {
+            assert!(
+                SOURCE_ADAPTERS.iter().any(|(a, _)| a == id),
+                "{id} is not in SOURCE_ADAPTERS"
+            );
+        }
+        assert_eq!(SOURCE_ADAPTERS.len(), packages.len());
+    }
 
     #[test]
     fn a_brewfile_keeps_a_third_party_tap_and_shortens_an_official_one() {

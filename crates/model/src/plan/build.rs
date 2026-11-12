@@ -189,9 +189,13 @@ pub enum PackageState {
     /// source: learning what its install would do means running third-party code before
     /// approval. This blocks it.
     Unofficial(String),
-    /// A `script/v1` tool whose binary is missing, and whose script identity (`script:<url>`,
-    /// the text) has no grant: installing it would run a script the owner never trusted.
-    Ungranted(String),
+    /// A tool or checkout to be installed (or rolled) whose source identity has no grant: a
+    /// `script/v1` script (`script:<url>`), or a source the bound checkout does not declare.
+    /// `field` is the pointer of the value that names the source, chosen by the adapter.
+    Ungranted {
+        identity: String,
+        field: &'static str,
+    },
     /// The declared provider does not list it, and these (the package or a missing dependency)
     /// have no prebuilt binary for this machine. A source build adds build-time dependencies the
     /// listing does not name, so the plan could not show them; this blocks it.
@@ -242,7 +246,7 @@ impl PackageState {
             PackageState::Upgrades(d) => format!("upgrades:{}", d.join(",")),
             PackageState::SourceBuild(d) => format!("source-build:{}", d.join(",")),
             PackageState::Unofficial(w) => format!("unofficial:{w}"),
-            PackageState::Ungranted(id) => format!("ungranted:{id}"),
+            PackageState::Ungranted { identity, .. } => format!("ungranted:{identity}"),
             PackageState::OtherOwner(w) => format!("other-owner:{w}"),
             PackageState::Unsupported(w) => format!("unsupported:{w}"),
             PackageState::Unknown(w) => format!("unknown:{w}"),
@@ -1381,15 +1385,29 @@ impl Planner<'_> {
                 op.effect = format!("blocked: {}", f.detail);
                 self.blocker(r, None, f);
             }
-            Some(PackageState::Ungranted(identity)) => {
+            Some(PackageState::Ungranted { identity, field }) => {
+                let script = identity.starts_with(crate::lock::SCRIPT);
+                let (why, read) = if script {
+                    (
+                        format!(
+                            "{name} is not installed, and its install script has no grant ({identity}); dfm runs only a script the owner trusts"
+                        ),
+                        "reading the script",
+                    )
+                } else {
+                    (
+                        format!(
+                            "{name} needs its source {identity}, which the bound checkout does not declare and which has no grant; dfm fetches it only with a grant"
+                        ),
+                        "reviewing the source",
+                    )
+                };
                 let f = fail(
                     Code::SourceUntrusted,
-                    "/url",
+                    field,
+                    why,
                     format!(
-                        "{name} is not installed, and its install script has no grant ({identity}); dfm runs only a script the owner trusts"
-                    ),
-                    format!(
-                        "run {} after reading the script, then run sync again",
+                        "run {} after {read}, then run sync again",
                         crate::lock::trust_command(&identity)
                     ),
                 );
@@ -1425,6 +1443,16 @@ impl Planner<'_> {
                 self.blocker(r, None, f);
             }
             Some(PackageState::OtherOwner(why)) => {
+                // A checkout path holds a directory, not another provider's package.
+                let fix: std::borrow::Cow<'static, str> = match r.value.get("path") {
+                    Some(Value::String(p)) if r.adapter == "git-checkout/v1" => format!(
+                        "move or remove ~/{p}, or point the declaration at the repository it holds"
+                    )
+                    .into(),
+                    _ => {
+                        "remove the other installation, or declare the adapter that owns it".into()
+                    }
+                };
                 let f = fail(
                     Code::Conflict,
                     "/name",
@@ -1432,7 +1460,7 @@ impl Planner<'_> {
                         "{name} is declared for {} but {why}; a declared owner is not permission to replace another owner",
                         r.adapter
                     ),
-                    "remove the other installation, or declare the adapter that owns it",
+                    fix,
                 );
                 op.effect = format!("blocked: {}", f.detail);
                 self.blocker(r, None, f);

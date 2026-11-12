@@ -4306,6 +4306,254 @@ fn sync_fast_forwards_the_agent_registry_and_installs_from_the_bound_root() {
     );
 }
 
+/// DFM-25 (C01): a declared `git-checkout/v1` needs no grant. The first sync clones it in the
+/// packages scope; the next sync's `checkouts` row fast-forwards it with real git.
+#[test]
+fn sync_clones_a_declared_checkout_then_fast_forwards_it() {
+    let u = Up::new(r#"["checkouts"]"#);
+    let tool = Remote::new(u.fake.path(), "tool");
+    put(&tool.seed, "README", "v1\n");
+    tool.push("v1");
+    put(
+        &u.fx.upstream.seed,
+        "base/modules/extra/module.toml",
+        &format!(
+            "{}\n[[resources]]\nid = \"tool\"\nkind = \"package\"\nadapter = \"git-checkout/v1\"\n[resources.value]\nurl = \"{}\"\npath = \"x/tool\"\n",
+            common::EXTRA,
+            tool.origin()
+        ),
+    );
+    u.fx.upstream.push("declare the checkout");
+    let copy = u.fx.h("x/tool");
+    let o = u.sync(&[]);
+    assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
+    let before = git(&copy, &["rev-parse", "--short", "HEAD"]);
+    let s = stdout(&o);
+    assert!(s.contains("  current checkouts"), "{s}");
+    assert!(
+        s.contains(&format!("    note: extra.tool current at {before}")),
+        "{s}"
+    );
+    put(&tool.seed, "README", "v2\n");
+    tool.push("v2");
+    let after = git(&tool.bare, &["rev-parse", "--short", "refs/heads/main"]);
+    let o = u.sync(&[]);
+    assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
+    let s = stdout(&o);
+    assert!(
+        s.contains("  checkouts: would fast-forward 1 checkout ("),
+        "{s}"
+    );
+    assert!(s.contains("  updated checkouts"), "{s}");
+    assert!(
+        s.contains(&format!("    note: extra.tool {before} -> {after}")),
+        "{s}"
+    );
+    assert_eq!(git(&copy, &["rev-parse", "--short", "HEAD"]), after);
+}
+
+/// The checkout `extra.tool` of `tool`, declared upstream and cloned by a first sync. Returns the
+/// checkout path and the revision it holds.
+fn cloned_checkout(u: &Up, tool: &Remote) -> (PathBuf, String) {
+    cloned_checkout_at(u, tool, &tool.origin())
+}
+
+/// As [`cloned_checkout`], with `url` as the declared url.
+fn cloned_checkout_at(u: &Up, tool: &Remote, url: &str) -> (PathBuf, String) {
+    put(&tool.seed, "README", "v1\n");
+    tool.push("v1");
+    put(
+        &u.fx.upstream.seed,
+        "base/modules/extra/module.toml",
+        &format!(
+            "{}\n[[resources]]\nid = \"tool\"\nkind = \"package\"\nadapter = \"git-checkout/v1\"\n[resources.value]\nurl = \"{url}\"\npath = \"x/tool\"\n",
+            common::EXTRA,
+        ),
+    );
+    u.fx.upstream.push("declare the checkout");
+    let copy = u.fx.h("x/tool");
+    let o = u.sync(&[]);
+    assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
+    let before = git(&copy, &["rev-parse", "--short", "HEAD"]);
+    put(&tool.seed, "README", "v2\n");
+    tool.push("v2");
+    (copy, before)
+}
+
+/// A command-running key in a declared checkout's own configuration blocks its pull before any
+/// fetch, as sync's checkout configuration rule does (docs/sync.md).
+#[test]
+fn a_checkout_whose_configuration_runs_a_command_is_blocked_before_the_fetch() {
+    let u = Up::new(r#"["checkouts"]"#);
+    let tool = Remote::new(u.fake.path(), "tool");
+    let (copy, before) = cloned_checkout(&u, &tool);
+    let ran = u.fake.path().join("ssh-ran");
+    // The first sync fetched once; only a fetch of this run may leave FETCH_HEAD now.
+    let _ = fs::remove_file(copy.join(".git/FETCH_HEAD"));
+    git(
+        &copy,
+        &[
+            "config",
+            "core.sshCommand",
+            &format!("touch {}", ran.display()),
+        ],
+    );
+    let o = u.sync(&[]);
+    assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
+    let s = stdout(&o);
+    assert!(s.contains("  blocked checkouts"), "{s}");
+    assert!(s.contains("core.sshcommand"), "{s}");
+    assert!(!copy.join(".git/FETCH_HEAD").exists());
+    assert!(!ran.exists());
+    assert_eq!(git(&copy, &["rev-parse", "--short", "HEAD"]), before);
+}
+
+/// The owner's `url.*.insteadOf` rewrites the declared url and the upstream alike, so the
+/// checkout is pulled; the rewrite is the owner's intent (Codex #102).
+#[test]
+fn an_insteadof_rule_of_the_owner_rewrites_the_declared_url_too() {
+    let u = Up::new(r#"["checkouts"]"#);
+    let tool = Remote::new(u.fake.path(), "tool");
+    let declared = "https://example.invalid/o/tool";
+    fs::write(
+        u.fx.h(".gitconfig"),
+        format!("[url \"{}\"]\n\tinsteadOf = {declared}\n", tool.origin()),
+    )
+    .unwrap();
+    let (copy, before) = cloned_checkout_at(&u, &tool, declared);
+    let after = git(&tool.bare, &["rev-parse", "--short", "refs/heads/main"]);
+    let o = u.sync(&[]);
+    assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
+    let s = stdout(&o);
+    assert!(s.contains("  updated checkouts"), "{s}");
+    assert!(
+        s.contains(&format!("    note: extra.tool {before} -> {after}")),
+        "{s}"
+    );
+    assert_eq!(git(&copy, &["rev-parse", "--short", "HEAD"]), after);
+}
+
+/// A HOME directory linked into the bound checkout, as `~/.config/tmux` is on the M5: a declared
+/// checkout below it lands in the bound checkout. Where the checkout's git ignores that path, the
+/// checkout is cloned and pulled; where it does not, it is a note and nothing is pulled.
+#[test]
+fn a_checkout_in_an_ignored_directory_of_the_bound_checkout_is_pulled() {
+    for ignored in [true, false] {
+        let u = Up::new(r#"["checkouts"]"#);
+        let seed = &u.fx.upstream.seed;
+        // The loader reads only the roots, so the clone's `.git` below `plugins` is not read.
+        put(
+            seed,
+            "base/bundle.toml",
+            &format!(
+                "{}\n[sources]\nroots = [\"base\", \"profiles\"]\n",
+                common::BUNDLE
+            ),
+        );
+        if ignored {
+            put(seed, ".gitignore", "plugins/\n");
+        }
+        u.fx.upstream.push("plugins");
+        fs::create_dir_all(u.fx.root.join("plugins")).unwrap();
+        fs::create_dir_all(u.fx.h(".config")).unwrap();
+        std::os::unix::fs::symlink(u.fx.root.join("plugins"), u.fx.h(".config/plugins")).unwrap();
+        let tool = Remote::new(u.fake.path(), "tool");
+        put(&tool.seed, "README", "v1\n");
+        tool.push("v1");
+        put(
+            seed,
+            "base/modules/extra/module.toml",
+            &format!(
+                "{}\n[[resources]]\nid = \"tool\"\nkind = \"package\"\nadapter = \"git-checkout/v1\"\n[resources.value]\nurl = \"{}\"\npath = \".config/plugins/tool\"\n",
+                common::EXTRA,
+                tool.origin()
+            ),
+        );
+        u.fx.upstream.push("declare the checkout");
+        let o = u.sync(&[]);
+        assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
+        let s = stdout(&o);
+        let note = "is a dotfiles source checkout; sync updates it";
+        if ignored {
+            assert!(u.fx.root.join("plugins/tool/.git").exists(), "{s}");
+            assert!(s.contains("  current checkouts"), "{s}");
+            assert!(!s.contains(note), "{s}");
+        } else {
+            // The same rule at plan time: the packages scope refuses it, and nothing is cloned.
+            assert!(!u.fx.root.join("plugins/tool").exists(), "{s}");
+            assert!(s.contains("E_MANIFEST_INVALID"), "{s}");
+            assert!(s.contains("  blocked checkouts"), "{s}");
+            assert!(s.contains(note), "{s}");
+        }
+    }
+}
+
+/// A checkout that a nested source declares needs a grant for its url: sync's `checkouts` row is
+/// blocked with the `--trust-origin` command, and nothing is fetched (docs/sync.md, "Source
+/// identities").
+#[test]
+fn a_checkout_that_a_nested_source_declares_is_blocked_without_a_grant() {
+    let u = Up::new(r#"["checkouts"]"#);
+    let tool = Remote::new(u.fake.path(), "tool");
+    put(&tool.seed, "README", "v1\n");
+    tool.push("v1");
+    // Cloned by hand, so the row reaches the grant check.
+    let copy = u.fx.h("x/tool");
+    fs::create_dir_all(copy.parent().unwrap()).unwrap();
+    git(
+        u.fake.path(),
+        &["clone", "-q", &tool.origin(), copy.to_str().unwrap()],
+    );
+    put(&tool.seed, "README", "v2\n");
+    tool.push("v2");
+    let before = git(&copy, &["rev-parse", "--short", "HEAD"]);
+    let ext = Remote::new(u.fx.work.path(), "ext");
+    put(
+        &ext.seed,
+        "modules/work/module.toml",
+        &format!(
+            "{WORK}\n[[resources]]\nid = \"tool\"\nkind = \"package\"\nadapter = \"git-checkout/v1\"\n[resources.value]\nurl = \"{}\"\npath = \"x/tool\"\n",
+            tool.origin()
+        ),
+    );
+    put(&ext.seed, "modules/work/files/profile", "work=1\n");
+    let pin = ext.push("ext initial");
+    let seed = &u.fx.upstream.seed;
+    put(seed, "base/bundle.toml", BUNDLE_WITH_EXT);
+    put(
+        seed,
+        "profiles/t-01.toml",
+        &format!(
+            "{}updaters = [\"checkouts\"]\n",
+            common::PROFILE.replace("modules = [\"extra\"]", "modules = [\"extra\", \"work\"]")
+        ),
+    );
+    put(
+        seed,
+        "dotfiles-manager.lock",
+        &lock_for(&[
+            (&u.fx.origin(), None, "."),
+            (&ext.origin(), Some(&pin), "base/ext"),
+        ]),
+    );
+    u.fx.upstream.push("add the ext source");
+    u.fx.trust(&ext.origin());
+    let o = u.sync(&[]);
+    assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
+    let s = stdout(&o);
+    assert!(s.contains("  blocked checkouts"), "{s}");
+    assert!(
+        s.contains(&format!(
+            "    note: E_SOURCE_UNTRUSTED: no grant for {}; review it, then run dfm sync --trust-origin '{}'",
+            tool.origin(),
+            tool.origin()
+        )),
+        "{s}"
+    );
+    assert!(!copy.join(".git/FETCH_HEAD").exists());
+    assert_eq!(git(&copy, &["rev-parse", "--short", "HEAD"]), before);
+}
+
 /// DFM-25 (C04, G2, G6): without a grant for the registry origin, `agents` is a `blocked` row
 /// in the listing and in the run. Only read-only git runs: nothing is fetched or installed, and
 /// the rest of sync runs.

@@ -1224,6 +1224,70 @@ fn c09_competing_owners_are_refused() {
     assert_eq!(e.conflicts_with.as_deref(), Some("agents.skills"));
 }
 
+/// A `git-checkout/v1` claims its HOME `path`, so two checkouts at one path, or one inside
+/// another, collide at resolve time (DFM-25 C01).
+#[test]
+fn two_checkouts_at_one_path_or_nested_paths_collide() {
+    let checkout = |id: &str, path: &str| {
+        format!(
+            "{{ id = \"{id}\", kind = \"package\", adapter = \"git-checkout/v1\", value = {{ url = \"https://github.com/o/{id}\", path = \"{path}\" }} }}"
+        )
+    };
+    for (second, why) in [
+        (".tmux/plugins/tpm", "the same output path"),
+        (
+            ".tmux/plugins/TPM",
+            "the same output path, compared without case",
+        ),
+        (".tmux/plugins/tpm/sub", "a file cannot also be a directory"),
+    ] {
+        let mut set = synthetic();
+        edit(
+            &mut set,
+            PRIVATE,
+            "add",
+            "/resources/-",
+            Some(&checkout("one", ".tmux/plugins/tpm")),
+        );
+        edit(
+            &mut set,
+            PRIVATE,
+            "add",
+            "/resources/-",
+            Some(&checkout("two", second)),
+        );
+        let e = err(&set, B);
+        assert_eq!(e.code, Code::TargetCollision, "{second}: {e}");
+        assert!(e.message.contains(why), "{second}: {e}");
+    }
+}
+
+/// The M5 layout: a directory link at `.config/tmux` and the tpm checkout below it resolve.
+/// A checkout path collides only with another checkout path.
+#[test]
+fn a_checkout_below_a_directory_link_resolves() {
+    let mut set = examples();
+    edit(
+        &mut set,
+        AGENTS_MOD,
+        "add",
+        "/resources/-",
+        Some(
+            "{ id = \"config-tmux\", kind = \"link\", adapter = \"fs-link/v1\", target = \".config/tmux\", value = { source = \"files/sample-audit\", directory = true } }",
+        ),
+    );
+    edit(
+        &mut set,
+        AGENTS_MOD,
+        "add",
+        "/resources/-",
+        Some(
+            "{ id = \"tpm\", kind = \"package\", adapter = \"git-checkout/v1\", value = { url = \"https://github.com/tmux-plugins/tpm\", path = \".config/tmux/plugins/tpm\" } }",
+        ),
+    );
+    ok(&set, PERSONAL);
+}
+
 #[test]
 fn a_link_to_a_directory_needs_the_explicit_directory_flag() {
     let link = |extra: &str| {

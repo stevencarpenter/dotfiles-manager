@@ -3,6 +3,7 @@
 //! kind, whether it owns a target, how its `value` is typed, and which outputs it claims. No
 //! adapter is run here.
 
+pub(crate) mod checkout;
 mod generate;
 mod merge_plan;
 pub mod package;
@@ -217,6 +218,7 @@ impl Adapter {
                     | package::APT
                     | package::UV_TOOL
                     | script::ADAPTER
+                    | checkout::ADAPTER
             )
     }
 
@@ -431,6 +433,21 @@ pub fn registry() -> Vec<Adapter> {
             ),
             generator: None,
         },
+        // A git repository cloned to a HOME path (docs/packages.md, "Git checkouts").
+        Adapter {
+            spec: spec(
+                checkout::ADAPTER,
+                "package",
+                TargetRule::Forbidden,
+                Claims::Path("/path"),
+                Schema::Table(vec![
+                    field("url", Schema::Str, true),
+                    field("path", Schema::HomePath, true),
+                    field("branch", Schema::Str, false),
+                ]),
+            ),
+            generator: None,
+        },
         Adapter {
             spec: spec(
                 "firstmate-native/v1",
@@ -527,7 +544,7 @@ mod tests {
         assert_eq!(table.iter().filter(|a| a.renders()).count(), secrets.len());
         // Every package adapter has a provider.
         let packages: Vec<_> = table.iter().filter(|a| a.spec.kind == "package").collect();
-        assert_eq!(packages.len(), 5);
+        assert_eq!(packages.len(), 6);
         assert!(
             packages
                 .iter()

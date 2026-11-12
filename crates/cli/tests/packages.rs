@@ -108,11 +108,12 @@ esac
 /// `<name> <version>` line per installed version); the table form is refused, as a stand-in for
 /// its truncated tool column. `mise install <name>@<version>` appends; a bare name exits 1,
 /// as real mise installs only the configured version for one and none is configured under
-/// `MISE_NO_CONFIG=1`.
+/// `MISE_NO_CONFIG=1`. The install records the requested version, 2.0.0 for `latest`.
 const FAKE_MISE: &str = r#"#!/bin/sh
 PATH=/usr/bin:/bin:$PATH
 here=$(dirname "$0")
-printf 'mise %s | yes=%s auto=%s noconfig=%s\n' "$*" "${MISE_YES:-unset}" "${MISE_NOT_FOUND_AUTO_INSTALL:-unset}" "${MISE_NO_CONFIG:-unset}" >> "$here/../log"
+scoped=$(env | sed -n 's/^npm_config_@s:registry=//p')
+printf 'mise %s | yes=%s auto=%s noconfig=%s scoped=%s registry=%s\n' "$*" "${MISE_YES:-unset}" "${MISE_NOT_FOUND_AUTO_INSTALL:-unset}" "${MISE_NO_CONFIG:-unset}" "${scoped:-unset}" "${npm_config_registry:-unset}" >> "$here/../log"
 db="$here/../installed-mise"
 case "$1" in
   ls)
@@ -129,7 +130,8 @@ case "$1" in
     exit 0 ;;
   install)
     case "$2" in *@*) ;; *) echo "mise ERROR no version requested for $2" >&2; exit 1 ;; esac
-    echo "${2%%@*}  2.0.0" >> "$db"; exit 0 ;;
+    v=${2##*@}; [ "$v" = latest ] && v=2.0.0
+    echo "${2%@*}  $v" >> "$db"; exit 0 ;;
   *) exit 64 ;;
 esac
 "#;
@@ -143,6 +145,32 @@ printf 'dpkg-query %s\n' "$*" >> "$here/../log"
 [ -e "$here/../broken-apt" ] && exit 2
 if grep -qx "$3" "$here/../installed-apt" 2>/dev/null; then printf 'install ok installed'; exit 0; fi
 echo "dpkg-query: no packages found matching $3" >&2; exit 1
+"#;
+
+/// `git -C <dir> config --get remote.origin.url` prints `<dir>/.git/origin` (exit 1 without
+/// it). `git -C <dir> rev-parse ...` prints `<dir>/.git/head` and fails without it. `git clone
+/// [--branch <b>] <url> <dir>` makes `<dir>/.git/origin` and `head`, then exits 128 when the
+/// `clone-fails` marker exists. Every call logs its arguments and `GIT_TERMINAL_PROMPT`.
+const FAKE_GIT: &str = r#"#!/bin/sh
+PATH=/usr/bin:/bin:$PATH
+here=$(dirname "$0")
+printf 'git %s | prompt=%s ceiling=%s sock=%s\n' "$*" "${GIT_TERMINAL_PROMPT:-unset}" "${GIT_CEILING_DIRECTORIES:-unset}" "${SSH_AUTH_SOCK:-unset}" >> "$here/../log"
+case "$1" in
+  -C)
+    d=$2; shift 2
+    case "$1" in
+      config) cat "$d/.git/origin" 2>/dev/null || exit 1 ;;
+      rev-parse) [ -s "$d/.git/head" ] && echo abc1234 || exit 128 ;;
+    esac ;;
+  clone)
+    shift
+    [ "$1" = "--branch" ] && shift 2
+    [ "$1" = "--" ] && shift
+    mkdir -p "$2/.git" && echo "$1" > "$2/.git/origin" && echo abc1234 > "$2/.git/head"
+    [ -e "$here/../clone-fails" ] && exit 128
+    exit 0 ;;
+  *) exit 64 ;;
+esac
 "#;
 
 struct Fx {
@@ -189,6 +217,7 @@ impl Fx {
             ("brew", FAKE_BREW),
             ("mise", FAKE_MISE),
             ("dpkg-query", FAKE_DPKG),
+            ("git", FAKE_GIT),
         ] {
             let p = fx.bin().join(name);
             fs::write(&p, body).unwrap();
@@ -1104,4 +1133,398 @@ fn a_provider_that_cannot_answer_blocks_and_the_flags_of_apply_are_refused() {
         a.extend_from_slice(flags);
         assert_eq!(code(&fx.run(&a)), 2);
     }
+}
+
+/// A module whose only resource is the `mise/v1` tool `name`.
+fn mise_fx(name: &str) -> Fx {
+    let fx = Fx::new();
+    fx.put(
+        "base/modules/extra/module.toml",
+        &format!(
+            "schema = 1\nid = \"extra\"\nplatforms = [\"macos\", \"linux\"]\nrequires = []\n\n[[resources]]\nid = \"t\"\nkind = \"package\"\nadapter = \"mise/v1\"\n[resources.value]\nname = \"{name}\"\nupdate_policy = \"rolling\"\n"
+        ),
+    );
+    fx
+}
+
+fn mise_installs(fx: &Fx) -> usize {
+    fx.log()
+        .lines()
+        .filter(|l| l.starts_with("mise install"))
+        .count()
+}
+
+/// A backend-qualified mise tool from a nested source fetches from its backend: it needs a
+/// grant for that source, for an install and for `--update` (docs/sync.md, "Source identities").
+#[test]
+fn a_nested_github_mise_tool_installs_only_with_a_grant() {
+    let fx = mise_fx("github:o/tool");
+    let module = fs::read_to_string(fx.root.join("base/modules/extra/module.toml")).unwrap();
+    common::nest_extra(&fx.root, &module);
+    for flags in [&[][..], &["--update"][..]] {
+        let mut a = vec!["packages", "--root", fx.root_arg(), "--preview"];
+        a.extend_from_slice(flags);
+        let o = fx.run(&a);
+        let t = format!("{}{}", text(&o.stdout), stderr(&o));
+        assert_eq!(code(&o), 3, "{flags:?}: {t}");
+        assert!(t.contains("E_SOURCE_UNTRUSTED"), "{t}");
+        assert!(
+            t.contains("dfm sync --trust-origin 'https://github.com/o/tool'"),
+            "{t}"
+        );
+    }
+    assert_eq!(mise_installs(&fx), 0, "{}", fx.log());
+    common::grant_aside(&fx.root, "https://github.com/o/tool", |a| fx.run(a));
+    let o = fx.packages(&digest_of(&fx.preview()));
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+    assert_eq!(mise_installs(&fx), 1, "{}", fx.log());
+}
+
+#[test]
+fn a_nested_mise_tool_of_another_backend_is_refused() {
+    let fx = mise_fx("aqua:o/tool");
+    let module = fs::read_to_string(fx.root.join("base/modules/extra/module.toml")).unwrap();
+    common::nest_extra(&fx.root, &module);
+    let o = fx.preview();
+    let t = format!("{}{}", text(&o.stdout), stderr(&o));
+    assert_eq!(code(&o), 3, "{t}");
+    assert!(t.contains("E_SOURCE_UNTRUSTED"), "{t}");
+    assert!(
+        t.contains(
+            "is not declared by the bound checkout, so it may be only a registry name or a github:, ubi: or npm: tool"
+        ),
+        "{t}"
+    );
+    assert_eq!(mise_installs(&fx), 0, "{}", fx.log());
+}
+
+/// A version from a nested source cannot name another source: an npm alias, a git or URL
+/// spec, or any other text but `latest` and a plain version is refused.
+#[test]
+fn a_nested_mise_tool_whose_version_names_another_source_is_refused() {
+    // A url holds `//`, which the name rule refuses before the source check.
+    for (name, code_name) in [
+        ("npm:x@git+https://e/x", "E_MANIFEST_INVALID"),
+        ("github:o/r@https://e", "E_MANIFEST_INVALID"),
+        ("npm:x@npm:y", "E_SOURCE_UNTRUSTED"),
+        ("npm:x@github:o/evil", "E_SOURCE_UNTRUSTED"),
+    ] {
+        let fx = mise_fx(name);
+        let module = fs::read_to_string(fx.root.join("base/modules/extra/module.toml")).unwrap();
+        common::nest_extra(&fx.root, &module);
+        let o = fx.preview();
+        let t = format!("{}{}", text(&o.stdout), stderr(&o));
+        assert_eq!(code(&o), 3, "{name}: {t}");
+        assert!(t.contains(code_name), "{name}: {t}");
+        if code_name == "E_SOURCE_UNTRUSTED" {
+            assert!(
+                t.contains("must be latest or a plain version"),
+                "{name}: {t}"
+            );
+        }
+        assert_eq!(mise_installs(&fx), 0, "{}", fx.log());
+    }
+}
+
+/// A plain version installs with the grant, from the default npm registry. (`@latest` is a
+/// selector that the mise adapter refuses for every declaration, docs/packages.md.)
+#[test]
+fn a_nested_npm_mise_tool_installs_from_the_default_registry_with_a_grant() {
+    for name in ["npm:x@1.2.3", "npm:@s/x@1.2.3"] {
+        let fx = mise_fx(name);
+        let module = fs::read_to_string(fx.root.join("base/modules/extra/module.toml")).unwrap();
+        common::nest_extra(&fx.root, &module);
+        let id = name.rsplit_once('@').unwrap().0;
+        common::grant_aside(&fx.root, id, |a| fx.run(a));
+        let o = fx.packages(&digest_of(&fx.preview()));
+        assert_eq!(code(&o), 0, "{name}: {}\n{}", stderr(&o), text(&o.stdout));
+        let installs: Vec<String> = fx
+            .log()
+            .lines()
+            .filter(|l| l.starts_with("mise install"))
+            .map(str::to_string)
+            .collect();
+        assert_eq!(installs.len(), 1, "{}", fx.log());
+        assert!(
+            installs[0].ends_with("registry=https://registry.npmjs.org/"),
+            "{}",
+            installs[0]
+        );
+        // A scoped name also pins its scope's registry.
+        let scoped = if name.starts_with("npm:@s/") {
+            "scoped=https://registry.npmjs.org/ "
+        } else {
+            "scoped=unset "
+        };
+        assert!(installs[0].contains(scoped), "{}", installs[0]);
+    }
+}
+
+/// The bound checkout's own backend-qualified tool is unchanged: no grant.
+#[test]
+fn a_root_github_mise_tool_installs_without_a_grant() {
+    let fx = mise_fx("github:o/tool");
+    let o = fx.packages(&digest_of(&fx.preview()));
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+    assert_eq!(mise_installs(&fx), 1, "{}", fx.log());
+}
+
+const CHECKOUT_OP: &str = "extra.r@package";
+
+/// A module whose only resource is a `git-checkout/v1` of `url` at `x/r`, plus `extra` fields.
+fn checkout_fx(url: &str, extra: &str) -> Fx {
+    let fx = Fx::new();
+    fx.put(
+        "base/modules/extra/module.toml",
+        &format!(
+            "schema = 1\nid = \"extra\"\nplatforms = [\"macos\", \"linux\"]\nrequires = []\n\n[[resources]]\nid = \"r\"\nkind = \"package\"\nadapter = \"git-checkout/v1\"\n[resources.value]\nurl = \"{url}\"\npath = \"x/r\"\n{extra}"
+        ),
+    );
+    fx
+}
+
+fn clones(fx: &Fx) -> Vec<String> {
+    fx.log()
+        .lines()
+        .filter(|l| l.starts_with("git clone"))
+        .map(str::to_string)
+        .collect()
+}
+
+/// The one clone logged: `prefix`, a sibling temporary directory of `x/r`, and the clone's
+/// environment.
+fn assert_clone(fx: &Fx, prefix: &str) {
+    let tmp = fx.home.path().join("x/.r.dfm-clone-").display().to_string();
+    let log = clones(fx);
+    assert_eq!(log.len(), 1, "{}", fx.log());
+    let rest = log[0]
+        .strip_prefix(&format!("{prefix} {tmp}"))
+        .unwrap_or_else(|| panic!("{}", log[0]));
+    assert!(
+        rest.ends_with("| prompt=0 ceiling=unset sock=unset"),
+        "{}",
+        log[0]
+    );
+}
+
+#[test]
+fn a_missing_checkout_is_cloned() {
+    let fx = checkout_fx("https://github.com/o/r.git", "");
+    let o = fx.preview();
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+    assert!(
+        text(&o.stdout).contains("install extra.r with git-checkout/v1"),
+        "{}",
+        text(&o.stdout)
+    );
+    assert!(clones(&fx).is_empty(), "{}", fx.log());
+    let o = fx.packages(&digest_of(&o));
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+    assert_clone(&fx, "git clone -- https://github.com/o/r.git");
+    assert!(fx.home.path().join("x/r/.git/origin").is_file());
+    let o = fx.packages(&digest_of(&fx.preview()));
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+    assert!(
+        text(&o.stdout).contains(&format!("current {CHECKOUT_OP}")),
+        "{}",
+        text(&o.stdout)
+    );
+    assert_eq!(clones(&fx).len(), 1, "{}", fx.log());
+}
+
+/// A checkout that a nested source declares is not the owner's: it is cloned only with a
+/// grant (docs/sync.md, "Source identities").
+#[test]
+fn a_checkout_from_a_nested_source_is_cloned_only_with_a_grant() {
+    let fx = checkout_fx("https://github.com/o/r.git", "");
+    let module = fs::read_to_string(fx.root.join("base/modules/extra/module.toml")).unwrap();
+    common::nest_extra(&fx.root, &module);
+    let o = fx.preview();
+    let t = format!("{}{}", text(&o.stdout), stderr(&o));
+    assert_eq!(code(&o), 3, "{t}");
+    assert!(t.contains("E_SOURCE_UNTRUSTED"), "{t}");
+    assert!(
+        t.contains("dfm sync --trust-origin 'https://github.com/o/r'"),
+        "{t}"
+    );
+    assert!(clones(&fx).is_empty(), "{}", fx.log());
+    common::grant_aside(&fx.root, "https://github.com/o/r", |a| fx.run(a));
+    let o = fx.packages(&digest_of(&fx.preview()));
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+    assert_clone(&fx, "git clone -- https://github.com/o/r.git");
+}
+
+/// The manager's ssh-agent socket reaches the clone, so a key held in an agent can clone.
+#[test]
+fn the_clone_gets_the_ssh_agent_socket() {
+    let fx = checkout_fx("git@github.com:o/r.git", "");
+    let digest = digest_of(&fx.preview());
+    let o = fx
+        .cmd(&["packages", "--root", fx.root_arg(), "--yes-plan", &digest])
+        .env("SSH_AUTH_SOCK", "/tmp/agent.sock")
+        .output()
+        .unwrap();
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+    let log = clones(&fx);
+    assert_eq!(log.len(), 1, "{}", fx.log());
+    assert!(log[0].ends_with("sock=/tmp/agent.sock"), "{}", log[0]);
+    // The probes get nothing.
+    assert!(
+        fx.log()
+            .lines()
+            .filter(|l| !l.starts_with("git clone"))
+            .all(|l| l.ends_with("sock=unset")),
+        "{}",
+        fx.log()
+    );
+}
+
+#[test]
+fn a_branch_is_passed_to_the_clone() {
+    let fx = checkout_fx("https://github.com/o/r.git", "branch = \"main\"\n");
+    let o = fx.packages(&digest_of(&fx.preview()));
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+    assert_clone(&fx, "git clone --branch main -- https://github.com/o/r.git");
+}
+
+#[test]
+fn a_checkout_of_the_declared_repository_is_current() {
+    let fx = checkout_fx("git@github.com:o/r.git", "");
+    let git = fx.home.path().join("x/r/.git");
+    fs::create_dir_all(&git).unwrap();
+    fs::write(git.join("origin"), "ssh://git@github.com/o/r\n").unwrap();
+    fs::write(git.join("head"), "abc1234\n").unwrap();
+    let o = fx.packages(&digest_of(&fx.preview()));
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+    assert!(
+        text(&o.stdout).contains(&format!("current {CHECKOUT_OP}")),
+        "{}",
+        text(&o.stdout)
+    );
+    assert!(clones(&fx).is_empty(), "{}", fx.log());
+}
+
+#[test]
+fn a_checkout_of_another_repository_is_another_owner() {
+    let fx = checkout_fx("https://github.com/o/r.git", "");
+    let git = fx.home.path().join("x/r/.git");
+    fs::create_dir_all(&git).unwrap();
+    fs::write(git.join("origin"), "https://github.com/o/other\n").unwrap();
+    let o = fx.preview();
+    assert_eq!(code(&o), 3, "{}\n{}", stderr(&o), text(&o.stdout));
+    assert!(stderr(&o).contains("E_CONFLICT"), "{}", stderr(&o));
+    assert!(
+        stderr(&o).contains("https://github.com/o/other"),
+        "{}",
+        stderr(&o)
+    );
+    assert!(
+        stderr(&o)
+            .contains("move or remove ~/x/r, or point the declaration at the repository it holds"),
+        "{}",
+        stderr(&o)
+    );
+    assert!(clones(&fx).is_empty(), "{}", fx.log());
+}
+
+#[test]
+fn a_path_that_is_not_a_checkout_is_another_owner() {
+    for file in [false, true] {
+        let fx = checkout_fx("https://github.com/o/r.git", "");
+        let dest = fx.home.path().join("x/r");
+        if file {
+            fs::create_dir_all(dest.parent().unwrap()).unwrap();
+            fs::write(&dest, "data").unwrap();
+        } else {
+            fs::create_dir_all(&dest).unwrap();
+        }
+        let o = fx.preview();
+        assert_eq!(
+            code(&o),
+            3,
+            "file={file}: {}\n{}",
+            stderr(&o),
+            text(&o.stdout)
+        );
+        assert!(stderr(&o).contains("E_CONFLICT"), "{}", stderr(&o));
+        assert!(clones(&fx).is_empty(), "{}", fx.log());
+        assert_eq!(dest.is_file(), file);
+        assert_eq!(fs::read_dir(&dest).map_or(0, Iterator::count), 0);
+    }
+}
+
+#[test]
+fn a_failing_clone_leaves_nothing_and_the_install_stays_planned() {
+    let fx = checkout_fx("https://github.com/o/r.git", "");
+    let parent = fx.home.path().join("x");
+    fs::create_dir_all(&parent).unwrap();
+    fs::write(parent.join("keep"), "mine").unwrap();
+    // A sibling left by an earlier killed run is removed before the clone.
+    fs::create_dir_all(parent.join(".r.dfm-clone-1/.git")).unwrap();
+    fs::write(fx.fake.path().join("clone-fails"), "").unwrap();
+    let o = fx.packages(&digest_of(&fx.preview()));
+    assert_eq!(code(&o), 1, "{}\n{}", stderr(&o), text(&o.stdout));
+    assert_eq!(clones(&fx).len(), 1, "{}", fx.log());
+    assert!(!parent.join("r").exists());
+    let names: Vec<_> = fs::read_dir(&parent)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(names, ["keep"]);
+    assert_eq!(fs::read_to_string(parent.join("keep")).unwrap(), "mine");
+    let o = fx.preview();
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+    assert!(
+        text(&o.stdout).contains("install extra.r with git-checkout/v1"),
+        "{}",
+        text(&o.stdout)
+    );
+}
+
+#[test]
+fn the_stale_clone_cleanup_removes_only_directories() {
+    let fx = checkout_fx("https://github.com/o/r.git", "");
+    let parent = fx.home.path().join("x");
+    fs::create_dir_all(parent.join(".r.dfm-clone-1/.git")).unwrap();
+    fs::write(parent.join(".r.dfm-clone-file"), "mine").unwrap();
+    let elsewhere = fx.home.path().join("elsewhere");
+    fs::create_dir_all(&elsewhere).unwrap();
+    fs::write(elsewhere.join("keep"), "mine").unwrap();
+    std::os::unix::fs::symlink(&elsewhere, parent.join(".r.dfm-clone-link")).unwrap();
+    let o = fx.packages(&digest_of(&fx.preview()));
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+    assert!(!parent.join(".r.dfm-clone-1").exists());
+    assert_eq!(
+        fs::read_to_string(parent.join(".r.dfm-clone-file")).unwrap(),
+        "mine"
+    );
+    assert!(fs::symlink_metadata(parent.join(".r.dfm-clone-link")).is_ok());
+    assert_eq!(fs::read_to_string(elsewhere.join("keep")).unwrap(), "mine");
+}
+
+#[test]
+fn a_checkout_without_a_commit_is_another_owner() {
+    let fx = checkout_fx("https://github.com/o/r.git", "");
+    let git = fx.home.path().join("x/r/.git");
+    fs::create_dir_all(&git).unwrap();
+    fs::write(git.join("origin"), "https://github.com/o/r\n").unwrap();
+    let o = fx.preview();
+    assert_eq!(code(&o), 3, "{}\n{}", stderr(&o), text(&o.stdout));
+    assert!(stderr(&o).contains("no commit"), "{}", stderr(&o));
+    assert!(clones(&fx).is_empty(), "{}", fx.log());
+}
+
+#[test]
+fn the_probe_stops_git_at_the_checkouts_parent_and_an_empty_git_directory_is_another_owner() {
+    let fx = checkout_fx("https://github.com/o/r.git", "");
+    fs::create_dir_all(fx.home.path().join("x/r/.git")).unwrap();
+    let o = fx.preview();
+    assert_eq!(code(&o), 3, "{}\n{}", stderr(&o), text(&o.stdout));
+    assert!(stderr(&o).contains("E_CONFLICT"), "{}", stderr(&o));
+    let ceiling = fx.home.path().join("x").canonicalize().unwrap();
+    assert!(
+        fx.log().contains(&format!("ceiling={}", ceiling.display())),
+        "{}",
+        fx.log()
+    );
 }
