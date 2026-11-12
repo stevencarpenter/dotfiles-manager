@@ -17,6 +17,7 @@ This page lists the adapter registry and records what the configuration adapters
 | `skills/v1` | `distribution` | `config` | [docs/resolver.md](resolver.md), rule 8 |
 | `op-template/v1` | `secret` | `secrets` | [docs/secrets.md](secrets.md) |
 | `homebrew/v1`, `mise/v1`, `apt/v1`, `uv-tool/v1` | `package` | `packages` | [docs/packages.md](packages.md), [docs/toolchains.md](toolchains.md) |
+| `git-checkout/v1` | `package` | `packages` | [docs/packages.md](packages.md), "Git checkouts" |
 | `script/v1` | `package` | `packages` | [docs/packages.md](packages.md), "Script declarations" |
 | `launchd-agent/v1`, `brew-service/v1`, `omlx-app/v1` | `service` | `services` | [docs/lifecycle.md](lifecycle.md) |
 | `firstmate-native/v1` | `application` | none (always `not_in_scope`) | DESIGN.md. A catalog entry only, with no adapter code ([docs/lifecycle.md](lifecycle.md)). |

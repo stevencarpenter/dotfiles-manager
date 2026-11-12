@@ -145,6 +145,28 @@ if grep -qx "$3" "$here/../installed-apt" 2>/dev/null; then printf 'install ok i
 echo "dpkg-query: no packages found matching $3" >&2; exit 1
 "#;
 
+/// `git -C <dir> config --get remote.origin.url` prints `<dir>/.git/origin` (exit 1 without it),
+/// `git -C <dir> rev-parse ...` prints a short commit, and `git clone [--branch <b>] <url> <dir>`
+/// makes `<dir>/.git/origin` with the url. Every call logs its arguments and `GIT_TERMINAL_PROMPT`.
+const FAKE_GIT: &str = r#"#!/bin/sh
+PATH=/usr/bin:/bin:$PATH
+here=$(dirname "$0")
+printf 'git %s | prompt=%s\n' "$*" "${GIT_TERMINAL_PROMPT:-unset}" >> "$here/../log"
+case "$1" in
+  -C)
+    d=$2; shift 2
+    case "$1" in
+      config) cat "$d/.git/origin" 2>/dev/null || exit 1 ;;
+      rev-parse) echo abc1234 ;;
+    esac ;;
+  clone)
+    shift
+    [ "$1" = "--branch" ] && shift 2
+    mkdir -p "$2/.git" && echo "$1" > "$2/.git/origin" ;;
+  *) exit 64 ;;
+esac
+"#;
+
 struct Fx {
     home: TempDir,
     _src: TempDir,
@@ -189,6 +211,7 @@ impl Fx {
             ("brew", FAKE_BREW),
             ("mise", FAKE_MISE),
             ("dpkg-query", FAKE_DPKG),
+            ("git", FAKE_GIT),
         ] {
             let p = fx.bin().join(name);
             fs::write(&p, body).unwrap();
@@ -1103,5 +1126,132 @@ fn a_provider_that_cannot_answer_blocks_and_the_flags_of_apply_are_refused() {
         let mut a = vec!["packages", "--root", fx.root_arg()];
         a.extend_from_slice(flags);
         assert_eq!(code(&fx.run(&a)), 2);
+    }
+}
+
+const CHECKOUT_OP: &str = "extra.r@package";
+
+/// A module whose only resource is a `git-checkout/v1` of `url` at `x/r`, plus `extra` fields.
+fn checkout_fx(url: &str, extra: &str) -> Fx {
+    let fx = Fx::new();
+    fx.put(
+        "base/modules/extra/module.toml",
+        &format!(
+            "schema = 1\nid = \"extra\"\nplatforms = [\"macos\", \"linux\"]\nrequires = []\n\n[[resources]]\nid = \"r\"\nkind = \"package\"\nadapter = \"git-checkout/v1\"\n[resources.value]\nurl = \"{url}\"\npath = \"x/r\"\n{extra}"
+        ),
+    );
+    fx
+}
+
+fn clones(fx: &Fx) -> Vec<String> {
+    fx.log()
+        .lines()
+        .filter(|l| l.starts_with("git clone"))
+        .map(str::to_string)
+        .collect()
+}
+
+#[test]
+fn a_missing_checkout_is_cloned() {
+    let fx = checkout_fx("https://github.com/o/r.git", "");
+    let o = fx.preview();
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+    assert!(
+        text(&o.stdout).contains("install extra.r with git-checkout/v1"),
+        "{}",
+        text(&o.stdout)
+    );
+    assert!(clones(&fx).is_empty(), "{}", fx.log());
+    let o = fx.packages(&digest_of(&o));
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+    let dest = fx.home.path().join("x/r");
+    assert_eq!(
+        clones(&fx),
+        [format!(
+            "git clone https://github.com/o/r.git {} | prompt=0",
+            dest.display()
+        )]
+    );
+    let o = fx.packages(&digest_of(&fx.preview()));
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+    assert!(
+        text(&o.stdout).contains(&format!("current {CHECKOUT_OP}")),
+        "{}",
+        text(&o.stdout)
+    );
+    assert_eq!(clones(&fx).len(), 1, "{}", fx.log());
+}
+
+#[test]
+fn a_branch_is_passed_to_the_clone() {
+    let fx = checkout_fx("https://github.com/o/r.git", "branch = \"main\"\n");
+    let o = fx.packages(&digest_of(&fx.preview()));
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+    let dest = fx.home.path().join("x/r");
+    assert_eq!(
+        clones(&fx),
+        [format!(
+            "git clone --branch main https://github.com/o/r.git {} | prompt=0",
+            dest.display()
+        )]
+    );
+}
+
+#[test]
+fn a_checkout_of_the_declared_repository_is_current() {
+    let fx = checkout_fx("git@github.com:o/r.git", "");
+    let git = fx.home.path().join("x/r/.git");
+    fs::create_dir_all(&git).unwrap();
+    fs::write(git.join("origin"), "ssh://git@github.com/o/r\n").unwrap();
+    let o = fx.packages(&digest_of(&fx.preview()));
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+    assert!(
+        text(&o.stdout).contains(&format!("current {CHECKOUT_OP}")),
+        "{}",
+        text(&o.stdout)
+    );
+    assert!(clones(&fx).is_empty(), "{}", fx.log());
+}
+
+#[test]
+fn a_checkout_of_another_repository_is_another_owner() {
+    let fx = checkout_fx("https://github.com/o/r.git", "");
+    let git = fx.home.path().join("x/r/.git");
+    fs::create_dir_all(&git).unwrap();
+    fs::write(git.join("origin"), "https://github.com/o/other\n").unwrap();
+    let o = fx.preview();
+    assert_eq!(code(&o), 3, "{}\n{}", stderr(&o), text(&o.stdout));
+    assert!(stderr(&o).contains("E_CONFLICT"), "{}", stderr(&o));
+    assert!(
+        stderr(&o).contains("https://github.com/o/other"),
+        "{}",
+        stderr(&o)
+    );
+    assert!(clones(&fx).is_empty(), "{}", fx.log());
+}
+
+#[test]
+fn a_path_that_is_not_a_checkout_is_another_owner() {
+    for file in [false, true] {
+        let fx = checkout_fx("https://github.com/o/r.git", "");
+        let dest = fx.home.path().join("x/r");
+        if file {
+            fs::create_dir_all(dest.parent().unwrap()).unwrap();
+            fs::write(&dest, "data").unwrap();
+        } else {
+            fs::create_dir_all(&dest).unwrap();
+        }
+        let o = fx.preview();
+        assert_eq!(
+            code(&o),
+            3,
+            "file={file}: {}\n{}",
+            stderr(&o),
+            text(&o.stdout)
+        );
+        assert!(stderr(&o).contains("E_CONFLICT"), "{}", stderr(&o));
+        assert!(clones(&fx).is_empty(), "{}", fx.log());
+        assert_eq!(dest.is_file(), file);
+        assert_eq!(fs::read_dir(&dest).map_or(0, Iterator::count), 0);
     }
 }

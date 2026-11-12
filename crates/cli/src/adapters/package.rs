@@ -8,6 +8,7 @@
 //! Every child runs through the engine runner (fixed search path, rebuilt environment, process
 //! group, timeout). The providers' standard error is bounded and never printed or persisted.
 
+use super::checkout;
 use super::script::{self, ScriptCx};
 use dfm_engine::{End, ProcOutput, ProcRequest, Runner};
 use dfm_model::plan::{PackageState, Scope};
@@ -23,7 +24,7 @@ pub const MISE: &str = "mise/v1";
 pub const APT: &str = "apt/v1";
 pub const UV_TOOL: &str = "uv-tool/v1";
 
-const PROBE_TIMEOUT: Duration = Duration::from_secs(60);
+pub(super) const PROBE_TIMEOUT: Duration = Duration::from_secs(60);
 const INSTALL_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 /// A listing or an install log is bounded; its content is not kept.
 const MAX_OUTPUT: usize = 1 << 20;
@@ -124,7 +125,7 @@ fn valid_name(n: &str) -> bool {
         })
 }
 
-fn request<'a>(
+pub(super) fn request<'a>(
     program: &'a str,
     args: &'a [String],
     env: &'a [(String, String)],
@@ -141,7 +142,7 @@ fn request<'a>(
 }
 
 /// Why a child did not end with an exit code the adapter can read.
-fn ended(what: &str, out: &ProcOutput) -> Option<String> {
+pub(super) fn ended(what: &str, out: &ProcOutput) -> Option<String> {
     match &out.end {
         End::Exited(_) => None,
         End::TimedOut => Some(format!("{what} did not answer within {PROBE_TIMEOUT:?}")),
@@ -1454,7 +1455,7 @@ pub fn upgrade(runner: &Runner, adapter: &str, value: &Value) -> Result<(), Refu
 }
 
 /// Runs a provider command that changes the machine, within the install timeout.
-fn change(
+pub(super) fn change(
     runner: &Runner,
     program: &str,
     args: &[String],
@@ -1523,7 +1524,9 @@ fn facts(
         if let Some(stop) = dfm_engine::signal::requested() {
             return Err(stop);
         }
-        let looked = if r.adapter == script::ADAPTER {
+        let looked = if r.adapter == checkout::ADAPTER {
+            checkout::probe(runner, &r.value)
+        } else if r.adapter == script::ADAPTER {
             script::probe(runner, &r.id, &r.value, scripts, update)
         } else if uv_sourced(&r.adapter, &r.value) {
             if update {

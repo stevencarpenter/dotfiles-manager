@@ -1,6 +1,7 @@
 //! The `render` and `assemble` adapters (docs/adapters.md). Pure functions of the resource
 //! value and the verified inputs apply or the planner supplies. They open no file.
 
+use super::checkout;
 use super::script::{self, ScriptCx};
 use super::{Adapter, package, registry, secret, service};
 use dfm_engine::{Completion, Dir, Generator, GeneratorInputs, Got, Runner, Sys};
@@ -272,7 +273,9 @@ impl Generator for Generators<'_> {
                 )
             })?;
         let value = self.value(op)?;
-        if op.adapter == script::ADAPTER {
+        if op.adapter == checkout::ADAPTER {
+            checkout::probe(runner, value)
+        } else if op.adapter == script::ADAPTER {
             let update = op.action == Action::Upgrade;
             script::probe(runner, &op.resource, value, self.scripts.as_ref(), update)
         } else if package::uv_sourced(&op.adapter, value) {
@@ -300,7 +303,9 @@ impl Generator for Generators<'_> {
                 )
             })?;
         let value = self.value(op)?;
-        if op.adapter == script::ADAPTER {
+        if op.adapter == checkout::ADAPTER {
+            checkout::install(runner, value)
+        } else if op.adapter == script::ADAPTER {
             let cx = self.scripts.as_ref().ok_or_else(|| {
                 Refusal::new(
                     Code::GeneratorUnavailable,
