@@ -234,6 +234,7 @@ case "$1" in
     [ -e "$st/next-{name}" ] && cp "$st/next-{name}" "$st/{name}"
     [ -e "$st/write-{name}" ] && echo changed >> "$(cat "$st/write-{name}")"
     exit 0 ;;
+  plugin) exit 0 ;;
   *) exit 64 ;;
 esac
 "#,

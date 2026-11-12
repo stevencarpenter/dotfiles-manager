@@ -163,9 +163,9 @@ four plans and one sync digest that covers them and the sources. sync is the one
 the only one that runs without a digest: it then plans again under the lock and refuses
 (E_PLAN_STALE) when that plan is not the printed one. -y <sync digest> is optional and pins the run
 to a plan --preview printed. Every origin needs a grant in state/grants.json first (--trust-origin
-<origin> writes one, prints the plan and stops; no fetch happens before the grant). The skills,
-agents, npm and uv updaters run only when each source they fetch has a grant (an npm:<package>
-identity is granted with --trust-origin too). A script/v1 tool whose binary is missing installs
+<origin> writes one, prints the plan and stops; no fetch happens before the grant). The agents
+updater runs only when its upstream has a grant, and a source that a nested source declares
+needs a grant too (an npm:<package> identity is granted with --trust-origin). A script/v1 tool whose binary is missing installs
 only with a script:<url> grant. The run fast-forwards each checkout (never reset, clean, stash, rebase, commit or push; divergence and
 overwritten local changes are refused), then runs apply, packages, secrets and services in that
 order, each with its own plan digest and receipt. A removal of an owned output needs no flag. An
@@ -174,7 +174,7 @@ runs; a restart runs only with --restart <resource-id>. A scope that fails stops
 (not_started). Without a 1Password session the secrets are skipped; a blocked packages, secrets or
 services plan does not run; the other scopes run, and the last lines of the output warn what waits
 and how to fix it. A blocked configuration plan refuses the run. A pin is never rewritten.
-Then the updaters the profile declares (updaters = [...], from agents, brew, checkouts, claude, codex, mise,
+Then the updaters the profile declares (updaters = [...], from agents, brew, cargo, checkouts, claude, codex, go, mise,
 npm, opencode, rustup, side-channels, skills, uv) run in order, detached, each reported updated, current, held, pending, failed or blocked,
 with one upgrade receipt; a failure warns and the exit stays 0. --no-upgrade skips them.
 --preview fetches into staging and changes nothing else. See docs/sync.md and docs/upgrade.md.

@@ -1,6 +1,6 @@
 # DFM-25 C01: move the side-channel installers into dfm
 
-Status: draft for owner review, 2026-11-11; owner answers of 2026-11-11 (fantasy-sports as an external bundle) and of 2026-11-12 (mise, `skills` and declared uv sources ungated) applied. Kaneo: DFM-25 (C01; the grant rule is C04). Inputs: the code at main 0e90709 and `~/.dotfiles/scripts/sync-side-channels.sh` at the dotfiles `main` of 2026-11-11.
+Status: draft for owner review, 2026-11-11; slice 4 superseded by the owner decision of 2026-11-12 (see "Owner decision of 2026-11-12"); owner answers of 2026-11-11 (fantasy-sports as an external bundle) and of 2026-11-12 (mise, `skills` and declared uv sources ungated) applied. Kaneo: DFM-25 (C01; the grant rule is C04). Inputs: the code at main 0e90709 and `~/.dotfiles/scripts/sync-side-channels.sh` at the dotfiles `main` of 2026-11-11.
 
 ## Intent
 
@@ -37,7 +37,7 @@ The owner decided on 2026-11-11 that every step of the script is managed by dfm.
 | 1 | `mise install` | mise's registries and the `github:`, `npm:` and `go:` backends that the global config names | The `mise` updater runs `mise install` before `mise upgrade`, without a gate (see "mise sources"). |
 | 2 | `mise upgrade --no-prune` | the same | The existing `mise` updater. Its prune behavior stays (see "Decided in this design"). |
 | 3 | DuckDB `INSTALL spatial; INSTALL avro;` | DuckDB's core extension repository | New package adapter `duckdb-extension/v1`. |
-| 4 | gh-axi skill: `npx --yes skills@1.7.0 add <github tree URL at a commit> --skill gh-axi --global --yes --agent ...` | `npm:skills`, `https://github.com/kunchenguid/gh-axi` | New package adapter `skill-source/v1`. |
+| 4 | gh-axi skill: `npx --yes skills@1.7.0 add <github tree URL at a commit> --skill gh-axi --global --yes --agent ...` | `npm:skills`, `https://github.com/kunchenguid/gh-axi` | Dropped: no skill adapter. The `skills` updater rolls skills at latest; see "Owner decision of 2026-11-12". |
 | 5 | `firstmate --setup` | `https://github.com/kunchenguid/firstmate` | A `git-checkout/v1` resource for `~/.local/share/firstmate/repo`. `--setup` is no longer run (see "Firstmate"). |
 | 6 | `op-render` with `op signin` on a TTY | 1Password | `~/.config/zsh/.personal.env` is already an `op-template/v1` secret (`dfm-module-personal.toml`). `~/.ssh/config.d/10-homelab.conf` is declared the same way. op-render wrote it, so the first render is a takeover that needs one `--allow-adopt`. No dfm code change. |
 | 7 | tpm clone or `pull --ff-only` | `https://github.com/tmux-plugins/tpm` | New package adapter `git-checkout/v1` and a new `checkouts` updater. |
@@ -46,7 +46,7 @@ The owner decided on 2026-11-11 that every step of the script is managed by dfm.
 | 10 | `lefthook install` in the bound checkout | none | New `lefthook` updater: the fixed command `lefthook install` in the bound checkout. |
 | 11 | token-auditor: `uv tool install --force git+https://github.com/stevencarpenter/token-auditor@<tag>`, with the tag from `versions/token-auditor` | `https://github.com/stevencarpenter/token-auditor` | `uv-tool/v1` accepts a git source with an immutable ref. |
 | 12 | agent-reap: `uv tool install --force --reinstall <checkout>/agent_reap` | none (local) | `uv-tool/v1` accepts a path source inside the bound checkout. |
-| 13 | Codex ponytail: `codex plugin marketplace add DietrichGebert/ponytail`, `codex plugin add ponytail@ponytail` | `https://github.com/DietrichGebert/ponytail` | New package adapter `codex-plugin/v1`. |
+| 13 | Codex ponytail: `codex plugin marketplace add DietrichGebert/ponytail`, `codex plugin add ponytail@ponytail` | `https://github.com/DietrichGebert/ponytail` | Dropped: no plugin adapter. The `codex` updater also runs `codex plugin marketplace upgrade`; see "Owner decision of 2026-11-12". |
 | 14 | `firstmate --request-update` | Firstmate's own origin, fetched by Firstmate | New `firstmate` updater: the fixed command `~/.local/bin/firstmate --request-update`. |
 
 ## The parts
@@ -56,8 +56,6 @@ The owner decided on 2026-11-11 that every step of the script is managed by dfm.
 A new package adapter follows docs/packages.md: a read-only probe before the plan, an install operation in the packages scope, a re-probe after the install, and an `E_MANIFEST_INVALID` refusal of bad fields at resolve time. Each adapter that fetches from an origin reports its identities, and the packages scope blocks the operation without a grant, as `script/v1` does with `script:<url>` (docs/sync.md, "Source identities").
 
 - **`git-checkout/v1`.** Fields: `url` (a git URL that maps to a canonical identity), `path` (HOME-relative), `branch` (optional; the clone uses `--branch <branch>`). The probe passes when `<path>/.git` exists and `remote.origin.url` maps to the same identity. A different identity is `E_CONFLICT` (another owner). A missing path is installed with `git clone <url> <path>`. The packages scope never pulls. The identity is the origin of `url`.
-- **`skill-source/v1`.** Fields: `source` (the GitHub tree URL at a commit, as the script writes it), `skill`, `agents` (a list), `installer` (an `npm:skills@<version>` value). The probe reads the `skills` CLI's source record, as `skills_sources` does now, and passes when an entry has that `source` and `skill`. The install runs `mise exec -- npx --yes skills@<version> add <source> --skill <skill> --global --yes --agent <agents...>` with the default npm registry forced, as the `skills` updater does. Identities: `npm:skills` and the repository origin of `source`.
-- **`codex-plugin/v1`.** Fields: `marketplace` (a GitHub shorthand or URL), `plugin` (`<name>@<marketplace>`). The probe reads `codex plugin marketplace list` and `codex plugin list`. The install runs `codex plugin marketplace add` when the marketplace is missing, then `codex plugin add`. The identity is the marketplace origin. A marketplace grant covers its plugins, as for Claude (trust design, "Grants").
 - **`duckdb-extension/v1`.** Field: `name`. The probe runs `duckdb -init /dev/null -c` with a query on `duckdb_extensions()` and passes when the extension is installed. The install runs `INSTALL <name>`. DuckDB keeps extensions per version, so a DuckDB upgrade makes the probe fail and the next sync installs the extension again. DuckDB's core repository is the tool's own owner, so it is not gated, as for `brew` and `mise`. `DUCKDB_AGENT_MODE=0` is set, as in the script.
 - **`uv-tool/v1` sources.** Add an optional `source` field. A declared source needs no grant (owner decision of 2026-11-12). `git+https://<repo>` is the rolling form: the default branch, upgraded by `packages --update`. `git+https://<repo>@<ref>` pins a tag or a full commit, never a branch. The install runs `uv tool install --force <source>`. A `path:<bundle-relative dir>` source must resolve inside the bound checkout. The probe compares the source that uv records for the tool with the declared source; a different source is stale and is installed again. A name-only value keeps its current behavior.
 
@@ -81,7 +79,17 @@ Owner decision, 2026-11-11: the fantasy-sports repository (`ssh://git@github.com
 
 ### mise sources
 
-Owner decision, 2026-11-12: the north star of dfm is user experience, not strict auditability. The `mise` and `skills` updaters run without a gate. The mise configuration is the owner's own file in the granted checkout, and the friction of a grant per tool outweighs the risk. The `mise` updater runs `mise install` before `mise upgrade`; `mise ls --installed --json` before and after the install reports each tool version it adds and makes the row `updated`. `skills` keeps its `npm:skills` and skill-source grants. A declared `uv-tool/v1` source needs no grant either: the owner wrote it in the owner's own checkout. Everything rolls to the newest version; a declared source pins only when it names a tag or a commit. This replaces the owner decision of 2026-11-11 that gated mise.
+Owner decision, 2026-11-12: the north star of dfm is user experience, not strict auditability. The `mise` and `skills` updaters run without a gate. The mise configuration is the owner's own file in the granted checkout, and the friction of a grant per tool outweighs the risk. The `mise` updater runs `mise install` before `mise upgrade`; `mise ls --installed --json` before and after the install reports each tool version it adds and makes the row `updated`. `skills` keeps no grant either. A declared `uv-tool/v1` source needs no grant either: the owner wrote it in the owner's own checkout. Everything rolls to the newest version; a declared source pins only when it names a tag or a commit. This replaces the owner decision of 2026-11-11 that gated mise.
+
+### Owner decision of 2026-11-12
+
+User experience comes first, and dfm manages the package manager, not the package. This replaces the per-package parts of this design.
+
+- The `skills`, `npm` and `uv` updaters need no per-package grant. An updater acts on everything its package manager lists. `skills` runs `mise exec -- npx skills@latest update`.
+- No per-package adapter, pin, grant or special case. The `skill-source/v1` and `codex-plugin/v1` adapters are dropped. New updaters (`go`, `cargo`) and the `codex` plugin marketplace upgrade replace them.
+- Grants stay for the dotfiles checkout's origins and for sources that a nested source declares (PR #102). The npm registry forcing of the `skills` and `npm` updaters stays.
+- The `agents` updater keeps its upstream grant.
+- The owner defers the fantasy-sports external bundle (slice 3, step 9) to summer 2027. `install-fantasy-sports.sh` stays in the side-channel script until then.
 
 ### Firstmate
 
@@ -98,10 +106,8 @@ The updaters run after the four scopes. The tools that the new package adapters 
 - The `mise` updater keeps mise's prune grace period (`upgrade.prune_after`, 24 h) instead of `--no-prune`. The script's reason is to keep old installs for sessions that are already running, and the grace period covers that.
 - The `agents` updater's working-copy rule is kept because it exists in dfm now.
 - `versions/token-auditor` is removed. The tag moves into the `uv-tool/v1` value.
-- The `skills@1.7.0` installer pin moves into the `skill-source/v1` value.
 - agent-reap is installed by the packages scope when its declared source differs from uv's record. The `uv` updater runs `uv tool upgrade agent-reap` on every sync, as for every tool. Whether that rebuilds a path tool whose code changed without a version bump depends on uv's cache and is unchecked. If it does not, the builder adds a content digest of the directory to the probe.
 - Capability gates of the script (`host-capability.sh skills`, `mcp`, `agents`, and the `personal` identity) become module membership. A resource is in a module that the work profile does not list.
-- The `skill-source/v1` probe does not use the `skills` CLI's source record: that record has no gh-axi entry today, and an entry there would let the `skills` updater roll the skill past its pin. The probe passes when the installed skill directory exists and dfm's own record of the last install (state, keyed by resource) names the declared `source` and installer version.
 - The other callers of the script are rewired in the last dotfiles PR: the `sync-dfm-apply` recipe (`Justfile:92`), `scripts/update-inputs.sh:42`, `scripts/test-sync-capability-gating.sh` and the message at `bootstrap.sh:106`.
 - Each dotfiles PR removes a step from the script in the same change that declares its resource, so no file has two writers after the merge (op-render and the secrets scope included).
 - `op signin` is not run. Without a 1Password session the secrets scope is skipped with its warning, as now, and the owner runs `op signin` and syncs again.
@@ -119,6 +125,6 @@ Each slice is one PR that passes the gate and gets Codex's thumbs-up. Each slice
 
 1. `uv-tool/v1` sources (steps 11 and 12), and `mise install` in the `mise` updater (step 1, "mise sources").
 2. `git-checkout/v1` and the `checkouts` updater (step 7), then the agent registry (step 8), and the bundle's `op-template/v1` secret (step 6).
-3. The fantasy-sports external bundle (step 9).
-4. `skill-source/v1` (step 4) and `codex-plugin/v1` (step 13).
+3. The fantasy-sports external bundle (step 9). Deferred by the owner to summer 2027 (2026-11-12).
+4. Package managers (2026-11-12): `skills` at latest, `go` and `cargo` updaters, `codex` plugin marketplaces (steps 4 and 13). No per-package adapter.
 5. `duckdb-extension/v1` (step 3), `lefthook` (step 10), Firstmate (steps 5 and 14), then deletion of the script, the recipe and `Updater::SideChannels` (G5).

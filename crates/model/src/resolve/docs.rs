@@ -828,10 +828,10 @@ mod tests {
 
     #[test]
     fn profile_unknown_updater_is_manifest_invalid() {
-        let e = profile_with("updaters = [\"cargo\"]\n").unwrap_err();
+        let e = profile_with("updaters = [\"pip\"]\n").unwrap_err();
         assert!(
             e.action.contains(
-                "use one of: agents, brew, checkouts, claude, codex, mise, npm, opencode, rustup, side-channels, skills, uv"
+                "use one of: agents, brew, cargo, checkouts, claude, codex, go, mise, npm, opencode, rustup, side-channels, skills, uv"
             ),
             "{e:?}"
         );
