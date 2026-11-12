@@ -8,6 +8,7 @@ pub enum Updater {
     Checkouts,
     Claude,
     Codex,
+    Go,
     Mise,
     Npm,
     Opencode,
@@ -18,12 +19,13 @@ pub enum Updater {
 }
 
 impl Updater {
-    pub const ALL: [Updater; 12] = [
+    pub const ALL: [Updater; 13] = [
         Updater::Agents,
         Updater::Brew,
         Updater::Checkouts,
         Updater::Claude,
         Updater::Codex,
+        Updater::Go,
         Updater::Mise,
         Updater::Npm,
         Updater::Opencode,
@@ -40,6 +42,7 @@ impl Updater {
             Updater::Checkouts => "checkouts",
             Updater::Claude => "claude",
             Updater::Codex => "codex",
+            Updater::Go => "go",
             Updater::Mise => "mise",
             Updater::Npm => "npm",
             Updater::Opencode => "opencode",

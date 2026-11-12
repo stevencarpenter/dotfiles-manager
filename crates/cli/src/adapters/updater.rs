@@ -91,6 +91,7 @@ fn owner_dir(u: Updater) -> Option<&'static str> {
         Updater::Agents
         | Updater::Brew
         | Updater::Checkouts
+        | Updater::Go
         | Updater::Mise
         | Updater::Npm
         | Updater::SideChannels
@@ -254,6 +255,7 @@ pub fn run(u: Updater, env: &Env) -> Row {
                 Err(e) => d.stop(e),
             }
         }
+        Updater::Go => go(d, env),
         Updater::Mise => mise(d, env),
         Updater::Npm => npm(d, env),
         Updater::Rustup => rustup(d, env),
@@ -352,6 +354,7 @@ pub fn second_copies(u: Updater, env: &Env) -> Vec<String> {
         Updater::Agents
         | Updater::Brew
         | Updater::Checkouts
+        | Updater::Go
         | Updater::Mise
         | Updater::Npm
         | Updater::Rustup
@@ -967,6 +970,116 @@ fn uv(mut d: Draft, env: &Env) -> Row {
     }
 }
 
+// ---- go binaries -----------------------------------------------------------------------------
+
+/// Where `go install` puts binaries, relative to HOME.
+const GO_BIN: &str = "go/bin";
+
+/// `go version -m <bin>`: the package path and the module version of a binary. `None` when the
+/// output has no `path` line or no `mod` line with a real version (`(devel)` is not one).
+fn go_module(stdout: &[u8]) -> (Option<String>, Option<String>) {
+    let (mut path, mut version) = (None, None);
+    for line in String::from_utf8_lossy(stdout).lines() {
+        let f: Vec<&str> = line.trim().split('\t').collect();
+        match f.as_slice() {
+            ["path", p] => path = Some(p.to_string()),
+            ["mod", _, v, ..] if *v != "(devel)" => version = Some(v.to_string()),
+            _ => {}
+        }
+    }
+    (path, version)
+}
+
+/// Reinstalls every binary in `~/go/bin` at `@latest`. `go` is a mise shim whose `GOBIN` is the
+/// versioned install directory that a Go patch upgrade replaces, so each command runs under
+/// `mise exec` with `GOBIN` set to `~/go/bin`. A file that `go version -m` cannot read is not a
+/// Go binary and is skipped. One failing install fails the row; the others still run.
+fn go(mut d: Draft, env: &Env) -> Row {
+    if let Err(e) = env.provider.resolve("mise") {
+        d.notes.push(e.detail);
+        return d.end(Status::Blocked);
+    }
+    let dir = env.home.join(GO_BIN);
+    let mut files = match std::fs::read_dir(&dir) {
+        Ok(e) => e
+            .filter_map(|e| e.ok().filter(|e| e.file_type().is_ok_and(|t| t.is_file())))
+            .map(|e| e.path())
+            .collect::<Vec<_>>(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => vec![],
+        Err(e) => return d.stop((format!("cannot read {}: {e}", dir.display()), false)),
+    };
+    files.sort();
+    let gobin = vec![("GOBIN".to_string(), dir.display().to_string())];
+    let read = |bin: &Path| {
+        let a = args(&[
+            "exec",
+            "--",
+            "go",
+            "version",
+            "-m",
+            &bin.display().to_string(),
+        ]);
+        call(env.provider, "mise", &a, &gobin, env.timeouts.short)
+    };
+    // package path -> (binary name, version before)
+    let mut groups: std::collections::BTreeMap<String, Vec<(PathBuf, String)>> = Default::default();
+    for bin in files {
+        let name = bin
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned();
+        match read(&bin) {
+            Err(e) if e.1 => return d.stop(e),
+            // Not a Go binary.
+            Err(_) => {}
+            Ok(out) => match go_module(&out.stdout) {
+                (Some(path), Some(v)) => groups.entry(path).or_default().push((bin, v)),
+                _ => d.notes.push(format!("{name} held (no module version)")),
+            },
+        }
+    }
+    if groups.is_empty() && d.notes.is_empty() {
+        d.notes.push("no go binary is installed".into());
+        return d.end(Status::Current);
+    }
+    let mut failure = None;
+    let mut changed = false;
+    for (path, bins) in &groups {
+        let a = args(&["exec", "--", "go", "install", &format!("{path}@latest")]);
+        match call(env.provider, "mise", &a, &gobin, env.timeouts.long) {
+            // A stop ends the updater here: no other go command starts.
+            Err(e) if e.1 => return d.stop(e),
+            Err(e) if failure.is_none() => failure = Some(e),
+            Err(e) => d.notes.push(e.0),
+            Ok(_) => {}
+        }
+        for (bin, before) in bins {
+            let after = match read(bin) {
+                Ok(out) => go_module(&out.stdout).1,
+                Err(e) if e.1 => return d.stop(e),
+                Err(_) => None,
+            };
+            let name = bin.file_name().unwrap_or_default().to_string_lossy();
+            match after {
+                Some(v) if v != *before => {
+                    changed = true;
+                    d.notes.push(format!("{name} {before} -> {v}"));
+                }
+                Some(_) => {}
+                None => d
+                    .notes
+                    .push(format!("{name}: version unreadable after the install")),
+            }
+        }
+    }
+    match failure {
+        Some(e) => d.stop(e),
+        None if changed => d.end(Status::Updated),
+        None => d.end(Status::Current),
+    }
+}
+
 // ---- source trust (docs/upgrade.md, "Source trust") ------------------------------------------
 
 /// The environment of `skills update` and of every `npm` command: the default npm registry, so
@@ -1552,6 +1665,14 @@ fn preview_command(u: Updater, env: &Env) -> String {
         Updater::Skills => match env.provider.resolve("mise") {
             Ok(p) => format!(
                 "would run mise exec -- npx --yes skills@latest update ({})",
+                p.display()
+            ),
+            Err(e) => format!("blocked: {}", e.detail),
+        },
+        Updater::Go => match env.provider.resolve("mise") {
+            Ok(p) => format!(
+                "would run mise exec -- go version -m and go install <package>@latest for each binary in {} ({})",
+                env.home.join(GO_BIN).display(),
                 p.display()
             ),
             Err(e) => format!("blocked: {}", e.detail),
@@ -2393,6 +2514,7 @@ mod tests {
             Updater::Codex,
             Updater::Opencode,
             Updater::Brew,
+            Updater::Go,
             Updater::Mise,
             Updater::Rustup,
             Updater::Npm,
@@ -3090,6 +3212,141 @@ mod tests {
                 "case \"$1 $2\" in\n  'tool list') cat \"$st/uv-list\" ;;\n  'tool upgrade') [ -f \"$st/uv-fail-$3\" ] && exit 1; cp \"$st/uv-after\" \"$st/uv-list\" ;;\n  *) exit 64 ;;\nesac",
             );
         }
+    }
+
+    impl T {
+        /// `mise exec -- go` whose `version -m <bin>` prints `st/gobin/<name>` (exit 1 when
+        /// absent: not a Go binary) and whose `install <pkg>@latest` copies `st/golatest/<name>`
+        /// over each binary whose `path` line is `<pkg>`, or exits 1 with the `st/go-fail-<name>`
+        /// marker (`<name>` is the last element of the package path). It logs `GOBIN`.
+        fn go(&self, bins: &[(&str, &str, &str, &str)]) {
+            let (cur, new) = (self.root.join("st/gobin"), self.root.join("st/golatest"));
+            fs::create_dir_all(&cur).unwrap();
+            fs::create_dir_all(&new).unwrap();
+            let dir = self.home.join(GO_BIN);
+            fs::create_dir_all(&dir).unwrap();
+            for (name, pkg, v, latest) in bins {
+                fs::write(dir.join(name), "").unwrap();
+                let text = |v: &str| {
+                    format!("{name}: go1.26.3\n\tpath\t{pkg}\n\tmod\tm/{name}\t{v}\th1:x=\n")
+                };
+                fs::write(cur.join(name), text(v)).unwrap();
+                fs::write(new.join(name), text(latest)).unwrap();
+            }
+            self.script(
+                &self.bin.join("mise"),
+                "echo \"$GOBIN\" >> $st/go-env\n[ \"$1 $2 $3\" = 'exec -- go' ] || exit 64\ncase \"$4\" in\n  version) [ -f \"$st/gobin/$(basename $6)\" ] || exit 1; cat \"$st/gobin/$(basename $6)\" ;;\n  install) pkg=${5%@latest}; [ -f \"$st/go-fail-$(basename $pkg)\" ] && exit 1; for f in $st/gobin/*; do grep -q \"path	$pkg\\$\" $f && cp $st/golatest/$(basename $f) $f; done; true ;;\n  *) exit 64 ;;\nesac",
+            );
+        }
+    }
+
+    #[test]
+    fn go_reinstalls_each_binary_at_latest() {
+        let t = T::new();
+        t.go(&[
+            (
+                "bumblebee",
+                "github.com/p/bumblebee/cmd/bumblebee",
+                "v0.1.1",
+                "v0.1.2",
+            ),
+            (
+                "protoc-gen-go",
+                "google.golang.org/protobuf/cmd/protoc-gen-go",
+                "v1.36.0",
+                "v1.36.0",
+            ),
+        ]);
+        let r = run(Updater::Go, &t.env());
+        assert_eq!(r.status, Status::Updated, "{r:?}");
+        assert_eq!(r.notes, vec!["bumblebee v0.1.1 -> v0.1.2".to_string()]);
+        let bin = |n: &str| t.home.join("go/bin").join(n).display().to_string();
+        assert_eq!(
+            t.calls(),
+            vec![
+                format!("mise exec -- go version -m {}", bin("bumblebee")),
+                format!("mise exec -- go version -m {}", bin("protoc-gen-go")),
+                "mise exec -- go install github.com/p/bumblebee/cmd/bumblebee@latest".to_string(),
+                format!("mise exec -- go version -m {}", bin("bumblebee")),
+                "mise exec -- go install google.golang.org/protobuf/cmd/protoc-gen-go@latest"
+                    .to_string(),
+                format!("mise exec -- go version -m {}", bin("protoc-gen-go")),
+            ]
+        );
+        // The versioned mise install directory is never the target.
+        let envs = fs::read_to_string(t.root.join("st/go-env")).unwrap();
+        let want = t.home.join("go/bin").display().to_string();
+        assert!(envs.lines().all(|l| l == want), "{envs}");
+        // A second run finds nothing newer.
+        let r = run(Updater::Go, &t.env());
+        assert_eq!(r.status, Status::Current, "{r:?}");
+        assert!(r.notes.is_empty(), "{r:?}");
+    }
+
+    #[test]
+    fn go_holds_a_binary_without_a_module_version() {
+        let t = T::new();
+        t.go(&[("tool", "example.com/tool", "(devel)", "v1.0.0")]);
+        fs::write(t.home.join("go/bin/plain"), "").unwrap();
+        fs::write(
+            t.root.join("st/gobin/plain"),
+            "plain: go1.26.3\n\tpath\texample.com/plain\n",
+        )
+        .unwrap();
+        // A file that is not a Go binary is skipped without a note.
+        fs::write(t.home.join("go/bin/script.sh"), "").unwrap();
+        let r = run(Updater::Go, &t.env());
+        assert_eq!(r.status, Status::Current, "{r:?}");
+        assert_eq!(
+            r.notes,
+            vec![
+                "plain held (no module version)".to_string(),
+                "tool held (no module version)".to_string()
+            ]
+        );
+        assert!(!t.log().contains("go install"), "{}", t.log());
+    }
+
+    #[test]
+    fn go_with_no_binaries_is_current() {
+        let t = T::new();
+        t.script(&t.bin.join("mise"), "exit 64");
+        let r = run(Updater::Go, &t.env());
+        assert_eq!(r.status, Status::Current, "{r:?}");
+        assert_eq!(r.notes, vec!["no go binary is installed".to_string()]);
+        assert_eq!(t.log(), "");
+    }
+
+    #[test]
+    fn go_missing_is_blocked() {
+        let t = T::new();
+        let r = run(Updater::Go, &t.env());
+        assert_eq!(r.status, Status::Blocked, "{r:?}");
+        assert!(preview(Updater::Go, &t.env()).starts_with("blocked: "));
+    }
+
+    #[test]
+    fn one_failing_go_install_fails_the_row_and_the_others_still_run() {
+        let t = T::new();
+        t.go(&[
+            ("a", "example.com/a", "v1.0.0", "v1.1.0"),
+            ("b", "example.com/b", "v2.0.0", "v2.1.0"),
+        ]);
+        fs::write(t.root.join("st/go-fail-a"), "").unwrap();
+        let r = run(Updater::Go, &t.env());
+        assert_eq!(r.status, Status::Failed, "{r:?}");
+        assert!(r.notes.iter().any(|n| n == "b v2.0.0 -> v2.1.0"), "{r:?}");
+        assert!(
+            r.notes
+                .iter()
+                .any(|n| n.contains("go install example.com/a@latest")),
+            "{r:?}"
+        );
+        assert!(
+            t.calls()
+                .contains(&"mise exec -- go install example.com/b@latest".to_string())
+        );
+        assert!(preview(Updater::Go, &t.env()).contains("go install"));
     }
 
     const MISE_TWO: &str = r#"{"go":{"name":"go","requested":"1.27","current":"1.27.3","latest":"1.27.4"},"usage":{"name":"usage","requested":"latest","current":"2.0.0","latest":"2.1.0"}}"#;

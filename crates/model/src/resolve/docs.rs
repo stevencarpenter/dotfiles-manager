@@ -831,7 +831,7 @@ mod tests {
         let e = profile_with("updaters = [\"cargo\"]\n").unwrap_err();
         assert!(
             e.action.contains(
-                "use one of: agents, brew, checkouts, claude, codex, mise, npm, opencode, rustup, side-channels, skills, uv"
+                "use one of: agents, brew, checkouts, claude, codex, go, mise, npm, opencode, rustup, side-channels, skills, uv"
             ),
             "{e:?}"
         );
