@@ -949,8 +949,9 @@ fn ungranted(runner: &Runner, source: &UvSource, cx: &ScriptCx) -> Result<Option
 /// `packages --update` for a source tool. The name and the source are checked first, as the
 /// plan without `--update` checks them. Then [`maintain`] decides, and it holds a tool that
 /// uv's receipt shows from the declared source, with or without a grant (it fetches nothing).
-/// A tool installed from anywhere else (the package index, another rev) is `Missing`, so it is
-/// installed from its source and never upgraded from the index. A missing one, which the
+/// A tool installed from anywhere else (the package index, another rev) is `Missing`, with the
+/// owner check (`OtherOwner` blocks), so it is installed from its source and never upgraded
+/// from the index. A missing one, which the
 /// install would fetch, is `Ungranted` when its git source has no grant. Without `cx`
 /// (`doctor`) a path source is not resolved.
 fn maintain_sourced(
@@ -968,10 +969,12 @@ fn maintain_sourced(
     };
     let source = uv_source(value, cx.root())?.ok_or_else(|| bad_source(text, "is missing"))?;
     let state = match maintain(runner, UV_TOOL, value)? {
+        // `maintain` holds some copies before its owner check, so a copy it now treats as
+        // missing gets that check here, as the plain probe does.
         PackageState::Installed(_) | PackageState::Held(_) | PackageState::Rolling(_)
             if !uv_receipt_names(&runner.home, &pkg, &source) =>
         {
-            PackageState::Missing(Vec::new())
+            settled(runner, UV_TOOL, &pkg, PackageState::Missing(Vec::new()))
         }
         state => state,
     };

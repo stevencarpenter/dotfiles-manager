@@ -1176,6 +1176,28 @@ fn the_update_installs_a_source_tool_from_its_source_when_the_index_copy_is_inst
     );
 }
 
+/// A copy from another source is planned as missing under the update, and a missing tool gets
+/// the owner check: an executable of the same name from another owner blocks the install.
+#[test]
+fn the_update_keeps_another_owner_for_a_source_tool_from_another_source() {
+    let fx = Fx::new();
+    fx.with_source(GIT);
+    fx.grant("https://github.com/o/r");
+    fx.installed("uv", "nuv 0.5.2\ntoken-auditor 2026.11.10\n");
+    // From the git source at another rev, which the update holds before its owner check.
+    fx.uv_receipt(
+        "token-auditor",
+        "[tool]\nrequirements = [{ name = \"token-auditor\", git = \"https://github.com/o/r?rev=2026.11.10\" }]\n",
+    );
+    let other = fx.other_copy("token-auditor");
+    let o = fx.preview(true);
+    let e = stderr(&o);
+    assert_eq!(code(&o), 3, "{e}\n{}", text(&o.stdout));
+    assert!(e.contains("E_CONFLICT"), "{e}");
+    assert!(e.contains(&other.display().to_string()), "{e}");
+    assert!(fx.changes().is_empty(), "{}", fx.log());
+}
+
 #[test]
 fn a_source_that_builds_another_name_fails_with_the_reason() {
     let fx = Fx::new();
