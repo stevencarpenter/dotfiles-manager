@@ -844,20 +844,26 @@ pub(crate) fn uv_source_probe(
     Ok(settled(runner, UV_TOOL, &pkg, state))
 }
 
-/// Whether uv's receipt for `pkg` has a requirement from `source`: a `git` of
-/// `<url>?rev=<rev>`, or a `directory` of the canonical path. An unreadable receipt does not.
+/// Whether uv's receipt for `pkg` has the requirement of `pkg` itself (its `name` equal as uv
+/// normalizes it) from `source`: a `git` of `<url>?rev=<rev>`, or a `directory` of the canonical
+/// path. A `--with` extra from the source does not count. An unreadable receipt does not.
 fn uv_receipt_names(home: &Path, pkg: &str, source: &UvSource) -> bool {
     let (key, want) = match source {
         UvSource::Git { url, rev } => ("git", format!("{url}?rev={rev}")),
         UvSource::Path(dir) => ("directory", dir.display().to_string()),
     };
-    uv_receipt(home, pkg).is_ok_and(|(v, _)| {
+    let pkg = uv_norm(pkg);
+    uv_receipt(home, &pkg).is_ok_and(|(v, _)| {
         v.get("tool")
             .and_then(|t| t.get("requirements"))
             .and_then(Value::as_array)
             .is_some_and(|reqs| {
-                reqs.iter()
-                    .any(|r| r.get(key).and_then(Value::as_str) == Some(want.as_str()))
+                reqs.iter().any(|r| {
+                    r.get("name")
+                        .and_then(Value::as_str)
+                        .is_some_and(|n| uv_norm(n) == pkg)
+                        && r.get(key).and_then(Value::as_str) == Some(want.as_str())
+                })
             })
     })
 }
@@ -1890,6 +1896,33 @@ mod tests {
         ));
         std::fs::create_dir_all(&p).unwrap();
         p
+    }
+
+    #[test]
+    fn a_receipt_matches_the_source_only_through_the_declared_package() {
+        let home = scratch("uv-names");
+        let dir = home.join(".local/share/uv/tools/token-auditor");
+        std::fs::create_dir_all(&dir).unwrap();
+        let source = UvSource::Git {
+            url: "https://github.com/o/r".into(),
+            rev: "1.0.0".into(),
+        };
+        let receipt = |reqs: &str| {
+            std::fs::write(
+                dir.join("uv-receipt.toml"),
+                format!("[tool]\nrequirements = [{reqs}]\n"),
+            )
+            .unwrap();
+        };
+        // The tool itself from the index, a `--with` extra from the declared source.
+        receipt(
+            r#"{ name = "token-auditor" }, { name = "helper", git = "https://github.com/o/r?rev=1.0.0" }"#,
+        );
+        assert!(!uv_receipt_names(&home, "token-auditor", &source));
+        // The tool from the source, under a name uv spells another way.
+        receipt(r#"{ name = "Token_Auditor", git = "https://github.com/o/r?rev=1.0.0" }"#);
+        assert!(uv_receipt_names(&home, "token-auditor", &source));
+        std::fs::remove_dir_all(&home).unwrap();
     }
 
     #[test]

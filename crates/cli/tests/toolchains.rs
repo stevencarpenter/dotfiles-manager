@@ -121,12 +121,12 @@ case "$2" in
   install|upgrade)
     [ -e "$here/../nopython" ] && { echo "error: No interpreter found" >&2; exit 2; }
     if [ "$3" = --force ]; then
-      dir="$HOME/.local/share/uv/tools/$(cat "$here/../uv-builds")"; mkdir -p "$dir"
+      built=$(cat "$here/../uv-builds"); dir="$HOME/.local/share/uv/tools/$built"; mkdir -p "$dir"
       case "$4" in
         git+*) s=${4#git+}; req="git = \"${s%@*}?rev=${s##*@}\"" ;;
         *) req="directory = \"$4\"" ;;
       esac
-      printf '[tool]\nrequirements = [{ name = "x", %s }]\n' "$req" > "$dir/uv-receipt.toml"
+      printf '[tool]\nrequirements = [{ name = "%s", %s }]\n' "$built" "$req" > "$dir/uv-receipt.toml"
       exit 0
     fi
     name=$3
