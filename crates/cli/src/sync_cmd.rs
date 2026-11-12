@@ -613,28 +613,36 @@ fn check_config(git: &Git, live: &str) -> Result<(), Refusal> {
             visible(live)
         )));
     }
+    match refused_config_key(&String::from_utf8_lossy(&o.stdout)) {
+        None => Ok(()),
+        Some(shown) => Err(untrusted(format!(
+            "the checkout at {} configures {}, which sync does not allow because git would read it during the fetch or the fast-forward; remove it from the checkout's configuration (a global setting is not read)",
+            visible(live),
+            visible(&shown)
+        ))),
+    }
+}
+
+/// The first key of a `git config --list --show-origin -z` listing outside
+/// [`config_key_allowed`], with its subsection elided, or `None`. The command-line pins are
+/// skipped. A value is never returned: it may hold a credential.
+pub(crate) fn refused_config_key(listing: &str) -> Option<String> {
     // `-z`: `<origin>\0<key>\n<value>\0` per entry; a `-c` pin's origin is `command line:`.
-    let text = String::from_utf8_lossy(&o.stdout);
-    let mut fields = text.split('\0');
+    let mut fields = listing.split('\0');
     while let (Some(origin), Some(entry)) = (fields.next(), fields.next()) {
         let key = entry.split('\n').next().unwrap_or(entry);
         if origin == "command line:" || config_key_allowed(key) {
             continue;
         }
         // A subsection can hold a credential too (`url.https://user:token@host/.insteadOf`).
-        let shown = match (key.split_once('.'), key.rsplit_once('.')) {
+        return Some(match (key.split_once('.'), key.rsplit_once('.')) {
             (Some((section, rest)), Some((_, name))) if rest.contains('.') => {
                 format!("{section}.*.{name}")
             }
             _ => key.to_string(),
-        };
-        return Err(untrusted(format!(
-            "the checkout at {} configures {}, which sync does not allow because git would read it during the fetch or the fast-forward; remove it from the checkout's configuration (a global setting is not read)",
-            visible(live),
-            visible(&shown)
-        )));
+        });
     }
-    Ok(())
+    None
 }
 
 /// The HEAD commit of the checkout at `dir`, or `None` when there is no checkout there.

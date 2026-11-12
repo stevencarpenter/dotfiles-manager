@@ -4352,6 +4352,58 @@ fn sync_clones_a_declared_checkout_then_fast_forwards_it() {
     assert_eq!(git(&copy, &["rev-parse", "--short", "HEAD"]), after);
 }
 
+/// The checkout `extra.tool` of `tool`, declared upstream and cloned by a first sync. Returns the
+/// checkout path and the revision it holds.
+fn cloned_checkout(u: &Up, tool: &Remote) -> (PathBuf, String) {
+    put(&tool.seed, "README", "v1\n");
+    tool.push("v1");
+    put(
+        &u.fx.upstream.seed,
+        "base/modules/extra/module.toml",
+        &format!(
+            "{}\n[[resources]]\nid = \"tool\"\nkind = \"package\"\nadapter = \"git-checkout/v1\"\n[resources.value]\nurl = \"{}\"\npath = \"x/tool\"\n",
+            common::EXTRA,
+            tool.origin()
+        ),
+    );
+    u.fx.upstream.push("declare the checkout");
+    let copy = u.fx.h("x/tool");
+    let o = u.sync(&[]);
+    assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
+    let before = git(&copy, &["rev-parse", "--short", "HEAD"]);
+    put(&tool.seed, "README", "v2\n");
+    tool.push("v2");
+    (copy, before)
+}
+
+/// A command-running key in a declared checkout's own configuration blocks its pull before any
+/// fetch, as sync's checkout configuration rule does (docs/sync.md).
+#[test]
+fn a_checkout_whose_configuration_runs_a_command_is_blocked_before_the_fetch() {
+    let u = Up::new(r#"["checkouts"]"#);
+    let tool = Remote::new(u.fake.path(), "tool");
+    let (copy, before) = cloned_checkout(&u, &tool);
+    let ran = u.fake.path().join("ssh-ran");
+    // The first sync fetched once; only a fetch of this run may leave FETCH_HEAD now.
+    let _ = fs::remove_file(copy.join(".git/FETCH_HEAD"));
+    git(
+        &copy,
+        &[
+            "config",
+            "core.sshCommand",
+            &format!("touch {}", ran.display()),
+        ],
+    );
+    let o = u.sync(&[]);
+    assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
+    let s = stdout(&o);
+    assert!(s.contains("  blocked checkouts"), "{s}");
+    assert!(s.contains("core.sshcommand"), "{s}");
+    assert!(!copy.join(".git/FETCH_HEAD").exists());
+    assert!(!ran.exists());
+    assert_eq!(git(&copy, &["rev-parse", "--short", "HEAD"]), before);
+}
+
 /// DFM-25 (C04, G2, G6): without a grant for the registry origin, `agents` is a `blocked` row
 /// in the listing and in the run. Only read-only git runs: nothing is fetched or installed, and
 /// the rest of sync runs.

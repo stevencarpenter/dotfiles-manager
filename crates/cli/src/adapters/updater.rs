@@ -1429,7 +1429,21 @@ fn fast_forward(
     before: &mut Option<String>,
     gate: impl Fn(&Upstream) -> Option<String>,
 ) -> Result<Result<String, String>, (String, bool)> {
-    // Read-only checks first: the revision and the dirty state.
+    // The copy's own configuration first, by sync's checkout rule (docs/sync.md, "Checkout
+    // configuration"): a key there can run a command (`core.sshCommand`, `core.fsmonitor`) or
+    // send the fetch elsewhere. `--local` reads no include, so an `include.path` is refused too.
+    let listing = git(
+        env,
+        copy,
+        &["config", "--list", "--local", "--show-origin", "-z"],
+    )?;
+    if let Some(key) = crate::sync_cmd::refused_config_key(&listing) {
+        return Ok(Err(format!(
+            "{noun} {} configures {key}, which git would read during the fetch or the pull; remove it from the copy's own configuration; not pulled",
+            copy.display()
+        )));
+    }
+    // Read-only checks next: the revision and the dirty state.
     *before = Some(git(env, copy, &["rev-parse", "--short", "HEAD"])?);
     if !git(env, copy, &["status", "--porcelain"])?.is_empty() {
         return Ok(Err(format!(
@@ -1893,7 +1907,7 @@ mod tests {
             fs::write(st.join("url-origin"), REGISTRY).unwrap();
             self.script(
                 &self.bin.join("git"),
-                "case \"$3\" in\n  rev-parse) if [ \"$4\" = --abbrev-ref ]; then echo main; else cat \"$st/rev\"; fi ;;\n  config) [ -f \"$st/no-upstream\" ] && exit 1; case \"$5\" in *.remote) cat \"$st/remote\" 2>/dev/null || echo origin ;; *) echo refs/heads/main ;; esac ;;\n  remote) cat \"$st/url-$5\" ;;\n  status) cat \"$st/porcelain\" 2>/dev/null || true ;;\n  fetch) exit 0 ;;\n  rev-list) cat \"$st/ahead\" 2>/dev/null || echo 0 ;;\n  pull) cp \"$st/rev-after\" \"$st/rev\" ;;\n  *) exit 64 ;;\nesac",
+                "case \"$3\" in\n  rev-parse) if [ \"$4\" = --abbrev-ref ]; then echo main; else cat \"$st/rev\"; fi ;;\n  config) [ \"$4\" = --list ] && exit 0; [ -f \"$st/no-upstream\" ] && exit 1; case \"$5\" in *.remote) cat \"$st/remote\" 2>/dev/null || echo origin ;; *) echo refs/heads/main ;; esac ;;\n  remote) cat \"$st/url-$5\" ;;\n  status) cat \"$st/porcelain\" 2>/dev/null || true ;;\n  fetch) exit 0 ;;\n  rev-list) cat \"$st/ahead\" 2>/dev/null || echo 0 ;;\n  pull) cp \"$st/rev-after\" \"$st/rev\" ;;\n  *) exit 64 ;;\nesac",
             );
             self.script(
                 &self.dots.join("scripts/install-agent-registry.sh"),
@@ -1919,6 +1933,7 @@ mod tests {
     /// The read-only calls that find the upstream of the copy at `c`.
     fn upstream_calls(c: &str, remote: &str) -> Vec<String> {
         vec![
+            format!("git -C {c} config --list --local --show-origin -z"),
             format!("git -C {c} rev-parse --short HEAD"),
             format!("git -C {c} status --porcelain"),
             format!("git -C {c} rev-parse --abbrev-ref HEAD"),
@@ -2032,7 +2047,7 @@ mod tests {
         fn checkouts_git(&self) {
             self.script(
                 &self.bin.join("git"),
-                "d=$(basename \"$2\")\n[ -f \"$st/$d/fail-$3\" ] && exit 2\ncase \"$3\" in\n  rev-parse) if [ \"$4\" = --abbrev-ref ]; then echo main; else cat \"$st/$d/rev\"; fi ;;\n  config) [ -f \"$st/$d/no-upstream\" ] && exit 1; case \"$5\" in *.remote) echo origin ;; *) echo refs/heads/main ;; esac ;;\n  remote) echo \"https://github.com/o/$d.git\" ;;\n  status) cat \"$st/$d/porcelain\" 2>/dev/null || true ;;\n  fetch) exit 0 ;;\n  rev-list) cat \"$st/$d/ahead\" 2>/dev/null || echo 0 ;;\n  pull) cp \"$st/$d/rev-after\" \"$st/$d/rev\" ;;\n  *) exit 64 ;;\nesac",
+                "d=$(basename \"$2\")\n[ -f \"$st/$d/fail-$3\" ] && exit 2\ncase \"$3\" in\n  rev-parse) if [ \"$4\" = --abbrev-ref ]; then echo main; else cat \"$st/$d/rev\"; fi ;;\n  config) [ \"$4\" = --list ] && exit 0; [ -f \"$st/$d/no-upstream\" ] && exit 1; case \"$5\" in *.remote) echo origin ;; *) echo refs/heads/main ;; esac ;;\n  remote) echo \"https://github.com/o/$d.git\" ;;\n  status) cat \"$st/$d/porcelain\" 2>/dev/null || true ;;\n  fetch) exit 0 ;;\n  rev-list) cat \"$st/$d/ahead\" 2>/dev/null || echo 0 ;;\n  pull) cp \"$st/$d/rev-after\" \"$st/$d/rev\" ;;\n  *) exit 64 ;;\nesac",
             );
         }
 
@@ -2161,7 +2176,7 @@ mod tests {
             ]
         );
         let d = dirty.display().to_string();
-        let mut want = upstream_calls(&d, "origin")[..2].to_vec();
+        let mut want = upstream_calls(&d, "origin")[..3].to_vec();
         want.extend(checkout_calls(&moved));
         assert_eq!(t.calls(), want);
     }
@@ -2759,7 +2774,7 @@ mod tests {
         );
         // Only the read-only calls that find the upstream for the source check.
         let c = copy.display().to_string();
-        assert_eq!(t.calls(), upstream_calls(&c, "origin")[2..]);
+        assert_eq!(t.calls(), upstream_calls(&c, "origin")[3..]);
     }
 
     impl Drop for T {
