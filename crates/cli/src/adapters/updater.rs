@@ -993,7 +993,7 @@ fn cargo_list(stdout: &[u8]) -> std::collections::BTreeMap<String, (String, Opti
 }
 
 /// The `cargo install` arguments that reinstall a crate from where it came from, or why it is
-/// held. A registry crate has no source; a git source keeps its `branch`, `tag` or `rev`.
+/// held. A registry crate has no source; a git source keeps its `branch`, and drops a `tag` or `rev`.
 fn cargo_install_args(name: &str, src: Option<&str>) -> Result<Vec<String>, String> {
     let mut a = args(&["install", "--locked"]);
     match src {
@@ -1004,9 +1004,10 @@ fn cargo_install_args(name: &str, src: Option<&str>) -> Result<Vec<String>, Stri
             let g = g.split_once('#').map_or(g, |(url, _)| url);
             let (url, query) = g.split_once('?').unwrap_or((g, ""));
             a.extend(args(&["--git", url]));
+            // A branch rolls with the branch; a tag or a rev is a pin and is dropped.
             for (k, v) in query.split('&').filter_map(|q| q.split_once('=')) {
-                if matches!(k, "branch" | "tag" | "rev") {
-                    a.extend([format!("--{k}"), v.to_string()]);
+                if k == "branch" {
+                    a.extend(["--branch".to_string(), v.to_string()]);
                 }
             }
         }
@@ -1020,7 +1021,8 @@ fn cargo_install_args(name: &str, src: Option<&str>) -> Result<Vec<String>, Stri
 /// `~/.cargo/bin/cargo` (the rustup proxy). A registry crate is `cargo install --locked <name>`,
 /// which cargo skips when the crate is current; a git crate is reinstalled from its own
 /// repository; a path crate is held. One failing install fails the row; the others still run.
-/// A git crate whose commit moved without a version change reads as `current`.
+/// A git crate is compared by version and by the `#sha` of its source, so a moved commit is
+/// `updated` even when the version did not change.
 fn cargo(mut d: Draft, env: &Env) -> Row {
     let r = match native_runner(Updater::Cargo, env) {
         Ok(r) => r,
@@ -1069,11 +1071,22 @@ fn cargo(mut d: Draft, env: &Env) -> Row {
         Err(e) => return d.stop(e),
     };
     let mut changed = false;
-    for (name, (was, _)) in &before {
+    let sha = |src: &Option<String>| {
+        src.as_deref()
+            .and_then(|s| s.split_once('#'))
+            .map(|(_, sha)| sha.chars().take(7).collect::<String>())
+    };
+    for (name, (was, src)) in &before {
         match after.get(name) {
             Some((now, _)) if now != was => {
                 changed = true;
                 d.notes.push(format!("{name} {was} -> {now}"));
+            }
+            Some((_, src_now)) if sha(src) != sha(src_now) => {
+                changed = true;
+                let q = |s: Option<String>| s.unwrap_or_else(|| "?".into());
+                d.notes
+                    .push(format!("{name} {} -> {}", q(sha(src)), q(sha(src_now))));
             }
             Some(_) => {}
             None => d
@@ -3687,7 +3700,7 @@ mod tests {
     fn cargo_keeps_a_git_or_path_crate_on_its_source() {
         let t = T::new();
         t.cargo(
-            "g v1.0.0 (https://github.com/o/g#abc1234):\n    g\nb v1.0.0 (git+https://github.com/o/b?branch=dev#abc1234):\n    b\nstevectl v7.4.0 (/Users/x/stevectl/cli):\n    stevectl\n",
+            "g v1.0.0 (https://github.com/o/g#abc1234):\n    g\nb v1.0.0 (git+https://github.com/o/b?branch=dev#abc1234):\n    b\nt v1.0.0 (https://github.com/o/t?tag=v1.0.0#abc1234):\n    t\nr v1.0.0 (https://github.com/o/r?rev=abc1234#abc1234):\n    r\nstevectl v7.4.0 (/Users/x/stevectl/cli):\n    stevectl\n",
             &[],
         );
         let r = run(Updater::Cargo, &t.env());
@@ -3702,9 +3715,28 @@ mod tests {
                 "cargo install --list".to_string(),
                 "cargo install --locked --git https://github.com/o/b --branch dev b".to_string(),
                 "cargo install --locked --git https://github.com/o/g g".to_string(),
+                "cargo install --locked --git https://github.com/o/r r".to_string(),
+                "cargo install --locked --git https://github.com/o/t t".to_string(),
                 "cargo install --list".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn cargo_git_crate_with_a_moved_commit_is_updated_without_a_version_change() {
+        let t = T::new();
+        t.cargo(
+            "g v1.0.0 (https://github.com/o/g#abc1234def):\n    g\n",
+            &[(
+                "g",
+                "g v1.0.0 (https://github.com/o/g#fedcba9876):\n    g\n",
+            )],
+        );
+        let r = run(Updater::Cargo, &t.env());
+        assert_eq!(r.status, Status::Updated, "{r:?}");
+        assert_eq!(r.notes, vec!["g abc1234 -> fedcba9".to_string()]);
+        let r = run(Updater::Cargo, &t.env());
+        assert_eq!(r.status, Status::Current, "{r:?}");
     }
 
     #[test]
