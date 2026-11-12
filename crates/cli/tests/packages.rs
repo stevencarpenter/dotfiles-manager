@@ -147,22 +147,25 @@ echo "dpkg-query: no packages found matching $3" >&2; exit 1
 
 /// `git -C <dir> config --get remote.origin.url` prints `<dir>/.git/origin` (exit 1 without it),
 /// `git -C <dir> rev-parse ...` prints a short commit, and `git clone [--branch <b>] <url> <dir>`
-/// makes `<dir>/.git/origin` with the url. Every call logs its arguments and `GIT_TERMINAL_PROMPT`.
+/// makes `<dir>/.git/origin` and `head` (then exits 128 with a `clone-fails` marker); `rev-parse` fails without `head`. Every call logs its arguments and `GIT_TERMINAL_PROMPT`.
 const FAKE_GIT: &str = r#"#!/bin/sh
 PATH=/usr/bin:/bin:$PATH
 here=$(dirname "$0")
-printf 'git %s | prompt=%s\n' "$*" "${GIT_TERMINAL_PROMPT:-unset}" >> "$here/../log"
+printf 'git %s | prompt=%s ceiling=%s\n' "$*" "${GIT_TERMINAL_PROMPT:-unset}" "${GIT_CEILING_DIRECTORIES:-unset}" >> "$here/../log"
 case "$1" in
   -C)
     d=$2; shift 2
     case "$1" in
       config) cat "$d/.git/origin" 2>/dev/null || exit 1 ;;
-      rev-parse) echo abc1234 ;;
+      rev-parse) [ -s "$d/.git/head" ] && echo abc1234 || exit 128 ;;
     esac ;;
   clone)
     shift
     [ "$1" = "--branch" ] && shift 2
-    mkdir -p "$2/.git" && echo "$1" > "$2/.git/origin" ;;
+    [ "$1" = "--" ] && shift
+    mkdir -p "$2/.git" && echo "$1" > "$2/.git/origin" && echo abc1234 > "$2/.git/head"
+    [ -e "$here/../clone-fails" ] && exit 128
+    exit 0 ;;
   *) exit 64 ;;
 esac
 "#;
@@ -1151,6 +1154,18 @@ fn clones(fx: &Fx) -> Vec<String> {
         .collect()
 }
 
+/// The one clone logged: `prefix`, a sibling temporary directory of `x/r`, and the clone's
+/// environment.
+fn assert_clone(fx: &Fx, prefix: &str) {
+    let tmp = fx.home.path().join("x/.r.dfm-clone-").display().to_string();
+    let log = clones(fx);
+    assert_eq!(log.len(), 1, "{}", fx.log());
+    let rest = log[0]
+        .strip_prefix(&format!("{prefix} {tmp}"))
+        .unwrap_or_else(|| panic!("{}", log[0]));
+    assert!(rest.ends_with("| prompt=0 ceiling=unset"), "{}", log[0]);
+}
+
 #[test]
 fn a_missing_checkout_is_cloned() {
     let fx = checkout_fx("https://github.com/o/r.git", "");
@@ -1164,14 +1179,8 @@ fn a_missing_checkout_is_cloned() {
     assert!(clones(&fx).is_empty(), "{}", fx.log());
     let o = fx.packages(&digest_of(&o));
     assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
-    let dest = fx.home.path().join("x/r");
-    assert_eq!(
-        clones(&fx),
-        [format!(
-            "git clone https://github.com/o/r.git {} | prompt=0",
-            dest.display()
-        )]
-    );
+    assert_clone(&fx, "git clone -- https://github.com/o/r.git");
+    assert!(fx.home.path().join("x/r/.git/origin").is_file());
     let o = fx.packages(&digest_of(&fx.preview()));
     assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
     assert!(
@@ -1187,14 +1196,7 @@ fn a_branch_is_passed_to_the_clone() {
     let fx = checkout_fx("https://github.com/o/r.git", "branch = \"main\"\n");
     let o = fx.packages(&digest_of(&fx.preview()));
     assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
-    let dest = fx.home.path().join("x/r");
-    assert_eq!(
-        clones(&fx),
-        [format!(
-            "git clone --branch main https://github.com/o/r.git {} | prompt=0",
-            dest.display()
-        )]
-    );
+    assert_clone(&fx, "git clone --branch main -- https://github.com/o/r.git");
 }
 
 #[test]
@@ -1203,6 +1205,7 @@ fn a_checkout_of_the_declared_repository_is_current() {
     let git = fx.home.path().join("x/r/.git");
     fs::create_dir_all(&git).unwrap();
     fs::write(git.join("origin"), "ssh://git@github.com/o/r\n").unwrap();
+    fs::write(git.join("head"), "abc1234\n").unwrap();
     let o = fx.packages(&digest_of(&fx.preview()));
     assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
     assert!(
@@ -1254,4 +1257,59 @@ fn a_path_that_is_not_a_checkout_is_another_owner() {
         assert_eq!(dest.is_file(), file);
         assert_eq!(fs::read_dir(&dest).map_or(0, Iterator::count), 0);
     }
+}
+
+#[test]
+fn a_failing_clone_leaves_nothing_and_the_install_stays_planned() {
+    let fx = checkout_fx("https://github.com/o/r.git", "");
+    let parent = fx.home.path().join("x");
+    fs::create_dir_all(&parent).unwrap();
+    fs::write(parent.join("keep"), "mine").unwrap();
+    // A sibling left by an earlier killed run is removed before the clone.
+    fs::create_dir_all(parent.join(".r.dfm-clone-1/.git")).unwrap();
+    fs::write(fx.fake.path().join("clone-fails"), "").unwrap();
+    let o = fx.packages(&digest_of(&fx.preview()));
+    assert_eq!(code(&o), 1, "{}\n{}", stderr(&o), text(&o.stdout));
+    assert_eq!(clones(&fx).len(), 1, "{}", fx.log());
+    assert!(!parent.join("r").exists());
+    let names: Vec<_> = fs::read_dir(&parent)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(names, ["keep"]);
+    assert_eq!(fs::read_to_string(parent.join("keep")).unwrap(), "mine");
+    let o = fx.preview();
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+    assert!(
+        text(&o.stdout).contains("install extra.r with git-checkout/v1"),
+        "{}",
+        text(&o.stdout)
+    );
+}
+
+#[test]
+fn a_checkout_without_a_commit_is_another_owner() {
+    let fx = checkout_fx("https://github.com/o/r.git", "");
+    let git = fx.home.path().join("x/r/.git");
+    fs::create_dir_all(&git).unwrap();
+    fs::write(git.join("origin"), "https://github.com/o/r\n").unwrap();
+    let o = fx.preview();
+    assert_eq!(code(&o), 3, "{}\n{}", stderr(&o), text(&o.stdout));
+    assert!(stderr(&o).contains("no commit"), "{}", stderr(&o));
+    assert!(clones(&fx).is_empty(), "{}", fx.log());
+}
+
+#[test]
+fn the_probe_stops_git_at_the_checkouts_parent_and_an_empty_git_directory_is_another_owner() {
+    let fx = checkout_fx("https://github.com/o/r.git", "");
+    fs::create_dir_all(fx.home.path().join("x/r/.git")).unwrap();
+    let o = fx.preview();
+    assert_eq!(code(&o), 3, "{}\n{}", stderr(&o), text(&o.stdout));
+    assert!(stderr(&o).contains("E_CONFLICT"), "{}", stderr(&o));
+    let ceiling = fx.home.path().join("x").canonicalize().unwrap();
+    assert!(
+        fx.log().contains(&format!("ceiling={}", ceiling.display())),
+        "{}",
+        fx.log()
+    );
 }

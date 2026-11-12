@@ -89,7 +89,18 @@ fn query(runner: &Runner, dir: &Path, rest: &[&str]) -> Result<Option<String>, R
     let mut args = vec!["-C".to_string(), dir.display().to_string()];
     args.extend(rest.iter().map(|a| a.to_string()));
     let what = format!("git {}", rest.join(" "));
-    let out = runner.run(&request("git", &args, &[], PROBE_TIMEOUT))?;
+    // Git must not walk up from a `.git` that is not a repository to an enclosing one.
+    let ceiling = dir.parent().map(|p| p.canonicalize().unwrap_or(p.into()));
+    let env: Vec<(String, String)> = ceiling
+        .iter()
+        .map(|c| {
+            (
+                "GIT_CEILING_DIRECTORIES".to_string(),
+                c.display().to_string(),
+            )
+        })
+        .collect();
+    let out = runner.run(&request("git", &args, &env, PROBE_TIMEOUT))?;
     if let Some(why) = ended(&what, &out) {
         return Err(Refusal::new(Code::ProbeFailed, why));
     }
@@ -129,41 +140,61 @@ pub(crate) fn probe(runner: &Runner, value: &Value) -> Result<PackageState, Refu
             ));
         }
     }
-    let head = query(runner, &dir, &["rev-parse", "--short", "HEAD"])?
-        .filter(|h| !h.is_empty())
-        .unwrap_or_else(|| "no commit".into());
-    Ok(PackageState::Installed(head))
+    // A killed clone leaves `.git` with the origin set and no commit: never installed.
+    match query(runner, &dir, &["rev-parse", "--short", "HEAD"])?.filter(|h| !h.is_empty()) {
+        Some(head) => Ok(PackageState::Installed(head)),
+        None => Ok(other("is a git checkout with no commit; inspect it")),
+    }
 }
 
-/// Clones the declared repository into the missing path, with prompts off. The caller probes
-/// again afterwards. A failed clone leaves nothing this function removes: git cleans its own.
+/// Clones the declared repository into a sibling directory `.<name>.dfm-clone-<pid>` and renames
+/// it to the missing path once the clone succeeds, so a failed or killed clone never leaves a
+/// half checkout at the path. Prompts are off. The caller probes again afterwards. The sibling is
+/// a directory this run created: it is removed on failure, and one left by an earlier killed
+/// run is removed first.
 pub(crate) fn install(runner: &Runner, value: &Value) -> Result<(), Refusal> {
     let d = declared(value)?;
     let dir = runner.home.join(&d.path);
-    if let Some(parent) = dir.parent() {
-        fs::create_dir_all(parent).map_err(|e| {
-            Refusal::new(
-                Code::IoFailed,
-                format!("{} could not be created: {}", parent.display(), e.kind()),
-            )
-        })?;
+    let (Some(parent), Some(name)) = (dir.parent(), dir.file_name().and_then(|n| n.to_str()))
+    else {
+        return Err(invalid("path has no directory name"));
+    };
+    let io = |what: &Path, e: std::io::Error| {
+        Refusal::new(
+            Code::IoFailed,
+            format!("{} could not be changed: {}", what.display(), e.kind()),
+        )
+    };
+    fs::create_dir_all(parent).map_err(|e| io(parent, e))?;
+    let prefix = format!(".{name}.dfm-clone-");
+    for e in fs::read_dir(parent).map_err(|e| io(parent, e))? {
+        let e = e.map_err(|e| io(parent, e))?;
+        if e.file_name().to_string_lossy().starts_with(&prefix) {
+            fs::remove_dir_all(e.path()).map_err(|x| io(&e.path(), x))?;
+        }
     }
-    let dest = dir
+    let tmp = parent.join(format!("{prefix}{}", std::process::id()));
+    let tmp_text = tmp
         .to_str()
         .ok_or_else(|| invalid("path resolves to a path that is not UTF-8"))?;
     let mut args = vec!["clone".to_string()];
     if let Some(b) = &d.branch {
         args.extend(["--branch".to_string(), b.clone()]);
     }
-    args.extend([d.url.clone(), dest.to_string()]);
+    args.extend(["--".to_string(), d.url.clone(), tmp_text.to_string()]);
     let env = [("GIT_TERMINAL_PROMPT".to_string(), "0".to_string())];
-    change(
+    let cloned = change(
         runner,
         "git",
         &args,
         &env,
         &format!("git {}", args.join(" ")),
     )
+    .and_then(|()| fs::rename(&tmp, &dir).map_err(|e| io(&dir, e)));
+    if cloned.is_err() {
+        let _ = fs::remove_dir_all(&tmp);
+    }
+    cloned
 }
 
 #[cfg(test)]
