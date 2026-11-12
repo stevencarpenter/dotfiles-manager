@@ -3,7 +3,7 @@
 //! tool, a failed command or a stop request is a row.
 
 use dfm_engine::proc::{End, Output, Request, Runner};
-use dfm_model::lock::{Grants, NPM, NPM_REGISTRY, git_identity, trust_command};
+use dfm_model::lock::{Grants, NPM, NPM_REGISTRY, git_identity, source_identity, trust_command};
 use dfm_model::state::Status;
 use dfm_model::updater::Updater;
 use dfm_model::{Code, Refusal};
@@ -587,13 +587,92 @@ fn mise_outdated(env: &Env) -> Result<Vec<Item>, (String, bool)> {
         .collect())
 }
 
-/// `mise upgrade` without `--bump`: the newest version inside each configured range, so no
-/// configuration file is written. mise removes the replaced version after its own grace period
+/// The identities the global mise configuration's backend tools fetch from, as `source_identity`
+/// maps them: `github:` and `ubi:` take an `o/r`, `npm:` and `go:` stay as they are. A registry
+/// name and `core:` fetch from mise's own registry and need none. Any other backend maps to no
+/// identity, and so does an unreadable file.
+// shortcut: reads only ~/.config/mise/config.toml and conf.d/; MISE_GLOBAL_CONFIG_FILE and
+// config.local.toml are not read, upgrade if a machine sets them.
+fn mise_identities(env: &Env) -> Vec<Result<String, String>> {
+    let dir = env.home.join(".config/mise");
+    let mut files = vec![dir.join("config.toml")];
+    let mut extra = match std::fs::read_dir(dir.join("conf.d")) {
+        Ok(rd) => rd
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.extension().is_some_and(|x| x == "toml"))
+            .collect(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => vec![],
+        Err(e) => return vec![Err(format!("cannot read {}/conf.d: {e}", dir.display()))],
+    };
+    extra.sort();
+    files.extend(extra);
+    let mut ids = Vec::new();
+    for file in files {
+        let text = match std::fs::read_to_string(&file) {
+            Ok(t) => t,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => {
+                ids.push(Err(format!("cannot read {}: {e}", file.display())));
+                continue;
+            }
+        };
+        let doc: toml::Table = match text.parse() {
+            Ok(d) => d,
+            Err(e) => {
+                ids.push(Err(format!("{}: {e}", file.display())));
+                continue;
+            }
+        };
+        let tools = doc.get("tools").and_then(|t| t.as_table());
+        for key in tools.into_iter().flat_map(|t| t.keys()) {
+            let tool = key.split_once('[').map_or(key.as_str(), |(t, _)| t);
+            let Some((backend, value)) = tool.split_once(':') else {
+                continue;
+            };
+            match backend {
+                "core" => {}
+                "github" | "ubi" | "npm" | "go" => {
+                    let value = if matches!(backend, "github" | "ubi") {
+                        value.to_string()
+                    } else {
+                        tool.to_string()
+                    };
+                    ids.push(
+                        source_identity(&value, cfg!(feature = "test-isolation"))
+                            .map_err(|e| format!("{}: {}", e.code.as_str(), e.detail)),
+                    );
+                }
+                _ => ids.push(Err(format!(
+                    "mise tool {key}: the {backend} backend maps to no identity; declare it as a registry name or a github:, ubi:, npm: or go: tool"
+                ))),
+            }
+        }
+    }
+    ids
+}
+
+/// `mise install` for the configured tools that are missing, then `mise upgrade` without
+/// `--bump`: the newest version inside each configured range, so no configuration file is
+/// written. A backend tool without a grant blocks the row before any command. mise removes the replaced version after its own grace period
 /// (`upgrade.prune_after`).
 fn mise(mut d: Draft, env: &Env) -> Row {
     if let Err(e) = env.provider.resolve("mise") {
         d.notes.push(e.detail);
         return d.end(Status::Blocked);
+    }
+    let untrusted = trust_notes(Updater::Mise, env);
+    if !untrusted.is_empty() {
+        d.notes.extend(untrusted);
+        return d.end(Status::Blocked);
+    }
+    if let Err(e) = call(
+        env.provider,
+        "mise",
+        &args(&["install"]),
+        &[],
+        env.timeouts.long,
+    ) {
+        return d.stop(e);
     }
     let list = || mise_outdated(env);
     let before = match list() {
@@ -1132,7 +1211,8 @@ fn untrusted(ids: Vec<Result<String, String>>, grants: &Grants) -> Vec<String> {
 
 /// Why the updater must not run because of its sources, one note each, or nothing. `skills`
 /// and the `agents` managed copy fetch extension sources, each global npm package runs its
-/// install scripts, and a uv tool from a git source is built from what it fetches: each such
+/// install scripts, and a uv tool from a git source is built from what it fetches, and a mise backend tool
+/// fetches from its backend: each such
 /// source needs a grant (DFM-25, C04). The `agents` working copy is never fetched, and the
 /// other updaters update a binary or packages from their owner: none of them is gated. An
 /// unreadable source record is one note. An updater with a note runs no command that fetches
@@ -1151,6 +1231,7 @@ pub fn trust_notes(u: Updater, env: &Env) -> Vec<String> {
             Err(why) => vec![why],
         },
         Updater::Uv => untrusted(uv_identities(env), env.grants),
+        Updater::Mise => untrusted(mise_identities(env), env.grants),
         Updater::Agents => {
             let (copy, working) = agents_copy(env);
             if working || std::fs::symlink_metadata(copy.join(".git")).is_err() {
@@ -1457,7 +1538,7 @@ fn preview_command(u: Updater, env: &Env) -> String {
         },
         Updater::Mise => match env.provider.resolve("mise") {
             Ok(p) => format!(
-                "would run mise outdated --json, mise upgrade ({})",
+                "would run mise install, mise outdated --json, mise upgrade ({})",
                 p.display()
             ),
             Err(e) => format!("blocked: {}", e.detail),
@@ -1950,7 +2031,7 @@ mod tests {
         assert_eq!(r.status, Status::Blocked, "{r:?}");
         assert!(
             r.notes[0].starts_with(
-                "E_SOURCE_UNTRUSTED: git remote \"npm:skills\" names an npm: identity"
+                "E_SOURCE_UNTRUSTED: git remote \"npm:skills\" names an npm: or go: identity"
             ),
             "{r:?}"
         );
@@ -1969,7 +2050,6 @@ mod tests {
             Updater::Codex,
             Updater::Opencode,
             Updater::Brew,
-            Updater::Mise,
             Updater::Rustup,
         ] {
             assert!(trust_notes(u, &t.env()).is_empty(), "{u:?}");
@@ -2561,14 +2641,22 @@ mod tests {
 
     impl T {
         /// `mise` whose `outdated --json` prints `st/mise-outdated` and whose bare `upgrade`
-        /// replaces it with `st/mise-after`. Any other upgrade form (`--bump`, a name) exits 65.
+        /// replaces it with `st/mise-after`. Any other upgrade form (`--bump`, a name) exits 65,
+        /// and so does `install` with an argument.
         fn mise(&self, outdated: &str, after: &str) {
             fs::write(self.root.join("st/mise-outdated"), outdated).unwrap();
             fs::write(self.root.join("st/mise-after"), after).unwrap();
             self.script(
                 &self.bin.join("mise"),
-                "case \"$1\" in\n  outdated) cat \"$st/mise-outdated\" ;;\n  upgrade) [ -z \"$2\" ] || exit 65; cp \"$st/mise-after\" \"$st/mise-outdated\" ;;\n  *) exit 64 ;;\nesac",
+                "case \"$1\" in\n  install) [ -z \"$2\" ] || exit 65 ;;\n  outdated) cat \"$st/mise-outdated\" ;;\n  upgrade) [ -z \"$2\" ] || exit 65; cp \"$st/mise-after\" \"$st/mise-outdated\" ;;\n  *) exit 64 ;;\nesac",
             );
+        }
+
+        /// Writes a mise configuration file under `~/.config/mise/`.
+        fn mise_config(&self, rel: &str, body: &str) {
+            let path = self.home.join(".config/mise").join(rel);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, body).unwrap();
         }
 
         /// `rustup` in `~/.cargo/bin` whose `check` prints `st/rustup-check` and exits 100 when
@@ -2638,11 +2726,109 @@ mod tests {
         assert_eq!(
             t.calls(),
             vec![
+                "mise install".to_string(),
                 "mise outdated --json".to_string(),
                 "mise upgrade".to_string(),
                 "mise outdated --json".to_string()
             ]
         );
+    }
+
+    const MISE_BACKENDS: &str = "[tools]\ngo = \"1.27\"\n\"npm:pyright\" = \"latest\"\n\"go:golang.org/x/tools/gopls\" = \"latest\"\n";
+    const MISE_GITHUB: &str = "[tools]\n\"github:o/r\" = { version = \"latest\" }\n";
+
+    #[test]
+    fn mise_runs_install_before_the_upgrade() {
+        let t = T::new();
+        t.mise(MISE_TWO, "{}");
+        let r = run(Updater::Mise, &t.env());
+        assert_eq!(r.status, Status::Updated, "{r:?}");
+        assert_eq!(
+            t.calls(),
+            [
+                "mise install",
+                "mise outdated --json",
+                "mise upgrade",
+                "mise outdated --json"
+            ]
+        );
+        assert!(preview(Updater::Mise, &t.env()).contains("mise install, mise outdated"));
+    }
+
+    #[test]
+    fn mise_with_an_ungranted_backend_tool_is_blocked_before_any_command() {
+        let mut t = T::new();
+        t.grants = Grants::default();
+        t.mise(MISE_TWO, "{}");
+        t.mise_config("config.toml", MISE_BACKENDS);
+        t.mise_config("conf.d/dev.toml", MISE_GITHUB);
+        let r = run(Updater::Mise, &t.env());
+        assert_eq!(r.status, Status::Blocked, "{r:?}");
+        // go:..., https://github.com/o/r, npm:pyright; `go` is a registry name.
+        assert_eq!(r.notes.len(), 3, "{r:?}");
+        assert!(
+            r.notes
+                .iter()
+                .all(|n| n.starts_with("E_SOURCE_UNTRUSTED: no grant for ")),
+            "{r:?}"
+        );
+        assert_eq!(t.log(), "");
+        assert!(preview(Updater::Mise, &t.env()).starts_with("blocked: E_SOURCE_UNTRUSTED"));
+    }
+
+    #[test]
+    fn mise_with_every_identity_granted_runs() {
+        let mut t = T::new();
+        t.mise(MISE_TWO, "{}");
+        t.mise_config("config.toml", MISE_BACKENDS);
+        t.mise_config("conf.d/dev.toml", MISE_GITHUB);
+        for id in [
+            "go:golang.org/x/tools/gopls",
+            "https://github.com/o/r",
+            "npm:pyright",
+        ] {
+            t.grants.grant(id, "2026-11-02T00:00:00Z");
+        }
+        let r = run(Updater::Mise, &t.env());
+        assert_eq!(r.status, Status::Updated, "{r:?}");
+        assert_eq!(t.calls()[0], "mise install");
+    }
+
+    #[test]
+    fn mise_identities_strip_tool_options() {
+        let t = T::new();
+        t.mise_config(
+            "config.toml",
+            "[tools]\n\"ubi:o/r[exe=x]\" = \"latest\"\n\"aqua:o/r\" = \"latest\"\n\"cargo:x\" = \"latest\"\n\"core:node\" = \"22\"\nnode = \"22\"\n",
+        );
+        let ids = mise_identities(&t.env());
+        assert_eq!(ids.len(), 3, "{ids:?}");
+        // Keys are read in sorted order: aqua, cargo, ubi.
+        assert!(ids[0].as_ref().unwrap_err().contains("the aqua backend"));
+        assert!(ids[1].as_ref().unwrap_err().contains("the cargo backend"));
+        assert_eq!(ids[2], Ok("https://github.com/o/r".to_string()));
+    }
+
+    #[test]
+    fn mise_without_a_global_config_is_not_gated() {
+        let mut t = T::new();
+        t.grants = Grants::default();
+        t.mise("{}", "{}");
+        assert!(trust_notes(Updater::Mise, &t.env()).is_empty());
+        let r = run(Updater::Mise, &t.env());
+        assert_eq!(r.status, Status::Current, "{r:?}");
+    }
+
+    #[test]
+    fn mise_with_an_invalid_config_is_blocked() {
+        let t = T::new();
+        t.mise(MISE_TWO, "{}");
+        t.mise_config("config.toml", "[tools");
+        let r = run(Updater::Mise, &t.env());
+        assert_eq!(r.status, Status::Blocked, "{r:?}");
+        assert_eq!(r.notes.len(), 1, "{r:?}");
+        assert!(r.notes[0].contains("config.toml"), "{r:?}");
+        assert_eq!(t.log(), "");
     }
 
     #[test]
@@ -2651,7 +2837,13 @@ mod tests {
         t.mise("{}", "{}");
         let r = run(Updater::Mise, &t.env());
         assert_eq!(r.status, Status::Current, "{r:?}");
-        assert_eq!(t.calls(), vec!["mise outdated --json".to_string()]);
+        assert_eq!(
+            t.calls(),
+            vec![
+                "mise install".to_string(),
+                "mise outdated --json".to_string()
+            ]
+        );
     }
 
     #[test]
