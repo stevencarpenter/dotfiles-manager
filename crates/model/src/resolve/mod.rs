@@ -71,6 +71,27 @@ pub struct ResolvedResource {
     pub precedence: Option<String>,
 }
 
+/// Whether the owner's own checkout declared `r` and the value at `pointer`, so its source needs
+/// no grant (docs/sync.md, "Source identities"). True only when the declaring manifest and the
+/// manifest that supplied the value both lie outside every nested source path of the lock.
+/// `nested` holds those paths relative to the bound root; the paths are compared by whole
+/// components after the case fold. A value without a provenance entry is not owner declared.
+pub fn owner_declared(r: &ResolvedResource, pointer: &str, nested: &[String]) -> bool {
+    let outside = |file: &str| {
+        let file = crate::fold::fold(file);
+        nested.iter().all(|n| {
+            let n = crate::fold::fold(n);
+            file != n
+                && !file
+                    .strip_prefix(&n)
+                    .is_some_and(|rest| rest.starts_with('/'))
+        })
+    };
+    r.provenance
+        .get(pointer)
+        .is_some_and(|p| outside(&r.declared_in) && outside(&p.source_file))
+}
+
 /// A fragment directory: only files matching `pattern` may be placed in it by another resource.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DirClaim {
@@ -120,4 +141,87 @@ pub fn resolve(
     catalog: &AdapterCatalog,
 ) -> Result<Resolved, ResolveError> {
     compose::resolve(sources, profile_path, catalog)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn res(declared_in: &str, url_from: Option<&str>) -> ResolvedResource {
+        let provenance = url_from
+            .map(|f| {
+                let p = Provenance {
+                    owner: "m".into(),
+                    original: None,
+                    change: None,
+                    changer: None,
+                    reason: None,
+                    source_file: f.into(),
+                    source_path: None,
+                    content_id: None,
+                };
+                BTreeMap::from([("/url".to_string(), p)])
+            })
+            .unwrap_or_default();
+        ResolvedResource {
+            id: "m.r".into(),
+            module: "m".into(),
+            declared_in: declared_in.into(),
+            kind: "package".into(),
+            adapter: "git-checkout/v1".into(),
+            target: None,
+            value: Value::Table(Table::new()),
+            defaults: Vec::new(),
+            extensions: Vec::new(),
+            secret_values: false,
+            sensitive: false,
+            native_document: false,
+            provenance,
+            claims: Vec::new(),
+            dir_claims: Vec::new(),
+            precedence: None,
+        }
+    }
+
+    fn nested() -> Vec<String> {
+        vec!["base/ext".into()]
+    }
+
+    #[test]
+    fn a_root_declaration_is_owner_declared() {
+        let m = "base/modules/m/module.toml";
+        assert!(owner_declared(&res(m, Some(m)), "/url", &nested()));
+        assert!(owner_declared(&res(m, Some(m)), "/url", &[]));
+    }
+
+    #[test]
+    fn a_nested_declaration_is_not() {
+        let m = "base/ext/modules/w/module.toml";
+        assert!(!owner_declared(&res(m, Some(m)), "/url", &nested()));
+        // The case fold: APFS opens one directory for both spellings.
+        let m = "base/Ext/modules/w/module.toml";
+        assert!(!owner_declared(&res(m, Some(m)), "/url", &nested()));
+    }
+
+    #[test]
+    fn a_root_declaration_with_a_value_from_a_nested_overlay_is_not() {
+        let r = res(
+            "base/modules/m/module.toml",
+            Some("base/ext/modules/w/module.toml"),
+        );
+        assert!(!owner_declared(&r, "/url", &nested()));
+    }
+
+    #[test]
+    fn a_missing_provenance_entry_is_not() {
+        let m = "base/modules/m/module.toml";
+        assert!(!owner_declared(&res(m, None), "/url", &nested()));
+        assert!(!owner_declared(&res(m, Some(m)), "/source", &nested()));
+    }
+
+    #[test]
+    fn a_path_that_only_shares_a_prefix_is_outside() {
+        let m = "base/extra/modules/m/module.toml";
+        assert!(owner_declared(&res(m, Some(m)), "/url", &nested()));
+    }
 }
