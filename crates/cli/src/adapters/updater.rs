@@ -1244,14 +1244,6 @@ pub fn trust_notes(u: Updater, env: &Env) -> Vec<String> {
             Err(why) => vec![why],
         },
         Updater::Uv => untrusted(uv_identities(env), env.grants),
-        // The preview only: the run gates each checkout on its own, so the others still run.
-        Updater::Checkouts => untrusted(
-            declared_checkouts(env)
-                .filter(|c| !c.owner_declared)
-                .map(|c| git_id(&c.url))
-                .collect(),
-            env.grants,
-        ),
         Updater::Agents => {
             let (copy, working) = agents_copy(env);
             if working || std::fs::symlink_metadata(copy.join(".git")).is_err() {
@@ -1719,9 +1711,29 @@ fn preview_command(u: Updater, env: &Env) -> String {
                         paths.join(", ")
                     ),
                 };
-                match invalid {
+                let would = match invalid {
                     0 => would,
                     n => format!("{would}; {n} declaration{} invalid", plural(n)),
+                };
+                // The run gates each checkout on its own, so the others still run: the preview
+                // names the grants without blocking the row.
+                let ungranted = untrusted(
+                    declared_checkouts(env)
+                        .filter(|c| !c.owner_declared)
+                        .map(|c| git_id(&c.url))
+                        .collect(),
+                    env.grants,
+                );
+                match ungranted.len() {
+                    0 => would,
+                    1 => format!(
+                        "{would}; may block 1 checkout that needs a grant: {}",
+                        ungranted[0]
+                    ),
+                    n => format!(
+                        "{would}; may block {n} checkouts that need a grant: {}",
+                        ungranted.join("; ")
+                    ),
                 }
             }
         },
@@ -2184,10 +2196,11 @@ mod tests {
         t.checkout("tpm", "a1b2c3d", "d4e5f6a");
         let ext = t.checkout("ext", "a1b2c3d", "d4e5f6a");
         t.checkouts[1].as_mut().unwrap().owner_declared = false;
-        // The preview names the grant the run will need.
+        // The preview names the grant the run will need, and does not claim the whole row.
         let p = preview(Updater::Checkouts, &t.env());
+        assert!(p.starts_with("would fast-forward 2 checkouts ("), "{p}");
         assert!(
-            p.starts_with("blocked: E_SOURCE_UNTRUSTED: no grant for https://github.com/o/ext; "),
+            p.contains("; may block 1 checkout that needs a grant: E_SOURCE_UNTRUSTED: no grant for https://github.com/o/ext; "),
             "{p}"
         );
         let r = run(Updater::Checkouts, &t.env());
