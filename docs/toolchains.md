@@ -86,6 +86,6 @@ The manager does not upgrade either. Both come from Homebrew on the inventoried 
 
 - **No candidate in the preview.** The reviewer approves "the provider's newest" without seeing the version.
 - **Selected identity.** Which version a shim selects in a given directory is mise's decision. `doctor` does not probe tools.
-- **mise backends.** A tool of a mise backend (`npm:`, `go:`, `github:`, `ubi:`, `vfox:` and the others) resolves its newest version from that backend's origin. The backend's origin, not a plan row, decides what is fetched, as for the install path. The `mise` updater of `dfm sync` gates these tools on a grant (docs/upgrade.md, "Source trust"). `packages --update` is unchanged.
+- **mise backends.** A tool of a mise backend (`npm:`, `go:`, `github:`, `ubi:`, `vfox:` and the others) resolves its newest version from that backend's origin. The backend's origin, not a plan row, decides what is fetched, as for the install path.
 - **`mise ls` without configuration.** The listing shows every installed version and no `active` or `requested_version` field. The adapter does not read those.
 - **Evidence scope.** Tests use the `test-isolation` build and `mise`, `uv` and `brew` look-alikes. `mise ls --json`, `mise --version` and `uv tool list` were run by hand against the real tools once to learn their output. No test runs a real install or upgrade.

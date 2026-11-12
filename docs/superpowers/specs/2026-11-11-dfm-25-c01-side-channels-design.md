@@ -1,6 +1,6 @@
 # DFM-25 C01: move the side-channel installers into dfm
 
-Status: draft for owner review, 2026-11-11; owner answers of 2026-11-11 (fantasy-sports as an external bundle, mise gated) applied. Kaneo: DFM-25 (C01; the grant rule is C04). Inputs: the code at main 0e90709 and `~/.dotfiles/scripts/sync-side-channels.sh` at the dotfiles `main` of 2026-11-11.
+Status: draft for owner review, 2026-11-11; owner answers of 2026-11-11 (fantasy-sports as an external bundle) and of 2026-11-12 (mise, `skills` and declared uv sources ungated) applied. Kaneo: DFM-25 (C01; the grant rule is C04). Inputs: the code at main 0e90709 and `~/.dotfiles/scripts/sync-side-channels.sh` at the dotfiles `main` of 2026-11-11.
 
 ## Intent
 
@@ -11,7 +11,7 @@ The owner decided on 2026-11-11 that every step of the script is managed by dfm.
 ## Goals
 
 - **G1.** Every step of `scripts/sync-side-channels.sh` is a declared resource in the dotfiles bundle or a built-in updater of dfm. The inventory below is the checklist.
-- **G2.** Every external origin that a step fetches from needs a grant in `state/grants.json` before the first fetch, with the identities of docs/sync.md ("Source identities"). An ungranted source gives a `blocked` row with the `dfm sync --trust-origin` command, as the `skills` and `agents` updaters do now.
+- **G2.** Every external origin that dfm discovers and fetches from needs a grant in `state/grants.json` before the first fetch, with the identities of docs/sync.md ("Source identities"). An ungranted source gives a `blocked` row with the `dfm sync --trust-origin` command, as the `skills` and `agents` updaters do now. G2 applies to sources dfm discovers (a skills record, an npm global, a checkout's upstream). It does not apply to sources the owner declares in the owner's own checkout: a `uv-tool/v1` `source` and the mise configuration (owner decision of 2026-11-12, see "mise sources").
 - **G3.** A pin (a tag, a commit, an installer version) is data in a bundle document, not a constant in Rust. Changing a pin never needs a rebuild of dfm (owner constraint).
 - **G4.** A profile still cannot add a command. Resources and updaters come from the fixed set built into dfm. A document chooses only which ones run and with which data.
 - **G5.** At the end, `scripts/sync-side-channels.sh`, the recipe, `Updater::SideChannels` and its tests and docs are removed, and the `side-channels` entry is removed from `personal-mac.toml`.
@@ -34,7 +34,7 @@ The owner decided on 2026-11-11 that every step of the script is managed by dfm.
 
 | # | Script step | Origin(s) | Target in dfm |
 | --- | --- | --- | --- |
-| 1 | `mise install` | mise's registries and the `github:`, `npm:` and `go:` backends that the global config names | The `mise` updater runs `mise install` before `mise upgrade`, and both are gated (see "mise sources"). |
+| 1 | `mise install` | mise's registries and the `github:`, `npm:` and `go:` backends that the global config names | The `mise` updater runs `mise install` before `mise upgrade`, without a gate (see "mise sources"). |
 | 2 | `mise upgrade --no-prune` | the same | The existing `mise` updater. Its prune behavior stays (see "Decided in this design"). |
 | 3 | DuckDB `INSTALL spatial; INSTALL avro;` | DuckDB's core extension repository | New package adapter `duckdb-extension/v1`. |
 | 4 | gh-axi skill: `npx --yes skills@1.7.0 add <github tree URL at a commit> --skill gh-axi --global --yes --agent ...` | `npm:skills`, `https://github.com/kunchenguid/gh-axi` | New package adapter `skill-source/v1`. |
@@ -59,7 +59,7 @@ A new package adapter follows docs/packages.md: a read-only probe before the pla
 - **`skill-source/v1`.** Fields: `source` (the GitHub tree URL at a commit, as the script writes it), `skill`, `agents` (a list), `installer` (an `npm:skills@<version>` value). The probe reads the `skills` CLI's source record, as `skills_sources` does now, and passes when an entry has that `source` and `skill`. The install runs `mise exec -- npx --yes skills@<version> add <source> --skill <skill> --global --yes --agent <agents...>` with the default npm registry forced, as the `skills` updater does. Identities: `npm:skills` and the repository origin of `source`.
 - **`codex-plugin/v1`.** Fields: `marketplace` (a GitHub shorthand or URL), `plugin` (`<name>@<marketplace>`). The probe reads `codex plugin marketplace list` and `codex plugin list`. The install runs `codex plugin marketplace add` when the marketplace is missing, then `codex plugin add`. The identity is the marketplace origin. A marketplace grant covers its plugins, as for Claude (trust design, "Grants").
 - **`duckdb-extension/v1`.** Field: `name`. The probe runs `duckdb -init /dev/null -c` with a query on `duckdb_extensions()` and passes when the extension is installed. The install runs `INSTALL <name>`. DuckDB keeps extensions per version, so a DuckDB upgrade makes the probe fail and the next sync installs the extension again. DuckDB's core repository is the tool's own owner, so it is not gated, as for `brew` and `mise`. `DUCKDB_AGENT_MODE=0` is set, as in the script.
-- **`uv-tool/v1` sources.** Add an optional `source` field. `git+https://<repo>@<ref>` needs a grant for the repository origin, and the ref must be a tag or a full commit, never a branch. The install runs `uv tool install --force <source>`. A `path:<bundle-relative dir>` source must resolve inside the bound checkout and needs no grant. The probe compares the source that uv records for the tool with the declared source; a different source is stale and is installed again. A name-only value keeps its current behavior.
+- **`uv-tool/v1` sources.** Add an optional `source` field. A declared source needs no grant (owner decision of 2026-11-12). `git+https://<repo>` is the rolling form: the default branch, upgraded by `packages --update`. `git+https://<repo>@<ref>` pins a tag or a full commit, never a branch. The install runs `uv tool install --force <source>`. A `path:<bundle-relative dir>` source must resolve inside the bound checkout. The probe compares the source that uv records for the tool with the declared source; a different source is stale and is installed again. A name-only value keeps its current behavior.
 
 ### Updaters
 
@@ -81,34 +81,7 @@ Owner decision, 2026-11-11: the fantasy-sports repository (`ssh://git@github.com
 
 ### mise sources
 
-Owner decision, 2026-11-11: `mise install` and `mise upgrade` are gated. Before any mise command, the `mise` updater finds the mise files without running mise: in the runner directory under HOME and each parent up to `/`, `.tool-versions`, `mise*.toml` and `.mise*.toml` (`mise.toml`, `mise.local.toml`, `mise.<env>.toml`), `.config/mise*.toml`, and `config*.toml` and `mise*.toml` in `.config/mise/`, `.mise/` and `mise/` with every `conf.d/*.toml` there; then the same names in `~/.config/mise/` and `/etc/mise/`. mise also reads files below a `conf.d` (such as `conf.d/<dir>/mise.toml`), which the gate does not enter: any `conf.d` entry that is not a `*.toml` file (a directory, a dangling link, a special file or another name) blocks the row with a note that names it. A link to a `*.toml` file is read as the file it names, because the dotfiles link these files from the checkout. It reads each one (a `.tool-versions` file as `<tool> <version>` lines) and maps each tool of a non-registry backend to an identity:
-
-- `github:o/r` and `ubi:o/r` map to `https://github.com/o/r`.
-- `npm:<name>` maps to `npm:<name>`.
-- `go:<module path>` maps to its own identity `go:<module path>`, stored in `packages` beside `npm:`. A module path is a lowercase host with a dot and a path, with no version.
-- A tool of another backend (`vfox:`, `cargo:`, `pipx:`, `aqua:`, `asdf:` and the others) is handled as the builder finds the registry maps it: a backend with no mapping is `E_SOURCE_UNTRUSTED`. A short name of mise's registry (`go`, `java`, `rust-analyzer`) is not gated, because mise's registry is its owner, as Homebrew's official formulae are.
-
-Each of these also blocks the row, with one note that names the file and the entry, because each one can move a fetch away from the checked identity:
-
-- A file that cannot be read or parsed.
-- A template (`{{`, `{%` or `{#`): mise renders it to read the file, and a template can run a command.
-- A non-empty `[hooks]` table: `mise install` runs its commands.
-- A `conf.d` entry that is not a `*.toml` file, because mise reads files below it.
-- A non-empty `[plugins]`, `[tool_alias]` or `[alias]` table.
-- A tool option other than `version` or `minimum_release_age` in a value table, or other than `exe`, `bin` or `matching` in a `[...]` key suffix.
-- Any setting under `[settings]`, at any depth, other than `trusted_config_paths`.
-- A non-empty `[env]` table: mise passes it to the commands it runs, so `npm_config_registry` or `GOPROXY` there would move a granted fetch.
-- A lockfile beside a gated file (`mise.lock`, `mise.local.lock`, `mise.<env>.lock`, `.mise*.lock` or `<stem>.lock`, and for a `conf.d` file the directory above), because it can record a download url.
-
-Only when every file passes and every identity has a grant does `mise config ls --json` run, with the runner, directory and environment of `mise install`. A listing that fails, or a path it lists that the gate did not read, blocks the row before the install.
-
-Every mise command (`config ls`, `ls`, `install`, `outdated`, `upgrade`) runs with the default npm registry, also for each `npm:@scope` the files name, so an `npm:` grant covers that registry only. It also runs with Go at its defaults: `GOENV=off` (so Go's own env file from `go env -w` is not read), `GOPROXY=https://proxy.golang.org,direct`, `GOSUMDB=sum.golang.org`, `GOTOOLCHAIN=local`, and `GOFLAGS`, `GONOSUMDB`, `GONOSUMCHECK`, `GOPRIVATE`, `GONOPROXY` and `GOINSECURE` empty. A `go:` grant names a module, and the public Go proxy serves it.
-
-`mise ls --installed --json` runs before and after `mise install`. Each tool version the install adds is a note and makes the row `updated`.
-
-The `skills` updater runs `mise exec`, which renders the same files. Before it, the same file checks run (the files, the `conf.d` rule, templates, `[hooks]`, `[env]`, whose directives such as `_.source` run a script, read and parse errors), without the backend-tool grants. `mise exec` gets the same environment, and `MISE_EXEC_AUTO_INSTALL=false` and `MISE_NOT_FOUND_AUTO_INSTALL=false`, so it installs no configured tool.
-
-One ungranted identity blocks the whole row before any mise command that fetches, with one note per identity, as for `skills` (trust design, anti-goal "a partial updater run"). This changes DFM-85's rule that mise is not gated. docs/upgrade.md ("Source trust") and docs/toolchains.md change with it. The current live tools need grants once, on the first sync after the slice; the slice's PR description lists the `--trust-origin` commands for the M5's current config.
+Owner decision, 2026-11-12: the north star of dfm is user experience, not strict auditability. The `mise` and `skills` updaters run without a gate. The mise configuration is the owner's own file in the granted checkout, and the friction of a grant per tool outweighs the risk. The `mise` updater runs `mise install` before `mise upgrade`; `mise ls --installed --json` before and after the install reports each tool version it adds and makes the row `updated`. `skills` keeps its `npm:skills` and skill-source grants. A declared `uv-tool/v1` source needs no grant either: the owner wrote it in the owner's own checkout. Everything rolls to the newest version; a declared source pins only when it names a tag or a commit. This replaces the owner decision of 2026-11-11 that gated mise.
 
 ### Firstmate
 
@@ -127,7 +100,6 @@ The updaters run after the four scopes. The tools that the new package adapters 
 - `versions/token-auditor` is removed. The tag moves into the `uv-tool/v1` value.
 - The `skills@1.7.0` installer pin moves into the `skill-source/v1` value.
 - agent-reap is installed by the packages scope when its declared source differs from uv's record. The `uv` updater runs `uv tool upgrade agent-reap` on every sync, as for every tool. Whether that rebuilds a path tool whose code changed without a version bump depends on uv's cache and is unchecked. If it does not, the builder adds a content digest of the directory to the probe.
-- Known gap: a path source's own dependencies can name `git+` direct references, and the install fetches them without a grant.
 - Capability gates of the script (`host-capability.sh skills`, `mcp`, `agents`, and the `personal` identity) become module membership. A resource is in a module that the work profile does not list.
 - The `skill-source/v1` probe does not use the `skills` CLI's source record: that record has no gh-axi entry today, and an entry there would let the `skills` updater roll the skill past its pin. The probe passes when the installed skill directory exists and dfm's own record of the last install (state, keyed by resource) names the declared `source` and installer version.
 - The other callers of the script are rewired in the last dotfiles PR: the `sync-dfm-apply` recipe (`Justfile:92`), `scripts/update-inputs.sh:42`, `scripts/test-sync-capability-gating.sh` and the message at `bootstrap.sh:106`.
@@ -138,14 +110,14 @@ The updaters run after the four scopes. The tools that the new package adapters 
 
 - Field names, row layout and note text, within the docs' existing style.
 - Whether `checkouts` reports one row per checkout or one row with notes.
-- The test layout. Required cases: each new adapter's probe for installed, missing and other-owner states; each fetching adapter blocked without a grant and installed with one; `uv-tool/v1` refusing a branch ref and a path outside the bound checkout; `checkouts` blocked on a dirty, diverged and ungranted copy; a skill installed at another source than declared reinstalled; the `mise` updater blocked before any mise command by one ungranted backend tool, and run when every identity has a grant.
+- The test layout. Required cases: each new adapter's probe for installed, missing and other-owner states; each fetching adapter blocked without a grant and installed with one (not `uv-tool/v1` sources); `uv-tool/v1` refusing a branch ref and a path outside the bound checkout; `checkouts` blocked on a dirty, diverged and ungranted copy; a skill installed at another source than declared reinstalled; the `mise` updater installing a missing tool and reporting it.
 - The docs: `docs/packages.md`, `docs/upgrade.md`, `docs/sync.md` ("Source identities", the updater list), `docs/adapters.md` (the table), `README.md` and the `dfm sync` help text.
 
 ## Delivery
 
 Each slice is one PR that passes the gate and gets Codex's thumbs-up. Each slice removes its steps from `scripts/sync-side-channels.sh` in a matching dotfiles PR, which merges only after the M5 runs a dfm that has the slice (`dfm self-update`).
 
-1. `uv-tool/v1` sources (steps 11 and 12), and the gated `mise install` (step 1, "mise sources").
+1. `uv-tool/v1` sources (steps 11 and 12), and `mise install` in the `mise` updater (step 1, "mise sources").
 2. `git-checkout/v1` and the `checkouts` updater (step 7), then the agent registry (step 8), and the bundle's `op-template/v1` secret (step 6).
 3. The fantasy-sports external bundle (step 9).
 4. `skill-source/v1` (step 4) and `codex-plugin/v1` (step 13).

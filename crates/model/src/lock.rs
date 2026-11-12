@@ -222,34 +222,6 @@ fn npm_name(p: &str) -> bool {
     p.len() <= 214 && part(name)
 }
 
-/// The prefix of a Go module identity: `go:<module path>`, the module a mise `go:` tool names
-/// (docs/sync.md, "Source identities"). It is stored in `packages`, beside `npm:`.
-pub const GO: &str = "go:";
-
-/// A Go module path: a lowercase host with a `.` and no empty label, then one or more path
-/// components of `[A-Za-z0-9._~-]`. No component is empty, `.`, `..` or starts with `-`. No
-/// version (`@`), at most 256 bytes.
-fn go_module(p: &str) -> bool {
-    let component = |c: &str, case_ok: fn(u8) -> bool| {
-        !c.is_empty()
-            && !matches!(c, "." | "..")
-            && !c.starts_with('-')
-            && c.bytes()
-                .all(|b| case_ok(b) || b.is_ascii_digit() || matches!(b, b'-' | b'.' | b'_' | b'~'))
-    };
-    let host_byte: fn(u8) -> bool = |b| b.is_ascii_lowercase();
-    let path_byte: fn(u8) -> bool = |b| b.is_ascii_alphabetic();
-    let mut parts = p.split('/');
-    let host = parts.next().unwrap_or_default();
-    let mut rest = parts.peekable();
-    p.len() <= 256
-        && host.contains('.')
-        && component(host, host_byte)
-        && host.split('.').all(|label| !label.is_empty())
-        && rest.peek().is_some()
-        && rest.all(|c| component(c, path_byte))
-}
-
 /// The prefix of an install script identity: `script:<url>`, the URL a `script/v1` declaration
 /// names (docs/sync.md, "Source identities").
 pub const SCRIPT: &str = "script:";
@@ -268,7 +240,7 @@ pub fn script_url(url: &str) -> bool {
 }
 
 /// A source identity that `--trust-origin` grants: a canonical origin ([`check_origin`]),
-/// `npm:<package>`, `go:<module>` or `script:<https url>`. Anything else is `E_SOURCE_UNTRUSTED`.
+/// `npm:<package>` or `script:<https url>`. Anything else is `E_SOURCE_UNTRUSTED`.
 pub fn check_identity(identity: &str, allow_file: bool) -> Result<(), Refusal> {
     if let Some(url) = identity.strip_prefix(SCRIPT) {
         return if script_url(url) {
@@ -276,15 +248,6 @@ pub fn check_identity(identity: &str, allow_file: bool) -> Result<(), Refusal> {
         } else {
             Err(untrusted(format!(
                 "{identity:?} is not script:<url> with an https:// URL of at most {MAX_SCRIPT_URL} bytes"
-            )))
-        };
-    }
-    if let Some(p) = identity.strip_prefix(GO) {
-        return if go_module(p) {
-            Ok(())
-        } else {
-            Err(untrusted(format!(
-                "{identity:?} is not go:<module path> with a host that has a dot and a path"
             )))
         };
     }
@@ -309,8 +272,8 @@ pub fn trust_command(identity: &str) -> String {
 
 /// The identity of a source as a tool's own record names it (docs/sync.md, "Source
 /// identities"): a GitHub shorthand `o/r` is `https://github.com/o/r`, the SCP form
-/// `git@host:path.git` is `ssh://git@host/path`, a URL loses a `.git` suffix, and an `npm:` or
-/// `go:` identity stays as it is. The result must pass [`check_identity`]. A value that maps to
+/// `git@host:path.git` is `ssh://git@host/path`, a URL loses a `.git` suffix, and an `npm:`
+/// identity stays as it is. The result must pass [`check_identity`]. A value that maps to
 /// nothing is `E_SOURCE_UNTRUSTED`.
 pub fn source_identity(value: &str, allow_file: bool) -> Result<String, Refusal> {
     let unsuffixed = |p: &'_ str| p.strip_suffix(".git").unwrap_or(p).to_string();
@@ -321,7 +284,7 @@ pub fn source_identity(value: &str, allow_file: bool) -> Result<String, Refusal>
                 && c.bytes()
                     .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
         });
-    let id = if value.starts_with(NPM) || value.starts_with(GO) {
+    let id = if value.starts_with(NPM) {
         value.to_string()
     } else if value.contains("://") {
         unsuffixed(value)
@@ -334,7 +297,7 @@ pub fn source_identity(value: &str, allow_file: bool) -> Result<String, Refusal>
         format!("https://github.com/{value}")
     } else {
         return Err(untrusted(format!(
-            "source {:?} is not a URL, git@host:path, owner/repo, npm:<package> or go:<module>",
+            "source {:?} is not a URL, git@host:path, owner/repo or npm:<package>",
             mask_userinfo(value)
         )));
     };
@@ -343,13 +306,12 @@ pub fn source_identity(value: &str, allow_file: bool) -> Result<String, Refusal>
 }
 
 /// The identity of a git remote: [`source_identity`], limited to git origins. Git reads
-/// `npm:skills` as the SCP form (host `npm`), and `go:golang.org/x/tools` the same with host
-/// `go`, so an `npm:` or `go:` identity, whose grant covers only a package or module, is
-/// `E_SOURCE_UNTRUSTED` here.
+/// `npm:skills` as the SCP form (host `npm`), so an `npm:` identity, whose grant covers only an
+/// npm package, is `E_SOURCE_UNTRUSTED` here.
 pub fn git_identity(value: &str, allow_file: bool) -> Result<String, Refusal> {
-    if value.starts_with(NPM) || value.starts_with(GO) {
+    if value.starts_with(NPM) {
         return Err(untrusted(format!(
-            "git remote {value:?} names an npm: or go: identity; a package grant does not cover a git fetch"
+            "git remote {value:?} names an npm: identity; an npm grant does not cover a git fetch"
         )));
     }
     source_identity(value, allow_file)
@@ -527,7 +489,7 @@ impl Grants {
             let mut s = self.scripts.iter();
             s.find(|g| g.script == identity)
                 .map(|g| g.grant_id.as_str())
-        } else if identity.starts_with(NPM) || identity.starts_with(GO) {
+        } else if identity.starts_with(NPM) {
             let mut p = self.packages.iter();
             p.find(|g| g.package == identity)
                 .map(|g| g.grant_id.as_str())
@@ -545,7 +507,7 @@ impl Grants {
     }
 
     /// Adds a grant for `identity` unless one exists: a `script:` identity to `scripts`, an
-    /// `npm:` or `go:` identity to `packages`, an origin to `origins`. Returns the grant id.
+    /// `npm:` identity to `packages`, an origin to `origins`. Returns the grant id.
     pub fn grant(&mut self, identity: &str, at: &str) -> String {
         if let Some(id) = self.existing(identity) {
             return id.to_string();
@@ -561,7 +523,7 @@ impl Grants {
                 grant_id,
                 granted_at,
             });
-        } else if identity.starts_with(NPM) || identity.starts_with(GO) {
+        } else if identity.starts_with(NPM) {
             self.packages.push(PackageGrant {
                 package: identity.into(),
                 grant_id,
@@ -722,38 +684,6 @@ ref = "refs/heads/main"
         assert_eq!(Grants::parse(&bytes).unwrap(), g);
         // Without npm grants the file has no `packages` key, as before it existed.
         assert!(!String::from_utf8(bytes).unwrap().contains("packages"));
-    }
-
-    #[test]
-    fn a_go_identity_is_checked_and_round_trips_in_packages() {
-        assert!(check_identity("go:golang.org/x/tools/gopls", false).is_ok());
-        assert!(check_identity("go:github.com/o/r/cmd/x", false).is_ok());
-        for bad in [
-            "go:",
-            "go:gopls",
-            "go:Golang.org/x",
-            "go:golang.org/x@v1",
-            "go:golang.org//x",
-            "go:golang.org/../x",
-            "go:-x.org/y",
-            "go:.org/x",
-            "go:a..b/x",
-            "go:x./y",
-            "go:golang.org",
-        ] {
-            assert!(check_identity(bad, false).is_err(), "{bad}");
-        }
-        // The cap is on the module path, after `go:`: 256 bytes pass, 257 do not.
-        let module = |len: usize| format!("go:example.com/{}", "a".repeat(len - 12));
-        assert_eq!(module(256).len(), 3 + 256);
-        assert!(check_identity(&module(256), false).is_ok());
-        assert!(check_identity(&module(257), false).is_err());
-        assert!(git_identity("go:golang.org/x/tools", false).is_err());
-        let mut g = Grants::default();
-        g.grant("go:golang.org/x/tools/gopls", "2026-11-11T00:00:00Z");
-        assert!(g.trusts("go:golang.org/x/tools/gopls"));
-        assert!(g.origins.is_empty() && g.packages.len() == 1);
-        assert_eq!(Grants::parse(&serde_json::to_vec(&g).unwrap()).unwrap(), g);
     }
 
     #[test]
