@@ -320,7 +320,22 @@ fn native(mut d: Draft, env: &Env) -> Row {
     ) {
         return d.stop(e);
     }
+    // Codex also refreshes its Git plugin marketplaces; a failure fails the row after the version
+    // check, and a stop request ends it as pending.
+    let mut marketplaces = None;
+    if u == Updater::Codex {
+        let a = args(&["plugin", "marketplace", "upgrade"]);
+        match call(&r, u.name(), &a, &[], env.timeouts.long) {
+            Err(e) if e.1 => return d.stop(e),
+            Err(e) => marketplaces = Some(e),
+            Ok(_) => {}
+        }
+    }
     match version(&r, u, env) {
+        Ok(v) if marketplaces.is_some() => {
+            d.after = Some(v);
+            d.stop(marketplaces.take().unwrap_or_default())
+        }
         Ok(v) => {
             let changed = d.before.as_deref() != Some(v.as_str());
             d.after = Some(v);
@@ -331,6 +346,9 @@ fn native(mut d: Draft, env: &Env) -> Row {
             })
         }
         Err((note, _)) => {
+            if let Some(e) = marketplaces {
+                d.notes.push(e.0);
+            }
             d.notes.push(format!(
                 "the update ran, but the new version is unknown: {note}"
             ));
@@ -1949,9 +1967,14 @@ fn preview_command(u: Updater, env: &Env) -> String {
         },
         Updater::Claude | Updater::Codex | Updater::Opencode => match native_runner(u, env) {
             Ok(r) => format!(
-                "would run {} {} ({})",
+                "would run {} {}{} ({})",
                 u.name(),
                 native_update(u),
+                if u == Updater::Codex {
+                    ", codex plugin marketplace upgrade"
+                } else {
+                    ""
+                },
                 r.resolve(u.name())
                     .map(|p| p.display().to_string())
                     .unwrap_or_default()
@@ -2083,7 +2106,7 @@ mod tests {
             self.script(
                 &self.home.join(rel),
                 &format!(
-                    "case \"$1\" in\n  --version) cat \"$st/{name}\" ;;\n  {update}) printf '%s' '{after}' > \"$st/{name}\" ;;\n  *) exit 64 ;;\nesac"
+                    "case \"$1\" in\n  --version) cat \"$st/{name}\" ;;\n  {update}) printf '%s' '{after}' > \"$st/{name}\" ;;\n  plugin) ;;\n  *) exit 64 ;;\nesac"
                 ),
             );
         }
@@ -2973,6 +2996,46 @@ mod tests {
         );
         let r = run(Updater::Claude, &t.env());
         assert_eq!(r.status, Status::Current, "{r:?}");
+    }
+
+    /// `codex` whose `update` and `plugin marketplace upgrade` succeed, or the latter exits 1 with
+    /// the `st/mkt-fail` marker.
+    fn codex_with_marketplaces(t: &T) {
+        t.script(
+            &t.home.join(".codex/packages/standalone/current/bin/codex"),
+            "case \"$1\" in\n  --version) echo codex-cli 1.0 ;;\n  update) ;;\n  plugin) [ \"$2 $3\" = 'marketplace upgrade' ] || exit 64; [ -f \"$st/mkt-fail\" ] && { echo boom >&2; exit 1; }; true ;;\n  *) exit 64 ;;\nesac",
+        );
+    }
+
+    #[test]
+    fn codex_also_upgrades_its_plugin_marketplaces() {
+        let t = T::new();
+        fs::create_dir_all(t.root.join("st")).unwrap();
+        codex_with_marketplaces(&t);
+        let r = run(Updater::Codex, &t.env());
+        assert_eq!(r.status, Status::Current, "{r:?}");
+        let calls = t.calls();
+        let at = |c: &str| calls.iter().position(|x| x == c).unwrap();
+        assert!(
+            at("codex update") < at("codex plugin marketplace upgrade"),
+            "{calls:?}"
+        );
+        assert!(preview(Updater::Codex, &t.env()).contains("codex plugin marketplace upgrade"));
+        // A failure adds a note and fails the row.
+        fs::write(t.root.join("st/mkt-fail"), "").unwrap();
+        let r = run(Updater::Codex, &t.env());
+        assert_eq!(r.status, Status::Failed, "{r:?}");
+        assert!(
+            r.notes
+                .iter()
+                .any(|n| n.contains("plugin marketplace upgrade")),
+            "{r:?}"
+        );
+        // claude and opencode never run it.
+        let t = T::new();
+        t.native(".local/bin/claude", "update", "1.0", "1.0");
+        run(Updater::Claude, &t.env());
+        assert!(!t.log().contains("marketplace"), "{}", t.log());
     }
 
     #[test]
