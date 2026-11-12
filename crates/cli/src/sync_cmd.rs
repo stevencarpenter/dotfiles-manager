@@ -2251,15 +2251,17 @@ fn updater_env<'a>(
     }
 }
 
-/// The `git-checkout/v1` resources of the profile. A declaration that is not valid, or one at or
-/// inside a source checkout in `sources` (sync fast-forwards those), is a note of the
-/// `checkouts` row, so the other updaters still run. `nested` holds the nested source paths of
+/// The `git-checkout/v1` resources of the profile. A declaration that is not valid, or one at,
+/// above or inside a source checkout in `sources` (sync fast-forwards those), is a note of the
+/// `checkouts` row, so the other updaters still run. A path inside a source checkout that its
+/// git ignores (`ignored(root, rel)`, a plugin directory of the dotfiles) is allowed. `nested` holds the nested source paths of
 /// the lock (`nested_paths`), which decide whether the bound checkout declared each one.
 fn declared_checkouts(
     home: &Path,
     resolved: &Resolved,
     sources: &[PathBuf],
     nested: Option<&[String]>,
+    ignored: &dyn Fn(&Path, &Path) -> bool,
 ) -> Vec<Result<updater::Checkout, String>> {
     resolved
         .resources
@@ -2267,9 +2269,19 @@ fn declared_checkouts(
         .filter(|r| r.adapter == checkout::ADAPTER)
         .map(|r| {
             let owner = crate::adapters::package::owner_source(nested, r);
-            declared_checkout(home, &r.id, &r.value, sources, owner)
+            declared_checkout(home, &r.id, &r.value, sources, owner, ignored)
         })
         .collect()
+}
+
+/// Whether the git of the source checkout at `root` ignores `rel`
+/// (`git check-ignore -q -- <rel>`, exit 0). Any other answer is not ignored.
+fn git_ignores(git: &Git, root: &Path, rel: &Path) -> bool {
+    let (Some(root), Some(rel)) = (root.to_str(), rel.to_str()) else {
+        return false;
+    };
+    git.output(true, &["-C", root, "check-ignore", "-q", "--", rel])
+        .is_ok_and(|o| o.success())
 }
 
 /// `p` through links: the nearest ancestor that exists, canonicalized, joined with the
@@ -2290,13 +2302,20 @@ fn declared_checkout(
     value: &dfm_model::resolve::Value,
     sources: &[PathBuf],
     owner_declared: bool,
+    ignored: &dyn Fn(&Path, &Path) -> bool,
 ) -> Result<updater::Checkout, String> {
     let d = checkout::declared(value).map_err(|e| format!("{id}: {}", e.detail))?;
     let path = home.join(d.path);
-    if sources
-        .iter()
-        .any(|s| real_path(&path).starts_with(real_path(s)))
-    {
+    let real = real_path(&path);
+    // At or above a source checkout: refused. Inside one: only where its git ignores the path.
+    let overlaps = sources.iter().any(|s| {
+        let root = real_path(s);
+        root.starts_with(&real)
+            || real
+                .strip_prefix(&root)
+                .is_ok_and(|rel| !ignored(&root, rel))
+    });
+    if overlaps {
         return Err(format!(
             "{id}: {} is a dotfiles source checkout; sync updates it",
             path.display()
@@ -2417,11 +2436,13 @@ fn upgrade_preview(
     }
     let runner = ctx.runner(sys);
     // A declared checkout at a source checkout is left to sync's own fast-forward.
+    let git = Git::new(ctx, sys);
     let checkouts = declared_checkouts(
         ctx.platform.home(),
         resolved,
         &guarded_checkouts(root)?,
         nested_paths(root).as_deref(),
+        &|root, rel| git_ignores(&git, root, rel),
     );
     let agents = updaters.contains(&Updater::Agents);
     let env = updater_env(ctx, &runner, root, grants, (&checkouts, agents));
@@ -2498,17 +2519,18 @@ fn upgrade(
     let mut runner = ctx.runner(sys);
     runner.detach = true;
     let checkouts = guarded_checkouts(root)?;
+    let git = Git::new(ctx, sys);
     let declared = declared_checkouts(
         ctx.platform.home(),
         &resolved,
         &checkouts,
         nested_paths(root).as_deref(),
+        &|root, rel| git_ignores(&git, root, rel),
     );
     let agents = updaters.contains(&Updater::Agents);
     let env = updater_env(ctx, &runner, root, &grants, (&declared, agents));
     // The tracked-file guard (DFM-25, G5): the tracked changes before the updaters, compared
     // after each one that ran. A change it made fails its row and stays in place.
-    let git = Git::new(ctx, sys);
     let mut tracked = tracked_status(&git, &checkouts)?;
     writeln!(out, "{}", paint::label(ctx.color, "upgrade:")).map_err(w)?;
     let mut ops = Vec::new();
@@ -2664,7 +2686,8 @@ mod tests {
                 "extra.r",
                 &value("https://github.com/o/r.git"),
                 &[],
-                true
+                true,
+                &never,
             ),
             Ok(updater::Checkout {
                 id: "extra.r".into(),
@@ -2673,7 +2696,7 @@ mod tests {
                 owner_declared: true,
             })
         );
-        let e = declared_checkout(home, "extra.bad", &value("o/r"), &[], true).unwrap_err();
+        let e = declared_checkout(home, "extra.bad", &value("o/r"), &[], true, &never).unwrap_err();
         assert!(e.starts_with("extra.bad: url "), "{e}");
     }
 
@@ -2693,9 +2716,11 @@ mod tests {
                 &v,
                 &[home.join("dots"), home.join("ext/nested")],
                 true,
+                &never,
             )
         };
-        for path in ["dots", "dots/sub", "ext/nested"] {
+        // At, inside (not ignored) or containing a source checkout.
+        for path in ["dots", "dots/sub", "ext/nested", "ext"] {
             assert_eq!(
                 at(path),
                 Err(format!(
@@ -2704,28 +2729,50 @@ mod tests {
             );
         }
         assert!(at("dotsy").is_ok());
-        assert!(at("ext").is_ok());
+        assert!(at("ext2").is_ok());
     }
 
-    /// A path that does not exist yet, under a link into a source checkout, still overlaps it.
+    /// A source checkout's git never ignores a path in these tests.
+    fn never(_: &Path, _: &Path) -> bool {
+        false
+    }
+
+    /// A path inside a source checkout is allowed only when that checkout's git ignores it,
+    /// directly or through a link above a path not cloned yet (the tmux plugin directory of the
+    /// dotfiles). A path that contains a source checkout is refused whatever git says.
     #[test]
-    fn a_missing_checkout_under_a_link_into_a_source_checkout_is_a_note() {
+    fn a_checkout_inside_a_source_checkout_is_allowed_only_where_git_ignores_it() {
         let home = std::env::temp_dir().join(format!("dfm-sync-link-{}", std::process::id()));
         let _ = fs::remove_dir_all(&home);
-        fs::create_dir_all(home.join("dots")).unwrap();
+        fs::create_dir_all(home.join("dots/plugins")).unwrap();
         std::os::unix::fs::symlink(home.join("dots"), home.join("alias")).unwrap();
-        let v = dfm_model::resolve::Value::Table(
-            toml::from_str("url = \"https://github.com/o/r.git\"\npath = \"alias/new/r\"\n")
+        let dots = home.join("dots").canonicalize().unwrap();
+        let at = |path: &str, ignored: &dyn Fn(&Path, &Path) -> bool| {
+            let v = dfm_model::resolve::Value::Table(
+                toml::from_str(&format!(
+                    "url = \"https://github.com/o/r.git\"\npath = {path:?}\n"
+                ))
                 .unwrap(),
-        );
-        let got = declared_checkout(&home, "extra.r", &v, &[home.join("dots")], true);
+            );
+            declared_checkout(&home, "extra.r", &v, &[home.join("dots")], true, ignored)
+        };
+        let plugins = |root: &Path, rel: &Path| root == dots && rel.starts_with("plugins");
+        let all = |_: &Path, _: &Path| true;
+        let refused = |got: Result<updater::Checkout, String>| {
+            got.is_err_and(|e| e.ends_with("is a dotfiles source checkout; sync updates it"))
+        };
+        let results = [
+            at("dots/plugins/tpm", &plugins).is_ok(),
+            at("alias/plugins/tpm", &plugins).is_ok(),
+            refused(at("dots/plugins/tpm", &never)),
+            refused(at("alias/plugins/tpm", &never)),
+            refused(at("alias/new/r", &plugins)),
+            refused(at("dots", &all)),
+        ];
         let _ = fs::remove_dir_all(&home);
-        assert!(
-            got.as_ref()
-                .is_err_and(|e| e.ends_with("is a dotfiles source checkout; sync updates it")),
-            "{got:?}"
-        );
+        assert_eq!(results, [true; 6]);
     }
+
     #[test]
     fn redirects_and_http_alternates_stay_disabled() {
         // Any value but `true` also disables the dumb-HTTP alternates (is_alternate_allowed).

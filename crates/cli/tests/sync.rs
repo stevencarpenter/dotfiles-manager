@@ -4433,6 +4433,58 @@ fn an_insteadof_rule_of_the_owner_rewrites_the_declared_url_too() {
     assert_eq!(git(&copy, &["rev-parse", "--short", "HEAD"]), after);
 }
 
+/// A HOME directory linked into the bound checkout, as `~/.config/tmux` is on the M5: a declared
+/// checkout below it lands in the bound checkout. Where the checkout's git ignores that path, the
+/// checkout is cloned and pulled; where it does not, it is a note and nothing is pulled.
+#[test]
+fn a_checkout_in_an_ignored_directory_of_the_bound_checkout_is_pulled() {
+    for ignored in [true, false] {
+        let u = Up::new(r#"["checkouts"]"#);
+        let seed = &u.fx.upstream.seed;
+        // The loader reads only the roots, so the clone's `.git` below `plugins` is not read.
+        put(
+            seed,
+            "base/bundle.toml",
+            &format!(
+                "{}\n[sources]\nroots = [\"base\", \"profiles\"]\n",
+                common::BUNDLE
+            ),
+        );
+        if ignored {
+            put(seed, ".gitignore", "plugins/\n");
+        }
+        u.fx.upstream.push("plugins");
+        fs::create_dir_all(u.fx.root.join("plugins")).unwrap();
+        fs::create_dir_all(u.fx.h(".config")).unwrap();
+        std::os::unix::fs::symlink(u.fx.root.join("plugins"), u.fx.h(".config/plugins")).unwrap();
+        let tool = Remote::new(u.fake.path(), "tool");
+        put(&tool.seed, "README", "v1\n");
+        tool.push("v1");
+        put(
+            seed,
+            "base/modules/extra/module.toml",
+            &format!(
+                "{}\n[[resources]]\nid = \"tool\"\nkind = \"package\"\nadapter = \"git-checkout/v1\"\n[resources.value]\nurl = \"{}\"\npath = \".config/plugins/tool\"\n",
+                common::EXTRA,
+                tool.origin()
+            ),
+        );
+        u.fx.upstream.push("declare the checkout");
+        let o = u.sync(&[]);
+        assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
+        let s = stdout(&o);
+        assert!(u.fx.root.join("plugins/tool/.git").exists(), "{s}");
+        let note = "is a dotfiles source checkout; sync updates it";
+        if ignored {
+            assert!(s.contains("  current checkouts"), "{s}");
+            assert!(!s.contains(note), "{s}");
+        } else {
+            assert!(s.contains("  blocked checkouts"), "{s}");
+            assert!(s.contains(note), "{s}");
+        }
+    }
+}
+
 /// DFM-25 (C04, G2, G6): without a grant for the registry origin, `agents` is a `blocked` row
 /// in the listing and in the run. Only read-only git runs: nothing is fetched or installed, and
 /// the rest of sync runs.
