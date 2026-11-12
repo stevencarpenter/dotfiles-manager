@@ -4638,7 +4638,7 @@ fn skills_runs_without_a_record_or_a_grant() {
     let s = stdout(&o);
     assert!(s.contains("  current skills"), "{s}");
     assert!(!s.contains("E_SOURCE_UNTRUSTED"), "{s}");
-    assert_eq!(u.log(), "mise exec -- npx skills@latest update\n");
+    assert_eq!(u.log(), "mise exec -- npx --yes skills@latest update\n");
 }
 
 #[test]

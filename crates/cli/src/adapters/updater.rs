@@ -242,7 +242,7 @@ pub fn run(u: Updater, env: &Env) -> Row {
             match call(
                 env.provider,
                 "mise",
-                &args(&["exec", "--", "npx", "skills@latest", "update"]),
+                &args(&["exec", "--", "npx", "--yes", "skills@latest", "update"]),
                 &npm_env(&[]),
                 env.timeouts.short,
             ) {
@@ -759,7 +759,7 @@ fn npm_names(env: &Env) -> Result<Vec<String>, String> {
     .map_err(|(n, _)| why(n))?;
     let v: serde_json::Value =
         serde_json::from_slice(&out.stdout).map_err(|e| why(format!("not JSON ({e})")))?;
-    // `npm` itself is held (see `npm_outdated`), so it needs no grant.
+    // `npm` itself is held (see `npm_outdated`), so it is left out of the names.
     Ok(v.get("dependencies")
         .and_then(|d| d.as_object())
         .map(|d| d.keys().filter(|n| *n != "npm").cloned().collect())
@@ -1551,7 +1551,7 @@ fn preview_command(u: Updater, env: &Env) -> String {
         },
         Updater::Skills => match env.provider.resolve("mise") {
             Ok(p) => format!(
-                "would run mise exec -- npx skills@latest update ({})",
+                "would run mise exec -- npx --yes skills@latest update ({})",
                 p.display()
             ),
             Err(e) => format!("blocked: {}", e.detail),
@@ -2827,10 +2827,10 @@ mod tests {
         let t = T::new();
         t.script(&t.bin.join("mise"), "exit 0");
         run(Updater::Skills, &t.env());
-        assert_eq!(t.calls(), ["mise exec -- npx skills@latest update"]);
+        assert_eq!(t.calls(), ["mise exec -- npx --yes skills@latest update"]);
         assert!(
             preview(Updater::Skills, &t.env())
-                .starts_with("would run mise exec -- npx skills@latest update"),
+                .starts_with("would run mise exec -- npx --yes skills@latest update"),
         );
     }
 
@@ -2879,7 +2879,7 @@ mod tests {
         );
         assert!(
             t.log()
-                .starts_with("mise exec -- npx skills@latest update |"),
+                .starts_with("mise exec -- npx --yes skills@latest update |"),
             "{}",
             t.log()
         );
