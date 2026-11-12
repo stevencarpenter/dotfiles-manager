@@ -41,6 +41,9 @@ pub struct Env<'a> {
     /// The declared `git-checkout/v1` checkouts that the `checkouts` updater fast-forwards. An
     /// `Err` is the note for a declaration that is not valid (`<id>: <reason>`).
     pub checkouts: &'a [Result<Checkout, String>],
+    /// The profile declares `agents`, which pulls its managed copy itself, so `checkouts`
+    /// leaves that copy out.
+    pub agents_declared: bool,
 }
 
 /// A declared `git-checkout/v1` checkout.
@@ -1251,9 +1254,8 @@ struct Upstream {
 }
 
 /// Reads the upstream with local git commands only; nothing is fetched. `noun` names the copy
-/// in the notes. `Ok(Err)` is the
-/// blocked reason (no upstream branch, or a remote url git cannot give); `Err` is a command
-/// that did not run or was stopped.
+/// in the notes. `Ok(Err)` is the blocked reason (no upstream branch, or a remote url git
+/// cannot give); `Err` is a command that did not run or was stopped.
 fn agents_upstream(
     env: &Env,
     copy: &Path,
@@ -1374,11 +1376,23 @@ fn side_channels(mut d: Draft, env: &Env) -> Row {
     }
 }
 
-/// `git -C <dir> <a>`; its trimmed standard output.
+/// `git -C <dir> <a>`; its trimmed standard output. As in the `git-checkout/v1` probe, git must
+/// not walk up from a `.git` that is not a repository to an enclosing one.
 fn git(env: &Env, dir: &Path, a: &[&str]) -> Result<String, (String, bool)> {
     let mut all = args(&["-C", &dir.display().to_string()]);
     all.extend(args(a));
-    let out = call(env.provider, "git", &all, &[], env.timeouts.short)?;
+    let ceiling: Vec<(String, String)> = dir
+        .parent()
+        .map(|p| p.canonicalize().unwrap_or(p.into()))
+        .map(|c| {
+            (
+                "GIT_CEILING_DIRECTORIES".to_string(),
+                c.display().to_string(),
+            )
+        })
+        .into_iter()
+        .collect();
+    let out = call(env.provider, "git", &all, &ceiling, env.timeouts.short)?;
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
@@ -1401,10 +1415,10 @@ fn agents_gate(env: &Env, copy: &Path, up: &Upstream) -> Option<String> {
 }
 
 /// Fast-forwards the clean copy at `copy` from its upstream, after `gate` passed for that
-/// upstream. `noun` names the copy in the notes. `before` gets the revision that is read first. `Ok(Ok(after))` is the revision
-/// after the pull. `Ok(Err)` is the blocked note (dirty, no upstream, the gate, or diverged),
-/// and nothing changed. `Err` is a command that did not succeed. Nothing here merges, resets
-/// or clones.
+/// upstream. `noun` names the copy in the notes. `before` gets the revision that is read
+/// first. `Ok(Ok(after))` is the revision after the pull. `Ok(Err)` is the blocked note
+/// (dirty, no upstream, the gate, or diverged), and nothing changed. `Err` is a command that
+/// did not succeed. Nothing here merges, resets or clones.
 fn fast_forward(
     env: &Env,
     copy: &Path,
@@ -1447,14 +1461,14 @@ fn fast_forward(
     git(env, copy, &["rev-parse", "--short", "HEAD"]).map(Ok)
 }
 
-/// The declared checkouts that the `checkouts` updater pulls: each one but the `agents` managed
-/// copy, which the `agents` updater pulls before its install.
+/// The declared checkouts that the `checkouts` updater pulls. When the profile declares
+/// `agents`, its managed copy is left out: the `agents` updater pulls it before its install.
 fn declared_checkouts<'e>(env: &'e Env) -> impl Iterator<Item = &'e Checkout> {
-    let agents = agents_copy(env).0;
+    let agents = env.agents_declared.then(|| agents_copy(env).0);
     env.checkouts
         .iter()
         .flatten()
-        .filter(move |c| c.path != agents)
+        .filter(move |c| agents.as_ref() != Some(&c.path))
 }
 
 /// Fast-forwards each declared checkout, one note each. A blocked or failed checkout does not
@@ -1613,14 +1627,21 @@ fn preview_command(u: Updater, env: &Env) -> String {
                 let paths: Vec<String> = declared_checkouts(env)
                     .map(|c| c.path.display().to_string())
                     .collect();
-                if paths.is_empty() {
-                    "nothing declared".into()
-                } else {
-                    format!(
-                        "would fast-forward {} checkouts ({})",
-                        paths.len(),
+                // An invalid declaration blocks the row, so the preview counts it.
+                let invalid = env.checkouts.iter().filter(|c| c.is_err()).count();
+                let plural = |n: usize| if n == 1 { "" } else { "s" };
+                let would = match paths.len() {
+                    0 if invalid == 0 => return "nothing declared".into(),
+                    0 => "would fast-forward no checkout".to_string(),
+                    n => format!(
+                        "would fast-forward {n} checkout{} ({})",
+                        plural(n),
                         paths.join(", ")
-                    )
+                    ),
+                };
+                match invalid {
+                    0 => would,
+                    n => format!("{would}; {n} declaration{} invalid", plural(n)),
                 }
             }
         },
@@ -1723,6 +1744,7 @@ mod tests {
         runner: Runner,
         grants: Grants,
         checkouts: Vec<Result<Checkout, String>>,
+        agents_declared: bool,
     }
 
     /// The registry remote that [`T::managed`] records, and its identity.
@@ -1783,6 +1805,7 @@ mod tests {
                 runner,
                 grants,
                 checkouts: vec![],
+                agents_declared: false,
             }
         }
 
@@ -1817,6 +1840,7 @@ mod tests {
                 timeouts: Timeouts::DEFAULT,
                 grants: &self.grants,
                 checkouts: &self.checkouts,
+                agents_declared: self.agents_declared,
             }
         }
 
@@ -2119,6 +2143,7 @@ mod tests {
     fn checkouts_skips_the_agents_managed_copy() {
         let mut t = T::new();
         t.checkouts_git();
+        t.agents_declared = true;
         let copy = t.managed();
         t.checkouts.push(Ok(Checkout {
             id: "agent-registry".into(),
@@ -2130,6 +2155,47 @@ mod tests {
         assert!(r.notes.is_empty(), "{r:?}");
         assert_eq!(t.log(), "");
         assert_eq!(preview(Updater::Checkouts, &t.env()), "nothing declared");
+    }
+
+    #[test]
+    fn checkouts_pulls_the_managed_copy_when_agents_is_not_declared() {
+        let mut t = T::new();
+        t.checkouts_git();
+        let copy = t.managed();
+        let st = t.root.join("st/agent-registry");
+        fs::create_dir_all(&st).unwrap();
+        fs::write(st.join("rev"), "a1b2c3d").unwrap();
+        fs::write(st.join("rev-after"), "d4e5f6a").unwrap();
+        t.checkouts.push(Ok(Checkout {
+            id: "agent-registry".into(),
+            url: "https://github.com/o/agent-registry.git".into(),
+            path: copy.clone(),
+        }));
+        assert_eq!(
+            preview(Updater::Checkouts, &t.env()),
+            format!("would fast-forward 1 checkout ({})", copy.display())
+        );
+        let r = run(Updater::Checkouts, &t.env());
+        assert_eq!(r.status, Status::Updated, "{r:?}");
+        assert_eq!(r.notes, ["agent-registry a1b2c3d -> d4e5f6a"]);
+        assert_eq!(t.calls(), checkout_calls(&copy));
+    }
+
+    #[test]
+    fn git_for_a_copy_stops_at_the_copy_parent() {
+        let mut t = T::new();
+        let ceiling = t.root.join("st/ceiling");
+        t.script(
+            &t.bin.join("git"),
+            "printf '%s\\n' \"$GIT_CEILING_DIRECTORIES\" >> \"$st/ceiling\"; exit 2",
+        );
+        // `agents` runs its git commands through the same `git` helper.
+        let path = t.checkout("tpm", "a1b2c3d", "a1b2c3d");
+        run(Updater::Checkouts, &t.env());
+        assert_eq!(
+            fs::read_to_string(&ceiling).unwrap(),
+            format!("{}\n", path.parent().unwrap().display())
+        );
     }
 
     #[test]
@@ -2219,6 +2285,14 @@ mod tests {
             "extra.bad: url o/r is not an https:// or ssh remote".into()
         ));
         t.checkout("moved", "a1b2c3d", "d4e5f6a");
+        let moved = t.home.join("src/moved");
+        assert_eq!(
+            preview(Updater::Checkouts, &t.env()),
+            format!(
+                "would fast-forward 1 checkout ({}); 1 declaration invalid",
+                moved.display()
+            )
+        );
         let r = run(Updater::Checkouts, &t.env());
         assert_eq!(r.status, Status::Blocked, "{r:?}");
         assert_eq!(

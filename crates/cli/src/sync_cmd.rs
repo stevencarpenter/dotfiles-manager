@@ -2229,7 +2229,7 @@ fn updater_env<'a>(
     runner: &'a Runner,
     root: &'a Path,
     grants: &'a Grants,
-    checkouts: &'a [Result<updater::Checkout, String>],
+    (checkouts, agents_declared): (&'a [Result<updater::Checkout, String>], bool),
 ) -> updater::Env<'a> {
     updater::Env {
         provider: runner,
@@ -2238,17 +2238,23 @@ fn updater_env<'a>(
         timeouts: updater::Timeouts::DEFAULT,
         grants,
         checkouts,
+        agents_declared,
     }
 }
 
-/// The `git-checkout/v1` resources of the profile. A declaration that is not valid is a note
-/// of the `checkouts` row, so the other updaters still run.
-fn declared_checkouts(home: &Path, resolved: &Resolved) -> Vec<Result<updater::Checkout, String>> {
+/// The `git-checkout/v1` resources of the profile. A declaration that is not valid, or one at or
+/// inside a source checkout in `sources` (sync fast-forwards those), is a note of the
+/// `checkouts` row, so the other updaters still run.
+fn declared_checkouts(
+    home: &Path,
+    resolved: &Resolved,
+    sources: &[PathBuf],
+) -> Vec<Result<updater::Checkout, String>> {
     resolved
         .resources
         .values()
         .filter(|r| r.adapter == checkout::ADAPTER)
-        .map(|r| declared_checkout(home, &r.id, &r.value))
+        .map(|r| declared_checkout(home, &r.id, &r.value, sources))
         .collect()
 }
 
@@ -2257,12 +2263,21 @@ fn declared_checkout(
     home: &Path,
     id: &str,
     value: &dfm_model::resolve::Value,
+    sources: &[PathBuf],
 ) -> Result<updater::Checkout, String> {
     let d = checkout::declared(value).map_err(|e| format!("{id}: {}", e.detail))?;
+    let path = home.join(d.path);
+    let real = |p: &Path| fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    if sources.iter().any(|s| real(&path).starts_with(real(s))) {
+        return Err(format!(
+            "{id}: {} is a dotfiles source checkout; sync updates it",
+            path.display()
+        ));
+    }
     Ok(updater::Checkout {
         id: id.to_string(),
         url: d.url,
-        path: home.join(d.path),
+        path,
     })
 }
 
@@ -2361,8 +2376,10 @@ fn upgrade_preview(
         return writeln!(out, "upgrade: none declared in the profile").map_err(w);
     }
     let runner = ctx.runner(sys);
-    let checkouts = declared_checkouts(ctx.platform.home(), resolved);
-    let env = updater_env(ctx, &runner, root, grants, &checkouts);
+    // A declared checkout at a source checkout is left to sync's own fast-forward.
+    let checkouts = declared_checkouts(ctx.platform.home(), resolved, &guarded_checkouts(root)?);
+    let agents = updaters.contains(&Updater::Agents);
+    let env = updater_env(ctx, &runner, root, grants, (&checkouts, agents));
     writeln!(out, "{}", paint::label(ctx.color, "upgrade:")).map_err(w)?;
     for u in updaters {
         writeln!(
@@ -2435,12 +2452,13 @@ fn upgrade(
     let started = now_ns()?;
     let mut runner = ctx.runner(sys);
     runner.detach = true;
-    let declared = declared_checkouts(ctx.platform.home(), &resolved);
-    let env = updater_env(ctx, &runner, root, &grants, &declared);
+    let checkouts = guarded_checkouts(root)?;
+    let declared = declared_checkouts(ctx.platform.home(), &resolved, &checkouts);
+    let agents = updaters.contains(&Updater::Agents);
+    let env = updater_env(ctx, &runner, root, &grants, (&declared, agents));
     // The tracked-file guard (DFM-25, G5): the tracked changes before the updaters, compared
     // after each one that ran. A change it made fails its row and stays in place.
     let git = Git::new(ctx, sys);
-    let checkouts = guarded_checkouts(root)?;
     let mut tracked = tracked_status(&git, &checkouts)?;
     writeln!(out, "{}", paint::label(ctx.color, "upgrade:")).map_err(w)?;
     let mut ops = Vec::new();
@@ -2591,15 +2609,44 @@ mod tests {
             )
         };
         assert_eq!(
-            declared_checkout(home, "extra.r", &value("https://github.com/o/r.git")),
+            declared_checkout(home, "extra.r", &value("https://github.com/o/r.git"), &[]),
             Ok(updater::Checkout {
                 id: "extra.r".into(),
                 url: "https://github.com/o/r.git".into(),
                 path: home.join("x/r"),
             })
         );
-        let e = declared_checkout(home, "extra.bad", &value("o/r")).unwrap_err();
+        let e = declared_checkout(home, "extra.bad", &value("o/r"), &[]).unwrap_err();
         assert!(e.starts_with("extra.bad: url "), "{e}");
+    }
+
+    #[test]
+    fn a_checkout_at_or_inside_a_source_checkout_is_a_note() {
+        let home = Path::new("/h");
+        let at = |path: &str| {
+            let v = dfm_model::resolve::Value::Table(
+                toml::from_str(&format!(
+                    "url = \"https://github.com/o/r.git\"\npath = {path:?}\n"
+                ))
+                .unwrap(),
+            );
+            declared_checkout(
+                home,
+                "extra.r",
+                &v,
+                &[home.join("dots"), home.join("ext/nested")],
+            )
+        };
+        for path in ["dots", "dots/sub", "ext/nested"] {
+            assert_eq!(
+                at(path),
+                Err(format!(
+                    "extra.r: /h/{path} is a dotfiles source checkout; sync updates it"
+                ))
+            );
+        }
+        assert!(at("dotsy").is_ok());
+        assert!(at("ext").is_ok());
     }
     #[test]
     fn redirects_and_http_alternates_stay_disabled() {

@@ -145,9 +145,10 @@ if grep -qx "$3" "$here/../installed-apt" 2>/dev/null; then printf 'install ok i
 echo "dpkg-query: no packages found matching $3" >&2; exit 1
 "#;
 
-/// `git -C <dir> config --get remote.origin.url` prints `<dir>/.git/origin` (exit 1 without it),
-/// `git -C <dir> rev-parse ...` prints a short commit, and `git clone [--branch <b>] <url> <dir>`
-/// makes `<dir>/.git/origin` and `head` (then exits 128 with a `clone-fails` marker); `rev-parse` fails without `head`. Every call logs its arguments and `GIT_TERMINAL_PROMPT`.
+/// `git -C <dir> config --get remote.origin.url` prints `<dir>/.git/origin` (exit 1 without
+/// it). `git -C <dir> rev-parse ...` prints `<dir>/.git/head` and fails without it. `git clone
+/// [--branch <b>] <url> <dir>` makes `<dir>/.git/origin` and `head`, then exits 128 when the
+/// `clone-fails` marker exists. Every call logs its arguments and `GIT_TERMINAL_PROMPT`.
 const FAKE_GIT: &str = r#"#!/bin/sh
 PATH=/usr/bin:/bin:$PATH
 here=$(dirname "$0")
@@ -1230,6 +1231,12 @@ fn a_checkout_of_another_repository_is_another_owner() {
         "{}",
         stderr(&o)
     );
+    assert!(
+        stderr(&o)
+            .contains("move or remove ~/x/r, or point the declaration at the repository it holds"),
+        "{}",
+        stderr(&o)
+    );
     assert!(clones(&fx).is_empty(), "{}", fx.log());
 }
 
@@ -1285,6 +1292,27 @@ fn a_failing_clone_leaves_nothing_and_the_install_stays_planned() {
         "{}",
         text(&o.stdout)
     );
+}
+
+#[test]
+fn the_stale_clone_cleanup_removes_only_directories() {
+    let fx = checkout_fx("https://github.com/o/r.git", "");
+    let parent = fx.home.path().join("x");
+    fs::create_dir_all(parent.join(".r.dfm-clone-1/.git")).unwrap();
+    fs::write(parent.join(".r.dfm-clone-file"), "mine").unwrap();
+    let elsewhere = fx.home.path().join("elsewhere");
+    fs::create_dir_all(&elsewhere).unwrap();
+    fs::write(elsewhere.join("keep"), "mine").unwrap();
+    std::os::unix::fs::symlink(&elsewhere, parent.join(".r.dfm-clone-link")).unwrap();
+    let o = fx.packages(&digest_of(&fx.preview()));
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+    assert!(!parent.join(".r.dfm-clone-1").exists());
+    assert_eq!(
+        fs::read_to_string(parent.join(".r.dfm-clone-file")).unwrap(),
+        "mine"
+    );
+    assert!(fs::symlink_metadata(parent.join(".r.dfm-clone-link")).is_ok());
+    assert_eq!(fs::read_to_string(elsewhere.join("keep")).unwrap(), "mine");
 }
 
 #[test]

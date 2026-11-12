@@ -169,7 +169,9 @@ pub(crate) fn install(runner: &Runner, value: &Value) -> Result<(), Refusal> {
     let prefix = format!(".{name}.dfm-clone-");
     for e in fs::read_dir(parent).map_err(|e| io(parent, e))? {
         let e = e.map_err(|e| io(parent, e))?;
-        if e.file_name().to_string_lossy().starts_with(&prefix) {
+        // Only a directory is a stale clone; a file or a link of that name is left alone.
+        let dir = fs::symlink_metadata(e.path()).is_ok_and(|m| m.is_dir());
+        if dir && e.file_name().to_string_lossy().starts_with(&prefix) {
             fs::remove_dir_all(e.path()).map_err(|x| io(&e.path(), x))?;
         }
     }

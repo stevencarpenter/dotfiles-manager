@@ -4341,7 +4341,7 @@ fn sync_clones_a_declared_checkout_then_fast_forwards_it() {
     assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
     let s = stdout(&o);
     assert!(
-        s.contains("  checkouts: would fast-forward 1 checkouts ("),
+        s.contains("  checkouts: would fast-forward 1 checkout ("),
         "{s}"
     );
     assert!(s.contains("  updated checkouts"), "{s}");

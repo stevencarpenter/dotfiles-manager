@@ -1425,6 +1425,16 @@ impl Planner<'_> {
                 self.blocker(r, None, f);
             }
             Some(PackageState::OtherOwner(why)) => {
+                // A checkout path holds a directory, not another provider's package.
+                let fix: std::borrow::Cow<'static, str> = match r.value.get("path") {
+                    Some(Value::String(p)) if r.adapter == "git-checkout/v1" => format!(
+                        "move or remove ~/{p}, or point the declaration at the repository it holds"
+                    )
+                    .into(),
+                    _ => {
+                        "remove the other installation, or declare the adapter that owns it".into()
+                    }
+                };
                 let f = fail(
                     Code::Conflict,
                     "/name",
@@ -1432,7 +1442,7 @@ impl Planner<'_> {
                         "{name} is declared for {} but {why}; a declared owner is not permission to replace another owner",
                         r.adapter
                     ),
-                    "remove the other installation, or declare the adapter that owns it",
+                    fix,
                 );
                 op.effect = format!("blocked: {}", f.detail);
                 self.blocker(r, None, f);
