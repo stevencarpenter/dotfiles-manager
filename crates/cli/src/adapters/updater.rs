@@ -619,14 +619,18 @@ fn mise_files(env: &Env) -> Result<Vec<PathBuf>, String> {
 /// `Err` is a note that blocks the row: a listing that fails, a file that cannot be read or
 /// parsed, a backend that maps to no identity, and any configuration that can point a tool at
 /// another source (a `[plugins]`, `[tool_alias]` or `[alias]` entry, a tool option outside
-/// the allowlist, or a setting whose name contains `url` or `registry`).
+/// the allowlist, a setting other than `trusted_config_paths`, a non-empty `[env]`, or a
+/// lockfile beside a listed file).
 fn mise_identities(env: &Env) -> Vec<Result<String, String>> {
     let files = match mise_files(env) {
         Ok(f) => f,
         Err(why) => return vec![Err(why)],
     };
     let mut ids = Vec::new();
+    // One note per lockfile, also when several listed files share its directory.
+    let mut locks = BTreeSet::new();
     for file in files {
+        locks.extend(mise_locks(&file));
         let at = file.display();
         let text = match std::fs::read_to_string(&file) {
             Ok(t) => t,
@@ -666,6 +670,14 @@ fn mise_identities(env: &Env) -> Vec<Result<String, String>> {
                 )));
             }
         }
+        if doc
+            .get("env")
+            .is_some_and(|t| t.as_table().is_none_or(|t| !t.is_empty()))
+        {
+            ids.push(Err(format!(
+                "{at}: the [env] table reaches the commands mise runs to fetch, such as npm_config_registry or GOPROXY; remove it"
+            )));
+        }
         if let Some(settings) = doc.get("settings").and_then(|t| t.as_table()) {
             mise_settings(&file, "settings", settings, &mut ids);
         }
@@ -674,10 +686,59 @@ fn mise_identities(env: &Env) -> Vec<Result<String, String>> {
             ids.extend(mise_tool(&file, key, Some(value)));
         }
     }
+    ids.extend(locks.into_iter().map(Err));
     ids
 }
 
-/// One note per setting under `t`, at any depth, whose name contains `url` or `registry`.
+/// One note per lockfile mise can pair with `file`: in its directory (and, for a `conf.d`
+/// file, the directory above), a `mise*.lock` or `.mise*.lock` (`mise.lock`,
+/// `mise.local.lock`, `mise.<env>.lock`) or `<stem>.lock`. A lockfile can record a download
+/// url that the gate never reads. A directory that exists but cannot be listed is a note too.
+fn mise_locks(file: &Path) -> Vec<String> {
+    let stem = file
+        .file_stem()
+        .map(|s| format!("{}.lock", s.to_string_lossy()));
+    let dir = file.parent().unwrap_or(Path::new("/"));
+    let mut dirs = vec![dir];
+    if dir.file_name().is_some_and(|n| n == "conf.d")
+        && let Some(up) = dir.parent()
+    {
+        dirs.push(up);
+    }
+    let mut notes = Vec::new();
+    for d in dirs {
+        let entries = match std::fs::read_dir(d) {
+            Ok(e) => e,
+            // No directory holds no lockfile; the missing file is its own note.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => {
+                notes.push(format!(
+                    "cannot list {} for a mise lockfile: {e}",
+                    d.display()
+                ));
+                continue;
+            }
+        };
+        for e in entries.filter_map(Result::ok) {
+            let name = e.file_name().to_string_lossy().into_owned();
+            let paired = name.ends_with(".lock")
+                && (name.starts_with("mise")
+                    || name.starts_with(".mise")
+                    || stem.as_deref() == Some(name.as_str()));
+            if paired {
+                notes.push(format!(
+                    "{}: a mise lockfile can record a download url that dfm does not check; remove it",
+                    e.path().display()
+                ));
+            }
+        }
+    }
+    notes
+}
+
+/// One note per setting under `t`, at any depth, other than `trusted_config_paths`: many
+/// settings move a fetch (`go.download_mirror`, `github.enterprise_hosts`, `aqua.registry_url`)
+/// without a telling name, so only the one setting the live files use is allowed.
 fn mise_settings(
     file: &Path,
     prefix: &str,
@@ -686,14 +747,13 @@ fn mise_settings(
 ) {
     for (k, v) in t {
         let name = format!("{prefix}.{k}");
-        let lower = k.to_ascii_lowercase();
-        if lower.contains("url") || lower.contains("registry") {
+        if let Some(sub) = v.as_table() {
+            mise_settings(file, &name, sub, ids);
+        } else if name != "settings.trusted_config_paths" {
             ids.push(Err(format!(
-                "{}: the mise setting {name} can change where tools are fetched from; remove it",
+                "{}: the mise setting {name} is not one dfm allows (only settings.trusted_config_paths), because a setting can change where tools are fetched from; remove it",
                 file.display()
             )));
-        } else if let Some(sub) = v.as_table() {
-            mise_settings(file, &name, sub, ids);
         }
     }
 }
@@ -1644,7 +1704,7 @@ fn preview_command(u: Updater, env: &Env) -> String {
         },
         Updater::Mise => match env.provider.resolve("mise") {
             Ok(p) => format!(
-                "would run mise install, mise outdated --json, mise upgrade ({})",
+                "would run mise config ls --json, mise install, mise outdated --json, mise upgrade ({})",
                 p.display()
             ),
             Err(e) => format!("blocked: {}", e.detail),
@@ -2883,7 +2943,12 @@ mod tests {
                 "mise outdated --json"
             ]
         );
-        assert!(preview(Updater::Mise, &t.env()).contains("mise install, mise outdated"));
+        assert!(
+            preview(Updater::Mise, &t.env())
+                .starts_with("would run mise config ls --json, mise install, mise outdated"),
+            "{}",
+            preview(Updater::Mise, &t.env())
+        );
     }
 
     #[test]
@@ -3056,6 +3121,61 @@ mod tests {
         // github:o/r and ubi:o/r are one identity without a grant; the allowed options add no
         // note.
         assert_eq!(notes.len(), 6, "{notes:?}");
+    }
+
+    #[test]
+    fn mise_with_a_setting_outside_the_allowlist_is_blocked() {
+        let t = T::new();
+        t.mise(MISE_TWO, "{}");
+        // None of these names says url or registry, and each one moves a fetch.
+        t.mise_config(
+            "config.toml",
+            "[settings]\ntrusted_config_paths = [\"~/x\"]\n[settings.go]\ndownload_mirror = \"https://h\"\n[settings.github]\nenterprise_hosts = [\"h\"]\n",
+        );
+        let notes = mise_blocked(&t);
+        assert_eq!(notes.len(), 2, "{notes:?}");
+        let has = |a: &str| {
+            notes
+                .iter()
+                .any(|n| n.contains("config.toml") && n.contains(a))
+        };
+        assert!(has("settings.go.download_mirror"), "{notes:?}");
+        assert!(has("settings.github.enterprise_hosts"), "{notes:?}");
+    }
+
+    #[test]
+    fn mise_with_an_env_table_is_blocked() {
+        let t = T::new();
+        t.mise(MISE_TWO, "{}");
+        t.mise_config("config.toml", "[env]\nGOPROXY = \"https://h\"\n");
+        t.mise_config("conf.d/empty.toml", "[env]\n");
+        let notes = mise_blocked(&t);
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert!(
+            notes[0].contains("config.toml") && notes[0].contains("[env]"),
+            "{notes:?}"
+        );
+    }
+
+    #[test]
+    fn mise_with_a_lockfile_beside_a_gated_file_is_blocked() {
+        for (config, lock) in [
+            ("config.toml", "mise.lock"),
+            ("conf.d/dev.toml", "mise.lock"),
+            ("mise.local.toml", "mise.local.lock"),
+        ] {
+            let t = T::new();
+            t.mise(MISE_TWO, "{}");
+            t.mise_config(config, "[tools]\nnode = \"22\"\n");
+            let path = t.home.join(".config/mise").join(lock);
+            fs::write(&path, "[[tools.node]]\nversion = \"22.0.0\"\n").unwrap();
+            let notes = mise_blocked(&t);
+            assert_eq!(notes.len(), 1, "{config}: {notes:?}");
+            assert!(
+                notes[0].contains(&path.display().to_string()),
+                "{config}: {notes:?}"
+            );
+        }
     }
 
     #[test]

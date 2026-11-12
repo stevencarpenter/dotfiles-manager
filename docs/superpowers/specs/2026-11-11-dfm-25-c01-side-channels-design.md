@@ -81,14 +81,25 @@ Owner decision, 2026-11-11: the fantasy-sports repository (`ssh://git@github.com
 
 ### mise sources
 
-Owner decision, 2026-11-11: `mise install` and `mise upgrade` are gated. Before any mise command, the `mise` updater reads the tools of the global configuration (`~/.config/mise/config.toml` and `conf.d/`) without running mise, and maps each tool of a non-registry backend to an identity:
+Owner decision, 2026-11-11: `mise install` and `mise upgrade` are gated. Before any mise command that fetches, the `mise` updater runs `mise config ls --json` with the runner, directory and environment of `mise install`. That listing reads local files only. The updater reads every file it lists (a `.tool-versions` file as `<tool> <version>` lines) and maps each tool of a non-registry backend to an identity:
 
 - `github:o/r` and `ubi:o/r` map to `https://github.com/o/r`.
 - `npm:<name>` maps to `npm:<name>`.
 - `go:<module path>` maps to its own identity `go:<module path>`, stored in `packages` beside `npm:`. A module path is a lowercase host with a dot and a path, with no version.
 - A tool of another backend (`vfox:`, `cargo:`, `pipx:`, `aqua:`, `asdf:` and the others) is handled as the builder finds the registry maps it: a backend with no mapping is `E_SOURCE_UNTRUSTED`. A short name of mise's registry (`go`, `java`, `rust-analyzer`) is not gated, because mise's registry is its owner, as Homebrew's official formulae are.
 
-One ungranted identity blocks the whole row before any mise command, with one note per identity, as for `skills` (trust design, anti-goal "a partial updater run"). This changes DFM-85's rule that mise is not gated. docs/upgrade.md ("Source trust") and docs/toolchains.md change with it. The current live tools need grants once, on the first sync after the slice; the slice's PR description lists the `--trust-origin` commands for the M5's current config.
+Each of these also blocks the row, with one note that names the file and the entry, because each one can move a fetch away from the checked identity:
+
+- A listing that fails, or a listed file that cannot be read or parsed.
+- A non-empty `[plugins]`, `[tool_alias]` or `[alias]` table.
+- A tool option other than `version` or `minimum_release_age` in a value table, or other than `exe`, `bin` or `matching` in a `[...]` key suffix.
+- Any setting under `[settings]`, at any depth, other than `trusted_config_paths`.
+- A non-empty `[env]` table: mise passes it to the commands it runs, so `npm_config_registry` or `GOPROXY` there would move a granted fetch.
+- A lockfile beside a listed file (`mise.lock`, `mise.local.lock`, `mise.<env>.lock`, `.mise*.lock` or `<stem>.lock`, and for a `conf.d` file the directory above), because it can record a download url.
+
+Every mise command then runs with the default npm registry, also for each `npm:@scope` the files name, so an `npm:` grant covers that registry only. A `go:` grant names a module, and `GOPROXY` decides where it is downloaded from.
+
+One ungranted identity blocks the whole row before any mise command that fetches, with one note per identity, as for `skills` (trust design, anti-goal "a partial updater run"). This changes DFM-85's rule that mise is not gated. docs/upgrade.md ("Source trust") and docs/toolchains.md change with it. The current live tools need grants once, on the first sync after the slice; the slice's PR description lists the `--trust-origin` commands for the M5's current config.
 
 ### Firstmate
 
