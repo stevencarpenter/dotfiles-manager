@@ -38,8 +38,9 @@ pub struct Env<'a> {
     /// The grants that the `skills` and `agents` sources must hold (docs/upgrade.md, "Source
     /// trust").
     pub grants: &'a Grants,
-    /// The declared `git-checkout/v1` checkouts that the `checkouts` updater fast-forwards.
-    pub checkouts: &'a [Checkout],
+    /// The declared `git-checkout/v1` checkouts that the `checkouts` updater fast-forwards. An
+    /// `Err` is the note for a declaration that is not valid (`<id>: <reason>`).
+    pub checkouts: &'a [Result<Checkout, String>],
 }
 
 /// A declared `git-checkout/v1` checkout.
@@ -1231,7 +1232,7 @@ pub fn trust_notes(u: Updater, env: &Env) -> Vec<String> {
             if working || std::fs::symlink_metadata(copy.join(".git")).is_err() {
                 return vec![];
             }
-            match agents_upstream(env, &copy) {
+            match agents_upstream(env, &copy, AGENTS_NOUN) {
                 Ok(Ok(up)) => agents_gate(env, &copy, &up).into_iter().collect(),
                 Ok(Err(why)) | Err((why, _)) => vec![why],
             }
@@ -1249,13 +1250,18 @@ struct Upstream {
     url: String,
 }
 
-/// Reads the upstream with local git commands only; nothing is fetched. `Ok(Err)` is the
+/// Reads the upstream with local git commands only; nothing is fetched. `noun` names the copy
+/// in the notes. `Ok(Err)` is the
 /// blocked reason (no upstream branch, or a remote url git cannot give); `Err` is a command
 /// that did not run or was stopped.
-fn agents_upstream(env: &Env, copy: &Path) -> Result<Result<Upstream, String>, (String, bool)> {
+fn agents_upstream(
+    env: &Env,
+    copy: &Path,
+    noun: &str,
+) -> Result<Result<Upstream, String>, (String, bool)> {
     let none = || {
         format!(
-            "the managed copy {} has no upstream branch; not pulled",
+            "the {noun} {} has no upstream branch; not pulled",
             copy.display()
         )
     };
@@ -1298,6 +1304,8 @@ fn agents_upstream(env: &Env, copy: &Path) -> Result<Result<Upstream, String>, (
 const AGENTS_WORKING: &str = "projects/agents";
 const AGENTS_MANAGED: &str = ".local/share/agent-registry";
 const AGENTS_INSTALL: &str = "install-agent-registry.sh";
+/// The agent registry's managed copy in the notes.
+const AGENTS_NOUN: &str = "managed copy";
 
 /// The copy to install from: the working copy when it holds `pyproject.toml`, else the managed
 /// copy. `true` marks the working copy.
@@ -1383,6 +1391,7 @@ fn agents_gate(env: &Env, copy: &Path, up: &Upstream) -> Option<String> {
         && env
             .checkouts
             .iter()
+            .flatten()
             .any(|c| c.path == copy && git_id(&c.url).as_ref() == Ok(i))
     {
         return None;
@@ -1392,13 +1401,14 @@ fn agents_gate(env: &Env, copy: &Path, up: &Upstream) -> Option<String> {
 }
 
 /// Fast-forwards the clean copy at `copy` from its upstream, after `gate` passed for that
-/// upstream. `before` gets the revision that is read first. `Ok(Ok(after))` is the revision
+/// upstream. `noun` names the copy in the notes. `before` gets the revision that is read first. `Ok(Ok(after))` is the revision
 /// after the pull. `Ok(Err)` is the blocked note (dirty, no upstream, the gate, or diverged),
 /// and nothing changed. `Err` is a command that did not succeed. Nothing here merges, resets
 /// or clones.
 fn fast_forward(
     env: &Env,
     copy: &Path,
+    noun: &str,
     before: &mut Option<String>,
     gate: impl Fn(&Upstream) -> Option<String>,
 ) -> Result<Result<String, String>, (String, bool)> {
@@ -1406,12 +1416,12 @@ fn fast_forward(
     *before = Some(git(env, copy, &["rev-parse", "--short", "HEAD"])?);
     if !git(env, copy, &["status", "--porcelain"])?.is_empty() {
         return Ok(Err(format!(
-            "managed copy {} has uncommitted changes; not pulled",
+            "{noun} {} has uncommitted changes; not pulled",
             copy.display()
         )));
     }
     // No upstream is a precondition, like a missing copy: nothing to fast-forward from.
-    let up = match agents_upstream(env, copy)? {
+    let up = match agents_upstream(env, copy, noun)? {
         Ok(up) => up,
         Err(why) => return Ok(Err(why)),
     };
@@ -1425,7 +1435,7 @@ fn fast_forward(
     let n = git(env, copy, &["rev-list", "--count", "@{u}..HEAD"])?;
     if n != "0" {
         return Ok(Err(format!(
-            "managed copy {} has {n} local commits that are not on its upstream; not pulled",
+            "{noun} {} has {n} local commits that are not on its upstream; not pulled",
             copy.display()
         )));
     }
@@ -1441,12 +1451,16 @@ fn fast_forward(
 /// copy, which the `agents` updater pulls before its install.
 fn declared_checkouts<'e>(env: &'e Env) -> impl Iterator<Item = &'e Checkout> {
     let agents = agents_copy(env).0;
-    env.checkouts.iter().filter(move |c| c.path != agents)
+    env.checkouts
+        .iter()
+        .flatten()
+        .filter(move |c| c.path != agents)
 }
 
 /// Fast-forwards each declared checkout, one note each. A blocked or failed checkout does not
 /// stop the others. The row is the worst of them: `failed`, then `blocked`, then `updated`,
-/// then `current`. A declared checkout needs no grant: the owner declared it.
+/// then `current`. A declared checkout needs no grant: the owner declared it. Its upstream must
+/// have the declared url's identity, else it is blocked.
 fn checkouts(mut d: Draft, env: &Env) -> Row {
     if let Err(e) = env.provider.resolve("git") {
         d.notes.push(e.detail);
@@ -1458,7 +1472,18 @@ fn checkouts(mut d: Draft, env: &Env) -> Row {
         Status::Updated => 1,
         _ => 0,
     };
-    let mut status = Status::Current;
+    // A declaration that is not valid is noted; the others still run.
+    let invalid: Vec<&String> = env
+        .checkouts
+        .iter()
+        .filter_map(|c| c.as_ref().err())
+        .collect();
+    let mut status = if invalid.is_empty() {
+        Status::Current
+    } else {
+        Status::Blocked
+    };
+    d.notes.extend(invalid.into_iter().cloned());
     for c in declared_checkouts(env) {
         if std::fs::symlink_metadata(c.path.join(".git")).is_err() {
             d.notes.push(format!(
@@ -1468,7 +1493,18 @@ fn checkouts(mut d: Draft, env: &Env) -> Row {
             continue;
         }
         let mut before = None;
-        let (note, s) = match fast_forward(env, &c.path, &mut before, |_| None) {
+        // No grant: the owner declared the url. The upstream must fetch from that url.
+        let declared = |up: &Upstream| match (git_id(&up.url), git_id(&c.url)) {
+            (Ok(a), Ok(b)) if a == b => None,
+            _ => Some(format!(
+                "{}: {} fetches {}, not the declared {}; not pulled",
+                c.id,
+                c.path.display(),
+                up.url,
+                c.url
+            )),
+        };
+        let (note, s) = match fast_forward(env, &c.path, "checkout", &mut before, declared) {
             Ok(Ok(after)) => match before {
                 Some(b) if b != after => (format!("{} {b} -> {after}", c.id), Status::Updated),
                 _ => (format!("{} current at {after}", c.id), Status::Current),
@@ -1529,7 +1565,9 @@ fn agents(mut d: Draft, env: &Env) -> Row {
         ));
         d.after = d.before.clone();
     } else {
-        match fast_forward(env, &copy, &mut d.before, |up| agents_gate(env, &copy, up)) {
+        match fast_forward(env, &copy, AGENTS_NOUN, &mut d.before, |up| {
+            agents_gate(env, &copy, up)
+        }) {
             Ok(Ok(after)) => d.after = Some(after),
             Ok(Err(why)) => {
                 d.notes.push(why);
@@ -1684,7 +1722,7 @@ mod tests {
         bin: PathBuf,
         runner: Runner,
         grants: Grants,
-        checkouts: Vec<Checkout>,
+        checkouts: Vec<Result<Checkout, String>>,
     }
 
     /// The registry remote that [`T::managed`] records, and its identity.
@@ -1957,12 +1995,13 @@ mod tests {
     impl T {
         /// `git` for declared checkouts: each one is the directory `<home>/src/<id>`, and its
         /// state is under `st/<id>`: `rev`, `rev-after` (copied over `rev` by `pull`),
-        /// `porcelain`, and `fail-<command>` that makes that command exit 2. The upstream is
+        /// `porcelain`, `ahead` (the `rev-list` count, 0 when absent), `no-upstream`, and
+        /// `fail-<command>` that makes that command exit 2. The upstream is
         /// `origin`, `refs/heads/main`, at `https://github.com/o/<id>.git`.
         fn checkouts_git(&self) {
             self.script(
                 &self.bin.join("git"),
-                "d=$(basename \"$2\")\n[ -f \"$st/$d/fail-$3\" ] && exit 2\ncase \"$3\" in\n  rev-parse) if [ \"$4\" = --abbrev-ref ]; then echo main; else cat \"$st/$d/rev\"; fi ;;\n  config) case \"$5\" in *.remote) echo origin ;; *) echo refs/heads/main ;; esac ;;\n  remote) echo \"https://github.com/o/$d.git\" ;;\n  status) cat \"$st/$d/porcelain\" 2>/dev/null || true ;;\n  fetch) exit 0 ;;\n  rev-list) echo 0 ;;\n  pull) cp \"$st/$d/rev-after\" \"$st/$d/rev\" ;;\n  *) exit 64 ;;\nesac",
+                "d=$(basename \"$2\")\n[ -f \"$st/$d/fail-$3\" ] && exit 2\ncase \"$3\" in\n  rev-parse) if [ \"$4\" = --abbrev-ref ]; then echo main; else cat \"$st/$d/rev\"; fi ;;\n  config) [ -f \"$st/$d/no-upstream\" ] && exit 1; case \"$5\" in *.remote) echo origin ;; *) echo refs/heads/main ;; esac ;;\n  remote) echo \"https://github.com/o/$d.git\" ;;\n  status) cat \"$st/$d/porcelain\" 2>/dev/null || true ;;\n  fetch) exit 0 ;;\n  rev-list) cat \"$st/$d/ahead\" 2>/dev/null || echo 0 ;;\n  pull) cp \"$st/$d/rev-after\" \"$st/$d/rev\" ;;\n  *) exit 64 ;;\nesac",
             );
         }
 
@@ -1974,11 +2013,11 @@ mod tests {
             fs::write(st.join("rev-after"), rev_after).unwrap();
             let path = self.home.join("src").join(id);
             fs::create_dir_all(path.join(".git")).unwrap();
-            self.checkouts.push(Checkout {
+            self.checkouts.push(Ok(Checkout {
                 id: id.into(),
                 url: format!("https://github.com/o/{id}.git"),
                 path: path.clone(),
-            });
+            }));
             path
         }
     }
@@ -2046,7 +2085,7 @@ mod tests {
             r.notes,
             [
                 format!(
-                    "managed copy {} has uncommitted changes; not pulled",
+                    "checkout {} has uncommitted changes; not pulled",
                     dirty.display()
                 ),
                 "moved a1b2c3d -> d4e5f6a".to_string(),
@@ -2081,11 +2120,11 @@ mod tests {
         let mut t = T::new();
         t.checkouts_git();
         let copy = t.managed();
-        t.checkouts.push(Checkout {
+        t.checkouts.push(Ok(Checkout {
             id: "agent-registry".into(),
             url: REGISTRY.into(),
             path: copy,
-        });
+        }));
         let r = run(Updater::Checkouts, &t.env());
         assert_eq!(r.status, Status::Current, "{r:?}");
         assert!(r.notes.is_empty(), "{r:?}");
@@ -2112,10 +2151,81 @@ mod tests {
             r.notes[1..],
             [
                 format!(
-                    "managed copy {} has uncommitted changes; not pulled",
+                    "checkout {} has uncommitted changes; not pulled",
                     dirty.display()
                 ),
                 "moved a1b2c3d -> d4e5f6a".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_checkout_that_fetches_an_undeclared_url_is_blocked_before_any_fetch() {
+        let mut t = T::new();
+        t.checkouts_git();
+        let fork = t.checkout("fork", "a1b2c3d", "d4e5f6a");
+        // The directory tracks `https://github.com/o/fork.git`; the declaration names another.
+        t.checkouts[0].as_mut().unwrap().url = "https://github.com/o/other.git".into();
+        let moved = t.checkout("moved", "a1b2c3d", "d4e5f6a");
+        let r = run(Updater::Checkouts, &t.env());
+        assert_eq!(r.status, Status::Blocked, "{r:?}");
+        assert_eq!(
+            r.notes,
+            [
+                format!(
+                    "fork: {} fetches https://github.com/o/fork.git, not the declared https://github.com/o/other.git; not pulled",
+                    fork.display()
+                ),
+                "moved a1b2c3d -> d4e5f6a".to_string(),
+            ]
+        );
+        let mut want = upstream_calls(&fork.display().to_string(), "origin");
+        want.extend(checkout_calls(&moved));
+        assert_eq!(t.calls(), want);
+    }
+
+    #[test]
+    fn checkouts_diverged_or_without_an_upstream_are_blocked() {
+        let mut t = T::new();
+        t.checkouts_git();
+        let ahead = t.checkout("ahead", "a1b2c3d", "d4e5f6a");
+        fs::write(t.root.join("st/ahead/ahead"), "2\n").unwrap();
+        let loose = t.checkout("loose", "a1b2c3d", "d4e5f6a");
+        fs::write(t.root.join("st/loose/no-upstream"), "").unwrap();
+        let r = run(Updater::Checkouts, &t.env());
+        assert_eq!(r.status, Status::Blocked, "{r:?}");
+        assert_eq!(
+            r.notes,
+            [
+                format!(
+                    "checkout {} has 2 local commits that are not on its upstream; not pulled",
+                    ahead.display()
+                ),
+                format!(
+                    "the checkout {} has no upstream branch; not pulled",
+                    loose.display()
+                ),
+            ]
+        );
+        assert!(!t.log().contains(" pull "), "{}", t.log());
+        assert!(!t.log().contains("loose fetch"), "{}", t.log());
+    }
+
+    #[test]
+    fn an_invalid_checkout_declaration_is_a_note_and_the_others_run() {
+        let mut t = T::new();
+        t.checkouts_git();
+        t.checkouts.push(Err(
+            "extra.bad: url o/r is not an https:// or ssh remote".into()
+        ));
+        t.checkout("moved", "a1b2c3d", "d4e5f6a");
+        let r = run(Updater::Checkouts, &t.env());
+        assert_eq!(r.status, Status::Blocked, "{r:?}");
+        assert_eq!(
+            r.notes,
+            [
+                "extra.bad: url o/r is not an https:// or ssh remote",
+                "moved a1b2c3d -> d4e5f6a"
             ]
         );
     }
@@ -2127,17 +2237,17 @@ mod tests {
         let copy = t.managed();
         t.grants = Grants::default();
         // Another spelling of the upstream url: the identities match.
-        t.checkouts.push(Checkout {
+        t.checkouts.push(Ok(Checkout {
             id: "agent-registry".into(),
             url: "ssh://git@github.com/o/agents.git".into(),
             path: copy.clone(),
-        });
+        }));
         assert!(trust_notes(Updater::Agents, &t.env()).is_empty());
         assert!(preview(Updater::Agents, &t.env()).starts_with("would fast-forward "));
         let r = run(Updater::Agents, &t.env());
         assert_eq!(r.status, Status::Updated, "{r:?}");
         // The same path declared with another repository keeps the grant check.
-        t.checkouts[0].url = "https://github.com/o/other.git".into();
+        t.checkouts[0].as_mut().unwrap().url = "https://github.com/o/other.git".into();
         t.agents("abc1234", "def5678");
         let r = run(Updater::Agents, &t.env());
         assert_eq!(r.status, Status::Blocked, "{r:?}");

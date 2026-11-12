@@ -2229,7 +2229,7 @@ fn updater_env<'a>(
     runner: &'a Runner,
     root: &'a Path,
     grants: &'a Grants,
-    checkouts: &'a [updater::Checkout],
+    checkouts: &'a [Result<updater::Checkout, String>],
 ) -> updater::Env<'a> {
     updater::Env {
         provider: runner,
@@ -2241,21 +2241,29 @@ fn updater_env<'a>(
     }
 }
 
-/// The `git-checkout/v1` resources of the profile, each at HOME joined with its declared path.
-fn declared_checkouts(home: &Path, resolved: &Resolved) -> Result<Vec<updater::Checkout>, Refusal> {
+/// The `git-checkout/v1` resources of the profile. A declaration that is not valid is a note
+/// of the `checkouts` row, so the other updaters still run.
+fn declared_checkouts(home: &Path, resolved: &Resolved) -> Vec<Result<updater::Checkout, String>> {
     resolved
         .resources
         .values()
         .filter(|r| r.adapter == checkout::ADAPTER)
-        .map(|r| {
-            let d = checkout::declared(&r.value)?;
-            Ok(updater::Checkout {
-                id: r.id.clone(),
-                url: d.url,
-                path: home.join(d.path),
-            })
-        })
+        .map(|r| declared_checkout(home, &r.id, &r.value))
         .collect()
+}
+
+/// One declared checkout at HOME joined with its path, or the note `<id>: <reason>`.
+fn declared_checkout(
+    home: &Path,
+    id: &str,
+    value: &dfm_model::resolve::Value,
+) -> Result<updater::Checkout, String> {
+    let d = checkout::declared(value).map_err(|e| format!("{id}: {}", e.detail))?;
+    Ok(updater::Checkout {
+        id: id.to_string(),
+        url: d.url,
+        path: home.join(d.path),
+    })
 }
 
 /// The checkouts the tracked-file guard watches (DFM-25, G5): the bound checkout and each nested
@@ -2353,7 +2361,7 @@ fn upgrade_preview(
         return writeln!(out, "upgrade: none declared in the profile").map_err(w);
     }
     let runner = ctx.runner(sys);
-    let checkouts = declared_checkouts(ctx.platform.home(), resolved)?;
+    let checkouts = declared_checkouts(ctx.platform.home(), resolved);
     let env = updater_env(ctx, &runner, root, grants, &checkouts);
     writeln!(out, "{}", paint::label(ctx.color, "upgrade:")).map_err(w)?;
     for u in updaters {
@@ -2427,7 +2435,7 @@ fn upgrade(
     let started = now_ns()?;
     let mut runner = ctx.runner(sys);
     runner.detach = true;
-    let declared = declared_checkouts(ctx.platform.home(), &resolved)?;
+    let declared = declared_checkouts(ctx.platform.home(), &resolved);
     let env = updater_env(ctx, &runner, root, &grants, &declared);
     // The tracked-file guard (DFM-25, G5): the tracked changes before the updaters, compared
     // after each one that ran. A change it made fails its row and stays in place.
@@ -2573,6 +2581,26 @@ fn untrusted_refusal(origins: &[&str]) -> Refusal {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_invalid_checkout_value_is_a_note_not_a_refusal() {
+        let home = Path::new("/h");
+        let value = |url: &str| {
+            dfm_model::resolve::Value::Table(
+                toml::from_str(&format!("url = {url:?}\npath = \"x/r\"\n")).unwrap(),
+            )
+        };
+        assert_eq!(
+            declared_checkout(home, "extra.r", &value("https://github.com/o/r.git")),
+            Ok(updater::Checkout {
+                id: "extra.r".into(),
+                url: "https://github.com/o/r.git".into(),
+                path: home.join("x/r"),
+            })
+        );
+        let e = declared_checkout(home, "extra.bad", &value("o/r")).unwrap_err();
+        assert!(e.starts_with("extra.bad: url "), "{e}");
+    }
     #[test]
     fn redirects_and_http_alternates_stay_disabled() {
         // Any value but `true` also disables the dumb-HTTP alternates (is_alternate_allowed).
