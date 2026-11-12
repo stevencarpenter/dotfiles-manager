@@ -174,7 +174,7 @@ runs; a restart runs only with --restart <resource-id>. A scope that fails stops
 (not_started). Without a 1Password session the secrets are skipped; a blocked packages, secrets or
 services plan does not run; the other scopes run, and the last lines of the output warn what waits
 and how to fix it. A blocked configuration plan refuses the run. A pin is never rewritten.
-Then the updaters the profile declares (updaters = [...], from agents, brew, checkouts, claude, codex, go, mise,
+Then the updaters the profile declares (updaters = [...], from agents, brew, cargo, checkouts, claude, codex, go, mise,
 npm, opencode, rustup, side-channels, skills, uv) run in order, detached, each reported updated, current, held, pending, failed or blocked,
 with one upgrade receipt; a failure warns and the exit stays 0. --no-upgrade skips them.
 --preview fetches into staging and changes nothing else. See docs/sync.md and docs/upgrade.md.

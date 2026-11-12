@@ -87,7 +87,7 @@ fn owner_dir(u: Updater) -> Option<&'static str> {
         Updater::Claude => Some(".local/bin"),
         Updater::Codex => Some(".codex/packages/standalone/current/bin"),
         Updater::Opencode => Some(".opencode/bin"),
-        Updater::Rustup => Some(".cargo/bin"),
+        Updater::Cargo | Updater::Rustup => Some(".cargo/bin"),
         Updater::Agents
         | Updater::Brew
         | Updater::Checkouts
@@ -255,6 +255,7 @@ pub fn run(u: Updater, env: &Env) -> Row {
                 Err(e) => d.stop(e),
             }
         }
+        Updater::Cargo => cargo(d, env),
         Updater::Go => go(d, env),
         Updater::Mise => mise(d, env),
         Updater::Npm => npm(d, env),
@@ -353,6 +354,7 @@ pub fn second_copies(u: Updater, env: &Env) -> Vec<String> {
         Updater::Opencode => (Some("opencode"), None),
         Updater::Agents
         | Updater::Brew
+        | Updater::Cargo
         | Updater::Checkouts
         | Updater::Go
         | Updater::Mise
@@ -970,30 +972,218 @@ fn uv(mut d: Draft, env: &Env) -> Row {
     }
 }
 
+// ---- cargo crates ----------------------------------------------------------------------------
+
+/// One crate of `cargo install --list`: its name, version and the source in parentheses, if any.
+/// The header lines are `name vX.Y.Z:`, `name vX.Y.Z (https://host/repo#sha):` for a git install
+/// and `name vX.Y.Z (/abs/path):` for a path install; the indented binary names are skipped.
+fn cargo_list(stdout: &[u8]) -> std::collections::BTreeMap<String, (String, Option<String>)> {
+    String::from_utf8_lossy(stdout)
+        .lines()
+        .filter(|l| !l.starts_with(char::is_whitespace))
+        .filter_map(|l| {
+            let (name, rest) = l.trim_end().strip_suffix(':')?.split_once(' ')?;
+            let (v, src) = match rest.split_once(" (") {
+                Some((v, src)) => (v, Some(src.strip_suffix(')')?.to_string())),
+                None => (rest, None),
+            };
+            Some((name.to_string(), (v.to_string(), src)))
+        })
+        .collect()
+}
+
+/// The `cargo install` arguments that reinstall a crate from where it came from, or why it is
+/// held. A registry crate has no source; a git source keeps its `branch`, `tag` or `rev`.
+fn cargo_install_args(name: &str, src: Option<&str>) -> Result<Vec<String>, String> {
+    let mut a = args(&["install", "--locked"]);
+    match src {
+        None => {}
+        Some(p) if p.starts_with('/') => return Err(format!("{name} held (path install {p})")),
+        Some(g) if g.contains("://") => {
+            let g = g.strip_prefix("git+").unwrap_or(g);
+            let g = g.split_once('#').map_or(g, |(url, _)| url);
+            let (url, query) = g.split_once('?').unwrap_or((g, ""));
+            a.extend(args(&["--git", url]));
+            for (k, v) in query.split('&').filter_map(|q| q.split_once('=')) {
+                if matches!(k, "branch" | "tag" | "rev") {
+                    a.extend([format!("--{k}"), v.to_string()]);
+                }
+            }
+        }
+        Some(other) => return Err(format!("{name} held (source {other})")),
+    }
+    a.push(name.to_string());
+    Ok(a)
+}
+
+/// Reinstalls every crate that `cargo install --list` shows. `cargo` runs from its owner path
+/// `~/.cargo/bin/cargo` (the rustup proxy). A registry crate is `cargo install --locked <name>`,
+/// which cargo skips when the crate is current; a git crate is reinstalled from its own
+/// repository; a path crate is held. One failing install fails the row; the others still run.
+/// A git crate whose commit moved without a version change reads as `current`.
+fn cargo(mut d: Draft, env: &Env) -> Row {
+    let r = match native_runner(Updater::Cargo, env) {
+        Ok(r) => r,
+        Err(why) => {
+            d.notes.push(why);
+            return d.end(Status::Blocked);
+        }
+    };
+    let list = || {
+        call(
+            &r,
+            "cargo",
+            &args(&["install", "--list"]),
+            &[],
+            env.timeouts.short,
+        )
+        .map(|o| cargo_list(&o.stdout))
+    };
+    let before = match list() {
+        Ok(l) => l,
+        Err(e) => return d.stop(e),
+    };
+    if before.is_empty() {
+        d.notes.push("no cargo crate is installed".into());
+        return d.end(Status::Current);
+    }
+    let mut failure = None;
+    for (name, (_, src)) in &before {
+        let a = match cargo_install_args(name, src.as_deref()) {
+            Ok(a) => a,
+            Err(held) => {
+                d.notes.push(held);
+                continue;
+            }
+        };
+        match call(&r, "cargo", &a, &[], env.timeouts.long) {
+            // A stop ends the updater here: no other cargo command starts.
+            Err(e) if e.1 => return d.stop(e),
+            Err(e) if failure.is_none() => failure = Some(e),
+            Err(e) => d.notes.push(e.0),
+            Ok(_) => {}
+        }
+    }
+    let after = match list() {
+        Ok(l) => l,
+        Err(e) => return d.stop(e),
+    };
+    let mut changed = false;
+    for (name, (was, _)) in &before {
+        match after.get(name) {
+            Some((now, _)) if now != was => {
+                changed = true;
+                d.notes.push(format!("{name} {was} -> {now}"));
+            }
+            Some(_) => {}
+            None => d
+                .notes
+                .push(format!("{name}: gone from the list after the install")),
+        }
+    }
+    match failure {
+        Some(e) => d.stop(e),
+        None if changed => d.end(Status::Updated),
+        None => d.end(Status::Current),
+    }
+}
+
 // ---- go binaries -----------------------------------------------------------------------------
 
 /// Where `go install` puts binaries, relative to HOME.
 const GO_BIN: &str = "go/bin";
 
-/// `go version -m <bin>`: the package path and the module version of a binary. `None` when the
-/// output has no `path` line or no `mod` line with a real version (`(devel)` is not one).
-fn go_module(stdout: &[u8]) -> (Option<String>, Option<String>) {
-    let (mut path, mut version) = (None, None);
+/// What `go version -m <bin>` says about a binary: the package path and the `mod` line.
+#[derive(Default)]
+struct GoBuild {
+    path: Option<String>,
+    module: Option<String>,
+    version: Option<String>,
+    /// The `mod` line has an `h1:` sum: the module came from the module cache, not a local tree.
+    sum: bool,
+}
+
+fn go_build(stdout: &[u8]) -> GoBuild {
+    let mut b = GoBuild::default();
     for line in String::from_utf8_lossy(stdout).lines() {
         let f: Vec<&str> = line.trim().split('\t').collect();
         match f.as_slice() {
-            ["path", p] => path = Some(p.to_string()),
-            ["mod", _, v, ..] if *v != "(devel)" => version = Some(v.to_string()),
+            ["path", p] => b.path = Some(p.to_string()),
+            ["mod", m, v, rest @ ..] => {
+                b.module = Some(m.to_string());
+                b.version = Some(v.to_string());
+                b.sum = rest.first().is_some_and(|s| s.starts_with("h1:"));
+            }
             _ => {}
         }
     }
-    (path, version)
+    b
 }
 
-/// Reinstalls every binary in `~/go/bin` at `@latest`. `go` is a mise shim whose `GOBIN` is the
-/// versioned install directory that a Go patch upgrade replaces, so each command runs under
-/// `mise exec` with `GOBIN` set to `~/go/bin`. A file that `go version -m` cannot read is not a
-/// Go binary and is skipped. One failing install fails the row; the others still run.
+/// Why `go install <path>@latest` must not replace this binary, or `None`. Only a build from
+/// the module cache has a published module to fetch: a stamped version without a sum, or a
+/// `+dirty` one, was built from a local tree.
+fn go_hold(b: &GoBuild) -> Option<&'static str> {
+    match (&b.path, &b.version) {
+        (Some(_), Some(v)) if v != "(devel)" => {
+            if !b.sum || v.ends_with("+dirty") {
+                Some("built from a local checkout")
+            } else {
+                None
+            }
+        }
+        _ => Some("no module version"),
+    }
+}
+
+/// `go version -m <bin>` through mise. `Ok(None)` is a file that is not a Go binary; any other
+/// failure is an `Err`, as for [`call`].
+fn go_read(
+    env: &Env,
+    gobin: &[(String, String)],
+    bin: &Path,
+) -> Result<Option<GoBuild>, (String, bool)> {
+    let a = args(&[
+        "exec",
+        "--",
+        "go",
+        "version",
+        "-m",
+        &bin.display().to_string(),
+    ]);
+    let what = format!("mise {}", a.join(" "));
+    let out = env
+        .provider
+        .run(&Request {
+            program: "mise",
+            args: &a,
+            env: gobin,
+            stdin: None,
+            timeout: env.timeouts.short,
+            max_stdout: 16 << 20,
+        })
+        .map_err(|e| (format!("{what}: {}", e.detail), false))?;
+    match trouble(&what, &out, env.timeouts.short, &[0]) {
+        None => Ok(Some(go_build(&out.stdout))),
+        Some(_)
+            if {
+                let err = String::from_utf8_lossy(&out.stderr);
+                matches!(out.end, End::Exited(_))
+                    && (err.contains("could not read Go build info")
+                        || err.contains("not a Go executable"))
+            } =>
+        {
+            Ok(None)
+        }
+        Some(n) => Err((n, matches!(out.end, End::Stopped(_)))),
+    }
+}
+
+/// Reinstalls every regular file in `~/go/bin` at `@latest`. `go` is a mise shim whose `GOBIN`
+/// is the versioned install directory that a Go patch upgrade replaces, so each command runs
+/// under `mise exec` with `GOBIN` set to `~/go/bin`. A first `go version` proves the shim
+/// works. A file that `go version -m` calls not a Go binary is skipped; any other failure fails
+/// the row. One failing install fails the row; the others still run.
 fn go(mut d: Draft, env: &Env) -> Row {
     if let Err(e) = env.provider.resolve("mise") {
         d.notes.push(e.detail);
@@ -1009,39 +1199,42 @@ fn go(mut d: Draft, env: &Env) -> Row {
         Err(e) => return d.stop((format!("cannot read {}: {e}", dir.display()), false)),
     };
     files.sort();
+    if files.is_empty() {
+        d.notes.push("no go binary is installed".into());
+        return d.end(Status::Current);
+    }
     let gobin = vec![("GOBIN".to_string(), dir.display().to_string())];
-    let read = |bin: &Path| {
-        let a = args(&[
-            "exec",
-            "--",
-            "go",
-            "version",
-            "-m",
-            &bin.display().to_string(),
-        ]);
-        call(env.provider, "mise", &a, &gobin, env.timeouts.short)
-    };
-    // package path -> (binary name, version before)
-    let mut groups: std::collections::BTreeMap<String, Vec<(PathBuf, String)>> = Default::default();
+    if let Err(e) = call(
+        env.provider,
+        "mise",
+        &args(&["exec", "--", "go", "version"]),
+        &gobin,
+        env.timeouts.short,
+    ) {
+        return d.stop(e);
+    }
+    // package path -> (binary, module and version before)
+    let mut groups: std::collections::BTreeMap<String, Vec<(PathBuf, String, String)>> =
+        Default::default();
     for bin in files {
         let name = bin
             .file_name()
             .unwrap_or_default()
             .to_string_lossy()
             .into_owned();
-        match read(&bin) {
-            Err(e) if e.1 => return d.stop(e),
+        match go_read(env, &gobin, &bin) {
+            Err(e) => return d.stop(e),
             // Not a Go binary.
-            Err(_) => {}
-            Ok(out) => match go_module(&out.stdout) {
-                (Some(path), Some(v)) => groups.entry(path).or_default().push((bin, v)),
-                _ => d.notes.push(format!("{name} held (no module version)")),
+            Ok(None) => {}
+            Ok(Some(b)) => match go_hold(&b) {
+                Some(why) => d.notes.push(format!("{name} held ({why})")),
+                None => groups.entry(b.path.unwrap_or_default()).or_default().push((
+                    bin,
+                    b.module.unwrap_or_default(),
+                    b.version.unwrap_or_default(),
+                )),
             },
         }
-    }
-    if groups.is_empty() && d.notes.is_empty() {
-        d.notes.push("no go binary is installed".into());
-        return d.end(Status::Current);
     }
     let mut failure = None;
     let mut changed = false;
@@ -1054,22 +1247,30 @@ fn go(mut d: Draft, env: &Env) -> Row {
             Err(e) => d.notes.push(e.0),
             Ok(_) => {}
         }
-        for (bin, before) in bins {
-            let after = match read(bin) {
-                Ok(out) => go_module(&out.stdout).1,
-                Err(e) if e.1 => return d.stop(e),
-                Err(_) => None,
-            };
+        for (bin, module, before) in bins {
             let name = bin.file_name().unwrap_or_default().to_string_lossy();
+            let after = match go_read(env, &gobin, bin) {
+                Err(e) if e.1 => return d.stop(e),
+                Err(e) => Err(e.0),
+                Ok(None) => Err(format!(
+                    "{name}: not readable as a Go binary after the install"
+                )),
+                Ok(Some(b)) => match (b.module, b.version) {
+                    (Some(m), Some(v)) if m == *module => Ok(v),
+                    (Some(m), Some(_)) => Err(format!(
+                        "{name}: module changed from {module} to {m} after the install"
+                    )),
+                    _ => Err(format!("{name}: version unreadable after the install")),
+                },
+            };
             match after {
-                Some(v) if v != *before => {
+                Ok(v) if v != *before => {
                     changed = true;
                     d.notes.push(format!("{name} {before} -> {v}"));
                 }
-                Some(_) => {}
-                None => d
-                    .notes
-                    .push(format!("{name}: version unreadable after the install")),
+                Ok(_) => {}
+                Err(n) if failure.is_none() => failure = Some((n, false)),
+                Err(n) => d.notes.push(n),
             }
         }
     }
@@ -1668,6 +1869,15 @@ fn preview_command(u: Updater, env: &Env) -> String {
                 p.display()
             ),
             Err(e) => format!("blocked: {}", e.detail),
+        },
+        Updater::Cargo => match native_runner(u, env) {
+            Ok(r) => format!(
+                "would run cargo install --list and cargo install --locked of every listed crate, from its git repository for a git install ({})",
+                r.resolve("cargo")
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_default()
+            ),
+            Err(why) => format!("blocked: {why}"),
         },
         Updater::Go => match env.provider.resolve("mise") {
             Ok(p) => format!(
@@ -2514,6 +2724,7 @@ mod tests {
             Updater::Codex,
             Updater::Opencode,
             Updater::Brew,
+            Updater::Cargo,
             Updater::Go,
             Updater::Mise,
             Updater::Rustup,
@@ -3235,7 +3446,7 @@ mod tests {
             }
             self.script(
                 &self.bin.join("mise"),
-                "echo \"$GOBIN\" >> $st/go-env\n[ \"$1 $2 $3\" = 'exec -- go' ] || exit 64\ncase \"$4\" in\n  version) [ -f \"$st/gobin/$(basename $6)\" ] || exit 1; cat \"$st/gobin/$(basename $6)\" ;;\n  install) pkg=${5%@latest}; [ -f \"$st/go-fail-$(basename $pkg)\" ] && exit 1; for f in $st/gobin/*; do grep -q \"path	$pkg\\$\" $f && cp $st/golatest/$(basename $f) $f; done; true ;;\n  *) exit 64 ;;\nesac",
+                "echo \"$GOBIN\" >> $st/go-env\n[ \"$1 $2 $3\" = 'exec -- go' ] || exit 64\ncase \"$4\" in\n  version) if [ -z \"$5\" ]; then [ -f \"$st/go-broken\" ] && exit 1; exit 0; fi; [ -f \"$st/go-err-$(basename $6)\" ] && { echo boom >&2; exit 1; }; [ -f \"$st/gobin/$(basename $6)\" ] || { echo \"$6: could not read Go build info\" >&2; exit 1; }; cat \"$st/gobin/$(basename $6)\" ;;\n  install) pkg=${5%@latest}; [ -f \"$st/go-fail-$(basename $pkg)\" ] && exit 1; for f in $st/gobin/*; do grep -q \"path	$pkg\\$\" $f && cp $st/golatest/$(basename $f) $f; done; true ;;\n  *) exit 64 ;;\nesac",
             );
         }
     }
@@ -3264,6 +3475,7 @@ mod tests {
         assert_eq!(
             t.calls(),
             vec![
+                "mise exec -- go version".to_string(),
                 format!("mise exec -- go version -m {}", bin("bumblebee")),
                 format!("mise exec -- go version -m {}", bin("protoc-gen-go")),
                 "mise exec -- go install github.com/p/bumblebee/cmd/bumblebee@latest".to_string(),
@@ -3308,6 +3520,85 @@ mod tests {
     }
 
     #[test]
+    fn a_broken_go_fails_the_row_instead_of_skipping_every_file() {
+        let t = T::new();
+        t.go(&[("a", "example.com/a", "v1.0.0", "v1.1.0")]);
+        fs::write(t.root.join("st/go-broken"), "").unwrap();
+        let r = run(Updater::Go, &t.env());
+        assert_eq!(r.status, Status::Failed, "{r:?}");
+        assert!(
+            r.notes[0].contains("mise exec -- go version exited 1"),
+            "{r:?}"
+        );
+        assert!(!t.log().contains("go install"), "{}", t.log());
+    }
+
+    #[test]
+    fn a_version_failure_that_is_not_a_missing_build_info_fails_the_row() {
+        let t = T::new();
+        t.go(&[
+            ("a", "example.com/a", "v1.0.0", "v1.1.0"),
+            ("b", "example.com/b", "v2.0.0", "v2.1.0"),
+        ]);
+        fs::write(t.root.join("st/go-err-a"), "").unwrap();
+        let r = run(Updater::Go, &t.env());
+        assert_eq!(r.status, Status::Failed, "{r:?}");
+        assert!(r.notes[0].contains("go version -m"), "{r:?}");
+        assert!(!t.log().contains("go install"), "{}", t.log());
+    }
+
+    #[test]
+    fn go_holds_a_local_build_that_has_no_sum_or_is_dirty() {
+        let t = T::new();
+        t.go(&[
+            ("dirty", "example.com/dirty", "v1.0.0+dirty", "v1.1.0"),
+            ("local", "example.com/local", "v1.0.0", "v1.1.0"),
+        ]);
+        fs::write(
+            t.root.join("st/gobin/local"),
+            "local: go1.26.3\n\tpath\texample.com/local\n\tmod\tm/local\tv1.0.0\t\n",
+        )
+        .unwrap();
+        let r = run(Updater::Go, &t.env());
+        assert_eq!(r.status, Status::Current, "{r:?}");
+        assert_eq!(
+            r.notes,
+            vec![
+                "dirty held (built from a local checkout)".to_string(),
+                "local held (built from a local checkout)".to_string()
+            ]
+        );
+        assert!(!t.log().contains("go install"), "{}", t.log());
+    }
+
+    #[test]
+    fn a_module_change_or_an_unreadable_version_after_the_install_fails_the_row() {
+        let t = T::new();
+        t.go(&[
+            ("a", "example.com/a", "v1.0.0", "v1.1.0"),
+            ("b", "example.com/b", "v2.0.0", "v2.1.0"),
+        ]);
+        fs::write(
+            t.root.join("st/golatest/a"),
+            "a: go1.26.3\n\tpath\texample.com/a\n\tmod\tother/a\tv1.1.0\th1:x=\n",
+        )
+        .unwrap();
+        fs::write(
+            t.root.join("st/golatest/b"),
+            "b: go1.26.3\n\tpath\texample.com/b\n",
+        )
+        .unwrap();
+        let r = run(Updater::Go, &t.env());
+        assert_eq!(r.status, Status::Failed, "{r:?}");
+        let all = r.notes.join("\n");
+        assert!(all.contains("module changed from m/a to other/a"), "{all}");
+        assert!(
+            all.contains("b: version unreadable after the install"),
+            "{all}"
+        );
+    }
+
+    #[test]
     fn go_with_no_binaries_is_current() {
         let t = T::new();
         t.script(&t.bin.join("mise"), "exit 64");
@@ -3347,6 +3638,113 @@ mod tests {
                 .contains(&"mise exec -- go install example.com/b@latest".to_string())
         );
         assert!(preview(Updater::Go, &t.env()).contains("go install"));
+    }
+
+    impl T {
+        /// `cargo` in `~/.cargo/bin` whose `install --list` prints `st/cargo-list` and whose
+        /// `install ... <name>` rewrites that line of the list from `st/cargo-new-<name>`, or
+        /// exits 1 with the `st/cargo-fail-<name>` marker. `<name>` is the last argument.
+        fn cargo(&self, list: &str, latest: &[(&str, &str)]) {
+            fs::write(self.root.join("st/cargo-list"), list).unwrap();
+            for (name, line) in latest {
+                fs::write(self.root.join(format!("st/cargo-new-{name}")), line).unwrap();
+            }
+            self.script(
+                &self.home.join(".cargo/bin/cargo"),
+                "case \"$1 $2\" in\n  'install --list') cat \"$st/cargo-list\" ;;\n  'install --locked') for n; do :; done; [ -f \"$st/cargo-fail-$n\" ] && exit 1; [ -f \"$st/cargo-new-$n\" ] && { grep -v \"^$n \" \"$st/cargo-list\" > \"$st/cargo-tmp\"; cat \"$st/cargo-new-$n\" >> \"$st/cargo-tmp\"; cp \"$st/cargo-tmp\" \"$st/cargo-list\"; }; true ;;\n  *) exit 64 ;;\nesac",
+            );
+        }
+    }
+
+    const CARGO_LIST: &str =
+        "cargo-deny v0.20.2:\n    cargo-deny\nsqlx-cli v0.9.0:\n    cargo-sqlx\n    sqlx\n";
+
+    #[test]
+    fn cargo_upgrades_each_registry_crate() {
+        let t = T::new();
+        t.cargo(
+            CARGO_LIST,
+            &[("cargo-deny", "cargo-deny v0.21.0:\n    cargo-deny\n")],
+        );
+        let r = run(Updater::Cargo, &t.env());
+        assert_eq!(r.status, Status::Updated, "{r:?}");
+        assert_eq!(r.notes, vec!["cargo-deny v0.20.2 -> v0.21.0".to_string()]);
+        assert_eq!(
+            t.calls(),
+            vec![
+                "cargo install --list".to_string(),
+                "cargo install --locked cargo-deny".to_string(),
+                "cargo install --locked sqlx-cli".to_string(),
+                "cargo install --list".to_string(),
+            ]
+        );
+        let r = run(Updater::Cargo, &t.env());
+        assert_eq!(r.status, Status::Current, "{r:?}");
+        assert!(r.notes.is_empty(), "{r:?}");
+    }
+
+    #[test]
+    fn cargo_keeps_a_git_or_path_crate_on_its_source() {
+        let t = T::new();
+        t.cargo(
+            "g v1.0.0 (https://github.com/o/g#abc1234):\n    g\nb v1.0.0 (git+https://github.com/o/b?branch=dev#abc1234):\n    b\nstevectl v7.4.0 (/Users/x/stevectl/cli):\n    stevectl\n",
+            &[],
+        );
+        let r = run(Updater::Cargo, &t.env());
+        assert_eq!(r.status, Status::Current, "{r:?}");
+        assert_eq!(
+            r.notes,
+            vec!["stevectl held (path install /Users/x/stevectl/cli)".to_string()]
+        );
+        assert_eq!(
+            t.calls(),
+            vec![
+                "cargo install --list".to_string(),
+                "cargo install --locked --git https://github.com/o/b --branch dev b".to_string(),
+                "cargo install --locked --git https://github.com/o/g g".to_string(),
+                "cargo install --list".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn cargo_with_nothing_installed_is_current() {
+        let t = T::new();
+        t.cargo("", &[]);
+        let r = run(Updater::Cargo, &t.env());
+        assert_eq!(r.status, Status::Current, "{r:?}");
+        assert_eq!(r.notes, vec!["no cargo crate is installed".to_string()]);
+        assert_eq!(t.calls(), vec!["cargo install --list".to_string()]);
+    }
+
+    #[test]
+    fn cargo_missing_is_blocked() {
+        let t = T::new();
+        let r = run(Updater::Cargo, &t.env());
+        assert_eq!(r.status, Status::Blocked, "{r:?}");
+        assert!(r.notes[0].contains(".cargo/bin/cargo"), "{r:?}");
+        assert!(preview(Updater::Cargo, &t.env()).starts_with("blocked: "));
+    }
+
+    #[test]
+    fn one_failing_cargo_install_fails_the_row_and_the_others_still_run() {
+        let t = T::new();
+        t.cargo(
+            "a v1.0.0:\n    a\nb v2.0.0:\n    b\n",
+            &[("b", "b v2.1.0:\n    b\n")],
+        );
+        fs::write(t.root.join("st/cargo-fail-a"), "").unwrap();
+        let r = run(Updater::Cargo, &t.env());
+        assert_eq!(r.status, Status::Failed, "{r:?}");
+        assert!(r.notes.iter().any(|n| n == "b v2.0.0 -> v2.1.0"), "{r:?}");
+        assert!(
+            r.notes
+                .iter()
+                .any(|n| n.contains("cargo install --locked a")),
+            "{r:?}"
+        );
+        assert!(t.calls().contains(&"cargo install --locked b".to_string()));
+        assert!(preview(Updater::Cargo, &t.env()).contains("cargo install"));
     }
 
     const MISE_TWO: &str = r#"{"go":{"name":"go","requested":"1.27","current":"1.27.3","latest":"1.27.4"},"usage":{"name":"usage","requested":"latest","current":"2.0.0","latest":"2.1.0"}}"#;
