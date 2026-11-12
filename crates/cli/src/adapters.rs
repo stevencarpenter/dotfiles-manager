@@ -439,7 +439,7 @@ pub fn registry() -> Vec<Adapter> {
                 checkout::ADAPTER,
                 "package",
                 TargetRule::Forbidden,
-                Claims::None,
+                Claims::Path("/path"),
                 Schema::Table(vec![
                     field("url", Schema::Str, true),
                     field("path", Schema::HomePath, true),

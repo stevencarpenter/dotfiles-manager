@@ -1412,6 +1412,14 @@ fn claims_of(
     Ok(match spec.claims {
         Claims::None => (Vec::new(), Vec::new()),
         Claims::Target => (owner.doc.target.iter().cloned().collect(), Vec::new()),
+        Claims::Path(p) => (
+            get(p)
+                .and_then(Value::as_str)
+                .map(String::from)
+                .into_iter()
+                .collect(),
+            Vec::new(),
+        ),
         Claims::TargetAndFragments { dir, pattern } => {
             let (Some(Value::String(d)), Some(Value::String(p))) = (get(dir), get(pattern)) else {
                 return Ok((owner.doc.target.iter().cloned().collect(), Vec::new()));
