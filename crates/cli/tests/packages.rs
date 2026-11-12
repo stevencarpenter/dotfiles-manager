@@ -1190,7 +1190,7 @@ fn a_nested_mise_tool_of_another_backend_is_refused() {
     assert!(t.contains("E_SOURCE_UNTRUSTED"), "{t}");
     assert!(
         t.contains(
-            "a nested source may declare only registry names or github:, ubi: or npm: mise tools"
+            "is not declared by the bound checkout, so it may be only a registry name or a github:, ubi: or npm: tool"
         ),
         "{t}"
     );

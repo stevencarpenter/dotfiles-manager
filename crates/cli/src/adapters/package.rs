@@ -789,16 +789,26 @@ fn mise_identity(name: &str) -> Result<Option<(String, String)>, Refusal> {
     };
     if let Some(v) = version.filter(|v| !plain(v)) {
         return Err(untrusted(&format!(
-            "the version {} from a nested source must be latest or a plain version such as 1.2.3",
+            "is not declared by the bound checkout, so its version {} must be latest or a plain version such as 1.2.3",
             dfm_model::display::visible(v)
         )));
     }
+    // `github:`/`ubi:` take only the `o/r` shorthand: `source_identity` would read
+    // `github:npm:x` as the npm identity `npm:x`.
+    let shorthand = |r: &str| {
+        !r.contains(':') && r.split('/').count() == 2 && r.split('/').all(|c| !c.is_empty())
+    };
     let source = match backend {
+        "github" | "ubi" if !shorthand(rest) => {
+            return Err(untrusted(
+                "is not declared by the bound checkout, so a github: or ubi: tool must be the owner/repo shorthand",
+            ));
+        }
         "github" | "ubi" => rest.to_string(),
         "npm" => format!("{}{rest}", dfm_model::lock::NPM),
         _ => {
             return Err(untrusted(
-                "a nested source may declare only registry names or github:, ubi: or npm: mise tools",
+                "is not declared by the bound checkout, so it may be only a registry name or a github:, ubi: or npm: tool",
             ));
         }
     };
@@ -1812,6 +1822,9 @@ mod tests {
         }
         for n in [
             "aqua:o/r",
+            "github:npm:x",
+            "ubi:npm:@s/x",
+            "github:o/r/x",
             "cargo:x",
             "core:node",
             "github:o",
