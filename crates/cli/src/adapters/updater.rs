@@ -1435,15 +1435,23 @@ fn git_with(
 
 /// The note that blocks the pull of the `agents` managed copy, or none. The upstream's grant
 /// covers the pull and the registry's own install code. A checkout that the bound checkout
-/// declared at the copy with the upstream's identity needs no grant.
+/// declared at the copy with the upstream's identity needs no grant. The declared url goes
+/// through the owner's `url.*.insteadOf` rewrites first (`git ls-remote --get-url` in the copy,
+/// no network), as `remote get-url` did for the upstream.
 fn agents_gate(env: &Env, copy: &Path, up: &Upstream) -> Option<String> {
     let id = git_id(&up.url);
+    let declared = |c: &Checkout| {
+        git(env, copy, &["ls-remote", "--get-url", &c.url])
+            .ok()
+            .map(|u| git_id(&u))
+    };
     if let Ok(i) = &id
         && env
             .checkouts
             .iter()
             .flatten()
-            .any(|c| c.owner_declared && c.path == copy && git_id(&c.url).as_ref() == Ok(i))
+            .filter(|c| c.owner_declared && c.path == copy)
+            .any(|c| declared(c).is_some_and(|d| d.as_ref() == Ok(i)))
     {
         return None;
     }
@@ -1961,7 +1969,7 @@ mod tests {
             fs::write(st.join("url-origin"), REGISTRY).unwrap();
             self.script(
                 &self.bin.join("git"),
-                "case \"$3\" in\n  rev-parse) if [ \"$4\" = --abbrev-ref ]; then echo main; else cat \"$st/rev\"; fi ;;\n  config) [ \"$4\" = --list ] && exit 0; [ -f \"$st/no-upstream\" ] && exit 1; case \"$5\" in *.remote) cat \"$st/remote\" 2>/dev/null || echo origin ;; *) echo refs/heads/main ;; esac ;;\n  remote) cat \"$st/url-$5\" ;;\n  status) cat \"$st/porcelain\" 2>/dev/null || true ;;\n  fetch) exit 0 ;;\n  rev-list) cat \"$st/ahead\" 2>/dev/null || echo 0 ;;\n  pull) cp \"$st/rev-after\" \"$st/rev\" ;;\n  *) exit 64 ;;\nesac",
+                "case \"$3\" in\n  rev-parse) if [ \"$4\" = --abbrev-ref ]; then echo main; else cat \"$st/rev\"; fi ;;\n  config) [ \"$4\" = --list ] && exit 0; [ -f \"$st/no-upstream\" ] && exit 1; case \"$5\" in *.remote) cat \"$st/remote\" 2>/dev/null || echo origin ;; *) echo refs/heads/main ;; esac ;;\n  remote) cat \"$st/url-$5\" ;;\n  ls-remote) if [ -f \"$st/rewrite\" ]; then cat \"$st/rewrite\"; else echo \"$5\"; fi ;;\n  status) cat \"$st/porcelain\" 2>/dev/null || true ;;\n  fetch) exit 0 ;;\n  rev-list) cat \"$st/ahead\" 2>/dev/null || echo 0 ;;\n  pull) cp \"$st/rev-after\" \"$st/rev\" ;;\n  *) exit 64 ;;\nesac",
             );
             self.script(
                 &self.dots.join("scripts/install-agent-registry.sh"),
@@ -2493,6 +2501,29 @@ mod tests {
         assert!(notes[0].starts_with("E_SOURCE_UNTRUSTED: "), "{notes:?}");
         let r = run(Updater::Agents, &t.env());
         assert_eq!(r.status, Status::Blocked, "{r:?}");
+    }
+
+    /// The owner's `url.*.insteadOf` rewrites the declared https url to the ssh upstream, so the
+    /// declared copy still needs no grant (Codex #102, as for `checkouts`).
+    #[test]
+    fn agents_rewrites_the_declared_url_before_it_compares_the_upstream() {
+        let mut t = T::new();
+        t.agents("abc1234", "def5678");
+        let copy = t.managed();
+        t.grants = Grants::default();
+        t.checkouts.push(Ok(Checkout {
+            id: "agent-registry".into(),
+            url: "https://github.com/o/agents".into(),
+            path: copy,
+            owner_declared: true,
+        }));
+        // Without the rule the https declaration is another identity: a grant is needed.
+        assert_eq!(trust_notes(Updater::Agents, &t.env()).len(), 1);
+        // `https://github.com/` instead of `git@github.com:`: git rewrites the declared url.
+        fs::write(t.root.join("st/rewrite"), REGISTRY).unwrap();
+        assert!(trust_notes(Updater::Agents, &t.env()).is_empty());
+        let r = run(Updater::Agents, &t.env());
+        assert_eq!(r.status, Status::Updated, "{r:?}");
     }
 
     #[test]
