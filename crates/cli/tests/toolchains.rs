@@ -2,7 +2,8 @@
 //! isolated binary (DFM-24, docs/toolchains.md).
 //!
 //! Every run passes `--home <temp dir>` and an empty environment, plus `DFM_PROVIDER_PATH`
-//! pointing at a directory with `mise`, `uv` and `brew` look-alikes. Each look-alike logs its
+//! pointing at a directory with `mise`, `uv` and `brew` look-alikes, and a `git` that runs
+//! only `git ls-remote --get-url`, which reads the git config and fetches nothing. Each look-alike logs its
 //! arguments and the provider variables it saw, lists what an `installed-<provider>` file
 //! names, and changes that file only on an install or upgrade, so no real provider runs and
 //! nothing reaches the network.
@@ -140,6 +141,9 @@ esac
 
 /// `brew --cellar` and `brew --caskroom` print the fixture's `Cellar` and `Caskroom`; nothing
 /// else is answered. A homebrew/v1 package under `--update` is probed and then held.
+/// The system git, for `ls-remote --get-url` only.
+const FAKE_GIT: &str = "#!/bin/sh\nPATH=/usr/bin:/bin\n[ \"$1 $2\" = 'ls-remote --get-url' ] || exit 64\nexec git \"$@\"\n";
+
 const FAKE_BREW: &str = r#"#!/bin/sh
 PATH=/usr/bin:/bin:$PATH
 here=$(dirname "$0")
@@ -186,7 +190,12 @@ impl Fx {
         fx.put("base/modules/extra/module.toml", EXTRA);
         fx.put("profiles/t-01.toml", common::PROFILE);
         fs::create_dir_all(fx.bin()).unwrap();
-        for (name, body) in [("mise", FAKE_MISE), ("uv", FAKE_UV), ("brew", FAKE_BREW)] {
+        for (name, body) in [
+            ("mise", FAKE_MISE),
+            ("uv", FAKE_UV),
+            ("brew", FAKE_BREW),
+            ("git", FAKE_GIT),
+        ] {
             let p = fx.bin().join(name);
             fs::write(&p, body).unwrap();
             fs::set_permissions(&p, fs::Permissions::from_mode(0o755)).unwrap();
@@ -326,11 +335,18 @@ impl Fx {
 
     /// Writes `state/grants.json` with one origin grant, as `sync --trust-origin` would.
     fn grant(&self, origin: &str) {
+        self.grants(&[origin]);
+    }
+
+    /// Replaces the grants with one per origin.
+    fn grants(&self, origins: &[&str]) {
         let p = self.state().join("grants.json");
-        let body = serde_json::json!({
-            "schema": 2,
-            "origins": [{ "origin": origin, "grant_id": "grant-0", "granted_at": "2026-11-11T00:00:00Z" }],
-        });
+        let origins: Vec<_> = origins
+            .iter()
+            .enumerate()
+            .map(|(i, o)| serde_json::json!({ "origin": o, "grant_id": format!("grant-{i}"), "granted_at": "2026-11-11T00:00:00Z" }))
+            .collect();
+        let body = serde_json::json!({ "schema": 2, "origins": origins });
         fs::write(&p, body.to_string()).unwrap();
         fs::set_permissions(&p, fs::Permissions::from_mode(0o600)).unwrap();
     }
@@ -927,6 +943,43 @@ fn a_git_source_without_a_grant_blocks_and_with_one_installs() {
         text(&o.stdout)
     );
     assert_eq!(fx.changes().len(), 1, "{}", fx.log());
+}
+
+/// uv clones a git source with git, so a `url.*.insteadOf` rewrite in the user's git config
+/// redirects the clone: the url git would fetch needs its own grant.
+#[test]
+fn a_git_source_that_git_rewrites_needs_a_grant_for_the_rewritten_url() {
+    let fx = Fx::new();
+    fx.with_source(GIT);
+    fx.grant("https://github.com/o/r");
+    let config = fx.home.path().join(".config/git/config");
+    fs::create_dir_all(config.parent().unwrap()).unwrap();
+    fs::write(
+        &config,
+        "[url \"https://mirror.invalid/\"]\n\tinsteadOf = https://github.com/\n",
+    )
+    .unwrap();
+    let o = fx.preview(false);
+    let t = format!("{}{}", text(&o.stdout), stderr(&o));
+    assert_eq!(code(&o), 3, "{t}");
+    assert!(
+        t.contains("dfm sync --trust-origin 'https://mirror.invalid/o/r'"),
+        "{t}"
+    );
+    // The rewritten url alone is not enough: the declared one needs its grant too.
+    fx.grant("https://mirror.invalid/o/r");
+    let o = fx.preview(false);
+    let t = format!("{}{}", text(&o.stdout), stderr(&o));
+    assert_eq!(code(&o), 3, "{t}");
+    assert!(
+        t.contains("dfm sync --trust-origin 'https://github.com/o/r'"),
+        "{t}"
+    );
+    assert!(fx.changes().is_empty(), "{}", fx.log());
+    fx.grants(&["https://github.com/o/r", "https://mirror.invalid/o/r"]);
+    let o = fx.apply(false);
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+    assert_eq!(fx.changes(), [format!("uv tool install --force {GIT}")]);
 }
 
 #[test]

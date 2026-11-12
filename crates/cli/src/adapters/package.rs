@@ -831,7 +831,7 @@ pub(crate) fn uv_source_probe(
     let source = uv_source(value, cx.root())?.ok_or_else(|| bad_source(text, "is missing"))?;
     let (key, want, shown) = match &source {
         UvSource::Git { url, rev } => {
-            if let Some(id) = ungranted(&source, cx)? {
+            if let Some(id) = ungranted(runner, &source, cx)? {
                 return Ok(PackageState::Ungranted(id));
             }
             ("git", format!("{url}?rev={rev}"), rev.clone())
@@ -868,7 +868,7 @@ pub(crate) fn uv_source_install(
     let source = uv_source(value, cx.root())?.ok_or_else(|| bad_source(text, "is missing"))?;
     let arg = match &source {
         UvSource::Git { url, rev } => {
-            if let Some(id) = ungranted(&source, cx)? {
+            if let Some(id) = ungranted(runner, &source, cx)? {
                 return Err(Refusal::new(
                     Code::SourceUntrusted,
                     format!(
@@ -914,13 +914,22 @@ fn uv_source_name(value: &Value) -> Result<String, Refusal> {
     Ok(pkg)
 }
 
-/// The identity of a git source that has no grant, or `None` (a granted git source, a path).
-fn ungranted(source: &UvSource, cx: &ScriptCx) -> Result<Option<String>, Refusal> {
+/// The first identity of a git source that has no grant, or `None` (a granted git source, a
+/// path). uv clones with git, so both the declared url and the url git fetches from after
+/// `url.*.insteadOf` need a grant. `Err` is a url git cannot resolve or one that maps to no
+/// identity.
+fn ungranted(runner: &Runner, source: &UvSource, cx: &ScriptCx) -> Result<Option<String>, Refusal> {
     let UvSource::Git { url, .. } = source else {
         return Ok(None);
     };
-    let id = git_identity(url)?;
-    Ok((!cx.grants()?.trusts(&id)).then_some(id))
+    let declared = git_identity(url)?;
+    let fetched = super::updater::fetch_url(runner, url, PROBE_TIMEOUT)
+        .map_err(|why| Refusal::new(Code::SourceUntrusted, why))?;
+    let fetched = dfm_model::lock::git_identity(&fetched, cfg!(feature = "test-isolation"))?;
+    let grants = cx.grants()?;
+    Ok([declared, fetched]
+        .into_iter()
+        .find(|id| !grants.trusts(id)))
 }
 
 /// `packages --update` for a source tool: what [`maintain`] decides, which holds an installed
@@ -935,7 +944,7 @@ fn maintain_sourced(
     if matches!(state, PackageState::Missing(_))
         && let Some(cx) = cx
         && let Some(source) = uv_source(value, cx.root())?
-        && let Some(id) = ungranted(&source, cx)?
+        && let Some(id) = ungranted(runner, &source, cx)?
     {
         return Ok(PackageState::Ungranted(id));
     }

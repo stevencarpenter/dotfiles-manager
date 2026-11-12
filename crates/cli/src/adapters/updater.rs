@@ -1050,7 +1050,7 @@ fn uv_identities(env: &Env) -> Vec<Result<String, String>> {
                     let url = git.split(['?', '#']).next().unwrap_or_default();
                     ids.push(
                         git_id(url)
-                            .and_then(|_| fetch_url(env, url))
+                            .and_then(|_| fetch_url(env.provider, url, env.timeouts.short))
                             .and_then(|u| git_id(&u))
                             .map_err(why),
                     );
@@ -1254,18 +1254,19 @@ fn git_id(url: &str) -> Result<String, String> {
 }
 
 /// The url git fetches from for `url`: `git ls-remote --get-url` applies `url.*.insteadOf`
-/// from the user's git config and makes no network call.
-fn fetch_url(env: &Env, url: &str) -> Result<String, String> {
+/// from the user's git config and makes no network call. `r` is the runner of the command
+/// that clones.
+pub(crate) fn fetch_url(r: &Runner, url: &str, timeout: Duration) -> Result<String, String> {
     let why = |n: String| {
         format!("cannot resolve the source {url} with git ls-remote --get-url: {n}; nothing ran")
     };
-    env.provider.resolve("git").map_err(|e| why(e.detail))?;
+    r.resolve("git").map_err(|e| why(e.detail))?;
     let out = call(
-        env.provider,
+        r,
         "git",
         &args(&["ls-remote", "--get-url", url]),
         &[],
-        env.timeouts.short,
+        timeout,
     )
     .map_err(|(n, _)| why(n))?;
     match String::from_utf8_lossy(&out.stdout).trim() {
@@ -1287,7 +1288,7 @@ fn skills_identities(env: &Env, values: &[String]) -> Vec<Result<String, String>
         } else {
             format!("{id}.git")
         };
-        git_id(&fetch_url(env, &clone)?)
+        git_id(&fetch_url(env.provider, &clone, env.timeouts.short)?)
     }));
     ids
 }
