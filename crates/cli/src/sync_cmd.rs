@@ -2276,12 +2276,31 @@ fn declared_checkouts(
 
 /// Whether the git of the source checkout at `root` ignores `rel`
 /// (`git check-ignore -q -- <rel>`, exit 0). Any other answer is not ignored.
-fn git_ignores(git: &Git, root: &Path, rel: &Path) -> bool {
+pub(crate) fn git_ignores(git: &Git, root: &Path, rel: &Path) -> bool {
     let (Some(root), Some(rel)) = (root.to_str(), rel.to_str()) else {
         return false;
     };
     git.output(true, &["-C", root, "check-ignore", "-q", "--", rel])
         .is_ok_and(|o| o.success())
+}
+
+/// Whether a checkout at `path` would overlap a source checkout in `sources`: at or above one,
+/// or inside one whose git does not ignore it (`ignored(root, rel)`, with the canonical root).
+/// Paths are compared through links ([`real_path`]). The `checkouts` step and the
+/// `git-checkout/v1` plan share this rule (docs/upgrade.md).
+pub(crate) fn overlaps_source(
+    path: &Path,
+    sources: &[PathBuf],
+    ignored: &dyn Fn(&Path, &Path) -> bool,
+) -> bool {
+    let real = real_path(path);
+    sources.iter().any(|s| {
+        let root = real_path(s);
+        root.starts_with(&real)
+            || real
+                .strip_prefix(&root)
+                .is_ok_and(|rel| !ignored(&root, rel))
+    })
 }
 
 /// `p` through links: the nearest ancestor that exists, canonicalized, joined with the
@@ -2306,16 +2325,7 @@ fn declared_checkout(
 ) -> Result<updater::Checkout, String> {
     let d = checkout::declared(value).map_err(|e| format!("{id}: {}", e.detail))?;
     let path = home.join(d.path);
-    let real = real_path(&path);
-    // At or above a source checkout: refused. Inside one: only where its git ignores the path.
-    let overlaps = sources.iter().any(|s| {
-        let root = real_path(s);
-        root.starts_with(&real)
-            || real
-                .strip_prefix(&root)
-                .is_ok_and(|rel| !ignored(&root, rel))
-    });
-    if overlaps {
+    if overlaps_source(&path, sources, ignored) {
         return Err(format!(
             "{id}: {} is a dotfiles source checkout; sync updates it",
             path.display()

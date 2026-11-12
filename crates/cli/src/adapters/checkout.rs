@@ -86,6 +86,19 @@ pub(crate) fn declared(value: &Value) -> Result<Declared, Refusal> {
     })
 }
 
+/// `E_MANIFEST_INVALID` for a checkout at or above a source checkout, or inside one whose git
+/// does not ignore the path, with the note of the `checkouts` step: sync updates that tree.
+fn refuse_source_overlap(cx: &ScriptCx, r: &ResolvedResource, dir: &Path) -> Result<(), Refusal> {
+    if cx.overlaps_source(dir) {
+        return Err(invalid(format!(
+            "{}: {} is a dotfiles source checkout; sync updates it",
+            r.id,
+            dir.display()
+        )));
+    }
+    Ok(())
+}
+
 /// Runs a read-only `git -C <dir>` query. `Ok(None)` is an exit code other than 0.
 fn query(runner: &Runner, dir: &Path, rest: &[&str]) -> Result<Option<String>, Refusal> {
     let mut args = vec!["-C".to_string(), dir.display().to_string()];
@@ -120,6 +133,9 @@ pub(crate) fn probe(
 ) -> Result<PackageState, Refusal> {
     let d = declared(&r.value)?;
     let dir = runner.home.join(&d.path);
+    if let Some(cx) = cx {
+        refuse_source_overlap(cx, r, &dir)?;
+    }
     match fs::symlink_metadata(&dir) {
         Err(e) if e.kind() == ErrorKind::NotFound => {
             if let Some(cx) = cx
@@ -168,6 +184,7 @@ pub(crate) fn probe(
 /// run is removed first. A url that needs a grant is checked for it again first.
 pub(crate) fn install(runner: &Runner, r: &ResolvedResource, cx: &ScriptCx) -> Result<(), Refusal> {
     let d = declared(&r.value)?;
+    refuse_source_overlap(cx, r, &runner.home.join(&d.path))?;
     source_gate(cx, r, identity(&d.url)?)?;
     let dir = runner.home.join(&d.path);
     let (Some(parent), Some(name)) = (dir.parent(), dir.file_name().and_then(|n| n.to_str()))

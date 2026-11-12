@@ -291,7 +291,8 @@ pub(crate) fn probe(
 ) -> Result<Probed, Refusal> {
     let resolved = &loaded.resolved;
     let mut probed = Probed::default();
-    let scripts = || ScriptCx::new(ctx, sys, &loaded.root);
+    let scripts =
+        || ScriptCx::new(ctx, sys, &loaded.root).with_staged_tree(loaded.staged.as_deref());
     match args.scope {
         Scope::Packages if args.update => {
             probed.package = crate::adapters::package::update_facts(
@@ -517,7 +518,10 @@ pub(crate) fn generators_for<'a>(
             &loaded.root,
             ctx.runner(sys),
         )
-        .with_scripts(ScriptCx::for_install(ctx, sys, &loaded.root)),
+        .with_scripts(
+            ScriptCx::for_install(ctx, sys, &loaded.root)
+                .with_staged_tree(loaded.staged.as_deref()),
+        ),
         Scope::Secrets | Scope::Services => Generators::with_runner(
             &loaded.resolved,
             &loaded.sources,

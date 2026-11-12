@@ -4473,12 +4473,15 @@ fn a_checkout_in_an_ignored_directory_of_the_bound_checkout_is_pulled() {
         let o = u.sync(&[]);
         assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
         let s = stdout(&o);
-        assert!(u.fx.root.join("plugins/tool/.git").exists(), "{s}");
         let note = "is a dotfiles source checkout; sync updates it";
         if ignored {
+            assert!(u.fx.root.join("plugins/tool/.git").exists(), "{s}");
             assert!(s.contains("  current checkouts"), "{s}");
             assert!(!s.contains(note), "{s}");
         } else {
+            // The same rule at plan time: the packages scope refuses it, and nothing is cloned.
+            assert!(!u.fx.root.join("plugins/tool").exists(), "{s}");
+            assert!(s.contains("E_MANIFEST_INVALID"), "{s}");
             assert!(s.contains("  blocked checkouts"), "{s}");
             assert!(s.contains(note), "{s}");
         }

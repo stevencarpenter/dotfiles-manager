@@ -148,6 +148,9 @@ pub(crate) struct ScriptCx {
     root: PathBuf,
     /// The nested source paths of the lock at `root` (`sync_cmd::nested_paths`).
     nested: Option<Vec<String>>,
+    /// The staged copy that `sync` plans as the tree `root` will hold, when there is one: its
+    /// git answers whether a path is ignored ([`ScriptCx::overlaps_source`]).
+    staged_tree: Option<PathBuf>,
     /// The fetched scripts of this run by resource id, set by the probe under the writer lock
     /// and taken by the install. `None` once taken, so the postcondition probe never fetches.
     staged: Option<Mutex<BTreeMap<String, Option<Staged>>>>,
@@ -167,6 +170,7 @@ impl ScriptCx {
             git: Git::new(ctx, sys),
             root: root.to_path_buf(),
             nested: crate::sync_cmd::nested_paths(root),
+            staged_tree: None,
             staged: None,
         }
     }
@@ -189,6 +193,36 @@ impl ScriptCx {
     /// The bound checkout of this run.
     pub(crate) fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// The context with `tree`, the staged copy `sync` plans from, or as it is without one.
+    pub(crate) fn with_staged_tree(self, tree: Option<&Path>) -> ScriptCx {
+        ScriptCx {
+            staged_tree: tree.map(Path::to_path_buf),
+            ..self
+        }
+    }
+
+    /// Whether a checkout at `path` would overlap the bound checkout or a nested source
+    /// checkout ([`crate::sync_cmd::overlaps_source`]). Ignored paths are asked of the staged
+    /// copy when there is one, because that is the tree the run publishes.
+    pub(crate) fn overlaps_source(&self, path: &Path) -> bool {
+        let mut sources = vec![self.root.clone()];
+        sources.extend(
+            self.nested
+                .iter()
+                .flatten()
+                .map(|n| self.root.join(n))
+                .filter(|d| d.join(".git").exists()),
+        );
+        let live = fs::canonicalize(&self.root).unwrap_or_else(|_| self.root.clone());
+        crate::sync_cmd::overlaps_source(path, &sources, &|root, rel| {
+            let dir = match (&self.staged_tree, root.strip_prefix(&live)) {
+                (Some(tree), Ok(inner)) => tree.join(inner),
+                _ => root.to_path_buf(),
+            };
+            crate::sync_cmd::git_ignores(&self.git, &dir, rel)
+        })
     }
 
     /// The nested source paths of the lock at the bound checkout, `None` for an unreadable lock.
