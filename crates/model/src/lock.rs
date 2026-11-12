@@ -226,25 +226,28 @@ fn npm_name(p: &str) -> bool {
 /// (docs/sync.md, "Source identities"). It is stored in `packages`, beside `npm:`.
 pub const GO: &str = "go:";
 
-/// A Go module path: a lowercase host with a `.`, then one or more path components, each of
-/// `[A-Za-z0-9._~-]`. No component is empty, `.`, `..` or starts with `-`. No version (`@`), at
-/// most 256 bytes.
+/// A Go module path: a lowercase host with a `.` and no empty label, then one or more path
+/// components of `[A-Za-z0-9._~-]`. No component is empty, `.`, `..` or starts with `-`. No
+/// version (`@`), at most 256 bytes.
 fn go_module(p: &str) -> bool {
-    let mut parts = p.split('/');
-    let host = parts.next().unwrap_or_default();
-    let ok = |c: &str, lower: bool| {
+    let component = |c: &str, case_ok: fn(u8) -> bool| {
         !c.is_empty()
             && !matches!(c, "." | "..")
             && !c.starts_with('-')
-            && c.bytes().all(|b| {
-                (b.is_ascii_alphanumeric() && !(lower && b.is_ascii_uppercase()))
-                    || matches!(b, b'-' | b'.' | b'_' | b'~')
-            })
+            && c.bytes()
+                .all(|b| case_ok(b) || b.is_ascii_digit() || matches!(b, b'-' | b'.' | b'_' | b'~'))
     };
-    p.len() <= 256 && host.contains('.') && ok(host, true) && {
-        let mut rest = parts.peekable();
-        rest.peek().is_some() && rest.all(|c| ok(c, false))
-    }
+    let host_byte: fn(u8) -> bool = |b| b.is_ascii_lowercase();
+    let path_byte: fn(u8) -> bool = |b| b.is_ascii_alphabetic();
+    let mut parts = p.split('/');
+    let host = parts.next().unwrap_or_default();
+    let mut rest = parts.peekable();
+    p.len() <= 256
+        && host.contains('.')
+        && component(host, host_byte)
+        && host.split('.').all(|label| !label.is_empty())
+        && rest.peek().is_some()
+        && rest.all(|c| component(c, path_byte))
 }
 
 /// The prefix of an install script identity: `script:<url>`, the URL a `script/v1` declaration
@@ -306,8 +309,8 @@ pub fn trust_command(identity: &str) -> String {
 
 /// The identity of a source as a tool's own record names it (docs/sync.md, "Source
 /// identities"): a GitHub shorthand `o/r` is `https://github.com/o/r`, the SCP form
-/// `git@host:path.git` is `ssh://git@host/path`, a URL loses a `.git` suffix, and an `npm:`
-/// identity stays as it is. The result must pass [`check_identity`]. A value that maps to
+/// `git@host:path.git` is `ssh://git@host/path`, a URL loses a `.git` suffix, and an `npm:` or
+/// `go:` identity stays as it is. The result must pass [`check_identity`]. A value that maps to
 /// nothing is `E_SOURCE_UNTRUSTED`.
 pub fn source_identity(value: &str, allow_file: bool) -> Result<String, Refusal> {
     let unsuffixed = |p: &'_ str| p.strip_suffix(".git").unwrap_or(p).to_string();
@@ -331,7 +334,7 @@ pub fn source_identity(value: &str, allow_file: bool) -> Result<String, Refusal>
         format!("https://github.com/{value}")
     } else {
         return Err(untrusted(format!(
-            "source {:?} is not a URL, git@host:path, owner/repo or npm:<package>",
+            "source {:?} is not a URL, git@host:path, owner/repo, npm:<package> or go:<module>",
             mask_userinfo(value)
         )));
     };
@@ -340,12 +343,13 @@ pub fn source_identity(value: &str, allow_file: bool) -> Result<String, Refusal>
 }
 
 /// The identity of a git remote: [`source_identity`], limited to git origins. Git reads
-/// `npm:skills` as the SCP form (host `npm`), so an `npm:` identity, whose grant covers only an
-/// npm package, is `E_SOURCE_UNTRUSTED` here.
+/// `npm:skills` as the SCP form (host `npm`), and `go:golang.org/x/tools` the same with host
+/// `go`, so an `npm:` or `go:` identity, whose grant covers only a package or module, is
+/// `E_SOURCE_UNTRUSTED` here.
 pub fn git_identity(value: &str, allow_file: bool) -> Result<String, Refusal> {
-    if value.starts_with(NPM) {
+    if value.starts_with(NPM) || value.starts_with(GO) {
         return Err(untrusted(format!(
-            "git remote {value:?} names an npm: identity; an npm grant does not cover a git fetch"
+            "git remote {value:?} names an npm: or go: identity; a package grant does not cover a git fetch"
         )));
     }
     source_identity(value, allow_file)
@@ -732,9 +736,16 @@ ref = "refs/heads/main"
             "go:golang.org//x",
             "go:golang.org/../x",
             "go:-x.org/y",
+            "go:.org/x",
+            "go:a..b/x",
+            "go:x./y",
+            "go:golang.org",
         ] {
             assert!(check_identity(bad, false).is_err(), "{bad}");
         }
+        let long = format!("go:example.com/{}", "a".repeat(250));
+        assert!(check_identity(&long, false).is_err());
+        assert!(git_identity("go:golang.org/x/tools", false).is_err());
         let mut g = Grants::default();
         g.grant("go:golang.org/x/tools/gopls", "2026-11-11T00:00:00Z");
         assert!(g.trusts("go:golang.org/x/tools/gopls"));
