@@ -8,7 +8,7 @@ use dfm_model::state::Status;
 use dfm_model::updater::Updater;
 use dfm_model::{Code, Refusal};
 use std::collections::BTreeSet;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 /// How long each command may run.
@@ -563,14 +563,14 @@ fn field(v: &serde_json::Value, k: &str) -> String {
         .to_string()
 }
 
-/// `mise outdated --json`: an object keyed by tool name, with `current` and `latest`. The
-/// global configuration applies, because the updater runs outside any project directory.
-fn mise_outdated(env: &Env) -> Result<Vec<Item>, (String, bool)> {
+/// `mise outdated --json`: an object keyed by tool name, with `current` and `latest`, for the
+/// files that `mise config ls` lists from the runner directory.
+fn mise_outdated(env: &Env, registry: &[(String, String)]) -> Result<Vec<Item>, (String, bool)> {
     let out = call(
         env.provider,
         "mise",
         &args(&["outdated", "--json"]),
-        &[],
+        registry,
         env.timeouts.short,
     )?;
     let bad = |why: String| (format!("mise outdated --json: {why}"), false);
@@ -587,94 +587,200 @@ fn mise_outdated(env: &Env) -> Result<Vec<Item>, (String, bool)> {
         .collect())
 }
 
-/// The identities the global mise configuration's backend tools fetch from, as `source_identity`
-/// maps them: `github:` and `ubi:` take an `o/r`, `npm:` and `go:` stay as they are. A registry
-/// name and `core:` fetch from mise's own registry and need none. Any other backend maps to no
-/// identity, and so does an unreadable file.
-// shortcut: reads only ~/.config/mise/config.toml and conf.d/; MISE_GLOBAL_CONFIG_FILE and
-// config.local.toml are not read, upgrade if a machine sets them.
+/// The configuration files that `mise install` reads from the runner directory, as `mise config
+/// ls --json` lists them (`[{"path": .., ..}]`). The listing reads local files only.
+fn mise_files(env: &Env) -> Result<Vec<PathBuf>, String> {
+    let why = |n: String| format!("cannot list the mise configuration files: {n}; nothing ran");
+    let out = call(
+        env.provider,
+        "mise",
+        &args(&["config", "ls", "--json"]),
+        &npm_env(&[]),
+        env.timeouts.short,
+    )
+    .map_err(|(n, _)| why(n))?;
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout)
+        .map_err(|e| why(format!("mise config ls --json printed no JSON ({e})")))?;
+    v.as_array()
+        .ok_or_else(|| why("mise config ls --json printed no list".into()))?
+        .iter()
+        .map(|f| {
+            f["path"]
+                .as_str()
+                .map(PathBuf::from)
+                .ok_or_else(|| why("mise config ls --json listed an entry without a path".into()))
+        })
+        .collect()
+}
+
+/// The identities that the tools of the files `mise config ls` lists fetch from, as
+/// `source_identity` maps them: `github:` and `ubi:` take an `o/r`, `npm:` and `go:` stay as
+/// they are. A registry name and `core:` fetch from mise's own registry and need none. Each
+/// `Err` is a note that blocks the row: a listing that fails, a file that cannot be read or
+/// parsed, a backend that maps to no identity, and any configuration that can point a tool at
+/// another source (a `[plugins]`, `[tool_alias]` or `[alias]` entry, a tool option outside
+/// the allowlist, or a setting whose name contains `url` or `registry`).
 fn mise_identities(env: &Env) -> Vec<Result<String, String>> {
-    let dir = env.home.join(".config/mise");
-    let mut files = vec![dir.join("config.toml")];
-    let mut extra = match std::fs::read_dir(dir.join("conf.d")) {
-        Ok(rd) => rd
-            .filter_map(|e| e.ok().map(|e| e.path()))
-            .filter(|p| p.extension().is_some_and(|x| x == "toml"))
-            .collect(),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => vec![],
-        Err(e) => return vec![Err(format!("cannot read {}/conf.d: {e}", dir.display()))],
+    let files = match mise_files(env) {
+        Ok(f) => f,
+        Err(why) => return vec![Err(why)],
     };
-    extra.sort();
-    files.extend(extra);
     let mut ids = Vec::new();
     for file in files {
+        let at = file.display();
         let text = match std::fs::read_to_string(&file) {
             Ok(t) => t,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
             Err(e) => {
-                ids.push(Err(format!("cannot read {}: {e}", file.display())));
+                ids.push(Err(format!("cannot read {at}: {e}")));
                 continue;
             }
         };
+        if file.file_name().is_some_and(|n| n == ".tool-versions") {
+            for line in text.lines() {
+                let line = line.split_once('#').map_or(line, |(l, _)| l);
+                let mut words = line.split_whitespace();
+                match (words.next(), words.next()) {
+                    (None, _) => {}
+                    (Some(tool), Some(_)) => ids.extend(mise_tool(&file, tool, None)),
+                    (Some(tool), None) => {
+                        ids.push(Err(format!("{at}: the line for {tool} names no version")))
+                    }
+                }
+            }
+            continue;
+        }
         let doc: toml::Table = match text.parse() {
             Ok(d) => d,
             Err(e) => {
-                ids.push(Err(format!("{}: {e}", file.display())));
+                ids.push(Err(format!("{at}: {e}")));
                 continue;
             }
         };
-        let tools = doc.get("tools").and_then(|t| t.as_table());
-        for key in tools.into_iter().flat_map(|t| t.keys()) {
-            let tool = key.split_once('[').map_or(key.as_str(), |(t, _)| t);
-            let Some((backend, value)) = tool.split_once(':') else {
-                continue;
-            };
-            match backend {
-                "core" => {}
-                "github" | "ubi" | "npm" | "go" => {
-                    let value = if matches!(backend, "github" | "ubi") {
-                        value.to_string()
-                    } else {
-                        tool.to_string()
-                    };
-                    ids.push(
-                        source_identity(&value, cfg!(feature = "test-isolation"))
-                            .map_err(|e| format!("{}: {}", e.code.as_str(), e.detail)),
-                    );
-                }
-                _ => ids.push(Err(format!(
-                    "mise tool {key}: the {backend} backend maps to no identity; declare it as a registry name or a github:, ubi:, npm: or go: tool"
-                ))),
+        for table in ["plugins", "tool_alias", "alias"] {
+            if doc
+                .get(table)
+                .is_some_and(|t| t.as_table().is_none_or(|t| !t.is_empty()))
+            {
+                ids.push(Err(format!(
+                    "{at}: the [{table}] table can point a tool at another source; remove it"
+                )));
             }
         }
+        if let Some(settings) = doc.get("settings").and_then(|t| t.as_table()) {
+            mise_settings(&file, "settings", settings, &mut ids);
+        }
+        let tools = doc.get("tools").and_then(|t| t.as_table());
+        for (key, value) in tools.into_iter().flatten() {
+            ids.extend(mise_tool(&file, key, Some(value)));
+        }
+    }
+    ids
+}
+
+/// One note per setting under `t`, at any depth, whose name contains `url` or `registry`.
+fn mise_settings(
+    file: &Path,
+    prefix: &str,
+    t: &toml::Table,
+    ids: &mut Vec<Result<String, String>>,
+) {
+    for (k, v) in t {
+        let name = format!("{prefix}.{k}");
+        let lower = k.to_ascii_lowercase();
+        if lower.contains("url") || lower.contains("registry") {
+            ids.push(Err(format!(
+                "{}: the mise setting {name} can change where tools are fetched from; remove it",
+                file.display()
+            )));
+        } else if let Some(sub) = v.as_table() {
+            mise_settings(file, &name, sub, ids);
+        }
+    }
+}
+
+/// The identity of one mise tool key, with a note for each option outside the allowlist: `exe`,
+/// `bin` and `matching` in the key's `[...]`, `version` and `minimum_release_age` in a value
+/// table.
+fn mise_tool(file: &Path, key: &str, value: Option<&toml::Value>) -> Vec<Result<String, String>> {
+    let (tool, options) = key.split_once('[').unwrap_or((key, ""));
+    let in_key = options
+        .trim_end_matches(']')
+        .split(',')
+        .map(|o| o.split_once('=').map_or(o, |(n, _)| n).trim())
+        .filter(|n| !n.is_empty() && !matches!(*n, "exe" | "bin" | "matching"));
+    let tables: Vec<&toml::Table> = match value {
+        Some(toml::Value::Table(t)) => vec![t],
+        Some(toml::Value::Array(a)) => a.iter().filter_map(|v| v.as_table()).collect(),
+        _ => vec![],
+    };
+    let in_value = tables
+        .into_iter()
+        .flat_map(|t| t.keys().map(String::as_str))
+        .filter(|n| !matches!(*n, "version" | "minimum_release_age"));
+    let mut ids: Vec<Result<String, String>> = in_key
+        .chain(in_value)
+        .map(|n| {
+            Err(format!(
+                "{}: mise tool {key}: the option {n} can change where it fetches from; remove it",
+                file.display()
+            ))
+        })
+        .collect();
+    let Some((backend, value)) = tool.split_once(':') else {
+        return ids;
+    };
+    match backend {
+        "core" => {}
+        "github" | "ubi" | "npm" | "go" => {
+            let value = if matches!(backend, "github" | "ubi") {
+                value
+            } else {
+                tool
+            };
+            ids.push(
+                source_identity(value, cfg!(feature = "test-isolation"))
+                    .map_err(|e| format!("{}: {}", e.code.as_str(), e.detail)),
+            );
+        }
+        _ => ids.push(Err(format!(
+            "mise tool {key}: the {backend} backend maps to no identity; declare it as a registry name or a github:, ubi:, npm: or go: tool"
+        ))),
     }
     ids
 }
 
 /// `mise install` for the configured tools that are missing, then `mise upgrade` without
 /// `--bump`: the newest version inside each configured range, so no configuration file is
-/// written. A backend tool without a grant blocks the row before any command. mise removes the replaced version after its own grace period
-/// (`upgrade.prune_after`).
+/// written. A tool or setting that [`mise_identities`] does not clear blocks the row before
+/// any command that fetches. Every mise command uses the default npm registry, for each
+/// `npm:@scope` too, so an `npm:` grant covers that registry only. mise removes the replaced
+/// version after its own grace period (`upgrade.prune_after`).
 fn mise(mut d: Draft, env: &Env) -> Row {
     if let Err(e) = env.provider.resolve("mise") {
         d.notes.push(e.detail);
         return d.end(Status::Blocked);
     }
-    let untrusted = trust_notes(Updater::Mise, env);
+    let ids = mise_identities(env);
+    let npm: Vec<String> = ids
+        .iter()
+        .filter_map(|id| id.as_ref().ok()?.strip_prefix(NPM).map(str::to_string))
+        .collect();
+    let untrusted = untrusted(ids, env.grants);
     if !untrusted.is_empty() {
         d.notes.extend(untrusted);
         return d.end(Status::Blocked);
     }
+    let registry = npm_env(&npm);
     if let Err(e) = call(
         env.provider,
         "mise",
         &args(&["install"]),
-        &[],
+        &registry,
         env.timeouts.long,
     ) {
         return d.stop(e);
     }
-    let list = || mise_outdated(env);
+    let list = || mise_outdated(env, &registry);
     let before = match list() {
         Ok(l) => l,
         Err(e) => return d.stop(e),
@@ -684,7 +790,7 @@ fn mise(mut d: Draft, env: &Env) -> Row {
             env.provider,
             "mise",
             &args(&["upgrade"]),
-            &[],
+            &registry,
             env.timeouts.long,
         )
     };
@@ -2640,23 +2746,46 @@ mod tests {
     // ---- mise, rustup, npm, uv (DFM-85) ------------------------------------------------------
 
     impl T {
-        /// `mise` whose `outdated --json` prints `st/mise-outdated` and whose bare `upgrade`
-        /// replaces it with `st/mise-after`. Any other upgrade form (`--bump`, a name) exits 65,
-        /// and so does `install` with an argument.
+        /// `mise` whose `config ls --json` lists each path in `st/mise-files` (and exits 1 with
+        /// `st/mise-config-fail`), whose `outdated --json` prints `st/mise-outdated` and whose
+        /// bare `upgrade` replaces it with `st/mise-after`. Any other upgrade form (`--bump`, a
+        /// name) exits 65, and so does `install` with an argument. Each call appends its first
+        /// argument and its `npm_config_` variables to `st/mise-env`.
         fn mise(&self, outdated: &str, after: &str) {
             fs::write(self.root.join("st/mise-outdated"), outdated).unwrap();
             fs::write(self.root.join("st/mise-after"), after).unwrap();
             self.script(
                 &self.bin.join("mise"),
-                "case \"$1\" in\n  install) [ -z \"$2\" ] || exit 65 ;;\n  outdated) cat \"$st/mise-outdated\" ;;\n  upgrade) [ -z \"$2\" ] || exit 65; cp \"$st/mise-after\" \"$st/mise-outdated\" ;;\n  *) exit 64 ;;\nesac",
+                "printf '%s ' \"$1\" >> \"$st/mise-env\"; env | grep '^npm_config_' | sort | tr '\\n' ' ' >> \"$st/mise-env\"; echo >> \"$st/mise-env\"\ncase \"$1\" in\n  config) [ \"$2 $3\" = 'ls --json' ] || exit 65; [ -f \"$st/mise-config-fail\" ] && exit 1; printf '['; sep=; [ -f \"$st/mise-files\" ] && while read -r p; do printf '%s{\"path\":\"%s\",\"tools\":[],\"override\":false}' \"$sep\" \"$p\"; sep=,; done < \"$st/mise-files\"; echo ']' ;;\n  install) [ -z \"$2\" ] || exit 65 ;;\n  outdated) cat \"$st/mise-outdated\" ;;\n  upgrade) [ -z \"$2\" ] || exit 65; cp \"$st/mise-after\" \"$st/mise-outdated\" ;;\n  *) exit 64 ;;\nesac",
             );
         }
 
-        /// Writes a mise configuration file under `~/.config/mise/`.
+        /// Writes a mise configuration file under `~/.config/mise/` and lists it.
         fn mise_config(&self, rel: &str, body: &str) {
-            let path = self.home.join(".config/mise").join(rel);
+            self.mise_file(&self.home.join(".config/mise").join(rel), body);
+        }
+
+        /// Writes a mise configuration file at `path` and adds it to what `mise config ls`
+        /// lists.
+        fn mise_file(&self, path: &Path, body: &str) {
             fs::create_dir_all(path.parent().unwrap()).unwrap();
             fs::write(path, body).unwrap();
+            self.mise_list(path);
+        }
+
+        /// Adds `path` to what `mise config ls` lists, without writing it.
+        fn mise_list(&self, path: &Path) {
+            use std::io::Write;
+            let mut f = fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(self.root.join("st/mise-files"))
+                .unwrap();
+            writeln!(f, "{}", path.display()).unwrap();
+        }
+
+        fn mise_env(&self) -> String {
+            fs::read_to_string(self.root.join("st/mise-env")).unwrap_or_default()
         }
 
         /// `rustup` in `~/.cargo/bin` whose `check` prints `st/rustup-check` and exits 100 when
@@ -2726,6 +2855,7 @@ mod tests {
         assert_eq!(
             t.calls(),
             vec![
+                "mise config ls --json".to_string(),
                 "mise install".to_string(),
                 "mise outdated --json".to_string(),
                 "mise upgrade".to_string(),
@@ -2746,6 +2876,7 @@ mod tests {
         assert_eq!(
             t.calls(),
             [
+                "mise config ls --json",
                 "mise install",
                 "mise outdated --json",
                 "mise upgrade",
@@ -2772,7 +2903,7 @@ mod tests {
                 .all(|n| n.starts_with("E_SOURCE_UNTRUSTED: no grant for ")),
             "{r:?}"
         );
-        assert_eq!(t.log(), "");
+        assert_eq!(t.calls(), ["mise config ls --json"]);
         assert!(preview(Updater::Mise, &t.env()).starts_with("blocked: E_SOURCE_UNTRUSTED"));
     }
 
@@ -2791,12 +2922,13 @@ mod tests {
         }
         let r = run(Updater::Mise, &t.env());
         assert_eq!(r.status, Status::Updated, "{r:?}");
-        assert_eq!(t.calls()[0], "mise install");
+        assert_eq!(t.calls()[..2], ["mise config ls --json", "mise install"]);
     }
 
     #[test]
     fn mise_identities_strip_tool_options() {
         let t = T::new();
+        t.mise("{}", "{}");
         t.mise_config(
             "config.toml",
             "[tools]\n\"ubi:o/r[exe=x]\" = \"latest\"\n\"aqua:o/r\" = \"latest\"\n\"cargo:x\" = \"latest\"\n\"core:node\" = \"22\"\nnode = \"22\"\n",
@@ -2828,7 +2960,129 @@ mod tests {
         assert_eq!(r.status, Status::Blocked, "{r:?}");
         assert_eq!(r.notes.len(), 1, "{r:?}");
         assert!(r.notes[0].contains("config.toml"), "{r:?}");
-        assert_eq!(t.log(), "");
+        assert_eq!(t.calls(), ["mise config ls --json"]);
+    }
+
+    /// Blocks the mise row and returns its notes, after checking that only the local listing
+    /// ran.
+    fn mise_blocked(t: &T) -> Vec<String> {
+        let r = run(Updater::Mise, &t.env());
+        assert_eq!(r.status, Status::Blocked, "{r:?}");
+        assert_eq!(t.calls(), ["mise config ls --json"]);
+        r.notes
+    }
+
+    #[test]
+    fn mise_gates_every_file_that_mise_config_ls_lists() {
+        let mut t = T::new();
+        t.grants = Grants::default();
+        t.mise(MISE_TWO, "{}");
+        t.mise_file(&t.home.join("mise.toml"), MISE_GITHUB);
+        t.mise_file(
+            &t.home.join(".tool-versions"),
+            "# pins\nnode 22\n\nnpm:evil 1.0 # trailing\n",
+        );
+        let notes = mise_blocked(&t);
+        assert_eq!(
+            notes,
+            [
+                "E_SOURCE_UNTRUSTED: no grant for https://github.com/o/r; review it, then run dfm sync --trust-origin 'https://github.com/o/r'",
+                "E_SOURCE_UNTRUSTED: no grant for npm:evil; review it, then run dfm sync --trust-origin 'npm:evil'"
+            ]
+        );
+    }
+
+    #[test]
+    fn mise_with_a_listed_file_it_cannot_read_or_list_is_blocked() {
+        let t = T::new();
+        t.mise(MISE_TWO, "{}");
+        let gone = t.home.join("gone/mise.toml");
+        t.mise_list(&gone);
+        let notes = mise_blocked(&t);
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert!(notes[0].contains(&gone.display().to_string()), "{notes:?}");
+        let t = T::new();
+        t.mise(MISE_TWO, "{}");
+        t.mise_file(&t.home.join(".tool-versions"), "node\n");
+        let notes = mise_blocked(&t);
+        assert!(notes[0].contains(".tool-versions"), "{notes:?}");
+        let t = T::new();
+        t.mise(MISE_TWO, "{}");
+        fs::write(t.root.join("st/mise-config-fail"), "").unwrap();
+        let notes = mise_blocked(&t);
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert!(notes[0].contains("mise config ls --json"), "{notes:?}");
+    }
+
+    #[test]
+    fn mise_with_a_remapping_table_is_blocked() {
+        let t = T::new();
+        t.mise(MISE_TWO, "{}");
+        t.mise_config(
+            "config.toml",
+            "[plugins]\nnode = \"https://h/o/vfox-node\"\n[tool_alias]\nnode = \"github:o/r\"\n[alias.go]\nx = \"1\"\n",
+        );
+        t.mise_config("conf.d/empty.toml", "[alias]\n[plugins]\n");
+        let notes = mise_blocked(&t);
+        assert_eq!(notes.len(), 3, "{notes:?}");
+        for table in ["[alias]", "[plugins]", "[tool_alias]"] {
+            assert!(
+                notes
+                    .iter()
+                    .any(|n| n.contains("config.toml") && n.contains(table)),
+                "{table}: {notes:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn mise_with_a_fetch_option_or_url_setting_is_blocked() {
+        let t = T::new();
+        t.mise(MISE_TWO, "{}");
+        t.mise_config(
+            "config.toml",
+            "[tools]\n\"github:o/r\" = { version = \"1\", minimum_release_age = \"0s\", api_url = \"https://h\" }\n\"ubi:o/r[exe=x,matching=y,bin=z,provider=gitlab]\" = \"latest\"\nnode = [{ version = \"22\", postinstall = \"x\" }]\n[settings]\ntrusted_config_paths = [\"~/x\"]\nurl_replacements = { a = \"b\" }\n[settings.aqua]\nregistry_url = \"https://h\"\n",
+        );
+        let notes = mise_blocked(&t);
+        let has = |a: &str, b: &str| notes.iter().any(|n| n.contains(a) && n.contains(b));
+        assert!(has("github:o/r", "api_url"), "{notes:?}");
+        assert!(has("ubi:o/r", "provider"), "{notes:?}");
+        assert!(has("node", "postinstall"), "{notes:?}");
+        assert!(has("config.toml", "settings.url_replacements"), "{notes:?}");
+        assert!(
+            has("config.toml", "settings.aqua.registry_url"),
+            "{notes:?}"
+        );
+        // github:o/r and ubi:o/r are one identity without a grant; the allowed options add no
+        // note.
+        assert_eq!(notes.len(), 6, "{notes:?}");
+    }
+
+    #[test]
+    fn mise_install_and_upgrade_use_the_default_npm_registry_for_each_scope() {
+        let mut t = T::new();
+        t.mise(MISE_TWO, "{}");
+        t.mise_config(
+            "config.toml",
+            "[tools]\n\"npm:@s/x\" = \"latest\"\n\"npm:pyright\" = \"latest\"\n",
+        );
+        for id in ["npm:@s/x", "npm:pyright"] {
+            t.grants.grant(id, "2026-11-02T00:00:00Z");
+        }
+        let r = run(Updater::Mise, &t.env());
+        assert_eq!(r.status, Status::Updated, "{r:?}");
+        let env = t.mise_env();
+        for cmd in ["install", "upgrade"] {
+            let line = env
+                .lines()
+                .find(|l| l.starts_with(&format!("{cmd} ")))
+                .unwrap_or_else(|| panic!("{cmd}: {env}"));
+            assert!(
+                line.contains(&format!("npm_config_registry={NPM_REGISTRY}"))
+                    && line.contains(&format!("npm_config_@s:registry={NPM_REGISTRY}")),
+                "{line}"
+            );
+        }
     }
 
     #[test]
@@ -2840,6 +3094,7 @@ mod tests {
         assert_eq!(
             t.calls(),
             vec![
+                "mise config ls --json".to_string(),
                 "mise install".to_string(),
                 "mise outdated --json".to_string()
             ]
