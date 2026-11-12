@@ -81,7 +81,7 @@ Owner decision, 2026-11-11: the fantasy-sports repository (`ssh://git@github.com
 
 ### mise sources
 
-Owner decision, 2026-11-11: `mise install` and `mise upgrade` are gated. Before any mise command, the `mise` updater reads every file mise can read for the runner directory. The gate first finds, without running mise, every file mise can read for the runner directory under HOME: in that directory and each parent up to `/`, `.tool-versions`, `mise*.toml` and `.mise*.toml` (`mise.toml`, `mise.local.toml`, `mise.<env>.toml`), `.config/mise*.toml`, and `config*.toml` and `mise*.toml` in `.config/mise/`, `.mise/` and `mise/` with every `conf.d/*.toml` there; then the same names in `~/.config/mise/` and `/etc/mise/`. It reads each one (a `.tool-versions` file as `<tool> <version>` lines) and maps each tool of a non-registry backend to an identity:
+Owner decision, 2026-11-11: `mise install` and `mise upgrade` are gated. Before any mise command, the `mise` updater finds the mise files without running mise: in the runner directory under HOME and each parent up to `/`, `.tool-versions`, `mise*.toml` and `.mise*.toml` (`mise.toml`, `mise.local.toml`, `mise.<env>.toml`), `.config/mise*.toml`, and `config*.toml` and `mise*.toml` in `.config/mise/`, `.mise/` and `mise/` with every `conf.d/*.toml` there; then the same names in `~/.config/mise/` and `/etc/mise/`. mise also reads files below a `conf.d` (such as `conf.d/<dir>/mise.toml`), which the gate does not enter: any `conf.d` entry that is not a `*.toml` file (a directory, a dangling link, a special file or another name) blocks the row with a note that names it. A link to a `*.toml` file is read as the file it names, because the dotfiles link these files from the checkout. It reads each one (a `.tool-versions` file as `<tool> <version>` lines) and maps each tool of a non-registry backend to an identity:
 
 - `github:o/r` and `ubi:o/r` map to `https://github.com/o/r`.
 - `npm:<name>` maps to `npm:<name>`.
@@ -93,6 +93,7 @@ Each of these also blocks the row, with one note that names the file and the ent
 - A file that cannot be read or parsed.
 - A template (`{{`, `{%` or `{#`): mise renders it to read the file, and a template can run a command.
 - A non-empty `[hooks]` table: `mise install` runs its commands.
+- A `conf.d` entry that is not a `*.toml` file, because mise reads files below it.
 - A non-empty `[plugins]`, `[tool_alias]` or `[alias]` table.
 - A tool option other than `version` or `minimum_release_age` in a value table, or other than `exe`, `bin` or `matching` in a `[...]` key suffix.
 - Any setting under `[settings]`, at any depth, other than `trusted_config_paths`.
@@ -104,6 +105,8 @@ Only when every file passes and every identity has a grant does `mise config ls 
 Every mise command (`config ls`, `ls`, `install`, `outdated`, `upgrade`) runs with the default npm registry, also for each `npm:@scope` the files name, so an `npm:` grant covers that registry only. It also runs with Go at its defaults: `GOENV=off` (so Go's own env file from `go env -w` is not read), `GOPROXY=https://proxy.golang.org,direct`, `GOSUMDB=sum.golang.org`, `GOTOOLCHAIN=local`, and `GOFLAGS`, `GONOSUMDB`, `GONOSUMCHECK`, `GOPRIVATE`, `GONOPROXY` and `GOINSECURE` empty. A `go:` grant names a module, and the public Go proxy serves it.
 
 `mise ls --installed --json` runs before and after `mise install`. Each tool version the install adds is a note and makes the row `updated`.
+
+The `skills` updater runs `mise exec`, which renders the same files. Before it, the same file checks run (the files, the `conf.d` rule, templates, `[hooks]`, read and parse errors), without the backend-tool grants. `mise exec` gets the same environment, and `MISE_EXEC_AUTO_INSTALL=false` and `MISE_NOT_FOUND_AUTO_INSTALL=false`, so it installs no configured tool.
 
 One ungranted identity blocks the whole row before any mise command that fetches, with one note per identity, as for `skills` (trust design, anti-goal "a partial updater run"). This changes DFM-85's rule that mise is not gated. docs/upgrade.md ("Source trust") and docs/toolchains.md change with it. The current live tools need grants once, on the first sync after the slice; the slice's PR description lists the `--trust-origin` commands for the M5's current config.
 

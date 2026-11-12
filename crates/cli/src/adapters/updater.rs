@@ -212,11 +212,16 @@ pub fn run(u: Updater, env: &Env) -> Row {
                 d.notes.extend(untrusted);
                 return d.end(Status::Blocked);
             }
+            // No auto install: a configured tool is installed by the gated mise updater only.
+            let mut exec_env = mise_env(&[]);
+            for var in ["MISE_EXEC_AUTO_INSTALL", "MISE_NOT_FOUND_AUTO_INSTALL"] {
+                exec_env.push((var.to_string(), "false".to_string()));
+            }
             match call(
                 env.provider,
                 "mise",
                 &args(&["exec", "--", "npx", "skills", "update"]),
-                &npm_env(&[]),
+                &exec_env,
                 env.timeouts.short,
             ) {
                 Ok(_) => {
@@ -620,8 +625,11 @@ fn mise_files(env: &Env) -> Result<Vec<PathBuf>, String> {
 /// `config*.toml` and `mise*.toml` in `.config/mise/`, `.mise/` and `mise/` with every
 /// `conf.d/*.toml` there; then the same names in the global `~/.config/mise/` and the system
 /// `/etc/mise/`. A directory that cannot be listed is still probed for the fixed names; a file
-/// missed here is caught when `mise config ls` lists it.
-fn mise_candidates(env: &Env) -> BTreeSet<PathBuf> {
+/// missed here is caught when `mise config ls` lists it. mise also reads files below a
+/// `conf.d` (`conf.d/<dir>/mise.toml`), which this walk does not enter, so each `conf.d` entry
+/// that is not a `*.toml` regular file, through a link or not, is a note that blocks: a
+/// directory, a link to one, a dangling link, a special file or any other name.
+fn mise_candidates(env: &Env) -> (BTreeSet<PathBuf>, Vec<String>) {
     // (directory, name prefixes of its `.toml` files; empty is every `.toml` file)
     type Dirs = Vec<(PathBuf, &'static [&'static str])>;
     fn config_dir(d: PathBuf, dirs: &mut Dirs, fixed: &mut Vec<PathBuf>) {
@@ -651,22 +659,43 @@ fn mise_candidates(env: &Env) -> BTreeSet<PathBuf> {
     config_dir(env.home.join(".config/mise"), &mut dirs, &mut fixed);
     config_dir(PathBuf::from("/etc/mise"), &mut dirs, &mut fixed);
     let mut out: BTreeSet<PathBuf> = fixed.into_iter().filter(|p| p.is_file()).collect();
+    // A set: the global directory is also HOME's `.config/mise`, so it is walked twice.
+    let mut notes = BTreeSet::new();
     for (dir, prefixes) in dirs {
         let Ok(entries) = std::fs::read_dir(&dir) else {
             continue;
         };
+        // Only a `conf.d` has no prefixes.
+        let conf_d = prefixes.is_empty();
         for e in entries.filter_map(Result::ok) {
             let name = e.file_name();
             let name = name.to_string_lossy();
-            if name.ends_with(".toml")
-                && (prefixes.is_empty() || prefixes.iter().any(|p| name.starts_with(p)))
-                && e.path().is_file()
-            {
+            let toml = name.ends_with(".toml") && e.path().is_file();
+            if toml && (conf_d || prefixes.iter().any(|p| name.starts_with(p))) {
                 out.insert(e.path());
+            } else if conf_d {
+                notes.insert(format!(
+                    "{}: an entry in a mise conf.d directory that is not a *.toml file; mise can read files below it that dfm does not check; remove it",
+                    e.path().display()
+                ));
             }
         }
     }
-    out
+    (out, notes.into_iter().collect())
+}
+
+/// Why mise must not read the configuration, one note each, or nothing: a `conf.d` entry of
+/// [`mise_candidates`], or a candidate file that cannot be read or parsed, holds a template,
+/// or has a non-empty `[hooks]` table. Every mise command renders the configuration
+/// (`mise exec` too), and a template can run a command.
+fn mise_render_notes(env: &Env) -> Vec<String> {
+    let (files, mut notes) = mise_candidates(env);
+    let mut ids = Vec::new();
+    for f in &files {
+        mise_gate_file(f, &mut ids, true);
+    }
+    notes.extend(ids.into_iter().filter_map(Result::err));
+    notes
 }
 
 /// The identities that the tools of the mise configuration fetch from, as `source_identity`
@@ -681,13 +710,13 @@ fn mise_candidates(env: &Env) -> BTreeSet<PathBuf> {
 /// file passes and every identity has a grant does `mise config ls --json` run; a listing that
 /// fails, or a path it lists that is not a candidate, is a note too.
 fn mise_identities(env: &Env) -> Vec<Result<String, String>> {
-    let candidates = mise_candidates(env);
-    let mut ids = Vec::new();
+    let (candidates, entries) = mise_candidates(env);
+    let mut ids: Vec<Result<String, String>> = entries.into_iter().map(Err).collect();
     // One note per lockfile, also when several files share its directory.
     let mut locks = BTreeSet::new();
     for file in &candidates {
         locks.extend(mise_locks(file));
-        mise_gate_file(file, &mut ids);
+        mise_gate_file(file, &mut ids, false);
     }
     ids.extend(locks.into_iter().map(Err));
     if ids
@@ -721,7 +750,9 @@ fn mise_identities(env: &Env) -> Vec<Result<String, String>> {
 }
 
 /// Reads one mise configuration file into `ids`: its identities and the notes that block.
-fn mise_gate_file(file: &Path, ids: &mut Vec<Result<String, String>>) {
+/// `render_only` keeps the checks that matter before mise reads the file at all (read, parse,
+/// template, `[hooks]`) and skips the sources.
+fn mise_gate_file(file: &Path, ids: &mut Vec<Result<String, String>>, render_only: bool) {
     let at = file.display();
     let text = match std::fs::read_to_string(file) {
         Ok(t) => t,
@@ -737,6 +768,9 @@ fn mise_gate_file(file: &Path, ids: &mut Vec<Result<String, String>>) {
         return;
     }
     if file.file_name().is_some_and(|n| n == ".tool-versions") {
+        if render_only {
+            return;
+        }
         for line in text.lines() {
             let line = line.split_once('#').map_or(line, |(l, _)| l);
             let mut words = line.split_whitespace();
@@ -761,17 +795,20 @@ fn mise_gate_file(file: &Path, ids: &mut Vec<Result<String, String>>) {
         doc.get(k)
             .is_some_and(|t| t.as_table().is_none_or(|t| !t.is_empty()))
     };
+    if filled("hooks") {
+        ids.push(Err(format!(
+            "{at}: the [hooks] table runs commands around mise install; remove it"
+        )));
+    }
+    if render_only {
+        return;
+    }
     for table in ["plugins", "tool_alias", "alias"] {
         if filled(table) {
             ids.push(Err(format!(
                 "{at}: the [{table}] table can point a tool at another source; remove it"
             )));
         }
-    }
-    if filled("hooks") {
-        ids.push(Err(format!(
-            "{at}: the [hooks] table runs commands around mise install; remove it"
-        )));
     }
     if filled("env") {
         ids.push(Err(format!(
@@ -1559,10 +1596,15 @@ fn untrusted(ids: Vec<Result<String, String>>, grants: &Grants) -> Vec<String> {
 /// updater with a note runs no command that fetches or installs.
 pub fn trust_notes(u: Updater, env: &Env) -> Vec<String> {
     match u {
-        Updater::Skills => match skills_sources(env) {
-            Ok(v) => untrusted(skills_identities(env, &v), env.grants),
-            Err(why) => vec![why],
-        },
+        Updater::Skills => {
+            // `mise exec` renders the mise configuration before `npx` starts.
+            let mut notes = mise_render_notes(env);
+            match skills_sources(env) {
+                Ok(v) => notes.extend(untrusted(skills_identities(env, &v), env.grants)),
+                Err(why) => notes.push(why),
+            }
+            notes
+        }
         Updater::Npm => match npm_names(env) {
             Ok(names) => untrusted(
                 names.iter().map(|n| Ok(format!("{NPM}{n}"))).collect(),
@@ -2817,6 +2859,47 @@ mod tests {
     }
 
     #[test]
+    fn skills_with_a_template_in_a_mise_file_runs_no_mise_command() {
+        let t = T::new();
+        t.script(&t.bin.join("mise"), "exit 0");
+        // `mise exec` renders this file, as `mise config ls` does.
+        let path = t.home.join(".config/mise/config.toml");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, "[tools]\nnode = \"{{ exec(command='id') }}\"\n").unwrap();
+        let r = run(Updater::Skills, &t.env());
+        assert_eq!(r.status, Status::Blocked, "{r:?}");
+        assert_eq!(r.notes.len(), 1, "{r:?}");
+        assert!(r.notes[0].contains(&path.display().to_string()), "{r:?}");
+        assert_eq!(t.log(), "");
+        assert!(preview(Updater::Skills, &t.env()).starts_with("blocked: "));
+    }
+
+    #[test]
+    fn skills_runs_mise_exec_without_auto_install_and_with_the_pinned_env() {
+        let t = T::new();
+        let seen = t.root.join("seen");
+        t.script(
+            &t.bin.join("mise"),
+            &format!(
+                "env | grep -E '^(MISE_|GO|npm_config_registry=)' | sort > {}",
+                seen.display()
+            ),
+        );
+        let r = run(Updater::Skills, &t.env());
+        assert_eq!(r.status, Status::Current, "{r:?}");
+        let env = fs::read_to_string(&seen).unwrap();
+        for var in [
+            "MISE_EXEC_AUTO_INSTALL=false",
+            "MISE_NOT_FOUND_AUTO_INSTALL=false",
+            "GOENV=off",
+            "GOPROXY=https://proxy.golang.org,direct",
+            "npm_config_registry=https://registry.npmjs.org/",
+        ] {
+            assert!(env.lines().any(|l| l == var), "{var}: {env}");
+        }
+    }
+
+    #[test]
     fn skills_exit_0_is_current_with_a_note() {
         let t = T::new();
         t.script(&t.bin.join("mise"), "exit 0");
@@ -3397,6 +3480,63 @@ mod tests {
                 "{rel}: {notes:?}"
             );
         }
+    }
+
+    #[test]
+    fn mise_with_an_entry_in_conf_d_that_is_not_a_toml_file_runs_no_mise_command() {
+        // mise also reads `conf.d/<dir>/mise.toml`; dfm does not walk into it, so it blocks.
+        for conf_d in [".config/mise/conf.d", ".cache/.mise/conf.d"] {
+            let t = T::new();
+            t.mise(MISE_TWO, "{}");
+            let sub = t.home.join(conf_d).join("sub");
+            fs::create_dir_all(&sub).unwrap();
+            fs::write(
+                sub.join("mise.toml"),
+                "[tools]\nnode = \"{{ exec(command='id') }}\"\n",
+            )
+            .unwrap();
+            let notes = mise_blocked(&t);
+            assert_eq!(notes.len(), 1, "{conf_d}: {notes:?}");
+            assert!(
+                notes[0].contains(&sub.display().to_string()),
+                "{conf_d}: {notes:?}"
+            );
+        }
+        let t = T::new();
+        t.mise(MISE_TWO, "{}");
+        let conf_d = t.home.join(".config/mise/conf.d");
+        fs::create_dir_all(&conf_d).unwrap();
+        fs::write(conf_d.join("README"), "notes\n").unwrap();
+        std::os::unix::fs::symlink(t.root.join("absent.toml"), conf_d.join("gone.toml")).unwrap();
+        let notes = mise_blocked(&t);
+        assert_eq!(notes.len(), 2, "{notes:?}");
+    }
+
+    #[test]
+    fn mise_reads_a_linked_toml_file_in_conf_d_as_the_file_it_names() {
+        // dfm links the conf.d files from the checkout; mise reads the file behind the link.
+        let t = T::new();
+        t.mise(MISE_TWO, "{}");
+        let target = t.root.join("dots/dev.toml");
+        fs::create_dir_all(target.parent().unwrap()).unwrap();
+        fs::write(&target, "[tools]\nnode = \"22\"\n").unwrap();
+        let link = t.home.join(".config/mise/conf.d/dev.toml");
+        fs::create_dir_all(link.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        t.mise_list(&link);
+        let r = run(Updater::Mise, &t.env());
+        assert_eq!(r.status, Status::Updated, "{r:?}");
+        // The same link with a template behind it blocks.
+        let t2 = T::new();
+        t2.mise(MISE_TWO, "{}");
+        let target = t2.root.join("dots/dev.toml");
+        fs::create_dir_all(target.parent().unwrap()).unwrap();
+        fs::write(&target, "{% set x = 1 %}\n").unwrap();
+        let link = t2.home.join(".config/mise/conf.d/dev.toml");
+        fs::create_dir_all(link.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let notes = mise_blocked(&t2);
+        assert!(notes[0].contains("template"), "{notes:?}");
     }
 
     #[test]
