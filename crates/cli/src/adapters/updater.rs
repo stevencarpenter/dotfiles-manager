@@ -328,7 +328,7 @@ fn native(mut d: Draft, env: &Env) -> Row {
         match call(&r, u.name(), &a, &[], env.timeouts.long) {
             Err(e) if e.1 => return d.stop(e),
             Err(e) => marketplaces = Some(e),
-            Ok(_) => {}
+            Ok(_) => d.notes.push("plugin marketplaces refreshed".into()),
         }
     }
     match version(&r, u, env) {
@@ -1010,9 +1010,75 @@ fn cargo_list(stdout: &[u8]) -> std::collections::BTreeMap<String, (String, Opti
         .collect()
 }
 
+/// The source of a `cargo install --list` entry or of a `.crates2.json` key, in one form: `None`
+/// for a registry, the path for a path install, the URL (with `?...#sha`) for a git install.
+fn cargo_source(s: &str) -> Option<String> {
+    if s.starts_with("registry+") {
+        None
+    } else if let Some(p) = s.strip_prefix("path+file://") {
+        Some(p.to_string())
+    } else {
+        Some(s.strip_prefix("git+").unwrap_or(s).to_string())
+    }
+}
+
+/// `cargo install` flags by (crate name, source).
+type CargoOptions = std::collections::HashMap<(String, Option<String>), Vec<String>>;
+
+/// The options cargo recorded for each install in `~/.cargo/.crates2.json`, the package
+/// manager's own record, as `cargo install` flags keyed by name and source: `--features`,
+/// `--all-features` and `--no-default-features`. A missing file records nothing; an unreadable
+/// or invalid one is an error. `--bin` is not passed.
+fn cargo_options(home: &Path) -> Result<CargoOptions, String> {
+    let path = home.join(".cargo/.crates2.json");
+    let why = |n: String| format!("cannot read {}: {n}", path.display());
+    let text = match std::fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Default::default()),
+        Err(e) => return Err(why(e.to_string())),
+    };
+    let v: serde_json::Value = serde_json::from_str(&text).map_err(|e| why(e.to_string()))?;
+    let installs = v
+        .get("installs")
+        .and_then(|i| i.as_object())
+        .ok_or_else(|| why("no installs object".into()))?;
+    let mut out = std::collections::HashMap::new();
+    for (key, rec) in installs {
+        // "<name> <version> (<source>)"
+        let Some((name, rest)) = key.split_once(' ') else {
+            continue;
+        };
+        let Some(src) = rest.split_once(" (").and_then(|(_, s)| s.strip_suffix(')')) else {
+            continue;
+        };
+        let mut flags = vec![];
+        let features: Vec<&str> = rec
+            .get("features")
+            .and_then(|f| f.as_array())
+            .map(|f| f.iter().filter_map(|x| x.as_str()).collect())
+            .unwrap_or_default();
+        if !features.is_empty() {
+            flags.extend(["--features".to_string(), features.join(",")]);
+        }
+        let on = |k: &str| rec.get(k).and_then(|b| b.as_bool()) == Some(true);
+        if on("all_features") {
+            flags.push("--all-features".into());
+        }
+        if on("no_default_features") {
+            flags.push("--no-default-features".into());
+        }
+        out.insert((name.to_string(), cargo_source(src)), flags);
+    }
+    Ok(out)
+}
+
 /// The `cargo install` arguments that reinstall a crate from where it came from, or why it is
 /// held. A registry crate has no source; a git source keeps its `branch`, and drops a `tag` or `rev`.
-fn cargo_install_args(name: &str, src: Option<&str>) -> Result<Vec<String>, String> {
+fn cargo_install_args(
+    name: &str,
+    src: Option<&str>,
+    options: &[String],
+) -> Result<Vec<String>, String> {
     let mut a = args(&["install", "--locked"]);
     match src {
         None => {}
@@ -1037,6 +1103,7 @@ fn cargo_install_args(name: &str, src: Option<&str>) -> Result<Vec<String>, Stri
         }
         Some(other) => return Err(format!("{name} held (source {other})")),
     }
+    a.extend(options.iter().cloned());
     a.push(name.to_string());
     Ok(a)
 }
@@ -1073,9 +1140,16 @@ fn cargo(mut d: Draft, env: &Env) -> Row {
         d.notes.push("no cargo crate is installed".into());
         return d.end(Status::Current);
     }
+    let options = match cargo_options(env.home) {
+        Ok(o) => o,
+        Err(e) => return d.stop((e, false)),
+    };
     let mut failure = None;
     for (name, (_, src)) in &before {
-        let a = match cargo_install_args(name, src.as_deref()) {
+        let opts = options
+            .get(&(name.clone(), src.as_deref().and_then(cargo_source)))
+            .map_or(&[][..], Vec::as_slice);
+        let a = match cargo_install_args(name, src.as_deref(), opts) {
             Ok(a) => a,
             Err(held) => {
                 d.notes.push(held);
@@ -1138,6 +1212,8 @@ struct GoBuild {
     version: Option<String>,
     /// The `mod` line has an `h1:` sum: the module came from the module cache, not a local tree.
     sum: bool,
+    /// The value of a `build -tags=<x>` line.
+    tags: Option<String>,
 }
 
 fn go_build(stdout: &[u8]) -> GoBuild {
@@ -1150,6 +1226,11 @@ fn go_build(stdout: &[u8]) -> GoBuild {
                 b.module = Some(m.to_string());
                 b.version = Some(v.to_string());
                 b.sum = rest.first().is_some_and(|s| s.starts_with("h1:"));
+            }
+            ["build", kv] => {
+                if let Some(t) = kv.strip_prefix("-tags=") {
+                    b.tags = Some(t.to_string());
+                }
             }
             _ => {}
         }
@@ -1218,6 +1299,10 @@ fn go_read(
     }
 }
 
+/// Binaries to reinstall by (package path, build tags): the file, its module and its version.
+type GoGroups =
+    std::collections::BTreeMap<(String, Option<String>), Vec<(PathBuf, String, String)>>;
+
 /// Reinstalls every regular file in `~/go/bin` at `@latest`. `go` is a mise shim whose `GOBIN`
 /// is the versioned install directory that a Go patch upgrade replaces, so each command runs
 /// under `mise exec` with `GOBIN` set to `~/go/bin`. A first `go version` proves the shim
@@ -1252,10 +1337,11 @@ fn go(mut d: Draft, env: &Env) -> Row {
     ) {
         return d.stop(e);
     }
-    // package path -> (binary, module and version before)
-    let mut groups: std::collections::BTreeMap<String, Vec<(PathBuf, String, String)>> =
-        Default::default();
+    // (package path, build tags) -> (binary, module and version before)
+    let mut groups: GoGroups = Default::default();
+    let (mut seen, mut not_go) = (0, 0);
     for bin in files {
+        seen += 1;
         let name = bin
             .file_name()
             .unwrap_or_default()
@@ -1264,21 +1350,32 @@ fn go(mut d: Draft, env: &Env) -> Row {
         match go_read(env, &gobin, &bin) {
             Err(e) => return d.stop(e),
             // Not a Go binary.
-            Ok(None) => {}
+            Ok(None) => not_go += 1,
             Ok(Some(b)) => match go_hold(&b) {
                 Some(why) => d.notes.push(format!("{name} held ({why})")),
-                None => groups.entry(b.path.unwrap_or_default()).or_default().push((
-                    bin,
-                    b.module.unwrap_or_default(),
-                    b.version.unwrap_or_default(),
-                )),
+                None => groups
+                    .entry((b.path.unwrap_or_default(), b.tags))
+                    .or_default()
+                    .push((
+                        bin,
+                        b.module.unwrap_or_default(),
+                        b.version.unwrap_or_default(),
+                    )),
             },
         }
     }
+    if seen == not_go {
+        d.notes
+            .push(format!("{not_go} file(s) in ~/go/bin are not Go binaries"));
+    }
     let mut failure = None;
     let mut changed = false;
-    for (path, bins) in &groups {
-        let a = args(&["exec", "--", "go", "install", &format!("{path}@latest")]);
+    for ((path, tags), bins) in &groups {
+        let mut a = args(&["exec", "--", "go", "install"]);
+        if let Some(t) = tags {
+            a.extend(["-tags".to_string(), t.clone()]);
+        }
+        a.push(format!("{path}@latest"));
         match call(env.provider, "mise", &a, &gobin, env.timeouts.long) {
             // A stop ends the updater here: no other go command starts.
             Err(e) if e.1 => return d.stop(e),
@@ -3530,7 +3627,7 @@ mod tests {
             }
             self.script(
                 &self.bin.join("mise"),
-                "echo \"$GOBIN\" >> $st/go-env\n[ \"$1 $2 $3\" = 'exec -- go' ] || exit 64\ncase \"$4\" in\n  version) if [ -z \"$5\" ]; then [ -f \"$st/go-broken\" ] && exit 1; exit 0; fi; [ -f \"$st/go-silent-$(basename $6)\" ] && exit 1; [ -f \"$st/go-err-$(basename $6)\" ] && { echo boom >&2; exit 1; }; [ -f \"$st/gobin/$(basename $6)\" ] || { echo \"$6: could not read Go build info\" >&2; exit 1; }; cat \"$st/gobin/$(basename $6)\" ;;\n  install) pkg=${5%@latest}; [ -f \"$st/go-fail-$(basename $pkg)\" ] && exit 1; for f in $st/gobin/*; do grep -q \"path	$pkg\\$\" $f && cp $st/golatest/$(basename $f) $f; done; true ;;\n  *) exit 64 ;;\nesac",
+                "echo \"$GOBIN\" >> $st/go-env\n[ \"$1 $2 $3\" = 'exec -- go' ] || exit 64\ncase \"$4\" in\n  version) if [ -z \"$5\" ]; then [ -f \"$st/go-broken\" ] && exit 1; exit 0; fi; [ -f \"$st/go-silent-$(basename $6)\" ] && exit 1; [ -f \"$st/go-err-$(basename $6)\" ] && { echo boom >&2; exit 1; }; [ -f \"$st/gobin/$(basename $6)\" ] || { echo \"$6: could not read Go build info\" >&2; exit 1; }; cat \"$st/gobin/$(basename $6)\" ;;\n  install) for a; do pkg=${a%@latest}; done; [ -f \"$st/go-fail-$(basename $pkg)\" ] && exit 1; for f in $st/gobin/*; do grep -q \"path	$pkg\\$\" $f && cp $st/golatest/$(basename $f) $f; done; true ;;\n  *) exit 64 ;;\nesac",
             );
         }
     }
@@ -3839,6 +3936,102 @@ mod tests {
             ]
         );
         assert!(!t.log().contains("install --locked"), "{}", t.log());
+    }
+
+    #[test]
+    fn cargo_passes_the_install_options_that_cargo_recorded() {
+        let t = T::new();
+        t.cargo(
+            "cargo-about v0.9.0:\n    cargo-about\nplain v1.0.0:\n    plain\nsqlx-cli v0.9.0:\n    sqlx\nall v1.0.0:\n    all\n",
+            &[],
+        );
+        let key =
+            |n: &str| format!("{n} 1.0.0 (registry+https://github.com/rust-lang/crates.io-index)");
+        let rec = |f: &str, all: bool, nd: bool| {
+            format!(
+                r#"{{"features":{f},"all_features":{all},"no_default_features":{nd},"bins":["x"]}}"#
+            )
+        };
+        let json = format!(
+            r#"{{"installs":{{"{}":{},"{}":{},"{}":{},"{}":{}}}}}"#,
+            key("cargo-about"),
+            rec(r#"["cli"]"#, false, false),
+            key("sqlx-cli"),
+            rec(r#"["postgres","mysql"]"#, false, true),
+            key("all"),
+            rec("[]", true, false),
+            key("other"),
+            rec(r#"["zzz"]"#, false, false),
+        );
+        fs::write(t.home.join(".cargo/.crates2.json"), json).unwrap();
+        run(Updater::Cargo, &t.env());
+        let calls = t.calls();
+        for want in [
+            "cargo install --locked --features cli cargo-about",
+            "cargo install --locked --features postgres,mysql --no-default-features sqlx-cli",
+            "cargo install --locked --all-features all",
+            "cargo install --locked plain",
+        ] {
+            assert!(calls.contains(&want.to_string()), "{want}: {calls:?}");
+        }
+    }
+
+    #[test]
+    fn cargo_with_an_invalid_crates2_file_fails_and_installs_nothing() {
+        let t = T::new();
+        t.cargo(CARGO_LIST, &[]);
+        fs::write(t.home.join(".cargo/.crates2.json"), "not json").unwrap();
+        let r = run(Updater::Cargo, &t.env());
+        assert_eq!(r.status, Status::Failed, "{r:?}");
+        assert!(r.notes[0].contains(".crates2.json"), "{r:?}");
+        assert!(!t.log().contains("install --locked"), "{}", t.log());
+    }
+
+    #[test]
+    fn go_counts_files_that_are_not_go_binaries() {
+        let t = T::new();
+        t.go(&[]);
+        for n in ["README", "run.sh"] {
+            fs::write(t.home.join("go/bin").join(n), "").unwrap();
+            fs::write(t.root.join(format!("st/go-silent-{n}")), "").unwrap();
+        }
+        let r = run(Updater::Go, &t.env());
+        assert_eq!(r.status, Status::Current, "{r:?}");
+        assert_eq!(
+            r.notes,
+            vec!["2 file(s) in ~/go/bin are not Go binaries".to_string()]
+        );
+    }
+
+    #[test]
+    fn go_install_keeps_the_build_tags() {
+        let t = T::new();
+        t.go(&[("a", "example.com/a", "v1.0.0", "v1.1.0")]);
+        for (dir, v) in [("gobin", "v1.0.0"), ("golatest", "v1.1.0")] {
+            fs::write(
+                t.root.join("st").join(dir).join("a"),
+                format!("a: go1.26.3\n\tpath\texample.com/a\n\tmod\tm/a\t{v}\th1:x=\n\tbuild\t-ldflags=-s\n\tbuild\t-tags=sqlite,fts5\n"),
+            )
+            .unwrap();
+        }
+        let r = run(Updater::Go, &t.env());
+        assert_eq!(r.status, Status::Updated, "{r:?}");
+        assert!(
+            t.calls().contains(
+                &"mise exec -- go install -tags sqlite,fts5 example.com/a@latest".to_string()
+            ),
+            "{:?}",
+            t.calls()
+        );
+    }
+
+    #[test]
+    fn codex_notes_the_refreshed_marketplaces() {
+        let t = T::new();
+        fs::create_dir_all(t.root.join("st")).unwrap();
+        codex_with_marketplaces(&t);
+        let r = run(Updater::Codex, &t.env());
+        assert_eq!(r.notes, vec!["plugin marketplaces refreshed".to_string()]);
     }
 
     #[test]
