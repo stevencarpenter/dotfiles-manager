@@ -257,7 +257,10 @@ pub(crate) fn probe(
         return Ok(PackageState::Missing(Vec::new()));
     };
     if !cx.store()?.read_grants()?.trusts(&d.identity()) {
-        return Ok(PackageState::Ungranted(d.identity()));
+        return Ok(PackageState::Ungranted {
+            identity: d.identity(),
+            field: "/url",
+        });
     }
     if cx.staged.is_none() || cx.staged()?.contains_key(id) {
         return Ok(PackageState::Missing(Vec::new()));

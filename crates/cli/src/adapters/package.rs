@@ -719,11 +719,41 @@ fn uv_receipt(home: &Path, name: &str) -> Result<(dfm_model::resolve::Table, Str
     Ok((v, shown))
 }
 
-/// Whether the bound checkout declared the source of `r` (its pointer in
-/// [`dfm_model::resolve::SOURCE_ADAPTERS`]). `nested` holds the nested source paths of the lock
-/// (`sync_cmd::nested_paths`); `None`, an unreadable lock, is never the owner's.
+/// Each package adapter and the pointer of the source it fetches from. That source needs no grant
+/// only when the bound checkout declared it ([`owner_source`], docs/sync.md, "Source
+/// identities"); otherwise its identity needs one. `None`: the adapter installs from its
+/// provider's registry, or its source always needs a grant (`script/v1`). A new package adapter
+/// must be listed here (`every_package_adapter_states_its_source_rule`).
+pub(crate) const SOURCE_ADAPTERS: &[(&str, Option<&str>)] = &[
+    (HOMEBREW, None),
+    (MISE, Some("/name")),
+    (APT, None),
+    (UV_TOOL, Some("/source")),
+    (checkout::ADAPTER, Some("/url")),
+    (script::ADAPTER, None),
+];
+
+/// The [`SOURCE_ADAPTERS`] pointer of `adapter`, or `None`.
+fn source_pointer(adapter: &str) -> Option<&'static str> {
+    SOURCE_ADAPTERS
+        .iter()
+        .find(|(a, _)| *a == adapter)
+        .and_then(|(_, p)| *p)
+}
+
+/// `Ungranted` for `identity`, with the [`SOURCE_ADAPTERS`] pointer of `r` as the plan's field.
+pub(crate) fn ungranted_state(r: &ResolvedResource, identity: String) -> PackageState {
+    PackageState::Ungranted {
+        identity,
+        field: source_pointer(&r.adapter).unwrap_or("/url"),
+    }
+}
+
+/// Whether the bound checkout declared the source of `r` (its [`SOURCE_ADAPTERS`] pointer).
+/// `nested` holds the nested source paths of the lock (`sync_cmd::nested_paths`); `None`, an
+/// unreadable lock, is never the owner's.
 pub(crate) fn owner_source(nested: Option<&[String]>, r: &ResolvedResource) -> bool {
-    match (dfm_model::resolve::source_pointer(&r.adapter), nested) {
+    match (source_pointer(&r.adapter), nested) {
         (Some(p), Some(n)) => dfm_model::resolve::owner_declared(r, p, n),
         _ => false,
     }
@@ -795,7 +825,7 @@ pub(crate) fn mise_gated(
     }
     Ok(match mise_identity(&name(&r.value)?) {
         Ok(None) => state,
-        Ok(Some((_, id))) => ungranted(cx, r, id)?.map_or(state, PackageState::Ungranted),
+        Ok(Some((_, id))) => ungranted(cx, r, id)?.map_or(state, |id| ungranted_state(r, id)),
         Err(e) => PackageState::Unofficial(e.detail),
     })
 }
@@ -940,7 +970,7 @@ fn gated(
         (&state, source)
         && let Some(id) = ungranted(cx, r, git_identity(url)?)?
     {
-        return Ok(PackageState::Ungranted(id));
+        return Ok(ungranted_state(r, id));
     }
     Ok(state)
 }
@@ -1807,13 +1837,11 @@ mod tests {
             .collect();
         for id in &packages {
             assert!(
-                dfm_model::resolve::SOURCE_ADAPTERS
-                    .iter()
-                    .any(|(a, _)| a == id),
+                SOURCE_ADAPTERS.iter().any(|(a, _)| a == id),
                 "{id} is not in SOURCE_ADAPTERS"
             );
         }
-        assert_eq!(dfm_model::resolve::SOURCE_ADAPTERS.len(), packages.len());
+        assert_eq!(SOURCE_ADAPTERS.len(), packages.len());
     }
 
     #[test]

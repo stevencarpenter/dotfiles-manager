@@ -1386,7 +1386,7 @@ fn package_row(r: &ResolvedResource, s: &PackageState, path: &OsStr) -> Row {
             why.clone(),
             blocked.into(),
         ),
-        PackageState::Ungranted(identity) => {
+        PackageState::Ungranted { identity, .. } => {
             let (why, fix) = if identity.starts_with(dfm_model::lock::SCRIPT) {
                 (
                     format!(
