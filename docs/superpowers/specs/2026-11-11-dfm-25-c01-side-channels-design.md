@@ -85,8 +85,8 @@ Owner decision, 2026-11-11: `mise install` and `mise upgrade` are gated. Before 
 
 - `github:o/r` and `ubi:o/r` map to `https://github.com/o/r`.
 - `npm:<name>` maps to `npm:<name>`.
-- `go:<module path>` maps to the canonical origin of the module's repository when the path is on `github.com`. Another host is `E_SOURCE_UNTRUSTED` with the fix "a go tool must come from github.com".
-- A tool of another backend (`vfox:`, `cargo:`, `pipx:`, `aqua:`, `asdf:` and the others) and a short name of mise's registry are handled as the builder finds the registry maps them: a registry name whose backend is one of the above gets that identity, and a backend with no mapping is `E_SOURCE_UNTRUSTED`.
+- `go:<module path>` maps to its own identity `go:<module path>`, stored in `packages` beside `npm:`. A module path is a lowercase host with a dot and a path, with no version.
+- A tool of another backend (`vfox:`, `cargo:`, `pipx:`, `aqua:`, `asdf:` and the others) is handled as the builder finds the registry maps it: a backend with no mapping is `E_SOURCE_UNTRUSTED`. A short name of mise's registry (`go`, `java`, `rust-analyzer`) is not gated, because mise's registry is its owner, as Homebrew's official formulae are.
 
 One ungranted identity blocks the whole row before any mise command, with one note per identity, as for `skills` (trust design, anti-goal "a partial updater run"). This changes DFM-85's rule that mise is not gated. docs/upgrade.md ("Source trust") and docs/toolchains.md change with it. The current live tools need grants once, on the first sync after the slice; the slice's PR description lists the `--trust-origin` commands for the M5's current config.
 

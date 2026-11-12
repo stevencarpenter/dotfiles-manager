@@ -222,6 +222,31 @@ fn npm_name(p: &str) -> bool {
     p.len() <= 214 && part(name)
 }
 
+/// The prefix of a Go module identity: `go:<module path>`, the module a mise `go:` tool names
+/// (docs/sync.md, "Source identities"). It is stored in `packages`, beside `npm:`.
+pub const GO: &str = "go:";
+
+/// A Go module path: a lowercase host with a `.`, then one or more path components, each of
+/// `[A-Za-z0-9._~-]`. No component is empty, `.`, `..` or starts with `-`. No version (`@`), at
+/// most 256 bytes.
+fn go_module(p: &str) -> bool {
+    let mut parts = p.split('/');
+    let host = parts.next().unwrap_or_default();
+    let ok = |c: &str, lower: bool| {
+        !c.is_empty()
+            && !matches!(c, "." | "..")
+            && !c.starts_with('-')
+            && c.bytes().all(|b| {
+                (b.is_ascii_alphanumeric() && !(lower && b.is_ascii_uppercase()))
+                    || matches!(b, b'-' | b'.' | b'_' | b'~')
+            })
+    };
+    p.len() <= 256 && host.contains('.') && ok(host, true) && {
+        let mut rest = parts.peekable();
+        rest.peek().is_some() && rest.all(|c| ok(c, false))
+    }
+}
+
 /// The prefix of an install script identity: `script:<url>`, the URL a `script/v1` declaration
 /// names (docs/sync.md, "Source identities").
 pub const SCRIPT: &str = "script:";
@@ -240,7 +265,7 @@ pub fn script_url(url: &str) -> bool {
 }
 
 /// A source identity that `--trust-origin` grants: a canonical origin ([`check_origin`]),
-/// `npm:<package>` or `script:<https url>`. Anything else is `E_SOURCE_UNTRUSTED`.
+/// `npm:<package>`, `go:<module>` or `script:<https url>`. Anything else is `E_SOURCE_UNTRUSTED`.
 pub fn check_identity(identity: &str, allow_file: bool) -> Result<(), Refusal> {
     if let Some(url) = identity.strip_prefix(SCRIPT) {
         return if script_url(url) {
@@ -248,6 +273,15 @@ pub fn check_identity(identity: &str, allow_file: bool) -> Result<(), Refusal> {
         } else {
             Err(untrusted(format!(
                 "{identity:?} is not script:<url> with an https:// URL of at most {MAX_SCRIPT_URL} bytes"
+            )))
+        };
+    }
+    if let Some(p) = identity.strip_prefix(GO) {
+        return if go_module(p) {
+            Ok(())
+        } else {
+            Err(untrusted(format!(
+                "{identity:?} is not go:<module path> with a host that has a dot and a path"
             )))
         };
     }
@@ -284,7 +318,7 @@ pub fn source_identity(value: &str, allow_file: bool) -> Result<String, Refusal>
                 && c.bytes()
                     .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
         });
-    let id = if value.starts_with(NPM) {
+    let id = if value.starts_with(NPM) || value.starts_with(GO) {
         value.to_string()
     } else if value.contains("://") {
         unsuffixed(value)
@@ -489,7 +523,7 @@ impl Grants {
             let mut s = self.scripts.iter();
             s.find(|g| g.script == identity)
                 .map(|g| g.grant_id.as_str())
-        } else if identity.starts_with(NPM) {
+        } else if identity.starts_with(NPM) || identity.starts_with(GO) {
             let mut p = self.packages.iter();
             p.find(|g| g.package == identity)
                 .map(|g| g.grant_id.as_str())
@@ -507,7 +541,7 @@ impl Grants {
     }
 
     /// Adds a grant for `identity` unless one exists: a `script:` identity to `scripts`, an
-    /// `npm:` identity to `packages`, an origin to `origins`. Returns the grant id.
+    /// `npm:` or `go:` identity to `packages`, an origin to `origins`. Returns the grant id.
     pub fn grant(&mut self, identity: &str, at: &str) -> String {
         if let Some(id) = self.existing(identity) {
             return id.to_string();
@@ -523,7 +557,7 @@ impl Grants {
                 grant_id,
                 granted_at,
             });
-        } else if identity.starts_with(NPM) {
+        } else if identity.starts_with(NPM) || identity.starts_with(GO) {
             self.packages.push(PackageGrant {
                 package: identity.into(),
                 grant_id,
@@ -684,6 +718,28 @@ ref = "refs/heads/main"
         assert_eq!(Grants::parse(&bytes).unwrap(), g);
         // Without npm grants the file has no `packages` key, as before it existed.
         assert!(!String::from_utf8(bytes).unwrap().contains("packages"));
+    }
+
+    #[test]
+    fn a_go_identity_is_checked_and_round_trips_in_packages() {
+        assert!(check_identity("go:golang.org/x/tools/gopls", false).is_ok());
+        assert!(check_identity("go:github.com/o/r/cmd/x", false).is_ok());
+        for bad in [
+            "go:",
+            "go:gopls",
+            "go:Golang.org/x",
+            "go:golang.org/x@v1",
+            "go:golang.org//x",
+            "go:golang.org/../x",
+            "go:-x.org/y",
+        ] {
+            assert!(check_identity(bad, false).is_err(), "{bad}");
+        }
+        let mut g = Grants::default();
+        g.grant("go:golang.org/x/tools/gopls", "2026-11-11T00:00:00Z");
+        assert!(g.trusts("go:golang.org/x/tools/gopls"));
+        assert!(g.origins.is_empty() && g.packages.len() == 1);
+        assert_eq!(Grants::parse(&serde_json::to_vec(&g).unwrap()).unwrap(), g);
     }
 
     #[test]
