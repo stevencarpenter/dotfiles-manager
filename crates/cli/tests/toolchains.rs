@@ -1020,9 +1020,24 @@ fn a_path_source_outside_the_checkout_is_refused() {
 }
 
 #[test]
-fn an_ungranted_git_source_blocks_the_update_too() {
+fn an_ungranted_git_source_is_held_under_the_update_when_installed_and_blocked_when_missing() {
     let fx = Fx::new();
     fx.with_source(GIT);
+    // Installed from the git source, no grant: held, so the other rolling updates still run.
+    fx.installed("uv", "nuv 0.5.2\ntoken-auditor 2026.11.11\n");
+    fx.uv_receipt(
+        "token-auditor",
+        "[tool]\nrequirements = [{ name = \"token-auditor\", git = \"https://github.com/o/r?rev=2026.11.11\" }]\n",
+    );
+    let o = fx.preview(true);
+    let t = text(&o.stdout);
+    assert_eq!(code(&o), 0, "{}\n{t}", stderr(&o));
+    assert!(t.contains(&format!("held {SRC}")), "{t}");
+    assert!(t.contains("installed from a git source"), "{t}");
+    assert!(fx.changes().is_empty(), "{}", fx.log());
+    // Missing, no grant: the install would fetch, so the row is blocked.
+    fx.installed("uv", "nuv 0.5.2\n");
+    fs::remove_dir_all(fx.home.path().join(".local/share/uv/tools/token-auditor")).unwrap();
     let o = fx.preview(true);
     let t = format!("{}{}", text(&o.stdout), stderr(&o));
     assert_eq!(code(&o), 3, "{t}");

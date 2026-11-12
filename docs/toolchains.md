@@ -11,7 +11,7 @@
 | Tests with `mise`, `uv` and `brew` look-alikes | `crates/cli/tests/toolchains.rs`; trial tools in `crates/cli/tests/trial.rs` |
 | Trial tools under `--update` (`probe_with_trials`) | `crates/cli/src/apply_cmd.rs` |
 
-Two provider paths are built: mise (runtimes and tools from mise's registry and backends, by the name mise takes) and uv tools by package-index name. A uv tool declared with `source` (a granted git tag or a checkout path, docs/packages.md) is installed by `packages` and `sync`, and is held under `--update`, as is a tool installed from a source by hand. A git source without a grant is blocked under `--update` too. The `uv` updater of `dfm sync` still needs a grant for a git source (docs/upgrade.md, "Source trust").
+Two provider paths are built: mise (runtimes and tools from mise's registry and backends, by the name mise takes) and uv tools by package-index name. A uv tool declared with `source` (a granted git tag or a checkout path, docs/packages.md) is installed by `packages` and `sync`, and is held under `--update`, as is a tool installed from a source by hand. Under `--update`, a missing source tool whose git source has no grant is blocked; an installed one is held with or without a grant. The `uv` updater of `dfm sync` still needs a grant for a git source (docs/upgrade.md, "Source trust").
 
 ## The command
 

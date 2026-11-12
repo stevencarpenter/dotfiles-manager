@@ -923,20 +923,23 @@ fn ungranted(source: &UvSource, cx: &ScriptCx) -> Result<Option<String>, Refusal
     Ok((!cx.grants()?.trusts(&id)).then_some(id))
 }
 
-/// `packages --update` for a source tool: `Ungranted` for a git source without a grant, else
-/// what [`maintain`] decides (it holds an installed source tool).
+/// `packages --update` for a source tool: what [`maintain`] decides, which holds an installed
+/// source tool with or without a grant (it fetches nothing). A missing one, which the install
+/// would fetch, is `Ungranted` when its git source has no grant.
 fn maintain_sourced(
     runner: &Runner,
     value: &Value,
     cx: Option<&ScriptCx>,
 ) -> Result<PackageState, Refusal> {
-    if let Some(cx) = cx
+    let state = maintain(runner, UV_TOOL, value)?;
+    if matches!(state, PackageState::Missing(_))
+        && let Some(cx) = cx
         && let Some(source) = uv_source(value, cx.root())?
         && let Some(id) = ungranted(&source, cx)?
     {
         return Ok(PackageState::Ungranted(id));
     }
-    maintain(runner, UV_TOOL, value)
+    Ok(state)
 }
 
 /// `dpkg-query -W -f=${Status} <name>`: `install ok installed` means installed. A missing
