@@ -1526,18 +1526,28 @@ fn checkouts(mut d: Draft, env: &Env) -> Row {
         }
         let mut before = None;
         // The upstream must fetch from the declared url, which needs a grant unless the bound
-        // checkout declared it.
-        let declared = |up: &Upstream| match (git_id(&up.url), git_id(&c.url)) {
-            (Ok(a), Ok(b)) if a == b => (!c.owner_declared)
-                .then(|| untrusted(vec![Ok(b)], env.grants).into_iter().next())
-                .flatten(),
-            _ => Some(format!(
-                "{}: {} fetches {}, not the declared {}; not pulled",
-                c.id,
-                c.path.display(),
-                up.url,
-                c.url
-            )),
+        // checkout declared it. Both go through the owner's `url.*.insteadOf` rewrites: `git
+        // ls-remote --get-url` in the copy rewrites the declared url as `remote get-url` did
+        // the upstream, and makes no network call.
+        let declared = |up: &Upstream| {
+            let rewritten =
+                git(env, &c.path, &["ls-remote", "--get-url", &c.url]).map_err(|(why, _)| why);
+            match (git_id(&up.url), rewritten.and_then(|u| git_id(&u))) {
+                (Ok(a), Ok(b)) if a == b => (!c.owner_declared)
+                    .then(|| {
+                        untrusted(vec![git_id(&c.url)], env.grants)
+                            .into_iter()
+                            .next()
+                    })
+                    .flatten(),
+                _ => Some(format!(
+                    "{}: {} fetches {}, not the declared {}; not pulled",
+                    c.id,
+                    c.path.display(),
+                    up.url,
+                    c.url
+                )),
+            }
         };
         let (note, s) = match fast_forward(env, &c.path, "checkout", &mut before, declared) {
             Ok(Ok(after)) => match before {
@@ -2047,7 +2057,7 @@ mod tests {
         fn checkouts_git(&self) {
             self.script(
                 &self.bin.join("git"),
-                "d=$(basename \"$2\")\n[ -f \"$st/$d/fail-$3\" ] && exit 2\ncase \"$3\" in\n  rev-parse) if [ \"$4\" = --abbrev-ref ]; then echo main; else cat \"$st/$d/rev\"; fi ;;\n  config) [ \"$4\" = --list ] && exit 0; [ -f \"$st/$d/no-upstream\" ] && exit 1; case \"$5\" in *.remote) echo origin ;; *) echo refs/heads/main ;; esac ;;\n  remote) echo \"https://github.com/o/$d.git\" ;;\n  status) cat \"$st/$d/porcelain\" 2>/dev/null || true ;;\n  fetch) exit 0 ;;\n  rev-list) cat \"$st/$d/ahead\" 2>/dev/null || echo 0 ;;\n  pull) cp \"$st/$d/rev-after\" \"$st/$d/rev\" ;;\n  *) exit 64 ;;\nesac",
+                "d=$(basename \"$2\")\n[ -f \"$st/$d/fail-$3\" ] && exit 2\ncase \"$3\" in\n  rev-parse) if [ \"$4\" = --abbrev-ref ]; then echo main; else cat \"$st/$d/rev\"; fi ;;\n  config) [ \"$4\" = --list ] && exit 0; [ -f \"$st/$d/no-upstream\" ] && exit 1; case \"$5\" in *.remote) echo origin ;; *) echo refs/heads/main ;; esac ;;\n  remote) echo \"https://github.com/o/$d.git\" ;;\n  ls-remote) echo \"$5\" ;;\n  status) cat \"$st/$d/porcelain\" 2>/dev/null || true ;;\n  fetch) exit 0 ;;\n  rev-list) cat \"$st/$d/ahead\" 2>/dev/null || echo 0 ;;\n  pull) cp \"$st/$d/rev-after\" \"$st/$d/rev\" ;;\n  *) exit 64 ;;\nesac",
             );
         }
 
@@ -2073,7 +2083,9 @@ mod tests {
     fn checkout_calls(c: &Path) -> Vec<String> {
         let c = c.display().to_string();
         let mut v = upstream_calls(&c, "origin");
+        let id = c.rsplit('/').next().unwrap_or_default();
         v.extend([
+            format!("git -C {c} ls-remote --get-url https://github.com/o/{id}.git"),
             format!("git -C {c} fetch --quiet origin"),
             format!("git -C {c} rev-list --count @{{u}}..HEAD"),
             format!("git -C {c} pull --ff-only --quiet origin refs/heads/main"),
@@ -2307,7 +2319,11 @@ mod tests {
                 "moved a1b2c3d -> d4e5f6a".to_string(),
             ]
         );
-        let mut want = upstream_calls(&fork.display().to_string(), "origin");
+        let f = fork.display().to_string();
+        let mut want = upstream_calls(&f, "origin");
+        want.push(format!(
+            "git -C {f} ls-remote --get-url https://github.com/o/other.git"
+        ));
         want.extend(checkout_calls(&moved));
         assert_eq!(t.calls(), want);
     }

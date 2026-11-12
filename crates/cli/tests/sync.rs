@@ -4355,15 +4355,19 @@ fn sync_clones_a_declared_checkout_then_fast_forwards_it() {
 /// The checkout `extra.tool` of `tool`, declared upstream and cloned by a first sync. Returns the
 /// checkout path and the revision it holds.
 fn cloned_checkout(u: &Up, tool: &Remote) -> (PathBuf, String) {
+    cloned_checkout_at(u, tool, &tool.origin())
+}
+
+/// As [`cloned_checkout`], with `url` as the declared url.
+fn cloned_checkout_at(u: &Up, tool: &Remote, url: &str) -> (PathBuf, String) {
     put(&tool.seed, "README", "v1\n");
     tool.push("v1");
     put(
         &u.fx.upstream.seed,
         "base/modules/extra/module.toml",
         &format!(
-            "{}\n[[resources]]\nid = \"tool\"\nkind = \"package\"\nadapter = \"git-checkout/v1\"\n[resources.value]\nurl = \"{}\"\npath = \"x/tool\"\n",
+            "{}\n[[resources]]\nid = \"tool\"\nkind = \"package\"\nadapter = \"git-checkout/v1\"\n[resources.value]\nurl = \"{url}\"\npath = \"x/tool\"\n",
             common::EXTRA,
-            tool.origin()
         ),
     );
     u.fx.upstream.push("declare the checkout");
@@ -4402,6 +4406,31 @@ fn a_checkout_whose_configuration_runs_a_command_is_blocked_before_the_fetch() {
     assert!(!copy.join(".git/FETCH_HEAD").exists());
     assert!(!ran.exists());
     assert_eq!(git(&copy, &["rev-parse", "--short", "HEAD"]), before);
+}
+
+/// The owner's `url.*.insteadOf` rewrites the declared url and the upstream alike, so the
+/// checkout is pulled; the rewrite is the owner's intent (Codex #102).
+#[test]
+fn an_insteadof_rule_of_the_owner_rewrites_the_declared_url_too() {
+    let u = Up::new(r#"["checkouts"]"#);
+    let tool = Remote::new(u.fake.path(), "tool");
+    let declared = "https://example.invalid/o/tool";
+    fs::write(
+        u.fx.h(".gitconfig"),
+        format!("[url \"{}\"]\n\tinsteadOf = {declared}\n", tool.origin()),
+    )
+    .unwrap();
+    let (copy, before) = cloned_checkout_at(&u, &tool, declared);
+    let after = git(&tool.bare, &["rev-parse", "--short", "refs/heads/main"]);
+    let o = u.sync(&[]);
+    assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
+    let s = stdout(&o);
+    assert!(s.contains("  updated checkouts"), "{s}");
+    assert!(
+        s.contains(&format!("    note: extra.tool {before} -> {after}")),
+        "{s}"
+    );
+    assert_eq!(git(&copy, &["rev-parse", "--short", "HEAD"]), after);
 }
 
 /// DFM-25 (C04, G2, G6): without a grant for the registry origin, `agents` is a `blocked` row
