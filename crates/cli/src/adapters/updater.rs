@@ -686,8 +686,9 @@ fn mise_candidates(env: &Env) -> (BTreeSet<PathBuf>, Vec<String>) {
 
 /// Why mise must not read the configuration, one note each, or nothing: a `conf.d` entry of
 /// [`mise_candidates`], or a candidate file that cannot be read or parsed, holds a template,
-/// or has a non-empty `[hooks]` table. Every mise command renders the configuration
-/// (`mise exec` too), and a template can run a command.
+/// or has a non-empty `[hooks]` or `[env]` table. Every mise command renders the configuration
+/// (`mise exec` too), and a template can run a command; so can an `[env]` directive such as
+/// `_.source`, which runs a script, and `[env]` values reach the commands mise runs.
 fn mise_render_notes(env: &Env) -> Vec<String> {
     let (files, mut notes) = mise_candidates(env);
     let mut ids = Vec::new();
@@ -751,7 +752,7 @@ fn mise_identities(env: &Env) -> Vec<Result<String, String>> {
 
 /// Reads one mise configuration file into `ids`: its identities and the notes that block.
 /// `render_only` keeps the checks that matter before mise reads the file at all (read, parse,
-/// template, `[hooks]`) and skips the sources.
+/// template, `[hooks]`, `[env]`) and skips the sources.
 fn mise_gate_file(file: &Path, ids: &mut Vec<Result<String, String>>, render_only: bool) {
     let at = file.display();
     let text = match std::fs::read_to_string(file) {
@@ -800,6 +801,11 @@ fn mise_gate_file(file: &Path, ids: &mut Vec<Result<String, String>>, render_onl
             "{at}: the [hooks] table runs commands around mise install; remove it"
         )));
     }
+    if filled("env") {
+        ids.push(Err(format!(
+            "{at}: the [env] table reaches the commands mise runs, and its directives (such as _.source) run commands; remove it"
+        )));
+    }
     if render_only {
         return;
     }
@@ -809,11 +815,6 @@ fn mise_gate_file(file: &Path, ids: &mut Vec<Result<String, String>>, render_onl
                 "{at}: the [{table}] table can point a tool at another source; remove it"
             )));
         }
-    }
-    if filled("env") {
-        ids.push(Err(format!(
-            "{at}: the [env] table reaches the commands mise runs to fetch, such as npm_config_registry or GOPROXY; remove it"
-        )));
     }
     if let Some(settings) = doc.get("settings").and_then(|t| t.as_table()) {
         mise_settings(file, "settings", settings, ids);
@@ -2875,6 +2876,24 @@ mod tests {
     }
 
     #[test]
+    fn skills_with_an_env_directive_in_a_mise_file_runs_no_mise_command() {
+        let t = T::new();
+        t.script(&t.bin.join("mise"), "exit 0");
+        // `mise exec` runs `_.source` scripts; no template is involved.
+        let path = t.home.join(".config/mise/config.toml");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, "[env]\n_.source = \"x.sh\"\n").unwrap();
+        let r = run(Updater::Skills, &t.env());
+        assert_eq!(r.status, Status::Blocked, "{r:?}");
+        assert_eq!(r.notes.len(), 1, "{r:?}");
+        assert!(
+            r.notes[0].contains(&path.display().to_string()) && r.notes[0].contains("[env]"),
+            "{r:?}"
+        );
+        assert_eq!(t.log(), "");
+    }
+
+    #[test]
     fn skills_runs_mise_exec_without_auto_install_and_with_the_pinned_env() {
         let t = T::new();
         let seen = t.root.join("seen");
@@ -3510,6 +3529,13 @@ mod tests {
         std::os::unix::fs::symlink(t.root.join("absent.toml"), conf_d.join("gone.toml")).unwrap();
         let notes = mise_blocked(&t);
         assert_eq!(notes.len(), 2, "{notes:?}");
+        for name in ["README", "gone.toml"] {
+            let path = conf_d.join(name).display().to_string();
+            assert!(
+                notes.iter().any(|n| n.starts_with(&format!("{path}: "))),
+                "{name}: {notes:?}"
+            );
+        }
     }
 
     #[test]

@@ -106,7 +106,7 @@ Every mise command (`config ls`, `ls`, `install`, `outdated`, `upgrade`) runs wi
 
 `mise ls --installed --json` runs before and after `mise install`. Each tool version the install adds is a note and makes the row `updated`.
 
-The `skills` updater runs `mise exec`, which renders the same files. Before it, the same file checks run (the files, the `conf.d` rule, templates, `[hooks]`, read and parse errors), without the backend-tool grants. `mise exec` gets the same environment, and `MISE_EXEC_AUTO_INSTALL=false` and `MISE_NOT_FOUND_AUTO_INSTALL=false`, so it installs no configured tool.
+The `skills` updater runs `mise exec`, which renders the same files. Before it, the same file checks run (the files, the `conf.d` rule, templates, `[hooks]`, `[env]`, whose directives such as `_.source` run a script, read and parse errors), without the backend-tool grants. `mise exec` gets the same environment, and `MISE_EXEC_AUTO_INSTALL=false` and `MISE_NOT_FOUND_AUTO_INSTALL=false`, so it installs no configured tool.
 
 One ungranted identity blocks the whole row before any mise command that fetches, with one note per identity, as for `skills` (trust design, anti-goal "a partial updater run"). This changes DFM-85's rule that mise is not gated. docs/upgrade.md ("Source trust") and docs/toolchains.md change with it. The current live tools need grants once, on the first sync after the slice; the slice's PR description lists the `--trust-origin` commands for the M5's current config.
 
