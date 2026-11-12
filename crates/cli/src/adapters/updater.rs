@@ -3,10 +3,10 @@
 //! tool, a failed command or a stop request is a row.
 
 use dfm_engine::proc::{End, Output, Request, Runner};
-use dfm_model::lock::{Grants, NPM, NPM_REGISTRY, git_identity, trust_command};
+use dfm_model::Code;
+use dfm_model::lock::{Grants, NPM_REGISTRY, git_identity, trust_command};
 use dfm_model::state::Status;
 use dfm_model::updater::Updater;
-use dfm_model::{Code, Refusal};
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -35,7 +35,7 @@ pub struct Env<'a> {
     /// `scripts/install-agent-registry.sh`.
     pub root: &'a Path,
     pub timeouts: Timeouts,
-    /// The grants that the `skills` and `agents` sources must hold (docs/upgrade.md, "Source
+    /// The grants that the `agents` source must hold (docs/upgrade.md, "Source
     /// trust").
     pub grants: &'a Grants,
     /// The declared `git-checkout/v1` checkouts that the `checkouts` updater fast-forwards. An
@@ -239,15 +239,10 @@ pub fn run(u: Updater, env: &Env) -> Row {
                 d.notes.push(e.detail);
                 return d.end(Status::Blocked);
             }
-            let untrusted = trust_notes(Updater::Skills, env);
-            if !untrusted.is_empty() {
-                d.notes.extend(untrusted);
-                return d.end(Status::Blocked);
-            }
             match call(
                 env.provider,
                 "mise",
-                &args(&["exec", "--", "npx", "skills", "update"]),
+                &args(&["exec", "--", "npx", "skills@latest", "update"]),
                 &npm_env(&[]),
                 env.timeouts.short,
             ) {
@@ -827,13 +822,13 @@ fn npm_outdated(env: &Env, names: &[String]) -> Result<(Vec<Item>, Vec<String>),
 }
 
 /// `npm update -g <names>` of every outdated global package that is not held, on the default
-/// registry that the `npm:<name>` grants cover.
+/// registry.
 fn npm(mut d: Draft, env: &Env) -> Row {
     if let Err(e) = env.provider.resolve("npm") {
         d.notes.push(e.detail);
         return d.end(Status::Blocked);
     }
-    // One listing: the names give the grants to check and the scopes to pin.
+    // One listing: the names give the scopes to pin.
     let names = match npm_names(env) {
         Ok(n) => n,
         Err(why) => {
@@ -841,20 +836,12 @@ fn npm(mut d: Draft, env: &Env) -> Row {
             return d.end(Status::Blocked);
         }
     };
-    let untrusted = untrusted(
-        names.iter().map(|n| Ok(format!("{NPM}{n}"))).collect(),
-        env.grants,
-    );
-    if !untrusted.is_empty() {
-        d.notes.extend(untrusted);
-        return d.end(Status::Blocked);
-    }
     let (before, held) = match npm_outdated(env, &names) {
         Ok(l) => l,
         Err(e) => return d.stop(e),
     };
     d.notes.extend(held);
-    // Only a name the checked listing holds is updated: the grants were checked against it.
+    // Only a name the listing holds is updated: its scope is pinned to the default registry.
     let unlisted: Vec<&str> = before
         .iter()
         .filter(|i| !names.contains(&i.name))
@@ -906,84 +893,6 @@ fn uv_tool_names(env: &Env) -> Result<Vec<String>, String> {
     Ok(names)
 }
 
-/// The identities the uv tools are built from, read from each receipt: a `git` requirement
-/// (its `?rev=` query aside) is mapped as it is, so a value that maps to no git origin never
-/// reaches git, and then as git fetches it (`git ls-remote --get-url` applies the user's
-/// `url.*.insteadOf` rewrites, locally); a directory, an editable path or an index name needs
-/// none; any other source (a `url` archive) maps to no identity, and so does a legacy string
-/// requirement or an unreadable receipt.
-fn uv_identities(env: &Env) -> Vec<Result<String, String>> {
-    let names = match uv_tool_names(env) {
-        Ok(n) => n,
-        Err(why) => return vec![Err(why)],
-    };
-    let mut ids = Vec::new();
-    for name in names {
-        let receipt = env.home.join(UV_TOOLS).join(&name).join("uv-receipt.toml");
-        let why = |n: String| format!("uv tool {name}: {n}");
-        let doc: toml::Table = match std::fs::read_to_string(&receipt)
-            .map_err(|e| format!("cannot read {}: {e}", receipt.display()))
-            .and_then(|s| {
-                s.parse()
-                    .map_err(|e: toml::de::Error| format!("{}: {e}", receipt.display()))
-            }) {
-            Ok(d) => d,
-            Err(n) => {
-                ids.push(Err(why(n)));
-                continue;
-            }
-        };
-        // Every list under `[tool]` but the entry points is a source list an upgrade resolves
-        // again: `requirements`, `constraints`, `overrides`, and any list a newer uv records.
-        let lists = doc
-            .get("tool")
-            .and_then(|t| t.as_table())
-            .into_iter()
-            .flat_map(|t| t.iter())
-            .filter(|(k, _)| k.as_str() != "entrypoints")
-            .filter_map(|(k, v)| v.as_array().map(|a| (k.clone(), a.clone())))
-            .collect::<Vec<_>>();
-        for (list, entries) in lists {
-            for r in entries {
-                // uv's legacy receipt form is one PEP 508 string per requirement, whose source
-                // these keys cannot show (as `package::uv_receipt_source` holds it).
-                if !r.is_table() {
-                    ids.push(Err(why(format!(
-                    "a legacy string entry in the receipt's {list}, whose source cannot be checked; reinstall the tool with uv tool install"
-                ))));
-                    continue;
-                }
-                if let Some(git) = r.get("git").and_then(|g| g.as_str()) {
-                    let url = git.split(['?', '#']).next().unwrap_or_default();
-                    ids.push(
-                        git_id(url)
-                            .and_then(|_| fetch_url(env, url))
-                            .and_then(|u| git_id(&u))
-                            .map_err(why),
-                    );
-                } else if r.get("directory").is_none()
-                    && r.get("editable").is_none()
-                    && r.get("path").is_none()
-                    && r.get("url").is_some()
-                {
-                    ids.push(Err(why(format!(
-                        "the source {} maps to no identity; upgrade it by hand",
-                        field_toml(&r, "url")
-                    ))));
-                }
-            }
-        }
-    }
-    ids
-}
-
-fn field_toml(v: &toml::Value, k: &str) -> String {
-    v.get(k)
-        .and_then(|x| x.as_str())
-        .unwrap_or_default()
-        .to_string()
-}
-
 /// `uv tool list`: `<name> v<version>` lines, each followed by its `- <entrypoint>` lines.
 fn uv_tool_list(env: &Env) -> Result<Vec<(String, String)>, (String, bool)> {
     let out = call(
@@ -1008,11 +917,6 @@ fn uv_tool_list(env: &Env) -> Result<Vec<(String, String)>, (String, bool)> {
 fn uv(mut d: Draft, env: &Env) -> Row {
     if let Err(e) = env.provider.resolve("uv") {
         d.notes.push(e.detail);
-        return d.end(Status::Blocked);
-    }
-    let untrusted = trust_notes(Updater::Uv, env);
-    if !untrusted.is_empty() {
-        d.notes.extend(untrusted);
         return d.end(Status::Blocked);
     }
     let names = match uv_tool_names(env) {
@@ -1065,33 +969,8 @@ fn uv(mut d: Draft, env: &Env) -> Row {
 
 // ---- source trust (docs/upgrade.md, "Source trust") ------------------------------------------
 
-/// The `skills` CLI's record of the global skills it updates, relative to HOME. The runner
-/// clears the environment, so `XDG_STATE_HOME`, which would move it, is never set.
-const SKILLS_RECORD: &str = ".agents/.skill-lock.json";
-/// The only record version this manager reads.
-const SKILLS_RECORD_VERSION: u64 = 3;
-/// The installer that `npx` fetches and runs.
-const SKILLS_PACKAGE: &str = "skills";
-/// The largest source record read.
-const RECORD_MAX_BYTES: u64 = 1 << 20;
-
-fn read_record(path: &Path) -> Result<String, String> {
-    let why = |what: String| format!("cannot read {}: {what}; nothing ran", path.display());
-    let bytes = crate::read_fs::read_regular_bounded(
-        path,
-        RECORD_MAX_BYTES,
-        |e| Refusal::new(Code::IoFailed, e.kind().to_string()),
-        || Refusal::new(Code::IoFailed, "not a regular file"),
-    )
-    .map_err(|e| why(e.detail))?;
-    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > RECORD_MAX_BYTES {
-        return Err(why("larger than 1 MiB".into()));
-    }
-    String::from_utf8(bytes).map_err(|_| why("not UTF-8".into()))
-}
-
 /// The environment of `skills update` and of every `npm` command: the default npm registry, so
-/// a registry that an npmrc names cannot serve a package that an `npm:` grant covers. npm
+/// a registry that an npmrc names cannot serve a package. npm
 /// resolves a scoped package through `@<scope>:registry`, which `npm_config_registry` does
 /// not override, so each scope among `names` is pinned to the default registry too.
 pub(crate) fn npm_env(names: &[String]) -> Vec<(String, String)> {
@@ -1114,89 +993,10 @@ pub(crate) fn npm_env(names: &[String]) -> Vec<(String, String)> {
     v
 }
 
-/// The git sources that `skills update` fetches: `source` and `sourceUrl` of each entry of the
-/// `skills` CLI's record (version 3:
-/// `{"version": 3, "skills": {<name>: {"source": .., "sourceUrl": .., ..}}}`). `Err` is why
-/// the record cannot be read.
-fn skills_sources(env: &Env) -> Result<Vec<String>, String> {
-    let path = env.home.join(SKILLS_RECORD);
-    let text = read_record(&path)?;
-    let unknown = |what: &str| {
-        format!(
-            "{} is not a skills record this manager reads: {what}; nothing ran",
-            path.display()
-        )
-    };
-    let doc: serde_json::Value =
-        serde_json::from_str(&text).map_err(|_| unknown("not valid JSON"))?;
-    if doc["version"].as_u64() != Some(SKILLS_RECORD_VERSION) {
-        return Err(unknown("version is not 3"));
-    }
-    let skills = doc["skills"]
-        .as_object()
-        .ok_or_else(|| unknown("skills is not an object"))?;
-    let mut values = Vec::new();
-    for (name, entry) in skills {
-        let source = entry["source"]
-            .as_str()
-            .ok_or_else(|| unknown(&format!("skill {name:?} has no source")))?;
-        values.push(source.to_string());
-        match &entry["sourceUrl"] {
-            serde_json::Value::Null => {}
-            serde_json::Value::String(u) => values.push(u.clone()),
-            _ => {
-                return Err(unknown(&format!(
-                    "skill {name:?} has a sourceUrl that is not text"
-                )));
-            }
-        }
-    }
-    Ok(values)
-}
-
 /// The identity of a git remote url, or its note.
 fn git_id(url: &str) -> Result<String, String> {
     git_identity(url, cfg!(feature = "test-isolation"))
         .map_err(|e| format!("{}: {}", e.code.as_str(), e.detail))
-}
-
-/// The url git fetches from for `url`: `git ls-remote --get-url` applies `url.*.insteadOf`
-/// from the user's git config and makes no network call.
-fn fetch_url(env: &Env, url: &str) -> Result<String, String> {
-    let why = |n: String| {
-        format!("cannot resolve the source {url} with git ls-remote --get-url: {n}; nothing ran")
-    };
-    env.provider.resolve("git").map_err(|e| why(e.detail))?;
-    let out = call(
-        env.provider,
-        "git",
-        &args(&["ls-remote", "--get-url", url]),
-        &[],
-        env.timeouts.short,
-    )
-    .map_err(|(n, _)| why(n))?;
-    match String::from_utf8_lossy(&out.stdout).trim() {
-        "" => Err(why("it printed no url".into())),
-        u => Ok(u.to_string()),
-    }
-}
-
-/// The identities `skills update` fetches: `npm:skills` for the installer, then each record
-/// source as git clones it. A value is mapped before git sees it, so a value that maps to no
-/// git origin never reaches git; then its fetch url is mapped again.
-fn skills_identities(env: &Env, values: &[String]) -> Vec<Result<String, String>> {
-    let mut ids = vec![Ok(format!("{NPM}{SKILLS_PACKAGE}"))];
-    ids.extend(values.iter().map(|v| {
-        let id = git_id(v)?;
-        // The `skills` CLI clones a GitHub shorthand as `https://github.com/<o>/<r>.git`.
-        let clone = if v.contains(':') {
-            v.clone()
-        } else {
-            format!("{id}.git")
-        };
-        git_id(&fetch_url(env, &clone)?)
-    }));
-    ids
 }
 
 /// The notes for the identities one updater fetches: each note as it is, and one per identity
@@ -1222,28 +1022,14 @@ fn untrusted(ids: Vec<Result<String, String>>, grants: &Grants) -> Vec<String> {
     notes
 }
 
-/// Why the updater must not run because of its sources, one note each, or nothing. `skills`
-/// and the `agents` managed copy fetch extension sources, each global npm package runs its
-/// install scripts, and a uv tool from a git source is built from what it fetches: each such
-/// source needs a grant (DFM-25, C04), except an `agents` managed copy that is a declared
-/// checkout of the same repository. The `agents` working copy is never fetched, and the
-/// other updaters update a binary or packages from their owner: none of them is gated. An
-/// unreadable source record is one note. An updater with a note runs no command that fetches
-/// or installs.
+/// Why the updater must not run because of its sources, one note each, or nothing. Only the
+/// `agents` managed copy is gated: its upstream needs a grant (DFM-25, C04), except a managed
+/// copy that is a declared checkout of the same repository. The `agents` working copy is never
+/// fetched. Every other updater acts on what its package manager lists (owner decision of
+/// 2026-11-12): none of them is gated. An updater with a note runs no command that fetches or
+/// installs.
 pub fn trust_notes(u: Updater, env: &Env) -> Vec<String> {
     match u {
-        Updater::Skills => match skills_sources(env) {
-            Ok(v) => untrusted(skills_identities(env, &v), env.grants),
-            Err(why) => vec![why],
-        },
-        Updater::Npm => match npm_names(env) {
-            Ok(names) => untrusted(
-                names.iter().map(|n| Ok(format!("{NPM}{n}"))).collect(),
-                env.grants,
-            ),
-            Err(why) => vec![why],
-        },
-        Updater::Uv => untrusted(uv_identities(env), env.grants),
         Updater::Agents => {
             let (copy, working) = agents_copy(env);
             if working || std::fs::symlink_metadata(copy.join(".git")).is_err() {
@@ -1764,7 +1550,10 @@ fn preview_command(u: Updater, env: &Env) -> String {
             Err(e) => format!("blocked: {}", e.detail),
         },
         Updater::Skills => match env.provider.resolve("mise") {
-            Ok(p) => format!("would run mise exec -- npx skills update ({})", p.display()),
+            Ok(p) => format!(
+                "would run mise exec -- npx skills@latest update ({})",
+                p.display()
+            ),
             Err(e) => format!("blocked: {}", e.detail),
         },
         Updater::Mise => match env.provider.resolve("mise") {
@@ -1843,8 +1632,6 @@ mod tests {
     /// The registry remote that [`T::managed`] records, and its identity.
     const REGISTRY: &str = "git@github.com:o/agents.git";
     const REGISTRY_ID: &str = "ssh://git@github.com/o/agents";
-    /// A skills record with one GitHub skill, whose identity is `https://github.com/o/skill`.
-    const SKILL_RECORD: &str = r#"{"version":3,"skills":{"one":{"source":"o/skill","sourceType":"github","sourceUrl":"https://github.com/o/skill.git","skillPath":"skills/one/SKILL.md"}}}"#;
 
     impl T {
         fn new() -> T {
@@ -1871,11 +1658,7 @@ mod tests {
                 detach: false,
             };
             let mut grants = Grants::default();
-            for id in [REGISTRY_ID, "npm:skills", "https://github.com/o/skill"] {
-                grants.grant(id, "2026-11-02T00:00:00Z");
-            }
-            fs::create_dir_all(home.join(".agents")).unwrap();
-            fs::write(home.join(".agents/.skill-lock.json"), SKILL_RECORD).unwrap();
+            grants.grant(REGISTRY_ID, "2026-11-02T00:00:00Z");
             // `git ls-remote --get-url <url>` prints `st/mirror` when it exists (an insteadOf
             // rewrite), else the url; `st/lsremote-fail` makes it fail. It logs nothing;
             // `agents` replaces it with its own look-alike.
@@ -2540,24 +2323,6 @@ mod tests {
     }
 
     #[test]
-    fn skills_without_a_grant_for_npm_skills_is_blocked() {
-        let mut t = T::new();
-        t.script(&t.bin.join("mise"), "exit 0");
-        t.grants = Grants::default();
-        t.grants
-            .grant("https://github.com/o/skill", "2026-11-02T00:00:00Z");
-        let r = run(Updater::Skills, &t.env());
-        assert_eq!(r.status, Status::Blocked, "{r:?}");
-        assert_eq!(
-            r.notes,
-            [
-                "E_SOURCE_UNTRUSTED: no grant for npm:skills; review it, then run dfm sync --trust-origin 'npm:skills'"
-            ]
-        );
-        assert_eq!(t.log(), "");
-    }
-
-    #[test]
     fn side_channels_runs_the_checkout_recipe() {
         let t = T::new();
         t.script(
@@ -2598,103 +2363,13 @@ mod tests {
     }
 
     #[test]
-    fn skills_lists_every_ungranted_skill_source() {
-        let mut t = T::new();
-        t.script(&t.bin.join("mise"), "exit 0");
-        t.grants = Grants::default();
-        let p = preview(Updater::Skills, &t.env());
-        assert!(p.starts_with("blocked: "), "{p}");
-        for id in ["npm:skills", "https://github.com/o/skill"] {
-            assert!(p.contains(&trust_command(id)), "{p}");
-        }
-        // A source that maps to no identity is untrusted, also with every grant held.
-        let t = T::new();
-        t.script(&t.bin.join("mise"), "exit 0");
-        fs::write(
-            t.home.join(".agents/.skill-lock.json"),
-            r#"{"version":3,"skills":{"mine":{"source":"/Users/me/skills","sourceType":"local"}}}"#,
-        )
-        .unwrap();
-        let r = run(Updater::Skills, &t.env());
-        assert_eq!(r.status, Status::Blocked, "{r:?}");
-        assert!(
-            r.notes[0].starts_with("E_SOURCE_UNTRUSTED: source "),
-            "{r:?}"
-        );
-        assert_eq!(t.log(), "");
-    }
-
-    #[test]
-    fn skills_with_an_unreadable_source_record_is_blocked() {
-        let t = T::new();
-        t.script(&t.bin.join("mise"), "exit 0");
-        let record = t.home.join(".agents/.skill-lock.json");
-        for (text, why) in [
-            (None, "cannot read"),
-            (Some("not json"), "not valid JSON"),
-            (Some(r#"{"version":4,"skills":{}}"#), "version is not 3"),
-            (Some(r#"{"version":3,"skills":{"x":{}}}"#), "has no source"),
-        ] {
-            match text {
-                Some(t) => fs::write(&record, t).unwrap(),
-                None => {
-                    let _ = fs::remove_file(&record);
-                }
-            }
-            let r = run(Updater::Skills, &t.env());
-            assert_eq!(r.status, Status::Blocked, "{r:?}");
-            assert!(r.notes[0].contains(why), "{why}: {r:?}");
-            assert!(r.notes[0].ends_with("; nothing ran"), "{r:?}");
-            assert!(preview(Updater::Skills, &t.env()).starts_with("blocked: "));
-        }
-        assert_eq!(t.log(), "");
-    }
-
-    #[test]
-    fn skills_checks_the_url_git_rewrites_to() {
-        let t = T::new();
-        t.script(&t.bin.join("mise"), "exit 0");
-        // The literal source is granted, but insteadOf sends the clone to a mirror.
-        fs::write(
-            t.root.join("st/mirror"),
-            "https://mirror.invalid/o/skill.git\n",
-        )
-        .unwrap();
-        let r = run(Updater::Skills, &t.env());
-        assert_eq!(r.status, Status::Blocked, "{r:?}");
-        assert_eq!(
-            r.notes,
-            [
-                "E_SOURCE_UNTRUSTED: no grant for https://mirror.invalid/o/skill; review it, then run dfm sync --trust-origin 'https://mirror.invalid/o/skill'"
-            ]
-        );
-        assert!(preview(Updater::Skills, &t.env()).starts_with("blocked: E_SOURCE_UNTRUSTED"));
-        assert_eq!(t.log(), "");
-    }
-
-    #[test]
-    fn skills_whose_url_git_cannot_resolve_is_blocked() {
-        let t = T::new();
-        t.script(&t.bin.join("mise"), "exit 0");
-        fs::write(t.root.join("st/lsremote-fail"), "").unwrap();
-        let r = run(Updater::Skills, &t.env());
-        assert_eq!(r.status, Status::Blocked, "{r:?}");
-        assert!(
-            r.notes[0].starts_with("cannot resolve the source "),
-            "{r:?}"
-        );
-        assert!(r.notes[0].ends_with("; nothing ran"), "{r:?}");
-        assert_eq!(t.log(), "");
-    }
-
-    #[test]
     fn agents_with_an_npm_upstream_is_blocked_although_npm_is_granted() {
-        let t = T::new();
+        let mut t = T::new();
         t.agents("abc1234", "def5678");
         let copy = t.managed();
         // Git reads `npm:skills` as host `npm`; the npm:skills grant must not cover it.
         fs::write(t.root.join("st/url-origin"), "npm:skills").unwrap();
-        assert!(t.grants.trusts("npm:skills"));
+        t.grants.grant("npm:skills", "2026-11-02T00:00:00Z");
         let r = run(Updater::Agents, &t.env());
         assert_eq!(r.status, Status::Blocked, "{r:?}");
         assert!(
@@ -2720,6 +2395,9 @@ mod tests {
             Updater::Brew,
             Updater::Mise,
             Updater::Rustup,
+            Updater::Npm,
+            Updater::Uv,
+            Updater::Skills,
         ] {
             assert!(trust_notes(u, &t.env()).is_empty(), "{u:?}");
         }
@@ -3145,6 +2823,50 @@ mod tests {
     }
 
     #[test]
+    fn skills_runs_the_latest_cli() {
+        let t = T::new();
+        t.script(&t.bin.join("mise"), "exit 0");
+        run(Updater::Skills, &t.env());
+        assert_eq!(t.calls(), ["mise exec -- npx skills@latest update"]);
+        assert!(
+            preview(Updater::Skills, &t.env())
+                .starts_with("would run mise exec -- npx skills@latest update"),
+        );
+    }
+
+    #[test]
+    fn npm_uv_and_skills_run_without_grants() {
+        let mut t = T::new();
+        t.grants = Grants::default();
+        t.script(&t.bin.join("mise"), "exit 0");
+        t.npm(NPM_LS, NPM_OUTDATED, NPM_ONLY);
+        t.uv(
+            &[("b", "git = \"https://github.com/o/b.git?rev=1\"")],
+            UV_LIST,
+            UV_AFTER,
+        );
+        for (u, status) in [
+            (Updater::Skills, Status::Current),
+            (Updater::Npm, Status::Updated),
+            (Updater::Uv, Status::Updated),
+        ] {
+            let r = run(u, &t.env());
+            assert_eq!(r.status, status, "{u:?}: {r:?}");
+            assert!(
+                !r.notes.iter().any(|n| n.contains("E_SOURCE_UNTRUSTED")),
+                "{u:?}: {r:?}"
+            );
+            assert!(!preview(u, &t.env()).starts_with("blocked"), "{u:?}");
+        }
+        assert!(
+            t.log().contains("npm update -g @webos-tools/cli"),
+            "{}",
+            t.log()
+        );
+        assert!(t.log().contains("uv tool upgrade b"), "{}", t.log());
+    }
+
+    #[test]
     fn skills_exit_0_is_current_with_a_note() {
         let t = T::new();
         t.script(&t.bin.join("mise"), "exit 0");
@@ -3156,7 +2878,8 @@ mod tests {
             "{r:?}"
         );
         assert!(
-            t.log().starts_with("mise exec -- npx skills update |"),
+            t.log()
+                .starts_with("mise exec -- npx skills@latest update |"),
             "{}",
             t.log()
         );
@@ -3547,28 +3270,8 @@ mod tests {
     const NPM_ONLY: &str = r#"{"npm":{"current":"11.20.0","wanted":"12.2.2","latest":"12.2.2"}}"#;
 
     #[test]
-    fn npm_without_a_grant_for_each_package_is_blocked_before_any_outdated() {
+    fn npm_updates_every_package_and_holds_npm_on_the_default_registry() {
         let t = T::new();
-        t.npm(NPM_LS, NPM_OUTDATED, NPM_ONLY);
-        let r = run(Updater::Npm, &t.env());
-        assert_eq!(r.status, Status::Blocked, "{r:?}");
-        assert_eq!(
-            r.notes,
-            vec![format!(
-                "E_SOURCE_UNTRUSTED: no grant for npm:@webos-tools/cli; review it, then run {}",
-                trust_command("npm:@webos-tools/cli")
-            )]
-        );
-        // npm itself is held, so it needs no grant.
-        assert_eq!(t.calls(), vec!["npm ls -g --depth=0 --json".to_string()]);
-        assert!(preview(Updater::Npm, &t.env()).starts_with("blocked: E_SOURCE_UNTRUSTED"));
-    }
-
-    #[test]
-    fn npm_updates_the_granted_packages_and_holds_npm_on_the_default_registry() {
-        let mut t = T::new();
-        t.grants
-            .grant("npm:@webos-tools/cli", "2026-11-06T00:00:00Z");
         t.npm(NPM_LS, NPM_OUTDATED, NPM_ONLY);
         let r = run(Updater::Npm, &t.env());
         assert_eq!(r.status, Status::Updated, "{r:?}");
@@ -3606,9 +3309,7 @@ mod tests {
 
     #[test]
     fn npm_package_at_wanted_is_held_and_nothing_outdated_is_current() {
-        let mut t = T::new();
-        t.grants
-            .grant("npm:@webos-tools/cli", "2026-11-06T00:00:00Z");
+        let t = T::new();
         let at_wanted =
             r#"{"@webos-tools/cli":{"current":"3.2.6","wanted":"3.2.6","latest":"4.0.0"}}"#;
         t.npm(NPM_LS, at_wanted, at_wanted);
@@ -3629,10 +3330,8 @@ mod tests {
     const UV_AFTER: &str = "a v1.0\n- a\nb v3.0\n- b\n- b-cli\n";
 
     #[test]
-    fn uv_upgrades_each_tool_from_a_local_or_granted_source() {
-        let mut t = T::new();
-        t.grants
-            .grant("https://github.com/o/b", "2026-11-06T00:00:00Z");
+    fn uv_upgrades_each_tool() {
+        let t = T::new();
         t.uv(
             &[
                 ("a", "directory = \"/x/a\""),
@@ -3656,85 +3355,8 @@ mod tests {
     }
 
     #[test]
-    fn uv_with_an_ungranted_git_source_is_blocked_before_any_command() {
-        let t = T::new();
-        t.uv(
-            &[
-                ("a", "editable = \"/x/a\""),
-                ("b", "git = \"ssh://git@github.com/o/b\""),
-            ],
-            UV_LIST,
-            UV_AFTER,
-        );
-        let r = run(Updater::Uv, &t.env());
-        assert_eq!(r.status, Status::Blocked, "{r:?}");
-        assert_eq!(
-            r.notes,
-            vec![format!(
-                "E_SOURCE_UNTRUSTED: no grant for ssh://git@github.com/o/b; review it, then run {}",
-                trust_command("ssh://git@github.com/o/b")
-            )]
-        );
-        assert_eq!(t.calls(), Vec::<String>::new());
-        assert!(preview(Updater::Uv, &t.env()).starts_with("blocked: E_SOURCE_UNTRUSTED"));
-    }
-
-    #[test]
-    fn uv_checks_the_url_git_rewrites_to() {
-        let mut t = T::new();
-        t.grants
-            .grant("https://github.com/o/b", "2026-11-06T00:00:00Z");
-        t.uv(
-            &[("b", "git = \"https://github.com/o/b.git?rev=1\"")],
-            UV_LIST,
-            UV_AFTER,
-        );
-        // The literal source is granted, but insteadOf sends the fetch to a mirror.
-        fs::write(t.root.join("st/mirror"), "https://mirror.invalid/o/b.git\n").unwrap();
-        let r = run(Updater::Uv, &t.env());
-        assert_eq!(r.status, Status::Blocked, "{r:?}");
-        assert_eq!(
-            r.notes,
-            vec![format!(
-                "E_SOURCE_UNTRUSTED: no grant for https://mirror.invalid/o/b; review it, then run {}",
-                trust_command("https://mirror.invalid/o/b")
-            )]
-        );
-        assert_eq!(t.calls(), Vec::<String>::new());
-        fs::write(t.root.join("st/lsremote-fail"), "").unwrap();
-        let r = run(Updater::Uv, &t.env());
-        assert_eq!(r.status, Status::Blocked, "{r:?}");
-        assert!(
-            r.notes[0]
-                .starts_with("uv tool b: cannot resolve the source https://github.com/o/b.git"),
-            "{r:?}"
-        );
-    }
-
-    #[test]
-    fn uv_legacy_string_requirement_is_blocked() {
-        let t = T::new();
-        t.uv(&[("a", "directory = \"/x/a\"")], UV_LIST, UV_AFTER);
-        fs::write(
-            t.home.join(UV_TOOLS).join("a/uv-receipt.toml"),
-            "[tool]\nrequirements = [\"a @ git+https://example.invalid/o/a\"]\n",
-        )
-        .unwrap();
-        let r = run(Updater::Uv, &t.env());
-        assert_eq!(r.status, Status::Blocked, "{r:?}");
-        assert!(
-            r.notes[0]
-                .starts_with("uv tool a: a legacy string entry in the receipt's requirements"),
-            "{r:?}"
-        );
-        assert_eq!(t.calls(), Vec::<String>::new());
-    }
-
-    #[test]
     fn npm_error_document_and_bad_entry_are_failed_not_current() {
-        let mut t = T::new();
-        t.grants
-            .grant("npm:@webos-tools/cli", "2026-11-06T00:00:00Z");
+        let t = T::new();
         let error = r#"{"error":{"code":"E403","summary":"forbidden"}}"#;
         t.npm(NPM_LS, error, error);
         let r = run(Updater::Npm, &t.env());
@@ -3763,37 +3385,8 @@ mod tests {
     }
 
     #[test]
-    fn uv_constraint_sources_need_a_grant_too() {
-        let t = T::new();
-        t.uv(&[("a", "directory = \"/x/a\"")], UV_LIST, UV_AFTER);
-        fs::write(
-            t.home.join(UV_TOOLS).join("a/uv-receipt.toml"),
-            "[tool]\nrequirements = [{ name = \"a\", directory = \"/x/a\" }]\nconstraints = [{ name = \"dep\", git = \"https://github.com/o/dep\" }]\noverrides = [\"x @ git+https://example.invalid/o/x\"]\nentrypoints = [{ name = \"a\", install-path = \"/x/bin/a\", from = \"a\" }]\n",
-        )
-        .unwrap();
-        let r = run(Updater::Uv, &t.env());
-        assert_eq!(r.status, Status::Blocked, "{r:?}");
-        assert!(
-            r.notes
-                .iter()
-                .any(|n| n.contains("no grant for https://github.com/o/dep")),
-            "{r:?}"
-        );
-        assert!(
-            r.notes
-                .iter()
-                .any(|n| n
-                    .starts_with("uv tool a: a legacy string entry in the receipt's overrides")),
-            "{r:?}"
-        );
-        assert_eq!(t.calls(), Vec::<String>::new());
-    }
-
-    #[test]
     fn npm_updates_only_the_names_the_checked_listing_holds() {
-        let mut t = T::new();
-        t.grants
-            .grant("npm:@webos-tools/cli", "2026-11-06T00:00:00Z");
+        let t = T::new();
         // A filtered listing (an npmrc `link=true`) names no package; outdated still does.
         t.npm(
             r#"{"name":"lib","dependencies":{}}"#,
@@ -3813,25 +3406,6 @@ mod tests {
             env.lines().all(|l| l.contains("npm_config_link=false ")),
             "{env}"
         );
-    }
-
-    #[test]
-    fn uv_url_source_and_unreadable_receipt_are_blocked() {
-        let t = T::new();
-        t.uv(&[("a", "url = \"https://h/a.tar.gz\"")], UV_LIST, UV_AFTER);
-        let r = run(Updater::Uv, &t.env());
-        assert_eq!(r.status, Status::Blocked, "{r:?}");
-        assert_eq!(
-            r.notes,
-            vec![
-                "uv tool a: the source https://h/a.tar.gz maps to no identity; upgrade it by hand"
-                    .to_string()
-            ]
-        );
-        fs::write(t.home.join(UV_TOOLS).join("a/uv-receipt.toml"), "[tool\n").unwrap();
-        let r = run(Updater::Uv, &t.env());
-        assert_eq!(r.status, Status::Blocked, "{r:?}");
-        assert!(r.notes[0].starts_with("uv tool a: "), "{r:?}");
     }
 
     #[test]

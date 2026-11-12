@@ -4145,7 +4145,7 @@ fn sync_runs_the_declared_updaters_in_order() {
 
 /// DFM-85: the `mise`, `rustup`, `uv` and `npm` updaters run in the declared order through
 /// look-alikes that exit as the real listings do (`rustup check` 100 and `npm outdated` 1 when
-/// there is work). `npm` needs a grant for each global package; `npm` itself is held.
+/// there is work). No updater needs a grant; `npm` itself is held.
 #[test]
 fn sync_runs_the_mise_rustup_uv_and_npm_updaters_in_order() {
     let u = Up::new(r#"["mise", "rustup", "uv", "npm"]"#);
@@ -4202,45 +4202,34 @@ fn sync_runs_the_mise_rustup_uv_and_npm_updaters_in_order() {
         "[tool]\nrequirements = [{ name = \"a\", directory = \"/x/a\" }]\n",
     )
     .unwrap();
-    // Without the grant, npm is a blocked row and runs nothing but its listing.
     let o = u.sync(&[]);
     assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
     let s = stdout(&o);
-    assert!(s.contains("  blocked npm"), "{s}");
-    assert!(s.contains("no grant for npm:x"), "{s}");
-    assert!(!s.contains("npm:npm"), "{s}");
-    assert!(!u.log().contains("npm outdated"), "{}", u.log());
+    assert!(!s.contains("E_SOURCE_UNTRUSTED"), "{s}");
     assert!(s.contains("  updated mise"), "{s}");
     assert!(s.contains("    note: go 1.27.3 -> 1.27.4 upgraded"), "{s}");
     assert!(s.contains("  updated rustup"), "{s}");
     assert!(s.contains("  updated uv"), "{s}");
     assert!(s.contains("    note: a 1.0 -> 1.1 upgraded"), "{s}");
-    let log = u.log();
-    let at = |c: &str| log.find(c).unwrap_or_else(|| panic!("{c}\n{log}"));
-    assert!(at("mise upgrade") < at("rustup update"), "{log}");
-    assert!(at("rustup update") < at("uv tool upgrade a"), "{log}");
-    // The listing before publication ran the npm source check once already; the run's own
-    // `npm ls` is the last one.
-    assert!(
-        at("uv tool upgrade a") < log.rfind("npm ls -g --depth=0 --json").unwrap(),
-        "{log}"
-    );
-    assert!(s.contains("  upgrade: updated=3 blocked=1"), "{s}");
-    // With the grant, npm updates x and holds npm.
-    u.fx.trust("npm:x");
-    u.clear_log();
-    let o = u.sync(&[]);
-    assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
-    let s = stdout(&o);
     assert!(s.contains("  updated npm"), "{s}");
     assert!(
         s.contains("    note: npm 11.0 held (Homebrew's node formula owns it; latest 12.0)"),
         "{s}"
     );
     assert!(s.contains("    note: x 1.0 -> 1.1 upgraded"), "{s}");
-    assert!(u.log().contains("npm update -g x\n"), "{}", u.log());
+    let log = u.log();
+    let at = |c: &str| log.find(c).unwrap_or_else(|| panic!("{c}\n{log}"));
+    assert!(at("mise upgrade") < at("rustup update"), "{log}");
+    assert!(at("rustup update") < at("uv tool upgrade a"), "{log}");
+    assert!(at("uv tool upgrade a") < at("npm update -g x\n"), "{log}");
+    assert!(s.contains("  upgrade: updated=4"), "{s}");
+    // A second run finds nothing to do.
+    u.clear_log();
+    let o = u.sync(&[]);
+    assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
+    let s = stdout(&o);
     assert!(s.contains("  current mise"), "{s}");
-    assert!(s.contains("  upgrade: updated=1 current=3"), "{s}");
+    assert!(s.contains("  upgrade: current=4"), "{s}");
     assert_eq!(u.upgrade_receipts().len(), 2);
 }
 
@@ -4629,10 +4618,10 @@ fn a_granted_origin_with_an_ungranted_upstream_remote_blocks_agents() {
     assert!(!u.log().contains("install"), "{}", u.log());
 }
 
-/// DFM-25 (C04, G2, G6): `skills` needs its source record and a grant for `npm:skills` and
-/// for each skill source. Until then it is a `blocked` row, and `mise` never runs.
+/// Owner decision of 2026-11-12: `skills` needs no source record and no grant. It runs the
+/// latest CLI.
 #[test]
-fn skills_is_blocked_until_its_record_and_sources_are_granted() {
+fn skills_runs_without_a_record_or_a_grant() {
     let u = Up::new(r#"["skills"]"#);
     let mise = u.fake.path().join("bin/mise");
     fs::write(
@@ -4644,46 +4633,12 @@ fn skills_is_blocked_until_its_record_and_sources_are_granted() {
     )
     .unwrap();
     fs::set_permissions(&mise, fs::Permissions::from_mode(0o755)).unwrap();
-    // No record: the source list cannot be read.
     let o = u.sync(&[]);
     assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
     let s = stdout(&o);
-    assert!(s.contains("  skills: blocked: cannot read "), "{s}");
-    assert!(s.contains("  blocked skills\n"), "{s}");
-    assert!(s.contains("  upgrade: blocked=1"), "{s}");
-    // A record with one GitHub skill: neither npm:skills nor the skill source has a grant.
-    fs::create_dir_all(u.fx.h(".agents")).unwrap();
-    fs::write(
-        u.fx.h(".agents/.skill-lock.json"),
-        r#"{"version":3,"skills":{"one":{"source":"o/skill","sourceType":"github","sourceUrl":"https://github.com/o/skill.git"}}}"#,
-    )
-    .unwrap();
-    let o = u.sync(&[]);
-    let s = stdout(&o);
-    assert!(
-        s.contains("    note: E_SOURCE_UNTRUSTED: no grant for npm:skills;"),
-        "{s}"
-    );
-    assert!(
-        s.contains("dfm sync --trust-origin 'https://github.com/o/skill'"),
-        "{s}"
-    );
-    // npm:skills alone is not enough. A grant run with nothing to change still stops for
-    // review and runs no updater.
-    let o = u.sync(&["--trust-origin", "npm:skills"]);
-    assert_eq!(code(&o), 3, "{}\n{}", stdout(&o), stderr(&o));
-    assert!(stderr(&o).contains("E_APPROVAL_REQUIRED"), "{}", stderr(&o));
-    let o = u.sync(&[]);
-    let s = stdout(&o);
-    assert!(!s.contains("no grant for npm:skills"), "{s}");
-    assert!(s.contains("  blocked skills\n"), "{s}");
-    assert_eq!(u.log(), "");
-    let o = u.sync(&["--trust-origin", "https://github.com/o/skill"]);
-    assert_eq!(code(&o), 3, "{}\n{}", stdout(&o), stderr(&o));
-    let o = u.sync(&[]);
-    let s = stdout(&o);
     assert!(s.contains("  current skills"), "{s}");
-    assert_eq!(u.log(), "mise exec -- npx skills update\n");
+    assert!(!s.contains("E_SOURCE_UNTRUSTED"), "{s}");
+    assert_eq!(u.log(), "mise exec -- npx skills@latest update\n");
 }
 
 #[test]
