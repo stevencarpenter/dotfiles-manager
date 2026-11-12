@@ -902,6 +902,12 @@ fn a_git_source_without_a_grant_blocks_and_with_one_installs() {
         t.contains("dfm sync --trust-origin 'https://github.com/o/r'"),
         "{t}"
     );
+    assert!(
+        t.contains("its git source has no grant (https://github.com/o/r)"),
+        "{t}"
+    );
+    assert!(t.contains("after reviewing that repository"), "{t}");
+    assert!(!t.contains("script"), "{t}");
     assert!(fx.changes().is_empty(), "{}", fx.log());
     fx.grant("https://github.com/o/r");
     let o = fx.apply(false);
@@ -1011,4 +1017,34 @@ fn a_path_source_outside_the_checkout_is_refused() {
         );
     }
     assert!(fx.changes().is_empty(), "{}", fx.log());
+}
+
+#[test]
+fn an_ungranted_git_source_blocks_the_update_too() {
+    let fx = Fx::new();
+    fx.with_source(GIT);
+    let o = fx.preview(true);
+    let t = format!("{}{}", text(&o.stdout), stderr(&o));
+    assert_eq!(code(&o), 3, "{t}");
+    assert!(t.contains("E_SOURCE_UNTRUSTED"), "{t}");
+    assert!(
+        t.contains("dfm sync --trust-origin 'https://github.com/o/r'"),
+        "{t}"
+    );
+    assert!(fx.changes().is_empty(), "{}", fx.log());
+}
+
+#[test]
+fn a_source_that_builds_another_name_fails_with_the_reason() {
+    let fx = Fx::new();
+    fs::create_dir_all(fx.root.join("agent_reap")).unwrap();
+    fx.with_source("path:agent_reap");
+    fx.marker("uv-builds", "agent-reap");
+    let o = fx.apply(false);
+    assert_eq!(code(&o), 1, "{}\n{}", stderr(&o), text(&o.stdout));
+    assert!(
+        stderr(&o).contains("the package at the source may have another name"),
+        "{}",
+        stderr(&o)
+    );
 }

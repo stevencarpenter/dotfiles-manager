@@ -819,16 +819,8 @@ pub(crate) fn uv_source_probe(
     value: &Value,
     cx: Option<&ScriptCx>,
 ) -> Result<PackageState, Refusal> {
-    let pkg = name(value)?;
+    let pkg = uv_source_name(value)?;
     policy(value)?;
-    if !uv_name(&pkg) {
-        return Err(Refusal::new(
-            Code::ManifestInvalid,
-            format!(
-                "{pkg}: uv-tool/v1 takes a package-index name (letters, digits, '.', '_', '-'); a source goes in source"
-            ),
-        ));
-    }
     let text = source_text(value).unwrap_or_default();
     let Some(cx) = cx else {
         if !text.starts_with("path:") {
@@ -839,8 +831,7 @@ pub(crate) fn uv_source_probe(
     let source = uv_source(value, cx.root())?.ok_or_else(|| bad_source(text, "is missing"))?;
     let (key, want, shown) = match &source {
         UvSource::Git { url, rev } => {
-            let id = git_identity(url)?;
-            if !cx.grants()?.trusts(&id) {
+            if let Some(id) = ungranted(&source, cx)? {
                 return Ok(PackageState::Ungranted(id));
             }
             ("git", format!("{url}?rev={rev}"), rev.clone())
@@ -872,12 +863,12 @@ pub(crate) fn uv_source_install(
     value: &Value,
     cx: &ScriptCx,
 ) -> Result<(), Refusal> {
-    name(value)?;
+    let pkg = uv_source_name(value)?;
     let text = source_text(value).unwrap_or_default();
-    let arg = match uv_source(value, cx.root())?.ok_or_else(|| bad_source(text, "is missing"))? {
+    let source = uv_source(value, cx.root())?.ok_or_else(|| bad_source(text, "is missing"))?;
+    let arg = match &source {
         UvSource::Git { url, rev } => {
-            let id = git_identity(&url)?;
-            if !cx.grants()?.trusts(&id) {
+            if let Some(id) = ungranted(&source, cx)? {
                 return Err(Refusal::new(
                     Code::SourceUntrusted,
                     format!(
@@ -895,13 +886,57 @@ pub(crate) fn uv_source_install(
             .to_string(),
     };
     let args = ["tool".to_string(), "install".into(), "--force".into(), arg];
-    change(
-        runner,
-        "uv",
-        &args,
-        &uv_env(false),
-        &format!("uv tool install --force {}", args[3]),
-    )
+    let what = format!("uv tool install --force {}", args[3]);
+    change(runner, "uv", &args, &uv_env(false), &what)?;
+    // uv names the tool's directory after the package at the source, not after the declaration.
+    uv_receipt(&runner.home, &pkg).map(|_| ()).map_err(|why| {
+        Refusal::new(
+            Code::IoFailed,
+            format!(
+                "{what} succeeded, but no receipt names {pkg} ({why}); the package at the source may have another name than the declared one"
+            ),
+        )
+    })
+}
+
+/// The declared name of a source tool: a package name that is also a package-index name, so
+/// the receipt path takes no `/`.
+fn uv_source_name(value: &Value) -> Result<String, Refusal> {
+    let pkg = name(value)?;
+    if !uv_name(&pkg) {
+        return Err(Refusal::new(
+            Code::ManifestInvalid,
+            format!(
+                "{pkg}: uv-tool/v1 takes a package-index name (letters, digits, '.', '_', '-'); a source goes in source"
+            ),
+        ));
+    }
+    Ok(pkg)
+}
+
+/// The identity of a git source that has no grant, or `None` (a granted git source, a path).
+fn ungranted(source: &UvSource, cx: &ScriptCx) -> Result<Option<String>, Refusal> {
+    let UvSource::Git { url, .. } = source else {
+        return Ok(None);
+    };
+    let id = git_identity(url)?;
+    Ok((!cx.grants()?.trusts(&id)).then_some(id))
+}
+
+/// `packages --update` for a source tool: `Ungranted` for a git source without a grant, else
+/// what [`maintain`] decides (it holds an installed source tool).
+fn maintain_sourced(
+    runner: &Runner,
+    value: &Value,
+    cx: Option<&ScriptCx>,
+) -> Result<PackageState, Refusal> {
+    if let Some(cx) = cx
+        && let Some(source) = uv_source(value, cx.root())?
+        && let Some(id) = ungranted(&source, cx)?
+    {
+        return Ok(PackageState::Ungranted(id));
+    }
+    maintain(runner, UV_TOOL, value)
 }
 
 /// `dpkg-query -W -f=${Status} <name>`: `install ok installed` means installed. A missing
@@ -1443,9 +1478,12 @@ fn facts(
         }
         let looked = if r.adapter == script::ADAPTER {
             script::probe(runner, &r.id, &r.value, scripts, update)
-        } else if !update && uv_sourced(&r.adapter, &r.value) {
-            // `packages --update` keeps holding a source tool: `maintain` reads its receipt.
-            uv_source_probe(runner, &r.value, scripts)
+        } else if uv_sourced(&r.adapter, &r.value) {
+            if update {
+                maintain_sourced(runner, &r.value, scripts)
+            } else {
+                uv_source_probe(runner, &r.value, scripts)
+            }
         } else {
             look(runner, &r.adapter, &r.value)
         };

@@ -271,22 +271,16 @@ impl Generator for Generators<'_> {
                     format!("no package provider for {}", op.adapter),
                 )
             })?;
+        let value = self.value(op)?;
         if op.adapter == script::ADAPTER {
             let update = op.action == Action::Upgrade;
-            script::probe(
-                runner,
-                &op.resource,
-                self.value(op)?,
-                self.scripts.as_ref(),
-                update,
-            )
-        } else if op.action != Action::Upgrade && package::uv_sourced(&op.adapter, self.value(op)?)
-        {
-            package::uv_source_probe(runner, self.value(op)?, self.scripts.as_ref())
+            script::probe(runner, &op.resource, value, self.scripts.as_ref(), update)
+        } else if op.action != Action::Upgrade && package::uv_sourced(&op.adapter, value) {
+            package::uv_source_probe(runner, value, self.scripts.as_ref())
         } else if op.action == Action::Upgrade {
-            package::maintain(runner, &op.adapter, self.value(op)?)
+            package::maintain(runner, &op.adapter, value)
         } else {
-            package::probe(runner, &op.adapter, self.value(op)?)
+            package::probe(runner, &op.adapter, value)
         }
     }
 
@@ -301,6 +295,7 @@ impl Generator for Generators<'_> {
                     format!("no package provider for {}", op.adapter),
                 )
             })?;
+        let value = self.value(op)?;
         if op.adapter == script::ADAPTER {
             let cx = self.scripts.as_ref().ok_or_else(|| {
                 Refusal::new(
@@ -308,20 +303,19 @@ impl Generator for Generators<'_> {
                     format!("no script installer for {}", op.adapter),
                 )
             })?;
-            script::install(runner, &op.resource, self.value(op)?, cx)
-        } else if op.action != Action::Upgrade && package::uv_sourced(&op.adapter, self.value(op)?)
-        {
+            script::install(runner, &op.resource, value, cx)
+        } else if op.action != Action::Upgrade && package::uv_sourced(&op.adapter, value) {
             let cx = self.scripts.as_ref().ok_or_else(|| {
                 Refusal::new(
                     Code::GeneratorUnavailable,
                     format!("no source installer for {}", op.adapter),
                 )
             })?;
-            package::uv_source_install(runner, self.value(op)?, cx)
+            package::uv_source_install(runner, value, cx)
         } else if op.action == Action::Upgrade {
-            package::upgrade(runner, &op.adapter, self.value(op)?)
+            package::upgrade(runner, &op.adapter, value)
         } else {
-            package::install(runner, &op.adapter, self.value(op)?)
+            package::install(runner, &op.adapter, value)
         }
     }
 
