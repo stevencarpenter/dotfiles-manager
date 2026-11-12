@@ -65,6 +65,55 @@ pub fn copy_tree(from: &Path, to: &Path) {
 
 pub const BIN: &str = env!("CARGO_BIN_EXE_dfm");
 
+/// Moves the `extra` module of the bound tree at `root` into a nested source at `base/ext`
+/// that the lock pins: its declarations are then not the bound checkout's (docs/sync.md,
+/// "Source identities"). `module` is the manifest it gets there.
+pub fn nest_extra(root: &Path, module: &str) {
+    let ext = root.join("base/ext/modules/extra");
+    fs::create_dir_all(&ext).unwrap();
+    fs::write(ext.join("module.toml"), module).unwrap();
+    fs::remove_file(root.join("base/modules/extra/module.toml")).unwrap();
+    fs::write(
+        root.join("base/bundle.toml"),
+        BUNDLE.replace("modules/extra/", "ext/modules/extra/"),
+    )
+    .unwrap();
+    fs::write(
+        root.join("dotfiles-manager.lock"),
+        remote::lock_for(&[
+            ("https://github.com/o/dotfiles", None, "."),
+            (
+                "https://github.com/o/ext",
+                Some(&"a".repeat(40)),
+                "base/ext",
+            ),
+        ]),
+    )
+    .unwrap();
+}
+
+/// Grants `id` with `dfm sync --trust-origin` while the lock at `root` is set aside, so the
+/// run writes the grant and fetches nothing. `run` runs the bound binary with its arguments.
+pub fn grant_aside(root: &Path, id: &str, run: impl Fn(&[&str]) -> Output) {
+    let lock = root.join("dotfiles-manager.lock");
+    let aside = root.join("../lock.aside");
+    fs::rename(&lock, &aside).unwrap();
+    let o = run(&[
+        "sync",
+        "--root",
+        root.to_str().unwrap(),
+        "--trust-origin",
+        id,
+    ]);
+    fs::rename(&aside, &lock).unwrap();
+    assert!(
+        text(&o.stdout).contains(&format!("granted: {id} ")),
+        "{}\n{}",
+        text(&o.stdout),
+        text(&o.stderr)
+    );
+}
+
 pub fn text(b: &[u8]) -> String {
     String::from_utf8_lossy(b).into_owned()
 }

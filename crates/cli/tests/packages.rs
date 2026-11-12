@@ -1192,6 +1192,28 @@ fn a_missing_checkout_is_cloned() {
     assert_eq!(clones(&fx).len(), 1, "{}", fx.log());
 }
 
+/// A checkout that a nested source declares is not the owner's: it is cloned only with a
+/// grant (docs/sync.md, "Source identities").
+#[test]
+fn a_checkout_from_a_nested_source_is_cloned_only_with_a_grant() {
+    let fx = checkout_fx("https://github.com/o/r.git", "");
+    let module = fs::read_to_string(fx.root.join("base/modules/extra/module.toml")).unwrap();
+    common::nest_extra(&fx.root, &module);
+    let o = fx.preview();
+    let t = format!("{}{}", text(&o.stdout), stderr(&o));
+    assert_eq!(code(&o), 3, "{t}");
+    assert!(t.contains("E_SOURCE_UNTRUSTED"), "{t}");
+    assert!(
+        t.contains("dfm sync --trust-origin 'https://github.com/o/r'"),
+        "{t}"
+    );
+    assert!(clones(&fx).is_empty(), "{}", fx.log());
+    common::grant_aside(&fx.root, "https://github.com/o/r", |a| fx.run(a));
+    let o = fx.packages(&digest_of(&fx.preview()));
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+    assert_clone(&fx, "git clone -- https://github.com/o/r.git");
+}
+
 #[test]
 fn a_branch_is_passed_to_the_clone() {
     let fx = checkout_fx("https://github.com/o/r.git", "branch = \"main\"\n");

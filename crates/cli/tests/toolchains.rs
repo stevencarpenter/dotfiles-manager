@@ -969,6 +969,70 @@ fn the_update_rolls_a_ref_less_git_source_tool() {
     );
 }
 
+/// A source that a nested source declares is not the owner's: it needs a grant, and a path
+/// source is refused (docs/sync.md, "Source identities").
+#[test]
+fn a_git_source_from_a_nested_source_installs_only_with_a_grant() {
+    let fx = Fx::new();
+    fx.with_source(GIT);
+    let module = fs::read_to_string(fx.root.join("base/modules/extra/module.toml")).unwrap();
+    common::nest_extra(&fx.root, &module);
+    for update in [false, true] {
+        let o = fx.preview(update);
+        let t = format!("{}{}", text(&o.stdout), stderr(&o));
+        assert_eq!(code(&o), 3, "{t}");
+        assert!(t.contains("E_SOURCE_UNTRUSTED"), "{t}");
+        assert!(
+            t.contains("dfm sync --trust-origin 'https://github.com/o/r'"),
+            "{t}"
+        );
+    }
+    assert!(fx.changes().is_empty(), "{}", fx.log());
+    common::grant_aside(&fx.root, "https://github.com/o/r", |a| fx.run(a));
+    let o = fx.apply(false);
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+    assert_eq!(fx.changes(), [format!("uv tool install --force {GIT}")]);
+}
+
+#[test]
+fn a_ref_less_source_from_a_nested_source_does_not_roll_without_a_grant() {
+    let fx = Fx::new();
+    fx.with_source(ROLLING);
+    fx.installed("uv", "nuv 0.5.2\ntoken-auditor 1.0.0\n");
+    fx.uv_receipt(
+        "token-auditor",
+        "[tool]\nrequirements = [{ name = \"token-auditor\", git = \"https://github.com/o/r?rev=main-tip\" }]\n",
+    );
+    let module = fs::read_to_string(fx.root.join("base/modules/extra/module.toml")).unwrap();
+    common::nest_extra(&fx.root, &module);
+    let o = fx.preview(true);
+    let t = format!("{}{}", text(&o.stdout), stderr(&o));
+    assert_eq!(code(&o), 3, "{t}");
+    assert!(
+        t.contains("dfm sync --trust-origin 'https://github.com/o/r'"),
+        "{t}"
+    );
+    assert!(fx.changes().is_empty(), "{}", fx.log());
+}
+
+#[test]
+fn a_path_source_from_a_nested_source_is_refused() {
+    let fx = Fx::new();
+    fs::create_dir_all(fx.root.join("agent_reap")).unwrap();
+    fx.with_source("path:agent_reap");
+    let module = fs::read_to_string(fx.root.join("base/modules/extra/module.toml")).unwrap();
+    common::nest_extra(&fx.root, &module);
+    let o = fx.preview(false);
+    let t = format!("{}{}", text(&o.stdout), stderr(&o));
+    assert_eq!(code(&o), 3, "{t}");
+    assert!(t.contains("E_MANIFEST_INVALID"), "{t}");
+    assert!(
+        t.contains("a path source must be declared in the bound checkout"),
+        "{t}"
+    );
+    assert!(fx.changes().is_empty(), "{}", fx.log());
+}
+
 #[test]
 fn a_git_source_with_a_branch_ref_is_refused() {
     let fx = Fx::new();

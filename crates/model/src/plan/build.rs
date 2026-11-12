@@ -1382,14 +1382,32 @@ impl Planner<'_> {
                 self.blocker(r, None, f);
             }
             Some(PackageState::Ungranted(identity)) => {
+                let script = identity.starts_with(crate::lock::SCRIPT);
+                let (why, read) = if script {
+                    (
+                        format!(
+                            "{name} is not installed, and its install script has no grant ({identity}); dfm runs only a script the owner trusts"
+                        ),
+                        "reading the script",
+                    )
+                } else {
+                    (
+                        format!(
+                            "{name} needs its source {identity}, which a nested source declares and which has no grant; dfm fetches it only with a grant"
+                        ),
+                        "reviewing the source",
+                    )
+                };
                 let f = fail(
                     Code::SourceUntrusted,
-                    "/url",
+                    if r.adapter == "uv-tool/v1" {
+                        "/source"
+                    } else {
+                        "/url"
+                    },
+                    why,
                     format!(
-                        "{name} is not installed, and its install script has no grant ({identity}); dfm runs only a script the owner trusts"
-                    ),
-                    format!(
-                        "run {} after reading the script, then run sync again",
+                        "run {} after {read}, then run sync again",
                         crate::lock::trust_command(&identity)
                     ),
                 );

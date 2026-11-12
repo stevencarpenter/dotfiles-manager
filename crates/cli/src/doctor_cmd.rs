@@ -1386,15 +1386,32 @@ fn package_row(r: &ResolvedResource, s: &PackageState, path: &OsStr) -> Row {
             why.clone(),
             blocked.into(),
         ),
-        PackageState::Ungranted(identity) => (
-            Level::Warn,
-            Code::SourceUntrusted.into(),
-            format!("{pkg} is not installed and its install script has no grant ({identity})"),
-            format!(
-                "Read the script, then run {}.",
-                dfm_model::lock::trust_command(identity)
-            ),
-        ),
+        PackageState::Ungranted(identity) => {
+            let (why, fix) = if identity.starts_with(dfm_model::lock::SCRIPT) {
+                (
+                    format!(
+                        "{pkg} is not installed and its install script has no grant ({identity})"
+                    ),
+                    "Read the script",
+                )
+            } else {
+                (
+                    format!(
+                        "{pkg} needs its source {identity}, which a nested source declares and which has no grant"
+                    ),
+                    "Review the source",
+                )
+            };
+            (
+                Level::Warn,
+                Code::SourceUntrusted.into(),
+                why,
+                format!(
+                    "{fix}, then run {}.",
+                    dfm_model::lock::trust_command(identity)
+                ),
+            )
+        }
         PackageState::SourceBuild(d) => (
             Level::Warn,
             Code::PlatformUnsupported.into(),

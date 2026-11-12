@@ -16,7 +16,7 @@ use dfm_model::digest::sha256_hex;
 use dfm_model::display::visible;
 use dfm_model::lock::{SCRIPT, script_url, trust_command};
 use dfm_model::plan::PackageState;
-use dfm_model::resolve::Value;
+use dfm_model::resolve::{ResolvedResource, Value};
 use dfm_model::state::{SHELLS, valid_path};
 use dfm_model::{Code, Refusal};
 use std::collections::BTreeMap;
@@ -146,6 +146,8 @@ pub(crate) struct ScriptCx {
     sys: Sys,
     git: Git,
     root: PathBuf,
+    /// The nested source paths of the lock at `root` (`sync_cmd::nested_paths`).
+    nested: Option<Vec<String>>,
     /// The fetched scripts of this run by resource id, set by the probe under the writer lock
     /// and taken by the install. `None` once taken, so the postcondition probe never fetches.
     staged: Option<Mutex<BTreeMap<String, Option<Staged>>>>,
@@ -164,6 +166,7 @@ impl ScriptCx {
             sys: *sys,
             git: Git::new(ctx, sys),
             root: root.to_path_buf(),
+            nested: crate::sync_cmd::nested_paths(root),
             staged: None,
         }
     }
@@ -186,6 +189,19 @@ impl ScriptCx {
     /// The bound checkout of this run.
     pub(crate) fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// Whether the bound checkout declared `r` and its value at `pointer`
+    /// ([`dfm_model::resolve::owner_declared`]). An unreadable lock is never the owner's.
+    pub(crate) fn owner_declared(&self, r: &ResolvedResource, pointer: &str) -> bool {
+        self.nested
+            .as_deref()
+            .is_some_and(|n| dfm_model::resolve::owner_declared(r, pointer, n))
+    }
+
+    /// Whether `identity` has a grant.
+    pub(crate) fn trusts(&self, identity: &str) -> Result<bool, Refusal> {
+        Ok(self.store()?.read_grants()?.trusts(identity))
     }
 
     fn staged(

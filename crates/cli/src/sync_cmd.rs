@@ -2281,6 +2281,17 @@ fn declared_checkout(
     })
 }
 
+/// The nested source paths of the lock at `root`, relative to it, for
+/// [`dfm_model::resolve::owner_declared`]. A checkout without a sync lock has none. `None` is a
+/// lock that cannot be read: then no declaration counts as the owner's.
+pub(crate) fn nested_paths(root: &Path) -> Option<Vec<String>> {
+    if no_sync_sources(root) {
+        return Some(Vec::new());
+    }
+    let lock = read_lock(root).ok()?;
+    Some(lock.nested().iter().map(|s| s.path.clone()).collect())
+}
+
 /// The checkouts the tracked-file guard watches (DFM-25, G5): the bound checkout and each nested
 /// source checkout that the published lock declares and that exists.
 pub(crate) fn guarded_checkouts(root: &Path) -> Result<Vec<PathBuf>, Refusal> {

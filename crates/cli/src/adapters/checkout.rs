@@ -1,14 +1,16 @@
 //! The `git-checkout/v1` package adapter (docs/packages.md, "Git checkouts"): a git repository
-//! cloned to a HOME-relative path. A declared checkout needs no grant: the owner wrote the
-//! declaration. The probe reads only local git state. The install clones a missing checkout
+//! cloned to a HOME-relative path. A checkout the bound checkout declared needs no grant; one
+//! from a nested source needs a grant for its url (`package::SOURCE_ADAPTERS`). The probe reads
+//! only local git state. The install clones a missing checkout
 //! and never pulls (the `checkouts` step of `dfm sync` fast-forwards it).
 
-use super::package::{PROBE_TIMEOUT, change, ended, request};
+use super::package::{PROBE_TIMEOUT, change, ended, request, source_gate, ungranted};
+use super::script::ScriptCx;
 use dfm_engine::Runner;
 use dfm_model::display::visible;
 use dfm_model::lock::git_identity;
 use dfm_model::plan::PackageState;
-use dfm_model::resolve::Value;
+use dfm_model::resolve::{ResolvedResource, Value};
 use dfm_model::state::valid_path;
 use dfm_model::{Code, Refusal};
 use std::fs;
@@ -108,13 +110,25 @@ fn query(runner: &Runner, dir: &Path, rest: &[&str]) -> Result<Option<String>, R
         .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string()))
 }
 
-/// The state of the checkout: no path is `Missing`, a git checkout of the declared repository
-/// is `Installed` (its short HEAD), and anything else at the path is `OtherOwner`.
-pub(crate) fn probe(runner: &Runner, value: &Value) -> Result<PackageState, Refusal> {
-    let d = declared(value)?;
+/// The state of the checkout: no path is `Missing` (`Ungranted` when its url needs a grant it
+/// lacks; without `cx` that is not judged), a git checkout of the declared repository is
+/// `Installed` (its short HEAD), and anything else at the path is `OtherOwner`.
+pub(crate) fn probe(
+    runner: &Runner,
+    r: &ResolvedResource,
+    cx: Option<&ScriptCx>,
+) -> Result<PackageState, Refusal> {
+    let d = declared(&r.value)?;
     let dir = runner.home.join(&d.path);
     match fs::symlink_metadata(&dir) {
-        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(PackageState::Missing(Vec::new())),
+        Err(e) if e.kind() == ErrorKind::NotFound => {
+            if let Some(cx) = cx
+                && let Some(id) = ungranted(cx, r, identity(&d.url)?)?
+            {
+                return Ok(PackageState::Ungranted(id));
+            }
+            return Ok(PackageState::Missing(Vec::new()));
+        }
         Err(e) => {
             return Err(Refusal::new(
                 Code::ProbeFailed,
@@ -151,9 +165,10 @@ pub(crate) fn probe(runner: &Runner, value: &Value) -> Result<PackageState, Refu
 /// it to the missing path once the clone succeeds, so a failed or killed clone never leaves a
 /// half checkout at the path. Prompts are off. The caller probes again afterwards. The sibling is
 /// a directory this run created: it is removed on failure, and one left by an earlier killed
-/// run is removed first.
-pub(crate) fn install(runner: &Runner, value: &Value) -> Result<(), Refusal> {
-    let d = declared(value)?;
+/// run is removed first. A url that needs a grant is checked for it again first.
+pub(crate) fn install(runner: &Runner, r: &ResolvedResource, cx: &ScriptCx) -> Result<(), Refusal> {
+    let d = declared(&r.value)?;
+    source_gate(cx, r, identity(&d.url)?)?;
     let dir = runner.home.join(&d.path);
     let (Some(parent), Some(name)) = (dir.parent(), dir.file_name().and_then(|n| n.to_str()))
     else {

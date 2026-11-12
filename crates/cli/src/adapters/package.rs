@@ -12,7 +12,7 @@ use super::checkout;
 use super::script::{self, ScriptCx};
 use dfm_engine::{End, ProcOutput, ProcRequest, Runner};
 use dfm_model::plan::{PackageState, Scope};
-use dfm_model::resolve::{Resolved, Value};
+use dfm_model::resolve::{Resolved, ResolvedResource, Value};
 use dfm_model::{Code, Refusal};
 use std::collections::BTreeMap;
 use std::os::unix::fs::PermissionsExt;
@@ -719,6 +719,59 @@ fn uv_receipt(home: &Path, name: &str) -> Result<(dfm_model::resolve::Table, Str
     Ok((v, shown))
 }
 
+/// Each package adapter and the pointer of the source it fetches from. That source needs no grant
+/// only when the bound checkout declared it ([`ScriptCx::owner_declared`], docs/sync.md,
+/// "Source identities"); otherwise its identity needs one. `None`: the adapter installs from its
+/// provider's registry, or its source always needs a grant (`script/v1`). A new package adapter
+/// must be listed here (`every_package_adapter_states_its_source_rule`).
+pub(crate) const SOURCE_ADAPTERS: &[(&str, Option<&str>)] = &[
+    (HOMEBREW, None),
+    (MISE, None),
+    (APT, None),
+    (UV_TOOL, Some("/source")),
+    (checkout::ADAPTER, Some("/url")),
+    (script::ADAPTER, None),
+];
+
+/// Whether the bound checkout declared the source of `r` (its [`SOURCE_ADAPTERS`] pointer).
+pub(crate) fn owner_source(cx: &ScriptCx, r: &ResolvedResource) -> bool {
+    SOURCE_ADAPTERS
+        .iter()
+        .find(|(a, _)| *a == r.adapter)
+        .and_then(|(_, p)| *p)
+        .is_some_and(|p| cx.owner_declared(r, p))
+}
+
+/// `identity` when the source of `r` still needs a grant: the bound checkout did not declare it
+/// and `identity` has none.
+pub(crate) fn ungranted(
+    cx: &ScriptCx,
+    r: &ResolvedResource,
+    identity: String,
+) -> Result<Option<String>, Refusal> {
+    Ok((!owner_source(cx, r) && !cx.trusts(&identity)?).then_some(identity))
+}
+
+/// The re-check under the writer lock before a source is fetched: `E_SOURCE_UNTRUSTED` with the
+/// `--trust-origin` command when [`ungranted`] holds.
+pub(crate) fn source_gate(
+    cx: &ScriptCx,
+    r: &ResolvedResource,
+    identity: String,
+) -> Result<(), Refusal> {
+    match ungranted(cx, r, identity)? {
+        None => Ok(()),
+        Some(id) => Err(Refusal::new(
+            Code::SourceUntrusted,
+            format!(
+                "the source {id} of {} has no grant; nothing was run. Fix: {}",
+                r.id,
+                dfm_model::lock::trust_command(&id)
+            ),
+        )),
+    }
+}
+
 /// A `uv-tool/v1` source other than the package index (docs/packages.md, "uv tools from a
 /// source").
 #[derive(Debug, PartialEq, Eq)]
@@ -767,6 +820,36 @@ pub(crate) fn uv_source(value: &Value, root: &Path) -> Result<Option<UvSource>, 
     } else {
         Err(outside())
     }
+}
+
+/// [`uv_source`] of `r`, which must have one. A path source must come from the bound checkout:
+/// one that a nested source declares or changes is `E_MANIFEST_INVALID`.
+fn checked_source(r: &ResolvedResource, cx: &ScriptCx) -> Result<UvSource, Refusal> {
+    let text = source_text(&r.value).unwrap_or_default();
+    let source = uv_source(&r.value, cx.root())?.ok_or_else(|| bad_source(text, "is missing"))?;
+    if matches!(source, UvSource::Path(_)) && !owner_source(cx, r) {
+        return Err(bad_source(
+            text,
+            "comes from a nested source; a path source must be declared in the bound checkout",
+        ));
+    }
+    Ok(source)
+}
+
+/// A git source's state, or `Ungranted` when its repository needs a grant it lacks.
+fn gated(
+    cx: &ScriptCx,
+    r: &ResolvedResource,
+    source: &UvSource,
+    state: PackageState,
+) -> Result<PackageState, Refusal> {
+    if let (PackageState::Missing(_) | PackageState::Rolling(_), UvSource::Git { url, .. }) =
+        (&state, source)
+        && let Some(id) = ungranted(cx, r, git_identity(url)?)?
+    {
+        return Ok(PackageState::Ungranted(id));
+    }
+    Ok(state)
 }
 
 /// `git+https://<repository>`, or `git+https://<repository>@<rev>` split at the last `@` (an
@@ -819,17 +902,19 @@ pub(crate) fn uv_sourced(adapter: &str, value: &Value) -> bool {
     adapter == UV_TOOL && source_text(value).is_some()
 }
 
-/// The installed state of a `uv-tool/v1` tool with a `source`. A declared source needs no
-/// grant: the owner wrote it in the owner's own checkout. Without `cx` a source that can be
-/// judged without the checkout is checked and the tool is `Missing`. uv's receipt decides: a
-/// requirement from the declared source ([`uv_receipt_names`]) is `Installed`, anything else
-/// (no receipt, another source, an unreadable receipt, which `--force` replaces) is `Missing`,
-/// with the owner check.
+/// The installed state of a `uv-tool/v1` tool with a `source`. A source the bound checkout
+/// declared needs no grant; a git source from a nested source that is to be installed needs a
+/// grant for its repository, else it is `Ungranted` ([`SOURCE_ADAPTERS`]). Without `cx` a
+/// source that can be judged without the checkout is checked and the tool is `Missing`. uv's
+/// receipt decides: a requirement from the declared source ([`uv_receipt_names`]) is
+/// `Installed`, anything else (no receipt, another source, an unreadable receipt, which
+/// `--force` replaces) is `Missing`, with the owner check.
 pub(crate) fn uv_source_probe(
     runner: &Runner,
-    value: &Value,
+    r: &ResolvedResource,
     cx: Option<&ScriptCx>,
 ) -> Result<PackageState, Refusal> {
+    let value = &r.value;
     let pkg = uv_source_name(value)?;
     policy(value)?;
     let text = source_text(value).unwrap_or_default();
@@ -839,7 +924,7 @@ pub(crate) fn uv_source_probe(
         }
         return Ok(PackageState::Missing(Vec::new()));
     };
-    let source = uv_source(value, cx.root())?.ok_or_else(|| bad_source(text, "is missing"))?;
+    let source = checked_source(r, cx)?;
     let state = if uv_receipt_names(&runner.home, &pkg, &source) {
         PackageState::Installed(match &source {
             UvSource::Git { rev: Some(rev), .. } => rev.clone(),
@@ -848,7 +933,7 @@ pub(crate) fn uv_source_probe(
     } else {
         PackageState::Missing(Vec::new())
     };
-    Ok(settled(runner, UV_TOOL, &pkg, state))
+    gated(cx, r, &source, settled(runner, UV_TOOL, &pkg, state))
 }
 
 /// Whether uv's receipt for `pkg` has the requirement of `pkg` itself (its `name` equal as uv
@@ -889,15 +974,17 @@ fn uv_receipt_names(home: &Path, pkg: &str, source: &UvSource) -> bool {
 }
 
 /// Installs a `uv-tool/v1` tool from its `source` with `uv tool install --force`, which replaces
-/// a copy from another source. The caller probes again afterwards.
+/// a copy from another source. A git source from a nested source is checked for its grant
+/// again first ([`source_gate`]). The caller probes again afterwards.
 pub(crate) fn uv_source_install(
     runner: &Runner,
-    value: &Value,
+    r: &ResolvedResource,
     cx: &ScriptCx,
 ) -> Result<(), Refusal> {
-    let pkg = uv_source_name(value)?;
-    let text = source_text(value).unwrap_or_default();
-    let source = uv_source(value, cx.root())?.ok_or_else(|| bad_source(text, "is missing"))?;
+    let pkg = uv_source_name(&r.value)?;
+    let text = source_text(&r.value).unwrap_or_default();
+    let source = checked_source(r, cx)?;
+    uv_source_gate(r, cx, &source)?;
     let arg = match &source {
         UvSource::Git {
             url,
@@ -923,6 +1010,20 @@ pub(crate) fn uv_source_install(
     })
 }
 
+/// [`source_gate`] for a git source; a path source is checked by [`checked_source`].
+fn uv_source_gate(r: &ResolvedResource, cx: &ScriptCx, source: &UvSource) -> Result<(), Refusal> {
+    match source {
+        UvSource::Git { url, .. } => source_gate(cx, r, git_identity(url)?),
+        UvSource::Path(_) => Ok(()),
+    }
+}
+
+/// The re-check under the writer lock before `uv tool upgrade` of a source tool resolves its
+/// source again.
+pub(crate) fn uv_source_upgrade_gate(r: &ResolvedResource, cx: &ScriptCx) -> Result<(), Refusal> {
+    uv_source_gate(r, cx, &checked_source(r, cx)?)
+}
+
 /// The declared name of a source tool: a package name that is also a package-index name, so
 /// the receipt path takes no `/`.
 fn uv_source_name(value: &Value) -> Result<String, Refusal> {
@@ -945,12 +1046,14 @@ fn uv_source_name(value: &Value) -> Result<String, Refusal> {
 /// it to the default branch's newest commit, with the owner check. A tool installed from
 /// anywhere else (the package index, another rev or repository) is `Missing`, with the owner
 /// check (`OtherOwner` blocks), so it is installed from its source and never upgraded from the
-/// index. Without `cx` (`doctor`) a path source is not resolved.
+/// index. A git source from a nested source that would be installed or rolled needs a grant,
+/// else it is `Ungranted`. Without `cx` (`doctor`) a path source is not resolved.
 pub(crate) fn maintain_sourced(
     runner: &Runner,
-    value: &Value,
+    r: &ResolvedResource,
     cx: Option<&ScriptCx>,
 ) -> Result<PackageState, Refusal> {
+    let value = &r.value;
     let pkg = uv_source_name(value)?;
     let text = source_text(value).unwrap_or_default();
     let Some(cx) = cx else {
@@ -959,7 +1062,7 @@ pub(crate) fn maintain_sourced(
         }
         return maintain(runner, UV_TOOL, value);
     };
-    let source = uv_source(value, cx.root())?.ok_or_else(|| bad_source(text, "is missing"))?;
+    let source = checked_source(r, cx)?;
     let state = match maintain(runner, UV_TOOL, value)? {
         // `maintain` holds some copies before its owner check, so a copy it now treats as
         // missing gets that check here, as the plain probe does.
@@ -984,7 +1087,7 @@ pub(crate) fn maintain_sourced(
         }
         state => state,
     };
-    Ok(state)
+    gated(cx, r, &source, state)
 }
 
 /// `dpkg-query -W -f=${Status} <name>`: `install ok installed` means installed. A missing
@@ -1525,14 +1628,14 @@ fn facts(
             return Err(stop);
         }
         let looked = if r.adapter == checkout::ADAPTER {
-            checkout::probe(runner, &r.value)
+            checkout::probe(runner, r, scripts)
         } else if r.adapter == script::ADAPTER {
             script::probe(runner, &r.id, &r.value, scripts, update)
         } else if uv_sourced(&r.adapter, &r.value) {
             if update {
-                maintain_sourced(runner, &r.value, scripts)
+                maintain_sourced(runner, r, scripts)
             } else {
-                uv_source_probe(runner, &r.value, scripts)
+                uv_source_probe(runner, r, scripts)
             }
         } else {
             look(runner, &r.adapter, &r.value)
@@ -1550,6 +1653,25 @@ fn facts(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A new package adapter must state its source rule, so it cannot skip the grant of a
+    /// source that a nested source declares (docs/sync.md, "Source identities").
+    #[test]
+    fn every_package_adapter_states_its_source_rule() {
+        let table = super::super::registry();
+        let packages: Vec<&str> = table
+            .iter()
+            .filter(|a| a.spec.kind == "package")
+            .map(|a| a.spec.id.as_str())
+            .collect();
+        for id in &packages {
+            assert!(
+                SOURCE_ADAPTERS.iter().any(|(a, _)| a == id),
+                "{id} is not in SOURCE_ADAPTERS"
+            );
+        }
+        assert_eq!(SOURCE_ADAPTERS.len(), packages.len());
+    }
 
     #[test]
     fn a_brewfile_keeps_a_third_party_tap_and_shortens_an_official_one() {

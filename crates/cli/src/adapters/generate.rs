@@ -12,7 +12,7 @@ use dfm_model::plan::{
     Action, Blocker, MAX_HASHED_BYTES, Node, Observations, Operation, Ownership, PackageState,
     Plan, ServiceState, Status, file_fingerprint, matches_pattern,
 };
-use dfm_model::resolve::{Entry, Resolved, SourceSet, Table, Value};
+use dfm_model::resolve::{Entry, Resolved, ResolvedResource, SourceSet, Table, Value};
 use dfm_model::state::Class;
 use dfm_model::{Code, Refusal};
 use std::collections::{BTreeMap, BTreeSet};
@@ -127,16 +127,16 @@ impl<'a> Generators<'a> {
     }
 
     fn value(&self, op: &Operation) -> Result<&'a Value, Refusal> {
-        self.resolved
-            .resources
-            .get(&op.resource)
-            .map(|r| &r.value)
-            .ok_or_else(|| {
-                Refusal::new(
-                    Code::GeneratorUnavailable,
-                    format!("{} is not in the resolved model", op.resource),
-                )
-            })
+        self.resource(op).map(|r| &r.value)
+    }
+
+    fn resource(&self, op: &Operation) -> Result<&'a ResolvedResource, Refusal> {
+        self.resolved.resources.get(&op.resource).ok_or_else(|| {
+            Refusal::new(
+                Code::GeneratorUnavailable,
+                format!("{} is not in the resolved model", op.resource),
+            )
+        })
     }
 }
 
@@ -272,17 +272,18 @@ impl Generator for Generators<'_> {
                     format!("no package provider for {}", op.adapter),
                 )
             })?;
-        let value = self.value(op)?;
+        let r = self.resource(op)?;
+        let value = &r.value;
         if op.adapter == checkout::ADAPTER {
-            checkout::probe(runner, value)
+            checkout::probe(runner, r, self.scripts.as_ref())
         } else if op.adapter == script::ADAPTER {
             let update = op.action == Action::Upgrade;
             script::probe(runner, &op.resource, value, self.scripts.as_ref(), update)
         } else if package::uv_sourced(&op.adapter, value) {
             if op.action == Action::Upgrade {
-                package::maintain_sourced(runner, value, self.scripts.as_ref())
+                package::maintain_sourced(runner, r, self.scripts.as_ref())
             } else {
-                package::uv_source_probe(runner, value, self.scripts.as_ref())
+                package::uv_source_probe(runner, r, self.scripts.as_ref())
             }
         } else if op.action == Action::Upgrade {
             package::maintain(runner, &op.adapter, value)
@@ -302,25 +303,28 @@ impl Generator for Generators<'_> {
                     format!("no package provider for {}", op.adapter),
                 )
             })?;
-        let value = self.value(op)?;
+        let r = self.resource(op)?;
+        let value = &r.value;
+        let cx = |what: &str| {
+            self.scripts.as_ref().ok_or_else(|| {
+                Refusal::new(
+                    Code::GeneratorUnavailable,
+                    format!("no {what} installer for {}", op.adapter),
+                )
+            })
+        };
         if op.adapter == checkout::ADAPTER {
-            checkout::install(runner, value)
+            checkout::install(runner, r, cx("checkout")?)
         } else if op.adapter == script::ADAPTER {
-            let cx = self.scripts.as_ref().ok_or_else(|| {
-                Refusal::new(
-                    Code::GeneratorUnavailable,
-                    format!("no script installer for {}", op.adapter),
-                )
-            })?;
-            script::install(runner, &op.resource, value, cx)
-        } else if op.action != Action::Upgrade && package::uv_sourced(&op.adapter, value) {
-            let cx = self.scripts.as_ref().ok_or_else(|| {
-                Refusal::new(
-                    Code::GeneratorUnavailable,
-                    format!("no source installer for {}", op.adapter),
-                )
-            })?;
-            package::uv_source_install(runner, value, cx)
+            script::install(runner, &op.resource, value, cx("script")?)
+        } else if package::uv_sourced(&op.adapter, value) {
+            let cx = cx("source")?;
+            if op.action == Action::Upgrade {
+                package::uv_source_upgrade_gate(r, cx)?;
+                package::upgrade(runner, &op.adapter, value)
+            } else {
+                package::uv_source_install(runner, r, cx)
+            }
         } else if op.action == Action::Upgrade {
             package::upgrade(runner, &op.adapter, value)
         } else {
