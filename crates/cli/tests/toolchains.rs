@@ -1103,6 +1103,57 @@ fn an_ungranted_git_source_is_held_under_the_update_when_installed_and_blocked_w
 }
 
 #[test]
+fn the_update_refuses_a_git_source_with_a_branch_ref() {
+    let fx = Fx::new();
+    fx.with_source("git+https://github.com/o/r@main");
+    fx.grant("https://github.com/o/r");
+    // Installed, so the update would otherwise decide from the listing alone.
+    fx.installed("uv", "nuv 0.5.2\ntoken-auditor 2026.11.11\n");
+    fx.uv_receipt(
+        "token-auditor",
+        "[tool]\nrequirements = [{ name = \"token-auditor\", git = \"https://github.com/o/r?rev=main\" }]\n",
+    );
+    let o = fx.preview(true);
+    let t = format!("{}{}", text(&o.stdout), stderr(&o));
+    assert_eq!(code(&o), 3, "{t}");
+    assert!(t.contains("E_MANIFEST_INVALID"), "{t}");
+    assert!(t.contains("does not end in a tag"), "{t}");
+    assert!(fx.changes().is_empty(), "{}", fx.log());
+}
+
+/// A tool installed from the package index although it declares a git source is not upgraded
+/// from the index: the update plans the source install, with its grant check.
+#[test]
+fn the_update_installs_a_source_tool_from_its_source_when_the_index_copy_is_installed() {
+    let fx = Fx::new();
+    fx.with_source(GIT);
+    fx.installed("uv", "nuv 0.5.2\ntoken-auditor 2026.11.11\n");
+    fx.uv_receipt(
+        "token-auditor",
+        "[tool]\nrequirements = [{ name = \"token-auditor\" }]\n",
+    );
+    let o = fx.preview(true);
+    let t = format!("{}{}", text(&o.stdout), stderr(&o));
+    assert_eq!(code(&o), 3, "{t}");
+    assert!(
+        t.contains("dfm sync --trust-origin 'https://github.com/o/r'"),
+        "{t}"
+    );
+    fx.grant("https://github.com/o/r");
+    let o = fx.apply(true);
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+    let changes = fx.changes();
+    assert!(
+        changes.contains(&format!("uv tool install --force {GIT}")),
+        "{changes:?}"
+    );
+    assert!(
+        !changes.iter().any(|c| c.contains("upgrade token-auditor")),
+        "{changes:?}"
+    );
+}
+
+#[test]
 fn a_source_that_builds_another_name_fails_with_the_reason() {
     let fx = Fx::new();
     fs::create_dir_all(fx.root.join("agent_reap")).unwrap();

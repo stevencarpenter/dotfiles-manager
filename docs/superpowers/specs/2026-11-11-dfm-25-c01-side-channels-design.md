@@ -107,6 +107,7 @@ The updaters run after the four scopes. The tools that the new package adapters 
 - `versions/token-auditor` is removed. The tag moves into the `uv-tool/v1` value.
 - The `skills@1.7.0` installer pin moves into the `skill-source/v1` value.
 - agent-reap is installed by the packages scope when its declared source differs from uv's record. The `uv` updater runs `uv tool upgrade agent-reap` on every sync, as for every tool. Whether that rebuilds a path tool whose code changed without a version bump depends on uv's cache and is unchecked. If it does not, the builder adds a content digest of the directory to the probe.
+- Known gap: a path source's own dependencies can name `git+` direct references, and the install fetches them without a grant.
 - Capability gates of the script (`host-capability.sh skills`, `mcp`, `agents`, and the `personal` identity) become module membership. A resource is in a module that the work profile does not list.
 - The `skill-source/v1` probe does not use the `skills` CLI's source record: that record has no gh-axi entry today, and an entry there would let the `skills` updater roll the skill past its pin. The probe passes when the installed skill directory exists and dfm's own record of the last install (state, keyed by resource) names the declared `source` and installer version.
 - The other callers of the script are rewired in the last dotfiles PR: the `sync-dfm-apply` recipe (`Justfile:92`), `scripts/update-inputs.sh:42`, `scripts/test-sync-capability-gating.sh` and the message at `bootstrap.sh:106`.

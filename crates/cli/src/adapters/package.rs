@@ -829,16 +829,31 @@ pub(crate) fn uv_source_probe(
         return Ok(PackageState::Missing(Vec::new()));
     };
     let source = uv_source(value, cx.root())?.ok_or_else(|| bad_source(text, "is missing"))?;
-    let (key, want, shown) = match &source {
-        UvSource::Git { url, rev } => {
+    let shown = match &source {
+        UvSource::Git { rev, .. } => {
             if let Some(id) = ungranted(runner, &source, cx)? {
                 return Ok(PackageState::Ungranted(id));
             }
-            ("git", format!("{url}?rev={rev}"), rev.clone())
+            rev.clone()
         }
-        UvSource::Path(dir) => ("directory", dir.display().to_string(), text.to_string()),
+        UvSource::Path(_) => text.to_string(),
     };
-    let installed = uv_receipt(&runner.home, &pkg).is_ok_and(|(v, _)| {
+    let state = if uv_receipt_names(&runner.home, &pkg, &source) {
+        PackageState::Installed(shown)
+    } else {
+        PackageState::Missing(Vec::new())
+    };
+    Ok(settled(runner, UV_TOOL, &pkg, state))
+}
+
+/// Whether uv's receipt for `pkg` has a requirement from `source`: a `git` of
+/// `<url>?rev=<rev>`, or a `directory` of the canonical path. An unreadable receipt does not.
+fn uv_receipt_names(home: &Path, pkg: &str, source: &UvSource) -> bool {
+    let (key, want) = match source {
+        UvSource::Git { url, rev } => ("git", format!("{url}?rev={rev}")),
+        UvSource::Path(dir) => ("directory", dir.display().to_string()),
+    };
+    uv_receipt(home, pkg).is_ok_and(|(v, _)| {
         v.get("tool")
             .and_then(|t| t.get("requirements"))
             .and_then(Value::as_array)
@@ -846,13 +861,7 @@ pub(crate) fn uv_source_probe(
                 reqs.iter()
                     .any(|r| r.get(key).and_then(Value::as_str) == Some(want.as_str()))
             })
-    });
-    let state = if installed {
-        PackageState::Installed(shown)
-    } else {
-        PackageState::Missing(Vec::new())
-    };
-    Ok(settled(runner, UV_TOOL, &pkg, state))
+    })
 }
 
 /// Installs a `uv-tool/v1` tool from its `source` with `uv tool install --force`, which replaces
@@ -916,34 +925,53 @@ fn uv_source_name(value: &Value) -> Result<String, Refusal> {
 
 /// The first identity of a git source that has no grant, or `None` (a granted git source, a
 /// path). uv clones with git, so both the declared url and the url git fetches from after
-/// `url.*.insteadOf` need a grant. `Err` is a url git cannot resolve or one that maps to no
-/// identity.
+/// `url.*.insteadOf` need a grant. The declared url is checked first, so an ungranted one
+/// never reaches git. `Err` is a url git cannot resolve or one that maps to no identity.
 fn ungranted(runner: &Runner, source: &UvSource, cx: &ScriptCx) -> Result<Option<String>, Refusal> {
     let UvSource::Git { url, .. } = source else {
         return Ok(None);
     };
+    let grants = cx.grants()?;
     let declared = git_identity(url)?;
+    if !grants.trusts(&declared) {
+        return Ok(Some(declared));
+    }
     let fetched = super::updater::fetch_url(runner, url, PROBE_TIMEOUT)
         .map_err(|why| Refusal::new(Code::SourceUntrusted, why))?;
     let fetched = dfm_model::lock::git_identity(&fetched, cfg!(feature = "test-isolation"))?;
-    let grants = cx.grants()?;
-    Ok([declared, fetched]
-        .into_iter()
-        .find(|id| !grants.trusts(id)))
+    Ok((!grants.trusts(&fetched)).then_some(fetched))
 }
 
-/// `packages --update` for a source tool: what [`maintain`] decides, which holds an installed
-/// source tool with or without a grant (it fetches nothing). A missing one, which the install
-/// would fetch, is `Ungranted` when its git source has no grant.
+/// `packages --update` for a source tool. The name and the source are checked first, as the
+/// plan without `--update` checks them. Then [`maintain`] decides, and it holds a tool that
+/// uv's receipt shows from the declared source, with or without a grant (it fetches nothing).
+/// A tool installed from anywhere else (the package index, another rev) is `Missing`, so it is
+/// installed from its source and never upgraded from the index. A missing one, which the
+/// install would fetch, is `Ungranted` when its git source has no grant. Without `cx`
+/// (`doctor`) a path source is not resolved.
 fn maintain_sourced(
     runner: &Runner,
     value: &Value,
     cx: Option<&ScriptCx>,
 ) -> Result<PackageState, Refusal> {
-    let state = maintain(runner, UV_TOOL, value)?;
+    let pkg = uv_source_name(value)?;
+    let text = source_text(value).unwrap_or_default();
+    let Some(cx) = cx else {
+        if !text.starts_with("path:") {
+            git_source(text)?;
+        }
+        return maintain(runner, UV_TOOL, value);
+    };
+    let source = uv_source(value, cx.root())?.ok_or_else(|| bad_source(text, "is missing"))?;
+    let state = match maintain(runner, UV_TOOL, value)? {
+        PackageState::Installed(_) | PackageState::Held(_) | PackageState::Rolling(_)
+            if !uv_receipt_names(&runner.home, &pkg, &source) =>
+        {
+            PackageState::Missing(Vec::new())
+        }
+        state => state,
+    };
     if matches!(state, PackageState::Missing(_))
-        && let Some(cx) = cx
-        && let Some(source) = uv_source(value, cx.root())?
         && let Some(id) = ungranted(runner, &source, cx)?
     {
         return Ok(PackageState::Ungranted(id));
@@ -1853,14 +1881,27 @@ mod tests {
         assert_eq!(uv_source(&Value::Table(t), root), Ok(None));
     }
 
+    /// A new directory for one test, as the other test modules of this crate make it.
+    fn scratch(label: &str) -> PathBuf {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static N: AtomicU32 = AtomicU32::new(0);
+        let p = std::env::temp_dir().canonicalize().unwrap().join(format!(
+            "dfm-package-{label}-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&p).unwrap();
+        p
+    }
+
     #[test]
     fn a_path_source_is_a_directory_inside_the_checkout() {
-        let tmp = std::env::temp_dir().join(format!("dfm-uv-path-{}", std::process::id()));
+        let tmp = scratch("uv-path");
         let root = tmp.join("root");
         std::fs::create_dir_all(root.join("agent_reap")).unwrap();
         std::fs::create_dir_all(tmp.join("x")).unwrap();
         std::fs::write(root.join("file"), "").unwrap();
-        let _ = std::os::unix::fs::symlink("/tmp", root.join("link"));
+        std::os::unix::fs::symlink("/tmp", root.join("link")).unwrap();
         let v = |s: &str| {
             let mut t = dfm_model::resolve::Table::new();
             t.insert("source".into(), Value::String(s.into()));

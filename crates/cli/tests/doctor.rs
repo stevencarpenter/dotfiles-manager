@@ -1386,3 +1386,35 @@ fn no_upgrade_receipt_means_no_upgrade_row() {
     let (_, rows) = fx.rows();
     assert!(!rows.iter().any(|r| r["kind"] == "upgrade"), "{rows:#?}");
 }
+
+/// DFM-25 C01: a uv tool from a git source without a grant names the git source and the
+/// `--trust-origin` command, not an install script.
+#[test]
+fn an_ungranted_uv_git_source_is_named_as_a_git_source() {
+    let fx = Fx::new();
+    fx.put(
+        "base/modules/extra/module.toml",
+        &format!(
+            "{}\n[[resources]]\nid = \"src\"\nkind = \"package\"\nadapter = \"uv-tool/v1\"\n[resources.value]\nname = \"token-auditor\"\nupdate_policy = \"rolling\"\nsource = \"git+https://github.com/o/r@2026.11.11\"\n",
+            common::EXTRA
+        ),
+    );
+    // Doctor probes packages only when the provider working directory exists with mode 0700.
+    let run = fx.h(".cache/dotfiles-manager/run");
+    fs::create_dir_all(&run).unwrap();
+    fs::set_permissions(&run, fs::Permissions::from_mode(0o700)).unwrap();
+    let (_, rows) = fx.rows();
+    let r = at(&rows, "extra.src");
+    assert_eq!(r["code"], "E_SOURCE_UNTRUSTED", "{r:#}");
+    assert!(
+        r["detail"].as_str().unwrap().starts_with(
+            "token-auditor is not installed and its git source has no grant (https://github.com/o/r)"
+        ),
+        "{r:#}"
+    );
+    assert_eq!(
+        r["fix"],
+        "Review that repository, then run dfm sync --trust-origin 'https://github.com/o/r'.",
+        "{r:#}"
+    );
+}

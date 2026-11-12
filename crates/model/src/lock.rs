@@ -743,8 +743,11 @@ ref = "refs/heads/main"
         ] {
             assert!(check_identity(bad, false).is_err(), "{bad}");
         }
-        let long = format!("go:example.com/{}", "a".repeat(250));
-        assert!(check_identity(&long, false).is_err());
+        // The cap is on the module path, after `go:`: 256 bytes pass, 257 do not.
+        let module = |len: usize| format!("go:example.com/{}", "a".repeat(len - 12));
+        assert_eq!(module(256).len(), 3 + 256);
+        assert!(check_identity(&module(256), false).is_ok());
+        assert!(check_identity(&module(257), false).is_err());
         assert!(git_identity("go:golang.org/x/tools", false).is_err());
         let mut g = Grants::default();
         g.grant("go:golang.org/x/tools/gopls", "2026-11-11T00:00:00Z");

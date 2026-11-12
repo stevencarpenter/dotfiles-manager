@@ -1318,12 +1318,11 @@ fn untrusted(ids: Vec<Result<String, String>>, grants: &Grants) -> Vec<String> {
 
 /// Why the updater must not run because of its sources, one note each, or nothing. `skills`
 /// and the `agents` managed copy fetch extension sources, each global npm package runs its
-/// install scripts, and a uv tool from a git source is built from what it fetches, and a mise backend tool
-/// fetches from its backend: each such
-/// source needs a grant (DFM-25, C04). The `agents` working copy is never fetched, and the
-/// other updaters update a binary or packages from their owner: none of them is gated. An
-/// unreadable source record is one note. An updater with a note runs no command that fetches
-/// or installs.
+/// install scripts, a uv tool from a git source is built from what it fetches, and a mise
+/// backend tool fetches from its backend: each such source needs a grant (DFM-25, C04). The
+/// `agents` working copy is never fetched, and the other updaters update a binary or packages
+/// from their owner: none of them is gated. An unreadable source record is one note. An
+/// updater with a note runs no command that fetches or installs.
 pub fn trust_notes(u: Updater, env: &Env) -> Vec<String> {
     match u {
         Updater::Skills => match skills_sources(env) {
