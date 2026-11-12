@@ -142,7 +142,7 @@ esac
 /// `brew --cellar` and `brew --caskroom` print the fixture's `Cellar` and `Caskroom`; nothing
 /// else is answered. A homebrew/v1 package under `--update` is probed and then held.
 /// The system git, for `ls-remote --get-url` only.
-const FAKE_GIT: &str = "#!/bin/sh\nPATH=/usr/bin:/bin\n[ \"$1 $2\" = 'ls-remote --get-url' ] || exit 64\nexec git \"$@\"\n";
+const FAKE_GIT: &str = "#!/bin/sh\nPATH=/usr/bin:/bin\nprintf 'git %s\\n' \"$*\" >> \"$(dirname \"$0\")/../log\"\n[ \"$1 $2\" = 'ls-remote --get-url' ] || exit 64\nexec git \"$@\"\n";
 
 const FAKE_BREW: &str = r#"#!/bin/sh
 PATH=/usr/bin:/bin:$PATH
@@ -980,6 +980,29 @@ fn a_git_source_that_git_rewrites_needs_a_grant_for_the_rewritten_url() {
     let o = fx.apply(false);
     assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
     assert_eq!(fx.changes(), [format!("uv tool install --force {GIT}")]);
+}
+
+/// A tool that uv's receipt shows from its declared git source needs no fetch, so a removed
+/// grant does not block it: the receipt is read before the grant, and nothing runs.
+#[test]
+fn an_installed_git_source_tool_without_a_grant_is_current() {
+    let fx = Fx::new();
+    fx.with_source(GIT);
+    fx.uv_receipt(
+        "token-auditor",
+        "[tool]\nrequirements = [{ name = \"token-auditor\", git = \"https://github.com/o/r?rev=2026.11.11\" }]\n",
+    );
+    let o = fx.apply(false);
+    let t = text(&o.stdout);
+    assert_eq!(code(&o), 0, "{}\n{t}", stderr(&o));
+    assert!(t.contains(&format!("current {SRC}")), "{t}");
+    // The only uv call is the index tool's listing (nuv); git never runs.
+    let log = fx.log();
+    let other = |l: &str| {
+        l.starts_with("git ") || (l.starts_with("uv ") && !l.starts_with("uv tool list "))
+    };
+    assert!(!log.lines().any(other), "{log}");
+    assert!(fx.changes().is_empty(), "{log}");
 }
 
 #[test]

@@ -808,12 +808,12 @@ pub(crate) fn uv_sourced(adapter: &str, value: &Value) -> bool {
     adapter == UV_TOOL && source_text(value).is_some()
 }
 
-/// The installed state of a `uv-tool/v1` tool with a `source`. Without `cx` (`doctor`) a source
-/// that can be judged without the checkout is checked and the tool is `Missing`. A git source
-/// without a grant is `Ungranted`. uv's receipt decides the rest: a requirement from the
-/// declared `<url>?rev=<rev>` or the canonical directory is `Installed`, anything else (no
-/// receipt, another source, an unreadable receipt, which `--force` replaces) is `Missing`, with
-/// the owner check.
+/// The installed state of a `uv-tool/v1` tool with a `source`. Without `cx` a source that can
+/// be judged without the checkout is checked and the tool is `Missing`. uv's receipt decides
+/// first: a requirement from the declared `<url>?rev=<rev>` or the canonical directory is
+/// `Installed`, with no grant read, because nothing is fetched. Anything else (no receipt,
+/// another source, an unreadable receipt, which `--force` replaces) must be installed: a git
+/// source without a grant is then `Ungranted`, else `Missing`, with the owner check.
 pub(crate) fn uv_source_probe(
     runner: &Runner,
     value: &Value,
@@ -829,17 +829,15 @@ pub(crate) fn uv_source_probe(
         return Ok(PackageState::Missing(Vec::new()));
     };
     let source = uv_source(value, cx.root())?.ok_or_else(|| bad_source(text, "is missing"))?;
-    let shown = match &source {
-        UvSource::Git { rev, .. } => {
-            if let Some(id) = ungranted(runner, &source, cx)? {
-                return Ok(PackageState::Ungranted(id));
-            }
-            rev.clone()
-        }
-        UvSource::Path(_) => text.to_string(),
-    };
+    // A tool already installed from its source needs no fetch, so only an install reads the
+    // grant (and runs git for the insteadOf check).
     let state = if uv_receipt_names(&runner.home, &pkg, &source) {
-        PackageState::Installed(shown)
+        PackageState::Installed(match &source {
+            UvSource::Git { rev, .. } => rev.clone(),
+            UvSource::Path(_) => text.to_string(),
+        })
+    } else if let Some(id) = ungranted(runner, &source, cx)? {
+        return Ok(PackageState::Ungranted(id));
     } else {
         PackageState::Missing(Vec::new())
     };
