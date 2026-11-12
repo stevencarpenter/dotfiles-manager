@@ -14,7 +14,7 @@ use crate::{Ctx, state_cmd};
 use dfm_engine::{Layout, Runner, Store, Sys};
 use dfm_model::digest::sha256_hex;
 use dfm_model::display::visible;
-use dfm_model::lock::{SCRIPT, script_url, trust_command};
+use dfm_model::lock::{Grants, SCRIPT, script_url, trust_command};
 use dfm_model::plan::PackageState;
 use dfm_model::resolve::Value;
 use dfm_model::state::{SHELLS, valid_path};
@@ -181,6 +181,16 @@ impl ScriptCx {
     fn store(&self) -> Result<Store, Refusal> {
         Store::open_read(self.sys, &self.layout, state_cmd::fail_from_env()?)?
             .ok_or_else(crate::state_lost_refusal)
+    }
+
+    /// The owner's grants, read without the lock as [`ScriptCx::store`] does.
+    pub(crate) fn grants(&self) -> Result<Grants, Refusal> {
+        self.store()?.read_grants()
+    }
+
+    /// The bound checkout of this run.
+    pub(crate) fn root(&self) -> &Path {
+        &self.root
     }
 
     fn staged(

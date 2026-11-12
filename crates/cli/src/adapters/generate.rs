@@ -280,6 +280,9 @@ impl Generator for Generators<'_> {
                 self.scripts.as_ref(),
                 update,
             )
+        } else if op.action != Action::Upgrade && package::uv_sourced(&op.adapter, self.value(op)?)
+        {
+            package::uv_source_probe(runner, self.value(op)?, self.scripts.as_ref())
         } else if op.action == Action::Upgrade {
             package::maintain(runner, &op.adapter, self.value(op)?)
         } else {
@@ -306,6 +309,15 @@ impl Generator for Generators<'_> {
                 )
             })?;
             script::install(runner, &op.resource, self.value(op)?, cx)
+        } else if op.action != Action::Upgrade && package::uv_sourced(&op.adapter, self.value(op)?)
+        {
+            let cx = self.scripts.as_ref().ok_or_else(|| {
+                Refusal::new(
+                    Code::GeneratorUnavailable,
+                    format!("no source installer for {}", op.adapter),
+                )
+            })?;
+            package::uv_source_install(runner, self.value(op)?, cx)
         } else if op.action == Action::Upgrade {
             package::upgrade(runner, &op.adapter, self.value(op)?)
         } else {

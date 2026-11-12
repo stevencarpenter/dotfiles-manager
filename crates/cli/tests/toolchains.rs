@@ -98,9 +98,11 @@ esac
 
 /// `uv tool list` prints `<name> v<version>` and `- <name>` per line of `installed-uv`, or
 /// `No tools installed`. `uv tool upgrade <name>` replaces the version with the one
-/// `latest-uv` names (`2.0.0` when there is none); `uv tool install <name>` adds `1.0.0`. The
-/// `nopython` marker makes a change fail as uv does when no interpreter is found and downloads
-/// are off.
+/// `latest-uv` names (`2.0.0` when there is none); `uv tool install <name>` adds `1.0.0`.
+/// `uv tool install --force <source>` writes the receipt uv would for the tool the `uv-builds`
+/// marker names: a `git` requirement `<url>?rev=<rev>` for `git+<url>@<rev>`, else a
+/// `directory` one. The `nopython` marker makes a change fail as uv does when no interpreter
+/// is found and downloads are off.
 const FAKE_UV: &str = r#"#!/bin/sh
 PATH=/usr/bin:/bin:$PATH
 here=$(dirname "$0")
@@ -117,6 +119,15 @@ case "$2" in
     exit 0 ;;
   install|upgrade)
     [ -e "$here/../nopython" ] && { echo "error: No interpreter found" >&2; exit 2; }
+    if [ "$3" = --force ]; then
+      dir="$HOME/.local/share/uv/tools/$(cat "$here/../uv-builds")"; mkdir -p "$dir"
+      case "$4" in
+        git+*) s=${4#git+}; req="git = \"${s%@*}?rev=${s##*@}\"" ;;
+        *) req="directory = \"$4\"" ;;
+      esac
+      printf '[tool]\nrequirements = [{ name = "x", %s }]\n' "$req" > "$dir/uv-receipt.toml"
+      exit 0
+    fi
     name=$3
     new=$(grep "^$name " "$here/../latest-uv" 2>/dev/null | head -1 | cut -d' ' -f2)
     [ -z "$new" ] && new=2.0.0
@@ -300,6 +311,28 @@ impl Fx {
         let dir = self.home.path().join(".local/share/uv/tools").join(name);
         fs::create_dir_all(&dir).unwrap();
         fs::write(dir.join("uv-receipt.toml"), body).unwrap();
+    }
+
+    /// The extra module with one more uv tool `src`, built by the fake uv from `source`.
+    fn with_source(&self, source: &str) {
+        self.marker("uv-builds", "token-auditor");
+        self.put(
+            "base/modules/extra/module.toml",
+            &format!(
+                "{EXTRA}\n[[resources]]\nid = \"src\"\nkind = \"package\"\nadapter = \"uv-tool/v1\"\n[resources.value]\nname = \"token-auditor\"\nupdate_policy = \"rolling\"\nsource = \"{source}\"\n"
+            ),
+        );
+    }
+
+    /// Writes `state/grants.json` with one origin grant, as `sync --trust-origin` would.
+    fn grant(&self, origin: &str) {
+        let p = self.state().join("grants.json");
+        let body = serde_json::json!({
+            "schema": 2,
+            "origins": [{ "origin": origin, "grant_id": "grant-0", "granted_at": "2026-11-11T00:00:00Z" }],
+        });
+        fs::write(&p, body.to_string()).unwrap();
+        fs::set_permissions(&p, fs::Permissions::from_mode(0o600)).unwrap();
     }
 
     /// An executable of `name` another owner put in `~/.local/bin`.
@@ -852,4 +885,130 @@ fn a_read_only_plan_and_doctor_start_no_provider() {
         "a provider was started: {}",
         fx.log()
     );
+}
+
+const SRC: &str = "extra.src@package";
+const GIT: &str = "git+https://github.com/o/r@2026.11.11";
+
+#[test]
+fn a_git_source_without_a_grant_blocks_and_with_one_installs() {
+    let fx = Fx::new();
+    fx.with_source(GIT);
+    let o = fx.preview(false);
+    let t = format!("{}{}", text(&o.stdout), stderr(&o));
+    assert_eq!(code(&o), 3, "{t}");
+    assert!(t.contains("E_SOURCE_UNTRUSTED"), "{t}");
+    assert!(
+        t.contains("dfm sync --trust-origin 'https://github.com/o/r'"),
+        "{t}"
+    );
+    assert!(fx.changes().is_empty(), "{}", fx.log());
+    fx.grant("https://github.com/o/r");
+    let o = fx.apply(false);
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+    assert!(
+        text(&o.stdout).contains(&format!("updated {SRC}")),
+        "{}",
+        text(&o.stdout)
+    );
+    assert_eq!(fx.changes(), [format!("uv tool install --force {GIT}")]);
+    // Installed at the declared tag: the next run is current and changes nothing.
+    let o = fx.apply(false);
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+    assert!(
+        text(&o.stdout).contains(&format!("current {SRC}")),
+        "{}",
+        text(&o.stdout)
+    );
+    assert_eq!(fx.changes().len(), 1, "{}", fx.log());
+}
+
+#[test]
+fn a_git_source_with_a_branch_ref_is_refused() {
+    let fx = Fx::new();
+    fx.with_source("git+https://github.com/o/r@main");
+    fx.grant("https://github.com/o/r");
+    let o = fx.preview(false);
+    let t = format!("{}{}", text(&o.stdout), stderr(&o));
+    assert_eq!(code(&o), 3, "{t}");
+    assert!(t.contains("E_MANIFEST_INVALID"), "{t}");
+    assert!(t.contains("does not end in a tag"), "{t}");
+    assert!(fx.changes().is_empty(), "{}", fx.log());
+}
+
+#[test]
+fn a_git_source_at_another_rev_is_missing() {
+    let fx = Fx::new();
+    fx.with_source(GIT);
+    fx.grant("https://github.com/o/r");
+    let receipt = |rev: &str| {
+        format!(
+            "[tool]\nrequirements = [{{ name = \"token-auditor\", git = \"https://github.com/o/r?rev={rev}\" }}]\n"
+        )
+    };
+    fx.uv_receipt("token-auditor", &receipt("2026.11.10"));
+    let o = fx.preview(false);
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+    assert!(
+        text(&o.stdout).contains("install token-auditor with uv-tool/v1"),
+        "{}",
+        text(&o.stdout)
+    );
+    fx.uv_receipt("token-auditor", &receipt("2026.11.11"));
+    let o = fx.apply(false);
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+    assert!(
+        text(&o.stdout).contains(&format!("current {SRC}")),
+        "{}",
+        text(&o.stdout)
+    );
+    assert!(fx.changes().is_empty(), "{}", fx.log());
+}
+
+#[test]
+fn a_path_source_installs_from_the_checkout() {
+    let fx = Fx::new();
+    fs::create_dir_all(fx.root.join("agent_reap")).unwrap();
+    fx.with_source("path:agent_reap");
+    // A grants file that cannot be read: a path source never reads it.
+    fs::write(fx.state().join("grants.json"), "not json").unwrap();
+    let dir = fx.root.canonicalize().unwrap().join("agent_reap");
+    let o = fx.apply(false);
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+    assert!(
+        text(&o.stdout).contains(&format!("updated {SRC}")),
+        "{}",
+        text(&o.stdout)
+    );
+    assert_eq!(
+        fx.changes(),
+        [format!("uv tool install --force {}", dir.display())]
+    );
+    let o = fx.apply(false);
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+    assert!(
+        text(&o.stdout).contains(&format!("current {SRC}")),
+        "{}",
+        text(&o.stdout)
+    );
+    assert_eq!(fx.changes().len(), 1, "{}", fx.log());
+}
+
+#[test]
+fn a_path_source_outside_the_checkout_is_refused() {
+    let fx = Fx::new();
+    fs::create_dir_all(fx.root.join("../x")).unwrap();
+    std::os::unix::fs::symlink("/tmp", fx.root.join("link")).unwrap();
+    for source in ["path:../x", "path:link"] {
+        fx.with_source(source);
+        let o = fx.preview(false);
+        let t = format!("{}{}", text(&o.stdout), stderr(&o));
+        assert_eq!(code(&o), 3, "{source}: {t}");
+        assert!(t.contains("E_MANIFEST_INVALID"), "{source}: {t}");
+        assert!(
+            t.contains("is not a directory inside the checkout"),
+            "{source}: {t}"
+        );
+    }
+    assert!(fx.changes().is_empty(), "{}", fx.log());
 }

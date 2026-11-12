@@ -11,7 +11,7 @@
 | Tests with `mise`, `uv` and `brew` look-alikes | `crates/cli/tests/toolchains.rs`; trial tools in `crates/cli/tests/trial.rs` |
 | Trial tools under `--update` (`probe_with_trials`) | `crates/cli/src/apply_cmd.rs` |
 
-Two provider paths are built: mise (runtimes and tools from mise's registry and backends, by the name mise takes) and uv tools by package-index name. A uv tool from a Git origin or a local path is not built. It needs origin trust ([docs/sync.md](sync.md)) and a source identity the manager can record. Declared, it is `E_MANIFEST_INVALID`. Installed that way by hand, it is held under `--update`.
+Two provider paths are built: mise (runtimes and tools from mise's registry and backends, by the name mise takes) and uv tools by package-index name. A uv tool declared with `source` (a granted git tag or a checkout path, docs/packages.md) is installed by `packages` and `sync`, and is held under `--update`, as is a tool installed from a source by hand. The `uv` updater of `dfm sync` still needs a grant for a git source (docs/upgrade.md, "Source trust").
 
 ## The command
 

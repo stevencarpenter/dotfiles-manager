@@ -396,8 +396,20 @@ pub fn registry() -> Vec<Adapter> {
             spec: package("apt/v1"),
             generator: None,
         },
+        // A package-index tool, or one from a granted git tag or a checkout path (`source`).
         Adapter {
-            spec: package("uv-tool/v1"),
+            spec: spec(
+                "uv-tool/v1",
+                "package",
+                TargetRule::Forbidden,
+                Claims::None,
+                Schema::Table(vec![
+                    field("name", Schema::Str, true),
+                    field("update_policy", Schema::Str, true),
+                    field("downgrade", Schema::Str, false),
+                    field("source", Schema::Str, false),
+                ]),
+            ),
             generator: None,
         },
         // A tool installed by its own script, adopted from a script trial (docs/packages.md,
