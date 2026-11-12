@@ -1838,6 +1838,84 @@ mod tests {
         }
     }
 
+    /// Under the writer lock, `mise_gate` refuses a backend name from a nested source that maps
+    /// to no single identity before anything is installed, and a backend name needs the
+    /// context at all.
+    #[test]
+    fn mise_gate_refuses_a_nested_backend_name_under_the_lock() {
+        use crate::Ctx;
+        use dfm_engine::Sys;
+        use dfm_model::resolve::Provenance;
+        use dfm_platform_macos::Platform;
+        let home = std::env::temp_dir().join(format!("dfm-mise-gate-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        let root = home.join("root");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            root.join("dotfiles-manager.lock"),
+            format!(
+                "[[sources]]\nid = \"r\"\nkind = \"git\"\norigin = \"https://github.com/o/d\"\nref = \"refs/heads/main\"\n\n[[sources]]\nid = \"e\"\nkind = \"git\"\norigin = \"https://github.com/o/e\"\nref = \"refs/heads/main\"\ncommit = \"{}\"\npath = \"base/ext\"\n",
+                "a".repeat(40)
+            ),
+        )
+        .unwrap();
+        let ctx = Ctx {
+            platform: Platform::with_home(home.clone()),
+            binding_path: home.join("binding.toml"),
+            os: "macos".into(),
+            arch: "aarch64".into(),
+            isolated: None,
+            color: false,
+        };
+        let sys = Sys {
+            uid: dfm_platform_macos::current_uid().unwrap(),
+        };
+        let cx = ScriptCx::for_install(&ctx, &sys, &root);
+        let file = "base/ext/modules/w/module.toml";
+        let resource = |name: &str| ResolvedResource {
+            id: "w.t".into(),
+            module: "w".into(),
+            declared_in: file.into(),
+            kind: "package".into(),
+            adapter: MISE.into(),
+            target: None,
+            value: Value::Table(
+                toml::from_str(&format!("name = {name:?}\nupdate_policy = \"rolling\"\n")).unwrap(),
+            ),
+            defaults: Vec::new(),
+            extensions: Vec::new(),
+            secret_values: false,
+            sensitive: false,
+            native_document: false,
+            provenance: BTreeMap::from([(
+                "/name".to_string(),
+                Provenance {
+                    owner: "w".into(),
+                    original: None,
+                    change: None,
+                    changer: None,
+                    reason: None,
+                    source_file: file.into(),
+                    source_path: None,
+                    content_id: None,
+                },
+            )]),
+            claims: Vec::new(),
+            dir_claims: Vec::new(),
+            precedence: None,
+        };
+        let refused: Vec<Code> = ["aqua:o/r", "npm:x@npm:y", "github:npm:x"]
+            .into_iter()
+            .map(|n| mise_gate(Some(&cx), &resource(n)).unwrap_err().code)
+            .collect();
+        let without_cx = mise_gate(None, &resource("github:o/r")).unwrap_err().code;
+        let registry = mise_gate(Some(&cx), &resource("duckdb")).unwrap();
+        let _ = std::fs::remove_dir_all(&home);
+        assert_eq!(refused, [Code::SourceUntrusted; 3]);
+        assert_eq!(without_cx, Code::GeneratorUnavailable);
+        assert!(registry.is_empty());
+    }
+
     /// A new package adapter must state its source rule, so it cannot skip the grant of a
     /// source that a nested source declares (docs/sync.md, "Source identities").
     #[test]

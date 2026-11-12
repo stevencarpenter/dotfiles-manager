@@ -112,7 +112,8 @@ esac
 const FAKE_MISE: &str = r#"#!/bin/sh
 PATH=/usr/bin:/bin:$PATH
 here=$(dirname "$0")
-printf 'mise %s | yes=%s auto=%s noconfig=%s registry=%s\n' "$*" "${MISE_YES:-unset}" "${MISE_NOT_FOUND_AUTO_INSTALL:-unset}" "${MISE_NO_CONFIG:-unset}" "${npm_config_registry:-unset}" >> "$here/../log"
+scoped=$(env | sed -n 's/^npm_config_@s:registry=//p')
+printf 'mise %s | yes=%s auto=%s noconfig=%s scoped=%s registry=%s\n' "$*" "${MISE_YES:-unset}" "${MISE_NOT_FOUND_AUTO_INSTALL:-unset}" "${MISE_NO_CONFIG:-unset}" "${scoped:-unset}" "${npm_config_registry:-unset}" >> "$here/../log"
 db="$here/../installed-mise"
 case "$1" in
   ls)
@@ -1249,6 +1250,13 @@ fn a_nested_npm_mise_tool_installs_from_the_default_registry_with_a_grant() {
             "{}",
             installs[0]
         );
+        // A scoped name also pins its scope's registry.
+        let scoped = if name.starts_with("npm:@s/") {
+            "scoped=https://registry.npmjs.org/ "
+        } else {
+            "scoped=unset "
+        };
+        assert!(installs[0].contains(scoped), "{}", installs[0]);
     }
 }
 
