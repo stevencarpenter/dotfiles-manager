@@ -2263,6 +2263,17 @@ fn declared_checkouts(
         .collect()
 }
 
+/// `p` through links: the nearest ancestor that exists, canonicalized, joined with the
+/// components below it that do not exist yet. A link above a path not yet cloned still counts.
+fn real_path(p: &Path) -> PathBuf {
+    p.ancestors()
+        .find_map(|a| {
+            let rest = p.strip_prefix(a).ok()?;
+            fs::canonicalize(a).ok().map(|c| c.join(rest))
+        })
+        .unwrap_or_else(|| p.to_path_buf())
+}
+
 /// One declared checkout at HOME joined with its path, or the note `<id>: <reason>`.
 fn declared_checkout(
     home: &Path,
@@ -2273,8 +2284,10 @@ fn declared_checkout(
 ) -> Result<updater::Checkout, String> {
     let d = checkout::declared(value).map_err(|e| format!("{id}: {}", e.detail))?;
     let path = home.join(d.path);
-    let real = |p: &Path| fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
-    if sources.iter().any(|s| real(&path).starts_with(real(s))) {
+    if sources
+        .iter()
+        .any(|s| real_path(&path).starts_with(real_path(s)))
+    {
         return Err(format!(
             "{id}: {} is a dotfiles source checkout; sync updates it",
             path.display()
@@ -2683,6 +2696,26 @@ mod tests {
         }
         assert!(at("dotsy").is_ok());
         assert!(at("ext").is_ok());
+    }
+
+    /// A path that does not exist yet, under a link into a source checkout, still overlaps it.
+    #[test]
+    fn a_missing_checkout_under_a_link_into_a_source_checkout_is_a_note() {
+        let home = std::env::temp_dir().join(format!("dfm-sync-link-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&home);
+        fs::create_dir_all(home.join("dots")).unwrap();
+        std::os::unix::fs::symlink(home.join("dots"), home.join("alias")).unwrap();
+        let v = dfm_model::resolve::Value::Table(
+            toml::from_str("url = \"https://github.com/o/r.git\"\npath = \"alias/new/r\"\n")
+                .unwrap(),
+        );
+        let got = declared_checkout(&home, "extra.r", &v, &[home.join("dots")], true);
+        let _ = fs::remove_dir_all(&home);
+        assert!(
+            got.as_ref()
+                .is_err_and(|e| e.ends_with("is a dotfiles source checkout; sync updates it")),
+            "{got:?}"
+        );
     }
     #[test]
     fn redirects_and_http_alternates_stay_disabled() {
