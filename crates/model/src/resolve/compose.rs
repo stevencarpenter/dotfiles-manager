@@ -901,6 +901,8 @@ fn finish(
     let mut include_total = 0usize;
     let mut leaf_budget = 0usize;
     let mut claim_budget = 0usize;
+    // The paths of `Claims::Path` resources, checked only against each other.
+    let mut owned_paths: Vec<(String, String)> = Vec::new();
     // One digest per located source path, however many references name it.
     let mut digests: BTreeMap<String, String> = BTreeMap::new();
     for (gid, owner) in resources {
@@ -1029,6 +1031,12 @@ fn finish(
         }
         // Claims are counted before anything expensive is done for this resource.
         let (claims, dir_claims) = claims_of(spec, owner, gid, value, &mut claim_budget)?;
+        if let Claims::Path(p) = spec.claims
+            && let Some(Value::String(path)) =
+                pointer::get(value, &pointer::parse(p).expect("static pointer"))
+        {
+            owned_paths.push((path.clone(), gid.clone()));
+        }
         // Source containment, through symlinks, relative to the file that supplied the value.
         let mut prov: BTreeMap<String, Provenance> = BTreeMap::new();
         let mut srcs: BTreeMap<String, (String, Option<String>)> = BTreeMap::new();
@@ -1152,8 +1160,34 @@ fn finish(
             },
         );
     }
+    check_owned_paths(&out, owned_paths)?;
     let groups = include_groups(&out, raw_includes);
     Ok((out, groups))
+}
+
+/// Two `Claims::Path` resources (`git-checkout/v1` clones) may not own one directory, compared
+/// without case, or one inside the other. Any other resource may sit at or below such a path:
+/// a checkout under a directory link is the tmux plugin layout, and sync's ignore rule governs
+/// a checkout inside a source tree (docs/upgrade.md).
+fn check_owned_paths(
+    resolved: &BTreeMap<String, ResolvedResource>,
+    mut owned: Vec<(String, String)>,
+) -> Result<(), ResolveError> {
+    let tokens = |p: &str| -> Vec<String> { p.split('/').map(crate::fold::fold).collect() };
+    owned.sort_by_cached_key(|(p, gid)| (tokens(p), gid.clone()));
+    for pair in owned.windows(2) {
+        let ((a, a_gid), (b, b_gid)) = (&pair[0], &pair[1]);
+        let (ta, tb) = (tokens(a), tokens(b));
+        if tb.starts_with(&ta) {
+            let why = if ta == tb {
+                "the same output path, compared without case"
+            } else {
+                "a file cannot also be a directory"
+            };
+            return Err(collision(&resolved[b_gid], b_gid, b, a_gid, a, why));
+        }
+    }
+    Ok(())
 }
 
 /// The HOME-relative output path an include names. `~/x` is `x`. A relative path is taken
@@ -1412,14 +1446,8 @@ fn claims_of(
     Ok(match spec.claims {
         Claims::None => (Vec::new(), Vec::new()),
         Claims::Target => (owner.doc.target.iter().cloned().collect(), Vec::new()),
-        Claims::Path(p) => (
-            get(p)
-                .and_then(Value::as_str)
-                .map(String::from)
-                .into_iter()
-                .collect(),
-            Vec::new(),
-        ),
+        // Checked by `check_owned_paths`, against other `Claims::Path` resources only.
+        Claims::Path(_) => (Vec::new(), Vec::new()),
         Claims::TargetAndFragments { dir, pattern } => {
             let (Some(Value::String(d)), Some(Value::String(p))) = (get(dir), get(pattern)) else {
                 return Ok((owner.doc.target.iter().cloned().collect(), Vec::new()));

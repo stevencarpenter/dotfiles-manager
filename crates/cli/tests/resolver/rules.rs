@@ -1262,6 +1262,32 @@ fn two_checkouts_at_one_path_or_nested_paths_collide() {
     }
 }
 
+/// The M5 layout: a directory link at `.config/tmux` and the tpm checkout below it resolve.
+/// A checkout path collides only with another checkout path.
+#[test]
+fn a_checkout_below_a_directory_link_resolves() {
+    let mut set = examples();
+    edit(
+        &mut set,
+        AGENTS_MOD,
+        "add",
+        "/resources/-",
+        Some(
+            "{ id = \"config-tmux\", kind = \"link\", adapter = \"fs-link/v1\", target = \".config/tmux\", value = { source = \"files/sample-audit\", directory = true } }",
+        ),
+    );
+    edit(
+        &mut set,
+        AGENTS_MOD,
+        "add",
+        "/resources/-",
+        Some(
+            "{ id = \"tpm\", kind = \"package\", adapter = \"git-checkout/v1\", value = { url = \"https://github.com/tmux-plugins/tpm\", path = \".config/tmux/plugins/tpm\" } }",
+        ),
+    );
+    ok(&set, PERSONAL);
+}
+
 #[test]
 fn a_link_to_a_directory_needs_the_explicit_directory_flag() {
     let link = |extra: &str| {
