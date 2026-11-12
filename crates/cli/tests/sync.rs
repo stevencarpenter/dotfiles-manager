@@ -4165,7 +4165,7 @@ fn sync_runs_the_mise_rustup_uv_and_npm_updaters_in_order() {
     };
     exe(
         &u.fake.path().join("bin/mise"),
-        "case \"$1\" in\n  outdated) cat \"$st/mise-outdated\" ;;\n  upgrade) echo '{}' > \"$st/mise-outdated\" ;;\n  *) exit 64 ;;\nesac",
+        "case \"$1\" in\n  ls) echo '{}' ;;\n  install) exit 0 ;;\n  outdated) cat \"$st/mise-outdated\" ;;\n  upgrade) echo '{}' > \"$st/mise-outdated\" ;;\n  *) exit 64 ;;\nesac",
     );
     exe(
         &u.fx.h(".cargo/bin/rustup"),

@@ -183,6 +183,11 @@ impl ScriptCx {
             .ok_or_else(crate::state_lost_refusal)
     }
 
+    /// The bound checkout of this run.
+    pub(crate) fn root(&self) -> &Path {
+        &self.root
+    }
+
     fn staged(
         &self,
     ) -> Result<std::sync::MutexGuard<'_, BTreeMap<String, Option<Staged>>>, Refusal> {

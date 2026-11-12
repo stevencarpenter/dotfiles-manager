@@ -587,14 +587,69 @@ fn mise_outdated(env: &Env) -> Result<Vec<Item>, (String, bool)> {
         .collect())
 }
 
-/// `mise upgrade` without `--bump`: the newest version inside each configured range, so no
-/// configuration file is written. mise removes the replaced version after its own grace period
-/// (`upgrade.prune_after`).
+/// Each installed `(tool, version)`, from `mise ls --installed --json`: an object keyed by tool
+/// name, each an array of records with `version` (and `installed`, never `false` here). It
+/// reads the install directory and fetches nothing.
+fn mise_installed(env: &Env) -> Result<BTreeSet<(String, String)>, (String, bool)> {
+    let out = call(
+        env.provider,
+        "mise",
+        &args(&["ls", "--installed", "--json"]),
+        &[],
+        env.timeouts.short,
+    )?;
+    let bad = |why: &str| (format!("mise ls --installed --json: {why}"), false);
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).map_err(|_| bad("not JSON"))?;
+    let mut set = BTreeSet::new();
+    for (tool, versions) in v.as_object().ok_or_else(|| bad("not an object"))? {
+        for r in versions
+            .as_array()
+            .ok_or_else(|| bad("a tool is not a list"))?
+        {
+            if r.get("installed").and_then(|i| i.as_bool()) == Some(false) {
+                continue;
+            }
+            let version = r
+                .get("version")
+                .and_then(|x| x.as_str())
+                .ok_or_else(|| bad("a record has no version"))?;
+            set.insert((tool.clone(), version.to_string()));
+        }
+    }
+    Ok(set)
+}
+
+/// `mise install` for the configured tools that are missing, then `mise upgrade` without
+/// `--bump`: the newest version inside each configured range, so no configuration file is
+/// written. Each tool version the install adds is a note, and makes the row `updated`. mise
+/// removes the replaced version after its own grace period (`upgrade.prune_after`).
 fn mise(mut d: Draft, env: &Env) -> Row {
     if let Err(e) = env.provider.resolve("mise") {
         d.notes.push(e.detail);
         return d.end(Status::Blocked);
     }
+    let had = match mise_installed(env) {
+        Ok(s) => s,
+        Err(e) => return d.stop(e),
+    };
+    if let Err(e) = call(
+        env.provider,
+        "mise",
+        &args(&["install"]),
+        &[],
+        env.timeouts.long,
+    ) {
+        return d.stop(e);
+    }
+    let has = match mise_installed(env) {
+        Ok(s) => s,
+        Err(e) => return d.stop(e),
+    };
+    let added = has.difference(&had).count();
+    d.notes.extend(
+        has.difference(&had)
+            .map(|(tool, version)| format!("{tool} {version} installed")),
+    );
     let list = || mise_outdated(env);
     let before = match list() {
         Ok(l) => l,
@@ -609,7 +664,11 @@ fn mise(mut d: Draft, env: &Env) -> Row {
             env.timeouts.long,
         )
     };
-    roll(d, "mise upgrade", before, &upgrade, &list)
+    let mut row = roll(d, "mise upgrade", before, &upgrade, &list);
+    if added > 0 && row.status == Status::Current {
+        row.status = Status::Updated;
+    }
+    row
 }
 
 /// `rustup check`: one line per toolchain and one for rustup itself, `<name> - update
@@ -1457,7 +1516,7 @@ fn preview_command(u: Updater, env: &Env) -> String {
         },
         Updater::Mise => match env.provider.resolve("mise") {
             Ok(p) => format!(
-                "would run mise outdated --json, mise upgrade ({})",
+                "would run mise ls --installed --json, mise install, mise outdated --json, mise upgrade ({})",
                 p.display()
             ),
             Err(e) => format!("blocked: {}", e.detail),
@@ -2560,14 +2619,16 @@ mod tests {
     // ---- mise, rustup, npm, uv (DFM-85) ------------------------------------------------------
 
     impl T {
-        /// `mise` whose `outdated --json` prints `st/mise-outdated` and whose bare `upgrade`
-        /// replaces it with `st/mise-after`. Any other upgrade form (`--bump`, a name) exits 65.
+        /// `mise` whose `ls --installed --json` prints `st/mise-ls` (`{}` when absent), whose
+        /// bare `install` copies `st/mise-ls-after` over it when that exists, whose `outdated
+        /// --json` prints `st/mise-outdated` and whose bare `upgrade` replaces it with
+        /// `st/mise-after`. Any other upgrade or install form (`--bump`, a name) exits 65.
         fn mise(&self, outdated: &str, after: &str) {
             fs::write(self.root.join("st/mise-outdated"), outdated).unwrap();
             fs::write(self.root.join("st/mise-after"), after).unwrap();
             self.script(
                 &self.bin.join("mise"),
-                "case \"$1\" in\n  outdated) cat \"$st/mise-outdated\" ;;\n  upgrade) [ -z \"$2\" ] || exit 65; cp \"$st/mise-after\" \"$st/mise-outdated\" ;;\n  *) exit 64 ;;\nesac",
+                "case \"$1\" in\n  ls) [ \"$2 $3\" = '--installed --json' ] || exit 65; cat \"$st/mise-ls\" 2>/dev/null || echo '{}' ;;\n  install) [ -z \"$2\" ] || exit 65; [ -f \"$st/mise-ls-after\" ] && cp \"$st/mise-ls-after\" \"$st/mise-ls\"; exit 0 ;;\n  outdated) cat \"$st/mise-outdated\" ;;\n  upgrade) [ -z \"$2\" ] || exit 65; cp \"$st/mise-after\" \"$st/mise-outdated\" ;;\n  *) exit 64 ;;\nesac",
             );
         }
 
@@ -2638,10 +2699,54 @@ mod tests {
         assert_eq!(
             t.calls(),
             vec![
+                "mise ls --installed --json".to_string(),
+                "mise install".to_string(),
+                "mise ls --installed --json".to_string(),
                 "mise outdated --json".to_string(),
                 "mise upgrade".to_string(),
                 "mise outdated --json".to_string()
             ]
+        );
+        assert!(
+            preview(Updater::Mise, &t.env()).starts_with(
+                "would run mise ls --installed --json, mise install, mise outdated --json, mise upgrade"
+            ),
+            "{}",
+            preview(Updater::Mise, &t.env())
+        );
+    }
+
+    #[test]
+    fn mise_installing_a_missing_tool_is_updated_although_nothing_is_outdated() {
+        let t = T::new();
+        t.mise("{}", "{}");
+        fs::write(
+            t.root.join("st/mise-ls"),
+            r#"{"go":[{"version":"1.27.3","installed":true}]}"#,
+        )
+        .unwrap();
+        fs::write(
+            t.root.join("st/mise-ls-after"),
+            r#"{"go":[{"version":"1.27.3","installed":true}],"node":[{"version":"22.1.0","installed":true}]}"#,
+        )
+        .unwrap();
+        let r = run(Updater::Mise, &t.env());
+        assert_eq!(r.status, Status::Updated, "{r:?}");
+        assert_eq!(r.notes, ["node 22.1.0 installed"]);
+        // A listing that is not JSON stops the row as failed, before the install.
+        let t = T::new();
+        t.mise("{}", "{}");
+        fs::write(t.root.join("st/mise-ls"), "mise ERROR").unwrap();
+        let r = run(Updater::Mise, &t.env());
+        assert_eq!(r.status, Status::Failed, "{r:?}");
+        assert!(
+            r.notes[0].starts_with("mise ls --installed --json: not JSON"),
+            "{r:?}"
+        );
+        assert!(
+            !t.calls().contains(&"mise install".to_string()),
+            "{:?}",
+            t.calls()
         );
     }
 
@@ -2651,7 +2756,15 @@ mod tests {
         t.mise("{}", "{}");
         let r = run(Updater::Mise, &t.env());
         assert_eq!(r.status, Status::Current, "{r:?}");
-        assert_eq!(t.calls(), vec!["mise outdated --json".to_string()]);
+        assert_eq!(
+            t.calls(),
+            vec![
+                "mise ls --installed --json".to_string(),
+                "mise install".to_string(),
+                "mise ls --installed --json".to_string(),
+                "mise outdated --json".to_string()
+            ]
+        );
     }
 
     #[test]

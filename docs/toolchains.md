@@ -11,7 +11,7 @@
 | Tests with `mise`, `uv` and `brew` look-alikes | `crates/cli/tests/toolchains.rs`; trial tools in `crates/cli/tests/trial.rs` |
 | Trial tools under `--update` (`probe_with_trials`) | `crates/cli/src/apply_cmd.rs` |
 
-Two provider paths are built: mise (runtimes and tools from mise's registry and backends, by the name mise takes) and uv tools by package-index name. A uv tool from a Git origin or a local path is not built. It needs origin trust ([docs/sync.md](sync.md)) and a source identity the manager can record. Declared, it is `E_MANIFEST_INVALID`. Installed that way by hand, it is held under `--update`.
+Two provider paths are built: mise (runtimes and tools from mise's registry and backends, by the name mise takes) and uv tools by package-index name. A uv tool declared with `source` (a git repository, a git tag or commit, or a checkout path, docs/packages.md) is installed by `packages` and `sync` without a grant. Under `--update`, the source is checked as without it, so a branch ref is `E_MANIFEST_INVALID`. A tool that uv's receipt shows from the declared source is held when the source names a tag, a commit or a path, and rolls with `uv tool upgrade <name>` when it is the ref-less `git+https://<repository>` form. A tool installed from anywhere else, such as the package index, is planned as missing, with the owner check: it is installed from its source and never upgraded from the index. The `uv` updater of `dfm sync` still needs a grant for a git source (docs/upgrade.md, "Source trust").
 
 ## The command
 

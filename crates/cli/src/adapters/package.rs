@@ -654,20 +654,7 @@ fn uv_norm(s: &str) -> String {
 /// persists and reuses); `Ok(Some(reason))` says which. A receipt that cannot be read or has
 /// no requirements is an error: the update cannot tell what it would resolve.
 fn uv_receipt_source(home: &Path, name: &str) -> Result<Option<String>, String> {
-    let path = home
-        .join(".local/share/uv/tools")
-        .join(uv_norm(name))
-        .join("uv-receipt.toml");
-    let shown = path.display().to_string();
-    let bytes = crate::read_fs::read_regular_bounded(
-        &path,
-        1 << 20,
-        |e| Refusal::new(Code::IoFailed, format!("cannot read {shown}: {}", e.kind())),
-        || Refusal::new(Code::IoFailed, format!("{shown} is not a regular file")),
-    )
-    .map_err(|r| r.detail)?;
-    let text = String::from_utf8(bytes).map_err(|_| format!("{shown} is not UTF-8"))?;
-    let v: dfm_model::resolve::Table = text.parse().map_err(|_| format!("{shown} is not TOML"))?;
+    let (v, shown) = uv_receipt(home, name)?;
     let tool = v.get("tool");
     let reqs = tool
         .and_then(|t| t.get("requirements"))
@@ -709,6 +696,294 @@ fn uv_receipt_source(home: &Path, name: &str) -> Result<Option<String>, String> 
             keys.join(", ")
         )
     }))
+}
+
+/// uv's receipt for an installed tool, `~/.local/share/uv/tools/<name>/uv-receipt.toml`, read
+/// as a regular file of at most 1 MiB, with its path as shown in errors.
+fn uv_receipt(home: &Path, name: &str) -> Result<(dfm_model::resolve::Table, String), String> {
+    let path = home
+        .join(".local/share/uv/tools")
+        .join(uv_norm(name))
+        .join("uv-receipt.toml");
+    let shown = path.display().to_string();
+    let bytes = crate::read_fs::read_regular_bounded(
+        &path,
+        1 << 20,
+        |e| Refusal::new(Code::IoFailed, format!("cannot read {shown}: {}", e.kind())),
+        || Refusal::new(Code::IoFailed, format!("{shown} is not a regular file")),
+    )
+    .map_err(|r| r.detail)?;
+    let text = String::from_utf8(bytes).map_err(|_| format!("{shown} is not UTF-8"))?;
+    let v = text.parse().map_err(|_| format!("{shown} is not TOML"))?;
+    Ok((v, shown))
+}
+
+/// A `uv-tool/v1` source other than the package index (docs/packages.md, "uv tools from a
+/// source").
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum UvSource {
+    /// `git+<url>@<rev>`: an https repository at a tag or a full commit; `git+<url>`, the
+    /// rolling form: its default branch.
+    Git { url: String, rev: Option<String> },
+    /// `path:<rel>`: a directory in the bound checkout, canonical.
+    Path(PathBuf),
+}
+
+const SOURCE_FORMS: &str = "git+https://<repository>, git+https://<repository>@<tag or 40-hex commit> or path:<directory in the checkout>";
+
+fn bad_source(s: &str, why: &str) -> Refusal {
+    Refusal::new(
+        Code::ManifestInvalid,
+        format!(
+            "uv-tool/v1 source {} {why}; the accepted forms are {SOURCE_FORMS}",
+            dfm_model::display::visible(s)
+        ),
+    )
+}
+
+/// The declared `source`, or `None` for a package-index tool.
+fn source_text(value: &Value) -> Option<&str> {
+    value.get("source").and_then(Value::as_str)
+}
+
+/// The checked source of a `uv-tool/v1` value: `None` without `source`, `E_MANIFEST_INVALID`
+/// for a bad one. A path source must resolve, through links, to a directory inside `root`.
+pub(crate) fn uv_source(value: &Value, root: &Path) -> Result<Option<UvSource>, Refusal> {
+    let Some(s) = source_text(value) else {
+        return Ok(None);
+    };
+    let Some(rel) = s.strip_prefix("path:") else {
+        return git_source(s).map(Some);
+    };
+    let outside = || bad_source(s, "is not a directory inside the checkout");
+    if rel.is_empty() {
+        return Err(outside());
+    }
+    let root = root.canonicalize().map_err(|_| outside())?;
+    let dir = root.join(rel).canonicalize().map_err(|_| outside())?;
+    if dir.starts_with(&root) && dir.is_dir() {
+        Ok(Some(UvSource::Path(dir)))
+    } else {
+        Err(outside())
+    }
+}
+
+/// `git+https://<repository>`, or `git+https://<repository>@<rev>` split at the last `@` (an
+/// `@` followed by a `/` belongs to the url). The repository must map to a source identity; a
+/// rev must be a tag shaped like a version or a full commit.
+/// shortcut: a version-shaped ref is taken to be a tag without asking the remote; a branch named
+/// like a version passes, upgrade by checking refs/tags with git ls-remote.
+fn git_source(s: &str) -> Result<UvSource, Refusal> {
+    let rest = s
+        .strip_prefix("git+")
+        .filter(|r| r.starts_with("https://"))
+        .ok_or_else(|| bad_source(s, "is not a git+https source"))?;
+    let (url, rev) = match rest.rsplit_once('@') {
+        Some((url, rev)) if !rev.contains('/') => (url, Some(rev)),
+        _ => (rest, None),
+    };
+    git_identity(url).map_err(|e| bad_source(s, &e.detail))?;
+    let Some(rev) = rev else {
+        return Ok(UvSource::Git {
+            url: url.into(),
+            rev: None,
+        });
+    };
+    let hex = rev.len() == 40 && rev.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
+    let parts: Vec<&str> = rev.strip_prefix('v').unwrap_or(rev).split('.').collect();
+    let version = parts.len() > 1
+        && parts
+            .iter()
+            .all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()));
+    if !hex && !version {
+        return Err(bad_source(
+            s,
+            "does not end in a tag like 1.2.3 or v1.2.3 or a 40-hex commit; a branch moves outside the plan",
+        ));
+    }
+    Ok(UvSource::Git {
+        url: url.into(),
+        rev: Some(rev.into()),
+    })
+}
+
+/// The source identity of a git source's repository.
+fn git_identity(url: &str) -> Result<String, Refusal> {
+    dfm_model::lock::source_identity(url, cfg!(feature = "test-isolation"))
+}
+
+/// Whether a resource is a `uv-tool/v1` tool with a `source`, which [`uv_source_probe`] and
+/// [`uv_source_install`] handle instead of [`probe`] and [`install`].
+pub(crate) fn uv_sourced(adapter: &str, value: &Value) -> bool {
+    adapter == UV_TOOL && source_text(value).is_some()
+}
+
+/// The installed state of a `uv-tool/v1` tool with a `source`. A declared source needs no
+/// grant: the owner wrote it in the owner's own checkout. Without `cx` a source that can be
+/// judged without the checkout is checked and the tool is `Missing`. uv's receipt decides: a
+/// requirement from the declared source ([`uv_receipt_names`]) is `Installed`, anything else
+/// (no receipt, another source, an unreadable receipt, which `--force` replaces) is `Missing`,
+/// with the owner check.
+pub(crate) fn uv_source_probe(
+    runner: &Runner,
+    value: &Value,
+    cx: Option<&ScriptCx>,
+) -> Result<PackageState, Refusal> {
+    let pkg = uv_source_name(value)?;
+    policy(value)?;
+    let text = source_text(value).unwrap_or_default();
+    let Some(cx) = cx else {
+        if !text.starts_with("path:") {
+            git_source(text)?;
+        }
+        return Ok(PackageState::Missing(Vec::new()));
+    };
+    let source = uv_source(value, cx.root())?.ok_or_else(|| bad_source(text, "is missing"))?;
+    let state = if uv_receipt_names(&runner.home, &pkg, &source) {
+        PackageState::Installed(match &source {
+            UvSource::Git { rev: Some(rev), .. } => rev.clone(),
+            _ => text.to_string(),
+        })
+    } else {
+        PackageState::Missing(Vec::new())
+    };
+    Ok(settled(runner, UV_TOOL, &pkg, state))
+}
+
+/// Whether uv's receipt for `pkg` has the requirement of `pkg` itself (its `name` equal as uv
+/// normalizes it) from `source`: a `git` of `<url>?rev=<rev>` for a source with a rev, a `git`
+/// of the same repository at any rev for a ref-less one, or a `directory` of the canonical path.
+/// A `--with` extra from the source does not count. An unreadable receipt does not.
+fn uv_receipt_names(home: &Path, pkg: &str, source: &UvSource) -> bool {
+    let (key, want) = match source {
+        UvSource::Git {
+            url,
+            rev: Some(rev),
+        } => ("git", format!("{url}?rev={rev}")),
+        UvSource::Git { url, rev: None } => ("git", url.clone()),
+        UvSource::Path(dir) => ("directory", dir.display().to_string()),
+    };
+    let rolling = matches!(source, UvSource::Git { rev: None, .. });
+    let same = |got: &str| {
+        if rolling {
+            got.split(['?', '#']).next() == Some(want.as_str())
+        } else {
+            got == want
+        }
+    };
+    let pkg = uv_norm(pkg);
+    uv_receipt(home, &pkg).is_ok_and(|(v, _)| {
+        v.get("tool")
+            .and_then(|t| t.get("requirements"))
+            .and_then(Value::as_array)
+            .is_some_and(|reqs| {
+                reqs.iter().any(|r| {
+                    r.get("name")
+                        .and_then(Value::as_str)
+                        .is_some_and(|n| uv_norm(n) == pkg)
+                        && r.get(key).and_then(Value::as_str).is_some_and(same)
+                })
+            })
+    })
+}
+
+/// Installs a `uv-tool/v1` tool from its `source` with `uv tool install --force`, which replaces
+/// a copy from another source. The caller probes again afterwards.
+pub(crate) fn uv_source_install(
+    runner: &Runner,
+    value: &Value,
+    cx: &ScriptCx,
+) -> Result<(), Refusal> {
+    let pkg = uv_source_name(value)?;
+    let text = source_text(value).unwrap_or_default();
+    let source = uv_source(value, cx.root())?.ok_or_else(|| bad_source(text, "is missing"))?;
+    let arg = match &source {
+        UvSource::Git {
+            url,
+            rev: Some(rev),
+        } => format!("git+{url}@{rev}"),
+        UvSource::Git { url, rev: None } => format!("git+{url}"),
+        UvSource::Path(dir) => dir
+            .to_str()
+            .ok_or_else(|| bad_source(text, "resolves to a path that is not UTF-8"))?
+            .to_string(),
+    };
+    let args = ["tool".to_string(), "install".into(), "--force".into(), arg];
+    let what = format!("uv tool install --force {}", args[3]);
+    change(runner, "uv", &args, &uv_env(false), &what)?;
+    // uv names the tool's directory after the package at the source, not after the declaration.
+    uv_receipt(&runner.home, &pkg).map(|_| ()).map_err(|why| {
+        Refusal::new(
+            Code::IoFailed,
+            format!(
+                "{what} succeeded, but no receipt names {pkg} ({why}); the package at the source may have another name than the declared one"
+            ),
+        )
+    })
+}
+
+/// The declared name of a source tool: a package name that is also a package-index name, so
+/// the receipt path takes no `/`.
+fn uv_source_name(value: &Value) -> Result<String, Refusal> {
+    let pkg = name(value)?;
+    if !uv_name(&pkg) {
+        return Err(Refusal::new(
+            Code::ManifestInvalid,
+            format!(
+                "{pkg}: uv-tool/v1 takes a package-index name (letters, digits, '.', '_', '-'); a source goes in source"
+            ),
+        ));
+    }
+    Ok(pkg)
+}
+
+/// `packages --update` for a source tool. The name and the source are checked first, as the
+/// plan without `--update` checks them. Then [`maintain`] decides, and it holds a tool that
+/// uv's receipt shows from a pinned source (a tag, a commit or a path). A rolling tool from a
+/// ref-less git source that the receipt shows is `Rolling` instead, so `uv tool upgrade` moves
+/// it to the default branch's newest commit, with the owner check. A tool installed from
+/// anywhere else (the package index, another rev or repository) is `Missing`, with the owner
+/// check (`OtherOwner` blocks), so it is installed from its source and never upgraded from the
+/// index. Without `cx` (`doctor`) a path source is not resolved.
+pub(crate) fn maintain_sourced(
+    runner: &Runner,
+    value: &Value,
+    cx: Option<&ScriptCx>,
+) -> Result<PackageState, Refusal> {
+    let pkg = uv_source_name(value)?;
+    let text = source_text(value).unwrap_or_default();
+    let Some(cx) = cx else {
+        if !text.starts_with("path:") {
+            git_source(text)?;
+        }
+        return maintain(runner, UV_TOOL, value);
+    };
+    let source = uv_source(value, cx.root())?.ok_or_else(|| bad_source(text, "is missing"))?;
+    let state = match maintain(runner, UV_TOOL, value)? {
+        // `maintain` holds some copies before its owner check, so a copy it now treats as
+        // missing gets that check here, as the plain probe does.
+        PackageState::Installed(_) | PackageState::Held(_) | PackageState::Rolling(_)
+            if !uv_receipt_names(&runner.home, &pkg, &source) =>
+        {
+            settled(runner, UV_TOOL, &pkg, PackageState::Missing(Vec::new()))
+        }
+        // `maintain` holds every git receipt; a ref-less source is the rolling form.
+        PackageState::Held(_)
+            if matches!(source, UvSource::Git { rev: None, .. }) && policy(value)? == "rolling" =>
+        {
+            match (
+                probe(runner, UV_TOOL, value)?,
+                other_owner(runner, UV_TOOL, &pkg),
+            ) {
+                (_, Ok(Some(why))) => PackageState::OtherOwner(why),
+                (_, Err(why)) => PackageState::Unknown(why),
+                (PackageState::Installed(v), Ok(None)) => PackageState::Rolling(v),
+                (state, Ok(None)) => state,
+            }
+        }
+        state => state,
+    };
+    Ok(state)
 }
 
 /// `dpkg-query -W -f=${Status} <name>`: `install ok installed` means installed. A missing
@@ -1250,6 +1525,12 @@ fn facts(
         }
         let looked = if r.adapter == script::ADAPTER {
             script::probe(runner, &r.id, &r.value, scripts, update)
+        } else if uv_sourced(&r.adapter, &r.value) {
+            if update {
+                maintain_sourced(runner, &r.value, scripts)
+            } else {
+                uv_source_probe(runner, &r.value, scripts)
+            }
         } else {
             look(runner, &r.adapter, &r.value)
         };
@@ -1561,6 +1842,132 @@ mod tests {
                 e.detail
             );
         }
+    }
+
+    #[test]
+    fn a_git_source_needs_a_tag_or_a_commit() {
+        let root = Path::new("/r");
+        let v = |s: &str| {
+            let mut t = dfm_model::resolve::Table::new();
+            t.insert("name".into(), Value::String("token-auditor".into()));
+            t.insert("update_policy".into(), Value::String("rolling".into()));
+            t.insert("source".into(), Value::String(s.into()));
+            Value::Table(t)
+        };
+        assert_eq!(
+            uv_source(&v("git+https://github.com/o/r@2026.11.11"), root),
+            Ok(Some(UvSource::Git {
+                url: "https://github.com/o/r".into(),
+                rev: Some("2026.11.11".into())
+            }))
+        );
+        // Without a ref: the rolling form.
+        assert_eq!(
+            uv_source(&v("git+https://github.com/o/r"), root),
+            Ok(Some(UvSource::Git {
+                url: "https://github.com/o/r".into(),
+                rev: None
+            }))
+        );
+        assert!(matches!(
+            uv_source(&v("git+https://github.com/o/r@v1.2.3"), root),
+            Ok(Some(_))
+        ));
+        let commit = format!("git+https://github.com/o/r@{}", "a".repeat(40));
+        assert!(matches!(uv_source(&v(&commit), root), Ok(Some(_))));
+        for bad in [
+            "git+https://github.com/o/r@main",
+            "git+http://github.com/o/r@1.0",
+            "git+ssh://git@github.com/o/r@1.0",
+            "https://github.com/o/r@1.0",
+            "git+https://github.com/o/r@1",
+            "git+https://github.com/o/r@v1.",
+            &format!("git+https://github.com/o/r@{}", "A".repeat(40)),
+        ] {
+            assert_eq!(
+                uv_source(&v(bad), root).unwrap_err().code,
+                Code::ManifestInvalid,
+                "{bad}"
+            );
+        }
+        let mut t = dfm_model::resolve::Table::new();
+        t.insert("name".into(), Value::String("token-auditor".into()));
+        assert_eq!(uv_source(&Value::Table(t), root), Ok(None));
+    }
+
+    /// A new directory for one test, as the other test modules of this crate make it.
+    fn scratch(label: &str) -> PathBuf {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static N: AtomicU32 = AtomicU32::new(0);
+        let p = std::env::temp_dir().canonicalize().unwrap().join(format!(
+            "dfm-package-{label}-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    #[test]
+    fn a_receipt_matches_the_source_only_through_the_declared_package() {
+        let home = scratch("uv-names");
+        let dir = home.join(".local/share/uv/tools/token-auditor");
+        std::fs::create_dir_all(&dir).unwrap();
+        let source = UvSource::Git {
+            url: "https://github.com/o/r".into(),
+            rev: Some("1.0.0".into()),
+        };
+        let receipt = |reqs: &str| {
+            std::fs::write(
+                dir.join("uv-receipt.toml"),
+                format!("[tool]\nrequirements = [{reqs}]\n"),
+            )
+            .unwrap();
+        };
+        // The tool itself from the index, a `--with` extra from the declared source.
+        receipt(
+            r#"{ name = "token-auditor" }, { name = "helper", git = "https://github.com/o/r?rev=1.0.0" }"#,
+        );
+        assert!(!uv_receipt_names(&home, "token-auditor", &source));
+        // The tool from the source, under a name uv spells another way.
+        receipt(r#"{ name = "Token_Auditor", git = "https://github.com/o/r?rev=1.0.0" }"#);
+        assert!(uv_receipt_names(&home, "token-auditor", &source));
+        std::fs::remove_dir_all(&home).unwrap();
+    }
+
+    #[test]
+    fn a_path_source_is_a_directory_inside_the_checkout() {
+        let tmp = scratch("uv-path");
+        let root = tmp.join("root");
+        std::fs::create_dir_all(root.join("agent_reap")).unwrap();
+        std::fs::create_dir_all(tmp.join("x")).unwrap();
+        std::fs::write(root.join("file"), "").unwrap();
+        std::os::unix::fs::symlink("/tmp", root.join("link")).unwrap();
+        let v = |s: &str| {
+            let mut t = dfm_model::resolve::Table::new();
+            t.insert("source".into(), Value::String(s.into()));
+            Value::Table(t)
+        };
+        let canon = root.canonicalize().unwrap().join("agent_reap");
+        assert_eq!(
+            uv_source(&v("path:agent_reap"), &root),
+            Ok(Some(UvSource::Path(canon)))
+        );
+        for bad in [
+            "path:../x",
+            "path:link",
+            "path:file",
+            "path:absent",
+            "path:",
+            "path:/tmp",
+        ] {
+            assert_eq!(
+                uv_source(&v(bad), &root).unwrap_err().code,
+                Code::ManifestInvalid,
+                "{bad}"
+            );
+        }
+        std::fs::remove_dir_all(&tmp).unwrap();
     }
 
     #[test]
