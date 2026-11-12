@@ -2,8 +2,7 @@
 //! isolated binary (DFM-24, docs/toolchains.md).
 //!
 //! Every run passes `--home <temp dir>` and an empty environment, plus `DFM_PROVIDER_PATH`
-//! pointing at a directory with `mise`, `uv` and `brew` look-alikes, and a `git` that runs
-//! only `git ls-remote --get-url`, which reads the git config and fetches nothing. Each look-alike logs its
+//! pointing at a directory with `mise`, `uv` and `brew` look-alikes. Each look-alike logs its
 //! arguments and the provider variables it saw, lists what an `installed-<provider>` file
 //! names, and changes that file only on an install or upgrade, so no real provider runs and
 //! nothing reaches the network.
@@ -101,8 +100,8 @@ esac
 /// `No tools installed`. `uv tool upgrade <name>` replaces the version with the one
 /// `latest-uv` names (`2.0.0` when there is none); `uv tool install <name>` adds `1.0.0`.
 /// `uv tool install --force <source>` writes the receipt uv would for the tool the `uv-builds`
-/// marker names: a `git` requirement `<url>?rev=<rev>` for `git+<url>@<rev>`, else a
-/// `directory` one. The `nopython` marker makes a change fail as uv does when no interpreter
+/// marker names: a `git` requirement `<url>?rev=<rev>` for `git+<url>@<rev>`, `<url>?rev=main-tip`
+/// for a ref-less `git+<url>`, else a `directory` one. The `nopython` marker makes a change fail as uv does when no interpreter
 /// is found and downloads are off.
 const FAKE_UV: &str = r#"#!/bin/sh
 PATH=/usr/bin:/bin:$PATH
@@ -123,7 +122,8 @@ case "$2" in
     if [ "$3" = --force ]; then
       built=$(cat "$here/../uv-builds"); dir="$HOME/.local/share/uv/tools/$built"; mkdir -p "$dir"
       case "$4" in
-        git+*) s=${4#git+}; req="git = \"${s%@*}?rev=${s##*@}\"" ;;
+        git+*@*) s=${4#git+}; req="git = \"${s%@*}?rev=${s##*@}\"" ;;
+        git+*) req="git = \"${4#git+}?rev=main-tip\"" ;;
         *) req="directory = \"$4\"" ;;
       esac
       printf '[tool]\nrequirements = [{ name = "%s", %s }]\n' "$built" "$req" > "$dir/uv-receipt.toml"
@@ -141,9 +141,6 @@ esac
 
 /// `brew --cellar` and `brew --caskroom` print the fixture's `Cellar` and `Caskroom`; nothing
 /// else is answered. A homebrew/v1 package under `--update` is probed and then held.
-/// The system git, for `ls-remote --get-url` only.
-const FAKE_GIT: &str = "#!/bin/sh\nPATH=/usr/bin:/bin\nprintf 'git %s\\n' \"$*\" >> \"$(dirname \"$0\")/../log\"\n[ \"$1 $2\" = 'ls-remote --get-url' ] || exit 64\nexec git \"$@\"\n";
-
 const FAKE_BREW: &str = r#"#!/bin/sh
 PATH=/usr/bin:/bin:$PATH
 here=$(dirname "$0")
@@ -190,12 +187,7 @@ impl Fx {
         fx.put("base/modules/extra/module.toml", EXTRA);
         fx.put("profiles/t-01.toml", common::PROFILE);
         fs::create_dir_all(fx.bin()).unwrap();
-        for (name, body) in [
-            ("mise", FAKE_MISE),
-            ("uv", FAKE_UV),
-            ("brew", FAKE_BREW),
-            ("git", FAKE_GIT),
-        ] {
+        for (name, body) in [("mise", FAKE_MISE), ("uv", FAKE_UV), ("brew", FAKE_BREW)] {
             let p = fx.bin().join(name);
             fs::write(&p, body).unwrap();
             fs::set_permissions(&p, fs::Permissions::from_mode(0o755)).unwrap();
@@ -331,24 +323,6 @@ impl Fx {
                 "{EXTRA}\n[[resources]]\nid = \"src\"\nkind = \"package\"\nadapter = \"uv-tool/v1\"\n[resources.value]\nname = \"token-auditor\"\nupdate_policy = \"rolling\"\nsource = \"{source}\"\n"
             ),
         );
-    }
-
-    /// Writes `state/grants.json` with one origin grant, as `sync --trust-origin` would.
-    fn grant(&self, origin: &str) {
-        self.grants(&[origin]);
-    }
-
-    /// Replaces the grants with one per origin.
-    fn grants(&self, origins: &[&str]) {
-        let p = self.state().join("grants.json");
-        let origins: Vec<_> = origins
-            .iter()
-            .enumerate()
-            .map(|(i, o)| serde_json::json!({ "origin": o, "grant_id": format!("grant-{i}"), "granted_at": "2026-11-11T00:00:00Z" }))
-            .collect();
-        let body = serde_json::json!({ "schema": 2, "origins": origins });
-        fs::write(&p, body.to_string()).unwrap();
-        fs::set_permissions(&p, fs::Permissions::from_mode(0o600)).unwrap();
     }
 
     /// An executable of `name` another owner put in `~/.local/bin`.
@@ -906,26 +880,11 @@ fn a_read_only_plan_and_doctor_start_no_provider() {
 const SRC: &str = "extra.src@package";
 const GIT: &str = "git+https://github.com/o/r@2026.11.11";
 
+/// A declared source needs no grant: the owner wrote it in the owner's own checkout.
 #[test]
-fn a_git_source_without_a_grant_blocks_and_with_one_installs() {
+fn a_git_source_installs_without_a_grant() {
     let fx = Fx::new();
     fx.with_source(GIT);
-    let o = fx.preview(false);
-    let t = format!("{}{}", text(&o.stdout), stderr(&o));
-    assert_eq!(code(&o), 3, "{t}");
-    assert!(t.contains("E_SOURCE_UNTRUSTED"), "{t}");
-    assert!(
-        t.contains("dfm sync --trust-origin 'https://github.com/o/r'"),
-        "{t}"
-    );
-    assert!(
-        t.contains("its git source has no grant (https://github.com/o/r)"),
-        "{t}"
-    );
-    assert!(t.contains("after reviewing that repository"), "{t}");
-    assert!(!t.contains("script"), "{t}");
-    assert!(fx.changes().is_empty(), "{}", fx.log());
-    fx.grant("https://github.com/o/r");
     let o = fx.apply(false);
     assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
     assert!(
@@ -945,71 +904,75 @@ fn a_git_source_without_a_grant_blocks_and_with_one_installs() {
     assert_eq!(fx.changes().len(), 1, "{}", fx.log());
 }
 
-/// uv clones a git source with git, so a `url.*.insteadOf` rewrite in the user's git config
-/// redirects the clone: the url git would fetch needs its own grant.
+const ROLLING: &str = "git+https://github.com/o/r";
+
+/// A git source without a ref is the rolling form: it installs the default branch, and a
+/// receipt from the same repository at any rev is current.
 #[test]
-fn a_git_source_that_git_rewrites_needs_a_grant_for_the_rewritten_url() {
+fn a_ref_less_git_source_installs_and_any_rev_of_its_repository_is_current() {
     let fx = Fx::new();
-    fx.with_source(GIT);
-    fx.grant("https://github.com/o/r");
-    let config = fx.home.path().join(".config/git/config");
-    fs::create_dir_all(config.parent().unwrap()).unwrap();
-    fs::write(
-        &config,
-        "[url \"https://mirror.invalid/\"]\n\tinsteadOf = https://github.com/\n",
-    )
-    .unwrap();
-    let o = fx.preview(false);
-    let t = format!("{}{}", text(&o.stdout), stderr(&o));
-    assert_eq!(code(&o), 3, "{t}");
-    assert!(
-        t.contains("dfm sync --trust-origin 'https://mirror.invalid/o/r'"),
-        "{t}"
-    );
-    // The rewritten url alone is not enough: the declared one needs its grant too.
-    fx.grant("https://mirror.invalid/o/r");
-    let o = fx.preview(false);
-    let t = format!("{}{}", text(&o.stdout), stderr(&o));
-    assert_eq!(code(&o), 3, "{t}");
-    assert!(
-        t.contains("dfm sync --trust-origin 'https://github.com/o/r'"),
-        "{t}"
-    );
-    assert!(fx.changes().is_empty(), "{}", fx.log());
-    fx.grants(&["https://github.com/o/r", "https://mirror.invalid/o/r"]);
+    fx.with_source(ROLLING);
     let o = fx.apply(false);
     assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
-    assert_eq!(fx.changes(), [format!("uv tool install --force {GIT}")]);
-}
-
-/// A tool that uv's receipt shows from its declared git source needs no fetch, so a removed
-/// grant does not block it: the receipt is read before the grant, and nothing runs.
-#[test]
-fn an_installed_git_source_tool_without_a_grant_is_current() {
-    let fx = Fx::new();
-    fx.with_source(GIT);
+    assert_eq!(fx.changes(), [format!("uv tool install --force {ROLLING}")]);
+    let receipt = |git: &str| {
+        format!("[tool]\nrequirements = [{{ name = \"token-auditor\", git = \"{git}\" }}]\n")
+    };
     fx.uv_receipt(
         "token-auditor",
-        "[tool]\nrequirements = [{ name = \"token-auditor\", git = \"https://github.com/o/r?rev=2026.11.11\" }]\n",
+        &receipt("https://github.com/o/r?rev=0123456789abcdef0123456789abcdef01234567"),
     );
     let o = fx.apply(false);
-    let t = text(&o.stdout);
-    assert_eq!(code(&o), 0, "{}\n{t}", stderr(&o));
-    assert!(t.contains(&format!("current {SRC}")), "{t}");
-    // The only uv call is the index tool's listing (nuv); git never runs.
-    let log = fx.log();
-    let other = |l: &str| {
-        l.starts_with("git ") || (l.starts_with("uv ") && !l.starts_with("uv tool list "))
-    };
-    assert!(!log.lines().any(other), "{log}");
-    assert!(fx.changes().is_empty(), "{log}");
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+    assert!(
+        text(&o.stdout).contains(&format!("current {SRC}")),
+        "{}",
+        text(&o.stdout)
+    );
+    assert_eq!(fx.changes().len(), 1, "{}", fx.log());
+    // Another repository is not this source: the tool is installed again.
+    fx.uv_receipt(
+        "token-auditor",
+        &receipt("https://github.com/o/other?rev=1.0.0"),
+    );
+    let o = fx.preview(false);
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+    assert!(
+        text(&o.stdout).contains("install token-auditor with uv-tool/v1"),
+        "{}",
+        text(&o.stdout)
+    );
+}
+
+/// Under the update, a ref-less source tool rolls with `uv tool upgrade`, as an index tool does.
+#[test]
+fn the_update_rolls_a_ref_less_git_source_tool() {
+    let fx = Fx::new();
+    fx.with_source(ROLLING);
+    fx.installed("uv", "nuv 0.5.2\ntoken-auditor 1.0.0\n");
+    fx.uv_receipt(
+        "token-auditor",
+        "[tool]\nrequirements = [{ name = \"token-auditor\", git = \"https://github.com/o/r?rev=main-tip\" }]\n",
+    );
+    let o = fx.apply(true);
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+    let changes = fx.changes();
+    assert!(
+        changes
+            .iter()
+            .any(|c| c.starts_with("uv tool upgrade token-auditor")),
+        "{changes:?}"
+    );
+    assert!(
+        !changes.iter().any(|c| c.contains("install --force")),
+        "{changes:?}"
+    );
 }
 
 #[test]
 fn a_git_source_with_a_branch_ref_is_refused() {
     let fx = Fx::new();
     fx.with_source("git+https://github.com/o/r@main");
-    fx.grant("https://github.com/o/r");
     let o = fx.preview(false);
     let t = format!("{}{}", text(&o.stdout), stderr(&o));
     assert_eq!(code(&o), 3, "{t}");
@@ -1022,7 +985,6 @@ fn a_git_source_with_a_branch_ref_is_refused() {
 fn a_git_source_at_another_rev_is_missing() {
     let fx = Fx::new();
     fx.with_source(GIT);
-    fx.grant("https://github.com/o/r");
     let receipt = |rev: &str| {
         format!(
             "[tool]\nrequirements = [{{ name = \"token-auditor\", git = \"https://github.com/o/r?rev={rev}\" }}]\n"
@@ -1052,8 +1014,6 @@ fn a_path_source_installs_from_the_checkout() {
     let fx = Fx::new();
     fs::create_dir_all(fx.root.join("agent_reap")).unwrap();
     fx.with_source("path:agent_reap");
-    // A grants file that cannot be read: a path source never reads it.
-    fs::write(fx.state().join("grants.json"), "not json").unwrap();
     let dir = fx.root.canonicalize().unwrap().join("agent_reap");
     let o = fx.apply(false);
     assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
@@ -1096,10 +1056,10 @@ fn a_path_source_outside_the_checkout_is_refused() {
 }
 
 #[test]
-fn an_ungranted_git_source_is_held_under_the_update_when_installed_and_blocked_when_missing() {
+fn a_git_source_tool_is_held_under_the_update_when_installed_and_installed_when_missing() {
     let fx = Fx::new();
     fx.with_source(GIT);
-    // Installed from the git source, no grant: held, so the other rolling updates still run.
+    // Installed from the git source: held, so the other rolling updates still run.
     fx.installed("uv", "nuv 0.5.2\ntoken-auditor 2026.11.11\n");
     fx.uv_receipt(
         "token-auditor",
@@ -1111,25 +1071,23 @@ fn an_ungranted_git_source_is_held_under_the_update_when_installed_and_blocked_w
     assert!(t.contains(&format!("held {SRC}")), "{t}");
     assert!(t.contains("installed from a git source"), "{t}");
     assert!(fx.changes().is_empty(), "{}", fx.log());
-    // Missing, no grant: the install would fetch, so the row is blocked.
+    // Missing: the update installs it from its source.
     fx.installed("uv", "nuv 0.5.2\n");
     fs::remove_dir_all(fx.home.path().join(".local/share/uv/tools/token-auditor")).unwrap();
-    let o = fx.preview(true);
-    let t = format!("{}{}", text(&o.stdout), stderr(&o));
-    assert_eq!(code(&o), 3, "{t}");
-    assert!(t.contains("E_SOURCE_UNTRUSTED"), "{t}");
+    let o = fx.apply(true);
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
     assert!(
-        t.contains("dfm sync --trust-origin 'https://github.com/o/r'"),
-        "{t}"
+        fx.changes()
+            .contains(&format!("uv tool install --force {GIT}")),
+        "{}",
+        fx.log()
     );
-    assert!(fx.changes().is_empty(), "{}", fx.log());
 }
 
 #[test]
 fn the_update_refuses_a_git_source_with_a_branch_ref() {
     let fx = Fx::new();
     fx.with_source("git+https://github.com/o/r@main");
-    fx.grant("https://github.com/o/r");
     // Installed, so the update would otherwise decide from the listing alone.
     fx.installed("uv", "nuv 0.5.2\ntoken-auditor 2026.11.11\n");
     fx.uv_receipt(
@@ -1145,7 +1103,7 @@ fn the_update_refuses_a_git_source_with_a_branch_ref() {
 }
 
 /// A tool installed from the package index although it declares a git source is not upgraded
-/// from the index: the update plans the source install, with its grant check.
+/// from the index: the update plans the source install.
 #[test]
 fn the_update_installs_a_source_tool_from_its_source_when_the_index_copy_is_installed() {
     let fx = Fx::new();
@@ -1155,14 +1113,6 @@ fn the_update_installs_a_source_tool_from_its_source_when_the_index_copy_is_inst
         "token-auditor",
         "[tool]\nrequirements = [{ name = \"token-auditor\" }]\n",
     );
-    let o = fx.preview(true);
-    let t = format!("{}{}", text(&o.stdout), stderr(&o));
-    assert_eq!(code(&o), 3, "{t}");
-    assert!(
-        t.contains("dfm sync --trust-origin 'https://github.com/o/r'"),
-        "{t}"
-    );
-    fx.grant("https://github.com/o/r");
     let o = fx.apply(true);
     assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
     let changes = fx.changes();
@@ -1182,7 +1132,6 @@ fn the_update_installs_a_source_tool_from_its_source_when_the_index_copy_is_inst
 fn the_update_keeps_another_owner_for_a_source_tool_from_another_source() {
     let fx = Fx::new();
     fx.with_source(GIT);
-    fx.grant("https://github.com/o/r");
     fx.installed("uv", "nuv 0.5.2\ntoken-auditor 2026.11.10\n");
     // From the git source at another rev, which the update holds before its owner check.
     fx.uv_receipt(

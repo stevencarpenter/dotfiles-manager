@@ -722,14 +722,14 @@ fn uv_receipt(home: &Path, name: &str) -> Result<(dfm_model::resolve::Table, Str
 /// source").
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum UvSource {
-    /// `git+<url>@<rev>`: an https repository at a tag or a full commit.
-    Git { url: String, rev: String },
+    /// `git+<url>@<rev>`: an https repository at a tag or a full commit; `git+<url>`, the
+    /// rolling form: its default branch.
+    Git { url: String, rev: Option<String> },
     /// `path:<rel>`: a directory in the bound checkout, canonical.
     Path(PathBuf),
 }
 
-const SOURCE_FORMS: &str =
-    "git+https://<repository>@<tag or 40-hex commit> or path:<directory in the checkout>";
+const SOURCE_FORMS: &str = "git+https://<repository>, git+https://<repository>@<tag or 40-hex commit> or path:<directory in the checkout>";
 
 fn bad_source(s: &str, why: &str) -> Refusal {
     Refusal::new(
@@ -768,17 +768,27 @@ pub(crate) fn uv_source(value: &Value, root: &Path) -> Result<Option<UvSource>, 
     }
 }
 
-/// `git+https://<repository>@<rev>`, split at the last `@`. The repository must map to a source
-/// identity a grant can name; the rev must be a tag shaped like a version or a full commit.
+/// `git+https://<repository>`, or `git+https://<repository>@<rev>` split at the last `@` (an
+/// `@` followed by a `/` belongs to the url). The repository must map to a source identity; a
+/// rev must be a tag shaped like a version or a full commit.
 /// shortcut: a version-shaped ref is taken to be a tag without asking the remote; a branch named
 /// like a version passes, upgrade by checking refs/tags with git ls-remote.
 fn git_source(s: &str) -> Result<UvSource, Refusal> {
-    let (url, rev) = s
+    let rest = s
         .strip_prefix("git+")
-        .and_then(|r| r.rsplit_once('@'))
-        .filter(|(url, _)| url.starts_with("https://"))
-        .ok_or_else(|| bad_source(s, "is not a git+https source with a rev"))?;
+        .filter(|r| r.starts_with("https://"))
+        .ok_or_else(|| bad_source(s, "is not a git+https source"))?;
+    let (url, rev) = match rest.rsplit_once('@') {
+        Some((url, rev)) if !rev.contains('/') => (url, Some(rev)),
+        _ => (rest, None),
+    };
     git_identity(url).map_err(|e| bad_source(s, &e.detail))?;
+    let Some(rev) = rev else {
+        return Ok(UvSource::Git {
+            url: url.into(),
+            rev: None,
+        });
+    };
     let hex = rev.len() == 40 && rev.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
     let parts: Vec<&str> = rev.strip_prefix('v').unwrap_or(rev).split('.').collect();
     let version = parts.len() > 1
@@ -793,11 +803,11 @@ fn git_source(s: &str) -> Result<UvSource, Refusal> {
     }
     Ok(UvSource::Git {
         url: url.into(),
-        rev: rev.into(),
+        rev: Some(rev.into()),
     })
 }
 
-/// The grant identity of a git source's repository.
+/// The source identity of a git source's repository.
 fn git_identity(url: &str) -> Result<String, Refusal> {
     dfm_model::lock::source_identity(url, cfg!(feature = "test-isolation"))
 }
@@ -808,12 +818,12 @@ pub(crate) fn uv_sourced(adapter: &str, value: &Value) -> bool {
     adapter == UV_TOOL && source_text(value).is_some()
 }
 
-/// The installed state of a `uv-tool/v1` tool with a `source`. Without `cx` a source that can
-/// be judged without the checkout is checked and the tool is `Missing`. uv's receipt decides
-/// first: a requirement from the declared `<url>?rev=<rev>` or the canonical directory is
-/// `Installed`, with no grant read, because nothing is fetched. Anything else (no receipt,
-/// another source, an unreadable receipt, which `--force` replaces) must be installed: a git
-/// source without a grant is then `Ungranted`, else `Missing`, with the owner check.
+/// The installed state of a `uv-tool/v1` tool with a `source`. A declared source needs no
+/// grant: the owner wrote it in the owner's own checkout. Without `cx` a source that can be
+/// judged without the checkout is checked and the tool is `Missing`. uv's receipt decides: a
+/// requirement from the declared source ([`uv_receipt_names`]) is `Installed`, anything else
+/// (no receipt, another source, an unreadable receipt, which `--force` replaces) is `Missing`,
+/// with the owner check.
 pub(crate) fn uv_source_probe(
     runner: &Runner,
     value: &Value,
@@ -829,15 +839,11 @@ pub(crate) fn uv_source_probe(
         return Ok(PackageState::Missing(Vec::new()));
     };
     let source = uv_source(value, cx.root())?.ok_or_else(|| bad_source(text, "is missing"))?;
-    // A tool already installed from its source needs no fetch, so only an install reads the
-    // grant (and runs git for the insteadOf check).
     let state = if uv_receipt_names(&runner.home, &pkg, &source) {
         PackageState::Installed(match &source {
-            UvSource::Git { rev, .. } => rev.clone(),
-            UvSource::Path(_) => text.to_string(),
+            UvSource::Git { rev: Some(rev), .. } => rev.clone(),
+            _ => text.to_string(),
         })
-    } else if let Some(id) = ungranted(runner, &source, cx)? {
-        return Ok(PackageState::Ungranted(id));
     } else {
         PackageState::Missing(Vec::new())
     };
@@ -845,12 +851,25 @@ pub(crate) fn uv_source_probe(
 }
 
 /// Whether uv's receipt for `pkg` has the requirement of `pkg` itself (its `name` equal as uv
-/// normalizes it) from `source`: a `git` of `<url>?rev=<rev>`, or a `directory` of the canonical
-/// path. A `--with` extra from the source does not count. An unreadable receipt does not.
+/// normalizes it) from `source`: a `git` of `<url>?rev=<rev>` for a source with a rev, a `git`
+/// of the same repository at any rev for a ref-less one, or a `directory` of the canonical path.
+/// A `--with` extra from the source does not count. An unreadable receipt does not.
 fn uv_receipt_names(home: &Path, pkg: &str, source: &UvSource) -> bool {
     let (key, want) = match source {
-        UvSource::Git { url, rev } => ("git", format!("{url}?rev={rev}")),
+        UvSource::Git {
+            url,
+            rev: Some(rev),
+        } => ("git", format!("{url}?rev={rev}")),
+        UvSource::Git { url, rev: None } => ("git", url.clone()),
         UvSource::Path(dir) => ("directory", dir.display().to_string()),
+    };
+    let rolling = matches!(source, UvSource::Git { rev: None, .. });
+    let same = |got: &str| {
+        if rolling {
+            got.split(['?', '#']).next() == Some(want.as_str())
+        } else {
+            got == want
+        }
     };
     let pkg = uv_norm(pkg);
     uv_receipt(home, &pkg).is_ok_and(|(v, _)| {
@@ -862,15 +881,14 @@ fn uv_receipt_names(home: &Path, pkg: &str, source: &UvSource) -> bool {
                     r.get("name")
                         .and_then(Value::as_str)
                         .is_some_and(|n| uv_norm(n) == pkg)
-                        && r.get(key).and_then(Value::as_str) == Some(want.as_str())
+                        && r.get(key).and_then(Value::as_str).is_some_and(same)
                 })
             })
     })
 }
 
 /// Installs a `uv-tool/v1` tool from its `source` with `uv tool install --force`, which replaces
-/// a copy from another source. A git source needs its grant, read again here under the writer
-/// lock; without it nothing runs. The caller probes again afterwards.
+/// a copy from another source. The caller probes again afterwards.
 pub(crate) fn uv_source_install(
     runner: &Runner,
     value: &Value,
@@ -880,19 +898,11 @@ pub(crate) fn uv_source_install(
     let text = source_text(value).unwrap_or_default();
     let source = uv_source(value, cx.root())?.ok_or_else(|| bad_source(text, "is missing"))?;
     let arg = match &source {
-        UvSource::Git { url, rev } => {
-            if let Some(id) = ungranted(runner, &source, cx)? {
-                return Err(Refusal::new(
-                    Code::SourceUntrusted,
-                    format!(
-                        "the uv source {} has no grant; nothing was run. Fix: {}",
-                        dfm_model::display::visible(text),
-                        dfm_model::lock::trust_command(&id)
-                    ),
-                ));
-            }
-            format!("git+{url}@{rev}")
-        }
+        UvSource::Git {
+            url,
+            rev: Some(rev),
+        } => format!("git+{url}@{rev}"),
+        UvSource::Git { url, rev: None } => format!("git+{url}"),
         UvSource::Path(dir) => dir
             .to_str()
             .ok_or_else(|| bad_source(text, "resolves to a path that is not UTF-8"))?
@@ -927,34 +937,15 @@ fn uv_source_name(value: &Value) -> Result<String, Refusal> {
     Ok(pkg)
 }
 
-/// The first identity of a git source that has no grant, or `None` (a granted git source, a
-/// path). uv clones with git, so both the declared url and the url git fetches from after
-/// `url.*.insteadOf` need a grant. The declared url is checked first, so an ungranted one
-/// never reaches git. `Err` is a url git cannot resolve or one that maps to no identity.
-fn ungranted(runner: &Runner, source: &UvSource, cx: &ScriptCx) -> Result<Option<String>, Refusal> {
-    let UvSource::Git { url, .. } = source else {
-        return Ok(None);
-    };
-    let grants = cx.grants()?;
-    let declared = git_identity(url)?;
-    if !grants.trusts(&declared) {
-        return Ok(Some(declared));
-    }
-    let fetched = super::updater::fetch_url(runner, url, PROBE_TIMEOUT)
-        .map_err(|why| Refusal::new(Code::SourceUntrusted, why))?;
-    let fetched = dfm_model::lock::git_identity(&fetched, cfg!(feature = "test-isolation"))?;
-    Ok((!grants.trusts(&fetched)).then_some(fetched))
-}
-
 /// `packages --update` for a source tool. The name and the source are checked first, as the
 /// plan without `--update` checks them. Then [`maintain`] decides, and it holds a tool that
-/// uv's receipt shows from the declared source, with or without a grant (it fetches nothing).
-/// A tool installed from anywhere else (the package index, another rev) is `Missing`, with the
-/// owner check (`OtherOwner` blocks), so it is installed from its source and never upgraded
-/// from the index. A missing one, which the
-/// install would fetch, is `Ungranted` when its git source has no grant. Without `cx`
-/// (`doctor`) a path source is not resolved.
-fn maintain_sourced(
+/// uv's receipt shows from a pinned source (a tag, a commit or a path). A rolling tool from a
+/// ref-less git source that the receipt shows is `Rolling` instead, so `uv tool upgrade` moves
+/// it to the default branch's newest commit, with the owner check. A tool installed from
+/// anywhere else (the package index, another rev or repository) is `Missing`, with the owner
+/// check (`OtherOwner` blocks), so it is installed from its source and never upgraded from the
+/// index. Without `cx` (`doctor`) a path source is not resolved.
+pub(crate) fn maintain_sourced(
     runner: &Runner,
     value: &Value,
     cx: Option<&ScriptCx>,
@@ -976,13 +967,22 @@ fn maintain_sourced(
         {
             settled(runner, UV_TOOL, &pkg, PackageState::Missing(Vec::new()))
         }
+        // `maintain` holds every git receipt; a ref-less source is the rolling form.
+        PackageState::Held(_)
+            if matches!(source, UvSource::Git { rev: None, .. }) && policy(value)? == "rolling" =>
+        {
+            match (
+                probe(runner, UV_TOOL, value)?,
+                other_owner(runner, UV_TOOL, &pkg),
+            ) {
+                (_, Ok(Some(why))) => PackageState::OtherOwner(why),
+                (_, Err(why)) => PackageState::Unknown(why),
+                (PackageState::Installed(v), Ok(None)) => PackageState::Rolling(v),
+                (state, Ok(None)) => state,
+            }
+        }
         state => state,
     };
-    if matches!(state, PackageState::Missing(_))
-        && let Some(id) = ungranted(runner, &source, cx)?
-    {
-        return Ok(PackageState::Ungranted(id));
-    }
     Ok(state)
 }
 
@@ -1858,7 +1858,15 @@ mod tests {
             uv_source(&v("git+https://github.com/o/r@2026.11.11"), root),
             Ok(Some(UvSource::Git {
                 url: "https://github.com/o/r".into(),
-                rev: "2026.11.11".into()
+                rev: Some("2026.11.11".into())
+            }))
+        );
+        // Without a ref: the rolling form.
+        assert_eq!(
+            uv_source(&v("git+https://github.com/o/r"), root),
+            Ok(Some(UvSource::Git {
+                url: "https://github.com/o/r".into(),
+                rev: None
             }))
         );
         assert!(matches!(
@@ -1869,7 +1877,6 @@ mod tests {
         assert!(matches!(uv_source(&v(&commit), root), Ok(Some(_))));
         for bad in [
             "git+https://github.com/o/r@main",
-            "git+https://github.com/o/r",
             "git+http://github.com/o/r@1.0",
             "git+ssh://git@github.com/o/r@1.0",
             "https://github.com/o/r@1.0",
@@ -1908,7 +1915,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let source = UvSource::Git {
             url: "https://github.com/o/r".into(),
-            rev: "1.0.0".into(),
+            rev: Some("1.0.0".into()),
         };
         let receipt = |reqs: &str| {
             std::fs::write(

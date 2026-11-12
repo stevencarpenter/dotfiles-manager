@@ -1382,27 +1382,17 @@ impl Planner<'_> {
                 self.blocker(r, None, f);
             }
             Some(PackageState::Ungranted(identity)) => {
-                let trust = crate::lock::trust_command(&identity);
-                // A `script/v1` tool runs its install script; a `uv-tool/v1` tool builds a git source.
-                let f = if identity.starts_with(crate::lock::SCRIPT) {
-                    fail(
-                        Code::SourceUntrusted,
-                        "/url",
-                        format!(
-                            "{name} is not installed, and its install script has no grant ({identity}); dfm runs only a script the owner trusts"
-                        ),
-                        format!("run {trust} after reading the script, then run sync again"),
-                    )
-                } else {
-                    fail(
-                        Code::SourceUntrusted,
-                        "/source",
-                        format!(
-                            "{name} is not installed, and its git source has no grant ({identity}); dfm builds only a source the owner trusts"
-                        ),
-                        format!("run {trust} after reviewing that repository, then run sync again"),
-                    )
-                };
+                let f = fail(
+                    Code::SourceUntrusted,
+                    "/url",
+                    format!(
+                        "{name} is not installed, and its install script has no grant ({identity}); dfm runs only a script the owner trusts"
+                    ),
+                    format!(
+                        "run {} after reading the script, then run sync again",
+                        crate::lock::trust_command(&identity)
+                    ),
+                );
                 op.effect = format!("blocked: {}", f.detail);
                 self.blocker(r, None, f);
             }

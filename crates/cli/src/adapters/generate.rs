@@ -275,8 +275,12 @@ impl Generator for Generators<'_> {
         if op.adapter == script::ADAPTER {
             let update = op.action == Action::Upgrade;
             script::probe(runner, &op.resource, value, self.scripts.as_ref(), update)
-        } else if op.action != Action::Upgrade && package::uv_sourced(&op.adapter, value) {
-            package::uv_source_probe(runner, value, self.scripts.as_ref())
+        } else if package::uv_sourced(&op.adapter, value) {
+            if op.action == Action::Upgrade {
+                package::maintain_sourced(runner, value, self.scripts.as_ref())
+            } else {
+                package::uv_source_probe(runner, value, self.scripts.as_ref())
+            }
         } else if op.action == Action::Upgrade {
             package::maintain(runner, &op.adapter, value)
         } else {

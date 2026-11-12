@@ -396,7 +396,7 @@ pub fn registry() -> Vec<Adapter> {
             spec: package("apt/v1"),
             generator: None,
         },
-        // A package-index tool, or one from a granted git tag or a checkout path (`source`).
+        // A package-index tool, or one from a declared git repository or checkout path (`source`).
         Adapter {
             spec: spec(
                 "uv-tool/v1",

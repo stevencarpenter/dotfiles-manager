@@ -1386,15 +1386,6 @@ fn package_row(r: &ResolvedResource, s: &PackageState, path: &OsStr) -> Row {
             why.clone(),
             blocked.into(),
         ),
-        PackageState::Ungranted(identity) if !identity.starts_with(dfm_model::lock::SCRIPT) => (
-            Level::Warn,
-            Code::SourceUntrusted.into(),
-            format!("{pkg} is not installed and its git source has no grant ({identity})"),
-            format!(
-                "Review that repository, then run {}.",
-                dfm_model::lock::trust_command(identity)
-            ),
-        ),
         PackageState::Ungranted(identity) => (
             Level::Warn,
             Code::SourceUntrusted.into(),
