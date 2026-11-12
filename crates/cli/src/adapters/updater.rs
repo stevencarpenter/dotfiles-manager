@@ -1094,7 +1094,7 @@ fn read_record(path: &Path) -> Result<String, String> {
 /// a registry that an npmrc names cannot serve a package that an `npm:` grant covers. npm
 /// resolves a scoped package through `@<scope>:registry`, which `npm_config_registry` does
 /// not override, so each scope among `names` is pinned to the default registry too.
-fn npm_env(names: &[String]) -> Vec<(String, String)> {
+pub(crate) fn npm_env(names: &[String]) -> Vec<(String, String)> {
     let mut v = vec![
         ("npm_config_registry".to_string(), NPM_REGISTRY.to_string()),
         // An npmrc `link=true` limits `npm ls` to linked packages; the listing must be whole.

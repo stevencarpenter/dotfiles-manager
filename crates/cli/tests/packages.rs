@@ -108,11 +108,11 @@ esac
 /// `<name> <version>` line per installed version); the table form is refused, as a stand-in for
 /// its truncated tool column. `mise install <name>@<version>` appends; a bare name exits 1,
 /// as real mise installs only the configured version for one and none is configured under
-/// `MISE_NO_CONFIG=1`.
+/// `MISE_NO_CONFIG=1`. The install records the requested version, 2.0.0 for `latest`.
 const FAKE_MISE: &str = r#"#!/bin/sh
 PATH=/usr/bin:/bin:$PATH
 here=$(dirname "$0")
-printf 'mise %s | yes=%s auto=%s noconfig=%s\n' "$*" "${MISE_YES:-unset}" "${MISE_NOT_FOUND_AUTO_INSTALL:-unset}" "${MISE_NO_CONFIG:-unset}" >> "$here/../log"
+printf 'mise %s | yes=%s auto=%s noconfig=%s registry=%s\n' "$*" "${MISE_YES:-unset}" "${MISE_NOT_FOUND_AUTO_INSTALL:-unset}" "${MISE_NO_CONFIG:-unset}" "${npm_config_registry:-unset}" >> "$here/../log"
 db="$here/../installed-mise"
 case "$1" in
   ls)
@@ -129,7 +129,8 @@ case "$1" in
     exit 0 ;;
   install)
     case "$2" in *@*) ;; *) echo "mise ERROR no version requested for $2" >&2; exit 1 ;; esac
-    echo "${2%%@*}  2.0.0" >> "$db"; exit 0 ;;
+    v=${2##*@}; [ "$v" = latest ] && v=2.0.0
+    echo "${2%@*}  $v" >> "$db"; exit 0 ;;
   *) exit 64 ;;
 esac
 "#;
@@ -1194,6 +1195,61 @@ fn a_nested_mise_tool_of_another_backend_is_refused() {
         "{t}"
     );
     assert_eq!(mise_installs(&fx), 0, "{}", fx.log());
+}
+
+/// A version from a nested source cannot name another source: an npm alias, a git or URL
+/// spec, or any other text but `latest` and a plain version is refused.
+#[test]
+fn a_nested_mise_tool_whose_version_names_another_source_is_refused() {
+    // A url holds `//`, which the name rule refuses before the source check.
+    for (name, code_name) in [
+        ("npm:x@git+https://e/x", "E_MANIFEST_INVALID"),
+        ("github:o/r@https://e", "E_MANIFEST_INVALID"),
+        ("npm:x@npm:y", "E_SOURCE_UNTRUSTED"),
+        ("npm:x@github:o/evil", "E_SOURCE_UNTRUSTED"),
+    ] {
+        let fx = mise_fx(name);
+        let module = fs::read_to_string(fx.root.join("base/modules/extra/module.toml")).unwrap();
+        common::nest_extra(&fx.root, &module);
+        let o = fx.preview();
+        let t = format!("{}{}", text(&o.stdout), stderr(&o));
+        assert_eq!(code(&o), 3, "{name}: {t}");
+        assert!(t.contains(code_name), "{name}: {t}");
+        if code_name == "E_SOURCE_UNTRUSTED" {
+            assert!(
+                t.contains("must be latest or a plain version"),
+                "{name}: {t}"
+            );
+        }
+        assert_eq!(mise_installs(&fx), 0, "{}", fx.log());
+    }
+}
+
+/// A plain version installs with the grant, from the default npm registry. (`@latest` is a
+/// selector that the mise adapter refuses for every declaration, docs/packages.md.)
+#[test]
+fn a_nested_npm_mise_tool_installs_from_the_default_registry_with_a_grant() {
+    for name in ["npm:x@1.2.3", "npm:@s/x@1.2.3"] {
+        let fx = mise_fx(name);
+        let module = fs::read_to_string(fx.root.join("base/modules/extra/module.toml")).unwrap();
+        common::nest_extra(&fx.root, &module);
+        let id = name.rsplit_once('@').unwrap().0;
+        common::grant_aside(&fx.root, id, |a| fx.run(a));
+        let o = fx.packages(&digest_of(&fx.preview()));
+        assert_eq!(code(&o), 0, "{name}: {}\n{}", stderr(&o), text(&o.stdout));
+        let installs: Vec<String> = fx
+            .log()
+            .lines()
+            .filter(|l| l.starts_with("mise install"))
+            .map(str::to_string)
+            .collect();
+        assert_eq!(installs.len(), 1, "{}", fx.log());
+        assert!(
+            installs[0].ends_with("registry=https://registry.npmjs.org/"),
+            "{}",
+            installs[0]
+        );
+    }
 }
 
 /// The bound checkout's own backend-qualified tool is unchanged: no grant.

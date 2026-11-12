@@ -729,18 +729,16 @@ pub(crate) fn owner_source(nested: Option<&[String]>, r: &ResolvedResource) -> b
     }
 }
 
-/// The source identity that a backend-qualified `mise/v1` name fetches from, or `None` for a
-/// registry name (no `<backend>:`). `github:o/r` and `ubi:o/r` are the repository
-/// (`https://github.com/o/r`), `npm:<name>` is `npm:<name>`; a trailing `@<version>` is not part
-/// of it. Any other backend is `E_SOURCE_UNTRUSTED`: only these three map to one identity.
-fn mise_identity(name: &str) -> Result<Option<String>, Refusal> {
+/// The backend tool of a backend-qualified `mise/v1` name and the source identity it fetches
+/// from, or `None` for a registry name (no `<backend>:`). `github:o/r` and `ubi:o/r` are the
+/// repository (`https://github.com/o/r`), `npm:<name>` is `npm:<name>`. A version after the
+/// first `@` past the start must be `latest` or a plain version (`[0-9A-Za-z][0-9A-Za-z.+-]*`):
+/// anything else (an npm alias `npm:y`, a git or URL spec) would make the tool fetch another
+/// source than the identity names. Any other backend, or another version, is
+/// `E_SOURCE_UNTRUSTED`.
+fn mise_identity(name: &str) -> Result<Option<(String, String)>, Refusal> {
     let Some((backend, rest)) = name.split_once(':') else {
         return Ok(None);
-    };
-    // `npm:@scope/x` starts with `@`; only a later `@` is a version.
-    let rest = match rest.rfind('@') {
-        Some(i) if i > 0 => &rest[..i],
-        _ => rest,
     };
     let untrusted = |why: &str| {
         Refusal::new(
@@ -748,6 +746,23 @@ fn mise_identity(name: &str) -> Result<Option<String>, Refusal> {
             format!("mise/v1 tool {}: {why}", dfm_model::display::visible(name)),
         )
     };
+    // `npm:@scope/x` starts with `@`; the first `@` after the start begins the version.
+    let (rest, version) = match rest.char_indices().skip(1).find(|(_, c)| *c == '@') {
+        Some((i, _)) => (&rest[..i], Some(&rest[i + 1..])),
+        None => (rest, None),
+    };
+    let plain = |v: &str| {
+        v == "latest"
+            || v.starts_with(|c: char| c.is_ascii_alphanumeric())
+                && v.chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '+' | '-'))
+    };
+    if let Some(v) = version.filter(|v| !plain(v)) {
+        return Err(untrusted(&format!(
+            "the version {} from a nested source must be latest or a plain version such as 1.2.3",
+            dfm_model::display::visible(v)
+        )));
+    }
     let source = match backend {
         "github" | "ubi" => rest.to_string(),
         "npm" => format!("{}{rest}", dfm_model::lock::NPM),
@@ -758,7 +773,7 @@ fn mise_identity(name: &str) -> Result<Option<String>, Refusal> {
         }
     };
     dfm_model::lock::source_identity(&source, cfg!(feature = "test-isolation"))
-        .map(Some)
+        .map(|id| Some((rest.to_string(), id)))
         .map_err(|e| untrusted(&e.detail))
 }
 
@@ -780,21 +795,25 @@ pub(crate) fn mise_gated(
     }
     Ok(match mise_identity(&name(&r.value)?) {
         Ok(None) => state,
-        Ok(Some(id)) => ungranted(cx, r, id)?.map_or(state, PackageState::Ungranted),
+        Ok(Some((_, id))) => ungranted(cx, r, id)?.map_or(state, PackageState::Ungranted),
         Err(e) => PackageState::Unofficial(e.detail),
     })
 }
 
 /// The re-check under the writer lock before `mise install` or an upgrade of a backend-qualified
 /// name that the bound checkout did not declare ([`source_gate`]). Without `cx` such a name is
-/// not installed.
-pub(crate) fn mise_gate(cx: Option<&ScriptCx>, r: &ResolvedResource) -> Result<(), Refusal> {
+/// not installed. The result is the extra provider variables: an `npm:` tool from a nested
+/// source installs from the default registry, with the pins the `npm` updater sets.
+pub(crate) fn mise_gate(
+    cx: Option<&ScriptCx>,
+    r: &ResolvedResource,
+) -> Result<Vec<(String, String)>, Refusal> {
     if r.adapter != MISE {
-        return Ok(());
+        return Ok(Vec::new());
     }
     let n = name(&r.value)?;
     if !n.contains(':') {
-        return Ok(());
+        return Ok(Vec::new());
     }
     let cx = cx.ok_or_else(|| {
         Refusal::new(
@@ -803,12 +822,17 @@ pub(crate) fn mise_gate(cx: Option<&ScriptCx>, r: &ResolvedResource) -> Result<(
         )
     })?;
     if owner_source(cx.nested(), r) {
-        return Ok(());
+        return Ok(Vec::new());
     }
-    match mise_identity(&n)? {
-        Some(id) => source_gate(cx, r, id),
-        None => Ok(()),
-    }
+    let Some((tool, id)) = mise_identity(&n)? else {
+        return Ok(Vec::new());
+    };
+    source_gate(cx, r, id)?;
+    Ok(if n.starts_with(dfm_model::lock::NPM) {
+        super::updater::npm_env(&[tool])
+    } else {
+        Vec::new()
+    })
 }
 
 /// `identity` when the source of `r` still needs a grant: the bound checkout did not declare it
@@ -1338,6 +1362,17 @@ fn settled(runner: &Runner, adapter: &str, pkg: &str, state: PackageState) -> Pa
 /// installs only the version mise's configuration requests, and `MISE_NO_CONFIG=1` hides that
 /// configuration.
 pub fn install(runner: &Runner, adapter: &str, value: &Value) -> Result<(), Refusal> {
+    install_env(runner, adapter, value, &[])
+}
+
+/// [`install`] with `extra` variables for the provider (the npm registry pins of
+/// [`mise_gate`]).
+pub(crate) fn install_env(
+    runner: &Runner,
+    adapter: &str,
+    value: &Value,
+    extra: &[(String, String)],
+) -> Result<(), Refusal> {
     let pkg = name(value)?;
     let pkg = if adapter == MISE {
         mise_selector(&pkg)
@@ -1360,7 +1395,14 @@ pub fn install(runner: &Runner, adapter: &str, value: &Value) -> Result<(), Refu
             args.extend(off.args());
             ("brew", args, brew_env())
         }
-        MISE => ("mise", vec!["install".to_string(), pkg.clone()], mise_env()),
+        MISE => (
+            "mise",
+            vec!["install".to_string(), pkg.clone()],
+            mise_env()
+                .into_iter()
+                .chain(extra.iter().cloned())
+                .collect(),
+        ),
         UV_TOOL => (
             "uv",
             vec!["tool".to_string(), "install".into(), pkg.clone()],
@@ -1733,10 +1775,21 @@ mod tests {
             ("npm:prettier@3", Some("npm:prettier")),
             ("npm:@scope/x@1.2", Some("npm:@scope/x")),
             ("npm:@scope/x", Some("npm:@scope/x")),
+            ("npm:x@latest", Some("npm:x")),
         ] {
-            assert_eq!(mise_identity(n).unwrap().as_deref(), want, "{n}");
+            let got = mise_identity(n).unwrap().map(|(_, id)| id);
+            assert_eq!(got.as_deref(), want, "{n}");
         }
-        for n in ["aqua:o/r", "cargo:x", "core:node", "github:o"] {
+        for n in [
+            "aqua:o/r",
+            "cargo:x",
+            "core:node",
+            "github:o",
+            "npm:x@git+https://e/x",
+            "npm:x@npm:y",
+            "github:o/r@https://e",
+            "npm:x@1@2",
+        ] {
             let e = mise_identity(n).unwrap_err();
             assert_eq!(e.code, Code::SourceUntrusted, "{n}: {e}");
         }

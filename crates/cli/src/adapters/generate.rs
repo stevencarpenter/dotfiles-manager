@@ -329,11 +329,12 @@ impl Generator for Generators<'_> {
                 package::uv_source_install(runner, r, cx)
             }
         } else {
-            package::mise_gate(self.scripts.as_ref(), r)?;
-            if op.action == Action::Upgrade {
+            let extra = package::mise_gate(self.scripts.as_ref(), r)?;
+            // A mise upgrade is a `mise install` of the selector, so it takes the same pins.
+            if op.action == Action::Upgrade && op.adapter != package::MISE {
                 package::upgrade(runner, &op.adapter, value)
             } else {
-                package::install(runner, &op.adapter, value)
+                package::install_env(runner, &op.adapter, value, &extra)
             }
         }
     }
