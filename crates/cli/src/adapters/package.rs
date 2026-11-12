@@ -719,29 +719,11 @@ fn uv_receipt(home: &Path, name: &str) -> Result<(dfm_model::resolve::Table, Str
     Ok((v, shown))
 }
 
-/// Each package adapter and the pointer of the source it fetches from. That source needs no grant
-/// only when the bound checkout declared it ([`owner_source`], docs/sync.md,
-/// "Source identities"); otherwise its identity needs one. `None`: the adapter installs from its
-/// provider's registry, or its source always needs a grant (`script/v1`). A new package adapter
-/// must be listed here (`every_package_adapter_states_its_source_rule`).
-pub(crate) const SOURCE_ADAPTERS: &[(&str, Option<&str>)] = &[
-    (HOMEBREW, None),
-    (MISE, None),
-    (APT, None),
-    (UV_TOOL, Some("/source")),
-    (checkout::ADAPTER, Some("/url")),
-    (script::ADAPTER, None),
-];
-
-/// Whether the bound checkout declared the source of `r` (its [`SOURCE_ADAPTERS`] pointer).
-/// `nested` holds the nested source paths of the lock (`sync_cmd::nested_paths`); `None`, an
-/// unreadable lock, is never the owner's.
+/// Whether the bound checkout declared the source of `r` (its pointer in
+/// [`dfm_model::resolve::SOURCE_ADAPTERS`]). `nested` holds the nested source paths of the lock
+/// (`sync_cmd::nested_paths`); `None`, an unreadable lock, is never the owner's.
 pub(crate) fn owner_source(nested: Option<&[String]>, r: &ResolvedResource) -> bool {
-    let pointer = SOURCE_ADAPTERS
-        .iter()
-        .find(|(a, _)| *a == r.adapter)
-        .and_then(|(_, p)| *p);
-    match (pointer, nested) {
+    match (dfm_model::resolve::source_pointer(&r.adapter), nested) {
         (Some(p), Some(n)) => dfm_model::resolve::owner_declared(r, p, n),
         _ => false,
     }
@@ -835,7 +817,7 @@ fn checked_source(r: &ResolvedResource, cx: &ScriptCx) -> Result<UvSource, Refus
     if matches!(source, UvSource::Path(_)) && !owner_source(cx.nested(), r) {
         return Err(bad_source(
             text,
-            "comes from a nested source; a path source must be declared in the bound checkout",
+            "is not declared by the bound checkout; a path source must be declared in the bound checkout",
         ));
     }
     Ok(source)
@@ -909,7 +891,7 @@ pub(crate) fn uv_sourced(adapter: &str, value: &Value) -> bool {
 
 /// The installed state of a `uv-tool/v1` tool with a `source`. A source the bound checkout
 /// declared needs no grant; a git source from a nested source that is to be installed needs a
-/// grant for its repository, else it is `Ungranted` ([`SOURCE_ADAPTERS`]). Without `cx` a
+/// grant for its repository, else it is `Ungranted` ([`owner_source`]). Without `cx` a
 /// source that can be judged without the checkout is checked and the tool is `Missing`. uv's
 /// receipt decides: a requirement from the declared source ([`uv_receipt_names`]) is
 /// `Installed`, anything else (no receipt, another source, an unreadable receipt, which
@@ -1671,11 +1653,13 @@ mod tests {
             .collect();
         for id in &packages {
             assert!(
-                SOURCE_ADAPTERS.iter().any(|(a, _)| a == id),
+                dfm_model::resolve::SOURCE_ADAPTERS
+                    .iter()
+                    .any(|(a, _)| a == id),
                 "{id} is not in SOURCE_ADAPTERS"
             );
         }
-        assert_eq!(SOURCE_ADAPTERS.len(), packages.len());
+        assert_eq!(dfm_model::resolve::SOURCE_ADAPTERS.len(), packages.len());
     }
 
     #[test]

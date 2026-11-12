@@ -71,6 +71,28 @@ pub struct ResolvedResource {
     pub precedence: Option<String>,
 }
 
+/// Each package adapter and the pointer of the source it fetches from. That source needs no grant
+/// only when the bound checkout declared it ([`owner_declared`], docs/sync.md, "Source
+/// identities"); otherwise its identity needs one. `None`: the adapter installs from its
+/// provider's registry, or its source always needs a grant (`script/v1`). The cli test
+/// `every_package_adapter_states_its_source_rule` fails for a package adapter not listed here.
+pub const SOURCE_ADAPTERS: &[(&str, Option<&str>)] = &[
+    ("homebrew/v1", None),
+    ("mise/v1", Some("/name")),
+    ("apt/v1", None),
+    ("uv-tool/v1", Some("/source")),
+    ("git-checkout/v1", Some("/url")),
+    ("script/v1", None),
+];
+
+/// The [`SOURCE_ADAPTERS`] pointer of `adapter`, or `None`.
+pub fn source_pointer(adapter: &str) -> Option<&'static str> {
+    SOURCE_ADAPTERS
+        .iter()
+        .find(|(a, _)| *a == adapter)
+        .and_then(|(_, p)| *p)
+}
+
 /// Whether the owner's own checkout declared `r` and the value at `pointer`, so its source needs
 /// no grant (docs/sync.md, "Source identities"). True only when the declaring manifest and the
 /// manifest that supplied the value both lie outside every nested source path of the lock.

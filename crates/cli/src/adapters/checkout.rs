@@ -1,6 +1,6 @@
 //! The `git-checkout/v1` package adapter (docs/packages.md, "Git checkouts"): a git repository
 //! cloned to a HOME-relative path. A checkout the bound checkout declared needs no grant; one
-//! from a nested source needs a grant for its url (`package::SOURCE_ADAPTERS`). The probe reads
+//! from a nested source needs a grant for its url (`dfm_model::resolve::SOURCE_ADAPTERS`). The probe reads
 //! only local git state. The install clones a missing checkout
 //! and never pulls (the `checkouts` step of `dfm sync` fast-forwards it).
 

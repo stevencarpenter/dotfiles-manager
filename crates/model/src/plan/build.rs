@@ -1393,18 +1393,14 @@ impl Planner<'_> {
                 } else {
                     (
                         format!(
-                            "{name} needs its source {identity}, which a nested source declares and which has no grant; dfm fetches it only with a grant"
+                            "{name} needs its source {identity}, which the bound checkout does not declare and which has no grant; dfm fetches it only with a grant"
                         ),
                         "reviewing the source",
                     )
                 };
                 let f = fail(
                     Code::SourceUntrusted,
-                    if r.adapter == "uv-tool/v1" {
-                        "/source"
-                    } else {
-                        "/url"
-                    },
+                    crate::resolve::source_pointer(&r.adapter).unwrap_or("/url"),
                     why,
                     format!(
                         "run {} after {read}, then run sync again",

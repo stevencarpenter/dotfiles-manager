@@ -1397,7 +1397,7 @@ fn package_row(r: &ResolvedResource, s: &PackageState, path: &OsStr) -> Row {
             } else {
                 (
                     format!(
-                        "{pkg} needs its source {identity}, which a nested source declares and which has no grant"
+                        "{pkg} needs its source {identity}, which the bound checkout does not declare and which has no grant"
                     ),
                     "Review the source",
                 )
