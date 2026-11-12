@@ -999,7 +999,13 @@ fn cargo_install_args(name: &str, src: Option<&str>) -> Result<Vec<String>, Stri
     match src {
         None => {}
         Some(p) if p.starts_with('/') => return Err(format!("{name} held (path install {p})")),
-        Some(g) if g.contains("://") => {
+        // Git only when it is `git+...` or a plain URL; `registry ...` and `sparse+...` are not.
+        Some(g)
+            if !g.contains(char::is_whitespace)
+                && ["git+", "https://", "ssh://"]
+                    .iter()
+                    .any(|p| g.starts_with(p)) =>
+        {
             let g = g.strip_prefix("git+").unwrap_or(g);
             let g = g.split_once('#').map_or(g, |(url, _)| url);
             let (url, query) = g.split_once('?').unwrap_or((g, ""));
@@ -1181,9 +1187,11 @@ fn go_read(
         Some(_)
             if {
                 let err = String::from_utf8_lossy(&out.stderr);
-                matches!(out.end, End::Exited(_))
-                    && (err.contains("could not read Go build info")
-                        || err.contains("not a Go executable"))
+                // A text file or random bytes exit 1 with an empty stderr.
+                (matches!(out.end, End::Exited(1)) && err.trim().is_empty())
+                    || (matches!(out.end, End::Exited(_))
+                        && (err.contains("could not read Go build info")
+                            || err.contains("not a Go executable")))
             } =>
         {
             Ok(None)
@@ -3459,7 +3467,7 @@ mod tests {
             }
             self.script(
                 &self.bin.join("mise"),
-                "echo \"$GOBIN\" >> $st/go-env\n[ \"$1 $2 $3\" = 'exec -- go' ] || exit 64\ncase \"$4\" in\n  version) if [ -z \"$5\" ]; then [ -f \"$st/go-broken\" ] && exit 1; exit 0; fi; [ -f \"$st/go-err-$(basename $6)\" ] && { echo boom >&2; exit 1; }; [ -f \"$st/gobin/$(basename $6)\" ] || { echo \"$6: could not read Go build info\" >&2; exit 1; }; cat \"$st/gobin/$(basename $6)\" ;;\n  install) pkg=${5%@latest}; [ -f \"$st/go-fail-$(basename $pkg)\" ] && exit 1; for f in $st/gobin/*; do grep -q \"path	$pkg\\$\" $f && cp $st/golatest/$(basename $f) $f; done; true ;;\n  *) exit 64 ;;\nesac",
+                "echo \"$GOBIN\" >> $st/go-env\n[ \"$1 $2 $3\" = 'exec -- go' ] || exit 64\ncase \"$4\" in\n  version) if [ -z \"$5\" ]; then [ -f \"$st/go-broken\" ] && exit 1; exit 0; fi; [ -f \"$st/go-silent-$(basename $6)\" ] && exit 1; [ -f \"$st/go-err-$(basename $6)\" ] && { echo boom >&2; exit 1; }; [ -f \"$st/gobin/$(basename $6)\" ] || { echo \"$6: could not read Go build info\" >&2; exit 1; }; cat \"$st/gobin/$(basename $6)\" ;;\n  install) pkg=${5%@latest}; [ -f \"$st/go-fail-$(basename $pkg)\" ] && exit 1; for f in $st/gobin/*; do grep -q \"path	$pkg\\$\" $f && cp $st/golatest/$(basename $f) $f; done; true ;;\n  *) exit 64 ;;\nesac",
             );
         }
     }
@@ -3612,6 +3620,18 @@ mod tests {
     }
 
     #[test]
+    fn go_skips_a_file_whose_read_exits_1_with_no_stderr_and_installs_the_rest() {
+        let t = T::new();
+        t.go(&[("a", "example.com/a", "v1.0.0", "v1.1.0")]);
+        // Real `go version -m` on a text file or random bytes exits 1 and prints nothing.
+        fs::write(t.home.join("go/bin/README"), "text").unwrap();
+        fs::write(t.root.join("st/go-silent-README"), "").unwrap();
+        let r = run(Updater::Go, &t.env());
+        assert_eq!(r.status, Status::Updated, "{r:?}");
+        assert_eq!(r.notes, vec!["a v1.0.0 -> v1.1.0".to_string()]);
+    }
+
+    #[test]
     fn go_with_no_binaries_is_current() {
         let t = T::new();
         t.script(&t.bin.join("mise"), "exit 64");
@@ -3737,6 +3757,25 @@ mod tests {
         assert_eq!(r.notes, vec!["g abc1234 -> fedcba9".to_string()]);
         let r = run(Updater::Cargo, &t.env());
         assert_eq!(r.status, Status::Current, "{r:?}");
+    }
+
+    #[test]
+    fn cargo_holds_an_alternate_registry_crate_and_never_installs_it() {
+        let t = T::new();
+        t.cargo(
+            "x v1.0.0 (registry `https://my.reg/index`):\n    x\ny v1.0.0 (sparse+https://my.reg/):\n    y\n",
+            &[],
+        );
+        let r = run(Updater::Cargo, &t.env());
+        assert_eq!(r.status, Status::Current, "{r:?}");
+        assert_eq!(
+            r.notes,
+            vec![
+                "x held (source registry `https://my.reg/index`)".to_string(),
+                "y held (source sparse+https://my.reg/)".to_string()
+            ]
+        );
+        assert!(!t.log().contains("install --locked"), "{}", t.log());
     }
 
     #[test]
