@@ -2247,6 +2247,7 @@ fn updater_env<'a>(
         grants,
         checkouts,
         agents_declared,
+        ssh_agent: updater::ssh_agent(),
     }
 }
 

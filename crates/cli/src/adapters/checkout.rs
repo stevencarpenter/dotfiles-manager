@@ -199,7 +199,10 @@ pub(crate) fn install(runner: &Runner, r: &ResolvedResource, cx: &ScriptCx) -> R
         args.extend(["--branch".to_string(), b.clone()]);
     }
     args.extend(["--".to_string(), d.url.clone(), tmp_text.to_string()]);
-    let env = [("GIT_TERMINAL_PROMPT".to_string(), "0".to_string())];
+    // A key held only in an ssh-agent must reach git's ssh; nothing else passes through.
+    let env: Vec<(String, String)> = std::iter::once(("GIT_TERMINAL_PROMPT".into(), "0".into()))
+        .chain(super::updater::ssh_agent())
+        .collect();
     let cloned = change(
         runner,
         "git",

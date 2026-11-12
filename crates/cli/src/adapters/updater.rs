@@ -44,6 +44,17 @@ pub struct Env<'a> {
     /// The profile declares `agents`, which pulls its managed copy itself, so `checkouts`
     /// leaves that copy out.
     pub agents_declared: bool,
+    /// `SSH_AUTH_SOCK` of the manager's own environment, passed to the fetch and the pull only,
+    /// so a key held in an ssh-agent reaches git's ssh ([`ssh_agent`]).
+    pub ssh_agent: Option<(String, String)>,
+}
+
+/// `SSH_AUTH_SOCK` of the manager's own environment, when it is set and UTF-8. Only the commands
+/// that reach a remote (`git clone`, `fetch`, `pull`) get it; nothing else passes through.
+pub(crate) fn ssh_agent() -> Option<(String, String)> {
+    std::env::var("SSH_AUTH_SOCK")
+        .ok()
+        .map(|v| ("SSH_AUTH_SOCK".to_string(), v))
 }
 
 /// A declared `git-checkout/v1` checkout.
@@ -1382,6 +1393,20 @@ fn side_channels(mut d: Draft, env: &Env) -> Row {
 /// `git -C <dir> <a>`; its trimmed standard output. As in the `git-checkout/v1` probe, git must
 /// not walk up from a `.git` that is not a repository to an enclosing one.
 fn git(env: &Env, dir: &Path, a: &[&str]) -> Result<String, (String, bool)> {
+    git_with(env, dir, a, None)
+}
+
+/// [`git`] for a command that reaches the remote: it also gets [`Env::ssh_agent`].
+fn git_remote(env: &Env, dir: &Path, a: &[&str]) -> Result<String, (String, bool)> {
+    git_with(env, dir, a, env.ssh_agent.clone())
+}
+
+fn git_with(
+    env: &Env,
+    dir: &Path,
+    a: &[&str],
+    extra: Option<(String, String)>,
+) -> Result<String, (String, bool)> {
     let mut all = args(&["-C", &dir.display().to_string()]);
     all.extend(args(a));
     let ceiling: Vec<(String, String)> = dir
@@ -1394,6 +1419,7 @@ fn git(env: &Env, dir: &Path, a: &[&str]) -> Result<String, (String, bool)> {
             )
         })
         .into_iter()
+        .chain(extra)
         .collect();
     let out = call(env.provider, "git", &all, &ceiling, env.timeouts.short)?;
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
@@ -1462,7 +1488,7 @@ fn fast_forward(
     // The fetch and the pull name the checked remote, so git cannot pick another one. `fetch`
     // moves only the remote-tracking refs. A local commit that is not on the upstream means the
     // copy diverged: `pull --ff-only` is not tried.
-    git(env, copy, &["fetch", "--quiet", &up.remote])?;
+    git_remote(env, copy, &["fetch", "--quiet", &up.remote])?;
     let n = git(env, copy, &["rev-list", "--count", "@{u}..HEAD"])?;
     if n != "0" {
         return Ok(Err(format!(
@@ -1470,7 +1496,7 @@ fn fast_forward(
             copy.display()
         )));
     }
-    git(
+    git_remote(
         env,
         copy,
         &["pull", "--ff-only", "--quiet", &up.remote, &up.merge],
@@ -1530,9 +1556,16 @@ fn checkouts(mut d: Draft, env: &Env) -> Row {
         // ls-remote --get-url` in the copy rewrites the declared url as `remote get-url` did
         // the upstream, and makes no network call.
         let declared = |up: &Upstream| {
-            let rewritten =
-                git(env, &c.path, &["ls-remote", "--get-url", &c.url]).map_err(|(why, _)| why);
-            match (git_id(&up.url), rewritten.and_then(|u| git_id(&u))) {
+            let rewritten = match git(env, &c.path, &["ls-remote", "--get-url", &c.url]) {
+                Ok(u) => git_id(&u),
+                Err((why, _)) => {
+                    return Some(format!(
+                        "{}: the declared {} could not be resolved with git ls-remote --get-url: {why}; not pulled",
+                        c.id, c.url
+                    ));
+                }
+            };
+            match (git_id(&up.url), rewritten) {
                 (Ok(a), Ok(b)) if a == b => (!c.owner_declared)
                     .then(|| {
                         untrusted(vec![git_id(&c.url)], env.grants)
@@ -1776,6 +1809,7 @@ mod tests {
         grants: Grants,
         checkouts: Vec<Result<Checkout, String>>,
         agents_declared: bool,
+        ssh_agent: Option<(String, String)>,
     }
 
     /// The registry remote that [`T::managed`] records, and its identity.
@@ -1837,6 +1871,7 @@ mod tests {
                 grants,
                 checkouts: vec![],
                 agents_declared: false,
+                ssh_agent: None,
             }
         }
 
@@ -1850,7 +1885,7 @@ mod tests {
             fs::write(
                 path,
                 format!(
-                    "#!/bin/sh\nPATH=/usr/bin:/bin\nst={st}\nprintf '%s %s | auto=%s deps=%s analytics=%s\\n' {name} \"$*\" \"${{HOMEBREW_NO_AUTO_UPDATE:-unset}}\" \"${{HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK:-unset}}\" \"${{HOMEBREW_NO_ANALYTICS:-unset}}\" >> {log}\n{body}\n",
+                    "#!/bin/sh\nPATH=/usr/bin:/bin\nst={st}\nprintf '%s %s | auto=%s deps=%s analytics=%s sock=%s\\n' {name} \"$*\" \"${{HOMEBREW_NO_AUTO_UPDATE:-unset}}\" \"${{HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK:-unset}}\" \"${{HOMEBREW_NO_ANALYTICS:-unset}}\" \"${{SSH_AUTH_SOCK:-unset}}\" >> {log}\n{body}\n",
                     st = self.root.join("st").display(),
                     log = log.display(),
                 ),
@@ -1872,6 +1907,7 @@ mod tests {
                 grants: &self.grants,
                 checkouts: &self.checkouts,
                 agents_declared: self.agents_declared,
+                ssh_agent: self.ssh_agent.clone(),
             }
         }
 
@@ -2157,6 +2193,23 @@ mod tests {
         let r = run(Updater::Checkouts, &t.env());
         assert_eq!(r.status, Status::Updated, "{r:?}");
         assert_eq!(r.notes[1], "ext a1b2c3d -> d4e5f6a", "{r:?}");
+    }
+
+    /// The manager's ssh-agent socket reaches the fetch and the pull, and no other git call.
+    #[test]
+    fn checkouts_pass_the_ssh_agent_to_the_fetch_and_the_pull_only() {
+        let mut t = T::new();
+        t.checkouts_git();
+        t.ssh_agent = Some(("SSH_AUTH_SOCK".into(), "/tmp/agent.sock".into()));
+        t.checkout("tpm", "a1b2c3d", "d4e5f6a");
+        let r = run(Updater::Checkouts, &t.env());
+        assert_eq!(r.status, Status::Updated, "{r:?}");
+        let log = t.log();
+        for line in log.lines() {
+            let remote = line.contains(" fetch ") || line.contains(" pull ");
+            assert_eq!(line.ends_with("sock=/tmp/agent.sock"), remote, "{line}");
+        }
+        assert!(log.contains(" fetch "), "{log}");
     }
 
     #[test]

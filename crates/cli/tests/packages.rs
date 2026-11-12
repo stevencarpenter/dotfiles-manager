@@ -152,7 +152,7 @@ echo "dpkg-query: no packages found matching $3" >&2; exit 1
 const FAKE_GIT: &str = r#"#!/bin/sh
 PATH=/usr/bin:/bin:$PATH
 here=$(dirname "$0")
-printf 'git %s | prompt=%s ceiling=%s\n' "$*" "${GIT_TERMINAL_PROMPT:-unset}" "${GIT_CEILING_DIRECTORIES:-unset}" >> "$here/../log"
+printf 'git %s | prompt=%s ceiling=%s sock=%s\n' "$*" "${GIT_TERMINAL_PROMPT:-unset}" "${GIT_CEILING_DIRECTORIES:-unset}" "${SSH_AUTH_SOCK:-unset}" >> "$here/../log"
 case "$1" in
   -C)
     d=$2; shift 2
@@ -1164,7 +1164,11 @@ fn assert_clone(fx: &Fx, prefix: &str) {
     let rest = log[0]
         .strip_prefix(&format!("{prefix} {tmp}"))
         .unwrap_or_else(|| panic!("{}", log[0]));
-    assert!(rest.ends_with("| prompt=0 ceiling=unset"), "{}", log[0]);
+    assert!(
+        rest.ends_with("| prompt=0 ceiling=unset sock=unset"),
+        "{}",
+        log[0]
+    );
 }
 
 #[test]
@@ -1212,6 +1216,31 @@ fn a_checkout_from_a_nested_source_is_cloned_only_with_a_grant() {
     let o = fx.packages(&digest_of(&fx.preview()));
     assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
     assert_clone(&fx, "git clone -- https://github.com/o/r.git");
+}
+
+/// The manager's ssh-agent socket reaches the clone, so a key held in an agent can clone.
+#[test]
+fn the_clone_gets_the_ssh_agent_socket() {
+    let fx = checkout_fx("git@github.com:o/r.git", "");
+    let digest = digest_of(&fx.preview());
+    let o = fx
+        .cmd(&["packages", "--root", fx.root_arg(), "--yes-plan", &digest])
+        .env("SSH_AUTH_SOCK", "/tmp/agent.sock")
+        .output()
+        .unwrap();
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+    let log = clones(&fx);
+    assert_eq!(log.len(), 1, "{}", fx.log());
+    assert!(log[0].ends_with("sock=/tmp/agent.sock"), "{}", log[0]);
+    // The probes get nothing.
+    assert!(
+        fx.log()
+            .lines()
+            .filter(|l| !l.starts_with("git clone"))
+            .all(|l| l.ends_with("sock=unset")),
+        "{}",
+        fx.log()
+    );
 }
 
 #[test]
