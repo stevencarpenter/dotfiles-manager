@@ -8,7 +8,7 @@ use dfm_model::state::Status;
 use dfm_model::updater::Updater;
 use dfm_model::{Code, Refusal};
 use std::collections::BTreeSet;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 /// How long each command may run.
@@ -38,6 +38,18 @@ pub struct Env<'a> {
     /// The grants that the `skills` and `agents` sources must hold (docs/upgrade.md, "Source
     /// trust").
     pub grants: &'a Grants,
+    /// The declared `git-checkout/v1` checkouts that the `checkouts` updater fast-forwards.
+    pub checkouts: &'a [Checkout],
+}
+
+/// A declared `git-checkout/v1` checkout.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Checkout {
+    /// The resource id.
+    pub id: String,
+    pub url: String,
+    /// The absolute checkout directory.
+    pub path: PathBuf,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -60,6 +72,7 @@ fn owner_dir(u: Updater) -> Option<&'static str> {
         Updater::Rustup => Some(".cargo/bin"),
         Updater::Agents
         | Updater::Brew
+        | Updater::Checkouts
         | Updater::Mise
         | Updater::Npm
         | Updater::SideChannels
@@ -201,6 +214,7 @@ pub fn run(u: Updater, env: &Env) -> Row {
     match u {
         Updater::Agents => agents(d, env),
         Updater::Brew => brew(d, env),
+        Updater::Checkouts => checkouts(d, env),
         Updater::Skills => {
             // As the preview says: a missing `mise` is blocked, not a failed command.
             if let Err(e) = env.provider.resolve("mise") {
@@ -324,6 +338,7 @@ pub fn second_copies(u: Updater, env: &Env) -> Vec<String> {
         Updater::Opencode => (Some("opencode"), None),
         Updater::Agents
         | Updater::Brew
+        | Updater::Checkouts
         | Updater::Mise
         | Updater::Npm
         | Updater::Rustup
@@ -1192,7 +1207,8 @@ fn untrusted(ids: Vec<Result<String, String>>, grants: &Grants) -> Vec<String> {
 /// Why the updater must not run because of its sources, one note each, or nothing. `skills`
 /// and the `agents` managed copy fetch extension sources, each global npm package runs its
 /// install scripts, and a uv tool from a git source is built from what it fetches: each such
-/// source needs a grant (DFM-25, C04). The `agents` working copy is never fetched, and the
+/// source needs a grant (DFM-25, C04), except an `agents` managed copy that is a declared
+/// checkout of the same repository. The `agents` working copy is never fetched, and the
 /// other updaters update a binary or packages from their owner: none of them is gated. An
 /// unreadable source record is one note. An updater with a note runs no command that fetches
 /// or installs.
@@ -1216,7 +1232,7 @@ pub fn trust_notes(u: Updater, env: &Env) -> Vec<String> {
                 return vec![];
             }
             match agents_upstream(env, &copy) {
-                Ok(Ok(up)) => untrusted(vec![git_id(&up.url)], env.grants),
+                Ok(Ok(up)) => agents_gate(env, &copy, &up).into_iter().collect(),
                 Ok(Err(why)) | Err((why, _)) => vec![why],
             }
         }
@@ -1358,6 +1374,118 @@ fn git(env: &Env, dir: &Path, a: &[&str]) -> Result<String, (String, bool)> {
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
+/// The note that blocks the pull of the `agents` managed copy, or none. The upstream's grant
+/// covers the pull and the registry's own install code. A declared checkout at the copy with the
+/// upstream's identity needs no grant: the owner declared it.
+fn agents_gate(env: &Env, copy: &Path, up: &Upstream) -> Option<String> {
+    let id = git_id(&up.url);
+    if let Ok(i) = &id
+        && env
+            .checkouts
+            .iter()
+            .any(|c| c.path == copy && git_id(&c.url).as_ref() == Ok(i))
+    {
+        return None;
+    }
+    // One identity gives at most one note.
+    untrusted(vec![id], env.grants).into_iter().next()
+}
+
+/// Fast-forwards the clean copy at `copy` from its upstream, after `gate` passed for that
+/// upstream. `before` gets the revision that is read first. `Ok(Ok(after))` is the revision
+/// after the pull. `Ok(Err)` is the blocked note (dirty, no upstream, the gate, or diverged),
+/// and nothing changed. `Err` is a command that did not succeed. Nothing here merges, resets
+/// or clones.
+fn fast_forward(
+    env: &Env,
+    copy: &Path,
+    before: &mut Option<String>,
+    gate: impl Fn(&Upstream) -> Option<String>,
+) -> Result<Result<String, String>, (String, bool)> {
+    // Read-only checks first: the revision and the dirty state.
+    *before = Some(git(env, copy, &["rev-parse", "--short", "HEAD"])?);
+    if !git(env, copy, &["status", "--porcelain"])?.is_empty() {
+        return Ok(Err(format!(
+            "managed copy {} has uncommitted changes; not pulled",
+            copy.display()
+        )));
+    }
+    // No upstream is a precondition, like a missing copy: nothing to fast-forward from.
+    let up = match agents_upstream(env, copy)? {
+        Ok(up) => up,
+        Err(why) => return Ok(Err(why)),
+    };
+    if let Some(why) = gate(&up) {
+        return Ok(Err(why));
+    }
+    // The fetch and the pull name the checked remote, so git cannot pick another one. `fetch`
+    // moves only the remote-tracking refs. A local commit that is not on the upstream means the
+    // copy diverged: `pull --ff-only` is not tried.
+    git(env, copy, &["fetch", "--quiet", &up.remote])?;
+    let n = git(env, copy, &["rev-list", "--count", "@{u}..HEAD"])?;
+    if n != "0" {
+        return Ok(Err(format!(
+            "managed copy {} has {n} local commits that are not on its upstream; not pulled",
+            copy.display()
+        )));
+    }
+    git(
+        env,
+        copy,
+        &["pull", "--ff-only", "--quiet", &up.remote, &up.merge],
+    )?;
+    git(env, copy, &["rev-parse", "--short", "HEAD"]).map(Ok)
+}
+
+/// The declared checkouts that the `checkouts` updater pulls: each one but the `agents` managed
+/// copy, which the `agents` updater pulls before its install.
+fn declared_checkouts<'e>(env: &'e Env) -> impl Iterator<Item = &'e Checkout> {
+    let agents = agents_copy(env).0;
+    env.checkouts.iter().filter(move |c| c.path != agents)
+}
+
+/// Fast-forwards each declared checkout, one note each. A blocked or failed checkout does not
+/// stop the others. The row is the worst of them: `failed`, then `blocked`, then `updated`,
+/// then `current`. A declared checkout needs no grant: the owner declared it.
+fn checkouts(mut d: Draft, env: &Env) -> Row {
+    if let Err(e) = env.provider.resolve("git") {
+        d.notes.push(e.detail);
+        return d.end(Status::Blocked);
+    }
+    let rank = |s: Status| match s {
+        Status::Failed => 3,
+        Status::Blocked => 2,
+        Status::Updated => 1,
+        _ => 0,
+    };
+    let mut status = Status::Current;
+    for c in declared_checkouts(env) {
+        if std::fs::symlink_metadata(c.path.join(".git")).is_err() {
+            d.notes.push(format!(
+                "{} is not cloned yet; the packages scope clones it",
+                c.path.display()
+            ));
+            continue;
+        }
+        let mut before = None;
+        let (note, s) = match fast_forward(env, &c.path, &mut before, |_| None) {
+            Ok(Ok(after)) => match before {
+                Some(b) if b != after => (format!("{} {b} -> {after}", c.id), Status::Updated),
+                _ => (format!("{} current at {after}", c.id), Status::Current),
+            },
+            Ok(Err(why)) => (why, Status::Blocked),
+            // A stop request starts no more commands.
+            Err((why, true)) => return d.stop((why, true)),
+            Err((why, false)) => (why, Status::Failed),
+        };
+        d.notes.push(note);
+        if rank(s) > rank(status) {
+            status = s;
+        }
+    }
+    d.end(status)
+}
+
 /// The agent registry: install from the working copy as it is, or fast-forward the managed copy
 /// and install from it. Nothing here merges, resets or clones: a missing, dirty or diverged
 /// managed copy is `blocked` before any change.
@@ -1381,16 +1509,15 @@ fn agents(mut d: Draft, env: &Env) -> Row {
         ));
         return d.end(Status::Blocked);
     }
-    // Read-only checks first: the revision and the dirty state.
-    match git(env, &copy, &["rev-parse", "--short", "HEAD"]) {
-        Ok(v) => d.before = Some(v),
-        Err(e) => return d.stop(e),
-    }
-    let dirty = match git(env, &copy, &["status", "--porcelain"]) {
-        Ok(s) => !s.is_empty(),
-        Err(e) => return d.stop(e),
-    };
     if working {
+        match git(env, &copy, &["rev-parse", "--short", "HEAD"]) {
+            Ok(v) => d.before = Some(v),
+            Err(e) => return d.stop(e),
+        }
+        let dirty = match git(env, &copy, &["status", "--porcelain"]) {
+            Ok(s) => !s.is_empty(),
+            Err(e) => return d.stop(e),
+        };
         d.notes.push(format!(
             "working copy {}{}; not pulled",
             copy.display(),
@@ -1402,54 +1529,12 @@ fn agents(mut d: Draft, env: &Env) -> Row {
         ));
         d.after = d.before.clone();
     } else {
-        if dirty {
-            d.notes.push(format!(
-                "managed copy {} has uncommitted changes; not pulled",
-                copy.display()
-            ));
-            return d.end(Status::Blocked);
-        }
-        // No upstream is a precondition, like a missing copy: nothing to fast-forward from.
-        let up = match agents_upstream(env, &copy) {
-            Ok(Ok(up)) => up,
+        match fast_forward(env, &copy, &mut d.before, |up| agents_gate(env, &copy, up)) {
+            Ok(Ok(after)) => d.after = Some(after),
             Ok(Err(why)) => {
                 d.notes.push(why);
                 return d.end(Status::Blocked);
             }
-            Err(e) => return d.stop(e),
-        };
-        // The upstream's grant covers the pull and the registry's own install code. The
-        // fetch and the pull name the checked remote, so git cannot pick another one.
-        let notes = untrusted(vec![git_id(&up.url)], env.grants);
-        if !notes.is_empty() {
-            d.notes.extend(notes);
-            return d.end(Status::Blocked);
-        }
-        // `fetch` moves only the remote-tracking refs. A local commit that is not on the
-        // upstream means the copy diverged: `pull --ff-only` is not tried.
-        if let Err(e) = git(env, &copy, &["fetch", "--quiet", &up.remote]) {
-            return d.stop(e);
-        }
-        match git(env, &copy, &["rev-list", "--count", "@{u}..HEAD"]) {
-            Ok(n) if n == "0" => {}
-            Ok(n) => {
-                d.notes.push(format!(
-                    "managed copy {} has {n} local commits that are not on its upstream; not pulled",
-                    copy.display()
-                ));
-                return d.end(Status::Blocked);
-            }
-            Err(e) => return d.stop(e),
-        }
-        if let Err(e) = git(
-            env,
-            &copy,
-            &["pull", "--ff-only", "--quiet", &up.remote, &up.merge],
-        ) {
-            return d.stop(e);
-        }
-        match git(env, &copy, &["rev-parse", "--short", "HEAD"]) {
-            Ok(v) => d.after = Some(v),
             Err(e) => return d.stop(e),
         }
     }
@@ -1484,6 +1569,23 @@ pub fn preview(u: Updater, env: &Env) -> String {
 
 fn preview_command(u: Updater, env: &Env) -> String {
     match u {
+        Updater::Checkouts => match env.provider.resolve("git") {
+            Err(e) => format!("blocked: {}", e.detail),
+            Ok(_) => {
+                let paths: Vec<String> = declared_checkouts(env)
+                    .map(|c| c.path.display().to_string())
+                    .collect();
+                if paths.is_empty() {
+                    "nothing declared".into()
+                } else {
+                    format!(
+                        "would fast-forward {} checkouts ({})",
+                        paths.len(),
+                        paths.join(", ")
+                    )
+                }
+            }
+        },
         Updater::Agents => {
             let (copy, working) = agents_copy(env);
             match agents_runner(env) {
@@ -1582,6 +1684,7 @@ mod tests {
         bin: PathBuf,
         runner: Runner,
         grants: Grants,
+        checkouts: Vec<Checkout>,
     }
 
     /// The registry remote that [`T::managed`] records, and its identity.
@@ -1641,6 +1744,7 @@ mod tests {
                 bin,
                 runner,
                 grants,
+                checkouts: vec![],
             }
         }
 
@@ -1674,6 +1778,7 @@ mod tests {
                 root: &self.dots,
                 timeouts: Timeouts::DEFAULT,
                 grants: &self.grants,
+                checkouts: &self.checkouts,
             }
         }
 
@@ -1847,6 +1952,196 @@ mod tests {
         assert!(trust_notes(Updater::Agents, &t.env()).is_empty());
         let r = run(Updater::Agents, &t.env());
         assert_eq!(r.status, Status::Current, "{r:?}");
+    }
+
+    impl T {
+        /// `git` for declared checkouts: each one is the directory `<home>/src/<id>`, and its
+        /// state is under `st/<id>`: `rev`, `rev-after` (copied over `rev` by `pull`),
+        /// `porcelain`, and `fail-<command>` that makes that command exit 2. The upstream is
+        /// `origin`, `refs/heads/main`, at `https://github.com/o/<id>.git`.
+        fn checkouts_git(&self) {
+            self.script(
+                &self.bin.join("git"),
+                "d=$(basename \"$2\")\n[ -f \"$st/$d/fail-$3\" ] && exit 2\ncase \"$3\" in\n  rev-parse) if [ \"$4\" = --abbrev-ref ]; then echo main; else cat \"$st/$d/rev\"; fi ;;\n  config) case \"$5\" in *.remote) echo origin ;; *) echo refs/heads/main ;; esac ;;\n  remote) echo \"https://github.com/o/$d.git\" ;;\n  status) cat \"$st/$d/porcelain\" 2>/dev/null || true ;;\n  fetch) exit 0 ;;\n  rev-list) echo 0 ;;\n  pull) cp \"$st/$d/rev-after\" \"$st/$d/rev\" ;;\n  *) exit 64 ;;\nesac",
+            );
+        }
+
+        /// A declared checkout `id`, cloned at `rev`, whose pull moves it to `rev_after`.
+        fn checkout(&mut self, id: &str, rev: &str, rev_after: &str) -> PathBuf {
+            let st = self.root.join("st").join(id);
+            fs::create_dir_all(&st).unwrap();
+            fs::write(st.join("rev"), rev).unwrap();
+            fs::write(st.join("rev-after"), rev_after).unwrap();
+            let path = self.home.join("src").join(id);
+            fs::create_dir_all(path.join(".git")).unwrap();
+            self.checkouts.push(Checkout {
+                id: id.into(),
+                url: format!("https://github.com/o/{id}.git"),
+                path: path.clone(),
+            });
+            path
+        }
+    }
+
+    /// The calls that fast-forward the checkout at `c` from `origin`.
+    fn checkout_calls(c: &Path) -> Vec<String> {
+        let c = c.display().to_string();
+        let mut v = upstream_calls(&c, "origin");
+        v.extend([
+            format!("git -C {c} fetch --quiet origin"),
+            format!("git -C {c} rev-list --count @{{u}}..HEAD"),
+            format!("git -C {c} pull --ff-only --quiet origin refs/heads/main"),
+            format!("git -C {c} rev-parse --short HEAD"),
+        ]);
+        v
+    }
+
+    #[test]
+    fn checkouts_fast_forwards_each_declared_checkout() {
+        let mut t = T::new();
+        t.checkouts_git();
+        // A declared checkout needs no grant.
+        t.grants = Grants::default();
+        let tpm = t.checkout("tpm", "a1b2c3d", "d4e5f6a");
+        let other = t.checkout("other", "a1b2c3d", "a1b2c3d");
+        assert_eq!(
+            preview(Updater::Checkouts, &t.env()),
+            format!(
+                "would fast-forward 2 checkouts ({}, {})",
+                tpm.display(),
+                other.display()
+            )
+        );
+        assert_eq!(t.log(), "");
+        let r = run(Updater::Checkouts, &t.env());
+        assert_eq!(r.status, Status::Updated, "{r:?}");
+        assert_eq!(
+            r.notes,
+            ["tpm a1b2c3d -> d4e5f6a", "other current at a1b2c3d"]
+        );
+        let mut want = checkout_calls(&tpm);
+        want.extend(checkout_calls(&other));
+        assert_eq!(t.calls(), want);
+    }
+
+    #[test]
+    fn checkouts_with_nothing_declared_is_current() {
+        let t = T::new();
+        assert_eq!(preview(Updater::Checkouts, &t.env()), "nothing declared");
+        let r = run(Updater::Checkouts, &t.env());
+        assert_eq!(r.status, Status::Current, "{r:?}");
+        assert_eq!(t.log(), "");
+    }
+
+    #[test]
+    fn one_dirty_checkout_does_not_stop_the_others() {
+        let mut t = T::new();
+        t.checkouts_git();
+        let dirty = t.checkout("dirty", "a1b2c3d", "d4e5f6a");
+        fs::write(t.root.join("st/dirty/porcelain"), " M x\n").unwrap();
+        let moved = t.checkout("moved", "a1b2c3d", "d4e5f6a");
+        let r = run(Updater::Checkouts, &t.env());
+        assert_eq!(r.status, Status::Blocked, "{r:?}");
+        assert_eq!(
+            r.notes,
+            [
+                format!(
+                    "managed copy {} has uncommitted changes; not pulled",
+                    dirty.display()
+                ),
+                "moved a1b2c3d -> d4e5f6a".to_string(),
+            ]
+        );
+        let d = dirty.display().to_string();
+        let mut want = upstream_calls(&d, "origin")[..2].to_vec();
+        want.extend(checkout_calls(&moved));
+        assert_eq!(t.calls(), want);
+    }
+
+    #[test]
+    fn a_checkout_not_cloned_yet_is_a_note() {
+        let mut t = T::new();
+        t.checkouts_git();
+        let path = t.checkout("tpm", "a1b2c3d", "d4e5f6a");
+        fs::remove_dir(path.join(".git")).unwrap();
+        let r = run(Updater::Checkouts, &t.env());
+        assert_eq!(r.status, Status::Current, "{r:?}");
+        assert_eq!(
+            r.notes,
+            [format!(
+                "{} is not cloned yet; the packages scope clones it",
+                path.display()
+            )]
+        );
+        assert_eq!(t.log(), "");
+    }
+
+    #[test]
+    fn checkouts_skips_the_agents_managed_copy() {
+        let mut t = T::new();
+        t.checkouts_git();
+        let copy = t.managed();
+        t.checkouts.push(Checkout {
+            id: "agent-registry".into(),
+            url: REGISTRY.into(),
+            path: copy,
+        });
+        let r = run(Updater::Checkouts, &t.env());
+        assert_eq!(r.status, Status::Current, "{r:?}");
+        assert!(r.notes.is_empty(), "{r:?}");
+        assert_eq!(t.log(), "");
+        assert_eq!(preview(Updater::Checkouts, &t.env()), "nothing declared");
+    }
+
+    #[test]
+    fn checkouts_failed_outranks_blocked_and_updated() {
+        let mut t = T::new();
+        t.checkouts_git();
+        t.checkout("broken", "a1b2c3d", "d4e5f6a");
+        fs::write(t.root.join("st/broken/fail-fetch"), "").unwrap();
+        let dirty = t.checkout("dirty", "a1b2c3d", "d4e5f6a");
+        fs::write(t.root.join("st/dirty/porcelain"), " M x\n").unwrap();
+        t.checkout("moved", "a1b2c3d", "d4e5f6a");
+        let r = run(Updater::Checkouts, &t.env());
+        assert_eq!(r.status, Status::Failed, "{r:?}");
+        assert!(
+            r.notes[0].contains("fetch --quiet origin exited 2"),
+            "{r:?}"
+        );
+        assert_eq!(
+            r.notes[1..],
+            [
+                format!(
+                    "managed copy {} has uncommitted changes; not pulled",
+                    dirty.display()
+                ),
+                "moved a1b2c3d -> d4e5f6a".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn agents_needs_no_grant_for_a_declared_copy() {
+        let mut t = T::new();
+        t.agents("abc1234", "def5678");
+        let copy = t.managed();
+        t.grants = Grants::default();
+        // Another spelling of the upstream url: the identities match.
+        t.checkouts.push(Checkout {
+            id: "agent-registry".into(),
+            url: "ssh://git@github.com/o/agents.git".into(),
+            path: copy.clone(),
+        });
+        assert!(trust_notes(Updater::Agents, &t.env()).is_empty());
+        assert!(preview(Updater::Agents, &t.env()).starts_with("would fast-forward "));
+        let r = run(Updater::Agents, &t.env());
+        assert_eq!(r.status, Status::Updated, "{r:?}");
+        // The same path declared with another repository keeps the grant check.
+        t.checkouts[0].url = "https://github.com/o/other.git".into();
+        t.agents("abc1234", "def5678");
+        let r = run(Updater::Agents, &t.env());
+        assert_eq!(r.status, Status::Blocked, "{r:?}");
+        assert!(r.notes[0].starts_with("E_SOURCE_UNTRUSTED: "), "{r:?}");
     }
 
     #[test]

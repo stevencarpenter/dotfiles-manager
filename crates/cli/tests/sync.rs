@@ -4306,6 +4306,52 @@ fn sync_fast_forwards_the_agent_registry_and_installs_from_the_bound_root() {
     );
 }
 
+/// DFM-25 (C01): a declared `git-checkout/v1` needs no grant. The first sync clones it in the
+/// packages scope; the next sync's `checkouts` row fast-forwards it with real git.
+#[test]
+fn sync_clones_a_declared_checkout_then_fast_forwards_it() {
+    let u = Up::new(r#"["checkouts"]"#);
+    let tool = Remote::new(u.fake.path(), "tool");
+    put(&tool.seed, "README", "v1\n");
+    tool.push("v1");
+    put(
+        &u.fx.upstream.seed,
+        "base/modules/extra/module.toml",
+        &format!(
+            "{}\n[[resources]]\nid = \"tool\"\nkind = \"package\"\nadapter = \"git-checkout/v1\"\n[resources.value]\nurl = \"{}\"\npath = \"x/tool\"\n",
+            common::EXTRA,
+            tool.origin()
+        ),
+    );
+    u.fx.upstream.push("declare the checkout");
+    let copy = u.fx.h("x/tool");
+    let o = u.sync(&[]);
+    assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
+    let before = git(&copy, &["rev-parse", "--short", "HEAD"]);
+    let s = stdout(&o);
+    assert!(s.contains("  current checkouts"), "{s}");
+    assert!(
+        s.contains(&format!("    note: extra.tool current at {before}")),
+        "{s}"
+    );
+    put(&tool.seed, "README", "v2\n");
+    tool.push("v2");
+    let after = git(&tool.bare, &["rev-parse", "--short", "refs/heads/main"]);
+    let o = u.sync(&[]);
+    assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
+    let s = stdout(&o);
+    assert!(
+        s.contains("  checkouts: would fast-forward 1 checkouts ("),
+        "{s}"
+    );
+    assert!(s.contains("  updated checkouts"), "{s}");
+    assert!(
+        s.contains(&format!("    note: extra.tool {before} -> {after}")),
+        "{s}"
+    );
+    assert_eq!(git(&copy, &["rev-parse", "--short", "HEAD"]), after);
+}
+
 /// DFM-25 (C04, G2, G6): without a grant for the registry origin, `agents` is a `blocked` row
 /// in the listing and in the run. Only read-only git runs: nothing is fetched or installed, and
 /// the rest of sync runs.

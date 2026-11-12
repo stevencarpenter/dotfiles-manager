@@ -9,7 +9,7 @@
 //! rebase, commit or push. A nested source is pinned to an exact commit, and the lock that holds
 //! the pin is never rewritten.
 
-use crate::adapters::{secret, updater};
+use crate::adapters::{checkout, secret, updater};
 use crate::plan_cmd::{plan_for, plan_with_outputs, render_body};
 use crate::read_fs::read_regular_bounded;
 use crate::source_fs::load_scoped;
@@ -1904,7 +1904,7 @@ fn run_inner(
     // The updaters, a blocked one included, are listed before any part runs (DFM-31.C02).
     let updaters = &loaded.resolved.updaters;
     if args.apply.preview || (args.upgrade && !updaters.is_empty()) {
-        upgrade_preview(ctx, &sys, (&root, &grants), args, updaters, out)?;
+        upgrade_preview(ctx, &sys, (&root, &grants), args, &loaded.resolved, out)?;
     }
     if args.apply.preview {
         return Ok(());
@@ -2222,12 +2222,14 @@ fn status_name(s: state::Status) -> String {
         .unwrap_or_default()
 }
 
-/// The updater environment: the provider runner, HOME, the bound checkout and the grants.
+/// The updater environment: the provider runner, HOME, the bound checkout, the grants and the
+/// declared checkouts.
 fn updater_env<'a>(
     ctx: &'a Ctx,
     runner: &'a Runner,
     root: &'a Path,
     grants: &'a Grants,
+    checkouts: &'a [updater::Checkout],
 ) -> updater::Env<'a> {
     updater::Env {
         provider: runner,
@@ -2235,7 +2237,25 @@ fn updater_env<'a>(
         root,
         timeouts: updater::Timeouts::DEFAULT,
         grants,
+        checkouts,
     }
+}
+
+/// The `git-checkout/v1` resources of the profile, each at HOME joined with its declared path.
+fn declared_checkouts(home: &Path, resolved: &Resolved) -> Result<Vec<updater::Checkout>, Refusal> {
+    resolved
+        .resources
+        .values()
+        .filter(|r| r.adapter == checkout::ADAPTER)
+        .map(|r| {
+            let d = checkout::declared(&r.value)?;
+            Ok(updater::Checkout {
+                id: r.id.clone(),
+                url: d.url,
+                path: home.join(d.path),
+            })
+        })
+        .collect()
 }
 
 /// The checkouts the tracked-file guard watches (DFM-25, G5): the bound checkout and each nested
@@ -2320,9 +2340,10 @@ fn upgrade_preview(
     sys: &Sys,
     (root, grants): (&Path, &Grants),
     args: &Args,
-    updaters: &[Updater],
+    resolved: &Resolved,
     out: &mut dyn Write,
 ) -> Result<(), Refusal> {
+    let updaters = &resolved.updaters;
     let w =
         |e: std::io::Error| Refusal::new(Code::IoFailed, format!("output failed: {}", e.kind()));
     if !args.upgrade {
@@ -2332,7 +2353,8 @@ fn upgrade_preview(
         return writeln!(out, "upgrade: none declared in the profile").map_err(w);
     }
     let runner = ctx.runner(sys);
-    let env = updater_env(ctx, &runner, root, grants);
+    let checkouts = declared_checkouts(ctx.platform.home(), resolved)?;
+    let env = updater_env(ctx, &runner, root, grants, &checkouts);
     writeln!(out, "{}", paint::label(ctx.color, "upgrade:")).map_err(w)?;
     for u in updaters {
         writeln!(
@@ -2389,10 +2411,10 @@ fn upgrade(
         return Err(crate::state_lost_refusal());
     }
     store.require_identity(binding)?;
-    let declared = resolve(&load_scoped(root, rel)?, rel, &builtin_catalog())?.updaters;
+    let resolved = resolve(&load_scoped(root, rel)?, rel, &builtin_catalog())?;
     let updaters: Vec<Updater> = reviewed
         .iter()
-        .filter(|u| declared.contains(u))
+        .filter(|u| resolved.updaters.contains(u))
         .copied()
         .collect();
     if updaters.is_empty() {
@@ -2405,7 +2427,8 @@ fn upgrade(
     let started = now_ns()?;
     let mut runner = ctx.runner(sys);
     runner.detach = true;
-    let env = updater_env(ctx, &runner, root, &grants);
+    let declared = declared_checkouts(ctx.platform.home(), &resolved)?;
+    let env = updater_env(ctx, &runner, root, &grants, &declared);
     // The tracked-file guard (DFM-25, G5): the tracked changes before the updaters, compared
     // after each one that ran. A change it made fails its row and stays in place.
     let git = Git::new(ctx, sys);
