@@ -720,7 +720,7 @@ fn uv_receipt(home: &Path, name: &str) -> Result<(dfm_model::resolve::Table, Str
 }
 
 /// Each package adapter and the pointer of the source it fetches from. That source needs no grant
-/// only when the bound checkout declared it ([`ScriptCx::owner_declared`], docs/sync.md,
+/// only when the bound checkout declared it ([`owner_source`], docs/sync.md,
 /// "Source identities"); otherwise its identity needs one. `None`: the adapter installs from its
 /// provider's registry, or its source always needs a grant (`script/v1`). A new package adapter
 /// must be listed here (`every_package_adapter_states_its_source_rule`).
@@ -734,12 +734,17 @@ pub(crate) const SOURCE_ADAPTERS: &[(&str, Option<&str>)] = &[
 ];
 
 /// Whether the bound checkout declared the source of `r` (its [`SOURCE_ADAPTERS`] pointer).
-pub(crate) fn owner_source(cx: &ScriptCx, r: &ResolvedResource) -> bool {
-    SOURCE_ADAPTERS
+/// `nested` holds the nested source paths of the lock (`sync_cmd::nested_paths`); `None`, an
+/// unreadable lock, is never the owner's.
+pub(crate) fn owner_source(nested: Option<&[String]>, r: &ResolvedResource) -> bool {
+    let pointer = SOURCE_ADAPTERS
         .iter()
         .find(|(a, _)| *a == r.adapter)
-        .and_then(|(_, p)| *p)
-        .is_some_and(|p| cx.owner_declared(r, p))
+        .and_then(|(_, p)| *p);
+    match (pointer, nested) {
+        (Some(p), Some(n)) => dfm_model::resolve::owner_declared(r, p, n),
+        _ => false,
+    }
 }
 
 /// `identity` when the source of `r` still needs a grant: the bound checkout did not declare it
@@ -749,7 +754,7 @@ pub(crate) fn ungranted(
     r: &ResolvedResource,
     identity: String,
 ) -> Result<Option<String>, Refusal> {
-    Ok((!owner_source(cx, r) && !cx.trusts(&identity)?).then_some(identity))
+    Ok((!owner_source(cx.nested(), r) && !cx.trusts(&identity)?).then_some(identity))
 }
 
 /// The re-check under the writer lock before a source is fetched: `E_SOURCE_UNTRUSTED` with the
@@ -827,7 +832,7 @@ pub(crate) fn uv_source(value: &Value, root: &Path) -> Result<Option<UvSource>, 
 fn checked_source(r: &ResolvedResource, cx: &ScriptCx) -> Result<UvSource, Refusal> {
     let text = source_text(&r.value).unwrap_or_default();
     let source = uv_source(&r.value, cx.root())?.ok_or_else(|| bad_source(text, "is missing"))?;
-    if matches!(source, UvSource::Path(_)) && !owner_source(cx, r) {
+    if matches!(source, UvSource::Path(_)) && !owner_source(cx.nested(), r) {
         return Err(bad_source(
             text,
             "comes from a nested source; a path source must be declared in the bound checkout",

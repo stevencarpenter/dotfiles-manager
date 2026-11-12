@@ -16,7 +16,7 @@ use dfm_model::digest::sha256_hex;
 use dfm_model::display::visible;
 use dfm_model::lock::{SCRIPT, script_url, trust_command};
 use dfm_model::plan::PackageState;
-use dfm_model::resolve::{ResolvedResource, Value};
+use dfm_model::resolve::Value;
 use dfm_model::state::{SHELLS, valid_path};
 use dfm_model::{Code, Refusal};
 use std::collections::BTreeMap;
@@ -191,12 +191,9 @@ impl ScriptCx {
         &self.root
     }
 
-    /// Whether the bound checkout declared `r` and its value at `pointer`
-    /// ([`dfm_model::resolve::owner_declared`]). An unreadable lock is never the owner's.
-    pub(crate) fn owner_declared(&self, r: &ResolvedResource, pointer: &str) -> bool {
-        self.nested
-            .as_deref()
-            .is_some_and(|n| dfm_model::resolve::owner_declared(r, pointer, n))
+    /// The nested source paths of the lock at the bound checkout, `None` for an unreadable lock.
+    pub(crate) fn nested(&self) -> Option<&[String]> {
+        self.nested.as_deref()
     }
 
     /// Whether `identity` has a grant.

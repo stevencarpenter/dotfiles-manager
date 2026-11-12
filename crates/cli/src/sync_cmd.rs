@@ -2244,17 +2244,22 @@ fn updater_env<'a>(
 
 /// The `git-checkout/v1` resources of the profile. A declaration that is not valid, or one at or
 /// inside a source checkout in `sources` (sync fast-forwards those), is a note of the
-/// `checkouts` row, so the other updaters still run.
+/// `checkouts` row, so the other updaters still run. `nested` holds the nested source paths of
+/// the lock (`nested_paths`), which decide whether the bound checkout declared each one.
 fn declared_checkouts(
     home: &Path,
     resolved: &Resolved,
     sources: &[PathBuf],
+    nested: Option<&[String]>,
 ) -> Vec<Result<updater::Checkout, String>> {
     resolved
         .resources
         .values()
         .filter(|r| r.adapter == checkout::ADAPTER)
-        .map(|r| declared_checkout(home, &r.id, &r.value, sources))
+        .map(|r| {
+            let owner = crate::adapters::package::owner_source(nested, r);
+            declared_checkout(home, &r.id, &r.value, sources, owner)
+        })
         .collect()
 }
 
@@ -2264,6 +2269,7 @@ fn declared_checkout(
     id: &str,
     value: &dfm_model::resolve::Value,
     sources: &[PathBuf],
+    owner_declared: bool,
 ) -> Result<updater::Checkout, String> {
     let d = checkout::declared(value).map_err(|e| format!("{id}: {}", e.detail))?;
     let path = home.join(d.path);
@@ -2278,6 +2284,7 @@ fn declared_checkout(
         id: id.to_string(),
         url: d.url,
         path,
+        owner_declared,
     })
 }
 
@@ -2388,7 +2395,12 @@ fn upgrade_preview(
     }
     let runner = ctx.runner(sys);
     // A declared checkout at a source checkout is left to sync's own fast-forward.
-    let checkouts = declared_checkouts(ctx.platform.home(), resolved, &guarded_checkouts(root)?);
+    let checkouts = declared_checkouts(
+        ctx.platform.home(),
+        resolved,
+        &guarded_checkouts(root)?,
+        nested_paths(root).as_deref(),
+    );
     let agents = updaters.contains(&Updater::Agents);
     let env = updater_env(ctx, &runner, root, grants, (&checkouts, agents));
     writeln!(out, "{}", paint::label(ctx.color, "upgrade:")).map_err(w)?;
@@ -2464,7 +2476,12 @@ fn upgrade(
     let mut runner = ctx.runner(sys);
     runner.detach = true;
     let checkouts = guarded_checkouts(root)?;
-    let declared = declared_checkouts(ctx.platform.home(), &resolved, &checkouts);
+    let declared = declared_checkouts(
+        ctx.platform.home(),
+        &resolved,
+        &checkouts,
+        nested_paths(root).as_deref(),
+    );
     let agents = updaters.contains(&Updater::Agents);
     let env = updater_env(ctx, &runner, root, &grants, (&declared, agents));
     // The tracked-file guard (DFM-25, G5): the tracked changes before the updaters, compared
@@ -2620,14 +2637,21 @@ mod tests {
             )
         };
         assert_eq!(
-            declared_checkout(home, "extra.r", &value("https://github.com/o/r.git"), &[]),
+            declared_checkout(
+                home,
+                "extra.r",
+                &value("https://github.com/o/r.git"),
+                &[],
+                true
+            ),
             Ok(updater::Checkout {
                 id: "extra.r".into(),
                 url: "https://github.com/o/r.git".into(),
                 path: home.join("x/r"),
+                owner_declared: true,
             })
         );
-        let e = declared_checkout(home, "extra.bad", &value("o/r"), &[]).unwrap_err();
+        let e = declared_checkout(home, "extra.bad", &value("o/r"), &[], true).unwrap_err();
         assert!(e.starts_with("extra.bad: url "), "{e}");
     }
 
@@ -2646,6 +2670,7 @@ mod tests {
                 "extra.r",
                 &v,
                 &[home.join("dots"), home.join("ext/nested")],
+                true,
             )
         };
         for path in ["dots", "dots/sub", "ext/nested"] {

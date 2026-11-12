@@ -54,6 +54,9 @@ pub struct Checkout {
     pub url: String,
     /// The absolute checkout directory.
     pub path: PathBuf,
+    /// The bound checkout declared it and its url (`dfm_model::resolve::owner_declared`): then
+    /// its url needs no grant.
+    pub owner_declared: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1397,8 +1400,8 @@ fn git(env: &Env, dir: &Path, a: &[&str]) -> Result<String, (String, bool)> {
 }
 
 /// The note that blocks the pull of the `agents` managed copy, or none. The upstream's grant
-/// covers the pull and the registry's own install code. A declared checkout at the copy with the
-/// upstream's identity needs no grant: the owner declared it.
+/// covers the pull and the registry's own install code. A checkout that the bound checkout
+/// declared at the copy with the upstream's identity needs no grant.
 fn agents_gate(env: &Env, copy: &Path, up: &Upstream) -> Option<String> {
     let id = git_id(&up.url);
     if let Ok(i) = &id
@@ -1406,7 +1409,7 @@ fn agents_gate(env: &Env, copy: &Path, up: &Upstream) -> Option<String> {
             .checkouts
             .iter()
             .flatten()
-            .any(|c| c.path == copy && git_id(&c.url).as_ref() == Ok(i))
+            .any(|c| c.owner_declared && c.path == copy && git_id(&c.url).as_ref() == Ok(i))
     {
         return None;
     }
@@ -1473,8 +1476,9 @@ fn declared_checkouts<'e>(env: &'e Env) -> impl Iterator<Item = &'e Checkout> {
 
 /// Fast-forwards each declared checkout, one note each. A blocked or failed checkout does not
 /// stop the others. The row is the worst of them: `failed`, then `blocked`, then `updated`,
-/// then `current`. A declared checkout needs no grant: the owner declared it. Its upstream must
-/// have the declared url's identity, else it is blocked.
+/// then `current`. A checkout that the bound checkout declared needs no grant; one that a nested
+/// source declared needs a grant for its url. Its upstream must have the declared url's
+/// identity, else it is blocked.
 fn checkouts(mut d: Draft, env: &Env) -> Row {
     if let Err(e) = env.provider.resolve("git") {
         d.notes.push(e.detail);
@@ -1507,9 +1511,12 @@ fn checkouts(mut d: Draft, env: &Env) -> Row {
             continue;
         }
         let mut before = None;
-        // No grant: the owner declared the url. The upstream must fetch from that url.
+        // The upstream must fetch from the declared url, which needs a grant unless the bound
+        // checkout declared it.
         let declared = |up: &Upstream| match (git_id(&up.url), git_id(&c.url)) {
-            (Ok(a), Ok(b)) if a == b => None,
+            (Ok(a), Ok(b)) if a == b => (!c.owner_declared)
+                .then(|| untrusted(vec![Ok(b)], env.grants).into_iter().next())
+                .flatten(),
             _ => Some(format!(
                 "{}: {} fetches {}, not the declared {}; not pulled",
                 c.id,
@@ -2041,6 +2048,7 @@ mod tests {
                 id: id.into(),
                 url: format!("https://github.com/o/{id}.git"),
                 path: path.clone(),
+                owner_declared: true,
             }));
             path
         }
@@ -2085,6 +2093,43 @@ mod tests {
         let mut want = checkout_calls(&tpm);
         want.extend(checkout_calls(&other));
         assert_eq!(t.calls(), want);
+    }
+
+    /// A checkout that a nested source declares needs a grant for its url (docs/sync.md,
+    /// "Source identities"); the other checkouts still run.
+    #[test]
+    fn checkouts_needs_a_grant_for_a_nested_declaration() {
+        let mut t = T::new();
+        t.checkouts_git();
+        t.grants = Grants::default();
+        t.checkout("tpm", "a1b2c3d", "d4e5f6a");
+        let ext = t.checkout("ext", "a1b2c3d", "d4e5f6a");
+        t.checkouts[1].as_mut().unwrap().owner_declared = false;
+        let r = run(Updater::Checkouts, &t.env());
+        assert_eq!(r.status, Status::Blocked, "{r:?}");
+        assert_eq!(
+            r.notes,
+            [
+                "tpm a1b2c3d -> d4e5f6a".to_string(),
+                format!(
+                    "E_SOURCE_UNTRUSTED: no grant for https://github.com/o/ext; review it, then run {}",
+                    trust_command("https://github.com/o/ext")
+                )
+            ]
+        );
+        // Nothing was fetched for the nested declaration.
+        assert!(
+            !t.calls()
+                .iter()
+                .any(|c| c.starts_with(&format!("git -C {} fetch", ext.display()))),
+            "{:?}",
+            t.calls()
+        );
+        t.grants
+            .grant("https://github.com/o/ext", "2026-11-12T00:00:00Z");
+        let r = run(Updater::Checkouts, &t.env());
+        assert_eq!(r.status, Status::Updated, "{r:?}");
+        assert_eq!(r.notes[1], "ext a1b2c3d -> d4e5f6a", "{r:?}");
     }
 
     #[test]
@@ -2149,6 +2194,7 @@ mod tests {
             id: "agent-registry".into(),
             url: REGISTRY.into(),
             path: copy,
+            owner_declared: true,
         }));
         let r = run(Updater::Checkouts, &t.env());
         assert_eq!(r.status, Status::Current, "{r:?}");
@@ -2170,6 +2216,7 @@ mod tests {
             id: "agent-registry".into(),
             url: "https://github.com/o/agent-registry.git".into(),
             path: copy.clone(),
+            owner_declared: true,
         }));
         assert_eq!(
             preview(Updater::Checkouts, &t.env()),
@@ -2315,6 +2362,7 @@ mod tests {
             id: "agent-registry".into(),
             url: "ssh://git@github.com/o/agents.git".into(),
             path: copy.clone(),
+            owner_declared: true,
         }));
         assert!(trust_notes(Updater::Agents, &t.env()).is_empty());
         assert!(preview(Updater::Agents, &t.env()).starts_with("would fast-forward "));
@@ -2326,6 +2374,26 @@ mod tests {
         let r = run(Updater::Agents, &t.env());
         assert_eq!(r.status, Status::Blocked, "{r:?}");
         assert!(r.notes[0].starts_with("E_SOURCE_UNTRUSTED: "), "{r:?}");
+    }
+
+    /// The `agents` grant skip holds only for a copy the bound checkout declared.
+    #[test]
+    fn agents_needs_a_grant_for_a_copy_a_nested_source_declares() {
+        let mut t = T::new();
+        t.agents("abc1234", "def5678");
+        let copy = t.managed();
+        t.grants = Grants::default();
+        t.checkouts.push(Ok(Checkout {
+            id: "agent-registry".into(),
+            url: "ssh://git@github.com/o/agents.git".into(),
+            path: copy,
+            owner_declared: false,
+        }));
+        let notes = trust_notes(Updater::Agents, &t.env());
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert!(notes[0].starts_with("E_SOURCE_UNTRUSTED: "), "{notes:?}");
+        let r = run(Updater::Agents, &t.env());
+        assert_eq!(r.status, Status::Blocked, "{r:?}");
     }
 
     #[test]
