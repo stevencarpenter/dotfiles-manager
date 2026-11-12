@@ -729,6 +729,88 @@ pub(crate) fn owner_source(nested: Option<&[String]>, r: &ResolvedResource) -> b
     }
 }
 
+/// The source identity that a backend-qualified `mise/v1` name fetches from, or `None` for a
+/// registry name (no `<backend>:`). `github:o/r` and `ubi:o/r` are the repository
+/// (`https://github.com/o/r`), `npm:<name>` is `npm:<name>`; a trailing `@<version>` is not part
+/// of it. Any other backend is `E_SOURCE_UNTRUSTED`: only these three map to one identity.
+fn mise_identity(name: &str) -> Result<Option<String>, Refusal> {
+    let Some((backend, rest)) = name.split_once(':') else {
+        return Ok(None);
+    };
+    // `npm:@scope/x` starts with `@`; only a later `@` is a version.
+    let rest = match rest.rfind('@') {
+        Some(i) if i > 0 => &rest[..i],
+        _ => rest,
+    };
+    let untrusted = |why: &str| {
+        Refusal::new(
+            Code::SourceUntrusted,
+            format!("mise/v1 tool {}: {why}", dfm_model::display::visible(name)),
+        )
+    };
+    let source = match backend {
+        "github" | "ubi" => rest.to_string(),
+        "npm" => format!("{}{rest}", dfm_model::lock::NPM),
+        _ => {
+            return Err(untrusted(
+                "a nested source may declare only registry names or github:, ubi: or npm: mise tools",
+            ));
+        }
+    };
+    dfm_model::lock::source_identity(&source, cfg!(feature = "test-isolation"))
+        .map(Some)
+        .map_err(|e| untrusted(&e.detail))
+}
+
+/// The state of a `mise/v1` tool that the bound checkout did not declare: a backend-qualified
+/// name that would be installed or rolled needs a grant for its source (`Ungranted`), and a
+/// backend without one identity is `Unofficial`. A registry name, the bound checkout's own tool,
+/// and any state without `cx` are kept as they are.
+pub(crate) fn mise_gated(
+    cx: Option<&ScriptCx>,
+    r: &ResolvedResource,
+    state: PackageState,
+) -> Result<PackageState, Refusal> {
+    let gated = matches!(state, PackageState::Missing(_) | PackageState::Rolling(_));
+    let Some(cx) = cx.filter(|_| r.adapter == MISE && gated) else {
+        return Ok(state);
+    };
+    if owner_source(cx.nested(), r) {
+        return Ok(state);
+    }
+    Ok(match mise_identity(&name(&r.value)?) {
+        Ok(None) => state,
+        Ok(Some(id)) => ungranted(cx, r, id)?.map_or(state, PackageState::Ungranted),
+        Err(e) => PackageState::Unofficial(e.detail),
+    })
+}
+
+/// The re-check under the writer lock before `mise install` or an upgrade of a backend-qualified
+/// name that the bound checkout did not declare ([`source_gate`]). Without `cx` such a name is
+/// not installed.
+pub(crate) fn mise_gate(cx: Option<&ScriptCx>, r: &ResolvedResource) -> Result<(), Refusal> {
+    if r.adapter != MISE {
+        return Ok(());
+    }
+    let n = name(&r.value)?;
+    if !n.contains(':') {
+        return Ok(());
+    }
+    let cx = cx.ok_or_else(|| {
+        Refusal::new(
+            Code::GeneratorUnavailable,
+            format!("no source context for the mise/v1 tool {n}"),
+        )
+    })?;
+    if owner_source(cx.nested(), r) {
+        return Ok(());
+    }
+    match mise_identity(&n)? {
+        Some(id) => source_gate(cx, r, id),
+        None => Ok(()),
+    }
+}
+
 /// `identity` when the source of `r` still needs a grant: the bound checkout did not declare it
 /// and `identity` has none.
 pub(crate) fn ungranted(
@@ -1625,7 +1707,7 @@ fn facts(
                 uv_source_probe(runner, r, scripts)
             }
         } else {
-            look(runner, &r.adapter, &r.value)
+            look(runner, &r.adapter, &r.value).and_then(|s| mise_gated(scripts, r, s))
         };
         let state = match looked {
             Ok(s) => s,
@@ -1640,6 +1722,25 @@ fn facts(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_mise_backend_name_maps_to_the_identity_it_fetches_from() {
+        for (n, want) in [
+            ("duckdb", None),
+            ("duckdb@1.2", None),
+            ("github:o/r", Some("https://github.com/o/r")),
+            ("ubi:o/r@v1.2.3", Some("https://github.com/o/r")),
+            ("npm:prettier@3", Some("npm:prettier")),
+            ("npm:@scope/x@1.2", Some("npm:@scope/x")),
+            ("npm:@scope/x", Some("npm:@scope/x")),
+        ] {
+            assert_eq!(mise_identity(n).unwrap().as_deref(), want, "{n}");
+        }
+        for n in ["aqua:o/r", "cargo:x", "core:node", "github:o"] {
+            let e = mise_identity(n).unwrap_err();
+            assert_eq!(e.code, Code::SourceUntrusted, "{n}: {e}");
+        }
+    }
 
     /// A new package adapter must state its source rule, so it cannot skip the grant of a
     /// source that a nested source declares (docs/sync.md, "Source identities").

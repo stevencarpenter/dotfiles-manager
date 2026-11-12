@@ -1133,6 +1133,78 @@ fn a_provider_that_cannot_answer_blocks_and_the_flags_of_apply_are_refused() {
     }
 }
 
+/// A module whose only resource is the `mise/v1` tool `name`.
+fn mise_fx(name: &str) -> Fx {
+    let fx = Fx::new();
+    fx.put(
+        "base/modules/extra/module.toml",
+        &format!(
+            "schema = 1\nid = \"extra\"\nplatforms = [\"macos\", \"linux\"]\nrequires = []\n\n[[resources]]\nid = \"t\"\nkind = \"package\"\nadapter = \"mise/v1\"\n[resources.value]\nname = \"{name}\"\nupdate_policy = \"rolling\"\n"
+        ),
+    );
+    fx
+}
+
+fn mise_installs(fx: &Fx) -> usize {
+    fx.log()
+        .lines()
+        .filter(|l| l.starts_with("mise install"))
+        .count()
+}
+
+/// A backend-qualified mise tool from a nested source fetches from its backend: it needs a
+/// grant for that source, for an install and for `--update` (docs/sync.md, "Source identities").
+#[test]
+fn a_nested_github_mise_tool_installs_only_with_a_grant() {
+    let fx = mise_fx("github:o/tool");
+    let module = fs::read_to_string(fx.root.join("base/modules/extra/module.toml")).unwrap();
+    common::nest_extra(&fx.root, &module);
+    for flags in [&[][..], &["--update"][..]] {
+        let mut a = vec!["packages", "--root", fx.root_arg(), "--preview"];
+        a.extend_from_slice(flags);
+        let o = fx.run(&a);
+        let t = format!("{}{}", text(&o.stdout), stderr(&o));
+        assert_eq!(code(&o), 3, "{flags:?}: {t}");
+        assert!(t.contains("E_SOURCE_UNTRUSTED"), "{t}");
+        assert!(
+            t.contains("dfm sync --trust-origin 'https://github.com/o/tool'"),
+            "{t}"
+        );
+    }
+    assert_eq!(mise_installs(&fx), 0, "{}", fx.log());
+    common::grant_aside(&fx.root, "https://github.com/o/tool", |a| fx.run(a));
+    let o = fx.packages(&digest_of(&fx.preview()));
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+    assert_eq!(mise_installs(&fx), 1, "{}", fx.log());
+}
+
+#[test]
+fn a_nested_mise_tool_of_another_backend_is_refused() {
+    let fx = mise_fx("aqua:o/tool");
+    let module = fs::read_to_string(fx.root.join("base/modules/extra/module.toml")).unwrap();
+    common::nest_extra(&fx.root, &module);
+    let o = fx.preview();
+    let t = format!("{}{}", text(&o.stdout), stderr(&o));
+    assert_eq!(code(&o), 3, "{t}");
+    assert!(t.contains("E_SOURCE_UNTRUSTED"), "{t}");
+    assert!(
+        t.contains(
+            "a nested source may declare only registry names or github:, ubi: or npm: mise tools"
+        ),
+        "{t}"
+    );
+    assert_eq!(mise_installs(&fx), 0, "{}", fx.log());
+}
+
+/// The bound checkout's own backend-qualified tool is unchanged: no grant.
+#[test]
+fn a_root_github_mise_tool_installs_without_a_grant() {
+    let fx = mise_fx("github:o/tool");
+    let o = fx.packages(&digest_of(&fx.preview()));
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+    assert_eq!(mise_installs(&fx), 1, "{}", fx.log());
+}
+
 const CHECKOUT_OP: &str = "extra.r@package";
 
 /// A module whose only resource is a `git-checkout/v1` of `url` at `x/r`, plus `extra` fields.

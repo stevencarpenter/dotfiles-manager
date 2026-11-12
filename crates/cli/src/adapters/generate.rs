@@ -285,10 +285,13 @@ impl Generator for Generators<'_> {
             } else {
                 package::uv_source_probe(runner, r, self.scripts.as_ref())
             }
-        } else if op.action == Action::Upgrade {
-            package::maintain(runner, &op.adapter, value)
         } else {
-            package::probe(runner, &op.adapter, value)
+            let state = if op.action == Action::Upgrade {
+                package::maintain(runner, &op.adapter, value)?
+            } else {
+                package::probe(runner, &op.adapter, value)?
+            };
+            package::mise_gated(self.scripts.as_ref(), r, state)
         }
     }
 
@@ -325,10 +328,13 @@ impl Generator for Generators<'_> {
             } else {
                 package::uv_source_install(runner, r, cx)
             }
-        } else if op.action == Action::Upgrade {
-            package::upgrade(runner, &op.adapter, value)
         } else {
-            package::install(runner, &op.adapter, value)
+            package::mise_gate(self.scripts.as_ref(), r)?;
+            if op.action == Action::Upgrade {
+                package::upgrade(runner, &op.adapter, value)
+            } else {
+                package::install(runner, &op.adapter, value)
+            }
         }
     }
 
