@@ -2732,6 +2732,31 @@ mod tests {
         assert!(at("ext2").is_ok());
     }
 
+    /// No lock has no nested source; a lock that cannot be read gives `None`, so nothing counts
+    /// as the bound checkout's; a valid lock gives its nested paths.
+    #[test]
+    fn nested_paths_fail_closed_on_an_unreadable_lock() {
+        let root = std::env::temp_dir().join(format!("dfm-sync-lock-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let none = nested_paths(&root);
+        fs::write(root.join(LOCK_FILE), "schema = [").unwrap();
+        let bad = nested_paths(&root);
+        fs::write(
+            root.join(LOCK_FILE),
+            format!(
+                "[[sources]]\nid = \"r\"\nkind = \"git\"\norigin = \"https://github.com/o/d\"\nref = \"refs/heads/main\"\n\n[[sources]]\nid = \"e\"\nkind = \"git\"\norigin = \"https://github.com/o/e\"\nref = \"refs/heads/main\"\ncommit = \"{}\"\npath = \"base/ext\"\n",
+                "a".repeat(40)
+            ),
+        )
+        .unwrap();
+        let good = nested_paths(&root);
+        let _ = fs::remove_dir_all(&root);
+        assert_eq!(none, Some(Vec::new()));
+        assert_eq!(bad, None);
+        assert_eq!(good, Some(vec!["base/ext".to_string()]));
+    }
+
     /// A source checkout's git never ignores a path in these tests.
     fn never(_: &Path, _: &Path) -> bool {
         false

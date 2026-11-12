@@ -4485,6 +4485,72 @@ fn a_checkout_in_an_ignored_directory_of_the_bound_checkout_is_pulled() {
     }
 }
 
+/// A checkout that a nested source declares needs a grant for its url: sync's `checkouts` row is
+/// blocked with the `--trust-origin` command, and nothing is fetched (docs/sync.md, "Source
+/// identities").
+#[test]
+fn a_checkout_that_a_nested_source_declares_is_blocked_without_a_grant() {
+    let u = Up::new(r#"["checkouts"]"#);
+    let tool = Remote::new(u.fake.path(), "tool");
+    put(&tool.seed, "README", "v1\n");
+    tool.push("v1");
+    // Cloned by hand, so the row reaches the grant check.
+    let copy = u.fx.h("x/tool");
+    fs::create_dir_all(copy.parent().unwrap()).unwrap();
+    git(
+        u.fake.path(),
+        &["clone", "-q", &tool.origin(), copy.to_str().unwrap()],
+    );
+    put(&tool.seed, "README", "v2\n");
+    tool.push("v2");
+    let before = git(&copy, &["rev-parse", "--short", "HEAD"]);
+    let ext = Remote::new(u.fx.work.path(), "ext");
+    put(
+        &ext.seed,
+        "modules/work/module.toml",
+        &format!(
+            "{WORK}\n[[resources]]\nid = \"tool\"\nkind = \"package\"\nadapter = \"git-checkout/v1\"\n[resources.value]\nurl = \"{}\"\npath = \"x/tool\"\n",
+            tool.origin()
+        ),
+    );
+    put(&ext.seed, "modules/work/files/profile", "work=1\n");
+    let pin = ext.push("ext initial");
+    let seed = &u.fx.upstream.seed;
+    put(seed, "base/bundle.toml", BUNDLE_WITH_EXT);
+    put(
+        seed,
+        "profiles/t-01.toml",
+        &format!(
+            "{}updaters = [\"checkouts\"]\n",
+            common::PROFILE.replace("modules = [\"extra\"]", "modules = [\"extra\", \"work\"]")
+        ),
+    );
+    put(
+        seed,
+        "dotfiles-manager.lock",
+        &lock_for(&[
+            (&u.fx.origin(), None, "."),
+            (&ext.origin(), Some(&pin), "base/ext"),
+        ]),
+    );
+    u.fx.upstream.push("add the ext source");
+    u.fx.trust(&ext.origin());
+    let o = u.sync(&[]);
+    assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
+    let s = stdout(&o);
+    assert!(s.contains("  blocked checkouts"), "{s}");
+    assert!(
+        s.contains(&format!(
+            "    note: E_SOURCE_UNTRUSTED: no grant for {}; review it, then run dfm sync --trust-origin '{}'",
+            tool.origin(),
+            tool.origin()
+        )),
+        "{s}"
+    );
+    assert!(!copy.join(".git/FETCH_HEAD").exists());
+    assert_eq!(git(&copy, &["rev-parse", "--short", "HEAD"]), before);
+}
+
 /// DFM-25 (C04, G2, G6): without a grant for the registry origin, `agents` is a `blocked` row
 /// in the listing and in the run. Only read-only git runs: nothing is fetched or installed, and
 /// the rest of sync runs.
