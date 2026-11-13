@@ -236,7 +236,10 @@ impl Runner {
             return Err(refused(format!("argument {bad:?} holds a NUL byte")));
         }
         let mut cmd = Command::new(&program);
-        cmd.args(req.args)
+        // The checked canonical path runs under the requested name, as from a shell: a
+        // multi-call binary such as the rustup proxy picks its role from argv0.
+        cmd.arg0(req.program)
+            .args(req.args)
             .env_clear()
             .env("PATH", self.joined_path())
             .env("HOME", &self.home)

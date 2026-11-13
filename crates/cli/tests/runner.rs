@@ -279,6 +279,35 @@ fn every_resolve_check_refuses_and_a_symlinked_search_dir_is_compared_canonicall
 }
 
 #[test]
+fn a_program_reached_through_a_link_gets_its_requested_name_as_argv0() {
+    // A multi-call binary (the rustup proxy at ~/.cargo/bin/cargo) picks its role from argv0;
+    // the checked canonical path runs, but under the name the caller asked for, as a shell does.
+    let d = scratch("argv0");
+    let bin = d.join("bin");
+    // A compiled program prints its argv0: a script would see its path from the kernel, and a
+    // copied system binary may not run. `cc` is the linker of this build, so it is present.
+    let src = d.join("argv0.c");
+    std::fs::write(
+        &src,
+        "#include <stdio.h>\nint main(int c, char **v) { puts(v[0]); return 0; }\n",
+    )
+    .unwrap();
+    let real = bin.join("multi-call");
+    let cc = std::process::Command::new("cc")
+        .arg(&src)
+        .arg("-o")
+        .arg(&real)
+        .status()
+        .unwrap();
+    assert!(cc.success());
+    std::os::unix::fs::symlink("multi-call", bin.join("tool")).unwrap();
+    let out = runner(&bin).run(&req(&[], None, 5)).unwrap();
+    assert!(out.success(), "{out:?}");
+    assert_eq!(String::from_utf8(out.stdout).unwrap().trim(), "tool");
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
 fn a_working_directory_that_is_not_a_plain_directory_and_a_nul_argument_are_refused() {
     let d = scratch("cwd");
     script(&d.join("bin"), "tool", "echo ran > ran");
