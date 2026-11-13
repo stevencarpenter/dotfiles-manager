@@ -562,15 +562,22 @@ fn check_live(git: &Git, live: &str) -> Result<(), Refusal> {
 /// origin (`scheme://`) and no staging path (`/...`) can equal. `branch.*` reaches no fetch,
 /// fast-forward or detached checkout.
 fn config_key_allowed(key: &str) -> bool {
-    const PLAIN: [&str; 8] = [
+    const PLAIN: [&str; 13] = [
         "core.repositoryformatversion",
         "core.filemode",
         "core.bare",
         "core.logallrefupdates",
         "core.ignorecase",
         "core.precomposeunicode",
+        // `git init` writes it on some file systems; it only picks a link or a plain file.
+        "core.symlinks",
         "user.name",
         "user.email",
+        // Notes rewriting runs on `commit --amend` and `rebase` only, never on a fetch or a pull.
+        "notes.rewritemode",
+        "notes.rewriteref",
+        "notes.rewrite.amend",
+        "notes.rewrite.rebase",
     ];
     if PLAIN.contains(&key) {
         return true;
@@ -598,7 +605,7 @@ fn config_key_allowed(key: &str) -> bool {
 /// whatever `include.path` names), which the scrubbed environment cannot remove. A key there
 /// can send a fetch elsewhere (`url.*.insteadOf`, `remote.*.proxy`, `http.*`), run a command
 /// (`credential.helper`, `core.sshCommand`, `core.gitProxy`, `core.askPass`, `alias.*`), or
-/// rewrite the files a fast-forward writes (`filter.*`, `core.attributesFile`, `core.symlinks`).
+/// rewrite the files a fast-forward writes (`filter.*`, `core.attributesFile`).
 /// So the whole configuration is listed with its origins, the command-line pins are skipped,
 /// and any other key outside [`config_key_allowed`] is refused by name: a value may hold a
 /// credential, so it is never printed.
@@ -2237,7 +2244,7 @@ fn updater_env<'a>(
     runner: &'a Runner,
     root: &'a Path,
     grants: &'a Grants,
-    (checkouts, agents_declared): (&'a [Result<updater::Checkout, String>], bool),
+    checkouts: &'a [Result<updater::Checkout, String>],
 ) -> updater::Env<'a> {
     updater::Env {
         provider: runner,
@@ -2246,7 +2253,6 @@ fn updater_env<'a>(
         timeouts: updater::Timeouts::DEFAULT,
         grants,
         checkouts,
-        agents_declared,
         ssh_agent: updater::ssh_agent(),
     }
 }
@@ -2454,8 +2460,7 @@ fn upgrade_preview(
         nested_paths(root).as_deref(),
         &|root, rel| git_ignores(&git, root, rel),
     );
-    let agents = updaters.contains(&Updater::Agents);
-    let env = updater_env(ctx, &runner, root, grants, (&checkouts, agents));
+    let env = updater_env(ctx, &runner, root, grants, &checkouts);
     writeln!(out, "{}", paint::label(ctx.color, "upgrade:")).map_err(w)?;
     for u in updaters {
         writeln!(
@@ -2537,8 +2542,7 @@ fn upgrade(
         nested_paths(root).as_deref(),
         &|root, rel| git_ignores(&git, root, rel),
     );
-    let agents = updaters.contains(&Updater::Agents);
-    let env = updater_env(ctx, &runner, root, &grants, (&declared, agents));
+    let env = updater_env(ctx, &runner, root, &grants, &declared);
     // The tracked-file guard (DFM-25, G5): the tracked changes before the updaters, compared
     // after each one that ran. A change it made fails its row and stays in place.
     let mut tracked = tracked_status(&git, &checkouts)?;
