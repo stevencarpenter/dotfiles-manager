@@ -1371,6 +1371,11 @@ fn a_checkout_configuration_outside_the_allowlist_is_refused_before_any_fetch() 
         ("worktrunk.default-branch", "main"),
         ("worktrunk.hints.shell-integration", "false"),
         ("worktrunk.history", "1"),
+        ("core.symlinks", "true"),
+        ("notes.rewriteMode", "concatenate"),
+        ("notes.rewriteRef", "refs/notes/commits"),
+        ("notes.rewrite.amend", "true"),
+        ("notes.rewrite.rebase", "true"),
     ] {
         git(&fx.root, &["config", key, value]);
     }
@@ -4234,9 +4239,9 @@ fn sync_runs_the_mise_rustup_uv_and_npm_updaters_in_order() {
 }
 
 /// An `agents` fixture with real git: the install script in the bound checkout logs its call,
-/// and the managed copy is a clone of a local registry remote at `v1`, which then gets `v2`.
-/// Returns the registry, the copy and its revision before the update.
-fn registry_fixture(u: &Up) -> (Remote, PathBuf, String) {
+/// and the working copy `~/projects/agents` is a clone of a local registry remote at `v1`, which
+/// then gets `v2`. Returns the copy and its revision.
+fn registry_fixture(u: &Up) -> (PathBuf, String) {
     let seed = &u.fx.upstream.seed;
     let script = "scripts/install-agent-registry.sh";
     put(
@@ -4252,38 +4257,41 @@ fn registry_fixture(u: &Up) -> (Remote, PathBuf, String) {
     let registry = Remote::new(u.fake.path(), "registry");
     put(&registry.seed, "pyproject.toml", "");
     registry.push("v1");
-    fs::create_dir_all(u.fx.h(".local/share")).unwrap();
-    // Cloned from the `file:` origin, so the copy's origin remote is a source identity.
+    fs::create_dir_all(u.fx.h("projects")).unwrap();
     git(
-        &u.fx.h(".local/share"),
-        &["clone", "-q", &registry.origin(), "agent-registry"],
+        &u.fx.h("projects"),
+        &["clone", "-q", &registry.origin(), "agents"],
     );
-    let copy = u.fx.h(".local/share/agent-registry");
+    let copy = u.fx.h("projects/agents");
     let before = git(&copy, &["rev-parse", "--short", "HEAD"]);
     put(&registry.seed, "agents/x.md", "x\n");
     registry.push("v2");
-    (registry, copy, before)
+    (copy, before)
 }
 
-/// DFM-25.C09: `agents` fast-forwards the managed copy with real git (a local registry remote)
-/// and runs the install script from the bound checkout with the copy's path. The registry
-/// origin has a grant (DFM-25.C04).
+/// `agents` installs from the working copy with real git and runs the install script from the
+/// bound checkout with the copy's path. It needs no grant and never fetches: the registry's
+/// newer commit stays out of the copy.
 #[test]
-fn sync_fast_forwards_the_agent_registry_and_installs_from_the_bound_root() {
+fn sync_installs_the_agent_registry_from_the_working_copy_without_fetching() {
     let u = Up::new(r#"["agents"]"#);
     let script = "scripts/install-agent-registry.sh";
-    let (registry, copy, before) = registry_fixture(&u);
-    u.fx.trust(&registry.origin());
-    let after = git(&registry.bare, &["rev-parse", "--short", "refs/heads/main"]);
+    let (copy, before) = registry_fixture(&u);
     let o = u.sync(&[]);
     assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
     let s = stdout(&o);
+    assert!(s.contains("  current agents"), "{s}");
     assert!(
-        s.contains(&format!("  updated agents {before} -> {after}")),
+        s.contains(&format!(
+            "    note: installed from working copy {}",
+            copy.display()
+        )),
         "{s}"
     );
-    assert!(s.contains("  upgrade: updated=1"), "{s}");
-    assert_eq!(git(&copy, &["rev-parse", "--short", "HEAD"]), after);
+    assert!(s.contains("  upgrade: current=1"), "{s}");
+    assert!(!s.contains("E_SOURCE_UNTRUSTED"), "{s}");
+    assert_eq!(git(&copy, &["rev-parse", "--short", "HEAD"]), before);
+    assert!(!copy.join(".git/FETCH_HEAD").exists());
     let root = fs::canonicalize(&u.fx.root).unwrap();
     assert_eq!(
         u.log(),
@@ -4541,81 +4549,6 @@ fn a_checkout_that_a_nested_source_declares_is_blocked_without_a_grant() {
     );
     assert!(!copy.join(".git/FETCH_HEAD").exists());
     assert_eq!(git(&copy, &["rev-parse", "--short", "HEAD"]), before);
-}
-
-/// DFM-25 (C04, G2, G6): without a grant for the registry origin, `agents` is a `blocked` row
-/// in the listing and in the run. Only read-only git runs: nothing is fetched or installed, and
-/// the rest of sync runs.
-#[test]
-fn an_ungranted_registry_remote_blocks_agents_before_any_fetch() {
-    let u = Up::new(r#"["agents", "claude"]"#);
-    let (registry, copy, before) = registry_fixture(&u);
-    let fix = format!("dfm sync --trust-origin '{}'", registry.origin());
-    // Publish the install script first, so the listing reaches the source check.
-    let o = u.sync(&["--no-upgrade"]);
-    assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
-    let o = u.sync(&["--preview"]);
-    assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
-    let s = stdout(&o);
-    assert!(
-        s.contains("  agents: blocked: E_SOURCE_UNTRUSTED: no grant for "),
-        "{s}"
-    );
-    assert!(s.contains(&fix), "{s}");
-    assert!(s.contains("  claude: would run claude update"), "{s}");
-    let o = u.sync(&[]);
-    assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
-    let s = stdout(&o);
-    assert!(s.contains("  agents: blocked: E_SOURCE_UNTRUSTED"), "{s}");
-    assert!(s.contains("  blocked agents "), "{s}");
-    assert!(
-        s.contains(&format!(
-            "    note: E_SOURCE_UNTRUSTED: no grant for {}",
-            registry.origin()
-        )),
-        "{s}"
-    );
-    assert!(s.contains("  current claude"), "{s}");
-    assert!(s.contains("  upgrade: current=1 blocked=1"), "{s}");
-    assert!(
-        s.contains("\nwarning: upgrade agents blocked: E_SOURCE_UNTRUSTED"),
-        "{s}"
-    );
-    // No fetch, no pull and no install.
-    assert!(!copy.join(".git/FETCH_HEAD").exists());
-    assert_eq!(git(&copy, &["rev-parse", "--short", "HEAD"]), before);
-    assert!(!u.log().contains("install"), "{}", u.log());
-}
-
-/// DFM-25 (C04): the check reads the remote the branch tracks, not `origin`. A granted origin
-/// does not cover an upstream on another remote, and nothing is fetched from either.
-#[test]
-fn a_granted_origin_with_an_ungranted_upstream_remote_blocks_agents() {
-    let u = Up::new(r#"["agents"]"#);
-    let (registry, copy, before) = registry_fixture(&u);
-    u.fx.trust(&registry.origin());
-    let mirror = Remote::new(u.fake.path(), "mirror");
-    git(&copy, &["remote", "add", "mirror", &mirror.origin()]);
-    let branch = git(&copy, &["rev-parse", "--abbrev-ref", "HEAD"]);
-    git(
-        &copy,
-        &["config", &format!("branch.{branch}.remote"), "mirror"],
-    );
-    let o = u.sync(&[]);
-    assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
-    let s = stdout(&o);
-    assert!(s.contains("  blocked agents "), "{s}");
-    assert!(
-        s.contains(&format!(
-            "    note: E_SOURCE_UNTRUSTED: no grant for {}; review it, then run dfm sync --trust-origin '{}'",
-            mirror.origin(),
-            mirror.origin()
-        )),
-        "{s}"
-    );
-    assert!(!copy.join(".git/FETCH_HEAD").exists());
-    assert_eq!(git(&copy, &["rev-parse", "--short", "HEAD"]), before);
-    assert!(!u.log().contains("install"), "{}", u.log());
 }
 
 /// Owner decision of 2026-11-12: `skills` needs no source record and no grant. It runs the

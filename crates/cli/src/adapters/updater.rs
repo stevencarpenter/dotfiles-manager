@@ -41,9 +41,6 @@ pub struct Env<'a> {
     /// The declared `git-checkout/v1` checkouts that the `checkouts` updater fast-forwards. An
     /// `Err` is the note for a declaration that is not valid (`<id>: <reason>`).
     pub checkouts: &'a [Result<Checkout, String>],
-    /// The profile declares `agents`, which pulls its managed copy itself, so `checkouts`
-    /// leaves that copy out.
-    pub agents_declared: bool,
     /// `SSH_AUTH_SOCK` of the manager's own environment, passed to the fetch and the pull only,
     /// so a key held in an ssh-agent reaches git's ssh ([`ssh_agent`]).
     pub ssh_agent: Option<(String, String)>,
@@ -1472,29 +1469,15 @@ fn untrusted(ids: Vec<Result<String, String>>, grants: &Grants) -> Vec<String> {
     notes
 }
 
-/// Why the updater must not run because of its sources, one note each, or nothing. Only the
-/// `agents` managed copy is gated: its upstream needs a grant (DFM-25, C04), except a managed
-/// copy that is a declared checkout of the same repository. The `agents` working copy is never
-/// fetched. Every other updater acts on what its package manager lists (owner decision of
-/// 2026-11-12): none of them is gated. An updater with a note runs no command that fetches or
-/// installs.
-pub fn trust_notes(u: Updater, env: &Env) -> Vec<String> {
-    match u {
-        Updater::Agents => {
-            let (copy, working) = agents_copy(env);
-            if working || std::fs::symlink_metadata(copy.join(".git")).is_err() {
-                return vec![];
-            }
-            match agents_upstream(env, &copy, AGENTS_NOUN) {
-                Ok(Ok(up)) => agents_gate(env, &copy, &up).into_iter().collect(),
-                Ok(Err(why)) | Err((why, _)) => vec![why],
-            }
-        }
-        _ => vec![],
-    }
+/// Why the updater must not run because of its sources, one note each, or nothing. No updater
+/// is gated: each one acts on what its package manager lists, and `agents` installs from the
+/// owner's working copy, which it never fetches (owner decisions of 2026-11-12). A checkout
+/// that a nested source declares keeps its grant check in the `checkouts` run.
+pub fn trust_notes(_u: Updater, _env: &Env) -> Vec<String> {
+    vec![]
 }
 
-/// The managed copy's upstream: the remote and the branch that `branch.<HEAD>.remote` and
+/// A copy's upstream: the remote and the branch that `branch.<HEAD>.remote` and
 /// `branch.<HEAD>.merge` name, and the remote's url as git fetches from it (`git remote
 /// get-url` applies `url.*.insteadOf`).
 struct Upstream {
@@ -1506,7 +1489,7 @@ struct Upstream {
 /// Reads the upstream with local git commands only; nothing is fetched. `noun` names the copy
 /// in the notes. `Ok(Err)` is the blocked reason (no upstream branch, or a remote url git
 /// cannot give); `Err` is a command that did not run or was stopped.
-fn agents_upstream(
+fn upstream(
     env: &Env,
     copy: &Path,
     noun: &str,
@@ -1551,24 +1534,10 @@ fn agents_upstream(
     Ok(Ok(Upstream { remote, merge, url }))
 }
 
-/// The agent registry's working copy (never pulled) and managed copy (fast-forwarded), relative
-/// to HOME.
+/// The agent registry's one copy, the owner's working copy, relative to HOME. The `checkouts`
+/// updater pulls it when the dotfiles declare it; `agents` never fetches.
 const AGENTS_WORKING: &str = "projects/agents";
-const AGENTS_MANAGED: &str = ".local/share/agent-registry";
 const AGENTS_INSTALL: &str = "install-agent-registry.sh";
-/// The agent registry's managed copy in the notes.
-const AGENTS_NOUN: &str = "managed copy";
-
-/// The copy to install from: the working copy when it holds `pyproject.toml`, else the managed
-/// copy. `true` marks the working copy.
-fn agents_copy(env: &Env) -> (std::path::PathBuf, bool) {
-    let working = env.home.join(AGENTS_WORKING);
-    if working.join("pyproject.toml").is_file() {
-        (working, true)
-    } else {
-        (env.home.join(AGENTS_MANAGED), false)
-    }
-}
 
 /// The runner for the install script: the bound checkout's `scripts` first, then the provider
 /// path. `Err` is the blocked reason.
@@ -1661,44 +1630,19 @@ fn git_with(
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
-/// The note that blocks the pull of the `agents` managed copy, or none. The upstream's grant
-/// covers the pull and the registry's own install code. A checkout that the bound checkout
-/// declared at the copy with the upstream's identity needs no grant. The declared url goes
-/// through the owner's `url.*.insteadOf` rewrites first (`git ls-remote --get-url` in the copy,
-/// no network), as `remote get-url` did for the upstream.
-fn agents_gate(env: &Env, copy: &Path, up: &Upstream) -> Option<String> {
-    let id = git_id(&up.url);
-    let declared = |c: &Checkout| {
-        git(env, copy, &["ls-remote", "--get-url", &c.url])
-            .ok()
-            .map(|u| git_id(&u))
-    };
-    if let Ok(i) = &id
-        && env
-            .checkouts
-            .iter()
-            .flatten()
-            .filter(|c| c.owner_declared && c.path == copy)
-            .any(|c| declared(c).is_some_and(|d| d.as_ref() == Ok(i)))
-    {
-        return None;
-    }
-    // One identity gives at most one note.
-    untrusted(vec![id], env.grants).into_iter().next()
-}
-
 /// Fast-forwards the clean copy at `copy` from its upstream, after `gate` passed for that
 /// upstream. `noun` names the copy in the notes. `before` gets the revision that is read
-/// first. `Ok(Ok(after))` is the revision after the pull. `Ok(Err)` is the blocked note
-/// (dirty, no upstream, the gate, or diverged), and nothing changed. `Err` is a command that
-/// did not succeed. Nothing here merges, resets or clones.
+/// first. `Ok(Ok(after))` is the revision after the pull. `Ok(Err)` is the note and the status
+/// when nothing changed: local work (uncommitted changes, or commits that are not on the
+/// upstream) is left alone and `current`; a refused configuration, no upstream or the gate is
+/// `blocked`. `Err` is a command that did not succeed. Nothing here merges, resets or clones.
 fn fast_forward(
     env: &Env,
     copy: &Path,
     noun: &str,
     before: &mut Option<String>,
     gate: impl Fn(&Upstream) -> Option<String>,
-) -> Result<Result<String, String>, (String, bool)> {
+) -> Result<Result<String, (String, Status)>, (String, bool)> {
     // The copy's own configuration first, by sync's checkout rule (docs/sync.md, "Checkout
     // configuration"): a key there can run a command (`core.sshCommand`, `core.fsmonitor`) or
     // send the fetch elsewhere. `--local` reads no include, so an `include.path` is refused too.
@@ -1708,36 +1652,45 @@ fn fast_forward(
         &["config", "--list", "--local", "--show-origin", "-z"],
     )?;
     if let Some(key) = crate::sync_cmd::refused_config_key(&listing) {
-        return Ok(Err(format!(
-            "{noun} {} configures {key}, which git would read during the fetch or the pull; remove it from the copy's own configuration; not pulled",
-            copy.display()
+        return Ok(Err((
+            format!(
+                "{noun} {} configures {key}, which git would read during the fetch or the pull; remove it from the copy's own configuration; not pulled",
+                copy.display()
+            ),
+            Status::Blocked,
         )));
     }
     // Read-only checks next: the revision and the dirty state.
     *before = Some(git(env, copy, &["rev-parse", "--short", "HEAD"])?);
     if !git(env, copy, &["status", "--porcelain"])?.is_empty() {
-        return Ok(Err(format!(
-            "{noun} {} has uncommitted changes; not pulled",
-            copy.display()
+        return Ok(Err((
+            format!(
+                "{noun} {} has uncommitted changes; not pulled",
+                copy.display()
+            ),
+            Status::Current,
         )));
     }
     // No upstream is a precondition, like a missing copy: nothing to fast-forward from.
-    let up = match agents_upstream(env, copy, noun)? {
+    let up = match upstream(env, copy, noun)? {
         Ok(up) => up,
-        Err(why) => return Ok(Err(why)),
+        Err(why) => return Ok(Err((why, Status::Blocked))),
     };
     if let Some(why) = gate(&up) {
-        return Ok(Err(why));
+        return Ok(Err((why, Status::Blocked)));
     }
     // The fetch and the pull name the checked remote, so git cannot pick another one. `fetch`
-    // moves only the remote-tracking refs. A local commit that is not on the upstream means the
-    // copy diverged: `pull --ff-only` is not tried.
+    // moves only the remote-tracking refs. A local commit that is not on the upstream is the
+    // owner's work: `pull --ff-only` is not tried.
     git_remote(env, copy, &["fetch", "--quiet", &up.remote])?;
     let n = git(env, copy, &["rev-list", "--count", "@{u}..HEAD"])?;
     if n != "0" {
-        return Ok(Err(format!(
-            "{noun} {} has {n} local commits that are not on its upstream; not pulled",
-            copy.display()
+        return Ok(Err((
+            format!(
+                "{noun} {} has {n} local commits that are not on its upstream; not pulled",
+                copy.display()
+            ),
+            Status::Current,
         )));
     }
     git_remote(
@@ -1748,19 +1701,14 @@ fn fast_forward(
     git(env, copy, &["rev-parse", "--short", "HEAD"]).map(Ok)
 }
 
-/// The declared checkouts that the `checkouts` updater pulls. When the profile declares
-/// `agents`, its managed copy is left out: the `agents` updater pulls it before its install.
+/// The valid declared checkouts, which the `checkouts` updater pulls.
 fn declared_checkouts<'e>(env: &'e Env) -> impl Iterator<Item = &'e Checkout> {
-    let agents = env.agents_declared.then(|| agents_copy(env).0);
-    env.checkouts
-        .iter()
-        .flatten()
-        .filter(move |c| agents.as_ref() != Some(&c.path))
+    env.checkouts.iter().flatten()
 }
 
 /// Fast-forwards each declared checkout, one note each. A blocked or failed checkout does not
-/// stop the others. The row is the worst of them: `failed`, then `blocked`, then `updated`,
-/// then `current`. A checkout that the bound checkout declared needs no grant; one that a nested
+/// stop the others. A checkout with local work is left alone and counts as `current`. The row is
+/// the worst of them: `failed`, then `blocked`, then `updated`, then `current`. A checkout that the bound checkout declared needs no grant; one that a nested
 /// source declared needs a grant for its url. Its upstream must have the declared url's
 /// identity, else it is blocked.
 fn checkouts(mut d: Draft, env: &Env) -> Row {
@@ -1831,7 +1779,7 @@ fn checkouts(mut d: Draft, env: &Env) -> Row {
                 Some(b) if b != after => (format!("{} {b} -> {after}", c.id), Status::Updated),
                 _ => (format!("{} current at {after}", c.id), Status::Current),
             },
-            Ok(Err(why)) => (why, Status::Blocked),
+            Ok(Err(skipped)) => skipped,
             // A stop request starts no more commands.
             Err((why, true)) => return d.stop((why, true)),
             Err((why, false)) => (why, Status::Failed),
@@ -1844,11 +1792,11 @@ fn checkouts(mut d: Draft, env: &Env) -> Row {
     d.end(status)
 }
 
-/// The agent registry: install from the working copy as it is, or fast-forward the managed copy
-/// and install from it. Nothing here merges, resets or clones: a missing, dirty or diverged
-/// managed copy is `blocked` before any change.
+/// The agent registry: install from the working copy `~/projects/agents` as it is, uncommitted
+/// changes included. Nothing here fetches, pulls, merges, resets or clones: a missing working
+/// copy is `blocked`, and the `checkouts` updater pulls a declared one before this runs.
 fn agents(mut d: Draft, env: &Env) -> Row {
-    let (copy, working) = agents_copy(env);
+    let copy = env.home.join(AGENTS_WORKING);
     let r = match agents_runner(env) {
         Ok(r) => r,
         Err(why) => {
@@ -1860,44 +1808,21 @@ fn agents(mut d: Draft, env: &Env) -> Row {
         d.notes.push(e.detail);
         return d.end(Status::Blocked);
     }
-    if !working && std::fs::symlink_metadata(copy.join(".git")).is_err() {
+    if !copy.join("pyproject.toml").is_file() {
         d.notes.push(format!(
-            "no managed copy at {}; clone it by hand",
+            "no working copy at {}; dfm sync clones it when the agent-registry checkout is declared",
             copy.display()
         ));
         return d.end(Status::Blocked);
     }
-    if working {
-        match git(env, &copy, &["rev-parse", "--short", "HEAD"]) {
-            Ok(v) => d.before = Some(v),
-            Err(e) => return d.stop(e),
-        }
-        let dirty = match git(env, &copy, &["status", "--porcelain"]) {
-            Ok(s) => !s.is_empty(),
-            Err(e) => return d.stop(e),
-        };
-        d.notes.push(format!(
-            "working copy {}{}; not pulled",
-            copy.display(),
-            if dirty {
-                " has uncommitted changes"
-            } else {
-                ""
-            }
-        ));
-        d.after = d.before.clone();
-    } else {
-        match fast_forward(env, &copy, AGENTS_NOUN, &mut d.before, |up| {
-            agents_gate(env, &copy, up)
-        }) {
-            Ok(Ok(after)) => d.after = Some(after),
-            Ok(Err(why)) => {
-                d.notes.push(why);
-                return d.end(Status::Blocked);
-            }
-            Err(e) => return d.stop(e),
-        }
+    match git(env, &copy, &["rev-parse", "--short", "HEAD"]) {
+        Ok(v) => d.before = Some(v),
+        Err(e) => return d.stop(e),
     }
+    let dirty = match git(env, &copy, &["status", "--porcelain"]) {
+        Ok(s) => !s.is_empty(),
+        Err(e) => return d.stop(e),
+    };
     if let Err(e) = call(
         &r,
         AGENTS_INSTALL,
@@ -1907,12 +1832,17 @@ fn agents(mut d: Draft, env: &Env) -> Row {
     ) {
         return d.stop(e);
     }
-    let changed = d.before != d.after;
-    d.end(if changed {
-        Status::Updated
-    } else {
-        Status::Current
-    })
+    d.notes.push(format!(
+        "installed from working copy {}{}",
+        copy.display(),
+        if dirty {
+            " with uncommitted changes"
+        } else {
+            ""
+        }
+    ));
+    d.after = d.before.clone();
+    d.end(Status::Current)
 }
 
 /// What `run` would do, without running anything.
@@ -1974,15 +1904,10 @@ fn preview_command(u: Updater, env: &Env) -> String {
             }
         },
         Updater::Agents => {
-            let (copy, working) = agents_copy(env);
+            let copy = env.home.join(AGENTS_WORKING);
             match agents_runner(env) {
                 Ok(r) => format!(
-                    "would {} {} and run {} ({})",
-                    if working {
-                        "install from the working copy"
-                    } else {
-                        "fast-forward"
-                    },
+                    "would install from the working copy {} and run {} ({})",
                     copy.display(),
                     AGENTS_INSTALL,
                     r.resolve(AGENTS_INSTALL)
@@ -2097,13 +2022,8 @@ mod tests {
         runner: Runner,
         grants: Grants,
         checkouts: Vec<Result<Checkout, String>>,
-        agents_declared: bool,
         ssh_agent: Option<(String, String)>,
     }
-
-    /// The registry remote that [`T::managed`] records, and its identity.
-    const REGISTRY: &str = "git@github.com:o/agents.git";
-    const REGISTRY_ID: &str = "ssh://git@github.com/o/agents";
 
     impl T {
         fn new() -> T {
@@ -2129,8 +2049,7 @@ mod tests {
                 grace: Duration::from_millis(200),
                 detach: false,
             };
-            let mut grants = Grants::default();
-            grants.grant(REGISTRY_ID, "2026-11-02T00:00:00Z");
+            let grants = Grants::default();
             // `git ls-remote --get-url <url>` prints `st/mirror` when it exists (an insteadOf
             // rewrite), else the url; `st/lsremote-fail` makes it fail. It logs nothing;
             // `agents` replaces it with its own look-alike.
@@ -2153,7 +2072,6 @@ mod tests {
                 runner,
                 grants,
                 checkouts: vec![],
-                agents_declared: false,
                 ssh_agent: None,
             }
         }
@@ -2189,7 +2107,6 @@ mod tests {
                 timeouts: Timeouts::DEFAULT,
                 grants: &self.grants,
                 checkouts: &self.checkouts,
-                agents_declared: self.agents_declared,
                 ssh_agent: self.ssh_agent.clone(),
             }
         }
@@ -2233,7 +2150,6 @@ mod tests {
             fs::create_dir_all(&st).unwrap();
             fs::write(st.join("rev"), rev).unwrap();
             fs::write(st.join("rev-after"), rev_after).unwrap();
-            fs::write(st.join("url-origin"), REGISTRY).unwrap();
             self.script(
                 &self.bin.join("git"),
                 "case \"$3\" in\n  rev-parse) if [ \"$4\" = --abbrev-ref ]; then echo main; else cat \"$st/rev\"; fi ;;\n  config) [ \"$4\" = --list ] && exit 0; [ -f \"$st/no-upstream\" ] && exit 1; case \"$5\" in *.remote) cat \"$st/remote\" 2>/dev/null || echo origin ;; *) echo refs/heads/main ;; esac ;;\n  remote) cat \"$st/url-$5\" ;;\n  ls-remote) if [ -f \"$st/rewrite\" ]; then cat \"$st/rewrite\"; else echo \"$5\"; fi ;;\n  status) cat \"$st/porcelain\" 2>/dev/null || true ;;\n  fetch) exit 0 ;;\n  rev-list) cat \"$st/ahead\" 2>/dev/null || echo 0 ;;\n  pull) cp \"$st/rev-after\" \"$st/rev\" ;;\n  *) exit 64 ;;\nesac",
@@ -2244,9 +2160,11 @@ mod tests {
             );
         }
 
-        fn managed(&self) -> PathBuf {
-            let copy = self.home.join(".local/share/agent-registry");
-            fs::create_dir_all(copy.join(".git")).unwrap();
+        /// The working copy `~/projects/agents` with its `pyproject.toml`.
+        fn working(&self) -> PathBuf {
+            let copy = self.home.join("projects/agents");
+            fs::create_dir_all(&copy).unwrap();
+            fs::write(copy.join("pyproject.toml"), "").unwrap();
             copy
         }
 
@@ -2270,101 +2188,6 @@ mod tests {
             format!("git -C {c} config --get branch.main.merge"),
             format!("git -C {c} remote get-url {remote}"),
         ]
-    }
-
-    #[test]
-    fn agents_with_an_ungranted_upstream_is_blocked_before_any_fetch() {
-        let mut t = T::new();
-        t.agents("abc1234", "def5678");
-        let copy = t.managed();
-        t.grants = Grants::default();
-        let r = run(Updater::Agents, &t.env());
-        assert_eq!(r.status, Status::Blocked, "{r:?}");
-        assert_eq!(
-            r.notes,
-            [format!(
-                "E_SOURCE_UNTRUSTED: no grant for {REGISTRY_ID}; review it, then run dfm sync --trust-origin '{REGISTRY_ID}'"
-            )]
-        );
-        assert_eq!(
-            t.calls(),
-            upstream_calls(&copy.display().to_string(), "origin")
-        );
-        assert_eq!(
-            preview(Updater::Agents, &t.env()),
-            format!("blocked: {}", r.notes[0])
-        );
-    }
-
-    #[test]
-    fn agents_checks_the_upstream_remote_not_origin() {
-        let t = T::new();
-        t.agents("abc1234", "def5678");
-        let copy = t.managed();
-        // origin is granted, but the branch tracks the remote `fork`, which is not.
-        fs::write(t.root.join("st/remote"), "fork").unwrap();
-        fs::write(t.root.join("st/url-fork"), "git@github.com:evil/agents.git").unwrap();
-        let r = run(Updater::Agents, &t.env());
-        assert_eq!(r.status, Status::Blocked, "{r:?}");
-        assert_eq!(
-            r.notes,
-            [
-                "E_SOURCE_UNTRUSTED: no grant for ssh://git@github.com/evil/agents; review it, then run dfm sync --trust-origin 'ssh://git@github.com/evil/agents'"
-            ]
-        );
-        assert_eq!(
-            t.calls(),
-            upstream_calls(&copy.display().to_string(), "fork")
-        );
-        assert!(preview(Updater::Agents, &t.env()).starts_with("blocked: E_SOURCE_UNTRUSTED"));
-    }
-
-    #[test]
-    fn agents_with_a_granted_origin_runs() {
-        let t = T::new();
-        t.agents("abc1234", "def5678");
-        t.managed();
-        assert!(t.grants.trusts(REGISTRY_ID));
-        let r = run(Updater::Agents, &t.env());
-        assert_eq!(r.status, Status::Updated, "{r:?}");
-    }
-
-    #[test]
-    fn agents_with_an_unreadable_or_local_upstream_is_blocked() {
-        let t = T::new();
-        t.agents("abc1234", "def5678");
-        let copy = t.managed();
-        // `remote get-url` fails: the url git would fetch from is unknown.
-        fs::remove_file(t.root.join("st/url-origin")).unwrap();
-        let r = run(Updater::Agents, &t.env());
-        assert_eq!(r.status, Status::Blocked, "{r:?}");
-        assert!(
-            r.notes[0].starts_with(&format!(
-                "cannot read the url of the remote origin of {}: ",
-                copy.display()
-            )),
-            "{r:?}"
-        );
-        // A local path is not a source identity.
-        fs::write(t.root.join("st/url-origin"), "/some/local/path").unwrap();
-        let r = run(Updater::Agents, &t.env());
-        assert_eq!(r.status, Status::Blocked, "{r:?}");
-        assert!(r.notes[0].starts_with("E_SOURCE_UNTRUSTED: "), "{r:?}");
-        assert!(!t.log().contains(" fetch"), "{}", t.log());
-        assert!(!t.log().contains("install-agent-registry"), "{}", t.log());
-    }
-
-    #[test]
-    fn agents_working_copy_is_not_checked() {
-        let mut t = T::new();
-        t.agents("abc1234", "def5678");
-        let working = t.home.join("projects/agents");
-        fs::create_dir_all(&working).unwrap();
-        fs::write(working.join("pyproject.toml"), "").unwrap();
-        t.grants = Grants::default();
-        assert!(trust_notes(Updater::Agents, &t.env()).is_empty());
-        let r = run(Updater::Agents, &t.env());
-        assert_eq!(r.status, Status::Current, "{r:?}");
     }
 
     impl T {
@@ -2520,7 +2343,7 @@ mod tests {
         fs::write(t.root.join("st/dirty/porcelain"), " M x\n").unwrap();
         let moved = t.checkout("moved", "a1b2c3d", "d4e5f6a");
         let r = run(Updater::Checkouts, &t.env());
-        assert_eq!(r.status, Status::Blocked, "{r:?}");
+        assert_eq!(r.status, Status::Updated, "{r:?}");
         assert_eq!(
             r.notes,
             [
@@ -2556,50 +2379,6 @@ mod tests {
     }
 
     #[test]
-    fn checkouts_skips_the_agents_managed_copy() {
-        let mut t = T::new();
-        t.checkouts_git();
-        t.agents_declared = true;
-        let copy = t.managed();
-        t.checkouts.push(Ok(Checkout {
-            id: "agent-registry".into(),
-            url: REGISTRY.into(),
-            path: copy,
-            owner_declared: true,
-        }));
-        let r = run(Updater::Checkouts, &t.env());
-        assert_eq!(r.status, Status::Current, "{r:?}");
-        assert!(r.notes.is_empty(), "{r:?}");
-        assert_eq!(t.log(), "");
-        assert_eq!(preview(Updater::Checkouts, &t.env()), "nothing declared");
-    }
-
-    #[test]
-    fn checkouts_pulls_the_managed_copy_when_agents_is_not_declared() {
-        let mut t = T::new();
-        t.checkouts_git();
-        let copy = t.managed();
-        let st = t.root.join("st/agent-registry");
-        fs::create_dir_all(&st).unwrap();
-        fs::write(st.join("rev"), "a1b2c3d").unwrap();
-        fs::write(st.join("rev-after"), "d4e5f6a").unwrap();
-        t.checkouts.push(Ok(Checkout {
-            id: "agent-registry".into(),
-            url: "https://github.com/o/agent-registry.git".into(),
-            path: copy.clone(),
-            owner_declared: true,
-        }));
-        assert_eq!(
-            preview(Updater::Checkouts, &t.env()),
-            format!("would fast-forward 1 checkout ({})", copy.display())
-        );
-        let r = run(Updater::Checkouts, &t.env());
-        assert_eq!(r.status, Status::Updated, "{r:?}");
-        assert_eq!(r.notes, ["agent-registry a1b2c3d -> d4e5f6a"]);
-        assert_eq!(t.calls(), checkout_calls(&copy));
-    }
-
-    #[test]
     fn git_for_a_copy_stops_at_the_copy_parent() {
         let mut t = T::new();
         let ceiling = t.root.join("st/ceiling");
@@ -2622,8 +2401,8 @@ mod tests {
         t.checkouts_git();
         t.checkout("broken", "a1b2c3d", "d4e5f6a");
         fs::write(t.root.join("st/broken/fail-fetch"), "").unwrap();
-        let dirty = t.checkout("dirty", "a1b2c3d", "d4e5f6a");
-        fs::write(t.root.join("st/dirty/porcelain"), " M x\n").unwrap();
+        let loose = t.checkout("loose", "a1b2c3d", "d4e5f6a");
+        fs::write(t.root.join("st/loose/no-upstream"), "").unwrap();
         t.checkout("moved", "a1b2c3d", "d4e5f6a");
         let r = run(Updater::Checkouts, &t.env());
         assert_eq!(r.status, Status::Failed, "{r:?}");
@@ -2635,8 +2414,8 @@ mod tests {
             r.notes[1..],
             [
                 format!(
-                    "checkout {} has uncommitted changes; not pulled",
-                    dirty.display()
+                    "the checkout {} has no upstream branch; not pulled",
+                    loose.display()
                 ),
                 "moved a1b2c3d -> d4e5f6a".to_string(),
             ]
@@ -2672,31 +2451,51 @@ mod tests {
         assert_eq!(t.calls(), want);
     }
 
+    /// Owner decision of 2026-11-12: uncommitted changes and local commits are the owner's work,
+    /// not a problem. The checkout is left as it is and the row stays `current`.
     #[test]
-    fn checkouts_diverged_or_without_an_upstream_are_blocked() {
+    fn checkouts_leaves_local_work_alone_and_reports_current() {
         let mut t = T::new();
         t.checkouts_git();
+        let dirty = t.checkout("dirty", "a1b2c3d", "d4e5f6a");
+        fs::write(t.root.join("st/dirty/porcelain"), " M x\n").unwrap();
         let ahead = t.checkout("ahead", "a1b2c3d", "d4e5f6a");
         fs::write(t.root.join("st/ahead/ahead"), "2\n").unwrap();
+        let r = run(Updater::Checkouts, &t.env());
+        assert_eq!(r.status, Status::Current, "{r:?}");
+        assert_eq!(
+            r.notes,
+            [
+                format!(
+                    "checkout {} has uncommitted changes; not pulled",
+                    dirty.display()
+                ),
+                format!(
+                    "checkout {} has 2 local commits that are not on its upstream; not pulled",
+                    ahead.display()
+                ),
+            ]
+        );
+        assert!(!t.log().contains(" pull "), "{}", t.log());
+        assert!(!t.log().contains("dirty fetch"), "{}", t.log());
+    }
+
+    #[test]
+    fn checkouts_without_an_upstream_are_blocked() {
+        let mut t = T::new();
+        t.checkouts_git();
         let loose = t.checkout("loose", "a1b2c3d", "d4e5f6a");
         fs::write(t.root.join("st/loose/no-upstream"), "").unwrap();
         let r = run(Updater::Checkouts, &t.env());
         assert_eq!(r.status, Status::Blocked, "{r:?}");
         assert_eq!(
             r.notes,
-            [
-                format!(
-                    "checkout {} has 2 local commits that are not on its upstream; not pulled",
-                    ahead.display()
-                ),
-                format!(
-                    "the checkout {} has no upstream branch; not pulled",
-                    loose.display()
-                ),
-            ]
+            [format!(
+                "the checkout {} has no upstream branch; not pulled",
+                loose.display()
+            )]
         );
-        assert!(!t.log().contains(" pull "), "{}", t.log());
-        assert!(!t.log().contains("loose fetch"), "{}", t.log());
+        assert!(!t.log().contains(" fetch "), "{}", t.log());
     }
 
     #[test]
@@ -2724,74 +2523,6 @@ mod tests {
                 "moved a1b2c3d -> d4e5f6a"
             ]
         );
-    }
-
-    #[test]
-    fn agents_needs_no_grant_for_a_declared_copy() {
-        let mut t = T::new();
-        t.agents("abc1234", "def5678");
-        let copy = t.managed();
-        t.grants = Grants::default();
-        // Another spelling of the upstream url: the identities match.
-        t.checkouts.push(Ok(Checkout {
-            id: "agent-registry".into(),
-            url: "ssh://git@github.com/o/agents.git".into(),
-            path: copy.clone(),
-            owner_declared: true,
-        }));
-        assert!(trust_notes(Updater::Agents, &t.env()).is_empty());
-        assert!(preview(Updater::Agents, &t.env()).starts_with("would fast-forward "));
-        let r = run(Updater::Agents, &t.env());
-        assert_eq!(r.status, Status::Updated, "{r:?}");
-        // The same path declared with another repository keeps the grant check.
-        t.checkouts[0].as_mut().unwrap().url = "https://github.com/o/other.git".into();
-        t.agents("abc1234", "def5678");
-        let r = run(Updater::Agents, &t.env());
-        assert_eq!(r.status, Status::Blocked, "{r:?}");
-        assert!(r.notes[0].starts_with("E_SOURCE_UNTRUSTED: "), "{r:?}");
-    }
-
-    /// The `agents` grant skip holds only for a copy the bound checkout declared.
-    #[test]
-    fn agents_needs_a_grant_for_a_copy_a_nested_source_declares() {
-        let mut t = T::new();
-        t.agents("abc1234", "def5678");
-        let copy = t.managed();
-        t.grants = Grants::default();
-        t.checkouts.push(Ok(Checkout {
-            id: "agent-registry".into(),
-            url: "ssh://git@github.com/o/agents.git".into(),
-            path: copy,
-            owner_declared: false,
-        }));
-        let notes = trust_notes(Updater::Agents, &t.env());
-        assert_eq!(notes.len(), 1, "{notes:?}");
-        assert!(notes[0].starts_with("E_SOURCE_UNTRUSTED: "), "{notes:?}");
-        let r = run(Updater::Agents, &t.env());
-        assert_eq!(r.status, Status::Blocked, "{r:?}");
-    }
-
-    /// The owner's `url.*.insteadOf` rewrites the declared https url to the ssh upstream, so the
-    /// declared copy still needs no grant (Codex #102, as for `checkouts`).
-    #[test]
-    fn agents_rewrites_the_declared_url_before_it_compares_the_upstream() {
-        let mut t = T::new();
-        t.agents("abc1234", "def5678");
-        let copy = t.managed();
-        t.grants = Grants::default();
-        t.checkouts.push(Ok(Checkout {
-            id: "agent-registry".into(),
-            url: "https://github.com/o/agents".into(),
-            path: copy,
-            owner_declared: true,
-        }));
-        // Without the rule the https declaration is another identity: a grant is needed.
-        assert_eq!(trust_notes(Updater::Agents, &t.env()).len(), 1);
-        // `https://github.com/` instead of `git@github.com:`: git rewrites the declared url.
-        fs::write(t.root.join("st/rewrite"), REGISTRY).unwrap();
-        assert!(trust_notes(Updater::Agents, &t.env()).is_empty());
-        let r = run(Updater::Agents, &t.env());
-        assert_eq!(r.status, Status::Updated, "{r:?}");
     }
 
     #[test]
@@ -2835,32 +2566,12 @@ mod tests {
     }
 
     #[test]
-    fn agents_with_an_npm_upstream_is_blocked_although_npm_is_granted() {
-        let mut t = T::new();
-        t.agents("abc1234", "def5678");
-        let copy = t.managed();
-        // Git reads `npm:skills` as host `npm`; the npm:skills grant must not cover it.
-        fs::write(t.root.join("st/url-origin"), "npm:skills").unwrap();
-        t.grants.grant("npm:skills", "2026-11-02T00:00:00Z");
-        let r = run(Updater::Agents, &t.env());
-        assert_eq!(r.status, Status::Blocked, "{r:?}");
-        assert!(
-            r.notes[0].starts_with(
-                "E_SOURCE_UNTRUSTED: git remote \"npm:skills\" names an npm: identity"
-            ),
-            "{r:?}"
-        );
-        assert_eq!(
-            t.calls(),
-            upstream_calls(&copy.display().to_string(), "origin")
-        );
-    }
-
-    #[test]
     fn binaries_and_package_managers_are_not_gated() {
         let mut t = T::new();
         t.grants = Grants::default();
         for u in [
+            Updater::Agents,
+            Updater::Checkouts,
             Updater::Claude,
             Updater::Codex,
             Updater::Opencode,
@@ -2878,26 +2589,16 @@ mod tests {
     }
 
     #[test]
-    fn agents_working_copy_is_not_pulled_and_reports_dirty() {
+    fn agents_installs_from_the_working_copy_without_fetching() {
         let t = T::new();
         t.agents("abc1234", "def5678");
-        let working = t.home.join("projects/agents");
-        fs::create_dir_all(&working).unwrap();
-        fs::write(working.join("pyproject.toml"), "").unwrap();
-        // A managed copy exists too; the working copy wins.
-        t.managed();
-        fs::write(t.root.join("st/porcelain"), " M agents/x.md\n").unwrap();
+        let w = t.working();
         let r = run(Updater::Agents, &t.env());
         assert_eq!(r.status, Status::Current, "{r:?}");
         assert_eq!(r.before.as_deref(), Some("abc1234"));
         assert_eq!(r.after.as_deref(), Some("abc1234"));
-        let w = working.display();
-        assert_eq!(
-            r.notes,
-            [format!(
-                "working copy {w} has uncommitted changes; not pulled"
-            )]
-        );
+        let w = w.display();
+        assert_eq!(r.notes, [format!("installed from working copy {w}")]);
         assert_eq!(
             t.calls(),
             [
@@ -2906,105 +2607,33 @@ mod tests {
                 format!("install-agent-registry.sh {w}"),
             ]
         );
-    }
-
-    #[test]
-    fn agents_managed_copy_is_fast_forwarded_and_installed() {
-        let t = T::new();
-        t.agents("abc1234", "def5678");
-        let copy = t.managed();
-        let r = run(Updater::Agents, &t.env());
-        assert_eq!(r.status, Status::Updated, "{r:?}");
-        assert_eq!(r.before.as_deref(), Some("abc1234"));
-        assert_eq!(r.after.as_deref(), Some("def5678"));
-        let c = copy.display();
-        let mut want = upstream_calls(&c.to_string(), "origin");
-        want.extend([
-            format!("git -C {c} fetch --quiet origin"),
-            format!("git -C {c} rev-list --count @{{u}}..HEAD"),
-            format!("git -C {c} pull --ff-only --quiet origin refs/heads/main"),
-            format!("git -C {c} rev-parse --short HEAD"),
-            format!("install-agent-registry.sh {c}"),
-        ]);
-        assert_eq!(t.calls(), want);
-    }
-
-    #[test]
-    fn agents_managed_copy_without_new_commits_is_current() {
-        let t = T::new();
-        t.agents("abc1234", "abc1234");
-        t.managed();
+        // Uncommitted changes are installed as they are, and named.
+        fs::write(t.root.join("st/porcelain"), " M agents/x.md\n").unwrap();
         let r = run(Updater::Agents, &t.env());
         assert_eq!(r.status, Status::Current, "{r:?}");
-    }
-
-    #[test]
-    fn agents_diverged_copy_is_blocked_and_not_pulled() {
-        let t = T::new();
-        t.agents("abc1234", "def5678");
-        t.managed();
-        fs::write(t.root.join("st/ahead"), "2\n").unwrap();
-        let r = run(Updater::Agents, &t.env());
-        assert_eq!(r.status, Status::Blocked, "{r:?}");
-        assert!(
-            r.notes.iter().any(
-                |n| n.ends_with("has 2 local commits that are not on its upstream; not pulled")
-            ),
-            "{r:?}"
-        );
-        assert!(!t.log().contains(" pull "), "{}", t.log());
-        assert!(!t.log().contains("install-agent-registry"), "{}", t.log());
-    }
-
-    #[test]
-    fn agents_copy_without_an_upstream_is_blocked_before_fetch() {
-        let t = T::new();
-        t.agents("abc1234", "def5678");
-        let copy = t.managed();
-        fs::write(t.root.join("st/no-upstream"), "").unwrap();
-        let r = run(Updater::Agents, &t.env());
-        assert_eq!(r.status, Status::Blocked, "{r:?}");
         assert_eq!(
             r.notes,
             [format!(
-                "the managed copy {} has no upstream branch; not pulled",
-                copy.display()
+                "installed from working copy {w} with uncommitted changes"
             )]
         );
         assert!(!t.log().contains(" fetch"), "{}", t.log());
-        assert!(!t.log().contains("install-agent-registry"), "{}", t.log());
+        assert!(!t.log().contains(" pull"), "{}", t.log());
     }
 
     #[test]
-    fn agents_dirty_managed_copy_is_blocked_and_not_fetched() {
+    fn agents_without_a_working_copy_is_blocked() {
         let t = T::new();
         t.agents("abc1234", "def5678");
-        t.managed();
-        fs::write(t.root.join("st/porcelain"), "?? stray\n").unwrap();
+        // A directory without `pyproject.toml` is not the registry.
+        fs::create_dir_all(t.home.join("projects/agents/.git")).unwrap();
         let r = run(Updater::Agents, &t.env());
         assert_eq!(r.status, Status::Blocked, "{r:?}");
-        assert!(
-            r.notes
-                .iter()
-                .any(|n| n.ends_with("has uncommitted changes; not pulled")),
-            "{r:?}"
-        );
-        assert!(!t.log().contains(" fetch"), "{}", t.log());
-        assert!(!t.log().contains("install-agent-registry"), "{}", t.log());
-    }
-
-    #[test]
-    fn agents_missing_copy_is_blocked_and_never_cloned() {
-        let t = T::new();
-        t.agents("abc1234", "def5678");
-        let r = run(Updater::Agents, &t.env());
-        assert_eq!(r.status, Status::Blocked, "{r:?}");
-        let want = t.home.join(".local/share/agent-registry");
         assert_eq!(
             r.notes,
             [format!(
-                "no managed copy at {}; clone it by hand",
-                want.display()
+                "no working copy at {}; dfm sync clones it when the agent-registry checkout is declared",
+                t.home.join("projects/agents").display()
             )]
         );
         assert_eq!(t.log(), "");
@@ -3014,7 +2643,7 @@ mod tests {
     fn agents_failed_install_is_failed_and_withholds_stderr() {
         let t = T::new();
         t.agents("abc1234", "def5678");
-        t.managed();
+        t.working();
         fs::write(t.root.join("st/install-exit"), "3").unwrap();
         let r = run(Updater::Agents, &t.env());
         assert_eq!(r.status, Status::Failed, "{r:?}");
@@ -3022,15 +2651,14 @@ mod tests {
         assert!(note.contains("install-agent-registry.sh"), "{note}");
         assert!(note.contains("exited 3"), "{note}");
         assert!(!note.contains("secret detail"), "{note}");
-        // The pull happened before the install; the row still shows it.
-        assert_eq!(r.after.as_deref(), Some("def5678"));
+        assert_eq!(r.before.as_deref(), Some("abc1234"));
     }
 
     #[test]
     fn agents_without_the_install_script_is_blocked_before_any_git() {
         let t = T::new();
         t.agents("abc1234", "def5678");
-        t.managed();
+        t.working();
         fs::remove_file(t.dots.join("scripts/install-agent-registry.sh")).unwrap();
         let r = run(Updater::Agents, &t.env());
         assert_eq!(r.status, Status::Blocked, "{r:?}");
@@ -3043,18 +2671,16 @@ mod tests {
     fn agents_preview_names_the_copy_and_runs_nothing() {
         let t = T::new();
         t.agents("abc1234", "def5678");
-        let copy = t.managed();
+        let copy = t.working();
         let p = preview(Updater::Agents, &t.env());
         assert!(
             p.starts_with(&format!(
-                "would fast-forward {} and run install-agent-registry.sh",
+                "would install from the working copy {} and run install-agent-registry.sh",
                 copy.display()
             )),
             "{p}"
         );
-        // Only the read-only calls that find the upstream for the source check.
-        let c = copy.display().to_string();
-        assert_eq!(t.calls(), upstream_calls(&c, "origin")[3..]);
+        assert_eq!(t.log(), "");
     }
 
     impl Drop for T {
