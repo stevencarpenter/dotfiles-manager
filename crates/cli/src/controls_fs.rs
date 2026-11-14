@@ -214,12 +214,18 @@ pub fn toolchain_tree_digest(dir: &Path) -> Result<String, String> {
     toolchain_tree_digest_as(dir, uid)
 }
 
+/// rustup's copy of the channel manifest. rustup writes its tables in a random order on every
+/// install, so the file differs between two installs of one release. No build step reads it.
+/// The digest leaves it out; the owner and mode checks still cover it.
+const RUSTUP_MANIFEST: &str = "lib/rustlib/multirust-channel-manifest.toml";
+
 fn toolchain_tree_digest_as(dir: &Path, uid: u32) -> Result<String, String> {
     use std::os::unix::fs::PermissionsExt;
     closed_tree(dir, ".", uid)?;
     let mut entries = Vec::new();
     for (rel, node) in walk(dir)? {
         let kind = match node {
+            Node::File if rel == RUSTUP_MANIFEST => continue,
             Node::File => {
                 let p = dir.join(&rel);
                 let exec = fs::metadata(&p)

@@ -25,7 +25,7 @@ Prerequisites: Command Line Tools (`xcode-select --install`), the rustup toolcha
 
    The block runs in a subshell. If it prints `stopped` or any error, or the status is not 0, stop.
 
-   The copy must be a real directory, not a symlink, made as your own user and not with `sudo`: the script refuses a toolchain entry that another user owns (`E_TOOLCHAIN_MISMATCH`). The printed digest must equal `toolchain_tree_sha256` in `dotfiles-manager.lock` before `install`. The digest was recorded on the M5 and can differ on another device. If it differs, stop: the lock holds one digest for every device, and `install` refuses with `E_TOOLCHAIN_MISMATCH`.
+   The copy must be a real directory, not a symlink, made as your own user and not with `sudo`: the script refuses a toolchain entry that another user owns (`E_TOOLCHAIN_MISMATCH`). The printed digest must equal `toolchain_tree_sha256` in `dotfiles-manager.lock` before `install`. The digest leaves out rustup's `multirust-channel-manifest.toml`, which differs on every install (docs/bootstrap.md). It can still differ on a device whose toolchain holds other components. If it differs, stop: the lock holds one digest for every device, and `install` refuses with `E_TOOLCHAIN_MISMATCH`.
 2. Check out the commit to install, usually `main` after `git pull --ff-only`. The script builds the commit the checkout has checked out (its HEAD), not uncommitted files.
 3. Run the bootstrap script (not with `env -i`: it clears `HOME` and the script refuses with `E_HOME_MISMATCH`; the script scrubs its own environment):
 
