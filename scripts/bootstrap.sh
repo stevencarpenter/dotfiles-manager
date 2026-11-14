@@ -409,14 +409,18 @@ toolchain_digest() (
   # Another owner could rewrite an entry after the digest, so every entry (a link too) must belong to the current user.
   uid=$(owner_uid) && [ -n "$uid" ] || exit 1
   out=$(find . ! -user "$uid" -print) && [ -z "$out" ] || exit 1
-  # rustup writes the tables of its channel manifest copy in a random order on every install, and
-  # no build step reads the file. The digest leaves it out; the checks above still cover it.
+  # Two rustup bookkeeping files can differ between two installs of one release: rustup writes the
+  # tables of its channel manifest copy in a random order, and the line order of `components` is
+  # not fixed (measured: 2 orders in 3 clean installs). No build step reads them (the build runs
+  # the toolchain's own cargo and rustc, never a rustup proxy). The digest leaves them out; the
+  # checks above still cover them.
   skip=./lib/rustlib/multirust-channel-manifest.toml
-  nf=$(find . -type f ! -path "$skip" | wc -l); nl=$(find . -type l | wc -l)
+  skip2=./lib/rustlib/components
+  nf=$(find . -type f ! -path "$skip" ! -path "$skip2" | wc -l); nl=$(find . -type l | wc -l)
   [ "$nf" -gt 0 ] || exit 1
-  plain=$(find . -type f ! -path "$skip" ! -perm -u+x -print0 | xargs -0 -r /usr/bin/shasum -a 256 |
+  plain=$(find . -type f ! -path "$skip" ! -path "$skip2" ! -perm -u+x -print0 | xargs -0 -r /usr/bin/shasum -a 256 |
     awk '{ h = $1; sub(/^[0-9a-f]+  \.\//, ""); printf "%s\tfile\t%s\n", $0, h }')
-  execs=$(find . -type f ! -path "$skip" -perm -u+x -print0 | xargs -0 -r /usr/bin/shasum -a 256 |
+  execs=$(find . -type f ! -path "$skip" ! -path "$skip2" -perm -u+x -print0 | xargs -0 -r /usr/bin/shasum -a 256 |
     awk '{ h = $1; sub(/^[0-9a-f]+  \.\//, ""); printf "%s\texec\t%s\n", $0, h }')
   # `readlink -n` prints the target bytes and nothing else, and the `x` keeps $(...) from dropping
   # a trailing newline of the target. A target that holds a newline becomes an empty target,

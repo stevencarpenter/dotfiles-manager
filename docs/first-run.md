@@ -6,7 +6,7 @@ Board ticket: DFM-46. The agent runs nothing live without written approval that 
 
 ## 1. Build and install the manager
 
-Prerequisites: Command Line Tools (`xcode-select --install`), the rustup toolchain `1.98.1-aarch64-apple-darwin`, and a clone of this repository (`git clone https://github.com/stevencarpenter/dotfiles-manager.git`). Run the commands below from that clone.
+Prerequisites: Command Line Tools (`xcode-select --install`), rustup at `~/.cargo/bin/rustup` (the path rustup.rs installs to), and a clone of this repository (`git clone https://github.com/stevencarpenter/dotfiles-manager.git`). Run the commands below from that clone.
 
 1. Place the pinned toolchain. `~/.local/share/dotfiles-manager` must be a real directory that you own and that group and others cannot write. Then run:
 
@@ -18,14 +18,19 @@ Prerequisites: Command Line Tools (`xcode-select --install`), the rustup toolcha
        echo 'stopped: remove toolchains/1.98.1 first, because cp would nest the copy' >&2
        exit 1
      fi
-     cp -Rp ~/.rustup/toolchains/1.98.1-aarch64-apple-darwin ~/.local/share/dotfiles-manager/toolchains/1.98.1
+     clean=$(mktemp -d)
+     RUSTUP_HOME="$clean" ~/.cargo/bin/rustup toolchain install 1.98.1 --profile default --no-self-update
+     cp -Rp "$clean/toolchains/1.98.1-aarch64-apple-darwin" ~/.local/share/dotfiles-manager/toolchains/1.98.1
+     rm -rf "$clean"
      sh scripts/bootstrap.sh toolchain-digest --dir ~/.local/share/dotfiles-manager/toolchains/1.98.1
    )
    ```
 
    The block runs in a subshell. If it prints `stopped` or any error, or the status is not 0, stop.
 
-   The copy must be a real directory, not a symlink, made as your own user and not with `sudo`: the script refuses a toolchain entry that another user owns (`E_TOOLCHAIN_MISMATCH`). The printed digest must equal `toolchain_tree_sha256` in `dotfiles-manager.lock` before `install`. The digest leaves out rustup's `multirust-channel-manifest.toml`, which differs on every install (docs/bootstrap.md). It can still differ on a device whose toolchain holds other components. If it differs, stop: the lock holds one digest for every device, and `install` refuses with `E_TOOLCHAIN_MISMATCH`.
+   The block installs a clean default-profile toolchain into a new, empty rustup home and copies that. It does not change `~/.rustup`. Do not copy `~/.rustup/toolchains/1.98.1-aarch64-apple-darwin` instead: a component or target added there (`rust-src`, a second `rust-std`) changes the digest.
+
+   The copy must be a real directory, not a symlink, made as your own user and not with `sudo`: the script refuses a toolchain entry that another user owns (`E_TOOLCHAIN_MISMATCH`). The printed digest must equal `toolchain_tree_sha256` in `dotfiles-manager.lock` before `install`. The digest leaves out rustup's `multirust-channel-manifest.toml` and `components`, which can differ between two installs (docs/bootstrap.md). If it differs, stop: the lock holds one digest for every device, and `install` refuses with `E_TOOLCHAIN_MISMATCH`.
 2. Check out the commit to install, usually `main` after `git pull --ff-only`. The script builds the commit the checkout has checked out (its HEAD), not uncommitted files.
 3. Run the bootstrap script (not with `env -i`: it clears `HOME` and the script refuses with `E_HOME_MISMATCH`; the script scrubs its own environment):
 
