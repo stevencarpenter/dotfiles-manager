@@ -952,34 +952,45 @@ fn cp_rp_copy_of_a_toolchain_tree_keeps_its_digest() {
     }
 }
 
-/// rustup writes its channel manifest copy in a random table order on every install, so two
-/// installs of one release differ in that file alone. Both digests leave it out.
+/// Two rustup bookkeeping files can differ between two installs of one release: the tables of
+/// its channel manifest copy are in a random order, and the line order of `components` is not
+/// fixed. Both digests leave both files out.
 #[test]
-fn rustup_channel_manifest_does_not_change_the_digest() {
-    let tmp = TempDir::new("rustup-manifest");
+fn rustup_bookkeeping_does_not_change_the_digest() {
+    let tmp = TempDir::new("rustup-bookkeeping");
     let home = tmp.path().join("home");
     fs::create_dir_all(&home).unwrap();
     let tc = tmp.path().join("tc");
     minimal_toolchain(&tc);
     let want = dfm_cli::toolchain_tree_digest(&tc).unwrap();
-    let manifest = tc.join("lib/rustlib/multirust-channel-manifest.toml");
-    for text in ["[pkg.a]\n[pkg.b]\n", "[pkg.b]\n[pkg.a]\n"] {
-        fs::write(&manifest, text).unwrap();
-        assert_eq!(dfm_cli::toolchain_tree_digest(&tc).unwrap(), want);
-        let o = script_test_mode(
-            &home,
-            &["toolchain-digest", "--dir", tc.to_str().unwrap()],
-            &[],
-        );
-        assert_eq!(
-            String::from_utf8_lossy(&o.stdout).trim(),
-            want,
-            "{}",
-            err(&o)
-        );
+    for (rel, texts) in [
+        (
+            "lib/rustlib/multirust-channel-manifest.toml",
+            ["[pkg.a]\n[pkg.b]\n", "[pkg.b]\n[pkg.a]\n"],
+        ),
+        (
+            "lib/rustlib/components",
+            ["cargo\nrustc\n", "rustc\ncargo\n"],
+        ),
+    ] {
+        for text in texts {
+            fs::write(tc.join(rel), text).unwrap();
+            assert_eq!(dfm_cli::toolchain_tree_digest(&tc).unwrap(), want, "{rel}");
+            let o = script_test_mode(
+                &home,
+                &["toolchain-digest", "--dir", tc.to_str().unwrap()],
+                &[],
+            );
+            assert_eq!(
+                String::from_utf8_lossy(&o.stdout).trim(),
+                want,
+                "{rel}: {}",
+                err(&o)
+            );
+        }
     }
     // Any other file still changes both digests.
-    fs::write(tc.join("lib/rustlib/components"), "x").unwrap();
+    fs::write(tc.join("lib/rustlib/multirust-config.toml"), "x").unwrap();
     assert_ne!(dfm_cli::toolchain_tree_digest(&tc).unwrap(), want);
 }
 

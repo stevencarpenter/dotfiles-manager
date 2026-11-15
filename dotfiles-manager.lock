@@ -1,3 +1,3 @@
 [manager]
 toolchain = "1.98.1"
-toolchain_tree_sha256 = "4a27c61d0fbcb99ead6147f8e9ffc0da302572464a7dcc49b85350e529cc420f"
+toolchain_tree_sha256 = "95b0ff9d607e6a7364cccfff0965858dc4d42d877a3cc82938ec475b3b9531e1"
