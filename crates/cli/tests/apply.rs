@@ -666,6 +666,50 @@ fn a_foreign_file_or_link_at_a_target_is_preserved() {
     assert_eq!(fingerprint(fx.home.path()), before);
 }
 
+/// DFM-25 (C06): a `skills/v1` entry is one link per target root. A foreign directory at the
+/// leaf is a conflict and is never replaced; a foreign skill beside it under the same root is
+/// left as it is, before and after the entry is published.
+#[test]
+fn a_foreign_skill_directory_at_a_leaf_conflicts_and_a_foreign_sibling_is_kept() {
+    let fx = Fx::new();
+    fx.put(
+        "base/modules/extra/module.toml",
+        &format!(
+            "{EXTRA}\n[[resources]]\nid = \"skills\"\nkind = \"distribution\"\nadapter = \"skills/v1\"\n[resources.value]\ntarget_roots = [\".claude/skills\"]\n[resources.value.entries.audit]\nsource = \"files/audit\"\nenabled = true\n"
+        ),
+    );
+    fx.put("base/modules/extra/files/audit/SKILL.md", "managed\n");
+    let leaf = fx.h(".claude/skills/audit");
+    let sibling = fx.h(".claude/skills/mine/SKILL.md");
+    fs::create_dir_all(&leaf).unwrap();
+    fs::write(leaf.join("SKILL.md"), "foreign\n").unwrap();
+    fs::create_dir_all(sibling.parent().unwrap()).unwrap();
+    fs::write(&sibling, "my own skill\n").unwrap();
+    let before = fingerprint(fx.home.path());
+    let o = fx.apply(&[]);
+    assert_eq!(code(&o), 3, "{}\n{}", text(&o.stderr), text(&o.stdout));
+    let err = text(&o.stderr);
+    assert!(err.contains("E_CONFLICT"), "{err}");
+    assert!(err.contains(".claude/skills/audit"), "{err}");
+    assert!(!err.contains(".claude/skills/mine"), "{err}");
+    assert_eq!(fingerprint(fx.home.path()), before);
+    // Once the owner moves the foreign directory aside, the entry is published as a link and
+    // the sibling stays a directory with its content.
+    fs::remove_dir_all(&leaf).unwrap();
+    let o = fx.apply(&[]);
+    assert_eq!(code(&o), 0, "{}\n{}", text(&o.stderr), text(&o.stdout));
+    assert!(is_link_to(
+        &leaf,
+        &fx.root.join("base/modules/extra/files/audit")
+    ));
+    assert!(
+        fs::symlink_metadata(sibling.parent().unwrap())
+            .unwrap()
+            .is_dir()
+    );
+    assert_eq!(fs::read_to_string(&sibling).unwrap(), "my own skill\n");
+}
+
 #[test]
 fn an_owned_link_the_user_retargeted_is_preserved_not_replaced() {
     let fx = Fx::new();
