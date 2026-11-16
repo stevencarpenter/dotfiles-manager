@@ -19,6 +19,7 @@ This page lists the adapter registry and records what the configuration adapters
 | `homebrew/v1`, `mise/v1`, `apt/v1`, `uv-tool/v1` | `package` | `packages` | [docs/packages.md](packages.md), [docs/toolchains.md](toolchains.md) |
 | `git-checkout/v1` | `package` | `packages` | [docs/packages.md](packages.md), "Git checkouts" |
 | `script/v1` | `package` | `packages` | [docs/packages.md](packages.md), "Script declarations" |
+| `duckdb-extension/v1` | `package` | `packages` | [docs/packages.md](packages.md), "DuckDB extensions" |
 | `launchd-agent/v1`, `brew-service/v1`, `omlx-app/v1` | `service` | `services` | [docs/lifecycle.md](lifecycle.md) |
 | `firstmate-native/v1` | `application` | none (always `not_in_scope`) | DESIGN.md. A catalog entry only, with no adapter code ([docs/lifecycle.md](lifecycle.md)). |
 

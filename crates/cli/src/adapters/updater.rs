@@ -44,6 +44,9 @@ pub struct Env<'a> {
     /// `SSH_AUTH_SOCK` of the manager's own environment, passed to the fetch and the pull only,
     /// so a key held in an ssh-agent reaches git's ssh ([`ssh_agent`]).
     pub ssh_agent: Option<(String, String)>,
+    /// `XDG_STATE_HOME` of the manager's own environment ([`xdg_state_home`]). The `skills` CLI
+    /// keeps a second global record under it, which only a run with the variable reaches.
+    pub xdg_state_home: Option<(String, String)>,
 }
 
 /// `SSH_AUTH_SOCK` of the manager's own environment, when it is set and UTF-8. Only the commands
@@ -52,6 +55,20 @@ pub(crate) fn ssh_agent() -> Option<(String, String)> {
     std::env::var("SSH_AUTH_SOCK")
         .ok()
         .map(|v| ("SSH_AUTH_SOCK".to_string(), v))
+}
+
+/// `XDG_STATE_HOME` of the manager's own environment, when it is an absolute UTF-8 path. Only
+/// the `skills` run for the record under it gets the variable.
+pub(crate) fn xdg_state_home() -> Option<(String, String)> {
+    state_home(std::env::var("XDG_STATE_HOME").ok())
+}
+
+/// [`xdg_state_home`] from the variable's value: an empty or relative value is ignored, as the
+/// XDG base directory specification says.
+fn state_home(value: Option<String>) -> Option<(String, String)> {
+    value
+        .filter(|v| Path::new(v).is_absolute())
+        .map(|v| ("XDG_STATE_HOME".to_string(), v))
 }
 
 /// A declared `git-checkout/v1` checkout.
@@ -65,6 +82,9 @@ pub struct Checkout {
     /// The bound checkout declared it and its url (`dfm_model::resolve::owner_declared`): then
     /// its url needs no grant.
     pub owner_declared: bool,
+    /// Its `update_policy` when that is `hold` or `native-request`: the owner's own updater pulls
+    /// it (Firstmate), so `checkouts` leaves it alone.
+    pub held: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -88,7 +108,9 @@ fn owner_dir(u: Updater) -> Option<&'static str> {
         Updater::Agents
         | Updater::Brew
         | Updater::Checkouts
+        | Updater::Firstmate
         | Updater::Go
+        | Updater::Lefthook
         | Updater::Mise
         | Updater::Npm
         | Updater::SideChannels
@@ -162,20 +184,37 @@ fn call_ok(
     timeout: Duration,
     ok: &[i32],
 ) -> Result<Output, (String, bool)> {
+    call_at(r, program, a, env, timeout, ok, None)
+}
+
+/// [`call_ok`], in `dir` instead of the runner's working directory when it is given
+/// ([`Runner::run_in`]).
+fn call_at(
+    r: &Runner,
+    program: &str,
+    a: &[String],
+    env: &[(String, String)],
+    timeout: Duration,
+    ok: &[i32],
+    dir: Option<&Path>,
+) -> Result<Output, (String, bool)> {
     let what = std::iter::once(program)
         .chain(a.iter().map(String::as_str))
         .collect::<Vec<_>>()
         .join(" ");
-    let out = r
-        .run(&Request {
-            program,
-            args: a,
-            env,
-            stdin: None,
-            timeout,
-            max_stdout: 16 << 20,
-        })
-        .map_err(|e| (format!("{what}: {}", e.detail), false))?;
+    let req = Request {
+        program,
+        args: a,
+        env,
+        stdin: None,
+        timeout,
+        max_stdout: 16 << 20,
+    };
+    let out = match dir {
+        Some(dir) => r.run_in(&req, dir),
+        None => r.run(&req),
+    }
+    .map_err(|e| (format!("{what}: {}", e.detail), false))?;
     match trouble(&what, &out, timeout, ok) {
         None => Ok(out),
         Some(n) => Err((n, matches!(out.end, End::Stopped(_)))),
@@ -231,36 +270,77 @@ pub fn run(u: Updater, env: &Env) -> Row {
         Updater::Agents => agents(d, env),
         Updater::Brew => brew(d, env),
         Updater::Checkouts => checkouts(d, env),
-        Updater::Skills => {
-            // As the preview says: a missing `mise` is blocked, not a failed command.
-            if let Err(e) = env.provider.resolve("mise") {
-                d.notes.push(e.detail);
-                return d.end(Status::Blocked);
-            }
-            match call(
-                env.provider,
-                "mise",
-                &args(&["exec", "--", "npx", "--yes", "skills@latest", "update"]),
-                &npm_env(&[]),
-                env.timeouts.short,
-            ) {
-                Ok(_) => {
-                    d.notes
-                        .push("skills update ran; it reports no version".into());
-                    d.end(Status::Current)
-                }
-                Err(e) => d.stop(e),
-            }
-        }
+        Updater::Skills => skills(d, env),
         Updater::Cargo => cargo(d, env),
         Updater::Go => go(d, env),
         Updater::Mise => mise(d, env),
         Updater::Npm => npm(d, env),
         Updater::Rustup => rustup(d, env),
         Updater::SideChannels => side_channels(d, env),
+        Updater::Lefthook => lefthook(d, env),
+        Updater::Firstmate => firstmate(d, env),
         Updater::Uv => uv(d, env),
         Updater::Claude | Updater::Codex | Updater::Opencode => native(d, env),
     }
+}
+
+/// The global records the `skills` CLI updates, each with the variables of its run: the record
+/// under HOME, which the runner's cleared environment selects, then the one under the manager's
+/// `XDG_STATE_HOME` when that file exists (the CLI uses it when the variable is set).
+fn skills_runs(env: &Env) -> Vec<(PathBuf, Vec<(String, String)>)> {
+    let mut runs = vec![(env.home.join(".agents/.skill-lock.json"), vec![])];
+    if let Some((k, v)) = &env.xdg_state_home {
+        let record = Path::new(v).join("skills/.skill-lock.json");
+        if record.is_file() {
+            runs.push((record, vec![(k.clone(), v.clone())]));
+        }
+    }
+    runs
+}
+
+/// `skills update` for each global record ([`skills_runs`]). It reports no version, so exit 0
+/// is `current` with one note per run. A failed run fails the row and the other run still runs;
+/// a stop request starts nothing more.
+fn skills(mut d: Draft, env: &Env) -> Row {
+    // As the preview says: a missing `mise` is blocked, not a failed command.
+    if let Err(e) = env.provider.resolve("mise") {
+        d.notes.push(e.detail);
+        return d.end(Status::Blocked);
+    }
+    let mut failed = false;
+    for (i, (record, extra)) in skills_runs(env).into_iter().enumerate() {
+        if i > 0 && dfm_engine::signal::requested().is_some() {
+            d.notes.push(format!(
+                "not started for {}: the run was stopped",
+                record.display()
+            ));
+            return d.end(Status::Pending);
+        }
+        let mut vars = npm_env(&[]);
+        vars.extend(extra);
+        match call(
+            env.provider,
+            "mise",
+            &args(&["exec", "--", "npx", "--yes", "skills@latest", "update"]),
+            &vars,
+            env.timeouts.short,
+        ) {
+            Ok(_) => d.notes.push(format!(
+                "skills update ran for {}; it reports no version",
+                record.display()
+            )),
+            Err((why, true)) => return d.stop((why, true)),
+            Err((why, false)) => {
+                d.notes.push(format!("{why} (record {})", record.display()));
+                failed = true;
+            }
+        }
+    }
+    d.end(if failed {
+        Status::Failed
+    } else {
+        Status::Current
+    })
 }
 
 /// The runner for a native tool: its owner directory first, then the provider path so its
@@ -371,7 +451,9 @@ pub fn second_copies(u: Updater, env: &Env) -> Vec<String> {
         | Updater::Brew
         | Updater::Cargo
         | Updater::Checkouts
+        | Updater::Firstmate
         | Updater::Go
+        | Updater::Lefthook
         | Updater::Mise
         | Updater::Npm
         | Updater::Rustup
@@ -1595,6 +1677,131 @@ fn side_channels(mut d: Draft, env: &Env) -> Row {
     }
 }
 
+/// Why `lefthook install` cannot run in the bound checkout: no checkout directory, no `.git`
+/// there (a directory or, in a worktree, a file; without it lefthook would install the hooks of
+/// an enclosing repository), or no `lefthook` on the provider path (a mise-only copy is not on
+/// it).
+fn lefthook_blocked(env: &Env) -> Option<String> {
+    if !env.root.is_dir() {
+        return Some(format!("no bound checkout at {}", env.root.display()));
+    }
+    if std::fs::symlink_metadata(env.root.join(".git")).is_err() {
+        return Some(format!(
+            "{} has no .git; lefthook install would act on an enclosing repository",
+            env.root.display()
+        ));
+    }
+    env.provider.resolve("lefthook").err().map(|e| e.detail)
+}
+
+/// The bound checkout's git hooks: the fixed command `lefthook install`, run in the bound
+/// checkout because lefthook has no directory option ([`Runner::run_in`] leaves the directory
+/// as it is). It reports no version, so a success is `current`; a failure stops nothing else.
+fn lefthook(mut d: Draft, env: &Env) -> Row {
+    if let Some(why) = lefthook_blocked(env) {
+        d.notes.push(why);
+        return d.end(Status::Blocked);
+    }
+    match call_at(
+        env.provider,
+        "lefthook",
+        &args(&["install"]),
+        &[],
+        env.timeouts.short,
+        &[0],
+        Some(env.root),
+    ) {
+        Ok(_) => {
+            d.notes.push(format!(
+                "lefthook install ran in {}; it reports no version",
+                env.root.display()
+            ));
+            d.end(Status::Current)
+        }
+        Err(e) => d.stop(e),
+    }
+}
+
+/// Firstmate's entry point, relative to HOME.
+const FIRSTMATE: &str = ".local/bin/firstmate";
+
+/// The runner and the program name for Firstmate's entry point. The entry point is usually a
+/// link into the bound checkout (`home/.local/bin/firstmate`), whose target leaves `~/.local`,
+/// so [`Runner::resolve`] refuses it from `~/.local/bin`. The search path therefore starts with
+/// the directory of the link's canonical target, which must be `~/.local/bin` itself or a
+/// directory inside the bound checkout; the target then passes the runner's executable checks
+/// there. `Err` is the blocked reason.
+fn firstmate_runner(env: &Env) -> Result<(Runner, String), String> {
+    let entry = env.home.join(FIRSTMATE);
+    if std::fs::symlink_metadata(&entry).is_err() {
+        return Err(format!("no Firstmate entry point at {}", entry.display()));
+    }
+    let shown = |e: std::io::Error| format!("{}: {}", entry.display(), e.kind());
+    let real = std::fs::canonicalize(&entry).map_err(shown)?;
+    let bin = entry
+        .parent()
+        .map(std::fs::canonicalize)
+        .transpose()
+        .map_err(shown)?;
+    let Some(dir) = real.parent() else {
+        return Err(format!("{} has no parent directory", real.display()));
+    };
+    // A link that leaves `~/.local/bin` may reach only Firstmate's own entry point in the bound
+    // checkout, never another file there.
+    if real.file_name().and_then(|n| n.to_str()) != Some("firstmate") {
+        return Err(format!(
+            "{} resolves to {}, which is not named firstmate",
+            entry.display(),
+            real.display()
+        ));
+    }
+    if bin.as_deref() != Some(dir) {
+        let root = std::fs::canonicalize(env.root)
+            .map_err(|e| format!("bound checkout {}: {}", env.root.display(), e.kind()))?;
+        if !real.starts_with(&root) {
+            return Err(format!(
+                "{} resolves to {}, outside {} and the bound checkout {}",
+                entry.display(),
+                real.display(),
+                entry.parent().unwrap_or(Path::new("")).display(),
+                root.display()
+            ));
+        }
+    }
+    let mut r = env.provider.clone();
+    r.search_path.insert(0, dir.to_path_buf());
+    r.resolve("firstmate").map_err(|e| e.detail)?;
+    Ok((r, "firstmate".to_string()))
+}
+
+/// Asks Firstmate to update itself: the fixed command `~/.local/bin/firstmate --request-update`.
+/// Firstmate pulls its own checkout and reports completion itself, so exit 0 is `current` with
+/// a note; `pending` would warn on every sync. Another exit (3: the request was saved but the
+/// wake failed) is `failed`.
+fn firstmate(mut d: Draft, env: &Env) -> Row {
+    let (r, name) = match firstmate_runner(env) {
+        Ok(r) => r,
+        Err(why) => {
+            d.notes.push(why);
+            return d.end(Status::Blocked);
+        }
+    };
+    match call(
+        &r,
+        &name,
+        &args(&["--request-update"]),
+        &[],
+        env.timeouts.short,
+    ) {
+        Ok(_) => {
+            d.notes
+                .push("update requested; Firstmate reports its own completion".into());
+            d.end(Status::Current)
+        }
+        Err(e) => d.stop(e),
+    }
+}
+
 /// `git -C <dir> <a>`; its trimmed standard output. As in the `git-checkout/v1` probe, git must
 /// not walk up from a `.git` that is not a repository to an enclosing one.
 fn git(env: &Env, dir: &Path, a: &[&str]) -> Result<String, (String, bool)> {
@@ -1701,9 +1908,14 @@ fn fast_forward(
     git(env, copy, &["rev-parse", "--short", "HEAD"]).map(Ok)
 }
 
-/// The valid declared checkouts, which the `checkouts` updater pulls.
+/// The valid declared checkouts. The `checkouts` updater pulls those that are not held.
 fn declared_checkouts<'e>(env: &'e Env) -> impl Iterator<Item = &'e Checkout> {
     env.checkouts.iter().flatten()
+}
+
+/// The valid declared checkouts that the `checkouts` updater pulls.
+fn pulled_checkouts<'e>(env: &'e Env) -> impl Iterator<Item = &'e Checkout> {
+    declared_checkouts(env).filter(|c| c.held.is_none())
 }
 
 /// Fast-forwards each declared checkout, one note each. A blocked or failed checkout does not
@@ -1735,6 +1947,12 @@ fn checkouts(mut d: Draft, env: &Env) -> Row {
     };
     d.notes.extend(invalid.into_iter().cloned());
     for c in declared_checkouts(env) {
+        // A held checkout is a note only; the packages scope still clones a missing one.
+        if let Some(p) = &c.held {
+            d.notes
+                .push(format!("{} held (update_policy {p}); not pulled", c.id));
+            continue;
+        }
         if std::fs::symlink_metadata(c.path.join(".git")).is_err() {
             d.notes.push(format!(
                 "{} is not cloned yet; the packages scope clones it",
@@ -1862,14 +2080,15 @@ fn preview_command(u: Updater, env: &Env) -> String {
         Updater::Checkouts => match env.provider.resolve("git") {
             Err(e) => format!("blocked: {}", e.detail),
             Ok(_) => {
-                let paths: Vec<String> = declared_checkouts(env)
+                let paths: Vec<String> = pulled_checkouts(env)
                     .map(|c| c.path.display().to_string())
                     .collect();
+                let held = declared_checkouts(env).count() - paths.len();
                 // An invalid declaration blocks the row, so the preview counts it.
                 let invalid = env.checkouts.iter().filter(|c| c.is_err()).count();
                 let plural = |n: usize| if n == 1 { "" } else { "s" };
                 let would = match paths.len() {
-                    0 if invalid == 0 => return "nothing declared".into(),
+                    0 if invalid == 0 && held == 0 => return "nothing declared".into(),
                     0 => "would fast-forward no checkout".to_string(),
                     n => format!(
                         "would fast-forward {n} checkout{} ({})",
@@ -1881,10 +2100,14 @@ fn preview_command(u: Updater, env: &Env) -> String {
                     0 => would,
                     n => format!("{would}; {n} declaration{} invalid", plural(n)),
                 };
+                let would = match held {
+                    0 => would,
+                    n => format!("{would}; {n} held by update_policy"),
+                };
                 // The run gates each checkout on its own, so the others still run: the preview
                 // names the grants without blocking the row.
                 let ungranted = untrusted(
-                    declared_checkouts(env)
+                    pulled_checkouts(env)
                         .filter(|c| !c.owner_declared)
                         .map(|c| git_id(&c.url))
                         .collect(),
@@ -1925,10 +2148,23 @@ fn preview_command(u: Updater, env: &Env) -> String {
             Err(e) => format!("blocked: {}", e.detail),
         },
         Updater::Skills => match env.provider.resolve("mise") {
-            Ok(p) => format!(
-                "would run mise exec -- npx --yes skills@latest update ({})",
-                p.display()
-            ),
+            Ok(p) => {
+                let runs = skills_runs(env);
+                let again = match runs.get(1) {
+                    Some((record, extra)) => format!(
+                        ", then again with {}={} for {}",
+                        extra[0].0,
+                        extra[0].1,
+                        record.display()
+                    ),
+                    None => String::new(),
+                };
+                format!(
+                    "would run mise exec -- npx --yes skills@latest update for {}{again} ({})",
+                    runs[0].0.display(),
+                    p.display()
+                )
+            }
             Err(e) => format!("blocked: {}", e.detail),
         },
         Updater::Cargo => match native_runner(u, env) {
@@ -1979,6 +2215,27 @@ fn preview_command(u: Updater, env: &Env) -> String {
             ),
             Err(why) => format!("blocked: {why}"),
         },
+        Updater::Lefthook => match lefthook_blocked(env) {
+            Some(why) => format!("blocked: {why}"),
+            None => format!(
+                "would run lefthook install in {} ({})",
+                env.root.display(),
+                env.provider
+                    .resolve("lefthook")
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_default()
+            ),
+        },
+        Updater::Firstmate => match firstmate_runner(env) {
+            Ok((r, name)) => format!(
+                "would run {} --request-update ({})",
+                env.home.join(FIRSTMATE).display(),
+                r.resolve(&name)
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_default()
+            ),
+            Err(why) => format!("blocked: {why}"),
+        },
         Updater::Uv => match env.provider.resolve("uv") {
             Ok(p) => format!(
                 "would run uv tool upgrade of each tool under {} ({})",
@@ -2023,6 +2280,7 @@ mod tests {
         grants: Grants,
         checkouts: Vec<Result<Checkout, String>>,
         ssh_agent: Option<(String, String)>,
+        xdg_state_home: Option<(String, String)>,
     }
 
     impl T {
@@ -2073,6 +2331,7 @@ mod tests {
                 grants,
                 checkouts: vec![],
                 ssh_agent: None,
+                xdg_state_home: None,
             }
         }
 
@@ -2108,6 +2367,7 @@ mod tests {
                 grants: &self.grants,
                 checkouts: &self.checkouts,
                 ssh_agent: self.ssh_agent.clone(),
+                xdg_state_home: self.xdg_state_home.clone(),
             }
         }
 
@@ -2216,6 +2476,7 @@ mod tests {
                 url: format!("https://github.com/o/{id}.git"),
                 path: path.clone(),
                 owner_declared: true,
+                held: None,
             }));
             path
         }
@@ -2358,6 +2619,53 @@ mod tests {
         let mut want = upstream_calls(&d, "origin")[..3].to_vec();
         want.extend(checkout_calls(&moved));
         assert_eq!(t.calls(), want);
+    }
+
+    /// A checkout whose `update_policy` is `hold` or `native-request` (Firstmate pulls its own)
+    /// is never pulled, and only noted; the others still run and decide the row.
+    #[test]
+    fn a_held_checkout_is_noted_and_not_pulled() {
+        let mut t = T::new();
+        t.checkouts_git();
+        // A nested declaration without a grant: held, it needs none.
+        t.grants = Grants::default();
+        for (id, policy) in [("fm", "native-request"), ("pinned", "hold")] {
+            t.checkout(id, "a1b2c3d", "d4e5f6a");
+            let c = t.checkouts.last_mut().unwrap().as_mut().unwrap();
+            c.held = Some(policy.into());
+            c.owner_declared = false;
+        }
+        let tpm = t.checkout("tpm", "a1b2c3d", "d4e5f6a");
+        assert_eq!(
+            preview(Updater::Checkouts, &t.env()),
+            format!(
+                "would fast-forward 1 checkout ({}); 2 held by update_policy",
+                tpm.display()
+            )
+        );
+        let r = run(Updater::Checkouts, &t.env());
+        assert_eq!(r.status, Status::Updated, "{r:?}");
+        assert_eq!(
+            r.notes,
+            [
+                "fm held (update_policy native-request); not pulled",
+                "pinned held (update_policy hold); not pulled",
+                "tpm a1b2c3d -> d4e5f6a",
+            ]
+        );
+        assert_eq!(t.calls(), checkout_calls(&tpm));
+        // Held alone: current, nothing runs, and a held checkout not cloned yet is still held.
+        t.checkouts.pop();
+        fs::remove_dir(t.home.join("src/fm/.git")).unwrap();
+        assert_eq!(
+            preview(Updater::Checkouts, &t.env()),
+            "would fast-forward no checkout; 2 held by update_policy"
+        );
+        fs::remove_file(t.root.join("log")).unwrap();
+        let r = run(Updater::Checkouts, &t.env());
+        assert_eq!(r.status, Status::Current, "{r:?}");
+        assert_eq!(r.notes.len(), 2, "{r:?}");
+        assert_eq!(t.log(), "");
     }
 
     #[test]
@@ -2566,24 +2874,250 @@ mod tests {
     }
 
     #[test]
+    fn lefthook_installs_in_the_bound_checkout() {
+        let t = T::new();
+        fs::create_dir_all(t.dots.join(".git")).unwrap();
+        t.script(&t.bin.join("lefthook"), "pwd > \"$st/lefthook-pwd\"");
+        assert_eq!(
+            preview(Updater::Lefthook, &t.env()),
+            format!(
+                "would run lefthook install in {} ({})",
+                t.dots.display(),
+                t.bin.join("lefthook").display()
+            )
+        );
+        assert_eq!(t.log(), "");
+        let r = run(Updater::Lefthook, &t.env());
+        assert_eq!(r.status, Status::Current, "{r:?}");
+        assert_eq!(
+            r.notes,
+            [format!(
+                "lefthook install ran in {}; it reports no version",
+                t.dots.display()
+            )]
+        );
+        assert_eq!(t.calls(), ["lefthook install"]);
+        let pwd = fs::read_to_string(t.root.join("st/lefthook-pwd")).unwrap();
+        assert_eq!(pwd.trim(), t.dots.display().to_string());
+        // The checkout is the working directory; the runner's own one is not even created.
+        assert!(!t.runner.cwd.exists());
+    }
+
+    #[test]
+    fn lefthook_without_the_program_or_the_checkout_is_blocked() {
+        let t = T::new();
+        fs::create_dir_all(t.dots.join(".git")).unwrap();
+        let p = preview(Updater::Lefthook, &t.env());
+        assert!(p.starts_with("blocked: lefthook was not found in "), "{p}");
+        let r = run(Updater::Lefthook, &t.env());
+        assert_eq!(r.status, Status::Blocked, "{r:?}");
+        assert!(
+            r.notes[0].starts_with("lefthook was not found in "),
+            "{r:?}"
+        );
+        t.script(&t.bin.join("lefthook"), "exit 0");
+        // A worktree has a `.git` file; it counts as a checkout.
+        fs::remove_dir(t.dots.join(".git")).unwrap();
+        fs::write(t.dots.join(".git"), "gitdir: /elsewhere\n").unwrap();
+        assert!(preview(Updater::Lefthook, &t.env()).starts_with("would run lefthook install"));
+        // Without `.git`, lefthook would install the hooks of an enclosing repository.
+        fs::remove_file(t.dots.join(".git")).unwrap();
+        let r = run(Updater::Lefthook, &t.env());
+        assert_eq!(r.status, Status::Blocked, "{r:?}");
+        assert_eq!(
+            r.notes,
+            [format!(
+                "{} has no .git; lefthook install would act on an enclosing repository",
+                t.dots.display()
+            )]
+        );
+        fs::remove_dir(&t.dots).unwrap();
+        let r = run(Updater::Lefthook, &t.env());
+        assert_eq!(r.status, Status::Blocked, "{r:?}");
+        assert_eq!(
+            r.notes,
+            [format!("no bound checkout at {}", t.dots.display())]
+        );
+        assert_eq!(t.log(), "");
+    }
+
+    /// A failing install is `failed` with the withheld-stderr note. The sync test
+    /// `lefthook_runs_in_the_bound_checkout_and_firstmate_runs_through_its_link` shows that the
+    /// next updater still runs.
+    #[test]
+    fn a_failing_lefthook_install_is_failed_with_the_stderr_withheld() {
+        let t = T::new();
+        fs::create_dir_all(t.dots.join(".git")).unwrap();
+        t.script(&t.bin.join("lefthook"), "echo 'secret' >&2; exit 1");
+        let r = run(Updater::Lefthook, &t.env());
+        assert_eq!(r.status, Status::Failed, "{r:?}");
+        assert!(
+            r.notes[0].starts_with(
+                "lefthook install exited 1; its 7 bytes of standard error are withheld"
+            ),
+            "{r:?}"
+        );
+        assert_eq!(t.calls(), ["lefthook install"]);
+    }
+
+    impl T {
+        /// Firstmate's entry point as on the live machine: `~/.local/bin/firstmate` is a link to
+        /// `home/.local/bin/firstmate` in the bound checkout. It exits with `st/fm-exit` (0 when
+        /// absent). Returns the link target.
+        fn firstmate_link(&self) -> PathBuf {
+            let real = self.dots.join("home/.local/bin/firstmate");
+            self.script(&real, "exit $(cat \"$st/fm-exit\" 2>/dev/null || echo 0)");
+            let link = self.home.join(FIRSTMATE);
+            fs::create_dir_all(link.parent().unwrap()).unwrap();
+            std::os::unix::fs::symlink(&real, &link).unwrap();
+            real
+        }
+    }
+
+    #[test]
+    fn firstmate_requests_an_update_through_its_link_into_the_bound_checkout() {
+        let t = T::new();
+        let real = t.firstmate_link();
+        // The provider runner alone refuses the link: its target leaves `~/.local`.
+        let mut plain = t.runner.clone();
+        plain.search_path.insert(0, t.home.join(".local/bin"));
+        assert!(plain.resolve("firstmate").is_err());
+        assert_eq!(
+            preview(Updater::Firstmate, &t.env()),
+            format!(
+                "would run {} --request-update ({})",
+                t.home.join(FIRSTMATE).display(),
+                real.display()
+            )
+        );
+        assert_eq!(t.log(), "");
+        let r = run(Updater::Firstmate, &t.env());
+        assert_eq!(r.status, Status::Current, "{r:?}");
+        assert_eq!(
+            r.notes,
+            ["update requested; Firstmate reports its own completion"]
+        );
+        assert_eq!(t.calls(), ["firstmate --request-update"]);
+    }
+
+    /// A regular file at `~/.local/bin/firstmate` runs from there.
+    #[test]
+    fn firstmate_as_a_regular_file_in_local_bin_runs() {
+        let t = T::new();
+        let entry = t.home.join(FIRSTMATE);
+        t.script(&entry, "exit 0");
+        assert_eq!(
+            preview(Updater::Firstmate, &t.env()),
+            format!(
+                "would run {} --request-update ({})",
+                entry.display(),
+                entry.display()
+            )
+        );
+        let r = run(Updater::Firstmate, &t.env());
+        assert_eq!(r.status, Status::Current, "{r:?}");
+        assert_eq!(t.calls(), ["firstmate --request-update"]);
+    }
+
+    /// A link into the bound checkout may reach only a file named `firstmate`.
+    #[test]
+    fn a_firstmate_link_to_another_file_in_the_checkout_is_blocked() {
+        let t = T::new();
+        let other = t.dots.join("scripts/install-agent-registry.sh");
+        t.script(&other, "exit 0");
+        let entry = t.home.join(FIRSTMATE);
+        fs::create_dir_all(entry.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&other, &entry).unwrap();
+        let r = run(Updater::Firstmate, &t.env());
+        assert_eq!(r.status, Status::Blocked, "{r:?}");
+        assert!(
+            r.notes[0].ends_with("which is not named firstmate"),
+            "{r:?}"
+        );
+        assert_eq!(t.log(), "");
+    }
+
+    #[test]
+    fn xdg_state_home_ignores_an_empty_or_relative_value() {
+        assert_eq!(state_home(None), None);
+        assert_eq!(state_home(Some(String::new())), None);
+        assert_eq!(state_home(Some("rel/state".into())), None);
+        assert_eq!(
+            state_home(Some("/h/.local/state".into())),
+            Some(("XDG_STATE_HOME".into(), "/h/.local/state".into()))
+        );
+    }
+
+    /// A failed first run fails the row, and the second run still runs.
+    #[test]
+    fn a_failing_first_skills_run_is_failed_and_the_second_still_runs() {
+        let mut t = T::new();
+        t.skills_mise();
+        let lock = t.xdg_state(true);
+        fs::write(t.root.join("st/skills-exit-1"), "1").unwrap();
+        let r = run(Updater::Skills, &t.env());
+        assert_eq!(r.status, Status::Failed, "{r:?}");
+        assert_eq!(t.calls().len(), 2);
+        assert!(r.notes[0].contains("exited 1;"), "{r:?}");
+        assert_eq!(
+            r.notes[1],
+            format!(
+                "skills update ran for {}; it reports no version",
+                lock.display()
+            )
+        );
+    }
+
+    /// Exit 3 is the wrapper's "request saved, wake failed": `failed`, not `current`.
+    #[test]
+    fn a_firstmate_request_that_exits_3_is_failed() {
+        let t = T::new();
+        t.firstmate_link();
+        fs::write(t.root.join("st/fm-exit"), "3").unwrap();
+        let r = run(Updater::Firstmate, &t.env());
+        assert_eq!(r.status, Status::Failed, "{r:?}");
+        assert!(
+            r.notes[0].starts_with("firstmate --request-update exited 3;"),
+            "{r:?}"
+        );
+    }
+
+    #[test]
+    fn firstmate_without_its_entry_point_or_with_a_link_out_of_the_checkout_is_blocked() {
+        let t = T::new();
+        let entry = t.home.join(FIRSTMATE);
+        let want = format!("no Firstmate entry point at {}", entry.display());
+        assert_eq!(
+            preview(Updater::Firstmate, &t.env()),
+            format!("blocked: {want}")
+        );
+        let r = run(Updater::Firstmate, &t.env());
+        assert_eq!(r.status, Status::Blocked, "{r:?}");
+        assert_eq!(r.notes, [want]);
+        // A link to a program outside `~/.local/bin` and the bound checkout is refused.
+        let elsewhere = t.root.join("elsewhere/firstmate");
+        t.script(&elsewhere, "exit 0");
+        fs::create_dir_all(entry.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, &entry).unwrap();
+        // No bound checkout to compare with: blocked, never a fallback to the raw path.
+        let r = run(Updater::Firstmate, &t.env());
+        assert_eq!(r.status, Status::Blocked, "{r:?}");
+        assert!(
+            r.notes[0].starts_with(&format!("bound checkout {}: ", t.dots.display())),
+            "{r:?}"
+        );
+        fs::create_dir_all(&t.dots).unwrap();
+        let r = run(Updater::Firstmate, &t.env());
+        assert_eq!(r.status, Status::Blocked, "{r:?}");
+        assert!(r.notes[0].contains(", outside "), "{r:?}");
+        assert_eq!(t.log(), "");
+    }
+
+    #[test]
     fn binaries_and_package_managers_are_not_gated() {
         let mut t = T::new();
         t.grants = Grants::default();
-        for u in [
-            Updater::Agents,
-            Updater::Checkouts,
-            Updater::Claude,
-            Updater::Codex,
-            Updater::Opencode,
-            Updater::Brew,
-            Updater::Cargo,
-            Updater::Go,
-            Updater::Mise,
-            Updater::Rustup,
-            Updater::Npm,
-            Updater::Uv,
-            Updater::Skills,
-        ] {
+        for u in Updater::ALL {
             assert!(trust_notes(u, &t.env()).is_empty(), "{u:?}");
         }
     }
@@ -3012,16 +3546,127 @@ mod tests {
         t.script(&t.bin.join("mise"), "exit 0");
         let r = run(Updater::Skills, &t.env());
         assert_eq!(r.status, Status::Current, "{r:?}");
-        assert!(
-            r.notes
-                .contains(&"skills update ran; it reports no version".to_string()),
-            "{r:?}"
+        assert_eq!(
+            r.notes,
+            [format!(
+                "skills update ran for {}; it reports no version",
+                t.home.join(".agents/.skill-lock.json").display()
+            )]
         );
         assert!(
             t.log()
                 .starts_with("mise exec -- npx --yes skills@latest update |"),
             "{}",
             t.log()
+        );
+    }
+
+    impl T {
+        /// `mise` that logs `XDG_STATE_HOME` and exits with `st/skills-exit-<n>` for its n-th
+        /// call (0 when absent).
+        fn skills_mise(&self) {
+            self.script(
+                &self.bin.join("mise"),
+                "n=$(($(cat \"$st/skills-n\" 2>/dev/null || echo 0) + 1)); echo $n > \"$st/skills-n\"\necho \"xdg=${XDG_STATE_HOME:-unset}\" >> \"$st/skills-env\"\nexit $(cat \"$st/skills-exit-$n\" 2>/dev/null || echo 0)",
+            );
+        }
+
+        fn skills_env(&self) -> Vec<String> {
+            fs::read_to_string(self.root.join("st/skills-env"))
+                .unwrap_or_default()
+                .lines()
+                .map(str::to_string)
+                .collect()
+        }
+
+        /// `XDG_STATE_HOME` set in the manager's environment, with or without the record.
+        fn xdg_state(&mut self, record: bool) -> PathBuf {
+            let state = self.root.join("state");
+            let lock = state.join("skills/.skill-lock.json");
+            if record {
+                fs::create_dir_all(lock.parent().unwrap()).unwrap();
+                fs::write(&lock, "{}").unwrap();
+            }
+            self.xdg_state_home = Some(("XDG_STATE_HOME".into(), state.display().to_string()));
+            lock
+        }
+    }
+
+    #[test]
+    fn skills_without_xdg_state_home_runs_once_without_the_variable() {
+        let t = T::new();
+        t.skills_mise();
+        let r = run(Updater::Skills, &t.env());
+        assert_eq!(r.status, Status::Current, "{r:?}");
+        assert_eq!(t.calls(), ["mise exec -- npx --yes skills@latest update"]);
+        assert_eq!(t.skills_env(), ["xdg=unset"]);
+    }
+
+    /// The skills CLI keeps a second global record under `XDG_STATE_HOME`; the runner clears
+    /// the variable, so a second run passes it through.
+    #[test]
+    fn skills_runs_again_for_the_record_under_xdg_state_home() {
+        let mut t = T::new();
+        t.skills_mise();
+        let lock = t.xdg_state(true);
+        let state = t.root.join("state").display().to_string();
+        assert_eq!(
+            preview(Updater::Skills, &t.env()),
+            format!(
+                "would run mise exec -- npx --yes skills@latest update for {}, then again with XDG_STATE_HOME={state} for {} ({})",
+                t.home.join(".agents/.skill-lock.json").display(),
+                lock.display(),
+                t.bin.join("mise").display()
+            )
+        );
+        let r = run(Updater::Skills, &t.env());
+        assert_eq!(r.status, Status::Current, "{r:?}");
+        assert_eq!(
+            r.notes,
+            [
+                format!(
+                    "skills update ran for {}; it reports no version",
+                    t.home.join(".agents/.skill-lock.json").display()
+                ),
+                format!(
+                    "skills update ran for {}; it reports no version",
+                    lock.display()
+                ),
+            ]
+        );
+        assert_eq!(t.calls().len(), 2);
+        assert_eq!(
+            t.skills_env(),
+            ["xdg=unset".to_string(), format!("xdg={state}")]
+        );
+    }
+
+    #[test]
+    fn skills_with_xdg_state_home_and_no_record_runs_once() {
+        let mut t = T::new();
+        t.skills_mise();
+        t.xdg_state(false);
+        assert!(!preview(Updater::Skills, &t.env()).contains("then again"));
+        let r = run(Updater::Skills, &t.env());
+        assert_eq!(r.status, Status::Current, "{r:?}");
+        assert_eq!(t.skills_env(), ["xdg=unset"]);
+    }
+
+    #[test]
+    fn a_failing_second_skills_run_is_failed() {
+        let mut t = T::new();
+        t.skills_mise();
+        let lock = t.xdg_state(true);
+        fs::write(t.root.join("st/skills-exit-2"), "1").unwrap();
+        let r = run(Updater::Skills, &t.env());
+        assert_eq!(r.status, Status::Failed, "{r:?}");
+        assert!(
+            r.notes[1].starts_with("mise exec -- npx --yes skills@latest update exited 1;"),
+            "{r:?}"
+        );
+        assert!(
+            r.notes[1].ends_with(&format!("(record {})", lock.display())),
+            "{r:?}"
         );
     }
 

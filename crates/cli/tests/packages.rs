@@ -1528,3 +1528,166 @@ fn the_probe_stops_git_at_the_checkouts_parent_and_an_empty_git_directory_is_ano
         fx.log()
     );
 }
+
+/// `mise exec -- duckdb -init /dev/null -noheader -csv -c <sql>`: a `SELECT` on
+/// `duckdb_extensions()` that asks for the name and its aliases prints `v:abc123` when a line
+/// of `installed-duckdb` (`<name> <alias>...`) holds the name, and nothing otherwise; `INSTALL <name>;` appends the name. With the `no-duckdb` marker it fails
+/// as mise does for a program that is not installed. Each call logs its arguments and the
+/// DuckDB and mise variables it saw.
+const FAKE_MISE_DUCKDB: &str = r#"#!/bin/sh
+PATH=/usr/bin:/bin:$PATH
+here=$(dirname "$0")
+printf 'mise %s | agent=%s exec_auto=%s auto=%s\n' "$*" "${DUCKDB_AGENT_MODE:-unset}" "${MISE_EXEC_AUTO_INSTALL:-unset}" "${MISE_NOT_FOUND_AUTO_INSTALL:-unset}" >> "$here/../log"
+[ "$1 $2 $3" = "exec -- duckdb" ] || exit 64
+[ -e "$here/../no-duckdb" ] && { echo "mise ERROR \"duckdb\" couldn't exec process: No such file or directory" >&2; exit 1; }
+[ "$4 $5 $6 $7 $8" = "-init /dev/null -noheader -csv -c" ] || exit 64
+db="$here/../installed-duckdb"
+case "$9" in
+  "INSTALL "*) n=${9#INSTALL }; echo "${n%;}" >> "$db"; exit 0 ;;
+  SELECT*)
+    n=$(printf '%s' "$9" | sed -n "s/.*(extension_name = '\([^']*\)' OR list_contains(aliases, '\1')) AND installed;$/\1/p")
+    [ -n "$n" ] || exit 64
+    grep -qw -- "$n" "$db" 2>/dev/null && echo "v:abc123"
+    exit 0 ;;
+esac
+exit 64
+"#;
+
+const DUCKDB_OP: &str = "extra.spatial@package";
+
+/// A module whose only resource is the `duckdb-extension/v1` extension `name`, with the DuckDB
+/// look-alike in place of `mise`.
+fn duckdb_fx(name: &str) -> Fx {
+    let fx = Fx::new();
+    fx.put(
+        "base/modules/extra/module.toml",
+        &format!(
+            "schema = 1\nid = \"extra\"\nplatforms = [\"macos\", \"linux\"]\nrequires = []\n\n[[resources]]\nid = \"spatial\"\nkind = \"package\"\nadapter = \"duckdb-extension/v1\"\n[resources.value]\nname = \"{name}\"\n"
+        ),
+    );
+    fs::write(fx.bin().join("mise"), FAKE_MISE_DUCKDB).unwrap();
+    fx
+}
+
+#[test]
+fn a_missing_duckdb_extension_is_installed_then_current() {
+    let fx = duckdb_fx("spatial");
+    let o = fx.preview();
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+    assert!(
+        text(&o.stdout).contains("install spatial with duckdb-extension/v1"),
+        "{}",
+        text(&o.stdout)
+    );
+    assert!(!fx.log().contains("INSTALL"), "{}", fx.log());
+    let o = fx.packages(&digest_of(&o));
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+    assert!(
+        text(&o.stdout).contains(&format!("updated {DUCKDB_OP}")),
+        "{}",
+        text(&o.stdout)
+    );
+    let log = fx.log();
+    assert_eq!(
+        log.lines()
+            .filter(|l| l.contains("-c INSTALL spatial;"))
+            .count(),
+        1,
+        "{log}"
+    );
+    // Every DuckDB call runs with agent mode off and without a mise auto-install.
+    assert!(
+        log.lines()
+            .all(|l| l.ends_with("| agent=0 exec_auto=false auto=false")),
+        "{log}"
+    );
+    let o = fx.packages(&digest_of(&fx.preview()));
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+    assert!(
+        text(&o.stdout).contains(&format!("current {DUCKDB_OP}")),
+        "{}",
+        text(&o.stdout)
+    );
+    assert_eq!(fx.log().matches("INSTALL").count(), 1, "{}", fx.log());
+}
+
+#[test]
+fn an_installed_duckdb_extension_is_current_and_nothing_is_installed() {
+    let fx = duckdb_fx("spatial");
+    fs::write(fx.fake.path().join("installed-duckdb"), "spatial\n").unwrap();
+    let o = fx.packages(&digest_of(&fx.preview()));
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+    assert!(
+        text(&o.stdout).contains(&format!("current {DUCKDB_OP}")),
+        "{}",
+        text(&o.stdout)
+    );
+    assert!(!fx.log().contains("INSTALL"), "{}", fx.log());
+}
+
+/// DuckDB lists `sqlite` as an alias of `sqlite_scanner`: a declaration by the alias is current
+/// once the extension is installed, and is not installed again.
+#[test]
+fn a_duckdb_extension_declared_by_its_alias_is_current() {
+    let fx = duckdb_fx("sqlite");
+    fs::write(
+        fx.fake.path().join("installed-duckdb"),
+        "sqlite_scanner sqlite sqlite3\n",
+    )
+    .unwrap();
+    let o = fx.packages(&digest_of(&fx.preview()));
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+    assert!(
+        text(&o.stdout).contains(&format!("current {DUCKDB_OP}")),
+        "{}",
+        text(&o.stdout)
+    );
+    assert!(!fx.log().contains("INSTALL"), "{}", fx.log());
+}
+
+/// The probe compares lower-case names, so an upper-case name is refused before DuckDB runs.
+#[test]
+fn an_upper_case_duckdb_extension_name_is_a_manifest_error() {
+    let fx = duckdb_fx("Spatial");
+    let o = fx.preview();
+    assert_eq!(code(&o), 3, "{}\n{}", stderr(&o), text(&o.stdout));
+    assert!(stderr(&o).contains("E_MANIFEST_INVALID"), "{}", stderr(&o));
+    assert!(!fx.provider_ran(), "{}", fx.log());
+}
+
+/// A missing `duckdb` or `mise` blocks the extension with the tool named; the probe installs
+/// nothing.
+#[test]
+fn a_missing_duckdb_or_mise_blocks_the_extension_and_names_the_tool() {
+    let fx = duckdb_fx("spatial");
+    fs::write(fx.fake.path().join("no-duckdb"), "").unwrap();
+    let o = fx.preview();
+    assert_eq!(code(&o), 3, "{}\n{}", stderr(&o), text(&o.stdout));
+    assert!(stderr(&o).contains("E_PROBE_FAILED"), "{}", stderr(&o));
+    assert!(
+        stderr(&o).contains("duckdb is not installed"),
+        "{}",
+        stderr(&o)
+    );
+    assert!(
+        text(&o.stdout).contains(&format!("blocked {DUCKDB_OP}")),
+        "{}",
+        text(&o.stdout)
+    );
+    fs::remove_file(fx.bin().join("mise")).unwrap();
+    let o = fx.preview();
+    assert_eq!(code(&o), 3, "{}\n{}", stderr(&o), text(&o.stdout));
+    assert!(stderr(&o).contains("mise was not found"), "{}", stderr(&o));
+    assert!(!fx.log().contains("INSTALL"), "{}", fx.log());
+}
+
+/// The name goes into a SQL statement: anything but letters, digits and `_` is refused before
+/// DuckDB runs.
+#[test]
+fn a_duckdb_extension_name_that_is_not_plain_is_a_manifest_error() {
+    let fx = duckdb_fx("x;DROP");
+    let o = fx.preview();
+    assert_eq!(code(&o), 3, "{}\n{}", stderr(&o), text(&o.stdout));
+    assert!(stderr(&o).contains("E_MANIFEST_INVALID"), "{}", stderr(&o));
+    assert!(!fx.provider_ran(), "{}", fx.log());
+}

@@ -1,6 +1,6 @@
 # DFM-25 C01: move the side-channel installers into dfm
 
-Status: draft for owner review, 2026-11-11; slice 4 superseded by the owner decision of 2026-11-12 (see "Owner decision of 2026-11-12"); owner answers of 2026-11-11 (fantasy-sports as an external bundle) and of 2026-11-12 (mise, `skills` and declared uv sources ungated) applied. Kaneo: DFM-25 (C01; the grant rule is C04). Inputs: the code at main 0e90709 and `~/.dotfiles/scripts/sync-side-channels.sh` at the dotfiles `main` of 2026-11-11.
+Status: draft for owner review, 2026-11-11; slice 4 superseded by the owner decision of 2026-11-12 (see "Owner decision of 2026-11-12"); slice 5 built on 2026-11-16 except G5 (see "Delivery"); owner answers of 2026-11-11 (fantasy-sports as an external bundle) and of 2026-11-12 (mise, `skills` and declared uv sources ungated) applied. Kaneo: DFM-25 (C01; the grant rule is C04). Inputs: the code at main 0e90709 and `~/.dotfiles/scripts/sync-side-channels.sh` at the dotfiles `main` of 2026-11-11.
 
 ## Intent
 
@@ -65,7 +65,7 @@ A new package adapter follows docs/packages.md: a read-only probe before the pla
 - **`agents`.** Unchanged, but the profile now declares it. The managed copy comes from a `git-checkout/v1` resource, so the updater still never clones. The `agents` updater keeps the pull of its copy, and `checkouts` skips that copy, so the install never runs from a revision that another updater has not pulled yet. The working-copy rule stays.
 - **`mise`.** Runs `mise install` before the existing flow.
 - **`lefthook`.** Runs `lefthook install` in the bound checkout. A missing `lefthook` is `blocked`. A failure is `failed` and stops nothing, as in the script.
-- **`firstmate`.** Runs `~/.local/bin/firstmate --request-update` and reports `pending` (an asynchronous request is not completion). It is declared last and runs only after the other updaters. A missing entry point is `blocked`.
+- **`firstmate`.** Runs `~/.local/bin/firstmate --request-update`. Exit 0 is `current` with the note `update requested; Firstmate reports its own completion`; another exit is `failed`. This changes the earlier `pending`: in dfm `pending` means a stop request or an unreadable version, it adds a `warning:` line and counts as a failure of the upgrade part, so it would warn on every sync. The note keeps the request apart from completion. It is declared last and runs only after the other updaters. A missing entry point is `blocked`.
 - **`side-channels`.** Deleted in the last slice.
 
 ### Fantasy-sports delivery
@@ -88,12 +88,12 @@ User experience comes first, and dfm manages the package manager, not the packag
 - The `skills`, `npm` and `uv` updaters need no per-package grant. An updater acts on everything its package manager lists. `skills` runs `mise exec -- npx skills@latest update`.
 - No per-package adapter, pin, grant or special case. The `skill-source/v1` and `codex-plugin/v1` adapters are dropped. New updaters (`go`, `cargo`) and the `codex` plugin marketplace upgrade replace them.
 - Grants stay for the dotfiles checkout's origins and for sources that a nested source declares (PR #102). The npm registry forcing of the `skills` and `npm` updaters stays.
-- The `agents` updater keeps its upstream grant.
+- The `agents` updater keeps its upstream grant. Superseded by PR #105: `agents` installs from the owner's working copy, never fetches, and needs no grant.
 - The owner defers the fantasy-sports external bundle (slice 3, step 9) to summer 2027. `install-fantasy-sports.sh` stays in the side-channel script until then.
 
 ### Firstmate
 
-dfm clones Firstmate itself with a `git-checkout/v1` resource (`url = "https://github.com/kunchenguid/firstmate"`, `branch = "main"`), so the grant covers the URL that is fetched. `firstmate --setup` is not run: its clone step is skipped when the checkout exists, and its other step migrates a legacy detached install that no machine has after this change. The wrapper's own origin check (`~/.local/bin/firstmate`) refuses to launch a checkout with another origin, so a wrapper and a declaration that disagree fail closed. Firstmate pulls its own checkout (`--request-update`, step 14), so `checkouts` skips it. `firstmate-native/v1` stays a catalog entry with no adapter.
+dfm clones Firstmate itself with a `git-checkout/v1` resource (`url = "https://github.com/kunchenguid/firstmate"`, `branch = "main"`), so the grant covers the URL that is fetched. `firstmate --setup` is not run: its clone step is skipped when the checkout exists, and its other step migrates a legacy detached install that no machine has after this change. The wrapper's own origin check (`~/.local/bin/firstmate`) refuses to launch a checkout with another origin, so a wrapper and a declaration that disagree fail closed. Firstmate pulls its own checkout (`--request-update`, step 14), so `checkouts` skips it. The skip is data, not a path in Rust: the resource declares `update_policy = "native-request"`, and `checkouts` never pulls a checkout whose `update_policy` is `hold` or `native-request`. `firstmate-native/v1` stays a catalog entry with no adapter.
 
 ### Order inside one sync
 
@@ -127,4 +127,4 @@ Each slice is one PR that passes the gate and gets Codex's thumbs-up. Each slice
 2. `git-checkout/v1` and the `checkouts` updater (step 7), then the agent registry (step 8), and the bundle's `op-template/v1` secret (step 6).
 3. The fantasy-sports external bundle (step 9). Deferred by the owner to summer 2027 (2026-11-12).
 4. Package managers (2026-11-12): `skills` at latest, `go` and `cargo` updaters, `codex` plugin marketplaces (steps 4 and 13). No per-package adapter.
-5. `duckdb-extension/v1` (step 3), `lefthook` (step 10), Firstmate (steps 5 and 14), then deletion of the script, the recipe and `Updater::SideChannels` (G5).
+5. `duckdb-extension/v1` (step 3), `lefthook` (step 10), Firstmate (steps 5 and 14), then deletion of the script, the recipe and `Updater::SideChannels` (G5). Built on 2026-11-16, except G5. G5 waits for the fantasy-sports external bundle (slice 3, deferred by the owner to summer 2027): until then the dotfiles script keeps `install-fantasy-sports.sh`, and the first install of the gh-axi skill and of the Codex ponytail plugin, so `Updater::SideChannels`, its tests and its docs stay.

@@ -232,6 +232,21 @@ impl Runner {
     pub fn run(&self, req: &Request<'_>) -> Result<Output, Refusal> {
         let program = self.resolve(req.program)?;
         self.ensure_cwd()?;
+        self.start(req, program, &self.cwd)
+    }
+
+    /// [`Runner::run`] with `dir` as the child's working directory instead of [`Runner::cwd`],
+    /// for a tool that acts on the repository it runs in (`lefthook install` in the bound
+    /// checkout). `dir` must be an existing directory; it is neither created nor changed.
+    pub fn run_in(&self, req: &Request<'_>, dir: &Path) -> Result<Output, Refusal> {
+        let program = self.resolve(req.program)?;
+        if !dir.is_dir() {
+            return Err(refused(format!("{} is not a directory", dir.display())));
+        }
+        self.start(req, program, dir)
+    }
+
+    fn start(&self, req: &Request<'_>, program: PathBuf, dir: &Path) -> Result<Output, Refusal> {
         if let Some(bad) = req.args.iter().find(|a| a.contains('\0')) {
             return Err(refused(format!("argument {bad:?} holds a NUL byte")));
         }
@@ -245,7 +260,7 @@ impl Runner {
             .env("HOME", &self.home)
             .env("LANG", "C")
             .envs(req.env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
-            .current_dir(&self.cwd)
+            .current_dir(dir)
             .stdin(if req.stdin.is_some() {
                 Stdio::piped()
             } else {

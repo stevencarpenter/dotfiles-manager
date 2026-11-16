@@ -1224,6 +1224,31 @@ fn c09_competing_owners_are_refused() {
     assert_eq!(e.conflicts_with.as_deref(), Some("agents.skills"));
 }
 
+/// A `skills/v1` entry name becomes one path component under each target root, so a name that
+/// climbs (`../x`) or nests (`a/b`) is refused at resolve time (DFM-25 C03).
+#[test]
+fn a_skills_entry_name_that_is_not_one_safe_component_is_refused() {
+    for name in ["..~1x", "a~1b", ".."] {
+        let mut set = examples();
+        edit(
+            &mut set,
+            AGENTS_MOD,
+            "add",
+            &format!("/resources/2/value/entries/{name}"),
+            Some("{ source = \"files/sample-audit\", enabled = true }"),
+        );
+        let e = refused(
+            &set,
+            PERSONAL,
+            Code::TargetInvalid,
+            AGENTS_MOD,
+            Some("agents.skills"),
+            "entry name is not a single safe component",
+        );
+        assert_eq!(e.field.as_deref(), Some("/entries"), "{name}: {e}");
+    }
+}
+
 /// A `git-checkout/v1` claims its HOME `path`, so two checkouts at one path, or one inside
 /// another, collide at resolve time (DFM-25 C01).
 #[test]

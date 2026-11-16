@@ -1,9 +1,9 @@
 //! The `render` and `assemble` adapters (docs/adapters.md). Pure functions of the resource
 //! value and the verified inputs apply or the planner supplies. They open no file.
 
-use super::checkout;
 use super::script::{self, ScriptCx};
 use super::{Adapter, package, registry, secret, service};
+use super::{checkout, duckdb};
 use dfm_engine::{Completion, Dir, Generator, GeneratorInputs, Got, Runner, Sys};
 use dfm_model::digest::sha256_hex;
 use dfm_model::fold;
@@ -276,6 +276,8 @@ impl Generator for Generators<'_> {
         let value = &r.value;
         if op.adapter == checkout::ADAPTER {
             checkout::probe(runner, r, self.scripts.as_ref())
+        } else if op.adapter == duckdb::ADAPTER {
+            duckdb::probe(runner, value)
         } else if op.adapter == script::ADAPTER {
             let update = op.action == Action::Upgrade;
             script::probe(runner, &op.resource, value, self.scripts.as_ref(), update)
@@ -318,6 +320,8 @@ impl Generator for Generators<'_> {
         };
         if op.adapter == checkout::ADAPTER {
             checkout::install(runner, r, cx("checkout")?)
+        } else if op.adapter == duckdb::ADAPTER {
+            duckdb::install(runner, value)
         } else if op.adapter == script::ADAPTER {
             script::install(runner, &op.resource, value, cx("script")?)
         } else if package::uv_sourced(&op.adapter, value) {

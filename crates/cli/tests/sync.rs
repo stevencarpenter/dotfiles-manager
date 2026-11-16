@@ -4349,6 +4349,45 @@ fn sync_clones_a_declared_checkout_then_fast_forwards_it() {
     assert_eq!(git(&copy, &["rev-parse", "--short", "HEAD"]), after);
 }
 
+/// DFM-25 (C01 slice 5): a checkout whose `update_policy` is `native-request` (Firstmate pulls
+/// its own) is cloned by the packages scope when missing, and the `checkouts` row never pulls it.
+#[test]
+fn sync_clones_a_held_checkout_and_never_pulls_it() {
+    let u = Up::new(r#"["checkouts"]"#);
+    let tool = Remote::new(u.fake.path(), "tool");
+    put(&tool.seed, "README", "v1\n");
+    tool.push("v1");
+    put(
+        &u.fx.upstream.seed,
+        "base/modules/extra/module.toml",
+        &format!(
+            "{}\n[[resources]]\nid = \"tool\"\nkind = \"package\"\nadapter = \"git-checkout/v1\"\n[resources.value]\nurl = \"{}\"\npath = \"x/tool\"\nupdate_policy = \"native-request\"\n",
+            common::EXTRA,
+            tool.origin()
+        ),
+    );
+    u.fx.upstream.push("declare the held checkout");
+    let copy = u.fx.h("x/tool");
+    let o = u.sync(&[]);
+    assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
+    let before = git(&copy, &["rev-parse", "--short", "HEAD"]);
+    put(&tool.seed, "README", "v2\n");
+    tool.push("v2");
+    let o = u.sync(&[]);
+    assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
+    let s = stdout(&o);
+    assert!(
+        s.contains("  checkouts: would fast-forward no checkout; 1 held by update_policy"),
+        "{s}"
+    );
+    assert!(s.contains("  current checkouts"), "{s}");
+    assert!(
+        s.contains("    note: extra.tool held (update_policy native-request); not pulled"),
+        "{s}"
+    );
+    assert_eq!(git(&copy, &["rev-parse", "--short", "HEAD"]), before);
+}
+
 /// The checkout `extra.tool` of `tool`, declared upstream and cloned by a first sync. Returns the
 /// checkout path and the revision it holds.
 fn cloned_checkout(u: &Up, tool: &Remote) -> (PathBuf, String) {
@@ -4589,6 +4628,103 @@ fn a_second_copy_shows_the_version_brew_left() {
         "{s}"
     );
     assert!(!s.contains("Homebrew cask codex 0.164.0"), "{s}");
+}
+
+/// DFM-25 (C01 slice 5): `lefthook install` runs in the bound checkout, and a failure there does
+/// not stop `firstmate`, which runs through its live layout: `~/.local/bin/firstmate` is a link
+/// to `home/.local/bin/firstmate` in the bound checkout.
+#[test]
+fn lefthook_runs_in_the_bound_checkout_and_firstmate_runs_through_its_link() {
+    let u = Up::new(r#"["lefthook", "firstmate"]"#);
+    let log = u.st("log");
+    fs::write(
+        u.fake.path().join("bin/lefthook"),
+        format!(
+            "#!/bin/sh\nprintf 'lefthook %s | pwd=%s\\n' \"$*\" \"$(/bin/pwd)\" >> {}\nexit 1\n",
+            log.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(
+        u.fake.path().join("bin/lefthook"),
+        fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
+    let rel = "home/.local/bin/firstmate";
+    put(
+        &u.fx.upstream.seed,
+        rel,
+        &format!(
+            "#!/bin/sh\nprintf 'firstmate %s\\n' \"$*\" >> {}\n",
+            log.display()
+        ),
+    );
+    fs::set_permissions(
+        u.fx.upstream.seed.join(rel),
+        fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
+    u.fx.upstream.push("add the firstmate entry point");
+    let o = u.sync(&["--no-upgrade"]);
+    assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
+    let link = u.fx.h(".local/bin/firstmate");
+    fs::create_dir_all(link.parent().unwrap()).unwrap();
+    std::os::unix::fs::symlink(u.fx.root.join(rel), &link).unwrap();
+    let o = u.sync(&[]);
+    assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
+    let s = stdout(&o);
+    assert!(s.contains("  failed lefthook"), "{s}");
+    assert!(s.contains("  current firstmate"), "{s}");
+    assert!(
+        s.contains("    note: update requested; Firstmate reports its own completion"),
+        "{s}"
+    );
+    let root = u.fx.root.canonicalize().unwrap();
+    assert_eq!(
+        u.log(),
+        format!(
+            "lefthook install | pwd={}\nfirstmate --request-update\n",
+            root.display()
+        )
+    );
+}
+
+/// DFM-25 (C05): an updater that writes through a dfm link in HOME into the bound checkout
+/// changes the tracked file the link reaches. Its row fails and the note names the file in the
+/// checkout, not the link (docs/upgrade.md, "Tracked files").
+#[test]
+fn an_updater_that_writes_a_tracked_file_through_a_home_link_fails_and_names_the_checkout_path() {
+    let u = Up::new(r#"["claude", "codex"]"#);
+    let o = u.sync(&["--no-upgrade"]);
+    assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
+    let link = u.fx.h(".config/git/config");
+    let tracked = u.fx.root.join("base/modules/core/files/gitconfig");
+    assert_eq!(
+        fs::canonicalize(&link).unwrap(),
+        fs::canonicalize(&tracked).unwrap()
+    );
+    fs::write(u.st("write-claude"), link.to_str().unwrap()).unwrap();
+    let o = u.sync(&[]);
+    assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
+    let s = stdout(&o);
+    assert!(s.contains("  failed claude"), "{s}");
+    let root = fs::canonicalize(&u.fx.root).unwrap();
+    let named = |r: &Path| {
+        s.contains(&format!(
+            "    note: E_CONFLICT: claude changed the tracked file {}/base/modules/core/files/gitconfig (M); it is left in place, not reverted, staged or committed",
+            r.display()
+        ))
+    };
+    assert!(named(&u.fx.root) || named(&root), "{s}");
+    assert!(!s.contains(&link.display().to_string()), "{s}");
+    assert!(s.contains("  current codex"), "{s}");
+    assert!(
+        fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    assert!(fs::read_to_string(&tracked).unwrap().ends_with("changed\n"));
 }
 
 /// DFM-25 (C05, G5): an updater that changes a tracked file in the bound checkout fails its

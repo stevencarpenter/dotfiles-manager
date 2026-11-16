@@ -8,8 +8,8 @@
 //! Every child runs through the engine runner (fixed search path, rebuilt environment, process
 //! group, timeout). The providers' standard error is bounded and never printed or persisted.
 
-use super::checkout;
 use super::script::{self, ScriptCx};
+use super::{checkout, duckdb};
 use dfm_engine::{End, ProcOutput, ProcRequest, Runner};
 use dfm_model::plan::{PackageState, Scope};
 use dfm_model::resolve::{Resolved, ResolvedResource, Value};
@@ -99,7 +99,7 @@ pub fn name(value: &Value) -> Result<String, Refusal> {
 
 /// The declared `update_policy`, one of `rolling`, `hold` and `native-request`. Any other
 /// value is a manifest error, so a typo is refused instead of holding the package silently.
-fn policy(value: &Value) -> Result<&str, Refusal> {
+pub(super) fn policy(value: &Value) -> Result<&str, Refusal> {
     let p = value
         .get("update_policy")
         .and_then(Value::as_str)
@@ -731,6 +731,8 @@ pub(crate) const SOURCE_ADAPTERS: &[(&str, Option<&str>)] = &[
     (UV_TOOL, Some("/source")),
     (checkout::ADAPTER, Some("/url")),
     (script::ADAPTER, None),
+    // DuckDB's own extension repository is the tool's own owner, as for brew.
+    (duckdb::ADAPTER, None),
 ];
 
 /// The [`SOURCE_ADAPTERS`] pointer of `adapter`, or `None`.
@@ -1780,6 +1782,8 @@ fn facts(
         }
         let looked = if r.adapter == checkout::ADAPTER {
             checkout::probe(runner, r, scripts)
+        } else if r.adapter == duckdb::ADAPTER {
+            duckdb::probe(runner, &r.value)
         } else if r.adapter == script::ADAPTER {
             script::probe(runner, &r.id, &r.value, scripts, update)
         } else if uv_sourced(&r.adapter, &r.value) {

@@ -1,6 +1,6 @@
 # Packages
 
-The `homebrew/v1`, `mise/v1`, `uv-tool/v1`, `apt/v1`, `git-checkout/v1` and `script/v1` package adapters and the `packages` command. The rolling update (`packages --update`) is in [docs/toolchains.md](toolchains.md). This document describes the behavior at HEAD.
+The `homebrew/v1`, `mise/v1`, `uv-tool/v1`, `apt/v1`, `git-checkout/v1`, `duckdb-extension/v1` and `script/v1` package adapters and the `packages` command. The rolling update (`packages --update`) is in [docs/toolchains.md](toolchains.md). This document describes the behavior at HEAD.
 
 | Part | Location |
 | --- | --- |
@@ -61,6 +61,7 @@ Nothing else reads a version. A package plan installs what is missing and never 
 | `mise/v1` | `mise ls --installed --json <tool>`. JSON, because the table truncates a long tool name. | Exit 0 and a JSON array with an installed `version` that matches. `[]` is missing. Any other answer is `E_PROBE_FAILED`. | `mise install <tool>@latest` for a bare name, `mise install <tool>@<version>` for a declared `tool@version`. The selector is always sent, because `mise install <tool>` installs only the version mise's configuration requests, and that configuration is hidden. |
 | `uv-tool/v1` | `uv tool list`. With `source`: uv's receipt, `~/.local/share/uv/tools/<name>/uv-receipt.toml` (at most 1 MiB, a regular file), and no provider call. | A `<name> v<version>` line for the name, compared as uv normalizes names. `No tools installed` or no line is missing. With `source`: the requirement for the declared name has a `git` of `<repository>?rev=<rev>` (of the same repository at any rev for the ref-less form), or a `directory` of the canonical path. A missing or unreadable receipt, or another source, is missing. | `uv tool install <name>`. With `source`: `uv tool install --force git+<repository>`, `uv tool install --force git+<repository>@<rev>` or `uv tool install --force <canonical path>`, which replaces a copy from another source. |
 | `git-checkout/v1` | `git -C <path> config --get remote.origin.url` and `git -C <path> rev-parse --short HEAD`. Local only, no network. `GIT_CEILING_DIRECTORIES` is the path's parent, so git never reads an enclosing repository. | `<path>` has a `.git` and its origin has the same source identity as `url`. The version is the short HEAD. No path is missing. Any other path, a checkout of another repository, or a checkout whose HEAD does not resolve (no commit) is another owner. | `git clone [--branch <branch>] -- <url> <HOME>/<parent>/.<name>.dfm-clone-<pid>`, a sibling of the path in its parent (for `path = "x/r"`, `<HOME>/x/.r.dfm-clone-<pid>`), then a rename to `<HOME>/<path>` |
+| `duckdb-extension/v1` | `mise exec -- duckdb -init /dev/null -noheader -csv -c "SELECT 'v:' \|\| coalesce(extension_version, '') FROM duckdb_extensions() WHERE (extension_name = '<name>' OR list_contains(aliases, '<name>')) AND installed;"`. An in-memory database; nothing is written. | One `v:<version>` line. No line is missing. A missing `mise` or `duckdb`, or any other answer, is `E_PROBE_FAILED` with the tool named. | `mise exec -- duckdb -init /dev/null -noheader -csv -c "INSTALL <name>;"` |
 | `apt/v1` | `dpkg-query -W -f=${Status} <name>` | Exit 0 and `install ok installed` | None. Installing needs root, and a HOME adapter never escalates. A missing apt package is a blocker, `E_PRIVILEGE_UNSUPPORTED`, with the command to run by hand. |
 
 Provider environment (the variables reach only the manager's child):
@@ -102,15 +103,28 @@ These calls load the formula's Ruby file, which for a non-official tap is third-
 
 ### Git checkouts
 
-A `git-checkout/v1` resource clones one git repository to a path under HOME. Its fields are `url` (required), `path` (required, relative to HOME) and `branch` (optional).
+A `git-checkout/v1` resource clones one git repository to a path under HOME. Its fields are `url` (required), `path` (required, relative to HOME), `branch` (optional) and `update_policy` (optional).
 
 - `url` is `https://<host>/<path>`, `ssh://git@<host>/<path>` or `git@<host>:<path>`. A local path, a `file://` URL, an `owner/repo` shorthand and userinfo other than `git@` are `E_MANIFEST_INVALID`. So is a `branch` with whitespace, a leading `-` or `..`.
 - The probe compares the source identity of `url` with that of the checkout's `remote.origin.url`. A path that is not a git checkout, or a checkout of another repository, is another owner: `E_CONFLICT`, and nothing is written. The fix reads `move or remove ~/<path>, or point the declaration at the repository it holds`.
 - The install runs `git clone [--branch <branch>] -- <url> <temporary>` with the runner's base environment (`PATH`, `HOME`, `LANG=C`) and `GIT_TERMINAL_PROMPT=0`. When the manager's own environment has `SSH_AUTH_SOCK`, the clone gets it too, so a key held only in an ssh-agent can clone. No other variable passes through. The URL is passed as declared. The temporary directory is the sibling `.<name>.dfm-clone-<pid>` of `<path>`, in a parent directory the install creates if needed. A successful clone is renamed to `<path>`. A failed clone removes the temporary directory and leaves `<path>` absent, so the next plan lists the install again. A directory sibling left by an earlier killed run is removed before the clone. A file or a link of that name is left alone.
 - `branch` matters only at clone time. The checkout then follows the branch its clone tracks.
+- `update_policy` is `rolling` (the default when absent), `hold` or `native-request`. Another value is `E_MANIFEST_INVALID`. With `hold` or `native-request` the `checkouts` step of `dfm sync` never pulls the checkout: `native-request` is for a tool that pulls its own checkout, such as Firstmate (docs/upgrade.md). The packages scope still clones a missing checkout whatever the policy.
 - `path` is an ownership claim against other checkouts only. Two checkouts at one path (compared without case), or one checkout inside another, are `E_TARGET_COLLISION` at resolve time. A checkout below a directory link, or below any other resource's output, resolves: `~/.config/tmux/plugins/tpm` under a linked `~/.config/tmux` is the usual case, and the `checkouts` step allows it only where the source checkout's git ignores the path (docs/upgrade.md).
 - The plan applies the same rule. A checkout path at or above the bound checkout or a nested source checkout, or inside one whose git does not ignore it, is `E_MANIFEST_INVALID` with the note `<id>: <path> is a dotfiles source checkout; sync updates it`, and nothing is cloned. During `sync` the ignore rules are read from the staged copy, the tree the run publishes. The install checks the rule again.
 - A checkout that the bound checkout declares needs no grant (owner decision 2026-11-12). A checkout that a nested source of the lock declares, or whose `url` such a source changes, is cloned only with a grant for its url; without one its row is `blocked` with `E_SOURCE_UNTRUSTED` and the `--trust-origin` command (docs/sync.md, "Source identities"). The packages scope only clones a missing checkout and never pulls. The `checkouts` step fast-forwards it.
+
+### DuckDB extensions
+
+A `duckdb-extension/v1` resource installs one DuckDB extension from DuckDB's own extension repository. Its one field is `name` (required).
+
+- `name` goes into a SQL statement, so it must be lower-case ASCII letters, digits or `_`, at most 64 characters, as DuckDB lists its extensions. Anything else is `E_MANIFEST_INVALID`, and DuckDB does not run.
+- The probe matches `name` against the extension's name and its aliases. `sqlite` is an alias of `sqlite_scanner`, and `INSTALL sqlite` installs `sqlite_scanner`, so a declaration by the alias is current once it is installed.
+- `duckdb` is a mise tool, so every call runs `mise exec -- duckdb`, as the `go` updater runs `go`. mise reads its global configuration to find the tool. So `MISE_NO_CONFIG=1`, which the `mise/v1` probe sets, cannot be set here: without the configuration mise has no DuckDB version to run. The file is the live `~/.config/mise/config.toml`, which a `mise activate` shell already evaluates at every prompt, so the probe adds no new evaluation of it (an accepted residual risk, docs/sync.md). `MISE_EXEC_AUTO_INSTALL=false` and `MISE_NOT_FOUND_AUTO_INSTALL=false` keep the probe read-only: a missing DuckDB is not installed.
+- Every call sets `DUCKDB_AGENT_MODE=0`. DuckDB 2 changes its behavior when it sees an agent's variables. `-init /dev/null` skips `~/.duckdbrc`.
+- DuckDB's extension repository is the tool's own owner, as Homebrew's is for `brew`, so no grant is needed (`SOURCE_ADAPTERS`).
+- DuckDB keeps extensions per DuckDB version. After a DuckDB upgrade the probe finds the extension missing, and the next sync installs it again.
+- `packages --update` does not update an extension. An installed extension stays `current`.
 
 ### Script declarations
 

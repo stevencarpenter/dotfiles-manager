@@ -1637,15 +1637,15 @@ fn a_changed_handler_replaces_the_old_entry_and_no_stale_one_remains() {
 fn keys_the_managed_block_never_sets_keep_their_values() {
     let fx = Fx::base();
     fx.live(
-        r#"{"$schema":"https://json.schemastore.org/claude-code-settings.json","model":"haiku","theme":"dark","editorMode":"vim","effortLevel":"medium","permissions":{"defaultMode":"acceptEdits"},"teammateMode":"tmux","voiceEnabled":true,"sandbox":{"filesystem":{"allowWrite":["/fixture/user-write"]}}}"#,
+        r#"{"$schema":"https://json.schemastore.org/claude-code-settings.json","model":"example-model","theme":"value-a","editorMode":"value-b","effortLevel":"value-c","permissions":{"defaultMode":"acceptEdits"},"teammateMode":"tmux","voiceEnabled":true,"sandbox":{"filesystem":{"allowWrite":["/fixture/user-write"]}}}"#,
     );
     assert_eq!(code(&fx.apply()), 0);
     let j = fx.live_json();
     for (k, v) in [
-        ("theme", "dark"),
-        ("editorMode", "vim"),
-        ("model", "haiku"),
-        ("effortLevel", "medium"),
+        ("theme", "value-a"),
+        ("editorMode", "value-b"),
+        ("model", "example-model"),
+        ("effortLevel", "value-c"),
     ] {
         assert_eq!(j[k], v, "in-tool key {k} was changed");
     }
