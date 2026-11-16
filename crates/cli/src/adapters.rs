@@ -189,7 +189,8 @@ fn handlers() -> Field {
 /// One adapter: what the resolver validates against, and the generator if the adapter produces
 /// file content. This table is the only place in the Rust code that names an adapter, so the
 /// catalog and the generators cannot disagree. `scripts/check_examples.py` keeps its own list
-/// for the example check.
+/// for the example check; the test `the_example_check_lists_exactly_the_adapters_of_the_catalog`
+/// keeps that list equal to this table.
 pub struct Adapter {
     pub spec: AdapterSpec,
     pub generator: Option<Gen>,
@@ -518,6 +519,7 @@ pub fn builtin_catalog() -> AdapterCatalog {
 #[cfg(test)]
 mod tests {
     use super::{git_includes, registry};
+    use std::collections::BTreeSet;
 
     #[test]
     fn every_generated_kind_has_a_generator_and_nothing_else_has_one() {
@@ -568,6 +570,59 @@ mod tests {
             table.iter().filter(|a| a.installs()).count(),
             packages.len()
         );
+    }
+
+    /// `scripts/check_examples.py` checks the example fixtures without the Rust catalog, so it
+    /// keeps its own `ADAPTERS` map of kind to adapter ids. This test keeps that map equal to
+    /// [`registry`], in both directions.
+    #[test]
+    fn the_example_check_lists_exactly_the_adapters_of_the_catalog() {
+        const SCRIPT: &str = "scripts/check_examples.py";
+        let text = include_str!("../../../scripts/check_examples.py");
+        let block = text
+            .split_once("\nADAPTERS = {\n")
+            .and_then(|(_, rest)| rest.split_once("\n}\n"))
+            .map(|(block, _)| block)
+            .unwrap_or_else(|| panic!("{SCRIPT}: no `ADAPTERS = {{` block ending in a `}}` line"));
+        // A quoted string followed by `:` is a kind; the strings after it are its adapter ids.
+        let mut script = BTreeSet::new();
+        let mut kind = None;
+        let mut rest = block;
+        while let Some((_, open)) = rest.split_once('"') {
+            let (word, after) = open
+                .split_once('"')
+                .unwrap_or_else(|| panic!("{SCRIPT}: unterminated string in ADAPTERS"));
+            if after.trim_start().starts_with(':') {
+                kind = Some(word);
+            } else {
+                let kind =
+                    kind.unwrap_or_else(|| panic!("{SCRIPT}: ADAPTERS lists {word} before a kind"));
+                script.insert((kind, word));
+            }
+            rest = after;
+        }
+        assert!(!script.is_empty(), "{SCRIPT}: ADAPTERS lists no adapter");
+        let table = registry();
+        let catalog: BTreeSet<(&str, &str)> = table
+            .iter()
+            .map(|a| (a.spec.kind, a.spec.id.as_str()))
+            .collect();
+        let mut errors: Vec<String> = catalog
+            .difference(&script)
+            .map(|(kind, id)| {
+                format!(
+                    "adapter {id} (kind {kind}) is in the catalog (crates/cli/src/adapters.rs) \
+                     but not in ADAPTERS in {SCRIPT}: add it there under \"{kind}\""
+                )
+            })
+            .collect();
+        errors.extend(script.difference(&catalog).map(|(kind, id)| {
+            format!(
+                "ADAPTERS in {SCRIPT} lists {id} under \"{kind}\", which the catalog \
+                 (crates/cli/src/adapters.rs) does not have: remove or correct it there"
+            )
+        }));
+        assert!(errors.is_empty(), "{}", errors.join("\n"));
     }
 
     #[test]
