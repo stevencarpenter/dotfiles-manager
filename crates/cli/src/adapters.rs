@@ -4,6 +4,7 @@
 //! adapter is run here.
 
 pub(crate) mod checkout;
+pub(crate) mod duckdb;
 mod generate;
 mod merge_plan;
 pub mod package;
@@ -219,6 +220,7 @@ impl Adapter {
                     | package::UV_TOOL
                     | script::ADAPTER
                     | checkout::ADAPTER
+                    | duckdb::ADAPTER
             )
     }
 
@@ -448,6 +450,17 @@ pub fn registry() -> Vec<Adapter> {
             ),
             generator: None,
         },
+        // A DuckDB extension from DuckDB's own repository (docs/packages.md, "DuckDB extensions").
+        Adapter {
+            spec: spec(
+                duckdb::ADAPTER,
+                "package",
+                TargetRule::Forbidden,
+                Claims::None,
+                Schema::Table(vec![field("name", Schema::Str, true)]),
+            ),
+            generator: None,
+        },
         Adapter {
             spec: spec(
                 "firstmate-native/v1",
@@ -544,7 +557,7 @@ mod tests {
         assert_eq!(table.iter().filter(|a| a.renders()).count(), secrets.len());
         // Every package adapter has a provider.
         let packages: Vec<_> = table.iter().filter(|a| a.spec.kind == "package").collect();
-        assert_eq!(packages.len(), 6);
+        assert_eq!(packages.len(), 7);
         assert!(
             packages
                 .iter()
