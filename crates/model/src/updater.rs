@@ -9,7 +9,6 @@ pub enum Updater {
     Checkouts,
     Claude,
     Codex,
-    Firstmate,
     Go,
     Lefthook,
     Mise,
@@ -22,14 +21,13 @@ pub enum Updater {
 }
 
 impl Updater {
-    pub const ALL: [Updater; 16] = [
+    pub const ALL: [Updater; 15] = [
         Updater::Agents,
         Updater::Brew,
         Updater::Cargo,
         Updater::Checkouts,
         Updater::Claude,
         Updater::Codex,
-        Updater::Firstmate,
         Updater::Go,
         Updater::Lefthook,
         Updater::Mise,
@@ -49,7 +47,6 @@ impl Updater {
             Updater::Checkouts => "checkouts",
             Updater::Claude => "claude",
             Updater::Codex => "codex",
-            Updater::Firstmate => "firstmate",
             Updater::Go => "go",
             Updater::Lefthook => "lefthook",
             Updater::Mise => "mise",
@@ -88,7 +85,6 @@ mod tests {
         assert_eq!(Updater::parse("Brew"), None);
         assert_eq!(Updater::parse("agents"), Some(Updater::Agents));
         assert_eq!(Updater::parse("lefthook"), Some(Updater::Lefthook));
-        assert_eq!(Updater::parse("firstmate"), Some(Updater::Firstmate));
         assert_eq!(Updater::ALL.len(), Updater::names().split(", ").count());
         // Sync never replaces the running manager.
         assert_eq!(Updater::parse("dfm"), None);
