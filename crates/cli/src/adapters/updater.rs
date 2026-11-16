@@ -44,6 +44,9 @@ pub struct Env<'a> {
     /// `SSH_AUTH_SOCK` of the manager's own environment, passed to the fetch and the pull only,
     /// so a key held in an ssh-agent reaches git's ssh ([`ssh_agent`]).
     pub ssh_agent: Option<(String, String)>,
+    /// `XDG_STATE_HOME` of the manager's own environment ([`xdg_state_home`]). The `skills` CLI
+    /// keeps a second global record under it, which only a run with the variable reaches.
+    pub xdg_state_home: Option<(String, String)>,
 }
 
 /// `SSH_AUTH_SOCK` of the manager's own environment, when it is set and UTF-8. Only the commands
@@ -52,6 +55,15 @@ pub(crate) fn ssh_agent() -> Option<(String, String)> {
     std::env::var("SSH_AUTH_SOCK")
         .ok()
         .map(|v| ("SSH_AUTH_SOCK".to_string(), v))
+}
+
+/// `XDG_STATE_HOME` of the manager's own environment, when it is an absolute UTF-8 path. Only
+/// the `skills` run for the record under it gets the variable.
+pub(crate) fn xdg_state_home() -> Option<(String, String)> {
+    std::env::var("XDG_STATE_HOME")
+        .ok()
+        .filter(|v| Path::new(v).is_absolute())
+        .map(|v| ("XDG_STATE_HOME".to_string(), v))
 }
 
 /// A declared `git-checkout/v1` checkout.
@@ -253,27 +265,7 @@ pub fn run(u: Updater, env: &Env) -> Row {
         Updater::Agents => agents(d, env),
         Updater::Brew => brew(d, env),
         Updater::Checkouts => checkouts(d, env),
-        Updater::Skills => {
-            // As the preview says: a missing `mise` is blocked, not a failed command.
-            if let Err(e) = env.provider.resolve("mise") {
-                d.notes.push(e.detail);
-                return d.end(Status::Blocked);
-            }
-            match call(
-                env.provider,
-                "mise",
-                &args(&["exec", "--", "npx", "--yes", "skills@latest", "update"]),
-                &npm_env(&[]),
-                env.timeouts.short,
-            ) {
-                Ok(_) => {
-                    d.notes
-                        .push("skills update ran; it reports no version".into());
-                    d.end(Status::Current)
-                }
-                Err(e) => d.stop(e),
-            }
-        }
+        Updater::Skills => skills(d, env),
         Updater::Cargo => cargo(d, env),
         Updater::Go => go(d, env),
         Updater::Mise => mise(d, env),
@@ -285,6 +277,58 @@ pub fn run(u: Updater, env: &Env) -> Row {
         Updater::Uv => uv(d, env),
         Updater::Claude | Updater::Codex | Updater::Opencode => native(d, env),
     }
+}
+
+/// The global records the `skills` CLI updates, each with the variables of its run: the record
+/// under HOME, which the runner's cleared environment selects, then the one under the manager's
+/// `XDG_STATE_HOME` when that file exists (the CLI uses it when the variable is set).
+fn skills_runs(env: &Env) -> Vec<(PathBuf, Vec<(String, String)>)> {
+    let mut runs = vec![(env.home.join(".agents/.skill-lock.json"), vec![])];
+    if let Some((k, v)) = &env.xdg_state_home {
+        let record = Path::new(v).join("skills/.skill-lock.json");
+        if record.is_file() {
+            runs.push((record, vec![(k.clone(), v.clone())]));
+        }
+    }
+    runs
+}
+
+/// `skills update` for each global record ([`skills_runs`]). It reports no version, so exit 0
+/// is `current` with one note per run. A failed run fails the row and the other run still runs;
+/// a stop request starts nothing more.
+fn skills(mut d: Draft, env: &Env) -> Row {
+    // As the preview says: a missing `mise` is blocked, not a failed command.
+    if let Err(e) = env.provider.resolve("mise") {
+        d.notes.push(e.detail);
+        return d.end(Status::Blocked);
+    }
+    let mut failed = false;
+    for (record, extra) in skills_runs(env) {
+        let mut vars = npm_env(&[]);
+        vars.extend(extra);
+        match call(
+            env.provider,
+            "mise",
+            &args(&["exec", "--", "npx", "--yes", "skills@latest", "update"]),
+            &vars,
+            env.timeouts.short,
+        ) {
+            Ok(_) => d.notes.push(format!(
+                "skills update ran for {}; it reports no version",
+                record.display()
+            )),
+            Err((why, true)) => return d.stop((why, true)),
+            Err((why, false)) => {
+                d.notes.push(format!("{why} (record {})", record.display()));
+                failed = true;
+            }
+        }
+    }
+    d.end(if failed {
+        Status::Failed
+    } else {
+        Status::Current
+    })
 }
 
 /// The runner for a native tool: its owner directory first, then the provider path so its
@@ -2072,10 +2116,23 @@ fn preview_command(u: Updater, env: &Env) -> String {
             Err(e) => format!("blocked: {}", e.detail),
         },
         Updater::Skills => match env.provider.resolve("mise") {
-            Ok(p) => format!(
-                "would run mise exec -- npx --yes skills@latest update ({})",
-                p.display()
-            ),
+            Ok(p) => {
+                let runs = skills_runs(env);
+                let again = match runs.get(1) {
+                    Some((record, extra)) => format!(
+                        ", then again with {}={} for {}",
+                        extra[0].0,
+                        extra[0].1,
+                        record.display()
+                    ),
+                    None => String::new(),
+                };
+                format!(
+                    "would run mise exec -- npx --yes skills@latest update for {}{again} ({})",
+                    runs[0].0.display(),
+                    p.display()
+                )
+            }
             Err(e) => format!("blocked: {}", e.detail),
         },
         Updater::Cargo => match native_runner(u, env) {
@@ -2191,6 +2248,7 @@ mod tests {
         grants: Grants,
         checkouts: Vec<Result<Checkout, String>>,
         ssh_agent: Option<(String, String)>,
+        xdg_state_home: Option<(String, String)>,
     }
 
     impl T {
@@ -2241,6 +2299,7 @@ mod tests {
                 grants,
                 checkouts: vec![],
                 ssh_agent: None,
+                xdg_state_home: None,
             }
         }
 
@@ -2276,6 +2335,7 @@ mod tests {
                 grants: &self.grants,
                 checkouts: &self.checkouts,
                 ssh_agent: self.ssh_agent.clone(),
+                xdg_state_home: self.xdg_state_home.clone(),
             }
         }
 
@@ -3368,16 +3428,127 @@ mod tests {
         t.script(&t.bin.join("mise"), "exit 0");
         let r = run(Updater::Skills, &t.env());
         assert_eq!(r.status, Status::Current, "{r:?}");
-        assert!(
-            r.notes
-                .contains(&"skills update ran; it reports no version".to_string()),
-            "{r:?}"
+        assert_eq!(
+            r.notes,
+            [format!(
+                "skills update ran for {}; it reports no version",
+                t.home.join(".agents/.skill-lock.json").display()
+            )]
         );
         assert!(
             t.log()
                 .starts_with("mise exec -- npx --yes skills@latest update |"),
             "{}",
             t.log()
+        );
+    }
+
+    impl T {
+        /// `mise` that logs `XDG_STATE_HOME` and exits with `st/skills-exit-<n>` for its n-th
+        /// call (0 when absent).
+        fn skills_mise(&self) {
+            self.script(
+                &self.bin.join("mise"),
+                "n=$(($(cat \"$st/skills-n\" 2>/dev/null || echo 0) + 1)); echo $n > \"$st/skills-n\"\necho \"xdg=${XDG_STATE_HOME:-unset}\" >> \"$st/skills-env\"\nexit $(cat \"$st/skills-exit-$n\" 2>/dev/null || echo 0)",
+            );
+        }
+
+        fn skills_env(&self) -> Vec<String> {
+            fs::read_to_string(self.root.join("st/skills-env"))
+                .unwrap_or_default()
+                .lines()
+                .map(str::to_string)
+                .collect()
+        }
+
+        /// `XDG_STATE_HOME` set in the manager's environment, with or without the record.
+        fn xdg_state(&mut self, record: bool) -> PathBuf {
+            let state = self.root.join("state");
+            let lock = state.join("skills/.skill-lock.json");
+            if record {
+                fs::create_dir_all(lock.parent().unwrap()).unwrap();
+                fs::write(&lock, "{}").unwrap();
+            }
+            self.xdg_state_home = Some(("XDG_STATE_HOME".into(), state.display().to_string()));
+            lock
+        }
+    }
+
+    #[test]
+    fn skills_without_xdg_state_home_runs_once_without_the_variable() {
+        let t = T::new();
+        t.skills_mise();
+        let r = run(Updater::Skills, &t.env());
+        assert_eq!(r.status, Status::Current, "{r:?}");
+        assert_eq!(t.calls(), ["mise exec -- npx --yes skills@latest update"]);
+        assert_eq!(t.skills_env(), ["xdg=unset"]);
+    }
+
+    /// The skills CLI keeps a second global record under `XDG_STATE_HOME`; the runner clears
+    /// the variable, so a second run passes it through.
+    #[test]
+    fn skills_runs_again_for_the_record_under_xdg_state_home() {
+        let mut t = T::new();
+        t.skills_mise();
+        let lock = t.xdg_state(true);
+        let state = t.root.join("state").display().to_string();
+        assert_eq!(
+            preview(Updater::Skills, &t.env()),
+            format!(
+                "would run mise exec -- npx --yes skills@latest update for {}, then again with XDG_STATE_HOME={state} for {} ({})",
+                t.home.join(".agents/.skill-lock.json").display(),
+                lock.display(),
+                t.bin.join("mise").display()
+            )
+        );
+        let r = run(Updater::Skills, &t.env());
+        assert_eq!(r.status, Status::Current, "{r:?}");
+        assert_eq!(
+            r.notes,
+            [
+                format!(
+                    "skills update ran for {}; it reports no version",
+                    t.home.join(".agents/.skill-lock.json").display()
+                ),
+                format!(
+                    "skills update ran for {}; it reports no version",
+                    lock.display()
+                ),
+            ]
+        );
+        assert_eq!(t.calls().len(), 2);
+        assert_eq!(
+            t.skills_env(),
+            ["xdg=unset".to_string(), format!("xdg={state}")]
+        );
+    }
+
+    #[test]
+    fn skills_with_xdg_state_home_and_no_record_runs_once() {
+        let mut t = T::new();
+        t.skills_mise();
+        t.xdg_state(false);
+        assert!(!preview(Updater::Skills, &t.env()).contains("then again"));
+        let r = run(Updater::Skills, &t.env());
+        assert_eq!(r.status, Status::Current, "{r:?}");
+        assert_eq!(t.skills_env(), ["xdg=unset"]);
+    }
+
+    #[test]
+    fn a_failing_second_skills_run_is_failed() {
+        let mut t = T::new();
+        t.skills_mise();
+        let lock = t.xdg_state(true);
+        fs::write(t.root.join("st/skills-exit-2"), "1").unwrap();
+        let r = run(Updater::Skills, &t.env());
+        assert_eq!(r.status, Status::Failed, "{r:?}");
+        assert!(
+            r.notes[1].starts_with("mise exec -- npx --yes skills@latest update exited 1;"),
+            "{r:?}"
+        );
+        assert!(
+            r.notes[1].ends_with(&format!("(record {})", lock.display())),
+            "{r:?}"
         );
     }
 

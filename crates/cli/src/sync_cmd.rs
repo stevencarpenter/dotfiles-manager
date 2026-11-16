@@ -2254,6 +2254,7 @@ fn updater_env<'a>(
         grants,
         checkouts,
         ssh_agent: updater::ssh_agent(),
+        xdg_state_home: updater::xdg_state_home(),
     }
 }
 
