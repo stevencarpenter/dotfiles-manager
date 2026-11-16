@@ -5427,6 +5427,51 @@
       }
     ],
     "superseded_marker": "A requirement the owner supersedes keeps its line and ID, unchecked, with its text struck through and a note: `- [ ] ~~DFM-6.C03: text~~ Superseded 2026-10-20: reason`. A struck requirement counts as complete for leaf, epic and prerequisite completion. Only the owner supersedes; the manifest records each superseded ID with its reason.",
+    "realignment_2026_11_16": {
+      "authority": "Owner instructions 2026-11-16 (\"both decisions are fine\"; \"Remove firstmate, but keep the -axi utilities.\"; \"Do not care about fantasy-sports at this point, remove it from however it is enabled.\"; \"approve revision\") after the DFM-25 C01 slice 5 merge (main 5ef5d67, PR #108) and the removal of the firstmate updater (main b3a4ab6, PR #109).",
+      "direction": "dfm manages the package manager, not each package (owner decision 2026-11-12). The skills CLI owns skill distribution. Code in the bound checkout runs without a further grant. Firstmate is removed from the dotfiles, and fantasy-sports is synced to no machine. The side-channel script keeps the first install of the gh-axi skill and of the Codex ponytail plugin.",
+      "changes": [
+        {
+          "ticket": "DFM-25",
+          "change": "criteria superseded",
+          "criterion_ids": ["DFM-25.C02"],
+          "reason": "The skills CLI owns skill distribution (owner decision of 2026-11-12). dfm keeps its own grants and shares no logic with mcp_sync."
+        },
+        {
+          "ticket": "DFM-25",
+          "change": "criteria superseded",
+          "criterion_ids": ["DFM-25.C04"],
+          "reason": "Grants cover new dotfiles origins, nested-source declarations and script/v1 URLs. Per-package grants were removed on 2026-11-12. Code in the bound checkout (the side-channel script, the registry install script) runs without a further grant, which accepts the Codex P1 of PR #100."
+        },
+        {
+          "ticket": "DFM-25",
+          "change": "criteria superseded",
+          "criterion_ids": ["DFM-25.C05"],
+          "reason": "No updater edits a pin or lock: everything rolls (owner decision of 2026-11-12). A tracked-file guard fails an updater that changes a tracked file, and a blocked or failed updater stays listed and counted."
+        },
+        {
+          "ticket": "DFM-25",
+          "change": "criterion rewritten",
+          "criterion_ids": ["DFM-25.C01"],
+          "reason": "Excludes the first install of the gh-axi skill and of the Codex ponytail plugin (they stay in the side-channel script), the OpenCode plugin list (OpenCode loads it), Firstmate and fantasy-sports (removed by the owner).",
+          "old_text": "Cover every selected plugin/extension/skill source and installer from the ledger, including external repositories and intentional tracked lock/settings files. Tool-owned sources are out of scope (Revision 2026-11-03): tmux plugins and tpm, yazi packages, nvim plugins and Pi npm extensions."
+        },
+        {
+          "ticket": "DFM-25",
+          "change": "criterion rewritten",
+          "criterion_ids": ["DFM-25.C03"],
+          "reason": "Narrowed to dfm's own writes. An installer that dfm starts owns its destinations.",
+          "old_text": "Enumerate destination claims before publication and preserve unmanaged entries, local patches and vendored forks."
+        },
+        {
+          "ticket": "DFM-25",
+          "change": "criterion rewritten",
+          "criterion_ids": ["DFM-25.C06"],
+          "reason": "Dependency overlap is dropped: dfm models no extension dependencies.",
+          "old_text": "Tests exercise disable/substitution, dependency overlap, malicious/escaped source paths, foreign skills, local forks and lock updates without hard-coding model names or cosmetic preferences."
+        }
+      ]
+    },
     "realignment_2026_10_20": {
       "authority": "Owner instruction 2026-10-20 (\"apply\"; \"strike through the open check box lines with a note that they are superseded. Those strike throughs count as completion.\") after the daily-path audit of 2026-10-19.",
       "direction": "Fast rolling updates with no soak; no generation or rollback machinery; the lighter modular approach: mcp_sync, skills sync, the agent registry and aws-config-generator stay external generators run from the just sync wrapper; root in the binding (DFM-61); one prompt on a TTY (DFM-62); sync composes every scope (DFM-63).",
