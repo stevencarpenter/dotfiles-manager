@@ -1,6 +1,6 @@
 # DFM-25 C01: move the side-channel installers into dfm
 
-Status: draft for owner review, 2026-11-11; slice 4 superseded by the owner decision of 2026-11-12 (see "Owner decision of 2026-11-12"); slice 5 built on 2026-11-16 except G5 (see "Delivery"); owner answers of 2026-11-11 (fantasy-sports as an external bundle) and of 2026-11-12 (mise, `skills` and declared uv sources ungated) applied. Kaneo: DFM-25 (C01; the grant rule is C04). Inputs: the code at main 0e90709 and `~/.dotfiles/scripts/sync-side-channels.sh` at the dotfiles `main` of 2026-11-11.
+Status: draft for owner review, 2026-11-11; slice 4 superseded by the owner decision of 2026-11-12 (see "Owner decision of 2026-11-12"); slice 5 built on 2026-11-16 except G5 (see "Delivery"); owner answers of 2026-11-11 (fantasy-sports as an external bundle) and of 2026-11-12 (mise, `skills` and declared uv sources ungated) applied; Firstmate and fantasy-sports removed by the owner decision of 2026-11-16 (see "Owner decision of 2026-11-16"). Kaneo: DFM-25 (C01; the grant rule is C04). Inputs: the code at main 0e90709 and `~/.dotfiles/scripts/sync-side-channels.sh` at the dotfiles `main` of 2026-11-11.
 
 ## Intent
 
@@ -94,6 +94,14 @@ User experience comes first, and dfm manages the package manager, not the packag
 ### Firstmate
 
 dfm clones Firstmate itself with a `git-checkout/v1` resource (`url = "https://github.com/kunchenguid/firstmate"`, `branch = "main"`), so the grant covers the URL that is fetched. `firstmate --setup` is not run: its clone step is skipped when the checkout exists, and its other step migrates a legacy detached install that no machine has after this change. The wrapper's own origin check (`~/.local/bin/firstmate`) refuses to launch a checkout with another origin, so a wrapper and a declaration that disagree fail closed. Firstmate pulls its own checkout (`--request-update`, step 14), so `checkouts` skips it. The skip is data, not a path in Rust: the resource declares `update_policy = "native-request"`, and `checkouts` never pulls a checkout whose `update_policy` is `hold` or `native-request`. `firstmate-native/v1` stays a catalog entry with no adapter.
+
+### Owner decision of 2026-11-16
+
+The owner removed Firstmate from the dotfiles. Steps 5 and 14 and the `firstmate` updater are withdrawn, and dfm no longer has that updater. `update_policy` on `git-checkout/v1` stays: it is generic, for any tool that pulls its own checkout. The `firstmate-native/v1` catalog entry is unchanged.
+
+Fantasy-sports (step 9, slice 3) is no longer deferred. It is removed: the owner does not want it synced to any machine. The external bundle is not built.
+
+The side-channel script now keeps only the first install of the gh-axi skill and of the Codex ponytail plugin. `Updater::SideChannels` therefore stays, and G5 stays open for those two steps.
 
 ### Order inside one sync
 

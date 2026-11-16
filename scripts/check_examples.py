@@ -14,6 +14,9 @@ import tomllib
 from pathlib import Path
 from typing import Any
 
+# Kind to adapter ids. The Rust test
+# `the_example_check_lists_exactly_the_adapters_of_the_catalog` (crates/cli/src/adapters.rs)
+# fails when this map and the adapter catalog differ.
 ADAPTERS = {
     "link": {"fs-link/v1"},
     "render": {"git-config/v1"},
@@ -21,8 +24,17 @@ ADAPTERS = {
     "assemble": {"text-fragments/v1"},
     "distribution": {"skills/v1"},
     "secret": {"op-template/v1"},
-    "package": {"homebrew/v1", "mise/v1", "apt/v1", "uv-tool/v1", "script/v1"},
+    "package": {
+        "homebrew/v1",
+        "mise/v1",
+        "apt/v1",
+        "uv-tool/v1",
+        "script/v1",
+        "git-checkout/v1",
+        "duckdb-extension/v1",
+    },
     "application": {"firstmate-native/v1"},
+    "service": {"launchd-agent/v1", "brew-service/v1", "omlx-app/v1"},
 }
 FILE_KINDS = {"link", "render", "merge", "assemble", "secret"}
 

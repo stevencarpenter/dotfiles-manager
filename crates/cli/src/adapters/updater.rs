@@ -82,8 +82,8 @@ pub struct Checkout {
     /// The bound checkout declared it and its url (`dfm_model::resolve::owner_declared`): then
     /// its url needs no grant.
     pub owner_declared: bool,
-    /// Its `update_policy` when that is `hold` or `native-request`: the owner's own updater pulls
-    /// it (Firstmate), so `checkouts` leaves it alone.
+    /// Its `update_policy` when that is `hold` or `native-request`: the tool pulls its own
+    /// checkout, so `checkouts` leaves it alone.
     pub held: Option<String>,
 }
 
@@ -108,7 +108,6 @@ fn owner_dir(u: Updater) -> Option<&'static str> {
         Updater::Agents
         | Updater::Brew
         | Updater::Checkouts
-        | Updater::Firstmate
         | Updater::Go
         | Updater::Lefthook
         | Updater::Mise
@@ -278,7 +277,6 @@ pub fn run(u: Updater, env: &Env) -> Row {
         Updater::Rustup => rustup(d, env),
         Updater::SideChannels => side_channels(d, env),
         Updater::Lefthook => lefthook(d, env),
-        Updater::Firstmate => firstmate(d, env),
         Updater::Uv => uv(d, env),
         Updater::Claude | Updater::Codex | Updater::Opencode => native(d, env),
     }
@@ -451,7 +449,6 @@ pub fn second_copies(u: Updater, env: &Env) -> Vec<String> {
         | Updater::Brew
         | Updater::Cargo
         | Updater::Checkouts
-        | Updater::Firstmate
         | Updater::Go
         | Updater::Lefthook
         | Updater::Mise
@@ -1722,86 +1719,6 @@ fn lefthook(mut d: Draft, env: &Env) -> Row {
     }
 }
 
-/// Firstmate's entry point, relative to HOME.
-const FIRSTMATE: &str = ".local/bin/firstmate";
-
-/// The runner and the program name for Firstmate's entry point. The entry point is usually a
-/// link into the bound checkout (`home/.local/bin/firstmate`), whose target leaves `~/.local`,
-/// so [`Runner::resolve`] refuses it from `~/.local/bin`. The search path therefore starts with
-/// the directory of the link's canonical target, which must be `~/.local/bin` itself or a
-/// directory inside the bound checkout; the target then passes the runner's executable checks
-/// there. `Err` is the blocked reason.
-fn firstmate_runner(env: &Env) -> Result<(Runner, String), String> {
-    let entry = env.home.join(FIRSTMATE);
-    if std::fs::symlink_metadata(&entry).is_err() {
-        return Err(format!("no Firstmate entry point at {}", entry.display()));
-    }
-    let shown = |e: std::io::Error| format!("{}: {}", entry.display(), e.kind());
-    let real = std::fs::canonicalize(&entry).map_err(shown)?;
-    let bin = entry
-        .parent()
-        .map(std::fs::canonicalize)
-        .transpose()
-        .map_err(shown)?;
-    let Some(dir) = real.parent() else {
-        return Err(format!("{} has no parent directory", real.display()));
-    };
-    // A link that leaves `~/.local/bin` may reach only Firstmate's own entry point in the bound
-    // checkout, never another file there.
-    if real.file_name().and_then(|n| n.to_str()) != Some("firstmate") {
-        return Err(format!(
-            "{} resolves to {}, which is not named firstmate",
-            entry.display(),
-            real.display()
-        ));
-    }
-    if bin.as_deref() != Some(dir) {
-        let root = std::fs::canonicalize(env.root)
-            .map_err(|e| format!("bound checkout {}: {}", env.root.display(), e.kind()))?;
-        if !real.starts_with(&root) {
-            return Err(format!(
-                "{} resolves to {}, outside {} and the bound checkout {}",
-                entry.display(),
-                real.display(),
-                entry.parent().unwrap_or(Path::new("")).display(),
-                root.display()
-            ));
-        }
-    }
-    let mut r = env.provider.clone();
-    r.search_path.insert(0, dir.to_path_buf());
-    r.resolve("firstmate").map_err(|e| e.detail)?;
-    Ok((r, "firstmate".to_string()))
-}
-
-/// Asks Firstmate to update itself: the fixed command `~/.local/bin/firstmate --request-update`.
-/// Firstmate pulls its own checkout and reports completion itself, so exit 0 is `current` with
-/// a note; `pending` would warn on every sync. Another exit (3: the request was saved but the
-/// wake failed) is `failed`.
-fn firstmate(mut d: Draft, env: &Env) -> Row {
-    let (r, name) = match firstmate_runner(env) {
-        Ok(r) => r,
-        Err(why) => {
-            d.notes.push(why);
-            return d.end(Status::Blocked);
-        }
-    };
-    match call(
-        &r,
-        &name,
-        &args(&["--request-update"]),
-        &[],
-        env.timeouts.short,
-    ) {
-        Ok(_) => {
-            d.notes
-                .push("update requested; Firstmate reports its own completion".into());
-            d.end(Status::Current)
-        }
-        Err(e) => d.stop(e),
-    }
-}
-
 /// `git -C <dir> <a>`; its trimmed standard output. As in the `git-checkout/v1` probe, git must
 /// not walk up from a `.git` that is not a repository to an enclosing one.
 fn git(env: &Env, dir: &Path, a: &[&str]) -> Result<String, (String, bool)> {
@@ -2226,16 +2143,6 @@ fn preview_command(u: Updater, env: &Env) -> String {
                     .unwrap_or_default()
             ),
         },
-        Updater::Firstmate => match firstmate_runner(env) {
-            Ok((r, name)) => format!(
-                "would run {} --request-update ({})",
-                env.home.join(FIRSTMATE).display(),
-                r.resolve(&name)
-                    .map(|p| p.display().to_string())
-                    .unwrap_or_default()
-            ),
-            Err(why) => format!("blocked: {why}"),
-        },
         Updater::Uv => match env.provider.resolve("uv") {
             Ok(p) => format!(
                 "would run uv tool upgrade of each tool under {} ({})",
@@ -2621,8 +2528,8 @@ mod tests {
         assert_eq!(t.calls(), want);
     }
 
-    /// A checkout whose `update_policy` is `hold` or `native-request` (Firstmate pulls its own)
-    /// is never pulled, and only noted; the others still run and decide the row.
+    /// A checkout whose `update_policy` is `hold` or `native-request` (a tool that pulls its own
+    /// checkout) is never pulled, and only noted; the others still run and decide the row.
     #[test]
     fn a_held_checkout_is_noted_and_not_pulled() {
         let mut t = T::new();
@@ -2942,8 +2849,8 @@ mod tests {
     }
 
     /// A failing install is `failed` with the withheld-stderr note. The sync test
-    /// `lefthook_runs_in_the_bound_checkout_and_firstmate_runs_through_its_link` shows that the
-    /// next updater still runs.
+    /// `a_failing_lefthook_install_in_the_bound_checkout_does_not_stop_the_next_updater` shows that
+    /// the next updater still runs.
     #[test]
     fn a_failing_lefthook_install_is_failed_with_the_stderr_withheld() {
         let t = T::new();
@@ -2958,83 +2865,6 @@ mod tests {
             "{r:?}"
         );
         assert_eq!(t.calls(), ["lefthook install"]);
-    }
-
-    impl T {
-        /// Firstmate's entry point as on the live machine: `~/.local/bin/firstmate` is a link to
-        /// `home/.local/bin/firstmate` in the bound checkout. It exits with `st/fm-exit` (0 when
-        /// absent). Returns the link target.
-        fn firstmate_link(&self) -> PathBuf {
-            let real = self.dots.join("home/.local/bin/firstmate");
-            self.script(&real, "exit $(cat \"$st/fm-exit\" 2>/dev/null || echo 0)");
-            let link = self.home.join(FIRSTMATE);
-            fs::create_dir_all(link.parent().unwrap()).unwrap();
-            std::os::unix::fs::symlink(&real, &link).unwrap();
-            real
-        }
-    }
-
-    #[test]
-    fn firstmate_requests_an_update_through_its_link_into_the_bound_checkout() {
-        let t = T::new();
-        let real = t.firstmate_link();
-        // The provider runner alone refuses the link: its target leaves `~/.local`.
-        let mut plain = t.runner.clone();
-        plain.search_path.insert(0, t.home.join(".local/bin"));
-        assert!(plain.resolve("firstmate").is_err());
-        assert_eq!(
-            preview(Updater::Firstmate, &t.env()),
-            format!(
-                "would run {} --request-update ({})",
-                t.home.join(FIRSTMATE).display(),
-                real.display()
-            )
-        );
-        assert_eq!(t.log(), "");
-        let r = run(Updater::Firstmate, &t.env());
-        assert_eq!(r.status, Status::Current, "{r:?}");
-        assert_eq!(
-            r.notes,
-            ["update requested; Firstmate reports its own completion"]
-        );
-        assert_eq!(t.calls(), ["firstmate --request-update"]);
-    }
-
-    /// A regular file at `~/.local/bin/firstmate` runs from there.
-    #[test]
-    fn firstmate_as_a_regular_file_in_local_bin_runs() {
-        let t = T::new();
-        let entry = t.home.join(FIRSTMATE);
-        t.script(&entry, "exit 0");
-        assert_eq!(
-            preview(Updater::Firstmate, &t.env()),
-            format!(
-                "would run {} --request-update ({})",
-                entry.display(),
-                entry.display()
-            )
-        );
-        let r = run(Updater::Firstmate, &t.env());
-        assert_eq!(r.status, Status::Current, "{r:?}");
-        assert_eq!(t.calls(), ["firstmate --request-update"]);
-    }
-
-    /// A link into the bound checkout may reach only a file named `firstmate`.
-    #[test]
-    fn a_firstmate_link_to_another_file_in_the_checkout_is_blocked() {
-        let t = T::new();
-        let other = t.dots.join("scripts/install-agent-registry.sh");
-        t.script(&other, "exit 0");
-        let entry = t.home.join(FIRSTMATE);
-        fs::create_dir_all(entry.parent().unwrap()).unwrap();
-        std::os::unix::fs::symlink(&other, &entry).unwrap();
-        let r = run(Updater::Firstmate, &t.env());
-        assert_eq!(r.status, Status::Blocked, "{r:?}");
-        assert!(
-            r.notes[0].ends_with("which is not named firstmate"),
-            "{r:?}"
-        );
-        assert_eq!(t.log(), "");
     }
 
     #[test]
@@ -3066,51 +2896,6 @@ mod tests {
                 lock.display()
             )
         );
-    }
-
-    /// Exit 3 is the wrapper's "request saved, wake failed": `failed`, not `current`.
-    #[test]
-    fn a_firstmate_request_that_exits_3_is_failed() {
-        let t = T::new();
-        t.firstmate_link();
-        fs::write(t.root.join("st/fm-exit"), "3").unwrap();
-        let r = run(Updater::Firstmate, &t.env());
-        assert_eq!(r.status, Status::Failed, "{r:?}");
-        assert!(
-            r.notes[0].starts_with("firstmate --request-update exited 3;"),
-            "{r:?}"
-        );
-    }
-
-    #[test]
-    fn firstmate_without_its_entry_point_or_with_a_link_out_of_the_checkout_is_blocked() {
-        let t = T::new();
-        let entry = t.home.join(FIRSTMATE);
-        let want = format!("no Firstmate entry point at {}", entry.display());
-        assert_eq!(
-            preview(Updater::Firstmate, &t.env()),
-            format!("blocked: {want}")
-        );
-        let r = run(Updater::Firstmate, &t.env());
-        assert_eq!(r.status, Status::Blocked, "{r:?}");
-        assert_eq!(r.notes, [want]);
-        // A link to a program outside `~/.local/bin` and the bound checkout is refused.
-        let elsewhere = t.root.join("elsewhere/firstmate");
-        t.script(&elsewhere, "exit 0");
-        fs::create_dir_all(entry.parent().unwrap()).unwrap();
-        std::os::unix::fs::symlink(&elsewhere, &entry).unwrap();
-        // No bound checkout to compare with: blocked, never a fallback to the raw path.
-        let r = run(Updater::Firstmate, &t.env());
-        assert_eq!(r.status, Status::Blocked, "{r:?}");
-        assert!(
-            r.notes[0].starts_with(&format!("bound checkout {}: ", t.dots.display())),
-            "{r:?}"
-        );
-        fs::create_dir_all(&t.dots).unwrap();
-        let r = run(Updater::Firstmate, &t.env());
-        assert_eq!(r.status, Status::Blocked, "{r:?}");
-        assert!(r.notes[0].contains(", outside "), "{r:?}");
-        assert_eq!(t.log(), "");
     }
 
     #[test]

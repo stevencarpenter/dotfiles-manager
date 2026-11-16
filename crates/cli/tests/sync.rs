@@ -4349,8 +4349,9 @@ fn sync_clones_a_declared_checkout_then_fast_forwards_it() {
     assert_eq!(git(&copy, &["rev-parse", "--short", "HEAD"]), after);
 }
 
-/// DFM-25 (C01 slice 5): a checkout whose `update_policy` is `native-request` (Firstmate pulls
-/// its own) is cloned by the packages scope when missing, and the `checkouts` row never pulls it.
+/// DFM-25 (C01 slice 5): a checkout whose `update_policy` is `native-request` (a tool that pulls
+/// its own checkout) is cloned by the packages scope when missing, and the `checkouts` row never
+/// pulls it.
 #[test]
 fn sync_clones_a_held_checkout_and_never_pulls_it() {
     let u = Up::new(r#"["checkouts"]"#);
@@ -4631,11 +4632,10 @@ fn a_second_copy_shows_the_version_brew_left() {
 }
 
 /// DFM-25 (C01 slice 5): `lefthook install` runs in the bound checkout, and a failure there does
-/// not stop `firstmate`, which runs through its live layout: `~/.local/bin/firstmate` is a link
-/// to `home/.local/bin/firstmate` in the bound checkout.
+/// not stop the next declared updater.
 #[test]
-fn lefthook_runs_in_the_bound_checkout_and_firstmate_runs_through_its_link() {
-    let u = Up::new(r#"["lefthook", "firstmate"]"#);
+fn a_failing_lefthook_install_in_the_bound_checkout_does_not_stop_the_next_updater() {
+    let u = Up::new(r#"["lefthook", "claude"]"#);
     let log = u.st("log");
     fs::write(
         u.fake.path().join("bin/lefthook"),
@@ -4650,43 +4650,18 @@ fn lefthook_runs_in_the_bound_checkout_and_firstmate_runs_through_its_link() {
         fs::Permissions::from_mode(0o755),
     )
     .unwrap();
-    let rel = "home/.local/bin/firstmate";
-    put(
-        &u.fx.upstream.seed,
-        rel,
-        &format!(
-            "#!/bin/sh\nprintf 'firstmate %s\\n' \"$*\" >> {}\n",
-            log.display()
-        ),
-    );
-    fs::set_permissions(
-        u.fx.upstream.seed.join(rel),
-        fs::Permissions::from_mode(0o755),
-    )
-    .unwrap();
-    u.fx.upstream.push("add the firstmate entry point");
-    let o = u.sync(&["--no-upgrade"]);
-    assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
-    let link = u.fx.h(".local/bin/firstmate");
-    fs::create_dir_all(link.parent().unwrap()).unwrap();
-    std::os::unix::fs::symlink(u.fx.root.join(rel), &link).unwrap();
     let o = u.sync(&[]);
     assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
     let s = stdout(&o);
     assert!(s.contains("  failed lefthook"), "{s}");
-    assert!(s.contains("  current firstmate"), "{s}");
-    assert!(
-        s.contains("    note: update requested; Firstmate reports its own completion"),
-        "{s}"
-    );
+    assert!(s.contains("  current claude"), "{s}");
     let root = u.fx.root.canonicalize().unwrap();
-    assert_eq!(
-        u.log(),
-        format!(
-            "lefthook install | pwd={}\nfirstmate --request-update\n",
-            root.display()
-        )
+    let log = u.log();
+    assert!(
+        log.starts_with(&format!("lefthook install | pwd={}\n", root.display())),
+        "{log}"
     );
+    assert!(log.contains("claude update"), "{log}");
 }
 
 /// DFM-25 (C05): an updater that writes through a dfm link in HOME into the bound checkout
