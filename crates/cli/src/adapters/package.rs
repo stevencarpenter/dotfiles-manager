@@ -99,7 +99,7 @@ pub fn name(value: &Value) -> Result<String, Refusal> {
 
 /// The declared `update_policy`, one of `rolling`, `hold` and `native-request`. Any other
 /// value is a manifest error, so a typo is refused instead of holding the package silently.
-fn policy(value: &Value) -> Result<&str, Refusal> {
+pub(super) fn policy(value: &Value) -> Result<&str, Refusal> {
     let p = value
         .get("update_policy")
         .and_then(Value::as_str)

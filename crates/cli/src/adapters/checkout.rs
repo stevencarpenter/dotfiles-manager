@@ -82,15 +82,13 @@ pub(crate) fn declared(value: &Value) -> Result<Declared, Refusal> {
             Some(b.to_string())
         }
     };
-    let held = match value.get("update_policy").map(Value::as_str) {
-        None | Some(Some("rolling")) => None,
-        Some(Some(p @ ("hold" | "native-request"))) => Some(p.to_string()),
-        Some(p) => {
-            return Err(invalid(format!(
-                "update_policy must be rolling, hold or native-request, not {}",
-                visible(p.unwrap_or("a non-string value"))
-            )));
-        }
+    // Absent is `rolling`; a present value is checked as for every package adapter.
+    let held = match value.get("update_policy") {
+        None => None,
+        Some(_) => match super::package::policy(value)? {
+            "rolling" => None,
+            p => Some(p.to_string()),
+        },
     };
     Ok(Declared {
         url: url.into(),
