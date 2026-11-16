@@ -307,6 +307,34 @@ fn a_program_reached_through_a_link_gets_its_requested_name_as_argv0() {
     let _ = std::fs::remove_dir_all(&d);
 }
 
+/// `run_in` starts the child in the given directory and neither creates it nor changes its
+/// mode, unlike the runner's own working directory (the `lefthook` updater runs in the bound
+/// checkout).
+#[test]
+fn run_in_uses_the_given_directory_and_leaves_its_mode_alone() {
+    let d = scratch("run-in");
+    script(&d.join("bin"), "tool", "pwd");
+    let repo = d.join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    std::fs::set_permissions(&repo, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let r = runner(&d.join("bin"));
+    let out = r.run_in(&req(&[], None, 5), &repo).unwrap();
+    assert!(out.success(), "{out:?}");
+    assert_eq!(
+        String::from_utf8(out.stdout).unwrap().trim(),
+        repo.display().to_string()
+    );
+    let mode = std::fs::metadata(&repo).unwrap().mode() & 0o7777;
+    assert_eq!(mode, 0o755);
+    assert!(!r.cwd.exists(), "run_in must not create the runner's cwd");
+    let missing = d.join("missing");
+    let e = r.run_in(&req(&[], None, 5), &missing).unwrap_err();
+    assert_eq!(e.code, Code::ProbeFailed);
+    assert!(e.detail.contains("is not a directory"), "{e}");
+    assert!(!missing.exists());
+    let _ = std::fs::remove_dir_all(&d);
+}
+
 #[test]
 fn a_working_directory_that_is_not_a_plain_directory_and_a_nul_argument_are_refused() {
     let d = scratch("cwd");

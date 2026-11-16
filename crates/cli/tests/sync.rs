@@ -4630,6 +4630,65 @@ fn a_second_copy_shows_the_version_brew_left() {
     assert!(!s.contains("Homebrew cask codex 0.164.0"), "{s}");
 }
 
+/// DFM-25 (C01 slice 5): `lefthook install` runs in the bound checkout, and a failure there does
+/// not stop `firstmate`, which runs through its live layout: `~/.local/bin/firstmate` is a link
+/// to `home/.local/bin/firstmate` in the bound checkout.
+#[test]
+fn lefthook_runs_in_the_bound_checkout_and_firstmate_runs_through_its_link() {
+    let u = Up::new(r#"["lefthook", "firstmate"]"#);
+    let log = u.st("log");
+    fs::write(
+        u.fake.path().join("bin/lefthook"),
+        format!(
+            "#!/bin/sh\nprintf 'lefthook %s | pwd=%s\\n' \"$*\" \"$(/bin/pwd)\" >> {}\nexit 1\n",
+            log.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(
+        u.fake.path().join("bin/lefthook"),
+        fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
+    let rel = "home/.local/bin/firstmate";
+    put(
+        &u.fx.upstream.seed,
+        rel,
+        &format!(
+            "#!/bin/sh\nprintf 'firstmate %s\\n' \"$*\" >> {}\n",
+            log.display()
+        ),
+    );
+    fs::set_permissions(
+        u.fx.upstream.seed.join(rel),
+        fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
+    u.fx.upstream.push("add the firstmate entry point");
+    let o = u.sync(&["--no-upgrade"]);
+    assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
+    let link = u.fx.h(".local/bin/firstmate");
+    fs::create_dir_all(link.parent().unwrap()).unwrap();
+    std::os::unix::fs::symlink(u.fx.root.join(rel), &link).unwrap();
+    let o = u.sync(&[]);
+    assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
+    let s = stdout(&o);
+    assert!(s.contains("  failed lefthook"), "{s}");
+    assert!(s.contains("  current firstmate"), "{s}");
+    assert!(
+        s.contains("    note: update requested; Firstmate reports its own completion"),
+        "{s}"
+    );
+    let root = u.fx.root.canonicalize().unwrap();
+    assert_eq!(
+        u.log(),
+        format!(
+            "lefthook install | pwd={}\nfirstmate --request-update\n",
+            root.display()
+        )
+    );
+}
+
 /// DFM-25 (C05, G5): an updater that changes a tracked file in the bound checkout fails its
 /// row with the file named. The change stays, unstaged and uncommitted, and the next updater
 /// still runs.

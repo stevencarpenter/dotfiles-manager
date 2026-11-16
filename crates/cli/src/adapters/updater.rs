@@ -91,7 +91,9 @@ fn owner_dir(u: Updater) -> Option<&'static str> {
         Updater::Agents
         | Updater::Brew
         | Updater::Checkouts
+        | Updater::Firstmate
         | Updater::Go
+        | Updater::Lefthook
         | Updater::Mise
         | Updater::Npm
         | Updater::SideChannels
@@ -165,20 +167,37 @@ fn call_ok(
     timeout: Duration,
     ok: &[i32],
 ) -> Result<Output, (String, bool)> {
+    call_at(r, program, a, env, timeout, ok, None)
+}
+
+/// [`call_ok`], in `dir` instead of the runner's working directory when it is given
+/// ([`Runner::run_in`]).
+fn call_at(
+    r: &Runner,
+    program: &str,
+    a: &[String],
+    env: &[(String, String)],
+    timeout: Duration,
+    ok: &[i32],
+    dir: Option<&Path>,
+) -> Result<Output, (String, bool)> {
     let what = std::iter::once(program)
         .chain(a.iter().map(String::as_str))
         .collect::<Vec<_>>()
         .join(" ");
-    let out = r
-        .run(&Request {
-            program,
-            args: a,
-            env,
-            stdin: None,
-            timeout,
-            max_stdout: 16 << 20,
-        })
-        .map_err(|e| (format!("{what}: {}", e.detail), false))?;
+    let req = Request {
+        program,
+        args: a,
+        env,
+        stdin: None,
+        timeout,
+        max_stdout: 16 << 20,
+    };
+    let out = match dir {
+        Some(dir) => r.run_in(&req, dir),
+        None => r.run(&req),
+    }
+    .map_err(|e| (format!("{what}: {}", e.detail), false))?;
     match trouble(&what, &out, timeout, ok) {
         None => Ok(out),
         Some(n) => Err((n, matches!(out.end, End::Stopped(_)))),
@@ -261,6 +280,8 @@ pub fn run(u: Updater, env: &Env) -> Row {
         Updater::Npm => npm(d, env),
         Updater::Rustup => rustup(d, env),
         Updater::SideChannels => side_channels(d, env),
+        Updater::Lefthook => lefthook(d, env),
+        Updater::Firstmate => firstmate(d, env),
         Updater::Uv => uv(d, env),
         Updater::Claude | Updater::Codex | Updater::Opencode => native(d, env),
     }
@@ -374,7 +395,9 @@ pub fn second_copies(u: Updater, env: &Env) -> Vec<String> {
         | Updater::Brew
         | Updater::Cargo
         | Updater::Checkouts
+        | Updater::Firstmate
         | Updater::Go
+        | Updater::Lefthook
         | Updater::Mise
         | Updater::Npm
         | Updater::Rustup
@@ -1598,6 +1621,111 @@ fn side_channels(mut d: Draft, env: &Env) -> Row {
     }
 }
 
+/// Why `lefthook install` cannot run in the bound checkout: no checkout directory, or no
+/// `lefthook` on the provider path (a mise-only copy is not on it).
+fn lefthook_blocked(env: &Env) -> Option<String> {
+    if !env.root.is_dir() {
+        return Some(format!("no bound checkout at {}", env.root.display()));
+    }
+    env.provider.resolve("lefthook").err().map(|e| e.detail)
+}
+
+/// The bound checkout's git hooks: the fixed command `lefthook install`, run in the bound
+/// checkout because lefthook has no directory option ([`Runner::run_in`] leaves the directory
+/// as it is). It reports no version, so a success is `current`; a failure stops nothing else.
+fn lefthook(mut d: Draft, env: &Env) -> Row {
+    if let Some(why) = lefthook_blocked(env) {
+        d.notes.push(why);
+        return d.end(Status::Blocked);
+    }
+    match call_at(
+        env.provider,
+        "lefthook",
+        &args(&["install"]),
+        &[],
+        env.timeouts.short,
+        &[0],
+        Some(env.root),
+    ) {
+        Ok(_) => {
+            d.notes.push(format!(
+                "lefthook install ran in {}; it reports no version",
+                env.root.display()
+            ));
+            d.end(Status::Current)
+        }
+        Err(e) => d.stop(e),
+    }
+}
+
+/// Firstmate's entry point, relative to HOME.
+const FIRSTMATE: &str = ".local/bin/firstmate";
+
+/// The runner and the program name for Firstmate's entry point. The entry point is usually a
+/// link into the bound checkout (`home/.local/bin/firstmate`), whose target leaves `~/.local`,
+/// so [`Runner::resolve`] refuses it from `~/.local/bin`. The search path therefore starts with
+/// the directory of the link's canonical target, which must be `~/.local/bin` itself or a
+/// directory inside the bound checkout; the target then passes the runner's executable checks
+/// there. `Err` is the blocked reason.
+fn firstmate_runner(env: &Env) -> Result<(Runner, String), String> {
+    let entry = env.home.join(FIRSTMATE);
+    if std::fs::symlink_metadata(&entry).is_err() {
+        return Err(format!("no Firstmate entry point at {}", entry.display()));
+    }
+    let shown = |e: std::io::Error| format!("{}: {}", entry.display(), e.kind());
+    let real = std::fs::canonicalize(&entry).map_err(shown)?;
+    let bin = entry
+        .parent()
+        .map(std::fs::canonicalize)
+        .transpose()
+        .map_err(shown)?;
+    let root = std::fs::canonicalize(env.root).unwrap_or_else(|_| env.root.to_path_buf());
+    let (Some(dir), Some(name)) = (real.parent(), real.file_name().and_then(|n| n.to_str())) else {
+        return Err(format!("{} has no file name", real.display()));
+    };
+    if bin.as_deref() != Some(dir) && !real.starts_with(&root) {
+        return Err(format!(
+            "{} resolves to {}, outside {} and the bound checkout {}",
+            entry.display(),
+            real.display(),
+            entry.parent().unwrap_or(Path::new("")).display(),
+            root.display()
+        ));
+    }
+    let mut r = env.provider.clone();
+    r.search_path.insert(0, dir.to_path_buf());
+    r.resolve(name).map_err(|e| e.detail)?;
+    Ok((r, name.to_string()))
+}
+
+/// Asks Firstmate to update itself: the fixed command `~/.local/bin/firstmate --request-update`.
+/// Firstmate pulls its own checkout and reports completion itself, so exit 0 is `current` with
+/// a note; `pending` would warn on every sync. Another exit (3: the request was saved but the
+/// wake failed) is `failed`.
+fn firstmate(mut d: Draft, env: &Env) -> Row {
+    let (r, name) = match firstmate_runner(env) {
+        Ok(r) => r,
+        Err(why) => {
+            d.notes.push(why);
+            return d.end(Status::Blocked);
+        }
+    };
+    match call(
+        &r,
+        &name,
+        &args(&["--request-update"]),
+        &[],
+        env.timeouts.short,
+    ) {
+        Ok(_) => {
+            d.notes
+                .push("update requested; Firstmate reports its own completion".into());
+            d.end(Status::Current)
+        }
+        Err(e) => d.stop(e),
+    }
+}
+
 /// `git -C <dir> <a>`; its trimmed standard output. As in the `git-checkout/v1` probe, git must
 /// not walk up from a `.git` that is not a repository to an enclosing one.
 fn git(env: &Env, dir: &Path, a: &[&str]) -> Result<String, (String, bool)> {
@@ -1995,6 +2123,27 @@ fn preview_command(u: Updater, env: &Env) -> String {
                 "would run just {SIDE_CHANNELS_RECIPE} in {} ({})",
                 env.root.display(),
                 j.display()
+            ),
+            Err(why) => format!("blocked: {why}"),
+        },
+        Updater::Lefthook => match lefthook_blocked(env) {
+            Some(why) => format!("blocked: {why}"),
+            None => format!(
+                "would run lefthook install in {} ({})",
+                env.root.display(),
+                env.provider
+                    .resolve("lefthook")
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_default()
+            ),
+        },
+        Updater::Firstmate => match firstmate_runner(env) {
+            Ok((r, name)) => format!(
+                "would run {} --request-update ({})",
+                env.home.join(FIRSTMATE).display(),
+                r.resolve(&name)
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_default()
             ),
             Err(why) => format!("blocked: {why}"),
         },
@@ -2633,24 +2782,164 @@ mod tests {
     }
 
     #[test]
+    fn lefthook_installs_in_the_bound_checkout() {
+        let t = T::new();
+        fs::create_dir_all(&t.dots).unwrap();
+        t.script(&t.bin.join("lefthook"), "pwd > \"$st/lefthook-pwd\"");
+        assert_eq!(
+            preview(Updater::Lefthook, &t.env()),
+            format!(
+                "would run lefthook install in {} ({})",
+                t.dots.display(),
+                t.bin.join("lefthook").display()
+            )
+        );
+        assert_eq!(t.log(), "");
+        let r = run(Updater::Lefthook, &t.env());
+        assert_eq!(r.status, Status::Current, "{r:?}");
+        assert_eq!(
+            r.notes,
+            [format!(
+                "lefthook install ran in {}; it reports no version",
+                t.dots.display()
+            )]
+        );
+        assert_eq!(t.calls(), ["lefthook install"]);
+        let pwd = fs::read_to_string(t.root.join("st/lefthook-pwd")).unwrap();
+        assert_eq!(pwd.trim(), t.dots.display().to_string());
+        // The checkout is the working directory; the runner's own one is not even created.
+        assert!(!t.runner.cwd.exists());
+    }
+
+    #[test]
+    fn lefthook_without_the_program_or_the_checkout_is_blocked() {
+        let t = T::new();
+        fs::create_dir_all(&t.dots).unwrap();
+        let p = preview(Updater::Lefthook, &t.env());
+        assert!(p.starts_with("blocked: lefthook was not found in "), "{p}");
+        let r = run(Updater::Lefthook, &t.env());
+        assert_eq!(r.status, Status::Blocked, "{r:?}");
+        assert!(
+            r.notes[0].starts_with("lefthook was not found in "),
+            "{r:?}"
+        );
+        t.script(&t.bin.join("lefthook"), "exit 0");
+        fs::remove_dir(&t.dots).unwrap();
+        let r = run(Updater::Lefthook, &t.env());
+        assert_eq!(r.status, Status::Blocked, "{r:?}");
+        assert_eq!(
+            r.notes,
+            [format!("no bound checkout at {}", t.dots.display())]
+        );
+        assert_eq!(t.log(), "");
+    }
+
+    /// A failing install is `failed` with the withheld-stderr note, and the next updater in the
+    /// profile still runs.
+    #[test]
+    fn a_failing_lefthook_install_is_failed_and_the_next_updater_runs() {
+        let t = T::new();
+        fs::create_dir_all(&t.dots).unwrap();
+        t.script(&t.bin.join("lefthook"), "echo 'secret' >&2; exit 1");
+        t.firstmate_link();
+        let r = run(Updater::Lefthook, &t.env());
+        assert_eq!(r.status, Status::Failed, "{r:?}");
+        assert!(
+            r.notes[0].starts_with(
+                "lefthook install exited 1; its 7 bytes of standard error are withheld"
+            ),
+            "{r:?}"
+        );
+        let r = run(Updater::Firstmate, &t.env());
+        assert_eq!(r.status, Status::Current, "{r:?}");
+        assert_eq!(
+            t.calls(),
+            ["lefthook install", "firstmate --request-update"]
+        );
+    }
+
+    impl T {
+        /// Firstmate's entry point as on the live machine: `~/.local/bin/firstmate` is a link to
+        /// `home/.local/bin/firstmate` in the bound checkout. It exits with `st/fm-exit` (0 when
+        /// absent). Returns the link target.
+        fn firstmate_link(&self) -> PathBuf {
+            let real = self.dots.join("home/.local/bin/firstmate");
+            self.script(&real, "exit $(cat \"$st/fm-exit\" 2>/dev/null || echo 0)");
+            let link = self.home.join(FIRSTMATE);
+            fs::create_dir_all(link.parent().unwrap()).unwrap();
+            std::os::unix::fs::symlink(&real, &link).unwrap();
+            real
+        }
+    }
+
+    #[test]
+    fn firstmate_requests_an_update_through_its_link_into_the_bound_checkout() {
+        let t = T::new();
+        let real = t.firstmate_link();
+        // The provider runner alone refuses the link: its target leaves `~/.local`.
+        let mut plain = t.runner.clone();
+        plain.search_path.insert(0, t.home.join(".local/bin"));
+        assert!(plain.resolve("firstmate").is_err());
+        assert_eq!(
+            preview(Updater::Firstmate, &t.env()),
+            format!(
+                "would run {} --request-update ({})",
+                t.home.join(FIRSTMATE).display(),
+                real.display()
+            )
+        );
+        assert_eq!(t.log(), "");
+        let r = run(Updater::Firstmate, &t.env());
+        assert_eq!(r.status, Status::Current, "{r:?}");
+        assert_eq!(
+            r.notes,
+            ["update requested; Firstmate reports its own completion"]
+        );
+        assert_eq!(t.calls(), ["firstmate --request-update"]);
+    }
+
+    /// Exit 3 is the wrapper's "request saved, wake failed": `failed`, not `current`.
+    #[test]
+    fn a_firstmate_request_that_exits_3_is_failed() {
+        let t = T::new();
+        t.firstmate_link();
+        fs::write(t.root.join("st/fm-exit"), "3").unwrap();
+        let r = run(Updater::Firstmate, &t.env());
+        assert_eq!(r.status, Status::Failed, "{r:?}");
+        assert!(
+            r.notes[0].starts_with("firstmate --request-update exited 3;"),
+            "{r:?}"
+        );
+    }
+
+    #[test]
+    fn firstmate_without_its_entry_point_or_with_a_link_out_of_the_checkout_is_blocked() {
+        let t = T::new();
+        let entry = t.home.join(FIRSTMATE);
+        let want = format!("no Firstmate entry point at {}", entry.display());
+        assert_eq!(
+            preview(Updater::Firstmate, &t.env()),
+            format!("blocked: {want}")
+        );
+        let r = run(Updater::Firstmate, &t.env());
+        assert_eq!(r.status, Status::Blocked, "{r:?}");
+        assert_eq!(r.notes, [want]);
+        // A link to a program outside `~/.local/bin` and the bound checkout is refused.
+        let elsewhere = t.root.join("elsewhere/firstmate");
+        t.script(&elsewhere, "exit 0");
+        fs::create_dir_all(entry.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, &entry).unwrap();
+        let r = run(Updater::Firstmate, &t.env());
+        assert_eq!(r.status, Status::Blocked, "{r:?}");
+        assert!(r.notes[0].contains(", outside "), "{r:?}");
+        assert_eq!(t.log(), "");
+    }
+
+    #[test]
     fn binaries_and_package_managers_are_not_gated() {
         let mut t = T::new();
         t.grants = Grants::default();
-        for u in [
-            Updater::Agents,
-            Updater::Checkouts,
-            Updater::Claude,
-            Updater::Codex,
-            Updater::Opencode,
-            Updater::Brew,
-            Updater::Cargo,
-            Updater::Go,
-            Updater::Mise,
-            Updater::Rustup,
-            Updater::Npm,
-            Updater::Uv,
-            Updater::Skills,
-        ] {
+        for u in Updater::ALL {
             assert!(trust_notes(u, &t.env()).is_empty(), "{u:?}");
         }
     }
