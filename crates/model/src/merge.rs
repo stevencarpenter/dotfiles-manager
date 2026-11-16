@@ -1907,7 +1907,7 @@ MANAGED = "1"
 [managed.sandbox.filesystem]
 allowWrite = ["/m/one", "/m/two", "/m/one"]
 [seed]
-model = "opusplan"
+model = "example-model"
 [seed.permissions]
 defaultMode = "auto"
 "#;
@@ -1925,14 +1925,14 @@ defaultMode = "auto"
         );
         assert_eq!(out["permissions"]["allow"], serde_json::json!(["Bash"]));
         assert_eq!(out["permissions"]["defaultMode"], "auto", "seed at depth");
-        assert_eq!(out["model"], "opusplan");
+        assert_eq!(out["model"], "example-model");
     }
 
     #[test]
     fn seeds_never_overwrite_a_live_value_at_any_depth() {
-        let live = br#"{"model":"haiku","permissions":{"defaultMode":"plan"}}"#;
+        let live = br#"{"model":"example-model-b","permissions":{"defaultMode":"plan"}}"#;
         let out = json(&merge(Some(live), &desired(NESTED), &[]).unwrap().bytes);
-        assert_eq!(out["model"], "haiku");
+        assert_eq!(out["model"], "example-model-b");
         assert_eq!(out["permissions"]["defaultMode"], "plan");
     }
 
