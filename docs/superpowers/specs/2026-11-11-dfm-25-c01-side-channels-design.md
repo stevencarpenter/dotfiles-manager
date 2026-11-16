@@ -88,7 +88,7 @@ User experience comes first, and dfm manages the package manager, not the packag
 - The `skills`, `npm` and `uv` updaters need no per-package grant. An updater acts on everything its package manager lists. `skills` runs `mise exec -- npx skills@latest update`.
 - No per-package adapter, pin, grant or special case. The `skill-source/v1` and `codex-plugin/v1` adapters are dropped. New updaters (`go`, `cargo`) and the `codex` plugin marketplace upgrade replace them.
 - Grants stay for the dotfiles checkout's origins and for sources that a nested source declares (PR #102). The npm registry forcing of the `skills` and `npm` updaters stays.
-- The `agents` updater keeps its upstream grant.
+- The `agents` updater keeps its upstream grant. Superseded by PR #105: `agents` installs from the owner's working copy, never fetches, and needs no grant.
 - The owner defers the fantasy-sports external bundle (slice 3, step 9) to summer 2027. `install-fantasy-sports.sh` stays in the side-channel script until then.
 
 ### Firstmate
