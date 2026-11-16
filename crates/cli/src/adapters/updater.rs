@@ -60,8 +60,13 @@ pub(crate) fn ssh_agent() -> Option<(String, String)> {
 /// `XDG_STATE_HOME` of the manager's own environment, when it is an absolute UTF-8 path. Only
 /// the `skills` run for the record under it gets the variable.
 pub(crate) fn xdg_state_home() -> Option<(String, String)> {
-    std::env::var("XDG_STATE_HOME")
-        .ok()
+    state_home(std::env::var("XDG_STATE_HOME").ok())
+}
+
+/// [`xdg_state_home`] from the variable's value: an empty or relative value is ignored, as the
+/// XDG base directory specification says.
+fn state_home(value: Option<String>) -> Option<(String, String)> {
+    value
         .filter(|v| Path::new(v).is_absolute())
         .map(|v| ("XDG_STATE_HOME".to_string(), v))
 }
@@ -303,7 +308,14 @@ fn skills(mut d: Draft, env: &Env) -> Row {
         return d.end(Status::Blocked);
     }
     let mut failed = false;
-    for (record, extra) in skills_runs(env) {
+    for (i, (record, extra)) in skills_runs(env).into_iter().enumerate() {
+        if i > 0 && dfm_engine::signal::requested().is_some() {
+            d.notes.push(format!(
+                "not started for {}: the run was stopped",
+                record.display()
+            ));
+            return d.end(Status::Pending);
+        }
         let mut vars = npm_env(&[]);
         vars.extend(extra);
         match call(
@@ -1665,11 +1677,19 @@ fn side_channels(mut d: Draft, env: &Env) -> Row {
     }
 }
 
-/// Why `lefthook install` cannot run in the bound checkout: no checkout directory, or no
-/// `lefthook` on the provider path (a mise-only copy is not on it).
+/// Why `lefthook install` cannot run in the bound checkout: no checkout directory, no `.git`
+/// there (a directory or, in a worktree, a file; without it lefthook would install the hooks of
+/// an enclosing repository), or no `lefthook` on the provider path (a mise-only copy is not on
+/// it).
 fn lefthook_blocked(env: &Env) -> Option<String> {
     if !env.root.is_dir() {
         return Some(format!("no bound checkout at {}", env.root.display()));
+    }
+    if std::fs::symlink_metadata(env.root.join(".git")).is_err() {
+        return Some(format!(
+            "{} has no .git; lefthook install would act on an enclosing repository",
+            env.root.display()
+        ));
     }
     env.provider.resolve("lefthook").err().map(|e| e.detail)
 }
@@ -1723,23 +1743,35 @@ fn firstmate_runner(env: &Env) -> Result<(Runner, String), String> {
         .map(std::fs::canonicalize)
         .transpose()
         .map_err(shown)?;
-    let root = std::fs::canonicalize(env.root).unwrap_or_else(|_| env.root.to_path_buf());
-    let (Some(dir), Some(name)) = (real.parent(), real.file_name().and_then(|n| n.to_str())) else {
-        return Err(format!("{} has no file name", real.display()));
+    let Some(dir) = real.parent() else {
+        return Err(format!("{} has no parent directory", real.display()));
     };
-    if bin.as_deref() != Some(dir) && !real.starts_with(&root) {
+    // A link that leaves `~/.local/bin` may reach only Firstmate's own entry point in the bound
+    // checkout, never another file there.
+    if real.file_name().and_then(|n| n.to_str()) != Some("firstmate") {
         return Err(format!(
-            "{} resolves to {}, outside {} and the bound checkout {}",
+            "{} resolves to {}, which is not named firstmate",
             entry.display(),
-            real.display(),
-            entry.parent().unwrap_or(Path::new("")).display(),
-            root.display()
+            real.display()
         ));
+    }
+    if bin.as_deref() != Some(dir) {
+        let root = std::fs::canonicalize(env.root)
+            .map_err(|e| format!("bound checkout {}: {}", env.root.display(), e.kind()))?;
+        if !real.starts_with(&root) {
+            return Err(format!(
+                "{} resolves to {}, outside {} and the bound checkout {}",
+                entry.display(),
+                real.display(),
+                entry.parent().unwrap_or(Path::new("")).display(),
+                root.display()
+            ));
+        }
     }
     let mut r = env.provider.clone();
     r.search_path.insert(0, dir.to_path_buf());
-    r.resolve(name).map_err(|e| e.detail)?;
-    Ok((r, name.to_string()))
+    r.resolve("firstmate").map_err(|e| e.detail)?;
+    Ok((r, "firstmate".to_string()))
 }
 
 /// Asks Firstmate to update itself: the fixed command `~/.local/bin/firstmate --request-update`.
@@ -2844,7 +2876,7 @@ mod tests {
     #[test]
     fn lefthook_installs_in_the_bound_checkout() {
         let t = T::new();
-        fs::create_dir_all(&t.dots).unwrap();
+        fs::create_dir_all(t.dots.join(".git")).unwrap();
         t.script(&t.bin.join("lefthook"), "pwd > \"$st/lefthook-pwd\"");
         assert_eq!(
             preview(Updater::Lefthook, &t.env()),
@@ -2874,7 +2906,7 @@ mod tests {
     #[test]
     fn lefthook_without_the_program_or_the_checkout_is_blocked() {
         let t = T::new();
-        fs::create_dir_all(&t.dots).unwrap();
+        fs::create_dir_all(t.dots.join(".git")).unwrap();
         let p = preview(Updater::Lefthook, &t.env());
         assert!(p.starts_with("blocked: lefthook was not found in "), "{p}");
         let r = run(Updater::Lefthook, &t.env());
@@ -2884,6 +2916,21 @@ mod tests {
             "{r:?}"
         );
         t.script(&t.bin.join("lefthook"), "exit 0");
+        // A worktree has a `.git` file; it counts as a checkout.
+        fs::remove_dir(t.dots.join(".git")).unwrap();
+        fs::write(t.dots.join(".git"), "gitdir: /elsewhere\n").unwrap();
+        assert!(preview(Updater::Lefthook, &t.env()).starts_with("would run lefthook install"));
+        // Without `.git`, lefthook would install the hooks of an enclosing repository.
+        fs::remove_file(t.dots.join(".git")).unwrap();
+        let r = run(Updater::Lefthook, &t.env());
+        assert_eq!(r.status, Status::Blocked, "{r:?}");
+        assert_eq!(
+            r.notes,
+            [format!(
+                "{} has no .git; lefthook install would act on an enclosing repository",
+                t.dots.display()
+            )]
+        );
         fs::remove_dir(&t.dots).unwrap();
         let r = run(Updater::Lefthook, &t.env());
         assert_eq!(r.status, Status::Blocked, "{r:?}");
@@ -2894,14 +2941,14 @@ mod tests {
         assert_eq!(t.log(), "");
     }
 
-    /// A failing install is `failed` with the withheld-stderr note, and the next updater in the
-    /// profile still runs.
+    /// A failing install is `failed` with the withheld-stderr note. The sync test
+    /// `lefthook_runs_in_the_bound_checkout_and_firstmate_runs_through_its_link` shows that the
+    /// next updater still runs.
     #[test]
-    fn a_failing_lefthook_install_is_failed_and_the_next_updater_runs() {
+    fn a_failing_lefthook_install_is_failed_with_the_stderr_withheld() {
         let t = T::new();
-        fs::create_dir_all(&t.dots).unwrap();
+        fs::create_dir_all(t.dots.join(".git")).unwrap();
         t.script(&t.bin.join("lefthook"), "echo 'secret' >&2; exit 1");
-        t.firstmate_link();
         let r = run(Updater::Lefthook, &t.env());
         assert_eq!(r.status, Status::Failed, "{r:?}");
         assert!(
@@ -2910,12 +2957,7 @@ mod tests {
             ),
             "{r:?}"
         );
-        let r = run(Updater::Firstmate, &t.env());
-        assert_eq!(r.status, Status::Current, "{r:?}");
-        assert_eq!(
-            t.calls(),
-            ["lefthook install", "firstmate --request-update"]
-        );
+        assert_eq!(t.calls(), ["lefthook install"]);
     }
 
     impl T {
@@ -2958,6 +3000,74 @@ mod tests {
         assert_eq!(t.calls(), ["firstmate --request-update"]);
     }
 
+    /// A regular file at `~/.local/bin/firstmate` runs from there.
+    #[test]
+    fn firstmate_as_a_regular_file_in_local_bin_runs() {
+        let t = T::new();
+        let entry = t.home.join(FIRSTMATE);
+        t.script(&entry, "exit 0");
+        assert_eq!(
+            preview(Updater::Firstmate, &t.env()),
+            format!(
+                "would run {} --request-update ({})",
+                entry.display(),
+                entry.display()
+            )
+        );
+        let r = run(Updater::Firstmate, &t.env());
+        assert_eq!(r.status, Status::Current, "{r:?}");
+        assert_eq!(t.calls(), ["firstmate --request-update"]);
+    }
+
+    /// A link into the bound checkout may reach only a file named `firstmate`.
+    #[test]
+    fn a_firstmate_link_to_another_file_in_the_checkout_is_blocked() {
+        let t = T::new();
+        let other = t.dots.join("scripts/install-agent-registry.sh");
+        t.script(&other, "exit 0");
+        let entry = t.home.join(FIRSTMATE);
+        fs::create_dir_all(entry.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&other, &entry).unwrap();
+        let r = run(Updater::Firstmate, &t.env());
+        assert_eq!(r.status, Status::Blocked, "{r:?}");
+        assert!(
+            r.notes[0].ends_with("which is not named firstmate"),
+            "{r:?}"
+        );
+        assert_eq!(t.log(), "");
+    }
+
+    #[test]
+    fn xdg_state_home_ignores_an_empty_or_relative_value() {
+        assert_eq!(state_home(None), None);
+        assert_eq!(state_home(Some(String::new())), None);
+        assert_eq!(state_home(Some("rel/state".into())), None);
+        assert_eq!(
+            state_home(Some("/h/.local/state".into())),
+            Some(("XDG_STATE_HOME".into(), "/h/.local/state".into()))
+        );
+    }
+
+    /// A failed first run fails the row, and the second run still runs.
+    #[test]
+    fn a_failing_first_skills_run_is_failed_and_the_second_still_runs() {
+        let mut t = T::new();
+        t.skills_mise();
+        let lock = t.xdg_state(true);
+        fs::write(t.root.join("st/skills-exit-1"), "1").unwrap();
+        let r = run(Updater::Skills, &t.env());
+        assert_eq!(r.status, Status::Failed, "{r:?}");
+        assert_eq!(t.calls().len(), 2);
+        assert!(r.notes[0].contains("exited 1;"), "{r:?}");
+        assert_eq!(
+            r.notes[1],
+            format!(
+                "skills update ran for {}; it reports no version",
+                lock.display()
+            )
+        );
+    }
+
     /// Exit 3 is the wrapper's "request saved, wake failed": `failed`, not `current`.
     #[test]
     fn a_firstmate_request_that_exits_3_is_failed() {
@@ -2989,6 +3099,14 @@ mod tests {
         t.script(&elsewhere, "exit 0");
         fs::create_dir_all(entry.parent().unwrap()).unwrap();
         std::os::unix::fs::symlink(&elsewhere, &entry).unwrap();
+        // No bound checkout to compare with: blocked, never a fallback to the raw path.
+        let r = run(Updater::Firstmate, &t.env());
+        assert_eq!(r.status, Status::Blocked, "{r:?}");
+        assert!(
+            r.notes[0].starts_with(&format!("bound checkout {}: ", t.dots.display())),
+            "{r:?}"
+        );
+        fs::create_dir_all(&t.dots).unwrap();
         let r = run(Updater::Firstmate, &t.env());
         assert_eq!(r.status, Status::Blocked, "{r:?}");
         assert!(r.notes[0].contains(", outside "), "{r:?}");
