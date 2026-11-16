@@ -27,8 +27,9 @@ fn env() -> Vec<(String, String)> {
     .collect()
 }
 
-/// The declared extension name: ASCII letters, digits and `_`, at most 64 characters. The name
-/// goes into a SQL statement, so anything else is `E_MANIFEST_INVALID`.
+/// The declared extension name: lower-case ASCII letters, digits and `_`, at most 64
+/// characters, as DuckDB lists its extensions and their aliases. The name goes into a SQL
+/// statement, so anything else is `E_MANIFEST_INVALID`.
 pub(crate) fn name(value: &Value) -> Result<&str, Refusal> {
     let n = value.get("name").and_then(Value::as_str).ok_or_else(|| {
         Refusal::new(
@@ -36,11 +37,16 @@ pub(crate) fn name(value: &Value) -> Result<&str, Refusal> {
             "a duckdb-extension/v1 declaration needs name",
         )
     })?;
-    if n.is_empty() || n.len() > 64 || !n.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+    if n.is_empty()
+        || n.len() > 64
+        || !n
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+    {
         return Err(Refusal::new(
             Code::ManifestInvalid,
             format!(
-                "duckdb extension name {} must be ASCII letters, digits or '_', at most 64 characters",
+                "duckdb extension name {} must be lower-case ASCII letters, digits or '_', at most 64 characters",
                 visible(n)
             ),
         ));
@@ -66,13 +72,14 @@ fn args(sql: &str) -> Vec<String> {
     .collect()
 }
 
-/// Whether the extension is installed: one `v:<version>` line is `Installed`, no line is
+/// Whether the extension is installed, by its name or one of its aliases (`sqlite` is an alias of
+/// `sqlite_scanner`, and `INSTALL sqlite` installs that): one `v:<version>` line is `Installed`, no line is
 /// `Missing`. A missing `mise` or `duckdb`, or any other answer, is `Unknown` with the tool
 /// named, so only this resource is blocked.
 pub(crate) fn probe(runner: &Runner, value: &Value) -> Result<PackageState, Refusal> {
     let n = name(value)?;
     let a = args(&format!(
-        "SELECT 'v:' || coalesce(extension_version, '') FROM duckdb_extensions() WHERE extension_name = '{n}' AND installed;"
+        "SELECT 'v:' || coalesce(extension_version, '') FROM duckdb_extensions() WHERE (extension_name = '{n}' OR list_contains(aliases, '{n}')) AND installed;"
     ));
     let out = match runner.run(&request("mise", &a, &env(), PROBE_TIMEOUT)) {
         Ok(o) => o,
@@ -132,11 +139,20 @@ mod tests {
 
     #[test]
     fn a_plain_name_is_accepted_and_anything_else_is_a_manifest_error() {
-        for n in ["spatial", "avro", "h3_ext", "Json2"] {
+        for n in ["spatial", "avro", "h3_ext", "json2", "sqlite"] {
             assert_eq!(name(&value(n)).unwrap(), n);
         }
         let long = "x".repeat(65);
-        for n in ["", "a b", "x';--", "a-b", "a.b", "ünï", long.as_str()] {
+        for n in [
+            "",
+            "a b",
+            "x';--",
+            "a-b",
+            "a.b",
+            "ünï",
+            "Spatial",
+            long.as_str(),
+        ] {
             let e = name(&value(n)).unwrap_err();
             assert_eq!(e.code, Code::ManifestInvalid, "{n}: {e}");
         }
