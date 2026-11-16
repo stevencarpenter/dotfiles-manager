@@ -446,6 +446,7 @@ pub fn registry() -> Vec<Adapter> {
                     field("url", Schema::Str, true),
                     field("path", Schema::HomePath, true),
                     field("branch", Schema::Str, false),
+                    field("update_policy", Schema::Str, false),
                 ]),
             ),
             generator: None,

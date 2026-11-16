@@ -2342,6 +2342,7 @@ fn declared_checkout(
         url: d.url,
         path,
         owner_declared,
+        held: d.held,
     })
 }
 
@@ -2708,6 +2709,7 @@ mod tests {
                 url: "https://github.com/o/r.git".into(),
                 path: home.join("x/r"),
                 owner_declared: true,
+                held: None,
             })
         );
         let e = declared_checkout(home, "extra.bad", &value("o/r"), &[], true, &never).unwrap_err();

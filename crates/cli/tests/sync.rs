@@ -4349,6 +4349,45 @@ fn sync_clones_a_declared_checkout_then_fast_forwards_it() {
     assert_eq!(git(&copy, &["rev-parse", "--short", "HEAD"]), after);
 }
 
+/// DFM-25 (C01 slice 5): a checkout whose `update_policy` is `native-request` (Firstmate pulls
+/// its own) is cloned by the packages scope when missing, and the `checkouts` row never pulls it.
+#[test]
+fn sync_clones_a_held_checkout_and_never_pulls_it() {
+    let u = Up::new(r#"["checkouts"]"#);
+    let tool = Remote::new(u.fake.path(), "tool");
+    put(&tool.seed, "README", "v1\n");
+    tool.push("v1");
+    put(
+        &u.fx.upstream.seed,
+        "base/modules/extra/module.toml",
+        &format!(
+            "{}\n[[resources]]\nid = \"tool\"\nkind = \"package\"\nadapter = \"git-checkout/v1\"\n[resources.value]\nurl = \"{}\"\npath = \"x/tool\"\nupdate_policy = \"native-request\"\n",
+            common::EXTRA,
+            tool.origin()
+        ),
+    );
+    u.fx.upstream.push("declare the held checkout");
+    let copy = u.fx.h("x/tool");
+    let o = u.sync(&[]);
+    assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
+    let before = git(&copy, &["rev-parse", "--short", "HEAD"]);
+    put(&tool.seed, "README", "v2\n");
+    tool.push("v2");
+    let o = u.sync(&[]);
+    assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
+    let s = stdout(&o);
+    assert!(
+        s.contains("  checkouts: would fast-forward no checkout; 1 held by update_policy"),
+        "{s}"
+    );
+    assert!(s.contains("  current checkouts"), "{s}");
+    assert!(
+        s.contains("    note: extra.tool held (update_policy native-request); not pulled"),
+        "{s}"
+    );
+    assert_eq!(git(&copy, &["rev-parse", "--short", "HEAD"]), before);
+}
+
 /// The checkout `extra.tool` of `tool`, declared upstream and cloned by a first sync. Returns the
 /// checkout path and the revision it holds.
 fn cloned_checkout(u: &Up, tool: &Remote) -> (PathBuf, String) {

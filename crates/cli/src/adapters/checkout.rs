@@ -26,6 +26,9 @@ pub(crate) struct Declared {
     /// The checkout directory, relative to HOME.
     pub path: PathBuf,
     pub branch: Option<String>,
+    /// The `update_policy` when it is `hold` or `native-request`: the `checkouts` step of `dfm
+    /// sync` does not pull the checkout. Absent or `rolling` is `None`.
+    pub held: Option<String>,
 }
 
 fn invalid(why: impl Into<String>) -> Refusal {
@@ -37,8 +40,8 @@ fn identity(url: &str) -> Result<String, Refusal> {
 }
 
 /// The value as a declaration. The resolver checks the field types and the HOME path form; this
-/// checks the URL (https, or ssh with userinfo `git` only, never a local path) and the branch.
-/// A bad value is `E_MANIFEST_INVALID`.
+/// checks the URL (https, or ssh with userinfo `git` only, never a local path), the branch and
+/// the `update_policy`. A bad value is `E_MANIFEST_INVALID`.
 pub(crate) fn declared(value: &Value) -> Result<Declared, Refusal> {
     let text = |k: &str| {
         value
@@ -79,10 +82,21 @@ pub(crate) fn declared(value: &Value) -> Result<Declared, Refusal> {
             Some(b.to_string())
         }
     };
+    let held = match value.get("update_policy").map(Value::as_str) {
+        None | Some(Some("rolling")) => None,
+        Some(Some(p @ ("hold" | "native-request"))) => Some(p.to_string()),
+        Some(p) => {
+            return Err(invalid(format!(
+                "update_policy must be rolling, hold or native-request, not {}",
+                visible(p.unwrap_or("a non-string value"))
+            )));
+        }
+    };
     Ok(Declared {
         url: url.into(),
         path: path.into(),
         branch,
+        held,
     })
 }
 
@@ -259,6 +273,28 @@ mod tests {
             declared(&value("https://h.io/o/r", "")).unwrap().branch,
             None
         );
+    }
+
+    #[test]
+    fn update_policy_is_optional_and_only_hold_and_native_request_hold_the_checkout() {
+        let held = |extra: &str| declared(&value("https://github.com/o/r", extra)).map(|d| d.held);
+        assert_eq!(held("").unwrap(), None);
+        assert_eq!(held("update_policy = \"rolling\"").unwrap(), None);
+        assert_eq!(
+            held("update_policy = \"hold\"").unwrap().as_deref(),
+            Some("hold")
+        );
+        assert_eq!(
+            held("update_policy = \"native-request\"")
+                .unwrap()
+                .as_deref(),
+            Some("native-request")
+        );
+        for bad in ["\"rollng\"", "\"\"", "7"] {
+            let e = held(&format!("update_policy = {bad}")).unwrap_err();
+            assert_eq!(e.code, Code::ManifestInvalid, "{bad}: {e}");
+            assert!(e.detail.contains("update_policy must be"), "{e}");
+        }
     }
 
     #[test]

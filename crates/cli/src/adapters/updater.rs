@@ -65,6 +65,9 @@ pub struct Checkout {
     /// The bound checkout declared it and its url (`dfm_model::resolve::owner_declared`): then
     /// its url needs no grant.
     pub owner_declared: bool,
+    /// Its `update_policy` when that is `hold` or `native-request`: the owner's own updater pulls
+    /// it (Firstmate), so `checkouts` leaves it alone.
+    pub held: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1701,9 +1704,14 @@ fn fast_forward(
     git(env, copy, &["rev-parse", "--short", "HEAD"]).map(Ok)
 }
 
-/// The valid declared checkouts, which the `checkouts` updater pulls.
+/// The valid declared checkouts. The `checkouts` updater pulls those that are not held.
 fn declared_checkouts<'e>(env: &'e Env) -> impl Iterator<Item = &'e Checkout> {
     env.checkouts.iter().flatten()
+}
+
+/// The valid declared checkouts that the `checkouts` updater pulls.
+fn pulled_checkouts<'e>(env: &'e Env) -> impl Iterator<Item = &'e Checkout> {
+    declared_checkouts(env).filter(|c| c.held.is_none())
 }
 
 /// Fast-forwards each declared checkout, one note each. A blocked or failed checkout does not
@@ -1735,6 +1743,12 @@ fn checkouts(mut d: Draft, env: &Env) -> Row {
     };
     d.notes.extend(invalid.into_iter().cloned());
     for c in declared_checkouts(env) {
+        // A held checkout is a note only; the packages scope still clones a missing one.
+        if let Some(p) = &c.held {
+            d.notes
+                .push(format!("{} held (update_policy {p}); not pulled", c.id));
+            continue;
+        }
         if std::fs::symlink_metadata(c.path.join(".git")).is_err() {
             d.notes.push(format!(
                 "{} is not cloned yet; the packages scope clones it",
@@ -1862,14 +1876,15 @@ fn preview_command(u: Updater, env: &Env) -> String {
         Updater::Checkouts => match env.provider.resolve("git") {
             Err(e) => format!("blocked: {}", e.detail),
             Ok(_) => {
-                let paths: Vec<String> = declared_checkouts(env)
+                let paths: Vec<String> = pulled_checkouts(env)
                     .map(|c| c.path.display().to_string())
                     .collect();
+                let held = declared_checkouts(env).count() - paths.len();
                 // An invalid declaration blocks the row, so the preview counts it.
                 let invalid = env.checkouts.iter().filter(|c| c.is_err()).count();
                 let plural = |n: usize| if n == 1 { "" } else { "s" };
                 let would = match paths.len() {
-                    0 if invalid == 0 => return "nothing declared".into(),
+                    0 if invalid == 0 && held == 0 => return "nothing declared".into(),
                     0 => "would fast-forward no checkout".to_string(),
                     n => format!(
                         "would fast-forward {n} checkout{} ({})",
@@ -1881,10 +1896,14 @@ fn preview_command(u: Updater, env: &Env) -> String {
                     0 => would,
                     n => format!("{would}; {n} declaration{} invalid", plural(n)),
                 };
+                let would = match held {
+                    0 => would,
+                    n => format!("{would}; {n} held by update_policy"),
+                };
                 // The run gates each checkout on its own, so the others still run: the preview
                 // names the grants without blocking the row.
                 let ungranted = untrusted(
-                    declared_checkouts(env)
+                    pulled_checkouts(env)
                         .filter(|c| !c.owner_declared)
                         .map(|c| git_id(&c.url))
                         .collect(),
@@ -2216,6 +2235,7 @@ mod tests {
                 url: format!("https://github.com/o/{id}.git"),
                 path: path.clone(),
                 owner_declared: true,
+                held: None,
             }));
             path
         }
@@ -2358,6 +2378,53 @@ mod tests {
         let mut want = upstream_calls(&d, "origin")[..3].to_vec();
         want.extend(checkout_calls(&moved));
         assert_eq!(t.calls(), want);
+    }
+
+    /// A checkout whose `update_policy` is `hold` or `native-request` (Firstmate pulls its own)
+    /// is never pulled, and only noted; the others still run and decide the row.
+    #[test]
+    fn a_held_checkout_is_noted_and_not_pulled() {
+        let mut t = T::new();
+        t.checkouts_git();
+        // A nested declaration without a grant: held, it needs none.
+        t.grants = Grants::default();
+        for (id, policy) in [("fm", "native-request"), ("pinned", "hold")] {
+            t.checkout(id, "a1b2c3d", "d4e5f6a");
+            let c = t.checkouts.last_mut().unwrap().as_mut().unwrap();
+            c.held = Some(policy.into());
+            c.owner_declared = false;
+        }
+        let tpm = t.checkout("tpm", "a1b2c3d", "d4e5f6a");
+        assert_eq!(
+            preview(Updater::Checkouts, &t.env()),
+            format!(
+                "would fast-forward 1 checkout ({}); 2 held by update_policy",
+                tpm.display()
+            )
+        );
+        let r = run(Updater::Checkouts, &t.env());
+        assert_eq!(r.status, Status::Updated, "{r:?}");
+        assert_eq!(
+            r.notes,
+            [
+                "fm held (update_policy native-request); not pulled",
+                "pinned held (update_policy hold); not pulled",
+                "tpm a1b2c3d -> d4e5f6a",
+            ]
+        );
+        assert_eq!(t.calls(), checkout_calls(&tpm));
+        // Held alone: current, nothing runs, and a held checkout not cloned yet is still held.
+        t.checkouts.pop();
+        fs::remove_dir(t.home.join("src/fm/.git")).unwrap();
+        assert_eq!(
+            preview(Updater::Checkouts, &t.env()),
+            "would fast-forward no checkout; 2 held by update_policy"
+        );
+        fs::remove_file(t.root.join("log")).unwrap();
+        let r = run(Updater::Checkouts, &t.env());
+        assert_eq!(r.status, Status::Current, "{r:?}");
+        assert_eq!(r.notes.len(), 2, "{r:?}");
+        assert_eq!(t.log(), "");
     }
 
     #[test]
