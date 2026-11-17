@@ -163,14 +163,16 @@ jobs:
       matrix:
         # Each entry lists the parts one job runs in turn (scripts/check_all.sh run_archive).
         # `solo` runs the release-graph gate test alone: it builds the workspace in release mode
-        # and doubled the run time of the partition that also held it (run 42617574999). nextest
-        # `count` partitions deal every other test of each binary round-robin. The shares come
-        # from measured times (runs 44059886213 and 44034546319): the other tests took about
-        # 3,735 test-seconds, about 1,245 s on the 3-core runner, and the solo test about 115 s,
-        # so nine equal chunks give each job about 250 to 280 s (two chunks, or solo and one).
-        # The gate test `every_cli_test_target_is_in_one_ci_shard` checks that the entries hold
-        # solo and count:1/N to N/N exactly once. Five jobs is the hosted macOS concurrency cap.
-        partition: ["solo count:9/9", "count:1/9 count:2/9", "count:3/9 count:4/9", "count:5/9 count:6/9", "count:7/9 count:8/9"]
+        # and doubled the run time of the partition that also held it (run 42617574999). The
+        # other tests are cut into nine nextest `hash` chunks. `count` chunks deal each binary's
+        # tests by position and differed by up to 1.8 times in duration (run 44065331090, 309 to
+        # 545 test-seconds against about 415); hash placement has no position bias. The shares
+        # come from measured times: the other tests take about 3,800 test-seconds, about 1,270 s
+        # on the 3-core runner, and the solo test about 115 s, so each job gets two chunks, or
+        # solo and one. The gate test `every_cli_test_target_is_in_one_ci_shard` checks that the
+        # entries hold solo and hash:1/N to N/N exactly once. Five jobs is the hosted macOS
+        # concurrency cap.
+        partition: ["solo hash:9/9", "hash:1/9 hash:2/9", "hash:3/9 hash:4/9", "hash:5/9 hash:6/9", "hash:7/9 hash:8/9"]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
