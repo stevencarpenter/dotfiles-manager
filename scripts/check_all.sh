@@ -61,19 +61,23 @@ solo_test=a_plain_release_build_of_every_target_has_no_test_isolation
 
 # Runs a selection of the archive. The archive is extracted into this checkout, so the build
 # paths compiled into the tests (CARGO_BIN_EXE_dfm, CARGO_MANIFEST_DIR) name real files: CI
-# builds and runs in the same checkout path. DFM_TEST_PARTITION is `solo` (only $solo_test) or a
-# nextest partition such as count:2/4 of every other test, so the jobs together run each test once.
+# builds and runs in the same checkout path. DFM_TEST_PARTITION holds one or more parts,
+# separated by spaces: `solo` (only $solo_test) or a nextest partition such as count:2/9 of every
+# other test. Each part is its own nextest run, and the jobs together run each test once.
 run_archive() {
-    local part=${DFM_TEST_PARTITION:?set DFM_TEST_PARTITION}
-    local select=(-E "not test(=$solo_test)" --partition "$part")
-    [ "$part" != solo ] || select=(-E "test(=$solo_test)")
-    cargo nextest run --archive-file "$DFM_TEST_ARCHIVE" --workspace-remap . \
-        --extract-to . --extract-overwrite "${select[@]}" "$@"
+    local parts part
+    read -ra parts <<<"${DFM_TEST_PARTITION:?set DFM_TEST_PARTITION}"
+    for part in "${parts[@]}"; do
+        local select=(-E "not test(=$solo_test)" --partition "$part")
+        [ "$part" != solo ] || select=(-E "test(=$solo_test)")
+        cargo nextest run --archive-file "$DFM_TEST_ARCHIVE" --workspace-remap . \
+            --extract-to . --extract-overwrite "${select[@]}" "$@"
+    done
 }
 
 # Implementation tests: unit, CLI, bootstrap script and build-controls differential tests.
 # Locally `cargo test` runs the test set. With DFM_TEST_ARCHIVE set (hosted CI), the step runs
-# the part DFM_TEST_PARTITION (solo, or for example count:2/4) of that prebuilt archive
+# the parts DFM_TEST_PARTITION names (for example `solo count:9/9`) of that prebuilt archive
 # instead; each test then runs in its own process.
 # Set DFM_SKIP_NETWORK_TESTS=1 (exactly 1) to skip the network-tests step; the skip is printed.
 step_rust_tests() {

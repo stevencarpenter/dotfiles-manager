@@ -685,20 +685,26 @@ fn count_partitions(total: usize) -> Vec<String> {
 }
 
 /// Hosted CI builds the whole test set once into a nextest archive (scripts/check_all.sh,
-/// step rust-archive). One job runs the test the script names in `solo_test` and nothing else;
-/// the other jobs run `count` partitions of every other test. Every test runs in exactly one job
-/// when the matrix lists `solo` and each partition 1 to N once and the solo test exists. Every
-/// workspace test target is in the archive when it needs no feature but test-isolation and the
-/// failpoints feature it switches on.
+/// step rust-archive). Each matrix entry lists the parts one job runs in turn: `solo` is the test
+/// the script names in `solo_test`, and a `count` partition holds a share of every other test.
+/// Every test runs in exactly one job when the entries together hold `solo` and each partition 1
+/// to N exactly once and the solo test exists. Every workspace test target is in the archive when
+/// it needs no feature but test-isolation and the failpoints feature it switches on.
 #[test]
 fn every_cli_test_target_is_in_one_ci_shard() {
-    let list = ci_partitions().remove(0);
-    let total = list.len() - 1;
+    let mut parts: Vec<String> = ci_partitions()
+        .remove(0)
+        .iter()
+        .flat_map(|entry| entry.split_whitespace().map(str::to_string))
+        .collect();
+    parts.sort();
+    let total = parts.len() - 1;
     let mut want = vec!["solo".to_string()];
     want.extend(count_partitions(total));
+    want.sort();
     assert_eq!(
-        list, want,
-        "list solo and each test partition 1 to {total} once in contract-check.yml"
+        parts, want,
+        "the test matrix entries of contract-check.yml together hold solo and each partition 1 to {total} exactly once"
     );
     let script = fs::read_to_string(repo_root().join("scripts/check_all.sh")).unwrap();
     let solo = script
