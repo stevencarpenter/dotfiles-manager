@@ -1511,7 +1511,13 @@ fn c11_one_conflicting_override() {
 
 #[test]
 fn hashing_helper_matches_the_digest_module() {
-    assert_eq!(sha(b"x"), format!("sha256:{:x}", Sha256::digest(b"x")));
+    assert_eq!(
+        sha(b"x"),
+        format!(
+            "sha256:{}",
+            dfm_model::digest::hex(Sha256::digest(b"x").as_slice())
+        )
+    );
 }
 
 // Fragment directories are claimed as prefixes.

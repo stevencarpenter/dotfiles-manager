@@ -304,7 +304,7 @@ fn fingerprint_skipping(root: &Path, skip: Option<&Path>) -> String {
     }
     let mut h = Sha256::new();
     go(root, &mut h, skip);
-    format!("{:x}", h.finalize())
+    dfm_model::digest::hex(h.finalize().as_slice())
 }
 
 fn is_link_to(p: &Path, target: &Path) -> bool {
@@ -1827,7 +1827,7 @@ fn a_stow_style_machine_is_adopted_without_writing_to_home() {
     // The link fingerprint is not the hash of a file with the same bytes.
     assert_ne!(
         want,
-        format!("{:x}", Sha256::digest(zsh.to_str().unwrap().as_bytes()))
+        dfm_model::digest::hex(Sha256::digest(zsh.to_str().unwrap().as_bytes()).as_slice())
     );
     assert_eq!(z["mode"], 0o777);
     // The receipt records each approval and no reload state.
