@@ -1102,7 +1102,7 @@ fn a_sensitive_prerequisite_is_recorded_by_mode_only() {
     let content = "TOKEN=hunter2-rendered-value\n";
     fs::write(&secret, content).unwrap();
     fs::set_permissions(&secret, fs::Permissions::from_mode(0o600)).unwrap();
-    let hash = format!("{:x}", Sha256::digest(content.as_bytes()));
+    let hash = dfm_model::digest::hex(Sha256::digest(content.as_bytes()).as_slice());
     fx.mark("brew-sketchybar", "none\n");
     fx.mark(
         "loaded",
@@ -1181,7 +1181,7 @@ fn a_secret_definition_shows_neither_its_hash_nor_its_arguments() {
     let content = AGENT_PLIST.replace("2097152", "TOKEN-hunter2-argument");
     fs::write(&plist, &content).unwrap();
     fs::set_permissions(&plist, fs::Permissions::from_mode(0o600)).unwrap();
-    let hash = format!("{:x}", Sha256::digest(content.as_bytes()));
+    let hash = dfm_model::digest::hex(Sha256::digest(content.as_bytes()).as_slice());
     let o = fx.preview(&[]);
     assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
     let t = text(&o.stdout);

@@ -363,7 +363,7 @@ fn a_secret_is_rendered_once_recorded_salted_and_a_rerun_is_current() {
     // Nothing but the destination holds the value, its plain hash or the salted hash.
     let plain = {
         use sha2::{Digest, Sha256};
-        format!("{:x}", Sha256::digest(format!("TOKEN={SECRET}\n")))
+        dfm_model::digest::hex(Sha256::digest(format!("TOKEN={SECRET}\n")).as_slice())
     };
     let state = all_bytes(&fx.state());
     assert!(

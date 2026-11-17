@@ -127,7 +127,7 @@ fn fingerprint(root: &Path) -> String {
     }
     let mut h = Sha256::new();
     go(root, &mut h);
-    format!("{:x}", h.finalize())
+    dfm_model::digest::hex(h.finalize().as_slice())
 }
 
 fn case_insensitive(dir: &Path) -> bool {
@@ -418,7 +418,7 @@ fn ownership_comes_from_the_ledger_only() {
 fn a_sensitive_destination_that_exists_is_merged_in_place_and_leaks_nothing() {
     let secret = "sk-PLANTED-0123456789";
     let content = format!("{{\"token\":\"{secret}\"}}");
-    let digest = format!("{:x}", Sha256::digest(content.as_bytes()));
+    let digest = dfm_model::digest::hex(Sha256::digest(content.as_bytes()).as_slice());
     // The merge adapter owns this path (docs/adapters.md): an existing file is read, never
     // printed, and merged in place. With no ledger entry the manager may write. A ledger entry
     // of another resource blocks. A file open to group or others blocks with fix text.
@@ -2092,7 +2092,7 @@ separator = "\n"
     let live = e.h(".claude/settings.json");
     fs::write(&live, content).unwrap();
     fs::set_permissions(&live, fs::Permissions::from_mode(0o600)).unwrap();
-    let digest = format!("{:x}", Sha256::digest(content.as_bytes()));
+    let digest = dfm_model::digest::hex(Sha256::digest(content.as_bytes()).as_slice());
     let o = e.plan(&["--json"]);
     assert_eq!(code(&o), 3, "{}", text(&o.stderr));
     let all = format!("{}{}", text(&o.stdout), text(&o.stderr));
@@ -2698,7 +2698,7 @@ fn a_ledger_entry_on_a_sensitive_claim_leaks_no_hash_and_is_not_a_removal() {
     // Another, deselected, normal resource owns the file in the ledger (its fingerprint is the
     // content hash), and a selected sensitive resource now claims it.
     record(&e, "gone.res", &out, "SECRETTOKEN123");
-    let digest = format!("{:x}", Sha256::digest(b"SECRETTOKEN123"));
+    let digest = dfm_model::digest::hex(Sha256::digest(b"SECRETTOKEN123").as_slice());
     for extra in [&["--json"][..], &[][..]] {
         let o = e.plan(extra);
         let all = format!("{}{}", text(&o.stdout), text(&o.stderr));
@@ -3066,7 +3066,7 @@ fn a_path_the_ledger_records_as_sensitive_is_never_hashed_whoever_claims_it_now(
         "yes",
     ]);
     assert_eq!(code(&o), 0, "{}", text(&o.stderr));
-    let digest = format!("{:x}", Sha256::digest(b"SECRETX-CONTENT"));
+    let digest = dfm_model::digest::hex(Sha256::digest(b"SECRETX-CONTENT").as_slice());
     let o = e.plan(&["--json"]);
     let all = text(&o.stdout);
     assert!(

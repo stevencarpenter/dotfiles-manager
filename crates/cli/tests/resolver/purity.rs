@@ -28,7 +28,7 @@ fn tree_fingerprint(root: &Path) -> String {
     }
     let mut h = Sha256::new();
     go(root, &mut h);
-    format!("{:x}", h.finalize())
+    dfm_model::digest::hex(h.finalize().as_slice())
 }
 
 #[test]

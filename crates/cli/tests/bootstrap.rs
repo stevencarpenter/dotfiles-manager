@@ -254,8 +254,8 @@ fn toolchain_digest_list_prints_the_entries_the_digest_covers() {
     let o = script_test_mode(&home, &["toolchain-digest", "--dir", dir, "--list"], &[]);
     assert_eq!(o.status.code(), Some(0), "{}", err(&o));
     let list = String::from_utf8(o.stdout).unwrap();
-    let a = format!("{:x}", sha2::Sha256::digest(b"a"));
-    let b = format!("{:x}", sha2::Sha256::digest(b"b"));
+    let a = dfm_model::digest::hex(sha2::Sha256::digest(b"a").as_slice());
+    let b = dfm_model::digest::hex(sha2::Sha256::digest(b"b").as_slice());
     assert_eq!(
         list,
         format!("bin/a\texec\t{a}\nbin/l\tsymlink\ta\nlib/b\tfile\t{b}\n")
@@ -269,7 +269,10 @@ fn toolchain_digest_list_prints_the_entries_the_digest_covers() {
     assert_eq!(o.status.code(), Some(0), "{}", err(&o));
     assert_eq!(
         String::from_utf8(o.stdout).unwrap(),
-        format!("{:x}\n", sha2::Sha256::digest(&encoded))
+        format!(
+            "{}\n",
+            dfm_model::digest::hex(sha2::Sha256::digest(&encoded).as_slice())
+        )
     );
 }
 
@@ -3253,7 +3256,7 @@ fn repeated_flags_and_flags_the_command_does_not_use_are_usage_errors() {
 
 fn sha256_hex(file: &Path) -> String {
     use sha2::Digest;
-    format!("{:x}", sha2::Sha256::digest(fs::read(file).unwrap()))
+    dfm_model::digest::hex(sha2::Sha256::digest(fs::read(file).unwrap()).as_slice())
 }
 
 /// `--expect-sha256` is the digest the owner holds out of band. It is checked before any command

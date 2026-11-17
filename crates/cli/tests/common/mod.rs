@@ -179,7 +179,7 @@ pub fn fingerprint_except(root: &Path, skip: &[&Path]) -> String {
     }
     let mut h = Sha256::new();
     go(root, skip, &mut h);
-    format!("{:x}", h.finalize())
+    dfm_model::digest::hex(h.finalize().as_slice())
 }
 
 pub const CORE: &str = r#"schema = 1

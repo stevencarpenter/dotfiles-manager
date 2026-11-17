@@ -89,7 +89,7 @@ fn digest_of(plan: &Output) -> String {
 }
 
 fn hex(b: &[u8]) -> String {
-    format!("{:x}", Sha256::digest(b))
+    dfm_model::digest::hex(Sha256::digest(b).as_slice())
 }
 
 impl Fx {
