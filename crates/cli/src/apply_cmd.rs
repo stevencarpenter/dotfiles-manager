@@ -37,6 +37,8 @@ pub struct Args {
     pub allow: BTreeSet<String>,
     pub allow_adopt: BTreeSet<String>,
     pub preview: bool,
+    /// `--all`: the printed plan lists every row (docs/planner.md, "Rows").
+    pub all: bool,
     /// Which resources the run acts on: `apply` is `Config`, `secrets` is `Secrets`.
     pub scope: Scope,
     /// `packages --update`: a rolling update of the installed rolling tools
@@ -85,6 +87,7 @@ pub fn parse_args(m: &clap::ArgMatches, scope: Scope) -> Result<Args, Refusal> {
         allow,
         allow_adopt,
         preview,
+        all: cli::flag(m, "all"),
         scope,
         update,
         restart,
@@ -583,7 +586,7 @@ fn run_inner(
         if let Some(i) = &ctx.isolated {
             writeln!(out, "isolated: true {i}").map_err(w)?;
         }
-        render(plan, &digest, ctx.color, ctx.all, out).map_err(w)?;
+        render(plan, &digest, ctx.color, args.all, out).map_err(w)?;
         for n in &notes {
             writeln!(out, "note: {}", visible(n)).map_err(w)?;
         }

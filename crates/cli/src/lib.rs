@@ -222,8 +222,6 @@ struct Ctx {
     isolated: Option<String>,
     /// Color the text output: stdout is a terminal (`paint::enabled`).
     color: bool,
-    /// `--all`: list the `current` and `not_in_scope` rows of a printed plan too.
-    all: bool,
 }
 
 impl Ctx {
@@ -329,7 +327,6 @@ fn context(home: Option<String>) -> Result<Ctx, Refusal> {
         arch,
         isolated,
         color: paint::enabled(&std::io::stdout()),
-        all: false,
     })
 }
 
@@ -344,7 +341,6 @@ fn context(_home: Option<String>) -> Result<Ctx, Refusal> {
         arch: arch.into(),
         isolated: None,
         color: paint::enabled(&std::io::stdout()),
-        all: false,
     })
 }
 
@@ -418,9 +414,6 @@ fn run_command(
 ) -> Result<(), Refusal> {
     let w =
         |e: std::io::Error| Refusal::new(Code::IoFailed, format!("output failed: {}", e.kind()));
-    // Every arm builds its context here, so `--all` reaches each command that prints a plan.
-    let all = cli::flag(sub, "all");
-    let context = |home| context(home).map(|ctx| Ctx { all, ..ctx });
     match cmd {
         "help" => write!(out, "{HELP}").map_err(w),
         "version" => write_version(out).map_err(w),

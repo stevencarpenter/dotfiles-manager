@@ -441,7 +441,7 @@ fn a_sync_that_changes_nothing_needs_no_approval() {
     // The default view counts the current rows instead of listing them (DFM-88).
     assert!(!s.lines().any(|l| l.starts_with("  current ")), "{s}");
     assert!(
-        s.contains("4 operation(s) that change nothing not shown (--all shows them)"),
+        s.contains("hidden: 4 current or out-of-scope operation(s); --all lists them"),
         "{s}"
     );
     assert!(s.contains("nothing to change: no approval needed"), "{s}");

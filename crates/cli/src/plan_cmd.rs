@@ -9,9 +9,8 @@ use crate::{Ctx, Loaded, cli, load_resolved, paint, read_existing_binding, usage
 use dfm_engine::{Dir, Fail, Store, merge, observe};
 use dfm_model::display::visible;
 use dfm_model::plan::{
-    self, Action, ApprovedFile, Binary, Context, LinkTo, MAX_PLAN_BYTES, Node, Observations,
-    Operation, Owned, PackageState, Plan, Saved, Scope, ServiceFacts, Stale, Status,
-    source_identity,
+    self, ApprovedFile, Binary, Context, LinkTo, MAX_PLAN_BYTES, Node, Observations, Operation,
+    Owned, PackageState, Plan, Saved, Scope, ServiceFacts, Stale, Status, source_identity,
 };
 use dfm_model::{Code, Refusal};
 use std::collections::{BTreeMap, BTreeSet};
@@ -22,6 +21,8 @@ pub struct Args {
     /// `--root`; `None` takes the root the binding records.
     pub root: Option<String>,
     pub json: bool,
+    /// `--all`: list every row of the text plan (docs/planner.md, "Rows").
+    pub all: bool,
     pub against: Option<String>,
 }
 
@@ -30,6 +31,7 @@ pub fn parse_args(m: &clap::ArgMatches) -> Args {
     Args {
         root: cli::one(m, "root"),
         json: cli::flag(m, "json"),
+        all: cli::flag(m, "all"),
         against: cli::one(m, "against"),
     }
 }
@@ -295,8 +297,9 @@ pub(crate) fn render(
 }
 
 /// The plan without its digest line: `sync` prints four plans and one digest for all of them.
-/// Without `all` (`--all`), `current` and `not_in_scope` rows are counted, not listed: they
-/// change nothing, so the digest approves nothing they would hide.
+/// Without `all` (`--all`), `current` and `not_in_scope` rows that apply does not journal
+/// (`Operation::journaled`) are counted, not listed: they write nothing, so the digest approves
+/// nothing they would hide.
 pub(crate) fn render_body(
     p: &Plan,
     color: bool,
@@ -316,13 +319,9 @@ pub(crate) fn render_body(
         writeln!(out, "{} {} {}", label("source:"), visible(&s.root), s.tree)?;
     }
     writeln!(out, "{} {}", label("operations:"), p.operations.len())?;
-    // A `current` removal still prunes its ledger entry (`Plan::changes_nothing`), so it shows.
+    // `held` writes nothing either, but it shows: the user chose to hold it.
     let quiet = |o: &&Operation| {
-        !all && match o.status {
-            Status::Current => o.action != Action::Remove,
-            Status::NotInScope => true,
-            Status::Planned | Status::Held | Status::Blocked => false,
-        }
+        !all && !o.journaled() && matches!(o.status, Status::Current | Status::NotInScope)
     };
     for o in p.operations.iter().filter(|o| !quiet(o)) {
         head_line(o, color, out)?;
@@ -361,7 +360,8 @@ pub(crate) fn render_body(
     if hidden > 0 {
         writeln!(
             out,
-            "  {hidden} operation(s) that change nothing not shown (--all shows them)"
+            "{} {hidden} current or out-of-scope operation(s); --all lists them",
+            label("hidden:")
         )?;
     }
     summary(p, color, out)?;
@@ -503,7 +503,7 @@ pub fn run(ctx: &Ctx, args: &Args, out: &mut dyn Write) -> Result<(), Refusal> {
         if let Some(i) = &ctx.isolated {
             writeln!(out, "isolated: true {i}").map_err(w)?;
         }
-        render(&fresh, &digest, ctx.color, ctx.all, out).map_err(w)?;
+        render(&fresh, &digest, ctx.color, args.all, out).map_err(w)?;
         print_stale(&diffs, out).map_err(w)?;
     }
     if let Some(first) = diffs.first() {

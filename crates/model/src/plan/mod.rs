@@ -424,17 +424,24 @@ pub struct Plan {
     pub blockers: Vec<Blocker>,
 }
 
+impl Operation {
+    /// Whether apply journals this operation: it is `planned`, or it is a `current` removal,
+    /// whose stale ledger entry apply prunes. Every other row writes nothing.
+    pub fn journaled(&self) -> bool {
+        self.status == Status::Planned
+            || (self.status == Status::Current && self.action == Action::Remove)
+    }
+}
+
 impl Plan {
-    /// Whether applying this plan would write nothing: no blocker, and every operation is
-    /// `current`, `held` or `not_in_scope`. A `current` removal is excluded, because apply prunes
-    /// its stale ledger entry.
+    /// Whether applying this plan would write nothing: no blocker, and no operation is
+    /// `blocked` or journaled (`Operation::journaled`).
     pub fn changes_nothing(&self) -> bool {
         self.blockers.is_empty()
-            && self.operations.iter().all(|o| match o.status {
-                Status::Current => o.action != Action::Remove,
-                Status::Held | Status::NotInScope => true,
-                Status::Planned | Status::Blocked => false,
-            })
+            && self
+                .operations
+                .iter()
+                .all(|o| o.status != Status::Blocked && !o.journaled())
     }
 
     /// SHA-256 of the canonical JSON of the plan (sorted keys, no insignificant whitespace).

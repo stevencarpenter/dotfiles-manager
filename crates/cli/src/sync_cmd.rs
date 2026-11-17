@@ -1905,7 +1905,7 @@ fn run_inner(
     let digest = sync_digest(&review, &previewed);
     let parts = review.split();
     printed.warnings = parts.iter().flat_map(ScopePlan::warnings).collect();
-    show(&review, &parts, &digest, ctx.color, ctx.all, out).map_err(w)?;
+    show(&review, &parts, &digest, ctx.color, args.apply.all, out).map_err(w)?;
     printed.plan = true;
     // A digest that no longer matches is the first thing to report: the reviewer approved a
     // different run.

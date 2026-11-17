@@ -2828,7 +2828,6 @@ mod tests {
             arch: "aarch64".into(),
             isolated: None,
             color: false,
-            all: false,
         };
         Git::new(&ctx, &Sys { uid: uid() })
     }

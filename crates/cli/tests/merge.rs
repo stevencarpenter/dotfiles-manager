@@ -386,15 +386,31 @@ fn the_text_plan_lists_only_rows_that_change_unless_all_is_given() {
         "{t}"
     );
     assert!(
-        t.contains("operation(s) that change nothing not shown (--all shows them)"),
+        t.contains("current or out-of-scope operation(s); --all lists them"),
         "{t}"
     );
     assert!(t.contains("summary: current="), "{t}");
     let all = text(&fx.plan().stdout);
     assert!(row(&all, "current "), "{all}");
-    assert!(!all.contains("not shown (--all"), "{all}");
+    assert!(!all.contains("hidden:"), "{all}");
     // The flag changes the text only, never the plan the digest approves.
     assert_eq!(t.lines().last(), all.lines().last());
+    let json = |extra: &[&str]| {
+        let mut a = vec!["plan", "--root", fx.root_arg(), "--json"];
+        a.extend_from_slice(extra);
+        fx.run(&a).stdout
+    };
+    assert_eq!(json(&[]), json(&["--all"]));
+    // apply prints the same default view.
+    let p = text(
+        &fx.run(&["apply", "--root", fx.root_arg(), "--preview"])
+            .stdout,
+    );
+    assert!(
+        !p.lines().any(|l| l.trim_start().starts_with("current ")),
+        "{p}"
+    );
+    assert!(p.contains("hidden: "), "{p}");
 }
 
 #[test]
