@@ -4,7 +4,8 @@ name: Contract checks
 # - commit hook: fixtures, scripts and Rust style on the staged tree (no tests)
 # - pull request: every step in parallel jobs; the Rust jobs run only when a Rust input
 #   changed, the network install tests only when a bootstrap input changed
-# - push to main: the whole gate
+# - push to main (a squash merge): the jobs whose inputs the merge changed, as for a pull request
+# - daily schedule and manual run: the whole gate, the backstop for changes no job input names
 # Compile once: the `build` job compiles every test binary into one cargo-nextest archive with the
 # cargo dependency cache; the test and install jobs download it and run one partition each
 # without compiling. The style job keeps its own cache (clippy builds check metadata only).
@@ -15,13 +16,20 @@ on:
   pull_request:
   push:
     branches: [main]
+  # A path-classified merge skips jobs whose inputs it did not touch, so this full run covers
+  # what no input pattern names (for example the install tests of a crates/*/src change).
+  schedule:
+    - cron: "17 9 * * *"
   workflow_dispatch:
 
 permissions:
   contents: read
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  # A pull request run is replaced by its newer push. Every other run has its own group, so a
+  # newer merge never cancels the pending run of an earlier merge that path classification
+  # would not repeat.
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
@@ -47,19 +55,25 @@ jobs:
         id: classify
         env:
           EVENT: ${{ github.event_name }}
+          BEFORE: ${{ github.event.before }}
         run: |
           rust=true
           bootstrap=true
-          # A manual run (workflow_dispatch) runs every job. A pull request and a push to main run
-          # only the jobs whose inputs changed: the first parent is the base branch tip, or the
-          # main tip before the squash merge. Without this, every merge ran the five network
-          # install jobs and held the five hosted macOS slots that the next pull request needs.
-          if [ "$EVENT" = pull_request ] || [ "$EVENT" = push ]; then
-            changed=$(git diff --name-only HEAD^1 HEAD)
+          # A scheduled or manual run runs every job. A pull request, and a push to main that is
+          # one squash merge (its parent is the tip before the push), run only the jobs whose
+          # inputs changed. A push of several commits runs every job, because HEAD^1 would show
+          # only the last one. Without this, every merge ran the five network install jobs and
+          # held the five hosted macOS slots that the next pull request needs.
+          classify=false
+          if [ "$EVENT" = pull_request ]; then classify=true; fi
+          if [ "$EVENT" = push ] && [ "$(git rev-parse HEAD^1)" = "$BEFORE" ]; then classify=true; fi
+          if [ "$classify" = true ]; then
+            # --no-renames lists both paths of a rename, so a file moved out of crates/ counts.
+            changed=$(git diff --name-only --no-renames HEAD^1 HEAD)
             printf 'changed:\n%s\n' "$changed"
             rust=false
             bootstrap=false
-            rust_inputs='^(crates/|examples/|tests/|Cargo\.(toml|lock)$|rust-toolchain\.toml$|scripts/check_all\.sh$|scripts/bootstrap\.sh$|docs/bootstrap\.md$|docs/authoring\.md$|\.github/workflows/contract-check\.yml$)'
+            rust_inputs='^(crates/|examples/|tests/|Cargo\.(toml|lock)$|rust-toolchain\.toml$|scripts/check_all\.sh$|scripts/bootstrap\.sh$|docs/bootstrap\.md$|docs/authoring\.md$|docs/doctor\.md$|scripts/check_examples\.py$|\.github/workflows/contract-check\.yml$)'
             bootstrap_inputs='^(scripts/bootstrap\.sh$|crates/cli/tests/bootstrap\.rs$|crates/cli/tests/common/|crates/[^/]+/Cargo\.toml$|Cargo\.(toml|lock)$|rust-toolchain\.toml$|scripts/check_all\.sh$|\.github/workflows/contract-check\.yml$)'
             if printf '%s\n' "$changed" | grep -Eq "$rust_inputs"; then rust=true; fi
             if printf '%s\n' "$changed" | grep -Eq "$bootstrap_inputs"; then bootstrap=true; fi
