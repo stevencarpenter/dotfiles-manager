@@ -1,6 +1,6 @@
 name: Contract checks
 
-# Stages of the gate (README, "Check the draft"):
+# Stages of the gate (README, "Check the repository"):
 # - commit hook: fixtures, scripts and Rust style on the staged tree (no tests)
 # - pull request: every step in parallel jobs; the Rust jobs run only when a Rust input
 #   changed, the network install tests only when a bootstrap input changed
