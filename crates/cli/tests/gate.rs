@@ -679,14 +679,15 @@ fn ci_partitions() -> Vec<Vec<String>> {
     lists
 }
 
-/// `count:1/N` to `count:N/N`, the nextest partitions that together hold every selected test.
-fn count_partitions(total: usize) -> Vec<String> {
-    (1..=total).map(|k| format!("count:{k}/{total}")).collect()
+/// `<kind>:1/N` to `<kind>:N/N` (`count` or `hash`), the nextest partitions that together hold
+/// every selected test.
+fn partitions(kind: &str, total: usize) -> Vec<String> {
+    (1..=total).map(|k| format!("{kind}:{k}/{total}")).collect()
 }
 
 /// Hosted CI builds the whole test set once into a nextest archive (scripts/check_all.sh,
 /// step rust-archive). Each matrix entry lists the parts one job runs in turn: `solo` is the test
-/// the script names in `solo_test`, and a `count` partition holds a share of every other test.
+/// the script names in `solo_test`, and a `hash` partition holds a share of every other test.
 /// Every test runs in exactly one job when the entries together hold `solo` and each partition 1
 /// to N exactly once and the solo test exists. Every workspace test target is in the archive when
 /// it needs no feature but test-isolation and the failpoints feature it switches on.
@@ -700,7 +701,7 @@ fn every_cli_test_target_is_in_one_ci_shard() {
     parts.sort();
     let total = parts.len() - 1;
     let mut want = vec!["solo".to_string()];
-    want.extend(count_partitions(total));
+    want.extend(partitions("hash", total));
     want.sort();
     assert_eq!(
         parts, want,
@@ -748,7 +749,7 @@ fn every_ignored_test_is_in_one_install_shard() {
     let total = list.len();
     assert_eq!(
         list,
-        count_partitions(total),
+        partitions("count", total),
         "list each install partition 1 to {total} once in contract-check.yml"
     );
     let mut files = Vec::new();
