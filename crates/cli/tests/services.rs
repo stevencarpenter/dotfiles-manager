@@ -276,7 +276,7 @@ impl Fx {
     }
 
     fn preview(&self, flags: &[&str]) -> Output {
-        let mut a = vec!["services", "--root", self.root_arg(), "--preview"];
+        let mut a = vec!["services", "--root", self.root_arg(), "--preview", "--all"];
         a.extend_from_slice(flags);
         self.run(&a)
     }
@@ -329,7 +329,7 @@ impl Fx {
 #[test]
 fn a_configuration_plan_lists_services_out_of_scope_and_starts_no_launcher() {
     let fx = Fx::new();
-    let o = fx.run(&["plan", "--root", fx.root_arg()]);
+    let o = fx.run(&["plan", "--root", fx.root_arg(), "--all"]);
     assert_eq!(code(&o), 0, "{}", stderr(&o));
     let t = text(&o.stdout);
     assert!(t.contains("not_in_scope extra.maxfiles@scope"), "{t}");
@@ -349,7 +349,7 @@ fn a_configuration_plan_lists_services_out_of_scope_and_starts_no_launcher() {
     assert!(!fx.launcher_ran(), "{}", fx.log());
     // The other scopes do not act on a service either, and none of them asks a launcher.
     fx.mark("brew-sketchybar", "none\n");
-    let o = fx.run(&["packages", "--root", fx.root_arg(), "--preview"]);
+    let o = fx.run(&["packages", "--root", fx.root_arg(), "--preview", "--all"]);
     assert!(
         text(&o.stdout).contains("not_in_scope extra.sketchybar@scope"),
         "{}\n{}",

@@ -20,7 +20,7 @@ Launchers run through the bounded runner (docs/secrets.md, "How `op` is run"). `
 ## The command
 
 ```
-dfm services [--root <dir>] [--preview] [-y|--yes-plan <digest>] [--allow-disruptive <operation-id>]... [--restart <resource-id>]...
+dfm services [--root <dir>] [--preview] [--all] [-y|--yes-plan <digest>] [--allow-disruptive <operation-id>]... [--restart <resource-id>]...
 ```
 
 `services` is `apply` over the services scope. Every `service` resource is planned. Every other resource is `not_in_scope` ("link is configuration, outside a services plan"). Nothing is removed or adopted: `--allow-adopt` is a usage error. `--root` defaults to the root the binding records.

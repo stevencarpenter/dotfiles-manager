@@ -15,7 +15,7 @@ The `op-template/v1` adapter and the `secrets` command. This document describes 
 ## The command
 
 ```
-dfm secrets [--root <dir>] [--preview] [-y|--yes-plan <digest>] [--allow-adopt <operation-id>]...
+dfm secrets [--root <dir>] [--preview] [--all] [-y|--yes-plan <digest>] [--allow-adopt <operation-id>]...
 ```
 
 `secrets` is `apply` over the secrets scope (docs/apply.md). Every `secret` resource is planned. Every other resource is `not_in_scope` ("link is configuration, outside a secrets plan"). `--root` defaults to the root the binding records. `plan` and `apply` list a secret as `not_in_scope` with destination and mode only. They never read the destination or start `op`.

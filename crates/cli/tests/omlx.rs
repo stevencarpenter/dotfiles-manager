@@ -373,7 +373,7 @@ fn a_rewrite_by_the_app_in_another_key_order_is_current() {
     reordered.push_str("    }\n}\n");
     fx.live(&reordered, 0o644);
     assert_eq!(fx.json(), j);
-    let o = fx.run(&["plan", "--root", fx.root_arg()]);
+    let o = fx.run(&["plan", "--root", fx.root_arg(), "--all"]);
     ok(&o);
     assert!(
         text(&o.stdout).contains("already holds the merge result"),

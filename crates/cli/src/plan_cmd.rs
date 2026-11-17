@@ -9,8 +9,9 @@ use crate::{Ctx, Loaded, cli, load_resolved, paint, read_existing_binding, usage
 use dfm_engine::{Dir, Fail, Store, merge, observe};
 use dfm_model::display::visible;
 use dfm_model::plan::{
-    self, ApprovedFile, Binary, Context, LinkTo, MAX_PLAN_BYTES, Node, Observations, Operation,
-    Owned, PackageState, Plan, Saved, Scope, ServiceFacts, Stale, Status, source_identity,
+    self, Action, ApprovedFile, Binary, Context, LinkTo, MAX_PLAN_BYTES, Node, Observations,
+    Operation, Owned, PackageState, Plan, Saved, Scope, ServiceFacts, Stale, Status,
+    source_identity,
 };
 use dfm_model::{Code, Refusal};
 use std::collections::{BTreeMap, BTreeSet};
@@ -281,9 +282,10 @@ pub(crate) fn render(
     p: &Plan,
     digest: &str,
     color: bool,
+    all: bool,
     out: &mut dyn Write,
 ) -> std::io::Result<()> {
-    render_body(p, color, out)?;
+    render_body(p, color, all, out)?;
     writeln!(
         out,
         "{} {}",
@@ -293,7 +295,14 @@ pub(crate) fn render(
 }
 
 /// The plan without its digest line: `sync` prints four plans and one digest for all of them.
-pub(crate) fn render_body(p: &Plan, color: bool, out: &mut dyn Write) -> std::io::Result<()> {
+/// Without `all` (`--all`), `current` and `not_in_scope` rows are counted, not listed: they
+/// change nothing, so the digest approves nothing they would hide.
+pub(crate) fn render_body(
+    p: &Plan,
+    color: bool,
+    all: bool,
+    out: &mut dyn Write,
+) -> std::io::Result<()> {
     let label = |s: &str| paint::label(color, s);
     writeln!(
         out,
@@ -307,7 +316,15 @@ pub(crate) fn render_body(p: &Plan, color: bool, out: &mut dyn Write) -> std::io
         writeln!(out, "{} {} {}", label("source:"), visible(&s.root), s.tree)?;
     }
     writeln!(out, "{} {}", label("operations:"), p.operations.len())?;
-    for o in &p.operations {
+    // A `current` removal still prunes its ledger entry (`Plan::changes_nothing`), so it shows.
+    let quiet = |o: &&Operation| {
+        !all && match o.status {
+            Status::Current => o.action != Action::Remove,
+            Status::NotInScope => true,
+            Status::Planned | Status::Held | Status::Blocked => false,
+        }
+    };
+    for o in p.operations.iter().filter(|o| !quiet(o)) {
         head_line(o, color, out)?;
         if !o.after.is_empty() {
             writeln!(out, "    after: {}", visible(&o.after.join(", ")))?;
@@ -339,6 +356,13 @@ pub(crate) fn render_body(p: &Plan, color: bool, out: &mut dyn Write) -> std::io
             let names: Vec<&str> = o.fragments.iter().map(|f| f.name.as_str()).collect();
             writeln!(out, "    fragments: {}", visible(&names.join(", ")))?;
         }
+    }
+    let hidden = p.operations.iter().filter(quiet).count();
+    if hidden > 0 {
+        writeln!(
+            out,
+            "  {hidden} operation(s) that change nothing not shown (--all shows them)"
+        )?;
     }
     summary(p, color, out)?;
     for b in &p.blockers {
@@ -479,7 +503,7 @@ pub fn run(ctx: &Ctx, args: &Args, out: &mut dyn Write) -> Result<(), Refusal> {
         if let Some(i) = &ctx.isolated {
             writeln!(out, "isolated: true {i}").map_err(w)?;
         }
-        render(&fresh, &digest, ctx.color, out).map_err(w)?;
+        render(&fresh, &digest, ctx.color, ctx.all, out).map_err(w)?;
         print_stale(&diffs, out).map_err(w)?;
     }
     if let Some(first) = diffs.first() {

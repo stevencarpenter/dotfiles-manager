@@ -583,7 +583,7 @@ fn run_inner(
         if let Some(i) = &ctx.isolated {
             writeln!(out, "isolated: true {i}").map_err(w)?;
         }
-        render(plan, &digest, ctx.color, out).map_err(w)?;
+        render(plan, &digest, ctx.color, ctx.all, out).map_err(w)?;
         for n in &notes {
             writeln!(out, "note: {}", visible(n)).map_err(w)?;
         }

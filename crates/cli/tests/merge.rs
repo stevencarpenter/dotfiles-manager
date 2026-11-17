@@ -179,7 +179,7 @@ impl Fx {
     }
 
     fn plan(&self) -> Output {
-        self.run(&["plan", "--root", self.root_arg()])
+        self.run(&["plan", "--root", self.root_arg(), "--all"])
     }
 
     /// Applies the current plan. A take-over of an existing file is approved by id, as a person
@@ -364,6 +364,37 @@ fn reversed(v: &serde_json::Value) -> String {
         }
         other => other.to_string(),
     }
+}
+
+#[test]
+fn the_text_plan_lists_only_rows_that_change_unless_all_is_given() {
+    let fx = Fx::new();
+    fx.live(LIVE);
+    let row = |t: &str, status: &str| {
+        t.lines()
+            .any(|l| l.contains("@.claude/settings.json") && l.trim_start().starts_with(status))
+    };
+    let default = |fx: &Fx| text(&fx.run(&["plan", "--root", fx.root_arg()]).stdout);
+    // A planned row always shows.
+    let t = default(&fx);
+    assert!(row(&t, "planned "), "{t}");
+    assert_eq!(code(&fx.apply()), 0);
+    // Afterwards the row is current: counted, not listed, unless --all is given.
+    let t = default(&fx);
+    assert!(
+        !t.lines().any(|l| l.trim_start().starts_with("current ")),
+        "{t}"
+    );
+    assert!(
+        t.contains("operation(s) that change nothing not shown (--all shows them)"),
+        "{t}"
+    );
+    assert!(t.contains("summary: current="), "{t}");
+    let all = text(&fx.plan().stdout);
+    assert!(row(&all, "current "), "{all}");
+    assert!(!all.contains("not shown (--all"), "{all}");
+    // The flag changes the text only, never the plan the digest approves.
+    assert_eq!(t.lines().last(), all.lines().last());
 }
 
 #[test]

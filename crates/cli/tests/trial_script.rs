@@ -1636,7 +1636,7 @@ fn adopt_promotes_a_created_config_entry_and_writes_the_declaration() {
     assert_eq!(fx.record("trial-boat")["adopted"]["module"], "extra");
     // The adopted composition plans, and the present binary is current: nothing is fetched.
     fs::write(fx.fake.path().join("log"), "").unwrap();
-    let o = fx.packages(&["--preview"]);
+    let o = fx.packages(&["--preview", "--all"]);
     let t = text(&o.stdout);
     assert_eq!(code(&o), 0, "{}\n{t}", stderr(&o));
     assert!(t.contains("current extra.boat@package"), "{t}");
@@ -1805,7 +1805,7 @@ fn packages_install_a_missing_declared_tool_only_with_the_grant() {
     assert_eq!(fx.cache_entries(), Vec::<String>::new());
     // The next run finds the binary: current, and the script does not run again.
     fs::write(fx.fake.path().join("log"), "").unwrap();
-    let o = fx.packages(&["--preview"]);
+    let o = fx.packages(&["--preview", "--all"]);
     let t = text(&o.stdout);
     assert_eq!(code(&o), 0, "{}\n{t}", stderr(&o));
     assert!(t.contains("current extra.boat@package"), "{t}");

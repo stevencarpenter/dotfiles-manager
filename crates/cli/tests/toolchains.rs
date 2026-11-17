@@ -273,7 +273,7 @@ impl Fx {
     }
 
     fn preview(&self, update: bool) -> Output {
-        let mut args = vec!["packages", "--root", self.root_arg(), "--preview"];
+        let mut args = vec!["packages", "--root", self.root_arg(), "--preview", "--all"];
         if update {
             args.push("--update");
         }

@@ -2572,7 +2572,7 @@ fn state_recover_fixes_the_ledger_after_an_unknown_replace_link() {
         fp_of(&fx),
         dfm_model::plan::link_fingerprint(old.to_str().unwrap()).as_str()
     );
-    let o = fx.run(&["plan", "--root", fx.root_arg()]);
+    let o = fx.run(&["plan", "--root", fx.root_arg(), "--all"]);
     let plan_text = text(&o.stdout);
     assert!(
         plan_text

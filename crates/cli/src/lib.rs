@@ -45,20 +45,20 @@ usage:
   dfm state recover
   dfm state resolve <journal-id> --as done|failed
   dfm explain <resource-or-target> [--root <dir>]
-  dfm plan [--root <dir>] [--json] [--against <saved plan>]
+  dfm plan [--root <dir>] [--json] [--all] [--against <saved plan>]
   dfm doctor [--root <dir>] [--json]
   dfm status [--root <dir>] [--json]
-  dfm apply [--root <dir>] [--preview] [-y|--yes-plan <digest>] [--allow-disruptive <operation-id>]...
+  dfm apply [--root <dir>] [--preview] [--all] [-y|--yes-plan <digest>] [--allow-disruptive <operation-id>]...
                                [--allow-adopt <operation-id>]...
-  dfm secrets [--root <dir>] [--preview] [-y|--yes-plan <digest>] [--allow-adopt <operation-id>]...
-  dfm packages [--root <dir>] [--preview] [-y|--yes-plan <digest>] [--update]
-  dfm services [--root <dir>] [--preview] [-y|--yes-plan <digest>] [--allow-disruptive <operation-id>]...
+  dfm secrets [--root <dir>] [--preview] [--all] [-y|--yes-plan <digest>] [--allow-adopt <operation-id>]...
+  dfm packages [--root <dir>] [--preview] [--all] [-y|--yes-plan <digest>] [--update]
+  dfm services [--root <dir>] [--preview] [--all] [-y|--yes-plan <digest>] [--allow-disruptive <operation-id>]...
                                [--restart <resource-id>]...
   dfm trial <package> [--id <trial-id>] [--provider homebrew/v1|mise/v1] [--config <path>]...
                                [--preview] [-y|--yes-plan <digest>]
   dfm adopt <trial-id> --module <module> [--root <dir>] [--preview] [-y|--yes-plan <digest>]
   dfm purge <trial-id> [--preview] [-y|--yes-plan <digest>]
-  dfm sync [--root <dir>] [--preview] [-y|--yes-plan <digest>] [--allow-disruptive <operation-id>]...
+  dfm sync [--root <dir>] [--preview] [--all] [-y|--yes-plan <digest>] [--allow-disruptive <operation-id>]...
                                [--allow-adopt <operation-id>]... [--restart <resource-id>]...
                                [--trust-origin <origin>]... [--no-upgrade]
   dfm self-update [--source <checkout>] [--commit <sha>]
@@ -222,6 +222,8 @@ struct Ctx {
     isolated: Option<String>,
     /// Color the text output: stdout is a terminal (`paint::enabled`).
     color: bool,
+    /// `--all`: list the `current` and `not_in_scope` rows of a printed plan too.
+    all: bool,
 }
 
 impl Ctx {
@@ -327,6 +329,7 @@ fn context(home: Option<String>) -> Result<Ctx, Refusal> {
         arch,
         isolated,
         color: paint::enabled(&std::io::stdout()),
+        all: false,
     })
 }
 
@@ -341,6 +344,7 @@ fn context(_home: Option<String>) -> Result<Ctx, Refusal> {
         arch: arch.into(),
         isolated: None,
         color: paint::enabled(&std::io::stdout()),
+        all: false,
     })
 }
 
@@ -414,6 +418,9 @@ fn run_command(
 ) -> Result<(), Refusal> {
     let w =
         |e: std::io::Error| Refusal::new(Code::IoFailed, format!("output failed: {}", e.kind()));
+    // Every arm builds its context here, so `--all` reaches each command that prints a plan.
+    let all = cli::flag(sub, "all");
+    let context = |home| context(home).map(|ctx| Ctx { all, ..ctx });
     match cmd {
         "help" => write!(out, "{HELP}").map_err(w),
         "version" => write_version(out).map_err(w),

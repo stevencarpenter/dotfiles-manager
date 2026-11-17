@@ -1870,6 +1870,7 @@ mod tests {
             arch: "aarch64".into(),
             isolated: None,
             color: false,
+            all: false,
         };
         let sys = Sys {
             uid: dfm_platform_macos::current_uid().unwrap(),

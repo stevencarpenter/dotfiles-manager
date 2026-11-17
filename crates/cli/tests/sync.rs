@@ -156,7 +156,7 @@ impl Fx {
     }
 
     fn preview(&self) -> Output {
-        self.run(&["sync", "--root", self.root_arg(), "--preview"])
+        self.run(&["sync", "--root", self.root_arg(), "--preview", "--all"])
     }
 
     fn sync(&self, digest: &str) -> Output {
@@ -1686,7 +1686,7 @@ impl Life {
     }
 
     fn preview(&self, flags: &[&str]) -> Output {
-        let mut a = vec!["sync", "--root", self.fx.root_arg(), "--preview"];
+        let mut a = vec!["sync", "--root", self.fx.root_arg(), "--preview", "--all"];
         a.extend_from_slice(flags);
         self.run(&a)
     }

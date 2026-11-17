@@ -184,7 +184,7 @@ impl Fx {
     }
 
     fn preview(&self) -> Output {
-        self.run(&["secrets", "--root", self.root_arg(), "--preview"])
+        self.run(&["secrets", "--root", self.root_arg(), "--preview", "--all"])
     }
 
     fn secrets(&self, digest: &str, adopt: &[&str]) -> Output {
@@ -252,7 +252,7 @@ fn contains(hay: &[u8], needle: &str) -> bool {
 #[test]
 fn a_configuration_plan_lists_the_secret_out_of_scope_and_never_starts_op() {
     let fx = Fx::new();
-    let o = fx.run(&["plan", "--root", fx.root_arg()]);
+    let o = fx.run(&["plan", "--root", fx.root_arg(), "--all"]);
     assert_eq!(code(&o), 0, "{}", stderr(&o));
     let t = text(&o.stdout);
     assert!(t.contains("not_in_scope extra.token@scope"), "{t}");
@@ -687,7 +687,7 @@ fn a_deselected_secret_keeps_its_file_and_entry_and_apply_still_runs() {
     assert_eq!(code(&o), 0, "{}", stderr(&o));
     let before = fx.content();
     fx.set_modules("");
-    let o = fx.run(&["plan", "--root", fx.root_arg()]);
+    let o = fx.run(&["plan", "--root", fx.root_arg(), "--all"]);
     assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
     let t = text(&o.stdout);
     assert!(t.contains("current remove@extra.token@"), "{t}");
