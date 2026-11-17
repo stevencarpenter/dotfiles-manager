@@ -249,7 +249,6 @@ impl World {
                 "DFM_PROVIDER_PATH",
                 format!("{}:/usr/bin:/bin", self.bin().display()),
             )
-            .env("DFM_SERVICE_TIMEOUT_SECS", "1")
             .env("USER", "leak-check")
             .envs(env.iter().copied())
             .arg("--home")

@@ -1551,6 +1551,8 @@ printf 'launchctl %s\n' "$*" >> "$here/../log"
 db="$here/../loaded"
 case "$1" in
   print)
+    # `slow-print`: answer late, as an unloaded probe would under CPU load (DFM-87).
+    [ -e "$here/../slow-print" ] && sleep 2
     label=${2##*/}
     line=$(grep "^$label " "$db" 2>/dev/null | head -1)
     if [ -z "$line" ]; then
@@ -1670,7 +1672,8 @@ impl Life {
         c.env_clear()
             .envs(env.iter().copied())
             .env("DFM_PROVIDER_PATH", path)
-            .env("DFM_SERVICE_TIMEOUT_SECS", "1")
+            // No short DFM_SERVICE_TIMEOUT_SECS: a probe that outlives it under load blocks the
+            // agent in one plan only, and the approved digest goes stale (DFM-87).
             .arg("--home")
             .arg(self.fx.home.path())
             .args(args);
@@ -2054,6 +2057,18 @@ fn a_package_failure_leaves_the_later_scopes_not_started() {
         assert!(!l.log().contains(effect), "a later scope ran {effect}");
     }
     assert!(!l.fx.h(".config/example/personal.env").exists());
+}
+
+#[test]
+fn a_slow_service_probe_on_the_approved_run_keeps_the_digest() {
+    let l = Life::new();
+    let p = l.preview(&[]);
+    assert_eq!(code(&p), 0, "{}\n{}", stdout(&p), stderr(&p));
+    // The approved run probes the agent late, within the bound: the plan and digest hold.
+    l.mark("slow-print");
+    let o = l.sync(&digest_of(&p), &[]);
+    assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
+    assert!(stdout(&o).contains("  services: ok"), "{}", stdout(&o));
 }
 
 #[test]
