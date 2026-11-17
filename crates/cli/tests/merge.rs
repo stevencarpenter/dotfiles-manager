@@ -616,6 +616,18 @@ fn an_edit_to_a_managed_field_is_a_conflict_at_plan_and_the_fix_is_to_adopt_it()
         !all.contains("hand-edited-secret-style"),
         "no value is shown: {all}"
     );
+    // The default view, without --all, still lists the blocked row and the refusal (DFM-88).
+    let d = fx.run(&["plan", "--root", fx.root_arg()]);
+    let t = text(&d.stdout);
+    assert!(
+        t.lines()
+            .any(|l| l.starts_with("  blocked ") && l.contains("@.claude/settings.json")),
+        "{t}"
+    );
+    assert!(
+        t.lines().any(|l| l.starts_with("blocked: E_CONFLICT")),
+        "{t}"
+    );
     let a = fx.apply_with(&digest_of(&o));
     assert_eq!(code(&a), 3, "{}", stderr(&a));
     assert!(stderr(&a).contains("E_CONFLICT"), "{}", stderr(&a));

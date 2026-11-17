@@ -438,6 +438,12 @@ fn a_sync_that_changes_nothing_needs_no_approval() {
     assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
     let s = stdout(&o);
     assert!(s.contains("summary: current=4; nothing to change"), "{s}");
+    // The default view counts the current rows instead of listing them (DFM-88).
+    assert!(!s.lines().any(|l| l.starts_with("  current ")), "{s}");
+    assert!(
+        s.contains("4 operation(s) that change nothing not shown (--all shows them)"),
+        "{s}"
+    );
     assert!(s.contains("nothing to change: no approval needed"), "{s}");
     assert!(s.ends_with("result: ok\n"), "{s}");
     assert_eq!(fx.receipts(), 1, "a no-op sync wrote a receipt");

@@ -358,6 +358,11 @@ fn a_rolling_update_upgrades_mise_and_uv_tools_keeps_every_installed_version_and
         "{t}"
     );
     assert!(t.contains("not_in_scope core.git@scope"), "{t}");
+    // The default view, without --all, still lists the held row (DFM-88).
+    let d = fx.run(&["packages", "--root", fx.root_arg(), "--preview", "--update"]);
+    let dt = text(&d.stdout);
+    assert!(dt.contains(&format!("held {JAVA}")), "{dt}");
+    assert!(!dt.contains("not_in_scope core.git@scope"), "{dt}");
     // The preview ran read-only listings only, with the provider variables that keep them so.
     let log = fx.log();
     assert!(
