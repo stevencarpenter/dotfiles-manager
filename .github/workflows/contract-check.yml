@@ -39,7 +39,8 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-          # The pull request checkout is the merge commit; depth 2 brings both parents.
+          # The pull request checkout is the merge commit, and a push to main is a squash merge
+          # with one parent; depth 2 brings the parent the diff below compares with.
           fetch-depth: 2
 
       - name: Classify the changed paths
@@ -49,8 +50,11 @@ jobs:
         run: |
           rust=true
           bootstrap=true
-          if [ "$EVENT" = pull_request ]; then
-            # First parent of the merge commit is the base branch tip.
+          # A manual run (workflow_dispatch) runs every job. A pull request and a push to main run
+          # only the jobs whose inputs changed: the first parent is the base branch tip, or the
+          # main tip before the squash merge. Without this, every merge ran the five network
+          # install jobs and held the five hosted macOS slots that the next pull request needs.
+          if [ "$EVENT" = pull_request ] || [ "$EVENT" = push ]; then
             changed=$(git diff --name-only HEAD^1 HEAD)
             printf 'changed:\n%s\n' "$changed"
             rust=false
