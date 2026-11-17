@@ -2528,6 +2528,9 @@ fn an_owned_output_that_nothing_selects_any_more_is_planned_for_removal() {
     let r = op(&s, "remove@gone.res@gone.txt");
     // The action is Remove so apply can drop the stale ledger entry (docs/apply.md).
     assert_eq!((r.action, r.status), (Action::Remove, Status::Current));
+    // It still writes the ledger, so the text plan lists it without --all (DFM-88).
+    let t = text(&e.plan(&[]).stdout);
+    assert!(t.contains("current remove@gone.res@gone.txt"), "{t}");
 
     // A directory is never removed.
     fs::create_dir(&gone).unwrap();

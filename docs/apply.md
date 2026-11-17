@@ -19,7 +19,7 @@ This page describes `apply` at HEAD. The plan it executes is in [docs/planner.md
 ## The command
 
 ```
-dfm apply [--root <dir>] [--preview] [-y|--yes-plan <digest>] [--allow-disruptive <operation-id>]... [--allow-adopt <operation-id>]...
+dfm apply [--root <dir>] [--preview] [--all] [-y|--yes-plan <digest>] [--allow-disruptive <operation-id>]... [--allow-adopt <operation-id>]...
 ```
 
 There is no `--plan <file>` flag. The manager stores no plan, so apply plans again from the current machine and compares the digest the reviewer approved. `--root` defaults to the root the binding records.

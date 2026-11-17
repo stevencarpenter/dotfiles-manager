@@ -302,7 +302,7 @@ impl Fx {
     }
 
     fn preview(&self) -> Output {
-        self.run(&["packages", "--root", self.root_arg(), "--preview"])
+        self.run(&["packages", "--root", self.root_arg(), "--preview", "--all"])
     }
 
     fn packages(&self, digest: &str) -> Output {
@@ -325,7 +325,7 @@ impl Fx {
 #[test]
 fn a_configuration_plan_lists_packages_out_of_scope_and_starts_no_provider() {
     let fx = Fx::new();
-    let o = fx.run(&["plan", "--root", fx.root_arg()]);
+    let o = fx.run(&["plan", "--root", fx.root_arg(), "--all"]);
     assert_eq!(code(&o), 0, "{}", stderr(&o));
     let t = text(&o.stdout);
     assert!(t.contains("not_in_scope extra.atuin@scope"), "{t}");

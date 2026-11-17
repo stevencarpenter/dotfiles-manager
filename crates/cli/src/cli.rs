@@ -58,6 +58,7 @@ fn scope<const N: usize>(
         .about(about)
         .arg(root())
         .arg(preview())
+        .arg(switch("all"))
         .arg(yes_plan())
         .args(extra.into_iter().filter(|a| parse || !a.is_hide_set()))
 }
@@ -122,6 +123,7 @@ fn tree(parse: bool) -> Command {
                 .about("Print the plan and its digest")
                 .arg(root())
                 .arg(switch("json"))
+                .arg(switch("all"))
                 .arg(value("against", "saved plan")),
         )
         .subcommand(report(

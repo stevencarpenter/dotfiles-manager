@@ -578,14 +578,7 @@ pub fn check_journal_capacity(
     settling: usize,
     plan: &Plan,
 ) -> Result<(), Refusal> {
-    let journaled = plan
-        .operations
-        .iter()
-        .filter(|o| {
-            o.status == PlanStatus::Planned
-                || (o.status == PlanStatus::Current && o.action == Action::Remove)
-        })
-        .count();
+    let journaled = plan.operations.iter().filter(|o| o.journaled()).count();
     let need = u64::try_from(journaled.saturating_add(settling))
         .unwrap_or(u64::MAX)
         .saturating_mul(JOURNAL_BYTES_PER_OPERATION);

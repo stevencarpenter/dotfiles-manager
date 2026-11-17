@@ -21,6 +21,8 @@ pub struct Args {
     /// `--root`; `None` takes the root the binding records.
     pub root: Option<String>,
     pub json: bool,
+    /// `--all`: list every row of the text plan (docs/planner.md, "Rows").
+    pub all: bool,
     pub against: Option<String>,
 }
 
@@ -29,6 +31,7 @@ pub fn parse_args(m: &clap::ArgMatches) -> Args {
     Args {
         root: cli::one(m, "root"),
         json: cli::flag(m, "json"),
+        all: cli::flag(m, "all"),
         against: cli::one(m, "against"),
     }
 }
@@ -281,9 +284,10 @@ pub(crate) fn render(
     p: &Plan,
     digest: &str,
     color: bool,
+    all: bool,
     out: &mut dyn Write,
 ) -> std::io::Result<()> {
-    render_body(p, color, out)?;
+    render_body(p, color, all, out)?;
     writeln!(
         out,
         "{} {}",
@@ -293,7 +297,15 @@ pub(crate) fn render(
 }
 
 /// The plan without its digest line: `sync` prints four plans and one digest for all of them.
-pub(crate) fn render_body(p: &Plan, color: bool, out: &mut dyn Write) -> std::io::Result<()> {
+/// Without `all` (`--all`), `current` and `not_in_scope` rows that apply does not journal
+/// (`Operation::journaled`) are counted, not listed: they write nothing, so the digest approves
+/// nothing they would hide.
+pub(crate) fn render_body(
+    p: &Plan,
+    color: bool,
+    all: bool,
+    out: &mut dyn Write,
+) -> std::io::Result<()> {
     let label = |s: &str| paint::label(color, s);
     writeln!(
         out,
@@ -307,7 +319,11 @@ pub(crate) fn render_body(p: &Plan, color: bool, out: &mut dyn Write) -> std::io
         writeln!(out, "{} {} {}", label("source:"), visible(&s.root), s.tree)?;
     }
     writeln!(out, "{} {}", label("operations:"), p.operations.len())?;
-    for o in &p.operations {
+    // `held` writes nothing either, but it shows: the user chose to hold it.
+    let quiet = |o: &&Operation| {
+        !all && !o.journaled() && matches!(o.status, Status::Current | Status::NotInScope)
+    };
+    for o in p.operations.iter().filter(|o| !quiet(o)) {
         head_line(o, color, out)?;
         if !o.after.is_empty() {
             writeln!(out, "    after: {}", visible(&o.after.join(", ")))?;
@@ -339,6 +355,14 @@ pub(crate) fn render_body(p: &Plan, color: bool, out: &mut dyn Write) -> std::io
             let names: Vec<&str> = o.fragments.iter().map(|f| f.name.as_str()).collect();
             writeln!(out, "    fragments: {}", visible(&names.join(", ")))?;
         }
+    }
+    let hidden = p.operations.iter().filter(quiet).count();
+    if hidden > 0 {
+        writeln!(
+            out,
+            "{} {hidden} current or out-of-scope operation(s); --all lists them",
+            label("hidden:")
+        )?;
     }
     summary(p, color, out)?;
     for b in &p.blockers {
@@ -479,7 +503,7 @@ pub fn run(ctx: &Ctx, args: &Args, out: &mut dyn Write) -> Result<(), Refusal> {
         if let Some(i) = &ctx.isolated {
             writeln!(out, "isolated: true {i}").map_err(w)?;
         }
-        render(&fresh, &digest, ctx.color, out).map_err(w)?;
+        render(&fresh, &digest, ctx.color, args.all, out).map_err(w)?;
         print_stale(&diffs, out).map_err(w)?;
     }
     if let Some(first) = diffs.first() {

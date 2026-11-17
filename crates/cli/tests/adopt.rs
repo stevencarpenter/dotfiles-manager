@@ -359,7 +359,7 @@ fn apply_after_adopt_plans_the_links_as_current() {
     fx.live(LIVE, TUICR);
     let o = fx.adopt_approved("core");
     assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), out(&o));
-    let o = fx.run(&["apply", "--preview"]);
+    let o = fx.run(&["apply", "--preview", "--all"]);
     assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), out(&o));
     let t = out(&o);
     assert!(

@@ -16,7 +16,7 @@ Two provider paths are built: mise (runtimes and tools from mise's registry and 
 ## The command
 
 ```
-dfm packages [--root <dir>] --update [--preview] [-y|--yes-plan <digest>]
+dfm packages [--root <dir>] --update [--preview] [--all] [-y|--yes-plan <digest>]
 ```
 
 `packages --update` is `packages` with a rolling update as the decision for each installed tool. Everything else is as in docs/packages.md: read-only probes before the plan, signal handlers before the first probe, the digest, the probes again under the lock, and one journaled operation per tool. A plain `packages` digest does not approve an update: the plan rows and preconditions differ, so the digest differs (`E_PLAN_STALE`). A rolling tool is always `planned`, so an update run with one needs `--yes-plan`. `--update` on any other command is a usage error.

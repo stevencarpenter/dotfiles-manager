@@ -156,7 +156,7 @@ impl Fx {
     }
 
     fn preview(&self) -> Output {
-        self.run(&["sync", "--root", self.root_arg(), "--preview"])
+        self.run(&["sync", "--root", self.root_arg(), "--preview", "--all"])
     }
 
     fn sync(&self, digest: &str) -> Output {
@@ -438,6 +438,12 @@ fn a_sync_that_changes_nothing_needs_no_approval() {
     assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
     let s = stdout(&o);
     assert!(s.contains("summary: current=4; nothing to change"), "{s}");
+    // The default view counts the current rows instead of listing them (DFM-88).
+    assert!(!s.lines().any(|l| l.starts_with("  current ")), "{s}");
+    assert!(
+        s.contains("hidden: 4 current or out-of-scope operation(s); --all lists them"),
+        "{s}"
+    );
     assert!(s.contains("nothing to change: no approval needed"), "{s}");
     assert!(s.ends_with("result: ok\n"), "{s}");
     assert_eq!(fx.receipts(), 1, "a no-op sync wrote a receipt");
@@ -1686,7 +1692,7 @@ impl Life {
     }
 
     fn preview(&self, flags: &[&str]) -> Output {
-        let mut a = vec!["sync", "--root", self.fx.root_arg(), "--preview"];
+        let mut a = vec!["sync", "--root", self.fx.root_arg(), "--preview", "--all"];
         a.extend_from_slice(flags);
         self.run(&a)
     }

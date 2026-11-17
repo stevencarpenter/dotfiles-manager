@@ -18,7 +18,7 @@ Providers run through the bounded runner (docs/secrets.md, "How `op` is run").
 ## The command
 
 ```
-dfm packages [--root <dir>] [--preview] [-y|--yes-plan <digest>] [--update]
+dfm packages [--root <dir>] [--preview] [--all] [-y|--yes-plan <digest>] [--update]
 ```
 
 `packages` is `apply` over the packages scope. Every `package` resource is planned. Every other resource is `not_in_scope` ("link is configuration, outside a packages plan"). Nothing is removed, upgraded or downgraded. `--root` defaults to the root the binding records. `--allow-disruptive` and `--allow-adopt` are usage errors (exit 2), because a packages plan removes and adopts nothing.

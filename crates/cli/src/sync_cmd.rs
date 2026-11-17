@@ -1578,6 +1578,7 @@ fn show(
     parts: &[ScopePlan],
     digest: &str,
     color: bool,
+    all: bool,
     out: &mut dyn Write,
 ) -> std::io::Result<()> {
     for p in parts {
@@ -1587,7 +1588,7 @@ fn show(
             paint::label(color, "scope:"),
             p.scope.as_str()
         )?;
-        render_body(&p.reviewed(), color, out)?;
+        render_body(&p.reviewed(), color, all, out)?;
         for r in &p.skipped {
             writeln!(
                 out,
@@ -1904,7 +1905,7 @@ fn run_inner(
     let digest = sync_digest(&review, &previewed);
     let parts = review.split();
     printed.warnings = parts.iter().flat_map(ScopePlan::warnings).collect();
-    show(&review, &parts, &digest, ctx.color, out).map_err(w)?;
+    show(&review, &parts, &digest, ctx.color, args.apply.all, out).map_err(w)?;
     printed.plan = true;
     // A digest that no longer matches is the first thing to report: the reviewer approved a
     // different run.
