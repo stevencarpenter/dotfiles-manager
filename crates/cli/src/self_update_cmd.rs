@@ -54,6 +54,15 @@ pub(crate) fn run(ctx: &Ctx, args: &Args, out: &mut dyn Write) -> Result<(), Ref
     header(out, ctx).map_err(w)?;
     let (home, data) = (ctx.platform.home(), ctx.platform.data_dir());
     let sys = ctx.sys()?;
+    // The bootstrap script locks the same existing directory, including on a fresh machine.
+    let home_lock = fs::File::open(home).map_err(|e| dfm_engine::fsys::io("open HOME", &e))?;
+    home_lock.try_lock().map_err(|e| match e {
+        fs::TryLockError::WouldBlock => Refusal::new(
+            Code::Locked,
+            "another install, uninstall or self-update holds the bootstrap lock",
+        ),
+        fs::TryLockError::Error(e) => dfm_engine::fsys::io("lock HOME", &e),
+    })?;
     let source = match &args.source {
         Some(s) => fs::canonicalize(s)
             .map_err(|e| usage(format!("--source {}: {}", visible(s), e.kind())))?,
@@ -137,7 +146,7 @@ pub(crate) fn run(ctx: &Ctx, args: &Args, out: &mut dyn Write) -> Result<(), Ref
     };
     writeln!(out, "self-update: installing {shown}").map_err(w)?;
     out.flush().map_err(w)?;
-    let status = bootstrap(ctx, &file, src, &commit);
+    let status = bootstrap(ctx, &file, src, &commit, &home_lock);
     let _ = fs::remove_dir_all(&dir);
     let status = status.map_err(|e| {
         Refusal::new(
@@ -295,6 +304,7 @@ fn bootstrap(
     file: &Path,
     src: &str,
     commit: &str,
+    home_lock: &fs::File,
 ) -> std::io::Result<std::process::ExitStatus> {
     let home = ctx.platform.home();
     let mut cmd = Command::new("/bin/sh");
@@ -304,7 +314,7 @@ fn bootstrap(
         .env("HOME", home)
         .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
         .current_dir(home)
-        .stdin(Stdio::null());
+        .stdin(Stdio::from(home_lock.try_clone()?));
     // The isolated build's home is not the password database's: the script's test mode, with
     // the test hooks the caller set (the script accepts only its own DFM_TEST_* names).
     #[cfg(feature = "test-isolation")]

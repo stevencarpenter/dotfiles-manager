@@ -2663,9 +2663,21 @@ fn build_dirs_gone(p: &Prepared) -> bool {
 }
 
 #[test]
-fn a_successful_install_with_a_stand_in_cargo_leaves_no_build_directories() {
+fn an_install_holds_the_lock_until_publication_and_cleans_its_build_directories() {
     let p = prepare_with("fake-ok", fake_toolchain("exit 0".into()));
-    let o = install(&p, &p.sha, &[]);
+    let hook = p.tmp.path().join("concurrent-uninstall.sh");
+    fs::write(
+        &hook,
+        r#"message=$(/bin/sh stage/scripts/bootstrap.sh uninstall 2>&1)
+case "$?:$message" in 3:*E_LOCKED*) exit 0 ;; *) echo "$message" >&2; exit 1 ;; esac
+"#,
+    )
+    .unwrap();
+    let o = install(
+        &p,
+        &p.sha,
+        &[("DFM_TEST_BEFORE_SWAP", hook.to_str().unwrap())],
+    );
     assert_eq!(o.status.code(), Some(0), "{}", err(&o));
     assert!(build_dirs_gone(&p));
     assert!(p.data.join("current").is_symlink());
@@ -2692,6 +2704,27 @@ mod self_update {
             .args(args)
             .output()
             .unwrap()
+    }
+
+    #[test]
+    fn install_uninstall_and_self_update_share_the_bootstrap_lock() {
+        let (_tmp, home, src, sha) = refusal_setup("bootstrap-lock");
+        let src = src.to_str().unwrap();
+        let before = entries_below(&home);
+        let lock = fs::File::open(&home).unwrap();
+        lock.try_lock().unwrap();
+        for result in [
+            script_test_mode(&home, &["install", "--source", src, "--commit", &sha], &[]),
+            script_test_mode(&home, &["uninstall"], &[]),
+            dfm(&home, &["self-update", "--source", src]),
+        ] {
+            assert_eq!(result.status.code(), Some(3), "{}", err(&result));
+            assert!(err(&result).contains("E_LOCKED"), "{}", err(&result));
+        }
+        assert_eq!(entries_below(&home), before);
+        drop(lock);
+        let result = script_test_mode(&home, &["uninstall"], &[]);
+        assert!(result.status.success(), "{}", err(&result));
     }
 
     fn installed(p: &Prepared) -> String {
