@@ -337,16 +337,12 @@ fn a_configuration_plan_lists_services_out_of_scope_and_starts_no_launcher() {
         t.contains("service is lifecycle, outside a config plan"),
         "{t}"
     );
-    // No provider has run, so the runner's working directory does not exist. Doctor creates
-    // nothing: it asks no launcher and reports each service unknown.
+    assert!(!fx.launcher_ran(), "{}", fx.log());
     let o = fx.run(&["doctor", "--root", fx.root_arg()]);
     assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
-    assert!(
-        text(&o.stdout).contains("does not exist yet"),
-        "{}",
-        text(&o.stdout)
-    );
-    assert!(!fx.launcher_ran(), "{}", fx.log());
+    assert!(fx.log().contains("brew services info"), "{}", fx.log());
+    assert!(!fx.home.path().join(".cache/dotfiles-manager/run").exists());
+    fx.unmark("log");
     // The other scopes do not act on a service either, and none of them asks a launcher.
     fx.mark("brew-sketchybar", "none\n");
     let o = fx.run(&["packages", "--root", fx.root_arg(), "--preview", "--all"]);
@@ -368,7 +364,7 @@ fn a_configuration_plan_lists_services_out_of_scope_and_starts_no_launcher() {
     );
     assert_eq!(code(&fx.preview(&["--restart"])), 2);
     assert!(!fx.launcher_ran() || !fx.log().contains("launchctl"));
-    // Once the directory exists, doctor asks the launchers with their read-only reports and
+    // Doctor asks the launchers with their read-only reports and
     // starts nothing: an installed formula that is not loaded is a pending start.
     fx.mark("brew-sketchybar", "none\n");
     fx.unmark("log");

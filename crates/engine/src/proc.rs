@@ -235,6 +235,11 @@ impl Runner {
         self.start(req, program, &self.cwd)
     }
 
+    /// Runs a provider observation outside any checkout, without creating or changing the private working directory.
+    pub fn probe(&self, req: &Request<'_>) -> Result<Output, Refusal> {
+        self.run_in(req, Path::new("/"))
+    }
+
     /// [`Runner::run`] with `dir` as the child's working directory instead of [`Runner::cwd`],
     /// for a tool that acts on the repository it runs in (`lefthook install` in the bound
     /// checkout). `dir` must be an existing directory; it is neither created nor changed.

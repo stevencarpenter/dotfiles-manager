@@ -15,7 +15,7 @@ use dfm_model::binding::Binding;
 use dfm_model::doctor::{DoctorCode as D, Level, Report, Row, RowCode};
 use dfm_model::fold;
 use dfm_model::plan::{
-    Action, Node, Observations, Operation, Owned, Ownership, PackageState, Plan, Request, Scope,
+    Action, Node, Observations, Operation, Owned, Ownership, PackageState, Plan, Request,
     ServiceFacts, ServiceState, Status, in_scope, link_fingerprint, sensitive_paths,
 };
 use dfm_model::resolve::ResolvedResource;
@@ -1279,14 +1279,7 @@ fn profile_rows(
     for m in &res.modules {
         rows.push(ok_row("module", m, "selected"));
     }
-    // The read-only probes of `packages` and `services`; neither installs, loads or starts.
-    // Only a stop request fails one, and then its resources keep the fallback row. The runner
-    // creates its working directory on first use and resets its mode, and doctor writes nothing,
-    // so unless that directory already exists with mode 0700 no provider starts and each package
-    // and service is unknown.
     let runner = ctx.runner(sys);
-    let private = std::fs::symlink_metadata(&runner.cwd)
-        .is_ok_and(|m| m.is_dir() && m.permissions().mode() & 0o7777 == 0o700);
     let sensitive = sensitive_paths(Some(res), ledger.unwrap_or_default());
     let (dirs, targets) = protected_metadata(&runner.home, Some(&loaded), ledger, &sensitive);
     let protected = Protected {
@@ -1305,56 +1298,30 @@ fn profile_rows(
         let real = std::fs::canonicalize(&at).unwrap_or_else(|_| at.clone());
         ledger.is_none() || targets.is_err() || is_sensitive(&runner.home, &at, &real, &protected)
     };
-    let (packages, services) = if private {
-        let packages = crate::adapters::package::package_facts(
-            res,
-            &runner,
-            // Reads the grants only: doctor fetches no script.
-            Some(&crate::adapters::script::ScriptCx::new(
-                ctx,
-                sys,
-                &loaded.root,
-            )),
-        )
-        .unwrap_or_else(|r| {
-            rows.push(refusal_row("resource", "package probes", &r));
-            BTreeMap::new()
-        });
-        let services = crate::adapters::service::service_facts(
-            res.resources.values().filter(|r| !hidden_definition(r)),
-            &runner,
-            None,
+    let packages = crate::adapters::package::package_facts(
+        res,
+        &runner,
+        // Reads the grants only: doctor fetches no script.
+        Some(&crate::adapters::script::ScriptCx::new(
+            ctx,
+            sys,
             &loaded.root,
-        )
-        .unwrap_or_else(|r| {
-            rows.push(refusal_row("resource", "service probes", &r));
-            BTreeMap::new()
-        });
-        (packages, services)
-    } else {
-        let why = format!(
-            "the provider working directory {} does not exist yet or is not mode 0700, and doctor changes nothing",
-            runner.cwd.display()
-        );
-        let of = |s: Scope| res.resources.values().filter(move |r| s.covers(r));
-        (
-            of(Scope::Packages)
-                .map(|r| (r.id.clone(), PackageState::Unknown(why.clone())))
-                .collect(),
-            of(Scope::Services)
-                .map(|r| {
-                    let state = ServiceState::Unknown(why.clone());
-                    (
-                        r.id.clone(),
-                        ServiceFacts {
-                            state,
-                            definition: None,
-                        },
-                    )
-                })
-                .collect(),
-        )
-    };
+        )),
+    )
+    .unwrap_or_else(|r| {
+        rows.push(refusal_row("resource", "package probes", &r));
+        BTreeMap::new()
+    });
+    let services = crate::adapters::service::service_facts(
+        res.resources.values().filter(|r| !hidden_definition(r)),
+        &runner,
+        None,
+        &loaded.root,
+    )
+    .unwrap_or_else(|r| {
+        rows.push(refusal_row("resource", "service probes", &r));
+        BTreeMap::new()
+    });
     for r in res.resources.values().filter(|r| !in_scope(r)) {
         if let (false, Some(s)) = (r.sensitive, packages.get(&r.id)) {
             rows.push(package_row(r, s, path));

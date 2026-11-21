@@ -128,7 +128,7 @@ fn query(runner: &Runner, dir: &Path, rest: &[&str]) -> Result<Option<String>, R
             )
         })
         .collect();
-    let out = runner.run(&request("git", &args, &env, PROBE_TIMEOUT))?;
+    let out = runner.probe(&request("git", &args, &env, PROBE_TIMEOUT))?;
     if let Some(why) = ended(&what, &out) {
         return Err(Refusal::new(Code::ProbeFailed, why));
     }

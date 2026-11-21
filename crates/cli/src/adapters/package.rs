@@ -159,7 +159,7 @@ fn brew_roots(runner: &Runner) -> Result<(PathBuf, PathBuf), String> {
     for flag in ["--cellar", "--caskroom"] {
         let args = [flag.to_string()];
         let out = runner
-            .run(&request("brew", &args, &env, PROBE_TIMEOUT))
+            .probe(&request("brew", &args, &env, PROBE_TIMEOUT))
             .map_err(|e| e.detail)?;
         if let Some(why) = ended(&format!("brew {flag}"), &out) {
             return Err(why);
@@ -365,7 +365,7 @@ fn brew_official(runner: &Runner, pkg: &str) -> Result<Option<Official>, String>
     for &list in lists {
         let args = [list.to_string()];
         let out = runner
-            .run(&request("brew", &args, &env, PROBE_TIMEOUT))
+            .probe(&request("brew", &args, &env, PROBE_TIMEOUT))
             .map_err(|e| e.detail)?;
         if let Some(why) = ended(&format!("brew {list}"), &out) {
             return Err(why);
@@ -399,7 +399,7 @@ fn brew_dependencies(runner: &Runner, off: &Official) -> PackageState {
     let env = brew_env();
     let run = |what: &str, args: Vec<String>, ok: &[i32]| -> Result<String, String> {
         let out = runner
-            .run(&request("brew", &args, &env, PROBE_TIMEOUT))
+            .probe(&request("brew", &args, &env, PROBE_TIMEOUT))
             .map_err(|e| e.detail)?;
         if let Some(why) = ended(what, &out) {
             return Err(why);
@@ -553,7 +553,7 @@ fn mise_listing(runner: &Runner, pkg: &str) -> Result<Vec<String>, PackageState>
         tool.into(),
     ];
     let out = runner
-        .run(&request("mise", &args, &mise_env(), PROBE_TIMEOUT))
+        .probe(&request("mise", &args, &mise_env(), PROBE_TIMEOUT))
         .map_err(|e| PackageState::Unknown(e.detail))?;
     if let Some(why) = ended("mise ls", &out) {
         return Err(PackageState::Unknown(why));
@@ -597,7 +597,7 @@ fn uv_probe(runner: &Runner, pkg: &str) -> PackageState {
         ));
     }
     let args = ["tool".to_string(), "list".into()];
-    let out = match runner.run(&request("uv", &args, &uv_env(true), PROBE_TIMEOUT)) {
+    let out = match runner.probe(&request("uv", &args, &uv_env(true), PROBE_TIMEOUT)) {
         Ok(o) => o,
         Err(e) => return PackageState::Unknown(e.detail),
     };
@@ -1230,7 +1230,7 @@ pub(crate) fn maintain_sourced(
 /// package is `Unsupported`.
 fn apt_probe(runner: &Runner, pkg: &str) -> PackageState {
     let args = ["-W".to_string(), "-f=${Status}".into(), pkg.into()];
-    let out = match runner.run(&request("dpkg-query", &args, &[], PROBE_TIMEOUT)) {
+    let out = match runner.probe(&request("dpkg-query", &args, &[], PROBE_TIMEOUT)) {
         Ok(o) => o,
         Err(e) => return PackageState::Unknown(e.detail),
     };

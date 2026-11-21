@@ -869,17 +869,14 @@ fn an_interrupted_upgrade_keeps_the_installed_versions_and_blocks_until_resolved
 }
 
 #[test]
-fn a_read_only_plan_and_doctor_start_no_provider() {
+fn a_read_only_plan_starts_no_provider_and_doctor_only_queries_providers() {
     let fx = Fx::new();
-    for cmd in ["plan", "doctor"] {
-        let o = fx.run(&[cmd, "--root", fx.root_arg()]);
-        assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
-    }
-    assert!(
-        !fx.fake.path().join("log").exists(),
-        "a provider was started: {}",
-        fx.log()
-    );
+    assert_eq!(code(&fx.run(&["plan", "--root", fx.root_arg()])), 0);
+    assert!(!fx.fake.path().join("log").exists());
+    assert_eq!(code(&fx.run(&["doctor", "--root", fx.root_arg()])), 0);
+    assert!(fx.log().contains("uv tool list"), "{}", fx.log());
+    assert!(fx.changes().is_empty());
+    assert!(!fx.home.path().join(".cache/dotfiles-manager/run").exists());
 }
 
 const SRC: &str = "extra.src@package";

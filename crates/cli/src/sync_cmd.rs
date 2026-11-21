@@ -188,14 +188,18 @@ impl Git {
         } else {
             (&self.remote, FETCH_TIMEOUT)
         };
-        self.runner.run(&ProcRequest {
-            program: "git",
-            args: &argv,
-            env,
-            stdin: None,
-            timeout,
-            max_stdout: MAX_STDOUT,
-        })
+        // Git gets its checkout through -C or an explicit path. A local query needs no scratch directory.
+        self.runner.run_in(
+            &ProcRequest {
+                program: "git",
+                args: &argv,
+                env,
+                stdin: None,
+                timeout,
+                max_stdout: MAX_STDOUT,
+            },
+            Path::new("/"),
+        )
     }
 
     /// Runs git and returns its trimmed standard output, or a refusal with `code` that names

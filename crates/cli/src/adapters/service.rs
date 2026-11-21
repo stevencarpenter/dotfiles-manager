@@ -462,7 +462,7 @@ fn launchd_report(runner: &Runner, label: &str) -> Result<Option<Loaded>, String
     let b = bounds();
     let args = ["print".to_string(), format!("{}/{label}", domain(runner))];
     let out = runner
-        .run(&request("launchctl", &args, &[], b.probe))
+        .probe(&request("launchctl", &args, &[], b.probe))
         .map_err(|e| e.detail)?;
     let not_found = || {
         String::from_utf8_lossy(&out.stderr).contains("Could not find service")
@@ -654,7 +654,7 @@ fn brew_report(runner: &Runner, name: &str) -> Result<Option<BrewInfo>, String> 
         "--json".into(),
     ];
     let out = runner
-        .run(&request("brew", &args, &brew_env(), b.probe))
+        .probe(&request("brew", &args, &brew_env(), b.probe))
         .map_err(|e| e.detail)?;
     let err = String::from_utf8_lossy(&out.stderr);
     match ended("brew services info", &out, b.probe)? {
@@ -793,7 +793,7 @@ fn omlx_term_server(runner: &Runner) -> Result<u32, Refusal> {
         "-p".into(),
         p.clone(),
     ];
-    let out = runner.run(&request("ps", &args, &[], b.probe))?;
+    let out = runner.probe(&request("ps", &args, &[], b.probe))?;
     match ended("ps", &out, b.probe).map_err(refuse)? {
         0 => {}
         _ => {

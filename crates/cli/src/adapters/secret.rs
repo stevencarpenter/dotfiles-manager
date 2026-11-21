@@ -80,7 +80,7 @@ pub fn credential(runner: &Runner, account: &str) -> Result<(), Refusal> {
 fn whoami(runner: &Runner, account: &str) -> Result<Option<String>, Refusal> {
     let args = ["whoami".to_string(), "--account".into(), account.into()];
     let env = dfm_engine::proc::passthrough(&OP_ENV_PREFIXES);
-    let out = runner.run(&request(&args, &env, None, WHOAMI_TIMEOUT))?;
+    let out = runner.probe(&request(&args, &env, None, WHOAMI_TIMEOUT))?;
     if out.success() {
         return Ok(None);
     }

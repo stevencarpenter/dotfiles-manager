@@ -319,7 +319,7 @@ pub(super) fn hints(body: &[u8]) -> Vec<&'static str> {
 /// Runs a short read-only probe through the runner and returns its trimmed output.
 fn probe(runner: &Runner, program: &str, args: &[&str]) -> Result<String, Refusal> {
     let args: Vec<String> = args.iter().map(|a| (*a).to_string()).collect();
-    let o = system_tools(runner).run(&Request {
+    let o = system_tools(runner).probe(&Request {
         program,
         args: &args,
         env: &[],
