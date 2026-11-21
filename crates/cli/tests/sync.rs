@@ -660,6 +660,25 @@ fn a_local_edit_the_update_would_overwrite_is_refused_and_kept() {
 }
 
 #[test]
+fn sync_preserves_an_ignored_file_the_fetched_commit_tracks() {
+    let fx = Fx::new();
+    let old = fx.head();
+    put(&fx.root, ".git/info/exclude", "local.conf\n");
+    put(&fx.root, "local.conf", "local\n");
+    put(&fx.upstream.seed, "local.conf", "upstream\n");
+    fx.upstream.push("add configuration");
+
+    let o = fx.plain(&[]);
+    assert_eq!(code(&o), 3, "{}\n{}", stdout(&o), stderr(&o));
+    assert!(stderr(&o).contains("E_CONFLICT"), "{}", stderr(&o));
+    assert_eq!(fx.head(), old);
+    assert_eq!(
+        fs::read_to_string(fx.root.join("local.conf")).unwrap(),
+        "local\n"
+    );
+}
+
+#[test]
 fn a_plain_sync_publishes_and_applies_without_a_digest() {
     let fx = Fx::new();
     put(
@@ -4445,6 +4464,29 @@ fn cloned_checkout_at(u: &Up, tool: &Remote, url: &str) -> (PathBuf, String) {
     put(&tool.seed, "README", "v2\n");
     tool.push("v2");
     (copy, before)
+}
+
+#[test]
+fn the_checkout_updater_preserves_an_ignored_file_the_remote_starts_tracking() {
+    let u = Up::new(r#"["checkouts"]"#);
+    let tool = Remote::new(u.fake.path(), "tool");
+    let (copy, before) = cloned_checkout(&u, &tool);
+    put(&copy, ".git/info/exclude", "local.conf\n");
+    put(&copy, "local.conf", "local\n");
+    put(&tool.seed, "local.conf", "upstream\n");
+    tool.push("add configuration");
+    let o = u.sync(&[]);
+    assert!(
+        stdout(&o).contains("failed checkouts"),
+        "{}\n{}",
+        stdout(&o),
+        stderr(&o)
+    );
+    assert_eq!(git(&copy, &["rev-parse", "--short", "HEAD"]), before);
+    assert_eq!(
+        fs::read_to_string(copy.join("local.conf")).unwrap(),
+        "local\n"
+    );
 }
 
 /// A command-running key in a declared checkout's own configuration blocks its pull before any

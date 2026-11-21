@@ -41,7 +41,7 @@ pub struct Env<'a> {
     /// The declared `git-checkout/v1` checkouts that the `checkouts` updater fast-forwards. An
     /// `Err` is the note for a declaration that is not valid (`<id>: <reason>`).
     pub checkouts: &'a [Result<Checkout, String>],
-    /// `SSH_AUTH_SOCK` of the manager's own environment, passed to the fetch and the pull only,
+    /// `SSH_AUTH_SOCK` of the manager's own environment, passed to the fetch only,
     /// so a key held in an ssh-agent reaches git's ssh ([`ssh_agent`]).
     pub ssh_agent: Option<(String, String)>,
     /// `XDG_STATE_HOME` of the manager's own environment ([`xdg_state_home`]). The `skills` CLI
@@ -50,7 +50,7 @@ pub struct Env<'a> {
 }
 
 /// `SSH_AUTH_SOCK` of the manager's own environment, when it is set and UTF-8. Only the commands
-/// that reach a remote (`git clone`, `fetch`, `pull`) get it; nothing else passes through.
+/// that reach a remote (`git clone`, `fetch`) get it; nothing else passes through.
 pub(crate) fn ssh_agent() -> Option<(String, String)> {
     std::env::var("SSH_AUTH_SOCK")
         .ok()
@@ -1811,11 +1811,13 @@ fn fast_forward(
     if let Some(why) = gate(&up) {
         return Ok(Err((why, Status::Blocked)));
     }
-    // The fetch and the pull name the checked remote, so git cannot pick another one. `fetch`
-    // moves only the remote-tracking refs. A local commit that is not on the upstream is the
-    // owner's work: `pull --ff-only` is not tried.
-    git_remote(env, copy, &["fetch", "--quiet", &up.remote])?;
-    let n = git(env, copy, &["rev-list", "--count", "@{u}..HEAD"])?;
+    // Merge exactly the fetched branch, preserving ignored files and local commits.
+    git_remote(
+        env,
+        copy,
+        &["fetch", "--quiet", "--", &up.remote, &up.merge],
+    )?;
+    let n = git(env, copy, &["rev-list", "--count", "FETCH_HEAD..HEAD"])?;
     if n != "0" {
         return Ok(Err((
             format!(
@@ -1825,10 +1827,16 @@ fn fast_forward(
             Status::Current,
         )));
     }
-    git_remote(
+    git(
         env,
         copy,
-        &["pull", "--ff-only", "--quiet", &up.remote, &up.merge],
+        &[
+            "merge",
+            "--ff-only",
+            "--no-overwrite-ignore",
+            "--quiet",
+            "FETCH_HEAD",
+        ],
     )?;
     git(env, copy, &["rev-parse", "--short", "HEAD"]).map(Ok)
 }
@@ -2394,7 +2402,7 @@ mod tests {
         /// names the remote in `st/remote` (`origin` when absent, nothing with
         /// `st/no-upstream`) and `refs/heads/main`, `remote get-url <r>` prints `st/url-<r>`,
         /// `status` prints `st/porcelain`, `rev-list`
-        /// prints `st/ahead` (0 when absent) and `pull` copies `st/rev-after` over `st/rev`; the
+        /// prints `st/ahead` (0 when absent) and `merge` copies `st/rev-after` over `st/rev`; the
         /// bound checkout's install script exits with `st/install-exit` (0 when absent).
         fn agents(&self, rev: &str, rev_after: &str) {
             let st = self.root.join("st");
@@ -2403,7 +2411,7 @@ mod tests {
             fs::write(st.join("rev-after"), rev_after).unwrap();
             self.script(
                 &self.bin.join("git"),
-                "case \"$3\" in\n  rev-parse) if [ \"$4\" = --abbrev-ref ]; then echo main; else cat \"$st/rev\"; fi ;;\n  config) [ \"$4\" = --list ] && exit 0; [ -f \"$st/no-upstream\" ] && exit 1; case \"$5\" in *.remote) cat \"$st/remote\" 2>/dev/null || echo origin ;; *) echo refs/heads/main ;; esac ;;\n  remote) cat \"$st/url-$5\" ;;\n  ls-remote) if [ -f \"$st/rewrite\" ]; then cat \"$st/rewrite\"; else echo \"$5\"; fi ;;\n  status) cat \"$st/porcelain\" 2>/dev/null || true ;;\n  fetch) exit 0 ;;\n  rev-list) cat \"$st/ahead\" 2>/dev/null || echo 0 ;;\n  pull) cp \"$st/rev-after\" \"$st/rev\" ;;\n  *) exit 64 ;;\nesac",
+                "case \"$3\" in\n  rev-parse) if [ \"$4\" = --abbrev-ref ]; then echo main; else cat \"$st/rev\"; fi ;;\n  config) [ \"$4\" = --list ] && exit 0; [ -f \"$st/no-upstream\" ] && exit 1; case \"$5\" in *.remote) cat \"$st/remote\" 2>/dev/null || echo origin ;; *) echo refs/heads/main ;; esac ;;\n  remote) cat \"$st/url-$5\" ;;\n  ls-remote) if [ -f \"$st/rewrite\" ]; then cat \"$st/rewrite\"; else echo \"$5\"; fi ;;\n  status) cat \"$st/porcelain\" 2>/dev/null || true ;;\n  fetch) exit 0 ;;\n  rev-list) cat \"$st/ahead\" 2>/dev/null || echo 0 ;;\n  merge) cp \"$st/rev-after\" \"$st/rev\" ;;\n  *) exit 64 ;;\nesac",
             );
             self.script(
                 &self.dots.join("scripts/install-agent-registry.sh"),
@@ -2443,18 +2451,18 @@ mod tests {
 
     impl T {
         /// `git` for declared checkouts: each one is the directory `<home>/src/<id>`, and its
-        /// state is under `st/<id>`: `rev`, `rev-after` (copied over `rev` by `pull`),
+        /// state is under `st/<id>`: `rev`, `rev-after` (copied over `rev` by `merge`),
         /// `porcelain`, `ahead` (the `rev-list` count, 0 when absent), `no-upstream`, and
         /// `fail-<command>` that makes that command exit 2. The upstream is
         /// `origin`, `refs/heads/main`, at `https://github.com/o/<id>.git`.
         fn checkouts_git(&self) {
             self.script(
                 &self.bin.join("git"),
-                "d=$(basename \"$2\")\n[ -f \"$st/$d/fail-$3\" ] && exit 2\ncase \"$3\" in\n  rev-parse) if [ \"$4\" = --abbrev-ref ]; then echo main; else cat \"$st/$d/rev\"; fi ;;\n  config) [ \"$4\" = --list ] && exit 0; [ -f \"$st/$d/no-upstream\" ] && exit 1; case \"$5\" in *.remote) echo origin ;; *) echo refs/heads/main ;; esac ;;\n  remote) echo \"https://github.com/o/$d.git\" ;;\n  ls-remote) echo \"$5\" ;;\n  status) cat \"$st/$d/porcelain\" 2>/dev/null || true ;;\n  fetch) exit 0 ;;\n  rev-list) cat \"$st/$d/ahead\" 2>/dev/null || echo 0 ;;\n  pull) cp \"$st/$d/rev-after\" \"$st/$d/rev\" ;;\n  *) exit 64 ;;\nesac",
+                "d=$(basename \"$2\")\n[ -f \"$st/$d/fail-$3\" ] && exit 2\ncase \"$3\" in\n  rev-parse) if [ \"$4\" = --abbrev-ref ]; then echo main; else cat \"$st/$d/rev\"; fi ;;\n  config) [ \"$4\" = --list ] && exit 0; [ -f \"$st/$d/no-upstream\" ] && exit 1; case \"$5\" in *.remote) echo origin ;; *) echo refs/heads/main ;; esac ;;\n  remote) echo \"https://github.com/o/$d.git\" ;;\n  ls-remote) echo \"$5\" ;;\n  status) cat \"$st/$d/porcelain\" 2>/dev/null || true ;;\n  fetch) exit 0 ;;\n  rev-list) cat \"$st/$d/ahead\" 2>/dev/null || echo 0 ;;\n  merge) cp \"$st/$d/rev-after\" \"$st/$d/rev\" ;;\n  *) exit 64 ;;\nesac",
             );
         }
 
-        /// A declared checkout `id`, cloned at `rev`, whose pull moves it to `rev_after`.
+        /// A declared checkout `id`, cloned at `rev`, whose merge moves it to `rev_after`.
         fn checkout(&mut self, id: &str, rev: &str, rev_after: &str) -> PathBuf {
             let st = self.root.join("st").join(id);
             fs::create_dir_all(&st).unwrap();
@@ -2480,9 +2488,9 @@ mod tests {
         let id = c.rsplit('/').next().unwrap_or_default();
         v.extend([
             format!("git -C {c} ls-remote --get-url https://github.com/o/{id}.git"),
-            format!("git -C {c} fetch --quiet origin"),
-            format!("git -C {c} rev-list --count @{{u}}..HEAD"),
-            format!("git -C {c} pull --ff-only --quiet origin refs/heads/main"),
+            format!("git -C {c} fetch --quiet -- origin refs/heads/main"),
+            format!("git -C {c} rev-list --count FETCH_HEAD..HEAD"),
+            format!("git -C {c} merge --ff-only --no-overwrite-ignore --quiet FETCH_HEAD"),
             format!("git -C {c} rev-parse --short HEAD"),
         ]);
         v
@@ -2561,9 +2569,9 @@ mod tests {
         assert_eq!(r.notes[1], "ext a1b2c3d -> d4e5f6a", "{r:?}");
     }
 
-    /// The manager's ssh-agent socket reaches the fetch and the pull, and no other git call.
+    /// The manager's ssh-agent socket reaches the fetch, and no other git call.
     #[test]
-    fn checkouts_pass_the_ssh_agent_to_the_fetch_and_the_pull_only() {
+    fn checkouts_pass_the_ssh_agent_to_the_fetch_only() {
         let mut t = T::new();
         t.checkouts_git();
         t.ssh_agent = Some(("SSH_AUTH_SOCK".into(), "/tmp/agent.sock".into()));
@@ -2572,7 +2580,7 @@ mod tests {
         assert_eq!(r.status, Status::Updated, "{r:?}");
         let log = t.log();
         for line in log.lines() {
-            let remote = line.contains(" fetch ") || line.contains(" pull ");
+            let remote = line.contains(" fetch ");
             assert_eq!(line.ends_with("sock=/tmp/agent.sock"), remote, "{line}");
         }
         assert!(log.contains(" fetch "), "{log}");
@@ -2706,7 +2714,7 @@ mod tests {
         let r = run(Updater::Checkouts, &t.env());
         assert_eq!(r.status, Status::Failed, "{r:?}");
         assert!(
-            r.notes[0].contains("fetch --quiet origin exited 2"),
+            r.notes[0].contains("fetch --quiet -- origin refs/heads/main exited 2"),
             "{r:?}"
         );
         assert_eq!(

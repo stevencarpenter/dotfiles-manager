@@ -741,7 +741,7 @@ fn advance(
             true,
             Code::Conflict,
             &format!("{id}: fast-forward the checkout to {new} (sync never resets, rebases, stashes or cleans; commit or move your work aside, then sync again)"),
-            &["-C", dir, "merge", "-q", "--ff-only", "--end-of-options", new],
+            &["-C", dir, "merge", "-q", "--ff-only", "--no-overwrite-ignore", "--end-of-options", new],
         )
     }
     .map(|_| ())
