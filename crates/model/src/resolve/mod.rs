@@ -9,7 +9,9 @@ mod schema;
 mod scope;
 mod source;
 
+#[cfg(test)]
 pub(crate) use docs::PROFILE_SCHEMA;
+pub(crate) use docs::profile;
 #[cfg(test)]
 pub(crate) use docs::valid_id;
 pub use error::ResolveError;

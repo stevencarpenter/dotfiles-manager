@@ -836,14 +836,7 @@ fn bind(
         .and_then(|f| f.take(MAX_BYTES as u64 + 1).read_to_end(&mut content))
         .map_err(|e| invalid(format!("{real}: {}", e.kind())))?;
     let target = check_profile(&content)?;
-    // Rebinding is unsupported, so a profile for another machine is refused before any write.
-    // A key the profile lacks is left to the resolver, which reports it.
-    let declared = |v: Option<&str>, own: &str| v.unwrap_or(own).to_string();
-    if let Some(d) = target_mismatch(
-        ctx,
-        &declared(target.platform.as_deref(), &ctx.os),
-        &declared(target.architecture.as_deref(), profile_arch(&ctx.arch)),
-    ) {
+    if let Some(d) = target_mismatch(ctx, &target.platform, &target.architecture) {
         return Err(Refusal::new(Code::PlatformMismatch, d));
     }
     let want = Binding::new(real, &machine_id)?;

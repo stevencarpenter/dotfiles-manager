@@ -461,6 +461,11 @@ fn a_profile_must_be_a_toml_file_with_a_schema_key() {
     let home = TempDir::new("profile-content");
     let dir = TempDir::new("profile-files");
     for (name, content, want) in [
+        (
+            "bundle.toml",
+            include_str!("../../../examples/base/bundle.toml"),
+            "E_PROFILE_INVALID",
+        ),
         ("empty.toml", "", "E_PROFILE_INVALID"),
         ("not-toml.toml", "this is [not toml", "E_PROFILE_INVALID"),
         ("no-schema.toml", "id = \"x\"\n", "E_PROFILE_INVALID"),
@@ -660,7 +665,7 @@ fn bind_binding_and_state_escape_an_invisible_profile_path() {
     let dir = src.path().join("p\u{202e}q");
     fs::create_dir_all(&dir).unwrap();
     let p = dir.join("profile.toml");
-    fs::write(&p, "schema = 1\n").unwrap();
+    fs::copy(profile("work-01.toml"), &p).unwrap();
     let p = p.to_str().unwrap();
     let r = dir.to_str().unwrap();
     let outputs = [

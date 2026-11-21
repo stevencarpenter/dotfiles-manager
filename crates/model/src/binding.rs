@@ -1,7 +1,6 @@
 //! The machine binding document (`machine.toml`). Schema 2 records the checkout root that
 //! commands default `--root` to; schema 1 has no root and stays readable.
 
-use crate::resolve::PROFILE_SCHEMA;
 use crate::{Code, Refusal};
 use serde::{Deserialize, Serialize};
 
@@ -34,41 +33,25 @@ pub fn valid_machine_id(id: &str) -> bool {
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || b"._-".contains(c))
 }
 
-/// The machine a profile declares, as written in its top-level `platform` and `architecture`
-/// keys. `None` for a key that is absent or not a string; the resolver validates both.
+/// The machine named by a validated profile.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProfileTarget {
-    pub platform: Option<String>,
-    pub architecture: Option<String>,
+    pub platform: String,
+    pub architecture: String,
 }
 
-/// A profile must be a bounded TOML document with a top-level `schema = 1`. The resolver
-/// validates the rest; this keeps `bind` from recording an arbitrary file and returns the
-/// declared machine so `bind` can refuse a profile for another one.
+/// Validate the profile before bind persists its identity.
 pub fn check_profile(bytes: &[u8]) -> Result<ProfileTarget, Refusal> {
-    let bad = |d: &str| Refusal::new(Code::ProfileInvalid, d.to_string());
-    if bytes.len() > MAX_BYTES {
-        return Err(bad("profile exceeds 1 MiB"));
-    }
-    let text = std::str::from_utf8(bytes).map_err(|_| bad("profile is not UTF-8"))?;
-    let table: toml::Table = text.parse().map_err(|e: toml::de::Error| {
-        bad(&format!("profile is not valid TOML: {}", e.message()))
-    })?;
-    match table.get("schema") {
-        Some(toml::Value::Integer(PROFILE_SCHEMA)) => {}
-        Some(toml::Value::Integer(n)) => {
-            return Err(Refusal::new(
-                Code::SchemaUnsupported,
-                format!("profile schema {n} is not supported (supported: {PROFILE_SCHEMA})"),
-            ));
+    let profile = crate::resolve::profile("profile", bytes).map_err(|e| {
+        let mut refusal = Refusal::from(e);
+        if refusal.code != Code::SchemaUnsupported {
+            refusal.code = Code::ProfileInvalid;
         }
-        Some(_) => return Err(bad("profile schema must be an integer")),
-        None => return Err(bad("profile has no top-level schema key")),
-    }
-    let get = |k: &str| table.get(k).and_then(|v| v.as_str()).map(str::to_string);
+        refusal
+    })?;
     Ok(ProfileTarget {
-        platform: get("platform"),
-        architecture: get("architecture"),
+        platform: profile.platform,
+        architecture: profile.architecture,
     })
 }
 
@@ -231,11 +214,13 @@ mod tests {
 
     #[test]
     fn profile_needs_a_top_level_schema_key() {
-        let t =
-            check_profile(b"schema = 1\nplatform = \"macos\"\narchitecture = \"arm64\"\n").unwrap();
-        assert_eq!(t.platform.as_deref(), Some("macos"));
-        assert_eq!(t.architecture.as_deref(), Some("arm64"));
-        assert!(check_profile(b"schema = 1\nid = \"x\"\n").is_ok());
+        let t = check_profile(include_bytes!("../../../examples/profiles/work-01.toml")).unwrap();
+        assert_eq!(t.platform, "macos");
+        assert_eq!(t.architecture, "arm64");
+        assert_eq!(
+            check_profile(b"schema = 1\nid = \"x\"\n").unwrap_err().code,
+            Code::ProfileInvalid
+        );
         for bad in [&b""[..], b"[t]\nschema = 1\n", b"[oops", b"\xff"] {
             assert_eq!(check_profile(bad).unwrap_err().code, Code::ProfileInvalid);
         }
@@ -245,12 +230,17 @@ mod tests {
     fn the_profile_schema_check_follows_the_resolver_constant_not_the_binding_schema() {
         // The resolver accepts exactly PROFILE_SCHEMA. A bump of the binding schema alone must
         // not change which profiles bind accepts.
-        let ok = format!("schema = {PROFILE_SCHEMA}\n");
-        assert!(check_profile(ok.as_bytes()).is_ok());
-        let next = format!("schema = {}\n", PROFILE_SCHEMA + 1);
-        let e = check_profile(next.as_bytes()).unwrap_err();
-        assert_eq!(e.code, Code::SchemaUnsupported);
-        assert!(e.detail.contains(&format!("supported: {PROFILE_SCHEMA}")));
+        let schema = crate::resolve::PROFILE_SCHEMA;
+        let document = include_str!("../../../examples/profiles/work-01.toml");
+        assert!(check_profile(document.as_bytes()).is_ok());
+        let next = document.replace(
+            &format!("schema = {schema}"),
+            &format!("schema = {}", schema + 1),
+        );
+        assert_eq!(
+            check_profile(next.as_bytes()).unwrap_err().code,
+            Code::SchemaUnsupported
+        );
     }
 
     #[test]
