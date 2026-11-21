@@ -43,6 +43,16 @@ pub fn link_block(id: &str, target: &str, source: &str) -> String {
     )
 }
 
+/// One provider package with the same hold policy as the trial.
+pub fn package_block(id: &str, adapter: &str, name: &str) -> String {
+    format!(
+        "\n[[resources]]\nid = {}\nkind = \"package\"\nadapter = {}\n[resources.value]\nname = {}\nupdate_policy = \"hold\"\n",
+        quoted(id),
+        quoted(adapter),
+        quoted(name)
+    )
+}
+
 /// What a `script/v1` declaration holds (docs/packages.md, "Script declarations").
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ScriptDecl<'a> {

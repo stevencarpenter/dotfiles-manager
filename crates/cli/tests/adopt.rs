@@ -851,12 +851,48 @@ fn adopting_twice_is_refused() {
 }
 
 #[test]
-fn nothing_found_is_refused() {
-    let fx = Fx::new();
-    refused(
-        &fx.adopt(&["--module", "core", "--preview"]),
-        "nothing to adopt",
-    );
+fn adopting_without_configuration_installs_the_tool_in_an_empty_home() {
+    for provider in [BREW, "mise/v1"] {
+        let first = Fx::bare();
+        let trial = ["trial", "tuicr", "--provider", provider];
+        let preview = first.run(&[trial.as_slice(), &["--preview"]].concat());
+        let d = digest_of(&preview);
+        let trial = first.run(&[trial.as_slice(), &["--yes-plan", &d]].concat());
+        assert_eq!(code(&trial), 0, "{}", stderr(&trial));
+        let adopt = first.adopt_approved("core");
+        assert_eq!(code(&adopt), 0, "{}", stderr(&adopt));
+        let second = Fx::bare();
+        fs::copy(first.root.join(MANIFEST), second.root.join(MANIFEST)).unwrap();
+        let preview = second.run(&["packages", "--preview"]);
+        let d = digest_of(&preview);
+        let applied = second.run(&["packages", "--yes-plan", &d]);
+        assert_eq!(code(&applied), 0, "{} {}", stderr(&applied), out(&applied));
+        assert!(
+            out(&applied).contains("updated core.package-tuicr@package"),
+            "{}",
+            out(&applied)
+        );
+        assert!(
+            out(&second.run(&["packages", "--all"])).contains("current core.package-tuicr@package")
+        );
+    }
+}
+
+#[test]
+fn preexisting_directories_only_contribute_explicitly_selected_files() {
+    let fx = Fx::bare();
+    fx.live(".config/tuicr/other", "unrelated");
+    fx.live(LIVE, "before");
+    fx.trial_tuicr(&[]);
+    fx.live(LIVE, TUICR);
+    let o = fx.adopt(&["--module", "core", "--preview"]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    assert!(!out(&o).contains("candidate:"));
+    let d = digest_of(&fx.adopt(&["--module", "core", "--file", LIVE, "--preview"]));
+    let applied = fx.adopt(&["--module", "core", "--file", LIVE, "-y", &d]);
+    assert_eq!(code(&applied), 0, "{}", stderr(&applied));
+    assert!(fx.h(LIVE).is_symlink());
+    assert!(!fx.h(".config/tuicr/other").is_symlink());
 }
 
 #[test]
@@ -922,26 +958,11 @@ fn a_cask_line_of_the_same_name_does_not_hide_the_formula_line() {
 }
 
 #[test]
-fn a_listed_package_needs_no_cask_probe() {
-    // brew cannot say formula or cask, but the Brewfile lists the package either way.
-    for listed in ["brew \"tuicr\"\ncask \"tuicr\"\n", "brew \"tuicr\"\n"] {
-        let fx = Fx::new();
-        fx.put("Brewfile", listed);
-        git(&fx.root, &["commit", "-q", "-am", "listed"]);
-        fs::write(fx.fake.path().join("caskroom-fail"), "").unwrap();
-        fx.live(LIVE, TUICR);
-        let o = fx.adopt(&["--module", "core", "--preview"]);
-        assert_eq!(code(&o), 0, "{listed:?}\n{}\n{}", stderr(&o), out(&o));
-        assert!(
-            out(&o).contains("brewfile: none (Brewfile already lists tuicr"),
-            "{listed:?}\n{}",
-            out(&o)
-        );
-    }
-    // Not listed: the kind decides the line, so the failed probe still refuses.
+fn a_brew_declaration_requires_a_confirmed_package_kind() {
     let fx = Fx::new();
+    fx.put("Brewfile", "brew \"tuicr\"\n");
+    git(&fx.root, &["commit", "-q", "-am", "listed"]);
     fs::write(fx.fake.path().join("caskroom-fail"), "").unwrap();
-    fx.live(LIVE, TUICR);
     refused(
         &fx.adopt(&["--module", "core", "--preview"]),
         "E_PROBE_FAILED",

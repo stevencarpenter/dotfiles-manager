@@ -183,6 +183,7 @@ fn tree(parse: bool) -> Command {
                 .about("Promote a trial into a module")
                 .arg(Arg::new("trial-id"))
                 .arg(value("module", "module"))
+                .arg(many("file", "HOME-relative-file"))
                 .arg(root())
                 .arg(preview())
                 .arg(yes_plan()),

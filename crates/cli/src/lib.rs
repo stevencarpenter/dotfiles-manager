@@ -56,7 +56,7 @@ usage:
                                [--restart <resource-id>]...
   dfm trial <package> [--id <trial-id>] [--provider homebrew/v1|mise/v1] [--config <path>]...
                                [--preview] [-y|--yes-plan <digest>]
-  dfm adopt <trial-id> --module <module> [--root <dir>] [--preview] [-y|--yes-plan <digest>]
+  dfm adopt <trial-id> --module <module> [--file <HOME-relative-file>]... [--root <dir>] [--preview] [-y|--yes-plan <digest>]
   dfm purge <trial-id> [--preview] [-y|--yes-plan <digest>]
   dfm sync [--root <dir>] [--preview] [--all] [-y|--yes-plan <digest>] [--allow-disruptive <operation-id>]...
                                [--allow-adopt <operation-id>]... [--restart <resource-id>]...
@@ -133,7 +133,8 @@ pre-exists), journals the install and writes a receipt. More than one capable pr
 adopt promotes a trial into a module: each regular file under the trial's baseline paths that
 the trial created or changed is copied to <module dir>/home/<path>, gets an fs-link/v1 block
 appended to the module manifest, and its live file becomes a dfm link. A homebrew/v1 trial also
-gets a brew or cask line appended to Brewfile.<module> or Brewfile. The candidates are scanned
+gets a line in an existing Brewfile. Homebrew and mise trials get a native package declaration.
+Use --file <HOME-relative-file> to include a specific file from a pre-existing directory. The candidates are scanned
 with gitleaks first. Nothing is committed. See docs/adopt.md.
 
 purge ends a trial that is not adopted (the trial id, or the tool of a trial-<tool> id). It
