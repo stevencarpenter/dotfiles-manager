@@ -40,6 +40,13 @@ fn spec(
         sensitive: false,
         native_document: false,
         claims,
+        package_claims: match id {
+            package::HOMEBREW => Some(package::brew_claims),
+            package::UV_TOOL => Some(|n| vec![package::uv_norm(n)]),
+            package::MISE => Some(|n| vec![package::mise_selector(n)]),
+            package::APT | duckdb::ADAPTER => Some(|n| vec![n.to_owned()]),
+            _ => None,
+        },
         value,
         source_includes: None,
         precedence: None,

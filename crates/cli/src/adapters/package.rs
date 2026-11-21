@@ -278,6 +278,16 @@ pub(crate) fn brewfile_names(pkg: &str) -> (String, Vec<String>) {
     }
 }
 
+/// A tap-qualified declaration selects that tap. A bare name can select either official tap.
+pub(super) fn brew_claims(pkg: &str) -> Vec<String> {
+    let pkg = pkg.to_ascii_lowercase();
+    if pkg.contains('/') {
+        vec![pkg]
+    } else {
+        OFFICIAL_TAPS.iter().map(|t| format!("{t}/{pkg}")).collect()
+    }
+}
+
 /// Whether brew holds `pkg` as a cask: a name pinned to `homebrew/cask/`, or a rack in the
 /// Caskroom and none in the Cellar. Reads the directories only, as [`brew_probe`] does.
 pub(crate) fn brew_is_cask(runner: &Runner, pkg: &str) -> Result<bool, Refusal> {
@@ -634,7 +644,7 @@ fn uv_tool_version(text: &str, name: &str) -> Option<String> {
 
 /// A name as uv normalizes it (PEP 503): lowercase, every run of `_`, `.` and `-` as one `-`.
 /// uv names a tool's directory under `~/.local/share/uv/tools` this way too.
-fn uv_norm(s: &str) -> String {
+pub(super) fn uv_norm(s: &str) -> String {
     s.chars()
         .fold(String::with_capacity(s.len()), |mut out, c| {
             match c {
@@ -1678,7 +1688,7 @@ fn local_build(v: &str) -> bool {
 
 /// The `TOOL@VERSION` argument mise gets for a declared name: the declared `tool@version` as
 /// it is, `tool@latest` for a bare name.
-fn mise_selector(pkg: &str) -> String {
+pub(super) fn mise_selector(pkg: &str) -> String {
     let (tool, want) = tool_and_version(pkg);
     let want = if want.is_empty() { "latest" } else { want };
     format!("{tool}@{want}")

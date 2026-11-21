@@ -85,6 +85,9 @@ pub struct AdapterSpec {
     /// The adapter writes into a native document with its own precedence rules.
     pub native_document: bool,
     pub claims: Claims,
+    /// Provider identities claimed by a named package. A bare Homebrew name can select either
+    /// its official formula or its official cask.
+    pub package_claims: Option<fn(&str) -> Vec<String>>,
     pub value: Schema,
     /// For adapters whose source file is a native document that includes other files (for
     /// example a Git config): lists those includes in the order the application reads them.

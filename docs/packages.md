@@ -15,6 +15,8 @@ The `homebrew/v1`, `mise/v1`, `uv-tool/v1`, `apt/v1`, `git-checkout/v1`, `duckdb
 
 Providers run through the bounded runner (docs/secrets.md, "How `op` is run").
 
+The resolver rejects two declarations for the same provider package. It compares normalized uv names, effective mise selectors, and the possible official formula and cask for a bare Homebrew name. Distinct explicit mise selectors and distinct qualified Homebrew formula and cask names remain available.
+
 ## The command
 
 ```

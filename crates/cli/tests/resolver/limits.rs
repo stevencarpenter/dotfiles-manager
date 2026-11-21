@@ -332,6 +332,7 @@ fn i1_each_document_is_parsed_once_however_many_resources_link_it() {
         sensitive: false,
         native_document: false,
         claims: Claims::Target,
+        package_claims: None,
         value: Schema::Table(vec![Field {
             name: "source",
             schema: Schema::Source,

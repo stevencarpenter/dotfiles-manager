@@ -1249,6 +1249,45 @@ fn a_skills_entry_name_that_is_not_one_safe_component_is_refused() {
     }
 }
 
+#[test]
+fn package_claims_use_the_provider_identity() {
+    let declaration = |id, adapter, name, policy| {
+        format!(
+            r#"{{ id = "{id}", kind = "package", adapter = "{adapter}", value = {{ name = "{name}", update_policy = "{policy}" }} }}"#
+        )
+    };
+    for (adapter, first, second, conflict) in [
+        ("uv-tool/v1", "my.Tool", "My__Tool", true),
+        ("mise/v1", "node", "node@latest", true),
+        ("mise/v1", "node@20", "node@22", false),
+        ("homebrew/v1", "docker", "homebrew/cask/docker", true),
+        (
+            "homebrew/v1",
+            "homebrew/core/docker",
+            "homebrew/cask/docker",
+            false,
+        ),
+    ] {
+        let mut set = synthetic();
+        for (id, name, policy) in [("one", first, "hold"), ("two", second, "rolling")] {
+            edit(
+                &mut set,
+                PRIVATE,
+                "add",
+                "/resources/-",
+                Some(&declaration(id, adapter, name, policy)),
+            );
+        }
+        if conflict {
+            let e = err(&set, B);
+            assert_eq!(e.code, Code::TargetCollision, "{e}");
+            assert_eq!(e.field.as_deref(), Some("/name"));
+        } else {
+            ok(&set, B);
+        }
+    }
+}
+
 /// A `git-checkout/v1` claims its HOME `path`, so two checkouts at one path, or one inside
 /// another, collide at resolve time (DFM-25 C01).
 #[test]

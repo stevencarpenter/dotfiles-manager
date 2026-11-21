@@ -903,6 +903,7 @@ fn finish(
     let mut claim_budget = 0usize;
     // The paths of `Claims::Path` resources, checked only against each other.
     let mut owned_paths: Vec<(String, String)> = Vec::new();
+    let mut packages = BTreeMap::new();
     // One digest per located source path, however many references name it.
     let mut digests: BTreeMap<String, String> = BTreeMap::new();
     for (gid, owner) in resources {
@@ -1036,6 +1037,27 @@ fn finish(
                 pointer::get(value, &pointer::parse(p).expect("static pointer"))
         {
             owned_paths.push((path.clone(), gid.clone()));
+        }
+        if let (Some(claims), Some(name)) = (
+            spec.package_claims,
+            value.get("name").and_then(Value::as_str),
+        ) {
+            for identity in claims(name) {
+                if let Some(other) = packages.insert((&r.adapter, identity.clone()), gid) {
+                    return Err(ResolveError::new(
+                        Code::TargetCollision,
+                        &owner.file,
+                        format!(
+                            "package `{identity}` has two declarations for {}",
+                            r.adapter
+                        ),
+                        "keep one resource for this package and set its update policy there",
+                    )
+                    .resource(gid)
+                    .field("/name")
+                    .conflicts_with(other));
+                }
+            }
         }
         // Source containment, through symlinks, relative to the file that supplied the value.
         let mut prov: BTreeMap<String, Provenance> = BTreeMap::new();
