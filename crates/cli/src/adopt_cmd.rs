@@ -2221,6 +2221,7 @@ pub fn run(ctx: &Ctx, args: &Args, out: &mut dyn Write) -> Result<(), Refusal> {
         owned_outputs: vec![],
         error: stopped.as_ref().map(|e| bounded_visible(&e.detail, 1024)),
         reload: None,
+        upgrade: None,
     });
     let receipt = Receipt {
         schema: SCHEMA,
@@ -2332,6 +2333,7 @@ fn written(
         owned_outputs: vec![],
         error: None,
         reload: None,
+        upgrade: None,
     }
 }
 

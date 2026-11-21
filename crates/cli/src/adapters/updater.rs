@@ -499,9 +499,13 @@ fn outdated(env: &Env) -> Result<Vec<Outdated>, (String, bool)> {
         &brew_env(false),
         env.timeouts.short,
     )?;
+    brew_candidates(&out.stdout)
+}
+
+fn brew_candidates(bytes: &[u8]) -> Result<Vec<Outdated>, (String, bool)> {
     let bad = |why: String| (format!("brew outdated --json=v2: {why}"), false);
     let v: serde_json::Value =
-        serde_json::from_slice(&out.stdout).map_err(|e| bad(format!("not JSON ({e})")))?;
+        serde_json::from_slice(bytes).map_err(|e| bad(format!("not JSON ({e})")))?;
     let mut list = Vec::new();
     for (key, kind) in [("formulae", "formula"), ("casks", "cask")] {
         let items = v
@@ -700,9 +704,13 @@ fn mise_outdated(env: &Env) -> Result<Vec<Item>, (String, bool)> {
         &[],
         env.timeouts.short,
     )?;
+    mise_candidates(&out.stdout)
+}
+
+fn mise_candidates(bytes: &[u8]) -> Result<Vec<Item>, (String, bool)> {
     let bad = |why: String| (format!("mise outdated --json: {why}"), false);
     let v: serde_json::Value =
-        serde_json::from_slice(&out.stdout).map_err(|e| bad(format!("not JSON ({e})")))?;
+        serde_json::from_slice(bytes).map_err(|e| bad(format!("not JSON ({e})")))?;
     let tools = v.as_object().ok_or_else(|| bad("not an object".into()))?;
     Ok(tools
         .iter()
@@ -1989,6 +1997,82 @@ pub fn preview(u: Updater, env: &Env) -> String {
     match trust_notes(u, env) {
         n if n.is_empty() => would,
         n => format!("blocked: {}", n.join("; ")),
+    }
+}
+
+/// Candidate listings are observations. Providers resolve their targets again during the update.
+pub fn preview_candidates(u: Updater, env: &Env, scratch: &Path) -> Vec<String> {
+    let (argv, mut vars) = match u {
+        Updater::Brew => (args(&["outdated", "--json=v2"]), brew_env(false)),
+        Updater::Mise => (args(&["outdated", "--json"]), vec![]),
+        _ => return vec!["candidate versions unavailable before execution".into()],
+    };
+    let inspect = || -> Result<Vec<String>, (String, bool)> {
+        let tmp = scratch
+            .canonicalize()
+            .map_err(|e| (e.kind().to_string(), false))?;
+        let tmp = tmp
+            .to_str()
+            .ok_or_else(|| ("preview directory is not UTF-8".into(), false))?;
+        let exe = env
+            .provider
+            .resolve(u.name())
+            .map_err(|e| (e.detail, false))?;
+        let exe = exe
+            .to_str()
+            .ok_or_else(|| ("provider path is not UTF-8".into(), false))?;
+        let mut runner = env.provider.clone();
+        runner.search_path.insert(0, "/usr/bin".into());
+        // Providers may populate caches even during a listing. Only the scratch directory is writable.
+        let profile = r#"(version 1)(allow default)(deny file-write*)(allow file-write* (subpath (param "SCRATCH")) (literal "/dev/null"))"#;
+        let mut query = vec![
+            "-D".into(),
+            format!("SCRATCH={tmp}"),
+            "-p".into(),
+            profile.into(),
+            exe.into(),
+        ];
+        query.extend(argv);
+        vars.push(("TMPDIR".into(), tmp.into()));
+        let out = call_at(
+            &runner,
+            "sandbox-exec",
+            &query,
+            &vars,
+            env.timeouts.short.min(Duration::from_secs(30)),
+            &[0],
+            Some(scratch),
+        )
+        .map_err(|_| {
+            (
+                "the read-only provider query did not complete".to_string(),
+                false,
+            )
+        })?;
+        if u == Updater::Brew {
+            return Ok(brew_candidates(&out.stdout)?
+                .into_iter()
+                .map(|item| {
+                    format!(
+                        "{} {} {} -> {}{}",
+                        item.kind,
+                        item.name,
+                        item.installed,
+                        item.current,
+                        if item.pinned { " (held)" } else { "" }
+                    )
+                })
+                .collect());
+        }
+        Ok(mise_candidates(&out.stdout)?
+            .into_iter()
+            .map(|item| format!("{} {} -> {}", item.name, item.installed, item.newest))
+            .collect())
+    };
+    match inspect() {
+        Ok(items) if items.is_empty() => vec!["no outdated candidates reported".into()],
+        Ok(items) => items,
+        Err((reason, _)) => vec![format!("candidate versions unavailable: {reason}")],
     }
 }
 

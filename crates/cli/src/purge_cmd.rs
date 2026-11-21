@@ -1722,6 +1722,7 @@ pub fn run(ctx: &Ctx, args: &Args, out: &mut dyn Write) -> Result<(), Refusal> {
             owned_outputs: vec![],
             error,
             reload: None,
+            upgrade: None,
         });
         writeln!(out, "{line}").map_err(w)?;
         Ok(failed)

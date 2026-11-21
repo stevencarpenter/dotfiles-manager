@@ -185,6 +185,7 @@ pub fn record_op(ctx: &Ctx, m: &clap::ArgMatches, out: &mut dyn Write) -> Result
             owned_outputs: vec![output],
             error: note,
             reload: None,
+            upgrade: None,
         }];
         let receipt = Receipt {
             schema: SCHEMA,

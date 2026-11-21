@@ -204,6 +204,7 @@ fn tree(parse: bool) -> Command {
                 many("restart", "resource-id"),
                 many("trust-origin", "origin"),
                 switch("no-upgrade"),
+                switch("strict-upgrade").conflicts_with("no-upgrade"),
             ],
         ))
         .subcommand(

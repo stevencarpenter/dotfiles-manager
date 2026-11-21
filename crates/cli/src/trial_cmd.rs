@@ -878,6 +878,7 @@ pub(super) fn conclude(
         owned_outputs: vec![],
         error: error.clone(),
         reload: None,
+        upgrade: None,
     }];
     let receipt = Receipt {
         schema: SCHEMA,

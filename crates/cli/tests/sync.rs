@@ -4243,6 +4243,15 @@ fn sync_runs_the_mise_rustup_uv_and_npm_updaters_in_order() {
         "{s}"
     );
     assert!(s.contains("    note: x 1.0 -> 1.1 upgraded"), "{s}");
+    let receipts = u.upgrade_receipts();
+    let evidence = &receipts[0]["operations"][0]["upgrade"]["notes"];
+    assert!(
+        evidence
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v == "go 1.27.3 -> 1.27.4 upgraded")
+    );
     let log = u.log();
     let at = |c: &str| log.find(c).unwrap_or_else(|| panic!("{c}\n{log}"));
     assert!(at("mise upgrade") < at("rustup update"), "{log}");
@@ -4864,13 +4873,23 @@ fn no_upgrade_skips_every_updater() {
 }
 
 #[test]
-fn preview_lists_updaters_and_runs_none() {
+fn preview_lists_read_only_candidates_without_modifying_provider_state() {
     let u = Up::new(r#"["claude", "brew"]"#);
+    fs::write(u.st("outdated-codex"), "").unwrap();
     let o = u.sync(&["--preview"]);
     assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
     let s = stdout(&o);
     assert!(s.contains("  claude: would run claude update"), "{s}");
     assert!(s.contains("  brew: would run brew update"), "{s}");
+    assert!(
+        s.contains("candidate: cask codex 0.164.0 -> 0.165.0"),
+        "{s}"
+    );
+    assert!(
+        s.contains("candidate: candidate versions unavailable before execution"),
+        "{s}"
+    );
+    assert!(u.st("outdated-codex").exists());
     assert_eq!(u.log(), "");
     assert!(u.upgrade_receipts().is_empty());
 }
@@ -4906,6 +4925,19 @@ fn a_failed_updater_warns_and_exits_0() {
 }
 
 #[test]
+fn strict_upgrade_reports_aggregate_failure_after_finishing_remaining_updaters() {
+    let u = Up::new(r#"["codex", "claude"]"#);
+    fs::write(u.st("fail-codex"), "").unwrap();
+    let o = u.sync(&["--strict-upgrade"]);
+    assert_eq!(code(&o), 1, "{}\n{}", stdout(&o), stderr(&o));
+    assert!(stdout(&o).contains("result: failed"));
+    assert!(stdout(&o).contains("warning: upgrade codex failed"));
+    assert!(u.log().contains("claude update"));
+    fs::remove_file(u.st("fail-codex")).unwrap();
+    assert_eq!(code(&u.sync(&["--strict-upgrade"])), 0);
+}
+
+#[test]
 fn a_refused_sync_runs_no_updater() {
     let u = Up::new(r#"["claude"]"#);
     // An origin the grants do not hold is refused before any fetch.
@@ -4936,6 +4968,29 @@ fn a_grant_without_a_digest_runs_no_updater() {
 }
 
 #[test]
+fn a_completed_updater_is_auditable_after_a_hard_stop() {
+    let u = Up::new(r#"["claude", "codex"]"#);
+    let o = u
+        .command_env(&[("DFM_FAILPOINT", "sync-after-upgrade-step:abort")], &[])
+        .output()
+        .unwrap();
+    assert!(!o.status.success());
+    assert!(u.upgrade_receipts().is_empty());
+    let steps: Vec<_> =
+        u.fx.receipt_docs()
+            .into_iter()
+            .filter(|r| r["command"] == "upgrade-step")
+            .collect();
+    assert_eq!(steps.len(), 1);
+    assert_eq!(steps[0]["operations"][0]["resource"], "updater:claude");
+    assert_eq!(
+        steps[0]["operations"][0]["upgrade"]["after_version"],
+        "2.1.311 (Claude Code)"
+    );
+    assert!(!u.log().contains("codex update"));
+}
+
+#[test]
 fn the_upgrade_receipt_records_each_updater() {
     let u = Up::new(r#"["codex", "claude"]"#);
     fs::write(u.st("fail-codex"), "").unwrap();
@@ -4943,6 +4998,30 @@ fn the_upgrade_receipt_records_each_updater() {
     assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
     let r = u.upgrade_receipts();
     assert_eq!(r.len(), 1, "{r:?}");
+    let steps: Vec<_> =
+        u.fx.receipt_docs()
+            .into_iter()
+            .filter(|r| r["command"] == "upgrade-step")
+            .collect();
+    assert_eq!(steps.len(), 2);
+    for step in steps {
+        let op = &step["operations"][0];
+        assert!(r[0]["operations"].as_array().unwrap().contains(op));
+        assert!(
+            step["op_id"]
+                .as_str()
+                .unwrap()
+                .starts_with(r[0]["op_id"].as_str().unwrap())
+        );
+    }
+    assert_eq!(
+        r[0]["operations"][1]["upgrade"]["before_version"],
+        "2.1.311 (Claude Code)"
+    );
+    assert_eq!(
+        r[0]["operations"][1]["upgrade"]["after_version"],
+        "2.1.311 (Claude Code)"
+    );
     let ops = r[0]["operations"].as_array().unwrap();
     let rows: Vec<(&str, &str, &str)> = ops
         .iter()

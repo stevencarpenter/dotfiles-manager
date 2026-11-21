@@ -92,18 +92,18 @@ A trial does not hold `brew`. The owner's decision of 2026-10-31 replaces DFM-31
 
 ## In sync
 
-1. After the plan, before publication and the scopes, each updater is listed with what it would run and its resolved path, or `blocked: <why>` (DFM-31.C02), the `agents` source check included. Every declared updater is listed, a blocked one too (DFM-25, G6). Nothing runs yet.
+1. After the plan, before publication and the scopes, each updater is listed with what it would run and its resolved path, or `blocked: <why>` (DFM-31.C02), the `agents` source check included. Every declared updater is listed, a blocked one too (DFM-25, G6). On an explicit preview, Homebrew and mise can report candidates through a read-only query.
 2. The four scopes run as docs/sync.md describes.
 3. A refused run (an error exit) runs no updater. A skipped or blocked scope does not stop them.
 4. `--no-upgrade` prints `upgrade: skipped (--no-upgrade)` and runs none.
 5. The step also runs after "nothing to change".
 6. Under the writer lock, the profile is resolved again from `--root`, because another sync may have changed it since the review. An updater runs only when the review listed it and the profile still declares it; one added meanwhile runs in the next sync, after its review. A profile that declared none in the review takes no lock. Each updater that runs prints one row: `  <status> <name> <before> -> <after>`, then its notes. A blocked updater prints its row too and counts in the summary. After the last row, the second copies of the native tools are read (see "The fixed set").
-7. One receipt is written (`command = "upgrade"`, no plan digest, no approval), with one operation per updater (`resource = "updater:<name>"`, `adapter = "updater/v1"`). An updater that is not `updated` or `current` makes the receipt `failed`, exit 1, while sync itself exits 0.
+7. Each completed provider writes an immutable `upgrade-step` receipt before the next provider starts. Its operation records the observed versions and per-item notes. The final `upgrade` receipt groups all operations. The step ID contains the run ID and provider name. Use `sync --strict-upgrade` in automation to return exit 1 after all providers finish if any reports a problem. Plain sync keeps its daily best-effort exit policy.
 8. The `scopes:` block ends with `  upgrade: <status>=<count>...`, and each `failed`, `blocked` or `pending` updater adds a `warning:` line at the end of standard output.
 9. A stop request during the step ends that updater, reports the rest `pending`, writes the receipt and ends the run with the stop's exit code (130 or 143). The warnings still print. No journal entry is written, so the next sync runs every updater again.
 10. An error of the step itself (the writer lock is held by another command, the state cannot be read, the receipt cannot be written) keeps the scope summary, reports `upgrade: failed (<code>)` and exits with that error.
 
-`--preview` lists each updater with what it would run and its resolved path, and runs nothing.
+`--preview` lists each updater and its resolved path. For Homebrew and mise it queries candidate versions with writes confined to temporary storage. Other providers report that candidates are unavailable. A provider resolves its final version when it runs.
 
 Updaters run detached: each starts in a new session (`setsid`, `Runner::detach`), with no controlling terminal and standard input closed. A step that needs a password or a prompt, such as a cask whose installer runs `sudo`, fails at once instead of waiting at the terminal. The `brew` row names the package that stayed outdated. Upgrade it by hand.
 
@@ -111,7 +111,6 @@ Timeouts: 30 minutes for each upgrade command (`brew upgrade`, `mise upgrade`, `
 
 ## Known limits
 
-- **No candidate version in the preview.** The newest version is what each provider resolves at run time.
 - **`sudo` casks fail** under the detached run.
 - **skills reports no version**, so it is never `updated`.
 - **The guard sees changes, not their author.** A change that another process makes to a tracked file while an updater runs is counted against that updater.

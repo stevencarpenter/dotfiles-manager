@@ -493,6 +493,14 @@ pub struct Fingerprint {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct UpgradeEvidence {
+    pub before_version: Option<String>,
+    pub after_version: Option<String>,
+    pub notes: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct OperationRecord {
     pub id: String,
     pub resource: String,
@@ -512,6 +520,8 @@ pub struct OperationRecord {
     /// postconditions). One of [`RELOADS`]. Absent when the operation published nothing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reload: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upgrade: Option<UpgradeEvidence>,
 }
 
 /// The consumer reload states the manager can record. A published file records `not_attempted`:
@@ -685,6 +695,20 @@ impl Receipt {
                 if !valid_sha256(&f.fingerprint) {
                     return Err(bad(format!("operation {} fingerprint is malformed", o.id)));
                 }
+            }
+            if let Some(u) = &o.upgrade
+                && (o.adapter != "updater/v1"
+                    || o.class != Class::Normal
+                    || u.before_version
+                        .iter()
+                        .chain(&u.after_version)
+                        .chain(&u.notes)
+                        .any(|s| s.len() > MAX_ERROR_BYTES))
+            {
+                return Err(bad(format!(
+                    "operation {} has invalid upgrade evidence",
+                    o.id
+                )));
             }
             if o.owned_outputs.iter().any(|p| !valid_path(p)) {
                 return Err(bad(format!("operation {} output path is malformed", o.id)));
@@ -1439,6 +1463,16 @@ impl Receipt {
             if let Some(e) = &mut o.error {
                 red(e);
             }
+            if let Some(u) = &mut o.upgrade {
+                for value in u
+                    .before_version
+                    .iter_mut()
+                    .chain(&mut u.after_version)
+                    .chain(&mut u.notes)
+                {
+                    red(value);
+                }
+            }
         }
         Ok(())
     }
@@ -1723,6 +1757,7 @@ mod tests {
             owned_outputs: vec!["/h/.gitconfig".into()],
             error: None,
             reload: None,
+            upgrade: None,
         }
     }
 

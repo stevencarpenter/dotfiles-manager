@@ -76,6 +76,7 @@ pub struct Args {
     restart: BTreeSet<String>,
     /// False with `--no-upgrade`: the profile's updaters do not run (docs/upgrade.md).
     upgrade: bool,
+    strict_upgrade: bool,
 }
 
 /// `sync [--root <dir>] [--preview] [--yes-plan <digest>] [--allow-disruptive <id>]...
@@ -104,6 +105,7 @@ pub fn parse_args(m: &clap::ArgMatches) -> Result<Args, Refusal> {
         trust,
         restart,
         upgrade,
+        strict_upgrade: cli::flag(m, "strict-upgrade"),
     })
 }
 
@@ -1722,6 +1724,7 @@ struct Printed {
     plan: bool,
     result: bool,
     warnings: Vec<String>,
+    incomplete_upgrade: bool,
 }
 
 pub fn run(ctx: &Ctx, args: &Args, out: &mut dyn Write) -> Result<(), Refusal> {
@@ -1746,7 +1749,11 @@ pub fn run(ctx: &Ctx, args: &Args, out: &mut dyn Write) -> Result<(), Refusal> {
             dfm_model::Exit::Interrupted | dfm_model::Exit::Terminated
         )
     });
-    for warning in printed.warnings.iter().filter(|_| r.is_ok() || stopped) {
+    for warning in printed
+        .warnings
+        .iter()
+        .filter(|_| r.is_ok() || stopped || printed.incomplete_upgrade)
+    {
         let _ = writeln!(
             out,
             "{} {warning}",
@@ -1774,6 +1781,16 @@ fn finish(
     if let Some(u) = upgrade {
         writeln!(out, "  upgrade: {u}").map_err(w)?;
     }
+    let result = result.and_then(|()| {
+        if printed.incomplete_upgrade {
+            Err(Refusal::new(
+                Code::Diagnosed,
+                "one or more updaters did not complete",
+            ))
+        } else {
+            Ok(())
+        }
+    });
     let exit = result
         .as_ref()
         .err()
@@ -1920,7 +1937,14 @@ fn run_inner(
     // The updaters, a blocked one included, are listed before any part runs (DFM-31.C02).
     let updaters = &loaded.resolved.updaters;
     if args.apply.preview || (args.upgrade && !updaters.is_empty()) {
-        upgrade_preview(ctx, &sys, (&root, &grants), args, &loaded.resolved, out)?;
+        upgrade_preview(
+            ctx,
+            &sys,
+            (&root, &grants, &staging.dir),
+            args,
+            &loaded.resolved,
+            out,
+        )?;
     }
     if args.apply.preview {
         return Ok(());
@@ -2435,11 +2459,11 @@ pub(crate) fn tracked_status(
     Ok(seen)
 }
 
-/// `--preview`: what the upgrade step would run. Nothing runs and nothing is written.
+/// Shows declared commands and, on an explicit preview, read-only candidate listings.
 fn upgrade_preview(
     ctx: &Ctx,
     sys: &Sys,
-    (root, grants): (&Path, &Grants),
+    (root, grants, staging): (&Path, &Grants, &Path),
     args: &Args,
     resolved: &Resolved,
     out: &mut dyn Write,
@@ -2466,13 +2490,18 @@ fn upgrade_preview(
     let env = updater_env(ctx, &runner, root, grants, &checkouts);
     writeln!(out, "{}", paint::label(ctx.color, "upgrade:")).map_err(w)?;
     for u in updaters {
-        writeln!(
-            out,
-            "  {}: {}",
-            u.name(),
-            visible(&updater::preview(*u, &env))
-        )
-        .map_err(w)?;
+        let command = updater::preview(*u, &env);
+        writeln!(out, "  {}: {}", u.name(), visible(&command)).map_err(w)?;
+        if args.apply.preview && !command.starts_with("blocked:") {
+            let scratch = staging.join(format!("candidates-{}", u.name()));
+            if matches!(u, Updater::Brew | Updater::Mise) {
+                fs::create_dir(&scratch)
+                    .map_err(|e| io_failed("create candidate preview directory", &e))?;
+            }
+            for item in updater::preview_candidates(*u, &env, &scratch) {
+                writeln!(out, "    candidate: {}", visible(&item)).map_err(w)?;
+            }
+        }
     }
     Ok(())
 }
@@ -2509,13 +2538,14 @@ fn upgrade(
         writeln!(out, "upgrade: none declared in the profile").map_err(w)?;
         return Ok(None);
     }
-    state_cmd::fail_from_env()?.hit("sync-before-upgrade-lock")?;
+    let fail = state_cmd::fail_from_env()?;
+    fail.hit("sync-before-upgrade-lock")?;
     // A sync with nothing to change ran no scope, so nothing armed the handlers yet.
     if !dfm_engine::signal::installed() {
         dfm_engine::signal::install()?;
     }
     let layout = ctx.layout();
-    let store = Store::open_write_with(*sys, &layout, state_cmd::fail_from_env()?, false)?;
+    let store = Store::open_write_with(*sys, &layout, fail.clone(), false)?;
     if !store.is_initialized() {
         return Err(crate::state_lost_refusal());
     }
@@ -2550,7 +2580,33 @@ fn upgrade(
     // after each one that ran. A change it made fails its row and stays in place.
     let mut tracked = tracked_status(&git, &checkouts)?;
     writeln!(out, "{}", paint::label(ctx.color, "upgrade:")).map_err(w)?;
-    let mut ops = Vec::new();
+    let binary = crate::plan_cmd::binary_identity()?;
+    let stamp = state::Stamp::of(binding);
+    let mut receipt = state::Receipt {
+        schema: state::SCHEMA,
+        op_id: format!("upgrade-{started}"),
+        command: "upgrade".into(),
+        update: false,
+        started_at: rfc3339(started),
+        finished_at: rfc3339(started),
+        binary: state::BinaryId {
+            version: binary.version,
+            commit: option_env!("DFM_BUILD_COMMIT").unwrap_or("unknown").into(),
+            sha256: binary.sha256,
+        },
+        profile: state::ProfileRef {
+            id: stamp.profile,
+            binding_digest: stamp.binding_digest,
+        },
+        machine_id: stamp.machine_id,
+        plan_digest: None,
+        approval: None,
+        sources: vec![],
+        approvals: vec![],
+        result: state::RunResult::from_operations(&[]),
+        operations: Vec::new(),
+    };
+    let mut operations = Vec::new();
     for u in &updaters {
         let mut row = updater::run(*u, &env);
         // A blocked updater ran no command, and a stopped run starts no more.
@@ -2581,6 +2637,38 @@ fn upgrade(
                 }
             }
         }
+        let op = state::OperationRecord {
+            id: format!("updater-{}", u.name()),
+            resource: format!("updater:{}", u.name()),
+            adapter: "updater/v1".into(),
+            class: Class::Normal,
+            status: row.status,
+            started_at: Some(row.started_at.clone()),
+            finished_at: Some(row.finished_at.clone()),
+            before: None,
+            after: None,
+            owned_outputs: vec![],
+            error: row.status.is_problem().then(|| row.notes.join("; ")),
+            reload: None,
+            upgrade: Some(state::UpgradeEvidence {
+                before_version: row.before.clone(),
+                after_version: row.after.clone(),
+                notes: row.notes.clone(),
+            }),
+        };
+        // Record the completed provider before output or the next native command can fail.
+        let step = state::Receipt {
+            op_id: format!("{}-{}", receipt.op_id, u.name()),
+            command: "upgrade-step".into(),
+            started_at: row.started_at.clone(),
+            finished_at: row.finished_at.clone(),
+            result: state::RunResult::from_operations(std::slice::from_ref(&op)),
+            operations: vec![op.clone()],
+            ..receipt.clone()
+        };
+        store.write_receipt(&step)?;
+        fail.hit("sync-after-upgrade-step")?;
+        operations.push(op);
         let status = status_name(row.status);
         let versions = match (&row.before, &row.after) {
             (Some(b), Some(a)) if a != b => format!(" {} -> {}", visible(b), visible(a)),
@@ -2605,30 +2693,6 @@ fn upgrade(
                 visible(&row.notes.join("; "))
             ));
         }
-        let mut error = problem.then(|| row.notes.join("; "));
-        if let Some(e) = &mut error
-            && e.len() > state::MAX_ERROR_BYTES
-        {
-            let mut cut = state::MAX_ERROR_BYTES;
-            while !e.is_char_boundary(cut) {
-                cut -= 1;
-            }
-            e.truncate(cut);
-        }
-        ops.push(state::OperationRecord {
-            id: format!("updater-{}", u.name()),
-            resource: format!("updater:{}", u.name()),
-            adapter: "updater/v1".into(),
-            class: Class::Normal,
-            status: row.status,
-            started_at: Some(row.started_at),
-            finished_at: Some(row.finished_at),
-            before: None,
-            after: None,
-            owned_outputs: vec![],
-            error,
-            reload: None,
-        });
     }
     // After the loop, so a copy that brew upgraded shows the version brew left. A stopped run
     // starts no more commands.
@@ -2638,32 +2702,10 @@ fn upgrade(
             writeln!(out, "  note: {} {}", u.name(), visible(&n)).map_err(w)?;
         }
     }
-    let binary = crate::plan_cmd::binary_identity()?;
-    let stamp = state::Stamp::of(binding);
-    let receipt = state::Receipt {
-        schema: state::SCHEMA,
-        op_id: format!("upgrade-{started}"),
-        command: "upgrade".into(),
-        update: false,
-        started_at: rfc3339(started),
-        finished_at: rfc3339(now_ns()?),
-        binary: state::BinaryId {
-            version: binary.version,
-            commit: option_env!("DFM_BUILD_COMMIT").unwrap_or("unknown").into(),
-            sha256: binary.sha256,
-        },
-        profile: state::ProfileRef {
-            id: stamp.profile,
-            binding_digest: stamp.binding_digest,
-        },
-        machine_id: stamp.machine_id,
-        plan_digest: None,
-        approval: None,
-        sources: vec![],
-        approvals: vec![],
-        result: state::RunResult::from_operations(&ops),
-        operations: ops,
-    };
+    receipt.operations = operations;
+    receipt.finished_at = rfc3339(now_ns()?);
+    receipt.result = state::RunResult::from_operations(&receipt.operations);
+    printed.incomplete_upgrade = args.strict_upgrade && receipt.result.exit_code != 0;
     let name = store.write_receipt(&receipt)?;
     writeln!(out, "receipt: {}", visible(&name)).map_err(w)?;
     let counts: Vec<String> = receipt

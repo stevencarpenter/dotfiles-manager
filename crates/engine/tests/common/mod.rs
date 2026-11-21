@@ -160,6 +160,7 @@ pub fn receipt(stamp: &Stamp, op_id: &str, outputs: Vec<String>) -> Receipt {
         owned_outputs: outputs,
         error: None,
         reload: None,
+        upgrade: None,
     }];
     Receipt {
         schema: dfm_model::state::SCHEMA,

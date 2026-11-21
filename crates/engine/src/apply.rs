@@ -2448,6 +2448,7 @@ fn record(
             text.chars().take(1024).collect()
         }),
         reload,
+        upgrade: None,
     }
 }
 
