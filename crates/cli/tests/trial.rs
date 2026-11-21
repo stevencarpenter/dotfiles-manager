@@ -221,7 +221,13 @@ fn a_new_tool_is_installed_and_the_trial_record_survives_the_process() {
     let trials = fx.entries("trials");
     assert_eq!(trials.len(), 1, "{trials:?}");
     let r = fx.json(&trials[0]);
-    assert_eq!(r["schema"], 4, "a record with data paths");
+    assert_eq!(r["schema"], 7);
+    assert_eq!(
+        r["package"]["install"]["verified"],
+        serde_json::json!({
+            "selector": "homebrew/core/atuin", "version": "1.0.0", "dependencies": {"libsodium": "1.0.0"}
+        })
+    );
     assert_eq!(r["trial_id"], "trial-atuin");
     assert_eq!(r["tool"], "atuin");
     assert_eq!(r["binding"]["machine_id"], "m5-test");
@@ -694,7 +700,7 @@ fn packages_update_does_not_roll_an_adopted_trial_from_its_record() {
     fx.mise_trial();
     let path = fx.state().join("trials/trial-duckdb.json");
     let mut t = fx.json(&path);
-    // A record with data paths stays schema 4 when adopted.
+    // An adopted record keeps its package evidence schema.
     t["adopted"] = serde_json::json!({"op_id": "adopt-1-2", "module": "extra", "at_unix_ns": 9});
     fs::write(&path, serde_json::to_vec(&t).unwrap()).unwrap();
     let o = fx.update(&[]);
@@ -1240,8 +1246,6 @@ fn purge_removes_the_install_its_dependencies_and_what_the_tool_created() {
     fx.home_put(".local/share/atuin/history.db", "rows\n");
     fx.home_put(".local/share/atuin/sub/deep", "x\n");
     fx.home_put(".cache/atuin/new", "after\n");
-    // An older keg beside the installed one: every version goes.
-    fs::create_dir_all(fx.cellar("atuin").join("0.9.0")).unwrap();
 
     let o = fx.purge(&["atuin", "--preview"]);
     assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
@@ -1297,12 +1301,12 @@ fn purge_removes_the_install_its_dependencies_and_what_the_tool_created() {
     assert!(t.ends_with("result: ok\n"), "{t}");
     let log = fx.log();
     assert!(
-        log.contains("brew uninstall --formula --force atuin |"),
+        log.contains("brew uninstall --formula homebrew/core/atuin |"),
         "{log}"
     );
     assert!(log.contains("uninstall autoremove=1"), "{log}");
     assert!(
-        log.contains("brew uninstall --formula --force libsodium |"),
+        log.contains("brew uninstall --formula homebrew/core/libsodium |"),
         "{log}"
     );
     assert!(
@@ -1346,6 +1350,66 @@ fn purge_removes_the_install_its_dependencies_and_what_the_tool_created() {
     // The tool can be tried again.
     let o = fx.trial(&["atuin", "--provider", BREW, "--preview"]);
     assert_eq!(code(&o), 0, "{}", stderr(&o));
+}
+
+#[test]
+fn purge_keeps_multiple_homebrew_kegs_and_unverified_installations() {
+    let fx = Fx::new();
+    fx.marker("deps-atuin", "libsodium\n");
+    fx.brew_trial();
+    let o = fx.purge(&["atuin", "--preview"]);
+    let digest = digest_of(&o);
+    let added = fx.cellar("libsodium").join("2.0.0");
+    fs::create_dir_all(&added).unwrap();
+    fs::copy(
+        fx.cellar("libsodium").join("1.0.0/INSTALL_RECEIPT.json"),
+        added.join("INSTALL_RECEIPT.json"),
+    )
+    .unwrap();
+    let o = fx.purge(&["atuin", "--yes-plan", &digest]);
+    assert!(stderr(&o).contains("E_PLAN_STALE"), "{}", stderr(&o));
+    let o = fx.purge_approved("atuin");
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    assert!(!fx.cellar("atuin").exists());
+    assert!(fx.cellar("libsodium").join("1.0.0").exists() && added.exists());
+
+    let fx = Fx::new();
+    fx.brew_trial();
+    fs::remove_file(&fx.entries("receipts")[0]).unwrap();
+    let o = fx.purge_approved("atuin");
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    assert!(fx.cellar("atuin").is_dir());
+    assert!(!fx.log().contains("brew uninstall"));
+}
+
+#[test]
+fn purge_keeps_a_formula_with_the_same_name_as_the_trial_cask() {
+    let fx = Fx::new();
+    fx.marker("official-cask", "atuin\n");
+    let pkg = "homebrew/cask/atuin";
+    let o = fx.trial(&[pkg, "--provider", BREW, "--preview"]);
+    let o = fx.trial(&[pkg, "--provider", BREW, "--yes-plan", &digest_of(&o)]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    fx.brew_installed("atuin 1.0.0\n");
+    let o = fx.purge_approved("atuin");
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    assert!(!fx.fake.path().join("Caskroom/atuin").exists());
+    assert!(fx.cellar("atuin").join("1.0.0").exists());
+}
+
+#[test]
+fn purge_requires_the_version_evidence_matched_by_the_original_receipt() {
+    let fx = Fx::new();
+    fx.mise_trial();
+    fx.marker("installed-mise", "duckdb 3.0.0\n");
+    let path = fx.state().join("trials/trial-duckdb.json");
+    let mut record = fx.json(&path);
+    record["package"]["install"]["verified"]["version"] = "3.0.0".into();
+    fs::write(&path, serde_json::to_vec(&record).unwrap()).unwrap();
+    let o = fx.purge_approved("duckdb");
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    assert!(text(&o.stdout).contains("no verified install versions and successful trial receipt"));
+    assert!(!fx.log().contains("mise uninstall"));
 }
 
 #[test]
@@ -1406,18 +1470,26 @@ fn purge_keeps_a_package_another_trial_uses() {
 }
 
 #[test]
-fn purge_uninstalls_every_version_of_a_mise_trial() {
+fn purge_pins_the_preview_and_only_removes_the_mise_version_the_trial_installed() {
     let fx = Fx::new();
     fx.mise_trial();
+    let o = fx.purge(&["trial-duckdb", "--preview"]);
+    let digest = digest_of(&o);
+    fx.marker("installed-mise", "duckdb 2.0.0\nduckdb 3.0.0\n");
+    let stale = fx.purge(&["trial-duckdb", "--yes-plan", &digest]);
+    assert_eq!(code(&stale), 3, "{}", stderr(&stale));
+    assert!(stderr(&stale).contains("E_PLAN_STALE"));
     let o = fx.purge_approved("trial-duckdb");
     assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
     assert!(
-        fx.log().contains("mise uninstall --all duckdb |"),
+        fx.log().contains("mise uninstall duckdb@2.0.0 |"),
         "{}",
         fx.log()
     );
-    let db = fs::read_to_string(fx.fake.path().join("installed-mise")).unwrap_or_default();
-    assert!(!db.contains("duckdb"), "{db}");
+    assert_eq!(
+        fs::read_to_string(fx.fake.path().join("installed-mise")).unwrap(),
+        "duckdb 3.0.0\n"
+    );
 }
 
 #[test]
@@ -1426,7 +1498,7 @@ fn purge_refuses_an_adopted_trial_and_an_unknown_id() {
     fx.mise_trial();
     let path = fx.state().join("trials/trial-duckdb.json");
     let mut t = fx.json(&path);
-    // A record with data paths stays schema 4 when adopted.
+    // An adopted record keeps its package evidence schema.
     t["adopted"] = serde_json::json!({"op_id": "adopt-1-2", "module": "extra", "at_unix_ns": 9});
     fs::write(&path, serde_json::to_vec(&t).unwrap()).unwrap();
     let o = fx.purge(&["trial-duckdb", "--preview"]);
@@ -1509,7 +1581,7 @@ fn a_brew_failure_that_is_not_the_dependents_refusal_fails_the_purge() {
         &brew,
         body.replacen(
             "  uninstall)\n",
-            "  uninstall)\n    [ \"$4\" = libsodium ] && { echo 'Error: another brew process is running' >&2; exit 1; }\n",
+            "  uninstall)\n    [ \"$3\" = homebrew/core/libsodium ] && { echo 'Error: another brew process is running' >&2; exit 1; }\n",
             1,
         ),
     )
@@ -1616,6 +1688,10 @@ fn an_old_record_without_data_paths_is_purged_with_a_note() {
     let path = fx.state().join("trials/trial-atuin.json");
     let mut t = fx.json(&path);
     t["schema"] = 2.into();
+    t["package"]["install"]
+        .as_object_mut()
+        .unwrap()
+        .remove("verified");
     t["baseline"].as_object_mut().unwrap().remove("data");
     fs::write(&path, serde_json::to_vec(&t).unwrap()).unwrap();
     let o = fx.purge(&["trial-atuin", "--preview"]);
@@ -1627,6 +1703,8 @@ fn an_old_record_without_data_paths_is_purged_with_a_note() {
     );
     let o = fx.purge_approved("trial-atuin");
     assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+    assert!(fx.cellar("atuin").is_dir());
+    assert!(!fx.log().contains("brew uninstall"), "{}", fx.log());
 }
 
 #[test]

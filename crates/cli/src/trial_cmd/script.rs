@@ -1313,6 +1313,7 @@ pub(super) fn run(
         ctx,
         &store,
         Outcome {
+            after: None,
             trial_id: &trial_id,
             op_id: &op_id,
             adapter: ADAPTER,

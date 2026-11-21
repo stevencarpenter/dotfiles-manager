@@ -206,9 +206,17 @@ fn rack_versions(root: &Path, name: &str) -> Result<Vec<String>, String> {
 /// tap-qualified name the install receipts must name that tap: a keg from another tap is another
 /// owner, and a receipt that cannot be read fails closed. A bare name accepts any tap.
 fn brew_probe(runner: &Runner, pkg: &str) -> PackageState {
+    match brew_listing(runner, pkg) {
+        Ok(v) if v.is_empty() => PackageState::Missing(Vec::new()),
+        Ok(v) => PackageState::Installed(v.join(" ")),
+        Err(s) => s,
+    }
+}
+
+fn brew_listing(runner: &Runner, pkg: &str) -> Result<Vec<String>, PackageState> {
     let (cellar, caskroom) = match brew_roots(runner) {
         Ok(r) => r,
-        Err(why) => return PackageState::Unknown(why),
+        Err(why) => return Err(PackageState::Unknown(why)),
     };
     let short = pkg.rsplit('/').next().unwrap_or(pkg);
     let tap = pkg.rsplit_once('/').map(|(t, _)| t.to_ascii_lowercase());
@@ -234,26 +242,26 @@ fn brew_probe(runner: &Runner, pkg: &str) -> PackageState {
                 );
                 versions.extend(v);
             }
-            Err(why) => return PackageState::Unknown(why),
+            Err(why) => return Err(PackageState::Unknown(why)),
         }
     }
     if versions.is_empty() {
-        return PackageState::Missing(Vec::new());
+        return Ok(versions);
     }
     if let Some(want) = &tap {
         for r in &receipts {
             match receipt_tap(r) {
                 Ok(t) if t == *want => {}
                 Ok(t) => {
-                    return PackageState::OtherOwner(format!(
+                    return Err(PackageState::OtherOwner(format!(
                         "{short} is installed from the tap {t}, not from {want}"
-                    ));
+                    )));
                 }
-                Err(why) => return PackageState::Unknown(why),
+                Err(why) => return Err(PackageState::Unknown(why)),
             }
         }
     }
-    PackageState::Installed(versions.join(" "))
+    Ok(versions)
 }
 
 /// The official taps: a package named in one is written by its short name in a Brewfile.
@@ -1476,59 +1484,128 @@ pub(crate) fn install_env(
     )
 }
 
-/// Uninstalls one package through its provider (`purge`, docs/purge.md): every installed
-/// version, without `--ignore-dependencies`, `--zap` or `autoremove`. Homebrew refuses a formula
-/// that another installed formula needs; that refusal is an error here and the caller decides.
-/// The caller probes again afterwards.
-pub fn uninstall(runner: &Runner, adapter: &str, value: &Value) -> Result<(), Refusal> {
-    let pkg = name(value)?;
+/// Pin the provider namespace before installation so a later purge can inspect the same rack.
+pub fn trial_selector(runner: &Runner, adapter: &str, pkg: &str) -> Result<String, Refusal> {
+    if adapter == MISE {
+        return Ok(pkg.into());
+    }
+    match brew_official(runner, pkg).map_err(|e| Refusal::new(Code::ProbeFailed, e))? {
+        Some(Official::Formula(n)) => Ok(core(&n)),
+        Some(Official::Cask(n)) => Ok(format!("homebrew/cask/{n}")),
+        None => Err(Refusal::new(
+            Code::SourceUntrusted,
+            format!("{pkg} has no official Homebrew identity"),
+        )),
+    }
+}
+
+pub fn trial_versions(
+    runner: &Runner,
+    adapter: &str,
+    selector: &str,
+) -> Result<Vec<String>, Refusal> {
+    if !valid_name(selector) {
+        return Err(Refusal::new(
+            Code::StateInvalid,
+            "invalid trial package selector",
+        ));
+    }
+    let mut versions = match adapter {
+        HOMEBREW
+            if selector.starts_with("homebrew/core/") || selector.starts_with("homebrew/cask/") =>
+        {
+            brew_listing(runner, selector)
+        }
+        MISE => mise_listing(runner, selector).map(|mut versions| {
+            let (_, want) = tool_and_version(selector);
+            versions.retain(|v| version_matches(v, want));
+            versions
+        }),
+        _ => {
+            return Err(Refusal::new(
+                Code::StateInvalid,
+                "unsupported trial provider or package identity",
+            ));
+        }
+    }
+    .map_err(|s| {
+        Refusal::new(
+            Code::ProbeFailed,
+            format!("{adapter} cannot list {selector}: {}", s.state()),
+        )
+    })?;
+    versions.sort();
+    versions.dedup();
+    Ok(versions)
+}
+
+/// A floating provider label cannot identify one installed version for purge.
+pub fn removable_trial_version(adapter: &str, version: &str) -> bool {
+    match adapter {
+        MISE => {
+            version.as_bytes().first().is_some_and(u8::is_ascii_digit)
+                && version
+                    .bytes()
+                    .all(|c| c.is_ascii_alphanumeric() || b"._-+".contains(&c))
+        }
+        HOMEBREW => {
+            !version.eq_ignore_ascii_case("latest") && !version.eq_ignore_ascii_case("head")
+        }
+        _ => false,
+    }
+}
+
+pub fn uninstall_version(
+    runner: &Runner,
+    adapter: &str,
+    selector: &str,
+    version: &str,
+) -> Result<(), Refusal> {
     let (program, args, env) = match adapter {
         HOMEBREW => {
-            let off = brew_official(runner, &pkg)
-                .map_err(|why| Refusal::new(Code::ProbeFailed, why))?
-                .ok_or_else(|| {
-                    Refusal::new(
-                        Code::SourceUntrusted,
-                        format!("{pkg} is not an official Homebrew formula or cask"),
-                    )
-                })?;
-            let args = match off {
-                // `--force` removes every installed keg, not only the latest one.
-                Official::Formula(n) => {
-                    vec!["uninstall".into(), "--formula".into(), "--force".into(), n]
+            let (tap, n) = selector
+                .rsplit_once('/')
+                .ok_or_else(|| Refusal::new(Code::StateInvalid, "missing Homebrew namespace"))?;
+            let kind = match tap {
+                "homebrew/core" => "--formula",
+                "homebrew/cask" => "--cask",
+                _ => {
+                    return Err(Refusal::new(
+                        Code::StateInvalid,
+                        "invalid Homebrew namespace",
+                    ));
                 }
-                Official::Cask(n) => vec!["uninstall".into(), "--cask".into(), n],
             };
-            ("brew", args, brew_env())
+            if !valid_name(n) {
+                return Err(Refusal::new(
+                    Code::StateInvalid,
+                    "invalid Homebrew package name",
+                ));
+            }
+            (
+                "brew",
+                vec!["uninstall".into(), kind.into(), selector.into()],
+                brew_env(),
+            )
         }
         MISE => {
-            let (tool, want) = tool_and_version(&pkg);
-            let args = if want.is_empty() {
-                vec!["uninstall".to_string(), "--all".into(), tool.into()]
-            } else {
-                // A pinned trial removes only the versions its pin matches: another version of
-                // the tool can predate the trial (`node@20` beside a trial of `node@22`).
-                let mut args = vec!["uninstall".to_string()];
-                args.extend(
-                    mise_listing(runner, &pkg)
-                        .map_err(|s| {
-                            Refusal::new(Code::ProbeFailed, format!("{pkg}: {}", s.state()))
-                        })?
-                        .iter()
-                        .filter(|v| version_matches(v, want))
-                        .map(|v| format!("{tool}@{v}")),
-                );
-                if args.len() == 1 {
-                    return Ok(());
-                }
-                args
-            };
-            ("mise", args, mise_env())
+            let tool = tool_and_version(selector).0;
+            if !valid_name(tool) || !removable_trial_version(adapter, version) {
+                return Err(Refusal::new(
+                    Code::StateInvalid,
+                    "cannot uninstall a non-versioned mise selector",
+                ));
+            }
+            (
+                "mise",
+                vec!["uninstall".into(), format!("{tool}@{version}")],
+                mise_env(),
+            )
         }
         _ => {
             return Err(Refusal::new(
-                Code::PrivilegeUnsupported,
-                format!("{adapter} cannot uninstall {pkg}"),
+                Code::StateInvalid,
+                "unsupported trial package provider",
             ));
         }
     };
@@ -1537,7 +1614,7 @@ pub fn uninstall(runner: &Runner, adapter: &str, value: &Value) -> Result<(), Re
         program,
         &args,
         &env,
-        &format!("{program} uninstall {pkg}"),
+        &format!("{program} uninstall {selector}"),
     )
 }
 
@@ -1552,12 +1629,8 @@ pub fn uninstall_formulae(runner: &Runner, names: &[String]) -> Result<(), Refus
             format!("{n} is not a formula name"),
         ));
     }
-    let mut args = vec![
-        "uninstall".to_string(),
-        "--formula".into(),
-        "--force".into(),
-    ];
-    args.extend(names.iter().cloned());
+    let mut args = vec!["uninstall".to_string(), "--formula".into()];
+    args.extend(names.iter().map(|name| core(name)));
     let what = format!("brew uninstall {}", names.join(" "));
     let out = runner.run(&request("brew", &args, &brew_env(), INSTALL_TIMEOUT))?;
     if matches!(out.end, End::Exited(c) if c != 0)
@@ -1587,29 +1660,6 @@ pub fn uninstall_formulae(runner: &Runner, names: &[String]) -> Result<(), Refus
         )),
         End::Stopped(r) => Err(r),
     }
-}
-
-/// Whether the provider itself lists the package (`purge`): the provider's listing only, without
-/// the owner check, the official-name check or the dependency listing that plan a missing
-/// install. `Installed`, `Missing` or `Unknown`.
-pub fn listed(runner: &Runner, adapter: &str, value: &Value) -> Result<PackageState, Refusal> {
-    let pkg = name(value)?;
-    Ok(match adapter {
-        HOMEBREW => brew_probe(runner, &pkg),
-        MISE => match mise_listing(runner, &pkg) {
-            Ok(v) => {
-                let (_, want) = tool_and_version(&pkg);
-                let v: Vec<String> = v.into_iter().filter(|v| version_matches(v, want)).collect();
-                if v.is_empty() {
-                    PackageState::Missing(Vec::new())
-                } else {
-                    PackageState::Installed(v.join(", "))
-                }
-            }
-            Err(s) => s,
-        },
-        other => PackageState::Unknown(format!("{other} has no listing purge can read")),
-    })
 }
 
 /// The rolling-update view of one installed package (docs/toolchains.md): the probe, then for

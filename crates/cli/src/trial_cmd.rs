@@ -17,8 +17,8 @@ use dfm_model::resolve::{Table, Value};
 use dfm_model::state::{
     Approval, Baseline, BaselinePath, BinaryId, Class, JournalEntry, MAX_BYTES, OperationRecord,
     Phase, ProfileRef, Receipt, Recovery, RunResult, SCHEMA, SHELLS, Stamp, Status,
-    TRIAL_SCHEMA_DATA, TrialInstall, TrialPackage, TrialRecord, count_statuses, rfc3339, valid_id,
-    valid_path,
+    TRIAL_SCHEMA_DATA, TRIAL_SCHEMA_VERSIONS, TrialInstall, TrialPackage, TrialRecord,
+    TrialVersions, count_statuses, rfc3339, valid_id, valid_path,
 };
 use dfm_model::{Code, Exit, Refusal};
 use serde_json::json;
@@ -280,7 +280,9 @@ impl Decision {
 
     fn record(&self, created: u64, op_id: &str) -> TrialRecord {
         TrialRecord {
-            schema: if self.data.is_empty() {
+            schema: if self.install.is_some() {
+                TRIAL_SCHEMA_VERSIONS
+            } else if self.data.is_empty() {
                 SCHEMA
             } else {
                 TRIAL_SCHEMA_DATA
@@ -302,6 +304,7 @@ impl Decision {
                 install: self.install.as_ref().map(|deps| TrialInstall {
                     op_id: op_id.into(),
                     dependencies: deps.clone(),
+                    verified: None,
                 }),
             }),
             unknown: UNKNOWN.iter().map(|u| u.to_string()).collect(),
@@ -573,6 +576,34 @@ pub(super) fn candidates(
     Ok(out)
 }
 
+/// Each package was missing before this install. Ambiguous results cannot authorize removal.
+fn installed_versions(
+    runner: &Runner,
+    adapter: &str,
+    selector: String,
+    deps: &[String],
+) -> Result<TrialVersions, Refusal> {
+    let one = |name: &str| {
+        let listed = package::trial_versions(runner, adapter, name)?;
+        if let [version] = listed.as_slice() {
+            return Ok(version.clone());
+        }
+        Err(signal::requested().unwrap_or_else(|| Refusal::new(
+            Code::IoFailed, format!("postcondition failed: {adapter} lists {} versions for {name}; the install needs one exact version", listed.len())
+        )))
+    };
+    let version = one(&selector)?;
+    let dependencies = deps
+        .iter()
+        .map(|d| one(&format!("homebrew/core/{d}")).map(|v| (d.clone(), v)))
+        .collect::<Result<_, _>>()?;
+    Ok(TrialVersions {
+        selector,
+        version,
+        dependencies,
+    })
+}
+
 pub fn run(ctx: &Ctx, args: &Args, out: &mut dyn Write) -> Result<(), Refusal> {
     if let Some(s) = &args.script {
         return script::run(ctx, args, s, out);
@@ -711,7 +742,8 @@ pub fn run(ctx: &Ctx, args: &Args, out: &mut dyn Write) -> Result<(), Refusal> {
     // The baseline is durable before the provider changes anything (C02). The create is
     // exclusive, so a record another run wrote since the check above is a conflict, not
     // replaced.
-    if !store.create_trial(&locked.record(started, &op_id))? {
+    let mut record = locked.record(started, &op_id);
+    if !store.create_trial(&record)? {
         return Err(store.stamp(conflict()));
     }
 
@@ -719,8 +751,8 @@ pub fn run(ctx: &Ctx, args: &Args, out: &mut dyn Write) -> Result<(), Refusal> {
     // a result line; a refusal is after a mutation, so it exits 1.
     let mut status = Status::Current;
     let mut stopped: Option<Refusal> = None;
-    if locked.install.is_some() {
-        let value = package_value(&package);
+    let mut after = None;
+    if let Some(deps) = &locked.install {
         let journal = |phase, recovery, reason| -> Result<(), Refusal> {
             store.append_journal(&JournalEntry {
                 schema: SCHEMA,
@@ -748,27 +780,32 @@ pub fn run(ctx: &Ctx, args: &Args, out: &mut dyn Write) -> Result<(), Refusal> {
         // The install and its postcondition, as `try_install` in the engine runs them for a
         // package (crates/engine/src/apply.rs).
         let result = intent.and_then(|()| {
-            fail.hit("trial-after-intent")
-                .and_then(|()| package::install(&runner, locked.adapter_name(), &value))
-                .and_then(|()| {
-                    match (
-                        package::probe(&runner, locked.adapter_name(), &value)?,
-                        signal::requested(),
-                    ) {
-                        (PackageState::Installed(_), _) => Ok(()),
-                        (_, Some(stop)) => Err(Refusal::new(
-                            stop.code,
-                            "stopped before the postcondition was checked; the install may have completed, and the next trial for this tool is refused until this one is purged",
-                        )),
-                        (s, None) => Err(Refusal::new(
-                            Code::IoFailed,
-                            format!(
-                                "postcondition failed: the provider reports {} after the install",
-                                s.state()
-                            ),
-                        )),
-                    }
-                })
+            let adapter = locked.adapter_name();
+            let selector = package::trial_selector(&runner, adapter, &package)?;
+            fail.hit("trial-after-intent")?;
+            for name in std::iter::once(selector.clone())
+                .chain(deps.iter().map(|d| format!("homebrew/core/{d}")))
+            {
+                if !package::trial_versions(&runner, adapter, &name)?.is_empty() {
+                    return Err(Refusal::new(
+                        Code::PlanStale,
+                        format!("{name} appeared before the install; its ownership is unknown"),
+                    ));
+                }
+            }
+            package::install(&runner, adapter, &package_value(&selector))?;
+            let versions = installed_versions(&runner, adapter, selector, deps)?;
+            after = Some(versions.fingerprint()?);
+            let install = record
+                .package
+                .as_mut()
+                .and_then(|p| p.install.as_mut())
+                .ok_or_else(|| {
+                    Refusal::new(Code::StateInvalid, "trial install record is missing")
+                })?;
+            install.verified = Some(versions);
+            store
+                .write_trial(&record)
                 // An effect whose outcome entry cannot be written is a failed operation, as
                 // the engine records it; the text names both causes.
                 .and_then(|()| {
@@ -816,6 +853,7 @@ pub fn run(ctx: &Ctx, args: &Args, out: &mut dyn Write) -> Result<(), Refusal> {
             stamp,
             digest,
             note: None,
+            after,
         },
         out,
     )
@@ -835,6 +873,7 @@ pub(super) struct Outcome<'a> {
     pub digest: String,
     /// One more line, written after the receipt so an output error cannot prevent it.
     pub note: Option<String>,
+    pub after: Option<dfm_model::state::Fingerprint>,
 }
 
 /// The receipt and the result lines of a trial whose record exists, shared by the package and
@@ -858,6 +897,7 @@ pub(super) fn conclude(
         stamp,
         digest,
         note,
+        after,
     } = o;
     let file = format!("{trial_id}.json");
     let finished = now_ns().unwrap_or(started);
@@ -874,7 +914,7 @@ pub(super) fn conclude(
         started_at: Some(rfc3339(started)),
         finished_at: Some(rfc3339(finished)),
         before: None,
-        after: None,
+        after,
         owned_outputs: vec![],
         error: error.clone(),
         reload: None,

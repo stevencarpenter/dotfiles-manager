@@ -1071,6 +1071,26 @@ pub struct Baseline {
 pub struct TrialInstall {
     pub op_id: String,
     pub dependencies: Vec<String>,
+    /// Absent before the install postcondition, and in records from older binaries.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verified: Option<TrialVersions>,
+}
+
+/// The provider identity and exact versions confirmed after an initially missing install.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TrialVersions {
+    pub selector: String,
+    pub version: String,
+    pub dependencies: BTreeMap<String, String>,
+}
+
+impl TrialVersions {
+    pub fn fingerprint(&self) -> Result<Fingerprint, Refusal> {
+        Ok(Fingerprint {
+            fingerprint: crate::digest::sha256_hex(&canonical(self)?),
+        })
+    }
 }
 
 /// The provider a trial asked and the package as that provider names it (DFM-32).
@@ -1101,6 +1121,8 @@ pub const TRIAL_SCHEMA_SCRIPT: i64 = 5;
 /// before the fence reports it as newer instead of failing on the key; a script record without
 /// a fence stays at [`TRIAL_SCHEMA_SCRIPT`].
 pub const TRIAL_SCHEMA_FENCE: i64 = 6;
+/// A new package install starts at this schema even before its version evidence is available.
+pub const TRIAL_SCHEMA_VERSIONS: i64 = 7;
 
 /// Shells a script trial can run the downloaded script with.
 pub const SHELLS: [&str; 3] = ["sh", "bash", "zsh"];
@@ -1305,6 +1327,7 @@ impl TrialRecord {
                 TRIAL_SCHEMA_DATA,
                 TRIAL_SCHEMA_SCRIPT,
                 TRIAL_SCHEMA_FENCE,
+                TRIAL_SCHEMA_VERSIONS,
             ],
         )?;
         t.validate()?;
@@ -1322,9 +1345,13 @@ impl TrialRecord {
             .adopted
             .as_ref()
             .is_none_or(|a| valid_id(&a.op_id) && valid_id(&a.module));
+        let install = self.package.as_ref().and_then(|p| p.install.as_ref());
+        let versioned =
+            install.is_some_and(|i| i.verified.is_some()) || self.schema == TRIAL_SCHEMA_VERSIONS;
         let expected = match (&self.script, self.baseline.data.is_empty(), &self.adopted) {
             (Some(s), _, _) if s.fence.is_some() => TRIAL_SCHEMA_FENCE,
             (Some(_), _, _) => TRIAL_SCHEMA_SCRIPT,
+            (None, _, _) if versioned && install.is_some() => TRIAL_SCHEMA_VERSIONS,
             (None, false, _) => TRIAL_SCHEMA_DATA,
             (None, true, None) => SCHEMA,
             (None, true, Some(_)) => TRIAL_SCHEMA_ADOPTED,
@@ -1360,10 +1387,19 @@ impl TrialRecord {
             sc.validate()?;
         }
         if let Some(p) = &self.package {
-            let install_ok = p
-                .install
-                .as_ref()
-                .is_none_or(|i| valid_id(&i.op_id) && i.dependencies.iter().all(|d| plain(d)));
+            let install_ok = p.install.as_ref().is_none_or(|i| {
+                valid_id(&i.op_id)
+                    && i.dependencies.iter().all(|d| plain(d))
+                    && i.verified.as_ref().is_none_or(|v| {
+                        self.script.is_none()
+                            && plain(&v.selector)
+                            && plain(&v.version)
+                            && v.dependencies.len() == i.dependencies.len()
+                            && i.dependencies
+                                .iter()
+                                .all(|d| v.dependencies.get(d).is_some_and(|v| plain(v)))
+                    })
+            });
             if !plain(&p.adapter) || !plain(&p.name) || !install_ok {
                 return Err(bad("trial package is malformed"));
             }
@@ -1527,11 +1563,17 @@ impl TrialRecord {
             .package
             .iter()
             .flat_map(|p| {
-                [&p.adapter, &p.name].into_iter().chain(
-                    p.install
-                        .iter()
-                        .flat_map(|i| std::iter::once(&i.op_id).chain(&i.dependencies)),
-                )
+                [&p.adapter, &p.name]
+                    .into_iter()
+                    .chain(p.install.iter().flat_map(|i| {
+                        std::iter::once(&i.op_id).chain(&i.dependencies).chain(
+                            i.verified.iter().flat_map(|v| {
+                                [&v.selector, &v.version]
+                                    .into_iter()
+                                    .chain(v.dependencies.values())
+                            }),
+                        )
+                    }))
             })
             .chain(self.baseline.owners.iter())
             .chain(self.unknown.iter());
@@ -2333,6 +2375,7 @@ mod tests {
             install: Some(TrialInstall {
                 op_id: "trial-1-2".into(),
                 dependencies: vec!["libsodium".into()],
+                verified: None,
             }),
         });
         with.unknown = vec!["services".into()];
@@ -2405,7 +2448,7 @@ mod tests {
             let e = TrialRecord::parse(format!("{{\"schema\":{n}}}").as_bytes()).unwrap_err();
             assert_eq!(e.code, code, "{n}");
             assert!(
-                e.detail.ends_with("(supported: 2, 3, 4, 5, 6)"),
+                e.detail.ends_with("(supported: 2, 3, 4, 5, 6, 7)"),
                 "{n}: {}",
                 e.detail
             );
@@ -2420,10 +2463,10 @@ mod tests {
             assert!(b.validate().is_err(), "module {bad:?}");
         }
 
-        // A schema above 6 is newer.
+        // A schema above 7 is newer.
         let newer = String::from_utf8(canonical(&t).unwrap())
             .unwrap()
-            .replace("\"schema\":3", "\"schema\":7");
+            .replace("\"schema\":3", "\"schema\":8");
         assert_eq!(
             TrialRecord::parse(newer.as_bytes()).unwrap_err().code,
             Code::StateNewer
@@ -2723,9 +2766,9 @@ mod tests {
     }
 
     #[test]
-    fn a_schema_7_record_is_newer() {
+    fn a_schema_8_record_is_newer() {
         let mut v: serde_json::Value = serde_json::to_value(sample_trial()).unwrap();
-        v["schema"] = 7.into();
+        v["schema"] = 8.into();
         assert_eq!(
             TrialRecord::parse(&serde_json::to_vec(&v).unwrap())
                 .unwrap_err()

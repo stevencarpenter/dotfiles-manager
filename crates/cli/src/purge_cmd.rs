@@ -16,8 +16,7 @@ use dfm_engine::{Runner, Store, now_ns, signal};
 use dfm_model::digest::sha256_hex;
 use dfm_model::display::{bounded_visible, visible};
 use dfm_model::fold::{eq as same_path, fold};
-use dfm_model::plan::{Binary, PackageState, file_fingerprint};
-use dfm_model::resolve::{Table, Value};
+use dfm_model::plan::{Binary, file_fingerprint};
 use dfm_model::state::{
     Approval, BaselinePath, BinaryId, Class, InodeFence, JournalEntry, MAX_BYTES, OperationRecord,
     Phase, ProfileRef, Receipt, Recovery, RecoveryOutput, RunResult, SCHEMA, Stamp, Status,
@@ -109,8 +108,8 @@ struct Decision {
     trial_id: String,
     tool: String,
     /// The provider and the package, when the record names one, with the step for it.
-    package: Option<(String, String, Step)>,
-    deps: Vec<(String, Step)>,
+    package: Option<(String, PackageItem)>,
+    deps: Vec<PackageItem>,
     paths: Vec<PathItem>,
     /// What a script trial's window saw and purge never removes, one line each.
     retained: Vec<String>,
@@ -143,8 +142,8 @@ impl Decision {
         let doc = json!({
             "trial_id": self.trial_id,
             "tool": self.tool,
-            "package": self.package.as_ref().map(|(a, n, s)| json!({"adapter": a, "name": n, "step": step_json(s)})),
-            "deps": self.deps.iter().map(|(n, s)| json!({"name": n, "step": step_json(s)})).collect::<Vec<_>>(),
+            "package": self.package.as_ref().map(|(a, item)| json!({"adapter": a, "item": item.json()})),
+            "deps": self.deps.iter().map(PackageItem::json).collect::<Vec<_>>(),
             "paths": self.paths.iter().map(|p| json!({"path": p.path, "now": now(&p.now), "step": step_json(&p.step)})).collect::<Vec<_>>(),
             "retained": self.retained,
             "unknown": self.unknown,
@@ -169,17 +168,10 @@ impl Decision {
                 visible(url)
             )?,
             (None, None) => writeln!(out, "package: none recorded; the trial installed nothing")?,
-            (Some((a, n, s)), _) => line(out, &format!("uninstall {a} {}", visible(n)), s)?,
+            (Some((a, item)), _) => item.print(out, &format!("uninstall {a}"))?,
         }
-        for (n, s) in &self.deps {
-            line(
-                out,
-                &format!(
-                    "uninstall dependency {HOMEBREW} {} (kept if an installed formula needs it)",
-                    visible(n)
-                ),
-                s,
-            )?;
+        for item in &self.deps {
+            item.print(out, &format!("uninstall dependency {HOMEBREW}"))?;
         }
         for p in &self.paths {
             if let (Now::Link(t), Step::Keep(why)) = (&p.now, &p.step) {
@@ -242,29 +234,112 @@ fn same_package(adapter: &str, a: &str, b: &str) -> bool {
     }
 }
 
-fn package_value(name: &str) -> Value {
-    let mut t = Table::new();
-    t.insert("name".into(), Value::String(name.into()));
-    // The adapters require a policy; purge never updates, so `hold` is the neutral one.
-    t.insert("update_policy".into(), Value::String("hold".into()));
-    Value::Table(t)
+/// The version the successful trial installed and every matching version observed for this plan.
+struct VersionEvidence {
+    selector: String,
+    version: String,
+    installed: Vec<String>,
 }
 
-/// The probe answer as a step. A probe that cannot answer refuses the whole purge: removing the
-/// record then would lose the only evidence of what the trial installed.
-/// Only the provider's own listing is asked: the install-planning checks of `probe` (another
-/// owner, the official name, the dependencies) do not answer "is it installed".
-fn probe_step(runner: &Runner, adapter: &str, name: &str) -> Result<Step, Refusal> {
-    match package::listed(runner, adapter, &package_value(name))? {
-        PackageState::Installed(_) => Ok(Step::Do),
-        PackageState::Missing(_) => Ok(Step::Absent),
-        PackageState::Unknown(why) => Err(Refusal::new(
-            Code::ProbeFailed,
-            format!(
-                "{adapter} cannot say whether {name} is installed ({why}); nothing was changed"
-            ),
-        )),
-        s => Ok(Step::Keep(format!("{adapter} reports {}", s.state()))),
+struct PackageItem {
+    name: String,
+    step: Step,
+    evidence: Option<VersionEvidence>,
+}
+
+impl PackageItem {
+    fn keep(name: &str, why: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            step: Step::Keep(why.into()),
+            evidence: None,
+        }
+    }
+
+    fn probe(
+        runner: &Runner,
+        adapter: &str,
+        name: &str,
+        selector: &str,
+        version: &str,
+    ) -> Result<Self, Refusal> {
+        let installed = package::trial_versions(runner, adapter, selector)?;
+        let step = if installed.is_empty() {
+            Step::Absent
+        } else if !package::removable_trial_version(adapter, version) {
+            Step::Keep("the provider supplied no exact removable version".into())
+        } else if !installed.iter().any(|v| v == version) {
+            Step::Keep("the trial's exact installed version is gone".into())
+        } else if adapter == HOMEBREW && installed.len() != 1 {
+            Step::Keep("Homebrew has other installed versions".into())
+        } else {
+            Step::Do
+        };
+        Ok(Self {
+            name: name.into(),
+            step,
+            evidence: Some(VersionEvidence {
+                selector: selector.into(),
+                version: version.into(),
+                installed,
+            }),
+        })
+    }
+
+    fn json(&self) -> serde_json::Value {
+        json!({"name": self.name, "step": step_json(&self.step), "versions": self.evidence.as_ref().map(|v| json!({"selector": v.selector, "trial_version": v.version, "installed": v.installed}))})
+    }
+
+    fn print(&self, out: &mut dyn Write, action: &str) -> std::io::Result<()> {
+        let mut what = format!("{action} {}", visible(&self.name));
+        if let Some(e) = &self.evidence {
+            what.push_str(&format!(
+                " (trial version {}; installed: {})",
+                visible(&e.version),
+                visible(&e.installed.join(", "))
+            ));
+        }
+        line(out, &what, &self.step)
+    }
+
+    fn check_before(&self, runner: &Runner, adapter: &str) -> Result<&VersionEvidence, Refusal> {
+        let e = self
+            .evidence
+            .as_ref()
+            .ok_or_else(|| Refusal::new(Code::StateInvalid, "uninstall lacks verified versions"))?;
+        if package::trial_versions(runner, adapter, &e.selector)? != e.installed {
+            return Err(Refusal::new(
+                Code::PlanStale,
+                format!(
+                    "the installed versions of {} changed after approval",
+                    self.name
+                ),
+            ));
+        }
+        Ok(e)
+    }
+
+    fn check_after(&self, runner: &Runner, adapter: &str) -> Result<(), Refusal> {
+        let e = self
+            .evidence
+            .as_ref()
+            .ok_or_else(|| Refusal::new(Code::StateInvalid, "uninstall lacks verified versions"))?;
+        let remaining: Vec<_> = e
+            .installed
+            .iter()
+            .filter(|v| **v != e.version)
+            .cloned()
+            .collect();
+        if package::trial_versions(runner, adapter, &e.selector)? != remaining {
+            return Err(Refusal::new(
+                Code::IoFailed,
+                format!(
+                    "postcondition failed: {} has unexpected versions after uninstall",
+                    self.name
+                ),
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -1247,7 +1322,8 @@ pub fn run(ctx: &Ctx, args: &Args, out: &mut dyn Write) -> Result<(), Refusal> {
         // Another trial's record that cannot be read could name the same package or path, so
         // nothing is decided without it.
         let mut others = Vec::new();
-        for (n, r) in store.load().trials {
+        let loaded = store.load();
+        for (n, r) in loaded.trials {
             match r {
                 Ok(o) if o.is_active() && o.trial_id != t.trial_id => others.push(o),
                 Ok(_) => {}
@@ -1340,30 +1416,77 @@ pub fn run(ctx: &Ctx, args: &Args, out: &mut dyn Write) -> Result<(), Refusal> {
         let package = match &t.package {
             None => None,
             Some(p) => {
-                let step = if t.baseline.tool_preexisting || p.install.is_none() {
-                    Step::Keep(format!(
-                        "existed before the trial ({})",
-                        t.baseline.owners.join("; ")
-                    ))
-                } else if let Some(o) = used_by(&p.adapter, &p.name) {
-                    Step::Keep(format!("trial {o} also uses it"))
-                } else {
-                    probe_step(&runner, &p.adapter, &p.name)?
+                let install = p.install.as_ref();
+                let verified = match install.and_then(|i| i.verified.as_ref().map(|v| (i, v))) {
+                    Some((i, versions)) => {
+                        let digest = versions.fingerprint()?;
+                        let confirmed = loaded
+                            .receipts
+                            .iter()
+                            .filter_map(|(_, r)| r.as_ref().ok())
+                            .any(|r| {
+                                r.op_id == i.op_id
+                                    && r.command == "trial"
+                                    && r.stamp() == t.binding
+                                    && r.result.exit_code == 0
+                                    && r.operations.iter().any(|o| {
+                                        o.id == i.op_id
+                                            && o.adapter == p.adapter
+                                            && o.resource == t.trial_id
+                                            && o.status == Status::Updated
+                                            && o.after.as_ref() == Some(&digest)
+                                    })
+                            });
+                        confirmed.then_some(versions)
+                    }
+                    None => None,
                 };
-                if p.adapter == HOMEBREW
-                    && matches!(step, Step::Do | Step::Absent)
-                    && let Some(i) = &p.install
-                {
+                let item = if t.baseline.tool_preexisting || install.is_none() {
+                    PackageItem::keep(
+                        &p.name,
+                        format!(
+                            "existed before the trial ({})",
+                            t.baseline.owners.join("; ")
+                        ),
+                    )
+                } else if let Some(o) = used_by(&p.adapter, &p.name) {
+                    PackageItem::keep(&p.name, format!("trial {o} also uses it"))
+                } else if let Some(v) = verified {
+                    if !same_package(&p.adapter, &v.selector, &p.name) {
+                        return Err(Refusal::new(
+                            Code::StateInvalid,
+                            "the verified install belongs to a different trial package",
+                        ));
+                    }
+                    PackageItem::probe(&runner, &p.adapter, &p.name, &v.selector, &v.version)?
+                } else {
+                    PackageItem::keep(
+                        &p.name,
+                        "no verified install versions and successful trial receipt",
+                    )
+                };
+                if let Some(i) = install {
                     for d in &i.dependencies {
                         stop()?;
-                        let s = match used_by(HOMEBREW, d) {
-                            Some(o) => Step::Keep(format!("trial {o} also uses it")),
-                            None => probe_step(&runner, HOMEBREW, d)?,
+                        let dep = if !matches!(item.step, Step::Do | Step::Absent) {
+                            PackageItem::keep(d, "the trial package is retained")
+                        } else if let Some(o) = used_by(HOMEBREW, d) {
+                            PackageItem::keep(d, format!("trial {o} also uses it"))
+                        } else if let Some(v) = verified.and_then(|v| v.dependencies.get(d)) {
+                            PackageItem::probe(
+                                &runner,
+                                HOMEBREW,
+                                d,
+                                &format!("homebrew/core/{d}"),
+                                v,
+                            )?
+                        } else {
+                            PackageItem::keep(d, "no verified dependency version")
                         };
-                        deps.push((d.clone(), s));
+                        deps.push(dep);
                     }
                 }
-                Some((p.adapter.clone(), p.name.clone(), step))
+                Some((p.adapter.clone(), item))
             }
         };
         // Paths a module owns are never removed, even if the trial saw them absent.
@@ -1706,44 +1829,46 @@ pub fn run(ctx: &Ctx, args: &Args, out: &mut dyn Write) -> Result<(), Refusal> {
     };
 
     let journaled = (|| -> Result<(), Refusal> {
-        if let Some((adapter, name, Step::Do)) = &locked.package {
-            let failed = act("uninstall", adapter, name, vec![], false, &|| {
-                package::uninstall(&runner, adapter, &package_value(name))?;
-                match package::listed(&runner, adapter, &package_value(name))? {
-                    PackageState::Missing(_) => Ok(()),
-                    s => Err(Refusal::new(
-                        Code::IoFailed,
-                        format!(
-                            "postcondition failed: {adapter} reports {} after the uninstall",
-                            s.state()
-                        ),
-                    )),
-                }
+        if let Some((adapter, item)) = &locked.package
+            && item.step == Step::Do
+        {
+            let failed = act("uninstall", adapter, &item.name, vec![], false, &|| {
+                let e = item.check_before(&runner, adapter)?;
+                package::uninstall_version(&runner, adapter, &e.selector, &e.version)?;
+                item.check_after(&runner, adapter)
             })?;
             if failed.is_some() {
-                // Nothing else runs: the dependencies and the files stay while the package
-                // that uses them may still be there.
                 return Ok(());
             }
         }
-        // One brew call for every dependency: brew checks dependents against the whole set, so
-        // a dependency of a dependency goes in the same call. When brew refuses, each one is
-        // tried alone once and a refusal keeps it (an installed formula still needs it).
-        let deps: Vec<String> = locked
-            .deps
-            .iter()
-            .filter(|(_, s)| *s == Step::Do)
-            .map(|(n, _)| n.clone())
-            .collect();
+        // Brew checks dependents against the whole set. A refusal keeps each dependency
+        // another installed formula still needs.
+        let deps: Vec<_> = locked.deps.iter().filter(|d| d.step == Step::Do).collect();
+        let remove_deps = |items: &[&PackageItem]| {
+            let mut names = Vec::new();
+            for item in items {
+                item.check_before(&runner, HOMEBREW)?;
+                names.push(item.name.clone());
+            }
+            package::uninstall_formulae(&runner, &names)?;
+            for item in items {
+                item.check_after(&runner, HOMEBREW)?;
+            }
+            Ok(())
+        };
         if !deps.is_empty() {
-            let all = deps.join(" ");
-            let failed = act("uninstall", HOMEBREW, &all, vec![], true, &|| {
-                package::uninstall_formulae(&runner, &deps)
+            let names = deps
+                .iter()
+                .map(|d| d.name.as_str())
+                .collect::<Vec<_>>()
+                .join(" ");
+            let failed = act("uninstall", HOMEBREW, &names, vec![], true, &|| {
+                remove_deps(&deps)
             })?;
             if failed == Some(Code::Conflict) {
-                for n in &deps {
-                    act("uninstall", HOMEBREW, n, vec![], true, &|| {
-                        package::uninstall_formulae(&runner, std::slice::from_ref(n))
+                for item in &deps {
+                    act("uninstall", HOMEBREW, &item.name, vec![], true, &|| {
+                        remove_deps(std::slice::from_ref(item))
                     })?;
                 }
             }

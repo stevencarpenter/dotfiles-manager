@@ -451,7 +451,7 @@ fn the_four_workflows_run_together_in_one_isolated_home() {
         out(&o)
     );
     assert!(
-        w.log().contains("mise uninstall --all duckdb"),
+        w.log().contains("mise uninstall duckdb@2.0.0"),
         "{}",
         w.log()
     );

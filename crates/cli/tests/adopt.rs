@@ -311,8 +311,8 @@ fn adopts_the_tuicr_shape() {
     );
     // The trial ended.
     let r = fx.record();
-    // Schema 4: the record carries data paths (docs/trial.md).
-    assert_eq!(r["schema"], 4);
+    // Adoption preserves the verified install versions.
+    assert_eq!(r["schema"], 7);
     assert_eq!(r["adopted"]["module"], "core");
     // The receipt.
     let receipts = fx.entries("receipts");
@@ -1101,7 +1101,7 @@ impl Fx {
         let r = self.record();
         assert_eq!(
             (r["schema"].as_i64(), r["adopted"]["module"].as_str()),
-            (Some(4), Some("core"))
+            (Some(7), Some("core"))
         );
         let last = self
             .adopt_journal()

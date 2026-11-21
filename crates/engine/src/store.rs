@@ -1096,8 +1096,8 @@ impl Store {
                 format!("trial {trial_id} is already adopted"),
             ));
         }
-        // A script record keeps its own schema (5 or 6): `validate` expects it whatever the data.
-        if t.baseline.data.is_empty() && t.script.is_none() {
+        // Only a plain schema-2 record needs a new schema to represent adoption.
+        if t.schema == state::SCHEMA {
             t.schema = state::TRIAL_SCHEMA_ADOPTED;
         }
         t.adopted = Some(adopted);

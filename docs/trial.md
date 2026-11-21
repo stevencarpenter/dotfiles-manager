@@ -54,7 +54,7 @@ A script trial uses the same codes. "Script trials" lists what each means there.
 
 ## The record
 
-`state/trials/<trial-id>.json`, canonical JSON. Schema 2, or 3 once adopted. A record with data paths is schema 4, adopted or not. A record with `script` is schema 5, and schema 6 when `script` carries `fence`. The docs/state.md validation applies: identity stamp, valid id, claim check on every path, secrets refused.
+`state/trials/<trial-id>.json`, canonical JSON. A trial that attempts a native install uses schema 7. Other package trial records use schema 2, or 3 once adopted. Older records with data paths use schema 4. A newly recorded pre-existing package with data paths also uses schema 4. A record with `script` is schema 5, and schema 6 when `script` carries `fence`. The docs/state.md validation applies: identity stamp, valid id, claim check on every path, secrets refused.
 
 | Field | Meaning |
 | --- | --- |
@@ -65,7 +65,7 @@ A script trial uses the same codes. "Script trials" lists what each means there.
 | `baseline.data[...]` | The data candidates, in the same shape. `adopt` never promotes them; `purge` removes the ones that were absent. Left out when empty, so a record written before they were observed still reads. |
 | `owned_outputs` | Empty. The trial writes no configuration. |
 | `package.adapter`, `package.name` | The provider that lists or installed the tool, and the package as it names it. Left out when only another owner has the tool. The journal and receipt then name the adapter `other-owner`. |
-| `package.install{op_id, dependencies}` | Present only when the trial installed: the journal and receipt id, and the dependencies the provider added. |
+| `package.install{op_id, dependencies, verified?}` | The intended install and its operation ID. After a successful provider call, the manager records the exact package selector, version and dependency versions in `verified`. Purge requires both this evidence and the successful receipt. |
 | `unknown` | Fixed tokens `services`, `paths-outside-baseline`, `provider-caches`: effects the trial does not instrument. Candidates for review, never owned cleanup scope. |
 | `script{...}` | Present only for a script trial. See "Script trials". |
 | `adopted{op_id, module, at_unix_ns}` | Set once by `adopt` (DFM-33), with `schema` 3. It names the journal operation and the module that took the configuration. Left out of an active trial. |
@@ -288,9 +288,8 @@ The record is not changed by an update. It keeps what the trial saw at its start
 
 ## What adopt and purge inherit
 
-- **Attribution by one id.** `package.install.op_id` names the journal `intent` and `done` (or `failed`) entries and the receipt `<start>-<op_id>.json`. A trial without `package.install` installed nothing. An `op_id` with no `intent` entry means the run ended between the record and the intent: nothing was started, and purge treats the package as not trial-installed until the provider's listing says otherwise.
+- **Install attribution.** Purge matches `package.install.op_id` to a successful trial receipt. It compares the exact versions in `package.install.verified` with the live provider. A failed or interrupted install and a legacy record without these versions provide no authority to uninstall. A version installed later, including a rolling update without independent ownership evidence, is retained.
 - **Baseline for restore.** `baseline.paths` with `existed` and `sha256` as observed before the install. `existed: false` is not delete authority: nothing observes the path after the install, so a file created there by anything else is indistinguishable from the tool's. Purge treats such a path as a candidate that needs its own approval (its preview shows the live hash and the approved digest covers it). It restores nothing for a pre-existing path whose hash no longer matches, and never touches a path with `existed: true` and no hash (a directory).
-- **The installed version.** Purge removes the trial's package by name (`package.name`), every installed version, because updates may change it after the trial starts (docs/upgrade.md, "Trials"). A mise roll installs the new version beside the old ones and removes none. The record keeps what it saw at trial start as history and is not updated.
 - **Owners.** `baseline.owners` says who had the tool. A pre-existing tool is never uninstalled. A dependency in `package.install.dependencies` is uninstalled only when no other active trial names it and Homebrew finds no installed formula that needs it. Purge reads no module (docs/purge.md, "Known limits").
 - **Unknown effects.** Purge reports the `unknown` entries as retained or unattributed, never as cleaned.
 - **Candidates for adopt.** `baseline.paths` are the files adopt reviews and promotes into a module. `package.adapter` and `package.name` are the install declaration it generates. For a script trial, each window entry `created` at the top level of `~/.config` is a candidate too, and `script` (URL, effective URL, shell, arguments, `--env` values, `binary.path`) is the `script/v1` declaration it generates (docs/adopt.md, "Script trials").
