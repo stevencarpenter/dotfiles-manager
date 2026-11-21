@@ -1705,7 +1705,7 @@ fn publication_error(store: &Store, audit: &state::Receipt, error: Refusal) -> R
 
 /// Publishes one staged source into its checkout exactly as the rehearsal moved the copy, after
 /// rechecking that the checkout is where the copy saw it. `Ok(true)` when the checkout changed.
-fn publish(git: &Git, s: &Staged) -> Result<bool, Refusal> {
+fn publish(git: &Git, root: &Path, s: &Staged) -> Result<bool, Refusal> {
     let id = s.src.id.as_str();
     let (repo_s, live_s) = (path_str(&s.repo)?, path_str(&s.live)?);
     let now = head_of(git, &s.live)?;
@@ -1740,7 +1740,16 @@ fn publish(git: &Git, s: &Staged) -> Result<bool, Refusal> {
         match dfm_engine::fsys::publish_new_checkout(&s.repo, &s.live) {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::CrossesDevices => {
-                checkout::publish_checkout(&s.live, |tmp| copy_checkout(&s.repo, tmp))?;
+                // Keep interrupted copies out of the scoped sources when the checkout itself
+                // lives on a volume other than the cache.
+                let git_dir = root.join(".git");
+                let device = |p: &Path| {
+                    fs::metadata(p)
+                        .map(|m| m.dev())
+                        .map_err(|e| io_failed("locate the checkout staging volume", &e))
+                };
+                let stage_in = (device(&git_dir)? == device(parent)?).then_some(git_dir.as_path());
+                checkout::publish_checkout(&s.live, stage_in, |tmp| copy_checkout(&s.repo, tmp))?;
             }
             Err(e) => return Err(io_failed("publish the new nested checkout", &e)),
         }
@@ -2105,7 +2114,7 @@ fn run_inner(
     for s in &staged {
         match fail
             .hit(&format!("sync-before-publish-{}", s.src.id))
-            .and_then(|()| publish(&git, s))
+            .and_then(|()| publish(&git, &root, s))
         {
             Ok(changed) => {
                 audit.sources.push(state::SourceId {

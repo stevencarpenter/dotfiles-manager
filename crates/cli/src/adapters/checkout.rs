@@ -193,6 +193,7 @@ pub(crate) fn probe(
 /// Populates a new checkout privately and publishes it only while the destination is absent.
 pub(crate) fn publish_checkout(
     destination: &Path,
+    staging_parent: Option<&Path>,
     populate: impl FnOnce(&Path) -> Result<(), Refusal>,
 ) -> Result<(), Refusal> {
     let (Some(parent), Some(name)) = (
@@ -208,7 +209,7 @@ pub(crate) fn publish_checkout(
         )
     };
     fs::create_dir_all(parent).map_err(|e| io(parent, e))?;
-    let stage = parent.join(format!(
+    let stage = staging_parent.unwrap_or(parent).join(format!(
         ".{name}.dfm-clone-{}-{}",
         std::process::id(),
         dfm_engine::now_ns()?
@@ -232,7 +233,7 @@ pub(crate) fn install(runner: &Runner, r: &ResolvedResource, cx: &ScriptCx) -> R
     let destination = runner.home.join(&d.path);
     refuse_source_overlap(cx, r, &destination)?;
     source_gate(cx, r, identity(&d.url)?)?;
-    publish_checkout(&destination, |tmp| {
+    publish_checkout(&destination, None, |tmp| {
         let tmp_text = tmp
             .to_str()
             .ok_or_else(|| invalid("path resolves to a path that is not UTF-8"))?;
@@ -270,8 +271,11 @@ mod tests {
         ));
         fs::create_dir(&parent).unwrap();
         let destination = parent.join("repo");
+        let metadata = parent.join(".git");
+        fs::create_dir(&metadata).unwrap();
         let mut inode = 0;
-        let result = publish_checkout(&destination, |stage| {
+        let result = publish_checkout(&destination, Some(&metadata), |stage| {
+            assert!(stage.starts_with(&metadata));
             fs::create_dir(stage).unwrap();
             fs::create_dir(&destination).unwrap();
             inode = fs::metadata(&destination).unwrap().ino();
@@ -279,7 +283,8 @@ mod tests {
         });
         assert!(result.is_err());
         assert_eq!(fs::metadata(&destination).unwrap().ino(), inode);
-        assert_eq!(fs::read_dir(&parent).unwrap().count(), 1);
+        assert_eq!(fs::read_dir(&metadata).unwrap().count(), 0);
+        assert_eq!(fs::read_dir(&parent).unwrap().count(), 2);
         fs::remove_dir_all(parent).unwrap();
     }
 
