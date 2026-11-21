@@ -514,6 +514,11 @@ fn is_sensitive(home: &Path, at: &Path, real: &Path, p: &Protected) -> bool {
         })
 }
 
+/// A second name on the same device could be a fragment inside a sensitive directory.
+fn may_alias_sensitive(file: &std::fs::Metadata, targets: &[std::fs::Metadata]) -> bool {
+    file.is_file() && file.nlink() > 1 && targets.iter().any(|target| target.dev() == file.dev())
+}
+
 /// The row of one script binary. The path is resolved through its links again and the file it
 /// points to now is hashed, up to the trial's hash cap. Nothing is executed. A path that is, or
 /// resolves to, a sensitive managed output (`sensitive`, folded) is never hashed.
@@ -572,11 +577,9 @@ fn binary_row(
             let runnable = meta
                 .as_ref()
                 .is_some_and(|m| m.permissions().mode() & 0o100 != 0);
-            // A second name for the file can be a sensitive output whose path the set does not
-            // name (a hard link made after the ledger entry), so such a file is not read.
             let shared = meta
                 .as_ref()
-                .is_some_and(|m| m.nlink() > 1 && targets.iter().any(|t| t.dev() == m.dev()));
+                .is_some_and(|m| may_alias_sensitive(m, targets));
             let digest = len
                 .filter(|n| hashing && runnable && !shared && *n <= HASH_CAP)
                 .and_then(|_| hash(&real));
@@ -1296,7 +1299,11 @@ fn profile_rows(
         };
         let at = runner.home.join(plist);
         let real = std::fs::canonicalize(&at).unwrap_or_else(|_| at.clone());
-        ledger.is_none() || targets.is_err() || is_sensitive(&runner.home, &at, &real, &protected)
+        ledger.is_none()
+            || targets.as_ref().map_or(true, |targets| {
+                is_sensitive(&runner.home, &at, &real, &protected)
+                    || std::fs::metadata(&real).is_ok_and(|m| may_alias_sensitive(&m, targets))
+            })
     };
     let packages = crate::adapters::package::package_facts(
         res,

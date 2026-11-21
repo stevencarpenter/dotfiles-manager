@@ -66,7 +66,7 @@ fn mise_env() -> Vec<(String, String)> {
 /// uv probes and changes read no uv configuration file (an index or a source override there
 /// is not in the plan), show no progress, and never download a Python interpreter: a tool
 /// whose interpreter is missing fails instead of installing a runtime the plan does not show.
-/// The probe (`uv tool list` reads uv's own tool directory) also runs offline.
+/// The probe reads uv's tool directory offline without a persistent cache.
 fn uv_env(offline: bool) -> Vec<(String, String)> {
     let mut env = vec![
         ("UV_NO_CONFIG".to_string(), "1".to_string()),
@@ -75,6 +75,7 @@ fn uv_env(offline: bool) -> Vec<(String, String)> {
     ];
     if offline {
         env.push(("UV_OFFLINE".into(), "1".into()));
+        env.push(("UV_NO_CACHE".into(), "1".into()));
     }
     env
 }
@@ -1065,10 +1066,11 @@ pub(crate) fn uv_source_probe(
     runner: &Runner,
     r: &ResolvedResource,
     cx: Option<&ScriptCx>,
+    updating: bool,
 ) -> Result<PackageState, Refusal> {
     let value = &r.value;
     let pkg = uv_source_name(value)?;
-    policy(value)?;
+    let policy = policy(value)?;
     let text = source_text(value).unwrap_or_default();
     let Some(cx) = cx else {
         if !text.starts_with("path:") {
@@ -1077,7 +1079,9 @@ pub(crate) fn uv_source_probe(
         return Ok(PackageState::Missing(Vec::new()));
     };
     let source = checked_source(r, cx)?;
-    let current = match installed_uv_source(&runner.home, &pkg) {
+    let may_upgrade =
+        updating && policy == "rolling" && matches!(source, UvSource::Git { rev: None, .. });
+    let current = match installed_uv_source(&runner.home, &pkg, (!may_upgrade).then_some(&source)) {
         Ok(s) => s,
         Err(why) => return Ok(PackageState::Unknown(why)),
     };
@@ -1140,7 +1144,11 @@ impl UvSource {
     }
 }
 
-fn installed_uv_source(home: &Path, pkg: &str) -> Result<Option<InstalledUvSource>, String> {
+fn installed_uv_source(
+    home: &Path,
+    pkg: &str,
+    acceptable_with_options: Option<&UvSource>,
+) -> Result<Option<InstalledUvSource>, String> {
     let dir = home.join(".local/share/uv/tools").join(uv_norm(pkg));
     match std::fs::symlink_metadata(&dir) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -1157,12 +1165,6 @@ fn installed_uv_source(home: &Path, pkg: &str) -> Result<Option<InstalledUvSourc
         .get("tool")
         .and_then(Value::as_table)
         .ok_or_else(unknown)?;
-    if tool
-        .get("options")
-        .is_some_and(|v| !v.as_table().is_some_and(|t| t.is_empty()))
-    {
-        return Err(unknown());
-    }
     let reqs = tool
         .get("requirements")
         .and_then(Value::as_array)
@@ -1212,6 +1214,13 @@ fn installed_uv_source(home: &Path, pkg: &str) -> Result<Option<InstalledUvSourc
         _ => return Err(unknown()),
     };
     if origins.next().is_some() {
+        return Err(unknown());
+    }
+    if !acceptable_with_options.is_some_and(|desired| source.matches(desired))
+        && tool
+            .get("options")
+            .is_some_and(|v| !v.as_table().is_some_and(|t| t.is_empty()))
+    {
         return Err(unknown());
     }
     Ok(Some(source))
@@ -1313,7 +1322,7 @@ pub(crate) fn maintain_sourced(
         return maintain(runner, UV_TOOL, value);
     };
     let source = checked_source(r, cx)?;
-    let present = uv_source_probe(runner, r, Some(cx))?;
+    let present = uv_source_probe(runner, r, Some(cx), true)?;
     if !matches!(present, PackageState::Installed(_)) {
         return Ok(present);
     }
@@ -1946,7 +1955,7 @@ fn facts(
             if update {
                 maintain_sourced(runner, r, scripts)
             } else {
-                uv_source_probe(runner, r, scripts)
+                uv_source_probe(runner, r, scripts, false)
             }
         } else {
             look(runner, &r.adapter, &r.value).and_then(|s| mise_gated(scripts, r, s))
@@ -2475,7 +2484,9 @@ mod tests {
         let receipt = |reqs: &str| {
             std::fs::write(
                 dir.join("uv-receipt.toml"),
-                format!("[tool]\nrequirements = [{reqs}]\n"),
+                format!(
+                    "[tool]\nrequirements = [{reqs}]\n[tool.options]\ncompile-bytecode = true\n"
+                ),
             )
             .unwrap();
         };
@@ -2483,16 +2494,11 @@ mod tests {
         receipt(
             r#"{ name = "token-auditor" }, { name = "helper", git = "https://github.com/o/r?rev=1.0.0" }"#,
         );
-        assert!(
-            !installed_uv_source(&home, "token-auditor")
-                .unwrap()
-                .unwrap()
-                .matches(&source)
-        );
+        assert!(installed_uv_source(&home, "token-auditor", Some(&source)).is_err());
         // The tool from the source, under a name uv spells another way.
         receipt(r#"{ name = "Token_Auditor", git = "https://github.com/o/r?rev=1.0.0" }"#);
         assert!(
-            installed_uv_source(&home, "token-auditor")
+            installed_uv_source(&home, "token-auditor", Some(&source))
                 .unwrap()
                 .unwrap()
                 .matches(&source)

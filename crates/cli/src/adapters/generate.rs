@@ -285,7 +285,7 @@ impl Generator for Generators<'_> {
             if op.action == Action::Upgrade {
                 package::maintain_sourced(runner, r, self.scripts.as_ref())
             } else {
-                package::uv_source_probe(runner, r, self.scripts.as_ref())
+                package::uv_source_probe(runner, r, self.scripts.as_ref(), false)
             }
         } else {
             let state = if op.action == Action::Upgrade {

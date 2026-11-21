@@ -1767,7 +1767,7 @@ fn git_with(
 /// first. `Ok(Ok(after))` is the revision after the pull. `Ok(Err)` is the note and the status
 /// when nothing changed: local work (uncommitted changes, or commits that are not on the
 /// upstream) is left alone and `current`; a refused configuration, no upstream or the gate is
-/// `blocked`. `Err` is a command that did not succeed. Nothing here merges, resets or clones.
+/// `blocked`. `Err` is a command that did not succeed.
 fn fast_forward(
     env: &Env,
     copy: &Path,
@@ -1811,34 +1811,57 @@ fn fast_forward(
     if let Some(why) = gate(&up) {
         return Ok(Err((why, Status::Blocked)));
     }
-    // Merge exactly the fetched branch, preserving ignored files and local commits.
+    // Other fetches can replace FETCH_HEAD. This ref belongs to this update.
+    let stamp = dfm_engine::now_ns().map_err(|e| (e.detail, false))?;
+    let fetched = format!("refs/dfm/checkout/{}-{stamp}", std::process::id());
+    let refspec = format!("{}:{fetched}", up.merge);
     git_remote(
         env,
         copy,
-        &["fetch", "--quiet", "--", &up.remote, &up.merge],
-    )?;
-    let n = git(env, copy, &["rev-list", "--count", "FETCH_HEAD..HEAD"])?;
-    if n != "0" {
-        return Ok(Err((
-            format!(
-                "{noun} {} has {n} local commits that are not on its upstream; not pulled",
-                copy.display()
-            ),
-            Status::Current,
-        )));
-    }
-    git(
-        env,
-        copy,
         &[
-            "merge",
-            "--ff-only",
-            "--no-overwrite-ignore",
+            "fetch",
             "--quiet",
-            "FETCH_HEAD",
+            "--no-write-fetch-head",
+            "--",
+            &up.remote,
+            &refspec,
         ],
     )?;
-    git(env, copy, &["rev-parse", "--short", "HEAD"]).map(Ok)
+    let update = (|| {
+        let commit = git(
+            env,
+            copy,
+            &["rev-parse", "--verify", &format!("{fetched}^{{commit}}")],
+        )?;
+        let n = git(
+            env,
+            copy,
+            &["rev-list", "--count", &format!("{commit}..HEAD")],
+        )?;
+        if n != "0" {
+            return Ok(Err((
+                format!(
+                    "{noun} {} has {n} local commits that are not on its upstream; not pulled",
+                    copy.display()
+                ),
+                Status::Current,
+            )));
+        }
+        git(
+            env,
+            copy,
+            &[
+                "merge",
+                "--ff-only",
+                "--no-overwrite-ignore",
+                "--quiet",
+                &commit,
+            ],
+        )?;
+        git(env, copy, &["rev-parse", "--short", "HEAD"]).map(Ok)
+    })();
+    let cleanup = git(env, copy, &["update-ref", "-d", &fetched]);
+    update.and_then(|result| cleanup.map(|_| result))
 }
 
 /// The valid declared checkouts. The `checkouts` updater pulls those that are not held.
@@ -2463,7 +2486,7 @@ mod tests {
         fn checkouts_git(&self) {
             self.script(
                 &self.bin.join("git"),
-                "d=$(basename \"$2\")\n[ -f \"$st/$d/fail-$3\" ] && exit 2\ncase \"$3\" in\n  rev-parse) if [ \"$4\" = --abbrev-ref ]; then echo main; else cat \"$st/$d/rev\"; fi ;;\n  config) [ \"$4\" = --list ] && exit 0; [ -f \"$st/$d/no-upstream\" ] && exit 1; case \"$5\" in *.remote) echo origin ;; *) echo refs/heads/main ;; esac ;;\n  remote) echo \"https://github.com/o/$d.git\" ;;\n  ls-remote) echo \"$5\" ;;\n  status) cat \"$st/$d/porcelain\" 2>/dev/null || true ;;\n  fetch) exit 0 ;;\n  rev-list) cat \"$st/$d/ahead\" 2>/dev/null || echo 0 ;;\n  merge) cp \"$st/$d/rev-after\" \"$st/$d/rev\" ;;\n  *) exit 64 ;;\nesac",
+                "d=$(basename \"$2\")\n[ -f \"$st/$d/fail-$3\" ] && exit 2\ncase \"$3\" in\n  rev-parse) if [ \"$4\" = --abbrev-ref ]; then echo main; elif [ \"$4\" = --verify ]; then cat \"$st/$d/rev-after\"; else cat \"$st/$d/rev\"; fi ;;\n  config) [ \"$4\" = --list ] && exit 0; [ -f \"$st/$d/no-upstream\" ] && exit 1; case \"$5\" in *.remote) echo origin ;; *) echo refs/heads/main ;; esac ;;\n  remote) echo \"https://github.com/o/$d.git\" ;;\n  ls-remote) echo \"$5\" ;;\n  status) cat \"$st/$d/porcelain\" 2>/dev/null || true ;;\n  fetch) exit 0 ;;\n  rev-list) cat \"$st/$d/ahead\" 2>/dev/null || echo 0 ;;\n  merge) cp \"$st/$d/rev-after\" \"$st/$d/rev\" ;;\n  update-ref) exit 0 ;;\n  *) exit 64 ;;\nesac",
             );
         }
 
@@ -2487,16 +2510,26 @@ mod tests {
     }
 
     /// The calls that fast-forward the checkout at `c` from `origin`.
-    fn checkout_calls(c: &Path) -> Vec<String> {
+    fn checkout_calls(t: &T, c: &Path, commit: &str) -> Vec<String> {
         let c = c.display().to_string();
         let mut v = upstream_calls(&c, "origin");
         let id = c.rsplit('/').next().unwrap_or_default();
+        let fetch =
+            format!("git -C {c} fetch --quiet --no-write-fetch-head -- origin refs/heads/main:");
+        let fetched = t
+            .calls()
+            .into_iter()
+            .find_map(|call| call.strip_prefix(&fetch).map(str::to_owned))
+            .unwrap();
+        assert!(fetched.starts_with("refs/dfm/checkout/"));
         v.extend([
             format!("git -C {c} ls-remote --get-url https://github.com/o/{id}.git"),
-            format!("git -C {c} fetch --quiet -- origin refs/heads/main"),
-            format!("git -C {c} rev-list --count FETCH_HEAD..HEAD"),
-            format!("git -C {c} merge --ff-only --no-overwrite-ignore --quiet FETCH_HEAD"),
+            format!("{fetch}{fetched}"),
+            format!("git -C {c} rev-parse --verify {fetched}^{{commit}}"),
+            format!("git -C {c} rev-list --count {commit}..HEAD"),
+            format!("git -C {c} merge --ff-only --no-overwrite-ignore --quiet {commit}"),
             format!("git -C {c} rev-parse --short HEAD"),
+            format!("git -C {c} update-ref -d {fetched}"),
         ]);
         v
     }
@@ -2524,8 +2557,8 @@ mod tests {
             r.notes,
             ["tpm a1b2c3d -> d4e5f6a", "other current at a1b2c3d"]
         );
-        let mut want = checkout_calls(&tpm);
-        want.extend(checkout_calls(&other));
+        let mut want = checkout_calls(&t, &tpm, "d4e5f6a");
+        want.extend(checkout_calls(&t, &other, "a1b2c3d"));
         assert_eq!(t.calls(), want);
     }
 
@@ -2621,7 +2654,7 @@ mod tests {
         );
         let d = dirty.display().to_string();
         let mut want = upstream_calls(&d, "origin")[..3].to_vec();
-        want.extend(checkout_calls(&moved));
+        want.extend(checkout_calls(&t, &moved, "d4e5f6a"));
         assert_eq!(t.calls(), want);
     }
 
@@ -2657,7 +2690,7 @@ mod tests {
                 "tpm a1b2c3d -> d4e5f6a",
             ]
         );
-        assert_eq!(t.calls(), checkout_calls(&tpm));
+        assert_eq!(t.calls(), checkout_calls(&t, &tpm, "d4e5f6a"));
         // Held alone: current, nothing runs, and a held checkout not cloned yet is still held.
         t.checkouts.pop();
         fs::remove_dir(t.home.join("src/fm/.git")).unwrap();
@@ -2719,7 +2752,9 @@ mod tests {
         let r = run(Updater::Checkouts, &t.env());
         assert_eq!(r.status, Status::Failed, "{r:?}");
         assert!(
-            r.notes[0].contains("fetch --quiet -- origin refs/heads/main exited 2"),
+            r.notes[0].contains(
+                "fetch --quiet --no-write-fetch-head -- origin refs/heads/main:refs/dfm/checkout/"
+            ) && r.notes[0].contains("exited 2"),
             "{r:?}"
         );
         assert_eq!(
@@ -2759,7 +2794,7 @@ mod tests {
         want.push(format!(
             "git -C {f} ls-remote --get-url https://github.com/o/other.git"
         ));
-        want.extend(checkout_calls(&moved));
+        want.extend(checkout_calls(&t, &moved, "d4e5f6a"));
         assert_eq!(t.calls(), want);
     }
 

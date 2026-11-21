@@ -106,7 +106,7 @@ esac
 const FAKE_UV: &str = r#"#!/bin/sh
 PATH=/usr/bin:/bin:$PATH
 here=$(dirname "$0")
-printf 'uv %s | noconfig=%s offline=%s downloads=%s progress=%s\n' "$*" "${UV_NO_CONFIG:-unset}" "${UV_OFFLINE:-unset}" "${UV_PYTHON_DOWNLOADS:-unset}" "${UV_NO_PROGRESS:-unset}" >> "$here/../log"
+printf 'uv %s | noconfig=%s offline=%s downloads=%s progress=%s nocache=%s\n' "$*" "${UV_NO_CONFIG:-unset}" "${UV_OFFLINE:-unset}" "${UV_PYTHON_DOWNLOADS:-unset}" "${UV_NO_PROGRESS:-unset}" "${UV_NO_CACHE:-unset}" >> "$here/../log"
 db="$here/../installed-uv"
 [ "$1" = tool ] || exit 64
 case "$2" in
@@ -880,7 +880,12 @@ fn a_read_only_plan_starts_no_provider_and_doctor_only_queries_providers() {
     assert_eq!(code(&fx.run(&["plan", "--root", fx.root_arg()])), 0);
     assert!(!fx.fake.path().join("log").exists());
     assert_eq!(code(&fx.run(&["doctor", "--root", fx.root_arg()])), 0);
-    assert!(fx.log().contains("uv tool list"), "{}", fx.log());
+    assert!(
+        fx.log()
+            .contains("uv tool list | noconfig=1 offline=1 downloads=never progress=1 nocache=1"),
+        "{}",
+        fx.log()
+    );
     assert!(fx.changes().is_empty());
     assert!(!fx.home.path().join(".cache/dotfiles-manager/run").exists());
 }
@@ -969,10 +974,17 @@ fn the_update_rolls_a_ref_less_git_source_tool() {
     let fx = Fx::new();
     fx.with_source(ROLLING);
     fx.installed("uv", "nuv 0.5.2\ntoken-auditor 1.0.0\n");
+    let receipt = "[tool]\nrequirements = [{ name = \"token-auditor\", git = \"https://github.com/o/r?rev=main-tip\" }]\n";
     fx.uv_receipt(
         "token-auditor",
-        "[tool]\nrequirements = [{ name = \"token-auditor\", git = \"https://github.com/o/r?rev=main-tip\" }]\n",
+        &format!("{receipt}[tool.options]\ncompile-bytecode = true\n"),
     );
+    let o = fx.preview(true);
+    assert_eq!(code(&o), 3, "{}\n{}", stderr(&o), text(&o.stdout));
+    assert!(text(&o.stdout).contains("the uv receipt does not identify one recognized source"));
+    assert!(fx.changes().is_empty(), "{}", fx.log());
+
+    fx.uv_receipt("token-auditor", receipt);
     let o = fx.apply(true);
     assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
     let changes = fx.changes();
@@ -1085,7 +1097,13 @@ fn a_git_source_at_another_rev_requires_approval_to_replace() {
         "{}",
         text(&o.stdout)
     );
-    fx.uv_receipt("token-auditor", &receipt("2026.11.11"));
+    fx.uv_receipt(
+        "token-auditor",
+        &format!(
+            "{}[tool.options]\ncompile-bytecode = true\n",
+            receipt("2026.11.11")
+        ),
+    );
     let o = fx.apply(false);
     assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
     assert!(

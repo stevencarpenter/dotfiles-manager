@@ -1153,6 +1153,45 @@ fn a_sensitive_prerequisite_is_recorded_by_mode_only() {
 }
 
 #[test]
+fn doctor_skips_a_definition_with_an_alias_in_a_sensitive_fragment_directory() {
+    let fx = Fx::new();
+    fx.put(
+        "base/modules/extra/module.toml",
+        &format!(
+            r#"{EXTRA}
+[[resources]]
+id = "settings"
+kind = "merge"
+adapter = "claude-settings/v1"
+target = ".claude/settings.json"
+[resources.value]
+fragments_dir = ".claude/settings.d"
+pattern = "*.json"
+[resources.value.managed]
+outputStyle = "STE"
+"#
+        ),
+    );
+    let fragment = fx.home.path().join(".claude/settings.d/sample.plist");
+    let plist = fx.home.path().join(PLIST);
+    fs::create_dir_all(fragment.parent().unwrap()).unwrap();
+    fs::create_dir_all(plist.parent().unwrap()).unwrap();
+    fs::write(&fragment, AGENT_PLIST).unwrap();
+    fs::hard_link(&fragment, &plist).unwrap();
+    let o = fx.run(&["doctor", "--root", fx.root_arg(), "--json"]);
+    let report: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
+    let row = report["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["subject"] == "extra.maxfiles")
+        .unwrap_or_else(|| panic!("{report:#}"));
+    assert_eq!(row["status"], "UNKNOWN", "{row}");
+    assert_eq!(row["code"], "D_DEPENDS_UNKNOWN", "{row}");
+    assert!(!fx.log().contains("launchctl"), "{}", fx.log());
+}
+
+#[test]
 fn a_secret_definition_shows_neither_its_hash_nor_its_arguments() {
     use sha2::{Digest, Sha256};
     let fx = Fx::new();

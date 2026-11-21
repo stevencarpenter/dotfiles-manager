@@ -70,7 +70,7 @@ Provider environment (the variables reach only the manager's child):
 
 - `brew`: `HOMEBREW_NO_AUTO_UPDATE=1`, `HOMEBREW_NO_ANALYTICS=1`, `HOMEBREW_NO_ENV_HINTS=1`, `HOMEBREW_NO_INSTALL_CLEANUP=1`, `HOMEBREW_NO_INSTALL_UPGRADE=1`, `HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK=1`. An install upgrades neither the formula nor its installed dependents.
 - `mise`: `MISE_YES=1`, `MISE_NOT_FOUND_AUTO_INSTALL=false`, `MISE_NO_CONFIG=1`. No config file is loaded, because config evaluation can run hooks, env sources and remote includes. The install uses the same variables, so no config hook (`postinstall`) runs.
-- `uv`: `UV_NO_CONFIG=1`, `UV_NO_PROGRESS=1`, `UV_PYTHON_DOWNLOADS=never`, and `UV_OFFLINE=1` for the probe only. No interpreter is downloaded.
+- `uv`: `UV_NO_CONFIG=1`, `UV_NO_PROGRESS=1`, and `UV_PYTHON_DOWNLOADS=never`. The probe also sets `UV_OFFLINE=1` and `UV_NO_CACHE=1` to avoid network access and persistent cache writes.
 
 A probe that cannot run (program not found or failed its checks), times out, or answers in a shape the adapter does not know is `Unknown` with a reason. The plan gets a blocker, `E_PROBE_FAILED`, exit 3: unknown support fails closed. The same code applies when the probe under the lock cannot answer.
 
