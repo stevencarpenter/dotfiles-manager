@@ -1250,7 +1250,7 @@ fn a_ledger_entry_owned_by_a_selected_sensitive_resource_is_not_read() {
     let r = at(&rows, ".zz-other");
     assert_eq!(
         (r["status"].as_str(), r["code"].as_str()),
-        (Some("N/A"), Some("D_NA_SENSITIVE")),
+        (Some("ERROR"), Some("E_CONFLICT")),
         "{r:#?}"
     );
 }
