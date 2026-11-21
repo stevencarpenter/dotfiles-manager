@@ -2766,17 +2766,15 @@ fn a_fragment_being_removed_is_not_an_input_and_its_consumer_runs_after_the_remo
 }
 
 #[test]
-fn outputs_of_a_resource_that_is_still_selected_are_never_removed() {
+fn a_selected_resource_no_longer_claiming_an_owned_file_plans_its_removal() {
     let e = Env::personal();
-    // `personal-dev.atuin` is selected and claims nothing.
-    record(&e, "personal-dev.atuin", &e.h("kept.txt"), "x");
+    record(&e, "personal-dev.atuin", &e.h("old.txt"), "x");
     let (o, s) = e.saved();
     assert_eq!(code(&o), 0, "{}", text(&o.stderr));
-    assert!(
-        s.plan
-            .operations
-            .iter()
-            .all(|o| !o.id.starts_with("remove@"))
+    let removal = op(&s, "remove@personal-dev.atuin@old.txt");
+    assert_eq!(
+        (removal.action, removal.status),
+        (Action::Remove, Status::Planned)
     );
 }
 

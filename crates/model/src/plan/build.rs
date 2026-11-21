@@ -447,9 +447,8 @@ pub struct Context<'a> {
     pub adopt_files: BTreeMap<String, ApprovedFile>,
 }
 
-/// Ledger outputs of a resource that is no longer selected, at a path no selected resource
-/// claims: candidates for removal. A resource that is still selected keeps its outputs even when
-/// it claims nothing now, and a path that another resource claims is that resource's business.
+/// Exact ledger paths left outside the current claims. Paths claimed by a different resource
+/// are handled by that resource's ownership checks.
 fn removals<'a>(resolved: &Resolved, ledger: &'a [Owned], scope: Scope) -> Vec<&'a Owned> {
     // Removal is configuration work: a secrets or packages plan removes nothing.
     if !scope.covers_kind("link") {
@@ -462,9 +461,7 @@ fn removals<'a>(resolved: &Resolved, ledger: &'a [Owned], scope: Scope) -> Vec<&
         .collect();
     ledger
         .iter()
-        .filter(|o| {
-            !resolved.resources.contains_key(&o.resource) && !claimed.contains(&fold(&o.path))
-        })
+        .filter(|o| !claimed.contains(&fold(&o.path)))
         .collect()
 }
 
@@ -491,17 +488,10 @@ pub fn requests(resolved: &Resolved, ledger: &[Owned], scope: Scope) -> Vec<Requ
     }
     // Whatever else asked for it, a path that a selected sensitive resource claims, or that the
     // ledger records as sensitive (whoever claims it now), is never hashed.
-    let sensitive_ledger = sensitive_ledger_paths(ledger);
+    let sensitive = sensitive_paths(Some(resolved), ledger);
     for (path, w) in &mut want {
-        if sensitive_ledger.contains(&fold(path)) {
+        if sensitive.contains(&fold(path)) {
             w.0 = false;
-        }
-    }
-    for r in resolved.resources.values().filter(|r| r.sensitive) {
-        for c in &r.claims {
-            if let Some(w) = want.get_mut(c) {
-                w.0 = false;
-            }
         }
     }
     want.into_iter()
@@ -551,7 +541,7 @@ pub fn followups(
     ledger: &[Owned],
     scope: Scope,
 ) -> Vec<Request> {
-    let sensitive = sensitive_ledger_paths(ledger);
+    let sensitive = sensitive_paths(Some(resolved), ledger);
     let claimed: BTreeSet<String> = resolved
         .resources
         .values()
@@ -1900,6 +1890,7 @@ impl Planner<'_> {
     fn remove_checks(&self, o: &Owned, op: &mut Operation) -> Result<(), Fail> {
         let field = "owned_outputs";
         let path = o.path.as_str();
+        let sensitive = self.sensitive.contains(&fold(path));
         // A link in a parent is reported first and for this entry only. Such an entry (a
         // stow-style linked config directory, for example) must not block any other operation.
         let comps = parts(path);
@@ -1930,11 +1921,11 @@ impl Planner<'_> {
         }
         op.preconditions.push(Precondition {
             subject: format!("path:{path}"),
-            state: node_state(&seen, o.class == Class::Sensitive),
+            state: node_state(&seen, sensitive),
         });
         op.preconditions.push(Precondition {
             subject: format!("ledger:{path}"),
-            state: self.ledger_state(path, o.class == Class::Sensitive),
+            state: self.ledger_state(path, sensitive),
         });
         match &seen.node {
             Node::Missing {} => {
@@ -1985,7 +1976,7 @@ impl Planner<'_> {
                 format!("{path} holds none of the owned handler entries and appended items");
             return Ok(());
         }
-        op.ownership = self.ownership(&o.resource, o.class == Class::Sensitive, path, &seen);
+        op.ownership = self.ownership(&o.resource, sensitive, path, &seen);
         let why = match op.ownership {
             Ownership::Owned => None,
             Ownership::Modified => Some("was changed after the manager wrote it"),
