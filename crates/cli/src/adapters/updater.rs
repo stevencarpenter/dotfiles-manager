@@ -2031,6 +2031,11 @@ pub fn preview_candidates(u: Updater, env: &Env, scratch: &Path) -> Vec<String> 
             .ok_or_else(|| ("provider path is not UTF-8".into(), false))?;
         let mut runner = env.provider.clone();
         runner.search_path.insert(0, "/usr/bin".into());
+        if runner.resolve("sandbox-exec").ok().as_deref()
+            != Some(Path::new("/usr/bin/sandbox-exec"))
+        {
+            return Err(("system sandbox unavailable".into(), false));
+        }
         // Providers may populate caches even during a listing. Only the scratch directory is writable.
         let profile = r#"(version 1)(allow default)(deny file-write*)(allow file-write* (subpath (param "SCRATCH")) (literal "/dev/null"))"#;
         let mut query = vec![
