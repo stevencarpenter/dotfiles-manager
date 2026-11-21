@@ -1208,6 +1208,25 @@ pub struct ScriptBinary {
     pub sha256: String,
 }
 
+/// Variables the script run sets itself. `--env` cannot override them.
+pub const FIXED_ENV: [&str; 15] = [
+    "HOME",
+    "USER",
+    "LOGNAME",
+    "TMPDIR",
+    "SHELL",
+    "PATH",
+    "LANG",
+    "LC_ALL",
+    "TERM",
+    "ZDOTDIR",
+    "XDG_CONFIG_HOME",
+    "XDG_DATA_HOME",
+    "XDG_STATE_HOME",
+    "XDG_CACHE_HOME",
+    "XDG_BIN_HOME",
+];
+
 /// A script trial (DFM-78): the script as downloaded, how it ran, and what the observation
 /// window saw. `exit`, `window` and `binary` stay unset until the run ends. `env` is a list of
 /// `[name, value]` pairs, sorted by name by the writer.
@@ -1221,6 +1240,9 @@ pub struct TrialScript {
     pub shell: String,
     pub args: Vec<String>,
     pub env: Vec<(String, String)>,
+    /// Caller-provided variables forwarded to the installer. Only names are persisted.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub env_from: Vec<String>,
     pub tty: bool,
     pub before: Vec<Observed>,
     pub exit: Option<ScriptExit>,
@@ -1244,6 +1266,19 @@ pub struct InodeFence {
 }
 
 impl TrialScript {
+    /// Strip custom values, including those present in an older script record.
+    pub fn protect_environment(&mut self) {
+        self.env.retain(|(n, _)| {
+            if FIXED_ENV.contains(&n.as_str()) {
+                return true;
+            }
+            self.env_from.push(n.clone());
+            false
+        });
+        self.env_from.sort();
+        self.env_from.dedup();
+    }
+
     fn validate(&self) -> Result<(), Refusal> {
         let https = |u: &str| u.starts_with("https://") && !u.chars().any(char::is_control);
         let plain = |t: &str| !t.chars().any(char::is_control);
@@ -1254,6 +1289,15 @@ impl TrialScript {
                 && plain(n)
                 && v.chars().all(|c| c == '\t' || !c.is_control())
         });
+        let refs_ok = self.env_from.iter().all(|n| {
+            let mut chars = n.chars();
+            chars
+                .next()
+                .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+                && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+                && !FIXED_ENV.contains(&n.as_str())
+                && !self.env.iter().any(|(k, _)| k == n)
+        }) && self.env_from.windows(2).all(|pair| pair[0] < pair[1]);
         let exit_ok = self
             .exit
             .as_ref()
@@ -1278,6 +1322,7 @@ impl TrialScript {
             && valid_sha256(&self.sha256)
             && SHELLS.contains(&self.shell.as_str())
             && self.args.iter().all(|a| plain(a))
+            && refs_ok
             && env_ok
             && self.before.iter().all(Observed::valid)
             && exit_ok
@@ -2516,6 +2561,7 @@ mod tests {
             bytes: 10,
             shell: "sh".into(),
             args: vec![],
+            env_from: Vec::new(),
             env: vec![],
             tty: false,
             before: vec![],
@@ -2540,6 +2586,7 @@ mod tests {
         t.package = None;
         t.script = Some(TrialScript {
             args: vec!["--no-modify-path".into()],
+            env_from: Vec::new(),
             env: vec![("HOME".into(), "/h".into())],
             before: vec![Observed {
                 path: "/h/.zshenv".into(),

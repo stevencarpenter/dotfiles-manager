@@ -60,14 +60,14 @@ pub struct ScriptDecl<'a> {
     pub effective_url: &'a str,
     pub shell: &'a str,
     pub args: &'a [String],
-    /// Sorted by name; each name is `[A-Za-z_][A-Za-z0-9_]*`, so it is a bare TOML key.
-    pub env: &'a [(String, String)],
+    /// Names of caller-supplied environment variables, sorted by name.
+    pub env_from: &'a [String],
     /// HOME-relative.
     pub binary: &'a str,
 }
 
 /// One `script/v1` package resource block, led by a blank line. `args` is always written, and
-/// `env` only when it holds a value.
+/// `env_from` is present when the installer needs caller-supplied variables.
 pub fn script_block(id: &str, d: &ScriptDecl<'_>) -> String {
     let args: Vec<String> = d.args.iter().map(|a| quoted(a)).collect();
     let mut out = format!(
@@ -79,11 +79,14 @@ pub fn script_block(id: &str, d: &ScriptDecl<'_>) -> String {
         args.join(", "),
         quoted(d.binary),
     );
-    if !d.env.is_empty() {
-        out.push_str("[resources.value.env]\n");
-        for (n, v) in d.env {
-            out.push_str(&format!("{n} = {}\n", quoted(v)));
-        }
+    if !d.env_from.is_empty() {
+        let names = d
+            .env_from
+            .iter()
+            .map(|n| quoted(n))
+            .collect::<Vec<_>>()
+            .join(", ");
+        out.push_str(&format!("env_from = [{names}]\n"));
     }
     out
 }
@@ -185,14 +188,14 @@ mod tests {
     fn a_script_block_parses_back_to_the_declaration() {
         let (args, env) = (
             vec!["--yes".to_string(), "a \"q\"".to_string()],
-            vec![("BOAT_NO_UPDATE".to_string(), "1".to_string())],
+            vec!["BOAT_NO_UPDATE".to_string()],
         );
         let d = ScriptDecl {
             url: "https://example.invalid/i.sh",
             effective_url: "https://cdn.example.invalid/i.sh",
             shell: "sh",
             args: &args,
-            env: &env,
+            env_from: &env,
             binary: "tools/boat",
         };
         let text = script_block("boat", &d);
@@ -203,9 +206,9 @@ mod tests {
         assert_eq!(r["kind"].as_str(), Some("package"));
         let v = &r["value"];
         assert_eq!(v["args"][1].as_str(), Some("a \"q\""));
-        assert_eq!(v["env"]["BOAT_NO_UPDATE"].as_str(), Some("1"));
+        assert_eq!(v["env_from"][0].as_str(), Some("BOAT_NO_UPDATE"));
         assert_eq!(v["binary"].as_str(), Some("tools/boat"));
-        let bare = script_block("boat", &ScriptDecl { env: &[], ..d });
+        let bare = script_block("boat", &ScriptDecl { env_from: &[], ..d });
         assert!(!bare.contains("env"), "{bare}");
     }
 

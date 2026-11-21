@@ -16,7 +16,6 @@ use crate::apply_cmd::{is_digest, label, stale};
 use crate::plan_cmd::{Probed, binary_identity, plan_with_outputs};
 use crate::read_fs::read_regular_bounded;
 use crate::sync_cmd::Git;
-use crate::trial_cmd::FIXED_ENV;
 use crate::{Ctx, Loaded, cli, load_resolved, paint, require_binding, state_cmd, usage};
 use dfm_engine::{
     Approval as Allowance, Dir, End, ProcRequest, Run, Runner, Store, now_ns, signal,
@@ -625,12 +624,6 @@ fn declaration(
             visible(&b.path)
         ))
     })?;
-    let env: Vec<(String, String)> = sc
-        .env
-        .iter()
-        .filter(|(n, _)| !FIXED_ENV.contains(&n.as_str()))
-        .cloned()
-        .collect();
     let id = resource_id(&t.tool);
     let block = script_block(
         &id,
@@ -639,7 +632,7 @@ fn declaration(
             effective_url: &sc.effective_url,
             shell: &sc.shell,
             args: &sc.args,
-            env: &env,
+            env_from: &sc.env_from,
             binary: &binary,
         },
     );
@@ -1365,8 +1358,11 @@ fn decide(
     (binary, stamp): (&Binary, &Stamp),
     scan_now: bool,
 ) -> Result<Decision, Refusal> {
-    let trial = trial_record(store, &args.trial)?;
-    // The record is canonical JSON on disk; its serialization here is the same document.
+    let mut trial = trial_record(store, &args.trial)?;
+    if let Some(script) = &mut trial.script {
+        script.protect_environment();
+    }
+    // Bind the record as adopted. Legacy custom values have become name references.
     let record = serde_json::to_vec(&trial)
         .map(|b| sha256_hex(&b))
         .map_err(|e| {
@@ -1841,7 +1837,7 @@ fn decide(
     }
 
     if scan_now {
-        // The declaration holds the script's arguments and `--env` values: it is scanned too.
+        // The script arguments can contain secrets, so scan its declaration too.
         let files: Vec<(String, Vec<u8>)> = candidates
             .iter()
             .map(|c| (c.live.clone(), c.bytes.clone()))

@@ -1100,6 +1100,9 @@ impl Store {
         if t.schema == state::SCHEMA {
             t.schema = state::TRIAL_SCHEMA_ADOPTED;
         }
+        if let Some(script) = &mut t.script {
+            script.protect_environment();
+        }
         t.adopted = Some(adopted);
         let (dir, name, bytes) = self.checked_trial(&t)?;
         dir.replace_file(&name, &bytes, &self.fail, "trial")

@@ -438,6 +438,7 @@ pub fn registry() -> Vec<Adapter> {
                     field("shell", Schema::Str, true),
                     field("args", Schema::Array(Box::new(Schema::Str)), false),
                     field("env", Schema::Map(Box::new(Schema::Str)), false),
+                    field("env_from", Schema::Array(Box::new(Schema::Str)), false),
                     field("binary", Schema::HomePath, true),
                 ]),
             ),

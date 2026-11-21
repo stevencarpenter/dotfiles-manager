@@ -111,7 +111,7 @@ Without `--tty` the script starts in a new session with standard input from `/de
 
 The preview notes are plain text matches on the script and are not guarantees. `note: the script reads /dev/tty; pass --tty to answer its prompts` appears when the text `/dev/tty` occurs. `note: the script edits shell startup files; ...` appears when `.zshrc`, `.zshenv`, `.bashrc` or `.profile` occurs.
 
-The digest is the SHA-256 of the canonical JSON of: trial id, tool, the script (URL, effective URL, SHA-256, bytes, shell, arguments, environment, `tty`), every baseline and data path, the skipped data candidates, the unknown tokens, `profile_sha256`, the binary identity and the binding stamp. The window watch set is not in the digest.
+The digest is the SHA-256 of the canonical JSON of: trial id, tool, the script (URL, effective URL, SHA-256, bytes, shell, arguments, salted environment digest, `tty`), every baseline and data path, the skipped data candidates, the unknown tokens, `profile_sha256`, the binary identity and the binding stamp. The window watch set is not in the digest.
 
 ### Fetch and cache
 
@@ -149,7 +149,7 @@ The script does not get dfm's environment. It gets exactly these variables, sort
 | `TERM` | Copied with `--tty` only. |
 | `--env` pairs | As given. |
 
-`id` and `getconf` run through the runner with `/usr/bin` first. The `--env` pairs cannot set any name in this table. The values go into the digest and the record. They are not checked for secrets: the record is a private state file.
+`id` and `getconf` run through the runner with `/usr/bin` first. The `--env` pairs cannot set any name in this table. The installer receives custom values in memory. The preview redacts them. The approval digest binds the environment with the machine’s private salt, so changing a supplied value requires another preview. The trial record stores the fixed environment and the names of custom variables in `env_from`. Installer-controlled terminal output can still print a value.
 
 ### The sandbox
 
@@ -204,7 +204,7 @@ The record also has a size budget of 3 MiB of serialized JSON, below the 4 MiB s
 | --- | --- |
 | `url`, `effective_url` | The requested URL and the URL after redirects. Both `https://`. |
 | `sha256`, `bytes` | The script as downloaded. |
-| `shell`, `args`, `env`, `tty` | How it ran. `env` is a list of `[name, value]` pairs, sorted by name. |
+| `shell`, `args`, `env`, `tty` | How it ran. `env` records the fixed environment. Optional `env_from` records custom names. Older records can contain custom literal values until adoption or purge. |
 | `before` | The window observation taken before the script started. |
 | `exit{code, signal}` | Exactly one is set. `signal` is `stopped` (a stop request), `timeout` or `signal`. Absent until the run ends, and absent when the script could not be started. |
 | `window[{path, change, kind, sha256, target, before}]` | One entry per difference. `change` is `created`, `modified`, `removed` or `kind-changed`. `before` describes a path observed earlier. Absent until the run ends. |
@@ -292,4 +292,4 @@ The record is not changed by an update. It keeps what the trial saw at its start
 - **Baseline for restore.** `baseline.paths` with `existed` and `sha256` as observed before the install. `existed: false` is not delete authority: nothing observes the path after the install, so a file created there by anything else is indistinguishable from the tool's. Purge treats such a path as a candidate that needs its own approval (its preview shows the live hash and the approved digest covers it). It restores nothing for a pre-existing path whose hash no longer matches, and never touches a path with `existed: true` and no hash (a directory).
 - **Owners.** `baseline.owners` says who had the tool. A pre-existing tool is never uninstalled. A dependency in `package.install.dependencies` is uninstalled only when no other active trial names it and Homebrew finds no installed formula that needs it. Purge reads no module (docs/purge.md, "Known limits").
 - **Unknown effects.** Purge reports the `unknown` entries as retained or unattributed, never as cleaned.
-- **Candidates for adopt.** `baseline.paths` are the files adopt reviews and promotes into a module. `package.adapter` and `package.name` are the install declaration it generates. For a script trial, each window entry `created` at the top level of `~/.config` is a candidate too, and `script` (URL, effective URL, shell, arguments, `--env` values, `binary.path`) is the `script/v1` declaration it generates (docs/adopt.md, "Script trials").
+- **Candidates for adopt.** `baseline.paths` are the files adopt reviews and promotes into a module. `package.adapter` and `package.name` are the install declaration it generates. For a script trial, each window entry `created` at the top level of `~/.config` is a candidate too, and `script` (URL, effective URL, shell, arguments, `--env` names, `binary.path`) is the `script/v1` declaration it generates (docs/adopt.md, "Script trials").

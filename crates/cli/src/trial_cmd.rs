@@ -58,24 +58,7 @@ pub struct ScriptArgs {
     pub tty: bool,
 }
 
-/// Variables the script run sets itself. `--env` cannot override them.
-pub(crate) const FIXED_ENV: [&str; 15] = [
-    "HOME",
-    "USER",
-    "LOGNAME",
-    "TMPDIR",
-    "SHELL",
-    "PATH",
-    "LANG",
-    "LC_ALL",
-    "TERM",
-    "ZDOTDIR",
-    "XDG_CONFIG_HOME",
-    "XDG_DATA_HOME",
-    "XDG_STATE_HOME",
-    "XDG_CACHE_HOME",
-    "XDG_BIN_HOME",
-];
+pub(crate) use dfm_model::state::FIXED_ENV;
 
 fn parse_env(pairs: Vec<String>) -> Result<Vec<(String, String)>, Refusal> {
     let mut env: Vec<(String, String)> = Vec::new();

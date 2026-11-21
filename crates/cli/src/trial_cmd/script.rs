@@ -649,12 +649,14 @@ struct Decision {
 
 impl Decision {
     /// Mirrors the package trial's digest, with the script in place of the provider.
-    fn digest(&self) -> Result<String, Refusal> {
+    fn digest(&self, salt: &[u8]) -> Result<String, Refusal> {
         let view = |ps: &[BaselinePath]| -> Vec<serde_json::Value> {
             ps.iter()
                 .map(|p| json!({"path": p.path, "existed": p.existed, "sha256": p.sha256}))
                 .collect()
         };
+        let env = serde_json::to_vec(&self.env)
+            .map_err(|e| Refusal::new(Code::IoFailed, e.to_string()))?;
         let doc = json!({
             "trial_id": self.trial_id,
             "tool": self.tool,
@@ -665,7 +667,7 @@ impl Decision {
                 "bytes": self.fetched.bytes,
                 "shell": self.shell,
                 "args": self.args,
-                "env": self.env,
+                "env": dfm_model::merge::salted(salt, &env),
                 "tty": self.tty,
             },
             "baseline": view(&self.baseline),
@@ -689,7 +691,7 @@ impl Decision {
     /// The record as `create_trial` writes it before the run: no exit, window or binary yet.
     /// The tool is never pre-existing: `run` refuses a tool that is already on PATH.
     fn record(&self, created: u64, before: Vec<Observed>) -> TrialRecord {
-        TrialRecord {
+        let mut record = TrialRecord {
             schema: TRIAL_SCHEMA_SCRIPT,
             binding: self.stamp.clone(),
             trial_id: self.trial_id.clone(),
@@ -712,6 +714,7 @@ impl Decision {
                 bytes: self.fetched.bytes,
                 shell: self.shell.clone(),
                 args: self.args.clone(),
+                env_from: Vec::new(),
                 env: self.env.clone(),
                 tty: self.tty,
                 before,
@@ -720,7 +723,11 @@ impl Decision {
                 binary: None,
                 fence: None,
             }),
+        };
+        if let Some(script) = &mut record.script {
+            script.protect_environment();
         }
+        record
     }
 
     fn print(&self, out: &mut dyn Write, digest: &str) -> std::io::Result<()> {
@@ -742,7 +749,16 @@ impl Decision {
         let env: Vec<String> = self
             .env
             .iter()
-            .map(|(n, v)| format!("{n}={}", visible(v)))
+            .map(|(n, v)| {
+                format!(
+                    "{n}={}",
+                    if super::FIXED_ENV.contains(&n.as_str()) {
+                        visible(v)
+                    } else {
+                        "[redacted]".into()
+                    }
+                )
+            })
             .collect();
         writeln!(out, "env: {}", env.join(" "))?;
         for h in hints(&f.body) {
@@ -1052,7 +1068,12 @@ pub(super) fn run(
         Ok((decision, profile))
     };
     let (first, _) = decide(fetched, confined)?;
-    let digest = first.digest()?;
+    let env_salt = |store: &Store| {
+        store.salt()?.ok_or_else(|| {
+            Refusal::new(Code::StateInvalid, "state/salt is missing; run dfm bind with the current identity before approving a script trial")
+        })
+    };
+    let digest = first.digest(&env_salt(&readable)?)?;
     if let Some(i) = &ctx.isolated {
         writeln!(out, "isolated: true {i}").map_err(w)?;
     }
@@ -1101,7 +1122,7 @@ pub(super) fn run(
         let fetched = cached(&layout.cache_dir, &s.url)?.ok_or_else(missing)?;
         let (locked, profile) = decide(fetched, confine(&ledger)?)?;
         stop()?;
-        let locked_digest = locked.digest()?;
+        let locked_digest = locked.digest(&env_salt(&store)?)?;
         if locked_digest != digest {
             return Err(stale(approved, &locked_digest));
         }
@@ -1521,7 +1542,7 @@ mod tests {
                 },
                 profile_sha256: profile.into(),
             }
-            .digest()
+            .digest(b"test salt")
             .unwrap()
         };
         let home = [("HOME", "/h")];

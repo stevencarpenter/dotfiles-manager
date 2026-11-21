@@ -152,7 +152,8 @@ The resolver checks the field types and that `binary` is a HOME-relative path (t
 - `url` and `effective_url`: `https://` with a host, no space or control character, at most 2048 bytes.
 - `shell`: `sh`, `bash` or `zsh`.
 - `args`: optional strings without a control character.
-- `env`: optional, the trial's `--env` values. A name matches `[A-Za-z_][A-Za-z0-9_]*` and is not one the run fixes (`HOME`, `PATH`, `TMPDIR` and the others of docs/trial.md, "The script's environment"). A value holds no control character other than a tab.
+- `env_from`: optional list of names from an adopted trial. For each name, export `DFM_SCRIPT_ENV_<NAME>` to the dfm invocation on the destination machine. The installer receives the value under `<NAME>`. A missing value blocks installation before the script fetch. A present binary needs no value. The install uses the value supplied at execution.
+- `env`: optional literal values for explicitly authored non-sensitive settings. A name matches `[A-Za-z_][A-Za-z0-9_]*` and is not one the run fixes (`HOME`, `PATH`, `TMPDIR` and the others of docs/trial.md, "The script's environment"). A value holds no control character other than a tab.
 
 The probe and the install:
 
