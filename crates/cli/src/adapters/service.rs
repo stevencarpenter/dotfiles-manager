@@ -10,7 +10,7 @@
 use dfm_engine::{Completion, End, ProcOutput, ProcRequest, Runner};
 use dfm_model::digest::sha256_hex;
 use dfm_model::plan::{Action, Definition, Scope, ServiceFacts, ServiceState};
-use dfm_model::resolve::{Resolved, Value};
+use dfm_model::resolve::{ResolvedResource, Value};
 use dfm_model::{Code, Refusal};
 use std::collections::BTreeMap;
 use std::io::Read;
@@ -1059,18 +1059,14 @@ pub fn act(
 /// ends the probing: the probe it arrived in is ended by the runner, no further launcher is
 /// started, and the request is the error. `staged` is [`Staged`]; `root` is the canonical
 /// checkout root.
-pub fn service_facts(
-    resolved: &Resolved,
+pub fn service_facts<'a>(
+    resources: impl Iterator<Item = &'a ResolvedResource>,
     runner: &Runner,
     staged: Option<Staged<'_>>,
     root: &Path,
 ) -> Result<BTreeMap<String, ServiceFacts>, Refusal> {
     let mut out = BTreeMap::new();
-    for r in resolved
-        .resources
-        .values()
-        .filter(|r| Scope::Services.covers(r))
-    {
+    for r in resources.filter(|r| Scope::Services.covers(r)) {
         if let Some(stop) = dfm_engine::signal::requested() {
             return Err(stop);
         }

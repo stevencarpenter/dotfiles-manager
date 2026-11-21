@@ -324,7 +324,7 @@ pub(crate) fn probe(
                 .as_deref()
                 .map(|t| (loaded.root.as_path(), t, &loaded.links, &loaded.generated));
             probed.service = crate::adapters::service::service_facts(
-                resolved,
+                resolved.resources.values(),
                 &ctx.runner(sys),
                 staged,
                 &loaded.root,

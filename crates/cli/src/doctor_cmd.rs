@@ -136,7 +136,15 @@ fn inspect(ctx: &Ctx, command: &'static str, root: Option<&Path>) -> Result<Repo
         .map_or(0, |d| d.as_secs());
     let (owned, scripts) = state_rows(sys, &layout, binding.as_ref(), &mut rows);
     lock_row(ctx, sys.uid, &mut rows);
-    let (loaded, plan) = profile_rows(ctx, &sys, &path, binding.as_ref(), root, &mut rows);
+    let (loaded, plan) = profile_rows(
+        ctx,
+        &sys,
+        &path,
+        binding.as_ref(),
+        root,
+        owned.as_deref(),
+        &mut rows,
+    );
     let sensitive = sensitive_paths(
         loaded.as_ref().map(|l| &l.resolved),
         owned.as_deref().unwrap_or_default(),
@@ -335,19 +343,7 @@ fn script_binary_rows(
     ledger: Option<&[Owned]>,
     rows: &mut Vec<Row>,
 ) {
-    // A sensitive merge reads fragments from these directories (`dir_claims`); a fragment
-    // there is sensitive although no claim names it, so nothing at or below one is read.
-    let dirs: Vec<String> = loaded
-        .into_iter()
-        .flat_map(|l| l.resolved.resources.values())
-        .filter(|r| r.sensitive)
-        .flat_map(|r| r.dir_claims.iter().map(|d| d.dir.clone()))
-        .collect();
-    // Each directory's metadata joins the targets, so a hard link to a fragment there (more
-    // than one link, on the directory's device) is not hashed either.
-    let mut spelled = spelled_sensitive(loaded, ledger.unwrap_or_default(), sensitive);
-    spelled.extend(dirs.iter().cloned());
-    let targets = sensitive_targets(home, &spelled);
+    let (dirs, targets) = protected_metadata(home, loaded, ledger, sensitive);
     // Without the ledger the sensitive set may miss a stale output path, and without the
     // resolved profile the fragment directories are unknown, so nothing is hashed.
     let unhashed = if ledger.is_none() {
@@ -417,6 +413,29 @@ fn script_binary_rows(
         let fix = "Run dfm sync, which installs the declared tool again.";
         rows.push(row(&who, &at, since, fix));
     }
+}
+
+/// Metadata shared by the service and executable checks. The caller skips content on any error.
+fn protected_metadata(
+    home: &Path,
+    loaded: Option<&Loaded>,
+    ledger: Option<&[Owned]>,
+    sensitive: &BTreeSet<String>,
+) -> (Vec<String>, Result<Vec<std::fs::Metadata>, String>) {
+    // A sensitive merge reads fragments from these directories (`dir_claims`); a fragment
+    // there is sensitive although no claim names it, so nothing at or below one is read.
+    let dirs: Vec<String> = loaded
+        .into_iter()
+        .flat_map(|l| l.resolved.resources.values())
+        .filter(|r| r.sensitive)
+        .flat_map(|r| r.dir_claims.iter().map(|d| d.dir.clone()))
+        .collect();
+    // Each directory's metadata joins the targets, so a hard link to a fragment there (more
+    // than one link, on the directory's device) is not hashed either.
+    let mut spelled = spelled_sensitive(loaded, ledger.unwrap_or_default(), sensitive);
+    spelled.extend(dirs.iter().cloned());
+    let targets = sensitive_targets(home, &spelled);
+    (dirs, targets)
 }
 
 /// The sensitive paths in the spelling the ledger and the claims use. `sensitive` holds folded
@@ -1212,6 +1231,7 @@ fn profile_rows(
     path: &OsStr,
     binding: Option<&Binding>,
     root: Option<&Path>,
+    ledger: Option<&[Owned]>,
     rows: &mut Vec<Row>,
 ) -> (Option<Loaded>, Option<Plan>) {
     let depends = |kind: &'static str, subject: &str, why: &str| {
@@ -1267,6 +1287,24 @@ fn profile_rows(
     let runner = ctx.runner(sys);
     let private = std::fs::symlink_metadata(&runner.cwd)
         .is_ok_and(|m| m.is_dir() && m.permissions().mode() & 0o7777 == 0o700);
+    let sensitive = sensitive_paths(Some(res), ledger.unwrap_or_default());
+    let (dirs, targets) = protected_metadata(&runner.home, Some(&loaded), ledger, &sensitive);
+    let protected = Protected {
+        sensitive: &sensitive,
+        dirs: &dirs,
+        targets: &targets,
+    };
+    let hidden_definition = |r: &ResolvedResource| {
+        if r.adapter != crate::adapters::service::LAUNCHD {
+            return false;
+        }
+        let Some(plist) = r.value.get("plist").and_then(toml::Value::as_str) else {
+            return false;
+        };
+        let at = runner.home.join(plist);
+        let real = std::fs::canonicalize(&at).unwrap_or_else(|_| at.clone());
+        ledger.is_none() || targets.is_err() || is_sensitive(&runner.home, &at, &real, &protected)
+    };
     let (packages, services) = if private {
         let packages = crate::adapters::package::package_facts(
             res,
@@ -1282,11 +1320,16 @@ fn profile_rows(
             rows.push(refusal_row("resource", "package probes", &r));
             BTreeMap::new()
         });
-        let services = crate::adapters::service::service_facts(res, &runner, None, &loaded.root)
-            .unwrap_or_else(|r| {
-                rows.push(refusal_row("resource", "service probes", &r));
-                BTreeMap::new()
-            });
+        let services = crate::adapters::service::service_facts(
+            res.resources.values().filter(|r| !hidden_definition(r)),
+            &runner,
+            None,
+            &loaded.root,
+        )
+        .unwrap_or_else(|r| {
+            rows.push(refusal_row("resource", "service probes", &r));
+            BTreeMap::new()
+        });
         (packages, services)
     } else {
         let why = format!(
@@ -1315,6 +1358,12 @@ fn profile_rows(
     for r in res.resources.values().filter(|r| !in_scope(r)) {
         if let (false, Some(s)) = (r.sensitive, packages.get(&r.id)) {
             rows.push(package_row(r, s, path));
+            continue;
+        }
+        if hidden_definition(r) {
+            rows.push(Row::new("resource", D::DependsUnknown, Level::Unknown, &r.id,
+                "the launch agent definition is sensitive or its sensitivity is unknown; its contents were not read",
+                "").optional());
             continue;
         }
         if let (false, Some(f)) = (r.sensitive, services.get(&r.id)) {

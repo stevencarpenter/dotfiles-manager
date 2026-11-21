@@ -1204,6 +1204,24 @@ fn a_secret_definition_shows_neither_its_hash_nor_its_arguments() {
     }
     assert!(!everything.contains("hunter2"), "{everything}");
     assert!(!everything.contains(&hash), "{everything}");
+    for (command, format) in [
+        ("doctor", None),
+        ("doctor", Some("--json")),
+        ("status", Some("--json")),
+    ] {
+        let mut args = vec![command, "--root", fx.root_arg()];
+        args.extend(format);
+        let diagnostic = fx.run(&args);
+        let shown = text(&diagnostic.stdout);
+        assert!(
+            shown.contains("launch agent definition is sensitive"),
+            "{shown}"
+        );
+        assert!(
+            !shown.contains("hunter2") && !shown.contains(&hash),
+            "{shown}"
+        );
+    }
     // A mode change is still a stale plan.
     fx.mark("loaded", "");
     let d = digest_of(&fx.preview(&[]));
