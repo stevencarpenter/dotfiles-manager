@@ -117,8 +117,7 @@ struct Decision {
     unknown: Vec<String>,
     /// The script URL of a script trial, which installs no package.
     script: Option<String>,
-    /// A script trial whose run did not finish: its candidates come from `before` and the
-    /// live state.
+    /// The script record has no final observation.
     interrupted: bool,
     binary: Binary,
     stamp: Stamp,
@@ -212,7 +211,7 @@ impl Decision {
         if self.interrupted {
             writeln!(
                 out,
-                "note: the script run of this trial did not finish; each path created since its before observation is a candidate"
+                "note: the script run of this trial did not finish; paths created since its before observation are retained"
             )?;
         }
         writeln!(
@@ -1423,34 +1422,10 @@ pub fn run(ctx: &Ctx, args: &Args, out: &mut dyn Write) -> Result<(), Refusal> {
             .then_some(TRUNCATED_WHY);
         let (mut retained, mut vouched) = (Vec::new(), Vec::new());
         if let Some(s) = &t.script {
-            // A run that did not finish has no window: what was created since `before` is. The
-            // live diff's link targets are today's, so no target counts as recorded.
-            let live: Vec<WindowEntry>;
-            // A run that ended but has no window failed its after-observation (a cap, for
-            // example): what changed during the run is unknown, and a live diff now would also
-            // count what appeared since. No window candidate is removed.
-            let ended_unobserved = s.window.is_none() && s.exit.is_some();
-            let entries = match &s.window {
-                Some(w) => w,
-                None if ended_unobserved => {
-                    retained.push((
-                        String::new(),
-                        "window candidates (the run ended but its after-observation was not \
-                         recorded; nothing it created is removed)"
-                            .into(),
-                    ));
-                    live = Vec::new();
-                    &live
-                }
-                None => {
-                    let watch = window::watch_set(&layout.home, &s.env);
-                    live = window::diff(&s.before, &window::observe(&watch)?)
-                        .into_iter()
-                        .map(|e| WindowEntry { target: None, ..e })
-                        .collect();
-                    &live
-                }
-            };
+            let entries = s.window.as_deref().unwrap_or_default();
+            if s.window.is_none() {
+                retained.push((String::new(), "window candidates (the after-observation was not recorded; ownership is unknown)".into()));
+            }
             // The trees the trial's sandbox protected that `check_claim` does not cover.
             let (root, _) = crate::canonical_root(&binding, None)?;
             let protected = protected_trees(
@@ -1482,7 +1457,9 @@ pub fn run(ctx: &Ctx, args: &Args, out: &mut dyn Write) -> Result<(), Refusal> {
             // an inexact name cannot be read back, so whatever it points at, file or directory,
             // could be left dangling.
             let truncated = t.unknown.iter().any(|u| u == window::WINDOW_TRUNCATED);
-            let keep_all = if truncated {
+            let keep_all = if s.window.is_none() {
+                Some("the after-observation was not recorded; ownership is unknown")
+            } else if truncated {
                 // A cut window may have dropped a link to any candidate, so none is removed.
                 Some(TRUNCATED_WHY)
             } else if s.window.is_some() && s.exit.is_none() {

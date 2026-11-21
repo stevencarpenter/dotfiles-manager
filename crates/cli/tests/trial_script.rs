@@ -2664,7 +2664,7 @@ fn a_link_into_a_held_created_directory_is_kept() {
 }
 
 #[test]
-fn an_interrupted_record_is_purged_from_its_before_observation() {
+fn an_interrupted_record_cannot_authorize_deleting_files_created_after_it() {
     if no_sandbox() {
         return;
     }
@@ -2680,29 +2680,24 @@ fn an_interrupted_record_is_purged_from_its_before_observation() {
         rec["script"][k] = serde_json::Value::Null;
     }
     fs::write(&p, serde_json::to_vec(&rec).unwrap()).unwrap();
-    // Created after the run ended: still a candidate, because the live state is compared.
     fs::write(fx.h(".later"), "x").unwrap();
-    // A link to a path outside every created directory: the live target is not a recorded one.
+    fs::create_dir_all(fx.h(".config/boat")).unwrap();
+    fs::write(fx.h(".config/boat/owner-config"), "mine").unwrap();
     std::os::unix::fs::symlink(fx.h(".keep"), fx.h(".local/bin/x")).unwrap();
     let (preview, run) = purged(&fx);
     let shown = text(&preview.stdout);
-    let note = shown
-        .find("note: the script run of this trial did not finish")
-        .unwrap_or_else(|| panic!("{shown}"));
-    assert!(note < shown.find("plan digest:").unwrap(), "{shown}");
-    let kept = format!(
-        "kept: {} -> {} (no target recorded)",
-        fx.h(".local/bin/x").display(),
-        fx.h(".keep").display()
+    assert!(
+        shown.contains("the after-observation was not recorded"),
+        "{shown}"
     );
-    assert!(shown.contains(&kept), "{shown}");
-    for want in [".boat", ".later"] {
-        let l = format!("action: remove {}", fx.h(want).display());
-        assert!(shown.contains(&l), "{l}\n{shown}");
-    }
-    let out = text(&run.stdout);
-    assert_eq!(code(&run), 0, "{}\n{out}", stderr(&run));
-    assert!(gone(&fx.h(".boat")) && gone(&fx.h(".later")), "{out}");
+    assert!(!shown.contains("action: remove"), "{shown}");
+    assert_eq!(code(&run), 0, "{}", stderr(&run));
+    assert!(fx.h(".boat").is_dir());
+    assert_eq!(fs::read_to_string(fx.h(".later")).unwrap(), "x");
+    assert_eq!(
+        fs::read_to_string(fx.h(".config/boat/owner-config")).unwrap(),
+        "mine"
+    );
     assert_eq!(fs::read_to_string(fx.h(".keep")).unwrap(), "mine\n");
     assert!(fs::symlink_metadata(fx.h(".local/bin/x")).is_ok());
     assert!(!p.exists());
@@ -3184,7 +3179,7 @@ fn a_run_that_ended_without_a_window_removes_no_window_candidate() {
     let (preview, run) = purged(&fx);
     let shown = text(&preview.stdout);
     assert!(
-        shown.contains("the run ended but its after-observation was not recorded"),
+        shown.contains("the after-observation was not recorded"),
         "{shown}"
     );
     assert!(!shown.contains("action: remove"), "{shown}");
