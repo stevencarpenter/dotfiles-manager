@@ -795,6 +795,18 @@ fn an_unchanged_world_matches_the_saved_plan() {
 }
 
 #[test]
+fn an_executable_bit_change_invalidates_a_saved_plan_without_changing_file_contents() {
+    let e = Env::personal();
+    let path = e.src("base/modules/core/files/gitconfig");
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+    let (f, _) = save(&e);
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+    let o = against(&e, &f);
+    assert_eq!(code(&o), 3, "{}", text(&o.stderr));
+    assert!(text(&o.stderr).contains("E_PLAN_STALE"));
+}
+
+#[test]
 fn a_source_edit_after_planning_invalidates_the_plan() {
     let e = Env::personal();
     let (f, _) = save(&e);

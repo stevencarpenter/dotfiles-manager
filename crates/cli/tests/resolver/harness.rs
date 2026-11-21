@@ -77,7 +77,7 @@ pub fn patch(doc: &mut Value, op: &str, path: &str, value: Option<Value>) {
 /// Parses `file` in the set, patches it, and stores the re-serialized document.
 pub fn apply(set: &mut SourceSet, file: &str, op: &str, path: &str, value: Option<Value>) {
     let bytes = match set.get(file) {
-        Some(dfm_model::resolve::Entry::File(b)) => b.clone(),
+        Some(dfm_model::resolve::Entry::File { bytes: b, .. }) => b.clone(),
         other => panic!("patch target {file} is not a file in the set: {other:?}"),
     };
     let mut doc: Value = toml::from_str(std::str::from_utf8(&bytes).unwrap()).unwrap();
@@ -87,7 +87,9 @@ pub fn apply(set: &mut SourceSet, file: &str, op: &str, path: &str, value: Optio
 
 pub fn text(set: &SourceSet, file: &str) -> String {
     match set.get(file) {
-        Some(dfm_model::resolve::Entry::File(b)) => String::from_utf8(b.clone()).unwrap(),
+        Some(dfm_model::resolve::Entry::File { bytes: b, .. }) => {
+            String::from_utf8(b.clone()).unwrap()
+        }
         other => panic!("{file}: {other:?}"),
     }
 }

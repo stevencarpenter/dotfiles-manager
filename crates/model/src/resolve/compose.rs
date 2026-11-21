@@ -1362,11 +1362,11 @@ fn contain(
                 let full = format!("{path}/{name}");
                 match sources.locate(&full, &sup.dir) {
                     Ok(Located::File { bytes, .. }) => {
-                        if let super::source::Entry::File(_) = e {
+                        if let super::source::Entry::File { executable, .. } = e {
                             entries.push(TreeEntry {
                                 path: name.to_string(),
                                 kind: EntryKind::File {
-                                    exec: false,
+                                    exec: *executable,
                                     sha256: sha256_hex(bytes),
                                 },
                             });

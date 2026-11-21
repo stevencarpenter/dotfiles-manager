@@ -466,6 +466,37 @@ fn a_changed_source_makes_the_approved_plan_stale() {
     assert!(!fx.h(".config/git/config").exists());
 }
 
+#[test]
+fn a_link_source_executable_bit_change_during_apply_blocks_publication() {
+    for directory in [false, true] {
+        let fx = Fx::new();
+        let file = if directory {
+            let manifest = CORE.replace(
+                "source = \"files/gitconfig\"",
+                "source = \"files/hooks\"\ndirectory = true",
+            );
+            fx.put("base/modules/core/module.toml", &manifest);
+            fx.put("base/modules/core/files/hooks/prepare", "prepare\n");
+            "base/modules/core/files/hooks/prepare"
+        } else {
+            "base/modules/core/files/gitconfig"
+        };
+        fs::set_permissions(fx.root.join(file), fs::Permissions::from_mode(0o644)).unwrap();
+        let o = parked_apply(&fx, "apply-before-op-core.git@.config/git/config", |fx| {
+            fs::set_permissions(fx.root.join(file), fs::Permissions::from_mode(0o755)).unwrap();
+        });
+        let out = text(&o.stdout);
+        assert_eq!(code(&o), 1, "{}\n{out}", stderr(&o));
+        assert!(out.contains("blocked core.git@.config/git/config"), "{out}");
+        assert!(
+            out.contains("E_PLAN_STALE") || stderr(&o).contains("E_PLAN_STALE"),
+            "{}\n{out}",
+            stderr(&o)
+        );
+        assert!(fs::symlink_metadata(fx.h(".config/git/config")).is_err());
+    }
+}
+
 // ---- publication ------------------------------------------------------------------------
 
 #[test]

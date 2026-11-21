@@ -568,8 +568,8 @@ pub fn file_fingerprint(content: &[u8]) -> String {
 }
 
 /// The identity of a source tree read from `root`: the
-/// canonical absolute root and the tree digest. Regular files and links only; the loader does
-/// not record the executable bit, so a mode-only edit is not detected (docs/planner.md).
+/// canonical absolute root and the tree digest. The tree includes directories, links, and the contents
+/// and executable bit of each regular file.
 pub fn source_identity(root: &str, set: &crate::resolve::SourceSet) -> Source {
     use crate::digest::{EntryKind, TreeEntry, tree_digest};
     use crate::resolve::Entry;
@@ -577,9 +577,9 @@ pub fn source_identity(root: &str, set: &crate::resolve::SourceSet) -> Source {
         .paths()
         .filter_map(|p| {
             let kind = match set.get(p)? {
-                Entry::File(b) => EntryKind::File {
-                    exec: false,
-                    sha256: sha256_hex(b),
+                Entry::File { bytes, executable } => EntryKind::File {
+                    exec: *executable,
+                    sha256: sha256_hex(bytes),
                 },
                 Entry::Link(t) => EntryKind::Symlink { target: t.clone() },
             };

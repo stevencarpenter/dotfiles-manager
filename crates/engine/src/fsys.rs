@@ -1004,6 +1004,17 @@ impl Dir {
     /// Reads at most `limit` bytes of the regular file `name` without following a link.
     /// `None` when it is absent, not a regular file, or larger than `limit`.
     pub fn read_plain(&self, name: &str, limit: u64) -> Result<Option<Vec<u8>>, Refusal> {
+        Ok(self
+            .read_plain_with_mode(name, limit)?
+            .map(|(bytes, _)| bytes))
+    }
+
+    /// The mode and bytes of the same open regular file.
+    pub(crate) fn read_plain_with_mode(
+        &self,
+        name: &str,
+        limit: u64,
+    ) -> Result<Option<(Vec<u8>, u32)>, Refusal> {
         check_name(name)?;
         let fd = match rfs::openat(
             &self.fd,
@@ -1024,7 +1035,10 @@ impl Dir {
             .take(limit.saturating_add(1))
             .read_to_end(&mut buf)
             .map_err(|e| io("read file", &e))?;
-        Ok((u64::try_from(buf.len()).unwrap_or(u64::MAX) <= limit).then_some(buf))
+        Ok(
+            (u64::try_from(buf.len()).unwrap_or(u64::MAX) <= limit)
+                .then_some((buf, mode_bits(&st))),
+        )
     }
 
     /// Reads the live file `name` of a co-owned destination from one descriptor opened without

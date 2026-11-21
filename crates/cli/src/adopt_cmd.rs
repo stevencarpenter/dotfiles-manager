@@ -1288,7 +1288,7 @@ fn within_source_limits(
     }
     let mut total: u64 = 0;
     for p in sources.paths() {
-        let Some(Entry::File(b)) = sources.get(p) else {
+        let Some(Entry::File { bytes: b, .. }) = sources.get(p) else {
             continue;
         };
         let len = match brewfile {
@@ -1385,7 +1385,7 @@ fn decide(
     })?;
     let module = args.module.as_str();
     let modules_line = match loaded.sources.get(&profile) {
-        Some(Entry::File(b)) => String::from_utf8_lossy(b)
+        Some(Entry::File { bytes: b, .. }) => String::from_utf8_lossy(b)
             .lines()
             .find(|l| l.trim_start().starts_with("modules"))
             .map_or_else(|| "modules = [...]".to_string(), |l| l.trim().to_string()),
@@ -1411,7 +1411,11 @@ fn decide(
     }
     // C1: the manifest is the file the resolver read as a regular source file, not a lexical
     // guess; the resolve of the edited composition below checks that it declares the module.
-    let Some(Entry::File(manifest_bytes)) = loaded.sources.get(&manifest) else {
+    let Some(Entry::File {
+        bytes: manifest_bytes,
+        executable: manifest_exec,
+    }) = loaded.sources.get(&manifest)
+    else {
         return Err(conflict(format!(
             "the manifest {manifest} of module {module} is not a regular file in the sources"
         )));
@@ -1581,7 +1585,7 @@ fn decide(
     let base_resolved;
     let resolved_now = if manifest_done {
         let mut s = loaded.sources.clone();
-        s.insert_file(manifest.clone(), manifest_base.to_vec());
+        s.insert_file_with_exec(manifest.clone(), manifest_base.to_vec(), *manifest_exec);
         base_resolved = resolve(&s, &profile, &crate::builtin_catalog()).map_err(Refusal::from)?;
         &base_resolved
     } else {
@@ -1865,9 +1869,9 @@ fn decide(
     // The edited composition must resolve, and plan each new link as an approved takeover.
     let new_manifest = append(manifest_base, &blocks);
     let mut sources = loaded.sources.clone();
-    sources.insert_file(manifest.clone(), new_manifest.clone());
-    for c in &candidates {
-        sources.insert_file(c.repo.clone(), c.bytes.clone());
+    sources.insert_file_with_exec(manifest.clone(), new_manifest.clone(), *manifest_exec);
+    for c in candidates.iter().filter(|c| !c.copied) {
+        sources.insert_file_with_exec(c.repo.clone(), c.bytes.clone(), c.mode & 0o111 != 0);
     }
     let brew_post = brewfile
         .as_ref()
