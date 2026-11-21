@@ -1482,7 +1482,7 @@ fn a_failing_clone_leaves_nothing_and_the_install_stays_planned() {
 }
 
 #[test]
-fn the_stale_clone_cleanup_removes_only_directories() {
+fn checkout_preserves_all_preexisting_siblings() {
     let fx = checkout_fx("https://github.com/o/r.git", "");
     let parent = fx.home.path().join("x");
     fs::create_dir_all(parent.join(".r.dfm-clone-1/.git")).unwrap();
@@ -1493,7 +1493,7 @@ fn the_stale_clone_cleanup_removes_only_directories() {
     std::os::unix::fs::symlink(&elsewhere, parent.join(".r.dfm-clone-link")).unwrap();
     let o = fx.packages(&digest_of(&fx.preview()));
     assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
-    assert!(!parent.join(".r.dfm-clone-1").exists());
+    assert!(parent.join(".r.dfm-clone-1/.git").is_dir());
     assert_eq!(
         fs::read_to_string(parent.join(".r.dfm-clone-file")).unwrap(),
         "mine"

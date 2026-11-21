@@ -15,6 +15,7 @@ use dfm_model::state::valid_path;
 use dfm_model::{Code, Refusal};
 use std::fs;
 use std::io::ErrorKind;
+use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
 
 pub(crate) const ADAPTER: &str = "git-checkout/v1";
@@ -189,66 +190,98 @@ pub(crate) fn probe(
     }
 }
 
-/// Clones the declared repository into a sibling directory `.<name>.dfm-clone-<pid>` and renames
-/// it to the missing path once the clone succeeds, so a failed or killed clone never leaves a
-/// half checkout at the path. Prompts are off. The caller probes again afterwards. The sibling is
-/// a directory this run created: it is removed on failure, and one left by an earlier killed
-/// run is removed first. A url that needs a grant is checked for it again first.
-pub(crate) fn install(runner: &Runner, r: &ResolvedResource, cx: &ScriptCx) -> Result<(), Refusal> {
-    let d = declared(&r.value)?;
-    refuse_source_overlap(cx, r, &runner.home.join(&d.path))?;
-    source_gate(cx, r, identity(&d.url)?)?;
-    let dir = runner.home.join(&d.path);
-    let (Some(parent), Some(name)) = (dir.parent(), dir.file_name().and_then(|n| n.to_str()))
-    else {
+/// Populates a new checkout privately and publishes it only while the destination is absent.
+pub(crate) fn publish_checkout(
+    destination: &Path,
+    populate: impl FnOnce(&Path) -> Result<(), Refusal>,
+) -> Result<(), Refusal> {
+    let (Some(parent), Some(name)) = (
+        destination.parent(),
+        destination.file_name().and_then(|n| n.to_str()),
+    ) else {
         return Err(invalid("path has no directory name"));
     };
-    let io = |what: &Path, e: std::io::Error| {
+    let io = |path: &Path, e: std::io::Error| {
         Refusal::new(
             Code::IoFailed,
-            format!("{} could not be changed: {}", what.display(), e.kind()),
+            format!("{} could not be changed: {}", path.display(), e.kind()),
         )
     };
     fs::create_dir_all(parent).map_err(|e| io(parent, e))?;
-    let prefix = format!(".{name}.dfm-clone-");
-    for e in fs::read_dir(parent).map_err(|e| io(parent, e))? {
-        let e = e.map_err(|e| io(parent, e))?;
-        // Only a directory is a stale clone; a file or a link of that name is left alone.
-        let dir = fs::symlink_metadata(e.path()).is_ok_and(|m| m.is_dir());
-        if dir && e.file_name().to_string_lossy().starts_with(&prefix) {
-            fs::remove_dir_all(e.path()).map_err(|x| io(&e.path(), x))?;
+    let stage = parent.join(format!(
+        ".{name}.dfm-clone-{}-{}",
+        std::process::id(),
+        dfm_engine::now_ns()?
+    ));
+    fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&stage)
+        .map_err(|e| io(&stage, e))?;
+    let checkout = stage.join("checkout");
+    let result = populate(&checkout).and_then(|()| {
+        dfm_engine::fsys::publish_new_checkout(&checkout, destination)
+            .map_err(|e| io(destination, e))
+    });
+    let cleanup = fs::remove_dir_all(&stage).map_err(|e| io(&stage, e));
+    result.and(cleanup)
+}
+
+/// Clones the declared repository into a private sibling before publishing it at the missing path.
+pub(crate) fn install(runner: &Runner, r: &ResolvedResource, cx: &ScriptCx) -> Result<(), Refusal> {
+    let d = declared(&r.value)?;
+    let destination = runner.home.join(&d.path);
+    refuse_source_overlap(cx, r, &destination)?;
+    source_gate(cx, r, identity(&d.url)?)?;
+    publish_checkout(&destination, |tmp| {
+        let tmp_text = tmp
+            .to_str()
+            .ok_or_else(|| invalid("path resolves to a path that is not UTF-8"))?;
+        let mut args = vec!["clone".to_string()];
+        if let Some(b) = &d.branch {
+            args.extend(["--branch".to_string(), b.clone()]);
         }
-    }
-    let tmp = parent.join(format!("{prefix}{}", std::process::id()));
-    let tmp_text = tmp
-        .to_str()
-        .ok_or_else(|| invalid("path resolves to a path that is not UTF-8"))?;
-    let mut args = vec!["clone".to_string()];
-    if let Some(b) = &d.branch {
-        args.extend(["--branch".to_string(), b.clone()]);
-    }
-    args.extend(["--".to_string(), d.url.clone(), tmp_text.to_string()]);
-    // A key held only in an ssh-agent must reach git's ssh; nothing else passes through.
-    let env: Vec<(String, String)> = std::iter::once(("GIT_TERMINAL_PROMPT".into(), "0".into()))
-        .chain(super::updater::ssh_agent())
-        .collect();
-    let cloned = change(
-        runner,
-        "git",
-        &args,
-        &env,
-        &format!("git {}", args.join(" ")),
-    )
-    .and_then(|()| fs::rename(&tmp, &dir).map_err(|e| io(&dir, e)));
-    if cloned.is_err() {
-        let _ = fs::remove_dir_all(&tmp);
-    }
-    cloned
+        args.extend(["--".to_string(), d.url.clone(), tmp_text.to_string()]);
+        // A key held only in an ssh-agent must reach git's ssh; nothing else passes through.
+        let env: Vec<(String, String)> =
+            std::iter::once(("GIT_TERMINAL_PROMPT".into(), "0".into()))
+                .chain(super::updater::ssh_agent())
+                .collect();
+        change(
+            runner,
+            "git",
+            &args,
+            &env,
+            &format!("git {}", args.join(" ")),
+        )
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_directory_that_appears_during_the_clone_keeps_its_identity() {
+        use std::os::unix::fs::MetadataExt;
+        let parent = std::env::temp_dir().join(format!(
+            "dfm-publish-{}-{}",
+            std::process::id(),
+            dfm_engine::now_ns().unwrap()
+        ));
+        fs::create_dir(&parent).unwrap();
+        let destination = parent.join("repo");
+        let mut inode = 0;
+        let result = publish_checkout(&destination, |stage| {
+            fs::create_dir(stage).unwrap();
+            fs::create_dir(&destination).unwrap();
+            inode = fs::metadata(&destination).unwrap().ino();
+            Ok(())
+        });
+        assert!(result.is_err());
+        assert_eq!(fs::metadata(&destination).unwrap().ino(), inode);
+        assert_eq!(fs::read_dir(&parent).unwrap().count(), 1);
+        fs::remove_dir_all(parent).unwrap();
+    }
 
     fn value(url: &str, extra: &str) -> Value {
         Value::Table(toml::from_str(&format!("url = {url:?}\npath = \"x/r\"\n{extra}")).unwrap())

@@ -190,6 +190,12 @@ pub(crate) fn publish_err(path: &Path, e: Errno) -> Refusal {
     sys_err("publish", e)
 }
 
+/// Publishes a staged checkout without replacing a destination that appeared during the clone.
+pub fn publish_new_checkout(from: &Path, to: &Path) -> std::io::Result<()> {
+    rfs::renameat_with(rfs::CWD, from, rfs::CWD, to, rfs::RenameFlags::NOREPLACE)?;
+    Ok(())
+}
+
 /// Renames `from` to `to` in the directory `dir` and fails with `EEXIST` when `to` exists.
 pub(crate) fn rename_new(dir: &OwnedFd, from: &str, to: &str) -> Result<(), Errno> {
     rfs::renameat_with(dir, from, dir, to, rfs::RenameFlags::NOREPLACE)
