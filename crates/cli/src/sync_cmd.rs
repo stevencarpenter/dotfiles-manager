@@ -9,6 +9,9 @@
 //! rebase, commit or push. A nested source is pinned to an exact commit, and the lock that holds
 //! the pin is never rewritten.
 
+mod pending_copy;
+
+use self::pending_copy::PendingCopy;
 use crate::adapters::{checkout, secret, updater};
 use crate::plan_cmd::{plan_for, plan_with_outputs, render_body};
 use crate::read_fs::read_regular_bounded;
@@ -449,12 +452,21 @@ const MAX_COPY_ENTRIES: usize = 1_000_000;
 /// Copies the checkout at `from` to `to` as it is: directories, regular files with their mode,
 /// and symlinks as symlinks (never followed). A socket or FIFO inside a `.git` directory (a file
 /// monitor's socket) is skipped; anywhere else it is untrusted, as the source loader says.
-fn copy_checkout(from: &Path, to: &Path) -> Result<(), Refusal> {
-    fn go(from: &Path, to: &Path, in_git: bool, seen: &mut usize) -> Result<(), Refusal> {
+fn copy_checkout(from: &Path, to: &Path, omit: Option<&Path>) -> Result<(), Refusal> {
+    fn go(
+        from: &Path,
+        to: &Path,
+        in_git: bool,
+        seen: &mut usize,
+        omit: Option<&Path>,
+    ) -> Result<(), Refusal> {
         let e = |e: std::io::Error| io_failed("copy the checkout into staging", &e);
-        fs::create_dir(to).map_err(e)?;
         for entry in fs::read_dir(from).map_err(e)? {
             let entry = entry.map_err(e)?;
+            let src = entry.path();
+            if Some(src.as_path()) == omit {
+                continue;
+            }
             *seen += 1;
             if *seen > MAX_COPY_ENTRIES {
                 return Err(Refusal::new(
@@ -462,14 +474,15 @@ fn copy_checkout(from: &Path, to: &Path) -> Result<(), Refusal> {
                     format!("the checkout holds more than {MAX_COPY_ENTRIES} entries"),
                 ));
             }
-            let (src, dst) = (entry.path(), to.join(entry.file_name()));
+            let dst = to.join(entry.file_name());
             let meta = fs::symlink_metadata(&src).map_err(e)?;
             let ft = meta.file_type();
             if ft.is_symlink() {
                 std::os::unix::fs::symlink(fs::read_link(&src).map_err(e)?, &dst).map_err(e)?;
             } else if ft.is_dir() {
                 let git_dir = in_git || entry.file_name().eq_ignore_ascii_case(".git");
-                go(&src, &dst, git_dir, seen)?;
+                fs::create_dir(&dst).map_err(e)?;
+                go(&src, &dst, git_dir, seen, omit)?;
             } else if ft.is_file() {
                 fs::copy(&src, &dst).map_err(e)?;
             } else if !in_git {
@@ -483,7 +496,7 @@ fn copy_checkout(from: &Path, to: &Path) -> Result<(), Refusal> {
         fs::set_permissions(to, fs::symlink_metadata(from).map_err(e)?.permissions()).map_err(e)
     }
     let mut seen = 0;
-    go(from, to, false, &mut seen)
+    go(from, to, false, &mut seen, omit)
 }
 
 /// A checkout the command drives (the staged copy or the live one) must be self-contained: its
@@ -919,6 +932,7 @@ fn stage_all(
     grants: &Grants,
     root: &Path,
     tree: &Path,
+    omit: Option<&Path>,
 ) -> Result<Vec<Staged>, Refusal> {
     // A checkout that holds the cache directory (a HOME that is itself the checkout) would be
     // copied into itself.
@@ -928,7 +942,8 @@ fn stage_all(
             visible(path_str(root)?)
         )));
     }
-    copy_checkout(root, tree)?;
+    fs::create_dir(tree).map_err(|e| io_failed("create the staged checkout", &e))?;
+    copy_checkout(root, tree, omit)?;
     let staged_root = stage_source(git, root_src, tree.to_path_buf(), root.to_path_buf())?;
     let fetched = read_lock(tree)?;
     let fetched_root = fetched
@@ -1705,7 +1720,7 @@ fn publication_error(store: &Store, audit: &state::Receipt, error: Refusal) -> R
 
 /// Publishes one staged source into its checkout exactly as the rehearsal moved the copy, after
 /// rechecking that the checkout is where the copy saw it. `Ok(true)` when the checkout changed.
-fn publish(git: &Git, root: &Path, s: &Staged) -> Result<bool, Refusal> {
+fn publish(git: &Git, root: &Path, s: &Staged, copies: &PendingCopy) -> Result<bool, Refusal> {
     let id = s.src.id.as_str();
     let (repo_s, live_s) = (path_str(&s.repo)?, path_str(&s.live)?);
     let now = head_of(git, &s.live)?;
@@ -1749,7 +1764,13 @@ fn publish(git: &Git, root: &Path, s: &Staged) -> Result<bool, Refusal> {
                         .map_err(|e| io_failed("locate the checkout staging volume", &e))
                 };
                 let stage_in = (device(&git_dir)? == device(parent)?).then_some(git_dir.as_path());
-                checkout::publish_checkout(&s.live, stage_in, |tmp| copy_checkout(&s.repo, tmp))?;
+                checkout::publish_checkout(&s.live, stage_in, |tmp| {
+                    fs::create_dir(tmp).map_err(|e| io_failed("create the checkout copy", &e))?;
+                    copies.register(tmp)?;
+                    copy_checkout(&s.repo, tmp, None)
+                })?;
+                // Publication has succeeded. An obsolete cache record names an absent stage.
+                let _ = copies.forget();
             }
             Err(e) => return Err(io_failed("publish the new nested checkout", &e)),
         }
@@ -1954,7 +1975,16 @@ fn run_inner(
     // staged tree as the tree --root will hold.
     let git = Git::new(ctx, &sys);
     let staging = Staging::create(ctx, &sys, false)?;
-    let previewed = stage_all(&git, root_src, &grants, &root, &staging.tree())?;
+    let copies = PendingCopy::new(&ctx.platform.cache_dir(), &root, sys)?;
+    let orphan = copies.find()?;
+    let previewed = stage_all(
+        &git,
+        root_src,
+        &grants,
+        &root,
+        &staging.tree(),
+        orphan.as_ref().map(|o| o.path.as_path()),
+    )?;
     for s in &previewed {
         // A root checkout on another branch is fast-forwarded where it is; say so.
         let checkout = match &s.branch {
@@ -2019,6 +2049,7 @@ fn run_inner(
     // part that would run with a change, can end here (docs/apply.md, step 4).
     if args.apply.yes_plan.is_none()
         && !journal_open
+        && orphan.is_none()
         && previewed.iter().all(|s| s.old.as_ref() == Some(&s.new))
         && parts.iter().all(|p| {
             not_run(p).is_some()
@@ -2076,7 +2107,10 @@ fn run_inner(
     }
     store.require_identity(&binding)?;
     let second = Staging::create(ctx, &sys, true)?;
-    let staged = stage_all(&git, root_src, &grants, &root, &second.tree())?;
+    if let Some(found) = copies.find()? {
+        copies.recover(found)?;
+    }
+    let staged = stage_all(&git, root_src, &grants, &root, &second.tree(), None)?;
     let (_, locked) = plan_staged(ctx, &binding, (&root, &rel), &second.tree(), args)?;
     let locked_digest = sync_digest(&locked, &staged, args.upgrade);
     if locked_digest != digest {
@@ -2114,7 +2148,7 @@ fn run_inner(
     for s in &staged {
         match fail
             .hit(&format!("sync-before-publish-{}", s.src.id))
-            .and_then(|()| publish(&git, &root, s))
+            .and_then(|()| publish(&git, &root, s, &copies))
         {
             Ok(changed) => {
                 audit.sources.push(state::SourceId {

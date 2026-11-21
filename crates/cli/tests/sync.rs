@@ -1053,6 +1053,45 @@ fn an_interrupted_first_nested_publication_can_be_retried() {
 }
 
 #[test]
+fn preview_and_retry_recover_a_registered_cross_volume_copy() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let fx = Fx::new();
+    let (ext, pin) = fx.add_ext();
+    fx.trust(&ext.origin());
+    let digest = digest_of(&fx.preview());
+    let root = fs::canonicalize(&fx.root).unwrap();
+    let rel = Path::new("base/.ext.dfm-clone-test");
+    let stage = root.join(rel);
+    let checkout = stage.join("checkout");
+    let token = "owner-123";
+    fs::create_dir(&stage).unwrap();
+    fs::set_permissions(&stage, fs::Permissions::from_mode(0o700)).unwrap();
+    fs::create_dir(stage.join(token)).unwrap();
+    fs::create_dir(&checkout).unwrap();
+    put(&checkout, ".git/HEAD", "ref: refs/heads/main");
+    let id = |p| {
+        let meta = fs::metadata(p).unwrap();
+        (meta.dev(), meta.ino())
+    };
+    let key = dfm_model::digest::sha256_hex(root.as_os_str().as_encoded_bytes());
+    let record = fx.h(&format!(".cache/dotfiles-manager/sync-copy-{key}.json"));
+    fs::write(
+        &record,
+        serde_json::to_vec(&(rel, id(&stage), id(&checkout), token)).unwrap(),
+    )
+    .unwrap();
+    fs::set_permissions(&record, fs::Permissions::from_mode(0o600)).unwrap();
+    assert_eq!(digest_of(&fx.preview()), digest);
+    assert!(checkout.join(".git/HEAD").exists());
+    let retry = fx.plain(&["--yes-plan", &digest]);
+    assert_eq!(code(&retry), 0, "{}\n{}", stdout(&retry), stderr(&retry));
+    assert_eq!(git(&root.join("base/ext"), &["rev-parse", "HEAD"]), pin);
+    assert!(!stage.exists());
+    assert!(!record.exists());
+}
+
+#[test]
 fn a_failed_second_publication_names_the_first_and_runs_no_scope() {
     let fx = Fx::new();
     let old = fx.head();

@@ -215,6 +215,13 @@ pub struct Ident {
     ino: u64,
 }
 
+impl Ident {
+    /// Values used to identify the same open directory after a process restart.
+    pub fn device_inode(self) -> (u64, u64) {
+        (self.dev, self.ino)
+    }
+}
+
 pub(crate) fn ident_of(st: &Stat) -> Result<Ident, Refusal> {
     Ok(Ident {
         dev: u64::try_from(st.st_dev).map_err(|_| storage("a device number is out of range"))?,
@@ -1207,6 +1214,15 @@ impl Dir {
         let Some(d) = self.child(sys, name, false, false)? else {
             return Ok(());
         };
+        self.remove_open_tree(sys, name, &d)
+    }
+
+    /// Clears the held directory and unlinks its name only if it still names that directory.
+    pub fn remove_open_tree(&self, sys: &Sys, name: &str, d: &Dir) -> Result<(), Refusal> {
+        let ident = d.ident()?;
+        if self.entry_ident(name)? != Some(ident) {
+            return Err(storage("the directory to remove was replaced"));
+        }
         let listing = d.list()?;
         if listing.odd > 0 {
             return Err(storage(format!(
@@ -1222,6 +1238,9 @@ impl Dir {
                 Err(Errno::NOENT) => {}
                 Err(e) => return Err(sys_err("stat entry", e)),
             }
+        }
+        if self.entry_ident(name)? != Some(ident) {
+            return Err(storage("the cleared directory was replaced"));
         }
         rfs::unlinkat(&self.fd, name, AtFlags::REMOVEDIR)
             .map_err(|e| sys_err("remove directory", e))
