@@ -1326,8 +1326,24 @@ fn two_checkouts_at_one_path_or_nested_paths_collide() {
     }
 }
 
+#[test]
+fn a_checkout_and_a_regular_link_cannot_claim_the_same_path() {
+    let mut set = examples();
+    edit(
+        &mut set,
+        AGENTS_MOD,
+        "add",
+        "/resources/-",
+        Some(
+            r#"{ id = "config-clone", kind = "package", adapter = "git-checkout/v1", value = { url = "https://github.com/o/config", path = ".CONFIG/git/config" } }"#,
+        ),
+    );
+    let e = err(&set, PERSONAL);
+    assert_eq!(e.code, Code::TargetCollision, "{e}");
+    assert!(e.message.contains("a checkout and a file"), "{e}");
+}
+
 /// The M5 layout: a directory link at `.config/tmux` and the tpm checkout below it resolve.
-/// A checkout path collides only with another checkout path.
 #[test]
 fn a_checkout_below_a_directory_link_resolves() {
     let mut set = examples();

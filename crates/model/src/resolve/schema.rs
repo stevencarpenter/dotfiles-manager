@@ -62,7 +62,8 @@ pub enum Claims {
         pattern: &'static str,
     },
     /// The HOME path at this field (a `HomePath`): a directory the resource owns, such as a
-    /// `git-checkout/v1` clone. It collides only with another `Path` claim, equal or nested.
+    /// `git-checkout/v1` clone. It collides with a file at the same path, and with an equal or nested
+    /// `Path` claim.
     Path(&'static str),
     /// One leaf per enabled entry under each root: `<root>/<entry name>`.
     Leaves {

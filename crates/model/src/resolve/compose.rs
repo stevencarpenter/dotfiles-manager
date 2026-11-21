@@ -901,7 +901,7 @@ fn finish(
     let mut include_total = 0usize;
     let mut leaf_budget = 0usize;
     let mut claim_budget = 0usize;
-    // The paths of `Claims::Path` resources, checked only against each other.
+    // The directories of `Claims::Path` resources.
     let mut owned_paths: Vec<(String, String)> = Vec::new();
     let mut packages = BTreeMap::new();
     // One digest per located source path, however many references name it.
@@ -1188,14 +1188,34 @@ fn finish(
 }
 
 /// Two `Claims::Path` resources (`git-checkout/v1` clones) may not own one directory, compared
-/// without case, or one inside the other. Any other resource may sit at or below such a path:
-/// a checkout under a directory link is the tmux plugin layout, and sync's ignore rule governs
-/// a checkout inside a source tree (docs/upgrade.md).
+/// without case, or one inside the other. Other resources cannot claim the same leaf. A checkout may sit
+/// below a directory link, as in the tmux plugin layout (docs/upgrade.md).
 fn check_owned_paths(
     resolved: &BTreeMap<String, ResolvedResource>,
     mut owned: Vec<(String, String)>,
 ) -> Result<(), ResolveError> {
     let tokens = |p: &str| -> Vec<String> { p.split('/').map(crate::fold::fold).collect() };
+    if owned.is_empty() {
+        return Ok(());
+    }
+    let checkout: BTreeMap<_, _> = owned
+        .iter()
+        .map(|(path, gid)| (crate::fold(path), (path, gid)))
+        .collect();
+    for (gid, r) in resolved {
+        for leaf in &r.claims {
+            if let Some((path, owner)) = checkout.get(&crate::fold(leaf)) {
+                return Err(collision(
+                    r,
+                    gid,
+                    leaf,
+                    owner,
+                    path,
+                    "a checkout and a file cannot own the same path",
+                ));
+            }
+        }
+    }
     owned.sort_by_cached_key(|(p, gid)| (tokens(p), gid.clone()));
     for pair in owned.windows(2) {
         let ((a, a_gid), (b, b_gid)) = (&pair[0], &pair[1]);
@@ -1468,7 +1488,7 @@ fn claims_of(
     Ok(match spec.claims {
         Claims::None => (Vec::new(), Vec::new()),
         Claims::Target => (owner.doc.target.iter().cloned().collect(), Vec::new()),
-        // Checked by `check_owned_paths`, against other `Claims::Path` resources only.
+        // Checked by `check_owned_paths` against checkout directories and file claims.
         Claims::Path(_) => (Vec::new(), Vec::new()),
         Claims::TargetAndFragments { dir, pattern } => {
             let (Some(Value::String(d)), Some(Value::String(p))) = (get(dir), get(pattern)) else {
