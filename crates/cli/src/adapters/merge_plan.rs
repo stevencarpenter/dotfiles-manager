@@ -425,7 +425,14 @@ fn verdict_for(
             cfg!(feature = "test-isolation"),
             || store.read_grants(),
         ) {
-            Ok(()) => MergeVerdict::Write,
+            Ok(()) => match recorded
+                .as_ref()
+                .zip(salt.as_deref())
+                .and_then(|(c, salt)| merge::new_leaf_takeover(c, salt, &m))
+            {
+                Some(token) => MergeVerdict::Takeover(token),
+                None => MergeVerdict::Write,
+            },
             Err(e) => refused(&e),
         },
         Err(e) => refused(&e),

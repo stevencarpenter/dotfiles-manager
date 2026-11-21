@@ -34,8 +34,10 @@ pub(crate) struct Declared {
     pub effective_url: String,
     pub shell: String,
     pub args: Vec<String>,
-    /// `--env` values of the trial, sorted by name. None is a name the run fixes.
+    /// Literal values in hand-authored and previously adopted declarations.
     pub env: Vec<(String, String)>,
+    /// Inputs explicitly supplied by the caller as DFM_SCRIPT_ENV_<name>.
+    pub env_from: Vec<String>,
     /// The tool's executable, relative to HOME.
     pub binary: String,
 }
@@ -120,6 +122,24 @@ pub(crate) fn declared(value: &Value) -> Result<Declared, Refusal> {
         }
     }
     env.sort();
+    let mut env_from = Vec::new();
+    for item in value
+        .get("env_from")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let name = item
+            .as_str()
+            .filter(|n| env_name(n))
+            .ok_or_else(|| invalid("env_from needs valid user-supplied environment names"))?;
+        if env_from.iter().any(|n| n == name) || env.iter().any(|(n, _)| n == name) {
+            return Err(invalid(format!(
+                "script environment variable {name} is declared twice"
+            )));
+        }
+        env_from.push(name.to_owned());
+    }
     let binary = text("binary")?;
     if !valid_path(&format!("/{binary}")) {
         return Err(invalid(format!(
@@ -132,6 +152,7 @@ pub(crate) fn declared(value: &Value) -> Result<Declared, Refusal> {
         effective_url: effective_url.into(),
         shell: shell.into(),
         args,
+        env_from,
         env,
         binary: binary.into(),
     })
@@ -256,6 +277,28 @@ fn executable(path: &Path) -> bool {
     fs::metadata(path).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o100 != 0)
 }
 
+/// Resolve only the variables the declaration explicitly requests.
+fn install_env(d: &Declared) -> Result<Vec<(String, String)>, Refusal> {
+    let mut env = d.env.clone();
+    for name in &d.env_from {
+        let source = format!("DFM_SCRIPT_ENV_{name}");
+        let value = std::env::var(&source).map_err(|_| {
+            Refusal::new(
+                Code::CredentialUnavailable,
+                format!("export {source} before installing the script package"),
+            )
+        })?;
+        if value.chars().any(|c| c != '\t' && c.is_control()) {
+            return Err(Refusal::new(
+                Code::CredentialUnavailable,
+                format!("{name} holds an unsupported control character"),
+            ));
+        }
+        env.push((name.clone(), value));
+    }
+    Ok(env)
+}
+
 fn redirected(d: &Declared, got: &str) -> String {
     format!(
         "the script {} now ends at {}, not at the declared effective URL {}; a redirect is followed only to the declared one",
@@ -296,6 +339,9 @@ pub(crate) fn probe(
             field: "/url",
         });
     }
+    if let Err(e) = install_env(&d) {
+        return Ok(PackageState::Refused(e.detail));
+    }
     if cx.staged.is_none() || cx.staged()?.contains_key(id) {
         return Ok(PackageState::Missing(Vec::new()));
     }
@@ -314,7 +360,7 @@ pub(crate) fn probe(
 
 /// Runs the declared script for a missing binary (docs/packages.md, "Script declarations"). It
 /// runs the bytes the probe under the writer lock just fetched, as a private copy, under the
-/// trial's sandbox profile and environment rule with the `--env` values, without a terminal
+/// trial's sandbox profile and environment rule with its declared variables, without a terminal
 /// (stdin is `/dev/null`, so a prompt fails), in a fresh work directory. A tracked file the
 /// script changed fails the install and stays in place. The caller probes again: the binary
 /// must then exist and be executable.
@@ -353,7 +399,13 @@ pub(crate) fn install(
     let dfm_env: Vec<(String, String)> = std::env::vars_os()
         .filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?)))
         .collect();
-    let env = script_env(runner, &dfm_env, false, &d.env, account_login_shell)?;
+    let env = script_env(
+        runner,
+        &dfm_env,
+        false,
+        &install_env(&d)?,
+        account_login_shell,
+    )?;
     let temp = env
         .iter()
         .find_map(|(n, v)| (n == "TMPDIR").then(|| PathBuf::from(v)))
@@ -433,6 +485,7 @@ url = "https://example.invalid/install.sh"
 effective_url = "https://cdn.example.invalid/install.sh"
 shell = "bash"
 args = ["--no-modify-path"]
+env_from = ["INPUT"]
 binary = ".local/bin/boat"
 [env]
 BOAT_NO_UPDATE = "1"
@@ -446,6 +499,7 @@ BOAT_NO_UPDATE = "1"
         assert_eq!(d.args, ["--no-modify-path"]);
         assert_eq!(d.env, [("BOAT_NO_UPDATE".to_string(), "1".to_string())]);
         assert_eq!(d.binary, ".local/bin/boat");
+        assert_eq!(d.env_from, ["INPUT"]);
     }
 
     #[test]
@@ -459,6 +513,9 @@ BOAT_NO_UPDATE = "1"
             ("\"bash\"", "\"fish\""),
             ("BOAT_NO_UPDATE", "PATH"),
             ("BOAT_NO_UPDATE", "1BAD"),
+            ("[\"INPUT\"]", "[\"HOME\"]"),
+            ("[\"INPUT\"]", "[\"INPUT\", \"INPUT\"]"),
+            ("[\"INPUT\"]", "[\"BOAT_NO_UPDATE\"]"),
             (".local/bin/boat", "../bin/boat"),
             (".local/bin/boat", "/usr/local/bin/boat"),
             ("--no-modify-path", "a\\u0007b"),

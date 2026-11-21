@@ -9,6 +9,9 @@
 //! rebase, commit or push. A nested source is pinned to an exact commit, and the lock that holds
 //! the pin is never rewritten.
 
+mod pending_copy;
+
+use self::pending_copy::PendingCopy;
 use crate::adapters::{checkout, secret, updater};
 use crate::plan_cmd::{plan_for, plan_with_outputs, render_body};
 use crate::read_fs::read_regular_bounded;
@@ -76,6 +79,7 @@ pub struct Args {
     restart: BTreeSet<String>,
     /// False with `--no-upgrade`: the profile's updaters do not run (docs/upgrade.md).
     upgrade: bool,
+    strict_upgrade: bool,
 }
 
 /// `sync [--root <dir>] [--preview] [--yes-plan <digest>] [--allow-disruptive <id>]...
@@ -104,6 +108,7 @@ pub fn parse_args(m: &clap::ArgMatches) -> Result<Args, Refusal> {
         trust,
         restart,
         upgrade,
+        strict_upgrade: cli::flag(m, "strict-upgrade"),
     })
 }
 
@@ -186,14 +191,18 @@ impl Git {
         } else {
             (&self.remote, FETCH_TIMEOUT)
         };
-        self.runner.run(&ProcRequest {
-            program: "git",
-            args: &argv,
-            env,
-            stdin: None,
-            timeout,
-            max_stdout: MAX_STDOUT,
-        })
+        // Git gets its checkout through -C or an explicit path. A local query needs no scratch directory.
+        self.runner.run_in(
+            &ProcRequest {
+                program: "git",
+                args: &argv,
+                env,
+                stdin: None,
+                timeout,
+                max_stdout: MAX_STDOUT,
+            },
+            Path::new("/"),
+        )
     }
 
     /// Runs git and returns its trimmed standard output, or a refusal with `code` that names
@@ -356,8 +365,7 @@ struct Staged {
     /// That head or pin when the checkout already holds it under local commits; `new` is then
     /// the checkout's HEAD, which stays where it is.
     ahead_of: Option<String>,
-    /// The branch the root checkout has out (`refs/heads/...`), `None` when its HEAD is detached
-    /// or the source is nested. Shown on the `source:` line only, not in the digest.
+    /// The branch publication would advance. A detached checkout has no branch.
     branch: Option<String>,
 }
 
@@ -444,12 +452,21 @@ const MAX_COPY_ENTRIES: usize = 1_000_000;
 /// Copies the checkout at `from` to `to` as it is: directories, regular files with their mode,
 /// and symlinks as symlinks (never followed). A socket or FIFO inside a `.git` directory (a file
 /// monitor's socket) is skipped; anywhere else it is untrusted, as the source loader says.
-fn copy_checkout(from: &Path, to: &Path) -> Result<(), Refusal> {
-    fn go(from: &Path, to: &Path, in_git: bool, seen: &mut usize) -> Result<(), Refusal> {
+fn copy_checkout(from: &Path, to: &Path, omit: Option<&Path>) -> Result<(), Refusal> {
+    fn go(
+        from: &Path,
+        to: &Path,
+        in_git: bool,
+        seen: &mut usize,
+        omit: Option<&Path>,
+    ) -> Result<(), Refusal> {
         let e = |e: std::io::Error| io_failed("copy the checkout into staging", &e);
-        fs::create_dir(to).map_err(e)?;
         for entry in fs::read_dir(from).map_err(e)? {
             let entry = entry.map_err(e)?;
+            let src = entry.path();
+            if Some(src.as_path()) == omit {
+                continue;
+            }
             *seen += 1;
             if *seen > MAX_COPY_ENTRIES {
                 return Err(Refusal::new(
@@ -457,14 +474,15 @@ fn copy_checkout(from: &Path, to: &Path) -> Result<(), Refusal> {
                     format!("the checkout holds more than {MAX_COPY_ENTRIES} entries"),
                 ));
             }
-            let (src, dst) = (entry.path(), to.join(entry.file_name()));
+            let dst = to.join(entry.file_name());
             let meta = fs::symlink_metadata(&src).map_err(e)?;
             let ft = meta.file_type();
             if ft.is_symlink() {
                 std::os::unix::fs::symlink(fs::read_link(&src).map_err(e)?, &dst).map_err(e)?;
             } else if ft.is_dir() {
                 let git_dir = in_git || entry.file_name().eq_ignore_ascii_case(".git");
-                go(&src, &dst, git_dir, seen)?;
+                fs::create_dir(&dst).map_err(e)?;
+                go(&src, &dst, git_dir, seen, omit)?;
             } else if ft.is_file() {
                 fs::copy(&src, &dst).map_err(e)?;
             } else if !in_git {
@@ -478,7 +496,7 @@ fn copy_checkout(from: &Path, to: &Path) -> Result<(), Refusal> {
         fs::set_permissions(to, fs::symlink_metadata(from).map_err(e)?.permissions()).map_err(e)
     }
     let mut seen = 0;
-    go(from, to, false, &mut seen)
+    go(from, to, false, &mut seen, omit)
 }
 
 /// A checkout the command drives (the staged copy or the live one) must be self-contained: its
@@ -698,14 +716,6 @@ fn advance(
     from: Option<&str>,
 ) -> Result<(), Refusal> {
     if let Some(from) = from {
-        if old.is_none() {
-            git.run(
-                true,
-                Code::IoFailed,
-                &format!("{id}: init the checkout"),
-                &["init", "-q", dir],
-            )?;
-        }
         git.run(
             true,
             Code::SourceMissing,
@@ -735,7 +745,7 @@ fn advance(
             true,
             Code::Conflict,
             &format!("{id}: fast-forward the checkout to {new} (sync never resets, rebases, stashes or cleans; commit or move your work aside, then sync again)"),
-            &["-C", dir, "merge", "-q", "--ff-only", "--end-of-options", new],
+            &["-C", dir, "merge", "-q", "--ff-only", "--no-overwrite-ignore", "--end-of-options", new],
         )
     }
     .map(|_| ())
@@ -854,17 +864,7 @@ fn stage_source(
         // The objects are already in the copy (the fetch above), so the fast-forward is local.
         advance(git, id, &repo_s, old.as_deref(), &new, None)?;
     }
-    let branch = if src.is_root() {
-        let out = git.output(true, &["-C", &repo_s, "symbolic-ref", "-q", "HEAD"])?;
-        match out.end {
-            End::Exited(0) => Some(String::from_utf8_lossy(&out.stdout).trim().to_string()),
-            End::Exited(1) => None,
-            End::Stopped(r) => return Err(r),
-            _ => return Err(untrusted(format!("{id}: git symbolic-ref HEAD failed"))),
-        }
-    } else {
-        None
-    };
+    let branch = branch_of(git, &repo_s, id)?;
     Ok(Staged {
         src: src.clone(),
         repo,
@@ -874,6 +874,22 @@ fn stage_source(
         ahead_of,
         branch,
     })
+}
+
+/// The ref a fast-forward in this checkout would move, or none for detached HEAD.
+fn branch_of(git: &Git, repo: &str, id: &str) -> Result<Option<String>, Refusal> {
+    let out = git.output(true, &["-C", repo, "symbolic-ref", "-q", "HEAD"])?;
+    match out.end {
+        End::Exited(0) => Ok(Some(
+            String::from_utf8(out.stdout)
+                .map_err(|_| untrusted(format!("{id}: the branch name is not UTF-8")))?
+                .trim_end_matches('\n')
+                .to_string(),
+        )),
+        End::Exited(1) => Ok(None),
+        End::Stopped(r) => Err(r),
+        _ => Err(untrusted(format!("{id}: git symbolic-ref HEAD failed"))),
+    }
 }
 
 /// A nested source lands at `base/<path>`. Every component of that path that exists must be a
@@ -916,6 +932,7 @@ fn stage_all(
     grants: &Grants,
     root: &Path,
     tree: &Path,
+    omit: Option<&Path>,
 ) -> Result<Vec<Staged>, Refusal> {
     // A checkout that holds the cache directory (a HOME that is itself the checkout) would be
     // copied into itself.
@@ -925,7 +942,8 @@ fn stage_all(
             visible(path_str(root)?)
         )));
     }
-    copy_checkout(root, tree)?;
+    fs::create_dir(tree).map_err(|e| io_failed("create the staged checkout", &e))?;
+    copy_checkout(root, tree, omit)?;
     let staged_root = stage_source(git, root_src, tree.to_path_buf(), root.to_path_buf())?;
     let fetched = read_lock(tree)?;
     let fetched_root = fetched
@@ -967,18 +985,23 @@ fn stage_all(
 /// of a session and, per source, what moves from where to where. A plan digest covers the loaded
 /// source tree, not the commits behind it, so a commit that changes only files outside the
 /// scoped roots would otherwise pass.
-fn sync_digest(review: &Review, staged: &[Staged]) -> String {
-    let mut text = format!("plan {} {}\n", Scope::Sync.as_str(), review.digest);
+fn sync_digest(review: &Review, staged: &[Staged], upgrade: bool) -> String {
+    let mut text = format!(
+        "plan {} {}\nupgrade {upgrade}\n",
+        Scope::Sync.as_str(),
+        review.digest
+    );
     for r in &review.excluded.skipped {
         text.push_str(&format!("skip {} {r}\n", Scope::Secrets.as_str()));
     }
     for s in staged {
         text.push_str(&format!(
-            "source {} {} {} {} {}\n",
+            "source {} {} {} {} {} {}\n",
             s.src.id,
             s.src.origin,
             s.src.reference,
             s.old.as_deref().unwrap_or("none"),
+            s.branch.as_deref().unwrap_or("detached"),
             s.new
         ));
     }
@@ -1676,9 +1699,28 @@ fn check(
     )
 }
 
+/// A source moved but the engine could not start. Record only the confirmed checkouts.
+fn publication_error(store: &Store, audit: &state::Receipt, error: Refusal) -> Refusal {
+    if !apply_cmd::sources_moved(audit) {
+        return error;
+    }
+    let mut error = error.after_mutation();
+    let mut receipt = audit.clone();
+    receipt.sources.retain(|s| s.commit.is_some());
+    receipt.finished_at = now_ns().map(rfc3339).unwrap_or(receipt.started_at.clone());
+    receipt.result.exit_code = error.exit().code();
+    receipt.result.outcome = error.exit().name().into();
+    if let Err(write) = store.write_receipt(&receipt) {
+        error.detail.push_str(&format!(
+            "; could not record the source publication: {write}"
+        ));
+    }
+    error
+}
+
 /// Publishes one staged source into its checkout exactly as the rehearsal moved the copy, after
 /// rechecking that the checkout is where the copy saw it. `Ok(true)` when the checkout changed.
-fn publish(git: &Git, s: &Staged) -> Result<bool, Refusal> {
+fn publish(git: &Git, root: &Path, s: &Staged, copies: &PendingCopy) -> Result<bool, Refusal> {
     let id = s.src.id.as_str();
     let (repo_s, live_s) = (path_str(&s.repo)?, path_str(&s.live)?);
     let now = head_of(git, &s.live)?;
@@ -1693,10 +1735,48 @@ fn publish(git: &Git, s: &Staged) -> Result<bool, Refusal> {
             ),
         ));
     }
+    if now.is_some() && branch_of(git, live_s, id)? != s.branch {
+        return Err(Refusal::new(
+            Code::PlanStale,
+            format!("{id}: the checked-out branch changed after review. Fix: plan again"),
+        ));
+    }
     if s.old.as_deref() == Some(s.new.as_str()) {
         return Ok(false);
     }
-    advance(git, id, live_s, s.old.as_deref(), &s.new, Some(repo_s))?;
+    if s.old.is_none() {
+        let parent = s
+            .live
+            .parent()
+            .ok_or_else(|| conflict("a nested checkout needs a parent"))?;
+        fs::create_dir_all(parent)
+            .map_err(|e| io_failed("create the nested checkout parent", &e))?;
+        // The staged checkout already passed the rehearsal at the approved detached commit.
+        match dfm_engine::fsys::publish_new_checkout(&s.repo, &s.live) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::CrossesDevices => {
+                // Keep interrupted copies out of the scoped sources when the checkout itself
+                // lives on a volume other than the cache.
+                let git_dir = root.join(".git");
+                let device = |p: &Path| {
+                    fs::metadata(p)
+                        .map(|m| m.dev())
+                        .map_err(|e| io_failed("locate the checkout staging volume", &e))
+                };
+                let stage_in = (device(&git_dir)? == device(parent)?).then_some(git_dir.as_path());
+                checkout::publish_checkout(&s.live, stage_in, |tmp| {
+                    fs::create_dir(tmp).map_err(|e| io_failed("create the checkout copy", &e))?;
+                    copies.register(tmp)?;
+                    copy_checkout(&s.repo, tmp, None)
+                })?;
+                // Publication has succeeded. An obsolete cache record names an absent stage.
+                let _ = copies.forget();
+            }
+            Err(e) => return Err(io_failed("publish the new nested checkout", &e)),
+        }
+    } else {
+        advance(git, id, live_s, s.old.as_deref(), &s.new, Some(repo_s))?;
+    }
     // Postcondition: the checkout is at the published commit.
     let after = head_of(git, &s.live)?;
     if after.as_deref() != Some(s.new.as_str()) {
@@ -1722,6 +1802,7 @@ struct Printed {
     plan: bool,
     result: bool,
     warnings: Vec<String>,
+    incomplete_upgrade: bool,
 }
 
 pub fn run(ctx: &Ctx, args: &Args, out: &mut dyn Write) -> Result<(), Refusal> {
@@ -1746,7 +1827,11 @@ pub fn run(ctx: &Ctx, args: &Args, out: &mut dyn Write) -> Result<(), Refusal> {
             dfm_model::Exit::Interrupted | dfm_model::Exit::Terminated
         )
     });
-    for warning in printed.warnings.iter().filter(|_| r.is_ok() || stopped) {
+    for warning in printed
+        .warnings
+        .iter()
+        .filter(|_| r.is_ok() || stopped || printed.incomplete_upgrade)
+    {
         let _ = writeln!(
             out,
             "{} {warning}",
@@ -1774,6 +1859,16 @@ fn finish(
     if let Some(u) = upgrade {
         writeln!(out, "  upgrade: {u}").map_err(w)?;
     }
+    let result = result.and_then(|()| {
+        if printed.incomplete_upgrade {
+            Err(Refusal::new(
+                Code::Diagnosed,
+                "one or more updaters did not complete",
+            ))
+        } else {
+            Ok(())
+        }
+    });
     let exit = result
         .as_ref()
         .err()
@@ -1880,11 +1975,20 @@ fn run_inner(
     // staged tree as the tree --root will hold.
     let git = Git::new(ctx, &sys);
     let staging = Staging::create(ctx, &sys, false)?;
-    let previewed = stage_all(&git, root_src, &grants, &root, &staging.tree())?;
+    let copies = PendingCopy::new(&ctx.platform.cache_dir(), &root, sys)?;
+    let orphan = copies.find()?;
+    let previewed = stage_all(
+        &git,
+        root_src,
+        &grants,
+        &root,
+        &staging.tree(),
+        orphan.as_ref().map(|o| o.path.as_path()),
+    )?;
     for s in &previewed {
         // A root checkout on another branch is fast-forwarded where it is; say so.
         let checkout = match &s.branch {
-            _ if !s.src.is_root() => String::new(),
+            None if !s.src.is_root() => String::new(),
             Some(b) if *b == s.src.reference => String::new(),
             Some(b) => format!("; checkout on {}", visible(b)),
             None => "; detached".into(),
@@ -1902,7 +2006,7 @@ fn run_inner(
         .map_err(w)?;
     }
     let (loaded, review) = plan_staged(ctx, &binding, (&root, &rel), &staging.tree(), args)?;
-    let digest = sync_digest(&review, &previewed);
+    let digest = sync_digest(&review, &previewed, args.upgrade);
     let parts = review.split();
     printed.warnings = parts.iter().flat_map(ScopePlan::warnings).collect();
     show(&review, &parts, &digest, ctx.color, args.apply.all, out).map_err(w)?;
@@ -1920,7 +2024,14 @@ fn run_inner(
     // The updaters, a blocked one included, are listed before any part runs (DFM-31.C02).
     let updaters = &loaded.resolved.updaters;
     if args.apply.preview || (args.upgrade && !updaters.is_empty()) {
-        upgrade_preview(ctx, &sys, (&root, &grants), args, &loaded.resolved, out)?;
+        upgrade_preview(
+            ctx,
+            &sys,
+            (&root, &grants, &staging.dir),
+            args,
+            &loaded.resolved,
+            out,
+        )?;
     }
     if args.apply.preview {
         return Ok(());
@@ -1938,6 +2049,7 @@ fn run_inner(
     // part that would run with a change, can end here (docs/apply.md, step 4).
     if args.apply.yes_plan.is_none()
         && !journal_open
+        && orphan.is_none()
         && previewed.iter().all(|s| s.old.as_ref() == Some(&s.new))
         && parts.iter().all(|p| {
             not_run(p).is_some()
@@ -1995,9 +2107,12 @@ fn run_inner(
     }
     store.require_identity(&binding)?;
     let second = Staging::create(ctx, &sys, true)?;
-    let staged = stage_all(&git, root_src, &grants, &root, &second.tree())?;
+    if let Some(found) = copies.find()? {
+        copies.recover(found)?;
+    }
+    let staged = stage_all(&git, root_src, &grants, &root, &second.tree(), None)?;
     let (_, locked) = plan_staged(ctx, &binding, (&root, &rel), &second.tree(), args)?;
-    let locked_digest = sync_digest(&locked, &staged);
+    let locked_digest = sync_digest(&locked, &staged, args.upgrade);
     if locked_digest != digest {
         return Err(match &args.apply.yes_plan {
             Some(approved) => apply_cmd::stale(approved, &locked_digest),
@@ -2022,17 +2137,31 @@ fn run_inner(
             "a source moved since the reviewed run: the commits to publish are not the ones shown with this digest. Fix: read the new plan with --preview and approve its digest",
         ));
     }
+    let mut audit = apply_cmd::plan_receipt(
+        &run_args(args, &locked.plan),
+        &binding,
+        &locked.plan,
+        &digest,
+        now_ns()?,
+    );
     let mut published = Vec::new();
     for s in &staged {
         match fail
             .hit(&format!("sync-before-publish-{}", s.src.id))
-            .and_then(|()| publish(&git, s))
+            .and_then(|()| publish(&git, &root, s, &copies))
         {
             Ok(changed) => {
-                writeln!(out, "published: {} {}", s.src.id, s.change()).map_err(w)?;
+                audit.sources.push(state::SourceId {
+                    id: s.src.id.clone(),
+                    previous_commit: s.old.clone(),
+                    commit: Some(s.new.clone()),
+                    tree: None,
+                });
                 if changed {
                     published.push(s.src.id.as_str());
                 }
+                writeln!(out, "published: {} {}", s.src.id, s.change())
+                    .map_err(|e| publication_error(&store, &audit, w(e)))?;
             }
             Err(e) if published.is_empty() => return Err(e),
             Err(e) => {
@@ -2043,14 +2172,14 @@ fn run_inner(
                     published.join(", "),
                     s.src.id
                 )
-                .map_err(w)?;
-                return Err(e.after_mutation());
+                .map_err(|e| publication_error(&store, &audit, w(e)))?;
+                return Err(publication_error(&store, &audit, e));
             }
         }
     }
     drop(second);
     let changed = !published.is_empty();
-    let after = |e: Refusal| if changed { e.after_mutation() } else { e };
+    let after = |e: Refusal| publication_error(&store, &audit, e);
 
     // The published tree must give the approved run (docs/sync.md, step 6). Then the session
     // check runs again: a session that ended since the review skips the secrets now.
@@ -2085,9 +2214,9 @@ fn run_inner(
     let runnable = run.runnable();
     // A run that changes nothing in any part (an approved repeat) writes no receipt.
     let runs = |p: &ScopePlan| not_run(p).is_none() && (!p.changes_nothing() || journal_open);
-    let mut failure: Option<Refusal> = dfm_engine::signal::requested();
+    let mut failure: Option<Refusal> = dfm_engine::signal::requested().map(after);
     let mut statuses: BTreeMap<String, state::Status> = BTreeMap::new();
-    if failure.is_none() && parts.iter().any(runs) {
+    if failure.is_none() && (changed || parts.iter().any(runs)) {
         let ran = apply_cmd::execute_locked(
             ctx,
             &run_args(args, &runnable),
@@ -2097,8 +2226,9 @@ fn run_inner(
                 fail: &fail,
                 loaded: &now_loaded,
                 plan: &runnable,
-                digest: &run.digest,
+                digest: &digest,
                 parts: Some(&run.parts),
+                source_receipt: Some(&audit),
             },
             out,
         );
@@ -2107,7 +2237,7 @@ fn run_inner(
                 statuses.extend(r.statuses);
                 failure = r.outcome.err();
             }
-            Err(e) => failure = Some(e),
+            Err(e) => failure = Some(after(e)),
         }
     }
     drop(store);
@@ -2435,11 +2565,11 @@ pub(crate) fn tracked_status(
     Ok(seen)
 }
 
-/// `--preview`: what the upgrade step would run. Nothing runs and nothing is written.
+/// Shows declared commands and, on an explicit preview, read-only candidate listings.
 fn upgrade_preview(
     ctx: &Ctx,
     sys: &Sys,
-    (root, grants): (&Path, &Grants),
+    (root, grants, staging): (&Path, &Grants, &Path),
     args: &Args,
     resolved: &Resolved,
     out: &mut dyn Write,
@@ -2466,13 +2596,18 @@ fn upgrade_preview(
     let env = updater_env(ctx, &runner, root, grants, &checkouts);
     writeln!(out, "{}", paint::label(ctx.color, "upgrade:")).map_err(w)?;
     for u in updaters {
-        writeln!(
-            out,
-            "  {}: {}",
-            u.name(),
-            visible(&updater::preview(*u, &env))
-        )
-        .map_err(w)?;
+        let command = updater::preview(*u, &env);
+        writeln!(out, "  {}: {}", u.name(), visible(&command)).map_err(w)?;
+        if args.apply.preview && !command.starts_with("blocked:") {
+            let scratch = staging.join(format!("candidates-{}", u.name()));
+            if matches!(u, Updater::Brew | Updater::Mise) {
+                fs::create_dir(&scratch)
+                    .map_err(|e| io_failed("create candidate preview directory", &e))?;
+            }
+            for item in updater::preview_candidates(*u, &env, &scratch) {
+                writeln!(out, "    candidate: {}", visible(&item)).map_err(w)?;
+            }
+        }
     }
     Ok(())
 }
@@ -2509,13 +2644,14 @@ fn upgrade(
         writeln!(out, "upgrade: none declared in the profile").map_err(w)?;
         return Ok(None);
     }
-    state_cmd::fail_from_env()?.hit("sync-before-upgrade-lock")?;
+    let fail = state_cmd::fail_from_env()?;
+    fail.hit("sync-before-upgrade-lock")?;
     // A sync with nothing to change ran no scope, so nothing armed the handlers yet.
     if !dfm_engine::signal::installed() {
         dfm_engine::signal::install()?;
     }
     let layout = ctx.layout();
-    let store = Store::open_write_with(*sys, &layout, state_cmd::fail_from_env()?, false)?;
+    let store = Store::open_write_with(*sys, &layout, fail.clone(), false)?;
     if !store.is_initialized() {
         return Err(crate::state_lost_refusal());
     }
@@ -2550,7 +2686,33 @@ fn upgrade(
     // after each one that ran. A change it made fails its row and stays in place.
     let mut tracked = tracked_status(&git, &checkouts)?;
     writeln!(out, "{}", paint::label(ctx.color, "upgrade:")).map_err(w)?;
-    let mut ops = Vec::new();
+    let binary = crate::plan_cmd::binary_identity()?;
+    let stamp = state::Stamp::of(binding);
+    let mut receipt = state::Receipt {
+        schema: state::SCHEMA,
+        op_id: format!("upgrade-{started}"),
+        command: "upgrade".into(),
+        update: false,
+        started_at: rfc3339(started),
+        finished_at: rfc3339(started),
+        binary: state::BinaryId {
+            version: binary.version,
+            commit: option_env!("DFM_BUILD_COMMIT").unwrap_or("unknown").into(),
+            sha256: binary.sha256,
+        },
+        profile: state::ProfileRef {
+            id: stamp.profile,
+            binding_digest: stamp.binding_digest,
+        },
+        machine_id: stamp.machine_id,
+        plan_digest: None,
+        approval: None,
+        sources: vec![],
+        approvals: vec![],
+        result: state::RunResult::from_operations(&[]),
+        operations: Vec::new(),
+    };
+    let mut operations = Vec::new();
     for u in &updaters {
         let mut row = updater::run(*u, &env);
         // A blocked updater ran no command, and a stopped run starts no more.
@@ -2581,6 +2743,38 @@ fn upgrade(
                 }
             }
         }
+        let op = state::OperationRecord {
+            id: format!("updater-{}", u.name()),
+            resource: format!("updater:{}", u.name()),
+            adapter: "updater/v1".into(),
+            class: Class::Normal,
+            status: row.status,
+            started_at: Some(row.started_at.clone()),
+            finished_at: Some(row.finished_at.clone()),
+            before: None,
+            after: None,
+            owned_outputs: vec![],
+            error: row.status.is_problem().then(|| row.notes.join("; ")),
+            reload: None,
+            upgrade: Some(state::UpgradeEvidence {
+                before_version: row.before.clone(),
+                after_version: row.after.clone(),
+                notes: row.notes.clone(),
+            }),
+        };
+        // Record the completed provider before output or the next native command can fail.
+        let step = state::Receipt {
+            op_id: format!("{}-{}", receipt.op_id, u.name()),
+            command: "upgrade-step".into(),
+            started_at: row.started_at.clone(),
+            finished_at: row.finished_at.clone(),
+            result: state::RunResult::from_operations(std::slice::from_ref(&op)),
+            operations: vec![op.clone()],
+            ..receipt.clone()
+        };
+        store.write_receipt(&step)?;
+        fail.hit("sync-after-upgrade-step")?;
+        operations.push(op);
         let status = status_name(row.status);
         let versions = match (&row.before, &row.after) {
             (Some(b), Some(a)) if a != b => format!(" {} -> {}", visible(b), visible(a)),
@@ -2605,30 +2799,6 @@ fn upgrade(
                 visible(&row.notes.join("; "))
             ));
         }
-        let mut error = problem.then(|| row.notes.join("; "));
-        if let Some(e) = &mut error
-            && e.len() > state::MAX_ERROR_BYTES
-        {
-            let mut cut = state::MAX_ERROR_BYTES;
-            while !e.is_char_boundary(cut) {
-                cut -= 1;
-            }
-            e.truncate(cut);
-        }
-        ops.push(state::OperationRecord {
-            id: format!("updater-{}", u.name()),
-            resource: format!("updater:{}", u.name()),
-            adapter: "updater/v1".into(),
-            class: Class::Normal,
-            status: row.status,
-            started_at: Some(row.started_at),
-            finished_at: Some(row.finished_at),
-            before: None,
-            after: None,
-            owned_outputs: vec![],
-            error,
-            reload: None,
-        });
     }
     // After the loop, so a copy that brew upgraded shows the version brew left. A stopped run
     // starts no more commands.
@@ -2638,32 +2808,10 @@ fn upgrade(
             writeln!(out, "  note: {} {}", u.name(), visible(&n)).map_err(w)?;
         }
     }
-    let binary = crate::plan_cmd::binary_identity()?;
-    let stamp = state::Stamp::of(binding);
-    let receipt = state::Receipt {
-        schema: state::SCHEMA,
-        op_id: format!("upgrade-{started}"),
-        command: "upgrade".into(),
-        update: false,
-        started_at: rfc3339(started),
-        finished_at: rfc3339(now_ns()?),
-        binary: state::BinaryId {
-            version: binary.version,
-            commit: option_env!("DFM_BUILD_COMMIT").unwrap_or("unknown").into(),
-            sha256: binary.sha256,
-        },
-        profile: state::ProfileRef {
-            id: stamp.profile,
-            binding_digest: stamp.binding_digest,
-        },
-        machine_id: stamp.machine_id,
-        plan_digest: None,
-        approval: None,
-        sources: vec![],
-        approvals: vec![],
-        result: state::RunResult::from_operations(&ops),
-        operations: ops,
-    };
+    receipt.operations = operations;
+    receipt.finished_at = rfc3339(now_ns()?);
+    receipt.result = state::RunResult::from_operations(&receipt.operations);
+    printed.incomplete_upgrade = args.strict_upgrade && receipt.result.exit_code != 0;
     let name = store.write_receipt(&receipt)?;
     writeln!(out, "receipt: {}", visible(&name)).map_err(w)?;
     let counts: Vec<String> = receipt

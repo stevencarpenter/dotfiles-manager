@@ -141,6 +141,8 @@ pub enum MergeVerdict {
     /// The merge changes the file, or the ledger needs an entry. The file is absent, or it can
     /// be merged.
     Write,
+    /// New managed leaves would replace different values the application already holds.
+    Takeover(String),
     /// The merged result equals the live file and the ledger already records it.
     Current,
     /// The file cannot be merged: malformed, open to group or others, or a managed field was
@@ -177,6 +179,8 @@ pub enum SecretVerdict {
 pub enum PackageState {
     /// The declared provider lists it, with the version it reports.
     Installed(String),
+    /// Reinstalling would replace an existing tool from the recorded source.
+    ReplaceSource { installed: String, desired: String },
     /// The declared provider does not list it and no other owner was seen. The names are the
     /// dependencies the install would add with it (empty when there are none, or when the
     /// provider has no dependency listing). They are part of the plan, so the reviewer approves
@@ -241,6 +245,9 @@ impl PackageState {
     pub fn state(&self) -> String {
         match self {
             PackageState::Installed(v) => format!("installed:{v}"),
+            PackageState::ReplaceSource { installed, desired } => {
+                format!("replace:{installed} -> {desired}")
+            }
             PackageState::Missing(d) if d.is_empty() => "missing".into(),
             PackageState::Missing(d) => format!("missing:with={}", d.join(",")),
             PackageState::Upgrades(d) => format!("upgrades:{}", d.join(",")),
@@ -445,9 +452,8 @@ pub struct Context<'a> {
     pub adopt_files: BTreeMap<String, ApprovedFile>,
 }
 
-/// Ledger outputs of a resource that is no longer selected, at a path no selected resource
-/// claims: candidates for removal. A resource that is still selected keeps its outputs even when
-/// it claims nothing now, and a path that another resource claims is that resource's business.
+/// Exact ledger paths left outside the current claims. Paths claimed by a different resource
+/// are handled by that resource's ownership checks.
 fn removals<'a>(resolved: &Resolved, ledger: &'a [Owned], scope: Scope) -> Vec<&'a Owned> {
     // Removal is configuration work: a secrets or packages plan removes nothing.
     if !scope.covers_kind("link") {
@@ -460,9 +466,7 @@ fn removals<'a>(resolved: &Resolved, ledger: &'a [Owned], scope: Scope) -> Vec<&
         .collect();
     ledger
         .iter()
-        .filter(|o| {
-            !resolved.resources.contains_key(&o.resource) && !claimed.contains(&fold(&o.path))
-        })
+        .filter(|o| !claimed.contains(&fold(&o.path)))
         .collect()
 }
 
@@ -489,17 +493,10 @@ pub fn requests(resolved: &Resolved, ledger: &[Owned], scope: Scope) -> Vec<Requ
     }
     // Whatever else asked for it, a path that a selected sensitive resource claims, or that the
     // ledger records as sensitive (whoever claims it now), is never hashed.
-    let sensitive_ledger = sensitive_ledger_paths(ledger);
+    let sensitive = sensitive_paths(Some(resolved), ledger);
     for (path, w) in &mut want {
-        if sensitive_ledger.contains(&fold(path)) {
+        if sensitive.contains(&fold(path)) {
             w.0 = false;
-        }
-    }
-    for r in resolved.resources.values().filter(|r| r.sensitive) {
-        for c in &r.claims {
-            if let Some(w) = want.get_mut(c) {
-                w.0 = false;
-            }
         }
     }
     want.into_iter()
@@ -549,7 +546,7 @@ pub fn followups(
     ledger: &[Owned],
     scope: Scope,
 ) -> Vec<Request> {
-    let sensitive = sensitive_ledger_paths(ledger);
+    let sensitive = sensitive_paths(Some(resolved), ledger);
     let claimed: BTreeSet<String> = resolved
         .resources
         .values()
@@ -1285,6 +1282,22 @@ impl Planner<'_> {
                 format!("{shown} already holds the merge result{what}"),
                 post,
             )),
+            Some(MergeVerdict::Takeover(token)) => {
+                op.takeover = true;
+                op.preconditions.push(Precondition {
+                    subject: format!("merge-takeover:{path}"),
+                    state: token.clone(),
+                });
+                Ok((
+                    Action::UpdateFile,
+                    Status::Planned,
+                    Ownership::Owned,
+                    format!(
+                        "take over newly managed settings in {shown} that already hold different values{what}"
+                    ),
+                    post,
+                ))
+            }
             Some(MergeVerdict::Write) if !owned => {
                 // The first write into an existing file the ledger does not record. The owner
                 // approves it by id (`--allow-adopt`): hand edits of managed fields are lost.
@@ -1317,7 +1330,7 @@ impl Planner<'_> {
     }
 
     /// A package (docs/packages.md): no path and no ledger entry. The caller probed the declared
-    /// provider; the plan installs what is missing and never upgrades, downgrades or removes.
+    /// provider; the plan installs missing packages and requests approval for uv source switches.
     /// Under a rolling update (docs/toolchains.md) the caller's `Rolling` state plans an
     /// `upgrade` to the newest version the provider resolves at apply time, and `Held` keeps
     /// the installed versions with the reason in the row.
@@ -1358,6 +1371,19 @@ impl Planner<'_> {
                     "{name} is installed by {} and held ({w}); not upgraded",
                     r.adapter
                 );
+            }
+            Some(PackageState::ReplaceSource { installed, desired }) => {
+                op.action = Action::Install;
+                op.status = Status::Planned;
+                op.takeover = true;
+                op.ownership = Ownership::Foreign;
+                op.effect = format!(
+                    "replace {name} from {installed} with {desired}. The installed version may change"
+                );
+                op.preconditions.push(Precondition {
+                    subject: probe,
+                    state: PackageState::ReplaceSource { installed, desired }.state(),
+                });
             }
             Some(PackageState::Missing(deps)) => {
                 op.action = Action::Install;
@@ -1882,6 +1908,7 @@ impl Planner<'_> {
     fn remove_checks(&self, o: &Owned, op: &mut Operation) -> Result<(), Fail> {
         let field = "owned_outputs";
         let path = o.path.as_str();
+        let sensitive = self.sensitive.contains(&fold(path));
         // A link in a parent is reported first and for this entry only. Such an entry (a
         // stow-style linked config directory, for example) must not block any other operation.
         let comps = parts(path);
@@ -1912,11 +1939,11 @@ impl Planner<'_> {
         }
         op.preconditions.push(Precondition {
             subject: format!("path:{path}"),
-            state: node_state(&seen, o.class == Class::Sensitive),
+            state: node_state(&seen, sensitive),
         });
         op.preconditions.push(Precondition {
             subject: format!("ledger:{path}"),
-            state: self.ledger_state(path, o.class == Class::Sensitive),
+            state: self.ledger_state(path, sensitive),
         });
         match &seen.node {
             Node::Missing {} => {
@@ -1967,7 +1994,7 @@ impl Planner<'_> {
                 format!("{path} holds none of the owned handler entries and appended items");
             return Ok(());
         }
-        op.ownership = self.ownership(&o.resource, o.class == Class::Sensitive, path, &seen);
+        op.ownership = self.ownership(&o.resource, sensitive, path, &seen);
         let why = match op.ownership {
             Ownership::Owned => None,
             Ownership::Modified => Some("was changed after the manager wrote it"),

@@ -447,8 +447,7 @@ fn a_sync_that_changes_nothing_needs_no_approval() {
     assert!(s.contains("nothing to change: no approval needed"), "{s}");
     assert!(s.ends_with("result: ok\n"), "{s}");
     assert_eq!(fx.receipts(), 1, "a no-op sync wrote a receipt");
-    // A new upstream commit is a publication: a plain sync publishes it, and no scope has
-    // anything to do, so no receipt is written.
+    // A source-only change records the same unattended approval as a run that changes HOME.
     let seed = &fx.upstream.seed;
     put(seed, "README.md", "notes\n");
     let head = fx.upstream.push("docs only");
@@ -458,7 +457,10 @@ fn a_sync_that_changes_nothing_needs_no_approval() {
     assert!(!s.contains("no approval needed"), "{s}");
     in_order(&s, &["published: src0 ", "  config: current", "result: ok"]);
     assert_eq!(fx.head(), head);
-    assert_eq!(fx.receipts(), 1);
+    let records = fx.receipt_docs();
+    assert_eq!(records.len(), 2);
+    assert_eq!(records[1]["approval"]["kind"], "unattended");
+    assert_eq!(records[1]["plan_digest"], digest_of(&o));
 }
 
 #[test]
@@ -660,6 +662,41 @@ fn a_local_edit_the_update_would_overwrite_is_refused_and_kept() {
 }
 
 #[test]
+fn the_sync_digest_binds_the_checkout_branch_and_upgrade_mode() {
+    let fx = Fx::new();
+    let preview = fx.plain(&["--preview", "--no-upgrade"]);
+    assert_eq!(code(&preview), 0, "{}", stderr(&preview));
+    let digest = digest_of(&preview);
+    let changed = fx.sync(&digest);
+    assert_eq!(code(&changed), 3, "{}", stdout(&changed));
+    assert!(stderr(&changed).contains("E_PLAN_STALE"));
+    git(&fx.root, &["checkout", "-q", "-b", "topic"]);
+    let changed = fx.plain(&["--no-upgrade", "-y", &digest]);
+    assert_eq!(code(&changed), 3, "{}", stdout(&changed));
+    assert!(stderr(&changed).contains("E_PLAN_STALE"));
+    assert_eq!(fx.receipts(), 0);
+}
+
+#[test]
+fn sync_preserves_an_ignored_file_the_fetched_commit_tracks() {
+    let fx = Fx::new();
+    let old = fx.head();
+    put(&fx.root, ".git/info/exclude", "local.conf\n");
+    put(&fx.root, "local.conf", "local\n");
+    put(&fx.upstream.seed, "local.conf", "upstream\n");
+    fx.upstream.push("add configuration");
+
+    let o = fx.plain(&[]);
+    assert_eq!(code(&o), 3, "{}\n{}", stdout(&o), stderr(&o));
+    assert!(stderr(&o).contains("E_CONFLICT"), "{}", stderr(&o));
+    assert_eq!(fx.head(), old);
+    assert_eq!(
+        fs::read_to_string(fx.root.join("local.conf")).unwrap(),
+        "local\n"
+    );
+}
+
+#[test]
 fn a_plain_sync_publishes_and_applies_without_a_digest() {
     let fx = Fx::new();
     put(
@@ -837,6 +874,35 @@ fn a_change_between_the_printed_plan_and_the_locked_plan_is_stale() {
 }
 
 #[test]
+fn a_source_only_publication_records_the_approved_digest_and_both_commits() {
+    let fx = Fx::new();
+    assert_eq!(code(&fx.sync_approved()), 0);
+    let old = fx.head();
+    put(&fx.upstream.seed, "notes.txt", "source-only change\n");
+    let new = fx.upstream.push("update notes");
+    let digest = digest_of(&fx.preview());
+    let o = fx.sync(&digest);
+    assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
+    let records = fx.receipt_docs();
+    assert_eq!(records.len(), 2);
+    let r = records.last().unwrap();
+    assert_eq!(r["plan_digest"], digest);
+    assert_eq!(r["approval"]["plan_digest"], digest);
+    assert_eq!(r["approval"]["kind"], "yes_plan");
+    assert_eq!(r["result"]["exit_code"], 0);
+    assert!(
+        r["sources"]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::json!({
+                "id":"src0", "previous_commit":old, "commit":new
+            }))
+    );
+    assert_eq!(code(&fx.sync_approved()), 0);
+    assert_eq!(fx.receipts(), 2);
+}
+
+#[test]
 fn a_change_between_preview_and_approval_is_stale_and_publishes_nothing() {
     let fx = Fx::new();
     let old = fx.head();
@@ -966,8 +1032,69 @@ fn an_exact_nested_pin_stays_exact_while_the_root_tracks() {
 }
 
 #[test]
+fn an_interrupted_first_nested_publication_can_be_retried() {
+    let fx = Fx::new();
+    let (ext, pin) = fx.add_ext();
+    fx.trust(&ext.origin());
+    let aborted = Command::new(BIN)
+        .env_clear()
+        .env("DFM_PROVIDER_PATH", "/usr/bin:/bin")
+        .env("DFM_FAILPOINT", "sync-before-publish-src1:abort")
+        .arg("--home")
+        .arg(fx.home.path())
+        .args(["sync", "--root", fx.root_arg()])
+        .output()
+        .unwrap();
+    assert!(!aborted.status.success());
+    assert!(!fx.root.join("base/ext").exists());
+    let retry = fx.plain(&[]);
+    assert_eq!(code(&retry), 0, "{}\n{}", stdout(&retry), stderr(&retry));
+    assert_eq!(git(&fx.root.join("base/ext"), &["rev-parse", "HEAD"]), pin);
+}
+
+#[test]
+fn preview_and_retry_recover_a_registered_cross_volume_copy() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let fx = Fx::new();
+    let (ext, pin) = fx.add_ext();
+    fx.trust(&ext.origin());
+    let digest = digest_of(&fx.preview());
+    let root = fs::canonicalize(&fx.root).unwrap();
+    let rel = Path::new("base/.ext.dfm-clone-test");
+    let stage = root.join(rel);
+    let checkout = stage.join("checkout");
+    let token = "owner-123";
+    fs::create_dir(&stage).unwrap();
+    fs::set_permissions(&stage, fs::Permissions::from_mode(0o700)).unwrap();
+    fs::create_dir(stage.join(token)).unwrap();
+    fs::create_dir(&checkout).unwrap();
+    put(&checkout, ".git/HEAD", "ref: refs/heads/main");
+    let id = |p| {
+        let meta = fs::metadata(p).unwrap();
+        (meta.dev(), meta.ino())
+    };
+    let key = dfm_model::digest::sha256_hex(root.as_os_str().as_encoded_bytes());
+    let record = fx.h(&format!(".cache/dotfiles-manager/sync-copy-{key}.json"));
+    fs::write(
+        &record,
+        serde_json::to_vec(&(rel, id(&stage), id(&checkout), token)).unwrap(),
+    )
+    .unwrap();
+    fs::set_permissions(&record, fs::Permissions::from_mode(0o600)).unwrap();
+    assert_eq!(digest_of(&fx.preview()), digest);
+    assert!(checkout.join(".git/HEAD").exists());
+    let retry = fx.plain(&["--yes-plan", &digest]);
+    assert_eq!(code(&retry), 0, "{}\n{}", stdout(&retry), stderr(&retry));
+    assert_eq!(git(&root.join("base/ext"), &["rev-parse", "HEAD"]), pin);
+    assert!(!stage.exists());
+    assert!(!record.exists());
+}
+
+#[test]
 fn a_failed_second_publication_names_the_first_and_runs_no_scope() {
     let fx = Fx::new();
+    let old = fx.head();
     let (ext, pin) = fx.add_ext();
     let root_new = fx.upstream.head();
     fx.trust(&ext.origin());
@@ -997,7 +1124,15 @@ fn a_failed_second_publication_names_the_first_and_runs_no_scope() {
     assert_eq!(fx.head(), root_new);
     assert!(!fx.root.join("base/ext").exists());
     assert!(!fx.h(".config/work/profile").exists());
-    assert_eq!(fx.receipts(), 0);
+    let records = fx.receipt_docs();
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0]["result"]["exit_code"], 1);
+    assert_eq!(records[0]["approval"]["plan_digest"], digest_of(&p));
+    assert_eq!(
+        records[0]["sources"],
+        serde_json::json!([{"id":"src0", "previous_commit":old, "commit":root_new}])
+    );
+
     // The next run publishes only the missing source, once, and then runs the scopes.
     let o = fx.sync_approved();
     assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
@@ -1012,7 +1147,7 @@ fn a_failed_second_publication_names_the_first_and_runs_no_scope() {
         fs::read_to_string(fx.h(".config/work/profile")).unwrap(),
         "work=1\n"
     );
-    assert_eq!(fx.receipts(), 1);
+    assert_eq!(fx.receipts(), 2);
 }
 
 #[test]
@@ -1931,6 +2066,57 @@ fn a_packages_scope_after_the_configuration_scope_probes_once_per_plan() {
     // plan of the published tree each probe, and the engine probes once before the install.
     let probes = l.log()[log.len()..].matches("\nbrew ruby ").count();
     assert_eq!(probes, 4, "{}", l.log());
+}
+
+#[test]
+fn sync_withholds_a_uv_source_switch_until_the_named_takeover_is_approved() {
+    let l = Life::new();
+    let receipt = l.fx.h(".local/share/uv/tools/sample-cli/uv-receipt.toml");
+    fs::create_dir_all(receipt.parent().unwrap()).unwrap();
+    let index = "[tool]\nrequirements = [{ name = 'sample-cli' }]\n";
+    fs::write(&receipt, index).unwrap();
+    let body = r#"#!/bin/sh
+case "$*" in
+    'tool list') echo 'sample-cli v1.0.0' ;;
+    'tool install sample-cli @ git+https://example.org/sample@2.0.0')
+        printf "[tool]\nrequirements = [{name='sample-cli', git='https://example.org/sample?rev=2.0.0'}]\n" > "$HOME/.local/share/uv/tools/sample-cli/uv-receipt.toml" ;;
+    *) exit 64 ;;
+esac
+"#;
+    let uv = l.fake.path().join("bin/uv");
+    fs::write(&uv, body).unwrap();
+    fs::set_permissions(&uv, fs::Permissions::from_mode(0o755)).unwrap();
+    l.push_module(
+        "\n[[resources]]\nid='sample'\nkind='package'\nadapter='uv-tool/v1'\n[resources.value]\nname='sample-cli'\nsource='git+https://example.org/sample@2.0.0'\nupdate_policy='hold'\n",
+        &[],
+        "add the sample tool",
+    );
+    let id = "life.sample@package";
+    let withheld = l.plain(&["--no-upgrade"]);
+    assert_eq!(
+        code(&withheld),
+        0,
+        "{}\n{}",
+        stdout(&withheld),
+        stderr(&withheld)
+    );
+    assert!(stdout(&withheld).contains(&format!("withheld: {id} (needs --allow-adopt)")));
+    assert_eq!(fs::read_to_string(&receipt).unwrap(), index);
+    let approved = l.plain(&["--no-upgrade", "--allow-adopt", id]);
+    assert_eq!(
+        code(&approved),
+        0,
+        "{}\n{}",
+        stdout(&approved),
+        stderr(&approved)
+    );
+    assert!(fs::read_to_string(receipt).unwrap().contains("?rev=2.0.0"));
+    assert!(l.fx.receipt_docs().iter().any(|r| {
+        r["command"] == "sync"
+            && r["approvals"]
+                .as_array()
+                .is_some_and(|v| v.iter().any(|a| a["how"] == "allow_adopt"))
+    }));
 }
 
 #[test]
@@ -4243,6 +4429,15 @@ fn sync_runs_the_mise_rustup_uv_and_npm_updaters_in_order() {
         "{s}"
     );
     assert!(s.contains("    note: x 1.0 -> 1.1 upgraded"), "{s}");
+    let receipts = u.upgrade_receipts();
+    let evidence = &receipts[0]["operations"][0]["upgrade"]["notes"];
+    assert!(
+        evidence
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v == "go 1.27.3 -> 1.27.4 upgraded")
+    );
     let log = u.log();
     let at = |c: &str| log.find(c).unwrap_or_else(|| panic!("{c}\n{log}"));
     assert!(at("mise upgrade") < at("rustup update"), "{log}");
@@ -4436,6 +4631,29 @@ fn cloned_checkout_at(u: &Up, tool: &Remote, url: &str) -> (PathBuf, String) {
     put(&tool.seed, "README", "v2\n");
     tool.push("v2");
     (copy, before)
+}
+
+#[test]
+fn the_checkout_updater_preserves_an_ignored_file_the_remote_starts_tracking() {
+    let u = Up::new(r#"["checkouts"]"#);
+    let tool = Remote::new(u.fake.path(), "tool");
+    let (copy, before) = cloned_checkout(&u, &tool);
+    put(&copy, ".git/info/exclude", "local.conf\n");
+    put(&copy, "local.conf", "local\n");
+    put(&tool.seed, "local.conf", "upstream\n");
+    tool.push("add configuration");
+    let o = u.sync(&[]);
+    assert!(
+        stdout(&o).contains("failed checkouts"),
+        "{}\n{}",
+        stdout(&o),
+        stderr(&o)
+    );
+    assert_eq!(git(&copy, &["rev-parse", "--short", "HEAD"]), before);
+    assert_eq!(
+        fs::read_to_string(copy.join("local.conf")).unwrap(),
+        "local\n"
+    );
 }
 
 /// A command-running key in a declared checkout's own configuration blocks its pull before any
@@ -4864,13 +5082,23 @@ fn no_upgrade_skips_every_updater() {
 }
 
 #[test]
-fn preview_lists_updaters_and_runs_none() {
+fn preview_lists_read_only_candidates_without_modifying_provider_state() {
     let u = Up::new(r#"["claude", "brew"]"#);
+    fs::write(u.st("outdated-codex"), "").unwrap();
     let o = u.sync(&["--preview"]);
     assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
     let s = stdout(&o);
     assert!(s.contains("  claude: would run claude update"), "{s}");
     assert!(s.contains("  brew: would run brew update"), "{s}");
+    assert!(
+        s.contains("candidate: cask codex 0.164.0 -> 0.165.0"),
+        "{s}"
+    );
+    assert!(
+        s.contains("candidate: candidate versions unavailable before execution"),
+        "{s}"
+    );
+    assert!(u.st("outdated-codex").exists());
     assert_eq!(u.log(), "");
     assert!(u.upgrade_receipts().is_empty());
 }
@@ -4906,6 +5134,19 @@ fn a_failed_updater_warns_and_exits_0() {
 }
 
 #[test]
+fn strict_upgrade_reports_aggregate_failure_after_finishing_remaining_updaters() {
+    let u = Up::new(r#"["codex", "claude"]"#);
+    fs::write(u.st("fail-codex"), "").unwrap();
+    let o = u.sync(&["--strict-upgrade"]);
+    assert_eq!(code(&o), 1, "{}\n{}", stdout(&o), stderr(&o));
+    assert!(stdout(&o).contains("result: failed"));
+    assert!(stdout(&o).contains("warning: upgrade codex failed"));
+    assert!(u.log().contains("claude update"));
+    fs::remove_file(u.st("fail-codex")).unwrap();
+    assert_eq!(code(&u.sync(&["--strict-upgrade"])), 0);
+}
+
+#[test]
 fn a_refused_sync_runs_no_updater() {
     let u = Up::new(r#"["claude"]"#);
     // An origin the grants do not hold is refused before any fetch.
@@ -4936,6 +5177,29 @@ fn a_grant_without_a_digest_runs_no_updater() {
 }
 
 #[test]
+fn a_completed_updater_is_auditable_after_a_hard_stop() {
+    let u = Up::new(r#"["claude", "codex"]"#);
+    let o = u
+        .command_env(&[("DFM_FAILPOINT", "sync-after-upgrade-step:abort")], &[])
+        .output()
+        .unwrap();
+    assert!(!o.status.success());
+    assert!(u.upgrade_receipts().is_empty());
+    let steps: Vec<_> =
+        u.fx.receipt_docs()
+            .into_iter()
+            .filter(|r| r["command"] == "upgrade-step")
+            .collect();
+    assert_eq!(steps.len(), 1);
+    assert_eq!(steps[0]["operations"][0]["resource"], "updater:claude");
+    assert_eq!(
+        steps[0]["operations"][0]["upgrade"]["after_version"],
+        "2.1.311 (Claude Code)"
+    );
+    assert!(!u.log().contains("codex update"));
+}
+
+#[test]
 fn the_upgrade_receipt_records_each_updater() {
     let u = Up::new(r#"["codex", "claude"]"#);
     fs::write(u.st("fail-codex"), "").unwrap();
@@ -4943,6 +5207,30 @@ fn the_upgrade_receipt_records_each_updater() {
     assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
     let r = u.upgrade_receipts();
     assert_eq!(r.len(), 1, "{r:?}");
+    let steps: Vec<_> =
+        u.fx.receipt_docs()
+            .into_iter()
+            .filter(|r| r["command"] == "upgrade-step")
+            .collect();
+    assert_eq!(steps.len(), 2);
+    for step in steps {
+        let op = &step["operations"][0];
+        assert!(r[0]["operations"].as_array().unwrap().contains(op));
+        assert!(
+            step["op_id"]
+                .as_str()
+                .unwrap()
+                .starts_with(r[0]["op_id"].as_str().unwrap())
+        );
+    }
+    assert_eq!(
+        r[0]["operations"][1]["upgrade"]["before_version"],
+        "2.1.311 (Claude Code)"
+    );
+    assert_eq!(
+        r[0]["operations"][1]["upgrade"]["after_version"],
+        "2.1.311 (Claude Code)"
+    );
     let ops = r[0]["operations"].as_array().unwrap();
     let rows: Vec<(&str, &str, &str)> = ops
         .iter()

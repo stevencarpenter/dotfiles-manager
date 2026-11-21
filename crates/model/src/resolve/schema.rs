@@ -62,7 +62,8 @@ pub enum Claims {
         pattern: &'static str,
     },
     /// The HOME path at this field (a `HomePath`): a directory the resource owns, such as a
-    /// `git-checkout/v1` clone. It collides only with another `Path` claim, equal or nested.
+    /// `git-checkout/v1` clone. It collides with a file at the same path, and with an equal or nested
+    /// `Path` claim.
     Path(&'static str),
     /// One leaf per enabled entry under each root: `<root>/<entry name>`.
     Leaves {
@@ -85,6 +86,8 @@ pub struct AdapterSpec {
     /// The adapter writes into a native document with its own precedence rules.
     pub native_document: bool,
     pub claims: Claims,
+    /// Identities the provider can select for a package name.
+    pub package_claims: Option<fn(&str) -> Vec<String>>,
     pub value: Schema,
     /// For adapters whose source file is a native document that includes other files (for
     /// example a Git config): lists those includes in the order the application reads them.

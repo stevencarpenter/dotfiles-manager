@@ -347,7 +347,7 @@ fn preview_fetches_once_caches_the_script_and_prints_the_path_and_hints() {
     let tmp = fx.tmpdir().display().to_string();
     assert!(env.contains(&("HOME", home.as_str())), "{env_line}");
     assert!(env.contains(&("TMPDIR", tmp.as_str())), "{env_line}");
-    assert!(env.contains(&("FOO", "bar")), "{env_line}");
+    assert!(env.contains(&("FOO", "[redacted]")), "{env_line}");
     assert!(
         env.contains(&("SHELL", "/opt/test/login-shell")),
         "{env_line}"
@@ -1629,7 +1629,7 @@ fn adopt_promotes_a_created_config_entry_and_writes_the_declaration() {
     assert_eq!(
         decl,
         format!(
-            "id = \"boat\"\nkind = \"package\"\nadapter = \"script/v1\"\n[resources.value]\nurl = \"{URL}\"\neffective_url = \"{URL}\"\nshell = \"sh\"\nargs = [\"--quiet\"]\nbinary = \".local/bin/boat\"\n[resources.value.env]\nBOAT_NO_UPDATE = \"1\"\n"
+            "id = \"boat\"\nkind = \"package\"\nadapter = \"script/v1\"\n[resources.value]\nurl = \"{URL}\"\neffective_url = \"{URL}\"\nshell = \"sh\"\nargs = [\"--quiet\"]\nbinary = \".local/bin/boat\"\nenv_from = [\"BOAT_NO_UPDATE\"]\n"
         ),
         "{m}"
     );
@@ -1700,23 +1700,73 @@ fn a_script_trial_whose_tool_is_not_on_path_is_refused() {
 }
 
 #[test]
-fn the_secret_scan_covers_the_declaration() {
+fn the_secret_scan_covers_script_arguments_in_the_declaration() {
     if no_sandbox() {
         return;
     }
     let fx = Fx::new();
     fx.bind_with_links();
-    fx.script_trial(BARE, &["--env", "BOAT_TOKEN=FAKE_SECRET"]);
+    fx.script_trial(BARE, &["--arg", "FAKE_SECRET"]);
     let before = fx.manifest();
-    let o = fx.run(&["adopt", "trial-boat", "--module", "extra", "--preview"]);
-    assert_eq!(code(&o), 3, "{}\n{}", stderr(&o), text(&o.stdout));
-    let e = stderr(&o);
+    let result = fx.run(&["adopt", "trial-boat", "--module", "extra", "--preview"]);
+    assert_eq!(code(&result), 3, "{}", stderr(&result));
     assert!(
-        e.contains("gitleaks found a possible secret in the script/v1 declaration boat"),
-        "{e}"
+        stderr(&result)
+            .contains("gitleaks found a possible secret in the script/v1 declaration boat")
     );
-    assert!(!e.contains("FAKE_SECRET"), "{e}");
+    assert!(!stderr(&result).contains("FAKE_SECRET"));
     assert_eq!(fx.manifest(), before);
+}
+
+#[test]
+fn custom_env_values_stay_out_of_the_preview_record_and_manifest() {
+    if no_sandbox() {
+        return;
+    }
+    let fx = Fx::new();
+    fx.bind_with_links();
+    fx.script(BARE);
+    let preview = fx.trial_script("boat", &["--env", "BOAT_TOKEN=FAKE_SECRET", "--preview"]);
+    let digest = digest_of(&preview);
+    assert!(!text(&preview.stdout).contains("FAKE_SECRET"));
+    let stale = fx.trial_script("boat", &["--env", "BOAT_TOKEN=different", "-y", &digest]);
+    assert_eq!(code(&stale), 3);
+    assert!(stderr(&stale).contains("E_PLAN_STALE"));
+    let result = fx.trial_script("boat", &["--env", "BOAT_TOKEN=FAKE_SECRET", "-y", &digest]);
+    assert_eq!(code(&result), 0, "{}", stderr(&result));
+    assert!(!text(&result.stdout).contains("FAKE_SECRET"));
+    let record = fx.record("trial-boat");
+    assert!(!record.to_string().contains("FAKE_SECRET"));
+    assert_eq!(
+        record["script"]["env_from"],
+        serde_json::json!(["BOAT_TOKEN"])
+    );
+    // A legacy record can be adopted without copying the old literal into the module or retained record.
+    let mut legacy = record;
+    let script = legacy["script"].as_object_mut().unwrap();
+    script.remove("env_from");
+    script["env"]
+        .as_array_mut()
+        .unwrap()
+        .push(serde_json::json!(["BOAT_TOKEN", "FAKE_SECRET"]));
+    fs::write(
+        fx.state().join("trials/trial-boat.json"),
+        serde_json::to_vec(&legacy).unwrap(),
+    )
+    .unwrap();
+    let (preview, result) = fx.adopt();
+    assert_eq!(code(&result), 0, "{}", stderr(&result));
+    for bytes in [
+        &preview.stdout,
+        &preview.stderr,
+        &result.stdout,
+        &result.stderr,
+    ] {
+        assert!(!text(bytes).contains("FAKE_SECRET"));
+    }
+    assert!(fx.manifest().contains("env_from = [\"BOAT_TOKEN\"]"));
+    assert!(!fx.manifest().contains("FAKE_SECRET"));
+    assert!(!fx.record("trial-boat").to_string().contains("FAKE_SECRET"));
 }
 
 #[test]
@@ -1757,9 +1807,21 @@ fn packages_install_a_missing_declared_tool_only_with_the_grant() {
         "{g:#}"
     );
     assert!(g["packages"].is_null(), "{g:#}");
+    let missing = fx.packages(&["--preview"]);
+    assert_eq!(code(&missing), 3);
+    assert!(text(&missing.stdout).contains("export DFM_SCRIPT_ENV_BOAT_NO_UPDATE"));
+    let packages = |extra: &[&str]| {
+        fx.command(&[&["packages"][..], extra].concat())
+            .env(
+                "DFM_SCRIPT_ENV_BOAT_NO_UPDATE",
+                "supplied-on-second-machine",
+            )
+            .output()
+            .unwrap()
+    };
     // With the grant the preview plans the install offline: no fetch, no cache entry.
     fx.clear_log();
-    let o = fx.packages(&["--preview"]);
+    let o = packages(&["--preview"]);
     let t = text(&o.stdout);
     assert_eq!(code(&o), 0, "{}\n{t}", stderr(&o));
     assert!(t.contains("planned extra.boat@package"), "{t}");
@@ -1769,7 +1831,7 @@ fn packages_install_a_missing_declared_tool_only_with_the_grant() {
     // without a terminal. The adopted `~/.config/ascii/config` is now a dfm link, which the
     // sandbox denies: a script that writes it fails its row and the repo copy stays as adopted.
     // The failed install fetches nothing more and leaves no cache entry.
-    let o = fx.packages(&["--yes-plan", &digest_of(&o)]);
+    let o = packages(&["--yes-plan", &digest_of(&o)]);
     let t = text(&o.stdout);
     assert_eq!(code(&o), 1, "{}\n{t}", stderr(&o));
     assert!(t.contains("failed extra.boat@package"), "{t}");
@@ -1784,17 +1846,20 @@ fn packages_install_a_missing_declared_tool_only_with_the_grant() {
     assert_eq!(fs::read_to_string(&copy).unwrap(), "x\n");
     fx.remove_tool();
     fx.script(BOAT_ENV.replace("echo x > \"$HOME/.config/ascii/config\"\n", ""));
-    let o = fx.packages(&["--preview"]);
+    let o = packages(&["--preview"]);
     let t = text(&o.stdout);
     assert_eq!(code(&o), 0, "{}\n{t}", stderr(&o));
     assert!(t.contains("planned extra.boat@package"), "{t}");
     fs::write(fx.fake.path().join("log"), "").unwrap();
-    let o = fx.packages(&["--yes-plan", &digest_of(&o)]);
+    let o = packages(&["--yes-plan", &digest_of(&o)]);
     let t = text(&o.stdout);
     assert_eq!(code(&o), 0, "{}\n{t}", stderr(&o));
     assert!(t.contains("updated extra.boat@package"), "{t}");
     assert!(fx.h(".local/bin/boat").exists());
-    assert_eq!(fs::read_to_string(fx.h(".ascii/env")).unwrap(), "1");
+    assert_eq!(
+        fs::read_to_string(fx.h(".ascii/env")).unwrap(),
+        "supplied-on-second-machine"
+    );
     let log = fx.log();
     assert!(
         log.contains(&format!("/bin/sh {}/run-sync-", fx.scripts().display())),
@@ -1805,7 +1870,7 @@ fn packages_install_a_missing_declared_tool_only_with_the_grant() {
     assert_eq!(fx.cache_entries(), Vec::<String>::new());
     // The next run finds the binary: current, and the script does not run again.
     fs::write(fx.fake.path().join("log"), "").unwrap();
-    let o = fx.packages(&["--preview", "--all"]);
+    let o = packages(&["--preview", "--all"]);
     let t = text(&o.stdout);
     assert_eq!(code(&o), 0, "{}\n{t}", stderr(&o));
     assert!(t.contains("current extra.boat@package"), "{t}");
@@ -2664,7 +2729,7 @@ fn a_link_into_a_held_created_directory_is_kept() {
 }
 
 #[test]
-fn an_interrupted_record_is_purged_from_its_before_observation() {
+fn an_interrupted_record_cannot_authorize_deleting_files_created_after_it() {
     if no_sandbox() {
         return;
     }
@@ -2680,29 +2745,24 @@ fn an_interrupted_record_is_purged_from_its_before_observation() {
         rec["script"][k] = serde_json::Value::Null;
     }
     fs::write(&p, serde_json::to_vec(&rec).unwrap()).unwrap();
-    // Created after the run ended: still a candidate, because the live state is compared.
     fs::write(fx.h(".later"), "x").unwrap();
-    // A link to a path outside every created directory: the live target is not a recorded one.
+    fs::create_dir_all(fx.h(".config/boat")).unwrap();
+    fs::write(fx.h(".config/boat/owner-config"), "mine").unwrap();
     std::os::unix::fs::symlink(fx.h(".keep"), fx.h(".local/bin/x")).unwrap();
     let (preview, run) = purged(&fx);
     let shown = text(&preview.stdout);
-    let note = shown
-        .find("note: the script run of this trial did not finish")
-        .unwrap_or_else(|| panic!("{shown}"));
-    assert!(note < shown.find("plan digest:").unwrap(), "{shown}");
-    let kept = format!(
-        "kept: {} -> {} (no target recorded)",
-        fx.h(".local/bin/x").display(),
-        fx.h(".keep").display()
+    assert!(
+        shown.contains("the after-observation was not recorded"),
+        "{shown}"
     );
-    assert!(shown.contains(&kept), "{shown}");
-    for want in [".boat", ".later"] {
-        let l = format!("action: remove {}", fx.h(want).display());
-        assert!(shown.contains(&l), "{l}\n{shown}");
-    }
-    let out = text(&run.stdout);
-    assert_eq!(code(&run), 0, "{}\n{out}", stderr(&run));
-    assert!(gone(&fx.h(".boat")) && gone(&fx.h(".later")), "{out}");
+    assert!(!shown.contains("action: remove"), "{shown}");
+    assert_eq!(code(&run), 0, "{}", stderr(&run));
+    assert!(fx.h(".boat").is_dir());
+    assert_eq!(fs::read_to_string(fx.h(".later")).unwrap(), "x");
+    assert_eq!(
+        fs::read_to_string(fx.h(".config/boat/owner-config")).unwrap(),
+        "mine"
+    );
     assert_eq!(fs::read_to_string(fx.h(".keep")).unwrap(), "mine\n");
     assert!(fs::symlink_metadata(fx.h(".local/bin/x")).is_ok());
     assert!(!p.exists());
@@ -3184,7 +3244,7 @@ fn a_run_that_ended_without_a_window_removes_no_window_candidate() {
     let (preview, run) = purged(&fx);
     let shown = text(&preview.stdout);
     assert!(
-        shown.contains("the run ended but its after-observation was not recorded"),
+        shown.contains("the after-observation was not recorded"),
         "{shown}"
     );
     assert!(!shown.contains("action: remove"), "{shown}");

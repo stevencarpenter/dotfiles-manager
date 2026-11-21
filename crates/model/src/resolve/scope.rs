@@ -353,7 +353,7 @@ pub fn module_manifest(
 ) -> Result<Option<String>, ResolveError> {
     let read = |path: &str, from: &str| -> Result<&[u8], ResolveError> {
         match sources.get(path) {
-            Some(Entry::File(b)) => Ok(b),
+            Some(Entry::File { bytes: b, .. }) => Ok(b),
             _ => Err(ResolveError::new(
                 Code::SourceMissing,
                 from,

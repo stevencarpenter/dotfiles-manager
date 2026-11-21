@@ -1766,6 +1766,7 @@ fn a_script_record_without_data_keeps_its_schema_when_adopted() {
         bytes: 1,
         shell: "sh".into(),
         args: vec![],
+        env_from: Vec::new(),
         env: vec![],
         tty: false,
         before: vec![],

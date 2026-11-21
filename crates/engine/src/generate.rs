@@ -470,15 +470,15 @@ fn walk(
                 continue;
             }
             Peek::File { .. } => {
-                let bytes = dir
-                    .read_plain(&name, MAX_SOURCE_FILE_BYTES)?
+                let (bytes, mode) = dir
+                    .read_plain_with_mode(&name, MAX_SOURCE_FILE_BYTES)?
                     .ok_or_else(|| tree_stale(shown))?;
                 tree.bytes += u64::try_from(bytes.len()).unwrap_or(u64::MAX);
                 if tree.bytes > MAX_SOURCE_TOTAL_BYTES {
                     return Err(tree_stale(shown));
                 }
                 EntryKind::File {
-                    exec: false,
+                    exec: mode & 0o111 != 0,
                     sha256: sha256_hex(&bytes),
                 }
             }
@@ -560,9 +560,9 @@ fn links_stay_inside(
 
 /// Reads the source of a link operation again, immediately before the operation is journaled.
 /// The source root is the trusted start; every component below it is opened without following a
-/// link. The path must still be a regular file or a directory, and its content hash (file) or
-/// tree digest (directory) must equal the plan's `source:` precondition. A source with no
-/// recorded identity (a secret value) is checked for presence and type only.
+/// link. A regular file must retain its recorded content hash and executable bit. A directory
+/// must retain its tree digest. A source with no recorded identity is checked for presence and
+/// type only.
 ///
 /// shortcut: a directory source with entries that `[sources].exclude` left out is not compared
 /// with its digest, because the plan does not record the exclude patterns; its links are only
@@ -598,8 +598,16 @@ pub(crate) fn link_source(sys: &Sys, plan: &Plan, op: &Operation) -> Result<(), 
     }
     match cur.peek(sys, name)? {
         Peek::File { .. } => {
-            let bytes = cur.read_plain(name, MAX_HASHED_BYTES)?.ok_or_else(gone)?;
-            if want.is_some_and(|h| h != sha256_hex(&bytes)) {
+            let (bytes, mode) = cur
+                .read_plain_with_mode(name, MAX_HASHED_BYTES)?
+                .ok_or_else(gone)?;
+            let mode_subject = format!("source-executable:{path}");
+            let mode_state = if mode & 0o111 != 0 { "true" } else { "false" };
+            let changed_mode = op
+                .preconditions
+                .iter()
+                .any(|p| p.subject == mode_subject && p.state != mode_state);
+            if changed_mode || want.is_some_and(|h| h != sha256_hex(&bytes)) {
                 return Err(stale(format!("source {path} changed since the plan")));
             }
         }

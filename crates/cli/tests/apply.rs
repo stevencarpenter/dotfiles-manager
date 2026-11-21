@@ -466,6 +466,37 @@ fn a_changed_source_makes_the_approved_plan_stale() {
     assert!(!fx.h(".config/git/config").exists());
 }
 
+#[test]
+fn a_link_source_executable_bit_change_during_apply_blocks_publication() {
+    for directory in [false, true] {
+        let fx = Fx::new();
+        let file = if directory {
+            let manifest = CORE.replace(
+                "source = \"files/gitconfig\"",
+                "source = \"files/hooks\"\ndirectory = true",
+            );
+            fx.put("base/modules/core/module.toml", &manifest);
+            fx.put("base/modules/core/files/hooks/prepare", "prepare\n");
+            "base/modules/core/files/hooks/prepare"
+        } else {
+            "base/modules/core/files/gitconfig"
+        };
+        fs::set_permissions(fx.root.join(file), fs::Permissions::from_mode(0o644)).unwrap();
+        let o = parked_apply(&fx, "apply-before-op-core.git@.config/git/config", |fx| {
+            fs::set_permissions(fx.root.join(file), fs::Permissions::from_mode(0o755)).unwrap();
+        });
+        let out = text(&o.stdout);
+        assert_eq!(code(&o), 1, "{}\n{out}", stderr(&o));
+        assert!(out.contains("blocked core.git@.config/git/config"), "{out}");
+        assert!(
+            out.contains("E_PLAN_STALE") || stderr(&o).contains("E_PLAN_STALE"),
+            "{}\n{out}",
+            stderr(&o)
+        );
+        assert!(fs::symlink_metadata(fx.h(".config/git/config")).is_err());
+    }
+}
+
 // ---- publication ------------------------------------------------------------------------
 
 #[test]
@@ -708,6 +739,18 @@ fn a_foreign_skill_directory_at_a_leaf_conflicts_and_a_foreign_sibling_is_kept()
             .is_dir()
     );
     assert_eq!(fs::read_to_string(&sibling).unwrap(), "my own skill\n");
+
+    let module = "base/modules/extra/module.toml";
+    let enabled = fs::read_to_string(fx.root.join(module)).unwrap();
+    fx.put(
+        module,
+        &enabled.replace("enabled = true", "enabled = false"),
+    );
+    let id = "remove@extra.skills@.claude/skills/audit";
+    let o = fx.apply(&["--allow-disruptive", id]);
+    assert_eq!(code(&o), 0, "{}\n{}", text(&o.stderr), text(&o.stdout));
+    assert!(fs::symlink_metadata(&leaf).is_err());
+    assert_eq!(fs::read_to_string(&sibling).unwrap(), "my own skill\n");
 }
 
 #[test]
@@ -864,6 +907,31 @@ fn deselecting_a_module_removes_only_its_owned_links_and_nothing_else() {
     assert!(fx.h(".local/share/app/state.db").is_file());
     assert!(fx.h(".ssh/config").is_symlink() && fx.h(".config/git/config").is_symlink());
     assert!(fx.root.join("base/modules/extra/files/zshrc").is_file());
+}
+
+#[test]
+fn a_selected_resource_retires_only_the_target_it_no_longer_claims() {
+    let fx = Fx::new();
+    assert_eq!(code(&fx.apply(&[])), 0);
+    fx.put(
+        "base/modules/extra/module.toml",
+        &EXTRA.replace(".zshrc", ".zshenv"),
+    );
+    let removal = "remove@extra.zsh@.zshrc";
+    let o = fx.apply(&[]);
+    assert_eq!(code(&o), 3, "{}", stderr(&o));
+    assert!(stderr(&o).contains(removal));
+    assert!(fx.h(".zshrc").is_symlink());
+    let o = fx.apply(&["--allow-disruptive", removal]);
+    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+    assert!(fs::symlink_metadata(fx.h(".zshrc")).is_err());
+    assert!(is_link_to(
+        &fx.h(".zshenv"),
+        &fx.root.join("base/modules/extra/files/zshrc")
+    ));
+    assert!(fx.h(".config/tmux/tmux.conf").is_symlink());
+    assert!(!fx.owned_paths().contains(&".zshrc".to_string()));
+    assert!(fx.owned_paths().contains(&".zshenv".to_string()));
 }
 
 #[test]
@@ -1466,10 +1534,7 @@ fn a_linked_parent_of_one_owned_output_blocks_only_that_entry() {
 }
 
 #[test]
-fn ledger_writes_still_work_when_another_entry_has_a_linked_parent() {
-    // The tmux resource now claims another path, so its old entry is no longer claimed and not a
-    // removal candidate (the resource is still selected). The old entry sits behind a link that
-    // leaves HOME. A new link is published and the ledger is rewritten around the old entry.
+fn a_retargeted_resource_cannot_retire_an_output_behind_a_linked_parent() {
     let fx = Fx::new();
     assert_eq!(code(&fx.apply(&[])), 0);
     let outside = stow_style_tmux(&fx);
@@ -1482,16 +1547,12 @@ fn ledger_writes_still_work_when_another_entry_has_a_linked_parent() {
         ),
     );
     let o = fx.apply(&[]);
-    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
-    assert!(is_link_to(
-        &fx.h(".tmux.conf"),
-        &fx.root.join("base/modules/extra/files/tmux.conf")
-    ));
-    let owned = fx.owned_paths();
-    assert!(owned.contains(&".tmux.conf".to_string()), "{owned:?}");
+    assert_eq!(code(&o), 3, "{}\n{}", stderr(&o), text(&o.stdout));
+    assert!(stderr(&o).contains("E_PARENT_UNSAFE"), "{}", stderr(&o));
+    assert!(fs::symlink_metadata(fx.h(".tmux.conf")).is_err());
     assert!(
-        owned.contains(&".config/tmux/tmux.conf".to_string()),
-        "the old entry is kept: {owned:?}"
+        fx.owned_paths()
+            .contains(&".config/tmux/tmux.conf".to_string())
     );
     assert!(
         outside.join("tmux/tmux.conf").is_symlink(),

@@ -149,7 +149,7 @@ fn tree(parse: bool) -> Command {
             "Install the missing packages",
             [
                 allow_disruptive().hide(true),
-                allow_adopt().hide(true),
+                allow_adopt(),
                 switch("update"),
             ],
         ))
@@ -183,6 +183,7 @@ fn tree(parse: bool) -> Command {
                 .about("Promote a trial into a module")
                 .arg(Arg::new("trial-id"))
                 .arg(value("module", "module"))
+                .arg(many("file", "HOME-relative-file"))
                 .arg(root())
                 .arg(preview())
                 .arg(yes_plan()),
@@ -204,6 +205,7 @@ fn tree(parse: bool) -> Command {
                 many("restart", "resource-id"),
                 many("trust-origin", "origin"),
                 switch("no-upgrade"),
+                switch("strict-upgrade").conflicts_with("no-upgrade"),
             ],
         ))
         .subcommand(

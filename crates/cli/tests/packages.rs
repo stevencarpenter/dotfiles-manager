@@ -331,39 +331,26 @@ fn a_configuration_plan_lists_packages_out_of_scope_and_starts_no_provider() {
     assert!(t.contains("not_in_scope extra.atuin@scope"), "{t}");
     assert!(t.contains("not_in_scope extra.duckdb@scope"), "{t}");
     assert!(!fx.provider_ran(), "plan started a provider: {}", fx.log());
-    // No provider has run, so the runner's working directory does not exist. Doctor creates
-    // nothing, so it starts no provider and reports each package unknown.
-    let o = fx.run(&["doctor", "--root", fx.root_arg()]);
-    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
-    let t = text(&o.stdout);
-    assert!(t.contains("UNKNOWN E_PROBE_FAILED resource"), "{t}");
-    assert!(t.contains("does not exist yet"), "{t}");
-    assert!(
-        !fx.provider_ran(),
-        "doctor started a provider: {}",
-        fx.log()
-    );
+    // Both a fresh installation and an existing non-private cache keep their original state.
     let run = fx.home.path().join(".cache/dotfiles-manager/run");
-    assert!(!run.exists());
-    // A runner directory with another mode is left as it is, and no provider starts.
-    fs::create_dir_all(&run).unwrap();
-    fs::set_permissions(&run, fs::Permissions::from_mode(0o755)).unwrap();
-    let o = fx.run(&["doctor", "--root", fx.root_arg()]);
-    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
-    assert!(
-        text(&o.stdout).contains("UNKNOWN E_PROBE_FAILED resource"),
-        "{}",
-        text(&o.stdout)
-    );
-    assert!(
-        !fx.provider_ran(),
-        "doctor started a provider: {}",
-        fx.log()
-    );
-    assert_eq!(
-        fs::metadata(&run).unwrap().permissions().mode() & 0o7777,
-        0o755
-    );
+    for existing in [false, true] {
+        if existing {
+            fs::create_dir_all(&run).unwrap();
+            fs::set_permissions(&run, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let o = fx.run(&["doctor", "--root", fx.root_arg()]);
+        assert_eq!(code(&o), 0, "{}", stderr(&o));
+        assert!(fx.provider_ran(), "{}", fx.log());
+        assert_eq!(code(&fx.preview()), 0);
+        if existing {
+            assert_eq!(
+                fs::metadata(&run).unwrap().permissions().mode() & 0o7777,
+                0o755
+            );
+        } else {
+            assert!(!run.exists());
+        }
+    }
 }
 
 /// The JSON row of `resource` in `doctor --json` run with `PATH`, and the document.
@@ -394,7 +381,6 @@ fn doctor_shows_provider_version_and_path_selection_and_reports_another_owner_un
     let fx = Fx::new();
     fx.installed("brew", "atuin 18.24.1\n");
     fx.installed("mise", "");
-    // A preview runs the providers once, which makes the runner's working directory.
     assert_eq!(code(&fx.preview()), 0);
     // PATH selects `atuin` through a link. Doctor reads the link and never runs its target.
     let real = fx.fake.path().join("real");
@@ -1115,7 +1101,7 @@ fn a_stop_request_during_a_probe_ends_the_probing_and_exits_143() {
 }
 
 #[test]
-fn a_provider_that_cannot_answer_blocks_and_the_flags_of_apply_are_refused() {
+fn a_provider_that_cannot_answer_blocks_and_disruptive_approval_is_refused() {
     let fx = Fx::new();
     fx.installed("brew", "atuin 1\n");
     fx.put(
@@ -1125,14 +1111,16 @@ fn a_provider_that_cannot_answer_blocks_and_the_flags_of_apply_are_refused() {
     let o = fx.preview();
     assert_eq!(code(&o), 3, "{}\n{}", stderr(&o), text(&o.stdout));
     assert!(stderr(&o).contains("E_PROBE_FAILED"), "{}", stderr(&o));
-    for flags in [
-        &["--allow-disruptive", "x"][..],
-        &["--allow-adopt", "x"][..],
-    ] {
-        let mut a = vec!["packages", "--root", fx.root_arg()];
-        a.extend_from_slice(flags);
-        assert_eq!(code(&fx.run(&a)), 2);
-    }
+    assert_eq!(
+        code(&fx.run(&[
+            "packages",
+            "--root",
+            fx.root_arg(),
+            "--allow-disruptive",
+            "x"
+        ])),
+        2
+    );
 }
 
 /// A module whose only resource is the `mise/v1` tool `name`.
@@ -1459,18 +1447,19 @@ fn a_failing_clone_leaves_nothing_and_the_install_stays_planned() {
     let parent = fx.home.path().join("x");
     fs::create_dir_all(&parent).unwrap();
     fs::write(parent.join("keep"), "mine").unwrap();
-    // A sibling left by an earlier killed run is removed before the clone.
+    // Cleanup preserves every sibling that predates this attempt.
     fs::create_dir_all(parent.join(".r.dfm-clone-1/.git")).unwrap();
     fs::write(fx.fake.path().join("clone-fails"), "").unwrap();
     let o = fx.packages(&digest_of(&fx.preview()));
     assert_eq!(code(&o), 1, "{}\n{}", stderr(&o), text(&o.stdout));
     assert_eq!(clones(&fx).len(), 1, "{}", fx.log());
     assert!(!parent.join("r").exists());
-    let names: Vec<_> = fs::read_dir(&parent)
+    let mut names: Vec<_> = fs::read_dir(&parent)
         .unwrap()
         .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
         .collect();
-    assert_eq!(names, ["keep"]);
+    names.sort();
+    assert_eq!(names, [".r.dfm-clone-1", "keep"]);
     assert_eq!(fs::read_to_string(parent.join("keep")).unwrap(), "mine");
     let o = fx.preview();
     assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
@@ -1482,7 +1471,7 @@ fn a_failing_clone_leaves_nothing_and_the_install_stays_planned() {
 }
 
 #[test]
-fn the_stale_clone_cleanup_removes_only_directories() {
+fn checkout_preserves_all_preexisting_siblings() {
     let fx = checkout_fx("https://github.com/o/r.git", "");
     let parent = fx.home.path().join("x");
     fs::create_dir_all(parent.join(".r.dfm-clone-1/.git")).unwrap();
@@ -1493,7 +1482,7 @@ fn the_stale_clone_cleanup_removes_only_directories() {
     std::os::unix::fs::symlink(&elsewhere, parent.join(".r.dfm-clone-link")).unwrap();
     let o = fx.packages(&digest_of(&fx.preview()));
     assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
-    assert!(!parent.join(".r.dfm-clone-1").exists());
+    assert!(parent.join(".r.dfm-clone-1/.git").is_dir());
     assert_eq!(
         fs::read_to_string(parent.join(".r.dfm-clone-file")).unwrap(),
         "mine"

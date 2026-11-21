@@ -118,6 +118,24 @@ check_platform() {
     refuse E_PLATFORM_UNSUPPORTED "$os/$arch is not supported; native Apple Silicon macOS is required"
 }
 
+# HOME already exists before the first install and survives uninstall. The directory inode
+# gives every entry point the same kernel lock without creating or unlinking a lock file.
+lock_bootstrap() {
+  home_id=$(/usr/bin/stat -f '%d:%i' "$HOME_DIR/.") || refuse E_PREREQ_MISSING "cannot stat HOME for the bootstrap lock"
+  if [ "$(/usr/bin/stat -f '%d:%i' 2>/dev/null)" = "$home_id" ]; then
+    # Reuse the open file description passed by self-update, then give children empty stdin.
+    exec 9<&0 0</dev/null
+  else
+    exec 9<"$HOME_DIR/."
+  fi
+  rc=0; /usr/bin/lockf -s -t 0 9 || rc=$?
+  case $rc in
+    0) ;;
+    75) refuse E_LOCKED "another install, uninstall or self-update holds the bootstrap lock" ;;
+    *) refuse E_PREREQ_MISSING "cannot lock HOME for bootstrap (lockf exit $rc)" ;;
+  esac
+}
+
 # ---- restricted-grammar checker (mirror of dfm_model::controls) ----------------------------
 # The scanner accepts: comments, [table] and [[table]] headers with bare dotted names, and
 # bare `key = value` lines where value is a single-line string without escapes, boolean,
@@ -696,7 +714,7 @@ cmd_install() {
     case ${#commit} in 40) fmt=sha1 ;; 64) fmt=sha256 ;; *) refuse E_SOURCE_UNTRUSTED "--commit must be a full lowercase hex object id (40 or 64 digits)" ;; esac
   fi
   [ -n "$src" ] || printf 'bootstrap: no --source given; the source is %s\n' "$ORIGIN" >&2
-  resolve_home; check_platform
+  resolve_home; check_platform; lock_bootstrap
   # /usr/bin/git is the Command Line Tools shim, so the tools are probed before any git call.
   ensure_clt
   build=$CACHE/build
@@ -860,8 +878,8 @@ retire_old_command_link() {
 # Removes what install created. The toolchain, state, binding and anything else in the cache
 # root are never touched.
 cmd_uninstall() {
-  resolve_home
-  check_home_dir; check_cache_tree; check_data_tree; check_current_leaves; check_bin_dir
+  resolve_home; check_home_dir; lock_bootstrap
+  check_cache_tree; check_data_tree; check_current_leaves; check_bin_dir
   link=$HOME_DIR/.local/bin/dfm
   if [ -L "$link" ] && [ "$(readlink "$link")" = "$DATA/current/dfm" ]; then rm -f "$link"; fi
   retire_old_command_link

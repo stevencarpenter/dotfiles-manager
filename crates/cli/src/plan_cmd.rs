@@ -236,7 +236,7 @@ pub(crate) fn plan_with_outputs(
         &loaded.root,
         loaded.read_root(),
     );
-    mark_excluded(&mut plan, &loaded.sources);
+    mark_source_metadata(&mut plan, &loaded.sources);
     Ok((plan, generated))
 }
 
@@ -272,11 +272,21 @@ fn staged_link_kinds(obs: &mut Observations, root: &Path, tree: &Path) {
 }
 
 /// Marks each operation whose directory source holds entries that `[sources].exclude` left
-/// unread. Such a directory is published whole on apply, but the plan hashed only what was read.
-fn mark_excluded(plan: &mut Plan, sources: &dfm_model::resolve::SourceSet) {
+/// unread. A link to a regular file also records the executable bit for its pre-write check.
+fn mark_source_metadata(plan: &mut Plan, sources: &dfm_model::resolve::SourceSet) {
     for o in &mut plan.operations {
         let n: usize = o.inputs.iter().map(|i| sources.pruned_under(&i.path)).sum();
         o.excluded = u64::try_from(n).ok().filter(|n| *n > 0);
+        if o.link.is_some()
+            && let Some(input) = o.inputs.first()
+            && let Some(dfm_model::resolve::Entry::File { executable, .. }) =
+                sources.get(&input.path)
+        {
+            o.preconditions.push(plan::Precondition {
+                subject: format!("source-executable:{}", input.path),
+                state: executable.to_string(),
+            });
+        }
     }
 }
 

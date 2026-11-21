@@ -2196,6 +2196,36 @@ fn state_check_refuses_a_lock_file_the_writer_would_refuse() {
 // ---- DFM-19.C04: the pre-flip state check of a new binary ------------------------------------
 
 #[test]
+fn state_health_and_pre_activation_check_read_grants_and_active_trials() {
+    let h = seeded("grants-and-trials");
+    let home = h.path().to_str().unwrap();
+    let preflight = || run(h.path(), &["self-check", "--state-home", home]);
+    assert_eq!(preflight().status.code(), Some(0));
+    let store = state(h.path());
+    let grants = store.join("grants.json");
+    let trial = store.join("trials/later.json");
+    for (file, bytes, expected) in [
+        (
+            &grants,
+            r#"{"schema":2,"origins":"invalid"}"#,
+            "E_STATE_INVALID",
+        ),
+        (&trial, r#"{"schema":99}"#, "E_STATE_NEWER"),
+    ] {
+        fs::write(file, bytes).unwrap();
+        fs::set_permissions(file, fs::Permissions::from_mode(0o600)).unwrap();
+        let health = check(h.path());
+        assert_eq!(health.status.code(), Some(1), "{}", text(&health.stdout));
+        assert!(text(&health.stdout).contains(expected));
+        let pre = preflight();
+        assert_eq!(pre.status.code(), Some(3), "{}", text(&pre.stderr));
+        assert!(text(&pre.stderr).contains(expected));
+        assert_eq!(fs::read_to_string(file).unwrap(), bytes);
+        fs::remove_file(file).unwrap();
+    }
+}
+
+#[test]
 fn the_state_check_fails_only_on_state_this_binary_cannot_read() {
     let h = bound_home("state-check");
     let home = h.path().to_str().unwrap();

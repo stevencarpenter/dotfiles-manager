@@ -1252,7 +1252,8 @@ impl Exec<'_, '_> {
                 .as_ref()
                 .map(|c| c.appended.clone())
                 .unwrap_or_default(),
-            takeover: op.takeover,
+            // A field takeover in a co-owned file grants no ownership of foreign list entries.
+            takeover: op.takeover && recorded.is_none(),
             home: self.run.home.shown().to_str().map(String::from),
             listing: fragments.listing,
             fragments: fragments.fragments,
@@ -1288,6 +1289,23 @@ impl Exec<'_, '_> {
                 let e = Refusal::new(e.code, format!("{rel}: {}", e.detail));
                 Ended::Blocked(e)
             })?;
+            let approved = op
+                .preconditions
+                .iter()
+                .find(|p| p.subject.starts_with("merge-takeover:"))
+                .map(|p| p.state.as_str());
+            let now = recorded
+                .as_ref()
+                .zip(salt.as_deref())
+                .and_then(|(c, salt)| dfm_model::merge::new_leaf_takeover(c, salt, &merged));
+            if approved != now.as_deref() {
+                return Err(blocked(
+                    Code::PlanStale,
+                    format!(
+                        "{rel}: the existing values of newly managed settings changed. Fix: review the plan again"
+                    ),
+                ));
+            }
             // The plan's trust check again, on the bytes this publication merges into: an
             // application that removed a marketplace after the plan would have it added back
             // (docs/adapters.md, "Source identities"). The isolated build (failpoints) allows
@@ -2044,10 +2062,8 @@ impl Exec<'_, '_> {
         recover::record_output(self.run.store, who, id, out)
     }
 
-    /// The outcome entry and ownership. A create or remove changes the ledger after `done`. An
-    /// update or replace already has a ledger entry with the old fingerprint, so the ledger
-    /// moves first: a crash or a failed write then leaves an open intent, and recovery repairs
-    /// the fingerprint. The other order would leave `done` with a stale fingerprint.
+    /// A create acquires ownership after `done`. Updates and removals settle their existing
+    /// ownership first, so an interrupted ledger write leaves an intent that recovery can repair.
     fn settle_outcome(
         &self,
         op: &Operation,
@@ -2073,7 +2089,7 @@ impl Exec<'_, '_> {
         // that settling closes with ownership, not a link no entry records.
         let ledger_first = matches!(
             op.action,
-            Action::UpdateFile | Action::ReplaceLink | Action::AdoptFile
+            Action::UpdateFile | Action::ReplaceLink | Action::AdoptFile | Action::Remove
         );
         if ledger_first {
             own()?;
@@ -2285,20 +2301,9 @@ impl Exec<'_, '_> {
         recover::forget_output(self.run.store, &op.resource, id, abs)
     }
 
-    /// Whether the entry at `rel` is absent right now, read through the opened HOME without
-    /// following a link. A parent that cannot be opened, or any doubt, is "not known absent".
-    fn absent_now(&self, rel: &str) -> bool {
-        let Ok(comps) = components(rel) else {
-            return false;
-        };
-        let Some((name, parents)) = comps.split_last() else {
-            return false;
-        };
-        self.run
-            .home
-            .open_below(&self.run.sys, parents)
-            .and_then(|p| p.peek(&self.run.sys, name))
-            .is_ok_and(|live| matches!(live, Peek::Missing))
+    fn absent_now(&self, abs: &str) -> bool {
+        let location = (&self.run.sys, self.run.home, self.run.home_path);
+        recover::observe_live(location, abs, false).is_some_and(|l| matches!(l.peek, Peek::Missing))
     }
 
     /// A removal candidate that is already gone: its ledger entry is stale authority. A later
@@ -2322,7 +2327,7 @@ impl Exec<'_, '_> {
             })
         });
         match listed {
-            Ok(true) if self.path_unknown(&abs).is_none() && self.absent_now(rel) => {}
+            Ok(true) if self.path_unknown(&abs).is_none() && self.absent_now(&abs) => {}
             Ok(_) => return Ended::Current,
             Err(e) => return failed(e),
         }
@@ -2345,7 +2350,7 @@ impl Exec<'_, '_> {
         if let Err(e) = self.journal(op, &id, Phase::Intent, Some(recovery), None) {
             return Ended::Failed(e, Some(id));
         }
-        let r = if self.absent_now(rel) {
+        let r = if self.absent_now(&abs) {
             self.forget_output(op, &id, &abs)
                 .and_then(|()| self.journal(op, &id, Phase::Done, None, None))
         } else {
@@ -2448,6 +2453,7 @@ fn record(
             text.chars().take(1024).collect()
         }),
         reload,
+        upgrade: None,
     }
 }
 

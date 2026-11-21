@@ -1303,6 +1303,22 @@ pub fn foreign_edit(salt: &[u8], recorded: &CoOwned, m: &Merged) -> bool {
     })
 }
 
+/// Identity of the existing values that a newly claimed leaf would replace in a co-owned file.
+/// Missing and matching leaves need no takeover. The sorted, fixed-width hashes encode both
+/// the pointers and their old values without disclosing sensitive data.
+pub fn new_leaf_takeover(recorded: &CoOwned, salt: &[u8], merged: &Merged) -> Option<String> {
+    let mut hashes = String::new();
+    for (pointer, desired) in &merged.rendered_leaves {
+        if !recorded.leaves.contains_key(pointer)
+            && let Some(live) = merged.live_leaves.get(pointer)
+            && live != desired
+        {
+            hashes.push_str(&leaf_hash(salt, pointer, live));
+        }
+    }
+    (!hashes.is_empty()).then(|| sha256_hex(hashes.as_bytes()))
+}
+
 /// The shared conflict check for plan and apply. `live_present` is false when the file is
 /// absent: there is nothing to compare, and the merge creates the file and records a new salted
 /// hash. A recorded hash needs a usable salt. Messages carry no live content.

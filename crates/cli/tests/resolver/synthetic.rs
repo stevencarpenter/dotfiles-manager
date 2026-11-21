@@ -18,7 +18,9 @@ fn public_only(full: &SourceSet) -> SourceSet {
     let mut out = SourceSet::new();
     for p in full.paths().filter(|p| p.starts_with("shared/") || *p == A) {
         match full.get(p).unwrap() {
-            Entry::File(b) => out.insert_file(p, b.clone()),
+            Entry::File { bytes, executable } => {
+                out.insert_file_with_exec(p, bytes.clone(), *executable)
+            }
             Entry::Link(t) => out.insert_link(p, t.clone()),
         }
     }

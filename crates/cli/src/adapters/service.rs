@@ -10,7 +10,7 @@
 use dfm_engine::{Completion, End, ProcOutput, ProcRequest, Runner};
 use dfm_model::digest::sha256_hex;
 use dfm_model::plan::{Action, Definition, Scope, ServiceFacts, ServiceState};
-use dfm_model::resolve::{Resolved, Value};
+use dfm_model::resolve::{ResolvedResource, Value};
 use dfm_model::{Code, Refusal};
 use std::collections::BTreeMap;
 use std::io::Read;
@@ -462,7 +462,7 @@ fn launchd_report(runner: &Runner, label: &str) -> Result<Option<Loaded>, String
     let b = bounds();
     let args = ["print".to_string(), format!("{}/{label}", domain(runner))];
     let out = runner
-        .run(&request("launchctl", &args, &[], b.probe))
+        .probe(&request("launchctl", &args, &[], b.probe))
         .map_err(|e| e.detail)?;
     let not_found = || {
         String::from_utf8_lossy(&out.stderr).contains("Could not find service")
@@ -654,7 +654,7 @@ fn brew_report(runner: &Runner, name: &str) -> Result<Option<BrewInfo>, String> 
         "--json".into(),
     ];
     let out = runner
-        .run(&request("brew", &args, &brew_env(), b.probe))
+        .probe(&request("brew", &args, &brew_env(), b.probe))
         .map_err(|e| e.detail)?;
     let err = String::from_utf8_lossy(&out.stderr);
     match ended("brew services info", &out, b.probe)? {
@@ -793,7 +793,7 @@ fn omlx_term_server(runner: &Runner) -> Result<u32, Refusal> {
         "-p".into(),
         p.clone(),
     ];
-    let out = runner.run(&request("ps", &args, &[], b.probe))?;
+    let out = runner.probe(&request("ps", &args, &[], b.probe))?;
     match ended("ps", &out, b.probe).map_err(refuse)? {
         0 => {}
         _ => {
@@ -1059,18 +1059,14 @@ pub fn act(
 /// ends the probing: the probe it arrived in is ended by the runner, no further launcher is
 /// started, and the request is the error. `staged` is [`Staged`]; `root` is the canonical
 /// checkout root.
-pub fn service_facts(
-    resolved: &Resolved,
+pub fn service_facts<'a>(
+    resources: impl Iterator<Item = &'a ResolvedResource>,
     runner: &Runner,
     staged: Option<Staged<'_>>,
     root: &Path,
 ) -> Result<BTreeMap<String, ServiceFacts>, Refusal> {
     let mut out = BTreeMap::new();
-    for r in resolved
-        .resources
-        .values()
-        .filter(|r| Scope::Services.covers(r))
-    {
+    for r in resources.filter(|r| Scope::Services.covers(r)) {
         if let Some(stop) = dfm_engine::signal::requested() {
             return Err(stop);
         }

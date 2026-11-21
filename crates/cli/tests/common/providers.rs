@@ -75,6 +75,7 @@ case "$1" in
     echo "uninstall autoremove=${HOMEBREW_NO_AUTOREMOVE:-unset}" >> "$here/../log"
     root=Cellar; [ "$2" = --cask ] && root=Caskroom; shift 2
     force=; [ "$1" = --force ] && { force=1; shift; }
+    for n in "$@"; do shift; set -- "$@" "${n##*/}"; done
     for n in "$@"; do
       for u in $(cat "$here/../needed-$n" 2>/dev/null); do
         case " $* " in *" $u "*) ;; *) echo "Error: Refusing to uninstall $n because it is required by $u" >&2; exit 1 ;; esac

@@ -5,7 +5,7 @@ use dfm_model::digest::hex;
 use sha2::{Digest, Sha256};
 use std::fs;
 use std::io::Read;
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::Path;
 
 /// Reads at most `limit + 1` bytes of a regular file, so the caller can tell that the file is
@@ -18,17 +18,28 @@ pub fn read_regular_bounded(
     io: impl Fn(std::io::Error) -> Refusal,
     not_regular: impl FnOnce() -> Refusal,
 ) -> Result<Vec<u8>, Refusal> {
+    read_regular_with_mode(path, limit, io, not_regular).map(|(bytes, _)| bytes)
+}
+
+/// Returns the permissions from the same opened file as its bytes.
+pub(crate) fn read_regular_with_mode(
+    path: &Path,
+    limit: u64,
+    io: impl Fn(std::io::Error) -> Refusal,
+    not_regular: impl FnOnce() -> Refusal,
+) -> Result<(Vec<u8>, u32), Refusal> {
     let file = fs::OpenOptions::new()
         .read(true)
         .custom_flags(dfm_platform_macos::O_NOFOLLOW | dfm_platform_macos::O_NONBLOCK)
         .open(path)
         .map_err(&io)?;
-    if !file.metadata().map_err(&io)?.is_file() {
+    let meta = file.metadata().map_err(&io)?;
+    if !meta.is_file() {
         return Err(not_regular());
     }
     let mut buf = Vec::new();
     file.take(limit + 1).read_to_end(&mut buf).map_err(&io)?;
-    Ok(buf)
+    Ok((buf, meta.permissions().mode()))
 }
 
 /// SHA-256 of a file as lowercase hex, streamed so the file is never held in memory.

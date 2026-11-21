@@ -742,6 +742,52 @@ fn an_owned_file_that_still_matches_is_removed_and_its_ledger_entry_goes() {
 }
 
 #[test]
+fn a_verified_removal_releases_ownership_before_done_and_after_recovery() {
+    for fail_ledger in [false, true] {
+        let s = rearmed(
+            |s| {
+                fs::write(s.h.0.join("a"), "mine").unwrap();
+                own(s, "a", "mine");
+            },
+            if fail_ledger {
+                Fail::at("ledger-before-write", Inject::Error)
+            } else {
+                Fail::none()
+            },
+        );
+        let o = op(&s.h, &s.store, "remove@core.x@a", 1, Action::Remove, "a");
+        let run_fail = if fail_ledger {
+            Fail::none()
+        } else {
+            Fail::at("apply-after-done", Inject::Error)
+        };
+        let r = go_with(
+            &s,
+            &plan(vec![o]),
+            &NoGenerator,
+            &ids(&["remove@core.x@a"]),
+            &run_fail,
+        );
+        assert_eq!(r.operations[0].status, Status::Failed);
+        assert!(!s.h.0.join("a").exists());
+        let entries = s.store.read_journal().unwrap();
+        if fail_ledger {
+            assert_eq!(entries.last().unwrap().phase, Phase::Intent);
+        } else {
+            assert_eq!(entries.last().unwrap().phase, Phase::Done);
+            assert!(s.store.read_ledger().unwrap().resources.is_empty());
+        }
+        let s = reopened(s);
+        assert!(recover_now(&s).open.is_empty());
+        assert!(s.store.read_ledger().unwrap().resources.is_empty());
+        assert_eq!(
+            s.store.read_journal().unwrap().last().unwrap().phase,
+            Phase::Done
+        );
+    }
+}
+
+#[test]
 fn a_removal_without_its_allowance_is_refused_with_every_id_as_a_flag() {
     let s = setup();
     for f in ["a", "b"] {
@@ -1315,28 +1361,32 @@ fn a_link_is_checked_against_the_root_of_its_own_source() {
 
 #[test]
 fn an_absent_removal_candidate_drops_its_stale_ledger_entry() {
-    let s = setup();
-    own(&s, "gone", "x");
-    let mut o = op(
-        &s.h,
-        &s.store,
-        "remove@core.x@gone",
-        1,
-        Action::Remove,
-        "gone",
-    );
-    o.status = PlanStatus::Current;
-    let r = go(&s, &plan(vec![o]), &NoGenerator, &none());
-    assert_eq!(r.operations[0].status, Status::Current);
-    assert!(s.store.read_ledger().unwrap().resources.is_empty());
-    let phases: Vec<_> = s
-        .store
-        .read_journal()
-        .unwrap()
-        .iter()
-        .map(|e| e.phase)
-        .collect();
-    assert_eq!(phases, [Phase::Intent, Phase::Done]);
+    for rel in ["gone", "absent/gone"] {
+        let s = setup();
+        own(&s, rel, "x");
+        let mut o = op(&s.h, &s.store, "remove@core.x@gone", 1, Action::Remove, rel);
+        o.status = PlanStatus::Current;
+        let r = go(&s, &plan(vec![o]), &NoGenerator, &none());
+        assert_eq!(r.operations[0].status, Status::Current);
+        assert!(s.store.read_ledger().unwrap().resources.is_empty());
+        assert_eq!(
+            s.store
+                .read_journal()
+                .unwrap()
+                .iter()
+                .map(|e| e.phase)
+                .collect::<Vec<_>>(),
+            [Phase::Intent, Phase::Done]
+        );
+        let file = s.h.0.join(rel);
+        fs::create_dir_all(file.parent().unwrap()).unwrap();
+        fs::write(&file, "x").unwrap();
+        assert!(
+            !s.store
+                .authorizes_delete("core.x", file.to_str().unwrap(), &file_fingerprint(b"x"))
+                .unwrap()
+        );
+    }
 }
 
 #[test]

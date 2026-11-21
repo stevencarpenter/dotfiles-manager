@@ -11,12 +11,11 @@
 //! so the scan passes no `--config` and the runner clears `GITLEAKS_CONFIG`. The ignore file is
 //! read from a named empty directory instead of the working directory.
 
-use crate::adapters::package::{self, HOMEBREW};
+use crate::adapters::package::{self, HOMEBREW, MISE};
 use crate::apply_cmd::{is_digest, label, stale};
 use crate::plan_cmd::{Probed, binary_identity, plan_with_outputs};
 use crate::read_fs::read_regular_bounded;
 use crate::sync_cmd::Git;
-use crate::trial_cmd::FIXED_ENV;
 use crate::{Ctx, Loaded, cli, load_resolved, paint, require_binding, state_cmd, usage};
 use dfm_engine::{
     Approval as Allowance, Dir, End, ProcRequest, Run, Runner, Store, now_ns, signal,
@@ -495,6 +494,7 @@ const MAX_TOKEN: usize = 4096;
 pub struct Args {
     pub trial: String,
     pub module: String,
+    pub files: Vec<String>,
     pub root: Option<PathBuf>,
     pub preview: bool,
     pub yes_plan: Option<String>,
@@ -528,6 +528,7 @@ pub fn parse_args(m: &clap::ArgMatches) -> Result<Args, Refusal> {
     Ok(Args {
         trial,
         module,
+        files: cli::all(m, "file"),
         root: root.map(PathBuf::from),
         preview,
         yes_plan: yes,
@@ -575,16 +576,41 @@ struct Declaration {
     id: String,
     /// The resource block appended to the manifest.
     block: String,
-    url: String,
-    /// The tool's binary, relative to HOME.
-    binary: String,
+    adapter: String,
+    detail: String,
 }
 
-/// The declaration for a script trial, `None` for any other trial. The binary must be below
-/// HOME. The environment keeps the trial's `--env` values only: the run fixes the rest again.
-fn declaration(t: &TrialRecord, home: &Path) -> Result<Option<Declaration>, Refusal> {
+/// The declaration that lets a second machine install the trial tool.
+fn declaration(
+    t: &TrialRecord,
+    home: &Path,
+    runner: &Runner,
+) -> Result<Option<Declaration>, Refusal> {
     let Some(sc) = &t.script else {
-        return Ok(None);
+        let Some(p) = &t.package else { return Ok(None) };
+        if !matches!(p.adapter.as_str(), HOMEBREW | MISE) {
+            return Err(conflict(format!(
+                "cannot declare trial package adapter {}",
+                p.adapter
+            )));
+        }
+        let id = resource_id(&format!("package-{}", t.tool));
+        // Homebrew resolves an ambiguous short name to the formula first.
+        let name = if p.adapter == HOMEBREW
+            && !p.name.contains('/')
+            && package::brew_is_cask(runner, &p.name)?
+        {
+            format!("homebrew/cask/{}", p.name)
+        } else {
+            p.name.clone()
+        };
+        let block = dfm_model::adopt::package_block(&id, &p.adapter, &name);
+        return Ok(Some(Declaration {
+            id,
+            block,
+            adapter: p.adapter.clone(),
+            detail: format!("name={}", visible(&name)),
+        }));
     };
     let b = sc.binary.as_ref().ok_or_else(|| {
         conflict(format!(
@@ -598,12 +624,6 @@ fn declaration(t: &TrialRecord, home: &Path) -> Result<Option<Declaration>, Refu
             visible(&b.path)
         ))
     })?;
-    let env: Vec<(String, String)> = sc
-        .env
-        .iter()
-        .filter(|(n, _)| !FIXED_ENV.contains(&n.as_str()))
-        .cloned()
-        .collect();
     let id = resource_id(&t.tool);
     let block = script_block(
         &id,
@@ -612,15 +632,19 @@ fn declaration(t: &TrialRecord, home: &Path) -> Result<Option<Declaration>, Refu
             effective_url: &sc.effective_url,
             shell: &sc.shell,
             args: &sc.args,
-            env: &env,
+            env_from: &sc.env_from,
             binary: &binary,
         },
     );
     Ok(Some(Declaration {
         id,
         block,
-        url: sc.url.clone(),
-        binary,
+        adapter: crate::adapters::script::ADAPTER.into(),
+        detail: format!(
+            "url={} binary=~/{} (sync installs the tool from it when the binary is missing, with the grant script:<url>)",
+            visible(&sc.url),
+            visible(&binary)
+        ),
     }))
 }
 
@@ -788,8 +812,7 @@ struct Decision {
     /// Why no Brewfile line is written, for the preview.
     brew_note: Option<String>,
     candidates: Vec<Candidate>,
-    /// The `script/v1` declaration of a script trial.
-    script: Option<Declaration>,
+    declaration: Option<Declaration>,
     unknown: Vec<String>,
     binary: Binary,
     stamp: Stamp,
@@ -819,7 +842,7 @@ impl Decision {
             "resume": self.resume,
             "brew_line": self.brewfile.as_ref().map(|b| &b.addition),
             "candidates": files,
-            "declaration": self.script.as_ref().map(|d| &d.block),
+            "declaration": self.declaration.as_ref().map(|d| &d.block),
             "binary": {"version": self.binary.version, "sha256": self.binary.sha256},
             "binding": {
                 "profile": self.stamp.profile,
@@ -883,20 +906,17 @@ impl Decision {
             "manifest: {} (+{} fs-link/v1 resources{}, appended){}",
             visible(&self.manifest.path),
             self.candidates.len(),
-            if self.script.is_some() {
-                ", +1 script/v1 declaration"
-            } else {
-                ""
-            },
+            self.declaration
+                .as_ref()
+                .map(|d| format!(", +1 {} declaration", d.adapter))
+                .unwrap_or_default(),
             kept(self.manifest.done)
         )?;
-        if let Some(d) = &self.script {
+        if let Some(d) = &self.declaration {
             writeln!(
                 out,
-                "declaration: {} adapter=script/v1 url={} binary=~/{} (sync installs the tool from it when the binary is missing, with the grant script:<url>)",
-                d.id,
-                visible(&d.url),
-                visible(&d.binary)
+                "declaration: {} adapter={} {}",
+                d.id, d.adapter, d.detail
             )?;
         }
         for c in &self.candidates {
@@ -1091,9 +1111,43 @@ fn live_candidates(
     t: &TrialRecord,
     home: &Path,
     linked: &Linked,
+    files: &[String],
+    uid: u32,
 ) -> Result<Vec<LiveFile>, Refusal> {
     let mut out = Vec::new();
-    for b in &candidate_roots(t, home) {
+    let roots = candidate_roots(t, home);
+    let mut selected = BTreeSet::new();
+    for file in files {
+        let rel = Path::new(file);
+        if rel.is_absolute() || !dfm_model::state::valid_path(&format!("/{file}")) {
+            return Err(usage(
+                "--file needs a HOME-relative file without . or .. components",
+            ));
+        }
+        let path = home.join(rel);
+        if !roots.iter().any(|b| {
+            b.existed
+                && b.sha256.is_none()
+                && path.starts_with(&b.path)
+                && path != Path::new(&b.path)
+        }) {
+            return Err(usage(format!(
+                "--file {} is outside the trial's pre-existing configuration directories",
+                visible(file)
+            )));
+        }
+        check_path(home, dir_of(file), uid, false)?;
+        selected.insert(path);
+    }
+    for p in selected {
+        let (bytes, mode, link) = read_live(&p, linked)?;
+        out.push((p, bytes, mode, true, link));
+    }
+    for b in &roots {
+        // A directory-only baseline has no evidence about the files inside it.
+        if b.existed && b.sha256.is_none() {
+            continue;
+        }
         let p = Path::new(&b.path);
         let now = match fs::symlink_metadata(p) {
             Ok(m) => Some(m),
@@ -1107,12 +1161,11 @@ fn live_candidates(
             }
         };
         let Some(now) = now else { continue };
-        let pre = b.existed && b.sha256.is_none();
         match (b.existed, &b.sha256) {
             (true, Some(was)) => {
                 let (bytes, mode, link) = read_live(p, linked)?;
                 if file_fingerprint(&bytes) != *was {
-                    out.push((p.to_path_buf(), bytes, mode, pre, link));
+                    out.push((p.to_path_buf(), bytes, mode, false, link));
                 }
             }
             _ if now.is_dir() => {
@@ -1120,14 +1173,22 @@ fn live_candidates(
                 files_below(p, linked, &mut found)?;
                 for f in found {
                     let (bytes, mode, link) = read_live(&f, linked)?;
-                    out.push((f, bytes, mode, pre, link));
+                    out.push((f, bytes, mode, false, link));
                 }
             }
             _ => {
                 let (bytes, mode, link) = read_live(p, linked)?;
-                out.push((p.to_path_buf(), bytes, mode, pre, link));
+                out.push((p.to_path_buf(), bytes, mode, false, link));
             }
         }
+    }
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    out.dedup_by(|a, b| a.0 == b.0);
+    if out.len() > MAX_CANDIDATES {
+        return Err(Refusal::new(
+            Code::LimitExceeded,
+            format!("more than {MAX_CANDIDATES} files to adopt"),
+        ));
     }
     Ok(out)
 }
@@ -1220,7 +1281,7 @@ fn within_source_limits(
     }
     let mut total: u64 = 0;
     for p in sources.paths() {
-        let Some(Entry::File(b)) = sources.get(p) else {
+        let Some(Entry::File { bytes: b, .. }) = sources.get(p) else {
             continue;
         };
         let len = match brewfile {
@@ -1297,8 +1358,11 @@ fn decide(
     (binary, stamp): (&Binary, &Stamp),
     scan_now: bool,
 ) -> Result<Decision, Refusal> {
-    let trial = trial_record(store, &args.trial)?;
-    // The record is canonical JSON on disk; its serialization here is the same document.
+    let mut trial = trial_record(store, &args.trial)?;
+    if let Some(script) = &mut trial.script {
+        script.protect_environment();
+    }
+    // Bind the record as adopted. Legacy custom values have become name references.
     let record = serde_json::to_vec(&trial)
         .map(|b| sha256_hex(&b))
         .map_err(|e| {
@@ -1317,7 +1381,7 @@ fn decide(
     })?;
     let module = args.module.as_str();
     let modules_line = match loaded.sources.get(&profile) {
-        Some(Entry::File(b)) => String::from_utf8_lossy(b)
+        Some(Entry::File { bytes: b, .. }) => String::from_utf8_lossy(b)
             .lines()
             .find(|l| l.trim_start().starts_with("modules"))
             .map_or_else(|| "modules = [...]".to_string(), |l| l.trim().to_string()),
@@ -1343,7 +1407,11 @@ fn decide(
     }
     // C1: the manifest is the file the resolver read as a regular source file, not a lexical
     // guess; the resolve of the edited composition below checks that it declares the module.
-    let Some(Entry::File(manifest_bytes)) = loaded.sources.get(&manifest) else {
+    let Some(Entry::File {
+        bytes: manifest_bytes,
+        executable: manifest_exec,
+    }) = loaded.sources.get(&manifest)
+    else {
         return Err(conflict(format!(
             "the manifest {manifest} of module {module} is not a regular file in the sources"
         )));
@@ -1368,9 +1436,11 @@ fn decide(
 
     // The candidates, each read once.
     let module_dir = dir_of(&manifest);
-    let script = declaration(&trial, &home)?;
+    let declaration = declaration(&trial, &home, runner)?;
     let mut candidates: Vec<Candidate> = Vec::new();
-    for (path, bytes, mode, preexisting_dir, linked) in live_candidates(&trial, &home, &linked)? {
+    for (path, bytes, mode, preexisting_dir, linked) in
+        live_candidates(&trial, &home, &linked, &args.files, uid)?
+    {
         let rel = rel_text(&path, &home)
             .ok_or_else(|| conflict(format!("{} is outside HOME", path.display())))?;
         let source = format!("home/{rel}");
@@ -1393,8 +1463,8 @@ fn decide(
             linked,
         });
     }
-    // A script trial with a binary is adopted with its declaration alone.
-    if candidates.is_empty() && script.is_none() {
+    // A known installation can be adopted without any configuration.
+    if candidates.is_empty() && declaration.is_none() {
         return Err(conflict(format!(
             "nothing to adopt: no file was created or changed under the baseline paths of trial {}",
             args.trial
@@ -1492,8 +1562,12 @@ fn decide(
         .iter()
         .map(|c| link_block(&c.id, &c.rel, &c.source))
         .collect();
-    if let Some(d) = &script {
-        blocks.push_str(&d.block);
+    if let Some(d) = &declaration {
+        if d.adapter == crate::adapters::script::ADAPTER {
+            blocks.push_str(&d.block);
+        } else {
+            blocks.insert_str(0, &d.block);
+        }
     }
     let mut manifest_base: &[u8] = manifest_bytes;
     let mut manifest_done = false;
@@ -1507,7 +1581,7 @@ fn decide(
     let base_resolved;
     let resolved_now = if manifest_done {
         let mut s = loaded.sources.clone();
-        s.insert_file(manifest.clone(), manifest_base.to_vec());
+        s.insert_file_with_exec(manifest.clone(), manifest_base.to_vec(), *manifest_exec);
         base_resolved = resolve(&s, &profile, &crate::builtin_catalog()).map_err(Refusal::from)?;
         &base_resolved
     } else {
@@ -1516,16 +1590,28 @@ fn decide(
 
     // Ownership and collisions.
     let mut ids: BTreeMap<&str, &str> = BTreeMap::new();
-    if let Some(d) = &script {
-        ids.insert(&d.id, "the script/v1 declaration");
+    if let Some(p) = &trial.package
+        && let Some(r) = resolved_now.resources.values().find(|r| {
+            r.adapter == p.adapter
+                && r.value.get("name").and_then(|n| n.as_str()) == Some(p.name.as_str())
+        })
+    {
+        return Err(conflict(format!(
+            "{} is already declared by {}; adopt cannot add a second owner",
+            visible(&p.name),
+            r.id
+        )));
+    }
+    if let Some(d) = &declaration {
+        ids.insert(&d.id, "the package declaration");
         if let Some(r) = resolved_now
             .resources
             .values()
             .find(|r| r.id.strip_prefix(&format!("{}.", r.module)) == Some(d.id.as_str()))
         {
             return Err(conflict(format!(
-                "the resource id {} of the script/v1 declaration already exists in module {}; nothing was changed",
-                d.id, r.module
+                "the resource id {} of the {} declaration already exists in module {}; nothing was changed",
+                d.id, d.adapter, r.module
             )));
         }
     }
@@ -1590,6 +1676,15 @@ fn decide(
     let (mut brewfile, mut brew_note) = (None, None);
     let mut brew_bytes = Vec::new();
     match &trial.package {
+        Some(p)
+            if p.adapter == HOMEBREW
+                && [&format!("Brewfile.{module}"), "Brewfile"].iter().all(|p| {
+                    fs::symlink_metadata(root.join(p))
+                        .is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound)
+                }) =>
+        {
+            brew_note = Some("no Brewfile in the checkout; the module declares the package".into());
+        }
         Some(p) if p.adapter == HOMEBREW => {
             let own = format!("Brewfile.{module}");
             let path = if fs::symlink_metadata(root.join(&own)).is_ok() {
@@ -1633,7 +1728,7 @@ fn decide(
                 p.adapter
             ));
         }
-        None if script.is_some() => {
+        None if trial.script.is_some() => {
             brew_note = Some(
                 "a script tool has no Brewfile line; its script/v1 declaration installs it".into(),
             );
@@ -1742,16 +1837,21 @@ fn decide(
     }
 
     if scan_now {
-        // The declaration holds the script's arguments and `--env` values: it is scanned too.
+        // The script arguments can contain secrets, so scan its declaration too.
         let files: Vec<(String, Vec<u8>)> = candidates
             .iter()
             .map(|c| (c.live.clone(), c.bytes.clone()))
-            .chain(script.as_ref().map(|d| {
-                (
-                    format!("the script/v1 declaration {}", d.id),
-                    d.block.clone().into_bytes(),
-                )
-            }))
+            .chain(
+                declaration
+                    .as_ref()
+                    .filter(|d| d.adapter == crate::adapters::script::ADAPTER)
+                    .map(|d| {
+                        (
+                            format!("the script/v1 declaration {}", d.id),
+                            d.block.clone().into_bytes(),
+                        )
+                    }),
+            )
             .collect();
         let hits = scan(runner, &ctx.platform.cache_dir().join("adopt-scan"), &files)?;
         if !hits.is_empty() {
@@ -1765,9 +1865,9 @@ fn decide(
     // The edited composition must resolve, and plan each new link as an approved takeover.
     let new_manifest = append(manifest_base, &blocks);
     let mut sources = loaded.sources.clone();
-    sources.insert_file(manifest.clone(), new_manifest.clone());
-    for c in &candidates {
-        sources.insert_file(c.repo.clone(), c.bytes.clone());
+    sources.insert_file_with_exec(manifest.clone(), new_manifest.clone(), *manifest_exec);
+    for c in candidates.iter().filter(|c| !c.copied) {
+        sources.insert_file_with_exec(c.repo.clone(), c.bytes.clone(), c.mode & 0o111 != 0);
     }
     let brew_post = brewfile
         .as_ref()
@@ -1794,17 +1894,17 @@ fn decide(
             )));
         }
     }
-    if let Some(d) = &script {
+    if let Some(d) = &declaration {
         let ok = resolved.resources.values().any(|r| {
             r.id == format!("{module}.{}", d.id)
                 && r.module == module
                 && r.declared_in == manifest
-                && r.adapter == crate::adapters::script::ADAPTER
+                && r.adapter == d.adapter
         });
         if !ok {
             return Err(conflict(format!(
-                "the script/v1 declaration {} does not resolve from {manifest} in module {module}",
-                d.id
+                "the {} declaration {} does not resolve from {manifest} in module {module}",
+                d.adapter, d.id
             )));
         }
     }
@@ -1835,7 +1935,7 @@ fn decide(
         brewfile,
         brew_note,
         candidates,
-        script,
+        declaration,
         unknown: trial.unknown.clone(),
         binary: binary.clone(),
         stamp: stamp.clone(),
@@ -2221,6 +2321,7 @@ pub fn run(ctx: &Ctx, args: &Args, out: &mut dyn Write) -> Result<(), Refusal> {
         owned_outputs: vec![],
         error: stopped.as_ref().map(|e| bounded_visible(&e.detail, 1024)),
         reload: None,
+        upgrade: None,
     });
     let receipt = Receipt {
         schema: SCHEMA,
@@ -2332,6 +2433,7 @@ fn written(
         owned_outputs: vec![],
         error: None,
         reload: None,
+        upgrade: None,
     }
 }
 
@@ -2474,7 +2576,7 @@ mod tests {
                     }),
                     brew_note: None,
                     candidates: vec![cand(sha, mode)],
-                    script: None,
+                    declaration: None,
                     unknown: vec![],
                     binary: Binary {
                         version: "0".into(),

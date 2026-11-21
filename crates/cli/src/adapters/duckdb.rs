@@ -81,7 +81,7 @@ pub(crate) fn probe(runner: &Runner, value: &Value) -> Result<PackageState, Refu
     let a = args(&format!(
         "SELECT 'v:' || coalesce(extension_version, '') FROM duckdb_extensions() WHERE (extension_name = '{n}' OR list_contains(aliases, '{n}')) AND installed;"
     ));
-    let out = match runner.run(&request("mise", &a, &env(), PROBE_TIMEOUT)) {
+    let out = match runner.probe(&request("mise", &a, &env(), PROBE_TIMEOUT)) {
         Ok(o) => o,
         Err(e) => return Ok(PackageState::Unknown(e.detail)),
     };

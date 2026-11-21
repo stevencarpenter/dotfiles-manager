@@ -6,7 +6,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Entry {
-    File(Vec<u8>),
+    File { bytes: Vec<u8>, executable: bool },
     Link(String),
 }
 
@@ -128,7 +128,22 @@ impl SourceSet {
     }
 
     pub fn insert_file(&mut self, path: impl Into<String>, bytes: impl Into<Vec<u8>>) {
-        self.insert(path.into(), Entry::File(bytes.into()));
+        self.insert_file_with_exec(path, bytes, false);
+    }
+
+    pub fn insert_file_with_exec(
+        &mut self,
+        path: impl Into<String>,
+        bytes: impl Into<Vec<u8>>,
+        executable: bool,
+    ) {
+        self.insert(
+            path.into(),
+            Entry::File {
+                bytes: bytes.into(),
+                executable,
+            },
+        );
     }
 
     pub fn insert_link(&mut self, path: impl Into<String>, target: impl Into<String>) {
@@ -260,7 +275,7 @@ impl SourceSet {
                         pending.push_front(part.to_string());
                     }
                 }
-                Some((key, Entry::File(_))) => {
+                Some((key, Entry::File { .. })) => {
                     // Keep the stored spelling so later steps and the result agree with it.
                     if let (Some(last), Some(actual)) =
                         (resolved.last_mut(), key.rsplit('/').next())
@@ -273,7 +288,7 @@ impl SourceSet {
         }
         let cur = resolved.join("/");
         match self.entry_at(&cur)? {
-            Some((key, Entry::File(bytes))) => Ok(Located::File {
+            Some((key, Entry::File { bytes, .. })) => Ok(Located::File {
                 path: key.clone(),
                 bytes,
             }),

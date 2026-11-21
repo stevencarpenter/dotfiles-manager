@@ -1018,6 +1018,9 @@ impl Store {
             .ok_or_else(|| storage("no receipts directory"))?;
         self.check_owner(&r.stamp())?;
         let mut r = r.clone();
+        if r.schema == state::SCHEMA {
+            r.schema = r.required_schema();
+        }
         r.scrub(&self.secret_refs())?;
         r.validate()?;
         for p in r.operations.iter().flat_map(|o| &o.owned_outputs) {
@@ -1096,9 +1099,12 @@ impl Store {
                 format!("trial {trial_id} is already adopted"),
             ));
         }
-        // A script record keeps its own schema (5 or 6): `validate` expects it whatever the data.
-        if t.baseline.data.is_empty() && t.script.is_none() {
+        // Only a plain schema-2 record needs a new schema to represent adoption.
+        if t.schema == state::SCHEMA {
             t.schema = state::TRIAL_SCHEMA_ADOPTED;
+        }
+        if let Some(script) = &mut t.script {
+            script.protect_environment();
         }
         t.adopted = Some(adopted);
         let (dir, name, bytes) = self.checked_trial(&t)?;
@@ -1275,6 +1281,44 @@ impl Store {
         }
     }
 
+    fn read_trial_file(&self, dir: &Dir, name: &str) -> Result<TrialRecord, Refusal> {
+        let bytes = dir
+            .read_private(&self.sys, name, state::MAX_BYTES)?
+            .ok_or_else(|| storage(format!("trials/{name} vanished")))?;
+        TrialRecord::parse(&bytes)
+            .map_err(|e| Refusal::new(e.code, format!("trials/{name}: {}", e.detail)))
+    }
+
+    /// Parse the documents an installed binary needs for its next operation or recovery.
+    /// Historical receipts and snapshots do not participate in activation.
+    pub fn active_document_errors(&self) -> Vec<Refusal> {
+        let mut errors: Vec<_> = [
+            self.read_state().map(|_| ()),
+            self.read_ledger_lenient().map(|_| ()),
+            self.read_journal_lenient().map(|_| ()),
+            self.read_grants().map(|_| ()),
+        ]
+        .into_iter()
+        .filter_map(Result::err)
+        .collect();
+        let mut trials = || -> Result<(), Refusal> {
+            let dir = self
+                .state()?
+                .child(&self.sys, "trials", true, false)?
+                .ok_or_else(|| storage("state/trials is missing"))?;
+            for name in dir.list()?.names.iter().filter(|n| n.ends_with(".json")) {
+                if let Err(e) = self.read_trial_file(&dir, name) {
+                    errors.push(e);
+                }
+            }
+            Ok(())
+        };
+        if let Err(e) = trials() {
+            errors.push(e);
+        }
+        errors
+    }
+
     /// Reads every document. Each file's result is kept separately so one unreadable document
     /// neither hides nor changes the others.
     pub fn load(&self) -> Loaded {
@@ -1316,29 +1360,27 @@ impl Store {
                     strays.push(format!("trials/{n} (interrupted write)"));
                     continue;
                 }
-                let t = read(&d, &n)
-                    .and_then(|b| TrialRecord::parse(&b))
-                    .and_then(|t| {
-                        t.validate_within(&self.scope)?;
-                        for p in t
-                            .baseline
-                            .paths
-                            .iter()
-                            .chain(&t.baseline.data)
-                            .map(|b| &b.path)
-                            .chain(&t.owned_outputs)
-                        {
-                            self.check_claim(p)?;
-                        }
-                        if format!("{}.json", t.trial_id) == n {
-                            Ok(t)
-                        } else {
-                            Err(Refusal::new(
-                                Code::StateInvalid,
-                                "name does not match content",
-                            ))
-                        }
-                    });
+                let t = self.read_trial_file(&d, &n).and_then(|t| {
+                    t.validate_within(&self.scope)?;
+                    for p in t
+                        .baseline
+                        .paths
+                        .iter()
+                        .chain(&t.baseline.data)
+                        .map(|b| &b.path)
+                        .chain(&t.owned_outputs)
+                    {
+                        self.check_claim(p)?;
+                    }
+                    if format!("{}.json", t.trial_id) == n {
+                        Ok(t)
+                    } else {
+                        Err(Refusal::new(
+                            Code::StateInvalid,
+                            "name does not match content",
+                        ))
+                    }
+                });
                 trials.push((n, t));
             }
         }
@@ -1377,6 +1419,9 @@ impl Store {
             }
         }
         if self.state().is_ok() {
+            if let Err(e) = self.read_grants() {
+                problems.push(Finding::new(e.code, GRANTS, e.detail));
+            }
             match (self.salt(), self.records_salted_hash()) {
                 (Err(e), _) => problems.push(Finding::new(Code::StorageInvalid, "salt", e.detail)),
                 (Ok(None), Ok(true)) => problems.push(Finding::new(

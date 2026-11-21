@@ -337,16 +337,12 @@ fn a_configuration_plan_lists_services_out_of_scope_and_starts_no_launcher() {
         t.contains("service is lifecycle, outside a config plan"),
         "{t}"
     );
-    // No provider has run, so the runner's working directory does not exist. Doctor creates
-    // nothing: it asks no launcher and reports each service unknown.
+    assert!(!fx.launcher_ran(), "{}", fx.log());
     let o = fx.run(&["doctor", "--root", fx.root_arg()]);
     assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
-    assert!(
-        text(&o.stdout).contains("does not exist yet"),
-        "{}",
-        text(&o.stdout)
-    );
-    assert!(!fx.launcher_ran(), "{}", fx.log());
+    assert!(fx.log().contains("brew services info"), "{}", fx.log());
+    assert!(!fx.home.path().join(".cache/dotfiles-manager/run").exists());
+    fx.unmark("log");
     // The other scopes do not act on a service either, and none of them asks a launcher.
     fx.mark("brew-sketchybar", "none\n");
     let o = fx.run(&["packages", "--root", fx.root_arg(), "--preview", "--all"]);
@@ -368,7 +364,7 @@ fn a_configuration_plan_lists_services_out_of_scope_and_starts_no_launcher() {
     );
     assert_eq!(code(&fx.preview(&["--restart"])), 2);
     assert!(!fx.launcher_ran() || !fx.log().contains("launchctl"));
-    // Once the directory exists, doctor asks the launchers with their read-only reports and
+    // Doctor asks the launchers with their read-only reports and
     // starts nothing: an installed formula that is not loaded is a pending start.
     fx.mark("brew-sketchybar", "none\n");
     fx.unmark("log");
@@ -1157,6 +1153,45 @@ fn a_sensitive_prerequisite_is_recorded_by_mode_only() {
 }
 
 #[test]
+fn doctor_skips_a_definition_with_an_alias_in_a_sensitive_fragment_directory() {
+    let fx = Fx::new();
+    fx.put(
+        "base/modules/extra/module.toml",
+        &format!(
+            r#"{EXTRA}
+[[resources]]
+id = "settings"
+kind = "merge"
+adapter = "claude-settings/v1"
+target = ".claude/settings.json"
+[resources.value]
+fragments_dir = ".claude/settings.d"
+pattern = "*.json"
+[resources.value.managed]
+outputStyle = "STE"
+"#
+        ),
+    );
+    let fragment = fx.home.path().join(".claude/settings.d/sample.plist");
+    let plist = fx.home.path().join(PLIST);
+    fs::create_dir_all(fragment.parent().unwrap()).unwrap();
+    fs::create_dir_all(plist.parent().unwrap()).unwrap();
+    fs::write(&fragment, AGENT_PLIST).unwrap();
+    fs::hard_link(&fragment, &plist).unwrap();
+    let o = fx.run(&["doctor", "--root", fx.root_arg(), "--json"]);
+    let report: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
+    let row = report["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["subject"] == "extra.maxfiles")
+        .unwrap_or_else(|| panic!("{report:#}"));
+    assert_eq!(row["status"], "UNKNOWN", "{row}");
+    assert_eq!(row["code"], "D_DEPENDS_UNKNOWN", "{row}");
+    assert!(!fx.log().contains("launchctl"), "{}", fx.log());
+}
+
+#[test]
 fn a_secret_definition_shows_neither_its_hash_nor_its_arguments() {
     use sha2::{Digest, Sha256};
     let fx = Fx::new();
@@ -1204,6 +1239,24 @@ fn a_secret_definition_shows_neither_its_hash_nor_its_arguments() {
     }
     assert!(!everything.contains("hunter2"), "{everything}");
     assert!(!everything.contains(&hash), "{everything}");
+    for (command, format) in [
+        ("doctor", None),
+        ("doctor", Some("--json")),
+        ("status", Some("--json")),
+    ] {
+        let mut args = vec![command, "--root", fx.root_arg()];
+        args.extend(format);
+        let diagnostic = fx.run(&args);
+        let shown = text(&diagnostic.stdout);
+        assert!(
+            shown.contains("launch agent definition is sensitive"),
+            "{shown}"
+        );
+        assert!(
+            !shown.contains("hunter2") && !shown.contains(&hash),
+            "{shown}"
+        );
+    }
     // A mode change is still a stale plan.
     fx.mark("loaded", "");
     let d = digest_of(&fx.preview(&[]));

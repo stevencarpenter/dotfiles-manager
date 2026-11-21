@@ -15,12 +15,13 @@ use dfm_model::binding::Binding;
 use dfm_model::doctor::{DoctorCode as D, Level, Report, Row, RowCode};
 use dfm_model::fold;
 use dfm_model::plan::{
-    Action, Node, Observations, Operation, Owned, Ownership, PackageState, Plan, Request, Scope,
+    Action, Node, Observations, Operation, Owned, Ownership, PackageState, Plan, Request,
     ServiceFacts, ServiceState, Status, in_scope, link_fingerprint, sensitive_paths,
 };
 use dfm_model::resolve::ResolvedResource;
 use dfm_model::state::{
-    Class, JournalEntry, Ledger, Receipt, ScriptBinary, TrialRecord, unfinished, unresolved,
+    Class, JournalEntry, Ledger, Receipt, ScriptBinary, TrialRecord, parse_rfc3339, unfinished,
+    unresolved,
 };
 use dfm_model::{Code, Refusal};
 use std::collections::{BTreeMap, BTreeSet};
@@ -135,7 +136,15 @@ fn inspect(ctx: &Ctx, command: &'static str, root: Option<&Path>) -> Result<Repo
         .map_or(0, |d| d.as_secs());
     let (owned, scripts) = state_rows(sys, &layout, binding.as_ref(), &mut rows);
     lock_row(ctx, sys.uid, &mut rows);
-    let (loaded, plan) = profile_rows(ctx, &sys, &path, binding.as_ref(), root, &mut rows);
+    let (loaded, plan) = profile_rows(
+        ctx,
+        &sys,
+        &path,
+        binding.as_ref(),
+        root,
+        owned.as_deref(),
+        &mut rows,
+    );
     let sensitive = sensitive_paths(
         loaded.as_ref().map(|l| &l.resolved),
         owned.as_deref().unwrap_or_default(),
@@ -334,19 +343,7 @@ fn script_binary_rows(
     ledger: Option<&[Owned]>,
     rows: &mut Vec<Row>,
 ) {
-    // A sensitive merge reads fragments from these directories (`dir_claims`); a fragment
-    // there is sensitive although no claim names it, so nothing at or below one is read.
-    let dirs: Vec<String> = loaded
-        .into_iter()
-        .flat_map(|l| l.resolved.resources.values())
-        .filter(|r| r.sensitive)
-        .flat_map(|r| r.dir_claims.iter().map(|d| d.dir.clone()))
-        .collect();
-    // Each directory's metadata joins the targets, so a hard link to a fragment there (more
-    // than one link, on the directory's device) is not hashed either.
-    let mut spelled = spelled_sensitive(loaded, ledger.unwrap_or_default(), sensitive);
-    spelled.extend(dirs.iter().cloned());
-    let targets = sensitive_targets(home, &spelled);
+    let (dirs, targets) = protected_metadata(home, loaded, ledger, sensitive);
     // Without the ledger the sensitive set may miss a stale output path, and without the
     // resolved profile the fragment directories are unknown, so nothing is hashed.
     let unhashed = if ledger.is_none() {
@@ -416,6 +413,29 @@ fn script_binary_rows(
         let fix = "Run dfm sync, which installs the declared tool again.";
         rows.push(row(&who, &at, since, fix));
     }
+}
+
+/// Metadata shared by the service and executable checks. The caller skips content on any error.
+fn protected_metadata(
+    home: &Path,
+    loaded: Option<&Loaded>,
+    ledger: Option<&[Owned]>,
+    sensitive: &BTreeSet<String>,
+) -> (Vec<String>, Result<Vec<std::fs::Metadata>, String>) {
+    // A sensitive merge reads fragments from these directories (`dir_claims`); a fragment
+    // there is sensitive although no claim names it, so nothing at or below one is read.
+    let dirs: Vec<String> = loaded
+        .into_iter()
+        .flat_map(|l| l.resolved.resources.values())
+        .filter(|r| r.sensitive)
+        .flat_map(|r| r.dir_claims.iter().map(|d| d.dir.clone()))
+        .collect();
+    // Each directory's metadata joins the targets, so a hard link to a fragment there (more
+    // than one link, on the directory's device) is not hashed either.
+    let mut spelled = spelled_sensitive(loaded, ledger.unwrap_or_default(), sensitive);
+    spelled.extend(dirs.iter().cloned());
+    let targets = sensitive_targets(home, &spelled);
+    (dirs, targets)
 }
 
 /// The sensitive paths in the spelling the ledger and the claims use. `sensitive` holds folded
@@ -494,6 +514,11 @@ fn is_sensitive(home: &Path, at: &Path, real: &Path, p: &Protected) -> bool {
         })
 }
 
+/// A second name on the same device could be a fragment inside a sensitive directory.
+fn may_alias_sensitive(file: &std::fs::Metadata, targets: &[std::fs::Metadata]) -> bool {
+    file.is_file() && file.nlink() > 1 && targets.iter().any(|target| target.dev() == file.dev())
+}
+
 /// The row of one script binary. The path is resolved through its links again and the file it
 /// points to now is hashed, up to the trial's hash cap. Nothing is executed. A path that is, or
 /// resolves to, a sensitive managed output (`sensitive`, folded) is never hashed.
@@ -552,11 +577,9 @@ fn binary_row(
             let runnable = meta
                 .as_ref()
                 .is_some_and(|m| m.permissions().mode() & 0o100 != 0);
-            // A second name for the file can be a sensitive output whose path the set does not
-            // name (a hard link made after the ledger entry), so such a file is not read.
             let shared = meta
                 .as_ref()
-                .is_some_and(|m| m.nlink() > 1 && targets.iter().any(|t| t.dev() == m.dev()));
+                .is_some_and(|m| may_alias_sensitive(m, targets));
             let digest = len
                 .filter(|n| hashing && runnable && !shared && *n <= HASH_CAP)
                 .and_then(|_| hash(&real));
@@ -1036,20 +1059,35 @@ fn trial_rows(l: &StateLoaded, findings: &[dfm_engine::Finding], rows: &mut Vec<
     }
 }
 
-/// The newest readable receipt whose command is (`upgrade`) or is not (`!upgrade`) the upgrade
-/// step's.
-fn latest_receipt(l: &StateLoaded, upgrade: bool) -> Option<(&String, &Receipt)> {
+fn latest_receipt(l: &StateLoaded, include: impl Fn(&str) -> bool) -> Option<(&String, &Receipt)> {
     l.receipts
         .iter()
         .filter_map(|(n, r)| r.as_ref().ok().map(|r| (n, r)))
-        .filter(|(_, r)| (r.command == "upgrade") == upgrade)
+        .filter(|(_, r)| include(&r.command))
         .max_by(|a, b| a.0.cmp(b.0))
 }
 
 /// The last upgrade, apart from the last run, so a failed updater does not hide the result of
 /// the last configuration run (docs/upgrade.md). No row before the first upgrade.
 fn upgrade_row(l: &StateLoaded, rows: &mut Vec<Row>) {
-    let Some((name, r)) = latest_receipt(l, true) else {
+    let summary = latest_receipt(l, |command| command == "upgrade");
+    let progress = latest_receipt(l, |command| command == "upgrade-step");
+    if let Some((name, step)) = progress
+        && summary.is_none_or(|(_, run)| {
+            parse_rfc3339(&step.started_at) > parse_rfc3339(&run.finished_at)
+        })
+    {
+        rows.push(Row::new(
+            "upgrade",
+            D::Upgrade,
+            Level::Warn,
+            name,
+            "an updater completed without a final run receipt",
+            "Run dfm sync.",
+        ));
+        return;
+    }
+    let Some((name, r)) = summary else {
         return;
     };
     let detail = format!(
@@ -1071,7 +1109,7 @@ fn upgrade_row(l: &StateLoaded, rows: &mut Vec<Row>) {
 }
 
 fn receipt_row(l: &StateLoaded, bad: usize, rows: &mut Vec<Row>) {
-    let latest = latest_receipt(l, false);
+    let latest = latest_receipt(l, |command| !matches!(command, "upgrade" | "upgrade-step"));
     let unreadable = l.receipts.iter().filter(|r| r.1.is_err()).count();
     let row = match latest {
         None => Row::new(
@@ -1196,6 +1234,7 @@ fn profile_rows(
     path: &OsStr,
     binding: Option<&Binding>,
     root: Option<&Path>,
+    ledger: Option<&[Owned]>,
     rows: &mut Vec<Row>,
 ) -> (Option<Loaded>, Option<Plan>) {
     let depends = |kind: &'static str, subject: &str, why: &str| {
@@ -1243,62 +1282,62 @@ fn profile_rows(
     for m in &res.modules {
         rows.push(ok_row("module", m, "selected"));
     }
-    // The read-only probes of `packages` and `services`; neither installs, loads or starts.
-    // Only a stop request fails one, and then its resources keep the fallback row. The runner
-    // creates its working directory on first use and resets its mode, and doctor writes nothing,
-    // so unless that directory already exists with mode 0700 no provider starts and each package
-    // and service is unknown.
     let runner = ctx.runner(sys);
-    let private = std::fs::symlink_metadata(&runner.cwd)
-        .is_ok_and(|m| m.is_dir() && m.permissions().mode() & 0o7777 == 0o700);
-    let (packages, services) = if private {
-        let packages = crate::adapters::package::package_facts(
-            res,
-            &runner,
-            // Reads the grants only: doctor fetches no script.
-            Some(&crate::adapters::script::ScriptCx::new(
-                ctx,
-                sys,
-                &loaded.root,
-            )),
-        )
-        .unwrap_or_else(|r| {
-            rows.push(refusal_row("resource", "package probes", &r));
-            BTreeMap::new()
-        });
-        let services = crate::adapters::service::service_facts(res, &runner, None, &loaded.root)
-            .unwrap_or_else(|r| {
-                rows.push(refusal_row("resource", "service probes", &r));
-                BTreeMap::new()
-            });
-        (packages, services)
-    } else {
-        let why = format!(
-            "the provider working directory {} does not exist yet or is not mode 0700, and doctor changes nothing",
-            runner.cwd.display()
-        );
-        let of = |s: Scope| res.resources.values().filter(move |r| s.covers(r));
-        (
-            of(Scope::Packages)
-                .map(|r| (r.id.clone(), PackageState::Unknown(why.clone())))
-                .collect(),
-            of(Scope::Services)
-                .map(|r| {
-                    let state = ServiceState::Unknown(why.clone());
-                    (
-                        r.id.clone(),
-                        ServiceFacts {
-                            state,
-                            definition: None,
-                        },
-                    )
-                })
-                .collect(),
-        )
+    let sensitive = sensitive_paths(Some(res), ledger.unwrap_or_default());
+    let (dirs, targets) = protected_metadata(&runner.home, Some(&loaded), ledger, &sensitive);
+    let protected = Protected {
+        sensitive: &sensitive,
+        dirs: &dirs,
+        targets: &targets,
     };
+    let hidden_definition = |r: &ResolvedResource| {
+        if r.adapter != crate::adapters::service::LAUNCHD {
+            return false;
+        }
+        let Some(plist) = r.value.get("plist").and_then(toml::Value::as_str) else {
+            return false;
+        };
+        let at = runner.home.join(plist);
+        let real = std::fs::canonicalize(&at).unwrap_or_else(|_| at.clone());
+        ledger.is_none()
+            || targets.as_ref().map_or(true, |targets| {
+                is_sensitive(&runner.home, &at, &real, &protected)
+                    || std::fs::metadata(&real).is_ok_and(|m| may_alias_sensitive(&m, targets))
+            })
+    };
+    let packages = crate::adapters::package::package_facts(
+        res,
+        &runner,
+        // Reads the grants only: doctor fetches no script.
+        Some(&crate::adapters::script::ScriptCx::new(
+            ctx,
+            sys,
+            &loaded.root,
+        )),
+    )
+    .unwrap_or_else(|r| {
+        rows.push(refusal_row("resource", "package probes", &r));
+        BTreeMap::new()
+    });
+    let services = crate::adapters::service::service_facts(
+        res.resources.values().filter(|r| !hidden_definition(r)),
+        &runner,
+        None,
+        &loaded.root,
+    )
+    .unwrap_or_else(|r| {
+        rows.push(refusal_row("resource", "service probes", &r));
+        BTreeMap::new()
+    });
     for r in res.resources.values().filter(|r| !in_scope(r)) {
         if let (false, Some(s)) = (r.sensitive, packages.get(&r.id)) {
             rows.push(package_row(r, s, path));
+            continue;
+        }
+        if hidden_definition(r) {
+            rows.push(Row::new("resource", D::DependsUnknown, Level::Unknown, &r.id,
+                "the launch agent definition is sensitive or its sensitivity is unknown; its contents were not read",
+                "").optional());
             continue;
         }
         if let (false, Some(f)) = (r.sensitive, services.get(&r.id)) {
@@ -1356,6 +1395,12 @@ fn package_row(r: &ResolvedResource, s: &PackageState, path: &OsStr) -> Row {
             D::Ok.into(),
             format!("{pkg} is installed by {by} ({v})"),
             String::new(),
+        ),
+        PackageState::ReplaceSource { installed, desired } => (
+            Level::Warn,
+            Code::Conflict.into(),
+            format!("{pkg} is installed from {installed}; the declaration requests {desired}"),
+            "Review the replacement with dfm packages --preview.".into(),
         ),
         PackageState::Missing(_) => (
             Level::Warn,

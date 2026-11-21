@@ -73,8 +73,8 @@ jobs:
             printf 'changed:\n%s\n' "$changed"
             rust=false
             bootstrap=false
-            rust_inputs='^(crates/|examples/|tests/|Cargo\.(toml|lock)$|rust-toolchain\.toml$|scripts/check_all\.sh$|scripts/bootstrap\.sh$|docs/bootstrap\.md$|docs/authoring\.md$|docs/doctor\.md$|scripts/check_examples\.py$|\.github/workflows/contract-check\.yml$)'
-            bootstrap_inputs='^(scripts/bootstrap\.sh$|crates/cli/tests/bootstrap\.rs$|crates/cli/tests/common/|crates/[^/]+/Cargo\.toml$|Cargo\.(toml|lock)$|rust-toolchain\.toml$|scripts/check_all\.sh$|\.github/workflows/contract-check\.yml$)'
+            rust_inputs='^(crates/|examples/|tests/|Cargo\.(toml|lock)$|dotfiles-manager\.lock$|rust-toolchain\.toml$|scripts/check_all\.sh$|scripts/bootstrap\.sh$|docs/bootstrap\.md$|docs/authoring\.md$|docs/doctor\.md$|scripts/check_examples\.py$|\.github/workflows/contract-check\.yml$)'
+            bootstrap_inputs='^(scripts/bootstrap\.sh$|crates/cli/tests/bootstrap\.rs$|crates/cli/tests/common/|crates/[^/]+/Cargo\.toml$|Cargo\.(toml|lock)$|dotfiles-manager\.lock$|rust-toolchain\.toml$|scripts/check_all\.sh$|\.github/workflows/contract-check\.yml$)'
             if printf '%s\n' "$changed" | grep -Eq "$rust_inputs"; then rust=true; fi
             if printf '%s\n' "$changed" | grep -Eq "$bootstrap_inputs"; then bootstrap=true; fi
           fi
@@ -154,6 +154,10 @@ jobs:
           echo "$SHA256  $RUNNER_TEMP/nextest.tar.gz" | shasum -a 256 -c -
           tar -xzf "$RUNNER_TEMP/nextest.tar.gz" -C "$RUNNER_TEMP/ci" cargo-nextest
           echo "$RUNNER_TEMP/ci" >> "$GITHUB_PATH"
+
+      - name: Check the shipped toolchain against the committed manager lock
+        if: needs.changes.outputs.bootstrap == 'true'
+        run: bash scripts/check_all.sh shipped-toolchain
 
       - name: Build the test archive and run the doc tests
         env:

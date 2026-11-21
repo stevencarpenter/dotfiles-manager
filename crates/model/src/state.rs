@@ -493,6 +493,14 @@ pub struct Fingerprint {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct UpgradeEvidence {
+    pub before_version: Option<String>,
+    pub after_version: Option<String>,
+    pub notes: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct OperationRecord {
     pub id: String,
     pub resource: String,
@@ -512,6 +520,8 @@ pub struct OperationRecord {
     /// postconditions). One of [`RELOADS`]. Absent when the operation published nothing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reload: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upgrade: Option<UpgradeEvidence>,
 }
 
 /// The consumer reload states the manager can record. A published file records `not_attempted`:
@@ -554,7 +564,12 @@ pub struct SourceId {
     /// Absent for a local path source, which has no commit. The `tree` digest identifies it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub commit: Option<String>,
-    pub tree: String,
+    /// HEAD before a sync published this checkout. A new checkout had no previous commit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_commit: Option<String>,
+    /// SHA-256 of the scoped inputs for a path source. Git sources carry their commit instead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tree: Option<String>,
 }
 
 /// One approved disruptive operation or adoption (receipt `approvals[]`, docs/state.md).
@@ -639,9 +654,24 @@ pub fn count_statuses(ops: &[OperationRecord]) -> BTreeMap<Status, u32> {
     counts
 }
 
+/// Receipts carrying Git publication history or provider upgrade evidence use this schema.
+const RECEIPT_SCHEMA_EVIDENCE: i64 = 3;
+
 impl Receipt {
+    pub fn required_schema(&self) -> i64 {
+        let git_evidence = self
+            .sources
+            .iter()
+            .any(|s| s.previous_commit.is_some() || s.tree.is_none());
+        if git_evidence || self.operations.iter().any(|o| o.upgrade.is_some()) {
+            RECEIPT_SCHEMA_EVIDENCE
+        } else {
+            SCHEMA
+        }
+    }
+
     pub fn parse(bytes: &[u8]) -> Result<Receipt, Refusal> {
-        let r: Receipt = parse("receipt", bytes)?;
+        let r: Receipt = parse_schemas("receipt", bytes, &[SCHEMA, RECEIPT_SCHEMA_EVIDENCE])?;
         r.validate()?;
         Ok(r)
     }
@@ -655,8 +685,8 @@ impl Receipt {
     }
 
     pub fn validate(&self) -> Result<(), Refusal> {
-        if self.schema != SCHEMA {
-            return Err(bad("receipt schema"));
+        if self.schema != self.required_schema() {
+            return Err(bad("receipt schema does not match its fields"));
         }
         if !valid_id(&self.op_id) || self.command.is_empty() || self.command.len() > MAX_ERROR_BYTES
         {
@@ -685,6 +715,20 @@ impl Receipt {
                 if !valid_sha256(&f.fingerprint) {
                     return Err(bad(format!("operation {} fingerprint is malformed", o.id)));
                 }
+            }
+            if let Some(u) = &o.upgrade
+                && (o.adapter != "updater/v1"
+                    || o.class != Class::Normal
+                    || u.before_version
+                        .iter()
+                        .chain(&u.after_version)
+                        .chain(&u.notes)
+                        .any(|s| s.len() > MAX_ERROR_BYTES))
+            {
+                return Err(bad(format!(
+                    "operation {} has invalid upgrade evidence",
+                    o.id
+                )));
             }
             if o.owned_outputs.iter().any(|p| !valid_path(p)) {
                 return Err(bad(format!("operation {} output path is malformed", o.id)));
@@ -727,9 +771,18 @@ impl Receipt {
             return Err(bad("receipt approval is malformed"));
         }
         for src in &self.sources {
-            let tree_ok = src.tree.strip_prefix("sha256:").is_some_and(valid_sha256);
-            let commit_ok = src.commit.as_deref().is_none_or(hex_id);
-            if !valid_id(&src.id) || !commit_ok || !tree_ok {
+            let tree_ok = src
+                .tree
+                .as_deref()
+                .is_none_or(|t| t.strip_prefix("sha256:").is_some_and(valid_sha256));
+            let commit_ok = src.commit.as_deref().is_none_or(hex_id)
+                && src.previous_commit.as_deref().is_none_or(hex_id)
+                && (src.previous_commit.is_none() || src.commit.is_some());
+            if !valid_id(&src.id)
+                || !commit_ok
+                || !tree_ok
+                || (src.commit.is_none() && src.tree.is_none())
+            {
                 return Err(bad("receipt source identity is malformed"));
             }
         }
@@ -748,6 +801,16 @@ impl Receipt {
                         && (o.status != Status::Updated
                             || o.before.is_some()
                             || o.reload.as_deref() == Some("reloaded"))
+                }
+                // A uv source switch records the provider operation without filesystem ownership.
+                "allow_adopt"
+                    if o.adapter == "uv-tool/v1"
+                        && matches!(self.command.as_str(), "packages" | "sync") =>
+                {
+                    o.owned_outputs.is_empty()
+                        && o.before.is_none()
+                        && o.after.is_none()
+                        && o.reload.is_none()
                 }
                 // A link adoption publishes nothing. The first write into an existing co-owned
                 // (sensitive) file is also approved this way: it has no fingerprints, owns its
@@ -1047,6 +1110,26 @@ pub struct Baseline {
 pub struct TrialInstall {
     pub op_id: String,
     pub dependencies: Vec<String>,
+    /// Absent before the install postcondition, and in records from older binaries.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verified: Option<TrialVersions>,
+}
+
+/// The provider identity and exact versions confirmed after an initially missing install.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TrialVersions {
+    pub selector: String,
+    pub version: String,
+    pub dependencies: BTreeMap<String, String>,
+}
+
+impl TrialVersions {
+    pub fn fingerprint(&self) -> Result<Fingerprint, Refusal> {
+        Ok(Fingerprint {
+            fingerprint: crate::digest::sha256_hex(&canonical(self)?),
+        })
+    }
 }
 
 /// The provider a trial asked and the package as that provider names it (DFM-32).
@@ -1077,6 +1160,8 @@ pub const TRIAL_SCHEMA_SCRIPT: i64 = 5;
 /// before the fence reports it as newer instead of failing on the key; a script record without
 /// a fence stays at [`TRIAL_SCHEMA_SCRIPT`].
 pub const TRIAL_SCHEMA_FENCE: i64 = 6;
+/// A new package install starts at this schema even before its version evidence is available.
+pub const TRIAL_SCHEMA_VERSIONS: i64 = 7;
 
 /// Shells a script trial can run the downloaded script with.
 pub const SHELLS: [&str; 3] = ["sh", "bash", "zsh"];
@@ -1148,6 +1233,25 @@ pub struct ScriptBinary {
     pub sha256: String,
 }
 
+/// Variables the script run sets itself. `--env` cannot override them.
+pub const FIXED_ENV: [&str; 15] = [
+    "HOME",
+    "USER",
+    "LOGNAME",
+    "TMPDIR",
+    "SHELL",
+    "PATH",
+    "LANG",
+    "LC_ALL",
+    "TERM",
+    "ZDOTDIR",
+    "XDG_CONFIG_HOME",
+    "XDG_DATA_HOME",
+    "XDG_STATE_HOME",
+    "XDG_CACHE_HOME",
+    "XDG_BIN_HOME",
+];
+
 /// A script trial (DFM-78): the script as downloaded, how it ran, and what the observation
 /// window saw. `exit`, `window` and `binary` stay unset until the run ends. `env` is a list of
 /// `[name, value]` pairs, sorted by name by the writer.
@@ -1161,6 +1265,9 @@ pub struct TrialScript {
     pub shell: String,
     pub args: Vec<String>,
     pub env: Vec<(String, String)>,
+    /// Caller-provided variables forwarded to the installer. Only names are persisted.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub env_from: Vec<String>,
     pub tty: bool,
     pub before: Vec<Observed>,
     pub exit: Option<ScriptExit>,
@@ -1184,6 +1291,19 @@ pub struct InodeFence {
 }
 
 impl TrialScript {
+    /// Strip custom values, including those present in an older script record.
+    pub fn protect_environment(&mut self) {
+        self.env.retain(|(n, _)| {
+            if FIXED_ENV.contains(&n.as_str()) {
+                return true;
+            }
+            self.env_from.push(n.clone());
+            false
+        });
+        self.env_from.sort();
+        self.env_from.dedup();
+    }
+
     fn validate(&self) -> Result<(), Refusal> {
         let https = |u: &str| u.starts_with("https://") && !u.chars().any(char::is_control);
         let plain = |t: &str| !t.chars().any(char::is_control);
@@ -1194,6 +1314,15 @@ impl TrialScript {
                 && plain(n)
                 && v.chars().all(|c| c == '\t' || !c.is_control())
         });
+        let refs_ok = self.env_from.iter().all(|n| {
+            let mut chars = n.chars();
+            chars
+                .next()
+                .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+                && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+                && !FIXED_ENV.contains(&n.as_str())
+                && !self.env.iter().any(|(k, _)| k == n)
+        }) && self.env_from.windows(2).all(|pair| pair[0] < pair[1]);
         let exit_ok = self
             .exit
             .as_ref()
@@ -1218,6 +1347,7 @@ impl TrialScript {
             && valid_sha256(&self.sha256)
             && SHELLS.contains(&self.shell.as_str())
             && self.args.iter().all(|a| plain(a))
+            && refs_ok
             && env_ok
             && self.before.iter().all(Observed::valid)
             && exit_ok
@@ -1281,6 +1411,7 @@ impl TrialRecord {
                 TRIAL_SCHEMA_DATA,
                 TRIAL_SCHEMA_SCRIPT,
                 TRIAL_SCHEMA_FENCE,
+                TRIAL_SCHEMA_VERSIONS,
             ],
         )?;
         t.validate()?;
@@ -1298,9 +1429,13 @@ impl TrialRecord {
             .adopted
             .as_ref()
             .is_none_or(|a| valid_id(&a.op_id) && valid_id(&a.module));
+        let install = self.package.as_ref().and_then(|p| p.install.as_ref());
+        let versioned =
+            install.is_some_and(|i| i.verified.is_some()) || self.schema == TRIAL_SCHEMA_VERSIONS;
         let expected = match (&self.script, self.baseline.data.is_empty(), &self.adopted) {
             (Some(s), _, _) if s.fence.is_some() => TRIAL_SCHEMA_FENCE,
             (Some(_), _, _) => TRIAL_SCHEMA_SCRIPT,
+            (None, _, _) if versioned && install.is_some() => TRIAL_SCHEMA_VERSIONS,
             (None, false, _) => TRIAL_SCHEMA_DATA,
             (None, true, None) => SCHEMA,
             (None, true, Some(_)) => TRIAL_SCHEMA_ADOPTED,
@@ -1336,10 +1471,19 @@ impl TrialRecord {
             sc.validate()?;
         }
         if let Some(p) = &self.package {
-            let install_ok = p
-                .install
-                .as_ref()
-                .is_none_or(|i| valid_id(&i.op_id) && i.dependencies.iter().all(|d| plain(d)));
+            let install_ok = p.install.as_ref().is_none_or(|i| {
+                valid_id(&i.op_id)
+                    && i.dependencies.iter().all(|d| plain(d))
+                    && i.verified.as_ref().is_none_or(|v| {
+                        self.script.is_none()
+                            && plain(&v.selector)
+                            && plain(&v.version)
+                            && v.dependencies.len() == i.dependencies.len()
+                            && i.dependencies
+                                .iter()
+                                .all(|d| v.dependencies.get(d).is_some_and(|v| plain(v)))
+                    })
+            });
             if !plain(&p.adapter) || !plain(&p.name) || !install_ok {
                 return Err(bad("trial package is malformed"));
             }
@@ -1417,7 +1561,7 @@ impl Receipt {
     /// Redacts descriptive text with `secrets` in one pass. A path or identifier that contains
     /// a secret cannot be redacted without breaking its use, so it is refused.
     pub fn scrub(&mut self, secrets: &[&str]) -> Result<(), Refusal> {
-        if leaks(&self.op_id, secrets) {
+        if leaks(&self.op_id, secrets) || self.sources.iter().any(|s| leaks(&s.id, secrets)) {
             return Err(secret_in_path());
         }
         for o in &self.operations {
@@ -1438,6 +1582,16 @@ impl Receipt {
         for o in &mut self.operations {
             if let Some(e) = &mut o.error {
                 red(e);
+            }
+            if let Some(u) = &mut o.upgrade {
+                for value in u
+                    .before_version
+                    .iter_mut()
+                    .chain(&mut u.after_version)
+                    .chain(&mut u.notes)
+                {
+                    red(value);
+                }
             }
         }
         Ok(())
@@ -1493,11 +1647,17 @@ impl TrialRecord {
             .package
             .iter()
             .flat_map(|p| {
-                [&p.adapter, &p.name].into_iter().chain(
-                    p.install
-                        .iter()
-                        .flat_map(|i| std::iter::once(&i.op_id).chain(&i.dependencies)),
-                )
+                [&p.adapter, &p.name]
+                    .into_iter()
+                    .chain(p.install.iter().flat_map(|i| {
+                        std::iter::once(&i.op_id).chain(&i.dependencies).chain(
+                            i.verified.iter().flat_map(|v| {
+                                [&v.selector, &v.version]
+                                    .into_iter()
+                                    .chain(v.dependencies.values())
+                            }),
+                        )
+                    }))
             })
             .chain(self.baseline.owners.iter())
             .chain(self.unknown.iter());
@@ -1723,6 +1883,7 @@ mod tests {
             owned_outputs: vec!["/h/.gitconfig".into()],
             error: None,
             reload: None,
+            upgrade: None,
         }
     }
 
@@ -2057,6 +2218,46 @@ mod tests {
     }
 
     #[test]
+    fn receipt_schema_tracks_git_and_upgrade_evidence() {
+        let mut old = receipt(vec![op(Status::Current, Class::Normal)]);
+        old.sources.push(SourceId {
+            id: "main".into(),
+            commit: Some("a".repeat(40)),
+            previous_commit: None,
+            tree: Some(format!("sha256:{}", "b".repeat(64))),
+        });
+        let bytes = canonical(&old).unwrap();
+        assert_eq!(old.required_schema(), SCHEMA);
+        assert_eq!(Receipt::parse(&bytes).unwrap(), old);
+
+        let mut added = old.clone();
+        added.sources[0].tree = None;
+        let mut moved = old.clone();
+        moved.sources[0].previous_commit = Some("c".repeat(40));
+        let mut upgraded = old;
+        upgraded.operations[0].adapter = "updater/v1".into();
+        upgraded.operations[0].upgrade = Some(UpgradeEvidence {
+            before_version: None,
+            after_version: None,
+            notes: vec!["done".into()],
+        });
+        for mut r in [added, moved, upgraded] {
+            assert_eq!(
+                Receipt::parse(&canonical(&r).unwrap()).unwrap_err().code,
+                Code::StateInvalid
+            );
+            r.schema = r.required_schema();
+            assert_eq!(r.schema, RECEIPT_SCHEMA_EVIDENCE);
+            let bytes = canonical(&r).unwrap();
+            assert_eq!(Receipt::parse(&bytes).unwrap(), r);
+            assert_eq!(
+                parse::<Receipt>("receipt", &bytes).unwrap_err().code,
+                Code::StateNewer
+            );
+        }
+    }
+
+    #[test]
     fn receipt_counts_and_sensitive_fingerprints_are_enforced() {
         let ok = receipt(vec![
             op(Status::Updated, Class::Normal),
@@ -2298,6 +2499,7 @@ mod tests {
             install: Some(TrialInstall {
                 op_id: "trial-1-2".into(),
                 dependencies: vec!["libsodium".into()],
+                verified: None,
             }),
         });
         with.unknown = vec!["services".into()];
@@ -2370,7 +2572,7 @@ mod tests {
             let e = TrialRecord::parse(format!("{{\"schema\":{n}}}").as_bytes()).unwrap_err();
             assert_eq!(e.code, code, "{n}");
             assert!(
-                e.detail.ends_with("(supported: 2, 3, 4, 5, 6)"),
+                e.detail.ends_with("(supported: 2, 3, 4, 5, 6, 7)"),
                 "{n}: {}",
                 e.detail
             );
@@ -2385,10 +2587,10 @@ mod tests {
             assert!(b.validate().is_err(), "module {bad:?}");
         }
 
-        // A schema above 6 is newer.
+        // A schema above 7 is newer.
         let newer = String::from_utf8(canonical(&t).unwrap())
             .unwrap()
-            .replace("\"schema\":3", "\"schema\":7");
+            .replace("\"schema\":3", "\"schema\":8");
         assert_eq!(
             TrialRecord::parse(newer.as_bytes()).unwrap_err().code,
             Code::StateNewer
@@ -2424,6 +2626,7 @@ mod tests {
             bytes: 10,
             shell: "sh".into(),
             args: vec![],
+            env_from: Vec::new(),
             env: vec![],
             tty: false,
             before: vec![],
@@ -2448,6 +2651,7 @@ mod tests {
         t.package = None;
         t.script = Some(TrialScript {
             args: vec!["--no-modify-path".into()],
+            env_from: Vec::new(),
             env: vec![("HOME".into(), "/h".into())],
             before: vec![Observed {
                 path: "/h/.zshenv".into(),
@@ -2688,9 +2892,9 @@ mod tests {
     }
 
     #[test]
-    fn a_schema_7_record_is_newer() {
+    fn a_schema_8_record_is_newer() {
         let mut v: serde_json::Value = serde_json::to_value(sample_trial()).unwrap();
-        v["schema"] = 7.into();
+        v["schema"] = 8.into();
         assert_eq!(
             TrialRecord::parse(&serde_json::to_vec(&v).unwrap())
                 .unwrap_err()
@@ -2827,7 +3031,8 @@ mod tests {
         r.sources = vec![SourceId {
             id: "path-0123456789ab".into(),
             commit: None,
-            tree: format!("sha256:{}", "b".repeat(64)),
+            previous_commit: None,
+            tree: Some(format!("sha256:{}", "b".repeat(64))),
         }];
         // A removal: it owns and publishes nothing, and `before` is the fingerprint it removed.
         r.operations[0].owned_outputs.clear();
@@ -2918,7 +3123,8 @@ mod tests {
         r.sources = vec![SourceId {
             id: "s".into(),
             commit: Some("zz".into()),
-            tree: "x".into(),
+            previous_commit: None,
+            tree: Some("x".into()),
         }];
         cases.push(("source", r));
         let mut r = good.clone();

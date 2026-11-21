@@ -99,14 +99,14 @@ esac
 /// `uv tool list` prints `<name> v<version>` and `- <name>` per line of `installed-uv`, or
 /// `No tools installed`. `uv tool upgrade <name>` replaces the version with the one
 /// `latest-uv` names (`2.0.0` when there is none); `uv tool install <name>` adds `1.0.0`.
-/// `uv tool install --force <source>` writes the receipt uv would for the tool the `uv-builds`
+/// `uv tool install "<name> @ <source>"` writes the receipt uv would for the tool the `uv-builds`
 /// marker names: a `git` requirement `<url>?rev=<rev>` for `git+<url>@<rev>`, `<url>?rev=main-tip`
 /// for a ref-less `git+<url>`, else a `directory` one. The `nopython` marker makes a change fail as uv does when no interpreter
 /// is found and downloads are off.
 const FAKE_UV: &str = r#"#!/bin/sh
 PATH=/usr/bin:/bin:$PATH
 here=$(dirname "$0")
-printf 'uv %s | noconfig=%s offline=%s downloads=%s progress=%s\n' "$*" "${UV_NO_CONFIG:-unset}" "${UV_OFFLINE:-unset}" "${UV_PYTHON_DOWNLOADS:-unset}" "${UV_NO_PROGRESS:-unset}" >> "$here/../log"
+printf 'uv %s | noconfig=%s offline=%s downloads=%s progress=%s nocache=%s\n' "$*" "${UV_NO_CONFIG:-unset}" "${UV_OFFLINE:-unset}" "${UV_PYTHON_DOWNLOADS:-unset}" "${UV_NO_PROGRESS:-unset}" "${UV_NO_CACHE:-unset}" >> "$here/../log"
 db="$here/../installed-uv"
 [ "$1" = tool ] || exit 64
 case "$2" in
@@ -119,14 +119,20 @@ case "$2" in
     exit 0 ;;
   install|upgrade)
     [ -e "$here/../nopython" ] && { echo "error: No interpreter found" >&2; exit 2; }
-    if [ "$3" = --force ]; then
-      built=$(cat "$here/../uv-builds"); dir="$HOME/.local/share/uv/tools/$built"; mkdir -p "$dir"
-      case "$4" in
-        git+*@*) s=${4#git+}; req="git = \"${s%@*}?rev=${s##*@}\"" ;;
-        git+*) req="git = \"${4#git+}?rev=main-tip\"" ;;
-        *) req="directory = \"$4\"" ;;
+    case "$3" in *" @ "*) src=${3#* @ } ;; *) src="" ;; esac
+    if [ -n "$src" ]; then
+      built=$(cat "$here/../uv-builds")
+      [ "$built" = "${3%% @ *}" ] || { echo "package name $built differs from the requested name" >&2; exit 1; }
+      dir="$HOME/.local/share/uv/tools/$built"; mkdir -p "$dir"
+      case "$src" in
+        git+*@*) s=${src#git+}; req="git = \"${s%@*}?rev=${s##*@}\"" ;;
+        git+*) req="git = \"${src#git+}?rev=main-tip\"" ;;
+        file://*) req="directory = \"${src#file://}\"" ;;
+        *) exit 64 ;;
       esac
       printf '[tool]\nrequirements = [{ name = "%s", %s }]\n' "$built" "$req" > "$dir/uv-receipt.toml"
+      grep -v "^$built " "$db" > "$db.next" 2>/dev/null
+      echo "$built 1.0.0" >> "$db.next"; mv "$db.next" "$db"
       exit 0
     fi
     name=$3
@@ -869,17 +875,19 @@ fn an_interrupted_upgrade_keeps_the_installed_versions_and_blocks_until_resolved
 }
 
 #[test]
-fn a_read_only_plan_and_doctor_start_no_provider() {
+fn a_read_only_plan_starts_no_provider_and_doctor_only_queries_providers() {
     let fx = Fx::new();
-    for cmd in ["plan", "doctor"] {
-        let o = fx.run(&[cmd, "--root", fx.root_arg()]);
-        assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
-    }
+    assert_eq!(code(&fx.run(&["plan", "--root", fx.root_arg()])), 0);
+    assert!(!fx.fake.path().join("log").exists());
+    assert_eq!(code(&fx.run(&["doctor", "--root", fx.root_arg()])), 0);
     assert!(
-        !fx.fake.path().join("log").exists(),
-        "a provider was started: {}",
+        fx.log()
+            .contains("uv tool list | noconfig=1 offline=1 downloads=never progress=1 nocache=1"),
+        "{}",
         fx.log()
     );
+    assert!(fx.changes().is_empty());
+    assert!(!fx.home.path().join(".cache/dotfiles-manager/run").exists());
 }
 
 const SRC: &str = "extra.src@package";
@@ -897,7 +905,10 @@ fn a_git_source_installs_without_a_grant() {
         "{}",
         text(&o.stdout)
     );
-    assert_eq!(fx.changes(), [format!("uv tool install --force {GIT}")]);
+    assert_eq!(
+        fx.changes(),
+        [format!("uv tool install token-auditor @ {GIT}")]
+    );
     // Installed at the declared tag: the next run is current and changes nothing.
     let o = fx.apply(false);
     assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
@@ -919,7 +930,10 @@ fn a_ref_less_git_source_installs_and_any_rev_of_its_repository_is_current() {
     fx.with_source(ROLLING);
     let o = fx.apply(false);
     assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
-    assert_eq!(fx.changes(), [format!("uv tool install --force {ROLLING}")]);
+    assert_eq!(
+        fx.changes(),
+        [format!("uv tool install token-auditor @ {ROLLING}")]
+    );
     let receipt = |git: &str| {
         format!("[tool]\nrequirements = [{{ name = \"token-auditor\", git = \"{git}\" }}]\n")
     };
@@ -935,15 +949,20 @@ fn a_ref_less_git_source_installs_and_any_rev_of_its_repository_is_current() {
         text(&o.stdout)
     );
     assert_eq!(fx.changes().len(), 1, "{}", fx.log());
-    // Another repository is not this source: the tool is installed again.
+    // Switching to a different repository needs explicit approval.
     fx.uv_receipt(
         "token-auditor",
         &receipt("https://github.com/o/other?rev=1.0.0"),
     );
     let o = fx.preview(false);
-    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+    assert_eq!(code(&o), 3, "{}\n{}", stderr(&o), text(&o.stdout));
     assert!(
-        text(&o.stdout).contains("install token-auditor with uv-tool/v1"),
+        text(&o.stdout).contains("replace token-auditor"),
+        "{}",
+        text(&o.stdout)
+    );
+    assert!(
+        text(&o.stdout).contains("--allow-adopt"),
         "{}",
         text(&o.stdout)
     );
@@ -955,10 +974,17 @@ fn the_update_rolls_a_ref_less_git_source_tool() {
     let fx = Fx::new();
     fx.with_source(ROLLING);
     fx.installed("uv", "nuv 0.5.2\ntoken-auditor 1.0.0\n");
+    let receipt = "[tool]\nrequirements = [{ name = \"token-auditor\", git = \"https://github.com/o/r?rev=main-tip\" }]\n";
     fx.uv_receipt(
         "token-auditor",
-        "[tool]\nrequirements = [{ name = \"token-auditor\", git = \"https://github.com/o/r?rev=main-tip\" }]\n",
+        &format!("{receipt}[tool.options]\ncompile-bytecode = true\n"),
     );
+    let o = fx.preview(true);
+    assert_eq!(code(&o), 3, "{}\n{}", stderr(&o), text(&o.stdout));
+    assert!(text(&o.stdout).contains("the uv receipt does not identify one recognized source"));
+    assert!(fx.changes().is_empty(), "{}", fx.log());
+
+    fx.uv_receipt("token-auditor", receipt);
     let o = fx.apply(true);
     assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
     let changes = fx.changes();
@@ -996,7 +1022,10 @@ fn a_git_source_from_a_nested_source_installs_only_with_a_grant() {
     common::grant_aside(&fx.root, "https://github.com/o/r", |a| fx.run(a));
     let o = fx.apply(false);
     assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
-    assert_eq!(fx.changes(), [format!("uv tool install --force {GIT}")]);
+    assert_eq!(
+        fx.changes(),
+        [format!("uv tool install token-auditor @ {GIT}")]
+    );
 }
 
 #[test]
@@ -1051,7 +1080,7 @@ fn a_git_source_with_a_branch_ref_is_refused() {
 }
 
 #[test]
-fn a_git_source_at_another_rev_is_missing() {
+fn a_git_source_at_another_rev_requires_approval_to_replace() {
     let fx = Fx::new();
     fx.with_source(GIT);
     let receipt = |rev: &str| {
@@ -1059,15 +1088,22 @@ fn a_git_source_at_another_rev_is_missing() {
             "[tool]\nrequirements = [{{ name = \"token-auditor\", git = \"https://github.com/o/r?rev={rev}\" }}]\n"
         )
     };
+    fx.installed("uv", "nuv 0.5.2\ntoken-auditor 2026.11.10\n");
     fx.uv_receipt("token-auditor", &receipt("2026.11.10"));
     let o = fx.preview(false);
-    assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
+    assert_eq!(code(&o), 3, "{}\n{}", stderr(&o), text(&o.stdout));
     assert!(
-        text(&o.stdout).contains("install token-auditor with uv-tool/v1"),
+        text(&o.stdout).contains("replace token-auditor"),
         "{}",
         text(&o.stdout)
     );
-    fx.uv_receipt("token-auditor", &receipt("2026.11.11"));
+    fx.uv_receipt(
+        "token-auditor",
+        &format!(
+            "{}[tool.options]\ncompile-bytecode = true\n",
+            receipt("2026.11.11")
+        ),
+    );
     let o = fx.apply(false);
     assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
     assert!(
@@ -1093,7 +1129,10 @@ fn a_path_source_installs_from_the_checkout() {
     );
     assert_eq!(
         fx.changes(),
-        [format!("uv tool install --force {}", dir.display())]
+        [format!(
+            "uv tool install token-auditor @ file://{}",
+            dir.display()
+        )]
     );
     let o = fx.apply(false);
     assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
@@ -1147,7 +1186,7 @@ fn a_git_source_tool_is_held_under_the_update_when_installed_and_installed_when_
     assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
     assert!(
         fx.changes()
-            .contains(&format!("uv tool install --force {GIT}")),
+            .contains(&format!("uv tool install token-auditor @ {GIT}")),
         "{}",
         fx.log()
     );
@@ -1182,11 +1221,41 @@ fn the_update_installs_a_source_tool_from_its_source_when_the_index_copy_is_inst
         "token-auditor",
         "[tool]\nrequirements = [{ name = \"token-auditor\" }]\n",
     );
-    let o = fx.apply(true);
+    let preview = fx.preview(true);
+    let t = text(&preview.stdout);
+    assert_eq!(code(&preview), 3, "{t}");
+    assert!(
+        t.contains("package index (version 2026.11.11)") && t.contains(GIT),
+        "{t}"
+    );
+    assert!(t.contains("--allow-adopt"), "{t}");
+    let digest = digest_of(&preview);
+    let unapproved = fx.packages(true, &digest);
+    assert_eq!(code(&unapproved), 3, "{}", stderr(&unapproved));
+    assert!(fx.changes().is_empty());
+    let run = || {
+        fx.run(&[
+            "packages",
+            "--root",
+            fx.root_arg(),
+            "--update",
+            "--yes-plan",
+            &digest,
+            "--allow-adopt",
+            SRC,
+        ])
+    };
+    fx.installed("uv", "nuv 0.5.2\ntoken-auditor 2026.11.12\n");
+    let stale = run();
+    assert_eq!(code(&stale), 3, "{}", stderr(&stale));
+    assert!(stderr(&stale).contains("E_PLAN_STALE"));
+    assert!(fx.changes().is_empty());
+    fx.installed("uv", "nuv 0.5.2\ntoken-auditor 2026.11.11\n");
+    let o = run();
     assert_eq!(code(&o), 0, "{}\n{}", stderr(&o), text(&o.stdout));
     let changes = fx.changes();
     assert!(
-        changes.contains(&format!("uv tool install --force {GIT}")),
+        changes.contains(&format!("uv tool install token-auditor @ {GIT}")),
         "{changes:?}"
     );
     assert!(
@@ -1195,8 +1264,27 @@ fn the_update_installs_a_source_tool_from_its_source_when_the_index_copy_is_inst
     );
 }
 
-/// A copy from another source is planned as missing under the update, and a missing tool gets
-/// the owner check: an executable of the same name from another owner blocks the install.
+#[test]
+fn an_existing_uv_tool_with_an_unknown_source_cannot_be_replaced() {
+    let fx = Fx::new();
+    fx.with_source(GIT);
+    fx.installed("uv", "nuv 0.5.2\ntoken-auditor 1.0\n");
+    for receipt in [
+        "[",
+        "[tool]\nrequirements = []",
+        "[tool]\nrequirements = [{name='token-auditor', url='unclassified'}]",
+    ] {
+        fx.uv_receipt("token-auditor", receipt);
+        for update in [false, true] {
+            let o = fx.preview(update);
+            assert_eq!(code(&o), 3, "{}", text(&o.stdout));
+            assert!(stderr(&o).contains("E_PROBE_FAILED"), "{}", stderr(&o));
+        }
+        assert!(fx.changes().is_empty());
+    }
+}
+
+/// The owner check also blocks a uv source replacement under the update.
 #[test]
 fn the_update_keeps_another_owner_for_a_source_tool_from_another_source() {
     let fx = Fx::new();
@@ -1217,7 +1305,7 @@ fn the_update_keeps_another_owner_for_a_source_tool_from_another_source() {
 }
 
 #[test]
-fn a_source_that_builds_another_name_fails_with_the_reason() {
+fn a_source_that_builds_another_name_cannot_install_the_other_tool() {
     let fx = Fx::new();
     fs::create_dir_all(fx.root.join("agent_reap")).unwrap();
     fx.with_source("path:agent_reap");
@@ -1225,8 +1313,14 @@ fn a_source_that_builds_another_name_fails_with_the_reason() {
     let o = fx.apply(false);
     assert_eq!(code(&o), 1, "{}\n{}", stderr(&o), text(&o.stdout));
     assert!(
-        stderr(&o).contains("the package at the source may have another name"),
+        stderr(&o).contains("E_IO_FAILED uv tool install token-auditor @ file://"),
         "{}",
         stderr(&o)
+    );
+    assert!(
+        !fx.home
+            .path()
+            .join(".local/share/uv/tools/agent-reap")
+            .exists()
     );
 }

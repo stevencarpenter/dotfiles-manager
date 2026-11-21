@@ -1118,6 +1118,46 @@ fn a_deleted_settings_file_is_created_again_and_the_hash_is_recorded_anew() {
 }
 
 #[test]
+fn newly_claimed_fields_only_need_takeover_for_different_existing_values() {
+    let fx = Fx::new();
+    assert_eq!(code(&fx.apply_bare()), 0);
+    let mut j = fx.live_json();
+    j["foreign"] = "keep".into();
+    j["equal"] = true.into();
+    fx.live(&j.to_string());
+    fx.module(|m| {
+        m.replace(
+            "outputStyle =",
+            "equal = true\nabsent = true\noutputStyle =",
+        )
+    });
+    assert_eq!(code(&fx.apply_bare()), 0);
+    fx.module(|m| m.replace("outputStyle =", "foreign = \"ours\"\noutputStyle ="));
+    let refused = fx.apply_bare();
+    assert_eq!(code(&refused), 3, "{}", stderr(&refused));
+    assert!(stderr(&refused).contains("E_ADOPT_UNAPPROVED"));
+    assert_eq!(fx.live_json()["foreign"], "keep");
+    assert_eq!(code(&fx.apply()), 0);
+    assert_eq!(fx.live_json()["foreign"], "ours");
+}
+
+#[test]
+fn apply_rechecks_newly_claimed_fields_before_writing() {
+    let fx = Fx::new();
+    assert_eq!(code(&fx.apply_bare()), 0);
+    fx.module(|m| m.replace("outputStyle =", "newKey = true\noutputStyle ="));
+    let digest = fx.saved().plan_digest;
+    let o = parked_apply(&fx, "merge-before-read", &digest, |fx| {
+        let mut j = fx.live_json();
+        j["newKey"] = false.into();
+        fx.live(&j.to_string());
+    });
+    assert_eq!(code(&o), 3, "{}", stderr(&o));
+    assert!(stderr(&o).contains("E_PLAN_STALE"));
+    assert_eq!(fx.live_json()["newKey"], false);
+}
+
+#[test]
 fn an_existing_file_with_no_ledger_entry_needs_allow_adopt_and_an_absent_one_does_not() {
     let fx = Fx::new();
     fx.live(LIVE);

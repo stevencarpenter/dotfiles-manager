@@ -93,7 +93,7 @@ impl<'a> Generators<'a> {
             .filter_map(|p| {
                 let path = p.source_path.clone()?;
                 match sources.get(&path)? {
-                    Entry::File(b) => Some((path, b.clone())),
+                    Entry::File { bytes: b, .. } => Some((path, b.clone())),
                     Entry::Link(_) => None,
                 }
             })
@@ -285,7 +285,7 @@ impl Generator for Generators<'_> {
             if op.action == Action::Upgrade {
                 package::maintain_sourced(runner, r, self.scripts.as_ref())
             } else {
-                package::uv_source_probe(runner, r, self.scripts.as_ref())
+                package::uv_source_probe(runner, r, self.scripts.as_ref(), false)
             }
         } else {
             let state = if op.action == Action::Upgrade {
@@ -983,7 +983,7 @@ mod tests {
             link_op("sensitive", Class::Sensitive, Status::Planned),
         ];
         let made = link_producers(&ops, &|p| match src.get(p) {
-            Some(dfm_model::resolve::Entry::File(b)) => Some(b.clone()),
+            Some(dfm_model::resolve::Entry::File { bytes: b, .. }) => Some(b.clone()),
             _ => None,
         });
         let keys: Vec<&str> = made.keys().map(String::as_str).collect();

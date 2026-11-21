@@ -56,7 +56,7 @@ usage:
                                [--restart <resource-id>]...
   dfm trial <package> [--id <trial-id>] [--provider homebrew/v1|mise/v1] [--config <path>]...
                                [--preview] [-y|--yes-plan <digest>]
-  dfm adopt <trial-id> --module <module> [--root <dir>] [--preview] [-y|--yes-plan <digest>]
+  dfm adopt <trial-id> --module <module> [--file <HOME-relative-file>]... [--root <dir>] [--preview] [-y|--yes-plan <digest>]
   dfm purge <trial-id> [--preview] [-y|--yes-plan <digest>]
   dfm sync [--root <dir>] [--preview] [--all] [-y|--yes-plan <digest>] [--allow-disruptive <operation-id>]...
                                [--allow-adopt <operation-id>]... [--restart <resource-id>]...
@@ -133,7 +133,8 @@ pre-exists), journals the install and writes a receipt. More than one capable pr
 adopt promotes a trial into a module: each regular file under the trial's baseline paths that
 the trial created or changed is copied to <module dir>/home/<path>, gets an fs-link/v1 block
 appended to the module manifest, and its live file becomes a dfm link. A homebrew/v1 trial also
-gets a brew or cask line appended to Brewfile.<module> or Brewfile. The candidates are scanned
+gets a line in an existing Brewfile. Homebrew and mise trials get a native package declaration.
+Use --file <HOME-relative-file> to include a specific file from a pre-existing directory. The candidates are scanned
 with gitleaks first. Nothing is committed. See docs/adopt.md.
 
 purge ends a trial that is not adopted (the trial id, or the tool of a trial-<tool> id). It
@@ -485,9 +486,9 @@ fn run_command(
         }
         "packages" => {
             let args = apply_cmd::parse_args(sub, dfm_model::plan::Scope::Packages)?;
-            if !args.allow.is_empty() || !args.allow_adopt.is_empty() {
+            if !args.allow.is_empty() {
                 return Err(usage(
-                    "packages removes and adopts nothing; --allow-disruptive and --allow-adopt do not apply",
+                    "packages removes nothing; --allow-disruptive does not apply",
                 ));
             }
             apply_cmd::run(&context(home)?, &args, out)
@@ -836,14 +837,7 @@ fn bind(
         .and_then(|f| f.take(MAX_BYTES as u64 + 1).read_to_end(&mut content))
         .map_err(|e| invalid(format!("{real}: {}", e.kind())))?;
     let target = check_profile(&content)?;
-    // Rebinding is unsupported, so a profile for another machine is refused before any write.
-    // A key the profile lacks is left to the resolver, which reports it.
-    let declared = |v: Option<&str>, own: &str| v.unwrap_or(own).to_string();
-    if let Some(d) = target_mismatch(
-        ctx,
-        &declared(target.platform.as_deref(), &ctx.os),
-        &declared(target.architecture.as_deref(), profile_arch(&ctx.arch)),
-    ) {
+    if let Some(d) = target_mismatch(ctx, &target.platform, &target.architecture) {
         return Err(Refusal::new(Code::PlatformMismatch, d));
     }
     let want = Binding::new(real, &machine_id)?;
@@ -1067,30 +1061,24 @@ fn state_check(home: PathBuf) -> Result<String, Refusal> {
     };
     let uid = dfm_platform_macos::current_uid()
         .ok_or_else(|| Refusal::new(Code::StorageInvalid, "cannot read the user id"))?;
-    let read = Store::open_read(Sys { uid }, &layout, Fail::none()).and_then(|s| match s {
-        Some(s) => {
-            s.read_state()?;
-            s.read_ledger_lenient()?;
-            s.read_journal_lenient().map(|_| "")
+    let errors = match Store::open_read(Sys { uid }, &layout, Fail::none()) {
+        Ok(None) => return Ok(": no state".into()),
+        Ok(Some(store)) => store.active_document_errors(),
+        Err(e) => vec![e],
+    };
+    let mut note = String::new();
+    for e in errors {
+        if matches!(
+            e.code,
+            Code::StateNewer | Code::SchemaUnsupported | Code::StateInvalid
+        ) {
+            return Err(e);
         }
-        None => Ok(": no state"),
-    });
-    match read {
-        Ok(note) => Ok(note.to_string()),
-        Err(e)
-            if matches!(
-                e.code,
-                Code::StateNewer | Code::SchemaUnsupported | Code::StateInvalid
-            ) =>
-        {
-            Err(e)
+        if note.is_empty() {
+            note = format!(": state not checked: {} {}", e.code.as_str(), e.detail);
         }
-        Err(e) => Ok(format!(
-            ": state not checked: {} {}",
-            e.code.as_str(),
-            e.detail
-        )),
     }
+    Ok(note)
 }
 
 /// `self-check --fixture-dir`: reads only that directory and makes no network call.

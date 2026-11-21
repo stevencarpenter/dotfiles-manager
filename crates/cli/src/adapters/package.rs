@@ -1,9 +1,8 @@
 //! The package adapters `homebrew/v1`, `mise/v1`, `apt/v1` and `uv-tool/v1` (docs/packages.md,
 //! docs/toolchains.md): a read-only probe of the declared provider's own listing, an owner check
-//! by executable name, and an install through the same provider. Nothing here reads or writes a
-//! version pin: a package plan makes a declared package present and never upgrades, downgrades
-//! or removes. A rolling update ([`maintain`], [`upgrade`]) asks mise or uv for its newest
-//! eligible version of a rolling tool and installs it beside the installed ones.
+//! by executable name, and an install through the same provider. A uv source switch requires
+//! approval to replace the installed copy. A rolling update ([`maintain`], [`upgrade`]) asks
+//! mise or uv for the newest eligible version.
 //!
 //! Every child runs through the engine runner (fixed search path, rebuilt environment, process
 //! group, timeout). The providers' standard error is bounded and never printed or persisted.
@@ -67,7 +66,7 @@ fn mise_env() -> Vec<(String, String)> {
 /// uv probes and changes read no uv configuration file (an index or a source override there
 /// is not in the plan), show no progress, and never download a Python interpreter: a tool
 /// whose interpreter is missing fails instead of installing a runtime the plan does not show.
-/// The probe (`uv tool list` reads uv's own tool directory) also runs offline.
+/// The probe reads uv's tool directory offline without a persistent cache.
 fn uv_env(offline: bool) -> Vec<(String, String)> {
     let mut env = vec![
         ("UV_NO_CONFIG".to_string(), "1".to_string()),
@@ -76,6 +75,7 @@ fn uv_env(offline: bool) -> Vec<(String, String)> {
     ];
     if offline {
         env.push(("UV_OFFLINE".into(), "1".into()));
+        env.push(("UV_NO_CACHE".into(), "1".into()));
     }
     env
 }
@@ -159,7 +159,7 @@ fn brew_roots(runner: &Runner) -> Result<(PathBuf, PathBuf), String> {
     for flag in ["--cellar", "--caskroom"] {
         let args = [flag.to_string()];
         let out = runner
-            .run(&request("brew", &args, &env, PROBE_TIMEOUT))
+            .probe(&request("brew", &args, &env, PROBE_TIMEOUT))
             .map_err(|e| e.detail)?;
         if let Some(why) = ended(&format!("brew {flag}"), &out) {
             return Err(why);
@@ -206,9 +206,17 @@ fn rack_versions(root: &Path, name: &str) -> Result<Vec<String>, String> {
 /// tap-qualified name the install receipts must name that tap: a keg from another tap is another
 /// owner, and a receipt that cannot be read fails closed. A bare name accepts any tap.
 fn brew_probe(runner: &Runner, pkg: &str) -> PackageState {
+    match brew_listing(runner, pkg) {
+        Ok(v) if v.is_empty() => PackageState::Missing(Vec::new()),
+        Ok(v) => PackageState::Installed(v.join(" ")),
+        Err(s) => s,
+    }
+}
+
+fn brew_listing(runner: &Runner, pkg: &str) -> Result<Vec<String>, PackageState> {
     let (cellar, caskroom) = match brew_roots(runner) {
         Ok(r) => r,
-        Err(why) => return PackageState::Unknown(why),
+        Err(why) => return Err(PackageState::Unknown(why)),
     };
     let short = pkg.rsplit('/').next().unwrap_or(pkg);
     let tap = pkg.rsplit_once('/').map(|(t, _)| t.to_ascii_lowercase());
@@ -234,26 +242,26 @@ fn brew_probe(runner: &Runner, pkg: &str) -> PackageState {
                 );
                 versions.extend(v);
             }
-            Err(why) => return PackageState::Unknown(why),
+            Err(why) => return Err(PackageState::Unknown(why)),
         }
     }
     if versions.is_empty() {
-        return PackageState::Missing(Vec::new());
+        return Ok(versions);
     }
     if let Some(want) = &tap {
         for r in &receipts {
             match receipt_tap(r) {
                 Ok(t) if t == *want => {}
                 Ok(t) => {
-                    return PackageState::OtherOwner(format!(
+                    return Err(PackageState::OtherOwner(format!(
                         "{short} is installed from the tap {t}, not from {want}"
-                    ));
+                    )));
                 }
-                Err(why) => return PackageState::Unknown(why),
+                Err(why) => return Err(PackageState::Unknown(why)),
             }
         }
     }
-    PackageState::Installed(versions.join(" "))
+    Ok(versions)
 }
 
 /// The official taps: a package named in one is written by its short name in a Brewfile.
@@ -275,6 +283,16 @@ pub(crate) fn brewfile_names(pkg: &str) -> (String, Vec<String>) {
             all.extend(OFFICIAL_TAPS.iter().map(|t| format!("{t}/{short}")));
             (short.to_string(), all)
         }
+    }
+}
+
+/// A tap-qualified declaration selects that tap. A bare name can select either official tap.
+pub(super) fn brew_claims(pkg: &str) -> Vec<String> {
+    let pkg = pkg.to_ascii_lowercase();
+    if pkg.contains('/') {
+        vec![pkg]
+    } else {
+        OFFICIAL_TAPS.iter().map(|t| format!("{t}/{pkg}")).collect()
     }
 }
 
@@ -365,7 +383,7 @@ fn brew_official(runner: &Runner, pkg: &str) -> Result<Option<Official>, String>
     for &list in lists {
         let args = [list.to_string()];
         let out = runner
-            .run(&request("brew", &args, &env, PROBE_TIMEOUT))
+            .probe(&request("brew", &args, &env, PROBE_TIMEOUT))
             .map_err(|e| e.detail)?;
         if let Some(why) = ended(&format!("brew {list}"), &out) {
             return Err(why);
@@ -399,7 +417,7 @@ fn brew_dependencies(runner: &Runner, off: &Official) -> PackageState {
     let env = brew_env();
     let run = |what: &str, args: Vec<String>, ok: &[i32]| -> Result<String, String> {
         let out = runner
-            .run(&request("brew", &args, &env, PROBE_TIMEOUT))
+            .probe(&request("brew", &args, &env, PROBE_TIMEOUT))
             .map_err(|e| e.detail)?;
         if let Some(why) = ended(what, &out) {
             return Err(why);
@@ -553,7 +571,7 @@ fn mise_listing(runner: &Runner, pkg: &str) -> Result<Vec<String>, PackageState>
         tool.into(),
     ];
     let out = runner
-        .run(&request("mise", &args, &mise_env(), PROBE_TIMEOUT))
+        .probe(&request("mise", &args, &mise_env(), PROBE_TIMEOUT))
         .map_err(|e| PackageState::Unknown(e.detail))?;
     if let Some(why) = ended("mise ls", &out) {
         return Err(PackageState::Unknown(why));
@@ -597,7 +615,7 @@ fn uv_probe(runner: &Runner, pkg: &str) -> PackageState {
         ));
     }
     let args = ["tool".to_string(), "list".into()];
-    let out = match runner.run(&request("uv", &args, &uv_env(true), PROBE_TIMEOUT)) {
+    let out = match runner.probe(&request("uv", &args, &uv_env(true), PROBE_TIMEOUT)) {
         Ok(o) => o,
         Err(e) => return PackageState::Unknown(e.detail),
     };
@@ -634,7 +652,7 @@ fn uv_tool_version(text: &str, name: &str) -> Option<String> {
 
 /// A name as uv normalizes it (PEP 503): lowercase, every run of `_`, `.` and `-` as one `-`.
 /// uv names a tool's directory under `~/.local/share/uv/tools` this way too.
-fn uv_norm(s: &str) -> String {
+pub(super) fn uv_norm(s: &str) -> String {
     s.chars()
         .fold(String::with_capacity(s.len()), |mut out, c| {
             match c {
@@ -714,6 +732,9 @@ fn uv_receipt(home: &Path, name: &str) -> Result<(dfm_model::resolve::Table, Str
         || Refusal::new(Code::IoFailed, format!("{shown} is not a regular file")),
     )
     .map_err(|r| r.detail)?;
+    if bytes.len() > 1 << 20 {
+        return Err(format!("{shown} exceeds 1 MiB"));
+    }
     let text = String::from_utf8(bytes).map_err(|_| format!("{shown} is not UTF-8"))?;
     let v = text.parse().map_err(|_| format!("{shown} is not TOML"))?;
     Ok((v, shown))
@@ -978,8 +999,10 @@ fn gated(
     source: &UvSource,
     state: PackageState,
 ) -> Result<PackageState, Refusal> {
-    if let (PackageState::Missing(_) | PackageState::Rolling(_), UvSource::Git { url, .. }) =
-        (&state, source)
+    if let (
+        PackageState::Missing(_) | PackageState::Rolling(_) | PackageState::ReplaceSource { .. },
+        UvSource::Git { url, .. },
+    ) = (&state, source)
         && let Some(id) = ungranted(cx, r, git_identity(url)?)?
     {
         return Ok(ungranted_state(r, id));
@@ -1037,21 +1060,17 @@ pub(crate) fn uv_sourced(adapter: &str, value: &Value) -> bool {
     adapter == UV_TOOL && source_text(value).is_some()
 }
 
-/// The installed state of a `uv-tool/v1` tool with a `source`. A source the bound checkout
-/// declared needs no grant; a git source from a nested source that is to be installed needs a
-/// grant for its repository, else it is `Ungranted` ([`owner_source`]). Without `cx` a
-/// source that can be judged without the checkout is checked and the tool is `Missing`. uv's
-/// receipt decides: a requirement from the declared source ([`uv_receipt_names`]) is
-/// `Installed`, anything else (no receipt, another source, an unreadable receipt, which
-/// `--force` replaces) is `Missing`, with the owner check.
+/// A matching uv receipt is current. A source change needs adoption. An unreadable receipt
+/// or disagreement about an existing installation blocks replacement.
 pub(crate) fn uv_source_probe(
     runner: &Runner,
     r: &ResolvedResource,
     cx: Option<&ScriptCx>,
+    updating: bool,
 ) -> Result<PackageState, Refusal> {
     let value = &r.value;
     let pkg = uv_source_name(value)?;
-    policy(value)?;
+    let policy = policy(value)?;
     let text = source_text(value).unwrap_or_default();
     let Some(cx) = cx else {
         if !text.starts_with("path:") {
@@ -1060,81 +1079,193 @@ pub(crate) fn uv_source_probe(
         return Ok(PackageState::Missing(Vec::new()));
     };
     let source = checked_source(r, cx)?;
-    let state = if uv_receipt_names(&runner.home, &pkg, &source) {
-        PackageState::Installed(match &source {
-            UvSource::Git { rev: Some(rev), .. } => rev.clone(),
-            _ => text.to_string(),
-        })
-    } else {
-        PackageState::Missing(Vec::new())
+    let may_upgrade =
+        updating && policy == "rolling" && matches!(source, UvSource::Git { rev: None, .. });
+    let current = match installed_uv_source(&runner.home, &pkg, (!may_upgrade).then_some(&source)) {
+        Ok(s) => s,
+        Err(why) => return Ok(PackageState::Unknown(why)),
+    };
+    if current.as_ref().is_some_and(|s| s.matches(&source)) {
+        return Ok(PackageState::Installed(match source {
+            UvSource::Git { rev: Some(rev), .. } => rev,
+            _ => text.to_owned(),
+        }));
+    }
+    let state = match (current, uv_probe(runner, &pkg)) {
+        (None, missing @ PackageState::Missing(_)) => missing,
+        (Some(s), PackageState::Installed(version)) => PackageState::ReplaceSource {
+            installed: format!("{} (version {version})", s.label()),
+            desired: text.to_owned(),
+        },
+        (_, unknown @ PackageState::Unknown(_)) => unknown,
+        _ => PackageState::Unknown(format!(
+            "the uv listing and receipt for {pkg} disagree; inspect the installation"
+        )),
     };
     gated(cx, r, &source, settled(runner, UV_TOOL, &pkg, state))
 }
 
-/// Whether uv's receipt for `pkg` has the requirement of `pkg` itself (its `name` equal as uv
-/// normalizes it) from `source`: a `git` of `<url>?rev=<rev>` for a source with a rev, a `git`
-/// of the same repository at any rev for a ref-less one, or a `directory` of the canonical path.
-/// A `--with` extra from the source does not count. An unreadable receipt does not.
-fn uv_receipt_names(home: &Path, pkg: &str, source: &UvSource) -> bool {
-    let (key, want) = match source {
-        UvSource::Git {
-            url,
-            rev: Some(rev),
-        } => ("git", format!("{url}?rev={rev}")),
-        UvSource::Git { url, rev: None } => ("git", url.clone()),
-        UvSource::Path(dir) => ("directory", dir.display().to_string()),
-    };
-    let rolling = matches!(source, UvSource::Git { rev: None, .. });
-    let same = |got: &str| {
-        if rolling {
-            got.split(['?', '#']).next() == Some(want.as_str())
-        } else {
-            got == want
-        }
-    };
-    let pkg = uv_norm(pkg);
-    uv_receipt(home, &pkg).is_ok_and(|(v, _)| {
-        v.get("tool")
-            .and_then(|t| t.get("requirements"))
-            .and_then(Value::as_array)
-            .is_some_and(|reqs| {
-                reqs.iter().any(|r| {
-                    r.get("name")
-                        .and_then(Value::as_str)
-                        .is_some_and(|n| uv_norm(n) == pkg)
-                        && r.get(key).and_then(Value::as_str).is_some_and(same)
-                })
-            })
-    })
+/// Only a source identity that can be checked and safely displayed may authorize replacement.
+#[derive(Debug)]
+enum InstalledUvSource {
+    Index,
+    Direct(UvSource),
 }
 
-/// Installs a `uv-tool/v1` tool from its `source` with `uv tool install --force`, which replaces
-/// a copy from another source. A git source from a nested source is checked for its grant
-/// again first ([`source_gate`]). The caller probes again afterwards.
+impl InstalledUvSource {
+    fn matches(&self, want: &UvSource) -> bool {
+        let Self::Direct(got) = self else {
+            return false;
+        };
+        match (got, want) {
+            (UvSource::Git { url: old, .. }, UvSource::Git { url, rev: None }) => old == url,
+            _ => got == want,
+        }
+    }
+
+    fn label(&self) -> String {
+        match self {
+            Self::Index => "package index".into(),
+            Self::Direct(source) => source.label(),
+        }
+    }
+}
+
+impl UvSource {
+    fn label(&self) -> String {
+        match self {
+            Self::Git {
+                url,
+                rev: Some(rev),
+            } => format!("git+{url}@{rev}"),
+            Self::Git { url, rev: None } => format!("git+{url}"),
+            Self::Path(dir) => format!("path:{}", dir.display()),
+        }
+    }
+}
+
+fn installed_uv_source(
+    home: &Path,
+    pkg: &str,
+    acceptable_with_options: Option<&UvSource>,
+) -> Result<Option<InstalledUvSource>, String> {
+    let dir = home.join(".local/share/uv/tools").join(uv_norm(pkg));
+    match std::fs::symlink_metadata(&dir) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Ok(m) if m.is_dir() => {}
+        _ => return Err(format!("cannot verify the uv install directory for {pkg}")),
+    }
+    let (receipt, _) = uv_receipt(home, pkg)?;
+    let unknown = || {
+        format!(
+            "the uv receipt does not identify one recognized source for {pkg}; inspect the installation"
+        )
+    };
+    let tool = receipt
+        .get("tool")
+        .and_then(Value::as_table)
+        .ok_or_else(unknown)?;
+    let reqs = tool
+        .get("requirements")
+        .and_then(Value::as_array)
+        .ok_or_else(unknown)?;
+    let norm = uv_norm(pkg);
+    let mut matching = reqs.iter().filter(|r| {
+        r.get("name")
+            .and_then(Value::as_str)
+            .is_some_and(|n| uv_norm(n) == norm)
+    });
+    let req = matching
+        .next()
+        .and_then(Value::as_table)
+        .ok_or_else(unknown)?;
+    if matching.next().is_some() || reqs.iter().any(|r| !r.is_table()) {
+        return Err(unknown());
+    }
+    let mut origins = req
+        .iter()
+        .filter(|(key, _)| !matches!(key.as_str(), "name" | "specifier" | "extras" | "marker"));
+    let source = match origins.next().map(|(k, v)| (k.as_str(), v.as_str())) {
+        None => InstalledUvSource::Index,
+        Some(("directory", Some(d))) if dfm_model::state::valid_path(d) => {
+            InstalledUvSource::Direct(UvSource::Path(d.into()))
+        }
+        Some(("git", Some(git))) => {
+            let (url, rev) = git
+                .split_once("?rev=")
+                .map_or((git, None), |(u, rev)| (u, Some(rev)));
+            if !url.starts_with("https://")
+                || git_identity(url).is_err()
+                || rev.is_some_and(|r| {
+                    r.is_empty()
+                        || r.len() > 128
+                        || !r.bytes().all(|b| {
+                            b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-' | b'/')
+                        })
+                })
+            {
+                return Err(unknown());
+            }
+            InstalledUvSource::Direct(UvSource::Git {
+                url: url.into(),
+                rev: rev.map(String::from),
+            })
+        }
+        _ => return Err(unknown()),
+    };
+    if origins.next().is_some() {
+        return Err(unknown());
+    }
+    if !acceptable_with_options.is_some_and(|desired| source.matches(desired))
+        && tool
+            .get("options")
+            .is_some_and(|v| !v.as_table().is_some_and(|t| t.is_empty()))
+    {
+        return Err(unknown());
+    }
+    Ok(Some(source))
+}
+
+/// Encode an absolute path as a PEP 508 file URL, including spaces and literal percent signs.
+fn uv_file_url(path: &str) -> String {
+    use std::fmt::Write;
+    let mut url = String::from("file://");
+    for b in path.bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'/' | b'-' | b'.' | b'_' | b'~') {
+            url.push(char::from(b));
+        } else {
+            write!(url, "%{b:02X}").expect("writing into a String cannot fail");
+        }
+    }
+    url
+}
+
+/// Name the target in the requirement so uv checks the package metadata. Its ordinary install
+/// accepts a changed source and preserves uv's conflict checks for unrelated executables.
 pub(crate) fn uv_source_install(
     runner: &Runner,
     r: &ResolvedResource,
     cx: &ScriptCx,
 ) -> Result<(), Refusal> {
     let pkg = uv_source_name(&r.value)?;
-    let text = source_text(&r.value).unwrap_or_default();
     let source = checked_source(r, cx)?;
     uv_source_gate(r, cx, &source)?;
     let arg = match &source {
-        UvSource::Git {
-            url,
-            rev: Some(rev),
-        } => format!("git+{url}@{rev}"),
-        UvSource::Git { url, rev: None } => format!("git+{url}"),
-        UvSource::Path(dir) => dir
-            .to_str()
-            .ok_or_else(|| bad_source(text, "resolves to a path that is not UTF-8"))?
-            .to_string(),
+        UvSource::Git { .. } => source.label(),
+        UvSource::Path(dir) => uv_file_url(dir.to_str().ok_or_else(|| {
+            bad_source(
+                source_text(&r.value).unwrap_or_default(),
+                "resolves to a path that is not UTF-8",
+            )
+        })?),
     };
-    let args = ["tool".to_string(), "install".into(), "--force".into(), arg];
-    let what = format!("uv tool install --force {}", args[3]);
+    let args = [
+        "tool".to_owned(),
+        "install".into(),
+        format!("{pkg} @ {arg}"),
+    ];
+    let what = format!("uv {}", args.join(" "));
     change(runner, "uv", &args, &uv_env(false), &what)?;
-    // uv names the tool's directory after the package at the source, not after the declaration.
     uv_receipt(&runner.home, &pkg).map(|_| ()).map_err(|why| {
         Refusal::new(
             Code::IoFailed,
@@ -1174,15 +1305,8 @@ fn uv_source_name(value: &Value) -> Result<String, Refusal> {
     Ok(pkg)
 }
 
-/// `packages --update` for a source tool. The name and the source are checked first, as the
-/// plan without `--update` checks them. Then [`maintain`] decides, and it holds a tool that
-/// uv's receipt shows from a pinned source (a tag, a commit or a path). A rolling tool from a
-/// ref-less git source that the receipt shows is `Rolling` instead, so `uv tool upgrade` moves
-/// it to the default branch's newest commit, with the owner check. A tool installed from
-/// anywhere else (the package index, another rev or repository) is `Missing`, with the owner
-/// check (`OtherOwner` blocks), so it is installed from its source and never upgraded from the
-/// index. A git source from a nested source that would be installed or rolled needs a grant,
-/// else it is `Ungranted`. Without `cx` (`doctor`) a path source is not resolved.
+/// A source switch follows the same approval rules in both package modes. Once installed, a
+/// ref-less Git source may roll; a pinned source uses the ordinary maintenance checks.
 pub(crate) fn maintain_sourced(
     runner: &Runner,
     r: &ResolvedResource,
@@ -1198,14 +1322,11 @@ pub(crate) fn maintain_sourced(
         return maintain(runner, UV_TOOL, value);
     };
     let source = checked_source(r, cx)?;
+    let present = uv_source_probe(runner, r, Some(cx), true)?;
+    if !matches!(present, PackageState::Installed(_)) {
+        return Ok(present);
+    }
     let state = match maintain(runner, UV_TOOL, value)? {
-        // `maintain` holds some copies before its owner check, so a copy it now treats as
-        // missing gets that check here, as the plain probe does.
-        PackageState::Installed(_) | PackageState::Held(_) | PackageState::Rolling(_)
-            if !uv_receipt_names(&runner.home, &pkg, &source) =>
-        {
-            settled(runner, UV_TOOL, &pkg, PackageState::Missing(Vec::new()))
-        }
         // `maintain` holds every git receipt; a ref-less source is the rolling form.
         PackageState::Held(_)
             if matches!(source, UvSource::Git { rev: None, .. }) && policy(value)? == "rolling" =>
@@ -1230,7 +1351,7 @@ pub(crate) fn maintain_sourced(
 /// package is `Unsupported`.
 fn apt_probe(runner: &Runner, pkg: &str) -> PackageState {
     let args = ["-W".to_string(), "-f=${Status}".into(), pkg.into()];
-    let out = match runner.run(&request("dpkg-query", &args, &[], PROBE_TIMEOUT)) {
+    let out = match runner.probe(&request("dpkg-query", &args, &[], PROBE_TIMEOUT)) {
         Ok(o) => o,
         Err(e) => return PackageState::Unknown(e.detail),
     };
@@ -1380,21 +1501,23 @@ pub fn probe(runner: &Runner, adapter: &str, value: &Value) -> Result<PackageSta
     Ok(settled(runner, adapter, &pkg, state))
 }
 
-/// The owner check for a package its provider does not list; any other state is the probe's.
+/// Check competing executable owners before an install or source switch.
 fn settled(runner: &Runner, adapter: &str, pkg: &str, state: PackageState) -> PackageState {
     match state {
-        PackageState::Missing(_) => match other_owner(runner, adapter, pkg) {
-            Ok(Some(why)) => PackageState::OtherOwner(why),
-            Ok(None) if adapter == HOMEBREW => match brew_official(runner, pkg) {
-                Ok(Some(off)) => brew_dependencies(runner, &off),
-                Ok(None) => PackageState::Unofficial(format!(
-                    "{pkg} is not an official Homebrew formula or cask; reading its dependencies would load tap code before approval"
-                )),
+        s @ (PackageState::Missing(_) | PackageState::ReplaceSource { .. }) => {
+            match other_owner(runner, adapter, pkg) {
+                Ok(Some(why)) => PackageState::OtherOwner(why),
+                Ok(None) if adapter == HOMEBREW => match brew_official(runner, pkg) {
+                    Ok(Some(off)) => brew_dependencies(runner, &off),
+                    Ok(None) => PackageState::Unofficial(format!(
+                        "{pkg} is not an official Homebrew formula or cask; reading its dependencies would load tap code before approval"
+                    )),
+                    Err(why) => PackageState::Unknown(why),
+                },
+                Ok(None) => s,
                 Err(why) => PackageState::Unknown(why),
-            },
-            Ok(None) => PackageState::Missing(Vec::new()),
-            Err(why) => PackageState::Unknown(why),
-        },
+            }
+        }
         s => s,
     }
 }
@@ -1466,59 +1589,128 @@ pub(crate) fn install_env(
     )
 }
 
-/// Uninstalls one package through its provider (`purge`, docs/purge.md): every installed
-/// version, without `--ignore-dependencies`, `--zap` or `autoremove`. Homebrew refuses a formula
-/// that another installed formula needs; that refusal is an error here and the caller decides.
-/// The caller probes again afterwards.
-pub fn uninstall(runner: &Runner, adapter: &str, value: &Value) -> Result<(), Refusal> {
-    let pkg = name(value)?;
+/// Pin the provider namespace before installation so a later purge can inspect the same rack.
+pub fn trial_selector(runner: &Runner, adapter: &str, pkg: &str) -> Result<String, Refusal> {
+    if adapter == MISE {
+        return Ok(pkg.into());
+    }
+    match brew_official(runner, pkg).map_err(|e| Refusal::new(Code::ProbeFailed, e))? {
+        Some(Official::Formula(n)) => Ok(core(&n)),
+        Some(Official::Cask(n)) => Ok(format!("homebrew/cask/{n}")),
+        None => Err(Refusal::new(
+            Code::SourceUntrusted,
+            format!("{pkg} has no official Homebrew identity"),
+        )),
+    }
+}
+
+pub fn trial_versions(
+    runner: &Runner,
+    adapter: &str,
+    selector: &str,
+) -> Result<Vec<String>, Refusal> {
+    if !valid_name(selector) {
+        return Err(Refusal::new(
+            Code::StateInvalid,
+            "invalid trial package selector",
+        ));
+    }
+    let mut versions = match adapter {
+        HOMEBREW
+            if selector.starts_with("homebrew/core/") || selector.starts_with("homebrew/cask/") =>
+        {
+            brew_listing(runner, selector)
+        }
+        MISE => mise_listing(runner, selector).map(|mut versions| {
+            let (_, want) = tool_and_version(selector);
+            versions.retain(|v| version_matches(v, want));
+            versions
+        }),
+        _ => {
+            return Err(Refusal::new(
+                Code::StateInvalid,
+                "unsupported trial provider or package identity",
+            ));
+        }
+    }
+    .map_err(|s| {
+        Refusal::new(
+            Code::ProbeFailed,
+            format!("{adapter} cannot list {selector}: {}", s.state()),
+        )
+    })?;
+    versions.sort();
+    versions.dedup();
+    Ok(versions)
+}
+
+/// A floating provider label cannot identify one installed version for purge.
+pub fn removable_trial_version(adapter: &str, version: &str) -> bool {
+    match adapter {
+        MISE => {
+            version.as_bytes().first().is_some_and(u8::is_ascii_digit)
+                && version
+                    .bytes()
+                    .all(|c| c.is_ascii_alphanumeric() || b"._-+".contains(&c))
+        }
+        HOMEBREW => {
+            !version.eq_ignore_ascii_case("latest") && !version.eq_ignore_ascii_case("head")
+        }
+        _ => false,
+    }
+}
+
+pub fn uninstall_version(
+    runner: &Runner,
+    adapter: &str,
+    selector: &str,
+    version: &str,
+) -> Result<(), Refusal> {
     let (program, args, env) = match adapter {
         HOMEBREW => {
-            let off = brew_official(runner, &pkg)
-                .map_err(|why| Refusal::new(Code::ProbeFailed, why))?
-                .ok_or_else(|| {
-                    Refusal::new(
-                        Code::SourceUntrusted,
-                        format!("{pkg} is not an official Homebrew formula or cask"),
-                    )
-                })?;
-            let args = match off {
-                // `--force` removes every installed keg, not only the latest one.
-                Official::Formula(n) => {
-                    vec!["uninstall".into(), "--formula".into(), "--force".into(), n]
+            let (tap, n) = selector
+                .rsplit_once('/')
+                .ok_or_else(|| Refusal::new(Code::StateInvalid, "missing Homebrew namespace"))?;
+            let kind = match tap {
+                "homebrew/core" => "--formula",
+                "homebrew/cask" => "--cask",
+                _ => {
+                    return Err(Refusal::new(
+                        Code::StateInvalid,
+                        "invalid Homebrew namespace",
+                    ));
                 }
-                Official::Cask(n) => vec!["uninstall".into(), "--cask".into(), n],
             };
-            ("brew", args, brew_env())
+            if !valid_name(n) {
+                return Err(Refusal::new(
+                    Code::StateInvalid,
+                    "invalid Homebrew package name",
+                ));
+            }
+            (
+                "brew",
+                vec!["uninstall".into(), kind.into(), selector.into()],
+                brew_env(),
+            )
         }
         MISE => {
-            let (tool, want) = tool_and_version(&pkg);
-            let args = if want.is_empty() {
-                vec!["uninstall".to_string(), "--all".into(), tool.into()]
-            } else {
-                // A pinned trial removes only the versions its pin matches: another version of
-                // the tool can predate the trial (`node@20` beside a trial of `node@22`).
-                let mut args = vec!["uninstall".to_string()];
-                args.extend(
-                    mise_listing(runner, &pkg)
-                        .map_err(|s| {
-                            Refusal::new(Code::ProbeFailed, format!("{pkg}: {}", s.state()))
-                        })?
-                        .iter()
-                        .filter(|v| version_matches(v, want))
-                        .map(|v| format!("{tool}@{v}")),
-                );
-                if args.len() == 1 {
-                    return Ok(());
-                }
-                args
-            };
-            ("mise", args, mise_env())
+            let tool = tool_and_version(selector).0;
+            if !valid_name(tool) || !removable_trial_version(adapter, version) {
+                return Err(Refusal::new(
+                    Code::StateInvalid,
+                    "cannot uninstall a non-versioned mise selector",
+                ));
+            }
+            (
+                "mise",
+                vec!["uninstall".into(), format!("{tool}@{version}")],
+                mise_env(),
+            )
         }
         _ => {
             return Err(Refusal::new(
-                Code::PrivilegeUnsupported,
-                format!("{adapter} cannot uninstall {pkg}"),
+                Code::StateInvalid,
+                "unsupported trial package provider",
             ));
         }
     };
@@ -1527,7 +1719,7 @@ pub fn uninstall(runner: &Runner, adapter: &str, value: &Value) -> Result<(), Re
         program,
         &args,
         &env,
-        &format!("{program} uninstall {pkg}"),
+        &format!("{program} uninstall {selector}"),
     )
 }
 
@@ -1542,12 +1734,8 @@ pub fn uninstall_formulae(runner: &Runner, names: &[String]) -> Result<(), Refus
             format!("{n} is not a formula name"),
         ));
     }
-    let mut args = vec![
-        "uninstall".to_string(),
-        "--formula".into(),
-        "--force".into(),
-    ];
-    args.extend(names.iter().cloned());
+    let mut args = vec!["uninstall".to_string(), "--formula".into()];
+    args.extend(names.iter().map(|name| core(name)));
     let what = format!("brew uninstall {}", names.join(" "));
     let out = runner.run(&request("brew", &args, &brew_env(), INSTALL_TIMEOUT))?;
     if matches!(out.end, End::Exited(c) if c != 0)
@@ -1577,29 +1765,6 @@ pub fn uninstall_formulae(runner: &Runner, names: &[String]) -> Result<(), Refus
         )),
         End::Stopped(r) => Err(r),
     }
-}
-
-/// Whether the provider itself lists the package (`purge`): the provider's listing only, without
-/// the owner check, the official-name check or the dependency listing that plan a missing
-/// install. `Installed`, `Missing` or `Unknown`.
-pub fn listed(runner: &Runner, adapter: &str, value: &Value) -> Result<PackageState, Refusal> {
-    let pkg = name(value)?;
-    Ok(match adapter {
-        HOMEBREW => brew_probe(runner, &pkg),
-        MISE => match mise_listing(runner, &pkg) {
-            Ok(v) => {
-                let (_, want) = tool_and_version(&pkg);
-                let v: Vec<String> = v.into_iter().filter(|v| version_matches(v, want)).collect();
-                if v.is_empty() {
-                    PackageState::Missing(Vec::new())
-                } else {
-                    PackageState::Installed(v.join(", "))
-                }
-            }
-            Err(s) => s,
-        },
-        other => PackageState::Unknown(format!("{other} has no listing purge can read")),
-    })
 }
 
 /// The rolling-update view of one installed package (docs/toolchains.md): the probe, then for
@@ -1678,7 +1843,7 @@ fn local_build(v: &str) -> bool {
 
 /// The `TOOL@VERSION` argument mise gets for a declared name: the declared `tool@version` as
 /// it is, `tool@latest` for a bare name.
-fn mise_selector(pkg: &str) -> String {
+pub(super) fn mise_selector(pkg: &str) -> String {
     let (tool, want) = tool_and_version(pkg);
     let want = if want.is_empty() { "latest" } else { want };
     format!("{tool}@{want}")
@@ -1790,7 +1955,7 @@ fn facts(
             if update {
                 maintain_sourced(runner, r, scripts)
             } else {
-                uv_source_probe(runner, r, scripts)
+                uv_source_probe(runner, r, scripts, false)
             }
         } else {
             look(runner, &r.adapter, &r.value).and_then(|s| mise_gated(scripts, r, s))
@@ -1807,6 +1972,14 @@ fn facts(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn uv_file_requirements_escape_reserved_and_unicode_path_bytes() {
+        assert_eq!(
+            super::uv_file_url("/tools/β #%;?"),
+            "file:///tools/%CE%B2%20%23%25%3B%3F"
+        );
+    }
+
     use super::*;
 
     #[test]
@@ -2311,7 +2484,9 @@ mod tests {
         let receipt = |reqs: &str| {
             std::fs::write(
                 dir.join("uv-receipt.toml"),
-                format!("[tool]\nrequirements = [{reqs}]\n"),
+                format!(
+                    "[tool]\nrequirements = [{reqs}]\n[tool.options]\ncompile-bytecode = true\n"
+                ),
             )
             .unwrap();
         };
@@ -2319,10 +2494,15 @@ mod tests {
         receipt(
             r#"{ name = "token-auditor" }, { name = "helper", git = "https://github.com/o/r?rev=1.0.0" }"#,
         );
-        assert!(!uv_receipt_names(&home, "token-auditor", &source));
+        assert!(installed_uv_source(&home, "token-auditor", Some(&source)).is_err());
         // The tool from the source, under a name uv spells another way.
         receipt(r#"{ name = "Token_Auditor", git = "https://github.com/o/r?rev=1.0.0" }"#);
-        assert!(uv_receipt_names(&home, "token-auditor", &source));
+        assert!(
+            installed_uv_source(&home, "token-auditor", Some(&source))
+                .unwrap()
+                .unwrap()
+                .matches(&source)
+        );
         std::fs::remove_dir_all(&home).unwrap();
     }
 

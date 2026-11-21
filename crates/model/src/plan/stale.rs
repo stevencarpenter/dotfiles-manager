@@ -239,6 +239,13 @@ fn op_diff(out: &mut Vec<Stale>, a: &Operation, b: &Operation) {
     let from = out.len();
     keyed(out, StaleKind::Observation, &pre(a), &pre(b));
     mask_content_tokens(&mut out[from..]);
+    for d in out[from..]
+        .iter_mut()
+        .filter(|d| d.subject.starts_with("merge-takeover:"))
+    {
+        d.was = "as planned".into();
+        d.now = "existing settings changed".into();
+    }
     let listed = |o: &Operation| -> Vec<(String, String)> {
         o.fragments
             .iter()

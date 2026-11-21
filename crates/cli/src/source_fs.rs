@@ -15,7 +15,7 @@
 //! snapshot. A source that cannot be read is `E_REPORT_UNAVAILABLE`, exit 2: the inability to
 //! produce the requested report (docs/resolver.md).
 
-use crate::read_fs::read_regular_bounded;
+use crate::read_fs::read_regular_with_mode;
 use dfm_model::fold::fold;
 use dfm_model::resolve::{SourceScope, SourceSet, bundle_scope, is_git_name, profile_bundle_path};
 use dfm_model::{Code, Refusal};
@@ -31,8 +31,8 @@ use dfm_model::plan::{
 /// Reads at most `MAX_FILE_BYTES + 1` bytes of a regular file. The open does not follow a final
 /// symlink and does not block on a FIFO, and fstat then confirms the type, so an entry that
 /// changed type after the directory listing is refused instead of read.
-fn read_regular(path: &Path, shown: &str) -> Result<Vec<u8>, Refusal> {
-    read_regular_bounded(
+fn read_regular(path: &Path, shown: &str) -> Result<(Vec<u8>, u32), Refusal> {
+    read_regular_with_mode(
         path,
         MAX_FILE_BYTES,
         |e| {
@@ -70,7 +70,7 @@ pub fn load_scoped(root: &Path, profile: &str) -> Result<SourceSet, Refusal> {
 /// The `[sources]` declaration of the bundle that `profile` names. The resolver later checks
 /// that it reached the same bundle (`E_MANIFEST_INVALID` otherwise).
 fn find_scope(root: &Path, profile: &str) -> Result<Option<SourceScope>, Refusal> {
-    let Ok(profile_bytes) = read_regular(&root.join(profile), profile) else {
+    let Ok((profile_bytes, _)) = read_regular(&root.join(profile), profile) else {
         return Ok(None);
     };
     let Some(bundle) = profile_bundle_path(profile, &profile_bytes) else {
@@ -83,7 +83,7 @@ fn find_scope(root: &Path, profile: &str) -> Result<Option<SourceScope>, Refusal
     let Some(bundle) = real.strip_prefix(root).ok().and_then(Path::to_str) else {
         return Ok(None);
     };
-    let Ok(bytes) = read_regular(&real, bundle) else {
+    let Ok((bytes, _)) = read_regular(&real, bundle) else {
         return Ok(None);
     };
     Ok(bundle_scope(bundle, &bytes)?)
@@ -391,7 +391,7 @@ fn load(root: &Path, declared: Option<&SourceScope>) -> Result<SourceSet, Refusa
                 st.set.insert_dir(path.clone());
                 go(&e.path(), &path, st, false)?;
             } else if ty.is_file() {
-                let buf = read_regular(&e.path(), &path)?;
+                let (buf, mode) = read_regular(&e.path(), &path)?;
                 st.bytes += buf.len() as u64;
                 if buf.len() as u64 > MAX_FILE_BYTES || st.bytes > MAX_TOTAL_BYTES {
                     return Err(refusal(
@@ -399,7 +399,7 @@ fn load(root: &Path, declared: Option<&SourceScope>) -> Result<SourceSet, Refusa
                         format!("source {path} exceeds the read limit"),
                     ));
                 }
-                st.set.insert_file(path, buf);
+                st.set.insert_file_with_exec(path, buf, mode & 0o111 != 0);
             } else {
                 return Err(refusal(
                     Code::SourceUntrusted,
@@ -491,7 +491,7 @@ mod tests {
         let e = read_regular(&d.join("link"), "link").unwrap_err();
         assert_eq!(e.code, Code::ReportUnavailable);
         // And a regular file reads.
-        assert_eq!(read_regular(&d.join("real"), "real").unwrap(), b"x");
+        assert_eq!(read_regular(&d.join("real"), "real").unwrap().0, b"x");
         let _ = fs::remove_dir_all(&d);
     }
 

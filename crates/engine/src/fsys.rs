@@ -190,6 +190,12 @@ pub(crate) fn publish_err(path: &Path, e: Errno) -> Refusal {
     sys_err("publish", e)
 }
 
+/// Publishes a staged checkout without replacing a destination that appeared during the clone.
+pub fn publish_new_checkout(from: &Path, to: &Path) -> std::io::Result<()> {
+    rfs::renameat_with(rfs::CWD, from, rfs::CWD, to, rfs::RenameFlags::NOREPLACE)?;
+    Ok(())
+}
+
 /// Renames `from` to `to` in the directory `dir` and fails with `EEXIST` when `to` exists.
 pub(crate) fn rename_new(dir: &OwnedFd, from: &str, to: &str) -> Result<(), Errno> {
     rfs::renameat_with(dir, from, dir, to, rfs::RenameFlags::NOREPLACE)
@@ -207,6 +213,13 @@ pub(crate) fn check_name(name: &str) -> Result<(), Refusal> {
 pub struct Ident {
     dev: u64,
     ino: u64,
+}
+
+impl Ident {
+    /// Values used to identify the same open directory after a process restart.
+    pub fn device_inode(self) -> (u64, u64) {
+        (self.dev, self.ino)
+    }
 }
 
 pub(crate) fn ident_of(st: &Stat) -> Result<Ident, Refusal> {
@@ -998,6 +1011,17 @@ impl Dir {
     /// Reads at most `limit` bytes of the regular file `name` without following a link.
     /// `None` when it is absent, not a regular file, or larger than `limit`.
     pub fn read_plain(&self, name: &str, limit: u64) -> Result<Option<Vec<u8>>, Refusal> {
+        Ok(self
+            .read_plain_with_mode(name, limit)?
+            .map(|(bytes, _)| bytes))
+    }
+
+    /// The mode and bytes of the same open regular file.
+    pub(crate) fn read_plain_with_mode(
+        &self,
+        name: &str,
+        limit: u64,
+    ) -> Result<Option<(Vec<u8>, u32)>, Refusal> {
         check_name(name)?;
         let fd = match rfs::openat(
             &self.fd,
@@ -1018,7 +1042,10 @@ impl Dir {
             .take(limit.saturating_add(1))
             .read_to_end(&mut buf)
             .map_err(|e| io("read file", &e))?;
-        Ok((u64::try_from(buf.len()).unwrap_or(u64::MAX) <= limit).then_some(buf))
+        Ok(
+            (u64::try_from(buf.len()).unwrap_or(u64::MAX) <= limit)
+                .then_some((buf, mode_bits(&st))),
+        )
     }
 
     /// Reads the live file `name` of a co-owned destination from one descriptor opened without
@@ -1187,6 +1214,15 @@ impl Dir {
         let Some(d) = self.child(sys, name, false, false)? else {
             return Ok(());
         };
+        self.remove_open_tree(sys, name, &d)
+    }
+
+    /// Clears the held directory and unlinks its name only if it still names that directory.
+    pub fn remove_open_tree(&self, sys: &Sys, name: &str, d: &Dir) -> Result<(), Refusal> {
+        let ident = d.ident()?;
+        if self.entry_ident(name)? != Some(ident) {
+            return Err(storage("the directory to remove was replaced"));
+        }
         let listing = d.list()?;
         if listing.odd > 0 {
             return Err(storage(format!(
@@ -1202,6 +1238,9 @@ impl Dir {
                 Err(Errno::NOENT) => {}
                 Err(e) => return Err(sys_err("stat entry", e)),
             }
+        }
+        if self.entry_ident(name)? != Some(ident) {
+            return Err(storage("the cleared directory was replaced"));
         }
         rfs::unlinkat(&self.fd, name, AtFlags::REMOVEDIR)
             .map_err(|e| sys_err("remove directory", e))

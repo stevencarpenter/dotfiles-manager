@@ -656,6 +656,7 @@ mod tests {
                 bytes: 1,
                 shell: "sh".into(),
                 args: vec![],
+                env_from: Vec::new(),
                 env: vec![],
                 tty: false,
                 before,
