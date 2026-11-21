@@ -141,6 +141,8 @@ pub enum MergeVerdict {
     /// The merge changes the file, or the ledger needs an entry. The file is absent, or it can
     /// be merged.
     Write,
+    /// New managed leaves would replace different values the application already holds.
+    Takeover(String),
     /// The merged result equals the live file and the ledger already records it.
     Current,
     /// The file cannot be merged: malformed, open to group or others, or a managed field was
@@ -1285,6 +1287,22 @@ impl Planner<'_> {
                 format!("{shown} already holds the merge result{what}"),
                 post,
             )),
+            Some(MergeVerdict::Takeover(token)) => {
+                op.takeover = true;
+                op.preconditions.push(Precondition {
+                    subject: format!("merge-takeover:{path}"),
+                    state: token.clone(),
+                });
+                Ok((
+                    Action::UpdateFile,
+                    Status::Planned,
+                    Ownership::Owned,
+                    format!(
+                        "take over newly managed settings in {shown} that already hold different values{what}"
+                    ),
+                    post,
+                ))
+            }
             Some(MergeVerdict::Write) if !owned => {
                 // The first write into an existing file the ledger does not record. The owner
                 // approves it by id (`--allow-adopt`): hand edits of managed fields are lost.
