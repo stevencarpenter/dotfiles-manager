@@ -654,9 +654,24 @@ pub fn count_statuses(ops: &[OperationRecord]) -> BTreeMap<Status, u32> {
     counts
 }
 
+/// Receipts carrying Git publication history or provider upgrade evidence use this schema.
+const RECEIPT_SCHEMA_EVIDENCE: i64 = 3;
+
 impl Receipt {
+    pub fn required_schema(&self) -> i64 {
+        let git_evidence = self
+            .sources
+            .iter()
+            .any(|s| s.previous_commit.is_some() || s.tree.is_none());
+        if git_evidence || self.operations.iter().any(|o| o.upgrade.is_some()) {
+            RECEIPT_SCHEMA_EVIDENCE
+        } else {
+            SCHEMA
+        }
+    }
+
     pub fn parse(bytes: &[u8]) -> Result<Receipt, Refusal> {
-        let r: Receipt = parse("receipt", bytes)?;
+        let r: Receipt = parse_schemas("receipt", bytes, &[SCHEMA, RECEIPT_SCHEMA_EVIDENCE])?;
         r.validate()?;
         Ok(r)
     }
@@ -670,8 +685,8 @@ impl Receipt {
     }
 
     pub fn validate(&self) -> Result<(), Refusal> {
-        if self.schema != SCHEMA {
-            return Err(bad("receipt schema"));
+        if self.schema != self.required_schema() {
+            return Err(bad("receipt schema does not match its fields"));
         }
         if !valid_id(&self.op_id) || self.command.is_empty() || self.command.len() > MAX_ERROR_BYTES
         {
@@ -2190,6 +2205,46 @@ mod tests {
         // Unknown fields are refused, like everywhere in the ledger.
         let json = String::from_utf8(canonical(&Ledger::empty(stamp())).unwrap()).unwrap();
         assert!(json.contains("resources"));
+    }
+
+    #[test]
+    fn receipt_schema_tracks_git_and_upgrade_evidence() {
+        let mut old = receipt(vec![op(Status::Current, Class::Normal)]);
+        old.sources.push(SourceId {
+            id: "main".into(),
+            commit: Some("a".repeat(40)),
+            previous_commit: None,
+            tree: Some(format!("sha256:{}", "b".repeat(64))),
+        });
+        let bytes = canonical(&old).unwrap();
+        assert_eq!(old.required_schema(), SCHEMA);
+        assert_eq!(Receipt::parse(&bytes).unwrap(), old);
+
+        let mut added = old.clone();
+        added.sources[0].tree = None;
+        let mut moved = old.clone();
+        moved.sources[0].previous_commit = Some("c".repeat(40));
+        let mut upgraded = old;
+        upgraded.operations[0].adapter = "updater/v1".into();
+        upgraded.operations[0].upgrade = Some(UpgradeEvidence {
+            before_version: None,
+            after_version: None,
+            notes: vec!["done".into()],
+        });
+        for mut r in [added, moved, upgraded] {
+            assert_eq!(
+                Receipt::parse(&canonical(&r).unwrap()).unwrap_err().code,
+                Code::StateInvalid
+            );
+            r.schema = r.required_schema();
+            assert_eq!(r.schema, RECEIPT_SCHEMA_EVIDENCE);
+            let bytes = canonical(&r).unwrap();
+            assert_eq!(Receipt::parse(&bytes).unwrap(), r);
+            assert_eq!(
+                parse::<Receipt>("receipt", &bytes).unwrap_err().code,
+                Code::StateNewer
+            );
+        }
     }
 
     #[test]

@@ -1018,6 +1018,9 @@ impl Store {
             .ok_or_else(|| storage("no receipts directory"))?;
         self.check_owner(&r.stamp())?;
         let mut r = r.clone();
+        if r.schema == state::SCHEMA {
+            r.schema = r.required_schema();
+        }
         r.scrub(&self.secret_refs())?;
         r.validate()?;
         for p in r.operations.iter().flat_map(|o| &o.owned_outputs) {
