@@ -1684,6 +1684,25 @@ fn check(
     )
 }
 
+/// A source moved but the engine could not start. Record only the confirmed checkouts.
+fn publication_error(store: &Store, audit: &state::Receipt, error: Refusal) -> Refusal {
+    if !apply_cmd::sources_moved(audit) {
+        return error;
+    }
+    let mut error = error.after_mutation();
+    let mut receipt = audit.clone();
+    receipt.sources.retain(|s| s.commit.is_some());
+    receipt.finished_at = now_ns().map(rfc3339).unwrap_or(receipt.started_at.clone());
+    receipt.result.exit_code = error.exit().code();
+    receipt.result.outcome = error.exit().name().into();
+    if let Err(write) = store.write_receipt(&receipt) {
+        error.detail.push_str(&format!(
+            "; could not record the source publication: {write}"
+        ));
+    }
+    error
+}
+
 /// Publishes one staged source into its checkout exactly as the rehearsal moved the copy, after
 /// rechecking that the checkout is where the copy saw it. `Ok(true)` when the checkout changed.
 fn publish(git: &Git, s: &Staged) -> Result<bool, Refusal> {
@@ -2075,6 +2094,13 @@ fn run_inner(
             "a source moved since the reviewed run: the commits to publish are not the ones shown with this digest. Fix: read the new plan with --preview and approve its digest",
         ));
     }
+    let mut audit = apply_cmd::plan_receipt(
+        &run_args(args, &locked.plan),
+        &binding,
+        &locked.plan,
+        &digest,
+        now_ns()?,
+    );
     let mut published = Vec::new();
     for s in &staged {
         match fail
@@ -2082,10 +2108,17 @@ fn run_inner(
             .and_then(|()| publish(&git, s))
         {
             Ok(changed) => {
-                writeln!(out, "published: {} {}", s.src.id, s.change()).map_err(w)?;
+                audit.sources.push(state::SourceId {
+                    id: s.src.id.clone(),
+                    previous_commit: s.old.clone(),
+                    commit: Some(s.new.clone()),
+                    tree: None,
+                });
                 if changed {
                     published.push(s.src.id.as_str());
                 }
+                writeln!(out, "published: {} {}", s.src.id, s.change())
+                    .map_err(|e| publication_error(&store, &audit, w(e)))?;
             }
             Err(e) if published.is_empty() => return Err(e),
             Err(e) => {
@@ -2096,14 +2129,14 @@ fn run_inner(
                     published.join(", "),
                     s.src.id
                 )
-                .map_err(w)?;
-                return Err(e.after_mutation());
+                .map_err(|e| publication_error(&store, &audit, w(e)))?;
+                return Err(publication_error(&store, &audit, e));
             }
         }
     }
     drop(second);
     let changed = !published.is_empty();
-    let after = |e: Refusal| if changed { e.after_mutation() } else { e };
+    let after = |e: Refusal| publication_error(&store, &audit, e);
 
     // The published tree must give the approved run (docs/sync.md, step 6). Then the session
     // check runs again: a session that ended since the review skips the secrets now.
@@ -2138,9 +2171,9 @@ fn run_inner(
     let runnable = run.runnable();
     // A run that changes nothing in any part (an approved repeat) writes no receipt.
     let runs = |p: &ScopePlan| not_run(p).is_none() && (!p.changes_nothing() || journal_open);
-    let mut failure: Option<Refusal> = dfm_engine::signal::requested();
+    let mut failure: Option<Refusal> = dfm_engine::signal::requested().map(after);
     let mut statuses: BTreeMap<String, state::Status> = BTreeMap::new();
-    if failure.is_none() && parts.iter().any(runs) {
+    if failure.is_none() && (changed || parts.iter().any(runs)) {
         let ran = apply_cmd::execute_locked(
             ctx,
             &run_args(args, &runnable),
@@ -2150,8 +2183,9 @@ fn run_inner(
                 fail: &fail,
                 loaded: &now_loaded,
                 plan: &runnable,
-                digest: &run.digest,
+                digest: &digest,
                 parts: Some(&run.parts),
+                source_receipt: Some(&audit),
             },
             out,
         );
@@ -2160,7 +2194,7 @@ fn run_inner(
                 statuses.extend(r.statuses);
                 failure = r.outcome.err();
             }
-            Err(e) => failure = Some(e),
+            Err(e) => failure = Some(after(e)),
         }
     }
     drop(store);

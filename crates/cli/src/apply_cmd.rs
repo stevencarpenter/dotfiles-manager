@@ -653,6 +653,7 @@ fn run_inner(
             plan: &locked,
             digest: &digest,
             parts: None,
+            source_receipt: None,
         },
         out,
     )?;
@@ -683,6 +684,83 @@ pub(crate) struct Locked<'a> {
     /// For `sync`: the part (scope) each operation id belongs to. Its report lists each part
     /// under a `scope:` line, in run order.
     pub(crate) parts: Option<&'a BTreeMap<String, Scope>>,
+    /// Sync starts its receipt before publishing the sources, using the outer approval digest.
+    pub(crate) source_receipt: Option<&'a Receipt>,
+}
+
+pub(crate) fn sources_moved(receipt: &Receipt) -> bool {
+    receipt
+        .sources
+        .iter()
+        .any(|s| s.commit != s.previous_commit)
+}
+
+/// The audit identity shared by source publication and the operation run that follows it.
+pub(crate) fn plan_receipt(
+    args: &Args,
+    binding: &dfm_model::binding::Binding,
+    plan: &Plan,
+    digest: &str,
+    started: u64,
+) -> Receipt {
+    let stamp = Stamp::of(binding);
+    let sources = plan
+        .sources
+        .iter()
+        .filter(|s| s.kind == "path")
+        .map(|s| SourceId {
+            id: format!(
+                "path-{}",
+                s.tree
+                    .trim_start_matches("sha256:")
+                    .get(..12)
+                    .unwrap_or("0")
+            ),
+            commit: None,
+            previous_commit: None,
+            tree: Some(s.tree.clone()),
+        })
+        .collect();
+    let command = match args.scope {
+        Scope::Config => "apply",
+        Scope::Secrets => "secrets",
+        Scope::Packages => "packages",
+        Scope::Services => "services",
+        Scope::Sync => "sync",
+    };
+    Receipt {
+        schema: SCHEMA,
+        op_id: format!("{command}-{}-{}", &digest[..16], std::process::id()),
+        command: command.into(),
+        update: args.update,
+        started_at: rfc3339(started),
+        finished_at: rfc3339(started),
+        binary: BinaryId {
+            version: plan.binary.version.clone(),
+            commit: option_env!("DFM_BUILD_COMMIT").unwrap_or("unknown").into(),
+            sha256: plan.binary.sha256.clone(),
+        },
+        profile: ProfileRef {
+            id: stamp.profile,
+            binding_digest: stamp.binding_digest,
+        },
+        machine_id: stamp.machine_id,
+        plan_digest: Some(digest.to_string()),
+        approval: Some(Approval {
+            kind: if args.unattended {
+                "unattended"
+            } else {
+                "yes_plan"
+            }
+            .into(),
+            plan_digest: digest.to_string(),
+            at: rfc3339(started),
+        }),
+        sources,
+        approvals: vec![],
+        operations: vec![],
+        result: RunResult::from_operations(&[]),
+    }
 }
 
 /// The part (scope) of operation `id` of a combined plan: configuration for an id that `parts`
@@ -758,7 +836,7 @@ pub(crate) fn execute_locked(
         .map_err(w)?;
     }
     let counts = count_statuses(&report.operations);
-    let mutated = store.mutated();
+    let mutated = store.mutated() || l.source_receipt.is_some_and(sources_moved);
     // One exit, derived from the first problem, is both printed and returned.
     let is_signal = |r: &Refusal| matches!(r.code, Code::Interrupted | Code::Terminated);
     // A signal that came during the run wins over any other stop (exit precedence, docs/apply.md).
@@ -772,7 +850,6 @@ pub(crate) fn execute_locked(
     let mut receipt_name = None;
     let mut receipt_error = None;
     if mutated {
-        let stamp = Stamp::of(binding);
         let approvals = locked
             .operations
             .iter()
@@ -791,65 +868,17 @@ pub(crate) fn execute_locked(
                 })
             })
             .collect();
-        let sources = locked
-            .sources
-            .iter()
-            .filter(|s| s.kind == "path")
-            .map(|s| SourceId {
-                id: format!(
-                    "path-{}",
-                    s.tree
-                        .trim_start_matches("sha256:")
-                        .get(..12)
-                        .unwrap_or("0")
-                ),
-                commit: None,
-                tree: s.tree.clone(),
-            })
-            .collect();
-        let command = match args.scope {
-            Scope::Config => "apply",
-            Scope::Secrets => "secrets",
-            Scope::Packages => "packages",
-            Scope::Services => "services",
-            Scope::Sync => "sync",
-        };
-        let receipt = Receipt {
-            schema: SCHEMA,
-            op_id: format!("{command}-{}-{}", &digest[..16], std::process::id()),
-            command: command.into(),
-            update: args.update,
-            started_at: rfc3339(started),
-            finished_at: rfc3339(finished),
-            binary: BinaryId {
-                version: locked.binary.version.clone(),
-                commit: option_env!("DFM_BUILD_COMMIT").unwrap_or("unknown").into(),
-                sha256: locked.binary.sha256.clone(),
-            },
-            profile: ProfileRef {
-                id: stamp.profile,
-                binding_digest: stamp.binding_digest,
-            },
-            machine_id: stamp.machine_id,
-            plan_digest: Some(digest.to_string()),
-            approval: Some(Approval {
-                kind: if args.unattended {
-                    "unattended"
-                } else {
-                    "yes_plan"
-                }
-                .into(),
-                plan_digest: digest.to_string(),
-                at: rfc3339(started),
-            }),
-            sources,
-            approvals,
-            operations: report.operations.clone(),
-            result: RunResult {
-                outcome: exit.name().into(),
-                exit_code: exit.code(),
-                counts: counts.clone(),
-            },
+        let mut receipt = l
+            .source_receipt
+            .cloned()
+            .unwrap_or_else(|| plan_receipt(args, binding, &locked, digest, started));
+        receipt.finished_at = rfc3339(finished);
+        receipt.approvals = approvals;
+        receipt.operations = report.operations.clone();
+        receipt.result = RunResult {
+            outcome: exit.name().into(),
+            exit_code: exit.code(),
+            counts: counts.clone(),
         };
         match store.write_receipt(&receipt) {
             Ok(name) => receipt_name = Some(name),

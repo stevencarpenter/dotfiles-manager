@@ -564,7 +564,12 @@ pub struct SourceId {
     /// Absent for a local path source, which has no commit. The `tree` digest identifies it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub commit: Option<String>,
-    pub tree: String,
+    /// HEAD before a sync published this checkout. A new checkout had no previous commit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_commit: Option<String>,
+    /// SHA-256 of the scoped inputs for a path source. Git sources carry their commit instead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tree: Option<String>,
 }
 
 /// One approved disruptive operation or adoption (receipt `approvals[]`, docs/state.md).
@@ -751,9 +756,18 @@ impl Receipt {
             return Err(bad("receipt approval is malformed"));
         }
         for src in &self.sources {
-            let tree_ok = src.tree.strip_prefix("sha256:").is_some_and(valid_sha256);
-            let commit_ok = src.commit.as_deref().is_none_or(hex_id);
-            if !valid_id(&src.id) || !commit_ok || !tree_ok {
+            let tree_ok = src
+                .tree
+                .as_deref()
+                .is_none_or(|t| t.strip_prefix("sha256:").is_some_and(valid_sha256));
+            let commit_ok = src.commit.as_deref().is_none_or(hex_id)
+                && src.previous_commit.as_deref().is_none_or(hex_id)
+                && (src.previous_commit.is_none() || src.commit.is_some());
+            if !valid_id(&src.id)
+                || !commit_ok
+                || !tree_ok
+                || (src.commit.is_none() && src.tree.is_none())
+            {
                 return Err(bad("receipt source identity is malformed"));
             }
         }
@@ -1477,7 +1491,7 @@ impl Receipt {
     /// Redacts descriptive text with `secrets` in one pass. A path or identifier that contains
     /// a secret cannot be redacted without breaking its use, so it is refused.
     pub fn scrub(&mut self, secrets: &[&str]) -> Result<(), Refusal> {
-        if leaks(&self.op_id, secrets) {
+        if leaks(&self.op_id, secrets) || self.sources.iter().any(|s| leaks(&s.id, secrets)) {
             return Err(secret_in_path());
         }
         for o in &self.operations {
@@ -2905,7 +2919,8 @@ mod tests {
         r.sources = vec![SourceId {
             id: "path-0123456789ab".into(),
             commit: None,
-            tree: format!("sha256:{}", "b".repeat(64)),
+            previous_commit: None,
+            tree: Some(format!("sha256:{}", "b".repeat(64))),
         }];
         // A removal: it owns and publishes nothing, and `before` is the fingerprint it removed.
         r.operations[0].owned_outputs.clear();
@@ -2996,7 +3011,8 @@ mod tests {
         r.sources = vec![SourceId {
             id: "s".into(),
             commit: Some("zz".into()),
-            tree: "x".into(),
+            previous_commit: None,
+            tree: Some("x".into()),
         }];
         cases.push(("source", r));
         let mut r = good.clone();

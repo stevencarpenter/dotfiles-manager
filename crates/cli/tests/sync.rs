@@ -447,8 +447,7 @@ fn a_sync_that_changes_nothing_needs_no_approval() {
     assert!(s.contains("nothing to change: no approval needed"), "{s}");
     assert!(s.ends_with("result: ok\n"), "{s}");
     assert_eq!(fx.receipts(), 1, "a no-op sync wrote a receipt");
-    // A new upstream commit is a publication: a plain sync publishes it, and no scope has
-    // anything to do, so no receipt is written.
+    // A source-only change records the same unattended approval as a run that changes HOME.
     let seed = &fx.upstream.seed;
     put(seed, "README.md", "notes\n");
     let head = fx.upstream.push("docs only");
@@ -458,7 +457,10 @@ fn a_sync_that_changes_nothing_needs_no_approval() {
     assert!(!s.contains("no approval needed"), "{s}");
     in_order(&s, &["published: src0 ", "  config: current", "result: ok"]);
     assert_eq!(fx.head(), head);
-    assert_eq!(fx.receipts(), 1);
+    let records = fx.receipt_docs();
+    assert_eq!(records.len(), 2);
+    assert_eq!(records[1]["approval"]["kind"], "unattended");
+    assert_eq!(records[1]["plan_digest"], digest_of(&o));
 }
 
 #[test]
@@ -872,6 +874,35 @@ fn a_change_between_the_printed_plan_and_the_locked_plan_is_stale() {
 }
 
 #[test]
+fn a_source_only_publication_records_the_approved_digest_and_both_commits() {
+    let fx = Fx::new();
+    assert_eq!(code(&fx.sync_approved()), 0);
+    let old = fx.head();
+    put(&fx.upstream.seed, "notes.txt", "source-only change\n");
+    let new = fx.upstream.push("update notes");
+    let digest = digest_of(&fx.preview());
+    let o = fx.sync(&digest);
+    assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
+    let records = fx.receipt_docs();
+    assert_eq!(records.len(), 2);
+    let r = records.last().unwrap();
+    assert_eq!(r["plan_digest"], digest);
+    assert_eq!(r["approval"]["plan_digest"], digest);
+    assert_eq!(r["approval"]["kind"], "yes_plan");
+    assert_eq!(r["result"]["exit_code"], 0);
+    assert!(
+        r["sources"]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::json!({
+                "id":"src0", "previous_commit":old, "commit":new
+            }))
+    );
+    assert_eq!(code(&fx.sync_approved()), 0);
+    assert_eq!(fx.receipts(), 2);
+}
+
+#[test]
 fn a_change_between_preview_and_approval_is_stale_and_publishes_nothing() {
     let fx = Fx::new();
     let old = fx.head();
@@ -1024,6 +1055,7 @@ fn an_interrupted_first_nested_publication_can_be_retried() {
 #[test]
 fn a_failed_second_publication_names_the_first_and_runs_no_scope() {
     let fx = Fx::new();
+    let old = fx.head();
     let (ext, pin) = fx.add_ext();
     let root_new = fx.upstream.head();
     fx.trust(&ext.origin());
@@ -1053,7 +1085,15 @@ fn a_failed_second_publication_names_the_first_and_runs_no_scope() {
     assert_eq!(fx.head(), root_new);
     assert!(!fx.root.join("base/ext").exists());
     assert!(!fx.h(".config/work/profile").exists());
-    assert_eq!(fx.receipts(), 0);
+    let records = fx.receipt_docs();
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0]["result"]["exit_code"], 1);
+    assert_eq!(records[0]["approval"]["plan_digest"], digest_of(&p));
+    assert_eq!(
+        records[0]["sources"],
+        serde_json::json!([{"id":"src0", "previous_commit":old, "commit":root_new}])
+    );
+
     // The next run publishes only the missing source, once, and then runs the scopes.
     let o = fx.sync_approved();
     assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
@@ -1068,7 +1108,7 @@ fn a_failed_second_publication_names_the_first_and_runs_no_scope() {
         fs::read_to_string(fx.h(".config/work/profile")).unwrap(),
         "work=1\n"
     );
-    assert_eq!(fx.receipts(), 1);
+    assert_eq!(fx.receipts(), 2);
 }
 
 #[test]
