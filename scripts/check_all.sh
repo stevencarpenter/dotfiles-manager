@@ -3,7 +3,7 @@
 # Usage: check_all.sh [step ...]
 #   steps: fixtures scripts rust-style rust-tests network-tests (default: the first four;
 #   rust-tests runs network-tests itself unless DFM_SKIP_NETWORK_TESTS=1), and rust-archive,
-#   which only hosted CI runs (it needs cargo-nextest)
+#   which only hosted CI runs (it needs cargo-nextest), and shipped-toolchain (Apple Silicon macOS)
 set -euo pipefail
 
 # Documentation fixtures only: shape and references. The resolver cases run in step rust-tests.
@@ -45,6 +45,23 @@ step_rust_style() {
 # The test set of the gate: the whole workspace in the isolated build. The CLI and differential
 # tests need feature test-isolation, which also switches on dfm-engine/failpoints.
 test_select=(--workspace --locked --features dfm-cli/test-isolation)
+
+# Exercise the first-run toolchain contract without changing the user's rustup home or manager.
+step_shipped_toolchain() (
+    local scratch pin manager_home toolchains
+    scratch=$(mktemp -d)
+    trap 'rm -rf "$scratch"' EXIT
+    pin=$(sed -n 's/^channel = "\([0-9][0-9.]*\)"$/\1/p' rust-toolchain.toml)
+    [[ "$pin" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo 'invalid pinned Rust version' >&2; exit 1; }
+    manager_home=$scratch/home
+    toolchains=$manager_home/.local/share/dotfiles-manager/toolchains
+    mkdir -p "$toolchains" "$scratch/stage"
+    cp Cargo.toml Cargo.lock rust-toolchain.toml dotfiles-manager.lock "$scratch/stage/"
+    RUSTUP_HOME="$scratch/rustup" rustup toolchain install "$pin-aarch64-apple-darwin" --profile default --no-self-update
+    mv "$scratch/rustup/toolchains/$pin-aarch64-apple-darwin" "$toolchains/$pin"
+    HOME="$manager_home" DFM_BOOTSTRAP_TEST=1 DFM_TEST_HOME="$manager_home" \
+        /bin/sh scripts/bootstrap.sh check-controls --source "$scratch/stage"
+)
 
 # Hosted CI only: build every test binary of the test set once into a cargo-nextest archive
 # (DFM_TEST_ARCHIVE), so each test job runs prebuilt binaries. nextest cannot archive doc tests,

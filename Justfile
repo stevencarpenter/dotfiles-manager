@@ -18,6 +18,10 @@ check-tests:
 check-network:
     bash scripts/check_all.sh network-tests
 
+# Check the shipped lock against a fresh official Apple Silicon toolchain.
+check-shipped-toolchain:
+    bash scripts/check_all.sh shipped-toolchain
+
 # The steps the commit hook runs, on the working tree instead of the staged copy.
 check-commit:
     bash scripts/check_all.sh fixtures scripts rust-style
