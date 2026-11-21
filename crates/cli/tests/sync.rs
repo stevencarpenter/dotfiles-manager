@@ -660,6 +660,22 @@ fn a_local_edit_the_update_would_overwrite_is_refused_and_kept() {
 }
 
 #[test]
+fn the_sync_digest_binds_the_checkout_branch_and_upgrade_mode() {
+    let fx = Fx::new();
+    let preview = fx.plain(&["--preview", "--no-upgrade"]);
+    assert_eq!(code(&preview), 0, "{}", stderr(&preview));
+    let digest = digest_of(&preview);
+    let changed = fx.sync(&digest);
+    assert_eq!(code(&changed), 3, "{}", stdout(&changed));
+    assert!(stderr(&changed).contains("E_PLAN_STALE"));
+    git(&fx.root, &["checkout", "-q", "-b", "topic"]);
+    let changed = fx.plain(&["--no-upgrade", "-y", &digest]);
+    assert_eq!(code(&changed), 3, "{}", stdout(&changed));
+    assert!(stderr(&changed).contains("E_PLAN_STALE"));
+    assert_eq!(fx.receipts(), 0);
+}
+
+#[test]
 fn sync_preserves_an_ignored_file_the_fetched_commit_tracks() {
     let fx = Fx::new();
     let old = fx.head();

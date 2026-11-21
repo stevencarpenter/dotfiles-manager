@@ -362,8 +362,7 @@ struct Staged {
     /// That head or pin when the checkout already holds it under local commits; `new` is then
     /// the checkout's HEAD, which stays where it is.
     ahead_of: Option<String>,
-    /// The branch the root checkout has out (`refs/heads/...`), `None` when its HEAD is detached
-    /// or the source is nested. Shown on the `source:` line only, not in the digest.
+    /// The branch publication would advance. A detached checkout has no branch.
     branch: Option<String>,
 }
 
@@ -860,17 +859,7 @@ fn stage_source(
         // The objects are already in the copy (the fetch above), so the fast-forward is local.
         advance(git, id, &repo_s, old.as_deref(), &new, None)?;
     }
-    let branch = if src.is_root() {
-        let out = git.output(true, &["-C", &repo_s, "symbolic-ref", "-q", "HEAD"])?;
-        match out.end {
-            End::Exited(0) => Some(String::from_utf8_lossy(&out.stdout).trim().to_string()),
-            End::Exited(1) => None,
-            End::Stopped(r) => return Err(r),
-            _ => return Err(untrusted(format!("{id}: git symbolic-ref HEAD failed"))),
-        }
-    } else {
-        None
-    };
+    let branch = branch_of(git, &repo_s, id)?;
     Ok(Staged {
         src: src.clone(),
         repo,
@@ -880,6 +869,22 @@ fn stage_source(
         ahead_of,
         branch,
     })
+}
+
+/// The ref a fast-forward in this checkout would move, or none for detached HEAD.
+fn branch_of(git: &Git, repo: &str, id: &str) -> Result<Option<String>, Refusal> {
+    let out = git.output(true, &["-C", repo, "symbolic-ref", "-q", "HEAD"])?;
+    match out.end {
+        End::Exited(0) => Ok(Some(
+            String::from_utf8(out.stdout)
+                .map_err(|_| untrusted(format!("{id}: the branch name is not UTF-8")))?
+                .trim_end_matches('\n')
+                .to_string(),
+        )),
+        End::Exited(1) => Ok(None),
+        End::Stopped(r) => Err(r),
+        _ => Err(untrusted(format!("{id}: git symbolic-ref HEAD failed"))),
+    }
 }
 
 /// A nested source lands at `base/<path>`. Every component of that path that exists must be a
@@ -973,18 +978,23 @@ fn stage_all(
 /// of a session and, per source, what moves from where to where. A plan digest covers the loaded
 /// source tree, not the commits behind it, so a commit that changes only files outside the
 /// scoped roots would otherwise pass.
-fn sync_digest(review: &Review, staged: &[Staged]) -> String {
-    let mut text = format!("plan {} {}\n", Scope::Sync.as_str(), review.digest);
+fn sync_digest(review: &Review, staged: &[Staged], upgrade: bool) -> String {
+    let mut text = format!(
+        "plan {} {}\nupgrade {upgrade}\n",
+        Scope::Sync.as_str(),
+        review.digest
+    );
     for r in &review.excluded.skipped {
         text.push_str(&format!("skip {} {r}\n", Scope::Secrets.as_str()));
     }
     for s in staged {
         text.push_str(&format!(
-            "source {} {} {} {} {}\n",
+            "source {} {} {} {} {} {}\n",
             s.src.id,
             s.src.origin,
             s.src.reference,
             s.old.as_deref().unwrap_or("none"),
+            s.branch.as_deref().unwrap_or("detached"),
             s.new
         ));
     }
@@ -1699,6 +1709,12 @@ fn publish(git: &Git, s: &Staged) -> Result<bool, Refusal> {
             ),
         ));
     }
+    if now.is_some() && branch_of(git, live_s, id)? != s.branch {
+        return Err(Refusal::new(
+            Code::PlanStale,
+            format!("{id}: the checked-out branch changed after review. Fix: plan again"),
+        ));
+    }
     if s.old.as_deref() == Some(s.new.as_str()) {
         return Ok(false);
     }
@@ -1905,7 +1921,7 @@ fn run_inner(
     for s in &previewed {
         // A root checkout on another branch is fast-forwarded where it is; say so.
         let checkout = match &s.branch {
-            _ if !s.src.is_root() => String::new(),
+            None if !s.src.is_root() => String::new(),
             Some(b) if *b == s.src.reference => String::new(),
             Some(b) => format!("; checkout on {}", visible(b)),
             None => "; detached".into(),
@@ -1923,7 +1939,7 @@ fn run_inner(
         .map_err(w)?;
     }
     let (loaded, review) = plan_staged(ctx, &binding, (&root, &rel), &staging.tree(), args)?;
-    let digest = sync_digest(&review, &previewed);
+    let digest = sync_digest(&review, &previewed, args.upgrade);
     let parts = review.split();
     printed.warnings = parts.iter().flat_map(ScopePlan::warnings).collect();
     show(&review, &parts, &digest, ctx.color, args.apply.all, out).map_err(w)?;
@@ -2025,7 +2041,7 @@ fn run_inner(
     let second = Staging::create(ctx, &sys, true)?;
     let staged = stage_all(&git, root_src, &grants, &root, &second.tree())?;
     let (_, locked) = plan_staged(ctx, &binding, (&root, &rel), &second.tree(), args)?;
-    let locked_digest = sync_digest(&locked, &staged);
+    let locked_digest = sync_digest(&locked, &staged, args.upgrade);
     if locked_digest != digest {
         return Err(match &args.apply.yes_plan {
             Some(approved) => apply_cmd::stale(approved, &locked_digest),
