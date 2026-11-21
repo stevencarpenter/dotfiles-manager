@@ -149,7 +149,7 @@ fn tree(parse: bool) -> Command {
             "Install the missing packages",
             [
                 allow_disruptive().hide(true),
-                allow_adopt().hide(true),
+                allow_adopt(),
                 switch("update"),
             ],
         ))

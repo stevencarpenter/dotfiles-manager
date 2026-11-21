@@ -179,6 +179,8 @@ pub enum SecretVerdict {
 pub enum PackageState {
     /// The declared provider lists it, with the version it reports.
     Installed(String),
+    /// Reinstalling would replace an existing tool from the recorded source.
+    ReplaceSource { installed: String, desired: String },
     /// The declared provider does not list it and no other owner was seen. The names are the
     /// dependencies the install would add with it (empty when there are none, or when the
     /// provider has no dependency listing). They are part of the plan, so the reviewer approves
@@ -243,6 +245,9 @@ impl PackageState {
     pub fn state(&self) -> String {
         match self {
             PackageState::Installed(v) => format!("installed:{v}"),
+            PackageState::ReplaceSource { installed, desired } => {
+                format!("replace:{installed} -> {desired}")
+            }
             PackageState::Missing(d) if d.is_empty() => "missing".into(),
             PackageState::Missing(d) => format!("missing:with={}", d.join(",")),
             PackageState::Upgrades(d) => format!("upgrades:{}", d.join(",")),
@@ -1325,7 +1330,7 @@ impl Planner<'_> {
     }
 
     /// A package (docs/packages.md): no path and no ledger entry. The caller probed the declared
-    /// provider; the plan installs what is missing and never upgrades, downgrades or removes.
+    /// provider; the plan installs missing packages and requests approval for uv source switches.
     /// Under a rolling update (docs/toolchains.md) the caller's `Rolling` state plans an
     /// `upgrade` to the newest version the provider resolves at apply time, and `Held` keeps
     /// the installed versions with the reason in the row.
@@ -1366,6 +1371,19 @@ impl Planner<'_> {
                     "{name} is installed by {} and held ({w}); not upgraded",
                     r.adapter
                 );
+            }
+            Some(PackageState::ReplaceSource { installed, desired }) => {
+                op.action = Action::Install;
+                op.status = Status::Planned;
+                op.takeover = true;
+                op.ownership = Ownership::Foreign;
+                op.effect = format!(
+                    "replace {name} from {installed} with {desired}. The installed version may change"
+                );
+                op.preconditions.push(Precondition {
+                    subject: probe,
+                    state: PackageState::ReplaceSource { installed, desired }.state(),
+                });
             }
             Some(PackageState::Missing(deps)) => {
                 op.action = Action::Install;

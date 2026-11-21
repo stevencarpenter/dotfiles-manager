@@ -1389,6 +1389,12 @@ fn package_row(r: &ResolvedResource, s: &PackageState, path: &OsStr) -> Row {
             format!("{pkg} is installed by {by} ({v})"),
             String::new(),
         ),
+        PackageState::ReplaceSource { installed, desired } => (
+            Level::Warn,
+            Code::Conflict.into(),
+            format!("{pkg} is installed from {installed}; the declaration requests {desired}"),
+            "Review the replacement with dfm packages --preview.".into(),
+        ),
         PackageState::Missing(_) => (
             Level::Warn,
             D::PlanPending.into(),

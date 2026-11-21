@@ -1101,7 +1101,7 @@ fn a_stop_request_during_a_probe_ends_the_probing_and_exits_143() {
 }
 
 #[test]
-fn a_provider_that_cannot_answer_blocks_and_the_flags_of_apply_are_refused() {
+fn a_provider_that_cannot_answer_blocks_and_disruptive_approval_is_refused() {
     let fx = Fx::new();
     fx.installed("brew", "atuin 1\n");
     fx.put(
@@ -1111,14 +1111,16 @@ fn a_provider_that_cannot_answer_blocks_and_the_flags_of_apply_are_refused() {
     let o = fx.preview();
     assert_eq!(code(&o), 3, "{}\n{}", stderr(&o), text(&o.stdout));
     assert!(stderr(&o).contains("E_PROBE_FAILED"), "{}", stderr(&o));
-    for flags in [
-        &["--allow-disruptive", "x"][..],
-        &["--allow-adopt", "x"][..],
-    ] {
-        let mut a = vec!["packages", "--root", fx.root_arg()];
-        a.extend_from_slice(flags);
-        assert_eq!(code(&fx.run(&a)), 2);
-    }
+    assert_eq!(
+        code(&fx.run(&[
+            "packages",
+            "--root",
+            fx.root_arg(),
+            "--allow-disruptive",
+            "x"
+        ])),
+        2
+    );
 }
 
 /// A module whose only resource is the `mise/v1` tool `name`.

@@ -334,8 +334,8 @@ pub struct Operation {
     /// (`output_sha256` stays unset); this covers the declared set only, never the live file.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub managed_sha256: Option<String>,
-    /// The first write into an existing co-owned file that the ledger does not record yet. It
-    /// needs `--allow-adopt <operation-id>` (docs/adapters.md, "Take over an existing file").
+    /// Writing an existing co-owned file for the first time, or switching an installed package
+    /// to a different source, requires `--allow-adopt <operation-id>`.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub takeover: bool,
     /// Size in bytes of the generated content. For people: `plan` prints it.

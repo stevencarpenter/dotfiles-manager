@@ -802,6 +802,16 @@ impl Receipt {
                             || o.before.is_some()
                             || o.reload.as_deref() == Some("reloaded"))
                 }
+                // A uv source switch records the provider operation without filesystem ownership.
+                "allow_adopt"
+                    if o.adapter == "uv-tool/v1"
+                        && matches!(self.command.as_str(), "packages" | "sync") =>
+                {
+                    o.owned_outputs.is_empty()
+                        && o.before.is_none()
+                        && o.after.is_none()
+                        && o.reload.is_none()
+                }
                 // A link adoption publishes nothing. The first write into an existing co-owned
                 // (sensitive) file is also approved this way: it has no fingerprints, owns its
                 // output, and may carry a reload state because it published.

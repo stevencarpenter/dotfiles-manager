@@ -486,9 +486,9 @@ fn run_command(
         }
         "packages" => {
             let args = apply_cmd::parse_args(sub, dfm_model::plan::Scope::Packages)?;
-            if !args.allow.is_empty() || !args.allow_adopt.is_empty() {
+            if !args.allow.is_empty() {
                 return Err(usage(
-                    "packages removes and adopts nothing; --allow-disruptive and --allow-adopt do not apply",
+                    "packages removes nothing; --allow-disruptive does not apply",
                 ));
             }
             apply_cmd::run(&context(home)?, &args, out)

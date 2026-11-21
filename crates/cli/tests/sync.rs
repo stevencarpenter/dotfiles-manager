@@ -2030,6 +2030,57 @@ fn a_packages_scope_after_the_configuration_scope_probes_once_per_plan() {
 }
 
 #[test]
+fn sync_withholds_a_uv_source_switch_until_the_named_takeover_is_approved() {
+    let l = Life::new();
+    let receipt = l.fx.h(".local/share/uv/tools/sample-cli/uv-receipt.toml");
+    fs::create_dir_all(receipt.parent().unwrap()).unwrap();
+    let index = "[tool]\nrequirements = [{ name = 'sample-cli' }]\n";
+    fs::write(&receipt, index).unwrap();
+    let body = r#"#!/bin/sh
+case "$*" in
+    'tool list') echo 'sample-cli v1.0.0' ;;
+    'tool install sample-cli @ git+https://example.org/sample@2.0.0')
+        printf "[tool]\nrequirements = [{name='sample-cli', git='https://example.org/sample?rev=2.0.0'}]\n" > "$HOME/.local/share/uv/tools/sample-cli/uv-receipt.toml" ;;
+    *) exit 64 ;;
+esac
+"#;
+    let uv = l.fake.path().join("bin/uv");
+    fs::write(&uv, body).unwrap();
+    fs::set_permissions(&uv, fs::Permissions::from_mode(0o755)).unwrap();
+    l.push_module(
+        "\n[[resources]]\nid='sample'\nkind='package'\nadapter='uv-tool/v1'\n[resources.value]\nname='sample-cli'\nsource='git+https://example.org/sample@2.0.0'\nupdate_policy='hold'\n",
+        &[],
+        "add the sample tool",
+    );
+    let id = "life.sample@package";
+    let withheld = l.plain(&["--no-upgrade"]);
+    assert_eq!(
+        code(&withheld),
+        0,
+        "{}\n{}",
+        stdout(&withheld),
+        stderr(&withheld)
+    );
+    assert!(stdout(&withheld).contains(&format!("withheld: {id} (needs --allow-adopt)")));
+    assert_eq!(fs::read_to_string(&receipt).unwrap(), index);
+    let approved = l.plain(&["--no-upgrade", "--allow-adopt", id]);
+    assert_eq!(
+        code(&approved),
+        0,
+        "{}\n{}",
+        stdout(&approved),
+        stderr(&approved)
+    );
+    assert!(fs::read_to_string(receipt).unwrap().contains("?rev=2.0.0"));
+    assert!(l.fx.receipt_docs().iter().any(|r| {
+        r["command"] == "sync"
+            && r["approvals"]
+                .as_array()
+                .is_some_and(|v| v.iter().any(|a| a["how"] == "allow_adopt"))
+    }));
+}
+
+#[test]
 fn a_secret_takeover_is_withheld_while_the_rest_of_the_run_continues() {
     let l = Life::new();
     // A second secret, new, for another account.
