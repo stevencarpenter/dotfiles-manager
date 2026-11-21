@@ -91,7 +91,7 @@ For one operation, apply does these steps in this order:
 6. **Effect.** See the next section.
 7. **Read-back.** Apply reads the result through the same descriptor: link target, content hash and mode, or absence.
 8. **Outcome.** The journal gets `done`. If the effect or the read-back failed, it gets `failed` with a redacted reason.
-9. **Ownership.** The ledger is rewritten atomically with the new output (or without the removed one). Ownership of a new output is recorded after `done`. For `update_file` and `replace_link` the output is already owned, so the ledger moves to the new fingerprint before `done`. A crash or a failed ledger write then leaves an open intent, and `state recover` records the fingerprint that is live (see Interrupted runs). `apply` plans before it settles, so until then the plan reports the output as changed (`E_CONFLICT`) and its fix text names `state recover`.
+9. **Ownership.** The ledger is rewritten atomically with the new output (or without the removed one). Ownership of a new output is recorded after `done`. A verified removal drops ownership before `done`. Recovery also drops ownership before closing a removal whose path is absent. For `update_file` and `replace_link` the output is already owned, so the ledger moves to the new fingerprint before `done`. A crash or a failed ledger write then leaves an open intent, and `state recover` records the fingerprint that is live (see Interrupted runs). `apply` plans before it settles, so until then the plan reports the output as changed (`E_CONFLICT`) and its fix text names `state recover`.
 
 The receipt is written once, after the last operation.
 

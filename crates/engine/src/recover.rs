@@ -44,7 +44,12 @@ pub(crate) fn observe_live(
     let rel = Path::new(abs).strip_prefix(home_path).ok()?.to_str()?;
     let comps = components(rel).ok()?;
     let (name, parents) = comps.split_last()?;
-    let parent = home.open_below(sys, parents).ok()?;
+    let Some(parent) = home.open_below_opt(sys, parents).ok()? else {
+        return Some(Live {
+            peek: Peek::Missing,
+            fingerprint: None,
+        });
+    };
     let peek = parent.peek(sys, name).ok()?;
     let fingerprint = match &peek {
         Peek::File { .. } if hash => parent
@@ -169,11 +174,10 @@ pub(crate) fn settle_all(
                 .iter()
                 .any(|r| r.resource == resource))
     };
-    // An update or replace that finished is closed through `close_done`, which first moves the
-    // ledger fingerprint. A failure returns here with the intent still open, so the next run
-    // tries again.
+    // Settle existing ownership before closing an update, replacement or removal. A failed
+    // ledger write leaves the intent open for the next recovery.
     for i in unfinished(&store.read_journal_lenient()?) {
-        if !matches!(i.op.as_str(), "update-file" | "replace-link") {
+        if !matches!(i.op.as_str(), "update-file" | "replace-link" | "remove") {
             continue;
         }
         let (probe, live) = inspect(store, w, i);
@@ -277,8 +281,9 @@ fn sweep_stages(store: &Store, (sys, home, home_path): Where<'_>) -> Result<Vec<
         let Some((name, parents)) = comps.split_last() else {
             continue;
         };
-        match home.open_below(sys, parents) {
-            Ok(parent) => {
+        match home.open_below_opt(sys, parents) {
+            Ok(None) => continue,
+            Ok(Some(parent)) => {
                 let (removed, warnings) = parent.sweep_stages(sys, name, id, at);
                 if removed {
                     store.mark_mutated();
@@ -342,8 +347,7 @@ pub(crate) fn close_failed(store: &Store, u: &Unresolved<'_>, reason: &str) -> R
     store.append_journal(&closing(u, Phase::Failed, reason)?)
 }
 
-/// Appends `done`, then handles ownership. A removal drops the ledger entry of the absent
-/// path. A created, replaced or adopted output is recorded only when every rule holds:
+/// Settles existing ownership before appending `done`. A removal drops the absent path. A created, replaced or adopted output is recorded only when every rule holds:
 /// - `Own` allows it (see [`Own`]);
 /// - the live fingerprint equals the one the intent expected;
 /// - a create did not find the path present before (`existed_before` is false);
@@ -392,15 +396,18 @@ pub(crate) fn close_done(
             owned.clone(),
         )?;
     }
+    if e.class == Class::Normal
+        && e.op == "remove"
+        && let Some(out) = first
+    {
+        forget_output(store, &e.resource, &e.op_id, &out.path)?;
+    }
     store.append_journal(&closing(u, Phase::Done, reason)?)?;
     let Some(out) = first else {
         return Ok(());
     };
     if e.class != Class::Normal {
         return Ok(());
-    }
-    if e.op == "remove" {
-        return forget_output(store, &e.resource, &e.op_id, &out.path);
     }
     match own {
         Own::Operator => {}
