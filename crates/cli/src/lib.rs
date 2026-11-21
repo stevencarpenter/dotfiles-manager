@@ -1061,30 +1061,24 @@ fn state_check(home: PathBuf) -> Result<String, Refusal> {
     };
     let uid = dfm_platform_macos::current_uid()
         .ok_or_else(|| Refusal::new(Code::StorageInvalid, "cannot read the user id"))?;
-    let read = Store::open_read(Sys { uid }, &layout, Fail::none()).and_then(|s| match s {
-        Some(s) => {
-            s.read_state()?;
-            s.read_ledger_lenient()?;
-            s.read_journal_lenient().map(|_| "")
+    let errors = match Store::open_read(Sys { uid }, &layout, Fail::none()) {
+        Ok(None) => return Ok(": no state".into()),
+        Ok(Some(store)) => store.active_document_errors(),
+        Err(e) => vec![e],
+    };
+    let mut note = String::new();
+    for e in errors {
+        if matches!(
+            e.code,
+            Code::StateNewer | Code::SchemaUnsupported | Code::StateInvalid
+        ) {
+            return Err(e);
         }
-        None => Ok(": no state"),
-    });
-    match read {
-        Ok(note) => Ok(note.to_string()),
-        Err(e)
-            if matches!(
-                e.code,
-                Code::StateNewer | Code::SchemaUnsupported | Code::StateInvalid
-            ) =>
-        {
-            Err(e)
+        if note.is_empty() {
+            note = format!(": state not checked: {} {}", e.code.as_str(), e.detail);
         }
-        Err(e) => Ok(format!(
-            ": state not checked: {} {}",
-            e.code.as_str(),
-            e.detail
-        )),
     }
+    Ok(note)
 }
 
 /// `self-check --fixture-dir`: reads only that directory and makes no network call.
