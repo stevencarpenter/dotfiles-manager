@@ -1001,6 +1001,27 @@ fn an_exact_nested_pin_stays_exact_while_the_root_tracks() {
 }
 
 #[test]
+fn an_interrupted_first_nested_publication_can_be_retried() {
+    let fx = Fx::new();
+    let (ext, pin) = fx.add_ext();
+    fx.trust(&ext.origin());
+    let aborted = Command::new(BIN)
+        .env_clear()
+        .env("DFM_PROVIDER_PATH", "/usr/bin:/bin")
+        .env("DFM_FAILPOINT", "sync-before-publish-src1:abort")
+        .arg("--home")
+        .arg(fx.home.path())
+        .args(["sync", "--root", fx.root_arg()])
+        .output()
+        .unwrap();
+    assert!(!aborted.status.success());
+    assert!(!fx.root.join("base/ext").exists());
+    let retry = fx.plain(&[]);
+    assert_eq!(code(&retry), 0, "{}\n{}", stdout(&retry), stderr(&retry));
+    assert_eq!(git(&fx.root.join("base/ext"), &["rev-parse", "HEAD"]), pin);
+}
+
+#[test]
 fn a_failed_second_publication_names_the_first_and_runs_no_scope() {
     let fx = Fx::new();
     let (ext, pin) = fx.add_ext();

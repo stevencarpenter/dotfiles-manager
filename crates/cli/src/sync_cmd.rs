@@ -703,14 +703,6 @@ fn advance(
     from: Option<&str>,
 ) -> Result<(), Refusal> {
     if let Some(from) = from {
-        if old.is_none() {
-            git.run(
-                true,
-                Code::IoFailed,
-                &format!("{id}: init the checkout"),
-                &["init", "-q", dir],
-            )?;
-        }
         git.run(
             true,
             Code::SourceMissing,
@@ -1718,7 +1710,24 @@ fn publish(git: &Git, s: &Staged) -> Result<bool, Refusal> {
     if s.old.as_deref() == Some(s.new.as_str()) {
         return Ok(false);
     }
-    advance(git, id, live_s, s.old.as_deref(), &s.new, Some(repo_s))?;
+    if s.old.is_none() {
+        let parent = s
+            .live
+            .parent()
+            .ok_or_else(|| conflict("a nested checkout needs a parent"))?;
+        fs::create_dir_all(parent)
+            .map_err(|e| io_failed("create the nested checkout parent", &e))?;
+        // The staged checkout already passed the rehearsal at the approved detached commit.
+        match dfm_engine::fsys::publish_new_checkout(&s.repo, &s.live) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::CrossesDevices => {
+                checkout::publish_checkout(&s.live, |tmp| copy_checkout(&s.repo, tmp))?;
+            }
+            Err(e) => return Err(io_failed("publish the new nested checkout", &e)),
+        }
+    } else {
+        advance(git, id, live_s, s.old.as_deref(), &s.new, Some(repo_s))?;
+    }
     // Postcondition: the checkout is at the published commit.
     let after = head_of(git, &s.live)?;
     if after.as_deref() != Some(s.new.as_str()) {
