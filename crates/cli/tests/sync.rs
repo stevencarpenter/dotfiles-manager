@@ -4348,6 +4348,16 @@ fn sync_runs_the_declared_updaters_in_order() {
     );
     assert!(s.contains("  current brew"), "{s}");
     assert!(s.contains("  upgrade: updated=1 current=1"), "{s}");
+    // Each row that ran ends with its wall time.
+    for name in ["claude", "brew"] {
+        let row = s
+            .lines()
+            .find(|l| l.starts_with("  ") && l.split(' ').nth(3) == Some(name))
+            .expect(&s);
+        let (_, time) = row.rsplit_once(" (").expect(row);
+        assert!(time.ends_with(" s)"), "{row}");
+        assert!(time.trim_end_matches(" s)").parse::<f64>().is_ok(), "{row}");
+    }
     // The updaters are listed before publication and the scopes, then run after them.
     let listed = s.find("  claude: would run claude update").expect(&s);
     let published = s.find("\npublished:").expect(&s);

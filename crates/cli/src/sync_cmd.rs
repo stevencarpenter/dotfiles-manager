@@ -39,7 +39,7 @@ use std::fs;
 use std::io::Write;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const LOCK_FILE: &str = "dotfiles-manager.lock";
 /// The default bound of one external process. A fetch gets the whole bound.
@@ -2714,7 +2714,9 @@ fn upgrade(
     };
     let mut operations = Vec::new();
     for u in &updaters {
+        let clock = Instant::now();
         let mut row = updater::run(*u, &env);
+        let took = clock.elapsed();
         // A blocked updater ran no command, and a stopped run starts no more.
         if row.status != state::Status::Blocked && dfm_engine::signal::requested().is_none() {
             match tracked_status(&git, &checkouts) {
@@ -2781,9 +2783,15 @@ fn upgrade(
             (Some(b), _) => format!(" {}", visible(b)),
             _ => String::new(),
         };
+        // A blocked updater ran no command, so its row has no time.
+        let time = if row.status == state::Status::Blocked {
+            String::new()
+        } else {
+            format!(" ({})", elapsed(took))
+        };
         writeln!(
             out,
-            "  {} {}{versions}",
+            "  {} {}{versions}{time}",
             paint::status(ctx.color, &status),
             u.name()
         )
@@ -2822,6 +2830,16 @@ fn upgrade(
         .map(|(s, n)| format!("{}={n}", status_name(*s)))
         .collect();
     Ok(Some(counts.join(" ")))
+}
+
+/// The wall time of one updater for its row: tenths of a second under 10 s, whole seconds above.
+fn elapsed(d: Duration) -> String {
+    let s = d.as_secs_f64();
+    if s < 10.0 {
+        format!("{s:.1} s")
+    } else {
+        format!("{} s", d.as_secs())
+    }
 }
 
 fn untrusted_refusal(origins: &[&str]) -> Refusal {
@@ -2972,6 +2990,14 @@ mod tests {
             .filter(|s| s.starts_with("http.followRedirects="))
             .collect();
         assert_eq!(follow, [&"http.followRedirects=false"]);
+    }
+
+    #[test]
+    fn updater_time_has_tenths_below_ten_seconds_and_whole_seconds_above() {
+        assert_eq!(elapsed(Duration::from_millis(40)), "0.0 s");
+        assert_eq!(elapsed(Duration::from_millis(4_260)), "4.3 s");
+        assert_eq!(elapsed(Duration::from_millis(9_940)), "9.9 s");
+        assert_eq!(elapsed(Duration::from_millis(67_800)), "67 s");
     }
 
     #[test]
