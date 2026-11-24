@@ -2783,17 +2783,13 @@ fn upgrade(
             (Some(b), _) => format!(" {}", visible(b)),
             _ => String::new(),
         };
-        // A blocked updater ran no command, so its row has no time.
-        let time = if row.status == state::Status::Blocked {
-            String::new()
-        } else {
-            format!(" ({})", elapsed(took))
-        };
+        // Every row has a time: a blocked or pending row can follow commands that ran.
         writeln!(
             out,
-            "  {} {}{versions}{time}",
+            "  {} {}{versions} ({})",
             paint::status(ctx.color, &status),
-            u.name()
+            u.name(),
+            elapsed(took)
         )
         .map_err(w)?;
         for n in &row.notes {
@@ -2834,11 +2830,12 @@ fn upgrade(
 
 /// The wall time of one updater for its row: tenths of a second under 10 s, whole seconds above.
 fn elapsed(d: Duration) -> String {
-    let s = d.as_secs_f64();
-    if s < 10.0 {
-        format!("{s:.1} s")
+    // Round to tenths before the branch, so 9.96 s prints as 10 s, not 10.0 s.
+    let tenths = (d.as_millis() + 50) / 100;
+    if tenths < 100 {
+        format!("{}.{} s", tenths / 10, tenths % 10)
     } else {
-        format!("{} s", d.as_secs())
+        format!("{} s", d.as_secs().max(10))
     }
 }
 
@@ -2997,6 +2994,7 @@ mod tests {
         assert_eq!(elapsed(Duration::from_millis(40)), "0.0 s");
         assert_eq!(elapsed(Duration::from_millis(4_260)), "4.3 s");
         assert_eq!(elapsed(Duration::from_millis(9_940)), "9.9 s");
+        assert_eq!(elapsed(Duration::from_millis(9_960)), "10 s");
         assert_eq!(elapsed(Duration::from_millis(67_800)), "67 s");
     }
 

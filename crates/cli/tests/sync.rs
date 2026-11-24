@@ -5038,7 +5038,7 @@ fn a_blocked_updater_is_listed_and_counted_not_dropped() {
     assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
     let s = stdout(&o);
     assert!(s.contains("  opencode: blocked: not installed at "), "{s}");
-    assert!(s.contains("  blocked opencode\n"), "{s}");
+    assert!(s.contains("  blocked opencode ("), "{s}");
     assert!(s.contains("  current claude"), "{s}");
     assert!(s.contains("  upgrade: current=1 blocked=1"), "{s}");
     assert!(
