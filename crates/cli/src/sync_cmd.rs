@@ -39,7 +39,7 @@ use std::fs;
 use std::io::Write;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const LOCK_FILE: &str = "dotfiles-manager.lock";
 /// The default bound of one external process. A fetch gets the whole bound.
@@ -2714,7 +2714,9 @@ fn upgrade(
     };
     let mut operations = Vec::new();
     for u in &updaters {
+        let clock = Instant::now();
         let mut row = updater::run(*u, &env);
+        let took = clock.elapsed();
         // A blocked updater ran no command, and a stopped run starts no more.
         if row.status != state::Status::Blocked && dfm_engine::signal::requested().is_none() {
             match tracked_status(&git, &checkouts) {
@@ -2781,11 +2783,13 @@ fn upgrade(
             (Some(b), _) => format!(" {}", visible(b)),
             _ => String::new(),
         };
+        // Every row has a time: a blocked or pending row can follow commands that ran.
         writeln!(
             out,
-            "  {} {}{versions}",
+            "  {} {}{versions} ({})",
             paint::status(ctx.color, &status),
-            u.name()
+            u.name(),
+            elapsed(took)
         )
         .map_err(w)?;
         for n in &row.notes {
@@ -2822,6 +2826,17 @@ fn upgrade(
         .map(|(s, n)| format!("{}={n}", status_name(*s)))
         .collect();
     Ok(Some(counts.join(" ")))
+}
+
+/// The wall time of one updater for its row: tenths of a second under 10 s, whole seconds above.
+fn elapsed(d: Duration) -> String {
+    // Round to tenths before the branch, so 9.96 s prints as 10 s, not 10.0 s.
+    let tenths = (d.as_millis() + 50) / 100;
+    if tenths < 100 {
+        format!("{}.{} s", tenths / 10, tenths % 10)
+    } else {
+        format!("{} s", d.as_secs().max(10))
+    }
 }
 
 fn untrusted_refusal(origins: &[&str]) -> Refusal {
@@ -2972,6 +2987,15 @@ mod tests {
             .filter(|s| s.starts_with("http.followRedirects="))
             .collect();
         assert_eq!(follow, [&"http.followRedirects=false"]);
+    }
+
+    #[test]
+    fn updater_time_has_tenths_below_ten_seconds_and_whole_seconds_above() {
+        assert_eq!(elapsed(Duration::from_millis(40)), "0.0 s");
+        assert_eq!(elapsed(Duration::from_millis(4_260)), "4.3 s");
+        assert_eq!(elapsed(Duration::from_millis(9_940)), "9.9 s");
+        assert_eq!(elapsed(Duration::from_millis(9_960)), "10 s");
+        assert_eq!(elapsed(Duration::from_millis(67_800)), "67 s");
     }
 
     #[test]
