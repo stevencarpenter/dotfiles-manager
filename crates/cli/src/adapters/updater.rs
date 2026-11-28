@@ -7,7 +7,7 @@ use dfm_model::Code;
 use dfm_model::lock::{Grants, NPM_REGISTRY, git_identity, trust_command};
 use dfm_model::state::Status;
 use dfm_model::updater::Updater;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -47,6 +47,188 @@ pub struct Env<'a> {
     /// `XDG_STATE_HOME` of the manager's own environment ([`xdg_state_home`]). The `skills` CLI
     /// keeps a second global record under it, which only a run with the variable reaches.
     pub xdg_state_home: Option<(String, String)>,
+    /// Told by `brew`, before its upgrade starts, which formulae of [`brew_formulae`] the
+    /// upgrade touches (docs/upgrade.md, "Order"), so an updater that needs none of them can
+    /// start while brew still runs. `None` tells nobody.
+    pub brew_plan: Option<&'a (dyn Fn(BTreeSet<String>) + Sync)>,
+}
+
+/// The formulae an updater that builds or fetches code can run against: interpreters, the
+/// libraries a build links, and git with ssh, which a git source or a credential helper runs.
+/// A name ending in `@*` matches every versioned formula of that name and the plain name.
+const BUILD: [&str; 13] = [
+    "openssl@*",
+    "python@*",
+    "readline",
+    "xz",
+    "zstd",
+    "sqlite",
+    "libffi",
+    "libyaml",
+    "gmp",
+    "pkgconf",
+    "llvm@*",
+    "git",
+    "openssh",
+];
+
+/// The formulae through which an updater that uses brew depends on it (docs/upgrade.md,
+/// "Order"): each plain name with its installed dependencies, each `@*` pattern by name. When
+/// `brew upgrade` touches none of them, the updater need not wait for brew to end. `None`:
+/// it waits (cargo links brew libraries, agents and side-channels run scripts), or it does not
+/// use brew at all.
+pub fn brew_formulae(u: Updater) -> Option<Vec<&'static str>> {
+    let with_build = |own: &[&'static str]| own.iter().chain(BUILD.iter()).copied().collect();
+    match u {
+        Updater::Mise | Updater::Go => Some(with_build(&["mise", "node@*"])),
+        // The skills CLI clones skill repositories with git.
+        Updater::Skills => Some(vec!["mise", "node@*", "git", "openssh"]),
+        Updater::Uv => Some(with_build(&["uv"])),
+        Updater::Npm => Some(with_build(&["node@*"])),
+        Updater::Lefthook => Some(vec!["lefthook", "git"]),
+        Updater::Checkouts | Updater::Codex => Some(vec!["git", "openssh"]),
+        Updater::Agents
+        | Updater::Brew
+        | Updater::Cargo
+        | Updater::Claude
+        | Updater::Opencode
+        | Updater::Rustup
+        | Updater::SideChannels => None,
+    }
+}
+
+#[cfg(test)]
+mod brew_names {
+    use super::*;
+
+    #[test]
+    fn patterns_name_versioned_formulae_and_taps_are_short() {
+        assert!(names("node@*", "node"));
+        assert!(names("node@*", "node@22"));
+        assert!(!names("node@*", "nodenv"));
+        assert!(names("git", "git"));
+        assert!(!names("git", "git-lfs"));
+        assert_eq!(short("charmbracelet/tap/crush"), "crush");
+        assert_eq!(short("git"), "git");
+        assert!(brew_formulae(Updater::Cargo).is_none());
+        assert!(brew_formulae(Updater::Npm).unwrap().contains(&"openssl@*"));
+        assert!(brew_formulae(Updater::Uv).unwrap().contains(&"git"));
+    }
+
+    #[test]
+    fn an_upgraded_dependency_of_a_versioned_formula_touches_its_pattern() {
+        let watched: BTreeSet<&str> = ["node@*", "git", "uv"].into();
+        let installed: BTreeSet<&str> = ["node", "node@22", "git", "libuv"].into();
+        let queried = formulae_of(&watched, &installed);
+        assert_eq!(queried.get("node@22"), Some(&vec!["node@*"]));
+        assert!(!queried.contains_key("libuv"));
+        let deps = "git: gettext pcre2\nnode: libuv icu4c@79\nnode@22: libuv\nuv: \n";
+        let up = |names: &[&str]| names.iter().map(|s| s.to_string()).collect::<BTreeSet<_>>();
+        let hit = hits(&watched, &queried, deps, &up(&["libuv"])).unwrap();
+        assert_eq!(hit, up(&["node@*"]));
+        let hit = hits(
+            &watched,
+            &queried,
+            deps,
+            &up(&["homebrew/core/uv"].map(short)),
+        )
+        .unwrap();
+        assert_eq!(hit, up(&["uv"]));
+        assert_eq!(hits(&watched, &queried, "other: x\n", &up(&["x"])), None);
+        assert_eq!(hits(&watched, &queried, "garbage\n", &up(&["x"])), None);
+    }
+}
+
+/// The short name of a formula: `user/tap/name` is `name`.
+fn short(name: &str) -> &str {
+    name.rsplit('/').next().unwrap_or(name)
+}
+
+/// Whether the watched entry `w` (a name or a `name@*` pattern) names formula `f`.
+fn names(w: &str, f: &str) -> bool {
+    match w.strip_suffix("@*") {
+        Some(stem) => f == stem || f.strip_prefix(stem).is_some_and(|r| r.starts_with('@')),
+        None => f == w,
+    }
+}
+
+/// Which entries of [`brew_formulae`] an upgrade of `upgrading` (short names) touches
+/// (`brew list --formula -1` and `brew deps --installed --for-each`, read by [`hits`]).
+/// `None` when brew cannot answer: then every dependent waits.
+fn touched(env: &Env, upgrading: &BTreeSet<String>) -> Option<BTreeSet<String>> {
+    let watched: BTreeSet<&str> = Updater::ALL
+        .into_iter()
+        .filter_map(brew_formulae)
+        .flatten()
+        .collect();
+    if upgrading.is_empty() {
+        return Some(BTreeSet::new());
+    }
+    let brew = |a: &[&str]| {
+        let out = call(
+            env.provider,
+            "brew",
+            &args(a),
+            &brew_env(false),
+            env.timeouts.short,
+        )
+        .ok()?;
+        String::from_utf8(out.stdout).ok()
+    };
+    let installed = brew(&["list", "--formula", "-1"])?;
+    let installed: BTreeSet<&str> = installed.lines().map(|l| short(l.trim())).collect();
+    let queried = formulae_of(&watched, &installed);
+    let mut a = vec!["deps", "--installed", "--for-each"];
+    a.extend(queried.keys().copied());
+    let deps = brew(&a)?;
+    hits(&watched, &queried, &deps, upgrading)
+}
+
+/// The formulae to read the dependencies of, each with the watched entries it stands for: a
+/// plain name stands for itself, and an installed formula that a `@*` pattern names stands for
+/// that pattern.
+fn formulae_of<'w>(
+    watched: &BTreeSet<&'w str>,
+    installed: &BTreeSet<&'w str>,
+) -> BTreeMap<&'w str, Vec<&'w str>> {
+    let mut map: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+    for w in watched {
+        if w.ends_with("@*") {
+            for f in installed.iter().filter(|f| names(w, f)) {
+                map.entry(*f).or_default().push(*w);
+            }
+        } else {
+            map.entry(*w).or_default().push(*w);
+        }
+    }
+    map
+}
+
+/// The watched entries an upgrade touches: one that names an upgraded formula, or one whose
+/// formula has an upgraded installed dependency in `deps` (`brew deps --for-each` lines,
+/// `<name>: <dep> ...`). `None` when a line cannot be read or names a formula not asked about.
+fn hits(
+    watched: &BTreeSet<&str>,
+    queried: &BTreeMap<&str, Vec<&str>>,
+    deps: &str,
+    upgrading: &BTreeSet<String>,
+) -> Option<BTreeSet<String>> {
+    let mut hit: BTreeSet<String> = watched
+        .iter()
+        .filter(|w| upgrading.iter().any(|f| names(w, f)))
+        .map(|w| w.to_string())
+        .collect();
+    for line in deps.lines().filter(|l| !l.trim().is_empty()) {
+        let (name, list) = line.split_once(':')?;
+        let entries = queried.get(short(name.trim()))?;
+        if list
+            .split_whitespace()
+            .any(|d| upgrading.contains(short(d)))
+        {
+            hit.extend(entries.iter().map(|e| e.to_string()));
+        }
+    }
+    Some(hit)
 }
 
 /// `SSH_AUTH_SOCK` of the manager's own environment, when it is set and UTF-8. Only the commands
@@ -576,6 +758,16 @@ fn brew(mut d: Draft, env: &Env) -> Row {
     }
     if before.is_empty() {
         return d.end(Status::Current);
+    }
+    if let Some(tell) = env.brew_plan {
+        let upgrading = before
+            .iter()
+            .filter(|o| o.kind == "formula")
+            .map(|o| short(&o.name).to_string())
+            .collect();
+        if let Some(t) = touched(env, &upgrading) {
+            tell(t);
+        }
     }
     // One call per kind, so a formula and a cask of one name are each upgraded as themselves. A
     // failed kind does not keep the other from its upgrade; the first failure is kept.
@@ -2410,6 +2602,7 @@ mod tests {
                 checkouts: &self.checkouts,
                 ssh_agent: self.ssh_agent.clone(),
                 xdg_state_home: self.xdg_state_home.clone(),
+                brew_plan: None,
             }
         }
 

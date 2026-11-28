@@ -4228,7 +4228,9 @@ printf 'brew %s\n' "$*" >> "$here/../st/log"
 case "$1" in
   update) exit 0 ;;
   outdated)
-    if [ -e "$here/../st/outdated-uv" ]; then
+    if [ -e "$here/../st/outdated-git" ]; then
+      echo '{"formulae":[{"name":"git","installed_versions":["2.56.1"],"current_version":"2.56.2"}],"casks":[]}'
+    elif [ -e "$here/../st/outdated-uv" ]; then
       echo '{"formulae":[{"name":"uv","installed_versions":["0.1"],"current_version":"0.2"}],"casks":[]}'
     elif [ -e "$here/../st/outdated-codex" ]; then
       echo '{"formulae":[],"casks":[{"name":"codex","installed_versions":["0.164.0"],"current_version":"0.165.0"}]}'
@@ -4236,11 +4238,16 @@ case "$1" in
       echo '{"formulae":[],"casks":[]}'
     fi ;;
   upgrade)
+    if [ -e "$here/../st/outdated-git" ]; then rm "$here/../st/outdated-git"; exit 0; fi
+    if [ -e "$here/../st/upgrade-ok" ]; then rm -f "$here/../st/outdated-uv"; exit 0; fi
     if [ -e "$here/../st/outdated-codex" ]; then
       rm "$here/../st/outdated-codex"; echo 'codex 0.165.0' > "$here/../st/list-codex"; exit 0
     fi
     touch "$here/../st/started-brew"; exec sleep 30 ;;
-  list) [ -n "$4" ] && [ -f "$here/../st/list-$4" ] && cat "$here/../st/list-$4" || exit 1 ;;
+  list)
+    if [ "$2 $3" = "--formula -1" ]; then cat "$here/../st/brew-installed" 2>/dev/null; exit 0; fi
+    [ -n "$4" ] && [ -f "$here/../st/list-$4" ] && cat "$here/../st/list-$4" || exit 1 ;;
+  deps) [ -f "$here/../st/brew-deps" ] && cat "$here/../st/brew-deps" || exit 1 ;;
   *) exit 64 ;;
 esac
 "#;
@@ -4957,6 +4964,80 @@ fn an_updater_that_writes_a_tracked_file_through_a_home_link_fails_and_names_the
     assert!(fs::read_to_string(&tracked).unwrap().ends_with("changed\n"));
 }
 
+/// Starts a sync whose `brew upgrade --formula uv` hangs, with `brew deps` printing `deps`,
+/// waits until codex ran beside it, then stops the run and returns its standard output.
+fn codex_beside_a_hanging_brew(deps: &str) -> String {
+    let u = Up::new(r#"["brew", "codex"]"#);
+    fs::write(u.st("outdated-uv"), "").unwrap();
+    fs::write(u.st("brew-deps"), deps).unwrap();
+    let child = u
+        .command(&[])
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let t0 = std::time::Instant::now();
+    // codex's step receipt is written when its row is recorded, so its row precedes the stop.
+    while !(u.st("started-brew").exists()
+        && u.fx.receipt_docs().iter().any(|r| {
+            r["command"] == "upgrade-step" && r["operations"][0]["resource"] == "updater:codex"
+        }))
+    {
+        assert!(t0.elapsed().as_secs() < 60, "{}", u.log());
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let kill = Command::new("/bin/kill")
+        .args(["-INT", &child.id().to_string()])
+        .status()
+        .unwrap();
+    assert!(kill.success());
+    let o = child.wait_with_output().unwrap();
+    assert_eq!(code(&o), 130, "{}", stdout(&o));
+    stdout(&o)
+}
+
+#[test]
+fn an_updater_whose_formulae_brew_does_not_touch_runs_beside_brew_upgrade() {
+    let s = codex_beside_a_hanging_brew(
+        "git: gettext pcre2\nlefthook: \nmise: \nopenssh: openssl@4\nuv: \nreadline: \n",
+    );
+    in_order(&s, &["  current codex", "  pending brew"]);
+}
+
+/// Runs `["brew", "codex"]` to its end and checks that codex started after brew's last command.
+fn codex_waits_for_brew(u: &Up) {
+    let o = u.sync(&[]);
+    assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
+    let log = u.log();
+    let brew_end = log.rfind("brew outdated").expect(&log);
+    assert!(log.find("codex update").expect(&log) > brew_end, "{log}");
+}
+
+#[test]
+fn an_updater_whose_formula_brew_upgrades_waits_for_brew() {
+    let u = Up::new(r#"["brew", "codex"]"#);
+    fs::write(u.st("outdated-git"), "").unwrap();
+    fs::write(u.st("brew-deps"), "git: gettext\n").unwrap();
+    codex_waits_for_brew(&u);
+}
+
+#[test]
+fn an_updater_whose_formula_depends_on_an_upgraded_one_waits_for_brew() {
+    let u = Up::new(r#"["brew", "codex"]"#);
+    fs::write(u.st("outdated-uv"), "").unwrap();
+    fs::write(u.st("upgrade-ok"), "").unwrap();
+    fs::write(u.st("brew-deps"), "git: gettext uv\n").unwrap();
+    codex_waits_for_brew(&u);
+}
+
+#[test]
+fn every_dependent_waits_for_brew_when_its_dependencies_cannot_be_read() {
+    // No `brew-deps` marker: the look-alike's `brew deps` exits 1.
+    let u = Up::new(r#"["brew", "codex"]"#);
+    fs::write(u.st("outdated-uv"), "").unwrap();
+    fs::write(u.st("upgrade-ok"), "").unwrap();
+    codex_waits_for_brew(&u);
+}
+
 /// A tracked file that changes while two updaters run is charged to both: each row fails and
 /// names the overlap, because the guard sees the change, not its author.
 #[test]
@@ -5366,8 +5447,12 @@ fn updaters_that_do_not_conflict_run_at_the_same_time() {
         .unwrap();
     // codex, declared after claude, runs and ends while claude update still runs.
     let t0 = std::time::Instant::now();
-    // codex reads its version before and after its update: the second read ends its row.
-    while !(u.st("started-claude").exists() && u.log().matches("codex --version").count() >= 2) {
+    // codex's step receipt is written when its row is recorded, so its row precedes the stop.
+    while !(u.st("started-claude").exists()
+        && u.fx.receipt_docs().iter().any(|r| {
+            r["command"] == "upgrade-step" && r["operations"][0]["resource"] == "updater:codex"
+        }))
+    {
         assert!(
             t0.elapsed().as_secs() < 60,
             "codex did not run beside claude\n{}",
