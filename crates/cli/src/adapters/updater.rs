@@ -53,10 +53,10 @@ pub struct Env<'a> {
     pub brew_plan: Option<&'a (dyn Fn(BTreeSet<String>) + Sync)>,
 }
 
-/// The formulae an updater that builds code can compile or run against: interpreters and the
-/// libraries a build links. A name ending in `@*` matches every versioned formula of that name
-/// and the plain name.
-const BUILD: [&str; 11] = [
+/// The formulae an updater that builds or fetches code can run against: interpreters, the
+/// libraries a build links, and git with ssh, which a git source or a credential helper runs.
+/// A name ending in `@*` matches every versioned formula of that name and the plain name.
+const BUILD: [&str; 13] = [
     "openssl@*",
     "python@*",
     "readline",
@@ -68,6 +68,8 @@ const BUILD: [&str; 11] = [
     "gmp",
     "pkgconf",
     "llvm@*",
+    "git",
+    "openssh",
 ];
 
 /// The formulae through which an updater that uses brew depends on it (docs/upgrade.md,
@@ -79,7 +81,8 @@ pub fn brew_formulae(u: Updater) -> Option<Vec<&'static str>> {
     let with_build = |own: &[&'static str]| own.iter().chain(BUILD.iter()).copied().collect();
     match u {
         Updater::Mise | Updater::Go => Some(with_build(&["mise", "node@*"])),
-        Updater::Skills => Some(vec!["mise", "node@*"]),
+        // The skills CLI clones skill repositories with git.
+        Updater::Skills => Some(vec!["mise", "node@*", "git", "openssh"]),
         Updater::Uv => Some(with_build(&["uv"])),
         Updater::Npm => Some(with_build(&["node@*"])),
         Updater::Lefthook => Some(vec!["lefthook", "git"]),
@@ -109,6 +112,7 @@ mod brew_names {
         assert_eq!(short("git"), "git");
         assert!(brew_formulae(Updater::Cargo).is_none());
         assert!(brew_formulae(Updater::Npm).unwrap().contains(&"openssl@*"));
+        assert!(brew_formulae(Updater::Uv).unwrap().contains(&"git"));
     }
 
     #[test]
