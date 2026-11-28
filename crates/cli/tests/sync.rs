@@ -4244,7 +4244,9 @@ case "$1" in
       rm "$here/../st/outdated-codex"; echo 'codex 0.165.0' > "$here/../st/list-codex"; exit 0
     fi
     touch "$here/../st/started-brew"; exec sleep 30 ;;
-  list) [ -n "$4" ] && [ -f "$here/../st/list-$4" ] && cat "$here/../st/list-$4" || exit 1 ;;
+  list)
+    if [ "$2 $3" = "--formula -1" ]; then cat "$here/../st/brew-installed" 2>/dev/null; exit 0; fi
+    [ -n "$4" ] && [ -f "$here/../st/list-$4" ] && cat "$here/../st/list-$4" || exit 1 ;;
   deps) [ -f "$here/../st/brew-deps" ] && cat "$here/../st/brew-deps" || exit 1 ;;
   *) exit 64 ;;
 esac
@@ -4974,7 +4976,12 @@ fn codex_beside_a_hanging_brew(deps: &str) -> String {
         .spawn()
         .unwrap();
     let t0 = std::time::Instant::now();
-    while !(u.st("started-brew").exists() && u.log().matches("codex --version").count() >= 2) {
+    // codex's step receipt is written when its row is recorded, so its row precedes the stop.
+    while !(u.st("started-brew").exists()
+        && u.fx.receipt_docs().iter().any(|r| {
+            r["command"] == "upgrade-step" && r["operations"][0]["resource"] == "updater:codex"
+        }))
+    {
         assert!(t0.elapsed().as_secs() < 60, "{}", u.log());
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
@@ -5440,8 +5447,12 @@ fn updaters_that_do_not_conflict_run_at_the_same_time() {
         .unwrap();
     // codex, declared after claude, runs and ends while claude update still runs.
     let t0 = std::time::Instant::now();
-    // codex reads its version before and after its update: the second read ends its row.
-    while !(u.st("started-claude").exists() && u.log().matches("codex --version").count() >= 2) {
+    // codex's step receipt is written when its row is recorded, so its row precedes the stop.
+    while !(u.st("started-claude").exists()
+        && u.fx.receipt_docs().iter().any(|r| {
+            r["command"] == "upgrade-step" && r["operations"][0]["resource"] == "updater:codex"
+        }))
+    {
         assert!(
             t0.elapsed().as_secs() < 60,
             "codex did not run beside claude\n{}",

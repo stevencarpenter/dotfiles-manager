@@ -7,7 +7,7 @@ use dfm_model::Code;
 use dfm_model::lock::{Grants, NPM_REGISTRY, git_identity, trust_command};
 use dfm_model::state::Status;
 use dfm_model::updater::Updater;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -110,6 +110,29 @@ mod brew_names {
         assert!(brew_formulae(Updater::Cargo).is_none());
         assert!(brew_formulae(Updater::Npm).unwrap().contains(&"openssl@*"));
     }
+
+    #[test]
+    fn an_upgraded_dependency_of_a_versioned_formula_touches_its_pattern() {
+        let watched: BTreeSet<&str> = ["node@*", "git", "uv"].into();
+        let installed: BTreeSet<&str> = ["node", "node@22", "git", "libuv"].into();
+        let queried = formulae_of(&watched, &installed);
+        assert_eq!(queried.get("node@22"), Some(&vec!["node@*"]));
+        assert!(!queried.contains_key("libuv"));
+        let deps = "git: gettext pcre2\nnode: libuv icu4c@79\nnode@22: libuv\nuv: \n";
+        let up = |names: &[&str]| names.iter().map(|s| s.to_string()).collect::<BTreeSet<_>>();
+        let hit = hits(&watched, &queried, deps, &up(&["libuv"])).unwrap();
+        assert_eq!(hit, up(&["node@*"]));
+        let hit = hits(
+            &watched,
+            &queried,
+            deps,
+            &up(&["homebrew/core/uv"].map(short)),
+        )
+        .unwrap();
+        assert_eq!(hit, up(&["uv"]));
+        assert_eq!(hits(&watched, &queried, "other: x\n", &up(&["x"])), None);
+        assert_eq!(hits(&watched, &queried, "garbage\n", &up(&["x"])), None);
+    }
 }
 
 /// The short name of a formula: `user/tap/name` is `name`.
@@ -125,51 +148,80 @@ fn names(w: &str, f: &str) -> bool {
     }
 }
 
-/// Which entries of [`brew_formulae`] an upgrade of `upgrading` (short names) touches: a
-/// pattern that names an upgraded formula, a plain name that is upgraded, or a plain name with
-/// an upgraded installed dependency (`brew deps --installed --for-each`). `None` when the
-/// dependencies cannot be read: then every dependent waits.
+/// Which entries of [`brew_formulae`] an upgrade of `upgrading` (short names) touches
+/// (`brew list --formula -1` and `brew deps --installed --for-each`, read by [`hits`]).
+/// `None` when brew cannot answer: then every dependent waits.
 fn touched(env: &Env, upgrading: &BTreeSet<String>) -> Option<BTreeSet<String>> {
     let watched: BTreeSet<&str> = Updater::ALL
         .into_iter()
         .filter_map(brew_formulae)
         .flatten()
         .collect();
+    if upgrading.is_empty() {
+        return Some(BTreeSet::new());
+    }
+    let brew = |a: &[&str]| {
+        let out = call(
+            env.provider,
+            "brew",
+            &args(a),
+            &brew_env(false),
+            env.timeouts.short,
+        )
+        .ok()?;
+        String::from_utf8(out.stdout).ok()
+    };
+    let installed = brew(&["list", "--formula", "-1"])?;
+    let installed: BTreeSet<&str> = installed.lines().map(|l| short(l.trim())).collect();
+    let queried = formulae_of(&watched, &installed);
+    let mut a = vec!["deps", "--installed", "--for-each"];
+    a.extend(queried.keys().copied());
+    let deps = brew(&a)?;
+    hits(&watched, &queried, &deps, upgrading)
+}
+
+/// The formulae to read the dependencies of, each with the watched entries it stands for: a
+/// plain name stands for itself, and an installed formula that a `@*` pattern names stands for
+/// that pattern.
+fn formulae_of<'w>(
+    watched: &BTreeSet<&'w str>,
+    installed: &BTreeSet<&'w str>,
+) -> BTreeMap<&'w str, Vec<&'w str>> {
+    let mut map: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+    for w in watched {
+        if w.ends_with("@*") {
+            for f in installed.iter().filter(|f| names(w, f)) {
+                map.entry(*f).or_default().push(*w);
+            }
+        } else {
+            map.entry(*w).or_default().push(*w);
+        }
+    }
+    map
+}
+
+/// The watched entries an upgrade touches: one that names an upgraded formula, or one whose
+/// formula has an upgraded installed dependency in `deps` (`brew deps --for-each` lines,
+/// `<name>: <dep> ...`). `None` when a line cannot be read or names a formula not asked about.
+fn hits(
+    watched: &BTreeSet<&str>,
+    queried: &BTreeMap<&str, Vec<&str>>,
+    deps: &str,
+    upgrading: &BTreeSet<String>,
+) -> Option<BTreeSet<String>> {
     let mut hit: BTreeSet<String> = watched
         .iter()
         .filter(|w| upgrading.iter().any(|f| names(w, f)))
         .map(|w| w.to_string())
         .collect();
-    let plain: Vec<&str> = watched
-        .iter()
-        .copied()
-        .filter(|w| !w.ends_with("@*"))
-        .collect();
-    if upgrading.is_empty() || plain.is_empty() {
-        return Some(hit);
-    }
-    let mut a = args(&["deps", "--installed", "--for-each"]);
-    a.extend(plain.iter().map(|s| s.to_string()));
-    let out = call(
-        env.provider,
-        "brew",
-        &a,
-        &brew_env(false),
-        env.timeouts.short,
-    )
-    .ok()?;
-    let text = String::from_utf8(out.stdout).ok()?;
-    for line in text.lines().filter(|l| !l.trim().is_empty()) {
-        let (name, deps) = line.split_once(':')?;
-        let name = short(name.trim());
-        if !plain.contains(&name) {
-            return None;
-        }
-        if deps
+    for line in deps.lines().filter(|l| !l.trim().is_empty()) {
+        let (name, list) = line.split_once(':')?;
+        let entries = queried.get(short(name.trim()))?;
+        if list
             .split_whitespace()
             .any(|d| upgrading.contains(short(d)))
         {
-            hit.insert(name.to_string());
+            hit.extend(entries.iter().map(|e| e.to_string()));
         }
     }
     Some(hit)
