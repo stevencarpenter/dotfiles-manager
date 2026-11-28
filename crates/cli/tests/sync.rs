@@ -4333,14 +4333,16 @@ impl Up {
 }
 
 #[test]
-fn sync_runs_the_declared_updaters_in_order() {
+fn sync_runs_the_declared_updaters() {
     let u = Up::new(r#"["claude", "brew"]"#);
     fs::write(u.st("next-claude"), "2.1.312 (Claude Code)\n").unwrap();
     let o = u.sync(&[]);
     assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
     let log = u.log();
-    let first_brew = log.find("brew update").expect(&log);
-    assert!(log.find("claude update").expect(&log) < first_brew, "{log}");
+    assert!(
+        log.contains("claude update") && log.contains("brew update"),
+        "{log}"
+    );
     let s = stdout(&o);
     assert!(
         s.contains("  updated claude 2.1.311 (Claude Code) -> 2.1.312 (Claude Code)"),
@@ -4365,11 +4367,11 @@ fn sync_runs_the_declared_updaters_in_order() {
     assert!(published < s.find("  updated claude").expect(&s), "{s}");
 }
 
-/// DFM-85: the `mise`, `rustup`, `uv` and `npm` updaters run in the declared order through
+/// DFM-85: the `mise`, `rustup`, `uv` and `npm` updaters run (at the same time: none uses another's tool) through
 /// look-alikes that exit as the real listings do (`rustup check` 100 and `npm outdated` 1 when
 /// there is work). No updater needs a grant; `npm` itself is held.
 #[test]
-fn sync_runs_the_mise_rustup_uv_and_npm_updaters_in_order() {
+fn sync_runs_the_mise_rustup_uv_and_npm_updaters() {
     let u = Up::new(r#"["mise", "rustup", "uv", "npm"]"#);
     let st = u.fake.path().join("st");
     let exe = |p: &Path, body: &str| {
@@ -4449,10 +4451,14 @@ fn sync_runs_the_mise_rustup_uv_and_npm_updaters_in_order() {
             .any(|v| v == "go 1.27.3 -> 1.27.4 upgraded")
     );
     let log = u.log();
-    let at = |c: &str| log.find(c).unwrap_or_else(|| panic!("{c}\n{log}"));
-    assert!(at("mise upgrade") < at("rustup update"), "{log}");
-    assert!(at("rustup update") < at("uv tool upgrade a"), "{log}");
-    assert!(at("uv tool upgrade a") < at("npm update -g x\n"), "{log}");
+    for c in [
+        "mise upgrade",
+        "rustup update",
+        "uv tool upgrade a",
+        "npm update -g x\n",
+    ] {
+        assert!(log.contains(c), "{c}\n{log}");
+    }
     assert!(s.contains("  upgrade: updated=4"), "{s}");
     // A second run finds nothing to do.
     u.clear_log();
@@ -4907,7 +4913,8 @@ fn a_failing_lefthook_install_in_the_bound_checkout_does_not_stop_the_next_updat
     let root = u.fx.root.canonicalize().unwrap();
     let log = u.log();
     assert!(
-        log.starts_with(&format!("lefthook install | pwd={}\n", root.display())),
+        log.lines()
+            .any(|l| l == format!("lefthook install | pwd={}", root.display())),
         "{log}"
     );
     assert!(log.contains("claude update"), "{log}");
@@ -4918,7 +4925,7 @@ fn a_failing_lefthook_install_in_the_bound_checkout_does_not_stop_the_next_updat
 /// checkout, not the link (docs/upgrade.md, "Tracked files").
 #[test]
 fn an_updater_that_writes_a_tracked_file_through_a_home_link_fails_and_names_the_checkout_path() {
-    let u = Up::new(r#"["claude", "codex"]"#);
+    let u = Up::new(r#"["claude"]"#);
     let o = u.sync(&["--no-upgrade"]);
     assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
     let link = u.fx.h(".config/git/config");
@@ -4941,7 +4948,6 @@ fn an_updater_that_writes_a_tracked_file_through_a_home_link_fails_and_names_the
     };
     assert!(named(&u.fx.root) || named(&root), "{s}");
     assert!(!s.contains(&link.display().to_string()), "{s}");
-    assert!(s.contains("  current codex"), "{s}");
     assert!(
         fs::symlink_metadata(&link)
             .unwrap()
@@ -4951,12 +4957,53 @@ fn an_updater_that_writes_a_tracked_file_through_a_home_link_fails_and_names_the
     assert!(fs::read_to_string(&tracked).unwrap().ends_with("changed\n"));
 }
 
+/// A tracked file that changes while two updaters run is charged to both: each row fails and
+/// names the overlap, because the guard sees the change, not its author.
+#[test]
+fn a_tracked_change_while_updaters_overlap_fails_each_of_them() {
+    let u = Up::new(r#"["claude", "codex"]"#);
+    let o = u.sync(&["--no-upgrade"]);
+    assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
+    let tracked = u.fx.root.join("profiles/t-01.toml");
+    fs::write(u.st("write-claude"), tracked.to_str().unwrap()).unwrap();
+    fs::write(u.st("hang-codex"), "").unwrap();
+    let child = u
+        .command(&[])
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    // claude's step receipt is written after the snapshot that saw its change.
+    let t0 = std::time::Instant::now();
+    while !(u.st("started-codex").exists()
+        && u.fx.receipt_docs().iter().any(|r| {
+            r["command"] == "upgrade-step" && r["operations"][0]["resource"] == "updater:claude"
+        }))
+    {
+        assert!(
+            t0.elapsed().as_secs() < 60,
+            "claude never ended beside codex\n{}",
+            u.log()
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let kill = Command::new("/bin/kill")
+        .args(["-INT", &child.id().to_string()])
+        .status()
+        .unwrap();
+    assert!(kill.success());
+    let o = child.wait_with_output().unwrap();
+    let s = stdout(&o);
+    assert_eq!(code(&o), 130, "{s}");
+    let note = "profiles/t-01.toml changed (M) while claude, codex ran; it is left in place, not reverted, staged or committed";
+    in_order(&s, &["  failed claude", note, "  failed codex", note]);
+    assert!(s.contains("  upgrade: failed=2"), "{s}");
+}
+
 /// DFM-25 (C05, G5): an updater that changes a tracked file in the bound checkout fails its
-/// row with the file named. The change stays, unstaged and uncommitted, and the next updater
-/// still runs.
+/// row with the file named. The change stays, unstaged and uncommitted.
 #[test]
 fn an_updater_that_changes_a_tracked_file_fails_its_row_and_leaves_the_change() {
-    let u = Up::new(r#"["claude", "codex"]"#);
+    let u = Up::new(r#"["claude"]"#);
     let o = u.sync(&["--no-upgrade"]);
     assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
     let tracked = u.fx.root.join("profiles/t-01.toml");
@@ -4977,8 +5024,7 @@ fn an_updater_that_changes_a_tracked_file_fails_its_row_and_leaves_the_change() 
         ),
         "{s}"
     );
-    assert!(s.contains("  current codex"), "{s}");
-    assert!(s.contains("  upgrade: current=1 failed=1"), "{s}");
+    assert!(s.contains("  upgrade: failed=1"), "{s}");
     assert!(s.contains("\nwarning: upgrade claude failed: "), "{s}");
     assert_eq!(
         fs::read_to_string(&tracked).unwrap(),
@@ -5188,7 +5234,8 @@ fn a_grant_without_a_digest_runs_no_updater() {
 
 #[test]
 fn a_completed_updater_is_auditable_after_a_hard_stop() {
-    let u = Up::new(r#"["claude", "codex"]"#);
+    // side-channels conflicts with every updater, so it waits for claude and never starts.
+    let u = Up::new(r#"["claude", "side-channels"]"#);
     let o = u
         .command_env(&[("DFM_FAILPOINT", "sync-after-upgrade-step:abort")], &[])
         .output()
@@ -5206,7 +5253,6 @@ fn a_completed_updater_is_auditable_after_a_hard_stop() {
         steps[0]["operations"][0]["upgrade"]["after_version"],
         "2.1.311 (Claude Code)"
     );
-    assert!(!u.log().contains("codex update"));
 }
 
 #[test]
@@ -5263,18 +5309,22 @@ fn the_upgrade_receipt_records_each_updater() {
     assert_eq!(r[0]["result"]["exit_code"], 1);
 }
 
-/// Starts a plain sync, waits until `claude update` started, sends SIGINT and returns the run.
+/// Starts a plain sync, waits until `claude update` and `codex update` both started (they do
+/// not conflict, so they run at the same time), sends SIGINT and returns the run.
 fn interrupted(u: &Up) -> Output {
     fs::write(u.st("hang-claude"), "").unwrap();
+    fs::write(u.st("hang-codex"), "").unwrap();
     let child = u
         .command(&[])
         .stdout(std::process::Stdio::piped())
         .spawn()
         .unwrap();
-    let started = u.st("started-claude");
     let t0 = std::time::Instant::now();
-    while !started.exists() {
-        assert!(t0.elapsed().as_secs() < 60, "claude update never started");
+    while !(u.st("started-claude").exists() && u.st("started-codex").exists()) {
+        assert!(
+            t0.elapsed().as_secs() < 60,
+            "claude and codex update never both started"
+        );
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
     let kill = Command::new("/bin/kill")
@@ -5283,8 +5333,14 @@ fn interrupted(u: &Up) -> Output {
         .unwrap();
     assert!(kill.success());
     let o = child.wait_with_output().unwrap();
-    fs::remove_file(u.st("hang-claude")).unwrap();
-    fs::remove_file(started).unwrap();
+    for name in [
+        "hang-claude",
+        "hang-codex",
+        "started-claude",
+        "started-codex",
+    ] {
+        fs::remove_file(u.st(name)).unwrap();
+    }
     o
 }
 
@@ -5296,8 +5352,80 @@ fn assert_stopped(u: &Up, o: &Output) {
     assert!(s.contains("  pending codex"), "{s}");
     assert!(s.contains("\nwarning: upgrade claude pending"), "{s}");
     assert!(s.contains("\nwarning: upgrade codex pending"), "{s}");
-    assert!(!u.log().contains("codex update"), "{}", u.log());
     assert_eq!(u.upgrade_receipts().len(), 1);
+}
+
+#[test]
+fn updaters_that_do_not_conflict_run_at_the_same_time() {
+    let u = Up::new(r#"["claude", "codex"]"#);
+    fs::write(u.st("hang-claude"), "").unwrap();
+    let child = u
+        .command(&[])
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    // codex, declared after claude, runs and ends while claude update still runs.
+    let t0 = std::time::Instant::now();
+    // codex reads its version before and after its update: the second read ends its row.
+    while !(u.st("started-claude").exists() && u.log().matches("codex --version").count() >= 2) {
+        assert!(
+            t0.elapsed().as_secs() < 60,
+            "codex did not run beside claude\n{}",
+            u.log()
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let kill = Command::new("/bin/kill")
+        .args(["-INT", &child.id().to_string()])
+        .status()
+        .unwrap();
+    assert!(kill.success());
+    let o = child.wait_with_output().unwrap();
+    let s = stdout(&o);
+    assert_eq!(code(&o), 130, "{s}");
+    in_order(&s, &["  current codex", "  pending claude"]);
+    // The receipt keeps the declared order.
+    let r = u.upgrade_receipts();
+    let ops: Vec<&str> = r[0]["operations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|o| o["resource"].as_str().unwrap())
+        .collect();
+    assert_eq!(ops, ["updater:claude", "updater:codex"]);
+}
+
+#[test]
+fn a_stop_leaves_the_updaters_that_wait_for_a_conflict_unstarted() {
+    // checkouts runs git from the provider path, which brew may replace, so it waits for brew.
+    let u = Up::new(r#"["brew", "checkouts"]"#);
+    fs::write(u.st("outdated-uv"), "").unwrap();
+    let child = u
+        .command(&[])
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let t0 = std::time::Instant::now();
+    while !u.st("started-brew").exists() {
+        assert!(t0.elapsed().as_secs() < 60, "brew upgrade never started");
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let kill = Command::new("/bin/kill")
+        .args(["-INT", &child.id().to_string()])
+        .status()
+        .unwrap();
+    assert!(kill.success());
+    let o = child.wait_with_output().unwrap();
+    let s = stdout(&o);
+    assert_eq!(code(&o), 130, "{s}");
+    in_order(
+        &s,
+        &[
+            "  pending brew",
+            "  pending checkouts (0.0 s)",
+            "    note: not started: the run was stopped",
+        ],
+    );
 }
 
 #[test]

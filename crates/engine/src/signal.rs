@@ -22,7 +22,7 @@ use dfm_model::{Code, Refusal};
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
 #[cfg(feature = "failpoints")]
-use std::cell::Cell;
+use std::sync::Arc;
 
 const NONE: u8 = 0;
 const INT: u8 = 1;
@@ -37,14 +37,47 @@ static INSTALLED: AtomicBool = AtomicBool::new(false);
 #[cfg(feature = "failpoints")]
 thread_local! {
     /// A stop request made by a test on this thread only, so one test can end its own run
-    /// without stopping the tests that run in parallel in the same process.
-    static SIMULATED: Cell<u8> = const { Cell::new(NONE) };
+    /// without stopping the tests that run in parallel in the same process. A thread that a run
+    /// starts shares its starter's cell ([`Seam`]).
+    static SIMULATED: std::cell::RefCell<Arc<AtomicU8>> =
+        std::cell::RefCell::new(Arc::new(AtomicU8::new(NONE)));
 }
 
-/// Test seam: ends the next check of this thread as if SIGTERM (`term`) or SIGINT arrived.
+/// Test seam: ends the next check of this thread, and of the threads that adopted its
+/// [`Seam`], as if SIGTERM (`term`) or SIGINT arrived.
 #[cfg(feature = "failpoints")]
 pub fn simulate(term: bool) {
-    SIMULATED.with(|s| s.set(if term { TERM } else { INT }));
+    SIMULATED.with(|s| {
+        s.borrow()
+            .store(if term { TERM } else { INT }, Ordering::SeqCst)
+    });
+}
+
+/// The simulated stop of the current thread, for a thread the run starts (the concurrent
+/// updaters): [`Seam::adopt`] on that thread makes it see a stop that a test simulates on this
+/// one. Without the `failpoints` feature it holds nothing and adopting it does nothing.
+#[derive(Clone, Debug, Default)]
+pub struct Seam {
+    #[cfg(feature = "failpoints")]
+    cell: Option<Arc<AtomicU8>>,
+}
+
+/// The current thread's [`Seam`].
+pub fn seam() -> Seam {
+    Seam {
+        #[cfg(feature = "failpoints")]
+        cell: Some(SIMULATED.with(|s| Arc::clone(&s.borrow()))),
+    }
+}
+
+impl Seam {
+    /// Makes the current thread share the simulated stop of the thread that made this seam.
+    pub fn adopt(self) {
+        #[cfg(feature = "failpoints")]
+        if let Some(cell) = self.cell {
+            SIMULATED.with(|s| *s.borrow_mut() = cell);
+        }
+    }
 }
 
 /// Test seam: makes [`install`] fail when it sets the SIGTERM action, after SIGINT is set.
@@ -58,7 +91,7 @@ pub static FAIL_RESTORE: AtomicBool = AtomicBool::new(false);
 
 fn first() -> u8 {
     #[cfg(feature = "failpoints")]
-    if let n @ (INT | TERM) = SIMULATED.with(Cell::get) {
+    if let n @ (INT | TERM) = SIMULATED.with(|s| s.borrow().load(Ordering::SeqCst)) {
         return n;
     }
     FIRST.load(Ordering::SeqCst)

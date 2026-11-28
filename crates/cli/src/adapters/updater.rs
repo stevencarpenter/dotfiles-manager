@@ -98,6 +98,22 @@ pub struct Row {
     pub finished_at: String,
 }
 
+impl Row {
+    /// The row of an updater whose code panicked: `failed`, with no version.
+    pub fn panicked(u: Updater) -> Row {
+        let at = now();
+        Row {
+            updater: u,
+            status: Status::Failed,
+            before: None,
+            after: None,
+            notes: vec!["the updater ended with an internal error (a panic)".into()],
+            started_at: at.clone(),
+            finished_at: at,
+        }
+    }
+}
+
 /// Where each native tool's own installer puts it, relative to HOME.
 fn owner_dir(u: Updater) -> Option<&'static str> {
     match u {
