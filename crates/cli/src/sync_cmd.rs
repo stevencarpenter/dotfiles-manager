@@ -2387,6 +2387,7 @@ fn updater_env<'a>(
         checkouts,
         ssh_agent: updater::ssh_agent(),
         xdg_state_home: updater::xdg_state_home(),
+        brew_plan: None,
     }
 }
 
@@ -2683,7 +2684,17 @@ fn upgrade(
         nested_paths(root).as_deref(),
         &|root, rel| git_ignores(&git, root, rel),
     );
-    let env = updater_env(ctx, &runner, root, &grants, &declared);
+    let mut env = updater_env(ctx, &runner, root, &grants, &declared);
+    // brew says which formulae its upgrade touches before it starts; see `Msg::Brew`.
+    let (tx, rx) = mpsc::channel::<Msg>();
+    let tell = {
+        let tx = tx.clone();
+        move |touched: BTreeSet<String>| {
+            // The receiver lives until every worker of the scope ended.
+            let _ = tx.send(Msg::Brew(touched));
+        }
+    };
+    env.brew_plan = Some(&tell);
     // The tracked-file guard (DFM-25, G5): the tracked changes before the updaters, compared
     // after each one that ran. A change it made fails its row and stays in place.
     let mut tracked = tracked_status(&git, &checkouts)?;
@@ -2726,8 +2737,10 @@ fn upgrade(
     // The first error of the step itself (a receipt that cannot be written, failed output). No
     // updater starts after it; the running ones end and are recorded, then the step fails.
     let mut halted: Option<Refusal> = None;
+    // What brew's upgrade touches, once brew said it: an updater that needs none of those
+    // formulae (`updater::brew_formulae`) does not wait for brew.
+    let mut touched: Option<BTreeSet<String>> = None;
     std::thread::scope(|s| {
-        let (tx, rx) = mpsc::channel::<(usize, updater::Row, Duration)>();
         let mut ready = std::collections::VecDeque::new();
         // Rows whose guard read failed while brew ran, read again when brew ends.
         let mut parked: Vec<(usize, updater::Row, Duration)> = Vec::new();
@@ -2747,7 +2760,14 @@ fn upgrade(
                     continue;
                 }
                 let u = updaters[i];
-                if (0..i).any(|j| slots[j] != Slot::Done && updaters[j].conflicts(u)) {
+                let released = touched.as_ref().is_some_and(|t| {
+                    updater::brew_formulae(u).is_some_and(|f| f.iter().all(|x| !t.contains(*x)))
+                });
+                if (0..i).any(|j| {
+                    slots[j] != Slot::Done
+                        && updaters[j].conflicts(u)
+                        && !(released && updaters[j] == Updater::Brew && slots[j] == Slot::Running)
+                }) {
                     continue;
                 }
                 slots[i] = Slot::Running;
@@ -2768,7 +2788,7 @@ fn upgrade(
                     }))
                     .unwrap_or_else(|_| updater::Row::panicked(u, started_at));
                     // The receiver lives until every worker of the scope ended.
-                    let _ = tx.send((i, row, clock.elapsed()));
+                    let _ = tx.send(Msg::Row(i, row, clock.elapsed()));
                 });
             }
             if left == 0 {
@@ -2776,9 +2796,16 @@ fn upgrade(
             }
             let (i, mut row, took) = match ready.pop_front() {
                 Some(next) => next,
-                None => rx
+                None => match rx
                     .recv()
-                    .expect("this thread holds a sender, so the channel stays open"),
+                    .expect("this thread holds a sender, so the channel stays open")
+                {
+                    Msg::Row(i, row, took) => (i, row, took),
+                    Msg::Brew(t) => {
+                        touched = Some(t);
+                        continue;
+                    }
+                },
             };
             let u = updaters[i];
             let stopped = dfm_engine::signal::requested().is_some();
@@ -2919,6 +2946,14 @@ fn upgrade(
         .map(|(s, n)| format!("{}={n}", status_name(*s)))
         .collect();
     Ok(Some(counts.join(" ")))
+}
+
+/// What a worker tells the coordinating thread of the upgrade step.
+enum Msg {
+    /// An updater ended: its declared index, its row and its wall time.
+    Row(usize, updater::Row, Duration),
+    /// brew is about to upgrade, touching these formulae of `updater::brew_formulae`.
+    Brew(BTreeSet<String>),
 }
 
 /// Where one updater of the upgrade step is.

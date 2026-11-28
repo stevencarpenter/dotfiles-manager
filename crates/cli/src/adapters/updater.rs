@@ -47,6 +47,76 @@ pub struct Env<'a> {
     /// `XDG_STATE_HOME` of the manager's own environment ([`xdg_state_home`]). The `skills` CLI
     /// keeps a second global record under it, which only a run with the variable reaches.
     pub xdg_state_home: Option<(String, String)>,
+    /// Told by `brew`, before its upgrade starts, which formulae of [`brew_formulae`] the
+    /// upgrade touches (docs/upgrade.md, "Order"), so an updater that needs none of them can
+    /// start while brew still runs. `None` tells nobody.
+    pub brew_plan: Option<&'a (dyn Fn(BTreeSet<String>) + Sync)>,
+}
+
+/// The formulae through which an updater that uses brew depends on it (docs/upgrade.md,
+/// "Order"), with their installed dependencies: when `brew upgrade` touches none of them, the
+/// updater need not wait for brew to end. `None`: it waits (cargo links brew libraries, agents
+/// and side-channels run scripts), or it does not use brew at all.
+pub fn brew_formulae(u: Updater) -> Option<&'static [&'static str]> {
+    match u {
+        Updater::Mise | Updater::Go | Updater::Skills => Some(&["mise", "node"]),
+        Updater::Uv => Some(&["uv"]),
+        Updater::Npm => Some(&["node"]),
+        Updater::Lefthook => Some(&["lefthook", "git"]),
+        Updater::Checkouts | Updater::Codex => Some(&["git", "openssh"]),
+        Updater::Agents
+        | Updater::Brew
+        | Updater::Cargo
+        | Updater::Claude
+        | Updater::Opencode
+        | Updater::Rustup
+        | Updater::SideChannels => None,
+    }
+}
+
+/// Which of the formulae in [`brew_formulae`] an upgrade of `upgrading` touches: the formula
+/// itself, or one of its installed dependencies (`brew deps --installed --for-each`). `None`
+/// when the dependencies cannot be read: then every dependent waits.
+fn touched(env: &Env, upgrading: &BTreeSet<String>) -> Option<BTreeSet<String>> {
+    let watched: BTreeSet<&str> = Updater::ALL
+        .into_iter()
+        .filter_map(brew_formulae)
+        .flatten()
+        .copied()
+        .collect();
+    if upgrading.is_empty() {
+        return Some(BTreeSet::new());
+    }
+    let mut a = args(&["deps", "--installed", "--for-each"]);
+    a.extend(watched.iter().map(|s| s.to_string()));
+    let out = call(
+        env.provider,
+        "brew",
+        &a,
+        &brew_env(false),
+        env.timeouts.short,
+    )
+    .ok()?;
+    let text = String::from_utf8(out.stdout).ok()?;
+    let mut hit = BTreeSet::new();
+    for line in text.lines() {
+        let (name, deps) = line.split_once(':')?;
+        let name = name.trim();
+        if !watched.contains(name) {
+            return None;
+        }
+        if upgrading.contains(name) || deps.split_whitespace().any(|d| upgrading.contains(d)) {
+            hit.insert(name.to_string());
+        }
+    }
+    // A watched formula that brew did not list is not installed; one being upgraded still counts.
+    hit.extend(
+        watched
+            .iter()
+            .filter(|w| upgrading.contains(**w))
+            .map(|w| w.to_string()),
+    );
+    Some(hit)
 }
 
 /// `SSH_AUTH_SOCK` of the manager's own environment, when it is set and UTF-8. Only the commands
@@ -576,6 +646,16 @@ fn brew(mut d: Draft, env: &Env) -> Row {
     }
     if before.is_empty() {
         return d.end(Status::Current);
+    }
+    if let Some(tell) = env.brew_plan {
+        let upgrading = before
+            .iter()
+            .filter(|o| o.kind == "formula")
+            .map(|o| o.name.clone())
+            .collect();
+        if let Some(t) = touched(env, &upgrading) {
+            tell(t);
+        }
     }
     // One call per kind, so a formula and a cask of one name are each upgraded as themselves. A
     // failed kind does not keep the other from its upgrade; the first failure is kept.
@@ -2410,6 +2490,7 @@ mod tests {
                 checkouts: &self.checkouts,
                 ssh_agent: self.ssh_agent.clone(),
                 xdg_state_home: self.xdg_state_home.clone(),
+                brew_plan: None,
             }
         }
 
