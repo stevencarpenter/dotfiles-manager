@@ -19,7 +19,22 @@ The upgrade step of `dfm sync` (DFM-31; the `mise`, `rustup`, `uv` and `npm` upd
 updaters = ["claude", "codex", "opencode", "brew", "skills", "agents"]
 ```
 
-The names come from a fixed set built into the manager. A document cannot add a command, so a commit pulled from GitHub cannot make sync run a program the manager does not know. The updaters run in the declared order, one at a time. An absent or empty list runs none.
+The names come from a fixed set built into the manager. A document cannot add a command, so a commit pulled from GitHub cannot make sync run a program the manager does not know. The updaters run at the same time unless they conflict (see "Order"). An absent or empty list runs none.
+
+## Order
+
+Two updaters conflict when one uses the other's tool or files (`Updater::uses` in `crates/model/src/updater.rs`):
+
+| Updater | Uses |
+| --- | --- |
+| `mise`, `uv`, `npm`, `lefthook`, `checkouts`, `codex` | `brew` (their programs, `git` and node come from Homebrew; codex refreshes its plugin marketplaces with `git`) |
+| `go`, `skills` | `brew`, `mise` (they run through `mise exec`) |
+| `cargo` | `brew`, `rustup` (`cargo` is the rustup proxy; a build can link Homebrew libraries) |
+| `agents` | `brew`, `checkouts` (it installs from the copy `checkouts` pulls, with Homebrew's `uv`) |
+| `side-channels` | every other updater (its recipe can run any tool) |
+| `brew`, `rustup`, `claude`, `opencode` | none |
+
+An updater starts when every earlier declared updater that it conflicts with has ended. Of a conflicting pair, the declared order decides which runs first; updaters that do not conflict run at the same time. So `side-channels` declared last runs after all the others, and `checkouts` declared before `agents` pulls the copy before it is installed. A row prints when its updater ends, so the rows of updaters that ran at the same time print in the order they ended.
 
 A manager built before this key refuses a profile that has it (`E_FIELD_UNKNOWN`). Declare `updaters` only after every machine that uses the profile runs a manager that knows it.
 
@@ -69,10 +84,10 @@ No updater is gated. `agents` installs from the owner's working copy, which it n
 
 An updater must not leave a tracked file changed in a source checkout without the owner knowing (DFM-25, C05).
 
-- Before the first updater, sync records a snapshot of the bound checkout and each nested source checkout that the published lock declares: `git status --porcelain=v1 -z --untracked-files=no` (with `--no-optional-locks`, through the scrubbed git of docs/sync.md), plus the type and content of each path it lists: `git hash-object --no-filters` for a file, the target for a symlink. Status alone is not enough, because an updater that rewrites a file that is already modified leaves its status line as it was. After each updater that ran, sync records the snapshot again and compares.
-- A tracked file that the updater changed (a new or changed status line, new content or a new type, or a change back to the committed form, shown as `restored`) makes that row `failed` with one note per file: `E_CONFLICT: claude changed the tracked file <checkout>/<path> (M); it is left in place, not reverted, staged or committed`. A file that resolves through a dfm link into a checkout shows as the file in the checkout.
+- Before the first updater, sync records a snapshot of the bound checkout and each nested source checkout that the published lock declares: `git status --porcelain=v1 -z --untracked-files=no` (with `--no-optional-locks`, through the scrubbed git of docs/sync.md), plus the type and content of each path it lists: `git hash-object --no-filters` for a file, the target for a symlink. Status alone is not enough, because an updater that rewrites a file that is already modified leaves its status line as it was. When an updater that ran ends, sync records the snapshot again and compares it with the previous one, before any updater that waited for this one starts.
+- A tracked file that changed (a new or changed status line, new content or a new type, or a change back to the committed form, shown as `restored`) is charged to every updater that ran since the previous snapshot: the one that ended and those still running. Each of their rows is `failed` with one note per file. One updater: `E_CONFLICT: claude changed the tracked file <checkout>/<path> (M); it is left in place, not reverted, staged or committed`. More than one: `E_CONFLICT: the tracked file <checkout>/<path> changed (M) while claude, codex ran; it is left in place, not reverted, staged or committed`; a row still running gets the note when it ends. A file that resolves through a dfm link into a checkout shows as the file in the checkout.
 - The change stays for the owner. Sync does not revert, stage, commit or push it. The next `dfm sync` refuses an update that would overwrite it (docs/sync.md, step 2).
-- The other updaters still run. A `blocked` updater ran no command and is not compared. A status that cannot be read after an updater fails that row with the cause; one that cannot be read before the first updater is an error of the step (`upgrade: failed (<code>)`).
+- The other updaters still run. A `blocked` updater ran no command and is not compared. A status is read twice when the first read fails. When both fail while `brew` runs (its upgrade of `git` can break the reads), that updater's row waits until `brew` ends and is read again then. A status that still cannot be read fails that row with the cause, and the updater stays charged for the next read; one that cannot be read before the first updater is an error of the step (`upgrade: failed (<code>)`).
 
 ## Statuses
 
@@ -97,11 +112,11 @@ A trial does not hold `brew`. The owner's decision of 2026-10-31 replaces DFM-31
 3. A refused run (an error exit) runs no updater. A skipped or blocked scope does not stop them.
 4. `--no-upgrade` prints `upgrade: skipped (--no-upgrade)` and runs none.
 5. The step also runs after "nothing to change".
-6. Under the writer lock, the profile is resolved again from `--root`, because another sync may have changed it since the review. An updater runs only when the review listed it and the profile still declares it; one added meanwhile runs in the next sync, after its review. A profile that declared none in the review takes no lock. Each updater that runs prints one row: `  <status> <name> <before> -> <after> (<time>)`, then its notes. The time is the updater's wall time, in tenths of a second below 10 s and whole seconds above (`(4.2 s)`, `(67 s)`); the receipt records the same run as `started_at` and `finished_at`. A blocked or pending updater prints its row and time too (a row can end blocked or pending after some commands ran; a pending row that never started shows `(0.0 s)`), and counts in the summary. After the last row, the second copies of the native tools are read (see "The fixed set").
-7. Each completed provider writes an immutable `upgrade-step` receipt before the next provider starts. Its operation records the observed versions and per-item notes. The final `upgrade` receipt groups all operations. The step ID contains the run ID and provider name. Use `sync --strict-upgrade` in automation to return exit 1 after all providers finish if any reports a problem. Plain sync keeps its daily best-effort exit policy.
+6. Under the writer lock, the profile is resolved again from `--root`, because another sync may have changed it since the review. An updater runs only when the review listed it and the profile still declares it; one added meanwhile runs in the next sync, after its review. A profile that declared none in the review takes no lock. Each updater that runs prints one row when it ends: `  <status> <name> <before> -> <after> (<time>)`, then its notes. The time is the updater's wall time, in tenths of a second below 10 s and whole seconds above (`(4.2 s)`, `(67 s)`); the receipt records the same run as `started_at` and `finished_at`. A blocked or pending updater prints its row and time too (a row can end blocked or pending after some commands ran; a pending row that never started shows `(0.0 s)`), and counts in the summary. After the last row, the second copies of the native tools are read (see "The fixed set").
+7. Each provider writes an immutable `upgrade-step` receipt when it ends, before an updater that waited for it starts. Its operation records the observed versions and per-item notes. The final `upgrade` receipt groups all operations, in the declared order, and the `warning:` lines follow the same order. The step ID contains the run ID and provider name. Use `sync --strict-upgrade` in automation to return exit 1 after all providers finish if any reports a problem. Plain sync keeps its daily best-effort exit policy.
 8. The `scopes:` block ends with `  upgrade: <status>=<count>...`, and each `failed`, `blocked` or `pending` updater adds a `warning:` line at the end of standard output.
-9. A stop request during the step ends that updater, reports the rest `pending`, writes the receipt and ends the run with the stop's exit code (130 or 143). The warnings still print. No journal entry is written, so the next sync runs every updater again.
-10. An error of the step itself (the writer lock is held by another command, the state cannot be read, the receipt cannot be written) keeps the scope summary, reports `upgrade: failed (<code>)` and exits with that error.
+9. A stop request during the step ends every running updater (each runner ends its own child's group), starts no more, reports the rest `pending` with the note `not started: the run was stopped`, writes the receipt and ends the run with the stop's exit code (130 or 143). The warnings still print. No journal entry is written, so the next sync runs every updater again.
+10. An error of the step itself (the writer lock is held by another command, the state cannot be read, the receipt cannot be written) starts no more updaters, waits for the running ones and records them, keeps the scope summary, reports `upgrade: failed (<code>)` and exits with that error.
 
 `--preview` lists each updater and its resolved path. For Homebrew and mise it queries candidate versions with writes confined to temporary storage. Other providers report that candidates are unavailable. A provider resolves its final version when it runs.
 
@@ -113,7 +128,9 @@ Timeouts: 30 minutes for each upgrade command (`brew upgrade`, `mise upgrade`, `
 
 - **`sudo` casks fail** under the detached run.
 - **skills reports no version**, so it is never `updated`.
-- **The guard sees changes, not their author.** A change that another process makes to a tracked file while an updater runs is counted against that updater.
+- **The guard sees changes, not their author.** A change that another process makes to a tracked file while an updater runs is counted against that updater, and a change made while updaters ran at the same time is counted against each of them.
+- **A stop skips the guard.** After a stop request the runner starts no command, `git` included, so a tracked file that an updater changed before the stop ended it is not reported. The next `dfm sync` refuses an update that would overwrite the change (docs/sync.md, step 2).
+- **The conflict table is fixed.** It lists the tools each updater runs as the manager knows them. A recipe or a tool that starts to use another updater's tool needs a row change in the manager.
 - **agents** does not clone a missing working copy; the packages scope clones the declared checkout. The working copy is installed with its uncommitted changes.
 - **Second copies** are looked for in Homebrew only, not in npm or mise, and only for the native tools.
 - **mise prunes.** The version `mise upgrade` replaced is removed after mise's grace period (`upgrade.prune_after`). A project configuration mise has not seen yet (not trusted) does not protect its pinned version.

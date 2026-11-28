@@ -39,6 +39,7 @@ use std::fs;
 use std::io::Write;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 const LOCK_FILE: &str = "dotfiles-manager.lock";
@@ -2612,8 +2613,9 @@ fn upgrade_preview(
     Ok(())
 }
 
-/// Runs the profile's updaters in order under the writer lock, prints one row each, writes one
-/// receipt and adds a warning per updater that did not succeed. `reviewed` is the list the
+/// Runs the profile's updaters under the writer lock, at the same time where they do not
+/// conflict (`Updater::conflicts`, docs/upgrade.md "Order"), prints one row each as it ends,
+/// writes one receipt and adds a warning per updater that did not succeed. `reviewed` is the list the
 /// review resolved. Another sync may change the profile before the lock, so under the lock the
 /// profile in `root` is resolved again, and an updater runs only when the review listed it and
 /// the profile still declares it: one added meanwhile runs in the next sync, after its review.
@@ -2712,98 +2714,189 @@ fn upgrade(
         result: state::RunResult::from_operations(&[]),
         operations: Vec::new(),
     };
-    let mut operations = Vec::new();
-    for u in &updaters {
-        let clock = Instant::now();
-        let mut row = updater::run(*u, &env);
-        let took = clock.elapsed();
-        // A blocked updater ran no command, and a stopped run starts no more.
-        if row.status != state::Status::Blocked && dfm_engine::signal::requested().is_none() {
-            match tracked_status(&git, &checkouts) {
-                Ok(now) => {
-                    let paths: BTreeSet<&String> = tracked.keys().chain(now.keys()).collect();
-                    for path in paths.into_iter().filter(|p| tracked.get(*p) != now.get(*p)) {
-                        // A path that left the status was changed back to its committed form.
-                        let code = now.get(path).map_or("restored", |(xy, _)| xy.trim());
+    // The updaters run concurrently where they do not conflict (docs/upgrade.md, "Order"): each
+    // one starts when every earlier declared updater it conflicts with has ended. Worker threads
+    // only run updaters; this thread starts them, reads the tracked-file guard, writes the
+    // receipts and prints the rows, in the order the updaters end.
+    let n = updaters.len();
+    let mut slots = vec![Slot::Waiting; n];
+    let mut operations: Vec<Option<state::OperationRecord>> = vec![None; n];
+    let mut warnings: Vec<Option<String>> = vec![None; n];
+    let mut guard = Guard::default();
+    // The first error of the step itself (a receipt that cannot be written, failed output). No
+    // updater starts after it; the running ones end and are recorded, then the step fails.
+    let mut halted: Option<Refusal> = None;
+    std::thread::scope(|s| {
+        let (tx, rx) = mpsc::channel::<(usize, updater::Row, Duration)>();
+        let mut ready = std::collections::VecDeque::new();
+        // Rows whose guard read failed while brew ran, read again when brew ends.
+        let mut parked: Vec<(usize, updater::Row, Duration)> = Vec::new();
+        let mut left = n;
+        while left > 0 {
+            let stopped = dfm_engine::signal::requested().is_some();
+            // Rows in hand are recorded first: a parked row is read again before an updater
+            // that waited for brew starts, so that updater is not charged for its change.
+            let dispatch = if ready.is_empty() { n } else { 0 };
+            for i in 0..dispatch {
+                if slots[i] != Slot::Waiting {
+                    continue;
+                }
+                if halted.is_some() {
+                    slots[i] = Slot::Done;
+                    left -= 1;
+                    continue;
+                }
+                let u = updaters[i];
+                if (0..i).any(|j| slots[j] != Slot::Done && updaters[j].conflicts(u)) {
+                    continue;
+                }
+                slots[i] = Slot::Running;
+                // A stopped run starts no more commands: the row is the pending "not started".
+                if stopped {
+                    ready.push_back((i, updater::run(u, &env), Duration::ZERO));
+                    continue;
+                }
+                guard.active.insert(i);
+                guard.since.insert(i);
+                let (tx, seam, env) = (tx.clone(), dfm_engine::signal::seam(), &env);
+                s.spawn(move || {
+                    seam.adopt();
+                    let clock = Instant::now();
+                    let started_at = updater::now();
+                    let row = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        updater::run(u, env)
+                    }))
+                    .unwrap_or_else(|_| updater::Row::panicked(u, started_at));
+                    // The receiver lives until every worker of the scope ended.
+                    let _ = tx.send((i, row, clock.elapsed()));
+                });
+            }
+            if left == 0 {
+                break;
+            }
+            let (i, mut row, took) = match ready.pop_front() {
+                Some(next) => next,
+                None => rx
+                    .recv()
+                    .expect("this thread holds a sender, so the channel stays open"),
+            };
+            let u = updaters[i];
+            let stopped = dfm_engine::signal::requested().is_some();
+            // A blocked updater ran no command and is not compared. After a stop the runner
+            // starts no command, git included, so nothing is compared.
+            if row.status == state::Status::Blocked || stopped {
+                guard.since.remove(&i);
+            } else {
+                // One more read when the first fails: brew may be replacing git at that moment.
+                match tracked_status(&git, &checkouts).or_else(|_| tracked_status(&git, &checkouts))
+                {
+                    Ok(now) => {
+                        guard.blame(&tracked, &now, &updaters, i);
+                        tracked = now;
+                    }
+                    // While brew runs, its upgrade of git can break both reads: the row waits
+                    // until brew ends and is read again then.
+                    Err(_)
+                        if (0..n).any(|j| {
+                            j != i && updaters[j] == Updater::Brew && slots[j] == Slot::Running
+                        }) =>
+                    {
+                        parked.push((i, row, took));
+                        continue;
+                    }
+                    Err(e) => {
+                        // The baseline stays, and so does this updater in the window: a change
+                        // it made is still named by the next read.
                         row.status = state::Status::Failed;
                         row.notes.push(format!(
-                            "{}: {} changed the tracked file {path} ({code}); it is left in place, not reverted, staged or committed",
-                            Code::Conflict.as_str(),
+                            "{}: the tracked files could not be checked after {}: {}",
+                            e.code.as_str(),
                             u.name(),
+                            e.detail
                         ));
                     }
-                    tracked = now;
-                }
-                Err(e) => {
-                    row.status = state::Status::Failed;
-                    row.notes.push(format!(
-                        "{}: the tracked files could not be checked after {}: {}",
-                        e.code.as_str(),
-                        u.name(),
-                        e.detail
-                    ));
                 }
             }
+            slots[i] = Slot::Done;
+            left -= 1;
+            guard.active.remove(&i);
+            if u == Updater::Brew {
+                ready.extend(parked.drain(..));
+            }
+            if let Some(notes) = guard.owed.remove(&i) {
+                row.status = state::Status::Failed;
+                row.notes.extend(notes);
+            }
+            let mut record = || -> Result<(), Refusal> {
+                let op = state::OperationRecord {
+                    id: format!("updater-{}", u.name()),
+                    resource: format!("updater:{}", u.name()),
+                    adapter: "updater/v1".into(),
+                    class: Class::Normal,
+                    status: row.status,
+                    started_at: Some(row.started_at.clone()),
+                    finished_at: Some(row.finished_at.clone()),
+                    before: None,
+                    after: None,
+                    owned_outputs: vec![],
+                    error: row.status.is_problem().then(|| row.notes.join("; ")),
+                    reload: None,
+                    upgrade: Some(state::UpgradeEvidence {
+                        before_version: row.before.clone(),
+                        after_version: row.after.clone(),
+                        notes: row.notes.clone(),
+                    }),
+                };
+                // Record the completed provider before output or the next native command can fail.
+                let step = state::Receipt {
+                    op_id: format!("{}-{}", receipt.op_id, u.name()),
+                    command: "upgrade-step".into(),
+                    started_at: row.started_at.clone(),
+                    finished_at: row.finished_at.clone(),
+                    result: state::RunResult::from_operations(std::slice::from_ref(&op)),
+                    operations: vec![op.clone()],
+                    ..receipt.clone()
+                };
+                store.write_receipt(&step)?;
+                operations[i] = Some(op);
+                fail.hit("sync-after-upgrade-step")?;
+                let status = status_name(row.status);
+                let versions = match (&row.before, &row.after) {
+                    (Some(b), Some(a)) if a != b => format!(" {} -> {}", visible(b), visible(a)),
+                    (Some(b), _) => format!(" {}", visible(b)),
+                    _ => String::new(),
+                };
+                if row.status.is_problem() {
+                    warnings[i] = Some(format!(
+                        "upgrade {} {status}: {}",
+                        u.name(),
+                        visible(&row.notes.join("; "))
+                    ));
+                }
+                // Every row has a time: a blocked or pending row can follow commands that ran.
+                writeln!(
+                    out,
+                    "  {} {}{versions} ({})",
+                    paint::status(ctx.color, &status),
+                    u.name(),
+                    elapsed(took)
+                )
+                .map_err(w)?;
+                for n in &row.notes {
+                    writeln!(out, "    note: {}", visible(n)).map_err(w)?;
+                }
+                Ok(())
+            };
+            if let Err(e) = record() {
+                halted.get_or_insert(e);
+            }
         }
-        let op = state::OperationRecord {
-            id: format!("updater-{}", u.name()),
-            resource: format!("updater:{}", u.name()),
-            adapter: "updater/v1".into(),
-            class: Class::Normal,
-            status: row.status,
-            started_at: Some(row.started_at.clone()),
-            finished_at: Some(row.finished_at.clone()),
-            before: None,
-            after: None,
-            owned_outputs: vec![],
-            error: row.status.is_problem().then(|| row.notes.join("; ")),
-            reload: None,
-            upgrade: Some(state::UpgradeEvidence {
-                before_version: row.before.clone(),
-                after_version: row.after.clone(),
-                notes: row.notes.clone(),
-            }),
-        };
-        // Record the completed provider before output or the next native command can fail.
-        let step = state::Receipt {
-            op_id: format!("{}-{}", receipt.op_id, u.name()),
-            command: "upgrade-step".into(),
-            started_at: row.started_at.clone(),
-            finished_at: row.finished_at.clone(),
-            result: state::RunResult::from_operations(std::slice::from_ref(&op)),
-            operations: vec![op.clone()],
-            ..receipt.clone()
-        };
-        store.write_receipt(&step)?;
-        fail.hit("sync-after-upgrade-step")?;
-        operations.push(op);
-        let status = status_name(row.status);
-        let versions = match (&row.before, &row.after) {
-            (Some(b), Some(a)) if a != b => format!(" {} -> {}", visible(b), visible(a)),
-            (Some(b), _) => format!(" {}", visible(b)),
-            _ => String::new(),
-        };
-        // Every row has a time: a blocked or pending row can follow commands that ran.
-        writeln!(
-            out,
-            "  {} {}{versions} ({})",
-            paint::status(ctx.color, &status),
-            u.name(),
-            elapsed(took)
-        )
-        .map_err(w)?;
-        for n in &row.notes {
-            writeln!(out, "    note: {}", visible(n)).map_err(w)?;
-        }
-        let problem = row.status.is_problem();
-        if problem {
-            printed.warnings.push(format!(
-                "upgrade {} {status}: {}",
-                u.name(),
-                visible(&row.notes.join("; "))
-            ));
-        }
+    });
+    if let Some(e) = halted {
+        return Err(e);
     }
+    let operations: Vec<state::OperationRecord> = operations.into_iter().flatten().collect();
+    printed.warnings.extend(warnings.into_iter().flatten());
     // After the loop, so a copy that brew upgraded shows the version brew left. A stopped run
     // starts no more commands.
     let stopped = dfm_engine::signal::requested().is_some();
@@ -2826,6 +2919,66 @@ fn upgrade(
         .map(|(s, n)| format!("{}={n}", status_name(*s)))
         .collect();
     Ok(Some(counts.join(" ")))
+}
+
+/// Where one updater of the upgrade step is.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Slot {
+    Waiting,
+    Running,
+    Done,
+}
+
+/// The tracked-file guard of concurrent updaters (docs/upgrade.md, "Tracked files"). A change
+/// seen when an updater ends is charged to every updater that ran since the previous snapshot:
+/// the one that ended and those still running. Each of their rows fails.
+#[derive(Default)]
+struct Guard {
+    /// The updaters running now, by declared index.
+    active: BTreeSet<usize>,
+    /// The updaters that ran since the last snapshot.
+    since: BTreeSet<usize>,
+    /// The notes each updater's row gets when it ends.
+    owed: BTreeMap<usize, Vec<String>>,
+}
+
+impl Guard {
+    /// Compares two snapshots, charges each changed path to the updaters in `since`, and starts
+    /// the next window with the updaters still running. `ended` is the updater whose end this
+    /// read follows. Only it and the running updaters get the note on their rows; one whose row
+    /// is already recorded (its own read failed) is named only.
+    fn blame(
+        &mut self,
+        before: &BTreeMap<String, (String, String)>,
+        now: &BTreeMap<String, (String, String)>,
+        updaters: &[Updater],
+        ended: usize,
+    ) {
+        let paths: BTreeSet<&String> = before.keys().chain(now.keys()).collect();
+        let names: Vec<&str> = self.since.iter().map(|i| updaters[*i].name()).collect();
+        for path in paths.into_iter().filter(|p| before.get(*p) != now.get(*p)) {
+            // A path that left the status was changed back to its committed form.
+            let code = now.get(path).map_or("restored", |(xy, _)| xy.trim());
+            let note = match names.as_slice() {
+                [one] => format!(
+                    "{}: {one} changed the tracked file {path} ({code}); it is left in place, not reverted, staged or committed",
+                    Code::Conflict.as_str(),
+                ),
+                many => format!(
+                    "{}: the tracked file {path} changed ({code}) while {} ran; it is left in place, not reverted, staged or committed",
+                    Code::Conflict.as_str(),
+                    many.join(", "),
+                ),
+            };
+            for i in &self.since {
+                if *i == ended || self.active.contains(i) {
+                    self.owed.entry(*i).or_default().push(note.clone());
+                }
+            }
+        }
+        self.since = self.active.clone();
+        self.since.remove(&ended);
+    }
 }
 
 /// The wall time of one updater for its row: tenths of a second under 10 s, whole seconds above.

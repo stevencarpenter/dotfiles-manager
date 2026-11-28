@@ -98,6 +98,21 @@ pub struct Row {
     pub finished_at: String,
 }
 
+impl Row {
+    /// The row of an updater whose code panicked: `failed`, with no version.
+    pub fn panicked(u: Updater, started_at: String) -> Row {
+        Row {
+            updater: u,
+            status: Status::Failed,
+            before: None,
+            after: None,
+            notes: vec!["the updater ended with an internal error (a panic)".into()],
+            started_at,
+            finished_at: now(),
+        }
+    }
+}
+
 /// Where each native tool's own installer puts it, relative to HOME.
 fn owner_dir(u: Updater) -> Option<&'static str> {
     match u {
@@ -141,7 +156,7 @@ fn brew_env(auto_update: bool) -> Vec<(String, String)> {
     v
 }
 
-fn now() -> String {
+pub(crate) fn now() -> String {
     dfm_model::state::rfc3339(dfm_engine::store::now_ns().unwrap_or(0))
 }
 
