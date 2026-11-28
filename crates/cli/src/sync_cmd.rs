@@ -2734,7 +2734,10 @@ fn upgrade(
         let mut left = n;
         while left > 0 {
             let stopped = dfm_engine::signal::requested().is_some();
-            for i in 0..n {
+            // Rows in hand are recorded first: a parked row is read again before an updater
+            // that waited for brew starts, so that updater is not charged for its change.
+            let dispatch = if ready.is_empty() { n } else { 0 };
+            for i in 0..dispatch {
                 if slots[i] != Slot::Waiting {
                     continue;
                 }
@@ -2794,10 +2797,9 @@ fn upgrade(
                     // While brew runs, its upgrade of git can break both reads: the row waits
                     // until brew ends and is read again then.
                     Err(_)
-                        if !parked.iter().any(|(p, ..)| *p == i)
-                            && (0..n).any(|j| {
-                                j != i && updaters[j] == Updater::Brew && slots[j] == Slot::Running
-                            }) =>
+                        if (0..n).any(|j| {
+                            j != i && updaters[j] == Updater::Brew && slots[j] == Slot::Running
+                        }) =>
                     {
                         parked.push((i, row, took));
                         continue;
