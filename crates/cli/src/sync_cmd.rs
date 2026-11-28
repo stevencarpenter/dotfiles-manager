@@ -2729,6 +2729,8 @@ fn upgrade(
     std::thread::scope(|s| {
         let (tx, rx) = mpsc::channel::<(usize, updater::Row, Duration)>();
         let mut ready = std::collections::VecDeque::new();
+        // Rows whose guard read failed while brew ran, read again when brew ends.
+        let mut parked: Vec<(usize, updater::Row, Duration)> = Vec::new();
         let mut left = n;
         while left > 0 {
             let stopped = dfm_engine::signal::requested().is_some();
@@ -2757,10 +2759,11 @@ fn upgrade(
                 s.spawn(move || {
                     seam.adopt();
                     let clock = Instant::now();
+                    let started_at = updater::now();
                     let row = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         updater::run(u, env)
                     }))
-                    .unwrap_or_else(|_| updater::Row::panicked(u));
+                    .unwrap_or_else(|_| updater::Row::panicked(u, started_at));
                     // The receiver lives until every worker of the scope ended.
                     let _ = tx.send((i, row, clock.elapsed()));
                 });
@@ -2774,22 +2777,34 @@ fn upgrade(
                     .recv()
                     .expect("this thread holds a sender, so the channel stays open"),
             };
-            slots[i] = Slot::Done;
-            left -= 1;
             let u = updaters[i];
-            guard.active.remove(&i);
-            // A blocked updater ran no command, and a stopped run starts no more.
-            if row.status != state::Status::Blocked && dfm_engine::signal::requested().is_none() {
+            let stopped = dfm_engine::signal::requested().is_some();
+            // A blocked updater ran no command and is not compared. After a stop the runner
+            // starts no command, git included, so nothing is compared.
+            if row.status == state::Status::Blocked || stopped {
+                guard.since.remove(&i);
+            } else {
                 // One more read when the first fails: brew may be replacing git at that moment.
                 match tracked_status(&git, &checkouts).or_else(|_| tracked_status(&git, &checkouts))
                 {
                     Ok(now) => {
-                        guard.blame(&tracked, &now, &updaters);
+                        guard.blame(&tracked, &now, &updaters, i);
                         tracked = now;
                     }
+                    // While brew runs, its upgrade of git can break both reads: the row waits
+                    // until brew ends and is read again then.
+                    Err(_)
+                        if !parked.iter().any(|(p, ..)| *p == i)
+                            && (0..n).any(|j| {
+                                j != i && updaters[j] == Updater::Brew && slots[j] == Slot::Running
+                            }) =>
+                    {
+                        parked.push((i, row, took));
+                        continue;
+                    }
                     Err(e) => {
-                        // This row carries the failure; the next window does not charge it.
-                        guard.since.remove(&i);
+                        // The baseline stays, and so does this updater in the window: a change
+                        // it made is still named by the next read.
                         row.status = state::Status::Failed;
                         row.notes.push(format!(
                             "{}: the tracked files could not be checked after {}: {}",
@@ -2799,8 +2814,12 @@ fn upgrade(
                         ));
                     }
                 }
-            } else {
-                guard.since.remove(&i);
+            }
+            slots[i] = Slot::Done;
+            left -= 1;
+            guard.active.remove(&i);
+            if u == Updater::Brew {
+                ready.extend(parked.drain(..));
             }
             if let Some(notes) = guard.owed.remove(&i) {
                 row.status = state::Status::Failed;
@@ -2923,12 +2942,15 @@ struct Guard {
 
 impl Guard {
     /// Compares two snapshots, charges each changed path to the updaters in `since`, and starts
-    /// the next window with the updaters still running.
+    /// the next window with the updaters still running. `ended` is the updater whose end this
+    /// read follows. Only it and the running updaters get the note on their rows; one whose row
+    /// is already recorded (its own read failed) is named only.
     fn blame(
         &mut self,
         before: &BTreeMap<String, (String, String)>,
         now: &BTreeMap<String, (String, String)>,
         updaters: &[Updater],
+        ended: usize,
     ) {
         let paths: BTreeSet<&String> = before.keys().chain(now.keys()).collect();
         let names: Vec<&str> = self.since.iter().map(|i| updaters[*i].name()).collect();
@@ -2947,10 +2969,13 @@ impl Guard {
                 ),
             };
             for i in &self.since {
-                self.owed.entry(*i).or_default().push(note.clone());
+                if *i == ended || self.active.contains(i) {
+                    self.owed.entry(*i).or_default().push(note.clone());
+                }
             }
         }
         self.since = self.active.clone();
+        self.since.remove(&ended);
     }
 }
 

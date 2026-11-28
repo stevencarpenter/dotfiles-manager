@@ -73,25 +73,25 @@ impl Updater {
     }
 
     /// The updaters whose tools this one runs or whose files it reads (docs/upgrade.md,
-    /// "Order"). The binaries of mise, uv, npm (node), lefthook and git come from Homebrew; go
-    /// and skills run through `mise exec`; cargo is the rustup proxy and links Homebrew
-    /// libraries when it builds; agents installs from the copy that `checkouts` pulls and runs
-    /// `uv`. side-channels runs an arbitrary recipe, so it uses every other updater. The match
-    /// is exhaustive, so a new updater does not compile until its row is written.
+    /// "Order"). brew installs the binaries of mise, uv, npm (node), lefthook and git, and codex
+    /// refreshes its plugin marketplaces with git. go and skills run through `mise exec`. cargo
+    /// is the rustup proxy and links libraries from brew when it builds. agents installs from
+    /// the copy that `checkouts` pulls and runs the `uv` from brew. side-channels runs an
+    /// arbitrary recipe, so it uses every other updater. The match is exhaustive, so a new
+    /// updater does not compile until its row is written.
     pub fn uses(self) -> &'static [Updater] {
         match self {
             Updater::Agents => &[Updater::Brew, Updater::Checkouts],
             Updater::Cargo => &[Updater::Brew, Updater::Rustup],
-            Updater::Checkouts | Updater::Lefthook | Updater::Mise | Updater::Npm | Updater::Uv => {
-                &[Updater::Brew]
-            }
+            Updater::Checkouts
+            | Updater::Codex
+            | Updater::Lefthook
+            | Updater::Mise
+            | Updater::Npm
+            | Updater::Uv => &[Updater::Brew],
             Updater::Go | Updater::Skills => &[Updater::Brew, Updater::Mise],
             Updater::SideChannels => &Updater::ALL,
-            Updater::Brew
-            | Updater::Claude
-            | Updater::Codex
-            | Updater::Opencode
-            | Updater::Rustup => &[],
+            Updater::Brew | Updater::Claude | Updater::Opencode | Updater::Rustup => &[],
         }
     }
 
@@ -134,6 +134,7 @@ mod tests {
         assert!(Updater::Agents.conflicts(Updater::Checkouts));
         assert!(!Updater::Brew.conflicts(Updater::Rustup));
         assert!(!Updater::Claude.conflicts(Updater::Codex));
+        assert!(Updater::Codex.conflicts(Updater::Brew));
         assert!(!Updater::Mise.conflicts(Updater::Npm));
     }
 }

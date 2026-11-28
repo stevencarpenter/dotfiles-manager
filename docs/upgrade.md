@@ -27,12 +27,12 @@ Two updaters conflict when one uses the other's tool or files (`Updater::uses` i
 
 | Updater | Uses |
 | --- | --- |
-| `mise`, `uv`, `npm`, `lefthook`, `checkouts` | `brew` (their programs, and `git` and node, come from Homebrew) |
+| `mise`, `uv`, `npm`, `lefthook`, `checkouts`, `codex` | `brew` (their programs, `git` and node come from Homebrew; codex refreshes its plugin marketplaces with `git`) |
 | `go`, `skills` | `brew`, `mise` (they run through `mise exec`) |
 | `cargo` | `brew`, `rustup` (`cargo` is the rustup proxy; a build can link Homebrew libraries) |
 | `agents` | `brew`, `checkouts` (it installs from the copy `checkouts` pulls, with Homebrew's `uv`) |
 | `side-channels` | every other updater (its recipe can run any tool) |
-| `brew`, `rustup`, `claude`, `codex`, `opencode` | none |
+| `brew`, `rustup`, `claude`, `opencode` | none |
 
 An updater starts when every earlier declared updater that it conflicts with has ended. Of a conflicting pair, the declared order decides which runs first; updaters that do not conflict run at the same time. So `side-channels` declared last runs after all the others, and `checkouts` declared before `agents` pulls the copy before it is installed. A row prints when its updater ends, so the rows of updaters that ran at the same time print in the order they ended.
 
@@ -87,7 +87,7 @@ An updater must not leave a tracked file changed in a source checkout without th
 - Before the first updater, sync records a snapshot of the bound checkout and each nested source checkout that the published lock declares: `git status --porcelain=v1 -z --untracked-files=no` (with `--no-optional-locks`, through the scrubbed git of docs/sync.md), plus the type and content of each path it lists: `git hash-object --no-filters` for a file, the target for a symlink. Status alone is not enough, because an updater that rewrites a file that is already modified leaves its status line as it was. When an updater that ran ends, sync records the snapshot again and compares it with the previous one, before any updater that waited for this one starts.
 - A tracked file that changed (a new or changed status line, new content or a new type, or a change back to the committed form, shown as `restored`) is charged to every updater that ran since the previous snapshot: the one that ended and those still running. Each of their rows is `failed` with one note per file. One updater: `E_CONFLICT: claude changed the tracked file <checkout>/<path> (M); it is left in place, not reverted, staged or committed`. More than one: `E_CONFLICT: the tracked file <checkout>/<path> changed (M) while claude, codex ran; it is left in place, not reverted, staged or committed`; a row still running gets the note when it ends. A file that resolves through a dfm link into a checkout shows as the file in the checkout.
 - The change stays for the owner. Sync does not revert, stage, commit or push it. The next `dfm sync` refuses an update that would overwrite it (docs/sync.md, step 2).
-- The other updaters still run. A `blocked` updater ran no command and is not compared. A status that cannot be read after an updater (read twice, because `brew` can be replacing `git` at that moment) fails that row with the cause; one that cannot be read before the first updater is an error of the step (`upgrade: failed (<code>)`).
+- The other updaters still run. A `blocked` updater ran no command and is not compared. A status is read twice when the first read fails. When both fail while `brew` runs (its upgrade of `git` can break the reads), that updater's row waits until `brew` ends and is read again then. A status that still cannot be read fails that row with the cause, and the updater stays charged for the next read; one that cannot be read before the first updater is an error of the step (`upgrade: failed (<code>)`).
 
 ## Statuses
 
@@ -129,6 +129,7 @@ Timeouts: 30 minutes for each upgrade command (`brew upgrade`, `mise upgrade`, `
 - **`sudo` casks fail** under the detached run.
 - **skills reports no version**, so it is never `updated`.
 - **The guard sees changes, not their author.** A change that another process makes to a tracked file while an updater runs is counted against that updater, and a change made while updaters ran at the same time is counted against each of them.
+- **A stop skips the guard.** After a stop request the runner starts no command, `git` included, so a tracked file that an updater changed before the stop ended it is not reported. The next `dfm sync` refuses an update that would overwrite the change (docs/sync.md, step 2).
 - **The conflict table is fixed.** It lists the tools each updater runs as the manager knows them. A recipe or a tool that starts to use another updater's tool needs a row change in the manager.
 - **agents** does not clone a missing working copy; the packages scope clones the declared checkout. The working copy is installed with its uncommitted changes.
 - **Second copies** are looked for in Homebrew only, not in npm or mise, and only for the native tools.
