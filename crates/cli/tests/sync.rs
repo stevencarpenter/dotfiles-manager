@@ -4228,7 +4228,9 @@ printf 'brew %s\n' "$*" >> "$here/../st/log"
 case "$1" in
   update) exit 0 ;;
   outdated)
-    if [ -e "$here/../st/outdated-uv" ]; then
+    if [ -e "$here/../st/outdated-git" ]; then
+      echo '{"formulae":[{"name":"git","installed_versions":["2.56.1"],"current_version":"2.56.2"}],"casks":[]}'
+    elif [ -e "$here/../st/outdated-uv" ]; then
       echo '{"formulae":[{"name":"uv","installed_versions":["0.1"],"current_version":"0.2"}],"casks":[]}'
     elif [ -e "$here/../st/outdated-codex" ]; then
       echo '{"formulae":[],"casks":[{"name":"codex","installed_versions":["0.164.0"],"current_version":"0.165.0"}]}'
@@ -4236,6 +4238,8 @@ case "$1" in
       echo '{"formulae":[],"casks":[]}'
     fi ;;
   upgrade)
+    if [ -e "$here/../st/outdated-git" ]; then rm "$here/../st/outdated-git"; exit 0; fi
+    if [ -e "$here/../st/upgrade-ok" ]; then rm -f "$here/../st/outdated-uv"; exit 0; fi
     if [ -e "$here/../st/outdated-codex" ]; then
       rm "$here/../st/outdated-codex"; echo 'codex 0.165.0' > "$here/../st/list-codex"; exit 0
     fi
@@ -4959,9 +4963,8 @@ fn an_updater_that_writes_a_tracked_file_through_a_home_link_fails_and_names_the
 }
 
 /// Starts a sync whose `brew upgrade --formula uv` hangs, with `brew deps` printing `deps`,
-/// waits until codex ran or (when `codex_runs` is false) a moment after brew's upgrade started,
-/// then stops the run and returns its standard output.
-fn brew_hangs_with_deps(deps: &str, codex_runs: bool) -> String {
+/// waits until codex ran beside it, then stops the run and returns its standard output.
+fn codex_beside_a_hanging_brew(deps: &str) -> String {
     let u = Up::new(r#"["brew", "codex"]"#);
     fs::write(u.st("outdated-uv"), "").unwrap();
     fs::write(u.st("brew-deps"), deps).unwrap();
@@ -4971,15 +4974,9 @@ fn brew_hangs_with_deps(deps: &str, codex_runs: bool) -> String {
         .spawn()
         .unwrap();
     let t0 = std::time::Instant::now();
-    while !(u.st("started-brew").exists()
-        && (!codex_runs || u.log().matches("codex --version").count() >= 2))
-    {
+    while !(u.st("started-brew").exists() && u.log().matches("codex --version").count() >= 2) {
         assert!(t0.elapsed().as_secs() < 60, "{}", u.log());
         std::thread::sleep(std::time::Duration::from_millis(50));
-    }
-    if !codex_runs {
-        // brew told its plan before its upgrade started; give the coordinator time to act on it.
-        std::thread::sleep(std::time::Duration::from_millis(500));
     }
     let kill = Command::new("/bin/kill")
         .args(["-INT", &child.id().to_string()])
@@ -4993,28 +4990,45 @@ fn brew_hangs_with_deps(deps: &str, codex_runs: bool) -> String {
 
 #[test]
 fn an_updater_whose_formulae_brew_does_not_touch_runs_beside_brew_upgrade() {
-    let s = brew_hangs_with_deps(
-        "git: gettext pcre2\nlefthook: \nmise: \nnode: openssl@4\nopenssh: openssl@4\nuv: \n",
-        true,
+    let s = codex_beside_a_hanging_brew(
+        "git: gettext pcre2\nlefthook: \nmise: \nopenssh: openssl@4\nuv: \nreadline: \n",
     );
     in_order(&s, &["  current codex", "  pending brew"]);
 }
 
+/// Runs `["brew", "codex"]` to its end and checks that codex started after brew's last command.
+fn codex_waits_for_brew(u: &Up) {
+    let o = u.sync(&[]);
+    assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
+    let log = u.log();
+    let brew_end = log.rfind("brew outdated").expect(&log);
+    assert!(log.find("codex update").expect(&log) > brew_end, "{log}");
+}
+
 #[test]
 fn an_updater_whose_formula_brew_upgrades_waits_for_brew() {
-    // uv is being upgraded and git depends on it here, so codex must wait.
-    let s = brew_hangs_with_deps(
-        "git: gettext uv\nlefthook: \nmise: \nnode: \nopenssh: \nuv: \n",
-        false,
-    );
-    in_order(
-        &s,
-        &[
-            "  pending brew",
-            "  pending codex (0.0 s)",
-            "    note: not started: the run was stopped",
-        ],
-    );
+    let u = Up::new(r#"["brew", "codex"]"#);
+    fs::write(u.st("outdated-git"), "").unwrap();
+    fs::write(u.st("brew-deps"), "git: gettext\n").unwrap();
+    codex_waits_for_brew(&u);
+}
+
+#[test]
+fn an_updater_whose_formula_depends_on_an_upgraded_one_waits_for_brew() {
+    let u = Up::new(r#"["brew", "codex"]"#);
+    fs::write(u.st("outdated-uv"), "").unwrap();
+    fs::write(u.st("upgrade-ok"), "").unwrap();
+    fs::write(u.st("brew-deps"), "git: gettext uv\n").unwrap();
+    codex_waits_for_brew(&u);
+}
+
+#[test]
+fn every_dependent_waits_for_brew_when_its_dependencies_cannot_be_read() {
+    // No `brew-deps` marker: the look-alike's `brew deps` exits 1.
+    let u = Up::new(r#"["brew", "codex"]"#);
+    fs::write(u.st("outdated-uv"), "").unwrap();
+    fs::write(u.st("upgrade-ok"), "").unwrap();
+    codex_waits_for_brew(&u);
 }
 
 /// A tracked file that changes while two updaters run is charged to both: each row fails and

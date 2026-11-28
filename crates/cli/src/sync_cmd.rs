@@ -2748,7 +2748,7 @@ fn upgrade(
         while left > 0 {
             let stopped = dfm_engine::signal::requested().is_some();
             // Rows in hand are recorded first: a parked row is read again before an updater
-            // that waited for brew starts, so that updater is not charged for its change.
+            // that waited for brew to end starts, so that updater is not charged for its change.
             let dispatch = if ready.is_empty() { n } else { 0 };
             for i in 0..dispatch {
                 if slots[i] != Slot::Waiting {
@@ -2760,9 +2760,12 @@ fn upgrade(
                     continue;
                 }
                 let u = updaters[i];
-                let released = touched.as_ref().is_some_and(|t| {
-                    updater::brew_formulae(u).is_some_and(|f| f.iter().all(|x| !t.contains(*x)))
-                });
+                // Not while a row is parked: its read waits for brew, and an updater started now
+                // would share that window.
+                let released = parked.is_empty()
+                    && touched.as_ref().is_some_and(|t| {
+                        updater::brew_formulae(u).is_some_and(|f| f.iter().all(|x| !t.contains(*x)))
+                    });
                 if (0..i).any(|j| {
                     slots[j] != Slot::Done
                         && updaters[j].conflicts(u)
